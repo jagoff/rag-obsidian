@@ -699,6 +699,23 @@ def auto_index_vault(vault_path: Path) -> dict:
                 continue
             md_files.append(p)
 
+        # Bootstrap: si la colección ya tiene chunks pero last_check es 0
+        # (estado no existía o fue borrado), asumimos que el index está al
+        # día y solo persistimos el timestamp actual. Sin esto, la primera
+        # corrida de auto_index escanea TODOS los archivos via
+        # _index_single_file (col.get por archivo = ~25s en 500 notas) —
+        # dispara un hang aparente al arrancar chat.
+        if not first_time and last_check == 0.0:
+            state[key] = _t.time()
+            _auto_index_state_save(state)
+            return {
+                "scanned": len(md_files),
+                "indexed": 0,
+                "removed": 0,
+                "kind": "no_changes",
+                "took_ms": int((_t.perf_counter() - t0) * 1000),
+            }
+
         # mtime-filter SOLO si no es first_time (ahí hay que indexar todo).
         if first_time:
             candidates = md_files
@@ -4774,24 +4791,17 @@ def _arrow_select(
                 return -1
             _redraw()
     finally:
-        # Restore primario: vuelve a los settings que había antes del cbreak.
+        # Restore puro: tcsetattr al snapshot pre-cbreak. TCSADRAIN espera
+        # que el output drain antes de cambiar — importante para que el
+        # erase_menu termine de mostrarse en el modo correcto.
         try:
-            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         except Exception:
             pass
-        # Belt + suspenders: forzar ICANON + ECHO + OPOST a ON, por si
-        # `old_settings` los tenía off (raro pero blindaje barato). Sin
-        # OPOST los \n no se traducen a \r\n y todo el output siguiente
-        # del chat se ve apilado en una línea — síntoma reportado.
-        try:
-            attrs = termios.tcgetattr(fd)
-            attrs[1] |= termios.OPOST                      # output post-processing
-            attrs[3] |= termios.ICANON | termios.ECHO      # canonical + echo
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        except Exception:
-            pass
-        # Asegurar que cualquier ANSI pendiente del erase_menu se haya
-        # vuelto a flush antes de seguir.
+        # Reasegurar cursor visible — Live de Rich (usado por el spinner
+        # del auto_index posterior) lo apaga; sin esto el prompt del chat
+        # queda invisible aunque ECHO esté ok.
+        sys.stdout.write("\x1b[?25h")
         sys.stdout.flush()
 
 
@@ -5002,7 +5012,13 @@ def chat(
             if not first_turn:
                 console.print(Rule(style="dim", characters="╌"))
             first_turn = False
-            question = console.input("\n[bold green]tu › [/bold green]").strip()
+            # Prompt explícito con ANSI directo + flush. Rich.console.print
+            # con end="" en algunos terminales/pipes queda en buffer y el
+            # prompt no aparece. print() de stdlib con flush=True es 100%
+            # confiable, y el ANSI funciona en todo terminal moderno.
+            # \x1b[?25h fuerza cursor visible (Live spinner puede apagarlo).
+            print("\n\x1b[?25h\x1b[1;32mtu ›\x1b[0m ", end="", flush=True)
+            question = input().strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Hasta luego.[/dim]")
             break
@@ -5158,7 +5174,7 @@ def chat(
 
         console.print()
         parts: list[str] = []
-        console.print("[bold cyan]rag › [/bold cyan]", end="")
+        print("\x1b[1;36mrag ›\x1b[0m ", end="", flush=True)
         from rich.live import Live
         with Live("", console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(

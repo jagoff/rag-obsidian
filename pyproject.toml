@@ -15,9 +15,15 @@ dependencies = [
     "watchdog>=6.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=9.0"]
+
 [project.scripts]
 rag = "rag:cli"
 obsidian-rag-mcp = "mcp_server:main"
 
 [tool.setuptools]
 py-modules = ["rag", "mcp_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

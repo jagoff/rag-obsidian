@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 import time
 import unicodedata
@@ -166,6 +167,170 @@ def log_query_event(event: dict) -> None:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ── SESSIONS ──────────────────────────────────────────────────────────────────
+# Persist multi-turn conversation so follow-ups ("profundizá", pronouns without
+# antecedent) can reference prior turns. Shared across `rag chat`, `rag query
+# --continue`, MCP `rag_query(session_id=...)`, and the Telegram bots (which
+# pass `tg:<chat_id>` as id).
+#
+# Storage: one JSON file per session under SESSIONS_DIR. LAST_SESSION_FILE
+# holds the most recent id so `--continue` / `--resume` can default to it.
+# Caller-supplied ids are allowed (needed for Telegram chat_id), validated
+# against SESSION_ID_RE.
+
+SESSIONS_DIR = Path.home() / ".local/share/obsidian-rag/sessions"
+LAST_SESSION_FILE = Path.home() / ".local/share/obsidian-rag/last_session"
+SESSION_TTL_DAYS = 30
+SESSION_MAX_TURNS = 50           # cap per file — keeps JSON small, bounds retrieval context
+SESSION_HISTORY_WINDOW = 6       # last N messages fed to reformulate_query / LLM
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def new_session_id() -> str:
+    """Short opaque id: hex timestamp + 6 random hex chars (sortable + unique)."""
+    return f"{int(time.time()):x}-{secrets.token_hex(3)}"
+
+
+def _valid_session_id(sid: str) -> bool:
+    return bool(SESSION_ID_RE.match(sid))
+
+
+def session_path(sid: str) -> Path:
+    if not _valid_session_id(sid):
+        raise ValueError(f"invalid session id: {sid!r}")
+    return SESSIONS_DIR / f"{sid}.json"
+
+
+def load_session(sid: str) -> dict | None:
+    """Read a session file. Returns None if missing, invalid id, or unreadable."""
+    try:
+        p = session_path(sid)
+    except ValueError:
+        return None
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_session(sess: dict) -> None:
+    """Atomic write via tmp file + replace. Also records last-session pointer."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    sess["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    p = session_path(sess["id"])
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+    _set_last_session(sess["id"])
+
+
+def ensure_session(sid: str | None, *, mode: str) -> dict:
+    """Return an existing session or a fresh one. Caller-supplied ids are kept
+    verbatim if valid; otherwise a new random id is minted.
+    """
+    if sid:
+        existing = load_session(sid)
+        if existing:
+            return existing
+        new_id = sid if _valid_session_id(sid) else new_session_id()
+    else:
+        new_id = new_session_id()
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "id": new_id,
+        "created_at": now,
+        "updated_at": now,
+        "mode": mode,
+        "turns": [],
+    }
+
+
+def append_turn(sess: dict, turn: dict) -> None:
+    """Append one turn to the session, capping total stored turns."""
+    sess.setdefault("turns", []).append({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        **turn,
+    })
+    if len(sess["turns"]) > SESSION_MAX_TURNS:
+        sess["turns"] = sess["turns"][-SESSION_MAX_TURNS:]
+
+
+def session_history(sess: dict, window: int = SESSION_HISTORY_WINDOW) -> list[dict]:
+    """Flatten session turns into `[{role, content}]` for reformulate_query /
+    the chat LLM. Returns the last `window` messages.
+    """
+    msgs: list[dict] = []
+    for turn in sess.get("turns", []):
+        q = turn.get("q")
+        a = turn.get("a")
+        if q:
+            msgs.append({"role": "user", "content": q})
+        if a:
+            msgs.append({"role": "assistant", "content": a})
+    return msgs[-window:]
+
+
+def last_session_id() -> str | None:
+    try:
+        sid = LAST_SESSION_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    return sid or None
+
+
+def _set_last_session(sid: str) -> None:
+    try:
+        LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_SESSION_FILE.write_text(sid, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def list_sessions(limit: int = 20) -> list[dict]:
+    """Return recent session summaries (newest first) — id, turn count, first question."""
+    if not SESSIONS_DIR.is_dir():
+        return []
+    out: list[dict] = []
+    for p in SESSIONS_DIR.glob("*.json"):
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        turns = s.get("turns", [])
+        first_q = next((t.get("q", "") for t in turns if t.get("q")), "")
+        out.append({
+            "id": s.get("id", p.stem),
+            "updated_at": s.get("updated_at", ""),
+            "created_at": s.get("created_at", ""),
+            "turns": len(turns),
+            "first_q": first_q[:80],
+            "mode": s.get("mode", ""),
+        })
+    out.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+    return out[:limit]
+
+
+def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
+    """Remove session files older than `ttl_days` by mtime. Returns count removed."""
+    if not SESSIONS_DIR.is_dir():
+        return 0
+    cutoff = time.time() - ttl_days * 86400
+    removed = 0
+    for p in SESSIONS_DIR.glob("*.json"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
 EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
 # Chat model preference: first available wins. command-r is RAG-trained +
 # citation-native, ideal for this use case. Fallbacks cover slower pulls.
@@ -1599,48 +1764,93 @@ def watch(debounce: float):
 @click.option("--raw", is_flag=True, help="Skip LLM — muestra chunks recuperados directo")
 @click.option("--loose", is_flag=True, help="Permite prosa externa del LLM (marcada con ⚠)")
 @click.option("--force", is_flag=True, help="Llamar al LLM incluso si la confianza del rerank es baja")
+@click.option("--session", "session_id", default=None,
+              help="ID de sesión (reanuda si existe, crea si no). Ej: 'tg:12345'.")
+@click.option("--continue", "continue_", is_flag=True,
+              help="Reanuda la última sesión usada (atajo a --session <última>)")
+@click.option("--plain", is_flag=True,
+              help="Salida plana sin colores/paneles/sources. Para consumo programático.")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
+    session_id: str | None, continue_: bool, plain: bool,
 ):
     """Consulta única contra las notas."""
     col = get_db()
     if col.count() == 0:
-        console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+        if plain:
+            click.echo("Índice vacío. Ejecuta: rag index")
+        else:
+            console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
+
+    # Session resolution: --continue picks up last_session_id unless --session
+    # is also given. If neither is present, we don't touch the session store.
+    sess: dict | None = None
+    if continue_ and not session_id:
+        session_id = last_session_id()
+    if session_id is not None or continue_:
+        sess = ensure_session(session_id, mode="query") if session_id else None
+    history = session_history(sess) if sess else None
+
+    # Reformulate standalone follow-ups when we have prior turns. Do this even
+    # outside --hyde/--precise because the whole point of --session is that the
+    # new question can be a pronoun-laden fragment.
+    effective_question = question
+    if history:
+        try:
+            effective_question = reformulate_query(question, history)
+        except Exception:
+            effective_question = question
 
     # Intent routing: aggregate/list/recent queries don't need the retrieval
     # pipeline + LLM — they want a metadata scan. Fall through to semantic
     # otherwise. User-supplied --folder/--tag override classifier params.
     known_tags, known_folders = get_vocabulary(col)
-    intent, intent_params = classify_intent(question, known_tags, known_folders)
+    intent, intent_params = classify_intent(effective_question, known_tags, known_folders)
     if intent != "semantic":
         if folder:
             intent_params["folder"] = folder
         if tag:
             intent_params["tag"] = tag
         params_str = ", ".join(f"{k}={v}" for k, v in intent_params.items() if v) or "sin filtros"
-        console.print()
+        if not plain:
+            console.print()
         if intent == "count":
             n, files = handle_count(col, intent_params)
-            console.print(
-                f"[bold green]{n}[/bold green] nota(s) [dim]({params_str})[/dim]"
-            )
-            if n and n <= 30:
-                render_file_list(f"notas", files)
+            if plain:
+                click.echo(f"{n} nota(s) ({params_str})")
+                for f in files[:30]:
+                    click.echo(f["file"])
+            else:
+                console.print(
+                    f"[bold green]{n}[/bold green] nota(s) [dim]({params_str})[/dim]"
+                )
+                if n and n <= 30:
+                    render_file_list(f"notas", files)
         elif intent == "list":
             files = handle_list(col, intent_params)
-            console.print(
-                f"[bold cyan]{len(files)}[/bold cyan] nota(s) [dim]({params_str})[/dim]"
-            )
-            render_file_list("notas", files)
+            if plain:
+                click.echo(f"{len(files)} nota(s) ({params_str})")
+                for f in files:
+                    click.echo(f["file"])
+            else:
+                console.print(
+                    f"[bold cyan]{len(files)}[/bold cyan] nota(s) [dim]({params_str})[/dim]"
+                )
+                render_file_list("notas", files)
         elif intent == "recent":
             files = handle_recent(col, intent_params)
-            console.print(
-                f"[bold cyan]{len(files)}[/bold cyan] nota(s) recientes [dim]({params_str})[/dim]"
-            )
-            render_file_list("últimas modificadas", files)
+            if plain:
+                click.echo(f"{len(files)} nota(s) recientes ({params_str})")
+                for f in files:
+                    click.echo(f["file"])
+            else:
+                console.print(
+                    f"[bold cyan]{len(files)}[/bold cyan] nota(s) recientes [dim]({params_str})[/dim]"
+                )
+                render_file_list("últimas modificadas", files)
         log_query_event({
             "cmd": "query", "q": question, "intent": intent, "params": intent_params,
             "count": len(files) if intent != "count" else n,
@@ -1648,11 +1858,17 @@ def query(
         return
 
     t_start = time.perf_counter()
-    with console.status("[dim]buscando…[/dim]", spinner="dots"):
+    if plain:
         result = retrieve(
-            col, question, k, folder, tag=tag, precise=hyde,
+            col, effective_question, k, folder, tag=tag, precise=hyde,
             multi_query=not no_multi, auto_filter=not no_auto_filter,
         )
+    else:
+        with console.status("[dim]buscando…[/dim]", spinner="dots"):
+            result = retrieve(
+                col, effective_question, k, folder, tag=tag, precise=hyde,
+                multi_query=not no_multi, auto_filter=not no_auto_filter,
+            )
     t_retrieve = time.perf_counter() - t_start
     if not result["docs"]:
         log_query_event({
@@ -1660,36 +1876,54 @@ def query(
             "variants": result.get("query_variants"), "paths": [],
             "top_score": None, "t_retrieve": round(t_retrieve, 2), "answered": False,
         })
-        console.print("[yellow]Sin resultados.[/yellow]")
+        if plain:
+            click.echo("Sin resultados.")
+        else:
+            console.print("[yellow]Sin resultados.[/yellow]")
         return
 
-    print_query_header(question, result)
+    if not plain:
+        print_query_header(question, result)
 
     if raw:
         # Skip LLM — dump retrieved chunks verbatim with their path.
-        console.print()
-        for d, m, s in zip(result["docs"], result["metas"], result["scores"]):
-            path = m.get("file", "")
-            note = m.get("note", "")
-            console.print(f"[bold cyan]{note}[/bold cyan] [dim]({path}) · {s:+.1f}[/dim]")
-            console.print(Markdown(d))
-            console.print(Rule(style="dim"))
-        print_sources(result)
-        render_related(find_related(col, result["metas"]))
+        if plain:
+            for d, m, s in zip(result["docs"], result["metas"], result["scores"]):
+                click.echo(f"{m.get('note','')} ({m.get('file','')}) · {s:+.1f}")
+                click.echo(d)
+                click.echo("---")
+        else:
+            console.print()
+            for d, m, s in zip(result["docs"], result["metas"], result["scores"]):
+                path = m.get("file", "")
+                note = m.get("note", "")
+                console.print(f"[bold cyan]{note}[/bold cyan] [dim]({path}) · {s:+.1f}[/dim]")
+                console.print(Markdown(d))
+                console.print(Rule(style="dim"))
+            print_sources(result)
+            render_related(find_related(col, result["metas"]))
         return
 
     # Gate LLM on reranker confidence. Negative top score ≈ rerank found
     # nothing relevant — skipping the LLM avoids hallucinated answers from
     # unrelated chunks. `--force` overrides.
     if result["confidence"] < CONFIDENCE_RERANK_MIN and not force:
-        console.print()
-        console.print(
-            f"[yellow]No tengo esa información en tus notas.[/yellow] "
-            f"[dim](top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
-            f"usá --force para llamar al LLM igual)[/dim]"
+        msg = (
+            f"No tengo esa información en tus notas. "
+            f"(top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
+            f"usá --force para llamar al LLM igual)"
         )
-        print_sources(result)
-        render_related(find_related(col, result["metas"]))
+        if plain:
+            click.echo(msg)
+        else:
+            console.print()
+            console.print(
+                f"[yellow]No tengo esa información en tus notas.[/yellow] "
+                f"[dim](top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
+                f"usá --force para llamar al LLM igual)[/dim]"
+            )
+            print_sources(result)
+            render_related(find_related(col, result["metas"]))
         log_query_event({
             "cmd": "query", "q": question,
             "filters": result.get("filters_applied"),
@@ -1700,6 +1934,16 @@ def query(
             "t_retrieve": round(t_retrieve, 2), "t_gen": 0.0,
             "answered": False, "gated_low_confidence": True,
         })
+        if sess is not None:
+            append_turn(sess, {
+                "q": question,
+                "q_reformulated": effective_question if effective_question != question else None,
+                "a": None,
+                "paths": [m.get("file", "") for m in result["metas"]],
+                "top_score": round(float(result["confidence"]), 3),
+                "gated": True,
+            })
+            save_session(sess)
         return
 
     context = "\n\n---\n\n".join(
@@ -1707,35 +1951,56 @@ def query(
         for d, m in zip(result["docs"], result["metas"])
     )
     rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
-    prompt = (
-        f"{rules}\n"
-        f"CONTEXTO:\n{context}\n\n"
-        f"PREGUNTA: {question}\n\nRESPUESTA:"
-    )
+    # When we have session history, build a chat-style prompt so the LLM sees
+    # the conversation context. Otherwise keep the one-shot prompt unchanged.
+    if history:
+        messages = (
+            [{"role": "system", "content": f"{rules}\nCONTEXTO:\n{context}"}]
+            + history
+            + [{"role": "user", "content": question}]
+        )
+    else:
+        messages = [{"role": "user", "content": f"{rules}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
 
     t_gen_start = time.perf_counter()
-    console.print()
     parts: list[str] = []
-    # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
-    # the answer forming. We render unstyled during the stream, then redraw
-    # with link/ext styling at the end.
-    from rich.live import Live
-    with Live("", console=console, refresh_per_second=12, transient=True) as live:
+    if plain:
+        # Stream tokens directly to stdout — no Rich overlays. Consumers (bots,
+        # scripts) see the answer forming in real time without ANSI cruft.
         for chunk in ollama.chat(
             model=resolve_chat_model(),
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             options=CHAT_OPTIONS,
             stream=True,
             keep_alive=OLLAMA_KEEP_ALIVE,
         ):
-            parts.append(chunk.message.content)
-            live.update(Text("".join(parts)))
+            tok = chunk.message.content
+            parts.append(tok)
+            click.echo(tok, nl=False)
+        click.echo("")
+    else:
+        console.print()
+        # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
+        # the answer forming. We render unstyled during the stream, then redraw
+        # with link/ext styling at the end.
+        from rich.live import Live
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            for chunk in ollama.chat(
+                model=resolve_chat_model(),
+                messages=messages,
+                options=CHAT_OPTIONS,
+                stream=True,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            ):
+                parts.append(chunk.message.content)
+                live.update(Text("".join(parts)))
     t_gen = time.perf_counter() - t_gen_start
     full = "".join(parts)
-    console.print(render_response(full))
+    if not plain:
+        console.print(render_response(full))
 
     bad = verify_citations(full, result["metas"])
-    if bad:
+    if bad and not plain:
         console.print()
         console.print("[bold red]⚠ Citas no verificadas:[/bold red]")
         for label, path in bad:
@@ -1744,6 +2009,8 @@ def query(
     log_query_event({
         "cmd": "query",
         "q": question,
+        "q_reformulated": effective_question if effective_question != question else None,
+        "session": sess["id"] if sess else None,
         "filters": result.get("filters_applied"),
         "variants": result.get("query_variants"),
         "paths": [m.get("file", "") for m in result["metas"]],
@@ -1754,10 +2021,22 @@ def query(
         "answer_len": len(full),
         "bad_citations": [p for _, p in bad],
         "mode": "raw" if raw else ("loose" if loose else "strict"),
+        "plain": plain,
     })
 
-    print_sources(result)
-    render_related(find_related(col, result["metas"]))
+    if sess is not None:
+        append_turn(sess, {
+            "q": question,
+            "q_reformulated": effective_question if effective_question != question else None,
+            "a": full,
+            "paths": [m.get("file", "") for m in result["metas"]],
+            "top_score": round(float(result["confidence"]), 3),
+        })
+        save_session(sess)
+
+    if not plain:
+        print_sources(result)
+        render_related(find_related(col, result["metas"]))
 
 
 @cli.command()
@@ -1767,15 +2046,28 @@ def query(
 @click.option("--precise", is_flag=True, help="HyDE + reformulación (más preciso, ~5s extra)")
 @click.option("--no-multi", is_flag=True, help="Desactiva multi-query expansion")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
+@click.option("--session", "session_id", default=None,
+              help="ID de sesión (reanuda si existe, crea si no). Admite 'tg:<chat_id>' etc.")
+@click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
 def chat(
     k: int, folder: str | None, tag: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
+    session_id: str | None, resume: bool,
 ):
     """Chat interactivo con tus notas."""
     col = get_db()
     if col.count() == 0:
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
+
+    # Resolve session: --resume takes last used id; --session takes explicit id;
+    # otherwise a fresh id is minted. ensure_session is idempotent on both paths.
+    if resume and not session_id:
+        session_id = last_session_id()
+        if not session_id:
+            console.print("[yellow]No hay sesión previa para reanudar. Creando una nueva.[/yellow]")
+    sess = ensure_session(session_id, mode="chat")
+    resumed = bool(sess["turns"])
 
     flags = []
     if folder:
@@ -1795,16 +2087,26 @@ def chat(
         subtitle += f" · {' · '.join(flags)}"
     subtitle += "[/dim]"
 
+    session_line = (
+        f"[dim]· sesión: [cyan]{sess['id']}[/cyan]"
+        f"{' · reanudada (' + str(len(sess['turns'])) + ' turnos)' if resumed else ' · nueva'}[/dim]"
+    )
+
     console.print(Panel(
-        f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
+        f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
         "[dim]/save [título] guarda última respuesta · /exit o Ctrl+C para salir[/dim]",
         border_style="green",
     ))
 
-    history: list[dict] = []
+    history: list[dict] = session_history(sess, window=SESSION_HISTORY_WINDOW)
     last_assistant = ""
     last_question = ""
     last_sources: list[dict] = []
+    # If resuming, seed last_* from final turn so `/save` works immediately.
+    if sess["turns"]:
+        final = sess["turns"][-1]
+        last_assistant = final.get("a", "") or ""
+        last_question = final.get("q", "") or ""
     first_turn = True
     while True:
         try:
@@ -1872,9 +2174,19 @@ def chat(
         full = "".join(parts)
         console.print(render_response(full))
         history.append({"role": "assistant", "content": full})
+        history = history[-SESSION_HISTORY_WINDOW:]
         last_assistant = full
         last_question = question
         last_sources = list(result["metas"])
+
+        append_turn(sess, {
+            "q": question,
+            "a": full,
+            "paths": [m.get("file", "") for m in result["metas"]],
+            "top_score": round(float(result["confidence"]), 3),
+        })
+        save_session(sess)
+
         print_sources(result)
         render_related(find_related(col, result["metas"]))
 
@@ -2689,6 +3001,93 @@ def stats():
     console.print(f"[cyan]Helper model:[/cyan] {HELPER_MODEL}")
     console.print(f"[cyan]Reranker:[/cyan] {RERANKER_MODEL}")
     console.print(f"[cyan]Pipeline:[/cyan] HyDE + BM25 + RRF + cross-encoder rerank")
+
+
+@cli.group()
+def session():
+    """Administrar sesiones conversacionales (list / show / clear / cleanup)."""
+
+
+@session.command("list")
+@click.option("-n", "limit", default=20, help="Máximo de sesiones a listar (default: 20)")
+def session_list(limit: int):
+    """Lista las sesiones recientes."""
+    rows = list_sessions(limit=limit)
+    if not rows:
+        console.print("[dim]No hay sesiones.[/dim]")
+        return
+    t = Table(title=f"Sesiones ({len(rows)})", show_header=True, header_style="bold")
+    t.add_column("id", style="cyan")
+    t.add_column("turns", justify="right")
+    t.add_column("modo", style="dim")
+    t.add_column("actualizada", style="dim")
+    t.add_column("primer turno")
+    for r in rows:
+        t.add_row(
+            r["id"], str(r["turns"]), r.get("mode", ""),
+            r.get("updated_at", ""), r.get("first_q", ""),
+        )
+    console.print(t)
+
+
+@session.command("show")
+@click.argument("sid")
+def session_show(sid: str):
+    """Muestra los turnos de una sesión."""
+    s = load_session(sid)
+    if not s:
+        console.print(f"[red]Sesión no encontrada: {sid}[/red]")
+        return
+    console.print(Panel(
+        f"[bold cyan]{s['id']}[/bold cyan]  [dim]· {len(s.get('turns', []))} turnos · "
+        f"{s.get('mode', '')}  · creada {s.get('created_at', '')}[/dim]",
+        border_style="cyan",
+    ))
+    for i, turn in enumerate(s.get("turns", []), 1):
+        console.print()
+        console.print(f"[bold]{i}. ❯[/bold] {turn.get('q', '')}")
+        if turn.get("q_reformulated"):
+            console.print(f"   [dim italic]reformulada: {turn['q_reformulated']}[/dim italic]")
+        if turn.get("a"):
+            console.print(render_response(turn["a"]))
+        paths = turn.get("paths") or []
+        if paths:
+            console.print(f"   [dim]sources: {', '.join(paths[:3])}{'…' if len(paths) > 3 else ''}[/dim]")
+
+
+@session.command("clear")
+@click.argument("sid")
+@click.option("--yes", is_flag=True, help="No pedir confirmación")
+def session_clear(sid: str, yes: bool):
+    """Borra una sesión por id."""
+    try:
+        p = session_path(sid)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    if not p.exists():
+        console.print(f"[yellow]No existe:[/yellow] {sid}")
+        return
+    if not yes:
+        try:
+            confirm = console.input(f"Borrar sesión [cyan]{sid}[/cyan]? [y/N] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("[dim]cancelado[/dim]")
+            return
+        if confirm != "y":
+            console.print("[dim]cancelado[/dim]")
+            return
+    p.unlink()
+    console.print(f"[green]✓ borrada:[/green] {sid}")
+
+
+@session.command("cleanup")
+@click.option("--days", default=SESSION_TTL_DAYS, show_default=True,
+              help="Borrar sesiones más viejas que N días (mtime)")
+def session_cleanup(days: int):
+    """Purga sesiones viejas."""
+    removed = cleanup_sessions(ttl_days=days)
+    console.print(f"[cyan]{removed}[/cyan] sesión(es) borrada(s) (TTL {days}d)")
 
 
 if __name__ == "__main__":

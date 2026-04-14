@@ -34,6 +34,7 @@ def rag_query(
     folder: str | None = None,
     tag: str | None = None,
     multi_query: bool = True,
+    session_id: str | None = None,
 ) -> list[dict]:
     """Retrieve the most relevant chunks from the Obsidian vault.
 
@@ -47,13 +48,28 @@ def rag_query(
         folder: Optional folder filter, e.g. "02-Areas/Coaching".
         tag: Optional tag filter (no '#' prefix), e.g. "coaching".
         multi_query: Expand query into 3 paraphrases for better recall.
+        session_id: Optional persistent conversation id. When set, prior turns
+            on the same id are used to reformulate follow-ups (so "profundizá"
+            or pronoun-laden fragments become standalone queries), and this
+            turn is appended to the session history. Accepts any short
+            identifier matching [A-Za-z0-9_.:-]{1,64} (e.g. "tg:123", "mcp-x").
     """
     col = rag.get_db()
     if col.count() == 0:
         return []
     k = max(1, min(k, 15))
+
+    sess = rag.ensure_session(session_id, mode="mcp") if session_id else None
+    history = rag.session_history(sess) if sess else None
+    effective_question = question
+    if history:
+        try:
+            effective_question = rag.reformulate_query(question, history)
+        except Exception:
+            effective_question = question
+
     result = rag.retrieve(
-        col, question, k, folder,
+        col, effective_question, k, folder,
         tag=tag, precise=False, multi_query=multi_query, auto_filter=True,
     )
     out = []
@@ -66,6 +82,21 @@ def rag_query(
             "score": round(float(score), 2),
             "content": doc,
         })
+
+    if sess is not None:
+        # MCP side: we don't have the final Claude answer (Claude is what's
+        # calling us). Persist the user turn + retrieved paths; Claude's reply
+        # is outside our visibility. Follow-up turns can still reformulate
+        # against the question history even without the answers.
+        rag.append_turn(sess, {
+            "q": question,
+            "q_reformulated": effective_question if effective_question != question else None,
+            "a": None,
+            "paths": [m.get("file", "") for m in result["metas"]],
+            "top_score": round(float(result["confidence"]), 3) if result.get("confidence") is not None else None,
+        })
+        rag.save_session(sess)
+
     return out
 
 

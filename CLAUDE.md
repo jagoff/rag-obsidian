@@ -107,6 +107,26 @@ Empirical finding that informed defaults: **HyDE with qwen2.5:3b drops hit@5 fro
 
 `rag query` and `rag chat` log to `~/.local/share/obsidian-rag/queries.jsonl` — one line per turn with `q`, `variants`, `paths`, `scores`, `top_score`, `t_retrieve`, `t_gen`, `bad_citations`, `mode`. `rag log` tails it. Use `--low-confidence` to surface queries the reranker wasn't sure about — those are usually prompts to write a new note in the vault.
 
+## Conversational sessions
+
+Multi-turn state shared across `rag chat`, `rag query`, the MCP server, and the Telegram bots — follow-ups like "profundizá" or "y el otro" resolve against prior turns.
+
+Storage: one JSON per session at `~/.local/share/obsidian-rag/sessions/<id>.json`, plus a `last_session` pointer for `--continue` / `--resume`. Schema: `{id, created_at, updated_at, mode, turns: [{ts, q, q_reformulated?, a, paths, top_score}]}`. Writes are atomic (tmp + replace). TTL 30 days (`SESSION_TTL_DAYS`), cap 50 turns per session (`SESSION_MAX_TURNS`, oldest dropped), history window 6 messages (`SESSION_HISTORY_WINDOW`) fed to the helper.
+
+Ids are opaque strings; callers can supply their own — the Telegram bots pass `tg:<chat_id>` so each chat keeps its thread. Validated against `SESSION_ID_RE = ^[A-Za-z0-9_.:-]{1,64}$`; an invalid id silently mints a fresh one rather than raising.
+
+Surfaces:
+- `rag chat --session <id> | --resume`
+- `rag query --session <id> | --continue` (plus `--plain` for bot-friendly output)
+- MCP `rag_query(session_id=...)`
+- Telegram `/rag <query>` in both bots passes `tg:<chat_id>` via `--session`
+
+Semantics: when `session_history()` returns anything, the helper rewrites the incoming query (`reformulate_query`) to absorb antecedents before retrieval — orthogonal to `--precise`. The rewrite is stored as `q_reformulated` on the turn.
+
+Admin: `rag session list | show <id> | clear <id> | cleanup` (cleanup drops files older than TTL by mtime).
+
+Tests: `tests/test_sessions.py` covers the module end-to-end — monkeypatches `SESSIONS_DIR` / `LAST_SESSION_FILE` to `tmp_path`. Run with `.venv/bin/python -m pytest` (pytest is in `[project.optional-dependencies].dev`).
+
 ## Vault path
 
 Hardcoded to `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes` (iCloud). If running against a different vault, change `VAULT_PATH` at the top of `rag.py` and run `rag index --reset`.

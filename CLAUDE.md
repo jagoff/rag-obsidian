@@ -44,6 +44,11 @@ rag links --rebuild                # backfill the URL sub-index from existing no
 rag wikilinks suggest                       # dry-run for whole vault
 rag wikilinks suggest --folder X --apply    # write [[wikilinks]] for unlinked title mentions
 
+# Daily productivity
+rag dupes [--threshold 0.85] [--folder X]   # pairs of notes with similar centroids
+rag inbox [--apply]                         # triage 00-Inbox: folder + tags + wikilinks + dupes
+rag prep "tema o persona" [--save]          # context brief from vault, optionally saved to 00-Inbox/
+
 # Quality + observability
 rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
 rag log [-n 20] [--low-confidence]
@@ -125,6 +130,28 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 ### Agent mode (`rag do`)
 
 `rag do "instrucción"` runs a tool-calling loop with command-r. Tools exposed: `_agent_tool_search` (calls `retrieve()`), `_agent_tool_read_note`, `_agent_tool_list_notes`, `_agent_tool_propose_write`. Writes are NOT applied during the loop — they accumulate in `_AGENT_PENDING_WRITES` and the user confirms each at the end (skip with `--yes`, cap iterations with `--max-iterations`, default 8). No delete/move tools by design — first version is conservative.
+
+### Daily-productivity layer
+
+Three commands that compose the lower-level primitives into routines that have an obvious "moment" in the user's day.
+
+**`rag dupes`** — surfaces pairs of notes with high centroid cosine similarity (mean of chunk embeddings). Pure local: numpy pairwise over the main collection (`_note_centroids` builds the matrix, `find_duplicate_notes` runs `arr @ arr.T` and masks the upper triangle). No LLM. Real-vault baseline: 521 notes finishes in <1s. Threshold 0.85 default; song-draft iterations and old-notes refactors surface immediately. The lower-threshold cousin `find_near_duplicates_for(col, path)` is what the inbox triage uses to flag "this incoming note may already exist."
+
+**`rag inbox`** — triage every note in `00-Inbox/` (configurable). Per note, composes:
+- `_suggest_folder_for_note` — semantic neighbours of the note's body, mode of their folders (excluding `00-` Inbox-style prefixes so we recommend a real home).
+- `_suggest_tags_for_note` — the helper LLM picks tags from the existing vault vocabulary (extracted from `rag autotag`'s logic into a shared helper). NEVER invents new tags.
+- `find_wikilink_suggestions` — graph densification on the incoming note.
+- `find_near_duplicates_for` — flags possible duplicates above 0.85 cosine.
+
+Without `--apply` it prints the plan; with `--apply` it moves the file (when folder confidence ≥ `--folder-min-conf`, default 0.4), rewrites the frontmatter `tags:` block via `_apply_frontmatter_tags` (preserves the rest of the YAML), applies the wikilinks, and re-indexes the new path. Skipped: confidence below threshold = no move; existing destination = no overwrite. The triage helpers are individually testable; tests cover folder/tag suggestion, frontmatter rewrite (including malformed YAML rejection), and end-to-end composition.
+
+**`rag prep`** — context brief for an upcoming meeting / topic / project. Pipeline:
+1. `retrieve(topic, k=8)` — main pool.
+2. `find_related(top_metas)` — graph neighbours.
+3. `find_urls(topic, k=5)` — bookmarks/refs scoped to the topic.
+4. command-r drafts a Markdown brief in 1ra persona with fixed sections (Resumen ejecutivo / Background / Threads abiertos / Preguntas para explorar / URLs y fuentes), 350-550 words, citing notes with `[[wikilinks]]`.
+
+`--save` writes the brief to `00-Inbox/YYYY-MM-DD-prep-<slug>.md` with frontmatter `{type: prep, topic, tags: [prep], sources: [[[note], ...]]}` and re-indexes so the brief itself becomes part of the corpus. v1 is vault-only; Gmail/Calendar integration is out of scope until the Python side gets Google API credentials.
 
 ### Wikilink density (`rag wikilinks suggest`)
 

@@ -1656,6 +1656,297 @@ def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
     return applied
 
 
+# ── DUPLICATE DETECTION ──────────────────────────────────────────────────────
+# Pairwise cosine over per-note centroid embeddings (mean of the note's chunks
+# in the main collection). Numpy for the O(N²/2) sweep — ~500 notes finishes
+# in well under a second. A "centroid" is a coarse fingerprint, intentional:
+# we want to surface notes that broadly cover the same topic, not just
+# notes that share a single phrase.
+
+def _note_centroids(
+    col: chromadb.Collection,
+    folder: str | None = None,
+) -> tuple[list[str], list[dict], "np.ndarray"]:
+    """Group all chunks by file, average the embeddings, L2-normalise.
+
+    Returns (file_paths, first_meta_per_file, centroids_matrix). Files with
+    zero chunks (shouldn't happen) are skipped silently.
+    """
+    import numpy as np
+    data = col.get(include=["embeddings", "metadatas"])
+    by_file: dict[str, dict] = {}
+    for emb, meta in zip(data["embeddings"], data["metadatas"]):
+        f = meta.get("file", "")
+        if not f:
+            continue
+        if folder and not (f == folder or f.startswith(folder.rstrip("/") + "/")):
+            continue
+        if f not in by_file:
+            by_file[f] = {"embeds": [], "meta": meta}
+        by_file[f]["embeds"].append(emb)
+    files = sorted(by_file.keys())
+    if not files:
+        return [], [], np.zeros((0, 0), dtype="float32")
+    arr = np.stack([
+        np.mean(np.asarray(by_file[f]["embeds"], dtype="float32"), axis=0)
+        for f in files
+    ])
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    arr = arr / norms
+    metas = [by_file[f]["meta"] for f in files]
+    return files, metas, arr
+
+
+def find_duplicate_notes(
+    col: chromadb.Collection,
+    threshold: float = 0.85,
+    folder: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Pairs of notes with centroid cosine ≥ threshold.
+
+    Returns descending-by-similarity list of
+    {a_path, a_note, b_path, b_note, similarity, snippet_a, snippet_b}.
+    The snippets are the first ~200 chars of each note's body for at-a-glance
+    comparison in the renderer.
+    """
+    import numpy as np
+    files, metas, arr = _note_centroids(col, folder)
+    if len(files) < 2:
+        return []
+    sims = arr @ arr.T
+    # Ignore self and lower triangle: only count each pair once. We mask via
+    # boolean — overwriting `sims` with `np.triu(sims, k=1)` would zero out
+    # the lower triangle, which a threshold of <= 0 would then accept as a
+    # spurious "match".
+    mask = np.triu(np.ones_like(sims, dtype=bool), k=1)
+    rows, cols = np.where(mask & (sims >= threshold))
+    pairs: list[dict] = []
+    for r, c in zip(rows, cols):
+        a, b = files[int(r)], files[int(c)]
+        pa = (VAULT_PATH / a)
+        pb = (VAULT_PATH / b)
+        snip_a = pa.read_text(encoding="utf-8", errors="ignore")[:200] if pa.is_file() else ""
+        snip_b = pb.read_text(encoding="utf-8", errors="ignore")[:200] if pb.is_file() else ""
+        pairs.append({
+            "a_path": a,
+            "b_path": b,
+            "a_note": metas[int(r)].get("note", ""),
+            "b_note": metas[int(c)].get("note", ""),
+            "similarity": round(float(sims[r, c]), 3),
+            "snippet_a": re.sub(r"\s+", " ", snip_a).strip(),
+            "snippet_b": re.sub(r"\s+", " ", snip_b).strip(),
+        })
+    pairs.sort(key=lambda p: -p["similarity"])
+    return pairs[:limit]
+
+
+def _suggest_tags_for_note(
+    col: chromadb.Collection,
+    body: str,
+    note_title: str,
+    max_tags: int = 6,
+) -> list[str]:
+    """Pure helper: ask the helper LLM to pick tags from existing vault vocab.
+    Returns picked list (may be empty). Shared by `rag autotag` and `rag inbox`.
+    """
+    c = _load_corpus(col)
+    vocab = sorted(c["tags"])
+    if not vocab or not body.strip():
+        return []
+    prompt = (
+        "Sos un asistente que etiqueta notas personales. Elegí entre 3 y "
+        f"{max_tags} tags DEL VOCABULARIO EXISTENTE que mejor describan esta "
+        "nota. NO inventes tags nuevos. Devolvé SOLO una lista YAML de "
+        "strings, sin explicación.\n\n"
+        f"VOCABULARIO ({len(vocab)} tags): {', '.join(vocab)}\n\n"
+        f"TÍTULO: {note_title}\n\n"
+        f"CONTENIDO:\n{body}\n\n"
+        "TAGS:"
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=HELPER_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        answer = resp.message.content.strip()
+    except Exception:
+        return []
+    vocab_set = {t.lower() for t in vocab}
+    picked: list[str] = []
+    for line in answer.splitlines():
+        line = line.strip().strip("-*[]").strip().strip(",").strip("'\"")
+        if not line:
+            continue
+        for tok in re.split(r"[,\s]+", line):
+            tok = tok.strip("#'\"").lower()
+            if tok in vocab_set and tok not in picked:
+                picked.append(tok)
+        if len(picked) >= max_tags:
+            break
+    return picked
+
+
+def _apply_frontmatter_tags(note_path: Path, merged_tags: list[str]) -> bool:
+    """Rewrite the note's frontmatter `tags:` block to `merged_tags`.
+    Preserves the rest of the YAML verbatim. Returns True on success.
+    """
+    if not note_path.is_file():
+        return False
+    raw = note_path.read_text(encoding="utf-8", errors="ignore")
+    if raw.startswith("---\n"):
+        end = raw.find("\n---\n", 4)
+        if end < 0:
+            return False
+        fm_text = raw[4:end]
+        rest = raw[end + 5:]
+        new_fm_lines: list[str] = []
+        in_tag_block = False
+        for line in fm_text.splitlines():
+            if in_tag_block and re.match(r"^\s*-\s+", line):
+                continue
+            in_tag_block = False
+            if re.match(r"^tags\s*:", line):
+                in_tag_block = True
+                continue
+            new_fm_lines.append(line)
+        new_fm_lines.append("tags:")
+        for t in merged_tags:
+            new_fm_lines.append(f"- {t}")
+        new_raw = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + rest
+    else:
+        fm_block = (
+            "---\ntags:\n" + "\n".join(f"- {t}" for t in merged_tags) + "\n---\n\n"
+        )
+        new_raw = fm_block + raw
+    note_path.write_text(new_raw, encoding="utf-8")
+    return True
+
+
+def _suggest_folder_for_note(
+    col: chromadb.Collection,
+    note_path: str,
+    k: int = 8,
+    skip_folder_prefix: str = "00-",
+) -> tuple[str, float]:
+    """Propose a destination folder by mode of folders among the K most
+    semantically similar OTHER notes. Excludes Inbox-style folders (any path
+    starting with `skip_folder_prefix`) so we recommend a real home, not "stay
+    where you are".
+
+    Returns (folder, confidence) where confidence is the share of neighbors
+    that voted for the winner. ("", 0.0) if nothing usable.
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return ("", 0.0)
+    if not full.is_file():
+        return ("", 0.0)
+    raw = full.read_text(encoding="utf-8", errors="ignore")
+    text = clean_md(raw)[:3000].strip()
+    if not text or col.count() == 0:
+        return ("", 0.0)
+    try:
+        q_embed = embed([text])[0]
+    except Exception:
+        return ("", 0.0)
+    n = min(k * 4, col.count())
+    res = col.query(
+        query_embeddings=[q_embed], n_results=n, include=["metadatas"],
+    )
+    folders: list[str] = []
+    for m in res["metadatas"][0]:
+        if m.get("file") == note_path:
+            continue
+        f = m.get("folder") or ""
+        if not f or f.startswith(skip_folder_prefix):
+            continue
+        folders.append(f)
+        if len(folders) >= k:
+            break
+    if not folders:
+        return ("", 0.0)
+    from collections import Counter
+    best, count = Counter(folders).most_common(1)[0]
+    return (best, round(count / len(folders), 3))
+
+
+def triage_inbox_note(
+    col: chromadb.Collection,
+    note_path: str,
+    max_tags: int = 5,
+    dupe_threshold: float = 0.85,
+) -> dict:
+    """Compose all triage signals for one Inbox note: destination folder, tags
+    from vocabulary, wikilink suggestions, near-duplicate flags. Returns a
+    plain dict the CLI renderer + the eventual `--apply` path consume.
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    if not full.is_file():
+        return {"path": note_path, "error": "not found"}
+    raw = full.read_text(encoding="utf-8", errors="ignore")
+    fm = parse_frontmatter(raw)
+    current_tags = [str(t) for t in (fm.get("tags") or []) if t]
+    body = clean_md(raw)[:3000]
+    folder, fconf = _suggest_folder_for_note(col, note_path)
+    tags = _suggest_tags_for_note(col, body, full.stem, max_tags=max_tags)
+    new_tags = [t for t in tags if t not in current_tags]
+    wikilinks = find_wikilink_suggestions(col, note_path, max_per_note=10)
+    dupes = find_near_duplicates_for(
+        col, note_path, threshold=dupe_threshold, limit=3,
+    )
+    return {
+        "path": note_path,
+        "current_folder": str(full.parent.relative_to(VAULT_PATH)),
+        "folder_suggested": folder,
+        "folder_confidence": fconf,
+        "tags_current": current_tags,
+        "tags_suggested": tags,
+        "tags_new": new_tags,
+        "wikilinks": wikilinks,
+        "duplicates": dupes,
+    }
+
+
+def find_near_duplicates_for(
+    col: chromadb.Collection,
+    note_path: str,
+    threshold: float = 0.80,
+    limit: int = 5,
+) -> list[dict]:
+    """Notes whose centroid is most similar to `note_path`'s centroid.
+
+    Used by inbox triage to flag "this incoming note may already exist".
+    Lower default threshold than `find_duplicate_notes` so partial overlaps
+    surface as warnings rather than be silently missed.
+    """
+    import numpy as np
+    files, metas, arr = _note_centroids(col)
+    if note_path not in files:
+        return []
+    idx = files.index(note_path)
+    sims = arr @ arr[idx]
+    out: list[dict] = []
+    for i, s in enumerate(sims):
+        if i == idx:
+            continue
+        s = float(s)
+        if s < threshold:
+            continue
+        out.append({
+            "path": files[i],
+            "note": metas[i].get("note", ""),
+            "similarity": round(s, 3),
+        })
+    out.sort(key=lambda r: -r["similarity"])
+    return out[:limit]
+
+
 def find_contradictions(
     col: chromadb.Collection,
     question: str,
@@ -4449,6 +4740,356 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         "folder": folder, "tag": tag,
         "top_url": items[0]["url"] if items else None,
     })
+
+
+@cli.command()
+@click.option("--threshold", default=0.85, show_default=True,
+              help="Cosine mínimo para considerar duplicado (sobre centroides)")
+@click.option("--folder", default=None, help="Acotar a este folder")
+@click.option("--limit", default=50, show_default=True,
+              help="Top N pares a mostrar")
+@click.option("--plain", is_flag=True, help="Salida plana sin colores")
+def dupes(threshold: float, folder: str | None, limit: int, plain: bool):
+    """Buscar pares de notas potencialmente duplicadas (centroides similares)."""
+    pairs = find_duplicate_notes(col=get_db(), threshold=threshold, folder=folder, limit=limit)
+    if not pairs:
+        msg = f"Sin pares con cosine ≥ {threshold}."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    if plain:
+        for p in pairs:
+            click.echo(f"{p['similarity']:.2f}  {p['a_path']}  ↔  {p['b_path']}")
+        return
+    console.print()
+    console.print(Rule(
+        title=f"[bold yellow]🔁 {len(pairs)} par(es) sospechoso(s) (cosine ≥ {threshold})[/bold yellow]",
+        style="yellow",
+    ))
+    for p in pairs:
+        console.print()
+        console.print(
+            f"[bold]{p['similarity']:.3f}[/bold]  "
+            f"[magenta]{p['a_note']}[/magenta] "
+            f"[dim]({p['a_path']})[/dim]"
+        )
+        console.print(
+            f"      ↔  [magenta]{p['b_note']}[/magenta] "
+            f"[dim]({p['b_path']})[/dim]"
+        )
+        if p.get("snippet_a"):
+            console.print(f"      [dim]A:[/dim] [dim italic]{p['snippet_a'][:140]}[/dim italic]")
+        if p.get("snippet_b"):
+            console.print(f"      [dim]B:[/dim] [dim italic]{p['snippet_b'][:140]}[/dim italic]")
+    log_query_event({
+        "cmd": "dupes", "threshold": threshold, "folder": folder,
+        "n_pairs": len(pairs),
+    })
+
+
+@cli.command()
+@click.option("--folder", default="00-Inbox", show_default=True,
+              help="Folder de Inbox a triar")
+@click.option("--apply", is_flag=True,
+              help="Mover + taggear + linkificar (default = dry-run)")
+@click.option("--max-tags", default=5, show_default=True)
+@click.option("--limit", default=20, show_default=True,
+              help="Máximo de notas a procesar por corrida")
+@click.option("--folder-min-conf", default=0.4, show_default=True,
+              help="Confianza mínima para mover (--apply)")
+@click.option("--no-folder", is_flag=True, help="No sugerir destino")
+@click.option("--no-tags", is_flag=True, help="No sugerir tags")
+@click.option("--no-wikilinks", is_flag=True, help="No sugerir wikilinks")
+def inbox(folder: str, apply: bool, max_tags: int, limit: int,
+          folder_min_conf: float, no_folder: bool, no_tags: bool,
+          no_wikilinks: bool):
+    """Triar notas de Inbox: sugerir destino + tags + wikilinks + duplicados.
+
+    Compone retrieve (vecino semántico para folder), autotag, find_wikilink_
+    suggestions y find_near_duplicates_for. Con --apply mueve cada nota a su
+    destino sugerido (si la confianza supera --folder-min-conf), agrega los
+    tags nuevos al frontmatter, aplica los wikilinks y re-indexa.
+    """
+    inbox_dir = VAULT_PATH / folder
+    if not inbox_dir.is_dir():
+        console.print(f"[red]No existe el folder:[/red] {inbox_dir}")
+        return
+    notes = sorted(inbox_dir.glob("*.md"))[:limit]
+    if not notes:
+        console.print(f"[yellow]Sin notas en {folder}.[/yellow]")
+        return
+
+    col = get_db()
+    moved = 0
+    tagged = 0
+    linkified = 0
+    flagged_dupes = 0
+    for path in notes:
+        rel = str(path.relative_to(VAULT_PATH))
+        try:
+            t = triage_inbox_note(col, rel, max_tags=max_tags)
+        except Exception as e:
+            console.print(f"[red]Error en {rel}: {e}[/red]")
+            continue
+
+        console.print()
+        console.print(Rule(style="dim", characters="╌"))
+        console.print(f"[bold cyan]{rel}[/bold cyan]")
+
+        if not no_folder and t.get("folder_suggested"):
+            conf = t["folder_confidence"]
+            color = "green" if conf >= folder_min_conf else "yellow"
+            console.print(
+                f"  📁 destino: [{color}]{t['folder_suggested']}[/{color}] "
+                f"[dim]({conf:.2f} conf)[/dim]"
+            )
+        if not no_tags and t.get("tags_new"):
+            console.print(
+                f"  🏷  tags nuevos: [yellow]{', '.join(t['tags_new'])}[/yellow] "
+                f"[dim](actuales: {', '.join(t['tags_current']) or '—'})[/dim]"
+            )
+        if not no_wikilinks and t.get("wikilinks"):
+            wl_titles = [w["title"] for w in t["wikilinks"][:6]]
+            extra = len(t["wikilinks"]) - len(wl_titles)
+            extras_str = f" [dim]+{extra} más[/dim]" if extra > 0 else ""
+            console.print(
+                f"  🔗 wikilinks: [magenta]{', '.join(wl_titles)}[/magenta]{extras_str}"
+            )
+        for d in (t.get("duplicates") or []):
+            flagged_dupes += 1
+            console.print(
+                f"  ⚠  posible duplicado: [red]{d['note']}[/red] "
+                f"[dim]({d['path']}, sim {d['similarity']})[/dim]"
+            )
+
+        if not apply:
+            continue
+
+        # Apply: move (only if confidence ≥ min), tag, linkify, reindex.
+        target_path = path
+        if not no_folder and t.get("folder_suggested") and t["folder_confidence"] >= folder_min_conf:
+            target_dir = VAULT_PATH / t["folder_suggested"]
+            target_dir.mkdir(parents=True, exist_ok=True)
+            candidate = target_dir / path.name
+            if candidate.exists():
+                console.print(f"  [red]✗ destino ya existe, no muevo[/red]")
+            else:
+                import shutil
+                shutil.move(str(path), str(candidate))
+                # Drop chunks of the old path; the new path will be added below.
+                _index_single_file(col, path, skip_contradict=True)
+                target_path = candidate
+                moved += 1
+                console.print(
+                    f"  [green]✓ movido a {target_path.relative_to(VAULT_PATH)}[/green]"
+                )
+
+        if not no_tags and t.get("tags_new"):
+            merged = list(dict.fromkeys([*t["tags_current"], *t["tags_new"]]))[:max_tags]
+            if _apply_frontmatter_tags(target_path, merged):
+                tagged += 1
+                console.print("  [green]✓ tags actualizados[/green]")
+
+        if not no_wikilinks:
+            # Recompute against the (possibly new) path; the file content may
+            # have shifted offsets after the tag-write above.
+            new_rel = str(target_path.relative_to(VAULT_PATH))
+            fresh = find_wikilink_suggestions(col, new_rel, max_per_note=10)
+            if fresh:
+                n = apply_wikilink_suggestions(new_rel, fresh)
+                if n:
+                    linkified += 1
+                    console.print(f"  [green]✓ {n} wikilinks aplicados[/green]")
+
+        # Final reindex picks up moved path + tag/wikilink edits in one pass.
+        try:
+            _index_single_file(col, target_path, skip_contradict=True)
+        except Exception:
+            pass
+
+    console.print()
+    if apply:
+        console.print(
+            f"[green]✓ Triaje aplicado:[/green] "
+            f"{moved} movidas · {tagged} tags actualizados · "
+            f"{linkified} con wikilinks · {flagged_dupes} dupes flaggeados"
+        )
+    else:
+        console.print(
+            f"[cyan]Plan generado para {len(notes)} nota(s).[/cyan] "
+            f"[dim]Re-correr con --apply para ejecutar.[/dim]"
+        )
+
+
+def _slug(text: str, maxlen: int = 50) -> str:
+    """Slugify for filenames: lowercase, alphanum + hyphens, capped."""
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s[:maxlen] or "topic"
+
+
+@cli.command()
+@click.argument("topic")
+@click.option("-k", default=8, show_default=True,
+              help="Chunks de contexto principal a recuperar")
+@click.option("--folder", default=None,
+              help="Limitar el contexto a este folder (e.g., '02-Areas/Coaching')")
+@click.option("--save", is_flag=True,
+              help="Guardar el brief en 00-Inbox/ y auto-indexar")
+@click.option("--no-urls", is_flag=True, help="Saltear URLs")
+@click.option("--no-related", is_flag=True, help="Saltear notas relacionadas (graph)")
+@click.option("--plain", is_flag=True,
+              help="Salida plana sin colores/streaming overlay")
+def prep(topic: str, k: int, folder: str | None, save: bool,
+         no_urls: bool, no_related: bool, plain: bool):
+    """Preparar un brief de contexto sobre una persona / proyecto / tema.
+
+    Compone retrieve + find_related + find_urls y le pide a command-r que
+    arme un brief estructurado en 1ra persona (background, threads abiertos,
+    preguntas para explorar, URLs). Sin --save imprime al terminal; con
+    --save escribe `00-Inbox/YYYY-MM-DD-prep-<slug>.md` y lo indexa.
+    """
+    col = get_db()
+    if col.count() == 0:
+        msg = "Índice vacío. Ejecuta: rag index"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    # 1. Main retrieval — direct topic search.
+    main = retrieve(
+        col, topic, k=k, folder=folder, tag=None,
+        precise=False, multi_query=True, auto_filter=True,
+    )
+    sources_main = main["metas"]
+    if not sources_main:
+        msg = f"Sin contexto en el vault para '{topic}'."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+
+    # 2. Graph neighbours of the top sources.
+    related = [] if no_related else find_related(col, sources_main, limit=6)
+
+    # 3. URLs scoped to topic — surface bookmarks/refs the brief should mention.
+    urls = [] if no_urls else find_urls(topic, k=5, folder=folder)
+
+    # 4. Build the context block. Cap chunk length so the brief stays focused.
+    chunks_text = "\n\n---\n\n".join(
+        f"[{i+1}] [[{m.get('note','')}]] (ruta: {m.get('file','')})\n{d[:600]}"
+        for i, (d, m) in enumerate(zip(main["docs"], sources_main))
+    )
+    related_text = (
+        "\n".join(
+            f"- [[{m.get('note','')}]] ({m.get('file','')})  ×{score} {reason}"
+            for m, score, reason in related[:6]
+        )
+        or "(sin relacionadas)"
+    )
+    urls_text = (
+        "\n".join(
+            f"- {u['url']}  ({u.get('anchor') or u.get('note','')})"
+            for u in urls[:5]
+        )
+        or "(sin URLs en el vault para esto)"
+    )
+
+    rules = (
+        "Sos un asistente que arma briefs de contexto a partir de las notas "
+        "personales del usuario, en 1ra persona. NO inventes información que "
+        "no esté en el contexto. Citá las notas con [[Título]] cuando hagas "
+        "afirmaciones puntuales. Si no hay info para una sección, escribí "
+        "honestamente que no hay nada en el vault."
+    )
+    prompt = (
+        f"{rules}\n\n"
+        f"TEMA / PERSONA / PROYECTO: {topic}\n\n"
+        f"NOTAS RELEVANTES:\n{chunks_text}\n\n"
+        f"NOTAS RELACIONADAS (graph):\n{related_text}\n\n"
+        f"URLS RELEVANTES:\n{urls_text}\n\n"
+        "Generá el brief en Markdown con esta estructura exacta:\n\n"
+        f"# Prep: {topic}\n\n"
+        "## Resumen ejecutivo\n"
+        "(2-3 líneas, lo más importante para entrar en contexto YA)\n\n"
+        "## Background\n"
+        "(lo que ya sé sobre esto desde mis notas — un párrafo sólido)\n\n"
+        "## Threads abiertos\n"
+        "(decisiones/acciones pendientes que detectes en las notas; bullets)\n\n"
+        "## Preguntas para explorar\n"
+        "(qué preguntas valdría hacer/considerar en una conversación sobre "
+        "esto; bullets, máximo 5)\n\n"
+        "## URLs y fuentes\n"
+        "(URLs relevantes literales + lista de notas citadas como [[wikilinks]])\n\n"
+        "Mantenete entre 350 y 550 palabras."
+    )
+
+    t_start = time.perf_counter()
+    parts: list[str] = []
+    if plain:
+        for chunk in ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            stream=True,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        ):
+            tok = chunk.message.content
+            parts.append(tok)
+            click.echo(tok, nl=False)
+        click.echo("")
+    else:
+        from rich.live import Live
+        with console.status("[dim]armando brief…[/dim]", spinner="dots"):
+            # Drain the stream silently first, then redraw with link styling.
+            for chunk in ollama.chat(
+                model=resolve_chat_model(),
+                messages=[{"role": "user", "content": prompt}],
+                options=CHAT_OPTIONS,
+                stream=True,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            ):
+                parts.append(chunk.message.content)
+        full = "".join(parts)
+        console.print()
+        console.print(render_response(full))
+
+    full = "".join(parts)
+    t_gen = time.perf_counter() - t_start
+
+    log_query_event({
+        "cmd": "prep", "topic": topic, "folder": folder,
+        "n_sources": len(sources_main), "n_related": len(related),
+        "n_urls": len(urls), "answer_len": len(full),
+        "t_gen": round(t_gen, 2),
+    })
+
+    if save:
+        date = datetime.now().strftime("%Y-%m-%d")
+        slug = _slug(topic)
+        target_dir = VAULT_PATH / "00-Inbox"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        candidate = target_dir / f"{date}-prep-{slug}.md"
+        i = 2
+        while candidate.exists():
+            candidate = target_dir / f"{date}-prep-{slug}-{i}.md"
+            i += 1
+        source_links = ", ".join(
+            f"'[[{m.get('note','')}]]'" for m in sources_main
+        )
+        fm = (
+            "---\n"
+            f"created: {datetime.now().isoformat(timespec='seconds')}\n"
+            "type: prep\n"
+            f"topic: \"{topic}\"\n"
+            "tags: [prep]\n"
+            f"sources: [{source_links}]\n"
+            "---\n\n"
+        )
+        candidate.write_text(fm + full + "\n", encoding="utf-8")
+        try:
+            _index_single_file(col, candidate, skip_contradict=True)
+        except Exception:
+            pass
+        rel = candidate.relative_to(VAULT_PATH)
+        click.echo(f"guardado: {rel}") if plain else console.print(
+            f"\n[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]"
+        )
 
 
 @cli.group()

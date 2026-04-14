@@ -1192,6 +1192,39 @@ _SAVE_INTENT_RE = re.compile(
 )
 
 
+# Reindex intent — matched in chat loop so the user can ask to reindex
+# without leaving the conversation. Strong verbs trigger alone; "actualizá"
+# (weaker, ambiguous) needs a vault/notas/índice object nearby.
+_REINDEX_STRONG_RE = re.compile(
+    r"\b(?:re[\s-]?index(?:ar|á|a|alo|alos|alas)?|reescane(?:ar|á|a)?|refresc(?:ar|á|a))\b",
+    re.IGNORECASE,
+)
+_REINDEX_WEAK_RE = re.compile(r"\bactualiz(?:ar|á|a)\b", re.IGNORECASE)
+_REINDEX_OBJECT_RE = re.compile(
+    r"\b(?:vault|[íi]ndice|notas?|todo)\b", re.IGNORECASE,
+)
+_REINDEX_RESET_RE = re.compile(
+    r"\b(?:desde\s+cero|de\s+cero|completo|reset(?:ear|á|a)?|rebuild|scratch|borr(?:ar|á|alo)\s+(?:y|e)\s+rehacer)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_reindex_intent(text: str) -> tuple[bool, bool]:
+    """Return (matches, reset). `reset=True` when the user asked for a full
+    rebuild (`reset`/`desde cero`/`completo`) — otherwise incremental.
+    """
+    t = text.strip()
+    if t.startswith("/reindex"):
+        rest = t[len("/reindex"):].strip().lower()
+        return True, bool(_REINDEX_RESET_RE.search(rest)) or rest in ("--reset", "reset")
+    has_match = bool(_REINDEX_STRONG_RE.search(t)) or (
+        bool(_REINDEX_WEAK_RE.search(t)) and bool(_REINDEX_OBJECT_RE.search(t))
+    )
+    if not has_match:
+        return False, False
+    return True, bool(_REINDEX_RESET_RE.search(t))
+
+
 def detect_save_intent(text: str) -> tuple[bool, str | None]:
     """Return (is_save, optional_title). Title extracted after 'llamada/titulada/nota:'
     if present, else None so save_note derives from body.
@@ -1971,16 +2004,10 @@ def _index_single_file(
     return "indexed"
 
 
-@cli.command()
-@click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
-@click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
-def index(reset: bool, no_contradict: bool):
-    """Indexar notas del vault (incremental, detecta cambios por hash).
-
-    En el camino incremental, cada nota nueva o modificada pasa por un check
-    de contradicciones contra el resto del vault. Con `--reset` se omite
-    (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
-    saltea también en incremental.
+def _run_index(reset: bool, no_contradict: bool) -> dict:
+    """Core indexing logic. Shared by the `rag index` CLI and the in-chat
+    natural-language reindex intent. Returns stats dict for callers that
+    want to render their own summary.
     """
     col = get_db()
     _invalidate_corpus_cache()
@@ -2102,6 +2129,26 @@ def index(reset: bool, no_contradict: bool):
         f"{updated_files} notas actualizadas · "
         f"{len(orphan_files)} huérfanas limpiadas.[/green]"
     )
+    return {
+        "added_chunks": added_chunks,
+        "updated_files": updated_files,
+        "orphans": len(orphan_files),
+        "total_files": len(md_files),
+    }
+
+
+@cli.command()
+@click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
+@click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
+def index(reset: bool, no_contradict: bool):
+    """Indexar notas del vault (incremental, detecta cambios por hash).
+
+    En el camino incremental, cada nota nueva o modificada pasa por un check
+    de contradicciones contra el resto del vault. Con `--reset` se omite
+    (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
+    saltea también en incremental.
+    """
+    _run_index(reset=reset, no_contradict=no_contradict)
 
 
 @cli.command()
@@ -2549,7 +2596,7 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
-        "[dim]/save [título] guarda última respuesta · /exit o Ctrl+C para salir[/dim]",
+        "[dim]/save [título] guarda · /reindex [reset] reindexa el vault · /exit[/dim]",
         border_style="green",
     ))
 
@@ -2577,6 +2624,30 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # Reindex intent — accepts /reindex or natural-language ("reindexá",
+        # "actualizá el vault", "reescaneá las notas", "reset desde cero").
+        # Checked BEFORE save intent so a phrase like "reindexá las notas"
+        # doesn't trigger the save heuristic via "notas".
+        is_reindex, reset = detect_reindex_intent(question)
+        if is_reindex:
+            label = "completo (--reset)" if reset else "incremental"
+            console.print(f"[dim]Reindexando ({label})…[/dim]")
+            try:
+                stats = _run_index(reset=reset, no_contradict=False)
+            except Exception as e:
+                console.print(f"[red]Error indexando: {e}[/red]")
+                continue
+            # Collection identity changes on --reset; refresh local handle so
+            # subsequent retrieves hit the new collection. Cache invalidation
+            # already happens inside _run_index.
+            col = get_db()
+            console.print(
+                f"[green]✓ Indexado:[/green] {stats['added_chunks']} chunks · "
+                f"{stats['updated_files']} actualizadas · "
+                f"{stats['orphans']} huérfanas"
+            )
             continue
 
         # Save intent — accepts /save or natural-language ("agregá esto a una

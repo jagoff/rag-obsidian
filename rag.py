@@ -905,6 +905,39 @@ def find_related(
 
 INBOX_FOLDER = "00-Inbox"
 
+# Natural-language save triggers. Two cases:
+#   - Strong save verbs (guardá, salvá, agendá) → save on their own.
+#   - Neutral verbs (creá, armá, generá, escribí, agregá, añadí) → require
+#     the word "nota/notas" within ~5 tokens to avoid false positives on
+#     generic questions like "creá un resumen".
+_STRONG_SAVE_VERB = r"(?:guard[aá]|salv[aá]|agend[aá])"
+_NEUTRAL_SAVE_VERB = r"(?:cre[aá]|agreg[aá]|a[nñ]ad[ií]|escrib[íi]|arm[aá]|gener[aá])"
+_SAVE_INTENT_RE = re.compile(
+    r"\b(?:"
+    rf"{_STRONG_SAVE_VERB}\w*"
+    rf"|{_NEUTRAL_SAVE_VERB}\w*(?:\s+\w+){{0,5}}\s+notas?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_save_intent(text: str) -> tuple[bool, str | None]:
+    """Return (is_save, optional_title). Title extracted after 'llamada/titulada/nota:'
+    if present, else None so save_note derives from body.
+    """
+    t = text.strip()
+    if t.startswith("/save"):
+        title = t[len("/save"):].strip() or None
+        return True, title
+    if not _SAVE_INTENT_RE.search(t):
+        return False, None
+    # Try to extract a title after common prepositions / markers.
+    m = re.search(
+        r"(?:titulad[ao]|llamad[ao]|con\s+(?:el\s+)?t[ií]tulo|nota\s*[:\-])\s+['\"]?([^'\"\n]+?)['\"]?\s*$",
+        t, re.IGNORECASE,
+    )
+    return True, (m.group(1).strip() if m else None)
+
 
 def save_note(
     col: chromadb.Collection,
@@ -1664,14 +1697,15 @@ def chat(
         if not question:
             continue
 
-        # /save [título opcional] — dump last assistant response to a new note.
-        if question.startswith("/save"):
+        # Save intent — accepts /save or natural-language ("agregá esto a una
+        # nota", "guardá la respuesta", "creá una nota llamada X", etc.)
+        is_save, save_title = detect_save_intent(question)
+        if is_save:
             if not last_assistant:
                 console.print("[yellow]No hay respuesta para guardar todavía.[/yellow]")
                 continue
-            title = question[len("/save"):].strip() or None
             path = save_note(
-                col, title, last_assistant, last_question, last_sources,
+                col, save_title, last_assistant, last_question, last_sources,
             )
             rel = path.relative_to(VAULT_PATH)
             console.print(f"[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]")

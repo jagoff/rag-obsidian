@@ -2415,6 +2415,262 @@ def log(n: int, low_confidence: bool):
     console.print(tbl)
 
 
+# ── AGENT LOOP ────────────────────────────────────────────────────────────────
+
+def _agent_tool_search(query: str, k: int = 5) -> str:
+    """Buscar chunks relevantes en el vault de Obsidian.
+
+    Args:
+        query: Pregunta o tema a buscar, en lenguaje natural.
+        k: Cantidad de chunks a devolver (default 5).
+
+    Returns:
+        JSON con lista de {note, path, score, content} de los chunks más
+        relevantes, ordenados por score descendente.
+    """
+    col = get_db()
+    result = retrieve(
+        col, query, k, folder=None, tag=None,
+        precise=False, multi_query=True, auto_filter=True,
+    )
+    out = [
+        {
+            "note": m.get("note", ""),
+            "path": m.get("file", ""),
+            "score": round(float(s), 3),
+            "content": d[:1000],
+        }
+        for d, m, s in zip(result["docs"], result["metas"], result["scores"])
+    ]
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _agent_tool_read_note(path: str) -> str:
+    """Leer el contenido completo de una nota del vault.
+
+    Args:
+        path: Ruta relativa al vault, por ej. "02-Areas/Coaching/Ikigai.md".
+
+    Returns:
+        Texto markdown completo, o mensaje de error si no existe.
+    """
+    if not path.endswith(".md"):
+        return "Error: el path debe terminar en .md"
+    full = (VAULT_PATH / path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return "Error: path fuera del vault"
+    if not full.is_file():
+        return f"Error: nota no encontrada: {path}"
+    return full.read_text(encoding="utf-8", errors="ignore")
+
+
+def _agent_tool_list_notes(folder: str | None = None, tag: str | None = None, limit: int = 30) -> str:
+    """Listar notas del vault, opcionalmente filtradas por carpeta o tag.
+
+    Args:
+        folder: Carpeta vault-relativa para filtrar (ej. "02-Areas/Coaching").
+        tag: Tag sin '#' prefix (ej. "coaching").
+        limit: Cantidad máxima a devolver.
+
+    Returns:
+        JSON con lista de {note, path, tags, modified}.
+    """
+    col = get_db()
+    c = _load_corpus(col)
+    files = _filter_files(c["metas"], tag, folder)
+    files.sort(key=lambda m: m.get("modified") or "", reverse=True)
+    out = [
+        {
+            "note": m.get("note", ""),
+            "path": m.get("file", ""),
+            "tags": m.get("tags", ""),
+            "modified": m.get("modified", ""),
+        }
+        for m in files[:limit]
+    ]
+    return json.dumps(out, ensure_ascii=False)
+
+
+_AGENT_PENDING_WRITES: list[dict] = []
+
+
+def _agent_tool_propose_write(path: str, content: str, rationale: str = "") -> str:
+    """Proponer crear o sobreescribir una nota del vault. NO escribe
+    inmediatamente — registra la propuesta para que el usuario confirme.
+
+    Usá esta tool para crear notas resumen, agregar notas derivadas, o
+    guardar outputs. Siempre bajo rutas del vault (00-Inbox/, 01-Projects/,
+    02-Areas/, 03-Resources/). Nunca en dotfolders.
+
+    Args:
+        path: Ruta relativa al vault. Debe terminar en .md.
+        content: Contenido markdown completo (incluye frontmatter si querés).
+        rationale: Breve justificación (por qué esta nota).
+
+    Returns:
+        Mensaje de confirmación registrado.
+    """
+    if not path.endswith(".md"):
+        return "Error: path debe terminar en .md"
+    if is_excluded(path):
+        return "Error: path en dotfolder rechazado"
+    _AGENT_PENDING_WRITES.append({"path": path, "content": content, "rationale": rationale})
+    return f"Propuesta registrada: {path} ({len(content)} chars). El usuario verá la acción antes de ejecutarse."
+
+
+_AGENT_SYSTEM = (
+    "Sos un asistente agéntico sobre un vault de Obsidian personal. "
+    "Tenés tools para buscar, leer y listar notas del vault, y para PROPONER "
+    "creaciones o modificaciones. No ejecutás writes vos — sólo los proponés "
+    "vía `propose_write`; el usuario los confirma después.\n\n"
+    "Reglas:\n"
+    "1. Antes de proponer writes, usá search/read/list para juntar contexto "
+    "   del vault real. No inventes paths ni contenidos.\n"
+    "2. Las notas propuestas deben vivir bajo 00-Inbox/, 01-Projects/, "
+    "   02-Areas/ o 03-Resources/. Default: 00-Inbox/ para capturas nuevas.\n"
+    "3. Incluí frontmatter YAML válido con `created`, `tags` del vocabulario "
+    "   existente cuando sea posible, y `related: [[wikilink]]` a notas "
+    "   fuente cuando derivás de ellas.\n"
+    "4. Cuando terminás, respondé con un resumen breve en lenguaje natural "
+    "   de lo que hiciste y qué proponés.\n"
+    "5. Si la instrucción es ambigua o no podés completarla con el vault, "
+    "   decilo — no inventes."
+)
+
+
+@cli.command()
+@click.argument("instruction")
+@click.option("--yes", is_flag=True, help="Ejecutar writes propuestos sin confirmar uno por uno")
+@click.option("--max-iterations", default=8, help="Cap de iteraciones de tool calling (default 8)")
+def do(instruction: str, yes: bool, max_iterations: int):
+    """Ejecutar una instrucción agéntica sobre el vault.
+
+    Ejemplos:
+        rag do "armá un resumen de todas mis notas sobre ikigai en una nota nueva"
+        rag do "listame qué referentes tengo en coaching y proponé una nota índice"
+        rag do "buscá notas sin tags y sugerí tags basados en contenido"
+
+    Los writes se proponen primero (`propose_write` tool) y se confirman al
+    final uno por uno (o todos con --yes).
+    """
+    _AGENT_PENDING_WRITES.clear()
+
+    tools = [
+        _agent_tool_search,
+        _agent_tool_read_note,
+        _agent_tool_list_notes,
+        _agent_tool_propose_write,
+    ]
+    tool_fns = {fn.__name__: fn for fn in tools}
+
+    messages = [
+        {"role": "system", "content": _AGENT_SYSTEM},
+        {"role": "user", "content": instruction},
+    ]
+
+    console.print(Panel(f"[bold cyan]{instruction}[/bold cyan]", border_style="cyan"))
+
+    model = resolve_chat_model()
+    for it in range(max_iterations):
+        with console.status(f"[dim]pensando (iter {it + 1}/{max_iterations})…[/dim]", spinner="dots"):
+            resp = ollama.chat(
+                model=model,
+                messages=messages,
+                tools=tools,
+                options=CHAT_OPTIONS,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+
+        msg = resp.message
+        # Persist the assistant turn for the follow-up tool messages.
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])],
+        })
+
+        if not msg.tool_calls:
+            # Final answer.
+            console.print()
+            console.print(render_response(msg.content or ""))
+            break
+
+        # Execute each tool call.
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = tc.function.arguments or {}
+            # command-r wraps args as {"tool_name": "...", "parameters": {...}}.
+            # Unwrap so we can call the Python function directly.
+            if isinstance(args, dict) and "parameters" in args and isinstance(args["parameters"], (dict, str)):
+                params = args["parameters"]
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except Exception:
+                        params = {}
+                args = params
+            # Drop empty-string optional args so defaults kick in.
+            args = {k: v for k, v in args.items() if v not in ("", None)}
+            console.print(f"  [dim]→ {name}({', '.join(f'{k}={str(v)[:40]!r}' for k, v in args.items())})[/dim]")
+            fn = tool_fns.get(name)
+            if not fn:
+                result = f"Error: tool '{name}' no existe"
+            else:
+                try:
+                    result = fn(**args)
+                except TypeError as e:
+                    result = f"Error de argumentos en {name}: {e}"
+                except Exception as e:
+                    result = f"Error ejecutando {name}: {e}"
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "content": result if isinstance(result, str) else json.dumps(result),
+            })
+    else:
+        console.print(f"[yellow]⚠ Cap de {max_iterations} iteraciones alcanzado.[/yellow]")
+
+    # Show pending writes, confirm each.
+    if _AGENT_PENDING_WRITES:
+        console.print()
+        console.print(Rule(title="[bold yellow]Writes propuestos[/bold yellow]", style="yellow"))
+        col = get_db()
+        for i, w in enumerate(_AGENT_PENDING_WRITES, 1):
+            console.print()
+            console.print(f"[bold]{i}. {w['path']}[/bold]  [dim]({len(w['content'])} chars)[/dim]")
+            if w.get("rationale"):
+                console.print(f"   [dim italic]{w['rationale']}[/dim italic]")
+            console.print(Markdown(w["content"][:600] + ("…" if len(w["content"]) > 600 else "")))
+
+            if yes:
+                apply = True
+            else:
+                try:
+                    resp = console.input("   [bold green]Crear?[/bold green] [y/N] ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    console.print("   [yellow]cancelado[/yellow]")
+                    break
+                apply = resp in ("y", "s", "yes", "si", "sí")
+
+            if apply:
+                full = VAULT_PATH / w["path"]
+                full.parent.mkdir(parents=True, exist_ok=True)
+                if full.exists():
+                    full = full.with_name(f"{full.stem} ({datetime.now().strftime('%H%M%S')}).md")
+                full.write_text(w["content"], encoding="utf-8")
+                try:
+                    _index_single_file(col, full)
+                except Exception:
+                    pass
+                console.print(f"   [green]✓ escrito:[/green] {full.relative_to(VAULT_PATH)}")
+            else:
+                console.print("   [dim]saltado[/dim]")
+    else:
+        console.print("[dim](sin writes propuestos)[/dim]")
+
+
 @cli.command()
 def stats():
     """Estado del índice."""

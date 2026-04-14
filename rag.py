@@ -4661,47 +4661,107 @@ def query(
         render_related(find_related(col, result["metas"]))
 
 
+def _arrow_select(
+    title: str,
+    choices: list[str],
+    default_idx: int = 0,
+) -> int:
+    """Menú interactivo con ↑/↓ + Enter. Retorna el índice elegido, o -1
+    si el usuario cancela (Esc / Ctrl-C / q).
+
+    Fallback no-TTY (pipes, tests, CI): retorna default_idx sin prompt.
+    Implementado con termios + rich.Live, sin agregar dependencias.
+    """
+    import sys
+    if not sys.stdin.isatty():
+        return default_idx
+
+    import termios
+    import tty
+
+    selected = max(0, min(default_idx, len(choices) - 1))
+
+    def _render() -> Text:
+        out = Text()
+        out.append(title + "\n", style="bold")
+        for i, label in enumerate(choices):
+            if i == selected:
+                out.append("  ❯ ", style="bold cyan")
+                out.append(label + "\n", style="bold cyan")
+            else:
+                out.append("    ")
+                out.append(label + "\n")
+        out.append("\n[↑/↓ navegar · Enter elegir · Esc/q cancelar]", style="dim")
+        return out
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    from rich.live import Live
+    try:
+        tty.setraw(fd)
+        with Live(_render(), console=console, refresh_per_second=30,
+                  transient=True) as live:
+            while True:
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":   # ESC o secuencia
+                    # Leer hasta 2 chars más sin bloquear si no llegan.
+                    import select as _select
+                    if _select.select([sys.stdin], [], [], 0.05)[0]:
+                        seq = sys.stdin.read(2)
+                        if seq == "[A":
+                            selected = (selected - 1) % len(choices)
+                        elif seq == "[B":
+                            selected = (selected + 1) % len(choices)
+                        # otras secuencias: ignorar
+                    else:
+                        return -1   # ESC bare → cancelar
+                elif ch in ("\r", "\n"):
+                    return selected
+                elif ch in ("\x03", "q"):   # Ctrl-C, q
+                    return -1
+                elif ch == "k":   # vim-style up
+                    selected = (selected - 1) % len(choices)
+                elif ch == "j":   # vim-style down
+                    selected = (selected + 1) % len(choices)
+                live.update(_render())
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
     """Pide al usuario qué vault(s) usar al arrancar chat. Solo se llama si
     hay ≥2 vaults registrados. Retorna lista de (name, path)."""
     vaults = list(cfg["vaults"].items())
     n = len(vaults)
-    console.print()
-    console.print("[bold]¿Sobre qué vault querés conversar?[/bold]")
-    default_idx = 1
+    default_idx = 0
     if cfg["current"] and cfg["current"] in cfg["vaults"]:
-        default_idx = list(cfg["vaults"].keys()).index(cfg["current"]) + 1
-    for i, (name, path) in enumerate(vaults, 1):
-        marker = "→" if name == cfg["current"] else " "
-        console.print(
-            f"  {marker} [bold cyan]{i}[/bold cyan]  [bold]{name}[/bold]  "
-            f"[dim]({Path(path).name})[/dim]"
-        )
-    console.print(
-        f"    [bold cyan]{n + 1}[/bold cyan]  [bold]ambos / todos[/bold]  "
-        f"[dim](búsqueda cross-vault en los {n} a la vez)[/dim]"
-    )
-    try:
-        choice = click.prompt(
-            f"\nSeleccioná",
-            default=str(default_idx),
-            show_default=True,
-        ).strip()
-    except (KeyboardInterrupt, EOFError):
-        return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
+        default_idx = list(cfg["vaults"].keys()).index(cfg["current"])
 
-    # Permitir tipear el nombre directo también (UX fallback).
-    if choice in cfg["vaults"]:
-        return [(choice, Path(cfg["vaults"][choice]))]
-    try:
-        idx = int(choice)
-    except ValueError:
-        return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
-    if 1 <= idx <= n:
-        return [(vaults[idx - 1][0], Path(vaults[idx - 1][1]))]
-    if idx == n + 1:
-        return [(name, Path(path)) for name, path in vaults]
-    return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
+    choices = [
+        f"{name}  ({Path(path).name})"
+        for name, path in vaults
+    ]
+    choices.append(f"ambos / todos  (cross-vault en los {n} a la vez)")
+
+    selected = _arrow_select(
+        "¿Sobre qué vault querés conversar?",
+        choices,
+        default_idx=default_idx,
+    )
+    if selected < 0:
+        # Cancelado → caer al default (vault current).
+        selected = default_idx
+
+    if selected < n:
+        name, path = vaults[selected]
+        console.print(f"[dim]→ vault: [bold magenta]{name}[/bold magenta][/dim]")
+        return [(name, Path(path))]
+    # Última opción: todos.
+    console.print(
+        f"[dim]→ vault: [bold magenta]{' + '.join(n for n, _ in vaults)}[/bold magenta] "
+        f"[dim](cross-vault)[/dim][/dim]"
+    )
+    return [(name, Path(path)) for name, path in vaults]
 
 
 @cli.command()

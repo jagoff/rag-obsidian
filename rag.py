@@ -3217,6 +3217,323 @@ def graph(note_title: str, depth: int, output: str | None):
     )
 
 
+# ── Weekly narrative digest (Contradiction Radar phase 3) ─────────────────────
+
+def _iso_week_label(dt: datetime) -> str:
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _parse_iso_week(week: str) -> tuple[datetime, datetime]:
+    """Parse 'YYYY-WNN' to [Monday 00:00, next Monday 00:00) local time."""
+    from datetime import timedelta as _td
+    m = re.match(r"^(\d{4})-W(\d{1,2})$", week.strip())
+    if not m:
+        raise click.BadParameter(
+            f"Formato inválido: {week!r} (esperado YYYY-WNN, ej. 2026-W15)"
+        )
+    year, wk = int(m.group(1)), int(m.group(2))
+    monday = datetime.strptime(f"{year}-W{wk:02d}-1", "%G-W%V-%u")
+    return monday, monday + _td(days=7)
+
+
+def _collect_week_evidence(
+    start: datetime,
+    end: datetime,
+    vault: Path,
+    query_log: Path,
+    contradiction_log: Path,
+) -> dict:
+    """Gather evidence for the weekly digest from three sources.
+
+    Returns dict with keys:
+      - recent_notes: vault files modified in [start, end)
+      - fm_contradictions: notes whose YAML has `contradicts: [paths]` (snapshot)
+      - index_contradictions: sidecar log entries in [start, end) with ≥1 contradict
+      - query_contradictions: queries.jsonl entries in window with contradictions
+      - low_conf_queries: queries in window with top_score <= CONFIDENCE_RERANK_MIN
+    """
+    recent: list[dict] = []
+    fm_contrad: list[dict] = []
+    if vault.is_dir():
+        for p in vault.rglob("*.md"):
+            try:
+                rel = str(p.relative_to(vault))
+            except ValueError:
+                continue
+            if is_excluded(rel):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+            except OSError:
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            fm = parse_frontmatter(raw)
+            contradicts = fm.get("contradicts") or []
+            if isinstance(contradicts, list) and contradicts:
+                targets = [str(t) for t in contradicts if t]
+                if targets:
+                    fm_contrad.append({"path": rel, "targets": targets})
+            if start <= mtime < end:
+                snippet = clean_md(raw)[:300].strip()
+                recent.append({
+                    "path": rel,
+                    "title": p.stem,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": snippet,
+                })
+    recent.sort(key=lambda r: r["modified"], reverse=True)
+
+    def _read_jsonl_in_window(path: Path) -> list[dict]:
+        if not path.is_file():
+            return []
+        out: list[dict] = []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if start <= ts < end:
+                out.append(e)
+        return out
+
+    index_contrad: list[dict] = []
+    for e in _read_jsonl_in_window(contradiction_log):
+        if e.get("cmd") != "contradict_index":
+            continue
+        entries = e.get("contradicts") or []
+        if not entries:
+            continue
+        index_contrad.append({
+            "ts": e.get("ts"),
+            "subject_path": e.get("subject_path", ""),
+            "targets": [
+                {"path": c.get("path", ""), "why": c.get("why", "")}
+                for c in entries if isinstance(c, dict)
+            ],
+        })
+
+    query_contrad: list[dict] = []
+    low_conf: list[dict] = []
+    for e in _read_jsonl_in_window(query_log):
+        if e.get("cmd") != "query":
+            continue
+        contrad = e.get("contradictions")
+        if isinstance(contrad, list) and contrad:
+            for c in contrad:
+                if isinstance(c, dict) and c.get("path"):
+                    query_contrad.append({
+                        "ts": e.get("ts"),
+                        "q": e.get("q", ""),
+                        "path": c.get("path", ""),
+                        "why": c.get("why", ""),
+                    })
+        score = e.get("top_score")
+        if isinstance(score, (int, float)) and score <= CONFIDENCE_RERANK_MIN:
+            q = (e.get("q") or "").strip()
+            if q:
+                low_conf.append({
+                    "ts": e.get("ts"),
+                    "q": q,
+                    "top_score": float(score),
+                })
+
+    return {
+        "recent_notes": recent,
+        "fm_contradictions": fm_contrad,
+        "index_contradictions": index_contrad,
+        "query_contradictions": query_contrad,
+        "low_conf_queries": low_conf,
+    }
+
+
+def _render_digest_prompt(week_label: str, ev: dict) -> str:
+    parts: list[str] = [
+        f"Contexto del vault para la semana {week_label}.",
+        "",
+    ]
+    if ev["recent_notes"]:
+        parts.append("Notas creadas/modificadas esta semana:")
+        for n in ev["recent_notes"][:40]:
+            snippet = n["snippet"].replace("\n", " ")
+            parts.append(f"- [[{n['title']}]] ({n['path']}) — {snippet}")
+        parts.append("")
+    if ev["index_contradictions"]:
+        parts.append("Contradicciones flaggeadas al indexar (fase 2):")
+        for ic in ev["index_contradictions"][:40]:
+            for t in ic["targets"]:
+                parts.append(
+                    f"- {ic['subject_path']} vs {t['path']} — {t['why']}"
+                )
+        parts.append("")
+    if ev["fm_contradictions"]:
+        parts.append(
+            "Estado actual de `contradicts:` en frontmatter (snapshot del vault):"
+        )
+        for fc in ev["fm_contradictions"][:40]:
+            parts.append(f"- {fc['path']} → {', '.join(fc['targets'])}")
+        parts.append("")
+    if ev["query_contradictions"]:
+        parts.append("Contradicciones detectadas al responder queries (fase 1):")
+        for qc in ev["query_contradictions"][:40]:
+            parts.append(
+                f"- pregunta {qc['q']!r} → {qc['path']}: {qc['why']}"
+            )
+        parts.append("")
+    if ev["low_conf_queries"]:
+        parts.append("Queries con baja confianza (posibles gaps persistentes):")
+        for lq in ev["low_conf_queries"][:30]:
+            parts.append(f"- {lq['q']!r} (top_score={lq['top_score']:.3f})")
+        parts.append("")
+    parts.append(
+        "Tarea: armá un review en primera persona de qué pasó en mi vault "
+        "esta semana: qué conceptos nuevos emergieron, qué posiciones se "
+        "movieron vs posiciones previas, qué tensiones se revelaron, qué "
+        "gaps persistentes aparecieron. Prosa narrativa, no bullets. "
+        "400-600 palabras. Citá notas con [[wikilinks]] de Obsidian. Si "
+        "alguno de los contextos está vacío, obvialo sin mencionarlo "
+        "explícitamente."
+    )
+    return "\n".join(parts)
+
+
+def _generate_digest_narrative(prompt: str) -> str:
+    resp = ollama.chat(
+        model=resolve_chat_model(),
+        messages=[{"role": "user", "content": prompt}],
+        options=CHAT_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    return (resp.message.content or "").strip()
+
+
+DIGEST_FOLDER = "05-Reviews"
+
+
+@cli.command()
+@click.option("--week", "week_opt", default=None,
+              help="Semana ISO YYYY-WNN (default: la semana que termina hoy)")
+@click.option("--days", default=7, show_default=True,
+              help="Ventana en días (ignorado si se pasa --week)")
+@click.option("--dry-run", is_flag=True,
+              help="No escribas ni indexes — mostrá el output")
+def digest(week_opt: str | None, days: int, dry_run: bool):
+    """Weekly narrative digest del vault (Contradiction Radar fase 3).
+
+    Consume notas modificadas, frontmatter `contradicts:`, el sidecar log
+    de contradicciones index-time, las contradicciones query-time y las
+    queries low-confidence. Genera prosa narrativa con command-r y la
+    guarda en `05-Reviews/YYYY-WNN.md` (auto-indexado).
+    """
+    from datetime import timedelta as _td
+    if week_opt:
+        try:
+            start, end = _parse_iso_week(week_opt)
+        except click.BadParameter as e:
+            console.print(f"[red]{e.message}[/red]")
+            return
+        week_label = week_opt
+    else:
+        end = datetime.now()
+        start = end - _td(days=days)
+        week_label = _iso_week_label(end)
+
+    ev = _collect_week_evidence(
+        start, end, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
+    )
+
+    total_signals = (
+        len(ev["recent_notes"]) + len(ev["fm_contradictions"])
+        + len(ev["index_contradictions"])
+        + len(ev["query_contradictions"]) + len(ev["low_conf_queries"])
+    )
+    if total_signals == 0:
+        console.print(
+            f"[yellow]Sin evidencia para {week_label}: "
+            "0 notas modificadas, 0 contradicciones, 0 queries low-confidence."
+            "[/yellow]"
+        )
+        return
+
+    console.print(
+        f"[dim]Evidencia {week_label}:[/dim] "
+        f"{len(ev['recent_notes'])} notas · "
+        f"{len(ev['index_contradictions'])} contradicciones index · "
+        f"{len(ev['fm_contradictions'])} frontmatter · "
+        f"{len(ev['query_contradictions'])} query · "
+        f"{len(ev['low_conf_queries'])} low-conf"
+    )
+
+    prompt = _render_digest_prompt(week_label, ev)
+    with console.status(
+        "[dim]Generando narrativa con command-r…[/dim]", spinner="dots"
+    ):
+        narrative = _generate_digest_narrative(prompt)
+
+    if not narrative:
+        console.print("[red]El modelo devolvió respuesta vacía. Abortando.[/red]")
+        return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    fm_lines = [
+        "---",
+        f"created: '{now}'",
+        f"modified: '{now}'",
+        "tags:",
+        "- review",
+        "- weekly-digest",
+        f"week: '{week_label}'",
+        "---",
+    ]
+    body = (
+        "\n".join(fm_lines)
+        + f"\n\n# Review {week_label}\n\n{narrative.strip()}\n"
+    )
+
+    if dry_run:
+        console.rule(f"[bold]Digest {week_label} (dry-run)[/bold]")
+        console.print(body, markup=False, highlight=False)
+        return
+
+    path = VAULT_PATH / DIGEST_FOLDER / f"{week_label}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path = path.with_name(
+            f"{week_label} ({datetime.now().strftime('%H%M%S')}).md"
+        )
+    path.write_text(body, encoding="utf-8")
+
+    try:
+        col = get_db()
+        _index_single_file(col, path)
+    except Exception as e:
+        console.print(
+            f"[yellow]Nota escrita pero auto-index falló: {e}[/yellow]"
+        )
+
+    try:
+        rel = path.relative_to(VAULT_PATH)
+    except ValueError:
+        rel = path
+    console.print(
+        f"[green]✓ Digest guardado:[/green] [bold cyan]{rel}[/bold cyan]"
+    )
+
+
 def _path_to_title(corpus: dict, path: str) -> str | None:
     for title, paths in corpus["title_to_paths"].items():
         if path in paths:

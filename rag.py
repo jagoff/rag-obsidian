@@ -758,10 +758,14 @@ SYSTEM_RULES_STRICT = (
 )
 
 
-def print_query_header(question: str, result: dict) -> None:
-    """Render the question panel + metadata row (filters, variants, confidence)."""
+def print_query_header(question: str, result: dict, show_question: bool = True) -> None:
+    """Render the metadata row (filters, variants, confidence), optionally
+    preceded by the question in a panel. In chat the user just typed the
+    question, so `show_question=False` skips that to reduce noise.
+    """
     console.print()
-    console.print(Panel(f"[bold white]{question}[/bold white]", border_style="cyan", padding=(0, 1)))
+    if show_question:
+        console.print(Panel(f"[bold white]{question}[/bold white]", border_style="cyan", padding=(0, 1)))
     meta_bits: list[str] = []
     emoji, label = confidence_badge(result["confidence"])
     meta_bits.append(f"{emoji} {label}")
@@ -1439,7 +1443,7 @@ def chat(
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
             continue
 
-        print_query_header(question, result)
+        print_query_header(question, result, show_question=False)
 
         context = "\n\n---\n\n".join(
             f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"

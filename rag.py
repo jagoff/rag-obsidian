@@ -1641,7 +1641,253 @@ def file_hash(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _index_single_file(col: chromadb.Collection, path: Path) -> str:
+# Sidecar log for contradiction events. Phase 3 (weekly digest) reads this.
+# Schema (per-line JSON): {ts, subject_path, contradicts: [{path, why}], helper_raw}.
+CONTRADICTION_LOG_PATH = Path.home() / ".local/share/obsidian-rag/contradictions.jsonl"
+
+
+def find_contradictions_for_note(
+    col: chromadb.Collection,
+    note_body: str,
+    exclude_paths: set[str],
+    k: int = 5,
+) -> list[dict]:
+    """Index-time twin of `find_contradictions`.
+
+    Surfaces chunks in the vault that contradict claims in `note_body`. Called
+    when a new or modified note is (re)indexed so we can flag it against prior
+    vault content. Uses the note's first paragraph as the rerank anchor (no
+    external question). Returns [{path, note, snippet, why}, ...]; empty on
+    short bodies, empty vault, parse errors, or no genuine contradictions.
+    """
+    body = (note_body or "").strip()
+    if len(body) < 200 or col.count() == 0:
+        return []
+    anchor = next(
+        (p.strip() for p in body.split("\n\n") if p.strip()),
+        body[:400],
+    )[:400]
+    try:
+        body_embed = embed([body[:2000]])[0]
+    except Exception:
+        return []
+    n = min(k * 4 + len(exclude_paths) + 5, col.count())
+    cand = col.query(
+        query_embeddings=[body_embed], n_results=n,
+        include=["documents", "metadatas"],
+    )
+    filtered: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for d, m in zip(cand["documents"][0], cand["metadatas"][0]):
+        path_str = m.get("file", "")
+        if path_str in exclude_paths or path_str in seen:
+            continue
+        seen.add(path_str)
+        filtered.append((expand_to_parent(d, m), m))
+        if len(filtered) >= k * 2:
+            break
+    if not filtered:
+        return []
+    try:
+        reranker = get_reranker()
+        pairs = [(anchor, d) for d, _ in filtered]
+        scores = reranker.predict(pairs, show_progress_bar=False)
+    except Exception:
+        scores = [0.0] * len(filtered)
+    ranked = sorted(
+        zip(filtered, scores), key=lambda x: float(x[1]), reverse=True
+    )[:k]
+
+    numbered = "\n\n".join(
+        f"[{i}] nota: {m.get('note','')} (ruta: {m.get('file','')})\n{d[:600]}"
+        for i, ((d, m), _) in enumerate(ranked, 1)
+    )
+    prompt = (
+        "Esta es una nota nueva o modificada del vault:\n\n"
+        f"NOTA:\n{body[:1500]}\n\n"
+        "Estos son fragmentos de OTRAS notas previas del vault:\n\n"
+        f"{numbered}\n\n"
+        "Tu tarea: identificar cuáles fragmentos (si hay) CONTRADICEN "
+        "afirmaciones de la nota nueva. Contradicción = afirmaciones "
+        "incompatibles sobre el mismo sujeto. NO cuenta: temas distintos, "
+        "matices, información complementaria, o perspectivas que el autor "
+        "podría sostener a la vez. Sé conservador — mejor perder una "
+        "contradicción real que marcar una falsa.\n\n"
+        "Respondé SOLO con JSON con esta forma exacta:\n"
+        '{"contradictions": [{"index": N, "why": "tensión en <20 palabras"}]}\n'
+        'Si no hay contradicciones: {"contradictions": []}'
+    )
+    # Detector uses the chat model (command-r), NOT the helper. Same reasoning
+    # as find_contradictions: qwen2.5:3b is non-deterministic and emits
+    # malformed JSON; command-r returns clean parseable output. Cost ~5-10s
+    # per new note in incremental indexing — bounded by guardrails (skip on
+    # full reindex, skip if body < 200 chars).
+    helper_raw = ""
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        helper_raw = resp.message.content.strip()
+    except Exception:
+        return []
+    m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    hits = data.get("contradictions") or []
+    if not isinstance(hits, list):
+        return []
+    out: list[dict] = []
+    for item in hits:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if not isinstance(idx, int) or not (1 <= idx <= len(ranked)):
+            continue
+        (doc, meta), _ = ranked[idx - 1]
+        why = str(item.get("why") or "").strip()[:200]
+        out.append({
+            "path": meta.get("file", ""),
+            "note": meta.get("note", ""),
+            "snippet": doc[:280].strip(),
+            "why": why,
+            "_helper_raw": helper_raw,  # consumed by _log_contradictions, stripped for callers
+        })
+    return out
+
+
+def _log_contradictions(
+    subject_path: str,
+    contrad: list[dict] | None = None,
+    skipped: str | None = None,
+    helper_raw: str = "",
+) -> None:
+    """Append a contradiction event to the sidecar log. Best-effort, never raises.
+
+    Schema (agreed with phase-3 digest worker):
+      {ts, cmd: "contradict_index", subject_path,
+       contradicts: [{path, note, why}], helper_raw, skipped: str|null}
+    `skipped` is null when the check ran and produced entries; a string reason
+    ("too_short" | "error") when it bailed.
+    """
+    entries = [
+        {
+            "path": c["path"],
+            "note": c.get("note", ""),
+            "why": c.get("why", ""),
+        }
+        for c in (contrad or [])
+    ]
+    try:
+        CONTRADICTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "cmd": "contradict_index",
+            "subject_path": subject_path,
+            "contradicts": entries,
+            "helper_raw": helper_raw,
+            "skipped": skipped,
+        }
+        with CONTRADICTION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
+    """Write/replace `contradicts: [...]` in the note's YAML frontmatter.
+
+    Preserves all other frontmatter keys and body content verbatim. Creates
+    a frontmatter block if none exists. Returns True if the file was written.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    if raw.startswith("---\n"):
+        end = raw.find("\n---\n", 4)
+        if end < 0:
+            return False
+        fm_text = raw[4:end]
+        rest = raw[end + 5:]
+        new_lines: list[str] = []
+        in_block = False
+        for line in fm_text.splitlines():
+            if in_block and re.match(r"^\s*-\s+", line):
+                continue
+            in_block = False
+            if re.match(r"^contradicts\s*:", line):
+                in_block = True
+                continue
+            new_lines.append(line)
+        new_lines.append("contradicts:")
+        for p in contradicts:
+            new_lines.append(f"- {p}")
+        new_raw = "---\n" + "\n".join(new_lines) + "\n---\n" + rest
+    else:
+        fm_block = (
+            "---\ncontradicts:\n"
+            + "\n".join(f"- {p}" for p in contradicts)
+            + "\n---\n\n"
+        )
+        new_raw = fm_block + raw
+    try:
+        path.write_text(new_raw, encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
+def _check_and_flag_contradictions(
+    col: chromadb.Collection,
+    path: Path,
+    text: str,
+    doc_id_prefix: str,
+) -> tuple[str, str] | None:
+    """Run the contradiction pipeline and persist findings to FM + sidecar log.
+
+    If contradictions are found, the note's frontmatter is updated in place
+    and a CLI alert + log entry are emitted. Returns (new_raw, new_hash) when
+    the file was modified so the caller can use the fresh values for indexing;
+    returns None on short body, no contradictions, or any failure.
+    """
+    if len(text) < 200:
+        _log_contradictions(doc_id_prefix, skipped="too_short")
+        return None
+    try:
+        contrad = find_contradictions_for_note(col, text, {doc_id_prefix}, k=5)
+    except Exception:
+        _log_contradictions(doc_id_prefix, skipped="error")
+        return None
+    if not contrad:
+        return None  # ran cleanly, nothing to flag — no log entry
+    paths = [c["path"] for c in contrad]
+    if not _update_contradicts_frontmatter(path, paths):
+        _log_contradictions(doc_id_prefix, skipped="error")
+        return None
+    try:
+        new_raw = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        _log_contradictions(doc_id_prefix, skipped="error")
+        return None
+    console.print(
+        f"[yellow]⚠[/yellow] [bold]{path.stem}[/bold] "
+        f"contradice: {', '.join(paths)}"
+    )
+    helper_raw = contrad[0].get("_helper_raw", "") if contrad else ""
+    _log_contradictions(doc_id_prefix, contrad=contrad, helper_raw=helper_raw)
+    return (new_raw, file_hash(new_raw))
+
+
+def _index_single_file(
+    col: chromadb.Collection, path: Path, skip_contradict: bool = False,
+) -> str:
     """(Re)index one markdown file. Returns one of:
     'skipped' (unchanged), 'indexed' (new/updated), 'removed' (file gone),
     'empty' (file exists but produced no chunks).
@@ -1672,14 +1918,27 @@ def _index_single_file(col: chromadb.Collection, path: Path) -> str:
     if existing_hash == h:
         return "skipped"
 
-    if existing_ids:
-        col.delete(ids=existing_ids)
-
     folder = str(path.relative_to(VAULT_PATH).parent)
     fm = parse_frontmatter(raw)
     tags = [str(t) for t in (fm.get("tags") or []) if t]
     outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
     text = clean_md(raw)
+
+    # Contradiction check runs before re-embedding so we only pay once. The
+    # collection still holds the old version of this note if any — we exclude
+    # `doc_id_prefix` from the candidate set regardless.
+    if not skip_contradict:
+        updated = _check_and_flag_contradictions(col, path, text, doc_id_prefix)
+        if updated:
+            raw, h = updated
+            fm = parse_frontmatter(raw)
+            tags = [str(t) for t in (fm.get("tags") or []) if t]
+            outlinks = extract_wikilinks(raw)
+            # text is derived from clean_md (strips frontmatter), unchanged.
+
+    if existing_ids:
+        col.delete(ids=existing_ids)
+
     chunks = semantic_chunks(text, path.stem, folder, tags, fm)
     if not chunks:
         _invalidate_corpus_cache()
@@ -1714,10 +1973,19 @@ def _index_single_file(col: chromadb.Collection, path: Path) -> str:
 
 @cli.command()
 @click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
-def index(reset: bool):
-    """Indexar notas del vault (incremental, detecta cambios por hash)."""
+@click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
+def index(reset: bool, no_contradict: bool):
+    """Indexar notas del vault (incremental, detecta cambios por hash).
+
+    En el camino incremental, cada nota nueva o modificada pasa por un check
+    de contradicciones contra el resto del vault. Con `--reset` se omite
+    (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
+    saltea también en incremental.
+    """
     col = get_db()
     _invalidate_corpus_cache()
+    # Contradiction check only runs in incremental mode and when not opted out.
+    check_contradictions = not reset and not no_contradict
 
     if reset:
         client = chromadb.PersistentClient(path=str(DB_PATH))
@@ -1759,15 +2027,28 @@ def index(reset: bool):
             indexed_files.add(doc_id_prefix)
             continue
 
+        fm = parse_frontmatter(raw)
+        tags = [str(t) for t in (fm.get("tags") or []) if t]
+        outlinks = extract_wikilinks(raw)
+        text = clean_md(raw)
+
+        # Before touching the collection for this file, check whether the
+        # incoming content contradicts anything already in the vault. When
+        # it does, the note's frontmatter is rewritten in place and we pick
+        # up the new raw/hash here.
+        if check_contradictions:
+            updated = _check_and_flag_contradictions(col, path, text, doc_id_prefix)
+            if updated:
+                raw, h = updated
+                fm = parse_frontmatter(raw)
+                tags = [str(t) for t in (fm.get("tags") or []) if t]
+                outlinks = extract_wikilinks(raw)
+
         # File changed (or new) — remove any stale chunks first
         if existing:
             col.delete(ids=[eid for eid, _ in existing])
             updated_files += 1
 
-        fm = parse_frontmatter(raw)
-        tags = [str(t) for t in (fm.get("tags") or []) if t]
-        outlinks = extract_wikilinks(raw)
-        text = clean_md(raw)
         chunks = semantic_chunks(text, path.stem, folder, tags, fm)
         if not chunks:
             indexed_files.add(doc_id_prefix)
@@ -1914,11 +2195,14 @@ def watch(debounce: float):
               help="Reanuda la última sesión usada (atajo a --session <última>)")
 @click.option("--plain", is_flag=True,
               help="Salida plana sin colores/paneles/sources. Para consumo programático.")
+@click.option("--counter", is_flag=True,
+              help="Después de responder, buscar chunks del vault que CONTRADIGAN la respuesta")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
+    counter: bool,
 ):
     """Consulta única contra las notas."""
     col = get_db()

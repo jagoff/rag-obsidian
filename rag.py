@@ -593,6 +593,242 @@ CONFIDENCE_RERANK_MIN = 0.015
 console = Console()
 
 
+# ── FEEDBACK LOOP ────────────────────────────────────────────────────────────
+# 👍/👎 sobre cada respuesta del chat → archivo append-only + índice derivado
+# que re-alimenta retrieve() para sesgar resultados hacia paths que antes
+# funcionaron (y contra los que no). Dos canales:
+#
+#   feedback.jsonl        log append-only, fuente de verdad.
+#   feedback_golden.json  cache derivada (query + embedding + paths). Se
+#                         rebuildea perezosamente cuando el jsonl cambia.
+#
+# Contract con retrieve(): positivos inyectan sus paths en el candidate pool
+# (conservador — el reranker sigue decidiendo el orden final). Negativos
+# restan un delta fijo al score post-rerank. Se activa sólo si la query
+# entrante tiene cosine ≥ FEEDBACK_MATCH_COSINE con alguna query calificada
+# previamente — sin eso el feedback pasado no se aplica.
+
+FEEDBACK_PATH = Path.home() / ".local/share/obsidian-rag/feedback.jsonl"
+FEEDBACK_GOLDEN_PATH = Path.home() / ".local/share/obsidian-rag/feedback_golden.json"
+FEEDBACK_MATCH_COSINE = 0.88        # similaridad mínima para matchear query pasada
+FEEDBACK_POSITIVE_BOOST = 0.03      # suma al rerank score si el path viene de un 👍 similar
+FEEDBACK_NEGATIVE_PENALTY = 0.15    # resta al rerank score si el path viene de un 👎 similar
+
+
+def new_turn_id() -> str:
+    """Short opaque id per answered turn — 12 hex chars from os.urandom."""
+    return secrets.token_hex(6)
+
+
+def detect_rating_intent(text: str) -> int | None:
+    """Return +1 / -1 if the input is a rating, else None.
+
+    Accepted: bare '👍'/'👎' (with skin-tone modifiers), '/bien', '/mal'.
+    Anything with additional words is NOT a rating — the user may be asking
+    a question that happens to contain those tokens.
+    """
+    t = text.strip()
+    if not t:
+        return None
+    # Strip common emoji variation selectors + skin-tone modifiers so both
+    # plain and decorated thumbs register as the same signal.
+    stripped = re.sub(r"[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F]", "", t)
+    if stripped in ("👍", "/bien"):
+        return 1
+    if stripped in ("👎", "/mal"):
+        return -1
+    return None
+
+
+def record_feedback(
+    turn_id: str,
+    rating: int,
+    q: str,
+    paths: list[str],
+) -> None:
+    """Append a rating event to feedback.jsonl. Invalidates the golden cache
+    so the next retrieve() picks up the new signal.
+    """
+    try:
+        FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "turn_id": turn_id,
+            "rating": 1 if rating > 0 else -1,
+            "q": q,
+            "paths": list(paths or []),
+        }
+        with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # Cache invalidation — next load rebuilds from jsonl. Best-effort delete.
+    try:
+        if FEEDBACK_GOLDEN_PATH.is_file():
+            FEEDBACK_GOLDEN_PATH.unlink()
+    except Exception:
+        pass
+
+
+def feedback_counts() -> tuple[int, int]:
+    """Return (positives, negatives) from the raw log — cheap scan, no embeddings."""
+    pos = neg = 0
+    if not FEEDBACK_PATH.is_file():
+        return 0, 0
+    try:
+        for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            r = ev.get("rating", 0)
+            if r > 0:
+                pos += 1
+            elif r < 0:
+                neg += 1
+    except Exception:
+        pass
+    return pos, neg
+
+
+def _feedback_golden_fresh() -> bool:
+    """Cache is fresh iff it exists AND its mtime ≥ feedback.jsonl's mtime."""
+    if not FEEDBACK_GOLDEN_PATH.is_file():
+        return False
+    if not FEEDBACK_PATH.is_file():
+        # No raw log but a stale cache exists — treat as fresh (empty).
+        return True
+    try:
+        return FEEDBACK_GOLDEN_PATH.stat().st_mtime >= FEEDBACK_PATH.stat().st_mtime
+    except Exception:
+        return False
+
+
+def _rebuild_feedback_golden() -> dict:
+    """Fold feedback.jsonl into {positives, negatives} with query embeddings.
+
+    Each entry: {q, emb, paths}. Paths from the most-recent rating win when
+    the same turn_id appears twice (user changed their mind). Embeddings are
+    computed in one batched ollama call — O(1) per rebuild, ~300ms.
+    """
+    by_turn: dict[str, dict] = {}
+    if FEEDBACK_PATH.is_file():
+        try:
+            for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                tid = ev.get("turn_id")
+                if not tid:
+                    continue
+                by_turn[tid] = ev  # later write overrides earlier
+        except Exception:
+            pass
+
+    positives: list[dict] = []
+    negatives: list[dict] = []
+    queries: list[str] = []
+    buckets: list[tuple[str, list[dict], list[str]]] = []
+    for ev in by_turn.values():
+        q = (ev.get("q") or "").strip()
+        paths = [p for p in (ev.get("paths") or []) if p]
+        if not q or not paths:
+            continue
+        bucket = positives if ev.get("rating", 0) > 0 else negatives
+        buckets.append((q, bucket, paths))
+        queries.append(q)
+
+    if queries:
+        try:
+            embs = embed(queries)
+        except Exception:
+            embs = [[0.0]] * len(queries)
+        for (q, bucket, paths), emb in zip(buckets, embs):
+            bucket.append({"q": q, "emb": list(emb), "paths": paths})
+
+    golden = {"positives": positives, "negatives": negatives}
+    try:
+        FEEDBACK_GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FEEDBACK_GOLDEN_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(golden, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(FEEDBACK_GOLDEN_PATH)
+    except Exception:
+        pass
+    return golden
+
+
+_feedback_golden_memo: dict | None = None
+_feedback_golden_mtime: float = 0.0
+
+
+def load_feedback_golden() -> dict:
+    """Return {positives, negatives} — rebuild on disk-mtime change, memoise in-process."""
+    global _feedback_golden_memo, _feedback_golden_mtime
+    # In-process memoisation: if feedback.jsonl hasn't changed since we last
+    # loaded, reuse what's in memory (avoids hitting disk on every query).
+    try:
+        mtime = FEEDBACK_PATH.stat().st_mtime if FEEDBACK_PATH.is_file() else 0.0
+    except Exception:
+        mtime = 0.0
+    if _feedback_golden_memo is not None and mtime == _feedback_golden_mtime:
+        return _feedback_golden_memo
+
+    if _feedback_golden_fresh():
+        try:
+            _feedback_golden_memo = json.loads(
+                FEEDBACK_GOLDEN_PATH.read_text(encoding="utf-8")
+            )
+        except Exception:
+            _feedback_golden_memo = _rebuild_feedback_golden()
+    else:
+        _feedback_golden_memo = _rebuild_feedback_golden()
+    _feedback_golden_mtime = mtime
+    return _feedback_golden_memo
+
+
+def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[str]]:
+    """Return (boost_paths, penalty_paths) for this query. Matches against
+    the golden cache — only previous ratings with cosine ≥ FEEDBACK_MATCH_COSINE
+    to the incoming query contribute.
+    """
+    golden = load_feedback_golden()
+    if not (golden["positives"] or golden["negatives"]):
+        return set(), set()
+
+    import numpy as np
+    q = np.asarray(q_embedding, dtype="float32")
+    qn = float(np.linalg.norm(q))
+    if qn == 0:
+        return set(), set()
+
+    boost: set[str] = set()
+    penalty: set[str] = set()
+    for entry in golden["positives"]:
+        e = np.asarray(entry["emb"], dtype="float32")
+        en = float(np.linalg.norm(e))
+        if en == 0:
+            continue
+        if float(np.dot(q, e)) / (qn * en) >= FEEDBACK_MATCH_COSINE:
+            boost.update(entry["paths"])
+    for entry in golden["negatives"]:
+        e = np.asarray(entry["emb"], dtype="float32")
+        en = float(np.linalg.norm(e))
+        if en == 0:
+            continue
+        if float(np.dot(q, e)) / (qn * en) >= FEEDBACK_MATCH_COSINE:
+            penalty.update(entry["paths"])
+    # Positive wins if a path appears in both (user rated it 👍 more recently).
+    penalty -= boost
+    return boost, penalty
+
+
 # ── DB ────────────────────────────────────────────────────────────────────────
 
 def get_db() -> chromadb.Collection:
@@ -3389,6 +3625,29 @@ def retrieve(
             "query_variants": variants,
         }
 
+    # 4b. Feedback signals (👍/👎 del usuario sobre queries similares previas).
+    #     Usamos el embedding de la query original (el primero del batch) —
+    #     no las paraphrases — porque el cosine se compara contra las queries
+    #     que el usuario realmente tipeó en el pasado.
+    boost_paths, penalty_paths = feedback_signals_for_query(variant_embeds[0])
+
+    # 4c. Path injection: si algún chunk de un path boosteado quedó fuera
+    #     del pool (BM25 + sem no lo trajeron), lo metemos manualmente.
+    #     El reranker sigue decidiendo si merece subir o no — esto es
+    #     candidate-pinning, no score override.
+    if boost_paths:
+        try:
+            extra = col.get(
+                where={"file": {"$in": list(boost_paths)}},
+                include=[],
+            )
+            for eid in extra.get("ids", []):
+                if eid not in seen_ids:
+                    seen_ids.add(eid)
+                    merged_ordered.append(eid)
+        except Exception:
+            pass
+
     # 5a. Cap pool antes de fetch/rerank. El reranker es O(n) en pares y
     #     domina la latencia de la query (~50ms/par en MPS fp32). Un pool
     #     de 40 mantiene recall efectivo (top-5 rarísimo que esté fuera
@@ -3423,6 +3682,14 @@ def retrieve(
         final = float(s)
         if apply_recency:
             final += 0.1 * recency_boost(c[1])
+        # Feedback: small additive boost para paths que el usuario marcó 👍 en
+        # queries similares, penalty más fuerte para los 👎. El signo importa
+        # pero el módulo es chico — no queremos ossificar el ranking.
+        path = c[1].get("file", "") if isinstance(c[1], dict) else ""
+        if path in boost_paths:
+            final += FEEDBACK_POSITIVE_BOOST
+        if path in penalty_paths:
+            final -= FEEDBACK_NEGATIVE_PENALTY
         final_pairs.append((c, e, final))
     scored = sorted(final_pairs, key=lambda x: x[2], reverse=True)[:k]
     final_scores = [s for _, _, s in scored]
@@ -4684,8 +4951,10 @@ def query(
                 contrad = _run_counter()
             render_contradictions(contrad)
 
+    query_turn_id = new_turn_id()
     log_query_event({
         "cmd": "query",
+        "turn_id": query_turn_id,
         "q": question,
         "q_reformulated": effective_question if effective_question != question else None,
         "session": sess["id"] if sess else None,
@@ -4711,6 +4980,7 @@ def query(
             "paths": [m.get("file", "") for m in result["metas"]],
             "top_score": round(float(result["confidence"]), 3),
             "contradictions": [c["path"] for c in contrad] if contrad else None,
+            "turn_id": query_turn_id,
         })
         save_session(sess)
 
@@ -4995,7 +5265,7 @@ def chat(
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
         f"{vault_line}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · /cls · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · 👍/👎 · /cls · /exit[/dim]",
         border_style="green",
     ))
 
@@ -5042,11 +5312,13 @@ def chat(
     last_assistant = ""
     last_question = ""
     last_sources: list[dict] = []
+    last_turn_id: str | None = None
     # If resuming, seed last_* from final turn so `/save` works immediately.
     if sess["turns"]:
         final = sess["turns"][-1]
         last_assistant = final.get("a", "") or ""
         last_question = final.get("q", "") or ""
+        last_turn_id = final.get("turn_id")
     first_turn = True
     while True:
         try:
@@ -5068,6 +5340,24 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # Rating intent — 👍 / 👎 / /bien / /mal aplicado a la última respuesta.
+        # Check ANTES de /save /reindex /etc porque es el token más corto
+        # (emoji solo) y no queremos que nada más lo robe. detect_rating_intent
+        # acepta sólo inputs donde el rating es TODO el mensaje, así que no
+        # va a confundir "👍 eso está bueno" con un rating.
+        rating = detect_rating_intent(question)
+        if rating is not None:
+            if not last_turn_id:
+                console.print("[yellow]Todavía no hay respuesta para calificar.[/yellow]")
+                continue
+            record_feedback(
+                last_turn_id, rating, last_question,
+                [m.get("file", "") for m in last_sources if m.get("file")],
+            )
+            icon = "👍" if rating > 0 else "👎"
+            console.print(f"[dim]{icon} feedback guardado.[/dim]")
             continue
 
         # /cls — limpia la pantalla y borra la conversación: turnos persistidos,
@@ -5244,17 +5534,34 @@ def chat(
                 )
             render_contradictions(contrad)
 
+        turn_id = new_turn_id()
         append_turn(sess, {
             "q": question,
             "a": full,
             "paths": [m.get("file", "") for m in result["metas"]],
             "top_score": round(float(result["confidence"]), 3),
             "contradictions": [c["path"] for c in contrad] if contrad else None,
+            "turn_id": turn_id,
         })
         save_session(sess)
 
+        # Log chat turn to queries.jsonl too — with turn_id so `rag feedback`
+        # y `rag log --feedback` pueden cruzar contra feedback.jsonl.
+        log_query_event({
+            "cmd": "chat",
+            "turn_id": turn_id,
+            "session": sess["id"],
+            "q": question,
+            "paths": [m.get("file", "") for m in result["metas"]],
+            "scores": [round(float(s), 2) for s in result["scores"]],
+            "top_score": round(float(result["confidence"]), 2),
+        })
+
+        last_turn_id = turn_id
+
         print_sources(result)
         render_related(find_related(col, result["metas"]))
+        console.print("[dim]› 👍 / 👎 para dar feedback[/dim]")
 
 
 @cli.command()
@@ -6145,7 +6452,9 @@ def _path_to_title(corpus: dict, path: str) -> str | None:
 @cli.command()
 @click.option("-n", default=20, help="Cantidad de queries a mostrar (default: 20)")
 @click.option("--low-confidence", is_flag=True, help="Solo queries con top_score < 0")
-def log(n: int, low_confidence: bool):
+@click.option("--feedback", "with_feedback", is_flag=True,
+              help="Solo turnos con rating (👍/👎), con una columna de feedback")
+def log(n: int, low_confidence: bool, with_feedback: bool):
     """Inspeccionar el log de queries (últimas N)."""
     if not LOG_PATH.is_file():
         console.print(f"[yellow]No hay log aún en {LOG_PATH}[/yellow]")
@@ -6161,11 +6470,35 @@ def log(n: int, low_confidence: bool):
             continue
     if low_confidence:
         entries = [e for e in entries if (e.get("top_score") or 0) < 0]
+
+    # Pre-load feedback so we can annotate (and filter if --feedback).
+    fb_by_turn: dict[str, int] = {}
+    if FEEDBACK_PATH.is_file():
+        try:
+            for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                tid = ev.get("turn_id")
+                if tid:
+                    fb_by_turn[tid] = 1 if ev.get("rating", 0) > 0 else -1
+        except Exception:
+            pass
+
+    if with_feedback:
+        entries = [e for e in entries if e.get("turn_id") in fb_by_turn]
+
     entries = entries[-n:]
     tbl = Table(title=f"Últimas {len(entries)} queries", show_lines=False)
     tbl.add_column("ts", style="dim")
     tbl.add_column("query", style="cyan", overflow="fold", max_width=45)
     tbl.add_column("score", justify="right")
+    if with_feedback or fb_by_turn:
+        tbl.add_column("fb", justify="center")
     tbl.add_column("retr", justify="right")
     tbl.add_column("gen", justify="right")
     tbl.add_column("mode", style="dim")
@@ -6173,14 +6506,25 @@ def log(n: int, low_confidence: bool):
         score = e.get("top_score")
         score_str = f"{score:+.1f}" if isinstance(score, (int, float)) else "-"
         score_style = "green" if (score or 0) >= 3 else ("yellow" if (score or 0) >= 0 else "red")
-        tbl.add_row(
+        row = [
             e.get("ts", "")[-8:],
             e.get("q", ""),
             f"[{score_style}]{score_str}[/{score_style}]",
+        ]
+        if with_feedback or fb_by_turn:
+            rating = fb_by_turn.get(e.get("turn_id", "") or "_none_")
+            if rating is None:
+                row.append("[dim]·[/dim]")
+            elif rating > 0:
+                row.append("[green]👍[/green]")
+            else:
+                row.append("[red]👎[/red]")
+        row.extend([
             f"{e.get('t_retrieve', 0):.1f}",
             f"{e.get('t_gen', 0):.1f}",
             e.get("mode", ""),
-        )
+        ])
+        tbl.add_row(*row)
     console.print(tbl)
 
 
@@ -8472,6 +8816,9 @@ def stats():
     console.print(f"[cyan]Helper model:[/cyan] {HELPER_MODEL}")
     console.print(f"[cyan]Reranker:[/cyan] {RERANKER_MODEL}")
     console.print(f"[cyan]Pipeline:[/cyan] HyDE + BM25 + RRF + cross-encoder rerank")
+    pos, neg = feedback_counts()
+    if pos or neg:
+        console.print(f"[cyan]Feedback:[/cyan] 👍 {pos} · 👎 {neg}  [dim]({FEEDBACK_PATH})[/dim]")
 
 
 @cli.group()

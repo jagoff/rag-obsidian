@@ -1023,23 +1023,67 @@ def cross_encoder_rerank(
 
 # ── RETRIEVAL PIPELINE ────────────────────────────────────────────────────────
 
+_PROPER_NOUN_RE = re.compile(r"\b([A-ZÁÉÍÓÚÑ][\wáéíóúñ'\-]{2,})\b")
+_PARAPHRASE_TOKEN_RE = re.compile(r"\b[\wáéíóúñ'\-]{3,}\b")
+
+
+def _extract_proper_nouns(text: str) -> set[str]:
+    """Tokens que arrancan con mayúscula, ≥3 chars — candidatos a nombre
+    propio. Usado para validar que las paráfrasis preservan entidades.
+    """
+    return {m.group(1) for m in _PROPER_NOUN_RE.finditer(text)}
+
+
 def expand_queries(question: str) -> list[str]:
-    """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2]."""
+    """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
+
+    Nombres propios se preservan vía dos frenos: (1) el prompt se lo pide
+    explícito con un anti-ejemplo, (2) un guardrail case-insensitive rechaza
+    paráfrasis que droppean tokens propios del original. Sin esto, qwen2.5:3b
+    generaba 'el actor Adam Jones' / 'el intérprete X', desviando el recall.
+    """
     prompt = (
-        "Reformulá esta pregunta de DOS maneras distintas — distintas palabras clave, "
-        "mismo sentido. Devolvé SOLO las dos reformulaciones, una por línea. "
-        "Sin numerar, sin explicar.\n\n"
+        "Reformulá esta pregunta de DOS maneras distintas — distintas "
+        "palabras clave, mismo sentido. Nombres propios (personas, bandas, "
+        "productos, acrónimos) van literales, NO agregues calificativos "
+        "como 'el actor X' o 'la banda Y'.\n\n"
+        "Ejemplo:\n"
+        "  'qué usa adam jones?'\n"
+        "  → 'qué equipo usa adam jones?'\n"
+        "  → 'cuál es el rig de adam jones?'\n\n"
+        "Devolvé SOLO las dos reformulaciones, una por línea. Sin numerar, "
+        "sin explicar.\n\n"
         f"Pregunta: {question}"
     )
-    resp = ollama.chat(
-        model=HELPER_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options=HELPER_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
-    )
-    lines = [l.strip(" -*·") for l in resp.message.content.splitlines() if l.strip()]
-    variants = [question] + [l for l in lines if l != question][:2]
-    return variants
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=HELPER_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        content = resp.message.content
+    except Exception:
+        return [question]
+
+    lines = [l.strip(" -*·") for l in content.splitlines() if l.strip()]
+    # Guardrail case-insensitive: cada paráfrasi debe contener todos los
+    # tokens propios del original (lowercased). Evita que "RAG" se pierda
+    # aunque qwen lo devuelva como "rag" — el issue no es el case, es que
+    # la entidad esté presente.
+    original_noun_tokens = {n.lower() for n in _extract_proper_nouns(question)}
+    kept: list[str] = []
+    for l in lines:
+        if l == question:
+            continue
+        if original_noun_tokens:
+            para_tokens = {m.group(0).lower() for m in _PARAPHRASE_TOKEN_RE.finditer(l)}
+            if not original_noun_tokens.issubset(para_tokens):
+                continue
+        kept.append(l)
+        if len(kept) >= 2:
+            break
+    return [question] + kept
 
 
 _RECENCY_RE = re.compile(
@@ -3905,10 +3949,25 @@ def chat(
             f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
             for d, m in zip(result["docs"], result["metas"])
         )
-        system = f"{SYSTEM_RULES}\nCONTEXTO RELEVANTE:\n{context}"
-
+        # Prompt shape debe igualar `rag query` exactamente: sin priming
+        # (PREGUNTA:/RESPUESTA:) command-r a veces refusea en borderline scores
+        # aunque el contexto alcance — reproducido con "adam jones sistema de
+        # sonido" (score 0.3, mismo Guitar.md retrieved, query respondía y chat
+        # decía "No tengo esa información"). Para el primer turno usamos la
+        # misma estructura one-shot que query; con history armamos el formato
+        # multi-turno pero manteniendo el priming del contexto igual.
+        if history:
+            messages = (
+                [{"role": "system", "content": f"{SYSTEM_RULES}\nCONTEXTO:\n{context}"}]
+                + history
+                + [{"role": "user", "content": question}]
+            )
+        else:
+            messages = [{"role": "user", "content": (
+                f"{SYSTEM_RULES}\nCONTEXTO:\n{context}\n\n"
+                f"PREGUNTA: {question}\n\nRESPUESTA:"
+            )}]
         history.append({"role": "user", "content": question})
-        messages = [{"role": "system", "content": system}] + history[-6:]
 
         console.print()
         parts: list[str] = []

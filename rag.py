@@ -4774,7 +4774,25 @@ def _arrow_select(
                 return -1
             _redraw()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        # Restore primario: vuelve a los settings que había antes del cbreak.
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        except Exception:
+            pass
+        # Belt + suspenders: forzar ICANON + ECHO + OPOST a ON, por si
+        # `old_settings` los tenía off (raro pero blindaje barato). Sin
+        # OPOST los \n no se traducen a \r\n y todo el output siguiente
+        # del chat se ve apilado en una línea — síntoma reportado.
+        try:
+            attrs = termios.tcgetattr(fd)
+            attrs[1] |= termios.OPOST                      # output post-processing
+            attrs[3] |= termios.ICANON | termios.ECHO      # canonical + echo
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+        # Asegurar que cualquier ANSI pendiente del erase_menu se haya
+        # vuelto a flush antes de seguir.
+        sys.stdout.flush()
 
 
 def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:

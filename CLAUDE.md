@@ -18,17 +18,30 @@ Fully local: ChromaDB + Ollama + sentence-transformers. No cloud calls.
 uv tool install --reinstall --editable .
 
 # Index ops
-rag index              # incremental (hash-based). --reset rebuilds
+rag index              # incremental (hash-based). --reset rebuilds. --no-contradict to skip phase-2 check
 rag watch              # watchdog auto-reindex on vault changes (debounce 3s)
 
 # Query paths
 rag query "text"       # one-shot; flags: --hyde --no-multi --raw --loose --force
-rag chat               # interactive; /save [título] or NL intents guardan última respuesta
+                       #             --counter --session <id> --continue --plain
+rag chat               # interactive; /save and /reindex (or NL equivalents) work mid-conversation
+                       # flags: --counter --session <id> --resume
 rag stats              # models + index status
 
+# Sessions (multi-turn state)
+rag session list | show <id> | clear <id> | cleanup [--days N]
+
+# Agent mode + retrospective
+rag do "instrucción"   # tool-calling agent: search/read/list + propose_write with confirm
+rag digest             # weekly narrative review of vault evolution. --week YYYY-WNN, --days N, --dry-run
+
 # Quality + observability
-rag eval               # run queries.yaml → hit@k, MRR, recall@k
+rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
 rag log [-n 20] [--low-confidence]
+
+# Tests
+.venv/bin/python -m pytest tests/ -q   # pytest in [project.optional-dependencies].dev
+.venv/bin/python -m pytest tests/test_sessions.py::test_round_trip   # single test
 
 # Run the MCP server manually (Claude Code launches it on demand)
 obsidian-rag-mcp
@@ -38,7 +51,7 @@ Python 3.13, `uv` for deps. Runtime: `.venv/bin/python` is the local venv; the g
 
 ## Architecture
 
-Everything is in `rag.py` (~1700 lines) + `mcp_server.py` (thin wrapper). Single-file by design — small enough to keep in head, no framework abstractions between the caller and the pipeline.
+Everything is in `rag.py` (~3500 lines) + `mcp_server.py` (thin wrapper) + `tests/`. Single-file by design — no framework abstractions between the caller and the pipeline. The size grew with knowledge graph, agent loop, sessions, contradiction radar, digest — the call graph stays flat and readable; resist the urge to package-split until a real friction shows up.
 
 ### Retrieval pipeline (`retrieve()` in rag.py)
 
@@ -66,7 +79,7 @@ Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. E
 
 Hash per file triggers re-embed only when content changes. Orphan cleanup on full index. `is_excluded()` skips any path whose segment starts with `.` (.trash, .obsidian, .claude, .git…).
 
-Breaking schema changes must bump `COLLECTION_NAME` (currently `obsidian_notes_v6`) so `get_or_create_collection` produces a fresh space; old collections become orphans and can be deleted.
+Breaking schema changes must bump `_COLLECTION_BASE` (currently `obsidian_notes_v7`) so `get_or_create_collection` produces a fresh space; old collections become orphans and can be deleted. Per-vault suffix is appended automatically (sha256[:8] of `VAULT_PATH`) when running against a non-default vault, so multi-vault setups don't share an index.
 
 ### Model stack (two tiers, with fallback resolver)
 
@@ -93,9 +106,28 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 
 `NOTE_LINK_RE` accepts single-level balanced parens inside the path so `Explorando (otras)/…md` renders correctly. `verify_citations()` checks both formats against the retrieved metas and flags unknown paths after the response.
 
-### Save intent (`detect_save_intent`, `save_note`)
+### In-chat intents (`detect_save_intent`, `detect_reindex_intent`)
 
-`rag chat` accepts `/save [título]` and natural-language saves. Strong save verbs (`guardá|salvá|agendá`) trigger alone; neutral verbs (`creá|agregá|añadí|escribí|armá|generá`) require "nota/notas" within ~5 tokens. Saved notes land in `00-Inbox/` with frontmatter carrying union-of-source tags, `related:` wikilinks to retrieved notes, and the original `source_query`. The new note is auto-indexed so it's searchable immediately.
+`rag chat` parses two intents off the user's input before treating it as a question. Reindex is checked first so "reindexá las notas" doesn't trip the save heuristic via the word "notas".
+
+- **Save**: `/save [título]` or NL saves. Strong save verbs (`guardá|salvá|agendá`) trigger alone; neutral verbs (`creá|agregá|añadí|escribí|armá|generá`) require "nota/notas" within ~5 tokens. Saved notes land in `00-Inbox/` with frontmatter carrying union-of-source tags, `related:` wikilinks to retrieved notes, and the original `source_query`. The new note is auto-indexed so it's searchable immediately.
+- **Reindex**: `/reindex [reset]` or NL ("reindexá", "actualizá el vault", "reescaneá las notas", "refrescá el índice"). Strong verbs (reindex/reescan/refresc) trigger alone; weak `actualiz` requires an object (vault/índice/notas/todo). Reset markers (`desde cero|completo|reset|rebuild|scratch`) flip to full rebuild. Calls `_run_index()` — the same helper the CLI command wraps — so behaviour matches `rag index` exactly.
+
+### Agent mode (`rag do`)
+
+`rag do "instrucción"` runs a tool-calling loop with command-r. Tools exposed: `_agent_tool_search` (calls `retrieve()`), `_agent_tool_read_note`, `_agent_tool_list_notes`, `_agent_tool_propose_write`. Writes are NOT applied during the loop — they accumulate in `_AGENT_PENDING_WRITES` and the user confirms each at the end (skip with `--yes`, cap iterations with `--max-iterations`, default 8). No delete/move tools by design — first version is conservative.
+
+### Contradiction Radar
+
+Three-phase feature that turns the vault into an interlocutor instead of an archive: it surfaces tensions between notes instead of just retrieving agreement.
+
+- **Phase 1 — query-time counter-evidence** (`find_contradictions`, `render_contradictions`). Opt-in `--counter` on `rag query` and `rag chat`. After the LLM answer, embed it, pull nearest chunks, drop already-cited paths, rerank vs the original question, ask the chat model for real contradictions only (strict JSON prompt, conservative bias). Renders a "⚡ Counter-evidence" block under the answer; persists `contradictions: [{path, why}]` to the query log + session turn.
+- **Phase 2 — index-time flag** (`find_contradictions_for_note`, `_check_and_flag_contradictions`). On every new/modified note in incremental indexing, the same detector runs against the rest of the vault. Hits land in **two sinks**: `contradicts: [path, ...]` in the note's YAML frontmatter (so Obsidian/dataview can surface it inline) AND a sidecar log at `~/.local/share/obsidian-rag/contradictions.jsonl`. Skipped on `--reset` (would be O(n²)); also skipped if `note_body < 200 chars` or via `--no-contradict`.
+- **Phase 3 — weekly narrative digest** (`rag digest`). Reads recent notes (vault mtime), `contradicts:` frontmatter, the sidecar log, the query log's `contradictions` field, and low-confidence queries. command-r drafts a first-person review (~400-600 words, with `[[wikilinks]]`) into `05-Reviews/YYYY-WNN.md`, auto-indexed.
+
+**Detector model — empirical**: both detectors use `resolve_chat_model()` (command-r), NOT the helper. qwen2.5:3b proved non-deterministic at temp=0 seed=42 on this corpus (same case yields FP first run, empty next) and emits malformed JSON often. command-r hugs source text and returns parseable output. Cost ~5-10s per check — bounded by guardrails (opt-in for query; only changed notes for index). The pattern of "use the helper for cheap rewrites, escalate to chat model for judgment" is worth preserving.
+
+Tests: `tests/test_contradictions.py` (16 cases — fixtures monkeypatch `embed`/`get_reranker`/`ollama.chat` so model-agnostic), `tests/test_digest.py` (11 cases). `tests/contradiction_cases.yaml` is a golden set ready for a future eval harness when the detector prompt gets tuned.
 
 ## Eval harness (`rag eval` + `queries.yaml`)
 
@@ -133,6 +165,6 @@ Tests: `tests/test_sessions.py` covers the module end-to-end — monkeypatches `
 
 ## Vault path
 
-Hardcoded to `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes` (iCloud). If running against a different vault, change `VAULT_PATH` at the top of `rag.py` and run `rag index --reset`.
+Defaults to `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes` (iCloud). Override at runtime with the `OBSIDIAN_RAG_VAULT` env var — collections are namespaced per resolved vault path (sha256[:8] suffix on `_COLLECTION_BASE`) so switching doesn't pollute the index. Fresh vault = fresh collection automatically; just `rag index` after pointing at it.
 
 The `memory` directory Claude Code reads at `~/.claude/projects/-Users-fer/memory/` is a symlink into the vault (`04-Archive/99-obsidian-system/99-Claude/memory/`). Renaming that folder in the vault requires re-pointing the symlink.

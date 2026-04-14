@@ -171,8 +171,20 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-f
 COLLECTION_NAME = "obsidian_notes_v6"  # v6: larger chunks (150-800), parent-in-metadata
 
 # Deterministic decoding — this is a retrieval tool, not creative writing.
-CHAT_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42}
-HELPER_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42}
+# num_ctx: headroom for system rules (~800 chars) + context (5 chunks × ~800 chars)
+# + query + answer. 8192 tokens cubre holgado sin desperdiciar VRAM.
+CHAT_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42, "num_ctx": 8192}
+HELPER_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42, "num_ctx": 2048}
+
+# Keep models resident in VRAM between queries — avoids 2-3s cold reload.
+# Ollama accepts -1 (forever, as int) or a duration string like "30m". Default
+# to forever for the local-first use case; user can tune via env var.
+def _parse_keep_alive(val: str) -> int | str:
+    try:
+        return int(val)
+    except ValueError:
+        return val
+OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "-1"))
 
 
 _CHAT_MODEL_RESOLVED: str | None = None
@@ -398,7 +410,7 @@ def semantic_chunks(
 # ── EMBEDDING ─────────────────────────────────────────────────────────────────
 
 def embed(texts: list[str]) -> list[list[float]]:
-    resp = ollama.embed(model=EMBED_MODEL, input=texts)
+    resp = ollama.embed(model=EMBED_MODEL, input=texts, keep_alive=OLLAMA_KEEP_ALIVE)
     return resp.embeddings
 
 
@@ -411,6 +423,7 @@ def hyde_embed(question: str) -> list[float]:
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
     )
     return embed([resp.message.content.strip()])[0]
 
@@ -560,6 +573,7 @@ def expand_queries(question: str) -> list[str]:
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
     )
     lines = [l.strip(" -*·") for l in resp.message.content.splitlines() if l.strip()]
     variants = [question] + [l for l in lines if l != question][:2]
@@ -814,6 +828,149 @@ def print_sources(result: dict) -> None:
     console.print(render_sources(result["metas"], result["scores"]))
 
 
+def find_related(
+    col: chromadb.Collection,
+    source_metas: list[dict],
+    limit: int = 5,
+    min_shared: int = 2,
+) -> list[tuple[dict, int]]:
+    """Return up to `limit` notes related to the sources by shared tags.
+
+    Score = number of tags shared with the UNION of source tags. Notes that
+    appear in sources are excluded. Ties broken by folder proximity
+    (same top-level folder as any source ranks higher).
+    """
+    source_paths = {m.get("file", "") for m in source_metas}
+    source_tags: set[str] = set()
+    source_roots: set[str] = set()
+    for m in source_metas:
+        for t in (m.get("tags") or "").split(","):
+            t = t.strip()
+            if t:
+                source_tags.add(t)
+        f = m.get("file", "")
+        if "/" in f:
+            source_roots.add(f.split("/", 1)[0])
+
+    if not source_tags:
+        return []
+
+    c = _load_corpus(col)
+    candidates: dict[str, tuple[dict, int, int]] = {}
+    for m in c["metas"]:
+        f = m.get("file", "")
+        if f in source_paths or f in candidates or is_excluded(f):
+            continue
+        tags = [t.strip() for t in (m.get("tags") or "").split(",") if t.strip()]
+        shared = len(source_tags.intersection(tags))
+        if shared < min_shared:
+            continue
+        root_match = 1 if f.split("/", 1)[0] in source_roots else 0
+        candidates[f] = (m, shared, root_match)
+
+    # Sort: most shared tags → same top-folder → alphabetical
+    ranked = sorted(
+        candidates.values(),
+        key=lambda x: (-x[1], -x[2], x[0].get("file", "")),
+    )
+    return [(m, shared) for m, shared, _ in ranked[:limit]]
+
+
+INBOX_FOLDER = "00-Inbox"
+
+
+def save_note(
+    col: chromadb.Collection,
+    title: str | None,
+    body: str,
+    question: str,
+    source_metas: list[dict],
+    folder: str = INBOX_FOLDER,
+) -> Path:
+    """Create a new Markdown note in the vault from a chat response.
+
+    Returns the absolute Path written. Also indexes the new note so it
+    becomes retrievable immediately.
+    """
+    # Title: user-supplied → first non-empty line of body → timestamp.
+    if title:
+        clean_title = title.strip().strip('"').strip("'")
+    else:
+        first_line = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+        # strip markdown bullets / leading # if present
+        first_line = re.sub(r"^[#*\-\d.\s]+", "", first_line).strip()
+        clean_title = first_line[:80] or datetime.now().strftime("nota-%Y%m%d-%H%M%S")
+    # Sanitise for filename
+    safe = re.sub(r"[/\\:\n]", " ", clean_title).strip()
+    safe = safe or datetime.now().strftime("nota-%Y%m%d-%H%M%S")
+    path = VAULT_PATH / folder / f"{safe}.md"
+
+    # Avoid clobbering an existing note — suffix with a timestamp.
+    if path.exists():
+        path = path.with_name(
+            f"{safe} ({datetime.now().strftime('%H%M%S')}).md"
+        )
+
+    # Aggregate tags from source notes (union, capped).
+    all_tags: list[str] = []
+    for m in source_metas:
+        for t in (m.get("tags") or "").split(","):
+            t = t.strip()
+            if t and t not in all_tags:
+                all_tags.append(t)
+    all_tags = all_tags[:10]
+
+    now = datetime.now().isoformat(timespec="seconds")
+    fm_lines = [
+        "---",
+        f"created: '{now}'",
+        f"modified: '{now}'",
+    ]
+    if all_tags:
+        fm_lines.append("tags:")
+        for t in all_tags:
+            fm_lines.append(f"- {t}")
+    # Source notes for traceability.
+    if source_metas:
+        fm_lines.append("related:")
+        for m in source_metas:
+            fm_lines.append(f"- '[[{m.get('note', '')}]]'")
+    fm_lines.append(f"source_query: {question!r}")
+    fm_lines.append("---")
+    frontmatter = "\n".join(fm_lines)
+
+    content = f"{frontmatter}\n\n# {clean_title}\n\n{body.strip()}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    # Index immediately so it's searchable right away.
+    try:
+        _index_single_file(col, path)
+    except Exception:
+        pass
+
+    return path
+
+
+def render_related(related: list[tuple[dict, int]]) -> None:
+    """Print a compact panel of related notes with shared-tag counts."""
+    if not related:
+        return
+    console.print()
+    console.print(Rule(title="[dim]Relacionadas[/dim]", style="dim", characters="╌"))
+    tbl = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
+    tbl.add_column(style="dim", justify="right")
+    tbl.add_column(style="bold magenta")
+    tbl.add_column(style="cyan dim")
+    for m, shared in related:
+        tbl.add_row(
+            f"×{shared}",
+            m.get("note", ""),
+            m.get("file", ""),
+        )
+    console.print(tbl)
+
+
 def reformulate_query(question: str, history: list[dict]) -> str:
     """Rewrite the question as a standalone search query using conversation history."""
     if not history:
@@ -836,6 +993,7 @@ def reformulate_query(question: str, history: list[dict]) -> str:
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
     )
     return resp.message.content.strip().strip('"')
 
@@ -915,12 +1073,16 @@ def retrieve(
     else:
         variant_embeds = embed(variants)
 
+    # Sequential — ChromaDB + BM25Okapi both hold a GIL-bound mutex, so
+    # ThreadPoolExecutor over these serialises anyway AND adds per-task
+    # overhead. Measured: parallel 3× slower than sequential on M3 Max.
     seen_ids: set[str] = set()
     merged_ordered: list[str] = []
+    n_results = min(RETRIEVE_K, col.count())
     for v, q_embed in zip(variants, variant_embeds):
         sem_kwargs: dict = {
             "query_embeddings": [q_embed],
-            "n_results": min(RETRIEVE_K, col.count()),
+            "n_results": n_results,
             "include": ["documents", "metadatas"],
         }
         if where:
@@ -1328,6 +1490,7 @@ def query(
             console.print(Markdown(d))
             console.print(Rule(style="dim"))
         print_sources(result)
+        render_related(find_related(col, result["metas"]))
         return
 
     # Gate LLM on reranker confidence. Negative top score ≈ rerank found
@@ -1341,6 +1504,7 @@ def query(
             f"usá --force para llamar al LLM igual)[/dim]"
         )
         print_sources(result)
+        render_related(find_related(col, result["metas"]))
         log_query_event({
             "cmd": "query", "q": question,
             "filters": result.get("filters_applied"),
@@ -1365,16 +1529,24 @@ def query(
     )
 
     t_gen_start = time.perf_counter()
-    with console.status("[dim]pensando…[/dim]", spinner="dots"):
-        response = ollama.chat(
+    console.print()
+    parts: list[str] = []
+    # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
+    # the answer forming. We render unstyled during the stream, then redraw
+    # with link/ext styling at the end.
+    from rich.live import Live
+    with Live("", console=console, refresh_per_second=12, transient=True) as live:
+        for chunk in ollama.chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-        )
+            stream=True,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        ):
+            parts.append(chunk.message.content)
+            live.update(Text("".join(parts)))
     t_gen = time.perf_counter() - t_gen_start
-    full = response.message.content
-
-    console.print()
+    full = "".join(parts)
     console.print(render_response(full))
 
     bad = verify_citations(full, result["metas"])
@@ -1400,6 +1572,7 @@ def query(
     })
 
     print_sources(result)
+    render_related(find_related(col, result["metas"]))
 
 
 @cli.command()
@@ -1439,11 +1612,14 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
-        "[dim]/exit o Ctrl+C para salir[/dim]",
+        "[dim]/save [título] guarda última respuesta · /exit o Ctrl+C para salir[/dim]",
         border_style="green",
     ))
 
     history: list[dict] = []
+    last_assistant = ""
+    last_question = ""
+    last_sources: list[dict] = []
     first_turn = True
     while True:
         try:
@@ -1459,6 +1635,19 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # /save [título opcional] — dump last assistant response to a new note.
+        if question.startswith("/save"):
+            if not last_assistant:
+                console.print("[yellow]No hay respuesta para guardar todavía.[/yellow]")
+                continue
+            title = question[len("/save"):].strip() or None
+            path = save_note(
+                col, title, last_assistant, last_question, last_sources,
+            )
+            rel = path.relative_to(VAULT_PATH)
+            console.print(f"[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]")
             continue
 
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
@@ -1481,16 +1670,27 @@ def chat(
         history.append({"role": "user", "content": question})
         messages = [{"role": "system", "content": system}] + history[-6:]
 
-        with console.status("[dim]pensando…[/dim]", spinner="dots"):
-            response = ollama.chat(
-                model=resolve_chat_model(), messages=messages, options=CHAT_OPTIONS
-            )
-        full = response.message.content
-
         console.print()
+        parts: list[str] = []
+        from rich.live import Live
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            for chunk in ollama.chat(
+                model=resolve_chat_model(),
+                messages=messages,
+                options=CHAT_OPTIONS,
+                stream=True,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            ):
+                parts.append(chunk.message.content)
+                live.update(Text("".join(parts)))
+        full = "".join(parts)
         console.print(render_response(full))
         history.append({"role": "assistant", "content": full})
+        last_assistant = full
+        last_question = question
+        last_sources = list(result["metas"])
         print_sources(result)
+        render_related(find_related(col, result["metas"]))
 
 
 @cli.command()

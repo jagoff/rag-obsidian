@@ -485,6 +485,13 @@ def is_excluded(rel_path: str) -> bool:
     """
     return any(seg.startswith(".") for seg in rel_path.split("/") if seg)
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
+# Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
+# 2 métodos el pool crudo llega a 70-80 únicos, reranker tarda ~4s. Cappear
+# a 40 lleva el rerank a ~2.5s (ahorro ~1.5s) manteniendo hit@5 = RERANK_TOP
+# siempre es ≤5, imposible que el top-5 caiga fuera del top-40 RRF salvo
+# corner case con score muy plano. Calibrado empíricamente — bajarlo a 30
+# arriesga recall en queries ambigüas.
+RERANK_POOL_MAX = 40
 RERANK_TOP = 5     # final chunks after reranking
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
@@ -2613,6 +2620,12 @@ def retrieve(
             "search_query": search_query, "filters_applied": filters_applied,
             "query_variants": variants,
         }
+
+    # 5a. Cap pool antes de fetch/rerank. El reranker es O(n) en pares y
+    #     domina la latencia de la query (~50ms/par en MPS fp32). Un pool
+    #     de 40 mantiene recall efectivo (top-5 rarísimo que esté fuera
+    #     del top-40 RRF) y ahorra 1-2s por query.
+    merged_ordered = merged_ordered[:RERANK_POOL_MAX]
 
     # 5. Fetch candidates
     fetched = col.get(ids=merged_ordered, include=["documents", "metadatas"])

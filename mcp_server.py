@@ -160,6 +160,42 @@ def rag_list_notes(
 
 
 @mcp.tool()
+def rag_links(
+    query: str,
+    k: int = 5,
+    folder: str | None = None,
+    tag: str | None = None,
+) -> list[dict]:
+    """Find URLs in the vault by semantic context match.
+
+    Designed for "where is the link to X" type questions. Returns the literal
+    URLs along with their source note, anchor text (when written as
+    `[anchor](url)`), line number, and the surrounding prose used for ranking.
+    Bypasses the chat LLM — no paraphrasing of URLs.
+
+    Args:
+        query: Natural-language description of what the link is about.
+        k: Number of URLs to return (default 5, max 30).
+        folder: Optional folder filter, e.g. "03-Resources".
+        tag: Optional tag filter (no '#' prefix).
+    """
+    k = max(1, min(k, 30))
+    items = rag.find_urls(query, k=k, folder=folder, tag=tag)
+    return [
+        {
+            "url": it["url"],
+            "anchor": it.get("anchor", ""),
+            "path": it["path"],
+            "note": it.get("note", ""),
+            "line": it.get("line", 0),
+            "context": it.get("context", ""),
+            "score": round(float(it.get("score", 0.0)), 3),
+        }
+        for it in items
+    ]
+
+
+@mcp.tool()
 def rag_stats() -> dict:
     """Return indexing metadata: chunk count, models, collection name."""
     col = rag.get_db()

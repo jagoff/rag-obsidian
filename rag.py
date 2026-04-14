@@ -338,11 +338,19 @@ CHAT_MODEL_PREFERENCE = ("command-r:latest", "qwen2.5:14b", "phi4:latest")
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
 _COLLECTION_BASE = "obsidian_notes_v7"  # v7: wikilinks (outlinks) in metadata
+# Separate collection for URL-context embeddings — the URL-finder pipeline
+# scores against the prose around each link, not the link string itself.
+# Versioned independently from the main collection.
+_URLS_COLLECTION_BASE = "obsidian_urls_v1"
 # Per-vault suffix so multiple vaults don't share a collection.
 _vault_slug = hashlib.sha256(str(VAULT_PATH.resolve()).encode()).hexdigest()[:8]
 COLLECTION_NAME = (
     _COLLECTION_BASE if str(VAULT_PATH.resolve()) == str(_DEFAULT_VAULT.resolve())
     else f"{_COLLECTION_BASE}_{_vault_slug}"
+)
+URLS_COLLECTION_NAME = (
+    _URLS_COLLECTION_BASE if str(VAULT_PATH.resolve()) == str(_DEFAULT_VAULT.resolve())
+    else f"{_URLS_COLLECTION_BASE}_{_vault_slug}"
 )
 
 # Deterministic decoding — this is a retrieval tool, not creative writing.
@@ -427,6 +435,142 @@ def get_db() -> chromadb.Collection:
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
+
+
+def get_urls_db() -> chromadb.Collection:
+    """Companion collection storing one row per URL found in the vault, with
+    its surrounding prose embedded for semantic-by-context lookup.
+    """
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    return client.get_or_create_collection(
+        name=URLS_COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+# ── URL EXTRACTION ────────────────────────────────────────────────────────────
+# URLs in markdown notes show up two ways: as `[anchor](https://...)` (preferred,
+# carries human description) and as bare `https://...`. We extract both, dedup
+# by URL within a file, and capture ±URL_CONTEXT_CHARS of surrounding prose so
+# the URL-finder can match queries like "donde está el link a la doc de X" by
+# semantic similarity to that context, not to the URL itself.
+
+URL_BARE_RE = re.compile(r'https?://[^\s\)\]"\'<>`]+', re.IGNORECASE)
+URL_MD_RE = re.compile(r'\[([^\]]+)\]\((https?://[^\)\s]+)\)', re.IGNORECASE)
+# Trailing punctuation that's almost never part of a real URL.
+_URL_TRAILING_PUNCT = ".,;:!?)>\"'`"
+URL_CONTEXT_CHARS = 240
+# Images and media — almost always noise when the user asks for "links" or
+# "documentación de X". Filtered at extraction time. Embedded image references
+# in markdown also use `![alt](url)` which never goes through URL_MD_RE
+# (notice the leading `!` is not consumed by `[`); but bare image URLs in prose
+# are common (CDN links inside copy-pasted docs), so we filter on the path tail.
+_IMAGE_EXT_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|webp|bmp|ico|tiff?|avif|heic|mp4|webm|mov|mp3|wav|ogg|pdf)"
+    r"(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_media_url(url: str) -> bool:
+    return bool(_IMAGE_EXT_RE.search(url))
+
+
+def _grab_url_context(text: str, start: int, end: int, window: int = URL_CONTEXT_CHARS) -> str:
+    """Return up to `window` chars on each side of [start, end), single-line."""
+    a = max(0, start - window)
+    b = min(len(text), end + window)
+    snippet = text[a:b]
+    snippet = re.sub(r'\s+', ' ', snippet).strip()
+    return snippet[:window * 2 + 100]
+
+
+def extract_urls(text: str) -> list[dict]:
+    """Pull every URL out of a note body. Returns deduped list of
+    {url, anchor, line, context}.
+
+    Markdown-style links are scanned first and consumed so a bare-URL pass
+    doesn't double-flag the same address inside a `[label](url)`.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    consumed: list[tuple[int, int]] = []
+    for m in URL_MD_RE.finditer(text):
+        anchor, url = m.group(1).strip(), m.group(2).strip()
+        consumed.append(m.span())
+        if url in seen or _is_media_url(url):
+            continue
+        seen.add(url)
+        out.append({
+            "url": url,
+            "anchor": anchor[:120],
+            "line": text[:m.start()].count("\n") + 1,
+            "context": _grab_url_context(text, m.start(), m.end()),
+        })
+    for m in URL_BARE_RE.finditer(text):
+        if any(s <= m.start() < e for s, e in consumed):
+            continue
+        url = m.group(0).rstrip(_URL_TRAILING_PUNCT)
+        if url in seen or _is_media_url(url):
+            continue
+        seen.add(url)
+        out.append({
+            "url": url,
+            "anchor": "",
+            "line": text[:m.start()].count("\n") + 1,
+            "context": _grab_url_context(text, m.start(), m.end()),
+        })
+    return out
+
+
+def _index_urls(
+    col_urls: chromadb.Collection,
+    doc_id_prefix: str,
+    raw_text: str,
+    note_title: str,
+    folder: str,
+    tags: list[str],
+) -> int:
+    """Replace the URL rows for this file with entries extracted from raw_text.
+    Returns the count of URL rows written.
+
+    Idempotent: deletes any existing rows whose id starts with `{path}::url::`,
+    then re-inserts. Called from `_index_single_file` so URL state stays in
+    lockstep with the main chunk index.
+    """
+    # Delete any prior URL rows for this file. ChromaDB has no prefix delete,
+    # so we list ids and filter.
+    existing = col_urls.get(where={"file": doc_id_prefix}, include=[])
+    if existing.get("ids"):
+        col_urls.delete(ids=existing["ids"])
+
+    urls = extract_urls(raw_text)
+    if not urls:
+        return 0
+
+    ids = [f"{doc_id_prefix}::url::{i}" for i in range(len(urls))]
+    contexts = [u["context"] for u in urls]
+    embeddings = embed(contexts)
+    metas = [
+        {
+            "file": doc_id_prefix,
+            "note": note_title,
+            "folder": folder,
+            "tags": ",".join(tags),
+            "url": u["url"],
+            "anchor": u["anchor"],
+            "line": u["line"],
+        }
+        for u in urls
+    ]
+    col_urls.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=contexts,
+        metadatas=metas,
+    )
+    return len(urls)
 
 
 # ── TEXT PROCESSING ───────────────────────────────────────────────────────────
@@ -1207,6 +1351,35 @@ _REINDEX_RESET_RE = re.compile(
     r"\b(?:desde\s+cero|de\s+cero|completo|reset(?:ear|á|a)?|rebuild|scratch|borr(?:ar|á|alo)\s+(?:y|e)\s+rehacer)\b",
     re.IGNORECASE,
 )
+
+
+# Link-finder intent — when the user wants the URL itself, not prose about
+# the URL. Patterns: "link/url/enlace/doc(umentación) de|para|a X",
+# "donde está/tengo el link/url/doc de X", "dame el link/url/enlace de X".
+# Tight on purpose — must not steal "qué dice X sobre Y" or generic queries.
+_LINK_INTENT_RE = re.compile(
+    r"(?:"
+    r"\b(?:link|url|enlace|enlaces|links|urls|doc|docs|documentaci[oó]n)\b\s+(?:de|del|para|a|al|sobre)\s+"
+    r"|d[oó]nde\s+(?:est[áa]|tengo|guardo|qued[oó]|hab[íi]a)\s+(?:el\s+|la\s+|los\s+|las\s+)?(?:link|url|enlace|doc|documentaci[oó]n)"
+    r"|dame\s+(?:el|los|la|las)\s+(?:link|url|enlace|enlaces|links|urls|doc|docs)"
+    r"|busc[áa]\s+(?:el|los|la|las)\s+(?:link|url|enlace|doc)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def detect_link_intent(text: str) -> tuple[bool, str | None]:
+    """Return (matches, query). When matches, `query` is the residual text
+    after stripping the trigger phrase — what to actually search for. None
+    means "use the whole input verbatim".
+    """
+    t = text.strip()
+    if t.startswith("/links"):
+        rest = t[len("/links"):].strip()
+        return True, (rest or None)
+    if not _LINK_INTENT_RE.search(t):
+        return False, None
+    return True, None
 
 
 def detect_reindex_intent(text: str) -> tuple[bool, bool]:
@@ -2000,6 +2173,11 @@ def _index_single_file(
         documents=display_texts,
         metadatas=metadatas,
     )
+    # URL sub-index runs in lockstep — same hash gate, same liveness window.
+    try:
+        _index_urls(get_urls_db(), doc_id_prefix, raw, path.stem, folder, tags)
+    except Exception:
+        pass
     _invalidate_corpus_cache()
     return "indexed"
 
@@ -2016,14 +2194,18 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
     if reset:
         client = chromadb.PersistentClient(path=str(DB_PATH))
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
+        for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
+            try:
+                client.delete_collection(cname)
+            except Exception:
+                pass
         col = client.get_or_create_collection(
             COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
-        console.print("[yellow]Índice borrado.[/yellow]")
+        console.print("[yellow]Índice borrado (notas + URLs).[/yellow]")
+
+    col_urls = get_urls_db()
+    urls_indexed = 0
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
     existing_all = col.get(include=["metadatas"])
@@ -2114,6 +2296,11 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             metadatas=metadatas,
         )
         added_chunks += len(ids)
+        # URL sub-index, same hash gate as the chunk index above.
+        try:
+            urls_indexed += _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
+        except Exception:
+            pass
         indexed_files.add(doc_id_prefix)
 
     # Orphan cleanup: files in DB that no longer exist on disk
@@ -2123,15 +2310,25 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         orphan_ids.extend(eid for eid, _ in file_to_chunks[f])
     if orphan_ids:
         col.delete(ids=orphan_ids)
+    # Mirror orphan cleanup in the URL collection.
+    for f in orphan_files:
+        try:
+            existing_urls = col_urls.get(where={"file": f}, include=[])
+            if existing_urls.get("ids"):
+                col_urls.delete(ids=existing_urls["ids"])
+        except Exception:
+            pass
 
     console.print(
         f"[green]Listo. {added_chunks} chunks (re)indexados · "
         f"{updated_files} notas actualizadas · "
+        f"{urls_indexed} URLs indexadas · "
         f"{len(orphan_files)} huérfanas limpiadas.[/green]"
     )
     return {
         "added_chunks": added_chunks,
         "updated_files": updated_files,
+        "urls_indexed": urls_indexed,
         "orphans": len(orphan_files),
         "total_files": len(md_files),
     }
@@ -2596,7 +2793,7 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
-        "[dim]/save [título] guarda · /reindex [reset] reindexa el vault · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /exit[/dim]",
         border_style="green",
     ))
 
@@ -2624,6 +2821,24 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # Link intent — "donde está el link a X", "dame la url de Y",
+        # "documentación de Z". Bypasses the LLM and returns URLs directly
+        # from the URL sub-index. Checked early so a query that names a
+        # vault topic doesn't get prose-paraphrased when the user really
+        # wanted the literal link.
+        is_link, link_q = detect_link_intent(question)
+        if is_link:
+            search_q = link_q or question
+            with console.status("[dim]buscando URLs…[/dim]", spinner="dots"):
+                items = find_urls(search_q, k=10)
+            render_links(items)
+            log_query_event({
+                "cmd": "links", "q": search_q, "via": "chat",
+                "n_results": len(items),
+                "top_url": items[0]["url"] if items else None,
+            })
             continue
 
         # Reindex intent — accepts /reindex or natural-language ("reindexá",
@@ -3910,12 +4125,202 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print("[dim](sin writes propuestos)[/dim]")
 
 
+def find_urls(
+    query: str,
+    k: int = 10,
+    folder: str | None = None,
+    tag: str | None = None,
+) -> list[dict]:
+    """Semantic-by-context search over the URL sub-index.
+
+    The collection embeds the prose around each URL (not the URL string), so a
+    query like "documentación de claude code" matches notes that introduce or
+    annotate the relevant link. Reranks the top candidates against the query
+    with the cross-encoder, dedups by URL, returns up to k items.
+    """
+    col_urls = get_urls_db()
+    if col_urls.count() == 0:
+        return []
+    try:
+        q_embed = embed([query])[0]
+    except Exception:
+        return []
+    where = build_where(folder, tag)
+    n = min(k * 3 + 5, col_urls.count())
+    kwargs: dict = {
+        "query_embeddings": [q_embed], "n_results": n,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        kwargs["where"] = where
+    res = col_urls.query(**kwargs)
+    docs, metas, dists = res["documents"][0], res["metadatas"][0], res["distances"][0]
+    if not docs:
+        return []
+    try:
+        reranker = get_reranker()
+        scores = [float(s) for s in reranker.predict(
+            [(query, d) for d in docs], show_progress_bar=False,
+        )]
+    except Exception:
+        scores = [1.0 - float(d) for d in dists]
+    items: list[dict] = []
+    seen: set[str] = set()
+    per_file: dict[str, int] = {}
+    PER_FILE_CAP = 2  # diversify so one note can't dominate the top-k
+    for d, m, score in sorted(
+        zip(docs, metas, scores), key=lambda x: x[2], reverse=True,
+    ):
+        url = m.get("url", "")
+        path_str = m.get("file", "")
+        if not url or url in seen:
+            continue
+        if per_file.get(path_str, 0) >= PER_FILE_CAP:
+            continue
+        seen.add(url)
+        per_file[path_str] = per_file.get(path_str, 0) + 1
+        items.append({
+            "url": url,
+            "anchor": m.get("anchor", ""),
+            "path": path_str,
+            "note": m.get("note", ""),
+            "line": m.get("line", 0),
+            "context": d,
+            "score": score,
+        })
+        if len(items) >= k:
+            break
+    return items
+
+
+def render_links(items: list[dict], plain: bool = False) -> None:
+    """Render link-finder results. Plain mode = bot/script-friendly text."""
+    if not items:
+        if plain:
+            click.echo("Sin URLs.")
+        else:
+            console.print("[yellow]Sin URLs en el vault para esa consulta.[/yellow]")
+        return
+    if plain:
+        for i, it in enumerate(items, 1):
+            click.echo(f"{i}. {it['url']}")
+            label = it.get("anchor") or it.get("note", "")
+            if label:
+                click.echo(f"   {label}")
+            click.echo(f"   en {it['path']}:{it.get('line', 0)}")
+        return
+    console.print()
+    console.print(Rule(title="[bold cyan]🔗 Links[/bold cyan]", style="cyan"))
+    for i, it in enumerate(items, 1):
+        console.print()
+        head = Text()
+        head.append(f" {i}. ", style="bold cyan")
+        # Real OSC 8 hyperlink so Cmd/Ctrl-click opens in the default browser.
+        head.append(it["url"], style=f"underline blue link {it['url']}")
+        console.print(head)
+        if it.get("anchor"):
+            console.print(f"    [italic]{it['anchor']}[/italic]")
+        loc = Text()
+        loc.append("    en ", style="dim")
+        loc.append(it.get("note", ""), style=_file_link_style(it["path"], "magenta"))
+        loc.append(
+            f"  ({it['path']}:{it.get('line', 0)})",
+            style=_file_link_style(it["path"], "dim"),
+        )
+        console.print(loc)
+        ctx = (it.get("context") or "").strip()
+        if ctx:
+            ctx_short = ctx[:240] + ("…" if len(ctx) > 240 else "")
+            console.print(f"    [dim]{ctx_short}[/dim]")
+
+
+def _rebuild_urls_index() -> dict:
+    """Re-extract URLs from every note in the vault into the URL collection
+    without touching chunk embeddings. Cheap (no LLM, no chunk re-embed) — use
+    after upgrades that change URL extraction logic, or to backfill the URL
+    index on a vault that was already chunk-indexed before this feature.
+    """
+    col_urls = get_urls_db()
+    md_files = [
+        p for p in VAULT_PATH.rglob("*.md")
+        if not is_excluded(str(p.relative_to(VAULT_PATH)))
+    ]
+    console.print(f"[cyan]Re-extrayendo URLs de {len(md_files)} notas...[/cyan]")
+    total = 0
+    files_with_urls = 0
+    for path in track(md_files, description="URLs..."):
+        try:
+            doc_id_prefix = str(path.relative_to(VAULT_PATH))
+            folder = str(path.relative_to(VAULT_PATH).parent)
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+            fm = parse_frontmatter(raw)
+            tags = [str(t) for t in (fm.get("tags") or []) if t]
+            n = _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
+            total += n
+            if n:
+                files_with_urls += 1
+        except Exception:
+            continue
+    console.print(
+        f"[green]Listo. {total} URLs en {files_with_urls} notas.[/green]"
+    )
+    return {"urls": total, "files": files_with_urls}
+
+
+@cli.command()
+@click.argument("query", required=False)
+@click.option("-k", default=10, help="Cantidad de URLs a devolver (default: 10)")
+@click.option("--folder", default=None, help="Filtrar por carpeta")
+@click.option("--tag", default=None, help="Filtrar por tag")
+@click.option("--open", "open_idx", type=int, default=None,
+              help="Abrir la URL del rank N en el browser por defecto (macOS: open)")
+@click.option("--plain", is_flag=True, help="Salida plana sin colores/paneles")
+@click.option("--rebuild", is_flag=True,
+              help="Re-extraer URLs de todas las notas sin re-embeddar chunks")
+def links(query: str | None, k: int, folder: str | None, tag: str | None,
+          open_idx: int | None, plain: bool, rebuild: bool):
+    """Buscar URLs en el vault por contexto semántico — respuesta sin LLM."""
+    if rebuild:
+        _rebuild_urls_index()
+        return
+    if not query:
+        console.print("[yellow]Pasá una query o usá --rebuild.[/yellow]")
+        return
+    items = find_urls(query, k=k, folder=folder, tag=tag)
+    if open_idx is not None:
+        if not (1 <= open_idx <= len(items)):
+            msg = f"Índice {open_idx} fuera de rango (1-{len(items)})"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+        url = items[open_idx - 1]["url"]
+        import subprocess
+        try:
+            subprocess.run(["open", url], check=False)
+        except Exception as e:
+            msg = f"No pude abrir: {e}"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+        click.echo(f"abierto: {url}") if plain else console.print(f"[green]✓ Abierto:[/green] {url}")
+        return
+    render_links(items, plain=plain)
+    log_query_event({
+        "cmd": "links", "q": query, "n_results": len(items),
+        "folder": folder, "tag": tag,
+        "top_url": items[0]["url"] if items else None,
+    })
+
+
 @cli.command()
 def stats():
     """Estado del índice."""
     col = get_db()
     count = col.count()
+    try:
+        urls_count = get_urls_db().count()
+    except Exception:
+        urls_count = 0
     console.print(f"[cyan]Chunks indexados:[/cyan] {count}")
+    console.print(f"[cyan]URLs indexadas:[/cyan] {urls_count}  [dim]({URLS_COLLECTION_NAME})[/dim]")
     console.print(f"[cyan]Vault:[/cyan] {VAULT_PATH}")
     console.print(f"[cyan]DB:[/cyan] {DB_PATH}")
     console.print(f"[cyan]Colección:[/cyan] {COLLECTION_NAME}")

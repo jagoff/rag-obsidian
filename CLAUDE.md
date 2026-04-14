@@ -35,6 +35,11 @@ rag session list | show <id> | clear <id> | cleanup [--days N]
 rag do "instrucción"   # tool-calling agent: search/read/list + propose_write with confirm
 rag digest             # weekly narrative review of vault evolution. --week YYYY-WNN, --days N, --dry-run
 
+# URL finder (semantic-by-context, no LLM)
+rag links "documentación de X"     # ranked URLs from the vault, OSC 8 clickable
+rag links "X" --open 1             # open rank-1 URL in default browser
+rag links --rebuild                # backfill the URL sub-index from existing notes
+
 # Quality + observability
 rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
 rag log [-n 20] [--low-confidence]
@@ -116,6 +121,23 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 ### Agent mode (`rag do`)
 
 `rag do "instrucción"` runs a tool-calling loop with command-r. Tools exposed: `_agent_tool_search` (calls `retrieve()`), `_agent_tool_read_note`, `_agent_tool_list_notes`, `_agent_tool_propose_write`. Writes are NOT applied during the loop — they accumulate in `_AGENT_PENDING_WRITES` and the user confirms each at the end (skip with `--yes`, cap iterations with `--max-iterations`, default 8). No delete/move tools by design — first version is conservative.
+
+### URL finder (`rag links`, `rag_links` MCP tool)
+
+URLs are second-class citizens in the main pipeline — bge-m3 embeds whole chunks, the reranker scores topical relevance, and the LLM tends to paraphrase or omit literal URLs in prose. The URL sub-index fixes this for "where is the link to X" type questions.
+
+At index time `_index_urls()` extracts every URL from each note (`extract_urls`: markdown `[anchor](url)` first, then bare `https?://...`, deduped per file). Image/media URLs (`png|jpg|svg|webp|mp4|pdf|...`) are filtered — they're noise for "find the doc". Each URL row in the `obsidian_urls_v1` Chroma collection embeds the **prose around the URL** (±240 chars), not the URL string itself, plus metadata `{file, note, folder, tags, url, anchor, line}`.
+
+`find_urls(query, k, folder, tag)` embeds the query, semantic-matches against contexts, reranks with the cross-encoder, dedups by URL, and caps at 2 per source file (`PER_FILE_CAP`) so one note doesn't dominate. Bypasses the chat LLM entirely — output is the literal URLs with rich-link-styled OSC 8 hyperlinks (Cmd/Ctrl-click opens in browser).
+
+Surfaces:
+- `rag links "<query>"` — CLI. Flags: `-k`, `--folder`, `--tag`, `--open N` (opens rank N via macOS `open`), `--plain`, `--rebuild`.
+- `rag chat` natural-language intent (`detect_link_intent`) — patterns like "donde está el link a X", "dame la url de Y", "documentación de Z" route to `find_urls` instead of the LLM. Tight regex; explicitly does NOT match generic "qué dice X sobre Y" queries.
+- MCP `rag_links(query, k, folder, tag)` — for Claude Code to fetch URLs from the vault directly.
+
+`--rebuild` re-extracts URLs from every note without re-embedding chunks (no LLM, ~1 min for 521 notes). Use after upgrades that change extraction logic, or to backfill into a vault that was indexed before this feature landed.
+
+Tests: `tests/test_urls.py` — 30 cases covering extraction edge cases (markdown vs bare, dedup, line numbers, multiple per line, image filtering, trailing punctuation), `find_urls` behavior (empty, dedup-by-URL, k cap, folder filter), `_index_urls` idempotent replace, and `detect_link_intent` matches/non-matches.
 
 ### Contradiction Radar
 

@@ -41,7 +41,9 @@ from rich.text import Text
 
 import urllib.parse
 
-NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\n]+?\.md)\)")
+# Allow single-level balanced parens inside the path (Obsidian paths often
+# contain literal parens like "02-Areas/Musica/Explorando (otras)/X.md").
+NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:[^()\n]|\([^()\n]*\))+?\.md)\)")
 # command-r often emits just [path.md] without a markdown-link wrapper.
 BARE_PATH_RE = re.compile(r"\[([^\[\]\n]+?\.md)\]")
 EXT_RE = re.compile(r"<<ext>>(.*?)<<\/ext>>", re.DOTALL)
@@ -86,26 +88,51 @@ def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, s
     return issues
 
 
+def _file_link_style(path: str, base: str) -> str:
+    """OSC 8 clickable style (iTerm2/Terminal.app) — opens the note in Obsidian
+    when clicked on macOS (file:// URL hands off to the default .md handler).
+    """
+    full = (VAULT_PATH / path).resolve()
+    return f"{base} link file://{urllib.parse.quote(str(full))}"
+
+
 def render_response(text: str) -> Text:
-    """Render LLM response with:
-       - [Note](path.md) → cyan bold + underlined path
-       - <<ext>>...<</ext>> → dim yellow (info NOT from notes: filler, intros, general knowledge)
+    """Render LLM response:
+       - [Label](path.md) → label bold cyan, path dim cyan + clickable
+       - [path.md]        → path bold magenta + clickable (command-r style)
+       - <<ext>>...<</ext>> → dim yellow (external / inferred content)
     """
     out = Text()
 
     def append_with_links(segment: str, base_style: str | None = None):
-        last = 0
+        # Walk the segment, flushing plain text between recognised link spans.
+        spans: list[tuple[int, int, str, str]] = []  # (start, end, label, path)
+        consumed: list[tuple[int, int]] = []
         for m in NOTE_LINK_RE.finditer(segment):
-            if m.start() > last:
-                out.append(segment[last:m.start()], style=base_style)
-            out.append(m.group(1), style="bold cyan" if not base_style else "bold yellow")
-            out.append(" (", style="dim")
-            out.append(
-                m.group(2),
-                style="cyan underline" if not base_style else "yellow underline",
-            )
-            out.append(")", style="dim")
-            last = m.end()
+            spans.append((m.start(), m.end(), m.group(1), m.group(2)))
+            consumed.append(m.span())
+        for m in BARE_PATH_RE.finditer(segment):
+            if any(s <= m.start() < e for s, e in consumed):
+                continue
+            spans.append((m.start(), m.end(), m.group(1), m.group(1)))
+        spans.sort()
+
+        last = 0
+        label_base = "bold cyan" if not base_style else "bold yellow"
+        path_base = "cyan dim" if not base_style else "yellow dim"
+        for start, end, label, path in spans:
+            if start > last:
+                out.append(segment[last:start], style=base_style)
+            # If label == path (bracket-only format), render path as the main
+            # token in magenta to visually distinguish it from a named link.
+            if label == path:
+                out.append(path, style=_file_link_style(path, "bold magenta"))
+            else:
+                out.append(label, style=_file_link_style(path, label_base))
+                out.append(" (", style="dim")
+                out.append(path, style=_file_link_style(path, path_base))
+                out.append(")", style="dim")
+            last = end
         if last < len(segment):
             out.append(segment[last:], style=base_style)
 
@@ -113,7 +140,7 @@ def render_response(text: str) -> Text:
     for m in EXT_RE.finditer(text):
         if m.start() > pos:
             append_with_links(text[pos:m.start()])
-        # Marker for external/inferred content, rendered dim yellow with a leading icon.
+        # External / inferred content wrapped by the LLM.
         out.append("⚠ ", style="bold yellow")
         append_with_links(m.group(1).strip(), base_style="yellow dim italic")
         pos = m.end()

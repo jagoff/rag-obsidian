@@ -11,16 +11,16 @@ queries:
   # RAG system itself
   - question: "qué modelo de embeddings uso en mi RAG"
     expected:
-      - 03-Resources/Obsidian RAG Local.md
+      - 03-Resources/RAG-Local/Obsidian RAG Local.md
 
   - question: "qué reranker tiene el sistema"
     expected:
-      - 03-Resources/Obsidian RAG Local.md
+      - 03-Resources/RAG-Local/Obsidian RAG Local.md
       - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag.md
 
   - question: "cómo se indexan las notas en el vault"
     expected:
-      - 03-Resources/Obsidian RAG Local.md
+      - 03-Resources/RAG-Local/Obsidian RAG Local.md
 
   # Coaching
   - question: "charla sobre ansiedad y estrés laboral"
@@ -157,13 +157,13 @@ chains:
     turns:
       - question: "qué modelo de embeddings uso"
         expected:
-          - 03-Resources/Obsidian RAG Local.md
+          - 03-Resources/RAG-Local/Obsidian RAG Local.md
       - question: "y el reranker"
         expected:
-          - 03-Resources/Obsidian RAG Local.md
+          - 03-Resources/RAG-Local/Obsidian RAG Local.md
       - question: "y cómo las indexás"
         expected:
-          - 03-Resources/Obsidian RAG Local.md
+          - 03-Resources/RAG-Local/Obsidian RAG Local.md
 
   - id: meta-vault-ollama
     turns:

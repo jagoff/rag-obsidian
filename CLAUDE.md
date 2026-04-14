@@ -150,6 +150,32 @@ Plist generation uses absolute paths to the `rag` binary resolved at install tim
 
 Auto-backfill: `find_urls()` calls `_maybe_backfill_urls()` once per process — if the URL collection is empty but the main collection isn't, the URL sub-index rebuilds itself silently (~1 min). No more "did I run `rag links --rebuild` after upgrading?" tax.
 
+### Ambient Agent — co-autor reactivo del Inbox
+
+Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el hash cambió. **Composición pura de primitivas existentes, sin LLM extra** (el hook cuesta ~0 además del indexing ya pagado). Activable por usuario vía `/enable_ambient` en el bot de Telegram.
+
+- **Auto-aplica**: `find_wikilink_suggestions` + `apply_wikilink_suggestions`. Regex determinística (el suggester ya es conservador: skip ambigüos, short titles, self-links).
+- **Notifica vía Telegram**: near-duplicates (cosine ≥0.85), related notes (graph/tags), wikilinks aplicados. Mensaje compacto con `[[wikilinks]]` para que sea clickeable en Obsidian.
+- **Silent por default**: si no hay findings interesantes, no manda nada (evita ruido por cada save).
+- **Skip rules**:
+  - Fuera de `00-Inbox/` → no-op.
+  - Sin config (no se hizo `/enable_ambient`) → no-op.
+  - Frontmatter `ambient: skip` → opt-out por nota.
+  - `type: morning-brief | weekly-digest | prep` → skip (system-generated).
+  - Dedup 5min: `{path, hash}` analizado recientemente → skip (evita doble ping si el usuario guarda dos veces).
+
+**Config** en `~/.local/share/obsidian-rag/ambient.json` con `{chat_id, bot_token, enabled}`. Escrito por el bot (`/enable_ambient` toma el chat_id del mensaje + bot token del env). Leído por rag.py vía `_ambient_config()`.
+
+**Contract con el bot**: rag.py SOLO lee la config y POST directo a `api.telegram.org/bot<token>/sendMessage` (urllib). No depende del bot estando up — si el bot muere, el ping se pierde pero el análisis corre y queda en `ambient.jsonl`. Desacoplado.
+
+**CLI admin**: `rag ambient status | disable | test [path] | log [-n N]`. El comando `test` dispara el hook contra una nota existente para debugging sin tener que guardar en Obsidian.
+
+**Storage**:
+- `ambient.jsonl` → log append-only de eventos con wikilinks/dupes/related counts + telegram_sent bool.
+- `ambient_state.jsonl` → dedup state (path + hash + timestamp), scan últimas 500 líneas para decidir skip.
+
+Tests: `tests/test_ambient.py` — 18 casos cubriendo config gate, frontmatter opt-out, dedup window, auto-apply wikilinks, telegram send stubbed (el `_ambient_telegram_send` se monkeypatchea para no tocar la red).
+
 ### Capture / morning / dead-notes trilogy
 
 **`rag capture "<text>"`** — atomic building block for quick capture. Writes `<vault>/00-Inbox/YYYY-MM-DD-HHMM-<slug>.md` with frontmatter `{type: capture, tags: [capture, ...], source?}`. Supports `--stdin` (voice transcripts piped in), `--tag` (repeatable), `--source`, `--title`, `--plain`. Auto-indexes so the capture is retrievable immediately. Used by the user directly AND by the Telegram bot's `/note` command + voice-with-`/note`-caption path.

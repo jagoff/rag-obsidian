@@ -2523,6 +2523,224 @@ def _check_and_flag_contradictions(
     return (new_raw, file_hash(new_raw))
 
 
+# ── AMBIENT AGENT ────────────────────────────────────────────────────────────
+# Reactivo al filesystem: cuando una nota nueva aparece (o cambia) en 00-Inbox,
+# el agente corre análisis sin LLM (dupes + related + wikilinks) y:
+#   - auto-aplica wikilinks (regex determinística, segura)
+#   - envía un mensaje Telegram con los findings + cambios
+#
+# Config (escrita por el bot vía `/enable_ambient`): JSON en
+# `~/.local/share/obsidian-rag/ambient.json` con `{chat_id, bot_token}`.
+# Sin config → no-op silencioso (no molesta si el usuario no lo habilitó).
+#
+# State file para idempotencia: `~/.local/share/obsidian-rag/ambient_state.jsonl`
+# con `{path, hash, analyzed_at}`. Skip si la misma combinación corrió hace <5min.
+
+AMBIENT_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.json"
+AMBIENT_STATE_PATH = Path.home() / ".local/share/obsidian-rag/ambient_state.jsonl"
+AMBIENT_DEDUP_WINDOW_SEC = 300   # 5 min
+AMBIENT_LOG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.jsonl"
+
+
+def _ambient_config() -> dict | None:
+    """Read the ambient config. Returns None if disabled / missing."""
+    if not AMBIENT_CONFIG_PATH.is_file():
+        return None
+    try:
+        c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not c.get("chat_id") or not c.get("bot_token"):
+        return None
+    if c.get("enabled") is False:
+        return None
+    return c
+
+
+def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
+    """Return True if we already analyzed this exact path+hash recently."""
+    if not AMBIENT_STATE_PATH.is_file():
+        return False
+    try:
+        lines = AMBIENT_STATE_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    cutoff = time.time() - AMBIENT_DEDUP_WINDOW_SEC
+    for line in reversed(lines[-500:]):   # scan recent tail
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("path") != doc_id_prefix or e.get("hash") != h:
+            continue
+        try:
+            ts = float(e.get("analyzed_at", 0))
+        except Exception:
+            continue
+        if ts >= cutoff:
+            return True
+    return False
+
+
+def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
+    try:
+        AMBIENT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "path": doc_id_prefix, "hash": h,
+            "analyzed_at": time.time(), **payload,
+        }
+        with AMBIENT_STATE_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _ambient_log_event(event: dict) -> None:
+    try:
+        AMBIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+        with AMBIENT_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _ambient_telegram_send(chat_id: str, bot_token: str, text: str) -> bool:
+    """Fire-and-forget Telegram sendMessage. Returns True on 2xx response."""
+    import urllib.request
+    import urllib.error
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _ambient_hook(
+    col: chromadb.Collection,
+    path: Path,
+    doc_id_prefix: str,
+    h: str,
+) -> None:
+    """Reactive analysis triggered on new/modified Inbox notes.
+
+    No-op when:
+      - file is outside 00-Inbox/
+      - ambient config missing (bot didn't run /enable_ambient)
+      - same path+hash analyzed within 5 min (dedup)
+      - frontmatter `ambient: skip`
+
+    Cheap actions (no LLM):
+      - apply_wikilink_suggestions  (regex-deterministic)
+      - find_near_duplicates_for    (pairwise cosine)
+      - find_related                (graph + tags)
+    Expensive (tag suggestion, contradiction) NOT run — those live in their
+    own pipelines to avoid double-counting LLM cost per save event.
+    """
+    if not doc_id_prefix.startswith(_CAPTURE_FOLDER + "/"):
+        return
+    cfg = _ambient_config()
+    if cfg is None:
+        return
+    if _ambient_should_skip(doc_id_prefix, h):
+        return
+
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return
+    fm = parse_frontmatter(raw)
+    if fm.get("ambient") == "skip":
+        _ambient_state_record(doc_id_prefix, h, {"skipped_reason": "fm_skip"})
+        return
+    if fm.get("type") in ("morning-brief", "weekly-digest", "prep"):
+        # System-generated notes don't deserve ambient pings.
+        _ambient_state_record(doc_id_prefix, h, {"skipped_reason": "system_note"})
+        return
+
+    # 1. Wikilink suggestions → auto-apply (conservative: the suggester already
+    #    skips ambiguous titles, self-links, and short titles by default).
+    wikilinks_applied = 0
+    try:
+        sugs = find_wikilink_suggestions(col, doc_id_prefix, max_per_note=10)
+        if sugs:
+            wikilinks_applied = apply_wikilink_suggestions(doc_id_prefix, sugs)
+    except Exception:
+        sugs = []
+
+    # 2. Near-duplicates — flag only (user decides whether to merge).
+    try:
+        dupes = find_near_duplicates_for(col, doc_id_prefix, threshold=0.85, limit=3)
+    except Exception:
+        dupes = []
+
+    # 3. Related notes — informational (top 3).
+    try:
+        # find_related takes a list of metas; build one from our own.
+        self_meta = {
+            "file": doc_id_prefix, "note": path.stem,
+            "folder": str(path.relative_to(VAULT_PATH).parent),
+            "tags": ",".join(
+                str(t) for t in (fm.get("tags") or []) if t
+            ),
+        }
+        related = find_related(col, [self_meta], limit=5)
+    except Exception:
+        related = []
+
+    # Build Telegram message — compact, with wikilink-safe format.
+    title = path.stem
+    lines = [f"🤖 Ambient: [[{title}]]"]
+    if wikilinks_applied:
+        titles_applied = [s["title"] for s in sugs[:wikilinks_applied]]
+        preview = ", ".join(titles_applied[:3])
+        extra = "" if len(titles_applied) <= 3 else f" +{len(titles_applied) - 3}"
+        lines.append(f"🔗 Linkeé {wikilinks_applied}: {preview}{extra}")
+    if dupes:
+        lines.append("⚠ Posibles duplicados:")
+        for d in dupes[:3]:
+            lines.append(f"  · [[{d['note']}]]  sim {d['similarity']:.2f}")
+    if related:
+        lines.append("📎 Relacionadas:")
+        for m, score, reason in related[:3]:
+            badge = {"link": "↔", "tags": "#", "tags+link": "↔#"}.get(reason, "")
+            lines.append(f"  · [[{m.get('note', '')}]]  ×{score} {badge}")
+
+    msg = "\n".join(lines)
+    sent = False
+    if len(lines) > 1:
+        sent = _ambient_telegram_send(cfg["chat_id"], cfg["bot_token"], msg)
+
+    _ambient_log_event({
+        "cmd": "ambient_hook",
+        "path": doc_id_prefix,
+        "hash": h,
+        "wikilinks_applied": wikilinks_applied,
+        "wikilinks_proposed": len(sugs),
+        "dupes": [{"path": d["path"], "sim": d["similarity"]} for d in dupes],
+        "related_count": len(related),
+        "telegram_sent": sent,
+        "quiet": len(lines) <= 1,
+    })
+    _ambient_state_record(doc_id_prefix, h, {
+        "wikilinks_applied": wikilinks_applied,
+        "dupes_count": len(dupes),
+        "related_count": len(related),
+    })
+
+
 def _index_single_file(
     col: chromadb.Collection, path: Path, skip_contradict: bool = False,
 ) -> str:
@@ -2611,6 +2829,18 @@ def _index_single_file(
     except Exception:
         pass
     _invalidate_corpus_cache()
+    # Ambient hook — fires for Inbox saves only, no-op otherwise.
+    # Runs AFTER the main indexing so the note is retrievable to itself for
+    # related/dupe analysis. Pure best-effort; any failure is logged, never
+    # blocks indexing.
+    try:
+        _ambient_hook(col, path, doc_id_prefix, h)
+    except Exception as e:
+        _ambient_log_event({
+            "cmd": "ambient_hook_error",
+            "path": doc_id_prefix,
+            "error": str(e)[:200],
+        })
     return "indexed"
 
 
@@ -6004,6 +6234,102 @@ def setup(remove: bool):
         console.print()
         console.print(
             f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest}}.{{log,error.log}}[/dim]"
+        )
+
+
+@cli.group()
+def ambient():
+    """Ambient Agent: reacciona a capturas en 00-Inbox con wikilinks+dupes+related."""
+
+
+@ambient.command("status")
+def ambient_status():
+    """¿Está habilitado? ¿Con qué chat_id?"""
+    cfg = _ambient_config()
+    if cfg is None:
+        if not AMBIENT_CONFIG_PATH.is_file():
+            console.print("[yellow]Deshabilitado[/yellow] — no hay config. Enviá /enable_ambient al bot.")
+        else:
+            console.print(
+                "[yellow]Deshabilitado[/yellow] — config existe pero está mal o tiene enabled=false."
+            )
+        return
+    console.print(
+        f"[green]Habilitado[/green] · chat_id={cfg['chat_id']} · "
+        f"bot_token={cfg['bot_token'][:10]}…"
+    )
+    if AMBIENT_STATE_PATH.is_file():
+        try:
+            n = sum(1 for _ in AMBIENT_STATE_PATH.open())
+            console.print(f"[dim]State: {n} análisis registrados[/dim]")
+        except Exception:
+            pass
+
+
+@ambient.command("disable")
+def ambient_disable():
+    """Deshabilitar ambient (deja el config pero con enabled=false)."""
+    if not AMBIENT_CONFIG_PATH.is_file():
+        console.print("[dim]No había config.[/dim]")
+        return
+    try:
+        c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        c = {}
+    c["enabled"] = False
+    AMBIENT_CONFIG_PATH.write_text(json.dumps(c, indent=2), encoding="utf-8")
+    console.print("[green]✓[/green] ambient deshabilitado. Re-habilitar con /enable_ambient en el bot.")
+
+
+@ambient.command("test")
+@click.argument("path", required=False)
+def ambient_test(path: str | None):
+    """Simular análisis sobre una nota existente (dry-run en vivo, sí escribe)."""
+    col = get_db()
+    if path is None:
+        inbox = VAULT_PATH / _CAPTURE_FOLDER
+        candidates = sorted(inbox.glob("*.md"))[:1]
+        if not candidates:
+            console.print(f"[yellow]Sin notas en {inbox}[/yellow]")
+            return
+        p = candidates[0]
+    else:
+        p = VAULT_PATH / path if not path.startswith("/") else Path(path)
+    if not p.is_file():
+        console.print(f"[red]No existe:[/red] {p}")
+        return
+    doc_id_prefix = str(p.relative_to(VAULT_PATH))
+    raw = p.read_text(encoding="utf-8", errors="ignore")
+    h = file_hash(raw)
+    console.print(f"[cyan]Triggereando ambient hook sobre:[/cyan] {doc_id_prefix}")
+    _ambient_hook(col, p, doc_id_prefix, h)
+    console.print("[green]✓[/green] Listo. Ver log: tail ~/.local/share/obsidian-rag/ambient.jsonl")
+
+
+@ambient.command("log")
+@click.option("-n", default=10, show_default=True, help="Últimos N eventos")
+def ambient_log(n: int):
+    """Tail del log de eventos ambient."""
+    if not AMBIENT_LOG_PATH.is_file():
+        console.print(f"[yellow]Aún no hay log en {AMBIENT_LOG_PATH}[/yellow]")
+        return
+    lines = AMBIENT_LOG_PATH.read_text(encoding="utf-8").splitlines()[-n:]
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        ts = e.get("ts", "")[-8:]
+        applied = e.get("wikilinks_applied", 0)
+        dupes = len(e.get("dupes") or [])
+        rel = e.get("related_count", 0)
+        sent = "📨" if e.get("telegram_sent") else ("🔇" if e.get("quiet") else "✗")
+        console.print(
+            f"[dim]{ts}[/dim] {sent} "
+            f"[cyan]{e.get('path', '—')}[/cyan] "
+            f"[yellow]links={applied}[/yellow] "
+            f"[magenta]dupes={dupes}[/magenta] "
+            f"[blue]rel={rel}[/blue]"
         )
 
 

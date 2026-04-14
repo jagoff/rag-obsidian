@@ -222,7 +222,56 @@ def render_response(text: str) -> Text:
 # Collections are namespaced per vault path so switching doesn't pollute the
 # index — fresh vault = fresh collection automatically.
 _DEFAULT_VAULT = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
-VAULT_PATH = Path(os.environ.get("OBSIDIAN_RAG_VAULT", str(_DEFAULT_VAULT)))
+
+# Multi-vault: registry persistente con vaults nombrados + un "current"
+# pointer. Precedencia para resolver VAULT_PATH:
+#   1. OBSIDIAN_RAG_VAULT env (per-invocation override, gana siempre).
+#   2. Registry's "current" vault (rag vault use <name>).
+#   3. _DEFAULT_VAULT (iCloud Notes) — para usuarios single-vault que
+#      nunca tocan el registry.
+# La colección de Chroma se nombra con el hash del path resuelto, así que
+# cada vault tiene su propio índice automáticamente. Cero contaminación.
+VAULTS_CONFIG_PATH = Path.home() / ".config/obsidian-rag/vaults.json"
+
+
+def _load_vaults_config() -> dict:
+    """Lee el registry de vaults. Estructura:
+      {"vaults": {name: absolute_path}, "current": name | None}
+    Si no existe o está corrupto, devuelve estructura vacía — el caller
+    decide qué hacer (typicamente: caer al default).
+    """
+    if not VAULTS_CONFIG_PATH.is_file():
+        return {"vaults": {}, "current": None}
+    try:
+        cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"vaults": {}, "current": None}
+    cfg.setdefault("vaults", {})
+    cfg.setdefault("current", None)
+    return cfg
+
+
+def _save_vaults_config(cfg: dict) -> None:
+    VAULTS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    VAULTS_CONFIG_PATH.write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _resolve_vault_path() -> Path:
+    """Aplica la precedencia de 3 niveles para decidir el vault activo."""
+    env = os.environ.get("OBSIDIAN_RAG_VAULT")
+    if env:
+        return Path(env)
+    cfg = _load_vaults_config()
+    cur = cfg.get("current")
+    vaults = cfg.get("vaults", {})
+    if cur and cur in vaults:
+        return Path(vaults[cur])
+    return _DEFAULT_VAULT
+
+
+VAULT_PATH = _resolve_vault_path()
 DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 
@@ -3150,7 +3199,39 @@ def retrieve(
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 
-@click.group()
+# Highlight `chat` en `rag --help`. El default formatter de click pinta cada
+# subcomando en gris uniforme — `chat` es el daily driver, vale destacarlo.
+# Manualmente formateamos las filas para que los ANSI escapes no rompan la
+# alineación de la columna (formatter.write_dl mide len() literal y no la
+# visible width).
+_HIGHLIGHTED_COMMANDS = {"chat"}
+
+
+class _HighlightGroup(click.Group):
+    def format_commands(self, ctx, formatter):
+        rows: list[tuple[str, click.Command]] = []
+        for name in self.list_commands(ctx):
+            cmd = self.get_command(ctx, name)
+            if cmd is None or cmd.hidden:
+                continue
+            rows.append((name, cmd))
+        if not rows:
+            return
+        max_name = max(len(n) for n, _ in rows)
+        # Reserva 4 cols (2 indent + 2 gap) además del nombre.
+        limit = formatter.width - 4 - max_name
+        with formatter.section("Commands"):
+            for name, cmd in rows:
+                short = cmd.get_short_help_str(limit)
+                pad = " " * (max_name - len(name) + 2)
+                if name in _HIGHLIGHTED_COMMANDS:
+                    display = click.style(name, fg="cyan", bold=True)
+                else:
+                    display = name
+                formatter.write(f"  {display}{pad}{short}\n")
+
+
+@click.group(cls=_HighlightGroup)
 def cli():
     """RAG local para notas de Obsidian."""
 
@@ -7680,7 +7761,16 @@ def stats():
         urls_count = 0
     console.print(f"[cyan]Chunks indexados:[/cyan] {count}")
     console.print(f"[cyan]URLs indexadas:[/cyan] {urls_count}  [dim]({URLS_COLLECTION_NAME})[/dim]")
-    console.print(f"[cyan]Vault:[/cyan] {VAULT_PATH}")
+    # Identificar la fuente del vault (env / registry / default) ayuda al
+    # debug en setups multi-vault.
+    vault_src = "default"
+    if os.environ.get("OBSIDIAN_RAG_VAULT"):
+        vault_src = "env"
+    else:
+        _vcfg = _load_vaults_config()
+        if _vcfg["current"] and _vcfg["current"] in _vcfg["vaults"]:
+            vault_src = f"registry · {_vcfg['current']}"
+    console.print(f"[cyan]Vault:[/cyan] {VAULT_PATH}  [dim]({vault_src})[/dim]")
     console.print(f"[cyan]DB:[/cyan] {DB_PATH}")
     console.print(f"[cyan]Colección:[/cyan] {COLLECTION_NAME}")
     console.print(f"[cyan]Embed model:[/cyan] {EMBED_MODEL}")
@@ -7692,6 +7782,132 @@ def stats():
     console.print(f"[cyan]Helper model:[/cyan] {HELPER_MODEL}")
     console.print(f"[cyan]Reranker:[/cyan] {RERANKER_MODEL}")
     console.print(f"[cyan]Pipeline:[/cyan] HyDE + BM25 + RRF + cross-encoder rerank")
+
+
+@cli.group()
+def vault():
+    """Multi-vault: registrar / cambiar / listar vaults de Obsidian.
+
+    El registry vive en ~/.config/obsidian-rag/vaults.json. Cada vault
+    obtiene su propia colección de Chroma automáticamente (namespacing
+    por hash del path) — switchear no contamina ni cruza datos.
+
+    Precedencia para resolver el vault activo:
+      1. OBSIDIAN_RAG_VAULT env var (override per-invocación, gana siempre).
+      2. `vault use <name>` (el "current" del registry, persistente).
+      3. Default iCloud Notes (legacy, para usuarios single-vault).
+    """
+
+
+@vault.command("add")
+@click.argument("name")
+@click.argument("path", type=click.Path(
+    exists=True, file_okay=False, dir_okay=True, resolve_path=True,
+))
+def vault_add(name: str, path: str):
+    """Registrar un vault con un nombre. Si es el primero, queda activo."""
+    cfg = _load_vaults_config()
+    if name in cfg["vaults"] and cfg["vaults"][name] != path:
+        console.print(
+            f"[yellow]Sobreescribiendo[/yellow] '{name}': "
+            f"{cfg['vaults'][name]} → {path}"
+        )
+    cfg["vaults"][name] = path
+    if not cfg["current"]:
+        cfg["current"] = name
+        marker = " (activo)"
+    else:
+        marker = ""
+    _save_vaults_config(cfg)
+    console.print(f"[green]✓[/green] vault [bold]{name}[/bold] → {path}{marker}")
+
+
+@vault.command("list")
+def vault_list():
+    """Listar vaults registrados, marcando el activo."""
+    cfg = _load_vaults_config()
+    if not cfg["vaults"]:
+        console.print(
+            "[dim]Sin vaults registrados.[/dim] "
+            "Usá [bold]rag vault add <name> <path>[/bold] para empezar."
+        )
+        console.print(f"[dim]Default actual: {_DEFAULT_VAULT}[/dim]")
+        return
+    cur = cfg["current"]
+    env = os.environ.get("OBSIDIAN_RAG_VAULT")
+    for name, path in cfg["vaults"].items():
+        marker = "[green]→[/green]" if name == cur else "  "
+        console.print(f"  {marker} [bold]{name}[/bold]  [dim]{path}[/dim]")
+    if env:
+        console.print(
+            f"\n[yellow]⚠ OBSIDIAN_RAG_VAULT está seteado[/yellow] "
+            f"[dim]({env})[/dim] — overridea el registry."
+        )
+
+
+@vault.command("use")
+@click.argument("name")
+def vault_use(name: str):
+    """Cambiar al vault NAME (persistente). Afecta a futuras invocaciones."""
+    cfg = _load_vaults_config()
+    if name not in cfg["vaults"]:
+        registered = ", ".join(cfg["vaults"]) or "(ninguno)"
+        console.print(
+            f"[red]vault '{name}' no registrado.[/red] "
+            f"Registrados: {registered}"
+        )
+        return
+    cfg["current"] = name
+    _save_vaults_config(cfg)
+    path = cfg["vaults"][name]
+    console.print(f"[green]✓[/green] vault activo: [bold]{name}[/bold]  [dim]({path})[/dim]")
+    if os.environ.get("OBSIDIAN_RAG_VAULT"):
+        console.print(
+            "[yellow]⚠[/yellow] OBSIDIAN_RAG_VAULT está seteado — "
+            "lo seguirá overrideando hasta que lo desetees."
+        )
+
+
+@vault.command("current")
+def vault_current():
+    """Mostrar el vault que se va a usar y por qué."""
+    env = os.environ.get("OBSIDIAN_RAG_VAULT")
+    if env:
+        console.print(f"[bold]env[/bold] OBSIDIAN_RAG_VAULT → [cyan]{env}[/cyan]")
+        return
+    cfg = _load_vaults_config()
+    cur = cfg["current"]
+    if cur and cur in cfg["vaults"]:
+        console.print(
+            f"[bold]registry[/bold] [bold]{cur}[/bold] → "
+            f"[cyan]{cfg['vaults'][cur]}[/cyan]"
+        )
+        return
+    console.print(f"[bold]default[/bold] → [cyan]{_DEFAULT_VAULT}[/cyan]")
+
+
+@vault.command("remove")
+@click.argument("name")
+def vault_remove(name: str):
+    """Quitar un vault del registry. NO borra archivos del disco."""
+    cfg = _load_vaults_config()
+    if name not in cfg["vaults"]:
+        console.print(f"[red]vault '{name}' no registrado.[/red]")
+        return
+    del cfg["vaults"][name]
+    if cfg["current"] == name:
+        cfg["current"] = next(iter(cfg["vaults"]), None)
+    _save_vaults_config(cfg)
+    if cfg["current"]:
+        console.print(
+            f"[green]✓[/green] '{name}' removido. "
+            f"Activo ahora: [bold]{cfg['current']}[/bold]"
+        )
+    else:
+        console.print(
+            f"[green]✓[/green] '{name}' removido. "
+            f"Sin current — caerá al default."
+        )
 
 
 @cli.group()

@@ -1,0 +1,102 @@
+# Golden query set for evaluating the retriever.
+# Each entry:
+#   - question:  the user query as typed
+#   - expected:  list of note paths (vault-relative) that SHOULD appear in top-k
+#                — a query "hits" if ANY expected path is in top-k results
+#   - note:      optional human comment on intent (not used by the evaluator)
+#
+# Add more queries over time. Keep them representative of real usage.
+
+queries:
+  # RAG system itself
+  - question: "qué modelo de embeddings uso en mi RAG"
+    expected:
+      - 03-Resources/Obsidian RAG Local.md
+
+  - question: "qué reranker tiene el sistema"
+    expected:
+      - 03-Resources/Obsidian RAG Local.md
+
+  - question: "cómo se indexan las notas en el vault"
+    expected:
+      - 03-Resources/Obsidian RAG Local.md
+
+  # Coaching
+  - question: "charla sobre ansiedad y estrés laboral"
+    expected:
+      - 02-Areas/Coaching/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+
+  - question: "curso de liderazgo estratégico"
+    expected:
+      - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
+
+  - question: "qué es ikigai"
+    expected:
+      - 02-Areas/Coaching/Ikigai.md
+
+  - question: "comunicación no violenta"
+    expected:
+      - 02-Areas/Coaching/Comunicacion no violenta.md
+
+  - question: "mis referentes en coaching"
+    expected:
+      - 02-Areas/Coaching/Coaching - Referentes.md
+
+  - question: "bio de fer coach"
+    expected:
+      - 02-Areas/Coaching/Fer coach - Bio.md
+
+  - question: "podcast primer episodio coaching"
+    expected:
+      - 02-Areas/Coaching/Podcast - Episodio 01 - Coaching.md
+
+  # Música
+  - question: "letra de muros fractales"
+    expected:
+      - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+
+  - question: "canción miro la lluvia"
+    expected:
+      - 02-Areas/Musica/Miro la lluvia/Miro la lluvia.md
+
+  - question: "toma tres tema"
+    expected:
+      - 02-Areas/Musica/Toma tres.md
+
+  # Claude / Tech
+  - question: "comandos CLI de claude code"
+    expected:
+      - 03-Resources/Claude Code - Comandos CLI.md
+
+  - question: "comandos interactivos claude code"
+    expected:
+      - 03-Resources/Claude Code - Comandos Interactivos.md
+
+  - question: "equipamiento amps guitarra"
+    expected:
+      - 03-Resources/Equipamiento - Amps.md
+
+  # Hard: sin tildes (testing accent normalization)
+  - question: "que es el ikigai"
+    expected:
+      - 02-Areas/Coaching/Ikigai.md
+
+  - question: "comunicacion no violenta"
+    expected:
+      - 02-Areas/Coaching/Comunicacion no violenta.md
+
+  # Hard: question ABOUT content (not title keyword)
+  - question: "cómo manejar el estrés en el trabajo"
+    expected:
+      - 02-Areas/Coaching/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+
+  # Hard: metaphorical / topic-level query
+  - question: "herramientas para grabar podcast"
+    expected:
+      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+
+  # Hard: typo
+  - question: "liderasgo estrategico"
+    expected:
+      - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
+

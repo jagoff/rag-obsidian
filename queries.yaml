@@ -101,3 +101,79 @@ queries:
     expected:
       - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
 
+# Multi-turn chains: each chain is an independent conversation where later
+# turns may contain pronouns or ellipsis that only resolve against the
+# prior user/assistant exchange. Eval builds `history` progressively per
+# chain; from turn 2 onward, `reformulate_query` rewrites the question as
+# a standalone query before retrieve.
+chains:
+  - id: coaching-ikigai
+    turns:
+      - question: "qué es ikigai"
+        expected:
+          - 02-Areas/Coaching/Ikigai.md
+      - question: "profundizá en el concepto"
+        expected:
+          - 02-Areas/Coaching/Ikigai.md
+      - question: "y cómo se relaciona eso con mi perfil de coach"
+        expected:
+          - 02-Areas/Coaching/Fer coach - Bio.md
+          - 02-Areas/Coaching/Fer Coach.md
+
+  - id: coaching-liderazgo
+    turns:
+      - question: "curso de liderazgo estratégico"
+        expected:
+          - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
+      - question: "y el otro curso que tenía"
+        expected:
+          - 02-Areas/Coaching/Coaching - Curso de liderazgo.md
+      - question: "quiénes son mis referentes en esto"
+        expected:
+          - 02-Areas/Coaching/Coaching - Referentes.md
+
+  - id: musica-muros-fractales
+    turns:
+      - question: "letra de muros fractales"
+        expected:
+          - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+      - question: "qué otras letras tengo en esa misma carpeta"
+        expected:
+          - 02-Areas/Musica/Muros Fractales/Letras - Astio.md
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
+
+  - id: tech-claude-code
+    turns:
+      - question: "comandos CLI de claude code"
+        expected:
+          - 03-Resources/Claude Code - Comandos CLI.md
+      - question: "y los interactivos"
+        expected:
+          - 03-Resources/Claude Code - Comandos Interactivos.md
+
+  - id: rag-system
+    turns:
+      - question: "qué modelo de embeddings uso"
+        expected:
+          - 03-Resources/Obsidian RAG Local.md
+      - question: "y el reranker"
+        expected:
+          - 03-Resources/Obsidian RAG Local.md
+      - question: "y cómo las indexás"
+        expected:
+          - 03-Resources/Obsidian RAG Local.md
+
+  - id: meta-vault-ollama
+    turns:
+      - question: "qué modelos de ollama tengo instalados"
+        expected:
+          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama.md
+      - question: "y el bot de telegram que los usa"
+        expected:
+          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama_telegram_bot.md
+      - question: "hay otro bot con claude?"
+        expected:
+          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_claude_telegram_bot.md
+

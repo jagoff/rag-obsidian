@@ -99,7 +99,11 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 
 ## Eval harness (`rag eval` + `queries.yaml`)
 
-`queries.yaml` is the golden set: 21 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical). Baseline is `hit@5 95.24% · MRR 0.857 · recall@5 95.24%` on v6. Use this to measure any change to chunking, prompts, models, or retrieval — don't ship blind.
+`queries.yaml` is the golden set. Two axes:
+- **singles**: 21 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical). Baseline on v7: `hit@5 90.48% · MRR 0.786 · recall@5 90.48%`.
+- **chains**: 6 multi-turn chains (16 turns total) exercising follow-ups with pronouns/demonstratives — each turn after the first is reformulated via `reformulate_query` against the running history. Baseline on v7: `hit@5 75.00% · MRR 0.656 · recall@5 75.00% · chain_success 50.00%`.
+
+The v6→v7 drop in singles (95.24 → 90.48) is the schema bump (outlinks + re-chunking), not a retrieval regression — confirmed by `--no-multi` showing the same numbers. Use these baselines to measure any change to chunking, prompts, models, or retrieval — don't ship blind.
 
 Empirical finding that informed defaults: **HyDE with qwen2.5:3b drops hit@5 from 95 → 90%**. Small models drift the hypothetical from real note phrasing. HyDE is opt-in (`--hyde`); re-measure if the helper model changes size class.
 

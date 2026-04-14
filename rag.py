@@ -2214,8 +2214,9 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
 
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     queries = data.get("queries") or []
-    if not queries:
-        console.print(f"[yellow]Sin queries en {path}[/yellow]")
+    chains = data.get("chains") or []
+    if not queries and not chains:
+        console.print(f"[yellow]Sin queries ni chains en {path}[/yellow]")
         return
 
     col = get_db()
@@ -2223,79 +2224,152 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
 
-    hits = 0
-    rr_sum = 0.0
-    recall_sum = 0.0
-    per_query: list[tuple[str, bool, float, float, list[str]]] = []
-
-    for entry in track(queries, description="Evaluando…"):
-        q = entry["question"]
-        expected = set(entry.get("expected") or [])
-        result = retrieve(
-            col, q, k, folder=None, tag=None,
-            precise=hyde, multi_query=not no_multi, auto_filter=True,
-        )
-        retrieved_paths = [m.get("file", "") for m in result["metas"]]
-        # dedup while preserving order for MRR
-        seen_paths: list[str] = []
-        for p in retrieved_paths:
-            if p not in seen_paths:
-                seen_paths.append(p)
-        unique_retrieved = set(seen_paths)
-
-        hit = bool(expected & unique_retrieved)
-        hits += 1 if hit else 0
-
+    def _score(expected_set: set[str], seen_paths: list[str]) -> tuple[bool, float, float]:
+        retrieved_set = set(seen_paths)
+        hit = bool(expected_set & retrieved_set)
         rr = 0.0
         for rank, p in enumerate(seen_paths, start=1):
-            if p in expected:
+            if p in expected_set:
                 rr = 1.0 / rank
                 break
-        rr_sum += rr
-
-        recall = len(expected & unique_retrieved) / len(expected) if expected else 0.0
-        recall_sum += recall
-
-        per_query.append((q, hit, rr, recall, seen_paths))
-
-    n = len(queries)
-    hit_at_k = hits / n
-    mrr = rr_sum / n
-    recall_at_k = recall_sum / n
-
-    # Per-query detail table
-    tbl = Table(title=f"Evaluación (k={k})", show_lines=False)
-    tbl.add_column("Query", style="cyan", overflow="fold", max_width=50)
-    tbl.add_column("Hit", justify="center")
-    tbl.add_column("RR", justify="right")
-    tbl.add_column("Recall", justify="right")
-    for q, hit, rr, rec, _ in per_query:
-        tbl.add_row(
-            q,
-            "[green]✓[/green]" if hit else "[red]✗[/red]",
-            f"{rr:.2f}",
-            f"{rec:.2f}",
+        recall = (
+            len(expected_set & retrieved_set) / len(expected_set)
+            if expected_set else 0.0
         )
-    console.print(tbl)
+        return hit, rr, recall
 
-    # Failed queries: show what the retriever actually returned
-    failed = [(q, paths) for q, hit, _, _, paths in per_query if not hit]
-    if failed:
+    def _dedup(paths: list[str]) -> list[str]:
+        seen: list[str] = []
+        for p in paths:
+            if p not in seen:
+                seen.append(p)
+        return seen
+
+    # ── Single queries ──────────────────────────────────────────────────
+    per_query: list[tuple[str, bool, float, float, list[str]]] = []
+    if queries:
+        for entry in track(queries, description="Evaluando queries…"):
+            q = entry["question"]
+            expected = set(entry.get("expected") or [])
+            result = retrieve(
+                col, q, k, folder=None, tag=None,
+                precise=hyde, multi_query=not no_multi, auto_filter=True,
+            )
+            seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
+            hit, rr, recall = _score(expected, seen_paths)
+            per_query.append((q, hit, rr, recall, seen_paths))
+
+        tbl = Table(title=f"Queries sueltas (k={k})", show_lines=False)
+        tbl.add_column("Query", style="cyan", overflow="fold", max_width=50)
+        tbl.add_column("Hit", justify="center")
+        tbl.add_column("RR", justify="right")
+        tbl.add_column("Recall", justify="right")
+        for q, hit, rr, rec, _ in per_query:
+            tbl.add_row(
+                q,
+                "[green]✓[/green]" if hit else "[red]✗[/red]",
+                f"{rr:.2f}",
+                f"{rec:.2f}",
+            )
+        console.print(tbl)
+
+        failed = [(q, paths) for q, hit, _, _, paths in per_query if not hit]
+        if failed:
+            console.print()
+            console.print("[bold red]Queries sin hit — top-k recuperado:[/bold red]")
+            for q, paths in failed:
+                console.print(f"  [yellow]{q}[/yellow]")
+                for p in paths[:k]:
+                    console.print(f"    [dim]· {p}[/dim]")
+
+        n = len(queries)
+        hit_at_k = sum(1 for _, h, _, _, _ in per_query if h) / n
+        mrr = sum(r for _, _, r, _, _ in per_query) / n
+        recall_at_k = sum(r for _, _, _, r, _ in per_query) / n
         console.print()
-        console.print("[bold red]Queries sin hit — top-k recuperado:[/bold red]")
-        for q, paths in failed:
-            console.print(f"  [yellow]{q}[/yellow]")
-            for p in paths[:k]:
-                console.print(f"    [dim]· {p}[/dim]")
+        console.print(
+            f"[bold]Singles:[/bold] hit@{k} {hit_at_k:.2%}  ·  "
+            f"MRR {mrr:.3f}  ·  recall@{k} {recall_at_k:.2%}  ·  "
+            f"[dim]n={n}[/dim]"
+        )
 
-    # Aggregate
-    console.print()
-    console.print(
-        f"[bold]hit@{k}:[/bold] {hit_at_k:.2%}  ·  "
-        f"[bold]MRR:[/bold] {mrr:.3f}  ·  "
-        f"[bold]recall@{k}:[/bold] {recall_at_k:.2%}  ·  "
-        f"[dim]n={n}[/dim]"
-    )
+    # ── Multi-turn chains ───────────────────────────────────────────────
+    # Turn 0 runs as-is. For later turns we explicitly call reformulate_query
+    # against accumulated history and pass the rewrite as the search query to
+    # retrieve(..., precise=False) — keeps history-aware search on while
+    # avoiding HyDE (bundled with precise=True, known to hurt on qwen2.5:3b).
+    if chains:
+        console.print()
+        chain_rows: list[tuple[str, str, bool, float, float, list[str]]] = []
+        per_chain_success: list[tuple[str, bool]] = []
+
+        for chain in track(chains, description="Evaluando chains…"):
+            chain_id = chain.get("id", "<sin id>")
+            turns = chain.get("turns") or []
+            history: list[dict] = []
+            all_hit = True
+            for i, turn in enumerate(turns):
+                q = turn["question"]
+                expected = set(turn.get("expected") or [])
+                search_q = q if (i == 0 or not history) else reformulate_query(q, history)
+                result = retrieve(
+                    col, search_q, k, folder=None, tag=None,
+                    precise=False, multi_query=not no_multi, auto_filter=True,
+                )
+                seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
+                hit, rr, recall = _score(expected, seen_paths)
+                if not hit:
+                    all_hit = False
+                chain_rows.append((chain_id, q, hit, rr, recall, seen_paths))
+                # Fake assistant turn: top retrieved path anchors the topic so
+                # the next reformulation has concrete nouns to resolve pronouns
+                # against without a real chat-model call.
+                history.append({"role": "user", "content": q})
+                top = seen_paths[0] if seen_paths else ""
+                history.append({
+                    "role": "assistant",
+                    "content": f"(contexto recuperado: {top})",
+                })
+            per_chain_success.append((chain_id, all_hit))
+
+        ctbl = Table(title=f"Chains multi-turno (k={k})", show_lines=False)
+        ctbl.add_column("Chain", style="magenta", no_wrap=True)
+        ctbl.add_column("Turno", style="cyan", overflow="fold", max_width=44)
+        ctbl.add_column("Hit", justify="center")
+        ctbl.add_column("RR", justify="right")
+        ctbl.add_column("Recall", justify="right")
+        for cid, q, hit, rr, rec, _ in chain_rows:
+            ctbl.add_row(
+                cid,
+                q,
+                "[green]✓[/green]" if hit else "[red]✗[/red]",
+                f"{rr:.2f}",
+                f"{rec:.2f}",
+            )
+        console.print(ctbl)
+
+        failed_turns = [(cid, q, paths) for cid, q, hit, _, _, paths in chain_rows if not hit]
+        if failed_turns:
+            console.print()
+            console.print("[bold red]Turns sin hit — top-k recuperado:[/bold red]")
+            for cid, q, paths in failed_turns:
+                console.print(f"  [magenta]{cid}[/magenta] [yellow]{q}[/yellow]")
+                for p in paths[:k]:
+                    console.print(f"    [dim]· {p}[/dim]")
+
+        nt = len(chain_rows)
+        nc = len(per_chain_success)
+        chain_hit = sum(1 for _, _, h, _, _, _ in chain_rows if h) / nt if nt else 0.0
+        chain_mrr = sum(r for _, _, _, r, _, _ in chain_rows) / nt if nt else 0.0
+        chain_recall = sum(r for _, _, _, _, r, _ in chain_rows) / nt if nt else 0.0
+        chain_success = sum(1 for _, ok in per_chain_success if ok) / nc if nc else 0.0
+        console.print()
+        console.print(
+            f"[bold]Chains:[/bold] hit@{k} {chain_hit:.2%}  ·  "
+            f"MRR {chain_mrr:.3f}  ·  recall@{k} {chain_recall:.2%}  ·  "
+            f"chain_success {chain_success:.2%}  ·  "
+            f"[dim]turns={nt}, chains={nc}[/dim]"
+        )
 
 
 @cli.command()

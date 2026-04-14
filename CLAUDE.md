@@ -48,6 +48,9 @@ rag wikilinks suggest --folder X --apply    # write [[wikilinks]] for unlinked t
 rag dupes [--threshold 0.85] [--folder X]   # pairs of notes with similar centroids
 rag inbox [--apply]                         # triage 00-Inbox: folder + tags + wikilinks + dupes
 rag prep "tema o persona" [--save]          # context brief from vault, optionally saved to 00-Inbox/
+rag capture "texto" [--tag X --source Y]    # quick note to 00-Inbox/ (auto-indexed)
+rag morning [--dry-run]                      # daily brief → 05-Reviews/YYYY-MM-DD.md
+rag dead [--min-age-days 365]                # candidates to archive: 0 edges + not retrieved + old
 
 # Automation (launchd)
 rag setup            # install com.fer.obsidian-rag-{watch,digest} launchd services
@@ -141,10 +144,19 @@ Two services keep the RAG running without manual rituals — installed by `rag s
 
 - **`com.fer.obsidian-rag-watch`** — runs `rag watch` continuously (`RunAtLoad + KeepAlive`). Re-indexes on every vault save (debounce 3s). Removes the manual "did I `rag index` after that batch of edits?" friction.
 - **`com.fer.obsidian-rag-digest`** — runs `rag digest` every Sunday 22:00 local. Generates `05-Reviews/YYYY-WNN.md` automatically. Honours `NO_COLOR=1` and `TERM=dumb` so logs stay readable.
+- **`com.fer.obsidian-rag-morning`** — runs `rag morning` every weekday (Mon-Fri) at 7:00 local. Generates `05-Reviews/YYYY-MM-DD.md`. Reads the vault + queries.jsonl + contradictions.jsonl, drafts a 120-280-word brief with command-r: 1-line recap of yesterday, 3 focus items for today, pending triage if any, contradictions/gaps if any. Silently skips when there's zero evidence.
 
 Plist generation uses absolute paths to the `rag` binary resolved at install time (`_rag_binary()` checks `~/.local/bin/rag`, `/usr/local/bin/rag`, `/opt/homebrew/bin/rag`, then `shutil.which`). The launchd PATH includes Homebrew + uv tool dirs so subprocess hops (e.g., `ollama`) resolve too.
 
 Auto-backfill: `find_urls()` calls `_maybe_backfill_urls()` once per process — if the URL collection is empty but the main collection isn't, the URL sub-index rebuilds itself silently (~1 min). No more "did I run `rag links --rebuild` after upgrading?" tax.
+
+### Capture / morning / dead-notes trilogy
+
+**`rag capture "<text>"`** — atomic building block for quick capture. Writes `<vault>/00-Inbox/YYYY-MM-DD-HHMM-<slug>.md` with frontmatter `{type: capture, tags: [capture, ...], source?}`. Supports `--stdin` (voice transcripts piped in), `--tag` (repeatable), `--source`, `--title`, `--plain`. Auto-indexes so the capture is retrievable immediately. Used by the user directly AND by the Telegram bot's `/note` command + voice-with-`/note`-caption path.
+
+**`rag morning [--dry-run]`** — proactive daily brief. Collects, for the last 36h: notes modified (excluding `05-Reviews/`), current `00-Inbox/` contents, frontmatter `todo:`/`due:` signals, new entries in `contradictions.jsonl`, low-confidence queries (`top_score ≤ CONFIDENCE_RERANK_MIN`). command-r drafts 120-280 words in 1ra persona with a fixed Markdown structure (`## 📬 Ayer en una línea` / `## 🎯 Foco sugerido para hoy` / `## 🗂 Pendientes que asoman` / `## ⚠ Atender`). Writes to `05-Reviews/YYYY-MM-DD.md` and auto-indexes. Auto-fires via launchd Mon-Fri 7:00. Silent no-op when evidence is zero.
+
+**`rag dead`** — dead-note detector. Criterion AND: 0 outlinks + 0 backlinks + not retrieved in `--query-window-days` + age > `--min-age-days` + outside `00-Inbox/04-Archive/05-Reviews`. **Age source**: frontmatter `created:` parsed via ISO/strftime fallbacks (preferred — iCloud sync constantly bumps mtime), else mtime. Set `use_frontmatter_date=False` to force mtime. Pure Python; logs the run to `queries.jsonl` as `cmd: "dead"`. Never moves or deletes — only surfaces candidates.
 
 ### Daily-productivity layer
 

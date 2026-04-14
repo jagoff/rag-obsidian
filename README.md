@@ -291,6 +291,10 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
+| `rag capture "<texto>"` | Captura rápida al `00-Inbox/YYYY-MM-DD-HHMM-<slug>.md`. Auto-indexa. |
+| `rag capture --stdin --tag voice --source tg:123` | Leer texto de stdin. Útil para voice transcripts. |
+| `rag morning [--dry-run] [--date Y-M-D] [--lookback-hours 36]` | Brief diario: ayer + foco hoy + inbox + contradicciones nuevas + queries low-conf. command-r 120-280 palabras. Auto Mon-Fri 7:00. |
+| `rag dead [--min-age-days 365] [--query-window-days 180] [--folder X] [--plain]` | Candidatos a archivar: 0 outlinks + 0 backlinks + no recuperada + vieja. Usa frontmatter `created:` si existe (iCloud-safe). |
 | `rag dupes [--threshold 0.85] [--folder X] [--limit 50] [--plain]` | Pares de notas con centroides similares. Numpy. <1s sobre 521 notas. |
 | `rag inbox [--folder 00-Inbox] [--apply]` | Triage cada nota: folder destino + tags + wikilinks + duplicados. `--apply` mueve + escribe + reindexa (si confianza ≥ 0.4). |
 | `rag inbox --no-folder/--no-tags/--no-wikilinks` | Skip individual signals. |
@@ -405,6 +409,7 @@ Servicios instalados por `rag setup`:
 |---|---|---|---|
 | `com.fer.obsidian-rag-watch` | `rag watch` | RunAtLoad + KeepAlive | `~/.local/share/obsidian-rag/watch.{log,error.log}` |
 | `com.fer.obsidian-rag-digest` | `rag digest` | StartCalendarInterval `domingo 22:00 local` | `~/.local/share/obsidian-rag/digest.{log,error.log}` |
+| `com.fer.obsidian-rag-morning` | `rag morning` | StartCalendarInterval `lun-vie 07:00 local` | `~/.local/share/obsidian-rag/morning.{log,error.log}` |
 
 ```bash
 rag setup                      # install/recarga
@@ -446,6 +451,26 @@ rag inbox --apply                            # mueve + taggea + linkifica
 ```bash
 rag prep "Maria coaching liderazgo" --save
 # → ~/Vault/00-Inbox/2026-04-15-prep-maria-coaching-liderazgo.md
+```
+
+### Captura rápida desde donde sea
+```bash
+rag capture "idea suelta sobre X"              # CLI
+echo "transcript largo" | rag capture --stdin  # pipe
+# O desde Telegram: /note <texto>, o voice + caption /note
+```
+
+### Morning brief a mano
+```bash
+rag morning --dry-run                   # ver primero
+rag morning                             # escribe 05-Reviews/YYYY-MM-DD.md
+# Auto-fires lun-vie 7am vía launchd (rag setup)
+```
+
+### Encontrar notas para archivar
+```bash
+rag dead --min-age-days 365 --query-window-days 180
+rag dead --folder 03-Resources --min-age-days 30
 ```
 
 ### Densificar el grafo de Obsidian
@@ -492,6 +517,18 @@ OBSIDIAN_RAG_VAULT=/otro/vault rag chat
 
 ---
 
+### Telegram (claude-telegram-bot @ffeerrr_bot)
+
+| Trigger | Acción |
+|---|---|
+| `/rag <q>` (texto) | Consulta RAG con session `tg:<chat_id>`. |
+| `/note <texto>` (texto) | `rag capture` a 00-Inbox/ con tags `[capture, telegram]`, source `tg:<chat_id>`. |
+| mensaje de voz, sin caption | Transcribe + habla con Claude (flujo default). |
+| mensaje de voz, caption `/note` | Transcribe + captura a 00-Inbox/ con tags `[capture, telegram, voice]`. |
+| mensaje de voz, caption `/rag [q extra]` | Transcribe + `rag query`. Caption se prepende al transcript. |
+
+---
+
 ## Troubleshooting
 
 | Síntoma | Causa probable | Fix |
@@ -508,6 +545,9 @@ OBSIDIAN_RAG_VAULT=/otro/vault rag chat
 | `rag watch` no re-indexa | El servicio puede haber crasheado | `tail ~/.local/share/obsidian-rag/watch.error.log`; `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch`. |
 | Eval baseline cae | Schema bump (v6→v7 = -5%) o cambio en pipeline | `rag eval --no-multi` para aislar el efecto del multi-query. Comparar contra el baseline en CLAUDE.md. |
 | `rag wikilinks suggest --apply` rompió un archivo | La regex no debería pero por las dudas | `git diff` en el vault si está versionado. Sino, re-escribir desde Obsidian (los `[[wrap]]` son no-destructivos). |
+| `rag dead` devuelve 0 candidatos con vault viejo | iCloud sync bumpea los mtimes constantemente | `rag dead` usa frontmatter `created:` cuando existe. Si tus notas no tienen ese campo, agregarlo (o aceptar que mtime no discrimina edad en iCloud). |
+| `rag morning` auto-fire no aparece en el vault | Servicio launchd no corrió (Mac apagado, suspendido, o error) | `tail ~/.local/share/obsidian-rag/morning.error.log`; re-disparar manual con `rag morning`. |
+| Telegram `/note` error "capture timeout" | `rag capture` está llamando al indexer y demora | Aumentar timeout en `runCapture` (default 30s) o hacer el index async. |
 
 ---
 

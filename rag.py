@@ -5227,6 +5227,605 @@ def wikilinks_suggest(
         )
 
 
+# ── QUICK CAPTURE (rag capture) ──────────────────────────────────────────────
+# Atomic building block: take a string (from stdin or arg) and land it in the
+# vault as a fresh Inbox note. Used directly by the user and indirectly by the
+# Telegram voice-to-note path.
+
+_CAPTURE_FOLDER = "00-Inbox"
+
+
+def _capture_slug(text: str, maxlen: int = 40) -> str:
+    """First non-empty line, slugged."""
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "capture")
+    return _slug(first, maxlen=maxlen)
+
+
+def capture_note(
+    text: str,
+    tags: list[str] | None = None,
+    source: str | None = None,
+    title: str | None = None,
+) -> Path:
+    """Create `<vault>/00-Inbox/YYYY-MM-DD-HHMM-<slug>.md` with the given text
+    and minimal frontmatter. Returns the written path.
+
+    Idempotent on name collision: appends a ``-2``, ``-3`` suffix.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("capture text is empty")
+    now = datetime.now()
+    stamp = now.strftime("%Y-%m-%d-%H%M")
+    slug = _slug(title, maxlen=40) if title else _capture_slug(text)
+    target_dir = VAULT_PATH / _CAPTURE_FOLDER
+    target_dir.mkdir(parents=True, exist_ok=True)
+    candidate = target_dir / f"{stamp}-{slug}.md"
+    i = 2
+    while candidate.exists():
+        candidate = target_dir / f"{stamp}-{slug}-{i}.md"
+        i += 1
+    fm_lines = [
+        "---",
+        f"created: '{now.isoformat(timespec='seconds')}'",
+        "type: capture",
+    ]
+    all_tags = list(dict.fromkeys(["capture", *(tags or [])]))
+    fm_lines.append("tags:")
+    for t in all_tags:
+        fm_lines.append(f"- {t}")
+    if source:
+        fm_lines.append(f"source: {source}")
+    fm_lines.append("---")
+    body = "\n".join(fm_lines) + f"\n\n{text.strip()}\n"
+    candidate.write_text(body, encoding="utf-8")
+    return candidate
+
+
+@cli.command()
+@click.argument("text", required=False)
+@click.option("--stdin", "from_stdin", is_flag=True,
+              help="Leer texto de stdin (ignora arg posicional)")
+@click.option("--tag", "tags", multiple=True,
+              help="Tag extra (además de 'capture'). Repetible.")
+@click.option("--source", default=None,
+              help="Etiqueta de origen (ej: 'voice', 'telegram', 'cli')")
+@click.option("--title", default=None,
+              help="Título custom (slug del filename). Default: primera línea.")
+@click.option("--plain", is_flag=True, help="Salida plana (ruta only)")
+def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
+            source: str | None, title: str | None, plain: bool):
+    """Capturar una nota rápida al 00-Inbox/ del vault.
+
+    Uso:
+      rag capture "idea suelta"
+      echo "nota" | rag capture --stdin --tag voice --source telegram
+    """
+    if from_stdin:
+        import sys
+        text = sys.stdin.read()
+    if not (text and text.strip()):
+        msg = "Sin texto. Pasá arg o --stdin."
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+    try:
+        path = capture_note(
+            text, tags=list(tags), source=source, title=title,
+        )
+    except ValueError as e:
+        click.echo(str(e)) if plain else console.print(f"[red]{e}[/red]")
+        return
+    # Auto-index so the captured note is retrievable inmediatly — `rag watch`
+    # would pick it up too, but we don't want to wait for its debounce.
+    try:
+        _index_single_file(get_db(), path, skip_contradict=True)
+    except Exception:
+        pass
+    rel = path.relative_to(VAULT_PATH)
+    if plain:
+        click.echo(str(rel))
+    else:
+        console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
+
+
+# ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
+# Proactive daily brief: what happened yesterday + what's pending + what to
+# focus today. Composes recent-notes / inbox / todo-frontmatter / new
+# contradictions / low-conf queries. Writes to 05-Reviews/YYYY-MM-DD.md.
+# Auto-fires via launchd weekday mornings.
+
+MORNING_FOLDER = "05-Reviews"
+
+
+def _collect_morning_evidence(
+    now: datetime,
+    vault: Path,
+    query_log: Path,
+    contradiction_log: Path,
+    lookback_hours: int = 36,
+) -> dict:
+    """Gather yesterday-ish signals. 36h lookback covers the gap between
+    morning runs on different days (skipping a day doesn't lose yesterday).
+    """
+    from datetime import timedelta as _td
+    start = now - _td(hours=lookback_hours)
+
+    recent: list[dict] = []
+    inbox: list[dict] = []
+    todos: list[dict] = []
+    if vault.is_dir():
+        for p in vault.rglob("*.md"):
+            try:
+                rel = str(p.relative_to(vault))
+            except ValueError:
+                continue
+            if is_excluded(rel):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+            except OSError:
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            fm = parse_frontmatter(raw)
+            title = p.stem
+            if rel.startswith(f"{_CAPTURE_FOLDER}/"):
+                inbox.append({
+                    "path": rel, "title": title,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": clean_md(raw)[:160].strip(),
+                })
+            if start <= mtime < now and not rel.startswith(f"{MORNING_FOLDER}/"):
+                recent.append({
+                    "path": rel, "title": title,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": clean_md(raw)[:220].strip(),
+                })
+            t = fm.get("todo")
+            d = fm.get("due")
+            if t or d:
+                todos.append({
+                    "path": rel, "title": title,
+                    "todo": t if t else None,
+                    "due": str(d) if d else None,
+                })
+
+    new_contrad: list[dict] = []
+    if contradiction_log.is_file():
+        try:
+            lines = contradiction_log.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if ts < start or ts >= now:
+                continue
+            if e.get("cmd") != "contradict_index":
+                continue
+            entries = e.get("contradicts") or []
+            if not entries:
+                continue
+            new_contrad.append({
+                "subject_path": e.get("subject_path", ""),
+                "targets": [
+                    {"path": c.get("path", ""), "why": c.get("why", "")}
+                    for c in entries if isinstance(c, dict)
+                ],
+            })
+
+    low_conf: list[dict] = []
+    if query_log.is_file():
+        try:
+            lines = query_log.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if ts < start or ts >= now:
+                continue
+            if e.get("cmd") != "query":
+                continue
+            score = e.get("top_score")
+            if isinstance(score, (int, float)) and score <= CONFIDENCE_RERANK_MIN:
+                q = (e.get("q") or "").strip()
+                if q:
+                    low_conf.append({"q": q, "top_score": float(score)})
+
+    recent.sort(key=lambda r: r["modified"], reverse=True)
+    inbox.sort(key=lambda r: r["modified"], reverse=True)
+
+    return {
+        "recent_notes": recent,
+        "inbox_pending": inbox,
+        "todos": todos,
+        "new_contradictions": new_contrad,
+        "low_conf_queries": low_conf,
+    }
+
+
+def _render_morning_prompt(date_label: str, ev: dict) -> str:
+    parts = [
+        f"Generás un morning brief para el {date_label}, en 1ra persona, "
+        "en español rioplatense, tono calmo y directo.",
+        "",
+        "Contexto real del vault (NO inventes lo que no esté acá):",
+        "",
+    ]
+    if ev["recent_notes"]:
+        parts.append(f"## Notas modificadas ayer ({len(ev['recent_notes'])}):")
+        for r in ev["recent_notes"][:12]:
+            parts.append(f"- [[{r['title']}]] ({r['path']}): {r['snippet'][:200]}")
+        parts.append("")
+    if ev["inbox_pending"]:
+        parts.append(f"## En 00-Inbox/ ({len(ev['inbox_pending'])} sin triar):")
+        for r in ev["inbox_pending"][:10]:
+            parts.append(f"- [[{r['title']}]]: {r['snippet'][:160]}")
+        parts.append("")
+    if ev["todos"]:
+        parts.append(f"## Notas con todo/due ({len(ev['todos'])}):")
+        for r in ev["todos"][:10]:
+            bits = []
+            if r.get("due"):
+                bits.append(f"due={r['due']}")
+            if r.get("todo"):
+                bits.append("todo=Y")
+            parts.append(f"- [[{r['title']}]] ({r['path']}) {', '.join(bits)}")
+        parts.append("")
+    if ev["new_contradictions"]:
+        parts.append(
+            f"## Contradicciones nuevas detectadas ({len(ev['new_contradictions'])}):"
+        )
+        for c in ev["new_contradictions"][:5]:
+            targets = ", ".join(t["path"] for t in c["targets"][:3])
+            parts.append(f"- {c['subject_path']} ↔ {targets}")
+        parts.append("")
+    if ev["low_conf_queries"]:
+        parts.append(f"## Queries sin respuesta buena ({len(ev['low_conf_queries'])}):")
+        for q in ev["low_conf_queries"][:6]:
+            parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
+        parts.append("")
+    parts.extend([
+        "Formato de salida (Markdown, EXACTO):",
+        "",
+        "## 📬 Ayer en una línea",
+        "(1 oración: qué pasó en el vault ayer)",
+        "",
+        "## 🎯 Foco sugerido para hoy",
+        "(3 bullets con [[wikilink]] a la nota relevante si aplica; "
+        "priorizar lo urgente/frágil; si no hay nada crítico, decilo honestamente)",
+        "",
+        "## 🗂 Pendientes que asoman",
+        "(si hay inbox o todos, listarlos cortos; si no, omitir la sección)",
+        "",
+        "## ⚠ Atender",
+        "(si hay contradicciones nuevas o gaps persistentes, nombrarlos; "
+        "si no, omitir la sección)",
+        "",
+        "Entre 120 y 280 palabras total. Citá notas con [[Título]].",
+    ])
+    return "\n".join(parts)
+
+
+def _generate_morning_narrative(prompt: str) -> str:
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return (resp.message.content or "").strip()
+    except Exception:
+        return ""
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True,
+              help="Imprimir el brief sin escribir el archivo")
+@click.option("--date", "date_opt", default=None,
+              help="Fecha objetivo YYYY-MM-DD (default: hoy)")
+@click.option("--lookback-hours", default=36, show_default=True,
+              help="Ventana de evidencia hacia atrás")
+def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
+    """Brief matutino: qué pasó ayer + qué enfocar hoy.
+
+    Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
+    contradicciones index-time del sidecar y queries low-confidence.
+    command-r arma un brief de 120-280 palabras. Escribe a
+    `05-Reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+    """
+    if date_opt:
+        try:
+            target = datetime.fromisoformat(date_opt)
+        except ValueError:
+            console.print(f"[red]Fecha inválida: {date_opt}[/red]")
+            return
+    else:
+        target = datetime.now()
+
+    ev = _collect_morning_evidence(
+        target, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
+        lookback_hours=lookback_hours,
+    )
+    total = (
+        len(ev["recent_notes"]) + len(ev["inbox_pending"])
+        + len(ev["todos"]) + len(ev["new_contradictions"])
+        + len(ev["low_conf_queries"])
+    )
+    if total == 0:
+        console.print(
+            "[yellow]Mañana en blanco:[/yellow] sin notas modificadas, "
+            "inbox vacío, 0 todos, 0 contradicciones nuevas."
+        )
+        return
+
+    console.print(
+        f"[dim]Evidencia:[/dim] {len(ev['recent_notes'])} recientes · "
+        f"{len(ev['inbox_pending'])} inbox · {len(ev['todos'])} todos · "
+        f"{len(ev['new_contradictions'])} contrad · "
+        f"{len(ev['low_conf_queries'])} low-conf"
+    )
+
+    date_label = target.strftime("%Y-%m-%d")
+    prompt = _render_morning_prompt(date_label, ev)
+    with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
+        narrative = _generate_morning_narrative(prompt)
+    if not narrative:
+        console.print("[red]Modelo devolvió respuesta vacía.[/red]")
+        return
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    fm_lines = [
+        "---",
+        f"created: '{now_iso}'",
+        "type: morning-brief",
+        "tags:",
+        "- review",
+        "- morning-brief",
+        f"date: '{date_label}'",
+        "---",
+    ]
+    body = "\n".join(fm_lines) + f"\n\n# Morning brief — {date_label}\n\n{narrative}\n"
+
+    if dry_run:
+        console.rule(f"[bold]Morning brief {date_label} (dry-run)[/bold]")
+        console.print(body, markup=False, highlight=False)
+        return
+
+    path = VAULT_PATH / MORNING_FOLDER / f"{date_label}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path = path.with_name(
+            f"{date_label} ({datetime.now().strftime('%H%M%S')}).md"
+        )
+    path.write_text(body, encoding="utf-8")
+    try:
+        _index_single_file(get_db(), path, skip_contradict=True)
+    except Exception:
+        pass
+    rel = path.relative_to(VAULT_PATH)
+    console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+
+
+# ── DEAD NOTES (rag dead) ────────────────────────────────────────────────────
+# Candidates for archive: notes with 0 graph edges + never retrieved + old mtime.
+# Pure Python. Surfaces candidates only — never moves/deletes.
+
+
+def _note_created_ts(raw: str, mtime: float) -> float:
+    """Best-effort creation timestamp for a note. iCloud sync bumps mtimes
+    constantly, so mtime-only age is noisy. Prefer frontmatter `created:` when
+    parseable, fall back to mtime.
+    """
+    if not raw.startswith("---"):
+        return mtime
+    fm = parse_frontmatter(raw)
+    for key in ("created", "date"):
+        v = fm.get(key)
+        if not v:
+            continue
+        s = str(v).strip().strip("'\"")
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s[:len(fmt) + 2].rstrip("Z"), fmt).timestamp()
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(s).timestamp()
+        except ValueError:
+            continue
+    return mtime
+
+
+def find_dead_notes(
+    col: chromadb.Collection,
+    vault: Path,
+    query_log: Path,
+    min_age_days: int = 365,
+    query_window_days: int = 180,
+    exclude_folders: tuple[str, ...] = (
+        "00-Inbox", "04-Archive", "05-Reviews",
+    ),
+    use_frontmatter_date: bool = True,
+) -> list[dict]:
+    """Dead-note candidates. AND of: 0 outlinks + 0 backlinks + not retrieved
+    in `query_window_days` + age > `min_age_days` + outside `exclude_folders`.
+
+    Age source: frontmatter `created:` if present (more reliable in iCloud
+    vaults where sync constantly bumps mtime), else mtime. Disable with
+    `use_frontmatter_date=False`.
+    """
+    from datetime import timedelta as _td
+    corpus = _load_corpus(col)
+    title_to_paths = corpus["title_to_paths"]
+    paths_with_outlinks = {
+        p for p, links in corpus["outlinks"].items() if links
+    }
+    backlinked_paths: set[str] = set()
+    for title, sources in corpus["backlinks"].items():
+        if sources:
+            backlinked_paths.update(title_to_paths.get(title, set()))
+
+    retrieved_paths: set[str] = set()
+    if query_log.is_file():
+        cutoff = datetime.now() - _td(days=query_window_days)
+        try:
+            lines = query_log.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            paths = e.get("paths") or []
+            if isinstance(paths, list):
+                for p in paths:
+                    if isinstance(p, str) and p:
+                        retrieved_paths.add(p)
+
+    files_info: dict[str, tuple[float, float]] = {}  # rel → (age_ts, mtime)
+    if vault.is_dir():
+        for p in vault.rglob("*.md"):
+            try:
+                rel = str(p.relative_to(vault))
+            except ValueError:
+                continue
+            if is_excluded(rel):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            age_ts = mtime
+            if use_frontmatter_date:
+                try:
+                    raw = p.read_text(encoding="utf-8", errors="ignore")
+                    age_ts = _note_created_ts(raw, mtime)
+                except OSError:
+                    pass
+            files_info[rel] = (age_ts, mtime)
+
+    age_cutoff = datetime.now().timestamp() - (min_age_days * 86400)
+    candidates: list[dict] = []
+    for rel, (age_ts, mtime) in files_info.items():
+        if any(
+            rel == ex or rel.startswith(ex.rstrip("/") + "/")
+            for ex in exclude_folders
+        ):
+            continue
+        if age_ts >= age_cutoff:
+            continue
+        if rel in paths_with_outlinks:
+            continue
+        if rel in backlinked_paths:
+            continue
+        if rel in retrieved_paths:
+            continue
+        age_days = int((datetime.now().timestamp() - age_ts) // 86400)
+        candidates.append({
+            "path": rel,
+            "age_days": age_days,
+            "mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+            "age_source": "frontmatter" if age_ts != mtime else "mtime",
+        })
+    candidates.sort(key=lambda r: -r["age_days"])
+    return candidates
+
+
+@cli.command()
+@click.option("--min-age-days", default=365, show_default=True,
+              help="Edad mínima por mtime")
+@click.option("--query-window-days", default=180, show_default=True,
+              help="Ventana para considerar que una nota 'fue usada' en queries")
+@click.option("--limit", default=50, show_default=True,
+              help="Cap del listado")
+@click.option("--folder", default=None, help="Acotar a una subcarpeta")
+@click.option("--plain", is_flag=True, help="Salida plana (path por línea)")
+def dead(min_age_days: int, query_window_days: int, limit: int,
+         folder: str | None, plain: bool):
+    """Listar notas candidatas a archivar (dead code del vault).
+
+    Criterio AND: 0 outlinks + 0 backlinks + no recuperada en N días +
+    mtime > N días + fuera de Inbox/Archive/Reviews. No borra nada.
+    """
+    col = get_db()
+    items = find_dead_notes(
+        col, VAULT_PATH, LOG_PATH,
+        min_age_days=min_age_days,
+        query_window_days=query_window_days,
+    )
+    if folder:
+        prefix = folder.rstrip("/") + "/"
+        items = [
+            it for it in items
+            if it["path"] == folder or it["path"].startswith(prefix)
+        ]
+    items = items[:limit]
+
+    log_query_event({
+        "cmd": "dead", "min_age_days": min_age_days,
+        "query_window_days": query_window_days,
+        "folder": folder, "n_candidates": len(items),
+    })
+
+    if not items:
+        msg = "Sin candidatos a dead notes."
+        click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
+        return
+    if plain:
+        for it in items:
+            click.echo(f"{it['age_days']}d\t{it['path']}")
+        return
+    console.print()
+    console.print(Rule(
+        title=f"[bold yellow]🪦 {len(items)} nota(s) candidatas a archivar[/bold yellow]",
+        style="yellow",
+    ))
+    tbl = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    tbl.add_column("edad", style="yellow", justify="right")
+    tbl.add_column("última modif", style="dim")
+    tbl.add_column("path", style="cyan")
+    for it in items:
+        tbl.add_row(f"{it['age_days']}d", it["mtime"][:10], it["path"])
+    console.print(tbl)
+    console.print(
+        "\n[dim]Criterio AND: 0 outlinks · 0 backlinks · "
+        f"no recuperada en {query_window_days}d · mtime > {min_age_days}d.[/dim]"
+    )
+
+
 # ── AUTOMATION (launchd) ─────────────────────────────────────────────────────
 # Two services keep the RAG alive without manual rituals:
 #  - obsidian-rag-watch: runs `rag watch` (auto-reindex on vault changes).
@@ -5313,6 +5912,39 @@ def _digest_plist(rag_bin: str) -> str:
 """
 
 
+def _morning_plist(rag_bin: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-morning</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>morning</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/morning.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/morning.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -5320,6 +5952,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _watch_plist(rag_bin)),
         ("com.fer.obsidian-rag-digest", "com.fer.obsidian-rag-digest.plist",
          _digest_plist(rag_bin)),
+        ("com.fer.obsidian-rag-morning", "com.fer.obsidian-rag-morning.plist",
+         _morning_plist(rag_bin)),
     ]
 
 

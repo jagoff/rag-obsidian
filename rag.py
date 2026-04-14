@@ -4336,7 +4336,7 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /file [apply|undo] · /cls · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · /cls · /exit[/dim]",
         border_style="green",
     ))
 
@@ -4384,12 +4384,15 @@ def chat(
             console.print("[dim]Conversación borrada. Sesión sigue activa.[/dim]")
             continue
 
-        # /file [apply|undo] — filing assistant, mismo behavior que `rag file`
-        # standalone. Sin args: dry-run en 00-Inbox. Apply abre el loop
-        # interactivo con click.prompt (compone bien con el input de chat).
-        # Undo revierte el último batch.
-        if question == "/file" or question.startswith("/file "):
-            rest = question[len("/file"):].strip().split()
+        # /inbox [apply|undo] — filing assistant sobre 00-Inbox, dispatch al
+        # mismo callback que `rag file` standalone. Sin args: dry-run.
+        # Apply abre el loop interactivo con click.prompt (compone bien con
+        # el input de chat). Undo revierte el último batch.
+        # Nota: el CLI sigue siendo `rag file` por compatibilidad; el slash
+        # del chat usa `/inbox` porque es más representativo del scope
+        # ("¿qué hago con mi inbox?").
+        if question == "/inbox" or question.startswith("/inbox "):
+            rest = question[len("/inbox"):].strip().split()
             do_apply = "apply" in rest
             do_undo = "undo" in rest
             if do_apply and do_undo:
@@ -4401,7 +4404,7 @@ def chat(
                     k=8, do_apply=do_apply, do_undo=do_undo, plain=False,
                 )
             except Exception as e:
-                console.print(f"[red]Error en /file: {e}[/red]")
+                console.print(f"[red]Error en /inbox: {e}[/red]")
             continue
 
         # Link intent — "donde está el link a X", "dame la url de Y",

@@ -176,6 +176,76 @@ def test_ext_block_still_renders_with_warning():
 # ── Combinaciones (el caso real que motivó esto) ─────────────────────────────
 
 
+# ── External URLs ────────────────────────────────────────────────────────────
+# Real case from a "bookmarks de películas" chat: command-r emits external
+# links as `[Label](https://...)` and the renderer used to drop them as raw
+# markdown. Now they should render as the label only, with the URL hidden
+# (clickable via OSC 8).
+
+
+def _styles(rendered) -> list[tuple[str, str]]:
+    """List of (text, style) spans — for asserting that styles include link."""
+    return [(span.text, str(span.style)) for span in rendered.divide([len(rendered)])[0].split()]
+
+
+def test_url_link_renders_label_not_url():
+    text = "Mirá [Cliver.tv](https://www2.cliver.me/) para ver pelis."
+    r = _plain(rag.render_response(text))
+    assert "Cliver.tv" in r
+    # URL queda accesible via OSC 8 hyperlink, no impreso como texto.
+    assert "https://www2.cliver.me/" not in r
+    # Markdown wrappers no aparecen.
+    assert "[" not in r
+    assert "](" not in r
+
+
+def test_url_link_with_special_chars_in_url():
+    # Real case: query strings con `=` y `&` no deben romper el match.
+    text = "[Search](https://example.com/q?x=1&y=2)"
+    r = _plain(rag.render_response(text))
+    assert "Search" in r
+    assert "https://example.com" not in r
+
+
+def test_bare_url_renders_as_clickable():
+    text = "Visitá https://example.com hoy."
+    r = _plain(rag.render_response(text))
+    # URL bare se imprime tal cual (no hay label que mostrar).
+    assert "https://example.com" in r
+    assert "Visitá " in r
+    assert " hoy." in r
+
+
+def test_url_link_does_not_consume_md_link_after():
+    # Mezcla: URL externa primero, nota .md después — ambas se rendereen.
+    text = "[Web](https://x.com) y [nota](02-Areas/X.md)"
+    r = _plain(rag.render_response(text))
+    assert "Web" in r
+    assert "nota" in r
+    assert "02-Areas/X.md" in r
+    assert "https://x.com" not in r
+
+
+def test_url_attaches_link_style():
+    # OSC 8 hyperlink sale via Rich — style del span debe incluir 'link'.
+    rendered = rag.render_response("[Anchor](https://example.com/foo)")
+    full_style = " ".join(str(span.style) for span in rendered.spans)
+    assert "link" in full_style
+    assert "https://example.com/foo" in full_style
+
+
+def test_md_link_with_md_extension_in_https_url():
+    # Edge: GitHub raw link a un .md externo. URL debe ganar a NOTE_LINK_RE
+    # (URL es más específica — exige `://`). Si NOTE_LINK_RE ganara,
+    # _file_link_style trataría la URL como path relativo al vault.
+    text = "[README](https://raw.githubusercontent.com/x/y/main/README.md)"
+    rendered = rag.render_response(text)
+    full_style = " ".join(str(span.style) for span in rendered.spans)
+    # El link debe apuntar al https, no a file://.../README.md.
+    assert "link https://" in full_style
+    assert "link file://" not in full_style
+
+
 def test_prose_plus_fence_plus_link_roundtrip():
     # Mezcla típica de respuesta del RAG con comando bash + cita de nota.
     text = (

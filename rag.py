@@ -33,7 +33,8 @@ import chromadb
 import ollama
 import yaml
 from rank_bm25 import BM25Okapi
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import track
@@ -48,6 +49,11 @@ import urllib.parse
 NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:[^()\n]|\([^()\n]*\))+?\.md)\)")
 # command-r often emits just [path.md] without a markdown-link wrapper.
 BARE_PATH_RE = re.compile(r"\[([^\[\]\n]+?\.md)\]")
+# External web links — checked before NOTE_LINK_RE because URLs can technically
+# end in .md (e.g. github raw README.md) and would otherwise be treated as a
+# vault-relative path. Bare URL form catches naked https:// in prose.
+URL_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+BARE_URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+")
 EXT_RE = re.compile(r"<<ext>>(.*?)<<\/ext>>", re.DOTALL)
 # Fenced code blocks: ```lang\nbody\n```  — lang is optional.
 CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+.\-]*\n?(.*?)\n?```", re.DOTALL)
@@ -107,6 +113,13 @@ def _file_link_style(path: str, base: str) -> str:
     return f"{base} link file://{urllib.parse.quote(str(full))}"
 
 
+def _url_link_style(url: str, base: str) -> str:
+    """OSC 8 clickable style for external https?:// URLs — terminal hands off
+    to the default browser when Cmd/Ctrl-clicked.
+    """
+    return f"{base} link {url}"
+
+
 def render_response(text: str) -> Text:
     """Render LLM response:
        - ```lang\\n...\\n``` → fence stripped, cada línea con gutter dim ("  │ ")
@@ -155,30 +168,53 @@ def render_response(text: str) -> Text:
             out.append(seg[pos:], style=base_style)
 
     def emit_links(segment: str, base_style: str | None = None):
-        """Segmento con links + inline code. Asume fences y ext ya extraídos."""
-        spans: list[tuple[int, int, str, str]] = []
+        """Segmento con links + inline code. Asume fences y ext ya extraídos.
+
+        Order matters: URLs first (more specific — must contain `://`), then
+        note paths. A markdown link whose target is `https://x/foo.md` would
+        otherwise be misread as a vault path by NOTE_LINK_RE.
+        """
+        spans: list[tuple[int, int, str, str, str]] = []  # start, end, label, target, kind
         consumed: list[tuple[int, int]] = []
+        for m in URL_LINK_RE.finditer(segment):
+            spans.append((m.start(), m.end(), m.group(1), m.group(2), "url-md"))
+            consumed.append(m.span())
         for m in NOTE_LINK_RE.finditer(segment):
-            spans.append((m.start(), m.end(), m.group(1), m.group(2)))
+            if any(s <= m.start() < e for s, e in consumed):
+                continue
+            spans.append((m.start(), m.end(), m.group(1), m.group(2), "note-md"))
             consumed.append(m.span())
         for m in BARE_PATH_RE.finditer(segment):
             if any(s <= m.start() < e for s, e in consumed):
                 continue
-            spans.append((m.start(), m.end(), m.group(1), m.group(1)))
+            spans.append((m.start(), m.end(), m.group(1), m.group(1), "note-bare"))
+            consumed.append(m.span())
+        for m in BARE_URL_RE.finditer(segment):
+            if any(s <= m.start() < e for s, e in consumed):
+                continue
+            spans.append((m.start(), m.end(), m.group(0), m.group(0), "url-bare"))
         spans.sort()
 
         last = 0
         label_base = "bold cyan" if not base_style else "bold yellow"
         path_base = "cyan dim" if not base_style else "yellow dim"
-        for start, end, label, path in spans:
+        url_base = "bold blue" if not base_style else "bold yellow"
+        for start, end, label, target, kind in spans:
             if start > last:
                 emit_plain_or_inline(segment[last:start], base_style=base_style)
-            if label == path:
-                out.append(path, style=_file_link_style(path, "bold magenta"))
-            else:
-                out.append(label, style=_file_link_style(path, label_base))
+            if kind == "url-md":
+                # External link with explicit anchor — render the anchor only.
+                # The URL is reachable via the OSC 8 hyperlink; printing it
+                # again clutters the line (URLs are often 60+ chars).
+                out.append(label, style=_url_link_style(target, url_base))
+            elif kind == "url-bare":
+                out.append(target, style=_url_link_style(target, url_base))
+            elif kind == "note-bare":
+                out.append(target, style=_file_link_style(target, "bold magenta"))
+            else:  # note-md
+                out.append(label, style=_file_link_style(target, label_base))
                 out.append(" (", style="dim")
-                out.append(path, style=_file_link_style(path, path_base))
+                out.append(target, style=_file_link_style(target, path_base))
                 out.append(")", style="dim")
             last = end
         if last < len(segment):
@@ -6502,6 +6538,47 @@ def find_urls(
     return items
 
 
+# Same single-level-balanced-parens trick as NOTE_LINK_RE so URLs with
+# `(…)` inside (Wikipedia, disambiguation pages) aren't half-matched.
+_CTX_URL_MD_RE = re.compile(
+    r"\[([^\]]+)\]\(https?://[^\s()]*(?:\([^)]*\)[^\s()]*)?\)"
+)
+_CTX_URL_BARE_RE = re.compile(r"https?://\S+")
+_CTX_TABLE_SEP_RE = re.compile(r"\s*\|\s*")
+_CTX_BACKTICKS_RE = re.compile(r"`([^`]+)`")
+_CTX_FRONTMATTER_BLOCK_RE = re.compile(r"-{3,}.*?-{3,}", flags=re.DOTALL)
+_CTX_FRONTMATTER_SEP_RE = re.compile(r"-{3,}")
+_CTX_TAG_RE = re.compile(r"#[\w/-]+")
+_CTX_WS_RE = re.compile(r"[ \t]+")
+
+
+def _clean_link_context(ctx: str, own_url: str, max_len: int = 240) -> str:
+    """Smooth the 240-char context snippet into readable prose.
+
+    Flattens markdown links to their anchor text, drops bare URLs (they
+    collide visually with the main URL shown above), removes the YAML
+    frontmatter block when the snippet starts mid-note, collapses table
+    pipes, strips backticks and inline #tags. Keeps plain prose intact so
+    the snippet still functions as a preview.
+    """
+    if not ctx:
+        return ""
+    s = _CTX_FRONTMATTER_BLOCK_RE.sub(" ", ctx)
+    s = _CTX_URL_MD_RE.sub(r"\1", s)
+    s = s.replace(own_url, "")
+    s = _CTX_URL_BARE_RE.sub("", s)
+    s = _CTX_BACKTICKS_RE.sub(r"\1", s)
+    s = _CTX_FRONTMATTER_SEP_RE.sub(" ", s)
+    s = _CTX_TABLE_SEP_RE.sub(" · ", s)
+    s = _CTX_TAG_RE.sub("", s)
+    s = _CTX_WS_RE.sub(" ", s)
+    s = re.sub(r"(?:\s*·\s*){2,}", " · ", s)
+    s = s.strip(" \t·-|,;:.\n…*>)")
+    if len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return s
+
+
 def render_links(items: list[dict], plain: bool = False) -> None:
     """Render link-finder results. Plain mode = bot/script-friendly text."""
     if not items:
@@ -6521,26 +6598,40 @@ def render_links(items: list[dict], plain: bool = False) -> None:
     console.print()
     console.print(Rule(title="[bold cyan]🔗 Links[/bold cyan]", style="cyan"))
     for i, it in enumerate(items, 1):
-        console.print()
-        head = Text()
-        head.append(f" {i}. ", style="bold cyan")
-        # Real OSC 8 hyperlink so Cmd/Ctrl-click opens in the default browser.
-        head.append(it["url"], style=f"underline blue link {it['url']}")
-        console.print(head)
-        if it.get("anchor"):
-            console.print(f"    [italic]{it['anchor']}[/italic]")
-        loc = Text()
-        loc.append("    en ", style="dim")
-        loc.append(it.get("note", ""), style=_file_link_style(it["path"], "magenta"))
-        loc.append(
-            f"  ({it['path']}:{it.get('line', 0)})",
-            style=_file_link_style(it["path"], "dim"),
+        url = it["url"]
+        anchor = (it.get("anchor") or "").strip()
+        use_anchor = bool(anchor) and anchor != url
+        title = Text()
+        title.append(f" {i} ", style="reverse bold cyan")
+        title.append(" ")
+        title.append(
+            anchor if use_anchor else url,
+            style=f"bold underline blue link {url}",
         )
-        console.print(loc)
-        ctx = (it.get("context") or "").strip()
+        body_lines: list[Text | str] = []
+        if use_anchor:
+            body_lines.append(Text(url, style=f"dim blue link {url}"))
+        loc = Text()
+        loc.append(it.get("note", ""), style=_file_link_style(it["path"], "magenta"))
+        loc.append("  ·  ", style="dim")
+        loc.append(
+            f"{it['path']}:{it.get('line', 0)}",
+            style=_file_link_style(it["path"], "cyan dim"),
+        )
+        body_lines.append(loc)
+        ctx = _clean_link_context(it.get("context") or "", url)
         if ctx:
-            ctx_short = ctx[:240] + ("…" if len(ctx) > 240 else "")
-            console.print(f"    [dim]{ctx_short}[/dim]")
+            body_lines.append(Text(ctx, style="dim italic"))
+        console.print(
+            Panel(
+                Group(*body_lines),
+                title=title,
+                title_align="left",
+                border_style="cyan dim",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
 
 def _rebuild_urls_index() -> dict:

@@ -4336,7 +4336,7 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /cls · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /file [apply|undo] · /cls · /exit[/dim]",
         border_style="green",
     ))
 
@@ -4382,6 +4382,26 @@ def chat(
             last_sources = []
             console.clear()
             console.print("[dim]Conversación borrada. Sesión sigue activa.[/dim]")
+            continue
+
+        # /file [apply|undo] — filing assistant, mismo behavior que `rag file`
+        # standalone. Sin args: dry-run en 00-Inbox. Apply abre el loop
+        # interactivo con click.prompt (compone bien con el input de chat).
+        # Undo revierte el último batch.
+        if question == "/file" or question.startswith("/file "):
+            rest = question[len("/file"):].strip().split()
+            do_apply = "apply" in rest
+            do_undo = "undo" in rest
+            if do_apply and do_undo:
+                console.print("[red]No podés combinar apply y undo.[/red]")
+                continue
+            try:
+                file_cmd.callback(
+                    path=None, folder="00-Inbox", one=False, limit=20,
+                    k=8, do_apply=do_apply, do_undo=do_undo, plain=False,
+                )
+            except Exception as e:
+                console.print(f"[red]Error en /file: {e}[/red]")
             continue
 
         # Link intent — "donde está el link a X", "dame la url de Y",

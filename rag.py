@@ -176,6 +176,13 @@ def resolve_chat_model() -> str:
 MIN_CHUNK = 150    # chars — merge smaller chunks with neighbor
 MAX_CHUNK = 800    # chars — bge-m3 accepts ~2048 tokens; 800 chars ≈ 200 tokens
                    # sweet spot: enough context per chunk, prefix doesn't dominate
+
+# Folder prefixes to exclude from indexing entirely (deleted / system folders).
+EXCLUDED_PREFIXES = (".trash/", ".obsidian/")
+
+
+def is_excluded(rel_path: str) -> bool:
+    return any(rel_path.startswith(p) for p in EXCLUDED_PREFIXES)
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 RERANK_TOP = 5     # final chunks after reranking
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
@@ -585,14 +592,12 @@ def classify_intent(
 
 def _filter_files(metas: list[dict], tag: str | None, folder: str | None) -> list[dict]:
     """Return a deduped list of unique-file meta dicts matching filters.
-    Always skips `.trash/` to keep aggregate answers relevant.
+    Always skips excluded prefixes (`.trash/`, `.obsidian/`).
     """
     seen: dict[str, dict] = {}
     for m in metas:
         f = m.get("file", "")
-        if f in seen:
-            continue
-        if f.startswith(".trash/"):
+        if f in seen or is_excluded(f):
             continue
         if tag:
             tags_list = [t.strip() for t in (m.get("tags") or "").split(",") if t.strip()]
@@ -964,6 +969,8 @@ def _index_single_file(col: chromadb.Collection, path: Path) -> str:
         doc_id_prefix = str(path.relative_to(VAULT_PATH))
     except ValueError:
         return "skipped"  # outside vault
+    if is_excluded(doc_id_prefix):
+        return "skipped"
 
     existing = col.get(where={"file": doc_id_prefix}, include=["metadatas"])
     existing_ids = existing["ids"]
@@ -1047,7 +1054,10 @@ def index(reset: bool):
             (id_, meta.get("hash", ""))
         )
 
-    md_files = list(VAULT_PATH.rglob("*.md"))
+    md_files = [
+        p for p in VAULT_PATH.rglob("*.md")
+        if not is_excluded(str(p.relative_to(VAULT_PATH)))
+    ]
     console.print(f"[cyan]Indexando {len(md_files)} notas...[/cyan]")
 
     indexed_files = set()

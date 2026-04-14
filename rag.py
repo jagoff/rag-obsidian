@@ -48,6 +48,11 @@ NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:[^()\n]|\([^()\n]*\))+?\.md)\)")
 # command-r often emits just [path.md] without a markdown-link wrapper.
 BARE_PATH_RE = re.compile(r"\[([^\[\]\n]+?\.md)\]")
 EXT_RE = re.compile(r"<<ext>>(.*?)<<\/ext>>", re.DOTALL)
+# Fenced code blocks: ```lang\nbody\n```  — lang is optional.
+CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+.\-]*\n?(.*?)\n?```", re.DOTALL)
+# Inline code: `literal` (no newlines, no empties). Skipped inside fences
+# because fences are extracted before this pass runs.
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 
 
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
@@ -99,15 +104,33 @@ def _file_link_style(path: str, base: str) -> str:
 
 def render_response(text: str) -> Text:
     """Render LLM response:
+       - ```lang\\n...\\n``` → fence stripped, cada línea con gutter dim ("  │ ")
+         y contenido bold white (se puede copiar el comando limpio)
+       - `inline`         → backticks stripped, bold cyan
        - [Label](path.md) → label bold cyan, path dim cyan + clickable
        - [path.md]        → path bold magenta + clickable (command-r style)
-       - <<ext>>...<</ext>> → dim yellow (external / inferred content)
+       - <<ext>>...<</ext>> → dim yellow italic (external / inferred content)
+
+    El pipeline extrae primero los fences (que no contienen más markdown),
+    después procesa lo de afuera con ext → links → inline code.
     """
     out = Text()
 
-    def append_with_links(segment: str, base_style: str | None = None):
-        # Walk the segment, flushing plain text between recognised link spans.
-        spans: list[tuple[int, int, str, str]] = []  # (start, end, label, path)
+    def emit_plain_or_inline(seg: str, base_style: str | None = None):
+        """Segmento sin links/ext/fences — solo maneja `inline` code."""
+        pos = 0
+        for m in INLINE_CODE_RE.finditer(seg):
+            if m.start() > pos:
+                out.append(seg[pos:m.start()], style=base_style)
+            inline_style = "bold yellow" if base_style and "yellow" in base_style else "bold cyan"
+            out.append(m.group(1), style=inline_style)
+            pos = m.end()
+        if pos < len(seg):
+            out.append(seg[pos:], style=base_style)
+
+    def emit_links(segment: str, base_style: str | None = None):
+        """Segmento con links + inline code. Asume fences y ext ya extraídos."""
+        spans: list[tuple[int, int, str, str]] = []
         consumed: list[tuple[int, int]] = []
         for m in NOTE_LINK_RE.finditer(segment):
             spans.append((m.start(), m.end(), m.group(1), m.group(2)))
@@ -123,9 +146,7 @@ def render_response(text: str) -> Text:
         path_base = "cyan dim" if not base_style else "yellow dim"
         for start, end, label, path in spans:
             if start > last:
-                out.append(segment[last:start], style=base_style)
-            # If label == path (bracket-only format), render path as the main
-            # token in magenta to visually distinguish it from a named link.
+                emit_plain_or_inline(segment[last:start], base_style=base_style)
             if label == path:
                 out.append(path, style=_file_link_style(path, "bold magenta"))
             else:
@@ -135,18 +156,41 @@ def render_response(text: str) -> Text:
                 out.append(")", style="dim")
             last = end
         if last < len(segment):
-            out.append(segment[last:], style=base_style)
+            emit_plain_or_inline(segment[last:], base_style=base_style)
+
+    def emit_ext_and_links(segment: str):
+        """Segmento sin fences — ext markers primero, links después."""
+        pos = 0
+        for m in EXT_RE.finditer(segment):
+            if m.start() > pos:
+                emit_links(segment[pos:m.start()])
+            out.append("⚠ ", style="bold yellow")
+            emit_links(m.group(1).strip(), base_style="yellow dim italic")
+            pos = m.end()
+        if pos < len(segment):
+            emit_links(segment[pos:])
+
+    def emit_code_fence(code: str):
+        """Fence stripped: gutter dim + contenido bold white por línea. El
+        contenido queda seleccionable/copiable sin los backticks."""
+        lines = code.rstrip("\n").split("\n")
+        if not lines or (len(lines) == 1 and not lines[0]):
+            return
+        # Blank line arriba del bloque para respiro visual.
+        if len(out) and not str(out).endswith("\n"):
+            out.append("\n")
+        for ln in lines:
+            out.append("  │ ", style="cyan dim")
+            out.append(ln + "\n", style="bold white")
 
     pos = 0
-    for m in EXT_RE.finditer(text):
+    for m in CODE_FENCE_RE.finditer(text):
         if m.start() > pos:
-            append_with_links(text[pos:m.start()])
-        # External / inferred content wrapped by the LLM.
-        out.append("⚠ ", style="bold yellow")
-        append_with_links(m.group(1).strip(), base_style="yellow dim italic")
+            emit_ext_and_links(text[pos:m.start()])
+        emit_code_fence(m.group(1))
         pos = m.end()
     if pos < len(text):
-        append_with_links(text[pos:])
+        emit_ext_and_links(text[pos:])
     return out
 
 # Multi-vault: `OBSIDIAN_RAG_VAULT` env var overrides the default iCloud vault.

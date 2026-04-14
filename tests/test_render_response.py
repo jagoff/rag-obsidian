@@ -93,6 +93,61 @@ def test_inline_code_inside_fence_is_not_reparsed():
     assert "  │ echo `date`" in r
 
 
+# ── Bold ─────────────────────────────────────────────────────────────────────
+
+
+def test_bold_strips_asterisks():
+    text = "Mirá **esto** con atención."
+    r = _plain(rag.render_response(text))
+    assert "**" not in r
+    assert "esto" in r
+    assert "Mirá " in r
+    assert " con atención." in r
+
+
+def test_bold_label_pattern_like_list_item():
+    # Caso real que pediste arreglar: "**Amplificadores:**" en listas.
+    text = "- **Amplificadores:** Marshall, Fender\n- **Pedales:** Boss"
+    r = _plain(rag.render_response(text))
+    assert "**" not in r
+    assert "Amplificadores:" in r
+    assert "Pedales:" in r
+    assert "Marshall" in r
+
+
+def test_bold_multiple_per_line():
+    text = "Entre **foo** y **bar** hay diferencia."
+    r = _plain(rag.render_response(text))
+    assert "**" not in r
+    assert "foo" in r
+    assert "bar" in r
+
+
+def test_bold_inside_inline_code_stays_literal():
+    # Si los ** están dentro de `code`, son parte del código — no tocar.
+    text = "El operador `**` eleva al cuadrado."
+    r = _plain(rag.render_response(text))
+    # Inline code strip: los backticks se van, pero los ** quedan.
+    assert "**" in r
+    assert "eleva al cuadrado" in r
+
+
+def test_bold_inside_fence_stays_literal():
+    text = "```py\nx = a ** 2\n```"
+    r = _plain(rag.render_response(text))
+    # Dentro del fence, los ** son código literal.
+    assert "x = a ** 2" in r
+    # Y el wrapper ``` no aparece.
+    assert "```" not in r
+
+
+def test_bold_empty_marker_is_not_consumed():
+    # `****` vacío — la regex exige contenido no-vacío, queda literal.
+    text = "Nada **** acá."
+    r = _plain(rag.render_response(text))
+    assert "****" in r
+
+
 # ── Regresión: features existentes siguen andando ────────────────────────────
 
 

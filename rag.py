@@ -53,6 +53,10 @@ CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+.\-]*\n?(.*?)\n?```", re.DOTALL)
 # Inline code: `literal` (no newlines, no empties). Skipped inside fences
 # because fences are extracted before this pass runs.
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+# Bold: **literal** (no nested asterisks, no newlines). command-r emite
+# estos marcadores seguido en listas ("**Amplificadores:**") y la terminal
+# los muestra raw si no los parseamos.
+BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 
 
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
@@ -117,14 +121,35 @@ def render_response(text: str) -> Text:
     out = Text()
 
     def emit_plain_or_inline(seg: str, base_style: str | None = None):
-        """Segmento sin links/ext/fences — solo maneja `inline` code."""
-        pos = 0
+        """Segmento sin links/ext/fences — maneja `inline code` y **bold**.
+        Se tokeniza en spans ordenados y no solapados para que `x **y** z`
+        o `**x `y` z**` se rendereen sin tocar los marcadores del otro tipo.
+        """
+        spans: list[tuple[int, int, str, str]] = []
         for m in INLINE_CODE_RE.finditer(seg):
-            if m.start() > pos:
-                out.append(seg[pos:m.start()], style=base_style)
-            inline_style = "bold yellow" if base_style and "yellow" in base_style else "bold cyan"
-            out.append(m.group(1), style=inline_style)
-            pos = m.end()
+            spans.append((m.start(), m.end(), "code", m.group(1)))
+        code_ranges = [(s, e) for s, e, *_ in spans]
+        for m in BOLD_RE.finditer(seg):
+            if any(cs <= m.start() < ce for cs, ce in code_ranges):
+                continue   # bold adentro de inline code es literal
+            spans.append((m.start(), m.end(), "bold", m.group(1)))
+        spans.sort()
+
+        inline_code_style = (
+            "bold yellow" if base_style and "yellow" in base_style
+            else "bold cyan"
+        )
+        bold_style = f"bold {base_style}" if base_style else "bold"
+
+        pos = 0
+        for start, end, kind, content in spans:
+            if start > pos:
+                out.append(seg[pos:start], style=base_style)
+            if kind == "code":
+                out.append(content, style=inline_code_style)
+            else:   # bold
+                out.append(content, style=bold_style)
+            pos = end
         if pos < len(seg):
             out.append(seg[pos:], style=base_style)
 

@@ -1515,6 +1515,147 @@ def render_related(related: list[tuple[dict, int, str]]) -> None:
     console.print(tbl)
 
 
+# ── WIKILINK SUGGESTIONS ──────────────────────────────────────────────────────
+# Densifies the Obsidian graph by surfacing mentions of existing note titles
+# that aren't yet `[[wikilinked]]`. Pure regex-by-title scan against the
+# corpus' `title_to_paths` index — no LLM, no embeddings. Skips frontmatter,
+# code blocks, existing wikilinks, markdown links and HTML tags so we never
+# wrap text the user already linked elsewhere.
+
+_WIKILINK_SKIP_PATTERNS = [
+    re.compile(r"```.*?```", re.DOTALL),                  # fenced code
+    re.compile(r"`[^`\n]+`"),                              # inline code
+    re.compile(r"!?\[\[[^\]]+\]\]"),                       # existing wikilinks (incl. ![[embed]])
+    re.compile(r"\[[^\]\n]+\]\([^\)\n]+\)"),               # markdown links
+    re.compile(r"<[^>\n]+>"),                              # HTML tags
+]
+
+
+def _wikilink_skip_spans(text: str) -> list[tuple[int, int]]:
+    """Build the list of (start, end) char ranges to ignore when proposing
+    wikilinks. Includes frontmatter at top, code blocks, existing wikilinks,
+    markdown links and HTML tags.
+    """
+    spans: list[tuple[int, int]] = []
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            spans.append((0, end + 4))
+    for pat in _WIKILINK_SKIP_PATTERNS:
+        for m in pat.finditer(text):
+            spans.append(m.span())
+    return spans
+
+
+def _in_skip_span(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
+def find_wikilink_suggestions(
+    col: chromadb.Collection,
+    note_path: str,
+    min_title_len: int = 4,
+    max_per_note: int = 30,
+) -> list[dict]:
+    """Return wikilink suggestions for one note.
+
+    For each unique title in the corpus whose body matches inside `note_path`
+    AND that match isn't already covered by a wikilink/markdown link/code/HTML
+    span, propose `[[Title]]`. Case-sensitive, word-boundary anchored.
+
+    Returns [{title, target, line, char_offset, context}, ...].
+
+    Heuristics:
+     - `min_title_len`: skip very short titles (high collision risk; "TDD",
+       "AI", "X" trigger everywhere).
+     - Ambiguous titles (same string maps to multiple paths) are skipped —
+       can't know which to link to without user input.
+     - Self-links suppressed (target == note_path).
+     - Only the FIRST occurrence per title in the note is proposed (Obsidian
+       convention: one wikilink per page is enough for graph purposes).
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return []
+    if not full.is_file():
+        return []
+    raw = full.read_text(encoding="utf-8", errors="ignore")
+    skip_spans = _wikilink_skip_spans(raw)
+
+    c = _load_corpus(col)
+    title_to_paths = c["title_to_paths"]
+    own_title = full.stem
+
+    suggestions: list[dict] = []
+    seen_titles: set[str] = set()
+    # Sort longest first — if "Claude Code" is a title and so is "Claude",
+    # prefer the longer phrase so we don't double-suggest overlapping spans.
+    titles_sorted = sorted(title_to_paths.items(), key=lambda kv: -len(kv[0]))
+    for title, paths in titles_sorted:
+        if len(title) < min_title_len or title in seen_titles:
+            continue
+        if title == own_title:
+            continue
+        if len(paths) != 1:
+            continue  # ambiguous — skip
+        target = next(iter(paths))
+        if target == note_path:
+            continue
+        try:
+            pat = re.compile(rf"\b{re.escape(title)}\b")
+        except re.error:
+            continue
+        for m in pat.finditer(raw):
+            if _in_skip_span(m.start(), skip_spans):
+                continue
+            line = raw[:m.start()].count("\n") + 1
+            ctx = raw[max(0, m.start() - 60):min(len(raw), m.end() + 60)]
+            suggestions.append({
+                "title": title,
+                "target": target,
+                "line": line,
+                "char_offset": m.start(),
+                "context": re.sub(r"\s+", " ", ctx).strip(),
+            })
+            seen_titles.add(title)
+            break  # one per title per note
+        if len(suggestions) >= max_per_note:
+            break
+    suggestions.sort(key=lambda s: s["char_offset"])
+    return suggestions
+
+
+def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
+    """Wrap each proposed mention with `[[ ]]`. Returns the count actually
+    applied. Iterates from highest offset to lowest so earlier offsets stay
+    valid. Defensive: re-checks the literal text at offset before substituting
+    so a stale suggestion (file edited mid-flight) is silently skipped.
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return 0
+    if not full.is_file() or not suggestions:
+        return 0
+    raw = full.read_text(encoding="utf-8", errors="ignore")
+    by_offset = sorted(suggestions, key=lambda s: s["char_offset"], reverse=True)
+    applied = 0
+    for s in by_offset:
+        start = s["char_offset"]
+        title = s["title"]
+        end = start + len(title)
+        if raw[start:end] != title:
+            continue
+        raw = raw[:start] + f"[[{title}]]" + raw[end:]
+        applied += 1
+    if applied:
+        full.write_text(raw, encoding="utf-8")
+    return applied
+
+
 def find_contradictions(
     col: chromadb.Collection,
     question: str,
@@ -4308,6 +4449,106 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         "folder": folder, "tag": tag,
         "top_url": items[0]["url"] if items else None,
     })
+
+
+@cli.group()
+def wikilinks():
+    """Densificar el grafo: sugerir [[wikilinks]] faltantes."""
+
+
+@wikilinks.command("suggest")
+@click.option("--note", "note_path", default=None,
+              help="Solo esta nota (vault-relative)")
+@click.option("--folder", default=None, help="Solo notas bajo este folder")
+@click.option("--apply", is_flag=True,
+              help="Aplicar las sugerencias (default = dry-run)")
+@click.option("--max-per-note", default=30, show_default=True,
+              help="Cap de sugerencias por nota")
+@click.option("--min-len", default=4, show_default=True,
+              help="Largo mínimo del título a considerar (filtro de colisiones)")
+@click.option("--show", default=5, show_default=True,
+              help="Sugerencias por nota a imprimir en dry-run")
+def wikilinks_suggest(
+    note_path: str | None, folder: str | None, apply: bool,
+    max_per_note: int, min_len: int, show: int,
+):
+    """Encontrar menciones a títulos de notas que NO están wikilinkeadas y
+    proponerlas. Skipea código, frontmatter, links existentes, y títulos
+    ambiguos (mismo string en varias notas).
+    """
+    col = get_db()
+    if note_path:
+        paths = [note_path]
+    else:
+        c = _load_corpus(col)
+        paths = sorted({m.get("file", "") for m in c["metas"] if m.get("file")})
+        if folder:
+            paths = [p for p in paths if p.startswith(folder.rstrip("/") + "/") or p == folder]
+
+    if not paths:
+        console.print("[yellow]No hay notas que procesar.[/yellow]")
+        return
+
+    total_suggestions = 0
+    notes_with_suggestions = 0
+    notes_applied = 0
+    by_note: list[tuple[str, list[dict]]] = []
+    for path in track(paths, description="Analizando..."):
+        try:
+            sugs = find_wikilink_suggestions(
+                col, path, min_title_len=min_len, max_per_note=max_per_note,
+            )
+        except Exception:
+            continue
+        if not sugs:
+            continue
+        notes_with_suggestions += 1
+        total_suggestions += len(sugs)
+        by_note.append((path, sugs))
+
+        if apply:
+            try:
+                n_applied = apply_wikilink_suggestions(path, sugs)
+                if n_applied:
+                    notes_applied += 1
+                    # Re-index the rewritten note so retrieval picks up the new
+                    # outlinks. Skip contradiction check — wikilinks aren't a
+                    # claim change, just graph noise; saves an LLM call.
+                    try:
+                        _index_single_file(
+                            col, VAULT_PATH / path, skip_contradict=True,
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                console.print(f"[red]Error aplicando en {path}: {e}[/red]")
+
+    if not apply:
+        for path, sugs in by_note:
+            console.print(
+                f"\n[bold cyan]{path}[/bold cyan] [dim]({len(sugs)} sugerencia(s))[/dim]"
+            )
+            for s in sugs[:show]:
+                console.print(
+                    f"  [yellow]{s['title']}[/yellow] → [magenta]{s['target']}[/magenta]"
+                    f" [dim]línea {s['line']}[/dim]"
+                )
+                ctx = s["context"]
+                if len(ctx) > 140:
+                    ctx = ctx[:140] + "…"
+                console.print(f"    [dim]{ctx}[/dim]")
+            if len(sugs) > show:
+                console.print(f"    [dim]+ {len(sugs) - show} más…[/dim]")
+        console.print(
+            f"\n[cyan]{total_suggestions} sugerencia(s) en "
+            f"{notes_with_suggestions}/{len(paths)} nota(s).[/cyan] "
+            f"[dim]Re-correr con --apply para escribir.[/dim]"
+        )
+    else:
+        console.print(
+            f"\n[green]✓ Aplicado:[/green] {total_suggestions} wikilinks en "
+            f"{notes_applied}/{len(paths)} notas."
+        )
 
 
 @cli.command()

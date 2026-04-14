@@ -40,6 +40,10 @@ rag links "documentación de X"     # ranked URLs from the vault, OSC 8 clickabl
 rag links "X" --open 1             # open rank-1 URL in default browser
 rag links --rebuild                # backfill the URL sub-index from existing notes
 
+# Wikilink density (graph builder, no LLM)
+rag wikilinks suggest                       # dry-run for whole vault
+rag wikilinks suggest --folder X --apply    # write [[wikilinks]] for unlinked title mentions
+
 # Quality + observability
 rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
 rag log [-n 20] [--low-confidence]
@@ -121,6 +125,22 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 ### Agent mode (`rag do`)
 
 `rag do "instrucción"` runs a tool-calling loop with command-r. Tools exposed: `_agent_tool_search` (calls `retrieve()`), `_agent_tool_read_note`, `_agent_tool_list_notes`, `_agent_tool_propose_write`. Writes are NOT applied during the loop — they accumulate in `_AGENT_PENDING_WRITES` and the user confirms each at the end (skip with `--yes`, cap iterations with `--max-iterations`, default 8). No delete/move tools by design — first version is conservative.
+
+### Wikilink density (`rag wikilinks suggest`)
+
+The Obsidian graph is the system's foundation: `find_related`, the contradiction radar's neighbour pool, and chain reformulation all benefit from denser wikilinks. But manually adding `[[Title]]` is friction users skip. This command densifies the graph in a single sweep — no LLM, just a regex scan against the corpus' `title_to_paths` index.
+
+For each note: walk the body, look for word-boundary matches of any *other* note's title, propose wrapping with `[[ ]]`. Skips frontmatter, fenced + inline code, existing wikilinks, markdown links, and HTML tags via `_wikilink_skip_spans`. Skips ambiguous titles (same string maps to multiple paths). Skips short titles by default (`--min-len 4`) — "TDD"/"AI"/"X" hit too widely. Only the first occurrence per title per note is proposed (one wikilink per page is enough for graph purposes).
+
+CLI:
+- `rag wikilinks suggest` — dry-run, all notes. `--folder X` or `--note <path>` to scope. `--show N` controls per-note display.
+- `rag wikilinks suggest --apply` — actually wraps with `[[ ]]`. Each modified note is re-indexed via `_index_single_file(skip_contradict=True)` so retrieval picks up the new outlinks immediately.
+
+`apply_wikilink_suggestions` iterates suggestions from highest char-offset to lowest so earlier offsets stay valid; defensive re-check at each offset silently skips stale suggestions if the file changed mid-flight.
+
+Real-vault baseline: 132 suggestions across 98/521 notes — ~25% of the vault gets denser in one apply.
+
+Tests: `tests/test_wikilinks.py` — 23 cases (skip-mask building, finder behavior incl. self-link suppression / one-per-title / ambiguous-title skip / short-title filter / word-boundary, `apply_wikilink_suggestions` round-trip + stale-offset defense).
 
 ### URL finder (`rag links`, `rag_links` MCP tool)
 

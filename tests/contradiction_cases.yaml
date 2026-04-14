@@ -1,0 +1,112 @@
+# Golden set for tuning the find_contradictions helper prompt.
+#
+# Each case fakes a (question, answer, chunks) input and declares which chunk
+# paths SHOULD be flagged as contradictions. The evaluator builds a one-shot
+# in-memory ChromaDB from `chunks`, calls find_contradictions, and reports
+# precision/recall against `expected`.
+#
+# Case shape:
+#   id:        short identifier
+#   question:  the user query that produced the answer
+#   answer:    the assistant's response
+#   chunks:    list of {path, note, text} — these become the candidate pool
+#   expected:  list of paths that the helper SHOULD flag
+#              ([] = no contradiction; helper should return [])
+#   notes:     optional human comment on what the case is probing
+
+cases:
+  # ── True contradictions ─────────────────────────────────────────────────────
+  - id: color-direct
+    question: "de qué color es mi guitarra principal"
+    answer: "Mi guitarra principal es azul, según la nota de equipamiento."
+    chunks:
+      - path: "03-Resources/Equipamiento - Guitarras.md"
+        note: "Equipamiento - Guitarras"
+        text: "Mi guitarra principal es una Telecaster roja del 2019, comprada en Buenos Aires."
+      - path: "03-Resources/Equipamiento - Amps.md"
+        note: "Equipamiento - Amps"
+        text: "Uso un Fender Blues Junior con la Telecaster, suena cálido."
+    expected:
+      - "03-Resources/Equipamiento - Guitarras.md"
+    notes: "Direct factual conflict (azul vs roja) about the same subject."
+
+  - id: number-mismatch
+    question: "cuántos cursos de coaching di"
+    answer: "Hasta ahora di tres cursos completos de coaching."
+    chunks:
+      - path: "02-Areas/Coaching/Coaching - Datos.md"
+        note: "Coaching - Datos"
+        text: "Cinco ediciones del curso de coaching dadas entre 2022 y 2025, todas con cohortes completas."
+      - path: "02-Areas/Coaching/Fer Coach.md"
+        note: "Fer Coach"
+        text: "Mi enfoque combina ICF, NVC y mindfulness."
+    expected:
+      - "02-Areas/Coaching/Coaching - Datos.md"
+    notes: "Quantitative conflict (3 vs 5 ediciones)."
+
+  - id: model-mismatch
+    question: "qué modelo de embeddings usa el RAG"
+    answer: "El sistema RAG usa OpenAI text-embedding-3 para indexar el vault."
+    chunks:
+      - path: "03-Resources/Obsidian RAG Local.md"
+        note: "Obsidian RAG Local"
+        text: "El embedding model es bge-m3 multilingüe (1024-dim), corre 100% local vía Ollama."
+    expected:
+      - "03-Resources/Obsidian RAG Local.md"
+    notes: "Architectural conflict (cloud vs local model)."
+
+  # ── False positives — helper SHOULD return [] ──────────────────────────────
+  - id: complementary-not-contradictory
+    question: "qué es ikigai"
+    answer: "Ikigai es un concepto japonés que cruza pasión, vocación, profesión y misión."
+    chunks:
+      - path: "02-Areas/Coaching/Ikigai.md"
+        note: "Ikigai"
+        text: "Ikigai surge en Okinawa y se asocia a la longevidad de sus habitantes."
+      - path: "02-Areas/Coaching/Coaching - Referentes.md"
+        note: "Coaching - Referentes"
+        text: "Ken Mogi escribió 'The Little Book of Ikigai' en 2017."
+    expected: []
+    notes: "Adds context about ikigai but doesn't contradict the answer."
+
+  - id: different-subject
+    question: "letras de muros fractales"
+    answer: "La letra principal de Muros Fractales habla sobre rutinas urbanas."
+    chunks:
+      - path: "02-Areas/Musica/Toma tres.md"
+        note: "Toma tres"
+        text: "Toma tres es una canción acústica sobre paisajes patagónicos."
+    expected: []
+    notes: "Different subject entirely — no contradiction even though both are songs."
+
+  - id: nuance-not-conflict
+    question: "qué reranker usa el RAG"
+    answer: "El reranker es bge-reranker-v2-m3, cross-encoder multilingüe."
+    chunks:
+      - path: "03-Resources/Obsidian RAG Local.md"
+        note: "Obsidian RAG Local"
+        text: "bge-reranker-v2-m3 corre en MPS con torch_dtype=float16 para evitar el fallback CPU."
+    expected: []
+    notes: "Adds device/dtype detail but agrees on the model identity."
+
+  # ── Edge: user holds both views simultaneously ─────────────────────────────
+  - id: same-author-two-perspectives
+    question: "qué pienso sobre comunicación no violenta"
+    answer: "La CNV es una herramienta poderosa pero a veces se aplica de forma rígida."
+    chunks:
+      - path: "02-Areas/Coaching/Comunicacion no violenta.md"
+        note: "Comunicacion no violenta"
+        text: "La CNV transforma conflictos cuando se practica con genuino interés en el otro."
+    expected: []
+    notes: "Both views can coexist — the helper should not flag own author's nuance as contradiction."
+
+  # ── Empty pool ─────────────────────────────────────────────────────────────
+  - id: short-answer
+    question: "color"
+    answer: "Azul."
+    chunks:
+      - path: "rojo.md"
+        note: "rojo"
+        text: "X es rojo."
+    expected: []
+    notes: "Answer < 40 chars — find_contradictions short-circuits before the LLM."

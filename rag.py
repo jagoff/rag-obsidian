@@ -1309,6 +1309,150 @@ def render_related(related: list[tuple[dict, int, str]]) -> None:
     console.print(tbl)
 
 
+def find_contradictions(
+    col: chromadb.Collection,
+    question: str,
+    answer: str,
+    exclude_paths: set[str],
+    k: int = 5,
+) -> list[dict]:
+    """Surface chunks in the vault whose claims contradict `answer`.
+
+    Procedure:
+      1. Embed the answer and pull nearest chunks (not the question — we want
+         what directly contradicts what was just claimed, not what matches
+         the question framing).
+      2. Drop chunks already cited in the answer's retrieval (`exclude_paths`).
+      3. Rerank the remainder against the original question so the survivors
+         are still topically on-point.
+      4. Ask the helper (one JSON prompt) which of the top candidates
+         actually contradict — strict definition, conservative bias.
+
+    Returns [{path, note, snippet, why}, ...] — empty if nothing genuine.
+    Non-fatal: parse errors, short answers, empty vault all return [].
+    """
+    answer = (answer or "").strip()
+    if len(answer) < 40 or col.count() == 0:
+        return []
+    try:
+        ans_embed = embed([answer])[0]
+    except Exception:
+        return []
+    # Pull generously; we'll filter + rerank down. Dedup by path so the
+    # counter-set isn't dominated by multiple chunks of the same note.
+    n = min(k * 4 + len(exclude_paths) + 5, col.count())
+    cand = col.query(
+        query_embeddings=[ans_embed], n_results=n,
+        include=["documents", "metadatas"],
+    )
+    filtered: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for d, m in zip(cand["documents"][0], cand["metadatas"][0]):
+        path = m.get("file", "")
+        if path in exclude_paths or path in seen:
+            continue
+        seen.add(path)
+        filtered.append((expand_to_parent(d, m), m))
+        if len(filtered) >= k * 2:
+            break
+    if not filtered:
+        return []
+    try:
+        reranker = get_reranker()
+        pairs = [(question, d) for d, _ in filtered]
+        scores = reranker.predict(pairs, show_progress_bar=False)
+    except Exception:
+        scores = [0.0] * len(filtered)
+    ranked = sorted(
+        zip(filtered, scores), key=lambda x: float(x[1]), reverse=True
+    )[:k]
+
+    numbered = "\n\n".join(
+        f"[{i}] nota: {m.get('note','')} (ruta: {m.get('file','')})\n{d[:600]}"
+        for i, ((d, m), _) in enumerate(ranked, 1)
+    )
+    prompt = (
+        "Se generó esta RESPUESTA a partir de notas de un vault personal:\n\n"
+        f"RESPUESTA: {answer}\n\n"
+        "Estos son fragmentos de OTRAS notas del vault que no se usaron en "
+        "la respuesta:\n\n"
+        f"{numbered}\n\n"
+        "Tu tarea: identificar cuáles fragmentos (si hay) CONTRADICEN la "
+        "respuesta. Contradicción = afirmaciones incompatibles sobre el "
+        "mismo sujeto. NO cuenta: temas distintos, matices, información "
+        "complementaria, o perspectivas que el autor podría sostener a la "
+        "vez. Sé conservador — mejor perder una contradicción real que "
+        "marcar una falsa.\n\n"
+        "Respondé SOLO con JSON con esta forma exacta:\n"
+        '{"contradictions": [{"index": N, "why": "tensión en <20 palabras"}]}\n'
+        'Si no hay contradicciones: {"contradictions": []}'
+    )
+    # Detector uses the chat model (command-r), NOT the helper. Empirical: on
+    # this corpus, qwen2.5:3b is non-deterministic at temp=0 (same case yields
+    # FP then empty across runs) and emits malformed JSON often. command-r is
+    # RAG-trained, hugs the source text, and reliably returns parseable JSON.
+    # Cost: ~5-10s per check — only paid on opt-in --counter, acceptable.
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        raw = resp.message.content.strip()
+    except Exception:
+        return []
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    hits = data.get("contradictions") or []
+    if not isinstance(hits, list):
+        return []
+    out: list[dict] = []
+    for item in hits:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if not isinstance(idx, int) or not (1 <= idx <= len(ranked)):
+            continue
+        (doc, meta), _ = ranked[idx - 1]
+        why = str(item.get("why") or "").strip()[:200]
+        out.append({
+            "path": meta.get("file", ""),
+            "note": meta.get("note", ""),
+            "snippet": doc[:280].strip(),
+            "why": why,
+        })
+    return out
+
+
+def render_contradictions(contrad: list[dict]) -> None:
+    """Render the counter-evidence block under a generated answer."""
+    if not contrad:
+        return
+    console.print()
+    console.print(Rule(
+        title="[bold red]⚡ Counter-evidence en tu vault[/bold red]",
+        style="red",
+    ))
+    for c in contrad:
+        console.print()
+        line = Text()
+        line.append("⚠ ", style="bold red")
+        line.append(c.get("note", ""), style=_file_link_style(c["path"], "bold red"))
+        line.append("  ", style="")
+        line.append(c["path"], style=_file_link_style(c["path"], "red dim"))
+        console.print(line)
+        if c.get("why"):
+            console.print(f"   [italic yellow]{c['why']}[/italic yellow]")
+        if c.get("snippet"):
+            console.print(f"   [dim]{c['snippet']}[/dim]")
+
+
 def reformulate_query(question: str, history: list[dict]) -> str:
     """Rewrite the question as a standalone search query using conversation history."""
     if not history:
@@ -2006,6 +2150,27 @@ def query(
         for label, path in bad:
             console.print(f"  [red]• {label} → {path}[/red] [dim](no está en los chunks recuperados)[/dim]")
 
+    contrad: list[dict] = []
+    if counter:
+        def _run_counter():
+            return find_contradictions(
+                col, question, full,
+                exclude_paths={m.get("file", "") for m in result["metas"]},
+            )
+        if plain:
+            contrad = _run_counter()
+            if contrad:
+                click.echo("")
+                click.echo("Counter-evidence:")
+                for c in contrad:
+                    click.echo(f"  ⚠ {c.get('note','')} ({c['path']})")
+                    if c.get("why"):
+                        click.echo(f"    {c['why']}")
+        else:
+            with console.status("[dim]buscando contra-evidencia…[/dim]", spinner="dots"):
+                contrad = _run_counter()
+            render_contradictions(contrad)
+
     log_query_event({
         "cmd": "query",
         "q": question,
@@ -2020,6 +2185,7 @@ def query(
         "t_gen": round(t_gen, 2),
         "answer_len": len(full),
         "bad_citations": [p for _, p in bad],
+        "contradictions": [{"path": c["path"], "why": c["why"]} for c in contrad] if counter else None,
         "mode": "raw" if raw else ("loose" if loose else "strict"),
         "plain": plain,
     })
@@ -2031,6 +2197,7 @@ def query(
             "a": full,
             "paths": [m.get("file", "") for m in result["metas"]],
             "top_score": round(float(result["confidence"]), 3),
+            "contradictions": [c["path"] for c in contrad] if contrad else None,
         })
         save_session(sess)
 
@@ -2049,10 +2216,12 @@ def query(
 @click.option("--session", "session_id", default=None,
               help="ID de sesión (reanuda si existe, crea si no). Admite 'tg:<chat_id>' etc.")
 @click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
+@click.option("--counter", is_flag=True,
+              help="Después de cada respuesta, buscar chunks del vault que la CONTRADIGAN")
 def chat(
     k: int, folder: str | None, tag: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
-    session_id: str | None, resume: bool,
+    session_id: str | None, resume: bool, counter: bool,
 ):
     """Chat interactivo con tus notas."""
     col = get_db()
@@ -2082,6 +2251,8 @@ def chat(
     if not no_auto_filter:
         features.append("auto-filter")
     features.append("rerank")
+    if counter:
+        features.append("counter")
     subtitle = f"[dim]· {' · '.join(features)}"
     if flags:
         subtitle += f" · {' · '.join(flags)}"
@@ -2179,11 +2350,21 @@ def chat(
         last_question = question
         last_sources = list(result["metas"])
 
+        contrad: list[dict] = []
+        if counter:
+            with console.status("[dim]buscando contra-evidencia…[/dim]", spinner="dots"):
+                contrad = find_contradictions(
+                    col, question, full,
+                    exclude_paths={m.get("file", "") for m in result["metas"]},
+                )
+            render_contradictions(contrad)
+
         append_turn(sess, {
             "q": question,
             "a": full,
             "paths": [m.get("file", "") for m in result["metas"]],
             "top_score": round(float(result["confidence"]), 3),
+            "contradictions": [c["path"] for c in contrad] if contrad else None,
         })
         save_session(sess)
 

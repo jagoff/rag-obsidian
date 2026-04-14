@@ -177,12 +177,11 @@ MIN_CHUNK = 150    # chars — merge smaller chunks with neighbor
 MAX_CHUNK = 800    # chars — bge-m3 accepts ~2048 tokens; 800 chars ≈ 200 tokens
                    # sweet spot: enough context per chunk, prefix doesn't dominate
 
-# Folder prefixes to exclude from indexing entirely (deleted / system folders).
-EXCLUDED_PREFIXES = (".trash/", ".obsidian/")
-
-
 def is_excluded(rel_path: str) -> bool:
-    return any(rel_path.startswith(p) for p in EXCLUDED_PREFIXES)
+    """Skip any path whose top-level segment or any parent segment is a
+    dotfolder (e.g. .trash/, .obsidian/, .git/). System/hidden by convention.
+    """
+    return any(seg.startswith(".") for seg in rel_path.split("/") if seg)
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 RERANK_TOP = 5     # final chunks after reranking
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish

@@ -279,3 +279,315 @@ def test_cli_file_dry_run_never_moves_files(tmp_vault, monkeypatch):
     assert original_path.read_text() == original_content
     # No aparecieron duplicados en Areas.
     assert not (vault / "02-Areas" / "note.md").exists()
+
+
+# ── Fase 2: apply + undo ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def tmp_vault_with_batch(tmp_vault, monkeypatch):
+    """Misma fixture + redirige FILING_BATCHES_DIR al tmp_path."""
+    vault, col = tmp_vault
+    monkeypatch.setattr(
+        rag, "FILING_BATCHES_DIR",
+        vault.parent / "filing_batches",
+    )
+    return vault, col
+
+
+# _append_upward_link / _remove_upward_link
+
+
+def test_append_upward_link_adds_block(tmp_path):
+    p = tmp_path / "note.md"
+    p.write_text("# Título\n\nCuerpo.", encoding="utf-8")
+    assert rag._append_upward_link(p, "MOC Salud") is True
+    text = p.read_text()
+    assert rag.FILING_UPWARD_MARKER in text
+    assert "[[MOC Salud]]" in text
+    assert "# Título" in text  # contenido intacto
+
+
+def test_append_upward_link_is_idempotent(tmp_path):
+    p = tmp_path / "note.md"
+    p.write_text("# A\n\nCuerpo.", encoding="utf-8")
+    rag._append_upward_link(p, "MOC 1")
+    rag._append_upward_link(p, "MOC 2")   # reemplaza, no duplica
+    text = p.read_text()
+    assert text.count(rag.FILING_UPWARD_MARKER) == 1
+    assert "[[MOC 2]]" in text
+    assert "[[MOC 1]]" not in text
+
+
+def test_remove_upward_link_roundtrip(tmp_path):
+    p = tmp_path / "note.md"
+    original = "# Título\n\nCuerpo.\n"
+    p.write_text(original, encoding="utf-8")
+    rag._append_upward_link(p, "MOC Salud")
+    assert rag._remove_upward_link(p) is True
+    # Volver al original (modulo trailing newline normalization).
+    assert "MOC Salud" not in p.read_text()
+    assert "# Título" in p.read_text()
+    assert "Cuerpo." in p.read_text()
+
+
+def test_remove_upward_link_noop_when_missing(tmp_path):
+    p = tmp_path / "note.md"
+    p.write_text("# Sin link\n", encoding="utf-8")
+    assert rag._remove_upward_link(p) is False
+
+
+# _apply_filing_move
+
+
+def test_apply_filing_move_happy_path(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/target.md", "target", HIGH,
+              body="contenido")
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    entry = rag._apply_filing_move(
+        col, "00-Inbox/target.md", "02-Areas/Salud", "MOC Salud"
+    )
+
+    assert entry["src"] == "00-Inbox/target.md"
+    assert entry["dst"] == "02-Areas/Salud/target.md"
+    assert entry["upward_title"] == "MOC Salud"
+    assert entry["upward_written"] is True
+
+    # File on disk: movido + con upward-link.
+    assert not (vault / "00-Inbox/target.md").exists()
+    assert (vault / "02-Areas/Salud/target.md").exists()
+    content = (vault / "02-Areas/Salud/target.md").read_text()
+    assert "[[MOC Salud]]" in content
+    assert "contenido" in content
+
+
+def test_apply_filing_move_creates_missing_target_folder(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/new.md", "new", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    # 02-Areas/Nueva no existe.
+    rag._apply_filing_move(col, "00-Inbox/new.md", "02-Areas/Nueva", "")
+
+    assert (vault / "02-Areas/Nueva/new.md").exists()
+
+
+def test_apply_filing_move_raises_if_dst_exists(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/clash.md", "clash", HIGH)
+    (vault / "02-Areas" / "clash.md").parent.mkdir(parents=True, exist_ok=True)
+    (vault / "02-Areas" / "clash.md").write_text("existente", encoding="utf-8")
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    with pytest.raises(FileExistsError):
+        rag._apply_filing_move(col, "00-Inbox/clash.md", "02-Areas", "")
+
+
+def test_apply_filing_move_rejects_path_traversal(tmp_vault_with_batch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/x.md", "x", HIGH)
+
+    with pytest.raises(ValueError):
+        rag._apply_filing_move(col, "00-Inbox/x.md", "../escape", "")
+
+
+# Batch persistence
+
+
+def test_write_batch_log_creates_jsonl(tmp_vault_with_batch):
+    vault, col = tmp_vault_with_batch
+    entries = [
+        {"src": "00-Inbox/a.md", "dst": "02-Areas/a.md",
+         "upward_title": "X", "upward_written": True},
+        {"src": "00-Inbox/b.md", "dst": "02-Areas/b.md",
+         "upward_title": "", "upward_written": False},
+    ]
+    path = rag._write_filing_batch(entries)
+    assert path is not None and path.is_file()
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    assert first["src"] == "00-Inbox/a.md"
+
+
+def test_write_batch_log_empty_returns_none(tmp_vault_with_batch):
+    assert rag._write_filing_batch([]) is None
+
+
+def test_last_filing_batch_returns_most_recent(tmp_vault_with_batch):
+    import time
+    vault, col = tmp_vault_with_batch
+    rag.FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    p1 = rag.FILING_BATCHES_DIR / "20260101-000000.jsonl"
+    p1.write_text("{}\n")
+    time.sleep(0.01)
+    p2 = rag.FILING_BATCHES_DIR / "20260102-000000.jsonl"
+    p2.write_text("{}\n")
+
+    assert rag._last_filing_batch() == p2
+
+
+# Rollback
+
+
+def test_rollback_restores_files_and_removes_upward(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/u.md", "u", HIGH, body="cuerpo u")
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    entry = rag._apply_filing_move(col, "00-Inbox/u.md", "02-Areas", "MOC X")
+    batch = rag._write_filing_batch([entry])
+
+    assert (vault / "02-Areas/u.md").exists()
+    assert not (vault / "00-Inbox/u.md").exists()
+
+    results = rag._rollback_filing_batch(col, batch)
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    # Revertido: de vuelta en Inbox, sin upward-link.
+    assert (vault / "00-Inbox/u.md").is_file()
+    assert not (vault / "02-Areas/u.md").exists()
+    content = (vault / "00-Inbox/u.md").read_text()
+    assert "MOC X" not in content
+    assert "cuerpo u" in content
+
+
+def test_rollback_reports_error_when_dst_missing(tmp_vault_with_batch):
+    vault, col = tmp_vault_with_batch
+    # Batch apunta a un dst que nunca existió.
+    batch = rag.FILING_BATCHES_DIR
+    batch.mkdir(parents=True, exist_ok=True)
+    bp = batch / "fake.jsonl"
+    bp.write_text(json.dumps({
+        "src": "00-Inbox/ghost.md", "dst": "02-Areas/ghost.md",
+        "upward_title": "", "upward_written": False,
+    }) + "\n")
+
+    results = rag._rollback_filing_batch(col, bp)
+    assert results[0]["ok"] is False
+    assert "no existe" in results[0]["error"]
+
+
+# CLI apply (interactive, driven by CliRunner stdin)
+
+
+def test_cli_apply_moves_on_y(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH, body="c")
+    _add_note(col, vault, "02-Areas/Salud/a.md", "A", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    # 'y' acepta la propuesta.
+    result = CliRunner().invoke(rag.file_cmd, ["--plain", "--apply"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert not (vault / "00-Inbox/n.md").exists()
+    assert (vault / "02-Areas/Salud/n.md").exists()
+
+
+def test_cli_apply_skip_on_s(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH, body="c")
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(rag.file_cmd, ["--plain", "--apply"], input="s\n")
+    assert result.exit_code == 0, result.output
+    assert (vault / "00-Inbox/n.md").exists()
+
+
+def test_cli_apply_edit_uses_new_folder(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH, body="c")
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    # 'e' + new target → debería mover a 03-Resources/Custom.
+    result = CliRunner().invoke(
+        rag.file_cmd, ["--plain", "--apply"],
+        input="e\n03-Resources/Custom\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert (vault / "03-Resources/Custom/n.md").exists()
+    assert not (vault / "00-Inbox/n.md").exists()
+
+
+def test_cli_apply_quit_stops_and_saves_partial_batch(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/a.md", "a", HIGH)
+    _add_note(col, vault, "00-Inbox/b.md", "b", HIGH)
+    _add_note(col, vault, "00-Inbox/c.md", "c", HIGH)
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    # Aceptar primera, quit en la segunda.
+    result = CliRunner().invoke(
+        rag.file_cmd, ["--plain", "--apply"], input="y\nq\n",
+    )
+    assert result.exit_code == 0, result.output
+    # Primera movida; segunda y tercera se quedan.
+    assert (vault / "02-Areas/a.md").exists()
+    assert (vault / "00-Inbox/b.md").exists()
+    assert (vault / "00-Inbox/c.md").exists()
+
+
+def test_cli_undo_reverses_last_batch(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH, body="c")
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    # Apply, después undo.
+    CliRunner().invoke(rag.file_cmd, ["--plain", "--apply"], input="y\n")
+    assert (vault / "02-Areas/n.md").exists()
+
+    result = CliRunner().invoke(rag.file_cmd, ["--plain", "--undo"])
+    assert result.exit_code == 0, result.output
+    assert (vault / "00-Inbox/n.md").exists()
+    assert not (vault / "02-Areas/n.md").exists()
+    # El batch se rename a .undone para trazabilidad.
+    assert any(
+        p.suffix == ".undone"
+        for p in rag.FILING_BATCHES_DIR.glob("*")
+    )
+
+
+def test_cli_undo_without_batch_is_graceful(tmp_vault_with_batch):
+    from click.testing import CliRunner
+    result = CliRunner().invoke(rag.file_cmd, ["--plain", "--undo"])
+    assert result.exit_code == 0
+    assert "No hay batches" in result.output
+
+
+def test_cli_apply_and_undo_mutually_exclusive(tmp_vault_with_batch):
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        rag.file_cmd, ["--plain", "--apply", "--undo"],
+    )
+    assert result.exit_code == 0
+    assert "No podés combinar" in result.output
+
+
+def test_frontmatter_file_skip_is_honored(tmp_vault_with_batch, monkeypatch):
+    vault, col = tmp_vault_with_batch
+    body_skip = "---\nfile: skip\n---\n\nno tocar"
+    _add_note(col, vault, "00-Inbox/protected.md", "protected", HIGH,
+              body=body_skip)
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    # Apply — pero la nota está opted-out, así que no hay nada que preguntar.
+    result = CliRunner().invoke(rag.file_cmd, ["--plain", "--apply"])
+    assert result.exit_code == 0
+    # Sigue en Inbox.
+    assert (vault / "00-Inbox/protected.md").exists()

@@ -2422,21 +2422,184 @@ def build_filing_proposal(
     }
 
 
-def _filing_log_proposal(proposal: dict) -> None:
-    """Append-only log. Una línea por propuesta, mismo shape que
-    ambient.jsonl/surface.jsonl. Fase 2 agregará `decision: accept|reject|edit`
-    cuando sumemos la tecla interactiva — por ahora solo loguea la propuesta.
+def _filing_log_proposal(proposal: dict, decision: str | None = None) -> None:
+    """Append-only log. Una línea por propuesta. `decision` es opcional —
+    fase 1 no lo setea (dry-run), fase 2 lo setea con accept/reject/edit/skip
+    para alimentar el ranker.
     """
     try:
         FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().isoformat(timespec="seconds")
+        event = {"ts": ts, "cmd": "filing_proposal", **proposal}
+        if decision is not None:
+            event["decision"] = decision
         with FILING_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(
-                {"ts": ts, "cmd": "filing_proposal", **proposal},
-                ensure_ascii=False,
-            ) + "\n")
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ── FILING apply + undo ──────────────────────────────────────────────────────
+
+FILING_BATCHES_DIR = Path.home() / ".local/share/obsidian-rag/filing_batches"
+# Token que marca el upward-link appendeado al pie de la nota — permite al
+# undo detectarlo y removerlo limpio. Cualquier edición manual del usuario
+# queda por encima del token intacta.
+FILING_UPWARD_MARKER = "<!-- rag-file:upward -->"
+
+
+def _append_upward_link(note_full_path: Path, upward_title: str) -> bool:
+    """Agrega `\\n\\n---\\n{marker}\\n↑ [[Title]]\\n` al final de la nota.
+    Idempotente: si ya existe un bloque con el marker, lo reemplaza en vez
+    de duplicar. Retorna True si se escribió.
+    """
+    if not note_full_path.is_file() or not upward_title:
+        return False
+    raw = note_full_path.read_text(encoding="utf-8", errors="ignore")
+    block = f"\n\n---\n{FILING_UPWARD_MARKER}\n↑ [[{upward_title}]]\n"
+    if FILING_UPWARD_MARKER in raw:
+        # Reemplazar el bloque viejo (desde el --- previo al marker hasta EOF).
+        idx = raw.find(FILING_UPWARD_MARKER)
+        # Buscar el --- que precede al marker (ancla del bloque).
+        sep = raw.rfind("\n---\n", 0, idx)
+        if sep >= 0:
+            raw = raw[:sep] + block
+        else:
+            raw = raw.rstrip() + block
+    else:
+        raw = raw.rstrip() + block
+    note_full_path.write_text(raw, encoding="utf-8")
+    return True
+
+
+def _remove_upward_link(note_full_path: Path) -> bool:
+    """Remueve el bloque agregado por _append_upward_link. Usado por undo.
+    Retorna True si había algo que remover.
+    """
+    if not note_full_path.is_file():
+        return False
+    raw = note_full_path.read_text(encoding="utf-8", errors="ignore")
+    idx = raw.find(FILING_UPWARD_MARKER)
+    if idx < 0:
+        return False
+    sep = raw.rfind("\n---\n", 0, idx)
+    if sep < 0:
+        return False
+    note_full_path.write_text(raw[:sep].rstrip() + "\n", encoding="utf-8")
+    return True
+
+
+def _apply_filing_move(
+    col: chromadb.Collection,
+    src_rel: str,
+    target_folder: str,
+    upward_title: str,
+) -> dict:
+    """Ejecuta el move + upward-link + reindex para UNA nota.
+
+    Retorna entry del batch log: {src, dst, upward_title, upward_written}.
+    Levanta si target folder queda fuera del vault (seguridad path traversal).
+    """
+    src = (VAULT_PATH / src_rel).resolve()
+    src.relative_to(VAULT_PATH.resolve())   # ValueError si escapa
+    if not src.is_file():
+        raise FileNotFoundError(src_rel)
+    target_dir = (VAULT_PATH / target_folder).resolve()
+    target_dir.relative_to(VAULT_PATH.resolve())
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dst = target_dir / src.name
+    if dst.exists():
+        raise FileExistsError(str(dst.relative_to(VAULT_PATH)))
+    # Mover con shutil para manejar cross-device edge cases (iCloud puede
+    # montarse distinto que el home en ciertos contextos).
+    import shutil
+    shutil.move(str(src), str(dst))
+    written = _append_upward_link(dst, upward_title) if upward_title else False
+    # Reindex: el hook del ambient agent se dispara sobre saves del Inbox,
+    # pero acá venimos del Inbox hacia afuera — skip_contradict para no
+    # gatillar un check O(n²) costoso en un apply-batch.
+    try:
+        _index_single_file(col, dst, skip_contradict=True)
+    except Exception:
+        pass
+    return {
+        "src": src_rel,
+        "dst": str(dst.relative_to(VAULT_PATH)),
+        "upward_title": upward_title,
+        "upward_written": written,
+    }
+
+
+def _write_filing_batch(entries: list[dict]) -> Path | None:
+    """Persiste un batch de moves para permitir undo atómico. Un archivo
+    JSONL por corrida, nombrado por timestamp. Retorna el path o None si no
+    hay entries válidos.
+    """
+    if not entries:
+        return None
+    FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = FILING_BATCHES_DIR / f"{ts}.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    return path
+
+
+def _last_filing_batch() -> Path | None:
+    """Devuelve el batch más reciente (por mtime). None si no hay ninguno."""
+    if not FILING_BATCHES_DIR.is_dir():
+        return None
+    batches = sorted(
+        FILING_BATCHES_DIR.glob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return batches[0] if batches else None
+
+
+def _rollback_filing_batch(col: chromadb.Collection, batch_path: Path) -> list[dict]:
+    """Revierte cada entry: remueve upward-link, mueve back del dst al src.
+    Retorna lista de resultados por entry: {src, dst, ok, error?}.
+
+    No borra el batch log hasta confirmar: el caller decide qué hacer con él
+    (el CLI lo rename a .undone para trazabilidad).
+    """
+    import shutil
+    results: list[dict] = []
+    with batch_path.open("r", encoding="utf-8") as f:
+        entries = [json.loads(l) for l in f if l.strip()]
+    # Revertir en orden inverso por seguridad (si hubo dependencias de path).
+    for e in reversed(entries):
+        src_rel = e["src"]
+        dst_rel = e["dst"]
+        r = {"src": src_rel, "dst": dst_rel, "ok": False}
+        try:
+            dst_full = (VAULT_PATH / dst_rel).resolve()
+            dst_full.relative_to(VAULT_PATH.resolve())
+            if not dst_full.is_file():
+                r["error"] = "dst no existe"
+                results.append(r)
+                continue
+            if e.get("upward_written"):
+                _remove_upward_link(dst_full)
+            src_full = (VAULT_PATH / src_rel).resolve()
+            src_full.relative_to(VAULT_PATH.resolve())
+            src_full.parent.mkdir(parents=True, exist_ok=True)
+            if src_full.exists():
+                r["error"] = "src ocupado — no overwrite"
+                results.append(r)
+                continue
+            shutil.move(str(dst_full), str(src_full))
+            try:
+                _index_single_file(col, src_full, skip_contradict=True)
+            except Exception:
+                pass
+            r["ok"] = True
+        except Exception as ex:
+            r["error"] = str(ex)
+        results.append(r)
+    return results
 
 
 def find_near_duplicates_for(
@@ -5703,6 +5866,53 @@ def surface(sim_threshold: float, min_hops: int, top: int,
     console.print(f"[dim]{duration_ms}ms · log: {SURFACE_LOG_PATH}[/dim]")
 
 
+def _render_filing_proposal(i: int, total: int, pr: dict, plain: bool) -> None:
+    """Renderer compartido por dry-run y apply. Muestra una propuesta; no pide
+    input ni decide — solo layout."""
+    if plain:
+        if "error" in pr:
+            click.echo(f"[{i}/{total}] {pr['path']}  [error: {pr['error']}]")
+            return
+        conf = pr["confidence"]
+        tag = ("firm" if conf >= FILING_CONFIDENCE_FIRM
+               else "tentative" if conf >= FILING_CONFIDENCE_TENTATIVE
+               else "low")
+        click.echo(f"[{i}/{total}] {pr['note']}  ({pr['path']})")
+        target = pr["folder"] or "(sin propuesta)"
+        click.echo(f"         -> {target}  (conf {conf:.2f}, {tag})")
+        if pr["upward_title"]:
+            click.echo(f"         ^ [[{pr['upward_title']}]] ({pr['upward_kind']})")
+        return
+    if "error" in pr:
+        console.print(
+            f"\n[bold]{i}/{total}[/bold] [red]{pr['path']}[/red] "
+            f"[dim](error: {pr['error']})[/dim]"
+        )
+        return
+    console.print(
+        f"\n[bold]{i}/{total}[/bold] [bold]{pr['note']}[/bold] "
+        f"[dim]({pr['path']})[/dim]"
+    )
+    conf = pr["confidence"]
+    if conf >= FILING_CONFIDENCE_FIRM:
+        style, label = "green", f"firm · {conf:.2f}"
+    elif conf >= FILING_CONFIDENCE_TENTATIVE:
+        style, label = "yellow", f"tentative · {conf:.2f}"
+    else:
+        style, label = "red", f"low · {conf:.2f}"
+    target = pr["folder"] or "(sin propuesta)"
+    console.print(
+        f"   [cyan]→[/cyan] [bold]{target}[/bold] "
+        f"[dim]·[/dim] [{style}]{label}[/{style}]"
+    )
+    if pr["upward_title"]:
+        badge = "📍 MOC" if pr["upward_kind"] == "moc" else "↔ nearest"
+        console.print(
+            f"   [cyan]↑[/cyan] [[[magenta]{pr['upward_title']}[/magenta]]] "
+            f"[dim]{badge}[/dim]"
+        )
+
+
 @cli.command(name="file")
 @click.argument("path", required=False)
 @click.option("--folder", default="00-Inbox", show_default=True,
@@ -5712,16 +5922,66 @@ def surface(sim_threshold: float, min_hops: int, top: int,
               help="Máximo de notas a procesar por corrida")
 @click.option("-k", "k", default=8, show_default=True,
               help="Cantidad de vecinos semánticos a considerar")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Modo interactivo: mover + upward-link + reindex con confirmación y/n/e/s/q")
+@click.option("--undo", "do_undo", is_flag=True,
+              help="Revertir el último batch de --apply (lee filing_batches/)")
 @click.option("--plain", is_flag=True, help="Salida plana sin colores")
 def file_cmd(path: str | None, folder: str, one: bool, limit: int,
-             k: int, plain: bool):
+             k: int, do_apply: bool, do_undo: bool, plain: bool):
     """Filing asistido de Inbox: destino PARA + upward-link sugeridos.
 
-    Fase 1 dry-run: solo propone y loguea a filing.jsonl — NO mueve archivos,
-    NO modifica el vault. La data acumulada entrena el ranker en fase 2
-    (cuando sumemos confirmación interactiva y --apply).
+    Sin flags: dry-run (propone y loguea, no mueve nada).
+    --apply:   interactivo — y/n/e(edit)/s(skip)/q(quit) por nota.
+    --undo:    revierte el último batch aplicado.
+
+    Contrato de seguridad: --apply mueve archivos solo tras tu 'y'. Cada
+    move se persiste en filing_batches/<ts>.jsonl para que --undo sepa
+    exactamente qué revertir. Edit permite cambiar el folder destino sin
+    volver a sugerir desde cero.
     """
     col = get_db()
+
+    if do_apply and do_undo:
+        msg = "No podés combinar --apply y --undo."
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    # ── UNDO path ────────────────────────────────────────────────────────────
+    if do_undo:
+        batch = _last_filing_batch()
+        if batch is None:
+            msg = "No hay batches previos para revertir."
+            click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+            return
+        results = _rollback_filing_batch(col, batch)
+        ok = sum(1 for r in results if r.get("ok"))
+        fail = len(results) - ok
+        # Renombrar el batch a .undone para trazabilidad sin borrar.
+        try:
+            batch.rename(batch.with_suffix(".undone"))
+        except Exception:
+            pass
+        if plain:
+            click.echo(f"undo: {ok} movido(s) de vuelta, {fail} error(es). batch: {batch.name}")
+            for r in results:
+                status = "✓" if r.get("ok") else f"✗ {r.get('error', '')}"
+                click.echo(f"  {status}  {r['dst']} -> {r['src']}")
+            return
+        console.print()
+        console.print(Rule(
+            title=f"[bold magenta]↩ undo: {ok} movido(s) de vuelta, {fail} error(es)[/bold magenta]",
+            style="magenta",
+        ))
+        for r in results:
+            if r.get("ok"):
+                console.print(f"  [green]✓[/green] [dim]{r['dst']}[/dim] → [cyan]{r['src']}[/cyan]")
+            else:
+                console.print(f"  [red]✗[/red] {r['dst']}  [dim]({r.get('error','?')})[/dim]")
+        console.print(f"\n[dim]batch renombrado a {batch.with_suffix('.undone').name}[/dim]")
+        return
+
+    # ── Collect target notes ─────────────────────────────────────────────────
     if path:
         full = Path(path) if path.startswith("/") else VAULT_PATH / path
         notes = [full] if full.is_file() else []
@@ -5735,8 +5995,6 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             msg = f"No existe el folder: {inbox_dir}"
             click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
             return
-        # Ordenar por mtime ascendente — las notas más viejas tienen
-        # prioridad (probablemente las más olvidadas).
         notes = sorted(inbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
         notes = notes[:1] if one else notes[:limit]
 
@@ -5745,72 +6003,146 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
 
-    proposals: list[dict] = []
+    # Frontmatter opt-out: file: skip respeta la elección del usuario.
+    eligible: list[Path] = []
+    skipped_by_fm: list[str] = []
     for p in notes:
         try:
-            rel = str(p.relative_to(VAULT_PATH))
-        except ValueError:
-            continue
-        prop = build_filing_proposal(col, rel, k=k)
-        proposals.append(prop)
-        _filing_log_proposal(prop)
-
-    if plain:
-        for i, pr in enumerate(proposals, 1):
-            if "error" in pr:
-                click.echo(f"{i}. {pr['path']}  [error: {pr['error']}]")
+            raw = p.read_text(encoding="utf-8", errors="ignore")
+            fm = parse_frontmatter(raw)
+            if fm.get("file") == "skip":
+                skipped_by_fm.append(str(p.relative_to(VAULT_PATH)))
                 continue
-            conf = pr["confidence"]
-            tag = ("firm" if conf >= FILING_CONFIDENCE_FIRM
-                   else "tentative" if conf >= FILING_CONFIDENCE_TENTATIVE
-                   else "low")
-            click.echo(f"{i}. {pr['note']}  ({pr['path']})")
-            target = pr["folder"] or "(sin propuesta)"
-            click.echo(f"   -> {target}  (conf {conf:.2f}, {tag})")
-            if pr["upward_title"]:
-                click.echo(f"   ^ [[{pr['upward_title']}]] ({pr['upward_kind']})")
-        click.echo(f"\nlog: {FILING_LOG_PATH}")
+        except Exception:
+            pass
+        eligible.append(p)
+
+    if skipped_by_fm and not plain:
+        console.print(
+            f"[dim]Skip por frontmatter `file: skip`: {len(skipped_by_fm)}[/dim]"
+        )
+
+    if not eligible:
+        msg = "Todas las notas tienen `file: skip` en frontmatter."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
 
-    console.print()
-    console.print(Rule(
-        title=f"[bold magenta]📥 {len(proposals)} propuesta(s) de filing[/bold magenta]",
-        style="magenta",
-    ))
-    for i, pr in enumerate(proposals, 1):
-        console.print()
-        if "error" in pr:
-            console.print(
-                f"[bold]{i}.[/bold] [red]{pr['path']}[/red] "
-                f"[dim](error: {pr['error']})[/dim]"
-            )
-            continue
-        console.print(
-            f"[bold]{i}.[/bold] [bold]{pr['note']}[/bold] "
-            f"[dim]({pr['path']})[/dim]"
-        )
-        conf = pr["confidence"]
-        if conf >= FILING_CONFIDENCE_FIRM:
-            style, label = "green", f"firm · {conf:.2f}"
-        elif conf >= FILING_CONFIDENCE_TENTATIVE:
-            style, label = "yellow", f"tentative · {conf:.2f}"
+    # ── Build proposals ──────────────────────────────────────────────────────
+    proposals: list[tuple[Path, dict]] = []
+    for p in eligible:
+        rel = str(p.relative_to(VAULT_PATH))
+        prop = build_filing_proposal(col, rel, k=k)
+        proposals.append((p, prop))
+
+    # ── Dry-run path: print + log, bail ──────────────────────────────────────
+    if not do_apply:
+        if not plain:
+            console.print()
+            console.print(Rule(
+                title=f"[bold magenta]📥 {len(proposals)} propuesta(s) de filing[/bold magenta]",
+                style="magenta",
+            ))
+        for i, (_, pr) in enumerate(proposals, 1):
+            _render_filing_proposal(i, len(proposals), pr, plain)
+            _filing_log_proposal(pr)
+        if plain:
+            click.echo(f"\nlog: {FILING_LOG_PATH}")
         else:
-            style, label = "red", f"low · {conf:.2f}"
-        target = pr["folder"] or "(sin propuesta)"
-        console.print(
-            f"   [cyan]→[/cyan] [bold]{target}[/bold] "
-            f"[dim]·[/dim] [{style}]{label}[/{style}]"
-        )
-        if pr["upward_title"]:
-            badge = "📍 MOC" if pr["upward_kind"] == "moc" else "↔ nearest"
             console.print(
-                f"   [cyan]↑[/cyan] [[[magenta]{pr['upward_title']}[/magenta]]] "
-                f"[dim]{badge}[/dim]"
+                f"\n[dim]Dry-run — nada se movió. Log: {FILING_LOG_PATH}[/dim]\n"
+                f"[dim]Correr con --apply para mover interactivo.[/dim]"
             )
-    console.print()
-    console.print(
-        f"[dim]Fase 1 dry-run — nada se movió. Log: {FILING_LOG_PATH}[/dim]"
-    )
+        return
+
+    # ── Apply path: interactive loop ─────────────────────────────────────────
+    if not plain:
+        console.print()
+        console.print(Rule(
+            title=f"[bold magenta]📥 Apply: {len(proposals)} nota(s) · y/n/e/s/q[/bold magenta]",
+            style="magenta",
+        ))
+
+    batch_entries: list[dict] = []
+    for i, (src_path, pr) in enumerate(proposals, 1):
+        _render_filing_proposal(i, len(proposals), pr, plain)
+        if "error" in pr:
+            _filing_log_proposal(pr, decision="error")
+            continue
+
+        target = pr["folder"]
+        if not target:
+            # Sin propuesta de folder → solo edit o skip.
+            choice = click.prompt("   [e]dit target / [s]kip / [q]uit",
+                                  default="s", show_default=False).strip().lower()
+        else:
+            choice = click.prompt(
+                "   [y]es · [n]o · [e]dit · [s]kip · [q]uit",
+                default="y", show_default=False,
+            ).strip().lower()
+
+        if choice == "q":
+            _filing_log_proposal(pr, decision="quit")
+            click.echo("Quit — guardando batch con lo aplicado hasta ahora.") if plain else console.print("[dim]Quit — guardando batch con lo aplicado hasta ahora.[/dim]")
+            break
+        if choice in ("s", "skip"):
+            _filing_log_proposal(pr, decision="skip")
+            continue
+        if choice in ("n", "no"):
+            _filing_log_proposal(pr, decision="reject")
+            continue
+        if choice in ("e", "edit"):
+            new_target = click.prompt("   Nuevo folder (vault-relative, ej 02-Areas/Salud)").strip()
+            if not new_target:
+                _filing_log_proposal(pr, decision="skip")
+                continue
+            target = new_target
+            decision = "edit"
+        else:
+            # 'y' o default
+            if not target:
+                _filing_log_proposal(pr, decision="skip")
+                continue
+            decision = "accept"
+
+        # Ejecutar move + upward-link + reindex.
+        try:
+            entry = _apply_filing_move(col, pr["path"], target, pr.get("upward_title") or "")
+        except FileExistsError as ex:
+            msg = f"   [destino ya existe: {ex}] skip"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            _filing_log_proposal(pr, decision="error")
+            continue
+        except Exception as ex:
+            msg = f"   [error: {ex}] skip"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            _filing_log_proposal(pr, decision="error")
+            continue
+
+        batch_entries.append(entry)
+        # Log con decisión + target efectivo (puede diferir de pr["folder"]).
+        logged = dict(pr)
+        logged["applied_to"] = entry["dst"]
+        _filing_log_proposal(logged, decision=decision)
+        if plain:
+            click.echo(f"   ✓ {entry['src']} -> {entry['dst']}")
+        else:
+            console.print(f"   [green]✓[/green] movido a [cyan]{entry['dst']}[/cyan]")
+
+    batch_path = _write_filing_batch(batch_entries)
+    if plain:
+        click.echo(f"\n{len(batch_entries)} aplicada(s).")
+        if batch_path:
+            click.echo(f"batch: {batch_path}  (rag file --undo para revertir)")
+    else:
+        console.print()
+        if batch_entries:
+            console.print(
+                f"[green]✓ {len(batch_entries)} aplicada(s).[/green] "
+                f"[dim]batch: {batch_path.name if batch_path else '(ninguno)'}[/dim]"
+            )
+            console.print("[dim]`rag file --undo` revierte este batch.[/dim]")
+        else:
+            console.print("[yellow]Nada aplicado.[/yellow]")
 
 
 @cli.command()

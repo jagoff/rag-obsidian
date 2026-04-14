@@ -13,13 +13,19 @@ RAG local sobre el vault de Obsidian, fully local: ChromaDB + Ollama + sentence-
 3. [Storage layout](#storage-layout-dónde-vive-cada-cosa)
 4. [Arquitectura: pipelines](#arquitectura-pipelines)
 5. [Comandos — referencia completa](#comandos--referencia-completa)
-6. [Configuración (env vars + modelos)](#configuración-env-vars--modelos)
-7. [Frontmatter conventions](#frontmatter-conventions)
-8. [MCP tools](#mcp-tools)
-9. [Automation (launchd)](#automation-launchd)
-10. [Recetas comunes](#recetas-comunes)
-11. [Troubleshooting](#troubleshooting)
-12. [Findings empíricos clave](#findings-empíricos-clave-no-olvidar)
+6. [Multi-vault (`rag vault`)](#multi-vault-rag-vault)
+7. [Ambient Agent (co-autor del Inbox)](#ambient-agent-co-autor-del-inbox)
+8. [Surface — puentes en el grafo](#surface--puentes-en-el-grafo)
+9. [Filing asistido (`rag file`)](#filing-asistido-rag-file)
+10. [Configuración (env vars + modelos)](#configuración-env-vars--modelos)
+11. [Frontmatter conventions](#frontmatter-conventions)
+12. [MCP tools](#mcp-tools)
+13. [Automation (launchd)](#automation-launchd)
+14. [Telegram bots](#telegram-bots)
+15. [Recetas comunes](#recetas-comunes)
+16. [Troubleshooting](#troubleshooting)
+17. [Findings empíricos clave](#findings-empíricos-clave-no-olvidar)
+18. [Suite de tests](#suite-de-tests)
 
 ---
 
@@ -99,14 +105,23 @@ rag setup                                  # instala launchd: watch + digest
 
 | Path | Qué guarda |
 |---|---|
-| `~/.local/share/obsidian-rag/chroma/` | ChromaDB persistente. Dos collections: `obsidian_notes_v7` (chunks) + `obsidian_urls_v1` (URLs con contexto embebido) |
+| `~/.local/share/obsidian-rag/chroma/` | ChromaDB persistente. Dos collections: `obsidian_notes_v7_<sha8>` (chunks) + `obsidian_urls_v1_<sha8>` (URLs con contexto embebido). Sufijo sha8 por vault. |
 | `~/.local/share/obsidian-rag/sessions/<id>.json` | Sesiones conversacionales (1 archivo por sesión) |
 | `~/.local/share/obsidian-rag/last_session` | Pointer a la última session id usada (`--continue`/`--resume`) |
 | `~/.local/share/obsidian-rag/queries.jsonl` | Log append-only de cada query/chat/links event |
 | `~/.local/share/obsidian-rag/contradictions.jsonl` | Log append-only de contradicciones detectadas al indexar |
+| `~/.local/share/obsidian-rag/ambient.json` | Config del Ambient Agent: `{chat_id, bot_token, enabled}`. Escrito por el bot vía `/enable_ambient`. |
+| `~/.local/share/obsidian-rag/ambient.jsonl` | Log de eventos del Ambient Agent (wikilinks aplicados, dupes, related, telegram_sent) |
+| `~/.local/share/obsidian-rag/ambient_state.jsonl` | Dedup state (`{path, hash, ts}` últimas 500 líneas) para evitar doble-ping al save |
+| `~/.local/share/obsidian-rag/surface.jsonl` | Log de puentes propuestos por `rag surface` (pares cercanos-pero-lejanos) |
+| `~/.local/share/obsidian-rag/filing.jsonl` | Log de decisiones de `rag file` (propuestas, confirmadas, skip, edit) |
+| `~/.local/share/obsidian-rag/filing_batches/<ts>.jsonl` | Batch de un `rag file --apply`: una línea por move, necesario para `--undo` |
+| `~/.local/share/obsidian-rag/auto_index_state.json` | Estado del watcher (lo último indexado por `rag watch`) |
 | `~/.local/share/obsidian-rag/watch.log` & `.error.log` | Logs del servicio launchd `rag watch` |
 | `~/.local/share/obsidian-rag/digest.log` & `.error.log` | Logs del servicio launchd `rag digest` |
-| `~/Library/LaunchAgents/com.fer.obsidian-rag-{watch,digest}.plist` | Plists generados por `rag setup` |
+| `~/.local/share/obsidian-rag/morning.log` & `.error.log` | Logs del servicio launchd `rag morning` |
+| `~/.config/obsidian-rag/vaults.json` | Registry multi-vault (`rag vault add/use/list`). Contiene `{vaults: {name: path}, current: name}`. |
+| `~/Library/LaunchAgents/com.fer.obsidian-rag-{watch,digest,morning}.plist` | Plists generados por `rag setup` |
 | `~/.local/share/uv/tools/obsidian-rag/` | Tool venv instalado por `uv tool install` |
 | `<repo>/.venv/` | Venv local para tests (pytest acá) |
 | `<vault>/05-Reviews/YYYY-WNN.md` | Output del weekly digest |
@@ -310,6 +325,45 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 | `rag do "<instrucción>"` | Tool-calling agent con command-r. Tools: search, read_note, list_notes, propose_write. **Writes son dry-run** (acumulados en `_AGENT_PENDING_WRITES`, confirmás cada uno al final). |
 | `rag do "..." --yes --max-iterations 12` | Skip confirmación + cap de iteraciones. |
 
+### Multi-vault
+
+| Comando | Función |
+|---|---|
+| `rag vault list` | Lista vaults registrados; marca el activo con `→`. |
+| `rag vault add <name> <path>` | Registra un vault con un alias. |
+| `rag vault use <name>` | Cambia el vault activo (persistente en `vaults.json`). |
+| `rag vault current` | Muestra cuál se va a usar y por qué (env var / registry / default). |
+| `rag vault remove <name>` | Quita del registry (no borra chunks de Chroma). |
+
+### Ambient Agent
+
+| Comando | Función |
+|---|---|
+| `rag ambient status` | ¿Enabled? ¿Con qué `chat_id`? |
+| `rag ambient disable` | Flag `enabled=false` (deja config intacta, re-habilitás desde el bot). |
+| `rag ambient test <path>` | Dispara el hook sobre una nota sin tener que guardar en Obsidian (debugging). |
+| `rag ambient log [-n N]` | Tail de `ambient.jsonl`. |
+
+### Surface (puentes en el grafo)
+
+| Comando | Función |
+|---|---|
+| `rag surface` | Propone pares cercanos semánticamente pero lejanos en el grafo. Default: cosine ≥0.78, hops ≥3, top 5. |
+| `rag surface --sim-threshold 0.8 --min-hops 4 --top 10` | Estrictar. |
+| `rag surface --skip-young-days 7` | Ignora notas más nuevas que N días (siguen cambiando). |
+| `rag surface --no-llm --plain` | Sin "por qué" generado por el LLM (más rápido). |
+
+### Filing asistido
+
+| Comando | Función |
+|---|---|
+| `rag file` | Dry-run sobre `00-Inbox/`: propone destino PARA + upward-link, loguea a `filing.jsonl`, no mueve. |
+| `rag file <path>` | Dry-run de una sola nota. |
+| `rag file --apply` | Interactivo: `y/n/e(edit)/s(skip)/q(quit)` por nota. Escribe batch a `filing_batches/<ts>.jsonl`. |
+| `rag file --undo` | Revierte el último batch aplicado. |
+| `rag file --one` | Solo la nota más vieja del Inbox. |
+| `rag file --folder X --limit 20 -k 8` | Scope, cap, k de vecinos. |
+
 ### Eval / observabilidad
 
 | Comando | Función |
@@ -343,6 +397,92 @@ tail -f ~/.local/share/obsidian-rag/{watch,digest}.log
 ```bash
 obsidian-rag-mcp   # se lanza por Claude Code on demand, no manualmente
 ```
+
+---
+
+## Multi-vault (`rag vault`)
+
+Registry en `~/.config/obsidian-rag/vaults.json` con `{vaults: {name: path}, current: name}`. Cada vault obtiene su propia colección de Chroma automáticamente — namespacing por `sha256(VAULT_PATH)[:8]` sobre `_COLLECTION_BASE`. Switchear no contamina datos.
+
+**Precedencia** al resolver vault activo:
+
+1. `OBSIDIAN_RAG_VAULT` env var — override por invocación, gana siempre.
+2. `rag vault use <name>` — el `current` del registry, persistente.
+3. Default iCloud `Notes` — legacy single-vault.
+
+**Gotcha conocido**: `queries.yaml` está calibrado contra el vocabulario de un vault concreto. Si corrés `rag eval` contra otro vault, el hit@5 va a parecer catastrófico — no es regresión del retriever, es data mismatch. Para evaluar otro vault hace falta su propio golden set.
+
+```bash
+rag vault add home "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+rag vault add work "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/obsidian-work"
+rag vault use work      # persistente
+rag vault current       # → work (registry)
+OBSIDIAN_RAG_VAULT=/tmp/tests rag index   # override temporal, no toca el registry
+```
+
+---
+
+## Ambient Agent (co-autor del Inbox)
+
+Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el hash cambió. **Composición pura de primitivas existentes, sin LLM extra** (~0 cost además del indexing ya pagado).
+
+- **Auto-aplica**: `find_wikilink_suggestions` + `apply_wikilink_suggestions`. El suggester ya es conservador (skip ambigüos, short titles, self-links).
+- **Notifica vía Telegram** al `chat_id` configurado: near-duplicates (cosine ≥0.85), related notes (graph/tags), wikilinks aplicados. Mensaje compacto con `[[wikilinks]]` clickeables en Obsidian.
+- **Silent por default**: si no hay findings interesantes, no manda nada.
+
+**Skip rules** (evaluadas en orden):
+
+| Condición | Efecto |
+|---|---|
+| Nota fuera de `00-Inbox/` | no-op |
+| Sin config (no se hizo `/enable_ambient`) | no-op |
+| Frontmatter `ambient: skip` | opt-out por nota |
+| `type: morning-brief \| weekly-digest \| prep` | skip (system-generated) |
+| Mismo `{path, hash}` analizado en los últimos 5 min | skip (evita doble ping) |
+
+**Config** en `~/.local/share/obsidian-rag/ambient.json`. Habilitación vía `/enable_ambient` en el bot Telegram (`@ragsystemobs_bot`) — el bot toma el `chat_id` del mensaje y el `bot_token` del env. rag.py SOLO lee y POST directo a `api.telegram.org/bot<token>/sendMessage` (urllib); no depende del bot estando up: si el bot muere, el ping se pierde pero el análisis corre y queda en `ambient.jsonl`.
+
+```bash
+rag ambient status
+rag ambient test 00-Inbox/idea-nueva.md     # dispara sin guardar en Obsidian
+rag ambient log -n 20
+rag ambient disable                          # deja config, flag enabled=false
+```
+
+---
+
+## Surface — puentes en el grafo
+
+Detecta pares de notas cercanas en significado (centroides con cosine ≥ `--sim-threshold`) pero lejanas en el grafo (distancia ≥ `--min-hops`). Son los "puentes no hechos": ideas que viven en folders distintos sin cruce de wikilinks y podrían densificar el conocimiento.
+
+Pipeline:
+
+1. Construye la matriz de centroides (mean de embeddings por nota).
+2. Calcula cosine pairwise (`arr @ arr.T`), enmascara lower triangle.
+3. Calcula distancias en el grafo (BFS sobre wikilinks + backlinks).
+4. Filtra pares con `cosine ≥ threshold AND hops ≥ min_hops AND edad ≥ skip_young_days`.
+5. Para cada par, opcional: command-r genera una línea de "por qué este puente importa".
+6. Loguea a `surface.jsonl`.
+
+**Uso típico**: cron nocturno antes del morning brief, o manual cuando se quiere densificar el grafo después de indexar mucho contenido nuevo.
+
+---
+
+## Filing asistido (`rag file`)
+
+Para cada nota del Inbox propone:
+
+- **Destino PARA**: sugiere un folder bajo `01-Projects/02-Areas/03-Resources/04-Archive` usando neighbours semánticos (mode de sus folders, excluyendo Inbox-style prefixes).
+- **Upward-links**: wikilinks hacia notas-hub/MOC relacionadas para que el move mantenga conectividad.
+
+**Contrato de seguridad**:
+
+- Sin flags → dry-run: propone y loguea a `filing.jsonl`, no mueve nada.
+- `--apply` → interactivo, prompts por nota: `y/n/e(edit)/s(skip)/q(quit)`. Cada move se persiste en `filing_batches/<ts>.jsonl`.
+- `--undo` → lee el último batch y revierte atómicamente (el archivo vuelve al path original).
+- `--one` → solo la nota más vieja; ideal para runs incrementales.
+
+Complementa a `rag inbox`: `inbox` optimiza para "tag + wikilink + dedup + auto-move" sobre volumen; `file` optimiza para "decidir bien el destino PARA" sobre cada nota con confirmación humana.
 
 ---
 
@@ -515,9 +655,62 @@ OBSIDIAN_RAG_VAULT=/otro/vault rag index    # crea collection nueva con sha8 suf
 OBSIDIAN_RAG_VAULT=/otro/vault rag chat
 ```
 
+### Usar dos vaults en paralelo (persistente)
+```bash
+rag vault add home "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+rag vault add work "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/obsidian-work"
+rag vault use work
+rag index              # indexa el vault work en su propia collection
+rag vault use home
+rag eval               # ahora corre contra home (cuyo golden set sí calibrado)
+```
+
+### Activar el Ambient Agent
+```bash
+# Desde Telegram @ragsystemobs_bot:
+/enable_ambient        # guarda chat_id en ~/.local/share/obsidian-rag/ambient.json
+# A partir de acá, cada save en 00-Inbox/ dispara el análisis y puede pingear.
+
+rag ambient status     # confirmá que quedó habilitado
+rag ambient test 00-Inbox/prueba.md    # dry-run sin tocar Obsidian
+```
+
+### Filing supervisado del Inbox
+```bash
+rag file                    # dry-run, ver qué propone
+rag file --apply --one      # la nota más vieja, con confirmación
+rag file --undo             # revertir el último batch si algo salió mal
+```
+
+### Buscar puentes no hechos
+```bash
+rag surface                            # dry-run, top 5 puentes (≥0.78 cosine, ≥3 hops)
+rag surface --sim-threshold 0.82 --top 10 --no-llm   # más estricto y sin generar "por qué"
+```
+
 ---
 
-### Telegram (claude-telegram-bot @ffeerrr_bot)
+## Telegram bots
+
+Dos bots independientes corriendo como launchd services (`com.fer.*`):
+
+### @ragsystemobs_bot (obsidian-rag-bot) — voice-first RAG dedicado
+
+Bot específico sobre el vault. Voz → transcripción (whisper-cli local) → `rag query` → respuesta texto + TTS (`say -v Mónica`).
+
+| Trigger | Acción |
+|---|---|
+| `/rag <q>` o texto libre | Consulta RAG con session `tg:<chat_id>`. |
+| mensaje de voz | Transcribe + `rag query` + responde con voz + texto. |
+| `/note <texto>` / voz con caption `/note` | `rag capture` a 00-Inbox/. |
+| `/enable_ambient` | Guarda `chat_id` en `ambient.json` — activa el Ambient Agent para este chat. |
+| `/disable_ambient` | Equivalente a `rag ambient disable`. |
+
+launchd: `com.fer.obsidian-rag-bot`, log en `~/obsidian-rag-bot/bot.log`. Token en el plist (`~/Library/LaunchAgents/com.fer.obsidian-rag-bot.plist`).
+
+### @ffeerrr_bot (claude-telegram-bot) — wrapper del CLI de Claude Code
+
+Bot general de asistente; permite hacer consultas al vault vía `/rag` pero su default es chat con Claude Code.
 
 | Trigger | Acción |
 |---|---|
@@ -526,6 +719,14 @@ OBSIDIAN_RAG_VAULT=/otro/vault rag chat
 | mensaje de voz, sin caption | Transcribe + habla con Claude (flujo default). |
 | mensaje de voz, caption `/note` | Transcribe + captura a 00-Inbox/ con tags `[capture, telegram, voice]`. |
 | mensaje de voz, caption `/rag [q extra]` | Transcribe + `rag query`. Caption se prepende al transcript. |
+
+launchd: `com.fer.claude-telegram-bot`.
+
+### Stack común
+
+- **STT**: `whisper-cli` local con modelos en `~/whisper-models/` (p.ej. `ggml-small.bin`).
+- **TTS**: macOS `say` con voces nativas (Mónica para español). Zero costo, zero cloud.
+- **Sesiones**: `tg:<chat_id>` como session_id literal → cada chat mantiene su thread. TTL 30 días.
 
 ---
 
@@ -569,15 +770,23 @@ OBSIDIAN_RAG_VAULT=/otro/vault rag chat
 
 ## Suite de tests
 
-| Archivo | Casos | Cubre |
-|---|---|---|
-| `tests/test_sessions.py` | 22 | Persistencia + IDs + window + TTL + cleanup |
-| `tests/test_contradictions.py` | 16 | find_contradictions + render + edge cases (mocks) |
-| `tests/test_digest.py` | 11 | Week label/parse + collect + digest dry-run/write |
-| `tests/test_urls.py` | 30 | Extract URLs + find_urls + index_urls + link intent |
-| `tests/test_wikilinks.py` | 23 | Skip mask + suggester + apply + edge cases |
-| `tests/test_dupes.py` | 11 | Pairwise sims + threshold + folder filter + centroid |
-| `tests/test_inbox.py` | 13 | Folder/tag suggester + frontmatter rewrite + triage compose |
-| **Total** | **126** | |
+| Archivo | Cubre |
+|---|---|
+| `tests/test_sessions.py` | Persistencia + IDs + window + TTL + cleanup |
+| `tests/test_contradictions.py` | `find_contradictions` + render + edge cases (mocks de embed/chat/reranker) |
+| `tests/test_digest.py` | Week label/parse + `_collect_week_evidence` + digest dry-run/write |
+| `tests/test_urls.py` | Extracción URLs + `find_urls` + `_index_urls` idempotencia + `detect_link_intent` |
+| `tests/test_wikilinks.py` | Skip mask + suggester + `apply_wikilink_suggestions` + stale-offset defense |
+| `tests/test_dupes.py` | Pairwise sims + threshold + folder filter + centroid |
+| `tests/test_inbox.py` | Folder/tag suggester + frontmatter rewrite + triage compose |
+| `tests/test_ambient.py` | Config gate + frontmatter opt-out + dedup window + auto-apply + telegram (stub) |
+| `tests/test_auto_index.py` | Watcher state + debounce + hash-based skip |
+| `tests/test_capture_morning_dead.py` | `capture` atomic write + `morning` brief + `dead` criteria |
+| `tests/test_expand_queries.py` | Helper LLM expansion (mocked) + paraphrase shape |
+| `tests/test_filing.py` | Destino PARA + upward-link + apply/undo batches |
+| `tests/test_folder_filter.py` | `infer_filters` + explicit folder/tag scoping |
+| `tests/test_render_response.py` | `NOTE_LINK_RE` + OSC 8 rendering + `verify_citations` |
+| `tests/test_surface.py` | Centroides + graph distance + pair filtering |
+| `tests/test_vaults.py` | Registry add/use/remove + precedence (env > registry > default) + per-vault collection |
 
-Correr: `.venv/bin/python -m pytest tests/ -q` (~3s). pytest está en `[project.optional-dependencies].dev`.
+Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.optional-dependencies].dev`. Los modelos se monkeypatchean donde hace falta (no se llama Ollama ni se carga el reranker de verdad).

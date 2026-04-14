@@ -4864,9 +4864,11 @@ def chat(
         console.print("[red]Sin vault para consultar. Registrá uno con `rag vault add`.[/red]")
         return
 
-    # Auto-index: para cada vault en scope detectar y absorber cambios
-    # antes de arrancar el chat. mtime-based para que el caso "nada cambió"
-    # cueste ~50ms; first-time index es bloqueante (con progreso visible).
+    # Defer auto_index hasta DESPUÉS de imprimir el Panel — sin esto, una
+    # corrida de first-time index (1-2 min para 500 notas) deja la pantalla
+    # en negro y parece colgada. Marcamos qué vaults van a indexarse para
+    # disparar el ciclo después del banner.
+    pending_index: list[tuple[str, Path, bool, int]] = []   # (name, path, is_first_time, n_files)
     for name, vpath in vaults_resolved:
         try:
             col_v = get_db_for(vpath)
@@ -4875,39 +4877,9 @@ def chat(
             continue
         n_files = sum(1 for _ in vpath.rglob("*.md"))
         if empty and n_files > 0:
-            with console.status(
-                f"[dim]'{name}' nunca se indexó — corriendo first-time index "
-                f"({n_files} notas, ~1-2 min)…[/dim]",
-                spinner="dots",
-            ):
-                stats = auto_index_vault(vpath)
-            console.print(
-                f"[green]✓ '{name}' indexado:[/green] {stats['indexed']} notas "
-                f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
-            )
+            pending_index.append((name, vpath, True, n_files))
         elif not empty:
-            stats = auto_index_vault(vpath)
-            if stats["kind"] == "incremental":
-                console.print(
-                    f"[green]✓ '{name}':[/green] {stats['indexed']} cambios "
-                    f"+ {stats['removed']} orphans removidos "
-                    f"[dim]({stats['took_ms']}ms)[/dim]"
-                )
-
-    # Re-validar después del auto-index — si todos quedaron vacíos (vault
-    # sin .md o todo skipeado), no tiene sentido seguir.
-    total_chunks = 0
-    for name, vpath in vaults_resolved:
-        try:
-            total_chunks += get_db_for(vpath).count()
-        except Exception:
-            pass
-    if total_chunks == 0:
-        console.print(
-            f"[red]Los vaults seleccionados están vacíos. "
-            f"Verificá que tienen archivos .md.[/red]"
-        )
-        return
+            pending_index.append((name, vpath, False, n_files))
 
     # Resolve session: --resume takes last used id; --session takes explicit id;
     # otherwise a fresh id is minted. ensure_session is idempotent on both paths.
@@ -4958,6 +4930,45 @@ def chat(
         border_style="green",
     ))
 
+    # AHORA sí: ejecutamos auto_index con feedback visible. El usuario vio
+    # el banner primero, así que sabe que el chat está vivo aunque la
+    # primera nota tarde 1-2 min en indexarse.
+    for name, vpath, is_first_time, n_files in pending_index:
+        if is_first_time:
+            with console.status(
+                f"[bold yellow]Primer index de '{name}'[/bold yellow] "
+                f"[dim]· {n_files} notas · 1-2 min · embeddings + chunking…[/dim]",
+                spinner="dots",
+            ):
+                stats = auto_index_vault(vpath)
+            console.print(
+                f"[green]✓ '{name}' indexado:[/green] {stats['indexed']} notas "
+                f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
+            )
+        else:
+            stats = auto_index_vault(vpath)
+            if stats["kind"] == "incremental" and (stats["indexed"] or stats["removed"]):
+                console.print(
+                    f"[green]✓ '{name}':[/green] {stats['indexed']} cambios "
+                    f"+ {stats['removed']} orphans removidos "
+                    f"[dim]({stats['took_ms']}ms)[/dim]"
+                )
+
+    # Re-validar — si todos quedaron vacíos (vault sin .md o índex falló),
+    # no tiene sentido seguir.
+    total_chunks = 0
+    for name, vpath in vaults_resolved:
+        try:
+            total_chunks += get_db_for(vpath).count()
+        except Exception:
+            pass
+    if total_chunks == 0:
+        console.print(
+            f"[red]Los vaults seleccionados están vacíos. "
+            f"Verificá que tienen archivos .md.[/red]"
+        )
+        return
+
     history: list[dict] = session_history(sess, window=SESSION_HISTORY_WINDOW)
     last_assistant = ""
     last_question = ""
@@ -4973,7 +4984,7 @@ def chat(
             if not first_turn:
                 console.print(Rule(style="dim", characters="╌"))
             first_turn = False
-            question = console.input("\n[bold cyan]❯[/bold cyan] ").strip()
+            question = console.input("\n[bold green]tu › [/bold green]").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Hasta luego.[/dim]")
             break
@@ -5033,6 +5044,13 @@ def chat(
         is_link, link_q = detect_link_intent(question)
         if is_link:
             search_q = link_q or question
+            # Backfill PRIMERO (fuera del status spinner) — si la URL DB
+            # está vacía, su mensaje "indexando ~1 min" tiene que ser
+            # visible al usuario, no enterrado bajo el "buscando URLs…".
+            try:
+                _maybe_backfill_urls()
+            except Exception:
+                pass
             with console.status("[dim]buscando URLs…[/dim]", spinner="dots"):
                 items = find_urls(search_q, k=10)
             render_links(items)
@@ -5122,6 +5140,7 @@ def chat(
 
         console.print()
         parts: list[str] = []
+        console.print("[bold cyan]rag › [/bold cyan]", end="")
         from rich.live import Live
         with Live("", console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(

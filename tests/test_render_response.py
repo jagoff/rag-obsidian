@@ -178,9 +178,9 @@ def test_ext_block_still_renders_with_warning():
 
 # ── External URLs ────────────────────────────────────────────────────────────
 # Real case from a "bookmarks de películas" chat: command-r emits external
-# links as `[Label](https://...)` and the renderer used to drop them as raw
-# markdown. Now they should render as the label only, with the URL hidden
-# (clickable via OSC 8).
+# links as `[Label](https://...)`. Render symmetric with note links —
+# `label (url)` both visible, OSC 8 hyperlinks on each span so both are
+# Cmd/Ctrl-clickable. Preserves the markdown-source look of the screenshot.
 
 
 def _styles(rendered) -> list[tuple[str, str]]:
@@ -188,13 +188,15 @@ def _styles(rendered) -> list[tuple[str, str]]:
     return [(span.text, str(span.style)) for span in rendered.divide([len(rendered)])[0].split()]
 
 
-def test_url_link_renders_label_not_url():
+def test_url_link_renders_label_and_url():
     text = "Mirá [Cliver.tv](https://www2.cliver.me/) para ver pelis."
     r = _plain(rag.render_response(text))
     assert "Cliver.tv" in r
-    # URL queda accesible via OSC 8 hyperlink, no impreso como texto.
-    assert "https://www2.cliver.me/" not in r
-    # Markdown wrappers no aparecen.
+    # URL visible al lado del label, entre paréntesis dim — mismo shape
+    # que note-md. OSC 8 hyperlinks hacen ambos clickeables.
+    assert "https://www2.cliver.me/" in r
+    assert "(https://www2.cliver.me/)" in r
+    # Markdown wrappers de corchetes no aparecen (reemplazados por paren dim).
     assert "[" not in r
     assert "](" not in r
 
@@ -204,7 +206,7 @@ def test_url_link_with_special_chars_in_url():
     text = "[Search](https://example.com/q?x=1&y=2)"
     r = _plain(rag.render_response(text))
     assert "Search" in r
-    assert "https://example.com" not in r
+    assert "https://example.com/q?x=1&y=2" in r
 
 
 def test_bare_url_renders_as_clickable():
@@ -223,7 +225,7 @@ def test_url_link_does_not_consume_md_link_after():
     assert "Web" in r
     assert "nota" in r
     assert "02-Areas/X.md" in r
-    assert "https://x.com" not in r
+    assert "https://x.com" in r
 
 
 def test_url_attaches_link_style():

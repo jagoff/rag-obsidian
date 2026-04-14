@@ -199,14 +199,19 @@ def render_response(text: str) -> Text:
         label_base = "bold cyan" if not base_style else "bold yellow"
         path_base = "cyan dim" if not base_style else "yellow dim"
         url_base = "bold blue" if not base_style else "bold yellow"
+        url_dim = "blue dim" if not base_style else "yellow dim"
         for start, end, label, target, kind in spans:
             if start > last:
                 emit_plain_or_inline(segment[last:start], base_style=base_style)
             if kind == "url-md":
-                # External link with explicit anchor — render the anchor only.
-                # The URL is reachable via the OSC 8 hyperlink; printing it
-                # again clutters the line (URLs are often 60+ chars).
+                # Symmetric with note-md: render `label (url)` both visible.
+                # Keeping the URL visible preserves the markdown-source look
+                # of the vault's bookmarks; OSC 8 hyperlinks attach to both
+                # so either span is Cmd/Ctrl-clickable.
                 out.append(label, style=_url_link_style(target, url_base))
+                out.append(" (", style="dim")
+                out.append(target, style=_url_link_style(target, url_dim))
+                out.append(")", style="dim")
             elif kind == "url-bare":
                 out.append(target, style=_url_link_style(target, url_base))
             elif kind == "note-bare":

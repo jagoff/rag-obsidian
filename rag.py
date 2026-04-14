@@ -2390,25 +2390,67 @@ def build_filing_proposal(
     col: chromadb.Collection,
     note_path: str,
     k: int = 8,
+    history: list[dict] | None = None,
 ) -> dict:
     """Compone folder sugerido + upward-link + neighbors para una nota del
     Inbox. Retorna dict plano que CLI + logger consumen igual.
 
-    Reutiliza `_suggest_folder_for_note` (mode-voting sobre top-k vecinos
-    fuera de Inbox) y `_infer_upward_link`. Sin efectos colaterales — pura
-    lectura de colección + disk read de la nota.
+    Compone tres señales:
+      - baseline: `_suggest_folder_for_note` (mode-voting sobre vecinos del
+        corpus, fuera de Inbox). Lo que ya teníamos en fase 1/2.
+      - upward-link: `_infer_upward_link` (MOC entre neighbors o top-1).
+      - personalización (fase 3): si hay ≥FILING_PERSONALIZE_MIN_HISTORY
+        decisiones pasadas, votamos por k-NN contra ellas y comparamos con
+        baseline. Tres estados:
+          * "agreed"           — ambos coinciden → boost de confidence.
+          * "personalized"     — disagree y la señal personal es más fuerte
+                                  → la propuesta cambia.
+          * "baseline+history" — disagree pero baseline gana → no cambia
+                                  pero marcamos que hay señal histórica.
+        Cold-start (history < umbral) → simplemente "baseline".
+
+    `history` opcional: el caller puede precargarlo (ej. el CLI lo hace
+    una vez antes del loop) para evitar releer filing.jsonl por nota.
     """
     full = (VAULT_PATH / note_path).resolve()
     if not full.is_file():
         return {"path": note_path, "error": "not_found"}
+
     neighbors = _top_k_neighbors(col, note_path, k=k)
-    folder, confidence = _suggest_folder_for_note(col, note_path, k=k)
+    base_folder, base_confidence = _suggest_folder_for_note(col, note_path, k=k)
     upward_title, upward_kind = _infer_upward_link(neighbors)
+
+    folder = base_folder
+    confidence = base_confidence
+    source = "baseline"
+    evidence: list[dict] = []
+
+    if history is None:
+        history = _load_filing_decisions()
+    if len(history) >= FILING_PERSONALIZE_MIN_HISTORY:
+        q_embed = _embed_note_body(note_path)
+        votes, evidence = _personalized_folder_vote(col, q_embed, history)
+        if votes:
+            personal_folder = max(votes, key=votes.get)
+            total = sum(votes.values())
+            personal_conf = (votes[personal_folder] / total) if total else 0.0
+            if personal_folder == base_folder and base_folder:
+                source = "agreed"
+                confidence = min(0.99, base_confidence + FILING_AGREE_BOOST)
+            elif personal_conf > base_confidence:
+                folder = personal_folder
+                confidence = round(personal_conf, 3)
+                source = "personalized"
+            else:
+                source = "baseline+history"
+
     return {
         "path": note_path,
         "note": full.stem,
         "folder": folder,
         "confidence": confidence,
+        "source": source,
+        "evidence": evidence,
         "upward_title": upward_title,
         "upward_kind": upward_kind,
         "neighbors": [
@@ -2437,6 +2479,142 @@ def _filing_log_proposal(proposal: dict, decision: str | None = None) -> None:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ── FILING fase 3: personalización por k-NN sobre decisiones pasadas ─────────
+# La idea: cuando proponemos folder para una nota nueva, miramos las notas que
+# YA filaste (decision=accept/edit en filing.jsonl). Si las notas más
+# semánticamente parecidas a la nueva fueron filadas a un folder X, sesgamos
+# la propuesta hacia X. Sin training, sin features manuales — pura memoria
+# de tu comportamiento sobre embeddings que ya tenemos.
+
+FILING_PERSONALIZE_MIN_HISTORY = 5      # below this → fallback a baseline puro
+FILING_PERSONALIZE_TOP_K = 5            # vecinos en el espacio de decisiones pasadas
+FILING_PERSONALIZE_MIN_SIM = 0.30       # piso de cosine para que una decisión "cuente"
+FILING_AGREE_BOOST = 0.15               # bump de confidence cuando baseline+personalized coinciden
+
+
+def _load_filing_decisions(limit: int = 500) -> list[dict]:
+    """Lee las últimas N decisiones positivas (accept/edit) de filing.jsonl.
+
+    Solo incluye las que tienen `applied_to` (sea porque se aplicaron en fase
+    2 o porque ya las migramos). reject/skip/error/quit se descartan — la
+    fase 3 personaliza desde lo que validaste, no desde lo que rechazaste
+    (eso vendría en una fase posterior con un ranker logístico real).
+    """
+    if not FILING_LOG_PATH.is_file():
+        return []
+    try:
+        lines = FILING_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= limit:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("decision") not in ("accept", "edit"):
+            continue
+        applied = e.get("applied_to")
+        if not applied:
+            continue
+        out.append({
+            "applied_to": applied,
+            "target_folder": str(Path(applied).parent),
+            "decision": e["decision"],
+            "ts": e.get("ts", ""),
+        })
+    return out
+
+
+def _embed_note_body(note_path: str) -> list[float] | None:
+    """Embed del cuerpo de la nota para lookups de similitud. None si no
+    se puede leer o está vacía. Espejo de lo que hace `_top_k_neighbors`
+    internamente — extraído acá para que personalización lo reuse.
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return None
+    if not full.is_file():
+        return None
+    text = clean_md(full.read_text(encoding="utf-8", errors="ignore"))[:3000].strip()
+    if not text:
+        return None
+    try:
+        return embed([text])[0]
+    except Exception:
+        return None
+
+
+def _personalized_folder_vote(
+    col: chromadb.Collection,
+    q_embed: list[float] | None,
+    history: list[dict],
+    top_k: int = FILING_PERSONALIZE_TOP_K,
+) -> tuple[dict[str, float], list[dict]]:
+    """Voto k-NN sobre decisiones pasadas. Para la nota query (q_embed),
+    encontrar las top_k decisiones más similares y sumar similitud por
+    target_folder.
+
+    Retorna (votes, evidence):
+      - votes: {folder: similarity_sum}
+      - evidence: lista [{applied_to, target_folder, sim}] de los vecinos
+        que efectivamente contribuyeron (para mostrar en UI: "3 similares
+        en este mismo folder").
+
+    Skip silencioso si no hay history, no hay query embedding, o ningún
+    `applied_to` está en los centroides (ej. notas borradas después).
+    """
+    if not history or q_embed is None:
+        return {}, []
+    import numpy as np
+    files, _metas, arr = _note_centroids(col)
+    file_to_idx = {f: i for i, f in enumerate(files)}
+
+    embs: list = []
+    info: list[dict] = []
+    for d in history:
+        idx = file_to_idx.get(d["applied_to"])
+        if idx is None:
+            continue
+        embs.append(arr[idx])
+        info.append(d)
+
+    if not embs:
+        return {}, []
+
+    decision_arr = np.asarray(embs, dtype=np.float32)
+    q = np.asarray(q_embed, dtype=np.float32)
+    n = float(np.linalg.norm(q))
+    if n < 1e-8:
+        return {}, []
+    q = q / n
+    # decision_arr ya viene L2-normalizado de _note_centroids → dot = cosine.
+    sims = decision_arr @ q
+
+    order = np.argsort(sims)[::-1]
+    votes: dict[str, float] = {}
+    evidence: list[dict] = []
+    for i in order[:top_k]:
+        sim = float(sims[i])
+        if sim < FILING_PERSONALIZE_MIN_SIM:
+            break
+        folder = info[i]["target_folder"]
+        votes[folder] = votes.get(folder, 0.0) + sim
+        evidence.append({
+            "applied_to": info[i]["applied_to"],
+            "target_folder": folder,
+            "sim": round(sim, 3),
+        })
+    return votes, evidence
 
 
 # ── FILING apply + undo ──────────────────────────────────────────────────────
@@ -5866,6 +6044,21 @@ def surface(sim_threshold: float, min_hops: int, top: int,
     console.print(f"[dim]{duration_ms}ms · log: {SURFACE_LOG_PATH}[/dim]")
 
 
+def _filing_source_label(pr: dict) -> str:
+    """Etiqueta corta de la procedencia de la propuesta. Vacía si baseline puro
+    (no agregamos ruido visual cuando no hay personalización)."""
+    src = pr.get("source", "baseline")
+    ev = pr.get("evidence", []) or []
+    if src == "agreed":
+        return f"agreed · {len(ev)} similar(es) en este folder"
+    if src == "personalized":
+        return f"personalized · {len(ev)} similar(es) confirman"
+    if src == "baseline+history":
+        # Hay history pero no convence — útil saberlo (el usuario puede edit).
+        return f"baseline · history apunta a otros folders"
+    return ""
+
+
 def _render_filing_proposal(i: int, total: int, pr: dict, plain: bool) -> None:
     """Renderer compartido por dry-run y apply. Muestra una propuesta; no pide
     input ni decide — solo layout."""
@@ -5879,7 +6072,11 @@ def _render_filing_proposal(i: int, total: int, pr: dict, plain: bool) -> None:
                else "low")
         click.echo(f"[{i}/{total}] {pr['note']}  ({pr['path']})")
         target = pr["folder"] or "(sin propuesta)"
-        click.echo(f"         -> {target}  (conf {conf:.2f}, {tag})")
+        line = f"         -> {target}  (conf {conf:.2f}, {tag})"
+        src_label = _filing_source_label(pr)
+        if src_label:
+            line += f"  [{src_label}]"
+        click.echo(line)
         if pr["upward_title"]:
             click.echo(f"         ^ [[{pr['upward_title']}]] ({pr['upward_kind']})")
         return
@@ -5901,10 +6098,24 @@ def _render_filing_proposal(i: int, total: int, pr: dict, plain: bool) -> None:
     else:
         style, label = "red", f"low · {conf:.2f}"
     target = pr["folder"] or "(sin propuesta)"
-    console.print(
+    src_label = _filing_source_label(pr)
+    src_style = {
+        "agreed · ": "green dim",
+        "personalized · ": "magenta dim",
+        "baseline · ": "yellow dim",
+    }
+    src_color = "dim"
+    for prefix, color in src_style.items():
+        if src_label.startswith(prefix.rstrip()):
+            src_color = color
+            break
+    line = (
         f"   [cyan]→[/cyan] [bold]{target}[/bold] "
         f"[dim]·[/dim] [{style}]{label}[/{style}]"
     )
+    if src_label:
+        line += f"  [{src_color}]· {src_label}[/{src_color}]"
+    console.print(line)
     if pr["upward_title"]:
         badge = "📍 MOC" if pr["upward_kind"] == "moc" else "↔ nearest"
         console.print(
@@ -6028,10 +6239,18 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
         return
 
     # ── Build proposals ──────────────────────────────────────────────────────
+    # Cargamos history una vez por batch — evita releer filing.jsonl N veces.
+    # Si está bajo el umbral, igual se pasa (build_filing_proposal lo ignora).
+    history = _load_filing_decisions()
+    if not plain and len(history) >= FILING_PERSONALIZE_MIN_HISTORY:
+        console.print(
+            f"[dim]Personalización activa · {len(history)} decisión(es) en history[/dim]"
+        )
+
     proposals: list[tuple[Path, dict]] = []
     for p in eligible:
         rel = str(p.relative_to(VAULT_PATH))
-        prop = build_filing_proposal(col, rel, k=k)
+        prop = build_filing_proposal(col, rel, k=k, history=history)
         proposals.append((p, prop))
 
     # ── Dry-run path: print + log, bail ──────────────────────────────────────

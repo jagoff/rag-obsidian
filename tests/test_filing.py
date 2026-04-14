@@ -577,6 +577,213 @@ def test_cli_apply_and_undo_mutually_exclusive(tmp_vault_with_batch):
     assert "No podés combinar" in result.output
 
 
+# ── Fase 3: personalización ───────────────────────────────────────────────────
+
+
+def _seed_decision(applied_to: str, decision: str = "accept", src: str = "00-Inbox/x.md"):
+    """Helper: appendea una decisión simulada a filing.jsonl."""
+    rag.FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with rag.FILING_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": "2026-04-14T10:00:00",
+            "cmd": "filing_proposal",
+            "path": src,
+            "note": Path(src).stem,
+            "folder": str(Path(applied_to).parent),
+            "confidence": 0.8,
+            "applied_to": applied_to,
+            "decision": decision,
+        }) + "\n")
+
+
+def test_load_filing_decisions_empty_when_no_log(tmp_vault):
+    assert rag._load_filing_decisions() == []
+
+
+def test_load_filing_decisions_filters_to_accept_and_edit(tmp_vault):
+    _seed_decision("02-Areas/Salud/a.md", decision="accept")
+    _seed_decision("02-Areas/Salud/b.md", decision="reject")  # filtered out
+    _seed_decision("02-Areas/Salud/c.md", decision="skip")    # filtered out
+    _seed_decision("02-Areas/Tech/d.md", decision="edit")     # kept
+
+    decisions = rag._load_filing_decisions()
+    paths = [d["applied_to"] for d in decisions]
+    assert "02-Areas/Salud/a.md" in paths
+    assert "02-Areas/Tech/d.md" in paths
+    assert "02-Areas/Salud/b.md" not in paths
+    assert "02-Areas/Salud/c.md" not in paths
+
+
+def test_load_filing_decisions_skips_entries_without_applied_to(tmp_vault):
+    rag.FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with rag.FILING_LOG_PATH.open("a", encoding="utf-8") as f:
+        # Dry-run del fase 1 no tiene applied_to.
+        f.write(json.dumps({
+            "ts": "2026-04-14T10:00:00",
+            "cmd": "filing_proposal",
+            "path": "00-Inbox/x.md",
+            "decision": "accept",
+        }) + "\n")
+    assert rag._load_filing_decisions() == []
+
+
+def test_load_filing_decisions_respects_limit(tmp_vault):
+    for i in range(20):
+        _seed_decision(f"02-Areas/n{i}.md")
+    out = rag._load_filing_decisions(limit=5)
+    assert len(out) == 5
+
+
+# _personalized_folder_vote
+
+
+def test_personalized_vote_empty_when_no_history(tmp_vault):
+    vault, col = tmp_vault
+    votes, ev = rag._personalized_folder_vote(col, [1.0, 0.0, 0.0, 0.0], history=[])
+    assert votes == {} and ev == []
+
+
+def test_personalized_vote_empty_when_history_paths_missing(tmp_vault):
+    vault, col = tmp_vault
+    history = [{"applied_to": "02-Areas/ghost.md", "target_folder": "02-Areas"}]
+    votes, ev = rag._personalized_folder_vote(col, [1.0, 0.0, 0.0, 0.0], history=history)
+    assert votes == {} and ev == []
+
+
+def test_personalized_vote_aggregates_by_folder(tmp_vault):
+    vault, col = tmp_vault
+    # Tres notas en Salud que el usuario "fileó" en el pasado, todas con
+    # embeddings cercanos al query.
+    _add_note(col, vault, "02-Areas/Salud/a.md", "A", HIGH)
+    _add_note(col, vault, "02-Areas/Salud/b.md", "B", MID)
+    _add_note(col, vault, "02-Areas/Tech/c.md", "C", LOW)
+    history = [
+        {"applied_to": "02-Areas/Salud/a.md", "target_folder": "02-Areas/Salud"},
+        {"applied_to": "02-Areas/Salud/b.md", "target_folder": "02-Areas/Salud"},
+        {"applied_to": "02-Areas/Tech/c.md", "target_folder": "02-Areas/Tech"},
+    ]
+    votes, ev = rag._personalized_folder_vote(col, list(HIGH), history=history)
+    # Salud debería ganar (suma de sims más alta).
+    assert max(votes, key=votes.get) == "02-Areas/Salud"
+    assert votes["02-Areas/Salud"] > votes.get("02-Areas/Tech", 0)
+    # Tech queda fuera por estar bajo MIN_SIM (0.3 vs sim ~0.3 borderline).
+    # Evidence ordenada por similitud desc.
+    assert ev[0]["sim"] >= ev[-1]["sim"]
+
+
+def test_personalized_vote_respects_min_sim_threshold(tmp_vault):
+    vault, col = tmp_vault
+    # Solo notas en Tech, todas muy disímiles del query.
+    _add_note(col, vault, "02-Areas/Tech/a.md", "A", LOW)  # cos ≈ 0.3 (borderline)
+    history = [{"applied_to": "02-Areas/Tech/a.md", "target_folder": "02-Areas/Tech"}]
+    # Query MUY ortogonal → similitud baja → nada cuenta.
+    votes, ev = rag._personalized_folder_vote(col, [0.0, 1.0, 0.0, 0.0], history=history)
+    assert votes == {}
+
+
+# build_filing_proposal con history
+
+
+def test_build_proposal_baseline_when_history_below_threshold(tmp_vault, monkeypatch):
+    vault, col = tmp_vault
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH)
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    # Solo 2 decisiones — bajo el umbral de FILING_PERSONALIZE_MIN_HISTORY=5.
+    _seed_decision("02-Areas/Coaching/a.md")
+    _seed_decision("02-Areas/Coaching/b.md")
+
+    prop = rag.build_filing_proposal(col, "00-Inbox/n.md")
+    assert prop["source"] == "baseline"
+    # Con 2 decisiones no hay personalización — folder viene del baseline puro.
+    assert prop["folder"] == "02-Areas"
+
+
+def test_build_proposal_agreed_boosts_confidence(tmp_vault, monkeypatch):
+    vault, col = tmp_vault
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH)
+    # Baseline: vecinos cercanos en Salud.
+    for i in range(5):
+        _add_note(col, vault, f"02-Areas/Salud/n{i}.md", f"N{i}", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    # History de 5+ notas también en Salud.
+    for i in range(5):
+        _seed_decision(f"02-Areas/Salud/n{i}.md")
+
+    prop = rag.build_filing_proposal(col, "00-Inbox/n.md")
+    assert prop["folder"] == "02-Areas/Salud"
+    assert prop["source"] == "agreed"
+    # Confidence boosted.
+    assert prop["confidence"] > 0.7   # baseline = 1.0 (todos votan), boost cap a 0.99
+
+
+def test_build_proposal_personalized_overrides_when_stronger(tmp_vault, monkeypatch):
+    vault, col = tmp_vault
+    # Inbox note.
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH)
+    # Baseline: vecinos en MUCHOS folders distintos → confidence baja.
+    _add_note(col, vault, "02-Areas/A/x.md", "Ax", HIGH)
+    _add_note(col, vault, "02-Areas/B/x.md", "Bx", HIGH)
+    _add_note(col, vault, "02-Areas/C/x.md", "Cx", HIGH)
+    _add_note(col, vault, "02-Areas/D/x.md", "Dx", HIGH)
+    # Personalized signal: 5 decisiones consistentes en 02-Areas/Personal.
+    _add_note(col, vault, "02-Areas/Personal/p1.md", "P1", MID)
+    _add_note(col, vault, "02-Areas/Personal/p2.md", "P2", MID)
+    _add_note(col, vault, "02-Areas/Personal/p3.md", "P3", MID)
+    _add_note(col, vault, "02-Areas/Personal/p4.md", "P4", MID)
+    _add_note(col, vault, "02-Areas/Personal/p5.md", "P5", MID)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+    for i in range(1, 6):
+        _seed_decision(f"02-Areas/Personal/p{i}.md")
+
+    prop = rag.build_filing_proposal(col, "00-Inbox/n.md")
+    # Baseline ≤ 0.25 (cuatro folders empatados) — personalización debería ganar.
+    assert prop["source"] in ("personalized", "agreed")
+    if prop["source"] == "personalized":
+        assert prop["folder"] == "02-Areas/Personal"
+
+
+def test_build_proposal_baseline_plus_history_when_baseline_stronger(tmp_vault, monkeypatch):
+    vault, col = tmp_vault
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH)
+    # Baseline FUERTE: 6 vecinos en mismo folder.
+    for i in range(6):
+        _add_note(col, vault, f"02-Areas/Strong/n{i}.md", f"N{i}", HIGH)
+    # Personalized débil: una sola decisión (que sí matchea HIGH) en otro folder.
+    _add_note(col, vault, "02-Areas/Other/p1.md", "P1", MID)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+    # 5 decisiones para superar el umbral, pero solo 1 con sim suficiente.
+    _seed_decision("02-Areas/Other/p1.md")
+    for i in range(4):
+        _seed_decision(f"02-Areas/Strong/n{i}.md")
+
+    prop = rag.build_filing_proposal(col, "00-Inbox/n.md")
+    # Baseline manda (confidence 1.0); estado posibles: agreed (la mayoría
+    # de history coincide) o baseline+history (no coincide).
+    assert prop["folder"] == "02-Areas/Strong"
+    assert prop["source"] in ("agreed", "baseline+history", "baseline")
+
+
+def test_cli_apply_logs_applied_to_for_fase3_history(tmp_vault_with_batch, monkeypatch):
+    """Smoke: tras --apply, la línea loggeada debe tener applied_to + decision
+    para que la fase 3 pueda usarla como historia."""
+    vault, col = tmp_vault_with_batch
+    _add_note(col, vault, "00-Inbox/n.md", "n", HIGH)
+    _add_note(col, vault, "02-Areas/x.md", "X", HIGH)
+    monkeypatch.setattr(rag, "embed", lambda ts: [list(HIGH) for _ in ts])
+
+    from click.testing import CliRunner
+    CliRunner().invoke(rag.file_cmd, ["--plain", "--apply"], input="y\n")
+
+    # Log debe tener al menos una entry con decision=accept y applied_to.
+    decisions = rag._load_filing_decisions()
+    assert len(decisions) >= 1
+    assert decisions[0]["decision"] == "accept"
+    assert decisions[0]["applied_to"].startswith("02-Areas/")
+
+
 def test_frontmatter_file_skip_is_honored(tmp_vault_with_batch, monkeypatch):
     vault, col = tmp_vault_with_batch
     body_skip = "---\nfile: skip\n---\n\nno tocar"

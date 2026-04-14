@@ -2305,6 +2305,140 @@ def triage_inbox_note(
     }
 
 
+# ── FILING: asistente de inbox que propone destino + upward-link ─────────────
+# Fase 1 es dry-run puro: calcula propuestas y las loguea a filing.jsonl. No
+# mueve archivos. Los datos acumulados (pares nota→folder aceptados/rechazados)
+# alimentan un ranker en fase 2 cuando sumemos confirmación interactiva.
+
+FILING_LOG_PATH = Path.home() / ".local/share/obsidian-rag/filing.jsonl"
+# Umbrales de confianza para la etiqueta visual (la decisión final siempre es
+# del usuario; el sistema solo colorea):
+#   ≥ 0.55  → firm      (≥55% de los K vecinos vota la misma carpeta)
+#   0.35-0.55 → tentative
+#   < 0.35  → low       (señal insuficiente, sugerir revisión manual)
+FILING_CONFIDENCE_FIRM = 0.55
+FILING_CONFIDENCE_TENTATIVE = 0.35
+
+
+def _top_k_neighbors(
+    col: chromadb.Collection,
+    note_path: str,
+    k: int = 8,
+    skip_folder_prefix: str = "00-",
+) -> list[tuple[dict, float]]:
+    """Top-k semantic neighbors (meta, similarity) dedupeado por file, excluye
+    la nota misma y cualquier path en Inbox-style folders (00-*).
+
+    Chroma cosine-space: distance = 1 - cos_sim → similarity = max(0, 1-dist).
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    try:
+        full.relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        return []
+    if not full.is_file() or col.count() == 0:
+        return []
+    text = clean_md(full.read_text(encoding="utf-8", errors="ignore"))[:3000].strip()
+    if not text:
+        return []
+    try:
+        q_embed = embed([text])[0]
+    except Exception:
+        return []
+    n = min(k * 4, col.count())
+    res = col.query(
+        query_embeddings=[q_embed], n_results=n,
+        include=["metadatas", "distances"],
+    )
+    metas = res["metadatas"][0]
+    dists = res["distances"][0]
+    out: list[tuple[dict, float]] = []
+    seen_files: set[str] = set()
+    for m, d in zip(metas, dists):
+        f = m.get("file", "")
+        if not f or f == note_path or f in seen_files:
+            continue
+        if f.startswith(skip_folder_prefix):
+            continue
+        seen_files.add(f)
+        sim = max(0.0, 1.0 - float(d))
+        out.append((m, sim))
+        if len(out) >= k:
+            break
+    return out
+
+
+def _infer_upward_link(
+    neighbors: list[tuple[dict, float]],
+) -> tuple[str, str]:
+    """De los vecinos top-k, elegir target para el upward-link.
+
+    Preferencia: primer MOC detectado (via _is_moc_note, que ya maneja
+    title/tag/folder-index). Si no hay MOC entre los vecinos, devolver el
+    top-1 como link horizontal (menos ideal pero no deja la nota huérfana).
+    Retorna (title, kind) con kind ∈ {"moc", "neighbor", ""}.
+    """
+    for m, _ in neighbors:
+        if _is_moc_note(m):
+            return (m.get("note", ""), "moc")
+    if neighbors:
+        return (neighbors[0][0].get("note", ""), "neighbor")
+    return ("", "")
+
+
+def build_filing_proposal(
+    col: chromadb.Collection,
+    note_path: str,
+    k: int = 8,
+) -> dict:
+    """Compone folder sugerido + upward-link + neighbors para una nota del
+    Inbox. Retorna dict plano que CLI + logger consumen igual.
+
+    Reutiliza `_suggest_folder_for_note` (mode-voting sobre top-k vecinos
+    fuera de Inbox) y `_infer_upward_link`. Sin efectos colaterales — pura
+    lectura de colección + disk read de la nota.
+    """
+    full = (VAULT_PATH / note_path).resolve()
+    if not full.is_file():
+        return {"path": note_path, "error": "not_found"}
+    neighbors = _top_k_neighbors(col, note_path, k=k)
+    folder, confidence = _suggest_folder_for_note(col, note_path, k=k)
+    upward_title, upward_kind = _infer_upward_link(neighbors)
+    return {
+        "path": note_path,
+        "note": full.stem,
+        "folder": folder,
+        "confidence": confidence,
+        "upward_title": upward_title,
+        "upward_kind": upward_kind,
+        "neighbors": [
+            {
+                "path": m.get("file", ""),
+                "note": m.get("note", ""),
+                "sim": round(s, 3),
+            }
+            for m, s in neighbors[:5]
+        ],
+    }
+
+
+def _filing_log_proposal(proposal: dict) -> None:
+    """Append-only log. Una línea por propuesta, mismo shape que
+    ambient.jsonl/surface.jsonl. Fase 2 agregará `decision: accept|reject|edit`
+    cuando sumemos la tecla interactiva — por ahora solo loguea la propuesta.
+    """
+    try:
+        FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat(timespec="seconds")
+        with FILING_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": ts, "cmd": "filing_proposal", **proposal},
+                ensure_ascii=False,
+            ) + "\n")
+    except Exception:
+        pass
+
+
 def find_near_duplicates_for(
     col: chromadb.Collection,
     note_path: str,
@@ -5567,6 +5701,116 @@ def surface(sim_threshold: float, min_hops: int, top: int,
             console.print(f"     [cyan]→[/cyan] [italic]{p['reason']}[/italic]")
     console.print()
     console.print(f"[dim]{duration_ms}ms · log: {SURFACE_LOG_PATH}[/dim]")
+
+
+@cli.command(name="file")
+@click.argument("path", required=False)
+@click.option("--folder", default="00-Inbox", show_default=True,
+              help="Folder a escanear si no pasás path")
+@click.option("--one", is_flag=True, help="Solo la nota más vieja del inbox")
+@click.option("--limit", default=20, show_default=True,
+              help="Máximo de notas a procesar por corrida")
+@click.option("-k", "k", default=8, show_default=True,
+              help="Cantidad de vecinos semánticos a considerar")
+@click.option("--plain", is_flag=True, help="Salida plana sin colores")
+def file_cmd(path: str | None, folder: str, one: bool, limit: int,
+             k: int, plain: bool):
+    """Filing asistido de Inbox: destino PARA + upward-link sugeridos.
+
+    Fase 1 dry-run: solo propone y loguea a filing.jsonl — NO mueve archivos,
+    NO modifica el vault. La data acumulada entrena el ranker en fase 2
+    (cuando sumemos confirmación interactiva y --apply).
+    """
+    col = get_db()
+    if path:
+        full = Path(path) if path.startswith("/") else VAULT_PATH / path
+        notes = [full] if full.is_file() else []
+        if not notes:
+            msg = f"No existe: {full}"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+    else:
+        inbox_dir = VAULT_PATH / folder
+        if not inbox_dir.is_dir():
+            msg = f"No existe el folder: {inbox_dir}"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+        # Ordenar por mtime ascendente — las notas más viejas tienen
+        # prioridad (probablemente las más olvidadas).
+        notes = sorted(inbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
+        notes = notes[:1] if one else notes[:limit]
+
+    if not notes:
+        msg = f"Sin notas en {folder}."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+
+    proposals: list[dict] = []
+    for p in notes:
+        try:
+            rel = str(p.relative_to(VAULT_PATH))
+        except ValueError:
+            continue
+        prop = build_filing_proposal(col, rel, k=k)
+        proposals.append(prop)
+        _filing_log_proposal(prop)
+
+    if plain:
+        for i, pr in enumerate(proposals, 1):
+            if "error" in pr:
+                click.echo(f"{i}. {pr['path']}  [error: {pr['error']}]")
+                continue
+            conf = pr["confidence"]
+            tag = ("firm" if conf >= FILING_CONFIDENCE_FIRM
+                   else "tentative" if conf >= FILING_CONFIDENCE_TENTATIVE
+                   else "low")
+            click.echo(f"{i}. {pr['note']}  ({pr['path']})")
+            target = pr["folder"] or "(sin propuesta)"
+            click.echo(f"   -> {target}  (conf {conf:.2f}, {tag})")
+            if pr["upward_title"]:
+                click.echo(f"   ^ [[{pr['upward_title']}]] ({pr['upward_kind']})")
+        click.echo(f"\nlog: {FILING_LOG_PATH}")
+        return
+
+    console.print()
+    console.print(Rule(
+        title=f"[bold magenta]📥 {len(proposals)} propuesta(s) de filing[/bold magenta]",
+        style="magenta",
+    ))
+    for i, pr in enumerate(proposals, 1):
+        console.print()
+        if "error" in pr:
+            console.print(
+                f"[bold]{i}.[/bold] [red]{pr['path']}[/red] "
+                f"[dim](error: {pr['error']})[/dim]"
+            )
+            continue
+        console.print(
+            f"[bold]{i}.[/bold] [bold]{pr['note']}[/bold] "
+            f"[dim]({pr['path']})[/dim]"
+        )
+        conf = pr["confidence"]
+        if conf >= FILING_CONFIDENCE_FIRM:
+            style, label = "green", f"firm · {conf:.2f}"
+        elif conf >= FILING_CONFIDENCE_TENTATIVE:
+            style, label = "yellow", f"tentative · {conf:.2f}"
+        else:
+            style, label = "red", f"low · {conf:.2f}"
+        target = pr["folder"] or "(sin propuesta)"
+        console.print(
+            f"   [cyan]→[/cyan] [bold]{target}[/bold] "
+            f"[dim]·[/dim] [{style}]{label}[/{style}]"
+        )
+        if pr["upward_title"]:
+            badge = "📍 MOC" if pr["upward_kind"] == "moc" else "↔ nearest"
+            console.print(
+                f"   [cyan]↑[/cyan] [[[magenta]{pr['upward_title']}[/magenta]]] "
+                f"[dim]{badge}[/dim]"
+            )
+    console.print()
+    console.print(
+        f"[dim]Fase 1 dry-run — nada se movió. Log: {FILING_LOG_PATH}[/dim]"
+    )
 
 
 @cli.command()

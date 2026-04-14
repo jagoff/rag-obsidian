@@ -168,6 +168,9 @@ sequenceDiagram
     ISF->>URLs: _index_urls (extract + embed context)
     URLs->>Chroma: upsert urls rows
     ISF->>ISF: _invalidate_corpus_cache
+    opt path en 00-Inbox/
+        ISF->>Ambient: _ambient_hook<br/>(wikilinks auto + dupes/related ping)
+    end
 ```
 
 **Guardrail clave**: el chequeo de contradicción solo corre incremental. `rag index --reset` lo skipea automáticamente (sería O(n²) calls a command-r).
@@ -266,6 +269,61 @@ graph LR
 
 **Decisión clave**: las 3 fases usan `command-r` como judge (NO el helper). qwen2.5:3b dio false positives + JSON malformado — command-r hugs source text y responde parseable. Ver `CLAUDE.md` finding #2.
 
+### 3.3.5 Ambient Agent (hook reactivo de Inbox)
+
+Se dispara al final de `_index_single_file` cuando el path está en `00-Inbox/` y el hash cambió. Composición de primitivas existentes, **sin LLM extra**:
+
+```mermaid
+sequenceDiagram
+    participant ISF as _index_single_file<br/>(después de indexar)
+    participant H as _ambient_hook
+    participant Cfg as ambient.json
+    participant St as ambient_state.jsonl
+    participant WL as find_wikilink_<br/>suggestions
+    participant Ap as apply_wikilink_<br/>suggestions
+    participant DP as find_near_<br/>duplicates_for
+    participant RL as find_related
+    participant TG as Telegram API
+
+    ISF->>H: (col, path, doc_id, hash)
+    H->>Cfg: read
+    alt no config o enabled=false
+        H-->>ISF: no-op
+    end
+    H->>St: check (path+hash ya<br/>analizado <5min?)
+    alt dedup hit
+        H-->>ISF: skip
+    end
+    H->>H: parse_frontmatter<br/>(chequea ambient:skip /<br/>type: morning|digest|prep)
+    H->>WL: get suggestions
+    WL-->>H: [{title, target, offset}]
+    H->>Ap: auto-apply<br/>(regex determinística)
+    H->>DP: threshold=0.85
+    DP-->>H: [{note, similarity}]
+    H->>RL: self_meta
+    RL-->>H: [(meta, score, reason)]
+    H->>H: build compact message
+    alt hay findings
+        H->>TG: POST sendMessage<br/>(urllib, 10s timeout)
+    end
+    H->>St: record analyzed_at
+    H->>H: log event to ambient.jsonl
+```
+
+Ping de ejemplo en Telegram:
+
+```
+🤖 Ambient: [[caminata-ideas]]
+🔗 Linkeé 2: Ikigai, Moka
+⚠ Posibles duplicados:
+  · [[Ideas - caminata 2026-02]]  sim 0.88
+📎 Relacionadas:
+  · [[Coaching - Propósito]]  ×8 ↔#
+  · [[Músicos y ikigai]]  ×4 #
+```
+
+**Desacople clave**: rag.py hace POST directo a `api.telegram.org` (urllib, 10s timeout). NO depende del bot estando up — si el bot muere, el análisis corre y queda en `ambient.jsonl`; solo se pierde el ping.
+
 ### 3.4 Capture → Morning → Digest (el loop diario/semanal)
 
 ```mermaid
@@ -311,7 +369,7 @@ El loop se auto-alimenta: un brief matutino es una nota que podría aparecer en 
 
 ```mermaid
 flowchart TD
-    Input[user input en rag chat]
+    Input[user input en rag chat / bot]
     Input --> Q{/exit?}
     Q -->|sí| Exit[salir]
     Q -->|no| LnkI{detect_link_intent?}
@@ -458,6 +516,9 @@ Los tres servicios son **independientes**. Si `watch` muere, no afecta `morning`
 |---|---|---|
 | `queries.jsonl` | Cada `rag query`/`chat`/`links`/`dead` | `rag log`, `rag gaps`, `rag morning`, `rag digest`, `find_dead_notes` |
 | `contradictions.jsonl` | `_check_and_flag_contradictions` en indexing | `rag morning`, `rag digest` |
+| `ambient.jsonl` | `_ambient_hook` en cada save de Inbox | `rag ambient log` |
+| `ambient_state.jsonl` | `_ambient_state_record` tras cada hook | `_ambient_should_skip` (dedup 5min) |
+| `ambient.json` | `/enable_ambient` desde el bot | `_ambient_config` en rag.py |
 | `watch.log` | stdout de `rag watch` | `tail` manual |
 | `morning.log` | stdout de `rag morning` | `tail` manual |
 | `digest.log` | stdout de `rag digest` | `tail` manual |
@@ -491,7 +552,18 @@ graph LR
 
 Cada call a `rag_query` con `session_id` extiende la misma sesión que la CLI usa — estado compartido.
 
-### Telegram (`@ffeerrr_bot`)
+### Telegram — dos bots con roles distintos
+
+Dos bots conviven, cada uno dedicado a un rol. Ambos usan Whisper local para voz, ambos usan el `rag` CLI como data plane cuando hace falta.
+
+| Bot | Propósito | Voz sin caption | Captions extra |
+|---|---|---|---|
+| **@ffeerrr_bot** (`~/claude-telegram-bot`) | Conversación con Claude (general-purpose) | → Claude CLI | `/rag <q>` (texto), `/note` (captura) |
+| **@ragsystemobs_bot** (`~/obsidian-rag-bot`) | RAG voice-first sobre el vault | → RAG + respuesta por voz (macOS `say`) | `/note`, `/text` (skip TTS), `/rag <extra>`, `/claude` (fallback), `/force` |
+
+El segundo además expone los slash-commands de Ambient: `/enable_ambient`, `/disable_ambient`, `/ambient_status`.
+
+### Telegram (`@ffeerrr_bot`) — voice handler detallado
 
 ```mermaid
 flowchart TB

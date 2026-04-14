@@ -4557,6 +4557,36 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print("[dim](sin writes propuestos)[/dim]")
 
 
+_URLS_BACKFILL_DONE = False
+
+
+def _maybe_backfill_urls() -> None:
+    """Auto-backfill the URL sub-index when it's empty but the main collection
+    isn't — covers the "user upgraded past v0 and never ran `rag links
+    --rebuild`" path. Idempotent within a process; runs at most once.
+    """
+    global _URLS_BACKFILL_DONE
+    if _URLS_BACKFILL_DONE:
+        return
+    _URLS_BACKFILL_DONE = True
+    try:
+        col_urls = get_urls_db()
+        if col_urls.count() > 0:
+            return
+        main = get_db()
+        if main.count() == 0:
+            return
+    except Exception:
+        return
+    console.print(
+        "[dim]URL index vacío — backfill automático (~1 min)…[/dim]"
+    )
+    try:
+        _rebuild_urls_index()
+    except Exception as e:
+        console.print(f"[yellow]Backfill falló: {e}[/yellow]")
+
+
 def find_urls(
     query: str,
     k: int = 10,
@@ -4569,7 +4599,12 @@ def find_urls(
     query like "documentación de claude code" matches notes that introduce or
     annotate the relevant link. Reranks the top candidates against the query
     with the cross-encoder, dedups by URL, returns up to k items.
+
+    First-call autopilot: if the URL collection is empty but the vault is
+    indexed, runs `_rebuild_urls_index` silently so the user never has to
+    remember `rag links --rebuild` after upgrading.
     """
+    _maybe_backfill_urls()
     col_urls = get_urls_db()
     if col_urls.count() == 0:
         return []
@@ -5189,6 +5224,152 @@ def wikilinks_suggest(
         console.print(
             f"\n[green]✓ Aplicado:[/green] {total_suggestions} wikilinks en "
             f"{notes_applied}/{len(paths)} notas."
+        )
+
+
+# ── AUTOMATION (launchd) ─────────────────────────────────────────────────────
+# Two services keep the RAG alive without manual rituals:
+#  - obsidian-rag-watch: runs `rag watch` (auto-reindex on vault changes).
+#  - obsidian-rag-digest: weekly `rag digest`, Sunday 22:00 local.
+# Both managed by `rag setup` / `rag setup --remove`. Idempotent reload on each
+# install. Logs land in ~/.local/share/obsidian-rag/ for tail-ability.
+
+_LAUNCH_AGENTS_DIR = Path.home() / "Library/LaunchAgents"
+_RAG_LOG_DIR = Path.home() / ".local/share/obsidian-rag"
+
+
+def _rag_binary() -> str:
+    """Best-effort path to the installed `rag` binary. Default uv tool path
+    first; fall back to PATH lookup. The launchd service runs without our
+    interactive PATH so we resolve it once at install time.
+    """
+    candidates = [
+        Path.home() / ".local/bin/rag",
+        Path("/usr/local/bin/rag"),
+        Path("/opt/homebrew/bin/rag"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    import shutil
+    found = shutil.which("rag")
+    return found or str(candidates[0])
+
+
+def _watch_plist(rag_bin: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/watch.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/watch.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _digest_plist(rag_bin: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-digest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>digest</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>22</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/digest.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/digest.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
+    """Return [(label, plist_filename, plist_xml), ...]."""
+    return [
+        ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
+         _watch_plist(rag_bin)),
+        ("com.fer.obsidian-rag-digest", "com.fer.obsidian-rag-digest.plist",
+         _digest_plist(rag_bin)),
+    ]
+
+
+@cli.command()
+@click.option("--remove", is_flag=True,
+              help="Desinstalar los servicios en lugar de instalarlos")
+def setup(remove: bool):
+    """Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo
+    sin intervención: `rag watch` (auto-reindex) y `rag digest` (semanal).
+    Idempotente — re-correr lo recarga.
+    """
+    import subprocess
+    rag_bin = _rag_binary()
+    if not Path(rag_bin).is_file():
+        console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
+        console.print("[dim]Instalá primero: uv tool install --reinstall --editable .[/dim]")
+        return
+    _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    _RAG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    for label, fname, content in _services_spec(rag_bin):
+        plist_path = _LAUNCH_AGENTS_DIR / fname
+        # Always unload first so a stale version doesn't linger after reinstall.
+        if plist_path.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist_path)],
+                check=False, capture_output=True,
+            )
+        if remove:
+            if plist_path.exists():
+                plist_path.unlink()
+                console.print(f"[green]✓[/green] removido: {label}")
+            else:
+                console.print(f"[dim]· no estaba instalado: {label}[/dim]")
+            continue
+        plist_path.write_text(content, encoding="utf-8")
+        try:
+            subprocess.run(
+                ["launchctl", "load", str(plist_path)],
+                check=True, capture_output=True,
+            )
+            console.print(f"[green]✓[/green] cargado: [bold]{label}[/bold]")
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="ignore") if e.stderr else ""
+            console.print(f"[red]✗[/red] falló cargar {label}: {stderr.strip()}")
+
+    if not remove:
+        console.print()
+        console.print(
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest}}.{{log,error.log}}[/dim]"
         )
 
 

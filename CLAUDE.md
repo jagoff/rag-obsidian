@@ -49,6 +49,10 @@ rag dupes [--threshold 0.85] [--folder X]   # pairs of notes with similar centro
 rag inbox [--apply]                         # triage 00-Inbox: folder + tags + wikilinks + dupes
 rag prep "tema o persona" [--save]          # context brief from vault, optionally saved to 00-Inbox/
 
+# Automation (launchd)
+rag setup            # install com.fer.obsidian-rag-{watch,digest} launchd services
+rag setup --remove   # uninstall both
+
 # Quality + observability
 rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
 rag log [-n 20] [--low-confidence]
@@ -130,6 +134,17 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 ### Agent mode (`rag do`)
 
 `rag do "instrucción"` runs a tool-calling loop with command-r. Tools exposed: `_agent_tool_search` (calls `retrieve()`), `_agent_tool_read_note`, `_agent_tool_list_notes`, `_agent_tool_propose_write`. Writes are NOT applied during the loop — they accumulate in `_AGENT_PENDING_WRITES` and the user confirms each at the end (skip with `--yes`, cap iterations with `--max-iterations`, default 8). No delete/move tools by design — first version is conservative.
+
+### Automation (launchd)
+
+Two services keep the RAG running without manual rituals — installed by `rag setup`, removed by `rag setup --remove`. Both are idempotent on reinstall (unload then load). Logs land in `~/.local/share/obsidian-rag/{watch,digest}.{log,error.log}`.
+
+- **`com.fer.obsidian-rag-watch`** — runs `rag watch` continuously (`RunAtLoad + KeepAlive`). Re-indexes on every vault save (debounce 3s). Removes the manual "did I `rag index` after that batch of edits?" friction.
+- **`com.fer.obsidian-rag-digest`** — runs `rag digest` every Sunday 22:00 local. Generates `05-Reviews/YYYY-WNN.md` automatically. Honours `NO_COLOR=1` and `TERM=dumb` so logs stay readable.
+
+Plist generation uses absolute paths to the `rag` binary resolved at install time (`_rag_binary()` checks `~/.local/bin/rag`, `/usr/local/bin/rag`, `/opt/homebrew/bin/rag`, then `shutil.which`). The launchd PATH includes Homebrew + uv tool dirs so subprocess hops (e.g., `ollama`) resolve too.
+
+Auto-backfill: `find_urls()` calls `_maybe_backfill_urls()` once per process — if the URL collection is empty but the main collection isn't, the URL sub-index rebuilds itself silently (~1 min). No more "did I run `rag links --rebuild` after upgrading?" tax.
 
 ### Daily-productivity layer
 

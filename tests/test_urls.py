@@ -94,7 +94,15 @@ def urls_col(tmp_path, fake_embed, fake_reranker, monkeypatch):
     c = client.get_or_create_collection(
         name="urls_test", metadata={"hnsw:space": "cosine"}
     )
+    main = client.get_or_create_collection(
+        name="urls_test_main", metadata={"hnsw:space": "cosine"}
+    )
     monkeypatch.setattr(rag, "get_urls_db", lambda: c)
+    # The auto-backfill in find_urls peeks at get_db() — point it at an
+    # empty tmp collection too so backfill never touches the real vault.
+    monkeypatch.setattr(rag, "get_db", lambda: main)
+    # Reset the per-process backfill latch so each test starts clean.
+    monkeypatch.setattr(rag, "_URLS_BACKFILL_DONE", False)
     return c
 
 

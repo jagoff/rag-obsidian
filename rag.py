@@ -4671,11 +4671,20 @@ def _arrow_select(
 
     Fallback no-TTY (pipes, tests, CI): retorna default_idx sin prompt.
     Implementado con termios + rich.Live, sin agregar dependencias.
+
+    Notas técnicas:
+      - `tty.setcbreak` (NO setraw): mantiene OPOST activo así los \\n
+        se traducen a \\r\\n correctamente. Con setraw el output era una
+        sola línea apilando todo a la derecha (bug confirmado en uso).
+      - `auto_refresh=False` + `refresh=True` explícito: el background
+        timer de Live causaba redibujado innecesario; en cbreak mode
+        eso provoca duplicados visuales. Solo refrescamos en keypress.
     """
     import sys
     if not sys.stdin.isatty():
         return default_idx
 
+    import select as _select_mod
     import termios
     import tty
 
@@ -4691,22 +4700,27 @@ def _arrow_select(
             else:
                 out.append("    ")
                 out.append(label + "\n")
-        out.append("\n[↑/↓ navegar · Enter elegir · Esc/q cancelar]", style="dim")
+        out.append("[↑/↓ navegar · Enter elegir · q cancelar]", style="dim")
         return out
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     from rich.live import Live
     try:
-        tty.setraw(fd)
-        with Live(_render(), console=console, refresh_per_second=30,
-                  transient=True) as live:
+        tty.setcbreak(fd)
+        with Live(
+            _render(),
+            console=console,
+            auto_refresh=False,
+            transient=True,
+        ) as live:
             while True:
-                ch = sys.stdin.read(1)
+                try:
+                    ch = sys.stdin.read(1)
+                except KeyboardInterrupt:
+                    return -1
                 if ch == "\x1b":   # ESC o secuencia
-                    # Leer hasta 2 chars más sin bloquear si no llegan.
-                    import select as _select
-                    if _select.select([sys.stdin], [], [], 0.05)[0]:
+                    if _select_mod.select([sys.stdin], [], [], 0.05)[0]:
                         seq = sys.stdin.read(2)
                         if seq == "[A":
                             selected = (selected - 1) % len(choices)
@@ -4717,13 +4731,15 @@ def _arrow_select(
                         return -1   # ESC bare → cancelar
                 elif ch in ("\r", "\n"):
                     return selected
-                elif ch in ("\x03", "q"):   # Ctrl-C, q
+                elif ch == "q":
                     return -1
                 elif ch == "k":   # vim-style up
                     selected = (selected - 1) % len(choices)
                 elif ch == "j":   # vim-style down
                     selected = (selected + 1) % len(choices)
-                live.update(_render())
+                live.update(_render(), refresh=True)
+    except KeyboardInterrupt:
+        return -1
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 

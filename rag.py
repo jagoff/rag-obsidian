@@ -853,6 +853,21 @@ def _invalidate_corpus_cache() -> None:
     _corpus_cache = None
 
 
+def _folder_matches(file_path: str, folder: str) -> bool:
+    """Match a file against a folder filter, always widening to 00-Inbox.
+
+    Inbox is a staging folder, not a topic — captures there haven't been
+    filed yet, so by construction they can be about *any* topic. Excluding
+    them from a folder-filtered search hides fresh context silently. This
+    bit us asking "como activo claude peers?" where infer_filters auto-
+    applied `folder=03-Resources/Claude` and the inbox note about the
+    claude-peers MCP was dropped.
+    """
+    if folder in file_path:
+        return True
+    return file_path.startswith(_CAPTURE_FOLDER + "/")
+
+
 def bm25_search(col: chromadb.Collection, query: str, k: int, folder: str | None, tag: str | None = None) -> list[str]:
     """Keyword search using BM25 over the full collection."""
     c = _load_corpus(col)
@@ -865,7 +880,7 @@ def bm25_search(col: chromadb.Collection, query: str, k: int, folder: str | None
     if folder or tag:
         valid = [
             i for i, m in enumerate(metas)
-            if (not folder or folder in m.get("file", ""))
+            if (not folder or _folder_matches(m.get("file", ""), folder))
             and (not tag or tag in m.get("tags", ""))
         ]
         if not valid:
@@ -1059,7 +1074,7 @@ def _filter_files(metas: list[dict], tag: str | None, folder: str | None) -> lis
             tags_list = [t.strip() for t in (m.get("tags") or "").split(",") if t.strip()]
             if tag not in tags_list:
                 continue
-        if folder and folder not in f:
+        if folder and not _folder_matches(f, folder):
             continue
         seen[f] = m
     return list(seen.values())
@@ -2366,10 +2381,18 @@ def reformulate_query(question: str, history: list[dict]) -> str:
 
 
 def build_where(folder: str | None, tag: str | None) -> dict | None:
-    """Build ChromaDB where filter from folder and/or tag."""
+    """Build ChromaDB where filter from folder and/or tag.
+
+    Folder is widened with `$or` to include 00-Inbox — rationale in
+    `_folder_matches`. If the user *explicitly* filtered to Inbox, the OR
+    is a no-op (same set twice), so the extra clause is harmless.
+    """
     conditions = []
     if folder:
-        conditions.append({"file": {"$contains": folder}})
+        conditions.append({"$or": [
+            {"file": {"$contains": folder}},
+            {"file": {"$contains": _CAPTURE_FOLDER + "/"}},
+        ]})
     if tag:
         conditions.append({"tags": {"$contains": tag}})
     if not conditions:

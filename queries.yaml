@@ -16,6 +16,7 @@ queries:
   - question: "qué reranker tiene el sistema"
     expected:
       - 03-Resources/Obsidian RAG Local.md
+      - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag.md
 
   - question: "cómo se indexan las notas en el vault"
     expected:

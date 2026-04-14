@@ -148,7 +148,11 @@ def render_response(text: str) -> Text:
         append_with_links(text[pos:])
     return out
 
-VAULT_PATH = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+# Multi-vault: `OBSIDIAN_RAG_VAULT` env var overrides the default iCloud vault.
+# Collections are namespaced per vault path so switching doesn't pollute the
+# index — fresh vault = fresh collection automatically.
+_DEFAULT_VAULT = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes"
+VAULT_PATH = Path(os.environ.get("OBSIDIAN_RAG_VAULT", str(_DEFAULT_VAULT)))
 DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 
@@ -168,7 +172,13 @@ EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
 CHAT_MODEL_PREFERENCE = ("command-r:latest", "qwen2.5:14b", "phi4:latest")
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-COLLECTION_NAME = "obsidian_notes_v6"  # v6: larger chunks (150-800), parent-in-metadata
+_COLLECTION_BASE = "obsidian_notes_v7"  # v7: wikilinks (outlinks) in metadata
+# Per-vault suffix so multiple vaults don't share a collection.
+_vault_slug = hashlib.sha256(str(VAULT_PATH.resolve()).encode()).hexdigest()[:8]
+COLLECTION_NAME = (
+    _COLLECTION_BASE if str(VAULT_PATH.resolve()) == str(_DEFAULT_VAULT.resolve())
+    else f"{_COLLECTION_BASE}_{_vault_slug}"
+)
 
 # Deterministic decoding — this is a retrieval tool, not creative writing.
 # num_ctx dimensionado al prompt real (system ~500 tokens + 5 chunks × ~300
@@ -284,6 +294,24 @@ def clean_md(text: str) -> str:
     text = re.sub(r"^---\n.*?\n---\n", "", text, flags=re.DOTALL)
     text = re.sub(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", r"\1", text)
     return text.strip()
+
+
+# Obsidian [[Link]] or [[Link#Section]] or [[Link|Alias]] — capture the target note title.
+WIKILINK_RE = re.compile(r"\[\[([^\]|#^]+)(?:[#^][^\]|]*)?(?:\|[^\]]+)?\]\]")
+
+
+def extract_wikilinks(text: str) -> list[str]:
+    """Return unique note titles referenced by Obsidian wikilinks in `text`,
+    order preserved. Run on RAW note content (before clean_md strips links).
+    Frontmatter `related:` wikilinks are already included via the YAML being
+    part of `text`.
+    """
+    seen: list[str] = []
+    for m in WIKILINK_RE.finditer(text):
+        title = m.group(1).strip()
+        if title and title not in seen:
+            seen.append(title)
+    return seen
 
 
 def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str:
@@ -477,6 +505,10 @@ def _load_corpus(col: chromadb.Collection) -> dict:
 
     tags: set[str] = set()
     folders: set[str] = set()
+    title_to_paths: dict[str, set[str]] = {}
+    outlinks: dict[str, list[str]] = {}   # path → list of linked note titles
+    backlinks: dict[str, set[str]] = {}   # note title → set of paths that link to it
+
     for m in metas:
         for t in (m.get("tags") or "").split(","):
             t = t.strip()
@@ -485,10 +517,24 @@ def _load_corpus(col: chromadb.Collection) -> dict:
         f = m.get("folder")
         if f:
             folders.add(f)
+        path = m.get("file", "")
+        title = m.get("note", "")
+        if title and path:
+            title_to_paths.setdefault(title, set()).add(path)
+        if path not in outlinks:
+            raw_links = [
+                ln.strip() for ln in (m.get("outlinks") or "").split(",") if ln.strip()
+            ]
+            outlinks[path] = raw_links
+            for t in raw_links:
+                backlinks.setdefault(t, set()).add(path)
 
     _corpus_cache = {
         "count": n, "ids": ids, "docs": docs, "metas": metas,
         "bm25": bm25, "tags": tags, "folders": folders,
+        "title_to_paths": title_to_paths,
+        "outlinks": outlinks,    # path → [linked titles]
+        "backlinks": backlinks,  # title → {paths that link to it}
     }
     return _corpus_cache
 
@@ -545,8 +591,9 @@ def get_reranker():
     """Lazy-load cross-encoder reranker on the best available accelerator.
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
     auto-detect falls back to CPU in some venvs, costing ~3× on rerank.
-    fp16 halves memory + latency on Apple MPS with no quality hit for this
-    model size.
+
+    NOTE: fp16 on MPS breaks bge-reranker-v2-m3 (collapses all scores to
+    ~0.001, verified empirically on 2026-04-13). Keep fp32.
     """
     global _reranker
     if _reranker is None:
@@ -558,12 +605,7 @@ def get_reranker():
             device = "cuda"
         else:
             device = "cpu"
-        _reranker = CrossEncoder(
-            RERANKER_MODEL,
-            max_length=512,
-            device=device,
-            model_kwargs={"torch_dtype": torch.float16} if device != "cpu" else None,
-        )
+        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
     return _reranker
 
 
@@ -605,6 +647,44 @@ def expand_queries(question: str) -> list[str]:
     lines = [l.strip(" -*·") for l in resp.message.content.splitlines() if l.strip()]
     variants = [question] + [l for l in lines if l != question][:2]
     return variants
+
+
+_RECENCY_RE = re.compile(
+    r"\b(?:recient(?:es?|emente)|[uú]ltim[aos]{1,2}|[uú]ltimamente|hoy|ayer|"
+    r"esta\s+semana|este\s+mes|este\s+a[nñ]o|del?\s+mes\s+pasado|reci[eé]n|"
+    r"en\s+el\s+[uú]ltimo\s+(?:mes|a[nñ]o))\b",
+    re.IGNORECASE,
+)
+
+
+def has_recency_cue(question: str) -> bool:
+    """True when the query asks for time-sorted results — triggers a recency
+    boost in the reranker composite score.
+    """
+    return bool(_RECENCY_RE.search(question))
+
+
+def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
+    """Exponential decay based on `modified` frontmatter. Returns a value in
+    [0, 1] — 1 if edited today, 0.5 after `half_life_days`, 0 for very old.
+    Falls back to `created` if `modified` is missing.
+    """
+    stamp = meta.get("modified") or meta.get("created") or ""
+    if not stamp:
+        return 0.0
+    try:
+        # Accept ISO strings like "2026-04-13T16:50:16-03:00" or date-only.
+        from datetime import datetime as _dt
+        dt = _dt.fromisoformat(stamp.replace("Z", "+00:00"))
+    except Exception:
+        return 0.0
+    try:
+        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+    except Exception:
+        return 0.0
+    import math
+    return math.exp(-math.log(2) * age_days / half_life_days)
 
 
 _INTENT_COUNT_RE = re.compile(r"\b(cu[aá]nt[aos]s?|how many)\b", re.IGNORECASE)
@@ -859,15 +939,20 @@ def find_related(
     col: chromadb.Collection,
     source_metas: list[dict],
     limit: int = 5,
-    min_shared: int = 2,
-) -> list[tuple[dict, int]]:
-    """Return up to `limit` notes related to the sources by shared tags.
+) -> list[tuple[dict, int, str]]:
+    """Return up to `limit` notes related to the sources.
 
-    Score = number of tags shared with the UNION of source tags. Notes that
-    appear in sources are excluded. Ties broken by folder proximity
-    (same top-level folder as any source ranks higher).
+    Score combines two signals:
+      - shared_tags: count of tags shared with the union of source tags
+      - graph_hops: 2× if directly linked from source (outlink), 2× if linked
+        TO source (backlink), 0 otherwise. Graph edges are strong signal —
+        Obsidian users link deliberately.
+    Tie-break: same top-level folder as any source.
+    Returns tuples of (meta, composite_score, reason) where reason is
+    'tags', 'link', or 'tags+link' for the UI.
     """
     source_paths = {m.get("file", "") for m in source_metas}
+    source_titles = {m.get("note", "") for m in source_metas if m.get("note")}
     source_tags: set[str] = set()
     source_roots: set[str] = set()
     for m in source_metas:
@@ -879,28 +964,49 @@ def find_related(
         if "/" in f:
             source_roots.add(f.split("/", 1)[0])
 
-    if not source_tags:
-        return []
-
     c = _load_corpus(col)
-    candidates: dict[str, tuple[dict, int, int]] = {}
+
+    # Graph: collect paths connected to any source via outlink or backlink.
+    linked_paths: dict[str, int] = {}  # path → link weight (1 per edge)
+    # Outlinks: source → titles → resolve to paths via title_to_paths
+    for src in source_metas:
+        src_path = src.get("file", "")
+        for target_title in c["outlinks"].get(src_path, []):
+            for target_path in c["title_to_paths"].get(target_title, set()):
+                if target_path in source_paths:
+                    continue
+                linked_paths[target_path] = linked_paths.get(target_path, 0) + 1
+    # Backlinks: notes that link TO a source title
+    for title in source_titles:
+        for linker_path in c["backlinks"].get(title, set()):
+            if linker_path in source_paths:
+                continue
+            linked_paths[linker_path] = linked_paths.get(linker_path, 0) + 1
+
+    candidates: dict[str, tuple[dict, int, int, str]] = {}
     for m in c["metas"]:
         f = m.get("file", "")
         if f in source_paths or f in candidates or is_excluded(f):
             continue
         tags = [t.strip() for t in (m.get("tags") or "").split(",") if t.strip()]
-        shared = len(source_tags.intersection(tags))
-        if shared < min_shared:
+        shared = len(source_tags.intersection(tags)) if source_tags else 0
+        link_hits = linked_paths.get(f, 0)
+        if shared < 2 and link_hits == 0:
             continue
+        # Graph weight = 2× per edge — deliberate links > tag co-occurrence.
+        score = shared + 2 * link_hits
+        reason = (
+            "tags+link" if shared >= 2 and link_hits > 0
+            else "link" if link_hits > 0 else "tags"
+        )
         root_match = 1 if f.split("/", 1)[0] in source_roots else 0
-        candidates[f] = (m, shared, root_match)
+        candidates[f] = (m, score, root_match, reason)
 
-    # Sort: most shared tags → same top-folder → alphabetical
     ranked = sorted(
         candidates.values(),
         key=lambda x: (-x[1], -x[2], x[0].get("file", "")),
     )
-    return [(m, shared) for m, shared, _ in ranked[:limit]]
+    return [(m, score, reason) for m, score, _, reason in ranked[:limit]]
 
 
 INBOX_FOLDER = "00-Inbox"
@@ -1012,19 +1118,26 @@ def save_note(
     return path
 
 
-def render_related(related: list[tuple[dict, int]]) -> None:
-    """Print a compact panel of related notes with shared-tag counts."""
+def render_related(related: list[tuple[dict, int, str]]) -> None:
+    """Print a compact panel of related notes with score + reason badge."""
     if not related:
         return
     console.print()
     console.print(Rule(title="[dim]Relacionadas[/dim]", style="dim", characters="╌"))
     tbl = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
-    tbl.add_column(style="dim", justify="right")
-    tbl.add_column(style="bold magenta")
-    tbl.add_column(style="cyan dim")
-    for m, shared in related:
+    tbl.add_column(style="dim", justify="right")   # score
+    tbl.add_column(style="dim italic")              # reason badge
+    tbl.add_column(style="bold magenta")            # note title
+    tbl.add_column(style="cyan dim")                # path
+    reason_style = {
+        "link": "[bold blue]↔[/bold blue]",
+        "tags": "[yellow]#[/yellow]",
+        "tags+link": "[bold blue]↔[/bold blue][yellow]#[/yellow]",
+    }
+    for m, score, reason in related:
         tbl.add_row(
-            f"×{shared}",
+            f"×{score}",
+            reason_style.get(reason, ""),
             m.get("note", ""),
             m.get("file", ""),
         )
@@ -1178,12 +1291,20 @@ def retrieve(
     reranker = get_reranker()
     pairs = [(question, e) for e in expanded]
     scores = reranker.predict(pairs, show_progress_bar=False)
-    scored = sorted(
-        zip(candidates, expanded, scores),
-        key=lambda x: float(x[2]),
-        reverse=True,
-    )[:k]
-    final_scores = [float(s) for _, _, s in scored]
+
+    # Recency boost: when the query carries a temporal cue ("últimamente",
+    # "este mes", "recientes"…), reweight by how fresh each note is. Small
+    # additive (<=0.1) — enough to break ties toward recent notes without
+    # overwhelming strong reranker signal.
+    apply_recency = has_recency_cue(question)
+    final_pairs: list[tuple] = []
+    for c, e, s in zip(candidates, expanded, scores):
+        final = float(s)
+        if apply_recency:
+            final += 0.1 * recency_boost(c[1])
+        final_pairs.append((c, e, final))
+    scored = sorted(final_pairs, key=lambda x: x[2], reverse=True)[:k]
+    final_scores = [s for _, _, s in scored]
     top_score = final_scores[0] if final_scores else float("-inf")
     docs = [e for _, e, _ in scored]
     metas = [c[1] for c, _, _ in scored]
@@ -1248,6 +1369,7 @@ def _index_single_file(col: chromadb.Collection, path: Path) -> str:
     folder = str(path.relative_to(VAULT_PATH).parent)
     fm = parse_frontmatter(raw)
     tags = [str(t) for t in (fm.get("tags") or []) if t]
+    outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
     text = clean_md(raw)
     chunks = semantic_chunks(text, path.stem, folder, tags, fm)
     if not chunks:
@@ -1263,6 +1385,7 @@ def _index_single_file(col: chromadb.Collection, path: Path) -> str:
     base_meta = {
         "file": doc_id_prefix, "note": path.stem, "folder": folder,
         "tags": ",".join(tags), "hash": h,
+        "outlinks": ",".join(outlinks),
     }
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -1334,6 +1457,7 @@ def index(reset: bool):
 
         fm = parse_frontmatter(raw)
         tags = [str(t) for t in (fm.get("tags") or []) if t]
+        outlinks = extract_wikilinks(raw)
         text = clean_md(raw)
         chunks = semantic_chunks(text, path.stem, folder, tags, fm)
         if not chunks:
@@ -1353,6 +1477,7 @@ def index(reset: bool):
             "folder": folder,
             "tags": ",".join(tags),
             "hash": h,
+            "outlinks": ",".join(outlinks),
         }
         for field in FM_SEARCHABLE_FIELDS:
             v = fm.get(field)
@@ -1859,6 +1984,393 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         f"[bold]recall@{k}:[/bold] {recall_at_k:.2%}  ·  "
         f"[dim]n={n}[/dim]"
     )
+
+
+@cli.command()
+@click.argument("path")
+@click.option("--apply", is_flag=True, help="Escribir los tags al frontmatter (por defecto solo imprime)")
+@click.option("--max-tags", default=6, help="Cantidad máxima de tags a sugerir")
+def autotag(path: str, apply: bool, max_tags: int):
+    """Sugerir tags para una nota usando el vocabulario existente del vault.
+
+    El helper model (qwen2.5:3b) ve los tags ya usados en el índice + el
+    contenido de la nota y elige los que encajen. No inventa tags nuevos —
+    mantiene consistencia con la taxonomía del vault.
+    """
+    note_path = VAULT_PATH / path if not path.startswith("/") else Path(path)
+    if not note_path.is_file():
+        console.print(f"[red]Nota no encontrada:[/red] {note_path}")
+        return
+
+    col = get_db()
+    c = _load_corpus(col)
+    vocab = sorted(c["tags"])
+    raw = note_path.read_text(encoding="utf-8", errors="ignore")
+    fm = parse_frontmatter(raw)
+    current_tags = [str(t) for t in (fm.get("tags") or []) if t]
+    body = clean_md(raw)[:3000]
+
+    prompt = (
+        "Sos un asistente que etiqueta notas personales. Elegí entre 3 y "
+        f"{max_tags} tags DEL VOCABULARIO EXISTENTE que mejor describan esta nota. "
+        "NO inventes tags nuevos. Devolvé SOLO una lista YAML de strings, "
+        "sin explicación.\n\n"
+        f"VOCABULARIO ({len(vocab)} tags): {', '.join(vocab)}\n\n"
+        f"TÍTULO: {note_path.stem}\n\n"
+        f"CONTENIDO:\n{body}\n\n"
+        "TAGS:"
+    )
+
+    resp = ollama.chat(
+        model=HELPER_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options=HELPER_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    answer = resp.message.content.strip()
+
+    # Parse: expect "- tag1\n- tag2" or "[tag1, tag2]" or plain list.
+    vocab_set = {t.lower() for t in vocab}
+    picked: list[str] = []
+    for line in answer.splitlines():
+        line = line.strip().strip("-*[]").strip().strip(",").strip("'\"")
+        if not line:
+            continue
+        for tok in re.split(r"[,\s]+", line):
+            tok = tok.strip("#'\"").lower()
+            if tok in vocab_set and tok not in picked:
+                picked.append(tok)
+        if len(picked) >= max_tags:
+            break
+
+    if not picked:
+        console.print("[yellow]El modelo no devolvió tags del vocabulario.[/yellow]")
+        console.print(f"[dim]Respuesta raw: {answer[:200]}[/dim]")
+        return
+
+    merged = list(dict.fromkeys([*current_tags, *picked]))[:max_tags]
+    new_tags = [t for t in picked if t not in current_tags]
+
+    console.print(f"[bold cyan]Nota:[/bold cyan] {path}")
+    console.print(f"[dim]Tags actuales:[/dim] {current_tags or '—'}")
+    console.print(f"[bold green]Sugeridos:[/bold green] {picked}")
+    console.print(f"[bold]Nuevos a añadir:[/bold] {new_tags or '—'}")
+
+    if not apply or not new_tags:
+        return
+
+    # Rewrite frontmatter with merged tag list.
+    if raw.startswith("---\n"):
+        end = raw.find("\n---\n", 4)
+        if end < 0:
+            console.print("[red]Frontmatter mal formado, no se modifica.[/red]")
+            return
+        fm_text = raw[4:end]
+        rest = raw[end + 5:]
+        # Replace or insert tags: key — yaml.safe_dump-ish but we want to
+        # preserve the rest of the frontmatter verbatim.
+        new_fm_lines: list[str] = []
+        skipped_tags = False
+        in_tag_block = False
+        for line in fm_text.splitlines():
+            if in_tag_block and re.match(r"^\s*-\s+", line):
+                continue  # drop old tag items
+            in_tag_block = False
+            if re.match(r"^tags\s*:", line):
+                in_tag_block = True
+                skipped_tags = True
+                continue
+            new_fm_lines.append(line)
+        new_fm_lines.append("tags:")
+        for t in merged:
+            new_fm_lines.append(f"- {t}")
+        new_raw = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + rest
+    else:
+        # No frontmatter — prepend one.
+        fm_block = "---\ntags:\n" + "\n".join(f"- {t}" for t in merged) + "\n---\n\n"
+        new_raw = fm_block + raw
+
+    note_path.write_text(new_raw, encoding="utf-8")
+    console.print(f"[green]✓ Frontmatter actualizado.[/green]")
+    _index_single_file(col, note_path)
+
+
+@cli.command()
+@click.option("--threshold", default=CONFIDENCE_RERANK_MIN,
+              help=f"Queries con top_score ≤ este umbral se consideran 'gap' (default: {CONFIDENCE_RERANK_MIN})")
+@click.option("--min-count", default=2, help="Queries mínimas por cluster para reportar")
+@click.option("--days", default=60, help="Ventana de log a analizar (default: 60)")
+def gaps(threshold: float, min_count: int, days: int):
+    """Detectar temas consultados repetidamente sin respuesta en el vault.
+
+    Agrupa queries low-confidence del log (confidence ≤ threshold) por
+    similaridad de embedding. Cada cluster con ≥min-count apariciones es un
+    candidato a nota nueva.
+    """
+    if not LOG_PATH.is_file():
+        console.print("[yellow]No hay log todavía.[/yellow]")
+        return
+    from datetime import timedelta as _td
+    cutoff = datetime.now() - _td(days=days)
+
+    entries = []
+    for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        score = e.get("top_score")
+        if score is None or score > threshold:
+            continue
+        try:
+            ts = datetime.fromisoformat(e.get("ts", ""))
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        q = e.get("q", "").strip()
+        if q:
+            entries.append({"q": q, "ts": ts, "score": score})
+
+    if not entries:
+        console.print("[green]No hay gaps persistentes en la ventana analizada.[/green]")
+        return
+
+    # Dedupe near-identical queries by lowercase stem, then cluster by
+    # embedding similarity (cheap — N low-conf queries is small).
+    queries_unique: list[str] = []
+    query_counts: dict[str, int] = {}
+    for e in entries:
+        key = " ".join(_tokenize(e["q"]))
+        if key not in query_counts:
+            queries_unique.append(e["q"])
+            query_counts[key] = 0
+        query_counts[key] += 1
+
+    if len(queries_unique) == 1:
+        q = queries_unique[0]
+        count = list(query_counts.values())[0]
+        if count >= min_count:
+            console.print(
+                f"[yellow]Gap:[/yellow] [bold]{q}[/bold] "
+                f"[dim](×{count})[/dim]"
+            )
+            console.print("[dim]Sugerencia: creá una nota sobre este tema.[/dim]")
+        return
+
+    # Cluster by cosine similarity on embeddings.
+    embeddings = embed(queries_unique)
+    clusters: list[list[int]] = []
+    assigned = [False] * len(queries_unique)
+    for i in range(len(queries_unique)):
+        if assigned[i]:
+            continue
+        group = [i]
+        assigned[i] = True
+        for j in range(i + 1, len(queries_unique)):
+            if assigned[j]:
+                continue
+            if cosine_sim(embeddings[i], embeddings[j]) >= 0.75:
+                group.append(j)
+                assigned[j] = True
+        clusters.append(group)
+
+    # Rank clusters by total query count.
+    cluster_rows: list[tuple[int, list[str]]] = []
+    for group in clusters:
+        total = sum(
+            query_counts.get(" ".join(_tokenize(queries_unique[idx])), 0)
+            for idx in group
+        )
+        if total < min_count:
+            continue
+        sample = [queries_unique[idx] for idx in group]
+        cluster_rows.append((total, sample))
+    cluster_rows.sort(key=lambda x: -x[0])
+
+    if not cluster_rows:
+        console.print("[green]No hay gaps persistentes (todos los grupos < min-count).[/green]")
+        return
+
+    console.print(
+        f"[bold yellow]Gaps detectados[/bold yellow] "
+        f"[dim]({len(cluster_rows)} cluster(s), últimos {days} días)[/dim]"
+    )
+    console.print()
+    for total, samples in cluster_rows:
+        console.print(f"  [bold magenta]×{total}[/bold magenta]  {samples[0]}")
+        for s in samples[1:4]:
+            console.print(f"         [dim]· {s}[/dim]")
+        if len(samples) > 4:
+            console.print(f"         [dim]· … {len(samples) - 4} variantes más[/dim]")
+        console.print()
+    console.print(
+        "[dim]Cada cluster es un tema que consultaste sin encontrar respuesta — "
+        "candidato a una nota nueva.[/dim]"
+    )
+
+
+@cli.command()
+@click.argument("query", required=False)
+@click.option("--tag", default=None, help="Filtrar por tag")
+@click.option("--folder", default=None, help="Filtrar por carpeta")
+@click.option("--limit", default=30, help="Cantidad de notas a mostrar")
+def timeline(query: str | None, tag: str | None, folder: str | None, limit: int):
+    """Ver notas ordenadas por fecha de modificación (más recientes primero).
+
+    Opcionalmente filtrable por tag, carpeta o query semántica. Usa
+    frontmatter `modified` — si falta, cae a `created`.
+    """
+    col = get_db()
+    c = _load_corpus(col)
+    if query:
+        # Rank by semantic similarity first, then show with dates.
+        result = retrieve(
+            col, query, limit, folder, tag=tag,
+            precise=False, multi_query=True, auto_filter=False,
+        )
+        files = []
+        seen = set()
+        for m in result["metas"]:
+            f = m.get("file", "")
+            if f in seen or is_excluded(f):
+                continue
+            seen.add(f)
+            files.append(m)
+    else:
+        files = _filter_files(c["metas"], tag, folder)
+
+    files.sort(
+        key=lambda m: m.get("modified") or m.get("created") or "",
+        reverse=True,
+    )
+    files = files[:limit]
+
+    if not files:
+        console.print("[yellow]Sin resultados.[/yellow]")
+        return
+
+    tbl = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
+    tbl.add_column(style="dim")            # date
+    tbl.add_column(style="bold magenta")   # title
+    tbl.add_column(style="cyan dim")       # path
+    for m in files:
+        stamp = (m.get("modified") or m.get("created") or "")[:10]
+        tbl.add_row(stamp or "—", m.get("note", ""), m.get("file", ""))
+    console.print(tbl)
+
+
+@cli.command()
+@click.argument("note_title")
+@click.option("--depth", default=1, help="Niveles de vecindad (1 = solo vecinos directos, 2 = vecinos de vecinos)")
+@click.option("--output", default=None, help="Ruta .canvas de salida (default: 00-Inbox/graph-{note}.canvas)")
+def graph(note_title: str, depth: int, output: str | None):
+    """Exportar un Obsidian canvas con la vecindad de una nota por wikilinks.
+
+    NOTE_TITLE: título exacto (file stem) de la nota semilla. Atravesa outlinks
+    y backlinks hasta `--depth`. El canvas resultante puede abrirse en
+    Obsidian para ver el clúster conceptual.
+    """
+    import json as _json
+    col = get_db()
+    c = _load_corpus(col)
+
+    # Resolver título → primer path (Obsidian permite múltiples notas con mismo
+    # stem; tomamos el primero no-excluido).
+    paths = [p for p in c["title_to_paths"].get(note_title, set()) if not is_excluded(p)]
+    if not paths:
+        console.print(f"[red]Nota no encontrada en el índice:[/red] {note_title}")
+        return
+    seed_path = sorted(paths)[0]
+
+    # BFS outlinks + backlinks
+    visited: dict[str, int] = {seed_path: 0}
+    edges: set[tuple[str, str]] = set()
+    frontier = [seed_path]
+    for hop in range(1, depth + 1):
+        next_frontier: list[str] = []
+        for p in frontier:
+            # outlinks
+            for target_title in c["outlinks"].get(p, []):
+                for tp in c["title_to_paths"].get(target_title, set()):
+                    if is_excluded(tp):
+                        continue
+                    edges.add((p, tp))
+                    if tp not in visited:
+                        visited[tp] = hop
+                        next_frontier.append(tp)
+            # backlinks — notes that link to the current node's TITLE
+            title = _path_to_title(c, p)
+            if title:
+                for linker in c["backlinks"].get(title, set()):
+                    if is_excluded(linker):
+                        continue
+                    edges.add((linker, p))
+                    if linker not in visited:
+                        visited[linker] = hop
+                        next_frontier.append(linker)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    # Build Obsidian canvas JSON (file nodes + edges)
+    nodes, canvas_edges = [], []
+    path_to_id: dict[str, str] = {}
+    for i, (p, hop) in enumerate(sorted(visited.items(), key=lambda kv: (kv[1], kv[0]))):
+        node_id = f"n{i}"
+        path_to_id[p] = node_id
+        # Radial layout: seed at center, rings per hop
+        import math
+        if hop == 0:
+            x, y = 0, 0
+        else:
+            ring_members = [q for q, h in visited.items() if h == hop]
+            idx = ring_members.index(p)
+            n = len(ring_members)
+            r = hop * 600
+            angle = 2 * math.pi * idx / max(1, n)
+            x, y = int(r * math.cos(angle)), int(r * math.sin(angle))
+        nodes.append({
+            "id": node_id,
+            "type": "file",
+            "file": p,
+            "x": x, "y": y,
+            "width": 320, "height": 160,
+        })
+    for i, (a, b) in enumerate(sorted(edges)):
+        if a in path_to_id and b in path_to_id:
+            canvas_edges.append({
+                "id": f"e{i}",
+                "fromNode": path_to_id[a], "fromSide": "right",
+                "toNode": path_to_id[b], "toSide": "left",
+            })
+
+    canvas = {"nodes": nodes, "edges": canvas_edges}
+
+    if output:
+        out_path = Path(output)
+        if not out_path.is_absolute():
+            out_path = VAULT_PATH / output
+    else:
+        safe = re.sub(r"[/\\:\n]", " ", note_title).strip()
+        out_path = VAULT_PATH / INBOX_FOLDER / f"graph-{safe}.canvas"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(_json.dumps(canvas, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    rel = out_path.relative_to(VAULT_PATH) if str(out_path).startswith(str(VAULT_PATH)) else out_path
+    console.print(
+        f"[green]✓ Canvas generado:[/green] [bold cyan]{rel}[/bold cyan] "
+        f"[dim]({len(nodes)} nodos, {len(canvas_edges)} aristas, depth={depth})[/dim]"
+    )
+
+
+def _path_to_title(corpus: dict, path: str) -> str | None:
+    for title, paths in corpus["title_to_paths"].items():
+        if path in paths:
+            return title
+    return None
 
 
 @cli.command()

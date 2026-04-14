@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Obsidian RAG — semantic chunking, title prefix, HyDE, hybrid BM25+semantic, reranking."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -585,6 +586,166 @@ def get_db_for(vault_path: Path) -> chromadb.Collection:
         name=_collection_name_for_vault(vault_path),
         metadata={"hnsw:space": "cosine"},
     )
+
+
+def _urls_collection_name_for_vault(vault_path: Path) -> str:
+    """Mismo schema que URLS_COLLECTION_NAME pero para un vault arbitrario."""
+    resolved = vault_path.resolve()
+    if str(resolved) == str(_DEFAULT_VAULT.resolve()):
+        return _URLS_COLLECTION_BASE
+    slug = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+    return f"{_URLS_COLLECTION_BASE}_{slug}"
+
+
+# ── Auto-index ────────────────────────────────────────────────────────────────
+# Detectar y absorber cambios del vault sin que el usuario tenga que correr
+# `rag index` explícito. Dos casos:
+#   1. Vault vacío en scope → first-time full index (silent excepto progreso).
+#   2. Vault con contenido + archivos modificados desde último check → reindex
+#      incremental SOLO de esos archivos. mtime es el filtro barato; hash
+#      gate dentro de _index_single_file evita reembedding si nada cambió.
+# Persistimos last_check_at por vault para no leer todos los archivos cada
+# vez que arranca el chat.
+
+AUTO_INDEX_STATE_PATH = Path.home() / ".local/share/obsidian-rag/auto_index_state.json"
+
+
+def _auto_index_state_load() -> dict:
+    """Lee el state de auto-index. Estructura: {vault_hash: last_check_ts}.
+    Tolerante a archivo faltante o corrupto — devuelve {} en cualquier error.
+    """
+    if not AUTO_INDEX_STATE_PATH.is_file():
+        return {}
+    try:
+        return json.loads(AUTO_INDEX_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _auto_index_state_save(state: dict) -> None:
+    try:
+        AUTO_INDEX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTO_INDEX_STATE_PATH.write_text(
+            json.dumps(state, indent=2), encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _vault_state_key(vault_path: Path) -> str:
+    """Clave estable para el state — sha256[:16] del path absoluto."""
+    return hashlib.sha256(str(vault_path.resolve()).encode()).hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def _with_vault(vault_path: Path):
+    """Context manager que swappea los globals VAULT_PATH /
+    COLLECTION_NAME / URLS_COLLECTION_NAME para apuntar a otro vault.
+
+    Usado por _auto_index_vault para reusar _index_single_file (que asume
+    que VAULT_PATH es el vault target). Single-threaded — NO usar entre
+    threads. Restaura los valores en finally + invalida cache de corpus.
+    """
+    g = globals()
+    saved = {
+        "VAULT_PATH": g["VAULT_PATH"],
+        "COLLECTION_NAME": g["COLLECTION_NAME"],
+        "URLS_COLLECTION_NAME": g["URLS_COLLECTION_NAME"],
+    }
+    try:
+        g["VAULT_PATH"] = vault_path
+        g["COLLECTION_NAME"] = _collection_name_for_vault(vault_path)
+        g["URLS_COLLECTION_NAME"] = _urls_collection_name_for_vault(vault_path)
+        _invalidate_corpus_cache()
+        yield
+    finally:
+        g["VAULT_PATH"] = saved["VAULT_PATH"]
+        g["COLLECTION_NAME"] = saved["COLLECTION_NAME"]
+        g["URLS_COLLECTION_NAME"] = saved["URLS_COLLECTION_NAME"]
+        _invalidate_corpus_cache()
+
+
+def auto_index_vault(vault_path: Path) -> dict:
+    """Detecta cambios en `vault_path` y reindexa lo necesario. Retorna
+    {scanned, indexed, removed, kind, took_ms} donde kind ∈
+    {"first_time", "incremental", "no_changes"}.
+
+    Estrategia:
+      - Vault vacío → first_time, escanea todo + indexa.
+      - Vault con contenido → mtime-based incremental: solo lee archivos
+        cuyo mtime > last_check_at. Para cada uno, _index_single_file
+        ya hace su propio hash gate (skip si content no cambió de verdad).
+      - Limpia orphans (archivos en el índice que ya no están en disco).
+      - Actualiza last_check_at al final.
+    """
+    import time as _t
+    t0 = _t.perf_counter()
+    state = _auto_index_state_load()
+    key = _vault_state_key(vault_path)
+    last_check = float(state.get(key, 0.0))
+
+    with _with_vault(vault_path):
+        col = get_db()
+        first_time = col.count() == 0
+
+        # Listar md files (rglob es rápido en APFS, ~50ms para 500 archivos).
+        md_files: list[Path] = []
+        for p in vault_path.rglob("*.md"):
+            try:
+                rel = p.relative_to(vault_path)
+            except ValueError:
+                continue
+            if is_excluded(str(rel)):
+                continue
+            md_files.append(p)
+
+        # mtime-filter SOLO si no es first_time (ahí hay que indexar todo).
+        if first_time:
+            candidates = md_files
+        else:
+            candidates = [p for p in md_files if p.stat().st_mtime > last_check]
+
+        indexed = 0
+        for p in candidates:
+            try:
+                status = _index_single_file(col, p, skip_contradict=True)
+            except Exception:
+                continue
+            if status == "indexed":
+                indexed += 1
+
+        # Orphans: archivos en el índice que ya no están en disco. Solo
+        # vale chequear cuando el vault ya estaba indexado (skip first_time).
+        removed = 0
+        if not first_time:
+            on_disk = {str(p.relative_to(vault_path)) for p in md_files}
+            existing = col.get(include=["metadatas"])
+            indexed_files = {m.get("file", "") for m in existing["metadatas"]}
+            indexed_files.discard("")
+            orphans = indexed_files - on_disk
+            for orphan in orphans:
+                stale = col.get(where={"file": orphan}, include=[])
+                if stale["ids"]:
+                    col.delete(ids=stale["ids"])
+                    removed += 1
+
+    state[key] = _t.time()
+    _auto_index_state_save(state)
+
+    if first_time and indexed > 0:
+        kind = "first_time"
+    elif indexed == 0 and removed == 0:
+        kind = "no_changes"
+    else:
+        kind = "incremental"
+
+    return {
+        "scanned": len(md_files),
+        "indexed": indexed,
+        "removed": removed,
+        "kind": kind,
+        "took_ms": int((_t.perf_counter() - t0) * 1000),
+    }
 
 
 def get_urls_db() -> chromadb.Collection:
@@ -4594,7 +4755,38 @@ def chat(
         console.print("[red]Sin vault para consultar. Registrá uno con `rag vault add`.[/red]")
         return
 
-    # Validar que al menos uno tenga chunks — si todos están vacíos, avisar.
+    # Auto-index: para cada vault en scope detectar y absorber cambios
+    # antes de arrancar el chat. mtime-based para que el caso "nada cambió"
+    # cueste ~50ms; first-time index es bloqueante (con progreso visible).
+    for name, vpath in vaults_resolved:
+        try:
+            col_v = get_db_for(vpath)
+            empty = col_v.count() == 0
+        except Exception:
+            continue
+        n_files = sum(1 for _ in vpath.rglob("*.md"))
+        if empty and n_files > 0:
+            with console.status(
+                f"[dim]'{name}' nunca se indexó — corriendo first-time index "
+                f"({n_files} notas, ~1-2 min)…[/dim]",
+                spinner="dots",
+            ):
+                stats = auto_index_vault(vpath)
+            console.print(
+                f"[green]✓ '{name}' indexado:[/green] {stats['indexed']} notas "
+                f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
+            )
+        elif not empty:
+            stats = auto_index_vault(vpath)
+            if stats["kind"] == "incremental":
+                console.print(
+                    f"[green]✓ '{name}':[/green] {stats['indexed']} cambios "
+                    f"+ {stats['removed']} orphans removidos "
+                    f"[dim]({stats['took_ms']}ms)[/dim]"
+                )
+
+    # Re-validar después del auto-index — si todos quedaron vacíos (vault
+    # sin .md o todo skipeado), no tiene sentido seguir.
     total_chunks = 0
     for name, vpath in vaults_resolved:
         try:
@@ -4604,7 +4796,7 @@ def chat(
     if total_chunks == 0:
         console.print(
             f"[red]Los vaults seleccionados están vacíos. "
-            f"Ejecutá `rag index` en cada uno primero.[/red]"
+            f"Verificá que tienen archivos .md.[/red]"
         )
         return
 

@@ -171,10 +171,21 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-f
 COLLECTION_NAME = "obsidian_notes_v6"  # v6: larger chunks (150-800), parent-in-metadata
 
 # Deterministic decoding — this is a retrieval tool, not creative writing.
-# num_ctx: headroom for system rules (~800 chars) + context (5 chunks × ~800 chars)
-# + query + answer. 8192 tokens cubre holgado sin desperdiciar VRAM.
-CHAT_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42, "num_ctx": 8192}
-HELPER_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42, "num_ctx": 2048}
+# num_ctx dimensionado al prompt real (system ~500 tokens + 5 chunks × ~300
+# tokens + query + answer) — ventana de KV más chica = menos memoria y genera
+# más rápido.
+# num_predict cap evita respuestas verbose: answers útiles caben en ~600 tok.
+CHAT_OPTIONS = {
+    "temperature": 0, "top_p": 1, "seed": 42,
+    "num_ctx": 4096,
+    "num_predict": 768,
+}
+# Helpers (paraphrases, HyDE) devuelven 1-3 líneas — cap chico acelera.
+HELPER_OPTIONS = {
+    "temperature": 0, "top_p": 1, "seed": 42,
+    "num_ctx": 1024,
+    "num_predict": 128,
+}
 
 # Keep models resident in VRAM between queries — avoids 2-3s cold reload.
 # Ollama accepts -1 (forever, as int) or a duration string like "30m". Default
@@ -531,12 +542,28 @@ _reranker = None
 
 
 def get_reranker():
-    """Lazy-load cross-encoder reranker (downloaded on first use, ~600MB)."""
+    """Lazy-load cross-encoder reranker on the best available accelerator.
+    Explicit device picks MPS on Apple Silicon — sentence-transformers'
+    auto-detect falls back to CPU in some venvs, costing ~3× on rerank.
+    fp16 halves memory + latency on Apple MPS with no quality hit for this
+    model size.
+    """
     global _reranker
     if _reranker is None:
+        import torch
         from sentence_transformers import CrossEncoder
-        # Use MPS on Apple Silicon, CPU elsewhere; sentence-transformers auto-detects.
-        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512)
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        _reranker = CrossEncoder(
+            RERANKER_MODEL,
+            max_length=512,
+            device=device,
+            model_kwargs={"torch_dtype": torch.float16} if device != "cpu" else None,
+        )
     return _reranker
 
 

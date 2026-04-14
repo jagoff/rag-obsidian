@@ -562,6 +562,31 @@ def get_db() -> chromadb.Collection:
     )
 
 
+def _collection_name_for_vault(vault_path: Path) -> str:
+    """Mismo schema que COLLECTION_NAME: sha256[:8] sufijo salvo default.
+    Factorizado para que podamos abrir colecciones de vaults *distintos* al
+    activo sin tocar VAULT_PATH ni forzar reimport.
+    """
+    resolved = vault_path.resolve()
+    if str(resolved) == str(_DEFAULT_VAULT.resolve()):
+        return _COLLECTION_BASE
+    slug = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+    return f"{_COLLECTION_BASE}_{slug}"
+
+
+def get_db_for(vault_path: Path) -> chromadb.Collection:
+    """Abre la colección Chroma correspondiente a un vault arbitrario.
+    Todos los vaults viven en la misma DB (DB_PATH) — la separación es por
+    nombre de colección, namespaced por hash del path del vault.
+    """
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    return client.get_or_create_collection(
+        name=_collection_name_for_vault(vault_path),
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
 def get_urls_db() -> chromadb.Collection:
     """Companion collection storing one row per URL found in the vault, with
     its surrounding prose embedded for semantic-by-context lookup.
@@ -3197,6 +3222,123 @@ def retrieve(
     }
 
 
+# ── Multi-vault retrieval ────────────────────────────────────────────────────
+# Wrapper sobre retrieve() que corre la pipeline una vez por cada colección
+# y merge-rankea globalmente por score del reranker. Cada vault mantiene su
+# propio BM25 + grafo de wikilinks (se construyen por col en _load_corpus),
+# y el reranker es el mismo (scores comparables entre cols).
+#
+# Trade-off conocido: latencia lineal en N de vaults (rerank es el cuello).
+# Para 2 vaults ≈ 2x (~4s vs ~2s). Paralelizar con threads no ayuda: el
+# reranker en MPS serializa de todas formas + agrega overhead por task.
+
+
+def resolve_vault_paths(names: list[str] | None) -> list[tuple[str, Path]]:
+    """Resuelve una lista de nombres a [(display_name, vault_path)]. Ignora
+    nombres no registrados silenciosamente (el caller puede verificar el
+    resultado vs input).
+
+    `names=None` → solo el vault activo (resolve_vault_path + su nombre).
+    `names=["all"]` → todos los registrados en el registry.
+    """
+    cfg = _load_vaults_config()
+    if names is None:
+        # Vault activo según precedencia estándar.
+        active = _resolve_vault_path()
+        # Intentamos darle un nombre legible.
+        env = os.environ.get("OBSIDIAN_RAG_VAULT")
+        if env:
+            return [(f"env:{active.name}", active)]
+        cur = cfg["current"]
+        if cur and cur in cfg["vaults"]:
+            return [(cur, active)]
+        return [(f"default:{active.name}", active)]
+    if names == ["all"]:
+        names = list(cfg["vaults"].keys())
+    out: list[tuple[str, Path]] = []
+    for n in names:
+        if n in cfg["vaults"]:
+            out.append((n, Path(cfg["vaults"][n])))
+    return out
+
+
+def multi_retrieve(
+    vaults: list[tuple[str, Path]],
+    question: str,
+    k: int,
+    folder: str | None,
+    history: list[dict] | None = None,
+    tag: str | None = None,
+    precise: bool = False,
+    multi_query: bool = True,
+    auto_filter: bool = True,
+) -> dict:
+    """Retrieve cross-vault. Para cada vault de `vaults`:
+      1. Abre su colección (get_db_for).
+      2. Corre retrieve() ahí.
+      3. Anota las metas con `_vault` (display name) + `_vault_path`.
+    Merge global por score del reranker, devuelve top-k.
+
+    Return shape compatible con retrieve() para que el resto del pipeline
+    (print_query_header, render_sources, etc.) no necesite cambios.
+    `filters_applied` refleja los filtros inferidos en el primer vault
+    que retornó algo (suficiente para mostrar en el header).
+    """
+    if not vaults:
+        return {
+            "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
+            "search_query": question, "filters_applied": {}, "query_variants": [question],
+            "vault_scope": [],
+        }
+    # Camino corto: un solo vault → evitamos el overhead de merge.
+    if len(vaults) == 1:
+        name, path = vaults[0]
+        col = get_db_for(path)
+        r = retrieve(
+            col, question, k, folder, history, tag, precise,
+            multi_query=multi_query, auto_filter=auto_filter,
+        )
+        # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
+        r["vault_scope"] = [name]
+        return r
+
+    all_items: list[tuple[float, str, dict]] = []
+    variants: list[str] | None = None
+    filters_applied: dict = {}
+    for name, path in vaults:
+        col = get_db_for(path)
+        if col.count() == 0:
+            continue   # vault no indexado — skip silent
+        r = retrieve(
+            col, question, k, folder, history, tag, precise,
+            multi_query=multi_query, auto_filter=auto_filter,
+        )
+        if variants is None:
+            variants = r["query_variants"]
+        for d, m, s in zip(r["docs"], r["metas"], r["scores"]):
+            annotated = dict(m)
+            annotated["_vault"] = name
+            annotated["_vault_path"] = str(path)
+            all_items.append((s, d, annotated))
+        # Primer vault con filtros inferidos manda (raro que difieran).
+        if not filters_applied and r["filters_applied"]:
+            filters_applied = r["filters_applied"]
+
+    all_items.sort(key=lambda x: -x[0])
+    top = all_items[:k]
+    top_score = top[0][0] if top else float("-inf")
+    return {
+        "docs": [d for _, d, _ in top],
+        "metas": [m for _, _, m in top],
+        "scores": [s for s, _, _ in top],
+        "confidence": top_score,
+        "search_query": question,
+        "filters_applied": filters_applied,
+        "query_variants": variants or [question],
+        "vault_scope": [n for n, _ in vaults],
+    }
+
+
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 
 # Highlight `chat` en `rag --help`. El default formatter de click pinta cada
@@ -4358,6 +4500,49 @@ def query(
         render_related(find_related(col, result["metas"]))
 
 
+def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
+    """Pide al usuario qué vault(s) usar al arrancar chat. Solo se llama si
+    hay ≥2 vaults registrados. Retorna lista de (name, path)."""
+    vaults = list(cfg["vaults"].items())
+    n = len(vaults)
+    console.print()
+    console.print("[bold]¿Sobre qué vault querés conversar?[/bold]")
+    default_idx = 1
+    if cfg["current"] and cfg["current"] in cfg["vaults"]:
+        default_idx = list(cfg["vaults"].keys()).index(cfg["current"]) + 1
+    for i, (name, path) in enumerate(vaults, 1):
+        marker = "→" if name == cfg["current"] else " "
+        console.print(
+            f"  {marker} [bold cyan]{i}[/bold cyan]  [bold]{name}[/bold]  "
+            f"[dim]({Path(path).name})[/dim]"
+        )
+    console.print(
+        f"    [bold cyan]{n + 1}[/bold cyan]  [bold]ambos / todos[/bold]  "
+        f"[dim](búsqueda cross-vault en los {n} a la vez)[/dim]"
+    )
+    try:
+        choice = click.prompt(
+            f"\nSeleccioná",
+            default=str(default_idx),
+            show_default=True,
+        ).strip()
+    except (KeyboardInterrupt, EOFError):
+        return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
+
+    # Permitir tipear el nombre directo también (UX fallback).
+    if choice in cfg["vaults"]:
+        return [(choice, Path(cfg["vaults"][choice]))]
+    try:
+        idx = int(choice)
+    except ValueError:
+        return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
+    if 1 <= idx <= n:
+        return [(vaults[idx - 1][0], Path(vaults[idx - 1][1]))]
+    if idx == n + 1:
+        return [(name, Path(path)) for name, path in vaults]
+    return [(vaults[default_idx - 1][0], Path(vaults[default_idx - 1][1]))]
+
+
 @cli.command()
 @click.option("-k", default=RERANK_TOP, help="Chunks finales por turno")
 @click.option("--folder", default=None, help="Filtrar por carpeta (ej: '02-Areas/Musica')")
@@ -4370,15 +4555,57 @@ def query(
 @click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
 @click.option("--counter", is_flag=True,
               help="Después de cada respuesta, buscar chunks del vault que la CONTRADIGAN")
+@click.option("--vault", "vault_scope", default=None,
+              help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
+                   "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
 def chat(
     k: int, folder: str | None, tag: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
+    vault_scope: str | None,
 ):
     """Chat interactivo con tus notas."""
+    # col = vault para WRITE operations (/save, /inbox, /reindex,
+    # find_related). Siempre apunta al current del registry, aunque el
+    # scope de READ incluya múltiples vaults — evita ambigüedad ("guardar
+    # dónde").
     col = get_db()
-    if col.count() == 0:
-        console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+
+    # Resolver scope de retrieval (READ).
+    if vault_scope:
+        if vault_scope.strip() == "all":
+            vaults_resolved = resolve_vault_paths(["all"])
+        else:
+            names = [n.strip() for n in vault_scope.split(",") if n.strip()]
+            vaults_resolved = resolve_vault_paths(names)
+        if not vaults_resolved:
+            console.print(
+                f"[red]--vault '{vault_scope}' no resolvió ningún vault registrado.[/red]"
+            )
+            return
+    else:
+        _vcfg = _load_vaults_config()
+        if len(_vcfg["vaults"]) >= 2 and not os.environ.get("OBSIDIAN_RAG_VAULT"):
+            vaults_resolved = _prompt_vault_scope_interactive(_vcfg)
+        else:
+            vaults_resolved = resolve_vault_paths(None)
+
+    if not vaults_resolved:
+        console.print("[red]Sin vault para consultar. Registrá uno con `rag vault add`.[/red]")
+        return
+
+    # Validar que al menos uno tenga chunks — si todos están vacíos, avisar.
+    total_chunks = 0
+    for name, vpath in vaults_resolved:
+        try:
+            total_chunks += get_db_for(vpath).count()
+        except Exception:
+            pass
+    if total_chunks == 0:
+        console.print(
+            f"[red]Los vaults seleccionados están vacíos. "
+            f"Ejecutá `rag index` en cada uno primero.[/red]"
+        )
         return
 
     # Resolve session: --resume takes last used id; --session takes explicit id;
@@ -4410,16 +4637,12 @@ def chat(
         subtitle += f" · {' · '.join(flags)}"
     subtitle += "[/dim]"
 
-    # Vault activo: qué está viendo el chat. Fuente visible (env/registry/
-    # default) para que no haya sorpresas en setups multi-vault.
-    if os.environ.get("OBSIDIAN_RAG_VAULT"):
-        vault_label = f"env · {VAULT_PATH.name}"
+    # Vault scope del chat. Uno solo → nombre; dos o más → "A + B" en la label.
+    scope_names = [n for n, _ in vaults_resolved]
+    if len(scope_names) == 1:
+        vault_label = scope_names[0]
     else:
-        _vcfg = _load_vaults_config()
-        if _vcfg["current"] and _vcfg["current"] in _vcfg["vaults"]:
-            vault_label = _vcfg["current"]
-        else:
-            vault_label = f"default · {VAULT_PATH.name}"
+        vault_label = " + ".join(scope_names) + f" [dim](cross-vault)[/dim]"
     vault_line = f"[dim]· vault: [bold magenta]{vault_label}[/bold magenta][/dim]"
 
     session_line = (
@@ -4558,8 +4781,8 @@ def chat(
             continue
 
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
-            result = retrieve(
-                col, question, k, folder, history, tag, precise,
+            result = multi_retrieve(
+                vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
             )
         if not result["docs"]:
@@ -4568,8 +4791,12 @@ def chat(
 
         print_query_header(question, result, show_question=False)
 
+        # Con >1 vault, anotamos el chunk header con el vault de origen así
+        # el LLM puede citarlo y vos podés distinguir en la respuesta.
+        is_multi = len(vaults_resolved) > 1
         context = "\n\n---\n\n".join(
-            f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
+            (f"[vault: {m.get('_vault', '?')}] " if is_multi else "")
+            + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
             for d, m in zip(result["docs"], result["metas"])
         )
         # Prompt shape debe igualar `rag query` exactamente: sin priming

@@ -228,3 +228,167 @@ def test_remove_current_falls_to_next_or_none(tmp_registry, tmp_path):
 def test_remove_unknown_errors(tmp_registry):
     result = CliRunner().invoke(rag.vault, ["remove", "ghost"])
     assert "no registrado" in result.output
+
+
+# ── resolve_vault_paths ──────────────────────────────────────────────────────
+
+
+def test_resolve_vault_paths_none_returns_active_single(tmp_registry, tmp_path):
+    v = tmp_path / "v"; v.mkdir()
+    rag._save_vaults_config({"vaults": {"home": str(v)}, "current": "home"})
+    result = rag.resolve_vault_paths(None)
+    assert len(result) == 1
+    assert result[0][0] == "home"
+    assert result[0][1] == v
+
+
+def test_resolve_vault_paths_all_expands_registry(tmp_registry, tmp_path):
+    v1 = tmp_path / "v1"; v1.mkdir()
+    v2 = tmp_path / "v2"; v2.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v1), "work": str(v2)},
+        "current": "home",
+    })
+    result = rag.resolve_vault_paths(["all"])
+    names = sorted(n for n, _ in result)
+    assert names == ["home", "work"]
+
+
+def test_resolve_vault_paths_filters_unknown(tmp_registry, tmp_path):
+    v = tmp_path / "v"; v.mkdir()
+    rag._save_vaults_config({"vaults": {"home": str(v)}, "current": "home"})
+    result = rag.resolve_vault_paths(["home", "ghost"])
+    names = [n for n, _ in result]
+    assert names == ["home"]   # "ghost" silent drop
+
+
+def test_resolve_vault_paths_with_env_overrides(tmp_registry, tmp_path, monkeypatch):
+    v = tmp_path / "envvault"; v.mkdir()
+    monkeypatch.setenv("OBSIDIAN_RAG_VAULT", str(v))
+    result = rag.resolve_vault_paths(None)
+    assert len(result) == 1
+    name, path = result[0]
+    assert path == v
+    assert name.startswith("env:")
+
+
+# ── _collection_name_for_vault + get_db_for ──────────────────────────────────
+
+
+def test_collection_name_uses_base_for_default():
+    # _DEFAULT_VAULT → nombre base sin sufijo.
+    name = rag._collection_name_for_vault(rag._DEFAULT_VAULT)
+    assert name == rag._COLLECTION_BASE
+
+
+def test_collection_name_adds_hash_for_custom_path(tmp_path):
+    v = tmp_path / "custom"; v.mkdir()
+    name = rag._collection_name_for_vault(v)
+    assert name.startswith(rag._COLLECTION_BASE + "_")
+    # Hash estable — mismo path → mismo nombre.
+    assert rag._collection_name_for_vault(v) == name
+
+
+def test_get_db_for_returns_distinct_collections_per_vault(tmp_path, monkeypatch):
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    v1 = tmp_path / "v1"; v1.mkdir()
+    v2 = tmp_path / "v2"; v2.mkdir()
+    c1 = rag.get_db_for(v1)
+    c2 = rag.get_db_for(v2)
+    assert c1.name != c2.name
+    # Insertar algo en c1 no aparece en c2 (aislamiento).
+    c1.add(
+        ids=["a::0"], embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["doc a"], metadatas=[{"file": "a.md", "note": "a"}],
+    )
+    assert c1.count() == 1
+    assert c2.count() == 0
+
+
+# ── multi_retrieve ────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def two_vaults(tmp_path, monkeypatch):
+    """Dos tmp vaults con contenidos distintos, cada uno con su colección."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "embed", lambda ts: [[1.0, 0.0, 0.0, 0.0] for _ in ts])
+    # Forzamos nombres de colección reproducibles.
+    v1 = tmp_path / "v1"; v1.mkdir()
+    v2 = tmp_path / "v2"; v2.mkdir()
+    c1 = rag.get_db_for(v1)
+    c2 = rag.get_db_for(v2)
+
+    def add(col, vault_dir, rel, body):
+        full = vault_dir / rel
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(body, encoding="utf-8")
+        col.add(
+            ids=[f"{rel}::0"],
+            embeddings=[[1.0, 0.0, 0.0, 0.0]],
+            documents=[body],
+            metadatas=[{
+                "file": rel, "note": Path(rel).stem,
+                "folder": str(Path(rel).parent),
+                "tags": "", "outlinks": "", "hash": "x",
+            }],
+        )
+    add(c1, v1, "02-Areas/nota-home.md", "contenido exclusivo de home")
+    add(c2, v2, "02-Areas/nota-work.md", "contenido exclusivo de work")
+    rag._invalidate_corpus_cache()
+    return [("home", v1), ("work", v2)]
+
+
+def test_multi_retrieve_single_vault_fastpath(two_vaults, monkeypatch):
+    # Con un solo vault el wrapper no debería merge-rankear — pasa derecho.
+    monkeypatch.setattr(rag, "get_reranker", lambda: _fake_reranker())
+    r = rag.multi_retrieve([two_vaults[0]], "contenido", k=3, folder=None)
+    assert len(r["docs"]) >= 1
+    assert r["vault_scope"] == ["home"]
+    # Single vault NO anota _vault en las metas (para no romper código legacy).
+    assert all("_vault" not in m for m in r["metas"])
+
+
+def test_multi_retrieve_merges_both_vaults_and_annotates(two_vaults, monkeypatch):
+    monkeypatch.setattr(rag, "get_reranker", lambda: _fake_reranker())
+    r = rag.multi_retrieve(two_vaults, "contenido", k=5, folder=None)
+    vault_names = {m.get("_vault") for m in r["metas"]}
+    assert "home" in vault_names
+    assert "work" in vault_names
+    # Todas las metas del modo multi deben tener _vault + _vault_path.
+    for m in r["metas"]:
+        assert m.get("_vault") in ("home", "work")
+        assert m.get("_vault_path")
+    assert sorted(r["vault_scope"]) == ["home", "work"]
+
+
+def test_multi_retrieve_skips_empty_vaults(two_vaults, tmp_path, monkeypatch):
+    monkeypatch.setattr(rag, "get_reranker", lambda: _fake_reranker())
+    # Agregamos un tercero vacío (nunca se indexó).
+    v3 = tmp_path / "v3"; v3.mkdir()
+    rag.get_db_for(v3)   # crea colección vacía
+    scope = two_vaults + [("empty", v3)]
+    r = rag.multi_retrieve(scope, "contenido", k=5, folder=None)
+    vaults_found = {m.get("_vault") for m in r["metas"]}
+    assert "empty" not in vaults_found
+    assert r["docs"]   # no queda en blanco solo por el vacío
+
+
+def test_multi_retrieve_empty_scope_returns_empty():
+    r = rag.multi_retrieve([], "cualquiera", k=5, folder=None)
+    assert r["docs"] == []
+    assert r["vault_scope"] == []
+    assert r["confidence"] == float("-inf")
+
+
+# ── Helper: fake reranker ─────────────────────────────────────────────────────
+
+
+def _fake_reranker():
+    """CrossEncoder mock que devuelve score=1.0 para todos los pairs — los
+    tests de multi_retrieve no dependen del ranking semántico real, solo
+    del merge y anotación."""
+    class _R:
+        def predict(self, pairs, show_progress_bar=False):
+            return [1.0] * len(pairs)
+    return _R()

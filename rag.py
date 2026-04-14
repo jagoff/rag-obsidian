@@ -4410,13 +4410,26 @@ def chat(
         subtitle += f" · {' · '.join(flags)}"
     subtitle += "[/dim]"
 
+    # Vault activo: qué está viendo el chat. Fuente visible (env/registry/
+    # default) para que no haya sorpresas en setups multi-vault.
+    if os.environ.get("OBSIDIAN_RAG_VAULT"):
+        vault_label = f"env · {VAULT_PATH.name}"
+    else:
+        _vcfg = _load_vaults_config()
+        if _vcfg["current"] and _vcfg["current"] in _vcfg["vaults"]:
+            vault_label = _vcfg["current"]
+        else:
+            vault_label = f"default · {VAULT_PATH.name}"
+    vault_line = f"[dim]· vault: [bold magenta]{vault_label}[/bold magenta][/dim]"
+
     session_line = (
         f"[dim]· sesión: [cyan]{sess['id']}[/cyan]"
         f"{' · reanudada (' + str(len(sess['turns'])) + ' turnos)' if resumed else ' · nueva'}[/dim]"
     )
 
     console.print(Panel(
-        f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
+        f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
+        f"{vault_line}\n{session_line}\n"
         "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · /cls · /exit[/dim]",
         border_style="green",
     ))

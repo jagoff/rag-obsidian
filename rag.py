@@ -3848,7 +3848,7 @@ def chat(
 
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /cls · /exit[/dim]",
         border_style="green",
     ))
 
@@ -3876,6 +3876,24 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # /cls — limpia la pantalla y borra la conversación: turnos persistidos,
+        # history en memoria, y last_* (no hay respuesta previa para `/save`).
+        # Mantiene el session_id para que `--resume` siga apuntando acá, pero
+        # arranca vacío (como si fuera primer turno).
+        if question == "/cls":
+            sess["turns"] = []
+            try:
+                save_session(sess)
+            except Exception:
+                pass
+            history = []
+            last_assistant = ""
+            last_question = ""
+            last_sources = []
+            console.clear()
+            console.print("[dim]Conversación borrada. Sesión sigue activa.[/dim]")
             continue
 
         # Link intent — "donde está el link a X", "dame la url de Y",

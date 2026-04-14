@@ -1742,6 +1742,253 @@ def find_duplicate_notes(
     return pairs[:limit]
 
 
+# ── SURFACE: proactive bridge builder ────────────────────────────────────────
+# Pares semánticamente cercanos pero topológicamente lejanos en el grafo de
+# wikilinks. Surface propone conexiones que el usuario no hizo — generalmente
+# porque las dos notas se escribieron en momentos distintos. Composición pura
+# de `_note_centroids` + grafo cacheado en `_load_corpus` + LLM helper para
+# una oración de "por qué están conectadas".
+
+SURFACE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/surface.jsonl"
+SURFACE_SKIP_FOLDERS = ("00-Inbox/", "04-Archive/", "05-Reviews/")
+
+
+def _build_graph_adj(corpus: dict) -> dict[str, set[str]]:
+    """Adyacencia no dirigida del grafo de wikilinks: path → set de paths linkeados.
+    Compone outlinks (path → títulos) con title_to_paths (título → paths).
+    Cada edge existe en ambas direcciones para tratar el grafo como no dirigido.
+    """
+    adj: dict[str, set[str]] = {}
+    title_to_paths = corpus["title_to_paths"]
+    for src_path, titles in corpus["outlinks"].items():
+        for t in titles:
+            for tgt in title_to_paths.get(t, ()):
+                if tgt == src_path:
+                    continue
+                adj.setdefault(src_path, set()).add(tgt)
+                adj.setdefault(tgt, set()).add(src_path)
+    return adj
+
+
+def _hop_set(adj: dict[str, set[str]], start: str, hops: int) -> set[str]:
+    """BFS hasta `hops` saltos desde `start`. Retorna el set visitado incluyendo start.
+    Usado para determinar distancia mínima: b no está en hop_set(a, N-1) ⇒ dist ≥ N.
+    """
+    if hops <= 0:
+        return {start}
+    seen = {start}
+    frontier = {start}
+    for _ in range(hops):
+        nxt: set[str] = set()
+        for n in frontier:
+            nxt |= adj.get(n, set()) - seen
+        if not nxt:
+            break
+        seen |= nxt
+        frontier = nxt
+    return seen
+
+
+_SURFACE_MOC_TITLE_RE = re.compile(r"^(MOC|Index|Map)(\s|$|[-_])", re.IGNORECASE)
+
+
+def _is_moc_note(meta: dict) -> bool:
+    """Heurística MOC: título empieza con MOC/Index/Map, o tag #moc, o la nota
+    lleva el mismo nombre que su carpeta (convención folder-index).
+    """
+    title = (meta.get("note") or "").strip()
+    if _SURFACE_MOC_TITLE_RE.match(title):
+        return True
+    tags = {t.strip().lower() for t in (meta.get("tags") or "").split(",") if t.strip()}
+    if "moc" in tags:
+        return True
+    path = meta.get("file") or ""
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[-1] == f"{parts[-2]}.md":
+        return True
+    return False
+
+
+def _note_age_days(meta: dict) -> float | None:
+    """Edad en días desde `created` o `modified` del frontmatter.
+    None si no hay timestamp parseable — el caller decide qué hacer.
+    """
+    stamp = meta.get("created") or meta.get("modified") or ""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    try:
+        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        return max(0.0, (now - dt).total_seconds() / 86400.0)
+    except Exception:
+        return None
+
+
+def find_surface_bridges(
+    col: chromadb.Collection,
+    sim_threshold: float = 0.78,
+    min_hops: int = 3,
+    top: int = 5,
+    skip_young_days: int = 7,
+) -> list[dict]:
+    """Pares de notas semánticamente cercanas pero lejanas en el grafo.
+    Propone los puentes que el usuario no hizo.
+
+    Filtros (AND):
+      - cosine(centroid_a, centroid_b) ≥ sim_threshold
+      - distancia en el grafo ≥ min_hops  (b ∉ (min_hops−1)-hop de a)
+      - ninguna nota en 00-Inbox / 04-Archive / 05-Reviews
+      - ninguna nota es MOC (título, tag o folder-index)
+      - el par NO comparte ≥2 tags (la conexión ya es explícita vía tags)
+      - ambas notas tienen edad ≥ skip_young_days (notas frescas siguen evolucionando)
+
+    Retorna los `top` mejores pares por similitud descendente. Cada dict incluye
+    snippets (primeros ~800 chars del body, sin frontmatter) para que el caller
+    pueda alimentar un LLM opcional que genere la oración de "por qué conectan".
+    """
+    import numpy as np
+    corpus = _load_corpus(col)
+    files, metas, arr = _note_centroids(col)
+    if len(files) < 2:
+        return []
+    adj = _build_graph_adj(corpus)
+
+    def _eligible(idx: int) -> bool:
+        p = files[idx]
+        if any(p.startswith(pref) for pref in SURFACE_SKIP_FOLDERS):
+            return False
+        if _is_moc_note(metas[idx]):
+            return False
+        age = _note_age_days(metas[idx])
+        if age is not None and age < skip_young_days:
+            return False
+        return True
+
+    elig = [i for i in range(len(files)) if _eligible(i)]
+    if len(elig) < 2:
+        return []
+
+    sims = arr @ arr.T
+    hop_cache: dict[str, set[str]] = {}
+
+    def _hops(p: str) -> set[str]:
+        if p not in hop_cache:
+            hop_cache[p] = _hop_set(adj, p, min_hops - 1)
+        return hop_cache[p]
+
+    candidates: list[dict] = []
+    for ii, i in enumerate(elig):
+        p_i = files[i]
+        hops_i = _hops(p_i)
+        row = sims[i]
+        tags_i = {t.strip() for t in (metas[i].get("tags") or "").split(",") if t.strip()}
+        for j in elig[ii + 1:]:
+            s = float(row[j])
+            if s < sim_threshold:
+                continue
+            p_j = files[j]
+            if p_j in hops_i:
+                continue
+            tags_j = {t.strip() for t in (metas[j].get("tags") or "").split(",") if t.strip()}
+            shared = tags_i & tags_j
+            if len(shared) >= 2:
+                continue
+            candidates.append({
+                "a_path": p_i, "b_path": p_j,
+                "a_note": metas[i].get("note", ""),
+                "b_note": metas[j].get("note", ""),
+                "similarity": round(s, 3),
+                "shared_tags": sorted(shared),
+                "a_age_days": _note_age_days(metas[i]),
+                "b_age_days": _note_age_days(metas[j]),
+            })
+
+    candidates.sort(key=lambda p: -p["similarity"])
+    top_pairs = candidates[:top]
+
+    # Snippets: una lectura por path único, sin frontmatter, colapsando whitespace.
+    needed = {p["a_path"] for p in top_pairs} | {p["b_path"] for p in top_pairs}
+    snippets: dict[str, str] = {}
+    for rel in needed:
+        full = VAULT_PATH / rel
+        if not full.is_file():
+            snippets[rel] = ""
+            continue
+        try:
+            body = full.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            snippets[rel] = ""
+            continue
+        if body.startswith("---\n"):
+            end = body.find("\n---\n", 4)
+            if end > 0:
+                body = body[end + 5:]
+        snippets[rel] = re.sub(r"\s+", " ", body[:800]).strip()
+    for p in top_pairs:
+        p["a_snippet"] = snippets.get(p["a_path"], "")
+        p["b_snippet"] = snippets.get(p["b_path"], "")
+    return top_pairs
+
+
+def _surface_generate_reason(pair: dict) -> str:
+    """Una oración en español explicando la conexión. '' si falla o si el modelo
+    declara "sin conexión clara" — esos pares quedan como candidatos silenciosos
+    (buenos para rankeo, ruidosos para mostrar).
+
+    Usa el chat model (command-r), no el helper: juzgar conexión entre notas es
+    una tarea de síntesis donde qwen2.5:3b se va a lo genérico ("ambas hablan
+    de música") o refuses con "sin conexión clara" en pares donde command-r sí
+    ve la temática real. Mismo criterio que el contradiction radar.
+    """
+    prompt = (
+        "Tenés dos notas de un vault personal. En UNA oración en español "
+        "(≤25 palabras), decí por qué están conectadas a nivel de contenido. "
+        "No inventes datos; si no hay conexión clara, respondé exactamente "
+        "'sin conexión clara'.\n\n"
+        f"NOTA A — {pair['a_note']}:\n{pair.get('a_snippet', '')[:600]}\n\n"
+        f"NOTA B — {pair['b_note']}:\n{pair.get('b_snippet', '')[:600]}\n\n"
+        "CONEXIÓN:"
+    )
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "top_p": 1, "seed": 42,
+                     "num_ctx": 2048, "num_predict": 80},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        reason = (resp.message.content or "").strip().split("\n", 1)[0].strip()
+    except Exception:
+        return ""
+    if not reason or "sin conexión clara" in reason.lower():
+        return ""
+    reason = reason.strip(".") + "."
+    return reason if len(reason) > 4 else ""
+
+
+def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
+    """Append-only log: una línea `surface_run` + N líneas `surface_pair`.
+    Mismo timestamp en todas para poder agrupar la corrida al leer."""
+    try:
+        SURFACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat(timespec="seconds")
+        with SURFACE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": ts, "cmd": "surface_run", **summary},
+                ensure_ascii=False,
+            ) + "\n")
+            for p in pairs:
+                f.write(json.dumps(
+                    {"ts": ts, "cmd": "surface_pair", **p},
+                    ensure_ascii=False,
+                ) + "\n")
+    except Exception:
+        pass
+
+
 def _suggest_tags_for_note(
     col: chromadb.Collection,
     body: str,
@@ -5049,6 +5296,85 @@ def dupes(threshold: float, folder: str | None, limit: int, plain: bool):
         "cmd": "dupes", "threshold": threshold, "folder": folder,
         "n_pairs": len(pairs),
     })
+
+
+@cli.command()
+@click.option("--sim-threshold", default=0.78, show_default=True,
+              help="Cosine mínimo entre centroides para considerar un par")
+@click.option("--min-hops", default=3, show_default=True,
+              help="Distancia mínima en el grafo (≥3 = ni vecinos ni vecinos-de-vecinos)")
+@click.option("--top", default=5, show_default=True,
+              help="Máximo de puentes a proponer por corrida")
+@click.option("--skip-young-days", default=7, show_default=True,
+              help="Ignorar notas más nuevas que este umbral (siguen evolucionando)")
+@click.option("--no-llm", is_flag=True,
+              help="No generar 'por qué' (más rápido, útil para debugging)")
+@click.option("--plain", is_flag=True, help="Salida plana sin colores")
+def surface(sim_threshold: float, min_hops: int, top: int,
+            skip_young_days: int, no_llm: bool, plain: bool):
+    """Puentes no hechos: pares de notas cercanas en significado pero lejanas en el grafo.
+
+    Corrida proactiva — ideal como cron nocturno antes del morning brief, o manual
+    cuando querés densificar el grafo. Cada corrida loguea a surface.jsonl para
+    después alimentar el ranker del feedback loop.
+    """
+    import time as _time
+    t0 = _time.time()
+    pairs = find_surface_bridges(
+        col=get_db(),
+        sim_threshold=sim_threshold,
+        min_hops=min_hops,
+        top=top,
+        skip_young_days=skip_young_days,
+    )
+    duration_ms = int((_time.time() - t0) * 1000)
+
+    if not pairs:
+        msg = f"Sin puentes con cosine ≥ {sim_threshold} y dist ≥ {min_hops}. Bajá --sim-threshold si querés explorar."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        _surface_log_run({
+            "n_pairs": 0, "sim_threshold": sim_threshold, "min_hops": min_hops,
+            "top": top, "skip_young_days": skip_young_days, "llm": not no_llm,
+            "duration_ms": duration_ms,
+        }, [])
+        return
+
+    if not no_llm:
+        for p in pairs:
+            p["reason"] = _surface_generate_reason(p)
+    duration_ms = int((_time.time() - t0) * 1000)
+
+    _surface_log_run({
+        "n_pairs": len(pairs), "sim_threshold": sim_threshold,
+        "min_hops": min_hops, "top": top, "skip_young_days": skip_young_days,
+        "llm": not no_llm, "duration_ms": duration_ms,
+    }, pairs)
+
+    if plain:
+        for i, p in enumerate(pairs, 1):
+            click.echo(f"{i}. {p['similarity']:.2f}  {p['a_path']}  ↔  {p['b_path']}")
+            if p.get("reason"):
+                click.echo(f"   {p['reason']}")
+        return
+
+    console.print()
+    console.print(Rule(
+        title=f"[bold magenta]🔗 {len(pairs)} puente(s) sugerido(s) (cosine ≥ {sim_threshold}, hops ≥ {min_hops})[/bold magenta]",
+        style="magenta",
+    ))
+    for i, p in enumerate(pairs, 1):
+        console.print()
+        console.print(
+            f"[bold]{i}.[/bold] [bold]{p['similarity']:.3f}[/bold]  "
+            f"[magenta]{p['a_note']}[/magenta] [dim]({p['a_path']})[/dim]"
+        )
+        console.print(
+            f"     ↔  [magenta]{p['b_note']}[/magenta] [dim]({p['b_path']})[/dim]"
+        )
+        if p.get("reason"):
+            console.print(f"     [cyan]→[/cyan] [italic]{p['reason']}[/italic]")
+    console.print()
+    console.print(f"[dim]{duration_ms}ms · log: {SURFACE_LOG_PATH}[/dim]")
 
 
 @cli.command()

@@ -4667,18 +4667,18 @@ def _arrow_select(
     default_idx: int = 0,
 ) -> int:
     """Menú interactivo con ↑/↓ + Enter. Retorna el índice elegido, o -1
-    si el usuario cancela (Esc / Ctrl-C / q).
+    si el usuario cancela (q / Esc bare / Ctrl-C).
 
     Fallback no-TTY (pipes, tests, CI): retorna default_idx sin prompt.
-    Implementado con termios + rich.Live, sin agregar dependencias.
 
-    Notas técnicas:
-      - `tty.setcbreak` (NO setraw): mantiene OPOST activo así los \\n
-        se traducen a \\r\\n correctamente. Con setraw el output era una
-        sola línea apilando todo a la derecha (bug confirmado en uso).
-      - `auto_refresh=False` + `refresh=True` explícito: el background
-        timer de Live causaba redibujado innecesario; en cbreak mode
-        eso provoca duplicados visuales. Solo refrescamos en keypress.
+    Implementación: ANSI cursor movement manual. Probada predictable —
+    Rich.Live con cbreak + auto_refresh dio bugs de doble-render y
+    flechas que no actualizaban. Acá controlamos línea por línea:
+      - render inicial: imprime N+2 líneas (título + choices + hint).
+      - en cada keypress: cursor up N+2, escribe cada línea con \\x1b[2K
+        (clear line) + contenido nuevo + \\n.
+      - al salir: cursor up N+2, clear N+2 líneas, posiciona cursor
+        donde estaba el título (chat panel arranca limpio ahí).
     """
     import sys
     if not sys.stdin.isatty():
@@ -4688,58 +4688,91 @@ def _arrow_select(
     import termios
     import tty
 
-    selected = max(0, min(default_idx, len(choices) - 1))
+    n_choices = len(choices)
+    selected = max(0, min(default_idx, n_choices - 1))
+    # Layout: 1 (título) + n_choices + 1 (hint) = total_lines.
+    total_lines = 1 + n_choices + 1
+    hint = "[↑/↓ navegar · Enter elegir · q cancelar]"
 
-    def _render() -> Text:
-        out = Text()
-        out.append(title + "\n", style="bold")
-        for i, label in enumerate(choices):
-            if i == selected:
-                out.append("  ❯ ", style="bold cyan")
-                out.append(label + "\n", style="bold cyan")
-            else:
-                out.append("    ")
-                out.append(label + "\n")
-        out.append("[↑/↓ navegar · Enter elegir · q cancelar]", style="dim")
-        return out
+    def _line_for(idx: int) -> str:
+        """Genera la línea idx-ésima del menú con ANSI styling.
+        idx 0 = título; 1..n_choices = choices; n_choices+1 = hint.
+        """
+        if idx == 0:
+            return f"\x1b[1m{title}\x1b[0m"
+        if idx == total_lines - 1:
+            return f"\x1b[2m{hint}\x1b[0m"
+        ci = idx - 1
+        label = choices[ci]
+        if ci == selected:
+            return f"  \x1b[1;36m❯ {label}\x1b[0m"
+        return f"    {label}"
+
+    def _draw_initial():
+        for i in range(total_lines):
+            sys.stdout.write(_line_for(i) + "\n")
+        sys.stdout.flush()
+
+    def _redraw():
+        # Volver al inicio del bloque, reescribir cada línea limpiándola.
+        sys.stdout.write(f"\x1b[{total_lines}A")
+        for i in range(total_lines):
+            sys.stdout.write("\r\x1b[2K" + _line_for(i) + "\n")
+        sys.stdout.flush()
+
+    def _erase_menu():
+        sys.stdout.write(f"\x1b[{total_lines}A")
+        for _ in range(total_lines):
+            sys.stdout.write("\r\x1b[2K\n")
+        sys.stdout.write(f"\x1b[{total_lines}A")
+        sys.stdout.flush()
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-    from rich.live import Live
+    _draw_initial()
     try:
         tty.setcbreak(fd)
-        with Live(
-            _render(),
-            console=console,
-            auto_refresh=False,
-            transient=True,
-        ) as live:
-            while True:
-                try:
-                    ch = sys.stdin.read(1)
-                except KeyboardInterrupt:
-                    return -1
-                if ch == "\x1b":   # ESC o secuencia
-                    if _select_mod.select([sys.stdin], [], [], 0.05)[0]:
-                        seq = sys.stdin.read(2)
-                        if seq == "[A":
-                            selected = (selected - 1) % len(choices)
-                        elif seq == "[B":
-                            selected = (selected + 1) % len(choices)
-                        # otras secuencias: ignorar
-                    else:
-                        return -1   # ESC bare → cancelar
-                elif ch in ("\r", "\n"):
-                    return selected
-                elif ch == "q":
-                    return -1
-                elif ch == "k":   # vim-style up
-                    selected = (selected - 1) % len(choices)
-                elif ch == "j":   # vim-style down
-                    selected = (selected + 1) % len(choices)
-                live.update(_render(), refresh=True)
-    except KeyboardInterrupt:
-        return -1
+        while True:
+            # CRÍTICO: os.read(fd, 1) — NO sys.stdin.read(1).
+            # sys.stdin es TextIOWrapper con su propio buffer que sigue
+            # siendo line-buffered incluso con cbreak en el TTY. read(1)
+            # bloquea esperando que llegue un newline. Bypass directo al
+            # fd con os.read da un byte tan pronto como esté disponible.
+            try:
+                b = os.read(fd, 1)
+            except (KeyboardInterrupt, OSError):
+                _erase_menu()
+                return -1
+            if not b:
+                continue
+            ch = b.decode("latin-1")
+            if ch == "\x1b":   # ESC o secuencia
+                # Pequeño timeout para distinguir ESC bare de inicio de seq.
+                r, _, _ = _select_mod.select([fd], [], [], 0.05)
+                if r:
+                    seq = os.read(fd, 2).decode("latin-1")
+                    if seq == "[A":
+                        selected = (selected - 1) % n_choices
+                    elif seq == "[B":
+                        selected = (selected + 1) % n_choices
+                    # otras secuencias: ignorar
+                else:
+                    _erase_menu()
+                    return -1   # ESC bare → cancelar
+            elif ch in ("\r", "\n"):
+                _erase_menu()
+                return selected
+            elif ch == "q":
+                _erase_menu()
+                return -1
+            elif ch == "k":
+                selected = (selected - 1) % n_choices
+            elif ch == "j":
+                selected = (selected + 1) % n_choices
+            elif ch == "\x03":   # Ctrl-C en cbreak (ISIG-aware) puede
+                _erase_menu()    # llegar igual via el fd; manejar.
+                return -1
+            _redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 

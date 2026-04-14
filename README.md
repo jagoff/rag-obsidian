@@ -134,6 +134,41 @@ rag setup                                  # instala launchd: watch + digest
 
 ## Arquitectura: pipelines
 
+> Los diagramas viven en [`docs/diagrams/`](./docs/diagrams/) como mermaid (`.mmd`, editable) + SVG renderizado. Los bloques `mermaid` inline abajo son los mismos diagramas — GitHub los renderiza directo. Regenerar SVGs: `cd docs/diagrams && for f in *.mmd; do npx -y @mermaid-js/mermaid-cli -i "$f" -o "${f%.mmd}.svg" -t dark -b transparent; done`.
+
+### System overview — cómo se conectan las piezas
+
+![System overview](./docs/diagrams/system-overview.svg)
+
+### Interacciones con Ollama
+
+Cada operación del pipeline va a un modelo específico. Ollama es el único daemon con estado (resident VRAM via `keep_alive=-1`); el reranker vive en sentence-transformers aparte (MPS+fp16).
+
+![Ollama interactions](./docs/diagrams/ollama-interactions.svg)
+
+| Operación | Modelo | Vía |
+|---|---|---|
+| Index embeddings (chunks + URL contexts) | `bge-m3` | Ollama `embed` |
+| Query embeddings (variantes) | `bge-m3` | Ollama `embed` |
+| Expand queries (3 paraphrases) | `qwen2.5:3b` | Ollama `chat` |
+| Reformulate con session history | `qwen2.5:3b` | Ollama `chat` |
+| HyDE (opt-in `--hyde`) | `qwen2.5:3b` | Ollama `chat` |
+| Autotag / inbox tag suggestion | `qwen2.5:3b` | Ollama `chat` |
+| Answer generation (query + chat) | `command-r:latest` | Ollama `chat` streaming |
+| Contradiction detection (fase 1 + 2) | `command-r:latest` | Ollama `chat` (JSON strict) |
+| Weekly digest / morning brief / prep | `command-r:latest` | Ollama `chat` |
+| Surface "por qué este puente" | `command-r:latest` | Ollama `chat` |
+| Agent loop (`rag do`) | `command-r:latest` | Ollama `chat` tool-calling |
+| Cross-encoder rerank | `BAAI/bge-reranker-v2-m3` | sentence-transformers local (MPS+fp16) |
+
+Fallback resolver de `resolve_chat_model()`: `command-r:latest` → `qwen2.5:14b` → `phi4:latest`. El primero instalado gana.
+
+### Topología de servicios
+
+Launchd + CLIs + bots + Ollama + storage — qué corre solo, qué dispara qué, qué escribe dónde.
+
+![Services topology](./docs/diagrams/services-topology.svg)
+
 ### Retrieval
 
 ```mermaid

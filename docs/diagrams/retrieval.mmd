@@ -1,0 +1,21 @@
+flowchart TD
+    Q[query] --> Intent[classify_intent]
+    Intent -->|count/list/recent| MetaScan[metadata scan<br/>sin LLM]
+    Intent -->|semantic| Filters[infer_filters<br/>auto folder/tag]
+    Filters --> History{¿hay session<br/>history?}
+    History -->|sí| Reform["reformulate_query<br/>(ollama: qwen2.5:3b)"]
+    History -->|no| Expand
+    Reform --> Expand["expand_queries<br/>3 paraphrases<br/>(ollama: qwen2.5:3b)"]
+    Expand --> Embed["batch embed<br/>(ollama: bge-m3)"]
+    Embed --> Per["por variante:<br/>ChromaDB sem + BM25"]
+    Per --> RRF[RRF merge + dedup]
+    RRF --> Parent[expand to parent section]
+    Parent --> Rerank["cross-encoder rerank<br/>bge-reranker-v2-m3<br/>MPS+fp16"]
+    Rerank --> Gate{top_score ≥<br/>CONFIDENCE_RERANK_MIN<br/>0.015?}
+    Gate -->|no, sin --force| Refuse[refuse + log]
+    Gate -->|sí| LLM["command-r streaming<br/>(ollama)<br/>strict / loose"]
+    LLM --> Verify[verify_citations]
+    Verify --> Counter{--counter?}
+    Counter -->|sí| FindContrad["find_contradictions<br/>(ollama: command-r)"]
+    Counter -->|no| Render[render + sources + related]
+    FindContrad --> Render

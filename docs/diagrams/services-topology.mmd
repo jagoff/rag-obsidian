@@ -1,0 +1,53 @@
+graph TD
+    subgraph User["🧑 Usuario"]
+        CLI["rag CLI<br/>(terminal)"]
+        CC["Claude Code<br/>(MCP client)"]
+        TG["Telegram app"]
+    end
+
+    subgraph Launchd["launchd services (com.fer.*)"]
+        Watch["obsidian-rag-watch<br/>RunAtLoad + KeepAlive"]
+        Digest["obsidian-rag-digest<br/>domingo 22:00"]
+        Morning["obsidian-rag-morning<br/>Lun-Vie 7:00"]
+        RagBot["obsidian-rag-bot<br/>@ragsystemobs_bot"]
+        ClaudeBot["claude-telegram-bot<br/>@ffeerrr_bot"]
+        OllamaBot["ollama-telegram-bot<br/>@rauuuliiitoo_bot"]
+        N8N["n8n<br/>localhost:5678"]
+    end
+
+    subgraph Core["Core (local, free)"]
+        Rag["rag.py (Python 3.13)<br/>→ ~/.local/bin/rag"]
+        MCP["obsidian-rag-mcp<br/>stdio"]
+        Ollama["Ollama localhost:11434<br/>bge-m3 · qwen2.5:3b · command-r · phi4"]
+        Whisper["whisper-cli<br/>~/whisper-models/ggml-small.bin"]
+        Say["macOS say -v Mónica<br/>(TTS)"]
+    end
+
+    subgraph Storage["Storage"]
+        Vault["Obsidian vault<br/>(iCloud)"]
+        Local["~/.local/share/obsidian-rag/<br/>chroma + jsonl + sessions"]
+        Config["~/.config/obsidian-rag/<br/>vaults.json"]
+    end
+
+    CLI --> Rag
+    CC --> MCP --> Rag
+
+    Watch --> Rag
+    Digest --> Rag
+    Morning --> Rag
+
+    Rag --> Ollama
+    Rag --> Vault
+    Rag --> Local
+    Rag --> Config
+
+    TG --> RagBot & ClaudeBot & OllamaBot
+    RagBot -->|voice| Whisper
+    RagBot -->|rag query| Rag
+    RagBot -->|TTS| Say
+    ClaudeBot -->|voice| Whisper
+    ClaudeBot -.->|/rag| Rag
+    OllamaBot --> Ollama
+
+    Rag -.->|ambient POST| TGAPI[api.telegram.org]
+    N8N -.->|opcional webhooks| Rag

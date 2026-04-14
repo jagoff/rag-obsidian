@@ -1,0 +1,19 @@
+flowchart LR
+    subgraph P1[Phase 1: query-time]
+        Q[rag query/chat<br/>--counter] --> A[answer<br/>command-r]
+        A --> Find1["find_contradictions<br/>(ollama: command-r)"]
+        Find1 --> Render[⚡ Counter-evidence block]
+    end
+    subgraph P2[Phase 2: index-time]
+        Edit[nota nueva/modificada] --> Find2["find_contradictions_for_note<br/>(ollama: command-r)"]
+        Find2 --> FM["frontmatter<br/>contradicts: [path]"]
+        Find2 --> JSONL[contradictions.jsonl]
+    end
+    subgraph P3[Phase 3: weekly digest]
+        Cron["Sunday 22:00<br/>(launchd)"] --> Collect[_collect_week_evidence]
+        FM --> Collect
+        JSONL --> Collect
+        QLogD[queries.jsonl] --> Collect
+        Collect --> Draft["command-r drafting<br/>(ollama)<br/>1ra persona"]
+        Draft --> Note[05-Reviews/YYYY-WNN.md<br/>auto-indexed]
+    end

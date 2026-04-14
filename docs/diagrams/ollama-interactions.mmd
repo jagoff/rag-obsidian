@@ -1,0 +1,55 @@
+flowchart LR
+    subgraph Ops["Operaciones (rag.py)"]
+        direction TB
+        IndexOp["Indexing<br/>_index_single_file"]
+        QueryOp["Query retrieval<br/>retrieve()"]
+        Reform["Reformulate query<br/>(session history)"]
+        Expand["Expand queries<br/>3 paraphrases"]
+        HyDE["HyDE<br/>(opt-in, OFF default)"]
+        Autotag["_suggest_tags_for_note<br/>(inbox + autotag)"]
+        LLMAns["LLM answer<br/>streaming"]
+        FindContr["find_contradictions<br/>(Phase 1 + Phase 2)"]
+        Digest["rag digest<br/>weekly review"]
+        Morning["rag morning<br/>daily brief"]
+        Prep["rag prep<br/>briefing"]
+        Surface["rag surface<br/>bridge 'por qué'"]
+        AgentDo["rag do<br/>tool-calling agent"]
+    end
+
+    subgraph Ollama["Ollama daemon · localhost:11434 · keep_alive=-1"]
+        direction TB
+        BGE["bge-m3<br/>embeddings · 1024d · multilingual"]
+        Q3B["qwen2.5:3b<br/>helper · rápido · temp=0 seed=42<br/>num_ctx=1024 num_predict=128"]
+        CR["command-r:latest<br/>chat + judgment · RAG-trained<br/>num_ctx=4096 num_predict=768"]
+    end
+
+    subgraph Fallback["resolve_chat_model preference"]
+        CR2[command-r:latest]
+        QW14[qwen2.5:14b]
+        PHI4[phi4:latest]
+        CR2 -->|not installed| QW14
+        QW14 -->|not installed| PHI4
+    end
+
+    subgraph Local["Sentence-Transformers local<br/>(NO pasa por Ollama)"]
+        RR["bge-reranker-v2-m3<br/>device=mps + fp16<br/>HF cache offline"]
+    end
+
+    IndexOp -->|embed chunks + URL contexts| BGE
+    QueryOp -->|embed query variants| BGE
+    QueryOp -->|cross-encoder rerank| RR
+
+    Reform --> Q3B
+    Expand --> Q3B
+    HyDE --> Q3B
+    Autotag --> Q3B
+
+    LLMAns --> CR
+    FindContr --> CR
+    Digest --> CR
+    Morning --> CR
+    Prep --> CR
+    Surface --> CR
+    AgentDo -->|tool-calling loop| CR
+
+    CR2 -.->|resolve_chat_model| CR

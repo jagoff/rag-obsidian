@@ -1,0 +1,22 @@
+flowchart TD
+    Trig{trigger}
+    Trig -->|"rag watch (launchd)"| Single[_index_single_file]
+    Trig -->|"rag index"| Bulk[_run_index loop]
+    Trig -->|"rag index --reset"| Drop[delete collections] --> Bulk
+
+    Single --> Hash{hash diff<br/>vs Chroma?}
+    Bulk --> Hash
+    Hash -->|igual| Skip[skip]
+    Hash -->|distinto| ContrCheck{skip_contradict<br/>=False?}
+    ContrCheck -->|sí| Contr["find_contradictions_for_note<br/>(ollama: command-r)"] --> WriteFM["update<br/>frontmatter contradicts:<br/>+ jsonl log"]
+    ContrCheck -->|no, o reset| Chunks
+    WriteFM --> Chunks[semantic_chunks<br/>150-800 chars]
+    Chunks --> EmbedC["embed<br/>(ollama: bge-m3)"]
+    EmbedC --> Upsert[upsert main collection]
+    Upsert --> URLs[_index_urls<br/>extract + embed contexto]
+    URLs --> URLUpsert[upsert urls collection]
+    URLUpsert --> Cache[invalidate corpus cache]
+    Cache --> Ambient{nota en<br/>00-Inbox/?}
+    Ambient -->|sí + config| Hook[ambient hook:<br/>wikilinks + dupes + related]
+    Hook --> Telegram[POST api.telegram.org]
+    Ambient -->|no| Done[done]

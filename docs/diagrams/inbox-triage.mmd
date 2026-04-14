@@ -1,0 +1,11 @@
+flowchart TD
+    Inbox[rag inbox] --> Loop[for nota in 00-Inbox/]
+    Loop --> Folder["_suggest_folder_for_note<br/>mode de neighbours<br/>(embeddings)"]
+    Loop --> Tags["_suggest_tags_for_note<br/>(ollama: qwen2.5:3b)<br/>contra vocab existente"]
+    Loop --> Wiki[find_wikilink_suggestions<br/>regex contra title_to_paths]
+    Loop --> Dupe[find_near_duplicates_for<br/>cosine centroides]
+    Folder & Tags & Wiki & Dupe --> Plan[render plan]
+    Plan -->|--apply| Move[shutil.move<br/>si conf ≥ 0.4]
+    Move --> ApplyTags[_apply_frontmatter_tags]
+    ApplyTags --> ApplyWiki[apply_wikilink_suggestions]
+    ApplyWiki --> Reidx["_index_single_file<br/>(skip_contradict=True)<br/>→ bge-m3"]

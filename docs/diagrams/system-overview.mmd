@@ -1,0 +1,46 @@
+graph TD
+    Vault["📁 Obsidian vault<br/>iCloud~md~obsidian"]
+
+    subgraph IDX["Indexing"]
+        Watch["rag watch<br/>(launchd)"]
+        IndexCmd["rag index"]
+    end
+
+    subgraph DB["Storage local<br/>~/.local/share/obsidian-rag/"]
+        Chroma[("ChromaDB<br/>obsidian_notes_v7<br/>+ obsidian_urls_v1")]
+        Sessions["sessions/*.json"]
+        QLog["queries.jsonl"]
+        CLog["contradictions.jsonl"]
+        ALog["ambient.jsonl"]
+        SLog["surface.jsonl"]
+        FLog["filing.jsonl"]
+    end
+
+    subgraph RT["Retrieval / generación"]
+        Query["rag query / chat<br/>prep / links"]
+        Counter["--counter<br/>(contradiction radar)"]
+    end
+
+    subgraph Ollama["Ollama localhost:11434<br/>keep_alive=-1"]
+        Embed["bge-m3 (1024d)"]
+        Helper["qwen2.5:3b (helper)"]
+        Chat["command-r (chat + judgment)"]
+    end
+
+    Reranker["bge-reranker-v2-m3<br/>sentence-transformers<br/>MPS + fp16"]
+
+    Vault --> Watch & IndexCmd
+    Watch & IndexCmd --> Embed
+    Embed --> Chroma
+    Query --> Embed
+    Query --> Helper
+    Query --> Reranker
+    Query --> Chat
+    Chroma --> Query
+    Query --> Sessions & QLog
+    Counter --> CLog
+    Watch --> ALog
+    Query --> SLog & FLog
+
+    MCP["obsidian-rag-mcp<br/>(stdio)"] -.-> Query
+    Bots["Telegram bots<br/>@ragsystemobs_bot<br/>@ffeerrr_bot"] -.-> Query

@@ -278,10 +278,12 @@ Tests: `tests/test_contradictions.py` (16 cases — fixtures monkeypatch `embed`
 ## Eval harness (`rag eval` + `queries.yaml`)
 
 `queries.yaml` is the golden set. Two axes:
-- **singles**: 21 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical). Baseline on v7: `hit@5 90.48% · MRR 0.786 · recall@5 90.48%`.
-- **chains**: 6 multi-turn chains (16 turns total) exercising follow-ups with pronouns/demonstratives — each turn after the first is reformulated via `reformulate_query` against the running history. Baseline on v7: `hit@5 75.00% · MRR 0.656 · recall@5 75.00% · chain_success 50.00%`.
+- **singles**: 29 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical). Current baseline (2026-04-15, master @ `1ae12b0`): `hit@5 82.76% · MRR 0.741 · recall@5 82.76%`.
+- **chains**: 6 multi-turn chains (16 turns total) exercising follow-ups with pronouns/demonstratives — each turn after the first is reformulated via `reformulate_query` against the running history. Current baseline (2026-04-15): `hit@5 56.25% · MRR 0.385 · recall@5 56.25% · chain_success 16.67%`.
 
-The v6→v7 drop in singles (95.24 → 90.48) is the schema bump (outlinks + re-chunking), not a retrieval regression — confirmed by `--no-multi` showing the same numbers. Use these baselines to measure any change to chunking, prompts, models, or retrieval — don't ship blind.
+Historical reference (v7 right after the schema bump): singles `hit@5 90.48% · MRR 0.786`, chains `hit@5 75.00% · MRR 0.656 · chain_success 50.00%`. The drop to current numbers is real on chains (same 16/6 turns) and partially explained on singles by the set growing (21 → 29). Locked in `docs/eval-baselines-2026-04-15.md` — diff against that file when measuring changes. Use the **current** numbers as the floor; never claim a win without re-running `rag eval` against the same set.
+
+The v6→v7 drop in singles (95.24 → 90.48 → 82.76) traces to the schema bump (outlinks + re-chunking) plus subsequent set growth and possible reformulate drift on chains — confirmed earlier with `--no-multi` showing the same numbers as multi. Use the current baseline to measure any change to chunking, prompts, models, or retrieval — don't ship blind.
 
 Empirical finding that informed defaults: **HyDE with qwen2.5:3b drops hit@5 from 95 → 90%**. Small models drift the hypothetical from real note phrasing. HyDE is opt-in (`--hyde`); re-measure if the helper model changes size class.
 

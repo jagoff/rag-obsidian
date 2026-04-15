@@ -2,6 +2,7 @@
 """Obsidian RAG — semantic chunking, title prefix, HyDE, hybrid BM25+semantic, reranking."""
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -3743,6 +3744,61 @@ def _personalized_folder_vote(
 # ── FILING apply + undo ──────────────────────────────────────────────────────
 
 FILING_BATCHES_DIR = Path.home() / ".local/share/obsidian-rag/filing_batches"
+VAULT_WRITE_LOCK_PATH = Path.home() / ".local/share/obsidian-rag/.write.lock"
+
+
+@contextlib.contextmanager
+def vault_write_lock(op: str, *, blocking: bool = True, timeout: float = 300.0):
+    """Advisory lock para serializar mutadores del vault + índice.
+
+    Cubre `rag index` (full + reset), `rag file --apply`, `rag inbox --apply`,
+    y cualquier flujo que mueva notas o escriba chunks a Chroma en batch.
+    NO se usa en paths read-only (query, chat, stats) ni en re-index de una
+    sola nota vía watch/ambient (esos serializan a través de los locks
+    internos de Chroma/SQLite; tomar el lock global ahí bloquearía un
+    mutator batch por horas).
+
+    `op` es el nombre de la operación (para el error message si otro
+    proceso tiene el lock). Con `blocking=False` raise RuntimeError en vez
+    de esperar. Con `blocking=True` espera hasta `timeout` y raise si no
+    se obtiene.
+    """
+    VAULT_WRITE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = VAULT_WRITE_LOCK_PATH.open("a+")
+    try:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        if blocking:
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() >= deadline:
+                        raise RuntimeError(
+                            f"{op}: otro mutator tiene el lock "
+                            f"({VAULT_WRITE_LOCK_PATH}). Esperé {timeout:.0f}s."
+                        )
+                    time.sleep(0.5)
+        else:
+            try:
+                fcntl.flock(lock_file.fileno(), flags)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"{op}: otro mutator tiene el lock ({VAULT_WRITE_LOCK_PATH})."
+                )
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"{op} · pid={os.getpid()} · {datetime.now().isoformat()}\n")
+        lock_file.flush()
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
+
 # Token que marca el upward-link appendeado al pie de la nota — permite al
 # undo detectarlo y removerlo limpio. Cualquier edición manual del usuario
 # queda por encima del token intacta.
@@ -3831,20 +3887,40 @@ def _apply_filing_move(
     }
 
 
-def _write_filing_batch(entries: list[dict]) -> Path | None:
-    """Persiste un batch de moves para permitir undo atómico. Un archivo
-    JSONL por corrida, nombrado por timestamp. Retorna el path o None si no
-    hay entries válidos.
+def _open_filing_batch() -> Path:
+    """Crea un batch file vacío con timestamp y devuelve su path.
+
+    Diseño: el batch se abre ANTES del loop de moves y se appendea por cada
+    move exitoso (ver `_append_filing_batch`). Si el loop se interrumpe
+    (Ctrl-C, error, OOM), `rag file --undo` puede revertir los moves ya
+    aplicados — antes se escribía todo al final del loop y una interrupción
+    dejaba los moves sin récord.
     """
-    if not entries:
-        return None
     FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     path = FILING_BATCHES_DIR / f"{ts}.jsonl"
-    with path.open("w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    path.touch()
     return path
+
+
+def _append_filing_batch(batch_path: Path, entry: dict) -> None:
+    """Appendea una entry al batch. Flush + fsync para que sobreviva crash."""
+    with batch_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _write_filing_batch(entries: list[dict]) -> Path | None:
+    """Compat wrapper — bulk write. Uso legacy desde tests y rutas pre-refactor.
+    Nueva feature debe usar `_open_filing_batch` + `_append_filing_batch`.
+    """
+    if not entries:
+        return None
+    batch_path = _open_filing_batch()
+    for e in entries:
+        _append_filing_batch(batch_path, e)
+    return batch_path
 
 
 def _last_filing_batch() -> Path | None:
@@ -5366,7 +5442,8 @@ def index(reset: bool, no_contradict: bool):
     (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
     saltea también en incremental.
     """
-    _run_index(reset=reset, no_contradict=no_contradict)
+    with vault_write_lock("index"):
+        _run_index(reset=reset, no_contradict=no_contradict)
 
 
 @cli.command()
@@ -8670,7 +8747,16 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             style="magenta",
         ))
 
+    try:
+        _write_lock = vault_write_lock("file --apply", blocking=False)
+        _write_lock.__enter__()
+    except RuntimeError as ex:
+        msg = f"{ex}  — probá otra vez cuando termine el otro proceso."
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
     batch_entries: list[dict] = []
+    batch_path = _open_filing_batch()
     for i, (src_path, pr) in enumerate(proposals, 1):
         _render_filing_proposal(i, len(proposals), pr, plain)
         if "error" in pr:
@@ -8727,7 +8813,7 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             continue
 
         batch_entries.append(entry)
-        # Log con decisión + target efectivo (puede diferir de pr["folder"]).
+        _append_filing_batch(batch_path, entry)
         logged = dict(pr)
         logged["applied_to"] = entry["dst"]
         _filing_log_proposal(logged, decision=decision)
@@ -8736,7 +8822,10 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
         else:
             console.print(f"   [green]✓[/green] movido a [cyan]{entry['dst']}[/cyan]")
 
-    batch_path = _write_filing_batch(batch_entries)
+    if not batch_entries:
+        batch_path.unlink(missing_ok=True)
+        batch_path = None
+
     if plain:
         click.echo(f"\n{len(batch_entries)} aplicada(s).")
         if batch_path:
@@ -8751,6 +8840,8 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
             console.print("[dim]`rag file --undo` revierte este batch.[/dim]")
         else:
             console.print("[yellow]Nada aplicado.[/yellow]")
+
+    _write_lock.__exit__(None, None, None)
 
 
 @cli.command()
@@ -8786,6 +8877,15 @@ def inbox(folder: str, apply: bool, max_tags: int, limit: int,
         return
 
     col = get_db()
+    if apply:
+        try:
+            _inbox_lock = vault_write_lock("inbox --apply", blocking=False)
+            _inbox_lock.__enter__()
+        except RuntimeError as ex:
+            console.print(f"[red]{ex}  — probá otra vez cuando termine el otro proceso.[/red]")
+            return
+    else:
+        _inbox_lock = None
     moved = 0
     tagged = 0
     linkified = 0
@@ -8880,6 +8980,8 @@ def inbox(folder: str, apply: bool, max_tags: int, limit: int,
             f"{moved} movidas · {tagged} tags actualizados · "
             f"{linkified} con wikilinks · {flagged_dupes} dupes flaggeados"
         )
+        if _inbox_lock is not None:
+            _inbox_lock.__exit__(None, None, None)
     else:
         console.print(
             f"[cyan]Plan generado para {len(notes)} nota(s).[/cyan] "

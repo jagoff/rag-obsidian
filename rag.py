@@ -4154,12 +4154,14 @@ def retrieve(
     multi_query: bool = True,
     auto_filter: bool = True,
     date_range: tuple[float, float] | None = None,
+    summary: str | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
 
     Pipeline:
-      - optional history-aware reformulation (precise)
+      - optional history-aware reformulation (precise), with optional `summary`
+        of older turns aged out of `history`
       - optional auto-filter by tag/folder inferred from the query
       - multi-query: 3 paraphrases, BM25 + semantic for each, union candidates
       - cross-encoder rerank against the original question
@@ -4173,8 +4175,8 @@ def retrieve(
 
     # 1. Reformulate vs history (precise mode)
     search_query = question
-    if precise and history:
-        search_query = reformulate_query(question, history)
+    if precise and (history or summary):
+        search_query = reformulate_query(question, history or [], summary=summary)
 
     # 2. Auto-filter: sniff tag/folder/date from the query against index vocabulary
     filters_applied: dict = {}
@@ -4383,6 +4385,7 @@ def multi_retrieve(
     multi_query: bool = True,
     auto_filter: bool = True,
     date_range: tuple[float, float] | None = None,
+    summary: str | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -4408,7 +4411,7 @@ def multi_retrieve(
         r = retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
-            date_range=date_range,
+            date_range=date_range, summary=summary,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -4424,7 +4427,7 @@ def multi_retrieve(
         r = retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
-            date_range=date_range,
+            date_range=date_range, summary=summary,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -5393,11 +5396,14 @@ def query(
 
     # Reformulate standalone follow-ups when we have prior turns. Do this even
     # outside --hyde/--precise because the whole point of --session is that the
-    # new question can be a pronoun-laden fragment.
+    # new question can be a pronoun-laden fragment. When the session has aged
+    # turns out of the raw window, feed the cached summary so long-range
+    # context survives the reformulation.
     effective_question = question
     if history:
         try:
-            effective_question = reformulate_query(question, history)
+            sess_summary = session_summary(sess) if sess else None
+            effective_question = reformulate_query(question, history, summary=sess_summary)
         except Exception:
             effective_question = question
 
@@ -6163,11 +6169,12 @@ def chat(
             console.print(f"[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]")
             continue
 
+        sess_summary = session_summary(sess)
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
-                date_range=pinned_date_range,
+                date_range=pinned_date_range, summary=sess_summary,
             )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
@@ -6386,11 +6393,20 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             chain_id = chain.get("id", "<sin id>")
             turns = chain.get("turns") or []
             history: list[dict] = []
+            # Synthetic session — `session_summary` only fires past
+            # SESSION_COMPRESSION_THRESHOLD turns. Current golden chains stay
+            # under it, so the wiring is invariant on this set; longer chains
+            # would benefit transparently.
+            fake_sess: dict = {"turns": []}
             all_hit = True
             for i, turn in enumerate(turns):
                 q = turn["question"]
                 expected = set(turn.get("expected") or [])
-                search_q = q if (i == 0 or not history) else reformulate_query(q, history)
+                if i == 0 or not history:
+                    search_q = q
+                else:
+                    chain_summary = session_summary(fake_sess)
+                    search_q = reformulate_query(q, history, summary=chain_summary)
                 result = retrieve(
                     col, search_q, k, folder=None, tag=None,
                     precise=False, multi_query=not no_multi, auto_filter=True,
@@ -6405,10 +6421,9 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
                 # against without a real chat-model call.
                 history.append({"role": "user", "content": q})
                 top = seen_paths[0] if seen_paths else ""
-                history.append({
-                    "role": "assistant",
-                    "content": f"(contexto recuperado: {top})",
-                })
+                fake_a = f"(contexto recuperado: {top})"
+                history.append({"role": "assistant", "content": fake_a})
+                fake_sess["turns"].append({"q": q, "a": fake_a})
             per_chain_success.append((chain_id, all_hit))
 
         ctbl = Table(title=f"Chains multi-turno (k={k})", show_lines=False)

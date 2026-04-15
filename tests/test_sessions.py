@@ -216,3 +216,204 @@ def test_save_session_updates_updated_at(sessions_tmp):
 def test_session_path_rejects_invalid_id(sessions_tmp):
     with pytest.raises(ValueError):
         rag.session_path("invalid id!")
+
+
+# ── session_summary / _compress_turns / reformulate_query summary plumbing ──
+
+
+def _sess_with_turns(n: int) -> dict:
+    """Hand-built session with `n` synthetic q/a turns. Bypasses append_turn so
+    we don't rely on system clock or save_session."""
+    return {"turns": [{"q": f"q{i}", "a": f"a{i}"} for i in range(n)]}
+
+
+def test_session_summary_returns_none_below_threshold():
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD - 1)
+    assert rag.session_summary(sess) is None
+    assert "compressed_history" not in sess
+
+
+def test_session_summary_returns_none_when_window_covers_all():
+    # threshold met, but n - window <= 0 means no aged-out turns to summarize.
+    n = rag.SESSION_COMPRESSION_THRESHOLD
+    sess = _sess_with_turns(n)
+    # bump window so it ≥ n; still triggers threshold path but no aged turns.
+    assert rag.session_summary(sess, window=n) is None
+    assert "compressed_history" not in sess
+
+
+def test_session_summary_computes_and_caches(monkeypatch):
+    calls: list[list[dict]] = []
+
+    def fake_compress(turns):
+        calls.append(turns)
+        return f"resumen de {len(turns)} turnos"
+
+    monkeypatch.setattr(rag, "_compress_turns", fake_compress)
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)  # n=10, window=6
+    out = rag.session_summary(sess)
+    assert out == "resumen de 4 turnos"  # turns[:n - window] = turns[:4]
+    cache = sess["compressed_history"]
+    assert cache["version"] == rag.SESSION_SUMMARY_VERSION
+    assert cache["covers_until_idx"] == 4
+    assert cache["summary"] == "resumen de 4 turnos"
+    assert "ts" in cache
+    assert len(calls) == 1
+
+
+def test_session_summary_uses_cache_when_idx_unchanged(monkeypatch):
+    call_count = {"n": 0}
+
+    def fake_compress(turns):
+        call_count["n"] += 1
+        return "first"
+
+    monkeypatch.setattr(rag, "_compress_turns", fake_compress)
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
+    rag.session_summary(sess)
+    rag.session_summary(sess)
+    rag.session_summary(sess)
+    assert call_count["n"] == 1
+
+
+def test_session_summary_recomputes_when_window_advances(monkeypatch):
+    payloads: list[str] = ["v1", "v2"]
+
+    def fake_compress(turns):
+        return payloads.pop(0)
+
+    monkeypatch.setattr(rag, "_compress_turns", fake_compress)
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)  # n=10, until=4
+    assert rag.session_summary(sess) == "v1"
+    sess["turns"].extend([{"q": f"q{i}", "a": f"a{i}"} for i in range(10, 13)])  # n=13, until=7
+    assert rag.session_summary(sess) == "v2"
+    assert sess["compressed_history"]["covers_until_idx"] == 7
+
+
+def test_session_summary_invalidates_cache_on_version_bump(monkeypatch):
+    call_count = {"n": 0}
+
+    def fake_compress(turns):
+        call_count["n"] += 1
+        return f"call{call_count['n']}"
+
+    monkeypatch.setattr(rag, "_compress_turns", fake_compress)
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
+    rag.session_summary(sess)
+    monkeypatch.setattr(rag, "SESSION_SUMMARY_VERSION", rag.SESSION_SUMMARY_VERSION + 1)
+    out = rag.session_summary(sess)
+    assert call_count["n"] == 2
+    assert out == "call2"
+
+
+def test_session_summary_falls_back_to_cached_on_empty_compress(monkeypatch):
+    """If a recompute yields empty (LLM hiccup), keep serving the previous
+    cached summary rather than dropping context entirely."""
+    payloads = iter(["good", ""])
+
+    def fake_compress(turns):
+        return next(payloads)
+
+    monkeypatch.setattr(rag, "_compress_turns", fake_compress)
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
+    assert rag.session_summary(sess) == "good"
+    sess["turns"].extend([{"q": f"q{i}", "a": f"a{i}"} for i in range(10, 14)])
+    out = rag.session_summary(sess)
+    assert out == "good"  # falls back to cached, doesn't return empty
+    # Cache should still reflect the original (idx=4), not the failed advance.
+    assert sess["compressed_history"]["covers_until_idx"] == 4
+
+
+def test_session_summary_returns_none_when_compress_empty_no_cache(monkeypatch):
+    monkeypatch.setattr(rag, "_compress_turns", lambda turns: "")
+    sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
+    assert rag.session_summary(sess) is None
+    assert "compressed_history" not in sess
+
+
+def test_save_load_roundtrip_persists_compressed_history(sessions_tmp, monkeypatch):
+    monkeypatch.setattr(rag, "_compress_turns", lambda turns: "persistido")
+    sess = rag.ensure_session("compress-rt", mode="chat")
+    for i in range(rag.SESSION_COMPRESSION_THRESHOLD + 3):
+        rag.append_turn(sess, {"q": f"q{i}", "a": f"a{i}"})
+    rag.session_summary(sess)
+    rag.save_session(sess)
+
+    loaded = rag.load_session("compress-rt")
+    assert loaded is not None
+    assert loaded["compressed_history"]["summary"] == "persistido"
+    assert loaded["compressed_history"]["version"] == rag.SESSION_SUMMARY_VERSION
+    assert loaded["compressed_history"]["covers_until_idx"] == 4
+
+
+def test_reformulate_query_includes_summary_section(monkeypatch):
+    captured = {}
+
+    class FakeMsg:
+        def __init__(self, content): self.content = content
+
+    class FakeResp:
+        def __init__(self, content): self.message = FakeMsg(content)
+
+    def fake_chat(*, model, messages, options, keep_alive):
+        captured["prompt"] = messages[0]["content"]
+        return FakeResp("reformulado")
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    history = [
+        {"role": "user", "content": "hola"},
+        {"role": "assistant", "content": "que tal"},
+    ]
+    out = rag.reformulate_query("y eso?", history, summary="conversación previa sobre X")
+    assert out == "reformulado"
+    assert "Resumen de turnos previos:" in captured["prompt"]
+    assert "conversación previa sobre X" in captured["prompt"]
+    # Original recent history still rendered.
+    assert "Usuario: hola" in captured["prompt"]
+
+
+def test_reformulate_query_no_summary_baseline(monkeypatch):
+    captured = {}
+
+    class FakeMsg:
+        def __init__(self, content): self.content = content
+
+    class FakeResp:
+        def __init__(self, content): self.message = FakeMsg(content)
+
+    def fake_chat(*, model, messages, options, keep_alive):
+        captured["prompt"] = messages[0]["content"]
+        return FakeResp("reformulado")
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    rag.reformulate_query(
+        "y eso?",
+        [{"role": "user", "content": "hola"}],
+    )
+    assert "Resumen de turnos previos:" not in captured["prompt"]
+
+
+def test_reformulate_query_short_circuits_when_neither_history_nor_summary():
+    # No LLM call expected — function returns the question verbatim.
+    assert rag.reformulate_query("¿qué es X?", []) == "¿qué es X?"
+
+
+def test_reformulate_query_works_with_summary_only(monkeypatch):
+    """Edge case: summary present but raw history empty (e.g., very long
+    session whose recent window has just been pruned). Should still fire."""
+    captured = {}
+
+    class FakeMsg:
+        def __init__(self, content): self.content = content
+
+    class FakeResp:
+        def __init__(self, content): self.message = FakeMsg(content)
+
+    def fake_chat(*, model, messages, options, keep_alive):
+        captured["prompt"] = messages[0]["content"]
+        return FakeResp("ok")
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    out = rag.reformulate_query("y eso?", [], summary="contexto previo")
+    assert out == "ok"
+    assert "contexto previo" in captured["prompt"]

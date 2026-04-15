@@ -77,13 +77,14 @@ Python 3.13, `uv` for deps. Runtime: `.venv/bin/python` is the local venv; the g
 
 ## Architecture
 
-Everything is in `rag.py` (~12k lines) + `mcp_server.py` (thin wrapper) + `tests/` (~20k lines, ~550 tests). Single-file by design — no framework abstractions between the caller and the pipeline. The size grew with knowledge graph, agent loop, sessions, contradiction radar, digest, daily-productivity trilogy, surface/insights, multi-vault registry — the call graph stays flat and readable; resist the urge to package-split until a real friction shows up.
+Everything is in `rag.py` (~14k lines) + `mcp_server.py` (thin wrapper) + `tests/` (617 tests). Single-file by design — no framework abstractions between the caller and the pipeline. The size grew with knowledge graph, agent loop, sessions, contradiction radar, digest, daily-productivity trilogy, surface/insights, multi-vault registry, auto-tuned ranker — the call graph stays flat and readable; resist the urge to package-split until a real friction shows up.
 
-Subsistemas material que NO están documentados individualmente abajo (v1 suficientemente estable, ver tests/docstrings):
-- **`rag surface`** — proactive bridge builder: encuentra pares de notas lejanas en el grafo (3+ hops) con centroides similares, sugiere wikilinks o notas puente. Pura numpy + BFS, sin LLM. Test: `tests/test_surface.py`.
-- **`rag insights`** — feedback-loop tool sobre `queries.jsonl` + `feedback.jsonl`. Clusters de low-confidence queries, queries con bad_citations, patrones temporales. Test: `tests/test_insights.py`.
-- **`rag file`** / **`rag gaps`** / **`rag graph`** — filing asistido (sin `inbox`, una nota a la vez), cluster de gaps de conocimiento, export Obsidian canvas.
-- **Multi-vault registry** — `rag vault {add,use,list,remove}`, 3-level precedence (env → flag → registry current). Collections namespaced por `sha256[:8]` del path absoluto. Test: `tests/test_vaults.py`.
+Subsistemas con test suite propia y docstring autodescriptiva en `rag.py` (no re-documentados acá a menos que cambie el contrato):
+- **`rag surface`** — puentes entre notas lejanas del grafo (3+ hops) con centroides similares. Pura numpy + BFS, sin LLM. `tests/test_surface.py`.
+- **`rag insights`** — agregador sobre `queries.jsonl` + `feedback.jsonl`: clusters de low-confidence, bad_citations, patrones temporales. `tests/test_insights.py`.
+- **`rag file` / `rag gaps` / `rag graph`** — filing una-nota-a-la-vez, cluster de gaps, export canvas.
+- **Multi-vault registry** — `rag vault {add,use,list,remove}`, 3-level precedence (env → flag → registry current). Collections namespaced por `sha256[:8]` del path absoluto. `tests/test_vaults.py`.
+- **`rag emergent` / `rag patterns` / `rag silence`** — proactive infra semanal (viernes/domingo): temas emergentes, patrones de feedback, notas silenciadas. Launchd `com.fer.obsidian-rag-{emergent,patterns}`.
 
 ### Retrieval pipeline (`retrieve()` in rag.py)
 
@@ -151,14 +152,17 @@ Two link formats recognised and both styled with OSC 8 `file://` hyperlinks (Ctr
 
 ### Automation (launchd)
 
-Four services keep the RAG running without manual rituals — installed by `rag setup`, removed by `rag setup --remove`. All idempotent on reinstall (unload then load). Logs land in `~/.local/share/obsidian-rag/{watch,digest,morning,today}.{log,error.log}`.
+Seven services keep the RAG running without manual rituals — installed by `rag setup`, removed by `rag setup --remove`. All idempotent on reinstall (unload then load). Logs land in `~/.local/share/obsidian-rag/<label>.{log,error.log}`.
 
-- **`com.fer.obsidian-rag-watch`** — runs `rag watch` continuously (`RunAtLoad + KeepAlive`). Re-indexes on every vault save (debounce 3s). Removes the manual "did I `rag index` after that batch of edits?" friction.
-- **`com.fer.obsidian-rag-digest`** — runs `rag digest` every Sunday 22:00 local. Generates `05-Reviews/YYYY-WNN.md` automatically. Honours `NO_COLOR=1` and `TERM=dumb` so logs stay readable.
-- **`com.fer.obsidian-rag-morning`** — runs `rag morning` every weekday (Mon-Fri) at 7:00 local. Generates `05-Reviews/YYYY-MM-DD.md`. Reads the vault + queries.jsonl + contradictions.jsonl, drafts a 120-280-word brief with command-r: 1-line recap of yesterday, 3 focus items for today, pending triage if any, contradictions/gaps if any. Silently skips when there's zero evidence.
-- **`com.fer.obsidian-rag-today`** — runs `rag today` every weekday (Mon-Fri) at 22:00 local. Generates `05-Reviews/YYYY-MM-DD-evening.md`. Cierre simétrico al morning: mira hacia atrás el día que terminó y prepara hand-off a mañana. Silent no-op cuando no hay evidencia.
+- **`com.fer.obsidian-rag-watch`** — `rag watch` continuously (`RunAtLoad + KeepAlive`). Re-indexes on every vault save (debounce 3s). Removes the manual "did I `rag index` after that batch of edits?" friction.
+- **`com.fer.obsidian-rag-digest`** — `rag digest` every Sunday 22:00. Generates `05-Reviews/YYYY-WNN.md`.
+- **`com.fer.obsidian-rag-morning`** — `rag morning` Mon-Fri 7:00. Generates `05-Reviews/YYYY-MM-DD.md`. Silent no-op when evidence is zero.
+- **`com.fer.obsidian-rag-today`** — `rag today` Mon-Fri 22:00. End-of-day closure mirror of morning → `05-Reviews/YYYY-MM-DD-evening.md`.
+- **`com.fer.obsidian-rag-emergent`** — `rag emergent` Friday 10:00. Semanal emergent themes detector.
+- **`com.fer.obsidian-rag-patterns`** — `rag patterns` Sunday 20:00. Feedback-pattern alert (correlaciones sobre feedback.jsonl).
+- **`com.fer.obsidian-rag-archive`** — `rag archive --apply --notify --report` day 1 of every month at 23:00. Moves dead notes to `04-Archive/` respecting PARA. Gate-protected (>20 candidates → dry-run + notify only).
 
-Plist generation uses absolute paths to the `rag` binary resolved at install time (`_rag_binary()` checks `~/.local/bin/rag`, `/usr/local/bin/rag`, `/opt/homebrew/bin/rag`, then `shutil.which`). The launchd PATH includes Homebrew + uv tool dirs so subprocess hops (e.g., `ollama`) resolve too.
+All calendarized services set `NO_COLOR=1` + `TERM=dumb` so logs stay readable. Plist generation uses absolute paths to the `rag` binary resolved at install time (`_rag_binary()` checks `~/.local/bin/rag`, `/usr/local/bin/rag`, `/opt/homebrew/bin/rag`, then `shutil.which`). The launchd PATH includes Homebrew + uv tool dirs so subprocess hops (e.g., `ollama`) resolve too.
 
 Auto-backfill: `find_urls()` calls `_maybe_backfill_urls()` once per process — if the URL collection is empty but the main collection isn't, the URL sub-index rebuilds itself silently (~1 min). No more "did I run `rag links --rebuild` after upgrading?" tax.
 
@@ -326,14 +330,20 @@ Tests: `tests/test_tune.py` — 28 casos (defaults preservados, roundtrip save/l
 ## Eval harness (`rag eval` + `queries.yaml`)
 
 `queries.yaml` is the golden set. Two axes:
-- **singles**: 21 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical). Current baseline (2026-04-15, post `06e9b4a`): `hit@5 90.48% · MRR 0.750 · recall@5 90.48%`. Set bajó de 29→21 al remover 7 queries cuyas notas wiki fueron movidas a `.trash` durante cleanup del Inbox.
-- **chains**: 9 multi-turn chains (25 turns total) exercising follow-ups with pronouns/demonstratives — each turn after the first is reformulated via `reformulate_query` against the running history. Current baseline (2026-04-15, post `e6ad9bd`): `hit@5 72.00% · MRR 0.537 · recall@5 67.33% · chain_success 44.44%`. El prompt hardening de `reformulate_query` (6 reglas estrictas vs 4-línea viejo) subió chain_success de 33→44% sobre golden expandido. Fallos residuales: 6 turns donde el helper todavía driftea (ver diagnostic print en eval), 1 retrieval-bound. El compressor de #4 no dispara en este golden (chains < threshold=7), su valor está en sesiones reales largas (WhatsApp/chat).
+- **singles**: 21 queries across RAG/coaching/música/tech, mixing easy keyword matches with harder cases (accents stripped, typos, content-about queries, metaphorical).
+- **chains**: 9 multi-turn chains (25 turns total) exercising follow-ups with pronouns/demonstratives — each turn after the first is reformulated via `reformulate_query` against the running history.
 
-Historical reference (v7 right after the schema bump): singles `hit@5 90.48% · MRR 0.786`, chains `hit@5 75.00% · MRR 0.656 · chain_success 50.00%`. The drop to current numbers is real on chains (same 16/6 turns) and partially explained on singles by the set growing (21 → 29). Locked in `docs/eval-baselines-2026-04-15.md` — diff against that file when measuring changes. Use the **current** numbers as the floor; never claim a win without re-running `rag eval` against the same set.
+**Floor actual (post-`rag tune --apply`, 2026-04-15)** — `docs/eval-tune-2026-04-15.md` es la fuente de verdad:
+- Singles: `hit@5 95.24% · MRR 0.802 · recall@5 95.24% · n=21`.
+- Chains: `hit@5 72.00% · MRR 0.557 · recall@5 67.33% · chain_success 44.44% · turns=25 chains=9`.
 
-The v6→v7 drop in singles (95.24 → 90.48 → 82.76) traces to the schema bump (outlinks + re-chunking) plus subsequent set growth and possible reformulate drift on chains — confirmed earlier with `--no-multi` showing the same numbers as multi. Use the current baseline to measure any change to chunking, prompts, models, or retrieval — don't ship blind.
+Pre-tune baseline (hardcoded weights): `hit@5 90.48% · MRR 0.750` singles, `hit@5 72.00% · MRR 0.537` chains. Queda como referencia del delta que `rag tune` aportó; no usar como floor.
 
-Empirical finding that informed defaults: **HyDE with qwen2.5:3b drops hit@5 from 95 → 90%**. Small models drift the hypothetical from real note phrasing. HyDE is opt-in (`--hyde`); re-measure if the helper model changes size class.
+Chain failures residuales al hoy: 6 turns con drift del helper (diagnostic print del eval), 1 retrieval-bound. El compresor de sesiones no dispara en este golden (chains < threshold=7), su valor está en sesiones reales largas.
+
+Empirical findings que informaron defaults (no re-probar a ciegas):
+- **HyDE con qwen2.5:3b baja hit@5 de 95 → 90%**. Helper chico driftea el hypothetical vs frases reales. HyDE opt-in (`--hyde`); re-medir si cambia el tamaño del helper.
+- Nunca reclamar una mejora sin re-correr `rag eval` sobre el mismo golden.
 
 ## Observability
 
@@ -358,6 +368,28 @@ Semantics: when `session_history()` returns anything, the helper rewrites the in
 Admin: `rag session list | show <id> | clear <id> | cleanup` (cleanup drops files older than TTL by mtime).
 
 Tests: `tests/test_sessions.py` covers the module end-to-end — monkeypatches `SESSIONS_DIR` / `LAST_SESSION_FILE` to `tmp_path`. Run with `.venv/bin/python -m pytest` (pytest is in `[project.optional-dependencies].dev`).
+
+## On-disk state (`~/.local/share/obsidian-rag/`)
+
+Quick mental model de qué archivo mantiene qué estado:
+
+- `chroma/` — ChromaDB (colecciones `obsidian_notes_v{N}` + `obsidian_urls_v1`, suffix sha256[:8] del vault path en multi-vault).
+- `queries.jsonl` — log append-only de `rag query`/`chat` (q, variants, paths, scores, top_score, t_retrieve, t_gen, mode, cmd…).
+- `feedback.jsonl` — 👍/👎/corrective_path por turn. `feedback_golden.json` es cache derivada (rebuilt lazy on mtime gap).
+- `ignored_notes.json` — hard-ignore paths (`rag ignore`).
+- `ranker.json` — pesos del RankerWeights (escrito por `rag tune --apply`). Borrar = reset a defaults hardcodeados. `tune.jsonl` es el log histórico de runs.
+- `sessions/*.json` — multi-turn state, TTL 30d, cap 50 turns. `last_session` pointer para `--continue`/`--resume`.
+- `contradictions.jsonl` — sidecar del radar (paralelo a los `contradicts:` en frontmatter).
+- `ambient.json` / `ambient.jsonl` / `ambient_state.jsonl` — config + log + dedup del ambient agent.
+- `filing_batches/*.jsonl` — audit log de moves (filing + archive). Prefix `archive-YYYYMMDD-HHMMSS.jsonl` para archiver, sin prefix para `rag file`.
+- `{watch,digest,morning,today,emergent,patterns,archive}.{log,error.log}` — stdout/stderr de los services launchd.
+
+**Reset de aprendizaje acumulado** (si el ranker convergió a algo raro o cambiaste el embed model):
+```bash
+rm ~/.local/share/obsidian-rag/ranker.json        # vuelve a weights hardcodeados
+rm ~/.local/share/obsidian-rag/feedback_golden.json  # rebuild lazy en el próximo uso
+```
+`feedback_signals_for_query` hace defensive dim-check: si una entry del golden tiene embedding de otra dimensión (ej. modelo cambió), se ignora silenciosamente en vez de crashear retrieval. Aún así, re-embed completo con el nuevo modelo = `rag index --reset`.
 
 ## Vault path
 

@@ -711,6 +711,10 @@ console = Console()
 
 FEEDBACK_PATH = Path.home() / ".local/share/obsidian-rag/feedback.jsonl"
 FEEDBACK_GOLDEN_PATH = Path.home() / ".local/share/obsidian-rag/feedback_golden.json"
+# Hard-ignore: paths que el usuario marcó "no me muestres esto más" — se
+# filtran del candidate pool antes del rerank. Distinto del feedback negativo
+# (que es semántico por query y solo pena): acá el usuario declara "nunca".
+IGNORED_NOTES_PATH = Path.home() / ".local/share/obsidian-rag/ignored_notes.json"
 # Calibrados con bge-m3 sobre queries reales de queries.jsonl (26 queries únicas):
 #   - 0.88 sólo matcheaba restatements casi verbatim (3/325 pares).
 #   - 0.80 captura paraphrases de la misma intent ("qué es ikigai" /
@@ -730,12 +734,54 @@ def new_turn_id() -> str:
     return secrets.token_hex(6)
 
 
+def load_ignored_paths() -> set[str]:
+    """Lee la lista de paths hard-ignored. Silencioso si no existe."""
+    if not IGNORED_NOTES_PATH.is_file():
+        return set()
+    try:
+        data = json.loads(IGNORED_NOTES_PATH.read_text(encoding="utf-8"))
+        return set(data.get("paths", []))
+    except Exception:
+        return set()
+
+
+def save_ignored_paths(paths: set[str]) -> None:
+    IGNORED_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IGNORED_NOTES_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"paths": sorted(paths)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(IGNORED_NOTES_PATH)
+
+
+def add_ignored_path(path: str) -> bool:
+    """Agrega `path` a la lista ignore. Retorna True si era nuevo."""
+    paths = load_ignored_paths()
+    if path in paths:
+        return False
+    paths.add(path)
+    save_ignored_paths(paths)
+    return True
+
+
+def remove_ignored_path(path: str) -> bool:
+    """Saca `path` de la lista. Retorna True si estaba."""
+    paths = load_ignored_paths()
+    if path not in paths:
+        return False
+    paths.discard(path)
+    save_ignored_paths(paths)
+    return True
+
+
 def detect_rating_intent(text: str) -> int | None:
     """Return +1 / -1 if the input is a rating, else None.
 
     Acepta sólo inputs donde el rating es TODO el mensaje (una query que
     contenga '+' o 'bien' no es feedback). Formas reconocidas:
       - '+' / '-'         ← forma canónica, una sola tecla
+      - '1' / '0'         ← phone-friendly (prompt del listener usa esto)
       - '/bien' / '/mal'  ← verbose
       - '👍' / '👎'       ← emoji (con skin-tone / variation selectors)
     """
@@ -745,9 +791,9 @@ def detect_rating_intent(text: str) -> int | None:
     # Strip common emoji variation selectors + skin-tone modifiers so both
     # plain and decorated thumbs register as the same signal.
     stripped = re.sub(r"[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F]", "", t)
-    if stripped in ("+", "/bien", "👍"):
+    if stripped in ("+", "1", "/bien", "👍"):
         return 1
-    if stripped in ("-", "/mal", "👎"):
+    if stripped in ("-", "0", "/mal", "👎"):
         return -1
     return None
 
@@ -4498,15 +4544,20 @@ def retrieve(
     # additive (<=0.1) — enough to break ties toward recent notes without
     # overwhelming strong reranker signal.
     apply_recency = has_recency_cue(question)
+    # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
+    # Se excluyen completamente del candidate pool — no es penalty, es filtro.
+    ignored = load_ignored_paths()
     final_pairs: list[tuple] = []
     for c, e, s in zip(candidates, expanded, scores):
+        path = c[1].get("file", "") if isinstance(c[1], dict) else ""
+        if path in ignored:
+            continue
         final = float(s)
         if apply_recency:
             final += 0.1 * recency_boost(c[1])
         # Feedback: small additive boost para paths que el usuario marcó 👍 en
         # queries similares, penalty más fuerte para los 👎. El signo importa
         # pero el módulo es chico — no queremos ossificar el ranking.
-        path = c[1].get("file", "") if isinstance(c[1], dict) else ""
         if path in boost_paths:
             final += FEEDBACK_POSITIVE_BOOST
         if path in penalty_paths:
@@ -6555,12 +6606,14 @@ def _coach_turn(question: str, session_id: str) -> tuple[str, dict]:
         keep_alive=OLLAMA_KEEP_ALIVE,
     )
     answer = (resp.message.content or "").strip()
+    turn_id = new_turn_id()
     append_turn(sess, {
         "q": question,
         "q_reformulated": effective_q if effective_q != question else None,
         "a": answer,
         "paths": [m.get("file", "") for m in result["metas"]],
         "top_score": result.get("top_score", 0.0),
+        "turn_id": turn_id,
     })
     save_session(sess)
     return answer, sess
@@ -6606,6 +6659,61 @@ def _coach_synthesize(session_id: str) -> tuple[str, Path | None]:
     except Exception:
         pass
     return (body, note_path)
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def ignore(ctx: click.Context):
+    """Manejar lista de notas hard-ignore.
+
+    Una nota en la lista no aparece nunca en resultados de retrieve (query,
+    chat, coach). Distinto del feedback 👎 (que es semántico por query) —
+    acá es un filtro absoluto.
+
+    Uso:
+      rag ignore             # lista actual
+      rag ignore add <path>
+      rag ignore rm <path>
+      rag ignore clear
+    """
+    if ctx.invoked_subcommand is None:
+        paths = sorted(load_ignored_paths())
+        if not paths:
+            console.print("[dim]sin paths en ignore list[/dim]")
+            return
+        console.print(f"[bold]{len(paths)} path(s) ignored:[/bold]")
+        for p in paths:
+            console.print(f"  [red]✗[/red] {p}")
+
+
+@ignore.command("add")
+@click.argument("path")
+def ignore_add(path: str):
+    """Agrega un path a la ignore list."""
+    path = path.strip().lstrip("/")
+    if add_ignored_path(path):
+        console.print(f"[green]✓[/green] ignore: {path}")
+    else:
+        console.print(f"[yellow]ya estaba ignored:[/yellow] {path}")
+
+
+@ignore.command("rm")
+@click.argument("path")
+def ignore_rm(path: str):
+    """Saca un path de la ignore list."""
+    path = path.strip().lstrip("/")
+    if remove_ignored_path(path):
+        console.print(f"[green]✓[/green] re-habilitado: {path}")
+    else:
+        console.print(f"[yellow]no estaba ignored:[/yellow] {path}")
+
+
+@ignore.command("clear")
+@click.confirmation_option(prompt="¿Limpiar toda la ignore list?")
+def ignore_clear():
+    """Limpia toda la ignore list."""
+    save_ignored_paths(set())
+    console.print("[green]✓[/green] ignore list vacía")
 
 
 @cli.group()
@@ -6657,6 +6765,38 @@ def coach_ask(text: str, session_id: str, plain: bool):
     else:
         console.print(Panel(answer, title=f"coach · {session_id}",
                             border_style="magenta"))
+
+
+@coach.command("rate")
+@click.argument("rating")
+@click.option("--session", "session_id", required=True)
+@click.option("--plain", is_flag=True)
+def coach_rate(rating: str, session_id: str, plain: bool):
+    """Aplica feedback +/- al último turno de la sesión coach.
+
+    `rating` acepta +, -, 0, 1, /bien, /mal, 👍, 👎 — todo lo que parsea
+    `detect_rating_intent`. Se registra contra el turn_id del último turn.
+    """
+    r = detect_rating_intent(rating)
+    if r is None:
+        msg = f"rating inválido: {rating!r}. Usá +/-, 0/1, 👍/👎."
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+    sess = load_session(session_id)
+    if not sess or not sess.get("turns"):
+        msg = "no hay turnos en la sesión — nada para calificar"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    last = sess["turns"][-1]
+    tid = last.get("turn_id")
+    if not tid:
+        msg = "el último turno no tiene turn_id (sesión pre-upgrade)"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    record_feedback(tid, r, last.get("q", ""), last.get("paths", []))
+    label = "positivo" if r > 0 else "negativo"
+    msg = f"✓ feedback {label} registrado"
+    click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
 
 
 @coach.command("close")

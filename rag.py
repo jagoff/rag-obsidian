@@ -4649,8 +4649,9 @@ def _check_and_flag_contradictions(
 #   - envía un mensaje Telegram con los findings + cambios
 #
 # Config (escrita por el bot vía `/enable_ambient`): JSON en
-# `~/.local/share/obsidian-rag/ambient.json` con `{chat_id, bot_token}`.
-# Sin config → no-op silencioso (no molesta si el usuario no lo habilitó).
+# `~/.local/share/obsidian-rag/ambient.json` con `{jid, enabled}`.
+# `jid` es el WhatsApp JID del destinatario (group `...@g.us` o DM
+# `...@s.whatsapp.net`). Sin config → no-op silencioso.
 #
 # State file para idempotencia: `~/.local/share/obsidian-rag/ambient_state.jsonl`
 # con `{path, hash, analyzed_at}`. Skip si la misma combinación corrió hace <5min.
@@ -4659,19 +4660,42 @@ AMBIENT_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.json"
 AMBIENT_STATE_PATH = Path.home() / ".local/share/obsidian-rag/ambient_state.jsonl"
 AMBIENT_DEDUP_WINDOW_SEC = 300   # 5 min
 AMBIENT_LOG_PATH = Path.home() / ".local/share/obsidian-rag/ambient.jsonl"
+# WhatsApp bridge local HTTP endpoint (whatsapp-mcp/whatsapp-bridge).
+AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8080/api/send"
+# Zero-width space prefix — el listener.ts del bot usa esto como anti-loop:
+# ignora mensajes que arrancan con U+200B para no procesar sus propios
+# outputs como queries entrantes.
+_AMBIENT_ANTILOOP_MARKER = "\u200b"
 
 
 def _ambient_config() -> dict | None:
-    """Read the ambient config. Returns None if disabled / missing."""
+    """Read the ambient config. Returns None if disabled / missing.
+
+    Schema actual (WhatsApp): `{jid, enabled}`. `jid` es el destinatario
+    WhatsApp (group `...@g.us` o DM `...@s.whatsapp.net`).
+
+    Backward compat: si detecta `chat_id`/`bot_token` (schema Telegram viejo)
+    loggea warning una vez y retorna None — el usuario debe re-habilitar
+    desde el bot de WhatsApp para regenerar la config.
+    """
     if not AMBIENT_CONFIG_PATH.is_file():
         return None
     try:
         c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not c.get("chat_id") or not c.get("bot_token"):
-        return None
     if c.get("enabled") is False:
+        return None
+    if c.get("chat_id") or c.get("bot_token"):
+        # Old Telegram schema — refuse silently (the CLI `ambient status`
+        # surfaces this; stderr-log would pollute watch.log on every save).
+        _ambient_log_event({
+            "cmd": "ambient_config",
+            "warning": "telegram_config_ignored",
+            "hint": "Re-habilitar desde el bot de WhatsApp (schema ahora es {jid, enabled}).",
+        })
+        return None
+    if not c.get("jid"):
         return None
     return c
 
@@ -4727,18 +4751,25 @@ def _ambient_log_event(event: dict) -> None:
         pass
 
 
-def _ambient_telegram_send(chat_id: str, bot_token: str, text: str) -> bool:
-    """Fire-and-forget Telegram sendMessage. Returns True on 2xx response."""
+def _ambient_whatsapp_send(jid: str, text: str) -> bool:
+    """Fire-and-forget al bridge local de WhatsApp. Retorna True en 2xx.
+
+    POSTea a `http://localhost:8080/api/send` con body
+    `{recipient: <jid>, message: <text>}`. El listener del bot RAG
+    filtra mensajes que arrancan con U+200B (anti-loop) — se prefixa
+    acá para evitar que nuestro propio output se procese como query.
+    """
     import urllib.request
-    import urllib.error
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload_text = _AMBIENT_ANTILOOP_MARKER + text if not text.startswith(
+        _AMBIENT_ANTILOOP_MARKER
+    ) else text
     data = json.dumps({
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
+        "recipient": jid,
+        "message": payload_text,
     }).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"},
+        AMBIENT_WHATSAPP_BRIDGE_URL, data=data,
+        headers={"Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -4819,7 +4850,7 @@ def _ambient_hook(
     except Exception:
         related = []
 
-    # Build Telegram message — compact, with wikilink-safe format.
+    # Build message — compact, with wikilink-safe format.
     title = path.stem
     lines = [f"🤖 Ambient: [[{title}]]"]
     if wikilinks_applied:
@@ -4840,7 +4871,7 @@ def _ambient_hook(
     msg = "\n".join(lines)
     sent = False
     if len(lines) > 1:
-        sent = _ambient_telegram_send(cfg["chat_id"], cfg["bot_token"], msg)
+        sent = _ambient_whatsapp_send(cfg["jid"], msg)
 
     _ambient_log_event({
         "cmd": "ambient_hook",
@@ -4850,7 +4881,7 @@ def _ambient_hook(
         "wikilinks_proposed": len(sugs),
         "dupes": [{"path": d["path"], "sim": d["similarity"]} for d in dupes],
         "related_count": len(related),
-        "telegram_sent": sent,
+        "whatsapp_sent": sent,
         "quiet": len(lines) <= 1,
     })
     _ambient_state_record(doc_id_prefix, h, {
@@ -9374,6 +9405,193 @@ def _fetch_mail_unread(max_items: int = 10) -> list[dict]:
     return items[:max_items]
 
 
+# ── WhatsApp unread (bridge SQLite) ─────────────────────────────────────────
+WHATSAPP_DB_PATH = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
+WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
+
+
+def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
+    """Inbound WhatsApp messages in the last `hours`, grouped by chat.
+
+    Skips the bot's own group and status broadcasts. Returns a list of
+    ``{"name": str, "jid": str, "count": int, "last_snippet": str}``
+    sorted by message count desc.
+    """
+    if not WHATSAPP_DB_PATH.is_file():
+        return []
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+              m.chat_jid AS jid,
+              (SELECT name FROM chats WHERE jid = m.chat_jid) AS name,
+              count(*) AS cnt,
+              (SELECT content FROM messages
+                 WHERE chat_jid = m.chat_jid AND is_from_me = 0
+                 ORDER BY datetime(timestamp) DESC LIMIT 1) AS last_content
+            FROM messages m
+            WHERE m.is_from_me = 0
+              AND datetime(m.timestamp) > datetime('now', ?)
+              AND m.chat_jid != ?
+              AND m.chat_jid NOT LIKE '%status@broadcast'
+            GROUP BY m.chat_jid
+            ORDER BY cnt DESC
+            LIMIT ?
+            """,
+            (f"-{int(hours)} hours", WHATSAPP_BOT_JID, int(max_chats)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    out: list[dict] = []
+    for r in rows:
+        snippet = (r["last_content"] or "").strip().replace("\n", " ")
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "…"
+        out.append({
+            "jid": r["jid"],
+            "name": r["name"] or r["jid"].split("@")[0],
+            "count": int(r["cnt"] or 0),
+            "last_snippet": snippet,
+        })
+    return out
+
+
+# ── Recent user queries ─────────────────────────────────────────────────────
+
+def _fetch_recent_queries(
+    query_log: Path, now: datetime, hours: int = 24, max_items: int = 8,
+) -> list[dict]:
+    """Queries the user issued in the last `hours`. Dedupes by text, keeps
+    most recent occurrence. Excludes eval/ambient synthetic queries.
+    """
+    if not query_log.is_file():
+        return []
+    try:
+        lines = query_log.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    start = now - timedelta(hours=hours)
+    seen: dict[str, dict] = {}
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("cmd") != "query":
+            continue
+        try:
+            ts = datetime.fromisoformat(e.get("ts", ""))
+        except Exception:
+            continue
+        if ts < start or ts > now:
+            continue
+        q = (e.get("q") or "").strip()
+        if not q:
+            continue
+        key = q.lower()
+        if key in seen:
+            continue
+        seen[key] = {"q": q, "ts": ts.isoformat(timespec="minutes")}
+        if len(seen) >= max_items:
+            break
+    return list(seen.values())
+
+
+# ── Weather (only if rain) ──────────────────────────────────────────────────
+WEATHER_LOCATION = "Recreo,Santa+Fe"
+
+
+def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
+    """Query wttr.in. Returns a summary dict ONLY if rain is in the forecast
+    for today (chance>=40% in any upcoming 3h block, or current condition is
+    raining). Returns ``None`` otherwise. Silent on any network error.
+    """
+    import urllib.request as _req
+    url = f"https://wttr.in/{location}?format=j1"
+    try:
+        with _req.urlopen(url, timeout=8.0) as resp:
+            raw = resp.read()
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+
+    # Current conditions: "Rain", "Light rain", "Thunderstorm", etc.
+    current = ""
+    try:
+        cc = data.get("current_condition") or []
+        if cc:
+            desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
+            current = desc.strip()
+    except Exception:
+        current = ""
+    currently_raining = bool(re.search(r"rain|shower|thunder|storm|drizzle", current, re.I))
+
+    # Today hourly: each entry has time="0|300|600|…|2100" (3h blocks) and
+    # chanceofrain / chanceofthunder as string ints.
+    weather_days = data.get("weather") or []
+    if not weather_days:
+        return None if not currently_raining else {
+            "summary": f"ahora: {current}",
+            "max_chance": 100, "blocks": [],
+        }
+    today = weather_days[0]
+    hourly = today.get("hourly") or []
+
+    now = datetime.now()
+    now_minutes = now.hour * 60 + now.minute
+    rain_blocks: list[dict] = []
+    max_chance = 0
+    for h in hourly:
+        try:
+            t = int(h.get("time", "0"))
+        except Exception:
+            continue
+        block_minutes = (t // 100) * 60
+        if block_minutes + 180 < now_minutes:
+            continue  # block already past
+        try:
+            chance_rain = int(h.get("chanceofrain", "0") or 0)
+            chance_thunder = int(h.get("chanceofthunder", "0") or 0)
+        except Exception:
+            continue
+        chance = max(chance_rain, chance_thunder)
+        if chance >= 40:
+            hh = block_minutes // 60
+            rain_blocks.append({"hour": hh, "chance": chance})
+            if chance > max_chance:
+                max_chance = chance
+
+    if not rain_blocks and not currently_raining:
+        return None
+
+    pieces = []
+    if currently_raining:
+        pieces.append(f"ahora: {current.lower()}")
+    if rain_blocks:
+        hour_str = ", ".join(f"{b['hour']:02d}h ({b['chance']}%)" for b in rain_blocks[:5])
+        pieces.append(f"bloques: {hour_str}")
+    return {
+        "summary": " · ".join(pieces) or current,
+        "max_chance": max_chance if max_chance else (100 if currently_raining else 0),
+        "blocks": rain_blocks,
+        "current": current,
+    }
+
+
 def _parse_applescript_date(s: str) -> datetime | None:
     """AppleScript `as string` dates are locale-formatted (e.g. 'lunes, 14 de abril
     de 2026, 09:00:00'). Try a few common locales/formats; return None on miss.
@@ -9545,6 +9763,7 @@ def _collect_morning_evidence(
     recent.sort(key=lambda r: r["modified"], reverse=True)
     inbox.sort(key=lambda r: r["modified"], reverse=True)
 
+    weather = _fetch_weather_rain()
     return {
         "recent_notes": recent,
         "inbox_pending": inbox,
@@ -9554,6 +9773,9 @@ def _collect_morning_evidence(
         "calendar_today": _fetch_calendar_today(),
         "reminders_due": _fetch_reminders_due(now),
         "mail_unread": _fetch_mail_unread(),
+        "whatsapp_unread": _fetch_whatsapp_unread(),
+        "recent_queries": _fetch_recent_queries(query_log, now),
+        "weather_rain": weather,  # dict or None
     }
 
 
@@ -9615,6 +9837,28 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
         for m in ev["mail_unread"][:10]:
             parts.append(f"- {m['subject']} — {m['sender']}")
         parts.append("")
+    if ev.get("whatsapp_unread"):
+        parts.append(
+            f"## WhatsApp — chats con actividad últimas 24h "
+            f"({len(ev['whatsapp_unread'])}):"
+        )
+        for w in ev["whatsapp_unread"][:8]:
+            snip = f" — “{w['last_snippet']}”" if w.get("last_snippet") else ""
+            parts.append(f"- {w['name']} ({w['count']} msgs){snip}")
+        parts.append("")
+    if ev.get("recent_queries"):
+        parts.append(
+            f"## Preguntas que me hiciste al RAG últimas 24h "
+            f"({len(ev['recent_queries'])}):"
+        )
+        for q in ev["recent_queries"][:8]:
+            parts.append(f"- \"{q['q']}\"")
+        parts.append("")
+    if ev.get("weather_rain"):
+        w = ev["weather_rain"]
+        parts.append("## Clima — lluvia pronosticada hoy:")
+        parts.append(f"- {w.get('summary', '')}")
+        parts.append("")
     parts.extend([
         "Formato de salida (Markdown, EXACTO):",
         "",
@@ -9622,9 +9866,10 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
         "(1 oración: qué pasó en el vault ayer)",
         "",
         "## 📅 Hoy en la agenda",
-        "(si hay eventos de Calendar, reminders vencidos/hoy o mails relevantes "
-        "sin leer, integrarlos en bullets cortos con horario si aplica; "
-        "mencionar remitente de mails destacados; si nada de esto existe, omitir la sección)",
+        "(si hay eventos de Calendar, reminders vencidos/hoy, mails relevantes "
+        "sin leer o WhatsApp con actividad últimas 24h, integrarlos en bullets cortos "
+        "con horario/remitente/nombre si aplica; si nada de esto existe, omitir la sección. "
+        "Si hay lluvia pronosticada, mencionala en una línea al final de esta sección.)",
         "",
         "## 🎯 Foco sugerido para hoy",
         "(3 bullets con [[wikilink]] a la nota relevante si aplica; "
@@ -9635,8 +9880,8 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
         "(si hay inbox o todos, listarlos cortos; si no, omitir la sección)",
         "",
         "## ⚠ Atender",
-        "(si hay contradicciones nuevas o gaps persistentes, nombrarlos; "
-        "si no, omitir la sección)",
+        "(si hay contradicciones nuevas, gaps persistentes, o preguntas recientes "
+        "sin responder bien, nombrarlos; si no, omitir la sección)",
         "",
         "Entre 140 y 320 palabras total. Citá notas con [[Título]].",
     ])
@@ -9691,11 +9936,15 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         + len(ev.get("calendar_today", []))
         + len(ev.get("reminders_due", []))
         + len(ev.get("mail_unread", []))
+        + len(ev.get("whatsapp_unread", []))
+        + len(ev.get("recent_queries", []))
+        + (1 if ev.get("weather_rain") else 0)
     )
     if total == 0:
         console.print(
             "[yellow]Mañana en blanco:[/yellow] sin notas modificadas, "
-            "inbox vacío, 0 todos, 0 contradicciones, calendar/reminders/mail vacíos."
+            "inbox vacío, 0 todos, 0 contradicciones, "
+            "calendar/reminders/mail/wa/queries vacíos, sin lluvia."
         )
         return
 
@@ -9706,7 +9955,10 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"{len(ev['low_conf_queries'])} low-conf · "
         f"{len(ev.get('calendar_today', []))} cal · "
         f"{len(ev.get('reminders_due', []))} rem · "
-        f"{len(ev.get('mail_unread', []))} mail"
+        f"{len(ev.get('mail_unread', []))} mail · "
+        f"{len(ev.get('whatsapp_unread', []))} wa · "
+        f"{len(ev.get('recent_queries', []))} queries"
+        + (" · 🌧" if ev.get("weather_rain") else "")
     )
 
     date_label = target.strftime("%Y-%m-%d")
@@ -10883,19 +11135,31 @@ def ambient():
 
 @ambient.command("status")
 def ambient_status():
-    """¿Está habilitado? ¿Con qué chat_id?"""
+    """¿Está habilitado? ¿A qué jid manda?"""
     cfg = _ambient_config()
     if cfg is None:
         if not AMBIENT_CONFIG_PATH.is_file():
-            console.print("[yellow]Deshabilitado[/yellow] — no hay config. Enviá /enable_ambient al bot.")
+            console.print("[yellow]Deshabilitado[/yellow] — no hay config. Enviá /enable_ambient al bot de WhatsApp.")
         else:
-            console.print(
-                "[yellow]Deshabilitado[/yellow] — config existe pero está mal o tiene enabled=false."
-            )
+            # Detectar schema viejo para dar un hint útil.
+            try:
+                raw = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                raw = {}
+            if raw.get("chat_id") or raw.get("bot_token"):
+                console.print(
+                    "[yellow]Deshabilitado[/yellow] — config tiene schema viejo "
+                    "(chat_id/bot_token de Telegram). Re-habilitá con "
+                    "/enable_ambient en el bot de WhatsApp."
+                )
+            else:
+                console.print(
+                    "[yellow]Deshabilitado[/yellow] — config existe pero está mal "
+                    "o tiene enabled=false."
+                )
         return
     console.print(
-        f"[green]Habilitado[/green] · chat_id={cfg['chat_id']} · "
-        f"bot_token={cfg['bot_token'][:10]}…"
+        f"[green]Habilitado[/green] · jid=[cyan]{cfg['jid']}[/cyan]"
     )
     if AMBIENT_STATE_PATH.is_file():
         try:

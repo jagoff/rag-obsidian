@@ -1,11 +1,10 @@
 """Tests para el Ambient Agent: reactivo a saves en 00-Inbox/.
 
-Mockea la red (Telegram send) y las primitivas caras (find_related) donde
-hace falta; los checks determinísticos (skip rules, dedup window, config)
-corren con fixtures de tmp_path.
+Mockea la red (WhatsApp bridge send) y las primitivas caras (find_related)
+donde hace falta; los checks determinísticos (skip rules, dedup window,
+config) corren con fixtures de tmp_path.
 """
 import json
-import time
 from pathlib import Path
 
 import chromadb
@@ -49,20 +48,27 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
 
 @pytest.fixture
 def captured_sends(monkeypatch):
-    """Collect Telegram payloads instead of hitting the network."""
+    """Collect WhatsApp bridge payloads instead of hitting the network."""
     calls: list[dict] = []
 
-    def fake_send(chat_id, bot_token, text):
-        calls.append({"chat_id": chat_id, "bot_token": bot_token, "text": text})
+    def fake_send(jid, text):
+        calls.append({"jid": jid, "text": text})
         return True
 
-    monkeypatch.setattr(rag, "_ambient_telegram_send", fake_send)
+    monkeypatch.setattr(rag, "_ambient_whatsapp_send", fake_send)
     return calls
 
 
-def _write_config(path: Path, enabled: bool = True):
+def _write_config(path: Path, enabled: bool = True, jid: str = "120363426178035051@g.us"):
     path.write_text(json.dumps({
-        "chat_id": "123", "bot_token": "fake-token", "enabled": enabled,
+        "jid": jid, "enabled": enabled,
+    }))
+
+
+def _write_legacy_telegram_config(path: Path):
+    """Schema viejo — se usa para verificar bwcompat (debe ser rechazado)."""
+    path.write_text(json.dumps({
+        "chat_id": "123", "bot_token": "fake-token", "enabled": True,
     }))
 
 
@@ -191,7 +197,7 @@ def test_hook_applies_wikilinks_in_inbox_note(tmp_vault, captured_sends):
     assert "[[Ikigai]]" in p.read_text()
 
 
-def test_hook_sends_telegram_when_findings(tmp_vault, captured_sends):
+def test_hook_sends_whatsapp_when_findings(tmp_vault, captured_sends):
     vault, col = tmp_vault
     _write_config(rag.AMBIENT_CONFIG_PATH)
     # Target note → auto-wikilink + related
@@ -206,10 +212,11 @@ def test_hook_sends_telegram_when_findings(tmp_vault, captured_sends):
     rag._ambient_hook(col, p, "00-Inbox/n.md", "h1")
 
     # At least one send with info
-    assert captured_sends, "expected telegram send"
+    assert captured_sends, "expected whatsapp send"
     msg = captured_sends[0]["text"]
     assert "Ambient" in msg
     assert "[[n]]" in msg
+    assert captured_sends[0]["jid"] == "120363426178035051@g.us"
 
 
 def test_hook_stays_quiet_without_findings(tmp_vault, captured_sends):
@@ -218,7 +225,7 @@ def test_hook_stays_quiet_without_findings(tmp_vault, captured_sends):
     p = vault / "00-Inbox" / "aa.md"     # very short title, below min_title_len
     p.write_text("contenido sin referencias ni duplicados ni nada.")
     rag._ambient_hook(col, p, "00-Inbox/aa.md", "h1")
-    # Nothing interesting → no telegram noise
+    # Nothing interesting → no whatsapp noise
     assert captured_sends == []
 
 
@@ -229,12 +236,12 @@ def test_ambient_config_reads_valid_json(tmp_vault):
     _write_config(rag.AMBIENT_CONFIG_PATH)
     c = rag._ambient_config()
     assert c is not None
-    assert c["chat_id"] == "123"
-    assert c["bot_token"] == "fake-token"
+    assert c["jid"] == "120363426178035051@g.us"
+    assert c["enabled"] is True
 
 
-def test_ambient_config_rejects_missing_fields(tmp_vault):
-    rag.AMBIENT_CONFIG_PATH.write_text(json.dumps({"chat_id": "123"}))
+def test_ambient_config_rejects_missing_jid(tmp_vault):
+    rag.AMBIENT_CONFIG_PATH.write_text(json.dumps({"enabled": True}))
     assert rag._ambient_config() is None
 
 
@@ -246,6 +253,67 @@ def test_ambient_config_rejects_enabled_false(tmp_vault):
 def test_ambient_config_rejects_corrupt_json(tmp_vault):
     rag.AMBIENT_CONFIG_PATH.write_text("not json at all")
     assert rag._ambient_config() is None
+
+
+def test_ambient_config_rejects_legacy_telegram_schema(tmp_vault):
+    """Bwcompat: schema viejo (chat_id/bot_token) debe devolver None para que
+    el usuario re-habilite contra el bot de WhatsApp.
+    """
+    _write_legacy_telegram_config(rag.AMBIENT_CONFIG_PATH)
+    assert rag._ambient_config() is None
+
+
+# ── WhatsApp send ────────────────────────────────────────────────────────────
+
+
+def test_whatsapp_send_prefixes_antiloop_marker(monkeypatch):
+    """El outgoing debe arrancar con U+200B para que el listener del bot lo
+    ignore (si no, el listener re-procesaría el ping como query entrante).
+    """
+    captured: dict = {}
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    ok = rag._ambient_whatsapp_send("120@g.us", "hola mundo")
+    assert ok is True
+    assert captured["url"] == rag.AMBIENT_WHATSAPP_BRIDGE_URL
+    assert captured["body"]["recipient"] == "120@g.us"
+    assert captured["body"]["message"].startswith("\u200b")
+    assert captured["body"]["message"].endswith("hola mundo")
+
+
+def test_whatsapp_send_does_not_double_prefix(monkeypatch):
+    """Si el texto ya arranca con U+200B, no re-prefixar."""
+    captured: dict = {}
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    rag._ambient_whatsapp_send("120@g.us", "\u200bprefixed")
+    assert captured["body"]["message"] == "\u200bprefixed"
+
+
+def test_whatsapp_send_returns_false_on_network_error(monkeypatch):
+    def boom(req, timeout):
+        raise OSError("bridge down")
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    assert rag._ambient_whatsapp_send("120@g.us", "x") is False
 
 
 # ── State file ───────────────────────────────────────────────────────────────

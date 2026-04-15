@@ -11,8 +11,12 @@ import threading
 import time
 import unicodedata
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # Reranker is cached locally — go offline to skip HF Hub network check + warnings.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -33,8 +37,7 @@ import chromadb
 import ollama
 import yaml
 from rank_bm25 import BM25Okapi
-from rich import box
-from rich.console import Console, Group
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import track
@@ -204,10 +207,8 @@ def render_response(text: str) -> Text:
             if start > last:
                 emit_plain_or_inline(segment[last:start], base_style=base_style)
             if kind == "url-md":
-                # Symmetric with note-md: render `label (url)` both visible.
-                # Keeping the URL visible preserves the markdown-source look
-                # of the vault's bookmarks; OSC 8 hyperlinks attach to both
-                # so either span is Cmd/Ctrl-clickable.
+                # Terminal-native: label clickeable (OSC 8) + URL en dim entre
+                # paréntesis. Sin brackets markdown — terminal no renderea md.
                 out.append(label, style=_url_link_style(target, url_base))
                 out.append(" (", style="dim")
                 out.append(target, style=_url_link_style(target, url_dim))
@@ -610,9 +611,18 @@ console = Console()
 
 FEEDBACK_PATH = Path.home() / ".local/share/obsidian-rag/feedback.jsonl"
 FEEDBACK_GOLDEN_PATH = Path.home() / ".local/share/obsidian-rag/feedback_golden.json"
-FEEDBACK_MATCH_COSINE = 0.88        # similaridad mínima para matchear query pasada
-FEEDBACK_POSITIVE_BOOST = 0.03      # suma al rerank score si el path viene de un 👍 similar
-FEEDBACK_NEGATIVE_PENALTY = 0.15    # resta al rerank score si el path viene de un 👎 similar
+# Calibrados con bge-m3 sobre queries reales de queries.jsonl (26 queries únicas):
+#   - 0.88 sólo matcheaba restatements casi verbatim (3/325 pares).
+#   - 0.80 captura paraphrases de la misma intent ("qué es ikigai" /
+#     "tengo notas sobre ikigai" → 0.81) sin arrastrar queries que sólo
+#     comparten tópico (distintas intents caen < 0.75).
+FEEDBACK_MATCH_COSINE = 0.80
+# Rerank score deltas calibrados contra la distribución real (queries.jsonl):
+#   rank1-rank2 gap p50 = 0.02, p75 = 0.12. Boost 0.03 ≈ 1.5× mediana
+#   (desempata ties sin override); penalty 0.15 ≈ 7.5× mediana (decisivo
+#   pero no obliterante — sobre top_score p75=0.47 deja 0.32, aún competitivo).
+FEEDBACK_POSITIVE_BOOST = 0.03
+FEEDBACK_NEGATIVE_PENALTY = 0.15
 
 
 def new_turn_id() -> str:
@@ -623,9 +633,11 @@ def new_turn_id() -> str:
 def detect_rating_intent(text: str) -> int | None:
     """Return +1 / -1 if the input is a rating, else None.
 
-    Accepted: bare '👍'/'👎' (with skin-tone modifiers), '/bien', '/mal'.
-    Anything with additional words is NOT a rating — the user may be asking
-    a question that happens to contain those tokens.
+    Acepta sólo inputs donde el rating es TODO el mensaje (una query que
+    contenga '+' o 'bien' no es feedback). Formas reconocidas:
+      - '+' / '-'         ← forma canónica, una sola tecla
+      - '/bien' / '/mal'  ← verbose
+      - '👍' / '👎'       ← emoji (con skin-tone / variation selectors)
     """
     t = text.strip()
     if not t:
@@ -633,9 +645,9 @@ def detect_rating_intent(text: str) -> int | None:
     # Strip common emoji variation selectors + skin-tone modifiers so both
     # plain and decorated thumbs register as the same signal.
     stripped = re.sub(r"[\U0001F3FB-\U0001F3FF\uFE0E\uFE0F]", "", t)
-    if stripped in ("👍", "/bien"):
+    if stripped in ("+", "/bien", "👍"):
         return 1
-    if stripped in ("👎", "/mal"):
+    if stripped in ("-", "/mal", "👎"):
         return -1
     return None
 
@@ -1166,6 +1178,7 @@ def _index_urls(
             "url": u["url"],
             "anchor": u["anchor"],
             "line": u["line"],
+            "source": "note",
         }
         for u in urls
     ]
@@ -1176,6 +1189,197 @@ def _index_urls(
         metadatas=metas,
     )
     return len(urls)
+
+
+# ── Chrome bookmarks ─────────────────────────────────────────────────────────
+# Chrome keeps bookmarks as a JSON tree at
+# ~/Library/Application Support/Google/Chrome/<Profile>/Bookmarks
+# Multiple profiles live side by side (Default, Profile 1, ...). We walk the
+# tree, flatten to (url, title, folder_breadcrumb), and write into the same
+# URL collection used by `rag links` with source="bookmark" — so a semantic
+# query surfaces notes AND bookmarks in a unified ranked list.
+
+
+def _chrome_bookmarks_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+
+
+def chrome_bookmark_files(root: Path | None = None) -> list[tuple[str, Path]]:
+    """Return (profile_name, bookmarks_path) tuples for every Chrome profile
+    that has a Bookmarks file. Empty list if Chrome is not installed.
+    """
+    base = root or _chrome_bookmarks_root()
+    if not base.is_dir():
+        return []
+    found: list[tuple[str, Path]] = []
+    for child in sorted(base.iterdir()):
+        if not child.is_dir():
+            continue
+        bm = child / "Bookmarks"
+        if bm.is_file():
+            found.append((child.name, bm))
+    return found
+
+
+def parse_chrome_bookmarks(path: Path) -> list[dict]:
+    """Flatten Chrome's Bookmarks JSON tree into [{url, title, folder, date_added}].
+
+    Chrome stores three top-level roots: bookmark_bar, other, synced. Folders
+    nest arbitrarily. Each leaf is `{type: url, url, name, date_added}` — date
+    is Webkit epoch (microseconds since 1601-01-01). Folders are `{type: folder,
+    name, children}`. Invalid JSON or missing structure yields [].
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    roots = (data or {}).get("roots") or {}
+    out: list[dict] = []
+
+    def _walk(node: dict, breadcrumb: list[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        ntype = node.get("type")
+        if ntype == "url":
+            url = (node.get("url") or "").strip()
+            if not url or not url.startswith(("http://", "https://")):
+                return
+            title = (node.get("name") or "").strip()
+            out.append({
+                "url": url,
+                "title": title,
+                "folder": " > ".join(breadcrumb),
+                "date_added": _webkit_ts_to_iso(node.get("date_added")),
+            })
+            return
+        if ntype == "folder":
+            label = (node.get("name") or "").strip()
+            children = node.get("children") or []
+            sub = breadcrumb + ([label] if label else [])
+            for c in children:
+                _walk(c, sub)
+
+    for root_key, root_node in roots.items():
+        if not isinstance(root_node, dict):
+            continue
+        label = root_node.get("name") or root_key
+        for child in root_node.get("children") or []:
+            _walk(child, [str(label)])
+    return out
+
+
+def _webkit_ts_to_iso(ts: object) -> str:
+    """Chrome's date_added is microseconds since 1601-01-01 UTC. Convert to
+    ISO-8601; return '' on bad input.
+    """
+    if not ts:
+        return ""
+    try:
+        micros = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    # Seconds between 1601-01-01 and 1970-01-01
+    epoch_delta = 11644473600
+    secs = micros / 1_000_000 - epoch_delta
+    try:
+        return datetime.fromtimestamp(secs).isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _bookmark_embed_text(title: str, folder_breadcrumb: str, url: str) -> str:
+    """Render the text that bge-m3 sees. Folder breadcrumb gives topical hints
+    the title alone often lacks ('Rust async' + 'Programming > Languages').
+    """
+    parts = []
+    if folder_breadcrumb:
+        parts.append(folder_breadcrumb)
+    if title:
+        parts.append(title)
+    # Include bare URL as a weak signal — domain words sometimes carry meaning.
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+    if host:
+        parts.append(host)
+    return " | ".join(parts) if parts else url
+
+
+def _index_chrome_bookmarks(
+    col_urls: chromadb.Collection,
+    profile: str,
+    bookmarks: list[dict],
+    batch_size: int = 256,
+) -> int:
+    """Replace all `source=bookmark` rows for this Chrome profile with the
+    current set. Idempotent — re-running the sync after adding bookmarks
+    surfaces only diffs.
+    """
+    file_id = f"chrome-bookmark::{profile}"
+    existing = col_urls.get(where={"file": file_id}, include=[])
+    if existing.get("ids"):
+        col_urls.delete(ids=existing["ids"])
+    if not bookmarks:
+        return 0
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict] = []
+    seen_urls: set[str] = set()
+    for bm in bookmarks:
+        url = bm["url"]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        ids.append(f"{file_id}::{h}")
+        docs.append(_bookmark_embed_text(bm["title"], bm["folder"], url))
+        metas.append({
+            "file": file_id,
+            "note": bm["title"] or url,
+            "folder": f"chrome/{profile}",
+            "tags": "bookmark",
+            "url": url,
+            "anchor": bm["title"],
+            "line": 0,
+            "source": "bookmark",
+            "profile": profile,
+            "bookmark_folder": bm["folder"],
+            "date_added": bm["date_added"],
+        })
+    for i in range(0, len(ids), batch_size):
+        batch_ids = ids[i:i + batch_size]
+        batch_docs = docs[i:i + batch_size]
+        batch_metas = metas[i:i + batch_size]
+        embeddings = embed(batch_docs)
+        col_urls.add(
+            ids=batch_ids,
+            embeddings=embeddings,
+            documents=batch_docs,
+            metadatas=batch_metas,
+        )
+    return len(ids)
+
+
+def sync_chrome_bookmarks(profile: str | None = None) -> dict:
+    """Parse Chrome's Bookmarks files for every profile (or only `profile`) and
+    replace the corresponding rows in the URL collection. Returns summary dict.
+    """
+    col_urls = get_urls_db()
+    pairs = chrome_bookmark_files()
+    if not pairs:
+        return {"profiles": 0, "total": 0, "per_profile": {}}
+    if profile is not None:
+        pairs = [p for p in pairs if p[0] == profile]
+    per_profile: dict[str, int] = {}
+    total = 0
+    for prof, path in pairs:
+        bookmarks = parse_chrome_bookmarks(path)
+        n = _index_chrome_bookmarks(col_urls, prof, bookmarks)
+        per_profile[prof] = n
+        total += n
+    return {"profiles": len(pairs), "total": total, "per_profile": per_profile}
 
 
 # ── TEXT PROCESSING ───────────────────────────────────────────────────────────
@@ -1362,9 +1566,39 @@ def semantic_chunks(
 
 # ── EMBEDDING ─────────────────────────────────────────────────────────────────
 
+# Cache LRU de embeddings por texto. Los procesos de chat multi-turn y los bots
+# persistentes repiten paraphrases idénticas (seed=42, deterministico) entre
+# queries — cachear ahorra ~50-150ms por hit dentro del proceso. Capacidad
+# calibrada: 512 strings × 1024 dims × 4B ≈ 2MB, ruido en memoria.
+_EMBED_CACHE_MAX = 512
+_embed_cache: "dict[str, list[float]]" = {}
+_embed_cache_lock = threading.Lock()
+
+
 def embed(texts: list[str]) -> list[list[float]]:
-    resp = ollama.embed(model=EMBED_MODEL, input=texts, keep_alive=OLLAMA_KEEP_ALIVE)
-    return resp.embeddings
+    if not texts:
+        return []
+    # Fast path: todos los textos ya cacheados.
+    with _embed_cache_lock:
+        cached = [_embed_cache.get(t) for t in texts]
+    missing_idx = [i for i, v in enumerate(cached) if v is None]
+    if not missing_idx:
+        return cached  # type: ignore[return-value]
+    missing_texts = [texts[i] for i in missing_idx]
+    resp = ollama.embed(model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE)
+    fresh = resp.embeddings
+    with _embed_cache_lock:
+        for t, v in zip(missing_texts, fresh):
+            if len(_embed_cache) >= _EMBED_CACHE_MAX:
+                # Drop oldest (dict preserva orden de inserción en 3.7+).
+                try:
+                    _embed_cache.pop(next(iter(_embed_cache)))
+                except StopIteration:
+                    pass
+            _embed_cache[t] = v
+    for idx, v in zip(missing_idx, fresh):
+        cached[idx] = v
+    return cached  # type: ignore[return-value]
 
 
 def hyde_embed(question: str) -> list[float]:
@@ -1473,7 +1707,11 @@ def _folder_matches(file_path: str, folder: str) -> bool:
     return file_path.startswith(_CAPTURE_FOLDER + "/")
 
 
-def bm25_search(col: chromadb.Collection, query: str, k: int, folder: str | None, tag: str | None = None) -> list[str]:
+def bm25_search(
+    col: chromadb.Collection, query: str, k: int,
+    folder: str | None, tag: str | None = None,
+    date_range: tuple[float, float] | None = None,
+) -> list[str]:
     """Keyword search using BM25 over the full collection."""
     c = _load_corpus(col)
     if c["bm25"] is None:
@@ -1482,11 +1720,19 @@ def bm25_search(col: chromadb.Collection, query: str, k: int, folder: str | None
     scores = c["bm25"].get_scores(_tokenize(query))
     ids, metas = c["ids"], c["metas"]
 
-    if folder or tag:
+    if folder or tag or date_range:
+        def in_range(m: dict) -> bool:
+            if not date_range:
+                return True
+            ts = m.get("created_ts")
+            if ts is None:
+                return False
+            return date_range[0] <= float(ts) <= date_range[1]
         valid = [
             i for i, m in enumerate(metas)
             if (not folder or _folder_matches(m.get("file", ""), folder))
             and (not tag or tag in m.get("tags", ""))
+            and in_range(m)
         ]
         if not valid:
             return []
@@ -1516,6 +1762,11 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
 _reranker = None
 
 
+_reranker_lock = threading.Lock()
+_warmup_started = False
+_warmup_lock = threading.Lock()
+
+
 def get_reranker():
     """Lazy-load cross-encoder reranker on the best available accelerator.
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
@@ -1523,19 +1774,66 @@ def get_reranker():
 
     NOTE: fp16 on MPS breaks bge-reranker-v2-m3 (collapses all scores to
     ~0.001, verified empirically on 2026-04-13). Keep fp32.
+
+    Thread-safe: el warmup async lo toca en paralelo con el path principal.
     """
     global _reranker
-    if _reranker is None:
-        import torch
-        from sentence_transformers import CrossEncoder
-        if torch.backends.mps.is_available():
-            device = "mps"
-        elif torch.cuda.is_available():
-            device = "cuda"
-        else:
-            device = "cpu"
-        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
+    if _reranker is not None:
+        return _reranker
+    with _reranker_lock:
+        if _reranker is None:
+            import torch
+            from sentence_transformers import CrossEncoder
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+            _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
     return _reranker
+
+
+def warmup_async() -> None:
+    """Dispara en background la carga del reranker, bge-m3 y corpus BM25.
+
+    El reranker cold load cuesta ~5s (sentence-transformers + pesos fp32 en
+    MPS). bge-m3 primer embed cuesta ~1s (warmup del cliente Ollama). El
+    corpus load es ~130ms. Todo esto pasa secuencial en el path del primer
+    query — aquí lo solapamos con el CLI arg parse + session resolution +
+    intent classification + reformulate (que toman colectivamente ~0.5-2s).
+
+    Idempotente por proceso. Opt-out via RAG_NO_WARMUP=1 para scripts
+    livianos (rag stats, rag session list) que no necesitan retrieval.
+    """
+    global _warmup_started
+    if os.environ.get("RAG_NO_WARMUP") == "1":
+        return
+    with _warmup_lock:
+        if _warmup_started:
+            return
+        _warmup_started = True
+
+    def _run() -> None:
+        # Reranker: costo dominante (~5s cold).
+        try:
+            get_reranker()
+        except Exception:
+            pass
+        # bge-m3 warm: primera llamada al servidor Ollama inicializa cliente
+        # y fuerza keep_alive — siguientes embeds responden <150ms.
+        try:
+            embed(["warmup"])
+        except Exception:
+            pass
+        # Corpus BM25 + vocabulario: ~130ms, se evita en primer retrieve().
+        try:
+            _load_corpus(get_db())
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_run, name="rag-warmup", daemon=True)
+    t.start()
 
 
 def cross_encoder_rerank(
@@ -1570,6 +1868,13 @@ def _extract_proper_nouns(text: str) -> set[str]:
     return {m.group(1) for m in _PROPER_NOUN_RE.finditer(text)}
 
 
+# Cache LRU de paráfrasis por query. Temperature=0 + seed=42 → determinístico,
+# cachear es gratis. Las queries se repiten bastante entre chat turns y bots.
+_EXPAND_CACHE_MAX = 256
+_expand_cache: "dict[str, list[str]]" = {}
+_expand_cache_lock = threading.Lock()
+
+
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
 
@@ -1578,6 +1883,10 @@ def expand_queries(question: str) -> list[str]:
     paráfrasis que droppean tokens propios del original. Sin esto, qwen2.5:3b
     generaba 'el actor Adam Jones' / 'el intérprete X', desviando el recall.
     """
+    with _expand_cache_lock:
+        hit = _expand_cache.get(question)
+    if hit is not None:
+        return list(hit)
     prompt = (
         "Reformulá esta pregunta de DOS maneras distintas — distintas "
         "palabras clave, mismo sentido. Nombres propios (personas, bandas, "
@@ -1602,24 +1911,32 @@ def expand_queries(question: str) -> list[str]:
     except Exception:
         return [question]
 
-    lines = [l.strip(" -*·") for l in content.splitlines() if l.strip()]
+    lines = [ln.strip(" -*·") for ln in content.splitlines() if ln.strip()]
     # Guardrail case-insensitive: cada paráfrasi debe contener todos los
     # tokens propios del original (lowercased). Evita que "RAG" se pierda
     # aunque qwen lo devuelva como "rag" — el issue no es el case, es que
     # la entidad esté presente.
     original_noun_tokens = {n.lower() for n in _extract_proper_nouns(question)}
     kept: list[str] = []
-    for l in lines:
-        if l == question:
+    for ln in lines:
+        if ln == question:
             continue
         if original_noun_tokens:
-            para_tokens = {m.group(0).lower() for m in _PARAPHRASE_TOKEN_RE.finditer(l)}
+            para_tokens = {m.group(0).lower() for m in _PARAPHRASE_TOKEN_RE.finditer(ln)}
             if not original_noun_tokens.issubset(para_tokens):
                 continue
-        kept.append(l)
+        kept.append(ln)
         if len(kept) >= 2:
             break
-    return [question] + kept
+    result = [question] + kept
+    with _expand_cache_lock:
+        if len(_expand_cache) >= _EXPAND_CACHE_MAX:
+            try:
+                _expand_cache.pop(next(iter(_expand_cache)))
+            except StopIteration:
+                pass
+        _expand_cache[question] = result
+    return list(result)
 
 
 _RECENCY_RE = re.compile(
@@ -2090,6 +2407,185 @@ def detect_save_intent(text: str) -> tuple[bool, str | None]:
     return True, (m.group(1).strip() if m else None)
 
 
+# ── TEMPORAL INTENT ───────────────────────────────────────────────────────────
+# "¿qué escribí la última semana sobre RAG?", "notas del mes pasado", "ideas
+# de enero". Tight Spanish-first patterns: infer (start_ts, end_ts) + a
+# cleaned query stripped of the temporal phrase so the embedder doesn't waste
+# signal on tokens we already turned into metadata.
+
+_SPANISH_MONTHS = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+_UNIT_DAYS = {
+    "dia": 1, "día": 1, "dias": 1, "días": 1,
+    "semana": 7, "semanas": 7,
+    "mes": 30, "meses": 30,
+    "año": 365, "ano": 365, "años": 365, "anos": 365,
+}
+
+# Each pattern captures the span to strip from the query via named group `span`.
+_TEMPORAL_PATTERNS = [
+    # "últimos N días/semanas/meses/años" (and últimas/último)
+    re.compile(
+        r"(?P<span>(?:en\s+)?(?:los\s+|las\s+)?[úu]ltim[oa]s?\s+(?P<n>\d+)\s+"
+        r"(?P<unit>d[íi]as?|semanas?|meses|a[ñn]os?))",
+        re.IGNORECASE,
+    ),
+    # "hace N días/semanas/meses/años"
+    re.compile(
+        r"(?P<span>hace\s+(?P<n>\d+)\s+(?P<unit>d[íi]as?|semanas?|meses|a[ñn]os?))",
+        re.IGNORECASE,
+    ),
+    # "última semana/mes/año" (implicit N=1). Prefix also accepts "de la" /
+    # "del" / "en la" / "en el" so phrases like "notas de la última semana"
+    # strip cleanly instead of leaving a dangling preposition.
+    re.compile(
+        r"(?P<span>(?:de\s+la\s+|de\s+el\s+|del\s+|en\s+la\s+|en\s+el\s+|la\s+|el\s+)?"
+        r"[úu]ltim[oa]\s+(?P<unit>semana|mes|a[ñn]o))",
+        re.IGNORECASE,
+    ),
+    # "semana/mes/año pasad[oa]" (implicit N=1)
+    re.compile(
+        r"(?P<span>(?:de\s+la\s+|de\s+el\s+|del\s+|en\s+la\s+|en\s+el\s+|la\s+|el\s+)?"
+        r"(?P<unit>semana|mes|a[ñn]o)\s+pasad[oa])",
+        re.IGNORECASE,
+    ),
+    # "esta semana/este mes/este año" — start of current calendar period
+    re.compile(
+        r"(?P<span>(?:de\s+|en\s+)?est[ae]\s+(?P<unit>semana|mes|a[ñn]o))",
+        re.IGNORECASE,
+    ),
+    # "ayer" / "hoy"
+    re.compile(r"(?P<span>\b(?P<unit>ayer|hoy)\b)", re.IGNORECASE),
+    # Spanish month name — "de enero", "en marzo", bare "enero"
+    re.compile(
+        r"(?P<span>(?:de\s+|en\s+)?\b(?P<month>enero|febrero|marzo|abril|mayo|junio|"
+        r"julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _now_dt() -> datetime:
+    """Indirection so tests can freeze time by monkeypatching."""
+    return datetime.now()
+
+
+def _range_last_n_days(n: int) -> tuple[float, float]:
+    now = _now_dt()
+    start = now.timestamp() - n * 86400
+    return start, now.timestamp()
+
+
+def _range_this_period(unit: str) -> tuple[float, float]:
+    """Start-of-current calendar period → now. `unit` ∈ semana|mes|año."""
+    now = _now_dt()
+    if unit.startswith("sem"):
+        # ISO week: Monday = 0. Start of the current week at 00:00.
+        start_dt = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    elif unit.startswith("mes"):
+        start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:  # año
+        start_dt = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start_dt.timestamp(), now.timestamp()
+
+
+def _range_month(month: int) -> tuple[float, float]:
+    """Absolute Spanish month name. If the month is in the future relative to
+    today, assume the user meant last year's occurrence (covers "qué escribí
+    en noviembre" asked in March).
+    """
+    now = _now_dt()
+    year = now.year if month <= now.month else now.year - 1
+    start_dt = datetime(year, month, 1)
+    if month == 12:
+        end_dt = datetime(year + 1, 1, 1)
+    else:
+        end_dt = datetime(year, month + 1, 1)
+    return start_dt.timestamp(), end_dt.timestamp()
+
+
+def detect_temporal_intent(text: str) -> tuple[tuple[float, float] | None, str]:
+    """Return ((start_ts, end_ts), cleaned_query) or (None, text).
+
+    Spanish-first. Tight regex — must not steal "del año de la pera" and
+    similar idioms. When a pattern matches, strips the phrase from the
+    returned query so the embedder sees only the semantic residue.
+    """
+    for pat in _TEMPORAL_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        groups = m.groupdict()
+        rng: tuple[float, float] | None = None
+        unit = groups.get("unit")
+        if "n" in groups and groups["n"]:
+            n = int(groups["n"])
+            days = _UNIT_DAYS.get(unit.lower())
+            if days:
+                rng = _range_last_n_days(n * days)
+        elif unit and unit.lower() in ("ayer",):
+            now = _now_dt()
+            start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            rng = (start.timestamp(), end.timestamp())
+        elif unit and unit.lower() in ("hoy",):
+            now = _now_dt()
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            rng = (start.timestamp(), now.timestamp())
+        elif groups.get("month"):
+            rng = _range_month(_SPANISH_MONTHS[groups["month"].lower()])
+        elif unit:
+            # última/pasad[oa] / esta — implicit N=1.
+            norm = unit.lower()
+            low_text = m.group("span").lower()
+            if "est" in low_text:  # "esta semana" / "este mes" / "este año"
+                rng = _range_this_period(norm)
+            else:
+                days = 7 if norm.startswith("sem") else (30 if norm.startswith("mes") else 365)
+                rng = _range_last_n_days(days)
+        if rng is None:
+            continue
+        cleaned = (text[:m.start("span")] + text[m.end("span"):]).strip()
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return rng, cleaned or text
+    return None, text
+
+
+_SINCE_REL_RE = re.compile(r"^(\d+)\s*([dwmy])$", re.IGNORECASE)
+
+
+def parse_since(value: str) -> float:
+    """Parse `--since` flag → start_ts. Accepts:
+      - '7d', '2w', '3m', '1y' (relative)
+      - ISO date: '2026-01-01' or '2026-01-01T09:30:00'
+    Raises click.BadParameter with a helpful message on invalid input.
+    """
+    s = value.strip()
+    m = _SINCE_REL_RE.match(s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit]
+        return _now_dt().timestamp() - n * days * 86400
+    # ISO date
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        raise click.BadParameter(
+            f"Formato inválido: {value!r}. Usá '7d', '2w', '3m', '1y' o una fecha ISO (YYYY-MM-DD)."
+        )
+
+
 def save_note(
     col: chromadb.Collection,
     title: str | None,
@@ -2523,7 +3019,6 @@ def find_surface_bridges(
     snippets (primeros ~800 chars del body, sin frontmatter) para que el caller
     pueda alimentar un LLM opcional que genere la oración de "por qué conectan".
     """
-    import numpy as np
     corpus = _load_corpus(col)
     files, metas, arr = _note_centroids(col)
     if len(files) < 2:
@@ -3275,7 +3770,7 @@ def _rollback_filing_batch(col: chromadb.Collection, batch_path: Path) -> list[d
     import shutil
     results: list[dict] = []
     with batch_path.open("r", encoding="utf-8") as f:
-        entries = [json.loads(l) for l in f if l.strip()]
+        entries = [json.loads(ln) for ln in f if ln.strip()]
     # Revertir en orden inverso por seguridad (si hubo dependencias de path).
     for e in reversed(entries):
         src_rel = e["src"]
@@ -3321,7 +3816,6 @@ def find_near_duplicates_for(
     Lower default threshold than `find_duplicate_notes` so partial overlaps
     surface as warnings rather than be silently missed.
     """
-    import numpy as np
     files, metas, arr = _note_centroids(col)
     if note_path not in files:
         return []
@@ -3514,12 +4008,21 @@ def reformulate_query(question: str, history: list[dict]) -> str:
     return resp.message.content.strip().strip('"')
 
 
-def build_where(folder: str | None, tag: str | None) -> dict | None:
-    """Build ChromaDB where filter from folder and/or tag.
+def build_where(
+    folder: str | None,
+    tag: str | None,
+    date_range: tuple[float, float] | None = None,
+) -> dict | None:
+    """Build ChromaDB where filter from folder and/or tag and/or date_range.
 
     Folder is widened with `$or` to include 00-Inbox — rationale in
     `_folder_matches`. If the user *explicitly* filtered to Inbox, the OR
     is a no-op (same set twice), so the extra clause is harmless.
+
+    `date_range` is a `(start_ts, end_ts)` tuple on the `created_ts` metadata
+    field. Chunks missing the field (indexed pre-temporal feature) fall out
+    naturally — the lazy `_maybe_backfill_created_ts` hook covers existing
+    vaults on first use.
     """
     conditions = []
     if folder:
@@ -3529,6 +4032,12 @@ def build_where(folder: str | None, tag: str | None) -> dict | None:
         ]})
     if tag:
         conditions.append({"tags": {"$contains": tag}})
+    if date_range:
+        start, end = date_range
+        conditions.append({"$and": [
+            {"created_ts": {"$gte": start}},
+            {"created_ts": {"$lte": end}},
+        ]})
     if not conditions:
         return None
     if len(conditions) == 1:
@@ -3546,6 +4055,7 @@ def retrieve(
     precise: bool = False,
     multi_query: bool = True,
     auto_filter: bool = True,
+    date_range: tuple[float, float] | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -3568,8 +4078,8 @@ def retrieve(
     if precise and history:
         search_query = reformulate_query(question, history)
 
-    # 2. Auto-filter: sniff tag/folder from the query against index vocabulary
-    filters_applied: dict[str, str] = {}
+    # 2. Auto-filter: sniff tag/folder/date from the query against index vocabulary
+    filters_applied: dict = {}
     if auto_filter and not folder and not tag:
         known_tags, known_folders = get_vocabulary(col)
         inferred_folder, inferred_tag = infer_filters(search_query, known_tags, known_folders)
@@ -3579,6 +4089,22 @@ def retrieve(
             filters_applied["tag"] = inferred_tag
         if inferred_folder:
             filters_applied["folder"] = inferred_folder
+    if auto_filter and date_range is None:
+        inferred_range, cleaned = detect_temporal_intent(search_query)
+        if inferred_range is not None:
+            date_range = inferred_range
+            # Strip the temporal phrase from the embedder/BM25 input — the
+            # filter carries that signal, embedding it again just adds noise.
+            search_query = cleaned
+    if date_range is not None:
+        # Backfill old chunks lazily the first time a date filter runs in
+        # this process. Idempotent; cheap when there's nothing to do.
+        try:
+            _maybe_backfill_created_ts()
+        except Exception:
+            pass
+        filters_applied["since"] = datetime.fromtimestamp(date_range[0]).strftime("%Y-%m-%d")
+        filters_applied["until"] = datetime.fromtimestamp(date_range[1]).strftime("%Y-%m-%d")
 
     # 3. Multi-query expansion (original + 2 paraphrases)
     variants = [search_query]
@@ -3591,7 +4117,7 @@ def retrieve(
     # 4. Retrieve per variant, union IDs.
     #    Non-HyDE path: batch-embed all variants in one Ollama call.
     #    HyDE path: each variant needs its own generated hypothetical, keep per-variant.
-    where = build_where(folder, tag)
+    where = build_where(folder, tag, date_range)
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
@@ -3612,7 +4138,7 @@ def retrieve(
         if where:
             sem_kwargs["where"] = where
         sem_ids = col.query(**sem_kwargs)["ids"][0]
-        bm25_ids = bm25_search(col, v, RETRIEVE_K, folder, tag)
+        bm25_ids = bm25_search(col, v, RETRIEVE_K, folder, tag, date_range)
         for id_ in rrf_merge(sem_ids, bm25_ids):
             if id_ not in seen_ids:
                 seen_ids.add(id_)
@@ -3758,6 +4284,7 @@ def multi_retrieve(
     precise: bool = False,
     multi_query: bool = True,
     auto_filter: bool = True,
+    date_range: tuple[float, float] | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -3783,6 +4310,7 @@ def multi_retrieve(
         r = retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
+            date_range=date_range,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -3798,6 +4326,7 @@ def multi_retrieve(
         r = retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
+            date_range=date_range,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -4396,10 +4925,17 @@ def _index_single_file(
     parent_texts = [c[2] for c in chunks]
     embeddings = embed(embed_texts)
 
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = time.time()
+    created_ts = _note_created_ts(raw, mtime)
+
     base_meta = {
         "file": doc_id_prefix, "note": path.stem, "folder": folder,
         "tags": ",".join(tags), "hash": h,
         "outlinks": ",".join(outlinks),
+        "created_ts": created_ts,
     }
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -4679,6 +5215,8 @@ def watch(debounce: float):
 @click.option("-k", default=RERANK_TOP, help=f"Chunks finales a usar (default: {RERANK_TOP})")
 @click.option("--folder", default=None, help="Filtrar por carpeta (ej: '02-Areas/Musica')")
 @click.option("--tag", default=None, help="Filtrar por tag (ej: letra, rock, ai, finanzas)")
+@click.option("--since", "since", default=None,
+              help="Filtrar por fecha de creación. Acepta '7d'/'2w'/'3m'/'1y' o ISO (YYYY-MM-DD).")
 @click.option("--hyde", is_flag=True, help="Activa HyDE (mejora con LLMs grandes; con modelos chicos tiende a empeorar)")
 @click.option("--no-multi", is_flag=True, help="Desactiva multi-query expansion")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
@@ -4695,12 +5233,18 @@ def watch(debounce: float):
               help="Después de responder, buscar chunks del vault que CONTRADIGAN la respuesta")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
+    since: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool,
 ):
     """Consulta única contra las notas."""
+    warmup_async()
+    # Explicit --since wins over auto-detect; both are pushed through retrieve().
+    date_range: tuple[float, float] | None = None
+    if since:
+        date_range = (parse_since(since), time.time())
     col = get_db()
     if col.count() == 0:
         if plain:
@@ -4752,7 +5296,7 @@ def query(
                     f"[bold green]{n}[/bold green] nota(s) [dim]({params_str})[/dim]"
                 )
                 if n and n <= 30:
-                    render_file_list(f"notas", files)
+                    render_file_list("notas", files)
         elif intent == "list":
             files = handle_list(col, intent_params)
             if plain:
@@ -4786,12 +5330,14 @@ def query(
         result = retrieve(
             col, effective_question, k, folder, tag=tag, precise=hyde,
             multi_query=not no_multi, auto_filter=not no_auto_filter,
+            date_range=date_range,
         )
     else:
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
             result = retrieve(
                 col, effective_question, k, folder, tag=tag, precise=hyde,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
+                date_range=date_range,
             )
     t_retrieve = time.perf_counter() - t_start
     if not result["docs"]:
@@ -5020,7 +5566,7 @@ def _arrow_select(
     selected = max(0, min(default_idx, n_choices - 1))
     # Layout: 1 (título) + n_choices + 1 (hint) = total_lines.
     total_lines = 1 + n_choices + 1
-    hint = "[↑/↓ navegar · Enter elegir · q cancelar]"
+    hint = "[↑/↓ (o 1-9) · Enter · q cancelar]"
 
     def _line_for(idx: int) -> str:
         """Genera la línea idx-ésima del menú con ANSI styling.
@@ -5071,8 +5617,12 @@ def _arrow_select(
             except (KeyboardInterrupt, OSError):
                 _erase_menu()
                 return -1
+            # EOF: stdin cerrado (pipe rota, Ctrl-D en algunos contextos).
+            # Sin esto, read(fd,1) devuelve b"" en loop → 100% CPU para siempre.
+            # Tratar como cancel (cae al default_idx arriba).
             if not b:
-                continue
+                _erase_menu()
+                return default_idx
             ch = b.decode("latin-1")
             if ch == "\x1b":   # ESC o secuencia
                 # Pequeño timeout para distinguir ESC bare de inicio de seq.
@@ -5097,6 +5647,15 @@ def _arrow_select(
                 selected = (selected - 1) % n_choices
             elif ch == "j":
                 selected = (selected + 1) % n_choices
+            # Numeric shortcut — si las arrow keys no responden (terminales
+            # raros, tmux en ciertos modos) el usuario puede tipear 1-9 para
+            # saltar directo a la opción y confirmarla en un solo keystroke.
+            elif ch.isdigit() and ch != "0":
+                idx = int(ch) - 1
+                if 0 <= idx < n_choices:
+                    selected = idx
+                    _erase_menu()
+                    return selected
             elif ch == "\x03":   # Ctrl-C en cbreak (ISIG-aware) puede
                 _erase_menu()    # llegar igual via el fd; manejar.
                 return -1
@@ -5156,6 +5715,8 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
 @click.option("-k", default=RERANK_TOP, help="Chunks finales por turno")
 @click.option("--folder", default=None, help="Filtrar por carpeta (ej: '02-Areas/Musica')")
 @click.option("--tag", default=None, help="Filtrar por tag (ej: letra, rock, ai, finanzas)")
+@click.option("--since", "since", default=None,
+              help="Filtrar por fecha de creación. '7d'/'2w'/'3m'/'1y' o ISO. También se auto-detecta en preguntas tipo 'la última semana'.")
 @click.option("--precise", is_flag=True, help="HyDE + reformulación (más preciso, ~5s extra)")
 @click.option("--no-multi", is_flag=True, help="Desactiva multi-query expansion")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
@@ -5168,12 +5729,19 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
               help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
                    "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
 def chat(
-    k: int, folder: str | None, tag: str | None, precise: bool,
+    k: int, folder: str | None, tag: str | None,
+    since: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
     vault_scope: str | None,
 ):
     """Chat interactivo con tus notas."""
+    warmup_async()
+    # --since fija un piso de fecha para todo el chat; cada turno también
+    # corre auto-detección ("qué hice ayer" trae su propio rango).
+    pinned_date_range: tuple[float, float] | None = None
+    if since:
+        pinned_date_range = (parse_since(since), time.time())
     # col = vault para WRITE operations (/save, /inbox, /reindex,
     # find_related). Siempre apunta al current del registry, aunque el
     # scope de READ incluya múltiples vaults — evita ambigüedad ("guardar
@@ -5234,6 +5802,8 @@ def chat(
         flags.append(f"carpeta: {folder}")
     if tag:
         flags.append(f"tag: #{tag}")
+    if pinned_date_range:
+        flags.append(f"desde: {datetime.fromtimestamp(pinned_date_range[0]).strftime('%Y-%m-%d')}")
     features = []
     if precise:
         features.append("HyDE")
@@ -5254,7 +5824,7 @@ def chat(
     if len(scope_names) == 1:
         vault_label = scope_names[0]
     else:
-        vault_label = " + ".join(scope_names) + f" [dim](cross-vault)[/dim]"
+        vault_label = " + ".join(scope_names) + " [dim](cross-vault)[/dim]"
     vault_line = f"[dim]· vault: [bold magenta]{vault_label}[/bold magenta][/dim]"
 
     session_line = (
@@ -5265,7 +5835,7 @@ def chat(
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
         f"{vault_line}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · 👍/👎 · /cls · /exit[/dim]",
+        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · +/- feedback · /cls · /exit[/dim]",
         border_style="green",
     ))
 
@@ -5303,8 +5873,8 @@ def chat(
             pass
     if total_chunks == 0:
         console.print(
-            f"[red]Los vaults seleccionados están vacíos. "
-            f"Verificá que tienen archivos .md.[/red]"
+            "[red]Los vaults seleccionados están vacíos. "
+            "Verificá que tienen archivos .md.[/red]"
         )
         return
 
@@ -5356,8 +5926,8 @@ def chat(
                 last_turn_id, rating, last_question,
                 [m.get("file", "") for m in last_sources if m.get("file")],
             )
-            icon = "👍" if rating > 0 else "👎"
-            console.print(f"[dim]{icon} feedback guardado.[/dim]")
+            label = "positivo" if rating > 0 else "negativo"
+            console.print(f"[dim]✓ feedback {label} guardado.[/dim]")
             continue
 
         # /cls — limpia la pantalla y borra la conversación: turnos persistidos,
@@ -5468,6 +6038,7 @@ def chat(
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
+                date_range=pinned_date_range,
             )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
@@ -5506,8 +6077,14 @@ def chat(
         console.print()
         parts: list[str] = []
         print("\x1b[1;36mrag ›\x1b[0m ", end="", flush=True)
+        # TTFT en command-r ≈ 1-3s — sin placeholder el usuario ve sólo el
+        # prompt "rag ›" colgado y parece que el chat se congeló. Arrancamos
+        # Live con un Spinner; en cuanto llega el primer chunk, live.update
+        # lo reemplaza por el texto y la transición es invisible.
         from rich.live import Live
-        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+        from rich.spinner import Spinner
+        placeholder = Spinner("dots", text=Text("pensando…", style="dim"))
+        with Live(placeholder, console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(
                 model=resolve_chat_model(),
                 messages=messages,
@@ -5561,7 +6138,7 @@ def chat(
 
         print_sources(result)
         render_related(find_related(col, result["metas"]))
-        console.print("[dim]› 👍 / 👎 para dar feedback[/dim]")
+        console.print("[dim]› [bold]+[/bold] o [bold]-[/bold] para dar feedback[/dim]")
 
 
 @cli.command()
@@ -5829,7 +6406,6 @@ def autotag(path: str, apply: bool, max_tags: int):
         # Replace or insert tags: key — yaml.safe_dump-ish but we want to
         # preserve the rest of the frontmatter verbatim.
         new_fm_lines: list[str] = []
-        skipped_tags = False
         in_tag_block = False
         for line in fm_text.splitlines():
             if in_tag_block and re.match(r"^\s*-\s+", line):
@@ -5837,7 +6413,6 @@ def autotag(path: str, apply: bool, max_tags: int):
             in_tag_block = False
             if re.match(r"^tags\s*:", line):
                 in_tag_block = True
-                skipped_tags = True
                 continue
             new_fm_lines.append(line)
         new_fm_lines.append("tags:")
@@ -5850,7 +6425,7 @@ def autotag(path: str, apply: bool, max_tags: int):
         new_raw = fm_block + raw
 
     note_path.write_text(new_raw, encoding="utf-8")
-    console.print(f"[green]✓ Frontmatter actualizado.[/green]")
+    console.print("[green]✓ Frontmatter actualizado.[/green]")
     _index_single_file(col, note_path)
 
 
@@ -6668,6 +7243,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
     Los writes se proponen primero (`propose_write` tool) y se confirman al
     final uno por uno (o todos con --yes).
     """
+    warmup_async()
     _AGENT_PENDING_WRITES.clear()
 
     tools = [
@@ -6784,6 +7360,76 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print("[dim](sin writes propuestos)[/dim]")
 
 
+_CREATED_TS_BACKFILL_DONE = False
+
+
+def _maybe_backfill_created_ts() -> None:
+    """Populate `created_ts` on chunks indexed before the temporal-retrieval
+    feature landed. Metadata-only update (no re-embedding) — reads each file
+    to get frontmatter `created:` or falls back to mtime, then `col.update()`
+    in batches. Idempotent within a process.
+
+    Gated by this lazy hook so users don't pay the scan cost until they
+    actually use a date filter. A freshly-reset index will have created_ts
+    on every chunk from the start, so this pass is a no-op and finishes fast.
+    """
+    global _CREATED_TS_BACKFILL_DONE
+    if _CREATED_TS_BACKFILL_DONE:
+        return
+    _CREATED_TS_BACKFILL_DONE = True
+    try:
+        col = get_db()
+        if col.count() == 0:
+            return
+        # Chroma doesn't support {"$not_exists": ...} across all backends,
+        # so we fetch all metadata and filter in Python. 521-note vault
+        # produces ~2k chunks — negligible.
+        data = col.get(include=["metadatas"])
+    except Exception:
+        return
+    ids = data.get("ids") or []
+    metas = data.get("metadatas") or []
+    missing: dict[str, list[tuple[str, dict]]] = {}
+    for id_, m in zip(ids, metas):
+        if m is None:
+            continue
+        if "created_ts" in m:
+            continue
+        file_rel = m.get("file", "")
+        if not file_rel:
+            continue
+        missing.setdefault(file_rel, []).append((id_, dict(m)))
+    if not missing:
+        return
+    console.print(
+        f"[dim]Backfill created_ts en {len(missing)} nota(s) "
+        f"({sum(len(v) for v in missing.values())} chunks)…[/dim]"
+    )
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
+    for file_rel, items in missing.items():
+        abs_path = VAULT_PATH / file_rel
+        try:
+            mtime = abs_path.stat().st_mtime
+            raw = abs_path.read_text(encoding="utf-8", errors="ignore") if abs_path.is_file() else ""
+        except OSError:
+            continue
+        ts = _note_created_ts(raw, mtime) if raw else mtime
+        for id_, m in items:
+            m["created_ts"] = ts
+            update_ids.append(id_)
+            update_metas.append(m)
+    if not update_ids:
+        return
+    try:
+        # Batch to avoid Chroma payload limits.
+        B = 500
+        for i in range(0, len(update_ids), B):
+            col.update(ids=update_ids[i:i + B], metadatas=update_metas[i:i + B])
+    except Exception as e:
+        console.print(f"[yellow]Backfill created_ts falló: {e}[/yellow]")
+
+
 _URLS_BACKFILL_DONE = False
 
 
@@ -6814,11 +7460,20 @@ def _maybe_backfill_urls() -> None:
         console.print(f"[yellow]Backfill falló: {e}[/yellow]")
 
 
+def _row_matches_source(meta: dict, source: str) -> bool:
+    """Legacy rows (indexed before the `source` field existed) lack the key.
+    Treat those as 'note' so `--source note` works without a reindex.
+    """
+    row_source = (meta or {}).get("source") or "note"
+    return row_source == source
+
+
 def find_urls(
     query: str,
     k: int = 10,
     folder: str | None = None,
     tag: str | None = None,
+    source: str | None = None,
 ) -> list[dict]:
     """Semantic-by-context search over the URL sub-index.
 
@@ -6826,6 +7481,10 @@ def find_urls(
     query like "documentación de claude code" matches notes that introduce or
     annotate the relevant link. Reranks the top candidates against the query
     with the cross-encoder, dedups by URL, returns up to k items.
+
+    `source="note"` restricts to URLs extracted from vault notes (also matches
+    legacy rows predating the field). `source="bookmark"` restricts to Chrome
+    bookmarks. Default mixes both.
 
     First-call autopilot: if the URL collection is empty but the vault is
     indexed, runs `_rebuild_urls_index` silently so the user never has to
@@ -6840,7 +7499,9 @@ def find_urls(
     except Exception:
         return []
     where = build_where(folder, tag)
-    n = min(k * 3 + 5, col_urls.count())
+    # Over-fetch when we'll post-filter by source — keeps the final pool wide.
+    overshoot = 5 if source else 3
+    n = min(k * overshoot + 5, col_urls.count())
     kwargs: dict = {
         "query_embeddings": [q_embed], "n_results": n,
         "include": ["documents", "metadatas", "distances"],
@@ -6849,6 +7510,16 @@ def find_urls(
         kwargs["where"] = where
     res = col_urls.query(**kwargs)
     docs, metas, dists = res["documents"][0], res["metadatas"][0], res["distances"][0]
+    if source:
+        kept = [
+            (d, m, dist) for d, m, dist in zip(docs, metas, dists)
+            if _row_matches_source(m, source)
+        ]
+        if not kept:
+            return []
+        docs = [x[0] for x in kept]
+        metas = [x[1] for x in kept]
+        dists = [x[2] for x in kept]
     if not docs:
         return []
     try:
@@ -6881,6 +7552,9 @@ def find_urls(
             "line": m.get("line", 0),
             "context": d,
             "score": score,
+            "source": m.get("source") or "note",
+            "profile": m.get("profile", ""),
+            "bookmark_folder": m.get("bookmark_folder", ""),
         })
         if len(items) >= k:
             break
@@ -6944,43 +7618,66 @@ def render_links(items: list[dict], plain: bool = False) -> None:
                 click.echo(f"   {label}")
             click.echo(f"   en {it['path']}:{it.get('line', 0)}")
         return
+    # Body mirrors the chat flow: header · markdown bullet list · Fuentes ·
+    # Relacionadas. Keeps URL output visually consistent with regular chat
+    # answers (the LLM emits the same `[label](url)` bullets).
     console.print()
-    console.print(Rule(title="[bold cyan]🔗 Links[/bold cyan]", style="cyan"))
+    files = {it["path"] for it in items if it.get("path")}
+    console.print(
+        f"  [dim]🔗 links · {len(items)} url(s) · {len(files)} nota(s)[/dim]"
+    )
+    console.print()
+
+    # Numeración `01.`, `02.` zero-padded. Un spans clickeable por item
+    # (OSC 8 hyperlink abre la URL). Si hay anchor, mostramos sólo el
+    # anchor — la URL está detrás del link, no hace falta duplicarla.
+    # Sin anchor → URL bare clickeable.
+    width = max(2, len(str(len(items))))
     for i, it in enumerate(items, 1):
         url = it["url"]
         anchor = (it.get("anchor") or "").strip()
-        use_anchor = bool(anchor) and anchor != url
-        title = Text()
-        title.append(f" {i} ", style="reverse bold cyan")
-        title.append(" ")
-        title.append(
-            anchor if use_anchor else url,
-            style=f"bold underline blue link {url}",
-        )
-        body_lines: list[Text | str] = []
-        if use_anchor:
-            body_lines.append(Text(url, style=f"dim blue link {url}"))
-        loc = Text()
-        loc.append(it.get("note", ""), style=_file_link_style(it["path"], "magenta"))
-        loc.append("  ·  ", style="dim")
-        loc.append(
-            f"{it['path']}:{it.get('line', 0)}",
-            style=_file_link_style(it["path"], "cyan dim"),
-        )
-        body_lines.append(loc)
-        ctx = _clean_link_context(it.get("context") or "", url)
-        if ctx:
-            body_lines.append(Text(ctx, style="dim italic"))
-        console.print(
-            Panel(
-                Group(*body_lines),
-                title=title,
-                title_align="left",
-                border_style="cyan dim",
-                box=box.ROUNDED,
-                padding=(0, 1),
-            )
-        )
+        label = anchor if anchor and anchor != url else url
+        line = Text()
+        line.append(f"{i:0{width}d}. ", style="dim")
+        line.append(label, style=_url_link_style(url, "blue"))
+        console.print(line)
+
+    # Fuentes + Relacionadas: look up full metas from the corpus so
+    # `find_related` has tags/outlinks to work with. URL items only carry
+    # {path, note, line} — the corpus has everything else.
+    try:
+        col = get_db()
+        corpus = _load_corpus(col)
+        by_file = {m.get("file", ""): m for m in corpus["metas"]}
+    except Exception:
+        by_file = {}
+
+    seen_files: set[str] = set()
+    metas: list[dict] = []
+    for it in items:
+        f = it.get("path", "")
+        if not f or f in seen_files:
+            continue
+        seen_files.add(f)
+        metas.append(by_file.get(f) or {
+            "file": f, "note": it.get("note", ""), "tags": "", "folder": "",
+        })
+    scores = [float(it.get("score", 0.0)) for it in items if it.get("path") and it["path"] in seen_files][:len(metas)]
+    # Pad with zeros if de-dup dropped some; render_sources just zips.
+    while len(scores) < len(metas):
+        scores.append(0.0)
+
+    if metas:
+        console.print()
+        console.print(Rule(title="[dim]Fuentes[/dim]", style="dim", characters="╌"))
+        console.print(render_sources(metas, scores))
+
+    if metas and by_file:
+        try:
+            related = find_related(col, metas, limit=5)
+        except Exception:
+            related = []
+        render_related(related)
 
 
 def _rebuild_urls_index() -> dict:
@@ -7026,8 +7723,12 @@ def _rebuild_urls_index() -> dict:
 @click.option("--plain", is_flag=True, help="Salida plana sin colores/paneles")
 @click.option("--rebuild", is_flag=True,
               help="Re-extraer URLs de todas las notas sin re-embeddar chunks")
+@click.option("--source", "source", type=click.Choice(["note", "bookmark"]),
+              default=None,
+              help="Filtrar por origen: solo URLs de notas o solo bookmarks de Chrome")
 def links(query: str | None, k: int, folder: str | None, tag: str | None,
-          open_idx: int | None, plain: bool, rebuild: bool):
+          open_idx: int | None, plain: bool, rebuild: bool,
+          source: str | None):
     """Buscar URLs en el vault por contexto semántico — respuesta sin LLM."""
     if rebuild:
         _rebuild_urls_index()
@@ -7035,7 +7736,8 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
     if not query:
         console.print("[yellow]Pasá una query o usá --rebuild.[/yellow]")
         return
-    items = find_urls(query, k=k, folder=folder, tag=tag)
+    warmup_async()
+    items = find_urls(query, k=k, folder=folder, tag=tag, source=source)
     if open_idx is not None:
         if not (1 <= open_idx <= len(items)):
             msg = f"Índice {open_idx} fuera de rango (1-{len(items)})"
@@ -7193,7 +7895,7 @@ def _filing_source_label(pr: dict) -> str:
         return f"personalized · {len(ev)} similar(es) confirman"
     if src == "baseline+history":
         # Hay history pero no convence — útil saberlo (el usuario puede edit).
-        return f"baseline · history apunta a otros folders"
+        return "baseline · history apunta a otros folders"
     return ""
 
 
@@ -7587,7 +8289,7 @@ def inbox(folder: str, apply: bool, max_tags: int, limit: int,
             target_dir.mkdir(parents=True, exist_ok=True)
             candidate = target_dir / path.name
             if candidate.exists():
-                console.print(f"  [red]✗ destino ya existe, no muevo[/red]")
+                console.print("  [red]✗ destino ya existe, no muevo[/red]")
             else:
                 import shutil
                 shutil.move(str(path), str(candidate))
@@ -7750,7 +8452,6 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
             click.echo(tok, nl=False)
         click.echo("")
     else:
-        from rich.live import Live
         with console.status("[dim]armando brief…[/dim]", spinner="dots"):
             # Drain the stream silently first, then redraw with link styling.
             for chunk in ollama.chat(
@@ -7806,6 +8507,86 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
         click.echo(f"guardado: {rel}") if plain else console.print(
             f"\n[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]"
         )
+
+
+@cli.group()
+def bookmarks():
+    """Indexar bookmarks de Chrome al sub-índice de URLs (rag links)."""
+
+
+@bookmarks.command("sync")
+@click.option("--profile", default=None,
+              help="Solo ese Chrome profile (ej: 'Default', 'Profile 1'). "
+                   "Omitir = todos los profiles.")
+def bookmarks_sync(profile: str | None):
+    """Parsear bookmarks de Chrome y escribirlos al sub-índice de URLs.
+
+    Las filas se etiquetan con `source=bookmark` así `rag links <q>` las mezcla
+    con las URLs de notas, y podés aislarlas con `rag links <q> --source bookmark`.
+    Idempotente: cada profile reemplaza sus filas previas, así nuevos/borrados
+    se reflejan al resyncar.
+    """
+    if not chrome_bookmark_files():
+        console.print(
+            "[yellow]No encontré Chrome en "
+            f"{_chrome_bookmarks_root()}.[/yellow]"
+        )
+        return
+    with console.status("[dim]Sincronizando bookmarks…[/dim]", spinner="dots"):
+        stats = sync_chrome_bookmarks(profile=profile)
+    if stats["profiles"] == 0:
+        console.print(
+            f"[yellow]Profile '{profile}' no existe.[/yellow]"
+            if profile else "[yellow]No hay profiles con bookmarks.[/yellow]"
+        )
+        return
+    for prof, n in stats["per_profile"].items():
+        console.print(f"  [cyan]{prof}[/cyan] · {n} bookmarks")
+    console.print(
+        f"[green]✓ Total:[/green] {stats['total']} bookmarks en "
+        f"{stats['profiles']} profile(s)"
+    )
+
+
+@bookmarks.command("stats")
+def bookmarks_stats():
+    """Contar bookmarks indexados por profile."""
+    col_urls = get_urls_db()
+    # Fetch only metadatas (no embeds) — cheap even with thousands of rows.
+    res = col_urls.get(where={"source": "bookmark"}, include=["metadatas"])
+    metas = res.get("metadatas") or []
+    if not metas:
+        console.print(
+            "[yellow]Sin bookmarks indexados.[/yellow] "
+            "Corré [bold]rag bookmarks sync[/bold]."
+        )
+        return
+    per_profile: dict[str, int] = {}
+    for m in metas:
+        p = (m or {}).get("profile") or "unknown"
+        per_profile[p] = per_profile.get(p, 0) + 1
+    for prof, n in sorted(per_profile.items(), key=lambda x: -x[1]):
+        console.print(f"  [cyan]{prof}[/cyan] · {n} bookmarks")
+    console.print(f"[green]Total:[/green] {len(metas)} bookmarks")
+
+
+@bookmarks.command("clear")
+@click.option("--profile", default=None,
+              help="Solo ese profile. Omitir = borrar TODOS los bookmarks.")
+@click.confirmation_option(prompt="¿Borrar filas source=bookmark del sub-índice?")
+def bookmarks_clear(profile: str | None):
+    """Eliminar bookmarks del sub-índice (no toca las notas)."""
+    col_urls = get_urls_db()
+    where: dict = {"source": "bookmark"}
+    if profile:
+        where = {"$and": [{"source": "bookmark"}, {"profile": profile}]}
+    existing = col_urls.get(where=where, include=[])
+    ids = existing.get("ids") or []
+    if not ids:
+        console.print("[yellow]Nada para borrar.[/yellow]")
+        return
+    col_urls.delete(ids=ids)
+    console.print(f"[green]✓ Borradas {len(ids)} filas.[/green]")
 
 
 @cli.group()
@@ -8009,6 +8790,364 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
         console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
 
 
+# ── URL INGEST (rag read) ────────────────────────────────────────────────────
+# Fetch an external URL, summarize in 1st-person Spanish, and ingest into the
+# vault as a linked note. Stdlib-only HTTP, readability via regex strip.
+
+_READ_FOLDER = "00-Inbox"
+_READ_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Apple Silicon) obsidian-rag/1.0 (+local)"
+)
+_READ_TIMEOUT_SECS = 20
+_READ_MIN_CHARS = 500
+_READ_MAX_CHARS = 16000
+
+_READ_STRIP_TAGS = ("script", "style", "nav", "header", "footer",
+                    "noscript", "aside", "form", "svg", "iframe")
+_READ_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_READ_TAG_RE = re.compile(r"<[^>]+>")
+_READ_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
+_READ_NEWLINES_RE = re.compile(r"\n{3,}")
+
+
+def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, dict]:
+    """Fetch URL, return (decoded_html, headers_dict). Raises RuntimeError on
+    network failure. Stdlib urllib only — no third-party.
+    """
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _READ_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+            "Accept-Language": "en,es;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            headers = dict(resp.headers.items())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Error de red: {e.reason}") from e
+    except (TimeoutError, OSError) as e:
+        raise RuntimeError(f"Timeout/error: {e}") from e
+    try:
+        html = raw.decode(charset, errors="replace")
+    except LookupError:
+        html = raw.decode("utf-8", errors="replace")
+    return html, headers
+
+
+def _read_extract(html: str) -> tuple[str, str]:
+    """Return (title, text). Title from <title>, text from body with scripts/
+    styles/nav/header/footer stripped. Whitespace collapsed. Truncated to
+    _READ_MAX_CHARS so the summary prompt fits the context window.
+    """
+    import html as _html
+    title = ""
+    m = _READ_TITLE_RE.search(html)
+    if m:
+        title = _READ_TAG_RE.sub("", m.group(1))
+        title = _html.unescape(title)
+        title = _READ_WHITESPACE_RE.sub(" ", title).strip()
+        title = re.sub(r"\s+", " ", title)[:200]
+    stripped = html
+    for tag in _READ_STRIP_TAGS:
+        pattern = re.compile(
+            rf"<{tag}\b[^>]*>.*?</{tag}>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        stripped = pattern.sub(" ", stripped)
+        stripped = re.sub(
+            rf"<{tag}\b[^>]*/?>", " ", stripped, flags=re.IGNORECASE,
+        )
+    stripped = re.sub(r"<!--.*?-->", " ", stripped, flags=re.DOTALL)
+    text = _READ_TAG_RE.sub("\n", stripped)
+    text = _html.unescape(text)
+    text = _READ_WHITESPACE_RE.sub(" ", text)
+    text = _READ_NEWLINES_RE.sub("\n\n", text)
+    text = "\n".join(ln.strip() for ln in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > _READ_MAX_CHARS:
+        text = text[:_READ_MAX_CHARS].rstrip() + "…"
+    return title, text
+
+
+def _find_related_by_embedding(
+    col: chromadb.Collection,
+    query_embedding: list[float],
+    limit: int = 5,
+) -> list[dict]:
+    """Semantic neighbours of an embedding — returns up to `limit` note-level
+    metas (deduped by file, best chunk wins). Used by `rag read` where we have
+    a summary but no in-vault source metas for the graph-based `find_related`.
+    """
+    if col.count() == 0:
+        return []
+    try:
+        res = col.query(
+            query_embeddings=[query_embedding],
+            n_results=min(limit * 4, col.count()),
+            include=["metadatas", "distances"],
+        )
+    except Exception:
+        return []
+    metas = res.get("metadatas", [[]])[0] or []
+    distances = res.get("distances", [[]])[0] or []
+    seen: dict[str, tuple[float, dict]] = {}
+    for m, dist in zip(metas, distances):
+        f = m.get("file") or ""
+        if not f or is_excluded(f):
+            continue
+        cur = seen.get(f)
+        if cur is None or dist < cur[0]:
+            seen[f] = (dist, m)
+    ranked = sorted(seen.values(), key=lambda x: x[0])
+    return [m for _, m in ranked[:limit]]
+
+
+def _read_summary_prompt(
+    url: str,
+    title: str,
+    text: str,
+    related_titles: list[str],
+) -> str:
+    related_block = (
+        ", ".join(f"[[{t}]]" for t in related_titles)
+        if related_titles else "(ninguna)"
+    )
+    title_line = f"TÍTULO DETECTADO: {title}\n" if title else ""
+    return (
+        "Sos un asistente que resume artículos externos para archivarlos en "
+        "mis notas personales. Escribí en 1ra persona, en español rioplatense, "
+        "tono calmo y directo, como en mis reviews matutinos. NO inventes "
+        "datos que no estén en el texto; si algo no está, omitilo.\n\n"
+        f"URL: {url}\n"
+        f"{title_line}"
+        f"NOTAS RELACIONADAS EN MI VAULT (podés citar con [[wikilink]] cuando "
+        f"sea pertinente): {related_block}\n\n"
+        "TEXTO FUENTE:\n"
+        f"{text}\n\n"
+        "Generá un resumen de 150-300 palabras que cubra: de qué va el "
+        "artículo, los 2-4 puntos centrales, y cómo se conecta con lo que "
+        "ya tengo en el vault (si aplica). Insertá [[wikilinks]] a las notas "
+        "relacionadas SOLO donde la conexión sea clara; no fuerces links. "
+        "Devolvé SOLO el cuerpo en Markdown — sin título, sin frontmatter, "
+        "sin preámbulo."
+    )
+
+
+def _read_generate_summary(prompt: str) -> str:
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return (resp.message.content or "").strip()
+    except Exception:
+        return ""
+
+
+def _read_slug_from(title: str, url: str) -> str:
+    if title and title.strip():
+        return _slug(title, maxlen=40)
+    try:
+        import urllib.parse as _up
+        host = _up.urlparse(url).netloc or ""
+    except Exception:
+        host = ""
+    host = host.replace("www.", "")
+    return _slug(host, maxlen=40) if host else "read"
+
+
+def _read_build_note(
+    url: str,
+    title: str,
+    summary: str,
+    tags: list[str],
+    related_titles: list[str],
+    created_iso: str,
+) -> str:
+    """Compose frontmatter + body for the read-note."""
+    fm_lines = ["---", f"created: '{created_iso}'", "type: read",
+                f"source: {url}"]
+    safe_title = title.replace('"', "'") if title else ""
+    fm_lines.append(f'title: "{safe_title}"')
+    all_tags = list(dict.fromkeys(["read", *tags]))
+    fm_lines.append("tags:")
+    for t in all_tags:
+        fm_lines.append(f"- {t}")
+    if related_titles:
+        rel_yaml = ", ".join(f'"[[{t}]]"' for t in related_titles)
+        fm_lines.append(f"related: [{rel_yaml}]")
+    else:
+        fm_lines.append("related: []")
+    fm_lines.append("---")
+    heading = title or url
+    body = "\n".join(fm_lines) + f"\n\n# {heading}\n\n{summary.strip()}\n"
+    return body
+
+
+def ingest_read_url(
+    col: chromadb.Collection,
+    url: str,
+    save: bool = False,
+    fetcher=None,
+) -> dict:
+    """Core pipeline for `rag read`. Fetch → extract → summarize → (optionally)
+    write to 00-Inbox. Returns a dict with keys `title`, `summary`, `tags`,
+    `related` (list of titles), `path` (Path or None), `text_len`.
+
+    `fetcher` override is for tests; default uses stdlib urllib.
+    """
+    fetch = fetcher or (lambda u: _read_fetch_url(u))
+    html, _ = fetch(url)
+    title, text = _read_extract(html)
+    if len(text) < _READ_MIN_CHARS:
+        raise RuntimeError(
+            f"Contenido insuficiente: {len(text)} caracteres extraídos "
+            f"(mínimo {_READ_MIN_CHARS}). ¿Paywall, SPA sin SSR, o redirect?"
+        )
+
+    # First pass: quick related lookup using the raw text so we can feed the
+    # titles to the summary prompt (command-r can then choose to link them).
+    related_metas: list[dict] = []
+    if col.count() > 0:
+        try:
+            seed_embed = embed([text[:2000]])[0]
+            related_metas = _find_related_by_embedding(col, seed_embed, limit=5)
+        except Exception:
+            related_metas = []
+    related_titles = [
+        m.get("note", "") for m in related_metas if m.get("note")
+    ]
+
+    prompt = _read_summary_prompt(url, title, text, related_titles)
+    summary = _read_generate_summary(prompt)
+    if not summary:
+        raise RuntimeError("Modelo devolvió un resumen vacío.")
+
+    # Refine related: embed the summary itself (higher signal than raw text).
+    if col.count() > 0:
+        try:
+            summary_embed = embed([summary])[0]
+            refined = _find_related_by_embedding(col, summary_embed, limit=5)
+            if refined:
+                related_metas = refined
+                related_titles = [
+                    m.get("note", "") for m in related_metas if m.get("note")
+                ]
+        except Exception:
+            pass
+
+    note_title_for_tags = title or url
+    try:
+        tags = _suggest_tags_for_note(col, summary, note_title_for_tags, max_tags=5)
+    except Exception:
+        tags = []
+
+    created_iso = datetime.now().isoformat(timespec="seconds")
+    note_body = _read_build_note(
+        url, title, summary, tags, related_titles, created_iso,
+    )
+
+    result = {
+        "url": url, "title": title, "summary": summary, "tags": tags,
+        "related": related_titles, "path": None,
+        "text_len": len(text), "body": note_body,
+    }
+
+    if not save:
+        return result
+
+    now = datetime.now()
+    stamp = now.strftime("%Y-%m-%d-%H%M")
+    slug = _read_slug_from(title, url)
+    target_dir = VAULT_PATH / _READ_FOLDER
+    target_dir.mkdir(parents=True, exist_ok=True)
+    candidate = target_dir / f"{stamp}-read-{slug}.md"
+    i = 2
+    while candidate.exists():
+        candidate = target_dir / f"{stamp}-read-{slug}-{i}.md"
+        i += 1
+    candidate.write_text(note_body, encoding="utf-8")
+    try:
+        _index_single_file(col, candidate, skip_contradict=True)
+    except Exception:
+        pass
+    result["path"] = candidate
+    return result
+
+
+@cli.command("read")
+@click.argument("url")
+@click.option("--save", is_flag=True,
+              help="Escribir la nota en 00-Inbox/ (default: dry-run)")
+@click.option("--plain", is_flag=True,
+              help="Salida plana sin ANSI (para bots)")
+def read_cmd(url: str, save: bool, plain: bool):
+    """Ingerir una URL externa como nota estructurada en el vault.
+
+    Fetchea la página, resume con command-r en 1ra persona, busca notas
+    relacionadas y arma una nota con frontmatter `type: read` + `source: <url>`.
+    Sin --save imprime el preview; con --save escribe a
+    `00-Inbox/YYYY-MM-DD-HHMM-read-<slug>.md` y la indexa.
+    """
+    if not (url.startswith("http://") or url.startswith("https://")):
+        msg = "URL inválida: debe empezar con http:// o https://"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        raise SystemExit(1)
+
+    col = get_db()
+    try:
+        result = ingest_read_url(col, url, save=save)
+    except RuntimeError as e:
+        click.echo(str(e)) if plain else console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    log_query_event({
+        "cmd": "read", "url": url, "saved": bool(save),
+        "title": result.get("title", ""),
+        "text_len": result.get("text_len", 0),
+        "n_related": len(result.get("related") or []),
+        "n_tags": len(result.get("tags") or []),
+    })
+
+    if plain:
+        if save and result.get("path"):
+            rel = result["path"].relative_to(VAULT_PATH)
+            click.echo(f"guardado: {rel}")
+        else:
+            click.echo(result["body"])
+        return
+
+    header = result["title"] or url
+    console.rule(f"[bold]📄 {header}[/bold]")
+    console.print(f"[dim]URL:[/dim] {url}")
+    if result.get("tags"):
+        console.print(f"[dim]Tags:[/dim] {', '.join(result['tags'])}")
+    if result.get("related"):
+        rel_txt = ", ".join(f"[[{t}]]" for t in result["related"])
+        console.print(f"[dim]Relacionadas:[/dim] {rel_txt}")
+    console.print()
+    console.print(render_response(result["summary"]))
+    if save and result.get("path"):
+        rel = result["path"].relative_to(VAULT_PATH)
+        console.print(
+            f"\n[green]✓ Guardado:[/green] [bold cyan]{rel}[/bold cyan]"
+        )
+    elif not save:
+        console.print(
+            "\n[dim]Dry-run. Re-correr con --save para escribir la nota.[/dim]"
+        )
+
+
 # ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
 # Proactive daily brief: what happened yesterday + what's pending + what to
 # focus today. Composes recent-notes / inbox / todo-frontmatter / new
@@ -8016,6 +9155,275 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
 # Auto-fires via launchd weekday mornings.
 
 MORNING_FOLDER = "05-Reviews"
+
+
+# ── Apple integrations (Calendar / Reminders / Mail) ─────────────────────────
+# osascript-backed evidence for the morning brief. Silent-fail by design:
+# a timeout, missing app, or denied Automation permission returns []. First
+# run triggers the macOS Automation prompt for Calendar/Reminders/Mail; user
+# declines → integration stays dark, rest of the brief still works. Disable
+# globally with OBSIDIAN_RAG_NO_APPLE=1.
+
+
+def _osascript(script: str, timeout: float = 15.0) -> str:
+    """Run AppleScript via osascript. Returns stdout stripped, or '' on any
+    failure (timeout, non-zero exit, missing binary, permission denial).
+    """
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if res.returncode != 0:
+        return ""
+    return (res.stdout or "").strip()
+
+
+# Calendar.app AppleScript `whose` over events is O(all events) and times
+# out in >2min on vaults with any history. EventKit via JXA is fast but
+# osascript lacks the entitlement to see iCloud CalDAV calendars (it only
+# exposes local ones — useless for an iCloud-primary user). The one
+# pragmatic path is icalBuddy (`brew install ical-buddy`): talks to Calendar.app
+# directly, sees all calendars, returns in <1s. If absent, Calendar section
+# is silently skipped.
+
+
+_REMINDERS_SCRIPT = '''
+set _out to ""
+tell application "Reminders"
+  repeat with _list in lists
+    try
+      set _pending to (reminders of _list whose completed is false)
+      repeat with _r in _pending
+        try
+          set _due to due date of _r
+          if _due is not missing value then
+            set _out to _out & (name of _r) & "|" & (_due as string) & "|" & (name of _list) & linefeed
+          end if
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+return _out
+'''
+
+
+# Use Mail's unified `inbox` alias — single query across all accounts, ~0.5s.
+# Previous per-account iteration was 10-20× slower and still missed Gmail
+# (no dedicated INBOX mailbox — Gmail uses labels).
+_MAIL_SCRIPT = '''
+set _cutoff to (current date) - (36 * hours)
+set _out to ""
+tell application "Mail"
+  try
+    repeat with _msg in (messages of inbox whose read status is false and date received > _cutoff)
+      try
+        set _out to _out & (subject of _msg) & "|" & (sender of _msg) & "|" & ((date received of _msg) as string) & linefeed
+      end try
+    end repeat
+  end try
+end tell
+return _out
+'''
+
+
+def _apple_enabled() -> bool:
+    return os.environ.get("OBSIDIAN_RAG_NO_APPLE", "").strip() not in ("1", "true", "yes")
+
+
+def _icalbuddy_path() -> str | None:
+    """Resolve icalBuddy binary. Returns None if not installed."""
+    import shutil
+    for p in ("/opt/homebrew/bin/icalBuddy", "/usr/local/bin/icalBuddy"):
+        if Path(p).is_file():
+            return p
+    return shutil.which("icalBuddy")
+
+
+def _fetch_calendar_today(max_events: int = 15) -> list[dict]:
+    """Events scheduled for today via icalBuddy. Returns [] if icalBuddy is
+    not installed — the user can `brew install ical-buddy` to enable.
+
+    Output parsing handles the default icalBuddy format:
+        Event title
+            list: CalendarName
+            date: 14/04/2026 at 09:30 - 10:00
+    """
+    if not _apple_enabled():
+        return []
+    icb = _icalbuddy_path()
+    if not icb:
+        return []
+    import subprocess
+    try:
+        res = subprocess.run(
+            [
+                icb,
+                "-npn",                        # no property names
+                "-nc",                          # no calendar names inline
+                "-nrd",                         # no relative dates
+                "-ea",                          # exclude all-day events? no, include.
+                "-iep", "title,datetime",       # include only: title + datetime
+                "-b", "",                       # no bullet prefix
+                "eventsToday",
+            ],
+            capture_output=True, text=True, timeout=10.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    out = (res.stdout or "").strip()
+    if not out:
+        return []
+    events: list[dict] = []
+    current: dict | None = None
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        # title lines start at col 0; property lines are indented
+        if not line.startswith(" ") and not line.startswith("\t"):
+            if current and current.get("title"):
+                events.append(current)
+            current = {"title": line.strip(), "start": "", "end": ""}
+            continue
+        # property line — look for date/time range
+        stripped = line.strip()
+        if current is None:
+            continue
+        # Formats seen: "today at 09:30 - 10:00", "14/04/2026 at 09:30 - 10:00",
+        # or bare "09:30 - 10:00"
+        m = re.search(r"(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)\s*-\s*(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)", stripped)
+        if m:
+            current["start"] = m.group(1)
+            current["end"] = m.group(2)
+    if current and current.get("title"):
+        events.append(current)
+    events.sort(key=lambda e: e["start"] or "99:99")
+    return events[:max_events]
+
+
+def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 20) -> list[dict]:
+    """Incomplete reminders with due date ≤ today + horizon_days. Splits
+    overdue vs today vs upcoming via the `bucket` field.
+    """
+    if not _apple_enabled():
+        return []
+    out = _osascript(_REMINDERS_SCRIPT, timeout=45.0)
+    if not out:
+        return []
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    horizon = today + timedelta(days=horizon_days + 1)
+    items: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        due_raw = parts[1].strip()
+        list_name = parts[2].strip() if len(parts) > 2 else ""
+        if not name:
+            continue
+        due_dt = _parse_applescript_date(due_raw)
+        if due_dt is None:
+            continue
+        if due_dt >= horizon:
+            continue
+        if due_dt < today:
+            bucket = "overdue"
+        elif due_dt < today + timedelta(days=1):
+            bucket = "today"
+        else:
+            bucket = "upcoming"
+        items.append({
+            "name": name,
+            "due": due_dt.isoformat(timespec="minutes"),
+            "list": list_name,
+            "bucket": bucket,
+        })
+    order = {"overdue": 0, "today": 1, "upcoming": 2}
+    items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
+    return items[:max_items]
+
+
+def _fetch_mail_unread(max_items: int = 10) -> list[dict]:
+    """Unread messages received in the last 36h from Apple Mail INBOX
+    across all accounts.
+    """
+    if not _apple_enabled():
+        return []
+    out = _osascript(_MAIL_SCRIPT, timeout=20.0)
+    if not out:
+        return []
+    items: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        subject = parts[0].strip()
+        sender = parts[1].strip()
+        received = parts[2].strip() if len(parts) > 2 else ""
+        if not subject:
+            continue
+        items.append({"subject": subject, "sender": sender, "received": received})
+    return items[:max_items]
+
+
+def _parse_applescript_date(s: str) -> datetime | None:
+    """AppleScript `as string` dates are locale-formatted (e.g. 'lunes, 14 de abril
+    de 2026, 09:00:00'). Try a few common locales/formats; return None on miss.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    fmts = [
+        "%A, %B %d, %Y at %I:%M:%S %p",
+        "%A, %d %B %Y at %H:%M:%S",
+        "%A %d %B %Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    # Spanish locale fallback: "miércoles, 15 de abril de 2026, 9:40:00 a. m."
+    import re as _re
+    m = _re.search(
+        r"(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(\d{4}),?\s+"
+        r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
+        r"(?:\s*(a\.?\s*m\.?|p\.?\s*m\.?))?",
+        s, _re.IGNORECASE,
+    )
+    if m:
+        months_es = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+            "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9,
+            "octubre": 10, "noviembre": 11, "diciembre": 12,
+        }
+        month = months_es.get(m.group(2).lower())
+        if month:
+            hour = int(m.group(4))
+            ampm = (m.group(7) or "").lower().replace(" ", "").replace(".", "")
+            if ampm == "pm" and hour < 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            try:
+                return datetime(
+                    int(m.group(3)), month, int(m.group(1)),
+                    hour, int(m.group(5)),
+                    int(m.group(6) or 0),
+                )
+            except ValueError:
+                return None
+    return None
 
 
 def _collect_morning_evidence(
@@ -8143,6 +9551,9 @@ def _collect_morning_evidence(
         "todos": todos,
         "new_contradictions": new_contrad,
         "low_conf_queries": low_conf,
+        "calendar_today": _fetch_calendar_today(),
+        "reminders_due": _fetch_reminders_due(now),
+        "mail_unread": _fetch_mail_unread(),
     }
 
 
@@ -8187,15 +9598,38 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
         for q in ev["low_conf_queries"][:6]:
             parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
         parts.append("")
+    if ev.get("calendar_today"):
+        parts.append(f"## Calendar — eventos de hoy ({len(ev['calendar_today'])}):")
+        for e in ev["calendar_today"][:12]:
+            parts.append(f"- {e['title']} ({e['start']})")
+        parts.append("")
+    if ev.get("reminders_due"):
+        parts.append(f"## Reminders — vencidos/hoy ({len(ev['reminders_due'])}):")
+        for r in ev["reminders_due"][:12]:
+            tag = r["bucket"]
+            lst = f" [{r['list']}]" if r.get("list") else ""
+            parts.append(f"- ({tag}) {r['name']} due={r['due']}{lst}")
+        parts.append("")
+    if ev.get("mail_unread"):
+        parts.append(f"## Mail — no leídos últimas 36h ({len(ev['mail_unread'])}):")
+        for m in ev["mail_unread"][:10]:
+            parts.append(f"- {m['subject']} — {m['sender']}")
+        parts.append("")
     parts.extend([
         "Formato de salida (Markdown, EXACTO):",
         "",
         "## 📬 Ayer en una línea",
         "(1 oración: qué pasó en el vault ayer)",
         "",
+        "## 📅 Hoy en la agenda",
+        "(si hay eventos de Calendar, reminders vencidos/hoy o mails relevantes "
+        "sin leer, integrarlos en bullets cortos con horario si aplica; "
+        "mencionar remitente de mails destacados; si nada de esto existe, omitir la sección)",
+        "",
         "## 🎯 Foco sugerido para hoy",
         "(3 bullets con [[wikilink]] a la nota relevante si aplica; "
-        "priorizar lo urgente/frágil; si no hay nada crítico, decilo honestamente)",
+        "priorizar lo urgente/frágil; cruzar con eventos de Calendar y reminders; "
+        "si no hay nada crítico, decilo honestamente)",
         "",
         "## 🗂 Pendientes que asoman",
         "(si hay inbox o todos, listarlos cortos; si no, omitir la sección)",
@@ -8204,7 +9638,7 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
         "(si hay contradicciones nuevas o gaps persistentes, nombrarlos; "
         "si no, omitir la sección)",
         "",
-        "Entre 120 y 280 palabras total. Citá notas con [[Título]].",
+        "Entre 140 y 320 palabras total. Citá notas con [[Título]].",
     ])
     return "\n".join(parts)
 
@@ -8254,11 +9688,14 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         len(ev["recent_notes"]) + len(ev["inbox_pending"])
         + len(ev["todos"]) + len(ev["new_contradictions"])
         + len(ev["low_conf_queries"])
+        + len(ev.get("calendar_today", []))
+        + len(ev.get("reminders_due", []))
+        + len(ev.get("mail_unread", []))
     )
     if total == 0:
         console.print(
             "[yellow]Mañana en blanco:[/yellow] sin notas modificadas, "
-            "inbox vacío, 0 todos, 0 contradicciones nuevas."
+            "inbox vacío, 0 todos, 0 contradicciones, calendar/reminders/mail vacíos."
         )
         return
 
@@ -8266,7 +9703,10 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"[dim]Evidencia:[/dim] {len(ev['recent_notes'])} recientes · "
         f"{len(ev['inbox_pending'])} inbox · {len(ev['todos'])} todos · "
         f"{len(ev['new_contradictions'])} contrad · "
-        f"{len(ev['low_conf_queries'])} low-conf"
+        f"{len(ev['low_conf_queries'])} low-conf · "
+        f"{len(ev.get('calendar_today', []))} cal · "
+        f"{len(ev.get('reminders_due', []))} rem · "
+        f"{len(ev.get('mail_unread', []))} mail"
     )
 
     date_label = target.strftime("%Y-%m-%d")
@@ -8308,6 +9748,332 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         pass
     rel = path.relative_to(VAULT_PATH)
     console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+
+
+# ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
+# End-of-day closure: mirrors morning's structure but looks BACK at the day
+# that just closed. Evidence window is [today 00:00 local, now]. Writes to
+# 05-Reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
+
+
+def _today_window(now: datetime) -> tuple[datetime, datetime]:
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, now
+
+
+def _collect_today_evidence(
+    now: datetime,
+    vault: Path,
+    query_log: Path,
+    contradiction_log: Path,
+) -> dict:
+    """Gather signals for the day that just closed. Window: today 00:00 → now
+    in local time. Mirrors `_collect_morning_evidence` but:
+      - `recent_notes` are notes created/modified today (mtime in window)
+      - `inbox_today` are Inbox notes whose mtime lands in the window (the
+        ones captured during the day — might still need folder/tags)
+      - `low_conf_queries` scan only today's queries
+    """
+    start, end = _today_window(now)
+
+    recent: list[dict] = []
+    inbox_today: list[dict] = []
+    todos: list[dict] = []
+    if vault.is_dir():
+        for p in vault.rglob("*.md"):
+            try:
+                rel = str(p.relative_to(vault))
+            except ValueError:
+                continue
+            if is_excluded(rel):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+            except OSError:
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            fm = parse_frontmatter(raw)
+            title = p.stem
+            in_window = start <= mtime < end
+            if in_window and rel.startswith(f"{_CAPTURE_FOLDER}/"):
+                tags = [str(t) for t in (fm.get("tags") or []) if t]
+                inbox_today.append({
+                    "path": rel, "title": title,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": clean_md(raw)[:180].strip(),
+                    "tags": tags,
+                })
+            if in_window and not rel.startswith(f"{MORNING_FOLDER}/") \
+                    and not rel.startswith(f"{_CAPTURE_FOLDER}/"):
+                recent.append({
+                    "path": rel, "title": title,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": clean_md(raw)[:220].strip(),
+                })
+            if in_window:
+                t = fm.get("todo")
+                d = fm.get("due")
+                if t or d:
+                    todos.append({
+                        "path": rel, "title": title,
+                        "todo": t if t else None,
+                        "due": str(d) if d else None,
+                    })
+
+    new_contrad: list[dict] = []
+    if contradiction_log.is_file():
+        try:
+            lines = contradiction_log.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if ts < start or ts >= end:
+                continue
+            if e.get("cmd") != "contradict_index":
+                continue
+            entries = e.get("contradicts") or []
+            if not entries:
+                continue
+            new_contrad.append({
+                "subject_path": e.get("subject_path", ""),
+                "targets": [
+                    {"path": c.get("path", ""), "why": c.get("why", "")}
+                    for c in entries if isinstance(c, dict)
+                ],
+            })
+
+    low_conf: list[dict] = []
+    if query_log.is_file():
+        try:
+            lines = query_log.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.get("ts", ""))
+            except Exception:
+                continue
+            if ts < start or ts >= end:
+                continue
+            if e.get("cmd") != "query":
+                continue
+            score = e.get("top_score")
+            if isinstance(score, (int, float)) and score <= CONFIDENCE_RERANK_MIN:
+                q = (e.get("q") or "").strip()
+                if q:
+                    low_conf.append({"q": q, "top_score": float(score)})
+
+    recent.sort(key=lambda r: r["modified"], reverse=True)
+    inbox_today.sort(key=lambda r: r["modified"], reverse=True)
+
+    return {
+        "recent_notes": recent,
+        "inbox_today": inbox_today,
+        "todos": todos,
+        "new_contradictions": new_contrad,
+        "low_conf_queries": low_conf,
+    }
+
+
+def _render_today_prompt(date_label: str, ev: dict) -> str:
+    parts = [
+        f"Generás un evening brief para el {date_label} (cierre del día), en "
+        "1ra persona, en español rioplatense, tono calmo y honesto. Mirás "
+        "hacia atrás — NO proyectes foco de mañana como agenda; solo semillas.",
+        "",
+        "Contexto real del vault (NO inventes lo que no esté acá):",
+        "",
+    ]
+    if ev["recent_notes"]:
+        parts.append(f"## Notas tocadas hoy ({len(ev['recent_notes'])}):")
+        for r in ev["recent_notes"][:12]:
+            parts.append(f"- [[{r['title']}]] ({r['path']}): {r['snippet'][:200]}")
+        parts.append("")
+    if ev["inbox_today"]:
+        parts.append(f"## Capturado hoy en 00-Inbox/ ({len(ev['inbox_today'])}):")
+        for r in ev["inbox_today"][:10]:
+            tag_hint = " [sin-tags]" if not r.get("tags") else ""
+            parts.append(f"- [[{r['title']}]]{tag_hint}: {r['snippet'][:160]}")
+        parts.append("")
+    if ev["todos"]:
+        parts.append(f"## Todos/due tocados hoy ({len(ev['todos'])}):")
+        for r in ev["todos"][:10]:
+            bits = []
+            if r.get("due"):
+                bits.append(f"due={r['due']}")
+            if r.get("todo"):
+                bits.append("todo=Y")
+            parts.append(f"- [[{r['title']}]] ({r['path']}) {', '.join(bits)}")
+        parts.append("")
+    if ev["new_contradictions"]:
+        parts.append(
+            f"## Contradicciones surgidas hoy ({len(ev['new_contradictions'])}):"
+        )
+        for c in ev["new_contradictions"][:5]:
+            targets = ", ".join(t["path"] for t in c["targets"][:3])
+            parts.append(f"- {c['subject_path']} ↔ {targets}")
+        parts.append("")
+    if ev["low_conf_queries"]:
+        parts.append(
+            f"## Preguntas sin buena respuesta hoy ({len(ev['low_conf_queries'])}):"
+        )
+        for q in ev["low_conf_queries"][:6]:
+            parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
+        parts.append("")
+    parts.extend([
+        "Formato de salida (Markdown, EXACTO, incluí las 4 secciones aunque "
+        "alguna quede corta):",
+        "",
+        "## 🪞 Lo que pasó hoy",
+        "(2-3 líneas concretas: qué notas tocaste, qué temas aparecieron; "
+        "si no hubo casi nada, decilo breve)",
+        "",
+        "## 📥 Sin procesar",
+        "(listar capturas de hoy que todavía no tienen carpeta/tags; si no "
+        "hay, decir 'nada quedó suelto')",
+        "",
+        "## 🔍 Preguntas abiertas",
+        "(queries low-confidence de hoy → notas que podrías escribir; "
+        "citá las preguntas literales; omitir la sección si no hubo ninguna)",
+        "",
+        "## 🌅 Para mañana",
+        "(2-3 action items concretos derivados de cabos sueltos de hoy; "
+        "NO agenda genérica — tienen que venir del contexto real)",
+        "",
+        "Entre 150 y 250 palabras total. Citá notas con [[Título]].",
+    ])
+    return "\n".join(parts)
+
+
+def _generate_today_narrative(prompt: str) -> str:
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return (resp.message.content or "").strip()
+    except Exception:
+        return ""
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True,
+              help="Imprimir el brief sin escribir el archivo")
+@click.option("--plain", is_flag=True, help="Sin ANSI / sin Rich markup")
+@click.option("--date", "date_opt", default=None,
+              help="Fecha objetivo YYYY-MM-DD (default: hoy)")
+def today(dry_run: bool, plain: bool, date_opt: str | None):
+    """Cierre del día: qué pasó hoy + cabos sueltos + semillas para mañana.
+
+    Ventana: hoy 00:00 → ahora. Evidencia: notas modificadas hoy, capturas del
+    día en 00-Inbox/, todos/due tocados, contradicciones nuevas, queries
+    low-confidence. command-r arma un brief de 150-250 palabras. Escribe a
+    `05-Reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
+    hay actividad, imprime "sin actividad hoy" y termina.
+    """
+    if date_opt:
+        try:
+            target = datetime.fromisoformat(date_opt)
+        except ValueError:
+            msg = f"Fecha inválida: {date_opt}"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+    else:
+        target = datetime.now()
+
+    ev = _collect_today_evidence(
+        target, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
+    )
+    total = (
+        len(ev["recent_notes"]) + len(ev["inbox_today"])
+        + len(ev["todos"]) + len(ev["new_contradictions"])
+        + len(ev["low_conf_queries"])
+    )
+    if total == 0:
+        msg = "sin actividad hoy"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+
+    if not plain:
+        console.print(
+            f"[dim]Evidencia:[/dim] {len(ev['recent_notes'])} tocadas · "
+            f"{len(ev['inbox_today'])} capturas · {len(ev['todos'])} todos · "
+            f"{len(ev['new_contradictions'])} contrad · "
+            f"{len(ev['low_conf_queries'])} low-conf"
+        )
+
+    date_label = target.strftime("%Y-%m-%d")
+    prompt = _render_today_prompt(date_label, ev)
+    if plain:
+        narrative = _generate_today_narrative(prompt)
+    else:
+        with console.status("[dim]Armando cierre del día…[/dim]", spinner="dots"):
+            narrative = _generate_today_narrative(prompt)
+    if not narrative:
+        msg = "Modelo devolvió respuesta vacía."
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    fm_lines = [
+        "---",
+        f"created: '{now_iso}'",
+        "type: evening-brief",
+        "tags:",
+        "- review",
+        "- evening-brief",
+        f"date: '{date_label}'",
+        "---",
+    ]
+    body = "\n".join(fm_lines) + f"\n\n# Evening brief — {date_label}\n\n{narrative}\n"
+
+    if dry_run:
+        if plain:
+            click.echo(body)
+        else:
+            console.rule(f"[bold]Evening brief {date_label} (dry-run)[/bold]")
+            console.print(body, markup=False, highlight=False)
+        return
+
+    path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path = path.with_name(
+            f"{date_label}-evening ({datetime.now().strftime('%H%M%S')}).md"
+        )
+    path.write_text(body, encoding="utf-8")
+    try:
+        _index_single_file(get_db(), path, skip_contradict=True)
+    except Exception:
+        pass
+    rel = path.relative_to(VAULT_PATH)
+    if plain:
+        click.echo(str(rel))
+    else:
+        console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
 
 
 # ── DEAD NOTES (rag dead) ────────────────────────────────────────────────────
@@ -8507,6 +10273,393 @@ def dead(min_age_days: int, query_window_days: int, limit: int,
     )
 
 
+# ── FOLLOW-UP SCANNER (rag followup) ─────────────────────────────────────────
+# Surfaces "open loops" across the vault — things the user said they'd do /
+# explore — and classifies each as resolved / stale / activo based on whether
+# later notes show semantic evidence of follow-through. Three loop kinds:
+# frontmatter todo/due, unchecked markdown checkboxes, and inline imperative
+# clauses ("tengo que X", "pendiente Y", "revisar Z"). Resolution check reuses
+# `retrieve()` scoped to notes modified AFTER the loop was written; the helper
+# LLM acts as a conservative yes/no judge. Never mutates notes — read-only.
+
+FOLLOWUP_STALE_DAYS = 14
+FOLLOWUP_RESOLVE_MIN_SCORE = 0.03
+
+_FOLLOWUP_IMPERATIVE_RE = re.compile(
+    r"\b(tengo que|pendiente[:\s]|revisar|explorar|profundizar|chequear)\b"
+    r"[\s:]+([^.\n\r]{1,80})",
+    re.IGNORECASE,
+)
+_CHECKBOX_OPEN_RE = re.compile(r"^\s*[-*]\s*\[\s\]\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _coerce_loop_items(value) -> list[str]:
+    """Flatten a frontmatter `todo:` / `due:` value into a list of strings.
+    Accepts str, list of str, list of dicts with common keys."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    import datetime as _dt
+    if isinstance(value, (_dt.date, _dt.datetime)):
+        return [value.isoformat()]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    out.append(s)
+            elif isinstance(item, dict):
+                for k in ("text", "task", "title", "item"):
+                    if isinstance(item.get(k), str) and item[k].strip():
+                        out.append(item[k].strip())
+                        break
+            elif item is not None:
+                out.append(str(item))
+        return out
+    return []
+
+
+def _body_without_frontmatter(raw: str) -> tuple[str, int]:
+    """Return (body, offset) where `offset` is how many chars of `raw` were
+    frontmatter. Preserves line structure of the body for regex scanning."""
+    if not raw.startswith("---"):
+        return raw, 0
+    m = re.match(r"^---\n.*?\n---\n", raw, re.DOTALL)
+    if not m:
+        return raw, 0
+    return raw[m.end():], m.end()
+
+
+def _extract_followup_loops(
+    raw: str, rel_path: str, extracted_ts: float,
+) -> list[dict]:
+    """Scan one note's raw content and return every open loop found.
+
+    Each loop: {source_note, loop_text, extracted_at (iso), kind}.
+    Kinds: "todo" (frontmatter todo/due), "checkbox" (unchecked -[ ]),
+    "inline" (imperative regex in body).
+    """
+    loops: list[dict] = []
+    extracted_iso = datetime.fromtimestamp(extracted_ts).isoformat(timespec="seconds")
+    fm = parse_frontmatter(raw)
+    for key in ("todo", "due"):
+        for item in _coerce_loop_items(fm.get(key)):
+            loops.append({
+                "source_note": rel_path,
+                "loop_text": item[:200],
+                "extracted_at": extracted_iso,
+                "kind": "todo",
+            })
+
+    body, _ = _body_without_frontmatter(raw)
+    body_no_fences = CODE_FENCE_RE.sub(
+        lambda m: "\n" * m.group(0).count("\n"), body,
+    )
+
+    for m in _CHECKBOX_OPEN_RE.finditer(body_no_fences):
+        text = m.group(1).strip()
+        if not text:
+            continue
+        loops.append({
+            "source_note": rel_path,
+            "loop_text": text[:200],
+            "extracted_at": extracted_iso,
+            "kind": "checkbox",
+        })
+
+    checkbox_line_re = re.compile(
+        r"^\s*[-*]\s*\[[ xX]\][^\n]*", re.MULTILINE,
+    )
+    checkbox_spans = [m.span() for m in checkbox_line_re.finditer(body_no_fences)]
+    def _in_checkbox(pos: int) -> bool:
+        return any(s <= pos < e for s, e in checkbox_spans)
+
+    seen_inline: set[str] = set()
+    for m in _FOLLOWUP_IMPERATIVE_RE.finditer(body_no_fences):
+        if _in_checkbox(m.start()):
+            continue
+        verb = m.group(1).strip().rstrip(":").lower()
+        obj = m.group(2).strip()
+        obj = re.split(r"[.;\n\r]", obj, maxsplit=1)[0].strip()
+        if not obj or len(obj) < 3:
+            continue
+        clause = f"{verb} {obj}"[:200]
+        key = clause.lower()
+        if key in seen_inline:
+            continue
+        seen_inline.add(key)
+        loops.append({
+            "source_note": rel_path,
+            "loop_text": clause,
+            "extracted_at": extracted_iso,
+            "kind": "inline",
+        })
+    return loops
+
+
+def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
+    """Ask the helper LLM whether `candidate_snippet` constitutes evidence
+    that `loop_text` was followed through. Strict JSON, bias toward "no".
+    Returns (resolved, reason). Any parse failure collapses to (False, "")."""
+    prompt = (
+        "Eres un juez conservador. Dada una tarea/pendiente y un fragmento de "
+        "una nota POSTERIOR, decidí si el fragmento evidencia que la tarea fue "
+        "realizada o resuelta. Sesgo hacia 'no': si hay duda, responde false.\n\n"
+        f"TAREA: {loop_text}\n\n"
+        f"FRAGMENTO POSTERIOR:\n{candidate_snippet[:800]}\n\n"
+        'Responde SOLO JSON: {"resolved": true|false, "reason": "<20 palabras"}'
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "seed": 42, "num_ctx": 2048, "num_predict": 128},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        raw = resp.message.content.strip()
+    except Exception:
+        return False, ""
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return False, ""
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return False, ""
+    resolved = bool(data.get("resolved"))
+    reason = str(data.get("reason") or "").strip()[:200]
+    return resolved, reason
+
+
+def _classify_followup_loop(
+    col: chromadb.Collection,
+    loop: dict,
+    now: datetime,
+    stale_days: int = FOLLOWUP_STALE_DAYS,
+    min_score: float = FOLLOWUP_RESOLVE_MIN_SCORE,
+    judge_fn=None,
+) -> dict:
+    """Run resolution check + classification. Returns the loop dict enriched
+    with `status`, `age_days`, and optionally `resolution_path`/`reason`.
+    Status is one of: resolved | stale | activo.
+    """
+    judge = judge_fn or _followup_judge
+    try:
+        extracted_dt = datetime.fromisoformat(loop["extracted_at"])
+    except Exception:
+        extracted_dt = now
+    age_days = max(0, int((now - extracted_dt).total_seconds() // 86400))
+    out = dict(loop)
+    out["age_days"] = age_days
+    out["status"] = "stale" if age_days > stale_days else "activo"
+    out["resolution_path"] = None
+    out["reason"] = None
+
+    try:
+        result = retrieve(
+            col, loop["loop_text"], k=5, folder=None,
+            multi_query=False, auto_filter=False,
+        )
+    except Exception:
+        return out
+    metas = result.get("metas") or []
+    docs = result.get("docs") or []
+    scores = result.get("scores") or []
+    source = loop.get("source_note", "")
+    candidates: list[tuple[float, dict, str]] = []
+    for meta, doc, score in zip(metas, docs, scores):
+        mpath = meta.get("file", "")
+        if not mpath or mpath == source:
+            continue
+        mtime_iso = meta.get("modified") or ""
+        mtime_dt = None
+        if mtime_iso:
+            try:
+                mtime_dt = datetime.fromisoformat(str(mtime_iso))
+            except Exception:
+                mtime_dt = None
+        if mtime_dt is None:
+            full = VAULT_PATH / mpath
+            try:
+                mtime_dt = datetime.fromtimestamp(full.stat().st_mtime)
+            except OSError:
+                continue
+        if mtime_dt <= extracted_dt:
+            continue
+        candidates.append((float(score), meta, doc))
+    if not candidates:
+        return out
+    candidates.sort(key=lambda x: -x[0])
+    top_score, top_meta, top_doc = candidates[0]
+    if top_score < min_score:
+        return out
+    resolved, reason = judge(loop["loop_text"], top_doc)
+    if resolved:
+        out["status"] = "resolved"
+        out["resolution_path"] = top_meta.get("file", "")
+        out["reason"] = reason
+    return out
+
+
+def find_followup_loops(
+    col: chromadb.Collection,
+    vault: Path,
+    days: int = 30,
+    stale_days: int = FOLLOWUP_STALE_DAYS,
+    min_score: float = FOLLOWUP_RESOLVE_MIN_SCORE,
+    now: datetime | None = None,
+    judge_fn=None,
+) -> list[dict]:
+    """Walk the vault for notes modified in the last `days`, extract every
+    open loop, and classify each. Returns a list sorted stale→activo→resolved,
+    oldest-first within each group."""
+    from datetime import timedelta as _td
+    now = now or datetime.now()
+    start = now - _td(days=days)
+    all_loops: list[dict] = []
+    if not vault.is_dir():
+        return []
+    for p in vault.rglob("*.md"):
+        try:
+            rel = str(p.relative_to(vault))
+        except ValueError:
+            continue
+        if is_excluded(rel):
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        mtime = st.st_mtime
+        if datetime.fromtimestamp(mtime) < start:
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        extracted_ts = _note_created_ts(raw, mtime)
+        all_loops.extend(_extract_followup_loops(raw, rel, extracted_ts))
+
+    classified = [
+        _classify_followup_loop(
+            col, loop, now,
+            stale_days=stale_days, min_score=min_score, judge_fn=judge_fn,
+        )
+        for loop in all_loops
+    ]
+    order = {"stale": 0, "activo": 1, "resolved": 2}
+    classified.sort(key=lambda r: (order.get(r["status"], 3), -r["age_days"]))
+    return classified
+
+
+@cli.command()
+@click.option("--days", default=30, show_default=True,
+              help="Ventana para scanear notas modificadas")
+@click.option("--status", type=click.Choice(["stale", "activo", "resolved"]),
+              default=None, help="Filtrar por status")
+@click.option("--json", "as_json", is_flag=True, help="Salida JSON")
+@click.option("--plain", is_flag=True, help="Sin ANSI")
+@click.option("--stale-days", default=FOLLOWUP_STALE_DAYS, show_default=True,
+              help="Umbral (días) para marcar un loop como stale")
+def followup(days: int, status: str | None, as_json: bool, plain: bool,
+             stale_days: int):
+    """Open loops del vault: qué dijiste que harías y no quedó cerrado.
+
+    Escanea frontmatter todo/due, checkboxes `- [ ]` y cláusulas imperativas
+    ("tengo que X", "pendiente Y", "revisar Z") en notas modificadas en la
+    última ventana. Clasifica cada loop como resolved / stale / activo según
+    si hay evidencia semántica de follow-through en notas posteriores.
+    """
+    col = get_db()
+    items = find_followup_loops(col, VAULT_PATH, days=days, stale_days=stale_days)
+    if status:
+        items = [it for it in items if it["status"] == status]
+
+    counts = {"stale": 0, "activo": 0, "resolved": 0}
+    for it in items:
+        counts[it["status"]] = counts.get(it["status"], 0) + 1
+
+    log_query_event({
+        "cmd": "followup", "days": days, "status": status,
+        "n_loops": len(items), "counts": counts,
+    })
+
+    if as_json:
+        click.echo(json.dumps(items, ensure_ascii=False))
+        return
+
+    if not items:
+        msg = "Sin open loops en esta ventana."
+        click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
+        return
+
+    if plain:
+        for it in items:
+            click.echo(
+                f"{it['status']}\t{it['age_days']}d\t{it['kind']}\t"
+                f"{it['source_note']}\t{it['loop_text']}"
+            )
+        return
+
+    badge_style = {
+        "stale": "bold red",
+        "activo": "bold yellow",
+        "resolved": "dim green",
+    }
+    kind_icon = {"todo": "📌", "checkbox": "☐", "inline": "✎"}
+    for group in ("stale", "activo", "resolved"):
+        group_items = [it for it in items if it["status"] == group]
+        if not group_items:
+            continue
+        title = {
+            "stale": f"🕸  {len(group_items)} stale (> {stale_days}d sin cerrar)",
+            "activo": f"🔥 {len(group_items)} activo(s)",
+            "resolved": f"✅ {len(group_items)} resuelto(s)",
+        }[group]
+        console.print()
+        console.print(Rule(
+            title=f"[{badge_style[group]}]{title}[/{badge_style[group]}]",
+            style=badge_style[group],
+        ))
+        if group == "resolved":
+            for it in group_items[:10]:
+                line = Text()
+                line.append("  ✓ ", style="green")
+                line.append(it["loop_text"][:80], style="dim")
+                line.append("  ← ", style="dim")
+                rpath = it.get("resolution_path") or ""
+                if rpath:
+                    line.append(rpath, style=_file_link_style(rpath, "cyan"))
+                console.print(line)
+            if len(group_items) > 10:
+                console.print(f"  [dim]… y {len(group_items) - 10} más[/dim]")
+            continue
+        for it in group_items:
+            line = Text()
+            icon = kind_icon.get(it["kind"], "•")
+            line.append(f"  {icon} ", style="dim")
+            line.append(f"{it['age_days']:>3}d ", style="yellow")
+            line.append(it["loop_text"][:100])
+            line.append("   ", style="dim")
+            line.append(
+                it["source_note"],
+                style=_file_link_style(it["source_note"], "cyan dim"),
+            )
+            console.print(line)
+
+    console.print()
+    console.print(
+        f"[dim]Total: {counts['stale']} stale · "
+        f"{counts['activo']} activo · {counts['resolved']} resuelto. "
+        f"Ventana: {days}d. Umbral stale: {stale_days}d.[/dim]"
+    )
+
+
 # ── AUTOMATION (launchd) ─────────────────────────────────────────────────────
 # Two services keep the RAG alive without manual rituals:
 #  - obsidian-rag-watch: runs `rag watch` (auto-reindex on vault changes).
@@ -8626,6 +10779,39 @@ def _morning_plist(rag_bin: str) -> str:
 """
 
 
+def _today_plist(rag_bin: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-today</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>today</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/today.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/today.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -8635,6 +10821,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _digest_plist(rag_bin)),
         ("com.fer.obsidian-rag-morning", "com.fer.obsidian-rag-morning.plist",
          _morning_plist(rag_bin)),
+        ("com.fer.obsidian-rag-today", "com.fer.obsidian-rag-today.plist",
+         _today_plist(rag_bin)),
     ]
 
 
@@ -8684,7 +10872,7 @@ def setup(remove: bool):
     if not remove:
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today}}.{{log,error.log}}[/dim]"
         )
 
 
@@ -8815,7 +11003,7 @@ def stats():
     console.print(f"[cyan]Chat model:[/cyan] {resolved}  [dim](preference: {', '.join(CHAT_MODEL_PREFERENCE)})[/dim]")
     console.print(f"[cyan]Helper model:[/cyan] {HELPER_MODEL}")
     console.print(f"[cyan]Reranker:[/cyan] {RERANKER_MODEL}")
-    console.print(f"[cyan]Pipeline:[/cyan] HyDE + BM25 + RRF + cross-encoder rerank")
+    console.print("[cyan]Pipeline:[/cyan] HyDE + BM25 + RRF + cross-encoder rerank")
     pos, neg = feedback_counts()
     if pos or neg:
         console.print(f"[cyan]Feedback:[/cyan] 👍 {pos} · 👎 {neg}  [dim]({FEEDBACK_PATH})[/dim]")

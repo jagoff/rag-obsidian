@@ -18,13 +18,17 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TQDM_DISABLE", "1")
 
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 import rag
 
 mcp = FastMCP("obsidian-rag")
+
+# MCP server es persistent pero larga vida por conexión — warmup async paga el
+# reranker cold load mientras el cliente MCP hace handshake, y deja bge-m3
+# caliente para el primer rag_query.
+rag.warmup_async()
 
 
 @mcp.tool()

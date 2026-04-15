@@ -75,7 +75,13 @@ Python 3.13, `uv` for deps. Runtime: `.venv/bin/python` is the local venv; the g
 
 ## Architecture
 
-Everything is in `rag.py` (~3500 lines) + `mcp_server.py` (thin wrapper) + `tests/`. Single-file by design — no framework abstractions between the caller and the pipeline. The size grew with knowledge graph, agent loop, sessions, contradiction radar, digest — the call graph stays flat and readable; resist the urge to package-split until a real friction shows up.
+Everything is in `rag.py` (~12k lines) + `mcp_server.py` (thin wrapper) + `tests/` (~20k lines, ~550 tests). Single-file by design — no framework abstractions between the caller and the pipeline. The size grew with knowledge graph, agent loop, sessions, contradiction radar, digest, daily-productivity trilogy, surface/insights, multi-vault registry — the call graph stays flat and readable; resist the urge to package-split until a real friction shows up.
+
+Subsistemas material que NO están documentados individualmente abajo (v1 suficientemente estable, ver tests/docstrings):
+- **`rag surface`** — proactive bridge builder: encuentra pares de notas lejanas en el grafo (3+ hops) con centroides similares, sugiere wikilinks o notas puente. Pura numpy + BFS, sin LLM. Test: `tests/test_surface.py`.
+- **`rag insights`** — feedback-loop tool sobre `queries.jsonl` + `feedback.jsonl`. Clusters de low-confidence queries, queries con bad_citations, patrones temporales. Test: `tests/test_insights.py`.
+- **`rag file`** / **`rag gaps`** / **`rag graph`** — filing asistido (sin `inbox`, una nota a la vez), cluster de gaps de conocimiento, export Obsidian canvas.
+- **Multi-vault registry** — `rag vault {add,use,list,remove}`, 3-level precedence (env → flag → registry current). Collections namespaced por `sha256[:8]` del path absoluto. Test: `tests/test_vaults.py`.
 
 ### Retrieval pipeline (`retrieve()` in rag.py)
 

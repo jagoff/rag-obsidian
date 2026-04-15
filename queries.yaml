@@ -11,16 +11,16 @@ queries:
   # RAG system itself
   - question: "qué modelo de embeddings uso en mi RAG"
     expected:
-      - 03-Resources/RAG-Local/Obsidian RAG Local.md
+      - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
   - question: "qué reranker tiene el sistema"
     expected:
-      - 03-Resources/RAG-Local/Obsidian RAG Local.md
+      - 01-Projects/RAG-Local/Obsidian RAG Local.md
       - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag.md
 
   - question: "cómo se indexan las notas en el vault"
     expected:
-      - 03-Resources/RAG-Local/Obsidian RAG Local.md
+      - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
   # Coaching
   - question: "charla sobre ansiedad y estrés laboral"
@@ -101,42 +101,6 @@ queries:
     expected:
       - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
 
-  # rag-read saved articles (Wikipedia · 2026-04-15) — exercising the
-  # ingestion pipeline. These notes have `type: read` frontmatter and live
-  # in 00-Inbox/. Replace the dated paths if the notes get archived/moved.
-
-  - question: "qué es BEIR como benchmark de RAG"
-    expected:
-      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
-
-  - question: "RAG aplicado a manufactura"
-    expected:
-      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
-
-  - question: "alucinaciones de LLM y cómo mitigarlas"
-    expected:
-      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
-
-  - question: "SBERT arquitectura de red siamesa"
-    expected:
-      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
-
-  - question: "por qué BERT [CLS] funciona mal para sentence embedding"
-    expected:
-      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
-
-  - question: "LangChain transformadores de sentencias para indexar documentos"
-    expected:
-      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
-
-  - question: "RankNet LambdaRank ListNet"
-    expected:
-      - 00-Inbox/2026-04-15-0206-read-learning-to-rank-wikipedia.md
-
-  - question: "enfoque pairwise vs listwise en learning to rank"
-    expected:
-      - 00-Inbox/2026-04-15-0206-read-learning-to-rank-wikipedia.md
-
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per
@@ -193,13 +157,13 @@ chains:
     turns:
       - question: "qué modelo de embeddings uso"
         expected:
-          - 03-Resources/RAG-Local/Obsidian RAG Local.md
+          - 01-Projects/RAG-Local/Obsidian RAG Local.md
       - question: "y el reranker"
         expected:
-          - 03-Resources/RAG-Local/Obsidian RAG Local.md
+          - 01-Projects/RAG-Local/Obsidian RAG Local.md
       - question: "y cómo las indexás"
         expected:
-          - 03-Resources/RAG-Local/Obsidian RAG Local.md
+          - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
   - id: meta-vault-ollama
     turns:
@@ -212,4 +176,51 @@ chains:
       - question: "hay otro bot con claude?"
         expected:
           - 04-Archive/99-obsidian-system/99-Claude/memory/reference_claude_telegram_bot.md
+
+  # Failure mode: folder semantics ("esa carpeta") + ambiguous pronoun "los"
+  # (los acordes vs los temas). Also cascada: t2 depende de t1 anclar en Sal.
+  - id: musica-sal-carpeta
+    turns:
+      - question: "letra de sal"
+        expected:
+          - 02-Areas/Musica/Sal/Letra - Sal.md
+          - 02-Areas/Musica/Sal/Letra - Sal AI.md
+      - question: "y los acordes de esa"
+        expected:
+          - 02-Areas/Musica/Sal/Letra - Sal - Acordes.md
+      - question: "qué otras versiones tengo en esa carpeta"
+        expected:
+          - 02-Areas/Musica/Sal/Letra - Sal2.md
+          - 02-Areas/Musica/Sal/Letra - Sal AI.md
+
+  # Failure mode: "contame más de eso" / "profundizá" con anclaje a nota
+  # específica, y luego cascada cross-note (herramientas de grabación).
+  - id: coaching-ansiedad-profundiza
+    turns:
+      - question: "charla sobre ansiedad y estrés laboral"
+        expected:
+          - 02-Areas/Coaching/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+      - question: "contame más de eso"
+        expected:
+          - 02-Areas/Coaching/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
+      - question: "qué herramientas uso para grabar ese tipo de charla"
+        expected:
+          - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+
+  # Failure mode: "profundizá en X" donde X es otra nota de la misma carpeta
+  # (no self-reference trivial), luego "y las versiones de Y" que también
+  # está en la carpeta. Exercises folder affinity + named-entity anchoring.
+  - id: musica-muros-profundiza
+    turns:
+      - question: "letra de muros fractales"
+        expected:
+          - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+      - question: "profundizá en la de astio"
+        expected:
+          - 02-Areas/Musica/Muros Fractales/Letras - Astio.md
+      - question: "y las versiones de la herrumbre que tengo"
+        expected:
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
+          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
 

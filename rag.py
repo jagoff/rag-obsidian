@@ -5005,6 +5005,330 @@ AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8080/api/send"
 _AMBIENT_ANTILOOP_MARKER = "\u200b"
 
 
+# ── Proactive nudges (emergent theme, feedback patterns, followups, etc) ─────
+# Pattern: features proactivas comparten un pipeline común que maneja rate-
+# limit global (max N/día), silencio por-kind, snooze, y log append-only.
+# El objetivo es que cada feature (emergent, patterns, followup, calendar)
+# solo declare 'kind' + construya el mensaje; la infra se encarga del resto.
+
+PROACTIVE_STATE_PATH = Path.home() / ".local/share/obsidian-rag/proactive.json"
+PROACTIVE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/proactive.jsonl"
+PROACTIVE_DAILY_CAP = 3
+
+
+def _proactive_load_state() -> dict:
+    """Carga {date, daily_count, silenced:[], snooze:{kind: iso_ts}}.
+
+    Si el date guardado no es hoy, resetea daily_count.
+    """
+    default = {"date": datetime.now().strftime("%Y-%m-%d"),
+               "daily_count": 0, "silenced": [], "snooze": {}}
+    if not PROACTIVE_STATE_PATH.is_file():
+        return default
+    try:
+        data = json.loads(PROACTIVE_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    today = datetime.now().strftime("%Y-%m-%d")
+    if data.get("date") != today:
+        data["date"] = today
+        data["daily_count"] = 0
+    return {**default, **data}
+
+
+def _proactive_save_state(state: dict) -> None:
+    PROACTIVE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROACTIVE_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(PROACTIVE_STATE_PATH)
+
+
+def _proactive_log(event: dict) -> None:
+    try:
+        PROACTIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PROACTIVE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
+                                **event}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _proactive_can_push(kind: str) -> tuple[bool, str]:
+    """Devuelve (ok, reason). 'reason' explica por qué no se envía."""
+    cfg = _ambient_config()
+    if not cfg:
+        return (False, "ambient WA no habilitado (/enable_ambient desde el bot)")
+    state = _proactive_load_state()
+    if kind in state.get("silenced", []):
+        return (False, f"{kind} silenciado (rag silence off {kind})")
+    snooze_ts = state.get("snooze", {}).get(kind)
+    if snooze_ts:
+        try:
+            until = datetime.fromisoformat(snooze_ts)
+            if datetime.now() < until:
+                return (False, f"{kind} en snooze hasta {until.isoformat(timespec='minutes')}")
+        except Exception:
+            pass
+    if state.get("daily_count", 0) >= PROACTIVE_DAILY_CAP:
+        return (False, f"daily cap alcanzado ({PROACTIVE_DAILY_CAP})")
+    return (True, "")
+
+
+def proactive_push(kind: str, message: str, *, snooze_hours: int | None = None) -> bool:
+    """Push proactivo a WA con rate-limit + silencio + snooze compartidos.
+
+    Si `snooze_hours` se pasa, tras enviar el kind entra en snooze por ese
+    tiempo — evita repetir el mismo trigger (ej: emergent theme sobre 'X'
+    ya se pingeó, no repetir hasta snooze_hours después).
+    """
+    ok, reason = _proactive_can_push(kind)
+    if not ok:
+        _proactive_log({"kind": kind, "sent": False, "reason": reason})
+        return False
+    cfg = _ambient_config()
+    if not cfg:
+        return False
+    sent = _ambient_whatsapp_send(cfg["jid"], message)
+    state = _proactive_load_state()
+    if sent:
+        state["daily_count"] = state.get("daily_count", 0) + 1
+        if snooze_hours:
+            state.setdefault("snooze", {})[kind] = (
+                datetime.now() + timedelta(hours=snooze_hours)
+            ).isoformat(timespec="seconds")
+        _proactive_save_state(state)
+    _proactive_log({"kind": kind, "sent": sent, "message_preview": message[:120]})
+    return sent
+
+
+def _scan_queries_log(days: int = 14) -> list[dict]:
+    """Lee LOG_PATH (queries.jsonl) y devuelve events dentro de la ventana."""
+    if not LOG_PATH.is_file():
+        return []
+    cutoff = datetime.now() - timedelta(days=days)
+    out: list[dict] = []
+    try:
+        for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            ts_raw = ev.get("ts") or ev.get("timestamp")
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except Exception:
+                continue
+            if ts >= cutoff:
+                out.append(ev)
+    except Exception:
+        pass
+    return out
+
+
+def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
+    """Greedy clustering por cosine. Devuelve lista de clusters (índices).
+
+    Centroide del cluster = media de embeddings miembros. Para ~100 queries
+    O(n²) es ~10k comparaciones, bge-m3 embed batch + numpy dot, <1s total.
+    """
+    if not qs:
+        return []
+    import numpy as np
+    embs = np.array(embed(qs))
+    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+    clusters: list[dict] = []  # [{indices:[i], centroid: np.array}]
+    for i, e in enumerate(embs):
+        best_idx = -1
+        best_sim = -1.0
+        for c_idx, c in enumerate(clusters):
+            sim = float(np.dot(e, c["centroid"]))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = c_idx
+        if best_idx >= 0 and best_sim >= threshold:
+            c = clusters[best_idx]
+            c["indices"].append(i)
+            members = embs[c["indices"]]
+            c["centroid"] = members.mean(axis=0)
+            c["centroid"] = c["centroid"] / (np.linalg.norm(c["centroid"]) + 1e-9)
+        else:
+            clusters.append({"indices": [i], "centroid": e})
+    return [c["indices"] for c in clusters]
+
+
+@cli.command()
+@click.option("--days", default=14, show_default=True,
+              help="Ventana de queries a analizar")
+@click.option("--min-size", default=5, show_default=True,
+              help="Tamaño mínimo de cluster para reportar")
+@click.option("--threshold", default=0.75, show_default=True,
+              help="Cosine mínimo entre centroides para agrupar")
+@click.option("--dry-run", is_flag=True, help="Solo imprimir, no pushear")
+@click.option("--push", is_flag=True, help="Forzar push aunque dry-run sea default")
+def emergent(days: int, min_size: int, threshold: float, dry_run: bool, push: bool):
+    """Detecta temas emergentes en queries.jsonl y propone capturarlos.
+
+    Busca clusters semánticos de ≥min-size queries en los últimos --days.
+    Si encuentra uno que NO tiene una nota cubriéndolo en el vault, pingea
+    WA con sugerencia de `/capture` prefilled.
+    """
+    events = _scan_queries_log(days=days)
+    queries = [
+        (ev.get("q_reformulated") or ev.get("q") or "").strip()
+        for ev in events
+    ]
+    queries = [q for q in queries if q and len(q) >= 6]
+    if not queries:
+        console.print(f"[dim]sin queries en ventana de {days}d[/dim]")
+        return
+    clusters = _cluster_queries(queries, threshold=threshold)
+    # Filter by size, sort by size desc.
+    big = [c for c in clusters if len(c) >= min_size]
+    big.sort(key=len, reverse=True)
+    if not big:
+        console.print(f"[dim]sin clusters ≥{min_size} queries[/dim]")
+        return
+    top = big[0]
+    sample = [queries[i] for i in top[:3]]
+    # Try to find representative centroid query (shortest — proxy for canonical).
+    rep = min((queries[i] for i in top), key=len)
+    col = get_db()
+    # Check vault coverage: retrieve for rep, see if top hit looks relevant.
+    result = retrieve(
+        col, rep, 3, folder=None, tag=None,
+        precise=False, multi_query=False, auto_filter=True,
+    )
+    has_coverage = bool(result["scores"]) and result["scores"][0] >= 0.3
+    msg_lines = [
+        f"🧭 Preguntaste {len(top)} veces sobre algo parecido en {days}d:",
+        *[f"  · {s}" for s in sample],
+        "",
+    ]
+    if has_coverage:
+        top_meta = result["metas"][0]
+        msg_lines.append(
+            f"Cubierto parcialmente por [[{top_meta.get('note','?')}]] "
+            f"({top_meta.get('file','?')}). ¿Actualizo?"
+        )
+    else:
+        msg_lines.append("No hay nota que lo cubra. ¿`/capture` una síntesis?")
+    msg = "\n".join(msg_lines)
+    console.print(msg)
+    if dry_run and not push:
+        return
+    # Snooze por 72h en el mismo theme — no queremos spam del mismo cluster.
+    sent = proactive_push("emergent", msg, snooze_hours=72)
+    if sent:
+        console.print("[green]✓ pusheado a WA[/green]")
+    else:
+        console.print("[yellow]no pusheado (cap diario, silencio o snooze)[/yellow]")
+
+
+@cli.command()
+@click.option("--last", default=30, show_default=True,
+              help="Últimos N feedback events a analizar")
+@click.option("--min-share", default=0.40, show_default=True,
+              help="Share mínimo (0-1) de una razón para reportar")
+@click.option("--dry-run", is_flag=True, help="Solo imprimir")
+@click.option("--push", is_flag=True, help="Forzar push")
+def patterns(last: int, min_share: float, dry_run: bool, push: bool):
+    """Alerta cuando una razón de feedback domina.
+
+    Mira los últimos N feedback events negativos con `reason` presente. Si
+    una razón específica supera --min-share de ellos, pingea WA con
+    sugerencia de acción.
+    """
+    if not FEEDBACK_PATH.is_file():
+        console.print("[dim]sin feedback log todavía[/dim]")
+        return
+    events: list[dict] = []
+    try:
+        for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("rating", 0) < 0 and ev.get("reason"):
+                events.append(ev)
+    except Exception:
+        return
+    events = events[-last:]
+    if len(events) < 5:
+        console.print(f"[dim]pocos 👎 con razón para analizar ({len(events)})[/dim]")
+        return
+    from collections import Counter
+    reasons = Counter(
+        ev["reason"].strip().lower()[:60] for ev in events
+    )
+    total = sum(reasons.values())
+    top_reason, top_count = reasons.most_common(1)[0]
+    share = top_count / total
+    console.print(
+        f"[bold]{len(events)} 👎 con razón · top:[/bold] "
+        f"'{top_reason}' × {top_count} ({share:.0%})"
+    )
+    if share < min_share:
+        console.print(f"[dim]ninguna razón supera {min_share:.0%} — sin alerta[/dim]")
+        return
+    msg = (
+        f"📊 Pattern de feedback: {share:.0%} de tus 👎 recientes "
+        f"({top_count}/{total}) dicen '{top_reason}'. "
+        f"¿Ajusto el retrieval/prompt para atacarlo?"
+    )
+    console.print(msg)
+    if dry_run and not push:
+        return
+    sent = proactive_push("patterns", msg, snooze_hours=168)  # weekly
+    if sent:
+        console.print("[green]✓ pusheado a WA[/green]")
+    else:
+        console.print("[yellow]no pusheado (cap/silencio/snooze)[/yellow]")
+
+
+@cli.command()
+@click.argument("kind", required=False)
+@click.option("--off", is_flag=True, help="Re-activar el kind (sacar del silenciado)")
+@click.option("--list", "do_list", is_flag=True, help="Listar silenciados actuales")
+def silence(kind: str | None, off: bool, do_list: bool):
+    """Silenciar o desilenciar notificaciones proactivas por kind.
+
+    Kinds conocidos: emergent, patterns, followup, calendar, anniversary.
+
+      rag silence --list
+      rag silence emergent          # silenciar
+      rag silence emergent --off    # volver a recibir
+    """
+    state = _proactive_load_state()
+    if do_list or (not kind and not off):
+        silenced = state.get("silenced", [])
+        if not silenced:
+            console.print("[dim]sin kinds silenciados[/dim]")
+        else:
+            console.print("[bold]silenciados:[/bold] " + ", ".join(silenced))
+        return
+    if not kind:
+        console.print("[red]especificá kind o usá --list[/red]")
+        return
+    silenced = set(state.get("silenced", []))
+    if off:
+        silenced.discard(kind)
+        msg = f"[green]✓[/green] {kind} re-activado"
+    else:
+        silenced.add(kind)
+        msg = f"[yellow]🔕[/yellow] {kind} silenciado"
+    state["silenced"] = sorted(silenced)
+    _proactive_save_state(state)
+    console.print(msg)
+
+
 def _ambient_config() -> dict | None:
     """Read the ambient config. Returns None if disabled / missing.
 
@@ -12050,6 +12374,70 @@ def _today_plist(rag_bin: str) -> str:
 """
 
 
+def _emergent_plist(rag_bin: str) -> str:
+    """Proactive #2 — emergent theme detector, viernes 10am."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-emergent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>emergent</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>5</integer>
+    <key>Hour</key><integer>10</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/emergent.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/emergent.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _patterns_plist(rag_bin: str) -> str:
+    """Proactive #4 — feedback pattern alert, domingo 20:00."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-patterns</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>patterns</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>20</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/patterns.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/patterns.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -12061,6 +12449,10 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _morning_plist(rag_bin)),
         ("com.fer.obsidian-rag-today", "com.fer.obsidian-rag-today.plist",
          _today_plist(rag_bin)),
+        ("com.fer.obsidian-rag-emergent", "com.fer.obsidian-rag-emergent.plist",
+         _emergent_plist(rag_bin)),
+        ("com.fer.obsidian-rag-patterns", "com.fer.obsidian-rag-patterns.plist",
+         _patterns_plist(rag_bin)),
     ]
 
 

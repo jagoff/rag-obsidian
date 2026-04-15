@@ -346,6 +346,8 @@ LAST_SESSION_FILE = Path.home() / ".local/share/obsidian-rag/last_session"
 SESSION_TTL_DAYS = 30
 SESSION_MAX_TURNS = 50           # cap per file — keeps JSON small, bounds retrieval context
 SESSION_HISTORY_WINDOW = 6       # last N messages fed to reformulate_query / LLM
+SESSION_COMPRESSION_THRESHOLD = 7  # turn count at which compressed_history kicks in
+SESSION_SUMMARY_VERSION = 1      # bump if compressor prompt/format changes (invalidates cache)
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
@@ -434,6 +436,49 @@ def session_history(sess: dict, window: int = SESSION_HISTORY_WINDOW) -> list[di
         if a:
             msgs.append({"role": "assistant", "content": a})
     return msgs[-window:]
+
+
+def session_summary(
+    sess: dict,
+    *,
+    window: int = SESSION_HISTORY_WINDOW,
+    threshold: int = SESSION_COMPRESSION_THRESHOLD,
+) -> str | None:
+    """Lazily compute / cache a compressed summary of turns aged out of the
+    raw history window. Returns the summary string, or None when the session
+    is short enough to feed raw turns directly.
+
+    Closes the empirical chains-vs-singles gap in `rag eval`: by turn 10+ the
+    helper reformulator was being fed 6 raw messages with the topic-anchoring
+    first turns already dropped, losing context. The summary covers `turns[:n
+    - window]` and is prepended to `reformulate_query` as a labelled section.
+
+    Mutates `sess["compressed_history"]` when (re)computing — caller is
+    responsible for calling `save_session()` to persist.
+    """
+    turns = sess.get("turns") or []
+    n = len(turns)
+    if n < threshold:
+        return None
+    need_until = n - window  # exclusive idx of turns to summarize
+    if need_until <= 0:
+        return None
+    cached = sess.get("compressed_history") or {}
+    if (
+        cached.get("version") == SESSION_SUMMARY_VERSION
+        and cached.get("covers_until_idx", 0) >= need_until
+    ):
+        return cached.get("summary") or None
+    summary_text = _compress_turns(turns[:need_until])
+    if not summary_text:
+        return cached.get("summary") if cached else None
+    sess["compressed_history"] = {
+        "version": SESSION_SUMMARY_VERSION,
+        "covers_until_idx": need_until,
+        "summary": summary_text,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+    return summary_text
 
 
 def last_session_id() -> str | None:
@@ -3981,9 +4026,19 @@ def render_contradictions(contrad: list[dict]) -> None:
             console.print(f"   [dim]{c['snippet']}[/dim]")
 
 
-def reformulate_query(question: str, history: list[dict]) -> str:
-    """Rewrite the question as a standalone search query using conversation history."""
-    if not history:
+def reformulate_query(
+    question: str,
+    history: list[dict],
+    summary: str | None = None,
+) -> str:
+    """Rewrite the question as a standalone search query using conversation history.
+
+    `summary` (optional) is a compressed digest of older turns aged out of the
+    raw window — see `session_summary()`. When provided, prepended to the
+    prompt as a labelled section so the helper has long-range context without
+    blowing the helper context window with raw turns.
+    """
+    if not history and not summary:
         return question
 
     recent = history[-6:]  # last 3 turns
@@ -3991,9 +4046,12 @@ def reformulate_query(question: str, history: list[dict]) -> str:
         f"{'Usuario' if m['role'] == 'user' else 'Asistente'}: {m['content'][:200]}"
         for m in recent
     )
+    summary_section = (
+        f"Resumen de turnos previos:\n{summary}\n\n" if summary else ""
+    )
     prompt = (
         "Dado este historial de conversación:\n"
-        f"{history_text}\n\n"
+        f"{summary_section}{history_text}\n\n"
         f"Y esta nueva pregunta: \"{question}\"\n\n"
         "Reescribe la pregunta como una consulta de búsqueda autónoma y específica "
         "(sin pronombres ambiguos, con contexto completo). "
@@ -4006,6 +4064,46 @@ def reformulate_query(question: str, history: list[dict]) -> str:
         keep_alive=OLLAMA_KEEP_ALIVE,
     )
     return resp.message.content.strip().strip('"')
+
+
+def _compress_turns(turns: list[dict]) -> str:
+    """Summarize a list of session turns into ~150-200 token prose digest.
+
+    Used by `session_summary()` to keep long sessions usable for
+    `reformulate_query` without truncating the topic-anchoring first turns.
+    Helper LLM (qwen2.5:3b) — same model used elsewhere for cheap rewrites.
+    Returns an empty string on failure (caller falls back to last cached value).
+    """
+    if not turns:
+        return ""
+    convo_lines: list[str] = []
+    for i, t in enumerate(turns, 1):
+        q = (t.get("q") or "").strip()
+        a = (t.get("a") or "").strip()
+        if q:
+            convo_lines.append(f"[turno {i}] Usuario: {q[:400]}")
+        if a:
+            convo_lines.append(f"[turno {i}] Asistente: {a[:400]}")
+    convo = "\n".join(convo_lines)
+    prompt = (
+        "Resumí en 150-200 tokens la siguiente conversación entre un usuario "
+        "y un asistente RAG sobre el vault personal del usuario. Preservá: "
+        "temas tratados, entidades y notas mencionadas, decisiones tomadas, "
+        "preguntas o hilos pendientes. NO inventes nada. Salida en español "
+        "neutral, prosa densa, sin headers ni listas.\n\n"
+        f"Conversación:\n{convo}\n\n"
+        "Resumen:"
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+    except Exception:
+        return ""
+    return (resp.message.content or "").strip()
 
 
 def build_where(
@@ -7132,6 +7230,295 @@ def log(n: int, low_confidence: bool, with_feedback: bool):
         ])
         tbl.add_row(*row)
     console.print(tbl)
+
+
+# ── INSIGHTS ──────────────────────────────────────────────────────────────────
+# Feedback loop desde queries.jsonl. Tres detectores output-only — el sistema
+# se vuelve auto-observable sin tocar el vault. Invocá `rag insights` semanal o
+# bajo demanda; la CLI surface los patrones, vos decidís qué acción tomar.
+#
+#   1. gaps     → queries low-confidence recurrentes ("escribí una nota")
+#   2. hots     → queries repetidas con buena respuesta ("promové a nota estable")
+#   3. orphans  → notas del vault nunca retrieved en la ventana ("archivá o relinká")
+#
+# Complementa `rag dead`: esa usa outlinks+backlinks (señal estructural),
+# insights usa usage real (señal de demanda). Overlap esperado pero no total.
+
+INSIGHTS_GAP_THRESHOLD = CONFIDENCE_RERANK_MIN
+INSIGHTS_GAP_MIN_OCCURRENCES = 2
+INSIGHTS_HOT_MIN_OCCURRENCES = 3
+INSIGHTS_DEFAULT_WINDOW_DAYS = 30
+INSIGHTS_ORPHAN_EXCLUDED_PREFIXES = ("00-Inbox/", "05-Reviews/", "04-Archive/")
+
+
+def _normalize_query_for_grouping(q: str) -> str:
+    """Lowercase + strip accents + drop punctuation + collapse whitespace.
+
+    Agrupa "¿Qué es RAG?" con "que es rag" — el user no tipea consistente,
+    especialmente al dictar por voz. Accent-strip via NFKD + ASCII ignore.
+    """
+    s = unicodedata.normalize("NFKD", q or "").encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _load_query_entries(since: datetime, log_path: Path = LOG_PATH) -> list[dict]:
+    """Entries with parseable ts ≥ since. Silently drops malformed lines — the
+    log is append-only and a single bad line shouldn't poison the run."""
+    if not log_path.is_file():
+        return []
+    out: list[dict] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        try:
+            ts = datetime.fromisoformat(e.get("ts", ""))
+        except Exception:
+            continue
+        if ts < since:
+            continue
+        out.append(e)
+    return out
+
+
+def detect_gap_queries(
+    entries: list[dict],
+    threshold: float = INSIGHTS_GAP_THRESHOLD,
+    min_occurrences: int = INSIGHTS_GAP_MIN_OCCURRENCES,
+) -> list[dict]:
+    """Low-confidence queries asked min_occurrences+ times.
+
+    A "gap" = el user repite una pregunta que el reranker no está resolviendo.
+    Señal fuerte de que falta una nota. Agrupa por query normalizada y reporta
+    count, max_score (lo más cerca que estuvimos), últimos timestamps.
+    """
+    groups: dict[str, dict] = {}
+    for e in entries:
+        if e.get("cmd") != "query":
+            continue
+        top = e.get("top_score")
+        if not isinstance(top, (int, float)) or top > threshold:
+            continue
+        q = (e.get("q") or "").strip()
+        key = _normalize_query_for_grouping(q)
+        if not key:
+            continue
+        g = groups.setdefault(key, {
+            "query": q, "count": 0, "max_score": top,
+            "last_ts": e.get("ts", ""),
+        })
+        g["count"] += 1
+        g["max_score"] = max(g["max_score"], top)
+        if e.get("ts", "") > g["last_ts"]:
+            g["last_ts"] = e.get("ts", "")
+    return sorted(
+        [g for g in groups.values() if g["count"] >= min_occurrences],
+        key=lambda g: (-g["count"], -g["max_score"]),
+    )
+
+
+def detect_hot_queries(
+    entries: list[dict],
+    threshold: float = INSIGHTS_GAP_THRESHOLD,
+    min_occurrences: int = INSIGHTS_HOT_MIN_OCCURRENCES,
+) -> list[dict]:
+    """Queries con top_score > threshold preguntadas min_occurrences+ veces.
+
+    Distinto de gaps: acá el sistema responde bien pero el user sigue
+    preguntando lo mismo. Señal de que la info existe pero no es fácil de
+    recordar — candidata a promover (nota estable con título prominente,
+    wikilinks desde un índice, etc.). Reporta top paths retrieved más veces
+    para que vos sepas desde dónde promover.
+    """
+    groups: dict[str, dict] = {}
+    for e in entries:
+        if e.get("cmd") != "query":
+            continue
+        top = e.get("top_score")
+        if not isinstance(top, (int, float)) or top <= threshold:
+            continue
+        q = (e.get("q") or "").strip()
+        key = _normalize_query_for_grouping(q)
+        if not key:
+            continue
+        g = groups.setdefault(key, {
+            "query": q, "count": 0, "score_sum": 0.0,
+            "last_ts": e.get("ts", ""), "_paths": {},
+        })
+        g["count"] += 1
+        g["score_sum"] += top
+        if e.get("ts", "") > g["last_ts"]:
+            g["last_ts"] = e.get("ts", "")
+        for p in (e.get("paths") or [])[:3]:
+            if isinstance(p, str):
+                g["_paths"][p] = g["_paths"].get(p, 0) + 1
+    results: list[dict] = []
+    for g in groups.values():
+        if g["count"] < min_occurrences:
+            continue
+        top_paths = sorted(g["_paths"].items(), key=lambda kv: -kv[1])[:3]
+        results.append({
+            "query": g["query"], "count": g["count"],
+            "avg_score": round(g["score_sum"] / g["count"], 3),
+            "last_ts": g["last_ts"],
+            "top_paths": [p for p, _ in top_paths],
+        })
+    return sorted(results, key=lambda g: -g["count"])
+
+
+def detect_orphan_notes(
+    entries: list[dict],
+    vault_path: Path,
+    excluded_prefixes: tuple[str, ...] = INSIGHTS_ORPHAN_EXCLUDED_PREFIXES,
+) -> list[str]:
+    """Vault .md files nunca mencionadas en `paths[]` de las entries dadas.
+
+    Distinto de `rag dead` (señal estructural: 0 outlinks + 0 backlinks).
+    Acá es señal de uso: la nota no apareció en ningún retrieve — podés
+    haberle escrito links, pero nadie la encuentra en la práctica. Excluye
+    Inbox (muy nueva), Reviews (auto-generada), Archive (cold intencional).
+    """
+    retrieved: set[str] = set()
+    for e in entries:
+        for p in e.get("paths") or []:
+            if isinstance(p, str):
+                retrieved.add(p)
+    if not vault_path.is_dir():
+        return []
+    orphans: list[str] = []
+    for md in vault_path.rglob("*.md"):
+        try:
+            rel = str(md.relative_to(vault_path))
+        except ValueError:
+            continue
+        if is_excluded(rel):
+            continue
+        if any(rel.startswith(pre) for pre in excluded_prefixes):
+            continue
+        if rel in retrieved:
+            continue
+        orphans.append(rel)
+    return sorted(orphans)
+
+
+@cli.command()
+@click.option("--days", default=INSIGHTS_DEFAULT_WINDOW_DAYS, show_default=True,
+              help="Ventana en días del log a analizar")
+@click.option("--min-gap", default=INSIGHTS_GAP_MIN_OCCURRENCES, show_default=True,
+              help="Mínimo de repeticiones para flaggear un gap")
+@click.option("--min-hot", default=INSIGHTS_HOT_MIN_OCCURRENCES, show_default=True,
+              help="Mínimo de repeticiones para flaggear una hot query")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON estructurado")
+@click.option("--plain", is_flag=True, help="Output texto plano (bot-friendly)")
+def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
+    """Patrones en queries.jsonl: gaps, hot queries, notas huérfanas.
+
+    Output-only — no escribe, no modifica vault, no llama al LLM. Surface los
+    patrones y vos decidís qué acción tomar (escribir nota, archivar, etc.).
+    """
+    since = datetime.now() - timedelta(days=days)
+    entries = _load_query_entries(since)
+    gaps = detect_gap_queries(entries, min_occurrences=min_gap)
+    hots = detect_hot_queries(entries, min_occurrences=min_hot)
+    orphans = detect_orphan_notes(entries, VAULT_PATH)
+
+    log_query_event({
+        "cmd": "insights", "window_days": days,
+        "n_entries": len(entries), "n_gaps": len(gaps),
+        "n_hots": len(hots), "n_orphans": len(orphans),
+    })
+
+    if as_json:
+        click.echo(json.dumps({
+            "window_days": days,
+            "entries_analyzed": len(entries),
+            "gaps": gaps,
+            "hot_queries": hots,
+            "orphan_notes": orphans,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    if plain:
+        lines = [f"Insights últimos {days}d · {len(entries)} queries analizadas"]
+        if gaps:
+            lines.append(f"\n🔴 {len(gaps)} gap(s) — escribí una nota:")
+            for g in gaps[:10]:
+                lines.append(f"  · ({g['count']}×) {g['query']}")
+        if hots:
+            lines.append(f"\n🟢 {len(hots)} hot(s) — promové a nota estable:")
+            for h in hots[:10]:
+                top = h["top_paths"][0] if h["top_paths"] else "-"
+                lines.append(f"  · ({h['count']}×) {h['query']} → {top}")
+        if orphans:
+            lines.append(f"\n⚫ {len(orphans)} huérfana(s) — archivá o relinká:")
+            for p in orphans[:10]:
+                lines.append(f"  · {p}")
+        if not (gaps or hots or orphans):
+            lines.append("\nSin patrones detectados en la ventana.")
+        click.echo("\n".join(lines))
+        return
+
+    console.print(Panel(
+        f"Analizando últimos {days} día(s) · {len(entries)} queries",
+        title="📊 Insights", style="cyan", border_style="cyan",
+    ))
+    console.print()
+
+    if gaps:
+        console.print(
+            f"[bold red]🔴 {len(gaps)} gap(s)[/bold red] "
+            "[dim]— queries sin respuesta en el vault, escribí una nota[/dim]"
+        )
+        tbl = Table(show_header=True, show_lines=False, box=None)
+        tbl.add_column("×", justify="right", style="red")
+        tbl.add_column("query", style="cyan", overflow="fold")
+        tbl.add_column("max score", justify="right", style="dim")
+        tbl.add_column("último", style="dim")
+        for g in gaps[:20]:
+            tbl.add_row(
+                str(g["count"]), g["query"],
+                f"{g['max_score']:.3f}", g["last_ts"][:10],
+            )
+        console.print(tbl)
+        console.print()
+
+    if hots:
+        console.print(
+            f"[bold green]🟢 {len(hots)} hot query(ies)[/bold green] "
+            "[dim]— repetidas con buena respuesta, promové a nota estable[/dim]"
+        )
+        tbl = Table(show_header=True, show_lines=False, box=None)
+        tbl.add_column("×", justify="right", style="green")
+        tbl.add_column("query", style="cyan", overflow="fold")
+        tbl.add_column("avg score", justify="right", style="dim")
+        tbl.add_column("top path", style="dim", overflow="fold", max_width=44)
+        for h in hots[:20]:
+            top = h["top_paths"][0] if h["top_paths"] else "-"
+            tbl.add_row(
+                str(h["count"]), h["query"],
+                f"{h['avg_score']:.3f}", top,
+            )
+        console.print(tbl)
+        console.print()
+
+    if orphans:
+        console.print(
+            f"[bold]⚫ {len(orphans)} nota(s) huérfana(s)[/bold] "
+            "[dim]— nunca retrieved en la ventana, archivá o relinká[/dim]"
+        )
+        for p in orphans[:30]:
+            console.print(f"  · [dim]{p}[/dim]")
+        if len(orphans) > 30:
+            console.print(f"  [dim]… {len(orphans) - 30} más[/dim]")
+        console.print()
+
+    if not (gaps or hots or orphans):
+        console.print("[green]✓ sin patrones detectados en la ventana.[/green]")
 
 
 # ── AGENT LOOP ────────────────────────────────────────────────────────────────

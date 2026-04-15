@@ -35,7 +35,7 @@ Tres niveles conceptuales:
 ┌─────────────────────────────────────────────────┐
 │  NIVEL 3: Aplicaciones                          │
 │  rag chat · rag prep · rag morning · rag do    │
-│  Telegram bot · MCP tools · weekly digest       │
+│  WhatsApp listener · MCP tools · weekly digest  │
 │  ← aquí el usuario HABLA con el vault           │
 ├─────────────────────────────────────────────────┤
 │  NIVEL 2: Primitivas composables                │
@@ -69,7 +69,7 @@ graph TB
     subgraph "User surfaces"
         CLI[rag CLI]
         MCP["obsidian-rag-mcp<br/>(stdio)"]
-        TG["Telegram @ffeerrr_bot<br/>(Whisper + Claude + /rag + /note)"]
+        WA["WhatsApp listener<br/>(Whisper → /rag · /note · /read · /followup · /today)"]
         LAUNCHD["launchd services<br/>watch · morning · digest"]
     end
 
@@ -100,7 +100,7 @@ graph TB
 
     CLI --> Retrieve & Index & Prims
     MCP --> Retrieve & Prims
-    TG --> CLI
+    WA --> CLI
     LAUNCHD --> CLI
 
     Index --> Embed
@@ -127,7 +127,7 @@ graph TB
 | `mcp_server.py` | Wrapper fino sobre las primitivas para Claude Code | Lógica nueva — delega a `rag.py` |
 | ChromaDB | Almacén vectorial persistente | Ser fuente de verdad — reconstructible del vault |
 | Ollama | Servir embeddings + LLMs locales | Persistir estado de negocio |
-| Telegram bot | Adapter texto/voz → `rag` CLI | Mantener historial del RAG (usa `rag` para eso) |
+| WhatsApp listener | Adapter texto/voz → `rag` CLI vía bridge local | Mantener historial del RAG (usa `rag` para eso) |
 | launchd | Mantener `watch`/`morning`/`digest` vivos | Saber qué hace cada comando |
 
 ---
@@ -283,7 +283,7 @@ sequenceDiagram
     participant Ap as apply_wikilink_<br/>suggestions
     participant DP as find_near_<br/>duplicates_for
     participant RL as find_related
-    participant TG as Telegram API
+    participant WA as WhatsApp bridge<br/>(localhost:8080)
 
     ISF->>H: (col, path, doc_id, hash)
     H->>Cfg: read
@@ -302,15 +302,15 @@ sequenceDiagram
     DP-->>H: [{note, similarity}]
     H->>RL: self_meta
     RL-->>H: [(meta, score, reason)]
-    H->>H: build compact message
+    H->>H: build U+200B prefix + compact msg
     alt hay findings
-        H->>TG: POST sendMessage<br/>(urllib, 10s timeout)
+        H->>WA: POST /api/send<br/>(urllib, 10s timeout)
     end
     H->>St: record analyzed_at
     H->>H: log event to ambient.jsonl
 ```
 
-Ping de ejemplo en Telegram:
+Ping de ejemplo en el self-chat *RagNet* de WhatsApp:
 
 ```
 🤖 Ambient: [[caminata-ideas]]
@@ -322,7 +322,7 @@ Ping de ejemplo en Telegram:
   · [[Músicos y ikigai]]  ×4 #
 ```
 
-**Desacople clave**: rag.py hace POST directo a `api.telegram.org` (urllib, 10s timeout). NO depende del bot estando up — si el bot muere, el análisis corre y queda en `ambient.jsonl`; solo se pierde el ping.
+**Desacople clave**: rag.py hace POST directo al bridge local `http://localhost:8080/api/send` (urllib, 10s timeout). El mensaje arranca con U+200B (anti-loop — el listener lo ignora para no procesar sus propios outputs como queries entrantes). NO depende del listener estando up: si el listener muere, el análisis corre y queda en `ambient.jsonl`; solo se pierde el ping hasta que el bridge lo entregue.
 
 ### 3.4 Capture → Morning → Digest (el loop diario/semanal)
 
@@ -330,8 +330,8 @@ Ping de ejemplo en Telegram:
 graph TB
     subgraph "Captura continua (todo el día)"
         U1[usuario CLI] -->|rag capture| CAP[capture_note]
-        TG1["Telegram /note"] -->|stdin| CAP
-        TG2["Telegram voz + caption /note"] -->|Whisper → stdin| CAP
+        WA1["WhatsApp /note"] -->|stdin| CAP
+        WA2["WhatsApp voz (default)"] -->|Whisper → stdin| CAP
         CAP --> IBX["00-Inbox/<br/>YYYY-MM-DD-HHMM-*.md"]
         IBX --> IDX1[auto-index]
     end
@@ -491,7 +491,7 @@ stateDiagram-v2
     Deleted --> [*]
 ```
 
-IDs opacos: `[A-Za-z0-9_.:-]{1,64}`. Telegram pasa `tg:<chat_id>` literal; CLI usa autogen `<unixhex>-<rand6>`.
+IDs opacos: `[A-Za-z0-9_.:-]{1,64}`. El listener de WhatsApp pasa `wa:<jid>` literal (ej: `wa:120363426178035051@g.us`); CLI usa autogen `<unixhex>-<rand6>`. Sesiones `tg:<chat_id>` viejas siguen válidas (formato idéntico) pero nunca se reactivan desde el nuevo listener.
 
 ### 5.3 Launchd services (automatización)
 
@@ -518,7 +518,7 @@ Los tres servicios son **independientes**. Si `watch` muere, no afecta `morning`
 | `contradictions.jsonl` | `_check_and_flag_contradictions` en indexing | `rag morning`, `rag digest` |
 | `ambient.jsonl` | `_ambient_hook` en cada save de Inbox | `rag ambient log` |
 | `ambient_state.jsonl` | `_ambient_state_record` tras cada hook | `_ambient_should_skip` (dedup 5min) |
-| `ambient.json` | `/enable_ambient` desde el bot | `_ambient_config` en rag.py |
+| `ambient.json` | `/enable_ambient` desde el listener WhatsApp | `_ambient_config` en rag.py (schema: `{jid, enabled}`; schema viejo `{chat_id, bot_token}` rechazado con hint) |
 | `watch.log` | stdout de `rag watch` | `tail` manual |
 | `morning.log` | stdout de `rag morning` | `tail` manual |
 | `digest.log` | stdout de `rag digest` | `tail` manual |
@@ -552,41 +552,44 @@ graph LR
 
 Cada call a `rag_query` con `session_id` extiende la misma sesión que la CLI usa — estado compartido.
 
-### Telegram — dos bots con roles distintos
+### WhatsApp listener — bot unificado
 
-Dos bots conviven, cada uno dedicado a un rol. Ambos usan Whisper local para voz, ambos usan el `rag` CLI como data plane cuando hace falta.
+Un solo listener consolida los roles que antes ocupaban los 3 bots de Telegram (`@ffeerrr_bot`, `@ragsystemobs_bot`, `@rauuuliiitoo_bot`). Vive en `~/whatsapp-listener/listener.ts`, arranca vía launchd (`com.fer.whatsapp-listener`), y polea el SQLite del bridge local (`com.fer.whatsapp-bridge`, `http://localhost:8080`). Anti-loop con U+200B prefix (ignora mensajes que arrancan con ZWSP — sus propios outputs vía bridge).
 
-| Bot | Propósito | Voz sin caption | Captions extra |
-|---|---|---|---|
-| **@ffeerrr_bot** (`~/claude-telegram-bot`) | Conversación con Claude (general-purpose) | → Claude CLI | `/rag <q>` (texto), `/note` (captura) |
-| **@ragsystemobs_bot** (`~/obsidian-rag-bot`) | RAG voice-first sobre el vault | → RAG + respuesta por voz (macOS `say`) | `/note`, `/text` (skip TTS), `/rag <extra>`, `/claude` (fallback), `/force` |
+| Trigger | Comportamiento | Backend |
+|---|---|---|
+| texto libre / `/rag <q>` | query RAG | `rag query --session wa:<jid> --plain` |
+| `/read <url>` | ingesta externa → 00-Inbox | `rag read` |
+| `/note <t>` | captura manual → 00-Inbox | `rag capture` |
+| `/followup [N]` | loops abiertos del vault | `rag followup --days N` |
+| `/today` | end-of-day closure | `rag today` |
+| voz (default) | Whisper → captura auto | `rag capture --stdin` |
+| `/enable_ambient` · `/disable_ambient` · `/ambient_status` | CRUD de `ambient.json` con el JID actual | escribe/lee `~/.local/share/obsidian-rag/ambient.json` |
 
-El segundo además expone los slash-commands de Ambient: `/enable_ambient`, `/disable_ambient`, `/ambient_status`.
-
-### Telegram (`@ffeerrr_bot`) — voice handler detallado
+### WhatsApp — voice + routing detallado
 
 ```mermaid
 flowchart TB
-    Msg[mensaje entrante]
-    Msg --> Type{tipo?}
-    Type -->|texto /start| Start[menú]
-    Type -->|texto /reset| Reset[history.delete]
-    Type -->|texto /history| Hist[count turns]
-    Type -->|texto /rag q| Rag["runRag(tg:<chat>, q)"]
-    Type -->|texto /note t| Cap["runCapture(t)"]
-    Type -->|texto libre| Claude["askClaude(q)"]
+    Msg[mensaje entrante en self-chat RagNet]
+    Msg --> Loop{arranca con U+200B?}
+    Loop -->|sí| Drop[drop — es mi propio output]
+    Loop -->|no| Type{tipo?}
+    Type -->|texto /rag q| Rag["rag query --session wa:<jid>"]
+    Type -->|texto /read url| Read["rag read"]
+    Type -->|texto /note t| Cap["rag capture"]
+    Type -->|texto /followup| Fol["rag followup"]
+    Type -->|texto /today| Tod["rag today"]
+    Type -->|texto libre| RagT["rag query (default)"]
     Type -->|voz| V[transcribeVoice via Whisper]
-    V --> Cap2{caption?}
-    Cap2 -->|/note| Cap
-    Cap2 -->|/rag extra| RagV["runRag(tg:<chat>, caption+transcript)"]
-    Cap2 -->|nada| Claude2["askClaude(transcript)"]
+    V --> CapV["rag capture --stdin (default)"]
 
     style Rag fill:#bfb
+    style RagT fill:#bfb
     style Cap fill:#ffb
-    style RagV fill:#bfb
+    style CapV fill:#ffb
 ```
 
-El bot NO mantiene estado conversacional propio para los comandos `/rag` o `/note` — todo eso vive en el RAG. La session `tg:<chat_id>` hace que retomes conversación en Telegram y la encuentres también vía `rag session show tg:<chat_id>` desde la CLI.
+El listener NO mantiene estado conversacional propio — todo vive en el RAG. La session `wa:<jid>` hace que retomes el hilo en el chat y lo encuentres también vía `rag session show wa:<jid>` desde la CLI.
 
 ### Automatización (launchd)
 

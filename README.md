@@ -21,7 +21,7 @@ RAG local sobre el vault de Obsidian, fully local: ChromaDB + Ollama + sentence-
 11. [Frontmatter conventions](#frontmatter-conventions)
 12. [MCP tools](#mcp-tools)
 13. [Automation (launchd)](#automation-launchd)
-14. [Telegram bots](#telegram-bots)
+14. [WhatsApp listener](#whatsapp-listener)
 15. [Recetas comunes](#recetas-comunes)
 16. [Troubleshooting](#troubleshooting)
 17. [Findings empíricos clave](#findings-empíricos-clave-no-olvidar)
@@ -74,7 +74,7 @@ graph TD
     Counter --> CLog
 
     MCP["obsidian-rag-mcp<br/>(stdio)"] -.-> Query
-    Telegram["Telegram bots<br/>/rag tg:chat_id"] -.-> Query
+    WhatsApp["WhatsApp listener<br/>/rag wa:jid"] -.-> Query
 ```
 
 ---
@@ -110,8 +110,8 @@ rag setup                                  # instala launchd: watch + digest
 | `~/.local/share/obsidian-rag/last_session` | Pointer a la última session id usada (`--continue`/`--resume`) |
 | `~/.local/share/obsidian-rag/queries.jsonl` | Log append-only de cada query/chat/links event |
 | `~/.local/share/obsidian-rag/contradictions.jsonl` | Log append-only de contradicciones detectadas al indexar |
-| `~/.local/share/obsidian-rag/ambient.json` | Config del Ambient Agent: `{chat_id, bot_token, enabled}`. Escrito por el bot vía `/enable_ambient`. |
-| `~/.local/share/obsidian-rag/ambient.jsonl` | Log de eventos del Ambient Agent (wikilinks aplicados, dupes, related, telegram_sent) |
+| `~/.local/share/obsidian-rag/ambient.json` | Config del Ambient Agent: `{jid, enabled}`. Escrito por el listener vía `/enable_ambient`. Configs viejas con `{chat_id, bot_token}` quedan inertes (re-`/enable_ambient` desde WhatsApp). |
+| `~/.local/share/obsidian-rag/ambient.jsonl` | Log de eventos del Ambient Agent (wikilinks aplicados, dupes, related, `whatsapp_sent`; líneas pre-migración llevan `telegram_sent`) |
 | `~/.local/share/obsidian-rag/ambient_state.jsonl` | Dedup state (`{path, hash, ts}` últimas 500 líneas) para evitar doble-ping al save |
 | `~/.local/share/obsidian-rag/surface.jsonl` | Log de puentes propuestos por `rag surface` (pares cercanos-pero-lejanos) |
 | `~/.local/share/obsidian-rag/filing.jsonl` | Log de decisiones de `rag file` (propuestas, confirmadas, skip, edit) |
@@ -284,7 +284,7 @@ flowchart TD
 | `rag query --loose` | Permite prosa externa del LLM (marcada con ⚠). Default es strict. |
 | `rag query --force` | Ignora la confidence gate y llama al LLM igual. |
 | `rag query --counter` | Contradiction radar query-time: muestra chunks que contradicen la respuesta. |
-| `rag query --session <id>` | Guarda + reanuda sesión por id. Telegram usa `tg:<chat_id>`. |
+| `rag query --session <id>` | Guarda + reanuda sesión por id. El WhatsApp listener usa `wa:<jid>`. |
 | `rag query --continue` | Atajo a `--session <last_session>`. |
 | `rag query --plain` | Salida sin colores/paneles para consumo programático (bots). |
 | `rag query --folder X --tag Y -k 8` | Filtros explícitos, k custom. |
@@ -342,7 +342,7 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 | Comando | Función |
 |---|---|
 | `rag capture "<texto>"` | Captura rápida al `00-Inbox/YYYY-MM-DD-HHMM-<slug>.md`. Auto-indexa. |
-| `rag capture --stdin --tag voice --source tg:123` | Leer texto de stdin. Útil para voice transcripts. |
+| `rag capture --stdin --tag voice --source whatsapp-voice` | Leer texto de stdin. Útil para voice transcripts. |
 | `rag morning [--dry-run] [--date Y-M-D] [--lookback-hours 36]` | Brief diario: ayer + foco hoy + inbox + contradicciones nuevas + queries low-conf. command-r 120-280 palabras. Auto Mon-Fri 7:00. |
 | `rag dead [--min-age-days 365] [--query-window-days 180] [--folder X] [--plain]` | Candidatos a archivar: 0 outlinks + 0 backlinks + no recuperada + vieja. Usa frontmatter `created:` si existe (iCloud-safe). |
 | `rag dupes [--threshold 0.85] [--folder X] [--limit 50] [--plain]` | Pares de notas con centroides similares. Numpy. <1s sobre 521 notas. |
@@ -462,7 +462,7 @@ OBSIDIAN_RAG_VAULT=/tmp/tests rag index   # override temporal, no toca el regist
 Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el hash cambió. **Composición pura de primitivas existentes, sin LLM extra** (~0 cost además del indexing ya pagado).
 
 - **Auto-aplica**: `find_wikilink_suggestions` + `apply_wikilink_suggestions`. El suggester ya es conservador (skip ambigüos, short titles, self-links).
-- **Notifica vía Telegram** al `chat_id` configurado: near-duplicates (cosine ≥0.85), related notes (graph/tags), wikilinks aplicados. Mensaje compacto con `[[wikilinks]]` clickeables en Obsidian.
+- **Notifica vía WhatsApp** al `jid` configurado: near-duplicates (cosine ≥0.85), related notes (graph/tags), wikilinks aplicados. Mensaje compacto con `[[wikilinks]]` clickeables en Obsidian.
 - **Silent por default**: si no hay findings interesantes, no manda nada.
 
 **Skip rules** (evaluadas en orden):
@@ -475,7 +475,7 @@ Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el ha
 | `type: morning-brief \| weekly-digest \| prep` | skip (system-generated) |
 | Mismo `{path, hash}` analizado en los últimos 5 min | skip (evita doble ping) |
 
-**Config** en `~/.local/share/obsidian-rag/ambient.json`. Habilitación vía `/enable_ambient` en el bot Telegram (`@ragsystemobs_bot`) — el bot toma el `chat_id` del mensaje y el `bot_token` del env. rag.py SOLO lee y POST directo a `api.telegram.org/bot<token>/sendMessage` (urllib); no depende del bot estando up: si el bot muere, el ping se pierde pero el análisis corre y queda en `ambient.jsonl`.
+**Config** en `~/.local/share/obsidian-rag/ambient.json`. Habilitación vía `/enable_ambient` en el listener de WhatsApp (`~/whatsapp-listener/listener.ts`, grupo "RagNet" — JID `120363426178035051@g.us`). El listener toma el JID del config local; no hay token externo. rag.py SOLO lee y POST a `http://localhost:8080/api/send` del `whatsapp-bridge` (urllib); no depende del listener estando up: si el listener muere el análisis sigue y queda en `ambient.jsonl`. Si el bridge muere se pierde el ping. Backwards-compat: configs viejas con `{chat_id, bot_token}` quedan inertes — borrar `ambient.json` y re-`/enable_ambient`.
 
 ```bash
 rag ambient status
@@ -558,7 +558,7 @@ HELPER_OPTIONS = {"temperature": 0, "top_p": 1, "seed": 42, "num_ctx": 1024, "nu
 | `cancion`, `familia`, `estado`, `periodo`, `created`, `modified` | manual | Idem (otros searchable fields) |
 | `type: prep`, `topic: ...`, `sources: [[[X]]]`, `tags: [prep]` | `rag prep --save` | Marca briefs de prep |
 | `tags: [review, weekly-digest]`, `week: YYYY-WNN` | `rag digest` | Marca digests semanales |
-| `transcript-source: voice` (planeado) | bot Telegram con `/note` | Marca notas dictadas por voz |
+| `transcript-source: voice` (planeado) | listener de WhatsApp con voice notes | Marca notas dictadas por voz |
 
 ---
 
@@ -632,7 +632,7 @@ rag prep "Maria coaching liderazgo" --save
 ```bash
 rag capture "idea suelta sobre X"              # CLI
 echo "transcript largo" | rag capture --stdin  # pipe
-# O desde Telegram: /note <texto>, o voice + caption /note
+# O desde WhatsApp (grupo RagNet): /note <texto>, o voice note → captura automática
 ```
 
 ### Morning brief a mano
@@ -702,8 +702,8 @@ rag eval               # ahora corre contra home (cuyo golden set sí calibrado)
 
 ### Activar el Ambient Agent
 ```bash
-# Desde Telegram @ragsystemobs_bot:
-/enable_ambient        # guarda chat_id en ~/.local/share/obsidian-rag/ambient.json
+# Desde WhatsApp (grupo RagNet, listener corriendo):
+/enable_ambient        # guarda jid en ~/.local/share/obsidian-rag/ambient.json
 # A partir de acá, cada save en 00-Inbox/ dispara el análisis y puede pingear.
 
 rag ambient status     # confirmá que quedó habilitado
@@ -725,43 +725,43 @@ rag surface --sim-threshold 0.82 --top 10 --no-llm   # más estricto y sin gener
 
 ---
 
-## Telegram bots
+## WhatsApp listener
 
-Dos bots independientes corriendo como launchd services (`com.fer.*`):
-
-### @ragsystemobs_bot (obsidian-rag-bot) — voice-first RAG dedicado
-
-Bot específico sobre el vault. Voz → transcripción (whisper-cli local) → `rag query` → respuesta texto + TTS (`say -v Mónica`).
+Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). Polls la SQLite del `whatsapp-bridge` cada 3s; un solo grupo de WhatsApp ("RagNet", JID `120363426178035051@g.us`) es el thread de in/out. Anti-loop: cada respuesta del bot se prefija con un U+200B invisible y los mensajes con ese marcador se ignoran.
 
 | Trigger | Acción |
 |---|---|
-| `/rag <q>` o texto libre | Consulta RAG con session `tg:<chat_id>`. |
-| mensaje de voz | Transcribe + `rag query` + responde con voz + texto. |
-| `/note <texto>` / voz con caption `/note` | `rag capture` a 00-Inbox/. |
-| `/enable_ambient` | Guarda `chat_id` en `ambient.json` — activa el Ambient Agent para este chat. |
-| `/disable_ambient` | Equivalente a `rag ambient disable`. |
+| texto libre o `/rag <q>` | Consulta RAG con session `wa:<jid>`. |
+| `/note <texto>` | `rag capture` a 00-Inbox/ con tags `[whatsapp-capture, note]`, source `whatsapp-text`. |
+| `/read <url>` | `rag read --save --plain`. Una respuesta por URL. |
+| URL-only message | Auto-dispara `/read` por cada URL detectada. URL embebida en una pregunta cae al RAG. |
+| `/followup [N]` | `rag followup --days N` (default 30, cap [1, 365]). |
+| `/today` | `rag today --dry-run` con frontmatter + ANSI strippeados. |
+| `/agenda [hoy\|mañana\|semana]` | Reminders + Calendar + WhatsApp last-24h; `hoy` agrega `rag morning --dry-run`. NL: "agenda", "pendiente", "hacer", "tareas", "reuniones", "eventos", "planes" + "hoy/mañana/semana". |
+| `/enable_ambient` | Guarda `{jid, enabled: true}` en `ambient.json` — habilita el Ambient Agent para este JID. |
+| `/help` | Lista de comandos. |
+| voice note (audio/ptt) | Whisper-cli local → captura el transcript a 00-Inbox/ con tags `[whatsapp-capture, voice]`. |
 
-launchd: `com.fer.obsidian-rag-bot`, log en `~/obsidian-rag-bot/bot.log`. Token en el plist (`~/Library/LaunchAgents/com.fer.obsidian-rag-bot.plist`).
+### Stack
 
-### @ffeerrr_bot (claude-telegram-bot) — wrapper del CLI de Claude Code
+- **Bridge**: `whatsapp-mcp/whatsapp-bridge` corriendo como `com.fer.whatsapp-bridge` en `localhost:8080`. Escribe a `~/repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db`.
+- **Listener**: `~/whatsapp-listener/listener.ts` corriendo como `com.fer.whatsapp-listener`. Logs en `~/.local/share/whatsapp-listener/`.
+- **STT**: `whisper-cli` local con modelos en `~/whisper-models/` (default `ggml-small.bin`, idioma fijo `es`).
+- **Tokens**: ninguno. La autenticación de WhatsApp la maneja el bridge (sesión persistente). El listener sólo POSTea a `localhost:8080/api/send` — sin secrets externos.
+- **Sesiones**: `wa:<jid>` como session_id literal → un solo thread por bot (un grupo). TTL 30 días.
+- **Tests**: `~/whatsapp-listener/listener.test.ts` cubre URL regexes, `ragRead/Followup/Today`, `enableAmbient`. `bun test listener.test.ts`.
 
-Bot general de asistente; permite hacer consultas al vault vía `/rag` pero su default es chat con Claude Code.
+### Bots de Telegram (deprecados)
 
-| Trigger | Acción |
+Los 3 bots de Telegram fueron archivados el 2026-04-15. Código histórico + plists vivos para rollback:
+
+| Antes | Ahora |
 |---|---|
-| `/rag <q>` (texto) | Consulta RAG con session `tg:<chat_id>`. |
-| `/note <texto>` (texto) | `rag capture` a 00-Inbox/ con tags `[capture, telegram]`, source `tg:<chat_id>`. |
-| mensaje de voz, sin caption | Transcribe + habla con Claude (flujo default). |
-| mensaje de voz, caption `/note` | Transcribe + captura a 00-Inbox/ con tags `[capture, telegram, voice]`. |
-| mensaje de voz, caption `/rag [q extra]` | Transcribe + `rag query`. Caption se prepende al transcript. |
+| `@ragsystemobs_bot` (obsidian-rag-bot) | `~/obsidian-rag-bot.archived/DEPRECATED.md` |
+| `@ffeerrr_bot` (claude-telegram-bot) | `~/claude-telegram-bot.archived/DEPRECATED.md` |
+| `@rauuuliiitoo_bot` (ollama-telegram / ollama-telegram-bot) | `~/ollama-telegram.archived/DEPRECATED.md`, `~/ollama-telegram-bot.archived/DEPRECATED.md` |
 
-launchd: `com.fer.claude-telegram-bot`.
-
-### Stack común
-
-- **STT**: `whisper-cli` local con modelos en `~/whisper-models/` (p.ej. `ggml-small.bin`).
-- **TTS**: macOS `say` con voces nativas (Mónica para español). Zero costo, zero cloud.
-- **Sesiones**: `tg:<chat_id>` como session_id literal → cada chat mantiene su thread. TTL 30 días.
+Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Para rollback: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/.archive-telegram/2026-04-15/com.fer.<bot>.plist`. Migration notes en `~/whatsapp-listener/MIGRATION.md`.
 
 ---
 
@@ -783,7 +783,7 @@ launchd: `com.fer.claude-telegram-bot`.
 | `rag wikilinks suggest --apply` rompió un archivo | La regex no debería pero por las dudas | `git diff` en el vault si está versionado. Sino, re-escribir desde Obsidian (los `[[wrap]]` son no-destructivos). |
 | `rag dead` devuelve 0 candidatos con vault viejo | iCloud sync bumpea los mtimes constantemente | `rag dead` usa frontmatter `created:` cuando existe. Si tus notas no tienen ese campo, agregarlo (o aceptar que mtime no discrimina edad en iCloud). |
 | `rag morning` auto-fire no aparece en el vault | Servicio launchd no corrió (Mac apagado, suspendido, o error) | `tail ~/.local/share/obsidian-rag/morning.error.log`; re-disparar manual con `rag morning`. |
-| Telegram `/note` error "capture timeout" | `rag capture` está llamando al indexer y demora | Aumentar timeout en `runCapture` (default 30s) o hacer el index async. |
+| WhatsApp `/note` error "capture timeout" | `rag capture` está llamando al indexer y demora | Aumentar `RAG_TIMEOUT_MS` en `~/whatsapp-listener/listener.ts` o hacer el index async. |
 
 ---
 
@@ -799,7 +799,7 @@ launchd: `com.fer.claude-telegram-bot`.
 8. **Wikilink suggester con `min_title_len=4`** filtra colisiones de títulos cortos (TDD/AI/X).
 9. **Phase 2 (index-time contradiction) skipea en `--reset`** automáticamente: full reindex con LLM call por nota = O(n²) inaceptable. Se asume que los contradicts viejos sobreviven al reset si quedaron en el frontmatter.
 10. **El URL sub-index embebe el CONTEXTO (±240 chars), no la URL**. Match semántico contra prosa, no contra el string http://...
-11. **Session memory + Telegram**: el bot pasa `tg:<chat_id>` como session_id literal. Validador `SESSION_ID_RE` lo permite. TTL 30 días.
+11. **Session memory + WhatsApp**: el listener pasa `wa:<jid>` como session_id literal. Validador `SESSION_ID_RE` lo permite. TTL 30 días. Sesiones pre-migración bajo `tg:<chat_id>` siguen leíbles (TTL las barre).
 
 ---
 
@@ -814,7 +814,7 @@ launchd: `com.fer.claude-telegram-bot`.
 | `tests/test_wikilinks.py` | Skip mask + suggester + `apply_wikilink_suggestions` + stale-offset defense |
 | `tests/test_dupes.py` | Pairwise sims + threshold + folder filter + centroid |
 | `tests/test_inbox.py` | Folder/tag suggester + frontmatter rewrite + triage compose |
-| `tests/test_ambient.py` | Config gate + frontmatter opt-out + dedup window + auto-apply + telegram (stub) |
+| `tests/test_ambient.py` | Config gate + frontmatter opt-out + dedup window + auto-apply + whatsapp send (stub) |
 | `tests/test_auto_index.py` | Watcher state + debounce + hash-based skip |
 | `tests/test_capture_morning_dead.py` | `capture` atomic write + `morning` brief + `dead` criteria |
 | `tests/test_expand_queries.py` | Helper LLM expansion (mocked) + paraphrase shape |

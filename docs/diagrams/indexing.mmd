@@ -18,5 +18,5 @@ flowchart TD
     URLUpsert --> Cache[invalidate corpus cache]
     Cache --> Ambient{nota en<br/>00-Inbox/?}
     Ambient -->|sí + config| Hook[ambient hook:<br/>wikilinks + dupes + related]
-    Hook --> Telegram[POST api.telegram.org]
+    Hook --> WA[POST localhost:8080/api/send<br/>U+200B prefix anti-loop]
     Ambient -->|no| Done[done]

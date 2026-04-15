@@ -2,16 +2,15 @@ graph TD
     subgraph User["🧑 Usuario"]
         CLI["rag CLI<br/>(terminal)"]
         CC["Claude Code<br/>(MCP client)"]
-        TG["Telegram app"]
+        WA["WhatsApp app<br/>(self-chat RagNet)"]
     end
 
     subgraph Launchd["launchd services (com.fer.*)"]
         Watch["obsidian-rag-watch<br/>RunAtLoad + KeepAlive"]
         Digest["obsidian-rag-digest<br/>domingo 22:00"]
         Morning["obsidian-rag-morning<br/>Lun-Vie 7:00"]
-        RagBot["obsidian-rag-bot<br/>@ragsystemobs_bot"]
-        ClaudeBot["claude-telegram-bot<br/>@ffeerrr_bot"]
-        OllamaBot["ollama-telegram-bot<br/>@rauuuliiitoo_bot"]
+        Bridge["whatsapp-bridge<br/>localhost:8080 + SQLite"]
+        Listener["whatsapp-listener<br/>Bun/TS polls SQLite"]
         N8N["n8n<br/>localhost:5678"]
     end
 
@@ -41,13 +40,11 @@ graph TD
     Rag --> Local
     Rag --> Config
 
-    TG --> RagBot & ClaudeBot & OllamaBot
-    RagBot -->|voice| Whisper
-    RagBot -->|rag query| Rag
-    RagBot -->|TTS| Say
-    ClaudeBot -->|voice| Whisper
-    ClaudeBot -.->|/rag| Rag
-    OllamaBot --> Ollama
+    WA <--> Bridge
+    Bridge --> Listener
+    Listener -->|voice transcript| Whisper
+    Listener -->|rag query / read / capture / followup / today| Rag
+    Listener -->|TTS reply via media_path| Say
 
-    Rag -.->|ambient POST| TGAPI[api.telegram.org]
+    Rag -.->|"ambient POST /api/send"| Bridge
     N8N -.->|opcional webhooks| Rag

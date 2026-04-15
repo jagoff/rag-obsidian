@@ -1,5 +1,4 @@
 import json
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -42,6 +41,10 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
         rag, "_index_single_file",
         lambda *a, **kw: "skipped",
     )
+    # Stub Apple integrations so morning tests never touch osascript.
+    monkeypatch.setattr(rag, "_fetch_calendar_today", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_reminders_due", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_mail_unread", lambda *a, **kw: [])
     rag._invalidate_corpus_cache()
     return vault, col
 
@@ -112,6 +115,195 @@ def test_morning_evidence_empty_vault(tmp_vault, tmp_path):
     assert ev["todos"] == []
     assert ev["new_contradictions"] == []
     assert ev["low_conf_queries"] == []
+    assert ev["calendar_today"] == []
+    assert ev["reminders_due"] == []
+    assert ev["mail_unread"] == []
+
+
+# ── Apple integrations (osascript wrappers) ──────────────────────────────────
+
+
+def test_apple_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("OBSIDIAN_RAG_NO_APPLE", "1")
+    called = {"n": 0}
+
+    def _fake_osa(*a, **kw):
+        called["n"] += 1
+        return "ignored"
+
+    monkeypatch.setattr(rag, "_osascript", _fake_osa)
+    monkeypatch.setattr(rag, "_icalbuddy_path", lambda: "/fake/icalBuddy")
+    assert rag._fetch_calendar_today() == []
+    assert rag._fetch_reminders_due(datetime.now()) == []
+    assert rag._fetch_mail_unread() == []
+    assert called["n"] == 0  # env gate short-circuits before osascript
+
+
+def test_osascript_silent_fails_on_timeout(monkeypatch):
+    import subprocess
+
+    def _raise(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="osascript", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    assert rag._osascript("return 1", timeout=1.0) == ""
+
+
+def test_osascript_silent_fails_on_nonzero_exit(monkeypatch):
+    import subprocess
+
+    class _R:
+        returncode = 1
+        stdout = "nope"
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _R())
+    assert rag._osascript("return 1") == ""
+
+
+def test_fetch_calendar_parses_icalbuddy_output(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+    out = (
+        "Standup diario\n"
+        "    09:30 - 10:00\n"
+        "Entrevista Ana\n"
+        "    14:00 - 15:00\n"
+    )
+
+    class _R:
+        returncode = 0
+        stdout = out
+        stderr = ""
+
+    import subprocess
+    monkeypatch.setattr(rag, "_icalbuddy_path", lambda: "/fake/icalBuddy")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _R())
+    events = rag._fetch_calendar_today()
+    titles = [e["title"] for e in events]
+    assert titles == ["Standup diario", "Entrevista Ana"]
+    assert events[0]["start"] == "09:30"
+    assert events[0]["end"] == "10:00"
+
+
+def test_fetch_calendar_empty_when_icalbuddy_missing(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+    monkeypatch.setattr(rag, "_icalbuddy_path", lambda: None)
+    assert rag._fetch_calendar_today() == []
+
+
+def test_fetch_calendar_silent_on_nonzero_exit(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+
+    class _R:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    import subprocess
+    monkeypatch.setattr(rag, "_icalbuddy_path", lambda: "/fake/icalBuddy")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _R())
+    assert rag._fetch_calendar_today() == []
+
+
+def test_fetch_reminders_buckets(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+    now = datetime(2026, 4, 14, 10, 0, 0)
+    out = (
+        # Overdue (yesterday)
+        "Mandar factura|2026-04-13 18:00:00|Trabajo\n"
+        # Today
+        "Llamar a Juan|2026-04-14 17:00:00|Personal\n"
+        # Tomorrow (upcoming within horizon)
+        "Pagar luz|2026-04-15 12:00:00|Casa\n"
+        # Too far (next week) → filtered out by default horizon
+        "Viaje|2026-04-22 10:00:00|Viajes\n"
+    )
+    monkeypatch.setattr(rag, "_osascript", lambda *a, **kw: out)
+    items = rag._fetch_reminders_due(now, horizon_days=1)
+    buckets = [i["bucket"] for i in items]
+    names = [i["name"] for i in items]
+    assert buckets == ["overdue", "today", "upcoming"]
+    assert names == ["Mandar factura", "Llamar a Juan", "Pagar luz"]
+    assert "Viaje" not in names
+
+
+def test_fetch_reminders_skips_items_without_parseable_date(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+    out = "Sin fecha|missing value|Personal\nConFecha|2026-04-14 10:00:00|Personal\n"
+    monkeypatch.setattr(rag, "_osascript", lambda *a, **kw: out)
+    items = rag._fetch_reminders_due(datetime(2026, 4, 14, 9, 0, 0))
+    assert [i["name"] for i in items] == ["ConFecha"]
+
+
+def test_fetch_mail_unread_parses_subjects(monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_RAG_NO_APPLE", raising=False)
+    out = (
+        "Factura Abril|contabilidad@empresa.com|Monday, April 14, 2026 at 08:00:00\n"
+        "Invitación meeting|ana@cliente.com|Monday, April 14, 2026 at 07:30:00\n"
+    )
+    monkeypatch.setattr(rag, "_osascript", lambda *a, **kw: out)
+    items = rag._fetch_mail_unread()
+    assert [m["subject"] for m in items] == ["Factura Abril", "Invitación meeting"]
+    assert items[0]["sender"] == "contabilidad@empresa.com"
+
+
+def test_parse_applescript_date_spanish_locale():
+    dt = rag._parse_applescript_date("lunes, 14 de abril de 2026, 9:00:00")
+    assert dt == datetime(2026, 4, 14, 9, 0, 0)
+
+
+def test_parse_applescript_date_spanish_am_pm():
+    # Real Reminders.app format observed on this machine
+    assert rag._parse_applescript_date(
+        "miércoles, 15 de abril de 2026, 9:40:00 a. m."
+    ) == datetime(2026, 4, 15, 9, 40, 0)
+    assert rag._parse_applescript_date(
+        "miércoles, 15 de abril de 2026, 2:30:00 p. m."
+    ) == datetime(2026, 4, 15, 14, 30, 0)
+
+
+def test_parse_applescript_date_english_locale():
+    dt = rag._parse_applescript_date("Monday, April 14, 2026 at 9:30:00 AM")
+    assert dt == datetime(2026, 4, 14, 9, 30, 0)
+
+
+def test_parse_applescript_date_returns_none_on_garbage():
+    assert rag._parse_applescript_date("not a date") is None
+    assert rag._parse_applescript_date("") is None
+
+
+def test_morning_prompt_includes_apple_sections(tmp_vault, tmp_path, monkeypatch):
+    vault, _ = tmp_vault
+    monkeypatch.setattr(
+        rag, "_fetch_calendar_today",
+        lambda *a, **kw: [{"title": "Standup", "start": "9:30", "end": "10:00"}],
+    )
+    monkeypatch.setattr(
+        rag, "_fetch_reminders_due",
+        lambda *a, **kw: [{
+            "name": "Pagar luz", "due": "2026-04-14T12:00",
+            "list": "Casa", "bucket": "today",
+        }],
+    )
+    monkeypatch.setattr(
+        rag, "_fetch_mail_unread",
+        lambda *a, **kw: [{
+            "subject": "Invitación meeting", "sender": "ana@x.com", "received": "07:30",
+        }],
+    )
+    ev = rag._collect_morning_evidence(
+        datetime.now(), vault,
+        query_log=tmp_path / "q.jsonl",
+        contradiction_log=tmp_path / "c.jsonl",
+    )
+    prompt = rag._render_morning_prompt("2026-04-14", ev)
+    assert "Calendar — eventos de hoy" in prompt
+    assert "Standup" in prompt
+    assert "Reminders — vencidos/hoy" in prompt
+    assert "Pagar luz" in prompt
+    assert "Mail — no leídos" in prompt
+    assert "Invitación meeting" in prompt
+    assert "## 📅 Hoy en la agenda" in prompt
 
 
 def test_morning_picks_up_inbox_pending(tmp_vault, tmp_path):

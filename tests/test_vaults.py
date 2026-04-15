@@ -4,8 +4,6 @@ Cubre la precedencia env > registry > default + el ciclo CRUD del registry
 (add / list / use / current / remove). Las commands del CLI se ejecutan
 con CliRunner contra un VAULTS_CONFIG_PATH redirigido al tmp_path.
 """
-import json
-import os
 from pathlib import Path
 
 import pytest

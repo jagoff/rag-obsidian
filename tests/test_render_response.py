@@ -191,12 +191,10 @@ def _styles(rendered) -> list[tuple[str, str]]:
 def test_url_link_renders_label_and_url():
     text = "Mirá [Cliver.tv](https://www2.cliver.me/) para ver pelis."
     r = _plain(rag.render_response(text))
+    # Terminal-native: label + URL en dim paréntesis, sin brackets markdown.
+    # OSC 8 hyperlinks hacen ambos clickeables.
     assert "Cliver.tv" in r
-    # URL visible al lado del label, entre paréntesis dim — mismo shape
-    # que note-md. OSC 8 hyperlinks hacen ambos clickeables.
-    assert "https://www2.cliver.me/" in r
     assert "(https://www2.cliver.me/)" in r
-    # Markdown wrappers de corchetes no aparecen (reemplazados por paren dim).
     assert "[" not in r
     assert "](" not in r
 

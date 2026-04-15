@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import chromadb
-import numpy as np
 import pytest
 
 import rag

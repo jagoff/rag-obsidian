@@ -1,7 +1,7 @@
 [project]
 name = "obsidian-rag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local RAG over an Obsidian vault — ChromaDB + Ollama + sentence-transformers, no cloud calls."
 requires-python = ">=3.13"
 dependencies = [
     "chromadb>=1.5.7",
@@ -27,3 +27,12 @@ py-modules = ["rag", "mcp_server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# E402: module-level imports after logging/warnings configuration are intentional.
+# E741: `l` is not used anywhere in rag.py after cleanup.
+extend-ignore = ["E402"]

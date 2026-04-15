@@ -8,7 +8,6 @@ infer_filters auto-aplicó `folder=03-Resources/Claude`, y la nota
 `00-Inbox/Claude-peers.md` quedó invisible. RAG respondió "No tengo esa
 información" sobre algo que sí estaba en el vault.
 """
-import pytest
 import rag
 
 

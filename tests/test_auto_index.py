@@ -6,11 +6,9 @@ Cubre:
   - _with_vault context manager (swap + restore + invalida cache).
   - auto_index_vault: first-time, no_changes, incremental, orphans.
 """
-import json
 import time
 from pathlib import Path
 
-import chromadb
 import pytest
 
 import rag

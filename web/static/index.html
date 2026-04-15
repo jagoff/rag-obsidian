@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>rag</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <label id="vault-picker-label" for="vault-picker">vault</label>
+    <select id="vault-picker" aria-label="Vault">
+      <option value="">cargando…</option>
+    </select>
+  </header>
+  <main id="chat">
+    <div id="messages"></div>
+    <form id="composer" autocomplete="off">
+      <div id="input-wrap">
+        <span id="input-prompt">tu ›</span>
+        <textarea
+          id="input"
+          rows="1"
+          placeholder="preguntale al vault"
+          aria-label="Pregunta"
+          autofocus
+        ></textarea>
+      </div>
+    </form>
+  </main>
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

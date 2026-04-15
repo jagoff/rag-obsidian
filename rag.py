@@ -10741,6 +10741,8 @@ def _classify_followup_loop(
                 mtime_dt = datetime.fromtimestamp(full.stat().st_mtime)
             except OSError:
                 continue
+        if mtime_dt.tzinfo is not None:
+            mtime_dt = mtime_dt.astimezone().replace(tzinfo=None)
         if mtime_dt <= extracted_dt:
             continue
         candidates.append((float(score), meta, doc))

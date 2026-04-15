@@ -261,6 +261,35 @@ def test_classify_ignores_older_than_extracted(tmp_vault, monkeypatch):
     assert called == []
 
 
+def test_classify_handles_tzaware_modified_metadata(tmp_vault, monkeypatch):
+    """Regression: chunk metadata carries tz-aware ISO (e.g. '…-03:00') while
+    `extracted_at` is naive — the comparison used to crash with TypeError."""
+    vault, col = tmp_vault
+    now = datetime.now()
+    loop = {
+        "source_note": "02-Areas/x.md",
+        "loop_text": "llamar a Juan",
+        "extracted_at": (now - timedelta(days=5)).isoformat(timespec="seconds"),
+        "kind": "todo",
+    }
+    later = vault / "02-Areas" / "later.md"
+    later.write_text("hablé con Juan")
+    tz_aware_iso = (now - timedelta(days=1)).isoformat(timespec="seconds") + "-03:00"
+    monkeypatch.setattr(
+        rag, "retrieve",
+        lambda *a, **kw: {
+            "docs": ["hablé con Juan"],
+            "metas": [{"file": "02-Areas/later.md", "modified": tz_aware_iso}],
+            "scores": [0.5],
+        },
+    )
+    out = rag._classify_followup_loop(
+        col, loop, now, judge_fn=lambda q, ctx: (True, "ok"),
+    )
+    assert out["status"] == "resolved"
+    assert out["resolution_path"] == "02-Areas/later.md"
+
+
 def test_classify_below_min_score_unresolved(tmp_vault, monkeypatch):
     vault, col = tmp_vault
     now = datetime.now()

@@ -67,11 +67,11 @@ queries:
   # Claude / Tech
   - question: "comandos CLI de claude code"
     expected:
-      - 03-Resources/Claude Code - Comandos CLI.md
+      - 03-Resources/Claude/Claude Code - Comandos CLI.md
 
   - question: "comandos interactivos claude code"
     expected:
-      - 03-Resources/Claude Code - Comandos Interactivos.md
+      - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
 
   - question: "equipamiento amps guitarra"
     expected:

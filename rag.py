@@ -123,6 +123,60 @@ def _url_link_style(url: str, base: str) -> str:
     return f"{base} link {url}"
 
 
+def to_obsidian_url(path: str, vault_name: str | None = None) -> str:
+    """`obsidian://open?vault=<name>&file=<encoded>` for a vault-relative .md path.
+
+    Used by `--plain` outputs that go to WhatsApp / Telegram / other chat
+    surfaces — those render bare URLs as clickable but ignore markdown link
+    syntax. Click on mobile opens the note straight in Obsidian.
+    Vault name defaults to `VAULT_PATH.name` (matches how Obsidian names vaults
+    by their directory).
+    """
+    name = vault_name or VAULT_PATH.name
+    encoded = urllib.parse.quote(path, safe="/")
+    return (
+        f"obsidian://open?vault={urllib.parse.quote(name, safe='')}"
+        f"&file={encoded}"
+    )
+
+
+def convert_obsidian_links(text: str, vault_name: str | None = None) -> str:
+    """Replace `[Label](path.md)` and `[path.md]` with `obsidian://` URLs.
+
+    For chat surfaces (WA/TG) where the markdown link syntax shows up as
+    literal `[Label](path.md)` text. We emit `Label: obsidian://...` for the
+    labeled form and a bare `obsidian://...` for the bracket-only form, so the
+    chat client renders the URL clickable while preserving the human label.
+
+    Order matters: NOTE_LINK_RE first, then BARE_PATH_RE on the leftovers, so
+    a `[Label](foo.md)` match isn't double-processed by the bracket-only pass.
+    """
+    consumed: list[tuple[int, int]] = []
+    parts: list[tuple[int, int, str]] = []
+    for m in NOTE_LINK_RE.finditer(text):
+        url = to_obsidian_url(m.group(2), vault_name)
+        parts.append((m.start(), m.end(), f"{m.group(1)}: {url}"))
+        consumed.append(m.span())
+    for m in BARE_PATH_RE.finditer(text):
+        if any(s <= m.start() < e for s, e in consumed):
+            continue
+        url = to_obsidian_url(m.group(1), vault_name)
+        parts.append((m.start(), m.end(), url))
+    if not parts:
+        return text
+    parts.sort()
+    out: list[str] = []
+    pos = 0
+    for start, end, repl in parts:
+        if start > pos:
+            out.append(text[pos:start])
+        out.append(repl)
+        pos = end
+    if pos < len(text):
+        out.append(text[pos:])
+    return "".join(out)
+
+
 def render_response(text: str) -> Text:
     """Render LLM response:
        - ```lang\\n...\\n``` → fence stripped, cada línea con gutter dim ("  │ ")
@@ -4894,6 +4948,38 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
         return False
 
 
+def _brief_push_to_whatsapp(
+    title: str, vault_relpath: str, narrative: str,
+) -> bool:
+    """Push a brief (morning / today / digest) to the user's WhatsApp chat.
+
+    Reuses `_ambient_config()` as the on/off gate — if the user ran
+    `/enable_ambient` from the bot, the same `jid` receives the brief.
+    Returns True on a successful 2xx from the bridge, False otherwise (no
+    config, bridge down, network error). Failures are silent — the file is
+    already on disk so the user keeps the brief regardless of delivery.
+
+    Citations in the narrative are rewritten to `obsidian://` URLs so they
+    render clickable in WhatsApp Mobile (taps open the note in Obsidian).
+    """
+    cfg = _ambient_config()
+    if cfg is None:
+        return False
+    body = convert_obsidian_links(narrative)
+    msg = (
+        f"📓 *{title}* — `{vault_relpath}`\n\n{body}"
+    )
+    sent = _ambient_whatsapp_send(cfg["jid"], msg)
+    _ambient_log_event({
+        "cmd": "brief_push",
+        "title": title,
+        "path": vault_relpath,
+        "narrative_len": len(narrative),
+        "whatsapp_sent": sent,
+    })
+    return sent
+
+
 def _ambient_hook(
     col: chromadb.Collection,
     path: Path,
@@ -5526,12 +5612,21 @@ def query(
 
     # Gate LLM on reranker confidence. Negative top score ≈ rerank found
     # nothing relevant — skipping the LLM avoids hallucinated answers from
-    # unrelated chunks. `--force` overrides.
+    # unrelated chunks. `--force` overrides. The gated message is intentionally
+    # actionable: chat-surface bots scan the prefix "No tengo esa información"
+    # to detect the gate and offer `/capture` to record the unanswered query
+    # as a `pregunta-abierta` note — closing the "vault no sabe → vault aprende"
+    # loop without dropping the user back to silence.
     if result["confidence"] < CONFIDENCE_RERANK_MIN and not force:
+        suggestion = (
+            "Mandá `/capture pregunta-abierta: " + question
+            + "` para guardarla como pregunta abierta y que la próxima vez la encuentre."
+        )
         msg = (
             f"No tengo esa información en tus notas. "
             f"(top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
-            f"usá --force para llamar al LLM igual)"
+            f"usá --force para llamar al LLM igual)\n\n"
+            f"{suggestion}"
         )
         if plain:
             click.echo(msg)
@@ -5542,6 +5637,7 @@ def query(
                 f"[dim](top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
                 f"usá --force para llamar al LLM igual)[/dim]"
             )
+            console.print(f"[dim]💡 {suggestion}[/dim]")
             print_sources(result)
             render_related(find_related(col, result["metas"]))
         log_query_event({
@@ -5585,8 +5681,11 @@ def query(
     t_gen_start = time.perf_counter()
     parts: list[str] = []
     if plain:
-        # Stream tokens directly to stdout — no Rich overlays. Consumers (bots,
-        # scripts) see the answer forming in real time without ANSI cruft.
+        # Buffer the stream then emit once with `[Label](path.md)` rewritten to
+        # `obsidian://open?...` URLs. Chat surfaces (WhatsApp, Telegram) ignore
+        # markdown link syntax but render bare URLs as clickable — `--plain` is
+        # documented as "consumo programático" so giving up token-by-token
+        # streaming here is the right trade for clickable citations.
         for chunk in ollama.chat(
             model=resolve_chat_model(),
             messages=messages,
@@ -5594,10 +5693,8 @@ def query(
             stream=True,
             keep_alive=OLLAMA_KEEP_ALIVE,
         ):
-            tok = chunk.message.content
-            parts.append(tok)
-            click.echo(tok, nl=False)
-        click.echo("")
+            parts.append(chunk.message.content)
+        click.echo(convert_obsidian_links("".join(parts)))
     else:
         console.print()
         # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
@@ -7176,6 +7273,8 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
     console.print(
         f"[green]✓ Digest guardado:[/green] [bold cyan]{rel}[/bold cyan]"
     )
+    if _brief_push_to_whatsapp(f"Digest {week_label}", str(rel), narrative):
+        console.print("[dim]→ enviado a WhatsApp[/dim]")
 
 
 def _path_to_title(corpus: dict, path: str) -> str | None:
@@ -8897,10 +8996,9 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
             stream=True,
             keep_alive=OLLAMA_KEEP_ALIVE,
         ):
-            tok = chunk.message.content
-            parts.append(tok)
-            click.echo(tok, nl=False)
-        click.echo("")
+            parts.append(chunk.message.content)
+        # Same WA/TG-friendly link rewrite as `query --plain`.
+        click.echo(convert_obsidian_links("".join(parts)))
     else:
         with console.status("[dim]armando brief…[/dim]", spinner="dots"):
             # Drain the stream silently first, then redraw with link styling.
@@ -10419,6 +10517,11 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         pass
     rel = path.relative_to(VAULT_PATH)
     console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+    # Push to WhatsApp if ambient is enabled — landing the brief in the chat
+    # at 7:00 means the user wakes up to the brief instead of having to open
+    # Obsidian to find it.
+    if _brief_push_to_whatsapp(f"Morning {date_label}", str(rel), narrative):
+        console.print("[dim]→ enviado a WhatsApp[/dim]")
 
 
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
@@ -10723,7 +10826,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
 
     if dry_run:
         if plain:
-            click.echo(body)
+            click.echo(convert_obsidian_links(body))
         else:
             console.rule(f"[bold]Evening brief {date_label} (dry-run)[/bold]")
             console.print(body, markup=False, highlight=False)
@@ -10745,6 +10848,9 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
         click.echo(str(rel))
     else:
         console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+    if _brief_push_to_whatsapp(f"Evening {date_label}", str(rel), narrative):
+        if not plain:
+            console.print("[dim]→ enviado a WhatsApp[/dim]")
 
 
 # ── DEAD NOTES (rag dead) ────────────────────────────────────────────────────

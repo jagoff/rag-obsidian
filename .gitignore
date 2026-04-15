@@ -12,3 +12,7 @@ wheels/
 # Claude Code worktree scratch — agents reusan este dir para checkouts
 # temporales durante parallel feature work. Regenerable, no versionar.
 .claude/
+
+# MCP server config — paths absolutos user-specific (chroma data-dir).
+# Migrar a ${HOME}/... y commitear en otra iteración si se quiere compartir.
+.mcp.json

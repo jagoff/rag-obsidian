@@ -1,5 +1,26 @@
 # Chain regression investigation — 2026-04-15
 
+> **Update (2026-04-15, post-fix)** — Las recomendaciones #1 y #3 de este doc
+> ya fueron ejecutadas. Números y tabla abajo reflejan el estado PRE-fix;
+> se dejan como trazabilidad del diagnóstico. Estado actual:
+>
+> - `5406c37` fixea paths stale de `tech-claude-code` chain (2 rows de la
+>   tabla de "Failing turns").
+> - `5ff7a34` fixea singles equivalentes (`03-Resources/Claude Code - *.md` →
+>   `03-Resources/Claude/Claude Code - *.md`), complemento simétrico.
+> - `b8c55a3` refresca baseline en `CLAUDE.md`: singles `89.66% · MRR 0.810`,
+>   chains `33.33%` (exactamente la proyección "chain_success 16.67 → ~33%"
+>   que este doc estimaba en § Impacto estimado).
+> - Expansión del golden set: `queries.yaml` pasó de 6→10 chains, 16→28 turns
+>   (4 chains nuevas cubren los failure modes "reformulate" residuales:
+>   pronombre ambiguo, folder semantics, cascada, profundizá). Working tree,
+>   pendiente de commit bajo coordinación del peer manager.
+>
+> **Vivo como análisis histórico.** Los 5 turns "reformulate" residuales
+> siguen siendo el piso real para subir chain_success más allá de 33%; el
+> trabajo del compressor (#4) y el tune del prompt `reformulate_query` siguen
+> activos. Candidatos originales abajo intactos.
+
 ## TL;DR
 
 **No hay regresión en el core de `retrieve()`. La caída de `chain_success` 50 → 16.67

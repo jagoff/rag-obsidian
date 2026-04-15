@@ -4050,12 +4050,27 @@ def reformulate_query(
         f"Resumen de turnos previos:\n{summary}\n\n" if summary else ""
     )
     prompt = (
-        "Dado este historial de conversación:\n"
+        "Tu tarea: reescribir la nueva pregunta como consulta de búsqueda autónoma "
+        "resolviendo SOLO pronombres y referencias ambiguas usando el historial. "
+        "Reglas estrictas:\n"
+        "1. NO inventes entidades, áreas, temas ni atributos que no aparezcan "
+        "explícitamente en el historial o la pregunta.\n"
+        "2. Preservá posesivos y referencias personales ('mi', 'mis', 'tengo', "
+        "'mío') — son señal de que la búsqueda es sobre notas del usuario.\n"
+        "3. Si la pregunta menciona 'en esa misma carpeta', 'del mismo folder' "
+        "o similar, preservá la palabra carpeta/folder y el nombre del folder "
+        "referido — no la conviertas en query semántico.\n"
+        "4. Si la pregunta empieza con conectores ('y', 'y el', 'y la', "
+        "'y los', 'y eso', 'y otro') o contiene pronombres/demostrativos "
+        "('los', 'las', 'eso', 'ese', 'esa', 'aquel'), es follow-up: resolvé "
+        "los antecedentes explícitamente.\n"
+        "5. Si la pregunta ya es autónoma (entidades explícitas, sin "
+        "conectores ni pronombres ambiguos), devolvela tal cual.\n"
+        "6. Mantené el registro y la longitud aproximada de la pregunta original.\n\n"
+        "Historial:\n"
         f"{summary_section}{history_text}\n\n"
-        f"Y esta nueva pregunta: \"{question}\"\n\n"
-        "Reescribe la pregunta como una consulta de búsqueda autónoma y específica "
-        "(sin pronombres ambiguos, con contexto completo). "
-        "Responde SOLO con la consulta reformulada, sin explicaciones."
+        f"Nueva pregunta: \"{question}\"\n\n"
+        "Respondé SOLO con la consulta reformulada, sin explicaciones ni comillas."
     )
     resp = ollama.chat(
         model=HELPER_MODEL,
@@ -6386,7 +6401,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
     # avoiding HyDE (bundled with precise=True, known to hurt on qwen2.5:3b).
     if chains:
         console.print()
-        chain_rows: list[tuple[str, str, bool, float, float, list[str]]] = []
+        chain_rows: list[tuple[str, str, str, bool, float, float, list[str]]] = []
         per_chain_success: list[tuple[str, bool]] = []
 
         for chain in track(chains, description="Evaluando chains…"):
@@ -6415,7 +6430,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
                 hit, rr, recall = _score(expected, seen_paths)
                 if not hit:
                     all_hit = False
-                chain_rows.append((chain_id, q, hit, rr, recall, seen_paths))
+                chain_rows.append((chain_id, q, search_q, hit, rr, recall, seen_paths))
                 # Fake assistant turn: top retrieved path anchors the topic so
                 # the next reformulation has concrete nouns to resolve pronouns
                 # against without a real chat-model call.
@@ -6432,7 +6447,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         ctbl.add_column("Hit", justify="center")
         ctbl.add_column("RR", justify="right")
         ctbl.add_column("Recall", justify="right")
-        for cid, q, hit, rr, rec, _ in chain_rows:
+        for cid, q, _sq, hit, rr, rec, _ in chain_rows:
             ctbl.add_row(
                 cid,
                 q,
@@ -6442,20 +6457,22 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             )
         console.print(ctbl)
 
-        failed_turns = [(cid, q, paths) for cid, q, hit, _, _, paths in chain_rows if not hit]
+        failed_turns = [(cid, q, sq, paths) for cid, q, sq, hit, _, _, paths in chain_rows if not hit]
         if failed_turns:
             console.print()
             console.print("[bold red]Turns sin hit — top-k recuperado:[/bold red]")
-            for cid, q, paths in failed_turns:
+            for cid, q, sq, paths in failed_turns:
                 console.print(f"  [magenta]{cid}[/magenta] [yellow]{q}[/yellow]")
+                if sq and sq != q:
+                    console.print(f"    [dim italic]→ reformulada: {sq}[/dim italic]")
                 for p in paths[:k]:
                     console.print(f"    [dim]· {p}[/dim]")
 
         nt = len(chain_rows)
         nc = len(per_chain_success)
-        chain_hit = sum(1 for _, _, h, _, _, _ in chain_rows if h) / nt if nt else 0.0
-        chain_mrr = sum(r for _, _, _, r, _, _ in chain_rows) / nt if nt else 0.0
-        chain_recall = sum(r for _, _, _, _, r, _ in chain_rows) / nt if nt else 0.0
+        chain_hit = sum(1 for _, _, _, h, _, _, _ in chain_rows if h) / nt if nt else 0.0
+        chain_mrr = sum(r for _, _, _, _, r, _, _ in chain_rows) / nt if nt else 0.0
+        chain_recall = sum(r for _, _, _, _, _, r, _ in chain_rows) / nt if nt else 0.0
         chain_success = sum(1 for _, ok in per_chain_success if ok) / nc if nc else 0.0
         console.print()
         console.print(

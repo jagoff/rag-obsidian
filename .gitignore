@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Claude Code worktree scratch — agents reusan este dir para checkouts
+# temporales durante parallel feature work. Regenerable, no versionar.
+.claude/

@@ -11929,6 +11929,170 @@ def _generate_morning_narrative(prompt: str) -> str:
         return ""
 
 
+# ── Template-first morning (structured JSON output) ─────────────────────────
+# El prompt monolítico + LLM-draftea-todo sufría dos problemas: (1) tokens
+# altos porque el LLM re-transcribe evidencia ya estructurada, (2) drift —
+# a veces inventaba secciones vacías con "(nada)" y otras las omitía. Este
+# pipeline invierte el control: el código arma el esqueleto + sección 📅
+# Agenda (determinística desde calendar/reminders/weather), y el LLM SÓLO
+# devuelve JSON con 4 fields textuales. Bloques sin evidencia se omiten
+# sin preguntarle al modelo.
+
+
+def _render_morning_agenda_section(ev: dict) -> str:
+    """Deterministic render of 📅 Agenda from calendar + reminders + weather.
+    Returns "" if there's nothing to show — caller omits the section entirely.
+    """
+    bullets: list[str] = []
+    for e in ev.get("calendar_today", [])[:10]:
+        when = e.get("start") or ""
+        # Stamp from AppleScript looks like "Wednesday, April 15, 2026 ...";
+        # if there's a time component, show just HH:MM for brevity.
+        bullets.append(f"- {e.get('title', '(sin título)')} · {when}")
+    for r in ev.get("reminders_due", [])[:10]:
+        bucket = r.get("bucket") or ""
+        tag = f"({bucket}) " if bucket else ""
+        lst = f" [{r['list']}]" if r.get("list") else ""
+        due = f" · {r['due']}" if r.get("due") else ""
+        bullets.append(f"- {tag}{r.get('name', '(sin nombre)')}{due}{lst}")
+    if ev.get("weather_rain"):
+        w = ev["weather_rain"]
+        summary = w.get("summary") or "lluvia pronosticada"
+        bullets.append(f"- 🌧 {summary}")
+    if not bullets:
+        return ""
+    return "## 📅 Hoy en la agenda\n" + "\n".join(bullets)
+
+
+def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
+    """Compact prompt — evidence only, asks for tight JSON. LLM ya NO
+    genera el esqueleto ni la sección 📅 (el código la arma).
+    """
+    parts = [
+        f"Sos asistente personal. Generás contenido del morning brief para el {date_label}, "
+        "en 1ra persona, español rioplatense, tono calmo y directo.",
+        "",
+        "EVIDENCIA REAL del vault (nada fuera de acá):",
+        "",
+    ]
+    if ev.get("recent_notes"):
+        parts.append(f"Notas modificadas ayer ({len(ev['recent_notes'])}):")
+        for r in ev["recent_notes"][:12]:
+            parts.append(f"- [[{r['title']}]] ({r['path']}): {r['snippet'][:180]}")
+    if ev.get("inbox_pending"):
+        parts.append(f"\n00-Inbox ({len(ev['inbox_pending'])} sin triar):")
+        for r in ev["inbox_pending"][:10]:
+            parts.append(f"- [[{r['title']}]]: {r['snippet'][:140]}")
+    if ev.get("todos"):
+        parts.append(f"\nNotas con todo/due ({len(ev['todos'])}):")
+        for r in ev["todos"][:10]:
+            bits = []
+            if r.get("due"): bits.append(f"due={r['due']}")
+            if r.get("todo"): bits.append("todo=Y")
+            parts.append(f"- [[{r['title']}]] ({r['path']}) {', '.join(bits)}")
+    if ev.get("new_contradictions"):
+        parts.append(f"\nContradicciones nuevas ({len(ev['new_contradictions'])}):")
+        for c in ev["new_contradictions"][:5]:
+            tgt = ", ".join(t["path"] for t in c["targets"][:3])
+            parts.append(f"- {c['subject_path']} ↔ {tgt}")
+    if ev.get("low_conf_queries"):
+        parts.append(f"\nQueries sin respuesta buena ({len(ev['low_conf_queries'])}):")
+        for q in ev["low_conf_queries"][:6]:
+            parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
+    if ev.get("recent_queries"):
+        parts.append(f"\nQueries recientes del RAG ({len(ev['recent_queries'])}):")
+        for q in ev["recent_queries"][:6]:
+            parts.append(f"- \"{q['q']}\"")
+    # Agenda (calendar/reminders/weather) ya la arma el código — igual la
+    # mencionamos como contexto para que el LLM pueda cruzar referencias
+    # ("hoy tenés reunión con X → priorizá la nota [[X]]").
+    if ev.get("calendar_today") or ev.get("reminders_due") or ev.get("weather_rain"):
+        parts.append("\nAgenda (para cruzar con el foco; NO la re-imprimas):")
+        for e in (ev.get("calendar_today") or [])[:8]:
+            parts.append(f"- evento: {e.get('title')} ({e.get('start')})")
+        for r in (ev.get("reminders_due") or [])[:8]:
+            parts.append(f"- reminder: {r.get('name')} ({r.get('bucket', '')})")
+        if ev.get("weather_rain"):
+            parts.append(f"- clima: {ev['weather_rain'].get('summary', 'lluvia')}")
+    parts.extend([
+        "",
+        "DEVOLVÉ SOLO este JSON (sin ``` ni prosa extra):",
+        '{"yesterday": "...", "focus": [...], "pending": [...], "attention": [...]}',
+        "",
+        "Reglas estrictas:",
+        "- yesterday: 1 oración 15-30 palabras. Si no hay evidencia de ayer → string vacío.",
+        "- focus: 2-4 bullets con [[wikilink]] a la nota relevante. Priorizá lo urgente. "
+        "Si realmente no hay nada crítico → array vacío.",
+        "- pending: bullets de inbox + todos. Max 5. Vacío si no hay.",
+        "- attention: contradicciones + low-conf queries + gaps. Max 4. Vacío si no hay.",
+        "- NUNCA inventes placeholders como '(nada)' ni repitas la sección Agenda.",
+    ])
+    return "\n".join(parts)
+
+
+def _generate_morning_json(prompt: str) -> dict | None:
+    """One LLM call, JSON-formatted output. Returns the parsed dict or None
+    if parse fails (caller falls back to the legacy text-based path).
+    """
+    try:
+        resp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[{"role": "user", "content": prompt}],
+            options=CHAT_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = (resp.message.content or "").strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _yesterday_evening_link(target: datetime, vault: Path) -> str:
+    """Return a markdown footer linking to yesterday's evening review if it
+    exists. Closes the daily loop — the morning brief picks up where the
+    previous `rag today` left off.
+    """
+    yesterday = target - timedelta(days=1)
+    rel = f"05-Reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
+    if not (vault / rel).is_file():
+        return ""
+    title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
+    return f"\n\n---\n_ayer cerraste con:_ [[{title}]]"
+
+
+def _assemble_morning_brief(
+    date_label: str, agenda_md: str, parts: dict, continuity: str,
+) -> str:
+    """Put the brief together skipping empty sections. Headers are fixed;
+    content comes from `parts` (LLM JSON) and `agenda_md` (deterministic)."""
+    sections: list[str] = []
+    y = (parts.get("yesterday") or "").strip()
+    if y:
+        sections.append(f"## 📬 Ayer en una línea\n{y}")
+    if agenda_md:
+        sections.append(agenda_md)
+    focus = parts.get("focus") or []
+    if isinstance(focus, list) and focus:
+        bullets = "\n".join(f"- {str(b).strip()}" for b in focus if str(b).strip())
+        if bullets:
+            sections.append(f"## 🎯 Foco sugerido para hoy\n{bullets}")
+    pending = parts.get("pending") or []
+    if isinstance(pending, list) and pending:
+        bullets = "\n".join(f"- {str(b).strip()}" for b in pending if str(b).strip())
+        if bullets:
+            sections.append(f"## 🗂 Pendientes que asoman\n{bullets}")
+    attention = parts.get("attention") or []
+    if isinstance(attention, list) and attention:
+        bullets = "\n".join(f"- {str(b).strip()}" for b in attention if str(b).strip())
+        if bullets:
+            sections.append(f"## ⚠ Atender\n{bullets}")
+    return f"# Morning brief — {date_label}\n\n" + "\n\n".join(sections) + continuity
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")
@@ -11990,12 +12154,25 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     )
 
     date_label = target.strftime("%Y-%m-%d")
-    prompt = _render_morning_prompt(date_label, ev)
+    # Template-first: Python owns the skeleton + agenda; LLM returns JSON
+    # with only the textual fields (yesterday/focus/pending/attention).
+    # Fallback to the legacy monolithic prompt if JSON parse fails.
+    agenda_md = _render_morning_agenda_section(ev)
+    structured_prompt = _render_morning_structured_prompt(date_label, ev)
     with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
+        parts = _generate_morning_json(structured_prompt)
+    continuity = _yesterday_evening_link(target, VAULT_PATH)
+    if parts is not None:
+        brief_body = _assemble_morning_brief(date_label, agenda_md, parts, continuity)
+    else:
+        # Legacy fallback — one-shot text generation with the old monolithic
+        # prompt. Not ideal but keeps morning working if the JSON path fails.
+        prompt = _render_morning_prompt(date_label, ev)
         narrative = _generate_morning_narrative(prompt)
-    if not narrative:
-        console.print("[red]Modelo devolvió respuesta vacía.[/red]")
-        return
+        if not narrative:
+            console.print("[red]Modelo devolvió respuesta vacía.[/red]")
+            return
+        brief_body = f"# Morning brief — {date_label}\n\n{narrative}{continuity}"
 
     now_iso = datetime.now().isoformat(timespec="seconds")
     fm_lines = [
@@ -12008,7 +12185,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"date: '{date_label}'",
         "---",
     ]
-    body = "\n".join(fm_lines) + f"\n\n# Morning brief — {date_label}\n\n{narrative}\n"
+    body = "\n".join(fm_lines) + "\n\n" + brief_body + "\n"
 
     if dry_run:
         console.rule(f"[bold]Morning brief {date_label} (dry-run)[/bold]")

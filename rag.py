@@ -2392,53 +2392,6 @@ SYSTEM_RULES_STRICT = (
 # en la pregunta reflexiva al final, no en la respuesta factual. Diferenciado
 # de SYSTEM_RULES/STRICT porque coaching genuino requiere dejar espacio al
 # usuario — respuestas largas o consejos directos apagan la exploración.
-SYSTEM_RULES_COACH = (
-    "Sos un partner de coaching reflexivo conversando con el usuario. Tu "
-    "tarea NO es dar respuestas factuales sobre sus notas — es ayudarlo a "
-    "explorar su pensamiento y emociones usando sus notas como espejo.\n\n"
-    "REGLAS:\n"
-    "1. LAS NOTAS SON ESPEJO: el CONTEXTO son notas del usuario, material "
-    "para reflejar. Podés citar cuando ancla algo que dijo ('en tu nota de "
-    "febrero mencionabas X'). Formato de cita: [Título](ruta.md). No es "
-    "obligatorio citar en cada turno.\n"
-    "2. TONO: cálido, curioso, no-judgmental. Primera persona informal "
-    "rioplatense (voseo). Sin frases cliché ('es importante...', 'recordá "
-    "que...', 'deberías...').\n"
-    "3. FORMATO: respuesta CORTA (2-4 oraciones máximo) + UNA pregunta "
-    "reflexiva al final. La pregunta es el valor — hacés que piense, no "
-    "le resolvés.\n"
-    "4. NO DES consejos no pedidos. NO des opiniones definitivas. Si el "
-    "usuario pide consejo concreto, ofrecé 1-2 opciones neutrales y preguntá "
-    "qué resuena.\n"
-    "5. EMERGENCIA: si detectás señales de crisis (autolesión, violencia, "
-    "abuso agudo), dejá el modo coach, sugerí hablar con profesional "
-    "(línea 135 Argentina, o emergencia médica) y cortá.\n"
-)
-
-# Síntesis al cierre de sesión coach. Genera la nota que queda en 00-Inbox/.
-# Formato estructurado para que sea escaneable y accionable; los checkboxes
-# se integran con `rag followup` y con Obsidian's checkbox plugin.
-COACH_SYNTHESIS_PROMPT = (
-    "Sos un editor reflexivo. El usuario terminó una sesión de coaching. "
-    "Leé la conversación y generá una nota Markdown con esta estructura "
-    "exacta:\n\n"
-    "## Resumen\n"
-    "3-5 oraciones: lo que el usuario vino a explorar, los temas clave que "
-    "surgieron, el estado emocional general.\n\n"
-    "## Insights\n"
-    "3-7 bullets con los insights más importantes. Primera persona del "
-    "usuario ('me di cuenta que...', 'veo que...'). Concretos, no genéricos.\n\n"
-    "## Action items\n"
-    "Checkboxes con pasos concretos que emergen: `- [ ] <acción>`. "
-    "Si no hay acciones claras, omití la sección.\n\n"
-    "## Preguntas pendientes\n"
-    "Los hilos abiertos, también checkboxes: `- [ ] <pregunta>`. "
-    "Si no hay, omití la sección.\n\n"
-    "REGLAS: literal y concreto, no inventes. Si citás notas, "
-    "[Título](ruta.md). Sin disclaimers ni cierres vacíos.\n"
-)
-
-
 def print_query_header(question: str, result: dict, show_question: bool = True) -> None:
     """Render the metadata row (filters, variants, confidence), optionally
     preceded by the question in a panel. In chat the user just typed the
@@ -5882,16 +5835,20 @@ def query(
         for d, m in zip(result["docs"], result["metas"])
     )
     rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
+    # Perfil del usuario + estado mutable se inyectan antes de las reglas.
+    # Vacío si no hay — zero overhead cuando el usuario no los configuró.
+    user_block = user_prompt_block()
+    rules_full = f"{user_block}{rules}" if user_block else rules
     # When we have session history, build a chat-style prompt so the LLM sees
     # the conversation context. Otherwise keep the one-shot prompt unchanged.
     if history:
         messages = (
-            [{"role": "system", "content": f"{rules}\nCONTEXTO:\n{context}"}]
+            [{"role": "system", "content": f"{rules_full}\nCONTEXTO:\n{context}"}]
             + history
             + [{"role": "user", "content": question}]
         )
     else:
-        messages = [{"role": "user", "content": f"{rules}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
+        messages = [{"role": "user", "content": f"{rules_full}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
 
     t_gen_start = time.perf_counter()
     parts: list[str] = []
@@ -6524,15 +6481,17 @@ def chat(
         # decía "No tengo esa información"). Para el primer turno usamos la
         # misma estructura one-shot que query; con history armamos el formato
         # multi-turno pero manteniendo el priming del contexto igual.
+        user_block = user_prompt_block()
+        rules_full = f"{user_block}{SYSTEM_RULES}" if user_block else SYSTEM_RULES
         if history:
             messages = (
-                [{"role": "system", "content": f"{SYSTEM_RULES}\nCONTEXTO:\n{context}"}]
+                [{"role": "system", "content": f"{rules_full}\nCONTEXTO:\n{context}"}]
                 + history
                 + [{"role": "user", "content": question}]
             )
         else:
             messages = [{"role": "user", "content": (
-                f"{SYSTEM_RULES}\nCONTEXTO:\n{context}\n\n"
+                f"{rules_full}\nCONTEXTO:\n{context}\n\n"
                 f"PREGUNTA: {question}\n\nRESPUESTA:"
             )}]
         history.append({"role": "user", "content": question})
@@ -6604,57 +6563,59 @@ def chat(
         console.print("[dim]› [bold]+[/bold] o [bold]-[/bold] para dar feedback[/dim]")
 
 
-COACH_STATE_PATH = Path.home() / ".local/share/obsidian-rag/coach_state.json"
-COACH_STATE_TTL_HOURS = 24
+USER_STATE_PATH = Path.home() / ".local/share/obsidian-rag/user_state.json"
+USER_STATE_TTL_HOURS = 24
 # Perfil explícito del usuario — nota vault-relativa. Si existe, su contenido
-# se prepende al system prompt del coach para calibrar tono/profundidad sin
-# tener que repetirlo cada sesión. Convención: archivo dentro del symlink de
-# memory para que conviva con el resto de la memoria persistente de Claude.
-COACH_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-Claude/perfil.md"
+# se inyecta en el system prompt de query/chat como bloque "SOBRE EL USUARIO".
+# Contexto estable (familia, trabajo, áreas de expertise, preferencias de tono).
+USER_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-Claude/perfil.md"
 
 
-def _read_coach_state() -> dict | None:
-    """Devuelve {'state': str, 'age_hours': float} si hay estado activo, else None."""
-    if not COACH_STATE_PATH.is_file():
+def read_user_state() -> dict | None:
+    """Devuelve {'state': str, 'age_hours': float} si hay estado activo, else None.
+
+    El estado decae a las USER_STATE_TTL_HOURS. Se inyecta en el system prompt
+    para calibrar tono/profundidad sin que el usuario lo repita cada query.
+    """
+    if not USER_STATE_PATH.is_file():
         return None
     try:
-        data = json.loads(COACH_STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(USER_STATE_PATH.read_text(encoding="utf-8"))
         ts = datetime.fromisoformat(data["ts"])
         age = (datetime.now() - ts).total_seconds() / 3600
-        if age > COACH_STATE_TTL_HOURS:
+        if age > USER_STATE_TTL_HOURS:
             return None
         return {"state": data["state"], "age_hours": age}
     except Exception:
         return None
 
 
-def _write_coach_state(state: str) -> None:
-    COACH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = COACH_STATE_PATH.with_suffix(".json.tmp")
+def write_user_state(state: str) -> None:
+    USER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USER_STATE_PATH.with_suffix(".json.tmp")
     tmp.write_text(
         json.dumps({"state": state, "ts": datetime.now().isoformat(timespec="seconds")}),
         encoding="utf-8",
     )
-    tmp.replace(COACH_STATE_PATH)
+    tmp.replace(USER_STATE_PATH)
 
 
-def _clear_coach_state() -> None:
-    if COACH_STATE_PATH.is_file():
+def clear_user_state() -> None:
+    if USER_STATE_PATH.is_file():
         try:
-            COACH_STATE_PATH.unlink()
+            USER_STATE_PATH.unlink()
         except Exception:
             pass
 
 
-def _read_coach_profile() -> str:
-    """Devuelve el texto del perfil si existe. Cap 2000 chars — el prompt ya
-    es grande y no queremos que un perfil largo coma el num_ctx."""
+def read_user_profile() -> str:
+    """Devuelve el texto del perfil si existe. Cap 2000 chars — no queremos
+    que un perfil largo coma el num_ctx del chat model."""
     try:
-        p = VAULT_PATH / COACH_PROFILE_RELPATH
+        p = VAULT_PATH / USER_PROFILE_RELPATH
         if not p.is_file():
             return ""
         raw = p.read_text(encoding="utf-8")
-        # Strip frontmatter si tiene.
         if raw.startswith("---\n"):
             end = raw.find("\n---\n", 4)
             if end != -1:
@@ -6664,117 +6625,21 @@ def _read_coach_profile() -> str:
         return ""
 
 
-def _build_coach_system_prompt() -> str:
-    """SYSTEM_RULES_COACH + perfil + estado actual si hay.
-
-    El perfil va primero (contexto estable), el estado después (mutable).
-    Ambos son opt-in: si no existen, el prompt queda igual que antes.
+def user_prompt_block() -> str:
+    """Bloque de contexto usuario (perfil + estado) para prepender al system
+    prompt de query/chat. Vacío si no hay perfil ni estado — opt-in.
     """
-    parts = [SYSTEM_RULES_COACH]
-    profile = _read_coach_profile()
+    parts: list[str] = []
+    profile = read_user_profile()
     if profile:
-        parts.append(f"\nPERFIL DEL USUARIO (contexto estable):\n{profile}")
-    state = _read_coach_state()
+        parts.append(f"SOBRE EL USUARIO (contexto estable):\n{profile}\n\n")
+    state = read_user_state()
     if state:
         parts.append(
-            f"\nESTADO ACTUAL (declarado hace {state['age_hours']:.1f}h): "
-            f"{state['state']}. Adaptá tono/profundidad."
+            f"ESTADO ACTUAL (hace {state['age_hours']:.1f}h): "
+            f"{state['state']}. Adaptá tono/profundidad.\n\n"
         )
     return "".join(parts)
-
-
-def _coach_turn(question: str, session_id: str) -> tuple[str, dict]:
-    """Un turno de coaching. Retorna (respuesta, sesión actualizada).
-
-    Reusa retrieve() para traer notas del vault como espejo — SYSTEM_RULES_COACH
-    las trata como material para reflejar, no como autoridad. Streamea off:
-    las respuestas coach son cortas (2-4 oraciones + pregunta) y el caller
-    las manda por WA o terminal de una sola vez.
-    """
-    col = get_db()
-    sess = ensure_session(session_id, mode="coach")
-    history = session_history(sess)
-    effective_q = question
-    if history:
-        try:
-            effective_q = reformulate_query(
-                question, history, summary=session_summary(sess)
-            )
-        except Exception:
-            effective_q = question
-    result = retrieve(
-        col, effective_q, RERANK_TOP, folder=None, tag=None,
-        precise=False, multi_query=True, auto_filter=True,
-    )
-    context = "\n\n---\n\n".join(
-        f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
-        for d, m in zip(result["docs"], result["metas"])
-    )
-    messages = [
-        {"role": "system", "content": _build_coach_system_prompt()},
-        *history,
-        {"role": "user", "content": f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}"},
-    ]
-    resp = ollama.chat(
-        model=resolve_chat_model(),
-        messages=messages,
-        options=CHAT_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
-    )
-    answer = (resp.message.content or "").strip()
-    turn_id = new_turn_id()
-    append_turn(sess, {
-        "q": question,
-        "q_reformulated": effective_q if effective_q != question else None,
-        "a": answer,
-        "paths": [m.get("file", "") for m in result["metas"]],
-        "top_score": result.get("top_score", 0.0),
-        "turn_id": turn_id,
-    })
-    save_session(sess)
-    return answer, sess
-
-
-def _coach_synthesize(session_id: str) -> tuple[str, Path | None]:
-    """Sintetiza la sesión de coaching en una nota de 00-Inbox/.
-
-    Retorna (markdown, path). Si la sesión no existe o está vacía, (msg, None).
-    """
-    sess = load_session(session_id)
-    if not sess or not sess.get("turns"):
-        return ("sesión vacía o inexistente", None)
-    convo_lines: list[str] = []
-    for i, t in enumerate(sess["turns"], 1):
-        q = (t.get("q") or "").strip()
-        a = (t.get("a") or "").strip()
-        if q:
-            convo_lines.append(f"[turno {i}] Usuario: {q}")
-        if a:
-            convo_lines.append(f"[turno {i}] Coach: {a}")
-    convo = "\n".join(convo_lines)
-    resp = ollama.chat(
-        model=resolve_chat_model(),
-        messages=[
-            {"role": "system", "content": COACH_SYNTHESIS_PROMPT},
-            {"role": "user", "content": f"Conversación:\n\n{convo}"},
-        ],
-        options={**CHAT_OPTIONS, "num_predict": 1024},
-        keep_alive=OLLAMA_KEEP_ALIVE,
-    )
-    body = (resp.message.content or "").strip()
-    first_q = sess["turns"][0].get("q", "coach session")
-    title = f"Coach · {first_q[:40]}"
-    note_path = capture_note(
-        body,
-        tags=["coach", "reflexion"],
-        source=f"coach-session:{session_id}",
-        title=title,
-    )
-    try:
-        _index_single_file(get_db(), note_path, skip_contradict=True)
-    except Exception:
-        pass
-    return (body, note_path)
 
 
 @cli.group(invoke_without_command=True)
@@ -6832,70 +6697,20 @@ def ignore_clear():
     console.print("[green]✓[/green] ignore list vacía")
 
 
-@cli.group()
-def coach():
-    """Modo coach reflexivo — conversación + síntesis.
-
-    Flow:
-      rag coach start [--session ID] [--topic T]
-      rag coach ask "texto" --session ID
-      rag coach close --session ID
-    """
-    pass
-
-
-@coach.command("start")
-@click.option("--session", "session_id", default=None,
-              help="ID de sesión (default = nuevo random)")
-@click.option("--topic", default=None,
-              help="Primer turno. Si se omite, la sesión queda abierta esperando el primer ask.")
-@click.option("--plain", is_flag=True, help="Salida plana")
-def coach_start(session_id: str | None, topic: str | None, plain: bool):
-    """Abre una sesión en modo coach."""
-    warmup_async()
-    if topic:
-        answer, sess = _coach_turn(topic, session_id or "")
-        output = f"{sess['id']}\n\n{answer}" if plain else answer
-        if plain:
-            click.echo(output)
-        else:
-            console.print(Panel(answer, title=f"coach · {sess['id']}",
-                                border_style="magenta"))
-    else:
-        sess = ensure_session(session_id, mode="coach")
-        save_session(sess)
-        msg = f"coach session abierta: {sess['id']}"
-        click.echo(msg) if plain else console.print(f"[magenta]{msg}[/magenta]")
-
-
-@coach.command("ask")
-@click.argument("text")
-@click.option("--session", "session_id", required=True)
-@click.option("--plain", is_flag=True)
-def coach_ask(text: str, session_id: str, plain: bool):
-    """Un turno de coach sobre una sesión existente."""
-    warmup_async()
-    answer, _ = _coach_turn(text, session_id)
-    if plain:
-        click.echo(answer)
-    else:
-        console.print(Panel(answer, title=f"coach · {session_id}",
-                            border_style="magenta"))
-
-
-@coach.command("rate")
+@cli.command()
 @click.argument("rating")
-@click.option("--session", "session_id", required=True)
+@click.option("--session", "session_id", default=None,
+              help="ID de sesión. Si se omite usa la última (last_session_id).")
 @click.option("--reason", default=None,
-              help="Razón del rating ('genérico', 'falta X.md', 'desactualizado'). "
-                   "También se puede pasar concatenado: 'rag coach rate \"0 genérico\"'")
+              help="Razón opcional ('genérico', 'falta X.md'). También se puede "
+                   "pasar concatenada: 'rag rate \"0 genérico\"'.")
 @click.option("--plain", is_flag=True)
-def coach_rate(rating: str, session_id: str, reason: str | None, plain: bool):
-    """Aplica feedback +/- al último turno de la sesión coach.
+def rate(rating: str, session_id: str | None, reason: str | None, plain: bool):
+    """Aplica rating +/-/0/1/👍/👎 al último turno de una sesión.
 
-    `rating` acepta +, -, 0, 1, /bien, /mal, 👍, 👎. Si en lugar de un token
-    solo llega texto tipo '0 genérico', se parsea: primer token rating, resto
-    razón. Eso permite al listener pasar literalmente lo que el usuario tipeó.
+    Si el primer token del `rating` es reconocido por detect_rating_intent y
+    hay más texto después, lo restante se loguea como `reason`. Útil para
+    que el listener pase lo que tipeó el usuario tal cual ("0 genérico").
     """
     rating_str = rating.strip()
     parts = rating_str.split(None, 1)
@@ -6906,10 +6721,14 @@ def coach_rate(rating: str, session_id: str, reason: str | None, plain: bool):
         msg = f"rating inválido: {rating!r}. Usá +/-, 0/1, 👍/👎."
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
-    effective_reason = reason or (tail.strip() or None)
-    sess = load_session(session_id)
+    sid = session_id or last_session_id()
+    if not sid:
+        msg = "no hay sesión — pasá --session o usá rag query --session X primero"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    sess = load_session(sid)
     if not sess or not sess.get("turns"):
-        msg = "no hay turnos en la sesión — nada para calificar"
+        msg = "sesión vacía — nada para calificar"
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
     last = sess["turns"][-1]
@@ -6918,9 +6737,10 @@ def coach_rate(rating: str, session_id: str, reason: str | None, plain: bool):
         msg = "el último turno no tiene turn_id (sesión pre-upgrade)"
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
+    effective_reason = reason or (tail.strip() or None)
     record_feedback(
         tid, r, last.get("q", ""), last.get("paths", []),
-        reason=effective_reason, session_id=session_id,
+        reason=effective_reason, session_id=sid,
     )
     label = "positivo" if r > 0 else "negativo"
     suffix = f" · {effective_reason}" if effective_reason else ""
@@ -6928,22 +6748,27 @@ def coach_rate(rating: str, session_id: str, reason: str | None, plain: bool):
     click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
 
 
-@coach.command("fix")
+@cli.command()
 @click.argument("path")
-@click.option("--session", "session_id", required=True)
+@click.option("--session", "session_id", default=None,
+              help="ID de sesión. Si se omite usa last_session_id.")
 @click.option("--plain", is_flag=True)
-def coach_fix(path: str, session_id: str, plain: bool):
-    """Declara el path correcto para el último turn — corrección.
+def fix(path: str, session_id: str | None, plain: bool):
+    """Declara el path correcto para el último turn — corrección explícita.
 
-    Use case: el bot respondió pero no retrieved la nota que el usuario tenía
-    en mente. `rag coach fix 02-Areas/X.md` marca ese path como positive de
-    alta confianza para esta query (y queries semánticamente similares).
-    Equivale a decir 'no, la nota que buscaba era ésta'.
+    Use case: bot respondió sin traer la nota que buscabas. `rag fix
+    02-Areas/X.md` marca ese path como positive de alta confianza para
+    queries semánticamente similares (valida que el path exista en vault).
     """
     path = path.strip().lstrip("/")
-    sess = load_session(session_id)
+    sid = session_id or last_session_id()
+    if not sid:
+        msg = "no hay sesión — pasá --session o querea algo primero"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    sess = load_session(sid)
     if not sess or not sess.get("turns"):
-        msg = "no hay turnos en la sesión — nada para corregir"
+        msg = "sesión vacía — nada para corregir"
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
     last = sess["turns"][-1]
@@ -6952,7 +6777,6 @@ def coach_fix(path: str, session_id: str, plain: bool):
         msg = "el último turno no tiene turn_id (sesión pre-upgrade)"
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
-    # Verify the corrective path exists in vault (avoid logging typos).
     full = VAULT_PATH / path
     if not full.is_file():
         msg = f"path no existe en vault: {path}"
@@ -6960,85 +6784,43 @@ def coach_fix(path: str, session_id: str, plain: bool):
         return
     record_feedback(
         tid, +1, last.get("q", ""), last.get("paths", []),
-        reason="corrective", corrective_path=path, session_id=session_id,
+        reason="corrective", corrective_path=path, session_id=sid,
     )
     msg = f"✓ corrección registrada: {path}"
     click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
 
 
-@coach.command("state")
+@cli.command()
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")
 @click.option("--plain", is_flag=True)
-def coach_state(text: str | None, clear: bool, plain: bool):
-    """Lee/escribe el estado emocional o de focus del usuario.
+def state(text: str | None, clear: bool, plain: bool):
+    """Lee/escribe el estado del usuario (cansado, inspirado, focus-code…).
 
-    Decae a las 24h — es señal mutable, no permanente. Se inyecta en el
-    system prompt del coach para adaptar tono/profundidad sin tener que
-    explicitarlo cada turno.
+    TTL 24h — señal mutable. Se inyecta al system prompt de query/chat
+    automáticamente para calibrar tono sin que lo declares cada vez.
 
-      rag coach state                 # muestra estado actual (si no expiró)
-      rag coach state cansado          # set
-      rag coach state --clear          # borra
+      rag state                # muestra estado actual (si no expiró)
+      rag state cansado         # set
+      rag state --clear         # borra
     """
     if clear:
-        _clear_coach_state()
+        clear_user_state()
         msg = "estado limpiado"
         click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
         return
     if not text:
-        state = _read_coach_state()
-        if state:
-            age_h = state.get("age_hours", 0)
-            msg = f"{state['state']} (hace {age_h:.1f}h)"
+        st = read_user_state()
+        if st:
+            msg = f"{st['state']} (hace {st['age_hours']:.1f}h)"
             click.echo(msg) if plain else console.print(f"[cyan]{msg}[/cyan]")
         else:
             msg = "sin estado activo"
             click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
         return
-    _write_coach_state(text.strip())
+    write_user_state(text.strip())
     msg = f"estado: {text.strip()}"
     click.echo(msg) if plain else console.print(f"[cyan]{msg}[/cyan]")
-
-
-@coach.command("close")
-@click.option("--session", "session_id", required=True)
-@click.option("--rating", type=click.IntRange(1, 5), default=None,
-              help="Rating holístico 1-5 de la sesión completa")
-@click.option("--plain", is_flag=True)
-def coach_close(session_id: str, rating: int | None, plain: bool):
-    """Sintetiza la sesión en una nota de 00-Inbox/ y la indexa.
-
-    Con `--rating 1-5` registra un feedback scope='session' — señal holística
-    distinta del rating por-turn, útil para rag insights a nivel conversación.
-    """
-    if rating is not None:
-        sess_snap = load_session(session_id)
-        last_q = ""
-        if sess_snap and sess_snap.get("turns"):
-            last_q = sess_snap["turns"][0].get("q", "")
-        record_feedback(
-            turn_id=f"session:{session_id}",
-            rating=+1 if rating >= 3 else -1,
-            q=last_q,
-            paths=[],
-            scope="session",
-            session_id=session_id,
-            session_rating=rating,
-        )
-    body, note_path = _coach_synthesize(session_id)
-    if note_path is None:
-        msg = body
-        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
-        return
-    rel = str(note_path.relative_to(VAULT_PATH))
-    if plain:
-        click.echo(rel)
-        click.echo("")
-        click.echo(body)
-    else:
-        console.print(Panel(body, title=f"síntesis → {rel}",
-                            border_style="green"))
 
 
 @cli.command()

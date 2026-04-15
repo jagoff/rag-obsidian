@@ -184,10 +184,10 @@ chains:
     turns:
       - question: "comandos CLI de claude code"
         expected:
-          - 03-Resources/Claude Code - Comandos CLI.md
+          - 03-Resources/Claude/Claude Code - Comandos CLI.md
       - question: "y los interactivos"
         expected:
-          - 03-Resources/Claude Code - Comandos Interactivos.md
+          - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
 
   - id: rag-system
     turns:

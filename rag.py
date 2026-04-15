@@ -803,19 +803,44 @@ def record_feedback(
     rating: int,
     q: str,
     paths: list[str],
+    *,
+    reason: str | None = None,
+    corrective_path: str | None = None,
+    scope: str = "turn",
+    session_id: str | None = None,
+    session_rating: int | None = None,
 ) -> None:
     """Append a rating event to feedback.jsonl. Invalidates the golden cache
     so the next retrieve() picks up the new signal.
+
+    Campos opcionales que enriquecen la señal:
+    - `reason`: texto libre corto ('genérico', 'falta X.md') — permite agrupar
+      patrones de fallo por categoría en rag insights.
+    - `corrective_path`: path vault-relativo que el usuario declaró como el
+      correcto cuando el retrieve falló. Se usa como positive de alta confianza
+      en el golden cache (FEEDBACK_POSITIVE_BOOST x 2 vía reason='corrective').
+    - `scope`: 'turn' (default) o 'session' — distingue feedback por turn vs
+      rating holístico al cierre.
+    - `session_id` / `session_rating`: metadata para scope='session'.
     """
     try:
         FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        event = {
+        event: dict = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "turn_id": turn_id,
             "rating": 1 if rating > 0 else -1,
             "q": q,
             "paths": list(paths or []),
+            "scope": scope,
         }
+        if reason:
+            event["reason"] = reason.strip()[:200]
+        if corrective_path:
+            event["corrective_path"] = corrective_path
+        if session_id:
+            event["session_id"] = session_id
+        if session_rating is not None:
+            event["session_rating"] = int(session_rating)
         with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
@@ -895,8 +920,20 @@ def _rebuild_feedback_golden() -> dict:
     queries: list[str] = []
     buckets: list[tuple[str, list[dict], list[str]]] = []
     for ev in by_turn.values():
+        # Session-scope ratings no aportan al boost/penalty por paths — son
+        # señal holística (para rag insights / telemetría), no para retrieval.
+        if ev.get("scope") == "session":
+            continue
         q = (ev.get("q") or "").strip()
         paths = [p for p in (ev.get("paths") or []) if p]
+        # `corrective_path` es el path que el usuario declaró como correcto
+        # después de un retrieve fallido. Lo tratamos como ground-truth
+        # positivo — se antepone a los paths retrieved para que el match
+        # semántico lo priorice. Y fuerza rating=+1 sin importar el original.
+        corrective = (ev.get("corrective_path") or "").strip()
+        if corrective:
+            paths = [corrective] + [p for p in paths if p != corrective]
+            ev = {**ev, "rating": 1}
         if not q or not paths:
             continue
         bucket = positives if ev.get("rating", 0) > 0 else negatives
@@ -6567,6 +6604,85 @@ def chat(
         console.print("[dim]› [bold]+[/bold] o [bold]-[/bold] para dar feedback[/dim]")
 
 
+COACH_STATE_PATH = Path.home() / ".local/share/obsidian-rag/coach_state.json"
+COACH_STATE_TTL_HOURS = 24
+# Perfil explícito del usuario — nota vault-relativa. Si existe, su contenido
+# se prepende al system prompt del coach para calibrar tono/profundidad sin
+# tener que repetirlo cada sesión. Convención: archivo dentro del symlink de
+# memory para que conviva con el resto de la memoria persistente de Claude.
+COACH_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-Claude/perfil.md"
+
+
+def _read_coach_state() -> dict | None:
+    """Devuelve {'state': str, 'age_hours': float} si hay estado activo, else None."""
+    if not COACH_STATE_PATH.is_file():
+        return None
+    try:
+        data = json.loads(COACH_STATE_PATH.read_text(encoding="utf-8"))
+        ts = datetime.fromisoformat(data["ts"])
+        age = (datetime.now() - ts).total_seconds() / 3600
+        if age > COACH_STATE_TTL_HOURS:
+            return None
+        return {"state": data["state"], "age_hours": age}
+    except Exception:
+        return None
+
+
+def _write_coach_state(state: str) -> None:
+    COACH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = COACH_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"state": state, "ts": datetime.now().isoformat(timespec="seconds")}),
+        encoding="utf-8",
+    )
+    tmp.replace(COACH_STATE_PATH)
+
+
+def _clear_coach_state() -> None:
+    if COACH_STATE_PATH.is_file():
+        try:
+            COACH_STATE_PATH.unlink()
+        except Exception:
+            pass
+
+
+def _read_coach_profile() -> str:
+    """Devuelve el texto del perfil si existe. Cap 2000 chars — el prompt ya
+    es grande y no queremos que un perfil largo coma el num_ctx."""
+    try:
+        p = VAULT_PATH / COACH_PROFILE_RELPATH
+        if not p.is_file():
+            return ""
+        raw = p.read_text(encoding="utf-8")
+        # Strip frontmatter si tiene.
+        if raw.startswith("---\n"):
+            end = raw.find("\n---\n", 4)
+            if end != -1:
+                raw = raw[end + 5 :]
+        return raw.strip()[:2000]
+    except Exception:
+        return ""
+
+
+def _build_coach_system_prompt() -> str:
+    """SYSTEM_RULES_COACH + perfil + estado actual si hay.
+
+    El perfil va primero (contexto estable), el estado después (mutable).
+    Ambos son opt-in: si no existen, el prompt queda igual que antes.
+    """
+    parts = [SYSTEM_RULES_COACH]
+    profile = _read_coach_profile()
+    if profile:
+        parts.append(f"\nPERFIL DEL USUARIO (contexto estable):\n{profile}")
+    state = _read_coach_state()
+    if state:
+        parts.append(
+            f"\nESTADO ACTUAL (declarado hace {state['age_hours']:.1f}h): "
+            f"{state['state']}. Adaptá tono/profundidad."
+        )
+    return "".join(parts)
+
+
 def _coach_turn(question: str, session_id: str) -> tuple[str, dict]:
     """Un turno de coaching. Retorna (respuesta, sesión actualizada).
 
@@ -6595,7 +6711,7 @@ def _coach_turn(question: str, session_id: str) -> tuple[str, dict]:
         for d, m in zip(result["docs"], result["metas"])
     )
     messages = [
-        {"role": "system", "content": SYSTEM_RULES_COACH},
+        {"role": "system", "content": _build_coach_system_prompt()},
         *history,
         {"role": "user", "content": f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}"},
     ]
@@ -6770,18 +6886,27 @@ def coach_ask(text: str, session_id: str, plain: bool):
 @coach.command("rate")
 @click.argument("rating")
 @click.option("--session", "session_id", required=True)
+@click.option("--reason", default=None,
+              help="Razón del rating ('genérico', 'falta X.md', 'desactualizado'). "
+                   "También se puede pasar concatenado: 'rag coach rate \"0 genérico\"'")
 @click.option("--plain", is_flag=True)
-def coach_rate(rating: str, session_id: str, plain: bool):
+def coach_rate(rating: str, session_id: str, reason: str | None, plain: bool):
     """Aplica feedback +/- al último turno de la sesión coach.
 
-    `rating` acepta +, -, 0, 1, /bien, /mal, 👍, 👎 — todo lo que parsea
-    `detect_rating_intent`. Se registra contra el turn_id del último turn.
+    `rating` acepta +, -, 0, 1, /bien, /mal, 👍, 👎. Si en lugar de un token
+    solo llega texto tipo '0 genérico', se parsea: primer token rating, resto
+    razón. Eso permite al listener pasar literalmente lo que el usuario tipeó.
     """
-    r = detect_rating_intent(rating)
+    rating_str = rating.strip()
+    parts = rating_str.split(None, 1)
+    first = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+    r = detect_rating_intent(first)
     if r is None:
         msg = f"rating inválido: {rating!r}. Usá +/-, 0/1, 👍/👎."
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
         return
+    effective_reason = reason or (tail.strip() or None)
     sess = load_session(session_id)
     if not sess or not sess.get("turns"):
         msg = "no hay turnos en la sesión — nada para calificar"
@@ -6793,17 +6918,114 @@ def coach_rate(rating: str, session_id: str, plain: bool):
         msg = "el último turno no tiene turn_id (sesión pre-upgrade)"
         click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
         return
-    record_feedback(tid, r, last.get("q", ""), last.get("paths", []))
+    record_feedback(
+        tid, r, last.get("q", ""), last.get("paths", []),
+        reason=effective_reason, session_id=session_id,
+    )
     label = "positivo" if r > 0 else "negativo"
-    msg = f"✓ feedback {label} registrado"
+    suffix = f" · {effective_reason}" if effective_reason else ""
+    msg = f"✓ feedback {label}{suffix}"
     click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+
+
+@coach.command("fix")
+@click.argument("path")
+@click.option("--session", "session_id", required=True)
+@click.option("--plain", is_flag=True)
+def coach_fix(path: str, session_id: str, plain: bool):
+    """Declara el path correcto para el último turn — corrección.
+
+    Use case: el bot respondió pero no retrieved la nota que el usuario tenía
+    en mente. `rag coach fix 02-Areas/X.md` marca ese path como positive de
+    alta confianza para esta query (y queries semánticamente similares).
+    Equivale a decir 'no, la nota que buscaba era ésta'.
+    """
+    path = path.strip().lstrip("/")
+    sess = load_session(session_id)
+    if not sess or not sess.get("turns"):
+        msg = "no hay turnos en la sesión — nada para corregir"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    last = sess["turns"][-1]
+    tid = last.get("turn_id")
+    if not tid:
+        msg = "el último turno no tiene turn_id (sesión pre-upgrade)"
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    # Verify the corrective path exists in vault (avoid logging typos).
+    full = VAULT_PATH / path
+    if not full.is_file():
+        msg = f"path no existe en vault: {path}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+    record_feedback(
+        tid, +1, last.get("q", ""), last.get("paths", []),
+        reason="corrective", corrective_path=path, session_id=session_id,
+    )
+    msg = f"✓ corrección registrada: {path}"
+    click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
+
+
+@coach.command("state")
+@click.argument("text", required=False)
+@click.option("--clear", is_flag=True, help="Borra el estado actual")
+@click.option("--plain", is_flag=True)
+def coach_state(text: str | None, clear: bool, plain: bool):
+    """Lee/escribe el estado emocional o de focus del usuario.
+
+    Decae a las 24h — es señal mutable, no permanente. Se inyecta en el
+    system prompt del coach para adaptar tono/profundidad sin tener que
+    explicitarlo cada turno.
+
+      rag coach state                 # muestra estado actual (si no expiró)
+      rag coach state cansado          # set
+      rag coach state --clear          # borra
+    """
+    if clear:
+        _clear_coach_state()
+        msg = "estado limpiado"
+        click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+        return
+    if not text:
+        state = _read_coach_state()
+        if state:
+            age_h = state.get("age_hours", 0)
+            msg = f"{state['state']} (hace {age_h:.1f}h)"
+            click.echo(msg) if plain else console.print(f"[cyan]{msg}[/cyan]")
+        else:
+            msg = "sin estado activo"
+            click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+        return
+    _write_coach_state(text.strip())
+    msg = f"estado: {text.strip()}"
+    click.echo(msg) if plain else console.print(f"[cyan]{msg}[/cyan]")
 
 
 @coach.command("close")
 @click.option("--session", "session_id", required=True)
+@click.option("--rating", type=click.IntRange(1, 5), default=None,
+              help="Rating holístico 1-5 de la sesión completa")
 @click.option("--plain", is_flag=True)
-def coach_close(session_id: str, plain: bool):
-    """Sintetiza la sesión en una nota de 00-Inbox/ y la indexa."""
+def coach_close(session_id: str, rating: int | None, plain: bool):
+    """Sintetiza la sesión en una nota de 00-Inbox/ y la indexa.
+
+    Con `--rating 1-5` registra un feedback scope='session' — señal holística
+    distinta del rating por-turn, útil para rag insights a nivel conversación.
+    """
+    if rating is not None:
+        sess_snap = load_session(session_id)
+        last_q = ""
+        if sess_snap and sess_snap.get("turns"):
+            last_q = sess_snap["turns"][0].get("q", "")
+        record_feedback(
+            turn_id=f"session:{session_id}",
+            rating=+1 if rating >= 3 else -1,
+            q=last_q,
+            paths=[],
+            scope="session",
+            session_id=session_id,
+            session_rating=rating,
+        )
     body, note_path = _coach_synthesize(session_id)
     if note_path is None:
         msg = body

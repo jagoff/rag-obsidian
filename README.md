@@ -757,9 +757,9 @@ Los 3 bots de Telegram fueron archivados el 2026-04-15. Código histórico + pli
 
 | Antes | Ahora |
 |---|---|
-| `@ragsystemobs_bot` (obsidian-rag-bot) | `~/obsidian-rag-bot.archived/DEPRECATED.md` |
-| `@ffeerrr_bot` (claude-telegram-bot) | `~/claude-telegram-bot.archived/DEPRECATED.md` |
-| `@rauuuliiitoo_bot` (ollama-telegram / ollama-telegram-bot) | `~/ollama-telegram.archived/DEPRECATED.md`, `~/ollama-telegram-bot.archived/DEPRECATED.md` |
+| `@ragsystemobs_bot` (obsidian-rag-bot) | `~/archive/telegram-2026-04-15/obsidian-rag-bot/DEPRECATED.md` |
+| `@ffeerrr_bot` (claude-telegram-bot) | `~/archive/telegram-2026-04-15/claude-telegram-bot/DEPRECATED.md` |
+| `@rauuuliiitoo_bot` (ollama-telegram / ollama-telegram-bot) | `~/archive/telegram-2026-04-15/ollama-telegram/DEPRECATED.md`, `~/archive/telegram-2026-04-15/ollama-telegram-bot/DEPRECATED.md` |
 
 Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Para rollback: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/.archive-telegram/2026-04-15/com.fer.<bot>.plist`. Migration notes en `~/whatsapp-listener/MIGRATION.md`.
 

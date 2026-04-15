@@ -54,13 +54,15 @@ rag morning [--dry-run]                      # daily brief → 05-Reviews/YYYY-M
 rag today [--dry-run]                        # end-of-day closure → 05-Reviews/YYYY-MM-DD-evening.md
 rag followup [--days 30 --status stale|activo|resolved --json]   # open-loop scanner
 rag dead [--min-age-days 365]                # candidates to archive: 0 edges + not retrieved + old
+rag archive [--apply] [--force] [--gate 20]  # mueve dead notes a 04-Archive/ mirror PARA (dry-run default)
 
 # Automation (launchd)
-rag setup            # install com.fer.obsidian-rag-{watch,digest,morning,today} launchd services
+rag setup            # install com.fer.obsidian-rag-{watch,digest,morning,today,emergent,patterns,archive} launchd services
 rag setup --remove   # uninstall all
 
 # Quality + observability
 rag eval               # run queries.yaml → hit@k, MRR, recall@k (singles + chains)
+rag tune [--samples 500] [--apply]   # auto-calibrate ranker weights against golden (+ feedback.jsonl)
 rag log [-n 20] [--low-confidence]
 
 # Tests
@@ -214,6 +216,20 @@ Flags: dry-run default (fetch+summarize+preview, no write), `--save` (escribe + 
 
 **`rag dead`** — dead-note detector. Criterion AND: 0 outlinks + 0 backlinks + not retrieved in `--query-window-days` + age > `--min-age-days` + outside `00-Inbox/04-Archive/05-Reviews`. **Age source**: frontmatter `created:` parsed via ISO/strftime fallbacks (preferred — iCloud sync constantly bumps mtime), else mtime. Set `use_frontmatter_date=False` to force mtime. Pure Python; logs the run to `queries.jsonl` as `cmd: "dead"`. Never moves or deletes — only surfaces candidates.
 
+**`rag archive`** — cyclical cleanup: ejecuta el move que `rag dead` sólo señala. Reusa `find_dead_notes` como fuente de candidatos, mapea cada path a `04-Archive/<ruta-original>` respetando PARA (`01-Projects/app-X/nota.md` → `04-Archive/01-Projects/app-X/nota.md`), stampea frontmatter con `archived_at / archived_from / archived_reason: dead` antes de mover para que el move sea reversible (y visible en Obsidian dataview). Colisiones resuelven con sufijo `-archived-YYYY-MM`.
+
+**Opt-out** por nota: frontmatter `archive: never` (explícito) o `type: moc|index|permanent` (notas-hub nunca mueren por falta de edits — un MOC con 0 outlinks sigue siendo MOC).
+
+**Gate de confirmación**: si el plan supera `--gate` (default 20), apply se corta y pide `--force`. Evita que una ventana flojamente calibrada vacíe medio vault en silencio.
+
+**Batch log** de cada corrida en `~/.local/share/obsidian-rag/filing_batches/archive-YYYYMMDD-HHMMSS.jsonl` (formato `{src, dst, ts, age_days}` por línea) — reversible manualmente mirando el archivo y moviendo back. El frontmatter stamp refuerza la auditoría.
+
+**Reporte** opcional a `05-Reviews/YYYY-MM-archive.md` (appendea por corrida mensual). **Notificación** opcional vía ambient bridge: cuenta por carpeta + alerta si el gate cortó. Ambos flags default `True`.
+
+**Launchd `com.fer.obsidian-rag-archive`** corre `rag archive --apply --notify --report` el día 1 de cada mes a las 23:00. Si el mes acumuló <20 candidatos: aplica, notifica. Si acumuló más: gate activo, dry-run, notifica para que corras `--force` tras revisar. Instalado por `rag setup` junto al resto.
+
+Tests: `tests/test_archive.py` (22 casos — mirror PARA, colisiones same-batch, stamp sobre FM existente/ausente/prior-stamp, opt-out por `archive: never` y `type`, dry-run vs apply, gate, force bypass, notificación con ambient off/on, reporte append).
+
 ### Daily-productivity layer
 
 Three commands that compose the lower-level primitives into routines that have an obvious "moment" in the user's day.
@@ -280,6 +296,32 @@ Three-phase feature that turns the vault into an interlocutor instead of an arch
 **Detector model — empirical**: both detectors use `resolve_chat_model()` (command-r), NOT the helper. qwen2.5:3b proved non-deterministic at temp=0 seed=42 on this corpus (same case yields FP first run, empty next) and emits malformed JSON often. command-r hugs source text and returns parseable output. Cost ~5-10s per check — bounded by guardrails (opt-in for query; only changed notes for index). The pattern of "use the helper for cheap rewrites, escalate to chat model for judgment" is worth preserving.
 
 Tests: `tests/test_contradictions.py` (16 cases — fixtures monkeypatch `embed`/`get_reranker`/`ollama.chat` so model-agnostic), `tests/test_digest.py` (11 cases). `tests/contradiction_cases.yaml` is a golden set ready for a future eval harness when the detector prompt gets tuned.
+
+### Auto-tuned ranker weights (`rag tune`)
+
+Los 5 pesos post-rerank (`recency_cue`, `recency_always`, `tag_literal`, `feedback_pos`, `feedback_neg`) eran constantes hardcodeadas. Ahora forman un `RankerWeights` persistido en `~/.local/share/obsidian-rag/ranker.json` y auto-calibrable vía `rag tune`.
+
+**Score final por candidato**:
+```
+score = rerank_logit
+      + w.recency_cue    * recency_raw   [si has_recency_cue]
+      + w.recency_always * recency_raw   [siempre]
+      + w.tag_literal    * n_tag_matches [tags literales presentes en la query]
+      + w.feedback_pos                   [si path en feedback+ match cosine≥0.80]
+      - w.feedback_neg                   [si path en feedback- match cosine≥0.80]
+```
+
+Dos señales nuevas vs la versión anterior: `recency_always` (decay universal, sin gate por cue temporal) y `tag_literal` (bonus por cada tag del vault que aparece literalmente en la query). Defaults (`recency_always=0`, `tag_literal=0`) preservan el comportamiento pre-tune exacto.
+
+**`rag tune` pipeline**: extrae features (rerank + recency_raw + tag_hits + fb_pos/neg + ignored flag) una vez por golden case via `collect_ranker_features()`, luego barre `--samples` combinaciones de pesos in-memory aplicando `apply_weighted_scores()`. Objetivo `hit@5 + 0.5*MRR`. Golden = `queries.yaml` + eventos de `feedback.jsonl` con `corrective_path` (un corrective es ground-truth explícito: "la nota que esperaba era X"). Coordinate-descent refinement alrededor del top-random cierra la optimización. Aplica con `--apply / --yes`; log append-only a `~/.local/share/obsidian-rag/tune.jsonl`.
+
+**Aproximación en chains**: la reformulación entre turnos anchora con el top-path bajo pesos por defecto (fija el contexto para que el sweep no se pelee consigo mismo). Post-tune conviene correr `rag eval` para la métrica end-to-end real.
+
+**Baseline locked-in 2026-04-15** (post-tune, `docs/eval-tune-2026-04-15.md`):
+- Singles: `hit@5 95.24% · MRR 0.802` (pre-tune: `90.48% / 0.750`, +4.76pp / +0.052).
+- Chains: `hit@5 72.00% · MRR 0.557 · chain_success 44.44%` (hit y chain_success estables; MRR +0.020).
+
+Tests: `tests/test_tune.py` — 28 casos (defaults preservados, roundtrip save/load, cache invalidación por mtime, `match_literal_tags` con acentos/hashtag/bare tokens, `apply_weighted_scores` determinístico, feedback augmentation, `_score_case`/`_aggregate`, sampling seed, `_coordinate_refine` monotónico).
 
 ## Eval harness (`rag eval` + `queries.yaml`)
 

@@ -729,6 +729,143 @@ FEEDBACK_POSITIVE_BOOST = 0.03
 FEEDBACK_NEGATIVE_PENALTY = 0.15
 
 
+# ── RANKER WEIGHTS (auto-tunable) ────────────────────────────────────────────
+# Pesos del score final post-rerank. Eran 4 constantes hardcodeadas
+# (recency 0.1, fb_pos 0.03, fb_neg 0.15) + 1 gate binario (recency sólo si la
+# query tenía cue temporal). Ahora forman un vector explícito persistido en
+# ~/.local/share/obsidian-rag/ranker.json, auto-calibrable vía `rag tune`
+# usando queries.yaml como objetivo. Defaults preservan el comportamiento
+# previo exacto: recency_always=0 + tag_literal=0 ⇒ ranking idéntico a antes.
+
+RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
+
+
+class RankerWeights:
+    """Linear combination aplicada al rerank score. Pure dataclass-like.
+
+    Fórmula del score final por candidato:
+        score = rerank_logit
+              + recency_cue    * recency_raw   [si has_recency_cue]
+              + recency_always * recency_raw   [siempre]
+              + tag_literal    * n_tag_matches [tags literales en la query]
+              + feedback_pos                   [path en feedback+ match cosine≥0.80]
+              - feedback_neg                   [path en feedback- match cosine≥0.80]
+    """
+    __slots__ = (
+        "recency_cue", "recency_always", "tag_literal",
+        "feedback_pos", "feedback_neg",
+    )
+
+    def __init__(
+        self,
+        recency_cue: float = 0.1,
+        recency_always: float = 0.0,
+        tag_literal: float = 0.0,
+        feedback_pos: float = FEEDBACK_POSITIVE_BOOST,
+        feedback_neg: float = FEEDBACK_NEGATIVE_PENALTY,
+    ):
+        self.recency_cue = float(recency_cue)
+        self.recency_always = float(recency_always)
+        self.tag_literal = float(tag_literal)
+        self.feedback_pos = float(feedback_pos)
+        self.feedback_neg = float(feedback_neg)
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__slots__}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RankerWeights":
+        return cls(**{
+            k: float(d.get(k, getattr(cls(), k))) for k in cls.__slots__
+        })
+
+    @classmethod
+    def defaults(cls) -> "RankerWeights":
+        return cls()
+
+    @classmethod
+    def load(cls) -> "RankerWeights":
+        """Read from RANKER_CONFIG_PATH; fall back to defaults on any error."""
+        try:
+            if RANKER_CONFIG_PATH.is_file():
+                data = json.loads(RANKER_CONFIG_PATH.read_text(encoding="utf-8"))
+                return cls.from_dict(data.get("weights", {}) if isinstance(data, dict) else {})
+        except Exception:
+            pass
+        return cls.defaults()
+
+    def save(self, metadata: dict | None = None) -> None:
+        RANKER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "weights": self.as_dict(),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        tmp = RANKER_CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(RANKER_CONFIG_PATH)
+
+
+# Proceso-local cache invalidado por mtime del config.
+_ranker_weights_cache: tuple[float, RankerWeights] | None = None
+
+
+def get_ranker_weights() -> RankerWeights:
+    """In-process cached read of RankerWeights, invalidated on config mtime."""
+    global _ranker_weights_cache
+    try:
+        mtime = RANKER_CONFIG_PATH.stat().st_mtime if RANKER_CONFIG_PATH.is_file() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _ranker_weights_cache and _ranker_weights_cache[0] == mtime:
+        return _ranker_weights_cache[1]
+    w = RankerWeights.load()
+    _ranker_weights_cache = (mtime, w)
+    return w
+
+
+def _invalidate_ranker_weights() -> None:
+    global _ranker_weights_cache
+    _ranker_weights_cache = None
+
+
+def match_literal_tags(question: str, tag_vocab: set[str]) -> set[str]:
+    """Return the set of vault tags literally present in the question.
+
+    Two patterns supported:
+      1. `#tag` explicit markers (stripped of the hash).
+      2. Bare tokens in the question that match a known tag verbatim
+         (case-insensitive, accent-insensitive). Filters tokens shorter than
+         4 chars to avoid false positives on generic words ("rag" as a tag
+         would otherwise fire every time the user says "rag query").
+
+    Returns set of canonical tags (as stored in the vault) that the caller
+    can use to boost candidates whose `tags` metadata contains them.
+    """
+    if not tag_vocab:
+        return set()
+
+    def _fold(s: str) -> str:
+        n = unicodedata.normalize("NFD", s.lower())
+        return "".join(c for c in n if not unicodedata.combining(c))
+
+    norm_vocab = {_fold(t): t for t in tag_vocab if t}
+    hit: set[str] = set()
+    # Explicit #tag markers — always honored regardless of length.
+    for m in re.finditer(r"#([A-Za-zÀ-ÿ0-9_\-/]{2,})", question):
+        key = _fold(m.group(1))
+        if key in norm_vocab:
+            hit.add(norm_vocab[key])
+    # Bare tokens — only if ≥4 chars to dodge noise words.
+    tokens = re.findall(r"[A-Za-zÀ-ÿ0-9_\-]{4,}", question)
+    for tok in tokens:
+        key = _fold(tok)
+        if key in norm_vocab:
+            hit.add(norm_vocab[key])
+    return hit
+
+
 def new_turn_id() -> str:
     """Short opaque id per answered turn — 12 hex chars from os.urandom."""
     return secrets.token_hex(6)
@@ -1005,8 +1142,16 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
 
     boost: set[str] = set()
     penalty: set[str] = set()
+    # Dimensional safety: a stale golden cache (e.g. rebuilt with a different
+    # embedder or written by tests with fake embeddings) can have a vector
+    # shape that doesn't match the current query's. Silently skip mismatched
+    # entries — worst case feedback doesn't fire on this query; better than
+    # crashing retrieval.
+    q_dim = q.shape[0]
     for entry in golden["positives"]:
         e = np.asarray(entry["emb"], dtype="float32")
+        if e.shape[0] != q_dim:
+            continue
         en = float(np.linalg.norm(e))
         if en == 0:
             continue
@@ -1014,6 +1159,8 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
             boost.update(entry["paths"])
     for entry in golden["negatives"]:
         e = np.asarray(entry["emb"], dtype="float32")
+        if e.shape[0] != q_dim:
+            continue
         en = float(np.linalg.norm(e))
         if en == 0:
             continue
@@ -4530,28 +4677,48 @@ def retrieve(
     scores = reranker.predict(pairs, show_progress_bar=False)
 
     # Recency boost: when the query carries a temporal cue ("últimamente",
-    # "este mes", "recientes"…), reweight by how fresh each note is. Small
-    # additive (<=0.1) — enough to break ties toward recent notes without
-    # overwhelming strong reranker signal.
+    # "este mes", "recientes"…), reweight by how fresh each note is. Second
+    # term `recency_always` applies the same decay without a cue gate — lets
+    # the tuner learn "recent notes should always get a small push" without
+    # overriding evergreen queries.
     apply_recency = has_recency_cue(question)
+    # Tag literal boost: tags in the question that match vault vocab. Not
+    # applied as a hard filter (infer_filters already does that when the
+    # user types `#tag`) — here it's a soft ranking signal that survives
+    # when the user omits the `#`.
+    try:
+        tag_vocab = _load_corpus(col)["tags"]
+    except Exception:
+        tag_vocab = set()
+    query_tag_hits = match_literal_tags(question, tag_vocab) if tag_vocab else set()
+    weights = get_ranker_weights()
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
     final_pairs: list[tuple] = []
     for c, e, s in zip(candidates, expanded, scores):
-        path = c[1].get("file", "") if isinstance(c[1], dict) else ""
+        meta = c[1] if isinstance(c[1], dict) else {}
+        path = meta.get("file", "")
         if path in ignored:
             continue
         final = float(s)
+        rec_raw = recency_boost(meta) if (apply_recency or weights.recency_always) else 0.0
         if apply_recency:
-            final += 0.1 * recency_boost(c[1])
-        # Feedback: small additive boost para paths que el usuario marcó 👍 en
-        # queries similares, penalty más fuerte para los 👎. El signo importa
-        # pero el módulo es chico — no queremos ossificar el ranking.
+            final += weights.recency_cue * rec_raw
+        if weights.recency_always:
+            final += weights.recency_always * rec_raw
+        if query_tag_hits and weights.tag_literal:
+            meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
+            n_matches = len(query_tag_hits & meta_tags)
+            if n_matches:
+                final += weights.tag_literal * n_matches
+        # Feedback: additive boost/penalty para paths marcados 👍/👎 en queries
+        # similares (cosine ≥ FEEDBACK_MATCH_COSINE). Módulo tuneable por
+        # weights — el signo es fijo.
         if path in boost_paths:
-            final += FEEDBACK_POSITIVE_BOOST
+            final += weights.feedback_pos
         if path in penalty_paths:
-            final -= FEEDBACK_NEGATIVE_PENALTY
+            final -= weights.feedback_neg
         final_pairs.append((c, e, final))
     scored = sorted(final_pairs, key=lambda x: x[2], reverse=True)[:k]
     final_scores = [s for _, _, s in scored]
@@ -4568,6 +4735,173 @@ def retrieve(
         "filters_applied": filters_applied,
         "query_variants": variants,
     }
+
+
+# ── Ranker feature extraction (for offline tuning) ──────────────────────────
+# `collect_ranker_features()` runs the retrieval pipeline up to the cross
+# encoder and returns each candidate's raw signals WITHOUT applying weights.
+# `apply_weighted_scores()` then sorts with a given `RankerWeights` — cheap
+# and deterministic. `rag tune` uses them together: one expensive call per
+# golden query, then thousands of weight combos evaluated in-memory.
+
+
+def collect_ranker_features(
+    col: "chromadb.Collection",
+    question: str,
+    history: list[dict] | None = None,
+    k_pool: int = 40,
+    multi_query: bool = True,
+    auto_filter: bool = True,
+) -> list[dict]:
+    """Return per-candidate feature vectors for a query. List items:
+
+        {
+          "path": str, "note": str, "meta": dict,
+          "rerank": float, "recency_raw": float,
+          "tag_hits": int, "fb_pos": bool, "fb_neg": bool,
+          "ignored": bool, "has_recency_cue": bool,
+        }
+
+    Mirrors `retrieve()` but stops one step short of the weighted sort.
+    """
+    if col.count() == 0:
+        return []
+
+    # Filters identical to retrieve()'s default path.
+    filters_applied: dict = {}
+    search_query = question
+    folder: str | None = None
+    tag: str | None = None
+    date_range: tuple[float, float] | None = None
+    if auto_filter:
+        known_tags, known_folders = get_vocabulary(col)
+        inferred_folder, inferred_tag = infer_filters(search_query, known_tags, known_folders)
+        folder = inferred_folder
+        tag = inferred_tag
+        inferred_range, cleaned = detect_temporal_intent(search_query)
+        if inferred_range is not None:
+            date_range = inferred_range
+            search_query = cleaned
+
+    variants = [search_query]
+    if multi_query:
+        try:
+            variants = expand_queries(search_query)
+        except Exception:
+            variants = [search_query]
+
+    variant_embeds = embed(variants)
+    where = build_where(folder, tag, date_range)
+    seen_ids: set[str] = set()
+    merged_ordered: list[str] = []
+    n_results = min(RETRIEVE_K, col.count())
+    for v, q_embed in zip(variants, variant_embeds):
+        sem_kwargs: dict = {
+            "query_embeddings": [q_embed],
+            "n_results": n_results,
+            "include": ["documents", "metadatas"],
+        }
+        if where:
+            sem_kwargs["where"] = where
+        sem_ids = col.query(**sem_kwargs)["ids"][0]
+        bm25_ids = bm25_search(col, v, RETRIEVE_K, folder, tag, date_range)
+        for id_ in rrf_merge(sem_ids, bm25_ids):
+            if id_ not in seen_ids:
+                seen_ids.add(id_)
+                merged_ordered.append(id_)
+
+    # Feedback signals — keyed on original query embedding (variant 0 pre-HyDE).
+    boost_paths, penalty_paths = feedback_signals_for_query(variant_embeds[0])
+    if boost_paths:
+        try:
+            extra = col.get(
+                where={"file": {"$in": list(boost_paths)}},
+                include=[],
+            )
+            for eid in extra.get("ids", []):
+                if eid not in seen_ids:
+                    seen_ids.add(eid)
+                    merged_ordered.append(eid)
+        except Exception:
+            pass
+
+    merged_ordered = merged_ordered[:k_pool]
+    if not merged_ordered:
+        return []
+    fetched = col.get(ids=merged_ordered, include=["documents", "metadatas"])
+    id_map = {
+        id_: (doc, meta)
+        for id_, doc, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
+    }
+    candidates = [(id_map[id_][0], id_map[id_][1], id_) for id_ in merged_ordered if id_ in id_map]
+    expanded = [expand_to_parent(c[0], c[1]) for c in candidates]
+    reranker = get_reranker()
+    rerank_scores = reranker.predict(
+        [(question, e) for e in expanded], show_progress_bar=False,
+    )
+
+    try:
+        tag_vocab = _load_corpus(col)["tags"]
+    except Exception:
+        tag_vocab = set()
+    query_tag_hits = match_literal_tags(question, tag_vocab) if tag_vocab else set()
+    recency_cue = has_recency_cue(question)
+    ignored_set = load_ignored_paths()
+
+    feats: list[dict] = []
+    for (_, meta, _), s in zip(candidates, rerank_scores):
+        if not isinstance(meta, dict):
+            continue
+        path = meta.get("file", "")
+        rec_raw = recency_boost(meta)
+        meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
+        n_tag = len(query_tag_hits & meta_tags) if query_tag_hits else 0
+        feats.append({
+            "path": path,
+            "note": meta.get("note", ""),
+            "rerank": float(s),
+            "recency_raw": float(rec_raw),
+            "tag_hits": int(n_tag),
+            "fb_pos": path in boost_paths,
+            "fb_neg": path in penalty_paths,
+            "ignored": path in ignored_set,
+            "has_recency_cue": bool(recency_cue),
+            "meta": meta,
+        })
+    return feats
+
+
+def apply_weighted_scores(
+    feats: list[dict],
+    weights: RankerWeights,
+    k: int,
+) -> list[dict]:
+    """Sort features by the final composite score and return the top-k.
+
+    Each returned item carries the original feature dict plus a `score` key.
+    Ignored paths are dropped. Deterministic given the same input + weights.
+    """
+    scored: list[tuple[float, dict]] = []
+    for f in feats:
+        if f["ignored"]:
+            continue
+        score = f["rerank"]
+        if f["has_recency_cue"]:
+            score += weights.recency_cue * f["recency_raw"]
+        if weights.recency_always:
+            score += weights.recency_always * f["recency_raw"]
+        if weights.tag_literal and f["tag_hits"]:
+            score += weights.tag_literal * f["tag_hits"]
+        if f["fb_pos"]:
+            score += weights.feedback_pos
+        if f["fb_neg"]:
+            score -= weights.feedback_neg
+        scored.append((score, f))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: list[dict] = []
+    for s, f in scored[:k]:
+        out.append({**f, "score": s})
+    return out
 
 
 # ── Multi-vault retrieval ────────────────────────────────────────────────────
@@ -7336,6 +7670,400 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             f"chain_success {chain_success:.2%}  ·  "
             f"[dim]turns={nt}, chains={nc}[/dim]"
         )
+
+
+# ── RANKER AUTO-TUNING (rag tune) ────────────────────────────────────────────
+# Weight optimization loop for RankerWeights. Collects per-case features via
+# `collect_ranker_features()` once, then runs a random search over the 5 knobs
+# that touch post-rerank scoring. Objective: hit@5 + 0.5 * MRR over the golden
+# set (queries.yaml singles + chains + optional feedback.jsonl augmentation).
+#
+# Why random search over grid/Bayes: the feature vectors are fixed per case,
+# so each trial is pure CPU (sort + metric). 500 trials finish in <1s after
+# the ~1-2s-per-query feature gathering. No extra deps (no optuna). Seeded
+# for reproducibility. Coordinate-descent refinement around the winner
+# tightens the top region.
+
+TUNE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/tune.jsonl"
+
+# Search spaces for random sampling. Keep defaults inside the box so the
+# baseline is a representable sample (search includes the status quo).
+_TUNE_SPACE = {
+    "recency_cue":    (0.0, 0.35),   # default 0.10
+    "recency_always": (0.0, 0.10),   # default 0.00 (new signal)
+    "tag_literal":    (0.0, 0.20),   # default 0.00 (new signal)
+    "feedback_pos":   (0.0, 0.15),   # default 0.03
+    "feedback_neg":   (0.0, 0.50),   # default 0.15
+}
+
+
+def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
+    """Mine feedback.jsonl for corrective_path events — each is a gold
+    (query, expected_paths) tuple. Skip session-scope, deduplicate queries
+    by normalised form, drop entries where the corrective path is empty or
+    the query is too short to be useful.
+    """
+    if not FEEDBACK_PATH.is_file():
+        return []
+    seen_q: set[str] = set()
+    out: list[dict] = []
+    try:
+        raw = FEEDBACK_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("scope") == "session":
+            continue
+        q = (ev.get("q") or "").strip()
+        cp = (ev.get("corrective_path") or "").strip()
+        if not q or not cp or len(q) < min_len:
+            continue
+        key = " ".join(q.lower().split())
+        if key in seen_q:
+            continue
+        seen_q.add(key)
+        out.append({"question": q, "expected": [cp], "source": "feedback"})
+    return out
+
+
+def _score_case(feats: list[dict], expected: set[str],
+                weights: "RankerWeights", k: int) -> tuple[bool, float, float]:
+    """Return (hit, reciprocal_rank, recall) for one case under `weights`."""
+    top = apply_weighted_scores(feats, weights, k)
+    paths = [t["path"] for t in top]
+    retrieved = set(paths)
+    hit = bool(expected & retrieved)
+    rr = 0.0
+    for rank, p in enumerate(paths, start=1):
+        if p in expected:
+            rr = 1.0 / rank
+            break
+    recall = len(expected & retrieved) / len(expected) if expected else 0.0
+    return hit, rr, recall
+
+
+def _aggregate(cases_metrics: list[tuple[bool, float, float]]) -> dict:
+    n = len(cases_metrics) or 1
+    hit = sum(1 for h, _, _ in cases_metrics if h) / n
+    mrr = sum(r for _, r, _ in cases_metrics) / n
+    recall = sum(rc for _, _, rc in cases_metrics) / n
+    return {"hit": hit, "mrr": mrr, "recall": recall, "n": n}
+
+
+def _objective(agg: dict) -> float:
+    """Composite objective favouring hit over rank quality."""
+    return agg["hit"] + 0.5 * agg["mrr"]
+
+
+def _sample_weights(rng) -> "RankerWeights":
+    kw = {k: rng.uniform(lo, hi) for k, (lo, hi) in _TUNE_SPACE.items()}
+    return RankerWeights(**kw)
+
+
+def _coordinate_refine(
+    best: "RankerWeights", cached_cases: list[dict], k: int,
+    steps: int = 7,
+) -> "RankerWeights":
+    """Cheap local search: for each dim, scan `steps` equally-spaced values
+    in a shrunken box around the current value, keeping each improvement.
+    Deterministic. Cheap: O(5 * steps * len(cases_metrics)).
+    """
+    current = RankerWeights(**best.as_dict())
+    best_score = _objective(_aggregate(
+        [c["metrics"](current) for c in cached_cases]
+    ))
+    for dim, (lo, hi) in _TUNE_SPACE.items():
+        cur = getattr(current, dim)
+        span = (hi - lo) * 0.3
+        low = max(lo, cur - span)
+        high = min(hi, cur + span)
+        if steps <= 1 or high <= low:
+            continue
+        for i in range(steps):
+            trial_val = low + (high - low) * i / (steps - 1)
+            kw = current.as_dict()
+            kw[dim] = trial_val
+            trial = RankerWeights(**kw)
+            score = _objective(_aggregate(
+                [c["metrics"](trial) for c in cached_cases]
+            ))
+            if score > best_score + 1e-9:
+                best_score = score
+                current = trial
+    return current
+
+
+def _log_tune_event(event: dict) -> None:
+    try:
+        TUNE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+        with TUNE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+@cli.command()
+@click.option("--file", "queries_file", default="queries.yaml",
+              help="YAML golden (default: queries.yaml)")
+@click.option("-k", default=5, help="top-k para métricas (default: 5)")
+@click.option("--samples", default=500, show_default=True,
+              help="Trials de random search")
+@click.option("--seed", default=42, show_default=True,
+              help="Seed para reproducibilidad")
+@click.option("--no-chains", is_flag=True,
+              help="Saltar chains (sólo singles + feedback)")
+@click.option("--no-feedback", is_flag=True,
+              help="Ignorar feedback.jsonl (usar sólo queries.yaml)")
+@click.option("--apply", is_flag=True,
+              help="Persistir winner a ~/.local/share/obsidian-rag/ranker.json")
+@click.option("--yes", is_flag=True,
+              help="Equivalente a --apply, sin prompt (para launchd)")
+def tune(queries_file: str, k: int, samples: int, seed: int,
+         no_chains: bool, no_feedback: bool, apply: bool, yes: bool):
+    """Auto-calibrar pesos del ranker sobre un golden set.
+
+    Toma queries.yaml + feedback.jsonl (corrective_path events), corre
+    `collect_ranker_features()` una vez por caso (~1-2s cada uno), y luego
+    barre `--samples` combinaciones de pesos in-memory contra hit@k + 0.5·MRR.
+    Reporta top-5 y el baseline (weights actuales). Con --apply persiste
+    el winner a RANKER_CONFIG_PATH. Log a tune.jsonl.
+
+    Aproximación en chains: la reformulación entre turnos usa los pesos
+    por defecto para anclar contexto — el barrido optimiza sólo la ordenación
+    final por turno. Para obtener métricas end-to-end con el winner,
+    re-correr `rag eval` después de --apply.
+    """
+    import pathlib
+    import random
+    path = pathlib.Path(queries_file)
+    if not path.is_absolute():
+        path = pathlib.Path.cwd() / queries_file
+    if not path.is_file():
+        console.print(f"[red]No existe {path}[/red]")
+        return
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    queries = data.get("queries") or []
+    chains = [] if no_chains else (data.get("chains") or [])
+    aug = [] if no_feedback else _feedback_augmented_cases()
+
+    col = get_db()
+    if col.count() == 0:
+        console.print("[red]Índice vacío. Ejecutá: rag index[/red]")
+        return
+
+    cases: list[dict] = []  # [{kind, id, q, expected, feats}]
+    total = len(queries) + len(aug) + sum(len(c.get("turns") or []) for c in chains)
+    if total == 0:
+        console.print("[yellow]Sin cases golden — queries.yaml vacío y sin feedback.[/yellow]")
+        return
+
+    # Singles + feedback augmentation — both evaluated identically.
+    single_items = list(queries) + aug
+    with console.status(f"Extrayendo features ({len(single_items)} singles + "
+                        f"{sum(len(c.get('turns') or []) for c in chains)} turns)…"):
+        for entry in single_items:
+            q = entry["question"] if "question" in entry else entry.get("q", "")
+            expected = set(entry.get("expected") or [])
+            if not q or not expected:
+                continue
+            feats = collect_ranker_features(col, q, k_pool=RERANK_POOL_MAX)
+            cases.append({
+                "kind": "single",
+                "id": entry.get("source", "golden"),
+                "q": q,
+                "expected": expected,
+                "feats": feats,
+            })
+
+        # Chain turns — reformulated per eval's pattern, features captured once.
+        defaults = RankerWeights.defaults()
+        for chain in chains:
+            chain_id = chain.get("id", "<sin id>")
+            turns = chain.get("turns") or []
+            history: list[dict] = []
+            fake_sess: dict = {"turns": []}
+            for i, turn in enumerate(turns):
+                q = turn["question"]
+                expected = set(turn.get("expected") or [])
+                if i == 0 or not history:
+                    search_q = q
+                else:
+                    chain_summary = session_summary(fake_sess)
+                    search_q = reformulate_query(q, history, summary=chain_summary)
+                feats = collect_ranker_features(col, search_q, k_pool=RERANK_POOL_MAX)
+                if expected:
+                    cases.append({
+                        "kind": "chain",
+                        "id": f"{chain_id}:{i}",
+                        "chain_id": chain_id,
+                        "turn_index": i,
+                        "q": q,
+                        "search_q": search_q,
+                        "expected": expected,
+                        "feats": feats,
+                    })
+                # Anchor next turn with top-under-defaults.
+                history.append({"role": "user", "content": q})
+                top = apply_weighted_scores(feats, defaults, k)
+                top_path = top[0]["path"] if top else ""
+                fake_a = f"(contexto recuperado: {top_path})"
+                history.append({"role": "assistant", "content": fake_a})
+                fake_sess["turns"].append({"q": q, "a": fake_a})
+
+    if not cases:
+        console.print("[yellow]Sin cases evaluables.[/yellow]")
+        return
+
+    # Pre-compute per-case scoring closures — keeps the inner loop allocation-free.
+    for c in cases:
+        feats = c["feats"]; expected = c["expected"]
+        c["metrics"] = lambda w, f=feats, e=expected, kk=k: _score_case(f, e, w, kk)
+
+    # Baseline: current persisted weights (or defaults if none saved).
+    baseline_w = RankerWeights.load()
+    baseline_metrics = [c["metrics"](baseline_w) for c in cases]
+    baseline_agg = _aggregate(baseline_metrics)
+    baseline_obj = _objective(baseline_agg)
+
+    # Random search.
+    rng = random.Random(seed)
+    trials: list[tuple[float, RankerWeights, dict]] = []
+    # Seed the trial list with the current baseline so a win must strictly beat it.
+    trials.append((baseline_obj, baseline_w, baseline_agg))
+    with console.status(f"Random search · {samples} trials…"):
+        for _ in range(samples):
+            w = _sample_weights(rng)
+            metrics = [c["metrics"](w) for c in cases]
+            agg = _aggregate(metrics)
+            trials.append((_objective(agg), w, agg))
+
+    trials.sort(key=lambda t: t[0], reverse=True)
+    best_obj, best_w, best_agg = trials[0]
+
+    # Coordinate descent refinement around the best random sample.
+    refined = _coordinate_refine(best_w, cases, k)
+    refined_agg = _aggregate([c["metrics"](refined) for c in cases])
+    refined_obj = _objective(refined_agg)
+    if refined_obj > best_obj:
+        best_obj, best_w, best_agg = refined_obj, refined, refined_agg
+
+    # Render results.
+    console.print()
+    console.print(Rule(title="[bold]rag tune[/bold]", style="cyan"))
+    tbl = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    tbl.add_column("rank", justify="right", style="dim")
+    tbl.add_column("objetivo", justify="right")
+    tbl.add_column(f"hit@{k}", justify="right")
+    tbl.add_column("MRR", justify="right")
+    tbl.add_column("recall", justify="right")
+    tbl.add_column("pesos", overflow="fold")
+    tbl.add_row(
+        "baseline",
+        f"{baseline_obj:.4f}",
+        f"{baseline_agg['hit']:.2%}",
+        f"{baseline_agg['mrr']:.3f}",
+        f"{baseline_agg['recall']:.2%}",
+        json.dumps(baseline_w.as_dict(), separators=(",", ":")),
+        style="yellow",
+    )
+    seen_objs: set[str] = set()
+    rank = 1
+    for obj, w, agg in trials:
+        key = json.dumps(w.as_dict(), sort_keys=True)
+        if key in seen_objs:
+            continue
+        seen_objs.add(key)
+        if rank > 5:
+            break
+        delta = obj - baseline_obj
+        tbl.add_row(
+            str(rank),
+            f"{obj:.4f} ({'+' if delta >= 0 else ''}{delta:.4f})",
+            f"{agg['hit']:.2%}",
+            f"{agg['mrr']:.3f}",
+            f"{agg['recall']:.2%}",
+            json.dumps(w.as_dict(), separators=(",", ":")),
+            style="green" if delta > 0 else None,
+        )
+        rank += 1
+
+    # Refined winner as its own row if different from top-1 random.
+    if best_w.as_dict() != trials[0][1].as_dict():
+        tbl.add_row(
+            "refined",
+            f"{best_obj:.4f} ({'+' if best_obj - baseline_obj >= 0 else ''}{best_obj - baseline_obj:.4f})",
+            f"{best_agg['hit']:.2%}",
+            f"{best_agg['mrr']:.3f}",
+            f"{best_agg['recall']:.2%}",
+            json.dumps(best_w.as_dict(), separators=(",", ":")),
+            style="bold green" if best_obj > baseline_obj else None,
+        )
+    console.print(tbl)
+
+    delta = best_obj - baseline_obj
+    console.print()
+    console.print(
+        f"[dim]Cases: {len(cases)} "
+        f"(singles={sum(1 for c in cases if c['kind']=='single')}, "
+        f"chain_turns={sum(1 for c in cases if c['kind']=='chain')})[/dim]"
+    )
+    if delta > 1e-6:
+        console.print(
+            f"[green]✓[/green] Mejor config: [bold]+{delta:.4f}[/bold] sobre baseline "
+            f"(hit {baseline_agg['hit']:.2%} → {best_agg['hit']:.2%}, "
+            f"MRR {baseline_agg['mrr']:.3f} → {best_agg['mrr']:.3f})"
+        )
+    else:
+        console.print(
+            "[yellow]= Sin mejora sobre baseline.[/yellow] El config actual ya está cerca del óptimo "
+            "en este golden — re-correr con --samples mayor o ampliar golden no hizo diferencia."
+        )
+
+    _log_tune_event({
+        "cmd": "tune",
+        "samples": samples,
+        "seed": seed,
+        "n_cases": len(cases),
+        "baseline": {"weights": baseline_w.as_dict(), **baseline_agg,
+                     "objective": baseline_obj},
+        "best": {"weights": best_w.as_dict(), **best_agg,
+                 "objective": best_obj},
+        "delta": delta,
+    })
+
+    if delta <= 1e-6:
+        return
+    do_apply = apply or yes
+    if not do_apply:
+        console.print()
+        console.print(
+            "[dim]Para persistir el winner:[/dim] "
+            "[bold]rag tune --apply[/bold] "
+            "[dim](o editar manualmente ranker.json)[/dim]"
+        )
+        return
+
+    best_w.save(metadata={
+        "source": "rag tune",
+        "baseline": baseline_w.as_dict(),
+        "metrics": best_agg,
+        "delta": delta,
+        "n_cases": len(cases),
+        "samples": samples,
+        "seed": seed,
+    })
+    _invalidate_ranker_weights()
+    console.print(
+        f"[green]✓[/green] Pesos persistidos en [cyan]{RANKER_CONFIG_PATH}[/cyan]."
+    )
 
 
 @cli.command()
@@ -11833,6 +12561,472 @@ def dead(min_age_days: int, query_window_days: int, limit: int,
     )
 
 
+# ── ARCHIVER (rag archive) ───────────────────────────────────────────────────
+# Cyclical cleanup: mueve las notas detectadas por `find_dead_notes` a
+# `04-Archive/` preservando la jerarquía PARA original (01-Projects/X/nota.md
+# → 04-Archive/01-Projects/X/nota.md). Frontmatter stamp archived_at /
+# archived_from / archived_reason para que el move sea reversible. Gate de
+# confirmación si hay más de N candidatos (evita masacres silenciosas cuando
+# la ventana o la edad afloja). Reusa el detector de `rag dead` — mismos
+# criterios AND (0 outlinks + 0 backlinks + no retrieved + age > N + fuera
+# de Inbox/Archive/Reviews). Opt-out por nota con `archive: never` o
+# `type: moc|index|permanent` en frontmatter.
+
+_ARCHIVE_ROOT = "04-Archive"
+ARCHIVE_GATE_DEFAULT = 20
+ARCHIVE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/archive.jsonl"
+_ARCHIVE_OPT_OUT_TYPES = ("moc", "index", "permanent")
+
+
+def _archive_target_path(src_rel: str) -> str:
+    """Mirror source path under 04-Archive/. Preserves the PARA folder below
+    the root so `01-Projects/app-X/nota.md` lands at
+    `04-Archive/01-Projects/app-X/nota.md`. Already-archived paths are
+    returned unchanged (detector should skip them anyway).
+    """
+    if src_rel.startswith(_ARCHIVE_ROOT + "/") or src_rel == _ARCHIVE_ROOT:
+        return src_rel
+    return f"{_ARCHIVE_ROOT}/{src_rel}"
+
+
+def _archive_resolve_collision(vault: Path, dst_rel: str) -> str:
+    """If destination exists, append `-archived-YYYY-MM` to the stem. Walks
+    a counter if that variant also collides (rare).
+    """
+    dst = vault / dst_rel
+    if not dst.exists():
+        return dst_rel
+    parent_rel = str(Path(dst_rel).parent)
+    stem = Path(dst_rel).stem
+    suffix = Path(dst_rel).suffix
+    tag = datetime.now().strftime("%Y-%m")
+    for i in range(1, 50):
+        extra = f"-archived-{tag}" if i == 1 else f"-archived-{tag}-{i}"
+        candidate = f"{parent_rel}/{stem}{extra}{suffix}" if parent_rel != "." else f"{stem}{extra}{suffix}"
+        if not (vault / candidate).exists():
+            return candidate
+    return dst_rel  # give up; caller will fail explicitly on the move
+
+
+def _is_archive_opt_out(raw: str) -> bool:
+    """True if the note frontmatter opts out of archiving via `archive: never`
+    or `type: moc|index|permanent`. Permanent-knowledge notes (MOCs, indexes,
+    evergreen references) shouldn't die just for lacking edits.
+    """
+    fm = parse_frontmatter(raw)
+    if str(fm.get("archive", "")).strip().lower() == "never":
+        return True
+    t = str(fm.get("type", "")).strip().lower()
+    return t in _ARCHIVE_OPT_OUT_TYPES
+
+
+def _archive_stamp_frontmatter(raw: str, orig_rel: str,
+                                reason: str = "dead") -> str:
+    """Inject `archived_at / archived_from / archived_reason` into the
+    frontmatter. Creates a fresh YAML block if the note has none. Idempotent:
+    re-stamping overwrites prior archived_* fields.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    stamps = {
+        "archived_at": today,
+        "archived_from": orig_rel,
+        "archived_reason": reason,
+    }
+    if raw.startswith("---\n"):
+        end = raw.find("\n---\n", 4)
+        if end >= 0:
+            fm_text = raw[4:end]
+            rest = raw[end + 5:]
+            kept_lines: list[str] = []
+            for line in fm_text.splitlines():
+                key = line.split(":", 1)[0].strip()
+                if key in stamps:
+                    continue  # drop prior stamp; we're rewriting
+                kept_lines.append(line)
+            extra = "\n".join(f"{k}: {v}" for k, v in stamps.items())
+            body = "\n".join(kept_lines).rstrip()
+            block = f"{body}\n{extra}" if body else extra
+            return f"---\n{block}\n---\n{rest}"
+    # No frontmatter (or malformed): prepend a fresh one.
+    fresh = "\n".join(f"{k}: {v}" for k, v in stamps.items())
+    return f"---\n{fresh}\n---\n\n{raw}"
+
+
+def _open_archive_batch() -> Path:
+    """One-batch-per-run audit log for rollback. Lives alongside filing
+    batches but with an `archive-` prefix so `rag file --undo` doesn't pick
+    it up accidentally.
+    """
+    FILING_BATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = FILING_BATCHES_DIR / f"archive-{ts}.jsonl"
+    path.touch()
+    return path
+
+
+def _append_archive_batch(batch_path: Path, entry: dict) -> None:
+    with batch_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _log_archive_event(event: dict) -> None:
+    try:
+        ARCHIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+        with ARCHIVE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _archive_move_one(
+    col: "chromadb.Collection", src_rel: str, dst_rel: str,
+) -> dict:
+    """Move a single note. Stamps frontmatter in place FIRST (so the moved
+    file carries the stamp), then `shutil.move`, then two reindex calls:
+    old path (now gone → Chroma deletes its chunks) + new path (fresh chunks
+    under the new `file=` metadata key).
+    """
+    import shutil
+    src = (VAULT_PATH / src_rel).resolve()
+    src.relative_to(VAULT_PATH.resolve())
+    if not src.is_file():
+        raise FileNotFoundError(src_rel)
+    dst = (VAULT_PATH / dst_rel).resolve()
+    dst.relative_to(VAULT_PATH.resolve())
+    if dst.exists():
+        raise FileExistsError(dst_rel)
+    raw = src.read_text(encoding="utf-8", errors="ignore")
+    stamped = _archive_stamp_frontmatter(raw, src_rel)
+    src.write_text(stamped, encoding="utf-8")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    # Clean old path from Chroma + add new path. Both best-effort — the next
+    # full `rag index` would converge regardless.
+    try:
+        _index_single_file(col, src, skip_contradict=True)
+    except Exception:
+        pass
+    try:
+        _index_single_file(col, dst, skip_contradict=True)
+    except Exception:
+        pass
+    return {
+        "src": src_rel,
+        "dst": dst_rel,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def archive_dead_notes(
+    col: "chromadb.Collection",
+    vault: Path,
+    candidates: list[dict],
+    apply: bool,
+    force: bool,
+    gate: int = ARCHIVE_GATE_DEFAULT,
+) -> dict:
+    """Plan (and optionally execute) the archive moves. Pure function — takes
+    precomputed candidates from `find_dead_notes`. Returns:
+        {"plan": [...], "applied": [...], "skipped": [...], "gated": bool,
+         "batch_path": str | None}
+    """
+    plan: list[dict] = []
+    skipped: list[dict] = []
+    seen_dst: set[str] = set()
+    for c in candidates:
+        src_rel = c["path"]
+        src_full = vault / src_rel
+        if not src_full.is_file():
+            skipped.append({"path": src_rel, "reason": "missing"})
+            continue
+        try:
+            raw = src_full.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            skipped.append({"path": src_rel, "reason": "unreadable"})
+            continue
+        if _is_archive_opt_out(raw):
+            skipped.append({"path": src_rel, "reason": "opt-out"})
+            continue
+        dst_rel = _archive_target_path(src_rel)
+        if dst_rel == src_rel:
+            skipped.append({"path": src_rel, "reason": "already-archived"})
+            continue
+        dst_rel = _archive_resolve_collision(vault, dst_rel)
+        # Collision across this same batch (two src stems mapping to the same
+        # dst after suffixing) — add a second suffix to the later one.
+        if dst_rel in seen_dst:
+            stem = Path(dst_rel).stem
+            suffix = Path(dst_rel).suffix
+            parent_rel = str(Path(dst_rel).parent)
+            for i in range(2, 50):
+                tag = datetime.now().strftime("%Y-%m")
+                candidate = (
+                    f"{parent_rel}/{stem}-{i}{suffix}" if parent_rel != "."
+                    else f"{stem}-{i}{suffix}"
+                )
+                if candidate not in seen_dst and not (vault / candidate).exists():
+                    dst_rel = candidate
+                    break
+        seen_dst.add(dst_rel)
+        plan.append({
+            "src": src_rel, "dst": dst_rel,
+            "age_days": c.get("age_days", 0),
+        })
+
+    gated = apply and bool(plan) and not force and len(plan) > gate
+    applied: list[dict] = []
+    batch_path: Path | None = None
+    if apply and not gated and plan:
+        batch_path = _open_archive_batch()
+        for entry in plan:
+            try:
+                result = _archive_move_one(col, entry["src"], entry["dst"])
+                result["age_days"] = entry["age_days"]
+                _append_archive_batch(batch_path, result)
+                applied.append(result)
+            except Exception as e:
+                skipped.append({"path": entry["src"], "reason": str(e)})
+    return {
+        "plan": plan,
+        "applied": applied,
+        "skipped": skipped,
+        "gated": gated,
+        "batch_path": str(batch_path) if batch_path else None,
+    }
+
+
+def _render_archive_result(result: dict, apply: bool, plain: bool) -> None:
+    plan = result["plan"]
+    applied = result["applied"]
+    skipped = result["skipped"]
+    gated = result["gated"]
+
+    if plain:
+        for e in (applied if apply and not gated else plan):
+            click.echo(f"{e['src']}\t→\t{e['dst']}")
+        return
+
+    if not plan and not skipped:
+        console.print("[green]Sin candidatos a archivar.[/green]")
+        return
+
+    title = (
+        f"[bold yellow]📦 {len(plan)} nota(s) a archivar"
+        f"{' (dry-run)' if not apply else ''}[/bold yellow]"
+    )
+    console.print()
+    console.print(Rule(title=title, style="yellow"))
+
+    if plan:
+        tbl = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+        tbl.add_column("edad", style="yellow", justify="right")
+        tbl.add_column("origen", style="cyan")
+        tbl.add_column("→", style="dim")
+        tbl.add_column("destino", style="magenta")
+        for e in plan:
+            tbl.add_row(
+                f"{e['age_days']}d",
+                e["src"],
+                "→",
+                e["dst"],
+            )
+        console.print(tbl)
+
+    if gated:
+        console.print(
+            f"\n[yellow]⚠ Gate activo[/yellow]: {len(plan)} > gate. "
+            "Corré con [bold]--force[/bold] para aplicar (o achicá la ventana)."
+        )
+    elif apply:
+        console.print(
+            f"\n[green]✓[/green] Aplicados: {len(applied)}. "
+            f"Batch log: [dim]{result.get('batch_path') or '—'}[/dim]"
+        )
+
+    if skipped:
+        console.print(
+            f"\n[dim]{len(skipped)} skipped — "
+            + ", ".join(f"{s['reason']}" for s in skipped[:5])
+            + (" …" if len(skipped) > 5 else "")
+            + "[/dim]"
+        )
+
+
+def _write_archive_report(result: dict, apply: bool) -> Path | None:
+    """Write a human-readable Markdown report to 05-Reviews/YYYY-MM-archive.md.
+    Appends a dated section if the file already exists (monthly cadence can
+    hit the same file twice if triggered manually between cycles).
+    """
+    plan = result["plan"]
+    skipped = result["skipped"]
+    if not plan and not skipped:
+        return None
+    reviews_dir = VAULT_PATH / "05-Reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    ym = datetime.now().strftime("%Y-%m")
+    path = reviews_dir / f"{ym}-archive.md"
+    header = (
+        f"\n\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} — "
+        f"{'apply' if apply and not result['gated'] else 'dry-run'}\n\n"
+    )
+    lines = [header]
+    if plan:
+        lines.append(f"**{len(plan)} nota(s) planeadas:**\n")
+        for e in plan:
+            lines.append(f"- `{e['src']}` → `{e['dst']}` ({e['age_days']}d)")
+        lines.append("")
+    if result["gated"]:
+        lines.append("> ⚠ Gate activo — no se aplicó. Revisá y corré `rag archive --apply --force`.\n")
+    elif apply:
+        lines.append(f"**Aplicadas**: {len(result['applied'])}")
+        if result.get("batch_path"):
+            lines.append(f"**Batch log**: `{result['batch_path']}`")
+        lines.append("")
+    if skipped:
+        lines.append(f"**{len(skipped)} skipped:**\n")
+        for s in skipped[:20]:
+            lines.append(f"- `{s['path']}` — {s['reason']}")
+        if len(skipped) > 20:
+            lines.append(f"- _… {len(skipped) - 20} más_")
+    body = "\n".join(lines) + "\n"
+    if path.is_file():
+        existing = path.read_text(encoding="utf-8")
+        path.write_text(existing + body, encoding="utf-8")
+    else:
+        frontmatter = (
+            "---\n"
+            f"type: archive-report\n"
+            f"created: {datetime.now().isoformat(timespec='seconds')}\n"
+            "tags:\n- archive\n- review\n"
+            "---\n\n"
+            f"# Archive report — {ym}\n"
+        )
+        path.write_text(frontmatter + body, encoding="utf-8")
+    return path
+
+
+def _push_archive_notification(result: dict, apply: bool) -> bool:
+    """Fire-and-forget WhatsApp push via the ambient bridge. Silently no-ops
+    if ambient isn't configured. Message is compact: counts + top-3 folders.
+    """
+    cfg = _ambient_config()
+    if cfg is None:
+        return False
+    plan = result["plan"]
+    if not plan and not result["skipped"]:
+        return False
+    from collections import Counter
+    folder_counts = Counter(str(Path(e["src"]).parent) for e in plan)
+    top = folder_counts.most_common(3)
+    verb = "archivadas" if apply and not result["gated"] else "candidatas"
+    lines = [f"📦 *Archive* — {len(plan)} {verb}"]
+    if result["gated"]:
+        lines.append(f"⚠ gate activo (> {ARCHIVE_GATE_DEFAULT}) — revisar y correr `rag archive --apply --force`")
+    elif apply:
+        lines.append(f"✓ aplicadas: {len(result['applied'])}")
+    if top:
+        lines.append("\nPor carpeta:")
+        for folder, n in top:
+            lines.append(f"• `{folder}` — {n}")
+    if result["skipped"]:
+        lines.append(f"\n_{len(result['skipped'])} skipped_")
+    msg = "\n".join(lines)
+    sent = _ambient_whatsapp_send(cfg["jid"], msg)
+    _ambient_log_event({
+        "cmd": "archive_push",
+        "n_plan": len(plan),
+        "n_applied": len(result["applied"]),
+        "gated": result["gated"],
+        "whatsapp_sent": sent,
+    })
+    return sent
+
+
+@cli.command()
+@click.option("--min-age-days", default=365, show_default=True,
+              help="Edad mínima (frontmatter created: preferido, mtime fallback)")
+@click.option("--query-window-days", default=180, show_default=True,
+              help="Ventana para considerar que una nota 'fue usada' en queries")
+@click.option("--folder", default=None, help="Acotar a una subcarpeta")
+@click.option("--limit", default=100, show_default=True,
+              help="Cap absoluto de candidatos procesados en una corrida")
+@click.option("--gate", default=ARCHIVE_GATE_DEFAULT, show_default=True,
+              help="Si el plan tiene más de N notas, requiere --force para aplicar")
+@click.option("--apply", is_flag=True,
+              help="Ejecutar moves. Sin este flag es dry-run (default).")
+@click.option("--force", is_flag=True, help="Bypass del gate de confirmación")
+@click.option("--notify/--no-notify", default=True,
+              help="Push a WhatsApp si ambient está configurado")
+@click.option("--report/--no-report", default=True,
+              help="Escribe reporte a 05-Reviews/YYYY-MM-archive.md")
+@click.option("--plain", is_flag=True, help="Salida plana (src\\tdst por línea)")
+def archive(min_age_days: int, query_window_days: int, folder: str | None,
+            limit: int, gate: int, apply: bool, force: bool,
+            notify: bool, report: bool, plain: bool):
+    """Mover notas muertas a 04-Archive/ preservando la jerarquía PARA.
+
+    Candidatos: los mismos que `rag dead` (0 outlinks + 0 backlinks +
+    no retrieved + age > N + fuera de Inbox/Archive/Reviews). Destino:
+    `04-Archive/<ruta-original>`. Frontmatter stamp archived_at /
+    archived_from / archived_reason para que el move sea reversible.
+
+    Opt-out por nota: frontmatter `archive: never` o `type: moc|index|permanent`.
+
+    Sin --apply: dry-run. Con --apply: aplica si el plan ≤ --gate, si no
+    pide --force. Batch log en ~/.local/share/obsidian-rag/filing_batches/.
+    """
+    col = get_db()
+    candidates = find_dead_notes(
+        col, VAULT_PATH, LOG_PATH,
+        min_age_days=min_age_days,
+        query_window_days=query_window_days,
+    )
+    if folder:
+        prefix = folder.rstrip("/") + "/"
+        candidates = [
+            it for it in candidates
+            if it["path"] == folder or it["path"].startswith(prefix)
+        ]
+    candidates = candidates[:limit]
+
+    if apply:
+        with vault_write_lock("archive"):
+            result = archive_dead_notes(
+                col, VAULT_PATH, candidates,
+                apply=True, force=force, gate=gate,
+            )
+    else:
+        result = archive_dead_notes(
+            col, VAULT_PATH, candidates,
+            apply=False, force=force, gate=gate,
+        )
+
+    _log_archive_event({
+        "cmd": "archive", "min_age_days": min_age_days,
+        "query_window_days": query_window_days, "folder": folder,
+        "dry_run": not apply, "force": force, "gate": gate,
+        "n_candidates": len(candidates),
+        "n_plan": len(result["plan"]),
+        "n_applied": len(result["applied"]),
+        "n_skipped": len(result["skipped"]),
+        "gated": result["gated"],
+        "batch_path": result.get("batch_path"),
+    })
+
+    _render_archive_result(result, apply=apply, plain=plain)
+    if report:
+        report_path = _write_archive_report(result, apply=apply)
+        if report_path and not plain:
+            console.print(
+                f"[dim]Reporte: {report_path.relative_to(VAULT_PATH)}[/dim]"
+            )
+    if notify:
+        _push_archive_notification(result, apply=apply)
+
+
 # ── FOLLOW-UP SCANNER (rag followup) ─────────────────────────────────────────
 # Surfaces "open loops" across the vault — things the user said they'd do /
 # explore — and classifies each as resolved / stale / activo based on whether
@@ -12438,6 +13632,44 @@ def _patterns_plist(rag_bin: str) -> str:
 """
 
 
+def _archive_plist(rag_bin: str) -> str:
+    """Proactive archiver — day 1 of each month at 23:00. Runs with --apply;
+    the gate (>20 plan entries) short-circuits to a dry-run + notification
+    so un-supervised drift can't accidentally move half the vault.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-archive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>archive</string>
+    <string>--apply</string>
+    <string>--notify</string>
+    <string>--report</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key><integer>1</integer>
+    <key>Hour</key><integer>23</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/archive.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/archive.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -12453,6 +13685,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _emergent_plist(rag_bin)),
         ("com.fer.obsidian-rag-patterns", "com.fer.obsidian-rag-patterns.plist",
          _patterns_plist(rag_bin)),
+        ("com.fer.obsidian-rag-archive", "com.fer.obsidian-rag-archive.plist",
+         _archive_plist(rag_bin)),
     ]
 
 
@@ -12502,7 +13736,7 @@ def setup(remove: bool):
     if not remove:
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive}}.{{log,error.log}}[/dim]"
         )
 
 

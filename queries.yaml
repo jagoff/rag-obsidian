@@ -101,6 +101,42 @@ queries:
     expected:
       - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
 
+  # rag-read saved articles (Wikipedia · 2026-04-15) — exercising the
+  # ingestion pipeline. These notes have `type: read` frontmatter and live
+  # in 00-Inbox/. Replace the dated paths if the notes get archived/moved.
+
+  - question: "qué es BEIR como benchmark de RAG"
+    expected:
+      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
+
+  - question: "RAG aplicado a manufactura"
+    expected:
+      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
+
+  - question: "alucinaciones de LLM y cómo mitigarlas"
+    expected:
+      - 00-Inbox/2026-04-15-0204-read-retrieval-augmented-generation-wikipedia.md
+
+  - question: "SBERT arquitectura de red siamesa"
+    expected:
+      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
+
+  - question: "por qué BERT [CLS] funciona mal para sentence embedding"
+    expected:
+      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
+
+  - question: "LangChain transformadores de sentencias para indexar documentos"
+    expected:
+      - 00-Inbox/2026-04-15-0205-read-sentence-embedding-wikipedia.md
+
+  - question: "RankNet LambdaRank ListNet"
+    expected:
+      - 00-Inbox/2026-04-15-0206-read-learning-to-rank-wikipedia.md
+
+  - question: "enfoque pairwise vs listwise en learning to rank"
+    expected:
+      - 00-Inbox/2026-04-15-0206-read-learning-to-rank-wikipedia.md
+
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per

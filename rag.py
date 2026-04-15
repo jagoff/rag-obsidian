@@ -2305,6 +2305,56 @@ SYSTEM_RULES_STRICT = (
     "fragmentos verbatim del contexto antes que reformular.\n"
 )
 
+# Coach mode: las notas del usuario son ESPEJO, no autoridad. El valor está
+# en la pregunta reflexiva al final, no en la respuesta factual. Diferenciado
+# de SYSTEM_RULES/STRICT porque coaching genuino requiere dejar espacio al
+# usuario — respuestas largas o consejos directos apagan la exploración.
+SYSTEM_RULES_COACH = (
+    "Sos un partner de coaching reflexivo conversando con el usuario. Tu "
+    "tarea NO es dar respuestas factuales sobre sus notas — es ayudarlo a "
+    "explorar su pensamiento y emociones usando sus notas como espejo.\n\n"
+    "REGLAS:\n"
+    "1. LAS NOTAS SON ESPEJO: el CONTEXTO son notas del usuario, material "
+    "para reflejar. Podés citar cuando ancla algo que dijo ('en tu nota de "
+    "febrero mencionabas X'). Formato de cita: [Título](ruta.md). No es "
+    "obligatorio citar en cada turno.\n"
+    "2. TONO: cálido, curioso, no-judgmental. Primera persona informal "
+    "rioplatense (voseo). Sin frases cliché ('es importante...', 'recordá "
+    "que...', 'deberías...').\n"
+    "3. FORMATO: respuesta CORTA (2-4 oraciones máximo) + UNA pregunta "
+    "reflexiva al final. La pregunta es el valor — hacés que piense, no "
+    "le resolvés.\n"
+    "4. NO DES consejos no pedidos. NO des opiniones definitivas. Si el "
+    "usuario pide consejo concreto, ofrecé 1-2 opciones neutrales y preguntá "
+    "qué resuena.\n"
+    "5. EMERGENCIA: si detectás señales de crisis (autolesión, violencia, "
+    "abuso agudo), dejá el modo coach, sugerí hablar con profesional "
+    "(línea 135 Argentina, o emergencia médica) y cortá.\n"
+)
+
+# Síntesis al cierre de sesión coach. Genera la nota que queda en 00-Inbox/.
+# Formato estructurado para que sea escaneable y accionable; los checkboxes
+# se integran con `rag followup` y con Obsidian's checkbox plugin.
+COACH_SYNTHESIS_PROMPT = (
+    "Sos un editor reflexivo. El usuario terminó una sesión de coaching. "
+    "Leé la conversación y generá una nota Markdown con esta estructura "
+    "exacta:\n\n"
+    "## Resumen\n"
+    "3-5 oraciones: lo que el usuario vino a explorar, los temas clave que "
+    "surgieron, el estado emocional general.\n\n"
+    "## Insights\n"
+    "3-7 bullets con los insights más importantes. Primera persona del "
+    "usuario ('me di cuenta que...', 'veo que...'). Concretos, no genéricos.\n\n"
+    "## Action items\n"
+    "Checkboxes con pasos concretos que emergen: `- [ ] <acción>`. "
+    "Si no hay acciones claras, omití la sección.\n\n"
+    "## Preguntas pendientes\n"
+    "Los hilos abiertos, también checkboxes: `- [ ] <pregunta>`. "
+    "Si no hay, omití la sección.\n\n"
+    "REGLAS: literal y concreto, no inventes. Si citás notas, "
+    "[Título](ruta.md). Sin disclaimers ni cierres vacíos.\n"
+)
+
 
 def print_query_header(question: str, result: dict, show_question: bool = True) -> None:
     """Render the metadata row (filters, variants, confidence), optionally
@@ -6464,6 +6514,169 @@ def chat(
         print_sources(result)
         render_related(find_related(col, result["metas"]))
         console.print("[dim]› [bold]+[/bold] o [bold]-[/bold] para dar feedback[/dim]")
+
+
+def _coach_turn(question: str, session_id: str) -> tuple[str, dict]:
+    """Un turno de coaching. Retorna (respuesta, sesión actualizada).
+
+    Reusa retrieve() para traer notas del vault como espejo — SYSTEM_RULES_COACH
+    las trata como material para reflejar, no como autoridad. Streamea off:
+    las respuestas coach son cortas (2-4 oraciones + pregunta) y el caller
+    las manda por WA o terminal de una sola vez.
+    """
+    col = get_db()
+    sess = ensure_session(session_id, mode="coach")
+    history = session_history(sess)
+    effective_q = question
+    if history:
+        try:
+            effective_q = reformulate_query(
+                question, history, summary=session_summary(sess)
+            )
+        except Exception:
+            effective_q = question
+    result = retrieve(
+        col, effective_q, RERANK_TOP, folder=None, tag=None,
+        precise=False, multi_query=True, auto_filter=True,
+    )
+    context = "\n\n---\n\n".join(
+        f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
+        for d, m in zip(result["docs"], result["metas"])
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_RULES_COACH},
+        *history,
+        {"role": "user", "content": f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}"},
+    ]
+    resp = ollama.chat(
+        model=resolve_chat_model(),
+        messages=messages,
+        options=CHAT_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    answer = (resp.message.content or "").strip()
+    append_turn(sess, {
+        "q": question,
+        "q_reformulated": effective_q if effective_q != question else None,
+        "a": answer,
+        "paths": [m.get("file", "") for m in result["metas"]],
+        "top_score": result.get("top_score", 0.0),
+    })
+    save_session(sess)
+    return answer, sess
+
+
+def _coach_synthesize(session_id: str) -> tuple[str, Path | None]:
+    """Sintetiza la sesión de coaching en una nota de 00-Inbox/.
+
+    Retorna (markdown, path). Si la sesión no existe o está vacía, (msg, None).
+    """
+    sess = load_session(session_id)
+    if not sess or not sess.get("turns"):
+        return ("sesión vacía o inexistente", None)
+    convo_lines: list[str] = []
+    for i, t in enumerate(sess["turns"], 1):
+        q = (t.get("q") or "").strip()
+        a = (t.get("a") or "").strip()
+        if q:
+            convo_lines.append(f"[turno {i}] Usuario: {q}")
+        if a:
+            convo_lines.append(f"[turno {i}] Coach: {a}")
+    convo = "\n".join(convo_lines)
+    resp = ollama.chat(
+        model=resolve_chat_model(),
+        messages=[
+            {"role": "system", "content": COACH_SYNTHESIS_PROMPT},
+            {"role": "user", "content": f"Conversación:\n\n{convo}"},
+        ],
+        options={**CHAT_OPTIONS, "num_predict": 1024},
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    body = (resp.message.content or "").strip()
+    first_q = sess["turns"][0].get("q", "coach session")
+    title = f"Coach · {first_q[:40]}"
+    note_path = capture_note(
+        body,
+        tags=["coach", "reflexion"],
+        source=f"coach-session:{session_id}",
+        title=title,
+    )
+    try:
+        _index_single_file(get_db(), note_path, skip_contradict=True)
+    except Exception:
+        pass
+    return (body, note_path)
+
+
+@cli.group()
+def coach():
+    """Modo coach reflexivo — conversación + síntesis.
+
+    Flow:
+      rag coach start [--session ID] [--topic T]
+      rag coach ask "texto" --session ID
+      rag coach close --session ID
+    """
+    pass
+
+
+@coach.command("start")
+@click.option("--session", "session_id", default=None,
+              help="ID de sesión (default = nuevo random)")
+@click.option("--topic", default=None,
+              help="Primer turno. Si se omite, la sesión queda abierta esperando el primer ask.")
+@click.option("--plain", is_flag=True, help="Salida plana")
+def coach_start(session_id: str | None, topic: str | None, plain: bool):
+    """Abre una sesión en modo coach."""
+    warmup_async()
+    if topic:
+        answer, sess = _coach_turn(topic, session_id or "")
+        output = f"{sess['id']}\n\n{answer}" if plain else answer
+        if plain:
+            click.echo(output)
+        else:
+            console.print(Panel(answer, title=f"coach · {sess['id']}",
+                                border_style="magenta"))
+    else:
+        sess = ensure_session(session_id, mode="coach")
+        save_session(sess)
+        msg = f"coach session abierta: {sess['id']}"
+        click.echo(msg) if plain else console.print(f"[magenta]{msg}[/magenta]")
+
+
+@coach.command("ask")
+@click.argument("text")
+@click.option("--session", "session_id", required=True)
+@click.option("--plain", is_flag=True)
+def coach_ask(text: str, session_id: str, plain: bool):
+    """Un turno de coach sobre una sesión existente."""
+    warmup_async()
+    answer, _ = _coach_turn(text, session_id)
+    if plain:
+        click.echo(answer)
+    else:
+        console.print(Panel(answer, title=f"coach · {session_id}",
+                            border_style="magenta"))
+
+
+@coach.command("close")
+@click.option("--session", "session_id", required=True)
+@click.option("--plain", is_flag=True)
+def coach_close(session_id: str, plain: bool):
+    """Sintetiza la sesión en una nota de 00-Inbox/ y la indexa."""
+    body, note_path = _coach_synthesize(session_id)
+    if note_path is None:
+        msg = body
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+    rel = str(note_path.relative_to(VAULT_PATH))
+    if plain:
+        click.echo(rel)
+        click.echo("")
+        click.echo(body)
+    else:
+        console.print(Panel(body, title=f"síntesis → {rel}",
+                            border_style="green"))
 
 
 @cli.command()

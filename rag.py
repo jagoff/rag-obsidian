@@ -11792,7 +11792,7 @@ def _collect_morning_evidence(
     inbox.sort(key=lambda r: r["modified"], reverse=True)
 
     weather = _fetch_weather_rain()
-    return {
+    ev = {
         "recent_notes": recent,
         "inbox_pending": inbox,
         "todos": todos,
@@ -11805,6 +11805,11 @@ def _collect_morning_evidence(
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
     }
+    # Dedup: if a vault todo matches an Apple Reminder (Jaccard ≥ 0.6 on
+    # normalized tokens), drop the todo — the reminder is the actionable
+    # source. Prevents "comprar pan" appearing twice in the brief.
+    ev["todos"] = _dedup_todos_vs_reminders(ev["todos"], ev["reminders_due"])
+    return ev
 
 
 def _render_morning_prompt(date_label: str, ev: dict) -> str:
@@ -11939,15 +11944,20 @@ def _generate_morning_narrative(prompt: str) -> str:
 # sin preguntarle al modelo.
 
 
+HEAVY_RAIN_THRESHOLD = 70  # max_chance% at or above → indoor suggestion
+
+
 def _render_morning_agenda_section(ev: dict) -> str:
     """Deterministic render of 📅 Agenda from calendar + reminders + weather.
     Returns "" if there's nothing to show — caller omits the section entirely.
+
+    Weather heuristic: if `max_chance ≥ HEAVY_RAIN_THRESHOLD` we append a
+    short "💡 considerá foco indoor" line below the rain summary. Pure code,
+    no LLM — predictable and cheap.
     """
     bullets: list[str] = []
     for e in ev.get("calendar_today", [])[:10]:
         when = e.get("start") or ""
-        # Stamp from AppleScript looks like "Wednesday, April 15, 2026 ...";
-        # if there's a time component, show just HH:MM for brevity.
         bullets.append(f"- {e.get('title', '(sin título)')} · {when}")
     for r in ev.get("reminders_due", [])[:10]:
         bucket = r.get("bucket") or ""
@@ -11959,9 +11969,77 @@ def _render_morning_agenda_section(ev: dict) -> str:
         w = ev["weather_rain"]
         summary = w.get("summary") or "lluvia pronosticada"
         bullets.append(f"- 🌧 {summary}")
+        # Heavy-rain hint: if ≥70% at any block today, suggest indoor focus.
+        max_chance = int(w.get("max_chance") or 0)
+        if max_chance >= HEAVY_RAIN_THRESHOLD:
+            bullets.append(
+                f"  💡 lluvia fuerte ({max_chance}%) — "
+                "priorizá trabajo indoor y evitá compromisos outdoor."
+            )
     if not bullets:
         return ""
     return "## 📅 Hoy en la agenda\n" + "\n".join(bullets)
+
+
+# ── Dedup todos-del-vault vs reminders-de-Apple ─────────────────────────────
+# Si tengo una nota con `todo: "comprar pan"` Y un Apple Reminder "comprar
+# pan", el brief los listaba duplicados — ruido. Drop el del vault (el
+# reminder ya es la fuente actionable con due y notificación). Jaccard
+# sobre tokens normalizados (≥3 chars, acentos foldeados).
+
+_TASK_DEDUP_JACCARD = 0.6
+
+
+def _normalize_task_text(s: str) -> str:
+    if not s:
+        return ""
+    n = unicodedata.normalize("NFD", s.lower())
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    n = re.sub(r"[^\w\s]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def _task_tokens(s: str) -> set[str]:
+    return {t for t in _normalize_task_text(s).split() if len(t) >= 3}
+
+
+def _task_text_from_todo(t: dict) -> str:
+    """Best-effort task string from a todo entry. `todo` can be a string,
+    a list of strings, or None; fall back to the note title."""
+    v = t.get("todo")
+    if isinstance(v, list):
+        return " ".join(str(x) for x in v if x)
+    if v:
+        return str(v)
+    return str(t.get("title") or "")
+
+
+def _dedup_todos_vs_reminders(
+    todos: list[dict], reminders: list[dict],
+    threshold: float = _TASK_DEDUP_JACCARD,
+) -> list[dict]:
+    """Remove todos whose task text overlaps (Jaccard ≥ threshold) with any
+    reminder name. Returns a new list — does not mutate input. Pure.
+    """
+    if not todos or not reminders:
+        return todos
+    rem_tokens = [_task_tokens(r.get("name", "")) for r in reminders]
+    rem_tokens = [t for t in rem_tokens if t]
+    if not rem_tokens:
+        return todos
+    out: list[dict] = []
+    for t in todos:
+        tokens = _task_tokens(_task_text_from_todo(t))
+        if not tokens:
+            out.append(t)
+            continue
+        if any(
+            len(tokens & rt) / len(tokens | rt) >= threshold
+            for rt in rem_tokens
+        ):
+            continue  # dup with a reminder — drop from todos
+        out.append(t)
+    return out
 
 
 def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:

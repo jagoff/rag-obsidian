@@ -63,6 +63,121 @@ def test_agenda_caps_long_lists():
     assert out.count("- ") <= 10
 
 
+def test_agenda_heavy_rain_triggers_indoor_hint():
+    ev = {"weather_rain": {"summary": "100% a las 18h", "max_chance": 100}}
+    out = rag._render_morning_agenda_section(ev)
+    assert "💡" in out
+    assert "indoor" in out.lower()
+
+
+def test_agenda_light_rain_no_hint():
+    ev = {"weather_rain": {"summary": "40% posible", "max_chance": 40}}
+    out = rag._render_morning_agenda_section(ev)
+    assert "💡" not in out
+
+
+def test_agenda_rain_no_max_chance_no_hint():
+    # Some wttr.in payloads only give `summary`, no max_chance (or 0).
+    ev = {"weather_rain": {"summary": "llovizna"}}
+    out = rag._render_morning_agenda_section(ev)
+    assert "💡" not in out
+
+
+# ── _dedup_todos_vs_reminders ───────────────────────────────────────────────
+
+
+def test_dedup_exact_match_drops_todo():
+    todos = [{"title": "Shopping", "todo": "comprar pan"}]
+    reminders = [{"name": "Comprar pan"}]
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert out == []
+
+
+def test_dedup_accent_fold():
+    todos = [{"todo": "pagar alquiler"}]
+    reminders = [{"name": "Pagar Alquiler"}]
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert out == []
+
+
+def test_dedup_substring_above_threshold():
+    todos = [{"todo": "comprar pan"}]
+    reminders = [{"name": "comprar pan en Coto"}]
+    # tokens: {comprar, pan} vs {comprar, pan, coto} → 2/3 ≥ 0.6
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert out == []
+
+
+def test_dedup_preserves_unrelated():
+    todos = [{"todo": "revisar PR"}, {"todo": "comprar pan"}]
+    reminders = [{"name": "comprar pan"}]
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert len(out) == 1
+    assert out[0]["todo"] == "revisar PR"
+
+
+def test_dedup_handles_list_todo_value():
+    todos = [{"todo": ["comprar", "pan"]}]
+    reminders = [{"name": "comprar pan"}]
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert out == []
+
+
+def test_dedup_empty_inputs_noop():
+    assert rag._dedup_todos_vs_reminders([], [{"name": "x"}]) == []
+    todos = [{"todo": "x"}]
+    assert rag._dedup_todos_vs_reminders(todos, []) == todos
+
+
+def test_dedup_short_tokens_keep_todo():
+    # Very short words (<3 chars) don't contribute to tokens → treated as
+    # non-comparable → todo kept.
+    todos = [{"todo": "ir a X"}]
+    reminders = [{"name": "Y"}]
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert out == todos
+
+
+def test_dedup_threshold_below_cut():
+    # 1/3 tokens overlap = 0.33, below 0.6 → keep.
+    todos = [{"todo": "comprar queso y vino"}]
+    reminders = [{"name": "comprar pan"}]
+    # tokens todo: {comprar, queso, vino}; rem: {comprar, pan}
+    # jaccard = 1 / 4 = 0.25
+    out = rag._dedup_todos_vs_reminders(todos, reminders)
+    assert len(out) == 1
+
+
+# ── _collect_morning_evidence wires dedup ────────────────────────────────────
+
+def test_collect_morning_wires_dedup(monkeypatch, tmp_path):
+    # Smoke-test: pass evidence through and verify dedup fires. We don't exercise
+    # the full scanner — just stub the expensive fetches and inspect output.
+    monkeypatch.setattr(rag, "_fetch_weather_rain", lambda *a, **kw: None)
+    monkeypatch.setattr(rag, "_fetch_calendar_today", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        rag, "_fetch_reminders_due",
+        lambda *a, **kw: [{"name": "comprar pan", "bucket": "hoy", "due": "", "list": "R"}],
+    )
+    monkeypatch.setattr(rag, "_fetch_mail_unread", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_whatsapp_unread", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_recent_queries", lambda *a, **kw: [])
+    # Prepare a vault with one note carrying a todo that matches the reminder.
+    vault = tmp_path / "vault"
+    (vault / "02-Areas").mkdir(parents=True)
+    (vault / "02-Areas" / "shopping.md").write_text(
+        "---\ntitle: Shopping\ntodo: comprar pan\n---\n\nbody\n"
+    )
+    ev = rag._collect_morning_evidence(
+        rag.datetime.now(), vault, tmp_path / "q.jsonl",
+        tmp_path / "c.jsonl", lookback_hours=48,
+    )
+    # The vault todo "comprar pan" should have been dropped because the
+    # reminder has the same task text.
+    texts = [(t.get("todo") or "") for t in ev["todos"]]
+    assert "comprar pan" not in texts
+
+
 # ── _yesterday_evening_link ─────────────────────────────────────────────────
 
 

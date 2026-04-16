@@ -11292,6 +11292,30 @@ return _out
 '''
 
 
+# Completed reminders — para cruzar con open loops del vault (rag followup).
+# Mismo shape que `_REMINDERS_SCRIPT` (name|date|list) pero filtra por
+# `completed is true` y emite `completion date` en vez de `due date`.
+_COMPLETED_REMINDERS_SCRIPT = '''
+set _out to ""
+tell application "Reminders"
+  repeat with _list in lists
+    try
+      set _done to (reminders of _list whose completed is true)
+      repeat with _r in _done
+        try
+          set _comp to completion date of _r
+          if _comp is not missing value then
+            set _out to _out & (name of _r) & "|" & (_comp as string) & "|" & (name of _list) & linefeed
+          end if
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+return _out
+'''
+
+
 # Use Mail's unified `inbox` alias — single query across all accounts, ~0.5s.
 # Previous per-account iteration was 10-20× slower and still missed Gmail
 # (no dedicated INBOX mailbox — Gmail uses labels).
@@ -11447,6 +11471,48 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
         })
     order = {"overdue": 0, "today": 1, "upcoming": 2}
     items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
+    return items[:max_items]
+
+
+def _fetch_completed_reminders(
+    now: datetime, days: int = 30, max_items: int = 200,
+) -> list[dict]:
+    """Completed Apple Reminders in the last `days`. Used by `rag followup`
+    to cross-resolve open loops in the vault against tasks already checked
+    off in Reminders.app — if you closed "comprar pan" there, the vault's
+    checkbox "comprar pan" is implicitly resolved.
+
+    Silent-fail: `_apple_enabled()=False` or osascript empty → []. Same
+    contract as `_fetch_reminders_due`. Shape: `[{name, completed_date,
+    list}]` sorted newest-first.
+    """
+    if not _apple_enabled():
+        return []
+    out = _osascript(_COMPLETED_REMINDERS_SCRIPT, timeout=60.0)
+    if not out:
+        return []
+    cutoff = now - timedelta(days=days)
+    items: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        comp_raw = parts[1].strip()
+        list_name = parts[2].strip() if len(parts) > 2 else ""
+        if not name:
+            continue
+        comp_dt = _parse_applescript_date(comp_raw)
+        if comp_dt is None:
+            continue
+        if comp_dt < cutoff:
+            continue
+        items.append({
+            "name": name,
+            "completed_date": comp_dt.isoformat(timespec="minutes"),
+            "list": list_name,
+        })
+    items.sort(key=lambda r: r["completed_date"], reverse=True)
     return items[:max_items]
 
 
@@ -12307,6 +12373,38 @@ def _dedup_todos_vs_reminders(
             continue  # dup with a reminder — drop from todos
         out.append(t)
     return out
+
+
+def _match_loop_to_completed_reminder(
+    loop_text: str,
+    completed: list[dict],
+    threshold: float = _TASK_DEDUP_JACCARD,
+) -> dict | None:
+    """Return the completed reminder (or None) whose `name` matches `loop_text`
+    at Jaccard ≥ `threshold` over normalized tokens (≥3 chars, accent-folded).
+
+    Picks the best match when multiple qualify — highest overlap wins. Pure.
+    Deterministic across reruns: newest-first stable sort from upstream
+    `_fetch_completed_reminders` breaks score ties toward the more recent
+    closure (which is usually the one the user meant).
+    """
+    if not loop_text or not completed:
+        return None
+    loop_tokens = _task_tokens(loop_text)
+    if not loop_tokens:
+        return None
+    best: tuple[float, dict] | None = None
+    for rem in completed:
+        name = rem.get("name") or ""
+        rt = _task_tokens(name)
+        if not rt:
+            continue
+        j = len(loop_tokens & rt) / len(loop_tokens | rt)
+        if j < threshold:
+            continue
+        if best is None or j > best[0]:
+            best = (j, rem)
+    return best[1] if best else None
 
 
 def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
@@ -13755,10 +13853,17 @@ def _classify_followup_loop(
     stale_days: int = FOLLOWUP_STALE_DAYS,
     min_score: float = FOLLOWUP_RESOLVE_MIN_SCORE,
     judge_fn=None,
+    completed_reminders: list[dict] | None = None,
 ) -> dict:
     """Run resolution check + classification. Returns the loop dict enriched
     with `status`, `age_days`, and optionally `resolution_path`/`reason`.
     Status is one of: resolved | stale | activo.
+
+    Fast path: si `completed_reminders` incluye un nombre que matchea el
+    loop por Jaccard (token overlap ≥ 0.6), marcamos resolved inmediatamente
+    con reason "reminder completado <date>" y saltamos la vuelta por
+    retrieve + LLM judge. Ahorra un call por loop cuando el cierre vivió
+    en Apple Reminders en vez del vault.
     """
     judge = judge_fn or _followup_judge
     try:
@@ -13771,6 +13876,21 @@ def _classify_followup_loop(
     out["status"] = "stale" if age_days > stale_days else "activo"
     out["resolution_path"] = None
     out["reason"] = None
+    out["resolved_by"] = None
+
+    # Fast path: ¿la completaste en Apple Reminders?
+    if completed_reminders:
+        match = _match_loop_to_completed_reminder(
+            loop.get("loop_text", ""), completed_reminders,
+        )
+        if match is not None:
+            comp_date = str(match.get("completed_date", ""))[:10]
+            list_name = match.get("list", "")
+            out["status"] = "resolved"
+            out["resolution_path"] = f"(Apple Reminders · {list_name})" if list_name else "(Apple Reminders)"
+            out["reason"] = f"reminder completado {comp_date}" if comp_date else "reminder completado"
+            out["resolved_by"] = "reminder"
+            return out
 
     try:
         result = retrieve(
@@ -13817,6 +13937,7 @@ def _classify_followup_loop(
         out["status"] = "resolved"
         out["resolution_path"] = top_meta.get("file", "")
         out["reason"] = reason
+        out["resolved_by"] = "note"
     return out
 
 
@@ -13828,10 +13949,17 @@ def find_followup_loops(
     min_score: float = FOLLOWUP_RESOLVE_MIN_SCORE,
     now: datetime | None = None,
     judge_fn=None,
+    completed_reminders: list[dict] | None = None,
 ) -> list[dict]:
     """Walk the vault for notes modified in the last `days`, extract every
     open loop, and classify each. Returns a list sorted stale→activo→resolved,
-    oldest-first within each group."""
+    oldest-first within each group.
+
+    `completed_reminders` opcional: si viene una lista (shape
+    `_fetch_completed_reminders`), el classifier prioriza matches Jaccard
+    contra ellas antes de caer al retrieval + LLM judge. None → fetch
+    automático con ventana = `days`.
+    """
     from datetime import timedelta as _td
     now = now or datetime.now()
     start = now - _td(days=days)
@@ -13859,10 +13987,18 @@ def find_followup_loops(
         extracted_ts = _note_created_ts(raw, mtime)
         all_loops.extend(_extract_followup_loops(raw, rel, extracted_ts))
 
+    # One osascript call para toda la corrida — evita N calls en
+    # `_classify_followup_loop`. Ventana de reminders = ventana de loops
+    # porque no tiene sentido matchear un loop de hoy contra una reminder
+    # completada hace 6 meses.
+    if completed_reminders is None:
+        completed_reminders = _fetch_completed_reminders(now, days=days)
+
     classified = [
         _classify_followup_loop(
             col, loop, now,
             stale_days=stale_days, min_score=min_score, judge_fn=judge_fn,
+            completed_reminders=completed_reminders,
         )
         for loop in all_loops
     ]
@@ -13943,12 +14079,20 @@ def followup(days: int, status: str | None, as_json: bool, plain: bool,
         if group == "resolved":
             for it in group_items[:10]:
                 line = Text()
-                line.append("  ✓ ", style="green")
+                by = it.get("resolved_by")
+                if by == "reminder":
+                    line.append("  ✓ reminder: ", style="bold green")
+                else:
+                    line.append("  ✓ ", style="green")
                 line.append(it["loop_text"][:80], style="dim")
                 line.append("  ← ", style="dim")
                 rpath = it.get("resolution_path") or ""
                 if rpath:
-                    line.append(rpath, style=_file_link_style(rpath, "cyan"))
+                    # Reminders no son paths — no darles file-link estilizado.
+                    if by == "reminder":
+                        line.append(rpath, style="green dim")
+                    else:
+                        line.append(rpath, style=_file_link_style(rpath, "cyan"))
                 console.print(line)
             if len(group_items) > 10:
                 console.print(f"  [dim]… y {len(group_items) - 10} más[/dim]")

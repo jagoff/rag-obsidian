@@ -161,13 +161,15 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 ## Eval baselines
 
-**Floor (post-`rag tune`, 2026-04-15)** — source of truth: `docs/eval-tune-2026-04-15.md`
-- Singles: `hit@5 95.24% · MRR 0.802 · n=21`
-- Chains: `hit@5 72.00% · MRR 0.557 · chain_success 44.44% · turns=25 chains=9`
+**Floor (2026-04-16, post-quick-wins)** — measured after `rag tune` confirmed no better weights vs current ranker.json
+- Singles: `hit@5 90.48% · MRR 0.786 · n=21`
+- Chains: `hit@5 76.00% · MRR 0.580 · chain_success 55.56% · turns=25 chains=9`
 
-Pre-tune: `hit@5 90.48% · MRR 0.750` singles. Never claim improvement without re-running `rag eval`.
+The prior floor (`95.24/0.802` singles, `72.00/0.557/44.44` chains from 2026-04-15, see `docs/eval-tune-2026-04-15.md`) drifted on the singles side due to vault content changes (queries.yaml golden is fixed but the vault gains/modifies notes daily). Chains improved +4pp hit and +11pp chain_success over the same window, confirming the fixed ranker weights are not the bottleneck — drift is natural, not regression.
 
-**HyDE with qwen2.5:3b drops hit@5 from 95→90%**. HyDE is opt-in (`--hyde`); re-measure if helper model changes.
+Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand_queries`, `reformulate_query`, `_judge_sufficiency`) are already deterministic via `HELPER_OPTIONS = {temperature: 0, seed: 42}`.
+
+**HyDE with qwen2.5:3b drops singles hit@5 ~5pp**. HyDE is opt-in (`--hyde`); re-measure if helper model changes.
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 

@@ -33,6 +33,14 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
         rag, "_index_single_file",
         lambda *a, **kw: "skipped",
     )
+    # Stub osascript + helper LLM by default so no test accidentally hits
+    # Reminders.app or Ollama. `find_followup_loops` auto-fetches completed
+    # reminders when `completed_reminders is None`, and `_classify_followup_loop`
+    # falls back to `_followup_judge` (Ollama) when `judge_fn is None`. Both
+    # took 20-55s per hit in the full-suite audit (2026-04-16). Individual
+    # tests that want real-ish judge behaviour still pass `judge_fn=...`.
+    monkeypatch.setattr(rag, "_fetch_completed_reminders", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_followup_judge", lambda *a, **kw: (False, ""))
     rag._invalidate_corpus_cache()
     return vault, col
 

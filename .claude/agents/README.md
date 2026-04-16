@@ -6,11 +6,15 @@ Agents especializados por dominio. Claude Code los detecta automáticamente al b
 
 | Agent | Responsabilidad | Zona en `rag.py` (aprox) |
 |-------|-----------------|--------------------------|
+| `pm` | Planifica y rutea — descompone tareas grandes, asigna a specialists, detecta overlaps con peers. No edita código. | N/A |
+| `developer` | Generalista — refactors cross-cutting, nuevos subcommands CLI, tests, `mcp_server.py`, `pyproject.toml`, launchd plists | spread |
 | `rag-retrieval` | Retrieve pipeline, HyDE, rerank, corpus cache, scoring | `retrieve()` + helpers |
 | `rag-brief-curator` | Morning / today / digest briefs, evidence rendering | ~12900–13950 |
 | `rag-ingestion` | `rag read` (incl. YouTube), capture, wikilinks, inbox triage, prep | ~11665–12100 |
 | `rag-vault-health` | Archive, dead, followup, contradictions, dupes, maintenance | spread |
 | `rag-integrations` | Apple Mail/Reminders/Calendar, Gmail API, WhatsApp, weather, ambient | ~12100–12700 |
+
+Para tareas ambiciosas o cross-dominio, arrancar por `pm`: devuelve un plan de dispatch que el caller ejecuta.
 
 ## Por qué existen
 

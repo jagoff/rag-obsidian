@@ -3489,11 +3489,14 @@ def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
 def _note_centroids(
     col: chromadb.Collection,
     folder: str | None = None,
+    skip_folders: tuple[str, ...] = (),
 ) -> tuple[list[str], list[dict], "np.ndarray"]:
     """Group all chunks by file, average the embeddings, L2-normalise.
 
     Returns (file_paths, first_meta_per_file, centroids_matrix). Files with
-    zero chunks (shouldn't happen) are skipped silently.
+    zero chunks (shouldn't happen) are skipped silently. `skip_folders` is
+    a tuple of path prefixes to exclude (e.g. `("04-Archive/",)` so dupes
+    don't pair a live note with its archived copy).
     """
     import numpy as np
     data = col.get(include=["embeddings", "metadatas"])
@@ -3503,6 +3506,8 @@ def _note_centroids(
         if not f:
             continue
         if folder and not (f == folder or f.startswith(folder.rstrip("/") + "/")):
+            continue
+        if any(f == p.rstrip("/") or f.startswith(p) for p in skip_folders):
             continue
         if f not in by_file:
             by_file[f] = {"embeds": [], "meta": meta}
@@ -3532,10 +3537,12 @@ def find_duplicate_notes(
     Returns descending-by-similarity list of
     {a_path, a_note, b_path, b_note, similarity, snippet_a, snippet_b}.
     The snippets are the first ~200 chars of each note's body for at-a-glance
-    comparison in the renderer.
+    comparison in the renderer. `04-Archive/` is excluded by default because
+    archived notes keep their content and surface as near-duplicates of their
+    pre-archive originals — noise on every run otherwise.
     """
     import numpy as np
-    files, metas, arr = _note_centroids(col, folder)
+    files, metas, arr = _note_centroids(col, folder, skip_folders=("04-Archive/",))
     if len(files) < 2:
         return []
     sims = arr @ arr.T
@@ -5334,7 +5341,10 @@ def deep_retrieve(
     all_docs = list(result["docs"])
     all_metas = list(result["metas"])
     all_scores = list(result["scores"])
+    all_graph_docs = list(result.get("graph_docs", []))
+    all_graph_metas = list(result.get("graph_metas", []))
     seen_chunks = {m.get("file", "") + "::" + d[:50] for d, m in zip(all_docs, all_metas)}
+    seen_graph = {gm.get("file", "") for gm in all_graph_metas if gm.get("file")}
 
     for iteration in range(1, _DEEP_MAX_ITERS):
         sufficient, sub_query = _judge_sufficiency(question, all_docs, all_metas)
@@ -5357,6 +5367,20 @@ def deep_retrieve(
                 all_metas.append(m)
                 all_scores.append(s)
                 added += 1
+        # Merge sub-pass graph neighbors, dedup by file path. Without this
+        # the graph context served to the LLM reflects only the first-pass
+        # top-3; deep-retrieve queries (triggered on low-confidence first
+        # passes) then miss graph signal from the very chunks that lifted
+        # them out of the confidence floor.
+        for gd, gm in zip(
+            sub_result.get("graph_docs", []),
+            sub_result.get("graph_metas", []),
+        ):
+            gf = gm.get("file", "")
+            if gf and gf not in seen_graph:
+                seen_graph.add(gf)
+                all_graph_docs.append(gd)
+                all_graph_metas.append(gm)
         if added == 0:
             break  # sub-query didn't surface anything new
 
@@ -5370,6 +5394,8 @@ def deep_retrieve(
     result["metas"] = [m for _, m, _ in combined]
     result["scores"] = [s for _, _, s in combined]
     result["confidence"] = result["scores"][0] if result["scores"] else float("-inf")
+    result["graph_docs"] = all_graph_docs
+    result["graph_metas"] = all_graph_metas
     return result
 
 
@@ -13001,12 +13027,14 @@ def _fetch_recent_queries(
 
 # ── Weather (only if rain) ──────────────────────────────────────────────────
 WEATHER_LOCATION = "Santa+Fe,Argentina"
+WEATHER_RAIN_THRESHOLD = 70  # contract in repo CLAUDE.md: hint only if rain ≥70%
 
 
 def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
     """Query wttr.in. Returns a summary dict ONLY if rain is in the forecast
-    for today (chance>=40% in any upcoming 3h block, or current condition is
-    raining). Returns ``None`` otherwise. Silent on any network error.
+    for today (chance ≥ WEATHER_RAIN_THRESHOLD in any upcoming 3h block, or
+    current condition is raining). Returns ``None`` otherwise. Silent on any
+    network error.
     """
     import urllib.request as _req
     url = f"https://wttr.in/{location}?format=j1"
@@ -13060,7 +13088,7 @@ def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
         except Exception:
             continue
         chance = max(chance_rain, chance_thunder)
-        if chance >= 40:
+        if chance >= WEATHER_RAIN_THRESHOLD:
             hh = block_minutes // 60
             rain_blocks.append({"hour": hh, "chance": chance})
             if chance > max_chance:
@@ -14857,12 +14885,20 @@ def _is_archive_opt_out(raw: str) -> bool:
     """True if the note frontmatter opts out of archiving via `archive: never`
     or `type: moc|index|permanent`. Permanent-knowledge notes (MOCs, indexes,
     evergreen references) shouldn't die just for lacking edits.
+
+    `type:` may be a scalar (`type: moc`) or a list (`type: [moc, reference]`).
+    Both forms are honored — list form was silently unmatched before because
+    stringifying the list yielded `"['moc', 'reference']"`.
     """
     fm = parse_frontmatter(raw)
     if str(fm.get("archive", "")).strip().lower() == "never":
         return True
-    t = str(fm.get("type", "")).strip().lower()
-    return t in _ARCHIVE_OPT_OUT_TYPES
+    raw_type = fm.get("type")
+    if isinstance(raw_type, list):
+        types = [str(x).strip().lower() for x in raw_type]
+    else:
+        types = [str(raw_type or "").strip().lower()]
+    return any(t in _ARCHIVE_OPT_OUT_TYPES for t in types)
 
 
 def _archive_stamp_frontmatter(raw: str, orig_rel: str,
@@ -15403,9 +15439,14 @@ def _extract_followup_loops(
 
 
 def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
-    """Ask the helper LLM whether `candidate_snippet` constitutes evidence
+    """Ask the chat LLM whether `candidate_snippet` constitutes evidence
     that `loop_text` was followed through. Strict JSON, bias toward "no".
-    Returns (resolved, reason). Any parse failure collapses to (False, "")."""
+    Returns (resolved, reason). Any parse failure collapses to (False, "").
+
+    Uses the chat model (not qwen2.5:3b). The helper proved non-deterministic
+    and emitted malformed JSON on judgment tasks — same failure mode as the
+    contradiction detector, which is also chat-model-only.
+    """
     prompt = (
         "Eres un juez conservador. Dada una tarea/pendiente y un fragmento de "
         "una nota POSTERIOR, decidí si el fragmento evidencia que la tarea fue "
@@ -15416,7 +15457,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
     )
     try:
         resp = ollama.chat(
-            model=HELPER_MODEL,
+            model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "seed": 42, "num_ctx": 2048, "num_predict": 128},
             keep_alive=OLLAMA_KEEP_ALIVE,

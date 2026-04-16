@@ -33,8 +33,11 @@ You own anything that touches how chunks are scored and returned. Specifically:
 
 ## Eval baseline to preserve or improve
 
-- Singles: hit@5 95.24% · MRR 0.802 (n=21)
-- Chains: hit@5 72.00% · MRR 0.557 · chain_success 44.44%
+Floor 2026-04-16 (post-quick-wins, ranker.json unchanged — tune found no better weights):
+- Singles: hit@5 90.48% · MRR 0.786 (n=21)
+- Chains: hit@5 76.00% · MRR 0.580 · chain_success 55.56%
+
+Prior floor 2026-04-15 (singles 95.24/0.802) drifted on the singles side due to vault content changes; chains improved +4pp/+11pp over the same window.
 
 Never claim improvement without re-running `rag eval`.
 

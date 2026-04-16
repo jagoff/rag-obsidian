@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -29,9 +30,12 @@ from rag import (  # noqa: E402
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
     SYSTEM_RULES,
+    _load_corpus,
     _load_vaults_config,
     append_turn,
     ensure_session,
+    get_db,
+    get_pagerank,
     log_query_event,
     multi_retrieve,
     new_turn_id,
@@ -221,6 +225,318 @@ def chat(req: ChatRequest) -> StreamingResponse:
         })
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/dashboard")
+def dashboard_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "dashboard.html")
+
+
+@app.get("/api/dashboard")
+def dashboard_api(days: int = 30) -> dict:
+    """Aggregate all JSONL logs into dashboard metrics."""
+    import statistics
+    from collections import defaultdict
+
+    data_dir = Path.home() / ".local/share/obsidian-rag"
+    cutoff = datetime.now() - timedelta(days=days)
+
+    def _read_jsonl(path: Path) -> list[dict]:
+        if not path.is_file():
+            return []
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+        return out
+
+    def _ts(e: dict) -> datetime | None:
+        raw = e.get("ts") or e.get("timestamp")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return None
+
+    def _pct(values: list[float], p: float) -> float:
+        if not values:
+            return 0.0
+        s = sorted(values)
+        idx = int(len(s) * p / 100)
+        return round(s[min(idx, len(s) - 1)], 3)
+
+    # ── Queries ──────────────────────────────────────────────────────
+    all_queries = _read_jsonl(data_dir / "queries.jsonl")
+    queries = [e for e in all_queries if (t := _ts(e)) and t >= cutoff]
+
+    scores = [float(e["top_score"]) for e in queries if isinstance(e.get("top_score"), (int, float))]
+    t_retrieves = [float(e["t_retrieve"]) for e in queries if isinstance(e.get("t_retrieve"), (int, float))]
+    t_gens = [float(e["t_gen"]) for e in queries if isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0]
+    t_totals = [
+        float(e["t_retrieve"]) + float(e["t_gen"])
+        for e in queries
+        if isinstance(e.get("t_retrieve"), (int, float)) and isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0
+    ]
+
+    # Per-day counts
+    queries_per_day: dict[str, int] = defaultdict(int)
+    latency_per_day: dict[str, list[float]] = defaultdict(list)
+    for e in queries:
+        t = _ts(e)
+        if t:
+            day = t.strftime("%Y-%m-%d")
+            queries_per_day[day] += 1
+            tr = e.get("t_retrieve")
+            tg = e.get("t_gen")
+            if isinstance(tr, (int, float)) and isinstance(tg, (int, float)) and tg > 0:
+                latency_per_day[day].append(float(tr) + float(tg))
+
+    # Hourly heatmap
+    hours = defaultdict(int)
+    for e in queries:
+        t = _ts(e)
+        if t:
+            hours[t.hour] += 1
+
+    # Command breakdown
+    cmds = defaultdict(int)
+    for e in queries:
+        cmds[e.get("cmd", "?")] += 1
+
+    # Source breakdown (wa: sessions vs web vs cli)
+    sources = defaultdict(int)
+    for e in queries:
+        sid = e.get("session") or ""
+        if sid.startswith("wa:"):
+            sources["whatsapp"] += 1
+        elif sid.startswith("web:"):
+            sources["web"] += 1
+        elif sid.startswith("tg:"):
+            sources["telegram"] += 1
+        else:
+            sources["cli"] += 1
+
+    # Score distribution (10 buckets)
+    score_buckets = [0] * 10
+    for s in scores:
+        idx = min(int(max(0.0, min(s, 1.0)) * 10), 9)
+        score_buckets[idx] += 1
+
+    # Hot topics
+    topics: dict[str, int] = defaultdict(int)
+    for e in queries:
+        q = e.get("q", "")
+        if q:
+            words = q.lower().split()[:3]
+            topics[" ".join(words)] += 1
+    hot_topics = sorted(topics.items(), key=lambda x: -x[1])[:15]
+
+    # Latency time series (daily p50)
+    latency_ts = {}
+    for day, vals in sorted(latency_per_day.items()):
+        latency_ts[day] = {
+            "p50": round(statistics.median(vals), 2) if vals else 0,
+            "p95": _pct(vals, 95),
+            "count": len(vals),
+        }
+
+    # ── Health metrics ───────────────────────────────────────────────
+    # Only count queries that actually go through retrieval (have scores)
+    retrieval_queries = [e for e in queries if isinstance(e.get("top_score"), (int, float)) and e.get("cmd") in ("query", "chat", "web", None)]
+    n_retrieval = len(retrieval_queries)
+
+    gated = sum(1 for e in queries if e.get("gated_low_confidence"))
+    gate_rate = round(gated / n_retrieval * 100, 1) if n_retrieval else 0
+
+    bad_citation_queries = sum(1 for e in queries if e.get("bad_citations"))
+    bad_citation_rate = round(bad_citation_queries / n_retrieval * 100, 1) if n_retrieval else 0
+    bad_citation_total = sum(len(e.get("bad_citations", [])) for e in queries)
+
+    # Score quality bands
+    retrieval_scores = [float(e["top_score"]) for e in retrieval_queries if isinstance(e.get("top_score"), (int, float))]
+    n_scored = len(retrieval_scores)
+    score_high = sum(1 for s in retrieval_scores if s >= 0.3)     # strong match
+    score_mid = sum(1 for s in retrieval_scores if 0.05 <= s < 0.3)  # acceptable
+    score_low = sum(1 for s in retrieval_scores if s < 0.05)      # weak/miss
+
+    # Score trend per day (daily mean)
+    score_per_day: dict[str, list[float]] = defaultdict(list)
+    for e in retrieval_queries:
+        t = _ts(e)
+        s = e.get("top_score")
+        if t and isinstance(s, (int, float)):
+            score_per_day[t.strftime("%Y-%m-%d")].append(float(s))
+    score_trend = {
+        day: round(statistics.mean(vals), 3)
+        for day, vals in sorted(score_per_day.items())
+    }
+
+    # Latency ratio (retrieve vs generate dominance)
+    avg_ret = statistics.mean(t_retrieves) if t_retrieves else 0
+    avg_gen = statistics.mean(t_gens) if t_gens else 0
+    retrieve_pct = round(avg_ret / (avg_ret + avg_gen) * 100, 1) if (avg_ret + avg_gen) > 0 else 0
+
+    # Answer length trend (is the LLM being verbose or terse?)
+    answer_lens = [e["answer_len"] for e in queries if isinstance(e.get("answer_len"), (int, float)) and e["answer_len"] > 0]
+    avg_answer_len = round(statistics.mean(answer_lens)) if answer_lens else 0
+
+    health = {
+        "retrieval_queries": n_retrieval,
+        "gate_rate": gate_rate,
+        "gated_count": gated,
+        "bad_citation_rate": bad_citation_rate,
+        "bad_citation_queries": bad_citation_queries,
+        "bad_citation_total": bad_citation_total,
+        "score_high": score_high,
+        "score_mid": score_mid,
+        "score_low": score_low,
+        "score_high_pct": round(score_high / n_scored * 100, 1) if n_scored else 0,
+        "score_mid_pct": round(score_mid / n_scored * 100, 1) if n_scored else 0,
+        "score_low_pct": round(score_low / n_scored * 100, 1) if n_scored else 0,
+        "score_trend": score_trend,
+        "retrieve_pct": retrieve_pct,
+        "generate_pct": round(100 - retrieve_pct, 1),
+        "avg_answer_len": avg_answer_len,
+    }
+
+    # ── Feedback ─────────────────────────────────────────────────────
+    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
+    fb_pos = sum(1 for e in fb_entries if e.get("rating") == 1)
+    fb_neg = sum(1 for e in fb_entries if e.get("rating") == -1)
+
+    # ── Ambient ──────────────────────────────────────────────────────
+    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
+    ambient_recent = [e for e in ambient_entries if (t := _ts(e)) and t >= cutoff]
+    ambient_wikilinks = sum(e.get("wikilinks_applied", 0) for e in ambient_recent)
+    ambient_per_day: dict[str, int] = defaultdict(int)
+    for e in ambient_recent:
+        t = _ts(e)
+        if t:
+            ambient_per_day[t.strftime("%Y-%m-%d")] += 1
+
+    # ── Contradictions ───────────────────────────────────────────────
+    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
+    contra_recent = [e for e in contra_entries if (t := _ts(e)) and t >= cutoff]
+    contra_found = [e for e in contra_recent if e.get("contradicts") and not e.get("skipped")]
+    contra_per_day: dict[str, int] = defaultdict(int)
+    for e in contra_found:
+        t = _ts(e)
+        if t:
+            contra_per_day[t.strftime("%Y-%m-%d")] += 1
+
+    # ── Surface ──────────────────────────────────────────────────────
+    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
+    surface_pairs = [e for e in surface_entries if e.get("cmd") == "surface_pair"]
+    surface_runs = [e for e in surface_entries if e.get("cmd") == "surface_run"]
+
+    # ── Filing ───────────────────────────────────────────────────────
+    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
+    filing_recent = [e for e in filing_entries if (t := _ts(e)) and t >= cutoff]
+
+    # ── Tune ─────────────────────────────────────────────────────────
+    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
+    tune_history = []
+    for e in tune_entries:
+        t = _ts(e)
+        tune_history.append({
+            "ts": e.get("ts"),
+            "samples": e.get("samples"),
+            "baseline_hit": e.get("baseline", {}).get("hit"),
+            "baseline_mrr": e.get("baseline", {}).get("mrr"),
+            "best_hit": e.get("best", {}).get("hit"),
+            "best_mrr": e.get("best", {}).get("mrr"),
+            "delta": e.get("delta"),
+        })
+
+    # ── Sessions ─────────────────────────────────────────────────────
+    sessions_dir = data_dir / "sessions"
+    session_count = 0
+    session_turns_total = 0
+    wa_sessions = 0
+    if sessions_dir.is_dir():
+        for sf in sessions_dir.glob("*.json"):
+            try:
+                sess = json.loads(sf.read_text(encoding="utf-8"))
+                session_count += 1
+                turns = sess.get("turns", [])
+                session_turns_total += len(turns)
+                if sess.get("id", "").startswith("wa:"):
+                    wa_sessions += 1
+            except Exception:
+                continue
+
+    # ── Index stats ──────────────────────────────────────────────────
+    index_stats = {}
+    try:
+        col = get_db()
+        n_chunks = col.count()
+        corpus = _load_corpus(col)
+        pr = get_pagerank(col)
+        top_pr = sorted(pr.items(), key=lambda x: -x[1])[:5] if pr else []
+        index_stats = {
+            "chunks": n_chunks,
+            "notes": len(corpus.get("title_to_paths", {})),
+            "tags": len(corpus.get("tags", set())),
+            "folders": len(corpus.get("folders", set())),
+            "top_pagerank": [{"path": p, "score": round(s, 4)} for p, s in top_pr],
+        }
+    except Exception:
+        pass
+
+    return {
+        "period_days": days,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "kpis": {
+            "total_queries": len(queries),
+            "total_queries_all_time": len(all_queries),
+            "avg_latency": round(statistics.mean(t_totals), 2) if t_totals else None,
+            "avg_retrieve": round(statistics.mean(t_retrieves), 2) if t_retrieves else None,
+            "avg_generate": round(statistics.mean(t_gens), 2) if t_gens else None,
+            "feedback_positive": fb_pos,
+            "feedback_negative": fb_neg,
+            "sessions": session_count,
+            "wa_sessions": wa_sessions,
+            "ambient_hooks": len(ambient_recent),
+            "ambient_wikilinks": ambient_wikilinks,
+            "contradictions_found": len(contra_found),
+            "surface_pairs": len(surface_pairs),
+            "filings": len(filing_recent),
+        },
+        "health": health,
+        "index": index_stats,
+        "queries_per_day": dict(sorted(queries_per_day.items())),
+        "latency_per_day": latency_ts,
+        "hours": {str(h): hours.get(h, 0) for h in range(24)},
+        "cmds": dict(sorted(cmds.items(), key=lambda x: -x[1])),
+        "sources": dict(sources),
+        "score_distribution": score_buckets,
+        "score_stats": {
+            "p50": _pct(scores, 50),
+            "p95": _pct(scores, 95),
+            "min": round(min(scores), 3) if scores else 0,
+            "max": round(max(scores), 3) if scores else 0,
+        },
+        "latency_stats": {
+            "retrieve_p50": _pct(t_retrieves, 50),
+            "retrieve_p95": _pct(t_retrieves, 95),
+            "generate_p50": _pct(t_gens, 50),
+            "generate_p95": _pct(t_gens, 95),
+            "total_p50": _pct(t_totals, 50),
+            "total_p95": _pct(t_totals, 95),
+        },
+        "hot_topics": [{"topic": t, "count": c} for t, c in hot_topics],
+        "ambient_per_day": dict(sorted(ambient_per_day.items())),
+        "contradictions_per_day": dict(sorted(contra_per_day.items())),
+        "tune_history": tune_history,
+        "surface_runs": len(surface_runs),
+        "filing_confidence": [round(e.get("confidence", 0), 2) for e in filing_recent],
+    }
 
 
 if __name__ == "__main__":

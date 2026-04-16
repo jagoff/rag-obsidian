@@ -13,6 +13,9 @@ dependencies = [
     "sentence-transformers>=3.0",
     "mcp>=1.0",
     "watchdog>=6.0.0",
+    "google-api-python-client>=2.0",
+    "google-auth>=2.0",
+    "youtube-transcript-api>=1.0",
 ]
 
 [project.optional-dependencies]

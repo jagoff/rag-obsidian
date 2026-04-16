@@ -404,7 +404,10 @@ SESSION_HISTORY_WINDOW = 6       # last N messages fed to reformulate_query / LL
 SESSION_COMPRESSION_THRESHOLD = 7  # turn count at which compressed_history kicks in
 SESSION_SUMMARY_VERSION = 1      # bump if compressor prompt/format changes (invalidates cache)
 
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# `@` is required for WhatsApp jids (e.g. `wa:120363...@g.us:vault`); without
+# it the regex rejected real WA ids and ensure_session minted a fresh UUID,
+# breaking session continuity AND analytics source-attribution.
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,80}$")
 
 
 def new_session_id() -> str:
@@ -618,13 +621,15 @@ URLS_COLLECTION_NAME = (
 # num_ctx dimensionado al prompt real (system ~500 tokens + 5 chunks × ~300
 # tokens + query + answer) — ventana de KV más chica = menos memoria y genera
 # más rápido.
-# num_predict cap — median answer_len=38 chars, p90 ≈ 200 tokens; 384 deja
+# num_ctx — prompt real medido: rules ~180 + 5 chunks × 300 + graph 2×300 +
+# progressive 6×30 + question = ~2500 tok. Dropeando 4096→3072 deja ~580
+# tok de slack y acelera prefill + generación en command-r (KV cache más
+# chico reduce attention overhead por token).
+# num_predict — median answer_len=38 chars, p90 ≈ 200 tokens; 384 deja
 # buffer cómodo y corta colas verbose del LLM cuando no encuentra EOS.
-# Bajado de 768 → 384 (perf): p90 generate tail cae ~10-15s sin perder answers
-# útiles en eval (ninguna respuesta legítima del corpus supera 384 tokens).
 CHAT_OPTIONS = {
     "temperature": 0, "top_p": 1, "seed": 42,
-    "num_ctx": 4096,
+    "num_ctx": 3072,
     "num_predict": 384,
 }
 # Helpers (paraphrases, HyDE) devuelven 1-3 líneas — cap chico acelera.
@@ -2770,6 +2775,18 @@ SYSTEM_RULES_STRICT = (
     "'ruta.md' o 'path.md' — siempre ruta real. Citar al menos la primera vez.\n"
     "3. Formato: directo, viñetas cortas, sin intro. Preferir verbatim del "
     "contexto antes que reformular.\n"
+)
+
+# Ultra-compressed variant for chat surfaces (WhatsApp) — ~60 tokens vs 180.
+# Menos prefill = faster first-token. WA ya renderiza las citas [Título](ruta)
+# como links; la regla de "ruta real" es redundante porque el contexto del
+# chunk ya trae `[ruta: ...]` y command-r la copia. Los ejemplos negativos
+# no sirven cuando el modelo ya es citation-native (command-r RAG-trained).
+SYSTEM_RULES_CHAT = (
+    "Respondé SOLO con info literal del CONTEXTO de abajo. "
+    "Si no está: 'No tengo esa información en tus notas.' y cortá. "
+    "Citá notas como [Título](ruta) usando la ruta exacta del chunk. "
+    "Directo, viñetas cortas, sin intro.\n"
 )
 
 # Coach mode: las notas del usuario son ESPEJO, no autoridad. El valor está
@@ -5182,9 +5199,14 @@ def retrieve(
     # Adds context from linked notes that didn't match semantically but are
     # topologically close. 1-hop neighbors scored higher than 2-hop. PageRank
     # breaks ties — more authoritative neighbors surface first.
+    #
+    # Skip cuando el top hit ya es fuerte (score > 0.5): el LLM tiene evidencia
+    # sólida en los primary chunks, agregar neighbors sólo suma prefill sin
+    # mejorar la respuesta. Los casos borderline (score ≤ 0.5) sí se benefician
+    # del contexto adicional del grafo.
     graph_docs: list[str] = []
     graph_metas: list[dict] = []
-    if metas:
+    if metas and top_score <= 0.5:
         try:
             corpus = _load_corpus(col)
             adj = _build_graph_adj(corpus)
@@ -11666,6 +11688,13 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
 # vault as a linked note. Stdlib-only HTTP, readability via regex strip.
 
 _READ_FOLDER = "00-Inbox"
+# Dedicated folders for specific content types — YouTube transcripts are too
+# noisy to leave in Inbox and form a logical PARA Resource category.
+_READ_YOUTUBE_FOLDER = "03-Resources/Transcriptions"
+# Inbox changelog — every note created OUTSIDE 00-Inbox appends a wikilink here
+# under the `## YYYY-MM-DD` section. Keeps Inbox as the "what entered the vault
+# today" view even when notes route to topic folders.
+_DAILY_NOTE_NAME = "Daily note.md"
 _READ_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Apple Silicon) obsidian-rag/1.0 (+local)"
 )
@@ -11719,7 +11748,8 @@ def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, d
 # Bypass: detect YouTube URL → fetch captions via youtube-transcript-api (free,
 # no API key — scrapes public caption endpoint) and the video title via oEmbed
 # (free, no API key). Transcript is joined into plain prose matching what
-# `_read_extract` returns, so the downstream pipeline needs zero changes.
+# `_read_extract` returns, so the downstream pipeline (summary, related, tags)
+# needs zero changes.
 
 _YOUTUBE_URL_RE = re.compile(
     r"""^https?://(?:
@@ -11769,12 +11799,7 @@ def _fetch_youtube_transcript(video_id: str) -> str:
     in order. Raises RuntimeError if no transcript is available (private video,
     captions disabled, region-locked).
     """
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError as exc:
-        raise RuntimeError(
-            "youtube-transcript-api no está instalado; corré uv sync"
-        ) from exc
+    from youtube_transcript_api import YouTubeTranscriptApi
     try:
         api = YouTubeTranscriptApi()
         transcript = api.fetch(video_id, languages=list(_YOUTUBE_LANG_PREFERENCES))
@@ -11793,7 +11818,8 @@ def _fetch_youtube_transcript(video_id: str) -> str:
 
 def _fetch_youtube_content(url: str) -> tuple[str, str]:
     """`(title, text)` for a YouTube URL — shape matches ``_read_extract``.
-    Title via oEmbed, text via caption API. Raises RuntimeError on failure.
+    Title via oEmbed, text via caption API. Raises RuntimeError on either
+    transcript failure (caller converts to user-facing error).
     """
     vid = _extract_youtube_id(url)
     if not vid:
@@ -11955,6 +11981,79 @@ def _read_build_note(
     return body
 
 
+def _append_to_daily_note(
+    note_path: Path, title: str, folder: str, when: datetime,
+) -> None:
+    """Append a wikilink entry to `00-Inbox/Daily note.md` under the `## YYYY-MM-DD`
+    section for `when`. Creates the file + today's section on first call of the
+    day; reuses existing sections on subsequent calls.
+
+    The wikilink uses just the note stem (Obsidian resolves it unambiguously if
+    the vault has no stem collisions — which stamped filenames ensure). The
+    destination folder is shown so the user knows where to find it without
+    opening the link.
+
+    Silent contract: raises on unrecoverable I/O errors only. The caller wraps
+    in try/except because a broken Daily note must never block ingestion.
+    """
+    daily_path = VAULT_PATH / _READ_FOLDER / _DAILY_NOTE_NAME
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    date_header = f"## {when.strftime('%Y-%m-%d')}"
+    time_label = when.strftime("%H:%M")
+    try:
+        rel = note_path.relative_to(VAULT_PATH)
+    except ValueError:
+        rel = note_path
+    stem = note_path.stem
+    entry = f"- [{time_label}] [[{stem}|{title}]] → `{folder}/`"
+
+    if not daily_path.is_file():
+        frontmatter = (
+            "---\n"
+            f"created: '{when.isoformat(timespec='seconds')}'\n"
+            "type: daily-index\n"
+            "tags:\n- daily-index\n"
+            "---\n\n"
+            "# Daily note\n\n"
+            "Registro de notas que entran al vault fuera de `00-Inbox/`. "
+            "Append-only, agrupado por fecha.\n\n"
+        )
+        daily_path.write_text(
+            frontmatter + f"{date_header}\n{entry}\n", encoding="utf-8",
+        )
+        return
+
+    content = daily_path.read_text(encoding="utf-8")
+    if date_header in content:
+        # Append under today's section — find the next `## ` or EOF and insert
+        # the entry at the end of the current section.
+        lines = content.splitlines()
+        try:
+            i = lines.index(date_header)
+        except ValueError:
+            lines.append(date_header)
+            lines.append(entry)
+        else:
+            # Walk forward to the section boundary (next `## ` or EOF).
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith("## "):
+                j += 1
+            # Insert before the blank line that precedes the next section (if
+            # any) so the structure stays clean.
+            insert_at = j
+            while insert_at > i + 1 and lines[insert_at - 1].strip() == "":
+                insert_at -= 1
+            lines.insert(insert_at, entry)
+        daily_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    # New day — append a fresh section at the end.
+    tail = content if content.endswith("\n") else content + "\n"
+    daily_path.write_text(
+        tail + f"\n{date_header}\n{entry}\n", encoding="utf-8",
+    )
+
+
 def ingest_read_url(
     col: chromadb.Collection,
     url: str,
@@ -12025,9 +12124,18 @@ def ingest_read_url(
     except Exception:
         tags = []
 
+    # YouTube: the folder is "Transcriptions" so the note must carry the actual
+    # transcript, not just an LLM summary. Keep the summary as a leading
+    # orientation block (useful for quick scan + wikilinks) and append the
+    # full captions below under `## Transcripción`. For generic web reads,
+    # the summary alone is the point.
+    body_text = summary
+    if is_youtube and text:
+        body_text = f"{summary}\n\n## Transcripción\n\n{text}"
+
     created_iso = datetime.now().isoformat(timespec="seconds")
     note_body = _read_build_note(
-        url, title, summary, tags, related_titles, created_iso,
+        url, title, body_text, tags, related_titles, created_iso,
     )
 
     result = {
@@ -12042,7 +12150,12 @@ def ingest_read_url(
     now = datetime.now()
     stamp = now.strftime("%Y-%m-%d-%H%M")
     slug = _read_slug_from(title, url)
-    target_dir = VAULT_PATH / _READ_FOLDER
+    # Route YouTube transcripts to the Transcriptions resource folder; other
+    # reads stay in 00-Inbox. Notes that land outside Inbox get logged in the
+    # Daily note so the user still sees "what entered the vault today" from
+    # 00-Inbox alone.
+    folder = _READ_YOUTUBE_FOLDER if is_youtube else _READ_FOLDER
+    target_dir = VAULT_PATH / folder
     target_dir.mkdir(parents=True, exist_ok=True)
     candidate = target_dir / f"{stamp}-read-{slug}.md"
     i = 2
@@ -12054,6 +12167,14 @@ def ingest_read_url(
         _index_single_file(col, candidate, skip_contradict=True)
     except Exception:
         pass
+    # Daily note changelog — only for notes outside 00-Inbox (Inbox notes are
+    # already visible when listing the folder). Silent-fail so a malformed
+    # daily note never blocks the actual ingestion.
+    if folder != _READ_FOLDER:
+        try:
+            _append_to_daily_note(candidate, title or url, folder, now)
+        except Exception:
+            pass
     result["path"] = candidate
     return result
 
@@ -12175,6 +12296,8 @@ tell application "Reminders"
           set _due to due date of _r
           if _due is not missing value then
             set _out to _out & (name of _r) & "|" & (_due as string) & "|" & (name of _list) & linefeed
+          else
+            set _out to _out & (name of _r) & "||" & (name of _list) & linefeed
           end if
         end try
       end repeat
@@ -12325,8 +12448,10 @@ def _fetch_calendar_today(max_events: int = 15) -> list[dict]:
 
 
 def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 20) -> list[dict]:
-    """Incomplete reminders with due date ≤ today + horizon_days. Splits
-    overdue vs today vs upcoming via the `bucket` field.
+    """Incomplete reminders with due date ≤ today + horizon_days, plus
+    reminders without any due date. Splits into buckets: ``overdue`` / ``today``
+    / ``upcoming`` (dated) and ``undated`` (no due). Undated reminders land at
+    the bottom of the sort order — still actionable but not time-sensitive.
     """
     if not _apple_enabled():
         return []
@@ -12345,6 +12470,14 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
         list_name = parts[2].strip() if len(parts) > 2 else ""
         if not name:
             continue
+        if not due_raw:
+            items.append({
+                "name": name,
+                "due": "",
+                "list": list_name,
+                "bucket": "undated",
+            })
+            continue
         due_dt = _parse_applescript_date(due_raw)
         if due_dt is None:
             continue
@@ -12362,7 +12495,7 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
             "list": list_name,
             "bucket": bucket,
         })
-    order = {"overdue": 0, "today": 1, "upcoming": 2}
+    order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
     items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
     return items[:max_items]
 
@@ -12483,6 +12616,171 @@ def _fetch_mail_unread(max_items: int = 10) -> list[dict]:
         })
     items.sort(key=lambda m: 0 if m.get("is_vip") else 1)
     return items[:max_items]
+
+
+# ── Gmail API evidence (via OAuth creds shared with gmail-send MCP) ─────────
+# Apple Mail already feeds `mail_unread`, but only the 36h unread window. Gmail
+# adds two signals Apple Mail can't compute cheaply:
+#   - awaiting_reply: threads in inbox older than 3d, newer than 14d, last
+#     sender is NOT me. Surfaces stuck replies before they rot.
+#   - starred: recent explicit-priority threads the user flagged.
+# Plus a total unread count (all-time inbox) as one cheap number.
+# Silent-fail: missing deps, missing creds, API error → {}. Same contract as
+# `_fetch_calendar_today`.
+GMAIL_CREDS_DIR = Path.home() / ".gmail-mcp"
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+]
+
+
+def _gmail_service():
+    """Authed Gmail API client, or None. Refreshes the access token in place
+    when expired and persists it back to `credentials.json` so the next call
+    doesn't re-refresh. Shares creds with the `gmail-send` MCP.
+    """
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+    except ImportError:
+        return None
+    creds_path = GMAIL_CREDS_DIR / "credentials.json"
+    oauth_path = GMAIL_CREDS_DIR / "gcp-oauth.keys.json"
+    if not creds_path.is_file() or not oauth_path.is_file():
+        return None
+    try:
+        stored = json.loads(creds_path.read_text(encoding="utf-8"))
+        oauth = json.loads(oauth_path.read_text(encoding="utf-8"))
+        installed = oauth.get("installed") or oauth.get("web") or {}
+        creds = Credentials(
+            token=stored.get("access_token"),
+            refresh_token=stored.get("refresh_token"),
+            token_uri=installed.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=installed.get("client_id"),
+            client_secret=installed.get("client_secret"),
+            scopes=GMAIL_SCOPES,
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            stored["access_token"] = creds.token
+            creds_path.write_text(json.dumps(stored), encoding="utf-8")
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+
+def _gmail_thread_last_meta(svc, thread_id: str) -> dict | None:
+    """Fetch metadata of the LAST message of a thread. Returns None on error.
+    Shape: {subject, from, snippet, internal_date_ms}.
+    """
+    try:
+        t = svc.users().threads().get(
+            userId="me", id=thread_id, format="metadata",
+            metadataHeaders=["Subject", "From", "Date"],
+        ).execute()
+    except Exception:
+        return None
+    msgs = t.get("messages") or []
+    if not msgs:
+        return None
+    last = msgs[-1]
+    headers = {
+        h["name"]: h["value"]
+        for h in (last.get("payload", {}).get("headers") or [])
+    }
+    try:
+        internal_ms = int(last.get("internalDate") or 0)
+    except Exception:
+        internal_ms = 0
+    return {
+        "subject": headers.get("Subject", "(sin asunto)"),
+        "from": headers.get("From", ""),
+        "snippet": (last.get("snippet") or "").strip()[:140],
+        "internal_date_ms": internal_ms,
+    }
+
+
+def _fetch_gmail_evidence(now: datetime) -> dict:
+    """Gmail signals for the morning brief. Hits Gmail API ~3-10 times
+    (<2s total with cached discovery). Silent-fail on any error.
+
+    Returns:
+        {
+          "unread_count": int — total unread in inbox (all-time),
+          "starred": [{subject, from, snippet}] up to 3 recent starred threads,
+          "awaiting_reply": [{subject, from, snippet, days_old}] up to 5
+             threads where the last message is NOT from me and is 3-14d old.
+        }
+    """
+    svc = _gmail_service()
+    if svc is None:
+        return {}
+    try:
+        profile = svc.users().getProfile(userId="me").execute()
+    except Exception:
+        return {}
+    me_lower = (profile.get("emailAddress") or "").lower()
+    out: dict = {"unread_count": 0, "starred": [], "awaiting_reply": []}
+
+    # Unread count — INBOX label metadata gives exact thread/message counts
+    # without scanning messages. Cheaper and accurate vs resultSizeEstimate.
+    try:
+        label = svc.users().labels().get(userId="me", id="INBOX").execute()
+        out["unread_count"] = int(label.get("threadsUnread") or 0)
+    except Exception:
+        pass
+
+    # Starred recent — explicit user-flagged threads.
+    try:
+        r = svc.users().threads().list(
+            userId="me", q="is:starred in:inbox newer_than:7d", maxResults=3,
+        ).execute()
+        for th in r.get("threads", []) or []:
+            meta = _gmail_thread_last_meta(svc, th.get("id") or "")
+            if meta:
+                out["starred"].append({
+                    "subject": meta["subject"],
+                    "from": meta["from"],
+                    "snippet": meta["snippet"],
+                })
+    except Exception:
+        pass
+
+    # Awaiting reply — threads stuck, last sender != me. Exclude auto-generated
+    # categories to keep signal/noise high.
+    try:
+        q = (
+            "in:inbox newer_than:14d older_than:3d "
+            "-category:promotions -category:social "
+            "-category:updates -category:forums"
+        )
+        r = svc.users().threads().list(
+            userId="me", q=q, maxResults=15,
+        ).execute()
+        for th in r.get("threads", []) or []:
+            if len(out["awaiting_reply"]) >= 5:
+                break
+            meta = _gmail_thread_last_meta(svc, th.get("id") or "")
+            if not meta:
+                continue
+            sender = meta["from"].lower()
+            if me_lower and me_lower in sender:
+                continue  # last reply was mine — not awaiting me
+            days_old = (
+                (now.timestamp() - meta["internal_date_ms"] / 1000) / 86400.0
+                if meta["internal_date_ms"] else 0.0
+            )
+            out["awaiting_reply"].append({
+                "subject": meta["subject"],
+                "from": meta["from"],
+                "snippet": meta["snippet"],
+                "days_old": round(days_old, 1),
+            })
+    except Exception:
+        pass
+
+    return out
 
 
 # ── WhatsApp unread (bridge SQLite) ─────────────────────────────────────────
@@ -13163,6 +13461,7 @@ def _collect_morning_evidence(
         "calendar_today": _fetch_calendar_today(),
         "reminders_due": _fetch_reminders_due(now),
         "mail_unread": _fetch_mail_unread(),
+        "gmail": _fetch_gmail_evidence(now),
         "whatsapp_unread": _fetch_whatsapp_unread(),
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
@@ -13236,6 +13535,23 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
             preview = (m.get("body_preview") or "").strip()
             if preview:
                 parts.append(f"    _{preview}_")
+        parts.append("")
+    gm = ev.get("gmail") or {}
+    if gm.get("unread_count") or gm.get("starred") or gm.get("awaiting_reply"):
+        unread_total = int(gm.get("unread_count") or 0)
+        parts.append(f"## Gmail — {unread_total} sin leer total en inbox:")
+        for m in gm.get("starred") or []:
+            parts.append(
+                f"- ⭐ {m.get('subject', '')} — {m.get('from', '')}: "
+                f"{m.get('snippet', '')}"
+            )
+        for m in gm.get("awaiting_reply") or []:
+            days = m.get("days_old") or 0
+            parts.append(
+                f"- ⏳ esperando mi respuesta hace {days}d: "
+                f"{m.get('subject', '')} — {m.get('from', '')}: "
+                f"{m.get('snippet', '')}"
+            )
         parts.append("")
     if ev.get("whatsapp_unread"):
         parts.append(
@@ -13328,10 +13644,14 @@ def _render_morning_agenda_section(ev: dict) -> str:
         bullets.append(f"- {e.get('title', '(sin título)')} · {when}")
     for r in ev.get("reminders_due", [])[:10]:
         bucket = r.get("bucket") or ""
-        tag = f"({bucket}) " if bucket else ""
         lst = f" [{r['list']}]" if r.get("list") else ""
-        due = f" · {r['due']}" if r.get("due") else ""
-        bullets.append(f"- {tag}{r.get('name', '(sin nombre)')}{due}{lst}")
+        name = r.get("name", "(sin nombre)")
+        if bucket == "undated":
+            bullets.append(f"- 📌 {name}{lst}")
+        else:
+            tag = f"({bucket}) " if bucket else ""
+            due = f" · {r['due']}" if r.get("due") else ""
+            bullets.append(f"- {tag}{name}{due}{lst}")
     if ev.get("weather_rain"):
         w = ev["weather_rain"]
         summary = w.get("summary") or "lluvia pronosticada"
@@ -13346,6 +13666,57 @@ def _render_morning_agenda_section(ev: dict) -> str:
     if not bullets:
         return ""
     return "## 📅 Hoy en la agenda\n" + "\n".join(bullets)
+
+
+def _format_gmail_from(raw: str) -> str:
+    """Extract the display name from a Gmail `From` header, falling back to
+    the bare address. `"Susana L." <s@x.com>` → `Susana L.`. `s@x.com` → `s@x.com`.
+    """
+    if not raw:
+        return ""
+    m = re.match(r"\s*\"?([^\"<]+?)\"?\s*<[^>]+>\s*$", raw)
+    if m:
+        name = m.group(1).strip().strip("'")
+        if name:
+            return name
+    return raw.strip()
+
+
+def _render_morning_gmail_section(ev: dict) -> str:
+    """Deterministic render of 📧 Gmail section. Surfaces two always-relevant
+    signals: threads where I haven't replied in ≥3 days (⏳) and starred
+    threads I explicitly flagged (⭐). Adds a trailing total-unread line if
+    > 0. Returns "" when none of the three apply.
+
+    Owned by code so these signals survive LLM compression — the previous
+    LLM-only path soft-dropped them on noisy mornings.
+    """
+    gm = ev.get("gmail") or {}
+    awaiting = gm.get("awaiting_reply") or []
+    starred = gm.get("starred") or []
+    unread = int(gm.get("unread_count") or 0)
+    if not awaiting and not starred and not unread:
+        return ""
+    bullets: list[str] = []
+    # awaiting_reply first — highest actionability
+    for m in awaiting[:5]:
+        subj = (m.get("subject") or "(sin asunto)").strip()
+        who = _format_gmail_from(m.get("from") or "")
+        days = m.get("days_old") or 0
+        bullets.append(f"- ⏳ {days}d · **{subj}** — {who}")
+        snip = (m.get("snippet") or "").strip()
+        if snip:
+            bullets.append(f"  _{snip}_")
+    for m in starred[:3]:
+        subj = (m.get("subject") or "(sin asunto)").strip()
+        who = _format_gmail_from(m.get("from") or "")
+        bullets.append(f"- ⭐ **{subj}** — {who}")
+        snip = (m.get("snippet") or "").strip()
+        if snip:
+            bullets.append(f"  _{snip}_")
+    if unread:
+        bullets.append(f"- 📬 {unread} sin leer en inbox")
+    return "## 📧 Gmail\n" + "\n".join(bullets)
 
 
 # ── Dedup todos-del-vault vs reminders-de-Apple ─────────────────────────────
@@ -13488,6 +13859,25 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
             preview = (m.get("body_preview") or "").strip()
             if preview:
                 parts.append(f"    _{preview}_")
+    gm = ev.get("gmail") or {}
+    if gm.get("unread_count") or gm.get("starred") or gm.get("awaiting_reply"):
+        unread_total = int(gm.get("unread_count") or 0)
+        parts.append(
+            f"\nGmail — {unread_total} sin leer "
+            "(NO re-imprimas, el código arma la sección 📧 Gmail):"
+        )
+        for m in gm.get("starred") or []:
+            parts.append(
+                f"- ⭐ {m.get('subject', '')} — {m.get('from', '')}: "
+                f"{m.get('snippet', '')}"
+            )
+        for m in gm.get("awaiting_reply") or []:
+            days = m.get("days_old") or 0
+            parts.append(
+                f"- ⏳ esperando mi respuesta hace {days}d: "
+                f"{m.get('subject', '')} — {m.get('from', '')}: "
+                f"{m.get('snippet', '')}"
+            )
     # Agenda (calendar/reminders/weather) ya la arma el código — igual la
     # mencionamos como contexto para que el LLM pueda cruzar referencias
     # ("hoy tenés reunión con X → priorizá la nota [[X]]").
@@ -13566,16 +13956,16 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
 
 def _assemble_morning_brief(
     date_label: str, agenda_md: str, parts: dict, continuity: str,
-    system_md: str = "",
+    system_md: str = "", gmail_md: str = "",
 ) -> str:
     """Put the brief together skipping empty sections. Headers are fixed;
-    content comes from `parts` (LLM JSON), `agenda_md` + `system_md`
-    (deterministic code-owned blocks).
+    content comes from `parts` (LLM JSON), `agenda_md` + `system_md` +
+    `gmail_md` (deterministic code-owned blocks).
 
-    Layout: `📬 Ayer → 📅 Agenda → ⚙️ Sistema → 🎯 Foco → 🗂 Pendientes →
-    ⚠ Atender`. Empty blocks are dropped; `system_md` ("" when nothing
-    automated fired) preserves legacy behavior for callers that don't
-    pass it.
+    Layout: `📬 Ayer → 📅 Agenda → 📧 Gmail → ⚙️ Sistema → 🎯 Foco →
+    🗂 Pendientes → ⚠ Atender`. Empty blocks are dropped; `system_md` and
+    `gmail_md` ("" when nothing to show) preserve legacy behavior for
+    callers that don't pass them.
     """
     sections: list[str] = []
     y = (parts.get("yesterday") or "").strip()
@@ -13583,6 +13973,8 @@ def _assemble_morning_brief(
         sections.append(f"## 📬 Ayer en una línea\n{y}")
     if agenda_md:
         sections.append(agenda_md)
+    if gmail_md:
+        sections.append(gmail_md)
     if system_md:
         sections.append(system_md)
     focus = parts.get("focus") or []
@@ -13641,6 +14033,9 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         + len(ev.get("whatsapp_unread", []))
         + len(ev.get("recent_queries", []))
         + (1 if ev.get("weather_rain") else 0)
+        + len((ev.get("gmail") or {}).get("starred") or [])
+        + len((ev.get("gmail") or {}).get("awaiting_reply") or [])
+        + (1 if (ev.get("gmail") or {}).get("unread_count") else 0)
     )
     if total == 0:
         console.print(
@@ -13659,7 +14054,9 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"{len(ev.get('reminders_due', []))} rem · "
         f"{len(ev.get('mail_unread', []))} mail · "
         f"{len(ev.get('whatsapp_unread', []))} wa · "
-        f"{len(ev.get('recent_queries', []))} queries"
+        f"{len(ev.get('recent_queries', []))} queries · "
+        f"{(ev.get('gmail') or {}).get('unread_count', 0)} gmail-unread · "
+        f"{len((ev.get('gmail') or {}).get('awaiting_reply') or [])} await-reply"
         + (" · 🌧" if ev.get("weather_rain") else "")
     )
 
@@ -13669,13 +14066,15 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     # Fallback to the legacy monolithic prompt if JSON parse fails.
     agenda_md = _render_morning_agenda_section(ev)
     system_md = _render_system_activity_section(ev.get("system_activity") or {})
+    gmail_md = _render_morning_gmail_section(ev)
     structured_prompt = _render_morning_structured_prompt(date_label, ev)
     with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
         parts = _generate_morning_json(structured_prompt)
     continuity = _yesterday_evening_link(target, VAULT_PATH)
     if parts is not None:
         brief_body = _assemble_morning_brief(
-            date_label, agenda_md, parts, continuity, system_md=system_md,
+            date_label, agenda_md, parts, continuity,
+            system_md=system_md, gmail_md=gmail_md,
         )
     else:
         # Legacy fallback — one-shot text generation with the old monolithic
@@ -15732,6 +16131,35 @@ def serve(host: str, port: int):
         pass  # Best-effort; si falla la primera query paga el costo.
     console.print("[green]All models warm.[/green]")
 
+    # ── Response cache — queries repetidas instantáneas ─────────────────────
+    # WA users retype consultas idénticas ("llueve hoy?", "test") con alta
+    # frecuencia; cachear evita re-correr embed + retrieve + rerank + LLM
+    # (~20-30s) cuando nada cambió. Key: (question, session_id). TTL 5min
+    # — balance entre freshness (notas nuevas indexadas) y hit rate. Cap 64
+    # entries (LRU) — budget de memoria ~200KB.
+    _serve_cache: dict[str, tuple[float, dict]] = {}
+    _SERVE_CACHE_MAX = 64
+    _SERVE_CACHE_TTL = 300.0  # seconds
+
+    def _cache_get(key: str) -> dict | None:
+        hit = _serve_cache.get(key)
+        if not hit:
+            return None
+        ts, payload = hit
+        if time.time() - ts > _SERVE_CACHE_TTL:
+            _serve_cache.pop(key, None)
+            return None
+        return payload
+
+    def _cache_put(key: str, payload: dict) -> None:
+        if len(_serve_cache) >= _SERVE_CACHE_MAX:
+            # Drop oldest (insertion order). Dict preserves order in 3.7+.
+            try:
+                _serve_cache.pop(next(iter(_serve_cache)))
+            except StopIteration:
+                pass
+        _serve_cache[key] = (time.time(), payload)
+
     def _handle_query(body: dict) -> dict:
         question = body.get("question", "").strip()
         if not question:
@@ -15744,10 +16172,35 @@ def serve(host: str, port: int):
         force = body.get("force", False)
         multi_q = body.get("multi_query", True)
         loose = body.get("loose", False)
+        # num_predict override — default 256 para chat surfaces (WA/bot).
+        # Respuestas median 38 chars, p95 236 tok; 256 deja buffer ajustado
+        # y cap gen time a ~25s a 10 tok/s peor caso. CLI usa CHAT_OPTIONS=384.
+        predict_cap = int(body.get("num_predict", 256))
+
+        # Emit "received" event before processing — lets the dashboard surface
+        # in-flight queries even when retrieval/generation hangs (the prior
+        # behavior was to log only on success, so failures silently disappeared
+        # from analytics).
+        try:
+            log_query_event({
+                "cmd": "serve.received", "q": question[:200],
+                "session": sid, "folder": qfolder, "tag": qtag,
+            })
+        except Exception:
+            pass
         # Deep retrieval off-default para bot WA: el segundo pase duplica
         # retrieve + agrega 1 judge call (5-15s). El path rápido responde
         # suficientemente bien en la mayoría de queries reales.
         deep = body.get("deep", False)
+
+        # Cache check — questiones idénticas en la misma sesión/vault sirven
+        # de cache. Skip cuando `force` (usuario pidió re-run) o filtros
+        # explícitos (cambian la respuesta sin cambiar la pregunta).
+        cache_key = f"{sid or ''}|{qfolder or ''}|{qtag or ''}|{loose}|{question}"
+        if not force and not qfolder and not qtag:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                return {**cached, "cached": True}
 
         # Session
         sess = ensure_session(sid, mode="serve") if sid else None
@@ -15799,19 +16252,25 @@ def serve(host: str, port: int):
                                    "paths": [m.get("file", "") for m in result["metas"]],
                                    "top_score": round(float(result["confidence"]), 3)})
                 save_session(sess)
-            return {
+            gated_payload = {
                 "answer": "No tengo esa información en tus notas.",
                 "gated": True, "sources": sources,
                 "confidence": round(float(result["confidence"]), 2),
                 "t_retrieve": round(t_retrieve, 3),
             }
+            if not qfolder and not qtag:
+                _cache_put(cache_key, gated_payload)
+            return gated_payload
 
         # Generate
         context = "\n\n---\n\n".join(
             f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
             for d, m in zip(result["docs"], result["metas"])
         )
-        rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
+        # Chat-compact rules default para serve — WA es voice/chat, necesita
+        # respuestas cortas y rápidas. `loose` conserva SYSTEM_RULES (permite
+        # <<ext>> para prosa externa marcada). STRICT ya no se usa en serve.
+        rules = SYSTEM_RULES if loose else SYSTEM_RULES_CHAT
         ub = user_prompt_block()
         rules_full = f"{ub}{rules}" if ub else rules
         if history:
@@ -15828,7 +16287,8 @@ def serve(host: str, port: int):
         parts: list[str] = []
         for chunk in ollama.chat(
             model=resolve_chat_model(), messages=messages,
-            options=CHAT_OPTIONS, stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+            options={**CHAT_OPTIONS, "num_predict": predict_cap},
+            stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
@@ -15856,11 +16316,15 @@ def serve(host: str, port: int):
             "answered": True,
         })
 
-        return {
+        payload = {
             "answer": answer, "sources": sources,
             "confidence": round(float(result["confidence"]), 2),
             "t_retrieve": round(t_retrieve, 3), "t_gen": round(t_gen, 3),
         }
+        # Cache only fresh successful answers (no force, no filters).
+        if not force and not qfolder and not qtag:
+            _cache_put(cache_key, payload)
+        return payload
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -15873,12 +16337,25 @@ def serve(host: str, port: int):
             if self.path != "/query":
                 self._json(404, {"error": "not found"})
                 return
+            body: dict = {}
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = _json.loads(self.rfile.read(length)) if length else {}
                 result = _handle_query(body)
                 self._json(200, result)
             except Exception as exc:
+                # Log so the dashboard surfaces failures instead of silently
+                # returning 500 — log_query_event was inside the success path
+                # and never fired on errors.
+                try:
+                    log_query_event({
+                        "cmd": "serve.error",
+                        "q": str(body.get("question") if isinstance(body, dict) else "")[:200],
+                        "session": body.get("session_id") if isinstance(body, dict) else None,
+                        "error": str(exc)[:300],
+                    })
+                except Exception:
+                    pass
                 self._json(500, {"error": str(exc)})
 
         def _json(self, code: int, data: dict):

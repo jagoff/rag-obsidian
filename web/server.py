@@ -8,8 +8,10 @@ ids del chat interactivo.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -309,11 +311,14 @@ def dashboard_api(days: int = 30) -> dict:
     for e in queries:
         cmds[e.get("cmd", "?")] += 1
 
-    # Source breakdown (wa: sessions vs web vs cli)
+    # Source breakdown. `cmd: serve*` is exclusively the rag-serve fast path
+    # (only the WhatsApp listener uses it), so any serve event is whatsapp
+    # regardless of session prefix.
     sources = defaultdict(int)
     for e in queries:
         sid = e.get("session") or ""
-        if sid.startswith("wa:"):
+        cmd = e.get("cmd") or ""
+        if sid.startswith("wa:") or cmd.startswith("serve"):
             sources["whatsapp"] += 1
         elif sid.startswith("web:"):
             sources["web"] += 1
@@ -409,6 +414,107 @@ def dashboard_api(days: int = 30) -> dict:
     fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
     fb_pos = sum(1 for e in fb_entries if e.get("rating") == 1)
     fb_neg = sum(1 for e in fb_entries if e.get("rating") == -1)
+
+    # Actionable feedback for RAG improvement (uses the *full* fb log, not windowed —
+    # negative signals are rare and we want all of them).
+    fb_recent = [e for e in fb_entries if (t := _ts(e)) and t >= cutoff]
+    neg_path_counts: dict[str, int] = defaultdict(int)
+    pos_path_counts: dict[str, int] = defaultdict(int)
+    for e in fb_entries:
+        rating = e.get("rating")
+        for p in e.get("paths") or []:
+            if rating == -1:
+                neg_path_counts[p] += 1
+            elif rating == 1:
+                pos_path_counts[p] += 1
+
+    # Corrective paths: user-supplied "the right note was here" — pure retrieval misses,
+    # i.e. golden-eval candidates. Most actionable signal in the whole pipeline.
+    corrective_misses: list[dict] = []
+    for e in fb_entries:
+        cp = e.get("corrective_path")
+        if not cp:
+            continue
+        if cp in (e.get("paths") or []):
+            continue
+        corrective_misses.append({
+            "ts": e.get("ts", ""),
+            "q": (e.get("q") or "")[:140],
+            "missing_path": cp,
+            "retrieved": list((e.get("paths") or [])[:3]),
+        })
+    corrective_misses.sort(key=lambda x: x["ts"], reverse=True)
+
+    # Recent negative reasons — qualitative why-it-failed signal.
+    neg_reasons: list[dict] = []
+    for e in fb_entries:
+        if e.get("rating") != -1 or not e.get("reason"):
+            continue
+        neg_reasons.append({
+            "ts": e.get("ts", ""),
+            "q": (e.get("q") or "")[:140],
+            "reason": e["reason"][:200],
+            "paths": list((e.get("paths") or [])[:2]),
+        })
+    neg_reasons.sort(key=lambda x: x["ts"], reverse=True)
+
+    # Calibration mismatch: cross feedback w/ queries by turn_id.
+    # - false_confident = retrieved with high score but user said -1
+    # - false_gated     = gate refused (low score) but user later said +1 / supplied corrective_path
+    queries_by_turn = {e.get("turn_id"): e for e in queries if e.get("turn_id")}
+    false_confident = 0
+    false_gated = 0
+    for fb in fb_entries:
+        q_ev = queries_by_turn.get(fb.get("turn_id"))
+        if not q_ev:
+            continue
+        ts = q_ev.get("top_score")
+        if not isinstance(ts, (int, float)):
+            continue
+        if fb.get("rating") == -1 and ts >= 0.20:
+            false_confident += 1
+        if fb.get("rating") == 1 and ts < 0.05:
+            false_gated += 1
+        if fb.get("corrective_path") and ts < 0.05:
+            false_gated += 1
+
+    # Feedback per day (positive vs negative trend)
+    fb_pos_per_day: dict[str, int] = defaultdict(int)
+    fb_neg_per_day: dict[str, int] = defaultdict(int)
+    for e in fb_recent:
+        t = _ts(e)
+        if not t:
+            continue
+        day = t.strftime("%Y-%m-%d")
+        if e.get("rating") == 1:
+            fb_pos_per_day[day] += 1
+        elif e.get("rating") == -1:
+            fb_neg_per_day[day] += 1
+
+    feedback_actionable = {
+        "total": len(fb_entries),
+        "recent_pos": sum(1 for e in fb_recent if e.get("rating") == 1),
+        "recent_neg": sum(1 for e in fb_recent if e.get("rating") == -1),
+        "net_satisfaction": (
+            round((fb_pos - fb_neg) / (fb_pos + fb_neg) * 100, 1)
+            if (fb_pos + fb_neg) > 0 else None
+        ),
+        "top_negative_paths": [
+            {"path": p, "count": c, "pos_count": pos_path_counts.get(p, 0)}
+            for p, c in sorted(neg_path_counts.items(), key=lambda x: -x[1])[:8]
+        ],
+        "top_positive_paths": [
+            {"path": p, "count": c}
+            for p, c in sorted(pos_path_counts.items(), key=lambda x: -x[1])[:8]
+        ],
+        "corrective_misses": corrective_misses[:10],
+        "n_corrective_misses": len(corrective_misses),
+        "negative_reasons": neg_reasons[:10],
+        "false_confident": false_confident,
+        "false_gated": false_gated,
+        "per_day_pos": dict(sorted(fb_pos_per_day.items())),
+        "per_day_neg": dict(sorted(fb_neg_per_day.items())),
+    }
 
     # ── Ambient ──────────────────────────────────────────────────────
     ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
@@ -536,7 +642,154 @@ def dashboard_api(days: int = 30) -> dict:
         "tune_history": tune_history,
         "surface_runs": len(surface_runs),
         "filing_confidence": [round(e.get("confidence", 0), 2) for e in filing_recent],
+        "feedback": feedback_actionable,
     }
+
+
+# ── Real-time stream ─────────────────────────────────────────────────────────
+# Tail JSONL logs and emit SSE events. The browser polls /api/dashboard for the
+# heavy aggregations; this endpoint pushes deltas as they happen so KPIs and
+# the live feed update without waiting for the next poll.
+
+_STREAM_FILES: dict[str, str] = {
+    "query": "queries.jsonl",
+    "feedback": "feedback.jsonl",
+    "ambient": "ambient.jsonl",
+    "contradiction": "contradictions.jsonl",
+}
+
+
+@app.get("/api/dashboard/stream")
+async def dashboard_stream() -> StreamingResponse:
+    """SSE: tail JSONL logs and push new events as they arrive."""
+    data_dir = Path.home() / ".local/share/obsidian-rag"
+    paths = {kind: data_dir / fname for kind, fname in _STREAM_FILES.items()}
+    # Start at current EOF so the client only sees new events.
+    offsets: dict[str, int] = {
+        kind: (p.stat().st_size if p.is_file() else 0) for kind, p in paths.items()
+    }
+
+    async def gen():
+        last_heartbeat = time.time()
+        # Initial hello so the client can flip the indicator immediately.
+        yield _sse("hello", {"t": time.time(), "tracking": list(paths.keys())})
+        try:
+            while True:
+                for kind, path in paths.items():
+                    if not path.is_file():
+                        continue
+                    try:
+                        cur_size = path.stat().st_size
+                    except OSError:
+                        continue
+                    prev = offsets.get(kind, 0)
+                    if cur_size < prev:
+                        # Truncated/rotated — reset and skip.
+                        offsets[kind] = cur_size
+                        continue
+                    if cur_size == prev:
+                        continue
+                    try:
+                        with path.open("rb") as f:
+                            f.seek(prev)
+                            chunk = f.read(cur_size - prev)
+                    except OSError:
+                        continue
+                    offsets[kind] = cur_size
+                    for line in chunk.decode("utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
+                        yield _sse(kind, _stream_payload(kind, ev))
+                now = time.time()
+                if now - last_heartbeat >= 15:
+                    yield _sse("heartbeat", {"t": now})
+                    last_heartbeat = now
+                await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _stream_payload(kind: str, ev: dict) -> dict:
+    """Trim raw log entries to the fields the dashboard needs."""
+    if kind == "query":
+        sid = ev.get("session") or ""
+        # Whatsapp listener uses session ids like `wa:<jid>` OR custom strings
+        # like `<runtime>:<vault>` (rag serve from whatsapp-listener) — treat
+        # `serve` cmd as whatsapp by default since that's the only consumer.
+        cmd = ev.get("cmd") or ""
+        if sid.startswith("wa:") or cmd.startswith("serve"):
+            source = "whatsapp"
+        elif sid.startswith("web:"):
+            source = "web"
+        elif sid.startswith("tg:"):
+            source = "telegram"
+        else:
+            source = "cli"
+        tr = ev.get("t_retrieve")
+        tg = ev.get("t_gen")
+        latency = (
+            round(float(tr) + float(tg), 2)
+            if isinstance(tr, (int, float)) and isinstance(tg, (int, float))
+            else None
+        )
+        # phase: received → in-flight, error → failed, anything else → completed
+        if cmd == "serve.received":
+            phase = "in_flight"
+        elif cmd == "serve.error":
+            phase = "error"
+        else:
+            phase = "done"
+        return {
+            "ts": ev.get("ts"),
+            "q": (ev.get("q") or "")[:160],
+            "score": ev.get("top_score"),
+            "latency": latency,
+            "source": source,
+            "cmd": cmd,
+            "phase": phase,
+            "error": (ev.get("error") or "")[:200] if ev.get("error") else None,
+            "gated": bool(ev.get("gated_low_confidence")),
+            "bad_citations": len(ev.get("bad_citations") or []),
+            "n_paths": len(ev.get("paths") or []),
+        }
+    if kind == "feedback":
+        return {
+            "ts": ev.get("ts"),
+            "rating": ev.get("rating"),
+            "q": (ev.get("q") or "")[:160],
+            "reason": (ev.get("reason") or "")[:200],
+            "corrective_path": ev.get("corrective_path"),
+            "n_paths": len(ev.get("paths") or []),
+        }
+    if kind == "ambient":
+        return {
+            "ts": ev.get("ts"),
+            "path": ev.get("path"),
+            "wikilinks_applied": ev.get("wikilinks_applied", 0),
+        }
+    if kind == "contradiction":
+        return {
+            "ts": ev.get("ts"),
+            "path": ev.get("path"),
+            "contradicts": ev.get("contradicts"),
+            "skipped": bool(ev.get("skipped")),
+        }
+    return ev
 
 
 if __name__ == "__main__":

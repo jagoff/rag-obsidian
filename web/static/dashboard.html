@@ -279,6 +279,157 @@
     .tune-metric { color: var(--cyan); }
     .tune-delta { color: var(--green); }
 
+    /* Live indicator */
+    .live {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-faint);
+      cursor: pointer;
+      user-select: none;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+    }
+    .live:hover { border-color: var(--border-strong); }
+    .live .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-faint);
+      box-shadow: 0 0 0 0 rgba(126,231,135,0);
+    }
+    .live[data-state="live"] .dot {
+      background: var(--green);
+      animation: pulse 1.6s ease-out infinite;
+    }
+    .live[data-state="paused"] .dot { background: var(--yellow); }
+    .live[data-state="off"] .dot { background: var(--red); }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(126,231,135,0.55); }
+      70%  { box-shadow: 0 0 0 7px rgba(126,231,135,0); }
+      100% { box-shadow: 0 0 0 0 rgba(126,231,135,0); }
+    }
+
+    /* Live ticker */
+    .ticker {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+    }
+    .ticker-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .ticker-head h2 {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .ticker-empty { color: var(--text-faint); font-style: italic; padding: 8px 0; font-size: 12px; }
+    .ticker-list { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+    .ticker-item {
+      display: grid;
+      grid-template-columns: 60px 70px 1fr 60px 60px;
+      gap: 10px;
+      align-items: center;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+      animation: slideIn 0.4s ease-out;
+    }
+    .ticker-item:hover { background: rgba(255,255,255,0.025); }
+    .ticker-item .t-time { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: 11px; }
+    .ticker-item .t-source {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      text-align: center;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    .ticker-item .t-source.whatsapp { background: rgba(126,231,135,0.12); color: var(--green); }
+    .ticker-item .t-source.web { background: rgba(121,192,255,0.12); color: var(--cyan); }
+    .ticker-item .t-source.cli { background: rgba(210,168,255,0.12); color: var(--purple); }
+    .ticker-item .t-source.telegram { background: rgba(255,166,87,0.12); color: var(--orange); }
+    .ticker-item .t-source.feedback { background: rgba(247,120,186,0.12); color: var(--pink); }
+    .ticker-item .t-q { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ticker-item .t-score { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+    .ticker-item .t-score.high { color: var(--green); }
+    .ticker-item .t-score.mid  { color: var(--yellow); }
+    .ticker-item .t-score.low  { color: var(--red); }
+    .ticker-item .t-latency { text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Feedback section */
+    .feedback-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .fb-list { display: flex; flex-direction: column; gap: 6px; max-height: 280px; overflow-y: auto; }
+    .fb-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.02);
+      border-radius: 6px;
+      font-size: 12px;
+      border-left: 2px solid var(--border-strong);
+    }
+    .fb-row.pos { border-left-color: var(--green); }
+    .fb-row.neg { border-left-color: var(--red); }
+    .fb-row.miss { border-left-color: var(--orange); }
+    .fb-path { color: var(--cyan); font-size: 11px; word-break: break-all; }
+    .fb-meta { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
+    .fb-q { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .fb-count {
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--red);
+      align-self: center;
+    }
+    .fb-count.pos { color: var(--green); }
+    .fb-empty {
+      color: var(--text-faint);
+      font-style: italic;
+      text-align: center;
+      padding: 30px 0;
+      font-size: 12px;
+    }
+    .fb-cal {
+      display: flex;
+      gap: 16px;
+      padding: 10px 0;
+      margin-top: 10px;
+      border-top: 1px solid var(--border);
+    }
+    .fb-cal-item { display: flex; flex-direction: column; gap: 2px; }
+    .fb-cal-label { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+    .fb-cal-value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .fb-cal-value.bad { color: var(--red); }
+    .fb-cal-value.warn { color: var(--yellow); }
+    .fb-cal-value.good { color: var(--green); }
+
+    @media (max-width: 900px) {
+      .feedback-grid { grid-template-columns: 1fr; }
+      .ticker-item { grid-template-columns: 50px 60px 1fr 50px; }
+      .ticker-item .t-latency { display: none; }
+    }
+
     /* Loading state */
     .loading {
       text-align: center;
@@ -308,6 +459,10 @@
       <h1>rag <span>· dashboard</span></h1>
       <div class="header-meta">
         <span id="meta-period"></span>
+        <span id="meta-updated"></span>
+        <button class="live" id="live-toggle" data-state="off" type="button" title="Click to pause/resume live updates">
+          <span class="dot"></span><span id="live-label">conectando…</span>
+        </button>
         <select id="days-picker" aria-label="Period">
           <option value="7">7 days</option>
           <option value="14">14 days</option>

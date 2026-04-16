@@ -16262,10 +16262,33 @@ def serve(host: str, port: int):
                 _cache_put(cache_key, gated_payload)
             return gated_payload
 
+        # Dynamic top-k: high-confidence hits ya traen la respuesta en los 3
+        # chunks más relevantes — mandar los 5 solo infla prefill sin cambiar
+        # la answer. Borderline (≤0.5) sí se beneficia del pool completo
+        # porque ninguno es obviamente el "el" chunk.
+        send_k = 3 if result["confidence"] > 0.5 else len(result["docs"])
+        ctx_docs = result["docs"][:send_k]
+        ctx_metas = result["metas"][:send_k]
+
+        # Truncar parent chunks 1200→600 chars. El reranker ya decidió que
+        # este chunk es relevante; el párrafo completo rara vez aporta sobre
+        # los primeros 600 chars, y el prefill escala lineal con bytes.
+        # Cortamos en boundary de oración/whitespace para no mutilar texto.
+        def _truncate_chunk(text: str, cap: int = 600) -> str:
+            if len(text) <= cap:
+                return text
+            head = text[:cap]
+            for boundary in ('. ', '.\n', '!\n', '?\n', '\n\n'):
+                pos = head.rfind(boundary)
+                if pos > cap * 0.6:
+                    return head[:pos + 1] + " […]"
+            pos = head.rfind(' ')
+            return (head[:pos] if pos > cap * 0.6 else head) + " […]"
+
         # Generate
         context = "\n\n---\n\n".join(
-            f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
-            for d, m in zip(result["docs"], result["metas"])
+            f"[nota: {m['note']}] [ruta: {m['file']}]\n{_truncate_chunk(d)}"
+            for d, m in zip(ctx_docs, ctx_metas)
         )
         # Chat-compact rules default para serve — WA es voice/chat, necesita
         # respuestas cortas y rápidas. `loose` conserva SYSTEM_RULES (permite

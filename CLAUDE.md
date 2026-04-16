@@ -168,19 +168,21 @@ Auto-backfill: `find_urls()` calls `_maybe_backfill_urls()` once per process —
 
 ### Ambient Agent — co-autor reactivo del Inbox
 
-Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el hash cambió. **Composición pura de primitivas existentes, sin LLM extra** (el hook cuesta ~0 además del indexing ya pagado). Activable por usuario vía `/enable_ambient` en el bot de WhatsApp (`~/whatsapp-listener/listener.ts`).
+Hook en `_index_single_file` que dispara sobre saves dentro de `allowed_folders` (default `["00-Inbox"]`) cuando el hash cambió. **Composición pura de primitivas existentes, sin LLM extra** (el hook cuesta ~0 además del indexing ya pagado). Activable por usuario vía `/enable_ambient` en el bot de WhatsApp (`~/whatsapp-listener/listener.ts`).
 
 - **Auto-aplica**: `find_wikilink_suggestions` + `apply_wikilink_suggestions`. Regex determinística (el suggester ya es conservador: skip ambigüos, short titles, self-links).
 - **Notifica vía WhatsApp**: near-duplicates (cosine ≥0.85), related notes (graph/tags), wikilinks aplicados. Mensaje compacto con `[[wikilinks]]` para que sea clickeable en Obsidian.
 - **Silent por default**: si no hay findings interesantes, no manda nada (evita ruido por cada save).
 - **Skip rules**:
-  - Fuera de `00-Inbox/` → no-op.
+  - Fuera de cualquier `allowed_folders` (default `["00-Inbox"]`) → no-op. Matching con trailing slash estricto (`01-Projects/` no matchea `01-ProjectsOld/`).
   - Sin config (no se hizo `/enable_ambient`) → no-op.
   - Frontmatter `ambient: skip` → opt-out por nota.
   - `type: morning-brief | weekly-digest | prep` → skip (system-generated).
   - Dedup 5min: `{path, hash}` analizado recientemente → skip (evita doble ping si el usuario guarda dos veces).
 
-**Config** en `~/.local/share/obsidian-rag/ambient.json` con `{jid, enabled}`. Escrito por el listener (`/enable_ambient` toma el JID del grupo del config del listener — no hay token porque la entrega va por el bridge local). Leído por rag.py vía `_ambient_config()`.
+**Config** en `~/.local/share/obsidian-rag/ambient.json` con `{jid, enabled, allowed_folders?: list[str]}`. Escrito por el listener (`/enable_ambient` toma el JID del grupo del config del listener — no hay token porque la entrega va por el bridge local). Leído por rag.py vía `_ambient_config()` que normaliza trailing slashes y preserva case (PARA folders son case-sensitive). Campo ausente o lista vacía → default `["00-Inbox"]` (backwards-compat).
+
+**Extender a más carpetas**: `rag ambient folders {list,add <folder>,remove <folder>}`. `add` deduplica y valida que exista en el vault; `remove` de último elemento wipea el campo para volver al default. Caso típico: `rag ambient folders add 01-Projects` para tener co-autoría proactiva sobre proyectos activos, no sólo inbox.
 
 **Contract con el bridge**: rag.py SOLO lee la config y POST al `whatsapp-bridge` local (`http://localhost:8080/api/send`, urllib) con `{recipient: jid, message}`. No depende del listener estando up — si el listener muere el análisis sigue y queda en `ambient.jsonl`; si el bridge muere se pierde el ping. Desacoplado.
 
@@ -192,13 +194,18 @@ Hook en `_index_single_file` que dispara sobre saves en `00-Inbox/` cuando el ha
 - `ambient.jsonl` → log append-only de eventos con wikilinks/dupes/related counts + `whatsapp_sent` bool (líneas pre-migración llevan `telegram_sent`).
 - `ambient_state.jsonl` → dedup state (path + hash + timestamp), scan últimas 500 líneas para decidir skip.
 
-Tests: `tests/test_ambient.py` — 18 casos cubriendo config gate, frontmatter opt-out, dedup window, auto-apply wikilinks, whatsapp send stubbed (el `_ambient_whatsapp_send` se monkeypatchea para no tocar el bridge).
+Tests: `tests/test_ambient.py` — 34 casos cubriendo config gate, normalización de `allowed_folders` (trailing slash, case, lista vacía → default), gating del hook por folder (dentro/fuera/exact-prefix), CLI runner de `folders {list,add,remove}` end-to-end, frontmatter opt-out, dedup window, auto-apply wikilinks, whatsapp send stubbed (el `_ambient_whatsapp_send` se monkeypatchea para no tocar el bridge).
 
 ### Capture / morning / dead-notes trilogy
 
 **`rag capture "<text>"`** — atomic building block for quick capture. Writes `<vault>/00-Inbox/YYYY-MM-DD-HHMM-<slug>.md` with frontmatter `{type: capture, tags: [capture, ...], source?}`. Supports `--stdin` (voice transcripts piped in), `--tag` (repeatable), `--source`, `--title`, `--plain`. Auto-indexes so the capture is retrievable immediately. Used by the user directly AND by the WhatsApp listener's `/note` command + voice-message capture path (`~/whatsapp-listener/listener.ts`).
 
-**`rag morning [--dry-run]`** — proactive daily brief. Collects, for the last 36h: notes modified (excluding `05-Reviews/`), current `00-Inbox/` contents, frontmatter `todo:`/`due:` signals, new entries in `contradictions.jsonl`, low-confidence queries (`top_score ≤ CONFIDENCE_RERANK_MIN`). command-r drafts 120-280 words in 1ra persona with a fixed Markdown structure (`## 📬 Ayer en una línea` / `## 🎯 Foco sugerido para hoy` / `## 🗂 Pendientes que asoman` / `## ⚠ Atender`). Writes to `05-Reviews/YYYY-MM-DD.md` and auto-indexes. Auto-fires via launchd Mon-Fri 7:00. Silent no-op when evidence is zero.
+**`rag morning [--dry-run]`** — proactive daily brief. Collects, for the last 36h: notes modified (excluding `05-Reviews/`), current `00-Inbox/` contents, frontmatter `todo:`/`due:` signals, new entries in `contradictions.jsonl`, low-confidence queries (`top_score ≤ CONFIDENCE_RERANK_MIN`), Apple Reminders con due, calendar del día, y forecast de lluvia vía wttr.in (`_fetch_weather_rain`, location default `Recreo,Santa+Fe`, no-op si no hay red o no hay bloques con chance≥40%). command-r drafts 120-280 words in 1ra persona with a fixed Markdown structure (`## 📅 Agenda` / `## ⚙️ Lo que el sistema hizo solo` / `## 📬 Ayer en una línea` / `## 🎯 Foco sugerido para hoy` / `## 🗂 Pendientes que asoman` / `## ⚠ Atender`). Writes to `05-Reviews/YYYY-MM-DD.md` and auto-indexes. Auto-fires via launchd Mon-Fri 7:00. Silent no-op when evidence is zero.
+
+Refinamientos puros-Python (sin tokens extra):
+- **Weather-aware hint**: si `weather_rain.max_chance ≥ HEAVY_RAIN_THRESHOLD` (70%), appendea bajo el resumen "💡 lluvia fuerte (N%) — priorizá trabajo indoor y evitá compromisos outdoor". No dispara si max_chance es 0 o falta.
+- **Dedup vault-todos vs reminders**: `_collect_morning_evidence` post-procesa `todos[]` dropeando los que matchean un reminder por Jaccard ≥ 0.6 sobre tokens normalizados ≥3 chars (NFD + lowercase + strip punct). Reminder gana siempre — tiene due + notificación nativa.
+- **"Lo que el sistema hizo solo"**: `_fetch_system_activity(now, lookback_hours=36)` agrega 3 fuentes on-disk (`ambient.jsonl` con wikilinks/dupes/related > 0, `filing_batches/*.jsonl` — archive-* diferenciado, `tune.jsonl` runs + último delta). `_render_system_activity_section` arma bullets determinísticos (no LLM) insertados entre 📅 Agenda y 🎯 Foco. Sección vacía si todos los conteos relevantes son 0 (un `tune_last_delta` solo no fuerza la sección). El structured_prompt avisa al LLM "NO la re-imprimas" para que cruce referencias pero no duplique.
 
 **`rag today [--dry-run]`** — end-of-day closure, simétrico a `morning`. Ventana: `[hoy 00:00, ahora)`. Recolecta notas modificadas hoy (excluyendo `05-Reviews/` y `00-Inbox/`), capturas del Inbox de hoy con flag `[sin-tags]` para las sin taxonomía, `todo:`/`due:` tocados hoy, entradas nuevas en `contradictions.jsonl`, queries low-confidence de hoy. command-r draftea 150-250 palabras en 1ra persona mirando hacia atrás, con 4 secciones fijas: `## 🪞 Lo que pasó hoy` / `## 📥 Sin procesar` / `## 🔍 Preguntas abiertas` / `## 🌅 Para mañana`. Escribe a `05-Reviews/YYYY-MM-DD-evening.md` (sufijo `-evening` para no colisionar con morning), auto-indexa. Auto-dispara via launchd Mon-Fri 22:00 (`com.fer.obsidian-rag-today`). Silent no-op cuando no hay evidencia. El output alimenta organicamente el `morning` del día siguiente — cierra el loop diario.
 

@@ -66,7 +66,15 @@ def rag_query(
     sess = rag.ensure_session(session_id, mode="mcp") if session_id else None
     history = rag.session_history(sess) if sess else None
     effective_question = question
-    if history:
+    pre_variants: list[str] | None = None
+    if history and multi_query:
+        try:
+            effective_question, pre_variants = rag.reformulate_and_expand(
+                question, history
+            )
+        except Exception:
+            effective_question = question
+    elif history:
         try:
             effective_question = rag.reformulate_query(question, history)
         except Exception:
@@ -75,6 +83,7 @@ def rag_query(
     result = rag.retrieve(
         col, effective_question, k, folder,
         tag=tag, precise=False, multi_query=multi_query, auto_filter=True,
+        variants=pre_variants,
     )
     out = []
     for doc, meta, score in zip(result["docs"], result["metas"], result["scores"]):

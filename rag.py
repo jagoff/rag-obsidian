@@ -678,10 +678,10 @@ def is_excluded(rel_path: str) -> bool:
     return any(seg.startswith(".") for seg in rel_path.split("/") if seg)
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
-# 2 métodos el pool crudo llega a 70-80 únicos. Cap a 25 ahorra ~750ms vs 40
-# (25×50ms=1.25s vs 40×50ms=2s). El top-5 final rarísimo que caiga fuera
-# del top-25 RRF — validado con `rag eval` post-cambio.
-RERANK_POOL_MAX = 25
+# 2 métodos el pool crudo llega a 70-80 únicos. Cap a 30 ahorra ~500ms vs 40
+# (30×50ms=1.5s vs 40×50ms=2s). Pool=25 probado: pierde 1 hit en eval (90.48%
+# vs 95.24%); pool=30 es el sweet spot validado empíricamente.
+RERANK_POOL_MAX = 30
 RERANK_TOP = 5     # final chunks after reranking
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
@@ -869,13 +869,22 @@ def new_turn_id() -> str:
     return secrets.token_hex(6)
 
 
+_ignored_paths_cache: tuple[float, set[str]] = (0.0, set())
+
+
 def load_ignored_paths() -> set[str]:
-    """Lee la lista de paths hard-ignored. Silencioso si no existe."""
+    """Lee la lista de paths hard-ignored. Mtime-cached in-process."""
+    global _ignored_paths_cache
     if not IGNORED_NOTES_PATH.is_file():
         return set()
     try:
+        mt = IGNORED_NOTES_PATH.stat().st_mtime
+        if mt == _ignored_paths_cache[0]:
+            return _ignored_paths_cache[1]
         data = json.loads(IGNORED_NOTES_PATH.read_text(encoding="utf-8"))
-        return set(data.get("paths", []))
+        result = set(data.get("paths", []))
+        _ignored_paths_cache = (mt, result)
+        return result
     except Exception:
         return set()
 
@@ -1171,13 +1180,22 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 
+_db_singleton: tuple[str, chromadb.Collection] | None = None
+
+
 def get_db() -> chromadb.Collection:
+    global _db_singleton
+    db_key = str(DB_PATH)
+    if _db_singleton is not None and _db_singleton[0] == db_key:
+        return _db_singleton[1]
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(DB_PATH))
-    return client.get_or_create_collection(
+    client = chromadb.PersistentClient(path=db_key)
+    col = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
+    _db_singleton = (db_key, col)
+    return col
 
 
 def _collection_name_for_vault(vault_path: Path) -> str:
@@ -2305,8 +2323,26 @@ def reformulate_and_expand(
         "Reglas:\n"
         "- Nombres propios van LITERALES (no 'el actor X', no 'la banda Y').\n"
         "- Preservá posesivos ('mi', 'mis', 'tengo').\n"
-        "- Si menciona 'esa carpeta' o 'del mismo folder', preservá el nombre "
-        "del folder referido.\n\n"
+        "- Si menciona 'esa carpeta' o 'del mismo folder', extraé el nombre "
+        "de carpeta de la ruta en el historial "
+        "(ej: '.../Muros Fractales/...' → 'Muros Fractales').\n"
+        "- Si la pregunta introduce un sustantivo NUEVO (ej: 'referentes', "
+        "'herramientas'), preservalo — no lo reemplaces por temas del historial.\n"
+        "- Pronombres como 'los', 'esa', 'eso' refieren a la entidad del turno "
+        "anterior, no a personas.\n"
+        "- UNA SOLA pregunta por línea. NO concatenes con turnos anteriores.\n"
+        "- NUNCA copies rutas de archivo (paths con '/') en la reformulación.\n\n"
+        "Ejemplos:\n"
+        "H: 'letra de muros fractales' → '(.../Muros Fractales/...)'\n"
+        "P: 'qué otras letras tengo en esa misma carpeta'\n"
+        "L1: qué otras letras tengo en la carpeta Muros Fractales\n"
+        "L2: otras canciones en la carpeta Muros Fractales\n"
+        "L3: letras en el folder Muros Fractales\n\n"
+        "H: 'qué modelos de ollama tengo'\n"
+        "P: 'y el bot de telegram que los usa'\n"
+        "L1: bot de telegram que usa los modelos de ollama\n"
+        "L2: bot telegram para modelos ollama\n"
+        "L3: telegram bot que utiliza ollama\n\n"
         f"Historial:\n{summary_section}{history_text}\n\n"
         f"Nueva pregunta: \"{question}\"\n\n"
         "Devolvé EXACTAMENTE 3 líneas (sin numerar, sin explicar):\n"
@@ -2318,7 +2354,7 @@ def reformulate_and_expand(
         resp = ollama.chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 192},
+            options={**HELPER_OPTIONS, "num_predict": 192, "num_ctx": 2048},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         lines = [ln.strip(" -*·") for ln in resp.message.content.splitlines() if ln.strip()]
@@ -4501,15 +4537,34 @@ def reformulate_query(
         "2. Preservá posesivos y referencias personales ('mi', 'mis', 'tengo', "
         "'mío') — son señal de que la búsqueda es sobre notas del usuario.\n"
         "3. Si la pregunta menciona 'en esa misma carpeta', 'del mismo folder' "
-        "o similar, preservá la palabra carpeta/folder y el nombre del folder "
-        "referido — no la conviertas en query semántico.\n"
+        "o similar, extraé el nombre de carpeta de la ruta en el historial "
+        "(ej: '.../Muros Fractales/...' → carpeta 'Muros Fractales').\n"
         "4. Si la pregunta empieza con conectores ('y', 'y el', 'y la', "
         "'y los', 'y eso', 'y otro') o contiene pronombres/demostrativos "
         "('los', 'las', 'eso', 'ese', 'esa', 'aquel'), es follow-up: resolvé "
         "los antecedentes explícitamente.\n"
         "5. Si la pregunta ya es autónoma (entidades explícitas, sin "
         "conectores ni pronombres ambiguos), devolvela tal cual.\n"
-        "6. Mantené el registro y la longitud aproximada de la pregunta original.\n\n"
+        "6. Mantené el registro y la longitud aproximada de la pregunta original.\n"
+        "7. Si la pregunta introduce un sustantivo NUEVO (ej: 'referentes', "
+        "'herramientas', 'reranker'), preservalo — no lo reemplaces por temas "
+        "del historial.\n"
+        "8. Devolvé UNA SOLA pregunta. NO concatenes con preguntas de turnos "
+        "anteriores.\n"
+        "9. NUNCA copies rutas de archivo (paths con '/') en la reformulación.\n\n"
+        "Ejemplos:\n"
+        "H: 'letra de muros fractales' → Asistente: '(contexto: .../Muros Fractales/...)'\n"
+        "P: 'qué otras letras tengo en esa misma carpeta'\n"
+        "→ qué otras letras tengo en la carpeta Muros Fractales\n\n"
+        "H: 'qué modelos de ollama tengo' → Asistente: '(contexto: modelos ollama)'\n"
+        "P: 'y el bot de telegram que los usa'\n"
+        "→ bot de telegram que usa los modelos de ollama\n\n"
+        "H: 'curso de liderazgo' + 'y el otro curso'\n"
+        "P: 'quiénes son mis referentes en esto'\n"
+        "→ quiénes son mis referentes en coaching y liderazgo\n\n"
+        "H: 'qué modelo de embeddings uso en mi RAG'\n"
+        "P: 'y el reranker'\n"
+        "→ qué reranker usa mi RAG\n\n"
         "Historial:\n"
         f"{summary_section}{history_text}\n\n"
         f"Nueva pregunta: \"{question}\"\n\n"
@@ -4518,7 +4573,7 @@ def reformulate_query(
     resp = ollama.chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        options=HELPER_OPTIONS,
+        options={**HELPER_OPTIONS, "num_ctx": 2048},
         keep_alive=OLLAMA_KEEP_ALIVE,
     )
     return resp.message.content.strip().strip('"')
@@ -4626,7 +4681,8 @@ def retrieve(
       - cross-encoder rerank against the original question
       - parent-chunk expansion for final candidates
     """
-    if col.count() == 0:
+    _col_count = col.count()
+    if _col_count == 0:
         return {
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
             "search_query": question, "filters_applied": {}, "query_variants": [question],
@@ -4693,7 +4749,7 @@ def retrieve(
     # overhead. Measured: parallel 3× slower than sequential on M3 Max.
     seen_ids: set[str] = set()
     merged_ordered: list[str] = []
-    n_results = min(RETRIEVE_K, col.count())
+    n_results = min(RETRIEVE_K, _col_count)
     for v, q_embed in zip(variants, variant_embeds):
         sem_kwargs: dict = {
             "query_embeddings": [q_embed],
@@ -6146,7 +6202,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     check_contradictions = not reset and not no_contradict
 
     if reset:
-        client = chromadb.PersistentClient(path=str(DB_PATH))
+        global _db_singleton
+        _db_singleton = None
+        db_key = str(DB_PATH)
+        client = chromadb.PersistentClient(path=db_key)
         for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
             try:
                 client.delete_collection(cname)
@@ -6155,6 +6214,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         col = client.get_or_create_collection(
             COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
         )
+        _db_singleton = (db_key, col)
         console.print("[yellow]Índice borrado (notas + URLs).[/yellow]")
 
     col_urls = get_urls_db()
@@ -6661,8 +6721,8 @@ def query(
     if not plain:
         console.print(render_response(full))
 
-    bad = verify_citations(full, result["metas"])
-    if bad and not plain:
+    bad = verify_citations(full, result["metas"]) if not plain else []
+    if bad:
         console.print()
         console.print("[bold red]⚠ Citas no verificadas:[/bold red]")
         for label, path in bad:

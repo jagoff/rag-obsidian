@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~14k lines) + `mcp_server.py` (thin wrapper) + `tests/` (617 tests). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~15k lines) + `mcp_server.py` (thin wrapper) + `tests/` (675 tests, 33 files). Resist package-split until real friction shows up.
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation

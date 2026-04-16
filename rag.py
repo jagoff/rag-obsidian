@@ -598,7 +598,7 @@ EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
 CHAT_MODEL_PREFERENCE = ("command-r:latest", "qwen2.5:14b", "phi4:latest")
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v8"  # v8: contextual embeddings (per-note summary in embed_text)
+_COLLECTION_BASE = "obsidian_notes_v9"  # v9: contextual embeddings + temporal tokens + graph PageRank
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
@@ -683,11 +683,17 @@ RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # vs 95.24%); pool=30 es el sweet spot validado empíricamente.
 RERANK_POOL_MAX = 30
 RERANK_TOP = 5     # final chunks after reranking
+PROGRESSIVE_CONTEXT_K = 15  # extra chunks for progressive context (summarized to 1-liners)
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
 # around 0.02-0.10, clearly relevant > 0.2. Gate the LLM below this threshold
 # to skip hallucinated answers from unrelated chunks.
 CONFIDENCE_RERANK_MIN = 0.015
+# Auto-deep threshold: below this score, retrieve() auto-triggers deep_retrieve
+# for a second pass. Between CONFIDENCE_RERANK_MIN and 0.3 (solid hit). Set at
+# 0.10 — borderline queries that would answer but weakly benefit most from
+# iterative retrieval. Above 0.10 the first pass already found strong evidence.
+CONFIDENCE_DEEP_THRESHOLD = 0.10
 
 console = Console()
 
@@ -740,21 +746,24 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
     dominating the chunk embedding.
     """
     # Truncate to avoid blowing helper context window (1024 tokens ≈ 4k chars)
-    body = text[:3000]
+    body = text[:2000]
     prompt = (
         f"Nota: \"{title}\" (carpeta: {folder})\n\n"
         f"{body}\n\n"
-        "Escribí UN resumen de 1-2 oraciones que capture el tema central y "
-        "propósito de esta nota. Solo el resumen, sin preámbulos."
+        "Respondé SOLO con una oración corta (máximo 20 palabras) que diga "
+        "de qué trata esta nota. Sin preámbulos, sin disculpas, sin explicaciones."
     )
     try:
         resp = ollama.chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 80},
+            options={**HELPER_OPTIONS, "num_predict": 40},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
-        return resp.message.content.strip()
+        raw = resp.message.content.strip()
+        # Take only the first sentence, cap at 120 chars to avoid prefix bloat
+        first_line = raw.split("\n")[0].split(". ")[0]
+        return first_line[:120]
     except Exception:
         return ""
 
@@ -832,7 +841,7 @@ class RankerWeights:
     """
     __slots__ = (
         "recency_cue", "recency_always", "tag_literal",
-        "feedback_pos", "feedback_neg",
+        "feedback_pos", "feedback_neg", "graph_pagerank",
     )
 
     def __init__(
@@ -842,21 +851,29 @@ class RankerWeights:
         tag_literal: float = 0.0,
         feedback_pos: float = FEEDBACK_POSITIVE_BOOST,
         feedback_neg: float = FEEDBACK_NEGATIVE_PENALTY,
+        graph_pagerank: float = 0.0,
     ):
         self.recency_cue = float(recency_cue)
         self.recency_always = float(recency_always)
         self.tag_literal = float(tag_literal)
         self.feedback_pos = float(feedback_pos)
         self.feedback_neg = float(feedback_neg)
+        self.graph_pagerank = float(graph_pagerank)
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}
 
     @classmethod
     def from_dict(cls, d: dict) -> "RankerWeights":
-        return cls(**{
-            k: float(d.get(k, getattr(cls(), k))) for k in cls.__slots__
-        })
+        defaults = cls()
+        sanitized = {}
+        for k in cls.__slots__:
+            v = float(d.get(k, getattr(defaults, k)))
+            import math
+            if math.isnan(v) or math.isinf(v):
+                v = float(getattr(defaults, k))
+            sanitized[k] = v
+        return cls(**sanitized)
 
     @classmethod
     def defaults(cls) -> "RankerWeights":
@@ -1859,6 +1876,37 @@ def extract_wikilinks(text: str) -> list[str]:
     return seen
 
 
+def temporal_token(fm: dict) -> str:
+    """Classify note age into a temporal bucket for embedding prefix.
+
+    Buckets are coarse enough to avoid re-indexing on every day change:
+      recent    → modified within 7 days
+      this-month → within 30 days
+      this-quarter → within 90 days
+      older     → beyond 90 days
+      (empty)   → no date metadata
+
+    The token shifts the embedding vector so queries about "current work"
+    naturally prefer recent notes without needing post-hoc recency boosts.
+    """
+    stamp = fm.get("modified") or fm.get("created")
+    if not stamp or not isinstance(stamp, str):
+        return ""
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+    except Exception:
+        return ""
+    if age_days <= 7:
+        return "recent"
+    elif age_days <= 30:
+        return "this-month"
+    elif age_days <= 90:
+        return "this-quarter"
+    return "older"
+
+
 def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str:
     """Build the embedding prefix combining path, frontmatter fields, and tags."""
     fm_bits = []
@@ -2120,8 +2168,9 @@ def _load_corpus(col: chromadb.Collection) -> dict:
 
 
 def _invalidate_corpus_cache() -> None:
-    global _corpus_cache
+    global _corpus_cache, _pagerank_cache
     _corpus_cache = None
+    _pagerank_cache = None
 
 
 def _folder_matches(file_path: str, folder: str) -> bool:
@@ -2721,6 +2770,70 @@ SYSTEM_RULES_STRICT = (
 # en la pregunta reflexiva al final, no en la respuesta factual. Diferenciado
 # de SYSTEM_RULES/STRICT porque coaching genuino requiere dejar espacio al
 # usuario — respuestas largas o consejos directos apagan la exploración.
+def build_progressive_context(
+    col: "chromadb.Collection",
+    primary_docs: list[str],
+    primary_metas: list[dict],
+    question: str,
+    k_extra: int = PROGRESSIVE_CONTEXT_K,
+) -> str:
+    """Build a two-tier LLM context: full primary chunks + 1-line summaries.
+
+    The primary docs (top-k from reranking) go in full. Then we fetch
+    k_extra additional candidates from the same retrieval pool and compress
+    each to a single line, giving the LLM a broader map of the knowledge
+    territory without blowing up the context window.
+
+    Returns the assembled context string ready for the system prompt.
+    """
+    # Primary context (full chunks)
+    primary = "\n\n---\n\n".join(
+        f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
+        for d, m in zip(primary_docs, primary_metas)
+    )
+
+    # Fetch extra candidates beyond what primary already has
+    primary_files = {m.get("file", "") for m in primary_metas}
+    try:
+        # Use semantic search with the question embedding to get nearby chunks
+        q_embed = embed([question])[0]
+        extra_result = col.query(
+            query_embeddings=[q_embed],
+            n_results=min(k_extra + len(primary_metas), col.count()),
+            include=["documents", "metadatas"],
+        )
+        extra_docs = extra_result["documents"][0] if extra_result["documents"] else []
+        extra_metas = extra_result["metadatas"][0] if extra_result["metadatas"] else []
+    except Exception:
+        return primary
+
+    # Filter out chunks already in primary, dedupe by file
+    seen_files: set[str] = set(primary_files)
+    summaries: list[str] = []
+    for doc, meta in zip(extra_docs, extra_metas):
+        fpath = meta.get("file", "")
+        if fpath in seen_files:
+            continue
+        seen_files.add(fpath)
+        # Compress to one line: first 120 chars of the chunk
+        snippet = doc.replace("\n", " ").strip()[:120]
+        if len(doc) > 120:
+            snippet += "…"
+        summaries.append(f"- [{meta.get('note', '?')}]({fpath}): {snippet}")
+        if len(summaries) >= k_extra:
+            break
+
+    if not summaries:
+        return primary
+
+    broad_context = "\n".join(summaries)
+    return (
+        f"{primary}\n\n"
+        f"--- CONTEXTO AMPLIO (consultar solo si las fuentes principales no alcanzan) ---\n\n"
+        f"{broad_context}"
+    )
+
+
 def print_query_header(question: str, result: dict, show_question: bool = True) -> None:
     """Render the metadata row (filters, variants, confidence), optionally
     preceded by the question in a panel. In chat the user just typed the
@@ -3455,6 +3568,47 @@ def _build_graph_adj(corpus: dict) -> dict[str, set[str]]:
                 adj.setdefault(src_path, set()).add(tgt)
                 adj.setdefault(tgt, set()).add(src_path)
     return adj
+
+
+def _graph_pagerank(
+    adj: dict[str, set[str]], damping: float = 0.85, iterations: int = 20,
+) -> dict[str, float]:
+    """Compute PageRank over the wikilink adjacency graph.
+
+    Simple power iteration — O(iterations * edges). With ~2k notes and
+    ~5k edges, this takes <10ms. Returns path → score (sums to 1.0).
+    """
+    nodes = list(adj.keys())
+    if not nodes:
+        return {}
+    n = len(nodes)
+    rank = {node: 1.0 / n for node in nodes}
+    for _ in range(iterations):
+        new_rank: dict[str, float] = {}
+        for node in nodes:
+            incoming = 0.0
+            for neighbor in adj.get(node, set()):
+                out_degree = len(adj.get(neighbor, set())) or 1
+                incoming += rank.get(neighbor, 0.0) / out_degree
+            new_rank[node] = (1 - damping) / n + damping * incoming
+        rank = new_rank
+    return rank
+
+
+# Module-level cache for PageRank — invalidated with corpus cache.
+_pagerank_cache: dict[str, float] | None = None
+
+
+def get_pagerank(col: "chromadb.Collection") -> dict[str, float]:
+    """Cached PageRank over the wikilink graph. Rebuilt when corpus changes."""
+    global _pagerank_cache
+    corpus = _load_corpus(col)
+    if _pagerank_cache is not None and corpus.get("_pagerank_id") == id(corpus):
+        return _pagerank_cache
+    adj = _build_graph_adj(corpus)
+    _pagerank_cache = _graph_pagerank(adj)
+    corpus["_pagerank_id"] = id(corpus)
+    return _pagerank_cache
 
 
 def _hop_set(adj: dict[str, set[str]], start: str, hops: int) -> set[str]:
@@ -4810,7 +4964,6 @@ def retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     variants: list[str] | None = None,
-    graph_expand: bool = False,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -4977,6 +5130,8 @@ def retrieve(
         tag_vocab = set()
     query_tag_hits = match_literal_tags(question, tag_vocab) if tag_vocab else set()
     weights = get_ranker_weights()
+    # Graph PageRank: authority signal from wikilink topology.
+    pagerank = get_pagerank(col) if weights.graph_pagerank else {}
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
@@ -4997,6 +5152,12 @@ def retrieve(
             n_matches = len(query_tag_hits & meta_tags)
             if n_matches:
                 final += weights.tag_literal * n_matches
+        # Graph PageRank: notes with more inbound wikilinks are more
+        # authoritative. Score is normalised [0,1] via rank/max_rank.
+        if weights.graph_pagerank and pagerank:
+            pr = pagerank.get(path, 0.0)
+            max_pr = max(pagerank.values()) if pagerank else 1.0
+            final += weights.graph_pagerank * (pr / max_pr if max_pr > 0 else 0.0)
         # Feedback: additive boost/penalty para paths marcados 👍/👎 en queries
         # similares (cosine ≥ FEEDBACK_MATCH_COSINE). Módulo tuneable por
         # weights — el signo es fijo.
@@ -5011,32 +5172,42 @@ def retrieve(
     docs = [e for _, e, _ in scored]
     metas = [c[1] for c, _, _ in scored]
 
-    # ── Graph expansion: 1-hop wikilink neighbors of top results ────────
+    # ── Graph expansion: weighted 2-hop wikilink neighbors of top results ──
     # Adds context from linked notes that didn't match semantically but are
-    # topologically close. Returned separately so the LLM can use them as
-    # supplementary context without polluting the ranked results.
+    # topologically close. 1-hop neighbors scored higher than 2-hop. PageRank
+    # breaks ties — more authoritative neighbors surface first.
     graph_docs: list[str] = []
     graph_metas: list[dict] = []
-    if graph_expand and metas:
+    if metas:
         try:
             corpus = _load_corpus(col)
             adj = _build_graph_adj(corpus)
+            pr = get_pagerank(col)
             hit_paths = {m.get("file", "") for m in metas}
-            neighbor_paths: list[str] = []
+            # Collect neighbors with (hop_distance, -pagerank) for sorting
+            neighbor_scores: dict[str, tuple[int, float]] = {}
             for m in metas[:3]:  # expand from top-3 only
                 path = m.get("file", "")
                 for nb in adj.get(path, set()):
-                    if nb not in hit_paths and nb not in neighbor_paths:
-                        neighbor_paths.append(nb)
+                    if nb not in hit_paths and nb not in neighbor_scores:
+                        neighbor_scores[nb] = (1, pr.get(nb, 0.0))
+                    # 2-hop: neighbors of neighbors
+                    for nb2 in adj.get(nb, set()):
+                        if nb2 not in hit_paths and nb2 not in neighbor_scores:
+                            neighbor_scores[nb2] = (2, pr.get(nb2, 0.0))
+            # Sort: prefer closer hops, then higher PageRank
+            sorted_neighbors = sorted(
+                neighbor_scores.items(),
+                key=lambda kv: (kv[1][0], -kv[1][1]),
+            )
             # Fetch best chunk per neighbor (first chunk = most representative)
-            for nb_path in neighbor_paths[:3]:  # cap at 3 graph neighbors
+            for nb_path, _ in sorted_neighbors[:5]:  # cap at 5 graph neighbors
                 try:
                     nb_chunks = col.get(
                         where={"file": nb_path},
                         include=["documents", "metadatas"],
                     )
                     if nb_chunks["ids"]:
-                        # Use the first chunk's parent for richer context
                         best_meta = nb_chunks["metadatas"][0]
                         best_doc = expand_to_parent(
                             nb_chunks["documents"][0], best_meta
@@ -5114,7 +5285,6 @@ def deep_retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     variants: list[str] | None = None,
-    graph_expand: bool = False,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -5127,7 +5297,6 @@ def deep_retrieve(
         col, question, k, folder, history=history, tag=tag, precise=precise,
         multi_query=multi_query, auto_filter=auto_filter,
         date_range=date_range, summary=summary, variants=variants,
-        graph_expand=graph_expand,
     )
     if not result["docs"]:
         return result
@@ -5147,7 +5316,6 @@ def deep_retrieve(
         sub_result = retrieve(
             col, sub_query, k, folder, tag=tag, precise=False,
             multi_query=False, auto_filter=False, date_range=date_range,
-            graph_expand=False,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -5285,6 +5453,8 @@ def collect_ranker_features(
     query_tag_hits = match_literal_tags(question, tag_vocab) if tag_vocab else set()
     recency_cue = has_recency_cue(question)
     ignored_set = load_ignored_paths()
+    pagerank = get_pagerank(col)
+    max_pr = max(pagerank.values()) if pagerank else 1.0
 
     feats: list[dict] = []
     for (_, meta, _), s in zip(candidates, rerank_scores):
@@ -5294,6 +5464,7 @@ def collect_ranker_features(
         rec_raw = recency_boost(meta)
         meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
         n_tag = len(query_tag_hits & meta_tags) if query_tag_hits else 0
+        pr = pagerank.get(path, 0.0)
         feats.append({
             "path": path,
             "note": meta.get("note", ""),
@@ -5304,6 +5475,7 @@ def collect_ranker_features(
             "fb_neg": path in penalty_paths,
             "ignored": path in ignored_set,
             "has_recency_cue": bool(recency_cue),
+            "graph_pagerank": float(pr / max_pr if max_pr > 0 else 0.0),
             "meta": meta,
         })
     return feats
@@ -5330,6 +5502,8 @@ def apply_weighted_scores(
             score += weights.recency_always * f["recency_raw"]
         if weights.tag_literal and f["tag_hits"]:
             score += weights.tag_literal * f["tag_hits"]
+        if weights.graph_pagerank and f.get("graph_pagerank"):
+            score += weights.graph_pagerank * f["graph_pagerank"]
         if f["fb_pos"]:
             score += weights.feedback_pos
         if f["fb_neg"]:
@@ -5394,7 +5568,6 @@ def multi_retrieve(
     auto_filter: bool = True,
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
-    graph_expand: bool = False,
     deep: bool = False,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
@@ -5424,7 +5597,6 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
-            graph_expand=graph_expand,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -5442,7 +5614,6 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
-            graph_expand=graph_expand,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -6777,17 +6948,15 @@ def watch(debounce: float):
               help="Salida plana sin colores/paneles/sources. Para consumo programático.")
 @click.option("--counter", is_flag=True,
               help="Después de responder, buscar chunks del vault que CONTRADIGAN la respuesta")
-@click.option("--graph", is_flag=True,
-              help="Expande resultados con vecinos del grafo de wikilinks (1-hop)")
-@click.option("--deep", is_flag=True,
-              help="Retrieval iterativo: el LLM evalúa suficiencia y genera sub-queries (2-3 pasadas)")
+@click.option("--no-deep", is_flag=True,
+              help="Desactiva retrieval iterativo automático (deep retrieve)")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
-    counter: bool, graph: bool, deep: bool,
+    counter: bool, no_deep: bool,
 ):
     """Consulta única contra las notas."""
     warmup_async()
@@ -6891,12 +7060,20 @@ def query(
         col=col, question=effective_question, k=k, folder=folder,
         history=history, tag=tag,
         precise=hyde, multi_query=not no_multi, auto_filter=not no_auto_filter,
-        date_range=date_range, variants=pre_variants, graph_expand=graph,
+        date_range=date_range, variants=pre_variants,
     )
-    if deep:
-        _do_retrieve = lambda: deep_retrieve(**_retrieve_kwargs)
-    else:
-        _do_retrieve = lambda: retrieve(**_retrieve_kwargs)
+
+    def _do_retrieve():
+        result = retrieve(**_retrieve_kwargs)
+        # Auto-deep: if first-pass confidence is borderline, run iterative
+        # retrieval to try to surface better evidence. Threshold calibrated
+        # between CONFIDENCE_RERANK_MIN (0.015, would refuse) and a "solid
+        # hit" (~0.3). Skipped when --no-deep or --raw.
+        if (not no_deep and not raw
+                and result["docs"]
+                and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
+            result = deep_retrieve(**_retrieve_kwargs)
+        return result
 
     if plain:
         result = _do_retrieve()
@@ -6990,9 +7167,9 @@ def query(
             save_session(sess)
         return
 
-    context = "\n\n---\n\n".join(
-        f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
-        for d, m in zip(result["docs"], result["metas"])
+    # Progressive context: top-k full + extra chunks as 1-line summaries
+    context = build_progressive_context(
+        col, result["docs"], result["metas"], question,
     )
     # Append graph-expanded neighbors as supplementary context
     graph_docs = result.get("graph_docs", [])
@@ -7313,10 +7490,8 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
 @click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
 @click.option("--counter", is_flag=True,
               help="Después de cada respuesta, buscar chunks del vault que la CONTRADIGAN")
-@click.option("--graph", is_flag=True,
-              help="Expande resultados con vecinos del grafo de wikilinks (1-hop)")
-@click.option("--deep", is_flag=True,
-              help="Retrieval iterativo: el LLM evalúa suficiencia y genera sub-queries")
+@click.option("--no-deep", is_flag=True,
+              help="Desactiva retrieval iterativo automático")
 @click.option("--vault", "vault_scope", default=None,
               help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
                    "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
@@ -7325,7 +7500,7 @@ def chat(
     since: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
-    graph: bool, deep: bool,
+    no_deep: bool,
     vault_scope: str | None,
 ):
     """Chat interactivo con tus notas."""
@@ -7633,8 +7808,18 @@ def chat(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
-                graph_expand=graph, deep=deep,
             )
+            # Auto-deep: if first-pass confidence is borderline, retry with
+            # iterative retrieval for richer context.
+            if (not no_deep
+                    and result["docs"]
+                    and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
+                result = multi_retrieve(
+                    vaults_resolved, question, k, folder, history, tag, precise,
+                    multi_query=not no_multi, auto_filter=not no_auto_filter,
+                    date_range=pinned_date_range, summary=sess_summary,
+                    deep=True,
+                )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
             continue
@@ -7644,11 +7829,17 @@ def chat(
         # Con >1 vault, anotamos el chunk header con el vault de origen así
         # el LLM puede citarlo y vos podés distinguir en la respuesta.
         is_multi = len(vaults_resolved) > 1
-        context = "\n\n---\n\n".join(
-            (f"[vault: {m.get('_vault', '?')}] " if is_multi else "")
-            + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
-            for d, m in zip(result["docs"], result["metas"])
-        )
+        if is_multi:
+            # Multi-vault: can't use progressive context (no single col)
+            context = "\n\n---\n\n".join(
+                f"[vault: {m.get('_vault', '?')}] "
+                + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
+                for d, m in zip(result["docs"], result["metas"])
+            )
+        else:
+            context = build_progressive_context(
+                col, result["docs"], result["metas"], question,
+            )
         # Append graph-expanded neighbors as supplementary context
         graph_docs = result.get("graph_docs", [])
         graph_metas = result.get("graph_metas", [])
@@ -8220,6 +8411,7 @@ _TUNE_SPACE = {
     "tag_literal":    (0.0, 0.20),   # default 0.00 (new signal)
     "feedback_pos":   (0.0, 0.15),   # default 0.03
     "feedback_neg":   (0.0, 0.50),   # default 0.15
+    "graph_pagerank": (0.0, 0.30),   # default 0.00 — wikilink authority signal
 }
 
 
@@ -9944,6 +10136,28 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print("[dim](sin writes propuestos)[/dim]")
 
 
+_WEATHER_ES: dict[str, str] = {
+    "Clear": "Despejado", "Sunny": "Soleado", "Partly Cloudy": "Parcialmente nublado",
+    "Partly cloudy": "Parcialmente nublado", "Cloudy": "Nublado", "Overcast": "Cubierto",
+    "Mist": "Neblina", "Fog": "Niebla", "Light rain": "Lluvia leve",
+    "Light drizzle": "Llovizna", "Drizzle": "Llovizna",
+    "Patchy rain nearby": "Lluvia intermitente", "Patchy rain possible": "Posible lluvia",
+    "Moderate rain": "Lluvia moderada", "Heavy rain": "Lluvia fuerte",
+    "Light rain shower": "Chubasco leve", "Moderate or heavy rain shower": "Chubasco fuerte",
+    "Thundery outbreaks possible": "Posibles tormentas",
+    "Patchy light rain with thunder": "Lluvia leve con truenos",
+    "Moderate or heavy rain with thunder": "Lluvia fuerte con truenos",
+    "Light snow": "Nieve leve", "Heavy snow": "Nieve fuerte",
+    "Patchy light drizzle": "Llovizna intermitente",
+    "Light freezing rain": "Lluvia helada leve",
+}
+
+
+def _translate_weather(desc: str) -> str:
+    parts = [_WEATHER_ES.get(p.strip(), p.strip()) for p in desc.split(",")]
+    return ", ".join(parts)
+
+
 @cli.command()
 @click.argument("question", default="")
 def weather(question: str):
@@ -9953,10 +10167,10 @@ def weather(question: str):
         click.echo("Error: no se pudo obtener el pronóstico.")
         raise SystemExit(1)
     cur = data["current"]
-    lines = [f"📍 {data['location']} — {cur['description']}, {cur['temp_C']}°C"]
+    lines = [f"📍 {data['location']} — {_translate_weather(cur['description'])}, {cur['temp_C']}°C"]
     for d in data["days"]:
         rain = f", 🌧 {d['chanceofrain']}%" if d["chanceofrain"] > 10 else ""
-        lines.append(f"  {d['date']}: {d['minC']}–{d['maxC']}°C, {d['description']}{rain}")
+        lines.append(f"  {d['date']}: {d['minC']}–{d['maxC']}°C, {_translate_weather(d['description'])}{rain}")
     click.echo("\n".join(lines))
 
 
@@ -12318,24 +12532,98 @@ def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
     }
 
 
+_WMO_WEATHER_CODES: dict[int, str] = {
+    0: "Despejado", 1: "Mayormente despejado", 2: "Parcialmente nublado",
+    3: "Cubierto", 45: "Neblina", 48: "Neblina helada",
+    51: "Llovizna leve", 53: "Llovizna moderada", 55: "Llovizna densa",
+    56: "Llovizna helada leve", 57: "Llovizna helada densa",
+    61: "Lluvia leve", 63: "Lluvia moderada", 65: "Lluvia fuerte",
+    66: "Lluvia helada leve", 67: "Lluvia helada fuerte",
+    71: "Nieve leve", 73: "Nieve moderada", 75: "Nieve fuerte",
+    77: "Granizo fino", 80: "Chubasco leve", 81: "Chubasco moderado",
+    82: "Chubasco fuerte", 85: "Nevada leve", 86: "Nevada fuerte",
+    95: "Tormenta", 96: "Tormenta con granizo leve", 99: "Tormenta con granizo fuerte",
+}
+
+
+def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
+    """Fallback weather via Open-Meteo (free, no API key)."""
+    import urllib.request as _req
+    import urllib.parse as _parse
+
+    city = location.replace("+", " ").split(",")[0]
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={_parse.quote(city)}&count=1&language=es"
+    try:
+        with _req.urlopen(geo_url, timeout=5.0) as resp:
+            geo = json.loads(resp.read())
+        r = geo["results"][0]
+        lat, lon, name = r["latitude"], r["longitude"], r.get("name", city)
+    except Exception:
+        return None
+
+    wx_url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,weather_code"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
+        "&timezone=auto&forecast_days=3"
+    )
+    try:
+        with _req.urlopen(wx_url, timeout=5.0) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+
+    cur = data.get("current", {})
+    cur_code = cur.get("weather_code", 0)
+    cur_desc = _WMO_WEATHER_CODES.get(cur_code, f"Código {cur_code}")
+    cur_temp = str(round(cur.get("temperature_2m", 0)))
+
+    daily = data.get("daily", {})
+    dates = daily.get("time", [])
+    maxs = daily.get("temperature_2m_max", [])
+    mins = daily.get("temperature_2m_min", [])
+    rain_probs = daily.get("precipitation_probability_max", [])
+    codes = daily.get("weather_code", [])
+
+    days: list[dict] = []
+    for i, d in enumerate(dates):
+        code = codes[i] if i < len(codes) else 0
+        days.append({
+            "date": d,
+            "minC": str(round(mins[i])) if i < len(mins) else "",
+            "maxC": str(round(maxs[i])) if i < len(maxs) else "",
+            "avgC": "",
+            "description": _WMO_WEATHER_CODES.get(code, f"Código {code}"),
+            "chanceofrain": rain_probs[i] if i < len(rain_probs) else 0,
+            "chanceofthunder": 0,
+        })
+
+    country = location.split(",")[-1].strip().replace("+", " ") if "," in location else ""
+    loc_str = f"{name},{country}" if country else name
+    return {
+        "location": loc_str,
+        "current": {"description": cur_desc, "temp_C": cur_temp},
+        "days": days,
+    }
+
+
 def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
-    """Query wttr.in and return a multi-day forecast summary.
+    """Query wttr.in, fallback to Open-Meteo. Returns multi-day forecast summary.
 
     Returns dict with keys: location, current, days (list of up to 3 day
     forecasts with date, minC, maxC, avgC, description, chanceofrain,
-    chanceofthunder). Returns None on network/parse errors.
+    chanceofthunder). Returns None on network/parse errors from both sources.
     """
     import urllib.request as _req
+
+    # Primary: wttr.in
     url = f"https://wttr.in/{location}?format=j1"
     try:
         with _req.urlopen(url, timeout=8.0) as resp:
             raw = resp.read()
-    except Exception:
-        return None
-    try:
         data = json.loads(raw)
     except Exception:
-        return None
+        return _fetch_weather_openmeteo(location)
 
     # Current conditions
     current = ""
@@ -12374,6 +12662,9 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
             "chanceofrain": max_rain,
             "chanceofthunder": max_thunder,
         })
+
+    if not days:
+        return _fetch_weather_openmeteo(location)
 
     return {
         "location": location.replace("+", " "),
@@ -15693,6 +15984,763 @@ def session_cleanup(days: int):
     """Purga sesiones viejas."""
     removed = cleanup_sessions(ttl_days=days)
     console.print(f"[cyan]{removed}[/cyan] sesión(es) borrada(s) (TTL {days}d)")
+
+
+# ── DASHBOARD ─────────────────────────────────────────────────────────────────
+# Terminal-based analytics over queries.jsonl. Shows query patterns, retrieval
+# quality distribution, latency breakdown, and feedback ratio.
+
+
+def _dashboard_data(days: int = 30) -> dict:
+    """Parse queries.jsonl into dashboard metrics."""
+    entries = _scan_queries_log(days=days)
+    if not entries:
+        return {"n": 0}
+
+    scores: list[float] = []
+    t_retrieves: list[float] = []
+    t_gens: list[float] = []
+    gated = 0
+    answered = 0
+    topics: dict[str, int] = {}
+    hours: dict[int, int] = {}
+    cmds: dict[str, int] = {}
+
+    for e in entries:
+        ts_raw = e.get("ts") or e.get("timestamp")
+        if ts_raw:
+            try:
+                hour = datetime.fromisoformat(ts_raw).hour
+                hours[hour] = hours.get(hour, 0) + 1
+            except Exception:
+                pass
+
+        cmd = e.get("cmd", "?")
+        cmds[cmd] = cmds.get(cmd, 0) + 1
+
+        top = e.get("top_score")
+        if isinstance(top, (int, float)):
+            scores.append(float(top))
+
+        tr = e.get("t_retrieve")
+        if isinstance(tr, (int, float)):
+            t_retrieves.append(float(tr))
+
+        tg = e.get("t_gen")
+        if isinstance(tg, (int, float)) and tg > 0:
+            t_gens.append(float(tg))
+
+        if e.get("gated_low_confidence"):
+            gated += 1
+        if e.get("answered"):
+            answered += 1
+
+        # Topic extraction: first 3 words of query
+        q = e.get("q", "")
+        if q:
+            words = q.lower().split()[:3]
+            topic = " ".join(words)
+            topics[topic] = topics.get(topic, 0) + 1
+
+    # Percentiles helper
+    def pct(values: list[float], p: float) -> float:
+        if not values:
+            return 0.0
+        s = sorted(values)
+        idx = int(len(s) * p / 100)
+        return s[min(idx, len(s) - 1)]
+
+    return {
+        "n": len(entries),
+        "days": days,
+        "scores": scores,
+        "t_retrieves": t_retrieves,
+        "t_gens": t_gens,
+        "gated": gated,
+        "answered": answered,
+        "topics": topics,
+        "hours": hours,
+        "cmds": cmds,
+        "pct": pct,
+    }
+
+
+@cli.command()
+@click.option("--days", default=30, show_default=True, help="Ventana temporal en días")
+def dashboard(days: int):
+    """Analytics dashboard — métricas del pipeline sobre queries.jsonl."""
+    data = _dashboard_data(days)
+    if data["n"] == 0:
+        console.print("[yellow]Sin queries en el período.[/yellow]")
+        return
+
+    console.print()
+    console.print(Rule(title="[bold cyan]Dashboard[/bold cyan]", style="cyan"))
+    console.print(f"  [dim]{data['n']} queries · últimos {data['days']} días[/dim]")
+    console.print()
+
+    # ── Commands breakdown ──
+    t = Table(title="Comandos", show_header=True, header_style="bold", box=None, padding=(0, 2))
+    t.add_column("Comando", style="cyan")
+    t.add_column("Count", justify="right")
+    for cmd, count in sorted(data["cmds"].items(), key=lambda x: -x[1])[:8]:
+        t.add_row(cmd, str(count))
+    console.print(t)
+    console.print()
+
+    # ── Retrieval quality ──
+    scores = data["scores"]
+    pct = data["pct"]
+    if scores:
+        console.print(Rule(title="[dim]Retrieval Quality[/dim]", style="dim", characters="╌"))
+        gate_rate = data["gated"] / data["n"] * 100 if data["n"] else 0
+        answer_rate = data["answered"] / data["n"] * 100 if data["n"] else 0
+        console.print(f"  Score p50: [bold]{pct(scores, 50):.3f}[/bold] · "
+                      f"p95: [bold]{pct(scores, 95):.3f}[/bold] · "
+                      f"min: {min(scores):.3f} · max: {max(scores):.3f}")
+        console.print(f"  Gate rate: [{'red' if gate_rate > 30 else 'green'}]"
+                      f"{gate_rate:.1f}%[/] · Answer rate: [green]{answer_rate:.1f}%[/]")
+        # Score distribution histogram (inline)
+        buckets = [0] * 10  # 0.0-0.1, 0.1-0.2, ..., 0.9-1.0
+        for s in scores:
+            clamped = max(0.0, min(s, 1.0))
+            idx = min(int(clamped * 10), 9)
+            buckets[idx] += 1
+        max_b = max(buckets) or 1
+        console.print("  Score distribution:")
+        for i, b in enumerate(buckets):
+            bar = "█" * int(b / max_b * 20) if b else ""
+            label = f"  {i/10:.1f}-{(i+1)/10:.1f}"
+            console.print(f"  {label} [{('green' if i >= 5 else 'yellow' if i >= 2 else 'red')}]{bar}[/] {b}")
+        console.print()
+
+    # ── Latency breakdown ──
+    t_r = data["t_retrieves"]
+    t_g = data["t_gens"]
+    if t_r:
+        console.print(Rule(title="[dim]Latency[/dim]", style="dim", characters="╌"))
+        console.print(f"  Retrieve: p50 [bold]{pct(t_r, 50):.2f}s[/bold] · "
+                      f"p95 [bold]{pct(t_r, 95):.2f}s[/bold]")
+        if t_g:
+            console.print(f"  Generate: p50 [bold]{pct(t_g, 50):.2f}s[/bold] · "
+                          f"p95 [bold]{pct(t_g, 95):.2f}s[/bold]")
+            total = [r + g for r, g in zip(t_r[:len(t_g)], t_g)]
+            if total:
+                console.print(f"  Total:    p50 [bold]{pct(total, 50):.2f}s[/bold] · "
+                              f"p95 [bold]{pct(total, 95):.2f}s[/bold]")
+        console.print()
+
+    # ── Activity heatmap (by hour) ──
+    hours = data["hours"]
+    if hours:
+        console.print(Rule(title="[dim]Activity by Hour[/dim]", style="dim", characters="╌"))
+        max_h = max(hours.values()) or 1
+        for h in range(24):
+            count = hours.get(h, 0)
+            bar = "█" * int(count / max_h * 30) if count else ""
+            console.print(f"  {h:02d}:00 [cyan]{bar}[/] {count if count else ''}")
+        console.print()
+
+    # ── Hot topics (top queries by prefix) ──
+    topics = data["topics"]
+    if topics:
+        console.print(Rule(title="[dim]Hot Topics[/dim]", style="dim", characters="╌"))
+        for topic, count in sorted(topics.items(), key=lambda x: -x[1])[:10]:
+            if count >= 2:
+                console.print(f"  [bold]{count}×[/bold] {topic}")
+        console.print()
+
+    # ── Feedback stats ──
+    try:
+        if FEEDBACK_PATH.is_file():
+            fb_lines = FEEDBACK_PATH.read_text(encoding="utf-8").splitlines()
+            pos = sum(1 for l in fb_lines if '"rating": 1' in l or '"rating":1' in l)
+            neg = sum(1 for l in fb_lines if '"rating": -1' in l or '"rating":-1' in l)
+            corrective = sum(1 for l in fb_lines if '"corrective_path"' in l)
+            console.print(Rule(title="[dim]Feedback[/dim]", style="dim", characters="╌"))
+            total_fb = pos + neg
+            ratio = pos / total_fb * 100 if total_fb else 0
+            console.print(f"  👍 {pos} · 👎 {neg} · ratio: [{'green' if ratio > 70 else 'yellow'}]{ratio:.0f}%[/]")
+            if corrective:
+                console.print(f"  🎯 {corrective} corrective paths")
+            console.print()
+    except Exception:
+        pass
+
+    # ── Index stats (quick) ──
+    try:
+        col = get_db()
+        n_chunks = col.count()
+        console.print(Rule(title="[dim]Index[/dim]", style="dim", characters="╌"))
+        console.print(f"  {n_chunks} chunks indexed")
+        corpus = _load_corpus(col)
+        console.print(f"  {len(corpus['tags'])} tags · "
+                      f"{len(corpus['folders'])} folders · "
+                      f"{len(corpus['title_to_paths'])} notes")
+        pr = get_pagerank(col)
+        if pr:
+            top_pr = sorted(pr.items(), key=lambda x: -x[1])[:5]
+            console.print("  Top PageRank:")
+            for path, score in top_pr:
+                console.print(f"    {score:.4f} {path}")
+    except Exception:
+        pass
+    console.print()
+
+
+# ── MAINTENANCE ──────────────────────────────────────────────────────────────
+# Unified housekeeping: reindex, prune orphans, rotate logs, clean caches,
+# rebuild derived state, report dead notes. Safe to run unattended (cron/launchd).
+
+_JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 10 MB threshold for log rotation
+
+_JSONL_LOG_PATHS: list[tuple[str, Path]] = [
+    ("queries.jsonl", LOG_PATH),
+    ("contradictions.jsonl", CONTRADICTION_LOG_PATH),
+    ("ambient.jsonl", AMBIENT_LOG_PATH),
+    ("ambient_state.jsonl", AMBIENT_STATE_PATH),
+    ("tune.jsonl", TUNE_LOG_PATH),
+]
+
+
+def _rotate_jsonl(path: Path, max_bytes: int = _JSONL_ROTATE_BYTES) -> str | None:
+    """Rotate a JSONL file if it exceeds max_bytes. Keeps the most recent half
+    of the lines and moves the rest to path.1. Returns description or None."""
+    if not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size < max_bytes:
+        return None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2:
+        return None
+    keep = len(lines) // 2
+    old = path.with_suffix(path.suffix + ".1")
+    old.write_text("\n".join(lines[:len(lines) - keep]) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines[len(lines) - keep:]) + "\n", encoding="utf-8")
+    return f"{len(lines) - keep} lines kept, {len(lines) - keep} archived → {old.name} ({size / 1024:.0f} KB → {path.stat().st_size / 1024:.0f} KB)"
+
+
+def _prune_context_cache(col: "chromadb.Collection") -> int:
+    """Remove context_summaries entries whose file hash is no longer in the index."""
+    cache = _load_context_cache()
+    if not cache:
+        return 0
+    existing = col.get(include=["metadatas"])
+    live_hashes: set[str] = set()
+    for m in existing["metadatas"]:
+        h = m.get("hash", "")
+        if h:
+            live_hashes.add(h)
+    stale = [k for k in cache if k not in live_hashes]
+    for k in stale:
+        del cache[k]
+    if stale:
+        global _context_cache_dirty
+        _context_cache_dirty = True
+        _save_context_cache()
+    return len(stale)
+
+
+def _prune_ignored_notes(vault: Path) -> int:
+    """Remove entries from ignored_notes.json whose files no longer exist."""
+    paths = load_ignored_paths()
+    if not paths:
+        return 0
+    stale = {p for p in paths if not (vault / p).exists()}
+    if stale:
+        save_ignored_paths(paths - stale)
+    return len(stale)
+
+
+def _prune_auto_index_state() -> int:
+    """Remove auto_index_state entries for vaults not in the registry or default."""
+    state = _auto_index_state_load()
+    if not state:
+        return 0
+    valid_keys = {_vault_state_key(VAULT_PATH)}
+    try:
+        vcfg = _load_vaults_config()
+        for vpath in vcfg["vaults"].values():
+            valid_keys.add(_vault_state_key(Path(vpath)))
+    except Exception:
+        pass
+    stale = [k for k in state if k not in valid_keys]
+    if stale:
+        for k in stale:
+            del state[k]
+        _auto_index_state_save(state)
+    return len(stale)
+
+
+_FILING_BATCH_TTL_DAYS = 90
+
+
+def _prune_filing_batches(ttl_days: int = _FILING_BATCH_TTL_DAYS) -> int:
+    """Delete filing batch files older than ttl_days."""
+    if not FILING_BATCHES_DIR.is_dir():
+        return 0
+    cutoff = time.time() - ttl_days * 86400
+    removed = 0
+    for f in FILING_BATCHES_DIR.glob("*.jsonl"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _cleanup_tmp_files() -> int:
+    """Remove orphan .tmp files from state directories (crashed writes)."""
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    removed = 0
+    if not state_dir.is_dir():
+        return 0
+    for tmp in state_dir.glob("*.tmp"):
+        try:
+            # Only remove if older than 1 hour (avoid racing with live writes)
+            if time.time() - tmp.stat().st_mtime > 3600:
+                tmp.unlink()
+                removed += 1
+        except OSError:
+            continue
+    # Also check sessions dir
+    if SESSIONS_DIR.is_dir():
+        for tmp in SESSIONS_DIR.glob("*.tmp"):
+            try:
+                if time.time() - tmp.stat().st_mtime > 3600:
+                    tmp.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def _check_ollama_health() -> dict:
+    """Verify required Ollama models are available. Returns {model: ok/missing}."""
+    required = [EMBED_MODEL, HELPER_MODEL] + list(CHAT_MODEL_PREFERENCE)
+    status: dict[str, str] = {}
+    try:
+        available = {m.model for m in ollama.list().models}
+    except Exception as e:
+        return {"error": str(e)}
+    for model in required:
+        # ollama.list() returns full names; match with and without :latest
+        found = model in available or f"{model}:latest" in available
+        if not found:
+            # Try prefix match (e.g. "command-r" matches "command-r:latest")
+            found = any(a.startswith(model.split(":")[0] + ":") for a in available)
+        status[model] = "ok" if found else "missing"
+    return status
+
+
+def _prune_url_orphans(vault: Path) -> int:
+    """Remove URL collection entries for files no longer on disk."""
+    try:
+        col_urls = get_urls_db()
+        all_urls = col_urls.get(include=["metadatas"])
+    except Exception:
+        return 0
+    if not all_urls["ids"]:
+        return 0
+    on_disk = {
+        str(p.relative_to(vault))
+        for p in vault.rglob("*.md")
+        if not is_excluded(str(p.relative_to(vault)))
+    }
+    orphan_ids = [
+        id_ for id_, meta in zip(all_urls["ids"], all_urls["metadatas"])
+        if meta.get("file", "") not in on_disk
+    ]
+    if orphan_ids:
+        # ChromaDB delete has a batch limit; chunk if needed
+        for i in range(0, len(orphan_ids), 5000):
+            col_urls.delete(ids=orphan_ids[i:i + 5000])
+    return len(orphan_ids)
+
+
+def _prune_feedback_orphans(vault: Path) -> int:
+    """Remove feedback.jsonl entries whose paths all point to deleted notes.
+    Rewrites the file in place, preserving entries that have at least one live path."""
+    if not FEEDBACK_PATH.is_file():
+        return 0
+    on_disk = {
+        str(p.relative_to(vault))
+        for p in vault.rglob("*.md")
+        if not is_excluded(str(p.relative_to(vault)))
+    }
+    lines = FEEDBACK_PATH.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    removed = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            kept.append(line)
+            continue
+        paths = ev.get("paths") or []
+        # Keep if any path still exists, or if it's a session-scope rating (no paths)
+        if not paths or any(p in on_disk for p in paths):
+            kept.append(line)
+        else:
+            removed += 1
+    if removed:
+        FEEDBACK_PATH.write_text("\n".join(kept) + "\n" if kept else "", encoding="utf-8")
+    return removed
+
+
+def _find_orphan_collections() -> list[str]:
+    """Detect ChromaDB collections from old schema versions or removed vaults."""
+    try:
+        client = chromadb.PersistentClient(path=str(DB_PATH))
+        all_cols = [c.name for c in client.list_collections()]
+    except Exception:
+        return []
+    known = {COLLECTION_NAME, URLS_COLLECTION_NAME}
+    # Also include collections for registered vaults
+    try:
+        vcfg = _load_vaults_config()
+        for vpath in vcfg["vaults"].values():
+            vp = Path(vpath)
+            known.add(_collection_name_for_vault(vp))
+            known.add(_urls_collection_name_for_vault(vp))
+    except Exception:
+        pass
+    return [c for c in all_cols if c not in known]
+
+
+def run_maintenance(
+    *,
+    dry_run: bool = False,
+    skip_reindex: bool = False,
+    skip_logs: bool = False,
+    verbose: bool = False,
+) -> dict:
+    """Run all maintenance tasks. Returns summary dict."""
+    import time as _t
+    t0 = _t.perf_counter()
+    results: dict = {}
+
+    # 1. Incremental reindex (cleans orphan chunks too)
+    if not skip_reindex and not dry_run:
+        try:
+            idx = auto_index_vault(VAULT_PATH)
+            results["reindex"] = idx
+        except Exception as e:
+            results["reindex_error"] = str(e)
+
+    # 2. Session cleanup
+    removed_sessions = cleanup_sessions()
+    results["sessions_removed"] = removed_sessions
+
+    # 3. Orphan collections
+    orphan_cols = _find_orphan_collections()
+    results["orphan_collections"] = orphan_cols
+    if orphan_cols and not dry_run:
+        client = chromadb.PersistentClient(path=str(DB_PATH))
+        for cname in orphan_cols:
+            try:
+                client.delete_collection(cname)
+            except Exception:
+                pass
+        results["orphan_collections_removed"] = len(orphan_cols)
+
+    # 4. Context cache pruning
+    try:
+        col = get_db()
+        if dry_run:
+            cache = _load_context_cache()
+            existing = col.get(include=["metadatas"])
+            live_hashes = {m.get("hash", "") for m in existing["metadatas"]} - {""}
+            results["context_cache_pruned"] = sum(1 for k in cache if k not in live_hashes)
+        else:
+            pruned = _prune_context_cache(col)
+            results["context_cache_pruned"] = pruned
+    except Exception as e:
+        results["context_cache_error"] = str(e)
+
+    # 5. Feedback golden rebuild
+    if not dry_run:
+        try:
+            golden = _rebuild_feedback_golden()
+            results["feedback_golden"] = {
+                "positives": len(golden.get("positives", [])),
+                "negatives": len(golden.get("negatives", [])),
+            }
+        except Exception as e:
+            results["feedback_golden_error"] = str(e)
+
+    # 6. JSONL log rotation
+    if not skip_logs:
+        rotated = {}
+        for label, path in _JSONL_LOG_PATHS:
+            if dry_run:
+                try:
+                    sz = path.stat().st_size if path.is_file() else 0
+                    if sz >= _JSONL_ROTATE_BYTES:
+                        rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
+                except OSError:
+                    pass
+            else:
+                r = _rotate_jsonl(path)
+                if r:
+                    rotated[label] = r
+        results["log_rotation"] = rotated
+
+    # 7. Ignored notes orphans
+    if dry_run:
+        ign = load_ignored_paths()
+        results["ignored_pruned"] = sum(1 for p in ign if not (VAULT_PATH / p).exists())
+    else:
+        results["ignored_pruned"] = _prune_ignored_notes(VAULT_PATH)
+
+    # 8. Auto-index state orphans
+    if dry_run:
+        st = _auto_index_state_load()
+        valid = {_vault_state_key(VAULT_PATH)}
+        try:
+            vcfg = _load_vaults_config()
+            for vp in vcfg["vaults"].values():
+                valid.add(_vault_state_key(Path(vp)))
+        except Exception:
+            pass
+        results["index_state_pruned"] = sum(1 for k in st if k not in valid)
+    else:
+        results["index_state_pruned"] = _prune_auto_index_state()
+
+    # 9. Filing batch pruning (>90d)
+    if dry_run:
+        cutoff = _t.time() - _FILING_BATCH_TTL_DAYS * 86400
+        results["batches_pruned"] = sum(
+            1 for f in (FILING_BATCHES_DIR.glob("*.jsonl") if FILING_BATCHES_DIR.is_dir() else [])
+            if f.stat().st_mtime < cutoff
+        )
+    else:
+        results["batches_pruned"] = _prune_filing_batches()
+
+    # 10. Tmp file cleanup
+    if dry_run:
+        state_dir = Path.home() / ".local/share/obsidian-rag"
+        n_tmp = 0
+        for d in (state_dir, SESSIONS_DIR):
+            if d.is_dir():
+                n_tmp += sum(1 for t in d.glob("*.tmp") if _t.time() - t.stat().st_mtime > 3600)
+        results["tmp_cleaned"] = n_tmp
+    else:
+        results["tmp_cleaned"] = _cleanup_tmp_files()
+
+    # 11. URL orphans (files deleted but URL rows remain)
+    if dry_run:
+        try:
+            cu = get_urls_db()
+            all_u = cu.get(include=["metadatas"])
+            od = {
+                str(p.relative_to(VAULT_PATH))
+                for p in VAULT_PATH.rglob("*.md")
+                if not is_excluded(str(p.relative_to(VAULT_PATH)))
+            }
+            results["url_orphans"] = sum(
+                1 for m in all_u["metadatas"] if m.get("file", "") not in od
+            )
+        except Exception:
+            results["url_orphans"] = 0
+    else:
+        results["url_orphans"] = _prune_url_orphans(VAULT_PATH)
+
+    # 12. Feedback orphans (paths no longer in vault)
+    if dry_run:
+        try:
+            od = {
+                str(p.relative_to(VAULT_PATH))
+                for p in VAULT_PATH.rglob("*.md")
+                if not is_excluded(str(p.relative_to(VAULT_PATH)))
+            }
+            n_fb_orphan = 0
+            if FEEDBACK_PATH.is_file():
+                for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    paths = ev.get("paths") or []
+                    if paths and not any(p in od for p in paths):
+                        n_fb_orphan += 1
+            results["feedback_orphans"] = n_fb_orphan
+        except Exception:
+            results["feedback_orphans"] = 0
+    else:
+        results["feedback_orphans"] = _prune_feedback_orphans(VAULT_PATH)
+
+    # 13. Ollama health (read-only)
+    results["ollama"] = _check_ollama_health()
+
+    # 14. Dead notes count (read-only)
+    try:
+        col = get_db()
+        dead = find_dead_notes(col, VAULT_PATH, LOG_PATH)
+        results["dead_notes"] = len(dead)
+    except Exception:
+        results["dead_notes"] = 0
+
+    results["took_ms"] = int((_t.perf_counter() - t0) * 1000)
+    return results
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Reportar sin modificar nada")
+@click.option("--skip-reindex", is_flag=True, help="Saltear reindex incremental")
+@click.option("--skip-logs", is_flag=True, help="Saltear rotación de logs")
+@click.option("--verbose", "-v", is_flag=True, help="Mostrar detalles de cada paso")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON (para cron/scripts)")
+def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool, as_json: bool):
+    """Mantenimiento integral: reindex, limpiar sesiones, podar caches, rotar logs, detectar dead notes.
+
+    Seguro para correr periódicamente vía launchd/cron. Con --dry-run solo reporta.
+    """
+    if not as_json:
+        mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
+        console.print(Rule(title=f"[bold cyan]Maintenance[/bold cyan] {mode}", style="cyan"))
+        console.print()
+
+    results = run_maintenance(
+        dry_run=dry_run,
+        skip_reindex=skip_reindex,
+        skip_logs=skip_logs,
+        verbose=verbose,
+    )
+
+    if as_json:
+        click.echo(json.dumps(results, ensure_ascii=False, indent=2, default=str))
+        return
+
+    # ── Reindex ──
+    idx = results.get("reindex")
+    if idx:
+        kind = idx.get("kind", "?")
+        color = {"no_changes": "dim", "incremental": "green", "first_time": "yellow"}.get(kind, "white")
+        console.print(f"  [bold]Reindex:[/bold] [{color}]{kind}[/{color}]"
+                      f" — {idx.get('indexed', 0)} indexed, {idx.get('removed', 0)} orphans removed"
+                      f" [dim]({idx.get('scanned', 0)} scanned, {idx.get('took_ms', 0)}ms)[/dim]")
+    elif "reindex_error" in results:
+        console.print(f"  [bold]Reindex:[/bold] [red]error: {results['reindex_error']}[/red]")
+    else:
+        console.print("  [bold]Reindex:[/bold] [dim]skipped[/dim]")
+
+    # ── Sessions ──
+    n_sess = results.get("sessions_removed", 0)
+    console.print(f"  [bold]Sessions:[/bold] {n_sess} expired removed" if n_sess else
+                  "  [bold]Sessions:[/bold] [dim]none expired[/dim]")
+
+    # ── Orphan collections ──
+    orphans = results.get("orphan_collections", [])
+    if orphans:
+        action = "would remove" if dry_run else "removed"
+        console.print(f"  [bold]Orphan collections:[/bold] [yellow]{action} {len(orphans)}[/yellow]: {', '.join(orphans)}")
+    else:
+        console.print("  [bold]Orphan collections:[/bold] [dim]none[/dim]")
+
+    # ── Context cache ──
+    pruned = results.get("context_cache_pruned", 0)
+    if pruned:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]Context cache:[/bold] [yellow]{pruned} stale entries {verb}[/yellow]")
+    else:
+        console.print("  [bold]Context cache:[/bold] [dim]clean[/dim]")
+
+    # ── Feedback golden ──
+    fg = results.get("feedback_golden")
+    if fg:
+        console.print(f"  [bold]Feedback golden:[/bold] rebuilt ({fg['positives']}+ / {fg['negatives']}-)")
+    elif dry_run:
+        console.print("  [bold]Feedback golden:[/bold] [dim]skipped (dry-run)[/dim]")
+
+    # ── Log rotation ──
+    rotated = results.get("log_rotation", {})
+    if rotated:
+        for label, detail in rotated.items():
+            console.print(f"  [bold]Log rotation:[/bold] {label} — {detail}")
+    else:
+        console.print("  [bold]Log rotation:[/bold] [dim]all under threshold[/dim]")
+
+    # ── Ignored notes ──
+    ign = results.get("ignored_pruned", 0)
+    if ign:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]Ignored notes:[/bold] [yellow]{ign} stale entries {verb}[/yellow]")
+    else:
+        console.print("  [bold]Ignored notes:[/bold] [dim]clean[/dim]")
+
+    # ── Auto-index state ──
+    idx_st = results.get("index_state_pruned", 0)
+    if idx_st:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]Index state:[/bold] [yellow]{idx_st} orphan vault keys {verb}[/yellow]")
+    else:
+        console.print("  [bold]Index state:[/bold] [dim]clean[/dim]")
+
+    # ── Filing batches ──
+    batches = results.get("batches_pruned", 0)
+    if batches:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]Filing batches:[/bold] [yellow]{batches} old batches {verb}[/yellow] [dim](>{_FILING_BATCH_TTL_DAYS}d)[/dim]")
+    else:
+        console.print("  [bold]Filing batches:[/bold] [dim]none expired[/dim]")
+
+    # ── Tmp files ──
+    tmps = results.get("tmp_cleaned", 0)
+    if tmps:
+        verb = "would remove" if dry_run else "removed"
+        console.print(f"  [bold]Tmp files:[/bold] [yellow]{tmps} orphans {verb}[/yellow]")
+    else:
+        console.print("  [bold]Tmp files:[/bold] [dim]none[/dim]")
+
+    # ── URL orphans ──
+    url_orph = results.get("url_orphans", 0)
+    if url_orph:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]URL orphans:[/bold] [yellow]{url_orph} rows {verb}[/yellow]")
+    else:
+        console.print("  [bold]URL orphans:[/bold] [dim]clean[/dim]")
+
+    # ── Feedback orphans ──
+    fb_orph = results.get("feedback_orphans", 0)
+    if fb_orph:
+        verb = "would prune" if dry_run else "pruned"
+        console.print(f"  [bold]Feedback orphans:[/bold] [yellow]{fb_orph} stale entries {verb}[/yellow]")
+    else:
+        console.print("  [bold]Feedback orphans:[/bold] [dim]clean[/dim]")
+
+    # ── Ollama health ──
+    oll = results.get("ollama", {})
+    if "error" in oll:
+        console.print(f"  [bold]Ollama:[/bold] [red]unreachable: {oll['error']}[/red]")
+    else:
+        missing = [m for m, s in oll.items() if s == "missing"]
+        if missing:
+            console.print(f"  [bold]Ollama:[/bold] [red]missing: {', '.join(missing)}[/red]")
+        else:
+            console.print(f"  [bold]Ollama:[/bold] [green]{len(oll)} models ok[/green]")
+
+    # ── Dead notes ──
+    dead = results.get("dead_notes", 0)
+    if dead:
+        console.print(f"  [bold]Dead notes:[/bold] [yellow]{dead} candidates[/yellow] [dim](run `rag archive` to act)[/dim]")
+    else:
+        console.print("  [bold]Dead notes:[/bold] [dim]none[/dim]")
+
+    console.print()
+    console.print(f"  [dim]Done in {results.get('took_ms', 0)}ms[/dim]")
 
 
 if __name__ == "__main__":

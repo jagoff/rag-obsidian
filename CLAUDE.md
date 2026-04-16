@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~15k lines) + `mcp_server.py` (thin wrapper) + `tests/` (675 tests, 33 files). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~16k lines) + `mcp_server.py` (thin wrapper) + `tests/` (715 tests, 33 files). Resist package-split until real friction shows up.
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -16,8 +16,8 @@ uv tool install --reinstall --editable .   # reinstall after code changes
 # Core
 rag index [--reset] [--no-contradict]      # incremental hash-based; --reset rebuilds
 rag watch                                  # watchdog auto-reindex (debounce 3s)
-rag query "text" [--hyde --no-multi --raw --loose --force --counter --session ID --continue --plain]
-rag chat [--counter --session ID --resume] # /save /reindex (or NL) work mid-conversation
+rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain]
+rag chat [--counter --no-deep --session ID --resume] # /save /reindex (or NL) work mid-conversation
 rag do "instrucción" [--yes --max-iterations 8]  # tool-calling agent loop
 rag stats                                  # models + index status
 rag session list|show|clear|cleanup
@@ -47,6 +47,10 @@ rag ambient folders list|add <F>|remove <F>
 rag eval                                   # queries.yaml → hit@k, MRR, recall@k
 rag tune [--samples 500] [--apply]         # auto-calibrate ranker weights
 rag log [-n 20] [--low-confidence]
+rag dashboard [--days 30]                  # analytics: scores, latency, topics, PageRank
+
+# Maintenance
+rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
 
 # Automation
 rag setup [--remove]                       # install/remove 7 launchd services
@@ -68,16 +72,28 @@ query → classify_intent → infer_filters [auto]
       → per variant: ChromaDB sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise)
       → RRF merge → dedup → expand to parent section (O(1) metadata)
       → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp16)
+      → graph expansion (1-hop wikilink neighbors, always on)
+      → [auto-deep: if confidence < 0.10, iterative sub-query retrieval]
       → top-k → LLM (streamed)
 ```
+
+**Graph expansion** (always on): after rerank, top-3 results expand via 1-hop wikilink neighbors (`_build_graph_adj` + `_hop_set`). Up to 3 graph neighbors added as supplementary LLM context marked `[nota relacionada (grafo)]`. Cost: in-memory graph lookups, negligible.
+
+**Auto-deep retrieval**: when top rerank score < `CONFIDENCE_DEEP_THRESHOLD` (0.10), `deep_retrieve()` auto-triggers: helper model judges sufficiency → generates focused sub-query → second retrieve pass → merge results. Max 3 iterations. Disable with `--no-deep`.
 
 **Corpus cache** (`_load_corpus`): BM25 + vocab built once, invalidated by `col.count()` delta. Cold 341ms → warm 2ms. Do not touch without re-measuring.
 
 ### Indexing
 
-Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. Each chunk: `embed_text` (prefixed `[folder|title|area|#tags]`), `display_text` (raw), `parent` metadata (enclosing section, ≤1200 chars). Hash per file → re-embed only on change. `is_excluded()` skips `.`-prefixed segments.
+Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. Each chunk: `embed_text` (prefixed `[folder|title|area|#tags]` + contextual summary), `display_text` (raw), `parent` metadata (enclosing section, ≤1200 chars). Hash per file → re-embed only on change. `is_excluded()` skips `.`-prefixed segments.
 
-**Schema changes**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v7`). Per-vault suffix = sha256[:8] of resolved path.
+**Contextual embeddings** (v8→v9): `get_context_summary()` generates a 1-2 sentence document-level summary per note via qwen2.5:3b, prepended to each chunk's `embed_text` as `Contexto: ...`. Cached by file hash in `~/.local/share/obsidian-rag/context_summaries.json`. Notes < 300 chars skip summarization. Improves multi-hop and chain retrieval significantly (+11% chain_success).
+
+**Temporal tokens** (v9): `build_prefix()` appends `[recent]`/`[this-month]`/`[this-quarter]`/`[older]` based on `modified`/`created` frontmatter. Shifts embedding space so "current work" queries prefer recent notes without post-hoc boosts.
+
+**Graph PageRank**: `_graph_pagerank()` computes authority scores over the wikilink adjacency graph (power iteration, <10ms). Cached per corpus. Used as a tuneable ranking signal (`graph_pagerank` weight) and to sort graph expansion neighbors.
+
+**Schema changes**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v9`). Per-vault suffix = sha256[:8] of resolved path.
 
 ### Model stack
 
@@ -112,6 +128,7 @@ score = rerank_logit
       + w.recency_cue    * recency_raw   [if has_recency_cue]
       + w.recency_always * recency_raw   [always]
       + w.tag_literal    * n_tag_matches
+      + w.graph_pagerank * (pr/max_pr)   [wikilink authority signal]
       + w.feedback_pos                   [if path in feedback+ cosine≥0.80]
       - w.feedback_neg                   [if path in feedback- cosine≥0.80]
 ```

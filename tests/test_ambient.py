@@ -342,3 +342,209 @@ def test_ambient_should_skip_true_within_window(tmp_vault):
 def test_ambient_should_skip_false_for_different_hash(tmp_vault):
     rag._ambient_state_record("00-Inbox/n.md", "h1", {})
     assert rag._ambient_should_skip("00-Inbox/n.md", "h2") is False
+
+
+# ── allowed_folders ──────────────────────────────────────────────────────────
+
+
+def _write_config_with_folders(path: Path, folders):
+    path.write_text(json.dumps({
+        "jid": "120363426178035051@g.us",
+        "enabled": True,
+        "allowed_folders": folders,
+    }))
+
+
+def test_config_default_when_no_allowed_folders(tmp_vault):
+    """Sin `allowed_folders` → `_ambient_config` retorna None en ese campo;
+    el hook cae al default [00-Inbox] al leer.
+    """
+    _write_config(rag.AMBIENT_CONFIG_PATH)
+    c = rag._ambient_config()
+    assert c is not None
+    assert c.get("allowed_folders") is None
+
+
+def test_config_normalizes_trailing_slashes(tmp_vault):
+    _write_config_with_folders(
+        rag.AMBIENT_CONFIG_PATH, ["01-Projects/", "02-Areas"]
+    )
+    c = rag._ambient_config()
+    assert c is not None
+    assert c["allowed_folders"] == ["01-Projects", "02-Areas"]
+
+
+def test_config_drops_empty_entries(tmp_vault):
+    _write_config_with_folders(
+        rag.AMBIENT_CONFIG_PATH, ["", "  ", "01-Projects"]
+    )
+    c = rag._ambient_config()
+    assert c is not None
+    assert c["allowed_folders"] == ["01-Projects"]
+
+
+def test_config_empty_list_falls_back_to_default_field_none(tmp_vault):
+    # `allowed_folders: []` → normalized to None so consumer uses default.
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, [])
+    c = rag._ambient_config()
+    assert c is not None
+    assert c.get("allowed_folders") is None
+
+
+def test_hook_default_only_fires_inside_inbox(tmp_vault, captured_sends):
+    """Config sin allowed_folders → sólo 00-Inbox (comportamiento legacy)."""
+    vault, col = tmp_vault
+    _write_config(rag.AMBIENT_CONFIG_PATH)
+
+    # Outside inbox → no send.
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    p_proj = vault / "01-Projects" / "n.md"
+    p_proj.write_text("body")
+    rag._ambient_hook(col, p_proj, "01-Projects/n.md", "h1")
+    assert captured_sends == []
+
+
+def test_hook_fires_on_configured_folder(tmp_vault, captured_sends):
+    """Config con `01-Projects` → hook corre ahí y NO corre en 00-Inbox."""
+    vault, col = tmp_vault
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, ["01-Projects"])
+
+    # Seed a target note with a distinctive title for auto-wikilink.
+    (vault / "02-Areas").mkdir(parents=True, exist_ok=True)
+    (vault / "02-Areas" / "Ikigai.md").write_text("Ikigai concepto japonés.")
+    _add_chunk(col, "02-Areas/Ikigai.md", "Ikigai")
+    rag._invalidate_corpus_cache()
+
+    # Note in 01-Projects → should be analyzed.
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    p_proj = vault / "01-Projects" / "nota.md"
+    p_proj.write_text("Pensé sobre Ikigai hoy.")
+    rag._ambient_hook(col, p_proj, "01-Projects/nota.md", "hproj")
+    assert "[[Ikigai]]" in p_proj.read_text()
+
+    # Note in 00-Inbox → NOT analyzed (inbox not in allowed_folders).
+    p_in = vault / "00-Inbox" / "captura.md"
+    p_in.write_text("Otra sobre Ikigai pero en inbox.")
+    rag._ambient_hook(col, p_in, "00-Inbox/captura.md", "hinbox")
+    assert "[[Ikigai]]" not in p_in.read_text()
+
+
+def test_hook_fires_on_multiple_configured_folders(tmp_vault, captured_sends):
+    vault, col = tmp_vault
+    _write_config_with_folders(
+        rag.AMBIENT_CONFIG_PATH, ["00-Inbox", "01-Projects"]
+    )
+    (vault / "02-Areas").mkdir(parents=True, exist_ok=True)
+    (vault / "02-Areas" / "Ikigai.md").write_text("Ikigai")
+    _add_chunk(col, "02-Areas/Ikigai.md", "Ikigai")
+    rag._invalidate_corpus_cache()
+
+    # Both folders should analyze.
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    p1 = vault / "01-Projects" / "a.md"
+    p1.write_text("idea sobre Ikigai")
+    rag._ambient_hook(col, p1, "01-Projects/a.md", "h1")
+    assert "[[Ikigai]]" in p1.read_text()
+
+    p2 = vault / "00-Inbox" / "b.md"
+    p2.write_text("otra sobre Ikigai")
+    rag._ambient_hook(col, p2, "00-Inbox/b.md", "h2")
+    assert "[[Ikigai]]" in p2.read_text()
+
+
+def test_hook_does_not_match_prefix_substring(tmp_vault, captured_sends):
+    """`01-Projects` no debe matchear `01-ProjectsOld/`. Verifica que el
+    check incluya el trailing slash.
+    """
+    vault, col = tmp_vault
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, ["01-Projects"])
+    (vault / "01-ProjectsOld").mkdir(parents=True, exist_ok=True)
+    p = vault / "01-ProjectsOld" / "n.md"
+    p.write_text("body")
+    rag._ambient_hook(col, p, "01-ProjectsOld/n.md", "h1")
+    assert captured_sends == []
+
+
+# ── rag ambient folders {add,remove,list} ────────────────────────────────────
+
+
+def test_ambient_folders_list_default(tmp_vault):
+    from click.testing import CliRunner
+    _write_config(rag.AMBIENT_CONFIG_PATH)
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "list"])
+    assert result.exit_code == 0
+    assert "00-Inbox" in result.output
+
+
+def test_ambient_folders_add_persists(tmp_vault):
+    from click.testing import CliRunner
+    vault, _ = tmp_vault
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    _write_config(rag.AMBIENT_CONFIG_PATH)
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "add", "01-Projects"])
+    assert result.exit_code == 0
+    assert "Agregado" in result.output or "Ya estaba" in result.output
+    raw = json.loads(rag.AMBIENT_CONFIG_PATH.read_text())
+    assert "01-Projects" in (raw.get("allowed_folders") or [])
+    # Preserves jid + enabled
+    assert raw.get("jid")
+    assert raw.get("enabled") is True
+
+
+def test_ambient_folders_add_dedup(tmp_vault):
+    from click.testing import CliRunner
+    vault, _ = tmp_vault
+    (vault / "01-Projects").mkdir(parents=True, exist_ok=True)
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, ["01-Projects"])
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "add", "01-Projects"])
+    assert result.exit_code == 0
+    assert "Ya estaba" in result.output
+    raw = json.loads(rag.AMBIENT_CONFIG_PATH.read_text())
+    assert raw["allowed_folders"].count("01-Projects") == 1
+
+
+def test_ambient_folders_add_validates_folder_exists(tmp_vault):
+    from click.testing import CliRunner
+    _write_config(rag.AMBIENT_CONFIG_PATH)
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "add", "99-DoesNotExist"])
+    assert result.exit_code == 0
+    assert "No existe" in result.output
+    raw = json.loads(rag.AMBIENT_CONFIG_PATH.read_text())
+    assert "99-DoesNotExist" not in (raw.get("allowed_folders") or [])
+
+
+def test_ambient_folders_remove_restores_default(tmp_vault):
+    from click.testing import CliRunner
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, ["01-Projects"])
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "remove", "01-Projects"])
+    assert result.exit_code == 0
+    assert "Default restaurado" in result.output
+    raw = json.loads(rag.AMBIENT_CONFIG_PATH.read_text())
+    # Field wiped so reader falls back to default.
+    assert "allowed_folders" not in raw or not raw.get("allowed_folders")
+
+
+def test_ambient_folders_remove_keeps_others(tmp_vault):
+    from click.testing import CliRunner
+    _write_config_with_folders(
+        rag.AMBIENT_CONFIG_PATH, ["00-Inbox", "01-Projects"]
+    )
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "remove", "01-Projects"])
+    assert result.exit_code == 0
+    raw = json.loads(rag.AMBIENT_CONFIG_PATH.read_text())
+    assert raw["allowed_folders"] == ["00-Inbox"]
+
+
+def test_ambient_folders_remove_missing_folder(tmp_vault):
+    from click.testing import CliRunner
+    _write_config_with_folders(rag.AMBIENT_CONFIG_PATH, ["00-Inbox"])
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["ambient", "folders", "remove", "01-Projects"])
+    assert result.exit_code == 0
+    assert "No estaba" in result.output

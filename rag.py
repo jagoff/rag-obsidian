@@ -5666,8 +5666,12 @@ def silence(kind: str | None, off: bool, do_list: bool):
 def _ambient_config() -> dict | None:
     """Read the ambient config. Returns None if disabled / missing.
 
-    Schema actual (WhatsApp): `{jid, enabled}`. `jid` es el destinatario
-    WhatsApp (group `...@g.us` o DM `...@s.whatsapp.net`).
+    Schema actual (WhatsApp): `{jid, enabled, allowed_folders?}`.
+    - `jid` — destinatario WhatsApp (group `...@g.us` o DM `...@s.whatsapp.net`).
+    - `allowed_folders` — lista de carpetas del vault donde corre el hook.
+      Default (campo ausente o lista vacía): `["00-Inbox"]`. Folders
+      case-sensitive (matchean vs path relativos del vault), trailing
+      slashes normalizados.
 
     Backward compat: si detecta `chat_id`/`bot_token` (schema Telegram viejo)
     loggea warning una vez y retorna None — el usuario debe re-habilitar
@@ -5692,6 +5696,19 @@ def _ambient_config() -> dict | None:
         return None
     if not c.get("jid"):
         return None
+    # Normalize allowed_folders: strip trailing slashes, drop empties.
+    # Case-sensitive on purpose — the vault uses PARA folders like
+    # `01-Projects` and matching `01-projects` would silently diverge.
+    raw_folders = c.get("allowed_folders")
+    if isinstance(raw_folders, list):
+        folders = [
+            str(f).rstrip("/").strip()
+            for f in raw_folders
+            if isinstance(f, str) and str(f).strip()
+        ]
+        c["allowed_folders"] = folders or None  # None → default at read site
+    else:
+        c["allowed_folders"] = None
     return c
 
 
@@ -5811,10 +5828,10 @@ def _ambient_hook(
     doc_id_prefix: str,
     h: str,
 ) -> None:
-    """Reactive analysis triggered on new/modified Inbox notes.
+    """Reactive analysis triggered on new/modified notes in allowed folders.
 
     No-op when:
-      - file is outside 00-Inbox/
+      - file is outside any of `cfg["allowed_folders"]` (default: `["00-Inbox"]`)
       - ambient config missing (bot didn't run /enable_ambient)
       - same path+hash analyzed within 5 min (dedup)
       - frontmatter `ambient: skip`
@@ -5826,10 +5843,14 @@ def _ambient_hook(
     Expensive (tag suggestion, contradiction) NOT run — those live in their
     own pipelines to avoid double-counting LLM cost per save event.
     """
-    if not doc_id_prefix.startswith(_CAPTURE_FOLDER + "/"):
-        return
     cfg = _ambient_config()
     if cfg is None:
+        return
+    allowed_folders = cfg.get("allowed_folders") or [_CAPTURE_FOLDER]
+    if not any(
+        doc_id_prefix.startswith(f.rstrip("/") + "/")
+        for f in allowed_folders
+    ):
         return
     if _ambient_should_skip(doc_id_prefix, h):
         return
@@ -14272,6 +14293,107 @@ def ambient_test(path: str | None):
     console.print(f"[cyan]Triggereando ambient hook sobre:[/cyan] {doc_id_prefix}")
     _ambient_hook(col, p, doc_id_prefix, h)
     console.print("[green]✓[/green] Listo. Ver log: tail ~/.local/share/obsidian-rag/ambient.jsonl")
+
+
+def _load_raw_ambient_config() -> dict:
+    """Read raw ambient config JSON (no filtering). Empty dict if missing."""
+    if not AMBIENT_CONFIG_PATH.is_file():
+        return {}
+    try:
+        c = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_raw_ambient_config(cfg: dict) -> None:
+    """Atomic-ish write of the raw ambient config. Preserves other keys."""
+    AMBIENT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AMBIENT_CONFIG_PATH.write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+@ambient.group("folders")
+def ambient_folders():
+    """Administrar carpetas donde corre el hook ambient (default 00-Inbox)."""
+
+
+@ambient_folders.command("list")
+def ambient_folders_list():
+    """Listar allowed_folders actuales."""
+    cfg = _load_raw_ambient_config()
+    folders = cfg.get("allowed_folders") or []
+    if not folders:
+        console.print(
+            f"[dim]Default:[/dim] [cyan]{_CAPTURE_FOLDER}[/cyan] "
+            "[dim](no hay allowed_folders seteado)[/dim]"
+        )
+        return
+    console.print("[cyan]Ambient corre sobre:[/cyan]")
+    for f in folders:
+        console.print(f"  · [cyan]{f}[/cyan]")
+
+
+@ambient_folders.command("add")
+@click.argument("folder")
+def ambient_folders_add(folder: str):
+    """Agregar una carpeta del vault a allowed_folders (dedup + valida)."""
+    folder = folder.rstrip("/").strip()
+    if not folder:
+        console.print("[red]Folder vacío.[/red]")
+        return
+    target = VAULT_PATH / folder
+    if not target.is_dir():
+        console.print(
+            f"[red]No existe en el vault:[/red] {target}"
+        )
+        return
+    cfg = _load_raw_ambient_config()
+    if not cfg:
+        console.print(
+            "[yellow]No hay ambient config[/yellow] — enviá /enable_ambient "
+            "al bot de WhatsApp primero."
+        )
+        return
+    folders = list(cfg.get("allowed_folders") or [])
+    if folder in folders:
+        console.print(f"[dim]Ya estaba:[/dim] {folder}")
+        return
+    folders.append(folder)
+    cfg["allowed_folders"] = folders
+    _save_raw_ambient_config(cfg)
+    console.print(f"[green]✓[/green] Agregado [cyan]{folder}[/cyan]")
+    console.print(f"[dim]Ahora:[/dim] {', '.join(folders)}")
+
+
+@ambient_folders.command("remove")
+@click.argument("folder")
+def ambient_folders_remove(folder: str):
+    """Quitar carpeta. Si queda vacía → vuelve a default [00-Inbox]."""
+    folder = folder.rstrip("/").strip()
+    cfg = _load_raw_ambient_config()
+    if not cfg:
+        console.print("[yellow]No hay ambient config.[/yellow]")
+        return
+    folders = list(cfg.get("allowed_folders") or [])
+    if folder not in folders:
+        console.print(f"[dim]No estaba:[/dim] {folder}")
+        return
+    folders = [f for f in folders if f != folder]
+    if not folders:
+        # Wipe the field → the config reader falls back to default.
+        cfg.pop("allowed_folders", None)
+        _save_raw_ambient_config(cfg)
+        console.print(
+            f"[green]✓[/green] Quitado {folder}. Default restaurado: "
+            f"[cyan]{_CAPTURE_FOLDER}[/cyan]"
+        )
+        return
+    cfg["allowed_folders"] = folders
+    _save_raw_ambient_config(cfg)
+    console.print(f"[green]✓[/green] Quitado [cyan]{folder}[/cyan]")
+    console.print(f"[dim]Ahora:[/dim] {', '.join(folders)}")
 
 
 @ambient.command("log")

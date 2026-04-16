@@ -10171,7 +10171,37 @@ def weather(question: str):
     for d in data["days"]:
         rain = f", 🌧 {d['chanceofrain']}%" if d["chanceofrain"] > 10 else ""
         lines.append(f"  {d['date']}: {d['minC']}–{d['maxC']}°C, {_translate_weather(d['description'])}{rain}")
-    click.echo("\n".join(lines))
+    forecast_block = "\n".join(lines)
+
+    if question.strip():
+        comment = _weather_comment(question, forecast_block)
+        click.echo(f"{comment}\n\n{forecast_block}")
+    else:
+        click.echo(forecast_block)
+
+
+def _weather_comment(question: str, forecast: str) -> str:
+    """Generate a brief conversational comment relating the forecast to the question."""
+    prompt = (
+        "Pronóstico:\n"
+        f"{forecast}\n\n"
+        f"Pregunta: \"{question}\"\n\n"
+        "Respondé EN ESPAÑOL RIOPLATENSE en 1-2 oraciones cortas. "
+        "Tono informal, directo al punto. "
+        "No repitas números ni datos del pronóstico. "
+        "Solo dá tu opinión o consejo basado en los datos. "
+        "Sin emojis. Sin saludos. Sin preámbulos."
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 80},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return resp.message.content.strip()
+    except Exception:
+        return ""
 
 
 _CREATED_TS_BACKFILL_DONE = False

@@ -16223,6 +16223,11 @@ def serve(host: str, port: int):
             except Exception:
                 effective = question
 
+        # turn_id stamped on every serve turn so `rag feedback` / `rag fix`
+        # pueden atarlo después (CLI ya lo hacía — serve estaba roto, el
+        # feedback devolvía "el último turno no tiene turn_id (sesión
+        # pre-upgrade)" aunque la sesión fuera fresh).
+        query_turn_id = new_turn_id()
         t0 = time.perf_counter()
         result = retrieve(
             col, effective, k, qfolder, tag=qtag, precise=False,
@@ -16250,7 +16255,8 @@ def serve(host: str, port: int):
             if sess:
                 append_turn(sess, {"q": question, "a": None, "gated": True,
                                    "paths": [m.get("file", "") for m in result["metas"]],
-                                   "top_score": round(float(result["confidence"]), 3)})
+                                   "top_score": round(float(result["confidence"]), 3),
+                                   "turn_id": query_turn_id})
                 save_session(sess)
             gated_payload = {
                 "answer": "No tengo esa información en tus notas.",
@@ -16325,6 +16331,7 @@ def serve(host: str, port: int):
                 "a": answer[:500],
                 "paths": [m.get("file", "") for m in result["metas"]],
                 "top_score": round(float(result["confidence"]), 3),
+                "turn_id": query_turn_id,
             })
             save_session(sess)
 
@@ -16392,8 +16399,11 @@ def serve(host: str, port: int):
         t_gen = time.perf_counter() - t0
         answer = "".join(parts).strip()
 
+        chat_turn_id = new_turn_id()
         if sess:
-            append_turn(sess, {"q": message, "a": answer[:500]})
+            append_turn(sess, {
+                "q": message, "a": answer[:500], "turn_id": chat_turn_id,
+            })
             save_session(sess)
 
         try:

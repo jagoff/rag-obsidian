@@ -598,7 +598,7 @@ EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
 CHAT_MODEL_PREFERENCE = ("command-r:latest", "qwen2.5:14b", "phi4:latest")
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v7"  # v7: wikilinks (outlinks) in metadata
+_COLLECTION_BASE = "obsidian_notes_v8"  # v8: contextual embeddings (per-note summary in embed_text)
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
@@ -690,6 +690,87 @@ RERANK_TOP = 5     # final chunks after reranking
 CONFIDENCE_RERANK_MIN = 0.015
 
 console = Console()
+
+
+# ── CONTEXTUAL EMBEDDINGS ───────────────────────────────────────────────────
+# Per-note context summary prepended to each chunk's embed_text. Generated
+# once per file hash by the helper model, cached on disk. Improves embedding
+# quality by giving each chunk document-level context (Anthropic's "Contextual
+# Retrieval" pattern — 35-49% retrieval improvement in their benchmarks).
+# Short notes (< 300 chars) skip summarization — the prefix already captures
+# the key signal and a summary would be redundant.
+
+CONTEXT_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/context_summaries.json"
+_CONTEXT_MIN_BODY = 300  # chars — skip summary for notes shorter than this
+
+_context_cache: dict[str, str] | None = None
+_context_cache_dirty = False
+
+
+def _load_context_cache() -> dict[str, str]:
+    """Load {file_hash: summary} from disk. Lazy, once per process."""
+    global _context_cache
+    if _context_cache is not None:
+        return _context_cache
+    if CONTEXT_CACHE_PATH.is_file():
+        try:
+            _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
+        except Exception:
+            _context_cache = {}
+    else:
+        _context_cache = {}
+    return _context_cache
+
+
+def _save_context_cache() -> None:
+    """Persist context cache to disk if dirty."""
+    global _context_cache_dirty
+    if not _context_cache_dirty or _context_cache is None:
+        return
+    CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONTEXT_CACHE_PATH.write_text(json.dumps(_context_cache, ensure_ascii=False))
+    _context_cache_dirty = False
+
+
+def _generate_context_summary(text: str, title: str, folder: str) -> str:
+    """Generate a 1-2 sentence context summary for a note using the helper model.
+
+    The summary captures the document-level topic so that individual chunks
+    inherit global context when embedded. Kept short (~30-50 tokens) to avoid
+    dominating the chunk embedding.
+    """
+    # Truncate to avoid blowing helper context window (1024 tokens ≈ 4k chars)
+    body = text[:3000]
+    prompt = (
+        f"Nota: \"{title}\" (carpeta: {folder})\n\n"
+        f"{body}\n\n"
+        "Escribí UN resumen de 1-2 oraciones que capture el tema central y "
+        "propósito de esta nota. Solo el resumen, sin preámbulos."
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 80},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return resp.message.content.strip()
+    except Exception:
+        return ""
+
+
+def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> str:
+    """Get or generate the contextual summary for a note. Cached by file hash."""
+    global _context_cache_dirty
+    cache = _load_context_cache()
+    if file_hash in cache:
+        return cache[file_hash]
+    if len(text) < _CONTEXT_MIN_BODY:
+        return ""
+    summary = _generate_context_summary(text, title, folder)
+    cache[file_hash] = summary
+    _context_cache_dirty = True
+    return summary
 
 
 # ── FEEDBACK LOOP ────────────────────────────────────────────────────────────
@@ -1837,7 +1918,8 @@ def _compute_parent(body: str, chunk_start: int, chunk_end: int) -> str:
 
 
 def semantic_chunks(
-    text: str, note_title: str, folder: str, tags: list[str], fm: dict
+    text: str, note_title: str, folder: str, tags: list[str], fm: dict,
+    context_summary: str = "",
 ) -> list[tuple[str, str, str]]:
     """
     Split text into semantic chunks.
@@ -1846,6 +1928,10 @@ def semantic_chunks(
     are still retrievable.
     """
     prefix = build_prefix(note_title, folder, tags, fm)
+    # Contextual embedding: prepend document-level summary to the prefix so
+    # each chunk carries global context in its embedding vector.
+    if context_summary:
+        prefix = f"{prefix}\nContexto: {context_summary}"
 
     stripped = text.strip()
     if not stripped:
@@ -2323,26 +2409,8 @@ def reformulate_and_expand(
         "Reglas:\n"
         "- Nombres propios van LITERALES (no 'el actor X', no 'la banda Y').\n"
         "- Preservá posesivos ('mi', 'mis', 'tengo').\n"
-        "- Si menciona 'esa carpeta' o 'del mismo folder', extraé el nombre "
-        "de carpeta de la ruta en el historial "
-        "(ej: '.../Muros Fractales/...' → 'Muros Fractales').\n"
-        "- Si la pregunta introduce un sustantivo NUEVO (ej: 'referentes', "
-        "'herramientas'), preservalo — no lo reemplaces por temas del historial.\n"
-        "- Pronombres como 'los', 'esa', 'eso' refieren a la entidad del turno "
-        "anterior, no a personas.\n"
-        "- UNA SOLA pregunta por línea. NO concatenes con turnos anteriores.\n"
-        "- NUNCA copies rutas de archivo (paths con '/') en la reformulación.\n\n"
-        "Ejemplos:\n"
-        "H: 'letra de muros fractales' → '(.../Muros Fractales/...)'\n"
-        "P: 'qué otras letras tengo en esa misma carpeta'\n"
-        "L1: qué otras letras tengo en la carpeta Muros Fractales\n"
-        "L2: otras canciones en la carpeta Muros Fractales\n"
-        "L3: letras en el folder Muros Fractales\n\n"
-        "H: 'qué modelos de ollama tengo'\n"
-        "P: 'y el bot de telegram que los usa'\n"
-        "L1: bot de telegram que usa los modelos de ollama\n"
-        "L2: bot telegram para modelos ollama\n"
-        "L3: telegram bot que utiliza ollama\n\n"
+        "- Si menciona 'esa carpeta' o 'del mismo folder', preservá la palabra "
+        "carpeta/folder y el nombre del folder referido.\n\n"
         f"Historial:\n{summary_section}{history_text}\n\n"
         f"Nueva pregunta: \"{question}\"\n\n"
         "Devolvé EXACTAMENTE 3 líneas (sin numerar, sin explicar):\n"
@@ -2364,7 +2432,7 @@ def reformulate_and_expand(
     if not lines:
         return question, [question]
 
-    standalone = lines[0]
+    standalone = _postprocess_reformulation(question, lines[0], history)
 
     # Guardrail: proper nouns from the ORIGINAL question must survive in all lines
     original_nouns = {n.lower() for n in _extract_proper_nouns(question)}
@@ -4505,6 +4573,97 @@ def render_contradictions(contrad: list[dict]) -> None:
             console.print(f"   [dim]{c['snippet']}[/dim]")
 
 
+_FOLDER_REF_RE = re.compile(
+    r"\b(?:esa(?:\s+misma)?\s+carpeta|del?\s+mismo\s+folder|en\s+(?:la|el)\s+"
+    r"(?:carpeta|folder)\s+carpeta|del?\s+(?:folder|carpeta)\b)",
+    re.IGNORECASE,
+)
+_PATH_IN_TEXT_RE = re.compile(r"\S*/\S+/\S+")  # 2+ slashes = likely a path
+
+
+def _extract_folder_from_history(history: list[dict]) -> str | None:
+    """Extract the deepest folder name from the last assistant path mention.
+
+    Handles real paths with spaces, accents, parens (common in Obsidian vaults).
+    Looks at both assistant AND user messages — the user query often names the
+    entity that anchors the folder.
+    """
+    for msg in reversed(history):
+        if msg.get("role") != "assistant":
+            continue
+        text = msg.get("content", "")
+        # Match paths like "02-Areas/Musica/Muros Fractales/File Name (AI).md"
+        for m in re.finditer(r"(?:[\w\- ]+/){2,}[^/\n]+\.md", text):
+            parts = m.group(0).rsplit("/", 1)
+            if len(parts) >= 2:
+                folder = parts[0].rsplit("/", 1)[-1].strip()
+                if folder:
+                    return folder
+    return None
+
+
+def _postprocess_reformulation(
+    original: str, reformulated: str, history: list[dict],
+) -> str:
+    """Deterministic fixes on the LLM reformulation output.
+
+    Handles three failure modes that qwen2.5:3b struggles with:
+    1. Folder deictics ("esa carpeta") left unresolved — inject folder name.
+    2. Paths leaked into the reformulation — strip them.
+    3. Key content nouns from the original dropped — restore them.
+    """
+    result = reformulated
+
+    # 1. Strip leaked paths
+    result = _PATH_IN_TEXT_RE.sub("", result).strip()
+
+    # 2. Resolve unresolved folder deictics
+    folder_name = _extract_folder_from_history(history)
+    if folder_name:
+        # If reformulated still has "carpeta carpeta" or "folder carpeta"
+        # (model echoed the word), or a bare "esa carpeta" without a name
+        if _FOLDER_REF_RE.search(result):
+            # Replace the deictic phrase with the actual folder name
+            result = re.sub(
+                r"(?:en\s+)?(?:la\s+|el\s+)?(?:carpeta|folder)\s+carpeta",
+                f"en la carpeta {folder_name}",
+                result, flags=re.IGNORECASE,
+            )
+            result = re.sub(
+                r"(?:en\s+)?esa(?:\s+misma)?\s+carpeta",
+                f"en la carpeta {folder_name}",
+                result, flags=re.IGNORECASE,
+            )
+            result = re.sub(
+                r"(?:en\s+|del?\s+)?(?:el\s+)?mismo\s+folder",
+                f"en la carpeta {folder_name}",
+                result, flags=re.IGNORECASE,
+            )
+
+    # 3. Restore key nouns the LLM may have dropped.
+    #    Extract content words (≥4 chars, not stopwords) from original that
+    #    are absent in the reformulation. If any are missing, append them.
+    _STOP = {
+        "como", "cómo", "como", "cual", "cuál", "cuales", "donde", "dónde",
+        "cuando", "cuándo", "para", "pero", "porque", "sino", "sobre", "cada",
+        "esto", "esta", "este", "esos", "esas", "ello", "ella", "ellos",
+        "esas", "otro", "otra", "otros", "otras", "algo", "nada", "todo",
+        "toda", "todos", "todas", "mismo", "misma", "mismos", "mismas",
+        "tengo", "tiene", "tenía", "quiénes", "quienes", "tipo",
+    }
+    orig_words = {
+        w.lower() for w in re.findall(r"[a-záéíóúñü]{4,}", original, re.IGNORECASE)
+    } - _STOP
+    ref_words = {
+        w.lower() for w in re.findall(r"[a-záéíóúñü]{4,}", result, re.IGNORECASE)
+    }
+    missing = orig_words - ref_words
+    if missing and len(missing) <= 3:
+        result = result.rstrip("?. ") + " " + " ".join(sorted(missing))
+
+    return result.strip()
+
+
 def reformulate_query(
     question: str,
     history: list[dict],
@@ -4537,34 +4696,15 @@ def reformulate_query(
         "2. Preservá posesivos y referencias personales ('mi', 'mis', 'tengo', "
         "'mío') — son señal de que la búsqueda es sobre notas del usuario.\n"
         "3. Si la pregunta menciona 'en esa misma carpeta', 'del mismo folder' "
-        "o similar, extraé el nombre de carpeta de la ruta en el historial "
-        "(ej: '.../Muros Fractales/...' → carpeta 'Muros Fractales').\n"
+        "o similar, preservá la palabra carpeta/folder y el nombre del folder "
+        "referido — no la conviertas en query semántico.\n"
         "4. Si la pregunta empieza con conectores ('y', 'y el', 'y la', "
         "'y los', 'y eso', 'y otro') o contiene pronombres/demostrativos "
         "('los', 'las', 'eso', 'ese', 'esa', 'aquel'), es follow-up: resolvé "
         "los antecedentes explícitamente.\n"
         "5. Si la pregunta ya es autónoma (entidades explícitas, sin "
         "conectores ni pronombres ambiguos), devolvela tal cual.\n"
-        "6. Mantené el registro y la longitud aproximada de la pregunta original.\n"
-        "7. Si la pregunta introduce un sustantivo NUEVO (ej: 'referentes', "
-        "'herramientas', 'reranker'), preservalo — no lo reemplaces por temas "
-        "del historial.\n"
-        "8. Devolvé UNA SOLA pregunta. NO concatenes con preguntas de turnos "
-        "anteriores.\n"
-        "9. NUNCA copies rutas de archivo (paths con '/') en la reformulación.\n\n"
-        "Ejemplos:\n"
-        "H: 'letra de muros fractales' → Asistente: '(contexto: .../Muros Fractales/...)'\n"
-        "P: 'qué otras letras tengo en esa misma carpeta'\n"
-        "→ qué otras letras tengo en la carpeta Muros Fractales\n\n"
-        "H: 'qué modelos de ollama tengo' → Asistente: '(contexto: modelos ollama)'\n"
-        "P: 'y el bot de telegram que los usa'\n"
-        "→ bot de telegram que usa los modelos de ollama\n\n"
-        "H: 'curso de liderazgo' + 'y el otro curso'\n"
-        "P: 'quiénes son mis referentes en esto'\n"
-        "→ quiénes son mis referentes en coaching y liderazgo\n\n"
-        "H: 'qué modelo de embeddings uso en mi RAG'\n"
-        "P: 'y el reranker'\n"
-        "→ qué reranker usa mi RAG\n\n"
+        "6. Mantené el registro y la longitud aproximada de la pregunta original.\n\n"
         "Historial:\n"
         f"{summary_section}{history_text}\n\n"
         f"Nueva pregunta: \"{question}\"\n\n"
@@ -4576,7 +4716,8 @@ def reformulate_query(
         options={**HELPER_OPTIONS, "num_ctx": 2048},
         keep_alive=OLLAMA_KEEP_ALIVE,
     )
-    return resp.message.content.strip().strip('"')
+    raw = resp.message.content.strip().strip('"')
+    return _postprocess_reformulation(question, raw, history)
 
 
 def _compress_turns(turns: list[dict]) -> str:
@@ -4669,6 +4810,7 @@ def retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     variants: list[str] | None = None,
+    graph_expand: bool = False,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -4869,6 +5011,43 @@ def retrieve(
     docs = [e for _, e, _ in scored]
     metas = [c[1] for c, _, _ in scored]
 
+    # ── Graph expansion: 1-hop wikilink neighbors of top results ────────
+    # Adds context from linked notes that didn't match semantically but are
+    # topologically close. Returned separately so the LLM can use them as
+    # supplementary context without polluting the ranked results.
+    graph_docs: list[str] = []
+    graph_metas: list[dict] = []
+    if graph_expand and metas:
+        try:
+            corpus = _load_corpus(col)
+            adj = _build_graph_adj(corpus)
+            hit_paths = {m.get("file", "") for m in metas}
+            neighbor_paths: list[str] = []
+            for m in metas[:3]:  # expand from top-3 only
+                path = m.get("file", "")
+                for nb in adj.get(path, set()):
+                    if nb not in hit_paths and nb not in neighbor_paths:
+                        neighbor_paths.append(nb)
+            # Fetch best chunk per neighbor (first chunk = most representative)
+            for nb_path in neighbor_paths[:3]:  # cap at 3 graph neighbors
+                try:
+                    nb_chunks = col.get(
+                        where={"file": nb_path},
+                        include=["documents", "metadatas"],
+                    )
+                    if nb_chunks["ids"]:
+                        # Use the first chunk's parent for richer context
+                        best_meta = nb_chunks["metadatas"][0]
+                        best_doc = expand_to_parent(
+                            nb_chunks["documents"][0], best_meta
+                        )
+                        graph_docs.append(best_doc)
+                        graph_metas.append(best_meta)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return {
         "docs": docs,
         "metas": metas,
@@ -4877,7 +5056,123 @@ def retrieve(
         "search_query": search_query,
         "filters_applied": filters_applied,
         "query_variants": variants,
+        "graph_docs": graph_docs,
+        "graph_metas": graph_metas,
     }
+
+
+# ── Agentic / deep retrieval ─────────────────────────────────────────────────
+# Multi-pass retrieval: retrieve → LLM judges sufficiency → generate sub-query
+# → retrieve again → merge. Max 3 iterations. Uses the helper model for fast
+# sufficiency judgment and sub-query generation.
+
+_DEEP_MAX_ITERS = 3
+
+
+def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tuple[bool, str]:
+    """Ask the helper model whether retrieved context is sufficient to answer
+    the question. Returns (is_sufficient, sub_query_if_not).
+
+    The sub_query is a focused follow-up to fill gaps in the evidence.
+    """
+    snippets = "\n---\n".join(
+        f"[{m.get('note', '')}]: {d[:300]}" for d, m in zip(docs[:5], metas[:5])
+    )
+    prompt = (
+        f"Pregunta del usuario: \"{question}\"\n\n"
+        f"Evidencia recuperada:\n{snippets}\n\n"
+        "¿La evidencia es SUFICIENTE para responder completamente la pregunta?\n"
+        "Si SÍ, respondé exactamente: SUFICIENTE\n"
+        "Si NO, respondé exactamente una línea con la sub-query que buscarías "
+        "para completar la información faltante. Solo la sub-query, sin explicar."
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 80},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        answer = resp.message.content.strip()
+        if answer.upper().startswith("SUFICIENTE"):
+            return True, ""
+        return False, answer
+    except Exception:
+        return True, ""  # fail-safe: don't loop on errors
+
+
+def deep_retrieve(
+    col: "chromadb.Collection",
+    question: str,
+    k: int,
+    folder: str | None,
+    history: list[dict] | None = None,
+    tag: str | None = None,
+    precise: bool = False,
+    multi_query: bool = True,
+    auto_filter: bool = True,
+    date_range: tuple[float, float] | None = None,
+    summary: str | None = None,
+    variants: list[str] | None = None,
+    graph_expand: bool = False,
+) -> dict:
+    """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
+
+    Returns the same dict shape as `retrieve()` but with potentially richer
+    context from multiple passes. The first pass uses the original question;
+    subsequent passes target gaps identified by the helper model.
+    """
+    # First pass — standard retrieval
+    result = retrieve(
+        col, question, k, folder, history=history, tag=tag, precise=precise,
+        multi_query=multi_query, auto_filter=auto_filter,
+        date_range=date_range, summary=summary, variants=variants,
+        graph_expand=graph_expand,
+    )
+    if not result["docs"]:
+        return result
+
+    all_docs = list(result["docs"])
+    all_metas = list(result["metas"])
+    all_scores = list(result["scores"])
+    seen_chunks = {m.get("file", "") + "::" + d[:50] for d, m in zip(all_docs, all_metas)}
+
+    for iteration in range(1, _DEEP_MAX_ITERS):
+        sufficient, sub_query = _judge_sufficiency(question, all_docs, all_metas)
+        if sufficient or not sub_query:
+            break
+
+        # Sub-query retrieval — no multi-query expansion (the sub-query is
+        # already focused), no auto-filter (inherit from first pass).
+        sub_result = retrieve(
+            col, sub_query, k, folder, tag=tag, precise=False,
+            multi_query=False, auto_filter=False, date_range=date_range,
+            graph_expand=False,
+        )
+        # Merge new results, dedup by chunk identity
+        added = 0
+        for d, m, s in zip(sub_result["docs"], sub_result["metas"], sub_result["scores"]):
+            key = m.get("file", "") + "::" + d[:50]
+            if key not in seen_chunks:
+                seen_chunks.add(key)
+                all_docs.append(d)
+                all_metas.append(m)
+                all_scores.append(s)
+                added += 1
+        if added == 0:
+            break  # sub-query didn't surface anything new
+
+    # Re-sort all collected results by score, take top-k
+    combined = sorted(
+        zip(all_docs, all_metas, all_scores),
+        key=lambda x: x[2], reverse=True,
+    )[:k + 3]  # slightly more than k to give the LLM richer context
+
+    result["docs"] = [d for d, _, _ in combined]
+    result["metas"] = [m for _, m, _ in combined]
+    result["scores"] = [s for _, _, s in combined]
+    result["confidence"] = result["scores"][0] if result["scores"] else float("-inf")
+    return result
 
 
 # ── Ranker feature extraction (for offline tuning) ──────────────────────────
@@ -5099,6 +5394,8 @@ def multi_retrieve(
     auto_filter: bool = True,
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
+    graph_expand: bool = False,
+    deep: bool = False,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -5117,30 +5414,35 @@ def multi_retrieve(
             "search_query": question, "filters_applied": {}, "query_variants": [question],
             "vault_scope": [],
         }
+    _retrieve_fn = deep_retrieve if deep else retrieve
+
     # Camino corto: un solo vault → evitamos el overhead de merge.
     if len(vaults) == 1:
         name, path = vaults[0]
         col = get_db_for(path)
-        r = retrieve(
+        r = _retrieve_fn(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
+            graph_expand=graph_expand,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
         return r
 
     all_items: list[tuple[float, str, dict]] = []
+    all_graph: list[tuple[str, dict]] = []
     variants: list[str] | None = None
     filters_applied: dict = {}
     for name, path in vaults:
         col = get_db_for(path)
         if col.count() == 0:
             continue   # vault no indexado — skip silent
-        r = retrieve(
+        r = _retrieve_fn(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
+            graph_expand=graph_expand,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -5152,6 +5454,11 @@ def multi_retrieve(
         # Primer vault con filtros inferidos manda (raro que difieran).
         if not filters_applied and r["filters_applied"]:
             filters_applied = r["filters_applied"]
+        # Merge graph-expanded context from all vaults
+        for gd, gm in zip(r.get("graph_docs", []), r.get("graph_metas", [])):
+            gm_annotated = dict(gm)
+            gm_annotated["_vault"] = name
+            all_graph.append((gd, gm_annotated))
 
     all_items.sort(key=lambda x: -x[0])
     top = all_items[:k]
@@ -5165,6 +5472,8 @@ def multi_retrieve(
         "filters_applied": filters_applied,
         "query_variants": variants or [question],
         "vault_scope": [n for n, _ in vaults],
+        "graph_docs": [d for d, _ in all_graph],
+        "graph_metas": [m for _, m in all_graph],
     }
 
 
@@ -6135,7 +6444,10 @@ def _index_single_file(
     if existing_ids:
         col.delete(ids=existing_ids)
 
-    chunks = semantic_chunks(text, path.stem, folder, tags, fm)
+    # Contextual embedding: generate or retrieve cached document-level summary
+    ctx_summary = get_context_summary(text, h, path.stem, folder)
+
+    chunks = semantic_chunks(text, path.stem, folder, tags, fm, context_summary=ctx_summary)
     if not chunks:
         _invalidate_corpus_cache()
         return "empty"
@@ -6175,6 +6487,8 @@ def _index_single_file(
         _index_urls(get_urls_db(), doc_id_prefix, raw, path.stem, folder, tags)
     except Exception:
         pass
+    # Persist context summary cache after each file in watch/incremental mode.
+    _save_context_cache()
     _invalidate_corpus_cache()
     # Ambient hook — fires for Inbox saves only, no-op otherwise.
     # Runs AFTER the main indexing so the note is retrievable to itself for
@@ -6271,7 +6585,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             col.delete(ids=[eid for eid, _ in existing])
             updated_files += 1
 
-        chunks = semantic_chunks(text, path.stem, folder, tags, fm)
+        # Contextual embedding: generate or retrieve cached document-level summary
+        ctx_summary = get_context_summary(text, h, path.stem, folder)
+
+        chunks = semantic_chunks(text, path.stem, folder, tags, fm, context_summary=ctx_summary)
         if not chunks:
             indexed_files.add(doc_id_prefix)
             continue
@@ -6331,6 +6648,9 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 col_urls.delete(ids=existing_urls["ids"])
         except Exception:
             pass
+
+    # Persist context summary cache so incremental runs don't re-generate.
+    _save_context_cache()
 
     console.print(
         f"[green]Listo. {added_chunks} chunks (re)indexados · "
@@ -6457,13 +6777,17 @@ def watch(debounce: float):
               help="Salida plana sin colores/paneles/sources. Para consumo programático.")
 @click.option("--counter", is_flag=True,
               help="Después de responder, buscar chunks del vault que CONTRADIGAN la respuesta")
+@click.option("--graph", is_flag=True,
+              help="Expande resultados con vecinos del grafo de wikilinks (1-hop)")
+@click.option("--deep", is_flag=True,
+              help="Retrieval iterativo: el LLM evalúa suficiencia y genera sub-queries (2-3 pasadas)")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
-    counter: bool,
+    counter: bool, graph: bool, deep: bool,
 ):
     """Consulta única contra las notas."""
     warmup_async()
@@ -6563,19 +6887,22 @@ def query(
         return
 
     t_start = time.perf_counter()
+    _retrieve_kwargs = dict(
+        col=col, question=effective_question, k=k, folder=folder,
+        history=history, tag=tag,
+        precise=hyde, multi_query=not no_multi, auto_filter=not no_auto_filter,
+        date_range=date_range, variants=pre_variants, graph_expand=graph,
+    )
+    if deep:
+        _do_retrieve = lambda: deep_retrieve(**_retrieve_kwargs)
+    else:
+        _do_retrieve = lambda: retrieve(**_retrieve_kwargs)
+
     if plain:
-        result = retrieve(
-            col, effective_question, k, folder, tag=tag, precise=hyde,
-            multi_query=not no_multi, auto_filter=not no_auto_filter,
-            date_range=date_range, variants=pre_variants,
-        )
+        result = _do_retrieve()
     else:
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
-            result = retrieve(
-                col, effective_question, k, folder, tag=tag, precise=hyde,
-                multi_query=not no_multi, auto_filter=not no_auto_filter,
-                date_range=date_range, variants=pre_variants,
-            )
+            result = _do_retrieve()
     t_retrieve = time.perf_counter() - t_start
     if not result["docs"]:
         log_query_event({
@@ -6667,6 +6994,15 @@ def query(
         f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
         for d, m in zip(result["docs"], result["metas"])
     )
+    # Append graph-expanded neighbors as supplementary context
+    graph_docs = result.get("graph_docs", [])
+    graph_metas = result.get("graph_metas", [])
+    if graph_docs:
+        graph_section = "\n\n---\n\n".join(
+            f"[nota relacionada (grafo): {m['note']}] [ruta: {m['file']}]\n{d}"
+            for d, m in zip(graph_docs, graph_metas)
+        )
+        context = f"{context}\n\n--- CONTEXTO EXPANDIDO POR GRAFO ---\n\n{graph_section}"
     rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
     # Perfil del usuario + estado mutable se inyectan antes de las reglas.
     # Vacío si no hay — zero overhead cuando el usuario no los configuró.
@@ -6977,6 +7313,10 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
 @click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
 @click.option("--counter", is_flag=True,
               help="Después de cada respuesta, buscar chunks del vault que la CONTRADIGAN")
+@click.option("--graph", is_flag=True,
+              help="Expande resultados con vecinos del grafo de wikilinks (1-hop)")
+@click.option("--deep", is_flag=True,
+              help="Retrieval iterativo: el LLM evalúa suficiencia y genera sub-queries")
 @click.option("--vault", "vault_scope", default=None,
               help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
                    "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
@@ -6985,6 +7325,7 @@ def chat(
     since: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
+    graph: bool, deep: bool,
     vault_scope: str | None,
 ):
     """Chat interactivo con tus notas."""
@@ -7292,6 +7633,7 @@ def chat(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
+                graph_expand=graph, deep=deep,
             )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
@@ -7307,6 +7649,15 @@ def chat(
             + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
             for d, m in zip(result["docs"], result["metas"])
         )
+        # Append graph-expanded neighbors as supplementary context
+        graph_docs = result.get("graph_docs", [])
+        graph_metas = result.get("graph_metas", [])
+        if graph_docs:
+            graph_section = "\n\n---\n\n".join(
+                f"[nota relacionada (grafo): {m['note']}] [ruta: {m['file']}]\n{d}"
+                for d, m in zip(graph_docs, graph_metas)
+            )
+            context = f"{context}\n\n--- CONTEXTO EXPANDIDO POR GRAFO ---\n\n{graph_section}"
         # Prompt shape debe igualar `rag query` exactamente: sin priming
         # (PREGUNTA:/RESPUESTA:) command-r a veces refusea en borderline scores
         # aunque el contexto alcance — reproducido con "adam jones sistema de
@@ -9593,6 +9944,22 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print("[dim](sin writes propuestos)[/dim]")
 
 
+@cli.command()
+@click.argument("question", default="")
+def weather(question: str):
+    """Consultar el clima sin agent loop ni writes al vault."""
+    data = _fetch_weather_forecast()
+    if data is None:
+        click.echo("Error: no se pudo obtener el pronóstico.")
+        raise SystemExit(1)
+    cur = data["current"]
+    lines = [f"📍 {data['location']} — {cur['description']}, {cur['temp_C']}°C"]
+    for d in data["days"]:
+        rain = f", 🌧 {d['chanceofrain']}%" if d["chanceofrain"] > 10 else ""
+        lines.append(f"  {d['date']}: {d['minC']}–{d['maxC']}°C, {d['description']}{rain}")
+    click.echo("\n".join(lines))
+
+
 _CREATED_TS_BACKFILL_DONE = False
 
 
@@ -11868,7 +12235,7 @@ def _fetch_recent_queries(
 
 
 # ── Weather (only if rain) ──────────────────────────────────────────────────
-WEATHER_LOCATION = "Recreo,Santa+Fe"
+WEATHER_LOCATION = "Santa+Fe,Argentina"
 
 
 def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:

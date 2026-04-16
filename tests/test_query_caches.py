@@ -205,14 +205,16 @@ def test_expand_eviction_drops_oldest_at_cap(fake_chat, monkeypatch):
     monkeypatch.setattr(rag, "_EXPAND_CACHE_MAX", 3)
     fake_chat["next_response"] = "alt one\nalt two"
 
-    for q in ["q1", "q2", "q3"]:
+    # Queries con ≥3 tokens — las de 1-2 se saltean el LLM (perf gate) y
+    # no pasan por el cache, así que no sirven para validar eviction.
+    for q in ["pregunta uno alfa", "pregunta dos beta", "pregunta tres gamma"]:
         rag.expand_queries(q)
     assert len(rag._expand_cache) == 3
 
-    rag.expand_queries("q4")
+    rag.expand_queries("pregunta cuatro delta")
     assert len(rag._expand_cache) == 3
-    assert "q1" not in rag._expand_cache
-    assert "q4" in rag._expand_cache
+    assert "pregunta uno alfa" not in rag._expand_cache
+    assert "pregunta cuatro delta" in rag._expand_cache
 
 
 def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
@@ -222,9 +224,12 @@ def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
     results = []
     errors = []
 
+    # ≥3 tokens para pasar el perf gate y llegar al cache
+    q = "pregunta concurrente varios"
+
     def worker():
         try:
-            results.append(tuple(rag.expand_queries("pregunta concurrente")))
+            results.append(tuple(rag.expand_queries(q)))
         except Exception as e:
             errors.append(e)
 
@@ -236,4 +241,4 @@ def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
 
     assert not errors
     assert len(set(results)) == 1
-    assert "pregunta concurrente" in rag._expand_cache
+    assert q in rag._expand_cache

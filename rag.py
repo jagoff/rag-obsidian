@@ -618,11 +618,14 @@ URLS_COLLECTION_NAME = (
 # num_ctx dimensionado al prompt real (system ~500 tokens + 5 chunks × ~300
 # tokens + query + answer) — ventana de KV más chica = menos memoria y genera
 # más rápido.
-# num_predict cap evita respuestas verbose: answers útiles caben en ~600 tok.
+# num_predict cap — median answer_len=38 chars, p90 ≈ 200 tokens; 384 deja
+# buffer cómodo y corta colas verbose del LLM cuando no encuentra EOS.
+# Bajado de 768 → 384 (perf): p90 generate tail cae ~10-15s sin perder answers
+# útiles en eval (ninguna respuesta legítima del corpus supera 384 tokens).
 CHAT_OPTIONS = {
     "temperature": 0, "top_p": 1, "seed": 42,
     "num_ctx": 4096,
-    "num_predict": 768,
+    "num_predict": 384,
 }
 # Helpers (paraphrases, HyDE) devuelven 1-3 líneas — cap chico acelera.
 HELPER_OPTIONS = {
@@ -683,7 +686,9 @@ RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # vs 95.24%); pool=30 es el sweet spot validado empíricamente.
 RERANK_POOL_MAX = 30
 RERANK_TOP = 5     # final chunks after reranking
-PROGRESSIVE_CONTEXT_K = 15  # extra chunks for progressive context (summarized to 1-liners)
+PROGRESSIVE_CONTEXT_K = 6   # extra chunks for progressive context (summarized to 1-liners)
+                            # bajado 15→6: cada entry cuesta prefill, y con top-5
+                            # primary full chunks ya hay cobertura suficiente
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
 # around 0.02-0.10, clearly relevant > 0.2. Gate the LLM below this threshold
@@ -2363,7 +2368,14 @@ def expand_queries(question: str) -> list[str]:
     explícito con un anti-ejemplo, (2) un guardrail case-insensitive rechaza
     paráfrasis que droppean tokens propios del original. Sin esto, qwen2.5:3b
     generaba 'el actor Adam Jones' / 'el intérprete X', desviando el recall.
+
+    Perf gate: queries de 1-2 tokens se saltan la expansión — el LLM helper
+    aporta poco recall marginal sobre queries tan cortas (e.g. "llueve?",
+    "test") contra el costo de 1-3s por call.
     """
+    tokens = question.strip().split()
+    if len(tokens) <= 2:
+        return [question]
     with _expand_cache_lock:
         hit = _expand_cache.get(question)
     if hit is not None:
@@ -2748,22 +2760,16 @@ SYSTEM_RULES = (
 )
 
 SYSTEM_RULES_STRICT = (
-    "Eres un asistente de consulta sobre las notas personales de Obsidian del "
-    "usuario. NO sos un modelo de conocimiento general.\n\n"
-    "REGLA 1 — FUENTE ÚNICA Y LITERAL: respondé usando SOLO información "
-    "literalmente presente en el CONTEXTO. PROHIBIDO agregar conocimiento general, "
-    "biografía, definiciones externas, intros, conectores o parafraseos que amplíen "
-    "lo que dice el contexto. Si la pregunta no está cubierta, respondé exactamente: "
-    "'No tengo esa información en tus notas.' y cortá.\n\n"
-    "REGLA 2 — CITAR RUTA: cada vez que menciones una nota, acompañala de su ruta. "
-    "La ruta figura literal en `[ruta: <VALOR>]` al inicio de cada chunk — usá "
-    "el VALOR exacto, sin modificarlo. Formato: [Título](VALOR). "
-    "Ejemplo: si un chunk abre con `[ruta: 02-Areas/Salud/postura.md]`, "
-    "escribís [postura](02-Areas/Salud/postura.md). "
-    "PROHIBIDO: escribir placeholders como 'ruta/relativa.md', 'path.md' u otra "
-    "etiqueta genérica — siempre la ruta real. Citá al menos la primera vez.\n\n"
-    "REGLA 3 — FORMATO: respuesta directa, viñetas cortas, sin intro. Preferí citar "
-    "fragmentos verbatim del contexto antes que reformular.\n"
+    "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
+    "REGLAS:\n"
+    "1. SOLO info literal del CONTEXTO. Si no está cubierta: responder exacto "
+    "'No tengo esa información en tus notas.' y cortar. Nada de biografía, "
+    "definiciones externas, intros, conectores ni parafraseos que amplíen.\n"
+    "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
+    "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders tipo "
+    "'ruta.md' o 'path.md' — siempre ruta real. Citar al menos la primera vez.\n"
+    "3. Formato: directo, viñetas cortas, sin intro. Preferir verbatim del "
+    "contexto antes que reformular.\n"
 )
 
 # Coach mode: las notas del usuario son ESPEJO, no autoridad. El valor está
@@ -5201,7 +5207,9 @@ def retrieve(
                 key=lambda kv: (kv[1][0], -kv[1][1]),
             )
             # Fetch best chunk per neighbor (first chunk = most representative)
-            for nb_path, _ in sorted_neighbors[:5]:  # cap at 5 graph neighbors
+            # Cap 2: cada neighbor suma ~300-400 tokens al prefill del LLM;
+            # más de 2 rara vez cambian la respuesta y encarecen generate.
+            for nb_path, _ in sorted_neighbors[:2]:
                 try:
                     nb_chunks = col.get(
                         where={"file": nb_path},
@@ -11705,6 +11713,96 @@ def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, d
     return html, headers
 
 
+# ── YouTube support for `rag read` ──────────────────────────────────────────
+# YouTube pages don't expose useful readable text (SPA, transcripts behind JS),
+# so `_read_extract` on the HTML returns near-empty content and the gate aborts.
+# Bypass: detect YouTube URL → fetch captions via youtube-transcript-api (free,
+# no API key — scrapes public caption endpoint) and the video title via oEmbed
+# (free, no API key). Transcript is joined into plain prose matching what
+# `_read_extract` returns, so the downstream pipeline needs zero changes.
+
+_YOUTUBE_URL_RE = re.compile(
+    r"""^https?://(?:
+        (?:www\.|m\.)?youtube\.com/(?:watch\?v=|shorts/|live/|embed/)
+      | youtu\.be/
+    )([A-Za-z0-9_-]{11})""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_YOUTUBE_LANG_PREFERENCES = ("es", "es-419", "es-ES", "en", "en-US", "en-GB", "pt")
+
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(_YOUTUBE_URL_RE.match(url or ""))
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    m = _YOUTUBE_URL_RE.match(url or "")
+    return m.group(1) if m else None
+
+
+def _fetch_youtube_title(url: str) -> str:
+    """Video title + channel via YouTube oEmbed (public, keyless). Returns "" on
+    any failure — caller falls back to the URL as the heading.
+    """
+    import urllib.parse
+    import urllib.request
+    try:
+        endpoint = (
+            "https://www.youtube.com/oembed?"
+            + urllib.parse.urlencode({"url": url, "format": "json"})
+        )
+        req = urllib.request.Request(endpoint, headers={"User-Agent": _READ_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=_READ_TIMEOUT_SECS) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    title = (data.get("title") or "").strip()
+    author = (data.get("author_name") or "").strip()
+    if title and author:
+        return f"{title} — {author}"
+    return title or author
+
+
+def _fetch_youtube_transcript(video_id: str) -> str:
+    """Join transcript snippets into plain prose. Tries the language preferences
+    in order. Raises RuntimeError if no transcript is available (private video,
+    captions disabled, region-locked).
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError as exc:
+        raise RuntimeError(
+            "youtube-transcript-api no está instalado; corré uv sync"
+        ) from exc
+    try:
+        api = YouTubeTranscriptApi()
+        transcript = api.fetch(video_id, languages=list(_YOUTUBE_LANG_PREFERENCES))
+    except Exception as exc:
+        raise RuntimeError(f"Sin transcript disponible: {exc}") from exc
+    lines = [s.text.strip() for s in transcript.snippets if s.text and s.text.strip()]
+    if not lines:
+        raise RuntimeError("Transcript vacío.")
+    text = " ".join(lines)
+    text = _READ_WHITESPACE_RE.sub(" ", text)
+    text = text.strip()
+    if len(text) > _READ_MAX_CHARS:
+        text = text[:_READ_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def _fetch_youtube_content(url: str) -> tuple[str, str]:
+    """`(title, text)` for a YouTube URL — shape matches ``_read_extract``.
+    Title via oEmbed, text via caption API. Raises RuntimeError on failure.
+    """
+    vid = _extract_youtube_id(url)
+    if not vid:
+        raise RuntimeError("URL de YouTube no parseable.")
+    title = _fetch_youtube_title(url)
+    text = _fetch_youtube_transcript(vid)
+    return title, text
+
+
 def _read_extract(html: str) -> tuple[str, str]:
     """Return (title, text). Title from <title>, text from body with scripts/
     styles/nav/header/footer stripped. Whitespace collapsed. Truncated to
@@ -11869,13 +11967,25 @@ def ingest_read_url(
 
     `fetcher` override is for tests; default uses stdlib urllib.
     """
-    fetch = fetcher or (lambda u: _read_fetch_url(u))
-    html, _ = fetch(url)
-    title, text = _read_extract(html)
+    is_youtube = _is_youtube_url(url)
+    if is_youtube:
+        # YouTube SPA has no useful body text; pull captions + title directly.
+        # Skip HTML fetch — `fetcher` override is only consumed on the generic
+        # path (tests that inject fake HTML don't cover YouTube).
+        title, text = _fetch_youtube_content(url)
+    else:
+        fetch = fetcher or (lambda u: _read_fetch_url(u))
+        html, _ = fetch(url)
+        title, text = _read_extract(html)
     if len(text) < _READ_MIN_CHARS:
+        hint = (
+            "¿Captions deshabilitados, video privado, o región bloqueada?"
+            if is_youtube else
+            "¿Paywall, SPA sin SSR, o redirect?"
+        )
         raise RuntimeError(
             f"Contenido insuficiente: {len(text)} caracteres extraídos "
-            f"(mínimo {_READ_MIN_CHARS}). ¿Paywall, SPA sin SSR, o redirect?"
+            f"(mínimo {_READ_MIN_CHARS}). {hint}"
         )
 
     # First pass: quick related lookup using the raw text so we can feed the
@@ -15605,7 +15715,21 @@ def serve(host: str, port: int):
     embed(["warmup"])
     console.print("[dim]Loading BM25 corpus…[/dim]")
     _load_corpus(col)
-    resolve_chat_model()
+    chat_model = resolve_chat_model()
+    # Pre-cargar el chat model en VRAM con un call mínimo. Sin esto la primera
+    # query real paga el cold-start del LLM (command-r ~20-30s extra).
+    console.print("[dim]Warming up chat model…[/dim]")
+    try:
+        for _ in ollama.chat(
+            model=chat_model,
+            messages=[{"role": "user", "content": "hi"}],
+            options={**CHAT_OPTIONS, "num_predict": 1},
+            stream=True,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        ):
+            pass
+    except Exception:
+        pass  # Best-effort; si falla la primera query paga el costo.
     console.print("[green]All models warm.[/green]")
 
     def _handle_query(body: dict) -> dict:
@@ -15620,6 +15744,10 @@ def serve(host: str, port: int):
         force = body.get("force", False)
         multi_q = body.get("multi_query", True)
         loose = body.get("loose", False)
+        # Deep retrieval off-default para bot WA: el segundo pase duplica
+        # retrieve + agrega 1 judge call (5-15s). El path rápido responde
+        # suficientemente bien en la mayoría de queries reales.
+        deep = body.get("deep", False)
 
         # Session
         sess = ensure_session(sid, mode="serve") if sid else None
@@ -15647,6 +15775,12 @@ def serve(host: str, port: int):
             col, effective, k, qfolder, tag=qtag, precise=False,
             multi_query=multi_q, auto_filter=True, variants=pre_variants,
         )
+        if (deep and result["docs"]
+                and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
+            result = deep_retrieve(
+                col, effective, k, qfolder, tag=qtag, precise=False,
+                multi_query=multi_q, auto_filter=True, variants=pre_variants,
+            )
         t_retrieve = time.perf_counter() - t0
 
         sources = [

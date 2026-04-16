@@ -678,12 +678,10 @@ def is_excluded(rel_path: str) -> bool:
     return any(seg.startswith(".") for seg in rel_path.split("/") if seg)
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
-# 2 métodos el pool crudo llega a 70-80 únicos, reranker tarda ~4s. Cappear
-# a 40 lleva el rerank a ~2.5s (ahorro ~1.5s) manteniendo hit@5 = RERANK_TOP
-# siempre es ≤5, imposible que el top-5 caiga fuera del top-40 RRF salvo
-# corner case con score muy plano. Calibrado empíricamente — bajarlo a 30
-# arriesga recall en queries ambigüas.
-RERANK_POOL_MAX = 40
+# 2 métodos el pool crudo llega a 70-80 únicos. Cap a 25 ahorra ~750ms vs 40
+# (25×50ms=1.25s vs 40×50ms=2s). El top-5 final rarísimo que caiga fuera
+# del top-25 RRF — validado con `rag eval` post-cambio.
+RERANK_POOL_MAX = 25
 RERANK_TOP = 5     # final chunks after reranking
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
@@ -2269,6 +2267,86 @@ def expand_queries(question: str) -> list[str]:
     return list(result)
 
 
+def reformulate_and_expand(
+    question: str,
+    history: list[dict],
+    summary: str | None = None,
+) -> tuple[str, list[str]]:
+    """Reformulate a follow-up question AND generate paraphrases in ONE helper call.
+
+    Merges the work of ``reformulate_query`` + ``expand_queries`` into a single
+    qwen2.5:3b round-trip, saving ~0.5-1.5s of Ollama latency per session query.
+
+    Returns ``(standalone_query, [standalone, paraphrase1, paraphrase2])``.
+    When there is no history/summary, delegates to ``expand_queries`` unchanged.
+    """
+    if not history and not summary:
+        variants = expand_queries(question)
+        return question, variants
+
+    # Check expand cache — if the reformulated form was already expanded in a
+    # previous turn we can skip the merged call entirely and only reformulate.
+    # But we don't know the reformulated form yet, so we merge.
+
+    recent = history[-6:]
+    history_text = "\n".join(
+        f"{'Usuario' if m['role'] == 'user' else 'Asistente'}: {m['content'][:200]}"
+        for m in recent
+    )
+    summary_section = (
+        f"Resumen de turnos previos:\n{summary}\n\n" if summary else ""
+    )
+    prompt = (
+        "Tu tarea tiene dos partes:\n"
+        "1. Si la pregunta tiene pronombres o referencias ambiguas al historial, "
+        "reescribila como consulta de búsqueda AUTÓNOMA resolviendo esas "
+        "referencias. Si ya es autónoma, dejala tal cual.\n"
+        "2. Generá 2 reformulaciones con distintas palabras clave, mismo sentido.\n\n"
+        "Reglas:\n"
+        "- Nombres propios van LITERALES (no 'el actor X', no 'la banda Y').\n"
+        "- Preservá posesivos ('mi', 'mis', 'tengo').\n"
+        "- Si menciona 'esa carpeta' o 'del mismo folder', preservá el nombre "
+        "del folder referido.\n\n"
+        f"Historial:\n{summary_section}{history_text}\n\n"
+        f"Nueva pregunta: \"{question}\"\n\n"
+        "Devolvé EXACTAMENTE 3 líneas (sin numerar, sin explicar):\n"
+        "Línea 1: consulta autónoma\n"
+        "Línea 2: paráfrasis 1\n"
+        "Línea 3: paráfrasis 2"
+    )
+    try:
+        resp = ollama.chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 192},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        lines = [ln.strip(" -*·") for ln in resp.message.content.splitlines() if ln.strip()]
+    except Exception:
+        return question, [question]
+
+    if not lines:
+        return question, [question]
+
+    standalone = lines[0]
+
+    # Guardrail: proper nouns from the ORIGINAL question must survive in all lines
+    original_nouns = {n.lower() for n in _extract_proper_nouns(question)}
+    kept: list[str] = [standalone]
+    for ln in lines[1:]:
+        if ln == standalone:
+            continue
+        if original_nouns:
+            para_tokens = {m.group(0).lower() for m in _PARAPHRASE_TOKEN_RE.finditer(ln)}
+            if not original_nouns.issubset(para_tokens):
+                continue
+        kept.append(ln)
+        if len(kept) >= 3:
+            break
+
+    return standalone, kept
+
+
 _RECENCY_RE = re.compile(
     r"\b(?:recient(?:es?|emente)|[uú]ltim[aos]{1,2}|[uú]ltimamente|hoy|ayer|"
     r"esta\s+semana|este\s+mes|este\s+a[nñ]o|del?\s+mes\s+pasado|reci[eé]n|"
@@ -3131,21 +3209,22 @@ def find_wikilink_suggestions(
 
 
 def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
-    """Wrap each proposed mention with `[[ ]]`. Returns the count actually
-    applied. Iterates from highest offset to lowest so earlier offsets stay
-    valid. Defensive: re-checks the literal text at offset before substituting
+    """Wrap each proposed mention with `[[ ]]`. Returns (count, titles_applied).
+    Iterates from highest offset to lowest so earlier offsets stay valid.
+    Defensive: re-checks the literal text at offset before substituting
     so a stale suggestion (file edited mid-flight) is silently skipped.
     """
     full = (VAULT_PATH / note_path).resolve()
     try:
         full.relative_to(VAULT_PATH.resolve())
     except ValueError:
-        return 0
+        return 0, []
     if not full.is_file() or not suggestions:
-        return 0
+        return 0, []
     raw = full.read_text(encoding="utf-8", errors="ignore")
     by_offset = sorted(suggestions, key=lambda s: s["char_offset"], reverse=True)
     applied = 0
+    applied_titles: list[str] = []
     for s in by_offset:
         start = s["char_offset"]
         title = s["title"]
@@ -3154,9 +3233,10 @@ def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
             continue
         raw = raw[:start] + f"[[{title}]]" + raw[end:]
         applied += 1
+        applied_titles.append(title)
     if applied:
         full.write_text(raw, encoding="utf-8")
-    return applied
+    return applied, applied_titles
 
 
 # ── DUPLICATE DETECTION ──────────────────────────────────────────────────────
@@ -4533,6 +4613,7 @@ def retrieve(
     auto_filter: bool = True,
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
+    variants: list[str] | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -4587,13 +4668,16 @@ def retrieve(
         filters_applied["since"] = datetime.fromtimestamp(date_range[0]).strftime("%Y-%m-%d")
         filters_applied["until"] = datetime.fromtimestamp(date_range[1]).strftime("%Y-%m-%d")
 
-    # 3. Multi-query expansion (original + 2 paraphrases)
-    variants = [search_query]
-    if multi_query:
-        try:
-            variants = expand_queries(search_query)
-        except Exception:
-            variants = [search_query]
+    # 3. Multi-query expansion (original + 2 paraphrases).
+    #    When `variants` is pre-supplied (e.g. from reformulate_and_expand),
+    #    skip the helper-model call — it was already done by the caller.
+    if variants is None:
+        variants = [search_query]
+        if multi_query:
+            try:
+                variants = expand_queries(search_query)
+            except Exception:
+                variants = [search_query]
 
     # 4. Retrieve per variant, union IDs.
     #    Non-HyDE path: batch-embed all variants in one Ollama call.
@@ -5877,7 +5961,7 @@ def _ambient_hook(
     try:
         sugs = find_wikilink_suggestions(col, doc_id_prefix, max_per_note=10)
         if sugs:
-            wikilinks_applied = apply_wikilink_suggestions(doc_id_prefix, sugs)
+            wikilinks_applied, titles_applied = apply_wikilink_suggestions(doc_id_prefix, sugs)
     except Exception:
         sugs = []
 
@@ -5905,7 +5989,6 @@ def _ambient_hook(
     title = path.stem
     lines = [f"🤖 Ambient: [[{title}]]"]
     if wikilinks_applied:
-        titles_applied = [s["title"] for s in sugs[:wikilinks_applied]]
         preview = ", ".join(titles_applied[:3])
         extra = "" if len(titles_applied) <= 3 else f" +{len(titles_applied) - 3}"
         lines.append(f"🔗 Linkeé {wikilinks_applied}: {preview}{extra}")
@@ -6345,13 +6428,21 @@ def query(
         sess = ensure_session(session_id, mode="query") if session_id else None
     history = session_history(sess) if sess else None
 
-    # Reformulate standalone follow-ups when we have prior turns. Do this even
-    # outside --hyde/--precise because the whole point of --session is that the
-    # new question can be a pronoun-laden fragment. When the session has aged
-    # turns out of the raw window, feed the cached summary so long-range
-    # context survives the reformulation.
+    # Reformulate + expand in ONE helper-model call when session history exists.
+    # Saves ~0.5-1.5s by eliminating one Ollama round-trip. When no history,
+    # expansion happens inside retrieve() as before.
     effective_question = question
-    if history:
+    pre_variants: list[str] | None = None
+    if history and not no_multi:
+        try:
+            sess_summary = session_summary(sess) if sess else None
+            effective_question, pre_variants = reformulate_and_expand(
+                question, history, summary=sess_summary
+            )
+        except Exception:
+            effective_question = question
+    elif history:
+        # Multi-query disabled but still need reformulation
         try:
             sess_summary = session_summary(sess) if sess else None
             effective_question = reformulate_query(question, history, summary=sess_summary)
@@ -6416,14 +6507,14 @@ def query(
         result = retrieve(
             col, effective_question, k, folder, tag=tag, precise=hyde,
             multi_query=not no_multi, auto_filter=not no_auto_filter,
-            date_range=date_range,
+            date_range=date_range, variants=pre_variants,
         )
     else:
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
             result = retrieve(
                 col, effective_question, k, folder, tag=tag, precise=hyde,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
-                date_range=date_range,
+                date_range=date_range, variants=pre_variants,
             )
     t_retrieve = time.perf_counter() - t_start
     if not result["docs"]:
@@ -8788,10 +8879,14 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
 
 
 def _path_to_title(corpus: dict, path: str) -> str | None:
-    for title, paths in corpus["title_to_paths"].items():
-        if path in paths:
-            return title
-    return None
+    rev = corpus.get("_path_to_title_rev")
+    if rev is None:
+        rev = {}
+        for title, paths in corpus["title_to_paths"].items():
+            for p in paths:
+                rev[p] = title
+        corpus["_path_to_title_rev"] = rev
+    return rev.get(path)
 
 
 @cli.command()
@@ -9240,6 +9335,22 @@ def _agent_tool_list_notes(folder: str | None = None, tag: str | None = None, li
     return json.dumps(out, ensure_ascii=False)
 
 
+def _agent_tool_weather(location: str | None = None) -> str:
+    """Consultar el pronóstico del tiempo (hoy + 2 días).
+
+    Args:
+        location: Ciudad a consultar (ej. "Buenos Aires"). Default: ubicación configurada.
+
+    Returns:
+        JSON con condición actual y pronóstico de 3 días (temp, lluvia, descripción).
+    """
+    loc = location.replace(" ", "+") if location else WEATHER_LOCATION
+    result = _fetch_weather_forecast(loc)
+    if result is None:
+        return "Error: no se pudo obtener el pronóstico. Verificá conectividad."
+    return json.dumps(result, ensure_ascii=False)
+
+
 _AGENT_PENDING_WRITES: list[dict] = []
 
 
@@ -9283,7 +9394,9 @@ _AGENT_SYSTEM = (
     "4. Cuando terminás, respondé con un resumen breve en lenguaje natural "
     "   de lo que hiciste y qué proponés.\n"
     "5. Si la instrucción es ambigua o no podés completarla con el vault, "
-    "   decilo — no inventes."
+    "   decilo — no inventes.\n"
+    "6. Tenés un tool `_agent_tool_weather` para consultar el pronóstico del "
+    "   tiempo. Usalo cuando la pregunta sea sobre clima/lluvia/temperatura."
 )
 
 
@@ -9310,6 +9423,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
         _agent_tool_read_note,
         _agent_tool_list_notes,
         _agent_tool_propose_write,
+        _agent_tool_weather,
     ]
     tool_fns = {fn.__name__: fn for fn in tools}
 
@@ -10390,7 +10504,7 @@ def inbox(folder: str, apply: bool, max_tags: int, limit: int,
             new_rel = str(target_path.relative_to(VAULT_PATH))
             fresh = find_wikilink_suggestions(col, new_rel, max_per_note=10)
             if fresh:
-                n = apply_wikilink_suggestions(new_rel, fresh)
+                n, _ = apply_wikilink_suggestions(new_rel, fresh)
                 if n:
                     linkified += 1
                     console.print(f"  [green]✓ {n} wikilinks aplicados[/green]")
@@ -10724,7 +10838,7 @@ def wikilinks_suggest(
 
         if apply:
             try:
-                n_applied = apply_wikilink_suggestions(path, sugs)
+                n_applied, _ = apply_wikilink_suggestions(path, sugs)
                 if n_applied:
                     notes_applied += 1
                     # Re-index the rewritten note so retrieval picks up the new
@@ -11774,6 +11888,70 @@ def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
         "max_chance": max_chance if max_chance else (100 if currently_raining else 0),
         "blocks": rain_blocks,
         "current": current,
+    }
+
+
+def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
+    """Query wttr.in and return a multi-day forecast summary.
+
+    Returns dict with keys: location, current, days (list of up to 3 day
+    forecasts with date, minC, maxC, avgC, description, chanceofrain,
+    chanceofthunder). Returns None on network/parse errors.
+    """
+    import urllib.request as _req
+    url = f"https://wttr.in/{location}?format=j1"
+    try:
+        with _req.urlopen(url, timeout=8.0) as resp:
+            raw = resp.read()
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+
+    # Current conditions
+    current = ""
+    temp_c = ""
+    try:
+        cc = data.get("current_condition") or []
+        if cc:
+            desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
+            current = desc.strip()
+            temp_c = cc[0].get("temp_C", "")
+    except Exception:
+        pass
+
+    # Daily forecasts (wttr.in gives today + 2 more days)
+    days: list[dict] = []
+    for wd in data.get("weather") or []:
+        # Max rain chance across hourly blocks
+        max_rain = 0
+        max_thunder = 0
+        descs: list[str] = []
+        for h in wd.get("hourly") or []:
+            try:
+                max_rain = max(max_rain, int(h.get("chanceofrain", "0") or 0))
+                max_thunder = max(max_thunder, int(h.get("chanceofthunder", "0") or 0))
+            except Exception:
+                pass
+            d = (h.get("weatherDesc") or [{}])[0].get("value", "")
+            if d and d not in descs:
+                descs.append(d)
+        days.append({
+            "date": wd.get("date", ""),
+            "minC": wd.get("mintempC", ""),
+            "maxC": wd.get("maxtempC", ""),
+            "avgC": wd.get("avgtempC", ""),
+            "description": ", ".join(descs[:3]),
+            "chanceofrain": max_rain,
+            "chanceofthunder": max_thunder,
+        })
+
+    return {
+        "location": location.replace("+", " "),
+        "current": {"description": current, "temp_C": temp_c},
+        "days": days,
     }
 
 
@@ -13693,6 +13871,10 @@ def archive(min_age_days: int, query_window_days: int, folder: str | None,
 FOLLOWUP_STALE_DAYS = 14
 FOLLOWUP_RESOLVE_MIN_SCORE = 0.03
 
+_FOLLOWUP_CHECKBOX_LINE_RE = re.compile(
+    r"^\s*[-*]\s*\[[ xX]\][^\n]*", re.MULTILINE,
+)
+
 _FOLLOWUP_IMPERATIVE_RE = re.compile(
     r"\b(tengo que|pendiente[:\s]|revisar|explorar|profundizar|chequear)\b"
     r"[\s:]+([^.\n\r]{1,80})",
@@ -13780,10 +13962,7 @@ def _extract_followup_loops(
             "kind": "checkbox",
         })
 
-    checkbox_line_re = re.compile(
-        r"^\s*[-*]\s*\[[ xX]\][^\n]*", re.MULTILINE,
-    )
-    checkbox_spans = [m.span() for m in checkbox_line_re.finditer(body_no_fences)]
+    checkbox_spans = [m.span() for m in _FOLLOWUP_CHECKBOX_LINE_RE.finditer(body_no_fences)]
     def _in_checkbox(pos: int) -> bool:
         return any(s <= pos < e for s, e in checkbox_spans)
 
@@ -14647,6 +14826,196 @@ def ambient_log(n: int):
             f"[magenta]dupes={dupes}[/magenta] "
             f"[blue]rel={rel}[/blue]"
         )
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", help="Bind address")
+@click.option("--port", default=7832, type=int, help="Port number")
+def serve(host: str, port: int):
+    """Persistent HTTP query server — keeps models warm between requests.
+
+    Designed for WhatsApp/bot integrations that need fast response times.
+    Eliminates the ~5s cold start of subprocess-per-query by keeping the
+    reranker, embedder, and BM25 corpus resident in memory.
+
+    Endpoints:
+      GET  /health  — liveness + chunk count
+      POST /query   — full retrieve + generate pipeline, returns JSON
+    """
+    import json as _json
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    col = get_db()
+    if col.count() == 0:
+        console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
+        return
+
+    # Eager warmup — block until all models are ready.
+    console.print("[dim]Warming up reranker…[/dim]")
+    get_reranker()
+    console.print("[dim]Warming up embedder…[/dim]")
+    embed(["warmup"])
+    console.print("[dim]Loading BM25 corpus…[/dim]")
+    _load_corpus(col)
+    resolve_chat_model()
+    console.print("[green]All models warm.[/green]")
+
+    def _handle_query(body: dict) -> dict:
+        question = body.get("question", "").strip()
+        if not question:
+            return {"error": "empty question"}
+
+        k = max(1, min(body.get("k", RERANK_TOP), 15))
+        qfolder = body.get("folder")
+        qtag = body.get("tag")
+        sid = body.get("session_id")
+        force = body.get("force", False)
+        multi_q = body.get("multi_query", True)
+        loose = body.get("loose", False)
+
+        # Session
+        sess = ensure_session(sid, mode="serve") if sid else None
+        history = session_history(sess) if sess else None
+
+        # Reformulate + expand (merged when history available)
+        effective = question
+        pre_variants: list[str] | None = None
+        if history and multi_q:
+            try:
+                s_sum = session_summary(sess) if sess else None
+                effective, pre_variants = reformulate_and_expand(
+                    question, history, summary=s_sum,
+                )
+            except Exception:
+                effective = question
+        elif history:
+            try:
+                effective = reformulate_query(question, history)
+            except Exception:
+                effective = question
+
+        t0 = time.perf_counter()
+        result = retrieve(
+            col, effective, k, qfolder, tag=qtag, precise=False,
+            multi_query=multi_q, auto_filter=True, variants=pre_variants,
+        )
+        t_retrieve = time.perf_counter() - t0
+
+        sources = [
+            {"note": m.get("note", ""), "path": m.get("file", ""),
+             "score": round(float(s), 2)}
+            for m, s in zip(result["metas"], result["scores"])
+        ]
+
+        if not result["docs"]:
+            return {"answer": "", "sources": [], "t_retrieve": round(t_retrieve, 3)}
+
+        # Confidence gate
+        if result["confidence"] < CONFIDENCE_RERANK_MIN and not force:
+            if sess:
+                append_turn(sess, {"q": question, "a": None, "gated": True,
+                                   "paths": [m.get("file", "") for m in result["metas"]],
+                                   "top_score": round(float(result["confidence"]), 3)})
+                save_session(sess)
+            return {
+                "answer": "No tengo esa información en tus notas.",
+                "gated": True, "sources": sources,
+                "confidence": round(float(result["confidence"]), 2),
+                "t_retrieve": round(t_retrieve, 3),
+            }
+
+        # Generate
+        context = "\n\n---\n\n".join(
+            f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
+            for d, m in zip(result["docs"], result["metas"])
+        )
+        rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
+        ub = user_prompt_block()
+        rules_full = f"{ub}{rules}" if ub else rules
+        if history:
+            messages = (
+                [{"role": "system", "content": f"{rules_full}\nCONTEXTO:\n{context}"}]
+                + history
+                + [{"role": "user", "content": question}]
+            )
+        else:
+            messages = [{"role": "user",
+                         "content": f"{rules_full}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
+
+        t_gen0 = time.perf_counter()
+        parts: list[str] = []
+        for chunk in ollama.chat(
+            model=resolve_chat_model(), messages=messages,
+            options=CHAT_OPTIONS, stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+        ):
+            parts.append(chunk.message.content)
+        t_gen = time.perf_counter() - t_gen0
+        answer = convert_obsidian_links("".join(parts))
+
+        # Session persist
+        if sess:
+            append_turn(sess, {
+                "q": question,
+                "q_reformulated": effective if effective != question else None,
+                "a": answer[:500],
+                "paths": [m.get("file", "") for m in result["metas"]],
+                "top_score": round(float(result["confidence"]), 3),
+            })
+            save_session(sess)
+
+        log_query_event({
+            "cmd": "serve", "q": question,
+            "filters": result.get("filters_applied"),
+            "variants": result.get("query_variants"),
+            "paths": [m.get("file", "") for m in result["metas"]],
+            "scores": [round(float(s), 2) for s in result["scores"]],
+            "top_score": round(float(result["confidence"]), 2),
+            "t_retrieve": round(t_retrieve, 2), "t_gen": round(t_gen, 2),
+            "answered": True,
+        })
+
+        return {
+            "answer": answer, "sources": sources,
+            "confidence": round(float(result["confidence"]), 2),
+            "t_retrieve": round(t_retrieve, 3), "t_gen": round(t_gen, 3),
+        }
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self._json(200, {"status": "ok", "chunks": col.count()})
+            else:
+                self._json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/query":
+                self._json(404, {"error": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = _json.loads(self.rfile.read(length)) if length else {}
+                result = _handle_query(body)
+                self._json(200, result)
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+
+        def _json(self, code: int, data: dict):
+            payload = _json.dumps(data, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass  # Silence per-request logging
+
+    server = HTTPServer((host, port), _Handler)
+    console.print(f"[bold green]rag serve[/bold green] → http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Stopped.[/yellow]")
 
 
 @cli.command()

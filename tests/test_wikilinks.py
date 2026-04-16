@@ -184,8 +184,9 @@ def test_apply_wraps_title(vault_with_titles):
     vault, col = vault_with_titles
     (vault / "apply.md").write_text("Hablamos de Ikigai en la reunión.")
     sugs = rag.find_wikilink_suggestions(col, "apply.md")
-    n = rag.apply_wikilink_suggestions("apply.md", sugs)
+    n, titles = rag.apply_wikilink_suggestions("apply.md", sugs)
     assert n == 1
+    assert "Ikigai" in titles
     assert "[[Ikigai]]" in (vault / "apply.md").read_text()
 
 
@@ -205,8 +206,9 @@ def test_apply_handles_multiple_suggestions(vault_with_titles):
     vault, col = vault_with_titles
     (vault / "multi.md").write_text("Ikigai y Moka son temas distintos.")
     sugs = rag.find_wikilink_suggestions(col, "multi.md")
-    n = rag.apply_wikilink_suggestions("multi.md", sugs)
+    n, titles = rag.apply_wikilink_suggestions("multi.md", sugs)
     assert n == 2
+    assert set(titles) == {"Ikigai", "Moka"}
     new = (vault / "multi.md").read_text()
     assert "[[Ikigai]]" in new and "[[Moka]]" in new
 
@@ -218,11 +220,13 @@ def test_apply_skips_stale_offset(vault_with_titles):
     # Mutate the file behind the suggestion's back so the offset no longer
     # points at "Ikigai".
     (vault / "stale.md").write_text("XXX está acá.")
-    n = rag.apply_wikilink_suggestions("stale.md", sugs)
+    n, titles = rag.apply_wikilink_suggestions("stale.md", sugs)
     assert n == 0
+    assert titles == []
     assert "[[" not in (vault / "stale.md").read_text()
 
 
 def test_apply_empty_returns_zero(vault_with_titles):
-    n = rag.apply_wikilink_suggestions("Ikigai.md", [])
+    n, titles = rag.apply_wikilink_suggestions("Ikigai.md", [])
     assert n == 0
+    assert titles == []

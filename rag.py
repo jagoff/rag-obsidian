@@ -11672,6 +11672,175 @@ def _parse_applescript_date(s: str) -> datetime | None:
     return None
 
 
+def _fetch_system_activity(
+    now: datetime, lookback_hours: int = 36,
+) -> dict:
+    """Qué hizo el sistema por su cuenta en las últimas `lookback_hours`.
+
+    Agrega 3 fuentes on-disk (no toca el vault):
+      - `ambient.jsonl` → eventos del hook ambient con wikilinks aplicados,
+        dupes detectados o related notes. Se cuentan solo entries con ts en
+        ventana y con al menos un signal > 0.
+      - `filing_batches/*.jsonl` → audit log de moves (filing + archive).
+        Conteo por MTIME del archivo dentro de la ventana. Archive runs
+        se diferencian por prefijo de nombre `archive-`.
+      - `tune.jsonl` → runs de `rag tune` (auto-calibración del ranker).
+        `tune_last_delta` devuelve el `delta` de la run más reciente.
+
+    Pure read: archivos inexistentes → ceros. Nunca crashea — errores de
+    parsing en líneas individuales se ignoran.
+    """
+    from datetime import timedelta as _td
+    start = now - _td(hours=lookback_hours)
+    start_ts = start.timestamp()
+
+    out = {
+        "ambient_events": 0,
+        "ambient_wikilinks": 0,
+        "filing_moves": 0,
+        "archive_moves": 0,
+        "tune_runs": 0,
+        "tune_last_delta": None,
+    }
+
+    # 1. Ambient: lineas con ts en ventana + al menos un signal > 0.
+    if AMBIENT_LOG_PATH.is_file():
+        try:
+            for line in AMBIENT_LOG_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(e.get("ts", ""))
+                except Exception:
+                    continue
+                if ts < start or ts >= now:
+                    continue
+                wl = int(e.get("wikilinks_applied") or 0)
+                dupes = len(e.get("dupes") or [])
+                rel = int(e.get("related_count") or 0)
+                if wl > 0 or dupes > 0 or rel > 0:
+                    out["ambient_events"] += 1
+                    out["ambient_wikilinks"] += wl
+        except OSError:
+            pass
+
+    # 2. Filing batches: iterar archivos jsonl en la carpeta, contar rows
+    # por mtime dentro de la ventana. Archive-* se cuenta también en
+    # `archive_moves`.
+    if FILING_BATCHES_DIR.is_dir():
+        try:
+            for batch in FILING_BATCHES_DIR.glob("*.jsonl"):
+                try:
+                    mtime = batch.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < start_ts:
+                    continue
+                try:
+                    n_rows = sum(
+                        1 for ln in batch.read_text(encoding="utf-8").splitlines()
+                        if ln.strip()
+                    )
+                except OSError:
+                    continue
+                out["filing_moves"] += n_rows
+                if batch.name.startswith("archive-"):
+                    out["archive_moves"] += n_rows
+        except OSError:
+            pass
+
+    # 3. Tune runs: líneas con ts en ventana.
+    last_delta: float | None = None
+    last_ts: datetime | None = None
+    if TUNE_LOG_PATH.is_file():
+        try:
+            for line in TUNE_LOG_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(e.get("ts", ""))
+                except Exception:
+                    continue
+                if ts < start or ts >= now:
+                    continue
+                out["tune_runs"] += 1
+                d = e.get("delta")
+                if isinstance(d, (int, float)):
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+                        last_delta = float(d)
+        except OSError:
+            pass
+    out["tune_last_delta"] = last_delta
+
+    return out
+
+
+def _render_system_activity_section(act: dict) -> str:
+    """Bullets determinísticos de "lo que el sistema hizo solo".
+
+    Retorna "" si no hay actividad significativa (todos los conteos 0,
+    ignorando `tune_last_delta`). Headers y bullets son code-owned — no
+    LLM toca este bloque.
+    """
+    if not act:
+        return ""
+    has_ambient = (
+        int(act.get("ambient_events") or 0) > 0
+        or int(act.get("ambient_wikilinks") or 0) > 0
+    )
+    filing = int(act.get("filing_moves") or 0)
+    archive = int(act.get("archive_moves") or 0)
+    tune_runs = int(act.get("tune_runs") or 0)
+    if not (has_ambient or filing or archive or tune_runs):
+        return ""
+
+    bullets: list[str] = []
+    wl = int(act.get("ambient_wikilinks") or 0)
+    ev = int(act.get("ambient_events") or 0)
+    if wl > 0 or ev > 0:
+        if wl > 0 and ev > 0:
+            bullets.append(
+                f"- ambient aplicó {wl} [[wikilinks]] automáticos en {ev} captura{'s' if ev != 1 else ''}"
+            )
+        elif wl > 0:
+            bullets.append(f"- ambient aplicó {wl} [[wikilinks]] automáticos")
+        else:
+            bullets.append(f"- ambient detectó señales en {ev} captura{'s' if ev != 1 else ''}")
+    # `archive_moves` es subset de `filing_moves`; reportar ambos, pero el
+    # no-archive (filing manual / `rag file`) solo si hubo moves que no fueron archive.
+    non_archive = filing - archive
+    if archive > 0:
+        bullets.append(
+            f"- archiver movió {archive} dead note{'s' if archive != 1 else ''} a 04-Archive"
+        )
+    if non_archive > 0:
+        bullets.append(
+            f"- filing movió {non_archive} nota{'s' if non_archive != 1 else ''} a su carpeta"
+        )
+    if tune_runs > 0:
+        delta = act.get("tune_last_delta")
+        if isinstance(delta, (int, float)):
+            bullets.append(
+                f"- rag tune recalibró pesos ({delta:+.3f} objetivo)"
+            )
+        else:
+            bullets.append(
+                f"- rag tune corrió {tune_runs} ve{'ces' if tune_runs != 1 else 'z'}"
+            )
+    return "## ⚙️ Lo que el sistema hizo solo\n" + "\n".join(bullets)
+
+
 def _collect_morning_evidence(
     now: datetime,
     vault: Path,
@@ -11804,6 +11973,7 @@ def _collect_morning_evidence(
         "whatsapp_unread": _fetch_whatsapp_unread(),
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
+        "system_activity": _fetch_system_activity(now, lookback_hours=lookback_hours),
     }
     # Dedup: if a vault todo matches an Apple Reminder (Jaccard ≥ 0.6 on
     # normalized tokens), drop the todo — the reminder is the actionable
@@ -12092,6 +12262,21 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
             parts.append(f"- reminder: {r.get('name')} ({r.get('bucket', '')})")
         if ev.get("weather_rain"):
             parts.append(f"- clima: {ev['weather_rain'].get('summary', 'lluvia')}")
+    # Contexto automatizado — NO pedir al LLM que re-imprima, el código arma
+    # la sección ⚙️ determinísticamente. Solo sirve para que pueda cruzar
+    # referencias (ej: "ambient linkeó X → priorizá la [[nota]] asociada").
+    act = ev.get("system_activity") or {}
+    if any(int(act.get(k) or 0) > 0 for k in (
+        "ambient_events", "ambient_wikilinks", "filing_moves", "tune_runs",
+    )):
+        parts.append(
+            "\nSistema automatizado últimas 24h (NO la re-imprimas, el código la renderiza):"
+        )
+        parts.append(
+            f"- ambient aplicó {int(act.get('ambient_wikilinks') or 0)} wikilinks, "
+            f"archiver movió {int(act.get('archive_moves') or 0)} notas, "
+            f"rag tune corrió {int(act.get('tune_runs') or 0)} veces"
+        )
     parts.extend([
         "",
         "DEVOLVÉ SOLO este JSON (sin ``` ni prosa extra):",
@@ -12144,15 +12329,25 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
 
 def _assemble_morning_brief(
     date_label: str, agenda_md: str, parts: dict, continuity: str,
+    system_md: str = "",
 ) -> str:
     """Put the brief together skipping empty sections. Headers are fixed;
-    content comes from `parts` (LLM JSON) and `agenda_md` (deterministic)."""
+    content comes from `parts` (LLM JSON), `agenda_md` + `system_md`
+    (deterministic code-owned blocks).
+
+    Layout: `📬 Ayer → 📅 Agenda → ⚙️ Sistema → 🎯 Foco → 🗂 Pendientes →
+    ⚠ Atender`. Empty blocks are dropped; `system_md` ("" when nothing
+    automated fired) preserves legacy behavior for callers that don't
+    pass it.
+    """
     sections: list[str] = []
     y = (parts.get("yesterday") or "").strip()
     if y:
         sections.append(f"## 📬 Ayer en una línea\n{y}")
     if agenda_md:
         sections.append(agenda_md)
+    if system_md:
+        sections.append(system_md)
     focus = parts.get("focus") or []
     if isinstance(focus, list) and focus:
         bullets = "\n".join(f"- {str(b).strip()}" for b in focus if str(b).strip())
@@ -12236,12 +12431,15 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     # with only the textual fields (yesterday/focus/pending/attention).
     # Fallback to the legacy monolithic prompt if JSON parse fails.
     agenda_md = _render_morning_agenda_section(ev)
+    system_md = _render_system_activity_section(ev.get("system_activity") or {})
     structured_prompt = _render_morning_structured_prompt(date_label, ev)
     with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
         parts = _generate_morning_json(structured_prompt)
     continuity = _yesterday_evening_link(target, VAULT_PATH)
     if parts is not None:
-        brief_body = _assemble_morning_brief(date_label, agenda_md, parts, continuity)
+        brief_body = _assemble_morning_brief(
+            date_label, agenda_md, parts, continuity, system_md=system_md,
+        )
     else:
         # Legacy fallback — one-shot text generation with the old monolithic
         # prompt. Not ideal but keeps morning working if the JSON path fails.

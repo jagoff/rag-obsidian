@@ -4,7 +4,10 @@ Cubre la parte determinística (agenda rendering, continuity footer, assembly)
 y la mecánica de fallback cuando el LLM JSON falla. El LLM real no se toca —
 monkeypatch del generador devuelve dicts conocidos.
 """
-from datetime import datetime
+import json
+import os
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -306,3 +309,265 @@ def test_generate_morning_json_parses_valid(monkeypatch):
     assert result is not None
     assert result["yesterday"] == "x"
     assert result["focus"] == ["a"]
+
+
+# ── _fetch_system_activity ───────────────────────────────────────────────────
+
+
+def _redirect_system_paths(monkeypatch, tmp_path):
+    """Apuntar las 3 rutas on-disk a tmp_path para aislar el test."""
+    monkeypatch.setattr(rag, "AMBIENT_LOG_PATH", tmp_path / "ambient.jsonl")
+    monkeypatch.setattr(rag, "FILING_BATCHES_DIR", tmp_path / "filing_batches")
+    monkeypatch.setattr(rag, "TUNE_LOG_PATH", tmp_path / "tune.jsonl")
+
+
+def test_fetch_system_activity_empty_when_files_missing(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime.now()
+    out = rag._fetch_system_activity(now, lookback_hours=36)
+    assert out == {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 0, "tune_last_delta": None,
+    }
+
+
+def test_fetch_system_activity_counts_ambient_events(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime(2026, 4, 15, 7, 0, 0)
+    recent = (now - timedelta(hours=3)).isoformat(timespec="seconds")
+    old = (now - timedelta(hours=50)).isoformat(timespec="seconds")
+    lines = [
+        # In-window: 3 wikilinks applied, 0 dupes, 0 related → counts
+        json.dumps({"ts": recent, "wikilinks_applied": 3, "dupes": [], "related_count": 0}),
+        # In-window: dupes present → counts as event, 0 wikilinks
+        json.dumps({"ts": recent, "wikilinks_applied": 0,
+                    "dupes": [{"path": "x", "sim": 0.9}], "related_count": 0}),
+        # In-window: only related → counts
+        json.dumps({"ts": recent, "wikilinks_applied": 0, "dupes": [], "related_count": 2}),
+        # In-window but no signals → does NOT count
+        json.dumps({"ts": recent, "wikilinks_applied": 0, "dupes": [], "related_count": 0}),
+        # Out of window → does NOT count
+        json.dumps({"ts": old, "wikilinks_applied": 99, "dupes": [], "related_count": 0}),
+        # Broken json line → ignored
+        "{not json",
+    ]
+    rag.AMBIENT_LOG_PATH.write_text("\n".join(lines) + "\n")
+    out = rag._fetch_system_activity(now, lookback_hours=36)
+    assert out["ambient_events"] == 3
+    assert out["ambient_wikilinks"] == 3
+
+
+def test_fetch_system_activity_filing_and_archive(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime.now()
+    rag.FILING_BATCHES_DIR.mkdir(parents=True)
+
+    # Archive batch in-window, 2 rows
+    archive_batch = rag.FILING_BATCHES_DIR / "archive-20260415-120000.jsonl"
+    archive_batch.write_text(
+        json.dumps({"src": "a.md", "dst": "04-Archive/a.md"}) + "\n"
+        + json.dumps({"src": "b.md", "dst": "04-Archive/b.md"}) + "\n"
+    )
+    # Plain filing batch in-window, 1 row
+    filing_batch = rag.FILING_BATCHES_DIR / "20260415-100000.jsonl"
+    filing_batch.write_text(json.dumps({"src": "c.md", "dst": "02-Areas/c.md"}) + "\n")
+
+    # Out-of-window batch (set old mtime) → should NOT count
+    old_batch = rag.FILING_BATCHES_DIR / "archive-20200101-000000.jsonl"
+    old_batch.write_text(json.dumps({"src": "d.md"}) + "\n")
+    old_ts = (now - timedelta(hours=200)).timestamp()
+    os.utime(old_batch, (old_ts, old_ts))
+
+    out = rag._fetch_system_activity(now, lookback_hours=36)
+    # Total moves = 3 (2 archive + 1 filing); archive_moves = 2
+    assert out["filing_moves"] == 3
+    assert out["archive_moves"] == 2
+
+
+def test_fetch_system_activity_tune_runs_and_last_delta(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime(2026, 4, 15, 9, 0, 0)
+    t1 = (now - timedelta(hours=20)).isoformat(timespec="seconds")
+    t2 = (now - timedelta(hours=2)).isoformat(timespec="seconds")   # más reciente
+    t_old = (now - timedelta(hours=100)).isoformat(timespec="seconds")
+    lines = [
+        json.dumps({"ts": t1, "delta": 0.008}),
+        json.dumps({"ts": t2, "delta": 0.012}),
+        json.dumps({"ts": t_old, "delta": 0.999}),   # out of window, ignored
+    ]
+    rag.TUNE_LOG_PATH.write_text("\n".join(lines) + "\n")
+    out = rag._fetch_system_activity(now, lookback_hours=36)
+    assert out["tune_runs"] == 2
+    assert out["tune_last_delta"] == pytest.approx(0.012)
+
+
+def test_fetch_system_activity_respects_window(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime(2026, 4, 15, 9, 0, 0)
+    too_old = (now - timedelta(hours=48)).isoformat(timespec="seconds")
+    rag.AMBIENT_LOG_PATH.write_text(
+        json.dumps({"ts": too_old, "wikilinks_applied": 5,
+                    "dupes": [], "related_count": 0}) + "\n"
+    )
+    rag.TUNE_LOG_PATH.write_text(
+        json.dumps({"ts": too_old, "delta": 0.5}) + "\n"
+    )
+    out = rag._fetch_system_activity(now, lookback_hours=36)
+    assert out["ambient_events"] == 0
+    assert out["ambient_wikilinks"] == 0
+    assert out["tune_runs"] == 0
+    assert out["tune_last_delta"] is None
+
+
+# ── _render_system_activity_section ─────────────────────────────────────────
+
+
+def test_render_system_activity_empty_all_zeros():
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 0, "tune_last_delta": None,
+    }
+    assert rag._render_system_activity_section(act) == ""
+
+
+def test_render_system_activity_ignores_tune_delta_alone():
+    # Only tune_last_delta being non-None should NOT force the section.
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 0, "tune_last_delta": 0.05,
+    }
+    assert rag._render_system_activity_section(act) == ""
+
+
+def test_render_system_activity_ambient_bullet():
+    act = {
+        "ambient_events": 3, "ambient_wikilinks": 7,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 0, "tune_last_delta": None,
+    }
+    out = rag._render_system_activity_section(act)
+    assert "## ⚙️ Lo que el sistema hizo solo" in out
+    assert "ambient aplicó 7" in out
+    assert "3 capturas" in out
+
+
+def test_render_system_activity_archive_bullet():
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 2, "archive_moves": 2,
+        "tune_runs": 0, "tune_last_delta": None,
+    }
+    out = rag._render_system_activity_section(act)
+    assert "archiver movió 2 dead notes a 04-Archive" in out
+    # non-archive filing is 0 → no filing bullet
+    assert "filing movió" not in out
+
+
+def test_render_system_activity_mixed_archive_and_filing():
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 5, "archive_moves": 2,
+        "tune_runs": 0, "tune_last_delta": None,
+    }
+    out = rag._render_system_activity_section(act)
+    assert "archiver movió 2" in out
+    assert "filing movió 3" in out
+
+
+def test_render_system_activity_tune_bullet_with_delta():
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 1, "tune_last_delta": 0.012,
+    }
+    out = rag._render_system_activity_section(act)
+    assert "rag tune recalibró pesos (+0.012 objetivo)" in out
+
+
+def test_render_system_activity_tune_bullet_no_delta():
+    act = {
+        "ambient_events": 0, "ambient_wikilinks": 0,
+        "filing_moves": 0, "archive_moves": 0,
+        "tune_runs": 2, "tune_last_delta": None,
+    }
+    out = rag._render_system_activity_section(act)
+    assert "rag tune corrió 2 veces" in out
+
+
+def test_render_system_activity_combined():
+    act = {
+        "ambient_events": 2, "ambient_wikilinks": 5,
+        "filing_moves": 3, "archive_moves": 3,
+        "tune_runs": 1, "tune_last_delta": 0.008,
+    }
+    out = rag._render_system_activity_section(act)
+    # All 3 bullets present
+    assert "ambient aplicó 5" in out
+    assert "archiver movió 3" in out
+    assert "rag tune recalibró pesos (+0.008 objetivo)" in out
+
+
+# ── _assemble_morning_brief with system_md ──────────────────────────────────
+
+
+def test_assemble_includes_system_md_between_agenda_and_focus():
+    parts = {"yesterday": "ayer", "focus": ["x"], "pending": [], "attention": []}
+    agenda = "## 📅 Hoy en la agenda\n- reu 10h"
+    system = "## ⚙️ Lo que el sistema hizo solo\n- ambient aplicó 3"
+    out = rag._assemble_morning_brief(
+        "2026-04-15", agenda_md=agenda, parts=parts, continuity="",
+        system_md=system,
+    )
+    idx_agenda = out.index("📅")
+    idx_system = out.index("⚙️")
+    idx_focus = out.index("🎯")
+    assert idx_agenda < idx_system < idx_focus
+
+
+def test_assemble_skips_empty_system_md():
+    parts = {"yesterday": "ayer", "focus": [], "pending": [], "attention": []}
+    out = rag._assemble_morning_brief(
+        "2026-04-15", agenda_md="", parts=parts, continuity="", system_md="",
+    )
+    assert "⚙️" not in out
+
+
+def test_assemble_system_md_default_noop_preserves_legacy():
+    # Old callers not passing system_md still work — no section rendered.
+    parts = {"yesterday": "ayer", "focus": [], "pending": [], "attention": []}
+    out = rag._assemble_morning_brief(
+        "2026-04-15", agenda_md="", parts=parts, continuity="",
+    )
+    assert "⚙️" not in out
+
+
+# ── _collect_morning_evidence wires system_activity ─────────────────────────
+
+
+def test_collect_morning_wires_system_activity(monkeypatch, tmp_path):
+    _redirect_system_paths(monkeypatch, tmp_path)
+    now = datetime.now()
+    recent = (now - timedelta(hours=3)).isoformat(timespec="seconds")
+    rag.AMBIENT_LOG_PATH.write_text(
+        json.dumps({"ts": recent, "wikilinks_applied": 4,
+                    "dupes": [], "related_count": 0}) + "\n"
+    )
+    monkeypatch.setattr(rag, "_fetch_weather_rain", lambda *a, **kw: None)
+    monkeypatch.setattr(rag, "_fetch_calendar_today", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_reminders_due", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_mail_unread", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_whatsapp_unread", lambda *a, **kw: [])
+    monkeypatch.setattr(rag, "_fetch_recent_queries", lambda *a, **kw: [])
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    ev = rag._collect_morning_evidence(
+        now, vault, tmp_path / "q.jsonl", tmp_path / "c.jsonl",
+        lookback_hours=36,
+    )
+    act = ev.get("system_activity")
+    assert act is not None
+    assert act["ambient_wikilinks"] == 4
+    assert act["ambient_events"] == 1

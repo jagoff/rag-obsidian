@@ -571,3 +571,146 @@ def test_collect_morning_wires_system_activity(monkeypatch, tmp_path):
     assert act is not None
     assert act["ambient_wikilinks"] == 4
     assert act["ambient_events"] == 1
+
+
+# ── _fetch_mail_unread: body_preview + is_vip ───────────────────────────────
+
+
+def _stub_mail_osascript(monkeypatch, payload: str):
+    monkeypatch.setattr(rag, "_apple_enabled", lambda: True)
+    monkeypatch.setattr(rag, "_osascript", lambda *a, **kw: payload)
+
+
+def test_fetch_mail_unread_returns_body_preview_and_is_vip(monkeypatch, tmp_path):
+    cfg = tmp_path / "mail-vip.json"
+    cfg.write_text(json.dumps({"vips": ["boss@acme.com"]}))
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", cfg)
+    payload = (
+        "Quarterly review|boss@acme.com|today|<p>Hola, <b>revisamos</b> Q1.</p>\n"
+        "Newsletter|news@medium.com|today|Top stories of the week\n"
+    )
+    _stub_mail_osascript(monkeypatch, payload)
+    items = rag._fetch_mail_unread()
+    assert len(items) == 2
+    # VIP sorted to top
+    assert items[0]["sender"] == "boss@acme.com"
+    assert items[0]["is_vip"] is True
+    assert "body_preview" in items[0]
+    assert items[0]["body_preview"] == "Hola, revisamos Q1."
+    assert items[1]["is_vip"] is False
+    assert items[1]["body_preview"] == "Top stories of the week"
+
+
+def test_fetch_mail_unread_body_preview_capped_at_200(monkeypatch, tmp_path):
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", tmp_path / "missing.json")
+    long_body = "x" * 500
+    payload = f"Subj|sender@x.com|today|{long_body}\n"
+    _stub_mail_osascript(monkeypatch, payload)
+    items = rag._fetch_mail_unread()
+    assert len(items[0]["body_preview"]) == 200
+
+
+def test_load_mail_vips_missing_file_returns_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", tmp_path / "nope.json")
+    assert rag._load_mail_vips() == set()
+
+
+def test_fetch_mail_unread_missing_vip_file_no_crash(monkeypatch, tmp_path):
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", tmp_path / "nope.json")
+    payload = "Subj|x@y.com|today|body\n"
+    _stub_mail_osascript(monkeypatch, payload)
+    items = rag._fetch_mail_unread()
+    assert items[0]["is_vip"] is False
+
+
+def test_load_mail_vips_malformed_json_warns_returns_empty(
+    monkeypatch, tmp_path, capsys,
+):
+    cfg = tmp_path / "mail-vip.json"
+    cfg.write_text("{not json")
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", cfg)
+    out = rag._load_mail_vips()
+    assert out == set()
+    captured = capsys.readouterr()
+    assert "mail-vip" in (captured.out + captured.err).lower()
+
+
+def test_load_mail_vips_wrong_shape_returns_empty(monkeypatch, tmp_path):
+    cfg = tmp_path / "mail-vip.json"
+    cfg.write_text(json.dumps(["not", "a", "dict"]))
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", cfg)
+    assert rag._load_mail_vips() == set()
+
+
+def test_is_vip_sender_substring_match():
+    vips = {"boss@acme.com"}
+    # Mail puts senders as `Name <email>` typically
+    assert rag._is_vip_sender("Big Boss <boss@acme.com>", vips) is True
+    assert rag._is_vip_sender("Newsletter <news@x.com>", vips) is False
+    assert rag._is_vip_sender("", vips) is False
+    assert rag._is_vip_sender("anyone@x.com", set()) is False
+
+
+def test_strip_html_to_preview_basic():
+    out = rag._strip_html_to_preview("<p>Hola <b>mundo</b></p>\n\n<br>line2", cap=200)
+    assert out == "Hola mundo line2"
+    assert rag._strip_html_to_preview("", cap=10) == ""
+    assert rag._strip_html_to_preview("a" * 50, cap=10) == "a" * 10
+
+
+def test_fetch_mail_unread_vips_survive_max_items_cap(monkeypatch, tmp_path):
+    cfg = tmp_path / "mail-vip.json"
+    cfg.write_text(json.dumps({"vips": ["vip@x.com"]}))
+    monkeypatch.setattr(rag, "MAIL_VIP_CONFIG_PATH", cfg)
+    # 12 non-vip first, 1 vip last → vip must survive max_items=10
+    lines = [f"S{i}|noise{i}@x.com|today|b{i}" for i in range(12)]
+    lines.append("Important|vip@x.com|today|critical")
+    payload = "\n".join(lines) + "\n"
+    _stub_mail_osascript(monkeypatch, payload)
+    items = rag._fetch_mail_unread(max_items=10)
+    assert len(items) == 10
+    assert items[0]["is_vip"] is True
+    assert items[0]["sender"] == "vip@x.com"
+
+
+# ── Morning prompts: VIP marker + body preview ──────────────────────────────
+
+
+def test_render_morning_structured_prompt_includes_vip_marker():
+    ev = {
+        "mail_unread": [
+            {"subject": "Quarter", "sender": "boss@acme.com",
+             "received": "today", "body_preview": "Revisemos Q1",
+             "is_vip": True},
+            {"subject": "Newsletter", "sender": "news@x.com",
+             "received": "today", "body_preview": "weekly", "is_vip": False},
+        ],
+    }
+    prompt = rag._render_morning_structured_prompt("2026-04-16", ev)
+    assert "**VIP**" in prompt
+    assert "Quarter" in prompt
+    assert "Revisemos Q1" in prompt
+    # Non-VIP must not get the marker on its own line
+    lines = [l for l in prompt.splitlines() if "Newsletter" in l]
+    assert lines and "**VIP**" not in lines[0]
+
+
+def test_render_morning_prompt_legacy_includes_vip_marker():
+    ev = {
+        "recent_notes": [], "inbox_pending": [], "todos": [],
+        "new_contradictions": [], "low_conf_queries": [],
+        "mail_unread": [
+            {"subject": "Urgent", "sender": "boss@acme.com",
+             "received": "today", "body_preview": "Hoy a las 4",
+             "is_vip": True},
+        ],
+    }
+    prompt = rag._render_morning_prompt("2026-04-16", ev)
+    assert "**VIP**" in prompt
+    assert "Hoy a las 4" in prompt
+
+
+def test_render_morning_structured_prompt_no_mail_section_when_empty():
+    ev = {"mail_unread": []}
+    prompt = rag._render_morning_structured_prompt("2026-04-16", ev)
+    assert "Mail no leído" not in prompt

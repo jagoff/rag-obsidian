@@ -11295,6 +11295,9 @@ return _out
 # Use Mail's unified `inbox` alias — single query across all accounts, ~0.5s.
 # Previous per-account iteration was 10-20× slower and still missed Gmail
 # (no dedicated INBOX mailbox — Gmail uses labels).
+# Body is truncated to 600 chars in AS and stripped of `|`/newlines/tabs so the
+# pipe-separated parse stays unambiguous; Python normalises HTML+whitespace and
+# caps to 200 chars for the preview.
 _MAIL_SCRIPT = '''
 set _cutoff to (current date) - (36 * hours)
 set _out to ""
@@ -11302,7 +11305,23 @@ tell application "Mail"
   try
     repeat with _msg in (messages of inbox whose read status is false and date received > _cutoff)
       try
-        set _out to _out & (subject of _msg) & "|" & (sender of _msg) & "|" & ((date received of _msg) as string) & linefeed
+        set _subject to subject of _msg
+        set _sender to sender of _msg
+        set _received to (date received of _msg) as string
+        set _body to ""
+        try
+          set _body to (content of _msg) as string
+        end try
+        if (count of _body) > 600 then
+          set _body to text 1 thru 600 of _body
+        end if
+        set _prev_tids to AppleScript's text item delimiters
+        set AppleScript's text item delimiters to {return, linefeed, character id 9, "|"}
+        set _bparts to text items of _body
+        set AppleScript's text item delimiters to " "
+        set _body to _bparts as text
+        set AppleScript's text item delimiters to _prev_tids
+        set _out to _out & _subject & "|" & _sender & "|" & _received & "|" & _body & linefeed
       end try
     end repeat
   end try
@@ -11431,26 +11450,79 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     return items[:max_items]
 
 
+MAIL_VIP_CONFIG_PATH = Path.home() / ".config/obsidian-rag/mail-vip.json"
+
+
+def _strip_html_to_preview(s: str, cap: int = 200) -> str:
+    """HTML→text preview: strip tags, collapse whitespace, cap length."""
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:cap]
+
+
+def _load_mail_vips() -> set[str]:
+    """VIP sender substrings from ``MAIL_VIP_CONFIG_PATH``. Returns lowercased
+    set. Missing file → empty. Malformed JSON or wrong shape → warning + empty.
+    """
+    p = MAIL_VIP_CONFIG_PATH
+    if not p.is_file():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        console.print(f"[yellow]mail-vip: config no parseable: {exc}[/yellow]")
+        return set()
+    vips = data.get("vips") if isinstance(data, dict) else None
+    if not isinstance(vips, list):
+        console.print(
+            "[yellow]mail-vip: esperaba {\"vips\": [...]}, ignorado.[/yellow]"
+        )
+        return set()
+    return {str(v).strip().lower() for v in vips if str(v).strip()}
+
+
+def _is_vip_sender(sender: str, vips: set[str]) -> bool:
+    if not sender or not vips:
+        return False
+    s = sender.lower()
+    return any(v in s for v in vips)
+
+
 def _fetch_mail_unread(max_items: int = 10) -> list[dict]:
     """Unread messages received in the last 36h from Apple Mail INBOX
-    across all accounts.
+    across all accounts. Each item carries ``subject``, ``sender``,
+    ``received``, ``body_preview`` (≤200 chars, HTML stripped) and
+    ``is_vip`` (sender matches an entry in ``MAIL_VIP_CONFIG_PATH``).
+    VIPs are sorted to the top before the ``max_items`` cap so they
+    survive truncation.
     """
     if not _apple_enabled():
         return []
     out = _osascript(_MAIL_SCRIPT, timeout=20.0)
     if not out:
         return []
+    vips = _load_mail_vips()
     items: list[dict] = []
     for line in out.splitlines():
-        parts = line.split("|", 2)
+        parts = line.split("|", 3)
         if len(parts) < 2:
             continue
         subject = parts[0].strip()
         sender = parts[1].strip()
         received = parts[2].strip() if len(parts) > 2 else ""
+        body_raw = parts[3] if len(parts) > 3 else ""
         if not subject:
             continue
-        items.append({"subject": subject, "sender": sender, "received": received})
+        items.append({
+            "subject": subject,
+            "sender": sender,
+            "received": received,
+            "body_preview": _strip_html_to_preview(body_raw, cap=200),
+            "is_vip": _is_vip_sender(sender, vips),
+        })
+    items.sort(key=lambda m: 0 if m.get("is_vip") else 1)
     return items[:max_items]
 
 
@@ -12059,7 +12131,11 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
     if ev.get("mail_unread"):
         parts.append(f"## Mail — no leídos últimas 36h ({len(ev['mail_unread'])}):")
         for m in ev["mail_unread"][:10]:
-            parts.append(f"- {m['subject']} — {m['sender']}")
+            prefix = "**VIP** · " if m.get("is_vip") else ""
+            parts.append(f"- {prefix}{m['subject']} — {m['sender']}")
+            preview = (m.get("body_preview") or "").strip()
+            if preview:
+                parts.append(f"    _{preview}_")
         parts.append("")
     if ev.get("whatsapp_unread"):
         parts.append(
@@ -12272,6 +12348,14 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
         parts.append(f"\nQueries recientes del RAG ({len(ev['recent_queries'])}):")
         for q in ev["recent_queries"][:6]:
             parts.append(f"- \"{q['q']}\"")
+    if ev.get("mail_unread"):
+        parts.append(f"\nMail no leído ({len(ev['mail_unread'])}):")
+        for m in ev["mail_unread"][:10]:
+            prefix = "**VIP** · " if m.get("is_vip") else ""
+            parts.append(f"- {prefix}{m.get('subject', '')} — {m.get('sender', '')}")
+            preview = (m.get("body_preview") or "").strip()
+            if preview:
+                parts.append(f"    _{preview}_")
     # Agenda (calendar/reminders/weather) ya la arma el código — igual la
     # mencionamos como contexto para que el LLM pueda cruzar referencias
     # ("hoy tenés reunión con X → priorizá la nota [[X]]").

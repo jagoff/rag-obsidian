@@ -12783,6 +12783,119 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
     return out
 
 
+# ── Google Drive evidence (via OAuth shared with google-drive MCP) ──────────
+# Surface files modified in the last N days — gives the morning brief context
+# about what docs/sheets/slides were touched. Skips the Drive.app daily churn
+# by showing only the top-N most-recent items. Silent-fail: missing deps, missing
+# creds, or API error → {}. OAuth reused from the `google-drive` MCP setup
+# (~/.config/google-drive-mcp/). Drive API exact-count is free; we don't need
+# to scan folders — modifiedTime query is O(log n).
+GDRIVE_CREDS_DIR = Path.home() / ".config/google-drive-mcp"
+GDRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+# Human-readable Drive mimeTypes for the rendered section. Everything else
+# falls back to a generic "📄 archivo" label.
+_GDRIVE_MIME_LABEL = {
+    "application/vnd.google-apps.document": "Doc",
+    "application/vnd.google-apps.spreadsheet": "Sheet",
+    "application/vnd.google-apps.presentation": "Slide",
+    "application/vnd.google-apps.folder": "Folder",
+    "application/vnd.google-apps.form": "Form",
+    "application/pdf": "PDF",
+}
+
+
+def _drive_service():
+    """Authed Drive API client, or None. Refreshes access_token in place and
+    persists back to tokens.json on expiry. Shares creds with the google-drive
+    MCP — so both paths stay authed through the same refresh token.
+    """
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+    except ImportError:
+        return None
+    tokens_path = GDRIVE_CREDS_DIR / "tokens.json"
+    oauth_path = GDRIVE_CREDS_DIR / "gcp-oauth.keys.json"
+    if not tokens_path.is_file() or not oauth_path.is_file():
+        return None
+    try:
+        stored = json.loads(tokens_path.read_text(encoding="utf-8"))
+        oauth = json.loads(oauth_path.read_text(encoding="utf-8"))
+        installed = oauth.get("installed") or oauth.get("web") or {}
+        # The google-drive MCP tokens file uses `access_token` / `refresh_token`
+        # at top level (same shape as the Gmail MCP). Some Google libs write
+        # `token` instead — accept both.
+        token = stored.get("access_token") or stored.get("token")
+        creds = Credentials(
+            token=token,
+            refresh_token=stored.get("refresh_token"),
+            token_uri=installed.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=installed.get("client_id"),
+            client_secret=installed.get("client_secret"),
+            scopes=GDRIVE_SCOPES,
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            stored["access_token"] = creds.token
+            stored["token"] = creds.token
+            tokens_path.write_text(json.dumps(stored), encoding="utf-8")
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+
+def _fetch_drive_evidence(now: datetime, days: int = 5, max_items: int = 5) -> dict:
+    """Files modified in Drive in the last `days`. Filters trashed + picks the
+    `max_items` most-recent. Returns `{"files": [{name, modified, link,
+    mime_label, days_ago}]}`. `days_ago` is a float for the renderer to format.
+    Silent-fail → {}.
+    """
+    svc = _drive_service()
+    if svc is None:
+        return {}
+    cutoff_dt = now - timedelta(days=days)
+    # Drive query wants RFC3339; strip tz for simplicity (local vs UTC mismatch
+    # is at most a few hours — negligible at a 5-day window).
+    cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    q = f"modifiedTime > '{cutoff_iso}' and trashed = false"
+    try:
+        resp = svc.files().list(
+            q=q,
+            orderBy="modifiedTime desc",
+            pageSize=max_items,
+            fields=(
+                "files(id,name,modifiedTime,webViewLink,mimeType,"
+                "lastModifyingUser(displayName))"
+            ),
+            spaces="drive",
+        ).execute()
+    except Exception:
+        return {}
+    files_out: list[dict] = []
+    for f in resp.get("files") or []:
+        mtime_iso = f.get("modifiedTime") or ""
+        try:
+            # Drive returns `2026-04-14T18:23:00.000Z`
+            mtime_dt = datetime.fromisoformat(mtime_iso.replace("Z", "+00:00"))
+            days_ago = max(0.0, (now.astimezone(mtime_dt.tzinfo) - mtime_dt).total_seconds() / 86400.0)
+        except Exception:
+            days_ago = 0.0
+        mime = f.get("mimeType") or ""
+        label = _GDRIVE_MIME_LABEL.get(mime, "archivo")
+        files_out.append({
+            "name": f.get("name") or "(sin nombre)",
+            "modified": mtime_iso,
+            "link": f.get("webViewLink") or "",
+            "mime_label": label,
+            "days_ago": round(days_ago, 1),
+            "modifier": (f.get("lastModifyingUser") or {}).get("displayName") or "",
+        })
+    return {"files": files_out, "window_days": days}
+
+
 # ── WhatsApp unread (bridge SQLite) ─────────────────────────────────────────
 WHATSAPP_DB_PATH = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
 WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
@@ -13462,6 +13575,7 @@ def _collect_morning_evidence(
         "reminders_due": _fetch_reminders_due(now),
         "mail_unread": _fetch_mail_unread(),
         "gmail": _fetch_gmail_evidence(now),
+        "drive": _fetch_drive_evidence(now, days=5),
         "whatsapp_unread": _fetch_whatsapp_unread(),
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
@@ -13719,6 +13833,30 @@ def _render_morning_gmail_section(ev: dict) -> str:
     return "## 📧 Gmail\n" + "\n".join(bullets)
 
 
+def _render_morning_drive_section(ev: dict) -> str:
+    """Deterministic render of 📁 Drive — files modified in the last `window_days`.
+    Returns "" if no recent activity. Owned by code (not LLM) so the signal
+    survives noisy mornings. Each bullet: `- Nd · Doc/Sheet/Slide · Name`.
+    Modifier name is appended when it's not just the user themselves.
+    """
+    dv = ev.get("drive") or {}
+    files = dv.get("files") or []
+    if not files:
+        return ""
+    window = int(dv.get("window_days") or 5)
+    bullets: list[str] = []
+    for f in files[:5]:
+        name = (f.get("name") or "(sin nombre)").strip()
+        label = f.get("mime_label") or "archivo"
+        days_ago = f.get("days_ago") or 0
+        line = f"- {days_ago}d · {label} · **{name}**"
+        modifier = (f.get("modifier") or "").strip()
+        if modifier:
+            line += f" _— {modifier}_"
+        bullets.append(line)
+    return f"## 📁 Drive (últimos {window}d)\n" + "\n".join(bullets)
+
+
 # ── Dedup todos-del-vault vs reminders-de-Apple ─────────────────────────────
 # Si tengo una nota con `todo: "comprar pan"` Y un Apple Reminder "comprar
 # pan", el brief los listaba duplicados — ruido. Drop el del vault (el
@@ -13878,6 +14016,19 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
                 f"{m.get('subject', '')} — {m.get('from', '')}: "
                 f"{m.get('snippet', '')}"
             )
+    dv = ev.get("drive") or {}
+    dv_files = dv.get("files") or []
+    if dv_files:
+        parts.append(
+            f"\nDrive — {len(dv_files)} archivo(s) modificados últimos "
+            f"{dv.get('window_days', 5)}d "
+            "(NO re-imprimas, el código arma la sección 📁 Drive):"
+        )
+        for f in dv_files[:5]:
+            parts.append(
+                f"- {f.get('mime_label','archivo')}: {f.get('name','')} "
+                f"(hace {f.get('days_ago',0)}d)"
+            )
     # Agenda (calendar/reminders/weather) ya la arma el código — igual la
     # mencionamos como contexto para que el LLM pueda cruzar referencias
     # ("hoy tenés reunión con X → priorizá la nota [[X]]").
@@ -13956,16 +14107,16 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
 
 def _assemble_morning_brief(
     date_label: str, agenda_md: str, parts: dict, continuity: str,
-    system_md: str = "", gmail_md: str = "",
+    system_md: str = "", gmail_md: str = "", drive_md: str = "",
 ) -> str:
     """Put the brief together skipping empty sections. Headers are fixed;
     content comes from `parts` (LLM JSON), `agenda_md` + `system_md` +
-    `gmail_md` (deterministic code-owned blocks).
+    `gmail_md` + `drive_md` (deterministic code-owned blocks).
 
-    Layout: `📬 Ayer → 📅 Agenda → 📧 Gmail → ⚙️ Sistema → 🎯 Foco →
-    🗂 Pendientes → ⚠ Atender`. Empty blocks are dropped; `system_md` and
-    `gmail_md` ("" when nothing to show) preserve legacy behavior for
-    callers that don't pass them.
+    Layout: `📬 Ayer → 📅 Agenda → 📧 Gmail → 📁 Drive → ⚙️ Sistema → 🎯 Foco →
+    🗂 Pendientes → ⚠ Atender`. Empty blocks are dropped; `system_md`,
+    `gmail_md`, and `drive_md` ("" when nothing to show) preserve legacy
+    behavior for callers that don't pass them.
     """
     sections: list[str] = []
     y = (parts.get("yesterday") or "").strip()
@@ -13975,6 +14126,8 @@ def _assemble_morning_brief(
         sections.append(agenda_md)
     if gmail_md:
         sections.append(gmail_md)
+    if drive_md:
+        sections.append(drive_md)
     if system_md:
         sections.append(system_md)
     focus = parts.get("focus") or []
@@ -14036,6 +14189,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         + len((ev.get("gmail") or {}).get("starred") or [])
         + len((ev.get("gmail") or {}).get("awaiting_reply") or [])
         + (1 if (ev.get("gmail") or {}).get("unread_count") else 0)
+        + len((ev.get("drive") or {}).get("files") or [])
     )
     if total == 0:
         console.print(
@@ -14056,7 +14210,8 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"{len(ev.get('whatsapp_unread', []))} wa · "
         f"{len(ev.get('recent_queries', []))} queries · "
         f"{(ev.get('gmail') or {}).get('unread_count', 0)} gmail-unread · "
-        f"{len((ev.get('gmail') or {}).get('awaiting_reply') or [])} await-reply"
+        f"{len((ev.get('gmail') or {}).get('awaiting_reply') or [])} await-reply · "
+        f"{len((ev.get('drive') or {}).get('files') or [])} drive-5d"
         + (" · 🌧" if ev.get("weather_rain") else "")
     )
 
@@ -14067,6 +14222,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     agenda_md = _render_morning_agenda_section(ev)
     system_md = _render_system_activity_section(ev.get("system_activity") or {})
     gmail_md = _render_morning_gmail_section(ev)
+    drive_md = _render_morning_drive_section(ev)
     structured_prompt = _render_morning_structured_prompt(date_label, ev)
     with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
         parts = _generate_morning_json(structured_prompt)
@@ -14074,7 +14230,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     if parts is not None:
         brief_body = _assemble_morning_brief(
             date_label, agenda_md, parts, continuity,
-            system_md=system_md, gmail_md=gmail_md,
+            system_md=system_md, gmail_md=gmail_md, drive_md=drive_md,
         )
     else:
         # Legacy fallback — one-shot text generation with the old monolithic

@@ -8,11 +8,17 @@
 </head>
 <body>
   <header id="topbar">
-    <a href="/dashboard" style="color:#5a5a60;text-decoration:none;font-size:12px">dashboard</a>
-    <label id="vault-picker-label" for="vault-picker">vault</label>
-    <select id="vault-picker" aria-label="Vault">
-      <option value="">cargando…</option>
-    </select>
+    <div class="topbar-inner">
+      <h1 class="topbar-title">rag <span>· chat</span></h1>
+      <div class="topbar-meta">
+        <label id="vault-picker-label" for="vault-picker">vault</label>
+        <select id="vault-picker" aria-label="Vault">
+          <option value="">cargando…</option>
+        </select>
+        <a class="topbar-link" href="/">← home</a>
+        <a class="topbar-link" href="/dashboard">dashboard →</a>
+      </div>
+    </div>
   </header>
   <main id="chat">
     <div id="messages"></div>

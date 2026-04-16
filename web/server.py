@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import subprocess
 import sys
 import time
 import uuid
@@ -29,11 +31,30 @@ import ollama  # noqa: E402
 
 from rag import (  # noqa: E402
     CHAT_OPTIONS,
+    CONTRADICTION_LOG_PATH,
+    LOG_PATH,
+    MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
     SYSTEM_RULES,
+    VAULT_PATH,
+    _apple_enabled,
+    _build_tasks_system_rules as _rag_build_tasks_system_rules,
+    _collect_scoped_tasks_evidence_multi as _rag_collect_scoped_tasks_evidence_multi,
+    _collect_today_evidence,
+    _fetch_calendar_ahead,
+    _fetch_reminders_due,
+    _fetch_weather_forecast,
+    _fetch_whatsapp_unread,
+    _format_scoped_tasks_context as _rag_format_scoped_tasks_context,
+    _generate_today_narrative,
+    _icalbuddy_path,
     _load_corpus,
     _load_vaults_config,
+    _pendientes_collect,
+    _pendientes_urgent,
+    _render_today_prompt,
+    _tasks_services_consulted as _rag_tasks_services_consulted,
     append_turn,
     ensure_session,
     get_db,
@@ -54,7 +75,12 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
-def index() -> FileResponse:
+def home_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "home.html")
+
+
+@app.get("/chat")
+def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -119,6 +145,595 @@ def _score_bar(score: float, width: int = 5) -> str:
     return "■" * filled + "□" * (width - filled)
 
 
+# ── Intent detection: tasks / agenda / pendientes ────────────────────────────
+# Short-circuits the normal RAG retrieve when the question is about what the
+# user has to do. RAG over vault notes produces hallucinations ("pedido de
+# speeds") because the vault doesn't store live calendar/reminders; the
+# services layer does.
+#
+# Tasks-mode is scope-aware: "mañana" queries fetch tomorrow's reminders +
+# calendar, "esta semana" fetches 7 days, default fetches 2 weeks. Without
+# this, a "qué tengo para mañana" query got today's reminders and the LLM
+# correctly concluded "nada para mañana" — the fix is to bring the right
+# window, not to patch the LLM.
+
+_TASKS_INTENT_TOKENS = re.compile(
+    r"\b(pendientes?|agenda|recordatorios?|to-?dos?|tasks?|reminders?|"
+    r"tareas?|reuniones?|meetings?|prioridad(?:es)?|prioriz|"
+    r"compromisos?|obligaciones?|deberes?)",
+    re.IGNORECASE,
+)
+_TASKS_INTENT_PHRASES = re.compile(
+    r"(qu[eé]\s+(tengo|hacer|debo|hay|me\s+falta|me\s+queda)|"
+    r"what\s+do\s+i\s+(have|need)|"
+    r"(tengo|hay)\s+(algo|cosas?|eventos?|citas?)\s+(pendiente|hoy|mañana|esta\s+semana)|"
+    r"que\s+hay\s+(para\s+)?(hoy|mañana|esta\s+semana)|"
+    r"organiz(ar|ame)\s+(el\s+d[ií]a|la\s+semana))",
+    re.IGNORECASE,
+)
+
+
+def _is_tasks_query(q: str) -> bool:
+    if not q:
+        return False
+    return bool(_TASKS_INTENT_TOKENS.search(q) or _TASKS_INTENT_PHRASES.search(q))
+
+
+_SCOPE_N_DAYS = re.compile(
+    r"\bpr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as?\b|\bnext\s+(\d+)\s+days?\b",
+    re.IGNORECASE,
+)
+_SCOPE_WEEK = re.compile(
+    r"\besta\s+semana\b|\bpr[oó]xima\s+semana\b|\bsemana\s+que\s+viene\b|"
+    r"\bthis\s+week\b|\bnext\s+week\b",
+    re.IGNORECASE,
+)
+_SCOPE_TOMORROW = re.compile(r"\bma(?:ñ|n)ana\b|\btomorrow\b", re.IGNORECASE)
+_SCOPE_TODAY = re.compile(
+    r"\bhoy\b|\bahora\b|\btoday\b|\beste\s+momento\b", re.IGNORECASE,
+)
+
+
+def _detect_time_scope(q: str) -> dict:
+    """Return the time scope carried by the query. Priority: explicit N days
+    beats week beats tomorrow beats today; unmarked queries get a 14-day
+    reminders window + 7-day calendar window (user asking "qué tengo
+    pendiente" wants a broad sweep).
+    """
+    m = _SCOPE_N_DAYS.search(q)
+    if m:
+        n = int(m.group(1) or m.group(2) or 0)
+        n = max(1, min(30, n))
+        return {
+            "key": "n_days", "label": f"próximos {n} días",
+            "reminders_horizon": n + 1, "calendar_ahead": n,
+        }
+    if _SCOPE_WEEK.search(q):
+        return {
+            "key": "week", "label": "esta semana",
+            "reminders_horizon": 8, "calendar_ahead": 7,
+        }
+    if _SCOPE_TOMORROW.search(q):
+        return {
+            "key": "tomorrow", "label": "mañana",
+            "reminders_horizon": 2, "calendar_ahead": 1,
+        }
+    if _SCOPE_TODAY.search(q):
+        return {
+            "key": "today", "label": "hoy",
+            "reminders_horizon": 1, "calendar_ahead": 0,
+        }
+    return {
+        "key": "general", "label": "próximas 2 semanas",
+        "reminders_horizon": 14, "calendar_ahead": 7,
+    }
+
+
+def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
+    """Events from today through today+days_ahead via icalBuddy with relative
+    date labels ("today" / "tomorrow" / "day after tomorrow" / YYYY-MM-DD).
+    Returns [{date_label, title, time_range}]. Empty list on any failure —
+    the brief layer tolerates silent missing calendar.
+    """
+    if not _apple_enabled() or days_ahead < 0:
+        return []
+    icb = _icalbuddy_path()
+    if not icb:
+        return []
+    query = "eventsToday" if days_ahead == 0 else f"eventsToday+{days_ahead}"
+    try:
+        res = subprocess.run(
+            [icb, "-nc", "-iep", "title,datetime", "-b", "", query],
+            capture_output=True, text=True, timeout=10.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if res.returncode != 0 or not (res.stdout or "").strip():
+        return []
+
+    events: list[dict] = []
+    current: dict | None = None
+    for raw in (res.stdout or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if not line.startswith(" ") and not line.startswith("\t"):
+            if current and current.get("title"):
+                events.append(current)
+            current = {"title": line.strip(), "date_label": "", "time_range": ""}
+            continue
+        stripped = line.strip()
+        if current is None:
+            continue
+        m = re.search(
+            r"(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)\s*-\s*(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)",
+            stripped,
+        )
+        if m:
+            current["time_range"] = f"{m.group(1)}–{m.group(2)}"
+            # date label is everything before the "at HH:MM" span
+            label = stripped.split(" at ", 1)[0].strip()
+            if label and label != stripped:
+                current["date_label"] = label
+        else:
+            # date-only line (all-day event)
+            current["date_label"] = stripped
+    if current and current.get("title"):
+        events.append(current)
+    return events[:max_events]
+
+
+def _collect_scoped_evidence(col, now: datetime, scope: dict) -> dict:
+    """`_pendientes_collect` under the hood for services that are scope-free
+    (gmail, mail, whatsapp, loops, contradictions), then override `reminders`
+    and `calendar` with scope-aware fetches. WhatsApp always stays on — user
+    wants the recent chat context attached even to non-WA questions.
+    """
+    ev = _pendientes_collect(col, now, days=14)
+    from contextlib import suppress
+    with suppress(Exception):
+        ev["reminders"] = _fetch_reminders_due(
+            now,
+            horizon_days=int(scope["reminders_horizon"]),
+            max_items=40,
+        )
+    with suppress(Exception):
+        ev["calendar_range"] = _fetch_calendar_ahead(int(scope["calendar_ahead"]))
+    # Ensure whatsapp is always populated even if `_pendientes_collect`
+    # skipped it silently (bridge transiently down, etc.).
+    if not ev.get("whatsapp"):
+        with suppress(Exception):
+            ev["whatsapp"] = _fetch_whatsapp_unread(hours=24, max_chats=8)
+    return ev
+
+
+def _format_pendientes_context(
+    ev: dict, urgent: list[str], now: datetime, scope: dict,
+) -> str:
+    """Markdown evidence blob for the LLM. Scope label is front-and-centre so
+    the model filters to the right window. WhatsApp is always included —
+    even a non-WA question benefits from seeing recent chat context.
+    """
+    lines: list[str] = [
+        f"# Evidencia de servicios · {now.strftime('%Y-%m-%d %H:%M')}",
+        f"**Ventana temporal pedida:** {scope['label']}",
+    ]
+
+    if urgent:
+        lines.append(f"\n## 🚨 Urgente / Overdue ({len(urgent)})")
+        lines.extend(f"- {u}" for u in urgent)
+
+    cal = ev.get("calendar_range") or ev.get("calendar") or []
+    if cal:
+        lines.append(f"\n## 📅 Calendar ({len(cal)} eventos)")
+        for e in cal[:20]:
+            when_bits = [b for b in (e.get("date_label"), e.get("time_range")) if b]
+            if not when_bits and e.get("start"):
+                when_bits = [e["start"]]
+            when = " · ".join(when_bits) or "sin hora"
+            lines.append(f"- {when} — {e.get('title','')}")
+
+    rem = ev.get("reminders") or []
+    if rem:
+        lines.append(f"\n## 📌 Apple Reminders ({len(rem)})")
+        for bucket in ("overdue", "today", "upcoming", "undated"):
+            bucket_items = [x for x in rem if (x.get("bucket") or "") == bucket]
+            for r in bucket_items[:10]:
+                due = f" (due {r['due']})" if r.get("due") else ""
+                lst = f" [{r['list']}]" if r.get("list") else ""
+                lines.append(f"- **{bucket}**: {r.get('name','')}{due}{lst}")
+
+    gm = ev.get("gmail") or {}
+    awaiting = gm.get("awaiting_reply") or []
+    if awaiting:
+        lines.append(f"\n## 📧 Gmail awaiting reply ({len(awaiting)})")
+        for m in awaiting[:8]:
+            lines.append(
+                f"- {m.get('days_old',0)}d · {m.get('subject','')} "
+                f"— {m.get('from','')}"
+            )
+
+    mail = ev.get("mail_unread") or []
+    if mail:
+        lines.append(f"\n## 📬 Apple Mail unread 36h ({len(mail)})")
+        for m in mail[:5]:
+            vip = "VIP · " if m.get("is_vip") else ""
+            lines.append(f"- {vip}{m.get('subject','')} — {m.get('sender','')}")
+
+    wa = ev.get("whatsapp") or []
+    if wa:
+        total = sum(int(w.get("count", 0)) for w in wa)
+        lines.append(
+            f"\n## 💬 WhatsApp últimas 24h ({len(wa)} chats · {total} msgs)"
+        )
+        for w in wa[:10]:
+            snip = (w.get("last_snippet") or "").strip()[:100]
+            snip_part = f' — "{snip}"' if snip else ""
+            lines.append(
+                f"- {w.get('name','?')} ({w.get('count',0)} msgs){snip_part}"
+            )
+
+    stale = ev.get("loops_stale") or []
+    activo = ev.get("loops_activo") or []
+    if stale or activo:
+        lines.append(
+            f"\n## 📁 Vault loops ({len(stale)} stale · {len(activo)} activo)"
+        )
+        for it in stale[:5]:
+            src = Path(it["source_note"]).stem
+            lines.append(
+                f"- stale {it.get('age_days',0)}d: "
+                f"{it.get('loop_text','')[:100]} [[{src}]]"
+            )
+        for it in activo[:5]:
+            src = Path(it["source_note"]).stem
+            lines.append(
+                f"- activo {it.get('age_days',0)}d: "
+                f"{it.get('loop_text','')[:100]} [[{src}]]"
+            )
+
+    contrad = ev.get("contradictions") or []
+    if contrad:
+        lines.append(f"\n## ⚠ Contradicciones recientes ({len(contrad)})")
+        for c in contrad[:3]:
+            tgt = ", ".join(t.get("path", "") for t in c.get("targets", [])[:2])
+            lines.append(f"- {c.get('subject_path','')} ↔ {tgt}")
+
+    return "\n".join(lines)
+
+
+def _pendientes_services_consulted(ev: dict) -> list[str]:
+    """Labels of services that returned data — used for UI meta."""
+    out: list[str] = []
+    if (ev.get("gmail") or {}).get("awaiting_reply"):
+        out.append("Gmail")
+    if ev.get("mail_unread"):
+        out.append("Apple Mail")
+    if ev.get("whatsapp"):
+        out.append("WhatsApp")
+    if ev.get("reminders"):
+        out.append("Reminders")
+    if ev.get("calendar_range") or ev.get("calendar"):
+        out.append("Calendar")
+    if ev.get("loops_stale") or ev.get("loops_activo"):
+        out.append("Vault loops")
+    return out
+
+
+def _build_tasks_system_rules(scope: dict) -> str:
+    """SYSTEM prompt with the concrete time-window embedded. Keeping it per-
+    call (instead of a global constant) avoids the 'Sin pendientes' parroting
+    failure mode — the model now has to filter by scope, not repeat a fixed
+    fallback string.
+    """
+    return (
+        "Sos un asistente personal que organiza la agenda del usuario a "
+        "partir de evidencia EN VIVO de sus servicios (Calendar, Reminders, "
+        "Gmail, Apple Mail, WhatsApp, loops del vault).\n\n"
+        f"VENTANA TEMPORAL: {scope['label']}.\n\n"
+        "Reglas estrictas:\n"
+        "1. Usá SOLO la evidencia del CONTEXTO. No inventes tareas, "
+        "reuniones ni plazos que no estén literalmente listados.\n"
+        "2. Filtrá los items a la ventana temporal indicada. "
+        "Items de Reminders fuera de la ventana → omitilos.\n"
+        "3. Respondé en español, estructurado con encabezados markdown y "
+        "bullets. Omití secciones que queden vacías después del filtro.\n"
+        "4. Orden: 🚨 Urgente/overdue → 📅 Agenda (Calendar) → "
+        "📌 Reminders → 📧 Bandeja (mails) → 💬 WhatsApp → 📁 Vault loops.\n"
+        "5. Sé conciso: una línea por item. Para eventos de Calendar incluí "
+        "día + hora + título.\n"
+        "6. Si tras filtrar por la ventana no queda NADA, respondé "
+        "exactamente: 'No tengo nada trackeado para esa ventana.' y parate "
+        "ahí — NO copies la frase 'Sin pendientes trackeados' del contexto."
+    )
+
+
+def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
+    """SSE generator for the tasks/agenda intent branch. Collects scope-aware
+    evidence from ALL registered vaults (home + work) via rag's multi-vault
+    collector, builds the structured context, streams the LLM answer.
+
+    Delegates formatting + prompt rules to `rag.py` so web and `rag serve`
+    (WhatsApp/bot surface) produce identical output — same sections, same
+    `[home]`/`[work]` loop labels, same "SIEMPRE mostrar" prompt semantics.
+    """
+    now = datetime.now()
+    scope = _detect_time_scope(question)
+    try:
+        all_vaults = resolve_vault_paths(["all"])
+    except Exception:
+        all_vaults = []
+    try:
+        if all_vaults:
+            ev = _rag_collect_scoped_tasks_evidence_multi(all_vaults, now, scope)
+        else:
+            ev = _collect_scoped_evidence(get_db(), now, scope)
+    except Exception as exc:
+        yield _sse("error", {"message": f"servicios fallaron: {exc}"})
+        return
+    urgent = _pendientes_urgent(ev, now)
+    services = (
+        _rag_tasks_services_consulted(ev) if all_vaults
+        else _pendientes_services_consulted(ev)
+    )
+    context = (
+        _rag_format_scoped_tasks_context(ev, urgent, now, scope) if all_vaults
+        else _format_pendientes_context(ev, urgent, now, scope)
+    )
+    system_rules = _rag_build_tasks_system_rules(scope)
+
+    meta_bits: list[str] = [f"📋 ventana: {scope['label']}"]
+    if services:
+        meta_bits.append(", ".join(services))
+    else:
+        meta_bits.append("sin datos de servicios")
+    if urgent:
+        meta_bits.append(f"🚨 {len(urgent)} urgente(s)")
+    yield _sse("meta", {"bits": meta_bits})
+
+    if history:
+        messages = (
+            [{"role": "system", "content": f"{system_rules}\nCONTEXTO:\n{context}"}]
+            + history
+            + [{"role": "user", "content": question}]
+        )
+    else:
+        messages = [{"role": "user", "content": (
+            f"{system_rules}\nCONTEXTO:\n{context}\n\n"
+            f"PREGUNTA: {question}\n\nRESPUESTA:"
+        )}]
+
+    parts: list[str] = []
+    # Tasks layout with 6+ sections + per-item bullets overflows the default
+    # 384 num_predict cap — LLM stops mid-"Vault loops". Bump to 800 so the
+    # full brief lands even with both vaults' loops expanded.
+    tasks_options = {**CHAT_OPTIONS, "num_predict": 800}
+    try:
+        for chunk in ollama.chat(
+            model=resolve_chat_model(),
+            messages=messages,
+            options=tasks_options,
+            stream=True,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        ):
+            delta = chunk.message.content or ""
+            if delta:
+                parts.append(delta)
+                yield _sse("token", {"delta": delta})
+    except Exception as exc:
+        yield _sse("error", {"message": f"LLM falló: {exc}"})
+        return
+
+    full = "".join(parts)
+    turn_id = new_turn_id()
+    append_turn(sess, {
+        "q": question,
+        "a": full,
+        "paths": [],
+        "top_score": 0.0,
+        "turn_id": turn_id,
+        "mode": "tasks",
+    })
+    save_session(sess)
+    log_query_event({
+        "cmd": "web.tasks",
+        "turn_id": turn_id,
+        "session": sess["id"],
+        "q": question,
+        "scope": scope["key"],
+        "scope_label": scope["label"],
+        "services": services,
+        "n_urgent": len(urgent),
+        "n_reminders": len(ev.get("reminders") or []),
+        "n_calendar": len(
+            ev.get("calendar_range") or ev.get("calendar") or []
+        ),
+        "n_whatsapp": len(ev.get("whatsapp") or []),
+        "n_loops_activo": len(ev.get("loops_activo") or []),
+        "n_loops_stale": len(ev.get("loops_stale") or []),
+    })
+
+    yield _sse("done", {"turn_id": turn_id, "mode": "tasks"})
+
+
+_TODAY_FM_SPLIT = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+
+
+def _persist_today_brief(date_label: str, narrative: str) -> None:
+    """Write the regenerated brief to `05-Reviews/YYYY-MM-DD-evening.md` so
+    subsequent `/api/home` calls hit the cached path. Mirrors the CLI
+    `rag today` write — same frontmatter shape so contradiction detection
+    and ambient skip rules treat both files the same. Silent-fail.
+    """
+    from contextlib import suppress
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    fm_lines = [
+        "---",
+        f"created: '{now_iso}'",
+        "type: evening-brief",
+        "tags:",
+        "- review",
+        "- evening-brief",
+        f"date: '{date_label}'",
+        "source: web",
+        "---",
+    ]
+    body = "\n".join(fm_lines) + f"\n\n# Evening brief — {date_label}\n\n{narrative}\n"
+    path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
+    with suppress(Exception):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+
+def _today_cached_narrative(date_label: str) -> str | None:
+    """Return narrative from `05-Reviews/YYYY-MM-DD-evening.md` if present.
+    CLI `rag today` writes this file, so we avoid re-running the LLM when the
+    brief was already generated today.
+    """
+    path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    body = _TODAY_FM_SPLIT.sub("", raw, count=1).strip()
+    # Strip the "# Evening brief — YYYY-MM-DD" header if present
+    lines = body.splitlines()
+    if lines and lines[0].startswith("# Evening brief"):
+        body = "\n".join(lines[1:]).lstrip()
+    return body or None
+
+
+@app.get("/api/home")
+def home_api(regenerate: bool = False) -> dict:
+    """Centralizer — aggregates every information channel the user cares
+    about into one JSON payload. Powers the home page.
+
+    Channels:
+    - today narrative (rag today) + vault evidence for the day
+    - live signals (reminders, Apple Mail, Gmail, WhatsApp, calendar, weather)
+    - derived signals (open loops, contradictions, low-confidence queries)
+    - tomorrow agenda + multi-day weather forecast
+
+    Per-channel silent-fail: if one source errors (e.g. Gmail OAuth expired,
+    icalBuddy not installed), that key is missing/empty but the rest renders.
+    `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
+    cached brief from `05-Reviews/<date>-evening.md` if present.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import suppress
+
+    now = datetime.now()
+    date_label = now.strftime("%Y-%m-%d")
+    col = get_db()
+
+    # ── Fan out: vault evidence + live channels + forecast run in parallel.
+    # `_pendientes_collect` internally fans out its 9 fetchers too, so the
+    # critical path across the whole page is max(today_evidence, slowest
+    # single fetcher, tomorrow_calendar, weather_forecast) instead of the sum.
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="home") as pool:
+        fut_today    = pool.submit(
+            _collect_today_evidence, now, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
+        )
+        fut_signals  = pool.submit(_pendientes_collect, col, now, 14)
+        fut_tomorrow = pool.submit(_fetch_calendar_ahead, 1, 10)
+        fut_forecast = pool.submit(_fetch_weather_forecast)
+
+        try:
+            today_ev = fut_today.result()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        signals = {}
+        with suppress(Exception):
+            signals = fut_signals.result()
+
+        tomorrow_calendar = []
+        with suppress(Exception):
+            tomorrow_calendar = fut_tomorrow.result() or []
+
+        weather_forecast = None
+        with suppress(Exception):
+            weather_forecast = fut_forecast.result()
+
+    today_total = (
+        len(today_ev.get("recent_notes") or [])
+        + len(today_ev.get("inbox_today") or [])
+        + len(today_ev.get("todos") or [])
+        + len(today_ev.get("new_contradictions") or [])
+        + len(today_ev.get("low_conf_queries") or [])
+    )
+
+    narrative = "" if today_total == 0 else (_today_cached_narrative(date_label) or "")
+    narrative_source = "cached" if narrative else "none"
+    # Only call the LLM when the caller explicitly asks. Default path stays
+    # fast — if no cached brief exists yet, the UI shows "pendiente" and
+    # offers a button that re-hits with regenerate=true.
+    if today_total > 0 and regenerate:
+        prompt = _render_today_prompt(date_label, today_ev)
+        narrative = _generate_today_narrative(prompt)
+        narrative_source = "generated" if narrative else "error"
+        if narrative:
+            _persist_today_brief(date_label, narrative)
+
+    brief_rel: str | None = None
+    path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
+    if path.is_file():
+        with suppress(ValueError):
+            brief_rel = str(path.relative_to(VAULT_PATH))
+
+    urgent: list[str] = []
+    with suppress(Exception):
+        urgent = _pendientes_urgent(signals, now)
+
+    return {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "date": date_label,
+        "today": {
+            "narrative": narrative,
+            "narrative_source": narrative_source,
+            "brief_path": brief_rel,
+            "counts": {
+                "recent_notes": len(today_ev.get("recent_notes") or []),
+                "inbox_today": len(today_ev.get("inbox_today") or []),
+                "todos": len(today_ev.get("todos") or []),
+                "new_contradictions": len(today_ev.get("new_contradictions") or []),
+                "low_conf_queries": len(today_ev.get("low_conf_queries") or []),
+                "total": today_total,
+            },
+            "evidence": today_ev,
+        },
+        "urgent": urgent,
+        "signals": signals,
+        "tomorrow_calendar": tomorrow_calendar,
+        "weather_forecast": weather_forecast,
+    }
+
+
+@app.get("/api/pendientes")
+def pendientes_api(days: int = 14) -> dict:
+    """Raw JSON view of the services layer. Useful for a dedicated pendientes
+    card in the UI or for third-party clients; the chat endpoint uses the
+    same `_pendientes_collect` internally when intent matches.
+    """
+    col = get_db()
+    now = datetime.now()
+    try:
+        ev = _pendientes_collect(col, now, days=days)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    urgent = _pendientes_urgent(ev, now)
+    return {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "days": days,
+        "urgent": urgent,
+        "services_consulted": _pendientes_services_consulted(ev),
+        "evidence": ev,
+    }
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
     question = req.question.strip()
@@ -135,6 +750,14 @@ def chat(req: ChatRequest) -> StreamingResponse:
         yield _sse("session", {"id": sess["id"]})
 
         history = session_history(sess, window=SESSION_HISTORY_WINDOW)
+
+        # Tasks / agenda intent → bypass vault RAG (which hallucinates on
+        # "what do I have tomorrow" queries because the vault doesn't hold
+        # live calendar/reminders) and pull from the services layer instead.
+        if _is_tasks_query(question):
+            yield from _gen_tasks_response(sess, question, history)
+            return
+
         try:
             result = multi_retrieve(
                 vaults, question, 6, None, history, None, False,
@@ -172,6 +795,29 @@ def chat(req: ChatRequest) -> StreamingResponse:
             + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d}"
             for d, m in zip(result["docs"], result["metas"])
         )
+
+        # Always attach recent WhatsApp activity as supplementary context.
+        # User rule: "siempre tenes que indexar mi whatsapp" → the LLM should
+        # always know what the user is actively chatting about, even for
+        # vault-RAG answers. Silent-fail if the bridge is down.
+        try:
+            wa_recent = _fetch_whatsapp_unread(hours=24, max_chats=8)
+        except Exception:
+            wa_recent = []
+        if wa_recent:
+            total_msgs = sum(int(w.get("count", 0)) for w in wa_recent)
+            wa_block_lines = [
+                f"[contexto auxiliar: WhatsApp últimas 24h · "
+                f"{len(wa_recent)} chats · {total_msgs} msgs]"
+            ]
+            for w in wa_recent[:8]:
+                snip = (w.get("last_snippet") or "").strip()[:100]
+                snip_part = f' — "{snip}"' if snip else ""
+                wa_block_lines.append(
+                    f"- {w.get('name','?')} ({w.get('count',0)} "
+                    f"msgs){snip_part}"
+                )
+            context = context + "\n\n---\n\n" + "\n".join(wa_block_lines)
         if history:
             messages = (
                 [{"role": "system", "content": f"{SYSTEM_RULES}\nCONTEXTO:\n{context}"}]

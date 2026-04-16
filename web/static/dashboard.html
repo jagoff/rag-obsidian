@@ -4,6 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>rag · dashboard</title>
+  <script>
+    // Inline theme init — runs before body paint to avoid flash.
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    })();
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -13,16 +24,68 @@
       --border: #33333a;
       --border-strong: #3e3e46;
       --text: #ececed;
-      --text-dim: #8a8a90;
-      --text-faint: #5a5a60;
+      --text-dim: #a0a0a6;
+      --text-faint: #7a7a82;
       --green: #7ee787;
       --cyan: #79c0ff;
-      --cyan-dim: #3b7aa1;
+      --cyan-dim: #5a9bd5;
       --yellow: #e3c27a;
       --red: #ff7b72;
       --purple: #d2a8ff;
       --orange: #ffa657;
       --pink: #f778ba;
+      --grid: rgba(255,255,255,0.04);
+      --hover: rgba(255,255,255,0.06);
+      --sep: rgba(255,255,255,0.03);
+      color-scheme: dark;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #fafafa;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --border: #e2e2e5;
+      --border-strong: #cfcfd4;
+      --text: #1a1a20;
+      --text-dim: #52525b;
+      --text-faint: #70707a;
+      --green: #2f8f3d;
+      --cyan: #0969da;
+      --cyan-dim: #0969da;
+      --yellow: #a0761a;
+      --red: #c8311f;
+      --purple: #7c3aed;
+      --orange: #c25a11;
+      --pink: #d02a8a;
+      --grid: rgba(0,0,0,0.05);
+      --hover: rgba(0,0,0,0.04);
+      --sep: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) {
+        --bg: #fafafa;
+        --bg-elev: #ffffff;
+        --bg-card: #ffffff;
+        --border: #e2e2e5;
+        --border-strong: #cfcfd4;
+        --text: #1a1a20;
+        --text-dim: #52525b;
+        --text-faint: #70707a;
+        --green: #2f8f3d;
+        --cyan: #0969da;
+        --cyan-dim: #0969da;
+        --yellow: #a0761a;
+        --red: #c8311f;
+        --purple: #7c3aed;
+        --orange: #c25a11;
+        --pink: #d02a8a;
+        --grid: rgba(0,0,0,0.05);
+        --hover: rgba(0,0,0,0.04);
+        --sep: rgba(0,0,0,0.04);
+        color-scheme: light;
+      }
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -34,6 +97,13 @@
       font-size: 13px;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
+    }
+
+    :focus { outline: none; }
+    :focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+      border-radius: 4px;
     }
 
     .container {
@@ -48,8 +118,14 @@
       align-items: baseline;
       justify-content: space-between;
       margin-bottom: 28px;
-      padding-bottom: 16px;
+      padding: 14px 0 16px;
       border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
     }
 
     header h1 {
@@ -85,7 +161,7 @@
       outline: none;
       cursor: pointer;
       appearance: none;
-      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%238a8a90' d='M0 0l5 6 5-6z'/></svg>");
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23888' d='M0 0l5 6 5-6z'/></svg>");
       background-repeat: no-repeat;
       background-position: right 8px center;
     }
@@ -120,6 +196,7 @@
       font-weight: 700;
       color: var(--text);
       line-height: 1.1;
+      font-variant-numeric: tabular-nums;
     }
 
     .kpi-sub {
@@ -164,11 +241,91 @@
     .chart-wrap {
       position: relative;
       width: 100%;
+      min-height: 180px;
     }
 
     .chart-wrap canvas {
       width: 100% !important;
     }
+
+    .chart-empty {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--text-faint);
+      font-size: 12px;
+      pointer-events: none;
+      background: color-mix(in srgb, var(--bg-card) 85%, transparent);
+    }
+    .chart-wrap[data-empty="true"] .chart-empty { display: flex; }
+    .chart-wrap[data-empty="true"] canvas { opacity: 0.2; }
+
+    /* SVG icon defaults */
+    .icon { display: inline-block; vertical-align: -2px; flex-shrink: 0; }
+    .tag-icon { display: inline-flex; align-items: center; margin-right: 4px; gap: 3px; }
+    @media (prefers-reduced-motion: no-preference) {
+      .icon.spin { animation: icon-spin 1.2s linear infinite; transform-origin: center; }
+      @keyframes icon-spin { to { transform: rotate(360deg); } }
+    }
+
+    /* Verdict issues list */
+    .verdict-issues {
+      list-style: none;
+      padding: 10px 0 0;
+      margin: 0;
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .verdict-issues li {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-dim);
+    }
+
+    /* Legend dots */
+    .legend { margin-top: 16px; font-size: 11px; color: var(--text-faint); line-height: 1.7; }
+    .legend > div { display: flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+    /* Skeleton */
+    .skeleton {
+      background: linear-gradient(90deg, var(--bg-card) 0%, var(--bg-elev) 50%, var(--bg-card) 100%);
+      background-size: 200% 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .skeleton { animation: shimmer 1.8s linear infinite; }
+      @keyframes shimmer {
+        0%   { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+      }
+    }
+    .skel-kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .skel-kpi { height: 88px; }
+    .skel-ticker { height: 230px; margin-bottom: 16px; }
+    .skel-health {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .skel-health-card { height: 200px; }
+    .skel-charts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    .skel-chart { height: 260px; }
+    .skel-chart.wide { grid-column: 1 / -1; }
 
     /* Stats table */
     .stats-table {
@@ -230,7 +387,7 @@
       justify-content: space-between;
       padding: 5px 0;
       font-size: 12px;
-      border-bottom: 1px solid rgba(255,255,255,0.03);
+      border-bottom: 1px solid var(--sep);
     }
     .health-row:last-child { border-bottom: none; }
 
@@ -261,9 +418,9 @@
       align-items: center;
       gap: 8px;
     }
-    .health-verdict.ok  { background: rgba(126,231,135,0.08); color: var(--green); border: 1px solid rgba(126,231,135,0.15); }
-    .health-verdict.mid { background: rgba(227,194,122,0.08); color: var(--yellow); border: 1px solid rgba(227,194,122,0.15); }
-    .health-verdict.bad { background: rgba(255,123,114,0.08); color: var(--red); border: 1px solid rgba(255,123,114,0.15); }
+    .health-verdict.ok  { background: color-mix(in srgb, var(--green) 12%, transparent); color: var(--green); border: 1px solid color-mix(in srgb, var(--green) 25%, transparent); }
+    .health-verdict.mid { background: color-mix(in srgb, var(--yellow) 12%, transparent); color: var(--yellow); border: 1px solid color-mix(in srgb, var(--yellow) 25%, transparent); }
+    .health-verdict.bad { background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); }
 
     /* Tune history */
     .tune-row {
@@ -303,14 +460,16 @@
     }
     .live[data-state="live"] .dot {
       background: var(--green);
-      animation: pulse 1.6s ease-out infinite;
     }
     .live[data-state="paused"] .dot { background: var(--yellow); }
     .live[data-state="off"] .dot { background: var(--red); }
-    @keyframes pulse {
-      0%   { box-shadow: 0 0 0 0 rgba(126,231,135,0.55); }
-      70%  { box-shadow: 0 0 0 7px rgba(126,231,135,0); }
-      100% { box-shadow: 0 0 0 0 rgba(126,231,135,0); }
+    @media (prefers-reduced-motion: no-preference) {
+      .live[data-state="live"] .dot { animation: pulse 1.6s ease-out infinite; }
+      @keyframes pulse {
+        0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 55%, transparent); }
+        70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--green) 0%, transparent); }
+        100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 0%, transparent); }
+      }
     }
 
     /* Live ticker */
@@ -334,7 +493,7 @@
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
-    .ticker-empty { color: var(--text-faint); font-style: italic; padding: 8px 0; font-size: 12px; }
+    .ticker-empty { color: var(--text-faint); padding: 8px 0; font-size: 12px; }
     .ticker-list { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
     .ticker-item {
       display: grid;
@@ -344,9 +503,11 @@
       padding: 4px 6px;
       border-radius: 4px;
       font-size: 12px;
-      animation: slideIn 0.4s ease-out;
     }
-    .ticker-item:hover { background: rgba(255,255,255,0.025); }
+    .ticker-item:hover { background: var(--hover); }
+    @media (prefers-reduced-motion: no-preference) {
+      .ticker-item { animation: slideIn 0.4s ease-out; }
+    }
     .ticker-item .t-time { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: 11px; }
     .ticker-item .t-source {
       font-size: 10px;
@@ -357,11 +518,11 @@
       letter-spacing: 0.04em;
       font-weight: 600;
     }
-    .ticker-item .t-source.whatsapp { background: rgba(126,231,135,0.12); color: var(--green); }
-    .ticker-item .t-source.web { background: rgba(121,192,255,0.12); color: var(--cyan); }
-    .ticker-item .t-source.cli { background: rgba(210,168,255,0.12); color: var(--purple); }
-    .ticker-item .t-source.telegram { background: rgba(255,166,87,0.12); color: var(--orange); }
-    .ticker-item .t-source.feedback { background: rgba(247,120,186,0.12); color: var(--pink); }
+    .ticker-item .t-source.whatsapp { background: color-mix(in srgb, var(--green) 15%, transparent); color: var(--green); }
+    .ticker-item .t-source.web { background: color-mix(in srgb, var(--cyan) 15%, transparent); color: var(--cyan); }
+    .ticker-item .t-source.cli { background: color-mix(in srgb, var(--purple) 15%, transparent); color: var(--purple); }
+    .ticker-item .t-source.telegram { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
+    .ticker-item .t-source.feedback { background: color-mix(in srgb, var(--pink) 15%, transparent); color: var(--pink); }
     .ticker-item .t-q { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .ticker-item .t-score { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
     .ticker-item .t-score.high { color: var(--green); }
@@ -385,7 +546,7 @@
       grid-template-columns: 1fr auto;
       gap: 10px;
       padding: 8px 10px;
-      background: rgba(255,255,255,0.02);
+      background: var(--sep);
       border-radius: 6px;
       font-size: 12px;
       border-left: 2px solid var(--border-strong);
@@ -405,7 +566,6 @@
     .fb-count.pos { color: var(--green); }
     .fb-empty {
       color: var(--text-faint);
-      font-style: italic;
       text-align: center;
       padding: 30px 0;
       font-size: 12px;
@@ -424,10 +584,17 @@
     .fb-cal-value.warn { color: var(--yellow); }
     .fb-cal-value.good { color: var(--green); }
 
-    @media (max-width: 900px) {
-      .feedback-grid { grid-template-columns: 1fr; }
-      .ticker-item { grid-template-columns: 50px 60px 1fr 50px; }
-      .ticker-item .t-latency { display: none; }
+    /* Screen-reader only */
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }
 
     /* Loading state */
@@ -435,21 +602,25 @@
       text-align: center;
       padding: 120px 0;
       color: var(--text-dim);
-      font-style: italic;
+      opacity: 0.85;
     }
 
     .loading::after {
       content: "▍";
-      animation: blink 1s steps(2) infinite;
     }
-
-    @keyframes blink { 50% { opacity: 0; } }
+    @media (prefers-reduced-motion: no-preference) {
+      .loading::after { animation: blink 1s steps(2) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+    }
 
     /* Responsive */
     @media (max-width: 900px) {
       .charts { grid-template-columns: 1fr; }
       .chart-card.wide { grid-column: 1; }
       .kpis { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+      .feedback-grid { grid-template-columns: 1fr; }
+      .ticker-item { grid-template-columns: 50px 60px 1fr 50px; }
+      .ticker-item .t-latency { display: none; }
     }
   </style>
 </head>
@@ -460,22 +631,48 @@
       <div class="header-meta">
         <span id="meta-period"></span>
         <span id="meta-updated"></span>
-        <button class="live" id="live-toggle" data-state="off" type="button" title="Click to pause/resume live updates">
-          <span class="dot"></span><span id="live-label">conectando…</span>
+        <button class="live" id="live-toggle" data-state="off" type="button" aria-pressed="false" aria-label="Pausar o reanudar actualizaciones en vivo">
+          <span class="dot" aria-hidden="true"></span><span id="live-label">conectando…</span>
         </button>
-        <select id="days-picker" aria-label="Period">
-          <option value="7">7 days</option>
-          <option value="14">14 days</option>
-          <option value="30" selected>30 days</option>
-          <option value="90">90 days</option>
-          <option value="365">1 year</option>
+        <select id="days-picker" aria-label="Período">
+          <option value="7">7 días</option>
+          <option value="14">14 días</option>
+          <option value="30" selected>30 días</option>
+          <option value="90">90 días</option>
+          <option value="365">1 año</option>
         </select>
-        <a href="/">chat</a>
+        <button id="theme-toggle" class="live" type="button" aria-label="Alternar tema claro/oscuro">
+          <span id="theme-icon" aria-hidden="true"></span>
+        </button>
+        <a href="/">home</a>
+        <a href="/chat">chat</a>
       </div>
     </header>
 
     <div id="content">
-      <div class="loading">cargando datos </div>
+      <div class="skel-ticker skeleton" aria-hidden="true"></div>
+      <div class="skel-kpis" aria-hidden="true">
+        <div class="skel-kpi skeleton"></div>
+        <div class="skel-kpi skeleton"></div>
+        <div class="skel-kpi skeleton"></div>
+        <div class="skel-kpi skeleton"></div>
+        <div class="skel-kpi skeleton"></div>
+        <div class="skel-kpi skeleton"></div>
+      </div>
+      <div class="skel-health" aria-hidden="true">
+        <div class="skel-health-card skeleton"></div>
+        <div class="skel-health-card skeleton"></div>
+        <div class="skel-health-card skeleton"></div>
+      </div>
+      <div class="skel-charts" aria-hidden="true">
+        <div class="skel-chart skeleton wide"></div>
+        <div class="skel-chart skeleton wide"></div>
+        <div class="skel-chart skeleton"></div>
+        <div class="skel-chart skeleton"></div>
+        <div class="skel-chart skeleton"></div>
+        <div class="skel-chart skeleton"></div>
+      </div>
+      <span class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard</span>
     </div>
   </div>
 

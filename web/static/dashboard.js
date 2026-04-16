@@ -1,34 +1,48 @@
 /* obsidian-rag dashboard — Chart.js 4 + vanilla JS, real-time via SSE + polling */
 
 const C = {
-  cyan:   "#79c0ff",
-  green:  "#7ee787",
-  yellow: "#e3c27a",
-  red:    "#ff7b72",
-  purple: "#d2a8ff",
-  orange: "#ffa657",
-  pink:   "#f778ba",
-  dim:    "#5a5a60",
-  border: "#33333a",
-  card:   "#26262c",
-  text:   "#ececed",
-  textDim:"#8a8a90",
+  cyan: "", green: "", yellow: "", red: "", purple: "", orange: "", pink: "",
+  dim: "", border: "", card: "", text: "", textDim: "", grid: "",
 };
 
-Chart.defaults.color = C.textDim;
-Chart.defaults.borderColor = C.border;
-Chart.defaults.font.family = "'SF Mono','Menlo','Monaco','JetBrains Mono',ui-monospace,monospace";
-Chart.defaults.font.size = 11;
-Chart.defaults.plugins.legend.labels.boxWidth = 12;
-Chart.defaults.plugins.legend.labels.padding = 14;
-Chart.defaults.plugins.tooltip.backgroundColor = "#2a2a30";
-Chart.defaults.plugins.tooltip.borderColor = C.border;
-Chart.defaults.plugins.tooltip.borderWidth = 1;
-Chart.defaults.plugins.tooltip.titleFont = { size: 11 };
-Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
-Chart.defaults.plugins.tooltip.padding = 10;
-Chart.defaults.scale.grid = { color: "rgba(255,255,255,0.04)" };
-Chart.defaults.animation.duration = 350;
+function readTokens() {
+  const s = getComputedStyle(document.documentElement);
+  const read = (name) => s.getPropertyValue(name).trim();
+  C.cyan    = read("--cyan");
+  C.green   = read("--green");
+  C.yellow  = read("--yellow");
+  C.red     = read("--red");
+  C.purple  = read("--purple");
+  C.orange  = read("--orange");
+  C.pink    = read("--pink");
+  C.dim     = read("--text-faint");
+  C.border  = read("--border");
+  C.card    = read("--bg-card");
+  C.text    = read("--text");
+  C.textDim = read("--text-dim");
+  C.grid    = read("--grid");
+}
+readTokens();
+
+function applyChartDefaults() {
+  Chart.defaults.color = C.textDim;
+  Chart.defaults.borderColor = C.border;
+  Chart.defaults.font.family = "'SF Mono','Menlo','Monaco','JetBrains Mono',ui-monospace,monospace";
+  Chart.defaults.font.size = 11;
+  Chart.defaults.plugins.legend.labels.boxWidth = 12;
+  Chart.defaults.plugins.legend.labels.padding = 14;
+  Chart.defaults.plugins.tooltip.backgroundColor = C.card;
+  Chart.defaults.plugins.tooltip.titleColor = C.text;
+  Chart.defaults.plugins.tooltip.bodyColor = C.text;
+  Chart.defaults.plugins.tooltip.borderColor = C.border;
+  Chart.defaults.plugins.tooltip.borderWidth = 1;
+  Chart.defaults.plugins.tooltip.titleFont = { size: 11 };
+  Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
+  Chart.defaults.plugins.tooltip.padding = 10;
+  Chart.defaults.scale.grid = { color: C.grid };
+  Chart.defaults.animation.duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 350;
+}
+applyChartDefaults();
 
 // ── State ─────────────────────────────────────────────────────────────────
 const POLL_MS = 10_000;        // refresh aggregations every 10s
@@ -53,23 +67,64 @@ const el = {
   daysPicker: document.getElementById("days-picker"),
   liveToggle: document.getElementById("live-toggle"),
   liveLabel: document.getElementById("live-label"),
+  themeToggle: document.getElementById("theme-toggle"),
+  themeIcon: document.getElementById("theme-icon"),
 };
+
+const SUN_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/><path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M6.34 17.66l-1.41 1.41"/><path d="M19.07 4.93l-1.41 1.41"/></svg>';
+const MOON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+
+function currentTheme() {
+  const explicit = document.documentElement.getAttribute("data-theme");
+  if (explicit) return explicit;
+  return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function setTheme(next) {
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("rag-theme", next); } catch (e) {}
+  el.themeIcon.innerHTML = next === "light" ? MOON_SVG : SUN_SVG;
+  el.themeToggle.setAttribute("aria-label", next === "light" ? "Cambiar a tema oscuro" : "Cambiar a tema claro");
+  readTokens();
+  applyChartDefaults();
+  // Rebuild charts only after first build; otherwise they don't exist yet.
+  if (state.built) {
+    Object.values(state.charts).forEach(c => c.destroy());
+    state.charts = {};
+    state.built = false;
+    load(false);
+  }
+}
+
+// Initial icon
+el.themeIcon.innerHTML = currentTheme() === "light" ? MOON_SVG : SUN_SVG;
+el.themeToggle.addEventListener("click", () => {
+  setTheme(currentTheme() === "light" ? "dark" : "light");
+});
+// React to OS changes when user hasn't set an explicit preference.
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  try {
+    if (localStorage.getItem("rag-theme")) return;
+  } catch (e) {}
+  setTheme(matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+});
 
 el.daysPicker.addEventListener("change", () => {
   state.days = +el.daysPicker.value;
-  state.built = false;
-  load(true);
+  // Keep chart instances alive — just refresh data in place.
+  load(false);
 });
 
 el.liveToggle.addEventListener("click", () => {
   state.paused = !state.paused;
+  el.liveToggle.setAttribute("aria-pressed", String(state.paused));
   if (state.paused) {
     setLiveState("paused", "pausado");
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
     if (state.poll) { clearInterval(state.poll); state.poll = null; }
   } else {
     setLiveState("off", "reconectando…");
-    load(true);
+    load(false);
     startPolling();
     startStream();
   }
@@ -95,8 +150,8 @@ startStream();
 // ── Loading + polling ─────────────────────────────────────────────────────
 
 async function load(showSkeleton) {
-  if (showSkeleton) {
-    el.content.innerHTML = '<div class="loading">cargando datos </div>';
+  if (showSkeleton && state.built) {
+    // Only blow away charts if we explicitly want a hard reset (e.g. error recovery).
     Object.values(state.charts).forEach(c => c.destroy());
     state.charts = {};
     state.built = false;
@@ -219,7 +274,7 @@ function buildLayout(d) {
         <h2>Eventos en vivo</h2>
         <span style="font-size:11px;color:var(--text-faint)" id="ticker-meta">esperando…</span>
       </div>
-      <div class="ticker-list" id="ticker-list">
+      <div class="ticker-list" id="ticker-list" role="log" aria-live="polite" aria-relevant="additions" aria-label="Eventos en vivo">
         <div class="ticker-empty">sin eventos todavía. cuando llegue una query, aparecerá acá.</div>
       </div>
     </div>
@@ -230,7 +285,7 @@ function buildLayout(d) {
     <div class="charts">
       <div class="chart-card wide">
         <h2>Queries por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-queries-day"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-queries-day"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
 
       <div class="chart-card wide">
@@ -240,43 +295,43 @@ function buildLayout(d) {
 
       <div class="chart-card">
         <h2>Latencia total (p50 diario)</h2>
-        <div class="chart-wrap"><canvas id="ch-latency"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-latency"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Distribucion de scores</h2>
-        <div class="chart-wrap"><canvas id="ch-scores"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-scores"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Actividad por hora</h2>
-        <div class="chart-wrap"><canvas id="ch-hours"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-hours"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Origen de queries</h2>
-        <div class="chart-wrap"><canvas id="ch-sources"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-sources"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Comandos</h2>
-        <div class="chart-wrap"><canvas id="ch-cmds"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-cmds"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Hot topics</h2>
-        <div class="chart-wrap"><canvas id="ch-topics"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-topics"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Score trend (promedio diario)</h2>
-        <div class="chart-wrap"><canvas id="ch-score-trend"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-score-trend"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
-        <h2>Feedback por dia (👍 vs 👎)</h2>
-        <div class="chart-wrap"><canvas id="ch-feedback-trend"></canvas></div>
+        <h2>Feedback por día (positivo vs negativo)</h2>
+        <div class="chart-wrap"><canvas id="ch-feedback-trend"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Ambient hooks por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-ambient"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-ambient"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card">
         <h2>Contradicciones por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-contra"></canvas></div>
+        <div class="chart-wrap"><canvas id="ch-contra"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
       <div class="chart-card" id="card-index">
         <h2>Index</h2>
@@ -348,8 +403,8 @@ function buildLayout(d) {
   state.charts.feedbackTrend = new Chart(document.getElementById("ch-feedback-trend"), {
     type: "bar",
     data: { labels: [], datasets: [
-      { label: "👍", data: [], backgroundColor: hexAlpha(C.green, 0.6), borderColor: C.green, borderWidth: 1, borderRadius: 3, stack: "fb" },
-      { label: "👎", data: [], backgroundColor: hexAlpha(C.red, 0.6), borderColor: C.red, borderWidth: 1, borderRadius: 3, stack: "fb" },
+      { label: "positivos", data: [], backgroundColor: hexAlpha(C.green, 0.6), borderColor: C.green, borderWidth: 1, borderRadius: 3, stack: "fb" },
+      { label: "negativos", data: [], backgroundColor: hexAlpha(C.red, 0.6), borderColor: C.red, borderWidth: 1, borderRadius: 3, stack: "fb" },
     ] },
     options: { responsive: true, scales: { x: { stacked: true, ticks: { maxRotation: 45 } }, y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } } } },
   });
@@ -388,13 +443,31 @@ function refresh(d) {
   ];
 
   const kpiContainer = document.getElementById("kpis");
-  kpiContainer.innerHTML = kpis.map(kpi => `
-    <div class="kpi">
-      <span class="kpi-label">${kpi.label}</span>
-      <span class="kpi-value ${kpi.cls}" data-kpi="${kpi.key}">${kpi.value}</span>
-      <span class="kpi-sub">${kpi.sub}</span>
-    </div>
-  `).join("");
+  // Mutate existing DOM when the set of KPIs hasn't changed (preserves focus/hover/tooltips on poll).
+  const existingKeys = Array.from(kpiContainer.querySelectorAll(".kpi")).map(n => n.dataset.key).join(",");
+  const nextKeys = kpis.map(k => k.key).join(",");
+  if (existingKeys === nextKeys && existingKeys !== "") {
+    for (const kpi of kpis) {
+      const card = kpiContainer.querySelector(`.kpi[data-key="${kpi.key}"]`);
+      if (!card) continue;
+      const valEl = card.querySelector(".kpi-value");
+      const subEl = card.querySelector(".kpi-sub");
+      if (valEl) {
+        if (valEl.textContent !== String(kpi.value)) valEl.textContent = kpi.value;
+        valEl.className = `kpi-value ${kpi.cls}`;
+        valEl.dataset.kpi = kpi.key;
+      }
+      if (subEl && subEl.textContent !== kpi.sub) subEl.textContent = kpi.sub;
+    }
+  } else {
+    kpiContainer.innerHTML = kpis.map(kpi => `
+      <div class="kpi" data-key="${kpi.key}">
+        <span class="kpi-label">${kpi.label}</span>
+        <span class="kpi-value ${kpi.cls}" data-kpi="${kpi.key}">${kpi.value}</span>
+        <span class="kpi-sub">${kpi.sub}</span>
+      </div>
+    `).join("");
+  }
 
   renderHealth(d);
   renderFeedbackPanel(d.feedback || {});
@@ -415,6 +488,7 @@ function refresh(d) {
   state.charts.scores.data.datasets[0].backgroundColor = scoreColors.map(c => hexAlpha(c, 0.6));
   state.charts.scores.data.datasets[0].borderColor = scoreColors;
   state.charts.scores.update("none");
+  setEmpty(state.charts.scores, !d.score_distribution.some(v => v > 0));
 
   // Hours
   const hourVals = Array.from({ length: 24 }, (_, i) => d.hours[String(i)] || 0);
@@ -422,6 +496,7 @@ function refresh(d) {
   state.charts.hours.data.datasets[0].data = hourVals;
   state.charts.hours.data.datasets[0].backgroundColor = hourVals.map(v => hexAlpha(C.cyan, 0.2 + (v / maxHour) * 0.8));
   state.charts.hours.update("none");
+  setEmpty(state.charts.hours, !hourVals.some(v => v > 0));
 
   // Sources
   const srcLabels = Object.keys(d.sources);
@@ -431,6 +506,7 @@ function refresh(d) {
   state.charts.sources.data.datasets[0].data = srcVals;
   state.charts.sources.data.datasets[0].backgroundColor = srcPalette.slice(0, srcLabels.length).map(c => hexAlpha(c, 0.7));
   state.charts.sources.update("none");
+  setEmpty(state.charts.sources, !srcLabels.length);
 
   // Commands
   const cmdLabels = Object.keys(d.cmds);
@@ -441,12 +517,14 @@ function refresh(d) {
   state.charts.cmds.data.datasets[0].backgroundColor = cmdLabels.map((_, i) => hexAlpha(cmdPalette[i % 7], 0.6));
   state.charts.cmds.data.datasets[0].borderColor = cmdLabels.map((_, i) => cmdPalette[i % 7]);
   state.charts.cmds.update("none");
+  setEmpty(state.charts.cmds, !cmdLabels.length);
 
   // Topics
   const topicData = (d.hot_topics || []).filter(t => t.count >= 2).slice(0, 12);
   state.charts.topics.data.labels = topicData.map(t => t.topic);
   state.charts.topics.data.datasets[0].data = topicData.map(t => t.count);
   state.charts.topics.update("none");
+  setEmpty(state.charts.topics, !topicData.length);
 
   // Score trend
   const sTrend = (d.health && d.health.score_trend) || {};
@@ -456,6 +534,7 @@ function refresh(d) {
   state.charts.scoreTrend.data.datasets[0].data = stVals;
   state.charts.scoreTrend.data.datasets[0].pointBackgroundColor = stVals.map(v => v >= 0.2 ? C.green : v >= 0.05 ? C.yellow : C.red);
   state.charts.scoreTrend.update("none");
+  setEmpty(state.charts.scoreTrend, !stDays.length);
 
   // Feedback trend (merge pos+neg day keys)
   const fb = d.feedback || {};
@@ -464,6 +543,7 @@ function refresh(d) {
   state.charts.feedbackTrend.data.datasets[0].data = fbDays.map(d2 => (fb.per_day_pos || {})[d2] || 0);
   state.charts.feedbackTrend.data.datasets[1].data = fbDays.map(d2 => (fb.per_day_neg || {})[d2] || 0);
   state.charts.feedbackTrend.update("none");
+  setEmpty(state.charts.feedbackTrend, !fbDays.length);
 
   // Ambient
   const aDays = Object.keys(d.ambient_per_day);
@@ -530,6 +610,15 @@ function updateChart(name, labels, datasets) {
   ch.data.labels = labels;
   datasets.forEach((data, i) => { ch.data.datasets[i].data = data; });
   ch.update("none");
+  setEmpty(ch, !labels.length || !datasets.some(ds => ds.some(v => Number(v) > 0)));
+}
+
+function setEmpty(ch, isEmpty) {
+  if (!ch || !ch.canvas) return;
+  const wrap = ch.canvas.parentElement;
+  if (wrap && wrap.classList.contains("chart-wrap")) {
+    wrap.dataset.empty = isEmpty ? "true" : "false";
+  }
 }
 
 // ── Health section ────────────────────────────────────────────────────────
@@ -544,11 +633,10 @@ function renderHealth(d) {
   if (h.gate_rate > 20) issues.push("gate rate alto");
   if (d.latency_stats.total_p50 > 60) issues.push("latencia alta");
 
-  let verdictClass, verdictText;
-  if (issues.length === 0) { verdictClass = "ok"; verdictText = "Sistema saludable"; }
-  else if (issues.length <= 2) { verdictClass = "mid"; verdictText = "Atención: " + issues.join(", "); }
-  else { verdictClass = "bad"; verdictText = "Problemas: " + issues.join(", "); }
-  const verdictIcon = verdictClass === "ok" ? "●" : verdictClass === "mid" ? "◐" : "○";
+  let verdictClass, verdictHeadline, verdictIconName;
+  if (issues.length === 0) { verdictClass = "ok"; verdictHeadline = "Sistema saludable"; verdictIconName = "check"; }
+  else if (issues.length <= 2) { verdictClass = "mid"; verdictHeadline = "Requiere atención"; verdictIconName = "half"; }
+  else { verdictClass = "bad"; verdictHeadline = "Problemas"; verdictIconName = "x"; }
 
   document.getElementById("health").innerHTML = `
     <div class="health-card">
@@ -582,14 +670,18 @@ function renderHealth(d) {
     <div class="health-card" style="display:flex;flex-direction:column;justify-content:space-between">
       <div>
         <h3>Veredicto</h3>
-        <div class="health-verdict ${verdictClass}">${verdictIcon} ${verdictText}</div>
+        <div class="health-verdict ${verdictClass}">
+          ${icon(verdictIconName, { size: 16 })}
+          <span>${verdictHeadline}</span>
+        </div>
+        ${issues.length ? `<ul class="verdict-issues">${issues.map(i => `<li><span class="tag-icon" style="color:var(--${verdictClass === "bad" ? "red" : "yellow"})">${icon("alert", { size: 11 })}</span>${escapeHtml(i)}</li>`).join("")}</ul>` : ""}
       </div>
-      <div style="margin-top:16px;font-size:11px;color:var(--text-faint);line-height:1.6">
-        <div><span style="color:var(--green)">●</span> score alto = doc correcto en top-5</div>
-        <div><span style="color:var(--yellow)">●</span> score medio = relevante pero no ideal</div>
-        <div><span style="color:var(--red)">●</span> score bajo = retrieval no encontró nada útil</div>
-        <div style="margin-top:6px"><span style="color:var(--cyan)">●</span> gate = query rechazada por baja confianza</div>
-        <div><span style="color:var(--red)">●</span> bad citation = LLM inventó un path de nota</div>
+      <div class="legend">
+        <div><span class="legend-dot" style="background:var(--green)"></span>score alto = doc correcto en top-5</div>
+        <div><span class="legend-dot" style="background:var(--yellow)"></span>score medio = relevante pero no ideal</div>
+        <div><span class="legend-dot" style="background:var(--red)"></span>score bajo = retrieval no encontró nada útil</div>
+        <div style="margin-top:6px"><span class="legend-dot" style="background:var(--cyan)"></span>gate = query rechazada por baja confianza</div>
+        <div><span class="legend-dot" style="background:var(--red)"></span>bad citation = LLM inventó un path de nota</div>
       </div>
     </div>
   `;
@@ -608,17 +700,19 @@ function renderFeedbackPanel(fb) {
   const sat = fb.net_satisfaction;
   const satClass = sat == null ? "" : sat >= 50 ? "good" : sat >= 0 ? "warn" : "bad";
 
+  const upIcon = icon("up", { size: 11, color: "var(--green)" });
+  const downIcon = icon("down", { size: 11, color: "var(--red)" });
   const negPathsHtml = negPaths.length
     ? negPaths.map(p => `
         <div class="fb-row neg">
           <div>
             <div class="fb-path">${escapeHtml(shortenPath(p.path))}</div>
-            <div class="fb-meta">${p.pos_count > 0 ? `también ${p.pos_count} 👍` : "sólo señales negativas"}</div>
+            <div class="fb-meta">${p.pos_count > 0 ? `también ${p.pos_count} ${upIcon}` : "sólo señales negativas"}</div>
           </div>
-          <div class="fb-count">${p.count} 👎</div>
+          <div class="fb-count">${p.count} ${downIcon}</div>
         </div>
       `).join("")
-    : `<div class="fb-empty">sin notas con feedback negativo recurrente — ✅</div>`;
+    : `<div class="fb-empty"><span class="tag-icon" style="color:var(--green)">${icon("check", { size: 12 })}</span> sin notas con feedback negativo recurrente</div>`;
 
   const correctiveHtml = corrective.length
     ? corrective.map(c => `
@@ -647,9 +741,9 @@ function renderFeedbackPanel(fb) {
 
   el.innerHTML = `
     <div class="fb-cal">
-      <div class="fb-cal-item"><span class="fb-cal-label">Net satisfaction</span><span class="fb-cal-value ${satClass}">${sat == null ? "—" : sat + "%"}</span></div>
-      <div class="fb-cal-item"><span class="fb-cal-label">👍 (período)</span><span class="fb-cal-value good">${fb.recent_pos || 0}</span></div>
-      <div class="fb-cal-item"><span class="fb-cal-label">👎 (período)</span><span class="fb-cal-value bad">${fb.recent_neg || 0}</span></div>
+      <div class="fb-cal-item"><span class="fb-cal-label">Satisfacción neta</span><span class="fb-cal-value ${satClass}">${sat == null ? "—" : sat + "%"}</span></div>
+      <div class="fb-cal-item"><span class="fb-cal-label"><span class="tag-icon" style="color:var(--green)">${icon("up", { size: 10 })}</span>positivos (período)</span><span class="fb-cal-value good">${fb.recent_pos || 0}</span></div>
+      <div class="fb-cal-item"><span class="fb-cal-label"><span class="tag-icon" style="color:var(--red)">${icon("down", { size: 10 })}</span>negativos (período)</span><span class="fb-cal-value bad">${fb.recent_neg || 0}</span></div>
       <div class="fb-cal-item" title="Score alto pero feedback negativo → reranker o LLM mienten con confianza">
         <span class="fb-cal-label">Falsos positivos (gate)</span>
         <span class="fb-cal-value ${fb.false_confident > 3 ? 'bad' : fb.false_confident > 0 ? 'warn' : 'good'}">${fb.false_confident || 0}</span>
@@ -682,6 +776,29 @@ function renderFeedbackPanel(fb) {
   `;
 }
 
+// ── Icons (Lucide-style, 16x16) ───────────────────────────────────────────
+
+const ICONS = {
+  refresh:  '<path d="M21 12a9 9 0 0 0-15-6.7L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 15 6.7l3-2.7"/><path d="M21 21v-5h-5"/>',
+  warning:  '<path d="M10.3 3.3L1.7 18a2 2 0 0 0 1.7 3h17.2a2 2 0 0 0 1.7-3L13.7 3.3a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  ban:      '<circle cx="12" cy="12" r="10"/><path d="M4.9 4.9l14.2 14.2"/>',
+  inbox:    '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.5 5.5l-3 6.5V18a2 2 0 0 0 2 2h15a2 2 0 0 0 2-2v-6l-3-6.5a2 2 0 0 0-1.8-1.1H7.3a2 2 0 0 0-1.8 1.1z"/>',
+  link:     '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+  up:       '<path d="M7 10v12"/><path d="M15 5.9L14 9h5.5a2 2 0 0 1 2 2.3l-1.4 8a2 2 0 0 1-2 1.7H7V10l5-8c1.7.2 3 1.5 3 3.2z"/>',
+  down:     '<path d="M17 14V2"/><path d="M9 18.1L10 15H4.5a2 2 0 0 1-2-2.3l1.4-8a2 2 0 0 1 2-1.7H17v12l-5 8c-1.7-.2-3-1.5-3-3.2z"/>',
+  check:    '<circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/>',
+  half:     '<circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 0 0 20z"/>',
+  x:        '<circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/>',
+  dot:      '<circle cx="12" cy="12" r="4"/>',
+  alert:    '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+};
+
+function icon(name, { size = 14, color = "currentColor", cls = "" } = {}) {
+  const body = ICONS[name];
+  if (!body) return "";
+  return `<svg class="icon ${cls}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+}
+
 // ── Live ticker ───────────────────────────────────────────────────────────
 
 function pushTicker(kind, ev) {
@@ -707,15 +824,15 @@ function renderTicker() {
       let scoreCell = score != null ? score.toFixed(2) : "—";
       let latencyCell = ev.latency != null ? ev.latency + "s" : "—";
       if (ev.phase === "in_flight") {
-        tag = '<span style="color:var(--cyan);margin-right:4px">🔄</span>';
+        tag = `<span class="tag-icon" style="color:var(--cyan)">${icon("refresh", { size: 12, cls: "spin" })}</span>`;
         scoreCell = '<span style="color:var(--cyan)">…</span>';
         latencyCell = '<span style="color:var(--cyan)">en curso</span>';
       } else if (ev.phase === "error") {
-        tag = '<span style="color:var(--red);margin-right:4px">⚠️</span>';
+        tag = `<span class="tag-icon" style="color:var(--red)">${icon("warning", { size: 12 })}</span>`;
         scoreCell = '<span style="color:var(--red)">err</span>';
         latencyCell = `<span style="color:var(--red)" title="${escapeHtml(ev.error || "")}">${escapeHtml((ev.error || "fallo").slice(0, 40))}</span>`;
       } else if (ev.gated) {
-        tag = "🚫 ";
+        tag = `<span class="tag-icon" style="color:var(--text-faint)">${icon("ban", { size: 12 })}</span>`;
       }
       return `
         <div class="ticker-item">
@@ -728,13 +845,17 @@ function renderTicker() {
       `;
     }
     if (kind === "feedback") {
-      const tag = ev.rating === 1 ? "👍" : ev.rating === -1 ? "👎" : "·";
+      const isPos = ev.rating === 1;
+      const isNeg = ev.rating === -1;
+      const ic = isPos ? icon("up", { size: 12, color: "var(--green)" })
+                 : isNeg ? icon("down", { size: 12, color: "var(--red)" })
+                 : icon("dot", { size: 12, color: "var(--text-faint)" });
       return `
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source feedback">feedback</span>
-          <span class="t-q">${tag} ${escapeHtml(ev.q || ev.reason || "(sin texto)")}</span>
-          <span class="t-score">${tag}</span>
+          <span class="t-q"><span class="tag-icon">${ic}</span>${escapeHtml(ev.q || ev.reason || "(sin texto)")}</span>
+          <span class="t-score">${ic}</span>
           <span class="t-latency"></span>
         </div>
       `;
@@ -744,8 +865,8 @@ function renderTicker() {
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source" style="background:rgba(255,166,87,0.12);color:var(--orange)">ambient</span>
-          <span class="t-q" title="${escapeHtml(ev.path || "")}">📥 ${escapeHtml(shortenPath(ev.path || ""))}</span>
-          <span class="t-score" style="color:var(--orange)">+${ev.wikilinks_applied || 0}🔗</span>
+          <span class="t-q" title="${escapeHtml(ev.path || "")}"><span class="tag-icon" style="color:var(--orange)">${icon("inbox", { size: 12 })}</span>${escapeHtml(shortenPath(ev.path || ""))}</span>
+          <span class="t-score" style="color:var(--orange)">+${ev.wikilinks_applied || 0}${icon("link", { size: 10, color: "var(--orange)" })}</span>
           <span class="t-latency"></span>
         </div>
       `;
@@ -755,7 +876,7 @@ function renderTicker() {
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source" style="background:rgba(255,123,114,0.12);color:var(--red)">contradicción</span>
-          <span class="t-q">⚠️ ${escapeHtml(shortenPath(ev.path || ""))}</span>
+          <span class="t-q"><span class="tag-icon" style="color:var(--red)">${icon("warning", { size: 12 })}</span>${escapeHtml(shortenPath(ev.path || ""))}</span>
           <span class="t-score"></span>
           <span class="t-latency"></span>
         </div>

@@ -16349,6 +16349,63 @@ def serve(host: str, port: int):
             _cache_put(cache_key, payload)
         return payload
 
+    # ── /chat — LLM directo, sin retrieval ──────────────────────────────────
+    # Para mensajes conversacionales ("hola", "cómo estás") que NO quieren
+    # tocar el vault. Reusa el command-r warm del serve, sin pagar retrieve
+    # ni rerank (~3-5s típico para respuestas cortas vs 15-30s del /query).
+    # Mantiene continuidad por session_id. El bot WA rutea bare text acá y
+    # /search|/rag al /query.
+    _CHAT_SYSTEM = (
+        "Sos un asistente conversacional amigable en WhatsApp. Respondé "
+        "corto y directo — 1-3 líneas salvo que te pregunten algo técnico "
+        "donde haga falta más. No inventes información sobre las notas del "
+        "usuario; si te preguntan algo que requiere buscar en sus notas, "
+        "sugerile usar `/search <pregunta>`."
+    )
+
+    def _handle_chat(body: dict) -> dict:
+        message = body.get("message", "").strip()
+        if not message:
+            return {"error": "empty message"}
+        sid = body.get("session_id")
+        predict_cap = int(body.get("num_predict", 256))
+
+        sess = ensure_session(sid, mode="chat") if sid else None
+        history = session_history(sess) if sess else None
+
+        messages = [{"role": "system", "content": _CHAT_SYSTEM}]
+        if history:
+            messages += history
+        messages.append({"role": "user", "content": message})
+
+        t0 = time.perf_counter()
+        parts: list[str] = []
+        try:
+            for chunk in ollama.chat(
+                model=resolve_chat_model(), messages=messages,
+                options={**CHAT_OPTIONS, "num_predict": predict_cap},
+                stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+            ):
+                parts.append(chunk.message.content)
+        except Exception as exc:
+            return {"error": f"llm failed: {exc}"}
+        t_gen = time.perf_counter() - t0
+        answer = "".join(parts).strip()
+
+        if sess:
+            append_turn(sess, {"q": message, "a": answer[:500]})
+            save_session(sess)
+
+        try:
+            log_query_event({
+                "cmd": "serve.chat", "q": message[:200],
+                "session": sid, "t_gen": round(t_gen, 2),
+                "answered": True,
+            })
+        except Exception:
+            pass
+        return {"answer": answer, "t_gen": round(t_gen, 3)}
+
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/health":
@@ -16357,14 +16414,15 @@ def serve(host: str, port: int):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            if self.path != "/query":
+            if self.path not in ("/query", "/chat"):
                 self._json(404, {"error": "not found"})
                 return
             body: dict = {}
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = _json.loads(self.rfile.read(length)) if length else {}
-                result = _handle_query(body)
+                handler = _handle_chat if self.path == "/chat" else _handle_query
+                result = handler(body)
                 self._json(200, result)
             except Exception as exc:
                 # Log so the dashboard surfaces failures instead of silently
@@ -16373,7 +16431,7 @@ def serve(host: str, port: int):
                 try:
                     log_query_event({
                         "cmd": "serve.error",
-                        "q": str(body.get("question") if isinstance(body, dict) else "")[:200],
+                        "q": str(body.get("question") or body.get("message") if isinstance(body, dict) else "")[:200],
                         "session": body.get("session_id") if isinstance(body, dict) else None,
                         "error": str(exc)[:300],
                     })

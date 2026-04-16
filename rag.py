@@ -4554,7 +4554,10 @@ def retrieve(
     # 1. Reformulate vs history (precise mode)
     search_query = question
     if precise and (history or summary):
-        search_query = reformulate_query(question, history or [], summary=summary)
+        try:
+            search_query = reformulate_query(question, history or [], summary=summary)
+        except Exception:
+            search_query = question
 
     # 2. Auto-filter: sniff tag/folder/date from the query against index vocabulary
     filters_applied: dict = {}
@@ -8811,7 +8814,7 @@ def log(n: int, low_confidence: bool, with_feedback: bool):
         except Exception:
             continue
     if low_confidence:
-        entries = [e for e in entries if (e.get("top_score") or 0) < 0]
+        entries = [e for e in entries if (e.get("top_score") or 0) < CONFIDENCE_RERANK_MIN]
 
     # Pre-load feedback so we can annotate (and filter if --feedback).
     fb_by_turn: dict[str, int] = {}
@@ -10178,100 +10181,95 @@ def file_cmd(path: str | None, folder: str, one: bool, limit: int,
         ))
 
     try:
-        _write_lock = vault_write_lock("file --apply", blocking=False)
-        _write_lock.__enter__()
+        with vault_write_lock("file --apply", blocking=False):
+            batch_entries: list[dict] = []
+            batch_path = _open_filing_batch()
+            for i, (src_path, pr) in enumerate(proposals, 1):
+                _render_filing_proposal(i, len(proposals), pr, plain)
+                if "error" in pr:
+                    _filing_log_proposal(pr, decision="error")
+                    continue
+
+                target = pr["folder"]
+                if not target:
+                    # Sin propuesta de folder → solo edit o skip.
+                    choice = click.prompt("   [e]dit target / [s]kip / [q]uit",
+                                          default="s", show_default=False).strip().lower()
+                else:
+                    choice = click.prompt(
+                        "   [y]es · [n]o · [e]dit · [s]kip · [q]uit",
+                        default="y", show_default=False,
+                    ).strip().lower()
+
+                if choice == "q":
+                    _filing_log_proposal(pr, decision="quit")
+                    click.echo("Quit — guardando batch con lo aplicado hasta ahora.") if plain else console.print("[dim]Quit — guardando batch con lo aplicado hasta ahora.[/dim]")
+                    break
+                if choice in ("s", "skip"):
+                    _filing_log_proposal(pr, decision="skip")
+                    continue
+                if choice in ("n", "no"):
+                    _filing_log_proposal(pr, decision="reject")
+                    continue
+                if choice in ("e", "edit"):
+                    new_target = click.prompt("   Nuevo folder (vault-relative, ej 02-Areas/Salud)").strip()
+                    if not new_target:
+                        _filing_log_proposal(pr, decision="skip")
+                        continue
+                    target = new_target
+                    decision = "edit"
+                else:
+                    # 'y' o default
+                    if not target:
+                        _filing_log_proposal(pr, decision="skip")
+                        continue
+                    decision = "accept"
+
+                # Ejecutar move + upward-link + reindex.
+                try:
+                    entry = _apply_filing_move(col, pr["path"], target, pr.get("upward_title") or "")
+                except FileExistsError as ex:
+                    msg = f"   [destino ya existe: {ex}] skip"
+                    click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+                    _filing_log_proposal(pr, decision="error")
+                    continue
+                except Exception as ex:
+                    msg = f"   [error: {ex}] skip"
+                    click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+                    _filing_log_proposal(pr, decision="error")
+                    continue
+
+                batch_entries.append(entry)
+                _append_filing_batch(batch_path, entry)
+                logged = dict(pr)
+                logged["applied_to"] = entry["dst"]
+                _filing_log_proposal(logged, decision=decision)
+                if plain:
+                    click.echo(f"   ✓ {entry['src']} -> {entry['dst']}")
+                else:
+                    console.print(f"   [green]✓[/green] movido a [cyan]{entry['dst']}[/cyan]")
+
+            if not batch_entries:
+                batch_path.unlink(missing_ok=True)
+                batch_path = None
+
+            if plain:
+                click.echo(f"\n{len(batch_entries)} aplicada(s).")
+                if batch_path:
+                    click.echo(f"batch: {batch_path}  (rag file --undo para revertir)")
+            else:
+                console.print()
+                if batch_entries:
+                    console.print(
+                        f"[green]✓ {len(batch_entries)} aplicada(s).[/green] "
+                        f"[dim]batch: {batch_path.name if batch_path else '(ninguno)'}[/dim]"
+                    )
+                    console.print("[dim]`rag file --undo` revierte este batch.[/dim]")
+                else:
+                    console.print("[yellow]Nada aplicado.[/yellow]")
     except RuntimeError as ex:
         msg = f"{ex}  — probá otra vez cuando termine el otro proceso."
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
-        return
-
-    batch_entries: list[dict] = []
-    batch_path = _open_filing_batch()
-    for i, (src_path, pr) in enumerate(proposals, 1):
-        _render_filing_proposal(i, len(proposals), pr, plain)
-        if "error" in pr:
-            _filing_log_proposal(pr, decision="error")
-            continue
-
-        target = pr["folder"]
-        if not target:
-            # Sin propuesta de folder → solo edit o skip.
-            choice = click.prompt("   [e]dit target / [s]kip / [q]uit",
-                                  default="s", show_default=False).strip().lower()
-        else:
-            choice = click.prompt(
-                "   [y]es · [n]o · [e]dit · [s]kip · [q]uit",
-                default="y", show_default=False,
-            ).strip().lower()
-
-        if choice == "q":
-            _filing_log_proposal(pr, decision="quit")
-            click.echo("Quit — guardando batch con lo aplicado hasta ahora.") if plain else console.print("[dim]Quit — guardando batch con lo aplicado hasta ahora.[/dim]")
-            break
-        if choice in ("s", "skip"):
-            _filing_log_proposal(pr, decision="skip")
-            continue
-        if choice in ("n", "no"):
-            _filing_log_proposal(pr, decision="reject")
-            continue
-        if choice in ("e", "edit"):
-            new_target = click.prompt("   Nuevo folder (vault-relative, ej 02-Areas/Salud)").strip()
-            if not new_target:
-                _filing_log_proposal(pr, decision="skip")
-                continue
-            target = new_target
-            decision = "edit"
-        else:
-            # 'y' o default
-            if not target:
-                _filing_log_proposal(pr, decision="skip")
-                continue
-            decision = "accept"
-
-        # Ejecutar move + upward-link + reindex.
-        try:
-            entry = _apply_filing_move(col, pr["path"], target, pr.get("upward_title") or "")
-        except FileExistsError as ex:
-            msg = f"   [destino ya existe: {ex}] skip"
-            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
-            _filing_log_proposal(pr, decision="error")
-            continue
-        except Exception as ex:
-            msg = f"   [error: {ex}] skip"
-            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
-            _filing_log_proposal(pr, decision="error")
-            continue
-
-        batch_entries.append(entry)
-        _append_filing_batch(batch_path, entry)
-        logged = dict(pr)
-        logged["applied_to"] = entry["dst"]
-        _filing_log_proposal(logged, decision=decision)
-        if plain:
-            click.echo(f"   ✓ {entry['src']} -> {entry['dst']}")
-        else:
-            console.print(f"   [green]✓[/green] movido a [cyan]{entry['dst']}[/cyan]")
-
-    if not batch_entries:
-        batch_path.unlink(missing_ok=True)
-        batch_path = None
-
-    if plain:
-        click.echo(f"\n{len(batch_entries)} aplicada(s).")
-        if batch_path:
-            click.echo(f"batch: {batch_path}  (rag file --undo para revertir)")
-    else:
-        console.print()
-        if batch_entries:
-            console.print(
-                f"[green]✓ {len(batch_entries)} aplicada(s).[/green] "
-                f"[dim]batch: {batch_path.name if batch_path else '(ninguno)'}[/dim]"
-            )
-            console.print("[dim]`rag file --undo` revierte este batch.[/dim]")
-        else:
-            console.print("[yellow]Nada aplicado.[/yellow]")
-
-    _write_lock.__exit__(None, None, None)
 
 
 @cli.command()
@@ -12687,7 +12685,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     # Push to WhatsApp if ambient is enabled — landing the brief in the chat
     # at 7:00 means the user wakes up to the brief instead of having to open
     # Obsidian to find it.
-    if _brief_push_to_whatsapp(f"Morning {date_label}", str(rel), narrative):
+    if _brief_push_to_whatsapp(f"Morning {date_label}", str(rel), brief_body):
         console.print("[dim]→ enviado a WhatsApp[/dim]")
 
 
@@ -14641,7 +14639,7 @@ def ambient_log(n: int):
         applied = e.get("wikilinks_applied", 0)
         dupes = len(e.get("dupes") or [])
         rel = e.get("related_count", 0)
-        sent = "📨" if e.get("telegram_sent") else ("🔇" if e.get("quiet") else "✗")
+        sent = "📨" if e.get("whatsapp_sent") else ("🔇" if e.get("quiet") else "✗")
         console.print(
             f"[dim]{ts}[/dim] {sent} "
             f"[cyan]{e.get('path', '—')}[/cyan] "

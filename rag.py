@@ -9971,12 +9971,104 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
     return out
 
 
+def _behavior_augmented_cases(days: int = 14) -> list[dict]:
+    """Mine behavior.jsonl for implicit feedback — forms gold (query, path) tuples.
+
+    Positive events (open/positive_implicit/save/kept) with a query field
+    become positive cases (weight=0.5). Negative events (negative_implicit/
+    deleted) with a query field become hard-negative cases. Conflicting (q,path)
+    pairs where both pos and neg are observed are dropped entirely. Events
+    without a 'query' field (e.g. brief events) are skipped. Returns [] if
+    behavior.jsonl is missing or empty.
+    """
+    if not BEHAVIOR_LOG_PATH.is_file():
+        return []
+    cutoff = time.time() - days * 86400
+    _POSITIVE = {"open", "positive_implicit", "save", "kept"}
+    _NEGATIVE = {"negative_implicit", "deleted"}
+    pos: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
+    neg: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
+    try:
+        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        # Filter by age — use "ts" field (ISO string) or skip if missing
+        ts_raw = ev.get("ts", "")
+        if ts_raw:
+            try:
+                ev_ts = datetime.fromisoformat(ts_raw).timestamp()
+                if ev_ts < cutoff:
+                    continue
+            except Exception:
+                pass
+        query = (ev.get("query") or "").strip()
+        if not query:
+            continue
+        path = (ev.get("path") or "").strip()
+        if not path:
+            continue
+        event = ev.get("event", "")
+        norm_q = " ".join(query.lower().split())
+        key = (norm_q, path)
+        if event in _POSITIVE:
+            pos[key] = event
+        elif event in _NEGATIVE:
+            neg[key] = event
+    # Drop conflicting (q, path) pairs
+    conflict = set(pos.keys()) & set(neg.keys())
+    out: list[dict] = []
+    for key, source in pos.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "expected": [path],
+            "kind_hint": "behavior_pos",
+            "source": source,
+            "weight": 0.5,
+        })
+    for key, source in neg.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "anti_expected": [path],
+            "kind_hint": "behavior_neg",
+            "source": source,
+            "weight": 0.5,
+        })
+    return out
+
+
 def _score_case(feats: list[dict], expected: set[str],
-                weights: "RankerWeights", k: int) -> tuple[bool, float, float]:
-    """Return (hit, reciprocal_rank, recall) for one case under `weights`."""
+                weights: "RankerWeights", k: int,
+                anti_expected: set[str] | None = None) -> tuple[bool, float, float]:
+    """Return (hit, reciprocal_rank, recall) for one case under `weights`.
+
+    For positive cases (anti_expected=None): hit iff expected ∩ top-k ≠ ∅.
+    For negative cases (anti_expected non-empty, expected empty): hit iff
+    anti_expected ∩ top-k = ∅ (the ranker correctly pushes the bad result out).
+    """
     top = apply_weighted_scores(feats, weights, k)
     paths = [t["path"] for t in top]
     retrieved = set(paths)
+    # Negative case: hit = bad path NOT in top-k (ranker correctly avoids it)
+    if anti_expected:
+        hit = not bool(anti_expected & retrieved)
+        # RR/recall not meaningful for negative cases — return 1.0 when hit
+        rr = 1.0 if hit else 0.0
+        recall = 1.0 if hit else 0.0
+        return hit, rr, recall
     hit = bool(expected & retrieved)
     rr = 0.0
     for rank, p in enumerate(paths, start=1):
@@ -10048,6 +10140,89 @@ def _log_tune_event(event: dict) -> None:
         pass
 
 
+def _backup_ranker_config() -> Path | None:
+    """Copy current ranker.json to a timestamped backup, keeping only 3 newest.
+
+    Returns the backup Path on success, None if ranker.json doesn't exist yet.
+    Prunes backups older than the 3 most recent after writing.
+    """
+    if not RANKER_CONFIG_PATH.is_file():
+        return None
+    ts = int(time.time())
+    backup = RANKER_CONFIG_PATH.parent / f"ranker.{ts}.json"
+    try:
+        import shutil
+        shutil.copy2(RANKER_CONFIG_PATH, backup)
+        # Prune: keep only 3 most recent backups
+        backups = sorted(
+            RANKER_CONFIG_PATH.parent.glob("ranker.*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in backups[3:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+        return backup
+    except Exception:
+        return None
+
+
+def _restore_ranker_backup(backup: Path) -> bool:
+    """Restore a backup file to ranker.json atomically. Returns True on success."""
+    try:
+        import shutil
+        tmp = RANKER_CONFIG_PATH.with_suffix(".json.tmp")
+        shutil.copy2(backup, tmp)
+        tmp.replace(RANKER_CONFIG_PATH)
+        return True
+    except Exception:
+        return False
+
+
+# CI gate thresholds — derived from post-title-in-rerank floor (2026-04-17).
+# Bootstrap 95% CI lower bounds: singles n=42, chains n=33 turns.
+# Singles floor: hit@5 90.48% CI lower bound = 76.19%
+# Chains floor:  hit@5 80.00% CI lower bound = 63.64%
+GATE_SINGLES_HIT5_MIN = 0.7619
+GATE_CHAINS_HIT5_MIN = 0.6364
+
+
+def _run_eval_gate() -> tuple[float | None, float | None, str]:
+    """Run `rag eval` in a subprocess and parse hit@5 for singles + chains.
+
+    Returns (singles_hit5, chains_hit5, raw_output). On timeout or parse error
+    one or both values may be None (treat as regression). Scrubs RAG_EXPLORE
+    from subprocess env so the eval run is production-equivalent.
+    """
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "RAG_EXPLORE"}
+    assert "RAG_EXPLORE" not in env, "RAG_EXPLORE must not be set during gate eval"
+    try:
+        result = subprocess.run(
+            ["rag", "eval"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, None, "[timeout after 600s]"
+    except Exception as exc:
+        return None, None, f"[subprocess error: {exc}]"
+    out = result.stdout + result.stderr
+    singles_hit5 = None
+    chains_hit5 = None
+    m = re.search(r"Singles:\s*hit@\d+\s+(\d+(?:\.\d+)?)%", out)
+    if m:
+        singles_hit5 = float(m.group(1)) / 100.0
+    m = re.search(r"Chains:\s*hit@\d+\s+(\d+(?:\.\d+)?)%", out)
+    if m:
+        chains_hit5 = float(m.group(1)) / 100.0
+    return singles_hit5, chains_hit5, out
+
+
 @cli.command()
 @click.option("--file", "queries_file", default="queries.yaml",
               help="YAML golden (default: queries.yaml)")
@@ -10064,8 +10239,15 @@ def _log_tune_event(event: dict) -> None:
               help="Persistir winner a ~/.local/share/obsidian-rag/ranker.json")
 @click.option("--yes", is_flag=True,
               help="Equivalente a --apply, sin prompt (para launchd)")
+@click.option("--online", is_flag=True,
+              help="Agregar behavior.jsonl como casos de tuning implícitos")
+@click.option("--days", default=14, show_default=True,
+              help="Ventana de días para eventos en behavior.jsonl (solo con --online)")
+@click.option("--rollback", is_flag=True,
+              help="Restaurar el backup más reciente de ranker.json sin tunear")
 def tune(queries_file: str, k: int, samples: int, seed: int,
-         no_chains: bool, no_feedback: bool, apply: bool, yes: bool):
+         no_chains: bool, no_feedback: bool, apply: bool, yes: bool,
+         online: bool, days: int, rollback: bool):
     """Auto-calibrar pesos del ranker sobre un golden set.
 
     Toma queries.yaml + feedback.jsonl (corrective_path events), corre
@@ -10074,6 +10256,9 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     Reporta top-5 y el baseline (weights actuales). Con --apply persiste
     el winner a RANKER_CONFIG_PATH. Log a tune.jsonl.
 
+    Con --online incluye behavior.jsonl como casos de tuning implícitos (weight=0.5).
+    Con --rollback restaura el backup más reciente sin tunear.
+
     Aproximación en chains: la reformulación entre turnos usa los pesos
     por defecto para anclar contexto — el barrido optimiza sólo la ordenación
     final por turno. Para obtener métricas end-to-end con el winner,
@@ -10081,6 +10266,43 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     """
     import pathlib
     import random
+    # ── Rollback subcommand ──────────────────────────────────────────────────
+    if rollback:
+        backups = sorted(
+            RANKER_CONFIG_PATH.parent.glob("ranker.*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not backups:
+            console.print("[yellow]No hay backups de ranker.json disponibles.[/yellow]")
+            return
+        # Show available backups
+        console.print("[bold]Backups disponibles (más reciente primero):[/bold]")
+        current_w = RankerWeights.load()
+        for bp in backups:
+            try:
+                bdata = json.loads(bp.read_text(encoding="utf-8"))
+                bw = RankerWeights.from_dict(bdata.get("weights", {}) if isinstance(bdata, dict) else {})
+                delta_str = ", ".join(
+                    f"{k}: {bw.as_dict()[k] - current_w.as_dict()[k]:+.4f}"
+                    for k in sorted(bw.as_dict())
+                    if abs(bw.as_dict()[k] - current_w.as_dict()[k]) > 1e-6
+                ) or "(sin diferencia)"
+            except Exception:
+                delta_str = "(no se pudo parsear)"
+            mtime_str = datetime.fromtimestamp(bp.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            console.print(f"  [cyan]{bp.name}[/cyan]  {mtime_str}  Δ {delta_str}")
+        # Restore most recent
+        newest = backups[0]
+        if _restore_ranker_backup(newest):
+            _invalidate_ranker_weights()
+            console.print(
+                f"[green]✓[/green] restored ranker.json from [cyan]{newest.name}[/cyan]"
+            )
+        else:
+            console.print(f"[red]Error al restaurar {newest.name}[/red]")
+        return
+
     path = pathlib.Path(queries_file)
     if not path.is_absolute():
         path = pathlib.Path.cwd() / queries_file
@@ -10091,21 +10313,33 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     queries = data.get("queries") or []
     chains = [] if no_chains else (data.get("chains") or [])
     aug = [] if no_feedback else _feedback_augmented_cases()
+    # Online mode: augment with implicit behavior signal
+    behavior_cases: list[dict] = []
+    if online:
+        behavior_cases = _behavior_augmented_cases(days=days)
+        console.print(
+            f"[dim]Behavior cases: {len(behavior_cases)} "
+            f"(pos={sum(1 for c in behavior_cases if 'expected' in c)}, "
+            f"neg={sum(1 for c in behavior_cases if 'anti_expected' in c)}, "
+            f"últimos {days}d)[/dim]"
+        )
 
     col = get_db()
     if col.count() == 0:
         console.print("[red]Índice vacío. Ejecutá: rag index[/red]")
         return
 
-    cases: list[dict] = []  # [{kind, id, q, expected, feats}]
-    total = len(queries) + len(aug) + sum(len(c.get("turns") or []) for c in chains)
+    cases: list[dict] = []  # [{kind, id, q, expected, feats, anti_expected?}]
+    total = len(queries) + len(aug) + len(behavior_cases) + sum(len(c.get("turns") or []) for c in chains)
     if total == 0:
         console.print("[yellow]Sin cases golden — queries.yaml vacío y sin feedback.[/yellow]")
         return
 
-    # Singles + feedback augmentation — both evaluated identically.
+    # Singles + feedback augmentation + behavior — positive cases.
     single_items = list(queries) + aug
+    # Behavior cases are handled separately since some are negative.
     with console.status(f"Extrayendo features ({len(single_items)} singles + "
+                        f"{len(behavior_cases)} behavior + "
                         f"{sum(len(c.get('turns') or []) for c in chains)} turns)…"):
         for entry in single_items:
             q = entry["question"] if "question" in entry else entry.get("q", "")
@@ -10118,6 +10352,24 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
                 "id": entry.get("source", "golden"),
                 "q": q,
                 "expected": expected,
+                "anti_expected": set(),
+                "feats": feats,
+            })
+
+        # Behavior cases — positive and negative, weight=0.5.
+        for entry in behavior_cases:
+            q = entry.get("question", "")
+            if not q:
+                continue
+            is_pos = "expected" in entry
+            feats = collect_ranker_features(col, q, k_pool=RERANK_POOL_MAX)
+            cases.append({
+                "kind": "behavior_pos" if is_pos else "behavior_neg",
+                "id": entry.get("source", "behavior"),
+                "q": q,
+                "expected": set(entry.get("expected") or []),
+                "anti_expected": set(entry.get("anti_expected") or []),
+                "weight": entry.get("weight", 0.5),
                 "feats": feats,
             })
 
@@ -10146,6 +10398,7 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
                         "q": q,
                         "search_q": search_q,
                         "expected": expected,
+                        "anti_expected": set(),
                         "feats": feats,
                     })
                 # Anchor next turn with top-under-defaults.
@@ -10163,7 +10416,8 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     # Pre-compute per-case scoring closures — keeps the inner loop allocation-free.
     for c in cases:
         feats = c["feats"]; expected = c["expected"]
-        c["metrics"] = lambda w, f=feats, e=expected, kk=k: _score_case(f, e, w, kk)
+        anti = c.get("anti_expected") or set()
+        c["metrics"] = lambda w, f=feats, e=expected, kk=k, a=anti: _score_case(f, e, w, kk, a)
 
     # Baseline: current persisted weights (or defaults if none saved).
     baseline_w = RankerWeights.load()
@@ -10251,7 +10505,9 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     console.print(
         f"[dim]Cases: {len(cases)} "
         f"(singles={sum(1 for c in cases if c['kind']=='single')}, "
-        f"chain_turns={sum(1 for c in cases if c['kind']=='chain')})[/dim]"
+        f"chain_turns={sum(1 for c in cases if c['kind']=='chain')}, "
+        f"behavior_pos={sum(1 for c in cases if c['kind']=='behavior_pos')}, "
+        f"behavior_neg={sum(1 for c in cases if c['kind']=='behavior_neg')})[/dim]"
     )
     if delta > 1e-6:
         console.print(
@@ -10267,9 +10523,11 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
 
     _log_tune_event({
         "cmd": "tune",
+        "online": online,
         "samples": samples,
         "seed": seed,
         "n_cases": len(cases),
+        "n_behavior": len(behavior_cases),
         "baseline": {"weights": baseline_w.as_dict(), **baseline_agg,
                      "objective": baseline_obj},
         "best": {"weights": best_w.as_dict(), **best_agg,
@@ -10289,12 +10547,16 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
         )
         return
 
+    # ── Version backup before writing ────────────────────────────────────────
+    backup_path = _backup_ranker_config()
+
     best_w.save(metadata={
-        "source": "rag tune",
+        "source": "rag tune" + (" --online" if online else ""),
         "baseline": baseline_w.as_dict(),
         "metrics": best_agg,
         "delta": delta,
         "n_cases": len(cases),
+        "n_behavior": len(behavior_cases),
         "samples": samples,
         "seed": seed,
     })
@@ -10302,6 +10564,60 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     console.print(
         f"[green]✓[/green] Pesos persistidos en [cyan]{RANKER_CONFIG_PATH}[/cyan]."
     )
+    if backup_path:
+        console.print(f"[dim]Backup: {backup_path.name}[/dim]")
+
+    # ── CI gate: only when --online --apply are both set ─────────────────────
+    if online:
+        console.print("[dim]Corriendo rag eval para validar CI gate…[/dim]")
+        s_hit5, c_hit5, eval_out = _run_eval_gate()
+        gate_ok = True
+        reason = ""
+        if s_hit5 is None:
+            gate_ok = False
+            reason = "No se pudo parsear singles hit@5 (timeout o error)"
+        elif s_hit5 < GATE_SINGLES_HIT5_MIN:
+            gate_ok = False
+            reason = (
+                f"Singles hit@5 {s_hit5:.2%} < floor {GATE_SINGLES_HIT5_MIN:.2%}"
+            )
+        if gate_ok and c_hit5 is None:
+            gate_ok = False
+            reason = "No se pudo parsear chains hit@5 (timeout o error)"
+        elif gate_ok and c_hit5 is not None and c_hit5 < GATE_CHAINS_HIT5_MIN:
+            gate_ok = False
+            reason = (
+                f"Chains hit@5 {c_hit5:.2%} < floor {GATE_CHAINS_HIT5_MIN:.2%}"
+            )
+        if not gate_ok:
+            console.print(
+                f"[red]✗ CI gate falló: {reason}. Auto-rollback…[/red]"
+            )
+            if backup_path and backup_path.is_file():
+                if _restore_ranker_backup(backup_path):
+                    _invalidate_ranker_weights()
+                    console.print(
+                        f"[yellow]Ranker restaurado desde {backup_path.name}[/yellow]"
+                    )
+                else:
+                    console.print("[red]Error al restaurar backup[/red]")
+            _log_tune_event({
+                "cmd": "tune_gate_regression",
+                "reason": reason,
+                "singles_hit5": s_hit5,
+                "chains_hit5": c_hit5,
+                "gate_singles_min": GATE_SINGLES_HIT5_MIN,
+                "gate_chains_min": GATE_CHAINS_HIT5_MIN,
+                "auto_rolled_back": backup_path is not None,
+            })
+            import sys
+            sys.exit(1)
+        else:
+            console.print(
+                f"[green]✓[/green] CI gate pasado "
+                f"(singles {s_hit5:.2%} ≥ {GATE_SINGLES_HIT5_MIN:.2%}, "
+                f"chains {c_hit5:.2%} ≥ {GATE_CHAINS_HIT5_MIN:.2%})"
+            )
 
 
 @cli.command()

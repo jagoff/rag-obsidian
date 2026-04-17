@@ -372,6 +372,7 @@ def _resolve_vault_path() -> Path:
 VAULT_PATH = _resolve_vault_path()
 DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
+EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 
 
 def log_query_event(event: dict) -> None:
@@ -640,14 +641,20 @@ HELPER_OPTIONS = {
 }
 
 # Keep models resident in VRAM between queries — avoids 2-3s cold reload.
-# Ollama accepts -1 (forever, as int) or a duration string like "30m". Default
-# to forever for the local-first use case; user can tune via env var.
+# Ollama accepts -1 (forever, as int) or a duration string like "30m".
+# Default changed from -1 (forever) to "20m" on 2026-04-17 after the Mac
+# started freezing: -1 pins command-r (~19 GB) permanently as wired memory,
+# and on a 36 GB unified-memory Mac that blocks the kernel from swapping
+# anything, so any app that grows triggers a beachball. "20m" lets the
+# daemon reclaim VRAM when the user walks away from chat; the first query
+# after the idle window pays a 2-3s cold load but the rest of macOS stays
+# responsive. Override with OLLAMA_KEEP_ALIVE env var per deploy.
 def _parse_keep_alive(val: str) -> int | str:
     try:
         return int(val)
     except ValueError:
         return val
-OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "-1"))
+OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "20m"))
 
 
 _CHAT_MODEL_RESOLVED: str | None = None
@@ -748,13 +755,39 @@ def _save_context_cache() -> None:
     _context_cache_dirty = False
 
 
+_SUMMARY_CLIENT: ollama.Client | None = None
+
+
+def _summary_client() -> ollama.Client:
+    """Dedicated ollama client with a hard timeout for context-summary calls.
+
+    The module-level `ollama.chat` uses the default httpx client which
+    has no read timeout — a stuck runner (seen in the wild when indexing
+    large vaults: one degenerate note hangs the runner for ~an hour) will
+    block the whole indexing batch on `recvfrom`. A 45s ceiling is well
+    above the p99 call time (~1s on qwen2.5:3b for a 2k-char prompt) but
+    bounds the worst case so indexing keeps moving.
+    """
+    global _SUMMARY_CLIENT
+    if _SUMMARY_CLIENT is None:
+        _SUMMARY_CLIENT = ollama.Client(timeout=45.0)
+    return _SUMMARY_CLIENT
+
+
 def _generate_context_summary(text: str, title: str, folder: str) -> str:
     """Generate a 1-2 sentence context summary for a note using the helper model.
 
     The summary captures the document-level topic so that individual chunks
     inherit global context when embedded. Kept short (~30-50 tokens) to avoid
     dominating the chunk embedding.
+
+    Bypass: set OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY=1 to skip this step
+    entirely (e.g. during bulk indexing of a large new vault where the
+    incremental quality bump is not worth the wall-clock cost — the
+    watch service will fill summaries in later as files change).
     """
+    if os.environ.get("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY"):
+        return ""
     # Truncate to avoid blowing helper context window (1024 tokens ≈ 4k chars)
     body = text[:2000]
     prompt = (
@@ -764,7 +797,7 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
         "de qué trata esta nota. Sin preámbulos, sin disculpas, sin explicaciones."
     )
     try:
-        resp = ollama.chat(
+        resp = _summary_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 40},
@@ -2075,7 +2108,26 @@ def embed(texts: list[str]) -> list[list[float]]:
     if not missing_idx:
         return cached  # type: ignore[return-value]
     missing_texts = [texts[i] for i in missing_idx]
-    resp = ollama.embed(model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE)
+    # Retry on transient Ollama hiccups (ConnectionError). The launchd
+    # KeepAlive daemon reboots ollama within 1-3s when it OOMs under
+    # pressure (happens when `rag index` runs against a large vault
+    # while the web server's command-r runner is also resident).
+    # Without retries, a single dropped connection kills the whole
+    # indexing batch — we've seen `rag index` die after ~5 notes.
+    _last_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            resp = ollama.embed(
+                model=EMBED_MODEL, input=missing_texts, keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+            break
+        except ConnectionError as exc:
+            _last_exc = exc
+            if attempt == 3:
+                raise
+            time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
+    else:
+        raise _last_exc  # pragma: no cover
     fresh = resp.embeddings
     with _embed_cache_lock:
         for t, v in zip(missing_texts, fresh):
@@ -2251,11 +2303,19 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
 
 
 _reranker = None
+_reranker_last_use = 0.0  # monotonic timestamp of most-recent predict()
 
 
 _reranker_lock = threading.Lock()
 _warmup_started = False
 _warmup_lock = threading.Lock()
+
+# Reranker idle-unload threshold. bge-reranker-v2-m3 in MPS holds ~2-3 GB
+# of unified memory in fp32. On a 36 GB Mac with command-r also loaded,
+# every GB matters. After this many seconds of no predict() calls, the
+# next touch_reranker() call unloads it; first subsequent query pays
+# ~2-3s to reinit. Override with RAG_RERANKER_IDLE_TTL env var (seconds).
+_RERANKER_IDLE_TTL = float(os.environ.get("RAG_RERANKER_IDLE_TTL", "900"))
 
 
 def get_reranker():
@@ -2267,8 +2327,11 @@ def get_reranker():
     ~0.001, verified empirically on 2026-04-13). Keep fp32.
 
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
+    Also records last-use timestamp so `maybe_unload_reranker()` can evict
+    it from MPS after a configurable idle window.
     """
-    global _reranker
+    global _reranker, _reranker_last_use
+    _reranker_last_use = time.time()
     if _reranker is not None:
         return _reranker
     with _reranker_lock:
@@ -2283,6 +2346,36 @@ def get_reranker():
                 device = "cpu"
             _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
     return _reranker
+
+
+def maybe_unload_reranker() -> bool:
+    """Drop the reranker from MPS if it hasn't been used in
+    `_RERANKER_IDLE_TTL` seconds. Call from a background sweeper.
+    Returns True if an unload happened.
+    """
+    global _reranker, _reranker_last_use
+    if _reranker is None:
+        return False
+    idle = time.time() - _reranker_last_use
+    if idle < _RERANKER_IDLE_TTL:
+        return False
+    with _reranker_lock:
+        if _reranker is None:
+            return False
+        try:
+            import gc
+            del _reranker
+            _reranker = None
+            try:
+                import torch
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
+        except Exception:
+            pass
+    return True
 
 
 def warmup_async() -> None:
@@ -2687,9 +2780,21 @@ def infer_filters(
         leaf = f.split("/")[-1].lower()
         if len(leaf) < 5:
             continue
-        if f" {leaf} " in f" {low} ":
-            folder = f
-            break
+        if f" {leaf} " not in f" {low} ":
+            continue
+        # Skip compound-noun matches for short single-token leaves.
+        # E.g. "claude peers" mentions the leaf "claude" but the adjacency to
+        # "peers" signals a brand/phrase, not a folder filter intent.
+        # Bug (2026-04-16): "cmd para enviar mensajes entre claude peers"
+        # locked folder=03-Resources/Claude and hid SKILL.md in 04-Archive.
+        leaf_tokens = re.split(r"[-_\s]+", leaf)
+        if len(leaf_tokens) == 1 and len(leaf) <= 6:
+            esc = re.escape(leaf)
+            adj = rf"(\b[a-záéíóúñ]{{3,}}\s+{esc}\b|\b{esc}\s+[a-záéíóúñ]{{3,}})"
+            if re.search(adj, low):
+                continue
+        folder = f
+        break
     return folder, tag
 
 
@@ -2787,6 +2892,34 @@ SYSTEM_RULES_CHAT = (
     "Si no está: 'No tengo esa información en tus notas.' y cortá. "
     "Citá notas como [Título](ruta) usando la ruta exacta del chunk. "
     "Directo, viñetas cortas, sin intro.\n"
+)
+
+# Web chat variant — slightly more room than CLI strict but still source-bound.
+# Rule 4 allows 2-4 sentences of contextual explanation so answers are useful
+# without requiring the user to click sources. Identical source/citation/ext rules.
+SYSTEM_RULES_WEB = (
+    "Eres un asistente de consulta sobre las notas personales de Obsidian del "
+    "usuario. NO sos un modelo de conocimiento general.\n\n"
+    "REGLA 1 — FUENTE ÚNICA: respondé usando SOLO información literalmente "
+    "presente en el CONTEXTO. Si la pregunta no está cubierta, respondé "
+    "exactamente: 'No tengo esa información en tus notas.' y cortá.\n\n"
+    "REGLA 2 — CITAR RUTA: cada vez que menciones una nota por nombre, "
+    "acompañala de su ruta. La ruta figura literal en `[ruta: <VALOR>]` al "
+    "inicio de cada chunk — usá el VALOR exacto, sin modificarlo. "
+    "Formato: [Título](VALOR). "
+    "Ejemplo: si un chunk abre con `[ruta: 02-Areas/Salud/postura.md]`, "
+    "escribís [postura](02-Areas/Salud/postura.md). "
+    "PROHIBIDO: escribir placeholders como 'ruta/relativa.md', 'path.md', "
+    "'nombre.md' u otra etiqueta genérica — siempre la ruta real. "
+    "Citá al menos la primera vez que nombres la nota.\n\n"
+    "REGLA 3 — MARCAR EXTERNO: si agregás texto que NO sale textualmente del "
+    "contexto (intros, parafraseos, biografía, conectores, opinión, conocimiento "
+    "general), envolvelo en `<<ext>>...<</ext>>`. Fuera de esos marcadores TODO "
+    "debe ser verificable palabra por palabra en el contexto.\n\n"
+    "REGLA 4 — FORMATO: respondé con 2-4 oraciones o una lista corta de viñetas. "
+    "Incluí el dato clave (comando, hecho, valor) en la primera oración, seguido "
+    "de una frase de contexto mínimo (qué hace, dónde vive) para que la respuesta "
+    "sea útil sin necesidad de abrir las fuentes. Sin intro vacía.\n"
 )
 
 # Coach mode: las notas del usuario son ESPEJO, no autoridad. El valor está
@@ -4994,6 +5127,7 @@ def retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     variants: list[str] | None = None,
+    rerank_pool: int | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -5124,7 +5258,10 @@ def retrieve(
     #     domina la latencia de la query (~50ms/par en MPS fp32). Un pool
     #     de 40 mantiene recall efectivo (top-5 rarísimo que esté fuera
     #     del top-40 RRF) y ahorra 1-2s por query.
-    merged_ordered = merged_ordered[:RERANK_POOL_MAX]
+    #     `rerank_pool` override permite reducir el pool para superficies
+    #     latency-sensitive (web) sin afectar el comportamiento del CLI.
+    _effective_pool = rerank_pool if rerank_pool is not None else RERANK_POOL_MAX
+    merged_ordered = merged_ordered[:_effective_pool]
 
     # 5. Fetch candidates
     fetched = col.get(ids=merged_ordered, include=["documents", "metadatas"])
@@ -5322,6 +5459,7 @@ def deep_retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     variants: list[str] | None = None,
+    rerank_pool: int | None = None,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -5334,6 +5472,7 @@ def deep_retrieve(
         col, question, k, folder, history=history, tag=tag, precise=precise,
         multi_query=multi_query, auto_filter=auto_filter,
         date_range=date_range, summary=summary, variants=variants,
+        rerank_pool=rerank_pool,
     )
     if not result["docs"]:
         return result
@@ -5356,6 +5495,7 @@ def deep_retrieve(
         sub_result = retrieve(
             col, sub_query, k, folder, tag=tag, precise=False,
             multi_query=False, auto_filter=False, date_range=date_range,
+            rerank_pool=rerank_pool,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -5625,6 +5765,7 @@ def multi_retrieve(
     date_range: tuple[float, float] | None = None,
     summary: str | None = None,
     deep: bool = False,
+    rerank_pool: int | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -5653,6 +5794,7 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
+            rerank_pool=rerank_pool,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -5670,6 +5812,7 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
+            rerank_pool=rerank_pool,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -6619,14 +6762,19 @@ def _ambient_hook(
 
 def _index_single_file(
     col: chromadb.Collection, path: Path, skip_contradict: bool = False,
+    vault_path: Path | None = None,
 ) -> str:
     """(Re)index one markdown file. Returns one of:
     'skipped' (unchanged), 'indexed' (new/updated), 'removed' (file gone),
     'empty' (file exists but produced no chunks).
     Invalidates the corpus cache when changes occur.
+
+    `vault_path` lets callers (multi-vault `watch`) target a non-default
+    vault without swapping the `VAULT_PATH` global. Defaults to `VAULT_PATH`.
     """
+    vault = vault_path or VAULT_PATH
     try:
-        doc_id_prefix = str(path.relative_to(VAULT_PATH))
+        doc_id_prefix = str(path.relative_to(vault))
     except ValueError:
         return "skipped"  # outside vault
     if is_excluded(doc_id_prefix):
@@ -6650,7 +6798,7 @@ def _index_single_file(
     if existing_hash == h:
         return "skipped"
 
-    folder = str(path.relative_to(VAULT_PATH).parent)
+    folder = str(path.relative_to(vault).parent)
     fm = parse_frontmatter(raw)
     tags = [str(t) for t in (fm.get("tags") or []) if t]
     outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
@@ -6911,26 +7059,87 @@ def index(reset: bool, no_contradict: bool):
 
 @cli.command()
 @click.option("--debounce", default=3.0, help="Segundos a esperar antes de reindexar un cambio (default: 3)")
-def watch(debounce: float):
-    """Observa el vault y reindexa incrementalmente al guardar notas."""
+@click.option("--all-vaults", "all_vaults", is_flag=True,
+              help="Observa todos los vaults registrados en ~/.config/obsidian-rag/vaults.yaml "
+                   "en un único proceso (evita duplicar imports ML por vault).")
+def watch(debounce: float, all_vaults: bool):
+    """Observa el/los vault(s) y reindexa incrementalmente al guardar notas.
+
+    Sin `--all-vaults`, observa el vault activo (legacy: un servicio launchd
+    por vault). Con `--all-vaults`, un único proceso observa todos los vaults
+    registrados — ahorra ~3-4 GB de swap por vault adicional porque chromadb
+    + transformers se importan una sola vez.
+    """
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
-    col = get_db()
-    pending: set[Path] = set()
-    lock = threading.Lock()
+    # Exclude high-churn folders from real-time reindexing. The WhatsApp
+    # vault-sync writes new messages to `03-Resources/WhatsApp/<chat>/YYYY-MM.md`
+    # every few seconds; without this, one file can re-fire the handler
+    # 50+ times per minute and each reindex hits ollama twice (context
+    # summary via qwen2.5:3b + contradiction detector), saturating the
+    # daemon and making /api/chat queue for minutes. WA files are still
+    # picked up by periodic `rag index` (cron or manual). Override with
+    # OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS="a,b,c" (relative to vault root).
+    _exclude_env = os.environ.get(
+        "OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS",
+        "03-Resources/WhatsApp",
+    )
+    exclude_folders = tuple(
+        f.strip().rstrip("/") for f in _exclude_env.split(",") if f.strip()
+    )
+    if exclude_folders:
+        console.print(f"[dim]watch excluye folders: {', '.join(exclude_folders)}[/dim]")
+
+    if all_vaults:
+        vaults = resolve_vault_paths(["all"])
+        if not vaults:
+            # Fallback: no registry → single active vault
+            vaults = resolve_vault_paths(None)
+    else:
+        vaults = resolve_vault_paths(None)
+
+    # Per-vault state: chromadb collection + pending set. Shared lock so
+    # handlers can write without per-vault contention.
+    vault_state: list[dict] = []
+    pending_lock = threading.Lock()
+    for name, vpath in vaults:
+        try:
+            col = get_db_for(vpath)
+        except Exception as e:
+            console.print(f"[red]vault {name}: no se pudo abrir colección[/red] ({e})")
+            continue
+        vault_state.append({
+            "name": name,
+            "path": vpath.resolve(),
+            "col": col,
+            "pending": set(),
+        })
+
+    if not vault_state:
+        console.print("[red]No hay vaults observables.[/red]")
+        return
 
     class Handler(FileSystemEventHandler):
+        def __init__(self, vstate: dict):
+            self.vstate = vstate
+
         def _queue(self, raw_path: str) -> None:
             if not raw_path.endswith(".md"):
                 return
             p = Path(raw_path)
             try:
-                p.resolve().relative_to(VAULT_PATH.resolve())
+                rel = p.resolve().relative_to(self.vstate["path"])
             except ValueError:
                 return
-            with lock:
-                pending.add(p)
+            # Drop files under an excluded folder — see module-level comment
+            # on `exclude_folders` for rationale.
+            rel_str = str(rel)
+            for folder in exclude_folders:
+                if rel_str.startswith(folder + "/") or rel_str == folder:
+                    return
+            with pending_lock:
+                self.vstate["pending"].add(p)
 
         def on_modified(self, event):
             if not event.is_directory:
@@ -6947,34 +7156,36 @@ def watch(debounce: float):
                 self._queue(event.dest_path)
 
     observer = Observer()
-    observer.schedule(Handler(), str(VAULT_PATH), recursive=True)
+    for vs in vault_state:
+        observer.schedule(Handler(vs), str(vs["path"]), recursive=True)
+        console.print(f"[cyan]Watching[/cyan] [{vs['name']}] {vs['path']}")
     observer.start()
-
-    console.print(f"[cyan]Watching[/cyan] {VAULT_PATH}")
     console.print(f"[dim]debounce={debounce}s · Ctrl+C para salir[/dim]")
 
     try:
         while True:
             time.sleep(debounce)
-            if not pending:
-                continue
-            with lock:
-                batch = list(pending)
-                pending.clear()
-            for p in batch:
-                try:
-                    status = _index_single_file(col, p)
-                except Exception as e:
-                    console.print(f"  [red]error[/red] {p.name}: {e}")
-                    continue
-                if status == "skipped":
-                    continue
-                try:
-                    rel = p.relative_to(VAULT_PATH)
-                except ValueError:
-                    rel = p
-                color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
-                console.print(f"  [{color}]{status:>8}[/{color}] {rel}")
+            for vs in vault_state:
+                with pending_lock:
+                    if not vs["pending"]:
+                        continue
+                    batch = list(vs["pending"])
+                    vs["pending"].clear()
+                for p in batch:
+                    try:
+                        status = _index_single_file(vs["col"], p, vault_path=vs["path"])
+                    except Exception as e:
+                        console.print(f"  [red]error[/red] [{vs['name']}] {p.name}: {e}")
+                        continue
+                    if status == "skipped":
+                        continue
+                    try:
+                        rel = p.relative_to(vs["path"])
+                    except ValueError:
+                        rel = p
+                    color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
+                    tag = f"[dim][{vs['name']}][/dim] " if len(vault_state) > 1 else ""
+                    console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
     except KeyboardInterrupt:
         pass
     finally:
@@ -8287,6 +8498,12 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
 
+    # Trend-log snapshot: captured below inside the singles/chains blocks, then
+    # appended to eval.jsonl once at the end so /api/home can render a mini
+    # trend line without re-running the evaluator.
+    singles_snap: dict | None = None
+    chains_snap: dict | None = None
+
     def _score(expected_set: set[str], seen_paths: list[str]) -> tuple[bool, float, float]:
         retrieved_set = set(seen_paths)
         hit = bool(expected_set & retrieved_set)
@@ -8355,6 +8572,11 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             f"MRR {mrr:.3f}  ·  recall@{k} {recall_at_k:.2%}  ·  "
             f"[dim]n={n}[/dim]"
         )
+        singles_snap = {
+            "hit5": round(hit_at_k, 4),
+            "mrr": round(mrr, 4),
+            "n": n,
+        }
 
     # ── Multi-turn chains ───────────────────────────────────────────────
     # Turn 0 runs as-is. For later turns we explicitly call reformulate_query
@@ -8443,6 +8665,29 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             f"chain_success {chain_success:.2%}  ·  "
             f"[dim]turns={nt}, chains={nc}[/dim]"
         )
+        chains_snap = {
+            "hit5": round(chain_hit, 4),
+            "mrr": round(chain_mrr, 4),
+            "chain_success": round(chain_success, 4),
+            "turns": nt,
+            "chains": nc,
+        }
+
+    # Trend log — one line per `rag eval` run. Silent-fail so an unwritable
+    # data dir never breaks the CLI. `/api/home._fetch_eval_trend` tails the
+    # last N entries to surface drift against the CLAUDE.md baseline.
+    if singles_snap or chains_snap:
+        try:
+            EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            entry = {"ts": datetime.now().isoformat(timespec="seconds")}
+            if singles_snap:
+                entry["singles"] = singles_snap
+            if chains_snap:
+                entry["chains"] = chains_snap
+            with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 
 # ── RANKER AUTO-TUNING (rag tune) ────────────────────────────────────────────
@@ -12922,6 +13167,161 @@ def _fetch_drive_evidence(now: datetime, days: int = 5, max_items: int = 5) -> d
     return {"files": files_out, "window_days": days}
 
 
+# ── Chrome bookmarks used (History join Bookmarks) ───────────────────────────
+# Bookmarks live in a JSON tree, visits live in SQLite; join by URL to surface
+# which *saved* pages the user reached for recently. Distinct signal from raw
+# top-visited (ambient browsing) because bookmarks encode intent.
+def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
+    """Top-n bookmarks whose URL was visited in the last `hours`.
+
+    Pipeline:
+    1. Flatten `Bookmarks` JSON (recursive across `roots.*`) into a URL→meta map.
+    2. Copy `History` SQLite (WAL-safe) and query visits within the window.
+    3. Inner-join by URL, sort by `last_visit` desc, truncate to n.
+
+    Chrome's `visit_time` is microseconds since 1601-01-01 UTC — same epoch as
+    `Bookmarks.date_added`, which is why the conversion constant is shared
+    with `_fetch_chrome_top_week`. Silent-fail if either file is missing.
+    """
+    import shutil
+    import sqlite3
+    import tempfile
+
+    bm_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Bookmarks"
+    hist_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    if not bm_path.is_file() or not hist_path.is_file():
+        return []
+
+    try:
+        tree = json.loads(bm_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    bookmarks: dict[str, dict] = {}
+
+    def _walk(node: dict, folder: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "url":
+            url = node.get("url") or ""
+            if url and url not in bookmarks:
+                bookmarks[url] = {
+                    "name": node.get("name") or "",
+                    "folder": folder.strip("/"),
+                }
+            return
+        name = node.get("name") or ""
+        sub_folder = f"{folder}/{name}" if name else folder
+        for child in node.get("children") or []:
+            _walk(child, sub_folder)
+
+    for root in (tree.get("roots") or {}).values():
+        _walk(root, "")
+
+    if not bookmarks:
+        return []
+
+    CHROME_EPOCH_OFFSET = 11_644_473_600
+    now_ts = time.time()
+    window_chrome = int((now_ts - hours * 3600 + CHROME_EPOCH_OFFSET) * 1_000_000)
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        shutil.copyfile(hist_path, tmp.name)
+        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT u.url AS url,
+                       COUNT(v.id) AS visit_count,
+                       MAX(v.visit_time) AS last_visit
+                FROM urls u
+                JOIN visits v ON v.url = u.id
+                WHERE v.visit_time >= ?
+                GROUP BY u.url
+                ORDER BY last_visit DESC
+                """,
+                (window_chrome,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        url = r["url"]
+        meta = bookmarks.get(url)
+        if not meta:
+            continue
+        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+        out.append({
+            "name": meta["name"],
+            "url": url,
+            "folder": meta["folder"],
+            "visit_count": int(r["visit_count"]),
+            "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
+# ── Per-vault activity (multi-vault aware, never mixes data) ─────────────────
+def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
+    """Per-vault recent-notes snapshot — iterates every registered vault.
+
+    Returns `{vault_name: [{path, title, modified, snippet}, ...]}` sorted
+    by mtime desc. Honors `is_excluded` (drops `.trash`, `.obsidian`, etc.)
+    and skips MORNING_FOLDER so the section doesn't re-surface the brief
+    itself. Silent-fail per vault — a single unreadable path doesn't tank
+    the others.
+
+    Designed for dashboards that need to keep personal/work vaults visibly
+    separated (user has explicit `vaults.json` config with both).
+    """
+    from datetime import timedelta as _td
+    vaults = resolve_vault_paths(["all"])
+    if not vaults:
+        return {}
+
+    cutoff = datetime.now() - _td(hours=hours)
+    out: dict[str, list[dict]] = {}
+    for name, vault in vaults:
+        if not vault.is_dir():
+            continue
+        items: list[dict] = []
+        try:
+            for p in vault.rglob("*.md"):
+                try:
+                    rel = str(p.relative_to(vault))
+                except ValueError:
+                    continue
+                if is_excluded(rel):
+                    continue
+                if rel.startswith(f"{MORNING_FOLDER}/"):
+                    continue
+                try:
+                    mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    continue
+                try:
+                    raw = p.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    raw = ""
+                items.append({
+                    "path": rel,
+                    "title": p.stem,
+                    "modified": mtime.isoformat(timespec="seconds"),
+                    "snippet": clean_md(raw)[:140].strip() if raw else "",
+                })
+        except OSError:
+            continue
+        items.sort(key=lambda r: r["modified"], reverse=True)
+        out[name] = items[:n_per_vault]
+    return out
+
+
 # ── WhatsApp unread (bridge SQLite) ─────────────────────────────────────────
 WHATSAPP_DB_PATH = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
 WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
@@ -13433,6 +13833,205 @@ def _fetch_system_activity(
     return out
 
 
+# ── Screen Time (knowledgeC.db) ─────────────────────────────────────────
+# macOS logs foreground app usage at `/app/usage` in CoreDuet's knowledge
+# store. Read-only access works without Full Disk Access as long as the
+# file is readable. Values are per foreground session; summing gives
+# active-use seconds (not wall time). Categories are heuristic — bundle
+# ID prefix match. Unknown apps render as bundle ID stem so new apps
+# surface instead of hiding in "otros".
+
+SCREENTIME_DB = Path.home() / "Library/Application Support/Knowledge/knowledgeC.db"
+# 978307200 = seconds between 1970-01-01 and 2001-01-01 (Cocoa epoch).
+_SCREENTIME_COCOA_OFFSET = 978307200
+
+_SCREENTIME_APP_LABELS = {
+    "com.exafunction.windsurf": "Windsurf",
+    "com.googlecode.iterm2": "iTerm",
+    "com.apple.Terminal": "Terminal",
+    "com.microsoft.VSCode": "VS Code",
+    "com.sublimetext.4": "Sublime",
+    "com.jetbrains.pycharm": "PyCharm",
+    "md.obsidian": "Obsidian",
+    "com.google.Chrome": "Chrome",
+    "com.apple.Safari": "Safari",
+    "company.thebrowser.Browser": "Arc",
+    "com.brave.Browser": "Brave",
+    "net.whatsapp.WhatsApp": "WhatsApp",
+    "com.apple.MobileSMS": "Messages",
+    "com.tinyspeck.slackmacgap": "Slack",
+    "com.hnc.Discord": "Discord",
+    "ru.keepcoder.Telegram": "Telegram",
+    "com.apple.mail": "Mail",
+    "com.apple.iCal": "Calendar",
+    "com.flexibits.fantastical2.mac": "Fantastical",
+    "com.apple.reminders": "Reminders",
+    "com.apple.Notes": "Notes",
+    "com.apple.finder": "Finder",
+    "com.apple.Photos": "Photos",
+    "com.apple.Music": "Music",
+    "com.spotify.client": "Spotify",
+    "com.apple.QuickTimePlayerX": "QuickTime",
+    "com.apple.systempreferences": "System Settings",
+    "com.apple.ActivityMonitor": "Activity Monitor",
+    "com.figma.Desktop": "Figma",
+    "com.linear": "Linear",
+    "notion.id": "Notion",
+    "com.apple.podcasts": "Podcasts",
+}
+
+_SCREENTIME_CATEGORIES = {
+    "code": {
+        "com.exafunction.windsurf", "com.googlecode.iterm2", "com.apple.Terminal",
+        "com.microsoft.VSCode", "com.sublimetext.4", "com.jetbrains.pycharm",
+        "com.apple.dt.Xcode", "com.todesktop.230313mzl4w4u92",  # Cursor
+    },
+    "notas": {"md.obsidian", "com.apple.Notes", "notion.id"},
+    "comms": {
+        "net.whatsapp.WhatsApp", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap",
+        "com.hnc.Discord", "ru.keepcoder.Telegram", "com.apple.mail", "com.apple.FaceTime",
+    },
+    "browser": {
+        "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser",
+        "com.brave.Browser", "org.mozilla.firefox",
+    },
+    "media": {
+        "com.apple.Music", "com.spotify.client", "com.apple.QuickTimePlayerX",
+        "com.apple.podcasts", "com.apple.TV",
+    },
+}
+
+
+def _screentime_app_label(bundle: str) -> str:
+    if bundle in _SCREENTIME_APP_LABELS:
+        return _SCREENTIME_APP_LABELS[bundle]
+    # Fallback: last dotted segment, title-cased ("com.foo.BarApp" → "BarApp")
+    return bundle.rsplit(".", 1)[-1] if "." in bundle else bundle
+
+
+def _screentime_category(bundle: str) -> str:
+    for cat, bundles in _SCREENTIME_CATEGORIES.items():
+        if bundle in bundles:
+            return cat
+    return "otros"
+
+
+def _collect_screentime(
+    start: datetime, end: datetime,
+    db_path: Path | None = None,
+) -> dict:
+    """Per-app foreground usage for [start, end). Returns:
+
+    ```
+    {
+        "available": bool,
+        "total_secs": int,
+        "top_apps": [{"bundle": str, "label": str, "secs": int}],
+        "categories": {"code": int, "comms": int, ...},
+    }
+    ```
+
+    Silent-degrades to `available=False` if the db is missing or locked.
+    Only sessions >= 5s counted (filters spurious re-focuses). Unknown
+    bundles surface via their stem so new apps aren't swept into "otros".
+    """
+    import sqlite3
+
+    path = db_path or SCREENTIME_DB
+    empty = {"available": False, "total_secs": 0, "top_apps": [], "categories": {}}
+    if not path.is_file():
+        return empty
+
+    start_ts = start.timestamp() - _SCREENTIME_COCOA_OFFSET
+    end_ts = end.timestamp() - _SCREENTIME_COCOA_OFFSET
+    try:
+        # immutable=1 lets us read even if macOS holds a write lock.
+        uri = f"file:{path}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            rows = conn.execute(
+                """
+                SELECT ZVALUESTRING, SUM(ZENDDATE - ZSTARTDATE) AS secs
+                FROM ZOBJECT
+                WHERE ZSTREAMNAME = '/app/usage'
+                  AND ZSTARTDATE >= ?
+                  AND ZSTARTDATE < ?
+                  AND (ZENDDATE - ZSTARTDATE) >= 5
+                GROUP BY ZVALUESTRING
+                ORDER BY secs DESC
+                """,
+                (start_ts, end_ts),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return empty
+
+    top: list[dict] = []
+    cats: dict[str, int] = {}
+    total = 0
+    for bundle, secs in rows:
+        if not bundle or secs is None:
+            continue
+        s = int(round(float(secs)))
+        if s <= 0:
+            continue
+        total += s
+        top.append({
+            "bundle": bundle,
+            "label": _screentime_app_label(bundle),
+            "secs": s,
+        })
+        cat = _screentime_category(bundle)
+        cats[cat] = cats.get(cat, 0) + s
+
+    return {
+        "available": True,
+        "total_secs": total,
+        "top_apps": top[:10],
+        "categories": cats,
+    }
+
+
+def _fmt_hm(secs: int) -> str:
+    """Format seconds as "Hh MMm" / "MMm" / "SSs" for brief rendering."""
+    if secs >= 3600:
+        h, r = divmod(secs, 3600)
+        m = r // 60
+        return f"{h}h {m:02d}m" if m else f"{h}h"
+    if secs >= 60:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def _render_screentime_section(st: dict) -> str:
+    """Deterministic "where time went" section. Empty if db unavailable
+    or total < 5 min (likely sleeping Mac or brand-new setup).
+    """
+    if not st or not st.get("available"):
+        return ""
+    total = int(st.get("total_secs") or 0)
+    if total < 300:
+        return ""
+
+    lines = [f"## 🖥 Pantalla · {_fmt_hm(total)} activo"]
+    top = (st.get("top_apps") or [])[:5]
+    if top:
+        parts = [f"{a['label']} {_fmt_hm(a['secs'])}" for a in top]
+        lines.append("- " + " · ".join(parts))
+    cats = st.get("categories") or {}
+    if cats:
+        order = ["code", "notas", "comms", "browser", "media", "otros"]
+        pieces = []
+        for k in order:
+            v = cats.get(k, 0)
+            if v >= 60:
+                pieces.append(f"{k} {_fmt_hm(v)}")
+        if pieces:
+            lines.append("- " + " · ".join(pieces))
+    return "\n".join(lines)
+
+
 def _render_system_activity_section(act: dict) -> str:
     """Bullets determinísticos de "lo que el sistema hizo solo".
 
@@ -13619,10 +14218,13 @@ def _collect_morning_evidence(
         "mail_unread": _fetch_mail_unread(),
         "gmail": _fetch_gmail_evidence(now),
         "drive": _fetch_drive_evidence(now, days=5),
+        "bookmarks_used": _fetch_chrome_bookmarks_used(hours=48, n=5),
+        "vault_activity": _fetch_vault_activity(hours=48, n_per_vault=5),
         "whatsapp_unread": _fetch_whatsapp_unread(),
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
         "system_activity": _fetch_system_activity(now, lookback_hours=lookback_hours),
+        "screentime": _collect_screentime(start, now),
     }
     # Dedup: if a vault todo matches an Apple Reminder (Jaccard ≥ 0.6 on
     # normalized tokens), drop the todo — the reminder is the actionable
@@ -13900,6 +14502,54 @@ def _render_morning_drive_section(ev: dict) -> str:
     return f"## 📁 Drive (últimos {window}d)\n" + "\n".join(bullets)
 
 
+def _render_morning_bookmarks_section(ev: dict) -> str:
+    """Deterministic render of 🔖 Bookmarks — saved pages the user actually
+    reached for in the last 48h. Returns "" if none. Code-owned so the
+    list survives noisy mornings and doesn't get hallucinated.
+    """
+    bm = ev.get("bookmarks_used") or []
+    if not bm:
+        return ""
+    bullets: list[str] = []
+    for b in bm[:5]:
+        name = (b.get("name") or "").strip() or b.get("url") or "(sin título)"
+        url = b.get("url") or ""
+        folder = (b.get("folder") or "").strip()
+        count = int(b.get("visit_count") or 0)
+        line = f"- **{name}** — [{url}]({url})"
+        extras: list[str] = []
+        if folder:
+            extras.append(folder)
+        if count:
+            extras.append(f"{count}×")
+        if extras:
+            line += " · " + " · ".join(extras)
+        bullets.append(line)
+    return "## 🔖 Bookmarks (últimas 48h)\n" + "\n".join(bullets)
+
+
+def _render_morning_vaults_section(ev: dict) -> str:
+    """Deterministic render of 📝 Vaults — per-vault recent activity, never
+    mixed. One subsection per registered vault ("home", "work", …) so
+    personal/work stay visibly separated. Returns "" if *all* vaults
+    are empty in the 48h window.
+    """
+    va = ev.get("vault_activity") or {}
+    if not va or not any(v for v in va.values()):
+        return ""
+    parts: list[str] = ["## 📝 Vaults (últimas 48h)"]
+    for name in sorted(va.keys()):
+        items = va.get(name) or []
+        if not items:
+            continue
+        parts.append(f"### {name} ({len(items)})")
+        for n in items[:5]:
+            title = (n.get("title") or "").strip() or "(sin título)"
+            path = n.get("path") or ""
+            parts.append(f"- [[{title}]] ([{path}]({path}))")
+    return "\n".join(parts)
+
+
 # ── Dedup todos-del-vault vs reminders-de-Apple ─────────────────────────────
 # Si tengo una nota con `todo: "comprar pan"` Y un Apple Reminder "comprar
 # pan", el brief los listaba duplicados — ruido. Drop el del vault (el
@@ -14072,6 +14722,27 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
                 f"- {f.get('mime_label','archivo')}: {f.get('name','')} "
                 f"(hace {f.get('days_ago',0)}d)"
             )
+    bm_used = ev.get("bookmarks_used") or []
+    if bm_used:
+        parts.append(
+            f"\nBookmarks usados últimas 48h — {len(bm_used)} "
+            "(NO re-imprimas, el código arma la sección 🔖 Bookmarks):"
+        )
+        for b in bm_used[:5]:
+            parts.append(
+                f"- {b.get('name','')} ({b.get('folder','')})"
+            )
+    va = ev.get("vault_activity") or {}
+    active_vaults = {k: v for k, v in va.items() if v}
+    if active_vaults:
+        parts.append(
+            "\nActividad por vault últimas 48h — personal/laboral separados "
+            "(NO re-imprimas, el código arma la sección 📝 Vaults):"
+        )
+        for name in sorted(active_vaults.keys()):
+            items = active_vaults[name]
+            titles = ", ".join((n.get("title") or "")[:40] for n in items[:3])
+            parts.append(f"- {name} ({len(items)} notas): {titles}")
     # Agenda (calendar/reminders/weather) ya la arma el código — igual la
     # mencionamos como contexto para que el LLM pueda cruzar referencias
     # ("hoy tenés reunión con X → priorizá la nota [[X]]").
@@ -14151,15 +14822,17 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
 def _assemble_morning_brief(
     date_label: str, agenda_md: str, parts: dict, continuity: str,
     system_md: str = "", gmail_md: str = "", drive_md: str = "",
+    bookmarks_md: str = "", vaults_md: str = "", screentime_md: str = "",
 ) -> str:
     """Put the brief together skipping empty sections. Headers are fixed;
     content comes from `parts` (LLM JSON), `agenda_md` + `system_md` +
-    `gmail_md` + `drive_md` (deterministic code-owned blocks).
+    `gmail_md` + `drive_md` + `bookmarks_md` + `vaults_md` (deterministic
+    code-owned blocks).
 
-    Layout: `📬 Ayer → 📅 Agenda → 📧 Gmail → 📁 Drive → ⚙️ Sistema → 🎯 Foco →
-    🗂 Pendientes → ⚠ Atender`. Empty blocks are dropped; `system_md`,
-    `gmail_md`, and `drive_md` ("" when nothing to show) preserve legacy
-    behavior for callers that don't pass them.
+    Layout: `📬 Ayer → 📅 Agenda → 📧 Gmail → 📁 Drive → 🔖 Bookmarks →
+    📝 Vaults → ⚙️ Sistema → 🎯 Foco → 🗂 Pendientes → ⚠ Atender`. Empty
+    blocks drop out. All `*_md` args default to "" so legacy callers
+    without the new sections still work.
     """
     sections: list[str] = []
     y = (parts.get("yesterday") or "").strip()
@@ -14171,6 +14844,12 @@ def _assemble_morning_brief(
         sections.append(gmail_md)
     if drive_md:
         sections.append(drive_md)
+    if bookmarks_md:
+        sections.append(bookmarks_md)
+    if vaults_md:
+        sections.append(vaults_md)
+    if screentime_md:
+        sections.append(screentime_md)
     if system_md:
         sections.append(system_md)
     focus = parts.get("focus") or []
@@ -14254,7 +14933,9 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         f"{len(ev.get('recent_queries', []))} queries · "
         f"{(ev.get('gmail') or {}).get('unread_count', 0)} gmail-unread · "
         f"{len((ev.get('gmail') or {}).get('awaiting_reply') or [])} await-reply · "
-        f"{len((ev.get('drive') or {}).get('files') or [])} drive-5d"
+        f"{len((ev.get('drive') or {}).get('files') or [])} drive-5d · "
+        f"{len(ev.get('bookmarks_used') or [])} bookmarks-48h · "
+        f"{sum(len(v) for v in (ev.get('vault_activity') or {}).values())} vault-48h"
         + (" · 🌧" if ev.get("weather_rain") else "")
     )
 
@@ -14266,6 +14947,9 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     system_md = _render_system_activity_section(ev.get("system_activity") or {})
     gmail_md = _render_morning_gmail_section(ev)
     drive_md = _render_morning_drive_section(ev)
+    bookmarks_md = _render_morning_bookmarks_section(ev)
+    vaults_md = _render_morning_vaults_section(ev)
+    screentime_md = _render_screentime_section(ev.get("screentime") or {})
     structured_prompt = _render_morning_structured_prompt(date_label, ev)
     with console.status("[dim]Armando brief…[/dim]", spinner="dots"):
         parts = _generate_morning_json(structured_prompt)
@@ -14274,6 +14958,8 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         brief_body = _assemble_morning_brief(
             date_label, agenda_md, parts, continuity,
             system_md=system_md, gmail_md=gmail_md, drive_md=drive_md,
+            bookmarks_md=bookmarks_md, vaults_md=vaults_md,
+            screentime_md=screentime_md,
         )
     else:
         # Legacy fallback — one-shot text generation with the old monolithic
@@ -14472,8 +15158,11 @@ def _collect_today_evidence(
 def _render_today_prompt(date_label: str, ev: dict) -> str:
     parts = [
         f"Generás un evening brief para el {date_label} (cierre del día), en "
-        "1ra persona, en español rioplatense, tono calmo y honesto. Mirás "
-        "hacia atrás — NO proyectes foco de mañana como agenda; solo semillas.",
+        "2da persona singular (tuteo rioplatense: 'recibiste', 'estuviste', "
+        "'tocaste', 'tenés'). NUNCA uses 1ra persona ('recibí', 'estuve', "
+        "'tengo'): le hablás al usuario sobre su propio día, no sos el usuario. "
+        "Tono calmo y honesto. Mirás hacia atrás — NO proyectes foco de "
+        "mañana como agenda; solo semillas.",
         "",
         "Contexto real del vault (NO inventes lo que no esté acá):",
         "",

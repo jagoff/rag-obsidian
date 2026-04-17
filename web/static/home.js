@@ -11,12 +11,45 @@ const els = {
   narrative: document.getElementById("narrative-wrap"),
   panels: document.getElementById("panels"),
   error: document.getElementById("error-wrap"),
-  btnReload: document.getElementById("btn-reload"),
-  btnRegen: document.getElementById("btn-regenerate"),
+  btnRefresh: document.getElementById("btn-refresh"),
+  progress: document.getElementById("progress"),
 };
 
 const REFRESH_MS = 60_000;
+const MIN_RELOAD_GAP_MS = 5_000;  // ignore back-to-back triggers (visibility + interval)
+const WARMING_POLL_MS = 3_000;    // fast poll while server cache is cold
 let refreshTimer = null;
+let firstLoad = true;
+let lastLoadStarted = 0;
+let inflight = false;
+let warmingPoll = null;
+
+// Skeleton panels painted on first load so the page has structure from
+// the first paint — avoids a ~4.5s blank gap while /api/home fans out.
+// Subsequent refreshes keep the prior data on screen until the new
+// payload arrives (no flicker).
+const SKELETON_PANELS = [
+  "gmail", "reminders", "calendar", "whatsapp · sin responder",
+  "notas tocadas", "inbox hoy", "open loops",
+  "low-conf", "contradicciones", "weather",
+  "autoridad", "retrieval health", "loops aging", "web 7d",
+  "drive 48h",
+];
+
+function renderSkeletons() {
+  const html = SKELETON_PANELS.map((label) => `
+    <section class="panel loading" aria-busy="true">
+      <div class="head">
+        <h3>${label}</h3>
+        <span class="count">…</span>
+      </div>
+      <div class="skel-line w80"></div>
+      <div class="skel-line w60"></div>
+      <div class="skel-line w40"></div>
+    </section>
+  `).join("");
+  els.panels.innerHTML = html;
+}
 
 function esc(s) {
   return String(s || "").replace(/[&<>"']/g, (c) =>
@@ -63,7 +96,9 @@ function renderReminders(items) {
   if (!items || !items.length) return panel("reminders", "reminders", 0, "");
   const lis = items.slice(0, 8).map((r) => {
     const bucket = r.bucket || "undated";
-    const due = r.due_display ? `<span class="meta">${esc(r.due_display)}</span>` : "";
+    // backend emits `due` (ISO) or `due_display` (preformatted); fall back to ISO
+    const dueText = r.due_display || (r.due ? fmtDate(r.due) + (r.due.includes("T") ? " " + fmtTime(r.due) : "") : "");
+    const due = dueText ? `<span class="meta">${esc(dueText)}</span>` : "";
     const list = r.list ? `<span class="meta">${esc(r.list)}</span>` : "";
     return `<li>
       <span class="bucket ${esc(bucket)}">${esc(bucket)}</span>
@@ -105,13 +140,18 @@ function renderGmail(g) {
   if (total === 0 && unreadCount === 0) return panel("gmail", "gmail", 0, "");
   let html = "";
   if (unreadCount) {
-    html += `<div class="meta" style="margin-bottom:6px;">${unreadCount} sin leer en INBOX</div>`;
+    html += `<div class="meta" style="margin-bottom:6px;">`
+      + linked("https://mail.google.com/mail/u/0/#inbox",
+          `${unreadCount} sin leer en INBOX`,
+          { external: true, title: "abrir bandeja" })
+      + `</div>`;
   }
   html += "<ul>";
   if (awaiting.length) {
     html += awaiting.slice(0, 5).map((m) => `<li>
       <span class="bucket overdue">${(m.days_old || 0)}d</span>
-      <b>${esc(m.subject || "")}</b>
+      ${linked(gmailHref(m), `<b>${esc(m.subject || "")}</b>`,
+        { external: true, title: "abrir en gmail" })}
       <span class="meta">${esc(m.from_name || m.from || "")}</span>
       ${m.snippet ? `<div class="snippet">${esc(m.snippet)}</div>` : ""}
     </li>`).join("");
@@ -119,7 +159,8 @@ function renderGmail(g) {
   if (starred.length) {
     html += starred.slice(0, 3).map((m) => `<li>
       <span class="bucket today">★</span>
-      <b>${esc(m.subject || "")}</b>
+      ${linked(gmailHref(m), `<b>${esc(m.subject || "")}</b>`,
+        { external: true, title: "abrir en gmail" })}
       <span class="meta">${esc(m.from_name || m.from || "")}</span>
     </li>`).join("");
   }
@@ -142,7 +183,8 @@ function renderMail(items) {
 function renderWhatsApp(items) {
   if (!items || !items.length) return panel("whatsapp", "whatsapp", 0, "");
   const lis = items.slice(0, 6).map((c) => `<li>
-    <b>${esc(c.name || "")}</b>
+    ${linked(waHref(c.jid), `<b>${esc(c.name || "")}</b>`,
+      { external: true, title: "abrir chat" })}
     <span class="meta">${c.count || 0} msg</span>
     ${c.last_snippet ? `<div class="snippet">${esc(c.last_snippet)}</div>` : ""}
   </li>`).join("");
@@ -168,17 +210,18 @@ function renderLoops(activo, stale) {
   const s = stale || [];
   const total = a.length + s.length;
   if (total === 0) return panel("loops", "open loops", 0, "");
+  const row = (l, cls) => {
+    const href = obsidianHref(l.source_note);
+    return `<li>
+      <span class="bucket ${cls}">${cls}</span>
+      ${linked(href, `<b>${esc(l.loop_text || "")}</b>`,
+        { title: "abrir nota en obsidian" })}
+      <span class="meta">${esc(l.source_note || "")} · ${l.age_days || 0}d</span>
+    </li>`;
+  };
   let html = "<ul>";
-  html += s.slice(0, 4).map((l) => `<li>
-    <span class="bucket stale">stale</span>
-    <b>${esc(l.loop_text || "")}</b>
-    <span class="meta">${esc(l.source_note || "")} · ${l.age_days || 0}d</span>
-  </li>`).join("");
-  html += a.slice(0, 4).map((l) => `<li>
-    <span class="bucket activo">activo</span>
-    <b>${esc(l.loop_text || "")}</b>
-    <span class="meta">${esc(l.source_note || "")} · ${l.age_days || 0}d</span>
-  </li>`).join("");
+  html += s.slice(0, 4).map((l) => row(l, "stale")).join("");
+  html += a.slice(0, 4).map((l) => row(l, "activo")).join("");
   html += "</ul>";
   return panel("loops", "open loops", total, html);
 }
@@ -186,10 +229,15 @@ function renderLoops(activo, stale) {
 function renderContradictions(items) {
   if (!items || !items.length) return panel("contradictions", "contradicciones", 0, "");
   const lis = items.slice(0, 5).map((c) => {
-    const targets = (c.targets || []).slice(0, 2).map((t) => esc(t.path || "")).join(", ");
+    const targets = (c.targets || []).slice(0, 2).map((t) =>
+      linked(obsidianHref(t.path), esc(t.path || ""),
+        { title: "abrir nota relacionada" })
+    ).join(", ");
     const why = (c.targets || [])[0]?.why || "";
     return `<li>
-      <b>${esc(c.subject_path || "")}</b>
+      ${linked(obsidianHref(c.subject_path),
+        `<b>${esc(c.subject_path || "")}</b>`,
+        { title: "abrir en obsidian" })}
       <span class="meta">↔ ${targets}</span>
       ${why ? `<div class="snippet">${esc(why)}</div>` : ""}
     </li>`;
@@ -200,7 +248,8 @@ function renderContradictions(items) {
 function renderLowConf(items) {
   if (!items || !items.length) return panel("lowconf", "preguntas sin respuesta", 0, "");
   const lis = items.slice(0, 6).map((q) => `<li>
-    <b>"${esc(q.q || "")}"</b>
+    ${linked(chatHref(q.q), `<b>"${esc(q.q || "")}"</b>`,
+      { title: "reintentar en chat" })}
     <span class="meta">score ${Number(q.top_score || 0).toFixed(3)}</span>
   </li>`).join("");
   return panel("lowconf", "preguntas sin respuesta", items.length, `<ul>${lis}</ul>`);
@@ -213,7 +262,8 @@ function renderInbox(items) {
       ? i.tags.map((t) => `#${esc(t)}`).join(" ")
       : `<span class="bucket sin-tags">sin-tags</span>`;
     return `<li>
-      <b>${esc(i.title || "")}</b>
+      ${linked(obsidianHref(i.path), `<b>${esc(i.title || "")}</b>`,
+        { title: "abrir en obsidian" })}
       <span class="meta">${tagBits} · ${fmtTime(i.modified)}</span>
       ${i.snippet ? `<div class="snippet">${esc(i.snippet.slice(0, 160))}</div>` : ""}
     </li>`;
@@ -224,11 +274,285 @@ function renderInbox(items) {
 function renderActivity(items) {
   if (!items || !items.length) return panel("activity", "notas tocadas", 0, "");
   const lis = items.slice(0, 6).map((n) => `<li>
-    <b>${esc(n.title || "")}</b>
+    ${linked(obsidianHref(n.path), `<b>${esc(n.title || "")}</b>`,
+      { title: "abrir en obsidian" })}
     <span class="meta">${esc(n.path || "")} · ${fmtTime(n.modified)}</span>
     ${n.snippet ? `<div class="snippet">${esc(n.snippet.slice(0, 160))}</div>` : ""}
   </li>`).join("");
   return panel("activity", "notas tocadas", items.length, `<ul>${lis}</ul>`);
+}
+
+// obsidian:// deep-link — opens the note in the desktop app.
+// Vault name is hardcoded since the whole app targets a single vault.
+function obsidianHref(path) {
+  if (!path) return "";
+  return `obsidian://open?vault=Notes&file=${encodeURIComponent(path)}`;
+}
+
+// Gmail web search — no thread_id in payload, but from+subject lands on the
+// thread reliably. Falls back to inbox if both missing.
+function gmailHref(m) {
+  if (!m) return "";
+  const parts = [];
+  const fromAddr = (m.from || "").match(/<([^>]+)>/)?.[1] || m.from || "";
+  if (fromAddr) parts.push(`from:${fromAddr}`);
+  if (m.subject) parts.push(`subject:"${m.subject.replace(/"/g, "")}"`);
+  const q = parts.join(" ");
+  return q
+    ? `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(q)}`
+    : `https://mail.google.com/mail/u/0/#inbox`;
+}
+
+// wa.me — only useful for individual chats (jid like 5493...@s.whatsapp.net).
+// Group jids (...@g.us) don't open externally; return chat list instead.
+function waHref(jid) {
+  if (!jid) return "";
+  const phone = String(jid).split("@")[0];
+  if (/^\d{6,}$/.test(phone)) return `https://wa.me/${phone}`;
+  return "https://web.whatsapp.com/";
+}
+
+// Re-run a low-confidence query in the chat UI (auto-submits via ?q=).
+function chatHref(q) {
+  return `/chat?q=${encodeURIComponent(q || "")}`;
+}
+
+// Helper: wrap a label in <a> if href is non-empty, else plain.
+function linked(href, html, opts = {}) {
+  if (!href) return html;
+  const target = opts.external ? ` target="_blank" rel="noopener noreferrer"` : "";
+  const title = opts.title ? ` title="${esc(opts.title)}"` : "";
+  return `<a href="${esc(href)}"${target}${title}>${html}</a>`;
+}
+
+function truncate(s, n) {
+  const str = String(s || "");
+  return str.length > n ? str.slice(0, n - 1) + "…" : str;
+}
+
+// signals.pagerank_top — wikilink graph authority. Items already sorted
+// asc by rank. Render top-5 with a visual bar scaled against the max pr
+// in the slice (purely relative, pr is unitless).
+function renderPageRank(items) {
+  if (!items || !items.length) return panel("pagerank", "autoridad", 0, "");
+  const slice = items.slice(0, 5);
+  const maxPr = Math.max(...slice.map((x) => Number(x.pr || 0)), 1e-9);
+  const lis = slice.map((it) => {
+    const pct = Math.max(4, Math.round((Number(it.pr || 0) / maxPr) * 100));
+    const href = obsidianHref(it.path);
+    const title = esc(it.title || it.path || "");
+    const rank = it.rank != null ? `#${it.rank}` : "";
+    return `<li>
+      <span class="rank">${esc(rank)}</span>
+      <a href="${esc(href)}"><b>${title}</b></a>
+      <div class="pr-bar" aria-hidden="true"><span style="width:${pct}%"></span></div>
+    </li>`;
+  }).join("");
+  return panel("pagerank", "autoridad", slice.length, `<ul class="pr-list">${lis}</ul>`);
+}
+
+// signals.eval_trend — latest retrieval metrics vs fixed baseline. The
+// deltas are what matter (singles drift naturally with vault growth —
+// see CLAUDE.md "Eval baselines"); chains/chain_success are the real
+// signal of ranker health.
+function renderEvalTrend(t) {
+  if (!t || !t.latest) return panel("evaltrend", "retrieval health", 0, "");
+  const L = t.latest || {};
+  const B = t.baseline || {};
+  const sL = L.singles || {};
+  const cL = L.chains || {};
+
+  const row = (label, cur, base, fmt) => {
+    const curN = Number(cur);
+    const baseN = Number(base);
+    const delta = Number.isFinite(curN) && Number.isFinite(baseN) ? (curN - baseN) : null;
+    const curStr = Number.isFinite(curN) ? fmt(curN) : "—";
+    const baseStr = Number.isFinite(baseN) ? fmt(baseN) : "—";
+    let deltaHtml = "";
+    if (delta != null) {
+      const cls = delta > 0.0005 ? "up" : delta < -0.0005 ? "down" : "flat";
+      const arrow = cls === "up" ? "▲" : cls === "down" ? "▼" : "·";
+      const sign = delta > 0 ? "+" : "";
+      deltaHtml = `<span class="delta ${cls}">${arrow} ${sign}${fmt(delta)}</span>`;
+    }
+    return `<li>
+      <b>${esc(label)}</b>
+      <span class="meta">${esc(curStr)} <span class="baseline">vs ${esc(baseStr)}</span></span>
+      ${deltaHtml}
+    </li>`;
+  };
+
+  const pct = (x) => `${(x * 100).toFixed(1)}%`;
+  const num = (x) => x.toFixed(3);
+
+  // Sparkline from history: plot singles hit@5 over time if available.
+  // 60×20 SVG polyline. Cheap and legible; no library.
+  let spark = "";
+  const hist = Array.isArray(t.history) ? t.history.filter((h) => h && Number.isFinite(h.singles_hit5)) : [];
+  if (hist.length >= 2) {
+    const vals = hist.slice(-20).map((h) => Number(h.singles_hit5));
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = Math.max(max - min, 1e-6);
+    const W = 60, H = 20;
+    const pts = vals.map((v, i) => {
+      const x = (i / (vals.length - 1)) * W;
+      const y = H - ((v - min) / range) * H;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    spark = `<svg class="sparkline" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">
+      <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    </svg>`;
+  }
+
+  const rows = [
+    row("singles hit@5", sL.hit5, B.singles_hit5, pct),
+    row("chains hit@5",  cL.hit5, B.chains_hit5, pct),
+    row("chain_success", cL.chain_success, B.chain_success, pct),
+    row("chains MRR",    cL.mrr, B.chains_mrr, num),
+  ].join("");
+
+  const nmeta = sL.n || cL.turns
+    ? `<div class="meta" style="margin-bottom:6px;">n=${esc(sL.n || 0)} singles · ${esc(cL.turns || 0)} turns / ${esc(cL.chains || 0)} chains ${spark}</div>`
+    : (spark ? `<div class="meta" style="margin-bottom:6px;">${spark}</div>` : "");
+
+  return panel("evaltrend", "retrieval health", 1, `${nmeta}<ul class="eval-list">${rows}</ul>`);
+}
+
+// signals.followup_aging — open-loop age distribution. 3 buckets + a
+// small sample. Colors escalate with age.
+function renderFollowupAging(a) {
+  if (!a || !a.total) return panel("aging", "loops aging", 0, "");
+  const b = a.buckets || {};
+  const fresh  = Number(b["0_7"] || 0);
+  const amber  = Number(b["8_30"] || 0);
+  const stale  = Number(b["stale_30plus"] || 0);
+  const badges = `
+    <div class="age-badges">
+      <span class="bucket age-fresh">0-7d · ${fresh}</span>
+      <span class="bucket age-amber">8-30d · ${amber}</span>
+      <span class="bucket age-stale">stale · ${stale}</span>
+    </div>`;
+  const sample = Array.isArray(a.sample) ? a.sample.slice(0, 3) : [];
+  const lis = sample.map((s) => {
+    const age = Number(s.age_days || 0);
+    const cls = age <= 7 ? "age-fresh" : age <= 30 ? "age-amber" : "age-stale";
+    return `<li>
+      <span class="bucket ${cls}">${age}d</span>
+      ${linked(obsidianHref(s.note),
+        `<b>${esc(truncate(s.loop || "", 80))}</b>`,
+        { title: "abrir nota en obsidian" })}
+      <span class="meta">${esc(s.note || "")}${s.status ? " · " + esc(s.status) : ""}</span>
+    </li>`;
+  }).join("");
+  const body = sample.length ? `${badges}<ul>${lis}</ul>` : badges;
+  return panel("aging", "loops aging", a.total, body);
+}
+
+// signals.chrome_top_week — top visited URLs (external). Host shown as
+// affordance before click; count as a bucket badge.
+function renderChromeTopWeek(items) {
+  if (!items || !items.length) return panel("chrome", "web 7d", 0, "");
+  const lis = items.slice(0, 5).map((u) => {
+    let host = "";
+    try { host = new URL(u.url).host.replace(/^www\./, ""); } catch (_) { host = ""; }
+    const title = truncate(u.title || host || u.url || "", 50);
+    const count = Number(u.visit_count || 0);
+    return `<li>
+      <a href="${esc(u.url || "")}" target="_blank" rel="noopener noreferrer"><b>${esc(title)}</b></a>
+      <span class="meta">${esc(host)}${u.last_visit_iso ? " · " + esc(fmtDate(u.last_visit_iso)) : ""}</span>
+      <span class="bucket today">${count}</span>
+    </li>`;
+  }).join("");
+  return panel("chrome", "web 7d", items.length, `<ul>${lis}</ul>`);
+}
+
+// signals.drive_recent — files modified in Google Drive within the last
+// 48h. Item shape from rag._fetch_drive_evidence: `{ name, link,
+// mime_label, days_ago, modifier }`. `days_ago` is a float so sub-day
+// ages render as hours for finer signal.
+function renderDriveRecent(items) {
+  if (!items || !items.length) return panel("drive", "drive 48h", 0, "");
+  const lis = items.slice(0, 5).map((f) => {
+    const name = truncate(f.name || "", 60);
+    const href = f.link || "";
+    const age = Number(f.days_ago || 0);
+    const ageStr = age < 1 ? `${Math.round(age * 24)}h` : `${age.toFixed(1)}d`;
+    const modifier = f.modifier ? ` · ${esc(f.modifier)}` : "";
+    const linkHtml = href
+      ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer"><b>${esc(name)}</b></a>`
+      : `<b>${esc(name)}</b>`;
+    return `<li>
+      ${linkHtml}
+      <span class="meta">${esc(f.mime_label || "archivo")} · ${esc(ageStr)}${modifier}</span>
+    </li>`;
+  }).join("");
+  return panel("drive", "drive 48h", items.length, `<ul>${lis}</ul>`);
+}
+
+// signals.chrome_bookmarks — bookmarks whose URL was visited in last 48h.
+// Distinct from `renderChromeTopWeek` (all visits): narrows to *saved*
+// pages the user reaches for. Item shape: `{ name, url, folder,
+// visit_count, last_visit_iso }`.
+function renderChromeBookmarks(items) {
+  if (!items || !items.length) return panel("bookmarks", "bookmarks 48h", 0, "");
+  const lis = items.slice(0, 5).map((b) => {
+    let host = "";
+    try { host = new URL(b.url).host.replace(/^www\./, ""); } catch (_) { host = ""; }
+    const title = truncate(b.name || host || b.url || "", 56);
+    const folder = b.folder ? truncate(b.folder, 36) : "";
+    const count = Number(b.visit_count || 0);
+    return `<li>
+      <a href="${esc(b.url || "")}" target="_blank" rel="noopener noreferrer"><b>${esc(title)}</b></a>
+      <span class="meta">${esc(host)}${folder ? " · " + esc(folder) : ""}${b.last_visit_iso ? " · " + esc(fmtDate(b.last_visit_iso)) : ""}</span>
+      <span class="bucket today">${count}</span>
+    </li>`;
+  }).join("");
+  return panel("bookmarks", "bookmarks 48h", items.length, `<ul>${lis}</ul>`);
+}
+
+// signals.vault_activity — per-vault recent notes, never mixed. Shape:
+// `{ vault_name: [{ path, title, modified, snippet }] }`. Emits one
+// panel per vault so personal/work stay separated. Panel title encodes
+// the vault name directly — easy to spot at a glance.
+function renderVaultActivity(byVault) {
+  if (!byVault || typeof byVault !== "object") return "";
+  return Object.keys(byVault).sort().map((name) => {
+    const items = byVault[name] || [];
+    if (!items.length) return panel(`vault-${name}`, `vault ${name} 48h`, 0, "");
+    const lis = items.slice(0, 5).map((n) => {
+      const title = truncate(n.title || "", 56);
+      const snippet = truncate(n.snippet || "", 120);
+      const obsidianUrl = `obsidian://open?vault=${encodeURIComponent(name)}&file=${encodeURIComponent(n.path || "")}`;
+      return `<li>
+        <a href="${esc(obsidianUrl)}"><b>${esc(title)}</b></a>
+        <span class="meta">${esc(n.modified ? fmtDate(n.modified) : "")}${n.path ? " · " + esc(n.path) : ""}</span>
+        ${snippet ? `<div class="snippet">${esc(snippet)}</div>` : ""}
+      </li>`;
+    }).join("");
+    return panel(`vault-${name}`, `vault ${name} 48h`, items.length, `<ul>${lis}</ul>`);
+  }).join("");
+}
+
+// signals.whatsapp_unreplied — chats whose last message is inbound and
+// still awaits a reply. Distinct from `renderWhatsApp` (unread inbound
+// in last 24h): this one flags where *you* owe the next move. Item
+// shape: `{ name, jid, last_snippet, hours_waiting }`. Age bucket
+// colors reuse the followup-aging palette for visual consistency.
+function renderWhatsAppUnreplied(items) {
+  if (!items || !items.length) return panel("wa-unreplied", "whatsapp · sin responder", 0, "");
+  const lis = items.slice(0, 5).map((c) => {
+    const h = Number(c.hours_waiting || 0);
+    const ageStr = h < 1 ? "<1h" : h < 24 ? `${Math.round(h)}h` : `${Math.round(h / 24)}d`;
+    const cls = h >= 24 ? "age-stale" : h >= 8 ? "age-amber" : "age-fresh";
+    return `<li>
+      <span class="bucket ${cls}">${esc(ageStr)}</span>
+      ${linked(waHref(c.jid), `<b>${esc(c.name || "")}</b>`,
+        { external: true, title: "abrir chat" })}
+      ${c.last_snippet ? `<div class="snippet">${esc(c.last_snippet)}</div>` : ""}
+    </li>`;
+  }).join("");
+  return panel("wa-unreplied", "whatsapp · sin responder", items.length, `<ul>${lis}</ul>`);
 }
 
 // ── Urgent banner ───────────────────────────────────────────────────────
@@ -282,17 +606,23 @@ function render(data) {
   const today = data.today?.evidence || {};
 
   const html = [
+    renderGmail(signals.gmail),
     renderReminders(signals.reminders),
     renderCalendar(signals.calendar, data.tomorrow_calendar),
-    renderGmail(signals.gmail),
-    renderWhatsApp(signals.whatsapp),
-    renderMail(signals.mail_unread),
+    renderWhatsAppUnreplied(signals.whatsapp_unreplied),
     renderActivity(today.recent_notes),
     renderInbox(today.inbox_today),
     renderLoops(signals.loops_activo, signals.loops_stale),
     renderLowConf(today.low_conf_queries),
     renderContradictions(today.new_contradictions),
     renderWeather(data.weather_forecast || signals.weather),
+    renderPageRank(signals.pagerank_top),
+    renderEvalTrend(signals.eval_trend),
+    renderFollowupAging(signals.followup_aging),
+    renderChromeTopWeek(signals.chrome_top_week),
+    renderChromeBookmarks(signals.chrome_bookmarks),
+    renderVaultActivity(signals.vault_activity),
+    renderDriveRecent(signals.drive_recent),
   ].join("");
 
   els.panels.innerHTML = html;
@@ -309,22 +639,59 @@ function render(data) {
     `${dot} ${srcText} · ${(data.today?.counts?.total || 0)} señales vault · actualizado ${fmtTime(data.generated_at)}`;
 }
 
-async function load(regenerate = false) {
-  els.btnReload.disabled = true;
-  els.btnRegen.disabled = true;
-  if (regenerate) {
-    els.status.innerHTML = '<span class="dot gen">●</span> generando brief… (10-15s)';
-  }
+async function load(regenerate = false, { bypassDebounce = false } = {}) {
+  // Debounce: collapse rapid back-to-back loads (visibilitychange firing
+  // right after the 60s interval would double-fetch). Always honor an
+  // explicit regenerate. Warming short-polls pass bypassDebounce — they
+  // fire every 3s and must not be swallowed by the 5s window.
+  const now = Date.now();
+  if (inflight) return;  // never issue two concurrent fetches
+  if (!regenerate && !bypassDebounce && now - lastLoadStarted < MIN_RELOAD_GAP_MS) return;
+  lastLoadStarted = now;
+  inflight = true;
+
+  els.btnRefresh.disabled = true;
+  els.btnRefresh.classList.add("spinning");
+  els.progress.classList.add("active");
+
+  // First paint: show skeleton panels so the page has structure while
+  // the fetch fans out (~4.5s cold). On refresh the prior data stays
+  // visible — no flicker, just the top progress bar + pulsing dot.
+  if (firstLoad) renderSkeletons();
+
+  const dot = regenerate
+    ? '<span class="dot gen loading">●</span> generando brief… (10-15s)'
+    : '<span class="dot loading">●</span> cargando canales…';
+  els.status.innerHTML = dot;
+
   try {
     const resp = await fetch(`/api/home?regenerate=${regenerate ? "true" : "false"}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
+    if (data.warming) {
+      // Backend pre-warmer is still computing the first payload. Keep
+      // skeletons up and short-poll so we catch the real payload as soon
+      // as it lands (waiting for the 60s auto-refresh stalls the UI up
+      // to 90s on cold starts — pre-warmer finishes in ~30s).
+      els.status.innerHTML = '<span class="dot loading">●</span> calentando caché… (primer arranque, ~30s)';
+      if (warmingPoll) clearTimeout(warmingPoll);
+      warmingPoll = setTimeout(() => {
+        warmingPoll = null;
+        load(false, { bypassDebounce: true });
+      }, WARMING_POLL_MS);
+      return;
+    }
+    if (warmingPoll) { clearTimeout(warmingPoll); warmingPoll = null; }
     render(data);
+    firstLoad = false;
   } catch (err) {
     els.error.innerHTML = `<div class="error">error: ${esc(err.message || String(err))}</div>`;
+    els.status.innerHTML = '<span class="dot stale">●</span> error — reintentá';
   } finally {
-    els.btnReload.disabled = false;
-    els.btnRegen.disabled = false;
+    inflight = false;
+    els.btnRefresh.disabled = false;
+    els.btnRefresh.classList.remove("spinning");
+    els.progress.classList.remove("active");
   }
 }
 
@@ -336,8 +703,9 @@ function scheduleRefresh() {
   }, REFRESH_MS);
 }
 
-els.btnReload.addEventListener("click", () => load(false));
-els.btnRegen.addEventListener("click", () => load(true));
+// One button, one action: fetch fresh evidence from every channel AND
+// regenerate the LLM brief. No cache reuse. Takes ~10-15s.
+els.btnRefresh.addEventListener("click", () => load(true));
 window._homeRegenerate = () => load(true);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load(false);

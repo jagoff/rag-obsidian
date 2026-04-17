@@ -11,6 +11,8 @@ Tools:
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 # Silence sentence-transformers / HF output that would corrupt MCP stdio.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -21,14 +23,56 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 
 from mcp.server.fastmcp import FastMCP
 
-import rag
-
 mcp = FastMCP("obsidian-rag")
 
-# MCP server es persistent pero larga vida por conexión — warmup async paga el
-# reranker cold load mientras el cliente MCP hace handshake, y deja bge-m3
-# caliente para el primer rag_query.
-rag.warmup_async()
+# Lazy-import `rag` — Claude Code spawns one MCP server per session, and
+# importing rag.py pulls in torch + sentence-transformers + chromadb (~4 GB
+# RSS per instance). Three idle sessions = 12 GB wasted and OOM thrash when
+# command-r (19 GB) tries to load. Defer until a tool is actually called;
+# idle MCPs then stay at ~50 MB.
+_rag = None
+_rag_lock = threading.Lock()
+
+# Idle self-exit — when Claude Code sessions linger for hours without
+# invoking a tool (sometimes days, if a terminal stays open), orphaned MCP
+# children pile up holding VM. After idle threshold we `os._exit(0)` and
+# Claude Code transparently respawns us on the next tool call (≤1s cost
+# per respawn vs. ~4 GB RAM held hostage). Thresholds:
+#   - rag not loaded:  2h (nobody ever used this session → keep alive longer
+#                          in case user is about to start working)
+#   - rag loaded:     30m (heavy libs resident → exit eagerly)
+_last_call = time.time()
+_IDLE_HOT_SECONDS = 30 * 60
+_IDLE_COLD_SECONDS = 2 * 3600
+
+
+def _touch() -> None:
+    """Record tool activity. Called from every tool handler."""
+    global _last_call
+    _last_call = time.time()
+
+
+def _idle_killer() -> None:
+    while True:
+        time.sleep(300)  # check every 5m
+        idle = time.time() - _last_call
+        threshold = _IDLE_HOT_SECONDS if _rag is not None else _IDLE_COLD_SECONDS
+        if idle > threshold:
+            os._exit(0)
+
+
+threading.Thread(target=_idle_killer, daemon=True, name="mcp-idle-killer").start()
+
+
+def _load_rag():
+    global _rag
+    if _rag is not None:
+        return _rag
+    with _rag_lock:
+        if _rag is None:
+            import rag as _r
+            _rag = _r
+    return _rag
 
 
 @mcp.tool()
@@ -58,6 +102,8 @@ def rag_query(
             turn is appended to the session history. Accepts any short
             identifier matching [A-Za-z0-9_.:-]{1,64} (e.g. "tg:123", "mcp-x").
     """
+    _touch()
+    rag = _load_rag()
     col = rag.get_db()
     if col.count() == 0:
         return []
@@ -121,8 +167,10 @@ def rag_read_note(path: str) -> str:
         path: Vault-relative path, e.g. "02-Areas/Coaching/Autoridad.md".
               Must end in .md and not escape the vault root.
     """
+    _touch()
     if not path.endswith(".md"):
         return "Error: path must end in .md"
+    rag = _load_rag()
     full = (rag.VAULT_PATH / path).resolve()
     try:
         full.relative_to(rag.VAULT_PATH.resolve())
@@ -149,6 +197,8 @@ def rag_list_notes(
         tag: Only include notes carrying this tag.
         limit: Max number of unique notes to return (default 100).
     """
+    _touch()
+    rag = _load_rag()
     col = rag.get_db()
     c = rag._load_corpus(col)
     seen: dict[str, dict] = {}
@@ -192,7 +242,9 @@ def rag_links(
         folder: Optional folder filter, e.g. "03-Resources".
         tag: Optional tag filter (no '#' prefix).
     """
+    _touch()
     k = max(1, min(k, 30))
+    rag = _load_rag()
     items = rag.find_urls(query, k=k, folder=folder, tag=tag)
     return [
         {
@@ -211,6 +263,8 @@ def rag_links(
 @mcp.tool()
 def rag_stats() -> dict:
     """Return indexing metadata: chunk count, models, collection name."""
+    _touch()
+    rag = _load_rag()
     col = rag.get_db()
     return {
         "chunks": col.count(),

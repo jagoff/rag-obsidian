@@ -393,6 +393,8 @@ DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
+BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
+BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -473,6 +475,193 @@ def log_behavior_event(event: dict) -> None:
         _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
     except Exception:
         pass
+
+
+def record_brief_written(
+    brief_type: str,
+    brief_path: "Path",
+    paths_cited: list[str],
+    citations_by_section: dict,
+) -> None:
+    """Append a record of what a morning/today brief cited.
+
+    Schema: {ts, brief_type, brief_path, paths_cited, citations_by_section}
+    Silent-fail on I/O error.
+    """
+    try:
+        BRIEF_WRITTEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "brief_type": brief_type,
+            "brief_path": str(brief_path),
+            "paths_cited": paths_cited,
+            "citations_by_section": citations_by_section,
+        }
+        with BRIEF_WRITTEN_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]")
+
+
+def _extract_wikilinks_from_markdown(text: str) -> list[str]:
+    """Return raw wikilink targets (the part before | or #) from markdown text."""
+    return _WIKILINK_RE.findall(text)
+
+
+def _resolve_wikilinks_to_paths(
+    wikilinks: list[str],
+    title_to_paths: dict[str, set[str]],
+    vault: "Path",
+) -> tuple[list[str], int]:
+    """Map wikilink titles to vault-relative paths.
+
+    Returns (resolved_paths, ambiguous_count). Wikilinks that match multiple
+    paths are skipped (ambiguous_count incremented) — callers must not guess.
+    """
+    resolved: list[str] = []
+    ambiguous = 0
+    seen: set[str] = set()
+    for title in wikilinks:
+        title = title.strip()
+        # Try exact title lookup first
+        matches = title_to_paths.get(title, set())
+        if not matches:
+            # Maybe it's a vault-relative path string
+            candidate = vault / title
+            if not title.endswith(".md"):
+                candidate = vault / (title + ".md")
+            if candidate.is_file():
+                rel = str(candidate.relative_to(vault))
+                if rel not in seen:
+                    seen.add(rel)
+                    resolved.append(rel)
+            # else: unresolvable, skip silently
+            continue
+        if len(matches) > 1:
+            ambiguous += 1
+            continue
+        p = next(iter(matches))
+        if p not in seen:
+            seen.add(p)
+            resolved.append(p)
+    return resolved, ambiguous
+
+
+def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
+    """Return True if this (brief_path, cited_path) pair was already emitted."""
+    key = f"{brief_path}\x00{cited_path}"
+    if not BRIEF_STATE_PATH.is_file():
+        return False
+    try:
+        for line in BRIEF_STATE_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("key") == key:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _brief_state_record(brief_path: str, cited_path: str) -> None:
+    """Mark this (brief_path, cited_path) pair as processed."""
+    key = f"{brief_path}\x00{cited_path}"
+    try:
+        BRIEF_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "key": key,
+        }
+        with BRIEF_STATE_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _diff_brief_signal() -> None:
+    """Compare yesterday's brief(s) as written vs on-disk now → emit behavior events.
+
+    For each entry in brief_written.jsonl from the previous 18-36h:
+      - Load the corresponding .md from the vault (if still there)
+      - For each path in paths_cited: check if any of its [[title]] or [[path]]
+        wikilink forms survive in the current file content
+      - Emit {"source": "brief", "event": "kept"|"deleted", "path": ...}
+      - Dedup via brief_state.jsonl to prevent double-counting across runs
+    """
+    try:
+        if not BRIEF_WRITTEN_PATH.is_file():
+            return
+        now = datetime.now()
+        low = 18 * 3600   # 18h — user has had time to edit
+        high = 36 * 3600  # 36h — older entries are stale
+        lines = BRIEF_WRITTEN_PATH.read_text(encoding="utf-8").splitlines()
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            try:
+                ts = datetime.fromisoformat(rec["ts"])
+            except Exception:
+                continue
+            age = (now - ts).total_seconds()
+            if age < low or age > high:
+                continue
+
+            brief_path_str = rec.get("brief_path", "")
+            paths_cited: list[str] = rec.get("paths_cited", [])
+            if not paths_cited:
+                continue
+
+            # Reconstruct the on-disk path: brief_path is vault-relative
+            brief_rel = Path(brief_path_str)
+            if brief_rel.is_absolute():
+                brief_abs = brief_rel
+            else:
+                brief_abs = VAULT_PATH / brief_rel
+
+            # If the file is gone, everything was deleted
+            if not brief_abs.is_file():
+                for cited in paths_cited:
+                    if _brief_state_seen(brief_path_str, cited):
+                        continue
+                    log_behavior_event({
+                        "source": "brief",
+                        "event": "deleted",
+                        "path": cited,
+                    })
+                    _brief_state_record(brief_path_str, cited)
+                continue
+
+            current_content = brief_abs.read_text(encoding="utf-8", errors="replace")
+
+            for cited in paths_cited:
+                if _brief_state_seen(brief_path_str, cited):
+                    continue
+                # Check both [[title]] and [[vault-relative-path]] forms
+                title = Path(cited).stem
+                found = (
+                    f"[[{title}]]" in current_content
+                    or f"[[{cited}]]" in current_content
+                    or f"[[{cited.removesuffix('.md')}]]" in current_content
+                )
+                evt = "kept" if found else "deleted"
+                log_behavior_event({
+                    "source": "brief",
+                    "event": evt,
+                    "path": cited,
+                })
+                _brief_state_record(brief_path_str, cited)
+    except Exception:
+        pass  # never propagate — brief generation must not fail because of us
 
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
@@ -16298,6 +16487,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     command-r arma un brief de 120-280 palabras. Escribe a
     `05-Reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
     """
+    _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
     if date_opt:
         try:
             target = datetime.fromisoformat(date_opt)
@@ -16415,6 +16605,17 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         pass
     rel = path.relative_to(VAULT_PATH)
     console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+    # Record citations for tomorrow's diff signal.
+    try:
+        wikilinks = _extract_wikilinks_from_markdown(brief_body)
+        c = _load_corpus(get_db())
+        cited_paths, _ambig = _resolve_wikilinks_to_paths(
+            wikilinks, c["title_to_paths"], VAULT_PATH,
+        )
+        record_brief_written("morning", rel, cited_paths, {})
+        # TODO: enrich citations_by_section by parsing section headers
+    except Exception:
+        pass
     # Push to WhatsApp if ambient is enabled — landing the brief in the chat
     # at 7:00 means the user wakes up to the brief instead of having to open
     # Obsidian to find it.
@@ -16783,6 +16984,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
     `05-Reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
     hay actividad, imprime "sin actividad hoy" y termina.
     """
+    _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
     if date_opt:
         try:
             target = datetime.fromisoformat(date_opt)
@@ -16863,6 +17065,17 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
         click.echo(str(rel))
     else:
         console.print(f"[green]✓ Brief guardado:[/green] [bold cyan]{rel}[/bold cyan]")
+    # Record citations for tomorrow's diff signal.
+    try:
+        wikilinks = _extract_wikilinks_from_markdown(narrative)
+        c = _load_corpus(get_db())
+        cited_paths, _ambig = _resolve_wikilinks_to_paths(
+            wikilinks, c["title_to_paths"], VAULT_PATH,
+        )
+        record_brief_written("today", rel, cited_paths, {})
+        # TODO: enrich citations_by_section by parsing section headers
+    except Exception:
+        pass
     if _brief_push_to_whatsapp(f"Evening {date_label}", str(rel), narrative):
         if not plain:
             console.print("[dim]→ enviado a WhatsApp[/dim]")
@@ -19927,6 +20140,9 @@ _JSONL_LOG_PATHS: list[tuple[str, Path]] = [
     ("ambient.jsonl", AMBIENT_LOG_PATH),
     ("ambient_state.jsonl", AMBIENT_STATE_PATH),
     ("tune.jsonl", TUNE_LOG_PATH),
+    ("behavior.jsonl", BEHAVIOR_LOG_PATH),
+    ("brief_written.jsonl", BRIEF_WRITTEN_PATH),
+    ("brief_state.jsonl", BRIEF_STATE_PATH),
 ]
 
 

@@ -4,6 +4,40 @@
 // Data source: GET /api/home (silent-fail per channel).
 // Auto-refresh: every 60s unless tab is hidden.
 
+// ── Behavior tracking ────────────────────────────────────────────────────────
+// Session ID persisted in sessionStorage so all clicks in a tab share one id.
+// Format: "web:<12 hex chars>" — satisfies SESSION_ID_RE in rag.py.
+function _ragSessionId() {
+  try {
+    let sid = sessionStorage.getItem("rag_session");
+    if (!sid) {
+      const hex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      sid = "web:" + hex;
+      sessionStorage.setItem("rag_session", sid);
+    }
+    return sid;
+  } catch (_) {
+    // Private browsing or storage blocked — generate per-call, fire-and-forget
+    const hex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    return "web:" + hex;
+  }
+}
+
+// Fire-and-forget behavior event. Uses sendBeacon for unload safety;
+// falls back to fetch with keepalive. Never blocks the click.
+function _trackBehavior(payload) {
+  const body = JSON.stringify({ source: "web", ...payload, session: _ragSessionId() });
+  const url = "/api/behavior";
+  if (typeof navigator.sendBeacon === "function") {
+    navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+  } else {
+    fetch(url, { method: "POST", body, keepalive: true,
+                 headers: { "Content-Type": "application/json" } }).catch(() => {});
+  }
+}
+
 const els = {
   date: document.getElementById("date-label"),
   status: document.getElementById("status-line"),
@@ -219,34 +253,35 @@ function renderLoops(activo, stale) {
   const s = stale || [];
   const total = a.length + s.length;
   if (total === 0) return panel("loops", "open loops", 0, "");
-  const row = (l, cls) => {
+  const allItems = [...s, ...a];
+  const row = (l, cls, rank) => {
     const href = obsidianHref(l.source_note);
     return `<li>
       <span class="bucket ${cls}">${cls}</span>
       ${linked(href, `<b>${esc(l.loop_text || "")}</b>`,
-        { title: "abrir nota en obsidian" })}
+        { title: "abrir nota en obsidian", noteData: { path: l.source_note, rank } })}
       <span class="meta">${esc(l.source_note || "")} · ${l.age_days || 0}d</span>
     </li>`;
   };
   let html = "<ul>";
-  html += s.slice(0, 4).map((l) => row(l, "stale")).join("");
-  html += a.slice(0, 4).map((l) => row(l, "activo")).join("");
+  html += s.slice(0, 4).map((l, i) => row(l, "stale", i + 1)).join("");
+  html += a.slice(0, 4).map((l, i) => row(l, "activo", s.slice(0, 4).length + i + 1)).join("");
   html += "</ul>";
   return panel("loops", "open loops", total, html);
 }
 
 function renderContradictions(items) {
   if (!items || !items.length) return panel("contradictions", "contradicciones", 0, "");
-  const lis = items.slice(0, 5).map((c) => {
-    const targets = (c.targets || []).slice(0, 2).map((t) =>
+  const lis = items.slice(0, 5).map((c, ci) => {
+    const targets = (c.targets || []).slice(0, 2).map((t, ti) =>
       linked(obsidianHref(t.path), esc(t.path || ""),
-        { title: "abrir nota relacionada" })
+        { title: "abrir nota relacionada", noteData: { path: t.path, rank: ti + 1 } })
     ).join(", ");
     const why = (c.targets || [])[0]?.why || "";
     return `<li>
       ${linked(obsidianHref(c.subject_path),
         `<b>${esc(c.subject_path || "")}</b>`,
-        { title: "abrir en obsidian" })}
+        { title: "abrir en obsidian", noteData: { path: c.subject_path, rank: ci + 1 } })}
       <span class="meta">↔ ${targets}</span>
       ${why ? `<div class="snippet">${esc(why)}</div>` : ""}
     </li>`;
@@ -266,13 +301,13 @@ function renderLowConf(items) {
 
 function renderInbox(items) {
   if (!items || !items.length) return panel("inbox", "capturado hoy", 0, "");
-  const lis = items.slice(0, 6).map((i) => {
+  const lis = items.slice(0, 6).map((i, idx) => {
     const tagBits = i.tags && i.tags.length
       ? i.tags.map((t) => `#${esc(t)}`).join(" ")
       : `<span class="bucket sin-tags">sin-tags</span>`;
     return `<li>
       ${linked(obsidianHref(i.path), `<b>${esc(i.title || "")}</b>`,
-        { title: "abrir en obsidian" })}
+        { title: "abrir en obsidian", noteData: { path: i.path, rank: idx + 1 } })}
       <span class="meta">${tagBits} · ${fmtTime(i.modified)}</span>
       ${i.snippet ? `<div class="snippet">${esc(i.snippet.slice(0, 160))}</div>` : ""}
     </li>`;
@@ -282,9 +317,9 @@ function renderInbox(items) {
 
 function renderActivity(items) {
   if (!items || !items.length) return panel("activity", "notas tocadas", 0, "");
-  const lis = items.slice(0, 6).map((n) => `<li>
+  const lis = items.slice(0, 6).map((n, idx) => `<li>
     ${linked(obsidianHref(n.path), `<b>${esc(n.title || "")}</b>`,
-      { title: "abrir en obsidian" })}
+      { title: "abrir en obsidian", noteData: { path: n.path, rank: idx + 1 } })}
     <span class="meta">${esc(n.path || "")} · ${fmtTime(n.modified)}</span>
     ${n.snippet ? `<div class="snippet">${esc(n.snippet.slice(0, 160))}</div>` : ""}
   </li>`).join("");
@@ -327,11 +362,19 @@ function chatHref(q) {
 }
 
 // Helper: wrap a label in <a> if href is non-empty, else plain.
+// opts.noteData = { path, rank, query } adds data-note-* attrs for click tracking.
 function linked(href, html, opts = {}) {
   if (!href) return html;
   const target = opts.external ? ` target="_blank" rel="noopener noreferrer"` : "";
   const title = opts.title ? ` title="${esc(opts.title)}"` : "";
-  return `<a href="${esc(href)}"${target}${title}>${html}</a>`;
+  let data = "";
+  if (opts.noteData) {
+    const nd = opts.noteData;
+    if (nd.path) data += ` data-note-path="${esc(nd.path)}"`;
+    if (nd.rank != null) data += ` data-note-rank="${Number(nd.rank)}"`;
+    if (nd.query) data += ` data-note-query="${esc(nd.query)}"`;
+  }
+  return `<a href="${esc(href)}"${target}${title}${data}>${html}</a>`;
 }
 
 function truncate(s, n) {
@@ -346,14 +389,17 @@ function renderPageRank(items) {
   if (!items || !items.length) return panel("pagerank", "autoridad", 0, "");
   const slice = items.slice(0, 5);
   const maxPr = Math.max(...slice.map((x) => Number(x.pr || 0)), 1e-9);
-  const lis = slice.map((it) => {
+  const lis = slice.map((it, idx) => {
     const pct = Math.max(4, Math.round((Number(it.pr || 0) / maxPr) * 100));
     const href = obsidianHref(it.path);
     const title = esc(it.title || it.path || "");
-    const rank = it.rank != null ? `#${it.rank}` : "";
+    const rankLabel = it.rank != null ? `#${it.rank}` : "";
+    const trackData = it.path
+      ? ` data-note-path="${esc(it.path)}" data-note-rank="${idx + 1}"`
+      : "";
     return `<li>
-      <span class="rank">${esc(rank)}</span>
-      <a href="${esc(href)}"><b>${title}</b></a>
+      <span class="rank">${esc(rankLabel)}</span>
+      <a href="${esc(href)}"${trackData}><b>${title}</b></a>
       <div class="pr-bar" aria-hidden="true"><span style="width:${pct}%"></span></div>
     </li>`;
   }).join("");
@@ -443,14 +489,14 @@ function renderFollowupAging(a) {
       <span class="bucket age-stale">stale · ${stale}</span>
     </div>`;
   const sample = Array.isArray(a.sample) ? a.sample.slice(0, 3) : [];
-  const lis = sample.map((s) => {
+  const lis = sample.map((s, idx) => {
     const age = Number(s.age_days || 0);
     const cls = age <= 7 ? "age-fresh" : age <= 30 ? "age-amber" : "age-stale";
     return `<li>
       <span class="bucket ${cls}">${age}d</span>
       ${linked(obsidianHref(s.note),
         `<b>${esc(truncate(s.loop || "", 80))}</b>`,
-        { title: "abrir nota en obsidian" })}
+        { title: "abrir nota en obsidian", noteData: { path: s.note, rank: idx + 1 } })}
       <span class="meta">${esc(s.note || "")}${s.status ? " · " + esc(s.status) : ""}</span>
     </li>`;
   }).join("");
@@ -529,12 +575,15 @@ function renderVaultActivity(byVault) {
   return Object.keys(byVault).sort().map((name) => {
     const items = byVault[name] || [];
     if (!items.length) return panel(`vault-${name}`, `vault ${name} 48h`, 0, "");
-    const lis = items.slice(0, 5).map((n) => {
+    const lis = items.slice(0, 5).map((n, idx) => {
       const title = truncate(n.title || "", 56);
       const snippet = truncate(n.snippet || "", 120);
       const obsidianUrl = `obsidian://open?vault=${encodeURIComponent(name)}&file=${encodeURIComponent(n.path || "")}`;
+      const trackData = n.path
+        ? ` data-note-path="${esc(n.path)}" data-note-rank="${idx + 1}"`
+        : "";
       return `<li>
-        <a href="${esc(obsidianUrl)}"><b>${esc(title)}</b></a>
+        <a href="${esc(obsidianUrl)}"${trackData}><b>${esc(title)}</b></a>
         <span class="meta">${esc(n.modified ? fmtDate(n.modified) : "")}${n.path ? " · " + esc(n.path) : ""}</span>
         ${snippet ? `<div class="snippet">${esc(snippet)}</div>` : ""}
       </li>`;
@@ -815,6 +864,20 @@ els.panels.addEventListener("click", async (ev) => {
     btn.title = `Error: ${err.message}`;
   }
 });
+// Track clicks on vault note links (obsidian:// href). These links are
+// rendered with data-note-path and data-note-rank set by the renderers
+// (see addNoteTracking()). sendBeacon fires before navigation so the
+// event survives even if the page unloads.
+els.panels.addEventListener("click", (ev) => {
+  const a = ev.target.closest("a[data-note-path]");
+  if (!a) return;
+  const path = a.dataset.notePath || null;
+  const rank = a.dataset.noteRank ? Number(a.dataset.noteRank) : null;
+  const query = a.dataset.noteQuery || null;
+  if (!path) return;
+  _trackBehavior({ event: "open", path, rank, query });
+});
+
 window._homeRegenerate = () => load(true);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load(false);

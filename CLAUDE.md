@@ -163,15 +163,24 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 ## Eval baselines
 
-**Floor (2026-04-16, post-quick-wins)** — measured after `rag tune` confirmed no better weights vs current ranker.json
-- Singles: `hit@5 90.48% · MRR 0.786 · n=21`
-- Chains: `hit@5 76.00% · MRR 0.580 · chain_success 55.56% · turns=25 chains=9`
+**Floor (2026-04-17, post-golden-expansion + bootstrap CI)** — queries.yaml doubled (21→42 singles, 9→12 chains; +15 singles in under-represented folders 03-Resources/Agile+Tech, 02-Areas/Personal, 01-Projects/obsidian-rag, 04-Archive memory). `rag eval` now reports percentile bootstrap 95% CI (1000 resamples, seed=42) alongside each metric + `rag eval --latency` reports P50/P95/P99 of retrieve() per bucket and accepts `--max-p95-ms` as a CI gate.
+- Singles: `hit@5 88.10% [76.19, 97.62] · MRR 0.772 [0.651, 0.873] · n=42`
+- Chains: `hit@5 78.79% [63.64, 90.91] · MRR 0.629 [0.490, 0.768] · chain_success 50.00% [25.00, 75.00] · turns=33 chains=12`
+- Latency: singles p95 2447ms · chains p95 3003ms
 
-The prior floor (`95.24/0.802` singles, `72.00/0.557/44.44` chains from 2026-04-15, see `docs/eval-tune-2026-04-15.md`) drifted on the singles side due to vault content changes (queries.yaml golden is fixed but the vault gains/modifies notes daily). Chains improved +4pp hit and +11pp chain_success over the same window, confirming the fixed ranker weights are not the bottleneck — drift is natural, not regression.
+Every post-expansion metric sits inside the prior floor's CI on the smaller set — expansion surfaced the noise band (~21pp singles hit, ~50pp chain_success) that previously masqueraded as drift.
+
+**Prior floor (2026-04-17, post-title-in-rerank, n=21 singles / 9 chains):** Singles `hit@5 90.48% · MRR 0.821`; Chains `hit@5 80.00% · MRR 0.627 · chain_success 55.56%`. Kept for historical trend, but do not compare new numbers against it without overlapping CIs.
+
+**Even-earlier floor (2026-04-16, post-quick-wins, n=21/9):** Singles `hit@5 90.48% · MRR 0.786`; Chains `hit@5 76.00% · MRR 0.580 · chain_success 55.56%`.
+
+The 2026-04-15 floor (`95.24/0.802` singles, `72.00/0.557/44.44` chains, see `docs/eval-tune-2026-04-15.md`) pre-dates both the expansion and the CI tooling — treat as a qualitative reference only.
 
 Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand_queries`, `reformulate_query`, `_judge_sufficiency`) are already deterministic via `HELPER_OPTIONS = {temperature: 0, seed: 42}`.
 
 **HyDE with qwen2.5:3b drops singles hit@5 ~5pp**. HyDE is opt-in (`--hyde`); re-measure if helper model changes.
+
+**`seen_titles` in `reformulate_query` regressed chains** (2026-04-17). Injecting "notas ya consultadas: [...]" into the helper prompt as a diversity nudge dropped chains hit@5 −16pp (80→64) and chain_success −33pp (55.56→22.22). The helper treats the list as "avoid these" and drifts off-topic. The kwarg remains on the signature (callers in eval pass it via `_titles_from_paths`) but is intentionally unused in the prompt. Future: try as a soft *reranker* hint (penalty on already-seen chunks post-rerank) instead of an LLM instruction.
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 

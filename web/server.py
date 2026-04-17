@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -74,7 +74,9 @@ from rag import (  # noqa: E402
     ensure_session,
     find_followup_loops,
     get_db,
+    BEHAVIOR_LOG_PATH,
     get_pagerank,
+    log_behavior_event,
     log_query_event,
     multi_retrieve,
     new_turn_id,
@@ -274,6 +276,92 @@ def submit_feedback(req: FeedbackRequest) -> dict:
         reason=reason,
         session_id=req.session_id,
     )
+    return {"ok": True}
+
+
+# ── /api/behavior ─────────────────────────────────────────────────────────────
+# In-memory token bucket for rate limiting: 120 events/min per IP.
+# Stored as {ip: [timestamp, ...]} with a 60s sliding window. No new deps.
+import collections as _collections
+
+_BEHAVIOR_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
+_BEHAVIOR_RATE_LIMIT = 120
+_BEHAVIOR_RATE_WINDOW = 60.0  # seconds
+
+_BEHAVIOR_KNOWN_EVENTS = frozenset({
+    "open", "open_external", "positive_implicit",
+    "negative_implicit", "kept", "deleted", "save",
+})
+_BEHAVIOR_SESSION_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,80}$")
+
+
+class BehaviorRequest(BaseModel):
+    source: str
+    event: str
+    query: str | None = None
+    path: str | None = None
+    rank: int | None = None
+    dwell_ms: int | None = None
+    session: str | None = None
+
+
+@app.post("/api/behavior")
+def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
+    """Record a user-behavior event from the web dashboard into behavior.jsonl."""
+    # Validate source
+    if req.source != "web":
+        raise HTTPException(status_code=400, detail="source must be 'web'")
+
+    # Validate event
+    if req.event not in _BEHAVIOR_KNOWN_EVENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown event '{req.event}'; valid: {sorted(_BEHAVIOR_KNOWN_EVENTS)}",
+        )
+
+    # Validate session regex if present
+    if req.session is not None and not _BEHAVIOR_SESSION_RE.match(req.session):
+        raise HTTPException(status_code=400, detail="session id format invalid")
+
+    # Validate path stays inside vault (no traversal)
+    if req.path is not None:
+        p = req.path
+        if p.startswith("/") or ".." in p.split("/"):
+            raise HTTPException(status_code=400, detail="path must be vault-relative")
+        try:
+            resolved = (VAULT_PATH / p).resolve()
+            VAULT_PATH.resolve()  # ensure VAULT_PATH itself resolves
+            resolved.relative_to(VAULT_PATH.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="path escapes vault root")
+
+    # Rate limit: 120 events/60s per client IP
+    client_ip = (request.client.host if request.client else "unknown")
+    now = time.time()
+    bucket = _BEHAVIOR_BUCKETS[client_ip]
+    # Prune old entries
+    cutoff = now - _BEHAVIOR_RATE_WINDOW
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= _BEHAVIOR_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    bucket.append(now)
+
+    try:
+        log_behavior_event({
+            "source": req.source,
+            "event": req.event,
+            "query": req.query,
+            "path": req.path,
+            "rank": req.rank,
+            "dwell_ms": req.dwell_ms,
+            "session": req.session,
+        })
+    except Exception as exc:
+        # Never 500 on I/O failure — degrade gracefully
+        print(f"[behavior] write error: {exc}", flush=True)
+        raise HTTPException(status_code=503, detail="event log unavailable")
+
     return {"ok": True}
 
 

@@ -112,12 +112,28 @@ def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, s
     return issues
 
 
+def _link_scheme() -> str:
+    """Return the URI scheme used for OSC 8 note links.
+
+    When RAG_TRACK_OPENS=1, returns "x-rag-open" so that terminals configured
+    with a custom URL handler (pointing at `rag open`) record open events in
+    behavior.jsonl. Users must register the handler separately — this function
+    only switches the scheme; no subprocess or side-effect occurs here.
+    When the env var is absent or any other value, returns "file" (default,
+    zero behavior change for existing users).
+    """
+    return "x-rag-open" if os.environ.get("RAG_TRACK_OPENS") == "1" else "file"
+
+
 def _file_link_style(path: str, base: str) -> str:
     """OSC 8 clickable style (iTerm2/Terminal.app) — opens the note in Obsidian
     when clicked on macOS (file:// URL hands off to the default .md handler).
+    When RAG_TRACK_OPENS=1, uses x-rag-open:// instead so a registered URL
+    handler can call `rag open <path>` and record the event in behavior.jsonl.
     """
     full = (VAULT_PATH / path).resolve()
-    return f"{base} link file://{urllib.parse.quote(str(full))}"
+    scheme = _link_scheme()
+    return f"{base} link {scheme}://{urllib.parse.quote(str(full))}"
 
 
 def _url_link_style(url: str, base: str) -> str:
@@ -376,6 +392,7 @@ VAULT_PATH = _resolve_vault_path()
 DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
+BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -426,6 +443,34 @@ def log_query_event(event: dict) -> None:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
+    except Exception:
+        pass
+
+
+def log_behavior_event(event: dict) -> None:
+    """Enqueue a user-behavior event for background append to behavior.jsonl.
+
+    Schema fields (all optional except source+event):
+      ts         — ISO8601 second-precision; injected if absent
+      source     — "cli" | "whatsapp" | "web" | "brief"
+      event      — "open" | "open_external" | "positive_implicit" |
+                   "negative_implicit" | "kept" | "deleted" | "save"
+      query      — triggering query text, if any
+      path       — vault-relative note path
+      rank       — 1-indexed rank among results when event occurred
+      dwell_ms   — milliseconds before next user action
+      session    — session id
+
+    Empty dict is a no-op. Never raises; safe from any thread.
+    Shared contract: other writers (TypeScript WhatsApp listener, FastAPI web)
+    append to the same absolute path ~/.local/share/obsidian-rag/behavior.jsonl.
+    """
+    if not event:
+        return
+    try:
+        event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
     except Exception:
         pass
 
@@ -5474,10 +5519,28 @@ def _postprocess_reformulation(
     return result.strip()
 
 
+def _titles_from_paths(paths: list[str] | None, limit: int = 6) -> list[str]:
+    """Extract note titles (basename sans .md) from vault-relative paths,
+    preserving first-seen order and dedup'ing. Returns up to `limit` titles."""
+    if not paths:
+        return []
+    seen: list[str] = []
+    for p in paths:
+        if not p:
+            continue
+        title = Path(p).stem
+        if title and title not in seen:
+            seen.append(title)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def reformulate_query(
     question: str,
     history: list[dict],
     summary: str | None = None,
+    seen_titles: list[str] | None = None,
 ) -> str:
     """Rewrite the question as a standalone search query using conversation history.
 
@@ -5485,6 +5548,11 @@ def reformulate_query(
     raw window — see `session_summary()`. When provided, prepended to the
     prompt as a labelled section so the helper has long-range context without
     blowing the helper context window with raw turns.
+
+    `seen_titles` (optional) is the list of note titles already surfaced in
+    prior turns. When provided, the helper is instructed to explore distinct
+    angles — avoids the chain-collapse pattern where turn N+1 re-embeds into
+    the same chunks as turn N.
     """
     if not history and not summary:
         return question
@@ -5497,6 +5565,12 @@ def reformulate_query(
     summary_section = (
         f"Resumen de turnos previos:\n{summary}\n\n" if summary else ""
     )
+    # NOTE: `seen_titles` was tried as a diversity nudge (2026-04-17) but
+    # regressed chains hit@5 by -16pp and chain_success by -33pp. The helper
+    # interprets the list as "avoid these" and drifts off-topic. Kept as a
+    # kwarg (scaffolding) so callers don't break, but deliberately not
+    # injected into the prompt. Future: try as a soft reranker hint instead.
+    _ = seen_titles  # intentionally unused
     prompt = (
         "Tu tarea: reescribir la nueva pregunta como consulta de búsqueda autónoma "
         "resolviendo SOLO pronombres y referencias ambiguas usando el historial. "
@@ -5769,9 +5843,22 @@ def retrieve(
     #    where the best-scoring chunk's parent is less relevant than another's.
     expanded = [expand_to_parent(c[0], c[1]) for c in candidates]
 
-    # 7. Cross-encoder rerank against the ORIGINAL question (not paraphrase)
+    # 7. Cross-encoder rerank against the ORIGINAL question (not paraphrase).
+    #    Prepend `{title}\n({folder})\n\n` so the reranker can match the
+    #    note's identity — without this the cross-encoder only sees body
+    #    prose and can't distinguish same-content variants (e.g. queries
+    #    mentioning a note title are dominated by variants with more body
+    #    prose that happen to rank higher). Bracketed section markers like
+    #    `[Verso 1]` also drag scores down; the title prefix compensates.
     reranker = get_reranker()
-    pairs = [(question, e) for e in expanded]
+    def _rerank_doc(parent: str, meta: dict) -> str:
+        title = (meta.get("note") or "").strip()
+        folder = (meta.get("folder") or "").strip()
+        header = f"{title}\n({folder})\n\n" if title and folder else (
+            f"{title}\n\n" if title else ""
+        )
+        return header + parent
+    pairs = [(question, _rerank_doc(e, c[1])) for e, c in zip(expanded, candidates)]
     scores = reranker.predict(pairs, show_progress_bar=False)
 
     # Recency boost: when the query carries a temporal cue ("últimamente",
@@ -7186,7 +7273,7 @@ def _ambient_hook(
     if fm.get("ambient") == "skip":
         _ambient_state_record(doc_id_prefix, h, {"skipped_reason": "fm_skip"})
         return
-    if fm.get("type") in ("morning-brief", "weekly-digest", "prep"):
+    if fm.get("type") in ("morning-brief", "weekly-digest", "prep", "wa-tasks"):
         # System-generated notes don't deserve ambient pings.
         _ambient_state_record(doc_id_prefix, h, {"skipped_reason": "system_note"})
         return
@@ -7446,7 +7533,12 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     indexed_files = set()
     added_chunks = 0
     updated_files = 0
-    for path in track(md_files, description="Procesando..."):
+    # Explicit console=console so the bar also renders from inside `rag chat`
+    # (`/reindex`), where rich's default Console missed TTY detection.
+    for path in track(
+        md_files, description="Procesando...",
+        console=console, transient=False,
+    ):
         doc_id_prefix = str(path.relative_to(VAULT_PATH))
         folder = str(path.relative_to(VAULT_PATH).parent)
         raw = path.read_text(encoding="utf-8", errors="ignore")
@@ -8999,13 +9091,23 @@ def state(text: str | None, clear: bool, plain: bool):
 @click.option("-k", default=5, help="top-k para calcular hit/recall (default: 5)")
 @click.option("--hyde", is_flag=True, help="Activa HyDE en la evaluación")
 @click.option("--no-multi", is_flag=True, help="Sin multi-query expansion")
-def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
+@click.option("--latency", is_flag=True,
+              help="Mide + reporta P50/P95/P99 de retrieve() por query (ms)")
+@click.option("--max-p95-ms", type=float, default=None,
+              help="Gate: exit 1 si P95 retrieve > este umbral. Implica --latency")
+def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
+         latency: bool, max_p95_ms: float | None):
     """Evaluar el retriever contra un set de queries golden.
 
     Métricas: hit@k (% queries donde alguna nota esperada cae en top-k),
     MRR (mean reciprocal rank del mejor hit), recall@k (fracción de notas
     esperadas recuperadas por query, promediado).
+
+    Con --latency cronometra cada llamada a retrieve() y reporta P50/P95/P99.
+    Con --max-p95-ms gatea: exit(1) si P95 > umbral (útil para CI).
     """
+    if max_p95_ms is not None:
+        latency = True
     import pathlib
     path = pathlib.Path(queries_file)
     if not path.is_absolute():
@@ -9032,6 +9134,31 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
     singles_snap: dict | None = None
     chains_snap: dict | None = None
 
+    def _bootstrap_ci(values: list[float], iters: int = 1000,
+                      conf: float = 0.95, seed: int = 42) -> tuple[float, float]:
+        """Percentile bootstrap CI over per-case metric values (hit bool or RR).
+
+        Returns (lo, hi) bounds. Used to surface whether eval-to-eval deltas
+        are within noise: if two runs' CIs overlap, the change is not
+        significant on the current golden set.
+        """
+        if not values:
+            return (0.0, 0.0)
+        import random as _rnd
+        rng = _rnd.Random(seed)
+        n = len(values)
+        means: list[float] = []
+        for _ in range(iters):
+            s = 0.0
+            for _ in range(n):
+                s += values[rng.randrange(n)]
+            means.append(s / n)
+        means.sort()
+        alpha = (1 - conf) / 2
+        lo = means[int(alpha * iters)]
+        hi = means[min(iters - 1, int((1 - alpha) * iters))]
+        return (lo, hi)
+
     def _score(expected_set: set[str], seen_paths: list[str]) -> tuple[bool, float, float]:
         retrieved_set = set(seen_paths)
         hit = bool(expected_set & retrieved_set)
@@ -9055,14 +9182,17 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
 
     # ── Single queries ──────────────────────────────────────────────────
     per_query: list[tuple[str, bool, float, float, list[str]]] = []
+    singles_latency_ms: list[float] = []
     if queries:
         for entry in track(queries, description="Evaluando queries…"):
             q = entry["question"]
             expected = set(entry.get("expected") or [])
+            _t0 = time.perf_counter()
             result = retrieve(
                 col, q, k, folder=None, tag=None,
                 precise=hyde, multi_query=not no_multi, auto_filter=True,
             )
+            singles_latency_ms.append((time.perf_counter() - _t0) * 1000)
             seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
             hit, rr, recall = _score(expected, seen_paths)
             per_query.append((q, hit, rr, recall, seen_paths))
@@ -9094,15 +9224,25 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         hit_at_k = sum(1 for _, h, _, _, _ in per_query if h) / n
         mrr = sum(r for _, _, r, _, _ in per_query) / n
         recall_at_k = sum(r for _, _, _, r, _ in per_query) / n
+
+        hit_vals = [1.0 if h else 0.0 for _, h, _, _, _ in per_query]
+        rr_vals = [r for _, _, r, _, _ in per_query]
+        hit_lo, hit_hi = _bootstrap_ci(hit_vals)
+        mrr_lo, mrr_hi = _bootstrap_ci(rr_vals)
+
         console.print()
         console.print(
-            f"[bold]Singles:[/bold] hit@{k} {hit_at_k:.2%}  ·  "
-            f"MRR {mrr:.3f}  ·  recall@{k} {recall_at_k:.2%}  ·  "
+            f"[bold]Singles:[/bold] hit@{k} {hit_at_k:.2%} "
+            f"[dim]\\[{hit_lo:.2%}, {hit_hi:.2%}][/dim]  ·  "
+            f"MRR {mrr:.3f} [dim]\\[{mrr_lo:.3f}, {mrr_hi:.3f}][/dim]  ·  "
+            f"recall@{k} {recall_at_k:.2%}  ·  "
             f"[dim]n={n}[/dim]"
         )
         singles_snap = {
             "hit5": round(hit_at_k, 4),
+            "hit5_ci": [round(hit_lo, 4), round(hit_hi, 4)],
             "mrr": round(mrr, 4),
+            "mrr_ci": [round(mrr_lo, 4), round(mrr_hi, 4)],
             "n": n,
         }
 
@@ -9116,6 +9256,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         chain_rows: list[tuple[str, str, str, bool, float, float, list[str]]] = []
         per_chain_success: list[tuple[str, bool]] = []
 
+        chains_latency_ms: list[float] = []
         for chain in track(chains, description="Evaluando chains…"):
             chain_id = chain.get("id", "<sin id>")
             turns = chain.get("turns") or []
@@ -9126,6 +9267,7 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
             # would benefit transparently.
             fake_sess: dict = {"turns": []}
             all_hit = True
+            chain_seen_paths: list[str] = []  # accumulates across turns for diversity
             for i, turn in enumerate(turns):
                 q = turn["question"]
                 expected = set(turn.get("expected") or [])
@@ -9133,16 +9275,26 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
                     search_q = q
                 else:
                     chain_summary = session_summary(fake_sess)
-                    search_q = reformulate_query(q, history, summary=chain_summary)
+                    search_q = reformulate_query(
+                        q, history, summary=chain_summary,
+                        seen_titles=_titles_from_paths(chain_seen_paths),
+                    )
+                _t0 = time.perf_counter()
                 result = retrieve(
                     col, search_q, k, folder=None, tag=None,
                     precise=False, multi_query=not no_multi, auto_filter=True,
                 )
+                chains_latency_ms.append((time.perf_counter() - _t0) * 1000)
                 seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
                 hit, rr, recall = _score(expected, seen_paths)
                 if not hit:
                     all_hit = False
                 chain_rows.append((chain_id, q, search_q, hit, rr, recall, seen_paths))
+                # Track paths across turns so next reformulation can steer away
+                # from already-covered notes (chain-diversity signal).
+                for p in seen_paths[:3]:
+                    if p and p not in chain_seen_paths:
+                        chain_seen_paths.append(p)
                 # Fake assistant turn: top retrieved path anchors the topic so
                 # the next reformulation has concrete nouns to resolve pronouns
                 # against without a real chat-model call.
@@ -9186,20 +9338,92 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
         chain_mrr = sum(r for _, _, _, _, r, _, _ in chain_rows) / nt if nt else 0.0
         chain_recall = sum(r for _, _, _, _, _, r, _ in chain_rows) / nt if nt else 0.0
         chain_success = sum(1 for _, ok in per_chain_success if ok) / nc if nc else 0.0
+
+        c_hit_vals = [1.0 if h else 0.0 for _, _, _, h, _, _, _ in chain_rows]
+        c_rr_vals = [r for _, _, _, _, r, _, _ in chain_rows]
+        c_success_vals = [1.0 if ok else 0.0 for _, ok in per_chain_success]
+        c_hit_lo, c_hit_hi = _bootstrap_ci(c_hit_vals)
+        c_mrr_lo, c_mrr_hi = _bootstrap_ci(c_rr_vals)
+        c_succ_lo, c_succ_hi = _bootstrap_ci(c_success_vals)
+
         console.print()
         console.print(
-            f"[bold]Chains:[/bold] hit@{k} {chain_hit:.2%}  ·  "
-            f"MRR {chain_mrr:.3f}  ·  recall@{k} {chain_recall:.2%}  ·  "
-            f"chain_success {chain_success:.2%}  ·  "
+            f"[bold]Chains:[/bold] hit@{k} {chain_hit:.2%} "
+            f"[dim]\\[{c_hit_lo:.2%}, {c_hit_hi:.2%}][/dim]  ·  "
+            f"MRR {chain_mrr:.3f} [dim]\\[{c_mrr_lo:.3f}, {c_mrr_hi:.3f}][/dim]  ·  "
+            f"recall@{k} {chain_recall:.2%}  ·  "
+            f"chain_success {chain_success:.2%} "
+            f"[dim]\\[{c_succ_lo:.2%}, {c_succ_hi:.2%}][/dim]  ·  "
             f"[dim]turns={nt}, chains={nc}[/dim]"
         )
         chains_snap = {
             "hit5": round(chain_hit, 4),
+            "hit5_ci": [round(c_hit_lo, 4), round(c_hit_hi, 4)],
             "mrr": round(chain_mrr, 4),
+            "mrr_ci": [round(c_mrr_lo, 4), round(c_mrr_hi, 4)],
             "chain_success": round(chain_success, 4),
+            "chain_success_ci": [round(c_succ_lo, 4), round(c_succ_hi, 4)],
             "turns": nt,
             "chains": nc,
         }
+
+    # ── Latency report ──────────────────────────────────────────────────
+    latency_snap: dict | None = None
+    gate_failed = False
+    if latency:
+        def _pct(xs: list[float], p: float) -> float:
+            if not xs:
+                return 0.0
+            s = sorted(xs)
+            k = (len(s) - 1) * p
+            lo = int(k)
+            hi = min(lo + 1, len(s) - 1)
+            return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+        buckets = []
+        if singles_latency_ms:
+            buckets.append(("singles", singles_latency_ms))
+        _chains_lat = locals().get("chains_latency_ms") or []
+        if _chains_lat:
+            buckets.append(("chains", _chains_lat))
+
+        if buckets:
+            console.print()
+            ltbl = Table(title="Latencia retrieve() (ms)", show_lines=False)
+            ltbl.add_column("Bucket", style="cyan", no_wrap=True)
+            ltbl.add_column("n", justify="right")
+            ltbl.add_column("p50", justify="right")
+            ltbl.add_column("p95", justify="right")
+            ltbl.add_column("p99", justify="right")
+            ltbl.add_column("mean", justify="right")
+            ltbl.add_column("max", justify="right")
+            latency_snap = {}
+            for label, xs in buckets:
+                p50 = _pct(xs, 0.50)
+                p95 = _pct(xs, 0.95)
+                p99 = _pct(xs, 0.99)
+                mean = sum(xs) / len(xs)
+                mx = max(xs)
+                ltbl.add_row(
+                    label, str(len(xs)),
+                    f"{p50:.0f}", f"{p95:.0f}", f"{p99:.0f}",
+                    f"{mean:.0f}", f"{mx:.0f}",
+                )
+                latency_snap[label] = {
+                    "n": len(xs),
+                    "p50_ms": round(p50, 1),
+                    "p95_ms": round(p95, 1),
+                    "p99_ms": round(p99, 1),
+                    "mean_ms": round(mean, 1),
+                    "max_ms": round(mx, 1),
+                }
+                if max_p95_ms is not None and p95 > max_p95_ms:
+                    gate_failed = True
+                    console.print(
+                        f"[bold red]GATE FAIL[/bold red] {label} p95 "
+                        f"{p95:.0f}ms > {max_p95_ms:.0f}ms"
+                    )
+            console.print(ltbl)
 
     # Trend log — one line per `rag eval` run. Silent-fail so an unwritable
     # data dir never breaks the CLI. `/api/home._fetch_eval_trend` tails the
@@ -9212,10 +9436,15 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
                 entry["singles"] = singles_snap
             if chains_snap:
                 entry["chains"] = chains_snap
+            if latency_snap:
+                entry["latency"] = latency_snap
             with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    if gate_failed:
+        raise SystemExit(1)
 
 
 # ── RANKER AUTO-TUNING (rag tune) ────────────────────────────────────────────
@@ -13971,6 +14200,342 @@ def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
     return out
 
 
+# ── WhatsApp action-item extractor (rag wa-tasks) ───────────────────────────
+#
+# Los chats de WhatsApp son fuente diaria de tareas, preguntas y compromisos
+# que hoy se pierden: el vault-sync escribe el histórico pero está excluido
+# del watch (high-churn mata ollama), y el morning sólo lista unread counts.
+# Este extractor corre periódicamente, lee delta vs último run, y destila
+# action items a `00-Inbox/WA-YYYY-MM-DD.md` donde quedan RAG-searchable y
+# visibles desde morning. `ambient: skip` evita el loop (no re-empuja a WA).
+
+WA_TASKS_STATE_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks_state.json"
+WA_TASKS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks.jsonl"
+# How many chats × messages per run. Conservative: one LLM call per chat
+# so the cap bounds cost. Chats with <2 inbound msgs in the window skip
+# (not enough signal for extraction).
+WA_TASKS_MAX_CHATS = 12
+WA_TASKS_MAX_MSGS_PER_CHAT = 40
+WA_TASKS_MIN_INBOUND = 2
+
+
+def _wa_tasks_load_state() -> dict:
+    """Returns `{last_run_ts: iso|null, processed_ids: [id, ...]}`.
+
+    `processed_ids` is a ring of recent message ids (cap 2000) — cheap dedup
+    across overlapping windows. `last_run_ts` is the high-water mark; next
+    run fetches strictly after it.
+    """
+    if not WA_TASKS_STATE_PATH.is_file():
+        return {"last_run_ts": None, "processed_ids": []}
+    try:
+        data = json.loads(WA_TASKS_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_run_ts": None, "processed_ids": []}
+    if not isinstance(data, dict):
+        return {"last_run_ts": None, "processed_ids": []}
+    data.setdefault("last_run_ts", None)
+    data.setdefault("processed_ids", [])
+    if not isinstance(data["processed_ids"], list):
+        data["processed_ids"] = []
+    return data
+
+
+def _wa_tasks_save_state(state: dict) -> None:
+    ids = state.get("processed_ids") or []
+    if len(ids) > 2000:
+        state["processed_ids"] = ids[-2000:]
+    WA_TASKS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WA_TASKS_STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _wa_chat_label(raw_name: str, jid: str) -> str:
+    """Human-readable chat label. Returns the stored name if it has at least
+    one alpha character, else `Contacto …<last4>` from the JID prefix.
+    Mirrors the filter in `_fetch_whatsapp_unread` so morning and the
+    extractor surface the same set of chats.
+    """
+    name = (raw_name or "").strip()
+    if any(ch.isalpha() for ch in name):
+        return name
+    prefix = (jid or "").split("@")[0]
+    tail = prefix[-4:] if len(prefix) >= 4 else prefix
+    return f"Contacto …{tail}" if tail else "Contacto"
+
+
+def _fetch_whatsapp_window(
+    since_ts: datetime | None,
+    now_ts: datetime,
+    processed_ids: set[str],
+) -> list[dict]:
+    """Per-chat conversation windows since `since_ts` (or last 24h if None).
+
+    Each entry: ``{"jid", "label", "is_group", "inbound": int,
+    "messages": [{"id", "ts", "who", "text", "is_from_me"}]}``. Outbound
+    messages are included for LLM context but don't count toward inbound
+    threshold. Chats below `WA_TASKS_MIN_INBOUND` are dropped. Skips the
+    bot's own group, status broadcasts, and unnamed contacts (same filter
+    as `_fetch_whatsapp_unread`).
+
+    `processed_ids` deduplicates across runs: messages already extracted
+    are filtered out, but we still fetch them because the LLM may need
+    the surrounding context.
+    """
+    if not WHATSAPP_DB_PATH.is_file():
+        return []
+    since = since_ts or (now_ts - timedelta(hours=24))
+    since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    try:
+        con = sqlite3.connect(
+            f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0,
+        )
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+              m.id AS id,
+              m.chat_jid AS jid,
+              m.sender AS sender,
+              m.content AS content,
+              m.timestamp AS ts,
+              m.is_from_me AS is_from_me,
+              m.media_type AS media_type,
+              c.name AS chat_name
+            FROM messages m
+            LEFT JOIN chats c ON c.jid = m.chat_jid
+            WHERE datetime(m.timestamp) >= datetime(?)
+              AND m.chat_jid != ?
+              AND m.chat_jid NOT LIKE '%status@broadcast'
+            ORDER BY m.timestamp ASC
+            """,
+            (since_iso, WHATSAPP_BOT_JID),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+    by_chat: dict[str, dict] = {}
+    for r in rows:
+        jid = r["jid"] or ""
+        label = _wa_chat_label(r["chat_name"] or "", jid)
+        # Drop unnamed contacts — same policy as morning brief.
+        if label.startswith("Contacto …") and not any(ch.isalpha() for ch in (r["chat_name"] or "")):
+            continue
+        content = (r["content"] or "").strip().replace("\n", " ")
+        if not content and r["media_type"]:
+            content = f"[{r['media_type']}]"
+        if not content:
+            continue
+        is_from_me = bool(r["is_from_me"])
+        who = "yo" if is_from_me else (r["sender"] or "").split("@")[0] or label
+        entry = by_chat.setdefault(jid, {
+            "jid": jid,
+            "label": label,
+            "is_group": jid.endswith("@g.us"),
+            "inbound": 0,
+            "messages": [],
+            "new_ids": [],
+        })
+        msg_id = r["id"] or ""
+        new = msg_id and msg_id not in processed_ids
+        if not is_from_me:
+            entry["inbound"] += 1
+        entry["messages"].append({
+            "id": msg_id,
+            "ts": r["ts"] or "",
+            "who": who,
+            "text": content[:400],
+            "is_from_me": is_from_me,
+            "new": new,
+        })
+        if new:
+            entry["new_ids"].append(msg_id)
+
+    out: list[dict] = []
+    for entry in by_chat.values():
+        if entry["inbound"] < WA_TASKS_MIN_INBOUND:
+            continue
+        # Skip chats with no *new* inbound messages — purely-read context,
+        # nothing to extract. (new_ids includes outbound; re-filter.)
+        new_inbound = sum(
+            1 for m in entry["messages"] if m["new"] and not m["is_from_me"]
+        )
+        if new_inbound == 0:
+            continue
+        # Keep the tail window — extraction cares about recent state.
+        entry["messages"] = entry["messages"][-WA_TASKS_MAX_MSGS_PER_CHAT:]
+        out.append(entry)
+
+    out.sort(key=lambda e: e["inbound"], reverse=True)
+    return out[:WA_TASKS_MAX_CHATS]
+
+
+def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -> dict:
+    """LLM-extract action items from a chat window.
+
+    Conservative prompt: only flag items a human would genuinely action.
+    Returns ``{"tasks": [str], "questions": [str], "commitments": [str]}``
+    (empty lists on LLM failure — callers treat as "nothing to extract",
+    not as an error). Deterministic via HELPER_OPTIONS.
+
+    `commitments` are things the user (yo) promised to do; `tasks` are
+    asks directed at the user; `questions` are open questions addressed
+    to the user that still need an answer.
+    """
+    empty = {"tasks": [], "questions": [], "commitments": []}
+    if not messages:
+        return empty
+    convo_lines: list[str] = []
+    for m in messages:
+        ts = (m["ts"] or "")[:16].replace("T", " ")
+        convo_lines.append(f"[{ts}] {m['who']}: {m['text']}")
+    convo = "\n".join(convo_lines)
+    if len(convo) > 6000:
+        convo = convo[-6000:]
+    kind = "grupo" if is_group else "chat directo"
+    prompt = (
+        f"Conversación de WhatsApp ({kind}): {chat_label}\n\n"
+        f"{convo}\n\n"
+        "Extraé solo items accionables reales para \"yo\" (el usuario). "
+        "Sé conservador: si no está claro que sea una acción, omitilo. "
+        "Ignorá saludos, small talk, memes, reacciones.\n\n"
+        "- tasks: cosas que alguien le pidió a yo (hacer X, mandar Y, revisar Z).\n"
+        "- questions: preguntas dirigidas a yo que aún no respondió.\n"
+        "- commitments: cosas que yo prometió hacer (\"te mando…\", \"mañana te paso…\").\n\n"
+        "Cada item: frase corta en español, 1 línea, sin nombre del chat ni timestamps. "
+        "Si no hay nada en una categoría, lista vacía. "
+        "Formato estricto JSON: "
+        "{\"tasks\": [\"...\"], \"questions\": [\"...\"], \"commitments\": [\"...\"]}"
+    )
+    try:
+        resp = _summary_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = (resp.message.content or "").strip()
+        data = json.loads(raw)
+    except Exception:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    out = {"tasks": [], "questions": [], "commitments": []}
+    for key in out:
+        items = data.get(key) or []
+        if not isinstance(items, list):
+            continue
+        seen: set[str] = set()
+        for item in items[:10]:
+            if not isinstance(item, str):
+                continue
+            clean = item.strip().strip("-•*").strip()
+            if len(clean) < 4 or len(clean) > 240:
+                continue
+            key_norm = clean.lower()
+            if key_norm in seen:
+                continue
+            seen.add(key_norm)
+            out[key].append(clean)
+    return out
+
+
+def _wa_chat_month_link(jid: str, label: str, ts_iso: str) -> str:
+    """Wikilink to the vault-sync'd chat note for the message's month.
+
+    Falls back to just the label if the month can't be parsed. The link
+    target mirrors `whatsapp-to-vault`'s layout:
+    `03-Resources/WhatsApp/<slug>/YYYY-MM.md`.
+    """
+    slug_src = label if any(ch.isalpha() for ch in label) else (jid.split("@")[0] or "sin-nombre")
+    # Same slug rule as vault-sync: strip non-word/dash/dot/space.
+    slug = re.sub(r"[^\w\-\. ]+", "", slug_src).strip()
+    slug = re.sub(r"\s+", " ", slug)[:80] or "sin-nombre"
+    try:
+        dt = datetime.fromisoformat(ts_iso[:19].replace(" ", "T"))
+        ym = dt.strftime("%Y-%m")
+    except Exception:
+        return f"[[{label}]]"
+    return f"[[03-Resources/WhatsApp/{slug}/{ym}|{label}]]"
+
+
+def _wa_tasks_write_note(
+    vault: Path,
+    run_ts: datetime,
+    by_chat: list[dict],
+    extractions: list[dict],
+) -> tuple[Path, bool, int]:
+    """Append a timestamped section to `00-Inbox/WA-YYYY-MM-DD.md`.
+
+    Creates the file with frontmatter on first write of the day. Later
+    runs append under a new `## HH:MM` heading so the same-day history is
+    preserved. Returns ``(path, created, new_items)``. If every extraction
+    came back empty, writes nothing and returns `(path, False, 0)`.
+    """
+    total_items = sum(
+        len(e["tasks"]) + len(e["questions"]) + len(e["commitments"])
+        for e in extractions
+    )
+    date_str = run_ts.strftime("%Y-%m-%d")
+    note_path = vault / INBOX_FOLDER / f"WA-{date_str}.md"
+    if total_items == 0:
+        return note_path, False, 0
+
+    lines: list[str] = []
+    section = f"## {run_ts.strftime('%H:%M')} — {sum(1 for e in extractions if any(e[k] for k in ('tasks','questions','commitments')))} chats\n"
+    lines.append(section)
+    for chat, ext in zip(by_chat, extractions):
+        if not any(ext[k] for k in ("tasks", "questions", "commitments")):
+            continue
+        first_new_ts = next(
+            (m["ts"] for m in chat["messages"] if m["new"] and not m["is_from_me"]),
+            chat["messages"][-1]["ts"] if chat["messages"] else "",
+        )
+        link = _wa_chat_month_link(chat["jid"], chat["label"], first_new_ts)
+        lines.append(f"### {link}\n")
+        for t in ext["tasks"]:
+            lines.append(f"- [ ] {t}")
+        for q in ext["questions"]:
+            lines.append(f"- ❓ {q}")
+        for c in ext["commitments"]:
+            lines.append(f"- 📌 {c}")
+        lines.append("")
+
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    created = not note_path.exists()
+    if created:
+        header = [
+            "---",
+            "source: whatsapp",
+            "type: wa-tasks",
+            f"date: {date_str}",
+            "ambient: skip",
+            "tags:",
+            "- whatsapp",
+            "- tasks/wa",
+            "---",
+            "",
+            f"# WhatsApp — tareas {date_str}",
+            "",
+        ]
+        body = "\n".join(header + lines) + "\n"
+        note_path.write_text(body, encoding="utf-8")
+    else:
+        existing = note_path.read_text(encoding="utf-8")
+        if not existing.endswith("\n"):
+            existing += "\n"
+        note_path.write_text(existing + "\n".join(lines) + "\n", encoding="utf-8")
+    return note_path, created, total_items
+
+
 # ── Recent user queries ─────────────────────────────────────────────────────
 
 def _fetch_recent_queries(
@@ -15816,6 +16381,120 @@ def _generate_today_narrative(prompt: str) -> str:
         return ""
 
 
+@cli.command("wa-tasks")
+@click.option("--dry-run", is_flag=True,
+              help="Imprimir acciones extraídas sin escribir el archivo")
+@click.option("--hours", type=int, default=None,
+              help="Ventana en horas (default: desde último run, o 24h si es la primera corrida)")
+@click.option("--force", is_flag=True,
+              help="Ignorar state file: procesar toda la ventana como si nunca se hubiera corrido")
+def wa_tasks(dry_run: bool, hours: int | None, force: bool):
+    """Extrae tareas, preguntas y compromisos de WhatsApp al Inbox.
+
+    Lee delta del bridge SQLite (is_from_me=0, ventana incremental vs último
+    run). Agrupa por chat; si un chat tiene ≥2 mensajes entrantes nuevos,
+    qwen2.5:3b destila action items. Escribe `00-Inbox/WA-YYYY-MM-DD.md`
+    con frontmatter `ambient: skip` (evita loop) + wikilinks al archivo
+    del chat/mes. Idempotente: sin items nuevos → no-op silencioso.
+
+    Ideal como launchd cada 30min — el file dispara el watch (00-Inbox
+    no está excluido), el morning lo ve como evidencia, y `rag query`
+    lo recupera como cualquier otra nota.
+    """
+    now = datetime.now()
+    state = _wa_tasks_load_state() if not force else {"last_run_ts": None, "processed_ids": []}
+    if hours is not None:
+        since = now - timedelta(hours=max(1, int(hours)))
+    elif state.get("last_run_ts"):
+        try:
+            since = datetime.fromisoformat(state["last_run_ts"])
+        except Exception:
+            since = now - timedelta(hours=24)
+    else:
+        since = now - timedelta(hours=24)
+
+    processed = set(state.get("processed_ids") or [])
+    by_chat = _fetch_whatsapp_window(since, now, processed)
+    if not by_chat:
+        console.print(f"[dim]sin chats con actividad nueva desde {since:%Y-%m-%d %H:%M}[/dim]")
+        if not dry_run:
+            state["last_run_ts"] = now.isoformat(timespec="seconds")
+            _wa_tasks_save_state(state)
+        return
+
+    console.print(
+        f"[dim]Ventana:[/dim] {since:%Y-%m-%d %H:%M} → {now:%H:%M} · "
+        f"{len(by_chat)} chats con nuevos mensajes entrantes"
+    )
+    extractions: list[dict] = []
+    for chat in by_chat:
+        ext = _wa_extract_actions(chat["label"], chat["is_group"], chat["messages"])
+        extractions.append(ext)
+        n = len(ext["tasks"]) + len(ext["questions"]) + len(ext["commitments"])
+        tag = "[green]✓[/green]" if n else "[dim]·[/dim]"
+        console.print(f"  {tag} [cyan]{chat['label']}[/cyan] · {chat['inbound']} inbound → {n} items")
+
+    total = sum(
+        len(e["tasks"]) + len(e["questions"]) + len(e["commitments"])
+        for e in extractions
+    )
+    if total == 0:
+        console.print("[yellow]sin items accionables extraídos[/yellow]")
+        if not dry_run:
+            state["last_run_ts"] = now.isoformat(timespec="seconds")
+            # Still record the fetched msg ids so we don't re-scan them next run.
+            for chat in by_chat:
+                for mid in chat["new_ids"]:
+                    state.setdefault("processed_ids", []).append(mid)
+            _wa_tasks_save_state(state)
+        return
+
+    if dry_run:
+        console.print(f"\n[bold]{total} items extraídos (dry-run — no se escribe)[/bold]")
+        for chat, ext in zip(by_chat, extractions):
+            if not any(ext[k] for k in ("tasks", "questions", "commitments")):
+                continue
+            console.print(f"\n[cyan]{chat['label']}[/cyan]")
+            for t in ext["tasks"]:
+                console.print(f"  [ ] {t}")
+            for q in ext["questions"]:
+                console.print(f"  ❓ {q}")
+            for c in ext["commitments"]:
+                console.print(f"  📌 {c}")
+        return
+
+    note_path, created, n_new = _wa_tasks_write_note(
+        VAULT_PATH, now, by_chat, extractions,
+    )
+    # Update state with ALL fetched new ids (including ones from chats that
+    # produced no extractions — we don't want to reprocess them).
+    for chat in by_chat:
+        for mid in chat["new_ids"]:
+            state.setdefault("processed_ids", []).append(mid)
+    state["last_run_ts"] = now.isoformat(timespec="seconds")
+    _wa_tasks_save_state(state)
+
+    # Append to log for analytics / debugging.
+    try:
+        WA_TASKS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with WA_TASKS_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": now.isoformat(timespec="seconds"),
+                "since": since.isoformat(timespec="seconds"),
+                "chats": len(by_chat),
+                "items": n_new,
+                "path": str(note_path.relative_to(VAULT_PATH)),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    rel = note_path.relative_to(VAULT_PATH)
+    verb = "creado" if created else "actualizado"
+    console.print(
+        f"\n[green]✓[/green] {verb}: [cyan]{rel}[/cyan] · {n_new} items"
+    )
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")
@@ -17180,6 +17859,41 @@ def _today_plist(rag_bin: str) -> str:
 """
 
 
+def _wa_tasks_plist(rag_bin: str) -> str:
+    """WhatsApp action-item extractor — every 30min.
+
+    Reads delta from the bridge SQLite since last run and distills tasks/
+    questions/commitments to `00-Inbox/WA-YYYY-MM-DD.md`. Cheap: one
+    qwen2.5:3b call per chat with new inbound messages (capped at 12
+    chats). `ambient: skip` in the output frontmatter prevents the
+    WhatsApp push loop.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-wa-tasks</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>wa-tasks</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-tasks.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-tasks.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _emergent_plist(rag_bin: str) -> str:
     """Proactive #2 — emergent theme detector, viernes 10am."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -17299,6 +18013,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _patterns_plist(rag_bin)),
         ("com.fer.obsidian-rag-archive", "com.fer.obsidian-rag-archive.plist",
          _archive_plist(rag_bin)),
+        ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
+         _wa_tasks_plist(rag_bin)),
     ]
 
 
@@ -17348,7 +18064,7 @@ def setup(remove: bool):
     if not remove:
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks}}.{{log,error.log}}[/dim]"
         )
 
 
@@ -18454,6 +19170,62 @@ def stats():
         console.print(f"[cyan]Feedback:[/cyan] 👍 {pos} · 👎 {neg}  [dim]({FEEDBACK_PATH})[/dim]")
 
 
+@cli.command("open")
+@click.argument("path")
+@click.option("--query", default=None, help="Triggering query, forwarded to behavior log")
+@click.option("--rank", default=None, type=int, help="1-indexed rank among results when opened")
+@click.option("--source", default="cli", help="Event source: cli | whatsapp | web | brief")
+@click.option("--session", default=None, help="Session id, forwarded to behavior log")
+def open_cmd(path: str, query: str | None, rank: int | None, source: str, session: str | None):
+    """Open a vault note and record an open event in behavior.jsonl.
+
+    PATH may be vault-relative (e.g. 01-Projects/foo.md) or absolute.
+    The file is opened via macOS `open` (hands off to the default .md handler).
+    An open event is appended to ~/.local/share/obsidian-rag/behavior.jsonl
+    for use by the ranker-vivo pipeline.
+
+    When RAG_TRACK_OPENS=1 terminals emit x-rag-open:// URIs instead of
+    file:// — registering `rag open` as the x-rag-open handler routes clicks
+    through this command so every note-open from query results is logged.
+    """
+    import subprocess
+
+    p = Path(path)
+    if not p.is_absolute():
+        resolved = VAULT_PATH / p
+    else:
+        resolved = p
+
+    if not resolved.exists():
+        click.echo(f"error: path not found: {resolved}", err=True)
+        raise SystemExit(1)
+
+    try:
+        inside_vault = resolved.resolve().is_relative_to(VAULT_PATH.resolve())
+    except Exception:
+        inside_vault = False
+
+    if inside_vault:
+        rel_path = str(resolved.resolve().relative_to(VAULT_PATH.resolve()))
+        ev: dict = {"source": source, "event": "open", "path": rel_path}
+        if query is not None:
+            ev["query"] = query
+        if rank is not None:
+            ev["rank"] = rank
+        if session is not None:
+            ev["session"] = session
+        log_behavior_event(ev)
+    else:
+        ev_ext: dict = {"source": source, "event": "open_external"}
+        if query is not None:
+            ev_ext["query"] = query
+        if session is not None:
+            ev_ext["session"] = session
+        log_behavior_event(ev_ext)
+
+    subprocess.run(["open", str(resolved)])
+
+
 @cli.group()
 def vault():
     """Multi-vault: registrar / cambiar / listar vaults de Obsidian.
@@ -18877,6 +19649,7 @@ _JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 10 MB threshold for log rotation
 
 _JSONL_LOG_PATHS: list[tuple[str, Path]] = [
     ("queries.jsonl", LOG_PATH),
+    ("behavior.jsonl", BEHAVIOR_LOG_PATH),
     ("contradictions.jsonl", CONTRADICTION_LOG_PATH),
     ("ambient.jsonl", AMBIENT_LOG_PATH),
     ("ambient_state.jsonl", AMBIENT_STATE_PATH),
@@ -19119,6 +19892,99 @@ def _find_orphan_collections() -> list[str]:
     return [c for c in all_cols if c not in known]
 
 
+def _find_orphan_segment_dirs() -> list[tuple[Path, int]]:
+    """Detect HNSW segment directories on disk not referenced in chroma.sqlite3.
+
+    Chroma's `delete_collection` removes rows from `segments` but sometimes
+    leaves the on-disk HNSW files behind. Over many v-bumps and --reset cycles
+    this can accumulate into tens of GB. Returns [(path, size_bytes), ...].
+    """
+    sqlite_path = DB_PATH / "chroma.sqlite3"
+    if not sqlite_path.is_file():
+        return []
+    import sqlite3 as _sqlite
+    try:
+        conn = _sqlite.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        try:
+            live_ids = {row[0] for row in conn.execute("SELECT id FROM segments")}
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    orphans: list[tuple[Path, int]] = []
+    for child in DB_PATH.iterdir():
+        if not child.is_dir():
+            continue
+        # Segment dirs are UUIDs (36 chars with dashes)
+        name = child.name
+        if len(name) != 36 or name.count("-") != 4:
+            continue
+        if name in live_ids:
+            continue
+        size = 0
+        try:
+            for p in child.rglob("*"):
+                if p.is_file():
+                    size += p.stat().st_size
+        except OSError:
+            pass
+        orphans.append((child, size))
+    return orphans
+
+
+def _prune_orphan_segment_dirs(dry_run: bool = False) -> dict:
+    """Delete orphan HNSW segment dirs. Returns {count, bytes_freed, paths}."""
+    orphans = _find_orphan_segment_dirs()
+    total = sum(sz for _, sz in orphans)
+    out: dict = {
+        "count": len(orphans),
+        "bytes_freed": total,
+        "paths": [p.name for p, _ in orphans],
+    }
+    if dry_run or not orphans:
+        return out
+    import shutil as _shutil
+    removed = 0
+    freed = 0
+    for path, sz in orphans:
+        try:
+            _shutil.rmtree(path)
+            removed += 1
+            freed += sz
+        except OSError:
+            pass
+    out["count"] = removed
+    out["bytes_freed"] = freed
+    return out
+
+
+def _chroma_wal_checkpoint(dry_run: bool = False) -> dict:
+    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on chroma.sqlite3.
+
+    Safer than VACUUM — doesn't require exclusive lock and truncates the
+    write-ahead log after flushing. Returns {before_bytes, after_bytes, ok}.
+    """
+    sqlite_path = DB_PATH / "chroma.sqlite3"
+    wal_path = DB_PATH / "chroma.sqlite3-wal"
+    if not sqlite_path.is_file():
+        return {"ok": False, "reason": "no sqlite file"}
+    before = sqlite_path.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
+    if dry_run:
+        return {"ok": True, "before_bytes": before, "after_bytes": before, "dry_run": True}
+    import sqlite3 as _sqlite
+    try:
+        conn = _sqlite.connect(str(sqlite_path), timeout=5.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "before_bytes": before}
+    after = sqlite_path.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
+    return {"ok": True, "before_bytes": before, "after_bytes": after}
+
+
 def run_maintenance(
     *,
     dry_run: bool = False,
@@ -19154,6 +20020,18 @@ def run_maintenance(
             except Exception:
                 pass
         results["orphan_collections_removed"] = len(orphan_cols)
+
+    # 3b. Orphan HNSW segment dirs (files left behind by delete_collection / --reset)
+    try:
+        results["orphan_segments"] = _prune_orphan_segment_dirs(dry_run=dry_run)
+    except Exception as e:
+        results["orphan_segments_error"] = str(e)
+
+    # 3c. WAL checkpoint (compacts chroma.sqlite3-wal)
+    try:
+        results["wal_checkpoint"] = _chroma_wal_checkpoint(dry_run=dry_run)
+    except Exception as e:
+        results["wal_checkpoint_error"] = str(e)
 
     # 4. Context cache pruning
     try:
@@ -19355,6 +20233,29 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
         console.print(f"  [bold]Orphan collections:[/bold] [yellow]{action} {len(orphans)}[/yellow]: {', '.join(orphans)}")
     else:
         console.print("  [bold]Orphan collections:[/bold] [dim]none[/dim]")
+
+    # ── Orphan segment dirs ──
+    seg = results.get("orphan_segments") or {}
+    n_seg = seg.get("count", 0)
+    if n_seg:
+        verb = "would free" if dry_run else "freed"
+        mb = seg.get("bytes_freed", 0) / (1024 * 1024)
+        console.print(f"  [bold]Orphan segments:[/bold] [yellow]{n_seg} dirs, {verb} {mb:.0f} MB[/yellow]")
+    else:
+        console.print("  [bold]Orphan segments:[/bold] [dim]none[/dim]")
+
+    # ── WAL checkpoint ──
+    wal = results.get("wal_checkpoint") or {}
+    if wal.get("ok"):
+        b = wal.get("before_bytes", 0) / (1024 * 1024)
+        a = wal.get("after_bytes", 0) / (1024 * 1024)
+        if dry_run:
+            console.print(f"  [bold]WAL:[/bold] [dim]{b:.1f} MB (dry-run)[/dim]")
+        else:
+            console.print(f"  [bold]WAL:[/bold] checkpoint {b:.1f} → {a:.1f} MB")
+    elif "wal_checkpoint_error" in results or wal.get("reason"):
+        reason = results.get("wal_checkpoint_error") or wal.get("reason")
+        console.print(f"  [bold]WAL:[/bold] [dim red]skipped: {reason}[/dim red]")
 
     # ── Context cache ──
     pruned = results.get("context_cache_pruned", 0)

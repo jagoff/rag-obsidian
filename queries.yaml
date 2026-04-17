@@ -101,6 +101,101 @@ queries:
     expected:
       - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
 
+  # === Expansión 2026-04-17: carpetas sub-representadas ===
+  # 03-Resources/Agile
+  - question: "objetivos SMART"
+    expected:
+      - 03-Resources/Agile/Objetivos SMART.md
+
+  - question: "retrospectiva del barco"
+    expected:
+      - 03-Resources/Agile/Retrospectiva del barco.md
+
+  - question: "liberating structures facilitación"
+    expected:
+      - 03-Resources/Agile/Liberating structures.md
+
+  - question: "consejos para equipos remotos"
+    expected:
+      - 03-Resources/Agile/Consejos para equipos con trabajo remoto.md
+
+  # 03-Resources/Tech
+  - question: "shortcuts de macos"
+    expected:
+      - 03-Resources/Tech/MacOS - Shorcuts.md
+
+  - question: "prompts para chatgpt"
+    expected:
+      - 03-Resources/Tech/Chat GPT prompts.md
+
+  - question: "sincronizar dos cuentas de dropbox en la misma mac"
+    expected:
+      - 03-Resources/Tech/Dropbox - Sync 2 accounts on the same SO.md
+
+  # 02-Areas/Personal — Guitar
+  - question: "axe fx 3 configuración"
+    expected:
+      - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+
+  - question: "equipo de guitarra que tengo"
+    expected:
+      - 02-Areas/Personal/Guitar/Guitar - Gear.md
+      - 03-Resources/Equipamiento - Amps.md
+
+  # 02-Areas/Musica (non-Coaching)
+  - question: "letra de sal"
+    expected:
+      - 02-Areas/Musica/Sal/Letra - Sal.md
+      - 02-Areas/Musica/Sal/Letra - Sal AI.md
+
+  - question: "letra de apagado"
+    expected:
+      - 02-Areas/Personal/Letras - Escritos/Apagado.md
+
+  # 01-Projects (non-RAG-Local)
+  - question: "arquitectura de obsidian-rag"
+    expected:
+      - 01-Projects/obsidian-rag/obsidian-rag - Arquitectura.md
+
+  - question: "pipelines de obsidian-rag"
+    expected:
+      - 01-Projects/obsidian-rag/obsidian-rag - Pipelines.md
+
+  - question: "bots y automatización del rag"
+    expected:
+      - 01-Projects/obsidian-rag/obsidian-rag - Automatización y bots.md
+
+  # 04-Archive — memorias PARA
+  - question: "feedback sobre stack local free"
+    expected:
+      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_local_free_stack.md
+
+  - question: "por qué hyde falla con modelos chicos"
+    expected:
+      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_hyde_small_models.md
+
+  - question: "estructura PARA del vault"
+    expected:
+      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_obsidian_para.md
+
+  # 03-Resources/Personal-ref/Info — queries diagnósticas
+  - question: "info del banco santander"
+    expected:
+      - 03-Resources/Personal-ref/Info/Info - Banco Santander.md
+
+  - question: "info del banco icbc"
+    expected:
+      - 03-Resources/Personal-ref/Info/Info - Banco ICBC.md
+
+  - question: "dónde está guardado el cbu del alquiler"
+    expected:
+      - 03-Resources/Personal-ref/Info/Info - CBU Alquiler.md
+
+  # Hard: acronym / techy phrasing
+  - question: "cómo grabé un podcast"
+    expected:
+      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per
@@ -223,4 +318,42 @@ chains:
           - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
           - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
           - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
+
+  # === Chains 2026-04-17: cross-folder + acronym follow-up ===
+  # Agile: entidad concreta → pronombre "y la otra" → otra nota del mismo folder
+  - id: agile-smart-retro
+    turns:
+      - question: "objetivos SMART"
+        expected:
+          - 03-Resources/Agile/Objetivos SMART.md
+      - question: "y la retrospectiva del barco"
+        expected:
+          - 03-Resources/Agile/Retrospectiva del barco.md
+      - question: "qué otras dinámicas tengo en esa carpeta"
+        expected:
+          - 03-Resources/Agile/Dinamicas grupales.md
+          - 03-Resources/Agile/Liberating structures.md
+
+  # Guitar: axe fx → "y mi equipo" → cross-folder (Amps en 03-Resources)
+  - id: guitar-gear
+    turns:
+      - question: "axe fx 3 configuración"
+        expected:
+          - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+      - question: "y qué equipo de guitarra tengo"
+        expected:
+          - 02-Areas/Personal/Guitar/Guitar - Gear.md
+      - question: "qué amplificadores uso"
+        expected:
+          - 03-Resources/Equipamiento - Amps.md
+
+  # Info bancaria: pronombre "y el otro" cross-banco
+  - id: info-bancos
+    turns:
+      - question: "info del banco santander"
+        expected:
+          - 03-Resources/Personal-ref/Info/Info - Banco Santander.md
+      - question: "y el icbc"
+        expected:
+          - 03-Resources/Personal-ref/Info/Info - Banco ICBC.md
 

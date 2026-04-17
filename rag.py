@@ -376,6 +376,7 @@ VAULT_PATH = _resolve_vault_path()
 DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
+BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -426,6 +427,34 @@ def log_query_event(event: dict) -> None:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
+    except Exception:
+        pass
+
+
+def log_behavior_event(event: dict) -> None:
+    """Enqueue a user-behavior event for background append to behavior.jsonl.
+
+    Schema fields (all optional except source+event):
+      ts         — ISO8601 second-precision; injected if absent
+      source     — "cli" | "whatsapp" | "web" | "brief"
+      event      — "open" | "open_external" | "positive_implicit" |
+                   "negative_implicit" | "kept" | "deleted" | "save" | "explore"
+      query      — triggering query text, if any
+      path       — vault-relative note path
+      rank       — 1-indexed rank among results when event occurred
+      dwell_ms   — milliseconds before next user action
+      session    — session id
+
+    Empty dict is a no-op. Never raises; safe from any thread.
+    Shared contract: other writers (TypeScript WhatsApp listener, FastAPI web)
+    append to the same absolute path ~/.local/share/obsidian-rag/behavior.jsonl.
+    """
+    if not event:
+        return
+    try:
+        event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
     except Exception:
         pass
 
@@ -1039,20 +1068,181 @@ FEEDBACK_NEGATIVE_PENALTY = 0.15
 RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
 
 
+# ── Behavior priors ──────────────────────────────────────────────────────────
+# Aggregates user-interaction events from behavior.jsonl into per-path CTR,
+# per-folder CTR, per-(path, hour) CTR, and dwell scores for use as ranking
+# signals in collect_ranker_features() / retrieve().
+#
+# Positive events: open, positive_implicit, save, kept
+# Negative events: negative_implicit, deleted
+#
+# Approximation note: we don't have full impression logs (we'd need to log
+# every retrieve() call with all returned paths). As a proxy, each behavior
+# event counts as both an impression (denominator) and optionally a click
+# (numerator=1 for positive events, numerator=0 for negative). This means
+# CTR is computed over interactions only, biased toward active paths. When
+# query logs get richer we can improve — for now Laplace smoothing
+# (clicks+1)/(impressions+10) keeps sparse paths from dominating.
+
+_BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept"})
+_BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
+
+_behavior_priors_cache: dict | None = None
+_behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size)
+
+
+def _load_behavior_priors() -> dict:
+    """Read behavior.jsonl and return an immutable aggregated snapshot.
+
+    Returns a dict with keys:
+      click_prior        {path: ctr_float}          — per-path CTR with Laplace
+      click_prior_folder {folder: ctr_float}        — top-level folder CTR
+      click_prior_hour   {(path, hour_int): ctr}    — path × hour CTR
+      dwell_score        {path: log1p(mean_dwell_s)} — dwell signal, log-transformed
+      n_events           int                         — total events parsed
+      hash               str                         — content key for debugging
+
+    All four feature dicts default to 0.0 for unseen keys. Safe when
+    behavior.jsonl is missing, empty, or corrupt — returns empty snapshot.
+    Never raises.
+    """
+    global _behavior_priors_cache, _behavior_priors_cache_key
+
+    try:
+        if BEHAVIOR_LOG_PATH.is_file():
+            stat = BEHAVIOR_LOG_PATH.stat()
+            cache_key: tuple[float, int] = (stat.st_mtime, stat.st_size)
+        else:
+            cache_key = (0.0, 0)
+    except OSError:
+        cache_key = (0.0, 0)
+
+    if _behavior_priors_cache is not None and _behavior_priors_cache_key == cache_key:
+        return _behavior_priors_cache
+
+    # Build fresh snapshot
+    # Impression/click accumulators: {key: [clicks, impressions]}
+    path_acc: dict[str, list[int]] = {}
+    folder_acc: dict[str, list[int]] = {}
+    hour_acc: dict[tuple[str, int], list[int]] = {}
+    dwell_acc: dict[str, list[float]] = {}
+    n_events = 0
+
+    try:
+        if BEHAVIOR_LOG_PATH.is_file():
+            raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+
+                event_type = ev.get("event", "")
+                path = ev.get("path", "")
+                if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
+                    continue
+
+                n_events += 1
+                is_click = 1 if event_type in _BEHAVIOR_POSITIVE else 0
+
+                # Per-path
+                if path not in path_acc:
+                    path_acc[path] = [0, 0]
+                path_acc[path][0] += is_click
+                path_acc[path][1] += 1
+
+                # Per-folder (top-level directory of path)
+                folder = path.split("/")[0] if "/" in path else ""
+                if folder:
+                    if folder not in folder_acc:
+                        folder_acc[folder] = [0, 0]
+                    folder_acc[folder][0] += is_click
+                    folder_acc[folder][1] += 1
+
+                # Per-(path, hour) — parse hour from ts field
+                try:
+                    ts_str = ev.get("ts", "")
+                    if ts_str:
+                        hour = int(ts_str[11:13])  # "YYYY-MM-DDTHH:..." → HH
+                        key_h = (path, hour)
+                        if key_h not in hour_acc:
+                            hour_acc[key_h] = [0, 0]
+                        hour_acc[key_h][0] += is_click
+                        hour_acc[key_h][1] += 1
+                except (ValueError, IndexError):
+                    pass
+
+                # Dwell (only from positive events with dwell_ms)
+                dwell_ms = ev.get("dwell_ms")
+                if dwell_ms is not None and is_click:
+                    try:
+                        dwell_acc.setdefault(path, []).append(float(dwell_ms))
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:
+        pass
+
+    import math
+
+    def _laplace_ctr(clicks: int, impressions: int) -> float:
+        """Laplace-smoothed CTR: (clicks+1)/(impressions+10)."""
+        return (clicks + 1) / (impressions + 10)
+
+    click_prior: dict[str, float] = {
+        p: _laplace_ctr(acc[0], acc[1]) for p, acc in path_acc.items()
+    }
+    click_prior_folder: dict[str, float] = {
+        f: _laplace_ctr(acc[0], acc[1]) for f, acc in folder_acc.items()
+    }
+    click_prior_hour: dict[tuple[str, int], float] = {
+        k: _laplace_ctr(acc[0], acc[1]) for k, acc in hour_acc.items()
+    }
+    dwell_score: dict[str, float] = {
+        p: math.log1p(sum(ms_list) / len(ms_list) / 1000.0)
+        for p, ms_list in dwell_acc.items()
+        if ms_list
+    }
+
+    snapshot = {
+        "click_prior": click_prior,
+        "click_prior_folder": click_prior_folder,
+        "click_prior_hour": click_prior_hour,
+        "dwell_score": dwell_score,
+        "n_events": n_events,
+        "hash": f"{cache_key[0]:.3f}:{cache_key[1]}",
+    }
+
+    _behavior_priors_cache = snapshot
+    _behavior_priors_cache_key = cache_key
+    return snapshot
+
+
 class RankerWeights:
     """Linear combination aplicada al rerank score. Pure dataclass-like.
 
     Fórmula del score final por candidato:
         score = rerank_logit
-              + recency_cue    * recency_raw   [si has_recency_cue]
-              + recency_always * recency_raw   [siempre]
-              + tag_literal    * n_tag_matches [tags literales en la query]
-              + feedback_pos                   [path en feedback+ match cosine≥0.80]
-              - feedback_neg                   [path en feedback- match cosine≥0.80]
+              + recency_cue        * recency_raw      [si has_recency_cue]
+              + recency_always     * recency_raw      [siempre]
+              + tag_literal        * n_tag_matches    [tags literales en la query]
+              + graph_pagerank     * (pr/max_pr)      [wikilink authority]
+              + click_prior        * ctr_path         [behavior: path CTR]
+              + click_prior_folder * ctr_folder       [behavior: folder CTR]
+              + click_prior_hour   * ctr_path_hour    [behavior: path × hour CTR]
+              + dwell_score        * log1p(dwell_s)   [behavior: mean dwell]
+              + feedback_pos                          [path en feedback+ cosine≥0.80]
+              - feedback_neg                          [path en feedback- cosine≥0.80]
+
+    New behavior knobs default to 0.0 — inert until rag tune learns weights.
+    Backward compatible: old ranker.json without these keys falls back to 0.0.
     """
     __slots__ = (
         "recency_cue", "recency_always", "tag_literal",
         "feedback_pos", "feedback_neg", "graph_pagerank",
+        "click_prior", "click_prior_folder", "click_prior_hour", "dwell_score",
     )
 
     def __init__(
@@ -1063,6 +1253,10 @@ class RankerWeights:
         feedback_pos: float = FEEDBACK_POSITIVE_BOOST,
         feedback_neg: float = FEEDBACK_NEGATIVE_PENALTY,
         graph_pagerank: float = 0.0,
+        click_prior: float = 0.0,
+        click_prior_folder: float = 0.0,
+        click_prior_hour: float = 0.0,
+        dwell_score: float = 0.0,
     ):
         self.recency_cue = float(recency_cue)
         self.recency_always = float(recency_always)
@@ -1070,6 +1264,10 @@ class RankerWeights:
         self.feedback_pos = float(feedback_pos)
         self.feedback_neg = float(feedback_neg)
         self.graph_pagerank = float(graph_pagerank)
+        self.click_prior = float(click_prior)
+        self.click_prior_folder = float(click_prior_folder)
+        self.click_prior_hour = float(click_prior_hour)
+        self.dwell_score = float(dwell_score)
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}
@@ -5792,6 +5990,13 @@ def retrieve(
     weights = get_ranker_weights()
     # Graph PageRank: authority signal from wikilink topology.
     pagerank = get_pagerank(col) if weights.graph_pagerank else {}
+    # Behavior priors — loaded once per retrieve() call, safe when file absent.
+    _any_behavior_weight = any([
+        weights.click_prior, weights.click_prior_folder,
+        weights.click_prior_hour, weights.dwell_score,
+    ])
+    priors = _load_behavior_priors() if _any_behavior_weight else {}
+    _behavior_hour = datetime.now().hour if _any_behavior_weight else 0
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
@@ -5818,6 +6023,22 @@ def retrieve(
             pr = pagerank.get(path, 0.0)
             max_pr = max(pagerank.values()) if pagerank else 1.0
             final += weights.graph_pagerank * (pr / max_pr if max_pr > 0 else 0.0)
+        # Behavior priors: user interaction signals from behavior.jsonl.
+        # All weights default 0.0 so this block is a no-op without tuning.
+        if _any_behavior_weight and priors:
+            cp = priors.get("click_prior", {})
+            cf = priors.get("click_prior_folder", {})
+            ch = priors.get("click_prior_hour", {})
+            ds = priors.get("dwell_score", {})
+            path_folder = path.split("/")[0] if "/" in path else ""
+            if weights.click_prior and cp:
+                final += weights.click_prior * cp.get(path, 0.0)
+            if weights.click_prior_folder and cf:
+                final += weights.click_prior_folder * cf.get(path_folder, 0.0)
+            if weights.click_prior_hour and ch:
+                final += weights.click_prior_hour * ch.get((path, _behavior_hour), 0.0)
+            if weights.dwell_score and ds:
+                final += weights.dwell_score * ds.get(path, 0.0)
         # Feedback: additive boost/penalty para paths marcados 👍/👎 en queries
         # similares (cosine ≥ FEEDBACK_MATCH_COSINE). Módulo tuneable por
         # weights — el signo es fijo.
@@ -5892,6 +6113,49 @@ def retrieve(
                     pass
         except Exception:
             pass
+
+    # ── ε-exploration toggle ─────────────────────────────────────────────────
+    # When RAG_EXPLORE=1, randomly swap one top-3 result with a rank-4..7
+    # candidate at rate ε=0.1. This introduces deliberate exploration so the
+    # behavior log accumulates signal on lower-ranked notes — otherwise the
+    # feedback loop only reinforces already-top results.
+    #
+    # MUST be disabled during eval/tune (set RAG_EXPLORE env var to anything
+    # other than "1", or unset it). The eval command enforces this via an
+    # assertion. Only live retrieve() calls with RAG_EXPLORE=1 may use this.
+    #
+    # Randomness: secrets.randbelow — NOT reproducible by design. We want real
+    # diversity across sessions, not reproducible exploration slots.
+    if os.environ.get("RAG_EXPLORE") == "1" and len(docs) >= 3 and len(scored_all) > k:
+        import secrets
+        # Fire with probability ε=0.1 (10 out of 100 calls)
+        if secrets.randbelow(100) < 10:
+            try:
+                # Pick a random position in top-3 to evict (0-indexed)
+                evict_slot = secrets.randbelow(3)
+                # Pick a random candidate from ranks k..k+3 (extras pool)
+                extras_pool = scored_all[k:k + 4]  # up to 4 candidates
+                if extras_pool:
+                    swap_idx = secrets.randbelow(len(extras_pool))
+                    swap_c, swap_e, _swap_s = extras_pool[swap_idx]
+                    swap_meta = swap_c[1] if isinstance(swap_c[1], dict) else {}
+                    swap_path = swap_meta.get("file", "")
+                    # Swap in-place on the already-built lists
+                    docs[evict_slot] = swap_e
+                    metas[evict_slot] = swap_meta
+                    final_scores[evict_slot] = _swap_s
+                    new_rank = evict_slot + 1  # 1-indexed
+                    log_behavior_event({
+                        "source": "cli",
+                        "event": "explore",
+                        "path": swap_path,
+                        "rank": new_rank,
+                        "query": search_query,
+                    })
+                    # Recompute top_score after swap (may have changed)
+                    top_score = max(final_scores) if final_scores else top_score
+            except Exception:
+                pass  # exploration failure is silently ignored
 
     return {
         "docs": docs,
@@ -6063,6 +6327,11 @@ def collect_ranker_features(
           "rerank": float, "recency_raw": float,
           "tag_hits": int, "fb_pos": bool, "fb_neg": bool,
           "ignored": bool, "has_recency_cue": bool,
+          "graph_pagerank": float,
+          "click_prior": float,        # per-path CTR from behavior.jsonl
+          "click_prior_folder": float, # top-level folder CTR
+          "click_prior_hour": float,   # path × current-hour CTR
+          "dwell_score": float,        # log1p(mean_dwell_s) for path
         }
 
     Mirrors `retrieve()` but stops one step short of the weighted sort.
@@ -6153,6 +6422,10 @@ def collect_ranker_features(
     pagerank = get_pagerank(col)
     max_pr = max(pagerank.values()) if pagerank else 1.0
 
+    # Behavior priors — loaded once per call, never raises.
+    priors = _load_behavior_priors()
+    current_hour = datetime.now().hour
+
     feats: list[dict] = []
     for (_, meta, _), s in zip(candidates, rerank_scores):
         if not isinstance(meta, dict):
@@ -6162,6 +6435,8 @@ def collect_ranker_features(
         meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
         n_tag = len(query_tag_hits & meta_tags) if query_tag_hits else 0
         pr = pagerank.get(path, 0.0)
+        # Top-level folder (e.g. "02-Areas" from "02-Areas/Coaching/Note.md")
+        path_folder = path.split("/")[0] if "/" in path else ""
         feats.append({
             "path": path,
             "note": meta.get("note", ""),
@@ -6173,6 +6448,11 @@ def collect_ranker_features(
             "ignored": path in ignored_set,
             "has_recency_cue": bool(recency_cue),
             "graph_pagerank": float(pr / max_pr if max_pr > 0 else 0.0),
+            # Behavior signals — all default 0.0 when behavior.jsonl is missing
+            "click_prior": priors["click_prior"].get(path, 0.0),
+            "click_prior_folder": priors["click_prior_folder"].get(path_folder, 0.0),
+            "click_prior_hour": priors["click_prior_hour"].get((path, current_hour), 0.0),
+            "dwell_score": priors["dwell_score"].get(path, 0.0),
             "meta": meta,
         })
     return feats
@@ -6201,6 +6481,14 @@ def apply_weighted_scores(
             score += weights.tag_literal * f["tag_hits"]
         if weights.graph_pagerank and f.get("graph_pagerank"):
             score += weights.graph_pagerank * f["graph_pagerank"]
+        if weights.click_prior and f.get("click_prior"):
+            score += weights.click_prior * f["click_prior"]
+        if weights.click_prior_folder and f.get("click_prior_folder"):
+            score += weights.click_prior_folder * f["click_prior_folder"]
+        if weights.click_prior_hour and f.get("click_prior_hour"):
+            score += weights.click_prior_hour * f["click_prior_hour"]
+        if weights.dwell_score and f.get("dwell_score"):
+            score += weights.dwell_score * f["dwell_score"]
         if f["fb_pos"]:
             score += weights.feedback_pos
         if f["fb_neg"]:
@@ -9006,6 +9294,15 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool):
     MRR (mean reciprocal rank del mejor hit), recall@k (fracción de notas
     esperadas recuperadas por query, promediado).
     """
+    # Strip RAG_EXPLORE from env before running — a stale parent-shell export
+    # must not corrupt deterministic eval metrics. The assert below is a cheap
+    # defensive sanity check that fires if the pop somehow failed (dead code in
+    # practice, but documents the invariant clearly).
+    os.environ.pop("RAG_EXPLORE", None)
+    assert os.environ.get("RAG_EXPLORE") != "1", (
+        "RAG_EXPLORE must not be set during eval — it corrupts metrics"
+    )
+
     import pathlib
     path = pathlib.Path(queries_file)
     if not path.is_absolute():
@@ -9235,12 +9532,17 @@ TUNE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/tune.jsonl"
 # Search spaces for random sampling. Keep defaults inside the box so the
 # baseline is a representable sample (search includes the status quo).
 _TUNE_SPACE = {
-    "recency_cue":    (0.0, 0.35),   # default 0.10
-    "recency_always": (0.0, 0.10),   # default 0.00 (new signal)
-    "tag_literal":    (0.0, 0.20),   # default 0.00 (new signal)
-    "feedback_pos":   (0.0, 0.15),   # default 0.03
-    "feedback_neg":   (0.0, 0.50),   # default 0.15
-    "graph_pagerank": (0.0, 0.30),   # default 0.00 — wikilink authority signal
+    "recency_cue":        (0.0, 0.35),   # default 0.10
+    "recency_always":     (0.0, 0.10),   # default 0.00 (new signal)
+    "tag_literal":        (0.0, 0.20),   # default 0.00 (new signal)
+    "feedback_pos":       (0.0, 0.15),   # default 0.03
+    "feedback_neg":       (0.0, 0.50),   # default 0.15
+    "graph_pagerank":     (0.0, 0.30),   # default 0.00 — wikilink authority signal
+    # Behavior priors — inert at 0.0 until behavior.jsonl accumulates signal
+    "click_prior":        (0.0, 0.30),   # per-path CTR from open/save events
+    "click_prior_folder": (0.0, 0.15),   # top-level folder CTR
+    "click_prior_hour":   (0.0, 0.20),   # path × current-hour CTR
+    "dwell_score":        (0.0, 0.10),   # log1p(mean_dwell_s) per path
 }
 
 

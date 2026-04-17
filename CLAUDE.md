@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~16k lines) + `mcp_server.py` (thin wrapper) + `tests/` (715 tests, 33 files). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~21k lines) + `mcp_server.py` (thin wrapper) + `tests/` (883 tests, 44 files). Resist package-split until real friction shows up.
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -44,10 +44,11 @@ rag ambient status|disable|test [path]|log [-n N]
 rag ambient folders list|add <F>|remove <F>
 
 # Quality
-rag eval                                   # queries.yaml → hit@k, MRR, recall@k
-rag tune [--samples 500] [--apply]         # auto-calibrate ranker weights
+rag eval [--latency --max-p95-ms N]        # queries.yaml → hit@k, MRR, recall@k (+ bootstrap CI); gate on P95
+rag tune [--samples 500] [--apply] [--online --days 14] [--rollback]  # offline + online ranker-vivo loop
 rag log [-n 20] [--low-confidence]
 rag dashboard [--days 30]                  # analytics: scores, latency, topics, PageRank
+rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `open` path (ranker-vivo click tracking)
 
 # Maintenance
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
@@ -57,9 +58,17 @@ rag setup [--remove]                       # install/remove 9 launchd services
 
 # Tests
 .venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/test_foo.py::test_bar -q   # single test
 ```
 
 Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/share/uv/tools/obsidian-rag/`.
+
+### Env vars
+
+- `OBSIDIAN_RAG_VAULT` — override default vault path. Collections are namespaced per resolved path (sha256[:8]).
+- `RAG_TRACK_OPENS=1` — switches OSC 8 link scheme from `file://` to `x-rag-open://` so CLI clicks route through `rag open` (ranker-vivo signal capture). Absent = no behavior change.
+- `RAG_EXPLORE=1` — enable ε-exploration in `retrieve()` (10% chance to swap a top-3 result with a rank-4..7 candidate). Set on `morning`/`today` plists to generate counterfactuals. MUST be unset during `rag eval` — the command actively `os.environ.pop`s it and asserts, as a belt-and-suspenders guard.
+- `RAG_RERANKER_IDLE_TTL` — seconds the cross-encoder stays resident before idle-unload (default 900).
 
 ## Architecture — invariants
 
@@ -167,6 +176,8 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 **Read**: fetch URL → readability strip → gate (< 500 chars = error) → command-r summary → two-pass related lookup → tags from existing vocab (never invents) → `00-Inbox/`. Dry-run default, `--save` to write.
 
+**Ranker-vivo (closed-loop ranker)**: implicit feedback from daily use re-tunes `ranker.json` nightly without manual intervention. Four signal sources append to `behavior.jsonl`: (1) CLI `rag open` wrapper (opt-in via `RAG_TRACK_OPENS=1` + user-registered `x-rag-open://` handler); (2) WhatsApp listener classifying follow-up turns (`/save`, quoted reply → positive; "no"/"la otra"/rephrase → negative; 120s silence → weak positive); (3) web `/api/behavior` POST from home dashboard `sendBeacon` clicks; (4) morning/today brief diff (`_diff_brief_signal` compares yesterday's written brief vs current on-disk — wikilinks that survived = `kept`, missing = `deleted`, dedup via `brief_state.jsonl`). Nightly `com.fer.obsidian-rag-online-tune` at 03:30 runs `rag tune --online --days 14 --apply --yes`, which calls `_behavior_augmented_cases` (weight=0.5, drops conflicts), backs up current `ranker.json` → `ranker.{ts}.json` (keeps 3 newest), re-tunes, runs the bootstrap-CI gate (`_run_eval_gate`: scrubs `RAG_EXPLORE`, subprocess `rag eval`, 10min cap, regex parses hit@5). If singles < 76.19% OR chains < 63.64% (lower CI bounds of the 2026-04-17 expanded floor) → auto-rollback + exit 1 + log to `tune.jsonl`. `rag tune --rollback` restores the most recent backup manually.
+
 ## Eval baselines
 
 **Floor (2026-04-17, post-golden-expansion + bootstrap CI)** — queries.yaml doubled (21→42 singles, 9→12 chains; +15 singles in under-represented folders 03-Resources/Agile+Tech, 02-Areas/Personal, 01-Projects/obsidian-rag, 04-Archive memory). `rag eval` now reports percentile bootstrap 95% CI (1000 resamples, seed=42) alongside each metric + `rag eval --latency` reports P50/P95/P99 of retrieve() per bucket and accepts `--max-p95-ms` as a CI gate.
@@ -190,16 +201,20 @@ Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 
-- `chroma/` — ChromaDB collections (per-vault suffixed)
+- `chroma/` — ChromaDB collections (per-vault suffixed). Orphan HNSW segment dirs (not referenced in `segments` table) + stale WAL are cleaned by `rag maintenance` via `_prune_orphan_segment_dirs` + `_chroma_wal_checkpoint`. One 33GB orphan cleanup shipped 2026-04-17.
 - `queries.jsonl` — query log (q, variants, paths, scores, timings, mode, cmd)
 - `feedback.jsonl` / `feedback_golden.json` (cache, rebuilt lazy on mtime gap)
-- `ranker.json` — tuned weights. Delete = reset to hardcoded defaults
+- `behavior.jsonl` — ranker-vivo event log (4 sources: cli, whatsapp, web, brief). Rotated by `rag maintenance`.
+- `brief_written.jsonl` / `brief_state.jsonl` — brief diff sidecars (what was cited vs dedup of already-emitted kept/deleted pairs).
+- `ranker.json` — tuned weights. Delete = reset to hardcoded defaults.
+- `ranker.{unix_ts}.json` — 3 most recent backups, written on every `rag tune --apply`. Consumed by `rag tune --rollback` + auto-rollback CI gate.
 - `sessions/*.json` + `last_session` — multi-turn state
 - `contradictions.jsonl` — radar sidecar
 - `ambient.json` / `ambient.jsonl` / `ambient_state.jsonl` — config + log + dedup
 - `filing_batches/*.jsonl` — audit log (prefix `archive-*` for archiver)
-- `ignored_notes.json`, `tune.jsonl`
-- `*.{log,error.log}` — launchd service logs
+- `ignored_notes.json`, `tune.jsonl` (online-tune regressions also land here)
+- `online-tune.{log,error.log}` — nightly tune launchd output
+- `*.{log,error.log}` — other launchd service logs
 
 **Reset learned state**: `rm ranker.json feedback_golden.json`. Dimension mismatch in feedback golden → silently ignored. Full re-embed: `rag index --reset`.
 

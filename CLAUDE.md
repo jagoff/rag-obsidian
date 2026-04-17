@@ -125,15 +125,21 @@ OSC 8 `file://` hyperlinks for both `[Label](path.md)` and `[path.md]` formats. 
 
 ```
 score = rerank_logit
-      + w.recency_cue    * recency_raw   [if has_recency_cue]
-      + w.recency_always * recency_raw   [always]
-      + w.tag_literal    * n_tag_matches
-      + w.graph_pagerank * (pr/max_pr)   [wikilink authority signal]
-      + w.feedback_pos                   [if path in feedback+ cosine≥0.80]
-      - w.feedback_neg                   [if path in feedback- cosine≥0.80]
+      + w.recency_cue        * recency_raw      [if has_recency_cue]
+      + w.recency_always     * recency_raw      [always]
+      + w.tag_literal        * n_tag_matches
+      + w.graph_pagerank     * (pr/max_pr)      [wikilink authority signal]
+      + w.click_prior        * ctr_path         [behavior: path CTR, Laplace-smoothed]
+      + w.click_prior_folder * ctr_folder       [behavior: top-level folder CTR]
+      + w.click_prior_hour   * ctr_path_hour    [behavior: path × current-hour CTR]
+      + w.dwell_score        * log1p(dwell_s)   [behavior: mean dwell time per path]
+      + w.feedback_pos                          [if path in feedback+ cosine≥0.80]
+      - w.feedback_neg                          [if path in feedback- cosine≥0.80]
 ```
 
-Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0` preserve pre-tune behavior.
+Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0, click_*=0, dwell_score=0` preserve pre-tune behavior. Behavior knobs are inert until `behavior.jsonl` accumulates signal and `rag tune` finds non-zero weights.
+
+Behavior priors (`_load_behavior_priors()`): read from `behavior.jsonl`, cached per mtime/size. Positive events: `open`, `positive_implicit`, `save`, `kept`. Negative: `negative_implicit`, `deleted`. CTR uses Laplace smoothing `(clicks+1)/(impressions+10)`.
 
 ## Key subsystems — contracts only
 

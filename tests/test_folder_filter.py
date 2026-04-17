@@ -87,3 +87,40 @@ def test_filter_files_folder_widens_to_inbox():
     assert "03-Resources/Claude/note1.md" in files
     # La nota en Areas sí queda fuera.
     assert "02-Areas/unrelated.md" not in files
+
+
+# ── infer_filters: compound-noun guard ────────────────────────────────────
+# Bug (2026-04-16): "dame el cmd para enviar mensajes entre claude peers"
+# auto-aplicó folder=03-Resources/Claude y escondió la nota SKILL.md en
+# 04-Archive/99-obsidian-system/99-Claude/skills/claude-peers-mcp/. El leaf
+# corto "claude" se match'ea pero está pegado a "peers" → es brand, no intent
+# de carpeta.
+
+def test_infer_filters_skips_compound_noun_match():
+    folders = {"03-Resources/Claude", "02-Areas/Coaching"}
+    f, t = rag.infer_filters(
+        "dame el cmd para enviar mensajes entre claude peers", set(), folders
+    )
+    assert f is None, "'claude peers' es compound, no debería lockear folder"
+
+
+def test_infer_filters_keeps_bare_leaf_match():
+    # Sin palabra adyacente, el leaf corto sí cuenta como intent de folder.
+    folders = {"03-Resources/Claude"}
+    f, t = rag.infer_filters("notas de claude", set(), folders)
+    assert f == "03-Resources/Claude"
+
+
+def test_infer_filters_keeps_multi_token_leaf():
+    # Leaf multi-token (hyphen) no aplica la guardia de compound: ya es
+    # suficientemente distintivo por su propia estructura.
+    folders = {"01-Projects/RAG-Local"}
+    f, t = rag.infer_filters("proyecto rag-local setup", set(), folders)
+    assert f == "01-Projects/RAG-Local"
+
+
+def test_infer_filters_long_leaf_ignores_compound_guard():
+    # Leafs de ≥7 chars no aplican guardia — suficientemente distintivos.
+    folders = {"02-Areas/Coaching"}
+    f, t = rag.infer_filters("coaching ansiedad", set(), folders)
+    assert f == "02-Areas/Coaching"

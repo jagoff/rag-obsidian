@@ -133,7 +133,7 @@ html, body {
 .turn {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
   padding-bottom: 22px;
 }
 
@@ -149,6 +149,10 @@ html, body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* Mini-gap between the user's question and the rag response — the turn's
+   flex `gap: 10px` was too tight when the reply started flush below. */
+.line + .line { margin-top: 6px; }
 
 .prompt {
   flex-shrink: 0;
@@ -242,6 +246,135 @@ html, body {
   white-space: nowrap;
 }
 
+/* Feedback bar --------------------------------------------------- */
+.feedback {
+  margin-top: 8px;
+  padding-top: 8px;
+  padding-left: 2ch;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+}
+
+.feedback-prompt {
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+
+.fb-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.fb-btn .fb-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+  flex-shrink: 0;
+  color: var(--text-faint);
+  transition: color 120ms ease;
+}
+
+.fb-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+}
+.fb-btn:hover:not(:disabled) .fb-icon { color: var(--text); }
+
+.fb-btn.fb-up:hover:not(:disabled),
+.fb-btn.fb-up:hover:not(:disabled) .fb-icon   { color: var(--green); }
+.fb-btn.fb-up:hover:not(:disabled)            { border-color: var(--green); }
+.fb-btn.fb-down:hover:not(:disabled),
+.fb-btn.fb-down:hover:not(:disabled) .fb-icon { color: var(--red); }
+.fb-btn.fb-down:hover:not(:disabled)          { border-color: var(--red); }
+
+.fb-btn.picked.fb-up,
+.fb-btn.picked.fb-up .fb-icon {
+  color: var(--green);
+}
+.fb-btn.picked.fb-up {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+.fb-btn.picked.fb-down,
+.fb-btn.picked.fb-down .fb-icon {
+  color: var(--red);
+}
+.fb-btn.picked.fb-down {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+.fb-btn.dimmed {
+  opacity: 0.35;
+  border-color: var(--border);
+}
+.fb-btn:disabled { cursor: default; }
+
+.feedback-status        { color: var(--text-faint); }
+.feedback-status.ok     { color: var(--green); }
+.feedback-status.warn   { color: var(--yellow); }
+.feedback-status.err    { color: var(--red); }
+
+/* Optional reason input, opened when 👎 is clicked.
+   Lives on its own row just under the thumbs bar so the layout doesn't
+   jump, and uses the same monospace/muted palette as the rest. */
+.feedback-reason {
+  margin-top: 6px;
+  padding-left: 2ch;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.fb-reason-input {
+  flex: 1;
+  min-width: 180px;
+  max-width: 520px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+.fb-reason-input::placeholder { color: var(--text-faint); }
+.fb-reason-input:focus { border-color: var(--border-strong); }
+
+.fb-text-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+.fb-text-btn:hover { color: var(--text); text-decoration-color: var(--text-dim); }
+.fb-text-btn.fb-text-muted { color: var(--text-faint); }
+.fb-text-btn.fb-text-muted:hover { color: var(--text-dim); }
+
 /* Empty / error states ------------------------------------------ */
 .empty {
   color: var(--yellow);
@@ -256,9 +389,28 @@ html, body {
 }
 
 .thinking {
-  color: var(--text-dim);
-  font-style: italic;
   padding-left: 2ch;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  height: 1.2em;
+}
+
+.thinking .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.3;
+  animation: thinking-pulse 1.2s ease-in-out infinite;
+}
+
+.thinking .dot:nth-child(2) { animation-delay: 0.15s; }
+.thinking .dot:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes thinking-pulse {
+  0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }
+  40%           { opacity: 0.95; transform: scale(1); }
 }
 
 /* Inline formatting in assistant text */
@@ -411,6 +563,76 @@ html, body {
   pointer-events: auto;
 }
 
+#composer-inner {
+  position: relative;
+  width: 100%;
+  max-width: 812px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Slash-command popover — floats above the input like Claude Code's
+   built-in slash menu. Absolute-positioned so it doesn't push the input
+   and always rises from the bottom edge of the composer. */
+.slash-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 260px;
+  overflow-y: auto;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12.5px;
+}
+.slash-popover[hidden] { display: none; }
+
+.slash-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: background 90ms ease, color 90ms ease;
+}
+.slash-item:hover,
+.slash-item.active {
+  background: color-mix(in srgb, var(--cyan) 14%, transparent);
+  color: var(--text);
+}
+.slash-item .slash-cmd {
+  color: var(--cyan);
+  font-weight: 700;
+}
+.slash-item .slash-arg {
+  color: var(--text-faint);
+  font-style: italic;
+  font-weight: 400;
+  margin-left: 4px;
+}
+.slash-item .slash-desc {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.slash-item.active .slash-desc { color: var(--text-dim); }
+
+.slash-popover-empty {
+  padding: 8px 10px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
 #input-wrap {
   display: flex;
   align-items: flex-start;
@@ -455,4 +677,277 @@ html, body {
 
 #input:disabled {
   opacity: 0.5;
+}
+
+/* Topbar buttons (TTS + help) ----------------------------------- */
+.topbar-btn {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+.topbar-btn:hover { border-color: var(--border-strong); color: var(--cyan); }
+.topbar-btn.active {
+  color: var(--green);
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, var(--bg-elev));
+}
+.tts-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.tts-svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  color: currentColor;
+}
+#help-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  justify-content: center;
+  font-weight: 700;
+  margin-left: 12px;
+}
+
+/* Stop button inside the composer. Only visible while pending. */
+.stop-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  align-self: center;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.stop-btn:hover { color: var(--red); border-color: var(--red); }
+
+/* Confidence pill in the sources header ------------------------- */
+.sources-rule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.conf-pill {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+}
+.conf-high {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 50%, var(--border));
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+.conf-mid {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 45%, var(--border));
+  background: color-mix(in srgb, var(--yellow) 8%, transparent);
+}
+.conf-low {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 50%, var(--border));
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+
+/* Message actions row (copy, etc) ------------------------------- */
+.msg-actions {
+  margin-top: 6px;
+  padding-left: 2ch;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.msg-action {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.msg-action svg {
+  width: 12px;
+  height: 12px;
+}
+.msg-action:hover {
+  color: var(--cyan);
+  border-color: var(--border-strong);
+}
+.msg-action.done {
+  color: var(--green);
+  border-color: var(--green);
+}
+.msg-action.err {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* Follow-up chips ---------------------------------------------- */
+.followups {
+  margin-top: 10px;
+  padding-left: 2ch;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+}
+.followups-label {
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  margin-bottom: 2px;
+}
+.follow-chip {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 14px;
+  cursor: pointer;
+  max-width: 420px;
+  text-align: left;
+  line-height: 1.3;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.follow-chip:hover {
+  color: var(--cyan);
+  border-color: var(--cyan-dim);
+  background: color-mix(in srgb, var(--cyan) 8%, var(--bg-elev));
+}
+
+/* Help modal --------------------------------------------------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.modal[hidden] { display: none; }
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(3px);
+}
+.modal-card {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 18px 22px 22px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.modal-head h2 {
+  margin: 0;
+  color: var(--cyan);
+  font-size: 14px;
+  letter-spacing: 0.02em;
+}
+.modal-close {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.modal-close:hover { color: var(--text); }
+.modal-card section {
+  margin-top: 14px;
+}
+.modal-card section h3 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.kb-list {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 12.5px;
+}
+.kb-list dt {
+  color: var(--text-dim);
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.kb-list dd {
+  margin: 0;
+  color: var(--text);
+}
+.kb-list .arg {
+  color: var(--text-faint);
+  font-style: italic;
+}
+kbd {
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-elev);
+  color: var(--text);
+  min-width: 18px;
+  text-align: center;
+}
+.kb-list code {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  color: var(--cyan);
+  font-size: 12px;
 }

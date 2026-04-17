@@ -45,7 +45,7 @@ function applyChartDefaults() {
 applyChartDefaults();
 
 // ── State ─────────────────────────────────────────────────────────────────
-const POLL_MS = 10_000;        // refresh aggregations every 10s
+const POLL_MS = 60_000;        // refresh aggregations every 60s; SSE pushes live deltas in between
 const TICKER_MAX = 12;         // live events kept on screen
 
 const state = {
@@ -167,6 +167,8 @@ async function load(showSkeleton) {
     if (!state.built) {
       buildLayout(d);
       state.built = true;
+      memInit();
+      cpuInit();
     }
     refresh(d);
   } catch (err) {
@@ -283,7 +285,57 @@ function buildLayout(d) {
     <div class="health" id="health"></div>
 
     <div class="charts">
-      <div class="chart-card wide">
+      <div class="chart-card wide" id="card-memory">
+        <h2>Memoria del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + chroma-mcp + whatsapp</span> <span id="mem-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+        <div class="memcard-grid">
+          <div class="memcard-main">
+            <div class="memcard-head">
+              <div>
+                <span class="memcard-total" id="mem-total">—<span class="unit">GB</span></span>
+                <span class="memcard-delta flat" id="mem-delta"></span>
+              </div>
+              <div class="memcard-window" id="mem-window">
+                <button data-min="5">5m</button>
+                <button data-min="60" class="active">1h</button>
+                <button data-min="360">6h</button>
+                <button data-min="1440">24h</button>
+              </div>
+            </div>
+            <div class="memcard-chart-wrap"><canvas id="ch-memory"></canvas></div>
+          </div>
+          <div class="memcard-top">
+            <h3>Top procesos</h3>
+            <ul id="mem-top-list"><li><span class="name">—</span></li></ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-card wide" id="card-cpu">
+        <h2>CPU del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + chroma-mcp + whatsapp · % de 1 core</span> <span id="cpu-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+        <div class="memcard-grid">
+          <div class="memcard-main">
+            <div class="memcard-head">
+              <div>
+                <span class="memcard-total" id="cpu-total">—<span class="unit">%</span></span>
+                <span class="memcard-delta flat" id="cpu-sub"></span>
+              </div>
+              <div class="memcard-window" id="cpu-window">
+                <button data-min="5">5m</button>
+                <button data-min="60" class="active">1h</button>
+                <button data-min="360">6h</button>
+                <button data-min="1440">24h</button>
+              </div>
+            </div>
+            <div class="memcard-chart-wrap"><canvas id="ch-cpu"></canvas></div>
+          </div>
+          <div class="memcard-top">
+            <h3>Top procesos</h3>
+            <ul id="cpu-top-list"><li><span class="name">—</span></li></ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-card">
         <h2>Queries por dia</h2>
         <div class="chart-wrap"><canvas id="ch-queries-day"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
@@ -317,6 +369,10 @@ function buildLayout(d) {
         <h2>Hot topics</h2>
         <div class="chart-wrap"><canvas id="ch-topics"></canvas><div class="chart-empty">sin datos en el período</div></div>
       </div>
+      <div class="chart-card" id="card-keywords">
+        <h2>Keywords del chat <span id="kw-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
+        <div id="kw-cloud" class="kw-cloud" aria-label="Nube de palabras más usadas en chat"></div>
+      </div>
       <div class="chart-card">
         <h2>Score trend (promedio diario)</h2>
         <div class="chart-wrap"><canvas id="ch-score-trend"></canvas><div class="chart-empty">sin datos en el período</div></div>
@@ -344,6 +400,14 @@ function buildLayout(d) {
       <div class="chart-card" id="card-tune">
         <h2>Historial de tune</h2>
         <div id="tune-content"></div>
+      </div>
+      <div class="chart-card" id="card-screentime-apps">
+        <h2>Pantalla · top apps</h2>
+        <div class="chart-wrap"><canvas id="ch-screentime-apps"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
+      </div>
+      <div class="chart-card" id="card-screentime-daily">
+        <h2>Pantalla · diario <span id="screentime-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
+        <div class="chart-wrap"><canvas id="ch-screentime-daily"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
       </div>
     </div>
   `;
@@ -420,6 +484,46 @@ function buildLayout(d) {
     data: { labels: [], datasets: [{ data: [], backgroundColor: hexAlpha(C.red, 0.5), borderColor: C.red, borderWidth: 1, borderRadius: 3 }] },
     options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } },
   });
+
+  state.charts.screentimeApps = new Chart(document.getElementById("ch-screentime-apps"), {
+    type: "bar",
+    data: { labels: [], datasets: [{ data: [], backgroundColor: hexAlpha(C.cyan, 0.5), borderColor: C.cyan, borderWidth: 1, borderRadius: 3 }] },
+    options: {
+      indexAxis: "y", responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtHm(ctx.parsed.x) } },
+      },
+      scales: { x: { beginAtZero: true, ticks: { callback: (v) => fmtHm(v) } } },
+    },
+  });
+
+  state.charts.screentimeDaily = new Chart(document.getElementById("ch-screentime-daily"), {
+    type: "bar",
+    data: { labels: [], datasets: [{ data: [], backgroundColor: hexAlpha(C.purple, 0.5), borderColor: C.purple, borderWidth: 1, borderRadius: 3 }] },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => fmtHm(ctx.parsed.y) } },
+      },
+      scales: {
+        x: { ticks: { maxRotation: 45 } },
+        y: { beginAtZero: true, ticks: { callback: (v) => fmtHm(v) } },
+      },
+    },
+  });
+}
+
+function fmtHm(s) {
+  s = Math.round(Number(s) || 0);
+  if (s >= 3600) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return m ? `${h}h ${String(m).padStart(2, "0")}m` : `${h}h`;
+  }
+  if (s >= 60) return `${Math.floor(s / 60)}m`;
+  return `${s}s`;
 }
 
 // ── Refresh (mutates existing charts/DOM in place) ────────────────────────
@@ -526,6 +630,11 @@ function refresh(d) {
   state.charts.topics.update("none");
   setEmpty(state.charts.topics, !topicData.length);
 
+  // Chat keyword cloud — font-size tier by log-scaled frequency.
+  // Tiers collapse cleanly when few words dominate (e.g. 2 words w/ counts
+  // 8 and 2 still render as t5 vs t2 instead of all clumping at the max).
+  renderKeywordCloud(d.chat_keywords || []);
+
   // Score trend
   const sTrend = (d.health && d.health.score_trend) || {};
   const stDays = Object.keys(sTrend);
@@ -566,7 +675,8 @@ function refresh(d) {
       rows += '<tr><td colspan="2" style="color:var(--text-faint);padding-top:10px">Top PageRank</td></tr>';
       for (const pr of idx.top_pagerank) {
         const name = pr.path.split("/").pop().replace(".md", "");
-        rows += `<tr><td style="color:var(--cyan)">${escapeHtml(name)}</td><td>${pr.score}</td></tr>`;
+        const cell = pathLink(pr.path, escapeHtml(name), { title: pr.path });
+        rows += `<tr><td style="color:var(--cyan)">${cell}</td><td>${pr.score}</td></tr>`;
       }
     }
     idxEl.innerHTML = `<table class="stats-table">${rows}</table>`;
@@ -587,6 +697,41 @@ function refresh(d) {
       Score p50: ${d.score_stats.p50} · p95: ${d.score_stats.p95} · rango: ${d.score_stats.min}–${d.score_stats.max}
     </div>
   `;
+
+  // Screen Time
+  const st = d.screentime || {};
+  const stAppsCh = state.charts.screentimeApps;
+  const stDailyCh = state.charts.screentimeDaily;
+  const stTotalEl = document.getElementById("screentime-total");
+  if (st.available && (st.top_apps?.length || st.daily?.length)) {
+    const apps = (st.top_apps || []).slice(0, 8);
+    stAppsCh.data.labels = apps.map(a => a.label || a.bundle);
+    stAppsCh.data.datasets[0].data = apps.map(a => a.secs);
+    stAppsCh.update("none");
+    setEmpty(stAppsCh, !apps.length);
+
+    const daily = st.daily || [];
+    stDailyCh.data.labels = daily.map(e => e.day.slice(5));  // MM-DD
+    stDailyCh.data.datasets[0].data = daily.map(e => e.secs);
+    stDailyCh.update("none");
+    setEmpty(stDailyCh, !daily.length);
+
+    if (stTotalEl) {
+      stTotalEl.textContent = st.total_label
+        ? `· ${st.total_label} · ${st.window_days}d`
+        : "";
+    }
+  } else {
+    stAppsCh.data.labels = [];
+    stAppsCh.data.datasets[0].data = [];
+    stAppsCh.update("none");
+    setEmpty(stAppsCh, true);
+    stDailyCh.data.labels = [];
+    stDailyCh.data.datasets[0].data = [];
+    stDailyCh.update("none");
+    setEmpty(stDailyCh, true);
+    if (stTotalEl) stTotalEl.textContent = "";
+  }
 
   // Tune history
   const tuneEl = document.getElementById("tune-content");
@@ -618,6 +763,41 @@ function setEmpty(ch, isEmpty) {
   const wrap = ch.canvas.parentElement;
   if (wrap && wrap.classList.contains("chart-wrap")) {
     wrap.dataset.empty = isEmpty ? "true" : "false";
+  }
+}
+
+function renderKeywordCloud(items) {
+  const el = document.getElementById("kw-cloud");
+  const total = document.getElementById("kw-total");
+  if (!el) return;
+  if (!items.length) {
+    el.innerHTML = '<div class="kw-cloud-empty">sin keywords en el período</div>';
+    if (total) total.textContent = "";
+    return;
+  }
+  // Log-scale counts to 5 tiers. log damps the long tail so a term used
+  // 40× doesn't reduce everything else to illegible 11px noise.
+  const counts = items.map(i => i.count);
+  const maxLog = Math.log(Math.max(...counts) + 1);
+  const minLog = Math.log(Math.min(...counts) + 1);
+  const span = Math.max(maxLog - minLog, 0.0001);
+  const sumAll = counts.reduce((a, b) => a + b, 0);
+  const frag = document.createDocumentFragment();
+  // Shuffle so the cloud feels organic, not sorted by frequency.
+  const shuffled = items.slice().sort(() => Math.random() - 0.5);
+  for (const { word, count } of shuffled) {
+    const lv = Math.log(count + 1);
+    const tier = Math.min(5, Math.max(1, Math.ceil(((lv - minLog) / span) * 5) || 1));
+    const span_ = document.createElement("span");
+    span_.className = `kw t${tier}`;
+    span_.textContent = word;
+    span_.title = `${count} menciones`;
+    frag.appendChild(span_);
+  }
+  el.innerHTML = "";
+  el.appendChild(frag);
+  if (total) {
+    total.textContent = `· ${items.length} términos · ${sumAll} menciones`;
   }
 }
 
@@ -706,7 +886,7 @@ function renderFeedbackPanel(fb) {
     ? negPaths.map(p => `
         <div class="fb-row neg">
           <div>
-            <div class="fb-path">${escapeHtml(shortenPath(p.path))}</div>
+            <div class="fb-path">${pathLink(p.path, escapeHtml(shortenPath(p.path)))}</div>
             <div class="fb-meta">${p.pos_count > 0 ? `también ${p.pos_count} ${upIcon}` : "sólo señales negativas"}</div>
           </div>
           <div class="fb-count">${p.count} ${downIcon}</div>
@@ -718,9 +898,9 @@ function renderFeedbackPanel(fb) {
     ? corrective.map(c => `
         <div class="fb-row miss" title="usuario indicó que la respuesta correcta estaba en otra nota">
           <div>
-            <div class="fb-q">${escapeHtml(c.q)}</div>
-            <div class="fb-meta">debió retornar → <span style="color:var(--orange)">${escapeHtml(shortenPath(c.missing_path))}</span></div>
-            <div class="fb-meta" style="opacity:0.7">en lugar de: ${(c.retrieved || []).map(p => escapeHtml(shortenPath(p))).join(" · ") || "(nada)"}</div>
+            <div class="fb-q"><a href="${escapeHtml(chatQueryHref(c.q))}" style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;" title="reintentar en chat">${escapeHtml(c.q)}</a></div>
+            <div class="fb-meta">debió retornar → <span style="color:var(--orange)">${pathLink(c.missing_path, escapeHtml(shortenPath(c.missing_path)))}</span></div>
+            <div class="fb-meta" style="opacity:0.7">en lugar de: ${(c.retrieved || []).map(p => pathLink(p, escapeHtml(shortenPath(p)))).join(" · ") || "(nada)"}</div>
           </div>
           <div style="font-size:10px;color:var(--text-faint);align-self:center">${shortDate(c.ts)}</div>
         </div>
@@ -838,7 +1018,7 @@ function renderTicker() {
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source ${ev.source || "cli"}">${ev.source || "cli"}</span>
-          <span class="t-q" title="${escapeHtml(ev.q || "")}">${tag}${escapeHtml(ev.q || "(sin texto)")}</span>
+          <span class="t-q" title="${escapeHtml(ev.q || "")}">${tag}<a href="${escapeHtml(chatQueryHref(ev.q || ""))}" style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;" title="reintentar en chat">${escapeHtml(ev.q || "(sin texto)")}</a></span>
           <span class="t-score ${scoreCls}">${scoreCell}</span>
           <span class="t-latency">${latencyCell}</span>
         </div>
@@ -865,7 +1045,7 @@ function renderTicker() {
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source" style="background:rgba(255,166,87,0.12);color:var(--orange)">ambient</span>
-          <span class="t-q" title="${escapeHtml(ev.path || "")}"><span class="tag-icon" style="color:var(--orange)">${icon("inbox", { size: 12 })}</span>${escapeHtml(shortenPath(ev.path || ""))}</span>
+          <span class="t-q" title="${escapeHtml(ev.path || "")}"><span class="tag-icon" style="color:var(--orange)">${icon("inbox", { size: 12 })}</span>${pathLink(ev.path, escapeHtml(shortenPath(ev.path || "")))}</span>
           <span class="t-score" style="color:var(--orange)">+${ev.wikilinks_applied || 0}${icon("link", { size: 10, color: "var(--orange)" })}</span>
           <span class="t-latency"></span>
         </div>
@@ -876,7 +1056,7 @@ function renderTicker() {
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source" style="background:rgba(255,123,114,0.12);color:var(--red)">contradicción</span>
-          <span class="t-q"><span class="tag-icon" style="color:var(--red)">${icon("warning", { size: 12 })}</span>${escapeHtml(shortenPath(ev.path || ""))}</span>
+          <span class="t-q"><span class="tag-icon" style="color:var(--red)">${icon("warning", { size: 12 })}</span>${pathLink(ev.path, escapeHtml(shortenPath(ev.path || "")))}</span>
           <span class="t-score"></span>
           <span class="t-latency"></span>
         </div>
@@ -924,6 +1104,22 @@ function shortenPath(p) {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
+// obsidian:// deep-link wrapper. Returns linked HTML if path present.
+function obsidianHref(path) {
+  if (!path) return "";
+  return `obsidian://open?vault=Notes&file=${encodeURIComponent(path)}`;
+}
+function pathLink(path, displayHtml, opts = {}) {
+  const href = obsidianHref(path);
+  if (!href) return displayHtml;
+  const title = opts.title || path;
+  return `<a href="${escapeHtml(href)}" title="${escapeHtml(title)}" style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;">${displayHtml}</a>`;
+}
+// Re-run a query in the chat UI.
+function chatQueryHref(q) {
+  return `/chat?q=${encodeURIComponent(q || "")}`;
+}
+
 function escapeHtml(s) {
   if (s == null) return "";
   return String(s)
@@ -932,4 +1128,453 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+// ── Per-process severity thresholds ──────────────────────────────────
+// Maps a process label (as produced by the server) to [warn, hot] cutoffs.
+// MEM units: MB. CPU units: % of one core (can exceed 100 on multi-threaded procs).
+//
+// Labels not listed here stay neutral — deliberately, to avoid false
+// positives on:
+//   - ollama runners (each model has a different RSS/CPU footprint, and
+//     generation legitimately pegs several cores at 400%+);
+//   - ad-hoc rag subcommands (`rag morning`, `rag eval`, etc.) that are
+//     expected to run hot while they do their job.
+//
+// Tune these if a legit process keeps tripping red.
+const MEM_THRESHOLDS_MB = {
+  "obsidian-rag-mcp":        [400, 800],
+  "rag web":                 [600, 1200],
+  "rag watch":               [200, 500],
+  "rag (python)":            [800, 1500],
+  "rag (resource_tracker)":  [40, 100],
+  "ollama serve":            [400, 800],
+  "chroma-mcp":              [400, 800],
+  "whatsapp-bridge":         [150, 300],
+  "whatsapp-listener":       [150, 300],
+  "whatsapp-mcp":            [150, 300],
+  "whatsapp-vault-sync":     [150, 300],
+};
+
+const CPU_THRESHOLDS_PCT = {
+  "rag web":                 [60, 150],
+  "rag watch":               [80, 200],
+  "ollama serve":            [30, 80],
+  "chroma-mcp":              [30, 80],
+  "obsidian-rag-mcp":        [60, 150],
+  "whatsapp-bridge":         [15, 40],
+  "whatsapp-listener":       [15, 40],
+  "whatsapp-mcp":            [15, 40],
+  "whatsapp-vault-sync":     [15, 40],
+};
+
+function severityFor(thresholds, label, value) {
+  const cuts = thresholds[label];
+  if (!cuts || value == null) return "ok";
+  if (value >= cuts[1]) return "hot";
+  if (value >= cuts[0]) return "warn";
+  return "ok";
+}
+
+// ── RAG-stack memory · live stacked area (2s SSE ticks + 60s backfill) ──
+// Buckets only our stack: rag python, ollama, chroma-mcp, whatsapp-*.
+// System processes outside the rag stack are intentionally excluded.
+const MEM = {
+  cats: ["rag", "ollama", "chroma-mcp", "whatsapp"],
+  labels: { "rag": "rag", "ollama": "ollama",
+            "chroma-mcp": "chroma-mcp", "whatsapp": "whatsapp" },
+  colors: { "rag": C.orange, "ollama": C.purple,
+            "chroma-mcp": C.cyan, "whatsapp": C.green },
+  windowMin: 60,
+  maxPoints: 1200,
+  samples: [],
+  current: null,
+  chart: null,
+  es: null,
+  backfillInFlight: null,
+};
+
+function memFmtGB(mb) {
+  if (mb == null) return "—";
+  return (mb / 1024).toFixed(mb < 1024 ? 2 : 1);
+}
+
+function memBuildChart() {
+  const canvas = document.getElementById("ch-memory");
+  if (!canvas) return;
+  const datasets = MEM.cats.map((c) => ({
+    label: MEM.labels[c],
+    data: [],
+    borderColor: MEM.colors[c],
+    backgroundColor: hexAlpha(MEM.colors[c], 0.45),
+    borderWidth: 1,
+    pointRadius: 0,
+    pointHitRadius: 6,
+    tension: 0.25,
+    fill: true,
+    stack: "mem",
+  }));
+  MEM.chart = new Chart(canvas, {
+    type: "line",
+    data: { labels: [], datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, padding: 10 } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${memFmtGB(ctx.parsed.y)} GB`,
+            footer: (items) => {
+              const total = items.reduce((a, it) => a + (it.parsed.y || 0), 0);
+              return `total: ${memFmtGB(total)} GB`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          ticks: { callback: (v) => `${(v / 1024).toFixed(1)} GB` },
+        },
+      },
+    },
+  });
+}
+
+function memSyncChart() {
+  if (!MEM.chart) return;
+  const showSeconds = MEM.windowMin <= 5;
+  const labels = MEM.samples.map((s) => {
+    const d = new Date(s.ts);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    if (!showSeconds) return `${hh}:${mm}`;
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+  });
+  MEM.chart.data.labels = labels;
+  MEM.cats.forEach((c, i) => {
+    MEM.chart.data.datasets[i].data = MEM.samples.map((s) => (s.by_category && s.by_category[c]) || 0);
+  });
+  MEM.chart.update("none");
+}
+
+function memSyncHeader() {
+  const totalEl = document.getElementById("mem-total");
+  const deltaEl = document.getElementById("mem-delta");
+  if (totalEl && MEM.current) {
+    totalEl.innerHTML = `${memFmtGB(MEM.current.total_mb)}<span class="unit">GB</span>`;
+  }
+  if (deltaEl) {
+    const now = (MEM.current && MEM.current.total_mb) || 0;
+    const then = MEM.samples.length ? (MEM.samples[0].total_mb || 0) : now;
+    const d = now - then;
+    const sign = d > 20 ? "up" : d < -20 ? "down" : "flat";
+    const arrow = sign === "up" ? "▲" : sign === "down" ? "▼" : "●";
+    deltaEl.className = `memcard-delta ${sign}`;
+    deltaEl.textContent = `${arrow} ${d >= 0 ? "+" : ""}${memFmtGB(Math.abs(d))} GB`;
+  }
+  const topEl = document.getElementById("mem-top-list");
+  if (topEl) {
+    const top = (MEM.current && MEM.current.top) || [];
+    topEl.innerHTML = top.length
+      ? top.slice(0, 10).map((p) => {
+          const sev = severityFor(MEM_THRESHOLDS_MB, p.name, p.mb);
+          const tip = sev === "ok" ? p.name
+            : `${p.name} · ${sev === "hot" ? "consumo alto" : "consumo elevado"}`;
+          return `<li class="${sev}"><span class="name" title="${escapeHtml(tip)}">${escapeHtml(p.name)}</span><span class="val">${memFmtGB(p.mb)} GB</span></li>`;
+        }).join("")
+      : `<li><span class="name">—</span></li>`;
+  }
+}
+
+function memTrim() {
+  const cutoff = Date.now() - MEM.windowMin * 60_000;
+  let samples = MEM.samples.filter((s) => {
+    const t = new Date(s.ts).getTime();
+    return Number.isFinite(t) && t >= cutoff;
+  });
+  if (samples.length > MEM.maxPoints) {
+    const stride = Math.ceil(samples.length / MEM.maxPoints);
+    samples = samples.filter((_, i) => i % stride === 0 || i === samples.length - 1);
+  }
+  MEM.samples = samples;
+}
+
+async function memBackfill() {
+  if (MEM.backfillInFlight) return MEM.backfillInFlight;
+  MEM.backfillInFlight = (async () => {
+    try {
+      const resp = await fetch(`/api/system-memory?minutes=${MEM.windowMin}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      MEM.cats = data.categories || MEM.cats;
+      const history = data.samples || [];
+      const seen = new Set(MEM.samples.map((s) => s.ts));
+      for (const s of history) {
+        if (!seen.has(s.ts)) MEM.samples.push(s);
+      }
+      MEM.samples.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+      if (data.current) MEM.current = data.current;
+      memTrim();
+    } catch (_) {
+      // silent — live stream will recover
+    } finally {
+      MEM.backfillInFlight = null;
+    }
+  })();
+  return MEM.backfillInFlight;
+}
+
+function memOpenStream() {
+  try { if (MEM.es) MEM.es.close(); } catch (_) {}
+  const es = new EventSource("/api/system-memory/stream");
+  MEM.es = es;
+  const dot = document.getElementById("mem-live-dot");
+  es.addEventListener("sample", (ev) => {
+    let sample; try { sample = JSON.parse(ev.data); } catch (_) { return; }
+    MEM.current = sample;
+    const last = MEM.samples[MEM.samples.length - 1];
+    if (!last || new Date(sample.ts) >= new Date(last.ts)) {
+      MEM.samples.push(sample);
+    }
+    memTrim();
+    memSyncChart();
+    memSyncHeader();
+    if (dot) { dot.style.color = "var(--green)"; dot.textContent = "● live"; }
+  });
+  es.onerror = () => {
+    if (dot) { dot.style.color = "var(--yellow)"; dot.textContent = "● reconectando…"; }
+    if (es.readyState === EventSource.CLOSED) setTimeout(memOpenStream, 5000);
+  };
+}
+
+async function memInit() {
+  const winEl = document.getElementById("mem-window");
+  if (winEl) {
+    winEl.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-min]");
+      if (!btn) return;
+      MEM.windowMin = Number(btn.dataset.min);
+      for (const b of winEl.querySelectorAll("button")) {
+        b.classList.toggle("active", Number(b.dataset.min) === MEM.windowMin);
+      }
+      MEM.samples = [];
+      await memBackfill();
+      memSyncChart();
+      memSyncHeader();
+    });
+  }
+  memBuildChart();
+  await memBackfill();
+  memSyncChart();
+  memSyncHeader();
+  memOpenStream();
+}
+
+// ── RAG-stack CPU · live stacked area (2s SSE ticks + 60s backfill) ──
+// Same scope + category palette as the memory chart. Values are
+// "% of one core" per category — summed across multi-threaded procs
+// so a single ollama runner pegging 4 cores shows ~400%. `ncores`
+// (reported by the server) is used to render a secondary total label.
+const CPU = {
+  cats: ["rag", "ollama", "chroma-mcp", "whatsapp"],
+  labels: { "rag": "rag", "ollama": "ollama",
+            "chroma-mcp": "chroma-mcp", "whatsapp": "whatsapp" },
+  colors: { "rag": C.orange, "ollama": C.purple,
+            "chroma-mcp": C.cyan, "whatsapp": C.green },
+  windowMin: 60,
+  maxPoints: 1200,
+  samples: [],
+  current: null,
+  chart: null,
+  es: null,
+  backfillInFlight: null,
+  ncores: 1,
+};
+
+function cpuBuildChart() {
+  const canvas = document.getElementById("ch-cpu");
+  if (!canvas) return;
+  const datasets = CPU.cats.map((c) => ({
+    label: CPU.labels[c],
+    data: [],
+    borderColor: CPU.colors[c],
+    backgroundColor: hexAlpha(CPU.colors[c], 0.45),
+    borderWidth: 1,
+    pointRadius: 0,
+    pointHitRadius: 6,
+    tension: 0.25,
+    fill: true,
+    stack: "cpu",
+  }));
+  CPU.chart = new Chart(canvas, {
+    type: "line",
+    data: { labels: [], datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, padding: 10 } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${(ctx.parsed.y || 0).toFixed(1)}%`,
+            footer: (items) => {
+              const total = items.reduce((a, it) => a + (it.parsed.y || 0), 0);
+              const pctOfMachine = CPU.ncores > 0 ? (total / CPU.ncores).toFixed(1) : "—";
+              return `total: ${total.toFixed(1)}%  (${pctOfMachine}% de ${CPU.ncores} cores)`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          ticks: { callback: (v) => `${v}%` },
+        },
+      },
+    },
+  });
+}
+
+function cpuSyncChart() {
+  if (!CPU.chart) return;
+  const showSeconds = CPU.windowMin <= 5;
+  const labels = CPU.samples.map((s) => {
+    const d = new Date(s.ts);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    if (!showSeconds) return `${hh}:${mm}`;
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+  });
+  CPU.chart.data.labels = labels;
+  CPU.cats.forEach((c, i) => {
+    CPU.chart.data.datasets[i].data = CPU.samples.map((s) => (s.by_category && s.by_category[c]) || 0);
+  });
+  CPU.chart.update("none");
+}
+
+function cpuSyncHeader() {
+  const totalEl = document.getElementById("cpu-total");
+  const subEl = document.getElementById("cpu-sub");
+  if (totalEl && CPU.current) {
+    totalEl.innerHTML = `${(CPU.current.total_pct || 0).toFixed(0)}<span class="unit">%</span>`;
+  }
+  if (subEl) {
+    const cur = (CPU.current && CPU.current.total_pct) || 0;
+    const ncores = CPU.ncores || 1;
+    const pctOfMachine = (cur / ncores).toFixed(1);
+    subEl.className = "memcard-delta flat";
+    subEl.textContent = `${pctOfMachine}% de ${ncores} cores`;
+  }
+  const topEl = document.getElementById("cpu-top-list");
+  if (topEl) {
+    const top = (CPU.current && CPU.current.top) || [];
+    topEl.innerHTML = top.length
+      ? top.slice(0, 10).map((p) => {
+          const sev = severityFor(CPU_THRESHOLDS_PCT, p.name, p.pct);
+          const tip = sev === "ok" ? p.name
+            : `${p.name} · ${sev === "hot" ? "consumo alto" : "consumo elevado"}`;
+          return `<li class="${sev}"><span class="name" title="${escapeHtml(tip)}">${escapeHtml(p.name)}</span><span class="val">${(p.pct || 0).toFixed(1)}%</span></li>`;
+        }).join("")
+      : `<li><span class="name">—</span></li>`;
+  }
+}
+
+function cpuTrim() {
+  const cutoff = Date.now() - CPU.windowMin * 60_000;
+  let samples = CPU.samples.filter((s) => {
+    const t = new Date(s.ts).getTime();
+    return Number.isFinite(t) && t >= cutoff;
+  });
+  if (samples.length > CPU.maxPoints) {
+    const stride = Math.ceil(samples.length / CPU.maxPoints);
+    samples = samples.filter((_, i) => i % stride === 0 || i === samples.length - 1);
+  }
+  CPU.samples = samples;
+}
+
+async function cpuBackfill() {
+  if (CPU.backfillInFlight) return CPU.backfillInFlight;
+  CPU.backfillInFlight = (async () => {
+    try {
+      const resp = await fetch(`/api/system-cpu?minutes=${CPU.windowMin}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      CPU.cats = data.categories || CPU.cats;
+      CPU.ncores = data.ncores || CPU.ncores;
+      const history = data.samples || [];
+      const seen = new Set(CPU.samples.map((s) => s.ts));
+      for (const s of history) {
+        if (!seen.has(s.ts)) CPU.samples.push(s);
+      }
+      CPU.samples.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+      if (data.current) CPU.current = data.current;
+      cpuTrim();
+    } catch (_) {
+      // silent — live stream will recover
+    } finally {
+      CPU.backfillInFlight = null;
+    }
+  })();
+  return CPU.backfillInFlight;
+}
+
+function cpuOpenStream() {
+  try { if (CPU.es) CPU.es.close(); } catch (_) {}
+  const es = new EventSource("/api/system-cpu/stream");
+  CPU.es = es;
+  const dot = document.getElementById("cpu-live-dot");
+  es.addEventListener("sample", (ev) => {
+    let sample; try { sample = JSON.parse(ev.data); } catch (_) { return; }
+    CPU.current = sample;
+    if (sample.ncores) CPU.ncores = sample.ncores;
+    const last = CPU.samples[CPU.samples.length - 1];
+    if (!last || new Date(sample.ts) >= new Date(last.ts)) {
+      CPU.samples.push(sample);
+    }
+    cpuTrim();
+    cpuSyncChart();
+    cpuSyncHeader();
+    if (dot) { dot.style.color = "var(--green)"; dot.textContent = "● live"; }
+  });
+  es.onerror = () => {
+    if (dot) { dot.style.color = "var(--yellow)"; dot.textContent = "● reconectando…"; }
+    if (es.readyState === EventSource.CLOSED) setTimeout(cpuOpenStream, 5000);
+  };
+}
+
+async function cpuInit() {
+  const winEl = document.getElementById("cpu-window");
+  if (winEl) {
+    winEl.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-min]");
+      if (!btn) return;
+      CPU.windowMin = Number(btn.dataset.min);
+      for (const b of winEl.querySelectorAll("button")) {
+        b.classList.toggle("active", Number(b.dataset.min) === CPU.windowMin);
+      }
+      CPU.samples = [];
+      await cpuBackfill();
+      cpuSyncChart();
+      cpuSyncHeader();
+    });
+  }
+  cpuBuildChart();
+  await cpuBackfill();
+  cpuSyncChart();
+  cpuSyncHeader();
+  cpuOpenStream();
 }

@@ -15,7 +15,7 @@
       } catch (e) {}
     })();
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
   <style>
     :root {
       --bg: #1a1a1f;
@@ -227,6 +227,137 @@
 
     .chart-card.wide {
       grid-column: 1 / -1;
+    }
+
+    /* Word cloud (chat keywords) — font-size scales with log(count) */
+    .kw-cloud {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      align-content: flex-start;
+      padding: 8px 2px;
+      min-height: 180px;
+      max-height: 320px;
+      overflow: hidden;
+      line-height: 1.35;
+    }
+    .kw-cloud .kw {
+      font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Monaco, monospace);
+      color: var(--text-dim);
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      transition: color 120ms;
+      cursor: default;
+    }
+    .kw-cloud .kw:hover { color: var(--cyan); }
+    .kw-cloud .kw.t1 { font-size: 11px; color: var(--text-faint); }
+    .kw-cloud .kw.t2 { font-size: 13px; }
+    .kw-cloud .kw.t3 { font-size: 16px; color: var(--text); }
+    .kw-cloud .kw.t4 { font-size: 20px; color: var(--cyan-dim); font-weight: 600; }
+    .kw-cloud .kw.t5 { font-size: 26px; color: var(--cyan); font-weight: 700; }
+    .kw-cloud-empty {
+      color: var(--text-faint);
+      font-size: 12px;
+      padding: 24px 4px;
+    }
+
+    /* ── Memory card ────────────────────────────────────────────── */
+    .memcard-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 240px;
+      gap: 22px;
+    }
+    .memcard-main { min-width: 0; }
+    .memcard-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+    .memcard-total {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--cyan);
+      font-variant-numeric: tabular-nums;
+    }
+    .memcard-total .unit {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-weight: 400;
+      margin-left: 3px;
+    }
+    .memcard-delta {
+      font-size: 11px;
+      margin-left: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+    .memcard-delta.up   { color: var(--red); }
+    .memcard-delta.down { color: var(--green); }
+    .memcard-delta.flat { color: var(--text-faint); }
+    .memcard-window { display: flex; gap: 4px; }
+    .memcard-window button {
+      background: transparent;
+      color: var(--text-faint);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      font-family: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .memcard-window button:hover { color: var(--text); }
+    .memcard-window button.active {
+      color: var(--cyan);
+      border-color: var(--cyan);
+    }
+    .memcard-chart-wrap {
+      position: relative;
+      width: 100%;
+      height: 240px;
+    }
+    .memcard-chart-wrap canvas { width: 100% !important; height: 100% !important; }
+    .memcard-top { font-size: 12px; min-width: 0; }
+    .memcard-top h3 {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+    .memcard-top ul { list-style: none; }
+    .memcard-top li {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
+      color: var(--text);
+    }
+    .memcard-top li:last-child { border-bottom: none; }
+    .memcard-top li .name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .memcard-top li .val {
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+    .memcard-top li.warn .name { color: var(--yellow); }
+    .memcard-top li.warn .val  { color: var(--yellow); font-weight: 600; }
+    .memcard-top li.hot  .name { color: var(--red); }
+    .memcard-top li.hot  .val  { color: var(--red); font-weight: 700; }
+    .memcard-top li.hot  .name::before {
+      content: "● ";
+      font-size: 10px;
+      vertical-align: middle;
+    }
+    @media (max-width: 900px) {
+      .memcard-grid { grid-template-columns: 1fr; }
     }
 
     .chart-card h2 {
@@ -676,6 +807,6 @@
     </div>
   </div>
 
-  <script src="/static/dashboard.js"></script>
+  <script src="/static/dashboard.js" defer></script>
 </body>
 </html>

@@ -277,6 +277,49 @@ def submit_feedback(req: FeedbackRequest) -> dict:
     return {"ok": True}
 
 
+def _ollama_alive(timeout: float = 2.0) -> bool:
+    """Fast probe: does the ollama daemon answer `/api/tags` within `timeout`s?
+    When the daemon hits its stuck-load state the HTTP listener accepts but
+    never replies — /api/chat then hangs forever. A short /api/tags probe
+    catches that state without waiting for a model load.
+    """
+    import urllib.request, urllib.error
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _ollama_restart_if_stuck() -> bool:
+    """Heal the ollama daemon via `brew services restart`. Returns True on
+    successful restart. Blocks 3-5s for the bounce.
+    """
+    try:
+        subprocess.run(
+            ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
+            check=True, capture_output=True, timeout=30,
+        )
+        # Wait up to 10s for the daemon to accept traffic again.
+        for _ in range(20):
+            if _ollama_alive(timeout=1.0):
+                return True
+            time.sleep(0.5)
+    except Exception:
+        pass
+    return False
+
+
+@app.post("/api/ollama/restart")
+def ollama_restart() -> dict:
+    """Panic button #2: brew-services-restart the ollama daemon. Use when
+    /api/chat is hanging forever (stuck-load state: daemon accepts HTTP
+    but never streams a reply). Blocks ~5-10s.
+    """
+    ok = _ollama_restart_if_stuck()
+    return {"ok": ok, "alive": _ollama_alive()}
+
+
 @app.post("/api/ollama/unload")
 def ollama_unload() -> dict:
     """Panic button: evict every loaded model from ollama + drop the
@@ -311,6 +354,31 @@ def ollama_unload() -> dict:
     except Exception:
         reranker_dropped = False
     return {"ok": True, "freed_models": freed, "reranker_dropped": reranker_dropped}
+
+
+class ReminderCompleteRequest(BaseModel):
+    reminder_id: str
+
+
+@app.post("/api/reminders/complete")
+def complete_reminder(req: ReminderCompleteRequest) -> dict:
+    """Mark an Apple Reminder as completed by its stable id.
+
+    Called from the home page when the user ticks a reminder. Invalidates
+    the home cache so the next /api/home doesn't return the now-completed
+    item from SWR.
+    """
+    from rag import _complete_reminder  # noqa: PLC0415
+    ok, msg = _complete_reminder(req.reminder_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    # Bust the home cache so the reminder disappears on next load without
+    # waiting for the 60s SWR cycle.
+    try:
+        _HOME_STATE["ts"] = 0.0
+    except Exception:
+        pass
+    return {"ok": True, "message": msg}
 
 
 @app.get("/api/model")
@@ -1446,6 +1514,157 @@ def _fetch_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict]
     return out
 
 
+# MOZE (Money app) export — user drops `MOZE_YYYYMMDD_HHMMSS.csv` into iCloud
+# Backup. We pick the newest file and parse locally; no network, no API.
+# Dates are MM/DD/YYYY (US format); Price uses ES decimals ("2026,74").
+# Expenses are stored as negative numbers — abs() for display.
+_FINANCE_BACKUP_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Backup"
+_FINANCE_CACHE: dict = {"key": None, "payload": None}
+
+
+def _fetch_finance(now: datetime | None = None) -> dict | None:
+    """Parse the latest MOZE_*.csv export into a home-panel summary.
+
+    Returns None (silent-fail) if: no CSV found, iCloud folder missing,
+    or no rows parseable. Cached by (path, mtime) — re-exports invalidate.
+    """
+    import calendar
+    import csv as _csv
+    from collections import Counter
+
+    now = now or datetime.now()
+    try:
+        csvs = sorted(
+            _FINANCE_BACKUP_DIR.glob("MOZE_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return None
+    if not csvs:
+        return None
+    src = csvs[0]
+    try:
+        mtime = src.stat().st_mtime
+    except Exception:
+        return None
+    key = (str(src), mtime)
+    if _FINANCE_CACHE["key"] == key:
+        return _FINANCE_CACHE["payload"]
+
+    def pnum(s: str) -> float:
+        s = (s or "").strip().replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    rows: list[tuple[datetime, dict]] = []
+    try:
+        with src.open(newline="", encoding="utf-8") as fh:
+            for r in _csv.DictReader(fh):
+                raw = (r.get("Date") or "").strip()
+                if not raw:
+                    continue
+                try:
+                    d = datetime.strptime(raw, "%m/%d/%Y")
+                except ValueError:
+                    continue
+                rows.append((d, r))
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    def ym(d: datetime) -> tuple[int, int]:
+        return (d.year, d.month)
+
+    this = ym(now)
+    anchor = datetime(now.year, now.month, 1)
+    prev = (anchor.year - 1, 12) if anchor.month == 1 else (anchor.year, anchor.month - 1)
+
+    expenses_this: dict[str, float] = {}
+    expenses_prev: dict[str, float] = {}
+    income_this: dict[str, float] = {}
+    by_cat: dict[str, Counter] = {}
+
+    for d, r in rows:
+        cur = (r.get("Currency") or "").strip()
+        typ = (r.get("Type") or "").strip()
+        amt = abs(pnum(r.get("Price")))
+        ymk = ym(d)
+        if typ == "Expense":
+            if ymk == this:
+                expenses_this[cur] = expenses_this.get(cur, 0.0) + amt
+                cat = (r.get("Main Category") or "—").strip() or "—"
+                by_cat.setdefault(cur, Counter())[cat] += amt
+            elif ymk == prev:
+                expenses_prev[cur] = expenses_prev.get(cur, 0.0) + amt
+        elif typ == "Income" and ymk == this:
+            income_this[cur] = income_this.get(cur, 0.0) + amt
+
+    rows.sort(key=lambda t: t[0], reverse=True)
+    latest: list[dict] = []
+    for d, r in rows:
+        if len(latest) >= 5:
+            break
+        if (r.get("Type") or "").strip() not in ("Expense", "Income"):
+            continue
+        latest.append({
+            "date": d.strftime("%Y-%m-%d"),
+            "type": (r.get("Type") or "").strip(),
+            "category": (r.get("Main Category") or "").strip(),
+            "name": (r.get("Name") or "").strip(),
+            "store": (r.get("Store") or "").strip(),
+            "amount": pnum(r.get("Price")),
+            "currency": (r.get("Currency") or "").strip(),
+        })
+
+    days_elapsed = now.day
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    ars_this = expenses_this.get("ARS", 0.0)
+    ars_prev = expenses_prev.get("ARS", 0.0)
+    run_rate = ars_this / days_elapsed if days_elapsed else 0.0
+    projected = run_rate * days_in_month
+    delta_pct = ((ars_this - ars_prev) / ars_prev * 100.0) if ars_prev else None
+
+    top_cats: list[dict] = []
+    for name, amt in (by_cat.get("ARS") or Counter()).most_common(5):
+        top_cats.append({
+            "name": name,
+            "amount": amt,
+            "share": (amt / ars_this) if ars_this else 0.0,
+        })
+
+    usd_this = expenses_this.get("USD", 0.0) + expenses_this.get("USDB", 0.0)
+    usd_prev = expenses_prev.get("USD", 0.0) + expenses_prev.get("USDB", 0.0)
+
+    payload = {
+        "source_file": src.name,
+        "source_mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+        "month_label": now.strftime("%Y-%m"),
+        "days_elapsed": days_elapsed,
+        "days_in_month": days_in_month,
+        "ars": {
+            "this_month": ars_this,
+            "prev_month": ars_prev,
+            "delta_pct": delta_pct,
+            "run_rate_daily": run_rate,
+            "projected": projected,
+            "income": income_this.get("ARS", 0.0),
+            "top_categories": top_cats,
+        },
+        "usd": {
+            "this_month": usd_this,
+            "prev_month": usd_prev,
+        },
+        "latest": latest,
+    }
+    _FINANCE_CACHE["key"] = key
+    _FINANCE_CACHE["payload"] = payload
+    return payload
+
+
 # Cold `_home_compute` is 30–40s (12-fetcher fan-out, slowest = pendientes
 # at ~25s). The user must NEVER block on that. Strategy:
 #   1. Background pre-warmer thread recomputes every BG_INTERVAL, populating
@@ -1669,7 +1888,7 @@ def _home_compute(regenerate: bool = False) -> dict:
     # with timeouts, and then `shutdown(wait=False)` to return fast while
     # any straggler (e.g. cold `_fetch_followup_aging` doing LLM-judge per
     # loop) keeps running in the background to warm its own cache.
-    pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="home")
+    pool = ThreadPoolExecutor(max_workers=14, thread_name_prefix="home")
     timings: dict[str, float] = {}
     t_submit = time.time()
 
@@ -1696,6 +1915,7 @@ def _home_compute(regenerate: bool = False) -> dict:
         fut_wa_unreplied = pool.submit(_timed, "wa_unreplied", _fetch_whatsapp_unreplied, 48, 5)
         fut_bookmarks   = pool.submit(_timed, "bookmarks", _fetch_chrome_bookmarks_used, 48, 5)
         fut_vaults      = pool.submit(_timed, "vaults", _fetch_vault_activity, 48, 5)
+        fut_finance     = pool.submit(_timed, "finance", _fetch_finance, now)
 
         try:
             today_ev = fut_today.result(timeout=30)
@@ -1755,6 +1975,10 @@ def _home_compute(regenerate: bool = False) -> dict:
         with suppress(Exception):
             vault_activity = fut_vaults.result(timeout=10) or {}
 
+        finance: dict | None = None
+        with suppress(Exception):
+            finance = fut_finance.result(timeout=5)
+
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
         signals["eval_trend"] = eval_trend
@@ -1763,6 +1987,7 @@ def _home_compute(regenerate: bool = False) -> dict:
         signals["whatsapp_unreplied"] = whatsapp_unreplied
         signals["chrome_bookmarks"] = chrome_bookmarks
         signals["vault_activity"] = vault_activity
+        signals["finance"] = finance
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         pool.shutdown(wait=False)
@@ -1872,6 +2097,17 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # live calendar/reminders) and pull from the services layer instead.
         if _is_tasks_query(question):
             yield from _gen_tasks_response(sess, question, history)
+            return
+
+        # Fail fast if ollama is in the "stuck-load" state — accepts HTTP
+        # but never responds. Without this probe, the chat hangs on the
+        # first embed call for ~5 minutes until the user gives up. The
+        # probe is /api/tags which returns instantly on a healthy daemon.
+        if not _ollama_alive(timeout=2.0):
+            yield _sse("error", {
+                "message": "Ollama no responde. Probá: curl -X POST "
+                "http://localhost:8765/api/ollama/restart",
+            })
             return
 
         # Kick off WhatsApp fetch in parallel with retrieve so the SQLite

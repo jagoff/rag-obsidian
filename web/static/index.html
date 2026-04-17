@@ -11,30 +11,76 @@
     <div class="topbar-inner">
       <h1 class="topbar-title">rag <span>· chat</span></h1>
       <div class="topbar-meta">
+        <button id="tts-toggle" class="topbar-btn" type="button" aria-pressed="false"
+          title="Leer respuestas en voz alta (Mónica)">
+          <span class="tts-icon" aria-hidden="true"></span>
+          <span class="tts-label">voz</span>
+        </button>
         <label id="vault-picker-label" for="vault-picker">vault</label>
         <select id="vault-picker" aria-label="Vault">
           <option value="">cargando…</option>
         </select>
         <a class="topbar-link" href="/">← home</a>
         <a class="topbar-link" href="/dashboard">dashboard →</a>
+        <button id="help-btn" class="topbar-btn" type="button"
+          title="Atajos y comandos (⌘/)">?</button>
       </div>
     </div>
   </header>
   <main id="chat">
     <div id="messages"></div>
     <form id="composer" autocomplete="off">
-      <div id="input-wrap">
-        <span id="input-prompt">tu ›</span>
-        <textarea
-          id="input"
-          rows="1"
-          placeholder="preguntale al vault"
-          aria-label="Pregunta"
-          autofocus
-        ></textarea>
+      <div id="composer-inner">
+        <div id="slash-popover" class="slash-popover" hidden role="listbox" aria-label="Comandos"></div>
+        <div id="input-wrap">
+          <span id="input-prompt">tu ›</span>
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="preguntale al vault — / para comandos, ⌘/ para ayuda"
+            aria-label="Pregunta"
+            autofocus
+          ></textarea>
+          <button id="stop-btn" type="button" class="stop-btn" hidden aria-label="Detener (Esc)">
+            <span aria-hidden="true">■</span>
+          </button>
+        </div>
       </div>
     </form>
   </main>
+  <div id="help-modal" class="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card" role="dialog" aria-labelledby="help-title">
+      <header class="modal-head">
+        <h2 id="help-title">atajos &amp; comandos</h2>
+        <button class="modal-close" type="button" data-close aria-label="Cerrar">×</button>
+      </header>
+      <section>
+        <h3>teclado</h3>
+        <dl class="kb-list">
+          <dt><kbd>Enter</kbd></dt><dd>enviar</dd>
+          <dt><kbd>Shift</kbd>+<kbd>Enter</kbd></dt><dd>salto de línea</dd>
+          <dt><kbd>⌘</kbd><kbd>K</kbd></dt><dd>nueva pregunta (foco al input)</dd>
+          <dt><kbd>⌘</kbd><kbd>↑</kbd></dt><dd>editar última pregunta</dd>
+          <dt><kbd>Esc</kbd></dt><dd>detener respuesta en curso</dd>
+          <dt><kbd>⌘</kbd><kbd>/</kbd></dt><dd>abrir / cerrar esta ayuda</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>slash commands</h3>
+        <dl class="kb-list">
+          <dt><code>/help</code></dt><dd>esta ventana</dd>
+          <dt><code>/cls</code></dt><dd>limpiar vista (sesión intacta)</dd>
+          <dt><code>/new</code></dt><dd>nueva sesión (olvida historial)</dd>
+          <dt><code>/session</code></dt><dd>info de la sesión actual</dd>
+          <dt><code>/model</code></dt><dd>modelo de chat en uso</dd>
+          <dt><code>/save</code> <span class="arg">[título]</span></dt><dd>guardar conversación en 00-Inbox</dd>
+          <dt><code>/reindex</code></dt><dd>reindex incremental en background</dd>
+          <dt><code>/tts</code></dt><dd>alternar lectura en voz alta</dd>
+        </dl>
+      </section>
+    </div>
+  </div>
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/app.js"></script>
 </body>

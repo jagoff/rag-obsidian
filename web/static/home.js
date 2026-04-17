@@ -33,7 +33,7 @@ const SKELETON_PANELS = [
   "notas tocadas", "inbox hoy", "open loops",
   "low-conf", "contradicciones", "weather",
   "autoridad", "retrieval health", "loops aging", "web 7d",
-  "drive 48h",
+  "drive 48h", "finanzas",
 ];
 
 function renderSkeletons() {
@@ -94,19 +94,28 @@ function panel(id, title, count, bodyHtml, emptyText = "sin actividad") {
 // ── Renderers per channel ────────────────────────────────────────────────
 function renderReminders(items) {
   if (!items || !items.length) return panel("reminders", "reminders", 0, "");
-  const lis = items.slice(0, 8).map((r) => {
+  const lis = items.slice(0, 8).map((r, i) => {
     const bucket = r.bucket || "undated";
     // backend emits `due` (ISO) or `due_display` (preformatted); fall back to ISO
     const dueText = r.due_display || (r.due ? fmtDate(r.due) + (r.due.includes("T") ? " " + fmtTime(r.due) : "") : "");
     const due = dueText ? `<span class="meta">${esc(dueText)}</span>` : "";
     const list = r.list ? `<span class="meta">${esc(r.list)}</span>` : "";
-    return `<li>
+    const rid = r.id || "";
+    const disabled = rid ? "" : "disabled";
+    const cbTitle = rid ? "Marcar como completada" : "Sin id — no se puede completar desde acá";
+    return `<li data-reminder-id="${esc(rid)}" data-reminder-idx="${i}">
+      <button class="rem-check" type="button" aria-label="Completar" title="${esc(cbTitle)}" ${disabled}>
+        <svg class="rem-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+      </button>
       <span class="bucket ${esc(bucket)}">${esc(bucket)}</span>
       <b>${esc(r.name || "")}</b>
       ${due}${list}
     </li>`;
   }).join("");
-  return panel("reminders", "reminders", items.length, `<ul>${lis}</ul>`);
+  return panel("reminders", "reminders", items.length, `<ul class="rem-list">${lis}</ul>`);
 }
 
 function renderCalendar(today, tomorrow) {
@@ -534,6 +543,70 @@ function renderVaultActivity(byVault) {
   }).join("");
 }
 
+// signals.finance — MOZE (Money app) export parsed locally. Shape:
+//   { month_label, days_elapsed, days_in_month,
+//     ars: { this_month, prev_month, delta_pct, run_rate_daily,
+//            projected, income, top_categories:[{name,amount,share}] },
+//     usd: { this_month, prev_month },
+//     latest: [{ date, type, category, name, amount, currency }] }
+// Expenses are abs() already; Income is positive.
+function renderFinance(f) {
+  if (!f || !f.ars) return panel("finance", "finanzas", 0, "", "sin export MOZE");
+  const ars = f.ars;
+  const fmtArs = (n) => {
+    const v = Math.round(Number(n || 0));
+    return "$" + v.toLocaleString("es-AR");
+  };
+  const fmtPct = (p) => {
+    if (p == null || !isFinite(p)) return "";
+    const sign = p > 0 ? "+" : "";
+    return `${sign}${p.toFixed(1)}%`;
+  };
+  const deltaCls = ars.delta_pct == null ? "flat"
+    : ars.delta_pct > 0.5 ? "down"   // more spent = red
+    : ars.delta_pct < -0.5 ? "up"
+    : "flat";
+  const arrow = deltaCls === "up" ? "▼" : deltaCls === "down" ? "▲" : "·";
+
+  const header = `
+    <li>
+      <b>${fmtArs(ars.this_month)} ARS</b>
+      <span class="meta">mes ${esc(f.month_label || "")} · día ${esc(f.days_elapsed)}/${esc(f.days_in_month)} · proy ${fmtArs(ars.projected)}</span>
+      <span class="delta ${deltaCls}">${arrow} ${esc(fmtPct(ars.delta_pct))} vs mes ant (${fmtArs(ars.prev_month)})</span>
+    </li>`;
+
+  const cats = (ars.top_categories || []).slice(0, 5).map((c) => {
+    const pct = Math.round((Number(c.share || 0)) * 100);
+    return `<li>
+      <b>${esc(c.name || "—")}</b>
+      <span class="meta">${fmtArs(c.amount)} · ${pct}%</span>
+      <div class="pr-bar"><span style="width:${pct}%;"></span></div>
+    </li>`;
+  }).join("");
+
+  const latest = (f.latest || []).slice(0, 4).map((t) => {
+    const sign = t.type === "Income" ? "+" : "-";
+    const cur = t.currency || "";
+    const amt = Math.round(Math.abs(Number(t.amount || 0))).toLocaleString("es-AR");
+    const cls = t.type === "Income" ? "up" : "down";
+    return `<li>
+      <b>${esc(t.name || t.category || "—")}</b>
+      <span class="meta">${esc(t.date)} · ${esc(t.category || "")}${t.store ? " · " + esc(t.store) : ""}</span>
+      <span class="delta ${cls}">${sign}$${esc(amt)} ${esc(cur)}</span>
+    </li>`;
+  }).join("");
+
+  const usdLine = (f.usd && (f.usd.this_month || f.usd.prev_month))
+    ? `<li><b>USD mes</b><span class="meta">prev ${esc(Math.round(f.usd.prev_month || 0).toLocaleString("en-US"))}</span><span class="delta flat">$${esc(Math.round(f.usd.this_month || 0).toLocaleString("en-US"))}</span></li>`
+    : "";
+
+  const body = `<ul>${header}${usdLine}</ul>`
+    + (cats ? `<div class="meta" style="margin:10px 0 4px;">top categorías</div><ul>${cats}</ul>` : "")
+    + (latest ? `<div class="meta" style="margin:10px 0 4px;">últimos movimientos</div><ul>${latest}</ul>` : "");
+
+  return panel("finance", "finanzas", null, body);
+}
+
 // signals.whatsapp_unreplied — chats whose last message is inbound and
 // still awaits a reply. Distinct from `renderWhatsApp` (unread inbound
 // in last 24h): this one flags where *you* owe the next move. Item
@@ -623,6 +696,7 @@ function render(data) {
     renderChromeBookmarks(signals.chrome_bookmarks),
     renderVaultActivity(signals.vault_activity),
     renderDriveRecent(signals.drive_recent),
+    renderFinance(signals.finance),
   ].join("");
 
   els.panels.innerHTML = html;
@@ -706,6 +780,41 @@ function scheduleRefresh() {
 // One button, one action: fetch fresh evidence from every channel AND
 // regenerate the LLM brief. No cache reuse. Takes ~10-15s.
 els.btnRefresh.addEventListener("click", () => load(true));
+
+// Event delegation on the panels container: the reminders list is
+// re-rendered via innerHTML on every load() so per-element listeners
+// would leak. Delegation survives re-renders.
+els.panels.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest(".rem-check");
+  if (!btn || btn.disabled) return;
+  const li = btn.closest("li[data-reminder-id]");
+  if (!li) return;
+  const rid = li.dataset.reminderId;
+  if (!rid) return;
+  if (li.classList.contains("completed") || li.classList.contains("completing")) return;
+  li.classList.add("completing");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/reminders/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reminder_id: rid }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${res.status}`);
+    }
+    li.classList.remove("completing");
+    li.classList.add("completed");
+    // Small delay so the strike-through/fade is visible, then soft-remove.
+    setTimeout(() => { li.style.display = "none"; }, 900);
+  } catch (err) {
+    li.classList.remove("completing");
+    li.classList.add("complete-err");
+    btn.disabled = false;
+    btn.title = `Error: ${err.message}`;
+  }
+});
 window._homeRegenerate = () => load(true);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load(false);

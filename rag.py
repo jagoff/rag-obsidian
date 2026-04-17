@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Obsidian RAG — semantic chunking, title prefix, HyDE, hybrid BM25+semantic, reranking."""
 
+import atexit
 import contextlib
+import csv
 import fcntl
 import hashlib
 import json
 import os
+import queue
 import re
 import secrets
 import threading
@@ -375,13 +378,54 @@ LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 
 
-def log_query_event(event: dict) -> None:
-    """Append a JSONL event to the local query log (best-effort, never raises)."""
+# Single-writer queue for best-effort JSONL appends on the response path.
+# log_query_event runs 20+ times across chat/query/morning/etc; moving the
+# write off the main thread avoids ~1-3ms fsync hiccups serialising with
+# stream rendering. Daemon thread + atexit flush keeps durability ≈same.
+_LOG_QUEUE: "queue.Queue[tuple[Path, str] | None]" = queue.Queue()
+
+
+def _log_writer_loop() -> None:
+    while True:
+        item = _LOG_QUEUE.get()
+        try:
+            if item is None:
+                return
+            path, line = item
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+        finally:
+            _LOG_QUEUE.task_done()
+
+
+_LOG_THREAD = threading.Thread(target=_log_writer_loop, daemon=True, name="rag-log-writer")
+_LOG_THREAD.start()
+
+
+def _flush_log_queue() -> None:
+    """Drain pending writes on interpreter shutdown. Bounded wait: if the
+    worker is stuck on slow disk, we don't want to hang exit forever."""
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _LOG_QUEUE.put_nowait(None)
+        _LOG_THREAD.join(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_flush_log_queue)
+
+
+def log_query_event(event: dict) -> None:
+    """Enqueue a JSONL event for background append to the query log.
+    Best-effort, never raises, non-blocking on the caller thread."""
+    try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        _LOG_QUEUE.put_nowait((LOG_PATH, line))
     except Exception:
         pass
 
@@ -823,6 +867,130 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
     cache[file_hash] = summary
     _context_cache_dirty = True
     return summary
+
+
+# ── SYNTHETIC QUESTIONS ──────────────────────────────────────────────────────
+# Per-note "FAQ" expansion: the helper model generates 2-4 questions that this
+# note answers, and those questions are prepended to every chunk's embed_text.
+# Queries arrive as questions ("¿qué reranker uso?") but notes are written as
+# statements ("el reranker es bge-v2-m3") — bge-m3 has to bridge that gap. By
+# baking synthetic questions into the chunk prefix, each chunk's embedding
+# biases toward matching question-shaped queries directly.
+#
+# Cached by file hash (same pattern as context_summaries). Short notes skip
+# generation — the prefix already captures the signal. Malformed helper output
+# returns [] silently; an empty list just reverts the chunk to
+# context-summary-only behavior, never blocks indexing.
+
+SYNTHETIC_Q_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/synthetic_questions.json"
+_SYNTHETIC_Q_MIN_BODY = 300  # chars — same threshold as context summary
+_SYNTHETIC_Q_CAP = 4         # hard upper bound on questions per note
+_SYNTHETIC_Q_MAX_CHARS = 120 # per-question char cap
+
+_synthetic_q_cache: dict[str, list[str]] | None = None
+_synthetic_q_cache_dirty = False
+
+
+def _load_synthetic_q_cache() -> dict[str, list[str]]:
+    """Load {file_hash: [questions]} from disk. Lazy, once per process."""
+    global _synthetic_q_cache
+    if _synthetic_q_cache is not None:
+        return _synthetic_q_cache
+    if SYNTHETIC_Q_CACHE_PATH.is_file():
+        try:
+            data = json.loads(SYNTHETIC_Q_CACHE_PATH.read_text())
+            if isinstance(data, dict):
+                _synthetic_q_cache = {
+                    k: [str(q) for q in v if isinstance(q, str)]
+                    for k, v in data.items() if isinstance(v, list)
+                }
+            else:
+                _synthetic_q_cache = {}
+        except Exception:
+            _synthetic_q_cache = {}
+    else:
+        _synthetic_q_cache = {}
+    return _synthetic_q_cache
+
+
+def _save_synthetic_q_cache() -> None:
+    """Persist synthetic questions cache to disk if dirty."""
+    global _synthetic_q_cache_dirty
+    if not _synthetic_q_cache_dirty or _synthetic_q_cache is None:
+        return
+    SYNTHETIC_Q_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYNTHETIC_Q_CACHE_PATH.write_text(json.dumps(_synthetic_q_cache, ensure_ascii=False))
+    _synthetic_q_cache_dirty = False
+
+
+def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str]:
+    """Generate 2-4 synthetic questions that this note answers.
+
+    Asks the helper model for strict JSON (`format=json`). Deterministic
+    (temp=0, seed=42 via HELPER_OPTIONS). Returns [] on failure or malformed
+    output — callers treat empty as "no synthetic questions" not as an error.
+
+    Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1.
+    """
+    if os.environ.get("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"):
+        return []
+    body = text[:2000]
+    prompt = (
+        f"Nota: \"{title}\" (carpeta: {folder})\n\n"
+        f"{body}\n\n"
+        "Generá 3 preguntas cortas y naturales que esta nota responde directamente. "
+        "Respondé las preguntas en el idioma predominante de la nota. "
+        "Formato estricto JSON sin preámbulo: "
+        "{\"preguntas\": [\"...\", \"...\", \"...\"]}"
+    )
+    try:
+        resp = _summary_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 220},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = resp.message.content.strip()
+        data = json.loads(raw)
+    except Exception:
+        return []
+    qs = None
+    if isinstance(data, dict):
+        qs = data.get("preguntas") or data.get("questions")
+    if not isinstance(qs, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for q in qs[:_SYNTHETIC_Q_CAP]:
+        if not isinstance(q, str):
+            continue
+        q = q.strip().strip("-•*").strip()
+        if not q:
+            continue
+        q = q[:_SYNTHETIC_Q_MAX_CHARS]
+        # Dedup key: lowercase + strip Spanish/English question marks + punctuation.
+        # "¿Qué X?" ≡ "qué X" ≡ "¿qué X?" deben colapsar.
+        key = q.lower().strip("¿?¡!.,;: ").strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(q)
+    return cleaned
+
+
+def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) -> list[str]:
+    """Get or generate synthetic questions for a note. Cached by file hash."""
+    global _synthetic_q_cache_dirty
+    cache = _load_synthetic_q_cache()
+    if file_hash in cache:
+        return cache[file_hash]
+    if len(text) < _SYNTHETIC_Q_MIN_BODY:
+        return []
+    qs = _generate_synthetic_questions(text, title, folder)
+    cache[file_hash] = qs
+    _synthetic_q_cache_dirty = True
+    return qs
 
 
 # ── FEEDBACK LOOP ────────────────────────────────────────────────────────────
@@ -1628,6 +1796,299 @@ def extract_urls(text: str) -> list[dict]:
     return out
 
 
+# MOZE (Money app) → monthly vault notes. User re-exports `MOZE_*.csv` to
+# iCloud Backup; we transform it into one markdown note per month so the
+# regular indexing pipeline picks it up automatically. No special retrieval
+# path — chunks, graph, reranker all treat these like any other note.
+MOZE_BACKUP_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Backup"
+MOZE_VAULT_SUBPATH = os.environ.get(
+    "OBSIDIAN_RAG_MOZE_FOLDER", "02-Areas/Personal/Finanzas/MOZE"
+)
+MOZE_MONTH_ES = [
+    "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def _moze_pnum(s: str) -> float:
+    """Parse MOZE numeric column: ES decimals, optional thousand dots."""
+    s = (s or "").strip().replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _moze_fmt_ars(n: float) -> str:
+    """$3.470.209 — ES-AR thousands, no decimals."""
+    v = int(round(abs(n)))
+    s = f"{v:,}".replace(",", ".")
+    return f"${s}"
+
+
+def _moze_parse_latest() -> tuple[Path, list[tuple[datetime, dict]]] | None:
+    """Find newest MOZE_*.csv and parse into (date, row) tuples. Dates are
+    MM/DD/YYYY; rows with unparseable dates are skipped.
+    """
+    try:
+        csvs = sorted(
+            MOZE_BACKUP_DIR.glob("MOZE_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return None
+    if not csvs:
+        return None
+    src = csvs[0]
+    rows: list[tuple[datetime, dict]] = []
+    try:
+        with src.open(newline="", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                raw = (r.get("Date") or "").strip()
+                if not raw:
+                    continue
+                try:
+                    d = datetime.strptime(raw, "%m/%d/%Y")
+                except ValueError:
+                    continue
+                rows.append((d, r))
+    except Exception:
+        return None
+    return (src, rows) if rows else None
+
+
+def _moze_render_month(year: int, month: int, rows: list[tuple[datetime, dict]],
+                       prev_rows: list[tuple[datetime, dict]],
+                       source_name: str, source_mtime: float) -> str:
+    """Render one monthly note. `rows`/`prev_rows` are pre-filtered to month.
+    Deterministic — same inputs → same output — so the file hash is stable
+    and the indexer skips unchanged months.
+    """
+    from collections import Counter
+
+    def _sum_by(rs, cur_only="ARS"):
+        tot = 0.0
+        for _, r in rs:
+            if (r.get("Currency") or "").strip() != cur_only:
+                continue
+            if (r.get("Type") or "").strip() != "Expense":
+                continue
+            tot += abs(_moze_pnum(r.get("Price")))
+        return tot
+
+    ars_this = _sum_by(rows, "ARS")
+    ars_prev = _sum_by(prev_rows, "ARS")
+    usd_this = sum(
+        abs(_moze_pnum(r.get("Price")))
+        for _, r in rows
+        if (r.get("Type") or "").strip() == "Expense"
+        and (r.get("Currency") or "").strip() in ("USD", "USDB")
+    )
+    income_ars = sum(
+        abs(_moze_pnum(r.get("Price")))
+        for _, r in rows
+        if (r.get("Type") or "").strip() == "Income"
+        and (r.get("Currency") or "").strip() == "ARS"
+    )
+
+    cat_tot: Counter = Counter()
+    for _, r in rows:
+        if (r.get("Currency") or "").strip() != "ARS":
+            continue
+        if (r.get("Type") or "").strip() != "Expense":
+            continue
+        cat = (r.get("Main Category") or "—").strip() or "—"
+        cat_tot[cat] += abs(_moze_pnum(r.get("Price")))
+
+    delta_pct = ((ars_this - ars_prev) / ars_prev * 100.0) if ars_prev else None
+    month_label_es = f"{MOZE_MONTH_ES[month]} {year}"
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("type: finanzas")
+    lines.append("source: MOZE")
+    lines.append(f"month: {year:04d}-{month:02d}")
+    lines.append(f"gasto_ars: {int(round(ars_this))}")
+    if usd_this:
+        lines.append(f"gasto_usd: {int(round(usd_this))}")
+    if income_ars:
+        lines.append(f"ingreso_ars: {int(round(income_ars))}")
+    lines.append("tags: [finanzas, moze, gastos]")
+    lines.append("ambient: skip")
+    lines.append(f"source_file: {source_name}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Finanzas — {month_label_es}")
+    lines.append("")
+
+    lines.append("## Resumen")
+    lines.append("")
+    lines.append(f"- Gasto ARS: **{_moze_fmt_ars(ars_this)}**")
+    if ars_prev:
+        delta_txt = f"{delta_pct:+.1f}%" if delta_pct is not None else "—"
+        lines.append(f"- Mes anterior: {_moze_fmt_ars(ars_prev)} ({delta_txt})")
+    if usd_this:
+        lines.append(f"- Gasto USD: ${usd_this:,.2f}")
+    if income_ars:
+        lines.append(f"- Ingreso ARS: {_moze_fmt_ars(income_ars)}")
+    lines.append(f"- Transacciones: {sum(1 for _, r in rows if (r.get('Type') or '') in ('Expense','Income'))}")
+    lines.append("")
+
+    if cat_tot:
+        lines.append("## Top categorías (ARS)")
+        lines.append("")
+        for name, amt in cat_tot.most_common(10):
+            share = (amt / ars_this * 100.0) if ars_this else 0.0
+            lines.append(f"- {name}: {_moze_fmt_ars(amt)} ({share:.0f}%)")
+        lines.append("")
+
+    lines.append("## Transacciones")
+    lines.append("")
+    ordered = sorted(rows, key=lambda t: (t[0], t[1].get("Time") or ""))
+    for d, r in ordered:
+        typ = (r.get("Type") or "").strip()
+        if typ not in ("Expense", "Income", "Receivable"):
+            continue
+        cur = (r.get("Currency") or "").strip()
+        cat = (r.get("Main Category") or "").strip()
+        sub = (r.get("Subcategory") or "").strip()
+        name = (r.get("Name") or "").strip()
+        store = (r.get("Store") or "").strip()
+        amt = _moze_pnum(r.get("Price"))
+        sign = "+" if typ == "Income" else "-"
+        amt_str = _moze_fmt_ars(amt) if cur == "ARS" else f"${abs(amt):,.2f}"
+        parts = [
+            d.strftime("%Y-%m-%d"),
+            typ,
+            cat,
+        ]
+        if sub and sub != cat:
+            parts.append(sub)
+        if name:
+            parts.append(name)
+        if store:
+            parts.append(store)
+        parts.append(f"{sign}{amt_str} {cur}")
+        lines.append(f"- {' · '.join(parts)}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _sync_moze_notes(vault_root: Path) -> dict:
+    """Regenerate monthly MOZE notes under `{vault_root}/{MOZE_VAULT_SUBPATH}/`.
+
+    Per-month note: `YYYY-MM.md`. Rewrite only if content changed (compare by
+    file text) so the indexer's hash-based skip still works. Also writes an
+    `_index.md` at the folder root with a summary table of recent months.
+
+    Returns stats for logging. Silent-fail if no CSV is found.
+    """
+    from collections import defaultdict
+
+    parsed = _moze_parse_latest()
+    if not parsed:
+        return {"ok": False, "reason": "no_csv"}
+    src, rows = parsed
+
+    by_month: dict[tuple[int, int], list[tuple[datetime, dict]]] = defaultdict(list)
+    for d, r in rows:
+        by_month[(d.year, d.month)].append((d, r))
+
+    target_dir = vault_root / MOZE_VAULT_SUBPATH
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "reason": f"mkdir: {exc}"}
+
+    months_sorted = sorted(by_month.keys())
+    src_mtime = src.stat().st_mtime
+    written = 0
+    skipped = 0
+    current_set = set()
+
+    for i, (year, month) in enumerate(months_sorted):
+        fname = f"{year:04d}-{month:02d}.md"
+        current_set.add(fname)
+        month_rows = by_month[(year, month)]
+        prev_rows: list[tuple[datetime, dict]] = []
+        if i > 0:
+            prev_rows = by_month[months_sorted[i - 1]]
+        body = _moze_render_month(year, month, month_rows, prev_rows, src.name, src_mtime)
+        path = target_dir / fname
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        # Strip `generated_at`-style volatile fields — we don't emit any, so
+        # a direct compare is enough; hash-based index skip follows naturally.
+        if existing == body:
+            skipped += 1
+            continue
+        path.write_text(body, encoding="utf-8")
+        written += 1
+
+    # Prune stale month files (e.g., a month that got fully deleted in MOZE).
+    for p in target_dir.glob("*.md"):
+        if p.name == "_index.md":
+            continue
+        if p.name not in current_set:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    # Roll-up index note — gives chat queries like "cuánto gasté este año"
+    # a single surface to land on instead of 12 per-month notes.
+    idx_lines = [
+        "---",
+        "type: finanzas",
+        "source: MOZE",
+        "tags: [finanzas, moze, indice]",
+        "ambient: skip",
+        f"source_file: {src.name}",
+        "---",
+        "",
+        "# Finanzas — índice mensual (MOZE)",
+        "",
+        f"Fuente: `{src.name}` (export Money app).",
+        "",
+        "| Mes | Gasto ARS | Δ vs mes ant |",
+        "|---|---:|---:|",
+    ]
+    prev_tot = 0.0
+    for (year, month) in months_sorted:
+        mrows = by_month[(year, month)]
+        tot = sum(
+            abs(_moze_pnum(r.get("Price")))
+            for _, r in mrows
+            if (r.get("Type") or "").strip() == "Expense"
+            and (r.get("Currency") or "").strip() == "ARS"
+        )
+        delta = ""
+        if prev_tot:
+            delta_pct = (tot - prev_tot) / prev_tot * 100.0
+            delta = f"{delta_pct:+.1f}%"
+        idx_lines.append(
+            f"| [[{year:04d}-{month:02d}]] | {_moze_fmt_ars(tot)} | {delta} |"
+        )
+        prev_tot = tot
+    idx_body = "\n".join(idx_lines) + "\n"
+    idx_path = target_dir / "_index.md"
+    if not idx_path.is_file() or idx_path.read_text(encoding="utf-8") != idx_body:
+        idx_path.write_text(idx_body, encoding="utf-8")
+        written += 1
+    else:
+        skipped += 1
+
+    return {
+        "ok": True,
+        "source": src.name,
+        "months_total": len(months_sorted),
+        "months_written": written,
+        "months_skipped": skipped,
+        "target": str(target_dir.relative_to(vault_root)),
+    }
+
+
 def _index_urls(
     col_urls: chromadb.Collection,
     doc_id_prefix: str,
@@ -2011,6 +2472,7 @@ def _compute_parent(body: str, chunk_start: int, chunk_end: int) -> str:
 def semantic_chunks(
     text: str, note_title: str, folder: str, tags: list[str], fm: dict,
     context_summary: str = "",
+    synthetic_questions: list[str] | None = None,
 ) -> list[tuple[str, str, str]]:
     """
     Split text into semantic chunks.
@@ -2019,6 +2481,14 @@ def semantic_chunks(
     are still retrievable.
     """
     prefix = build_prefix(note_title, folder, tags, fm)
+    # Synthetic questions: bias the chunk embedding toward question-shaped
+    # queries that this note answers. Prepended BEFORE the context summary so
+    # question tokens sit near the top of the embedding window.
+    if synthetic_questions:
+        qs = [q.rstrip() for q in synthetic_questions[:_SYNTHETIC_Q_CAP] if q]
+        qs = [q if q.endswith("?") else q + "?" for q in qs]
+        if qs:
+            prefix = f"{prefix}\nPreguntas: {' '.join(qs)}"
     # Contextual embedding: prepend document-level summary to the prefix so
     # each chunk carries global context in its embedding vector.
     if context_summary:
@@ -2411,8 +2881,13 @@ def warmup_async() -> None:
         except Exception:
             pass
         # Corpus BM25 + vocabulario: ~130ms, se evita en primer retrieve().
+        # Tras cargar el corpus, también precomputamos adj + PageRank: ambos
+        # se tocan en el primer retrieve (scoring + graph expansion) y
+        # cuestan ~30-50ms combinados sobre vault de ~500 notas.
         try:
-            _load_corpus(get_db())
+            col = get_db()
+            _load_corpus(col)
+            get_pagerank(col)
         except Exception:
             pass
 
@@ -2932,6 +3407,7 @@ def build_progressive_context(
     primary_metas: list[dict],
     question: str,
     k_extra: int = PROGRESSIVE_CONTEXT_K,
+    extras: list[tuple[str, dict]] | None = None,
 ) -> str:
     """Build a two-tier LLM context: full primary chunks + 1-line summaries.
 
@@ -2939,6 +3415,12 @@ def build_progressive_context(
     k_extra additional candidates from the same retrieval pool and compress
     each to a single line, giving the LLM a broader map of the knowledge
     territory without blowing up the context window.
+
+    `extras` (optional): reranked candidates beyond top-k, already surfaced
+    by retrieve(). When provided, we skip the second semantic col.query —
+    these are strictly higher-quality than a fresh sem search since they
+    already went through BM25+sem merge + cross-encoder rerank. Fallback
+    path (extras=None) stays for legacy callers.
 
     Returns the assembled context string ready for the system prompt.
     """
@@ -2948,20 +3430,22 @@ def build_progressive_context(
         for d, m in zip(primary_docs, primary_metas)
     )
 
-    # Fetch extra candidates beyond what primary already has
     primary_files = {m.get("file", "") for m in primary_metas}
-    try:
-        # Use semantic search with the question embedding to get nearby chunks
-        q_embed = embed([question])[0]
-        extra_result = col.query(
-            query_embeddings=[q_embed],
-            n_results=min(k_extra + len(primary_metas), col.count()),
-            include=["documents", "metadatas"],
-        )
-        extra_docs = extra_result["documents"][0] if extra_result["documents"] else []
-        extra_metas = extra_result["metadatas"][0] if extra_result["metadatas"] else []
-    except Exception:
-        return primary
+    if extras is not None:
+        extra_docs = [d for d, _ in extras]
+        extra_metas = [m for _, m in extras]
+    else:
+        try:
+            q_embed = embed([question])[0]
+            extra_result = col.query(
+                query_embeddings=[q_embed],
+                n_results=min(k_extra + len(primary_metas), col.count()),
+                include=["documents", "metadatas"],
+            )
+            extra_docs = extra_result["documents"][0] if extra_result["documents"] else []
+            extra_metas = extra_result["metadatas"][0] if extra_result["metadatas"] else []
+        except Exception:
+            return primary
 
     # Filter out chunks already in primary, dedupe by file
     seen_files: set[str] = set(primary_files)
@@ -3720,7 +4204,15 @@ def _build_graph_adj(corpus: dict) -> dict[str, set[str]]:
     """Adyacencia no dirigida del grafo de wikilinks: path → set de paths linkeados.
     Compone outlinks (path → títulos) con title_to_paths (título → paths).
     Cada edge existe en ambas direcciones para tratar el grafo como no dirigido.
+
+    Memoized on the corpus dict — `retrieve()` calls this path twice per turn
+    (once inside `get_pagerank`, once in graph expansion) plus `surface` and
+    other callers. Adj is a pure function of the corpus; the corpus cache
+    already invalidates on `col.count()` delta, so piggybacking is safe.
     """
+    cached = corpus.get("_adj_cache")
+    if cached is not None:
+        return cached
     adj: dict[str, set[str]] = {}
     title_to_paths = corpus["title_to_paths"]
     for src_path, titles in corpus["outlinks"].items():
@@ -3730,6 +4222,7 @@ def _build_graph_adj(corpus: dict) -> dict[str, set[str]]:
                     continue
                 adj.setdefault(src_path, set()).add(tgt)
                 adj.setdefault(tgt, set()).add(src_path)
+    corpus["_adj_cache"] = adj
     return adj
 
 
@@ -5333,11 +5826,18 @@ def retrieve(
         if path in penalty_paths:
             final -= weights.feedback_neg
         final_pairs.append((c, e, final))
-    scored = sorted(final_pairs, key=lambda x: x[2], reverse=True)[:k]
+    scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
+    scored = scored_all[:k]
+    # `extras`: candidates beyond top-k, still reranker-ordered. Used by
+    # `build_progressive_context` to avoid a redundant semantic col.query —
+    # these already went through BM25+sem merge + cross-encoder rerank, so
+    # they're better-quality neighbors than a fresh sem search would give.
+    extras_pairs = scored_all[k:]
     final_scores = [s for _, _, s in scored]
     top_score = final_scores[0] if final_scores else float("-inf")
     docs = [e for _, e, _ in scored]
     metas = [c[1] for c, _, _ in scored]
+    extras: list[tuple[str, dict]] = [(e, c[1]) for c, e, _ in extras_pairs]
 
     # ── Graph expansion: weighted 2-hop wikilink neighbors of top results ──
     # Adds context from linked notes that didn't match semantically but are
@@ -5403,6 +5903,7 @@ def retrieve(
         "query_variants": variants,
         "graph_docs": graph_docs,
         "graph_metas": graph_metas,
+        "extras": extras,
     }
 
 
@@ -6821,8 +7322,13 @@ def _index_single_file(
 
     # Contextual embedding: generate or retrieve cached document-level summary
     ctx_summary = get_context_summary(text, h, path.stem, folder)
+    synth_qs = get_synthetic_questions(text, h, path.stem, folder)
 
-    chunks = semantic_chunks(text, path.stem, folder, tags, fm, context_summary=ctx_summary)
+    chunks = semantic_chunks(
+        text, path.stem, folder, tags, fm,
+        context_summary=ctx_summary,
+        synthetic_questions=synth_qs,
+    )
     if not chunks:
         _invalidate_corpus_cache()
         return "empty"
@@ -6864,6 +7370,7 @@ def _index_single_file(
         pass
     # Persist context summary cache after each file in watch/incremental mode.
     _save_context_cache()
+    _save_synthetic_q_cache()
     _invalidate_corpus_cache()
     # Ambient hook — fires for Inbox saves only, no-op otherwise.
     # Runs AFTER the main indexing so the note is retrievable to itself for
@@ -6908,6 +7415,19 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
     col_urls = get_urls_db()
     urls_indexed = 0
+
+    # MOZE export → monthly markdown notes, in-place under the vault so the
+    # regular rglob picks them up. Silent if no CSV; hash-skip keeps reruns
+    # free when nothing changed.
+    try:
+        moze_stats = _sync_moze_notes(VAULT_PATH)
+        if moze_stats.get("ok") and moze_stats.get("months_written"):
+            console.print(
+                f"[dim]MOZE sync: {moze_stats['months_written']} notas nuevas/modificadas "
+                f"de {moze_stats['months_total']} meses → {moze_stats['target']}/[/dim]"
+            )
+    except Exception as exc:
+        console.print(f"[yellow]MOZE sync falló: {exc}[/yellow]")
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
     existing_all = col.get(include=["metadatas"])
@@ -6962,8 +7482,13 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
         # Contextual embedding: generate or retrieve cached document-level summary
         ctx_summary = get_context_summary(text, h, path.stem, folder)
+        synth_qs = get_synthetic_questions(text, h, path.stem, folder)
 
-        chunks = semantic_chunks(text, path.stem, folder, tags, fm, context_summary=ctx_summary)
+        chunks = semantic_chunks(
+            text, path.stem, folder, tags, fm,
+            context_summary=ctx_summary,
+            synthetic_questions=synth_qs,
+        )
         if not chunks:
             indexed_files.add(doc_id_prefix)
             continue
@@ -7026,6 +7551,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 
     # Persist context summary cache so incremental runs don't re-generate.
     _save_context_cache()
+    _save_synthetic_q_cache()
 
     console.print(
         f"[green]Listo. {added_chunks} chunks (re)indexados · "
@@ -7437,6 +7963,7 @@ def query(
     # Progressive context: top-k full + extra chunks as 1-line summaries
     context = build_progressive_context(
         col, result["docs"], result["metas"], question,
+        extras=result.get("extras"),
     )
     # Append graph-expanded neighbors as supplementary context
     graph_docs = result.get("graph_docs", [])
@@ -8106,6 +8633,7 @@ def chat(
         else:
             context = build_progressive_context(
                 col, result["docs"], result["metas"], question,
+                extras=result.get("extras"),
             )
         # Append graph-expanded neighbors as supplementary context
         graph_docs = result.get("graph_docs", [])
@@ -12564,11 +13092,12 @@ tell application "Reminders"
       set _pending to (reminders of _list whose completed is false)
       repeat with _r in _pending
         try
+          set _rid to id of _r
           set _due to due date of _r
           if _due is not missing value then
-            set _out to _out & (name of _r) & "|" & (_due as string) & "|" & (name of _list) & linefeed
+            set _out to _out & _rid & "|" & (name of _r) & "|" & (_due as string) & "|" & (name of _list) & linefeed
           else
-            set _out to _out & (name of _r) & "||" & (name of _list) & linefeed
+            set _out to _out & _rid & "|" & (name of _r) & "||" & (name of _list) & linefeed
           end if
         end try
       end repeat
@@ -12733,16 +13262,25 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     horizon = today + timedelta(days=horizon_days + 1)
     items: list[dict] = []
     for line in out.splitlines():
-        parts = line.split("|", 2)
-        if len(parts) < 2:
+        parts = line.split("|", 3)
+        # New shape: id|name|due|list. Legacy fallback (name|due|list) kept
+        # so a script that reverts doesn't silently drop all reminders.
+        if len(parts) == 4:
+            rid, name, due_raw, list_name = (p.strip() for p in parts)
+        elif len(parts) == 3:
+            rid = ""
+            name, due_raw, list_name = (p.strip() for p in parts)
+        elif len(parts) == 2:
+            rid = ""
+            name, due_raw = (p.strip() for p in parts)
+            list_name = ""
+        else:
             continue
-        name = parts[0].strip()
-        due_raw = parts[1].strip()
-        list_name = parts[2].strip() if len(parts) > 2 else ""
         if not name:
             continue
         if not due_raw:
             items.append({
+                "id": rid,
                 "name": name,
                 "due": "",
                 "list": list_name,
@@ -12761,6 +13299,7 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
         else:
             bucket = "upcoming"
         items.append({
+            "id": rid,
             "name": name,
             "due": due_dt.isoformat(timespec="minutes"),
             "list": list_name,
@@ -12769,6 +13308,42 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
     items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
     return items[:max_items]
+
+
+def _complete_reminder(reminder_id: str) -> tuple[bool, str]:
+    """Mark an Apple Reminder as completed by its stable `id` (the
+    `x-apple-reminder://UUID` form returned by `id of reminder`).
+
+    Returns `(ok, message)`. Used by the web UI's check-off control.
+    Silent-fail semantics for osascript errors so the endpoint can
+    surface a clean message without tracing.
+    """
+    rid = (reminder_id or "").strip()
+    if not rid:
+        return False, "reminder id vacío"
+    if not _apple_enabled():
+        return False, "Apple integration deshabilitada"
+    # Use `first reminder whose id = …`; wrap id in double-quotes (AppleScript
+    # string literal) and escape any pre-existing quotes defensively. Apple
+    # reminder ids are stable URIs without quotes, but better safe.
+    safe = rid.replace('"', '\\"')
+    script = (
+        'tell application "Reminders"\n'
+        '  try\n'
+        f'    set _r to first reminder whose id is "{safe}"\n'
+        '    set completed of _r to true\n'
+        '    return "ok"\n'
+        '  on error errMsg\n'
+        '    return "err: " & errMsg\n'
+        '  end try\n'
+        'end tell\n'
+    )
+    out = _osascript(script, timeout=15.0)
+    if out == "ok":
+        return True, "completada"
+    if out.startswith("err:"):
+        return False, out[4:].strip() or "reminder no encontrado"
+    return False, "osascript devolvió vacío"
 
 
 def _fetch_completed_reminders(
@@ -18351,6 +18926,27 @@ def _prune_context_cache(col: "chromadb.Collection") -> int:
     return len(stale)
 
 
+def _prune_synthetic_q_cache(col: "chromadb.Collection") -> int:
+    """Remove synthetic_questions entries whose file hash is no longer in the index."""
+    cache = _load_synthetic_q_cache()
+    if not cache:
+        return 0
+    existing = col.get(include=["metadatas"])
+    live_hashes: set[str] = set()
+    for m in existing["metadatas"]:
+        h = m.get("hash", "")
+        if h:
+            live_hashes.add(h)
+    stale = [k for k in cache if k not in live_hashes]
+    for k in stale:
+        del cache[k]
+    if stale:
+        global _synthetic_q_cache_dirty
+        _synthetic_q_cache_dirty = True
+        _save_synthetic_q_cache()
+    return len(stale)
+
+
 def _prune_ignored_notes(vault: Path) -> int:
     """Remove entries from ignored_notes.json whose files no longer exist."""
     paths = load_ignored_paths()
@@ -18564,12 +19160,16 @@ def run_maintenance(
         col = get_db()
         if dry_run:
             cache = _load_context_cache()
+            sq_cache = _load_synthetic_q_cache()
             existing = col.get(include=["metadatas"])
             live_hashes = {m.get("hash", "") for m in existing["metadatas"]} - {""}
             results["context_cache_pruned"] = sum(1 for k in cache if k not in live_hashes)
+            results["synthetic_q_cache_pruned"] = sum(1 for k in sq_cache if k not in live_hashes)
         else:
             pruned = _prune_context_cache(col)
             results["context_cache_pruned"] = pruned
+            pruned_sq = _prune_synthetic_q_cache(col)
+            results["synthetic_q_cache_pruned"] = pruned_sq
     except Exception as e:
         results["context_cache_error"] = str(e)
 

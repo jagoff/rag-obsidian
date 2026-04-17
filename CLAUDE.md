@@ -53,7 +53,7 @@ rag dashboard [--days 30]                  # analytics: scores, latency, topics,
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
 
 # Automation
-rag setup [--remove]                       # install/remove 7 launchd services
+rag setup [--remove]                       # install/remove 9 launchd services
 
 # Tests
 .venv/bin/python -m pytest tests/ -q

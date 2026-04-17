@@ -18612,6 +18612,7 @@ def _morning_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_EXPLORE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -18645,6 +18646,7 @@ def _today_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_EXPLORE</key><string>1</string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -18798,6 +18800,44 @@ def _archive_plist(rag_bin: str) -> str:
 """
 
 
+def _online_tune_plist(rag_bin: str) -> str:
+    """Nightly online-tune — every day at 03:30, after Ollama is idle."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-online-tune</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>tune</string>
+    <string>--online</string>
+    <string>--days</string>
+    <string>14</string>
+    <string>--apply</string>
+    <string>--yes</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/online-tune.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/online-tune.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -18817,6 +18857,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _archive_plist(rag_bin)),
         ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
          _wa_tasks_plist(rag_bin)),
+        ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
+         _online_tune_plist(rag_bin)),
     ]
 
 
@@ -18866,7 +18908,7 @@ def setup(remove: bool):
     if not remove:
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks,online-tune}}.{{log,error.log}}[/dim]"
         )
 
 

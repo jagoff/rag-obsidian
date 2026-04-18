@@ -2462,7 +2462,15 @@ def chat(req: ChatRequest) -> StreamingResponse:
             _wa_executor.shutdown(wait=False)
         _t_wa_end = time.perf_counter()
         _t_wa_wait_ms = int((_t_wa_end - _t_wa_wait_start) * 1000)
-        if wa_recent:
+        # WA block gated on query intent — antes se inyectaba en CADA chat,
+        # agregando ~500-1000ms de prefill innecesario. Ahora sólo se incluye
+        # si la pregunta menciona WhatsApp explícitamente. El fetch paralelo
+        # se sigue haciendo (telemetry + /api/home consumption) — sólo el
+        # prompt injection es el que filtra.
+        _wa_in_query = bool(
+            re.search(r"\b(whatsapp|\bwa\b|mensaje|chat de|último[s]? chat)", question, re.IGNORECASE)
+        )
+        if wa_recent and _wa_in_query:
             total_msgs = sum(int(w.get("count", 0)) for w in wa_recent)
             wa_block_lines = [
                 f"[contexto auxiliar: WhatsApp últimas 24h · "
@@ -2541,7 +2549,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
             "num_ctx": 4096,
-            "num_predict": 100,
+            "num_predict": 60,
         }
 
         yield _sse("status", {"stage": "generating"})

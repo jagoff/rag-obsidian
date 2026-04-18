@@ -202,6 +202,7 @@ def _warmup() -> None:
 
     _load_home_cache()
     _ensure_home_prewarmer()
+    _ensure_chat_model_prewarmer()
 
     def _do_warmup() -> None:
         try:
@@ -2024,6 +2025,61 @@ def _ensure_home_prewarmer() -> None:
             time.sleep(_HOME_BG_INTERVAL)
 
     threading.Thread(target=loop, name="home-prewarmer", daemon=True).start()
+
+
+# Chat-model prewarmer. Root cause: ollama evicts the /chat model from VRAM
+# between requests despite keep_alive=-1 when memory pressure builds up
+# (observed: qwen2.5:7b dropped after ~5min idle while qwen2.5:3b + bge-m3
+# + reranker stayed resident). Each cold reload = 4-7s prefill penalty on
+# the next /api/chat, turning warm 2.9s into 10s+.
+#
+# Fix: every _CHAT_PREWARM_INTERVAL seconds, send a 1-token ping to the
+# resolved chat model with keep_alive=-1. This re-pins the model in VRAM
+# even if ollama decided to evict during idle. Skipped while a real chat
+# is in flight (the chat itself keeps the model warm — no need to duplicate).
+#
+# Cost: ~100-200ms of ollama compute per cycle, ~5GB VRAM pinned continuously.
+# Safe on 36GB unified memory with command-r NOT also resident.
+_CHAT_PREWARM_INTERVAL = int(os.environ.get("OBSIDIAN_RAG_CHAT_PREWARM_INTERVAL", "240"))
+_CHAT_PREWARMER_STARTED = False
+
+
+def _ensure_chat_model_prewarmer() -> None:
+    """Start the chat-model prewarm loop once. Idempotent."""
+    global _CHAT_PREWARMER_STARTED
+    if _CHAT_PREWARMER_STARTED:
+        return
+    _CHAT_PREWARMER_STARTED = True
+
+    def loop() -> None:
+        # First cycle runs after a short startup delay so the app finishes
+        # booting (corpus cache, home hydration) before we pin the LLM.
+        # Subsequent cycles run every _CHAT_PREWARM_INTERVAL.
+        time.sleep(15)
+        while True:
+            try:
+                if _CHAT_INFLIGHT > 0:
+                    time.sleep(15)
+                    continue
+                model = _resolve_web_chat_model()
+                # Tiny ping — 1 token is enough to re-pin KV cache + model weights.
+                # options=keep_alive=-1 instructs ollama to hold the model forever,
+                # overriding its internal eviction pressure.
+                ollama.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": "."}],
+                    options={"num_predict": 1, "temperature": 0, "seed": 42},
+                    stream=False,
+                    keep_alive=-1,
+                )
+                print(f"[chat-prewarm] {model} pinned", flush=True)
+            except Exception as exc:
+                # Silent fail: ollama down, model not loaded, network blip.
+                # Next cycle retries. Never crash the daemon thread.
+                print(f"[chat-prewarm] skipped: {exc}", flush=True)
+            time.sleep(_CHAT_PREWARM_INTERVAL)
+
+    threading.Thread(target=loop, name="chat-model-prewarmer", daemon=True).start()
 
 
 def _home_compute(regenerate: bool = False) -> dict:

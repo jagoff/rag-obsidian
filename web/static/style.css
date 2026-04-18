@@ -823,7 +823,6 @@ html, body {
   color: var(--text-faint);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  margin-right: auto;
   opacity: 0.75;
   cursor: help;
 }

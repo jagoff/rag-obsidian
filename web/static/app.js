@@ -10,7 +10,15 @@ const stopBtn = document.getElementById("stop-btn");
 const SESSION_KEY = "obsidian-rag:session";
 const VAULT_KEY = "obsidian-rag:vault";
 const TTS_KEY = "obsidian-rag:tts";
-let sessionId = localStorage.getItem(SESSION_KEY) || null;
+// Session id lives in sessionStorage (per-tab), not localStorage. The DOM
+// doesn't restore prior turns on reload, but the server-side history was
+// being silently rehydrated — so a fresh-looking /chat tab inherited stale
+// FinOps/etc. context and biased every answer. Per-tab keeps multi-turn
+// across reloads while a new tab gets a clean slate.
+let sessionId = sessionStorage.getItem(SESSION_KEY) || null;
+// Legacy: prior versions stored session_id in localStorage, which leaked
+// stale history into fresh tabs. Drop any leftover entry on first load.
+try { localStorage.removeItem(SESSION_KEY); } catch {}
 let vaultScope = localStorage.getItem(VAULT_KEY) || "";
 let ttsEnabled = localStorage.getItem(TTS_KEY) === "1";
 let pending = false;
@@ -716,7 +724,7 @@ async function send(question) {
 
     if (event === "session") {
       sessionId = parsed.id;
-      localStorage.setItem(SESSION_KEY, sessionId);
+      sessionStorage.setItem(SESSION_KEY, sessionId);
     } else if (event === "meta") {
       if (!metaShown) {
         appendMeta(turn, parsed.bits);
@@ -751,8 +759,15 @@ async function send(question) {
       if (fullText.trim()) {
         const actions = el("div", "msg-actions");
         const totalMs = Number(parsed.total_ms);
+        const retrieveMs = Number(parsed.retrieve_ms);
+        const ttftMs = Number(parsed.ttft_ms);
+        const llmMs = Number(parsed.llm_ms);
         if (Number.isFinite(totalMs) && totalMs > 0) {
-          const timing = el("span", "msg-timing", `${(totalMs / 1000).toFixed(1)}s`);
+          const bits = [`⏱ ${(totalMs / 1000).toFixed(1)}s`];
+          if (Number.isFinite(retrieveMs) && retrieveMs >= 0) bits.push(`retrieve ${retrieveMs}ms`);
+          if (Number.isFinite(ttftMs) && ttftMs >= 0) bits.push(`ttft ${ttftMs}ms`);
+          if (Number.isFinite(llmMs) && llmMs >= 0) bits.push(`llm ${llmMs}ms`);
+          const timing = el("span", "msg-timing", bits.join(" · "));
           timing.title = `${totalMs} ms total`;
           actions.appendChild(timing);
         }
@@ -817,7 +832,8 @@ async function handleSlashCommand(raw) {
   }
   if (cmd === "/new") {
     sessionId = null;
-    localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(SESSION_KEY); // legacy cleanup
     messagesEl.innerHTML = "";
     input.value = "";
     autoGrow();

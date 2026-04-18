@@ -696,9 +696,8 @@ function renderNarrative(text, source, briefPath, totalSignals) {
   if (!text) {
     if (totalSignals > 0) {
       els.narrative.innerHTML = `
-        <div class="narrative" style="display:flex;justify-content:space-between;align-items:center;gap:16px;">
-          <span style="color:var(--text-dim);">brief del día pendiente · click en regenerar para armarlo (~10-15s)</span>
-          <button class="home-btn" onclick="window._homeRegenerate && window._homeRegenerate()">regenerar</button>
+        <div class="narrative">
+          <span style="color:var(--text-dim);">brief del día pendiente · click en refrescar (arriba) para armarlo (~10-15s)</span>
         </div>`;
     } else {
       els.narrative.innerHTML = "";
@@ -878,7 +877,6 @@ els.panels.addEventListener("click", (ev) => {
   _trackBehavior({ event: "open", path, rank, query });
 });
 
-window._homeRegenerate = () => load(true);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load(false);
 });

@@ -819,6 +819,14 @@ html, body {
   color: var(--red);
   border-color: var(--red);
 }
+.msg-timing {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+  opacity: 0.75;
+  cursor: help;
+}
 
 /* Follow-up chips ---------------------------------------------- */
 .followups {

@@ -750,6 +750,12 @@ async function send(question) {
       }
       if (fullText.trim()) {
         const actions = el("div", "msg-actions");
+        const totalMs = Number(parsed.total_ms);
+        if (Number.isFinite(totalMs) && totalMs > 0) {
+          const timing = el("span", "msg-timing", `${(totalMs / 1000).toFixed(1)}s`);
+          timing.title = `${totalMs} ms total`;
+          actions.appendChild(timing);
+        }
         appendCopyButton(actions, () => buildMarkdownExport(question, fullText, sources));
         turn.appendChild(actions);
       }

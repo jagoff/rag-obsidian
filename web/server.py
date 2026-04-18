@@ -2582,6 +2582,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         yield _sse("done", {
             "turn_id": turn_id,
             "top_score": round(float(result["confidence"]), 3),
+            "total_ms": _t_total_ms,
         })
 
     def guarded():

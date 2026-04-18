@@ -2555,9 +2555,12 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
         yield _sse("status", {"stage": "generating"})
 
-        # Brief pause so MPS can flush reranker ops before ollama starts
-        # prefill — avoids 20-40s GPU contention when reranker finishes hot.
-        time.sleep(0.2)
+        # MPS flush sleep removed 2026-04-18: the 20-40s GPU contention
+        # it defended against was actually caused by num_ctx mismatch
+        # (5120 vs 4096 loaded) forcing ollama KV reinit — fixed at commit
+        # 79f6b8e. Without the sleep, warm /api/chat drops by 200ms cleanly.
+        # If prefill variance returns to 20s+ range, first suspect num_ctx
+        # drift, not MPS contention.
 
         parts: list[str] = []
         stripper = _InlineCitationStripper()
@@ -2648,6 +2651,9 @@ def chat(req: ChatRequest) -> StreamingResponse:
             "turn_id": turn_id,
             "top_score": round(float(result["confidence"]), 3),
             "total_ms": _t_total_ms,
+            "retrieve_ms": _t_retrieve_ms,
+            "ttft_ms": _t_ttft_ms,
+            "llm_ms": _t_llm_decode_ms,
         })
 
     def guarded():

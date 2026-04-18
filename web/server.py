@@ -2365,24 +2365,25 @@ def chat(req: ChatRequest) -> StreamingResponse:
         yield _sse("status", {"stage": "retrieving"})
 
         _t_reform_start = time.perf_counter()
+        # Follow-up resolution: antes llamábamos a reformulate_query (qwen2.5:3b,
+        # ~1-2s de LLM call + re-eviction pressure sobre qwen2.5:7b). El comment
+        # original admite que el fallback (concat "{last_user_q} {current_q}")
+        # empíricamente lograba mismo rerank score con recall igual o mejor
+        # (~+0.20 score al anclar con la entidad del turno previo). Saltamos
+        # reform directo al concat: 2s → 0ms, y qwen2.5:3b ya no se carga en
+        # el path de /chat, aliviando VRAM pressure sobre el 7b pinned.
         search_question = question
         _reform_fired = False
         _reform_used_concat = False
         if history and _looks_like_followup(question):
             _reform_fired = True
-            try:
-                search_question = reformulate_query(question, history) or question
-            except Exception:
-                search_question = question
-            if _UNRESOLVED_PRONOUN_RE.search(search_question) or \
-                    search_question.strip().lower() == question.strip().lower():
-                last_user_q = next(
-                    (m["content"] for m in reversed(history) if m.get("role") == "user"),
-                    None,
-                )
-                if last_user_q:
-                    search_question = f"{last_user_q} {question}"
-                    _reform_used_concat = True
+            last_user_q = next(
+                (m["content"] for m in reversed(history) if m.get("role") == "user"),
+                None,
+            )
+            if last_user_q:
+                search_question = f"{last_user_q} {question}"
+                _reform_used_concat = True
         _t_reform_end = time.perf_counter()
 
         try:

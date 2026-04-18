@@ -770,6 +770,9 @@ async function send(question) {
     } else if (event === "error") {
       thinking.remove();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
+    } else if (event === "status") {
+      const label = parsed.stage === "generating" ? "generando…" : "buscando…";
+      thinking.setAttribute("data-stage", label);
     }
   }
 }

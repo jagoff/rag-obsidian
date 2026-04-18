@@ -3016,6 +3016,97 @@ def embed(texts: list[str]) -> list[list[float]]:
     return cached  # type: ignore[return-value]
 
 
+# ── In-process query embedder (web fast path) ─────────────────────────────────
+# When RAG_LOCAL_EMBED=1 is set, web chat query embedding bypasses the ollama
+# HTTP round-trip (~140ms) and uses a SentenceTransformer in-process singleton
+# (~10-30ms warm).  Only affects the *query* embed for retrieval — the indexing
+# path (bulk chunk embedding) stays on ollama to avoid memory pressure.
+#
+# Requirements:
+#   - BAAI/bge-m3 must be cached in ~/.cache/huggingface/hub/  (not auto-downloaded
+#     by this function — set RAG_LOCAL_EMBED=1 only after confirming the cache).
+#   - Cosine similarity between in-process and ollama embeddings of the same text
+#     must be > 0.999 (same weights, different backends).  If it falls below that,
+#     revert: `unset RAG_LOCAL_EMBED` and restart the web server.
+#   - Indexing/watch/ingest paths must NOT use this function.
+#
+# Cost: ~400MB extra RAM (fp32 bge-m3 weights on CPU) or ~200MB on MPS (fp16).
+# Safe on 36GB unified with command-r + reranker already loaded.
+
+_local_embedder = None
+_local_embedder_lock = threading.Lock()
+_LOCAL_EMBED_ENABLED = os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no")
+
+
+def _get_local_embedder():
+    """Lazy-load BAAI/bge-m3 as a SentenceTransformer for in-process query embeds.
+
+    Returns the model instance, or None if the model is not cached locally
+    (silently falls back to ollama in `query_embed_local`).
+
+    Uses MPS on Apple Silicon (same device as reranker).  Caches the model
+    globally so subsequent calls are O(1).
+    """
+    global _local_embedder
+    if _local_embedder is not None:
+        return _local_embedder
+    with _local_embedder_lock:
+        if _local_embedder is not None:
+            return _local_embedder
+        try:
+            import os as _os
+            # Only load from local cache — never trigger a download mid-serve.
+            _os.environ["HF_HUB_OFFLINE"] = "1"
+            import torch
+            from sentence_transformers import SentenceTransformer
+            if torch.backends.mps.is_available():
+                _dev = "mps"
+            elif torch.cuda.is_available():
+                _dev = "cuda"
+            else:
+                _dev = "cpu"
+            _t0 = time.perf_counter()
+            _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
+            _cold_ms = int((time.perf_counter() - _t0) * 1000)
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "[local-embed] cold load %dms device=%s", _cold_ms, _dev
+            )
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[local-embed] unavailable (%s) — falling back to ollama", _exc
+            )
+            _local_embedder = None  # stays None; callers fall back to ollama
+    return _local_embedder
+
+
+def query_embed_local(texts: list[str]) -> list[list[float]] | None:
+    """Embed `texts` in-process via BAAI/bge-m3 SentenceTransformer.
+
+    Returns a list of 1024-dim float vectors, or None if the in-process model
+    is unavailable (caller should fall back to `embed()`).
+
+    Only intended for the *web chat query* path (1-3 short strings per call).
+    Do NOT use from indexing/watch/ingest — those paths should stay on ollama.
+    """
+    if not _LOCAL_EMBED_ENABLED:
+        return None
+    model = _get_local_embedder()
+    if model is None:
+        return None
+    try:
+        vecs = model.encode(
+            texts,
+            normalize_embeddings=True,
+            batch_size=len(texts),
+            show_progress_bar=False,
+        )
+        return [v.tolist() for v in vecs]
+    except Exception:
+        return None
+
+
 def hyde_embed(question: str) -> list[float]:
     """Generate a short hypothetical note sentence and embed it (1 sentence = fast)."""
     prompt = (
@@ -3202,6 +3293,9 @@ def get_reranker():
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
     Also records last-use timestamp so `maybe_unload_reranker()` can evict
     it from MPS after a configurable idle window.
+
+    Cold load wall-time is logged to help calibrate the deferred pre-warm
+    delay in the idle sweeper (see `maybe_unload_reranker`).
     """
     global _reranker, _reranker_last_use
     _reranker_last_use = time.time()
@@ -3217,7 +3311,13 @@ def get_reranker():
                 device = "cuda"
             else:
                 device = "cpu"
+            _t0 = time.perf_counter()
             _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
+            _cold_ms = int((time.perf_counter() - _t0) * 1000)
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "[reranker] cold load %dms device=%s", _cold_ms, device
+            )
     return _reranker
 
 
@@ -6066,6 +6166,8 @@ def retrieve(
       - parent-chunk expansion for final candidates
     """
     _col_count = col.count()
+    _t_retrieve_start = time.perf_counter()
+    _timing: dict[str, float] = {}
     if _col_count == 0:
         return {
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
@@ -6122,11 +6224,18 @@ def retrieve(
     # 4. Retrieve per variant, union IDs.
     #    Non-HyDE path: batch-embed all variants in one Ollama call.
     #    HyDE path: each variant needs its own generated hypothetical, keep per-variant.
+    #    Fast path: when RAG_LOCAL_EMBED=1 (web server only), try in-process
+    #    SentenceTransformer embed first (~10-30ms vs ~140ms HTTP).  Falls back
+    #    to ollama silently if model not cached locally.  Indexing/watch paths
+    #    must not set RAG_LOCAL_EMBED so bulk chunk embeds stay on ollama.
     where = build_where(folder, tag, date_range)
+    _t0 = time.perf_counter()
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
-        variant_embeds = embed(variants)
+        _local_vecs = query_embed_local(variants) if _LOCAL_EMBED_ENABLED else None
+        variant_embeds = _local_vecs if _local_vecs is not None else embed(variants)
+    _timing["embed_ms"] = (time.perf_counter() - _t0) * 1000
 
     # Sequential — ChromaDB + BM25Okapi both hold a GIL-bound mutex, so
     # ThreadPoolExecutor over these serialises anyway AND adds per-task
@@ -6134,6 +6243,9 @@ def retrieve(
     seen_ids: set[str] = set()
     merged_ordered: list[str] = []
     n_results = min(RETRIEVE_K, _col_count)
+    _sem_ms = 0.0
+    _bm25_ms = 0.0
+    _rrf_ms = 0.0
     for v, q_embed in zip(variants, variant_embeds):
         sem_kwargs: dict = {
             "query_embeddings": [q_embed],
@@ -6142,12 +6254,21 @@ def retrieve(
         }
         if where:
             sem_kwargs["where"] = where
+        _t0 = time.perf_counter()
         sem_ids = col.query(**sem_kwargs)["ids"][0]
+        _sem_ms += (time.perf_counter() - _t0) * 1000
+        _t0 = time.perf_counter()
         bm25_ids = bm25_search(col, v, RETRIEVE_K, folder, tag, date_range)
+        _bm25_ms += (time.perf_counter() - _t0) * 1000
+        _t0 = time.perf_counter()
         for id_ in rrf_merge(sem_ids, bm25_ids):
             if id_ not in seen_ids:
                 seen_ids.add(id_)
                 merged_ordered.append(id_)
+        _rrf_ms += (time.perf_counter() - _t0) * 1000
+    _timing["sem_ms"] = _sem_ms
+    _timing["bm25_ms"] = _bm25_ms
+    _timing["rrf_ms"] = _rrf_ms
 
     if not merged_ordered:
         return {
@@ -6189,7 +6310,9 @@ def retrieve(
     merged_ordered = merged_ordered[:_effective_pool]
 
     # 5. Fetch candidates
+    _t0 = time.perf_counter()
     fetched = col.get(ids=merged_ordered, include=["documents", "metadatas"])
+    _timing["fetch_ms"] = (time.perf_counter() - _t0) * 1000
     id_map = {
         id_: (doc, meta)
         for id_, doc, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
@@ -6199,7 +6322,9 @@ def retrieve(
     # 6. Parent-chunk expansion BEFORE rerank so the reranker scores the same
     #    context the LLM will actually see. Prevents chunk-vs-parent mismatch
     #    where the best-scoring chunk's parent is less relevant than another's.
+    _t0 = time.perf_counter()
     expanded = [expand_to_parent(c[0], c[1]) for c in candidates]
+    _timing["parent_expand_ms"] = (time.perf_counter() - _t0) * 1000
 
     # 7. Cross-encoder rerank against the ORIGINAL question (not paraphrase).
     #    Prepend `{title}\n({folder})\n\n` so the reranker can match the
@@ -6217,7 +6342,9 @@ def retrieve(
         )
         return header + parent
     pairs = [(question, _rerank_doc(e, c[1])) for e, c in zip(expanded, candidates)]
+    _t0 = time.perf_counter()
     scores = reranker.predict(pairs, show_progress_bar=False)
+    _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
 
     # Recency boost: when the query carries a temporal cue ("últimamente",
     # "este mes", "recientes"…), reweight by how fresh each note is. Second
@@ -6318,6 +6445,7 @@ def retrieve(
     # del contexto adicional del grafo.
     graph_docs: list[str] = []
     graph_metas: list[dict] = []
+    _t0 = time.perf_counter()
     if metas and top_score <= 0.5:
         try:
             corpus = _load_corpus(col)
@@ -6360,6 +6488,7 @@ def retrieve(
                     pass
         except Exception:
             pass
+    _timing["graph_expand_ms"] = (time.perf_counter() - _t0) * 1000
 
     # ── ε-exploration toggle ─────────────────────────────────────────────────
     # When RAG_EXPLORE=1, randomly swap one top-3 result with a rank-4..7
@@ -6403,6 +6532,23 @@ def retrieve(
                     top_score = max(final_scores) if final_scores else top_score
             except Exception:
                 pass  # exploration failure is silently ignored
+
+    _timing["total_ms"] = (time.perf_counter() - _t_retrieve_start) * 1000
+    # Always-on: single line, negligible cost (~1µs dict format).
+    import sys as _sys
+    print(
+        f"[retrieve-timing] total={_timing.get('total_ms', 0):.0f}ms"
+        f" embed={_timing.get('embed_ms', 0):.0f}ms"
+        f" sem={_timing.get('sem_ms', 0):.0f}ms"
+        f" bm25={_timing.get('bm25_ms', 0):.0f}ms"
+        f" rrf={_timing.get('rrf_ms', 0):.0f}ms"
+        f" fetch={_timing.get('fetch_ms', 0):.0f}ms"
+        f" parent_expand={_timing.get('parent_expand_ms', 0):.0f}ms"
+        f" rerank={_timing.get('rerank_ms', 0):.0f}ms"
+        f" graph={_timing.get('graph_expand_ms', 0):.0f}ms",
+        file=_sys.stderr,
+        flush=True,
+    )
 
     return {
         "docs": docs,

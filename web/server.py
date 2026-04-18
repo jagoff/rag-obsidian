@@ -213,13 +213,41 @@ def _warmup() -> None:
         """Evict the reranker from MPS after `_RERANKER_IDLE_TTL` of no
         activity. Keeps the Mac responsive when the user walks away from
         chat — 2-3 GB of unified memory freed on idle.
+
+        After eviction, schedules a deferred pre-warm 60s later so the
+        reranker is hot again before the likely next request (user returns
+        to chat after a short break). The pre-warm runs in its own daemon
+        thread and MUST NOT block the sweeper loop.
+
+        When `RAG_RERANKER_NEVER_UNLOAD=1` (env var) the sweeper loop
+        still runs but skips `maybe_unload_reranker()` entirely — the
+        reranker stays pinned in MPS VRAM at all times. Use this on a
+        36 GB unified-memory Mac where the ~2-3 GB cost is acceptable and
+        eliminating the 9s cold-reload hit after idle eviction is worth it.
         """
-        from rag import maybe_unload_reranker
+        from rag import maybe_unload_reranker, get_reranker
+        _never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip() not in ("", "0", "false", "no")
+        if _never_unload:
+            print("[idle-sweep] RAG_RERANKER_NEVER_UNLOAD=1 — reranker pinned, sweeper disabled", flush=True)
         while True:
             try:
                 time.sleep(120)
+                if _never_unload:
+                    continue
                 if maybe_unload_reranker():
                     print("[idle-sweep] reranker unloaded from MPS", flush=True)
+
+                    def _deferred_rewarm() -> None:
+                        time.sleep(60)
+                        try:
+                            get_reranker()
+                            print("[idle-sweep] reranker pre-warmed (deferred)", flush=True)
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_deferred_rewarm, name="reranker-rewarm", daemon=True
+                    ).start()
             except Exception:
                 pass
 
@@ -846,12 +874,33 @@ def _is_tasks_query(q: str) -> bool:
 # demonstratives, ellipsis markers. If a follow-up has any of these, route it
 # through reformulate_query so retrieval gets the resolved entity. Otherwise
 # the original wording is already a self-contained search target.
+#
+# Deliberately excluded: `el`/`la`/`lo` — they're common articles and would
+# fire on virtually every Spanish sentence, causing the reformat call on fully
+# self-contained questions (empirically regressed quality by ~0.15 rerank).
 _FOLLOWUP_CUES = re.compile(
-    r"\b(eso|esa|ese|esto|esta|este|aquello|ella|él|el|la|lo|"
+    r"\b(eso|esa|ese|esto|esta|este|aquello|ella|[eé]l\b(?!\s+[A-ZÁÉÍÓÚ])|"
     r"ahí|ahi|allí|alli|allá|alla|"
+    r"it\b|this\b|that\b|he\b|she\b|"
     r"y\s+(de|sobre|con|para|en)|"
     r"profundizá|profundiza|ampliá|amplia|seguí|segui|continuá|continua|"
     r"más\s+(sobre|de|al\s+respecto)|mas\s+(sobre|de|al\s+respecto))\b",
+    re.IGNORECASE,
+)
+
+# Leading-pronoun pattern: question starts with a pronoun/demonstrative that
+# requires prior context to resolve. Only checked at position 0 (after strip).
+_LEADING_PRONOUN_RE = re.compile(
+    r"^(eso|esa|ese|esto|esta|este|ella|[eé]l|it|this|that|he|she)\b",
+    re.IGNORECASE,
+)
+
+# Short interrogative without an explicit subject — "qué hay de X?", "cuál
+# es?", "cómo funciona?" where X ≤ 1 token. Only fires for ≤5-word questions
+# so long complete questions pass through.
+_SHORT_INTERROGATIVE_RE = re.compile(
+    r"^(qué|que|cuál|cual|cómo|como|por\s+qué|por\s+que|"
+    r"what|how|which|why)\b",
     re.IGNORECASE,
 )
 
@@ -859,14 +908,31 @@ _FOLLOWUP_CUES = re.compile(
 def _looks_like_followup(q: str) -> bool:
     """Heuristic: should we pay the reformulate_query LLM call (~1s)?
 
-    Yes if the question is short (≤3 words) — likely "y eso?", "más?" — or
-    contains an explicit anaphora cue. Standalone questions skip the call
-    and search verbatim.
+    Fires when the question is contextually incomplete and needs prior-turn
+    resolution. Three cases:
+      (a) ≤2 words — genuine ellipsis: "y eso?", "más?", "cuál?"
+      (b) Starts with a pronoun/demonstrative: "eso que dijiste", "ella cómo?"
+      (c) ≤5-word question starting with an interrogative word (incomplete
+          subject implied by context): "qué hay de eso?"
+
+    Long standalone questions (≥4 words without leading cues) skip the call —
+    the original query is already a good search target. Avoids paying 0.6-2s
+    reformulate on "resumime los sprints", "qué dice la nota sobre Grecia", etc.
     """
     if not q:
         return False
-    if len(q.split()) <= 3:
+    words = q.split()
+    # (a) very short — almost certainly anaphoric
+    if len(words) <= 2:
         return True
+    # (b) starts with a pronoun/demonstrative that needs antecedent resolution
+    stripped = q.strip().lstrip("¿").strip()
+    if _LEADING_PRONOUN_RE.match(stripped):
+        return True
+    # (c) short interrogative (≤5 words) — subject likely implicit from context
+    if len(words) <= 5 and _SHORT_INTERROGATIVE_RE.match(stripped):
+        return True
+    # (d) explicit anaphora cue anywhere in the question
     return bool(_FOLLOWUP_CUES.search(q))
 
 
@@ -2224,9 +2290,14 @@ def chat(req: ChatRequest) -> StreamingResponse:
         #      "algo mas sobre ella" → concat produces "tenes notas sobre
         #      Grecia? tenes algo mas sobre ella?" which retrieves the
         #      Grecia notes at top (~+0.20 rerank score).
+        yield _sse("status", {"stage": "retrieving"})
+
         _t_reform_start = time.perf_counter()
         search_question = question
+        _reform_fired = False
+        _reform_used_concat = False
         if history and _looks_like_followup(question):
+            _reform_fired = True
             try:
                 search_question = reformulate_query(question, history) or question
             except Exception:
@@ -2239,21 +2310,25 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 )
                 if last_user_q:
                     search_question = f"{last_user_q} {question}"
+                    _reform_used_concat = True
         _t_reform_end = time.perf_counter()
 
         try:
             _t_retrieve_start = time.perf_counter()
             # multi_query=False: the qwen2.5:3b paraphrase call costs 1-3s
             # and only marginally improves recall on chat-style questions.
-            # rerank_pool=5: bge-reranker-v2-m3 on MPS hits a non-linear
-            # cliff — pool=5 averages ~210ms, pool=6+ jumps to 1.3-3s due
-            # to batch-padding misalignment. Measured 2026-04-17 with
-            # /tmp/profile_pool.py. Top-4 quality holds because RRF already
-            # picked the winners; the reranker only refines order.
+            # rerank_pool=4: prior note said pool=5 averages ~210ms; pool=6+
+            # jumps to 1.3-3s due to batch-padding misalignment on MPS.
+            # Re-verifying at pool=4 — bge-reranker-v2-m3 batch size 4 aligns
+            # naturally and may shave another ~50ms vs pool=5. Top-4 quality
+            # holds because RRF already picked the winners; the reranker only
+            # refines order. Measured 2026-04-17. Reverted if eval regresses
+            # below singles hit@5 76.19 (CI lower bound) or chains
+            # chain_success < 16.67.
             result = multi_retrieve(
                 vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
-                rerank_pool=5,
+                rerank_pool=4,
             )
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
@@ -2371,9 +2446,18 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # Log context size for prefill analysis
         _ctx_chars = sum(len(m.get("content","")) for m in messages)
 
-        # Fast-path LLM options. num_ctx 2560 fits the system prompt (~1100
-        # tokens) + history + ~500-token user content with headroom. Going
-        # lower would truncate; going higher slows prefill without payoff.
+        # Fast-path LLM options.
+        # num_ctx: measured from web.log (75 timing rows, 2026-04-17):
+        #   P50 ctx ≈ 4889 chars / 1.35 char-per-token ≈ 3622 tok
+        #   P95 ctx ≈ 6065 chars ≈ 4492 tok
+        #   P99 ctx ≈ 7751 chars ≈ 5742 tok
+        # Budget breakdown per request:
+        #   system prompt ~1100 tok + retrieved context ~2500–4500 tok
+        #   + history (trimmed) + current query
+        # 2560 was silently truncating every request above ~1900 tok of
+        # retrieved context. 5120 covers P99 (5742 tok) with ~10% headroom.
+        # Don't raise further without evidence — larger ctx has real prefill
+        # cost on command-r:35b.
         # num_predict 160 caps decode at ~12-15s on command-r:35b worst case
         # (10 tok/s × 160 = 16s), ~1-2s on qwen2.5:3b. The REGLA 4 prompt
         # asks for 2-4 sentences which lands at ~80-130 tokens.
@@ -2384,9 +2468,11 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # and made some calls hang silently — leave it out.
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
-            "num_ctx": 2560,
+            "num_ctx": 5120,
             "num_predict": 160,
         }
+
+        yield _sse("status", {"stage": "generating"})
 
         parts: list[str] = []
         stripper = _InlineCitationStripper()
@@ -2423,6 +2509,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _t_done = time.perf_counter()
 
         # Timing breakdown for diagnostics
+        _t_reform_ms = int((_t_reform_end - _t_reform_start) * 1000)
         _t_retrieve_ms = int((_t_retrieve_end - _t_retrieve_start) * 1000)
         _t_wa_ms = _t_wa_wait_ms
         _t_llm_prefill_ms = int((_t_first_token - _t_llm_start) * 1000) if _first_token_logged else -1
@@ -2430,8 +2517,15 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _t_total_ms = int((_t_done - _t0) * 1000)
         _t_ttft_ms = int(((_t_first_token if _first_token_logged else _t_done) - _t0) * 1000)
         _tok_count = len(full.split())
+        _q_words = len(question.split())
+        _reform_outcome = (
+            "concat" if _reform_used_concat
+            else "rewritten" if _reform_fired
+            else "skipped"
+        )
         print(
             f"[chat-timing] model={_resolve_web_chat_model()} retrieve={_t_retrieve_ms}ms "
+            f"reform={_t_reform_ms}ms reform_outcome={_reform_outcome} q_words={_q_words} "
             f"wa={_t_wa_ms}ms llm_prefill={_t_llm_prefill_ms}ms "
             f"llm_decode={_t_llm_decode_ms}ms ttft={_t_ttft_ms}ms "
             f"total={_t_total_ms}ms ctx_chars={_ctx_chars} tokens≈{_tok_count} "

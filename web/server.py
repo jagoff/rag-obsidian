@@ -122,6 +122,17 @@ def _resolve_web_chat_model() -> str:
 _WEB_SYSTEM_PROMPT = (
     "Eres un asistente de consulta sobre las notas personales de "
     "Obsidian del usuario. NO sos un modelo de conocimiento general.\n\n"
+    "REGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. "
+    "TOTALMENTE PROHIBIDO emitir tokens en chino, japonés, coreano, "
+    "árabe, ruso, alemán, portugués, italiano, francés o cualquier "
+    "idioma que no sea español. Si el contexto recuperado contiene "
+    "fragmentos en otros idiomas (ej. citas en inglés, nombres "
+    "propios, código), citalos textualmente entre comillas pero el "
+    "resto de tu respuesta TIENE QUE estar en español. Si la "
+    "pregunta del usuario está en otro idioma, traducila a español "
+    "mentalmente y respondé en español. Esta regla es ABSOLUTA — "
+    "ni siquiera caracteres sueltos en otro alfabeto (汉字, "
+    "русский, etc.) están permitidos en tu output.\n\n"
     "REGLA 1 — ENGÁNCHATE CON EL CONTEXTO QUE RECIBÍS:\n"
     "  • El CONTEXTO abajo es lo que el retriever consideró más "
     "relacionado con la pregunta. Tu trabajo es leerlo y resumir lo "
@@ -2326,7 +2337,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
             # below singles hit@5 76.19 (CI lower bound) or chains
             # chain_success < 16.67.
             result = multi_retrieve(
-                vaults, search_question, 4, None, history, None, False,
+                vaults, search_question, 1, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
                 rerank_pool=2,
             )
@@ -2469,7 +2480,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
             "num_ctx": 4096,
-            "num_predict": 160,
+            "num_predict": 100,
         }
 
         yield _sse("status", {"stage": "generating"})

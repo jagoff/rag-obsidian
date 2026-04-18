@@ -2486,31 +2486,15 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 )
             context = context + "\n\n---\n\n" + "\n".join(wa_block_lines)
 
-        # Retrieval signals block — helps the LLM frame its answer with
-        # the right degree of certainty / scope. Fed as a top-level
-        # preamble above the chunks so it's always in view.
-        _sig_lines = [
-            "[señales de retrieval]",
-            f"- confianza: {retrieval_signals['confidence_label']} "
-            f"(score {retrieval_signals['confidence_score']})",
-            f"- notas recuperadas: {retrieval_signals['n_notes']}",
-        ]
-        if retrieval_signals["filters"]:
-            _fparts = [f"{k}={v}" for k, v in retrieval_signals["filters"].items()]
-            _sig_lines.append(f"- filtros aplicados: {', '.join(_fparts)}")
-        if retrieval_signals["n_variants"] > 1:
-            _sig_lines.append(
-                f"- variantes de búsqueda exploradas: {retrieval_signals['n_variants']}"
-            )
-        _sig_lines.append(
-            "- usalas SOLO para calibrar el hedging, NUNCA para refusal. "
-            "Confianza baja = 'sé humilde en el tono' (ej. 'parece que...', "
-            "'según una nota breve...'), NO 'no tengo info'. Si el CONTEXTO "
-            "de abajo tiene chunks relacionados al tema, engánchate con "
-            "ellos aunque la confianza sea baja — la regla 1 lo exige."
-        )
-        signals_block = "\n".join(_sig_lines)
-        context = signals_block + "\n\n---\n\n" + context
+        # Retrieval signals block removido 2026-04-18: costaba ~300 chars
+        # = ~75 tokens = ~150ms de prefill uncached en CADA request. El
+        # hedging que calibraba (no-refusal, humildad en confianza baja,
+        # engancharse con contexto débil) ya está expresado en REGLA 1 +
+        # REGLA 4 del _WEB_SYSTEM_PROMPT (que está byte-identical + cached).
+        # Empíricamente el modelo respeta esas reglas sin repetir las
+        # señales cada turno — redundante con el system prompt.
+        # retrieval_signals dict sigue disponible para telemetría
+        # (_n_notes, confidence) pero no se inyecta al prompt.
 
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The

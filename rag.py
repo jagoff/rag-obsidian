@@ -13,6 +13,7 @@ import re
 import secrets
 import threading
 import time
+import traceback
 import unicodedata
 import warnings
 from datetime import datetime, timedelta
@@ -395,6 +396,9 @@ EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
 BRIEF_WRITTEN_PATH = Path.home() / ".local/share/obsidian-rag/brief_written.jsonl"
 BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
+COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
+COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
+COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -436,6 +440,58 @@ def _flush_log_queue() -> None:
 
 
 atexit.register(_flush_log_queue)
+
+
+def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
+    """Append an audit entry to collection_ops.log for any delete_collection call."""
+    entry = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "pid": os.getpid(),
+        "op": op,
+        "collection": collection_name,
+        "stack": traceback.format_stack()[:-1][-5:],
+    }
+    if extra:
+        entry.update(extra)
+    try:
+        COLLECTION_OPS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with COLLECTION_OPS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _collection_write_lock(timeout: int = 300):
+    """Exclusive cross-process lock serialising collection create/delete ops.
+
+    Uses fcntl.flock on COLLECTION_WRITE_LOCK. Retries every 0.5s up to
+    `timeout` seconds, then raises RuntimeError so callers surface the stall
+    rather than silently racing.
+    """
+    COLLECTION_WRITE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = COLLECTION_WRITE_LOCK.open("a+")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    lock_fh.close()
+                    raise RuntimeError(
+                        f"Could not acquire collection write lock after {timeout}s — "
+                        "another process may be stuck. Check: "
+                        f"{COLLECTION_WRITE_LOCK}"
+                    )
+                time.sleep(0.5)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    finally:
+        lock_fh.close()
 
 
 def log_query_event(event: dict) -> None:
@@ -1893,21 +1949,33 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
 # ── DB ────────────────────────────────────────────────────────────────────────
 
 _db_singleton: tuple[str, chromadb.Collection] | None = None
+_db_singleton_created_at: float = 0.0
+_db_singleton_lock = threading.Lock()
 
 
 def get_db() -> chromadb.Collection:
-    global _db_singleton
+    global _db_singleton, _db_singleton_created_at
     db_key = str(DB_PATH)
-    if _db_singleton is not None and _db_singleton[0] == db_key:
+    with _db_singleton_lock:
+        if _db_singleton is not None and _db_singleton[0] == db_key:
+            # Cheap sentinel mtime check: if another process ran `index --reset`
+            # after we cached the handle, the sentinel file will be newer.
+            try:
+                sentinel_mtime = os.stat(COLLECTION_RESET_SENTINEL).st_mtime
+                if sentinel_mtime > _db_singleton_created_at:
+                    _db_singleton = None
+            except FileNotFoundError:
+                pass
+        if _db_singleton is None or _db_singleton[0] != db_key:
+            DB_PATH.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(path=db_key)
+            col = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+            _db_singleton = (db_key, col)
+            _db_singleton_created_at = time.time()
         return _db_singleton[1]
-    DB_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=db_key)
-    col = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
-    _db_singleton = (db_key, col)
-    return col
 
 
 def _collection_name_for_vault(vault_path: Path) -> str:
@@ -1926,6 +1994,10 @@ def get_db_for(vault_path: Path) -> chromadb.Collection:
     """Abre la colección Chroma correspondiente a un vault arbitrario.
     Todos los vaults viven en la misma DB (DB_PATH) — la separación es por
     nombre de colección, namespaced por hash del path del vault.
+    No hay singleton aquí: cada llamada abre un cliente fresco, así que el
+    sentinel de reset no aplica — `index --reset` invalida el singleton de
+    get_db() y siempre llama a get_or_create_collection que devuelve el UUID
+    vigente.
     """
     DB_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(DB_PATH))
@@ -2080,13 +2152,35 @@ def auto_index_vault(vault_path: Path) -> dict:
 
         # Orphans: archivos en el índice que ya no están en disco. Solo
         # vale chequear cuando el vault ya estaba indexado (skip first_time).
+        # SAFETY GATE (2026-04-18): iCloud sync puede hacer que rglob devuelva
+        # 0 archivos temporariamente — sin este guard, TODOS los chunks se
+        # marcan como orphans y se borra la colección entera. Bailout si
+        # on_disk está vacío (no hay archivos visibles) o si on_disk cubre
+        # <10% del set indexado (sync parcial). Logeamos y dejamos que la
+        # próxima corrida limpie cuando sync haya terminado.
         removed = 0
         if not first_time:
             on_disk = {str(p.relative_to(vault_path)) for p in md_files}
             existing = col.get(include=["metadatas"])
             indexed_files = {m.get("file", "") for m in existing["metadatas"]}
             indexed_files.discard("")
-            orphans = indexed_files - on_disk
+            if not on_disk:
+                print(
+                    f"[auto_index] {vault_path.name}: rglob 0 files — "
+                    f"skip orphan cleanup (iCloud sync in progress?)",
+                    flush=True,
+                )
+                orphans = set()
+            elif indexed_files and len(on_disk) < 0.1 * len(indexed_files):
+                print(
+                    f"[auto_index] {vault_path.name}: on_disk={len(on_disk)} "
+                    f"vs indexed={len(indexed_files)} — too many orphans, "
+                    f"skip cleanup (likely sync glitch)",
+                    flush=True,
+                )
+                orphans = set()
+            else:
+                orphans = indexed_files - on_disk
             for orphan in orphans:
                 stale = col.get(where={"file": orphan}, include=[])
                 if stale["ids"]:
@@ -8079,19 +8173,26 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     check_contradictions = not reset and not no_contradict
 
     if reset:
-        global _db_singleton
-        _db_singleton = None
-        db_key = str(DB_PATH)
-        client = chromadb.PersistentClient(path=db_key)
-        for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
-            try:
-                client.delete_collection(cname)
-            except Exception:
-                pass
-        col = client.get_or_create_collection(
-            COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-        )
-        _db_singleton = (db_key, col)
+        with _collection_write_lock():
+            global _db_singleton, _db_singleton_created_at
+            _db_singleton = None
+            db_key = str(DB_PATH)
+            client = chromadb.PersistentClient(path=db_key)
+            for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
+                try:
+                    _log_collection_op("delete", cname, {"reason": "index --reset"})
+                    client.delete_collection(cname)
+                except Exception:
+                    pass
+            col = client.get_or_create_collection(
+                COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            )
+            _db_singleton = (db_key, col)
+            _db_singleton_created_at = time.time()
+            COLLECTION_RESET_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+            COLLECTION_RESET_SENTINEL.write_text(
+                f"{int(_db_singleton_created_at)} {col.id}\n"
+            )
         console.print("[yellow]Índice borrado (notas + URLs).[/yellow]")
 
     col_urls = get_urls_db()
@@ -20866,13 +20967,37 @@ def _prune_feedback_orphans(vault: Path) -> int:
 
 
 def _find_orphan_collections() -> list[str]:
-    """Detect ChromaDB collections from old schema versions or removed vaults."""
+    """Detect ChromaDB collections from old schema versions or removed vaults.
+
+    Safety invariants
+    -----------------
+    1. Base names are never orphaned: _COLLECTION_BASE ("obsidian_notes_v9")
+       and _URLS_COLLECTION_BASE ("obsidian_urls_v1") are unconditionally added
+       to `known` so that if this process was launched with OBSIDIAN_RAG_VAULT
+       pointing at a non-default vault, the default vault's unsuffixed collection
+       is still protected and not classified as an orphan.
+
+    2. Recency guard: ChromaDB's `collections` table has no `created_at` column
+       (schema confirmed: id, name, dimension, database_id, config_json_str,
+       schema_str). There is no timestamp we can query, so no recency guard is
+       implemented. See Task 2 comment if a future ChromaDB version adds one.
+
+    3. Audit: every candidate orphan is logged via _log_collection_op before
+       being returned to the caller (which may delete it).
+    """
     try:
         client = chromadb.PersistentClient(path=str(DB_PATH))
         all_cols = [c.name for c in client.list_collections()]
     except Exception:
         return []
     known = {COLLECTION_NAME, URLS_COLLECTION_NAME}
+    # Unconditionally protect the base names for the default vault.
+    # If this process was started with OBSIDIAN_RAG_VAULT set to a work vault,
+    # COLLECTION_NAME / URLS_COLLECTION_NAME resolve to the work-vault suffixed
+    # names.  The unsuffixed default-vault collections would then fall through
+    # as unknown and get wrongly classified as orphans without this guard.
+    known.add(_COLLECTION_BASE)
+    known.add(_URLS_COLLECTION_BASE)
     # Also include collections for registered vaults
     try:
         vcfg = _load_vaults_config()
@@ -20882,7 +21007,11 @@ def _find_orphan_collections() -> list[str]:
             known.add(_urls_collection_name_for_vault(vp))
     except Exception:
         pass
-    return [c for c in all_cols if c not in known]
+    orphans = [c for c in all_cols if c not in known]
+    # Audit every candidate before returning to caller — caller may delete them.
+    for cname in orphans:
+        _log_collection_op("orphan_candidate", cname)
+    return orphans
 
 
 def _find_orphan_segment_dirs() -> list[tuple[Path, int]]:
@@ -21006,12 +21135,14 @@ def run_maintenance(
     orphan_cols = _find_orphan_collections()
     results["orphan_collections"] = orphan_cols
     if orphan_cols and not dry_run:
-        client = chromadb.PersistentClient(path=str(DB_PATH))
-        for cname in orphan_cols:
-            try:
-                client.delete_collection(cname)
-            except Exception:
-                pass
+        with _collection_write_lock():
+            client = chromadb.PersistentClient(path=str(DB_PATH))
+            for cname in orphan_cols:
+                try:
+                    _log_collection_op("delete", cname, {"reason": "run_maintenance orphan"})
+                    client.delete_collection(cname)
+                except Exception:
+                    pass
         results["orphan_collections_removed"] = len(orphan_cols)
 
     # 3b. Orphan HNSW segment dirs (files left behind by delete_collection / --reset)

@@ -2082,6 +2082,53 @@ def _ensure_chat_model_prewarmer() -> None:
     threading.Thread(target=loop, name="chat-model-prewarmer", daemon=True).start()
 
 
+# ── Response cache ──────────────────────────────────────────────────────
+# LRU de respuestas completas de /api/chat para queries exactas repetidas.
+# Cuando el mismo user query llega dentro del TTL y el vault no cambió,
+# servimos la respuesta cacheada como SSE replay (<100ms wall) en lugar de
+# re-correr retrieve + LLM (2-3s).
+#
+# Cache key: sha256(question|vault_scope|chat_model|vault_chunks_count)[:16].
+# Incluir el chunks count efectivamente invalida el cache cuando el vault
+# gana/pierde notas (count cambia → key cambia). TTL secundario 5min para
+# invalidar respuestas sin cambio de vault pero con información que puede
+# haber envejecido (ej. `rag tune` refinó pesos → retrieval diferente).
+#
+# No cacheamos cuando:
+#   - hay history (follow-ups dependen del turno previo, el key no refleja eso)
+#   - el response fue vacío/error
+#   - _wa_in_query matcheó (WA data change rápidamente, datos frescos importan)
+_CHAT_CACHE: "OrderedDict[str, dict]" = __import__("collections").OrderedDict()
+_CHAT_CACHE_MAX = 100
+_CHAT_CACHE_TTL = 300.0  # 5 min
+_CHAT_CACHE_LOCK = threading.Lock()
+
+
+def _chat_cache_key(question: str, vault_scope: str, model: str, vault_chunks: int) -> str:
+    raw = f"{question.strip().lower()}|{vault_scope}|{model}|{vault_chunks}"
+    return __import__("hashlib").sha256(raw.encode()).hexdigest()[:16]
+
+
+def _chat_cache_get(key: str) -> dict | None:
+    with _CHAT_CACHE_LOCK:
+        entry = _CHAT_CACHE.get(key)
+        if not entry:
+            return None
+        if time.time() - entry["ts"] > _CHAT_CACHE_TTL:
+            del _CHAT_CACHE[key]
+            return None
+        _CHAT_CACHE.move_to_end(key)
+        return dict(entry)
+
+
+def _chat_cache_put(key: str, payload: dict) -> None:
+    with _CHAT_CACHE_LOCK:
+        _CHAT_CACHE[key] = {"ts": time.time(), **payload}
+        _CHAT_CACHE.move_to_end(key)
+        while len(_CHAT_CACHE) > _CHAT_CACHE_MAX:
+            _CHAT_CACHE.popitem(last=False)
+
+
 def _home_compute(regenerate: bool = False) -> dict:
     """Centralizer — aggregates every information channel the user cares
     about into one JSON payload. Powers the home page.
@@ -2324,6 +2371,55 @@ def chat(req: ChatRequest) -> StreamingResponse:
         if _is_tasks_query(question):
             yield from _gen_tasks_response(sess, question, history)
             return
+
+        # Response cache — sirve respuesta cacheada si (question, scope, model,
+        # vault_count) matchea + TTL viva + NO es follow-up. Skipped cuando hay
+        # history porque la respuesta depende del contexto de la conversación,
+        # que el key actual no refleja.
+        if not history:
+            try:
+                from rag import get_db_for
+                _vault_chunks = get_db_for(vaults[0][1]).count() if vaults else 0
+            except Exception:
+                _vault_chunks = 0
+            _cache_key = _chat_cache_key(
+                question, req.vault_scope or "", _resolve_web_chat_model(), _vault_chunks
+            )
+            _cached = _chat_cache_get(_cache_key)
+            if _cached:
+                # Replay completo como SSE. El UI no distingue cached de live.
+                yield _sse("status", {"stage": "cached"})
+                yield _sse("sources", {
+                    "items": _cached["sources_items"],
+                    "confidence": _cached["top_score"],
+                })
+                # Stream el texto en chunks chicos para mantener la ilusión
+                # de streaming (el cliente ya espera SSE tokens). 40 chars ≈
+                # 10 tokens — UI renderea suave sin el feel "pegote instantáneo".
+                _text = _cached["text"]
+                for i in range(0, len(_text), 40):
+                    yield _sse("token", {"delta": _text[i:i+40]})
+                _cached_total_ms = int((time.perf_counter() - _t0) * 1000)
+                yield _sse("done", {
+                    "turn_id": new_turn_id(),
+                    "top_score": _cached["top_score"],
+                    "total_ms": _cached_total_ms,
+                    "retrieve_ms": 0,
+                    "ttft_ms": _cached_total_ms,
+                    "llm_ms": 0,
+                    "cached": True,
+                })
+                print(f"[chat-cache] HIT {_cache_key} total={_cached_total_ms}ms", flush=True)
+                # Todavía appendeamos al session history — la conversación continúa normal
+                append_turn(sess, {
+                    "q": question,
+                    "a": _text,
+                    "paths": [s.get("file", "") for s in _cached["sources_items"]],
+                    "top_score": _cached["top_score"],
+                    "turn_id": new_turn_id(),
+                })
+                save_session(sess)
+                return
 
         # Fail fast if ollama is in the "stuck-load" state — accepts HTTP
         # but never responds. Without this probe, the chat hangs on the
@@ -2639,6 +2735,24 @@ def chat(req: ChatRequest) -> StreamingResponse:
             "ttft_ms": _t_ttft_ms,
             "llm_ms": _t_llm_decode_ms,
         })
+
+        # Cache store — sólo queries sin history (no follow-ups) y con
+        # respuesta no-vacía. Keya con el vault_chunks count computado en el
+        # cache-get path arriba (mismo scope/model/vault state → misma key).
+        if not history and full.strip():
+            try:
+                _sources_items = [
+                    {**_source_payload(m, s), "bar": _score_bar(float(s))}
+                    for m, s in zip(result["metas"], result["scores"])
+                ]
+                _chat_cache_put(_cache_key, {
+                    "text": full,
+                    "sources_items": _sources_items,
+                    "top_score": round(float(result["confidence"]), 3),
+                })
+                print(f"[chat-cache] PUT {_cache_key} len={len(full)}", flush=True)
+            except Exception as _cache_err:
+                print(f"[chat-cache] put failed: {_cache_err}", flush=True)
 
     def guarded():
         """Increment/decrement the global chat-in-flight counter around

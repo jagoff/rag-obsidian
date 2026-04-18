@@ -28,6 +28,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")          # suppresses fd-2 "unauthenticated" warn
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -227,11 +228,15 @@ def render_response(text: str) -> Text:
             spans.append((m.start(), m.end(), "bold", m.group(1)))
         spans.sort()
 
+        # No bold en respuesta (preferencia del usuario 2026-04-18).
+        # Inline code conserva color pero sin bold; **bold** del markdown
+        # se renderiza plano con el base_style actual. Las fuentes (ver
+        # print_sources) siguen con bold — son UI label, no prosa.
         inline_code_style = (
-            "bold yellow" if base_style and "yellow" in base_style
-            else "bold cyan"
+            "yellow" if base_style and "yellow" in base_style
+            else "cyan"
         )
-        bold_style = f"bold {base_style}" if base_style else "bold"
+        bold_style = base_style or ""
 
         pos = 0
         for start, end, kind, content in spans:
@@ -274,9 +279,10 @@ def render_response(text: str) -> Text:
         spans.sort()
 
         last = 0
-        label_base = "bold cyan" if not base_style else "bold yellow"
+        # Sin bold en la respuesta: links conservan color pero plano.
+        label_base = "cyan" if not base_style else "yellow"
         path_base = "cyan dim" if not base_style else "yellow dim"
-        url_base = "bold blue" if not base_style else "bold yellow"
+        url_base = "blue" if not base_style else "yellow"
         url_dim = "blue dim" if not base_style else "yellow dim"
         for start, end, label, target, kind in spans:
             if start > last:
@@ -291,7 +297,7 @@ def render_response(text: str) -> Text:
             elif kind == "url-bare":
                 out.append(target, style=_url_link_style(target, url_base))
             elif kind == "note-bare":
-                out.append(target, style=_file_link_style(target, "bold magenta"))
+                out.append(target, style=_file_link_style(target, "magenta"))
             else:  # note-md
                 out.append(label, style=_file_link_style(target, label_base))
                 out.append(" (", style="dim")
@@ -324,7 +330,7 @@ def render_response(text: str) -> Text:
             out.append("\n")
         for ln in lines:
             out.append("  │ ", style="cyan dim")
-            out.append(ln + "\n", style="bold white")
+            out.append(ln + "\n", style="white")
 
     pos = 0
     for m in CODE_FENCE_RE.finditer(text):
@@ -461,31 +467,43 @@ def _log_collection_op(op: str, collection_name: str, extra: dict | None = None)
         pass
 
 
-@contextlib.contextmanager
-def _collection_write_lock(timeout: int = 300):
-    """Exclusive cross-process lock serialising collection create/delete ops.
+class LockHeldError(Exception):
+    """Raised by _collection_write_lock(blocking=False) when the lock is already held."""
 
-    Uses fcntl.flock on COLLECTION_WRITE_LOCK. Retries every 0.5s up to
-    `timeout` seconds, then raises RuntimeError so callers surface the stall
-    rather than silently racing.
+
+@contextlib.contextmanager
+def _collection_write_lock(timeout: int = 300, blocking: bool = True):
+    """Exclusive cross-process lock serialising collection write ops.
+
+    Uses fcntl.flock on COLLECTION_WRITE_LOCK. When `blocking=True` (default),
+    retries every 0.5s up to `timeout` seconds, then raises RuntimeError.
+    When `blocking=False`, raises LockHeldError immediately if the lock is held,
+    so callers can skip gracefully rather than stall.
     """
     COLLECTION_WRITE_LOCK.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = COLLECTION_WRITE_LOCK.open("a+")
     try:
-        deadline = time.monotonic() + timeout
-        while True:
+        if blocking:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        lock_fh.close()
+                        raise RuntimeError(
+                            f"Could not acquire collection write lock after {timeout}s — "
+                            "another process may be stuck. Check: "
+                            f"{COLLECTION_WRITE_LOCK}"
+                        )
+                    time.sleep(0.5)
+        else:
             try:
                 fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    lock_fh.close()
-                    raise RuntimeError(
-                        f"Could not acquire collection write lock after {timeout}s — "
-                        "another process may be stuck. Check: "
-                        f"{COLLECTION_WRITE_LOCK}"
-                    )
-                time.sleep(0.5)
+                lock_fh.close()
+                raise LockHeldError("collection write lock is held by another process")
         try:
             yield
         finally:
@@ -931,9 +949,21 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
 
 
 EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
-# Chat model preference: first available wins. command-r is RAG-trained +
-# citation-native, ideal for this use case. Fallbacks cover slower pulls.
-CHAT_MODEL_PREFERENCE = ("command-r:latest", "qwen2.5:14b", "phi4:latest")
+# Chat model preference: first available wins.
+# Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
+# warm sobre vault work, rerank_pool=15, num_ctx=4096):
+#   qwen2.5:7b     — total P50 5.9s, best 3.2s (dense, Q4_K_M, 4.7 GB)
+#   qwen3:30b-a3b  — total P50 7.6s (MoE 3B activos, buena quality, 18 GB)
+#   command-r:35b  — total P50 37s (RAG-trained pero prefill+decode 10x slower)
+# qwen2.5:7b gana latencia sin sacrificar quality notable en queries en ES
+# con citaciones simples. Dejo command-r y qwen3 como fallback high-quality.
+CHAT_MODEL_PREFERENCE = (
+    "qwen2.5:7b",
+    "qwen3:30b-a3b",
+    "command-r:latest",
+    "qwen2.5:14b",
+    "phi4:latest",
+)
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
 _COLLECTION_BASE = "obsidian_notes_v9"  # v9: contextual embeddings + temporal tokens + graph PageRank
@@ -3159,18 +3189,10 @@ def _get_local_embedder():
                 _dev = "cuda"
             else:
                 _dev = "cpu"
-            _t0 = time.perf_counter()
             _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
-            _cold_ms = int((time.perf_counter() - _t0) * 1000)
-            import logging as _logging
-            _logging.getLogger(__name__).info(
-                "[local-embed] cold load %dms device=%s", _cold_ms, _dev
-            )
         except Exception as _exc:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "[local-embed] unavailable (%s) — falling back to ollama", _exc
-            )
+            if os.environ.get("RAG_DEBUG"):
+                print(f"[local-embed] unavailable ({_exc}) — falling back to ollama", flush=True)
             _local_embedder = None  # stays None; callers fall back to ollama
     return _local_embedder
 
@@ -3405,13 +3427,7 @@ def get_reranker():
                 device = "cuda"
             else:
                 device = "cpu"
-            _t0 = time.perf_counter()
             _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
-            _cold_ms = int((time.perf_counter() - _t0) * 1000)
-            import logging as _logging
-            _logging.getLogger(__name__).info(
-                "[reranker] cold load %dms device=%s", _cold_ms, device
-            )
     return _reranker
 
 
@@ -6437,6 +6453,11 @@ def retrieve(
         return header + parent
     pairs = [(question, _rerank_doc(e, c[1])) for e, c in zip(expanded, candidates)]
     _t0 = time.perf_counter()
+    # Default batch_size (32). Probado 2026-04-18 en CLI chat: batch_size=1
+    # forzaba 30 inferencias secuenciales a pool=30 (~3s de rerank). Batch
+    # default procesa todo en una pasada MPS, ~500ms. El fix de
+    # batch_size=1 del commit 79f6b8e aplicaba a pool=2-4 donde el
+    # padding overhead a pow-2 domina; a pool más grande no hace falta.
     scores = reranker.predict(pairs, show_progress_bar=False)
     _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
 
@@ -6628,21 +6649,23 @@ def retrieve(
                 pass  # exploration failure is silently ignored
 
     _timing["total_ms"] = (time.perf_counter() - _t_retrieve_start) * 1000
-    # Always-on: single line, negligible cost (~1µs dict format).
-    import sys as _sys
-    print(
-        f"[retrieve-timing] total={_timing.get('total_ms', 0):.0f}ms"
-        f" embed={_timing.get('embed_ms', 0):.0f}ms"
-        f" sem={_timing.get('sem_ms', 0):.0f}ms"
-        f" bm25={_timing.get('bm25_ms', 0):.0f}ms"
-        f" rrf={_timing.get('rrf_ms', 0):.0f}ms"
-        f" fetch={_timing.get('fetch_ms', 0):.0f}ms"
-        f" parent_expand={_timing.get('parent_expand_ms', 0):.0f}ms"
-        f" rerank={_timing.get('rerank_ms', 0):.0f}ms"
-        f" graph={_timing.get('graph_expand_ms', 0):.0f}ms",
-        file=_sys.stderr,
-        flush=True,
-    )
+    # Instrumentación gated behind env var — silencia el ruido en el CLI
+    # chat y solo aparece cuando el dev lo pide explícitamente.
+    if os.environ.get("RAG_RETRIEVE_TIMING") == "1":
+        import sys as _sys
+        print(
+            f"[retrieve-timing] total={_timing.get('total_ms', 0):.0f}ms"
+            f" embed={_timing.get('embed_ms', 0):.0f}ms"
+            f" sem={_timing.get('sem_ms', 0):.0f}ms"
+            f" bm25={_timing.get('bm25_ms', 0):.0f}ms"
+            f" rrf={_timing.get('rrf_ms', 0):.0f}ms"
+            f" fetch={_timing.get('fetch_ms', 0):.0f}ms"
+            f" parent_expand={_timing.get('parent_expand_ms', 0):.0f}ms"
+            f" rerank={_timing.get('rerank_ms', 0):.0f}ms"
+            f" graph={_timing.get('graph_expand_ms', 0):.0f}ms",
+            file=_sys.stderr,
+            flush=True,
+        )
 
     return {
         "docs": docs,
@@ -7132,29 +7155,59 @@ def multi_retrieve(
 # visible width).
 _HIGHLIGHTED_COMMANDS = {"chat"}
 
+# Agrupación temática para `rag --help`. El default de click es una lista
+# alfabética plana que a 45+ comandos se vuelve ilegible. Orden de grupos:
+# lo más usado arriba (chat/query), config/ops al fondo. Comandos nuevos:
+# agregar aquí o caen automáticamente en "Otros".
+_COMMAND_GROUPS: list[tuple[str, list[str]]] = [
+    ("Chat & búsqueda", ["chat", "query", "do", "links"]),
+    ("Captura & ingesta", ["capture", "read", "bookmarks", "wa-tasks"]),
+    ("Inbox & filing", ["inbox", "file", "autotag", "fix"]),
+    ("Grafo & exploración", ["wikilinks", "graph", "surface", "dupes", "timeline", "prep"]),
+    ("Briefs & cabos sueltos", ["morning", "today", "digest", "pendientes", "followup"]),
+    ("Hygiene & lifecycle", ["dead", "archive", "ignore", "maintenance"]),
+    ("Analytics & quality", ["dashboard", "log", "eval", "tune", "rate", "open", "gaps", "emergent", "insights", "patterns"]),
+    ("Indexing, config & ops", ["index", "watch", "serve", "stats", "session", "setup", "vault", "state", "silence", "ambient", "weather"]),
+]
+
 
 class _HighlightGroup(click.Group):
     def format_commands(self, ctx, formatter):
-        rows: list[tuple[str, click.Command]] = []
+        all_cmds: dict[str, click.Command] = {}
         for name in self.list_commands(ctx):
             cmd = self.get_command(ctx, name)
             if cmd is None or cmd.hidden:
                 continue
-            rows.append((name, cmd))
-        if not rows:
+            all_cmds[name] = cmd
+        if not all_cmds:
             return
-        max_name = max(len(n) for n, _ in rows)
+        max_name = max(len(n) for n in all_cmds)
         # Reserva 4 cols (2 indent + 2 gap) además del nombre.
         limit = formatter.width - 4 - max_name
-        with formatter.section("Commands"):
-            for name, cmd in rows:
-                short = cmd.get_short_help_str(limit)
-                pad = " " * (max_name - len(name) + 2)
-                if name in _HIGHLIGHTED_COMMANDS:
-                    display = click.style(name, fg="cyan", bold=True)
-                else:
-                    display = name
-                formatter.write(f"  {display}{pad}{short}\n")
+
+        def render_row(name: str) -> str:
+            cmd = all_cmds[name]
+            short = cmd.get_short_help_str(limit)
+            pad = " " * (max_name - len(name) + 2)
+            if name in _HIGHLIGHTED_COMMANDS:
+                display = click.style(name, fg="cyan", bold=True)
+            else:
+                display = name
+            return f"  {display}{pad}{short}\n"
+
+        grouped: set[str] = {n for _, names in _COMMAND_GROUPS for n in names}
+        for title, names in _COMMAND_GROUPS:
+            present = [n for n in names if n in all_cmds]
+            if not present:
+                continue
+            with formatter.section(title):
+                for name in present:
+                    formatter.write(render_row(name))
+        leftovers = sorted(n for n in all_cmds if n not in grouped)
+        if leftovers:
+            with formatter.section("Otros"):
+                for name in leftovers:
+                    formatter.write(render_row(name))
 
 
 @click.group(cls=_HighlightGroup)
@@ -8972,12 +9025,23 @@ def _arrow_select(
             ch = b.decode("latin-1")
             if ch == "\x1b":   # ESC o secuencia
                 # Pequeño timeout para distinguir ESC bare de inicio de seq.
-                r, _, _ = _select_mod.select([fd], [], [], 0.05)
+                r, _, _ = _select_mod.select([fd], [], [], 0.08)
                 if r:
+                    # cbreak pone VMIN=1 así que os.read(fd, 2) devuelve
+                    # tan pronto como haya 1 byte — podemos recibir solo
+                    # "[" y el "A" queda pendiente. Loopeamos hasta tener
+                    # los 2 bytes esperados (o timeout corto entre ellos).
                     seq = os.read(fd, 2).decode("latin-1")
-                    if seq == "[A":
+                    while len(seq) < 2:
+                        r2, _, _ = _select_mod.select([fd], [], [], 0.02)
+                        if not r2:
+                            break
+                        seq += os.read(fd, 2 - len(seq)).decode("latin-1")
+                    # Acepta CSI ("[A"/"[B") y SS3 ("OA"/"OB"; algunos
+                    # terminales en modo application-keypad).
+                    if seq in ("[A", "OA"):
                         selected = (selected - 1) % n_choices
-                    elif seq == "[B":
+                    elif seq in ("[B", "OB"):
                         selected = (selected + 1) % n_choices
                     # otras secuencias: ignorar
                 else:
@@ -9071,8 +9135,9 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
 @click.option("--resume", is_flag=True, help="Reanuda la última sesión usada")
 @click.option("--counter", is_flag=True,
               help="Después de cada respuesta, buscar chunks del vault que la CONTRADIGAN")
-@click.option("--no-deep", is_flag=True,
-              help="Desactiva retrieval iterativo automático")
+@click.option("--deep/--no-deep", "deep_mode", default=False,
+              help="Activa retrieval iterativo automático (default: off — "
+                   "triplica retrieve time por marginal quality gain)")
 @click.option("--vault", "vault_scope", default=None,
               help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
                    "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
@@ -9081,10 +9146,13 @@ def chat(
     since: str | None, precise: bool,
     no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
-    no_deep: bool,
+    deep_mode: bool,
     vault_scope: str | None,
 ):
     """Chat interactivo con tus notas."""
+    # no_deep es el nombre histórico de la variable dentro del flujo —
+    # invertir el flag CLI facilita el default off sin tocar resto del código.
+    no_deep = not deep_mode
     warmup_async()
     # --since fija un piso de fecha para todo el chat; cada turno también
     # corre auto-detección ("qué hice ayer" trae su propio rango).
@@ -9188,29 +9256,59 @@ def chat(
         border_style="green",
     ))
 
-    # AHORA sí: ejecutamos auto_index con feedback visible. El usuario vio
-    # el banner primero, así que sabe que el chat está vivo aunque la
-    # primera nota tarde 1-2 min en indexarse.
-    for name, vpath, is_first_time, n_files in pending_index:
-        if is_first_time:
-            with console.status(
-                f"[bold yellow]Primer index de '{name}'[/bold yellow] "
-                f"[dim]· {n_files} notas · 1-2 min · embeddings + chunking…[/dim]",
-                spinner="dots",
-            ):
-                stats = auto_index_vault(vpath)
-            console.print(
-                f"[green]✓ '{name}' indexado:[/green] {stats['indexed']} notas "
-                f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
-            )
-        else:
+    # Buffer de notices de daemon threads (index BG) — drenado en cada
+    # turno ANTES del prompt para no corromper la línea de input().
+    # Declarado acá antes de spawn de threads que lo usan.
+    _deferred_notices: list[str] = []
+    _deferred_notices_lock = threading.Lock()
+
+    # Ambos paths (first-time e incremental) corren en daemon thread —
+    # el usuario llega al prompt `tu ›` al toque. Si un vault está vacío
+    # (first-time), queries contra ese vault durante el index inicial
+    # retornan menos resultados; se imprime el ✓ cuando termina.
+    # Si el usuario solo tiene 1 vault Y está vacío, bloqueamos con
+    # spinner: no hay data para charlar sin esto.
+    _only_vault_empty = (
+        len(pending_index) == 1 and pending_index[0][2]  # is_first_time
+    )
+    if _only_vault_empty:
+        name, vpath, _, n_files = pending_index[0]
+        with console.status(
+            f"[bold yellow]Primer index de '{name}'[/bold yellow] "
+            f"[dim]· {n_files} notas · embeddings + chunking…[/dim]",
+            spinner="dots",
+        ):
             stats = auto_index_vault(vpath)
-            if stats["kind"] == "incremental" and (stats["indexed"] or stats["removed"]):
-                console.print(
-                    f"[green]✓ '{name}':[/green] {stats['indexed']} cambios "
-                    f"+ {stats['removed']} orphans removidos "
-                    f"[dim]({stats['took_ms']}ms)[/dim]"
-                )
+        console.print(
+            f"[green]✓ '{name}' indexado:[/green] {stats['indexed']} notas "
+            f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
+        )
+    else:
+        # Los daemon threads NO imprimen directo: corrompe la línea del
+        # input() cuando llegan en mitad de la escritura. Encolamos en
+        # `_deferred_notices` y el chat loop los drenea antes del próximo
+        # prompt (ver flush en el while True).
+        for name, vpath, is_first_time, n_files in pending_index:
+            def _bg_index(_name=name, _vpath=vpath, _first=is_first_time):
+                try:
+                    stats = auto_index_vault(_vpath)
+                    if _first:
+                        msg = (
+                            f"[green]✓ '{_name}' indexado:[/green] {stats['indexed']} notas "
+                            f"[dim]({stats['took_ms'] / 1000:.1f}s)[/dim]"
+                        )
+                    elif stats["kind"] == "incremental" and stats["indexed"] > 0:
+                        msg = (
+                            f"[green]✓ '{_name}':[/green] {stats['indexed']} cambios "
+                            f"[dim]({stats['took_ms']}ms)[/dim]"
+                        )
+                    else:
+                        return
+                    with _deferred_notices_lock:
+                        _deferred_notices.append(msg)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_index, name=f"chat-idx-{name}", daemon=True).start()
 
     # Re-validar — si todos quedaron vacíos (vault sin .md o índex falló),
     # no tiene sentido seguir.
@@ -9244,6 +9342,11 @@ def chat(
             if not first_turn:
                 console.print(Rule(style="dim", characters="╌"))
             first_turn = False
+            # Drenar notices de daemon threads ANTES del prompt. Cualquier
+            # print fuera de este punto corrompe la línea de input().
+            with _deferred_notices_lock:
+                while _deferred_notices:
+                    console.print(_deferred_notices.pop(0))
             # Prompt explícito con ANSI directo + flush. Rich.console.print
             # con end="" en algunos terminales/pipes queda en buffer y el
             # prompt no aparece. print() de stdlib con flush=True es 100%
@@ -9384,28 +9487,37 @@ def chat(
             continue
 
         sess_summary = session_summary(sess)
+        _t_turn_start = time.perf_counter()
+        _t_retrieve_start = time.perf_counter()
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
+            # rerank_pool=15 balancea quality/latency:
+            #   - pool=30 (default) × batch_size=1 = 3s rerank por pasada MPS
+            #   - pool=15 procesa en 1 batch, ~500-800ms
+            #   - multi-query (3 variantes) × 2 vaults genera <15 candidates
+            #     únicos post-RRF en mayoría de queries → 15 cubre todo.
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
+                rerank_pool=15,
             )
-            # Auto-deep: if first-pass confidence is borderline, retry with
-            # iterative retrieval for richer context.
+            # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
+            # match en el vault, deep no va a encontrar nada nuevo).
+            # Duplica el retrieve (2 vaults × 2 pasadas = 4) — solo vale
+            # cuando el primer pase encuentra algo borderline.
             if (not no_deep
                     and result["docs"]
-                    and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
+                    and 0.0 < result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
                 result = multi_retrieve(
                     vaults_resolved, question, k, folder, history, tag, precise,
                     multi_query=not no_multi, auto_filter=not no_auto_filter,
                     date_range=pinned_date_range, summary=sess_summary,
                     deep=True,
+                    rerank_pool=15,
                 )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
             continue
-
-        print_query_header(question, result, show_question=False)
 
         # Con >1 vault, anotamos el chunk header con el vault de origen así
         # el LLM puede citarlo y vos podés distinguir en la respuesta.
@@ -9453,9 +9565,22 @@ def chat(
             )}]
         history.append({"role": "user", "content": question})
 
+        _t_retrieve_ms = int((time.perf_counter() - _t_retrieve_start) * 1000)
         console.print()
         parts: list[str] = []
         print("\x1b[1;36mrag ›\x1b[0m ", end="", flush=True)
+        # num_ctx=4096 alinea con el valor de carga default de command-r
+        # — mismatch fuerza KV-cache reinit (~20-40s penalty). Mirror de
+        # _WEB_CHAT_OPTIONS. num_predict=256 da room para respuestas largas
+        # sin runaway (web usa 100, pero CLI tolera más verbosity).
+        _CLI_CHAT_OPTIONS = {
+            **CHAT_OPTIONS,
+            "num_ctx": 4096,
+            "num_predict": 256,
+        }
+        # Breve pausa para que MPS drene el rerank antes del prefill en
+        # VRAM compartida — evita 20-40s de contención GPU.
+        time.sleep(0.2)
         # TTFT en command-r ≈ 1-3s — sin placeholder el usuario ve sólo el
         # prompt "rag ›" colgado y parece que el chat se congeló. Arrancamos
         # Live con un Spinner; en cuanto llega el primer chunk, live.update
@@ -9463,18 +9588,32 @@ def chat(
         from rich.live import Live
         from rich.spinner import Spinner
         placeholder = Spinner("dots", text=Text("pensando…", style="dim"))
+        _t_llm_start = time.perf_counter()
+        _t_first_token: float | None = None
         with Live(placeholder, console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(
                 model=resolve_chat_model(),
                 messages=messages,
-                options=CHAT_OPTIONS,
+                options=_CLI_CHAT_OPTIONS,
                 stream=True,
                 keep_alive=OLLAMA_KEEP_ALIVE,
             ):
+                if _t_first_token is None and chunk.message.content:
+                    _t_first_token = time.perf_counter()
                 parts.append(chunk.message.content)
                 live.update(Text("".join(parts)))
+        _t_done = time.perf_counter()
+        _t_llm_ms = int((_t_done - _t_llm_start) * 1000)
+        _t_ttft_ms = int(((_t_first_token or _t_done) - _t_llm_start) * 1000)
+        _t_total_ms = int((_t_done - _t_turn_start) * 1000)
         full = "".join(parts)
         console.print(render_response(full))
+        console.print(
+            f"[dim]⏱  {_t_total_ms/1000:.1f}s "
+            f"· retrieve {_t_retrieve_ms}ms "
+            f"· ttft {_t_ttft_ms}ms "
+            f"· llm {_t_llm_ms}ms[/dim]"
+        )
         history.append({"role": "assistant", "content": full})
         history = history[-SESSION_HISTORY_WINDOW:]
         last_assistant = full

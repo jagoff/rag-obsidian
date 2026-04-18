@@ -124,7 +124,7 @@ Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. E
 
 | Role | Model | Notes |
 |------|-------|-------|
-| Chat | `resolve_chat_model()`: command-r > qwen2.5:14b > phi4 | RAG-trained, citation-native |
+| Chat | `resolve_chat_model()`: qwen2.5:7b > qwen3:30b-a3b > command-r > qwen2.5:14b > phi4 | qwen2.5:7b default tras bench 2026-04-18 (total P50 5.9s vs 37s de command-r); fallbacks high-quality disponibles. |
 | Helper | `qwen2.5:3b` | paraphrase/HyDE/reformulation |
 | Embed | `bge-m3` | 1024-dim multilingual |
 | Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float16` forced — do NOT remove (CPU fallback = 3× slower) |

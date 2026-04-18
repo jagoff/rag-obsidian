@@ -866,10 +866,15 @@ _TASKS_INTENT_TOKENS = re.compile(
     re.IGNORECASE,
 )
 _TASKS_INTENT_PHRASES = re.compile(
-    r"(qu[eé]\s+(tengo|hacer|debo|hay|me\s+falta|me\s+queda)|"
-    r"what\s+do\s+i\s+(have|need)|"
-    r"(tengo|hay)\s+(algo|cosas?|eventos?|citas?)\s+(pendiente|hoy|mañana|esta\s+semana)|"
-    r"que\s+hay\s+(para\s+)?(hoy|mañana|esta\s+semana)|"
+    # "qué tengo/debo/hay/etc" REQUIERE qualifier de tarea/tiempo después
+    # — la versión laxa anterior matcheaba "qué hay sobre X" / "qué tengo
+    # en notas sobre Y" y mis-routeaba topic queries al fetcher de agenda.
+    r"(qu[eé]\s+(tengo|debo|me\s+falta|me\s+queda|hay)\s+"
+    r"(para|que\s+(hacer|recordar|completar|priorizar)|"
+    r"hacer|recordar|completar|"
+    r"hoy|ma[nñ]ana|esta\s+semana|pendiente|priorizar|gestionar|organizar)|"
+    r"what\s+do\s+i\s+(have|need)\s+(to\s+)?(do|complete|finish)|"
+    r"(tengo|hay)\s+(algo|cosas?|eventos?|citas?)\s+(pendiente|hoy|ma[nñ]ana|esta\s+semana)|"
     r"organiz(ar|ame)\s+(el\s+d[ií]a|la\s+semana))",
     re.IGNORECASE,
 )

@@ -2328,7 +2328,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
             result = multi_retrieve(
                 vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
-                rerank_pool=4,
+                rerank_pool=2,
             )
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
@@ -2468,19 +2468,29 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # and made some calls hang silently — leave it out.
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
-            "num_ctx": 5120,
+            "num_ctx": 4096,
             "num_predict": 160,
         }
 
         yield _sse("status", {"stage": "generating"})
 
+        # Brief pause so MPS can flush reranker ops before ollama starts
+        # prefill — avoids 20-40s GPU contention when reranker finishes hot.
+        time.sleep(0.2)
+
         parts: list[str] = []
         stripper = _InlineCitationStripper()
+        _web_model = _resolve_web_chat_model()
+        print(
+            f"[chat-model-keepalive] model={_web_model} keep_alive={OLLAMA_KEEP_ALIVE}"
+            f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']}",
+            flush=True,
+        )
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
             for chunk in ollama.chat(
-                model=_resolve_web_chat_model(),
+                model=_web_model,
                 messages=messages,
                 options=_WEB_CHAT_OPTIONS,
                 stream=True,

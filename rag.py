@@ -6802,7 +6802,7 @@ def collect_ranker_features(
     expanded = [expand_to_parent(c[0], c[1]) for c in candidates]
     reranker = get_reranker()
     rerank_scores = reranker.predict(
-        [(question, e) for e in expanded], show_progress_bar=False,
+        [(question, e) for e in expanded], show_progress_bar=False, batch_size=1,
     )
 
     try:

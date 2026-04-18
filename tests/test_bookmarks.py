@@ -286,7 +286,7 @@ def test_find_urls_filters_by_source(tmp_urls_col, monkeypatch):
 
     # Force reranker to a degenerate mock so scores come straight from distances.
     class _FakeReranker:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, show_progress_bar=False, **_):
             return [1.0] * len(pairs)
 
     monkeypatch.setattr(rag, "get_reranker", lambda: _FakeReranker())

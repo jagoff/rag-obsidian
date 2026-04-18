@@ -7,7 +7,7 @@ import rag
 
 
 class FakeReranker:
-    def predict(self, pairs, show_progress_bar=False):
+    def predict(self, pairs, show_progress_bar=False, **_):
         # Descending constant scores — ranking follows insertion order of `pairs`.
         return [1.0 - i * 0.01 for i in range(len(pairs))]
 

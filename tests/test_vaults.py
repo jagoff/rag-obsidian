@@ -387,6 +387,6 @@ def _fake_reranker():
     tests de multi_retrieve no dependen del ranking semántico real, solo
     del merge y anotación."""
     class _R:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, show_progress_bar=False, **_):
             return [1.0] * len(pairs)
     return _R()

@@ -72,7 +72,7 @@ def test_extract_ignores_url_inside_markdown_link():
 
 
 class _FakeReranker:
-    def predict(self, pairs, show_progress_bar=False):
+    def predict(self, pairs, show_progress_bar=False, **_):
         return [1.0 - i * 0.01 for i in range(len(pairs))]
 
 

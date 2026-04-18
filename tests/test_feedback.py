@@ -259,7 +259,7 @@ def test_retrieve_applies_positive_boost(tmp_path, fb_tmp, fake_embed, monkeypat
     # Stub: reranker constante (ambos candidates empatados), multi_query off,
     # intent classifier → semantic sin filtros.
     class FlatReranker:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, show_progress_bar=False, **_):
             return [0.5 for _ in pairs]
 
     monkeypatch.setattr(rag, "get_reranker", lambda: FlatReranker())
@@ -307,7 +307,7 @@ def test_retrieve_applies_negative_penalty(tmp_path, fb_tmp, fake_embed, monkeyp
 
     # Reranker prefiere bad.md por 0.05; penalty de 0.15 debería revertir eso.
     class BiasedReranker:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, show_progress_bar=False, **_):
             return [0.6 if "bad" in p[1] else 0.55 for p in pairs]
 
     monkeypatch.setattr(rag, "get_reranker", lambda: BiasedReranker())
@@ -351,7 +351,7 @@ def test_retrieve_boost_path_not_in_pool_gets_injected(tmp_path, fb_tmp, fake_em
     # Reranker: hidden.md recibe score alto si llega, relevant.md score bajo.
     # Si hidden.md no se inyecta, nunca va a estar en pairs → nunca scoreado.
     class PrefersHidden:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, show_progress_bar=False, **_):
             return [1.0 if "oculto" in p[1] else 0.01 for p in pairs]
 
     monkeypatch.setattr(rag, "get_reranker", lambda: PrefersHidden())

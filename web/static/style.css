@@ -928,6 +928,44 @@ html, body {
   color: var(--red);
   border-color: var(--red);
 }
+/* Tool-call progress chips --------------------------------------
+   Surfaced during /api/chat between `retrieving` and `generating` —
+   one chip per tool invocation, pulses while pending, settles dim
+   with elapsed ms on tool_done. Match the visual weight of the
+   existing thinking indicator: small, muted, inline, no borders. */
+.tools-bar {
+  padding-left: 2ch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+.tool-chip {
+  color: var(--text-dim);
+  background: transparent;
+  padding: 1px 2px;
+  opacity: 0.75;
+  transition: opacity var(--dur-base) var(--ease-out), color var(--dur-base) var(--ease-out);
+  white-space: nowrap;
+}
+.tool-chip.pending {
+  color: var(--text-dim);
+  animation: tool-chip-pulse 1.4s var(--ease-inout) infinite;
+}
+.tool-chip + .tool-chip::before {
+  content: "·";
+  color: var(--border-strong);
+  margin-right: 6px;
+  margin-left: -2px;
+}
+@keyframes tool-chip-pulse {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 0.95; }
+}
+
 /* Follow-up chips ---------------------------------------------- */
 .followups {
   margin-top: 10px;

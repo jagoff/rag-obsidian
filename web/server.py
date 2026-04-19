@@ -2624,13 +2624,6 @@ def chat(req: ChatRequest) -> StreamingResponse:
 
         history = session_history(sess, window=SESSION_HISTORY_WINDOW)
 
-        # Tasks / agenda intent → bypass vault RAG (which hallucinates on
-        # "what do I have tomorrow" queries because the vault doesn't hold
-        # live calendar/reminders) and pull from the services layer instead.
-        if _is_tasks_query(question):
-            yield from _gen_tasks_response(sess, question, history)
-            return
-
         # Response cache — sirve respuesta cacheada si (question, scope, model,
         # vault_count) matchea + TTL viva + NO es follow-up. Skipped cuando hay
         # history porque la respuesta depende del contexto de la conversación,
@@ -2994,6 +2987,12 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 )
                 _tmsg = _tr.message
                 _tcalls = list(_tmsg.tool_calls or [])
+                if not _tcalls:
+                    # Terminal assistant turn — no tools. Don't append it to
+                    # tool_messages; if we did, the final streaming call
+                    # would see a completed answer and emit zero tokens.
+                    # The final call regenerates from the clean prompt.
+                    break
                 # Persist the assistant turn so the LLM sees its own tool_calls
                 # when we come back around (and the final streaming call too).
                 tool_messages.append({
@@ -3001,8 +3000,6 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     "content": _tmsg.content or "",
                     "tool_calls": [tc.model_dump() for tc in _tcalls],
                 })
-                if not _tcalls:
-                    break
 
                 # Split into serial (not parallel-safe) and parallel buckets.
                 _serial: list[tuple[str, dict]] = []

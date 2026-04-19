@@ -444,6 +444,29 @@ stopBtn.addEventListener("click", () => {
   if (currentController) currentController.abort();
 });
 
+// Tool-call chip labels — backend emits raw tool names (search_vault,
+// read_note, …); UI shows a Spanish-friendly short form. Unknown names
+// fall back to the raw identifier so new tools still render.
+const TOOL_LABELS = {
+  search_vault: "búsqueda vault",
+  read_note: "leyendo nota",
+  reminders_due: "reminders",
+  gmail_recent: "gmail",
+  finance_summary: "finanzas",
+  calendar_ahead: "calendario",
+  weather: "clima",
+};
+function toolLabel(name) {
+  if (!name) return "herramienta";
+  return TOOL_LABELS[name] || name;
+}
+function formatMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 10000) return `${Math.round(n)}ms`;
+  return `${(n / 1000).toFixed(1)}s`;
+}
+
 // Rendering helpers --------------------------------------------
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -982,14 +1005,39 @@ async function send(question) {
       scrollBottom();
     } else if (event === "empty") {
       thinking.remove();
+      clearToolChips();
       turn.appendChild(el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`));
       if (question) appendWebSearch(turn, question);
     } else if (event === "error") {
       thinking.remove();
+      clearToolChips();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
     } else if (event === "status") {
-      const label = parsed.stage === "generating" ? "generando…" : "buscando…";
-      thinking.setAttribute("data-stage", label);
+      if (parsed.stage === "tool") {
+        const bar = ensureToolsBar();
+        const chip = el("span", "tool-chip pending");
+        chip.dataset.tool = parsed.name || "";
+        chip.textContent = `Consultando ${toolLabel(parsed.name)}…`;
+        bar.appendChild(chip);
+        toolChips.push(chip);
+        scrollBottom();
+      } else if (parsed.stage === "tool_done") {
+        // Resolve the oldest still-pending chip for this tool name — works
+        // for both sequential rounds and parallel fan-outs where chips
+        // share a name. Falls back to no-op if nothing matches.
+        const name = parsed.name || "";
+        const pending = toolChips.find(
+          (c) => c.dataset.tool === name && c.classList.contains("pending"),
+        );
+        if (pending) {
+          pending.classList.remove("pending");
+          pending.textContent = `${toolLabel(name)} (${formatMs(parsed.ms)})`;
+        }
+      } else {
+        const label = parsed.stage === "generating" ? "generando…" : "buscando…";
+        thinking.setAttribute("data-stage", label);
+        if (parsed.stage === "generating") stopAllChipPulses();
+      }
     }
   }
 }

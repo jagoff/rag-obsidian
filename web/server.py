@@ -104,6 +104,35 @@ from web.tools import (  # noqa: E402
     _WEB_TOOL_ADDENDUM,
 )
 
+
+# Pre-router: keyword → tool forced execution. Defeats the system prompt's
+# "engancháte SIEMPRE con el CONTEXTO" bias which made the LLM decline to
+# call tools when retrieval already returned anything (even low-conf vault
+# notes). Regex-based, O(len(q)), runs before the LLM sees the query.
+#
+# Matches are independent — "gastos de este mes en agenda" fires both
+# finance_summary and calendar_ahead.
+_TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
+    ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
+    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|record[aá]me|agend[aá]me"),
+    ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail|inbox|bandeja)\b"),
+    ("calendar_ahead",  {}, r"calendari|\bevento\b|\bcita\b|reuni[oó]n|\bagenda\b|pr[oó]xim[ao]s?\s+d[ií]as"),
+    ("weather",         {}, r"\bclima\b|\btiempo\b|llov|lluvia|temperatur|pron[oó]stico"),
+)
+_TOOL_INTENT_COMPILED = tuple(
+    (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
+)
+
+
+def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
+    """Deterministic keyword → tool routing. Returns (name, args) tuples
+    to execute BEFORE the LLM tool-deciding call. Empty list = no forced
+    tools (LLM decides freely)."""
+    if not q:
+        return []
+    return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
+
+
 _CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
 
 
@@ -2976,6 +3005,65 @@ def chat(req: ChatRequest) -> StreamingResponse:
         try:
             from concurrent.futures import ThreadPoolExecutor as _ToolExecutor
             from concurrent.futures import as_completed as _as_completed
+
+            # ── Pre-router: keyword-forced tools ─────────────────────────
+            # Runs BEFORE the LLM tool-deciding call. Guarantees that
+            # unambiguous queries (gastos → finance_summary, pendientes →
+            # reminders_due, etc.) always fetch fresh data — the LLM's
+            # default bias (REGLA 1 "engancháte con CONTEXTO") previously
+            # swallowed these queries into stale vault summaries.
+            # Results are appended as a single `role:"system"` block with
+            # an explicit "DATOS FRESCOS" prefix so the LLM treats them as
+            # authoritative over the retrieved vault context.
+            _forced_tools = _detect_tool_intent(question)
+            if _forced_tools:
+                _f_serial = [(n, a) for n, a in _forced_tools if n not in PARALLEL_SAFE]
+                _f_parallel = [(n, a) for n, a in _forced_tools if n in PARALLEL_SAFE]
+                # Fan-out: emit all `tool` events upfront so the frontend
+                # renders chips before any blocks on execution.
+                for _n, _a in _forced_tools:
+                    yield _sse("status", {"stage": "tool", "name": _n, "args": _a})
+                _forced_results: list[tuple[str, str, int]] = []
+                _pre_serial_sum_ms = 0
+                _pre_parallel_max_ms = 0
+                # Serial bucket (vault-touching tools under GIL/MPS).
+                for _n, _a in _f_serial:
+                    _t0 = time.perf_counter()
+                    try:
+                        _res = TOOL_FNS[_n](**_a)
+                    except Exception as _exc:
+                        _res = f"Error: {_exc}"
+                    _ms = int((time.perf_counter() - _t0) * 1000)
+                    _pre_serial_sum_ms += _ms
+                    _forced_results.append((_n, str(_res), _ms))
+                    yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
+                    tool_names_called.append(_n)
+                # Parallel bucket (pure IO fetchers, no shared state).
+                if _f_parallel:
+                    def _run_tool(name: str, args: dict):
+                        _t0 = time.perf_counter()
+                        try:
+                            _r = TOOL_FNS[name](**args)
+                        except Exception as _exc:
+                            _r = f"Error: {_exc}"
+                        return name, str(_r), int((time.perf_counter() - _t0) * 1000)
+                    with _ToolExecutor(max_workers=5) as _pool:
+                        _futs = [_pool.submit(_run_tool, n, a) for n, a in _f_parallel]
+                        for _fut in _as_completed(_futs):
+                            _n, _res, _ms = _fut.result()
+                            _pre_parallel_max_ms = max(_pre_parallel_max_ms, _ms)
+                            _forced_results.append((_n, _res, _ms))
+                            yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
+                            tool_names_called.append(_n)
+                # Inject as system message — authoritative over the vault
+                # CONTEXTO. Citations rule from addendum still applies.
+                _datos_block = "DATOS FRESCOS (pre-cargados por pre-router, usar como fuente autoritativa sobre el CONTEXTO del vault si hay conflicto):\n"
+                for _n, _res, _ in _forced_results:
+                    _datos_block += f"\n## {_n}\n{_res}\n"
+                tool_messages.append({"role": "system", "content": _datos_block})
+                tool_rounds += 1
+                tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
+
             for _round_idx in range(_TOOL_ROUND_CAP):
                 _tr = ollama.chat(
                     model=_web_model,

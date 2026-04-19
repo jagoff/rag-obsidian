@@ -668,8 +668,27 @@ def _resolve_wikilinks_to_paths(
 
 
 def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
-    """Return True if this (brief_path, cited_path) pair was already emitted."""
+    """Return True if this (brief_path, cited_path) pair was already emitted.
+
+    When RAG_STATE_SQL=1: O(1) PK lookup on rag_brief_state.pair_key. Falls
+    back to JSONL scan if the flag is off OR the SQL row is missing (cutover
+    bridge — pair written pre-flag still lives in brief_state.jsonl).
+    """
     key = f"{brief_path}\x00{cited_path}"
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    "SELECT pair_key FROM rag_brief_state WHERE pair_key = ?",
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    return True
+                # Not in SQL → fall through to JSONL (may hold historical pair).
+        except Exception as exc:
+            _log_sql_state_error("brief_state_sql_read_failed", err=repr(exc))
+            # Fall through.
+
     if not BRIEF_STATE_PATH.is_file():
         return False
     try:
@@ -1437,102 +1456,86 @@ _BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept"})
 _BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
 
 _behavior_priors_cache: dict | None = None
-_behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size)
+_behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) — JSONL path
+# T4: SQL-backed cache key — MAX(ts) in rag_behavior. Separate variable so
+# the JSONL fallback's cache key stays a distinct type. T10 will collapse
+# both into one after the 7-day observation window.
+_behavior_priors_cache_key_sql: str | None = None
 
 
-def _load_behavior_priors() -> dict:
-    """Read behavior.jsonl and return an immutable aggregated snapshot.
+def _compute_behavior_priors_from_rows(rows_iter) -> dict:
+    """Fold behavior rows (dict-like, with `event`/`path`/`ts`/`dwell_ms`) into the
+    priors snapshot. Shared between the SQL and JSONL readers so CTR arithmetic
+    lives in one place.
 
-    Returns a dict with keys:
-      click_prior        {path: ctr_float}          — per-path CTR with Laplace
-      click_prior_folder {folder: ctr_float}        — top-level folder CTR
-      click_prior_hour   {(path, hour_int): ctr}    — path × hour CTR
-      dwell_score        {path: log1p(mean_dwell_s)} — dwell signal, log-transformed
-      n_events           int                         — total events parsed
-      hash               str                         — content key for debugging
-
-    All four feature dicts default to 0.0 for unseen keys. Safe when
-    behavior.jsonl is missing, empty, or corrupt — returns empty snapshot.
-    Never raises.
+    `rows_iter` yields dicts (or sqlite3.Row mapped to dict-access via `row[key]`).
+    Accepts both JSONL `dwell_ms` and SQL `dwell_s` — the latter is stored in
+    seconds per the rag_behavior schema; if present we multiply by 1000 to match
+    the JSONL dwell_ms convention before folding into dwell_acc.
     """
-    global _behavior_priors_cache, _behavior_priors_cache_key
-
-    try:
-        if BEHAVIOR_LOG_PATH.is_file():
-            stat = BEHAVIOR_LOG_PATH.stat()
-            cache_key: tuple[float, int] = (stat.st_mtime, stat.st_size)
-        else:
-            cache_key = (0.0, 0)
-    except OSError:
-        cache_key = (0.0, 0)
-
-    if _behavior_priors_cache is not None and _behavior_priors_cache_key == cache_key:
-        return _behavior_priors_cache
-
-    # Build fresh snapshot
-    # Impression/click accumulators: {key: [clicks, impressions]}
     path_acc: dict[str, list[int]] = {}
     folder_acc: dict[str, list[int]] = {}
     hour_acc: dict[tuple[str, int], list[int]] = {}
     dwell_acc: dict[str, list[float]] = {}
     n_events = 0
 
-    try:
-        if BEHAVIOR_LOG_PATH.is_file():
-            raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+    def _get(row, key):
+        # sqlite3.Row: bracket access raises IndexError on missing key; dict: KeyError.
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
+
+    for ev in rows_iter:
+        event_type = _get(ev, "event") or ""
+        path = _get(ev, "path") or ""
+        if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
+            continue
+
+        n_events += 1
+        is_click = 1 if event_type in _BEHAVIOR_POSITIVE else 0
+
+        if path not in path_acc:
+            path_acc[path] = [0, 0]
+        path_acc[path][0] += is_click
+        path_acc[path][1] += 1
+
+        folder = path.split("/")[0] if "/" in path else ""
+        if folder:
+            if folder not in folder_acc:
+                folder_acc[folder] = [0, 0]
+            folder_acc[folder][0] += is_click
+            folder_acc[folder][1] += 1
+
+        try:
+            ts_str = _get(ev, "ts") or ""
+            if ts_str:
+                hour = int(ts_str[11:13])  # "YYYY-MM-DDTHH:..." → HH
+                key_h = (path, hour)
+                if key_h not in hour_acc:
+                    hour_acc[key_h] = [0, 0]
+                hour_acc[key_h][0] += is_click
+                hour_acc[key_h][1] += 1
+        except (ValueError, IndexError, TypeError):
+            pass
+
+        # Dwell (only from positive events). JSONL writes `dwell_ms`; the SQL
+        # rag_behavior schema has `dwell_s`. Normalise both to milliseconds for
+        # the accumulator so downstream log1p(mean_dwell_s) stays correct.
+        if is_click:
+            dwell_ms_raw = _get(ev, "dwell_ms")
+            if dwell_ms_raw is not None:
                 try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-
-                event_type = ev.get("event", "")
-                path = ev.get("path", "")
-                if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
-                    continue
-
-                n_events += 1
-                is_click = 1 if event_type in _BEHAVIOR_POSITIVE else 0
-
-                # Per-path
-                if path not in path_acc:
-                    path_acc[path] = [0, 0]
-                path_acc[path][0] += is_click
-                path_acc[path][1] += 1
-
-                # Per-folder (top-level directory of path)
-                folder = path.split("/")[0] if "/" in path else ""
-                if folder:
-                    if folder not in folder_acc:
-                        folder_acc[folder] = [0, 0]
-                    folder_acc[folder][0] += is_click
-                    folder_acc[folder][1] += 1
-
-                # Per-(path, hour) — parse hour from ts field
-                try:
-                    ts_str = ev.get("ts", "")
-                    if ts_str:
-                        hour = int(ts_str[11:13])  # "YYYY-MM-DDTHH:..." → HH
-                        key_h = (path, hour)
-                        if key_h not in hour_acc:
-                            hour_acc[key_h] = [0, 0]
-                        hour_acc[key_h][0] += is_click
-                        hour_acc[key_h][1] += 1
-                except (ValueError, IndexError):
+                    dwell_acc.setdefault(path, []).append(float(dwell_ms_raw))
+                except (TypeError, ValueError):
                     pass
-
-                # Dwell (only from positive events with dwell_ms)
-                dwell_ms = ev.get("dwell_ms")
-                if dwell_ms is not None and is_click:
+            else:
+                dwell_s_raw = _get(ev, "dwell_s")
+                if dwell_s_raw is not None:
                     try:
-                        dwell_acc.setdefault(path, []).append(float(dwell_ms))
+                        dwell_acc.setdefault(path, []).append(float(dwell_s_raw) * 1000.0)
                     except (TypeError, ValueError):
                         pass
-    except Exception:
-        pass
 
     import math
 
@@ -1555,17 +1558,103 @@ def _load_behavior_priors() -> dict:
         if ms_list
     }
 
-    snapshot = {
+    return {
         "click_prior": click_prior,
         "click_prior_folder": click_prior_folder,
         "click_prior_hour": click_prior_hour,
         "dwell_score": dwell_score,
         "n_events": n_events,
-        "hash": f"{cache_key[0]:.3f}:{cache_key[1]}",
     }
 
+
+def _iter_behavior_jsonl() -> list[dict]:
+    """Yield parsed events from behavior.jsonl. Silent on missing/corrupt."""
+    if not BEHAVIOR_LOG_PATH.is_file():
+        return []
+    out: list[dict] = []
+    try:
+        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def _load_behavior_priors() -> dict:
+    """Read behavior events and return an immutable aggregated snapshot.
+
+    Returns a dict with keys:
+      click_prior        {path: ctr_float}          — per-path CTR with Laplace
+      click_prior_folder {folder: ctr_float}        — top-level folder CTR
+      click_prior_hour   {(path, hour_int): ctr}    — path × hour CTR
+      dwell_score        {path: log1p(mean_dwell_s)} — dwell signal, log-transformed
+      n_events           int                         — total events parsed
+      hash               str                         — content key for debugging
+
+    All four feature dicts default to 0.0 for unseen keys. Safe when the
+    backing store is missing/empty/corrupt — returns empty snapshot. Never raises.
+
+    When RAG_STATE_SQL=1: read rag_behavior with MAX(ts) as cache key.
+    If the SQL table is empty (e.g. cutover just flipped) → fall through to
+    JSONL so historical priors aren't lost during the 7-day observation window.
+    T10 strips the JSONL fallback.
+    """
+    global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                max_ts = _sql_max_ts(conn, "rag_behavior")
+                if max_ts is not None:
+                    if (_behavior_priors_cache is not None
+                            and _behavior_priors_cache_key_sql == max_ts):
+                        return _behavior_priors_cache
+                    import sqlite3 as _sqlite3
+                    prev_factory = conn.row_factory
+                    try:
+                        conn.row_factory = _sqlite3.Row
+                        rows = list(conn.execute(
+                            "SELECT ts, event, path, dwell_s FROM rag_behavior"
+                        ).fetchall())
+                    finally:
+                        conn.row_factory = prev_factory
+                    snapshot = _compute_behavior_priors_from_rows(rows)
+                    snapshot["hash"] = f"sql:{max_ts}"
+                    _behavior_priors_cache = snapshot
+                    _behavior_priors_cache_key_sql = max_ts
+                    _behavior_priors_cache_key = None
+                    return snapshot
+                # SQL empty (table has no rows) → fall through to JSONL.
+        except Exception as exc:
+            _log_sql_state_error("behavior_priors_sql_read_failed", err=repr(exc))
+            # Fall through.
+
+    try:
+        if BEHAVIOR_LOG_PATH.is_file():
+            stat = BEHAVIOR_LOG_PATH.stat()
+            cache_key: tuple[float, int] = (stat.st_mtime, stat.st_size)
+        else:
+            cache_key = (0.0, 0)
+    except OSError:
+        cache_key = (0.0, 0)
+
+    if (_behavior_priors_cache is not None
+            and _behavior_priors_cache_key == cache_key
+            and _behavior_priors_cache_key_sql is None):
+        return _behavior_priors_cache
+
+    snapshot = _compute_behavior_priors_from_rows(_iter_behavior_jsonl())
+    snapshot["hash"] = f"{cache_key[0]:.3f}:{cache_key[1]}"
     _behavior_priors_cache = snapshot
     _behavior_priors_cache_key = cache_key
+    _behavior_priors_cache_key_sql = None
     return snapshot
 
 
@@ -1974,18 +2063,319 @@ def _rebuild_feedback_golden() -> dict:
 
 _feedback_golden_memo: dict | None = None
 _feedback_golden_mtime: float = 0.0
+# T4: SQL-backed memo key — rag_feedback MAX(ts). Distinct from the JSONL
+# mtime key so both paths can coexist during cutover.
+_feedback_golden_source_ts_sql: str | None = None
+
+
+def _pack_embedding(emb) -> tuple[bytes, int]:
+    """Pack a list of floats into a little-endian float32 BLOB + dim."""
+    import struct
+    dim = len(emb)
+    return struct.pack("<" + "f" * dim, *[float(x) for x in emb]), dim
+
+
+def _unpack_embedding(blob: bytes, dim: int) -> list[float]:
+    """Inverse of _pack_embedding — unpack blob (dim floats, LE) into list."""
+    import struct
+    if not blob or dim <= 0:
+        return []
+    try:
+        return list(struct.unpack("<" + "f" * dim, blob))
+    except struct.error:
+        return []
+
+
+def _feedback_golden_meta_ts(conn) -> str | None:
+    """Read meta.last_built_source_ts or None if missing."""
+    try:
+        row = conn.execute(
+            "SELECT v FROM rag_feedback_golden_meta WHERE k='last_built_source_ts'"
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _feedback_golden_table_empty(conn) -> bool:
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM rag_feedback_golden").fetchone()
+        return int(row[0] if row else 0) == 0
+    except Exception:
+        return True
+
+
+def _read_feedback_golden_sql(conn) -> dict:
+    """Materialise {positives, negatives} from rag_feedback_golden.
+
+    Rows share the query embedding across all paths from the same feedback
+    entry. We re-group by (embedding_bytes, rating) so the resulting dict
+    matches the legacy JSON schema — `feedback_signals_for_query` iterates
+    entries and computes cosine against each once, then propagates the
+    similarity to every path in that entry's paths list.
+    """
+    import sqlite3 as _sqlite3
+    prev_factory = conn.row_factory
+    try:
+        conn.row_factory = _sqlite3.Row
+        rows = list(conn.execute(
+            "SELECT path, rating, embedding, dim FROM rag_feedback_golden"
+        ).fetchall())
+    finally:
+        conn.row_factory = prev_factory
+
+    groups: dict[tuple[int, bytes], dict] = {}
+    for r in rows:
+        blob = r["embedding"]
+        dim = int(r["dim"]) if r["dim"] is not None else 0
+        rating = int(r["rating"])
+        path = r["path"]
+        if not blob or dim <= 0 or not path:
+            continue
+        key = (rating, bytes(blob))
+        entry = groups.get(key)
+        if entry is None:
+            entry = {"q": "", "emb": _unpack_embedding(bytes(blob), dim),
+                     "paths": []}
+            groups[key] = entry
+        if path not in entry["paths"]:
+            entry["paths"].append(path)
+
+    positives = [e for (rat, _b), e in groups.items() if rat > 0]
+    negatives = [e for (rat, _b), e in groups.items() if rat < 0]
+    return {"positives": positives, "negatives": negatives}
+
+
+def _write_feedback_golden_sql(conn, golden: dict, source_ts: str) -> None:
+    """Persist a freshly built {positives, negatives} dict into
+    rag_feedback_golden + rag_feedback_golden_meta. Wipes prior rows under
+    the assumption the rebuild is authoritative.
+    """
+    built_at = datetime.now().isoformat(timespec="seconds")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM rag_feedback_golden")
+        for rating, entries in ((1, golden.get("positives") or []),
+                                 (-1, golden.get("negatives") or [])):
+            for entry in entries:
+                emb = entry.get("emb") or []
+                paths = [p for p in (entry.get("paths") or []) if p]
+                if not emb or not paths:
+                    continue
+                blob, dim = _pack_embedding(emb)
+                for p in paths:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rag_feedback_golden "
+                        "(path, rating, embedding, dim, built_at, source_ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (p, rating, blob, dim, built_at, source_ts),
+                    )
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+            ("last_built_source_ts", source_ts),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def _rebuild_feedback_golden_from_sql_feedback(conn) -> dict:
+    """Rebuild golden cache by reading rag_feedback rows (SQL-native path).
+
+    Mirrors _rebuild_feedback_golden's logic but pulls from the SQL feedback
+    table instead of feedback.jsonl. Persists the result into rag_feedback_golden
+    + meta so subsequent reads hit the table directly.
+    """
+    import sqlite3 as _sqlite3
+    prev_factory = conn.row_factory
+    try:
+        conn.row_factory = _sqlite3.Row
+        rows = list(conn.execute(
+            "SELECT ts, rating, q, paths_json, extra_json, turn_id "
+            "FROM rag_feedback ORDER BY ts"
+        ).fetchall())
+    finally:
+        conn.row_factory = prev_factory
+
+    # Reconstruct JSONL-shaped events from SQL rows so the rebuild stays shape-
+    # identical to _rebuild_feedback_golden. Later writes override earlier for
+    # a given turn_id.
+    by_turn: dict[str, dict] = {}
+    for r in rows:
+        tid = r["turn_id"]
+        if not tid:
+            continue
+        try:
+            paths = json.loads(r["paths_json"]) if r["paths_json"] else []
+        except Exception:
+            paths = []
+        extra: dict = {}
+        if r["extra_json"]:
+            try:
+                extra = json.loads(r["extra_json"]) or {}
+            except Exception:
+                extra = {}
+        ev = {
+            "turn_id": tid,
+            "ts": r["ts"],
+            "rating": int(r["rating"]) if r["rating"] is not None else 0,
+            "q": r["q"] or "",
+            "paths": paths,
+        }
+        # Merge extras — fields like `scope`, `corrective_path`.
+        for k, v in extra.items():
+            ev.setdefault(k, v)
+        by_turn[tid] = ev
+
+    positives: list[dict] = []
+    negatives: list[dict] = []
+    queries: list[str] = []
+    buckets: list[tuple[str, list[dict], list[str]]] = []
+    for ev in by_turn.values():
+        if ev.get("scope") == "session":
+            continue
+        q = (ev.get("q") or "").strip()
+        paths = [p for p in (ev.get("paths") or []) if p]
+        corrective = (ev.get("corrective_path") or "").strip()
+        if corrective:
+            paths = [corrective] + [p for p in paths if p != corrective]
+            ev = {**ev, "rating": 1}
+        if not q or not paths:
+            continue
+        bucket = positives if ev.get("rating", 0) > 0 else negatives
+        buckets.append((q, bucket, paths))
+        queries.append(q)
+
+    if queries:
+        try:
+            embs = embed(queries)
+        except Exception:
+            embs = [[0.0]] * len(queries)
+        for (q, bucket, paths), emb in zip(buckets, embs):
+            bucket.append({"q": q, "emb": list(emb), "paths": paths})
+
+    golden = {"positives": positives, "negatives": negatives}
+    source_ts = _sql_max_ts(conn, "rag_feedback") or datetime.now().isoformat(
+        timespec="seconds")
+    try:
+        _write_feedback_golden_sql(conn, golden, source_ts)
+    except Exception as exc:
+        _log_sql_state_error("feedback_golden_sql_write_failed", err=repr(exc))
+    return golden
+
+
+def _bridge_feedback_golden_json_to_sql(conn) -> dict | None:
+    """One-time bridge: if rag_feedback_golden is empty but the JSON cache
+    exists on disk (pre-cutover state), read the JSON, push rows into SQL
+    under `last_built_source_ts = now`, and return the loaded dict.
+
+    Returns None when no JSON is available (caller will rebuild from rag_feedback).
+    """
+    if not FEEDBACK_GOLDEN_PATH.is_file():
+        return None
+    try:
+        data = json.loads(FEEDBACK_GOLDEN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    positives = data.get("positives") or []
+    negatives = data.get("negatives") or []
+    golden = {"positives": positives, "negatives": negatives}
+    source_ts = _sql_max_ts(conn, "rag_feedback") or datetime.now().isoformat(
+        timespec="seconds")
+    try:
+        _write_feedback_golden_sql(conn, golden, source_ts)
+    except Exception as exc:
+        _log_sql_state_error("feedback_golden_bridge_write_failed",
+                              err=repr(exc))
+        return None
+    return golden
 
 
 def load_feedback_golden() -> dict:
-    """Return {positives, negatives} — rebuild on disk-mtime change, memoise in-process."""
-    global _feedback_golden_memo, _feedback_golden_mtime
-    # In-process memoisation: if feedback.jsonl hasn't changed since we last
-    # loaded, reuse what's in memory (avoids hitting disk on every query).
+    """Return {positives, negatives} — rebuild on source change, memoise in-process.
+
+    When RAG_STATE_SQL=1:
+      - Use meta.last_built_source_ts vs rag_feedback MAX(ts) for freshness.
+      - Rebuild from rag_feedback when stale OR table empty.
+      - One-time bridge: if the SQL golden table is empty AND feedback_golden.json
+        exists on disk, load JSON → write rows into SQL so the cutover is
+        transparent (no blank-priors period).
+      - On any SQL error → fall through to the JSONL path.
+    """
+    global _feedback_golden_memo, _feedback_golden_mtime, _feedback_golden_source_ts_sql
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                source_ts = _sql_max_ts(conn, "rag_feedback")
+                meta_ts = _feedback_golden_meta_ts(conn)
+                table_empty = _feedback_golden_table_empty(conn)
+
+                # Bridge: SQL table empty + JSON on disk → import JSON.
+                if table_empty and FEEDBACK_GOLDEN_PATH.is_file():
+                    bridged = _bridge_feedback_golden_json_to_sql(conn)
+                    if bridged is not None:
+                        _feedback_golden_memo = bridged
+                        _feedback_golden_source_ts_sql = (
+                            _feedback_golden_meta_ts(conn) or "")
+                        _feedback_golden_mtime = 0.0
+                        return bridged
+                    # Bridge failed → fall through to rebuild / JSONL.
+
+                need_rebuild = False
+                if source_ts is not None:
+                    # rag_feedback has rows. Rebuild if meta missing/stale or
+                    # table empty.
+                    if table_empty or meta_ts is None or meta_ts < source_ts:
+                        need_rebuild = True
+                elif table_empty:
+                    # Neither rag_feedback nor the golden table has anything —
+                    # with no JSON fallback either, return empty. We still
+                    # fall through to the JSONL path below in case feedback.jsonl
+                    # exists from pre-cutover.
+                    pass
+
+                if need_rebuild:
+                    rebuilt = _rebuild_feedback_golden_from_sql_feedback(conn)
+                    _feedback_golden_memo = rebuilt
+                    _feedback_golden_source_ts_sql = (
+                        _feedback_golden_meta_ts(conn) or source_ts or "")
+                    _feedback_golden_mtime = 0.0
+                    return rebuilt
+
+                # Cache hit on current source_ts.
+                if (_feedback_golden_memo is not None
+                        and _feedback_golden_source_ts_sql == (meta_ts or "")
+                        and not table_empty):
+                    return _feedback_golden_memo
+
+                if not table_empty:
+                    loaded = _read_feedback_golden_sql(conn)
+                    _feedback_golden_memo = loaded
+                    _feedback_golden_source_ts_sql = meta_ts or ""
+                    _feedback_golden_mtime = 0.0
+                    return loaded
+                # SQL table empty + no rag_feedback rows + no JSON → fall
+                # through to the JSONL path.
+        except Exception as exc:
+            _log_sql_state_error("feedback_golden_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through to JSONL.
+
+    # ── JSONL fallback (existing implementation) ──
     try:
         mtime = FEEDBACK_PATH.stat().st_mtime if FEEDBACK_PATH.is_file() else 0.0
     except Exception:
         mtime = 0.0
-    if _feedback_golden_memo is not None and mtime == _feedback_golden_mtime:
+    if (_feedback_golden_memo is not None
+            and mtime == _feedback_golden_mtime
+            and _feedback_golden_source_ts_sql is None):
         return _feedback_golden_memo
 
     if _feedback_golden_fresh():
@@ -1998,6 +2388,7 @@ def load_feedback_golden() -> dict:
     else:
         _feedback_golden_memo = _rebuild_feedback_golden()
     _feedback_golden_mtime = mtime
+    _feedback_golden_source_ts_sql = None
     return _feedback_golden_memo
 
 
@@ -9500,14 +9891,41 @@ def _ambient_config() -> dict | None:
 
 
 def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
-    """Return True if we already analyzed this exact path+hash recently."""
+    """Return True if we already analyzed this exact path+hash recently.
+
+    When RAG_STATE_SQL=1: O(1) PK lookup on rag_ambient_state.path. Falls back
+    to JSONL tail-scan if the flag is off OR no SQL row was found (the JSONL
+    may still hold the pre-cutover analysis).
+    """
+    cutoff = time.time() - AMBIENT_DEDUP_WINDOW_SEC
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    "SELECT hash, analyzed_at FROM rag_ambient_state "
+                    "WHERE path = ?",
+                    (doc_id_prefix,),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        ts = float(row[1]) if row[1] is not None else 0.0
+                    except (TypeError, ValueError):
+                        ts = 0.0
+                    if row[0] == h and ts >= cutoff:
+                        return True
+                    # path row exists but hash differs or stale — still check
+                    # JSONL in case the legacy analysis is newer.
+        except Exception as exc:
+            _log_sql_state_error("ambient_state_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through.
+
     if not AMBIENT_STATE_PATH.is_file():
         return False
     try:
         lines = AMBIENT_STATE_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
         return False
-    cutoff = time.time() - AMBIENT_DEDUP_WINDOW_SEC
     for line in reversed(lines[-500:]):   # scan recent tail
         line = line.strip()
         if not line:
@@ -12227,50 +12645,80 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
 
 
 def _behavior_augmented_cases(days: int = 14) -> list[dict]:
-    """Mine behavior.jsonl for implicit feedback — forms gold (query, path) tuples.
+    """Mine behavior events for implicit feedback — forms gold (query, path) tuples.
 
     Positive events (open/positive_implicit/save/kept) with a query field
     become positive cases (weight=0.5). Negative events (negative_implicit/
     deleted) with a query field become hard-negative cases. Conflicting (q,path)
     pairs where both pos and neg are observed are dropped entirely. Events
-    without a 'query' field (e.g. brief events) are skipped. Returns [] if
-    behavior.jsonl is missing or empty.
+    without a 'query' field (e.g. brief events) are skipped.
+
+    When RAG_STATE_SQL=1: read from rag_behavior with `ts >= since_ts`
+    (ISO-8601 14-day cutoff). Falls back to JSONL when SQL errors or the
+    table is empty during the 7-day cutover. T10 removes the JSONL fallback.
     """
-    if not BEHAVIOR_LOG_PATH.is_file():
-        return []
-    cutoff = time.time() - days * 86400
+    cutoff_ts = time.time() - days * 86400
+    since_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
     _POSITIVE = {"open", "positive_implicit", "save", "kept"}
     _NEGATIVE = {"negative_implicit", "deleted"}
     pos: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
     neg: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
-    try:
-        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in raw:
-        line = line.strip()
-        if not line:
-            continue
+
+    rows_iter: list = []
+    used_sql = False
+    if RAG_STATE_SQL:
         try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        # Filter by age — use "ts" field (ISO string) or skip if missing
-        ts_raw = ev.get("ts", "")
-        if ts_raw:
+            with _ragvec_state_conn() as conn:
+                sql_rows = _sql_query_window(conn, "rag_behavior", since_iso)
+            if sql_rows:
+                rows_iter = sql_rows
+                used_sql = True
+        except Exception as exc:
+            _log_sql_state_error("behavior_augmented_cases_sql_read_failed",
+                                  err=repr(exc))
+
+    if not used_sql:
+        if not BEHAVIOR_LOG_PATH.is_file():
+            return []
+        try:
+            raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                ev_ts = datetime.fromisoformat(ts_raw).timestamp()
-                if ev_ts < cutoff:
-                    continue
+                ev = json.loads(line)
             except Exception:
-                pass
-        query = (ev.get("query") or "").strip()
+                continue
+            rows_iter.append(ev)
+
+    for ev in rows_iter:
+        # Uniform accessor for sqlite3.Row + dict.
+        def _g(k):
+            try:
+                return ev[k]
+            except (KeyError, IndexError):
+                return None
+        # Filter by age — use "ts" field (ISO string) or skip if missing. For SQL
+        # rows the window filter already ran, but gate the dict path here.
+        if not used_sql:
+            ts_raw = _g("ts") or ""
+            if ts_raw:
+                try:
+                    ev_ts = datetime.fromisoformat(ts_raw).timestamp()
+                    if ev_ts < cutoff_ts:
+                        continue
+                except Exception:
+                    pass
+        query = (_g("query") or "").strip()
         if not query:
             continue
-        path = (ev.get("path") or "").strip()
+        path = (_g("path") or "").strip()
         if not path:
             continue
-        event = ev.get("event", "")
+        event = _g("event") or ""
         norm_q = " ".join(query.lower().split())
         key = (norm_q, path)
         if event in _POSITIVE:
@@ -23633,11 +24081,44 @@ def _pendientes_extract_loops_fast(
 def _pendientes_recent_contradictions(
     log_path: Path, now: datetime, days: int = 14, max_items: int = 5,
 ) -> list[dict]:
-    """Index-time contradictions from the last `days`. Newest-first."""
+    """Index-time contradictions from the last `days`. Newest-first.
+
+    When RAG_STATE_SQL=1: read from rag_contradictions. Fallback to JSONL scan
+    on empty/error during the 7-day cutover window.
+    """
+    cutoff = now - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat(timespec="seconds")
+    out: list[dict] = []
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+            if rows:
+                # Newest-first: rows come ordered by ts ASC; reverse.
+                for r in reversed(rows):
+                    try:
+                        contradicts = json.loads(r["contradicts_json"]) \
+                            if r["contradicts_json"] else []
+                    except Exception:
+                        contradicts = []
+                    if not contradicts:
+                        continue
+                    out.append({
+                        "subject_path": r["subject_path"] or "",
+                        "targets": contradicts[:3],
+                        "ts": r["ts"],
+                    })
+                    if len(out) >= max_items:
+                        break
+                return out
+        except Exception as exc:
+            _log_sql_state_error("contradictions_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through.
+
     if not log_path.is_file():
         return []
-    cutoff = now - timedelta(days=days)
-    out: list[dict] = []
     try:
         lines = log_path.read_text(encoding="utf-8").splitlines()
     except OSError:

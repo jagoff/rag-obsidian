@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -17,7 +17,7 @@ def fake_embed(monkeypatch):
 
 @pytest.fixture
 def tmp_urls_col(tmp_path, monkeypatch, fake_embed):
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="urls_test", metadata={"hnsw:space": "cosine"}
     )

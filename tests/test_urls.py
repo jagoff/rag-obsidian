@@ -1,4 +1,4 @@
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -90,7 +90,7 @@ def fake_reranker(monkeypatch):
 
 @pytest.fixture
 def urls_col(tmp_path, fake_embed, fake_reranker, monkeypatch):
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     c = client.get_or_create_collection(
         name="urls_test", metadata={"hnsw:space": "cosine"}
     )

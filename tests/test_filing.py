@@ -7,7 +7,7 @@ build_filing_proposal, logging a filing.jsonl, y smoke end-to-end del CLI.
 import json
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -29,7 +29,7 @@ def tmp_vault(tmp_path, monkeypatch):
         return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
     monkeypatch.setattr(rag, "embed", fake_embed)
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="filing_test", metadata={"hnsw:space": "cosine"}
     )

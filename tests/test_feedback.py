@@ -236,9 +236,9 @@ def test_retrieve_applies_positive_boost(tmp_path, fb_tmp, fake_embed, monkeypat
     """Con un 👍 previo sobre `winner.md`, retrieve() debe rankearlo por encima
     de `loser.md` aunque el reranker les dé el mismo score crudo.
     """
-    import chromadb
+    from rag import SqliteVecClient as _TestVecClient
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="feedback_test", metadata={"hnsw:space": "cosine"}
     )
@@ -288,9 +288,9 @@ def test_retrieve_applies_negative_penalty(tmp_path, fb_tmp, fake_embed, monkeyp
     """Un 👎 en `bad.md` debe tirar ese path al fondo incluso si el reranker
     lo pone ligeramente arriba del otro.
     """
-    import chromadb
+    from rag import SqliteVecClient as _TestVecClient
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="feedback_penalty_test", metadata={"hnsw:space": "cosine"}
     )
@@ -331,9 +331,9 @@ def test_retrieve_applies_negative_penalty(tmp_path, fb_tmp, fake_embed, monkeyp
 
 def test_retrieve_boost_path_not_in_pool_gets_injected(tmp_path, fb_tmp, fake_embed, monkeypatch):
     """Si un path 👍 no fue recuperado por semantic+BM25, debe inyectarse al pool."""
-    import chromadb
+    from rag import SqliteVecClient as _TestVecClient
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="feedback_inject_test", metadata={"hnsw:space": "cosine"}
     )

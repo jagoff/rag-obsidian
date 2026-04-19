@@ -7,7 +7,7 @@ config) corren con fixtures de tmp_path.
 import json
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -37,7 +37,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
         rag, "AMBIENT_LOG_PATH",
         tmp_path / "ambient.jsonl",
     )
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="amb_test", metadata={"hnsw:space": "cosine"}
     )

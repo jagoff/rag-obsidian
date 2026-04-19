@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -29,7 +29,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
               "03-Resources", "04-Archive", "05-Reviews"):
         (vault / d).mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="archive_test", metadata={"hnsw:space": "cosine"}
     )

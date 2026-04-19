@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 from click.testing import CliRunner
 
@@ -24,7 +24,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
     (vault / "02-Areas").mkdir(parents=True)
     (vault / "05-Reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="followup_test", metadata={"hnsw:space": "cosine"},
     )

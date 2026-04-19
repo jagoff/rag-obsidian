@@ -39,7 +39,7 @@ logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import click
-import chromadb
+import sqlite_vec
 import ollama
 import yaml
 from rank_bm25 import BM25Okapi
@@ -353,7 +353,7 @@ _DEFAULT_VAULT = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Docu
 #   2. Registry's "current" vault (rag vault use <name>).
 #   3. _DEFAULT_VAULT (iCloud Notes) — para usuarios single-vault que
 #      nunca tocan el registry.
-# La colección de Chroma se nombra con el hash del path resuelto, así que
+# La colección de sqlite-vec se nombra con el hash del path resuelto, así que
 # cada vault tiene su propio índice automáticamente. Cero contaminación.
 VAULTS_CONFIG_PATH = Path.home() / ".config/obsidian-rag/vaults.json"
 
@@ -396,7 +396,7 @@ def _resolve_vault_path() -> Path:
 
 
 VAULT_PATH = _resolve_vault_path()
-DB_PATH = Path.home() / ".local/share/obsidian-rag/chroma"
+DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
@@ -2009,13 +2009,539 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
+# sqlite-vec backend. Schema per "collection" (namespaced per-vault):
+#   vec_{name}  — virtual table: rowid INTEGER PRIMARY KEY, embedding float[dim]
+#   meta_{name} — regular table: rowid → chunk_id + document + metadata fields
+# Extra metadata (frontmatter fields not in KNOWN_META_COLS) goes into
+# meta_{name}.extra_json as a JSON blob — still SELECT-able via json_extract()
+# if needed, but the hot-path `where` filters use proper columns.
+#
+# Concurrency model: single `ragvec.db` file, WAL mode. Writers serialize
+# at _collection_write_lock() level (fcntl.flock). Readers run in parallel.
 
-_db_singleton: tuple[str, chromadb.Collection] | None = None
+
+_KNOWN_META_COLS = (
+    # Note-collection metadata
+    "file", "folder", "note", "tags", "hash", "outlinks",
+    "created_ts", "parent", "title", "area", "type", "archived_at",
+    "archived_from", "archived_reason", "contradicts", "ambient",
+    # URL sub-index metadata
+    "url", "anchor", "line", "source", "profile", "bookmark_folder",
+)
+
+
+def _sanitize_table_suffix(name: str) -> str:
+    """Collection name → SQL-safe table suffix. obsidian_notes_v9_abc123 is
+    already alphanumeric+underscore; this is defensive."""
+    return "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+
+
+class SqliteVecCollection:
+    """sqlite-vec-backed collection with a ChromaDB-compatible API surface.
+
+    Exposes the subset of the SqliteVecCollection API used by rag.py:
+      count(), get(), add(), delete(), query(), .id, .name
+    """
+
+    __slots__ = ("_db", "name", "_dim", "_vec", "_meta")
+
+    def __init__(self, db: "sqlite3.Connection", name: str, dim: int = 1024):
+        import sqlite3 as _sqlite3  # local alias to avoid name clash
+        self._db = db
+        self.name = name
+        self._dim = dim
+        suffix = _sanitize_table_suffix(name)
+        self._vec = f"vec_{suffix}"
+        self._meta = f"meta_{suffix}"
+        self._ensure_tables()
+
+    def _ensure_tables(self):
+        # Meta table is dim-independent → always create.
+        # vec0 table requires a known dim; defer to _ensure_vec_table(dim)
+        # called from the first add() — allows tests with 4-dim mocks and
+        # production with 1024-dim bge-m3 to coexist without hardcoding.
+        int_cols = {"line"}
+        real_cols = {"created_ts"}
+        cols_sql = ", ".join(
+            f"{c} INTEGER" if c in int_cols
+            else f"{c} REAL" if c in real_cols
+            else f"{c} TEXT"
+            for c in _KNOWN_META_COLS if c != "created_ts"
+        )
+        self._db.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._meta} ("
+            " rowid INTEGER PRIMARY KEY, "
+            " chunk_id TEXT UNIQUE NOT NULL, "
+            " document TEXT, "
+            f"{cols_sql}, "
+            " created_ts REAL, "
+            " extra_json TEXT"
+            ")"
+        )
+        self._db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self._meta}_file "
+            f"ON {self._meta}(file)"
+        )
+        self._db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self._meta}_folder "
+            f"ON {self._meta}(folder)"
+        )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_version ("
+            " table_name TEXT PRIMARY KEY, "
+            " version INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        self._db.commit()
+
+    def _ensure_vec_table(self, dim: int):
+        """Create vec0 table lazily on first insert with the actual dim.
+        If the table already exists with a different dim, drop+recreate
+        (destructive — caller must own the decision, e.g. `index --reset`
+        or switching between test/prod)."""
+        existing = self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+            (self._vec,),
+        ).fetchone()
+        if existing:
+            sql = existing[0]
+            if f"float[{dim}]" in sql:
+                return
+            # Dim mismatch → recreate. Only safe when no rows yet.
+            row_ct = self._db.execute(
+                f"SELECT COUNT(*) FROM {self._meta}"
+            ).fetchone()[0]
+            if row_ct > 0:
+                raise RuntimeError(
+                    f"vec0 dim mismatch in '{self._vec}': existing != {dim} "
+                    f"and {row_ct} meta rows exist. Drop/recreate needed."
+                )
+            self._db.execute(f"DROP TABLE {self._vec}")
+        self._db.execute(
+            f"CREATE VIRTUAL TABLE {self._vec} "
+            f"USING vec0(embedding float[{dim}])"
+        )
+        self._dim = dim
+
+    @property
+    def id(self) -> str:
+        """Monotonic schema version bumped on every destructive write.
+        Used by _load_corpus() to detect stale BM25 cache (same role as
+        ChromaDB's collection UUID that changed on delete+recreate)."""
+        row = self._db.execute(
+            "SELECT version FROM rag_schema_version WHERE table_name = ?",
+            (self.name,),
+        ).fetchone()
+        return f"{self.name}:{row[0] if row else 0}"
+
+    def _bump_version(self):
+        self._db.execute(
+            "INSERT INTO rag_schema_version(table_name, version) VALUES(?, 1) "
+            "ON CONFLICT(table_name) DO UPDATE SET version = version + 1",
+            (self.name,),
+        )
+
+    def count(self) -> int:
+        return self._db.execute(
+            f"SELECT COUNT(*) FROM {self._meta}"
+        ).fetchone()[0]
+
+    @staticmethod
+    def _build_where(where: dict | None) -> tuple[str, list]:
+        """Translate ChromaDB-style `where` to SQL.
+
+        Supported:
+          {field: value}              → `field = ?`
+          {field: {"$in": [...]}}     → `field IN (?, ?, …)`
+          {field: {"$contains": "x"}} → `field LIKE '%x%'`
+          {field: {"$gte": n}}        → `field >= ?`  (also $gt/$lte/$lt/$ne)
+          {"$and": [cond1, cond2]}    → `(cond1) AND (cond2)`
+          {"$or": [cond1, cond2]}     → `(cond1) OR (cond2)`
+        """
+        def _expand(cond: dict) -> tuple[str, list]:
+            if not cond:
+                return "1 = 1", []
+            parts: list[str] = []
+            params: list = []
+            for k, v in cond.items():
+                if k == "$and":
+                    subs = [_expand(c) for c in v]
+                    parts.append(" AND ".join(f"({s[0]})" for s in subs))
+                    for s in subs:
+                        params.extend(s[1])
+                elif k == "$or":
+                    subs = [_expand(c) for c in v]
+                    parts.append(" OR ".join(f"({s[0]})" for s in subs))
+                    for s in subs:
+                        params.extend(s[1])
+                elif isinstance(v, dict):
+                    # Field-level operator dict
+                    field_parts = []
+                    for op, val in v.items():
+                        if op == "$in":
+                            vals = list(val)
+                            if not vals:
+                                field_parts.append("0 = 1")
+                            else:
+                                ph = ",".join("?" * len(vals))
+                                field_parts.append(f"{k} IN ({ph})")
+                                params.extend(vals)
+                        elif op == "$nin":
+                            vals = list(val)
+                            if not vals:
+                                field_parts.append("1 = 1")
+                            else:
+                                ph = ",".join("?" * len(vals))
+                                field_parts.append(f"({k} NOT IN ({ph}) OR {k} IS NULL)")
+                                params.extend(vals)
+                        elif op == "$contains":
+                            field_parts.append(f"{k} LIKE ?")
+                            params.append(f"%{val}%")
+                        elif op == "$gte":
+                            field_parts.append(f"{k} >= ?")
+                            params.append(val)
+                        elif op == "$lte":
+                            field_parts.append(f"{k} <= ?")
+                            params.append(val)
+                        elif op == "$gt":
+                            field_parts.append(f"{k} > ?")
+                            params.append(val)
+                        elif op == "$lt":
+                            field_parts.append(f"{k} < ?")
+                            params.append(val)
+                        elif op == "$ne":
+                            field_parts.append(f"({k} != ? OR {k} IS NULL)")
+                            params.append(val)
+                        elif op == "$eq":
+                            field_parts.append(f"{k} = ?")
+                            params.append(val)
+                        else:
+                            # Unknown operator — fall through to equality of dict
+                            # serialised as JSON. Defensive; shouldn't happen.
+                            field_parts.append(f"{k} = ?")
+                            params.append(json.dumps(v))
+                    if field_parts:
+                        parts.append(" AND ".join(field_parts))
+                else:
+                    parts.append(f"{k} = ?")
+                    params.append(v)
+            return " AND ".join(parts), params
+
+        if not where:
+            return "", []
+        sql, params = _expand(where)
+        return " WHERE " + sql, params
+
+    def _row_to_meta(self, row, meta_col_names):
+        """Reconstruct metadata dict from meta_* row."""
+        out = {}
+        for i, col in enumerate(meta_col_names):
+            v = row[i]
+            if v is None:
+                continue
+            out[col] = v
+        # Merge extra_json if present
+        extra = out.pop("extra_json", None)
+        if extra:
+            try:
+                out.update(json.loads(extra))
+            except Exception:
+                pass
+        return out
+
+    def get(self, ids=None, where=None, include=None) -> dict:
+        include = include or []
+        want_docs = "documents" in include
+        want_metas = "metadatas" in include
+        want_embs = "embeddings" in include
+
+        meta_cols = list(_KNOWN_META_COLS) + ["extra_json"]
+        select_cols = ["rowid", "chunk_id"]
+        if want_docs:
+            select_cols.append("document")
+        if want_metas:
+            select_cols.extend(meta_cols)
+
+        sql = f"SELECT {', '.join(select_cols)} FROM {self._meta}"
+        params: list = []
+        if ids is not None:
+            ids_list = list(ids)
+            if not ids_list:
+                base = {"ids": []}
+                if want_docs:
+                    base["documents"] = []
+                if want_metas:
+                    base["metadatas"] = []
+                if want_embs:
+                    base["embeddings"] = []
+                return base
+            placeholders = ",".join("?" * len(ids_list))
+            sql += f" WHERE chunk_id IN ({placeholders})"
+            params = ids_list
+        elif where:
+            w_sql, w_params = self._build_where(where)
+            sql += w_sql
+            params = w_params
+
+        rows = self._db.execute(sql, params).fetchall()
+        result_ids = [r[1] for r in rows]
+        out: dict = {"ids": result_ids}
+
+        if want_docs:
+            doc_idx = 2
+            out["documents"] = [r[doc_idx] for r in rows]
+        if want_metas:
+            meta_start = 2 + (1 if want_docs else 0)
+            out["metadatas"] = [self._row_to_meta(r[meta_start:], meta_cols) for r in rows]
+        if want_embs:
+            import numpy as _np
+            rowids = [r[0] for r in rows]
+            embed_map: dict[int, list[float]] = {}
+            vec_exists = self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (self._vec,),
+            ).fetchone() is not None
+            if rowids and vec_exists:
+                placeholders = ",".join("?" * len(rowids))
+                for rid, raw in self._db.execute(
+                    f"SELECT rowid, embedding FROM {self._vec} WHERE rowid IN ({placeholders})",
+                    rowids,
+                ).fetchall():
+                    arr = _np.frombuffer(raw, dtype="float32")
+                    embed_map[rid] = arr.tolist()
+            out["embeddings"] = [embed_map.get(r[0]) for r in rows]
+
+        return out
+
+    def add(self, ids, embeddings, documents, metadatas):
+        known = _KNOWN_META_COLS
+        # Lazily create the vec0 table with the actual embedding dim.
+        embeddings = [list(e) for e in embeddings]
+        if embeddings:
+            self._ensure_vec_table(len(embeddings[0]))
+        with self._db:
+            for cid, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
+                extra = {k: v for k, v in meta.items() if k not in known}
+                extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+                # Normalize created_ts to float or None
+                created_ts = meta.get("created_ts")
+                try:
+                    created_ts = float(created_ts) if created_ts is not None else None
+                except (TypeError, ValueError):
+                    created_ts = None
+                values = [cid, doc]
+                for col in known:
+                    if col == "created_ts":
+                        values.append(created_ts)
+                    else:
+                        v = meta.get(col)
+                        # Preserve primitive types (int/float/bool/str/None);
+                        # only stringify complex values like lists/dicts.
+                        if v is None or isinstance(v, (int, float, bool, str)):
+                            values.append(v)
+                        else:
+                            values.append(str(v))
+                values.append(extra_json)
+                cols_list = ["chunk_id", "document"] + list(known) + ["extra_json"]
+                placeholders = ",".join("?" * len(values))
+                updates = ", ".join(f"{c}=excluded.{c}" for c in cols_list if c != "chunk_id")
+                self._db.execute(
+                    f"INSERT INTO {self._meta}({','.join(cols_list)}) VALUES({placeholders}) "
+                    f"ON CONFLICT(chunk_id) DO UPDATE SET {updates}",
+                    values,
+                )
+                rowid = self._db.execute(
+                    f"SELECT rowid FROM {self._meta} WHERE chunk_id = ?", (cid,)
+                ).fetchone()[0]
+                # Replace vec entry (vec0 doesn't support upsert directly)
+                self._db.execute(f"DELETE FROM {self._vec} WHERE rowid = ?", (rowid,))
+                self._db.execute(
+                    f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)",
+                    (rowid, sqlite_vec.serialize_float32(list(emb))),
+                )
+            self._bump_version()
+
+    def delete(self, ids=None, where=None):
+        rowids: list[int] = []
+        if ids is not None:
+            if not ids:
+                return
+            placeholders = ",".join("?" * len(ids))
+            rowids = [r[0] for r in self._db.execute(
+                f"SELECT rowid FROM {self._meta} WHERE chunk_id IN ({placeholders})",
+                list(ids),
+            ).fetchall()]
+        elif where:
+            w_sql, w_params = self._build_where(where)
+            rowids = [r[0] for r in self._db.execute(
+                f"SELECT rowid FROM {self._meta}" + w_sql, w_params,
+            ).fetchall()]
+        if not rowids:
+            return
+        with self._db:
+            placeholders = ",".join("?" * len(rowids))
+            self._db.execute(
+                f"DELETE FROM {self._vec} WHERE rowid IN ({placeholders})", rowids,
+            )
+            self._db.execute(
+                f"DELETE FROM {self._meta} WHERE rowid IN ({placeholders})", rowids,
+            )
+            self._bump_version()
+
+    def query(self, query_embeddings, n_results: int = 10,
+              where=None, include=None) -> dict:
+        """Semantic search. Returns batched results: {ids, documents,
+        metadatas, distances} each as list[list[...]] — one sublist per
+        query embedding, matching ChromaDB's shape."""
+        include = include or ["documents", "metadatas", "distances"]
+        want_docs = "documents" in include
+        want_metas = "metadatas" in include
+        want_dist = "distances" in include
+
+        meta_cols = list(_KNOWN_META_COLS) + ["extra_json"]
+        select_cols = ["m.chunk_id"]
+        if want_docs:
+            select_cols.append("m.document")
+        if want_metas:
+            select_cols.extend(f"m.{c}" for c in meta_cols)
+        select_cols.append("v.distance")
+        # Trailing v.rowid → used only for Python-side stable tie-breaking.
+        select_cols.append("v.rowid")
+
+        where_sql, where_params = self._build_where(where)
+        # vec0's MATCH is restrictive — can't chain arbitrary predicates in
+        # the same SELECT. Split the knn into a CTE and apply metadata
+        # filters on the outer SELECT. Over-fetch by 4× to compensate for
+        # post-filtering losing top candidates.
+        fetch_n = int(n_results)
+        post_filter = bool(where_sql)
+        if post_filter:
+            fetch_n = int(n_results) * 4 + 20
+
+        out: dict[str, list] = {"ids": []}
+        if want_docs:
+            out["documents"] = []
+        if want_metas:
+            out["metadatas"] = []
+        if want_dist:
+            out["distances"] = []
+
+        vec_exists = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (self._vec,),
+        ).fetchone() is not None
+        if not vec_exists:
+            for _ in query_embeddings:
+                out["ids"].append([])
+                if want_docs:
+                    out["documents"].append([])
+                if want_metas:
+                    out["metadatas"].append([])
+                if want_dist:
+                    out["distances"].append([])
+            return out
+
+        for qemb in query_embeddings:
+            # Step 1: vec0 knn into a subquery (no extra predicates allowed).
+            # Step 2: outer SELECT joins meta, applies user `where`, limits to n_results.
+            outer_where = where_sql  # already starts with " WHERE " if non-empty
+            # Secondary sort by rowid keeps tied distances in insertion order
+            # — without it, vec0 may return ties non-deterministically.
+            sql = (
+                f"SELECT {', '.join(select_cols)} FROM ("
+                f"  SELECT rowid, distance FROM {self._vec} "
+                f"  WHERE embedding MATCH ? AND k = ? ORDER BY distance"
+                f") v JOIN {self._meta} m ON v.rowid = m.rowid"
+                f"{outer_where} "
+                f"LIMIT ?"
+            )
+            params = (
+                [sqlite_vec.serialize_float32(list(qemb)), fetch_n]
+                + where_params
+                + [int(n_results)]
+            )
+            rows = self._db.execute(sql, params).fetchall()
+            # Python-side stable sort by (distance, rowid) — sqlite-vec ties
+            # resolve arbitrarily inside vec0, so we enforce insertion-order
+            # for ties here. Columns layout: chunk_id [doc] [meta*] distance rowid.
+            rows = sorted(rows, key=lambda r: (r[-2], r[-1]))
+            ids = [r[0] for r in rows]
+            out["ids"].append(ids)
+            if want_docs:
+                out["documents"].append([r[1] for r in rows])
+            if want_metas:
+                ms_start = 2 if want_docs else 1
+                out["metadatas"].append(
+                    [self._row_to_meta(r[ms_start:ms_start + len(meta_cols)], meta_cols)
+                     for r in rows]
+                )
+            if want_dist:
+                out["distances"].append([r[-2] for r in rows])
+
+        return out
+
+
+class SqliteVecClient:
+    """sqlite-vec client replacing chromadb.PersistentClient. All collections share one
+    SQLite file (ragvec.db inside path)."""
+
+    def __init__(self, path):
+        import sqlite3 as _sqlite3
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._file = self.path / "ragvec.db"
+        self._db = _sqlite3.connect(str(self._file), check_same_thread=False,
+                                    isolation_level=None)
+        self._db.enable_load_extension(True)
+        sqlite_vec.load(self._db)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA busy_timeout=10000")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_version ("
+            " table_name TEXT PRIMARY KEY, "
+            " version INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        self._db.commit()
+        self._collections: dict[str, SqliteVecCollection] = {}
+
+    def get_or_create_collection(self, name: str, metadata=None):
+        # metadata arg ignored (was `{"hnsw:space": "cosine"}`); sqlite-vec
+        # uses cosine distance natively via vec0 MATCH.
+        if name not in self._collections:
+            self._collections[name] = SqliteVecCollection(self._db, name)
+        return self._collections[name]
+
+    def list_collections(self):
+        rows = self._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'meta_%' "
+            "ORDER BY name"
+        ).fetchall()
+        # Strip "meta_" prefix → collection name
+        names = [r[0][5:] for r in rows]
+        # Return lightweight objects with .name (callers only use .name)
+        class _ColRef:
+            def __init__(self, n): self.name = n
+        return [_ColRef(n) for n in names]
+
+    def delete_collection(self, name: str):
+        suffix = _sanitize_table_suffix(name)
+        with self._db:
+            self._db.execute(f"DROP TABLE IF EXISTS vec_{suffix}")
+            self._db.execute(f"DROP TABLE IF EXISTS meta_{suffix}")
+            self._db.execute(
+                "DELETE FROM rag_schema_version WHERE table_name = ?", (name,)
+            )
+        self._collections.pop(name, None)
+
+
+_db_singleton: tuple[str, "SqliteVecCollection"] | None = None
 _db_singleton_created_at: float = 0.0
 _db_singleton_lock = threading.Lock()
 
 
-def get_db() -> chromadb.Collection:
+def get_db() -> SqliteVecCollection:
     global _db_singleton, _db_singleton_created_at
     db_key = str(DB_PATH)
     with _db_singleton_lock:
@@ -2030,7 +2556,7 @@ def get_db() -> chromadb.Collection:
                 pass
         if _db_singleton is None or _db_singleton[0] != db_key:
             DB_PATH.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(path=db_key)
+            client = SqliteVecClient(path=db_key)
             col = client.get_or_create_collection(
                 name=COLLECTION_NAME,
                 metadata={"hnsw:space": "cosine"},
@@ -2052,8 +2578,8 @@ def _collection_name_for_vault(vault_path: Path) -> str:
     return f"{_COLLECTION_BASE}_{slug}"
 
 
-def get_db_for(vault_path: Path) -> chromadb.Collection:
-    """Abre la colección Chroma correspondiente a un vault arbitrario.
+def get_db_for(vault_path: Path) -> SqliteVecCollection:
+    """Abre la colección sqlite-vec correspondiente a un vault arbitrario.
     Todos los vaults viven en la misma DB (DB_PATH) — la separación es por
     nombre de colección, namespaced por hash del path del vault.
     No hay singleton aquí: cada llamada abre un cliente fresco, así que el
@@ -2062,7 +2588,7 @@ def get_db_for(vault_path: Path) -> chromadb.Collection:
     vigente.
     """
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(DB_PATH))
+    client = SqliteVecClient(path=str(DB_PATH))
     return client.get_or_create_collection(
         name=_collection_name_for_vault(vault_path),
         metadata={"hnsw:space": "cosine"},
@@ -2278,12 +2804,12 @@ def auto_index_vault(vault_path: Path) -> dict:
     }
 
 
-def get_urls_db() -> chromadb.Collection:
+def get_urls_db() -> SqliteVecCollection:
     """Companion collection storing one row per URL found in the vault, with
     its surrounding prose embedded for semantic-by-context lookup.
     """
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(DB_PATH))
+    client = SqliteVecClient(path=str(DB_PATH))
     return client.get_or_create_collection(
         name=URLS_COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
@@ -2659,7 +3185,7 @@ def _sync_moze_notes(vault_root: Path) -> dict:
 
 
 def _index_urls(
-    col_urls: chromadb.Collection,
+    col_urls: SqliteVecCollection,
     doc_id_prefix: str,
     raw_text: str,
     note_title: str,
@@ -2673,7 +3199,7 @@ def _index_urls(
     then re-inserts. Called from `_index_single_file` so URL state stays in
     lockstep with the main chunk index.
     """
-    # Delete any prior URL rows for this file. ChromaDB has no prefix delete,
+    # Delete any prior URL rows for this file. No prefix delete in sqlite-vec,
     # so we list ids and filter.
     existing = col_urls.get(where={"file": doc_id_prefix}, include=[])
     if existing.get("ids"):
@@ -2825,7 +3351,7 @@ def _bookmark_embed_text(title: str, folder_breadcrumb: str, url: str) -> str:
 
 
 def _index_chrome_bookmarks(
-    col_urls: chromadb.Collection,
+    col_urls: SqliteVecCollection,
     profile: str,
     bookmarks: list[dict],
     batch_size: int = 256,
@@ -3291,7 +3817,7 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", stripped)
 
 
-def _load_corpus(col: chromadb.Collection) -> dict:
+def _load_corpus(col: SqliteVecCollection) -> dict:
     """Load and cache the full corpus + BM25 index + vocabulary.
 
     Invalidation keys: (collection UUID, chunk count). A concurrent
@@ -3299,7 +3825,7 @@ def _load_corpus(col: chromadb.Collection) -> dict:
     even when the post-reindex count lands at the same number, so relying
     on count alone left long-lived chat processes serving stale BM25
     indexes whose ids had been wiped. `col.id` is the authoritative churn
-    signal — chromadb rotates it on every delete+create.
+    signal — sqlite-vec rotates it on every delete+create.
     """
     global _corpus_cache
     n = col.count()
@@ -3382,7 +3908,7 @@ def _folder_matches(file_path: str, folder: str) -> bool:
 
 
 def bm25_search(
-    col: chromadb.Collection, query: str, k: int,
+    col: SqliteVecCollection, query: str, k: int,
     folder: str | None, tag: str | None = None,
     date_range: tuple[float, float] | None = None,
 ) -> list[str]:
@@ -3856,14 +4382,14 @@ def _filter_files(metas: list[dict], tag: str | None, folder: str | None) -> lis
     return list(seen.values())
 
 
-def handle_count(col: chromadb.Collection, params: dict) -> tuple[int, list[dict]]:
+def handle_count(col: SqliteVecCollection, params: dict) -> tuple[int, list[dict]]:
     """COUNT intent — returns (count, matching_files_meta)."""
     c = _load_corpus(col)
     files = _filter_files(c["metas"], params.get("tag"), params.get("folder"))
     return len(files), files
 
 
-def handle_list(col: chromadb.Collection, params: dict, limit: int = 50) -> list[dict]:
+def handle_list(col: SqliteVecCollection, params: dict, limit: int = 50) -> list[dict]:
     """LIST intent — returns up to `limit` files matching filters."""
     c = _load_corpus(col)
     files = _filter_files(c["metas"], params.get("tag"), params.get("folder"))
@@ -3871,7 +4397,7 @@ def handle_list(col: chromadb.Collection, params: dict, limit: int = 50) -> list
     return files[:limit]
 
 
-def handle_recent(col: chromadb.Collection, params: dict, limit: int = 20) -> list[dict]:
+def handle_recent(col: SqliteVecCollection, params: dict, limit: int = 20) -> list[dict]:
     """RECENT intent — returns files sorted by `modified` frontmatter desc."""
     c = _load_corpus(col)
     files = _filter_files(c["metas"], params.get("tag"), params.get("folder"))
@@ -3945,7 +4471,7 @@ def expand_to_parent(chunk_text: str, meta: dict) -> str:
     return parent if parent else chunk_text
 
 
-def get_vocabulary(col: chromadb.Collection) -> tuple[set[str], set[str]]:
+def get_vocabulary(col: SqliteVecCollection) -> tuple[set[str], set[str]]:
     """Collect unique tags and folders from the index for intent-based filtering."""
     c = _load_corpus(col)
     return c["tags"], c["folders"]
@@ -4066,7 +4592,7 @@ SYSTEM_RULES_WEB = (
 # de SYSTEM_RULES/STRICT porque coaching genuino requiere dejar espacio al
 # usuario — respuestas largas o consejos directos apagan la exploración.
 def build_progressive_context(
-    col: "chromadb.Collection",
+    col: "SqliteVecCollection",
     primary_docs: list[str],
     primary_metas: list[dict],
     question: str,
@@ -4168,7 +4694,7 @@ def print_sources(result: dict) -> None:
 
 
 def find_related(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     source_metas: list[dict],
     limit: int = 5,
 ) -> list[tuple[dict, int, str]]:
@@ -4519,7 +5045,7 @@ def parse_since(value: str) -> float:
 
 
 def save_note(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     title: str | None,
     body: str,
     question: str,
@@ -4654,7 +5180,7 @@ def _in_skip_span(pos: int, spans: list[tuple[int, int]]) -> bool:
 
 
 def find_wikilink_suggestions(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     min_title_len: int = 4,
     max_per_note: int = 30,
@@ -4768,7 +5294,7 @@ def apply_wikilink_suggestions(note_path: str, suggestions: list[dict]) -> int:
 # notes that share a single phrase.
 
 def _note_centroids(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     folder: str | None = None,
     skip_folders: tuple[str, ...] = (),
 ) -> tuple[list[str], list[dict], "np.ndarray"]:
@@ -4808,7 +5334,7 @@ def _note_centroids(
 
 
 def find_duplicate_notes(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     threshold: float = 0.85,
     folder: str | None = None,
     limit: int = 50,
@@ -4919,7 +5445,7 @@ def _graph_pagerank(
 _pagerank_cache: dict[str, float] | None = None
 
 
-def get_pagerank(col: "chromadb.Collection") -> dict[str, float]:
+def get_pagerank(col: "SqliteVecCollection") -> dict[str, float]:
     """Cached PageRank over the wikilink graph. Rebuilt when corpus changes."""
     global _pagerank_cache
     corpus = _load_corpus(col)
@@ -4989,7 +5515,7 @@ def _note_age_days(meta: dict) -> float | None:
 
 
 def find_surface_bridges(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     sim_threshold: float = 0.78,
     min_hops: int = 3,
     top: int = 5,
@@ -5150,7 +5676,7 @@ def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
 
 
 def _suggest_tags_for_note(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     body: str,
     note_title: str,
     max_tags: int = 6,
@@ -5234,7 +5760,7 @@ def _apply_frontmatter_tags(note_path: Path, merged_tags: list[str]) -> bool:
 
 
 def _suggest_folder_for_note(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     k: int = 8,
     skip_folder_prefix: str = "00-",
@@ -5284,7 +5810,7 @@ def _suggest_folder_for_note(
 
 
 def triage_inbox_note(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     max_tags: int = 5,
     dupe_threshold: float = 0.85,
@@ -5336,7 +5862,7 @@ FILING_CONFIDENCE_TENTATIVE = 0.35
 
 
 def _top_k_neighbors(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     k: int = 8,
     skip_folder_prefix: str = "00-",
@@ -5344,7 +5870,7 @@ def _top_k_neighbors(
     """Top-k semantic neighbors (meta, similarity) dedupeado por file, excluye
     la nota misma y cualquier path en Inbox-style folders (00-*).
 
-    Chroma cosine-space: distance = 1 - cos_sim → similarity = max(0, 1-dist).
+    sqlite-vec cosine-space: distance = 1 - cos_sim → similarity = max(0, 1-dist).
     """
     full = (VAULT_PATH / note_path).resolve()
     try:
@@ -5402,7 +5928,7 @@ def _infer_upward_link(
 
 
 def build_filing_proposal(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     k: int = 8,
     history: list[dict] | None = None,
@@ -5570,7 +6096,7 @@ def _embed_note_body(note_path: str) -> list[float] | None:
 
 
 def _personalized_folder_vote(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     q_embed: list[float] | None,
     history: list[dict],
     top_k: int = FILING_PERSONALIZE_TOP_K,
@@ -5643,10 +6169,10 @@ def vault_write_lock(op: str, *, blocking: bool = True, timeout: float = 300.0):
     """Advisory lock para serializar mutadores del vault + índice.
 
     Cubre `rag index` (full + reset), `rag file --apply`, `rag inbox --apply`,
-    y cualquier flujo que mueva notas o escriba chunks a Chroma en batch.
+    y cualquier flujo que mueva notas o escriba chunks a sqlite-vec en batch.
     NO se usa en paths read-only (query, chat, stats) ni en re-index de una
     sola nota vía watch/ambient (esos serializan a través de los locks
-    internos de Chroma/SQLite; tomar el lock global ahí bloquearía un
+    internos de sqlite-vec/SQLite; tomar el lock global ahí bloquearía un
     mutator batch por horas).
 
     `op` es el nombre de la operación (para el error message si otro
@@ -5738,7 +6264,7 @@ def _remove_upward_link(note_full_path: Path) -> bool:
 
 
 def _apply_filing_move(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     src_rel: str,
     target_folder: str,
     upward_title: str,
@@ -5826,7 +6352,7 @@ def _last_filing_batch() -> Path | None:
     return batches[0] if batches else None
 
 
-def _rollback_filing_batch(col: chromadb.Collection, batch_path: Path) -> list[dict]:
+def _rollback_filing_batch(col: SqliteVecCollection, batch_path: Path) -> list[dict]:
     """Revierte cada entry: remueve upward-link, mueve back del dst al src.
     Retorna lista de resultados por entry: {src, dst, ok, error?}.
 
@@ -5871,7 +6397,7 @@ def _rollback_filing_batch(col: chromadb.Collection, batch_path: Path) -> list[d
 
 
 def find_near_duplicates_for(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_path: str,
     threshold: float = 0.80,
     limit: int = 5,
@@ -5904,7 +6430,7 @@ def find_near_duplicates_for(
 
 
 def find_contradictions(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     question: str,
     answer: str,
     exclude_paths: set[str],
@@ -6268,7 +6794,7 @@ def build_where(
     tag: str | None,
     date_range: tuple[float, float] | None = None,
 ) -> dict | None:
-    """Build ChromaDB where filter from folder and/or tag and/or date_range.
+    """Build sqlite-vec where filter from folder and/or tag and/or date_range.
 
     Folder is widened with `$or` to include 00-Inbox — rationale in
     `_folder_matches`. If the user *explicitly* filtered to Inbox, the OR
@@ -6301,7 +6827,7 @@ def build_where(
 
 
 def retrieve(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     question: str,
     k: int,
     folder: str | None,
@@ -6398,7 +6924,7 @@ def retrieve(
         variant_embeds = _local_vecs if _local_vecs is not None else embed(variants)
     _timing["embed_ms"] = (time.perf_counter() - _t0) * 1000
 
-    # Sequential — ChromaDB + BM25Okapi both hold a GIL-bound mutex, so
+    # Sequential — sqlite-vec + BM25Okapi both hold a GIL-bound mutex, so
     # ThreadPoolExecutor over these serialises anyway AND adds per-task
     # overhead. Measured: parallel 3× slower than sequential on M3 Max.
     seen_ids: set[str] = set()
@@ -6777,7 +7303,7 @@ def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tup
 
 
 def deep_retrieve(
-    col: "chromadb.Collection",
+    col: "SqliteVecCollection",
     question: str,
     k: int,
     folder: str | None,
@@ -6878,7 +7404,7 @@ def deep_retrieve(
 
 
 def collect_ranker_features(
-    col: "chromadb.Collection",
+    col: "SqliteVecCollection",
     question: str,
     history: list[dict] | None = None,
     k_pool: int = 40,
@@ -7283,7 +7809,7 @@ CONTRADICTION_LOG_PATH = Path.home() / ".local/share/obsidian-rag/contradictions
 
 
 def find_contradictions_for_note(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     note_body: str,
     exclude_paths: set[str],
     k: int = 5,
@@ -7481,7 +8007,7 @@ def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
 
 
 def _check_and_flag_contradictions(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     path: Path,
     text: str,
     doc_id_prefix: str,
@@ -8031,7 +8557,7 @@ def _brief_push_to_whatsapp(
 
 
 def _ambient_hook(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     path: Path,
     doc_id_prefix: str,
     h: str,
@@ -8147,7 +8673,7 @@ def _ambient_hook(
 
 
 def _index_single_file(
-    col: chromadb.Collection, path: Path, skip_contradict: bool = False,
+    col: SqliteVecCollection, path: Path, skip_contradict: bool = False,
     vault_path: Path | None = None,
 ) -> str:
     """(Re)index one markdown file. Returns one of:
@@ -8292,7 +8818,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             global _db_singleton, _db_singleton_created_at
             _db_singleton = None
             db_key = str(DB_PATH)
-            client = chromadb.PersistentClient(path=db_key)
+            client = SqliteVecClient(path=db_key)
             for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
                 try:
                     _log_collection_op("delete", cname, {"reason": "index --reset"})
@@ -8495,7 +9021,7 @@ def watch(debounce: float, all_vaults: bool):
 
     Sin `--all-vaults`, observa el vault activo (legacy: un servicio launchd
     por vault). Con `--all-vaults`, un único proceso observa todos los vaults
-    registrados — ahorra ~3-4 GB de swap por vault adicional porque chromadb
+    registrados — ahorra ~3-4 GB de swap por vault adicional porque sqlite-vec
     + transformers se importan una sola vez.
     """
     from watchdog.observers import Observer
@@ -8527,7 +9053,7 @@ def watch(debounce: float, all_vaults: bool):
     else:
         vaults = resolve_vault_paths(None)
 
-    # Per-vault state: chromadb collection + pending set. Shared lock so
+    # Per-vault state: sqlite-vec collection + pending set. Shared lock so
     # handlers can write without per-vault contention.
     vault_state: list[dict] = []
     pending_lock = threading.Lock()
@@ -12510,7 +13036,7 @@ def _maybe_backfill_created_ts() -> None:
         col = get_db()
         if col.count() == 0:
             return
-        # Chroma doesn't support {"$not_exists": ...} across all backends,
+        # sqlite-vec doesn't support {"$not_exists": ...} filters,
         # so we fetch all metadata and filter in Python. 521-note vault
         # produces ~2k chunks — negligible.
         data = col.get(include=["metadatas"])
@@ -12551,7 +13077,7 @@ def _maybe_backfill_created_ts() -> None:
     if not update_ids:
         return
     try:
-        # Batch to avoid Chroma payload limits.
+        # Batch writes for predictable memory usage.
         B = 500
         for i in range(0, len(update_ids), B):
             col.update(ids=update_ids[i:i + B], metadatas=update_metas[i:i + B])
@@ -14120,7 +14646,7 @@ def _read_extract(html: str) -> tuple[str, str]:
 
 
 def _find_related_by_embedding(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     query_embedding: list[float],
     limit: int = 5,
 ) -> list[dict]:
@@ -14310,7 +14836,7 @@ def _append_to_daily_note(
 
 
 def ingest_read_url(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     url: str,
     save: bool = False,
     fetcher=None,
@@ -17877,7 +18403,7 @@ def _note_created_ts(raw: str, mtime: float) -> float:
 
 
 def find_dead_notes(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     vault: Path,
     query_log: Path,
     min_age_days: int = 365,
@@ -18172,11 +18698,11 @@ def _log_archive_event(event: dict) -> None:
 
 
 def _archive_move_one(
-    col: "chromadb.Collection", src_rel: str, dst_rel: str,
+    col: "SqliteVecCollection", src_rel: str, dst_rel: str,
 ) -> dict:
     """Move a single note. Stamps frontmatter in place FIRST (so the moved
     file carries the stamp), then `shutil.move`, then two reindex calls:
-    old path (now gone → Chroma deletes its chunks) + new path (fresh chunks
+    old path (now gone → sqlite-vec deletes its chunks) + new path (fresh chunks
     under the new `file=` metadata key).
     """
     import shutil
@@ -18193,7 +18719,7 @@ def _archive_move_one(
     src.write_text(stamped, encoding="utf-8")
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
-    # Clean old path from Chroma + add new path. Both best-effort — the next
+    # Clean old path from sqlite-vec + add new path. Both best-effort — the next
     # full `rag index` would converge regardless.
     try:
         _index_single_file(col, src, skip_contradict=True)
@@ -18211,7 +18737,7 @@ def _archive_move_one(
 
 
 def archive_dead_notes(
-    col: "chromadb.Collection",
+    col: "SqliteVecCollection",
     vault: Path,
     candidates: list[dict],
     apply: bool,
@@ -18687,7 +19213,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
 
 
 def _classify_followup_loop(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     loop: dict,
     now: datetime,
     stale_days: int = FOLLOWUP_STALE_DAYS,
@@ -18782,7 +19308,7 @@ def _classify_followup_loop(
 
 
 def find_followup_loops(
-    col: chromadb.Collection,
+    col: SqliteVecCollection,
     vault: Path,
     days: int = 30,
     stale_days: int = FOLLOWUP_STALE_DAYS,
@@ -19701,7 +20227,7 @@ def _collect_scoped_tasks_evidence(col, now: datetime, scope: dict) -> dict:
     `calendar_range` with scope-aware fetches. Ensures `whatsapp` always
     populated even if the base collector skipped silently.
 
-    Single-vault version kept for callers that pass a ChromaDB collection
+    Single-vault version kept for callers that pass a sqlite-vec collection
     directly (rag morning/today still use this). Multi-vault tasks-mode
     uses `_collect_scoped_tasks_evidence_multi` instead.
     """
@@ -20524,7 +21050,7 @@ def vault():
     """Multi-vault: registrar / cambiar / listar vaults de Obsidian.
 
     El registry vive en ~/.config/obsidian-rag/vaults.json. Cada vault
-    obtiene su propia colección de Chroma automáticamente (namespacing
+    obtiene su propia colección de sqlite-vec automáticamente (namespacing
     por hash del path) — switchear no contamina ni cruza datos.
 
     Precedencia para resolver el vault activo:
@@ -20974,7 +21500,7 @@ def _rotate_jsonl(path: Path, max_bytes: int = _JSONL_ROTATE_BYTES) -> str | Non
     return f"{len(lines) - keep} lines kept, {len(lines) - keep} archived → {old.name} ({size / 1024:.0f} KB → {path.stat().st_size / 1024:.0f} KB)"
 
 
-def _prune_context_cache(col: "chromadb.Collection") -> int:
+def _prune_context_cache(col: "SqliteVecCollection") -> int:
     """Remove context_summaries entries whose file hash is no longer in the index."""
     cache = _load_context_cache()
     if not cache:
@@ -20995,7 +21521,7 @@ def _prune_context_cache(col: "chromadb.Collection") -> int:
     return len(stale)
 
 
-def _prune_synthetic_q_cache(col: "chromadb.Collection") -> int:
+def _prune_synthetic_q_cache(col: "SqliteVecCollection") -> int:
     """Remove synthetic_questions entries whose file hash is no longer in the index."""
     cache = _load_synthetic_q_cache()
     if not cache:
@@ -21129,7 +21655,7 @@ def _prune_url_orphans(vault: Path) -> int:
         if meta.get("file", "") not in on_disk
     ]
     if orphan_ids:
-        # ChromaDB delete has a batch limit; chunk if needed
+        # Chunk deletes for predictable memory usage.
         for i in range(0, len(orphan_ids), 5000):
             col_urls.delete(ids=orphan_ids[i:i + 5000])
     return len(orphan_ids)
@@ -21169,7 +21695,7 @@ def _prune_feedback_orphans(vault: Path) -> int:
 
 
 def _find_orphan_collections() -> list[str]:
-    """Detect ChromaDB collections from old schema versions or removed vaults.
+    """Detect sqlite-vec collections from old schema versions or removed vaults.
 
     Safety invariants
     -----------------
@@ -21179,16 +21705,14 @@ def _find_orphan_collections() -> list[str]:
        pointing at a non-default vault, the default vault's unsuffixed collection
        is still protected and not classified as an orphan.
 
-    2. Recency guard: ChromaDB's `collections` table has no `created_at` column
-       (schema confirmed: id, name, dimension, database_id, config_json_str,
-       schema_str). There is no timestamp we can query, so no recency guard is
-       implemented. See Task 2 comment if a future ChromaDB version adds one.
+    2. No recency guard is implemented — sqlite-vec has no creation timestamp in
+       schema.
 
     3. Audit: every candidate orphan is logged via _log_collection_op before
        being returned to the caller (which may delete it).
     """
     try:
-        client = chromadb.PersistentClient(path=str(DB_PATH))
+        client = SqliteVecClient(path=str(DB_PATH))
         all_cols = [c.name for c in client.list_collections()]
     except Exception:
         return []
@@ -21217,43 +21741,9 @@ def _find_orphan_collections() -> list[str]:
 
 
 def _find_orphan_segment_dirs() -> list[tuple[Path, int]]:
-    """Detect HNSW segment directories on disk not referenced in chroma.sqlite3.
-
-    Chroma's `delete_collection` removes rows from `segments` but sometimes
-    leaves the on-disk HNSW files behind. Over many v-bumps and --reset cycles
-    this can accumulate into tens of GB. Returns [(path, size_bytes), ...].
-    """
-    sqlite_path = DB_PATH / "chroma.sqlite3"
-    if not sqlite_path.is_file():
-        return []
-    import sqlite3 as _sqlite
-    try:
-        conn = _sqlite.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-        try:
-            live_ids = {row[0] for row in conn.execute("SELECT id FROM segments")}
-        finally:
-            conn.close()
-    except Exception:
-        return []
-    orphans: list[tuple[Path, int]] = []
-    for child in DB_PATH.iterdir():
-        if not child.is_dir():
-            continue
-        # Segment dirs are UUIDs (36 chars with dashes)
-        name = child.name
-        if len(name) != 36 or name.count("-") != 4:
-            continue
-        if name in live_ids:
-            continue
-        size = 0
-        try:
-            for p in child.rglob("*"):
-                if p.is_file():
-                    size += p.stat().st_size
-        except OSError:
-            pass
-        orphans.append((child, size))
-    return orphans
+    """sqlite-vec has no HNSW segment dirs on disk; stub retained
+    for call-site compatibility with _prune_orphan_segment_dirs."""
+    return []
 
 
 def _prune_orphan_segment_dirs(dry_run: bool = False) -> dict:
@@ -21283,13 +21773,13 @@ def _prune_orphan_segment_dirs(dry_run: bool = False) -> dict:
 
 
 def _chroma_wal_checkpoint(dry_run: bool = False) -> dict:
-    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on chroma.sqlite3.
+    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on ragvec.db.
 
     Safer than VACUUM — doesn't require exclusive lock and truncates the
     write-ahead log after flushing. Returns {before_bytes, after_bytes, ok}.
     """
-    sqlite_path = DB_PATH / "chroma.sqlite3"
-    wal_path = DB_PATH / "chroma.sqlite3-wal"
+    sqlite_path = DB_PATH / "ragvec.db"
+    wal_path = DB_PATH / "ragvec.db-wal"
     if not sqlite_path.is_file():
         return {"ok": False, "reason": "no sqlite file"}
     before = sqlite_path.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
@@ -21338,7 +21828,7 @@ def run_maintenance(
     results["orphan_collections"] = orphan_cols
     if orphan_cols and not dry_run:
         with _collection_write_lock():
-            client = chromadb.PersistentClient(path=str(DB_PATH))
+            client = SqliteVecClient(path=str(DB_PATH))
             for cname in orphan_cols:
                 try:
                     _log_collection_op("delete", cname, {"reason": "run_maintenance orphan"})
@@ -21347,13 +21837,13 @@ def run_maintenance(
                     pass
         results["orphan_collections_removed"] = len(orphan_cols)
 
-    # 3b. Orphan HNSW segment dirs (files left behind by delete_collection / --reset)
+    # 3b. Orphan segment dirs stub (sqlite-vec stores all data in ragvec.db; no dirs)
     try:
         results["orphan_segments"] = _prune_orphan_segment_dirs(dry_run=dry_run)
     except Exception as e:
         results["orphan_segments_error"] = str(e)
 
-    # 3c. WAL checkpoint (compacts chroma.sqlite3-wal)
+    # 3c. WAL checkpoint (compacts ragvec.db-wal)
     try:
         results["wal_checkpoint"] = _chroma_wal_checkpoint(dry_run=dry_run)
     except Exception as e:

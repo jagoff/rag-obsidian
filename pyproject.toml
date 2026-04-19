@@ -1,10 +1,12 @@
 [project]
 name = "obsidian-rag"
 version = "0.1.0"
-description = "Local RAG over an Obsidian vault — ChromaDB + Ollama + sentence-transformers, no cloud calls."
+description = "Local RAG over an Obsidian vault — sqlite-vec + Ollama + sentence-transformers, no cloud calls."
 requires-python = ">=3.13"
 dependencies = [
-    "chromadb>=1.5.7",
+    "sqlite-vec>=0.1.6",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
     "click>=8.3.2",
     "ollama>=0.6.1",
     "rank-bm25>=0.2.2",

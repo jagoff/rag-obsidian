@@ -1,4 +1,4 @@
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -16,7 +16,7 @@ def vault_with_dupes(tmp_path, monkeypatch):
     (vault / "c.md").write_text("contenido completamente distinto.")
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="dupes_test", metadata={"hnsw:space": "cosine"}
     )
@@ -91,7 +91,7 @@ def test_folder_filter_excludes_outsiders(tmp_path, monkeypatch):
     (vault / "in" / "b.md").write_text("b")
     (vault / "out" / "c.md").write_text("c")
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
-    client = chromadb.PersistentClient(path=str(tmp_path / "c"))
+    client = _TestVecClient(path=str(tmp_path / "c"))
     col = client.get_or_create_collection(
         name="folder_test", metadata={"hnsw:space": "cosine"}
     )
@@ -118,7 +118,7 @@ def test_centroid_collapses_multiple_chunks(tmp_path, monkeypatch):
     vault.mkdir()
     (vault / "multi.md").write_text("multi chunk")
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
-    client = chromadb.PersistentClient(path=str(tmp_path / "c"))
+    client = _TestVecClient(path=str(tmp_path / "c"))
     col = client.get_or_create_collection(
         name="centroid_test", metadata={"hnsw:space": "cosine"}
     )
@@ -154,7 +154,7 @@ def test_find_near_duplicates_for_unknown_path_returns_empty(vault_with_dupes):
 
 
 def test_empty_collection_returns_empty(tmp_path):
-    client = chromadb.PersistentClient(path=str(tmp_path / "c"))
+    client = _TestVecClient(path=str(tmp_path / "c"))
     col = client.get_or_create_collection(
         name="empty_test", metadata={"hnsw:space": "cosine"}
     )

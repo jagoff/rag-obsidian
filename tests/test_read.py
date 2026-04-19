@@ -2,7 +2,7 @@ import io
 import json
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 from click.testing import CliRunner
 
@@ -54,7 +54,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed, fake_chat):
     (vault / "00-Inbox").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "LOG_PATH", tmp_path / "queries.jsonl")
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="read_test", metadata={"hnsw:space": "cosine"}
     )

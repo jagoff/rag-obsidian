@@ -50,7 +50,7 @@ def test_find_orphan_never_orphans_base_collections(tmp_path, monkeypatch):
     # Redirect ops log so we don't touch the real one.
     monkeypatch.setattr(rag, "COLLECTION_OPS_LOG", tmp_path / "ops.log")
 
-    with patch("rag.chromadb.PersistentClient", return_value=fake_client):
+    with patch("rag.SqliteVecClient", return_value=fake_client):
         result = rag._find_orphan_collections()
 
     assert rag._COLLECTION_BASE not in result
@@ -84,7 +84,7 @@ def test_find_orphan_protects_base_when_collection_name_is_suffixed(tmp_path, mo
     monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
     monkeypatch.setattr(rag, "COLLECTION_OPS_LOG", tmp_path / "ops.log")
 
-    with patch("rag.chromadb.PersistentClient", return_value=fake_client):
+    with patch("rag.SqliteVecClient", return_value=fake_client):
         result = rag._find_orphan_collections()
 
     assert rag._COLLECTION_BASE not in result, "base collection wrongly classified as orphan"
@@ -141,7 +141,7 @@ def test_sentinel_invalidates_db_singleton(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "_db_singleton", None)
     monkeypatch.setattr(rag, "_db_singleton_created_at", 0.0)
 
-    with patch("rag.chromadb.PersistentClient", return_value=fake_client):
+    with patch("rag.SqliteVecClient", return_value=fake_client):
         col_a = rag.get_db()
         id_a = col_a.id
 

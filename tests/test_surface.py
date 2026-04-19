@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -22,7 +22,7 @@ def tmp_vault(tmp_path, monkeypatch):
     vault.mkdir()
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "SURFACE_LOG_PATH", tmp_path / "surface.jsonl")
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="surface_test", metadata={"hnsw:space": "cosine"}
     )

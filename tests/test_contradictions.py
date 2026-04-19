@@ -1,6 +1,6 @@
 import json
 
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -53,7 +53,7 @@ def scripted_ollama(monkeypatch):
 
 @pytest.fixture
 def col(tmp_path, fake_embed, fake_reranker):
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     c = client.get_or_create_collection(
         name="contradict_test", metadata={"hnsw:space": "cosine"}
     )
@@ -77,7 +77,7 @@ def test_short_answer_returns_empty_without_llm_call(col, scripted_ollama):
 
 
 def test_empty_vault_returns_empty(tmp_path, fake_embed, fake_reranker, scripted_ollama):
-    client = chromadb.PersistentClient(path=str(tmp_path / "empty"))
+    client = _TestVecClient(path=str(tmp_path / "empty"))
     empty = client.get_or_create_collection(
         name="empty_test", metadata={"hnsw:space": "cosine"}
     )

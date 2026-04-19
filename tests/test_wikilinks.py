@@ -1,4 +1,4 @@
-import chromadb
+from rag import SqliteVecClient as _TestVecClient
 import pytest
 
 import rag
@@ -66,7 +66,7 @@ def vault_with_titles(tmp_path, monkeypatch):
     (vault / "TDD.md").write_text("test driven development.\n")  # short title
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="wl_test", metadata={"hnsw:space": "cosine"}
     )

@@ -522,9 +522,24 @@ def _collection_write_lock(timeout: int = 300, blocking: bool = True):
 
 def log_query_event(event: dict) -> None:
     """Enqueue a JSONL event for background append to the query log.
-    Best-effort, never raises, non-blocking on the caller thread."""
+    Best-effort, never raises, non-blocking on the caller thread.
+
+    When RAG_STATE_SQL=1: route to rag_queries via _sql_append_event. On any
+    SQL error, fall through to the legacy JSONL path (cutover fail-safe;
+    removed in T10 after 7d observation).
+    """
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    except Exception:
+        return
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_queries", _map_queries_row(event))
+            return
+        except Exception as exc:  # fail-safe fallthrough
+            _log_sql_state_error("queries_sql_write_failed", err=repr(exc))
+    try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
     except Exception:
@@ -553,6 +568,16 @@ def log_behavior_event(event: dict) -> None:
         return
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    except Exception:
+        return
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_behavior", _map_behavior_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("behavior_sql_write_failed", err=repr(exc))
+    try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
     except Exception:
@@ -568,8 +593,19 @@ def record_brief_written(
     """Append a record of what a morning/today brief cited.
 
     Schema: {ts, brief_type, brief_path, paths_cited, citations_by_section}
-    Silent-fail on I/O error.
+    Silent-fail on I/O error. When RAG_STATE_SQL=1, route to rag_brief_written.
     """
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(
+                    conn, "rag_brief_written",
+                    _map_brief_written_row(brief_type, str(brief_path),
+                                            paths_cited, citations_by_section),
+                )
+            return
+        except Exception as exc:
+            _log_sql_state_error("brief_written_sql_write_failed", err=repr(exc))
     try:
         BRIEF_WRITTEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         rec = {
@@ -633,8 +669,27 @@ def _resolve_wikilinks_to_paths(
 
 
 def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
-    """Return True if this (brief_path, cited_path) pair was already emitted."""
+    """Return True if this (brief_path, cited_path) pair was already emitted.
+
+    When RAG_STATE_SQL=1: O(1) PK lookup on rag_brief_state.pair_key. Falls
+    back to JSONL scan if the flag is off OR the SQL row is missing (cutover
+    bridge — pair written pre-flag still lives in brief_state.jsonl).
+    """
     key = f"{brief_path}\x00{cited_path}"
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    "SELECT pair_key FROM rag_brief_state WHERE pair_key = ?",
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    return True
+                # Not in SQL → fall through to JSONL (may hold historical pair).
+        except Exception as exc:
+            _log_sql_state_error("brief_state_sql_read_failed", err=repr(exc))
+            # Fall through.
+
     if not BRIEF_STATE_PATH.is_file():
         return False
     try:
@@ -651,7 +706,17 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
 
 
 def _brief_state_record(brief_path: str, cited_path: str) -> None:
-    """Mark this (brief_path, cited_path) pair as processed."""
+    """Mark this (brief_path, cited_path) pair as processed. Upsert on pk=pair_key
+    when RAG_STATE_SQL=1; append legacy line otherwise."""
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_upsert(conn, "rag_brief_state",
+                            _map_brief_state_row(brief_path, cited_path),
+                            ("pair_key",))
+            return
+        except Exception as exc:
+            _log_sql_state_error("brief_state_sql_write_failed", err=repr(exc))
     key = f"{brief_path}\x00{cited_path}"
     try:
         BRIEF_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1401,102 +1466,86 @@ _BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept"})
 _BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
 
 _behavior_priors_cache: dict | None = None
-_behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size)
+_behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) — JSONL path
+# T4: SQL-backed cache key — MAX(ts) in rag_behavior. Separate variable so
+# the JSONL fallback's cache key stays a distinct type. T10 will collapse
+# both into one after the 7-day observation window.
+_behavior_priors_cache_key_sql: str | None = None
 
 
-def _load_behavior_priors() -> dict:
-    """Read behavior.jsonl and return an immutable aggregated snapshot.
+def _compute_behavior_priors_from_rows(rows_iter) -> dict:
+    """Fold behavior rows (dict-like, with `event`/`path`/`ts`/`dwell_ms`) into the
+    priors snapshot. Shared between the SQL and JSONL readers so CTR arithmetic
+    lives in one place.
 
-    Returns a dict with keys:
-      click_prior        {path: ctr_float}          — per-path CTR with Laplace
-      click_prior_folder {folder: ctr_float}        — top-level folder CTR
-      click_prior_hour   {(path, hour_int): ctr}    — path × hour CTR
-      dwell_score        {path: log1p(mean_dwell_s)} — dwell signal, log-transformed
-      n_events           int                         — total events parsed
-      hash               str                         — content key for debugging
-
-    All four feature dicts default to 0.0 for unseen keys. Safe when
-    behavior.jsonl is missing, empty, or corrupt — returns empty snapshot.
-    Never raises.
+    `rows_iter` yields dicts (or sqlite3.Row mapped to dict-access via `row[key]`).
+    Accepts both JSONL `dwell_ms` and SQL `dwell_s` — the latter is stored in
+    seconds per the rag_behavior schema; if present we multiply by 1000 to match
+    the JSONL dwell_ms convention before folding into dwell_acc.
     """
-    global _behavior_priors_cache, _behavior_priors_cache_key
-
-    try:
-        if BEHAVIOR_LOG_PATH.is_file():
-            stat = BEHAVIOR_LOG_PATH.stat()
-            cache_key: tuple[float, int] = (stat.st_mtime, stat.st_size)
-        else:
-            cache_key = (0.0, 0)
-    except OSError:
-        cache_key = (0.0, 0)
-
-    if _behavior_priors_cache is not None and _behavior_priors_cache_key == cache_key:
-        return _behavior_priors_cache
-
-    # Build fresh snapshot
-    # Impression/click accumulators: {key: [clicks, impressions]}
     path_acc: dict[str, list[int]] = {}
     folder_acc: dict[str, list[int]] = {}
     hour_acc: dict[tuple[str, int], list[int]] = {}
     dwell_acc: dict[str, list[float]] = {}
     n_events = 0
 
-    try:
-        if BEHAVIOR_LOG_PATH.is_file():
-            raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+    def _get(row, key):
+        # sqlite3.Row: bracket access raises IndexError on missing key; dict: KeyError.
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
+
+    for ev in rows_iter:
+        event_type = _get(ev, "event") or ""
+        path = _get(ev, "path") or ""
+        if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
+            continue
+
+        n_events += 1
+        is_click = 1 if event_type in _BEHAVIOR_POSITIVE else 0
+
+        if path not in path_acc:
+            path_acc[path] = [0, 0]
+        path_acc[path][0] += is_click
+        path_acc[path][1] += 1
+
+        folder = path.split("/")[0] if "/" in path else ""
+        if folder:
+            if folder not in folder_acc:
+                folder_acc[folder] = [0, 0]
+            folder_acc[folder][0] += is_click
+            folder_acc[folder][1] += 1
+
+        try:
+            ts_str = _get(ev, "ts") or ""
+            if ts_str:
+                hour = int(ts_str[11:13])  # "YYYY-MM-DDTHH:..." → HH
+                key_h = (path, hour)
+                if key_h not in hour_acc:
+                    hour_acc[key_h] = [0, 0]
+                hour_acc[key_h][0] += is_click
+                hour_acc[key_h][1] += 1
+        except (ValueError, IndexError, TypeError):
+            pass
+
+        # Dwell (only from positive events). JSONL writes `dwell_ms`; the SQL
+        # rag_behavior schema has `dwell_s`. Normalise both to milliseconds for
+        # the accumulator so downstream log1p(mean_dwell_s) stays correct.
+        if is_click:
+            dwell_ms_raw = _get(ev, "dwell_ms")
+            if dwell_ms_raw is not None:
                 try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-
-                event_type = ev.get("event", "")
-                path = ev.get("path", "")
-                if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
-                    continue
-
-                n_events += 1
-                is_click = 1 if event_type in _BEHAVIOR_POSITIVE else 0
-
-                # Per-path
-                if path not in path_acc:
-                    path_acc[path] = [0, 0]
-                path_acc[path][0] += is_click
-                path_acc[path][1] += 1
-
-                # Per-folder (top-level directory of path)
-                folder = path.split("/")[0] if "/" in path else ""
-                if folder:
-                    if folder not in folder_acc:
-                        folder_acc[folder] = [0, 0]
-                    folder_acc[folder][0] += is_click
-                    folder_acc[folder][1] += 1
-
-                # Per-(path, hour) — parse hour from ts field
-                try:
-                    ts_str = ev.get("ts", "")
-                    if ts_str:
-                        hour = int(ts_str[11:13])  # "YYYY-MM-DDTHH:..." → HH
-                        key_h = (path, hour)
-                        if key_h not in hour_acc:
-                            hour_acc[key_h] = [0, 0]
-                        hour_acc[key_h][0] += is_click
-                        hour_acc[key_h][1] += 1
-                except (ValueError, IndexError):
+                    dwell_acc.setdefault(path, []).append(float(dwell_ms_raw))
+                except (TypeError, ValueError):
                     pass
-
-                # Dwell (only from positive events with dwell_ms)
-                dwell_ms = ev.get("dwell_ms")
-                if dwell_ms is not None and is_click:
+            else:
+                dwell_s_raw = _get(ev, "dwell_s")
+                if dwell_s_raw is not None:
                     try:
-                        dwell_acc.setdefault(path, []).append(float(dwell_ms))
+                        dwell_acc.setdefault(path, []).append(float(dwell_s_raw) * 1000.0)
                     except (TypeError, ValueError):
                         pass
-    except Exception:
-        pass
 
     import math
 
@@ -1519,17 +1568,103 @@ def _load_behavior_priors() -> dict:
         if ms_list
     }
 
-    snapshot = {
+    return {
         "click_prior": click_prior,
         "click_prior_folder": click_prior_folder,
         "click_prior_hour": click_prior_hour,
         "dwell_score": dwell_score,
         "n_events": n_events,
-        "hash": f"{cache_key[0]:.3f}:{cache_key[1]}",
     }
 
+
+def _iter_behavior_jsonl() -> list[dict]:
+    """Yield parsed events from behavior.jsonl. Silent on missing/corrupt."""
+    if not BEHAVIOR_LOG_PATH.is_file():
+        return []
+    out: list[dict] = []
+    try:
+        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def _load_behavior_priors() -> dict:
+    """Read behavior events and return an immutable aggregated snapshot.
+
+    Returns a dict with keys:
+      click_prior        {path: ctr_float}          — per-path CTR with Laplace
+      click_prior_folder {folder: ctr_float}        — top-level folder CTR
+      click_prior_hour   {(path, hour_int): ctr}    — path × hour CTR
+      dwell_score        {path: log1p(mean_dwell_s)} — dwell signal, log-transformed
+      n_events           int                         — total events parsed
+      hash               str                         — content key for debugging
+
+    All four feature dicts default to 0.0 for unseen keys. Safe when the
+    backing store is missing/empty/corrupt — returns empty snapshot. Never raises.
+
+    When RAG_STATE_SQL=1: read rag_behavior with MAX(ts) as cache key.
+    If the SQL table is empty (e.g. cutover just flipped) → fall through to
+    JSONL so historical priors aren't lost during the 7-day observation window.
+    T10 strips the JSONL fallback.
+    """
+    global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                max_ts = _sql_max_ts(conn, "rag_behavior")
+                if max_ts is not None:
+                    if (_behavior_priors_cache is not None
+                            and _behavior_priors_cache_key_sql == max_ts):
+                        return _behavior_priors_cache
+                    import sqlite3 as _sqlite3
+                    prev_factory = conn.row_factory
+                    try:
+                        conn.row_factory = _sqlite3.Row
+                        rows = list(conn.execute(
+                            "SELECT ts, event, path, dwell_s FROM rag_behavior"
+                        ).fetchall())
+                    finally:
+                        conn.row_factory = prev_factory
+                    snapshot = _compute_behavior_priors_from_rows(rows)
+                    snapshot["hash"] = f"sql:{max_ts}"
+                    _behavior_priors_cache = snapshot
+                    _behavior_priors_cache_key_sql = max_ts
+                    _behavior_priors_cache_key = None
+                    return snapshot
+                # SQL empty (table has no rows) → fall through to JSONL.
+        except Exception as exc:
+            _log_sql_state_error("behavior_priors_sql_read_failed", err=repr(exc))
+            # Fall through.
+
+    try:
+        if BEHAVIOR_LOG_PATH.is_file():
+            stat = BEHAVIOR_LOG_PATH.stat()
+            cache_key: tuple[float, int] = (stat.st_mtime, stat.st_size)
+        else:
+            cache_key = (0.0, 0)
+    except OSError:
+        cache_key = (0.0, 0)
+
+    if (_behavior_priors_cache is not None
+            and _behavior_priors_cache_key == cache_key
+            and _behavior_priors_cache_key_sql is None):
+        return _behavior_priors_cache
+
+    snapshot = _compute_behavior_priors_from_rows(_iter_behavior_jsonl())
+    snapshot["hash"] = f"{cache_key[0]:.3f}:{cache_key[1]}"
     _behavior_priors_cache = snapshot
     _behavior_priors_cache_key = cache_key
+    _behavior_priors_cache_key_sql = None
     return snapshot
 
 
@@ -1791,28 +1926,37 @@ def record_feedback(
       rating holístico al cierre.
     - `session_id` / `session_rating`: metadata para scope='session'.
     """
-    try:
-        FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        event: dict = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "turn_id": turn_id,
-            "rating": 1 if rating > 0 else -1,
-            "q": q,
-            "paths": list(paths or []),
-            "scope": scope,
-        }
-        if reason:
-            event["reason"] = reason.strip()[:200]
-        if corrective_path:
-            event["corrective_path"] = corrective_path
-        if session_id:
-            event["session_id"] = session_id
-        if session_rating is not None:
-            event["session_rating"] = int(session_rating)
-        with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    event: dict = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "turn_id": turn_id,
+        "rating": 1 if rating > 0 else -1,
+        "q": q,
+        "paths": list(paths or []),
+        "scope": scope,
+    }
+    if reason:
+        event["reason"] = reason.strip()[:200]
+    if corrective_path:
+        event["corrective_path"] = corrective_path
+    if session_id:
+        event["session_id"] = session_id
+    if session_rating is not None:
+        event["session_rating"] = int(session_rating)
+    _wrote_sql = False
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_feedback", _map_feedback_row(event))
+            _wrote_sql = True
+        except Exception as exc:
+            _log_sql_state_error("feedback_sql_write_failed", err=repr(exc))
+    if not _wrote_sql:
+        try:
+            FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
     # Cache invalidation — next load rebuilds from jsonl. Best-effort delete.
     try:
         if FEEDBACK_GOLDEN_PATH.is_file():
@@ -1929,18 +2073,319 @@ def _rebuild_feedback_golden() -> dict:
 
 _feedback_golden_memo: dict | None = None
 _feedback_golden_mtime: float = 0.0
+# T4: SQL-backed memo key — rag_feedback MAX(ts). Distinct from the JSONL
+# mtime key so both paths can coexist during cutover.
+_feedback_golden_source_ts_sql: str | None = None
+
+
+def _pack_embedding(emb) -> tuple[bytes, int]:
+    """Pack a list of floats into a little-endian float32 BLOB + dim."""
+    import struct
+    dim = len(emb)
+    return struct.pack("<" + "f" * dim, *[float(x) for x in emb]), dim
+
+
+def _unpack_embedding(blob: bytes, dim: int) -> list[float]:
+    """Inverse of _pack_embedding — unpack blob (dim floats, LE) into list."""
+    import struct
+    if not blob or dim <= 0:
+        return []
+    try:
+        return list(struct.unpack("<" + "f" * dim, blob))
+    except struct.error:
+        return []
+
+
+def _feedback_golden_meta_ts(conn) -> str | None:
+    """Read meta.last_built_source_ts or None if missing."""
+    try:
+        row = conn.execute(
+            "SELECT v FROM rag_feedback_golden_meta WHERE k='last_built_source_ts'"
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _feedback_golden_table_empty(conn) -> bool:
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM rag_feedback_golden").fetchone()
+        return int(row[0] if row else 0) == 0
+    except Exception:
+        return True
+
+
+def _read_feedback_golden_sql(conn) -> dict:
+    """Materialise {positives, negatives} from rag_feedback_golden.
+
+    Rows share the query embedding across all paths from the same feedback
+    entry. We re-group by (embedding_bytes, rating) so the resulting dict
+    matches the legacy JSON schema — `feedback_signals_for_query` iterates
+    entries and computes cosine against each once, then propagates the
+    similarity to every path in that entry's paths list.
+    """
+    import sqlite3 as _sqlite3
+    prev_factory = conn.row_factory
+    try:
+        conn.row_factory = _sqlite3.Row
+        rows = list(conn.execute(
+            "SELECT path, rating, embedding, dim FROM rag_feedback_golden"
+        ).fetchall())
+    finally:
+        conn.row_factory = prev_factory
+
+    groups: dict[tuple[int, bytes], dict] = {}
+    for r in rows:
+        blob = r["embedding"]
+        dim = int(r["dim"]) if r["dim"] is not None else 0
+        rating = int(r["rating"])
+        path = r["path"]
+        if not blob or dim <= 0 or not path:
+            continue
+        key = (rating, bytes(blob))
+        entry = groups.get(key)
+        if entry is None:
+            entry = {"q": "", "emb": _unpack_embedding(bytes(blob), dim),
+                     "paths": []}
+            groups[key] = entry
+        if path not in entry["paths"]:
+            entry["paths"].append(path)
+
+    positives = [e for (rat, _b), e in groups.items() if rat > 0]
+    negatives = [e for (rat, _b), e in groups.items() if rat < 0]
+    return {"positives": positives, "negatives": negatives}
+
+
+def _write_feedback_golden_sql(conn, golden: dict, source_ts: str) -> None:
+    """Persist a freshly built {positives, negatives} dict into
+    rag_feedback_golden + rag_feedback_golden_meta. Wipes prior rows under
+    the assumption the rebuild is authoritative.
+    """
+    built_at = datetime.now().isoformat(timespec="seconds")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM rag_feedback_golden")
+        for rating, entries in ((1, golden.get("positives") or []),
+                                 (-1, golden.get("negatives") or [])):
+            for entry in entries:
+                emb = entry.get("emb") or []
+                paths = [p for p in (entry.get("paths") or []) if p]
+                if not emb or not paths:
+                    continue
+                blob, dim = _pack_embedding(emb)
+                for p in paths:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rag_feedback_golden "
+                        "(path, rating, embedding, dim, built_at, source_ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (p, rating, blob, dim, built_at, source_ts),
+                    )
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+            ("last_built_source_ts", source_ts),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def _rebuild_feedback_golden_from_sql_feedback(conn) -> dict:
+    """Rebuild golden cache by reading rag_feedback rows (SQL-native path).
+
+    Mirrors _rebuild_feedback_golden's logic but pulls from the SQL feedback
+    table instead of feedback.jsonl. Persists the result into rag_feedback_golden
+    + meta so subsequent reads hit the table directly.
+    """
+    import sqlite3 as _sqlite3
+    prev_factory = conn.row_factory
+    try:
+        conn.row_factory = _sqlite3.Row
+        rows = list(conn.execute(
+            "SELECT ts, rating, q, paths_json, extra_json, turn_id "
+            "FROM rag_feedback ORDER BY ts"
+        ).fetchall())
+    finally:
+        conn.row_factory = prev_factory
+
+    # Reconstruct JSONL-shaped events from SQL rows so the rebuild stays shape-
+    # identical to _rebuild_feedback_golden. Later writes override earlier for
+    # a given turn_id.
+    by_turn: dict[str, dict] = {}
+    for r in rows:
+        tid = r["turn_id"]
+        if not tid:
+            continue
+        try:
+            paths = json.loads(r["paths_json"]) if r["paths_json"] else []
+        except Exception:
+            paths = []
+        extra: dict = {}
+        if r["extra_json"]:
+            try:
+                extra = json.loads(r["extra_json"]) or {}
+            except Exception:
+                extra = {}
+        ev = {
+            "turn_id": tid,
+            "ts": r["ts"],
+            "rating": int(r["rating"]) if r["rating"] is not None else 0,
+            "q": r["q"] or "",
+            "paths": paths,
+        }
+        # Merge extras — fields like `scope`, `corrective_path`.
+        for k, v in extra.items():
+            ev.setdefault(k, v)
+        by_turn[tid] = ev
+
+    positives: list[dict] = []
+    negatives: list[dict] = []
+    queries: list[str] = []
+    buckets: list[tuple[str, list[dict], list[str]]] = []
+    for ev in by_turn.values():
+        if ev.get("scope") == "session":
+            continue
+        q = (ev.get("q") or "").strip()
+        paths = [p for p in (ev.get("paths") or []) if p]
+        corrective = (ev.get("corrective_path") or "").strip()
+        if corrective:
+            paths = [corrective] + [p for p in paths if p != corrective]
+            ev = {**ev, "rating": 1}
+        if not q or not paths:
+            continue
+        bucket = positives if ev.get("rating", 0) > 0 else negatives
+        buckets.append((q, bucket, paths))
+        queries.append(q)
+
+    if queries:
+        try:
+            embs = embed(queries)
+        except Exception:
+            embs = [[0.0]] * len(queries)
+        for (q, bucket, paths), emb in zip(buckets, embs):
+            bucket.append({"q": q, "emb": list(emb), "paths": paths})
+
+    golden = {"positives": positives, "negatives": negatives}
+    source_ts = _sql_max_ts(conn, "rag_feedback") or datetime.now().isoformat(
+        timespec="seconds")
+    try:
+        _write_feedback_golden_sql(conn, golden, source_ts)
+    except Exception as exc:
+        _log_sql_state_error("feedback_golden_sql_write_failed", err=repr(exc))
+    return golden
+
+
+def _bridge_feedback_golden_json_to_sql(conn) -> dict | None:
+    """One-time bridge: if rag_feedback_golden is empty but the JSON cache
+    exists on disk (pre-cutover state), read the JSON, push rows into SQL
+    under `last_built_source_ts = now`, and return the loaded dict.
+
+    Returns None when no JSON is available (caller will rebuild from rag_feedback).
+    """
+    if not FEEDBACK_GOLDEN_PATH.is_file():
+        return None
+    try:
+        data = json.loads(FEEDBACK_GOLDEN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    positives = data.get("positives") or []
+    negatives = data.get("negatives") or []
+    golden = {"positives": positives, "negatives": negatives}
+    source_ts = _sql_max_ts(conn, "rag_feedback") or datetime.now().isoformat(
+        timespec="seconds")
+    try:
+        _write_feedback_golden_sql(conn, golden, source_ts)
+    except Exception as exc:
+        _log_sql_state_error("feedback_golden_bridge_write_failed",
+                              err=repr(exc))
+        return None
+    return golden
 
 
 def load_feedback_golden() -> dict:
-    """Return {positives, negatives} — rebuild on disk-mtime change, memoise in-process."""
-    global _feedback_golden_memo, _feedback_golden_mtime
-    # In-process memoisation: if feedback.jsonl hasn't changed since we last
-    # loaded, reuse what's in memory (avoids hitting disk on every query).
+    """Return {positives, negatives} — rebuild on source change, memoise in-process.
+
+    When RAG_STATE_SQL=1:
+      - Use meta.last_built_source_ts vs rag_feedback MAX(ts) for freshness.
+      - Rebuild from rag_feedback when stale OR table empty.
+      - One-time bridge: if the SQL golden table is empty AND feedback_golden.json
+        exists on disk, load JSON → write rows into SQL so the cutover is
+        transparent (no blank-priors period).
+      - On any SQL error → fall through to the JSONL path.
+    """
+    global _feedback_golden_memo, _feedback_golden_mtime, _feedback_golden_source_ts_sql
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                source_ts = _sql_max_ts(conn, "rag_feedback")
+                meta_ts = _feedback_golden_meta_ts(conn)
+                table_empty = _feedback_golden_table_empty(conn)
+
+                # Bridge: SQL table empty + JSON on disk → import JSON.
+                if table_empty and FEEDBACK_GOLDEN_PATH.is_file():
+                    bridged = _bridge_feedback_golden_json_to_sql(conn)
+                    if bridged is not None:
+                        _feedback_golden_memo = bridged
+                        _feedback_golden_source_ts_sql = (
+                            _feedback_golden_meta_ts(conn) or "")
+                        _feedback_golden_mtime = 0.0
+                        return bridged
+                    # Bridge failed → fall through to rebuild / JSONL.
+
+                need_rebuild = False
+                if source_ts is not None:
+                    # rag_feedback has rows. Rebuild if meta missing/stale or
+                    # table empty.
+                    if table_empty or meta_ts is None or meta_ts < source_ts:
+                        need_rebuild = True
+                elif table_empty:
+                    # Neither rag_feedback nor the golden table has anything —
+                    # with no JSON fallback either, return empty. We still
+                    # fall through to the JSONL path below in case feedback.jsonl
+                    # exists from pre-cutover.
+                    pass
+
+                if need_rebuild:
+                    rebuilt = _rebuild_feedback_golden_from_sql_feedback(conn)
+                    _feedback_golden_memo = rebuilt
+                    _feedback_golden_source_ts_sql = (
+                        _feedback_golden_meta_ts(conn) or source_ts or "")
+                    _feedback_golden_mtime = 0.0
+                    return rebuilt
+
+                # Cache hit on current source_ts.
+                if (_feedback_golden_memo is not None
+                        and _feedback_golden_source_ts_sql == (meta_ts or "")
+                        and not table_empty):
+                    return _feedback_golden_memo
+
+                if not table_empty:
+                    loaded = _read_feedback_golden_sql(conn)
+                    _feedback_golden_memo = loaded
+                    _feedback_golden_source_ts_sql = meta_ts or ""
+                    _feedback_golden_mtime = 0.0
+                    return loaded
+                # SQL table empty + no rag_feedback rows + no JSON → fall
+                # through to the JSONL path.
+        except Exception as exc:
+            _log_sql_state_error("feedback_golden_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through to JSONL.
+
+    # ── JSONL fallback (existing implementation) ──
     try:
         mtime = FEEDBACK_PATH.stat().st_mtime if FEEDBACK_PATH.is_file() else 0.0
     except Exception:
         mtime = 0.0
-    if _feedback_golden_memo is not None and mtime == _feedback_golden_mtime:
+    if (_feedback_golden_memo is not None
+            and mtime == _feedback_golden_mtime
+            and _feedback_golden_source_ts_sql is None):
         return _feedback_golden_memo
 
     if _feedback_golden_fresh():
@@ -1953,6 +2398,7 @@ def load_feedback_golden() -> dict:
     else:
         _feedback_golden_memo = _rebuild_feedback_golden()
     _feedback_golden_mtime = mtime
+    _feedback_golden_source_ts_sql = None
     return _feedback_golden_memo
 
 
@@ -2023,6 +2469,880 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
     for path in list(boost.keys()):
         penalty.pop(path, None)
     return boost, penalty
+
+
+# ── SQL state store (T1: foundation) ──────────────────────────────────────────
+# Feature-flagged migration of JSONL telemetry files into ragvec.db under the
+# `rag_*` table namespace (disjoint from sqlite-vec's `vec_*` / `meta_*`). When
+# RAG_STATE_SQL=1, SqliteVecClient.__init__ calls _ensure_telemetry_tables() to
+# create schemas + register rows in rag_schema_version. Writers/readers are
+# swapped in later tasks (T3/T4) — this task is pure additive scaffolding.
+#
+# Durability: telemetry writes set `PRAGMA synchronous=NORMAL` (WAL mode
+# already set by SqliteVecClient). Concurrent writers across processes
+# serialize via SQLite's busy_timeout; readers run in parallel (WAL).
+
+RAG_STATE_SQL = os.environ.get("RAG_STATE_SQL", "").strip() == "1"
+
+# DDL statements. All tables prefixed `rag_` to avoid collision with sqlite-vec
+# internal tables (`vec_*`, `meta_*`). `ts TEXT` stores ISO-8601 strings. Each
+# table has a corresponding row in `rag_schema_version` (registered idempotently
+# by _ensure_telemetry_tables) with version=1 so T9 rehearsal can validate
+# dev/prod schema parity without having to diff sqlite_master by hand.
+
+_TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "rag_queries",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_queries ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " q TEXT NOT NULL,"
+            " session TEXT,"
+            " mode TEXT,"
+            " top_score REAL,"
+            " t_retrieve REAL,"
+            " t_gen REAL,"
+            " answer_len INTEGER,"
+            " citation_repaired INTEGER,"
+            " critique_fired INTEGER,"
+            " critique_changed INTEGER,"
+            " variants_json TEXT,"
+            " paths_json TEXT,"
+            " scores_json TEXT,"
+            " filters_json TEXT,"
+            " bad_citations_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_ts ON rag_queries(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_session ON rag_queries(session)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_cmd_ts ON rag_queries(cmd, ts)",
+        ),
+    ),
+    (
+        "rag_behavior",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_behavior ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " source TEXT NOT NULL,"
+            " event TEXT NOT NULL,"
+            " path TEXT,"
+            " query TEXT,"
+            " rank INTEGER,"
+            " dwell_s REAL,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_ts ON rag_behavior(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path ON rag_behavior(path)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_event_ts ON rag_behavior(event, ts)",
+        ),
+    ),
+    (
+        "rag_feedback",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " turn_id TEXT,"
+            " rating INTEGER NOT NULL,"
+            " q TEXT,"
+            " scope TEXT,"
+            " paths_json TEXT,"
+            " extra_json TEXT,"
+            " UNIQUE(turn_id, rating, ts)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_feedback_ts ON rag_feedback(ts)",
+        ),
+    ),
+    (
+        "rag_feedback_golden",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback_golden ("
+            " path TEXT NOT NULL,"
+            " rating INTEGER NOT NULL,"
+            " embedding BLOB NOT NULL,"
+            " dim INTEGER NOT NULL,"
+            " built_at TEXT NOT NULL,"
+            " source_ts TEXT NOT NULL,"
+            " PRIMARY KEY(path, rating)"
+            ")",
+        ),
+    ),
+    (
+        "rag_feedback_golden_meta",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback_golden_meta ("
+            " k TEXT PRIMARY KEY,"
+            " v TEXT"
+            ")",
+        ),
+    ),
+    (
+        "rag_tune",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_tune ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " samples INTEGER,"
+            " seed INTEGER,"
+            " n_cases INTEGER,"
+            " baseline_json TEXT,"
+            " best_json TEXT,"
+            " delta REAL,"
+            " eval_hit5_singles REAL,"
+            " eval_hit5_chains REAL,"
+            " rolled_back INTEGER,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_tune_ts ON rag_tune(ts)",
+        ),
+    ),
+    (
+        "rag_contradictions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_contradictions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " subject_path TEXT NOT NULL,"
+            " contradicts_json TEXT,"
+            " helper_raw TEXT,"
+            " skipped TEXT,"
+            " UNIQUE(ts, subject_path)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_contradictions_ts ON rag_contradictions(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_contradictions_subject ON rag_contradictions(subject_path)",
+        ),
+    ),
+    (
+        "rag_ambient",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ambient ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " path TEXT,"
+            " hash TEXT,"
+            " payload_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ambient_ts ON rag_ambient(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ambient_path ON rag_ambient(path)",
+        ),
+    ),
+    (
+        "rag_ambient_state",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ambient_state ("
+            " path TEXT PRIMARY KEY,"
+            " hash TEXT,"
+            " analyzed_at REAL,"
+            " payload_json TEXT"
+            ")",
+        ),
+    ),
+    (
+        "rag_brief_written",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_written ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " brief_type TEXT NOT NULL,"
+            " brief_path TEXT,"
+            " paths_cited_json TEXT,"
+            " citations_by_section_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_brief_written_ts ON rag_brief_written(ts)",
+        ),
+    ),
+    (
+        "rag_brief_state",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_state ("
+            " pair_key TEXT PRIMARY KEY,"
+            " brief_type TEXT NOT NULL,"
+            " kind TEXT NOT NULL,"
+            " path TEXT NOT NULL,"
+            " first_ts TEXT NOT NULL,"
+            " last_ts TEXT NOT NULL"
+            ")",
+        ),
+    ),
+    (
+        "rag_conversations_index",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_conversations_index ("
+            " session_id TEXT PRIMARY KEY,"
+            " relative_path TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL"
+            ")",
+        ),
+    ),
+    # --- 9 extra tables, shape inferred from live JSONL in ~/.local/share/obsidian-rag/
+    (
+        "rag_wa_tasks",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_wa_tasks ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " since TEXT,"
+            " chats INTEGER,"
+            " items INTEGER,"
+            " path TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_wa_tasks_ts ON rag_wa_tasks(ts)",
+        ),
+    ),
+    (
+        "rag_archive_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_archive_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " min_age_days INTEGER,"
+            " query_window_days INTEGER,"
+            " folder TEXT,"
+            " dry_run INTEGER,"
+            " force INTEGER,"
+            " gate INTEGER,"
+            " n_candidates INTEGER,"
+            " n_plan INTEGER,"
+            " n_applied INTEGER,"
+            " n_skipped INTEGER,"
+            " gated INTEGER,"
+            " batch_path TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_archive_log_ts ON rag_archive_log(ts)",
+        ),
+    ),
+    (
+        "rag_filing_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_filing_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " path TEXT,"
+            " note TEXT,"
+            " folder TEXT,"
+            " confidence REAL,"
+            " upward_title TEXT,"
+            " upward_kind TEXT,"
+            " neighbors_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_filing_log_ts ON rag_filing_log(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_filing_log_path ON rag_filing_log(path)",
+        ),
+    ),
+    (
+        "rag_eval_runs",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_eval_runs ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " singles_hit5 REAL,"
+            " singles_mrr REAL,"
+            " singles_n INTEGER,"
+            " chains_hit5 REAL,"
+            " chains_mrr REAL,"
+            " chains_chain_success REAL,"
+            " chains_turns INTEGER,"
+            " chains_n INTEGER,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_eval_runs_ts ON rag_eval_runs(ts)",
+        ),
+    ),
+    (
+        "rag_surface_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_surface_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " n_pairs INTEGER,"
+            " sim_threshold REAL,"
+            " min_hops INTEGER,"
+            " top INTEGER,"
+            " skip_young_days INTEGER,"
+            " llm INTEGER,"
+            " duration_ms REAL,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_surface_log_ts ON rag_surface_log(ts)",
+        ),
+    ),
+    (
+        "rag_proactive_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_proactive_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " kind TEXT,"
+            " sent INTEGER,"
+            " reason TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_proactive_log_ts ON rag_proactive_log(ts)",
+        ),
+    ),
+    (
+        "rag_cpu_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_pct REAL,"
+            " ncores INTEGER,"
+            " interval_s REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_cpu_metrics_ts ON rag_cpu_metrics(ts)",
+        ),
+    ),
+    (
+        "rag_memory_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_memory_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_mb REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " vm_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_memory_metrics_ts ON rag_memory_metrics(ts)",
+        ),
+    ),
+    (
+        "system_memory_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS system_memory_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_mb REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " vm_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_system_memory_metrics_ts ON system_memory_metrics(ts)",
+        ),
+    ),
+)
+
+
+def _ensure_telemetry_tables(conn) -> None:
+    """Create all rag_* telemetry tables + indexes + schema_version rows.
+
+    Idempotent — relies on `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`.
+    Wraps all DDL in a single transaction so a crash mid-setup doesn't leave
+    half-built schema. Also sets `synchronous=NORMAL` on this connection so
+    telemetry writes survive power loss (vec reads keep their settings).
+
+    Called from SqliteVecClient.__init__ when RAG_STATE_SQL=1, so a process
+    that hasn't opted in never pays the DDL cost.
+    """
+    import sqlite3 as _sqlite3
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # Detect whether rag_schema_version exists. Created by SqliteVecClient on
+    # its own, but this helper might run against a bare DB in tests.
+    has_schema_version = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
+    ).fetchone())
+    try:
+        conn.execute("BEGIN")
+        for _table_name, stmts in _TELEMETRY_DDL:
+            for stmt in stmts:
+                conn.execute(stmt)
+        if has_schema_version:
+            conn.executemany(
+                "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                [(name,) for name, _ in _TELEMETRY_DDL],
+            )
+        conn.execute("COMMIT")
+    except _sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
+
+
+# Columns that hold JSON payloads. Non-primitive values in a row dict are
+# auto-serialised when written through _sql_append_event / _sql_upsert.
+_JSON_COL_SUFFIX = "_json"
+
+
+def _sql_serialise_row(row: dict) -> dict:
+    """Return a shallow copy where dict/list values destined for `*_json`
+    columns become JSON strings. Primitives pass through untouched.
+
+    Writers can hand in `{"paths_json": [...]}` and we persist the list as
+    JSON text without the caller double-encoding. Scalars in JSON-named
+    columns are serialised too (a string `"[a, b]"` passed through would be
+    a bug; so json.dumps always normalises)."""
+    out: dict = {}
+    for k, v in row.items():
+        if v is None or isinstance(v, (int, float, str, bytes)):
+            out[k] = v
+            continue
+        if k.endswith(_JSON_COL_SUFFIX):
+            out[k] = json.dumps(v, ensure_ascii=False, sort_keys=True)
+        else:
+            # Non-primitive in a non-JSON column: caller bug; let sqlite3 raise
+            # InterfaceError so it surfaces loudly instead of silently stringifying.
+            out[k] = v
+    return out
+
+
+def _sql_append_event(conn, table: str, row: dict) -> int:
+    """INSERT `row` into `table`; return lastrowid.
+
+    Row keys map 1:1 to column names. Values for `*_json` columns may be
+    dict/list — they're json.dumps'd here. Single-row insert wrapped in an
+    implicit transaction (autocommit mode when isolation_level=None, else a
+    BEGIN/COMMIT cycle on an explicit transaction). The WAL file absorbs
+    the write; readers see it on next snapshot.
+    """
+    serialised = _sql_serialise_row(row)
+    cols = list(serialised.keys())
+    placeholders = ",".join("?" for _ in cols)
+    col_sql = ",".join(cols)
+    sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+    # Use `with conn` to bracket an explicit transaction when one isn't active.
+    # On isolation_level=None connections this is a no-op wrapper — the write
+    # commits immediately, which matches the append-only semantics we want.
+    cur = conn.execute(sql, [serialised[c] for c in cols])
+    conn.commit()
+    return cur.lastrowid
+
+
+def _sql_upsert(conn, table: str, row: dict, pk_cols: tuple) -> None:
+    """INSERT OR REPLACE `row` into `table`. Primary key is `pk_cols`.
+
+    For the state tables (rag_ambient_state, rag_brief_state,
+    rag_conversations_index, rag_feedback_golden, rag_feedback_golden_meta)
+    where the caller's mental model is "remember the latest view of this
+    entity" rather than "log an event".
+    """
+    serialised = _sql_serialise_row(row)
+    cols = list(serialised.keys())
+    placeholders = ",".join("?" for _ in cols)
+    col_sql = ",".join(cols)
+    sql = f"INSERT OR REPLACE INTO {table} ({col_sql}) VALUES ({placeholders})"
+    conn.execute(sql, [serialised[c] for c in cols])
+    conn.commit()
+
+
+def _sql_query_window(
+    conn,
+    table: str,
+    since_ts: str,
+    until_ts: str | None = None,
+    where: str | None = None,
+    params: tuple = (),
+) -> list:
+    """SELECT * FROM `table` WHERE ts >= since_ts [AND ts < until_ts] [AND <where>].
+
+    Returns a list of sqlite3.Row. Caller controls the window; the index on
+    `ts` keeps this fast up to ~millions of rows per table. `where` is raw
+    SQL appended with AND — only used from trusted internal call sites.
+    """
+    clauses = ["ts >= ?"]
+    args: list = [since_ts]
+    if until_ts is not None:
+        clauses.append("ts < ?")
+        args.append(until_ts)
+    if where:
+        clauses.append(f"({where})")
+        args.extend(params)
+    sql = f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} ORDER BY ts"
+    # Row factory is set per-query so callers upstream don't need to manage
+    # connection-level config. Restore to whatever was in place after.
+    prev_row_factory = conn.row_factory
+    try:
+        import sqlite3 as _sqlite3
+        conn.row_factory = _sqlite3.Row
+        return list(conn.execute(sql, args).fetchall())
+    finally:
+        conn.row_factory = prev_row_factory
+
+
+def _sql_count_since(conn, table: str, since_ts: str) -> int:
+    """Fast COUNT(*) using ix_<table>_ts."""
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE ts >= ?", (since_ts,)
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _sql_max_ts(conn, table: str) -> str | None:
+    """MAX(ts) — used by feedback_golden rebuild-on-gap detection and by
+    cutover rehearsal to confirm writes are reaching SQL.
+    """
+    row = conn.execute(f"SELECT MAX(ts) FROM {table}").fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+# ── SQL state store (T3: writer swap) ────────────────────────────────────────
+# Short-lived connection helper used by the flag-gated writer path. We do NOT
+# reuse the sqlite-vec singleton because (a) many writers run off-thread (log
+# queue, samplers, watchdogs) and serialising them through one handle would
+# need a lock; (b) SQLite WAL mode serialises writers anyway at the file
+# level, so N short-lived connections each doing a one-row INSERT is cheap;
+# (c) we avoid re-loading the sqlite-vec extension for telemetry writes that
+# never touch vec_*/meta_* tables. Each connection runs `_ensure_telemetry_
+# tables` (idempotent) so a process that hits the writer path before the
+# singleton was warmed still gets a valid schema.
+
+_SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+
+
+def _log_sql_state_error(event_type: str, **fields) -> None:
+    """Append an error record to sql_state_errors.jsonl. Never raises.
+
+    Separate file (not queries.jsonl / LOG_PATH) so a SQL-state bug doesn't
+    pollute analytics. Consumed only during the 7-day cutover observation
+    window; T10 removes both this sink and the fallback path.
+    """
+    try:
+        _SQL_STATE_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"),
+               "event": event_type, **fields}
+        with _SQL_STATE_ERROR_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _ragvec_state_conn():
+    """Open a short-lived sqlite3 connection to ragvec.db with WAL + busy
+    timeout, ensure telemetry tables exist, yield the conn, then close.
+
+    Intentionally does NOT load the sqlite-vec extension — telemetry writes
+    only touch rag_*/system_memory_metrics tables. Keeps the writer path
+    independent of the vec singleton and safe to call from any thread.
+    """
+    import sqlite3 as _sqlite3
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    conn = _sqlite3.connect(str(DB_PATH / "ragvec.db"),
+                            isolation_level=None, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_version ("
+            " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
+        )
+        _ensure_telemetry_tables(conn)
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Row mappers ──────────────────────────────────────────────────────────────
+# One mapper per writer. Each takes the live payload dict and returns a dict
+# whose keys match the target table's columns. Unknown fields go to
+# `extra_json` / `payload_json` (see T1 DDL). Mappers are deliberately thin
+# and duplicate-free from T2's migration script — T2 is a one-shot and
+# doesn't expose a reusable API.
+
+_QUERIES_COLS = ("ts", "cmd", "q", "session", "mode", "top_score", "t_retrieve",
+                 "t_gen", "answer_len", "citation_repaired", "critique_fired",
+                 "critique_changed")
+_QUERIES_JSON = (("variants", "variants_json"), ("paths", "paths_json"),
+                 ("scores", "scores_json"), ("filters", "filters_json"),
+                 ("bad_citations", "bad_citations_json"))
+
+
+def _map_queries_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in _QUERIES_COLS:
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    for src_key, dst_col in _QUERIES_JSON:
+        if src_key in ev and ev[src_key] is not None:
+            out[dst_col] = ev[src_key]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    # Coerce bool→int for SQLite-friendly ints
+    for bk in ("citation_repaired", "critique_fired", "critique_changed"):
+        if bk in out and isinstance(out[bk], bool):
+            out[bk] = int(out[bk])
+    known = set(_QUERIES_COLS) | {k for k, _ in _QUERIES_JSON}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    # q is NOT NULL — supply empty string as fallback rather than let INSERT fail
+    out.setdefault("q", "")
+    return out
+
+
+def _map_behavior_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "source", "event", "path", "query", "rank", "dwell_s"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("source", "unknown")
+    out.setdefault("event", "unknown")
+    known = {"ts", "source", "event", "path", "query", "rank", "dwell_s"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_feedback_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "turn_id", "rating", "q", "scope"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "paths" in ev and ev["paths"] is not None:
+        out["paths_json"] = ev["paths"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("rating", 0)
+    known = {"ts", "turn_id", "rating", "q", "scope", "paths"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_tune_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "samples", "seed", "n_cases", "delta",
+              "eval_hit5_singles", "eval_hit5_chains", "rolled_back"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    for src_key, dst_col in (("baseline", "baseline_json"),
+                              ("best", "best_json")):
+        if src_key in ev and ev[src_key] is not None:
+            out[dst_col] = ev[src_key]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "rolled_back" in out and isinstance(out["rolled_back"], bool):
+        out["rolled_back"] = int(out["rolled_back"])
+    known = {"ts", "cmd", "samples", "seed", "n_cases", "delta",
+             "eval_hit5_singles", "eval_hit5_chains", "rolled_back",
+             "baseline", "best"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_contradiction_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "subject_path", "helper_raw", "skipped"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "contradicts" in ev:
+        out["contradicts_json"] = ev["contradicts"] or []
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("subject_path", "")
+    return out
+
+
+def _map_ambient_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "path", "hash"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "cmd", "path", "hash"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["payload_json"] = extra
+    return out
+
+
+def _map_ambient_state_row(path: str, h: str, analyzed_at: float,
+                            payload: dict) -> dict:
+    out: dict = {"path": path, "hash": h, "analyzed_at": analyzed_at}
+    if payload:
+        out["payload_json"] = payload
+    return out
+
+
+def _map_brief_written_row(brief_type: str, brief_path: str,
+                            paths_cited: list, citations_by_section: dict) -> dict:
+    return {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "brief_type": brief_type,
+        "brief_path": brief_path,
+        "paths_cited_json": list(paths_cited or []),
+        "citations_by_section_json": citations_by_section or {},
+    }
+
+
+def _map_brief_state_row(brief_path: str, cited_path: str) -> dict:
+    """brief_state is an upsert keyed by (brief_path, cited_path). First write
+    sets first_ts = last_ts; subsequent writes to the same pair move last_ts
+    forward. The writer is called only after `_brief_state_seen` returns False
+    so in practice we never update — but the schema supports it."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    pair_key = f"{brief_path}\x00{cited_path}"
+    bt = "today" if brief_path.endswith("-evening.md") else (
+        "morning" if "/05-Reviews/" in brief_path or brief_path.startswith("05-Reviews/") else "unknown"
+    )
+    return {"pair_key": pair_key, "brief_type": bt, "kind": "cited",
+            "path": cited_path, "first_ts": ts, "last_ts": ts}
+
+
+def _map_wa_tasks_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "since", "chats", "items", "path"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "since", "chats", "items", "path"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_archive_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "min_age_days", "query_window_days", "folder",
+              "dry_run", "force", "gate", "n_candidates", "n_plan",
+              "n_applied", "n_skipped", "gated", "batch_path"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    for bk in ("dry_run", "force", "gated"):
+        if bk in out and isinstance(out[bk], bool):
+            out[bk] = int(out[bk])
+    known = {"ts", "cmd", "min_age_days", "query_window_days", "folder",
+             "dry_run", "force", "gate", "n_candidates", "n_plan",
+             "n_applied", "n_skipped", "gated", "batch_path"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_filing_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "path", "note", "folder", "confidence",
+              "upward_title", "upward_kind"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "neighbors" in ev and ev["neighbors"] is not None:
+        out["neighbors_json"] = ev["neighbors"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "cmd", "path", "note", "folder", "confidence",
+             "upward_title", "upward_kind", "neighbors"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_eval_row(entry: dict) -> dict:
+    out: dict = {"ts": entry.get("ts") or datetime.now().isoformat(timespec="seconds")}
+    sg = entry.get("singles") or {}
+    ch = entry.get("chains") or {}
+    for src_key, dst in (("hit5", "singles_hit5"), ("mrr", "singles_mrr"),
+                          ("n", "singles_n")):
+        if src_key in sg:
+            out[dst] = sg[src_key]
+    for src_key, dst in (("hit5", "chains_hit5"), ("mrr", "chains_mrr"),
+                          ("chain_success", "chains_chain_success"),
+                          ("turns", "chains_turns"), ("chains", "chains_n")):
+        if src_key in ch:
+            out[dst] = ch[src_key]
+    extra = {k: v for k, v in entry.items() if k not in {"ts", "singles", "chains"}}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_surface_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "n_pairs", "sim_threshold", "min_hops", "top",
+              "skip_young_days", "llm", "duration_ms"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "llm" in out and isinstance(out["llm"], bool):
+        out["llm"] = int(out["llm"])
+    known = {"ts", "cmd", "n_pairs", "sim_threshold", "min_hops", "top",
+             "skip_young_days", "llm", "duration_ms"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_proactive_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "kind", "sent", "reason"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "sent" in out and isinstance(out["sent"], bool):
+        out["sent"] = int(out["sent"])
+    known = {"ts", "kind", "sent", "reason"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_cpu_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "total_pct", "ncores", "interval_s"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "by_category" in ev:
+        out["by_category_json"] = ev["by_category"]
+    if "top" in ev:
+        out["top_json"] = ev["top"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "total_pct", "ncores", "interval_s", "by_category", "top"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_memory_row(ev: dict) -> dict:
+    out: dict = {"ts": ev.get("ts") or datetime.now().isoformat(timespec="seconds")}
+    if "total_mb" in ev and ev["total_mb"] is not None:
+        out["total_mb"] = ev["total_mb"]
+    if "by_category" in ev:
+        out["by_category_json"] = ev["by_category"]
+    if "top" in ev:
+        out["top_json"] = ev["top"]
+    if "vm" in ev:
+        out["vm_json"] = ev["vm"]
+    known = {"ts", "total_mb", "by_category", "top", "vm"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -2522,6 +3842,11 @@ class SqliteVecClient:
         )
         self._db.commit()
         self._collections: dict[str, SqliteVecCollection] = {}
+        # Feature-flagged SQL state-store foundation (T1 of JSONL→SQLite
+        # migration). OFF by default; gated by RAG_STATE_SQL=1 env var.
+        # Hot path (vec reads/writes) is untouched when flag is off.
+        if RAG_STATE_SQL:
+            _ensure_telemetry_tables(self._db)
 
     def get_or_create_collection(self, name: str, metadata=None):
         # metadata arg ignored (was `{"hnsw:space": "cosine"}`); sqlite-vec
@@ -5995,10 +7320,26 @@ def _surface_generate_reason(pair: dict) -> str:
 
 def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
     """Append-only log: una línea `surface_run` + N líneas `surface_pair`.
-    Mismo timestamp en todas para poder agrupar la corrida al leer."""
+    Mismo timestamp en todas para poder agrupar la corrida al leer. When
+    RAG_STATE_SQL=1, each row is an INSERT into rag_surface_log."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(
+                    conn, "rag_surface_log",
+                    _map_surface_row({"ts": ts, "cmd": "surface_run", **summary}),
+                )
+                for p in pairs:
+                    _sql_append_event(
+                        conn, "rag_surface_log",
+                        _map_surface_row({"ts": ts, "cmd": "surface_pair", **p}),
+                    )
+            return
+        except Exception as exc:
+            _log_sql_state_error("surface_sql_write_failed", err=repr(exc))
     try:
         SURFACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().isoformat(timespec="seconds")
         with SURFACE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(
                 {"ts": ts, "cmd": "surface_run", **summary},
@@ -6346,14 +7687,21 @@ def build_filing_proposal(
 def _filing_log_proposal(proposal: dict, decision: str | None = None) -> None:
     """Append-only log. Una línea por propuesta. `decision` es opcional —
     fase 1 no lo setea (dry-run), fase 2 lo setea con accept/reject/edit/skip
-    para alimentar el ranker.
+    para alimentar el ranker. When RAG_STATE_SQL=1, route to rag_filing_log.
     """
+    ts = datetime.now().isoformat(timespec="seconds")
+    event = {"ts": ts, "cmd": "filing_proposal", **proposal}
+    if decision is not None:
+        event["decision"] = decision
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_filing_log", _map_filing_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("filing_sql_write_failed", err=repr(exc))
     try:
         FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().isoformat(timespec="seconds")
-        event = {"ts": ts, "cmd": "filing_proposal", **proposal}
-        if decision is not None:
-            event["decision"] = decision
         with FILING_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
@@ -8321,16 +9669,24 @@ def _log_contradictions(
         }
         for c in (contrad or [])
     ]
+    event = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "cmd": "contradict_index",
+        "subject_path": subject_path,
+        "contradicts": entries,
+        "helper_raw": helper_raw,
+        "skipped": skipped,
+    }
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_contradictions",
+                                   _map_contradiction_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("contradictions_sql_write_failed", err=repr(exc))
     try:
         CONTRADICTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        event = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "cmd": "contradict_index",
-            "subject_path": subject_path,
-            "contradicts": entries,
-            "helper_raw": helper_raw,
-            "skipped": skipped,
-        }
         with CONTRADICTION_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
@@ -8487,11 +9843,19 @@ def _proactive_save_state(state: dict) -> None:
 
 
 def _proactive_log(event: dict) -> None:
+    full = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_proactive_log",
+                                   _map_proactive_row(full))
+            return
+        except Exception as exc:
+            _log_sql_state_error("proactive_sql_write_failed", err=repr(exc))
     try:
         PROACTIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with PROACTIVE_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
-                                **event}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(full, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -8822,14 +10186,41 @@ def _ambient_config() -> dict | None:
 
 
 def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
-    """Return True if we already analyzed this exact path+hash recently."""
+    """Return True if we already analyzed this exact path+hash recently.
+
+    When RAG_STATE_SQL=1: O(1) PK lookup on rag_ambient_state.path. Falls back
+    to JSONL tail-scan if the flag is off OR no SQL row was found (the JSONL
+    may still hold the pre-cutover analysis).
+    """
+    cutoff = time.time() - AMBIENT_DEDUP_WINDOW_SEC
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    "SELECT hash, analyzed_at FROM rag_ambient_state "
+                    "WHERE path = ?",
+                    (doc_id_prefix,),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        ts = float(row[1]) if row[1] is not None else 0.0
+                    except (TypeError, ValueError):
+                        ts = 0.0
+                    if row[0] == h and ts >= cutoff:
+                        return True
+                    # path row exists but hash differs or stale — still check
+                    # JSONL in case the legacy analysis is newer.
+        except Exception as exc:
+            _log_sql_state_error("ambient_state_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through.
+
     if not AMBIENT_STATE_PATH.is_file():
         return False
     try:
         lines = AMBIENT_STATE_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
         return False
-    cutoff = time.time() - AMBIENT_DEDUP_WINDOW_SEC
     for line in reversed(lines[-500:]):   # scan recent tail
         line = line.strip()
         if not line:
@@ -8850,11 +10241,22 @@ def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
 
 
 def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
+    analyzed_at = time.time()
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_upsert(conn, "rag_ambient_state",
+                            _map_ambient_state_row(doc_id_prefix, h,
+                                                    analyzed_at, payload),
+                            ("path",))
+            return
+        except Exception as exc:
+            _log_sql_state_error("ambient_state_sql_write_failed", err=repr(exc))
     try:
         AMBIENT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         rec = {
             "path": doc_id_prefix, "hash": h,
-            "analyzed_at": time.time(), **payload,
+            "analyzed_at": analyzed_at, **payload,
         }
         with AMBIENT_STATE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -8863,9 +10265,16 @@ def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
 
 
 def _ambient_log_event(event: dict) -> None:
+    e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_ambient", _map_ambient_row(e))
+            return
+        except Exception as exc:
+            _log_sql_state_error("ambient_sql_write_failed", err=repr(exc))
     try:
         AMBIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with AMBIENT_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     except Exception:
@@ -11432,21 +12841,32 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
 
     # Trend log — one line per `rag eval` run. Silent-fail so an unwritable
     # data dir never breaks the CLI. `/api/home._fetch_eval_trend` tails the
-    # last N entries to surface drift against the CLAUDE.md baseline.
+    # last N entries to surface drift against the CLAUDE.md baseline. When
+    # RAG_STATE_SQL=1, route to rag_eval_runs via _sql_append_event.
     if singles_snap or chains_snap:
-        try:
-            EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            entry = {"ts": datetime.now().isoformat(timespec="seconds")}
-            if singles_snap:
-                entry["singles"] = singles_snap
-            if chains_snap:
-                entry["chains"] = chains_snap
-            if latency_snap:
-                entry["latency"] = latency_snap
-            with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        entry = {"ts": datetime.now().isoformat(timespec="seconds")}
+        if singles_snap:
+            entry["singles"] = singles_snap
+        if chains_snap:
+            entry["chains"] = chains_snap
+        if latency_snap:
+            entry["latency"] = latency_snap
+        _wrote_eval_sql = False
+        if RAG_STATE_SQL:
+            try:
+                with _ragvec_state_conn() as conn:
+                    _sql_append_event(conn, "rag_eval_runs",
+                                       _map_eval_row(entry))
+                _wrote_eval_sql = True
+            except Exception as exc:
+                _log_sql_state_error("eval_sql_write_failed", err=repr(exc))
+        if not _wrote_eval_sql:
+            try:
+                EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     if gate_failed:
         raise SystemExit(1)
@@ -11521,50 +12941,80 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
 
 
 def _behavior_augmented_cases(days: int = 14) -> list[dict]:
-    """Mine behavior.jsonl for implicit feedback — forms gold (query, path) tuples.
+    """Mine behavior events for implicit feedback — forms gold (query, path) tuples.
 
     Positive events (open/positive_implicit/save/kept) with a query field
     become positive cases (weight=0.5). Negative events (negative_implicit/
     deleted) with a query field become hard-negative cases. Conflicting (q,path)
     pairs where both pos and neg are observed are dropped entirely. Events
-    without a 'query' field (e.g. brief events) are skipped. Returns [] if
-    behavior.jsonl is missing or empty.
+    without a 'query' field (e.g. brief events) are skipped.
+
+    When RAG_STATE_SQL=1: read from rag_behavior with `ts >= since_ts`
+    (ISO-8601 14-day cutoff). Falls back to JSONL when SQL errors or the
+    table is empty during the 7-day cutover. T10 removes the JSONL fallback.
     """
-    if not BEHAVIOR_LOG_PATH.is_file():
-        return []
-    cutoff = time.time() - days * 86400
+    cutoff_ts = time.time() - days * 86400
+    since_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
     _POSITIVE = {"open", "positive_implicit", "save", "kept"}
     _NEGATIVE = {"negative_implicit", "deleted"}
     pos: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
     neg: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
-    try:
-        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in raw:
-        line = line.strip()
-        if not line:
-            continue
+
+    rows_iter: list = []
+    used_sql = False
+    if RAG_STATE_SQL:
         try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        # Filter by age — use "ts" field (ISO string) or skip if missing
-        ts_raw = ev.get("ts", "")
-        if ts_raw:
+            with _ragvec_state_conn() as conn:
+                sql_rows = _sql_query_window(conn, "rag_behavior", since_iso)
+            if sql_rows:
+                rows_iter = sql_rows
+                used_sql = True
+        except Exception as exc:
+            _log_sql_state_error("behavior_augmented_cases_sql_read_failed",
+                                  err=repr(exc))
+
+    if not used_sql:
+        if not BEHAVIOR_LOG_PATH.is_file():
+            return []
+        try:
+            raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                ev_ts = datetime.fromisoformat(ts_raw).timestamp()
-                if ev_ts < cutoff:
-                    continue
+                ev = json.loads(line)
             except Exception:
-                pass
-        query = (ev.get("query") or "").strip()
+                continue
+            rows_iter.append(ev)
+
+    for ev in rows_iter:
+        # Uniform accessor for sqlite3.Row + dict.
+        def _g(k):
+            try:
+                return ev[k]
+            except (KeyError, IndexError):
+                return None
+        # Filter by age — use "ts" field (ISO string) or skip if missing. For SQL
+        # rows the window filter already ran, but gate the dict path here.
+        if not used_sql:
+            ts_raw = _g("ts") or ""
+            if ts_raw:
+                try:
+                    ev_ts = datetime.fromisoformat(ts_raw).timestamp()
+                    if ev_ts < cutoff_ts:
+                        continue
+                except Exception:
+                    pass
+        query = (_g("query") or "").strip()
         if not query:
             continue
-        path = (ev.get("path") or "").strip()
+        path = (_g("path") or "").strip()
         if not path:
             continue
-        event = ev.get("event", "")
+        event = _g("event") or ""
         norm_q = " ".join(query.lower().split())
         key = (norm_q, path)
         if event in _POSITIVE:
@@ -11680,9 +13130,16 @@ def _coordinate_refine(
 
 
 def _log_tune_event(event: dict) -> None:
+    ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_tune", _map_tune_row(ev))
+            return
+        except Exception as exc:
+            _log_sql_state_error("tune_sql_write_failed", err=repr(exc))
     try:
         TUNE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with TUNE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
     except Exception:
@@ -18867,18 +20324,29 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
     _wa_tasks_save_state(state)
 
     # Append to log for analytics / debugging.
-    try:
-        WA_TASKS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with WA_TASKS_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": now.isoformat(timespec="seconds"),
-                "since": since.isoformat(timespec="seconds"),
-                "chats": len(by_chat),
-                "items": n_new,
-                "path": str(note_path.relative_to(VAULT_PATH)),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    _wa_log_event = {
+        "ts": now.isoformat(timespec="seconds"),
+        "since": since.isoformat(timespec="seconds"),
+        "chats": len(by_chat),
+        "items": n_new,
+        "path": str(note_path.relative_to(VAULT_PATH)),
+    }
+    _wrote_wa_sql = False
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_wa_tasks",
+                                   _map_wa_tasks_row(_wa_log_event))
+            _wrote_wa_sql = True
+        except Exception as exc:
+            _log_sql_state_error("wa_tasks_sql_write_failed", err=repr(exc))
+    if not _wrote_wa_sql:
+        try:
+            WA_TASKS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with WA_TASKS_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(_wa_log_event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     rel = note_path.relative_to(VAULT_PATH)
     verb = "creado" if created else "actualizado"
@@ -19315,9 +20783,17 @@ def _append_archive_batch(batch_path: Path, entry: dict) -> None:
 
 
 def _log_archive_event(event: dict) -> None:
+    e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_archive_log",
+                                   _map_archive_row(e))
+            return
+        except Exception as exc:
+            _log_sql_state_error("archive_sql_write_failed", err=repr(exc))
     try:
         ARCHIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with ARCHIVE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     except Exception:
@@ -22426,6 +23902,489 @@ def _chroma_wal_checkpoint(dry_run: bool = False) -> dict:
     return {"ok": True, "before_bytes": before, "after_bytes": after}
 
 
+# ── SQL log rotation (T7) ────────────────────────────────────────────────────
+# Retention policies per log-style rag_* table. When RAG_STATE_SQL=1 and
+# `rag maintenance` runs, rows with ts < now - retention are DELETEd. State-
+# style tables (rag_ambient_state, rag_brief_state, rag_conversations_index,
+# rag_feedback_golden, rag_feedback_golden_meta) are keyed upserts and MUST
+# NOT appear here.
+#
+# Defaults chosen in T7:
+#   90d: queries, behavior             — ranker-vivo signal window
+#   60d: ambient, brief_written, wa_tasks, archive, filing, eval, surface,
+#        proactive — useful historic context but not ranker input
+#   30d: cpu_metrics, memory_metrics, system_memory_metrics — sampled every
+#        minute by the web sampler; bloat magnet otherwise
+#   ∞ : feedback, tune, contradictions — small, high-signal, intentionally
+#        kept (feedback golden depends on full rag_feedback history, tune
+#        history feeds `rag dashboard`, contradictions are audit).
+#
+# Tables explicitly NOT rotated (empty tuple): retained forever.
+_SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
+    ("rag_queries", 90),
+    ("rag_behavior", 90),
+    ("rag_ambient", 60),
+    ("rag_brief_written", 60),
+    ("rag_wa_tasks", 60),
+    ("rag_archive_log", 60),
+    ("rag_filing_log", 60),
+    ("rag_eval_runs", 60),
+    ("rag_surface_log", 60),
+    ("rag_proactive_log", 60),
+    ("rag_cpu_metrics", 30),
+    ("rag_memory_metrics", 30),
+    ("system_memory_metrics", 30),
+)
+
+# Tables that upsert on a PK instead of appending log rows. Listed here both
+# for the rollback DROP loop and as documentation of the no-rotate contract.
+_SQL_STATE_TABLES: tuple[str, ...] = (
+    "rag_ambient_state",
+    "rag_brief_state",
+    "rag_conversations_index",
+    "rag_feedback_golden",
+    "rag_feedback_golden_meta",
+)
+
+# Log-style tables that are kept forever (no rotation row). Auditable in
+# `test_rotation_different_retentions_per_table` — their row count must not
+# decrease after rotation.
+_SQL_KEEP_ALL_TABLES: tuple[str, ...] = (
+    "rag_feedback",
+    "rag_tune",
+    "rag_contradictions",
+)
+
+# VACUUM gate: page_count * page_size must exceed last_vacuum_size by this
+# delta before we pay the cost. ~500 MB matches the T4 spec — VACUUM serialises
+# the whole DB and should only run weekly at most.
+_VACUUM_DELTA_BYTES = 500 * 1024 * 1024
+
+# Key in rag_feedback_golden_meta for the last-vacuum sentinel. Reuses the
+# existing meta table to avoid schema churn during the cutover; the key
+# namespace ("vacuum_*") is disjoint from the feedback-golden keys.
+_VACUUM_META_KEY_BYTES = "vacuum_last_bytes"
+_VACUUM_META_KEY_TS = "vacuum_last_ts"
+
+
+def _sql_rotate_log_tables(*, dry_run: bool = False,
+                            now_ts: float | None = None) -> dict:
+    """DELETE old rows from rotatable log tables + optionally VACUUM.
+
+    Returns
+    -------
+    {
+      "rows_deleted": {table: int, ...},
+      "wal_checkpoint": {ok: bool, before_bytes: int, after_bytes: int},
+      "vacuum_ran": bool,
+      "vacuum_before_bytes": int | None,
+      "vacuum_after_bytes": int | None,
+    }
+
+    Only touches rows matching the retention policy; state tables and
+    keep-all tables are untouched. Safe under dry_run — no DELETE/VACUUM
+    runs but the cutoff-derived counts are reported so operators can see
+    what a live run would do.
+    """
+    import sqlite3 as _sqlite
+    from datetime import datetime as _dt, timedelta as _td
+
+    sqlite_path = DB_PATH / "ragvec.db"
+    out: dict = {
+        "rows_deleted": {},
+        "wal_checkpoint": None,
+        "vacuum_ran": False,
+        "vacuum_before_bytes": None,
+        "vacuum_after_bytes": None,
+    }
+    if not sqlite_path.is_file():
+        out["skipped"] = "no sqlite file"
+        return out
+
+    # Use a dedicated connection — telemetry writers use short-lived conns
+    # anyway, so briefly exclusive VACUUM can fight a writer. busy_timeout
+    # is generous (30s) because rotation is unattended.
+    now = now_ts if now_ts is not None else time.time()
+    try:
+        conn = _sqlite.connect(str(sqlite_path), timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
+    except _sqlite.Error as e:
+        out["skipped"] = f"connect failed: {e}"
+        return out
+
+    try:
+        # Figure out which tables exist — skipping silently lets maintenance
+        # run on a pre-T1 DB without crashing.
+        existing = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        for table, days in _SQL_ROTATION_POLICY:
+            if table not in existing:
+                continue
+            cutoff_iso = _dt.fromtimestamp(now - days * 86400).isoformat(
+                timespec="seconds"
+            )
+            if dry_run:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE ts < ?", (cutoff_iso,)
+                ).fetchone()
+                out["rows_deleted"][table] = int(row[0] if row else 0)
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE ts < ?", (cutoff_iso,)
+                )
+                out["rows_deleted"][table] = cur.rowcount or 0
+
+        if not dry_run:
+            conn.commit()
+
+        # WAL checkpoint once after all deletes — cheaper than N checkpoints.
+        wal_path = DB_PATH / "ragvec.db-wal"
+        before_wal = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        if not dry_run:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.commit()
+                after_wal = sqlite_path.stat().st_size + (
+                    wal_path.stat().st_size if wal_path.is_file() else 0
+                )
+                out["wal_checkpoint"] = {
+                    "ok": True,
+                    "before_bytes": before_wal,
+                    "after_bytes": after_wal,
+                }
+            except _sqlite.Error as e:
+                out["wal_checkpoint"] = {"ok": False, "reason": str(e)}
+        else:
+            out["wal_checkpoint"] = {
+                "ok": True,
+                "before_bytes": before_wal,
+                "after_bytes": before_wal,
+                "dry_run": True,
+            }
+
+        # Conditional VACUUM — gated by delta since last vacuum.
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        current_bytes = page_count * page_size
+        last_bytes_row = None
+        if "rag_feedback_golden_meta" in existing:
+            last_bytes_row = conn.execute(
+                "SELECT v FROM rag_feedback_golden_meta WHERE k=?",
+                (_VACUUM_META_KEY_BYTES,),
+            ).fetchone()
+        last_bytes = int(last_bytes_row[0]) if last_bytes_row and last_bytes_row[0] else 0
+        delta = current_bytes - last_bytes
+        should_vacuum = delta >= _VACUUM_DELTA_BYTES
+
+        if should_vacuum and not dry_run:
+            out["vacuum_before_bytes"] = current_bytes
+            # VACUUM can't run inside a transaction.
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            new_page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            new_page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            new_bytes = new_page_count * new_page_size
+            out["vacuum_ran"] = True
+            out["vacuum_after_bytes"] = new_bytes
+            # Persist sentinel so we don't VACUUM again until another delta.
+            if "rag_feedback_golden_meta" in existing:
+                now_iso = _dt.fromtimestamp(now).isoformat(timespec="seconds")
+                conn.execute(
+                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                    (_VACUUM_META_KEY_BYTES, str(new_bytes)),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                    (_VACUUM_META_KEY_TS, now_iso),
+                )
+                conn.commit()
+        elif should_vacuum and dry_run:
+            out["vacuum_ran"] = False
+            out["vacuum_would_run"] = True
+            out["vacuum_before_bytes"] = current_bytes
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
+
+
+def _cleanup_bak_files(*, dry_run: bool = False,
+                        max_age_days: int = 30,
+                        now_ts: float | None = None) -> dict:
+    """Delete migration-era `*.bak.<unix_ts>` files older than max_age_days.
+
+    T2's migration script renames each legacy source to `name.bak.<unix_ts>`.
+    After the 30-day cutover observation window the originals are unneeded
+    and just waste disk. We parse the unix ts suffix directly rather than
+    stat — the filename IS the canonical migration time, stat.mtime can drift
+    under rsync/iCloud/etc.
+
+    Filenames that don't match `*.bak.<digits>` are ignored (including
+    legacy `.bak`, `.bak.notanumber`, or user-created `.baktemp`).
+
+    Returns
+    -------
+    {"deleted": int, "bytes_freed": int, "skipped_non_bak": int}
+    """
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    out = {"deleted": 0, "bytes_freed": 0, "skipped_non_bak": 0}
+    if not state_dir.is_dir():
+        return out
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - max_age_days * 86400
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        # Must match .*\.bak\.<digits>$
+        name = f.name
+        try:
+            idx = name.rindex(".bak.")
+        except ValueError:
+            continue
+        suffix = name[idx + len(".bak."):]
+        if not suffix.isdigit():
+            out["skipped_non_bak"] += 1
+            continue
+        try:
+            file_ts = int(suffix)
+        except ValueError:
+            out["skipped_non_bak"] += 1
+            continue
+        if file_ts >= cutoff:
+            continue  # still fresh
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+        if dry_run:
+            out["deleted"] += 1
+            out["bytes_freed"] += size
+        else:
+            try:
+                os.unlink(f)
+                out["deleted"] += 1
+                out["bytes_freed"] += size
+            except OSError:
+                continue
+    return out
+
+
+# ── Rollback subcommand helpers (T7) ─────────────────────────────────────────
+# `rag maintenance --rollback-state-migration` restores the JSONL baseline
+# in case the SQL cutover misbehaves within the 30-day observation window.
+# The inverse of T2's migration: rename each `name.bak.<ts>` back to `name`,
+# drop every rag_*/system_memory_metrics table, remove the schema_version
+# rows, checkpoint the WAL + VACUUM.
+#
+# Safety: refuses to run when `com.fer.obsidian-rag-*` launchd services have
+# live pids — a writer mid-transaction against a table we're about to drop
+# would cause data loss. `--force` bypasses the service check and the no-bak
+# refusal; it is NOT a free pass for the DROP TABLE loop which always runs.
+
+_ROLLBACK_TABLES: tuple[str, ...] = tuple(
+    name for name, _ in _TELEMETRY_DDL
+)
+
+
+def _pgrep_obsidian_rag() -> list[str]:
+    """Return list of pids matching `com.fer.obsidian-rag` launchd services.
+
+    Same logic as scripts/migrate_state_to_sqlite.py::_check_running_services
+    but inlined here so maintenance doesn't import the migration script.
+    """
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["pgrep", "-f", "com.fer.obsidian-rag"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (_sp.TimeoutExpired, FileNotFoundError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [line for line in out.stdout.split() if line.strip()]
+
+
+def _find_bak_files_for_rollback(*, max_age_days: int = 30,
+                                  now_ts: float | None = None) -> dict[str, Path]:
+    """Scan state_dir for `.bak.<ts>` files newer than max_age_days.
+
+    Returns a {original_path_as_str → newest_bak_path} mapping so the caller
+    restores exactly one bak per source. When multiple baks exist (e.g. a
+    user re-ran the migration twice) the most recent ts wins — the oldest
+    baks represent an intermediate state we don't want to revert to.
+    """
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    if not state_dir.is_dir():
+        return {}
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - max_age_days * 86400
+    # source_path → (ts, bak_path) to pick newest-wins
+    best: dict[str, tuple[int, Path]] = {}
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        try:
+            idx = name.rindex(".bak.")
+        except ValueError:
+            continue
+        suffix = name[idx + len(".bak."):]
+        if not suffix.isdigit():
+            continue
+        try:
+            file_ts = int(suffix)
+        except ValueError:
+            continue
+        if file_ts < cutoff:
+            continue  # older than window — nothing to restore to
+        original_name = name[:idx]
+        prev = best.get(original_name)
+        if prev is None or file_ts > prev[0]:
+            best[original_name] = (file_ts, f)
+    return {orig: p for orig, (_, p) in best.items()}
+
+
+def _rollback_state_migration(*, force: bool = False,
+                               now_ts: float | None = None) -> dict:
+    """Restore .bak.<ts> originals + drop rag_* tables.
+
+    Returns
+    -------
+    {
+      "ok": bool,
+      "refused": str | None,                # human reason, if refused
+      "files_restored": int,
+      "tables_dropped": list[str],
+      "bytes_reclaimed": int,
+      "wal_checkpoint": dict,
+      "vacuum_before_bytes": int,
+      "vacuum_after_bytes": int,
+    }
+    """
+    import sqlite3 as _sqlite
+
+    out: dict = {
+        "ok": False,
+        "refused": None,
+        "files_restored": 0,
+        "tables_dropped": [],
+        "bytes_reclaimed": 0,
+        "wal_checkpoint": None,
+        "vacuum_before_bytes": None,
+        "vacuum_after_bytes": None,
+    }
+
+    # 1. Preflight — services must be stopped.
+    pids = _pgrep_obsidian_rag()
+    if pids and not force:
+        out["refused"] = (
+            f"pgrep matched {len(pids)} com.fer.obsidian-rag pid(s): "
+            f"{' '.join(pids)}. Stop launchd services or pass --force."
+        )
+        return out
+
+    # 2. Preflight — at least one .bak.<ts> within the 30-day window must
+    # exist, otherwise we're restoring nothing and DROPs would be lossy.
+    bak_map = _find_bak_files_for_rollback(now_ts=now_ts)
+    if not bak_map and not force:
+        out["refused"] = (
+            "No *.bak.<unix_ts> files found within the 30-day window. "
+            "Nothing to restore to — pass --force to DROP tables anyway."
+        )
+        return out
+
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+
+    # 3. Restore files. os.replace is atomic; if the original still exists
+    # it's overwritten (expected — T3 writers may have been running in
+    # dual-write mode or before the flag was flipped off).
+    for original_name, bak_path in bak_map.items():
+        dest = state_dir / original_name
+        try:
+            os.replace(bak_path, dest)
+            out["files_restored"] += 1
+        except OSError as e:
+            _log_sql_state_error("rollback_restore_failed",
+                                  src=str(bak_path), dst=str(dest), err=repr(e))
+
+    # 4. DROP rag_* tables in one transaction + clear schema_version rows.
+    sqlite_path = DB_PATH / "ragvec.db"
+    if sqlite_path.is_file():
+        wal_path = DB_PATH / "ragvec.db-wal"
+        before_bytes = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        try:
+            conn = _sqlite.connect(str(sqlite_path), timeout=30.0)
+            conn.execute("PRAGMA busy_timeout=30000")
+        except _sqlite.Error as e:
+            out["refused"] = f"connect failed: {e}"
+            return out
+        try:
+            existing = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            conn.execute("BEGIN")
+            dropped: list[str] = []
+            for t in _ROLLBACK_TABLES:
+                if t in existing:
+                    conn.execute(f"DROP TABLE IF EXISTS {t}")
+                    dropped.append(t)
+            # Remove schema_version entries for the dropped tables.
+            if "rag_schema_version" in existing and dropped:
+                conn.executemany(
+                    "DELETE FROM rag_schema_version WHERE table_name=?",
+                    [(t,) for t in dropped],
+                )
+            conn.execute("COMMIT")
+            out["tables_dropped"] = dropped
+
+            # Checkpoint + VACUUM to reclaim pages. VACUUM rebuilds the db
+            # file so the tables actually release their pages (DROP alone
+            # only marks pages as free).
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+            # Sentinel: re-read size BEFORE vacuum so the reclaim metric
+            # reflects the DROP+VACUUM combo, not just WAL truncation.
+            out["vacuum_before_bytes"] = sqlite_path.stat().st_size
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            out["vacuum_after_bytes"] = sqlite_path.stat().st_size
+            out["wal_checkpoint"] = {"ok": True,
+                                       "before_bytes": before_bytes,
+                                       "after_bytes": sqlite_path.stat().st_size}
+        except _sqlite.Error as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            out["refused"] = f"sqlite error: {e}"
+            return out
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        after_bytes = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        out["bytes_reclaimed"] = max(0, before_bytes - after_bytes)
+
+    out["ok"] = True
+    return out
+
+
 def run_maintenance(
     *,
     dry_run: bool = False,
@@ -22505,22 +24464,40 @@ def run_maintenance(
         except Exception as e:
             results["feedback_golden_error"] = str(e)
 
-    # 6. JSONL log rotation
+    # 6. Log rotation.
+    # When RAG_STATE_SQL=1 the JSONL files are no-longer written (T3 swap),
+    # so we run SQL-aware rotation against the rag_* tables + clean up the
+    # one-shot `.bak.<ts>` migration artefacts. When the flag is off we keep
+    # the legacy JSONL rotation path unchanged.
     if not skip_logs:
-        rotated = {}
-        for label, path in _JSONL_LOG_PATHS:
-            if dry_run:
-                try:
-                    sz = path.stat().st_size if path.is_file() else 0
-                    if sz >= _JSONL_ROTATE_BYTES:
-                        rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
-                except OSError:
-                    pass
-            else:
-                r = _rotate_jsonl(path)
-                if r:
-                    rotated[label] = r
-        results["log_rotation"] = rotated
+        if RAG_STATE_SQL:
+            try:
+                results["sql_rotation"] = _sql_rotate_log_tables(dry_run=dry_run)
+            except Exception as e:
+                results["sql_rotation_error"] = str(e)
+            try:
+                results["bak_cleanup"] = _cleanup_bak_files(dry_run=dry_run)
+            except Exception as e:
+                results["bak_cleanup_error"] = str(e)
+            # Keep JSONL rotation section empty for renderer compatibility so
+            # downstream callers that already branch on "log_rotation" don't
+            # explode when the flag is on.
+            results["log_rotation"] = {}
+        else:
+            rotated = {}
+            for label, path in _JSONL_LOG_PATHS:
+                if dry_run:
+                    try:
+                        sz = path.stat().st_size if path.is_file() else 0
+                        if sz >= _JSONL_ROTATE_BYTES:
+                            rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
+                    except OSError:
+                        pass
+                else:
+                    r = _rotate_jsonl(path)
+                    if r:
+                        rotated[label] = r
+            results["log_rotation"] = rotated
 
     # 7. Ignored notes orphans
     if dry_run:
@@ -22630,11 +24607,66 @@ def run_maintenance(
 @click.option("--skip-logs", is_flag=True, help="Saltear rotación de logs")
 @click.option("--verbose", "-v", is_flag=True, help="Mostrar detalles de cada paso")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON (para cron/scripts)")
-def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool, as_json: bool):
+@click.option("--rollback-state-migration", "rollback_state", is_flag=True,
+               help="Escape hatch: restaurar .bak.<ts> originales + dropear rag_* tables (T7)")
+@click.option("--force", is_flag=True,
+               help="Bypass safety gates en --rollback-state-migration")
+def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool,
+                 as_json: bool, rollback_state: bool, force: bool):
     """Mantenimiento integral: reindex, limpiar sesiones, podar caches, rotar logs, detectar dead notes.
 
     Seguro para correr periódicamente vía launchd/cron. Con --dry-run solo reporta.
+
+    --rollback-state-migration deshace T2: renombra cada `.bak.<unix_ts>` a su
+    nombre original + dropea las 21 rag_*/system_memory_metrics tables +
+    VACUUM. Refuses si hay launchd services corriendo (usa --force para
+    bypass) o si no hay .bak.<ts> dentro de la ventana de 30 días.
     """
+    if rollback_state:
+        if not as_json:
+            mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[red]ROLLBACK[/red]"
+            console.print(Rule(title=f"[bold cyan]State Migration Rollback[/bold cyan] {mode}",
+                                style="cyan"))
+            console.print()
+        if dry_run:
+            # Dry-run semantics: report what the rollback would touch without
+            # renaming or dropping anything.
+            pids = _pgrep_obsidian_rag()
+            bak_map = _find_bak_files_for_rollback()
+            summary = {
+                "would_refuse": bool(pids and not force) or (not bak_map and not force),
+                "running_pids": pids,
+                "bak_files_found": len(bak_map),
+                "tables_would_drop": [t for t in _ROLLBACK_TABLES],
+            }
+            if as_json:
+                click.echo(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+                return
+            if summary["would_refuse"]:
+                if pids and not force:
+                    console.print(f"  [red]Refused:[/red] {len(pids)} launchd service(s) running — "
+                                   "stop services or pass --force.")
+                if not bak_map and not force:
+                    console.print("  [red]Refused:[/red] no .bak.<unix_ts> files within 30-day window — "
+                                   "nothing to restore to (pass --force to DROP anyway).")
+            console.print(f"  [bold].bak.<ts> files:[/bold] {len(bak_map)} would be restored")
+            console.print(f"  [bold]Tables would drop:[/bold] {len(summary['tables_would_drop'])}")
+            return
+        result = _rollback_state_migration(force=force)
+        if as_json:
+            click.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return
+        if not result["ok"]:
+            console.print(f"  [red]Refused:[/red] {result.get('refused', 'unknown')}")
+            raise click.exceptions.Exit(1)
+        mb = result.get("bytes_reclaimed", 0) / (1024 * 1024)
+        console.print(f"  [bold]Files restored:[/bold] {result['files_restored']}")
+        console.print(f"  [bold]Tables dropped:[/bold] {len(result['tables_dropped'])}"
+                       f" [dim]({', '.join(result['tables_dropped'][:4])}"
+                       f"{', …' if len(result['tables_dropped']) > 4 else ''})[/dim]")
+        console.print(f"  [bold]Disk reclaimed:[/bold] {mb:.1f} MB")
+        return
+
     if not as_json:
         mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
         console.print(Rule(title=f"[bold cyan]Maintenance[/bold cyan] {mode}", style="cyan"))
@@ -22720,8 +24752,53 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
     if rotated:
         for label, detail in rotated.items():
             console.print(f"  [bold]Log rotation:[/bold] {label} — {detail}")
-    else:
+    elif not RAG_STATE_SQL:
         console.print("  [bold]Log rotation:[/bold] [dim]all under threshold[/dim]")
+
+    # ── SQL log rotation (flag ON) ──
+    sql_rot = results.get("sql_rotation") or {}
+    if sql_rot:
+        rows = sql_rot.get("rows_deleted", {}) or {}
+        total = sum(rows.values())
+        verb = "would delete" if dry_run else "deleted"
+        if total:
+            console.print(f"  [bold]SQL rotation:[/bold] [yellow]{verb} {total} rows[/yellow] "
+                           f"across {sum(1 for v in rows.values() if v)} tables")
+            if verbose:
+                for t, n in sorted(rows.items(), key=lambda x: -x[1]):
+                    if n:
+                        console.print(f"    [dim]{t}: {n}[/dim]")
+        else:
+            console.print("  [bold]SQL rotation:[/bold] [dim]no rows past retention[/dim]")
+        wal = sql_rot.get("wal_checkpoint") or {}
+        if wal.get("ok"):
+            b = wal.get("before_bytes", 0) / (1024 * 1024)
+            a = wal.get("after_bytes", 0) / (1024 * 1024)
+            if dry_run:
+                console.print(f"  [bold]SQL WAL:[/bold] [dim]{b:.1f} MB (dry-run)[/dim]")
+            else:
+                console.print(f"  [bold]SQL WAL:[/bold] checkpoint {b:.1f} → {a:.1f} MB")
+        if sql_rot.get("vacuum_ran"):
+            bv = (sql_rot.get("vacuum_before_bytes") or 0) / (1024 * 1024)
+            av = (sql_rot.get("vacuum_after_bytes") or 0) / (1024 * 1024)
+            console.print(f"  [bold]VACUUM:[/bold] ran {bv:.1f} → {av:.1f} MB")
+        elif sql_rot.get("vacuum_would_run"):
+            console.print("  [bold]VACUUM:[/bold] [yellow]would run (delta ≥ 500 MB)[/yellow]")
+        else:
+            console.print("  [bold]VACUUM:[/bold] [dim]skipped (delta < 500 MB)[/dim]")
+    elif "sql_rotation_error" in results:
+        console.print(f"  [bold]SQL rotation:[/bold] [red]error: {results['sql_rotation_error']}[/red]")
+
+    # ── Migration .bak cleanup ──
+    bak = results.get("bak_cleanup") or {}
+    if bak:
+        n = bak.get("deleted", 0)
+        mb = bak.get("bytes_freed", 0) / (1024 * 1024)
+        if n:
+            verb = "would purge" if dry_run else "purged"
+            console.print(f"  [bold].bak cleanup:[/bold] [yellow]{verb} {n} files ({mb:.1f} MB)[/yellow]")
+        else:
+            console.print("  [bold].bak cleanup:[/bold] [dim]none >30d[/dim]")
 
     # ── Ignored notes ──
     ign = results.get("ignored_pruned", 0)
@@ -22901,11 +24978,44 @@ def _pendientes_extract_loops_fast(
 def _pendientes_recent_contradictions(
     log_path: Path, now: datetime, days: int = 14, max_items: int = 5,
 ) -> list[dict]:
-    """Index-time contradictions from the last `days`. Newest-first."""
+    """Index-time contradictions from the last `days`. Newest-first.
+
+    When RAG_STATE_SQL=1: read from rag_contradictions. Fallback to JSONL scan
+    on empty/error during the 7-day cutover window.
+    """
+    cutoff = now - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat(timespec="seconds")
+    out: list[dict] = []
+
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+            if rows:
+                # Newest-first: rows come ordered by ts ASC; reverse.
+                for r in reversed(rows):
+                    try:
+                        contradicts = json.loads(r["contradicts_json"]) \
+                            if r["contradicts_json"] else []
+                    except Exception:
+                        contradicts = []
+                    if not contradicts:
+                        continue
+                    out.append({
+                        "subject_path": r["subject_path"] or "",
+                        "targets": contradicts[:3],
+                        "ts": r["ts"],
+                    })
+                    if len(out) >= max_items:
+                        break
+                return out
+        except Exception as exc:
+            _log_sql_state_error("contradictions_sql_read_failed",
+                                  err=repr(exc))
+            # Fall through.
+
     if not log_path.is_file():
         return []
-    cutoff = now - timedelta(days=days)
-    out: list[dict] = []
     try:
         lines = log_path.read_text(encoding="utf-8").splitlines()
     except OSError:

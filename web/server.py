@@ -37,6 +37,12 @@ from rag import (  # noqa: E402
     EVAL_LOG_PATH,
     LOG_PATH,
     _LOG_QUEUE,
+    RAG_STATE_SQL,
+    _log_sql_state_error,
+    _map_cpu_row,
+    _map_memory_row,
+    _ragvec_state_conn,
+    _sql_append_event,
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
@@ -90,6 +96,13 @@ from rag import (  # noqa: E402
 )
 
 from web.conversation_writer import write_turn, TurnData  # noqa: E402
+from web.tools import (  # noqa: E402
+    CHAT_TOOLS,
+    CHAT_TOOL_OPTIONS,
+    PARALLEL_SAFE,
+    TOOL_FNS,
+    _WEB_TOOL_ADDENDUM,
+)
 
 _CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
 
@@ -2656,6 +2669,18 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     "cached": True,
                 })
                 print(f"[chat-cache] HIT {_cache_key} total={_cached_total_ms}ms", flush=True)
+                # Emit a timing schema-stable line so downstream parsers
+                # (tool_rounds/tool_ms/tool_names) don't see an NaN on
+                # cache-hit turns. Values are 0/empty — tool loop skipped.
+                print(
+                    f"[chat-timing] model={_resolve_web_chat_model()} retrieve=0ms "
+                    f"reform=0ms reform_outcome=skipped q_words={len(question.split())} "
+                    f"wa=0ms llm_prefill=0ms llm_decode=0ms ttft={_cached_total_ms}ms "
+                    f"total={_cached_total_ms}ms ctx_chars=0 tokens≈{len(_text.split())} "
+                    f"confidence={_cached['top_score']:.3f} variants=0 "
+                    f"tool_rounds=0 tool_ms=0 tool_names= cached=1",
+                    flush=True,
+                )
                 # Todavía appendeamos al session history — la conversación continúa normal
                 append_turn(sess, {
                     "q": question,
@@ -2863,14 +2888,22 @@ def chat(req: ChatRequest) -> StreamingResponse:
             f"{_person_block}CONTEXTO:\n{context}\n\n"
             f"PREGUNTA: {question}\n\nRESPUESTA:"
         )
-        messages = (
-            [{"role": "system", "content": _WEB_SYSTEM_PROMPT}]
+        # Tool-deciding messages: include _WEB_TOOL_ADDENDUM as a second
+        # system message so it's byte-identical across tool-deciding calls
+        # (ollama prefix cache stays warm across rounds). The final
+        # streaming call below STRIPS the addendum + `tools=` param so its
+        # cache state matches the pre-tool-calling era byte-for-byte.
+        tool_messages: list[dict] = (
+            [
+                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                {"role": "system", "content": _WEB_TOOL_ADDENDUM},
+            ]
             + (history or [])
             + [{"role": "user", "content": user_content}]
         )
 
-        # Log context size for prefill analysis
-        _ctx_chars = sum(len(m.get("content","")) for m in messages)
+        # Log context size for prefill analysis (pre-tool expansion).
+        _ctx_chars = sum(len(m.get("content","")) for m in tool_messages)
 
         # Fast-path LLM options.
         # num_ctx: measured from web.log (75 timing rows, 2026-04-17):
@@ -2908,20 +2941,178 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # If prefill variance returns to 20s+ range, first suspect num_ctx
         # drift, not MPS contention.
 
-        parts: list[str] = []
-        stripper = _InlineCitationStripper()
         _web_model = _resolve_web_chat_model()
         print(
             f"[chat-model-keepalive] model={_web_model} keep_alive={OLLAMA_KEEP_ALIVE}"
             f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']}",
             flush=True,
         )
+
+        # ── ollama-native tool loop ───────────────────────────────────
+        # Up to 3 tool-deciding rounds against CHAT_TOOLS. Each round is a
+        # non-streaming ollama.chat with tools= set. If the LLM emits
+        # tool_calls we execute them (serial bucket first, then parallel
+        # bucket via ThreadPoolExecutor) and append `role:"tool"` messages
+        # before the next round. When tool_calls comes back empty we break
+        # out and fall through to the plain streaming call below.
+        #
+        # tool_rounds = rounds where ≥1 tool actually executed. When the
+        # LLM returns no tool_calls in round 1, tool_rounds stays 0 —
+        # that's "no tools needed".
+        _TOOL_ROUND_CAP = 3
+        tool_rounds = 0
+        tool_ms_total = 0
+        tool_names_called: list[str] = []
+
+        def _unwrap_args(args):
+            """command-r wraps args as {"tool_name":..., "parameters":{...}}.
+            Unwrap so we can call the Python function directly (copied from
+            rag.py `rag do`)."""
+            if isinstance(args, dict) and "parameters" in args and isinstance(args["parameters"], (dict, str)):
+                params = args["parameters"]
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except Exception:
+                        params = {}
+                args = params
+            if not isinstance(args, dict):
+                return {}
+            return {k: v for k, v in args.items() if v not in ("", None)}
+
+        try:
+            from concurrent.futures import ThreadPoolExecutor as _ToolExecutor
+            from concurrent.futures import as_completed as _as_completed
+            for _round_idx in range(_TOOL_ROUND_CAP):
+                _tr = ollama.chat(
+                    model=_web_model,
+                    messages=tool_messages,
+                    tools=CHAT_TOOLS,
+                    options=CHAT_TOOL_OPTIONS,
+                    stream=False,
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+                _tmsg = _tr.message
+                _tcalls = list(_tmsg.tool_calls or [])
+                # Persist the assistant turn so the LLM sees its own tool_calls
+                # when we come back around (and the final streaming call too).
+                tool_messages.append({
+                    "role": "assistant",
+                    "content": _tmsg.content or "",
+                    "tool_calls": [tc.model_dump() for tc in _tcalls],
+                })
+                if not _tcalls:
+                    break
+
+                # Split into serial (not parallel-safe) and parallel buckets.
+                _serial: list[tuple[str, dict]] = []
+                _parallel: list[tuple[str, dict]] = []
+                for _tc in _tcalls:
+                    _name = _tc.function.name
+                    _args = _unwrap_args(_tc.function.arguments or {})
+                    if _name in PARALLEL_SAFE:
+                        _parallel.append((_name, _args))
+                    else:
+                        _serial.append((_name, _args))
+
+                _round_tool_names: list[str] = []
+                _round_parallel_max_ms = 0
+                _round_serial_sum_ms = 0
+
+                # Serial bucket first — vault search is the gating signal.
+                for _name, _args in _serial:
+                    yield _sse("status", {"stage": "tool", "name": _name, "args": _args})
+                    _t_tool_start = time.perf_counter()
+                    _fn = TOOL_FNS.get(_name)
+                    try:
+                        if _fn is None:
+                            _out = f"Error: tool '{_name}' no existe"
+                        else:
+                            _ret = _fn(**_args)
+                            _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
+                    except Exception as _exc:
+                        _out = f"Error: {_exc}"
+                    _elapsed_ms = int((time.perf_counter() - _t_tool_start) * 1000)
+                    _round_serial_sum_ms += _elapsed_ms
+                    _round_tool_names.append(_name)
+                    yield _sse("status", {"stage": "tool_done", "name": _name, "ms": _elapsed_ms})
+                    tool_messages.append({
+                        "role": "tool",
+                        "name": _name,
+                        "content": _out,
+                    })
+
+                # Parallel bucket: emit all `tool` fan-out events first, then
+                # submit + wait. Per spec, tool_done events arrive as futures
+                # resolve (interleaved).
+                if _parallel:
+                    for _name, _args in _parallel:
+                        yield _sse("status", {"stage": "tool", "name": _name, "args": _args})
+
+                    def _exec_one(name_args):
+                        _name, _args = name_args
+                        _t0 = time.perf_counter()
+                        _fn = TOOL_FNS.get(_name)
+                        try:
+                            if _fn is None:
+                                _out = f"Error: tool '{_name}' no existe"
+                            else:
+                                _ret = _fn(**_args)
+                                _out = _ret if isinstance(_ret, str) else json.dumps(_ret, ensure_ascii=False)
+                        except Exception as _exc:
+                            _out = f"Error: {_exc}"
+                        return _name, _out, int((time.perf_counter() - _t0) * 1000)
+
+                    _ex = _ToolExecutor(max_workers=5)
+                    try:
+                        _futures = [_ex.submit(_exec_one, na) for na in _parallel]
+                        for _fut in _as_completed(_futures):
+                            _name, _out, _elapsed_ms = _fut.result()
+                            if _elapsed_ms > _round_parallel_max_ms:
+                                _round_parallel_max_ms = _elapsed_ms
+                            _round_tool_names.append(_name)
+                            yield _sse("status", {"stage": "tool_done", "name": _name, "ms": _elapsed_ms})
+                            tool_messages.append({
+                                "role": "tool",
+                                "name": _name,
+                                "content": _out,
+                            })
+                    finally:
+                        _ex.shutdown(wait=False)
+
+                if _round_tool_names:
+                    tool_rounds += 1
+                    tool_names_called.extend(_round_tool_names)
+                    # Critical-path ms this round = serial sum + parallel max.
+                    tool_ms_total += _round_serial_sum_ms + _round_parallel_max_ms
+            else:
+                # Round cap reached without the model emitting an empty
+                # tool_calls turn — nudge it to close out with what it has.
+                tool_messages.append({
+                    "role": "system",
+                    "content": "Alcanzado cap de herramientas; respondé con lo que tenés.",
+                })
+        except Exception as exc:
+            yield _sse("error", {"message": f"LLM falló: {exc}"})
+            return
+
+        # Final streaming answer call: strip _WEB_TOOL_ADDENDUM and `tools=`
+        # so the prefix cache for plain-text generation matches the pre
+        # tool-calling era byte-for-byte. We keep the full tool loop
+        # (assistant tool_calls + tool messages) so the LLM sees what it
+        # learned; without `tools=` ollama won't re-invoke anything.
+        final_messages = [m for m in tool_messages if not (
+            m.get("role") == "system" and m.get("content") == _WEB_TOOL_ADDENDUM
+        )]
+
+        parts: list[str] = []
+        stripper = _InlineCitationStripper()
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
             for chunk in ollama.chat(
                 model=_web_model,
-                messages=messages,
+                messages=final_messages,
                 options=_WEB_CHAT_OPTIONS,
                 stream=True,
                 keep_alive=OLLAMA_KEEP_ALIVE,
@@ -2963,6 +3154,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
             else "rewritten" if _reform_fired
             else "skipped"
         )
+        _tool_names_str = ",".join(tool_names_called)
         print(
             f"[chat-timing] model={_resolve_web_chat_model()} retrieve={_t_retrieve_ms}ms "
             f"reform={_t_reform_ms}ms reform_outcome={_reform_outcome} q_words={_q_words} "
@@ -2970,7 +3162,8 @@ def chat(req: ChatRequest) -> StreamingResponse:
             f"llm_decode={_t_llm_decode_ms}ms ttft={_t_ttft_ms}ms "
             f"total={_t_total_ms}ms ctx_chars={_ctx_chars} tokens≈{_tok_count} "
             f"confidence={result['confidence']:.3f} "
-            f"variants={len(result.get('query_variants',[]))}",
+            f"variants={len(result.get('query_variants',[]))} "
+            f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str}",
             flush=True,
         )
 
@@ -3130,10 +3323,156 @@ def dashboard_api(days: int = 30) -> dict:
 
 
 def _dashboard_compute(days: int = 30) -> dict:
-    """Aggregate all JSONL logs into dashboard metrics."""
-    import statistics
-    from collections import defaultdict
+    """Aggregate telemetry into dashboard metrics.
 
+    When RAG_STATE_SQL=1: pull rows from the rag_* SQL tables. Falls back to
+    JSONL scan on any exception during the cutover observation window (T10
+    removes the fallback). Flag OFF = JSONL-only, unchanged behaviour.
+    """
+    if RAG_STATE_SQL:
+        try:
+            return _dashboard_compute_sql(days)
+        except Exception as exc:
+            _log_sql_state_error("dashboard_sql_compute_failed", err=repr(exc))
+            # Fall through to JSONL during the 7-day cutover.
+    return _dashboard_compute_jsonl(days)
+
+
+# ── Dashboard event-row helpers ─────────────────────────────────────────────
+# The SQL and JSONL readers converge on a common "event dict" shape (matches
+# the JSONL line schema) before the aggregator runs, so only the data source
+# differs. `_dashboard_aggregate()` is the single source of truth for every
+# field the dashboard JS consumes.
+
+
+def _dashboard_sql_row_to_event(row, json_cols: tuple[str, ...] = ()) -> dict:
+    """Rehydrate a sqlite3.Row into the JSONL-style event dict.
+
+    - `*_json` columns whose base name (`_json` suffix stripped) is listed in
+      `json_cols` are decoded and re-keyed to their JSONL equivalent (e.g.
+      `paths_json` → `paths`).
+    - `extra_json` is decoded and its keys merged into the top level (never
+      overwriting an explicit column).
+    - Other `*_json` columns are decoded in place if `json_cols` doesn't map
+      them — safe default so aggregate callers never see raw JSON strings.
+    """
+    ev: dict = {}
+    try:
+        keys = row.keys()
+    except Exception:
+        return ev
+    for k in keys:
+        v = row[k]
+        if v is None:
+            continue
+        if k == "extra_json":
+            try:
+                extra = json.loads(v)
+                if isinstance(extra, dict):
+                    for ek, ev_val in extra.items():
+                        ev.setdefault(ek, ev_val)
+            except Exception:
+                pass
+            continue
+        if k.endswith("_json"):
+            base = k[:-5]
+            try:
+                decoded = json.loads(v)
+            except Exception:
+                decoded = None
+            target = base if base in json_cols else k
+            if decoded is not None:
+                ev[target] = decoded
+            continue
+        ev[k] = v
+    return ev
+
+
+def _dashboard_compute_sql(days: int = 30) -> dict:
+    """SQL-path reader: fetch rag_* rows since cutoff, normalise to JSONL-shape
+    event dicts, then call the shared aggregator.
+
+    Tables read: rag_queries, rag_feedback, rag_ambient, rag_contradictions,
+    rag_filing_log, rag_tune, rag_surface_log. `all_queries` is the unwindowed
+    snapshot of rag_queries (used only for the total_queries_all_time KPI).
+    """
+    from rag import _ragvec_state_conn, _sql_query_window  # local import keeps module-load light
+    cutoff = datetime.now() - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat(timespec="seconds")
+
+    # Well-earlier floor — we still need "all time" count + full feedback for
+    # corrective-miss/neg-reason surfacing (JSONL path uses the full file).
+    ancient_iso = "0000-01-01T00:00:00"
+
+    with _ragvec_state_conn() as conn:
+        q_rows_window = _sql_query_window(conn, "rag_queries", cutoff_iso)
+        # all_queries: full history — same semantics as JSONL (unbounded scan).
+        q_rows_all = _sql_query_window(conn, "rag_queries", ancient_iso)
+        fb_rows_all = _sql_query_window(conn, "rag_feedback", ancient_iso)
+        amb_rows = _sql_query_window(conn, "rag_ambient", cutoff_iso)
+        contra_rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+        filing_rows = _sql_query_window(conn, "rag_filing_log", cutoff_iso)
+        tune_rows = _sql_query_window(conn, "rag_tune", ancient_iso)
+        surface_rows = _sql_query_window(conn, "rag_surface_log", ancient_iso)
+
+    _Q_JSON = ("variants", "paths", "scores", "filters", "bad_citations")
+    _F_JSON = ("paths",)
+    _C_JSON = ("contradicts",)
+    _FIL_JSON = ("neighbors",)
+    _T_JSON = ("baseline", "best")
+
+    all_queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_all]
+    queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_window]
+    fb_entries = [_dashboard_sql_row_to_event(r, _F_JSON) for r in fb_rows_all]
+    # rag_ambient stores extra fields in `payload_json`, not `extra_json`.
+    ambient_entries: list[dict] = []
+    for r in amb_rows:
+        ev = {}
+        try:
+            keys = r.keys()
+        except Exception:
+            keys = []
+        for k in keys:
+            v = r[k]
+            if v is None:
+                continue
+            if k == "payload_json":
+                try:
+                    payload = json.loads(v)
+                    if isinstance(payload, dict):
+                        for pk, pv in payload.items():
+                            ev.setdefault(pk, pv)
+                except Exception:
+                    pass
+                continue
+            ev[k] = v
+        ambient_entries.append(ev)
+    contra_entries = [_dashboard_sql_row_to_event(r, _C_JSON) for r in contra_rows]
+    # Flatten `singles`/`chains` back onto each tune entry so the JSONL aggregator
+    # sees `baseline`/`best` dicts as-is.
+    tune_entries = [_dashboard_sql_row_to_event(r, _T_JSON) for r in tune_rows]
+    # Filing rows — add an implicit `cmd` marker so the aggregator counts them
+    # as filing events (it treats every entry in filing_recent as a filing).
+    filing_recent = [_dashboard_sql_row_to_event(r, _FIL_JSON) for r in filing_rows]
+    # Surface rows — aggregator counts events by `cmd in {"surface_pair","surface_run"}`,
+    # and rag_surface_log preserves `cmd` as a column.
+    surface_entries = [_dashboard_sql_row_to_event(r) for r in surface_rows]
+
+    return _dashboard_aggregate(
+        queries=queries,
+        all_queries=all_queries,
+        fb_entries=fb_entries,
+        ambient_entries=ambient_entries,
+        contra_entries=contra_entries,
+        filing_recent=filing_recent,
+        tune_entries=tune_entries,
+        surface_entries=surface_entries,
+        days=days,
+    )
+
+
+def _dashboard_compute_jsonl(days: int = 30) -> dict:
+    """Aggregate all JSONL logs into dashboard metrics."""
     data_dir = Path.home() / ".local/share/obsidian-rag"
     cutoff = datetime.now() - timedelta(days=days)
 
@@ -3150,6 +3489,64 @@ def _dashboard_compute(days: int = 30) -> dict:
             except Exception:
                 continue
         return out
+
+    def _ts_local(e: dict) -> datetime | None:
+        raw = e.get("ts") or e.get("timestamp")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return None
+
+    all_queries = _read_jsonl(data_dir / "queries.jsonl")
+    queries = [e for e in all_queries if (t := _ts_local(e)) and t >= cutoff]
+    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
+    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
+    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
+    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
+    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
+    filing_recent = [e for e in filing_entries if (t := _ts_local(e)) and t >= cutoff]
+    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
+
+    return _dashboard_aggregate(
+        queries=queries,
+        all_queries=all_queries,
+        fb_entries=fb_entries,
+        ambient_entries=ambient_entries,
+        contra_entries=contra_entries,
+        filing_recent=filing_recent,
+        tune_entries=tune_entries,
+        surface_entries=surface_entries,
+        days=days,
+    )
+
+
+def _dashboard_aggregate(
+    *,
+    queries: list[dict],
+    all_queries: list[dict],
+    fb_entries: list[dict],
+    ambient_entries: list[dict],
+    contra_entries: list[dict],
+    filing_recent: list[dict],
+    tune_entries: list[dict],
+    surface_entries: list[dict],
+    days: int,
+) -> dict:
+    """Build the full dashboard payload from normalised event dicts.
+
+    This is the shared body both the JSONL and SQL paths call with identical
+    semantics. The dashboard JS key-contract (`queries_per_day`, `hours`,
+    `cmds`, `sources`, `score_distribution`, `hot_topics`, `chat_keywords`,
+    `feedback`, etc.) is fixed here — don't drop keys without updating
+    web/static/dashboard.js.
+    """
+    import statistics
+    from collections import defaultdict
+
+    data_dir = Path.home() / ".local/share/obsidian-rag"
+    cutoff = datetime.now() - timedelta(days=days)
 
     def _ts(e: dict) -> datetime | None:
         raw = e.get("ts") or e.get("timestamp")
@@ -3168,9 +3565,6 @@ def _dashboard_compute(days: int = 30) -> dict:
         return round(s[min(idx, len(s) - 1)], 3)
 
     # ── Queries ──────────────────────────────────────────────────────
-    all_queries = _read_jsonl(data_dir / "queries.jsonl")
-    queries = [e for e in all_queries if (t := _ts(e)) and t >= cutoff]
-
     scores = [float(e["top_score"]) for e in queries if isinstance(e.get("top_score"), (int, float))]
     t_retrieves = [float(e["t_retrieve"]) for e in queries if isinstance(e.get("t_retrieve"), (int, float))]
     t_gens = [float(e["t_gen"]) for e in queries if isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0]
@@ -3234,7 +3628,7 @@ def _dashboard_compute(days: int = 30) -> dict:
         if q:
             words = q.lower().split()[:3]
             topics[" ".join(words)] += 1
-    hot_topics = sorted(topics.items(), key=lambda x: -x[1])[:5]
+    hot_topics = sorted(topics.items(), key=lambda x: -x[1])[:15]
 
     # Chat keyword cloud — per-word frequency over user-initiated queries
     # (chat/web/whatsapp), not ambient/eval synthetic traffic. Tokenises
@@ -3364,16 +3758,16 @@ def _dashboard_compute(days: int = 30) -> dict:
     }
 
     # ── Feedback ─────────────────────────────────────────────────────
-    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
-    fb_recent_window = [e for e in fb_entries if (t := _ts(e)) and t >= cutoff]
-    fb_pos = sum(1 for e in fb_recent_window if e.get("rating") == 1)
-    fb_neg = sum(1 for e in fb_recent_window if e.get("rating") == -1)
+    # fb_entries is the full-history feedback log (SQL or JSONL). Peer
+    # work on master added a windowed view for the KPI widget + all-time
+    # companions — keep both so the dashboard can show "last N days" and
+    # "all time" side-by-side.
+    fb_recent = [e for e in fb_entries if (t := _ts(e)) and t >= cutoff]
+    fb_pos = sum(1 for e in fb_recent if e.get("rating") == 1)
+    fb_neg = sum(1 for e in fb_recent if e.get("rating") == -1)
     fb_pos_all = sum(1 for e in fb_entries if e.get("rating") == 1)
     fb_neg_all = sum(1 for e in fb_entries if e.get("rating") == -1)
 
-    # Actionable feedback for RAG improvement (uses the *full* fb log, not windowed —
-    # negative signals are rare and we want all of them).
-    fb_recent = fb_recent_window
     neg_path_counts: dict[str, int] = defaultdict(int)
     pos_path_counts: dict[str, int] = defaultdict(int)
     for e in fb_entries:
@@ -3473,7 +3867,7 @@ def _dashboard_compute(days: int = 30) -> dict:
     }
 
     # ── Ambient ──────────────────────────────────────────────────────
-    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
+    # ambient_entries is already provided by the caller; filter to window here.
     ambient_recent = [e for e in ambient_entries if (t := _ts(e)) and t >= cutoff]
     ambient_wikilinks = sum(e.get("wikilinks_applied", 0) for e in ambient_recent)
     ambient_per_day: dict[str, int] = defaultdict(int)
@@ -3483,7 +3877,6 @@ def _dashboard_compute(days: int = 30) -> dict:
             ambient_per_day[t.strftime("%Y-%m-%d")] += 1
 
     # ── Contradictions ───────────────────────────────────────────────
-    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
     contra_recent = [e for e in contra_entries if (t := _ts(e)) and t >= cutoff]
     contra_found = [e for e in contra_recent if e.get("contradicts") and not e.get("skipped")]
     contra_per_day: dict[str, int] = defaultdict(int)
@@ -3493,16 +3886,13 @@ def _dashboard_compute(days: int = 30) -> dict:
             contra_per_day[t.strftime("%Y-%m-%d")] += 1
 
     # ── Surface ──────────────────────────────────────────────────────
-    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
     surface_pairs = [e for e in surface_entries if e.get("cmd") == "surface_pair"]
     surface_runs = [e for e in surface_entries if e.get("cmd") == "surface_run"]
 
     # ── Filing ───────────────────────────────────────────────────────
-    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
-    filing_recent = [e for e in filing_entries if (t := _ts(e)) and t >= cutoff]
+    # filing_recent is already windowed by the caller.
 
     # ── Tune ─────────────────────────────────────────────────────────
-    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
     tune_history = []
     for e in tune_entries:
         t = _ts(e)
@@ -3956,6 +4346,14 @@ def _memory_load_history() -> None:
 
 
 def _memory_persist(sample: dict) -> None:
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_memory_metrics",
+                                   _map_memory_row(sample))
+            return
+        except Exception as exc:
+            _log_sql_state_error("memory_sql_write_failed", err=repr(exc))
     try:
         _MEMORY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _MEMORY_STATE_PATH.open("a", encoding="utf-8") as fh:
@@ -4204,6 +4602,14 @@ def _cpu_load_history() -> None:
 
 
 def _cpu_persist(sample: dict) -> None:
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_cpu_metrics",
+                                   _map_cpu_row(sample))
+            return
+        except Exception as exc:
+            _log_sql_state_error("cpu_sql_write_failed", err=repr(exc))
     try:
         _CPU_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CPU_STATE_PATH.open("a", encoding="utf-8") as fh:

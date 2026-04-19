@@ -2692,7 +2692,14 @@ def auto_index_vault(vault_path: Path) -> dict:
     last_check = float(state.get(key, 0.0))
 
     with _with_vault(vault_path):
-        col = get_db()
+        # Usar get_db_for(vault_path) en vez de get_db() — el singleton de
+        # get_db() cachea por DB_PATH e ignora COLLECTION_NAME del swap,
+        # entonces auto_index de un vault secundario terminaba operando
+        # sobre la colección del vault default. La orphan-cleanup veía
+        # on_disk del vault X contra indexed_files del vault default y
+        # borraba todo lo que no matcheara (bug: drenaba home al autoindexar
+        # work).
+        col = get_db_for(vault_path)
         first_time = col.count() == 0
 
         # Listar md files (rglob es rápido en APFS, ~50ms para 500 archivos).
@@ -4497,18 +4504,21 @@ def score_bar(score: float, width: int = 5) -> str:
 
 
 def render_sources(metas: list[dict], scores: list[float]) -> Table:
-    """Compact sources table with score bar + path."""
+    """Compact sources table with score bar + path. Note y path son OSC 8
+    hyperlinks que abren la nota en Obsidian (o `rag open` con RAG_TRACK_OPENS)."""
     tbl = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
     tbl.add_column(style="dim")  # bar
-    tbl.add_column(style="bold cyan")  # note name
-    tbl.add_column(style="cyan dim")  # path
+    tbl.add_column()  # note name (link style per row)
+    tbl.add_column()  # path (link style per row)
     seen_files = set()
     for m, s in zip(metas, scores):
         f = m.get("file", "")
         if f in seen_files:
             continue
         seen_files.add(f)
-        tbl.add_row(f"{score_bar(s)}  {s:+.1f}", m.get("note", ""), f)
+        note_txt = Text(m.get("note", ""), style=_file_link_style(f, "cyan"))
+        path_txt = Text(f, style=_file_link_style(f, "cyan dim"))
+        tbl.add_row(f"{score_bar(s)}  {s:+.1f}", note_txt, path_txt)
     return tbl
 
 
@@ -4581,11 +4591,73 @@ SYSTEM_RULES_WEB = (
     "contexto (intros, parafraseos, biografía, conectores, opinión, conocimiento "
     "general), envolvelo en `<<ext>>...<</ext>>`. Fuera de esos marcadores TODO "
     "debe ser verificable palabra por palabra en el contexto.\n\n"
-    "REGLA 4 — FORMATO: respondé con 2-4 oraciones o una lista corta de viñetas. "
+    "REGLA 4 — PRESERVAR LINKS: si el CONTEXTO contiene URLs (http://, https://) "
+    "o wikilinks ([[Nota]]), copialos LITERAL en la respuesta — son clickeables "
+    "para el usuario. Nunca digas 'ver documentación oficial' sin pegar la URL "
+    "que figura en el contexto. Si el chunk trae 'docs: https://x.com/y', "
+    "escribí 'docs: https://x.com/y', no 'docs (ver enlace)'.\n\n"
+    "REGLA 5 — FORMATO: respondé con 2-4 oraciones o una lista corta de viñetas. "
     "Incluí el dato clave (comando, hecho, valor) en la primera oración, seguido "
     "de una frase de contexto mínimo (qué hace, dónde vive) para que la respuesta "
     "sea útil sin necesidad de abrir las fuentes. Sin intro vacía.\n"
 )
+
+# Intent-specific system prompts — same hard rules as STRICT (no external prose,
+# cite via [path.md] or [Label](path.md), no fabricated paths) but tuned to the
+# response shape each intent requires.
+
+SYSTEM_RULES_LOOKUP = (
+    "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
+    "REGLAS:\n"
+    "1. SOLO info literal del CONTEXTO. Si no está cubierta: responder exacto "
+    "'No encontré esto en el vault.' y cortar. Sin parafraseos, intros ni conocimiento externo.\n"
+    "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
+    "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders — siempre ruta real.\n"
+    "3. Formato: máximo 1-2 oraciones por respuesta. Directo al dato.\n"
+)
+
+SYSTEM_RULES_SYNTHESIS = (
+    "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
+    "REGLAS:\n"
+    "1. SOLO info literal del CONTEXTO. Sin parafraseos, intros ni conocimiento externo.\n"
+    "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
+    "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders — siempre ruta real.\n"
+    "3. Cuando ≥2 fuentes se solapan, citalas explícitamente y señalá acuerdo o tensión entre ellas. "
+    "No suavices contradicciones — si dos notas dicen cosas distintas, indicalo.\n"
+    "4. Formato: síntesis integrada con viñetas si hay múltiples puntos, sin intro vacía.\n"
+)
+
+SYSTEM_RULES_COMPARISON = (
+    "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
+    "REGLAS:\n"
+    "1. SOLO info literal del CONTEXTO. Sin parafraseos, intros ni conocimiento externo.\n"
+    "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
+    "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders — siempre ruta real.\n"
+    "3. Estructurá la respuesta como: '[Fuente A] dice X / [Fuente B] dice Y / "
+    "Diferencia clave: …' cuando la pregunta implica comparación. "
+    "Si solo hay una fuente relevante, respondé directamente sin forzar la estructura.\n"
+    "4. Formato: contraste explícito, sin intro vacía.\n"
+)
+
+
+def system_prompt_for_intent(intent: str, loose: bool) -> str:
+    """Return the appropriate system prompt for a given intent + mode.
+
+    If loose → always SYSTEM_RULES (preserves --loose behaviour for every intent).
+    Else: count/list/recent → SYSTEM_RULES_LOOKUP; semantic or unknown → SYSTEM_RULES_STRICT.
+    synthesis/comparison: extension points for future classify_intent buckets.
+    """
+    if loose:
+        return SYSTEM_RULES
+    if intent in ("count", "list", "recent"):
+        return SYSTEM_RULES_LOOKUP
+    if intent == "synthesis":
+        return SYSTEM_RULES_SYNTHESIS
+    if intent == "comparison":
+        return SYSTEM_RULES_COMPARISON
+    # semantic or unknown — existing default
+    return SYSTEM_RULES_STRICT
+
 
 # Coach mode: las notas del usuario son ESPEJO, no autoridad. El valor está
 # en la pregunta reflexiva al final, no en la respuesta factual. Diferenciado
@@ -5126,19 +5198,20 @@ def render_related(related: list[tuple[dict, int, str]]) -> None:
     tbl = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
     tbl.add_column(style="dim", justify="right")   # score
     tbl.add_column(style="dim italic")              # reason badge
-    tbl.add_column(style="bold magenta")            # note title
-    tbl.add_column(style="cyan dim")                # path
+    tbl.add_column()                                # note title (link per row)
+    tbl.add_column()                                # path (link per row)
     reason_style = {
-        "link": "[bold blue]↔[/bold blue]",
+        "link": "[blue]↔[/blue]",
         "tags": "[yellow]#[/yellow]",
-        "tags+link": "[bold blue]↔[/bold blue][yellow]#[/yellow]",
+        "tags+link": "[blue]↔[/blue][yellow]#[/yellow]",
     }
     for m, score, reason in related:
+        f = m.get("file", "")
         tbl.add_row(
             f"×{score}",
             reason_style.get(reason, ""),
-            m.get("note", ""),
-            m.get("file", ""),
+            Text(m.get("note", ""), style=_file_link_style(f, "magenta")),
+            Text(f, style=_file_link_style(f, "cyan dim")),
         )
     console.print(tbl)
 
@@ -9171,13 +9244,15 @@ def watch(debounce: float, all_vaults: bool):
               help="Después de responder, buscar chunks del vault que CONTRADIGAN la respuesta")
 @click.option("--no-deep", is_flag=True,
               help="Desactiva retrieval iterativo automático (deep retrieve)")
+@click.option("--critique", is_flag=True,
+              help="Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
     hyde: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
-    counter: bool, no_deep: bool,
+    counter: bool, no_deep: bool, critique: bool,
 ):
     """Consulta única contra las notas."""
     warmup_async()
@@ -9402,7 +9477,7 @@ def query(
             for d, m in zip(graph_docs, graph_metas)
         )
         context = f"{context}\n\n--- CONTEXTO EXPANDIDO POR GRAFO ---\n\n{graph_section}"
-    rules = SYSTEM_RULES if loose else SYSTEM_RULES_STRICT
+    rules = system_prompt_for_intent(intent, loose)
     # Perfil del usuario + estado mutable se inyectan antes de las reglas.
     # Vacío si no hay — zero overhead cuando el usuario no los configuró.
     user_block = user_prompt_block()
@@ -9421,11 +9496,9 @@ def query(
     t_gen_start = time.perf_counter()
     parts: list[str] = []
     if plain:
-        # Buffer the stream then emit once with `[Label](path.md)` rewritten to
-        # `obsidian://open?...` URLs. Chat surfaces (WhatsApp, Telegram) ignore
-        # markdown link syntax but render bare URLs as clickable — `--plain` is
-        # documented as "consumo programático" so giving up token-by-token
-        # streaming here is the right trade for clickable citations.
+        # Buffer the stream; do NOT emit here. Citation-repair and critique may
+        # mutate `full` after generation. The single `click.echo` for plain mode
+        # fires after both passes complete (see below, after critique block).
         for chunk in ollama.chat(
             model=resolve_chat_model(),
             messages=messages,
@@ -9434,7 +9507,6 @@ def query(
             keep_alive=OLLAMA_KEEP_ALIVE,
         ):
             parts.append(chunk.message.content)
-        click.echo(convert_obsidian_links("".join(parts)))
     else:
         console.print()
         # Stream tokens: perceived latency drops from ~30s to ~3s as the user sees
@@ -9456,12 +9528,111 @@ def query(
     if not plain:
         console.print(render_response(full))
 
-    bad = verify_citations(full, result["metas"]) if not plain else []
+    # ── Task 1: Citation-repair loop ─────────────────────────────────────────
+    # Runs always (not gated on plain — plain outputs are consumed programmatically
+    # so silent repair is safe and desirable). Repair fires only when bad citations
+    # are detected. Single repair call; if repair also has bad citations or is
+    # empty, keep the original full.
+    citation_repaired = False
+    bad = verify_citations(full, result["metas"])
     if bad:
+        valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
+        if valid_paths:
+            _repair_system = (
+                "Solo puedes citar las siguientes rutas: "
+                + ", ".join(valid_paths)
+                + ". Responde la misma pregunta usando SOLO esas rutas. No inventes otras."
+            )
+            _repair_messages = [
+                {"role": "system", "content": _repair_system},
+                {"role": "user", "content": (
+                    f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
+                )},
+            ]
+            try:
+                _repair_resp = ollama.chat(
+                    model=resolve_chat_model(),
+                    messages=_repair_messages,
+                    options=CHAT_OPTIONS,
+                    stream=False,
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+                _repair_full = (_repair_resp.message.content or "").strip()
+                if _repair_full:
+                    _repair_bad = verify_citations(_repair_full, result["metas"])
+                    if not _repair_bad:
+                        full = _repair_full
+                        citation_repaired = True
+                        if not plain:
+                            # Reprint repaired answer (OSC 8 hyperlinks intact via render_response)
+                            console.print(render_response(full))
+            except Exception:
+                pass  # Keep original on any repair failure
+
+    # Report unverified citations that remain after repair (in interactive mode).
+    if bad and not citation_repaired and not plain:
         console.print()
         console.print("[bold red]⚠ Citas no verificadas:[/bold red]")
         for label, path in bad:
             console.print(f"  [red]• {label} → {path}[/red] [dim](no está en los chunks recuperados)[/dim]")
+
+    # ── Task 3: Critique (opt-in) ─────────────────────────────────────────────
+    # Fires after citation-repair. Single non-streaming call. Replaces `full`
+    # only when the critique output (stripped) differs from the original.
+    critique_fired = critique
+    critique_changed = False
+    if critique:
+        _critique_system = (
+            "Evalúa si la respuesta responde la pregunta usando SOLO las fuentes provistas. "
+            "Si es correcta, devuélvela tal cual. "
+            "Si es incorrecta o incompleta, regenerá una respuesta mejor usando SOLO esas fuentes. "
+            "No expliques tu evaluación — devolvé solo la respuesta final."
+        )
+        _retrieved_paths_str = "\n".join(
+            m.get("file", "") for m in result["metas"] if m.get("file")
+        )
+        _critique_user = (
+            f"Pregunta: {question}\n\n"
+            f"Respuesta original:\n{full}\n\n"
+            f"Fuentes disponibles:\n{_retrieved_paths_str}\n\n"
+            f"Contexto de las fuentes:\n{context}"
+        )
+        def _run_critique_call() -> str:
+            try:
+                _cr = ollama.chat(
+                    model=resolve_chat_model(),
+                    messages=[
+                        {"role": "system", "content": _critique_system},
+                        {"role": "user", "content": _critique_user},
+                    ],
+                    options=CHAT_OPTIONS,
+                    stream=False,
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+                return (_cr.message.content or "").strip()
+            except Exception:
+                return ""
+        if not plain:
+            with console.status("[dim][critique…][/dim]", spinner="dots"):
+                _crit_full = _run_critique_call()
+        else:
+            _crit_full = _run_critique_call()
+        if _crit_full:
+            import re as _re
+            _norm = lambda s: _re.sub(r'\s+', ' ', s.strip())
+            if _norm(_crit_full) != _norm(full):
+                full = _crit_full
+                critique_changed = True
+                if not plain:
+                    console.print(render_response(full))
+
+    # ── Plain-mode single echo ────────────────────────────────────────────────
+    # Deferred from the stream-collection block above so citation-repair and
+    # critique have already mutated `full`. Ordering: stream → repair → critique
+    # → THIS echo → counter-evidence (if --counter). Non-plain path uses Live +
+    # console.print reprints above and does not reach this branch.
+    if plain:
+        click.echo(convert_obsidian_links(full))
 
     contrad: list[dict] = []
     if counter:
@@ -9500,6 +9671,9 @@ def query(
         "t_gen": round(t_gen, 2),
         "answer_len": len(full),
         "bad_citations": [p for _, p in bad],
+        "citation_repaired": citation_repaired,
+        "critique_fired": critique_fired,
+        "critique_changed": critique_changed,
         "contradictions": [{"path": c["path"], "why": c["why"]} for c in contrad] if counter else None,
         "mode": "raw" if raw else ("loose" if loose else "strict"),
         "plain": plain,
@@ -9729,6 +9903,8 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
 @click.option("--vault", "vault_scope", default=None,
               help="Scope de retrieval: nombre(s) separados por coma, o 'all'. "
                    "Omitir = prompt interactivo si hay ≥2 vaults registrados.")
+@click.option("--critique", is_flag=True,
+              help="Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario")
 def chat(
     k: int, folder: str | None, tag: str | None,
     since: str | None, precise: bool,
@@ -9736,6 +9912,7 @@ def chat(
     session_id: str | None, resume: bool, counter: bool,
     deep_mode: bool,
     vault_scope: str | None,
+    critique: bool,
 ):
     """Chat interactivo con tus notas."""
     # no_deep es el nombre histórico de la variable dentro del flujo —
@@ -9876,8 +10053,13 @@ def chat(
         # input() cuando llegan en mitad de la escritura. Encolamos en
         # `_deferred_notices` y el chat loop los drenea antes del próximo
         # prompt (ver flush en el while True).
-        for name, vpath, is_first_time, n_files in pending_index:
-            def _bg_index(_name=name, _vpath=vpath, _first=is_first_time):
+        #
+        # Single thread serializa los auto_index_vault — `_with_vault` muta
+        # VAULT_PATH/COLLECTION_NAME globals y NO es thread-safe. Un thread
+        # por vault disparaba race: el vault A leía indexed_files del
+        # singleton del vault B y marcaba 700+ paths como orphans.
+        def _bg_index_all(_items=list(pending_index)):
+            for _name, _vpath, _first, _n_files in _items:
                 try:
                     stats = auto_index_vault(_vpath)
                     if _first:
@@ -9891,12 +10073,12 @@ def chat(
                             f"[dim]({stats['took_ms']}ms)[/dim]"
                         )
                     else:
-                        return
+                        continue
                     with _deferred_notices_lock:
                         _deferred_notices.append(msg)
                 except Exception:
-                    pass
-            threading.Thread(target=_bg_index, name=f"chat-idx-{name}", daemon=True).start()
+                    continue
+        threading.Thread(target=_bg_index_all, name="chat-idx-all", daemon=True).start()
 
     # Re-validar — si todos quedaron vacíos (vault sin .md o índex falló),
     # no tiene sentido seguir.
@@ -9918,6 +10100,8 @@ def chat(
     last_question = ""
     last_sources: list[dict] = []
     last_turn_id: str | None = None
+    # critique_active: session-local flag, does NOT persist to sessions/*.json
+    critique_active = critique
     # If resuming, seed last_* from final turn so `/save` works immediately.
     if sess["turns"]:
         final = sess["turns"][-1]
@@ -9986,6 +10170,13 @@ def chat(
             last_sources = []
             console.clear()
             console.print("[dim]Conversación borrada. Sesión sigue activa.[/dim]")
+            continue
+
+        # /critique — toggle auto-critique for subsequent turns (session-local).
+        if question == "/critique":
+            critique_active = not critique_active
+            state_label = "[critique on]" if critique_active else "[critique off]"
+            console.print(f"[dim]{state_label}[/dim]")
             continue
 
         # /inbox [apply|undo] — filing assistant sobre 00-Inbox, dispatch al
@@ -10202,6 +10393,83 @@ def chat(
             f"· ttft {_t_ttft_ms}ms "
             f"· llm {_t_llm_ms}ms[/dim]"
         )
+
+        # ── Citation-repair loop (chat path) ──────────────────────────────────
+        _chat_citation_repaired = False
+        _chat_bad = verify_citations(full, result["metas"])
+        if _chat_bad:
+            _chat_valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
+            if _chat_valid_paths:
+                _chat_repair_system = (
+                    "Solo puedes citar las siguientes rutas: "
+                    + ", ".join(_chat_valid_paths)
+                    + ". Responde la misma pregunta usando SOLO esas rutas. No inventes otras."
+                )
+                _chat_repair_messages = [
+                    {"role": "system", "content": _chat_repair_system},
+                    {"role": "user", "content": (
+                        f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
+                    )},
+                ]
+                try:
+                    _rresp = ollama.chat(
+                        model=resolve_chat_model(),
+                        messages=_chat_repair_messages,
+                        options=_CLI_CHAT_OPTIONS,
+                        stream=False,
+                        keep_alive=OLLAMA_KEEP_ALIVE,
+                    )
+                    _rfull = (_rresp.message.content or "").strip()
+                    if _rfull:
+                        _rbad = verify_citations(_rfull, result["metas"])
+                        if not _rbad:
+                            full = _rfull
+                            _chat_citation_repaired = True
+                            console.print(render_response(full))
+                except Exception:
+                    pass
+
+        # ── Critique (opt-in, chat path) ──────────────────────────────────────
+        _chat_critique_changed = False
+        if critique_active:
+            _cq_system = (
+                "Evalúa si la respuesta responde la pregunta usando SOLO las fuentes provistas. "
+                "Si es correcta, devuélvela tal cual. "
+                "Si es incorrecta o incompleta, regenerá una respuesta mejor usando SOLO esas fuentes. "
+                "No expliques tu evaluación — devolvé solo la respuesta final."
+            )
+            _cq_paths_str = "\n".join(
+                m.get("file", "") for m in result["metas"] if m.get("file")
+            )
+            _cq_user = (
+                f"Pregunta: {question}\n\n"
+                f"Respuesta original:\n{full}\n\n"
+                f"Fuentes disponibles:\n{_cq_paths_str}\n\n"
+                f"Contexto de las fuentes:\n{context}"
+            )
+            with console.status("[dim][critique…][/dim]", spinner="dots"):
+                try:
+                    _cq_resp = ollama.chat(
+                        model=resolve_chat_model(),
+                        messages=[
+                            {"role": "system", "content": _cq_system},
+                            {"role": "user", "content": _cq_user},
+                        ],
+                        options=_CLI_CHAT_OPTIONS,
+                        stream=False,
+                        keep_alive=OLLAMA_KEEP_ALIVE,
+                    )
+                    _cq_full = (_cq_resp.message.content or "").strip()
+                except Exception:
+                    _cq_full = ""
+            if _cq_full:
+                import re as _re
+                _norm_chat = lambda s: _re.sub(r'\s+', ' ', s.strip())
+                if _norm_chat(_cq_full) != _norm_chat(full):
+                    full = _cq_full
+                    _chat_critique_changed = True
+                    console.print(render_response(full))
+
         history.append({"role": "assistant", "content": full})
         history = history[-SESSION_HISTORY_WINDOW:]
         last_assistant = full
@@ -10238,6 +10506,9 @@ def chat(
             "paths": [m.get("file", "") for m in result["metas"]],
             "scores": [round(float(s), 2) for s in result["scores"]],
             "top_score": round(float(result["confidence"]), 2),
+            "citation_repaired": _chat_citation_repaired,
+            "critique_fired": critique_active,
+            "critique_changed": _chat_critique_changed,
         })
 
         last_turn_id = turn_id

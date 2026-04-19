@@ -6,7 +6,7 @@ Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 
-Fully local: ChromaDB + Ollama + sentence-transformers. No cloud calls.
+Fully local: Sqlite-vec + Ollama + sentence-transformers. No cloud calls.
 
 ## Agent dispatch rule
 
@@ -139,12 +139,22 @@ All ollama calls: `keep_alive=-1` (VRAM resident). `CHAT_OPTIONS`: `num_ctx=4096
 
 ### Generation prompts
 
-- `SYSTEM_RULES_STRICT` (default `rag query`): forbids external prose.
+- `SYSTEM_RULES_STRICT` (default `rag query`, `semantic` intent): forbids external prose.
 - `SYSTEM_RULES` (`--loose`, always in chat): allows `<<ext>>...<</ext>>` rendered dim yellow + ⚠.
+- `SYSTEM_RULES_LOOKUP` (intent `count`/`list`/`recent`): terse 1-2 sentences, exact "No encontré esto en el vault." refusal.
+- `SYSTEM_RULES_SYNTHESIS` (intent `synthesis`, extension point — not yet emitted by `classify_intent`): cross-reference ≥2 overlapping sources, must surface tension.
+- `SYSTEM_RULES_COMPARISON` (intent `comparison`, extension point): explicit `X dice A / Y dice B / Diferencia clave: …` structure.
+- Routed through `system_prompt_for_intent(intent, loose)` at generation time (both `query()` and `chat()` paths). `--loose` always maps to `SYSTEM_RULES` for every intent.
+
+### Response-quality post-pipeline
+
+**Citation-repair** (always-on): after generation, `verify_citations(full, metas)` flags invented paths. If non-empty, ONE repair call runs (`resolve_chat_model()` + `CHAT_OPTIONS`, non-streaming, `keep_alive=-1`) with system prompt `"Solo puedes citar las siguientes rutas: [...]. ... No inventes otras."` If repair output also has bad citations or is empty → keep original. On success → replace `full` silently (interactive: reprints via `render_response`; plain: single `click.echo` deferred until AFTER repair + critique). Logs `citation_repaired: bool` to `queries.jsonl`.
+
+**`--critique` flag** (opt-in, both `rag query` and `rag chat`, plus `/critique` chat toggle): after citation-repair, second non-streaming chat-model call evaluates + regenerates if needed. Whitespace-normalized diff vs original → replace + `critique_changed=True`. Logs `critique_fired` (always equals flag state) + `critique_changed` to `queries.jsonl`. Adds one extra ollama round-trip only when flag is set — off by default so no latency cost.
 
 ### Rendering
 
-OSC 8 `file://` hyperlinks for both `[Label](path.md)` and `[path.md]` formats. `NOTE_LINK_RE` handles single-level balanced parens. `verify_citations()` flags unknown paths post-response.
+OSC 8 `file://` hyperlinks for both `[Label](path.md)` and `[path.md]` formats. `NOTE_LINK_RE` handles single-level balanced parens. `verify_citations()` flags unknown paths post-response (feeds citation-repair loop).
 
 ### Scoring formula (post-rerank)
 
@@ -202,6 +212,8 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 - Latency: singles p95 2447ms · chains p95 3003ms
 
 Every post-expansion metric sits inside the prior floor's CI on the smaller set — expansion surfaced the noise band (~21pp singles hit, ~50pp chain_success) that previously masqueraded as drift.
+
+**Post prompt-per-intent + citation-repair (2026-04-19):** Singles `hit@5 88.10% [76.19, 97.62] · MRR 0.767 [0.643, 0.869]` — identical hit@5, MRR within CI. Chains `hit@5 81.82% [66.67, 93.94] · MRR 0.636 [0.505, 0.773] · chain_success 58.33% [33.33, 83.33]` — +3pp hit@5, +8pp chain_success, both inside prior CI so treat as noise until replicated. Floor unchanged for auto-rollback gate (still 76.19% / 63.64%).
 
 **Prior floor (2026-04-17, post-title-in-rerank, n=21 singles / 9 chains):** Singles `hit@5 90.48% · MRR 0.821`; Chains `hit@5 80.00% · MRR 0.627 · chain_success 55.56%`. Kept for historical trend, but do not compare new numbers against it without overlapping CIs.
 

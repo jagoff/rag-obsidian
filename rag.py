@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import secrets
+import subprocess
 import threading
 import time
 import traceback
@@ -1058,10 +1059,19 @@ MAX_CHUNK = 800    # chars — bge-m3 accepts ~2048 tokens; 800 chars ≈ 200 to
                    # sweet spot: enough context per chunk, prefix doesn't dominate
 
 def is_excluded(rel_path: str) -> bool:
-    """Skip any path whose top-level segment or any parent segment is a
-    dotfolder (e.g. .trash/, .obsidian/, .git/). System/hidden by convention.
+    """Skip hidden paths and Claude Code skill backing store.
+
+    - Dotfolders (.trash/, .obsidian/, .git/): system/hidden by convention.
+    - 99-Claude/skills/: these live under the vault via symlink chain
+      (~/.claude/skills → ~/.agents/skills → vault) for Claude Code to consume.
+      They are skill definitions/rules, not user notes — indexing them pollutes
+      tag/folder stats and surfaces irrelevant chunks in retrieval.
     """
-    return any(seg.startswith(".") for seg in rel_path.split("/") if seg)
+    if any(seg.startswith(".") for seg in rel_path.split("/") if seg):
+        return True
+    if "/99-Claude/skills/" in f"/{rel_path}":
+        return True
+    return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
 # 2 métodos el pool crudo llega a 70-80 únicos. Cap a 30 ahorra ~500ms vs 40
@@ -3453,11 +3463,25 @@ def parse_frontmatter(text: str) -> dict:
         return {}
 
 
+def _normalize_fm_tags(fm: dict) -> list[str]:
+    """Normalize frontmatter tags to list[str].
+
+    Obsidian accepts both `tags: a, b, c` (YAML scalar → str) and `tags: [a, b, c]`
+    (list). Iterating the scalar form yields characters — handle both forms here."""
+    raw = fm.get("tags")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [s for t in raw if (s := str(t).strip())]
+    s = str(raw).strip()
+    return [s] if s else []
+
+
 def extract_frontmatter_tags(text: str) -> list[str]:
     """Extract tags list from YAML frontmatter (kept for backwards compat)."""
-    fm = parse_frontmatter(text)
-    tags = fm.get("tags") or []
-    return [str(t) for t in tags if t]
+    return _normalize_fm_tags(parse_frontmatter(text))
 
 
 # Fields worth surfacing to both the embedding prefix and chunk metadata.
@@ -3904,6 +3928,240 @@ def _invalidate_corpus_cache() -> None:
     global _corpus_cache, _pagerank_cache
     _corpus_cache = None
     _pagerank_cache = None
+
+
+# ── Person-mention enrichment ────────────────────────────────────────────────
+# When a chat query mentions a person/entity by name, inject the matching
+# 99 Mentions @/<name>.md body + Apple Contacts data as a preamble so the LLM
+# knows who the user is talking about. Local-only: AppleScript via osascript,
+# no network. The mention notes' format is documented in the folder's
+# `_template.md`: filename stem + frontmatter `aliases:` are matched tokens.
+
+_MENTIONS_FOLDER = "04-Archive/99-obsidian-system/99 Mentions @"
+_MENTIONS_BODY_CAP = 1500
+_MENTIONS_MAX_PER_QUERY = 2
+_MENTIONS_MIN_TOKEN_LEN = 3
+_PERSON_CONTEXT_HEADER = "CONTEXTO SOBRE LA PERSONA:"
+
+_mentions_cache: dict | None = None
+_contacts_cache: dict[str, dict | None] = {}
+_contacts_cache_lock = threading.Lock()
+_contacts_permission_warned = False
+
+
+def _fold(s: str) -> str:
+    """Lowercase + strip combining accents (NFD). Matches `_tokenize`."""
+    n = unicodedata.normalize("NFD", (s or "").lower())
+    return "".join(c for c in n if not unicodedata.combining(c))
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            return text[end + 4:].lstrip("\n")
+    return text
+
+
+def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
+    """Scan 99 Mentions @/ → {folded_token: rel_path}.
+
+    Tokens = filename stem + frontmatter `aliases:`. Files prefixed with `_`
+    are scaffolding (see `_template.md`). Cached by max-mtime over folder.
+    """
+    global _mentions_cache
+    root = (vault_root or VAULT_PATH) / _MENTIONS_FOLDER
+    if not root.exists():
+        return {}
+    files = [p for p in root.glob("*.md") if not p.name.startswith("_")]
+    mtime_max = max((p.stat().st_mtime for p in files), default=0.0)
+    cache_key = str(root.resolve())
+    if (
+        _mentions_cache
+        and _mentions_cache.get("key") == cache_key
+        and _mentions_cache.get("mtime") == mtime_max
+    ):
+        return _mentions_cache["index"]
+
+    idx: dict[str, str] = {}
+    for p in files:
+        try:
+            txt = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        rel = str(p.relative_to(vault_root or VAULT_PATH))
+        if len(p.stem) >= _MENTIONS_MIN_TOKEN_LEN:
+            idx[_fold(p.stem)] = rel
+        # Lightweight aliases parser — only the `aliases:` block.
+        if txt.startswith("---\n"):
+            end = txt.find("\n---", 4)
+            if end != -1:
+                fm = txt[4:end]
+                in_aliases = False
+                for line in fm.split("\n"):
+                    if line.startswith("aliases:"):
+                        rest = line.split(":", 1)[1].strip()
+                        if rest.startswith("[") and rest.endswith("]"):
+                            for a in rest[1:-1].split(","):
+                                a = a.strip().strip("'\"")
+                                if len(a) >= _MENTIONS_MIN_TOKEN_LEN:
+                                    idx[_fold(a)] = rel
+                        else:
+                            in_aliases = True
+                        continue
+                    if in_aliases:
+                        if line.startswith("  - "):
+                            a = line[4:].strip().strip("'\"")
+                            if len(a) >= _MENTIONS_MIN_TOKEN_LEN:
+                                idx[_fold(a)] = rel
+                        elif line and not line.startswith(" "):
+                            in_aliases = False
+    _mentions_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
+    return idx
+
+
+def _match_mentions_in_query(query: str, vault_root: Path | None = None) -> list[str]:
+    """Word-boundary, accent-insensitive match. Returns rel_paths ordered by
+    first occurrence in the query, capped at _MENTIONS_MAX_PER_QUERY.
+    """
+    idx = _load_mentions_index(vault_root)
+    if not idx:
+        return []
+    folded_q = _fold(query)
+    hits: list[tuple[int, str]] = []
+    seen_paths: set[str] = set()
+    for token, path in idx.items():
+        if path in seen_paths:
+            continue
+        m = re.search(rf"\b{re.escape(token)}\b", folded_q)
+        if m:
+            hits.append((m.start(), path))
+            seen_paths.add(path)
+    hits.sort()
+    return [p for _, p in hits[:_MENTIONS_MAX_PER_QUERY]]
+
+
+def _fetch_contact(name: str) -> dict | None:
+    """Query Apple Contacts via osascript. Returns dict or None.
+
+    Cached per process. Silent-fail on missing osascript / permission denied
+    / timeout — first failure logs one warning, subsequent are silent so a
+    permission-denied state doesn't spam the chat log.
+    """
+    global _contacts_permission_warned
+    name = (name or "").strip()
+    if not name:
+        return None
+    with _contacts_cache_lock:
+        if name in _contacts_cache:
+            return _contacts_cache[name]
+    safe = name.replace('"', '\\"')
+    script = f'''
+on run
+    tell application "Contacts"
+        set matches to (every person whose name contains "{safe}")
+        if (count of matches) is 0 then return ""
+        set p to item 1 of matches
+        set fname to name of p
+        set ph_str to ""
+        repeat with ph in phones of p
+            set ph_str to ph_str & (value of ph as string) & "|"
+        end repeat
+        set em_str to ""
+        repeat with em in emails of p
+            set em_str to em_str & (value of em as string) & "|"
+        end repeat
+        set bd to ""
+        try
+            set bd to (birth date of p) as string
+        end try
+        return fname & "::" & ph_str & "::" & em_str & "::" & bd
+    end tell
+end run
+'''
+    result: dict | None = None
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, timeout=3.0, text=True,
+        )
+        if proc.returncode != 0:
+            if not _contacts_permission_warned:
+                _contacts_permission_warned = True
+                try:
+                    import sys as _sys_warn
+                    _sys_warn.stderr.write(
+                        f"[contacts-shim] osascript failed (rc={proc.returncode}): "
+                        f"{(proc.stderr or '').strip()[:160]}\n"
+                    )
+                except Exception:
+                    pass
+        else:
+            out = (proc.stdout or "").strip()
+            if out:
+                parts = out.split("::")
+                result = {
+                    "full_name": parts[0] if len(parts) > 0 else "",
+                    "phones": [p for p in (parts[1].split("|") if len(parts) > 1 else []) if p],
+                    "emails": [e for e in (parts[2].split("|") if len(parts) > 2 else []) if e],
+                    "birthday": parts[3] if len(parts) > 3 else "",
+                }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        result = None
+    with _contacts_cache_lock:
+        _contacts_cache[name] = result
+    return result
+
+
+def build_person_context(query: str, vault_root: Path | None = None) -> str | None:
+    """Detect mentions in query, build LLM preamble. Returns None if no match.
+
+    Output format:
+        CONTEXTO SOBRE LA PERSONA:
+
+        ### Grecia
+        - Relación: hija
+        ...
+
+        Apple Contacts → nombre completo: Grecia Ferrari
+          teléfonos: +54 ...
+
+    Caller prepends this to the user message so the LLM "knows who" before
+    seeing retrieved chunks. Pre-LLM only — never written to episodic notes.
+    """
+    paths = _match_mentions_in_query(query, vault_root)
+    if not paths:
+        return None
+    blocks: list[str] = []
+    root = vault_root or VAULT_PATH
+    for rel in paths:
+        full = root / rel
+        try:
+            body = _strip_frontmatter(full.read_text(encoding="utf-8")).strip()
+        except Exception:
+            continue
+        if not body:
+            continue
+        body = body[:_MENTIONS_BODY_CAP]
+        name = full.stem
+        contact = _fetch_contact(name)
+        contact_lines: list[str] = []
+        if contact:
+            if contact.get("full_name"):
+                contact_lines.append(f"Apple Contacts → nombre completo: {contact['full_name']}")
+            if contact.get("phones"):
+                contact_lines.append(f"  teléfonos: {', '.join(contact['phones'])}")
+            if contact.get("emails"):
+                contact_lines.append(f"  emails: {', '.join(contact['emails'])}")
+            if contact.get("birthday"):
+                contact_lines.append(f"  cumpleaños: {contact['birthday']}")
+        block = f"### {name}\n{body}"
+        if contact_lines:
+            block += "\n\n" + "\n".join(contact_lines)
+        blocks.append(block)
+    if not blocks:
+        return None
+    return f"{_PERSON_CONTEXT_HEADER}\n\n" + "\n\n---\n\n".join(blocks)
 
 
 def _folder_matches(file_path: str, folder: str) -> bool:
@@ -5904,7 +6162,7 @@ def triage_inbox_note(
         return {"path": note_path, "error": "not found"}
     raw = full.read_text(encoding="utf-8", errors="ignore")
     fm = parse_frontmatter(raw)
-    current_tags = [str(t) for t in (fm.get("tags") or []) if t]
+    current_tags = _normalize_fm_tags(fm)
     body = clean_md(raw)[:3000]
     folder, fconf = _suggest_folder_for_note(col, note_path)
     tags = _suggest_tags_for_note(col, body, full.stem, max_tags=max_tags)
@@ -6920,6 +7178,8 @@ def retrieve(
     summary: str | None = None,
     variants: list[str] | None = None,
     rerank_pool: int | None = None,
+    exclude_paths: set[str] | None = None,
+    exclude_path_prefixes: tuple[str, ...] | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -7074,9 +7334,12 @@ def retrieve(
     #     `rerank_pool` override permite reducir el pool para superficies
     #     latency-sensitive (web) sin afectar el comportamiento del CLI.
     _effective_pool = rerank_pool if rerank_pool is not None else RERANK_POOL_MAX
-    merged_ordered = merged_ordered[:_effective_pool]
 
-    # 5. Fetch candidates
+    # 5. Fetch candidates. Fetch BEFORE pool truncation so the exclude filter
+    #    (when active) drops candidates by metadata first, leaving _effective_pool
+    #    slots free for non-excluded items. Without this the pool can be
+    #    consumed by chunks we'd discard anyway, leaving zero results when
+    #    excluded items dominate the top of merged_ordered.
     _t0 = time.perf_counter()
     fetched = col.get(ids=merged_ordered, include=["documents", "metadatas"])
     _timing["fetch_ms"] = (time.perf_counter() - _t0) * 1000
@@ -7084,6 +7347,17 @@ def retrieve(
         id_: (doc, meta)
         for id_, doc, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
     }
+    if exclude_paths or exclude_path_prefixes:
+        def _drop_id(id_: str) -> bool:
+            meta = id_map.get(id_, (None, {}))[1] or {}
+            p = (meta.get("file") if isinstance(meta, dict) else "") or ""
+            if exclude_paths and p in exclude_paths:
+                return True
+            if exclude_path_prefixes and any(p.startswith(pre) for pre in exclude_path_prefixes):
+                return True
+            return False
+        merged_ordered = [id_ for id_ in merged_ordered if not _drop_id(id_)]
+    merged_ordered = merged_ordered[:_effective_pool]
     candidates = [(id_map[id_][0], id_map[id_][1], id_) for id_ in merged_ordered if id_ in id_map]
 
     # 6. Parent-chunk expansion BEFORE rerank so the reranker scores the same
@@ -7309,6 +7583,19 @@ def retrieve(
             except Exception:
                 pass  # exploration failure is silently ignored
 
+    # Graph-expansion neighbors: same exclude rules.
+    if (exclude_paths or exclude_path_prefixes) and graph_metas:
+        def _drop_graph(p: str) -> bool:
+            if exclude_paths and p in exclude_paths:
+                return True
+            if exclude_path_prefixes and any(p.startswith(pre) for pre in exclude_path_prefixes):
+                return True
+            return False
+        gkeep = [i for i, gm in enumerate(graph_metas) if not _drop_graph(gm.get("file") or "")]
+        if len(gkeep) != len(graph_metas):
+            graph_docs = [graph_docs[i] for i in gkeep]
+            graph_metas = [graph_metas[i] for i in gkeep]
+
     _timing["total_ms"] = (time.perf_counter() - _t_retrieve_start) * 1000
     # Instrumentación gated behind env var — silencia el ruido en el CLI
     # chat y solo aparece cuando el dev lo pide explícitamente.
@@ -7396,6 +7683,8 @@ def deep_retrieve(
     summary: str | None = None,
     variants: list[str] | None = None,
     rerank_pool: int | None = None,
+    exclude_paths: set[str] | None = None,
+    exclude_path_prefixes: tuple[str, ...] | None = None,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -7408,7 +7697,8 @@ def deep_retrieve(
         col, question, k, folder, history=history, tag=tag, precise=precise,
         multi_query=multi_query, auto_filter=auto_filter,
         date_range=date_range, summary=summary, variants=variants,
-        rerank_pool=rerank_pool,
+        rerank_pool=rerank_pool, exclude_paths=exclude_paths,
+        exclude_path_prefixes=exclude_path_prefixes,
     )
     if not result["docs"]:
         return result
@@ -7431,7 +7721,8 @@ def deep_retrieve(
         sub_result = retrieve(
             col, sub_query, k, folder, tag=tag, precise=False,
             multi_query=False, auto_filter=False, date_range=date_range,
-            rerank_pool=rerank_pool,
+            rerank_pool=rerank_pool, exclude_paths=exclude_paths,
+            exclude_path_prefixes=exclude_path_prefixes,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -7728,6 +8019,8 @@ def multi_retrieve(
     summary: str | None = None,
     deep: bool = False,
     rerank_pool: int | None = None,
+    exclude_paths: set[str] | None = None,
+    exclude_path_prefixes: tuple[str, ...] | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -7756,7 +8049,8 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
-            rerank_pool=rerank_pool,
+            rerank_pool=rerank_pool, exclude_paths=exclude_paths,
+            exclude_path_prefixes=exclude_path_prefixes,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -7774,7 +8068,8 @@ def multi_retrieve(
             col, question, k, folder, history, tag, precise,
             multi_query=multi_query, auto_filter=auto_filter,
             date_range=date_range, summary=summary,
-            rerank_pool=rerank_pool,
+            rerank_pool=rerank_pool, exclude_paths=exclude_paths,
+            exclude_path_prefixes=exclude_path_prefixes,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -8704,9 +8999,7 @@ def _ambient_hook(
         self_meta = {
             "file": doc_id_prefix, "note": path.stem,
             "folder": str(path.relative_to(VAULT_PATH).parent),
-            "tags": ",".join(
-                str(t) for t in (fm.get("tags") or []) if t
-            ),
+            "tags": ",".join(_normalize_fm_tags(fm)),
         }
         related = find_related(col, [self_meta], limit=5)
     except Exception:
@@ -8793,7 +9086,7 @@ def _index_single_file(
 
     folder = str(path.relative_to(vault).parent)
     fm = parse_frontmatter(raw)
-    tags = [str(t) for t in (fm.get("tags") or []) if t]
+    tags = _normalize_fm_tags(fm)
     outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
     text = clean_md(raw)
 
@@ -8805,7 +9098,7 @@ def _index_single_file(
         if updated:
             raw, h = updated
             fm = parse_frontmatter(raw)
-            tags = [str(t) for t in (fm.get("tags") or []) if t]
+            tags = _normalize_fm_tags(fm)
             outlinks = extract_wikilinks(raw)
             # text is derived from clean_md (strips frontmatter), unchanged.
 
@@ -8967,7 +9260,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             continue
 
         fm = parse_frontmatter(raw)
-        tags = [str(t) for t in (fm.get("tags") or []) if t]
+        tags = _normalize_fm_tags(fm)
         outlinks = extract_wikilinks(raw)
         text = clean_md(raw)
 
@@ -8980,7 +9273,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             if updated:
                 raw, h = updated
                 fm = parse_frontmatter(raw)
-                tags = [str(t) for t in (fm.get("tags") or []) if t]
+                tags = _normalize_fm_tags(fm)
                 outlinks = extract_wikilinks(raw)
 
         # File changed (or new) — remove any stale chunks first
@@ -10338,15 +10631,18 @@ def chat(
         # multi-turno pero manteniendo el priming del contexto igual.
         user_block = user_prompt_block()
         rules_full = f"{user_block}{SYSTEM_RULES}" if user_block else SYSTEM_RULES
+        # Person-mention enrichment — see build_person_context().
+        _person_ctx = build_person_context(question)
+        _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
         if history:
             messages = (
-                [{"role": "system", "content": f"{rules_full}\nCONTEXTO:\n{context}"}]
+                [{"role": "system", "content": f"{rules_full}\n{_person_block}CONTEXTO:\n{context}"}]
                 + history
                 + [{"role": "user", "content": question}]
             )
         else:
             messages = [{"role": "user", "content": (
-                f"{rules_full}\nCONTEXTO:\n{context}\n\n"
+                f"{rules_full}\n{_person_block}CONTEXTO:\n{context}\n\n"
                 f"PREGUNTA: {question}\n\nRESPUESTA:"
             )}]
         history.append({"role": "user", "content": question})
@@ -11894,7 +12190,7 @@ def autotag(path: str, apply: bool, max_tags: int):
     vocab = sorted(c["tags"])
     raw = note_path.read_text(encoding="utf-8", errors="ignore")
     fm = parse_frontmatter(raw)
-    current_tags = [str(t) for t in (fm.get("tags") or []) if t]
+    current_tags = _normalize_fm_tags(fm)
     body = clean_md(raw)[:3000]
 
     prompt = (
@@ -13633,7 +13929,7 @@ def _rebuild_urls_index() -> dict:
             folder = str(path.relative_to(VAULT_PATH).parent)
             raw = path.read_text(encoding="utf-8", errors="ignore")
             fm = parse_frontmatter(raw)
-            tags = [str(t) for t in (fm.get("tags") or []) if t]
+            tags = _normalize_fm_tags(fm)
             n = _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
             total += n
             if n:
@@ -18294,7 +18590,7 @@ def _collect_today_evidence(
             title = p.stem
             in_window = start <= mtime < end
             if in_window and rel.startswith(f"{_CAPTURE_FOLDER}/"):
-                tags = [str(t) for t in (fm.get("tags") or []) if t]
+                tags = _normalize_fm_tags(fm)
                 inbox_today.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),

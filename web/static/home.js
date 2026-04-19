@@ -222,13 +222,13 @@ function renderCalendar(today, tomorrow) {
   if (total === 0) return panel("calendar", "calendar", 0, "");
   let html = "<ul>";
   if (t.length) {
-    html += t.slice(0, 6).map((e) => {
+    html += t.slice(0, 5).map((e) => {
       const when = e.start ? `<span class="meta">${esc(e.start)}${e.end ? " – " + esc(e.end) : ""}</span>` : "";
       return `<li><span class="bucket today">today</span><b>${esc(e.title || "")}</b>${when}</li>`;
     }).join("");
   }
   if (mx.length) {
-    html += mx.slice(0, 6).map((e) => {
+    html += mx.slice(0, 5).map((e) => {
       const when = e.start ? `<span class="meta">${esc(e.date || "")} ${esc(e.start || "")}</span>` : `<span class="meta">${esc(e.date || "")}</span>`;
       return `<li><span class="bucket tomorrow">ahead</span><b>${esc(e.title || "")}</b>${when}</li>`;
     }).join("");
@@ -276,7 +276,7 @@ function renderGmail(g) {
 
 function renderMail(items) {
   if (!items || !items.length) return panel("mail", "apple mail", 0, "");
-  const lis = items.slice(0, 6).map((m) => {
+  const lis = items.slice(0, 5).map((m) => {
     const vip = m.is_vip ? `<span class="bucket today">VIP</span>` : "";
     return `<li>
       ${vip}<b>${esc(m.subject || "")}</b>
@@ -369,7 +369,7 @@ function renderContradictions(items) {
 
 function renderLowConf(items) {
   if (!items || !items.length) return panel("lowconf", "preguntas sin respuesta", 0, "");
-  const lis = items.slice(0, 6).map((q) => `<li>
+  const lis = items.slice(0, 5).map((q) => `<li>
     ${linked(chatHref(q.q), `<b>"${esc(q.q || "")}"</b>`,
       { title: "reintentar en chat" })}
     <span class="meta">score ${Number(q.top_score || 0).toFixed(3)}</span>
@@ -379,7 +379,7 @@ function renderLowConf(items) {
 
 function renderInbox(items) {
   if (!items || !items.length) return panel("inbox", "capturado hoy", 0, "");
-  const lis = items.slice(0, 6).map((i, idx) => {
+  const lis = items.slice(0, 5).map((i, idx) => {
     const tagBits = i.tags && i.tags.length
       ? i.tags.map((t) => `#${esc(t)}`).join(" ")
       : `<span class="bucket sin-tags">sin-tags</span>`;
@@ -395,7 +395,7 @@ function renderInbox(items) {
 
 function renderActivity(items) {
   if (!items || !items.length) return panel("activity", "notas tocadas", 0, "");
-  const lis = items.slice(0, 6).map((n, idx) => `<li>
+  const lis = items.slice(0, 5).map((n, idx) => `<li>
     ${linked(obsidianHref(n.path), `<b>${esc(n.title || "")}</b>`,
       { title: "abrir en obsidian", noteData: { path: n.path, rank: idx + 1 } })}
     <span class="meta">${esc(n.path || "")} · ${fmtTime(n.modified)}</span>
@@ -796,7 +796,7 @@ function renderUrgent(items) {
     els.urgent.innerHTML = "";
     return;
   }
-  const lis = items.slice(0, 6).map((u) => `<li>${esc(u)}</li>`).join("");
+  const lis = items.slice(0, 5).map((u) => `<li>${esc(u)}</li>`).join("");
   els.urgent.innerHTML = `
     <div class="urgent">
       <h3>urgente</h3>

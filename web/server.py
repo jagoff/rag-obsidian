@@ -91,6 +91,17 @@ from rag import (  # noqa: E402
 
 from web.conversation_writer import write_turn, TurnData  # noqa: E402
 
+_CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
+
+
+def _own_conversation_path(session_id: str) -> str | None:
+    try:
+        data = json.loads(_CONV_INDEX_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return data.get(session_id) if isinstance(data, dict) else None
+
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="obsidian-rag web", docs_url=None, redoc_url=None)
@@ -2721,18 +2732,26 @@ def chat(req: ChatRequest) -> StreamingResponse:
             _t_retrieve_start = time.perf_counter()
             # multi_query=False: the qwen2.5:3b paraphrase call costs 1-3s
             # and only marginally improves recall on chat-style questions.
-            # rerank_pool=4: prior note said pool=5 averages ~210ms; pool=6+
-            # jumps to 1.3-3s due to batch-padding misalignment on MPS.
-            # Re-verifying at pool=4 — bge-reranker-v2-m3 batch size 4 aligns
-            # naturally and may shave another ~50ms vs pool=5. Top-4 quality
-            # holds because RRF already picked the winners; the reranker only
-            # refines order. Measured 2026-04-17. Reverted if eval regresses
+            # k=4 + rerank_pool=5: k=1 + pool=2 starved the LLM context —
+            # ambiguous queries (e.g. "dame info sobre Grecia" as proper
+            # noun) leaked unrelated top-1 chunks (Contacts/_index), LLM
+            # faithfully cited wrong source. Pool=5 matches bge-reranker
+            # batch alignment (~210ms on MPS), k=4 gives the LLM real
+            # context + room for graph expansion. Reverted if eval regresses
             # below singles hit@5 76.19 (CI lower bound) or chains
             # chain_success < 16.67.
+            # Self-citation guard: drop this session's own episodic note +
+            # the entire conversations/ folder from candidates. CLAUDE.md
+            # marks these as system artifacts; surfacing them as retrieval
+            # sources creates a feedback loop where the just-written turn
+            # answers the next one (confirmed 2026-04-19).
+            _own_conv = _own_conversation_path(sid)
+            _exclude = {_own_conv} if _own_conv else None
             result = multi_retrieve(
-                vaults, search_question, 1, None, history, None, False,
+                vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
-                rerank_pool=2,
+                rerank_pool=5, exclude_paths=_exclude,
+                exclude_path_prefixes=("00-Inbox/conversations/",),
             )
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
@@ -2827,12 +2846,23 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # retrieval_signals dict sigue disponible para telemetría
         # (_n_notes, confidence) pero no se inyecta al prompt.
 
+        # Person-mention enrichment: when the query names someone listed in
+        # 99 Mentions @/, prepend that note's body + Apple Contacts data so
+        # the LLM knows who the user is talking about before reading the
+        # retrieved chunks. Pre-LLM only — never leaked to episodic notes.
+        from rag import build_person_context as _build_person_ctx
+        _person_ctx = _build_person_ctx(question)
+        _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
+
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The
         # context (which changes per query) goes in the user message AFTER
         # any history. With history, this puts the cacheable prefix as:
         #   [system (cached)] + [history turns (partially cached)] + user
-        user_content = f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
+        user_content = (
+            f"{_person_block}CONTEXTO:\n{context}\n\n"
+            f"PREGUNTA: {question}\n\nRESPUESTA:"
+        )
         messages = (
             [{"role": "system", "content": _WEB_SYSTEM_PROMPT}]
             + (history or [])
@@ -2961,6 +2991,8 @@ def chat(req: ChatRequest) -> StreamingResponse:
             "paths": [m.get("file", "") for m in result["metas"]],
             "scores": [round(float(s), 2) for s in result["scores"]],
             "top_score": round(float(result["confidence"]), 2),
+            "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
+            "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
         })
 
         yield _sse("done", {
@@ -3202,7 +3234,7 @@ def _dashboard_compute(days: int = 30) -> dict:
         if q:
             words = q.lower().split()[:3]
             topics[" ".join(words)] += 1
-    hot_topics = sorted(topics.items(), key=lambda x: -x[1])[:15]
+    hot_topics = sorted(topics.items(), key=lambda x: -x[1])[:5]
 
     # Chat keyword cloud — per-word frequency over user-initiated queries
     # (chat/web/whatsapp), not ambient/eval synthetic traffic. Tokenises
@@ -3259,7 +3291,7 @@ def _dashboard_compute(days: int = 30) -> dict:
             keyword_counts[folded] += 1
     chat_keywords = [
         {"word": w, "count": c}
-        for w, c in sorted(keyword_counts.items(), key=lambda x: -x[1])[:60]
+        for w, c in sorted(keyword_counts.items(), key=lambda x: -x[1])[:5]
         if c >= 2  # skip hapax — noise dominates
     ]
 
@@ -3333,12 +3365,15 @@ def _dashboard_compute(days: int = 30) -> dict:
 
     # ── Feedback ─────────────────────────────────────────────────────
     fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
-    fb_pos = sum(1 for e in fb_entries if e.get("rating") == 1)
-    fb_neg = sum(1 for e in fb_entries if e.get("rating") == -1)
+    fb_recent_window = [e for e in fb_entries if (t := _ts(e)) and t >= cutoff]
+    fb_pos = sum(1 for e in fb_recent_window if e.get("rating") == 1)
+    fb_neg = sum(1 for e in fb_recent_window if e.get("rating") == -1)
+    fb_pos_all = sum(1 for e in fb_entries if e.get("rating") == 1)
+    fb_neg_all = sum(1 for e in fb_entries if e.get("rating") == -1)
 
     # Actionable feedback for RAG improvement (uses the *full* fb log, not windowed —
     # negative signals are rare and we want all of them).
-    fb_recent = [e for e in fb_entries if (t := _ts(e)) and t >= cutoff]
+    fb_recent = fb_recent_window
     neg_path_counts: dict[str, int] = defaultdict(int)
     pos_path_counts: dict[str, int] = defaultdict(int)
     for e in fb_entries:
@@ -3422,15 +3457,15 @@ def _dashboard_compute(days: int = 30) -> dict:
         ),
         "top_negative_paths": [
             {"path": p, "count": c, "pos_count": pos_path_counts.get(p, 0)}
-            for p, c in sorted(neg_path_counts.items(), key=lambda x: -x[1])[:8]
+            for p, c in sorted(neg_path_counts.items(), key=lambda x: -x[1])[:5]
         ],
         "top_positive_paths": [
             {"path": p, "count": c}
-            for p, c in sorted(pos_path_counts.items(), key=lambda x: -x[1])[:8]
+            for p, c in sorted(pos_path_counts.items(), key=lambda x: -x[1])[:5]
         ],
-        "corrective_misses": corrective_misses[:10],
+        "corrective_misses": corrective_misses[:5],
         "n_corrective_misses": len(corrective_misses),
-        "negative_reasons": neg_reasons[:10],
+        "negative_reasons": neg_reasons[:5],
         "false_confident": false_confident,
         "false_gated": false_gated,
         "per_day_pos": dict(sorted(fb_pos_per_day.items())),
@@ -3522,7 +3557,9 @@ def _dashboard_compute(days: int = 30) -> dict:
         top_pr = sorted(pr.items(), key=lambda x: -x[1])[:5] if pr else []
         index_stats = {
             "chunks": n_chunks,
-            "notes": len(corpus.get("title_to_paths", {})),
+            "notes_files": len(corpus.get("outlinks", {})),
+            "notes_titles": len(corpus.get("title_to_paths", {})),
+            "notes": len(corpus.get("outlinks", {})),
             "tags": len(corpus.get("tags", set())),
             "folders": len(corpus.get("folders", set())),
             "top_pagerank": [{"path": p, "score": round(s, 4)} for p, s in top_pr],
@@ -3541,6 +3578,8 @@ def _dashboard_compute(days: int = 30) -> dict:
             "avg_generate": round(statistics.mean(t_gens), 2) if t_gens else None,
             "feedback_positive": fb_pos,
             "feedback_negative": fb_neg,
+            "feedback_positive_all_time": fb_pos_all,
+            "feedback_negative_all_time": fb_neg_all,
             "sessions": session_count,
             "wa_sessions": wa_sessions,
             "ambient_hooks": len(ambient_recent),

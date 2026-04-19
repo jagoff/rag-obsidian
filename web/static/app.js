@@ -794,9 +794,16 @@ marked.use({
 });
 
 function preprocess(text) {
-  let out = text.replace(/<<ext>>([\s\S]*?)<<\/ext>>/g, (_, body) => {
+  // Accept malformed closings (LLM frequently drops one `<` or `>`):
+  //   <<ext>>…<</ext>>   canonical
+  //   <<ext>>…</ext>>    one `<` dropped  ← caso real observado
+  //   <<ext>>…<</ext>    one `>` dropped
+  //   <<ext>>…</ext>     both dropped
+  let out = text.replace(/<<ext>>([\s\S]*?)<{1,2}\/ext>{1,2}/g, (_, body) => {
     return `\u0000EXT_OPEN\u0000${body}\u0000EXT_CLOSE\u0000`;
   });
+  // Strip any stray opener/closer that survived (no partner found).
+  out = out.replace(/<{1,2}\/?ext>{1,2}/g, "");
   out = out.replace(/\[\[([^\]]+)\]\]/g, (_, name) => {
     return `[${name}](${name}.md)`;
   });
@@ -837,6 +844,28 @@ async function send(question) {
   let confidence = null;
   let metaShown = false;
   let aborted = false;
+  // Tool-call progress chips — persist across the thinking→token boundary
+  // so `status {stage:"tool"}` events keep rendering after the dots
+  // disappear. Chips are appended in fire order; duplicates across rounds
+  // coexist (each status event = one chip).
+  let toolsBar = null;
+  const toolChips = [];
+  function ensureToolsBar() {
+    if (toolsBar) return toolsBar;
+    toolsBar = el("div", "tools-bar");
+    // Insert right after the user line so chips sit above thinking/reply.
+    if (thinking.isConnected) turn.insertBefore(toolsBar, thinking);
+    else turn.appendChild(toolsBar);
+    return toolsBar;
+  }
+  function clearToolChips() {
+    if (toolsBar && toolsBar.isConnected) toolsBar.remove();
+    toolsBar = null;
+    toolChips.length = 0;
+  }
+  function stopAllChipPulses() {
+    for (const c of toolChips) c.classList.remove("pending");
+  }
 
   try {
     const res = await fetch("/api/chat", {

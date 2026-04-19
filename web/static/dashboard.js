@@ -46,7 +46,7 @@ applyChartDefaults();
 
 // ── State ─────────────────────────────────────────────────────────────────
 const POLL_MS = 60_000;        // refresh aggregations every 60s; SSE pushes live deltas in between
-const TICKER_MAX = 12;         // live events kept on screen
+const TICKER_MAX = 5;          // live events kept on screen
 
 const state = {
   days: 30,
@@ -535,7 +535,7 @@ function refresh(d) {
   // KPIs
   const kpis = [
     { key: "queries", label: "Queries", value: k.total_queries, cls: "cyan", sub: `${k.total_queries_all_time} all-time` },
-    { key: "notes", label: "Notas indexadas", value: idx.notes || "—", cls: "green", sub: `${idx.chunks || 0} chunks` },
+    { key: "notes", label: "Notas indexadas", value: idx.notes_files ?? idx.notes ?? "—", cls: "green", sub: `${idx.chunks || 0} chunks · ${idx.notes_titles ?? "—"} títulos únicos` },
     { key: "latency", label: "Latencia promedio", value: k.avg_latency ? `${k.avg_latency}s` : "—", cls: "yellow", sub: `ret ${k.avg_retrieve || "—"}s · gen ${k.avg_generate || "—"}s` },
     { key: "feedback", label: "Feedback +/-", value: `${k.feedback_positive}/${k.feedback_negative}`, cls: "green", sub: k.feedback_positive + k.feedback_negative > 0 ? `${Math.round(k.feedback_positive / (k.feedback_positive + k.feedback_negative) * 100)}% positivo` : "sin feedback" },
     { key: "sessions", label: "Sesiones", value: k.sessions, cls: "purple", sub: `${k.wa_sessions} WhatsApp` },
@@ -624,7 +624,7 @@ function refresh(d) {
   setEmpty(state.charts.cmds, !cmdLabels.length);
 
   // Topics
-  const topicData = (d.hot_topics || []).filter(t => t.count >= 2).slice(0, 12);
+  const topicData = (d.hot_topics || []).filter(t => t.count >= 2).slice(0, 5);
   state.charts.topics.data.labels = topicData.map(t => t.topic);
   state.charts.topics.data.datasets[0].data = topicData.map(t => t.count);
   state.charts.topics.update("none");
@@ -665,9 +665,12 @@ function refresh(d) {
   // Index stats
   const idxEl = document.getElementById("index-content");
   if (idx.chunks) {
+    const nFiles = idx.notes_files ?? idx.notes ?? 0;
+    const nTitles = idx.notes_titles ?? idx.notes ?? 0;
     let rows = `
       <tr><td>Chunks</td><td>${idx.chunks.toLocaleString()}</td></tr>
-      <tr><td>Notas</td><td>${idx.notes.toLocaleString()}</td></tr>
+      <tr><td>Notas (archivos)</td><td>${Number(nFiles).toLocaleString()}</td></tr>
+      <tr><td>Títulos únicos</td><td>${Number(nTitles).toLocaleString()}</td></tr>
       <tr><td>Tags</td><td>${idx.tags}</td></tr>
       <tr><td>Carpetas</td><td>${idx.folders}</td></tr>
     `;
@@ -704,7 +707,7 @@ function refresh(d) {
   const stDailyCh = state.charts.screentimeDaily;
   const stTotalEl = document.getElementById("screentime-total");
   if (st.available && (st.top_apps?.length || st.daily?.length)) {
-    const apps = (st.top_apps || []).slice(0, 8);
+    const apps = (st.top_apps || []).slice(0, 5);
     stAppsCh.data.labels = apps.map(a => a.label || a.bundle);
     stAppsCh.data.datasets[0].data = apps.map(a => a.secs);
     stAppsCh.update("none");
@@ -736,7 +739,7 @@ function refresh(d) {
   // Tune history
   const tuneEl = document.getElementById("tune-content");
   if (d.tune_history.length) {
-    tuneEl.innerHTML = d.tune_history.map(t => `
+    tuneEl.innerHTML = d.tune_history.slice(-5).reverse().map(t => `
       <div class="tune-row">
         <span class="tune-date">${shortDate(t.ts)}</span>
         <span class="tune-metric">hit: ${fmt(t.baseline_hit)} → ${fmt(t.best_hit)}</span>
@@ -784,7 +787,7 @@ function renderKeywordCloud(items) {
   const sumAll = counts.reduce((a, b) => a + b, 0);
   const frag = document.createDocumentFragment();
   // Shuffle so the cloud feels organic, not sorted by frequency.
-  const shuffled = items.slice().sort(() => Math.random() - 0.5);
+  const shuffled = items.slice(0, 5).sort(() => Math.random() - 0.5);
   for (const { word, count } of shuffled) {
     const lv = Math.log(count + 1);
     const tier = Math.min(5, Math.max(1, Math.ceil(((lv - minLog) / span) * 5) || 1));
@@ -1285,7 +1288,7 @@ function memSyncHeader() {
   if (topEl) {
     const top = (MEM.current && MEM.current.top) || [];
     topEl.innerHTML = top.length
-      ? top.slice(0, 10).map((p) => {
+      ? top.slice(0, 5).map((p) => {
           const sev = severityFor(MEM_THRESHOLDS_MB, p.name, p.mb);
           const tip = sev === "ok" ? p.name
             : `${p.name} · ${sev === "hot" ? "consumo alto" : "consumo elevado"}`;
@@ -1483,7 +1486,7 @@ function cpuSyncHeader() {
   if (topEl) {
     const top = (CPU.current && CPU.current.top) || [];
     topEl.innerHTML = top.length
-      ? top.slice(0, 10).map((p) => {
+      ? top.slice(0, 5).map((p) => {
           const sev = severityFor(CPU_THRESHOLDS_PCT, p.name, p.pct);
           const tip = sev === "ok" ? p.name
             : `${p.name} · ${sev === "hot" ? "consumo alto" : "consumo elevado"}`;

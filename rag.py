@@ -2243,11 +2243,21 @@ def auto_index_vault(vault_path: Path) -> dict:
                 orphans = set()
             else:
                 orphans = indexed_files - on_disk
-            for orphan in orphans:
-                stale = col.get(where={"file": orphan}, include=[])
-                if stale["ids"]:
-                    col.delete(ids=stale["ids"])
-                    removed += 1
+            # Double-check per-orphan via is_file() inside the write lock.
+            # rglob on iCloud can return a partial listing during sync (file
+            # exists but momentarily invisible) — without this guard that
+            # single missing path gets deleted from the index. is_file() on
+            # the exact path hits macOS's fileProvider and reliably reflects
+            # the real on-disk state.
+            if orphans:
+                with _collection_write_lock():
+                    for orphan in orphans:
+                        if (vault_path / orphan).is_file():
+                            continue  # false positive from stale rglob
+                        stale = col.get(where={"file": orphan}, include=[])
+                        if stale["ids"]:
+                            col.delete(ids=stale["ids"])
+                            removed += 1
 
     state[key] = _t.time()
     _auto_index_state_save(state)
@@ -8164,7 +8174,8 @@ def _index_single_file(
 
     if not path.is_file():
         if existing_ids:
-            col.delete(ids=existing_ids)
+            with _collection_write_lock():
+                col.delete(ids=existing_ids)
             _invalidate_corpus_cache()
             return "removed"
         return "empty"
@@ -8191,9 +8202,6 @@ def _index_single_file(
             tags = [str(t) for t in (fm.get("tags") or []) if t]
             outlinks = extract_wikilinks(raw)
             # text is derived from clean_md (strips frontmatter), unchanged.
-
-    if existing_ids:
-        col.delete(ids=existing_ids)
 
     # Contextual embedding: generate or retrieve cached document-level summary
     ctx_summary = get_context_summary(text, h, path.stem, folder)
@@ -8232,12 +8240,19 @@ def _index_single_file(
             base_meta[field] = str(v)
 
     metadatas = [dict(base_meta, parent=p) for p in parent_texts]
-    col.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=display_texts,
-        metadatas=metadatas,
-    )
+    # Serialize delete+add so concurrent indexers can't leave the collection
+    # in a half-written state. existing_ids is stale at this point (another
+    # process may have just re-indexed the same file with the same hash —
+    # which would have landed on identical ids, so deleting them is safe).
+    with _collection_write_lock():
+        if existing_ids:
+            col.delete(ids=existing_ids)
+        col.add(
+            ids=ids,
+            embeddings=embeddings,
+            documents=display_texts,
+            metadatas=metadatas,
+        )
     # URL sub-index runs in lockstep — same hash gate, same liveness window.
     try:
         _index_urls(get_urls_db(), doc_id_prefix, raw, path.stem, folder, tags)

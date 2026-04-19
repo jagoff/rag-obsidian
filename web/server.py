@@ -2695,9 +2695,10 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # retrieved context. 5120 covers P99 (5742 tok) with ~10% headroom.
         # Don't raise further without evidence — larger ctx has real prefill
         # cost on command-r:35b.
-        # num_predict 160 caps decode at ~12-15s on command-r:35b worst case
-        # (10 tok/s × 160 = 16s), ~1-2s on qwen2.5:3b. The REGLA 4 prompt
-        # asks for 2-4 sentences which lands at ~80-130 tokens.
+        # num_predict 256: REGLA 5 (web prompt) pide 2-4 oraciones, lo que
+        # aterriza en ~80-180 tok; con la nueva REGLA 4 (preservar URLs) las
+        # respuestas pueden llegar a ~200 tok. Cap previo de 60 cortaba a
+        # media oración. Decode budget: qwen2.5:7b ≈ 30 tok/s → 256 tok ≈ 8s.
         # Prefix caching is automatic in ollama when system prompts match
         # byte-for-byte across requests — see _WEB_SYSTEM_PROMPT for the
         # stable definition that keeps the cache warm. cache_prompt was
@@ -2706,7 +2707,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
             "num_ctx": 4096,
-            "num_predict": 60,
+            "num_predict": 256,
         }
 
         yield _sse("status", {"stage": "generating"})

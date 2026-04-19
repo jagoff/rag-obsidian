@@ -368,13 +368,15 @@ input.addEventListener("keydown", (e) => {
       return;
     }
   }
-  if (e.key === "ArrowUp" &&
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") &&
       !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey &&
       history.length > 0) {
     const v = input.value;
     const caret = input.selectionStart;
-    const onFirstLine = !v.slice(0, caret).includes("\n");
-    if (onFirstLine) {
+    const edgeOk = e.key === "ArrowUp"
+      ? !v.slice(0, caret).includes("\n")
+      : !v.slice(caret).includes("\n");
+    if (edgeOk) {
       e.preventDefault();
       openHistoryPopover();
       return;

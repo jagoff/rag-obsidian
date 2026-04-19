@@ -699,10 +699,12 @@ html, body {
 
 .history-popover {
   left: 0;
-  right: 0;
-  width: auto;
-  max-height: 240px;
-  font-size: 14px;
+  right: auto;
+  width: max-content;
+  max-width: 100%;
+  box-sizing: border-box;
+  max-height: 280px;
+  font-size: 16px;
   color: var(--text);
   padding: 4px;
   gap: 0;
@@ -711,15 +713,16 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 7px 12px;
+  padding: 10px 12px;
   border-radius: 6px;
   cursor: pointer;
   color: var(--text);
   background: transparent;
   transition: background 90ms ease;
   overflow: hidden;
-  line-height: 1.4;
+  line-height: 1.5;
   min-width: 0;
+  box-sizing: border-box;
 }
 .history-item:hover,
 .history-item.active {
@@ -731,7 +734,7 @@ html, body {
   flex-shrink: 0;
   width: 3ch;
   text-align: right;
-  font-size: 12px;
+  font-size: 13px;
   opacity: 0.7;
 }
 .history-item .history-q {

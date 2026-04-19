@@ -32,6 +32,9 @@ py-modules = ["rag", "mcp_server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: multi-process stress tests (>1s wall; opt-out with `-m 'not slow'`)",
+]
 
 [tool.ruff]
 line-length = 100

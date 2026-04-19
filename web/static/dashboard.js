@@ -286,7 +286,7 @@ function buildLayout(d) {
 
     <div class="charts">
       <div class="chart-card wide" id="card-memory">
-        <h2>Memoria del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + chroma-mcp + whatsapp</span> <span id="mem-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+        <h2>Memoria del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp</span> <span id="mem-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
         <div class="memcard-grid">
           <div class="memcard-main">
             <div class="memcard-head">
@@ -311,7 +311,7 @@ function buildLayout(d) {
       </div>
 
       <div class="chart-card wide" id="card-cpu">
-        <h2>CPU del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + chroma-mcp + whatsapp · % de 1 core</span> <span id="cpu-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+        <h2>CPU del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp · % de 1 core</span> <span id="cpu-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
         <div class="memcard-grid">
           <div class="memcard-main">
             <div class="memcard-head">
@@ -1149,7 +1149,7 @@ const MEM_THRESHOLDS_MB = {
   "rag (python)":            [800, 1500],
   "rag (resource_tracker)":  [40, 100],
   "ollama serve":            [400, 800],
-  "chroma-mcp":              [400, 800],
+  "sqlite-vec-gui":          [400, 800],
   "whatsapp-bridge":         [150, 300],
   "whatsapp-listener":       [150, 300],
   "whatsapp-mcp":            [150, 300],
@@ -1160,7 +1160,7 @@ const CPU_THRESHOLDS_PCT = {
   "rag web":                 [60, 150],
   "rag watch":               [80, 200],
   "ollama serve":            [30, 80],
-  "chroma-mcp":              [30, 80],
+  "sqlite-vec-gui":          [30, 80],
   "obsidian-rag-mcp":        [60, 150],
   "whatsapp-bridge":         [15, 40],
   "whatsapp-listener":       [15, 40],
@@ -1177,14 +1177,14 @@ function severityFor(thresholds, label, value) {
 }
 
 // ── RAG-stack memory · live stacked area (2s SSE ticks + 60s backfill) ──
-// Buckets only our stack: rag python, ollama, chroma-mcp, whatsapp-*.
+// Buckets only our stack: rag python, ollama, sqlite-vec, whatsapp-*.
 // System processes outside the rag stack are intentionally excluded.
 const MEM = {
-  cats: ["rag", "ollama", "chroma-mcp", "whatsapp"],
+  cats: ["rag", "ollama", "sqlite-vec", "whatsapp"],
   labels: { "rag": "rag", "ollama": "ollama",
-            "chroma-mcp": "chroma-mcp", "whatsapp": "whatsapp" },
+            "sqlite-vec": "sqlite-vec", "whatsapp": "whatsapp" },
   colors: { "rag": C.orange, "ollama": C.purple,
-            "chroma-mcp": C.cyan, "whatsapp": C.green },
+            "sqlite-vec": C.cyan, "whatsapp": C.green },
   windowMin: 60,
   maxPoints: 1200,
   samples: [],
@@ -1385,11 +1385,11 @@ async function memInit() {
 // so a single ollama runner pegging 4 cores shows ~400%. `ncores`
 // (reported by the server) is used to render a secondary total label.
 const CPU = {
-  cats: ["rag", "ollama", "chroma-mcp", "whatsapp"],
+  cats: ["rag", "ollama", "sqlite-vec", "whatsapp"],
   labels: { "rag": "rag", "ollama": "ollama",
-            "chroma-mcp": "chroma-mcp", "whatsapp": "whatsapp" },
+            "sqlite-vec": "sqlite-vec", "whatsapp": "whatsapp" },
   colors: { "rag": C.orange, "ollama": C.purple,
-            "chroma-mcp": C.cyan, "whatsapp": C.green },
+            "sqlite-vec": C.cyan, "whatsapp": C.green },
   windowMin: 60,
   maxPoints: 1200,
   samples: [],

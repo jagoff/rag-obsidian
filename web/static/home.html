@@ -191,6 +191,37 @@
     .narrative a:hover { text-decoration: underline; }
     .narrative code { color: var(--yellow); font-size: 13px; }
 
+    /* ── "Para mañana" → Apple Reminder shortcut ───────────────
+       Each <li> under the "Para mañana" heading gets an inline
+       enter-arrow button. Faint by default so the narrative reads
+       clean; shows on hover. Click posts to /api/reminders/create
+       with due=tomorrow 09:00. Successful create → green check. */
+    .narrative .add-reminder-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-faint);
+      padding: 1px 4px;
+      margin-left: 6px;
+      cursor: pointer;
+      vertical-align: -2px;
+      opacity: 0;
+      border-radius: 3px;
+      transition: opacity 120ms ease, color 120ms ease, transform 140ms ease;
+    }
+    .narrative li:hover .add-reminder-btn,
+    .narrative .add-reminder-btn.err,
+    .narrative li.reminder-created .add-reminder-btn { opacity: 0.85; }
+    .narrative .add-reminder-btn:hover { color: var(--cyan); opacity: 1; }
+    .narrative .add-reminder-btn:active { transform: translateY(1px); }
+    .narrative .add-reminder-btn.loading svg { animation: refresh-spin 1s linear infinite; }
+    .narrative .add-reminder-btn.err { color: var(--red); }
+    .narrative li.reminder-created { color: var(--text-dim); }
+    .narrative li.reminder-created .add-reminder-btn { color: var(--green); cursor: default; }
+    .narrative li.reminder-created .add-reminder-btn svg { display: none; }
+    .narrative li.reminder-created .add-reminder-btn::after {
+      content: "✓"; font-size: 12px; line-height: 1;
+    }
+
     /* ── Panel grid (channels) ─────────────────────────────────── */
     .grid {
       display: grid;
@@ -210,8 +241,8 @@
     }
     .panel .head {
       display: flex;
-      justify-content: space-between;
-      align-items: baseline;
+      align-items: center;
+      gap: 8px;
       margin-bottom: 10px;
       padding-bottom: 8px;
       border-bottom: 1px solid var(--border);
@@ -222,12 +253,35 @@
       text-transform: uppercase;
       letter-spacing: 0.08em;
       color: var(--text-dim);
+      flex: 0 1 auto;
     }
     .panel .head .count {
       font-size: 11px;
       color: var(--text-faint);
       font-weight: 400;
+      margin-left: auto;
     }
+    .panel .head .collapse-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-faint);
+      padding: 2px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 3px;
+      opacity: 0;
+      transition: opacity 120ms ease, color 120ms ease;
+    }
+    .panel:hover .head .collapse-btn,
+    .panel.user-collapsed .head .collapse-btn { opacity: 0.75; }
+    .panel .head .collapse-btn:hover { color: var(--cyan); opacity: 1; }
+    .panel .head .collapse-btn svg {
+      display: block;
+      transition: transform 160ms ease;
+    }
+    .panel.user-collapsed .head .collapse-btn svg { transform: rotate(180deg); }
     .panel { min-width: 0; overflow: hidden; }
     .panel ul { list-style: none; flex: 1; min-width: 0; }
     .panel li {
@@ -268,6 +322,28 @@
       font-size: 12px;
       font-style: italic;
     }
+    /* Collapsed shell — shared styling for auto-empty panels AND panels
+       the user explicitly folded. Title row stays, body is gone.
+       Grid order is controlled from JS (applyPanelState) so filled
+       panels can be ranked by importance; auto-empties sink to
+       1000+priority. `align-self:start` stops grid-row stretching. */
+    .panel:has(.empty),
+    .panel.user-collapsed {
+      min-height: 0;
+      padding: 6px 14px;
+      align-self: start;
+    }
+    .panel:has(.empty) .head,
+    .panel.user-collapsed .head {
+      margin-bottom: 0;
+      padding-bottom: 0;
+      border-bottom: none;
+    }
+    .panel:has(.empty) { opacity: 0.55; }
+    .panel.user-collapsed { opacity: 0.75; }
+    .panel:has(.empty) .empty { display: none; }
+    /* Hide body when user collapsed. Keep the .head visible. */
+    .panel.user-collapsed > *:not(.head) { display: none; }
 
     .bucket {
       display: inline-block;
@@ -436,6 +512,6 @@
     <div id="error-wrap"></div>
   </main>
   <script src="/static/vendor/marked.min.js" defer></script>
-  <script src="/static/home.js" defer></script>
+  <script src="/static/home.js?v=2026-04-19f" defer></script>
 </body>
 </html>

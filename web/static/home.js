@@ -120,9 +120,72 @@ function panel(id, title, count, bodyHtml, emptyText = "sin actividad") {
       <div class="head">
         <h3>${esc(title)}</h3>
         <span class="count">${countStr}</span>
+        <button class="collapse-btn" type="button" aria-label="Colapsar/expandir" title="Colapsar / expandir">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="18 15 12 9 6 15"/>
+          </svg>
+        </button>
       </div>
       ${body}
     </section>`;
+}
+
+// ── Panel importance + user collapse state ───────────────────────────────
+// Priority = where this channel belongs when it HAS data. Lower = higher
+// on page. Auto-empty panels get shoved past 1000 so they sink no matter
+// what. User-collapsed panels keep their priority slot (they just fold).
+// Top 6 = inbox (actionable) + loops/signals. Rest is activity, then
+// external context, then ambient/telemetry.
+const PANEL_PRIORITY = {
+  "panel-gmail": 10,
+  "panel-reminders": 20,
+  "panel-calendar": 30,
+  "panel-wa-unreplied": 40,
+  "panel-loops": 50,
+  "panel-contradictions": 60,
+  "panel-aging": 70,
+  "panel-lowconf": 80,
+  "panel-inbox": 90,
+  "panel-activity": 100,
+  "panel-drive": 110,
+  "panel-chrome": 120,
+  "panel-youtube": 125,
+  "panel-bookmarks": 130,
+  "panel-evaltrend": 140,
+  "panel-pagerank": 150,
+  "panel-weather": 160,
+  "panel-finance": 170,
+};
+function panelPriority(id) {
+  if (id in PANEL_PRIORITY) return PANEL_PRIORITY[id];
+  if (id.startsWith("panel-vault-")) return 105;  // between inbox and activity
+  return 200;
+}
+
+const COLLAPSED_KEY = "rag-home-collapsed";
+function getCollapsedSet() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]");
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch (_) { return new Set(); }
+}
+function saveCollapsedSet(set) {
+  try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set])); } catch (_) {}
+}
+
+// Run after every render(): assign inline `order` (empties → 1000+prio so
+// they tail but still keep their category grouping) and restore the
+// user-collapsed class from localStorage.
+function applyPanelState() {
+  const collapsed = getCollapsedSet();
+  document.querySelectorAll("#panels .panel").forEach((p) => {
+    const autoEmpty = !!p.querySelector(".empty");
+    const pri = panelPriority(p.id);
+    p.style.order = autoEmpty ? 1000 + pri : pri;
+    if (collapsed.has(p.id)) p.classList.add("user-collapsed");
+    else p.classList.remove("user-collapsed");
+  });
 }
 
 // ── Renderers per channel ────────────────────────────────────────────────
@@ -235,17 +298,32 @@ function renderWhatsApp(items) {
 }
 
 function renderWeather(w) {
-  if (!w) return panel("weather", "weather", 0, "sin lluvia esperada");
-  let body = `<div class="meta" style="color:var(--text);font-size:13px;margin-bottom:6px;">${esc(w.summary || "")}</div>`;
-  if (Array.isArray(w.forecast) && w.forecast.length) {
+  // API shape from /api/home → weather_forecast:
+  //   { location, current: { description, temp_C },
+  //     days: [{ date, minC, maxC, avgC, description, chanceofrain }] }
+  // Legacy shape kept as fallback: { summary, forecast: [{ day, summary }] }.
+  if (!w) return panel("weather", "weather", 0, "", "sin datos");
+  const cur = w.current || {};
+  const days = Array.isArray(w.days) ? w.days
+    : Array.isArray(w.forecast) ? w.forecast.map((f) => ({ date: f.day, description: f.summary })) : [];
+  const summary = w.summary || cur.description || "";
+  if (!summary && !days.length) return panel("weather", "weather", 0, "", "sin datos");
+  let body = "";
+  if (summary || cur.temp_C) {
+    const temp = cur.temp_C ? ` · ${esc(cur.temp_C)}°` : "";
+    body += `<div class="meta" style="color:var(--text);font-size:13px;margin-bottom:6px;">${esc(summary)}${temp}</div>`;
+  }
+  if (days.length) {
     body += "<ul>";
-    body += w.forecast.slice(0, 5).map((d) => `<li>
-      <b>${esc(d.day || "")}</b>
-      <span class="meta">${esc(d.summary || "")}</span>
-    </li>`).join("");
+    body += days.slice(0, 5).map((d) => {
+      const range = (d.minC && d.maxC) ? `${esc(d.minC)}°–${esc(d.maxC)}°` : "";
+      const rain = Number(d.chanceofrain) >= 50 ? ` · ${d.chanceofrain}% lluvia` : "";
+      const meta = [esc(d.description || ""), range].filter(Boolean).join(" · ") + rain;
+      return `<li><b>${esc(d.date || d.day || "")}</b><span class="meta">${meta}</span></li>`;
+    }).join("");
     body += "</ul>";
   }
-  return panel("weather", "weather", 1, body);
+  return panel("weather", "weather", days.length || 1, body);
 }
 
 function renderLoops(activo, stale) {
@@ -550,8 +628,17 @@ function renderDriveRecent(items) {
 // pages the user reaches for. Item shape: `{ name, url, folder,
 // visit_count, last_visit_iso }`.
 function renderChromeBookmarks(items) {
-  if (!items || !items.length) return panel("bookmarks", "bookmarks 48h", 0, "");
-  const lis = items.slice(0, 5).map((b) => {
+  // Google homepage / search is high-volume noise — visiting it says
+  // nothing about current context. Drop it so the panel stays useful
+  // as a "what am I working on" signal. Sibling google domains
+  // (docs/drive/calendar/etc.) stay — those ARE work context.
+  const filtered = (items || []).filter((b) => {
+    let host = "";
+    try { host = new URL(b.url).host.replace(/^www\./, ""); } catch (_) { return true; }
+    return host !== "google.com";
+  });
+  if (!filtered.length) return panel("bookmarks", "bookmarks 48h", 0, "");
+  const lis = filtered.slice(0, 5).map((b) => {
     let host = "";
     try { host = new URL(b.url).host.replace(/^www\./, ""); } catch (_) { host = ""; }
     const title = truncate(b.name || host || b.url || "", 56);
@@ -563,7 +650,33 @@ function renderChromeBookmarks(items) {
       <span class="bucket today">${count}</span>
     </li>`;
   }).join("");
-  return panel("bookmarks", "bookmarks 48h", items.length, `<ul>${lis}</ul>`);
+  return panel("bookmarks", "bookmarks 48h", filtered.length, `<ul>${lis}</ul>`);
+}
+
+// signals.youtube_watched — recent YouTube /watch pages from Chrome
+// history (last 7 days, deduplicated by video_id). Title comes from the
+// Chrome <title> cache ("Video Title - YouTube" stripped server-side).
+// Thumbnail comes from the canonical i.ytimg.com pattern — no API/key,
+// lazy-loaded so cold paint stays fast.
+function renderYouTubeWatched(items) {
+  if (!items || !items.length) return panel("youtube", "youtube 7d", 0, "");
+  const lis = items.slice(0, 5).map((v) => {
+    const title = truncate(v.title || v.url || "", 60);
+    const when = v.last_visit_iso ? fmtDate(v.last_visit_iso) : "";
+    const vid = v.video_id || "";
+    const thumb = vid
+      ? `<img src="https://i.ytimg.com/vi/${esc(vid)}/mqdefault.jpg" alt="" loading="lazy"
+             style="width:72px;height:40px;object-fit:cover;border-radius:3px;flex:0 0 auto;background:var(--border);">`
+      : "";
+    return `<li style="display:flex;gap:10px;align-items:flex-start;">
+      ${thumb}
+      <div style="min-width:0;flex:1;">
+        <a href="${esc(v.url || "")}" target="_blank" rel="noopener noreferrer"><b>${esc(title)}</b></a>
+        <span class="meta">youtube${when ? " · " + esc(when) : ""}</span>
+      </div>
+    </li>`;
+  }).join("");
+  return panel("youtube", "youtube 7d", items.length, `<ul>${lis}</ul>`);
 }
 
 // signals.vault_activity — per-vault recent notes, never mixed. Shape:
@@ -708,7 +821,96 @@ function renderNarrative(text, source, briefPath, totalSignals) {
     ? marked.parse(stripWikilinks(text))
     : `<pre>${esc(stripWikilinks(text))}</pre>`;
   els.narrative.innerHTML = `<div class="narrative">${html}</div>`;
+  injectTomorrowReminderButtons();
 }
+
+// Tracks which "Para mañana" items were already converted in this tab.
+// Needed because load() re-renders the narrative via innerHTML — the
+// inline `.reminder-created` class would otherwise vanish after refresh
+// and let the user double-post the same item as a new reminder.
+const _createdReminderTexts = new Set();
+
+// Locate the "Para mañana" section in the rendered narrative and annotate
+// each <li> with an "enter arrow" button that POSTs to /api/reminders/create
+// on click. We snapshot the li's text BEFORE appending the button so the
+// icon's accessible-name SVG doesn't leak into the reminder body.
+function injectTomorrowReminderButtons() {
+  const root = els.narrative.querySelector(".narrative");
+  if (!root) return;
+  const heads = [...root.querySelectorAll("h2")];
+  const target = heads.find((h) => /ma[ñn]ana/i.test(h.textContent || ""));
+  if (!target) return;
+  let el = target.nextElementSibling;
+  while (el && el.tagName !== "H2") {
+    if (el.tagName === "UL" || el.tagName === "OL") {
+      [...el.querySelectorAll(":scope > li")].forEach((li) => {
+        if (li.querySelector(".add-reminder-btn")) return;
+        const original = (li.textContent || "").trim();
+        if (!original) return;
+        li.dataset.reminderText = original;
+        const btn = document.createElement("button");
+        btn.className = "add-reminder-btn";
+        btn.type = "button";
+        btn.title = "Crear Apple Reminder (mañana 9:00)";
+        btn.setAttribute("aria-label", "Crear Apple Reminder");
+        btn.innerHTML =
+          '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"' +
+          ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+          '<polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>';
+        li.appendChild(btn);
+        // Persist the created-state across narrative re-renders.
+        if (_createdReminderTexts.has(original)) {
+          li.classList.add("reminder-created");
+          btn.disabled = true;
+          btn.title = "Ya agregado a Reminders";
+        }
+      });
+    }
+    el = el.nextElementSibling;
+  }
+}
+
+// Delegated click handler on the narrative container — narrative HTML is
+// re-rendered via innerHTML every load(), so per-button listeners would
+// leak. Creates the Apple Reminder once per <li>; success paints a green
+// checkmark, error stains the icon red with the message in the tooltip.
+els.narrative.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest(".add-reminder-btn");
+  if (!btn) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const li = btn.closest("li");
+  if (!li || li.classList.contains("reminder-created")) return;
+  const text = li.dataset.reminderText || (li.textContent || "").trim();
+  if (!text) return;
+  btn.disabled = true;
+  btn.classList.add("loading");
+  try {
+    const res = await fetch("/api/reminders/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, due: "tomorrow" }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    _createdReminderTexts.add(text);
+    li.classList.add("reminder-created");
+    btn.title = "Agregado a Reminders";
+    // Server already busted _HOME_STATE cache; fetch fresh so the
+    // reminders panel surfaces the new item without waiting for the
+    // 60s auto-cycle. bypassDebounce because load() otherwise swallows
+    // calls issued within MIN_RELOAD_GAP_MS of the previous one.
+    load(false, { bypassDebounce: true });
+  } catch (e) {
+    btn.classList.add("err");
+    btn.title = "Error: " + (e.message || String(e));
+    btn.disabled = false;
+  } finally {
+    btn.classList.remove("loading");
+  }
+});
 
 // ── Full render ─────────────────────────────────────────────────────────
 function render(data) {
@@ -742,12 +944,14 @@ function render(data) {
     renderFollowupAging(signals.followup_aging),
     renderChromeTopWeek(signals.chrome_top_week),
     renderChromeBookmarks(signals.chrome_bookmarks),
+    renderYouTubeWatched(signals.youtube_watched),
     renderVaultActivity(signals.vault_activity),
     renderDriveRecent(signals.drive_recent),
     renderFinance(signals.finance),
   ].join("");
 
   els.panels.innerHTML = html;
+  applyPanelState();
 
   const source = data.today?.narrative_source || "none";
   const dot = source === "generated" ? '<span class="dot gen">●</span>'
@@ -828,6 +1032,22 @@ function scheduleRefresh() {
 // One button, one action: fetch fresh evidence from every channel AND
 // regenerate the LLM brief. No cache reuse. Takes ~10-15s.
 els.btnRefresh.addEventListener("click", () => load(true));
+
+// Manual collapse toggle: click chevron → fold body, persist in
+// localStorage so the state survives reloads and re-renders. Re-renders
+// call applyPanelState() which restores the class from the stored set.
+els.panels.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".collapse-btn");
+  if (!btn) return;
+  ev.stopPropagation();
+  ev.preventDefault();
+  const p = btn.closest(".panel");
+  if (!p) return;
+  const set = getCollapsedSet();
+  if (p.classList.toggle("user-collapsed")) set.add(p.id);
+  else set.delete(p.id);
+  saveCollapsedSet(set);
+});
 
 // Event delegation on the panels container: the reminders list is
 // re-rendered via innerHTML on every load() so per-element listeners

@@ -290,19 +290,26 @@ def render_response(text: str) -> Text:
             if kind == "url-md":
                 # Terminal-native: label clickeable (OSC 8) + URL en dim entre
                 # paréntesis. Sin brackets markdown — terminal no renderea md.
-                out.append(label, style=_url_link_style(target, url_base))
-                out.append(" (", style="dim")
-                out.append(target, style=_url_link_style(target, url_dim))
-                out.append(")", style="dim")
+                # Si label == target (LLM emitió `[url](url)`), un solo render.
+                if label.strip() == target.strip():
+                    out.append(target, style=_url_link_style(target, url_base))
+                else:
+                    out.append(label, style=_url_link_style(target, url_base))
+                    out.append(" (", style="dim")
+                    out.append(target, style=_url_link_style(target, url_dim))
+                    out.append(")", style="dim")
             elif kind == "url-bare":
                 out.append(target, style=_url_link_style(target, url_base))
             elif kind == "note-bare":
                 out.append(target, style=_file_link_style(target, "magenta"))
             else:  # note-md
-                out.append(label, style=_file_link_style(target, label_base))
-                out.append(" (", style="dim")
-                out.append(target, style=_file_link_style(target, path_base))
-                out.append(")", style="dim")
+                if label.strip() == target.strip():
+                    out.append(target, style=_file_link_style(target, label_base))
+                else:
+                    out.append(label, style=_file_link_style(target, label_base))
+                    out.append(" (", style="dim")
+                    out.append(target, style=_file_link_style(target, path_base))
+                    out.append(")", style="dim")
             last = end
         if last < len(segment):
             emit_plain_or_inline(segment[last:], base_style=base_style)
@@ -15561,6 +15568,59 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
     items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
     return items[:max_items]
+
+
+def _create_reminder(
+    name: str,
+    due_token: str | None = None,
+    list_name: str | None = None,
+) -> tuple[bool, str]:
+    """Create a new Apple Reminder. Returns `(ok, id_or_error)`.
+
+    `due_token="tomorrow"` → due tomorrow 09:00 (system local time,
+    computed inside AppleScript to stay locale-safe). No other tokens
+    supported yet — ISO parsing via AppleScript is locale-dependent,
+    so we keep it to the one shape the home UI needs.
+
+    `list_name` is the Reminders list to write to; omitted → default
+    (first) list. Unknown list name → osascript error surfaced verbatim.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return False, "nombre vacío"
+    if not _apple_enabled():
+        return False, "Apple integration deshabilitada"
+    safe_name = nm.replace('"', '\\"')
+    list_selector = ""
+    if list_name:
+        safe_list = list_name.replace('"', '\\"')
+        list_selector = f' of list "{safe_list}"'
+    due_block = ""
+    if due_token == "tomorrow":
+        due_block = (
+            '    set _d to (current date) + (1 * days)\n'
+            '    set hours of _d to 9\n'
+            '    set minutes of _d to 0\n'
+            '    set seconds of _d to 0\n'
+            '    set due date of _r to _d\n'
+        )
+    script = (
+        'tell application "Reminders"\n'
+        '  try\n'
+        f'    set _r to make new reminder{list_selector} with properties {{name:"{safe_name}"}}\n'
+        f'{due_block}'
+        '    return id of _r\n'
+        '  on error errMsg\n'
+        '    return "err: " & errMsg\n'
+        '  end try\n'
+        'end tell\n'
+    )
+    out = _osascript(script, timeout=15.0)
+    if out.startswith("err:"):
+        return False, out[4:].strip() or "error creando reminder"
+    if out:
+        return True, out
+    return False, "osascript devolvió vacío"
 
 
 def _complete_reminder(reminder_id: str) -> tuple[bool, str]:

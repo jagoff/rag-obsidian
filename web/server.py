@@ -510,6 +510,32 @@ def ollama_unload() -> dict:
     return {"ok": True, "freed_models": freed, "reranker_dropped": reranker_dropped}
 
 
+class ReminderCreateRequest(BaseModel):
+    text: str
+    due: str | None = None   # "tomorrow" or None
+    list: str | None = None  # Reminders list name; None → default
+
+
+@app.post("/api/reminders/create")
+def create_reminder(req: ReminderCreateRequest) -> dict:
+    """Create an Apple Reminder. Called from the daily brief's "Para
+    mañana" items — each <li> has an inline enter-arrow that posts here.
+    `due="tomorrow"` is the expected default from the UI; server computes
+    the concrete time inside AppleScript to stay locale-safe.
+    """
+    from rag import _create_reminder  # noqa: PLC0415
+    ok, res = _create_reminder(req.text, due_token=req.due, list_name=req.list)
+    if not ok:
+        raise HTTPException(status_code=400, detail=res)
+    # Bust the home cache so the new reminder shows up in the reminders
+    # panel on next load without waiting for SWR.
+    try:
+        _HOME_STATE["ts"] = 0.0
+    except Exception:
+        pass
+    return {"ok": True, "id": res}
+
+
 class ReminderCompleteRequest(BaseModel):
     reminder_id: str
 
@@ -1565,6 +1591,90 @@ def _fetch_chrome_top_week(n: int = 5) -> list[dict]:
     return out
 
 
+def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
+    """Most-recent YouTube video pages opened in Chrome, last `hours` window.
+
+    Same Chrome History DB + tmp-copy pattern as `_fetch_chrome_top_week`.
+    Matches `youtube.com/watch`, `m.youtube.com/watch`, and `youtu.be/<id>`.
+    Deduplicates by extracted video id (`v=...` for /watch, path segment
+    for youtu.be) so re-opening the same video doesn't clutter the panel.
+    Titles in Chrome history are the <title> tag at page load — the ad
+    slate title occasionally leaks in instead of the real video title;
+    acceptable noise for an ambient signal.
+    """
+    import shutil
+    import sqlite3
+    import tempfile
+    from urllib.parse import urlparse, parse_qs
+
+    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    if not src.is_file():
+        return []
+
+    CHROME_EPOCH_OFFSET = 11_644_473_600
+    now_ts = time.time()
+    window_start_chrome = int((now_ts - hours * 3_600 + CHROME_EPOCH_OFFSET) * 1_000_000)
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        shutil.copyfile(src, tmp.name)
+        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT u.url AS url, u.title AS title,
+                       COUNT(v.id) AS visit_count,
+                       MAX(v.visit_time) AS last_visit
+                FROM urls u
+                JOIN visits v ON v.url = u.id
+                WHERE v.visit_time >= ?
+                  AND (
+                       u.url LIKE '%://www.youtube.com/watch%'
+                    OR u.url LIKE '%://youtube.com/watch%'
+                    OR u.url LIKE '%://m.youtube.com/watch%'
+                    OR u.url LIKE '%://youtu.be/%'
+                  )
+                GROUP BY u.url
+                ORDER BY last_visit DESC
+                LIMIT 50
+                """,
+                (window_start_chrome,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    seen_ids: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        url = r["url"]
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc.endswith("youtu.be"):
+                vid = parsed.path.strip("/").split("/")[0] or url
+            else:
+                vid = (parse_qs(parsed.query).get("v") or [url])[0]
+        except Exception:
+            vid = url
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        # "Video Title - YouTube" → "Video Title"; Chrome appends " - YouTube"
+        # to the page <title> for every watch page.
+        raw_title = (r["title"] or "").strip()
+        title = raw_title[:-len(" - YouTube")].rstrip() if raw_title.endswith(" - YouTube") else raw_title
+        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+        out.append({
+            "title": title or url,
+            "url": url,
+            "video_id": vid,
+            "visit_count": int(r["visit_count"]),
+            "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
 # Baselines from CLAUDE.md (2026-04-16 post-quick-wins floor). Hardcoded
 # because they're the reference against which the UI renders drift — changing
 # the baseline needs a human decision, not an automatic update from the latest
@@ -2268,6 +2378,7 @@ def _home_compute(regenerate: bool = False) -> dict:
         fut_bookmarks   = pool.submit(_timed, "bookmarks", _fetch_chrome_bookmarks_used, 48, 5)
         fut_vaults      = pool.submit(_timed, "vaults", _fetch_vault_activity, 48, 5)
         fut_finance     = pool.submit(_timed, "finance", _fetch_finance, now)
+        fut_youtube     = pool.submit(_timed, "youtube", _fetch_youtube_watched, 5, 168)
 
         try:
             today_ev = fut_today.result(timeout=30)
@@ -2331,6 +2442,10 @@ def _home_compute(regenerate: bool = False) -> dict:
         with suppress(Exception):
             finance = fut_finance.result(timeout=5)
 
+        youtube_watched: list[dict] = []
+        with suppress(Exception):
+            youtube_watched = fut_youtube.result(timeout=5) or []
+
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week
         signals["eval_trend"] = eval_trend
@@ -2340,6 +2455,7 @@ def _home_compute(regenerate: bool = False) -> dict:
         signals["chrome_bookmarks"] = chrome_bookmarks
         signals["vault_activity"] = vault_activity
         signals["finance"] = finance
+        signals["youtube_watched"] = youtube_watched
     finally:
         # Detach stragglers; they continue warming caches for the next call.
         pool.shutdown(wait=False)
@@ -3626,7 +3742,7 @@ def _stream_payload(kind: str, ev: dict) -> dict:
 #   rag        — obsidian-rag python (watch, morning, today, digest, web,
 #                mcp, chat, query, launchd-spawned jobs, their children)
 #   ollama     — ollama serve + per-model runners (LLM + embeddings)
-#   chroma-mcp — chroma-mcp process pointed at our obsidian-rag data dir
+#   sqlite-vec — sqlite-vec-gui streamlit inspector pointed at ragvec.db
 #   whatsapp   — whatsapp-bridge, whatsapp-listener, whatsapp-mcp, vault-sync
 #
 # System-wide processes (browser, Claude Code, unrelated python) are
@@ -3646,7 +3762,7 @@ _MEMORY_SAMPLE_INTERVAL = 60.0
 _MEMORY_BUFFER: deque = deque(maxlen=_MEMORY_BUFFER_MAX)
 _MEMORY_LOCK = threading.Lock()
 
-_MEMORY_CATEGORIES = ("rag", "ollama", "chroma-mcp", "whatsapp")
+_MEMORY_CATEGORIES = ("rag", "ollama", "sqlite-vec", "whatsapp")
 
 # Order matters: first regex to match claims the process. `whatsapp`
 # goes before `rag` because whatsapp-mcp lives under a path that also
@@ -3655,7 +3771,7 @@ _MEMORY_CATEGORIES = ("rag", "ollama", "chroma-mcp", "whatsapp")
 _RAG_PROC_MATCHERS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("whatsapp",   re.compile(r"whatsapp-(bridge|listener|vault-sync|mcp)")),
     ("ollama",     re.compile(r"(?:^|/)ollama(?:\s|$)")),
-    ("chroma-mcp", re.compile(r"chroma-mcp\b")),
+    ("sqlite-vec", re.compile(r"sqlite-vec-gui\b")),
     ("rag",        re.compile(r"obsidian-rag")),
 )
 
@@ -3687,8 +3803,8 @@ def _rag_proc_label(cmd: str, cat: str) -> str:
         if "ollama serve" in cmd:
             return "ollama serve"
         return "ollama"
-    if cat == "chroma-mcp":
-        return "chroma-mcp"
+    if cat == "sqlite-vec":
+        return "sqlite-vec-gui"
     if cat == "whatsapp":
         for tag in ("whatsapp-bridge", "whatsapp-listener", "whatsapp-vault-sync", "whatsapp-mcp"):
             if tag in cmd:
@@ -3913,7 +4029,7 @@ async def system_memory_stream() -> StreamingResponse:
 
 
 # ── RAG-stack CPU sampler ──────────────────────────────────────────────
-# Same scope as the memory sampler (rag, ollama, chroma-mcp, whatsapp).
+# Same scope as the memory sampler (rag, ollama, sqlite-vec, whatsapp).
 # macOS `ps -o %cpu` is a decaying average, which smears transient load
 # — instead we compute instantaneous CPU% from deltas of cumulative CPU
 # time across two snapshots (`ps -axo pid,cputime,command`). Each caller

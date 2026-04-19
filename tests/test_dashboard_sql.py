@@ -142,32 +142,17 @@ def test_dashboard_sql_path_matches_jsonl_shape(sql_env):
     _write_jsonl(data_dir / "behavior.jsonl", behavior)
 
     sql_out = web_server._dashboard_compute_sql(days=7)
-    jsonl_out = web_server._dashboard_compute_jsonl(days=7)
 
-    # 1. Top-level keys identical.
-    assert sorted(sql_out.keys()) == sorted(jsonl_out.keys())
-
-    # 2. Core KPI counts match.
-    assert sql_out["kpis"]["total_queries"] == jsonl_out["kpis"]["total_queries"] == 20
-    assert sql_out["kpis"]["total_queries_all_time"] == \
-        jsonl_out["kpis"]["total_queries_all_time"] == 20
-    assert sql_out["kpis"]["feedback_positive"] == jsonl_out["kpis"]["feedback_positive"]
-    assert sql_out["kpis"]["feedback_negative"] == jsonl_out["kpis"]["feedback_negative"]
-
-    # 3. Hours heatmap — same count distribution.
-    assert sql_out["hours"] == jsonl_out["hours"]
-
-    # 4. Per-day counts identical.
-    assert sql_out["queries_per_day"] == jsonl_out["queries_per_day"]
-
-    # 5. cmds + sources breakdown identical.
-    assert sql_out["cmds"] == jsonl_out["cmds"]
-    assert sql_out["sources"] == jsonl_out["sources"]
-
-    # 6. Score stats — allow ±1e-6 for float jitter.
-    assert sql_out["score_stats"]["p50"] == pytest.approx(
-        jsonl_out["score_stats"]["p50"], abs=1e-6)
-    assert sql_out["score_distribution"] == jsonl_out["score_distribution"]
+    # Post-T10: SQL path is the only path. Assert core shape + KPIs against
+    # the seed counts rather than against a JSONL reference (which is gone).
+    assert sql_out["kpis"]["total_queries"] == 20
+    assert sql_out["kpis"]["total_queries_all_time"] == 20
+    assert sql_out["kpis"]["feedback_positive"] == 3  # i=0,2,4 rated +1
+    assert sql_out["kpis"]["feedback_negative"] == 2  # i=1,3 rated -1
+    # Hours heatmap has all 24 buckets.
+    assert len(sql_out["hours"]) == 24
+    # Score p50 sits near the mean of 0.3..0.7 cycled across 20 samples.
+    assert 0.3 <= sql_out["score_stats"]["p50"] <= 0.8
 
 
 def test_dashboard_sql_empty_returns_zero_shape(sql_env):
@@ -215,26 +200,32 @@ def test_dashboard_sql_cutoff_filters_properly(sql_env):
     assert d["kpis"]["total_queries_all_time"] == 10
 
 
-def test_dashboard_flag_off_uses_jsonl(jsonl_env):
-    """Flag off, seed only JSONL → JSONL data drives aggregates, SQL untouched."""
+def test_dashboard_flag_off_still_uses_sql(jsonl_env):
+    """Post-T10: RAG_STATE_SQL flag is inert. `_dashboard_compute` always
+    reads from SQL. JSONL on disk is ignored."""
     data_dir = jsonl_env["data_dir"]
-    # JSONL has a query; SQL has none.
+    # JSONL on disk, SQL empty.
     _write_jsonl(data_dir / "queries.jsonl", [{
         "ts": _now_iso(0), "cmd": "query", "q": "from jsonl",
         "top_score": 0.42,
     }])
+    # Also seed SQL so we can prove SQL is the source.
+    _seed_sql(jsonl_env["tmp"], "rag_queries", [{
+        "ts": _now_iso(0), "cmd": "query", "q": "from sql",
+        "top_score": 0.88,
+    }], rag._map_queries_row)
 
     d = web_server._dashboard_compute(days=7)
     assert d["kpis"]["total_queries"] == 1
-    # Dispatcher routed to JSONL path — confirm via a rough sentinel.
-    assert d["score_stats"]["p50"] == pytest.approx(0.42, abs=1e-3)
+    assert d["score_stats"]["p50"] == pytest.approx(0.88, abs=1e-3)
 
 
-def test_dashboard_sql_exception_falls_through(sql_env):
-    """Mock _sql_query_window to raise → JSONL path runs + error logged."""
+def test_dashboard_sql_exception_returns_empty_shape(sql_env):
+    """Post-T10: when the SQL compute raises, the dispatcher logs the error
+    and returns an empty-shape payload (no JSONL fallback)."""
     data_dir = sql_env["data_dir"]
     _write_jsonl(data_dir / "queries.jsonl", [{
-        "ts": _now_iso(0), "cmd": "query", "q": "from jsonl fallback",
+        "ts": _now_iso(0), "cmd": "query", "q": "ignored jsonl",
         "top_score": 0.33,
     }])
 
@@ -242,8 +233,9 @@ def test_dashboard_sql_exception_falls_through(sql_env):
                        side_effect=RuntimeError("boom")):
         d = web_server._dashboard_compute(days=7)
 
-    # JSONL data surfaces — fallback engaged.
-    assert d["kpis"]["total_queries"] == 1
+    # Empty-shape payload, not JSONL-backed.
+    assert d["kpis"]["total_queries"] == 0
+    assert d["kpis"]["total_queries_all_time"] == 0
     # Error log gained a record with the expected event type.
     log_txt = rag._SQL_STATE_ERROR_LOG.read_text(encoding="utf-8")
     assert "dashboard_sql_compute_failed" in log_txt

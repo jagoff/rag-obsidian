@@ -90,22 +90,35 @@ def test_bootstrap_ci_basic_shape():
             encoding="utf-8",
         )
         eval_log = Path(td) / "eval.jsonl"
+        db_dir = Path(td) / "ragvec"
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(rag, "get_db", lambda: _FakeCol())
             mp.setattr(rag, "retrieve", _fake_retrieve)
             mp.setattr(rag, "EVAL_LOG_PATH", eval_log)
+            # Post-T10: eval log lives in rag_eval_runs (SQL).
+            mp.setattr(rag, "DB_PATH", db_dir)
             res = runner.invoke(rag.eval, ["--file", str(qfile)])
             assert res.exit_code == 0, res.output
 
-        lines = [json.loads(l) for l in eval_log.read_text().splitlines() if l.strip()]
-        assert lines
-        snap = lines[-1]["singles"]
+        import sqlite3
+        conn = sqlite3.connect(str(db_dir / "ragvec.db"))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = list(conn.execute(
+                "SELECT singles_hit5, singles_mrr, extra_json "
+                "FROM rag_eval_runs ORDER BY id"
+            ).fetchall())
+        finally:
+            conn.close()
+        assert rows
+        extra = json.loads(rows[-1]["extra_json"] or "{}")
+        snap = extra.get("singles") or {}
         assert "hit5_ci" in snap and "mrr_ci" in snap
         lo, hi = snap["hit5_ci"]
-        assert 0.0 <= lo <= snap["hit5"] <= hi <= 1.0
+        assert 0.0 <= lo <= rows[-1]["singles_hit5"] <= hi <= 1.0
         lo, hi = snap["mrr_ci"]
-        assert 0.0 <= lo <= snap["mrr"] <= hi <= 1.0
+        assert 0.0 <= lo <= rows[-1]["singles_mrr"] <= hi <= 1.0
 
 
 def test_bootstrap_ci_deterministic_with_seed():

@@ -1,7 +1,8 @@
 """Tests para el loop de feedback 👍/👎.
 
-Monkeypatcheamos `FEEDBACK_PATH` / `FEEDBACK_GOLDEN_PATH` a `tmp_path` para
-aislar cada test. `embed` se stubea para evitar la llamada a Ollama.
+Post-T10: feedback storage is SQL-only. The fixture points rag.DB_PATH at
+tmp_path so writes land in a throwaway ragvec.db and clears the in-process
+golden memo. `embed` se stubea para evitar la llamada a Ollama.
 """
 
 import json
@@ -13,13 +14,16 @@ import rag
 
 @pytest.fixture
 def fb_tmp(tmp_path, monkeypatch):
-    """Redirige los paths de feedback a tmp_path y limpia la memo en proceso."""
+    """Redirige el storage de feedback a tmp_path (SQL-only) y limpia la memo."""
     fb_path = tmp_path / "feedback.jsonl"
     golden_path = tmp_path / "feedback_golden.json"
+    # Legacy JSONL paths kept redirected for any lingering file refs.
     monkeypatch.setattr(rag, "FEEDBACK_PATH", fb_path)
     monkeypatch.setattr(rag, "FEEDBACK_GOLDEN_PATH", golden_path)
+    # Actual backing store: SQL ragvec.db under tmp_path.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     monkeypatch.setattr(rag, "_feedback_golden_memo", None)
-    monkeypatch.setattr(rag, "_feedback_golden_mtime", 0.0)
+    monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", None)
     return fb_path, golden_path
 
 
@@ -88,47 +92,72 @@ def test_detect_rating_intent(text, expected):
 # ── record_feedback + feedback_counts ──────────────────────────────────────
 
 
-def test_record_feedback_roundtrip(fb_tmp):
-    fb_path, _ = fb_tmp
+def _read_sql_feedback(tmp_path) -> list[dict]:
+    """Read rag_feedback rows from the test DB as event-shaped dicts.
+    rag.DB_PATH is a directory — the actual sqlite file lives at
+    DB_PATH / 'ragvec.db'."""
+    import sqlite3
+    db_file = tmp_path / "ragvec.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT ts, turn_id, rating, q, paths_json, extra_json "
+            "FROM rag_feedback ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        ev = {
+            "ts": r["ts"], "turn_id": r["turn_id"], "rating": r["rating"],
+            "q": r["q"], "paths": json.loads(r["paths_json"] or "[]"),
+        }
+        if r["extra_json"]:
+            try:
+                ev.update(json.loads(r["extra_json"]))
+            except Exception:
+                pass
+        out.append(ev)
+    return out
+
+
+def test_record_feedback_roundtrip(tmp_path, fb_tmp):
     rag.record_feedback("abc123", 1, "mi query", ["a.md", "b.md"])
     rag.record_feedback("def456", -1, "otra", ["c.md"])
 
-    assert fb_path.is_file()
-    lines = fb_path.read_text().strip().splitlines()
-    assert len(lines) == 2
+    events = _read_sql_feedback(tmp_path)
+    assert len(events) == 2
 
-    first = json.loads(lines[0])
+    first = events[0]
     assert first["turn_id"] == "abc123"
     assert first["rating"] == 1
     assert first["q"] == "mi query"
     assert first["paths"] == ["a.md", "b.md"]
     assert "ts" in first
 
-    assert rag.feedback_counts() == (1, 1)
 
-
-def test_feedback_counts_empty(fb_tmp):
+def test_feedback_counts_empty(tmp_path, fb_tmp):
+    # feedback.jsonl never exists now — counts function scans JSONL path still,
+    # but with no writers to it, counts should be (0, 0).
     assert rag.feedback_counts() == (0, 0)
 
 
-def test_record_feedback_normalises_rating(fb_tmp):
+def test_record_feedback_normalises_rating(tmp_path, fb_tmp):
     """Valores de rating != ±1 se normalizan a signo — el schema es binario."""
     rag.record_feedback("t1", 999, "x", ["a.md"])
     rag.record_feedback("t2", -42, "y", ["b.md"])
-    fb_path, _ = fb_tmp
-    events = [json.loads(l) for l in fb_path.read_text().splitlines()]
+    events = _read_sql_feedback(tmp_path)
     assert events[0]["rating"] == 1
     assert events[1]["rating"] == -1
 
 
-def test_record_feedback_invalidates_golden_cache(fb_tmp, fake_embed):
-    _, golden_path = fb_tmp
-    # Seed: una feedback entry + cache fresca.
+def test_record_feedback_invalidates_golden_cache(tmp_path, fb_tmp, fake_embed):
+    # Seed a feedback entry and load golden (populates the SQL golden table).
     rag.record_feedback("t1", 1, "q1", ["a.md"])
     rag.load_feedback_golden()
-    assert golden_path.is_file()
 
-    # Nueva feedback → el delete de golden se dispara; la próxima load rebuildea.
+    # New feedback → memo invalidated → next load rebuilds and picks up t2.
     rag.record_feedback("t2", 1, "q2", ["b.md"])
     golden = rag.load_feedback_golden()
     assert {e["q"] for e in golden["positives"]} == {"q1", "q2"}

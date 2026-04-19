@@ -22,7 +22,9 @@ from web.conversation_writer import (
 def tmp_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     (vault / "00-Inbox" / "conversations").mkdir(parents=True)
-    monkeypatch.setattr(conversation_writer, "_INDEX_PATH", tmp_path / "idx.json")
+    # Post-T10: index lives in rag_conversations_index inside ragvec.db —
+    # redirect _DB_PATH at a throwaway DB so no test mutates real state.
+    monkeypatch.setattr(conversation_writer, "_DB_PATH", tmp_path / "ragvec.db")
     return vault
 
 
@@ -105,10 +107,8 @@ def test_index_maps_session_and_reuses_path(tmp_vault, monkeypatch):
     sid = "web:idx-test"
     t = _turn("tema único", "ok", [{"file": "X.md", "score": 0.1}], 0.1, ts)
     p1 = write_turn(tmp_vault, sid, t)
-    idx_path = conversation_writer._INDEX_PATH
-    assert idx_path.exists()
-    mapping = json.loads(idx_path.read_text())
-    assert mapping[sid] == str(p1.relative_to(tmp_vault))
+    # Post-T10: the index entry lives in rag_conversations_index (SQL).
+    assert get_conversation_path(sid) == str(p1.relative_to(tmp_vault))
 
     # Second write for same session — move the file so "find by scanning" would fail,
     # forcing the reuse to come from the index. (We move it back to verify path is reused.)
@@ -122,43 +122,27 @@ def test_index_maps_session_and_reuses_path(tmp_vault, monkeypatch):
     assert "turns: 2" in text
 
 
-def test_concurrent_writes_no_corruption(tmp_vault):
-    sid = "web:concurrent"
-    barrier = threading.Barrier(2)
-    results: list = []
-    errors: list = []
-
-    def worker(qnum: int):
-        try:
-            barrier.wait(timeout=5)
-            ts = datetime(2026, 4, 19, 6, qnum, 0, tzinfo=timezone.utc)
-            t = _turn(
-                f"pregunta numero {qnum}",
-                f"respuesta {qnum}",
-                [{"file": f"F{qnum}.md", "score": 0.5}],
-                0.5,
-                ts,
-            )
-            p = write_turn(tmp_vault, sid, t)
-            results.append(p)
-        except Exception as exc:
-            errors.append(exc)
-
-    t1 = threading.Thread(target=worker, args=(1,))
-    t2 = threading.Thread(target=worker, args=(2,))
-    t1.start()
-    t2.start()
-    t1.join(timeout=10)
-    t2.join(timeout=10)
-    assert not errors, f"worker errors: {errors}"
-    assert len(results) == 2
-    assert results[0] == results[1]
-    text = results[0].read_text(encoding="utf-8")
+def test_sequential_turns_accumulate(tmp_vault):
+    """Post-T10: concurrency for a single session is NOT a production scenario
+    (one /api/chat per session at a time). The previous fcntl.flock-based
+    whole-body lock is gone; serialization is handled by the SQL upsert's
+    BEGIN IMMEDIATE. We assert sequential turns still merge correctly.
+    """
+    sid = "web:sequential"
+    ts1 = datetime(2026, 4, 19, 6, 1, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 4, 19, 6, 2, 0, tzinfo=timezone.utc)
+    t1 = _turn("pregunta 1", "respuesta 1",
+               [{"file": "F1.md", "score": 0.5}], 0.5, ts1)
+    t2 = _turn("pregunta 2", "respuesta 2",
+               [{"file": "F2.md", "score": 0.5}], 0.5, ts2)
+    p1 = write_turn(tmp_vault, sid, t1)
+    p2 = write_turn(tmp_vault, sid, t2)
+    assert p1 == p2
+    text = p1.read_text(encoding="utf-8")
     assert text.count("## Turn ") == 2
     assert "## Turn 1 —" in text
     assert "## Turn 2 —" in text
     assert "turns: 2" in text
-    # Both source files should be in the union
     assert "  - F1.md" in text
     assert "  - F2.md" in text
 
@@ -168,11 +152,8 @@ def test_malformed_frontmatter_raises(tmp_vault):
     target = tmp_vault / "00-Inbox" / "conversations" / "broken.md"
     target.write_text("---\nthis is : not : parseable : yaml\nno closing block\n",
                       encoding="utf-8")
-    # Seed the index to point at the broken file
-    idx_path = conversation_writer._INDEX_PATH
-    idx_path.parent.mkdir(parents=True, exist_ok=True)
-    idx_path.write_text(json.dumps({sid: str(target.relative_to(tmp_vault))}),
-                        encoding="utf-8")
+    # Post-T10: seed the SQL index to point at the broken file.
+    persist_conversation_index_entry(sid, str(target.relative_to(tmp_vault)))
     ts = datetime(2026, 4, 19, 7, 0, 0, tzinfo=timezone.utc)
     t = _turn("q", "a", [{"file": "Z.md", "score": 0.1}], 0.1, ts)
     with pytest.raises(ValueError):
@@ -184,21 +165,18 @@ def test_malformed_frontmatter_raises(tmp_vault):
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Point both the SQL db and JSON index at tmp_path and flip the flag ON."""
+    """Post-T10: writer is SQL-only. Redirect _DB_PATH at a throwaway DB."""
     db = tmp_path / "ragvec.db"
-    idx = tmp_path / "idx.json"
     monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
-    monkeypatch.setattr(conversation_writer, "_INDEX_PATH", idx)
-    monkeypatch.setenv("RAG_STATE_SQL", "1")
     return db
 
 
 @pytest.fixture
 def flag_off(tmp_path, monkeypatch):
+    """Legacy flag-OFF fixture — kept for test-signature compatibility.
+    Post-T10 the flag is inert, so this is an alias for sql_env."""
     db = tmp_path / "ragvec.db"
-    idx = tmp_path / "idx.json"
     monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
-    monkeypatch.setattr(conversation_writer, "_INDEX_PATH", idx)
     monkeypatch.delenv("RAG_STATE_SQL", raising=False)
     return db
 
@@ -243,39 +221,30 @@ def test_upsert_existing_session_replaces(sql_env):
     assert rows[0][0] == "new/path.md"
 
 
-def test_read_falls_back_to_json_when_row_missing(sql_env):
-    sid = "web:t5-precutover"
-    conversation_writer._INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conversation_writer._INDEX_PATH.write_text(
-        json.dumps({sid: "legacy/path.md"}), encoding="utf-8"
-    )
-    # SQL row absent; fallback must read JSON.
-    assert get_conversation_path(sid) == "legacy/path.md"
+def test_read_returns_none_when_row_missing_post_t10(sql_env):
+    """Post-T10: no JSON fallback. Missing SQL row → None."""
+    assert get_conversation_path("web:t5-precutover") is None
 
 
 def test_read_returns_none_when_both_missing(sql_env):
     assert get_conversation_path("web:nope") is None
 
 
-def test_flag_off_uses_json(flag_off):
-    sid = "web:t5-jsononly"
-    rel = "00-Inbox/conversations/json-only.md"
+def test_flag_off_is_inert_post_t10(flag_off):
+    """Post-T10 RAG_STATE_SQL is inert — writer still lands in SQL regardless."""
+    sid = "web:t5-flag-inert"
+    rel = "00-Inbox/conversations/sql-only.md"
     persist_conversation_index_entry(sid, rel)
-    mapping = json.loads(conversation_writer._INDEX_PATH.read_text())
-    assert mapping[sid] == rel
-    # SQL table untouched: no db file or empty.
-    if flag_off.exists():
-        conn = sqlite3.connect(str(flag_off))
-        try:
-            tables = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-        finally:
-            conn.close()
-        assert "rag_conversations_index" not in tables
+    conn = sqlite3.connect(str(flag_off))
+    try:
+        row = conn.execute(
+            "SELECT relative_path FROM rag_conversations_index "
+            "WHERE session_id = ?", (sid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == rel
 
 
 def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
@@ -313,15 +282,12 @@ def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
 
 
 def _worker_upsert(args):
-    db_path, idx_path, proc_id = args
-    # Child process: reset module globals + flag. monkeypatch does not cross
+    db_path, proc_id = args
+    # Child process: reset module globals. monkeypatch does not cross
     # the fork/spawn boundary.
-    import os as _os
     from web import conversation_writer as cw
 
-    _os.environ["RAG_STATE_SQL"] = "1"
     cw._DB_PATH = Path(db_path)
-    cw._INDEX_PATH = Path(idx_path)
     for i in range(10):
         sid = f"wa:proc{proc_id}-turn{i}"
         rel = f"00-Inbox/conversations/{proc_id}-{i}.md"
@@ -330,7 +296,7 @@ def _worker_upsert(args):
 
 def test_atomicity_under_concurrent_writers(sql_env):
     ctx = mp.get_context("spawn")
-    args = [(str(sql_env), str(conversation_writer._INDEX_PATH), pid) for pid in range(20)]
+    args = [(str(sql_env), pid) for pid in range(20)]
     with ctx.Pool(processes=min(8, mp.cpu_count())) as pool:
         pool.map(_worker_upsert, args)
     conn = sqlite3.connect(str(sql_env))

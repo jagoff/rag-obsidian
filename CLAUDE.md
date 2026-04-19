@@ -172,9 +172,9 @@ score = rerank_logit
       - w.feedback_neg                          [if path in feedback- cosine≥0.80]
 ```
 
-Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0, click_*=0, dwell_score=0` preserve pre-tune behavior. Behavior knobs are inert until `behavior.jsonl` accumulates signal and `rag tune` finds non-zero weights.
+Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0, click_*=0, dwell_score=0` preserve pre-tune behavior. Behavior knobs are inert until `rag_behavior` accumulates signal and `rag tune` finds non-zero weights.
 
-Behavior priors (`_load_behavior_priors()`): read from `behavior.jsonl`, cached per mtime/size. Positive events: `open`, `positive_implicit`, `save`, `kept`. Negative: `negative_implicit`, `deleted`. CTR uses Laplace smoothing `(clicks+1)/(impressions+10)`.
+Behavior priors (`_load_behavior_priors()`): read from `rag_behavior` (SQL), cached per MAX(ts). Positive events: `open`, `positive_implicit`, `save`, `kept`. Negative: `negative_implicit`, `deleted`. CTR uses Laplace smoothing `(clicks+1)/(impressions+10)`.
 
 ## Key subsystems — contracts only
 
@@ -182,11 +182,11 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 **Sessions**: JSON per session in `sessions/<id>.json`. TTL 30d, cap 50 turns, history window 6. IDs validated `^[A-Za-z0-9_.:-]{1,64}$`; invalid → mint fresh. WhatsApp passes `wa:<jid>`.
 
-**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread that appends the turn to `00-Inbox/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). Sidecar index at `~/.local/share/obsidian-rag/conversations_index.json` maps `session_id → relative_path` so the folder isn't rescanned on every turn. Atomic write via `os.replace` + `fcntl.flock`. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Indexed automatically by `com.fer.obsidian-rag-watch` (no exclusion rule matches), so conversations become retrievable within one debounce cycle (~3s). Do NOT edit these notes manually — system artifacts. Curate by moving to PARA.
+**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread that appends the turn to `00-Inbox/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). The session_id → relative_path index lives in `rag_conversations_index` (SQL, upsert). Atomic .md write via `os.replace`; concurrent writes for the same session are not a production scenario (one /api/chat per session at a time) so the pre-T10 whole-body fcntl lock is gone — SQL upsert inside `BEGIN IMMEDIATE` handles index serialisation. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Indexed automatically by `com.fer.obsidian-rag-watch` (no exclusion rule matches), so conversations become retrievable within one debounce cycle (~3s). Do NOT edit these notes manually — system artifacts. Curate by moving to PARA.
 
-**Ambient agent**: hook in `_index_single_file` on saves within `allowed_folders` (default `["00-Inbox"]`). Config: `~/.local/share/obsidian-rag/ambient.json` (`{jid, enabled, allowed_folders?}`). Skip rules: outside allowed_folders, no config, frontmatter `ambient: skip`, `type: morning-brief|weekly-digest|prep`, dedup 5min. Sends via `whatsapp-bridge` POST (`http://localhost:8080/api/send`). Bridge down = message lost but analysis persists in `ambient.jsonl`.
+**Ambient agent**: hook in `_index_single_file` on saves within `allowed_folders` (default `["00-Inbox"]`). Config: `~/.local/share/obsidian-rag/ambient.json` (`{jid, enabled, allowed_folders?}`). Skip rules: outside allowed_folders, no config, frontmatter `ambient: skip`, `type: morning-brief|weekly-digest|prep`, dedup 5min (upsert on `rag_ambient_state.path`). Sends via `whatsapp-bridge` POST (`http://localhost:8080/api/send`). Bridge down = message lost but analysis persists in `rag_ambient`.
 
-**Contradiction radar**: Phase 1 (query-time `--counter`), Phase 2 (index-time frontmatter `contradicts:` + `contradictions.jsonl`), Phase 3 (`rag digest` weekly). Skipped on `--reset` (O(n²)) and `note_body < 200 chars`.
+**Contradiction radar**: Phase 1 (query-time `--counter`), Phase 2 (index-time frontmatter `contradicts:` + `rag_contradictions`), Phase 3 (`rag digest` weekly). Skipped on `--reset` (O(n²)) and `note_body < 200 chars`.
 
 **URL sub-index**: `obsidian_urls_v1` collection embeds **prose context** (±240 chars) not URL strings. `PER_FILE_CAP=2`. Auto-backfill on first `find_urls()` if collection empty.
 
@@ -204,7 +204,7 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 **Read**: fetch URL → readability strip → gate (< 500 chars = error) → command-r summary → two-pass related lookup → tags from existing vocab (never invents) → `00-Inbox/`. Dry-run default, `--save` to write.
 
-**Ranker-vivo (closed-loop ranker)**: implicit feedback from daily use re-tunes `ranker.json` nightly without manual intervention. Four signal sources append to `behavior.jsonl`: (1) CLI `rag open` wrapper (opt-in via `RAG_TRACK_OPENS=1` + user-registered `x-rag-open://` handler); (2) WhatsApp listener classifying follow-up turns (`/save`, quoted reply → positive; "no"/"la otra"/rephrase → negative; 120s silence → weak positive); (3) web `/api/behavior` POST from home dashboard `sendBeacon` clicks; (4) morning/today brief diff (`_diff_brief_signal` compares yesterday's written brief vs current on-disk — wikilinks that survived = `kept`, missing = `deleted`, dedup via `brief_state.jsonl`). Nightly `com.fer.obsidian-rag-online-tune` at 03:30 runs `rag tune --online --days 14 --apply --yes`, which calls `_behavior_augmented_cases` (weight=0.5, drops conflicts), backs up current `ranker.json` → `ranker.{ts}.json` (keeps 3 newest), re-tunes, runs the bootstrap-CI gate (`_run_eval_gate`: scrubs `RAG_EXPLORE`, subprocess `rag eval`, 10min cap, regex parses hit@5). If singles < 76.19% OR chains < 63.64% (lower CI bounds of the 2026-04-17 expanded floor) → auto-rollback + exit 1 + log to `tune.jsonl`. `rag tune --rollback` restores the most recent backup manually.
+**Ranker-vivo (closed-loop ranker)**: implicit feedback from daily use re-tunes `ranker.json` nightly without manual intervention. Four signal sources insert into `rag_behavior`: (1) CLI `rag open` wrapper (opt-in via `RAG_TRACK_OPENS=1` + user-registered `x-rag-open://` handler); (2) WhatsApp listener classifying follow-up turns (`/save`, quoted reply → positive; "no"/"la otra"/rephrase → negative; 120s silence → weak positive); (3) web `/api/behavior` POST from home dashboard `sendBeacon` clicks; (4) morning/today brief diff (`_diff_brief_signal` compares yesterday's written brief vs current on-disk — wikilinks that survived = `kept`, missing = `deleted`, dedup via `rag_brief_state`). Nightly `com.fer.obsidian-rag-online-tune` at 03:30 runs `rag tune --online --days 14 --apply --yes`, which calls `_behavior_augmented_cases` (weight=0.5, drops conflicts), backs up current `ranker.json` → `ranker.{ts}.json` (keeps 3 newest), re-tunes, runs the bootstrap-CI gate (`_run_eval_gate`: scrubs `RAG_EXPLORE`, subprocess `rag eval`, 10min cap, regex parses hit@5). If singles < 76.19% OR chains < 63.64% (lower CI bounds of the 2026-04-17 expanded floor) → auto-rollback + exit 1 + log to `rag_tune`. `rag tune --rollback` restores the most recent backup manually.
 
 ## Eval baselines
 
@@ -231,9 +231,9 @@ Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 
-### Telemetry — SQL tables (post-cutover 2026-04-19)
+### Telemetry — SQL tables (post-T10 2026-04-19)
 
-All operational telemetry + learning state now lives in `ragvec/ragvec.db` alongside the sqlite-vec meta/vec tables. 20 `rag_*` prefixed tables (no collision with `meta_*`/`vec_*`). Gated by `RAG_STATE_SQL=1`, set on every launchd plist at cutover. Legacy JSONL writes/reads still live in `rag.py` as fallback — T10 (~2026-04-26, +7d observation) strips them.
+All operational telemetry + learning state lives in `ragvec/ragvec.db` alongside the sqlite-vec meta/vec tables. 20 `rag_*` prefixed tables (no collision with `meta_*`/`vec_*`). SQL is now the only storage path — T10 (2026-04-19, same day as cutover) stripped the JSONL writers + readers so there is no 7-day observation window. `RAG_STATE_SQL=1` is still set on every launchd plist for trail/future-proofing, but it is now a no-op toggle: the flag is not consulted anywhere in the code (neither writers nor readers branch on it). Leaving it set costs nothing and keeps the deployment config ready for rollback.
 
 Log-style tables (`id INTEGER PK AUTOINCREMENT`, `ts TEXT` ISO-8601, indexed):
 - `rag_queries` — query log (q, variants_json, paths_json, scores_json, top_score, t_retrieve, t_gen, cmd, session, mode, citation_repaired, critique_fired/changed, extra_json). Retention 90d via `rag maintenance`.
@@ -249,18 +249,24 @@ Log-style tables (`id INTEGER PK AUTOINCREMENT`, `ts TEXT` ISO-8601, indexed):
 
 State-style tables:
 - `rag_conversations_index` — episodic session_id → relative_path (web/conversation_writer.py upsert; replaces the old conversations_index.json + fcntl dance).
-- `rag_feedback_golden` (pk=path,rating, `embedding BLOB` float32 little-endian, `source_ts`) + `rag_feedback_golden_meta` (k/v) — cache rebuilt when `rag_feedback.max(ts) > meta.last_built_source_ts`.
+- `rag_feedback_golden` (pk=path,rating, `embedding BLOB` float32 little-endian, `source_ts`) + `rag_feedback_golden_meta` (k/v) — cache rebuilt when `rag_feedback.max(ts) > meta.last_built_source_ts`. `record_feedback` clears both tables synchronously so the next `load_feedback_golden()` call always rebuilds (sidesteps a same-second MAX(ts) collision that could leave a stale cache).
 
 Primitives in `rag.py` (`# ── SQL state store (T1: foundation) ──` section):
 - `_ensure_telemetry_tables(conn)` — idempotent DDL
 - `_ragvec_state_conn()` — short-lived WAL conn with `synchronous=NORMAL` + `busy_timeout=10000`
 - `_sql_append_event(conn, table, row)`, `_sql_upsert(conn, table, row, pk_cols)`, `_sql_query_window(conn, table, since_ts, ...)`, `_sql_max_ts(conn, table)`
 
-Writer contract: if flag ON, single-row BEGIN/COMMIT into SQL; on exception, log to `sql_state_errors.jsonl` and fall through to JSONL (cutover fail-safe). Reader contract: if flag ON + SQL has data, return SQL; if SQL empty or raises, fall through to JSONL (historical data bridge).
+Writer contract (post-T10): single-row BEGIN/COMMIT into SQL. On exception, log the error to `sql_state_errors.jsonl` and **silently drop the event** — no JSONL fallback. Callers never see a raised exception. Reader contract: SQL-only. Readers return empty snapshots (behavior priors, feedback golden, behavior-augmented cases, contradictions) or False/None (brief_state, ambient_state lookups) on SQL error; retrieval pipeline stays functional without priors until the DB is readable again.
 
 Migration one-shot: `scripts/migrate_state_to_sqlite.py --source-dir ~/.local/share/obsidian-rag [--dry-run] [--round-trip-check] [--reverse] [--summary]`. Refuses to run while `com.fer.obsidian-rag-*` services are up (preflight `pgrep`; `--force` to override). Renames each source → `<name>.bak.<unix_ts>` on successful commit. Cutover of 2026-04-19 imported 7,946 records across 19 sources; 43 malformed pre-existing records dropped (missing NOT NULL fields).
 
-Rollback escape hatch: `rag maintenance --rollback-state-migration [--force]`. Restores the newest `.bak.<ts>` per source, drops the 20 `rag_*` tables, WAL checkpoint + VACUUM. Refuses if services up + no bak files found. `rag maintenance` also prunes `.bak.*` older than 30d.
+Rollback procedure (post-T10): **the escape hatch now requires a code revert, not just a CLI invocation.** `rag maintenance --rollback-state-migration [--force]` still restores the newest `.bak.<ts>` per source and drops the 20 `rag_*` tables + VACUUM — but the in-code readers/writers only know the SQL path after T10. To fully revert:
+
+1. `git revert <T10-commit-sha>` (or `git reset --hard <pre-T10-sha>` if the T10 commits are the tip). This brings back the JSONL fallback code.
+2. Restart launchd services so the reverted `rag.py` is loaded in-process.
+3. Run `rag maintenance --rollback-state-migration` — this restores the JSONL .bak files that the reverted code now reads.
+
+The `.bak.<ts>` files under `~/.local/share/obsidian-rag/` are still there (kept for the 30-day window) so data-loss is bounded, but without the code revert the restored files are ignored. `rag maintenance` continues to prune `.bak.*` older than 30d.
 
 ### Other state (unchanged; still on disk)
 
@@ -271,7 +277,7 @@ Rollback escape hatch: `rag maintenance --rollback-state-migration [--force]`. R
 - `filing_batches/*.jsonl` — audit log (prefix `archive-*` for archiver).
 - `ignored_notes.json`, `home_cache.json`, `context_summaries.json`, `auto_index_state.json`, `coach_state.json`, `synthetic_questions.json`, `wa_tasks_state.json` — app state + caches.
 - `online-tune.{log,error.log}`, `*.{log,error.log}` — launchd service logs.
-- `sql_state_errors.jsonl` — diagnostic sink for SQL-path write failures (only populated if the SQL branch raises and JSONL fallback fires).
+- `sql_state_errors.jsonl` — diagnostic sink for SQL-path write/read failures. Post-T10 this is the only visible signal when SQL errors happen, since the JSONL fallback is gone and the event is dropped after logging here.
 
 **Reset learned state**: `rm ranker.json` + `DELETE FROM rag_feedback_golden; DELETE FROM rag_feedback_golden_meta;` inside ragvec.db. Full re-embed: `rag index --reset`.
 

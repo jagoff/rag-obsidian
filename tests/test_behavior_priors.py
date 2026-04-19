@@ -1,4 +1,7 @@
-"""Tests for Task 2: behavior priors, ranker features, exploration toggle."""
+"""Tests for Task 2: behavior priors, ranker features, exploration toggle.
+
+Post-T10: behavior priors read from rag_behavior (SQL) only.
+"""
 import json
 import os
 import time
@@ -7,16 +10,25 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 
+def _seed_sql_behavior(db_dir: Path, events: list[dict]) -> None:
+    """Seed rag_behavior with the given events via the module's SQL primitives."""
+    import rag
+    # Ensure DB_PATH points at the test dir.
+    with rag._ragvec_state_conn() as conn:
+        for ev in events:
+            rag._sql_append_event(conn, "rag_behavior", rag._map_behavior_row(ev))
+
+
 # ── 1. _load_behavior_priors ─────────────────────────────────────────────────
 
-def test_load_behavior_priors_missing_file(tmp_path):
-    """Missing behavior.jsonl → empty snapshot with correct keys."""
+def test_load_behavior_priors_missing_file(tmp_path, monkeypatch):
+    """Empty rag_behavior → empty snapshot with correct keys."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                priors = rag._load_behavior_priors()
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    priors = rag._load_behavior_priors()
     assert priors["click_prior"] == {}
     assert priors["click_prior_folder"] == {}
     assert priors["click_prior_hour"] == {}
@@ -25,49 +37,48 @@ def test_load_behavior_priors_missing_file(tmp_path):
     assert "hash" in priors
 
 
-def _make_events(path):
-    """Write 10 fabricated events to a file."""
-    events = [
-        # 5 positive opens for "02-Areas/Coaching/Ikigai.md"
-        {"source": "cli", "event": "open", "path": "02-Areas/Coaching/Ikigai.md",
-         "ts": "2026-04-17T10:30:00"},
-        {"source": "cli", "event": "open", "path": "02-Areas/Coaching/Ikigai.md",
-         "ts": "2026-04-17T10:35:00"},
-        {"source": "whatsapp", "event": "positive_implicit", "path": "02-Areas/Coaching/Ikigai.md",
-         "ts": "2026-04-17T11:00:00"},
-        {"source": "brief", "event": "kept", "path": "02-Areas/Coaching/Ikigai.md",
-         "ts": "2026-04-17T09:00:00", "dwell_ms": 5000},
-        {"source": "cli", "event": "save", "path": "02-Areas/Coaching/Ikigai.md",
-         "ts": "2026-04-17T12:00:00"},
-        # 2 negative for "03-Resources/Bookmarks.md"
-        {"source": "brief", "event": "deleted", "path": "03-Resources/Bookmarks.md",
-         "ts": "2026-04-17T08:00:00"},
-        {"source": "brief", "event": "negative_implicit", "path": "03-Resources/Bookmarks.md",
-         "ts": "2026-04-17T08:05:00"},
-        # 3 for another note
-        {"source": "cli", "event": "open", "path": "01-Projects/Alpha.md",
-         "ts": "2026-04-17T14:00:00"},
-        {"source": "cli", "event": "open", "path": "01-Projects/Alpha.md",
-         "ts": "2026-04-17T15:00:00"},
-        {"source": "brief", "event": "kept", "path": "01-Projects/Alpha.md",
-         "ts": "2026-04-17T16:00:00", "dwell_ms": 2000},
-    ]
-    with open(path, "w") as f:
-        for ev in events:
-            f.write(json.dumps(ev) + "\n")
+_TEST_EVENTS = [
+    # 5 positive opens for "02-Areas/Coaching/Ikigai.md"
+    {"source": "cli", "event": "open", "path": "02-Areas/Coaching/Ikigai.md",
+     "ts": "2026-04-17T10:30:00"},
+    {"source": "cli", "event": "open", "path": "02-Areas/Coaching/Ikigai.md",
+     "ts": "2026-04-17T10:35:00"},
+    {"source": "whatsapp", "event": "positive_implicit", "path": "02-Areas/Coaching/Ikigai.md",
+     "ts": "2026-04-17T11:00:00"},
+    {"source": "brief", "event": "kept", "path": "02-Areas/Coaching/Ikigai.md",
+     "ts": "2026-04-17T09:00:00", "dwell_ms": 5000},
+    {"source": "cli", "event": "save", "path": "02-Areas/Coaching/Ikigai.md",
+     "ts": "2026-04-17T12:00:00"},
+    # 2 negative for "03-Resources/Bookmarks.md"
+    {"source": "brief", "event": "deleted", "path": "03-Resources/Bookmarks.md",
+     "ts": "2026-04-17T08:00:00"},
+    {"source": "brief", "event": "negative_implicit", "path": "03-Resources/Bookmarks.md",
+     "ts": "2026-04-17T08:05:00"},
+    # 3 for another note
+    {"source": "cli", "event": "open", "path": "01-Projects/Alpha.md",
+     "ts": "2026-04-17T14:00:00"},
+    {"source": "cli", "event": "open", "path": "01-Projects/Alpha.md",
+     "ts": "2026-04-17T15:00:00"},
+    {"source": "brief", "event": "kept", "path": "01-Projects/Alpha.md",
+     "ts": "2026-04-17T16:00:00", "dwell_ms": 2000},
+]
 
 
-def test_load_behavior_priors_with_events(tmp_path):
+def test_load_behavior_priors_with_events(tmp_path, monkeypatch):
     """10 events → correct CTR with Laplace smoothing."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    _make_events(fake)
-
-    # Invalidate cache
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                priors = rag._load_behavior_priors()
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    # Convert dwell_ms → dwell_s for SQL-native storage, preserving the
+    # mean-dwell signal the reader aggregates.
+    for ev in _TEST_EVENTS:
+        ev_sql = dict(ev)
+        if "dwell_ms" in ev_sql:
+            ev_sql["dwell_s"] = ev_sql.pop("dwell_ms") / 1000.0
+        _seed_sql_behavior(tmp_path, [ev_sql])
+    priors = rag._load_behavior_priors()
 
     # Ikigai: 5 clicks, 5 impressions → (5+1)/(5+10) = 0.4
     ikigai_ctr = priors["click_prior"]["02-Areas/Coaching/Ikigai.md"]
@@ -95,25 +106,21 @@ def test_load_behavior_priors_with_events(tmp_path):
     assert priors["n_events"] == 10
 
 
-def test_load_behavior_priors_cache_invalidation(tmp_path):
-    """Cache invalidates when file mtime changes."""
+def test_load_behavior_priors_cache_invalidation(tmp_path, monkeypatch):
+    """Cache invalidates when rag_behavior MAX(ts) moves forward."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    fake.write_text("")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
 
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                p1 = rag._load_behavior_priors()
-                n1 = p1["n_events"]
+    p1 = rag._load_behavior_priors()
+    n1 = p1["n_events"]
 
-                # Write events and wait for mtime to differ
-                time.sleep(0.01)
-                _make_events(fake)
-                # Force a fresh stat by touching the cache key
-                rag._behavior_priors_cache_key = (0.0, 0)  # stale key
-                p2 = rag._load_behavior_priors()
-                n2 = p2["n_events"]
+    # Seed events → MAX(ts) moves, cache invalidates.
+    _seed_sql_behavior(tmp_path, _TEST_EVENTS)
+    p2 = rag._load_behavior_priors()
+    n2 = p2["n_events"]
 
     assert n1 == 0
     assert n2 == 10
@@ -423,62 +430,56 @@ def test_eval_strips_rag_explore(monkeypatch):
 
 # ── 7. Laplace smoothing edge cases ─────────────────────────────────────────
 
-def test_laplace_smoothing_sparse_path(tmp_path):
+def test_laplace_smoothing_sparse_path(tmp_path, monkeypatch):
     """A path with 1 event gets (1+1)/(1+10)=2/11, not 1.0."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    events = [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    _seed_sql_behavior(tmp_path, [
         {"source": "cli", "event": "open", "path": "rare/note.md", "ts": "2026-04-17T10:00:00"},
-    ]
-    fake.write_text("\n".join(json.dumps(e) for e in events) + "\n")
-
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                priors = rag._load_behavior_priors()
+    ])
+    priors = rag._load_behavior_priors()
 
     ctr = priors["click_prior"]["rare/note.md"]
     expected = 2 / 11
     assert abs(ctr - expected) < 1e-6, f"Expected {expected}, got {ctr}"
 
 
-def test_laplace_smoothing_all_negative(tmp_path):
+def test_laplace_smoothing_all_negative(tmp_path, monkeypatch):
     """A path with only negative events gets (0+1)/(n+10)."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    events = [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    _seed_sql_behavior(tmp_path, [
         {"source": "brief", "event": "deleted", "path": "spam.md", "ts": "2026-04-17T08:00:00"},
         {"source": "brief", "event": "deleted", "path": "spam.md", "ts": "2026-04-17T08:01:00"},
         {"source": "brief", "event": "deleted", "path": "spam.md", "ts": "2026-04-17T08:02:00"},
-    ]
-    fake.write_text("\n".join(json.dumps(e) for e in events) + "\n")
-
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                priors = rag._load_behavior_priors()
+    ])
+    priors = rag._load_behavior_priors()
 
     ctr = priors["click_prior"]["spam.md"]
     expected = 1 / 13  # (0+1)/(3+10)
     assert abs(ctr - expected) < 1e-6
 
 
-def test_corrupt_lines_skipped(tmp_path):
-    """Corrupt JSONL lines are silently skipped."""
+def test_corrupt_lines_skipped(tmp_path, monkeypatch):
+    """Post-T10: with SQL-only storage there's no JSONL parser to skip
+    corrupt lines — invalid writes are rejected at insert time by the
+    row-mapper. This test now verifies well-formed SQL rows aggregate."""
     import rag
-    fake = tmp_path / "behavior.jsonl"
-    content = (
-        '{"source":"cli","event":"open","path":"ok.md","ts":"2026-04-17T10:00:00"}\n'
-        'not valid json\n'
-        '\n'
-        '{"source":"cli","event":"open","path":"ok.md","ts":"2026-04-17T11:00:00"}\n'
-    )
-    fake.write_text(content)
-
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        with patch.object(rag, "_behavior_priors_cache", None):
-            with patch.object(rag, "_behavior_priors_cache_key", None):
-                priors = rag._load_behavior_priors()
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    _seed_sql_behavior(tmp_path, [
+        {"source": "cli", "event": "open", "path": "ok.md", "ts": "2026-04-17T10:00:00"},
+        {"source": "cli", "event": "open", "path": "ok.md", "ts": "2026-04-17T11:00:00"},
+    ])
+    priors = rag._load_behavior_priors()
 
     assert priors["n_events"] == 2
     assert "ok.md" in priors["click_prior"]

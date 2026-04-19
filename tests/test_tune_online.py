@@ -11,23 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import rag
 
 
-# ── _behavior_augmented_cases ─────────────────────────────────────────────────
-
-def test_behavior_augmented_cases_missing_file(tmp_path):
-    """Missing behavior.jsonl → empty list (no crash)."""
-    fake = tmp_path / "behavior.jsonl"
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
-    assert result == []
-
-
-def test_behavior_augmented_cases_empty_file(tmp_path):
-    """Empty behavior.jsonl → empty list."""
-    fake = tmp_path / "behavior.jsonl"
-    fake.write_text("")
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
-    assert result == []
+# ── _behavior_augmented_cases (SQL-only post-T10) ────────────────────────────
 
 
 def _iso(offset_secs: int = 0) -> str:
@@ -35,21 +19,39 @@ def _iso(offset_secs: int = 0) -> str:
     return rag.datetime.fromtimestamp(time.time() + offset_secs).isoformat(timespec="seconds")
 
 
-def _write_events(path: Path, events: list[dict]) -> None:
-    path.write_text("\n".join(json.dumps(e) for e in events))
+def _seed_sql(tmp_path: Path, events: list[dict]) -> None:
+    """Seed rag_behavior with the given events via the SQL primitives."""
+    with rag._ragvec_state_conn() as conn:
+        for ev in events:
+            ev = {"source": ev.get("source", "cli"), **ev}
+            rag._sql_append_event(conn, "rag_behavior",
+                                    rag._map_behavior_row(ev))
 
 
-def test_behavior_positive_events(tmp_path):
+def test_behavior_augmented_cases_missing_file(tmp_path, monkeypatch):
+    """Empty rag_behavior → empty list (no crash)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    result = rag._behavior_augmented_cases(days=14)
+    assert result == []
+
+
+def test_behavior_augmented_cases_empty_file(tmp_path, monkeypatch):
+    """Empty rag_behavior → empty list."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    result = rag._behavior_augmented_cases(days=14)
+    assert result == []
+
+
+def test_behavior_positive_events(tmp_path, monkeypatch):
     """open/positive_implicit/save/kept with query → positive cases."""
-    fake = tmp_path / "behavior.jsonl"
-    _write_events(fake, [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_sql(tmp_path, [
         {"event": "open",              "query": "ikigai framework", "path": "Ikigai.md",     "ts": _iso(-100)},
         {"event": "positive_implicit", "query": "career change",    "path": "Career.md",     "ts": _iso(-100)},
         {"event": "save",              "query": "morning routine",   "path": "Morning.md",    "ts": _iso(-100)},
         {"event": "kept",              "query": "weekly review",     "path": "Review.md",     "ts": _iso(-100)},
     ])
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
+    result = rag._behavior_augmented_cases(days=14)
     assert len(result) == 4
     for c in result:
         assert "expected" in c
@@ -57,15 +59,14 @@ def test_behavior_positive_events(tmp_path):
         assert c.get("kind_hint") == "behavior_pos"
 
 
-def test_behavior_negative_events(tmp_path):
+def test_behavior_negative_events(tmp_path, monkeypatch):
     """negative_implicit/deleted with query → negative cases."""
-    fake = tmp_path / "behavior.jsonl"
-    _write_events(fake, [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_sql(tmp_path, [
         {"event": "negative_implicit", "query": "bad query", "path": "Wrong.md", "ts": _iso(-100)},
         {"event": "deleted",           "query": "stale note",  "path": "Old.md",   "ts": _iso(-100)},
     ])
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
+    result = rag._behavior_augmented_cases(days=14)
     assert len(result) == 2
     for c in result:
         assert "anti_expected" in c
@@ -73,47 +74,44 @@ def test_behavior_negative_events(tmp_path):
         assert c.get("kind_hint") == "behavior_neg"
 
 
-def test_behavior_conflict_dropped(tmp_path):
+def test_behavior_conflict_dropped(tmp_path, monkeypatch):
     """Same (q, path) pair appearing as both positive and negative → both dropped."""
-    fake = tmp_path / "behavior.jsonl"
-    _write_events(fake, [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_sql(tmp_path, [
         {"event": "open",              "query": "same query", "path": "Same.md", "ts": _iso(-100)},
         {"event": "negative_implicit", "query": "same query", "path": "Same.md", "ts": _iso(-100)},
         # Unrelated event that should survive
         {"event": "open",              "query": "other query", "path": "Other.md", "ts": _iso(-100)},
     ])
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
+    result = rag._behavior_augmented_cases(days=14)
     paths = [c.get("expected", c.get("anti_expected", [None]))[0] for c in result]
     assert "Same.md" not in paths
     assert "Other.md" in paths
     assert len(result) == 1
 
 
-def test_behavior_ignores_old_events(tmp_path):
+def test_behavior_ignores_old_events(tmp_path, monkeypatch):
     """Events older than days window are excluded."""
-    fake = tmp_path / "behavior.jsonl"
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     old_ts = rag.datetime.fromtimestamp(time.time() - 30 * 86400).isoformat(timespec="seconds")
-    _write_events(fake, [
+    _seed_sql(tmp_path, [
         {"event": "open", "query": "old event", "path": "Old.md", "ts": old_ts},
         {"event": "open", "query": "recent",     "path": "New.md", "ts": _iso(-100)},
     ])
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
+    result = rag._behavior_augmented_cases(days=14)
     assert len(result) == 1
     assert result[0]["expected"] == ["New.md"]
 
 
-def test_behavior_ignores_events_without_query(tmp_path):
+def test_behavior_ignores_events_without_query(tmp_path, monkeypatch):
     """Events without 'query' field (e.g. brief events) are skipped."""
-    fake = tmp_path / "behavior.jsonl"
-    _write_events(fake, [
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_sql(tmp_path, [
         {"event": "kept",  "path": "Brief.md", "ts": _iso(-100)},          # no query
         {"event": "open",  "path": "Brief.md", "ts": _iso(-100)},          # no query
         {"event": "open",  "query": "with query", "path": "Note.md", "ts": _iso(-100)},
     ])
-    with patch.object(rag, "BEHAVIOR_LOG_PATH", fake):
-        result = rag._behavior_augmented_cases(days=14)
+    result = rag._behavior_augmented_cases(days=14)
     assert len(result) == 1
     assert result[0]["expected"] == ["Note.md"]
 

@@ -22,6 +22,9 @@ def tmp_vault(tmp_path, monkeypatch):
     vault.mkdir()
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "SURFACE_LOG_PATH", tmp_path / "surface.jsonl")
+    # Post-T10: surface log writes to rag_surface_log (SQL). Point DB_PATH
+    # at the test dir so writes land in a throwaway ragvec.db.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="surface_test", metadata={"hnsw:space": "cosine"}
@@ -320,15 +323,37 @@ def test_is_moc_heuristics(meta, expected):
 # ── Logging + CLI integration ─────────────────────────────────────────────────
 
 
-def test_log_run_writes_summary_and_pairs(tmp_vault):
+def _read_surface_rows(db_dir: Path) -> list[dict]:
+    import sqlite3
+    conn = sqlite3.connect(str(db_dir / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT ts, cmd, n_pairs, sim_threshold, extra_json "
+            "FROM rag_surface_log ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        ev = {k: r[k] for k in r.keys() if r[k] is not None and k != "extra_json"}
+        if r["extra_json"]:
+            try:
+                ev.update(json.loads(r["extra_json"]))
+            except Exception:
+                pass
+        out.append(ev)
+    return out
+
+
+def test_log_run_writes_summary_and_pairs(tmp_vault, tmp_path):
     vault, col = tmp_vault
     pair = {"a_path": "a.md", "b_path": "b.md", "similarity": 0.85}
     rag._surface_log_run({"n_pairs": 1, "sim_threshold": 0.78}, [pair])
 
-    lines = rag.SURFACE_LOG_PATH.read_text().splitlines()
-    assert len(lines) == 2
-    summary = json.loads(lines[0])
-    detail = json.loads(lines[1])
+    rows = _read_surface_rows(tmp_path)
+    assert len(rows) == 2
+    summary, detail = rows
     assert summary["cmd"] == "surface_run"
     assert summary["n_pairs"] == 1
     assert detail["cmd"] == "surface_pair"
@@ -337,7 +362,7 @@ def test_log_run_writes_summary_and_pairs(tmp_vault):
     assert summary["ts"] == detail["ts"]
 
 
-def test_cli_surface_dry_run_end_to_end(tmp_vault, monkeypatch):
+def test_cli_surface_dry_run_end_to_end(tmp_vault, tmp_path, monkeypatch):
     vault, col = tmp_vault
     _add_note(col, vault, "02-Areas/a.md", "A", [1, 0, 0, 0], created=_old())
     _add_note(col, vault, "02-Areas/b.md", "B", HIGH_SIM, created=_old())
@@ -357,10 +382,10 @@ def test_cli_surface_dry_run_end_to_end(tmp_vault, monkeypatch):
     # La línea con la razón generada por el LLM stub debe aparecer.
     assert "Ambas hablan de" in result.output
 
-    # Log debe tener una línea run + una pair.
-    log_lines = rag.SURFACE_LOG_PATH.read_text().splitlines()
-    assert any(json.loads(l).get("cmd") == "surface_run" for l in log_lines)
-    assert any(json.loads(l).get("cmd") == "surface_pair" for l in log_lines)
+    # Post-T10: rag_surface_log debe tener una fila run + una pair.
+    rows = _read_surface_rows(tmp_path)
+    assert any(r["cmd"] == "surface_run" for r in rows)
+    assert any(r["cmd"] == "surface_pair" for r in rows)
 
 
 def test_cli_surface_no_llm_skips_reason(tmp_vault, monkeypatch):
@@ -386,7 +411,7 @@ def test_cli_surface_no_llm_skips_reason(tmp_vault, monkeypatch):
     assert "NEVER" not in result.output
 
 
-def test_cli_surface_no_pairs_still_logs(tmp_vault):
+def test_cli_surface_no_pairs_still_logs(tmp_vault, tmp_path):
     vault, col = tmp_vault
     _add_note(col, vault, "02-Areas/a.md", "A", [1, 0, 0, 0], created=_old())
     _add_note(col, vault, "02-Areas/c.md", "C", LOW_SIM, created=_old())
@@ -396,7 +421,7 @@ def test_cli_surface_no_pairs_still_logs(tmp_vault):
     result = runner.invoke(rag.surface, ["--plain", "--sim-threshold", "0.7"])
 
     assert result.exit_code == 0, result.output
-    log_lines = rag.SURFACE_LOG_PATH.read_text().splitlines()
-    run = json.loads(log_lines[-1])
-    assert run["cmd"] == "surface_run"
+    rows = _read_surface_rows(tmp_path)
+    # Final row is the surface_run summary.
+    run = [r for r in rows if r["cmd"] == "surface_run"][-1]
     assert run["n_pairs"] == 0

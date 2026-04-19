@@ -104,15 +104,16 @@ from web.tools import (  # noqa: E402
     _WEB_TOOL_ADDENDUM,
 )
 
-_CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
-
-
 def _own_conversation_path(session_id: str) -> str | None:
+    """Look up the episodic conversation .md for `session_id` in
+    rag_conversations_index. Used for the self-citation exclusion guard in
+    /api/chat. SQL-only since T10 (the old conversations_index.json path is
+    gone)."""
     try:
-        data = json.loads(_CONV_INDEX_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        from web.conversation_writer import get_conversation_path
+        return get_conversation_path(session_id)
+    except Exception:
         return None
-    return data.get(session_id) if isinstance(data, dict) else None
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -3322,17 +3323,19 @@ def dashboard_api(days: int = 30) -> dict:
 def _dashboard_compute(days: int = 30) -> dict:
     """Aggregate telemetry into dashboard metrics.
 
-    When RAG_STATE_SQL=1: pull rows from the rag_* SQL tables. Falls back to
-    JSONL scan on any exception during the cutover observation window (T10
-    removes the fallback). Flag OFF = JSONL-only, unchanged behaviour.
+    SQL-only since T10. On any exception, logs to sql_state_errors.jsonl and
+    returns an empty-shape payload so the dashboard JS can still render
+    (the aggregator handles empty lists uniformly).
     """
-    if RAG_STATE_SQL:
-        try:
-            return _dashboard_compute_sql(days)
-        except Exception as exc:
-            _log_sql_state_error("dashboard_sql_compute_failed", err=repr(exc))
-            # Fall through to JSONL during the 7-day cutover.
-    return _dashboard_compute_jsonl(days)
+    try:
+        return _dashboard_compute_sql(days)
+    except Exception as exc:
+        _log_sql_state_error("dashboard_sql_compute_failed", err=repr(exc))
+        return _dashboard_aggregate(
+            queries=[], all_queries=[], fb_entries=[], ambient_entries=[],
+            contra_entries=[], filing_recent=[], tune_entries=[],
+            surface_entries=[], days=days,
+        )
 
 
 # ── Dashboard event-row helpers ─────────────────────────────────────────────
@@ -3454,57 +3457,6 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
     # Surface rows — aggregator counts events by `cmd in {"surface_pair","surface_run"}`,
     # and rag_surface_log preserves `cmd` as a column.
     surface_entries = [_dashboard_sql_row_to_event(r) for r in surface_rows]
-
-    return _dashboard_aggregate(
-        queries=queries,
-        all_queries=all_queries,
-        fb_entries=fb_entries,
-        ambient_entries=ambient_entries,
-        contra_entries=contra_entries,
-        filing_recent=filing_recent,
-        tune_entries=tune_entries,
-        surface_entries=surface_entries,
-        days=days,
-    )
-
-
-def _dashboard_compute_jsonl(days: int = 30) -> dict:
-    """Aggregate all JSONL logs into dashboard metrics."""
-    data_dir = Path.home() / ".local/share/obsidian-rag"
-    cutoff = datetime.now() - timedelta(days=days)
-
-    def _read_jsonl(path: Path) -> list[dict]:
-        if not path.is_file():
-            return []
-        out = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
-        return out
-
-    def _ts_local(e: dict) -> datetime | None:
-        raw = e.get("ts") or e.get("timestamp")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(raw)
-        except Exception:
-            return None
-
-    all_queries = _read_jsonl(data_dir / "queries.jsonl")
-    queries = [e for e in all_queries if (t := _ts_local(e)) and t >= cutoff]
-    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
-    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
-    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
-    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
-    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
-    filing_recent = [e for e in filing_entries if (t := _ts_local(e)) and t >= cutoff]
-    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
 
     return _dashboard_aggregate(
         queries=queries,
@@ -4032,7 +3984,15 @@ _STREAM_FILES: dict[str, str] = {
 
 @app.get("/api/dashboard/stream")
 async def dashboard_stream() -> StreamingResponse:
-    """SSE: tail JSONL logs and push new events as they arrive."""
+    """SSE: tail JSONL logs and push new events as they arrive.
+
+    TODO: post-T10 — revisit SSE source. Writers no longer append to these
+    JSONL files (they write directly to rag_* SQL tables), so the tail loop
+    here will emit zero deltas in production. The endpoint stays up to keep
+    the dashboard JS connection alive (heartbeat events still fire) until
+    this is swapped for a short-interval `SELECT ... WHERE id > :last_id`
+    poll against the SQL tables.
+    """
     data_dir = Path.home() / ".local/share/obsidian-rag"
     paths = {kind: data_dir / fname for kind, fname in _STREAM_FILES.items()}
     # Start at current EOF so the client only sees new events.
@@ -4343,20 +4303,12 @@ def _memory_load_history() -> None:
 
 
 def _memory_persist(sample: dict) -> None:
-    if RAG_STATE_SQL:
-        try:
-            with _ragvec_state_conn() as conn:
-                _sql_append_event(conn, "rag_memory_metrics",
-                                   _map_memory_row(sample))
-            return
-        except Exception as exc:
-            _log_sql_state_error("memory_sql_write_failed", err=repr(exc))
     try:
-        _MEMORY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _MEMORY_STATE_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(sample, separators=(",", ":")) + "\n")
-    except Exception:
-        pass
+        with _ragvec_state_conn() as conn:
+            _sql_append_event(conn, "rag_memory_metrics",
+                               _map_memory_row(sample))
+    except Exception as exc:
+        _log_sql_state_error("memory_sql_write_failed", err=repr(exc))
 
 
 def _memory_trim_file() -> None:
@@ -4599,20 +4551,12 @@ def _cpu_load_history() -> None:
 
 
 def _cpu_persist(sample: dict) -> None:
-    if RAG_STATE_SQL:
-        try:
-            with _ragvec_state_conn() as conn:
-                _sql_append_event(conn, "rag_cpu_metrics",
-                                   _map_cpu_row(sample))
-            return
-        except Exception as exc:
-            _log_sql_state_error("cpu_sql_write_failed", err=repr(exc))
     try:
-        _CPU_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _CPU_STATE_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(sample, separators=(",", ":")) + "\n")
-    except Exception:
-        pass
+        with _ragvec_state_conn() as conn:
+            _sql_append_event(conn, "rag_cpu_metrics",
+                               _map_cpu_row(sample))
+    except Exception as exc:
+        _log_sql_state_error("cpu_sql_write_failed", err=repr(exc))
 
 
 def _cpu_trim_file() -> None:

@@ -22,6 +22,9 @@ def tmp_vault(tmp_path, monkeypatch):
     (vault / "00-Inbox").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "FILING_LOG_PATH", tmp_path / "filing.jsonl")
+    # Post-T10: filing log writes to rag_filing_log (SQL). Point DB_PATH at
+    # the test dir so writes land in a throwaway ragvec.db.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
 
     def fake_embed(texts):
         # Single 1-hot embedding per call — tests overridearán por query
@@ -175,20 +178,29 @@ def test_build_filing_proposal_not_found(tmp_vault):
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 
-def test_filing_log_writes_jsonl(tmp_vault):
+def test_filing_log_writes_sql(tmp_vault, tmp_path):
+    """Post-T10: filing log writes to rag_filing_log in SQL."""
+    import sqlite3
     vault, col = tmp_vault
     prop = {"path": "00-Inbox/x.md", "note": "X", "folder": "02-Areas",
             "confidence": 0.8, "upward_title": "", "upward_kind": "",
             "neighbors": []}
     rag._filing_log_proposal(prop)
 
-    lines = rag.FILING_LOG_PATH.read_text().splitlines()
-    assert len(lines) == 1
-    entry = json.loads(lines[0])
+    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT cmd, path, folder, ts FROM rag_filing_log"
+        ).fetchall())
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    entry = rows[0]
     assert entry["cmd"] == "filing_proposal"
     assert entry["path"] == "00-Inbox/x.md"
     assert entry["folder"] == "02-Areas"
-    assert "ts" in entry
+    assert entry["ts"]
 
 
 # ── CLI integration ──────────────────────────────────────────────────────────
@@ -207,9 +219,14 @@ def test_cli_file_dry_run_end_to_end(tmp_vault, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "00-Inbox/note.md" in result.output
     assert "02-Areas/Musica" in result.output
-    # Log debe tener al menos una propuesta.
-    lines = rag.FILING_LOG_PATH.read_text().splitlines()
-    assert len(lines) >= 1
+    # Post-T10: log debe tener al menos una propuesta en rag_filing_log.
+    import sqlite3
+    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM rag_filing_log").fetchone()[0]
+    finally:
+        conn.close()
+    assert n >= 1
 
 
 def test_cli_file_single_path_argument(tmp_vault, monkeypatch):
@@ -580,19 +597,19 @@ def test_cli_apply_and_undo_mutually_exclusive(tmp_vault_with_batch):
 
 
 def _seed_decision(applied_to: str, decision: str = "accept", src: str = "00-Inbox/x.md"):
-    """Helper: appendea una decisión simulada a filing.jsonl."""
-    rag.FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with rag.FILING_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "ts": "2026-04-14T10:00:00",
-            "cmd": "filing_proposal",
-            "path": src,
-            "note": Path(src).stem,
-            "folder": str(Path(applied_to).parent),
-            "confidence": 0.8,
-            "applied_to": applied_to,
-            "decision": decision,
-        }) + "\n")
+    """Post-T10: seed a decision into rag_filing_log (SQL)."""
+    event = {
+        "ts": "2026-04-14T10:00:00",
+        "cmd": "filing_proposal",
+        "path": src,
+        "note": Path(src).stem,
+        "folder": str(Path(applied_to).parent),
+        "confidence": 0.8,
+        "applied_to": applied_to,
+        "decision": decision,
+    }
+    with rag._ragvec_state_conn() as conn:
+        rag._sql_append_event(conn, "rag_filing_log", rag._map_filing_row(event))
 
 
 def test_load_filing_decisions_empty_when_no_log(tmp_vault):
@@ -614,15 +631,15 @@ def test_load_filing_decisions_filters_to_accept_and_edit(tmp_vault):
 
 
 def test_load_filing_decisions_skips_entries_without_applied_to(tmp_vault):
-    rag.FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with rag.FILING_LOG_PATH.open("a", encoding="utf-8") as f:
-        # Dry-run del fase 1 no tiene applied_to.
-        f.write(json.dumps({
-            "ts": "2026-04-14T10:00:00",
-            "cmd": "filing_proposal",
-            "path": "00-Inbox/x.md",
-            "decision": "accept",
-        }) + "\n")
+    # Post-T10: dry-run entries (sin applied_to) viven en rag_filing_log.
+    event = {
+        "ts": "2026-04-14T10:00:00",
+        "cmd": "filing_proposal",
+        "path": "00-Inbox/x.md",
+        "decision": "accept",
+    }
+    with rag._ragvec_state_conn() as conn:
+        rag._sql_append_event(conn, "rag_filing_log", rag._map_filing_row(event))
     assert rag._load_filing_decisions() == []
 
 

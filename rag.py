@@ -23606,6 +23606,489 @@ def _chroma_wal_checkpoint(dry_run: bool = False) -> dict:
     return {"ok": True, "before_bytes": before, "after_bytes": after}
 
 
+# ── SQL log rotation (T7) ────────────────────────────────────────────────────
+# Retention policies per log-style rag_* table. When RAG_STATE_SQL=1 and
+# `rag maintenance` runs, rows with ts < now - retention are DELETEd. State-
+# style tables (rag_ambient_state, rag_brief_state, rag_conversations_index,
+# rag_feedback_golden, rag_feedback_golden_meta) are keyed upserts and MUST
+# NOT appear here.
+#
+# Defaults chosen in T7:
+#   90d: queries, behavior             — ranker-vivo signal window
+#   60d: ambient, brief_written, wa_tasks, archive, filing, eval, surface,
+#        proactive — useful historic context but not ranker input
+#   30d: cpu_metrics, memory_metrics, system_memory_metrics — sampled every
+#        minute by the web sampler; bloat magnet otherwise
+#   ∞ : feedback, tune, contradictions — small, high-signal, intentionally
+#        kept (feedback golden depends on full rag_feedback history, tune
+#        history feeds `rag dashboard`, contradictions are audit).
+#
+# Tables explicitly NOT rotated (empty tuple): retained forever.
+_SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
+    ("rag_queries", 90),
+    ("rag_behavior", 90),
+    ("rag_ambient", 60),
+    ("rag_brief_written", 60),
+    ("rag_wa_tasks", 60),
+    ("rag_archive_log", 60),
+    ("rag_filing_log", 60),
+    ("rag_eval_runs", 60),
+    ("rag_surface_log", 60),
+    ("rag_proactive_log", 60),
+    ("rag_cpu_metrics", 30),
+    ("rag_memory_metrics", 30),
+    ("system_memory_metrics", 30),
+)
+
+# Tables that upsert on a PK instead of appending log rows. Listed here both
+# for the rollback DROP loop and as documentation of the no-rotate contract.
+_SQL_STATE_TABLES: tuple[str, ...] = (
+    "rag_ambient_state",
+    "rag_brief_state",
+    "rag_conversations_index",
+    "rag_feedback_golden",
+    "rag_feedback_golden_meta",
+)
+
+# Log-style tables that are kept forever (no rotation row). Auditable in
+# `test_rotation_different_retentions_per_table` — their row count must not
+# decrease after rotation.
+_SQL_KEEP_ALL_TABLES: tuple[str, ...] = (
+    "rag_feedback",
+    "rag_tune",
+    "rag_contradictions",
+)
+
+# VACUUM gate: page_count * page_size must exceed last_vacuum_size by this
+# delta before we pay the cost. ~500 MB matches the T4 spec — VACUUM serialises
+# the whole DB and should only run weekly at most.
+_VACUUM_DELTA_BYTES = 500 * 1024 * 1024
+
+# Key in rag_feedback_golden_meta for the last-vacuum sentinel. Reuses the
+# existing meta table to avoid schema churn during the cutover; the key
+# namespace ("vacuum_*") is disjoint from the feedback-golden keys.
+_VACUUM_META_KEY_BYTES = "vacuum_last_bytes"
+_VACUUM_META_KEY_TS = "vacuum_last_ts"
+
+
+def _sql_rotate_log_tables(*, dry_run: bool = False,
+                            now_ts: float | None = None) -> dict:
+    """DELETE old rows from rotatable log tables + optionally VACUUM.
+
+    Returns
+    -------
+    {
+      "rows_deleted": {table: int, ...},
+      "wal_checkpoint": {ok: bool, before_bytes: int, after_bytes: int},
+      "vacuum_ran": bool,
+      "vacuum_before_bytes": int | None,
+      "vacuum_after_bytes": int | None,
+    }
+
+    Only touches rows matching the retention policy; state tables and
+    keep-all tables are untouched. Safe under dry_run — no DELETE/VACUUM
+    runs but the cutoff-derived counts are reported so operators can see
+    what a live run would do.
+    """
+    import sqlite3 as _sqlite
+    from datetime import datetime as _dt, timedelta as _td
+
+    sqlite_path = DB_PATH / "ragvec.db"
+    out: dict = {
+        "rows_deleted": {},
+        "wal_checkpoint": None,
+        "vacuum_ran": False,
+        "vacuum_before_bytes": None,
+        "vacuum_after_bytes": None,
+    }
+    if not sqlite_path.is_file():
+        out["skipped"] = "no sqlite file"
+        return out
+
+    # Use a dedicated connection — telemetry writers use short-lived conns
+    # anyway, so briefly exclusive VACUUM can fight a writer. busy_timeout
+    # is generous (30s) because rotation is unattended.
+    now = now_ts if now_ts is not None else time.time()
+    try:
+        conn = _sqlite.connect(str(sqlite_path), timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
+    except _sqlite.Error as e:
+        out["skipped"] = f"connect failed: {e}"
+        return out
+
+    try:
+        # Figure out which tables exist — skipping silently lets maintenance
+        # run on a pre-T1 DB without crashing.
+        existing = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        for table, days in _SQL_ROTATION_POLICY:
+            if table not in existing:
+                continue
+            cutoff_iso = _dt.fromtimestamp(now - days * 86400).isoformat(
+                timespec="seconds"
+            )
+            if dry_run:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE ts < ?", (cutoff_iso,)
+                ).fetchone()
+                out["rows_deleted"][table] = int(row[0] if row else 0)
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE ts < ?", (cutoff_iso,)
+                )
+                out["rows_deleted"][table] = cur.rowcount or 0
+
+        if not dry_run:
+            conn.commit()
+
+        # WAL checkpoint once after all deletes — cheaper than N checkpoints.
+        wal_path = DB_PATH / "ragvec.db-wal"
+        before_wal = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        if not dry_run:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.commit()
+                after_wal = sqlite_path.stat().st_size + (
+                    wal_path.stat().st_size if wal_path.is_file() else 0
+                )
+                out["wal_checkpoint"] = {
+                    "ok": True,
+                    "before_bytes": before_wal,
+                    "after_bytes": after_wal,
+                }
+            except _sqlite.Error as e:
+                out["wal_checkpoint"] = {"ok": False, "reason": str(e)}
+        else:
+            out["wal_checkpoint"] = {
+                "ok": True,
+                "before_bytes": before_wal,
+                "after_bytes": before_wal,
+                "dry_run": True,
+            }
+
+        # Conditional VACUUM — gated by delta since last vacuum.
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        current_bytes = page_count * page_size
+        last_bytes_row = None
+        if "rag_feedback_golden_meta" in existing:
+            last_bytes_row = conn.execute(
+                "SELECT v FROM rag_feedback_golden_meta WHERE k=?",
+                (_VACUUM_META_KEY_BYTES,),
+            ).fetchone()
+        last_bytes = int(last_bytes_row[0]) if last_bytes_row and last_bytes_row[0] else 0
+        delta = current_bytes - last_bytes
+        should_vacuum = delta >= _VACUUM_DELTA_BYTES
+
+        if should_vacuum and not dry_run:
+            out["vacuum_before_bytes"] = current_bytes
+            # VACUUM can't run inside a transaction.
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            new_page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            new_page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            new_bytes = new_page_count * new_page_size
+            out["vacuum_ran"] = True
+            out["vacuum_after_bytes"] = new_bytes
+            # Persist sentinel so we don't VACUUM again until another delta.
+            if "rag_feedback_golden_meta" in existing:
+                now_iso = _dt.fromtimestamp(now).isoformat(timespec="seconds")
+                conn.execute(
+                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                    (_VACUUM_META_KEY_BYTES, str(new_bytes)),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO rag_feedback_golden_meta (k, v) VALUES (?, ?)",
+                    (_VACUUM_META_KEY_TS, now_iso),
+                )
+                conn.commit()
+        elif should_vacuum and dry_run:
+            out["vacuum_ran"] = False
+            out["vacuum_would_run"] = True
+            out["vacuum_before_bytes"] = current_bytes
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
+
+
+def _cleanup_bak_files(*, dry_run: bool = False,
+                        max_age_days: int = 30,
+                        now_ts: float | None = None) -> dict:
+    """Delete migration-era `*.bak.<unix_ts>` files older than max_age_days.
+
+    T2's migration script renames each legacy source to `name.bak.<unix_ts>`.
+    After the 30-day cutover observation window the originals are unneeded
+    and just waste disk. We parse the unix ts suffix directly rather than
+    stat — the filename IS the canonical migration time, stat.mtime can drift
+    under rsync/iCloud/etc.
+
+    Filenames that don't match `*.bak.<digits>` are ignored (including
+    legacy `.bak`, `.bak.notanumber`, or user-created `.baktemp`).
+
+    Returns
+    -------
+    {"deleted": int, "bytes_freed": int, "skipped_non_bak": int}
+    """
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    out = {"deleted": 0, "bytes_freed": 0, "skipped_non_bak": 0}
+    if not state_dir.is_dir():
+        return out
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - max_age_days * 86400
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        # Must match .*\.bak\.<digits>$
+        name = f.name
+        try:
+            idx = name.rindex(".bak.")
+        except ValueError:
+            continue
+        suffix = name[idx + len(".bak."):]
+        if not suffix.isdigit():
+            out["skipped_non_bak"] += 1
+            continue
+        try:
+            file_ts = int(suffix)
+        except ValueError:
+            out["skipped_non_bak"] += 1
+            continue
+        if file_ts >= cutoff:
+            continue  # still fresh
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+        if dry_run:
+            out["deleted"] += 1
+            out["bytes_freed"] += size
+        else:
+            try:
+                os.unlink(f)
+                out["deleted"] += 1
+                out["bytes_freed"] += size
+            except OSError:
+                continue
+    return out
+
+
+# ── Rollback subcommand helpers (T7) ─────────────────────────────────────────
+# `rag maintenance --rollback-state-migration` restores the JSONL baseline
+# in case the SQL cutover misbehaves within the 30-day observation window.
+# The inverse of T2's migration: rename each `name.bak.<ts>` back to `name`,
+# drop every rag_*/system_memory_metrics table, remove the schema_version
+# rows, checkpoint the WAL + VACUUM.
+#
+# Safety: refuses to run when `com.fer.obsidian-rag-*` launchd services have
+# live pids — a writer mid-transaction against a table we're about to drop
+# would cause data loss. `--force` bypasses the service check and the no-bak
+# refusal; it is NOT a free pass for the DROP TABLE loop which always runs.
+
+_ROLLBACK_TABLES: tuple[str, ...] = tuple(
+    name for name, _ in _TELEMETRY_DDL
+)
+
+
+def _pgrep_obsidian_rag() -> list[str]:
+    """Return list of pids matching `com.fer.obsidian-rag` launchd services.
+
+    Same logic as scripts/migrate_state_to_sqlite.py::_check_running_services
+    but inlined here so maintenance doesn't import the migration script.
+    """
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["pgrep", "-f", "com.fer.obsidian-rag"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (_sp.TimeoutExpired, FileNotFoundError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [line for line in out.stdout.split() if line.strip()]
+
+
+def _find_bak_files_for_rollback(*, max_age_days: int = 30,
+                                  now_ts: float | None = None) -> dict[str, Path]:
+    """Scan state_dir for `.bak.<ts>` files newer than max_age_days.
+
+    Returns a {original_path_as_str → newest_bak_path} mapping so the caller
+    restores exactly one bak per source. When multiple baks exist (e.g. a
+    user re-ran the migration twice) the most recent ts wins — the oldest
+    baks represent an intermediate state we don't want to revert to.
+    """
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    if not state_dir.is_dir():
+        return {}
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - max_age_days * 86400
+    # source_path → (ts, bak_path) to pick newest-wins
+    best: dict[str, tuple[int, Path]] = {}
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        try:
+            idx = name.rindex(".bak.")
+        except ValueError:
+            continue
+        suffix = name[idx + len(".bak."):]
+        if not suffix.isdigit():
+            continue
+        try:
+            file_ts = int(suffix)
+        except ValueError:
+            continue
+        if file_ts < cutoff:
+            continue  # older than window — nothing to restore to
+        original_name = name[:idx]
+        prev = best.get(original_name)
+        if prev is None or file_ts > prev[0]:
+            best[original_name] = (file_ts, f)
+    return {orig: p for orig, (_, p) in best.items()}
+
+
+def _rollback_state_migration(*, force: bool = False,
+                               now_ts: float | None = None) -> dict:
+    """Restore .bak.<ts> originals + drop rag_* tables.
+
+    Returns
+    -------
+    {
+      "ok": bool,
+      "refused": str | None,                # human reason, if refused
+      "files_restored": int,
+      "tables_dropped": list[str],
+      "bytes_reclaimed": int,
+      "wal_checkpoint": dict,
+      "vacuum_before_bytes": int,
+      "vacuum_after_bytes": int,
+    }
+    """
+    import sqlite3 as _sqlite
+
+    out: dict = {
+        "ok": False,
+        "refused": None,
+        "files_restored": 0,
+        "tables_dropped": [],
+        "bytes_reclaimed": 0,
+        "wal_checkpoint": None,
+        "vacuum_before_bytes": None,
+        "vacuum_after_bytes": None,
+    }
+
+    # 1. Preflight — services must be stopped.
+    pids = _pgrep_obsidian_rag()
+    if pids and not force:
+        out["refused"] = (
+            f"pgrep matched {len(pids)} com.fer.obsidian-rag pid(s): "
+            f"{' '.join(pids)}. Stop launchd services or pass --force."
+        )
+        return out
+
+    # 2. Preflight — at least one .bak.<ts> within the 30-day window must
+    # exist, otherwise we're restoring nothing and DROPs would be lossy.
+    bak_map = _find_bak_files_for_rollback(now_ts=now_ts)
+    if not bak_map and not force:
+        out["refused"] = (
+            "No *.bak.<unix_ts> files found within the 30-day window. "
+            "Nothing to restore to — pass --force to DROP tables anyway."
+        )
+        return out
+
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+
+    # 3. Restore files. os.replace is atomic; if the original still exists
+    # it's overwritten (expected — T3 writers may have been running in
+    # dual-write mode or before the flag was flipped off).
+    for original_name, bak_path in bak_map.items():
+        dest = state_dir / original_name
+        try:
+            os.replace(bak_path, dest)
+            out["files_restored"] += 1
+        except OSError as e:
+            _log_sql_state_error("rollback_restore_failed",
+                                  src=str(bak_path), dst=str(dest), err=repr(e))
+
+    # 4. DROP rag_* tables in one transaction + clear schema_version rows.
+    sqlite_path = DB_PATH / "ragvec.db"
+    if sqlite_path.is_file():
+        wal_path = DB_PATH / "ragvec.db-wal"
+        before_bytes = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        try:
+            conn = _sqlite.connect(str(sqlite_path), timeout=30.0)
+            conn.execute("PRAGMA busy_timeout=30000")
+        except _sqlite.Error as e:
+            out["refused"] = f"connect failed: {e}"
+            return out
+        try:
+            existing = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            conn.execute("BEGIN")
+            dropped: list[str] = []
+            for t in _ROLLBACK_TABLES:
+                if t in existing:
+                    conn.execute(f"DROP TABLE IF EXISTS {t}")
+                    dropped.append(t)
+            # Remove schema_version entries for the dropped tables.
+            if "rag_schema_version" in existing and dropped:
+                conn.executemany(
+                    "DELETE FROM rag_schema_version WHERE table_name=?",
+                    [(t,) for t in dropped],
+                )
+            conn.execute("COMMIT")
+            out["tables_dropped"] = dropped
+
+            # Checkpoint + VACUUM to reclaim pages. VACUUM rebuilds the db
+            # file so the tables actually release their pages (DROP alone
+            # only marks pages as free).
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+            # Sentinel: re-read size BEFORE vacuum so the reclaim metric
+            # reflects the DROP+VACUUM combo, not just WAL truncation.
+            out["vacuum_before_bytes"] = sqlite_path.stat().st_size
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            out["vacuum_after_bytes"] = sqlite_path.stat().st_size
+            out["wal_checkpoint"] = {"ok": True,
+                                       "before_bytes": before_bytes,
+                                       "after_bytes": sqlite_path.stat().st_size}
+        except _sqlite.Error as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            out["refused"] = f"sqlite error: {e}"
+            return out
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        after_bytes = sqlite_path.stat().st_size + (
+            wal_path.stat().st_size if wal_path.is_file() else 0
+        )
+        out["bytes_reclaimed"] = max(0, before_bytes - after_bytes)
+
+    out["ok"] = True
+    return out
+
+
 def run_maintenance(
     *,
     dry_run: bool = False,
@@ -23685,22 +24168,40 @@ def run_maintenance(
         except Exception as e:
             results["feedback_golden_error"] = str(e)
 
-    # 6. JSONL log rotation
+    # 6. Log rotation.
+    # When RAG_STATE_SQL=1 the JSONL files are no-longer written (T3 swap),
+    # so we run SQL-aware rotation against the rag_* tables + clean up the
+    # one-shot `.bak.<ts>` migration artefacts. When the flag is off we keep
+    # the legacy JSONL rotation path unchanged.
     if not skip_logs:
-        rotated = {}
-        for label, path in _JSONL_LOG_PATHS:
-            if dry_run:
-                try:
-                    sz = path.stat().st_size if path.is_file() else 0
-                    if sz >= _JSONL_ROTATE_BYTES:
-                        rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
-                except OSError:
-                    pass
-            else:
-                r = _rotate_jsonl(path)
-                if r:
-                    rotated[label] = r
-        results["log_rotation"] = rotated
+        if RAG_STATE_SQL:
+            try:
+                results["sql_rotation"] = _sql_rotate_log_tables(dry_run=dry_run)
+            except Exception as e:
+                results["sql_rotation_error"] = str(e)
+            try:
+                results["bak_cleanup"] = _cleanup_bak_files(dry_run=dry_run)
+            except Exception as e:
+                results["bak_cleanup_error"] = str(e)
+            # Keep JSONL rotation section empty for renderer compatibility so
+            # downstream callers that already branch on "log_rotation" don't
+            # explode when the flag is on.
+            results["log_rotation"] = {}
+        else:
+            rotated = {}
+            for label, path in _JSONL_LOG_PATHS:
+                if dry_run:
+                    try:
+                        sz = path.stat().st_size if path.is_file() else 0
+                        if sz >= _JSONL_ROTATE_BYTES:
+                            rotated[label] = f"would rotate ({sz / 1024:.0f} KB)"
+                    except OSError:
+                        pass
+                else:
+                    r = _rotate_jsonl(path)
+                    if r:
+                        rotated[label] = r
+            results["log_rotation"] = rotated
 
     # 7. Ignored notes orphans
     if dry_run:
@@ -23810,11 +24311,66 @@ def run_maintenance(
 @click.option("--skip-logs", is_flag=True, help="Saltear rotación de logs")
 @click.option("--verbose", "-v", is_flag=True, help="Mostrar detalles de cada paso")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON (para cron/scripts)")
-def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool, as_json: bool):
+@click.option("--rollback-state-migration", "rollback_state", is_flag=True,
+               help="Escape hatch: restaurar .bak.<ts> originales + dropear rag_* tables (T7)")
+@click.option("--force", is_flag=True,
+               help="Bypass safety gates en --rollback-state-migration")
+def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool,
+                 as_json: bool, rollback_state: bool, force: bool):
     """Mantenimiento integral: reindex, limpiar sesiones, podar caches, rotar logs, detectar dead notes.
 
     Seguro para correr periódicamente vía launchd/cron. Con --dry-run solo reporta.
+
+    --rollback-state-migration deshace T2: renombra cada `.bak.<unix_ts>` a su
+    nombre original + dropea las 21 rag_*/system_memory_metrics tables +
+    VACUUM. Refuses si hay launchd services corriendo (usa --force para
+    bypass) o si no hay .bak.<ts> dentro de la ventana de 30 días.
     """
+    if rollback_state:
+        if not as_json:
+            mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[red]ROLLBACK[/red]"
+            console.print(Rule(title=f"[bold cyan]State Migration Rollback[/bold cyan] {mode}",
+                                style="cyan"))
+            console.print()
+        if dry_run:
+            # Dry-run semantics: report what the rollback would touch without
+            # renaming or dropping anything.
+            pids = _pgrep_obsidian_rag()
+            bak_map = _find_bak_files_for_rollback()
+            summary = {
+                "would_refuse": bool(pids and not force) or (not bak_map and not force),
+                "running_pids": pids,
+                "bak_files_found": len(bak_map),
+                "tables_would_drop": [t for t in _ROLLBACK_TABLES],
+            }
+            if as_json:
+                click.echo(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+                return
+            if summary["would_refuse"]:
+                if pids and not force:
+                    console.print(f"  [red]Refused:[/red] {len(pids)} launchd service(s) running — "
+                                   "stop services or pass --force.")
+                if not bak_map and not force:
+                    console.print("  [red]Refused:[/red] no .bak.<unix_ts> files within 30-day window — "
+                                   "nothing to restore to (pass --force to DROP anyway).")
+            console.print(f"  [bold].bak.<ts> files:[/bold] {len(bak_map)} would be restored")
+            console.print(f"  [bold]Tables would drop:[/bold] {len(summary['tables_would_drop'])}")
+            return
+        result = _rollback_state_migration(force=force)
+        if as_json:
+            click.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return
+        if not result["ok"]:
+            console.print(f"  [red]Refused:[/red] {result.get('refused', 'unknown')}")
+            raise click.exceptions.Exit(1)
+        mb = result.get("bytes_reclaimed", 0) / (1024 * 1024)
+        console.print(f"  [bold]Files restored:[/bold] {result['files_restored']}")
+        console.print(f"  [bold]Tables dropped:[/bold] {len(result['tables_dropped'])}"
+                       f" [dim]({', '.join(result['tables_dropped'][:4])}"
+                       f"{', …' if len(result['tables_dropped']) > 4 else ''})[/dim]")
+        console.print(f"  [bold]Disk reclaimed:[/bold] {mb:.1f} MB")
+        return
+
     if not as_json:
         mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[green]LIVE[/green]"
         console.print(Rule(title=f"[bold cyan]Maintenance[/bold cyan] {mode}", style="cyan"))
@@ -23900,8 +24456,53 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
     if rotated:
         for label, detail in rotated.items():
             console.print(f"  [bold]Log rotation:[/bold] {label} — {detail}")
-    else:
+    elif not RAG_STATE_SQL:
         console.print("  [bold]Log rotation:[/bold] [dim]all under threshold[/dim]")
+
+    # ── SQL log rotation (flag ON) ──
+    sql_rot = results.get("sql_rotation") or {}
+    if sql_rot:
+        rows = sql_rot.get("rows_deleted", {}) or {}
+        total = sum(rows.values())
+        verb = "would delete" if dry_run else "deleted"
+        if total:
+            console.print(f"  [bold]SQL rotation:[/bold] [yellow]{verb} {total} rows[/yellow] "
+                           f"across {sum(1 for v in rows.values() if v)} tables")
+            if verbose:
+                for t, n in sorted(rows.items(), key=lambda x: -x[1]):
+                    if n:
+                        console.print(f"    [dim]{t}: {n}[/dim]")
+        else:
+            console.print("  [bold]SQL rotation:[/bold] [dim]no rows past retention[/dim]")
+        wal = sql_rot.get("wal_checkpoint") or {}
+        if wal.get("ok"):
+            b = wal.get("before_bytes", 0) / (1024 * 1024)
+            a = wal.get("after_bytes", 0) / (1024 * 1024)
+            if dry_run:
+                console.print(f"  [bold]SQL WAL:[/bold] [dim]{b:.1f} MB (dry-run)[/dim]")
+            else:
+                console.print(f"  [bold]SQL WAL:[/bold] checkpoint {b:.1f} → {a:.1f} MB")
+        if sql_rot.get("vacuum_ran"):
+            bv = (sql_rot.get("vacuum_before_bytes") or 0) / (1024 * 1024)
+            av = (sql_rot.get("vacuum_after_bytes") or 0) / (1024 * 1024)
+            console.print(f"  [bold]VACUUM:[/bold] ran {bv:.1f} → {av:.1f} MB")
+        elif sql_rot.get("vacuum_would_run"):
+            console.print("  [bold]VACUUM:[/bold] [yellow]would run (delta ≥ 500 MB)[/yellow]")
+        else:
+            console.print("  [bold]VACUUM:[/bold] [dim]skipped (delta < 500 MB)[/dim]")
+    elif "sql_rotation_error" in results:
+        console.print(f"  [bold]SQL rotation:[/bold] [red]error: {results['sql_rotation_error']}[/red]")
+
+    # ── Migration .bak cleanup ──
+    bak = results.get("bak_cleanup") or {}
+    if bak:
+        n = bak.get("deleted", 0)
+        mb = bak.get("bytes_freed", 0) / (1024 * 1024)
+        if n:
+            verb = "would purge" if dry_run else "purged"
+            console.print(f"  [bold].bak cleanup:[/bold] [yellow]{verb} {n} files ({mb:.1f} MB)[/yellow]")
+        else:
+            console.print("  [bold].bak cleanup:[/bold] [dim]none >30d[/dim]")
 
     # ── Ignored notes ──
     ign = results.get("ignored_pruned", 0)

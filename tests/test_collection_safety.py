@@ -198,3 +198,57 @@ def test_collection_write_lock_is_exclusive(tmp_path, monkeypatch):
     assert max_enter_second >= min_exit, (
         "Second thread entered lock before first thread released it"
     )
+
+
+# ── test 6: corpus cache invalidates on collection UUID change ────────────────
+
+
+def test_corpus_cache_invalidates_on_collection_id_change(monkeypatch):
+    """Concurrent `index --reset` deletes + recreates the collection with a
+    fresh UUID. If the post-reindex chunk count lands on the same number,
+    the pre-reset BM25 cache is stale but `count` alone wouldn't detect it.
+    The cache must compare against the current collection UUID too — otherwise
+    a long-lived chat process keeps serving BM25 ids that have been wiped.
+    """
+    monkeypatch.setattr(rag, "_corpus_cache", None)
+
+    def _fake_col(cid: str, n: int) -> MagicMock:
+        col = MagicMock()
+        col.id = cid
+        col.count.return_value = n
+        col.get.return_value = {
+            "ids": [f"doc::{i}" for i in range(n)],
+            "documents": [f"body {i}" for i in range(n)],
+            "metadatas": [
+                {"note": f"Note{i}", "file": f"f{i}.md", "folder": "X", "tags": "", "outlinks": ""}
+                for i in range(n)
+            ],
+        }
+        return col
+
+    col_a = _fake_col("uuid-A", 5)
+    corpus_a = rag._load_corpus(col_a)
+    assert corpus_a["collection_id"] == "uuid-A"
+    assert corpus_a["ids"] == [f"doc::{i}" for i in range(5)]
+
+    # Same count but new UUID (simulates delete + recreate with identical row count).
+    col_b = _fake_col("uuid-B", 5)
+    col_b.get.return_value = {
+        "ids": [f"fresh::{i}" for i in range(5)],
+        "documents": [f"fresh body {i}" for i in range(5)],
+        "metadatas": [
+            {"note": f"Fresh{i}", "file": f"g{i}.md", "folder": "Y", "tags": "", "outlinks": ""}
+            for i in range(5)
+        ],
+    }
+    corpus_b = rag._load_corpus(col_b)
+    assert corpus_b["collection_id"] == "uuid-B"
+    assert corpus_b["ids"] == [f"fresh::{i}" for i in range(5)], (
+        "BM25 cache did not rebuild after collection UUID change — stale ids would be served"
+    )
+
+    # Same UUID + same count → cache reused (no rebuild).
+    col_b.get.reset_mock()
+    corpus_b2 = rag._load_corpus(col_b)
+    assert corpus_b2 is corpus_b
+    col_b.get.assert_not_called()

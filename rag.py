@@ -1340,6 +1340,11 @@ IGNORED_NOTES_PATH = Path.home() / ".local/share/obsidian-rag/ignored_notes.json
 #     "tengo notas sobre ikigai" → 0.81) sin arrastrar queries que sólo
 #     comparten tópico (distintas intents caen < 0.75).
 FEEDBACK_MATCH_COSINE = 0.80
+# Soft-weighting floor: cosine below this is noise-level for bge-m3 on this
+# corpus (measured as ~0.5-0.6 background vs 0.75-0.95 same-intent paraphrases).
+# Acts as the hard gate for candidate pool expansion. Scoring-time floor lives
+# in RankerWeights.feedback_match_floor (tunable via `rag tune`).
+FEEDBACK_POOL_FLOOR = 0.70
 # Rerank score deltas calibrados contra la distribución real (queries.jsonl):
 #   rank1-rank2 gap p50 = 0.02, p75 = 0.12. Boost 0.03 ≈ 1.5× mediana
 #   (desempata ties sin override); penalty 0.15 ≈ 7.5× mediana (decisivo
@@ -1524,15 +1529,17 @@ class RankerWeights:
               + click_prior_folder * ctr_folder       [behavior: folder CTR]
               + click_prior_hour   * ctr_path_hour    [behavior: path × hour CTR]
               + dwell_score        * log1p(dwell_s)   [behavior: mean dwell]
-              + feedback_pos                          [path en feedback+ cosine≥0.80]
-              - feedback_neg                          [path en feedback- cosine≥0.80]
+              + feedback_pos * ramp(cos_pos, floor)   [pos match via golden]
+              - feedback_neg * ramp(cos_neg, floor)   [neg match via golden]
+                where ramp(c, f) = max(0, (c - f) / (1 - f))
+                and floor = weights.feedback_match_floor (default 0.80, tunable)
 
     New behavior knobs default to 0.0 — inert until rag tune learns weights.
     Backward compatible: old ranker.json without these keys falls back to 0.0.
     """
     __slots__ = (
         "recency_cue", "recency_always", "tag_literal",
-        "feedback_pos", "feedback_neg", "graph_pagerank",
+        "feedback_pos", "feedback_neg", "feedback_match_floor", "graph_pagerank",
         "click_prior", "click_prior_folder", "click_prior_hour", "dwell_score",
     )
 
@@ -1543,6 +1550,7 @@ class RankerWeights:
         tag_literal: float = 0.0,
         feedback_pos: float = FEEDBACK_POSITIVE_BOOST,
         feedback_neg: float = FEEDBACK_NEGATIVE_PENALTY,
+        feedback_match_floor: float = 0.80,
         graph_pagerank: float = 0.0,
         click_prior: float = 0.0,
         click_prior_folder: float = 0.0,
@@ -1554,6 +1562,7 @@ class RankerWeights:
         self.tag_literal = float(tag_literal)
         self.feedback_pos = float(feedback_pos)
         self.feedback_neg = float(feedback_neg)
+        self.feedback_match_floor = float(feedback_match_floor)
         self.graph_pagerank = float(graph_pagerank)
         self.click_prior = float(click_prior)
         self.click_prior_folder = float(click_prior_folder)
@@ -1930,23 +1939,41 @@ def load_feedback_golden() -> dict:
     return _feedback_golden_memo
 
 
-def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[str]]:
-    """Return (boost_paths, penalty_paths) for this query. Matches against
-    the golden cache — only previous ratings with cosine ≥ FEEDBACK_MATCH_COSINE
-    to the incoming query contribute.
+def _soft_feedback_weight(cos: float, floor: float) -> float:
+    """Linear ramp: 0 at or below floor, 1 at cosine=1.0.
+
+    Used in both retrieve() inline scoring and apply_weighted_scores to convert
+    a raw cosine similarity into a [0, 1] multiplier for feedback_pos/neg weights.
+    """
+    if cos <= floor or floor >= 1.0:
+        return 0.0
+    return (cos - floor) / (1.0 - floor)
+
+
+def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, float], dict[str, float]]:
+    """Return (boost_cos, penalty_cos): dict[path → max cosine observed]
+    across matching golden entries. Only entries with cosine ≥
+    FEEDBACK_POOL_FLOOR contribute — below that is background noise.
+
+    Callers (retrieve(), collect_ranker_features()) apply the scoring-time
+    ramp using weights.feedback_match_floor:
+        w = max(0, (cos - weights.feedback_match_floor) / (1 - weights.feedback_match_floor))
+
+    This replaces the former binary FEEDBACK_MATCH_COSINE=0.80 cliff with
+    a smooth contribution proportional to semantic similarity.
     """
     golden = load_feedback_golden()
     if not (golden["positives"] or golden["negatives"]):
-        return set(), set()
+        return {}, {}
 
     import numpy as np
     q = np.asarray(q_embedding, dtype="float32")
     qn = float(np.linalg.norm(q))
     if qn == 0:
-        return set(), set()
+        return {}, {}
 
-    boost: set[str] = set()
-    penalty: set[str] = set()
+    boost: dict[str, float] = {}
+    penalty: dict[str, float] = {}
     # Dimensional safety: a stale golden cache (e.g. rebuilt with a different
     # embedder or written by tests with fake embeddings) can have a vector
     # shape that doesn't match the current query's. Silently skip mismatched
@@ -1960,8 +1987,10 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
         en = float(np.linalg.norm(e))
         if en == 0:
             continue
-        if float(np.dot(q, e)) / (qn * en) >= FEEDBACK_MATCH_COSINE:
-            boost.update(entry["paths"])
+        cos = float(np.dot(q, e)) / (qn * en)
+        if cos >= FEEDBACK_POOL_FLOOR:
+            for path in entry["paths"]:
+                boost[path] = max(boost.get(path, 0.0), cos)
     for entry in golden["negatives"]:
         e = np.asarray(entry["emb"], dtype="float32")
         if e.shape[0] != q_dim:
@@ -1969,10 +1998,13 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[set[str], set[
         en = float(np.linalg.norm(e))
         if en == 0:
             continue
-        if float(np.dot(q, e)) / (qn * en) >= FEEDBACK_MATCH_COSINE:
-            penalty.update(entry["paths"])
+        cos = float(np.dot(q, e)) / (qn * en)
+        if cos >= FEEDBACK_POOL_FLOOR:
+            for path in entry["paths"]:
+                penalty[path] = max(penalty.get(path, 0.0), cos)
     # Positive wins if a path appears in both (user rated it 👍 more recently).
-    penalty -= boost
+    for path in list(boost.keys()):
+        penalty.pop(path, None)
     return boost, penalty
 
 
@@ -3252,13 +3284,21 @@ def _tokenize(text: str) -> list[str]:
 def _load_corpus(col: chromadb.Collection) -> dict:
     """Load and cache the full corpus + BM25 index + vocabulary.
 
-    Invalidated when collection size changes. Chunk updates that keep the same
-    count won't invalidate — acceptable for chat-mode within a process; fresh
-    CLI invocations rebuild from disk anyway.
+    Invalidation keys: (collection UUID, chunk count). A concurrent
+    `index --reset` deletes + recreates the collection with a fresh UUID
+    even when the post-reindex count lands at the same number, so relying
+    on count alone left long-lived chat processes serving stale BM25
+    indexes whose ids had been wiped. `col.id` is the authoritative churn
+    signal — chromadb rotates it on every delete+create.
     """
     global _corpus_cache
     n = col.count()
-    if _corpus_cache is not None and _corpus_cache["count"] == n:
+    cid = str(getattr(col, "id", "") or "")
+    if (
+        _corpus_cache is not None
+        and _corpus_cache["count"] == n
+        and _corpus_cache.get("collection_id") == cid
+    ):
         return _corpus_cache
 
     data = col.get(include=["documents", "metadatas"])
@@ -3300,7 +3340,8 @@ def _load_corpus(col: chromadb.Collection) -> dict:
                 backlinks.setdefault(t, set()).add(path)
 
     _corpus_cache = {
-        "count": n, "ids": ids, "docs": docs, "metas": metas,
+        "count": n, "collection_id": cid,
+        "ids": ids, "docs": docs, "metas": metas,
         "bm25": bm25, "tags": tags, "folders": folders,
         "title_to_paths": title_to_paths,
         "outlinks": outlinks,    # path → [linked titles]
@@ -6528,13 +6569,17 @@ def retrieve(
                 final += weights.click_prior_hour * ch.get((path, _behavior_hour), 0.0)
             if weights.dwell_score and ds:
                 final += weights.dwell_score * ds.get(path, 0.0)
-        # Feedback: additive boost/penalty para paths marcados 👍/👎 en queries
-        # similares (cosine ≥ FEEDBACK_MATCH_COSINE). Módulo tuneable por
-        # weights — el signo es fijo.
-        if path in boost_paths:
-            final += weights.feedback_pos
-        if path in penalty_paths:
-            final -= weights.feedback_neg
+        # Soft ramp: at cos=floor → w=0 (no effect), at cos=1.0 → w=1.0 (full weight).
+        # Floor is tunable (weights.feedback_match_floor) so rag tune can find the
+        # optimal gate point instead of relying on a hardcoded threshold.
+        floor = weights.feedback_match_floor
+        denom = max(1e-6, 1.0 - floor)
+        pos_cos = boost_paths.get(path, 0.0)
+        if pos_cos > floor:
+            final += weights.feedback_pos * (pos_cos - floor) / denom
+        neg_cos = penalty_paths.get(path, 0.0)
+        if neg_cos > floor:
+            final -= weights.feedback_neg * (neg_cos - floor) / denom
         final_pairs.append((c, e, final))
     scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
     scored = scored_all[:k]
@@ -6835,7 +6880,7 @@ def collect_ranker_features(
         {
           "path": str, "note": str, "meta": dict,
           "rerank": float, "recency_raw": float,
-          "tag_hits": int, "fb_pos": bool, "fb_neg": bool,
+          "tag_hits": int, "fb_pos_cos": float, "fb_neg_cos": float,
           "ignored": bool, "has_recency_cue": bool,
           "graph_pagerank": float,
           "click_prior": float,        # per-path CTR from behavior.jsonl
@@ -6953,8 +6998,8 @@ def collect_ranker_features(
             "rerank": float(s),
             "recency_raw": float(rec_raw),
             "tag_hits": int(n_tag),
-            "fb_pos": path in boost_paths,
-            "fb_neg": path in penalty_paths,
+            "fb_pos_cos": float(boost_paths.get(path, 0.0)),
+            "fb_neg_cos": float(penalty_paths.get(path, 0.0)),
             "ignored": path in ignored_set,
             "has_recency_cue": bool(recency_cue),
             "graph_pagerank": float(pr / max_pr if max_pr > 0 else 0.0),
@@ -6999,10 +7044,12 @@ def apply_weighted_scores(
             score += weights.click_prior_hour * f["click_prior_hour"]
         if weights.dwell_score and f.get("dwell_score"):
             score += weights.dwell_score * f["dwell_score"]
-        if f["fb_pos"]:
-            score += weights.feedback_pos
-        if f["fb_neg"]:
-            score -= weights.feedback_neg
+        pos_w = _soft_feedback_weight(f.get("fb_pos_cos", 0.0), weights.feedback_match_floor)
+        if pos_w:
+            score += weights.feedback_pos * pos_w
+        neg_w = _soft_feedback_weight(f.get("fb_neg_cos", 0.0), weights.feedback_match_floor)
+        if neg_w:
+            score -= weights.feedback_neg * neg_w
         scored.append((score, f))
     scored.sort(key=lambda x: x[0], reverse=True)
     out: list[dict] = []
@@ -10312,6 +10359,7 @@ _TUNE_SPACE = {
     "tag_literal":        (0.0, 0.20),   # default 0.00 (new signal)
     "feedback_pos":       (0.0, 0.15),   # default 0.03
     "feedback_neg":       (0.0, 0.50),   # default 0.15
+    "feedback_match_floor": (0.60, 0.95),  # default 0.80 — soft ramp floor; preserves pre-refactor hard-gate behavior at default
     "graph_pagerank":     (0.0, 0.30),   # default 0.00 — wikilink authority signal
     # Behavior priors — inert at 0.0 until behavior.jsonl accumulates signal
     "click_prior":        (0.0, 0.30),   # per-path CTR from open/save events

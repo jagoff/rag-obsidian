@@ -112,14 +112,17 @@ def test_noise_tokens_ignored():
 
 
 def _feat(path, rerank, **kw):
-    return {
+    # fb_pos_cos/fb_neg_cos: cosine similarity to matching golden entry (0.0 = no match).
+    # Cosine 1.0 with default floor 0.70 gives ramp weight 1.0, preserving old bool=True math.
+    base = {
         "path": path, "note": path.rsplit("/", 1)[-1],
         "rerank": rerank, "recency_raw": 0.0,
-        "tag_hits": 0, "fb_pos": False, "fb_neg": False,
+        "tag_hits": 0, "fb_pos_cos": 0.0, "fb_neg_cos": 0.0,
         "ignored": False, "has_recency_cue": False,
         "meta": {"file": path, "tags": ""},
-        **kw,
     }
+    base.update(kw)
+    return base
 
 
 def test_default_weights_sort_by_rerank_only():
@@ -153,9 +156,11 @@ def test_tag_boost_changes_order():
 
 
 def test_feedback_signals_applied_symmetrically():
+    # fb_pos_cos=1.0 with default floor=0.70 → ramp weight = (1.0-0.70)/(1.0-0.70) = 1.0
+    # so full feedback_pos/neg is applied, preserving the old bool=True semantics.
     feats = [
-        _feat("a.md", 0.5, fb_neg=True),    # penalty
-        _feat("b.md", 0.4, fb_pos=True),    # boost
+        _feat("a.md", 0.5, fb_neg_cos=1.0),    # penalty
+        _feat("b.md", 0.4, fb_pos_cos=1.0),    # boost
     ]
     w = rag.RankerWeights(feedback_pos=0.2, feedback_neg=0.3)
     top = rag.apply_weighted_scores(feats, w, k=2)

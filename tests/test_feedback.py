@@ -183,8 +183,8 @@ def test_load_feedback_golden_skips_empty_paths_or_query(fb_tmp, fake_embed):
 
 def test_feedback_signals_empty_when_no_history(fb_tmp, fake_embed):
     boost, penalty = rag.feedback_signals_for_query([1.0, 0.0, 0.0, 0.0])
-    assert boost == set()
-    assert penalty == set()
+    assert boost == {}
+    assert penalty == {}
 
 
 def test_feedback_signals_matches_identical_query(fb_tmp, fake_embed):
@@ -195,17 +195,17 @@ def test_feedback_signals_matches_identical_query(fb_tmp, fake_embed):
     q_emb = rag.embed(["adam jones sistema de sonido"])[0]
     boost, penalty = rag.feedback_signals_for_query(q_emb)
     assert "guitar.md" in boost
-    assert penalty == set()
+    assert penalty == {}
 
 
 def test_feedback_signals_below_threshold_ignored(fb_tmp, fake_embed, monkeypatch):
-    """Si cosine < FEEDBACK_MATCH_COSINE, el feedback no se aplica."""
-    monkeypatch.setattr(rag, "FEEDBACK_MATCH_COSINE", 0.99)
+    """Si cosine < FEEDBACK_POOL_FLOOR, el feedback no se aplica."""
+    monkeypatch.setattr(rag, "FEEDBACK_POOL_FLOOR", 0.99)
     rag.record_feedback("t1", 1, "aaa", ["a.md"])
     q_emb = rag.embed(["zzz"])[0]                # hash distinto → cosine bajo
     boost, penalty = rag.feedback_signals_for_query(q_emb)
-    assert boost == set()
-    assert penalty == set()
+    assert boost == {}
+    assert penalty == {}
 
 
 def test_feedback_signals_negative_loses_to_positive(fb_tmp, fake_embed):
@@ -225,7 +225,7 @@ def test_feedback_signals_negative_loses_to_positive(fb_tmp, fake_embed):
     # exactamente una. La query 'x' debe boostear; la 'y' debe penalizar.
     qx = rag.embed(["x"])[0]
     boost_x, pen_x = rag.feedback_signals_for_query(qx)
-    assert "shared.md" in boost_x
+    assert "shared.md" in boost_x   # dict `in` checks keys
     assert "shared.md" not in pen_x
 
 

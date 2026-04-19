@@ -231,22 +231,49 @@ Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 
-- `chroma/` — ChromaDB collections (per-vault suffixed). Orphan HNSW segment dirs (not referenced in `segments` table) + stale WAL are cleaned by `rag maintenance` via `_prune_orphan_segment_dirs` + `_chroma_wal_checkpoint`. One 33GB orphan cleanup shipped 2026-04-17.
-- `queries.jsonl` — query log (q, variants, paths, scores, timings, mode, cmd)
-- `feedback.jsonl` / `feedback_golden.json` (cache, rebuilt lazy on mtime gap)
-- `behavior.jsonl` — ranker-vivo event log (4 sources: cli, whatsapp, web, brief). Rotated by `rag maintenance`.
-- `brief_written.jsonl` / `brief_state.jsonl` — brief diff sidecars (what was cited vs dedup of already-emitted kept/deleted pairs).
+### Telemetry — SQL tables (post-cutover 2026-04-19)
+
+All operational telemetry + learning state now lives in `ragvec/ragvec.db` alongside the sqlite-vec meta/vec tables. 20 `rag_*` prefixed tables (no collision with `meta_*`/`vec_*`). Gated by `RAG_STATE_SQL=1`, set on every launchd plist at cutover. Legacy JSONL writes/reads still live in `rag.py` as fallback — T10 (~2026-04-26, +7d observation) strips them.
+
+Log-style tables (`id INTEGER PK AUTOINCREMENT`, `ts TEXT` ISO-8601, indexed):
+- `rag_queries` — query log (q, variants_json, paths_json, scores_json, top_score, t_retrieve, t_gen, cmd, session, mode, citation_repaired, critique_fired/changed, extra_json). Retention 90d via `rag maintenance`.
+- `rag_behavior` — ranker-vivo events (source: cli/whatsapp/web/brief × event: open/kept/deleted/positive_implicit/negative_implicit/save). Retention 90d.
+- `rag_feedback` — explicit +1/-1 + optional corrective_path (UNIQUE(turn_id,rating,ts)). Keep all.
+- `rag_tune` — offline + online tune history (cmd, baseline/best_json, delta, eval_hit5_*, rolled_back). Keep all.
+- `rag_contradictions` — radar Phase 2 (UNIQUE(ts,subject_path)). Keep all.
+- `rag_ambient` / `rag_ambient_state` — ambient agent log (retention 60d) + dedup state (upsert by path).
+- `rag_brief_written` — morning/today brief citation manifest (retention 60d).
+- `rag_brief_state` — kept/deleted dedup (upsert by pair_key = hash(brief_type, kind, path)).
+- `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log` — 60d retention.
+- `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics` — per-minute samplers, 30d retention.
+
+State-style tables:
+- `rag_conversations_index` — episodic session_id → relative_path (web/conversation_writer.py upsert; replaces the old conversations_index.json + fcntl dance).
+- `rag_feedback_golden` (pk=path,rating, `embedding BLOB` float32 little-endian, `source_ts`) + `rag_feedback_golden_meta` (k/v) — cache rebuilt when `rag_feedback.max(ts) > meta.last_built_source_ts`.
+
+Primitives in `rag.py` (`# ── SQL state store (T1: foundation) ──` section):
+- `_ensure_telemetry_tables(conn)` — idempotent DDL
+- `_ragvec_state_conn()` — short-lived WAL conn with `synchronous=NORMAL` + `busy_timeout=10000`
+- `_sql_append_event(conn, table, row)`, `_sql_upsert(conn, table, row, pk_cols)`, `_sql_query_window(conn, table, since_ts, ...)`, `_sql_max_ts(conn, table)`
+
+Writer contract: if flag ON, single-row BEGIN/COMMIT into SQL; on exception, log to `sql_state_errors.jsonl` and fall through to JSONL (cutover fail-safe). Reader contract: if flag ON + SQL has data, return SQL; if SQL empty or raises, fall through to JSONL (historical data bridge).
+
+Migration one-shot: `scripts/migrate_state_to_sqlite.py --source-dir ~/.local/share/obsidian-rag [--dry-run] [--round-trip-check] [--reverse] [--summary]`. Refuses to run while `com.fer.obsidian-rag-*` services are up (preflight `pgrep`; `--force` to override). Renames each source → `<name>.bak.<unix_ts>` on successful commit. Cutover of 2026-04-19 imported 7,946 records across 19 sources; 43 malformed pre-existing records dropped (missing NOT NULL fields).
+
+Rollback escape hatch: `rag maintenance --rollback-state-migration [--force]`. Restores the newest `.bak.<ts>` per source, drops the 20 `rag_*` tables, WAL checkpoint + VACUUM. Refuses if services up + no bak files found. `rag maintenance` also prunes `.bak.*` older than 30d.
+
+### Other state (unchanged; still on disk)
+
 - `ranker.json` — tuned weights. Delete = reset to hardcoded defaults.
 - `ranker.{unix_ts}.json` — 3 most recent backups, written on every `rag tune --apply`. Consumed by `rag tune --rollback` + auto-rollback CI gate.
-- `sessions/*.json` + `last_session` — multi-turn state
-- `contradictions.jsonl` — radar sidecar
-- `ambient.json` / `ambient.jsonl` / `ambient_state.jsonl` — config + log + dedup
-- `filing_batches/*.jsonl` — audit log (prefix `archive-*` for archiver)
-- `ignored_notes.json`, `tune.jsonl` (online-tune regressions also land here)
-- `online-tune.{log,error.log}` — nightly tune launchd output
-- `*.{log,error.log}` — other launchd service logs
+- `sessions/*.json` + `last_session` — multi-turn state (TTL 30d, cap 50 turns).
+- `ambient.json` — ambient agent config (jid, enabled, allowed_folders).
+- `filing_batches/*.jsonl` — audit log (prefix `archive-*` for archiver).
+- `ignored_notes.json`, `home_cache.json`, `context_summaries.json`, `auto_index_state.json`, `coach_state.json`, `synthetic_questions.json`, `wa_tasks_state.json` — app state + caches.
+- `online-tune.{log,error.log}`, `*.{log,error.log}` — launchd service logs.
+- `sql_state_errors.jsonl` — diagnostic sink for SQL-path write failures (only populated if the SQL branch raises and JSONL fallback fires).
 
-**Reset learned state**: `rm ranker.json feedback_golden.json`. Dimension mismatch in feedback golden → silently ignored. Full re-embed: `rag index --reset`.
+**Reset learned state**: `rm ranker.json` + `DELETE FROM rag_feedback_golden; DELETE FROM rag_feedback_golden_meta;` inside ragvec.db. Full re-embed: `rag index --reset`.
 
 ## Vault path
 

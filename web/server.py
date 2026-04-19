@@ -172,6 +172,29 @@ _WEB_SYSTEM_PROMPT = (
     "su uso (firma, parámetros, ejemplo, en qué MCP/server vive), "
     "ese uso es OBLIGATORIO en la respuesta — no te quedes en un "
     "token mínimo cuando el chunk lo explica.\n\n"
+    "REGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: si el CONTEXTO "
+    "contiene URLs (http://, https://) o wikilinks ([[Nota]]) que "
+    "viven DENTRO del cuerpo de una nota (no son la ruta del chunk), "
+    "copialos LITERAL en la respuesta — son clickeables y útiles para "
+    "el usuario. Aclaración respecto a REGLA 2: REGLA 2 prohíbe "
+    "citar las notas-fuente (la lista de abajo ya las muestra). Los "
+    "links/URLs que aparecen como contenido de una nota son data, "
+    "no citas; tienen que aparecer en la respuesta. Ejemplo: si un "
+    "chunk dice 'tutorial: https://x.com/y', escribí 'tutorial: "
+    "https://x.com/y', no 'tutorial disponible'.\n\n"
+    "REGLA 4.6 — LINK A DOCS OFICIALES (opcional, condicionado): si el "
+    "CONTEXTO sobre una herramienta/producto se queda corto Y la "
+    "pregunta se beneficiaría de docs oficiales (ej: 'cómo configuro X', "
+    "'qué features tiene Y'), podés ofrecer UN link a la documentación "
+    "oficial al final, envuelto en `<<ext>>...<</ext>>`. Restricciones "
+    "duras:\n"
+    "  • Sólo el dominio raíz canónico (ej: https://omnifocus.com, "
+    "https://obsidian.md). NUNCA inventes paths profundos "
+    "(/docs/v3/foo) — si no estás 100% seguro de la URL exacta, usá "
+    "el root.\n"
+    "  • Una sola línea, formato: `<<ext>>Más info: <URL></ext>>`.\n"
+    "  • NO ofrecer link si el CONTEXTO ya cubre la pregunta, ni para "
+    "consultas sobre las notas mismas (vault, tags, búsqueda).\n\n"
     "REGLA 5 — SEGUÍ EL HILO: esta es una conversación, no preguntas "
     "sueltas. Los mensajes previos (user/assistant de arriba) son "
     "contexto vivo. Si la pregunta nueva usa pronombres ('ella', "
@@ -613,30 +636,46 @@ def followups(req: FollowupsRequest) -> dict:
     suggestions tight and cheap (~400-800ms on M-series). Returns empty
     list on any error so the UI fails silently.
     """
-    from rag import load_session  # noqa: PLC0415
+    from rag import load_session, get_db  # noqa: PLC0415
     sess = load_session(req.session_id)
     if not sess or not sess.get("turns"):
         return {"followups": []}
     last = sess["turns"][-1]
     q = (last.get("q") or "").strip()
     a = (last.get("a") or "").strip()[:800]
-    paths = last.get("paths") or []
-    titles = [Path(p).stem for p in paths[:4]]
+    paths = (last.get("paths") or [])[:3]
+    snippets: list[str] = []
+    if paths:
+        try:
+            col = get_db()
+            for p in paths:
+                res = col.get(where={"file": p}, include=["documents", "metadatas"])
+                docs = res.get("documents") or []
+                metas = res.get("metadatas") or []
+                if not docs:
+                    continue
+                title = (metas[0].get("note") if metas else None) or Path(p).stem
+                body = (docs[0] or "").strip().replace("\n", " ")
+                snippets.append(f"- {title}: {body[:280]}")
+        except Exception:
+            snippets = []
     ctx_bits = [f"Pregunta previa: {q}", f"Respuesta: {a}"]
-    if titles:
-        ctx_bits.append(f"Notas del vault consultadas: {', '.join(titles)}")
+    if snippets:
+        ctx_bits.append("Fragmentos de las notas que aparecieron:\n" + "\n".join(snippets))
     ctx = "\n\n".join(ctx_bits)
     prompt = (
-        "Sugerí 3 preguntas de seguimiento que el usuario podría hacer para "
-        "profundizar sobre el mismo tema usando su vault de Obsidian. "
-        "Cada pregunta ≤70 caracteres, en español, natural, enfocada en su "
-        "propio vault (usá tuteo). Devolvé SOLO un JSON con la forma "
+        "Sugerí 3 preguntas de seguimiento concretas que el usuario podría "
+        "hacer para profundizar usando su vault de Obsidian. Las preguntas "
+        "DEBEN anclarse en hechos, nombres, herramientas o conceptos que "
+        "aparezcan literalmente en los fragmentos de arriba — no inventes "
+        "ángulos no presentes. Cada pregunta ≤70 caracteres, en español "
+        "rioplatense (tuteo). Devolvé SOLO un JSON con la forma "
         '{"followups": ["...", "...", "..."]}. Sin texto extra.\n\n'
         f"{ctx}\n\nJSON:"
     )
     try:
         resp = ollama.chat(
-            model="qwen2.5:3b",
+            model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.3, "seed": 42, "num_predict": 220, "num_ctx": 2048},
             format="json",
@@ -734,6 +773,43 @@ def list_vaults() -> dict:
         "registered": registered,
         "current": cfg.get("current"),
     }
+
+
+@app.get("/api/history")
+def query_history(limit: int = 200) -> dict:
+    """Tail of `queries.jsonl` for terminal-style up-arrow nav in the web UI.
+
+    Returns oldest→newest after deduping consecutive identical questions.
+    Filters to chat-bound commands so /save, /reindex, internal eval runs,
+    etc. don't pollute the history list.
+    """
+    limit = max(1, min(int(limit or 200), 1000))
+    if not LOG_PATH.is_file():
+        return {"history": []}
+    keep_cmds = {"query", "chat", "ask"}
+    out: list[str] = []
+    try:
+        with LOG_PATH.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                cmd = rec.get("cmd") or ""
+                if cmd and cmd not in keep_cmds:
+                    continue
+                q = (rec.get("q") or "").strip()
+                if not q:
+                    continue
+                if out and out[-1] == q:
+                    continue
+                out.append(q)
+    except OSError:
+        return {"history": []}
+    return {"history": out[-limit:]}
 
 
 def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:

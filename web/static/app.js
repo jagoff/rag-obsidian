@@ -26,6 +26,97 @@ let currentController = null;      // AbortController for in-flight /api/chat
 let currentAudio = null;           // In-flight <audio> playback
 let lastUserQuestion = "";         // For ⌘↑ edit-last
 
+// Terminal-style query history. Persisted across sessions via localStorage.
+const HISTORY_KEY = "obsidian-rag:history";
+const HISTORY_CAP = 100;
+function loadHistory() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    return Array.isArray(arr) ? arr.filter((s) => typeof s === "string") : [];
+  } catch { return []; }
+}
+let history = loadHistory();
+let historyIdx = history.length;   // length = "no entry restored, draft is current"
+let historyDraft = "";             // in-progress text saved when entering history mode
+function pushHistory(q) {
+  q = q.trim();
+  if (!q) return;
+  if (history[history.length - 1] !== q) {
+    history.push(q);
+    if (history.length > HISTORY_CAP) history.splice(0, history.length - HISTORY_CAP);
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+  }
+  historyIdx = history.length;
+  historyDraft = "";
+}
+// History popover — mirrors the slash popover UX so up-arrow opens a
+// browsable list of past queries instead of swapping the input value
+// silently. Newest entry is row 1 (terminal-style).
+const historyPopover = document.getElementById("history-popover");
+let historyPopoverIdx = 0;
+let historyPopoverItems = [];
+function renderHistoryPopover() {
+  historyPopover.innerHTML = "";
+  if (!historyPopoverItems.length) {
+    historyPopover.appendChild(el("div", "slash-popover-empty", "sin historial todavía"));
+    return;
+  }
+  historyPopoverItems.forEach((q, i) => {
+    const row = el("div", "history-item" + (i === historyPopoverIdx ? " active" : ""));
+    row.setAttribute("role", "option");
+    row.appendChild(el("span", "history-idx", String(i + 1)));
+    row.appendChild(el("span", "history-q", q));
+    row.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      pickHistoryEntry(q);
+    });
+    row.addEventListener("mouseenter", () => {
+      historyPopoverIdx = i;
+      [...historyPopover.children].forEach((c, j) => c.classList.toggle("active", j === historyPopoverIdx));
+    });
+    historyPopover.appendChild(row);
+  });
+  const active = historyPopover.children[historyPopoverIdx];
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+function openHistoryPopover() {
+  if (!history.length) return false;
+  if (historyIdx === history.length) historyDraft = input.value;
+  // Cap visible entries — popover stays compact, scroll handles the rest.
+  // Newest first matches terminal arrow-up convention.
+  historyPopoverItems = history.slice(-30).reverse();
+  historyPopoverIdx = 0;
+  historyPopover.hidden = false;
+  renderHistoryPopover();
+  return true;
+}
+function hideHistoryPopover() {
+  historyPopover.hidden = true;
+  historyPopoverItems = [];
+}
+function pickHistoryEntry(q) {
+  input.value = q;
+  autoGrow();
+  input.setSelectionRange(input.value.length, input.value.length);
+  hideHistoryPopover();
+  input.focus();
+}
+
+// Hydrate from server-side queries.jsonl so up-arrow surfaces real past
+// queries even on a fresh tab/browser. localStorage cache makes the first
+// arrow press instant; the fetch refines it with the authoritative log.
+(async function loadServerHistory() {
+  try {
+    const res = await fetch("/api/history?limit=200");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!Array.isArray(data.history) || !data.history.length) return;
+    history = data.history;
+    historyIdx = history.length;
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+  } catch {}
+})();
+
 // Vault picker ----------------------------------------------------
 async function loadVaults() {
   try {
@@ -219,6 +310,7 @@ function autoGrow() {
 input.addEventListener("input", () => {
   autoGrow();
   updateSlashPopover();
+  if (!historyPopover.hidden) hideHistoryPopover();
 });
 
 input.addEventListener("keydown", (e) => {
@@ -249,6 +341,60 @@ input.addEventListener("keydown", (e) => {
       return;
     }
   }
+  if (!historyPopover.hidden) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      historyPopoverIdx = (historyPopoverIdx + 1) % historyPopoverItems.length;
+      renderHistoryPopover();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      historyPopoverIdx = (historyPopoverIdx - 1 + historyPopoverItems.length) % historyPopoverItems.length;
+      renderHistoryPopover();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      const pick = historyPopoverItems[historyPopoverIdx];
+      if (pick) pickHistoryEntry(pick);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideHistoryPopover();
+      input.value = historyDraft;
+      autoGrow();
+      return;
+    }
+  }
+  if (e.key === "ArrowUp" &&
+      !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey &&
+      history.length > 0) {
+    const v = input.value;
+    const caret = input.selectionStart;
+    const onFirstLine = !v.slice(0, caret).includes("\n");
+    if (onFirstLine) {
+      e.preventDefault();
+      openHistoryPopover();
+      return;
+    }
+  }
+  if (e.key === "w" && e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    e.preventDefault();
+    const v = input.value;
+    const end = input.selectionEnd;
+    let start = input.selectionStart;
+    if (start === end) {
+      while (start > 0 && /\s/.test(v[start - 1])) start--;
+      while (start > 0 && !/\s/.test(v[start - 1])) start--;
+    }
+    if (start === end) return;
+    input.value = v.slice(0, start) + v.slice(end);
+    input.setSelectionRange(start, start);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     form.requestSubmit();
@@ -258,7 +404,7 @@ input.addEventListener("keydown", (e) => {
 input.addEventListener("blur", () => {
   // Small delay so a mousedown on a slash-item still registers before the
   // popover disappears.
-  setTimeout(hideSlashPopover, 120);
+  setTimeout(() => { hideSlashPopover(); hideHistoryPopover(); }, 120);
 });
 input.addEventListener("focus", updateSlashPopover);
 
@@ -462,6 +608,23 @@ function appendFeedback(parent, ctx) {
   wrap.appendChild(down);
   wrap.appendChild(status);
   parent.appendChild(wrap);
+  return wrap;
+}
+
+// Web-search escape hatch — surfaces when the vault has weak/no answer
+// (sin sources, o confianza baja). One click → Google búsqueda en pestaña
+// nueva. El usuario decide si vale la pena salir del vault.
+function appendWebSearch(parent, query) {
+  const wrap = el("div", "web-search");
+  const link = document.createElement("a");
+  link.className = "web-search-link";
+  link.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.textContent = "↗  buscar en internet";
+  link.title = `Google: ${query}`;
+  wrap.appendChild(link);
+  parent.appendChild(wrap);
 }
 
 function appendSources(parent, items, confidence) {
@@ -475,13 +638,19 @@ function appendSources(parent, items, confidence) {
     if (seen.has(s.file)) continue;
     seen.add(s.file);
     const row = el("div", "source-row");
-    const scoreStr = (s.score >= 0 ? "+" : "") + s.score.toFixed(1);
-    row.appendChild(el("span", "bar", `${s.bar}  ${scoreStr}`));
+    const filled = (s.bar.match(/■/g) || []).length;
+    const tone = filled >= 4 ? "good" : filled >= 2 ? "mid" : "low";
+    const bar = el("span", `bar bar-${tone}`);
+    bar.textContent = s.bar;
+    row.appendChild(bar);
     const note = el("a", "note", s.note || s.file);
     note.href = obsidianUrl(s.file);
     note.title = s.file;
     row.appendChild(note);
-    row.appendChild(el("span", "path", s.file));
+    const path = el("a", "path", s.file);
+    path.href = obsidianUrl(s.file);
+    path.title = s.file;
+    row.appendChild(path);
     wrap.appendChild(row);
   }
   parent.appendChild(wrap);
@@ -647,6 +816,7 @@ async function send(question) {
   if (pending) return;
   pending = true;
   lastUserQuestion = question;
+  pushHistory(question);
   input.disabled = true;
   stopBtn.hidden = false;
   currentController = new AbortController();
@@ -752,35 +922,29 @@ async function send(question) {
         ragText.classList.remove("pending");
         ragText.innerHTML = renderMarkdown(fullText);
       }
+      const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
       if (sources && sources.length) {
-        const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
         appendSources(turn, sources, conf);
       }
-      if (fullText.trim()) {
-        const actions = el("div", "msg-actions");
-        const totalMs = Number(parsed.total_ms);
-        const retrieveMs = Number(parsed.retrieve_ms);
-        const ttftMs = Number(parsed.ttft_ms);
-        const llmMs = Number(parsed.llm_ms);
-        if (Number.isFinite(totalMs) && totalMs > 0) {
-          const bits = [`⏱ ${(totalMs / 1000).toFixed(1)}s`];
-          if (Number.isFinite(retrieveMs) && retrieveMs >= 0) bits.push(`retrieve ${retrieveMs}ms`);
-          if (Number.isFinite(ttftMs) && ttftMs >= 0) bits.push(`ttft ${ttftMs}ms`);
-          if (Number.isFinite(llmMs) && llmMs >= 0) bits.push(`llm ${llmMs}ms`);
-          const timing = el("span", "msg-timing", bits.join(" · "));
-          timing.title = `${totalMs} ms total`;
-          actions.appendChild(timing);
-        }
-        appendCopyButton(actions, () => buildMarkdownExport(question, fullText, sources));
-        turn.appendChild(actions);
+      if (question && (!sources || !sources.length || (Number.isFinite(conf) && conf < 1.0))) {
+        appendWebSearch(turn, question);
       }
-      if (parsed.turn_id) {
-        appendFeedback(turn, {
-          turn_id: parsed.turn_id,
-          q: question,
-          paths: (sources || []).map((s) => s.file).filter(Boolean),
-          session_id: sessionId,
-        });
+      const feedbackBar = parsed.turn_id
+        ? appendFeedback(turn, {
+            turn_id: parsed.turn_id,
+            q: question,
+            paths: (sources || []).map((s) => s.file).filter(Boolean),
+            session_id: sessionId,
+          })
+        : null;
+      if (fullText.trim()) {
+        if (feedbackBar) {
+          appendCopyButton(feedbackBar, () => buildMarkdownExport(question, fullText, sources));
+        } else {
+          const actions = el("div", "msg-actions");
+          appendCopyButton(actions, () => buildMarkdownExport(question, fullText, sources));
+          turn.appendChild(actions);
+        }
       }
       if (sessionId && !aborted) appendFollowups(turn, sessionId);
       if (ttsEnabled && !aborted && fullText.trim()) speak(fullText);
@@ -788,6 +952,7 @@ async function send(question) {
     } else if (event === "empty") {
       thinking.remove();
       turn.appendChild(el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`));
+      if (question) appendWebSearch(turn, question);
     } else if (event === "error") {
       thinking.remove();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));

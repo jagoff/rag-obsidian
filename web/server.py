@@ -37,6 +37,12 @@ from rag import (  # noqa: E402
     EVAL_LOG_PATH,
     LOG_PATH,
     _LOG_QUEUE,
+    RAG_STATE_SQL,
+    _log_sql_state_error,
+    _map_cpu_row,
+    _map_memory_row,
+    _ragvec_state_conn,
+    _sql_append_event,
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
@@ -3917,6 +3923,14 @@ def _memory_load_history() -> None:
 
 
 def _memory_persist(sample: dict) -> None:
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_memory_metrics",
+                                   _map_memory_row(sample))
+            return
+        except Exception as exc:
+            _log_sql_state_error("memory_sql_write_failed", err=repr(exc))
     try:
         _MEMORY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _MEMORY_STATE_PATH.open("a", encoding="utf-8") as fh:
@@ -4165,6 +4179,14 @@ def _cpu_load_history() -> None:
 
 
 def _cpu_persist(sample: dict) -> None:
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_cpu_metrics",
+                                   _map_cpu_row(sample))
+            return
+        except Exception as exc:
+            _log_sql_state_error("cpu_sql_write_failed", err=repr(exc))
     try:
         _CPU_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _CPU_STATE_PATH.open("a", encoding="utf-8") as fh:

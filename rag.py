@@ -521,9 +521,24 @@ def _collection_write_lock(timeout: int = 300, blocking: bool = True):
 
 def log_query_event(event: dict) -> None:
     """Enqueue a JSONL event for background append to the query log.
-    Best-effort, never raises, non-blocking on the caller thread."""
+    Best-effort, never raises, non-blocking on the caller thread.
+
+    When RAG_STATE_SQL=1: route to rag_queries via _sql_append_event. On any
+    SQL error, fall through to the legacy JSONL path (cutover fail-safe;
+    removed in T10 after 7d observation).
+    """
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    except Exception:
+        return
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_queries", _map_queries_row(event))
+            return
+        except Exception as exc:  # fail-safe fallthrough
+            _log_sql_state_error("queries_sql_write_failed", err=repr(exc))
+    try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
     except Exception:
@@ -552,6 +567,16 @@ def log_behavior_event(event: dict) -> None:
         return
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    except Exception:
+        return
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_behavior", _map_behavior_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("behavior_sql_write_failed", err=repr(exc))
+    try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
     except Exception:
@@ -567,8 +592,19 @@ def record_brief_written(
     """Append a record of what a morning/today brief cited.
 
     Schema: {ts, brief_type, brief_path, paths_cited, citations_by_section}
-    Silent-fail on I/O error.
+    Silent-fail on I/O error. When RAG_STATE_SQL=1, route to rag_brief_written.
     """
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(
+                    conn, "rag_brief_written",
+                    _map_brief_written_row(brief_type, str(brief_path),
+                                            paths_cited, citations_by_section),
+                )
+            return
+        except Exception as exc:
+            _log_sql_state_error("brief_written_sql_write_failed", err=repr(exc))
     try:
         BRIEF_WRITTEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         rec = {
@@ -650,7 +686,17 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
 
 
 def _brief_state_record(brief_path: str, cited_path: str) -> None:
-    """Mark this (brief_path, cited_path) pair as processed."""
+    """Mark this (brief_path, cited_path) pair as processed. Upsert on pk=pair_key
+    when RAG_STATE_SQL=1; append legacy line otherwise."""
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_upsert(conn, "rag_brief_state",
+                            _map_brief_state_row(brief_path, cited_path),
+                            ("pair_key",))
+            return
+        except Exception as exc:
+            _log_sql_state_error("brief_state_sql_write_failed", err=repr(exc))
     key = f"{brief_path}\x00{cited_path}"
     try:
         BRIEF_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1781,28 +1827,37 @@ def record_feedback(
       rating holístico al cierre.
     - `session_id` / `session_rating`: metadata para scope='session'.
     """
-    try:
-        FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        event: dict = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "turn_id": turn_id,
-            "rating": 1 if rating > 0 else -1,
-            "q": q,
-            "paths": list(paths or []),
-            "scope": scope,
-        }
-        if reason:
-            event["reason"] = reason.strip()[:200]
-        if corrective_path:
-            event["corrective_path"] = corrective_path
-        if session_id:
-            event["session_id"] = session_id
-        if session_rating is not None:
-            event["session_rating"] = int(session_rating)
-        with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    event: dict = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "turn_id": turn_id,
+        "rating": 1 if rating > 0 else -1,
+        "q": q,
+        "paths": list(paths or []),
+        "scope": scope,
+    }
+    if reason:
+        event["reason"] = reason.strip()[:200]
+    if corrective_path:
+        event["corrective_path"] = corrective_path
+    if session_id:
+        event["session_id"] = session_id
+    if session_rating is not None:
+        event["session_rating"] = int(session_rating)
+    _wrote_sql = False
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_feedback", _map_feedback_row(event))
+            _wrote_sql = True
+        except Exception as exc:
+            _log_sql_state_error("feedback_sql_write_failed", err=repr(exc))
+    if not _wrote_sql:
+        try:
+            FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
     # Cache invalidation — next load rebuilds from jsonl. Best-effort delete.
     try:
         if FEEDBACK_GOLDEN_PATH.is_file():
@@ -2532,6 +2587,361 @@ def _sql_max_ts(conn, table: str) -> str | None:
     """
     row = conn.execute(f"SELECT MAX(ts) FROM {table}").fetchone()
     return row[0] if row and row[0] is not None else None
+
+
+# ── SQL state store (T3: writer swap) ────────────────────────────────────────
+# Short-lived connection helper used by the flag-gated writer path. We do NOT
+# reuse the sqlite-vec singleton because (a) many writers run off-thread (log
+# queue, samplers, watchdogs) and serialising them through one handle would
+# need a lock; (b) SQLite WAL mode serialises writers anyway at the file
+# level, so N short-lived connections each doing a one-row INSERT is cheap;
+# (c) we avoid re-loading the sqlite-vec extension for telemetry writes that
+# never touch vec_*/meta_* tables. Each connection runs `_ensure_telemetry_
+# tables` (idempotent) so a process that hits the writer path before the
+# singleton was warmed still gets a valid schema.
+
+_SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+
+
+def _log_sql_state_error(event_type: str, **fields) -> None:
+    """Append an error record to sql_state_errors.jsonl. Never raises.
+
+    Separate file (not queries.jsonl / LOG_PATH) so a SQL-state bug doesn't
+    pollute analytics. Consumed only during the 7-day cutover observation
+    window; T10 removes both this sink and the fallback path.
+    """
+    try:
+        _SQL_STATE_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"),
+               "event": event_type, **fields}
+        with _SQL_STATE_ERROR_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _ragvec_state_conn():
+    """Open a short-lived sqlite3 connection to ragvec.db with WAL + busy
+    timeout, ensure telemetry tables exist, yield the conn, then close.
+
+    Intentionally does NOT load the sqlite-vec extension — telemetry writes
+    only touch rag_*/system_memory_metrics tables. Keeps the writer path
+    independent of the vec singleton and safe to call from any thread.
+    """
+    import sqlite3 as _sqlite3
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    conn = _sqlite3.connect(str(DB_PATH / "ragvec.db"),
+                            isolation_level=None, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_version ("
+            " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
+        )
+        _ensure_telemetry_tables(conn)
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Row mappers ──────────────────────────────────────────────────────────────
+# One mapper per writer. Each takes the live payload dict and returns a dict
+# whose keys match the target table's columns. Unknown fields go to
+# `extra_json` / `payload_json` (see T1 DDL). Mappers are deliberately thin
+# and duplicate-free from T2's migration script — T2 is a one-shot and
+# doesn't expose a reusable API.
+
+_QUERIES_COLS = ("ts", "cmd", "q", "session", "mode", "top_score", "t_retrieve",
+                 "t_gen", "answer_len", "citation_repaired", "critique_fired",
+                 "critique_changed")
+_QUERIES_JSON = (("variants", "variants_json"), ("paths", "paths_json"),
+                 ("scores", "scores_json"), ("filters", "filters_json"),
+                 ("bad_citations", "bad_citations_json"))
+
+
+def _map_queries_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in _QUERIES_COLS:
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    for src_key, dst_col in _QUERIES_JSON:
+        if src_key in ev and ev[src_key] is not None:
+            out[dst_col] = ev[src_key]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    # Coerce bool→int for SQLite-friendly ints
+    for bk in ("citation_repaired", "critique_fired", "critique_changed"):
+        if bk in out and isinstance(out[bk], bool):
+            out[bk] = int(out[bk])
+    known = set(_QUERIES_COLS) | {k for k, _ in _QUERIES_JSON}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    # q is NOT NULL — supply empty string as fallback rather than let INSERT fail
+    out.setdefault("q", "")
+    return out
+
+
+def _map_behavior_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "source", "event", "path", "query", "rank", "dwell_s"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("source", "unknown")
+    out.setdefault("event", "unknown")
+    known = {"ts", "source", "event", "path", "query", "rank", "dwell_s"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_feedback_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "turn_id", "rating", "q", "scope"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "paths" in ev and ev["paths"] is not None:
+        out["paths_json"] = ev["paths"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("rating", 0)
+    known = {"ts", "turn_id", "rating", "q", "scope", "paths"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_tune_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "samples", "seed", "n_cases", "delta",
+              "eval_hit5_singles", "eval_hit5_chains", "rolled_back"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    for src_key, dst_col in (("baseline", "baseline_json"),
+                              ("best", "best_json")):
+        if src_key in ev and ev[src_key] is not None:
+            out[dst_col] = ev[src_key]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "rolled_back" in out and isinstance(out["rolled_back"], bool):
+        out["rolled_back"] = int(out["rolled_back"])
+    known = {"ts", "cmd", "samples", "seed", "n_cases", "delta",
+             "eval_hit5_singles", "eval_hit5_chains", "rolled_back",
+             "baseline", "best"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_contradiction_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "subject_path", "helper_raw", "skipped"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "contradicts" in ev:
+        out["contradicts_json"] = ev["contradicts"] or []
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("subject_path", "")
+    return out
+
+
+def _map_ambient_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "path", "hash"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "cmd", "path", "hash"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["payload_json"] = extra
+    return out
+
+
+def _map_ambient_state_row(path: str, h: str, analyzed_at: float,
+                            payload: dict) -> dict:
+    out: dict = {"path": path, "hash": h, "analyzed_at": analyzed_at}
+    if payload:
+        out["payload_json"] = payload
+    return out
+
+
+def _map_brief_written_row(brief_type: str, brief_path: str,
+                            paths_cited: list, citations_by_section: dict) -> dict:
+    return {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "brief_type": brief_type,
+        "brief_path": brief_path,
+        "paths_cited_json": list(paths_cited or []),
+        "citations_by_section_json": citations_by_section or {},
+    }
+
+
+def _map_brief_state_row(brief_path: str, cited_path: str) -> dict:
+    """brief_state is an upsert keyed by (brief_path, cited_path). First write
+    sets first_ts = last_ts; subsequent writes to the same pair move last_ts
+    forward. The writer is called only after `_brief_state_seen` returns False
+    so in practice we never update — but the schema supports it."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    pair_key = f"{brief_path}\x00{cited_path}"
+    bt = "today" if brief_path.endswith("-evening.md") else (
+        "morning" if "/05-Reviews/" in brief_path or brief_path.startswith("05-Reviews/") else "unknown"
+    )
+    return {"pair_key": pair_key, "brief_type": bt, "kind": "cited",
+            "path": cited_path, "first_ts": ts, "last_ts": ts}
+
+
+def _map_wa_tasks_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "since", "chats", "items", "path"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "since", "chats", "items", "path"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_archive_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "min_age_days", "query_window_days", "folder",
+              "dry_run", "force", "gate", "n_candidates", "n_plan",
+              "n_applied", "n_skipped", "gated", "batch_path"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    for bk in ("dry_run", "force", "gated"):
+        if bk in out and isinstance(out[bk], bool):
+            out[bk] = int(out[bk])
+    known = {"ts", "cmd", "min_age_days", "query_window_days", "folder",
+             "dry_run", "force", "gate", "n_candidates", "n_plan",
+             "n_applied", "n_skipped", "gated", "batch_path"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_filing_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "path", "note", "folder", "confidence",
+              "upward_title", "upward_kind"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "neighbors" in ev and ev["neighbors"] is not None:
+        out["neighbors_json"] = ev["neighbors"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "cmd", "path", "note", "folder", "confidence",
+             "upward_title", "upward_kind", "neighbors"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_eval_row(entry: dict) -> dict:
+    out: dict = {"ts": entry.get("ts") or datetime.now().isoformat(timespec="seconds")}
+    sg = entry.get("singles") or {}
+    ch = entry.get("chains") or {}
+    for src_key, dst in (("hit5", "singles_hit5"), ("mrr", "singles_mrr"),
+                          ("n", "singles_n")):
+        if src_key in sg:
+            out[dst] = sg[src_key]
+    for src_key, dst in (("hit5", "chains_hit5"), ("mrr", "chains_mrr"),
+                          ("chain_success", "chains_chain_success"),
+                          ("turns", "chains_turns"), ("chains", "chains_n")):
+        if src_key in ch:
+            out[dst] = ch[src_key]
+    extra = {k: v for k, v in entry.items() if k not in {"ts", "singles", "chains"}}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_surface_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "cmd", "n_pairs", "sim_threshold", "min_hops", "top",
+              "skip_young_days", "llm", "duration_ms"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "llm" in out and isinstance(out["llm"], bool):
+        out["llm"] = int(out["llm"])
+    known = {"ts", "cmd", "n_pairs", "sim_threshold", "min_hops", "top",
+             "skip_young_days", "llm", "duration_ms"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_proactive_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "kind", "sent", "reason"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "sent" in out and isinstance(out["sent"], bool):
+        out["sent"] = int(out["sent"])
+    known = {"ts", "kind", "sent", "reason"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_cpu_row(ev: dict) -> dict:
+    out: dict = {}
+    for k in ("ts", "total_pct", "ncores", "interval_s"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "by_category" in ev:
+        out["by_category_json"] = ev["by_category"]
+    if "top" in ev:
+        out["top_json"] = ev["top"]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    known = {"ts", "total_pct", "ncores", "interval_s", "by_category", "top"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
+
+
+def _map_memory_row(ev: dict) -> dict:
+    out: dict = {"ts": ev.get("ts") or datetime.now().isoformat(timespec="seconds")}
+    if "total_mb" in ev and ev["total_mb"] is not None:
+        out["total_mb"] = ev["total_mb"]
+    if "by_category" in ev:
+        out["by_category_json"] = ev["by_category"]
+    if "top" in ev:
+        out["top_json"] = ev["top"]
+    if "vm" in ev:
+        out["vm_json"] = ev["vm"]
+    known = {"ts", "total_mb", "by_category", "top", "vm"}
+    extra = {k: v for k, v in ev.items() if k not in known}
+    if extra:
+        out["extra_json"] = extra
+    return out
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -6261,10 +6671,26 @@ def _surface_generate_reason(pair: dict) -> str:
 
 def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
     """Append-only log: una línea `surface_run` + N líneas `surface_pair`.
-    Mismo timestamp en todas para poder agrupar la corrida al leer."""
+    Mismo timestamp en todas para poder agrupar la corrida al leer. When
+    RAG_STATE_SQL=1, each row is an INSERT into rag_surface_log."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(
+                    conn, "rag_surface_log",
+                    _map_surface_row({"ts": ts, "cmd": "surface_run", **summary}),
+                )
+                for p in pairs:
+                    _sql_append_event(
+                        conn, "rag_surface_log",
+                        _map_surface_row({"ts": ts, "cmd": "surface_pair", **p}),
+                    )
+            return
+        except Exception as exc:
+            _log_sql_state_error("surface_sql_write_failed", err=repr(exc))
     try:
         SURFACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().isoformat(timespec="seconds")
         with SURFACE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(
                 {"ts": ts, "cmd": "surface_run", **summary},
@@ -6612,14 +7038,21 @@ def build_filing_proposal(
 def _filing_log_proposal(proposal: dict, decision: str | None = None) -> None:
     """Append-only log. Una línea por propuesta. `decision` es opcional —
     fase 1 no lo setea (dry-run), fase 2 lo setea con accept/reject/edit/skip
-    para alimentar el ranker.
+    para alimentar el ranker. When RAG_STATE_SQL=1, route to rag_filing_log.
     """
+    ts = datetime.now().isoformat(timespec="seconds")
+    event = {"ts": ts, "cmd": "filing_proposal", **proposal}
+    if decision is not None:
+        event["decision"] = decision
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_filing_log", _map_filing_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("filing_sql_write_failed", err=repr(exc))
     try:
         FILING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().isoformat(timespec="seconds")
-        event = {"ts": ts, "cmd": "filing_proposal", **proposal}
-        if decision is not None:
-            event["decision"] = decision
         with FILING_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
@@ -8550,16 +8983,24 @@ def _log_contradictions(
         }
         for c in (contrad or [])
     ]
+    event = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "cmd": "contradict_index",
+        "subject_path": subject_path,
+        "contradicts": entries,
+        "helper_raw": helper_raw,
+        "skipped": skipped,
+    }
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_contradictions",
+                                   _map_contradiction_row(event))
+            return
+        except Exception as exc:
+            _log_sql_state_error("contradictions_sql_write_failed", err=repr(exc))
     try:
         CONTRADICTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        event = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "cmd": "contradict_index",
-            "subject_path": subject_path,
-            "contradicts": entries,
-            "helper_raw": helper_raw,
-            "skipped": skipped,
-        }
         with CONTRADICTION_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
@@ -8716,11 +9157,19 @@ def _proactive_save_state(state: dict) -> None:
 
 
 def _proactive_log(event: dict) -> None:
+    full = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_proactive_log",
+                                   _map_proactive_row(full))
+            return
+        except Exception as exc:
+            _log_sql_state_error("proactive_sql_write_failed", err=repr(exc))
     try:
         PROACTIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with PROACTIVE_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
-                                **event}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(full, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -9079,11 +9528,22 @@ def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
 
 
 def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
+    analyzed_at = time.time()
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_upsert(conn, "rag_ambient_state",
+                            _map_ambient_state_row(doc_id_prefix, h,
+                                                    analyzed_at, payload),
+                            ("path",))
+            return
+        except Exception as exc:
+            _log_sql_state_error("ambient_state_sql_write_failed", err=repr(exc))
     try:
         AMBIENT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         rec = {
             "path": doc_id_prefix, "hash": h,
-            "analyzed_at": time.time(), **payload,
+            "analyzed_at": analyzed_at, **payload,
         }
         with AMBIENT_STATE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -9092,9 +9552,16 @@ def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
 
 
 def _ambient_log_event(event: dict) -> None:
+    e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_ambient", _map_ambient_row(e))
+            return
+        except Exception as exc:
+            _log_sql_state_error("ambient_sql_write_failed", err=repr(exc))
     try:
         AMBIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with AMBIENT_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     except Exception:
@@ -11660,21 +12127,32 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
 
     # Trend log — one line per `rag eval` run. Silent-fail so an unwritable
     # data dir never breaks the CLI. `/api/home._fetch_eval_trend` tails the
-    # last N entries to surface drift against the CLAUDE.md baseline.
+    # last N entries to surface drift against the CLAUDE.md baseline. When
+    # RAG_STATE_SQL=1, route to rag_eval_runs via _sql_append_event.
     if singles_snap or chains_snap:
-        try:
-            EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            entry = {"ts": datetime.now().isoformat(timespec="seconds")}
-            if singles_snap:
-                entry["singles"] = singles_snap
-            if chains_snap:
-                entry["chains"] = chains_snap
-            if latency_snap:
-                entry["latency"] = latency_snap
-            with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        entry = {"ts": datetime.now().isoformat(timespec="seconds")}
+        if singles_snap:
+            entry["singles"] = singles_snap
+        if chains_snap:
+            entry["chains"] = chains_snap
+        if latency_snap:
+            entry["latency"] = latency_snap
+        _wrote_eval_sql = False
+        if RAG_STATE_SQL:
+            try:
+                with _ragvec_state_conn() as conn:
+                    _sql_append_event(conn, "rag_eval_runs",
+                                       _map_eval_row(entry))
+                _wrote_eval_sql = True
+            except Exception as exc:
+                _log_sql_state_error("eval_sql_write_failed", err=repr(exc))
+        if not _wrote_eval_sql:
+            try:
+                EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     if gate_failed:
         raise SystemExit(1)
@@ -11908,9 +12386,16 @@ def _coordinate_refine(
 
 
 def _log_tune_event(event: dict) -> None:
+    ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_tune", _map_tune_row(ev))
+            return
+        except Exception as exc:
+            _log_sql_state_error("tune_sql_write_failed", err=repr(exc))
     try:
         TUNE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with TUNE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
     except Exception:
@@ -19095,18 +19580,29 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
     _wa_tasks_save_state(state)
 
     # Append to log for analytics / debugging.
-    try:
-        WA_TASKS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with WA_TASKS_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": now.isoformat(timespec="seconds"),
-                "since": since.isoformat(timespec="seconds"),
-                "chats": len(by_chat),
-                "items": n_new,
-                "path": str(note_path.relative_to(VAULT_PATH)),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    _wa_log_event = {
+        "ts": now.isoformat(timespec="seconds"),
+        "since": since.isoformat(timespec="seconds"),
+        "chats": len(by_chat),
+        "items": n_new,
+        "path": str(note_path.relative_to(VAULT_PATH)),
+    }
+    _wrote_wa_sql = False
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_wa_tasks",
+                                   _map_wa_tasks_row(_wa_log_event))
+            _wrote_wa_sql = True
+        except Exception as exc:
+            _log_sql_state_error("wa_tasks_sql_write_failed", err=repr(exc))
+    if not _wrote_wa_sql:
+        try:
+            WA_TASKS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with WA_TASKS_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(_wa_log_event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     rel = note_path.relative_to(VAULT_PATH)
     verb = "creado" if created else "actualizado"
@@ -19543,9 +20039,17 @@ def _append_archive_batch(batch_path: Path, entry: dict) -> None:
 
 
 def _log_archive_event(event: dict) -> None:
+    e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
+    if RAG_STATE_SQL:
+        try:
+            with _ragvec_state_conn() as conn:
+                _sql_append_event(conn, "rag_archive_log",
+                                   _map_archive_row(e))
+            return
+        except Exception as exc:
+            _log_sql_state_error("archive_sql_write_failed", err=repr(exc))
     try:
         ARCHIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
         with ARCHIVE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     except Exception:

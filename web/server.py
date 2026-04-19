@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -36,6 +36,7 @@ from rag import (  # noqa: E402
     CONTRADICTION_LOG_PATH,
     EVAL_LOG_PATH,
     LOG_PATH,
+    _LOG_QUEUE,
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
@@ -87,6 +88,8 @@ from rag import (  # noqa: E402
     save_session,
     session_history,
 )
+
+from web.conversation_writer import write_turn, TurnData  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -2423,6 +2426,46 @@ def pendientes_api(days: int = 14) -> dict:
     }
 
 
+def _persist_conversation_turn(
+    vault_root: Path,
+    session_id: str,
+    question: str,
+    answer: str,
+    metas: list[dict],
+    scores: list[float],
+    confidence: float,
+) -> None:
+    try:
+        turn = TurnData(
+            question=question,
+            answer=answer,
+            sources=[
+                {"file": m.get("file", ""), "score": float(s)}
+                for m, s in zip(metas, scores)
+            ],
+            confidence=float(confidence),
+            timestamp=datetime.now(timezone.utc),
+        )
+        path = write_turn(vault_root, session_id, turn)
+        _LOG_QUEUE.put((
+            LOG_PATH,
+            json.dumps({
+                "kind": "conversation_turn_written",
+                "session_id": session_id,
+                "path": str(path.relative_to(vault_root)),
+            }) + "\n",
+        ))
+    except Exception as exc:
+        _LOG_QUEUE.put((
+            LOG_PATH,
+            json.dumps({
+                "kind": "conversation_turn_error",
+                "session_id": session_id,
+                "error": repr(exc),
+            }) + "\n",
+        ))
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest) -> StreamingResponse:
     question = req.question.strip()
@@ -2812,6 +2855,21 @@ def chat(req: ChatRequest) -> StreamingResponse:
             "ttft_ms": _t_ttft_ms,
             "llm_ms": _t_llm_decode_ms,
         })
+
+        threading.Thread(
+            target=_persist_conversation_turn,
+            args=(
+                VAULT_PATH,
+                sess["id"],
+                req.question,
+                full,
+                result["metas"],
+                result["scores"],
+                result["confidence"],
+            ),
+            daemon=True,
+            name=f"conv-writer-{turn_id[:8]}",
+        ).start()
 
         # Cache store — sólo queries sin history (no follow-ups) y con
         # respuesta no-vacía. Keya con el vault_chunks count computado en el

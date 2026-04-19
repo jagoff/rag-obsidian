@@ -3088,15 +3088,18 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
 
-            # Gate the LLM tool-deciding loop. When the pre-router matched
-            # tools, keep the loop so the LLM can chain more. When it matched
-            # nothing, the loop is pure overhead: an extra non-streaming
-            # prefill (~10s on 9k-char ctx) that usually returns tool_calls=[].
-            # Skip it unless RAG_WEB_TOOL_LLM_DECIDE=1 opts back in.
+            # Gate the LLM tool-deciding loop. Empirically the LLM rarely
+            # picks tools beyond what the pre-router already fired (REGLA 1
+            # pinning + pre-router-injected data satisfies the query), and
+            # the tool-deciding call is a non-streaming cold-prefill
+            # (~10-30s on 9k-char ctx) that burns latency for near-zero
+            # benefit. Skip it by default — go straight to final streaming.
+            # Opt back in with RAG_WEB_TOOL_LLM_DECIDE=1 for queries where
+            # chaining multiple tools based on first-round results matters.
             _llm_tool_decide = os.environ.get(
                 "RAG_WEB_TOOL_LLM_DECIDE", ""
             ).strip() not in ("", "0", "false", "no")
-            _skip_llm_tool_round = (not _forced_tools) and (not _llm_tool_decide)
+            _skip_llm_tool_round = not _llm_tool_decide
 
             for _round_idx in range(_TOOL_ROUND_CAP):
                 if _skip_llm_tool_round:

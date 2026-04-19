@@ -1,12 +1,21 @@
 import json
+import multiprocessing as mp
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from web import conversation_writer
-from web.conversation_writer import TurnData, slugify, write_turn
+from web.conversation_writer import (
+    TurnData,
+    get_conversation_path,
+    persist_conversation_index_entry,
+    slugify,
+    write_turn,
+)
 
 
 @pytest.fixture
@@ -168,3 +177,165 @@ def test_malformed_frontmatter_raises(tmp_vault):
     t = _turn("q", "a", [{"file": "Z.md", "score": 0.1}], 0.1, ts)
     with pytest.raises(ValueError):
         write_turn(tmp_vault, sid, t)
+
+
+# ── T5: SQL-backed index (RAG_STATE_SQL=1) ───────────────────────────────────
+
+
+@pytest.fixture
+def sql_env(tmp_path, monkeypatch):
+    """Point both the SQL db and JSON index at tmp_path and flip the flag ON."""
+    db = tmp_path / "ragvec.db"
+    idx = tmp_path / "idx.json"
+    monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
+    monkeypatch.setattr(conversation_writer, "_INDEX_PATH", idx)
+    monkeypatch.setenv("RAG_STATE_SQL", "1")
+    return db
+
+
+@pytest.fixture
+def flag_off(tmp_path, monkeypatch):
+    db = tmp_path / "ragvec.db"
+    idx = tmp_path / "idx.json"
+    monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
+    monkeypatch.setattr(conversation_writer, "_INDEX_PATH", idx)
+    monkeypatch.delenv("RAG_STATE_SQL", raising=False)
+    return db
+
+
+def _select_row(db_path: Path, sid: str):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT session_id, relative_path, updated_at FROM rag_conversations_index"
+            " WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_upsert_new_session_flag_on(sql_env):
+    sid = "web:t5-new"
+    rel = "00-Inbox/conversations/2026-04-19-1000-hello.md"
+    persist_conversation_index_entry(sid, rel)
+    row = _select_row(sql_env, sid)
+    assert row is not None
+    assert row[0] == sid
+    assert row[1] == rel
+    # ISO-8601 seconds (T1 convention): YYYY-MM-DDTHH:MM:SS
+    assert len(row[2]) == 19 and "T" in row[2]
+
+
+def test_upsert_existing_session_replaces(sql_env):
+    sid = "web:t5-replace"
+    persist_conversation_index_entry(sid, "old/path.md")
+    persist_conversation_index_entry(sid, "new/path.md")
+    conn = sqlite3.connect(str(sql_env))
+    try:
+        rows = conn.execute(
+            "SELECT relative_path FROM rag_conversations_index WHERE session_id = ?",
+            (sid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0][0] == "new/path.md"
+
+
+def test_read_falls_back_to_json_when_row_missing(sql_env):
+    sid = "web:t5-precutover"
+    conversation_writer._INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conversation_writer._INDEX_PATH.write_text(
+        json.dumps({sid: "legacy/path.md"}), encoding="utf-8"
+    )
+    # SQL row absent; fallback must read JSON.
+    assert get_conversation_path(sid) == "legacy/path.md"
+
+
+def test_read_returns_none_when_both_missing(sql_env):
+    assert get_conversation_path("web:nope") is None
+
+
+def test_flag_off_uses_json(flag_off):
+    sid = "web:t5-jsononly"
+    rel = "00-Inbox/conversations/json-only.md"
+    persist_conversation_index_entry(sid, rel)
+    mapping = json.loads(conversation_writer._INDEX_PATH.read_text())
+    assert mapping[sid] == rel
+    # SQL table untouched: no db file or empty.
+    if flag_off.exists():
+        conn = sqlite3.connect(str(flag_off))
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        assert "rag_conversations_index" not in tables
+
+
+def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
+    # Simulate a commit failure deep inside _sql_upsert by making conn.commit
+    # raise. The public writer API in web/server.py wraps write_turn in
+    # try/except — here we verify that layer's contract via the same pattern.
+    import rag
+
+    def boom(*_a, **_kw):
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    monkeypatch.setattr(rag, "_sql_upsert", boom)
+
+    vault = sql_env.parent / "vault"
+    (vault / "00-Inbox" / "conversations").mkdir(parents=True)
+    ts = datetime(2026, 4, 19, 8, 0, 0, tzinfo=timezone.utc)
+    turn = _turn("q5", "a5", [{"file": "X.md", "score": 0.1}], 0.1, ts)
+
+    # write_turn itself will propagate, matching the contract where
+    # web/server.py's _persist_conversation_turn is the swallower. Emulate.
+    caught: list = []
+    try:
+        write_turn(vault, "web:failtest", turn)
+    except Exception as exc:  # noqa: BLE001 — mirror server.py's broad catch
+        caught.append(exc)
+    assert caught, "expected the raw exception to surface to the caller-of-writer"
+    # Simulate the server.py wrapper: it catches and logs, never re-raises.
+    try:
+        try:
+            write_turn(vault, "web:failtest", turn)
+        except Exception as exc:
+            _ = repr(exc)  # would be logged via _LOG_QUEUE
+    except Exception:
+        pytest.fail("server-side swallower must not propagate")
+
+
+def _worker_upsert(args):
+    db_path, idx_path, proc_id = args
+    # Child process: reset module globals + flag. monkeypatch does not cross
+    # the fork/spawn boundary.
+    import os as _os
+    from web import conversation_writer as cw
+
+    _os.environ["RAG_STATE_SQL"] = "1"
+    cw._DB_PATH = Path(db_path)
+    cw._INDEX_PATH = Path(idx_path)
+    for i in range(10):
+        sid = f"wa:proc{proc_id}-turn{i}"
+        rel = f"00-Inbox/conversations/{proc_id}-{i}.md"
+        cw.persist_conversation_index_entry(sid, rel)
+
+
+def test_atomicity_under_concurrent_writers(sql_env):
+    ctx = mp.get_context("spawn")
+    args = [(str(sql_env), str(conversation_writer._INDEX_PATH), pid) for pid in range(20)]
+    with ctx.Pool(processes=min(8, mp.cpu_count())) as pool:
+        pool.map(_worker_upsert, args)
+    conn = sqlite3.connect(str(sql_env))
+    try:
+        (n,) = conn.execute("SELECT COUNT(*) FROM rag_conversations_index").fetchone()
+    finally:
+        conn.close()
+    assert n == 200

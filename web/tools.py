@@ -33,8 +33,19 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 7 tools: search_vault, read_note, reminders_due, gmail_recent, finance_summary, calendar_ahead, weather. Usalas SOLO si la pregunta las necesita; si el CONTEXTO ya alcanza, respondé sin tools.
+_WEB_TOOL_ADDENDUM: str = """Tenés 7 tools para traer datos frescos. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+
+Routing por palabra clave (si aparece → llamá la tool):
+- gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
+- pendiente/tarea/recordatorio/to-do/checklist → reminders_due
+- mail/correo/email/gmail/inbox → gmail_recent
+- evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
+- clima/tiempo/lluvia/temperatura/pronóstico → weather
+- para profundizar en una nota específica → read_note(path)
+- si ninguna aplica y necesitás más contexto del vault → search_vault
+
 Regla de citas: cita SOLO paths del vault devueltos por search_vault/read_note. NUNCA cites thread_id, event_id, category, ni ningún identificador de tools externos (gmail/finance/calendar/reminders/weather) — esos datos van en prosa, sin `[...](...)`.
+
 Paralelismo: podés llamar varias tools en el mismo turno si son independientes. Máximo 3 rondas.
 """
 

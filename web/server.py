@@ -112,11 +112,23 @@ from web.tools import (  # noqa: E402
 #
 # Matches are independent — "gastos de este mes en agenda" fires both
 # finance_summary and calendar_ahead.
+# Patterns covering "planning" queries — "cómo viene mi semana", "qué
+# tengo hoy", "qué hay mañana". These are ambiguous enough that we fire
+# BOTH reminders_due AND calendar_ahead (via the shared pattern below)
+# so the LLM has tasks + events to build a picture of the timeframe.
+_PLANNING_PAT = (
+    r"\bsemana\b|\bhoy\b|\bma[ñn]ana\b|pasado\s+ma[ñn]ana|\bd[ií]a\b|c[oó]mo\s+viene"
+    # "qué tengo / hay / tenés" only counts as planning when followed by a
+    # temporal token (hoy, mañana, semana, día, agenda, pendiente) so that
+    # "qué tengo sobre coaching" doesn't fire calendar + reminders.
+    r"|qu[eé]\s+(tengo|hay|ten[eé]s)\b(?=.{0,40}\b(hoy|ma[ñn]ana|semana|d[ií]a|agenda|pendient|tarea|recordator)\b)"
+)
+
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
-    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|record[aá]me|agend[aá]me"),
+    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|record[aá]me|agend[aá]me|" + _PLANNING_PAT),
     ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail|inbox|bandeja)\b"),
-    ("calendar_ahead",  {}, r"calendari|\bevento\b|\bcita\b|reuni[oó]n|\bagenda\b|pr[oó]xim[ao]s?\s+d[ií]as"),
+    ("calendar_ahead",  {}, r"calendari|\bevento\b|\bcita\b|reuni[oó]n|\bagenda\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
     ("weather",         {}, r"\bclima\b|\btiempo\b|llov|lluvia|temperatur|pron[oó]stico"),
 )
 _TOOL_INTENT_COMPILED = tuple(
@@ -3055,16 +3067,44 @@ def chat(req: ChatRequest) -> StreamingResponse:
                             _forced_results.append((_n, _res, _ms))
                             yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
                             tool_names_called.append(_n)
-                # Inject as system message — authoritative over the vault
-                # CONTEXTO. Citations rule from addendum still applies.
-                _datos_block = "DATOS FRESCOS (pre-cargados por pre-router, usar como fuente autoritativa sobre el CONTEXTO del vault si hay conflicto):\n"
+                # Replace CONTEXTO entirely with tool output. Prior attempts
+                # (append as system msg / prepend to user) failed: REGLA 1
+                # in _WEB_SYSTEM_PROMPT ("engancháte SIEMPRE con el
+                # CONTEXTO") pinned the LLM on vault retrieval. When the
+                # pre-router fires we have fresh authoritative data — the
+                # vault context is noise. Replacing the CONTEXTO block (the
+                # canonical anchor for REGLA 1) makes the LLM use the tool
+                # output as its sole evidence.
+                _datos_block = ""
                 for _n, _res, _ in _forced_results:
                     _datos_block += f"\n## {_n}\n{_res}\n"
-                tool_messages.append({"role": "system", "content": _datos_block})
+                for _msg in reversed(tool_messages):
+                    if _msg.get("role") == "user":
+                        _msg["content"] = (
+                            f"CONTEXTO (datos en vivo, no del vault):\n{_datos_block}\n\n"
+                            f"PREGUNTA: {question}\n\nRESPUESTA:"
+                        )
+                        break
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
 
+            # Gate the LLM tool-deciding loop. When the pre-router matched
+            # tools, keep the loop so the LLM can chain more. When it matched
+            # nothing, the loop is pure overhead: an extra non-streaming
+            # prefill (~10s on 9k-char ctx) that usually returns tool_calls=[].
+            # Skip it unless RAG_WEB_TOOL_LLM_DECIDE=1 opts back in.
+            _llm_tool_decide = os.environ.get(
+                "RAG_WEB_TOOL_LLM_DECIDE", ""
+            ).strip() not in ("", "0", "false", "no")
+            _skip_llm_tool_round = (not _forced_tools) and (not _llm_tool_decide)
+
             for _round_idx in range(_TOOL_ROUND_CAP):
+                if _skip_llm_tool_round:
+                    # Pre-router matched nothing and opt-in not set → skip
+                    # the LLM decide round entirely. `break` avoids the
+                    # `else:` clause firing (which would nudge the model
+                    # with a "cap reached" system message).
+                    break
                 _tr = ollama.chat(
                     model=_web_model,
                     messages=tool_messages,

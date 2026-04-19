@@ -2015,6 +2015,525 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
     return boost, penalty
 
 
+# ── SQL state store (T1: foundation) ──────────────────────────────────────────
+# Feature-flagged migration of JSONL telemetry files into ragvec.db under the
+# `rag_*` table namespace (disjoint from sqlite-vec's `vec_*` / `meta_*`). When
+# RAG_STATE_SQL=1, SqliteVecClient.__init__ calls _ensure_telemetry_tables() to
+# create schemas + register rows in rag_schema_version. Writers/readers are
+# swapped in later tasks (T3/T4) — this task is pure additive scaffolding.
+#
+# Durability: telemetry writes set `PRAGMA synchronous=NORMAL` (WAL mode
+# already set by SqliteVecClient). Concurrent writers across processes
+# serialize via SQLite's busy_timeout; readers run in parallel (WAL).
+
+RAG_STATE_SQL = os.environ.get("RAG_STATE_SQL", "").strip() == "1"
+
+# DDL statements. All tables prefixed `rag_` to avoid collision with sqlite-vec
+# internal tables (`vec_*`, `meta_*`). `ts TEXT` stores ISO-8601 strings. Each
+# table has a corresponding row in `rag_schema_version` (registered idempotently
+# by _ensure_telemetry_tables) with version=1 so T9 rehearsal can validate
+# dev/prod schema parity without having to diff sqlite_master by hand.
+
+_TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "rag_queries",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_queries ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " q TEXT NOT NULL,"
+            " session TEXT,"
+            " mode TEXT,"
+            " top_score REAL,"
+            " t_retrieve REAL,"
+            " t_gen REAL,"
+            " answer_len INTEGER,"
+            " citation_repaired INTEGER,"
+            " critique_fired INTEGER,"
+            " critique_changed INTEGER,"
+            " variants_json TEXT,"
+            " paths_json TEXT,"
+            " scores_json TEXT,"
+            " filters_json TEXT,"
+            " bad_citations_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_ts ON rag_queries(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_session ON rag_queries(session)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_cmd_ts ON rag_queries(cmd, ts)",
+        ),
+    ),
+    (
+        "rag_behavior",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_behavior ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " source TEXT NOT NULL,"
+            " event TEXT NOT NULL,"
+            " path TEXT,"
+            " query TEXT,"
+            " rank INTEGER,"
+            " dwell_s REAL,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_ts ON rag_behavior(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path ON rag_behavior(path)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_event_ts ON rag_behavior(event, ts)",
+        ),
+    ),
+    (
+        "rag_feedback",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " turn_id TEXT,"
+            " rating INTEGER NOT NULL,"
+            " q TEXT,"
+            " scope TEXT,"
+            " paths_json TEXT,"
+            " extra_json TEXT,"
+            " UNIQUE(turn_id, rating, ts)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_feedback_ts ON rag_feedback(ts)",
+        ),
+    ),
+    (
+        "rag_feedback_golden",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback_golden ("
+            " path TEXT NOT NULL,"
+            " rating INTEGER NOT NULL,"
+            " embedding BLOB NOT NULL,"
+            " dim INTEGER NOT NULL,"
+            " built_at TEXT NOT NULL,"
+            " source_ts TEXT NOT NULL,"
+            " PRIMARY KEY(path, rating)"
+            ")",
+        ),
+    ),
+    (
+        "rag_feedback_golden_meta",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_feedback_golden_meta ("
+            " k TEXT PRIMARY KEY,"
+            " v TEXT"
+            ")",
+        ),
+    ),
+    (
+        "rag_tune",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_tune ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " samples INTEGER,"
+            " seed INTEGER,"
+            " n_cases INTEGER,"
+            " baseline_json TEXT,"
+            " best_json TEXT,"
+            " delta REAL,"
+            " eval_hit5_singles REAL,"
+            " eval_hit5_chains REAL,"
+            " rolled_back INTEGER,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_tune_ts ON rag_tune(ts)",
+        ),
+    ),
+    (
+        "rag_contradictions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_contradictions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " subject_path TEXT NOT NULL,"
+            " contradicts_json TEXT,"
+            " helper_raw TEXT,"
+            " skipped TEXT,"
+            " UNIQUE(ts, subject_path)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_contradictions_ts ON rag_contradictions(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_contradictions_subject ON rag_contradictions(subject_path)",
+        ),
+    ),
+    (
+        "rag_ambient",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ambient ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " path TEXT,"
+            " hash TEXT,"
+            " payload_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ambient_ts ON rag_ambient(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_ambient_path ON rag_ambient(path)",
+        ),
+    ),
+    (
+        "rag_ambient_state",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ambient_state ("
+            " path TEXT PRIMARY KEY,"
+            " hash TEXT,"
+            " analyzed_at REAL,"
+            " payload_json TEXT"
+            ")",
+        ),
+    ),
+    (
+        "rag_brief_written",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_written ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " brief_type TEXT NOT NULL,"
+            " brief_path TEXT,"
+            " paths_cited_json TEXT,"
+            " citations_by_section_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_brief_written_ts ON rag_brief_written(ts)",
+        ),
+    ),
+    (
+        "rag_brief_state",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_state ("
+            " pair_key TEXT PRIMARY KEY,"
+            " brief_type TEXT NOT NULL,"
+            " kind TEXT NOT NULL,"
+            " path TEXT NOT NULL,"
+            " first_ts TEXT NOT NULL,"
+            " last_ts TEXT NOT NULL"
+            ")",
+        ),
+    ),
+    (
+        "rag_conversations_index",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_conversations_index ("
+            " session_id TEXT PRIMARY KEY,"
+            " relative_path TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL"
+            ")",
+        ),
+    ),
+    # --- 9 extra tables, shape inferred from live JSONL in ~/.local/share/obsidian-rag/
+    (
+        "rag_wa_tasks",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_wa_tasks ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " since TEXT,"
+            " chats INTEGER,"
+            " items INTEGER,"
+            " path TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_wa_tasks_ts ON rag_wa_tasks(ts)",
+        ),
+    ),
+    (
+        "rag_archive_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_archive_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " min_age_days INTEGER,"
+            " query_window_days INTEGER,"
+            " folder TEXT,"
+            " dry_run INTEGER,"
+            " force INTEGER,"
+            " gate INTEGER,"
+            " n_candidates INTEGER,"
+            " n_plan INTEGER,"
+            " n_applied INTEGER,"
+            " n_skipped INTEGER,"
+            " gated INTEGER,"
+            " batch_path TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_archive_log_ts ON rag_archive_log(ts)",
+        ),
+    ),
+    (
+        "rag_filing_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_filing_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " path TEXT,"
+            " note TEXT,"
+            " folder TEXT,"
+            " confidence REAL,"
+            " upward_title TEXT,"
+            " upward_kind TEXT,"
+            " neighbors_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_filing_log_ts ON rag_filing_log(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_filing_log_path ON rag_filing_log(path)",
+        ),
+    ),
+    (
+        "rag_eval_runs",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_eval_runs ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " singles_hit5 REAL,"
+            " singles_mrr REAL,"
+            " singles_n INTEGER,"
+            " chains_hit5 REAL,"
+            " chains_mrr REAL,"
+            " chains_chain_success REAL,"
+            " chains_turns INTEGER,"
+            " chains_n INTEGER,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_eval_runs_ts ON rag_eval_runs(ts)",
+        ),
+    ),
+    (
+        "rag_surface_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_surface_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " cmd TEXT,"
+            " n_pairs INTEGER,"
+            " sim_threshold REAL,"
+            " min_hops INTEGER,"
+            " top INTEGER,"
+            " skip_young_days INTEGER,"
+            " llm INTEGER,"
+            " duration_ms REAL,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_surface_log_ts ON rag_surface_log(ts)",
+        ),
+    ),
+    (
+        "rag_proactive_log",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_proactive_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " kind TEXT,"
+            " sent INTEGER,"
+            " reason TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_proactive_log_ts ON rag_proactive_log(ts)",
+        ),
+    ),
+    (
+        "rag_cpu_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_pct REAL,"
+            " ncores INTEGER,"
+            " interval_s REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_cpu_metrics_ts ON rag_cpu_metrics(ts)",
+        ),
+    ),
+    (
+        "rag_memory_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_memory_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_mb REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " vm_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_memory_metrics_ts ON rag_memory_metrics(ts)",
+        ),
+    ),
+    (
+        "system_memory_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS system_memory_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_mb REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " vm_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_system_memory_metrics_ts ON system_memory_metrics(ts)",
+        ),
+    ),
+)
+
+
+def _ensure_telemetry_tables(conn) -> None:
+    """Create all rag_* telemetry tables + indexes + schema_version rows.
+
+    Idempotent — relies on `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`.
+    Wraps all DDL in a single transaction so a crash mid-setup doesn't leave
+    half-built schema. Also sets `synchronous=NORMAL` on this connection so
+    telemetry writes survive power loss (vec reads keep their settings).
+
+    Called from SqliteVecClient.__init__ when RAG_STATE_SQL=1, so a process
+    that hasn't opted in never pays the DDL cost.
+    """
+    import sqlite3 as _sqlite3
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # Detect whether rag_schema_version exists. Created by SqliteVecClient on
+    # its own, but this helper might run against a bare DB in tests.
+    has_schema_version = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
+    ).fetchone())
+    try:
+        conn.execute("BEGIN")
+        for _table_name, stmts in _TELEMETRY_DDL:
+            for stmt in stmts:
+                conn.execute(stmt)
+        if has_schema_version:
+            conn.executemany(
+                "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                [(name,) for name, _ in _TELEMETRY_DDL],
+            )
+        conn.execute("COMMIT")
+    except _sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
+
+
+# Columns that hold JSON payloads. Non-primitive values in a row dict are
+# auto-serialised when written through _sql_append_event / _sql_upsert.
+_JSON_COL_SUFFIX = "_json"
+
+
+def _sql_serialise_row(row: dict) -> dict:
+    """Return a shallow copy where dict/list values destined for `*_json`
+    columns become JSON strings. Primitives pass through untouched.
+
+    Writers can hand in `{"paths_json": [...]}` and we persist the list as
+    JSON text without the caller double-encoding. Scalars in JSON-named
+    columns are serialised too (a string `"[a, b]"` passed through would be
+    a bug; so json.dumps always normalises)."""
+    out: dict = {}
+    for k, v in row.items():
+        if v is None or isinstance(v, (int, float, str, bytes)):
+            out[k] = v
+            continue
+        if k.endswith(_JSON_COL_SUFFIX):
+            out[k] = json.dumps(v, ensure_ascii=False, sort_keys=True)
+        else:
+            # Non-primitive in a non-JSON column: caller bug; let sqlite3 raise
+            # InterfaceError so it surfaces loudly instead of silently stringifying.
+            out[k] = v
+    return out
+
+
+def _sql_append_event(conn, table: str, row: dict) -> int:
+    """INSERT `row` into `table`; return lastrowid.
+
+    Row keys map 1:1 to column names. Values for `*_json` columns may be
+    dict/list — they're json.dumps'd here. Single-row insert wrapped in an
+    implicit transaction (autocommit mode when isolation_level=None, else a
+    BEGIN/COMMIT cycle on an explicit transaction). The WAL file absorbs
+    the write; readers see it on next snapshot.
+    """
+    serialised = _sql_serialise_row(row)
+    cols = list(serialised.keys())
+    placeholders = ",".join("?" for _ in cols)
+    col_sql = ",".join(cols)
+    sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+    # Use `with conn` to bracket an explicit transaction when one isn't active.
+    # On isolation_level=None connections this is a no-op wrapper — the write
+    # commits immediately, which matches the append-only semantics we want.
+    cur = conn.execute(sql, [serialised[c] for c in cols])
+    conn.commit()
+    return cur.lastrowid
+
+
+def _sql_upsert(conn, table: str, row: dict, pk_cols: tuple) -> None:
+    """INSERT OR REPLACE `row` into `table`. Primary key is `pk_cols`.
+
+    For the state tables (rag_ambient_state, rag_brief_state,
+    rag_conversations_index, rag_feedback_golden, rag_feedback_golden_meta)
+    where the caller's mental model is "remember the latest view of this
+    entity" rather than "log an event".
+    """
+    serialised = _sql_serialise_row(row)
+    cols = list(serialised.keys())
+    placeholders = ",".join("?" for _ in cols)
+    col_sql = ",".join(cols)
+    sql = f"INSERT OR REPLACE INTO {table} ({col_sql}) VALUES ({placeholders})"
+    conn.execute(sql, [serialised[c] for c in cols])
+    conn.commit()
+
+
+def _sql_query_window(
+    conn,
+    table: str,
+    since_ts: str,
+    until_ts: str | None = None,
+    where: str | None = None,
+    params: tuple = (),
+) -> list:
+    """SELECT * FROM `table` WHERE ts >= since_ts [AND ts < until_ts] [AND <where>].
+
+    Returns a list of sqlite3.Row. Caller controls the window; the index on
+    `ts` keeps this fast up to ~millions of rows per table. `where` is raw
+    SQL appended with AND — only used from trusted internal call sites.
+    """
+    clauses = ["ts >= ?"]
+    args: list = [since_ts]
+    if until_ts is not None:
+        clauses.append("ts < ?")
+        args.append(until_ts)
+    if where:
+        clauses.append(f"({where})")
+        args.extend(params)
+    sql = f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} ORDER BY ts"
+    # Row factory is set per-query so callers upstream don't need to manage
+    # connection-level config. Restore to whatever was in place after.
+    prev_row_factory = conn.row_factory
+    try:
+        import sqlite3 as _sqlite3
+        conn.row_factory = _sqlite3.Row
+        return list(conn.execute(sql, args).fetchall())
+    finally:
+        conn.row_factory = prev_row_factory
+
+
+def _sql_count_since(conn, table: str, since_ts: str) -> int:
+    """Fast COUNT(*) using ix_<table>_ts."""
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE ts >= ?", (since_ts,)
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _sql_max_ts(conn, table: str) -> str | None:
+    """MAX(ts) — used by feedback_golden rebuild-on-gap detection and by
+    cutover rehearsal to confirm writes are reaching SQL.
+    """
+    row = conn.execute(f"SELECT MAX(ts) FROM {table}").fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
 # ── DB ────────────────────────────────────────────────────────────────────────
 # sqlite-vec backend. Schema per "collection" (namespaced per-vault):
 #   vec_{name}  — virtual table: rowid INTEGER PRIMARY KEY, embedding float[dim]
@@ -2512,6 +3031,11 @@ class SqliteVecClient:
         )
         self._db.commit()
         self._collections: dict[str, SqliteVecCollection] = {}
+        # Feature-flagged SQL state-store foundation (T1 of JSONL→SQLite
+        # migration). OFF by default; gated by RAG_STATE_SQL=1 env var.
+        # Hot path (vec reads/writes) is untouched when flag is off.
+        if RAG_STATE_SQL:
+            _ensure_telemetry_tables(self._db)
 
     def get_or_create_collection(self, name: str, metadata=None):
         # metadata arg ignored (was `{"hnsw:space": "cosine"}`); sqlite-vec

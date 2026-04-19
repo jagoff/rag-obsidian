@@ -3104,10 +3104,156 @@ def dashboard_api(days: int = 30) -> dict:
 
 
 def _dashboard_compute(days: int = 30) -> dict:
-    """Aggregate all JSONL logs into dashboard metrics."""
-    import statistics
-    from collections import defaultdict
+    """Aggregate telemetry into dashboard metrics.
 
+    When RAG_STATE_SQL=1: pull rows from the rag_* SQL tables. Falls back to
+    JSONL scan on any exception during the cutover observation window (T10
+    removes the fallback). Flag OFF = JSONL-only, unchanged behaviour.
+    """
+    if RAG_STATE_SQL:
+        try:
+            return _dashboard_compute_sql(days)
+        except Exception as exc:
+            _log_sql_state_error("dashboard_sql_compute_failed", err=repr(exc))
+            # Fall through to JSONL during the 7-day cutover.
+    return _dashboard_compute_jsonl(days)
+
+
+# ── Dashboard event-row helpers ─────────────────────────────────────────────
+# The SQL and JSONL readers converge on a common "event dict" shape (matches
+# the JSONL line schema) before the aggregator runs, so only the data source
+# differs. `_dashboard_aggregate()` is the single source of truth for every
+# field the dashboard JS consumes.
+
+
+def _dashboard_sql_row_to_event(row, json_cols: tuple[str, ...] = ()) -> dict:
+    """Rehydrate a sqlite3.Row into the JSONL-style event dict.
+
+    - `*_json` columns whose base name (`_json` suffix stripped) is listed in
+      `json_cols` are decoded and re-keyed to their JSONL equivalent (e.g.
+      `paths_json` → `paths`).
+    - `extra_json` is decoded and its keys merged into the top level (never
+      overwriting an explicit column).
+    - Other `*_json` columns are decoded in place if `json_cols` doesn't map
+      them — safe default so aggregate callers never see raw JSON strings.
+    """
+    ev: dict = {}
+    try:
+        keys = row.keys()
+    except Exception:
+        return ev
+    for k in keys:
+        v = row[k]
+        if v is None:
+            continue
+        if k == "extra_json":
+            try:
+                extra = json.loads(v)
+                if isinstance(extra, dict):
+                    for ek, ev_val in extra.items():
+                        ev.setdefault(ek, ev_val)
+            except Exception:
+                pass
+            continue
+        if k.endswith("_json"):
+            base = k[:-5]
+            try:
+                decoded = json.loads(v)
+            except Exception:
+                decoded = None
+            target = base if base in json_cols else k
+            if decoded is not None:
+                ev[target] = decoded
+            continue
+        ev[k] = v
+    return ev
+
+
+def _dashboard_compute_sql(days: int = 30) -> dict:
+    """SQL-path reader: fetch rag_* rows since cutoff, normalise to JSONL-shape
+    event dicts, then call the shared aggregator.
+
+    Tables read: rag_queries, rag_feedback, rag_ambient, rag_contradictions,
+    rag_filing_log, rag_tune, rag_surface_log. `all_queries` is the unwindowed
+    snapshot of rag_queries (used only for the total_queries_all_time KPI).
+    """
+    from rag import _ragvec_state_conn, _sql_query_window  # local import keeps module-load light
+    cutoff = datetime.now() - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat(timespec="seconds")
+
+    # Well-earlier floor — we still need "all time" count + full feedback for
+    # corrective-miss/neg-reason surfacing (JSONL path uses the full file).
+    ancient_iso = "0000-01-01T00:00:00"
+
+    with _ragvec_state_conn() as conn:
+        q_rows_window = _sql_query_window(conn, "rag_queries", cutoff_iso)
+        # all_queries: full history — same semantics as JSONL (unbounded scan).
+        q_rows_all = _sql_query_window(conn, "rag_queries", ancient_iso)
+        fb_rows_all = _sql_query_window(conn, "rag_feedback", ancient_iso)
+        amb_rows = _sql_query_window(conn, "rag_ambient", cutoff_iso)
+        contra_rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+        filing_rows = _sql_query_window(conn, "rag_filing_log", cutoff_iso)
+        tune_rows = _sql_query_window(conn, "rag_tune", ancient_iso)
+        surface_rows = _sql_query_window(conn, "rag_surface_log", ancient_iso)
+
+    _Q_JSON = ("variants", "paths", "scores", "filters", "bad_citations")
+    _F_JSON = ("paths",)
+    _C_JSON = ("contradicts",)
+    _FIL_JSON = ("neighbors",)
+    _T_JSON = ("baseline", "best")
+
+    all_queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_all]
+    queries = [_dashboard_sql_row_to_event(r, _Q_JSON) for r in q_rows_window]
+    fb_entries = [_dashboard_sql_row_to_event(r, _F_JSON) for r in fb_rows_all]
+    # rag_ambient stores extra fields in `payload_json`, not `extra_json`.
+    ambient_entries: list[dict] = []
+    for r in amb_rows:
+        ev = {}
+        try:
+            keys = r.keys()
+        except Exception:
+            keys = []
+        for k in keys:
+            v = r[k]
+            if v is None:
+                continue
+            if k == "payload_json":
+                try:
+                    payload = json.loads(v)
+                    if isinstance(payload, dict):
+                        for pk, pv in payload.items():
+                            ev.setdefault(pk, pv)
+                except Exception:
+                    pass
+                continue
+            ev[k] = v
+        ambient_entries.append(ev)
+    contra_entries = [_dashboard_sql_row_to_event(r, _C_JSON) for r in contra_rows]
+    # Flatten `singles`/`chains` back onto each tune entry so the JSONL aggregator
+    # sees `baseline`/`best` dicts as-is.
+    tune_entries = [_dashboard_sql_row_to_event(r, _T_JSON) for r in tune_rows]
+    # Filing rows — add an implicit `cmd` marker so the aggregator counts them
+    # as filing events (it treats every entry in filing_recent as a filing).
+    filing_recent = [_dashboard_sql_row_to_event(r, _FIL_JSON) for r in filing_rows]
+    # Surface rows — aggregator counts events by `cmd in {"surface_pair","surface_run"}`,
+    # and rag_surface_log preserves `cmd` as a column.
+    surface_entries = [_dashboard_sql_row_to_event(r) for r in surface_rows]
+
+    return _dashboard_aggregate(
+        queries=queries,
+        all_queries=all_queries,
+        fb_entries=fb_entries,
+        ambient_entries=ambient_entries,
+        contra_entries=contra_entries,
+        filing_recent=filing_recent,
+        tune_entries=tune_entries,
+        surface_entries=surface_entries,
+        days=days,
+    )
+
+
+def _dashboard_compute_jsonl(days: int = 30) -> dict:
+    """Aggregate all JSONL logs into dashboard metrics."""
     data_dir = Path.home() / ".local/share/obsidian-rag"
     cutoff = datetime.now() - timedelta(days=days)
 
@@ -3124,6 +3270,64 @@ def _dashboard_compute(days: int = 30) -> dict:
             except Exception:
                 continue
         return out
+
+    def _ts_local(e: dict) -> datetime | None:
+        raw = e.get("ts") or e.get("timestamp")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return None
+
+    all_queries = _read_jsonl(data_dir / "queries.jsonl")
+    queries = [e for e in all_queries if (t := _ts_local(e)) and t >= cutoff]
+    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
+    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
+    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
+    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
+    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
+    filing_recent = [e for e in filing_entries if (t := _ts_local(e)) and t >= cutoff]
+    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
+
+    return _dashboard_aggregate(
+        queries=queries,
+        all_queries=all_queries,
+        fb_entries=fb_entries,
+        ambient_entries=ambient_entries,
+        contra_entries=contra_entries,
+        filing_recent=filing_recent,
+        tune_entries=tune_entries,
+        surface_entries=surface_entries,
+        days=days,
+    )
+
+
+def _dashboard_aggregate(
+    *,
+    queries: list[dict],
+    all_queries: list[dict],
+    fb_entries: list[dict],
+    ambient_entries: list[dict],
+    contra_entries: list[dict],
+    filing_recent: list[dict],
+    tune_entries: list[dict],
+    surface_entries: list[dict],
+    days: int,
+) -> dict:
+    """Build the full dashboard payload from normalised event dicts.
+
+    This is the shared body both the JSONL and SQL paths call with identical
+    semantics. The dashboard JS key-contract (`queries_per_day`, `hours`,
+    `cmds`, `sources`, `score_distribution`, `hot_topics`, `chat_keywords`,
+    `feedback`, etc.) is fixed here — don't drop keys without updating
+    web/static/dashboard.js.
+    """
+    import statistics
+    from collections import defaultdict
+
+    data_dir = Path.home() / ".local/share/obsidian-rag"
+    cutoff = datetime.now() - timedelta(days=days)
 
     def _ts(e: dict) -> datetime | None:
         raw = e.get("ts") or e.get("timestamp")
@@ -3142,9 +3346,6 @@ def _dashboard_compute(days: int = 30) -> dict:
         return round(s[min(idx, len(s) - 1)], 3)
 
     # ── Queries ──────────────────────────────────────────────────────
-    all_queries = _read_jsonl(data_dir / "queries.jsonl")
-    queries = [e for e in all_queries if (t := _ts(e)) and t >= cutoff]
-
     scores = [float(e["top_score"]) for e in queries if isinstance(e.get("top_score"), (int, float))]
     t_retrieves = [float(e["t_retrieve"]) for e in queries if isinstance(e.get("t_retrieve"), (int, float))]
     t_gens = [float(e["t_gen"]) for e in queries if isinstance(e.get("t_gen"), (int, float)) and e["t_gen"] > 0]
@@ -3338,7 +3539,6 @@ def _dashboard_compute(days: int = 30) -> dict:
     }
 
     # ── Feedback ─────────────────────────────────────────────────────
-    fb_entries = _read_jsonl(data_dir / "feedback.jsonl")
     fb_pos = sum(1 for e in fb_entries if e.get("rating") == 1)
     fb_neg = sum(1 for e in fb_entries if e.get("rating") == -1)
 
@@ -3444,7 +3644,7 @@ def _dashboard_compute(days: int = 30) -> dict:
     }
 
     # ── Ambient ──────────────────────────────────────────────────────
-    ambient_entries = _read_jsonl(data_dir / "ambient.jsonl")
+    # ambient_entries is already provided by the caller; filter to window here.
     ambient_recent = [e for e in ambient_entries if (t := _ts(e)) and t >= cutoff]
     ambient_wikilinks = sum(e.get("wikilinks_applied", 0) for e in ambient_recent)
     ambient_per_day: dict[str, int] = defaultdict(int)
@@ -3454,7 +3654,6 @@ def _dashboard_compute(days: int = 30) -> dict:
             ambient_per_day[t.strftime("%Y-%m-%d")] += 1
 
     # ── Contradictions ───────────────────────────────────────────────
-    contra_entries = _read_jsonl(data_dir / "contradictions.jsonl")
     contra_recent = [e for e in contra_entries if (t := _ts(e)) and t >= cutoff]
     contra_found = [e for e in contra_recent if e.get("contradicts") and not e.get("skipped")]
     contra_per_day: dict[str, int] = defaultdict(int)
@@ -3464,16 +3663,13 @@ def _dashboard_compute(days: int = 30) -> dict:
             contra_per_day[t.strftime("%Y-%m-%d")] += 1
 
     # ── Surface ──────────────────────────────────────────────────────
-    surface_entries = _read_jsonl(data_dir / "surface.jsonl")
     surface_pairs = [e for e in surface_entries if e.get("cmd") == "surface_pair"]
     surface_runs = [e for e in surface_entries if e.get("cmd") == "surface_run"]
 
     # ── Filing ───────────────────────────────────────────────────────
-    filing_entries = _read_jsonl(data_dir / "filing.jsonl")
-    filing_recent = [e for e in filing_entries if (t := _ts(e)) and t >= cutoff]
+    # filing_recent is already windowed by the caller.
 
     # ── Tune ─────────────────────────────────────────────────────────
-    tune_entries = _read_jsonl(data_dir / "tune.jsonl")
     tune_history = []
     for e in tune_entries:
         t = _ts(e)

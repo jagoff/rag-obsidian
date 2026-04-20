@@ -30,7 +30,7 @@ import time
 import traceback
 import unicodedata
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -500,6 +500,18 @@ SILENT_ERRORS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/silent_errors.
 _LOG_QUEUE: "queue.Queue[tuple[Path, str] | None]" = queue.Queue()
 
 
+def _now_utc_iso_z() -> str:
+    """ISO-8601 UTC timestamp with trailing 'Z' (Zulu) suffix.
+
+    Replaces `datetime.utcnow().isoformat() + "Z"` which emits a
+    DeprecationWarning on Python 3.12+ (utcnow is removed in 3.13+).
+    Preserves the exact legacy format — collection_ops.log, github sync
+    cutoffs and any external tooling grepping for a trailing 'Z' keep
+    working. Timespec=seconds matches the previous default.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _log_writer_loop() -> None:
     while True:
         item = _LOG_QUEUE.get()
@@ -568,7 +580,7 @@ def _silent_log(where: str, exc: BaseException) -> None:
 def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
     """Append an audit entry to collection_ops.log for any delete_collection call."""
     entry = {
-        "ts": datetime.utcnow().isoformat() + "Z",
+        "ts": _now_utc_iso_z(),
         "pid": os.getpid(),
         "op": op,
         "collection": collection_name,
@@ -5450,7 +5462,7 @@ def _sync_gdrive_notes(vault_root: Path, hours: int = 48, max_docs: int = 4, bod
         return {"ok": False, "reason": "google_api_missing"}
     try:
         dv = build("drive", "v3", credentials=creds, cache_discovery=False)
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         mime_filter = " or ".join(
             f"mimeType = '{m}'" for m in (
                 "application/vnd.google-apps.document",
@@ -5581,7 +5593,10 @@ def _sync_github_activity(vault_root: Path, hours: int = 48) -> dict:
     except json.JSONDecodeError:
         return {"ok": False, "reason": "events_parse_failed"}
 
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    # Naive UTC via aware → strip, preserves pre-3.12 utcnow() semantics.
+    # Compared against strptime(..., "%Y-%m-%dT%H:%M:%SZ") below which is
+    # also naive, so both sides are consistent.
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
     fresh: list[dict] = []
     for ev in events:
         ts_raw = ev.get("created_at", "")
@@ -19542,6 +19557,108 @@ _RECUR_WEEKDAY_MAP = {
 }
 
 
+# Rioplatense idioms dateparser silently mangles or misses entirely.
+# Regex is applied IN ORDER — keep the more specific patterns first.
+# Each entry is (pattern, replacement) passed to `re.sub` with IGNORECASE.
+# Tested empirically against `dateparser 1.4.0` on macOS / es-AR.
+_RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
+    # "18hs" / "18 hs" / "18h" / "18:30hs" → "18:00" / "18:30"
+    # Handles bare "Xhs" by appending ":00"; leaves "X:Yhs" intact (just strips
+    # the hs suffix). Only 1-2 digit hour blocks to avoid eating IDs/dates.
+    (r"\b(\d{1,2}):(\d{2})\s*(?:hs?|h)\b\.?", r"\1:\2"),
+    (r"\b(\d{1,2})\s*(?:hs?|h)\b\.?", r"\1:00"),
+    # "X que viene" / "X que vienen" → bare English weekday / "next week"
+    # / "next month" / "next year". Weekdays keep bare form (no "next ")
+    # because dateparser 1.4 silently rejects "next <weekday>"; with
+    # PREFER_DATES_FROM=future bare weekday rolls forward deterministic.
+    (r"\bla\s+semana\s+que\s+vienen?\b", "next week"),
+    (r"\bel\s+lunes\s+que\s+vienen?\b", "monday"),
+    (r"\bel\s+martes\s+que\s+vienen?\b", "tuesday"),
+    (r"\bel\s+mi[eé]rcoles\s+que\s+vienen?\b", "wednesday"),
+    (r"\bel\s+jueves\s+que\s+vienen?\b", "thursday"),
+    (r"\bel\s+viernes\s+que\s+vienen?\b", "friday"),
+    (r"\bel\s+s[aá]bado\s+que\s+vienen?\b", "saturday"),
+    (r"\bel\s+domingo\s+que\s+vienen?\b", "sunday"),
+    (r"\bel\s+mes\s+que\s+vienen?\b", "next month"),
+    (r"\bel\s+a[ñn]o\s+que\s+vienen?\b", "next year"),
+    # "a las N de la mañana/tarde/noche" — dateparser can't pattern-match
+    # Spanish "de la X" time-of-day qualifiers. Rewrite to am/pm.
+    (r"\ba\s+las\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+ma[ñn]ana\b",
+     lambda m: f"{m.group(1)}:{m.group(2) or '00'} am"),
+    (r"\ba\s+las\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+tarde\b",
+     lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
+    (r"\ba\s+las\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+noche\b",
+     lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
+    # Bare "a las N" / "a las N:MM" → explicit HH:MM. dateparser interprets
+    # bare "a las 10" as "day 10" — this coerces it to a time.
+    (r"\ba\s+las\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),
+    (r"\ba\s+las\s+(\d{1,2})\b(?!\s*:)", r"\1:00"),
+    # "al mediodía" / "al medio día" → 12:00 literal.
+    (r"\bal\s+medio\s*d[ií]a\b", "12:00"),
+    (r"\ba\s+la\s+medianoche\b", "00:00"),
+    # Diminutives are noise for dateparser.
+    (r"\bhoritas?\b", "horas"),
+    (r"\bminutit[oa]s?\b", "minutos"),
+    # "pasado mañana" — dateparser 1.4 falla silenciosamente en es;
+    # el inglés "day after tomorrow" lo resuelve perfectamente.
+    (r"\bpasado\s+ma[ñn]ana\b", "day after tomorrow"),
+    # "el finde" — ambiguous between sábado/domingo; bias toward sábado.
+    # Con PREFER_DATES_FROM=future dateparser resuelve el próximo.
+    (r"\bel\s+finde\b", "saturday"),
+    # Bare "el <weekday>" / "este <weekday>" / "próximo <weekday>" →
+    # English weekday name solo. Con PREFER_DATES_FROM=future dateparser
+    # lo interpreta como próximo <weekday> determinista. "next <weekday>"
+    # NO funciona (dateparser 1.4 lo rechaza silenciosamente).
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+lunes\b(?!\s+que)", "monday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+martes\b(?!\s+que)", "tuesday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+mi[eé]rcoles\b(?!\s+que)", "wednesday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+jueves\b(?!\s+que)", "thursday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+viernes\b(?!\s+que)", "friday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+s[aá]bado\b(?!\s+que)", "saturday"),
+    (r"\b(?:el|este|pr[oó]xim[oa])\s+domingo\b(?!\s+que)", "sunday"),
+    # "a la mañana" / "a la tarde" / "a la noche" — dateparser no lo parsea;
+    # mapeamos a horas defaults razonables.
+    (r"\ba\s+la\s+ma[ñn]ana(?:\s+temprano)?\b", "09:00"),
+    (r"\ba\s+la\s+tarde\b", "16:00"),
+    (r"\ba\s+la\s+noche\b", "20:00"),
+    (r"\ba\s+la\s+tardecita\b", "17:00"),
+    (r"\ba\s+la\s+nochecita\b", "20:00"),
+)
+
+_RIOPLATENSE_COMPILED = tuple(
+    (re.compile(pat, re.IGNORECASE), rep) for pat, rep in _RIOPLATENSE_REWRITES
+)
+
+
+def _preprocess_rioplatense_datetime(text: str) -> str:
+    """Normalise common rioplatense idioms so dateparser can resolve them.
+
+    Surface-level substitutions only — time-of-day aliases (`18hs`,
+    `al mediodía`), "X que viene" constructions, diminutives, `el finde`.
+    Semantic interpretation (e.g. "a la tardecita" → 17:00) is left to
+    the LLM fallback; hard-coding those would need per-user calibration.
+    """
+    if not text:
+        return text
+    s = text
+    for pat, rep in _RIOPLATENSE_COMPILED:
+        s = pat.sub(rep, s)
+    return s
+
+
+# Tokens that indicate the input carries a time-of-day reference. Used to
+# detect the dateparser "anchor echo" failure mode — when it silently
+# returns the anchor datetime's time because it couldn't parse the time
+# portion of a rioplatense-flavoured input ("a las 10 de la mañana"
+# → anchor time instead of 10:00).
+_TIME_MARKER_RE = re.compile(
+    r"\b(las|hora|minuto|medio.?d[ií]a|medianoche|ma[ñn]ana|tarde|noche|"
+    r"tardecita|nochecita|tempran)\b"
+    r"|\d{1,2}\s*(?:hs?|h|am|pm|:)",
+    re.IGNORECASE,
+)
+
+
 def _parse_natural_datetime(
     text: str,
     now: datetime | None = None,
@@ -19551,22 +19668,27 @@ def _parse_natural_datetime(
 ) -> datetime | None:
     """Parse a natural-language date/time string to a concrete `datetime`.
 
-    Tries `dateparser` first (covers the 80% — "mañana a las 10", "el jueves
-    4pm", ISO strings, relative "en 2 horas", english "next monday 3pm").
-    Falls back to a qwen2.5:3b helper JSON call only if dateparser yields
-    nothing AND the input looks like it might contain a date reference
-    (non-empty, ≥3 chars).
+    Pipeline:
+      1. `_preprocess_rioplatense_datetime` rewrites common AR idioms
+         (`18hs` → `18:00`, `al mediodía` → `12:00`, `el X que viene` →
+         `próximo X`, diminutives, `el finde`).
+      2. `dateparser` (es + en, `PREFER_DATES_FROM=future`) tries to parse.
+      3. Anchor-echo guard: if the input carries a time marker but
+         dateparser returned a datetime whose time equals the anchor's
+         (a known dateparser failure mode on partial time parses), we
+         discard it and fall through.
+      4. LLM fallback: qwen2.5:3b helper with a rioplatense-aware prompt
+         returns `{iso: …}` or `{iso: null}`.
 
-    `now` anchors relative resolution (tests pass it in for determinism).
-    `prefer_future=True` means bare weekdays / "jueves 4pm" → upcoming, not
-    past. Returns `None` if both paths fail — caller decides whether to
-    treat as error or prompt the user for clarification.
+    Returns `None` if all three fail. Callers decide whether to treat as
+    error or prompt the user for clarification.
     """
     s = (text or "").strip()
     if len(s) < 3:
         return None
 
     anchor = now or datetime.now()
+    s_norm = _preprocess_rioplatense_datetime(s)
     settings = {
         "RELATIVE_BASE": anchor,
         "PREFER_DATES_FROM": "future" if prefer_future else "current_period",
@@ -19574,22 +19696,51 @@ def _parse_natural_datetime(
     }
     try:
         import dateparser  # noqa: PLC0415
-        dt = dateparser.parse(s, languages=list(lang), settings=settings)
+        dt = dateparser.parse(s_norm, languages=list(lang), settings=settings)
     except Exception:
         dt = None
 
     if isinstance(dt, datetime):
-        # Strip tzinfo for consistency with the rest of the codebase
-        # (naive local datetimes everywhere in Apple helpers).
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
-        return dt
+        # Anchor-echo sanity: dateparser sometimes returns the anchor time
+        # back when it only matched the date portion of the input (e.g.
+        # "a las 10 de la mañana" with anchor=15:00 → returns 15:00, not
+        # 10:00). If the input looks time-bearing but the result exactly
+        # matches the anchor's time (down to the minute), distrust and
+        # fall through to LLM.
+        _has_time_marker = bool(_TIME_MARKER_RE.search(s_norm))
+        if _has_time_marker and (
+            dt.hour == anchor.hour and dt.minute == anchor.minute
+        ):
+            dt = None
+        else:
+            return dt
 
-    # LLM fallback. Prompt the helper model for a strict JSON shape.
+    # LLM fallback. Prompt explicitly flags rioplatense so the helper
+    # model doesn't regress on idioms like "la semana que viene" or
+    # "a la tardecita". Anchor is given both in ISO and a Spanish weekday
+    # label to help the model anchor relative references correctly —
+    # qwen2.5:3b otherwise mixes up "el jueves" (should roll forward) with
+    # the current day on deterministic seed. We pass the pre-processed
+    # form as a hint alongside the original so the model sees e.g.
+    # "el jueves 16:00" when the user wrote "el jueves a las 4 de la tarde"
+    # — makes am/pm interpretation unambiguous.
+    _es_weekdays = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    _es_anchor_day = _es_weekdays[anchor.weekday()]
+    _hint_line = f' Hint: "{s_norm}"' if s_norm != s else ""
     prompt = (
         "Parseá esta fecha/hora en lenguaje natural. "
-        f"Ahora es {anchor.isoformat(timespec='minutes')}. "
-        f'Texto: "{s}"\n\n'
+        "El usuario habla español argentino (rioplatense) — idioms como "
+        "'la semana que viene' (~7 días después), 'a la tardecita' (~17:00), "
+        "'a la nochecita' (~20:00), 'a la noche' (~20:00), 'tempranito' (~7:00), "
+        "'el finde' (sábado), '18hs' (18:00), 'a eso de las X' (~X:00), "
+        "'4 de la tarde' (16:00), son frecuentes.\n"
+        f"Ahora es {anchor.strftime('%Y-%m-%d %H:%M')} ({_es_anchor_day}). "
+        "Si el usuario dice un día de la semana sin más contexto "
+        "('el jueves'), asumí el PRÓXIMO de esa semana (rollforward). "
+        "Si no dio hora, usá 09:00.\n\n"
+        f'Texto: "{s}"{_hint_line}\n\n'
         'Respondé SOLO con JSON válido: {"iso": "YYYY-MM-DDTHH:MM"} '
         'o {"iso": null} si no hay fecha clara. '
         "Sin prosa, sin bloques de código."

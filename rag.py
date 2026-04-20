@@ -19528,20 +19528,219 @@ def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 
     return items[:max_items]
 
 
+# ── NL datetime + recurrence parsing (feeds propose_reminder / propose_event) ─
+
+# Weekday map for recurrence regex. RFC 5545 RRULE uses MO/TU/WE/TH/FR/SA/SU.
+_RECUR_WEEKDAY_MAP = {
+    # Spanish
+    "lunes": "MO", "martes": "TU", "miércoles": "WE", "miercoles": "WE",
+    "jueves": "TH", "viernes": "FR", "sábado": "SA", "sabado": "SA",
+    "domingo": "SU",
+    # English
+    "monday": "MO", "tuesday": "TU", "wednesday": "WE", "thursday": "TH",
+    "friday": "FR", "saturday": "SA", "sunday": "SU",
+}
+
+
+def _parse_natural_datetime(
+    text: str,
+    now: datetime | None = None,
+    *,
+    prefer_future: bool = True,
+    lang: tuple[str, ...] = ("es", "en"),
+) -> datetime | None:
+    """Parse a natural-language date/time string to a concrete `datetime`.
+
+    Tries `dateparser` first (covers the 80% — "mañana a las 10", "el jueves
+    4pm", ISO strings, relative "en 2 horas", english "next monday 3pm").
+    Falls back to a qwen2.5:3b helper JSON call only if dateparser yields
+    nothing AND the input looks like it might contain a date reference
+    (non-empty, ≥3 chars).
+
+    `now` anchors relative resolution (tests pass it in for determinism).
+    `prefer_future=True` means bare weekdays / "jueves 4pm" → upcoming, not
+    past. Returns `None` if both paths fail — caller decides whether to
+    treat as error or prompt the user for clarification.
+    """
+    s = (text or "").strip()
+    if len(s) < 3:
+        return None
+
+    anchor = now or datetime.now()
+    settings = {
+        "RELATIVE_BASE": anchor,
+        "PREFER_DATES_FROM": "future" if prefer_future else "current_period",
+        "RETURN_AS_TIMEZONE_AWARE": False,
+    }
+    try:
+        import dateparser  # noqa: PLC0415
+        dt = dateparser.parse(s, languages=list(lang), settings=settings)
+    except Exception:
+        dt = None
+
+    if isinstance(dt, datetime):
+        # Strip tzinfo for consistency with the rest of the codebase
+        # (naive local datetimes everywhere in Apple helpers).
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+
+    # LLM fallback. Prompt the helper model for a strict JSON shape.
+    prompt = (
+        "Parseá esta fecha/hora en lenguaje natural. "
+        f"Ahora es {anchor.isoformat(timespec='minutes')}. "
+        f'Texto: "{s}"\n\n'
+        'Respondé SOLO con JSON válido: {"iso": "YYYY-MM-DDTHH:MM"} '
+        'o {"iso": null} si no hay fecha clara. '
+        "Sin prosa, sin bloques de código."
+    )
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=HELPER_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        raw = (resp.message.content or "").strip()
+    except Exception:
+        return None
+
+    # Strip common code-fence wrappers the helper sometimes emits.
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    iso = data.get("iso") if isinstance(data, dict) else None
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except Exception:
+        return None
+
+
+def _parse_natural_recurrence(text: str | None) -> dict | None:
+    """Parse recurrence hints → RRULE-shaped dict, or `None` if unrecognized.
+
+    Shape: `{freq: DAILY|WEEKLY|MONTHLY|YEARLY, interval: int, byday?: [..]}`.
+    Covers common ES/EN patterns:
+      - "todos los días" / "diariamente" / "every day"    → DAILY
+      - "todos los lunes" / "cada martes" / "every monday" → WEEKLY + BYDAY
+      - "cada N semanas" / "every N weeks"                 → WEEKLY interval=N
+      - "mensualmente" / "todos los meses" / "monthly"     → MONTHLY
+      - "anualmente" / "yearly" / "cada año"               → YEARLY
+
+    Unrecognized → `None` (not an error — recurrence is optional).
+    """
+    if not text:
+        return None
+    s = text.strip().lower()
+    if not s:
+        return None
+
+    # Weekly by specific weekday: "todos los lunes" / "cada martes" / "every monday"
+    m = re.search(
+        r"\b(?:todos?\s+los?|cada|every)\s+"
+        r"(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        s,
+    )
+    if m:
+        day = _RECUR_WEEKDAY_MAP.get(m.group(1))
+        if day:
+            return {"freq": "WEEKLY", "interval": 1, "byday": [day]}
+
+    # "cada N semanas" / "every N weeks"
+    m = re.search(r"\bcada\s+(\d+)\s+semanas?\b|\bevery\s+(\d+)\s+weeks?\b", s)
+    if m:
+        n = int(m.group(1) or m.group(2))
+        return {"freq": "WEEKLY", "interval": max(1, n)}
+
+    # "cada N días" / "every N days"
+    m = re.search(r"\bcada\s+(\d+)\s+d[ií]as?\b|\bevery\s+(\d+)\s+days?\b", s)
+    if m:
+        n = int(m.group(1) or m.group(2))
+        return {"freq": "DAILY", "interval": max(1, n)}
+
+    # "cada N meses" / "every N months"
+    m = re.search(r"\bcada\s+(\d+)\s+meses?\b|\bevery\s+(\d+)\s+months?\b", s)
+    if m:
+        n = int(m.group(1) or m.group(2))
+        return {"freq": "MONTHLY", "interval": max(1, n)}
+
+    # Simple adverbs. Check after byday/interval so "todos los lunes" wins.
+    if re.search(r"\b(todos?\s+los?\s+d[ií]as|diariamente|daily|every\s+day)\b", s):
+        return {"freq": "DAILY", "interval": 1}
+    if re.search(r"\b(todas?\s+las?\s+semanas|semanalmente|weekly|every\s+week)\b", s):
+        return {"freq": "WEEKLY", "interval": 1}
+    if re.search(
+        r"\b(todos?\s+los?\s+meses|mensualmente|monthly|every\s+month|"
+        r"cada\s+mes)\b", s,
+    ):
+        return {"freq": "MONTHLY", "interval": 1}
+    if re.search(
+        r"\b(anualmente|yearly|every\s+year|cada\s+a[nñ]o|todos?\s+los?\s+a[nñ]os)\b", s,
+    ):
+        return {"freq": "YEARLY", "interval": 1}
+
+    return None
+
+
+def _build_rrule_string(recurrence: dict | None) -> str:
+    """Compose an iCalendar RRULE string from a recurrence dict.
+
+    Shape: `{freq, interval, byday?}` → `"FREQ=X;INTERVAL=N[;BYDAY=MO,TU]"`.
+    Returns empty string if input is falsy or missing `freq`.
+    """
+    if not isinstance(recurrence, dict):
+        return ""
+    freq = (recurrence.get("freq") or "").upper()
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        return ""
+    interval = int(recurrence.get("interval") or 1)
+    parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
+    byday = recurrence.get("byday") or []
+    if isinstance(byday, (list, tuple)) and byday:
+        valid_days = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+        clean = [d for d in byday if d in valid_days]
+        if clean:
+            parts.append("BYDAY=" + ",".join(clean))
+    return ";".join(parts)
+
+
 def _create_reminder(
     name: str,
     due_token: str | None = None,
     list_name: str | None = None,
+    *,
+    due_dt: datetime | None = None,
+    priority: int | None = None,
+    notes: str | None = None,
+    recurrence: dict | None = None,
 ) -> tuple[bool, str]:
     """Create a new Apple Reminder. Returns `(ok, id_or_error)`.
 
-    `due_token="tomorrow"` → due tomorrow 09:00 (system local time,
-    computed inside AppleScript to stay locale-safe). No other tokens
-    supported yet — ISO parsing via AppleScript is locale-dependent,
-    so we keep it to the one shape the home UI needs.
+    Fields:
+      - `name`: title (required, non-empty after strip).
+      - `due_dt`: specific datetime (wins over `due_token`). Day is set to 1
+        first inside AppleScript to avoid month-overflow when the current
+        day-of-month doesn't exist in the target month.
+      - `due_token="tomorrow"`: legacy path for the home UI's brief — due
+        tomorrow 09:00 local. Ignored if `due_dt` is given.
+      - `list_name`: destination Reminders list. Omitted → default (first).
+      - `priority`: Apple priority number `1|5|9` (high|medium|low). None
+        leaves priority unset. No validation beyond int cast.
+      - `notes`: free-form body text. Double quotes escaped.
+      - `recurrence`: `{freq, interval, byday?}` → RRULE. Best-effort:
+        Reminders.app AppleScript dictionary's `recurrence rule` is
+        inconsistent across macOS versions, so we wrap the property
+        assignment in its own `try/on error` block — the reminder itself
+        still gets created without recurrence if the property is rejected.
+        The caller's UX should advise manual verification in Reminders.app.
 
-    `list_name` is the Reminders list to write to; omitted → default
-    (first) list. Unknown list name → osascript error surfaced verbatim.
+    Unknown list name → osascript error surfaced verbatim.
     """
     nm = (name or "").strip()
     if not nm:
@@ -19553,8 +19752,30 @@ def _create_reminder(
     if list_name:
         safe_list = list_name.replace('"', '\\"')
         list_selector = f' of list "{safe_list}"'
+
+    # Build properties block. `name` always goes in the with-properties.
+    # `body` too if notes present, since it's cleaner than a follow-up set.
+    props = [f'name:"{safe_name}"']
+    if notes:
+        safe_notes = notes.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        props.append(f'body:"{safe_notes}"')
+    props_str = ", ".join(props)
+
+    # Due date block.
     due_block = ""
-    if due_token == "tomorrow":
+    if due_dt is not None:
+        due_block = (
+            '    set _d to (current date)\n'
+            '    set day of _d to 1\n'
+            f'    set year of _d to {due_dt.year}\n'
+            f'    set month of _d to {due_dt.month}\n'
+            f'    set day of _d to {due_dt.day}\n'
+            f'    set hours of _d to {due_dt.hour}\n'
+            f'    set minutes of _d to {due_dt.minute}\n'
+            '    set seconds of _d to 0\n'
+            '    set due date of _r to _d\n'
+        )
+    elif due_token == "tomorrow":
         due_block = (
             '    set _d to (current date) + (1 * days)\n'
             '    set hours of _d to 9\n'
@@ -19562,11 +19783,32 @@ def _create_reminder(
             '    set seconds of _d to 0\n'
             '    set due date of _r to _d\n'
         )
+
+    # Priority: 1=high, 5=medium, 9=low. Omit entirely when None.
+    priority_block = ""
+    if priority is not None:
+        pv = int(priority)
+        priority_block = f'    set priority of _r to {pv}\n'
+
+    # Recurrence: best-effort inner try so the reminder still lands if
+    # AppleScript rejects the property on this macOS version.
+    rrule = _build_rrule_string(recurrence)
+    recurrence_block = ""
+    if rrule:
+        recurrence_block = (
+            '    try\n'
+            f'      set recurrence of _r to "{rrule}"\n'
+            '    on error\n'
+            '    end try\n'
+        )
+
     script = (
         'tell application "Reminders"\n'
         '  try\n'
-        f'    set _r to make new reminder{list_selector} with properties {{name:"{safe_name}"}}\n'
+        f'    set _r to make new reminder{list_selector} with properties {{{props_str}}}\n'
         f'{due_block}'
+        f'{priority_block}'
+        f'{recurrence_block}'
         '    return id of _r\n'
         '  on error errMsg\n'
         '    return "err: " & errMsg\n'
@@ -19614,6 +19856,125 @@ def _complete_reminder(reminder_id: str) -> tuple[bool, str]:
         return True, "completada"
     if out.startswith("err:"):
         return False, out[4:].strip() or "reminder no encontrado"
+    return False, "osascript devolvió vacío"
+
+
+def _applescript_date_lines(var: str, dt: datetime, indent: str = "    ") -> str:
+    """Emit AppleScript to construct `var` as a date at `dt` (locale-safe).
+
+    Pattern: `set _x to (current date)`, then numeric property assignments.
+    Day is set to 1 first to avoid month-overflow glitches when the current
+    day-of-month doesn't exist in the target month (e.g. today=Jan 31 and
+    target month=Feb). All assignments are numeric, so no month-name
+    localization hazards.
+    """
+    return (
+        f'{indent}set {var} to (current date)\n'
+        f'{indent}set day of {var} to 1\n'
+        f'{indent}set year of {var} to {dt.year}\n'
+        f'{indent}set month of {var} to {dt.month}\n'
+        f'{indent}set day of {var} to {dt.day}\n'
+        f'{indent}set hours of {var} to {dt.hour}\n'
+        f'{indent}set minutes of {var} to {dt.minute}\n'
+        f'{indent}set seconds of {var} to 0\n'
+    )
+
+
+def _create_calendar_event(
+    title: str,
+    start: datetime,
+    end: datetime | None = None,
+    *,
+    calendar: str | None = None,
+    location: str | None = None,
+    notes: str | None = None,
+    all_day: bool = False,
+    recurrence: dict | None = None,
+) -> tuple[bool, str]:
+    """Create a Calendar.app event. Returns `(ok, uid_or_error)`.
+
+    Fields:
+      - `title`: summary (required, non-empty after strip).
+      - `start`: datetime (required). End defaults to `start + 1h`.
+      - `end`: explicit end datetime. Must be ≥ start.
+      - `calendar`: target calendar name. None → first writable calendar.
+        Calendar.app aggregates iCloud CalDAV calendars, so writes to
+        iCloud destinations go through even though JXA EventKit can't
+        read them back (this is why we `_fetch_calendar_*` via icalBuddy
+        but create via AppleScript-to-Calendar.app — different surfaces).
+      - `location`, `notes`: optional strings. Quotes escaped.
+      - `all_day=True`: sets the `allday event` property; `start`'s date
+        wins, times are ignored.
+      - `recurrence`: `{freq, interval, byday?}` → RRULE string. Unlike
+        Reminders, Calendar.app's `recurrence` property is stable across
+        recent macOS — we don't wrap it in a nested try/on error.
+
+    Returns the event's UID (stable identifier) on success so the caller
+    can surface a deep-link / deletion path in the UX.
+    """
+    nm = (title or "").strip()
+    if not nm:
+        return False, "título vacío"
+    if not _apple_enabled():
+        return False, "Apple integration deshabilitada"
+
+    if end is None:
+        end = start + timedelta(hours=1)
+    if end < start:
+        return False, "end date antes de start date"
+
+    safe_title = nm.replace("\\", "\\\\").replace('"', '\\"')
+
+    # Calendar selector: named or first-writable fallback.
+    if calendar:
+        safe_cal = calendar.replace("\\", "\\\\").replace('"', '\\"')
+        cal_sel = f'set _cal to first calendar whose name is "{safe_cal}"\n'
+    else:
+        cal_sel = "set _cal to first calendar whose writable is true\n"
+
+    start_lines = _applescript_date_lines("_s", start)
+    end_lines = _applescript_date_lines("_e", end)
+
+    # Properties block.
+    props = [
+        'summary:"' + safe_title + '"',
+        "start date:_s",
+        "end date:_e",
+    ]
+    if all_day:
+        props.append("allday event:true")
+    if location:
+        safe_loc = location.replace("\\", "\\\\").replace('"', '\\"')
+        props.append(f'location:"{safe_loc}"')
+    if notes:
+        safe_desc = notes.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        props.append(f'description:"{safe_desc}"')
+    props_str = ", ".join(props)
+
+    recurrence_block = ""
+    rrule = _build_rrule_string(recurrence)
+    if rrule:
+        recurrence_block = f'    set recurrence of _ev to "{rrule}"\n'
+
+    script = (
+        'tell application "Calendar"\n'
+        '  try\n'
+        f'  {cal_sel}'
+        f'{start_lines}'
+        f'{end_lines}'
+        f'    set _ev to make new event at end of events of _cal with properties {{{props_str}}}\n'
+        f'{recurrence_block}'
+        '    return uid of _ev\n'
+        '  on error errMsg\n'
+        '    return "err: " & errMsg\n'
+        '  end try\n'
+        'end tell\n'
+    )
+    out = _osascript(script, timeout=20.0)
+    if out.startswith("err:"):
+        return False, out[4:].strip() or "error creando evento"
+    if out:
+        return True, out
     return False, "osascript devolvió vacío"
 
 

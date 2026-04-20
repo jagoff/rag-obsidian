@@ -20,6 +20,7 @@ dependencies = [
     "google-auth-oauthlib>=1.2",
     "youtube-transcript-api>=1.0",
     "spotipy>=2.23",
+    "dateparser>=1.2",
 ]
 
 [project.optional-dependencies]

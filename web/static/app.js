@@ -1471,17 +1471,28 @@ async function send(question) {
       scrollBottom();
     } else if (event === "created") {
       // Auto-create happy path: a propose_* tool created a reminder/event
-      // directly. Toast with a context-appropriate action:
-      //   - Reminders: "Deshacer" POSTs to /api/reminders/delete (fast,
-      //     works; Reminders.app's AppleScript delete-by-id resolves
-      //     cleanly).
-      //   - Calendar events: "Ver en Calendar" opens the native deep
-      //     link `x-apple-calevent://<UID>` so the user can delete from
-      //     Calendar.app's own UI. Programmatic deletion via AppleScript
-      //     times out on calendars with >1k events (verified 2026-04-20:
-      //     `every event of _cal` takes >30s on a 1334-event calendar,
-      //     and `whose uid is X` errors immediately). EventKit/pyobjc
-      //     would solve it but the dependency weight isn't worth it.
+      // directly. Toast UX diverges by kind:
+      //
+      //   - Reminders: "Deshacer" POSTs to /api/reminders/delete within
+      //     10s. Reminders.app's AppleScript delete-by-id is fast and
+      //     reliable, so the undo flow works cleanly.
+      //
+      //   - Calendar events: INFO-ONLY toast, no action button. We
+      //     tried:
+      //     (a) AppleScript delete via `whose uid is X` — errors
+      //         immediately on macOS 14+ ("No puede obtenerse event 1
+      //         whose uid = ...").
+      //     (b) Iteration over events of writable calendars — times
+      //         out on calendars >1000 events (measured 30s on a
+      //         1334-event calendar).
+      //     (c) `x-apple-calevent://<UID>` deep link — not a
+      //         recognized URL scheme on macOS (verified with
+      //         `open -u` error kLSApplicationNotFoundErr).
+      //     (d) `calshow://<epoch>` — iOS-only, not macOS.
+      //     The honest path is to just confirm creation and let the
+      //     user go to Calendar.app if they want to edit/delete.
+      //     EventKit via pyobjc would fix this but the dependency
+      //     weight doesn't justify it for a toast undo button.
       hadProposal = true;
       const fields = parsed.fields || {};
       const isEvent = parsed.kind === "event";
@@ -1489,18 +1500,9 @@ async function send(question) {
         ? "✓ Agregado a tu Calendario" + (fields.title ? ` · ${fields.title}` : "")
         : "✓ Agregado a tus Recordatorios" + (fields.title ? ` · ${fields.title}` : "");
       if (isEvent) {
-        // Deep-link to the created event. Calendar.app resolves this URL
-        // scheme and opens the inspector where the user can delete.
-        const uid = parsed.event_uid;
-        showToast(msg, {
-          kind: "ok",
-          action: {
-            label: "Ver en Calendar",
-            onClick: async () => {
-              window.location.href = `x-apple-calevent://${uid}`;
-            },
-          },
-        });
+        // No action button: Calendar.app's AppleScript delete is
+        // unworkable. Toast is purely informational; default 4s.
+        showToast(msg, { kind: "ok" });
       } else {
         const reminderId = parsed.reminder_id;
         showToast(msg, {

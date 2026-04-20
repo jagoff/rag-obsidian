@@ -102,25 +102,58 @@ def test_generator_accepts_english_key(fake_client):
     assert qs == ["what model?", "which reranker?"]
 
 
-def test_generator_returns_empty_on_malformed_json(fake_client):
+def test_generator_returns_none_on_malformed_json(fake_client):
+    # Transient failure: return None so get_synthetic_questions won't cache.
     fake_client.next_response = "not json at all { broken"
     qs = rag._generate_synthetic_questions("x" * 500, "setup", "03-Resources")
-    assert qs == []
+    assert qs is None
 
 
-def test_generator_returns_empty_on_wrong_shape(fake_client):
+def test_generator_returns_none_on_wrong_shape(fake_client):
     # data es un list en vez de dict → no se puede extraer "preguntas"
+    # Treated as transient so the next index pass retries.
     fake_client.next_response = json.dumps(["¿qué?", "¿cómo?"])
     qs = rag._generate_synthetic_questions("x" * 500, "setup", "03-Resources")
-    assert qs == []
+    assert qs is None
 
 
-def test_generator_returns_empty_on_ollama_failure(fake_client):
+def test_generator_returns_none_on_ollama_failure(fake_client):
     def boom(**kwargs):
         raise RuntimeError("ollama down")
     fake_client.chat = boom  # type: ignore[assignment]
     qs = rag._generate_synthetic_questions("x" * 500, "setup", "03-Resources")
-    assert qs == []
+    assert qs is None
+
+
+def test_get_synthetic_questions_does_not_cache_transient_failure(fake_client, tmp_path, monkeypatch):
+    """Regression: previously a transient LLM failure cached [] by hash,
+    preventing retries until the note's content changed. New contract:
+    None from the generator is NOT persisted, so the next pass retries.
+    """
+    cache_path = tmp_path / "synth.json"
+    monkeypatch.setattr(rag, "SYNTHETIC_Q_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_synthetic_q_cache", None)
+    monkeypatch.setattr(rag, "_synthetic_q_cache_dirty", False)
+
+    # First call: LLM fails → generator returns None → caller sees [], NOT cached.
+    original_chat = type(fake_client).chat
+    should_fail = {"flag": True}
+    def gated_chat(self, **kwargs):
+        if should_fail["flag"]:
+            raise RuntimeError("ollama down")
+        return original_chat(self, **kwargs)
+    monkeypatch.setattr(type(fake_client), "chat", gated_chat)
+
+    first = rag.get_synthetic_questions("x" * 500, "hash1", "setup", "03-Resources")
+    assert first == []
+    assert "hash1" not in rag._load_synthetic_q_cache()
+
+    # Second call on same hash: LLM recovers → retry succeeds → cached.
+    should_fail["flag"] = False
+    fake_client.next_response = json.dumps({"preguntas": ["q1?", "q2?"]})
+    second = rag.get_synthetic_questions("x" * 500, "hash1", "setup", "03-Resources")
+    assert second == ["q1?", "q2?"]
+    assert rag._load_synthetic_q_cache()["hash1"] == ["q1?", "q2?"]
 
 
 def test_generator_respects_kill_switch(fake_client, monkeypatch):

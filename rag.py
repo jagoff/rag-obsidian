@@ -1444,14 +1444,17 @@ def _save_synthetic_q_cache() -> None:
     _synthetic_q_cache_dirty = False
 
 
-def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str]:
+def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str] | None:
     """Generate 2-4 synthetic questions that this note answers.
 
     Asks the helper model for strict JSON (`format=json`). Deterministic
-    (temp=0, seed=42 via HELPER_OPTIONS). Returns [] on failure or malformed
-    output — callers treat empty as "no synthetic questions" not as an error.
+    (temp=0, seed=42 via HELPER_OPTIONS). Returns:
+      - list[str]: success (possibly empty if the LLM produced no usable
+                   questions after cleaning — the note is a legitimate zero)
+      - None:       transient failure (ollama timeout, malformed JSON,
+                   etc) — caller should NOT cache so the next run retries
 
-    Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1.
+    Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1 (returns []).
     """
     if os.environ.get("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"):
         return []
@@ -1475,12 +1478,15 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
         raw = resp.message.content.strip()
         data = json.loads(raw)
     except Exception:
-        return []
+        # Transient — do not cache. Next index pass will retry.
+        return None
     qs = None
     if isinstance(data, dict):
         qs = data.get("preguntas") or data.get("questions")
     if not isinstance(qs, list):
-        return []
+        # LLM responded but the shape is wrong. Treat as transient: the
+        # helper occasionally drops out of JSON mode after a cold reload.
+        return None
     cleaned: list[str] = []
     seen: set[str] = set()
     for q in qs[:_SYNTHETIC_Q_CAP]:
@@ -1501,17 +1507,28 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
 
 
 def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) -> list[str]:
-    """Get or generate synthetic questions for a note. Cached by file hash."""
+    """Get or generate synthetic questions for a note. Cached by file hash.
+
+    A None return from _generate_synthetic_questions (transient LLM failure)
+    is NOT cached — the next index pass retries. Only legitimate empty lists
+    (text too short, or LLM successfully produced no useful questions)
+    flow into the cache so the retry budget stays bounded.
+    """
     global _synthetic_q_cache_dirty
     cache = _load_synthetic_q_cache()
     if file_hash in cache:
         return cache[file_hash]
     if len(text) < _SYNTHETIC_Q_MIN_BODY:
         return []
-    qs = _generate_synthetic_questions(text, title, folder)
-    cache[file_hash] = qs
+    result = _generate_synthetic_questions(text, title, folder)
+    if result is None:
+        # Transient failure — don't poison the cache. Return [] for the
+        # caller (the chunk embeds without synthetic prefix this pass) and
+        # let the next indexing pick it up.
+        return []
+    cache[file_hash] = result
     _synthetic_q_cache_dirty = True
-    return qs
+    return result
 
 
 # ── FEEDBACK LOOP ────────────────────────────────────────────────────────────

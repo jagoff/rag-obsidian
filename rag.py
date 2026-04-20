@@ -5331,8 +5331,8 @@ def _load_google_credentials(allow_interactive: bool = True):
             creds.refresh(Request())
             _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
             return creds
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log('google_token_refresh', exc)
     if not allow_interactive or not sys.stdin.isatty():
         return None
     keys = _google_keys_path()
@@ -12846,8 +12846,8 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             existing_urls = col_urls.get(where={"file": f}, include=[])
             if existing_urls.get("ids"):
                 col_urls.delete(ids=existing_urls["ids"])
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log('index_urls_cleanup_on_reindex', exc)
 
     # Persist context summary cache so incremental runs don't re-generate.
     _save_context_cache()
@@ -13954,8 +13954,8 @@ def chat(
     for name, vpath in vaults_resolved:
         try:
             total_chunks += get_db_for(vpath).count()
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log('chat_vault_chunk_count', exc)
     if total_chunks == 0:
         console.print(
             "[red]Los vaults seleccionados están vacíos. "
@@ -14030,8 +14030,8 @@ def chat(
             sess["turns"] = []
             try:
                 save_session(sess)
-            except Exception:
-                pass
+            except Exception as exc:
+                _silent_log('chat_history_save_on_topic_shift', exc)
             history = []
             last_assistant = ""
             last_question = ""
@@ -14083,8 +14083,8 @@ def chat(
             # visible al usuario, no enterrado bajo el "buscando URLs…".
             try:
                 _maybe_backfill_urls()
-            except Exception:
-                pass
+            except Exception as exc:
+                _silent_log('chat_urls_backfill', exc)
             with console.status("[dim]buscando URLs…[/dim]", spinner="dots"):
                 items = find_urls(search_q, k=10)
             render_links(items)
@@ -14297,8 +14297,8 @@ def chat(
                             full = _rfull
                             _chat_citation_repaired = True
                             console.print(render_response(full))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _silent_log('chat_citation_repair_stream', exc)
 
         # ── Critique (opt-in, chat path) ──────────────────────────────────────
         _chat_critique_changed = False
@@ -19187,8 +19187,8 @@ def ingest_read_url(
                 related_titles = [
                     m.get("note", "") for m in related_metas if m.get("note")
                 ]
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log('read_related_titles_gather', exc)
 
     note_title_for_tags = title or url
     try:
@@ -19237,16 +19237,16 @@ def ingest_read_url(
     candidate.write_text(note_body, encoding="utf-8")
     try:
         _index_single_file(col, candidate, skip_contradict=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log('read_post_save_index', exc)
     # Daily note changelog — only for notes outside 00-Inbox (Inbox notes are
     # already visible when listing the folder). Silent-fail so a malformed
     # daily note never blocks the actual ingestion.
     if folder != _READ_FOLDER:
         try:
             _append_to_daily_note(candidate, title or url, folder, now)
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log('read_daily_note_append', exc)
     result["path"] = candidate
     return result
 
@@ -20488,8 +20488,8 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
     try:
         label = svc.users().labels().get(userId="me", id="INBOX").execute()
         out["unread_count"] = int(label.get("threadsUnread") or 0)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log('gmail_unread_count', exc)
 
     # Starred recent — explicit user-flagged threads.
     try:
@@ -20504,8 +20504,8 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
                     "from": meta["from"],
                     "snippet": meta["snippet"],
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log('gmail_unread_list', exc)
 
     # Awaiting reply — threads stuck, last sender != me. Exclude auto-generated
     # categories to keep signal/noise high.
@@ -20537,8 +20537,8 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
                 "snippet": meta["snippet"],
                 "days_old": round(days_old, 1),
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log('gmail_followup_list', exc)
 
     return out
 

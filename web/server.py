@@ -286,6 +286,30 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 app = FastAPI(title="obsidian-rag web", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# CORS: same-origin only. The server is bound to 127.0.0.1 by the
+# launchd plist, so cross-origin requests would come from a browser
+# running an untrusted origin (e.g. a malicious local webpage trying
+# to hit our API). FastAPI without CORSMiddleware rejects cross-origin
+# by default, but adding the middleware explicitly:
+#   1. documents the intent for future maintainers who might otherwise
+#      assume CORS wasn't thought about,
+#   2. whitelists the exact origins we DO serve (127.0.0.1 / localhost
+#      on any port — the plist uses 8765 but dev sometimes uses 8766),
+#   3. prevents a future contributor from dropping in
+#      `CORSMiddleware(allow_origins=["*"])` thinking "we need CORS",
+#      which would open the API to every page in the browser.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402 — must go after `app = FastAPI(...)`
+
+app.add_middleware(
+    CORSMiddleware,
+    # Regex matches localhost / 127.0.0.1 with any port or no port.
+    # Refuses anything else, including file:// and 0.0.0.0.
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 # Chat model for /chat. Delegated to `resolve_chat_model()` so it tracks
 # whatever rag.py decides is best on this host (command-r > qwen2.5:14b >
 # phi4). command-r:35b prefill is slower (~5-10s on a 5k-char context)

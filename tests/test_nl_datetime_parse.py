@@ -275,6 +275,14 @@ def test_preprocess_a_las_bare():
     assert "10:00" in rag._preprocess_rioplatense_datetime("mañana a las 10")
 
 
+def test_preprocess_a_las_N_am_pm():
+    """'a las 10am' / 'a las 4pm' — dateparser falla con 'a las' antes
+    de am/pm porque mezcla idiomas. Strip del prefijo."""
+    assert rag._preprocess_rioplatense_datetime("a las 10am") == "10:00am"
+    assert rag._preprocess_rioplatense_datetime("a las 4pm") == "4:00pm"
+    assert rag._preprocess_rioplatense_datetime("a las 10:30am") == "10:30am"
+
+
 def test_preprocess_de_la_manana():
     """'a las N de la mañana' → 'N:00 am'."""
     assert rag._preprocess_rioplatense_datetime(

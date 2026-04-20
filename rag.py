@@ -19629,6 +19629,13 @@ _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
      lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
     (r"\ba\s+las\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+noche\b",
      lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
+    # "a las Nam" / "a las Npm" / "a las N:MMam" — common bilingual form.
+    # The "a las" prefix confuses dateparser (Spanish literal), and the
+    # bare "a las N" rule below wouldn't match because the word boundary
+    # between the digit and the "am"/"pm" letter doesn't fire. Strip
+    # the "a las" so dateparser sees just "Nam"/"Npm".
+    (r"\ba\s+las\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+     lambda m: f"{m.group(1)}:{m.group(2) or '00'}{m.group(3)}"),
     # Bare "a las N" / "a las N:MM" → explicit HH:MM. dateparser interprets
     # bare "a las 10" as "day 10" — this coerces it to a time.
     (r"\ba\s+las\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),

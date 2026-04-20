@@ -1003,8 +1003,13 @@ async function send(question) {
   thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
   // Seed the stage label immediately so the user sees "pensando…" on click.
   // Heartbeat/status events replace this with "buscando…" / "generando…"
-  // once they start flowing (~500ms–3s in).
-  thinking.setAttribute("data-stage", "pensando…");
+  // once they start flowing (~500ms–3s in). Rendered as real DOM (not a
+  // ::after pseudo) so the seconds portion can be coloured independently
+  // as a semáforo (verde → amarillo → rojo) once the ticker kicks in.
+  const stageLabelEl = el("span", "stage-label", "pensando…");
+  const stageSecsEl = el("span", "stage-secs");
+  thinking.appendChild(stageLabelEl);
+  thinking.appendChild(stageSecsEl);
   turn.appendChild(thinking);
   scrollBottom();
 
@@ -1035,30 +1040,52 @@ async function send(question) {
     const s = ms / 1000;
     return s < 10 ? s.toFixed(1) : Math.floor(s).toString();
   }
-  function retrieveCopy(ms) {
+  function stageTier(ms) {
+    // Semáforo agnóstico a la fase: los mismos umbrales que disparan el
+    // cambio de copy en retrieveLabel. Verde < 3s (snappy), amarillo < 8s
+    // (trabajando), rojo ≥ 8s (percibido como lento). Mantenerlos
+    // alineados con la copy evita que el color y el texto discrepen.
     const s = ms / 1000;
-    // Copy escalates at ~p50 and ~p95 retrieve latency so long tails feel
-    // acknowledged instead of hung. "búsqueda profunda" matches the
-    // auto-deep-retrieval branch in the backend (confidence < 0.10).
-    if (s < 3)  return `buscando · ${formatSecs(ms)}s`;
-    if (s < 8)  return `revisando notas · ${formatSecs(ms)}s`;
-    return `búsqueda profunda · ${formatSecs(ms)}s`;
+    if (s < 3) return "green";
+    if (s < 8) return "yellow";
+    return "red";
   }
-  function generateCopy(ms) {
+  function retrieveLabel(ms) {
     const s = ms / 1000;
-    if (s < 3)  return `generando · ${formatSecs(ms)}s`;
-    if (s < 8)  return `generando · ${formatSecs(ms)}s`;
-    if (s < 15) return `casi listo · ${formatSecs(ms)}s`;
-    return `todavía trabajando · ${formatSecs(ms)}s`;
+    // "búsqueda profunda" matches the auto-deep-retrieval branch in the
+    // backend (confidence < 0.10).
+    if (s < 3) return "buscando";
+    if (s < 8) return "revisando notas";
+    return "búsqueda profunda";
+  }
+  function generateLabel(ms) {
+    const s = ms / 1000;
+    if (s < 8)  return "generando";
+    if (s < 15) return "casi listo";
+    return "todavía trabajando";
   }
   function startStageTicker(phase) {
     stopStageTicker();
     stageStart = performance.now();
-    const copyFn = phase === "generating" ? generateCopy : retrieveCopy;
+    const labelFn = phase === "generating" ? generateLabel : retrieveLabel;
+    // El contador y el semáforo sólo tienen sentido durante `generating`:
+    // el usuario quiere medir "cuánto lleva generándome la respuesta", no
+    // "cuánto lleva el pipeline entero". Durante `retrieving` actualizamos
+    // sólo la label (buscando → revisando notas → búsqueda profunda) y
+    // mantenemos limpio el span de segundos para que el número arranque
+    // desde 0 recién cuando empieza la generación.
+    const showSecs = phase === "generating";
     const tick = () => {
       if (!thinking.isConnected) { stopStageTicker(); return; }
       const elapsed = performance.now() - stageStart;
-      thinking.setAttribute("data-stage", copyFn(elapsed));
+      stageLabelEl.textContent = showSecs ? `${labelFn(elapsed)} · ` : labelFn(elapsed);
+      if (showSecs) {
+        stageSecsEl.textContent = `${formatSecs(elapsed)}s`;
+        stageSecsEl.setAttribute("data-tier", stageTier(elapsed));
+      } else {
+        stageSecsEl.textContent = "";
+        stageSecsEl.removeAttribute("data-tier");
+      }
     };
     tick();
     stageTimer = setInterval(tick, 200);
@@ -1261,7 +1288,9 @@ async function send(question) {
           // running counter. Give a quick visual cue and let the normal
           // sources/token/done events tear down `thinking`.
           stopStageTicker();
-          thinking.setAttribute("data-stage", "desde caché");
+          stageLabelEl.textContent = "desde caché";
+          stageSecsEl.textContent = "";
+          stageSecsEl.removeAttribute("data-tier");
         } else {
           // Unknown/unlabelled status (e.g. a future stage name) — fall
           // back to the retrieve ticker. Guarantees the counter never

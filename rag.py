@@ -1248,6 +1248,43 @@ def _save_context_cache() -> None:
 
 _SUMMARY_CLIENT: ollama.Client | None = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
+_HELPER_CLIENT: "_TimedOllamaProxy | None" = None
+_CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
+
+# Capture the original `ollama.chat` at import time so _TimedOllamaProxy
+# can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
+_ORIGINAL_OLLAMA_CHAT = ollama.chat
+
+
+class _TimedOllamaProxy:
+    """Thin proxy over `ollama.chat` with a production-time timeout.
+
+    Tests that monkeypatch `rag.ollama.chat` expect the wrapped callers to
+    hit the module-level symbol directly — if we always went through
+    `ollama.Client(timeout=...).chat`, the mock would never run because
+    Client has its own httpx session. So: when `ollama.chat` is the
+    original function (no monkeypatch), route through a cached Client
+    with a real timeout. Otherwise, route through `ollama.chat` so test
+    mocks intercept correctly.
+
+    The timeout is a safety ceiling, not a performance knob. In production
+    a wedged ollama daemon raises httpx.ReadTimeout and the caller's
+    existing `except Exception` path handles it. In tests, the proxy is
+    transparent.
+    """
+
+    def __init__(self, timeout: float):
+        self._timeout = timeout
+        self._client: ollama.Client | None = None
+
+    def chat(self, **kwargs):
+        if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
+            # Monkey-patched (test): delegate to the module symbol so the
+            # mock intercepts. Timeout is ignored — tests don't need it.
+            return ollama.chat(**kwargs)
+        if self._client is None:
+            self._client = ollama.Client(timeout=self._timeout)
+        return self._client.chat(**kwargs)
 
 
 def _index_chat_client() -> ollama.Client:
@@ -1277,6 +1314,29 @@ def _summary_client() -> ollama.Client:
     if _SUMMARY_CLIENT is None:
         _SUMMARY_CLIENT = ollama.Client(timeout=45.0)
     return _SUMMARY_CLIENT
+
+
+def _helper_client() -> "_TimedOllamaProxy":
+    """Cached proxy with a 30s timeout for quick helper-model calls
+    (reformulate_query, expand_queries, _judge_sufficiency,
+    _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
+    _TimedOllamaProxy docstring.
+    """
+    global _HELPER_CLIENT
+    if _HELPER_CLIENT is None:
+        _HELPER_CLIENT = _TimedOllamaProxy(timeout=30.0)
+    return _HELPER_CLIENT
+
+
+def _chat_capped_client() -> "_TimedOllamaProxy":
+    """Cached proxy with a 90s timeout for bounded non-streaming chat
+    calls (citation-repair, critique, digest, morning/today narrative,
+    read summary, contradiction detector). Monkey-patch-compatible.
+    """
+    global _CHAT_CAPPED_CLIENT
+    if _CHAT_CAPPED_CLIENT is None:
+        _CHAT_CAPPED_CLIENT = _TimedOllamaProxy(timeout=90.0)
+    return _CHAT_CAPPED_CLIENT
 
 
 def _generate_context_summary(text: str, title: str, folder: str) -> str:
@@ -6535,7 +6595,7 @@ def hyde_embed(question: str) -> list[float]:
     prompt = (
         f'Write ONE sentence as if from personal notes that directly answers: "{question}"\n\nSentence:'
     )
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
@@ -7230,7 +7290,7 @@ def expand_queries(question: str) -> list[str]:
         f"Pregunta: {question}"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
@@ -7316,7 +7376,7 @@ def reformulate_and_expand(
         "Línea 3: paráfrasis 2"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 192, "num_ctx": 2048},
@@ -8778,7 +8838,7 @@ def _surface_generate_reason(pair: dict) -> str:
         "CONEXIÓN:"
     )
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "top_p": 1, "seed": 42,
@@ -8854,7 +8914,7 @@ def _suggest_tags_for_note(
         "TAGS:"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
@@ -9675,7 +9735,7 @@ def find_contradictions(
     # RAG-trained, hugs the source text, and reliably returns parseable JSON.
     # Cost: ~5-10s per check — only paid on opt-in --counter, acceptable.
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -9901,7 +9961,7 @@ def reformulate_query(
         f"Nueva pregunta: \"{question}\"\n\n"
         "Respondé SOLO con la consulta reformulada, sin explicaciones ni comillas."
     )
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options={**HELPER_OPTIONS, "num_ctx": 2048},
@@ -9940,7 +10000,7 @@ def _compress_turns(turns: list[dict]) -> str:
         "Resumen:"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
@@ -10479,7 +10539,7 @@ def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tup
         "para completar la información faltante. Solo la sub-query, sin explicar."
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
@@ -12872,7 +12932,7 @@ def query(
                 )},
             ]
             try:
-                _repair_resp = ollama.chat(
+                _repair_resp = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=_repair_messages,
                     options=CHAT_OPTIONS,
@@ -12921,7 +12981,7 @@ def query(
         )
         def _run_critique_call() -> str:
             try:
-                _cr = ollama.chat(
+                _cr = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=[
                         {"role": "system", "content": _critique_system},
@@ -13737,7 +13797,7 @@ def chat(
                     )},
                 ]
                 try:
-                    _rresp = ollama.chat(
+                    _rresp = _chat_capped_client().chat(
                         model=resolve_chat_model(),
                         messages=_chat_repair_messages,
                         options=_CLI_CHAT_OPTIONS,
@@ -13774,7 +13834,7 @@ def chat(
             )
             with console.status("[dim][critique…][/dim]", spinner="dots"):
                 try:
-                    _cq_resp = ollama.chat(
+                    _cq_resp = _chat_capped_client().chat(
                         model=resolve_chat_model(),
                         messages=[
                             {"role": "system", "content": _cq_system},
@@ -15274,7 +15334,7 @@ def autotag(path: str, apply: bool, max_tags: int):
         "TAGS:"
     )
 
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
@@ -15812,7 +15872,7 @@ def _render_digest_prompt(week_label: str, ev: dict) -> str:
 
 
 def _generate_digest_narrative(prompt: str) -> str:
-    resp = ollama.chat(
+    resp = _chat_capped_client().chat(
         model=resolve_chat_model(),
         messages=[{"role": "user", "content": prompt}],
         options=CHAT_OPTIONS,
@@ -16495,7 +16555,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
     model = resolve_chat_model()
     for it in range(max_iterations):
         with console.status(f"[dim]pensando (iter {it + 1}/{max_iterations})…[/dim]", spinner="dots"):
-            resp = ollama.chat(
+            resp = _chat_capped_client().chat(
                 model=model,
                 messages=messages,
                 tools=tools,
@@ -16648,7 +16708,7 @@ def _weather_comment(question: str, forecast: str) -> str:
         "Sin emojis. Sin saludos. Sin preámbulos."
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
@@ -18355,7 +18415,7 @@ def _read_summary_prompt(
 
 def _read_generate_summary(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -20955,7 +21015,7 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
 
 def _generate_morning_narrative(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -21380,7 +21440,7 @@ def _generate_morning_json(prompt: str) -> dict | None:
     if parse fails (caller falls back to the legacy text-based path).
     """
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -21873,7 +21933,7 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
 
 def _generate_today_narrative(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -22948,7 +23008,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         'Responde SOLO JSON: {"resolved": true|false, "reason": "<20 palabras"}'
     )
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "seed": 42, "num_ctx": 2048, "num_predict": 128},
@@ -24391,7 +24451,7 @@ def serve(host: str, port: int):
             tasks_predict_cap = max(predict_cap, 700)
             t_gen0 = time.perf_counter()
             try:
-                resp = ollama.chat(
+                resp = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},

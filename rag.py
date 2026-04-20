@@ -15338,8 +15338,16 @@ def _run_eval_gate() -> tuple[float | None, float | None, str]:
     Returns (singles_hit5, chains_hit5, raw_output). On timeout or parse error
     one or both values may be None (treat as regression). Scrubs RAG_EXPLORE
     from subprocess env so the eval run is production-equivalent.
+
+    Timeout sized at 300s (5 min): the real cost on this corpus is 60-100s
+    warm + ~30s cold-start margin for ollama. 10 min was the previous cap
+    — too generous, made `rag tune --online` hang for 10 min if ollama
+    was down instead of failing fast and triggering auto-rollback. The
+    caller treats timeout-as-None the same as a regression, so a too-tight
+    timeout costs us at most one nightly tune cycle.
     """
     import subprocess
+    _GATE_TIMEOUT_S = 300
     env = {k: v for k, v in os.environ.items() if k != "RAG_EXPLORE"}
     assert "RAG_EXPLORE" not in env, "RAG_EXPLORE must not be set during gate eval"
     try:
@@ -15347,11 +15355,11 @@ def _run_eval_gate() -> tuple[float | None, float | None, str]:
             ["rag", "eval"],
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=_GATE_TIMEOUT_S,
             env=env,
         )
     except subprocess.TimeoutExpired:
-        return None, None, "[timeout after 600s]"
+        return None, None, f"[timeout after {_GATE_TIMEOUT_S}s]"
     except Exception as exc:
         return None, None, f"[subprocess error: {exc}]"
     out = result.stdout + result.stderr
@@ -20140,6 +20148,76 @@ def _create_calendar_event(
         return False, out[4:].strip() or "error creando evento"
     if out:
         return True, out
+    return False, "osascript devolvió vacío"
+
+
+def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
+    """Permanently delete an Apple Reminder by its stable `id`
+    (`x-apple-reminderkit://REMCDReminder/UUID`). Returns `(ok, message)`.
+
+    Used by the chat auto-create + undo flow: after a reminder lands via
+    `_create_reminder`, the UI shows a 10s toast with a Deshacer button;
+    click dispatches `DELETE /api/reminders/{id}` which calls this.
+
+    Silent-fail on osascript errors (reminder already deleted, bad id)
+    so the endpoint surfaces a clean message without stack traces.
+    """
+    rid = (reminder_id or "").strip()
+    if not rid:
+        return False, "reminder id vacío"
+    if not _apple_enabled():
+        return False, "Apple integration deshabilitada"
+    safe = rid.replace('"', '\\"')
+    script = (
+        'tell application "Reminders"\n'
+        '  try\n'
+        f'    set _r to first reminder whose id is "{safe}"\n'
+        '    delete _r\n'
+        '    return "ok"\n'
+        '  on error errMsg\n'
+        '    return "err: " & errMsg\n'
+        '  end try\n'
+        'end tell\n'
+    )
+    out = _osascript(script, timeout=15.0)
+    if out == "ok":
+        return True, "borrada"
+    if out.startswith("err:"):
+        return False, out[4:].strip() or "reminder no encontrado"
+    return False, "osascript devolvió vacío"
+
+
+def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
+    """Permanently delete a Calendar.app event by its stable `uid`
+    (returned by `_create_calendar_event`). Returns `(ok, message)`.
+
+    Same contract as `_delete_reminder` — feeds the undo button on the
+    chat's auto-create toast. AppleScript's `whose uid is` query scans
+    all events; on a vault with thousands of past events this can take
+    1-2s. Timeout generous (20s) for the worst case.
+    """
+    uid = (event_uid or "").strip()
+    if not uid:
+        return False, "event uid vacío"
+    if not _apple_enabled():
+        return False, "Apple integration deshabilitada"
+    safe = uid.replace('"', '\\"')
+    script = (
+        'tell application "Calendar"\n'
+        '  try\n'
+        f'    set _e to first event whose uid is "{safe}"\n'
+        '    delete _e\n'
+        '    return "ok"\n'
+        '  on error errMsg\n'
+        '    return "err: " & errMsg\n'
+        '  end try\n'
+        'end tell\n'
+    )
+    out = _osascript(script, timeout=20.0)
+    if out == "ok":
+        return True, "borrado"
+    if out.startswith("err:"):
+        return False, out[4:].strip() or "evento no encontrado"
     return False, "osascript devolvió vacío"
 
 

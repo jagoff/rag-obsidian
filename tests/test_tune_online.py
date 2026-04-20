@@ -313,3 +313,52 @@ def test_gate_constants_derivation():
     """Gate constants must match the documented floor CI lower bounds."""
     assert rag.GATE_SINGLES_HIT5_MIN == pytest.approx(0.7619, abs=1e-4)
     assert rag.GATE_CHAINS_HIT5_MIN == pytest.approx(0.6364, abs=1e-4)
+
+
+def test_eval_gate_timeout_returns_none_none():
+    """subprocess.TimeoutExpired → both hit@5 values None (treated as
+    regression by the caller → auto-rollback). Regression guard against
+    the timeout accidentally bubbling up as a raw exception.
+
+    Pre-2026-04-20 the timeout was 600s — bumped down to 300s after the
+    audit because real eval wall is 60-100s + cold-start margin. Test
+    the contract (returns None tuple on timeout) not the specific value."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+
+    with patch("subprocess.run", fake_run):
+        s_hit5, c_hit5, out = rag._run_eval_gate()
+
+    assert s_hit5 is None
+    assert c_hit5 is None
+    assert "timeout" in out.lower()
+
+
+def test_eval_gate_timeout_is_bounded_tightly():
+    """Guard against the timeout creeping back up to 10+ minutes. A
+    dead ollama should fail the gate fast, not block the nightly tune
+    for 10 min.
+
+    Introspects _run_eval_gate's subprocess.run call and asserts the
+    timeout kwarg is ≤ 5 min (our target post-audit)."""
+    import subprocess
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        mock = MagicMock()
+        mock.stdout = "Singles: hit@5 90.00%\nChains: hit@5 80.00%"
+        mock.stderr = ""
+        return mock
+
+    with patch("subprocess.run", fake_run):
+        rag._run_eval_gate()
+
+    assert captured["timeout"] is not None, "timeout kwarg missing from subprocess.run"
+    assert captured["timeout"] <= 300, (
+        f"eval gate timeout is {captured['timeout']}s — audit target was ≤300s "
+        f"to fail fast when ollama is down. Did it creep up?"
+    )

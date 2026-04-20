@@ -1521,6 +1521,36 @@ html, body {
 .toast-info {
   border-left: 3px solid var(--cyan);
 }
+.toast-msg {
+  flex: 1;
+  display: inline-block;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.toast-action {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--cyan);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+  flex-shrink: 0;
+}
+.toast-action:hover:not(:disabled) {
+  background: rgba(121, 192, 255, 0.1);
+  border-color: var(--cyan-dim);
+}
+.toast-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 @media (prefers-reduced-motion: reduce) {
   .toast {
     transition: opacity 0.01ms;

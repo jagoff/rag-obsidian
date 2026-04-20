@@ -1109,6 +1109,46 @@ def complete_reminder(req: ReminderCompleteRequest) -> dict:
     return {"ok": True, "message": msg}
 
 
+class ReminderDeleteRequest(BaseModel):
+    reminder_id: str
+
+
+@app.post("/api/reminders/delete")
+def delete_reminder(req: ReminderDeleteRequest) -> dict:
+    """Permanently delete an Apple Reminder. Called from the chat's
+    auto-create toast Deshacer button — the user just saw a reminder
+    land in Reminders.app and wants to undo it within the 10s window.
+
+    POST (not DELETE verb) because the reminder_id is an
+    `x-apple-reminderkit://` URI which is painful to URL-encode.
+    """
+    from rag import _delete_reminder  # noqa: PLC0415
+    ok, msg = _delete_reminder(req.reminder_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    try:
+        _HOME_STATE["ts"] = 0.0
+    except Exception:
+        pass
+    return {"ok": True, "message": msg}
+
+
+class CalendarDeleteRequest(BaseModel):
+    event_uid: str
+
+
+@app.post("/api/calendar/delete")
+def delete_calendar_event(req: CalendarDeleteRequest) -> dict:
+    """Permanently delete a Calendar.app event by its UID. Companion
+    to the chat's auto-create toast Deshacer button for events.
+    """
+    from rag import _delete_calendar_event  # noqa: PLC0415
+    ok, msg = _delete_calendar_event(req.event_uid)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"ok": True, "message": msg}
+
+
 @app.get("/api/model")
 def get_chat_model() -> dict:
     """Return the chat model that /api/chat would use right now."""
@@ -1623,13 +1663,20 @@ def _sse(event: str, data: dict) -> str:
 
 def _maybe_emit_proposal(name: str, out: str) -> str | None:
     """If `name` is a proposal tool and `out` parses as the expected JSON
-    payload, return a pre-encoded SSE `proposal` frame; else None.
+    payload, return a pre-encoded SSE frame; else None.
+
+    Routes based on payload kind:
+      - `needs_clarification: true` → `proposal` event (UI shows card,
+        user confirms/edits).
+      - `created: true` → `created` event (UI shows toast with Deshacer).
+      - `created: false` → `proposal` event too, but with `error` field
+        set so the UI can surface the failure in the card.
 
     Keeps the gen() body clean — callers just
     `if frame := _maybe_emit_proposal(...): yield frame`. A malformed
     payload is treated as "not a proposal" (the LLM still sees the tool
     output normally via the `role:"tool"` message; the UI just won't
-    render a card). No logging here — caller decides what to do.
+    render anything). No logging here — caller decides what to do.
     """
     if name not in PROPOSAL_TOOL_NAMES:
         return None
@@ -1637,9 +1684,23 @@ def _maybe_emit_proposal(name: str, out: str) -> str | None:
         payload = json.loads(out)
     except Exception:
         return None
-    if not isinstance(payload, dict) or not payload.get("proposal_id"):
+    if not isinstance(payload, dict):
         return None
-    return _sse("proposal", payload)
+    # Auto-created happy path → toast + undo.
+    if payload.get("created") is True:
+        return _sse("created", payload)
+    # Ambiguous / needs-clarification path → confirmation card.
+    if payload.get("needs_clarification") or payload.get("proposal_id"):
+        return _sse("proposal", payload)
+    # created=false with error set → show proposal card with error state
+    # so the user can retry. Emit as proposal event (UI renders card).
+    if payload.get("created") is False and payload.get("error"):
+        # Inject a synthetic proposal_id so the UI handler treats it as
+        # a normal proposal. Keep the error field for visibility.
+        payload.setdefault("proposal_id", f"prop-err-{payload.get('kind', 'x')}")
+        payload["needs_clarification"] = True
+        return _sse("proposal", payload)
+    return None
 
 
 def _source_payload(meta: dict, score: float) -> dict:

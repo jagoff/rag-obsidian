@@ -764,28 +764,63 @@ function appendWebSearch(parent, query) {
 // Toast utility — prominent system-level confirmation when reminders/
 // events are created. Not just the inline chip next to the button: the
 // chip is easy to miss if the chat has scrolled. Toast lives top-right,
-// auto-dismisses after 4s, stacks if multiple fire.
-function showToast(message, kind = "ok") {
+// auto-dismisses after 4s (or 10s if it has an action button), stacks
+// if multiple fire.
+//
+// Options:
+//   kind: "ok" | "err" | "info"            (left-edge accent color)
+//   ms:   milliseconds before auto-dismiss (default 4000, action 10000)
+//   action: {label, onClick}                optional inline button
+function showToast(message, opts = {}) {
+  // Back-compat: accept second arg as a string kind.
+  if (typeof opts === "string") opts = { kind: opts };
+  const { kind = "ok", action = null } = opts;
+  const ms = opts.ms ?? (action ? 10000 : 4000);
+
   let container = document.getElementById("toast-container");
   if (!container) {
     container = el("div", "toast-container");
     container.id = "toast-container";
     document.body.appendChild(container);
   }
-  const toast = el("div", `toast toast-${kind}`, message);
-  container.appendChild(toast);
-  // Animate in on next frame so the browser picks up the transition.
-  requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  setTimeout(() => {
+  const toast = el("div", `toast toast-${kind}`);
+  const msgEl = el("span", "toast-msg", message);
+  toast.appendChild(msgEl);
+
+  let dismissTimer = null;
+  const dismiss = () => {
+    if (!toast.isConnected) return;
+    if (dismissTimer) clearTimeout(dismissTimer);
     toast.classList.remove("toast-visible");
     toast.addEventListener(
       "transitionend",
       () => toast.remove(),
       { once: true },
     );
-    // Safety net in case transitionend never fires (e.g. `prefers-reduced-motion`).
     setTimeout(() => toast.remove(), 500);
-  }, 4000);
+  };
+
+  if (action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "toast-action";
+    btn.textContent = action.label;
+    btn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      btn.disabled = true;
+      try {
+        await action.onClick();
+      } finally {
+        dismiss();
+      }
+    });
+    toast.appendChild(btn);
+  }
+
+  container.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  dismissTimer = setTimeout(dismiss, ms);
+  return { dismiss };
 }
 
 function formatIsoDatetime(iso) {
@@ -1426,14 +1461,57 @@ async function send(question) {
       // CREATING something, not asking about existing notes).
       if (parsed.propose_intent) hadProposal = true;
     } else if (event === "proposal") {
-      // The server emits this after a propose_reminder /
-      // propose_calendar_event tool resolves. We render the card
-      // immediately so the user sees it while the LLM's narrative
-      // keeps streaming. The thinking spinner (if still showing) is
-      // torn down on the next token event.
+      // The server emits this when the tool returned `needs_clarification`
+      // (ambiguous datetime) OR when the auto-create failed with an
+      // error. We render the card so the user can confirm/edit/retry.
+      // The thinking spinner (if still showing) is torn down on the next
+      // token event.
       hadProposal = true;
       appendProposal(turn, parsed);
       scrollBottom();
+    } else if (event === "created") {
+      // Auto-create happy path: a propose_* tool created a reminder/event
+      // directly. Render a prominent toast with a Deshacer button that
+      // POSTs to the delete endpoint within the toast's 10s lifetime.
+      hadProposal = true;
+      const fields = parsed.fields || {};
+      const msg = parsed.kind === "event"
+        ? "✓ Agregado a tu Calendario" + (fields.title ? ` · ${fields.title}` : "")
+        : "✓ Agregado a tus Recordatorios" + (fields.title ? ` · ${fields.title}` : "");
+      const undoId = parsed.kind === "event" ? parsed.event_uid : parsed.reminder_id;
+      const undoUrl = parsed.kind === "event" ? "/api/calendar/delete" : "/api/reminders/delete";
+      const undoBody = parsed.kind === "event"
+        ? { event_uid: undoId }
+        : { reminder_id: undoId };
+      showToast(msg, {
+        kind: "ok",
+        action: {
+          label: "Deshacer",
+          onClick: async () => {
+            try {
+              const res = await fetch(undoUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(undoBody),
+              });
+              if (!res.ok) {
+                const detail = await res.json().catch(() => ({}));
+                throw new Error(detail.detail || `HTTP ${res.status}`);
+              }
+              showToast(
+                parsed.kind === "event"
+                  ? "✓ Evento eliminado"
+                  : "✓ Recordatorio eliminado",
+                { kind: "info", ms: 3000 },
+              );
+            } catch (err) {
+              showToast(`✗ No se pudo deshacer: ${err.message}`, {
+                kind: "err", ms: 5000,
+              });
+            }
+          },
+        },
+      });
     } else if (event === "token") {
       if (!ragLine) {
         stopGeneratingTicker();

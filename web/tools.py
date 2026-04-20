@@ -46,12 +46,13 @@ Routing por palabra clave (si aparece → llamá la tool):
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
-Crear cosas nuevas (el usuario confirma antes de que se escriba):
+Crear cosas nuevas (se agregan automáticamente, el usuario puede deshacer):
 - "recordame X" / "acordate X" / "ponete un recordatorio" → propose_reminder(title, when, ...)
 - "creá/agendá/bloqueá un evento/reunión/turno" → propose_calendar_event(title, start, ...)
 - STATEMENT form implícito: "mañana tengo una daily a las 10am", "el jueves hay standup", "me citaron para entrevista el viernes 3pm" → ESTO TAMBIÉN es create intent. Llamá propose_calendar_event directamente. NO llames calendar_ahead/reminders_due en estos casos — el usuario está AGREGANDO algo, no consultando.
-- Estos tools NO crean nada — solo registran la propuesta. El usuario ve una tarjeta con botones y decide. No vuelvas a llamarlos si ya lo hiciste esta ronda.
-- Si el usuario no dio fecha u hora clara, preguntá en tu respuesta final (no llames el tool con inventos).
+- Si la fecha/hora parsea clara, el tool CREA de una (el usuario ve un toast con Deshacer por 10s). Si es ambigua, el tool devuelve una propuesta y el usuario aclara desde una tarjeta.
+- No vuelvas a llamar el tool si ya lo hiciste esta ronda.
+- En tu respuesta textual después de llamar el tool: SÉ CONCISO (1-2 oraciones). Decí algo tipo "Listo, quedó agendado" o "Ahí te lo sumo, avisame si hay que cambiar algo". No repitas todos los campos — el usuario ya los ve en el toast / tarjeta.
 
 Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/calendar/reminders/weather) van en PROSA, sin markdown links.
 
@@ -271,29 +272,29 @@ def propose_reminder(
     notes: str | None = None,
     recurrence_text: str | None = None,
 ) -> str:
-    """Proponer un recordatorio de Apple Reminders. NO lo crea — sólo
-    registra una propuesta que el usuario confirma en la tarjeta que se le
-    muestra. Si no confirma, no pasa nada.
+    """Agregar un recordatorio a Apple Reminders. Si la fecha/hora parsea
+    clara, se CREA automáticamente — el usuario ve un toast con un botón
+    Deshacer por 10 segundos. Si la fecha/hora es ambigua, vuelve como
+    propuesta y el usuario confirma o ajusta desde una tarjeta.
 
     Llamala cuando el usuario diga "recordame X", "acordate Y", "ponete un
-    recordatorio Z". Si la fecha/hora es ambigua ("un día de estos"), el
-    campo `due_iso` queda null y la respuesta incluye `needs_clarification:
-    true` — en ese caso pedí aclaración en tu mensaje final en vez de
-    llamar la tool de nuevo.
+    recordatorio Z", o en statement form ("mañana tengo que llamar a...").
+    No vuelvas a llamarla si ya lo hiciste esta ronda.
 
     Args:
-        title: Texto del recordatorio (lo que hay que recordar).
-        when: Fecha/hora en lenguaje natural (ej. "mañana a las 10", "el
-            jueves 4pm", "en 2 horas"). Vacío = recordatorio sin fecha.
+        title: Texto del recordatorio.
+        when: Fecha/hora en lenguaje natural (ej. "mañana a las 10",
+            "el jueves 4pm", "en 2 horas"). Vacío = recordatorio sin fecha.
         list: Lista de Reminders destino. None = lista default del sistema.
         priority: 1 (alta), 5 (media), 9 (baja). None = sin prioridad.
         notes: Texto adicional para el campo body del recordatorio.
-        recurrence_text: Recurrencia en lenguaje natural ("todos los lunes",
-            "cada 2 semanas"). None = no recurrente.
+        recurrence_text: Recurrencia en lenguaje natural ("todos los lunes").
 
     Returns:
-        JSON con el payload de la propuesta (shape idéntica al que la UI
-        recibe vía evento SSE `proposal`).
+        JSON con el resultado. Si se creó: `{kind, created: true,
+        reminder_id, fields}`. Si hay que aclarar: `{kind, proposal_id,
+        needs_clarification: true, fields}`. Si falló: `{kind,
+        created: false, error, fields}`.
     """
     import rag  # lazy: avoid circular import at module load.
 
@@ -304,23 +305,45 @@ def propose_reminder(
     )
     needs_clarif = bool(when and when.strip()) and due is None
 
-    payload = {
-        "kind": "reminder",
-        "proposal_id": f"prop-{uuid.uuid4()}",
-        "fields": {
-            "title": title,
-            "due_iso": due.isoformat() if due else None,
-            "due_text": when or "",
-            "list": list,
-            "priority": priority,
-            "notes": notes,
-            "recurrence": recurrence,
-            "recurrence_text": recurrence_text,
-        },
+    fields = {
+        "title": title,
+        "due_iso": due.isoformat() if due else None,
+        "due_text": when or "",
+        "list": list,
+        "priority": priority,
+        "notes": notes,
+        "recurrence": recurrence,
+        "recurrence_text": recurrence_text,
     }
+
     if needs_clarif:
-        payload["needs_clarification"] = True
-    return json.dumps(payload, ensure_ascii=False)
+        # Ambiguous datetime → ask the user via the confirmation card.
+        return json.dumps({
+            "kind": "reminder",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "needs_clarification": True,
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    # Datetime is clean (or absent — an undated reminder is also valid).
+    # Create immediately; UI renders a toast with undo.
+    ok, reminder_id = rag._create_reminder(
+        title, list_name=list,
+        due_dt=due, priority=priority, notes=notes, recurrence=recurrence,
+    )
+    if not ok:
+        return json.dumps({
+            "kind": "reminder",
+            "created": False,
+            "error": reminder_id,
+            "fields": fields,
+        }, ensure_ascii=False)
+    return json.dumps({
+        "kind": "reminder",
+        "created": True,
+        "reminder_id": reminder_id,
+        "fields": fields,
+    }, ensure_ascii=False)
 
 
 def propose_calendar_event(
@@ -333,14 +356,15 @@ def propose_calendar_event(
     all_day: bool = False,
     recurrence_text: str | None = None,
 ) -> str:
-    """Proponer un evento de Calendar.app. NO lo crea — sólo registra una
-    propuesta que el usuario confirma en la tarjeta mostrada.
+    """Agregar un evento a Calendar.app. Si la fecha de inicio parsea clara,
+    se CREA automáticamente — el usuario ve un toast con botón Deshacer
+    por 10 segundos. Si es ambigua, vuelve como propuesta para que el
+    usuario aclare desde una tarjeta.
 
     Llamala cuando el usuario diga "creá un evento", "agendá una reunión",
-    "bloqueame un turno", "poné una cita". Si no hay hora de fin explícita,
-    el evento dura 1h por default. Si la fecha de inicio no parsea, el
-    campo queda null y `needs_clarification: true` — pedí aclaración en
-    vez de re-llamar la tool.
+    "bloqueame un turno", o en statement form ("mañana tengo daily
+    a las 10am", "el jueves hay standup"). No vuelvas a llamarla si ya lo
+    hiciste esta ronda.
 
     Args:
         title: Título / summary del evento.
@@ -350,10 +374,13 @@ def propose_calendar_event(
         location: Ubicación (string libre).
         notes: Descripción / notas del evento.
         all_day: Evento de día completo (ignora hora).
-        recurrence_text: Recurrencia en lenguaje natural. None = sin.
+        recurrence_text: Recurrencia en lenguaje natural.
 
     Returns:
-        JSON con el payload de la propuesta.
+        JSON con el resultado. Si se creó: `{kind, created: true,
+        event_uid, fields}`. Si hay que aclarar: `{kind, proposal_id,
+        needs_clarification: true, fields}`. Si falló: `{kind,
+        created: false, error, fields}`.
     """
     import rag
 
@@ -370,26 +397,46 @@ def propose_calendar_event(
     )
     needs_clarif = start_dt is None
 
-    payload = {
-        "kind": "event",
-        "proposal_id": f"prop-{uuid.uuid4()}",
-        "fields": {
-            "title": title,
-            "start_iso": start_dt.isoformat() if start_dt else None,
-            "start_text": start or "",
-            "end_iso": end_dt.isoformat() if end_dt else None,
-            "end_text": end or "",
-            "calendar": calendar,
-            "location": location,
-            "notes": notes,
-            "all_day": bool(all_day),
-            "recurrence": recurrence,
-            "recurrence_text": recurrence_text,
-        },
+    fields = {
+        "title": title,
+        "start_iso": start_dt.isoformat() if start_dt else None,
+        "start_text": start or "",
+        "end_iso": end_dt.isoformat() if end_dt else None,
+        "end_text": end or "",
+        "calendar": calendar,
+        "location": location,
+        "notes": notes,
+        "all_day": bool(all_day),
+        "recurrence": recurrence,
+        "recurrence_text": recurrence_text,
     }
+
     if needs_clarif:
-        payload["needs_clarification"] = True
-    return json.dumps(payload, ensure_ascii=False)
+        return json.dumps({
+            "kind": "event",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "needs_clarification": True,
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    ok, res = rag._create_calendar_event(
+        title, start_dt, end_dt,
+        calendar=calendar, location=location, notes=notes,
+        all_day=bool(all_day), recurrence=recurrence,
+    )
+    if not ok:
+        return json.dumps({
+            "kind": "event",
+            "created": False,
+            "error": res,
+            "fields": fields,
+        }, ensure_ascii=False)
+    return json.dumps({
+        "kind": "event",
+        "created": True,
+        "event_uid": res,
+        "fields": fields,
+    }, ensure_ascii=False)
 
 
 CHAT_TOOLS: list[Callable] = [

@@ -512,6 +512,20 @@ def _now_utc_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _round_timing_ms(timing: dict | None) -> dict | None:
+    """Round retrieval per-stage timings to integer milliseconds for logs.
+
+    retrieve() returns a `timing` dict of float-ms (sub-microsecond
+    precision from perf_counter). For `queries.jsonl` persistence we
+    want compact integer ms — micros aren't informative over the wire
+    and inflate the log by 30-40%. Returns None if input is falsy/None
+    so callers can feed the result straight into an event dict.
+    """
+    if not timing:
+        return None
+    return {k: int(round(v)) for k, v in timing.items() if isinstance(v, (int, float))}
+
+
 def _log_writer_loop() -> None:
     while True:
         item = _LOG_QUEUE.get()
@@ -10446,6 +10460,7 @@ def retrieve(
         return {
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
             "search_query": question, "filters_applied": {}, "query_variants": [question],
+            "timing": dict(_timing),
         }
 
     # 1. Reformulate vs history (precise mode)
@@ -10545,10 +10560,12 @@ def retrieve(
     _timing["rrf_ms"] = _rrf_ms
 
     if not merged_ordered:
+        _timing["total_ms"] = (time.perf_counter() - _t_retrieve_start) * 1000
         return {
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
             "search_query": search_query, "filters_applied": filters_applied,
             "query_variants": variants,
+            "timing": dict(_timing),
         }
 
     # 4b. Feedback signals (👍/👎 del usuario sobre queries similares previas).
@@ -10882,6 +10899,12 @@ def retrieve(
         "graph_docs": graph_docs,
         "graph_metas": graph_metas,
         "extras": extras,
+        # Per-stage timing breakdown (embed/sem/bm25/rrf/fetch/parent_expand/
+        # rerank/graph_expand/total — all in ms). Surfaced so callers can
+        # log it to queries.jsonl for latency regression analysis. Previously
+        # only emitted to stderr behind RAG_RETRIEVE_TIMING=1; now always
+        # available in-process so callers can decide what to persist.
+        "timing": dict(_timing),
     }
 
 
@@ -13505,6 +13528,12 @@ def query(
         "scores": [round(float(s), 2) for s in result["scores"]],
         "top_score": round(float(result["confidence"]), 2),
         "t_retrieve": round(t_retrieve, 2),
+        # Per-stage breakdown (embed/sem/bm25/rrf/fetch/parent_expand/rerank/
+        # graph_expand/total). Always logged post-2026-04-20 audit so latency
+        # regressions after `rag tune --apply` are diagnosable without re-
+        # running with RAG_RETRIEVE_TIMING=1. Round to int ms (micros aren't
+        # informative over the wire).
+        "timing": _round_timing_ms(result.get("timing")),
         "t_gen": round(t_gen, 2),
         "answer_len": len(full),
         "bad_citations": [p for _, p in bad],

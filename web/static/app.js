@@ -942,36 +942,57 @@ async function send(question) {
   let confidence = null;
   let metaShown = false;
   let aborted = false;
-  // Ticker for the `generating` stage — server fires one `status` event
-  // when it starts calling the LLM, then nothing until the first token
-  // arrives ~5-10s later. Pulsing dots alone feel frozen; a running
-  // counter + shifting copy signals forward motion + "ya llega" past
-  // the P50 threshold.
-  let generatingStart = 0;
-  let generatingTimer = null;
-  function stopGeneratingTicker() {
-    if (generatingTimer) {
-      clearInterval(generatingTimer);
-      generatingTimer = null;
+  // Live tickers for the two long waits (retrieve + generate). Server fires
+  // one `status` event per phase and then silence for 2-10s while the
+  // reranker + LLM chew. Without a running counter the dots look frozen
+  // after the first second. One ticker at a time — start a new phase and
+  // the previous stops. 200ms refresh = one decimal fidelity without
+  // shaking the layout (tabular-nums in CSS locks the glyph width).
+  let stageTimer = null;
+  let stageStart = 0;
+  function stopStageTicker() {
+    if (stageTimer) {
+      clearInterval(stageTimer);
+      stageTimer = null;
     }
   }
-  function startGeneratingTicker() {
-    stopGeneratingTicker();
-    generatingStart = performance.now();
+  function formatSecs(ms) {
+    // 1 decimal up to 9.9s, integer after — avoids visual noise past the
+    // threshold where sub-second fidelity stops being useful.
+    const s = ms / 1000;
+    return s < 10 ? s.toFixed(1) : Math.floor(s).toString();
+  }
+  function retrieveCopy(ms) {
+    const s = ms / 1000;
+    // Copy escalates at ~p50 and ~p95 retrieve latency so long tails feel
+    // acknowledged instead of hung. "búsqueda profunda" matches the
+    // auto-deep-retrieval branch in the backend (confidence < 0.10).
+    if (s < 3)  return `buscando · ${formatSecs(ms)}s`;
+    if (s < 8)  return `revisando notas · ${formatSecs(ms)}s`;
+    return `búsqueda profunda · ${formatSecs(ms)}s`;
+  }
+  function generateCopy(ms) {
+    const s = ms / 1000;
+    if (s < 3)  return `generando · ${formatSecs(ms)}s`;
+    if (s < 8)  return `generando · ${formatSecs(ms)}s`;
+    if (s < 15) return `casi listo · ${formatSecs(ms)}s`;
+    return `todavía trabajando · ${formatSecs(ms)}s`;
+  }
+  function startStageTicker(phase) {
+    stopStageTicker();
+    stageStart = performance.now();
+    const copyFn = phase === "generating" ? generateCopy : retrieveCopy;
     const tick = () => {
-      if (!thinking.isConnected) { stopGeneratingTicker(); return; }
-      const s = (performance.now() - generatingStart) / 1000;
-      const whole = Math.floor(s);
-      let copy;
-      if (s < 3) copy = "generando…";
-      else if (s < 8) copy = `generando… (${whole}s)`;
-      else if (s < 15) copy = `casi listo… (${whole}s)`;
-      else copy = `todavía trabajando… (${whole}s)`;
-      thinking.setAttribute("data-stage", copy);
+      if (!thinking.isConnected) { stopStageTicker(); return; }
+      const elapsed = performance.now() - stageStart;
+      thinking.setAttribute("data-stage", copyFn(elapsed));
     };
     tick();
-    generatingTimer = setInterval(tick, 500);
+    stageTimer = setInterval(tick, 200);
   }
+  // Legacy names kept for minimal diff at call sites below.
+  const stopGeneratingTicker = stopStageTicker;
+  const startGeneratingTicker = () => startStageTicker("generating");
   // Tool-call progress chips — persist across the thinking→token boundary
   // so `status {stage:"tool"}` events keep rendering after the dots
   // disappear. Chips are appended in fire order; duplicates across rounds
@@ -1123,11 +1144,15 @@ async function send(question) {
       clearToolChips();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
     } else if (event === "heartbeat") {
-      const elapsed = parsed.elapsed_s != null
-        ? `${parsed.elapsed_s.toFixed(1)}s`
-        : "";
-      const stage = parsed.stage === "generating" ? "generando" : "trabajando";
-      thinking.setAttribute("data-stage", `${stage}… (${elapsed})`);
+      // Server-side heartbeat is a liveness signal. Only act on it as a
+      // fallback if no client-side ticker is running for this phase (e.g.
+      // the `status` event that would start the ticker never arrived).
+      // Otherwise the local 200ms ticker produces smoother copy and the
+      // heartbeat would flicker it back to the server's 1s cadence.
+      if (!stageTimer) {
+        if (parsed.stage === "generating") startStageTicker("generating");
+        else startStageTicker("retrieving");
+      }
     } else if (event === "status") {
       if (parsed.stage === "tool") {
         const bar = ensureToolsBar();
@@ -1153,9 +1178,22 @@ async function send(question) {
         if (parsed.stage === "generating") {
           stopAllChipPulses();
           startGeneratingTicker();
+        } else if (parsed.stage === "retrieving") {
+          // Server emits `status {stage:"retrieving"}` at the very start
+          // of retrieve(); run the counter from there so the user sees
+          // exactly the time the pipeline has been working.
+          startStageTicker("retrieving");
+        } else if (parsed.stage === "cached") {
+          // Cache replay is sub-100ms end-to-end — no point showing a
+          // running counter. Give a quick visual cue and let the normal
+          // sources/token/done events tear down `thinking`.
+          stopStageTicker();
+          thinking.setAttribute("data-stage", "desde caché");
         } else {
-          stopGeneratingTicker();
-          thinking.setAttribute("data-stage", "buscando…");
+          // Unknown/unlabelled status (e.g. a future stage name) — fall
+          // back to the retrieve ticker. Guarantees the counter never
+          // stalls at a static label again.
+          if (!stageTimer) startStageTicker("retrieving");
         }
       }
     }

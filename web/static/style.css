@@ -477,6 +477,15 @@ html, body {
   color: var(--text-dim);
   margin-left: 6px;
   align-self: center;
+  /* Lock digit width so the counter doesn't shift neighbouring glyphs
+     every 200ms. tabular-nums is the standard OpenType feature for this;
+     font-variant-numeric is the portable spelling. */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  /* Soft fade on label swap (stage change → new content). The base layer
+     redraws instantly via `content`, but opacity transitions the visual
+     change. Keeps phase transitions feeling continuous instead of abrupt. */
+  transition: opacity var(--dur-fast, 120ms) var(--ease-out, ease-out);
 }
 
 @keyframes thinking-pulse {

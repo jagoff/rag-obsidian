@@ -6,7 +6,6 @@ See rag.py:_render_silent_errors_log + the `log` command.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 

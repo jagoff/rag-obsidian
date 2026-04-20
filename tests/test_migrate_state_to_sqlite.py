@@ -325,7 +325,8 @@ def test_summary_json_format(source_dir):
         {"ts": "2026-04-19T12:00:00", "q": "x", "cmd": "query"},
     ])
     # --summary is like dry-run but emits parseable JSON
-    import io, contextlib
+    import io
+    import contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = mig.main(["--source-dir", str(source_dir), "--summary", "--only", "queries", "--force"])

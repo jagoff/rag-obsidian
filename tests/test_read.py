@@ -1,6 +1,3 @@
-import io
-import json
-from pathlib import Path
 
 from rag import SqliteVecClient as _TestVecClient
 import pytest

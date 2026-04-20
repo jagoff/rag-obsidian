@@ -20,7 +20,6 @@ the minimal set of monkeypatches needed to reach the repair/critique block:
   - print_sources, find_related, render_related, new_turn_id → no-ops
 """
 import pytest
-import click
 from click.testing import CliRunner
 
 import rag

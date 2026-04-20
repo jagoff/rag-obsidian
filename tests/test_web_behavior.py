@@ -11,10 +11,8 @@ import json
 import re
 import threading
 import time
-import types
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request

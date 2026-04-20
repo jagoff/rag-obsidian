@@ -9,10 +9,8 @@ world- or group-readable.
 from __future__ import annotations
 
 import os
-import stat
 from pathlib import Path
 
-import pytest
 
 import rag
 

@@ -8,10 +8,8 @@
 No tocamos osascript real — monkeypatch de `_osascript` + `retrieve` + judge.
 """
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 
 import rag
 
@@ -234,7 +232,8 @@ def test_find_loops_auto_fetches_completed_reminders(monkeypatch, tmp_path):
     note = vault / "02-Areas" / "shopping.md"
     note.write_text("# Shopping\n\n- [ ] comprar pan\n")
     # Make the note recent so it's inside the window.
-    import os, time
+    import os
+    import time
     os.utime(note, (time.time(), time.time()))
 
     calls = {"fetched": 0}

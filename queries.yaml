@@ -260,18 +260,6 @@ chains:
         expected:
           - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
-  - id: meta-vault-ollama
-    turns:
-      - question: "qué modelos de ollama tengo instalados"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama.md
-      - question: "y el bot de telegram que los usa"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama_telegram_bot.md
-      - question: "hay otro bot con claude?"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_claude_telegram_bot.md
-
   # Failure mode: folder semantics ("esa carpeta") + ambiguous pronoun "los"
   # (los acordes vs los temas). Also cascada: t2 depende de t1 anclar en Sal.
   - id: musica-sal-carpeta

@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 import yaml
-from click.testing import CliRunner
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +30,7 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
             for p in turn.get("expected") or []:
                 if not (vault / p).is_file():
                     missing.append(p)
-    assert not missing, f"Expected paths missing from vault:\n  " + "\n  ".join(missing[:10])
+    assert not missing, "Expected paths missing from vault:\n  " + "\n  ".join(missing[:10])
 
 
 def test_queries_yaml_has_underrepresented_folders():
@@ -75,7 +74,6 @@ def test_bootstrap_ci_basic_shape():
             "docs": [""], "scores": [0.1],
         }
 
-    import types
     # Create a temp queries file with 6 queries → CI should compute
     import tempfile
     with tempfile.TemporaryDirectory() as td:

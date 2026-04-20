@@ -10,7 +10,6 @@ quedarse offline y validar el comportamiento de:
   - log appendea evento con `whatsapp_sent` bool
 """
 import json
-from pathlib import Path
 
 import pytest
 

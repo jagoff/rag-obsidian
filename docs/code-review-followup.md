@@ -1,47 +1,98 @@
 # Code review — pending items
 
-Tracking file for the `code-review` branch audit (19 commits total).
-Everything below was flagged in the initial review but deferred from the
-main pass; keep as backlog for future iterations.
+**Status: all cleared.** Historical record only — the 3 deferred items
+from the initial `code-review` branch audit (19 commits) have now been
+addressed. Kept as documentation of the rationale + the false-positive
+triage from the subagent review.
 
-## Deferred — non-trivial scope
+## Resolved — previously deferred
 
-### 1. `except Exception: pass` audit (~100 sites)
-**Finding**: rag.py has ~100 silent exception swallows. Many are intentional
-(best-effort logging, cache invalidation, optional enrichment) but some
-mask real bugs: contradict detector JSON parse, reranker unload, feedback
-golden rebuild, `_rebuild_feedback_golden`.
+### 1. `except Exception: pass` audit  — resolved
 
-**Why deferred**: sweeping the 100 call sites risks behavioural regressions
-in subsystems I didn't verify. P0/P1 sites that had real data-loss
-consequences were already addressed (SQL fallback + dead-letter, retry
-queue for conversation turns, synthetic_questions sentinel).
+**Original finding**: rag.py had ~120 silent exception swallows. Most
+were intentional (best-effort logging, cache invalidation, optional
+enrichment) but a subset could mask real bugs at P0/P1 sites.
 
-**Suggested approach** for a follow-up: add a `_silent_log(where, exc)`
-helper that logs at WARN via `_LOG_QUEUE` instead of `pass`. Migrate the
-~20 call sites that can't be clearly categorised as "best-effort
-ignore" — leave the rest as documented intent.
+**What shipped** (`observability: _silent_log helper + migrate 21
+critical except Exception sites`):
 
-### 2. Watch debounce race tests
-**Finding**: `rag.py:12579` — `watch()` embeds the `Handler`
-class + debounce loop directly in the CLI command body. Exception
-recovery in `_index_single_file` is handled (`try/except Exception`
-inside the loop), but there are no tests for:
-- rapid file saves during debounce window
-- observer exception recovery
-- observer.stop() cleanup under load
+- New `_silent_log(where, exc)` helper near the `_LOG_QUEUE` definition
+  — records one JSON line per swallowed exception to
+  `~/.local/share/obsidian-rag/silent_errors.jsonl` via the same
+  non-blocking daemon thread that serves `queries.jsonl` / `behavior.jsonl`.
+  Contract: helper never raises; callers keep their silent-fail semantics.
+- Migrated 21 data-loss-adjacent sites: collection ops audit log,
+  brief_state read+write, diff_brief_signal, session load/list/last,
+  context + synthetic-q caches, **ranker.json load** (silent revert to
+  defaults is user-invisible), **feedback.jsonl write** (explicit user
+  feedback loss), **feedback golden rebuild** (including the zero-vec
+  embed fallback that was silently poisoning the ranker with 1-dim
+  vectors on ollama outages), **contradict detector** (both helper-chat
+  timeout and JSON parse fail — two sites the review explicitly called
+  out), and **reranker unload** (called out by name).
+- CLI surface: `rag log --silent-errors [--summary]` — list or aggregate
+  by (`where` × `exc_type`). Pattern-matching reveals e.g. 50 identical
+  `JSONDecodeError`s under `synthetic_q_cache_load` → cache is corrupt;
+  delete + move on.
+- Tests: `tests/test_silent_log.py` (5 cases: happy path, long-message
+  truncation, serialisation failure, queue-full failure, 10-thread
+  concurrent writes — all 100 lines parseable) +
+  `tests/test_silent_errors_log.py` (6 cases covering the CLI render).
 
-**Why deferred**: testing properly requires extracting the handler +
-debounce loop to a unit-testable function, which is a non-trivial refactor
-of a stable, production-proven code path. The existing
-`_index_single_file` error handling is correct; the gap is test
-coverage, not behaviour.
+**Sites left as bare `pass`** (genuinely best-effort — noise to log):
+- Optional enrichment (Calendar, Reminders, Mail, Screen Time, weather).
+- Cache-invalidation cleanups during shutdown; `atexit` best-effort sink.
+- HTTP posts to bridges that may be down (whatsapp-bridge).
+- chmod on NFS/SMB/FUSE (already documented intent in
+  `_ensure_state_dir_secure`).
+- Narrow numeric-parse catches (`except (TypeError, ValueError, IndexError)`)
+  on per-event fields like behavior.dwell_ms / ts-hour extract — logging
+  each would produce N lines per query.
 
-### 3. Marked package upgrade check
-**Finding**: `web/static/vendor/marked.min.js` is a vendored copy of an
-unknown version. The XSS hardening added in `P2.15` (renderer.html override
-+ _sanitizeHtml) makes this a non-blocker, but periodic re-vendoring is
-still good hygiene.
+### 2. Watch debounce race tests — resolved
+
+**Original finding**: `watch()` embedded the `Handler` class + debounce
+loop directly in the CLI command body. Three edge cases lacked tests:
+rapid file saves during the debounce window, per-file exception recovery,
+observer cleanup under load.
+
+**What shipped** (`test: add tests/test_silent_log.py +
+tests/test_watch.py`):
+
+- Extracted two pure helpers so the logic is testable without spawning
+  a real `watchdog.Observer`:
+  - `_watch_filter_path(raw_path, vault_path, exclude_folders)` — the
+    `.md` + under-vault + exclude-folder filter that used to live in
+    `Handler._queue`. Returns `Path | None`. Never raises on malformed
+    paths (matches original `try/except ValueError: return`).
+  - `_watch_drain_once(vstate, pending_lock)` — drains one vault's
+    pending set, calls `_index_single_file` per file, returns a list
+    of `(name, status, rel_path, err)` tuples. **Per-file errors never
+    abort the batch** (explicit test).
+- `watch()` CLI now delegates to both helpers; the visible behaviour of
+  the debounce loop + console rendering is unchanged.
+- Tests: `tests/test_watch.py` — 14 cases:
+  - 7 filter tests (accept `.md`, reject non-`.md`, reject outside
+    vault, reject excluded folder, prefix-only match guard,
+    folder-itself match, tolerate nonexistent path for deletes).
+  - 7 drain tests: empty pending no-op, status propagation, **per-file
+    error continuation**, vault-relative rendering, absolute-path
+    fallback, **rapid-save dedup via set** (3 files × 20 adds → 3
+    indexes), **thread-safe against concurrent producer** (drain twice
+    while a thread keeps queueing — no loss, no duplicates).
+
+### 3. `marked.min.js` re-vendor — resolved
+
+**Original finding**: `web/static/vendor/marked.min.js` was a vendored
+copy of v14.1.3. XSS hardening made this non-blocking but periodic
+re-vendoring is good hygiene.
+
+**What shipped**: updated to **v18.0.2** (latest, 2026-04 release) from
+jsdelivr's UMD build. File grew 36 KB → 42 KB. Renderer API (token-based
+`link({ href, title, tokens })` + `html({ text })` overrides) is stable
+across v4 through v18 — verified with a direct Node smoke test against
+the existing renderer config in `web/static/app.js`. The belt-and-
+suspenders `_sanitizeHtml` DOM walker is unchanged.
 
 ## False positives from the subagent review
 
@@ -66,9 +117,7 @@ non-issues:
   The `rag_cpu_metrics`, `rag_memory_metrics`, and `system_memory_metrics`
   tables are already in `_SQL_ROTATION_POLICY` (rag.py:25690-25704).
 
-## What shipped
-
-19 commits on `code-review`:
+## What shipped — cumulative
 
 **P0 (critical, shipped)**
 - SQL-first / disk-second in `_write_turn_body` (conversation atomicity)
@@ -95,5 +144,21 @@ non-issues:
 - Two anti-pattern tests tightened (citation-repair stream assertion,
   concurrent writers turn-order assertion)
 
-**Test suite**: 1155 passed / 1 failed (vault-dependent test unrelated
-to any change here). Previous master baseline: 1121 passed / 7 failed.
+**Followup items (now also shipped)**
+- `_silent_log` helper + 21 migrated sites + `rag log --silent-errors`
+  CLI + 11 tests across two files
+- `_watch_filter_path` + `_watch_drain_once` extraction + 14 tests
+- `marked.min.js` re-vendored from v14.1.3 to v18.0.2
+
+**Security + hygiene (landed alongside the followup)**
+- 0o700 state dir + 0o600 OAuth token writes (+ 6 tests)
+- TOCTOU fix in reranker idle-unload
+- Composite SQL indexes on `rag_queries(session,ts)` + `rag_behavior(path,ts)`
+- Dependabot weekly pip + monthly github-actions scans
+- Removed dead `main.py` uv-init stub
+- Corrected drift in CLAUDE.md (line counts, test counts, pipeline facts)
+
+**Test suite**: 1210 passed / 0 failed. Previous master baseline:
+1121 passed / 7 failed; mid-branch baseline (before this pass): 1203
+passed / 1 failed (vault-unrelated chain referencing dead notes —
+queries.yaml pruned as part of this batch).

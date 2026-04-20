@@ -159,22 +159,31 @@ _PROPOSE_INTENT_RE = re.compile(
     r"|\bagend[aá]me\b"
     r"|\bpon[eé](?:me|te|le)?\s+(?:un\s+)?recordatorio\b"
     r"|\bagreg(?:á|a|ar)\s+(?:un\s+)?recordatorio\b"
-    # Calendar triggers. Require a create verb + event noun to avoid
-    # matching queries like "qué eventos tengo" (already covered by
+    # Calendar triggers (create verb + event noun). Require the noun to
+    # avoid matching queries like "qué eventos tengo" (already covered by
     # calendar_ahead read-intent).
     r"|\b(?:cre[aá]|crear|agend[aá]|bloque[aá]|pon[eé]|agreg[aá])\b"
     r"[^.?!]*"
-    r"\b(?:evento|reuni[oó]n|cita|turno|llamad[ao]|meeting|appointment)\b",
+    r"\b(?:evento|reuni[oó]n|cita|turno|llamad[ao]|meeting|appointment)\b"
+    # Calendar-specific verbs that carry create intent on their own —
+    # "calendarizalo", "agendalo/agendala/agendame/agendar", "anotá en el
+    # calendario/agenda", "poné en el calendario/agenda". No event noun
+    # required because these verbs directly mean "put this in the calendar".
+    r"|\bcalendariz(?:á|ar|arl[oa]|al[oa]|ame|armel[oa]|amel[oa])\b"
+    r"|\bagend[aá](?:l[oa]|ame(?:l[oa])?|r|ar)\b"
+    r"|\banot(?:á|ame|arl[oa]|al[oa])\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b"
+    r"|\bpon(?:é|el[oa]|eme|ele)\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b",
     re.IGNORECASE,
 )
 
 # Implicit CREATE patterns — statement-of-fact form ("mañana tengo X", "hay
-# Y el jueves", "me citaron para Z"). Users speak this way constantly in
-# rioplatense when recording something that's going to happen. Detect via
-# the combination of (event noun) + (temporal anchor) + NOT starting with
-# a question word. Each signal in isolation is too noisy — together they
-# reliably separate "mañana tengo daily" (create) from "qué tengo mañana"
-# (query) and from "tengo hambre" (neither).
+# Y el jueves", "me citaron para Z", "mañana viene Z a casa"). Users speak
+# this way constantly in rioplatense when recording something that's going
+# to happen. Detect via the combination of (event noun OR visit-pattern) +
+# (temporal anchor) + NOT starting with a question word. Each signal in
+# isolation is too noisy — together they reliably separate "mañana tengo
+# daily" (create) from "qué tengo mañana" (query) and from "tengo hambre"
+# (neither).
 _EVENT_NOUN_RE = re.compile(
     r"\b(?:reuni[oó]n|evento|cita|turno|llamada|daily|stand-?up|meeting|"
     r"entrevista|\bcall\b|sync|retro(?:spectiva)?|planning|demo|all.?hands|"
@@ -182,6 +191,15 @@ _EVENT_NOUN_RE = re.compile(
     r"sesi[oó]n|taller|workshop|webinar|conferencia|almuerzo|cena|show|"
     r"concierto|partido|cumplea[ñn]os|aniversario|viaje|vuelo|appointment|"
     r"1:1|1on1|one.?on.?one|uno.?a.?uno)\b",
+    re.IGNORECASE,
+)
+
+# Visit / arrival pattern — "viene X", "pasa por casa", "llega Y". When
+# combined with a temporal anchor this is a create intent even without an
+# explicit event noun. "Mañana viene gracia a casa" → calendar event.
+_VISIT_PATTERN_RE = re.compile(
+    r"\b(?:viene|vienen|viene\s+a|pasa|pasan|llega|llegan|visit[ao]|"
+    r"trae|traen|trae\s+a|recojo|recoger|buscamos|busco|busc[aá]n)\b",
     re.IGNORECASE,
 )
 
@@ -198,8 +216,8 @@ _TEMPORAL_ANCHOR_RE = re.compile(
 )
 
 _QUESTION_START_RE = re.compile(
-    r"^\s*(?:qu[eé]|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|d[oó]nde|c[oó]mo|"
-    r"por\s+qu[eé]|a\s+qu[eé]|de\s+qu[eé])\b",
+    r"^\s*(?:qu[eé]|qui[eé]n(?:es)?|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|"
+    r"d[oó]nde|c[oó]mo|por\s+qu[eé]|a\s+qu[eé]|de\s+qu[eé])\b",
     re.IGNORECASE,
 )
 
@@ -207,12 +225,18 @@ _QUESTION_START_RE = re.compile(
 def _detect_propose_intent(q: str) -> bool:
     """Return True if `q` looks like a CREATE request (reminder or event).
 
-    Two branches:
+    Three branches:
       1. Explicit create verb (`_PROPOSE_INTENT_RE`) — covers
-         "recordame X", "creá un evento Y", etc.
-      2. Implicit statement form — event noun AND temporal anchor AND
+         "recordame X", "creá un evento Y", "calendarizalo", "agendalo",
+         "anotá en el calendario", etc.
+      2. Statement with event noun — event noun AND temporal anchor AND
          the sentence isn't a question. Covers "mañana tengo daily",
          "hay standup el jueves 10hs", "me citaron para entrevista".
+      3. Statement with visit pattern — "viene/pasa/llega/visita X" AND
+         temporal anchor AND not a question. Covers "mañana viene gracia
+         a casa", "el jueves pasa Juan por el estudio". "Visita" alone
+         already matches branch 2 as event noun; this branch catches
+         the verb form where no explicit event noun appears.
 
     Used by the chat endpoint to force the LLM tool-decide round even
     when RAG_WEB_TOOL_LLM_DECIDE is unset — proposal tools can only be
@@ -222,12 +246,16 @@ def _detect_propose_intent(q: str) -> bool:
         return False
     if _PROPOSE_INTENT_RE.search(q):
         return True
-    # Implicit branch. Question-word start disqualifies ("qué reuniones
-    # tengo" is a query, not create). Both event noun AND temporal must
-    # appear — either alone is too ambiguous.
+    # Implicit branches. Question-word start disqualifies ("qué reuniones
+    # tengo" is a query, not create).
     if _QUESTION_START_RE.match(q):
         return False
-    if _EVENT_NOUN_RE.search(q) and _TEMPORAL_ANCHOR_RE.search(q):
+    has_temporal = bool(_TEMPORAL_ANCHOR_RE.search(q))
+    if not has_temporal:
+        return False
+    if _EVENT_NOUN_RE.search(q):
+        return True
+    if _VISIT_PATTERN_RE.search(q):
         return True
     return False
 

@@ -199,6 +199,17 @@ def test_calendar_create_creator_fails(client, monkeypatch):
     "me citaron para una entrevista el viernes a las 3",
     "el lunes que viene tengo call con el cliente",
     "mañana hay demo a las 16hs",
+    # NEW: explicit calendar-action verbs (no event noun required).
+    "el miercoles viene gracia a casa, calendarizalo",
+    "calendarizame una reunión mañana",
+    "agendalo el jueves",
+    "agendala para el viernes",
+    "anotá en el calendario el turno del jueves",
+    "poné en la agenda la reunión del viernes 10am",
+    # NEW: visit/arrival pattern (viene/pasa/llega X + temporal).
+    "mañana pasa el plomero a casa",
+    "el jueves llega mi vieja",
+    "mañana viene mi hermana a casa",
 ])
 def test_detect_propose_intent_positive(q):
     assert web_server._detect_propose_intent(q) is True
@@ -213,9 +224,13 @@ def test_detect_propose_intent_positive(q):
     "mostrame los recordatorios",
     "cuándo es la próxima reunión",
     "dónde es la reunión",
+    # NEW: question-word forms that look like create-intent but aren't.
+    "quién viene mañana",
+    "quiénes vienen el jueves",
+    "cuándo viene el plomero",
     # Bare event noun without temporal → not enough signal
     "tengo reunión",
-    # Temporal without event noun → could be anything
+    # Temporal without event noun or visit pattern → ambiguous
     "el jueves a las 4",
     "",
     None,

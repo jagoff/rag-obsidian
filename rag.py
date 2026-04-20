@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Obsidian RAG — semantic chunking, title prefix, HyDE, hybrid BM25+semantic, reranking."""
 
+import os as _os_bootstrap
+
+# Pin HF/transformers into offline mode BEFORE any import that transitively
+# pulls huggingface_hub. huggingface_hub reads these envs at module-init and
+# caches the offline flag globally; setting them later (inside a lazy loader)
+# leaves a client that tries HEAD requests and fails on air-gapped setups.
+# Only opt in when the web server has RAG_LOCAL_EMBED=1 — keeps the indexing
+# path (which uses ollama for embeds) unaffected.
+if _os_bootstrap.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
+    _os_bootstrap.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os_bootstrap.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import atexit
 import contextlib
 import csv
@@ -12,6 +24,7 @@ import queue
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -1124,17 +1137,49 @@ MAX_CHUNK = 800    # chars — bge-m3 accepts ~2048 tokens; 800 chars ≈ 200 to
                    # sweet spot: enough context per chunk, prefix doesn't dominate
 
 def is_excluded(rel_path: str) -> bool:
-    """Skip hidden paths and Claude Code skill backing store.
+    """Skip hidden paths, system-backed folders and auto-generated content.
 
     - Dotfolders (.trash/, .obsidian/, .git/): system/hidden by convention.
-    - 99-Claude/skills/: these live under the vault via symlink chain
+    - 99-Claude/skills/: live under the vault via symlink chain
       (~/.claude/skills → ~/.agents/skills → vault) for Claude Code to consume.
-      They are skill definitions/rules, not user notes — indexing them pollutes
-      tag/folder stats and surfaces irrelevant chunks in retrieval.
+      Skill definitions/rules, not user notes — redundant with the broader
+      99-obsidian-system rule below but kept as belt-and-suspenders for paths
+      that may live outside 04-Archive via other symlink targets.
+    - 04-Archive/99-obsidian-system/*: Obsidian system folders (99-Attachments,
+      99-Canvas, 99-Claude, 99-Daily routine, 99-Forms, 99-Templates) — binary
+      assets, template scaffolding, plugin data. 99-Mentions is the ONE
+      exception: those are per-person dossiers that enrich retrieval via
+      `build_person_context()` and should stay indexed so they also surface
+      through normal search.
+    - 03-Resources/Claude/<slug>/: auto-generated Claude Code session
+      transcripts (280+ files, one per `~/.claude/projects/<slug>/*.jsonl`).
+      Written by `_sync_claude_code_transcripts`. They pollute retrieval with
+      low-signal CLI back-and-forth and dilute real note matches. User-authored
+      notes at the TOP LEVEL of 03-Resources/Claude/ (Claude Peers prompts,
+      command cheatsheets) stay indexed — only the generated subfolders are
+      filtered.
+    - 00-Inbox/conversations/: episodic chat transcripts written by the web
+      server after each `/api/chat` turn. Originally indexed so past turns
+      were retrievable — but we observed a toxic feedback loop (2026-04-20):
+      when the LLM gives a wrong answer, the turn is saved and reindexed
+      within ~3s, then the next identical query retrieves that bad answer as
+      the top match and parrots it. The LLM's own hallucinations become
+      ground truth. Excluding them breaks the loop; to keep a past turn
+      searchable, curate it by moving the relevant content into PARA.
     """
     if any(seg.startswith(".") for seg in rel_path.split("/") if seg):
         return True
     if "/99-Claude/skills/" in f"/{rel_path}":
+        return True
+    system_prefix = "04-Archive/99-obsidian-system/"
+    if rel_path.startswith(system_prefix) and not rel_path.startswith(
+        system_prefix + "99-Mentions/"
+    ):
+        return True
+    claude_prefix = "03-Resources/Claude/"
+    if rel_path.startswith(claude_prefix) and "/" in rel_path[len(claude_prefix):]:
+        return True
+    if rel_path.startswith("00-Inbox/conversations/"):
         return True
     return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
@@ -1202,6 +1247,20 @@ def _save_context_cache() -> None:
 
 
 _SUMMARY_CLIENT: ollama.Client | None = None
+_INDEX_CHAT_CLIENT: ollama.Client | None = None
+
+
+def _index_chat_client() -> ollama.Client:
+    """Cached `ollama.Client(timeout=120)` for index-time chat calls.
+    Wraps `find_contradictions_for_note`'s LLM call so a stuck Ollama
+    (cold-load contention while watch + web pin other models) can't hang
+    the whole rglob. The 120s ceiling is generous for cold-load (qwen2.5:7b
+    typically <30s) and fails fast on real saturation.
+    """
+    global _INDEX_CHAT_CLIENT
+    if _INDEX_CHAT_CLIENT is None:
+        _INDEX_CHAT_CLIENT = ollama.Client(timeout=120.0)
+    return _INDEX_CHAT_CLIENT
 
 
 def _summary_client() -> ollama.Client:
@@ -4533,6 +4592,1275 @@ def _sync_moze_notes(vault_root: Path) -> dict:
     }
 
 
+_WHATSAPP_ETL_SCRIPT = Path.home() / ".local/bin/whatsapp-to-vault"
+_WHATSAPP_ETL_RE = re.compile(
+    r"wrote\s+(\d+)\s+files,\s+(\d+)\s+unchanged,\s+(\d+)\s+\(chat, month\)\s+buckets,\s+(\d+)\s+chats"
+)
+
+
+def _sync_whatsapp_notes(vault_root: Path) -> dict:
+    """Trigger the WhatsApp → vault ETL script and parse its summary line.
+
+    Mirrors the MOZE pre-index pattern: produces `.md` files in
+    `<vault>/03-Resources/WhatsApp/<chat>/YYYY-MM.md` so the regular rglob
+    picks them up. Subprocess to keep it as a single source of truth — the
+    same script that the `com.fer.whatsapp-vault-sync` launchd plist runs
+    every 15 min. Silent-fail when the script is missing (other machines).
+    """
+    if not _WHATSAPP_ETL_SCRIPT.is_file():
+        return {"ok": False, "reason": "script_missing"}
+    try:
+        proc = subprocess.run(
+            [str(_WHATSAPP_ETL_SCRIPT)],
+            capture_output=True, timeout=60, text=True,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "reason": str(exc)[:120]}
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return {"ok": False, "reason": err[:160] or f"rc={proc.returncode}"}
+    m = _WHATSAPP_ETL_RE.search(out)
+    if not m:
+        return {"ok": True, "raw": out[:160]}
+    return {
+        "ok": True,
+        "files_written": int(m.group(1)),
+        "files_unchanged": int(m.group(2)),
+        "buckets": int(m.group(3)),
+        "chats": int(m.group(4)),
+        "target": "03-Resources/WhatsApp",
+    }
+
+
+# ── External-source ETLs ─────────────────────────────────────────────────────
+# Same pattern as MOZE / WhatsApp: produce `.md` files inside the vault so the
+# regular `_run_index` rglob absorbs them. Each helper is silent-fail and
+# returns a stats dict for logging. Triggered from `_run_index` after the
+# WhatsApp sync, before the vault scan.
+
+_REMINDERS_VAULT_SUBPATH = "03-Resources/Reminders"
+_CALENDAR_VAULT_SUBPATH = "03-Resources/Calendar"
+_CHROME_VAULT_SUBPATH = "03-Resources/Chrome"
+_YOUTUBE_VAULT_SUBPATH = "03-Resources/YouTube"
+_GMAIL_VAULT_SUBPATH = "03-Resources/Gmail"
+_GDRIVE_VAULT_SUBPATH = "03-Resources/GoogleDrive"
+_GITHUB_VAULT_SUBPATH = "03-Resources/GitHub"
+_CLAUDE_VAULT_SUBPATH = "03-Resources/Claude"
+_YOUTUBE_TRANSCRIPTS_SUBPATH = "03-Resources/YouTube/transcripts"
+_SPOTIFY_VAULT_SUBPATH = "03-Resources/Spotify"
+_SPOTIFY_CREDS_PATH = Path.home() / ".config/obsidian-rag/spotify_client.json"
+_SPOTIFY_TOKEN_PATH = Path.home() / ".config/obsidian-rag/spotify_token.json"
+_SPOTIFY_SCOPES = "user-read-recently-played user-top-read"
+_SPOTIFY_TOP_TTL_DAYS = 7  # weekly refresh of _top.md
+
+# OAuth keys: reuse the gmail-mcp client config so the user doesn't manage two
+# Google Cloud OAuth apps. Token is stored in our own config dir so the
+# scopes (gmail + drive readonly) are independent of gmail-mcp's own token.
+_GOOGLE_KEYS_CANDIDATES = (
+    Path.home() / ".config/obsidian-rag/google_credentials.json",
+    Path.home() / ".gmail-mcp/gcp-oauth.keys.json",
+)
+_GOOGLE_TOKEN_PATH = Path.home() / ".config/obsidian-rag/google_token.json"
+_GOOGLE_SCOPES = (
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+)
+
+_CHROME_HISTORY_PATH = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+# Chrome epoch is 1601-01-01 UTC microseconds (Windows FILETIME).
+_CHROME_EPOCH_OFFSET_S = 11644473600
+# URL prefixes / patterns we never want indexed — they're navigation noise,
+# not "things you read". chrome:// and about: are internal pages; google
+# search result pages are deduped to the underlying click target by the user
+# clicking through (we capture that separately).
+_CHROME_SKIP_PREFIXES = (
+    "chrome://", "chrome-extension://", "about:", "edge://", "view-source:",
+    "data:", "javascript:", "file:///",
+)
+_CHROME_SKIP_PATTERNS = (
+    re.compile(r"^https?://(www\.)?google\.[^/]+/search\?"),
+    re.compile(r"^https?://(www\.)?google\.[^/]+/url\?"),
+    re.compile(r"^https?://(www\.)?bing\.com/search\?"),
+    re.compile(r"^https?://(duckduckgo\.com|search\.brave\.com)/\?"),
+)
+_YOUTUBE_WATCH_RE = re.compile(r"^https?://(www\.|m\.)?youtube\.com/watch\?(?:.*&)?v=([\w\-]+)")
+
+
+def _atomic_write_if_changed(target: Path, body: str) -> bool:
+    """Write `body` to `target` only if its contents changed. Returns True on
+    write, False on skip. Indexing relies on hash-skip — rewriting bytes that
+    haven't changed forces re-embed for nothing.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            if target.read_text(encoding="utf-8") == body:
+                return False
+        except OSError:
+            pass
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, target)
+    return True
+
+
+def _sync_reminders_notes(vault_root: Path) -> dict:
+    """Snapshot Apple Reminders to a daily note. Pending only, horizon 180 days
+    + undated. Completed-reminders fetch is intentionally NOT included: even
+    with a `completion date > cutoff` clause AppleScript iterates every
+    completed reminder ever (~70s observed). Pending alone is the live picture.
+    """
+    if not _apple_enabled():
+        return {"ok": False, "reason": "apple_disabled"}
+    now = datetime.now()
+    pending = _fetch_reminders_due(now, horizon_days=180, max_items=500)
+    completed: list[dict] = []  # see docstring
+    if not pending:
+        return {"ok": True, "files_written": 0, "reason": "no_data"}
+
+    by_bucket: dict[str, list[dict]] = {}
+    for item in pending:
+        by_bucket.setdefault(item["bucket"], []).append(item)
+
+    today = now.strftime("%Y-%m-%d")
+    fm_lines = [
+        "---",
+        "source: apple-reminders",
+        f"snapshot_at: {now.isoformat(timespec='seconds')}",
+        f"pending_count: {len(pending)}",
+        "tags:",
+        "- apple-reminders",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Apple Reminders — {today}",
+        "",
+    ]
+    body_lines: list[str] = list(fm_lines)
+    for bucket_key, label in (
+        ("overdue", "Overdue"),
+        ("today", "Hoy"),
+        ("upcoming", "Próximos"),
+        ("undated", "Sin fecha"),
+    ):
+        items = by_bucket.get(bucket_key) or []
+        if not items:
+            continue
+        body_lines.append(f"## {label} ({len(items)})")
+        body_lines.append("")
+        for it in items:
+            due = it["due"] or "—"
+            list_tag = f" `[{it['list']}]`" if it.get("list") else ""
+            body_lines.append(f"- **{it['name']}** · {due}{list_tag}")
+        body_lines.append("")
+    body = "\n".join(body_lines)
+
+    target = vault_root / _REMINDERS_VAULT_SUBPATH / f"{today}.md"
+    written = _atomic_write_if_changed(target, body)
+    return {
+        "ok": True,
+        "files_written": 1 if written else 0,
+        "pending": len(pending),
+        "completed": 0,
+        "target": _REMINDERS_VAULT_SUBPATH,
+    }
+
+
+def _sync_apple_calendar_notes(vault_root: Path, days_ahead: int = 90) -> dict:
+    """Snapshot upcoming Apple Calendar events to per-week notes. Requires
+    icalBuddy (`brew install ical-buddy`); returns silently when missing.
+    """
+    if not _apple_enabled():
+        return {"ok": False, "reason": "apple_disabled"}
+    if not _icalbuddy_path():
+        return {"ok": False, "reason": "icalbuddy_missing"}
+    events = _fetch_calendar_ahead(days_ahead=days_ahead, max_events=200)
+    if not events:
+        return {"ok": True, "files_written": 0, "reason": "no_events"}
+    now = datetime.now()
+    iso_year, iso_week, _ = now.isocalendar()
+    week_label = f"{iso_year}-W{iso_week:02d}"
+
+    fm_lines = [
+        "---",
+        "source: apple-calendar",
+        f"snapshot_at: {now.isoformat(timespec='seconds')}",
+        f"window_days: {days_ahead}",
+        f"event_count: {len(events)}",
+        "tags:",
+        "- apple-calendar",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Calendar — semana {week_label} (próximos {days_ahead}d)",
+        "",
+    ]
+    body_lines: list[str] = list(fm_lines)
+    current_label = None
+    for ev in events:
+        label = ev.get("date_label") or "(sin fecha)"
+        if label != current_label:
+            body_lines.append(f"## {label}")
+            body_lines.append("")
+            current_label = label
+        time_range = ev.get("time_range") or ""
+        time_part = f"`{time_range}` · " if time_range else ""
+        body_lines.append(f"- {time_part}{ev.get('title', '(sin título)')}")
+    body_lines.append("")
+    body = "\n".join(body_lines)
+
+    target = vault_root / _CALENDAR_VAULT_SUBPATH / f"{week_label}.md"
+    written = _atomic_write_if_changed(target, body)
+    return {
+        "ok": True,
+        "files_written": 1 if written else 0,
+        "events": len(events),
+        "target": _CALENDAR_VAULT_SUBPATH,
+    }
+
+
+def _chrome_to_unix_ts(chrome_us: int) -> float:
+    return (chrome_us / 1_000_000.0) - _CHROME_EPOCH_OFFSET_S
+
+
+def _unix_to_chrome_ts(unix_s: float) -> int:
+    return int((unix_s + _CHROME_EPOCH_OFFSET_S) * 1_000_000)
+
+
+def _read_chrome_visits(history_db: Path, hours: int = 48) -> list[dict]:
+    """Read distinct URLs visited in the last `hours` from Chrome History.
+    Chrome locks the SQLite while the browser runs — we copy to /tmp and read
+    the snapshot. Empty list on any error.
+    """
+    if not history_db.is_file():
+        return []
+    import shutil
+    import sqlite3 as _sqlite3
+    import tempfile
+    tmp = Path(tempfile.gettempdir()) / "obsidian-rag-chrome-history.db"
+    try:
+        shutil.copy2(history_db, tmp)
+    except OSError:
+        return []
+    try:
+        con = _sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        con.row_factory = _sqlite3.Row
+        cutoff = _unix_to_chrome_ts(time.time() - hours * 3600)
+        rows = con.execute(
+            "SELECT url, title, visit_count, last_visit_time "
+            "FROM urls WHERE last_visit_time > ? "
+            "ORDER BY last_visit_time DESC",
+            (cutoff,),
+        ).fetchall()
+        con.close()
+    except _sqlite3.Error:
+        return []
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in rows:
+        url = (r["url"] or "").strip()
+        if not url or url in seen:
+            continue
+        if any(url.startswith(p) for p in _CHROME_SKIP_PREFIXES):
+            continue
+        if any(p.match(url) for p in _CHROME_SKIP_PATTERNS):
+            continue
+        seen.add(url)
+        out.append({
+            "url": url,
+            "title": (r["title"] or "").strip() or url,
+            "visit_count": int(r["visit_count"] or 0),
+            "ts": _chrome_to_unix_ts(int(r["last_visit_time"] or 0)),
+        })
+    return out
+
+
+def _sync_chrome_history(vault_root: Path, hours: int = 48) -> dict:
+    """Daily snapshot of Chrome history (last `hours`, dedup by exact URL).
+    Also derives a YouTube-only note from URLs matching watch?v=… so YouTube
+    activity surfaces independently in retrieval. Hash-skipped when content
+    matches the existing day file.
+    """
+    visits = _read_chrome_visits(_CHROME_HISTORY_PATH, hours=hours)
+    if not visits:
+        return {"ok": False, "reason": "no_visits_or_chrome_locked"}
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
+    chrome_fm = [
+        "---",
+        "source: chrome-history",
+        f"snapshot_at: {now.isoformat(timespec='seconds')}",
+        f"window_hours: {hours}",
+        f"url_count: {len(visits)}",
+        "tags:",
+        "- chrome-history",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Chrome history — {today} (últimas {hours}h)",
+        "",
+    ]
+    chrome_lines: list[str] = list(chrome_fm)
+    for v in visits:
+        ts = datetime.fromtimestamp(v["ts"]).strftime("%H:%M")
+        title = v["title"].replace("|", "·")
+        chrome_lines.append(f"- `{ts}` [{title}]({v['url']})")
+    chrome_body = "\n".join(chrome_lines) + "\n"
+
+    chrome_target = vault_root / _CHROME_VAULT_SUBPATH / f"{today}.md"
+    chrome_written = _atomic_write_if_changed(chrome_target, chrome_body)
+
+    yt_videos: list[dict] = []
+    seen_vid: set[str] = set()
+    for v in visits:
+        m = _YOUTUBE_WATCH_RE.match(v["url"])
+        if not m:
+            continue
+        vid = m.group(2)
+        if vid in seen_vid:
+            continue
+        seen_vid.add(vid)
+        yt_videos.append({
+            "video_id": vid,
+            "title": v["title"],
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "ts": v["ts"],
+        })
+
+    yt_written = 0
+    if yt_videos:
+        yt_fm = [
+            "---",
+            "source: youtube-via-chrome",
+            f"snapshot_at: {now.isoformat(timespec='seconds')}",
+            f"window_hours: {hours}",
+            f"video_count: {len(yt_videos)}",
+            "tags:",
+            "- youtube",
+            "- system-snapshot",
+            "---",
+            "",
+            f"# YouTube watched — {today} (últimas {hours}h, vía Chrome)",
+            "",
+        ]
+        yt_lines: list[str] = list(yt_fm)
+        for v in yt_videos:
+            ts = datetime.fromtimestamp(v["ts"]).strftime("%H:%M")
+            title = v["title"].replace("|", "·")
+            yt_lines.append(f"- `{ts}` [{title}]({v['url']})")
+        yt_body = "\n".join(yt_lines) + "\n"
+        yt_target = vault_root / _YOUTUBE_VAULT_SUBPATH / f"{today}.md"
+        yt_written = 1 if _atomic_write_if_changed(yt_target, yt_body) else 0
+
+    return {
+        "ok": True,
+        "files_written": (1 if chrome_written else 0) + yt_written,
+        "urls": len(visits),
+        "youtube_videos": len(yt_videos),
+        "target": _CHROME_VAULT_SUBPATH,
+    }
+
+
+def _google_keys_path() -> Path | None:
+    for p in _GOOGLE_KEYS_CANDIDATES:
+        if p.is_file():
+            return p
+    return None
+
+
+def _load_google_credentials(allow_interactive: bool = True):
+    """Return Google OAuth `Credentials` for Gmail + Drive (readonly), or None.
+
+    Lookup order: cached token → refresh if expired → first-time interactive
+    browser flow (only when `allow_interactive` and stdin is a TTY). Token is
+    persisted to `_GOOGLE_TOKEN_PATH` so subsequent runs are silent.
+    """
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        return None
+
+    creds = None
+    if _GOOGLE_TOKEN_PATH.is_file():
+        try:
+            creds = Credentials.from_authorized_user_file(
+                str(_GOOGLE_TOKEN_PATH), list(_GOOGLE_SCOPES)
+            )
+        except Exception:
+            creds = None
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            return creds
+        except Exception:
+            pass
+    if not allow_interactive or not sys.stdin.isatty():
+        return None
+    keys = _google_keys_path()
+    if not keys:
+        return None
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(str(keys), list(_GOOGLE_SCOPES))
+        creds = flow.run_local_server(port=0, open_browser=True)
+    except Exception:
+        return None
+    _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def _decode_gmail_body(payload: dict) -> str:
+    """Walk a Gmail API `payload` tree, prefer text/plain, fall back to HTML
+    stripped of tags. Returns empty string when the message has no body parts.
+    """
+    import base64
+    def _decode(data: str) -> str:
+        try:
+            return base64.urlsafe_b64decode(data.encode("ascii")).decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _walk(node: dict, want_mime: str) -> str:
+        if node.get("mimeType") == want_mime and (node.get("body") or {}).get("data"):
+            return _decode(node["body"]["data"])
+        for child in node.get("parts") or []:
+            found = _walk(child, want_mime)
+            if found:
+                return found
+        return ""
+
+    plain = _walk(payload, "text/plain")
+    if plain:
+        return plain
+    html = _walk(payload, "text/html")
+    if not html:
+        return ""
+    # Drop <style> + <script> block contents before stripping tags — otherwise
+    # CSS rules and JS leak into the snapshot as opaque token noise.
+    html = re.sub(
+        r"<(style|script)\b[^>]*>.*?</\1\s*>", " ", html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return re.sub(r"<[^>]+>", " ", html)
+
+
+def _sync_gmail_notes(vault_root: Path, hours: int = 48, max_messages: int = 30, body_cap: int = 5000) -> dict:
+    """Snapshot recent Gmail to a daily note. Subject + headers + body (capped)
+    per message. Hash-skipped when content unchanged.
+    """
+    creds = _load_google_credentials()
+    if creds is None:
+        return {"ok": False, "reason": "no_google_credentials"}
+    try:
+        from googleapiclient.discovery import build
+    except ImportError:
+        return {"ok": False, "reason": "google_api_missing"}
+    try:
+        gm = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        days = max(1, int((hours + 23) // 24))
+        resp = gm.users().messages().list(
+            userId="me", q=f"newer_than:{days}d", maxResults=max_messages,
+        ).execute()
+        ids = [m["id"] for m in (resp.get("messages") or [])]
+    except Exception as exc:
+        return {"ok": False, "reason": f"list_failed: {str(exc)[:120]}"}
+    if not ids:
+        return {"ok": True, "files_written": 0, "reason": "no_messages"}
+
+    messages: list[dict] = []
+    for mid in ids:
+        try:
+            msg = gm.users().messages().get(
+                userId="me", id=mid, format="full",
+            ).execute()
+        except Exception:
+            continue
+        headers = {h["name"].lower(): h["value"] for h in (msg.get("payload", {}).get("headers") or [])}
+        body = _decode_gmail_body(msg.get("payload") or {})
+        body = re.sub(r"\s+", " ", body).strip()[:body_cap]
+        messages.append({
+            "id": mid,
+            "subject": headers.get("subject", "(sin subject)"),
+            "from": headers.get("from", "?"),
+            "date": headers.get("date", ""),
+            "snippet": (msg.get("snippet") or "").strip(),
+            "body": body,
+        })
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    fm = [
+        "---",
+        "source: gmail",
+        f"snapshot_at: {now.isoformat(timespec='seconds')}",
+        f"window_hours: {hours}",
+        f"message_count: {len(messages)}",
+        "tags:",
+        "- gmail",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Gmail — {today} (últimas {hours}h)",
+        "",
+    ]
+    for m in messages:
+        fm.append(f"## {m['subject']}")
+        fm.append("")
+        fm.append(f"**From:** {m['from']}  ")
+        fm.append(f"**Date:** {m['date']}  ")
+        if m["snippet"]:
+            fm.append(f"**Snippet:** {m['snippet']}")
+        fm.append("")
+        if m["body"]:
+            fm.append(m["body"])
+            fm.append("")
+    body_text = "\n".join(fm) + "\n"
+    target = vault_root / _GMAIL_VAULT_SUBPATH / f"{today}.md"
+    written = _atomic_write_if_changed(target, body_text)
+    return {
+        "ok": True,
+        "files_written": 1 if written else 0,
+        "messages": len(messages),
+        "target": _GMAIL_VAULT_SUBPATH,
+    }
+
+
+def _sync_gdrive_notes(vault_root: Path, hours: int = 48, max_docs: int = 4, body_cap: int = 8000) -> dict:
+    """Snapshot the last `max_docs` Google Docs/Sheets/Slides modified in the
+    window. Title + exported text body per doc. Hash-skipped.
+    """
+    creds = _load_google_credentials()
+    if creds is None:
+        return {"ok": False, "reason": "no_google_credentials"}
+    try:
+        from googleapiclient.discovery import build
+    except ImportError:
+        return {"ok": False, "reason": "google_api_missing"}
+    try:
+        dv = build("drive", "v3", credentials=creds, cache_discovery=False)
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mime_filter = " or ".join(
+            f"mimeType = '{m}'" for m in (
+                "application/vnd.google-apps.document",
+                "application/vnd.google-apps.spreadsheet",
+                "application/vnd.google-apps.presentation",
+            )
+        )
+        q = f"(modifiedTime > '{cutoff}') and ({mime_filter}) and trashed = false"
+        resp = dv.files().list(
+            q=q, orderBy="modifiedTime desc", pageSize=max_docs,
+            fields="files(id, name, mimeType, modifiedTime, owners(displayName), webViewLink)",
+        ).execute()
+        files = resp.get("files") or []
+    except Exception as exc:
+        return {"ok": False, "reason": f"list_failed: {str(exc)[:120]}"}
+    if not files:
+        return {"ok": True, "files_written": 0, "reason": "no_docs"}
+
+    EXPORT_MIME = {
+        "application/vnd.google-apps.document": "text/plain",
+        "application/vnd.google-apps.spreadsheet": "text/csv",
+        "application/vnd.google-apps.presentation": "text/plain",
+    }
+    docs: list[dict] = []
+    for f in files:
+        export_mime = EXPORT_MIME.get(f["mimeType"], "text/plain")
+        try:
+            body = dv.files().export(fileId=f["id"], mimeType=export_mime).execute()
+            if isinstance(body, bytes):
+                body = body.decode("utf-8", errors="ignore")
+            body = body.strip()[:body_cap]
+        except Exception:
+            body = ""
+        docs.append({
+            "id": f["id"],
+            "name": f.get("name", "(sin nombre)"),
+            "mime": f["mimeType"].split(".")[-1],
+            "modified": f.get("modifiedTime", ""),
+            "owner": (f.get("owners") or [{}])[0].get("displayName", "?"),
+            "link": f.get("webViewLink", ""),
+            "body": body,
+        })
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    fm = [
+        "---",
+        "source: google-drive",
+        f"snapshot_at: {now.isoformat(timespec='seconds')}",
+        f"window_hours: {hours}",
+        f"doc_count: {len(docs)}",
+        "tags:",
+        "- google-drive",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Google Drive — {today} (últimos {len(docs)} docs últimas {hours}h)",
+        "",
+    ]
+    for d in docs:
+        fm.append(f"## {d['name']}")
+        fm.append("")
+        fm.append(f"**Tipo:** {d['mime']} · **Modificado:** {d['modified']} · **Owner:** {d['owner']}")
+        if d["link"]:
+            fm.append(f"**Link:** {d['link']}")
+        fm.append("")
+        if d["body"]:
+            fm.append(d["body"])
+            fm.append("")
+    body_text = "\n".join(fm) + "\n"
+    target = vault_root / _GDRIVE_VAULT_SUBPATH / f"{today}.md"
+    written = _atomic_write_if_changed(target, body_text)
+    return {
+        "ok": True,
+        "files_written": 1 if written else 0,
+        "docs": len(docs),
+        "target": _GDRIVE_VAULT_SUBPATH,
+    }
+
+
+# ── GitHub activity ──────────────────────────────────────────────────────────
+# Pulls recent public events + open PRs via the already-authenticated `gh` CLI.
+# Subprocess-based so we don't carry a token ourselves; silent-fail when `gh`
+# is missing or unauthenticated.
+
+_GH_EVENT_LABELS = {
+    "PushEvent": "push",
+    "PullRequestEvent": "pull-request",
+    "IssueCommentEvent": "issue-comment",
+    "IssuesEvent": "issue",
+    "PullRequestReviewEvent": "pr-review",
+    "PullRequestReviewCommentEvent": "pr-review-comment",
+    "CreateEvent": "create",
+    "DeleteEvent": "delete",
+    "ForkEvent": "fork",
+    "WatchEvent": "star",
+    "ReleaseEvent": "release",
+}
+
+
+def _gh_run(args: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
+    """Run a `gh` command. Returns (rc, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            ["gh", *args], capture_output=True, timeout=timeout, text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return 127, "", str(exc)[:160]
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _sync_github_activity(vault_root: Path, hours: int = 48) -> dict:
+    """Snapshot recent GitHub activity (push/PR/issues/stars) plus open PRs.
+    Uses the already-authenticated `gh` CLI; silent-fail on missing/unauth.
+    """
+    rc, login_out, _ = _gh_run(["api", "user", "--jq", ".login"])
+    if rc != 0:
+        return {"ok": False, "reason": "gh_unavailable_or_unauth"}
+    user = login_out.strip()
+    if not user:
+        return {"ok": False, "reason": "gh_no_login"}
+
+    rc, events_raw, err = _gh_run(["api", f"users/{user}/events?per_page=100"])
+    if rc != 0:
+        return {"ok": False, "reason": f"events_failed: {err[:120]}"}
+    try:
+        events = json.loads(events_raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "reason": "events_parse_failed"}
+
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    fresh: list[dict] = []
+    for ev in events:
+        ts_raw = ev.get("created_at", "")
+        try:
+            ts = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        fresh.append({
+            "ts": ts,
+            "type": ev.get("type", "?"),
+            "repo": (ev.get("repo") or {}).get("name", "?"),
+            "payload": ev.get("payload") or {},
+        })
+
+    rc, pr_raw, _ = _gh_run([
+        "api", "search/issues",
+        "-X", "GET",
+        "-f", f"q=is:pr is:open author:{user}",
+    ])
+    open_prs: list[dict] = []
+    if rc == 0:
+        try:
+            for it in (json.loads(pr_raw).get("items") or [])[:20]:
+                open_prs.append({
+                    "title": it.get("title", "?"),
+                    "url": it.get("html_url", ""),
+                    "repo": (it.get("repository_url", "") or "").split("/repos/")[-1],
+                    "number": it.get("number"),
+                })
+        except json.JSONDecodeError:
+            pass
+
+    if not fresh and not open_prs:
+        return {"ok": True, "files_written": 0, "reason": "no_activity"}
+
+    by_type: dict[str, list[dict]] = {}
+    for ev in fresh:
+        by_type.setdefault(ev["type"], []).append(ev)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    fm = [
+        "---",
+        "source: github",
+        f"snapshot_date: {today}",
+        f"window_hours: {hours}",
+        f"event_count: {len(fresh)}",
+        f"open_pr_count: {len(open_prs)}",
+        "tags:",
+        "- github",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# GitHub activity — {today} (últimas {hours}h, usuario {user})",
+        "",
+    ]
+    for ev_type, items in sorted(by_type.items()):
+        label = _GH_EVENT_LABELS.get(ev_type, ev_type)
+        fm.append(f"## {label} ({len(items)})")
+        fm.append("")
+        for ev in items:
+            ts = ev["ts"].strftime("%Y-%m-%d %H:%M")
+            repo = ev["repo"]
+            p = ev["payload"]
+            detail = ""
+            if ev_type == "PushEvent":
+                commits = p.get("commits") or []
+                msgs = " · ".join((c.get("message", "").split("\n", 1)[0])[:80] for c in commits[:3])
+                detail = f"{len(commits)} commit(s) {msgs}"
+            elif ev_type in ("PullRequestEvent", "PullRequestReviewEvent", "PullRequestReviewCommentEvent"):
+                pr = p.get("pull_request") or {}
+                detail = f"{p.get('action','?')} #{pr.get('number','?')} {pr.get('title','')[:80]}"
+            elif ev_type == "IssuesEvent":
+                iss = p.get("issue") or {}
+                detail = f"{p.get('action','?')} #{iss.get('number','?')} {iss.get('title','')[:80]}"
+            elif ev_type == "IssueCommentEvent":
+                iss = p.get("issue") or {}
+                detail = f"comentó #{iss.get('number','?')} {iss.get('title','')[:80]}"
+            elif ev_type == "WatchEvent":
+                detail = "starred"
+            elif ev_type == "CreateEvent":
+                detail = f"creó {p.get('ref_type','?')} {p.get('ref','') or ''}"
+            elif ev_type == "ReleaseEvent":
+                rel = p.get("release") or {}
+                detail = f"release {rel.get('tag_name','')}"
+            else:
+                detail = ""
+            fm.append(f"- `{ts}` {repo} — {detail}")
+        fm.append("")
+
+    if open_prs:
+        fm.append(f"## Open PRs ({len(open_prs)})")
+        fm.append("")
+        for pr in open_prs:
+            fm.append(f"- {pr['repo']}#{pr['number']} [{pr['title']}]({pr['url']})")
+        fm.append("")
+
+    body = "\n".join(fm) + "\n"
+    target = vault_root / _GITHUB_VAULT_SUBPATH / f"{today}.md"
+    written = _atomic_write_if_changed(target, body)
+    return {
+        "ok": True,
+        "files_written": 1 if written else 0,
+        "events": len(fresh),
+        "open_prs": len(open_prs),
+        "target": _GITHUB_VAULT_SUBPATH,
+    }
+
+
+# ── Claude Code transcripts ──────────────────────────────────────────────────
+# Source: ~/.claude/projects/<dir-slug>/<session-id>.jsonl. Each .jsonl is
+# one Claude Code session — JSON-per-line with `type`, `message`, etc. Convert
+# to per-session markdown so retrieve can search across past sessions.
+
+_CLAUDE_PROJECTS_ROOT = Path.home() / ".claude/projects"
+_CLAUDE_INDEX_WINDOW_DAYS = 30
+_CLAUDE_TURN_BODY_CAP = 8000
+
+# Best-effort secret redaction — NOT a security boundary. Catches the common
+# token shapes that show up pasted into prompts. Ordered most-specific first.
+_SECRET_PATTERNS = [
+    (re.compile(r"sk-(?:proj-|ant-)?[A-Za-z0-9_\-]{20,}"), "[REDACTED-OPENAI/ANTHROPIC]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{30,}"),                  "[REDACTED-GH-PAT]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),          "[REDACTED-GH-PAT-NEW]"),
+    (re.compile(r"AKIA[A-Z0-9]{16}"),                      "[REDACTED-AWS-KEY]"),
+    (re.compile(r"AIza[A-Za-z0-9_\-]{35}"),                "[REDACTED-GOOGLE-API]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),         "[REDACTED-SLACK]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_])(?:api[_-]?key|secret|password|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-./]{16,}"),
+                                                            "[REDACTED-KV]"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    for pat, rep in _SECRET_PATTERNS:
+        text = pat.sub(rep, text)
+    return text
+
+
+def _claude_extract_turn(record: dict) -> tuple[str, str, str] | None:
+    """Pull (role, ts, body) from one Claude Code transcript line. Returns
+    None when the record is internal (tool result, summary, etc.) and
+    shouldn't be rendered as a chat turn.
+    """
+    rec_type = record.get("type") or ""
+    msg = record.get("message") or {}
+    if rec_type not in ("user", "assistant"):
+        return None
+    role = msg.get("role") or rec_type
+    ts = (record.get("timestamp") or "").replace("T", " ").split(".")[0]
+    content = msg.get("content")
+    if isinstance(content, str):
+        body = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text"):
+                parts.append(block["text"])
+            elif block.get("type") == "tool_use":
+                tool = block.get("name", "?")
+                parts.append(f"[tool_use:{tool}]")
+            elif block.get("type") == "tool_result":
+                parts.append("[tool_result]")
+        body = "\n".join(parts)
+    else:
+        body = ""
+    body = _redact_secrets(body.strip())
+    if len(body) > _CLAUDE_TURN_BODY_CAP:
+        body = body[:_CLAUDE_TURN_BODY_CAP] + "\n\n[…body truncado]"
+    if not body:
+        return None
+    return role, ts, body
+
+
+def _sync_claude_code_transcripts(vault_root: Path) -> dict:
+    """Convert Claude Code session JSONL → per-session markdown. Walks
+    `~/.claude/projects/<slug>/*.jsonl` modified within the last 30 days,
+    redacts common secret shapes, hash-skips via `_atomic_write_if_changed`.
+    """
+    if not _CLAUDE_PROJECTS_ROOT.is_dir():
+        return {"ok": False, "reason": "no_claude_projects_dir"}
+    cutoff_mtime = time.time() - (_CLAUDE_INDEX_WINDOW_DAYS * 86400)
+    written = 0
+    total = 0
+    skipped = 0
+    for project_dir in sorted(_CLAUDE_PROJECTS_ROOT.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        for jsonl in sorted(project_dir.glob("*.jsonl")):
+            try:
+                stat = jsonl.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < cutoff_mtime:
+                continue
+            total += 1
+            try:
+                lines = jsonl.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+            turns: list[tuple[str, str, str]] = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = _claude_extract_turn(rec)
+                if t:
+                    turns.append(t)
+            if not turns:
+                skipped += 1
+                continue
+            session_id = jsonl.stem
+            started = turns[0][1] or "?"
+            ended = turns[-1][1] or "?"
+            fm = [
+                "---",
+                "source: claude-code",
+                f"project: {project_dir.name}",
+                f"session_id: {session_id}",
+                f"started_at: {started}",
+                f"ended_at: {ended}",
+                f"turn_count: {len(turns)}",
+                "tags:",
+                "- claude-code",
+                "- system-snapshot",
+                "---",
+                "",
+                f"# Claude Code session — {project_dir.name} / {session_id}",
+                "",
+            ]
+            for role, ts, body in turns:
+                fm.append(f"## {role} · {ts}")
+                fm.append("")
+                fm.append(body)
+                fm.append("")
+            body_text = "\n".join(fm) + "\n"
+            target = vault_root / _CLAUDE_VAULT_SUBPATH / project_dir.name / f"{session_id}.md"
+            if _atomic_write_if_changed(target, body_text):
+                written += 1
+            else:
+                skipped += 1
+
+    # Prune vault transcripts whose source JSONL is gone or older than the
+    # window. The ETL only WRITES — without this sweep, `.md` files persist
+    # forever as projects go dormant and the vault accumulates dead CLI
+    # history. Piggybacks on every `rag index` so no extra launchd job.
+    pruned = 0
+    vault_claude_dir = vault_root / _CLAUDE_VAULT_SUBPATH
+    if vault_claude_dir.is_dir():
+        for project_vault_dir in vault_claude_dir.iterdir():
+            if not project_vault_dir.is_dir():
+                continue  # top-level .md (hand-written) never pruned
+            source_project = _CLAUDE_PROJECTS_ROOT / project_vault_dir.name
+            for md_file in project_vault_dir.glob("*.md"):
+                session_id = md_file.stem
+                source_jsonl = source_project / f"{session_id}.jsonl"
+                stale = False
+                if not source_jsonl.is_file():
+                    stale = True
+                else:
+                    try:
+                        if source_jsonl.stat().st_mtime < cutoff_mtime:
+                            stale = True
+                    except OSError:
+                        stale = True
+                if stale:
+                    with contextlib.suppress(OSError):
+                        md_file.unlink()
+                        pruned += 1
+            # Clean up empty project-dirs left over after pruning.
+            with contextlib.suppress(OSError):
+                if not any(project_vault_dir.iterdir()):
+                    project_vault_dir.rmdir()
+
+    if not total and not pruned:
+        return {"ok": True, "files_written": 0, "reason": "no_recent_sessions"}
+    return {
+        "ok": True,
+        "files_written": written,
+        "sessions_seen": total,
+        "skipped": skipped,
+        "pruned": pruned,
+        "target": _CLAUDE_VAULT_SUBPATH,
+    }
+
+
+# ── YouTube transcripts ──────────────────────────────────────────────────────
+# Re-parses the daily YouTube note (produced by `_sync_chrome_history`) for
+# `watch?v=<id>` URLs and fetches a transcript per video. Per-video files at
+# `<vault>/03-Resources/YouTube/transcripts/<id>.md`. Transcripts are immutable
+# once fetched — existence-skip avoids re-hitting YouTube.
+
+_YT_TRANSCRIPT_LANG_PRIORITY = ("es", "es-419", "en", "en-US")
+_YT_TRANSCRIPT_BATCH = 10
+_YT_VIDEO_ID_RE = re.compile(r"youtube\.com/watch\?v=([\w\-]{6,})")
+
+
+def _collect_youtube_video_ids(vault_root: Path) -> list[tuple[str, str]]:
+    """Read recent YouTube daily notes, pull (video_id, title) pairs.
+    Title comes from the markdown link text. Dedup by video_id; preserve
+    discovery order so the throttle is deterministic.
+    """
+    yt_dir = vault_root / "03-Resources/YouTube"
+    if not yt_dir.is_dir():
+        return []
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for md in sorted(yt_dir.glob("*.md")):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _YT_VIDEO_ID_RE.search(line)
+            if not m:
+                continue
+            vid = m.group(1)
+            if vid in seen:
+                continue
+            seen.add(vid)
+            title_match = re.search(r"\[([^\]]+)\]\(", line)
+            title = title_match.group(1).strip() if title_match else vid
+            out.append((vid, title))
+    return out
+
+
+def _fetch_yt_transcript_for_index(video_id: str) -> tuple[str, str] | None:
+    """Returns (lang, transcript_text) or None on miss. Separate from
+    `_fetch_youtube_transcript` (used by `rag read`) because we want the
+    language tag for frontmatter and a silent-None contract instead of
+    raising RuntimeError.
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        return None
+    try:
+        api = YouTubeTranscriptApi()
+        listing = api.list(video_id)
+    except Exception:
+        return None
+    transcript = None
+    chosen_lang = None
+    for lang in _YT_TRANSCRIPT_LANG_PRIORITY:
+        try:
+            transcript = listing.find_transcript([lang])
+            chosen_lang = lang
+            break
+        except Exception:
+            continue
+    if transcript is None:
+        try:
+            transcript = next(iter(listing))
+            chosen_lang = transcript.language_code
+        except Exception:
+            return None
+    try:
+        fetched = transcript.fetch()
+    except Exception:
+        return None
+    snippets = getattr(fetched, "snippets", None) or fetched
+    parts = [getattr(s, "text", None) or s.get("text", "") for s in snippets]
+    text = " ".join(p for p in parts if p).strip()
+    if not text:
+        return None
+    return chosen_lang or "?", text
+
+
+def _sync_youtube_transcripts(vault_root: Path, batch: int = _YT_TRANSCRIPT_BATCH) -> dict:
+    """For each video referenced in recent YouTube daily notes, fetch its
+    transcript once. Caps at `batch` per run so a vault with hundreds of
+    historical videos doesn't try to hit YouTube all at once.
+    """
+    videos = _collect_youtube_video_ids(vault_root)
+    if not videos:
+        return {"ok": True, "files_written": 0, "reason": "no_videos"}
+    target_dir = vault_root / _YOUTUBE_TRANSCRIPTS_SUBPATH
+    target_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    fetched = 0
+    failed = 0
+    for vid, title in videos:
+        target = target_dir / f"{vid}.md"
+        if target.is_file():
+            continue
+        if fetched >= batch:
+            break
+        result = _fetch_yt_transcript_for_index(vid)
+        fetched += 1
+        if not result:
+            failed += 1
+            continue
+        lang, text = result
+        url = f"https://www.youtube.com/watch?v={vid}"
+        body = (
+            "---\n"
+            "source: youtube-transcript\n"
+            f"video_id: {vid}\n"
+            f"language: {lang}\n"
+            f"url: {url}\n"
+            "tags:\n"
+            "- youtube-transcript\n"
+            "- system-snapshot\n"
+            "---\n\n"
+            f"# {title}\n\n"
+            f"{url}\n\n"
+            f"{text}\n"
+        )
+        if _atomic_write_if_changed(target, body):
+            written += 1
+    return {
+        "ok": True,
+        "files_written": written,
+        "fetched_this_run": fetched,
+        "failed_this_run": failed,
+        "videos_known": len(videos),
+        "target": _YOUTUBE_TRANSCRIPTS_SUBPATH,
+    }
+
+
+def _spotify_client(allow_interactive: bool = True):
+    """Return an authenticated `spotipy.Spotify` instance, or None.
+
+    Reads client_id/secret from `_SPOTIFY_CREDS_PATH`, caches token at
+    `_SPOTIFY_TOKEN_PATH`. First-time auth pops a browser when stdin is a
+    TTY (or `allow_interactive=True`); otherwise silent-fails.
+    """
+    if not _SPOTIFY_CREDS_PATH.is_file():
+        return None
+    try:
+        import spotipy
+        from spotipy.oauth2 import SpotifyOAuth
+    except ImportError:
+        return None
+    try:
+        creds = json.loads(_SPOTIFY_CREDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    cid = creds.get("client_id")
+    secret = creds.get("client_secret")
+    redirect = creds.get("redirect_uri", "http://localhost:8888/callback")
+    if not (cid and secret):
+        return None
+    open_browser = bool(allow_interactive and sys.stdin.isatty())
+    auth = SpotifyOAuth(
+        client_id=cid, client_secret=secret, redirect_uri=redirect,
+        scope=_SPOTIFY_SCOPES, cache_path=str(_SPOTIFY_TOKEN_PATH),
+        open_browser=open_browser,
+    )
+    try:
+        token = auth.get_cached_token()
+        if not token or auth.is_token_expired(token):
+            if not open_browser:
+                return None
+            token = auth.get_access_token(as_dict=True)
+        if not token:
+            return None
+        return spotipy.Spotify(auth=token["access_token"])
+    except Exception:
+        return None
+
+
+def _sync_spotify_notes(vault_root: Path, max_recent: int = 50) -> dict:
+    """Snapshot Spotify recently-played + (weekly) top tracks.
+
+    - `<vault>/03-Resources/Spotify/YYYY-MM-DD.md` — recently-played daily.
+    - `<vault>/03-Resources/Spotify/_top.md` — top tracks/artists short_term,
+      refreshed once every 7 days (mtime gate).
+
+    Hash-skipped via `_atomic_write_if_changed`. NEVER triggers interactive
+    auth — would block `rag index` waiting for browser. Run `rag spotify-auth`
+    once to bootstrap the cached token, then this helper picks it up silently.
+    """
+    if not _SPOTIFY_TOKEN_PATH.is_file():
+        return {"ok": False, "reason": "no_spotify_token"}
+    sp = _spotify_client(allow_interactive=False)
+    if sp is None:
+        return {"ok": False, "reason": "no_spotify_credentials"}
+
+    try:
+        recent = sp.current_user_recently_played(limit=max_recent)
+    except Exception as exc:
+        return {"ok": False, "reason": f"recent_failed: {str(exc)[:120]}"}
+
+    items = recent.get("items") or []
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
+    fm = [
+        "---",
+        "source: spotify",
+        f"snapshot_date: {today}",
+        f"track_count: {len(items)}",
+        "tags:",
+        "- spotify",
+        "- system-snapshot",
+        "---",
+        "",
+        f"# Spotify recently played — {today}",
+        "",
+    ]
+    for it in items:
+        track = it.get("track") or {}
+        name = track.get("name") or "(sin título)"
+        artists = ", ".join(a.get("name", "?") for a in (track.get("artists") or []))
+        album = (track.get("album") or {}).get("name", "")
+        played = (it.get("played_at") or "").replace("T", " ").split(".")[0]
+        url = (track.get("external_urls") or {}).get("spotify", "")
+        link = f"[{name}]({url})" if url else name
+        fm.append(f"- `{played}` {link} — {artists}{f' · _{album}_' if album else ''}")
+    body = "\n".join(fm) + "\n"
+    target = vault_root / _SPOTIFY_VAULT_SUBPATH / f"{today}.md"
+    written_recent = _atomic_write_if_changed(target, body)
+
+    # _top.md — refresh max once per TTL window so we don't hit the API daily
+    # for short_term data that barely moves.
+    top_target = vault_root / _SPOTIFY_VAULT_SUBPATH / "_top.md"
+    written_top = 0
+    needs_top = (
+        not top_target.is_file()
+        or (time.time() - top_target.stat().st_mtime) > _SPOTIFY_TOP_TTL_DAYS * 86400
+    )
+    if needs_top:
+        try:
+            top_tracks = sp.current_user_top_tracks(limit=20, time_range="short_term")
+            top_artists = sp.current_user_top_artists(limit=20, time_range="short_term")
+        except Exception:
+            top_tracks = top_artists = None
+        if top_tracks and top_artists:
+            t_items = top_tracks.get("items") or []
+            a_items = top_artists.get("items") or []
+            tfm = [
+                "---",
+                "source: spotify-top",
+                f"refreshed_date: {today}",
+                f"window: short_term (4 weeks)",
+                "tags:",
+                "- spotify",
+                "- system-snapshot",
+                "---",
+                "",
+                "# Spotify Top — últimas 4 semanas",
+                "",
+                f"## Top tracks ({len(t_items)})",
+                "",
+            ]
+            for t in t_items:
+                artists = ", ".join(a.get("name", "?") for a in (t.get("artists") or []))
+                url = (t.get("external_urls") or {}).get("spotify", "")
+                name = t.get("name", "?")
+                link = f"[{name}]({url})" if url else name
+                tfm.append(f"- {link} — {artists}")
+            tfm += ["", f"## Top artists ({len(a_items)})", ""]
+            for a in a_items:
+                url = (a.get("external_urls") or {}).get("spotify", "")
+                name = a.get("name", "?")
+                genres = ", ".join((a.get("genres") or [])[:3])
+                link = f"[{name}]({url})" if url else name
+                tfm.append(f"- {link}{f' · {genres}' if genres else ''}")
+            top_body = "\n".join(tfm) + "\n"
+            if _atomic_write_if_changed(top_target, top_body):
+                written_top = 1
+
+    return {
+        "ok": True,
+        "files_written": (1 if written_recent else 0) + written_top,
+        "recently_played": len(items),
+        "refreshed_top": bool(written_top),
+        "target": _SPOTIFY_VAULT_SUBPATH,
+    }
+
+
 def _index_urls(
     col_urls: SqliteVecCollection,
     doc_id_prefix: str,
@@ -5111,7 +6439,12 @@ def _get_local_embedder():
         try:
             import os as _os
             # Only load from local cache — never trigger a download mid-serve.
+            # Both env vars required: HF_HUB_OFFLINE gates the hub client,
+            # TRANSFORMERS_OFFLINE gates sentence_transformers' HEAD check.
+            # Without the second one, ST tries an HTTP probe and raises on
+            # offline systems even when the snapshot is already cached.
             _os.environ["HF_HUB_OFFLINE"] = "1"
+            _os.environ["TRANSFORMERS_OFFLINE"] = "1"
             import torch
             from sentence_transformers import SentenceTransformer
             if torch.backends.mps.is_available():
@@ -5120,7 +6453,11 @@ def _get_local_embedder():
                 _dev = "cuda"
             else:
                 _dev = "cpu"
-            _local_embedder = SentenceTransformer(EMBED_MODEL, device=_dev)
+            # NOTE: EMBED_MODEL is the ollama short name ("bge-m3"); the
+            # HuggingFace repo id is "BAAI/bge-m3". Passing the ollama name
+            # makes sentence_transformers hit the hub HEAD endpoint and fail
+            # offline.
+            _local_embedder = SentenceTransformer("BAAI/bge-m3", device=_dev)
         except Exception as _exc:
             if os.environ.get("RAG_DEBUG"):
                 print(f"[local-embed] unavailable ({_exc}) — falling back to ollama", flush=True)
@@ -5262,11 +6599,35 @@ def _invalidate_corpus_cache() -> None:
 # no network. The mention notes' format is documented in the folder's
 # `_template.md`: filename stem + frontmatter `aliases:` are matched tokens.
 
-_MENTIONS_FOLDER = "04-Archive/99-obsidian-system/99 Mentions @"
+_MENTIONS_FOLDER = "04-Archive/99-obsidian-system/99-Mentions"
 _MENTIONS_BODY_CAP = 1500
 _MENTIONS_MAX_PER_QUERY = 2
 _MENTIONS_MIN_TOKEN_LEN = 3
-_PERSON_CONTEXT_HEADER = "CONTEXTO SOBRE LA PERSONA:"
+_PERSON_CONTEXT_HEADER = (
+    "IDENTIDAD DEL SUJETO — contexto prioritario\n"
+    "Nombraste a una persona cercana tuya (definida en 99-Mentions).\n"
+    "NO interpretes el nombre como un país, lugar, evento histórico ni homónimo.\n"
+    "Cualquier chunk recuperado que hable de un homónimo (país, ciudad, figura pública) "
+    "es ruido — mencionalo solo si pide contexto histórico explícito. "
+    "Respondé primero sobre ESTA persona usando los datos que siguen. "
+    "Dirigite al usuario en 2da persona (tuteo rioplatense): 'tu hija', 'tu hermano', "
+    "'tu socio'. NUNCA 'la hija del usuario', 'el hermano del usuario' ni 3ra persona."
+)
+# Stems that are kinship/relationship words rather than person names. Searching
+# Apple Contacts for these returns substring false-positives (e.g. file stem
+# "Mama" matches "Carina (Mama Bianca)"). When the stem is in this set we use
+# only the canonical name from the mention body to query Contacts.
+_RELATION_STEMS = {
+    "mama", "mami", "papa", "papi", "yo", "hijo", "hija",
+    "hermano", "hermana", "abuelo", "abuela", "tio", "tia",
+    "primo", "prima", "novio", "novia", "esposo", "esposa",
+    "pareja", "marido", "mujer",
+}
+# Frontmatter field labels we parse from mention bodies. Tolerant of bold
+# markers, leading dashes, and the YAML-style hyphen list prefix.
+_MENTION_FIELD_RE = re.compile(
+    r"^[\s\-*]*\*{0,2}([A-Za-zÁÉÍÓÚáéíóúñÑ /]+?)\*{0,2}\s*:\s*(.*)$"
+)
 
 _mentions_cache: dict | None = None
 _contacts_cache: dict[str, dict | None] = {}
@@ -5278,6 +6639,34 @@ def _fold(s: str) -> str:
     """Lowercase + strip combining accents (NFD). Matches `_tokenize`."""
     n = unicodedata.normalize("NFD", (s or "").lower())
     return "".join(c for c in n if not unicodedata.combining(c))
+
+
+def _parse_mention_metadata(body: str) -> dict:
+    """Extract canonical name + email from a mention note body. Used to query
+    Apple Contacts with the real-name identity rather than a kinship label.
+
+    Recognises field labels: 'Apellido / nombre completo', 'Apellido', 'Nombre
+    completo', 'Email'. Skips template placeholders (the `_template.md` ships
+    with `+54 9 ...`, `dd/mm/yyyy`, etc.).
+    """
+    out: dict = {"email": None, "canonical": None}
+    for line in body.splitlines():
+        m = _MENTION_FIELD_RE.match(line)
+        if not m:
+            continue
+        label = m.group(1).strip().lower()
+        value = m.group(2).strip()
+        if not value or value in {"...", "—", "-"}:
+            continue
+        # Strip wikilink wrappers, trailing wikilink fragments
+        value = re.sub(r"^\[\[|\]\]$", "", value).split("|")[0].strip()
+        if "apellido" in label or "nombre completo" in label:
+            if out["canonical"] is None:
+                out["canonical"] = value
+        elif label == "email" or label == "mail":
+            if "@" in value and out["email"] is None:
+                out["email"] = re.split(r"[\s,;|]", value)[0].strip()
+    return out
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -5366,25 +6755,20 @@ def _match_mentions_in_query(query: str, vault_root: Path | None = None) -> list
     return [p for _, p in hits[:_MENTIONS_MAX_PER_QUERY]]
 
 
-def _fetch_contact(name: str) -> dict | None:
-    """Query Apple Contacts via osascript. Returns dict or None.
+def _osascript_contact_search(predicate: str, value: str) -> dict | None:
+    """One osascript query against Contacts. Returns first hit as dict or None.
 
-    Cached per process. Silent-fail on missing osascript / permission denied
-    / timeout — first failure logs one warning, subsequent are silent so a
-    permission-denied state doesn't spam the chat log.
+    `predicate` is the AppleScript clause after `whose ` — e.g. `name contains`
+    or `value of emails contains`. `value` is the search literal (quoted into
+    the script). Silent-fails on permission denied / timeout / missing
+    osascript; logs one warning on first permission failure.
     """
     global _contacts_permission_warned
-    name = (name or "").strip()
-    if not name:
-        return None
-    with _contacts_cache_lock:
-        if name in _contacts_cache:
-            return _contacts_cache[name]
-    safe = name.replace('"', '\\"')
+    safe = (value or "").replace('"', '\\"')
     script = f'''
 on run
     tell application "Contacts"
-        set matches to (every person whose name contains "{safe}")
+        set matches to (every person whose {predicate} "{safe}")
         if (count of matches) is 0 then return ""
         set p to item 1 of matches
         set fname to name of p
@@ -5404,37 +6788,89 @@ on run
     end tell
 end run
 '''
-    result: dict | None = None
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, timeout=3.0, text=True,
         )
-        if proc.returncode != 0:
-            if not _contacts_permission_warned:
-                _contacts_permission_warned = True
-                try:
-                    import sys as _sys_warn
-                    _sys_warn.stderr.write(
-                        f"[contacts-shim] osascript failed (rc={proc.returncode}): "
-                        f"{(proc.stderr or '').strip()[:160]}\n"
-                    )
-                except Exception:
-                    pass
-        else:
-            out = (proc.stdout or "").strip()
-            if out:
-                parts = out.split("::")
-                result = {
-                    "full_name": parts[0] if len(parts) > 0 else "",
-                    "phones": [p for p in (parts[1].split("|") if len(parts) > 1 else []) if p],
-                    "emails": [e for e in (parts[2].split("|") if len(parts) > 2 else []) if e],
-                    "birthday": parts[3] if len(parts) > 3 else "",
-                }
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        result = None
+        return None
+    if proc.returncode != 0:
+        if not _contacts_permission_warned:
+            _contacts_permission_warned = True
+            try:
+                import sys as _sys_warn
+                _sys_warn.stderr.write(
+                    f"[contacts-shim] osascript failed (rc={proc.returncode}): "
+                    f"{(proc.stderr or '').strip()[:160]}\n"
+                )
+            except Exception:
+                pass
+        return None
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    parts = out.split("::")
+    bd = parts[3] if len(parts) > 3 else ""
+    return {
+        "full_name": parts[0] if len(parts) > 0 else "",
+        "phones": [p for p in (parts[1].split("|") if len(parts) > 1 else []) if p],
+        "emails": [e for e in (parts[2].split("|") if len(parts) > 2 else []) if e],
+        "birthday": "" if bd == "missing value" else bd,
+    }
+
+
+def _contact_matches_canonical(contact_name: str, canonical: str | None, stem: str) -> bool:
+    """Validate that a contact corresponds to the person we asked about.
+
+    Required because `name contains` is a substring match — searching "Mama"
+    pulls "Carina (Mama Bianca)" which is not the user's mother. We accept the
+    contact only if its folded name shares at least one ≥3-char token with the
+    canonical full name (preferred) or the file stem (fallback).
+    """
+    folded_contact = _fold(contact_name)
+    tokens: list[str] = []
+    if canonical:
+        tokens.extend(t for t in canonical.split() if len(t) >= _MENTIONS_MIN_TOKEN_LEN)
+    if not tokens and stem:
+        tokens.append(stem)
+    return any(_fold(t) in folded_contact for t in tokens)
+
+
+def _fetch_contact(stem: str, *, email: str | None = None, canonical: str | None = None) -> dict | None:
+    """Find a Contacts entry matching this mention. Tries (in order): email,
+    canonical full name, canonical first name, file stem. Skips the stem when
+    it is a kinship word like "Mama" — those return false-positives.
+
+    Cached per (stem, email, canonical) tuple. Returns None when no candidate
+    yields a validated match (better silent miss than misleading data).
+    """
+    stem = (stem or "").strip()
+    cache_key = f"{stem}|{email or ''}|{canonical or ''}"
     with _contacts_cache_lock:
-        _contacts_cache[name] = result
+        if cache_key in _contacts_cache:
+            return _contacts_cache[cache_key]
+
+    candidates: list[tuple[str, str]] = []  # (predicate, value)
+    if email:
+        candidates.append(("value of emails contains", email))
+    if canonical:
+        candidates.append(("name contains", canonical))
+        first = canonical.split()[0] if canonical.split() else ""
+        if first and first.lower() != canonical.lower():
+            candidates.append(("name contains", first))
+    if stem and _fold(stem) not in _RELATION_STEMS:
+        candidates.append(("name contains", stem))
+
+    result: dict | None = None
+    for predicate, value in candidates:
+        hit = _osascript_contact_search(predicate, value)
+        if hit and _contact_matches_canonical(hit["full_name"], canonical, stem):
+            result = hit
+            break
+
+    with _contacts_cache_lock:
+        _contacts_cache[cache_key] = result
     return result
 
 
@@ -5469,7 +6905,8 @@ def build_person_context(query: str, vault_root: Path | None = None) -> str | No
             continue
         body = body[:_MENTIONS_BODY_CAP]
         name = full.stem
-        contact = _fetch_contact(name)
+        meta = _parse_mention_metadata(body)
+        contact = _fetch_contact(name, email=meta["email"], canonical=meta["canonical"])
         contact_lines: list[str] = []
         if contact:
             if contact.get("full_name"):
@@ -9606,10 +11043,12 @@ def find_contradictions_for_note(
     # as find_contradictions: qwen2.5:3b is non-deterministic and emits
     # malformed JSON; command-r returns clean parseable output. Cost ~5-10s
     # per new note in incremental indexing — bounded by guardrails (skip on
-    # full reindex, skip if body < 200 chars).
+    # full reindex, skip if body < 200 chars). Wrapped in a 120s-timeout
+    # client so a stuck Ollama (cold-load contention while watch + web hold
+    # other models) can't hang the rglob — fail-skip instead.
     helper_raw = ""
     try:
-        resp = ollama.chat(
+        resp = _index_chat_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -9966,6 +11405,43 @@ def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
         else:
             clusters.append({"indices": [i], "centroid": e})
     return [c["indices"] for c in clusters]
+
+
+@cli.command(name="spotify-auth")
+def spotify_auth_cmd():
+    """One-shot Spotify OAuth bootstrap. Opens browser for consent, caches
+    refresh token at `~/.config/obsidian-rag/spotify_token.json`. After this
+    runs successfully, `rag index` syncs Spotify silently on every run.
+    """
+    if not _SPOTIFY_CREDS_PATH.is_file():
+        console.print(
+            "[red]No hay credenciales en[/red] "
+            f"[cyan]{_SPOTIFY_CREDS_PATH}[/cyan]"
+        )
+        console.print(
+            "Crear primero con client_id + client_secret de "
+            "https://developer.spotify.com/dashboard"
+        )
+        raise SystemExit(1)
+    console.print("[cyan]Abriendo browser para autorizar Spotify…[/cyan]")
+    console.print("[dim]Si no se abre solo, copiá el link que aparece y pegalo en el browser.[/dim]")
+    sp = _spotify_client(allow_interactive=True)
+    if sp is None:
+        console.print("[red]Auth falló. Revisá creds y volvé a intentar.[/red]")
+        raise SystemExit(1)
+    try:
+        me = sp.current_user()
+    except Exception as exc:
+        console.print(f"[red]Token obtenido pero la API rechazó: {exc}[/red]")
+        raise SystemExit(1)
+    console.print(
+        f"[green]✓ Auth OK[/green] — usuario "
+        f"[bold]{me.get('display_name', me.get('id', '?'))}[/bold]"
+    )
+    console.print(
+        f"Token cacheado en [cyan]{_SPOTIFY_TOKEN_PATH}[/cyan]. "
+        "El próximo `rag index` sincroniza Spotify automáticamente."
+    )
 
 
 @cli.command()
@@ -10634,6 +12110,99 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     except Exception as exc:
         console.print(f"[yellow]MOZE sync falló: {exc}[/yellow]")
 
+    # WhatsApp ETL → reads whatsapp-bridge SQLite, writes monthly per-chat
+    # `.md` so the rglob below absorbs them. Same script that
+    # `com.fer.whatsapp-vault-sync` runs every 15 min, just on-demand here so
+    # `rag index` always reflects the latest WhatsApp state.
+    try:
+        wa_stats = _sync_whatsapp_notes(VAULT_PATH)
+        if wa_stats.get("ok") and wa_stats.get("files_written"):
+            console.print(
+                f"[dim]WhatsApp sync: {wa_stats['files_written']} notas nuevas/modificadas "
+                f"de {wa_stats['buckets']} (chat, mes) buckets · {wa_stats['chats']} chats "
+                f"→ {wa_stats['target']}/[/dim]"
+            )
+        elif not wa_stats.get("ok") and wa_stats.get("reason") not in (None, "script_missing"):
+            console.print(f"[yellow]WhatsApp sync: {wa_stats['reason']}[/yellow]")
+    except Exception as exc:
+        console.print(f"[yellow]WhatsApp sync falló: {exc}[/yellow]")
+
+    # External-source ETLs (Phase 1, no auth): Apple Reminders, Apple Calendar,
+    # Chrome history (+ derived YouTube). All silent-fail when the source is
+    # unavailable (no Apple, no icalBuddy, Chrome locked) so `rag index` keeps
+    # working on hosts without these tools.
+    for label, fn, kind in (
+        ("Reminders",  _sync_reminders_notes,        "reminders"),
+        ("Calendar",   _sync_apple_calendar_notes,   "events"),
+        ("Chrome",     _sync_chrome_history,         "urls"),
+        ("Gmail",      _sync_gmail_notes,            "gmail"),
+        ("Drive",      _sync_gdrive_notes,           "drive"),
+        ("GitHub",     _sync_github_activity,        "github"),
+        ("Claude",     _sync_claude_code_transcripts,"claude"),
+        ("YT trans.",  _sync_youtube_transcripts,    "yt-trans"),
+        ("Spotify",    _sync_spotify_notes,          "spotify"),
+    ):
+        _t_etl = time.perf_counter()
+        try:
+            stats = fn(VAULT_PATH)
+            _ms = int((time.perf_counter() - _t_etl) * 1000)
+            if stats.get("ok") and stats.get("files_written"):
+                if kind == "reminders":
+                    detail = f"{stats.get('pending', 0)} pending · {stats.get('completed', 0)} done"
+                elif kind == "events":
+                    detail = f"{stats.get('events', 0)} eventos"
+                elif kind == "urls":
+                    detail = (
+                        f"{stats.get('urls', 0)} URLs · "
+                        f"{stats.get('youtube_videos', 0)} YouTube"
+                    )
+                elif kind == "gmail":
+                    detail = f"{stats.get('messages', 0)} mensajes"
+                elif kind == "drive":
+                    detail = f"{stats.get('docs', 0)} docs"
+                elif kind == "github":
+                    detail = f"{stats.get('events', 0)} eventos · {stats.get('open_prs', 0)} open PRs"
+                elif kind == "claude":
+                    detail = f"{stats.get('sessions_seen', 0)} sesiones (30d)"
+                elif kind == "yt-trans":
+                    detail = (
+                        f"{stats.get('fetched_this_run', 0)} fetched · "
+                        f"{stats.get('failed_this_run', 0)} failed · "
+                        f"{stats.get('videos_known', 0)} known"
+                    )
+                elif kind == "spotify":
+                    top_part = " · top refreshed" if stats.get('refreshed_top') else ""
+                    detail = f"{stats.get('recently_played', 0)} played{top_part}"
+                else:
+                    detail = ""
+                console.print(
+                    f"[dim]{label} sync: {stats['files_written']} archivo(s) → "
+                    f"{stats['target']}/ ({detail}, {_ms}ms)[/dim]"
+                )
+            elif stats.get("ok"):
+                # Hash-skip path: nothing changed. Print compact line so the
+                # user sees the ETL ran (otherwise looks like nothing happened).
+                console.print(
+                    f"[dim]{label} sync: skip ({_ms}ms)[/dim]"
+                )
+            elif not stats.get("ok") and stats.get("reason") not in (
+                None, "apple_disabled", "icalbuddy_missing",
+                "no_visits_or_chrome_locked", "no_data", "no_events",
+                "no_messages", "no_docs", "no_google_credentials",
+                "no_videos", "no_recent_sessions", "no_claude_projects_dir",
+                "gh_unavailable_or_unauth", "gh_no_login", "no_activity",
+                "no_spotify_credentials", "no_spotify_token",
+            ):
+                console.print(f"[yellow]{label} sync: {stats['reason']} ({_ms}ms)[/yellow]")
+            else:
+                # Skipped silently (no creds / no source available). Still
+                # show one dim line so the count of ETLs in the run is clear.
+                console.print(
+                    f"[dim]{label} sync: skip ({stats.get('reason','no-data')})[/dim]"
+                )
+        except Exception as exc:
+            console.print(f"[yellow]{label} sync falló: {exc}[/yellow]")
+
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
     existing_all = col.get(include=["metadatas"])
     file_to_chunks: dict[str, list[tuple[str, str]]] = {}
@@ -11191,16 +12760,21 @@ def query(
     # Vacío si no hay — zero overhead cuando el usuario no los configuró.
     user_block = user_prompt_block()
     rules_full = f"{user_block}{rules}" if user_block else rules
+    # Person-mention enrichment — see build_person_context(). Same path that
+    # web /api/chat + rag chat use; here it covers `rag query` (CLI) which the
+    # WhatsApp listener calls via subprocess for plain-text questions.
+    _person_ctx = build_person_context(question)
+    _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
     # When we have session history, build a chat-style prompt so the LLM sees
     # the conversation context. Otherwise keep the one-shot prompt unchanged.
     if history:
         messages = (
-            [{"role": "system", "content": f"{rules_full}\nCONTEXTO:\n{context}"}]
+            [{"role": "system", "content": f"{rules_full}\n{_person_block}CONTEXTO:\n{context}"}]
             + history
             + [{"role": "user", "content": question}]
         )
     else:
-        messages = [{"role": "user", "content": f"{rules_full}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
+        messages = [{"role": "user", "content": f"{rules_full}\n{_person_block}CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
 
     t_gen_start = time.perf_counter()
     parts: list[str] = []
@@ -20192,9 +21766,41 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
         for q in ev["low_conf_queries"][:6]:
             parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
         parts.append("")
-    parts.extend([
+    fin = ev.get("finance") or {}
+    ars = fin.get("ars") or {}
+    has_finance = bool(ars.get("this_month"))
+    if has_finance:
+        m_label = fin.get("month_label", "")
+        elapsed = fin.get("days_elapsed")
+        in_month = fin.get("days_in_month")
+        this_m = ars.get("this_month", 0.0)
+        prev_m = ars.get("prev_month", 0.0) or 0.0
+        delta = ars.get("delta_pct")
+        projected = ars.get("projected")
+        parts.append(f"## Finanzas {m_label} (MOZE, ARS):")
+        parts.append(f"- gastado: {this_m:,.0f} ARS ({elapsed}/{in_month} días)")
+        if prev_m:
+            sign = "+" if (delta or 0) >= 0 else ""
+            parts.append(f"- mes anterior: {prev_m:,.0f} ARS ({sign}{delta:.0f}%)")
+        if projected:
+            parts.append(f"- proyección fin de mes: {projected:,.0f} ARS")
+        cats = ars.get("top_categories") or []
+        if cats:
+            bits = ", ".join(
+                f"{c['name']} {c['amount']:,.0f} ({c['share']*100:.0f}%)"
+                for c in cats[:3]
+            )
+            parts.append(f"- top categorías: {bits}")
+        parts.append("")
+    sections_hint = (
         "Formato de salida (Markdown, EXACTO, incluí las 4 secciones aunque "
-        "alguna quede corta):",
+        "alguna quede corta" + (
+            "; agregá `## 💸 Finanzas` como 5ta sección SOLO si recibiste "
+            "el bloque 'Finanzas' arriba" if has_finance else ""
+        ) + "):"
+    )
+    parts.extend([
+        sections_hint,
         "",
         "## 🪞 Lo que pasó hoy",
         "(2-3 líneas concretas: qué notas tocaste, qué temas aparecieron; "
@@ -20211,6 +21817,15 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
         "## 🌅 Para mañana",
         "(2-3 action items concretos derivados de cabos sueltos de hoy; "
         "NO agenda genérica — tienen que venir del contexto real)",
+    ])
+    if has_finance:
+        parts.extend([
+            "",
+            "## 💸 Finanzas",
+            "(1-2 líneas: total del mes + si el run-rate proyecta arriba/abajo "
+            "del mes pasado, y 1 categoría que destaca. Sé factual, sin juicio.)",
+        ])
+    parts.extend([
         "",
         "Entre 150 y 250 palabras total. Citá notas con [[Título]].",
     ])

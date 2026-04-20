@@ -153,12 +153,17 @@ def chat_env(monkeypatch):
     - Skip person-mention enrichment.
     - Skip the episodic-conversation daemon thread.
     - No-op session persistence + log writer.
+    - Force RAG_WEB_TOOL_LLM_DECIDE=1 so the LLM tool-deciding round runs
+      even when the pre-router matches nothing (default prod behaviour is
+      to skip it for latency; these tests assert that round's semantics).
     """
+    monkeypatch.setenv("RAG_WEB_TOOL_LLM_DECIDE", "1")
     monkeypatch.setattr(
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
     )
     monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
     monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
     # build_person_context is a lazy `from rag import ...` inside the
     # endpoint, so we patch the source module.
@@ -266,6 +271,7 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
     ]
     mock = _OllamaMock(responses)
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _body = _post_chat("que tal")
 
@@ -309,6 +315,7 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
         _mk_stream(["tiempo: ", "soleado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _ = _post_chat("qué tiempo va a hacer")
 
@@ -355,6 +362,7 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _ = _post_chat("resumen del dia")
 
@@ -405,6 +413,7 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
         _mk_stream(["done"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _ = _post_chat("buscá foo y contame el clima")
 
@@ -434,6 +443,7 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _ = _post_chat("clima")
 
@@ -477,6 +487,7 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
         _mk_stream(["forzado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
     events, _ = _post_chat("dame clima 3 veces")
 

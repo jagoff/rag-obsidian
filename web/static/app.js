@@ -857,6 +857,10 @@ async function send(question) {
   appendLine(turn, "user", question);
   const thinking = el("div", "thinking");
   thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+  // Seed the stage label immediately so the user sees "pensando…" on click.
+  // Heartbeat/status events replace this with "buscando…" / "generando…"
+  // once they start flowing (~500ms–3s in).
+  thinking.setAttribute("data-stage", "pensando…");
   turn.appendChild(thinking);
   scrollBottom();
 
@@ -867,6 +871,36 @@ async function send(question) {
   let confidence = null;
   let metaShown = false;
   let aborted = false;
+  // Ticker for the `generating` stage — server fires one `status` event
+  // when it starts calling the LLM, then nothing until the first token
+  // arrives ~5-10s later. Pulsing dots alone feel frozen; a running
+  // counter + shifting copy signals forward motion + "ya llega" past
+  // the P50 threshold.
+  let generatingStart = 0;
+  let generatingTimer = null;
+  function stopGeneratingTicker() {
+    if (generatingTimer) {
+      clearInterval(generatingTimer);
+      generatingTimer = null;
+    }
+  }
+  function startGeneratingTicker() {
+    stopGeneratingTicker();
+    generatingStart = performance.now();
+    const tick = () => {
+      if (!thinking.isConnected) { stopGeneratingTicker(); return; }
+      const s = (performance.now() - generatingStart) / 1000;
+      const whole = Math.floor(s);
+      let copy;
+      if (s < 3) copy = "generando…";
+      else if (s < 8) copy = `generando… (${whole}s)`;
+      else if (s < 15) copy = `casi listo… (${whole}s)`;
+      else copy = `todavía trabajando… (${whole}s)`;
+      thinking.setAttribute("data-stage", copy);
+    };
+    tick();
+    generatingTimer = setInterval(tick, 500);
+  }
   // Tool-call progress chips — persist across the thinking→token boundary
   // so `status {stage:"tool"}` events keep rendering after the dots
   // disappear. Chips are appended in fire order; duplicates across rounds
@@ -915,6 +949,7 @@ async function send(question) {
       }
     }
   } catch (err) {
+    stopGeneratingTicker();
     if (err && err.name === "AbortError") {
       aborted = true;
       if (thinking.isConnected) thinking.remove();
@@ -925,6 +960,7 @@ async function send(question) {
       turn.appendChild(el("div", "error", `  error: ${err.message}`));
     }
   } finally {
+    stopGeneratingTicker();
     pending = false;
     input.disabled = false;
     stopBtn.hidden = true;
@@ -959,6 +995,7 @@ async function send(question) {
       if (Number.isFinite(parsed.confidence)) confidence = parsed.confidence;
     } else if (event === "token") {
       if (!ragLine) {
+        stopGeneratingTicker();
         thinking.remove();
         ragLine = document.createElement("div");
         ragLine.className = "line";
@@ -1004,14 +1041,22 @@ async function send(question) {
       if (ttsEnabled && !aborted && fullText.trim()) speak(fullText);
       scrollBottom();
     } else if (event === "empty") {
+      stopGeneratingTicker();
       thinking.remove();
       clearToolChips();
       turn.appendChild(el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`));
       if (question) appendWebSearch(turn, question);
     } else if (event === "error") {
+      stopGeneratingTicker();
       thinking.remove();
       clearToolChips();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
+    } else if (event === "heartbeat") {
+      const elapsed = parsed.elapsed_s != null
+        ? `${parsed.elapsed_s.toFixed(1)}s`
+        : "";
+      const stage = parsed.stage === "generating" ? "generando" : "trabajando";
+      thinking.setAttribute("data-stage", `${stage}… (${elapsed})`);
     } else if (event === "status") {
       if (parsed.stage === "tool") {
         const bar = ensureToolsBar();
@@ -1034,9 +1079,13 @@ async function send(question) {
           pending.textContent = `${toolLabel(name)} (${formatMs(parsed.ms)})`;
         }
       } else {
-        const label = parsed.stage === "generating" ? "generando…" : "buscando…";
-        thinking.setAttribute("data-stage", label);
-        if (parsed.stage === "generating") stopAllChipPulses();
+        if (parsed.stage === "generating") {
+          stopAllChipPulses();
+          startGeneratingTicker();
+        } else {
+          stopGeneratingTicker();
+          thinking.setAttribute("data-stage", "buscando…");
+        }
       }
     }
   }
@@ -1179,6 +1228,32 @@ form.addEventListener("submit", async (e) => {
   }
   send(q);
 });
+
+// Click the "rag" title in the topbar → clear the visible conversation.
+// Mirrors `/cls`: wipes the DOM + aborts in-flight, but keeps the session
+// id and the up-arrow query history intact. Server-side turns and arrow
+// history survive so the user can keep the thread going after clicking.
+const brand = document.querySelector(".topbar-title");
+if (brand) {
+  brand.style.cursor = "pointer";
+  brand.setAttribute("role", "button");
+  brand.setAttribute("tabindex", "0");
+  brand.setAttribute("title", "Click para limpiar la vista");
+  const clearView = () => {
+    if (currentController) currentController.abort();
+    messagesEl.innerHTML = "";
+    input.value = "";
+    autoGrow();
+    input.focus();
+  };
+  brand.addEventListener("click", clearView);
+  brand.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      clearView();
+    }
+  });
+}
 
 // Auto-submit when arriving from a deep-link like /chat?q=foo
 (() => {

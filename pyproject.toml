@@ -17,7 +17,9 @@ dependencies = [
     "watchdog>=6.0.0",
     "google-api-python-client>=2.0",
     "google-auth>=2.0",
+    "google-auth-oauthlib>=1.2",
     "youtube-transcript-api>=1.0",
+    "spotipy>=2.23",
 ]
 
 [project.optional-dependencies]

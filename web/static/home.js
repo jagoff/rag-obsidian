@@ -45,9 +45,19 @@ const els = {
   narrative: document.getElementById("narrative-wrap"),
   panels: document.getElementById("panels"),
   error: document.getElementById("error-wrap"),
-  btnRefresh: document.getElementById("btn-refresh"),
   progress: document.getElementById("progress"),
 };
+
+// Refresh buttons live inside the narrative card (inline when the brief is
+// pending, icon-only corner when the brief exists). Both carry class
+// `.js-refresh` so loading-state and click delegation don't care which one
+// is mounted.
+function setRefreshSpinning(on) {
+  document.querySelectorAll(".js-refresh").forEach((b) => {
+    b.disabled = on;
+    b.classList.toggle("spinning", on);
+  });
+}
 
 const REFRESH_MS = 60_000;
 const MIN_RELOAD_GAP_MS = 5_000;  // ignore back-to-back triggers (visibility + interval)
@@ -806,21 +816,49 @@ function renderUrgent(items) {
 
 // ── Narrative (today brief) ─────────────────────────────────────────────
 function renderNarrative(text, source, briefPath, totalSignals) {
+  const refreshBtnFull = `
+    <button type="button" class="home-btn home-btn-icon js-refresh"
+            title="Refrescar todo (fuentes + brief)" aria-label="Refrescar">
+      <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-3-6.7"/>
+        <path d="M21 3v6h-6"/>
+      </svg>
+      <span>refrescar</span>
+    </button>`;
+  const refreshBtnIcon = `
+    <button type="button" class="home-btn home-btn-icon js-refresh narrative-refresh"
+            title="Refrescar todo (fuentes + brief)" aria-label="Refrescar">
+      <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12a9 9 0 1 1-3-6.7"/>
+        <path d="M21 3v6h-6"/>
+      </svg>
+    </button>`;
   if (!text) {
     if (totalSignals > 0) {
       els.narrative.innerHTML = `
-        <div class="narrative">
-          <span style="color:var(--text-dim);">brief del día pendiente · click en refrescar (arriba) para armarlo (~10-15s)</span>
+        <div class="narrative narrative-pending">
+          <span style="color:var(--text-dim);">brief del día pendiente · armarlo toma ~10-15s</span>
+          ${refreshBtnFull}
         </div>`;
     } else {
-      els.narrative.innerHTML = "";
+      els.narrative.innerHTML = `
+        <div class="narrative narrative-pending">
+          <span style="color:var(--text-dim);">sin actividad hoy</span>
+          ${refreshBtnFull}
+        </div>`;
     }
     return;
   }
   const html = window.marked
     ? marked.parse(stripWikilinks(text))
     : `<pre>${esc(stripWikilinks(text))}</pre>`;
-  els.narrative.innerHTML = `<div class="narrative">${html}</div>`;
+  els.narrative.innerHTML = `
+    <div class="narrative narrative-filled">
+      ${refreshBtnIcon}
+      ${html}
+    </div>`;
   injectTomorrowReminderButtons();
 }
 
@@ -976,8 +1014,8 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
   lastLoadStarted = now;
   inflight = true;
 
-  els.btnRefresh.disabled = true;
-  els.btnRefresh.classList.add("spinning");
+  const spinStart = Date.now();
+  setRefreshSpinning(true);
   els.progress.classList.add("active");
 
   // First paint: show skeleton panels so the page has structure while
@@ -1009,15 +1047,25 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
     }
     if (warmingPoll) { clearTimeout(warmingPoll); warmingPoll = null; }
     render(data);
+    // render() rewrites the narrative card's innerHTML, which destroys
+    // the spinning button + rebuilds a fresh one without the class. Re-
+    // apply so the spin keeps going until MIN_SPIN_MS elapses.
+    setRefreshSpinning(true);
     firstLoad = false;
   } catch (err) {
     els.error.innerHTML = `<div class="error">error: ${esc(err.message || String(err))}</div>`;
     els.status.innerHTML = '<span class="dot stale">●</span> error — reintentá';
   } finally {
-    inflight = false;
-    els.btnRefresh.disabled = false;
-    els.btnRefresh.classList.remove("spinning");
-    els.progress.classList.remove("active");
+    // Cache hit returns in ~300ms — faster than perception. Hold the
+    // spinner + disabled state long enough that the click registers as
+    // feedback. Slow regenerate paths already exceed this floor.
+    const MIN_SPIN_MS = 800;
+    const remain = Math.max(0, MIN_SPIN_MS - (Date.now() - spinStart));
+    setTimeout(() => {
+      inflight = false;
+      setRefreshSpinning(false);
+      els.progress.classList.remove("active");
+    }, remain);
   }
 }
 
@@ -1029,9 +1077,14 @@ function scheduleRefresh() {
   }, REFRESH_MS);
 }
 
-// One button, one action: fetch fresh evidence from every channel AND
-// regenerate the LLM brief. No cache reuse. Takes ~10-15s.
-els.btnRefresh.addEventListener("click", () => load(true));
+// One action — delegated click catches whichever refresh button is
+// currently mounted (inline pending / corner when brief exists).
+// Fetches fresh evidence + regenerates the LLM brief (~10-15s).
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".js-refresh");
+  if (!btn || btn.disabled) return;
+  load(true);
+});
 
 // Manual collapse toggle: click chevron → fold body, persist in
 // localStorage so the state survives reloads and re-renders. Re-renders

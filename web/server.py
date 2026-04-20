@@ -127,7 +127,9 @@ _PLANNING_PAT = (
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
     ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|record[aá]me|agend[aá]me|" + _PLANNING_PAT),
-    ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail|inbox|bandeja)\b"),
+    # "inbox" / "bandeja" alone are too generic — Obsidian PARA uses
+    # "00-Inbox" heavily. Require an explicit mail signal.
+    ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)\b|bandeja\s+de\s+entrada"),
     ("calendar_ahead",  {}, r"calendari|\bevento\b|\bcita\b|reuni[oó]n|\bagenda\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
     ("weather",         {}, r"\bclima\b|\btiempo\b|llov|lluvia|temperatur|pron[oó]stico"),
 )
@@ -269,7 +271,17 @@ _WEB_SYSTEM_PROMPT = (
     "'eso', 'ahí'), referencias elípticas ('y de X?', 'profundizá'), "
     "o asume un tema del turn anterior, resolvé la referencia usando "
     "el historial y respondé sobre ESE tema. No trates la pregunta "
-    "como si empezara de cero.\n"
+    "como si empezara de cero.\n\n"
+    "REGLA 6 — TRATAMIENTO: le hablás DIRECTAMENTE al usuario en 2da "
+    "persona singular, tuteo rioplatense ('vos', 'tu', 'tenés', 'te'). "
+    "El usuario ES la persona que hace la pregunta — no es un tercero "
+    "del que hablás. TOTALMENTE PROHIBIDO escribir 'el usuario', 'del "
+    "usuario', 'le' refiriéndose al usuario, ni describirlo en 3ra "
+    "persona. Traducí automáticamente: 'la hija del usuario' → 'tu "
+    "hija'; 'las notas del usuario' → 'tus notas'; 'el proyecto X "
+    "del usuario' → 'tu proyecto X'. Si una nota dice 'Grecia es la "
+    "hija de Fernando', y Fernando es el usuario, escribí 'Grecia es "
+    "tu hija'.\n"
 )
 
 
@@ -307,6 +319,27 @@ def _warmup() -> None:
                 except Exception:
                     pass
                 break
+            # End-to-end warmup: load the expensive singletons that the
+            # first /api/chat would otherwise pay for (reranker on MPS +
+            # bge-m3 SentenceTransformer + one dummy embed pass). Only
+            # fires when the operator has opted into pinning them via the
+            # same flags that keep them resident.
+            if os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip() not in ("", "0", "false", "no"):
+                try:
+                    from rag import get_reranker as _get_rr
+                    _get_rr()
+                    print("[warmup] reranker loaded on MPS", flush=True)
+                except Exception as _exc:
+                    print(f"[warmup] reranker skipped: {_exc}", flush=True)
+            if os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
+                try:
+                    from rag import _get_local_embedder as _gle
+                    _mdl = _gle()
+                    if _mdl is not None:
+                        _mdl.encode(["warmup"], show_progress_bar=False)
+                        print("[warmup] bge-m3 local embedder ready", flush=True)
+                except Exception as _exc:
+                    print(f"[warmup] local embed skipped: {_exc}", flush=True)
         except Exception:
             pass
 
@@ -506,6 +539,39 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
     try:
         with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout) as r:
             return r.status == 200
+    except Exception:
+        return False
+
+
+# Dedicated streaming client with a per-chunk read timeout. httpx applies
+# `read` to each chunk of a streaming response: if no bytes arrive within
+# the budget, ReadTimeout fires and our `except Exception` surfaces an
+# error SSE to the frontend. Without this, a stuck-load ollama daemon
+# silently wedges the /api/chat stream forever (spinner never clears).
+# Budget rationale: qwen2.5:7b prefill on 9k-char ctx measures 5-10s P50,
+# so 45s read is >4x the worst observed and well below user patience.
+_OLLAMA_STREAM_TIMEOUT = 45.0
+_OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
+
+
+def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
+    """Deep probe: does `/api/chat` actually stream a token within `timeout_s`?
+
+    The shallow `/api/tags` probe is insufficient — we've seen the daemon
+    accept /api/tags while /api/chat hangs indefinitely (stuck-load mid-run).
+    This probe sends a 1-token chat against the pinned chat model; if the
+    daemon is wedged, httpx raises within the budget. Reuses the streaming
+    client so the budget applies uniformly.
+    """
+    try:
+        _OLLAMA_STREAM_CLIENT.chat(
+            model=_resolve_web_chat_model(),
+            messages=[{"role": "user", "content": "."}],
+            options={"num_predict": 1, "temperature": 0, "seed": 42},
+            stream=False,
+            keep_alive=-1,
+        )
+        return True
     except Exception:
         return False
 
@@ -871,17 +937,56 @@ def list_vaults() -> dict:
 
 @app.get("/api/history")
 def query_history(limit: int = 200) -> dict:
-    """Tail of `queries.jsonl` for terminal-style up-arrow nav in the web UI.
+    """Recent chat questions for terminal-style up-arrow nav in the web UI.
 
     Returns oldest→newest after deduping consecutive identical questions.
     Filters to chat-bound commands so /save, /reindex, internal eval runs,
     etc. don't pollute the history list.
+
+    Source of truth post-cutover 2026-04-19 is the SQL `rag_queries` table
+    (JSONL writes are gated off by RAG_STATE_SQL=1). Falls back to
+    `queries.jsonl` if SQL path is off or fails, so pre-cutover installs
+    keep working.
     """
     limit = max(1, min(int(limit or 200), 1000))
+    # `web` = web chat endpoint (default cmd in /api/chat log_query_event);
+    # `query`/`chat`/`ask` = CLI paths; older rows may have empty cmd.
+    keep_cmds = {"query", "chat", "ask", "web"}
+    out: list[str] = []
+
+    if RAG_STATE_SQL:
+        try:
+            # Pull ≥limit rows and dedup, newest-first, then reverse to
+            # oldest→newest for the UI. Over-fetch by 4x so consecutive
+            # duplicates don't starve the returned window.
+            with _ragvec_state_conn() as conn:
+                rows = conn.execute(
+                    "SELECT q, cmd FROM rag_queries "
+                    "ORDER BY id DESC LIMIT ?",
+                    (limit * 4,),
+                ).fetchall()
+            seen_prev: str | None = None
+            picked: list[str] = []
+            for q, cmd in rows:  # newest → oldest
+                cmd = (cmd or "").strip()
+                if cmd and cmd not in keep_cmds:
+                    continue
+                q = (q or "").strip()
+                if not q or q == seen_prev:
+                    continue
+                picked.append(q)
+                seen_prev = q
+                if len(picked) >= limit:
+                    break
+            out = list(reversed(picked))
+            if out:
+                return {"history": out}
+            # SQL returned zero rows — fall through to JSONL for older data.
+        except Exception as exc:
+            _log_sql_state_error("history_sql_read_failed", err=repr(exc))
+
     if not LOG_PATH.is_file():
         return {"history": []}
-    keep_cmds = {"query", "chat", "ask"}
-    out: list[str] = []
     try:
         with LOG_PATH.open("r", encoding="utf-8", errors="replace") as fh:
             for raw in fh:
@@ -1464,7 +1569,7 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
     # full brief lands even with both vaults' loops expanded.
     tasks_options = {**CHAT_OPTIONS, "num_predict": 800}
     try:
-        for chunk in ollama.chat(
+        for chunk in _OLLAMA_STREAM_CLIENT.chat(
             model=resolve_chat_model(),
             messages=messages,
             options=tasks_options,
@@ -2318,8 +2423,10 @@ def _ensure_chat_model_prewarmer() -> None:
                 model = _resolve_web_chat_model()
                 # Tiny ping — 1 token is enough to re-pin KV cache + model weights.
                 # options=keep_alive=-1 instructs ollama to hold the model forever,
-                # overriding its internal eviction pressure.
-                ollama.chat(
+                # overriding its internal eviction pressure. Uses the bounded
+                # streaming client so a stuck-load daemon can't wedge this
+                # thread forever and mask the next real request.
+                _OLLAMA_STREAM_CLIENT.chat(
                     model=model,
                     messages=[{"role": "user", "content": "."}],
                     options={"num_predict": 1, "temperature": 0, "seed": 42},
@@ -2545,6 +2652,12 @@ def _home_compute(regenerate: bool = False) -> dict:
     # fast — if no cached brief exists yet, the UI shows "pendiente" and
     # offers a button that re-hits with regenerate=true.
     if today_total > 0 and regenerate:
+        # Inject the monthly MOZE snapshot so the LLM narrative can cite
+        # cuánto gastaste este mes — otherwise it refuses ("no encontré
+        # finanzas") even though the home panel renders the numbers.
+        finance_snapshot = signals.get("finance") if isinstance(signals, dict) else None
+        if finance_snapshot:
+            today_ev = {**today_ev, "finance": finance_snapshot}
         prompt = _render_today_prompt(date_label, today_ev)
         narrative = _generate_today_narrative(prompt)
         narrative_source = "generated" if narrative else "error"
@@ -2727,15 +2840,22 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 return
 
         # Fail fast if ollama is in the "stuck-load" state — accepts HTTP
-        # but never responds. Without this probe, the chat hangs on the
-        # first embed call for ~5 minutes until the user gives up. The
-        # probe is /api/tags which returns instantly on a healthy daemon.
-        if not _ollama_alive(timeout=2.0):
-            yield _sse("error", {
-                "message": "Ollama no responde. Probá: curl -X POST "
-                "http://localhost:8765/api/ollama/restart",
-            })
-            return
+        # but never responds. Two-layer probe: /api/tags is the cheap
+        # "daemon listening?" check; the deep chat probe catches the mode
+        # where tags responds but chat hangs (seen 2026-04-19 — tags OK,
+        # /api/chat never flushed first chunk). On deep-probe failure we
+        # auto-heal via `brew services restart ollama` and re-probe once
+        # before giving up, so the user's next /api/chat request doesn't
+        # need a manual panic-button press.
+        if not _ollama_alive(timeout=2.0) or not _ollama_chat_probe(timeout_s=6.0):
+            print("[ollama-preflight] stuck-load detected — auto-restarting", flush=True)
+            if not _ollama_restart_if_stuck() or not _ollama_chat_probe(timeout_s=8.0):
+                yield _sse("error", {
+                    "message": "Ollama no responde (stuck-load). Auto-restart falló. "
+                    "Probá: brew services restart ollama",
+                })
+                return
+            print("[ollama-preflight] recovered via restart", flush=True)
 
         # Kick off WhatsApp fetch in parallel with retrieve so the SQLite
         # round-trip (25-180ms) overlaps with the heavier retrieval work
@@ -3108,7 +3228,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     # `else:` clause firing (which would nudge the model
                     # with a "cap reached" system message).
                     break
-                _tr = ollama.chat(
+                _tr = _OLLAMA_STREAM_CLIENT.chat(
                     model=_web_model,
                     messages=tool_messages,
                     tools=CHAT_TOOLS,
@@ -3238,7 +3358,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
-            for chunk in ollama.chat(
+            for chunk in _OLLAMA_STREAM_CLIENT.chat(
                 model=_web_model,
                 messages=final_messages,
                 options=_WEB_CHAT_OPTIONS,

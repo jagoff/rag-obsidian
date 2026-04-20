@@ -84,6 +84,13 @@ html, body {
   font-weight: 700;
   color: var(--cyan);
   letter-spacing: 0.01em;
+  transition: opacity 140ms ease-out;
+}
+.topbar-title[role="button"]:hover { opacity: 0.7; }
+.topbar-title[role="button"]:focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: 3px;
+  border-radius: 2px;
 }
 .topbar-title span {
   color: var(--text-faint);

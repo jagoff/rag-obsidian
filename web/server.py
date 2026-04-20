@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 # rag.py vive en el root del proyecto; lo importamos como módulo.
 ROOT = Path(__file__).resolve().parent.parent
@@ -640,10 +640,13 @@ class ChatRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     turn_id: str
     rating: int                   # +1 thumbs up / -1 thumbs down
-    q: str | None = None
-    paths: list[str] | None = None
+    # Post-hoc parse-time size caps so a multi-MB payload rejects with
+    # 422 before we allocate it into memory. The downstream handler
+    # trims/caps further as a belt-and-suspenders.
+    q: str | None = Field(None, max_length=2000)
+    paths: list[str] | None = Field(None, max_length=50)
     session_id: str | None = None
-    reason: str | None = None     # short free-text, optional (≤200 chars after trim)
+    reason: str | None = Field(None, max_length=500)     # short free-text, optional (≤200 chars after trim)
 
     @field_validator("turn_id")
     @classmethod
@@ -3378,6 +3381,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
 
+    # Detect create-intent EARLY. When true we skip emitting `sources`
+    # (vault citations are noise when the user is creating something new,
+    # not asking about existing notes) and we bypass the read-intent
+    # pre-router further down.
+    is_propose_intent = _detect_propose_intent(question)
+
     sid = req.session_id or f"web:{uuid.uuid4().hex[:12]}"
     sess = ensure_session(sid, mode="chat")
     vaults = _resolve_scope(req.vault_scope)
@@ -3407,10 +3416,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if _cached:
                 # Replay completo como SSE. El UI no distingue cached de live.
                 yield _sse("status", {"stage": "cached"})
-                yield _sse("sources", {
-                    "items": _cached["sources_items"],
-                    "confidence": _cached["top_score"],
-                })
+                if not is_propose_intent:
+                    yield _sse("sources", {
+                        "items": _cached["sources_items"],
+                        "confidence": _cached["top_score"],
+                    })
                 # Stream el texto en chunks chicos para mantener la ilusión
                 # de streaming (el cliente ya espera SSE tokens). 40 chars ≈
                 # 10 tokens — UI renderea suave sin el feel "pegote instantáneo".
@@ -3572,11 +3582,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         }
 
         yield _sse("sources", {
-            "items": [
-                {**_source_payload(m, s), "bar": _score_bar(float(s))}
-                for m, s in zip(result["metas"], result["scores"])
-            ],
+            "items": (
+                []
+                if is_propose_intent
+                else [
+                    {**_source_payload(m, s), "bar": _score_bar(float(s))}
+                    for m, s in zip(result["metas"], result["scores"])
+                ]
+            ),
             "confidence": round(float(result["confidence"]), 3),
+            "propose_intent": is_propose_intent,
         })
 
         is_multi = len(vaults) > 1
@@ -3785,7 +3800,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # CREATING something makes the LLM hallucinate that the event
             # already exists. Skip the pre-router entirely when propose
             # intent is detected — let the LLM decide cleanly.
-            _propose_intent = _detect_propose_intent(question)
+            _propose_intent = is_propose_intent
             _forced_tools = [] if _propose_intent else _detect_tool_intent(question)
             if _forced_tools:
                 _f_serial = [(n, a) for n, a in _forced_tools if n not in PARALLEL_SAFE]

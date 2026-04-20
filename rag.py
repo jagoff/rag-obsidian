@@ -1350,6 +1350,15 @@ CONFIDENCE_RERANK_MIN = 0.015
 # 0.10 — borderline queries that would answer but weakly benefit most from
 # iterative retrieval. Above 0.10 the first pass already found strong evidence.
 CONFIDENCE_DEEP_THRESHOLD = 0.10
+# Graph-expansion gate: when the top rerank score is ≤ this, retrieve() walks
+# the wikilink graph from top-3 hits and adds up to 2 related notes as
+# auxiliary context. Above the gate, the primary hits are strong enough that
+# extra graph context is pure prefill cost without quality lift. A/B tested
+# 2026-04-20 over 42-single/11-chain eval: 0.3 / 0.5 / 0.7 all within the
+# bootstrap CI of the floor (hit@5 78.57/83.33), so keeping 0.5 as the
+# calibrated middle-ground — narrow enough to skip strong hits, wide enough
+# to catch genuinely borderline ones. Tunable here for future corpus shifts.
+GRAPH_EXPANSION_GATE = 0.5
 
 console = Console()
 
@@ -10762,14 +10771,14 @@ def retrieve(
     # topologically close. 1-hop neighbors scored higher than 2-hop. PageRank
     # breaks ties — more authoritative neighbors surface first.
     #
-    # Skip cuando el top hit ya es fuerte (score > 0.5): el LLM tiene evidencia
-    # sólida en los primary chunks, agregar neighbors sólo suma prefill sin
-    # mejorar la respuesta. Los casos borderline (score ≤ 0.5) sí se benefician
-    # del contexto adicional del grafo.
+    # Skip cuando el top hit ya es fuerte (score > GRAPH_EXPANSION_GATE): el
+    # LLM tiene evidencia sólida en los primary chunks, agregar neighbors
+    # sólo suma prefill sin mejorar la respuesta. Los casos borderline
+    # (score ≤ gate) sí se benefician del contexto adicional del grafo.
     graph_docs: list[str] = []
     graph_metas: list[dict] = []
     _t0 = time.perf_counter()
-    if metas and top_score <= 0.5:
+    if metas and top_score <= GRAPH_EXPANSION_GATE:
         try:
             corpus = _load_corpus(col)
             adj = _build_graph_adj(corpus)

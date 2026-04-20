@@ -666,6 +666,17 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
 _OLLAMA_STREAM_TIMEOUT = 45.0
 _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 
+# Shared num_ctx for every call to the chat model from this server — the
+# real /api/chat, the preflight probe, and the background prewarmer must
+# all pass the same value. ollama re-initialises the KV cache when a
+# model call arrives with a different num_ctx than the currently-loaded
+# one, and qwen2.5:7b's default (2048) differs from the value the real
+# chat path needs (4096 — see _WEB_CHAT_OPTIONS below). A single drift
+# between preflight and /api/chat forces a full KV reinit and pushes
+# prefill from ~1.5s to ~4.9s (measured 2026-04-20). Defined at module
+# scope so there's one source of truth.
+_WEB_CHAT_NUM_CTX = 4096
+
 
 def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     """Deep probe: does `/api/chat` actually stream a token within `timeout_s`?
@@ -675,12 +686,19 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     This probe sends a 1-token chat against the pinned chat model; if the
     daemon is wedged, httpx raises within the budget. Reuses the streaming
     client so the budget applies uniformly.
+
+    CRITICAL: MUST pass num_ctx=_WEB_CHAT_NUM_CTX. Without it, ollama uses
+    its default (2048 for qwen2.5:7b) which differs from the real /api/chat
+    call (4096), forcing ollama to reinit the KV cache on the next user
+    request. Measured impact: prefill 1.5s → 4.9s (3x slower). See
+    `num_ctx mismatch` comment in the main chat path for the same trap.
     """
     try:
         _OLLAMA_STREAM_CLIENT.chat(
             model=_resolve_web_chat_model(),
             messages=[{"role": "user", "content": "."}],
-            options={"num_predict": 1, "temperature": 0, "seed": 42},
+            options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
+                     "temperature": 0, "seed": 42},
             stream=False,
             keep_alive=-1,
         )
@@ -2542,7 +2560,8 @@ def _ensure_chat_model_prewarmer() -> None:
                 _OLLAMA_STREAM_CLIENT.chat(
                     model=model,
                     messages=[{"role": "user", "content": "."}],
-                    options={"num_predict": 1, "temperature": 0, "seed": 42},
+                    options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
+                             "temperature": 0, "seed": 42},
                     stream=False,
                     keep_alive=-1,
                 )
@@ -3286,7 +3305,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # and made some calls hang silently — leave it out.
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
-            "num_ctx": 4096,
+            "num_ctx": _WEB_CHAT_NUM_CTX,
             "num_predict": 256,
         }
 

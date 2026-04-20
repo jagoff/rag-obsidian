@@ -1080,7 +1080,14 @@ URLS_COLLECTION_NAME = (
 # buffer cómodo y corta colas verbose del LLM cuando no encuentra EOS.
 CHAT_OPTIONS = {
     "temperature": 0, "top_p": 1, "seed": 42,
-    "num_ctx": 3072,
+    # num_ctx MUST match the value used by every other caller to the chat
+    # model (web/server.py _WEB_CHAT_NUM_CTX). When two call sites request
+    # the same model with different num_ctx, ollama reinitialises its KV
+    # cache and the prefix cache for the system prompt is lost — measured
+    # 2026-04-20: 20ms cache-hit prefill vs 4400ms cold-reinit (220× hit).
+    # 4096 is sized to fit system (1300 tok) + context P99 (1500 tok) +
+    # history (up to 1000 tok) without truncation, with a 300-tok margin.
+    "num_ctx": 4096,
     "num_predict": 384,
 }
 # Helpers (paraphrases, HyDE) devuelven 1-3 líneas — cap chico acelera.
@@ -8893,8 +8900,11 @@ def _surface_generate_reason(pair: dict) -> str:
         resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
+            # num_ctx=4096 matches CHAT_OPTIONS / _WEB_CHAT_NUM_CTX. Previous
+            # 2048 value was invalidating the web chat's KV cache every time
+            # the watch thread indexed a note and hit this path.
             options={"temperature": 0, "top_p": 1, "seed": 42,
-                     "num_ctx": 2048, "num_predict": 80},
+                     "num_ctx": 4096, "num_predict": 80},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         reason = (resp.message.content or "").strip().split("\n", 1)[0].strip()
@@ -23072,7 +23082,8 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "seed": 42, "num_ctx": 2048, "num_predict": 128},
+            # num_ctx=4096 to keep the web chat's KV cache warm (see CHAT_OPTIONS).
+            options={"temperature": 0, "seed": 42, "num_ctx": 4096, "num_predict": 128},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         raw = resp.message.content.strip()

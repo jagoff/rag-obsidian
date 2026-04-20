@@ -7270,26 +7270,30 @@ def get_reranker():
 
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
     Also records last-use timestamp so `maybe_unload_reranker()` can evict
-    it from MPS after a configurable idle window.
+    it from MPS after a configurable idle window. Both the timestamp
+    update and the `_reranker is None` check run inside `_reranker_lock`
+    to close a TOCTOU window with the sweeper — otherwise the sweeper
+    could read a stale `_reranker_last_use`, pass the idle check, and
+    unload the model while a concurrent query is mid-prepare. The lock
+    is uncontended on the fast path (<1µs on Python 3.13).
 
     Cold load wall-time is logged to help calibrate the deferred pre-warm
     delay in the idle sweeper (see `maybe_unload_reranker`).
     """
     global _reranker, _reranker_last_use
-    _reranker_last_use = time.time()
-    if _reranker is not None:
-        return _reranker
     with _reranker_lock:
-        if _reranker is None:
-            import torch
-            from sentence_transformers import CrossEncoder
-            if torch.backends.mps.is_available():
-                device = "mps"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
-            _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
+        _reranker_last_use = time.time()
+        if _reranker is not None:
+            return _reranker
+        import torch
+        from sentence_transformers import CrossEncoder
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
     return _reranker
 
 
@@ -7297,15 +7301,18 @@ def maybe_unload_reranker() -> bool:
     """Drop the reranker from MPS if it hasn't been used in
     `_RERANKER_IDLE_TTL` seconds. Call from a background sweeper.
     Returns True if an unload happened.
+
+    Idle check + unload happen atomically under `_reranker_lock` — reading
+    `_reranker_last_use` outside the lock would race with `get_reranker`
+    updating it, potentially unloading a model that a concurrent query
+    just touched (the query holds a local ref so predict() won't crash
+    mid-flight, but the next query pays an unnecessary 5s cold reload).
     """
     global _reranker, _reranker_last_use
-    if _reranker is None:
-        return False
-    idle = time.time() - _reranker_last_use
-    if idle < _RERANKER_IDLE_TTL:
-        return False
     with _reranker_lock:
         if _reranker is None:
+            return False
+        if time.time() - _reranker_last_use < _RERANKER_IDLE_TTL:
             return False
         try:
             import gc

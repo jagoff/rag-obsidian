@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 # rag.py vive en el root del proyecto; lo importamos como módulo.
 ROOT = Path(__file__).resolve().parent.parent
@@ -378,6 +378,16 @@ def _warmup() -> None:
                         print("[warmup] bge-m3 local embedder ready", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] local embed skipped: {_exc}", flush=True)
+            # Drain any conversation turns that failed to persist on previous
+            # runs (transient SQL busy / disk full / etc). Best-effort;
+            # survivors stay in the file for the next startup.
+            try:
+                _retried = _retry_pending_conversation_turns()
+                if _retried:
+                    print(f"[warmup] retried {_retried} pending conversation turn(s)",
+                          flush=True)
+            except Exception as _exc:
+                print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
         except Exception:
             pass
 
@@ -438,11 +448,45 @@ def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+_CHAT_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:@\-]{1,80}$")
+_TURN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_CHAT_QUESTION_MAX = 8000  # ~2k tokens — chat prompts >8k chars are pathological
+
+
 class ChatRequest(BaseModel):
     question: str
     session_id: str | None = None
     # None → vault activo; "all" → todos los registrados; "name" → ese puntual.
     vault_scope: str | None = None
+
+    @field_validator("question")
+    @classmethod
+    def _check_question(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("question must be non-empty")
+        if len(v) > _CHAT_QUESTION_MAX:
+            raise ValueError(f"question too long (>{_CHAT_QUESTION_MAX} chars)")
+        return v
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _CHAT_SESSION_RE.match(v):
+            raise ValueError("invalid session_id format")
+        return v
+
+    @field_validator("vault_scope")
+    @classmethod
+    def _check_vault_scope(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        # Same character class as session_id but shorter — vault names are
+        # paths / identifiers registered via `rag vault add`.
+        if len(v) > 200 or not re.match(r"^[A-Za-z0-9_./\-]{1,200}$", v):
+            raise ValueError("invalid vault_scope format")
+        return v
 
 
 class FeedbackRequest(BaseModel):
@@ -452,6 +496,22 @@ class FeedbackRequest(BaseModel):
     paths: list[str] | None = None
     session_id: str | None = None
     reason: str | None = None     # short free-text, optional (≤200 chars after trim)
+
+    @field_validator("turn_id")
+    @classmethod
+    def _check_turn_id(cls, v: str) -> str:
+        if not _TURN_ID_RE.match(v):
+            raise ValueError("invalid turn_id format")
+        return v
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _CHAT_SESSION_RE.match(v):
+            raise ValueError("invalid session_id format")
+        return v
 
 
 @app.post("/api/feedback")
@@ -485,10 +545,38 @@ def submit_feedback(req: FeedbackRequest) -> dict:
 # In-memory token bucket for rate limiting: 120 events/min per IP.
 # Stored as {ip: [timestamp, ...]} with a 60s sliding window. No new deps.
 import collections as _collections
+import threading as _threading
 
 _BEHAVIOR_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
 _BEHAVIOR_RATE_LIMIT = 120
 _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
+
+# Chat endpoint bucket — stricter because each hit pins the reranker, chat
+# model, and embedder on MPS; 30 chats/min per IP is plenty for human use
+# and stops an adversarial loop (e.g. browser extension gone rogue) from
+# starving the daemon. Separate from behavior bucket so clicks don't
+# consume chat budget.
+_CHAT_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
+_CHAT_RATE_LIMIT = 30
+_CHAT_RATE_WINDOW = 60.0
+
+# Single lock protects both buckets — contention is effectively nil
+# (list.append under GIL is fast enough that a lock hold measures in µs).
+_RATE_LIMIT_LOCK = _threading.Lock()
+
+
+def _check_rate_limit(bucket: dict[str, list[float]], ip: str,
+                      limit: int, window: float) -> None:
+    """Sliding-window rate limit per-IP. Raises HTTPException 429 on breach."""
+    now = time.time()
+    cutoff = now - window
+    with _RATE_LIMIT_LOCK:
+        events = bucket[ip]
+        while events and events[0] < cutoff:
+            events.pop(0)
+        if len(events) >= limit:
+            raise HTTPException(status_code=429, detail="rate limit exceeded")
+        events.append(now)
 
 _BEHAVIOR_KNOWN_EVENTS = frozenset({
     "open", "open_external", "positive_implicit",
@@ -539,15 +627,8 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
 
     # Rate limit: 120 events/60s per client IP
     client_ip = (request.client.host if request.client else "unknown")
-    now = time.time()
-    bucket = _BEHAVIOR_BUCKETS[client_ip]
-    # Prune old entries
-    cutoff = now - _BEHAVIOR_RATE_WINDOW
-    while bucket and bucket[0] < cutoff:
-        bucket.pop(0)
-    if len(bucket) >= _BEHAVIOR_RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
-    bucket.append(now)
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
 
     try:
         log_behavior_event({
@@ -2758,6 +2839,29 @@ def pendientes_api(days: int = 14) -> dict:
     }
 
 
+_CONV_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "conversation_turn_pending.jsonl"
+
+
+def _append_pending_conversation_turn(rec: dict) -> None:
+    """Append a serialisable turn record to the pending-retry file.
+
+    The file is a JSONL ring buffer consumed by _retry_pending_conversation_turns
+    at server startup and (best-effort) periodically. Each record is a
+    self-contained snapshot — vault_root str, session_id, question, answer,
+    sources, confidence, iso timestamp — so re-hydration doesn't need any
+    runtime context.
+    """
+    try:
+        _CONV_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _CONV_PENDING_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # Dead-letter failed too — nothing else we can do without blocking
+        # the SSE response. The LOG_QUEUE error record above is the last
+        # signal the operator gets.
+        pass
+
+
 def _persist_conversation_turn(
     vault_root: Path,
     session_id: str,
@@ -2767,16 +2871,18 @@ def _persist_conversation_turn(
     scores: list[float],
     confidence: float,
 ) -> None:
+    sources_payload = [
+        {"file": m.get("file", ""), "score": float(s)}
+        for m, s in zip(metas, scores)
+    ]
+    ts = datetime.now(timezone.utc)
     try:
         turn = TurnData(
             question=question,
             answer=answer,
-            sources=[
-                {"file": m.get("file", ""), "score": float(s)}
-                for m, s in zip(metas, scores)
-            ],
+            sources=sources_payload,
             confidence=float(confidence),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=ts,
         )
         path = write_turn(vault_root, session_id, turn)
         _LOG_QUEUE.put((
@@ -2788,18 +2894,84 @@ def _persist_conversation_turn(
             }) + "\n",
         ))
     except Exception as exc:
+        # Persist the turn payload to a retry queue on disk so a transient
+        # SQL / fs failure doesn't drop it silently. Consumed at startup by
+        # _retry_pending_conversation_turns. Errors still surface via
+        # LOG_QUEUE for operator visibility, but data is not lost.
+        _append_pending_conversation_turn({
+            "ts": ts.isoformat(timespec="seconds"),
+            "vault_root": str(vault_root),
+            "session_id": session_id,
+            "question": question,
+            "answer": answer,
+            "sources": sources_payload,
+            "confidence": float(confidence),
+            "error": repr(exc),
+        })
         _LOG_QUEUE.put((
             LOG_PATH,
             json.dumps({
                 "kind": "conversation_turn_error",
                 "session_id": session_id,
                 "error": repr(exc),
+                "queued_for_retry": True,
             }) + "\n",
         ))
 
 
+def _retry_pending_conversation_turns() -> int:
+    """Drain _CONV_PENDING_PATH on startup. Returns number of turns retried
+    successfully. Best-effort: failures stay in the file for the next run.
+    """
+    if not _CONV_PENDING_PATH.is_file():
+        return 0
+    try:
+        raw = _CONV_PENDING_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    remaining: list[str] = []
+    retried = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts_str = rec["ts"]
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            turn = TurnData(
+                question=rec["question"],
+                answer=rec["answer"],
+                sources=rec.get("sources", []),
+                confidence=float(rec.get("confidence", 0.0)),
+                timestamp=ts,
+            )
+            write_turn(Path(rec["vault_root"]), rec["session_id"], turn)
+            retried += 1
+        except Exception:
+            # Keep the line for the next retry cycle.
+            remaining.append(line)
+    try:
+        if remaining:
+            _CONV_PENDING_PATH.write_text("\n".join(remaining) + "\n",
+                                           encoding="utf-8")
+        else:
+            _CONV_PENDING_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return retried
+
+
 @app.post("/api/chat")
-def chat(req: ChatRequest) -> StreamingResponse:
+def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    # Rate limit: 30 chat requests / 60s per IP. Each request pins the
+    # chat model + reranker + embedder on MPS — a tight loop from a
+    # runaway client can starve the daemon for legitimate work.
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")

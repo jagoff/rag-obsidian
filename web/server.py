@@ -529,21 +529,38 @@ _WEB_SYSTEM_PROMPT = (
 # no sources. Without this override qwen2.5:7b reverts to its "resumí
 # lo que el retriever trajo" default and hallucinates a path like
 # "04-Archive/Calendar.md" to open instead of calling propose_*.
+#
+# Critical detail learned the hard way: do NOT give the model a literal
+# response example in the override. qwen2.5:7b will copy the example
+# verbatim and skip the tool call entirely ("Listo, quedó agendado."
+# was the literal example → model responded with exactly that text,
+# tool_rounds=0). The override now makes the tool call the PRIMARY
+# action and describes the response shape abstractly.
 _PROPOSE_CREATE_OVERRIDE = (
-    "OVERRIDE PARA ESTE TURNO (create-intent detectado): "
-    "El usuario quiere CREAR un recordatorio o evento. "
-    "NO hay CONTEXTO del vault adjunto. REGLA 1 (engancháte con CONTEXTO) "
-    "y REGLA 2/3/4.5 (citar fuentes, preservar links) NO aplican.\n\n"
-    "Tu única acción válida es llamar `propose_reminder` o "
-    "`propose_calendar_event` con los campos extraídos de la pregunta:\n"
-    "- `title`: qué se agenda (persona + motivo, ej. 'Grecia viene a casa').\n"
-    "- `when` / `start`: fecha/hora en lenguaje natural TAL COMO LA DIJO "
-    "  el usuario (no la conviertas — el tool la parsea).\n"
-    "- Campos opcionales: list/priority/notes/recurrence_text según aplique.\n\n"
-    "Después del tool call, respondé en UNA sola oración corta tipo "
-    "'Listo, quedó agendado' o 'Ahí te lo sumo'. NO describas los pasos "
-    "para hacerlo manual, NO menciones archivos del vault, NO inventes "
-    "paths, NO cites notas. El usuario YA ve el toast con el resultado."
+    "MODO CREATE-INTENT (turn-scoped): "
+    "El usuario te está pidiendo que REGISTRES un recordatorio o evento. "
+    "NO hay CONTEXTO del vault — no intentes resumirlo, no inventes archivos, "
+    "no menciones paths del vault, no digas que hay que abrir notas. "
+    "REGLA 1 y REGLAS 2/3/4.5 no aplican a este turno.\n\n"
+    "PROCEDIMIENTO OBLIGATORIO en este orden:\n"
+    "  1. Llamá tool_calls con UNA de estas dos tools:\n"
+    "     - `propose_calendar_event(title, start, ...)` — para eventos "
+    "       con fecha/hora (reuniones, visitas, cumpleaños, turnos).\n"
+    "     - `propose_reminder(title, when, ...)` — para recordatorios "
+    "       (pagos, llamadas, tareas).\n"
+    "     En caso de duda entre recordatorio vs evento: si la frase "
+    "     incluye HORA DE INICIO concreta → evento. Si es una tarea o "
+    "     'acordate de X' → reminder.\n"
+    "  2. Extraé `title` del texto (persona + motivo si aplica, SIN "
+    "     fechas ni horas ahí — ej. para 'Grecia viene el miercoles' "
+    "     el título es 'Grecia viene a casa', no 'miercoles').\n"
+    "  3. Pasá `start`/`when` en lenguaje natural TAL COMO LO DIJO "
+    "     el usuario. NO lo traduzcas a ISO. El tool lo parsea.\n"
+    "  4. DESPUÉS del tool call (en el turn siguiente del assistant "
+    "     sin tool_calls), respondé con UNA sola oración breve "
+    "     confirmando. Variá la redacción según el caso.\n\n"
+    "Si NO llamás el tool, el usuario no ve nada creado — es un bug. "
+    "La respuesta de texto SIN tool call NO sirve."
 )
 
 
@@ -3839,21 +3856,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # streaming call below STRIPS the addendum + `tools=` param so its
         # cache state matches the pre-tool-calling era byte-for-byte.
         #
-        # Third system message (create-intent only): a turn-scoped override
-        # that neutralises REGLA 1 (engancháte con CONTEXTO) and
-        # REGLA 2/3 (citar fuentes) which don't apply when there's no
-        # CONTEXTO. Without this the 7b model reverts to its default
-        # "summarise the vault" behaviour and hallucinates a file to
-        # open instead of calling propose_*.
-        _system_msgs: list[dict] = [
-            {"role": "system", "content": _WEB_SYSTEM_PROMPT},
-            {"role": "system", "content": _WEB_TOOL_ADDENDUM},
-        ]
+        # On create-intent turns we REPLACE the full stack with just the
+        # focused override — the normal _WEB_SYSTEM_PROMPT + addendum pin
+        # the model to "summarise the vault" behaviour that competes with
+        # the tool call. Prefix cache is cold for that first create-intent
+        # turn, acceptable cost given how rare they are compared to reads.
         if is_propose_intent:
-            _system_msgs.append({
-                "role": "system",
-                "content": _PROPOSE_CREATE_OVERRIDE,
-            })
+            _system_msgs: list[dict] = [
+                {"role": "system", "content": _PROPOSE_CREATE_OVERRIDE},
+            ]
+        else:
+            _system_msgs = [
+                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                {"role": "system", "content": _WEB_TOOL_ADDENDUM},
+            ]
         tool_messages: list[dict] = (
             _system_msgs
             + (history or [])
@@ -4053,10 +4069,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # `else:` clause firing (which would nudge the model
                     # with a "cap reached" system message).
                     break
+                # On create-intent turns, narrow the tool surface to JUST
+                # the 2 propose_* tools. With all 9 tools visible qwen2.5:7b
+                # gets decision paralysis and often returns a clarifying
+                # question instead of calling the tool. With only 2 tools
+                # present and the override telling it to call one of them,
+                # the choice is forced.
+                _round_tools = CHAT_TOOLS
+                if is_propose_intent:
+                    _round_tools = [
+                        fn for fn in CHAT_TOOLS if fn.__name__ in PROPOSAL_TOOL_NAMES
+                    ]
                 _tr = _OLLAMA_STREAM_CLIENT.chat(
                     model=_web_model,
                     messages=tool_messages,
-                    tools=CHAT_TOOLS,
+                    tools=_round_tools,
                     options=CHAT_TOOL_OPTIONS,
                     stream=False,
                     think=False,   # see _ollama_chat_probe for rationale

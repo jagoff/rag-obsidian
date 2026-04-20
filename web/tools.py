@@ -1,10 +1,11 @@
 """Chat-scoped tool registry for `POST /api/chat` ollama-native tool-calling.
 
-Exports `CHAT_TOOLS` (ordered list of 7 callables), `TOOL_FNS` (name→callable
+Exports `CHAT_TOOLS` (ordered list of callables), `TOOL_FNS` (name→callable
 dispatch map), `PARALLEL_SAFE` (names safe to run concurrently in a thread
-pool), `CHAT_TOOL_OPTIONS` (ollama options for tool-deciding call), and
-`_WEB_TOOL_ADDENDUM` (constant system-prompt suffix — kept byte-identical
-for ollama prefix caching).
+pool), `PROPOSAL_TOOL_NAMES` (names that emit SSE `proposal` events instead
+of plain tool output), `CHAT_TOOL_OPTIONS` (ollama options for
+tool-deciding call), and `_WEB_TOOL_ADDENDUM` (constant system-prompt
+suffix — kept byte-identical for ollama prefix caching).
 
 Glue only — all real logic lives in `rag.py` / `web.server`. Each tool has a
 Google-style docstring; ollama derives the JSON schema from signature +
@@ -14,7 +15,8 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -33,7 +35,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 7 tools para traer datos frescos. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 9 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -44,7 +46,13 @@ Routing por palabra clave (si aparece → llamá la tool):
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
-Regla de citas: cita SOLO paths del vault devueltos por search_vault/read_note. NUNCA cites thread_id, event_id, category, ni ningún identificador de tools externos (gmail/finance/calendar/reminders/weather) — esos datos van en prosa, sin `[...](...)`.
+Crear cosas nuevas (el usuario confirma antes de que se escriba):
+- "recordame X" / "acordate X" / "ponete un recordatorio" → propose_reminder(title, when, ...)
+- "creá/agendá un evento/reunión/turno" → propose_calendar_event(title, start, ...)
+- Estos tools NO crean nada — solo registran la propuesta. El usuario ve una tarjeta con botones y decide. No vuelvas a llamarlos si ya lo hiciste esta ronda.
+- Si el usuario no dio fecha u hora clara, preguntá en tu respuesta final (no llames el tool con inventos).
+
+Regla de citas: cita SOLO paths del vault devueltos por search_vault/read_note. NUNCA cites thread_id, event_id, category, proposal_id, ni ningún identificador de tools externos (gmail/finance/calendar/reminders/weather/propose_*) — esos datos van en prosa, sin `[...](...)`.
 
 Paralelismo: podés llamar varias tools en el mismo turno si son independientes. Máximo 3 rondas.
 """
@@ -254,6 +262,135 @@ def weather(location: str | None = None) -> str:
     return _agent_tool_weather(location)
 
 
+def propose_reminder(
+    title: str,
+    when: str = "",
+    list: str | None = None,
+    priority: int | None = None,
+    notes: str | None = None,
+    recurrence_text: str | None = None,
+) -> str:
+    """Proponer un recordatorio de Apple Reminders. NO lo crea — sólo
+    registra una propuesta que el usuario confirma en la tarjeta que se le
+    muestra. Si no confirma, no pasa nada.
+
+    Llamala cuando el usuario diga "recordame X", "acordate Y", "ponete un
+    recordatorio Z". Si la fecha/hora es ambigua ("un día de estos"), el
+    campo `due_iso` queda null y la respuesta incluye `needs_clarification:
+    true` — en ese caso pedí aclaración en tu mensaje final en vez de
+    llamar la tool de nuevo.
+
+    Args:
+        title: Texto del recordatorio (lo que hay que recordar).
+        when: Fecha/hora en lenguaje natural (ej. "mañana a las 10", "el
+            jueves 4pm", "en 2 horas"). Vacío = recordatorio sin fecha.
+        list: Lista de Reminders destino. None = lista default del sistema.
+        priority: 1 (alta), 5 (media), 9 (baja). None = sin prioridad.
+        notes: Texto adicional para el campo body del recordatorio.
+        recurrence_text: Recurrencia en lenguaje natural ("todos los lunes",
+            "cada 2 semanas"). None = no recurrente.
+
+    Returns:
+        JSON con el payload de la propuesta (shape idéntica al que la UI
+        recibe vía evento SSE `proposal`).
+    """
+    import rag  # lazy: avoid circular import at module load.
+
+    now = datetime.now()
+    due = rag._parse_natural_datetime(when, now=now) if when and when.strip() else None
+    recurrence = (
+        rag._parse_natural_recurrence(recurrence_text) if recurrence_text else None
+    )
+    needs_clarif = bool(when and when.strip()) and due is None
+
+    payload = {
+        "kind": "reminder",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "fields": {
+            "title": title,
+            "due_iso": due.isoformat() if due else None,
+            "due_text": when or "",
+            "list": list,
+            "priority": priority,
+            "notes": notes,
+            "recurrence": recurrence,
+            "recurrence_text": recurrence_text,
+        },
+    }
+    if needs_clarif:
+        payload["needs_clarification"] = True
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def propose_calendar_event(
+    title: str,
+    start: str,
+    end: str | None = None,
+    calendar: str | None = None,
+    location: str | None = None,
+    notes: str | None = None,
+    all_day: bool = False,
+    recurrence_text: str | None = None,
+) -> str:
+    """Proponer un evento de Calendar.app. NO lo crea — sólo registra una
+    propuesta que el usuario confirma en la tarjeta mostrada.
+
+    Llamala cuando el usuario diga "creá un evento", "agendá una reunión",
+    "bloqueame un turno", "poné una cita". Si no hay hora de fin explícita,
+    el evento dura 1h por default. Si la fecha de inicio no parsea, el
+    campo queda null y `needs_clarification: true` — pedí aclaración en
+    vez de re-llamar la tool.
+
+    Args:
+        title: Título / summary del evento.
+        start: Fecha/hora de inicio en lenguaje natural ("jueves 4pm").
+        end: Fecha/hora de fin (lenguaje natural). None = start + 1h.
+        calendar: Nombre del calendario destino. None = primero escribible.
+        location: Ubicación (string libre).
+        notes: Descripción / notas del evento.
+        all_day: Evento de día completo (ignora hora).
+        recurrence_text: Recurrencia en lenguaje natural. None = sin.
+
+    Returns:
+        JSON con el payload de la propuesta.
+    """
+    import rag
+
+    now = datetime.now()
+    start_dt = rag._parse_natural_datetime(start, now=now) if start and start.strip() else None
+    end_dt: datetime | None = None
+    if end and end.strip():
+        end_dt = rag._parse_natural_datetime(end, now=start_dt or now)
+    if start_dt and end_dt is None:
+        end_dt = start_dt + timedelta(hours=1)
+
+    recurrence = (
+        rag._parse_natural_recurrence(recurrence_text) if recurrence_text else None
+    )
+    needs_clarif = start_dt is None
+
+    payload = {
+        "kind": "event",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "fields": {
+            "title": title,
+            "start_iso": start_dt.isoformat() if start_dt else None,
+            "start_text": start or "",
+            "end_iso": end_dt.isoformat() if end_dt else None,
+            "end_text": end or "",
+            "calendar": calendar,
+            "location": location,
+            "notes": notes,
+            "all_day": bool(all_day),
+            "recurrence": recurrence,
+            "recurrence_text": recurrence_text,
+        },
+    }
+    if needs_clarif:
+        payload["needs_clarification"] = True
+    return json.dumps(payload, ensure_ascii=False)
+
+
 CHAT_TOOLS: list[Callable] = [
     search_vault,
     read_note,
@@ -262,6 +399,8 @@ CHAT_TOOLS: list[Callable] = [
     finance_summary,
     calendar_ahead,
     weather,
+    propose_reminder,
+    propose_calendar_event,
 ]
 
 TOOL_FNS: dict[str, Callable] = {fn.__name__: fn for fn in CHAT_TOOLS}
@@ -272,4 +411,15 @@ PARALLEL_SAFE: set[str] = {
     "calendar_ahead",
     "reminders_due",
     "gmail_recent",
+    "propose_reminder",
+    "propose_calendar_event",
+}
+
+# Tool names whose return value (JSON string) should ALSO be emitted as a
+# `proposal` SSE event by the web server — on top of the normal tool-output
+# routing. Lets the UI render a confirmation card inline while the LLM's
+# final narrative streams normally.
+PROPOSAL_TOOL_NAMES: set[str] = {
+    "propose_reminder",
+    "propose_calendar_event",
 }

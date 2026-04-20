@@ -93,6 +93,7 @@ from web.tools import (  # noqa: E402
     CHAT_TOOLS,
     CHAT_TOOL_OPTIONS,
     PARALLEL_SAFE,
+    PROPOSAL_TOOL_NAMES,
     TOOL_FNS,
     _WEB_TOOL_ADDENDUM,
 )
@@ -119,7 +120,11 @@ _PLANNING_PAT = (
 
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
-    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|record[aá]me|agend[aá]me|" + _PLANNING_PAT),
+    # NOTE: "recordame" / "agendáme" used to be here as query triggers, but
+    # they're CREATE intents now (propose_reminder / propose_calendar_event).
+    # Moved to `_PROPOSE_INTENT_RE` below. `recordator` still matches
+    # "qué recordatorios tengo" → list.
+    ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|" + _PLANNING_PAT),
     # "inbox" / "bandeja" alone are too generic — Obsidian PARA uses
     # "00-Inbox" heavily. Require an explicit mail signal.
     ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)\b|bandeja\s+de\s+entrada"),
@@ -138,6 +143,40 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     if not q:
         return []
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
+
+
+# Patterns that signal CREATE intent ("recordame X", "agendá una reunión").
+# These can't go through the pre-router because arg extraction (title, when)
+# is LLM-hard — a regex can't cleanly split "recordame llamar a Juan mañana
+# a las 10" into title="llamar a Juan" + when="mañana a las 10". But we use
+# these patterns to FORCE the LLM tool-decide loop even when
+# RAG_WEB_TOOL_LLM_DECIDE is unset (the default optimization skips the
+# decide round to save 10-30s of cold prefill on query-intent questions).
+_PROPOSE_INTENT_RE = re.compile(
+    # Reminder triggers.
+    r"\brecord[aá](?:me|te|rme|arme)\b"
+    r"|\bacord[aá](?:te|rme|ate|áte)\b"
+    r"|\bagend[aá]me\b"
+    r"|\bpon[eé](?:me|te|le)?\s+(?:un\s+)?recordatorio\b"
+    r"|\bagreg(?:á|a|ar)\s+(?:un\s+)?recordatorio\b"
+    # Calendar triggers. Require a create verb + event noun to avoid
+    # matching queries like "qué eventos tengo" (already covered by
+    # calendar_ahead read-intent).
+    r"|\b(?:cre[aá]|crear|agend[aá]|bloque[aá]|pon[eé]|agreg[aá])\b"
+    r"[^.?!]*"
+    r"\b(?:evento|reuni[oó]n|cita|turno|llamad[ao]|meeting|appointment)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_propose_intent(q: str) -> bool:
+    """Return True if `q` looks like a CREATE request (reminder or event).
+    Used by the chat endpoint to force the LLM tool-decide round even
+    when RAG_WEB_TOOL_LLM_DECIDE is unset — proposal tools can only be
+    invoked via that round (they require LLM arg extraction)."""
+    if not q:
+        return False
+    return bool(_PROPOSE_INTENT_RE.search(q))
 
 
 # Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
@@ -852,19 +891,52 @@ def ollama_unload() -> dict:
 
 class ReminderCreateRequest(BaseModel):
     text: str
-    due: str | None = None   # "tomorrow" or None
-    list: str | None = None  # Reminders list name; None → default
+    due: str | None = None         # legacy token: "tomorrow" or None
+    due_iso: str | None = None     # ISO-8601 datetime; wins over `due`
+    list: str | None = None        # Reminders list name; None → default
+    priority: int | None = None    # 1 high / 5 medium / 9 low / None
+    notes: str | None = None       # body text
+    recurrence: dict | None = None  # {freq, interval, byday?}
 
 
 @app.post("/api/reminders/create")
 def create_reminder(req: ReminderCreateRequest) -> dict:
-    """Create an Apple Reminder. Called from the daily brief's "Para
-    mañana" items — each <li> has an inline enter-arrow that posts here.
-    `due="tomorrow"` is the expected default from the UI; server computes
-    the concrete time inside AppleScript to stay locale-safe.
+    """Create an Apple Reminder.
+
+    Dual-use:
+      - Daily brief's "Para mañana" items POST `{text, due:"tomorrow"}` —
+        the legacy path, preserved byte-for-byte.
+      - Chat proposal cards POST `{text, due_iso, list, priority, notes,
+        recurrence}` after the user clicks ✓ on a `proposal` SSE card.
+
+    If both `due` and `due_iso` are present, `due_iso` wins. `recurrence`
+    is best-effort: Reminders.app's AppleScript dictionary inconsistently
+    accepts the property across macOS versions — the reminder is created
+    regardless (silent-fail on recurrence), caller should advise the user
+    to verify in Reminders.app.
     """
+    from datetime import datetime as _dt
+
     from rag import _create_reminder  # noqa: PLC0415
-    ok, res = _create_reminder(req.text, due_token=req.due, list_name=req.list)
+
+    due_dt: _dt | None = None
+    if req.due_iso:
+        try:
+            due_dt = _dt.fromisoformat(req.due_iso)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"due_iso inválido: {exc}",
+            ) from exc
+
+    ok, res = _create_reminder(
+        req.text,
+        due_token=req.due if not due_dt else None,
+        list_name=req.list,
+        due_dt=due_dt,
+        priority=req.priority,
+        notes=req.notes,
+        recurrence=req.recurrence,
+    )
     if not ok:
         raise HTTPException(status_code=400, detail=res)
     # Bust the home cache so the new reminder shows up in the reminders
@@ -874,6 +946,62 @@ def create_reminder(req: ReminderCreateRequest) -> dict:
     except Exception:
         pass
     return {"ok": True, "id": res}
+
+
+class CalendarCreateRequest(BaseModel):
+    title: str
+    start_iso: str                 # required
+    end_iso: str | None = None     # None → start + 1h
+    calendar: str | None = None    # None → first writable
+    location: str | None = None
+    notes: str | None = None
+    all_day: bool = False
+    recurrence: dict | None = None  # {freq, interval, byday?}
+
+
+@app.post("/api/calendar/create")
+def create_calendar_event(req: CalendarCreateRequest) -> dict:
+    """Create a Calendar.app event. Called from chat proposal cards after
+    the user confirms. Returns the event UID so the UI can surface a
+    deep-link or deletion path.
+
+    Writes through Calendar.app → iCloud CalDAV calendars are reachable
+    (unlike the JXA EventKit read path which can't see them without
+    entitlement). If `calendar` is omitted we write to the first writable
+    calendar — usually iCloud's default.
+    """
+    from datetime import datetime as _dt
+
+    from rag import _create_calendar_event  # noqa: PLC0415
+
+    try:
+        start_dt = _dt.fromisoformat(req.start_iso)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"start_iso inválido: {exc}",
+        ) from exc
+    end_dt: _dt | None = None
+    if req.end_iso:
+        try:
+            end_dt = _dt.fromisoformat(req.end_iso)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"end_iso inválido: {exc}",
+            ) from exc
+
+    ok, res = _create_calendar_event(
+        req.title,
+        start_dt,
+        end_dt,
+        calendar=req.calendar,
+        location=req.location,
+        notes=req.notes,
+        all_day=req.all_day,
+        recurrence=req.recurrence,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=res)
+    return {"ok": True, "uid": res}
 
 
 class ReminderCompleteRequest(BaseModel):
@@ -1411,6 +1539,27 @@ class _InlineCitationStripper:
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _maybe_emit_proposal(name: str, out: str) -> str | None:
+    """If `name` is a proposal tool and `out` parses as the expected JSON
+    payload, return a pre-encoded SSE `proposal` frame; else None.
+
+    Keeps the gen() body clean — callers just
+    `if frame := _maybe_emit_proposal(...): yield frame`. A malformed
+    payload is treated as "not a proposal" (the LLM still sees the tool
+    output normally via the `role:"tool"` message; the UI just won't
+    render a card). No logging here — caller decides what to do.
+    """
+    if name not in PROPOSAL_TOOL_NAMES:
+        return None
+    try:
+        payload = json.loads(out)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("proposal_id"):
+        return None
+    return _sse("proposal", payload)
 
 
 def _source_payload(meta: dict, score: float) -> dict:
@@ -3597,6 +3746,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _pre_serial_sum_ms += _ms
                     _forced_results.append((_n, str(_res), _ms))
                     yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
+                    if _prop := _maybe_emit_proposal(_n, str(_res)):
+                        yield _prop
                     tool_names_called.append(_n)
                 # Parallel bucket (pure IO fetchers, no shared state).
                 if _f_parallel:
@@ -3614,6 +3765,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             _pre_parallel_max_ms = max(_pre_parallel_max_ms, _ms)
                             _forced_results.append((_n, _res, _ms))
                             yield _sse("status", {"stage": "tool_done", "name": _n, "ms": _ms})
+                            if _prop := _maybe_emit_proposal(_n, _res):
+                                yield _prop
                             tool_names_called.append(_n)
                 # Replace CONTEXTO entirely with tool output. Prior attempts
                 # (append as system msg / prepend to user) failed: REGLA 1
@@ -3644,10 +3797,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # benefit. Skip it by default — go straight to final streaming.
             # Opt back in with RAG_WEB_TOOL_LLM_DECIDE=1 for queries where
             # chaining multiple tools based on first-round results matters.
+            #
+            # Exception: propose_reminder / propose_calendar_event can ONLY
+            # be invoked via the LLM tool-decide loop (arg extraction is
+            # LLM-hard). `_detect_propose_intent` flips the gate on for
+            # create-intent queries so the user doesn't have to flip
+            # RAG_WEB_TOOL_LLM_DECIDE just to record something.
             _llm_tool_decide = os.environ.get(
                 "RAG_WEB_TOOL_LLM_DECIDE", ""
             ).strip() not in ("", "0", "false", "no")
-            _skip_llm_tool_round = not _llm_tool_decide
+            _propose_intent = _detect_propose_intent(question)
+            _skip_llm_tool_round = not _llm_tool_decide and not _propose_intent
 
             for _round_idx in range(_TOOL_ROUND_CAP):
                 if _skip_llm_tool_round:
@@ -3713,6 +3873,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _round_serial_sum_ms += _elapsed_ms
                     _round_tool_names.append(_name)
                     yield _sse("status", {"stage": "tool_done", "name": _name, "ms": _elapsed_ms})
+                    if _prop := _maybe_emit_proposal(_name, _out):
+                        yield _prop
                     tool_messages.append({
                         "role": "tool",
                         "name": _name,
@@ -3749,6 +3911,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                 _round_parallel_max_ms = _elapsed_ms
                             _round_tool_names.append(_name)
                             yield _sse("status", {"stage": "tool_done", "name": _name, "ms": _elapsed_ms})
+                            if _prop := _maybe_emit_proposal(_name, _out):
+                                yield _prop
                             tool_messages.append({
                                 "role": "tool",
                                 "name": _name,

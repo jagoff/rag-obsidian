@@ -725,6 +725,175 @@ function appendWebSearch(parent, query) {
   parent.appendChild(wrap);
 }
 
+// ── Proposal cards ─────────────────────────────────────────────────────────
+//
+// The server fires an SSE `proposal` event whenever the LLM invokes
+// `propose_reminder` or `propose_calendar_event`. The payload shape is
+// identical to what those tools return — {kind, proposal_id, fields,
+// needs_clarification?}. We render an inline card with editable-looking
+// display of the parsed fields and a ✓/✗ pair. Clicking ✓ POSTs to the
+// corresponding create endpoint; ✗ silently dismisses. Nothing lands in
+// Calendar/Reminders until the user confirms.
+
+function formatIsoDatetime(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    // es-AR short: "jue, 23/04 16:00"
+    return d.toLocaleString("es-AR", {
+      weekday: "short", day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function appendProposal(parent, payload) {
+  const kind = payload.kind;                    // "reminder" | "event"
+  const fields = payload.fields || {};
+  const needsClarif = payload.needs_clarification === true;
+
+  const card = el("div", `proposal proposal-${kind}`);
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", kind === "event" ? "📅" : "✓"));
+  head.appendChild(el(
+    "span", "proposal-kind",
+    kind === "event" ? "Nuevo evento" : "Nuevo recordatorio",
+  ));
+  card.appendChild(head);
+
+  const title = el("div", "proposal-title", fields.title || "(sin título)");
+  card.appendChild(title);
+
+  const meta = el("div", "proposal-meta");
+  const addMeta = (label, value) => {
+    if (value === null || value === undefined || value === "") return;
+    const row = el("div", "proposal-meta-row");
+    row.appendChild(el("span", "proposal-meta-label", label));
+    row.appendChild(el("span", "proposal-meta-val", value));
+    meta.appendChild(row);
+  };
+
+  if (kind === "reminder") {
+    const dueStr = fields.due_iso
+      ? formatIsoDatetime(fields.due_iso)
+      : (fields.due_text ? `(no parseada) “${fields.due_text}”` : "sin fecha");
+    addMeta("cuándo", dueStr);
+    if (fields.list) addMeta("lista", fields.list);
+    const prioMap = { 1: "alta", 5: "media", 9: "baja" };
+    if (fields.priority) addMeta("prioridad", prioMap[fields.priority] || String(fields.priority));
+    if (fields.notes) addMeta("nota", fields.notes);
+  } else {
+    const startStr = fields.start_iso
+      ? formatIsoDatetime(fields.start_iso)
+      : `(no parseado) “${fields.start_text || ""}”`;
+    addMeta("inicio", startStr);
+    if (fields.end_iso) addMeta("fin", formatIsoDatetime(fields.end_iso));
+    if (fields.calendar) addMeta("calendario", fields.calendar);
+    if (fields.location) addMeta("lugar", fields.location);
+    if (fields.all_day) addMeta("todo el día", "sí");
+    if (fields.notes) addMeta("nota", fields.notes);
+  }
+  if (fields.recurrence) {
+    const rec = fields.recurrence;
+    const human = fields.recurrence_text
+      || `${rec.freq.toLowerCase()}${rec.interval > 1 ? ` · cada ${rec.interval}` : ""}`;
+    addMeta("repite", human);
+  }
+  card.appendChild(meta);
+
+  if (needsClarif) {
+    card.appendChild(el(
+      "div", "proposal-warn",
+      "⚠ Falta fecha/hora clara — pedí al agente que aclare o descartá.",
+    ));
+  }
+
+  const actions = el("div", "proposal-actions");
+  const createBtn = document.createElement("button");
+  createBtn.type = "button";
+  createBtn.className = "proposal-btn proposal-btn-create";
+  createBtn.textContent = "✓ Crear";
+  createBtn.disabled = needsClarif;
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "proposal-btn proposal-btn-cancel";
+  cancelBtn.textContent = "✗ Descartar";
+  const status = el("span", "proposal-status", "");
+  actions.appendChild(createBtn);
+  actions.appendChild(cancelBtn);
+  actions.appendChild(status);
+  card.appendChild(actions);
+
+  cancelBtn.addEventListener("click", () => {
+    if (card.dataset.resolved) return;
+    card.dataset.resolved = "cancelled";
+    createBtn.disabled = true;
+    cancelBtn.disabled = true;
+    status.textContent = "  descartada";
+    status.classList.add("cancelled");
+    card.classList.add("dimmed");
+  });
+
+  createBtn.addEventListener("click", async () => {
+    if (card.dataset.resolved) return;
+    card.dataset.resolved = "creating";
+    createBtn.disabled = true;
+    cancelBtn.disabled = true;
+    status.textContent = "  creando…";
+    status.classList.remove("ok", "err");
+
+    const url = kind === "event" ? "/api/calendar/create" : "/api/reminders/create";
+    const body = kind === "event"
+      ? {
+          title: fields.title,
+          start_iso: fields.start_iso,
+          end_iso: fields.end_iso,
+          calendar: fields.calendar,
+          location: fields.location,
+          notes: fields.notes,
+          all_day: fields.all_day,
+          recurrence: fields.recurrence,
+        }
+      : {
+          text: fields.title,
+          due_iso: fields.due_iso,
+          list: fields.list,
+          priority: fields.priority,
+          notes: fields.notes,
+          recurrence: fields.recurrence,
+        };
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      card.dataset.resolved = "created";
+      status.textContent = kind === "event" ? "  ✓ evento creado" : "  ✓ recordatorio creado";
+      status.classList.add("ok");
+      card.classList.add("created");
+    } catch (err) {
+      delete card.dataset.resolved;
+      createBtn.disabled = false;
+      cancelBtn.disabled = false;
+      status.textContent = `  error: ${err.message}`;
+      status.classList.add("err");
+    }
+  });
+
+  parent.appendChild(card);
+  return card;
+}
+
 function appendSources(parent, items, confidence) {
   const wrap = el("div", "sources");
   const head = el("div", "sources-rule");
@@ -1185,6 +1354,14 @@ async function send(question) {
     } else if (event === "sources") {
       sources = parsed.items;
       if (Number.isFinite(parsed.confidence)) confidence = parsed.confidence;
+    } else if (event === "proposal") {
+      // The server emits this after a propose_reminder /
+      // propose_calendar_event tool resolves. We render the card
+      // immediately so the user sees it while the LLM's narrative
+      // keeps streaming. The thinking spinner (if still showing) is
+      // torn down on the next token event.
+      appendProposal(turn, parsed);
+      scrollBottom();
     } else if (event === "token") {
       if (!ragLine) {
         stopGeneratingTicker();

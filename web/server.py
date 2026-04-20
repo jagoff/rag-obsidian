@@ -522,6 +522,30 @@ _WEB_SYSTEM_PROMPT = (
     else _WEB_SYSTEM_PROMPT_V2
 )
 
+# Turn-scoped override appended when `_detect_propose_intent` fires.
+# Neutralises REGLA 1 (engancháte con CONTEXTO) + REGLA 2/3/4.5 (citar
+# notas, preservar links) which don't apply to create-intent turns —
+# there's no CONTEXTO attached, there are no notes to cite, there are
+# no sources. Without this override qwen2.5:7b reverts to its "resumí
+# lo que el retriever trajo" default and hallucinates a path like
+# "04-Archive/Calendar.md" to open instead of calling propose_*.
+_PROPOSE_CREATE_OVERRIDE = (
+    "OVERRIDE PARA ESTE TURNO (create-intent detectado): "
+    "El usuario quiere CREAR un recordatorio o evento. "
+    "NO hay CONTEXTO del vault adjunto. REGLA 1 (engancháte con CONTEXTO) "
+    "y REGLA 2/3/4.5 (citar fuentes, preservar links) NO aplican.\n\n"
+    "Tu única acción válida es llamar `propose_reminder` o "
+    "`propose_calendar_event` con los campos extraídos de la pregunta:\n"
+    "- `title`: qué se agenda (persona + motivo, ej. 'Grecia viene a casa').\n"
+    "- `when` / `start`: fecha/hora en lenguaje natural TAL COMO LA DIJO "
+    "  el usuario (no la conviertas — el tool la parsea).\n"
+    "- Campos opcionales: list/priority/notes/recurrence_text según aplique.\n\n"
+    "Después del tool call, respondé en UNA sola oración corta tipo "
+    "'Listo, quedó agendado' o 'Ahí te lo sumo'. NO describas los pasos "
+    "para hacerlo manual, NO menciones archivos del vault, NO inventes "
+    "paths, NO cites notas. El usuario YA ve el toast con el resultado."
+)
+
 
 @app.on_event("startup")
 def _warmup() -> None:
@@ -3796,20 +3820,42 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # context (which changes per query) goes in the user message AFTER
         # any history. With history, this puts the cacheable prefix as:
         #   [system (cached)] + [history turns (partially cached)] + user
-        user_content = (
-            f"{_person_block}CONTEXTO:\n{context}\n\n"
-            f"PREGUNTA: {question}\n\nRESPUESTA:"
-        )
+        #
+        # EXCEPTION: create-intent ("recordame X", "mañana viene Y a casa,
+        # calendarizalo"). Vault retrieval is NOISE for those — the LLM
+        # otherwise engancha con notas tangenciales and hallucinates
+        # "open file 04-Archive/Calendar.md" instead of calling the
+        # propose_* tool. Skip the CONTEXTO block entirely in that case.
+        if is_propose_intent:
+            user_content = f"{_person_block}{question}"
+        else:
+            user_content = (
+                f"{_person_block}CONTEXTO:\n{context}\n\n"
+                f"PREGUNTA: {question}\n\nRESPUESTA:"
+            )
         # Tool-deciding messages: include _WEB_TOOL_ADDENDUM as a second
         # system message so it's byte-identical across tool-deciding calls
         # (ollama prefix cache stays warm across rounds). The final
         # streaming call below STRIPS the addendum + `tools=` param so its
         # cache state matches the pre-tool-calling era byte-for-byte.
+        #
+        # Third system message (create-intent only): a turn-scoped override
+        # that neutralises REGLA 1 (engancháte con CONTEXTO) and
+        # REGLA 2/3 (citar fuentes) which don't apply when there's no
+        # CONTEXTO. Without this the 7b model reverts to its default
+        # "summarise the vault" behaviour and hallucinates a file to
+        # open instead of calling propose_*.
+        _system_msgs: list[dict] = [
+            {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+            {"role": "system", "content": _WEB_TOOL_ADDENDUM},
+        ]
+        if is_propose_intent:
+            _system_msgs.append({
+                "role": "system",
+                "content": _PROPOSE_CREATE_OVERRIDE,
+            })
         tool_messages: list[dict] = (
-            [
-                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
-                {"role": "system", "content": _WEB_TOOL_ADDENDUM},
-            ]
+            _system_msgs
             + (history or [])
             + [{"role": "user", "content": user_content}]
         )

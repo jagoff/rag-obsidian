@@ -1,0 +1,55 @@
+# Dependabot config — weekly scans for direct dependency updates.
+# Scope is intentionally narrow: pip (rag.py + web/server.py deps via
+# pyproject.toml + uv.lock) and github-actions (CI workflow).
+#
+# No npm ecosystem — web/static/vendor/marked.min.js is manually vendored,
+# Dependabot would false-positive without package-lock.json. Re-vendor
+# manually when CVEs are announced.
+
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Argentina/Buenos_Aires"
+    open-pull-requests-limit: 3
+    # Keep local dev loop stable: group patch/minor bumps into one PR
+    # instead of 17 per week. Security advisories still open their own
+    # PR (separate `security-updates` group is implicit, opens unthrottled).
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+    # Watch list mirrors the subagent audit — Google auth stack has a
+    # history of breaking changes between minors, so pin to compatible
+    # releases and only allow patch auto-merge until reviewed manually.
+    ignore:
+      # google-api-python-client: breaking changes between minors
+      # (e.g. discovery cache backend swap in 2.100). Review manually.
+      - dependency-name: "google-api-python-client"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "google-auth-oauthlib"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # sentence-transformers pulls torch + transformers — a major bump
+      # can silently switch to a different embedding dtype and break
+      # bge-m3 cosine parity with ollama. Manual review only.
+      - dependency-name: "sentence-transformers"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    labels:
+      - "ci"
+    commit-message:
+      prefix: "ci"

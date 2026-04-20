@@ -218,7 +218,17 @@ html, body {
 
 .text {
   flex: 1;
+  /* Flex items default to min-width: auto, which lets their intrinsic
+     content size push them past the flex container's edge when a
+     single inline element (long link, blockquote with a single long
+     sentence, pre block) can't break. Forcing min-width: 0 makes the
+     flex item honour its parent's width and lets word-break / nowrap
+     rules inside the child elements take effect.
+     overflow-wrap: anywhere is a safety net for unbreakable strings
+     (URLs, hashes, filenames) — break at any character if needed. */
+  min-width: 0;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .text.user {
@@ -491,22 +501,31 @@ html, body {
 .thinking .dot:nth-child(2) { animation-delay: 0.15s; }
 .thinking .dot:nth-child(3) { animation-delay: 0.3s; }
 
-.thinking[data-stage]::after {
-  content: attr(data-stage);
+.thinking .stage-label,
+.thinking .stage-secs {
   font-size: 0.72em;
+  align-self: center;
+  transition: color var(--dur-fast, 120ms) var(--ease-out, ease-out);
+}
+.thinking .stage-label {
   color: var(--text-dim);
   margin-left: 6px;
-  align-self: center;
+}
+.thinking .stage-secs {
+  /* Semáforo sobre el contador: verde arranca, amarillo a los 3s, rojo a
+     los 8s. Umbrales viven en app.js (stageTier) — mantenerlos sincronizados.
+     Default color = --text-dim para el estado vacío/estático (seed
+     "pensando…", "desde caché"). */
+  color: var(--text-dim);
   /* Lock digit width so the counter doesn't shift neighbouring glyphs
      every 200ms. tabular-nums is the standard OpenType feature for this;
      font-variant-numeric is the portable spelling. */
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum" 1;
-  /* Soft fade on label swap (stage change → new content). The base layer
-     redraws instantly via `content`, but opacity transitions the visual
-     change. Keeps phase transitions feeling continuous instead of abrupt. */
-  transition: opacity var(--dur-fast, 120ms) var(--ease-out, ease-out);
 }
+.thinking .stage-secs[data-tier="green"]  { color: var(--green); }
+.thinking .stage-secs[data-tier="yellow"] { color: var(--yellow); }
+.thinking .stage-secs[data-tier="red"]    { color: var(--red); }
 
 @keyframes thinking-pulse {
   0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }

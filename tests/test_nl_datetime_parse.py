@@ -59,16 +59,18 @@ def test_parse_english_monday_3pm():
     assert dt.hour == 15
 
 
-def test_parse_pasado_manana_falls_back_to_llm(monkeypatch):
-    """'pasado mañana' dateparser no lo entiende en español — LLM fallback."""
+def test_parse_pasado_manana_via_preprocessor(monkeypatch):
+    """Post-preprocessor 'pasado mañana' → 'day after tomorrow', que
+    dateparser sí maneja — no hace falta el LLM fallback."""
     fake_client = MagicMock()
-    fake_client.chat.return_value = MagicMock(
-        message=MagicMock(content='{"iso": "2026-04-22T09:30"}')
-    )
+    fake_client.chat.side_effect = RuntimeError("no debería llamarse")
     monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
     now = datetime(2026, 4, 20, 15, 0, 0)
     dt = rag._parse_natural_datetime("pasado mañana 9:30", now=now)
-    assert dt == datetime(2026, 4, 22, 9, 30, 0)
+    assert dt is not None
+    assert dt.date().isoformat() == "2026-04-22"
+    assert dt.hour == 9
+    assert dt.minute == 30
 
 
 def test_parse_prefers_future_for_bare_weekday():
@@ -204,3 +206,176 @@ def test_recurrence_none_for_non_recurring():
     assert rag._parse_natural_recurrence("mañana a las 10") is None
     assert rag._parse_natural_recurrence("") is None
     assert rag._parse_natural_recurrence(None) is None
+
+
+# ── Rioplatense preprocessing (Argentinian idioms) ──────────────────────────
+
+
+def test_preprocess_hs_suffix():
+    """'18hs' / '18 hs' / '18h' → '18:00'. Si hay 'a las' antes, las dos
+    reglas combinadas ('a las N' + 'Nhs') colapsan a sólo el tiempo."""
+    assert rag._preprocess_rioplatense_datetime("hoy a las 18hs") == "hoy 18:00"
+    assert rag._preprocess_rioplatense_datetime("hoy 18hs") == "hoy 18:00"
+    assert rag._preprocess_rioplatense_datetime("a las 9 hs") == "9:00"
+    assert rag._preprocess_rioplatense_datetime("18h") == "18:00"
+
+
+def test_preprocess_mediodia():
+    assert rag._preprocess_rioplatense_datetime("al mediodía") == "12:00"
+    assert rag._preprocess_rioplatense_datetime("al medio día") == "12:00"
+    assert rag._preprocess_rioplatense_datetime("mañana al mediodía") == "mañana 12:00"
+
+
+def test_preprocess_que_viene():
+    """'que viene' se normaliza a inglés. Para weekdays el bare form
+    (no 'next X') porque dateparser 1.4 rechaza 'next <weekday>'; el bare
+    'monday' con PREFER_DATES_FROM=future rolls-forward determinista."""
+    assert rag._preprocess_rioplatense_datetime(
+        "la semana que viene",
+    ) == "next week"
+    assert rag._preprocess_rioplatense_datetime(
+        "el lunes que viene",
+    ).lower() == "monday"
+    assert rag._preprocess_rioplatense_datetime(
+        "el mes que viene",
+    ).lower() == "next month"
+
+
+def test_preprocess_bare_weekday_rewrite():
+    """'el jueves' / 'este jueves' / 'próximo jueves' → 'thursday' (bare)."""
+    assert rag._preprocess_rioplatense_datetime("el jueves").lower() == "thursday"
+    assert rag._preprocess_rioplatense_datetime("este viernes").lower() == "friday"
+    assert rag._preprocess_rioplatense_datetime("próximo miércoles").lower() == "wednesday"
+
+
+def test_preprocess_a_la_tarde_and_friends():
+    """'a la mañana/tarde/noche/tardecita/nochecita' → hora default."""
+    assert rag._preprocess_rioplatense_datetime("a la mañana") == "09:00"
+    assert rag._preprocess_rioplatense_datetime("a la tarde") == "16:00"
+    assert rag._preprocess_rioplatense_datetime("a la noche") == "20:00"
+    assert rag._preprocess_rioplatense_datetime("a la tardecita") == "17:00"
+
+
+def test_preprocess_tipo_N():
+    """'tipo 10' → '10:00'. 'a eso de las 4' → '4:00'. Idioms aproximativos
+    muy usados en rioplatense."""
+    assert rag._preprocess_rioplatense_datetime("tipo 10") == "10:00"
+    assert rag._preprocess_rioplatense_datetime("tipo 18:30") == "18:30"
+    assert rag._preprocess_rioplatense_datetime("a eso de las 4") == "4:00"
+    # Combinado con weekday normalización.
+    out = rag._preprocess_rioplatense_datetime("el sábado tipo 10")
+    assert "10:00" in out.lower()
+    assert "saturday" in out.lower()
+
+
+def test_preprocess_a_las_bare():
+    """'a las N' → 'N:00' (dateparser interpreta 'a las 10' como día 10)."""
+    assert rag._preprocess_rioplatense_datetime("a las 10") == "10:00"
+    assert rag._preprocess_rioplatense_datetime("a las 18:30") == "18:30"
+    assert "10:00" in rag._preprocess_rioplatense_datetime("mañana a las 10")
+
+
+def test_preprocess_de_la_manana():
+    """'a las N de la mañana' → 'N:00 am'."""
+    assert rag._preprocess_rioplatense_datetime(
+        "a las 10 de la mañana",
+    ) == "10:00 am"
+    assert rag._preprocess_rioplatense_datetime(
+        "a las 10:30 de la mañana",
+    ) == "10:30 am"
+
+
+def test_preprocess_de_la_tarde():
+    """'a las N de la tarde' → '(N+12):00' si N < 12."""
+    assert rag._preprocess_rioplatense_datetime(
+        "a las 4 de la tarde",
+    ) == "16:00"
+    # 12 de la tarde = 12:00 (mediodía), no 24:00.
+    assert rag._preprocess_rioplatense_datetime(
+        "a las 12 de la tarde",
+    ) == "12:00"
+
+
+def test_preprocess_diminutivos():
+    assert rag._preprocess_rioplatense_datetime("en 2 horitas") == "en 2 horas"
+    assert "minutos" in rag._preprocess_rioplatense_datetime("en 10 minutitos")
+
+
+def test_preprocess_finde():
+    """'el finde' → 'saturday' (bare). PREFER_DATES_FROM=future rollea al
+    próximo sábado. 'next saturday' NO funciona en dateparser 1.4."""
+    assert rag._preprocess_rioplatense_datetime("el finde") == "saturday"
+
+
+def test_preprocess_pasado_manana():
+    """'pasado mañana' se normaliza a 'day after tomorrow' (inglés)."""
+    assert rag._preprocess_rioplatense_datetime("pasado mañana") == "day after tomorrow"
+    assert rag._preprocess_rioplatense_datetime(
+        "pasado mañana a las 10",
+    ) == "day after tomorrow 10:00"
+
+
+def test_preprocess_passthrough_unchanged():
+    """Input sin idioms no debe cambiar."""
+    s = "2026-04-25 14:30"
+    assert rag._preprocess_rioplatense_datetime(s) == s
+
+
+def test_parse_rioplatense_hs(monkeypatch):
+    """Integration: '18hs' sin LLM debe resolver vía normalización."""
+    # Forzar que el LLM fallback falle (no debe llegar a invocarse).
+    fake_client = MagicMock()
+    fake_client.chat.side_effect = RuntimeError("no debería llamarse")
+    monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
+    now = datetime(2026, 4, 20, 15, 0, 0)
+    dt = rag._parse_natural_datetime("hoy a las 18hs", now=now)
+    assert dt is not None
+    assert dt.date().isoformat() == "2026-04-20"
+    assert dt.hour == 18
+    assert dt.minute == 0
+
+
+def test_parse_rioplatense_mediodia(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.chat.side_effect = RuntimeError("no debería llamarse")
+    monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
+    now = datetime(2026, 4, 20, 15, 0, 0)
+    dt = rag._parse_natural_datetime("mañana al mediodía", now=now)
+    assert dt is not None
+    assert dt.date().isoformat() == "2026-04-21"
+    assert dt.hour == 12
+
+
+def test_parse_rioplatense_semana_que_viene(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.chat.side_effect = RuntimeError("no debería llamarse")
+    monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
+    now = datetime(2026, 4, 20, 15, 0, 0)  # lunes
+    dt = rag._parse_natural_datetime("la semana que viene", now=now)
+    assert dt is not None
+    # "próxima semana" → la semana siguiente (cualquier día de esa semana ok)
+    assert dt >= now
+
+
+def test_parse_anchor_time_echo_triggers_fallback(monkeypatch):
+    """Dateparser a veces devuelve la hora del anchor cuando matcheó sólo
+    la parte de fecha (bug conocido en 1.4 con ciertos time markers raros).
+    El guard debe detectar eco exacto minuto-a-minuto y caer al LLM fallback.
+
+    El normalizador rioplatense resuelve la mayoría de casos reales, así
+    que forzamos el escenario monkeypatcheando dateparser directo.
+    """
+    import dateparser as _dp
+    anchor = datetime(2026, 4, 20, 15, 0, 0)
+    # Simular que dateparser devolvió el anchor exacto (echo).
+    monkeypatch.setattr(_dp, "parse", lambda *a, **kw: anchor)
+    fake_client = MagicMock()
+    fake_client.chat.return_value = MagicMock(
+        message=MagicMock(content='{"iso": "2026-04-20T10:00"}')
+    )
+    monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
+    # Input con time marker "las" → guard debe detectar eco y tirar a LLM.
+    dt = rag._parse_natural_datetime("las fechas anchor-weird", now=anchor)
+    assert dt is not None
+    assert dt.hour == 10
+    fake_client.chat.assert_called_once()

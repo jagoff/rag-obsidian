@@ -19623,6 +19623,13 @@ _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
     (r"\ba\s+la\s+noche\b", "20:00"),
     (r"\ba\s+la\s+tardecita\b", "17:00"),
     (r"\ba\s+la\s+nochecita\b", "20:00"),
+    # "tipo N" / "a eso de las N" → "N:00". "Tipo" es idiom rioplatense
+    # de aproximación. Corremos ESTO al final para que "tipo 10" después
+    # de rewrites de weekdays se interprete bien.
+    (r"\btipo\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),
+    (r"\btipo\s+(\d{1,2})\b(?!\s*:)", r"\1:00"),
+    (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),
+    (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2})\b(?!\s*:)", r"\1:00"),
 )
 
 _RIOPLATENSE_COMPILED = tuple(

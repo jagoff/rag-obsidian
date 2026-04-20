@@ -11015,6 +11015,23 @@ def collect_ranker_features(
         }
 
     Mirrors `retrieve()` but stops one step short of the weighted sort.
+
+    ⚠️ Feature-pool mismatch caveat (documented 2026-04-20 audit):
+    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=30` (see
+    `tune_cmd` ~L15344-15386). Production callers use different pools:
+    CLI `rag chat` passes `rerank_pool=15`; web `/api/chat` passes
+    `rerank_pool=5`. The weights `rag tune --apply` writes are
+    therefore fit on 30-candidate feature vectors but consumed by
+    retrieve paths that only ever score 5-15. Features that
+    only discriminate outside the runtime top-5 (e.g. a tag match on
+    rank 20 vs. rank 30) can receive spurious non-zero weights.
+
+    No empirical regression measured yet — the hit@5 baseline
+    (76.19%/63.64% CI lower bounds) survives with the mismatch, so
+    leaving this as-is until a dedicated tune-vs-runtime parity study.
+    When that study runs, either (a) bake `k_pool` into ranker.json
+    and have retrieve read it, or (b) align the tune pool to whichever
+    surface dominates user traffic (currently the web chat at pool=5).
     """
     if col.count() == 0:
         return []

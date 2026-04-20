@@ -149,9 +149,65 @@ def test_tag_boost_changes_order():
         _feat("b.md", 0.4, tag_hits=2),
     ]
     w_off = rag.RankerWeights(tag_literal=0.0)
-    w_on = rag.RankerWeights(tag_literal=0.3)   # 0.3 * 2 = 0.6 → b wins
+    # Post-2026-04-20 normalisation: tag_hits=2 → min(2/3, 1.0) = 0.667.
+    # tag_literal=0.3 × 0.667 ≈ 0.20, enough to close the 0.1 rerank gap.
+    w_on = rag.RankerWeights(tag_literal=0.3)
     assert rag.apply_weighted_scores(feats, w_off, k=1)[0]["path"] == "a.md"
     assert rag.apply_weighted_scores(feats, w_on, k=1)[0]["path"] == "b.md"
+
+
+def test_tag_hits_saturate_at_norm_cap():
+    """Regression guard for the 2026-04-20 normalisation: a note with
+    many tag matches must NOT receive a boost that grows linearly with
+    the count. tag_hits=1000 should contribute the same as tag_hits=3
+    (both clamp to 1.0 by min(n/3, 1.0))."""
+    feats = [
+        _feat("normal.md", 0.5, tag_hits=3),
+        _feat("pathological.md", 0.5, tag_hits=1000),
+    ]
+    w = rag.RankerWeights(tag_literal=0.2)
+    scored = rag.apply_weighted_scores(feats, w, k=2)
+    # Both should get the same cap-saturated boost. Order is preserved
+    # because the rerank tie-break keeps insertion order → normal first.
+    scores = {s["path"]: s["score"] for s in scored}
+    assert scores["normal.md"] == pytest.approx(scores["pathological.md"], abs=1e-9)
+    # And both are lifted above a hypothetical rerank=0.5 baseline by
+    # exactly tag_literal=0.2 (full saturation, not the pre-fix 0.6 / 200).
+    assert scored[0]["score"] == pytest.approx(0.5 + 0.2, abs=1e-9)
+
+
+def test_tag_hits_scales_linearly_below_cap():
+    """Below the cap the boost is fractional: tag_hits=1 should be 1/3
+    of the saturated boost (cap=3). This is the in-linear-regime path
+    — most queries fall here, and the signal should still rank them."""
+    feats_none = _feat("none.md", 0.5, tag_hits=0)
+    feats_one = _feat("one.md", 0.5, tag_hits=1)
+    feats_three = _feat("three.md", 0.5, tag_hits=3)
+    w = rag.RankerWeights(tag_literal=0.3)
+    scored = rag.apply_weighted_scores(
+        [feats_none, feats_one, feats_three], w, k=3,
+    )
+    by_path = {s["path"]: s["score"] for s in scored}
+    # none.md gets no boost; three.md saturates at 0.3; one.md at 0.1.
+    assert by_path["none.md"] == pytest.approx(0.5, abs=1e-9)
+    assert by_path["one.md"] == pytest.approx(0.5 + 0.1, abs=1e-9)
+    assert by_path["three.md"] == pytest.approx(0.5 + 0.3, abs=1e-9)
+
+
+def test_dwell_score_saturates_at_norm_cap():
+    """Same invariant for dwell: an absurdly long dwell value (e.g.
+    the note was left open overnight → log1p(28800)≈10.3) must not
+    overpower the rerank by virtue of magnitude alone."""
+    feats = [
+        _feat("short_dwell.md", 0.5, dwell_score=5.0),    # exactly at cap
+        _feat("overnight.md", 0.5, dwell_score=1000.0),   # 200× over cap
+    ]
+    w = rag.RankerWeights(dwell_score=0.1)
+    scored = rag.apply_weighted_scores(feats, w, k=2)
+    scores = {s["path"]: s["score"] for s in scored}
+    # Both clamp to 1.0 × weight → identical boost of 0.1.
+    assert scores["short_dwell.md"] == pytest.approx(scores["overnight.md"], abs=1e-9)
+    assert scored[0]["score"] == pytest.approx(0.5 + 0.1, abs=1e-9)
 
 
 def test_feedback_signals_applied_symmetrically():

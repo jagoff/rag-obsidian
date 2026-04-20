@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>rag</title>
-  <link rel="stylesheet" href="/static/style.css?v=2026-04-20-stage-ticker">
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-20-model-picker">
 </head>
 <body>
   <header id="topbar">
@@ -19,6 +19,10 @@
         <label id="vault-picker-label" for="vault-picker">vault</label>
         <select id="vault-picker" aria-label="Vault">
           <option value="">cargando…</option>
+        </select>
+        <label id="model-picker-label" for="model-picker">modelo</label>
+        <select id="model-picker" aria-label="Modelo de chat" title="Modelo LLM · persistente">
+          <option value="">…</option>
         </select>
         <a class="topbar-link" href="/">← home</a>
         <a class="topbar-link" href="/dashboard">dashboard →</a>
@@ -83,6 +87,6 @@
     </div>
   </div>
   <script src="/static/vendor/marked.min.js"></script>
-  <script src="/static/app.js?v=2026-04-20-stage-ticker"></script>
+  <script src="/static/app.js?v=2026-04-20-model-picker"></script>
 </body>
 </html>

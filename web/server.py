@@ -207,9 +207,54 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # Set OBSIDIAN_RAG_WEB_CHAT_MODEL to override if you need speed over quality.
 WEB_CHAT_MODEL = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL") or None
 
+# Runtime model override — persisted to disk so it survives server restarts.
+# Takes priority over env / resolve_chat_model() so the user can A/B different
+# models from the UI without editing the launchd plist or redeploying.
+# Format: {"model": "qwen3.6", "set_at": "2026-04-20T15:00:00"}. Absent or
+# malformed → no override active.
+_CHAT_MODEL_OVERRIDE_PATH = Path.home() / ".local/share/obsidian-rag" / "chat-model.json"
+
+
+def _read_chat_model_override() -> str | None:
+    """Load the persistent runtime override if any. Silent on any error —
+    a corrupt or missing file means "no override, use defaults"."""
+    try:
+        raw = _CHAT_MODEL_OVERRIDE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        model = (data or {}).get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _write_chat_model_override(model: str | None) -> None:
+    """Persist or clear the runtime override. None → delete the file."""
+    _CHAT_MODEL_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if model is None:
+        _CHAT_MODEL_OVERRIDE_PATH.unlink(missing_ok=True)
+        return
+    payload = {"model": model,
+               "set_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    tmp = _CHAT_MODEL_OVERRIDE_PATH.with_suffix(_CHAT_MODEL_OVERRIDE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, _CHAT_MODEL_OVERRIDE_PATH)
+
 
 def _resolve_web_chat_model() -> str:
-    """Return the env-override model if set, else whatever rag.py picks."""
+    """Model resolution priority (first match wins):
+      1. Runtime override file (_CHAT_MODEL_OVERRIDE_PATH) — set via
+         POST /api/chat/model from the UI; persists across restarts.
+      2. OBSIDIAN_RAG_WEB_CHAT_MODEL env var — for launchd plist overrides.
+      3. rag.resolve_chat_model() — the CHAT_MODEL_PREFERENCE fallback chain.
+    Not cached: the override file is cheap to re-read (JSON, <200 bytes)
+    and we want runtime flips to take effect on the next /api/chat call
+    with no server restart.
+    """
+    override = _read_chat_model_override()
+    if override:
+        return override
     return WEB_CHAT_MODEL or resolve_chat_model()
 
 
@@ -1064,6 +1109,111 @@ def list_vaults() -> dict:
         "registered": registered,
         "current": cfg.get("current"),
     }
+
+
+# ── Chat model runtime switch ────────────────────────────────────────────────
+# Qwen / Llama families ship a new tag every few weeks; hard-coding the
+# default in a launchd plist and restarting the daemon for each A/B is
+# enough friction to stop users from experimenting. These two endpoints
+# let the UI list available local models and pick one at runtime. No
+# server restart, no plist edit — the override is persisted to
+# ~/.local/share/obsidian-rag/chat-model.json and survives daemon restarts.
+
+# Families we want to surface as chat-capable. Everything else (embeddings,
+# rerankers, vision-only, helpers) is filtered out for the picker. This is
+# a denylist by prefix/pattern — easier to maintain as new model families
+# appear than whitelisting exact tags.
+_CHAT_MODEL_FAMILY_DENYLIST = (
+    "bge-",          # embedding models
+    "nomic-embed",
+    "all-minilm",
+    "snowflake-arctic-embed",
+    "mxbai-embed",
+    "jina-embeddings",
+)
+
+
+class ChatModelRequest(BaseModel):
+    model: str | None = None  # None / empty → clear override, revert to defaults
+
+
+@app.get("/api/chat/model")
+def get_chat_model() -> dict:
+    """Return the currently-active chat model + the local catalog.
+
+    Shape:
+      {
+        "current": "qwen2.5:7b",      # what _resolve_web_chat_model() returns
+        "override": "qwen2.5:7b",     # only set if the runtime file has one
+        "env_override": null,         # OBSIDIAN_RAG_WEB_CHAT_MODEL if set
+        "default": "qwen2.5:7b",      # resolve_chat_model() baseline
+        "available": ["qwen2.5:7b", "qwen3.6", ...]   # local, chat-capable
+      }
+
+    The UI uses this to render the selector with the active option marked.
+    """
+    override = _read_chat_model_override()
+    try:
+        available = sorted(
+            m.model for m in ollama.list().models
+            if not any(m.model.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
+        )
+    except Exception:
+        available = []
+    try:
+        default = resolve_chat_model()
+    except Exception:
+        default = None
+    return {
+        "current": _resolve_web_chat_model(),
+        "override": override,
+        "env_override": WEB_CHAT_MODEL,
+        "default": default,
+        "available": available,
+    }
+
+
+@app.post("/api/chat/model")
+def set_chat_model(req: ChatModelRequest) -> dict:
+    """Switch the chat model at runtime. Persisted to disk.
+
+    Empty / null `model` clears the override and reverts to the default
+    resolution chain (env var → resolve_chat_model). Validates that the
+    requested model is actually installed locally; rejects unknown tags
+    with 400 so the UI can surface the error instead of the next /api/chat
+    crashing on a missing model.
+
+    Side effect: invalidates the response LRU cache so follow-up queries
+    don't replay a cached response produced by a different model.
+    """
+    requested = (req.model or "").strip() or None
+    if requested is not None:
+        try:
+            available = {m.model for m in ollama.list().models}
+        except Exception:
+            available = set()
+        if requested not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"model '{requested}' not installed locally "
+                       f"(try: ollama pull {requested.split(':')[0]})",
+            )
+    try:
+        _write_chat_model_override(requested)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not persist override: {exc}")
+    # Invalidate response cache so the next identical query doesn't replay
+    # the previous model's answer.
+    try:
+        _CHAT_CACHE.clear()
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "current": _resolve_web_chat_model(),
+        "override": _read_chat_model_override(),
+    }
+
 
 
 @app.get("/api/history")

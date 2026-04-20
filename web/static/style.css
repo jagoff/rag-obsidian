@@ -123,7 +123,8 @@ html, body {
   color: var(--text-faint);
 }
 
-#vault-picker {
+#vault-picker,
+#model-picker {
   background: var(--bg-elev);
   color: var(--text);
   border: 1px solid var(--border);
@@ -141,9 +142,28 @@ html, body {
   transition: border-color 0.15s, color 0.15s;
 }
 
-#vault-picker:hover, #vault-picker:focus {
+#vault-picker:hover, #vault-picker:focus,
+#model-picker:hover, #model-picker:focus {
   border-color: var(--border-strong);
   color: var(--cyan);
+}
+
+#model-picker-label {
+  color: var(--text-faint);
+}
+
+/* Model picker gets a touch more width room because model tags
+   (e.g. `qwen2.5:7b`, `qwen3.6`, `command-r:35b`) are longer than
+   the usual vault names. Keeping the same font-size + height so
+   the two selects line up in the topbar without visual jitter. */
+#model-picker {
+  min-width: 110px;
+  max-width: 180px;
+}
+
+#model-picker:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 #chat {

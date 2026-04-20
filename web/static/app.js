@@ -2,6 +2,7 @@ const messagesEl = document.getElementById("messages");
 const form = document.getElementById("composer");
 const input = document.getElementById("input");
 const vaultPicker = document.getElementById("vault-picker");
+const modelPicker = document.getElementById("model-picker");
 const ttsToggle = document.getElementById("tts-toggle");
 const helpBtn = document.getElementById("help-btn");
 const helpModal = document.getElementById("help-modal");
@@ -169,6 +170,78 @@ vaultPicker.addEventListener("change", () => {
 });
 
 loadVaults();
+
+// Chat model picker ------------------------------------------------
+// Runtime switch between installed chat models. The backend persists
+// the choice in ~/.local/share/obsidian-rag/chat-model.json so the
+// selection survives server restarts. No reload needed — the next
+// /api/chat call picks up the override automatically.
+async function loadChatModels() {
+  if (!modelPicker) return;
+  try {
+    const res = await fetch("/api/chat/model");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    modelPicker.innerHTML = "";
+    // Sort so the current one lands first; that's what's active right now.
+    const available = data.available || [];
+    const current = data.current;
+    const rest = available.filter((m) => m !== current);
+    const ordered = current ? [current, ...rest] : rest;
+    for (const name of ordered) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name === current ? `${name} (activo)` : name;
+      modelPicker.appendChild(opt);
+    }
+    // If the current model isn't in `available` (env override pointing to
+    // an external registry), still show it as selected.
+    if (current && !ordered.includes(current)) {
+      const opt = document.createElement("option");
+      opt.value = current;
+      opt.textContent = `${current} (activo)`;
+      modelPicker.insertBefore(opt, modelPicker.firstChild);
+    }
+    modelPicker.value = current || "";
+    modelPicker.dataset.current = current || "";
+  } catch (err) {
+    modelPicker.innerHTML = '<option value="">n/a</option>';
+  }
+}
+
+modelPicker?.addEventListener("change", async () => {
+  const selected = modelPicker.value;
+  const previous = modelPicker.dataset.current || "";
+  if (!selected || selected === previous) return;
+  // Optimistic UI: mark busy; revert on error.
+  modelPicker.disabled = true;
+  try {
+    const res = await fetch("/api/chat/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: selected }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    modelPicker.dataset.current = data.current;
+    // Re-render the "(activo)" marker on the new option.
+    await loadChatModels();
+  } catch (err) {
+    console.error("[chat-model] switch failed:", err);
+    modelPicker.value = previous;
+    // Non-blocking toast via the textarea placeholder would be ideal,
+    // but alert() is the simplest way to surface a validation error
+    // (e.g. model not installed) without more UI plumbing.
+    alert(`No se pudo cambiar el modelo: ${err.message}`);
+  } finally {
+    modelPicker.disabled = false;
+  }
+});
+
+loadChatModels();
 
 // TTS toggle ------------------------------------------------------
 // SVGs defined up-front so renderTtsToggle() can use them on initial

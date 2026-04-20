@@ -43,7 +43,7 @@ line-length = 100
 target-version = "py313"
 # Run across the whole project by default. CI passes explicit src=...
 # but local `ruff check` with no args should mirror CI.
-src = ["rag.py", "mcp_server.py", "main.py", "web", "scripts"]
+src = ["rag.py", "mcp_server.py", "web", "scripts"]
 
 [tool.ruff.lint]
 # E402: module-level imports after logging/warnings configuration are intentional

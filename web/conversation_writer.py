@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,11 +88,21 @@ def _open_sql_conn() -> sqlite3.Connection:
     # thread spawned per /api/chat turn.
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
-        str(_DB_PATH), isolation_level=None, check_same_thread=False, timeout=10.0
+        str(_DB_PATH), isolation_level=None, check_same_thread=False, timeout=30.0
     )
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout FIRST — every subsequent PRAGMA then honours it instead
+    # of returning SQLITE_BUSY immediately. Critical under multi-process
+    # stampede where 20 workers all spawn conns within ~10ms of each other.
+    conn.execute("PRAGMA busy_timeout=30000")
+    # journal_mode=WAL briefly takes an exclusive lock to flip the header,
+    # so skip the write once WAL is already active (idempotent). Saves
+    # ~N² contention when multiple fresh conns all race to SET WAL.
+    cur = conn.execute("PRAGMA journal_mode")
+    row = cur.fetchone()
+    current_mode = (row[0] if row else "").lower()
+    if current_mode != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -265,7 +276,14 @@ def _render_turn_block(turn_n: int, turn: TurnData) -> str:
 
 def _atomic_write(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    # Write + fsync + rename: on a crash between write and rename, the tmp
+    # is orphaned (GC-able) but the target is either the old file or the
+    # new one — never half-written. Without fsync, the rename can land
+    # before the data pages, leaving an empty file at `path` after crash.
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -311,8 +329,13 @@ def _write_turn_body(
         block = _render_turn_block(new_turns, turn)
         body_trimmed = body.rstrip() + "\n\n"
         new_text = _render_frontmatter(new_meta) + "\n" + body_trimmed + block
-        _atomic_write(target, new_text)
+        # SQL-first / disk-second: commit the index entry before touching
+        # the .md file. If disk write fails (e.g. full vault), the index
+        # still points to an existing (stale by one turn) note — not to a
+        # ghost. The inverse order would create the .md and then fail the
+        # index upsert, fragmenting the session on the next turn.
         _persist_index_from_within_write_turn(session_id, str(target.relative_to(vault_root)))
+        _atomic_write(target, new_text)
         return target
 
     slug = slugify(turn.question)
@@ -331,8 +354,11 @@ def _write_turn_body(
     }
     block = _render_turn_block(1, turn)
     new_text = _render_frontmatter(new_meta) + "\n" + block
-    _atomic_write(target, new_text)
+    # SQL-first: if the upsert fails the .md never gets written, so there's
+    # no orphaned note on disk to mask the error. The caller (web/server.py)
+    # will see the exception and log it as conversation_turn_error.
     _persist_index_from_within_write_turn(session_id, str(target.relative_to(vault_root)))
+    _atomic_write(target, new_text)
     return target
 
 

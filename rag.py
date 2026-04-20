@@ -390,6 +390,8 @@ def _load_vaults_config() -> dict:
     try:
         cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
+        # Called during module init (before _silent_log is defined).
+        # User-visible failure mode: empty vault list → default vault used.
         return {"vaults": {}, "current": None}
     cfg.setdefault("vaults", {})
     cfg.setdefault("current", None)
@@ -482,6 +484,13 @@ BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
 COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
 COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
 COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
+# Sink for exceptions that used to be `except Exception: pass`. See
+# `_silent_log()` below — only called from sites where a silent failure
+# could mask a real bug (corrupt cache, data-loss adjacent, reranker
+# unload, contradict JSON parse, feedback golden rebuild). Best-effort
+# sites (optional enrichment, shutdown cleanup, Apple integrations) still
+# use bare `pass`.
+SILENT_ERRORS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/silent_errors.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -525,6 +534,37 @@ def _flush_log_queue() -> None:
 atexit.register(_flush_log_queue)
 
 
+def _silent_log(where: str, exc: BaseException) -> None:
+    """Record a swallowed exception without raising or blocking.
+
+    Used at sites where the contract is `silently fall back` (corrupt
+    cache → reset, failed append → skip, JSON parse fail → return None)
+    but the failure could mask a real bug in a subsystem we didn't fully
+    audit: contradict-detector JSON parse, reranker unload, feedback
+    golden rebuild, ranker.json load, session/state persistence.
+
+    Writes one JSON line to `silent_errors.jsonl` through the existing
+    `_LOG_QUEUE` (daemon thread, non-blocking) so the call is the same
+    ~1µs cost as `pass`. Callers keep their silent-fail contract — this
+    adds observability only. The helper itself must never raise; if the
+    queue is full or JSON serialisation throws, we drop the record.
+
+    Sites that are genuinely best-effort (optional enrichment, shutdown
+    cleanup, HTTP posts to bridges that may be down, chmod on NFS/SMB)
+    intentionally keep bare `pass` — see code-review-followup.md.
+    """
+    try:
+        line = json.dumps({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "where": where,
+            "exc_type": type(exc).__name__,
+            "exc": str(exc)[:500],
+        }, ensure_ascii=False) + "\n"
+        _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
+    except Exception:
+        pass
+
+
 def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
     """Append an audit entry to collection_ops.log for any delete_collection call."""
     entry = {
@@ -540,8 +580,8 @@ def _log_collection_op(op: str, collection_name: str, extra: dict | None = None)
         COLLECTION_OPS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with COLLECTION_OPS_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("collection_ops_log_write", exc)
 
 
 class LockHeldError(Exception):
@@ -769,8 +809,8 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
             rec = json.loads(line)
             if rec.get("key") == key:
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("brief_state_jsonl_read", exc)
     return False
 
 
@@ -795,8 +835,8 @@ def _brief_state_record(brief_path: str, cited_path: str) -> None:
         }
         with BRIEF_STATE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("brief_state_jsonl_write", exc)
 
 
 def _diff_brief_signal() -> None:
@@ -876,8 +916,11 @@ def _diff_brief_signal() -> None:
                     "path": cited,
                 })
                 _brief_state_record(brief_path_str, cited)
-    except Exception:
-        pass  # never propagate — brief generation must not fail because of us
+    except Exception as exc:
+        # Brief generation must never fail because of signal diff. Log
+        # so we can notice if this subsystem silently stops producing
+        # kept/deleted events (would degrade ranker-vivo input).
+        _silent_log("diff_brief_signal", exc)
 
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
@@ -930,7 +973,8 @@ def load_session(sid: str) -> dict | None:
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        _silent_log("session_load_json", exc)
         return None
 
 
@@ -1046,8 +1090,8 @@ def _set_last_session(sid: str) -> None:
     try:
         LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         LAST_SESSION_FILE.write_text(sid, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("last_session_write", exc)
 
 
 def list_sessions(limit: int = 20) -> list[dict]:
@@ -1058,7 +1102,8 @@ def list_sessions(limit: int = 20) -> list[dict]:
     for p in SESSIONS_DIR.glob("*.json"):
         try:
             s = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            _silent_log("session_list_parse", exc)
             continue
         turns = s.get("turns", [])
         first_q = next((t.get("q", "") for t in turns if t.get("q")), "")
@@ -1292,7 +1337,8 @@ def _load_context_cache() -> dict[str, str]:
     if CONTEXT_CACHE_PATH.is_file():
         try:
             _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
-        except Exception:
+        except Exception as exc:
+            _silent_log("context_cache_load", exc)
             _context_cache = {}
     else:
         _context_cache = {}
@@ -1490,7 +1536,8 @@ def _load_synthetic_q_cache() -> dict[str, list[str]]:
                 }
             else:
                 _synthetic_q_cache = {}
-        except Exception:
+        except Exception as exc:
+            _silent_log("synthetic_q_cache_load", exc)
             _synthetic_q_cache = {}
     else:
         _synthetic_q_cache = {}
@@ -1955,8 +2002,11 @@ class RankerWeights:
             if RANKER_CONFIG_PATH.is_file():
                 data = json.loads(RANKER_CONFIG_PATH.read_text(encoding="utf-8"))
                 return cls.from_dict(data.get("weights", {}) if isinstance(data, dict) else {})
-        except Exception:
-            pass
+        except Exception as exc:
+            # Corrupt ranker.json silently reverts to hardcoded defaults —
+            # tuning weights lost until next `rag tune --apply`. Log so we
+            # can detect it before eval regressions surface.
+            _silent_log("ranker_config_load", exc)
         return cls.defaults()
 
     def save(self, metadata: dict | None = None) -> None:
@@ -2163,14 +2213,17 @@ def record_feedback(
             FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
             with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Explicit user feedback (+1/-1/corrective_path) is the
+            # ground-truth signal ranker-vivo trains on. A silent loss
+            # here shows up as flat eval + no boost on repeated queries.
+            _silent_log("feedback_jsonl_write", exc)
     # Cache invalidation — next load rebuilds from jsonl. Best-effort delete.
     try:
         if FEEDBACK_GOLDEN_PATH.is_file():
             FEEDBACK_GOLDEN_PATH.unlink()
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_golden_cache_delete", exc)
 
 
 def feedback_counts() -> tuple[int, int]:
@@ -2186,14 +2239,18 @@ def feedback_counts() -> tuple[int, int]:
             try:
                 ev = json.loads(line)
             except Exception:
+                # Per-line parse skip is load-bearing: one bad line from
+                # an interrupted write shouldn't fail the whole count.
+                # Logged once via the rebuild path; suppress here to
+                # avoid N log entries per scan.
                 continue
             r = ev.get("rating", 0)
             if r > 0:
                 pos += 1
             elif r < 0:
                 neg += 1
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_counts_read", exc)
     return pos, neg
 
 
@@ -2226,14 +2283,15 @@ def _rebuild_feedback_golden() -> dict:
                     continue
                 try:
                     ev = json.loads(line)
-                except Exception:
+                except Exception as exc:
+                    _silent_log("feedback_jsonl_line_parse", exc)
                     continue
                 tid = ev.get("turn_id")
                 if not tid:
                     continue
                 by_turn[tid] = ev  # later write overrides earlier
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("feedback_golden_rebuild_read", exc)
 
     positives: list[dict] = []
     negatives: list[dict] = []
@@ -2263,7 +2321,13 @@ def _rebuild_feedback_golden() -> dict:
     if queries:
         try:
             embs = embed(queries)
-        except Exception:
+        except Exception as exc:
+            # Zero-vec fallback: dimension mismatch vs real bge-m3
+            # embeddings means these entries never match anything
+            # downstream — feedback effectively dropped. Log so we
+            # notice the ollama outage before the ranker quietly
+            # stops applying user feedback boosts.
+            _silent_log("feedback_golden_embed", exc)
             embs = [[0.0]] * len(queries)
         for (q, bucket, paths), emb in zip(buckets, embs):
             bucket.append({"q": q, "emb": list(emb), "paths": paths})
@@ -2274,8 +2338,8 @@ def _rebuild_feedback_golden() -> dict:
         tmp = FEEDBACK_GOLDEN_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(golden, ensure_ascii=False), encoding="utf-8")
         tmp.replace(FEEDBACK_GOLDEN_PATH)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_golden_write", exc)
     return golden
 
 
@@ -7410,10 +7474,18 @@ def maybe_unload_reranker() -> bool:
                 if torch.backends.mps.is_available():
                     torch.mps.empty_cache()
             except Exception:
+                # MPS cache drop is best-effort — torch may not be
+                # importable (Intel mac) or MPS backend may be down.
+                # Failing here just means VRAM is freed on next GC cycle.
                 pass
             gc.collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Called out in code-review-followup as a site where silent
+            # failure could mask a real bug. If gc/del on the reranker
+            # throws, we've left _reranker at None but didn't free the
+            # CrossEncoder object — subsequent touch_reranker() will load
+            # a fresh one while the old one leaks until GC catches it.
+            _silent_log("reranker_unload", exc)
     return True
 
 
@@ -11416,14 +11488,22 @@ def find_contradictions_for_note(
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         helper_raw = resp.message.content.strip()
-    except Exception:
+    except Exception as exc:
+        # Chat timeout / ollama unreachable / model-load OOM. Logging
+        # here lets us distinguish "Ollama down" from "model emits
+        # unparseable JSON" — the latter is the json.loads branch below.
+        _silent_log("contradict_helper_chat", exc)
         return []
     m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
     if not m:
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except Exception as exc:
+        # The followup audit explicitly flagged this: qwen2.5:3b used
+        # to emit malformed JSON here, which silently dropped real
+        # contradictions from the index. Now we at least see it.
+        _silent_log("contradict_json_parse", exc)
         return []
     hits = data.get("contradictions") or []
     if not isinstance(hits, list):
@@ -12723,6 +12803,82 @@ def index(reset: bool, no_contradict: bool):
         _run_index(reset=reset, no_contradict=no_contradict)
 
 
+def _watch_filter_path(
+    raw_path: str,
+    vault_path: Path,
+    exclude_folders: tuple[str, ...],
+) -> Path | None:
+    """Filter a filesystem event's path down to a vault-relative Path worth
+    queuing for reindex. Extracted from the `watch()` CLI body so the logic
+    is unit-testable (the CLI itself spawns a watchdog Observer + debounce
+    loop, which is hard to drive from tests).
+
+    Returns the original path (not the resolved one) when:
+      - it ends in `.md`
+      - resolves under `vault_path`
+      - is NOT under any of `exclude_folders` (vault-relative)
+
+    Returns None otherwise. Never raises — malformed paths (nonexistent
+    parents, PermissionError during resolve, unresolvable ValueError) are
+    treated as "don't queue", matching the original handler semantics
+    (the `try/except ValueError: return` pattern it replaces).
+    """
+    if not raw_path.endswith(".md"):
+        return None
+    p = Path(raw_path)
+    try:
+        rel = p.resolve().relative_to(vault_path)
+    except (ValueError, OSError):
+        return None
+    rel_str = str(rel)
+    for folder in exclude_folders:
+        if rel_str.startswith(folder + "/") or rel_str == folder:
+            return None
+    return p
+
+
+def _watch_drain_once(
+    vstate: dict,
+    pending_lock: threading.Lock,
+) -> list[tuple[str, str | None, Path, str | None]]:
+    """Drain one vault's pending set and reindex each file. Extracted from
+    the debounce loop in `watch()` so the two parts that used to be
+    entangled (watchdog.Observer + this loop) can be tested separately.
+
+    Returns a list of `(name, status, path, err)` tuples in drain order:
+      - `name`: vstate["name"], propagated for multi-vault rendering
+      - `status`: return value of `_index_single_file` (indexed/skipped/
+        removed/empty/…) or None if the call raised
+      - `path`: the vault-relative Path when possible, else the absolute Path
+      - `err`: str of the exception when `_index_single_file` raised,
+        else None. Per-file errors NEVER abort the drain — one malformed
+        note must not block the whole batch.
+
+    Caller is responsible for printing / logging the result tuples and
+    for interpreting `status == "skipped"` as a no-op.
+    """
+    with pending_lock:
+        if not vstate["pending"]:
+            return []
+        batch = list(vstate["pending"])
+        vstate["pending"].clear()
+
+    out: list[tuple[str, str | None, Path, str | None]] = []
+    for p in batch:
+        try:
+            status = _index_single_file(vstate["col"], p, vault_path=vstate["path"])
+            err_s: str | None = None
+        except Exception as e:
+            status = None
+            err_s = str(e) or type(e).__name__
+        try:
+            rel: Path = p.relative_to(vstate["path"])
+        except ValueError:
+            rel = p
+        out.append((vstate["name"], status, rel, err_s))
+    return out
+
+
 @cli.command()
 @click.option("--debounce", default=3.0, help="Segundos a esperar antes de reindexar un cambio (default: 3)")
 @click.option("--all-vaults", "all_vaults", is_flag=True,
@@ -12791,19 +12947,9 @@ def watch(debounce: float, all_vaults: bool):
             self.vstate = vstate
 
         def _queue(self, raw_path: str) -> None:
-            if not raw_path.endswith(".md"):
+            p = _watch_filter_path(raw_path, self.vstate["path"], exclude_folders)
+            if p is None:
                 return
-            p = Path(raw_path)
-            try:
-                rel = p.resolve().relative_to(self.vstate["path"])
-            except ValueError:
-                return
-            # Drop files under an excluded folder — see module-level comment
-            # on `exclude_folders` for rationale.
-            rel_str = str(rel)
-            for folder in exclude_folders:
-                if rel_str.startswith(folder + "/") or rel_str == folder:
-                    return
             with pending_lock:
                 self.vstate["pending"].add(p)
 
@@ -12828,29 +12974,19 @@ def watch(debounce: float, all_vaults: bool):
     observer.start()
     console.print(f"[dim]debounce={debounce}s · Ctrl+C para salir[/dim]")
 
+    multi = len(vault_state) > 1
     try:
         while True:
             time.sleep(debounce)
             for vs in vault_state:
-                with pending_lock:
-                    if not vs["pending"]:
-                        continue
-                    batch = list(vs["pending"])
-                    vs["pending"].clear()
-                for p in batch:
-                    try:
-                        status = _index_single_file(vs["col"], p, vault_path=vs["path"])
-                    except Exception as e:
-                        console.print(f"  [red]error[/red] [{vs['name']}] {p.name}: {e}")
+                for name, status, rel, err in _watch_drain_once(vs, pending_lock):
+                    if err is not None:
+                        console.print(f"  [red]error[/red] [{name}] {rel.name}: {err}")
                         continue
                     if status == "skipped":
                         continue
-                    try:
-                        rel = p.relative_to(vs["path"])
-                    except ValueError:
-                        rel = p
                     color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
-                    tag = f"[dim][{vs['name']}][/dim] " if len(vault_state) > 1 else ""
+                    tag = f"[dim][{name}][/dim] " if multi else ""
                     console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
     except KeyboardInterrupt:
         pass

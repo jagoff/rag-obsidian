@@ -46,8 +46,6 @@ from rag import (  # noqa: E402
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
-    SYSTEM_RULES,
-    SYSTEM_RULES_WEB,
     _collect_screentime,
     _fmt_hm,
     VAULT_PATH,
@@ -70,9 +68,6 @@ from rag import (  # noqa: E402
     _load_corpus,
     _load_vaults_config,
     _path_to_title,
-    clean_md,
-    is_excluded,
-    parse_frontmatter,
     _pendientes_collect,
     _pendientes_urgent,
     _render_today_prompt,
@@ -81,14 +76,12 @@ from rag import (  # noqa: E402
     ensure_session,
     find_followup_loops,
     get_db,
-    BEHAVIOR_LOG_PATH,
     get_pagerank,
     log_behavior_event,
     log_query_event,
     multi_retrieve,
     new_turn_id,
     record_feedback,
-    reformulate_query,
     resolve_chat_model,
     resolve_vault_paths,
     save_session,
@@ -654,7 +647,8 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
     never replies — /api/chat then hangs forever. A short /api/tags probe
     catches that state without waiting for a model load.
     """
-    import urllib.request, urllib.error
+    import urllib.request
+    import urllib.error
     try:
         with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout) as r:
             return r.status == 200

@@ -24,7 +24,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -458,7 +458,7 @@ def render_archive_summary(arch: dict) -> None:
         print()
         return
     print(f"  Notes archived: {Style.bold(str(arch['total_archived']))}")
-    print(f"  Batch files used:")
+    print("  Batch files used:")
     if not arch["batch_files"]:
         print(f"    {Style.dim('(none in window)')}")
     for f in arch["batch_files"]:
@@ -539,7 +539,7 @@ def render_frontmatter(fm: dict) -> None:
     print(f"  Missing:         {missing}")
     if fm["missing_stamp_sample"]:
         print()
-        print(f"  Sample of un-stamped notes:")
+        print("  Sample of un-stamped notes:")
         for p in fm["missing_stamp_sample"]:
             print(f"    - {p}")
     print()

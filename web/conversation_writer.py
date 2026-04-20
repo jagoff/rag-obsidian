@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sqlite3
-import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime

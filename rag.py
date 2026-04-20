@@ -3567,7 +3567,6 @@ class SqliteVecCollection:
     __slots__ = ("_db", "name", "_dim", "_vec", "_meta")
 
     def __init__(self, db: "sqlite3.Connection", name: str, dim: int = 1024):
-        import sqlite3 as _sqlite3  # local alias to avoid name clash
         self._db = db
         self.name = name
         self._dim = dim
@@ -5949,7 +5948,7 @@ def _sync_spotify_notes(vault_root: Path, max_recent: int = 50) -> dict:
                 "---",
                 "source: spotify-top",
                 f"refreshed_date: {today}",
-                f"window: short_term (4 weeks)",
+                "window: short_term (4 weeks)",
                 "tags:",
                 "- spotify",
                 "- system-snapshot",
@@ -25763,7 +25762,7 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
     what a live run would do.
     """
     import sqlite3 as _sqlite
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
 
     sqlite_path = DB_PATH / "ragvec.db"
     out: dict = {

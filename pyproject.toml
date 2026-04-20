@@ -12,6 +12,11 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "pyyaml>=6.0",
+    # sentence-transformers is CORE (not optional): CrossEncoder is the
+    # reranker used on every retrieve() call (rag.py:7469). Moving it to
+    # an extra would break the default install. Local-embed path
+    # (RAG_LOCAL_EMBED=1, rag.py:6770) reuses the same lib via
+    # SentenceTransformer — no separate dep needed.
     "sentence-transformers>=3.0",
     "mcp>=1.0",
     "watchdog>=6.0.0",
@@ -19,12 +24,19 @@ dependencies = [
     "google-auth>=2.0",
     "google-auth-oauthlib>=1.2",
     "youtube-transcript-api>=1.0",
-    "spotipy>=2.23",
     "dateparser>=1.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=9.0"]
+# Spotify recently-played ingest (`rag index` picks up per-day notes
+# under 03-Resources/Spotify/). Opt-in because it needs a user-supplied
+# `~/.config/obsidian-rag/spotify_client.json` with OAuth client ID +
+# secret; 99% of users never configure it. Code path is guarded by
+# `try: import spotipy` (rag.py:6035) + a SPOTIFY_CLIENT_ID env check,
+# so a missing install degrades gracefully (ETL skipped, not crash).
+# Install: `uv pip install obsidian-rag[spotify]`
+spotify = ["spotipy>=2.23"]
 
 [project.scripts]
 rag = "rag:cli"

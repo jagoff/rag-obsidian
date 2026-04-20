@@ -955,7 +955,6 @@ dependencies = [
     { name = "rank-bm25" },
     { name = "rich" },
     { name = "sentence-transformers" },
-    { name = "spotipy" },
     { name = "sqlite-vec" },
     { name = "uvicorn" },
     { name = "watchdog" },
@@ -965,6 +964,9 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
+]
+spotify = [
+    { name = "spotipy" },
 ]
 
 [package.metadata]
@@ -982,13 +984,13 @@ requires-dist = [
     { name = "rank-bm25", specifier = ">=0.2.2" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "sentence-transformers", specifier = ">=3.0" },
-    { name = "spotipy", specifier = ">=2.23" },
+    { name = "spotipy", marker = "extra == 'spotify'", specifier = ">=2.23" },
     { name = "sqlite-vec", specifier = ">=0.1.6" },
     { name = "uvicorn", specifier = ">=0.27" },
     { name = "watchdog", specifier = ">=6.0.0" },
     { name = "youtube-transcript-api", specifier = ">=1.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "spotify"]
 
 [[package]]
 name = "ollama"

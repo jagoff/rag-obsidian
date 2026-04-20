@@ -210,6 +210,16 @@ def test_dwell_score_saturates_at_norm_cap():
     assert scored[0]["score"] == pytest.approx(0.5 + 0.1, abs=1e-9)
 
 
+# ── seen_titles penalty (post-rerank diversity) ────────────────────────────
+
+
+def test_seen_title_penalty_constant_is_positive_and_small():
+    """Sanity: constant lives at the module level with a reasonable default.
+    Too large (>0.5) would flip rankings that shouldn't flip; too small
+    (<0.05) is invisible vs typical consecutive-candidate gaps."""
+    assert 0.05 <= rag.SEEN_TITLE_PENALTY <= 0.5
+
+
 def test_feedback_signals_applied_symmetrically():
     # fb_pos_cos=1.0 with default floor=0.70 → ramp weight = (1.0-0.70)/(1.0-0.70) = 1.0
     # so full feedback_pos/neg is applied, preserving the old bool=True semantics.

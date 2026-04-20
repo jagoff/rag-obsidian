@@ -191,6 +191,14 @@ def test_calendar_create_creator_fails(client, monkeypatch):
     "agendá una reunión con el equipo",
     "bloqueá un turno para el dentista",
     "poné una cita con el médico",
+    # Implicit statement form — "tengo/hay/tenemos X" + temporal.
+    "mañana tengo una daily meeting a las 10am",
+    "tengo reunión con el equipo el jueves 4pm",
+    "hay standup mañana 10:30",
+    "la semana que viene tengo turno con el dentista",
+    "me citaron para una entrevista el viernes a las 3",
+    "el lunes que viene tengo call con el cliente",
+    "mañana hay demo a las 16hs",
 ])
 def test_detect_propose_intent_positive(q):
     assert web_server._detect_propose_intent(q) is True
@@ -203,6 +211,12 @@ def test_detect_propose_intent_positive(q):
     "cómo llego a Palermo",
     "qué eventos tengo mañana",
     "mostrame los recordatorios",
+    "cuándo es la próxima reunión",
+    "dónde es la reunión",
+    # Bare event noun without temporal → not enough signal
+    "tengo reunión",
+    # Temporal without event noun → could be anything
+    "el jueves a las 4",
     "",
     None,
 ])

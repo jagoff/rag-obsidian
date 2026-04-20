@@ -168,15 +168,68 @@ _PROPOSE_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Implicit CREATE patterns — statement-of-fact form ("mañana tengo X", "hay
+# Y el jueves", "me citaron para Z"). Users speak this way constantly in
+# rioplatense when recording something that's going to happen. Detect via
+# the combination of (event noun) + (temporal anchor) + NOT starting with
+# a question word. Each signal in isolation is too noisy — together they
+# reliably separate "mañana tengo daily" (create) from "qué tengo mañana"
+# (query) and from "tengo hambre" (neither).
+_EVENT_NOUN_RE = re.compile(
+    r"\b(?:reuni[oó]n|evento|cita|turno|llamada|daily|stand-?up|meeting|"
+    r"entrevista|\bcall\b|sync|retro(?:spectiva)?|planning|demo|all.?hands|"
+    r"sprint(?:\s+(?:review|planning))?|visita|clase|entrenamiento|"
+    r"sesi[oó]n|taller|workshop|webinar|conferencia|almuerzo|cena|show|"
+    r"concierto|partido|cumplea[ñn]os|aniversario|viaje|vuelo|appointment|"
+    r"1:1|1on1|one.?on.?one|uno.?a.?uno)\b",
+    re.IGNORECASE,
+)
+
+_TEMPORAL_ANCHOR_RE = re.compile(
+    r"\b(?:ma[ñn]ana|pasado\s+ma[ñn]ana|hoy|esta\s+(?:noche|tarde|ma[ñn]ana)|"
+    r"(?:el|este|pr[oó]xim[oa])\s+(?:lunes|martes|mi[eé]rcoles|jueves|"
+    r"viernes|s[aá]bado|domingo|finde|semana|mes|a[ñn]o)|"
+    r"la\s+semana\s+que\s+vienen?|el\s+(?:finde|mes\s+que\s+vienen?|"
+    r"a[ñn]o\s+que\s+vienen?)|"
+    r"a\s+las?\s+\d|tipo\s+\d|a\s+eso\s+de\s+las|"
+    r"en\s+\d+\s+(?:minutos?|horas?|d[ií]as?|semanas?))\b"
+    r"|\b\d{1,2}\s*(?:hs|h|am|pm)\b|\d{1,2}:\d{2}",
+    re.IGNORECASE,
+)
+
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:qu[eé]|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|d[oó]nde|c[oó]mo|"
+    r"por\s+qu[eé]|a\s+qu[eé]|de\s+qu[eé])\b",
+    re.IGNORECASE,
+)
+
 
 def _detect_propose_intent(q: str) -> bool:
     """Return True if `q` looks like a CREATE request (reminder or event).
+
+    Two branches:
+      1. Explicit create verb (`_PROPOSE_INTENT_RE`) — covers
+         "recordame X", "creá un evento Y", etc.
+      2. Implicit statement form — event noun AND temporal anchor AND
+         the sentence isn't a question. Covers "mañana tengo daily",
+         "hay standup el jueves 10hs", "me citaron para entrevista".
+
     Used by the chat endpoint to force the LLM tool-decide round even
     when RAG_WEB_TOOL_LLM_DECIDE is unset — proposal tools can only be
-    invoked via that round (they require LLM arg extraction)."""
+    invoked via that round (they require LLM arg extraction).
+    """
     if not q:
         return False
-    return bool(_PROPOSE_INTENT_RE.search(q))
+    if _PROPOSE_INTENT_RE.search(q):
+        return True
+    # Implicit branch. Question-word start disqualifies ("qué reuniones
+    # tengo" is a query, not create). Both event noun AND temporal must
+    # appear — either alone is too ambiguous.
+    if _QUESTION_START_RE.match(q):
+        return False
+    if _EVENT_NOUN_RE.search(q) and _TEMPORAL_ANCHOR_RE.search(q):
+        return True
+    return False
 
 
 # Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
@@ -3724,7 +3777,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # Results are appended as a single `role:"system"` block with
             # an explicit "DATOS FRESCOS" prefix so the LLM treats them as
             # authoritative over the retrieved vault context.
-            _forced_tools = _detect_tool_intent(question)
+            #
+            # Exception: create-intent queries ("mañana tengo daily a las
+            # 10am") match `reminders_due` / `calendar_ahead` via the
+            # shared `_PLANNING_PAT` (any "mañana" triggers it). Feeding
+            # those read-intent results into context when the user is
+            # CREATING something makes the LLM hallucinate that the event
+            # already exists. Skip the pre-router entirely when propose
+            # intent is detected — let the LLM decide cleanly.
+            _propose_intent = _detect_propose_intent(question)
+            _forced_tools = [] if _propose_intent else _detect_tool_intent(question)
             if _forced_tools:
                 _f_serial = [(n, a) for n, a in _forced_tools if n not in PARALLEL_SAFE]
                 _f_parallel = [(n, a) for n, a in _forced_tools if n in PARALLEL_SAFE]
@@ -3806,7 +3868,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _llm_tool_decide = os.environ.get(
                 "RAG_WEB_TOOL_LLM_DECIDE", ""
             ).strip() not in ("", "0", "false", "no")
-            _propose_intent = _detect_propose_intent(question)
+            # `_propose_intent` set earlier (pre-router gate); reuse to avoid
+            # re-running the regex.
             _skip_llm_tool_round = not _llm_tool_decide and not _propose_intent
 
             for _round_idx in range(_TOOL_ROUND_CAP):

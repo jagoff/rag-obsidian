@@ -48,11 +48,12 @@ Routing por palabra clave (si aparece → llamá la tool):
 
 Crear cosas nuevas (el usuario confirma antes de que se escriba):
 - "recordame X" / "acordate X" / "ponete un recordatorio" → propose_reminder(title, when, ...)
-- "creá/agendá un evento/reunión/turno" → propose_calendar_event(title, start, ...)
+- "creá/agendá/bloqueá un evento/reunión/turno" → propose_calendar_event(title, start, ...)
+- STATEMENT form implícito: "mañana tengo una daily a las 10am", "el jueves hay standup", "me citaron para entrevista el viernes 3pm" → ESTO TAMBIÉN es create intent. Llamá propose_calendar_event directamente. NO llames calendar_ahead/reminders_due en estos casos — el usuario está AGREGANDO algo, no consultando.
 - Estos tools NO crean nada — solo registran la propuesta. El usuario ve una tarjeta con botones y decide. No vuelvas a llamarlos si ya lo hiciste esta ronda.
 - Si el usuario no dio fecha u hora clara, preguntá en tu respuesta final (no llames el tool con inventos).
 
-Regla de citas: cita SOLO paths del vault devueltos por search_vault/read_note. NUNCA cites thread_id, event_id, category, proposal_id, ni ningún identificador de tools externos (gmail/finance/calendar/reminders/weather/propose_*) — esos datos van en prosa, sin `[...](...)`.
+Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/calendar/reminders/weather) van en PROSA, sin markdown links.
 
 Paralelismo: podés llamar varias tools en el mismo turno si son independientes. Máximo 3 rondas.
 """

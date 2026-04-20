@@ -79,6 +79,10 @@ def test_delete_event_ok(monkeypatch):
     assert 'tell application "Calendar"' in script
     assert "delete" in script
     assert "UID-ABC-123" in script
+    # Iteration over writable calendars (not `whose uid is ...`) because
+    # Calendar.app's `whose uid` query is unreliable — verified 2026-04-20.
+    assert "writable is true" in script
+    assert "repeat with" in script
 
 
 def test_delete_event_escapes_uid_quotes(monkeypatch):

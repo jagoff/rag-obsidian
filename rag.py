@@ -1359,6 +1359,14 @@ CONFIDENCE_DEEP_THRESHOLD = 0.10
 # calibrated middle-ground — narrow enough to skip strong hits, wide enough
 # to catch genuinely borderline ones. Tunable here for future corpus shifts.
 GRAPH_EXPANSION_GATE = 0.5
+# Seen-title diversity penalty: when retrieve() is called with a non-empty
+# `seen_titles` list (typically from prior chat turns), candidates whose
+# note title matches get their post-rerank score shifted down by this
+# amount. Magnitude is ~20% of the typical borderline rerank_logit (0.5)
+# and ~50% of the typical consecutive-candidate gap, so it nudges a repeat
+# down a slot or two without killing a clearly-relevant re-match. Set to
+# 0 to disable the feature (equivalent to the pre-2026-04-20 behaviour).
+SEEN_TITLE_PENALTY = 0.1
 
 console = Console()
 
@@ -10450,9 +10458,19 @@ def retrieve(
     rerank_pool: int | None = None,
     exclude_paths: set[str] | None = None,
     exclude_path_prefixes: tuple[str, ...] | None = None,
+    seen_titles: list[str] | set[str] | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
+
+    `seen_titles`, when provided, applies a soft post-rerank penalty
+    (`SEEN_TITLE_PENALTY`) to candidates whose note title was already
+    surfaced in prior turns. Diversity nudge for chat chains that
+    otherwise collapse into the same chunks across turns. Tried earlier
+    as an LLM prompt instruction — regressed chains −16pp because the
+    helper interpreted the list as "avoid these" and drifted off-topic.
+    As a post-rerank score shift it only reorders within the already-
+    relevant pool, so semantically correct results still win.
 
     Pipeline:
       - optional history-aware reformulation (precise), with optional `summary`
@@ -10693,6 +10711,12 @@ def retrieve(
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
+    # Seen-title penalty: normalise caller's input to a case-insensitive
+    # set for O(1) membership checks inside the hot scoring loop. Empty
+    # → no-op. Matching is on note title (stem), not chunk body.
+    seen_title_set: set[str] = set()
+    if seen_titles and SEEN_TITLE_PENALTY > 0.0:
+        seen_title_set = {t.strip().lower() for t in seen_titles if t and t.strip()}
     final_pairs: list[tuple] = []
     for c, e, s in zip(candidates, expanded, scores):
         meta = c[1] if isinstance(c[1], dict) else {}
@@ -10752,6 +10776,15 @@ def retrieve(
         neg_cos = penalty_paths.get(path, 0.0)
         if neg_cos > floor:
             final -= weights.feedback_neg * (neg_cos - floor) / denom
+        # Seen-title diversity penalty: chat chains where turn N+1 is a
+        # refinement ("¿y sobre X?") tend to re-retrieve the same chunks
+        # as turn N. A soft shift down on already-surfaced titles
+        # encourages the model to pull adjacent context instead of the
+        # exact same note body. Case-insensitive match on note title.
+        if seen_title_set:
+            note_title = str(meta.get("note") or "").strip().lower()
+            if note_title and note_title in seen_title_set:
+                final -= SEEN_TITLE_PENALTY
         final_pairs.append((c, e, final))
     scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
     scored = scored_all[:k]
@@ -11328,6 +11361,7 @@ def multi_retrieve(
     rerank_pool: int | None = None,
     exclude_paths: set[str] | None = None,
     exclude_path_prefixes: tuple[str, ...] | None = None,
+    seen_titles: list[str] | set[str] | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -11358,6 +11392,7 @@ def multi_retrieve(
             date_range=date_range, summary=summary,
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
+            seen_titles=seen_titles,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -11377,6 +11412,7 @@ def multi_retrieve(
             date_range=date_range, summary=summary,
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
+            seen_titles=seen_titles,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -14866,6 +14902,11 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
                 result = retrieve(
                     col, search_q, k, folder=None, tag=None,
                     precise=False, multi_query=not no_multi, auto_filter=True,
+                    # Soft post-rerank penalty on titles seen in earlier
+                    # chain turns — encourages diversity without forcing
+                    # the LLM to drift off-topic (see retrieve() docstring
+                    # for the earlier prompt-injection attempt that failed).
+                    seen_titles=_titles_from_paths(chain_seen_paths),
                 )
                 chains_latency_ms.append((time.perf_counter() - _t0) * 1000)
                 seen_paths = _dedup([m.get("file", "") for m in result["metas"]])
@@ -20240,9 +20281,15 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
     (returned by `_create_calendar_event`). Returns `(ok, message)`.
 
     Same contract as `_delete_reminder` — feeds the undo button on the
-    chat's auto-create toast. AppleScript's `whose uid is` query scans
-    all events; on a vault with thousands of past events this can take
-    1-2s. Timeout generous (20s) for the worst case.
+    chat's auto-create toast for events.
+
+    Implementation note: Calendar.app's `whose uid is X` query is
+    unreliable — on vaults with many events it either times out OR
+    errors with "No puede obtenerse event 1 whose uid = ..." (macOS
+    14+ behaviour, verified 2026-04-20 via user test). The fix is to
+    iterate over writable calendars and scan each one's events until
+    we find a matching uid. Slower but reliable; timeout 30s covers
+    calendars with thousands of events.
     """
     uid = (event_uid or "").strip()
     if not uid:
@@ -20253,15 +20300,21 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
     script = (
         'tell application "Calendar"\n'
         '  try\n'
-        f'    set _e to first event whose uid is "{safe}"\n'
-        '    delete _e\n'
-        '    return "ok"\n'
+        '    repeat with _cal in (every calendar whose writable is true)\n'
+        '      repeat with _ev in (every event of _cal)\n'
+        f'        if uid of _ev is "{safe}" then\n'
+        '          delete _ev\n'
+        '          return "ok"\n'
+        '        end if\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '    return "err: evento no encontrado"\n'
         '  on error errMsg\n'
         '    return "err: " & errMsg\n'
         '  end try\n'
         'end tell\n'
     )
-    out = _osascript(script, timeout=20.0)
+    out = _osascript(script, timeout=30.0)
     if out == "ok":
         return True, "borrado"
     if out.startswith("err:"):

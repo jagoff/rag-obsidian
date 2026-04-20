@@ -3861,18 +3861,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # the model to "summarise the vault" behaviour that competes with
         # the tool call. Prefix cache is cold for that first create-intent
         # turn, acceptable cost given how rare they are compared to reads.
+        #
+        # History is also SKIPPED on create-intent. If previous turns in
+        # the same session show the assistant responding with text (no
+        # tool_calls) — which happened constantly during debug before the
+        # fix — the model mirrors that pattern and refuses to emit
+        # tool_calls this turn either (tool_rounds=0 logged). A create
+        # intent is a self-contained action anyway: no narrative continuity
+        # with prior turns, no pronouns to resolve against earlier context.
         if is_propose_intent:
             _system_msgs: list[dict] = [
                 {"role": "system", "content": _PROPOSE_CREATE_OVERRIDE},
             ]
+            _turn_history: list[dict] = []
         else:
             _system_msgs = [
                 {"role": "system", "content": _WEB_SYSTEM_PROMPT},
                 {"role": "system", "content": _WEB_TOOL_ADDENDUM},
             ]
+            _turn_history = history or []
         tool_messages: list[dict] = (
             _system_msgs
-            + (history or [])
+            + _turn_history
             + [{"role": "user", "content": user_content}]
         )
 

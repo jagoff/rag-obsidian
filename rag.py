@@ -2670,6 +2670,11 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_ts ON rag_queries(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_session ON rag_queries(session)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_cmd_ts ON rag_queries(cmd, ts)",
+            # Composite for "recent queries of session X" — session-scoped
+            # history reads in chat()/web (dashboard, session drawer) go
+            # via (session, ts DESC); without this covering index SQLite
+            # falls back to the session-only index + per-row ts sort.
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_session_ts ON rag_queries(session, ts)",
         ),
     ),
     (
@@ -2689,6 +2694,11 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_ts ON rag_behavior(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path ON rag_behavior(path)",
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_event_ts ON rag_behavior(event, ts)",
+            # Composite for ranker-vivo CTR/dwell aggregates per path within
+            # a time window (_compute_behavior_priors_from_rows scans the
+            # last N days by path). Without it the path-only index requires
+            # a filter pass on ts for every bucket.
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path_ts ON rag_behavior(path, ts)",
         ),
     ),
     (

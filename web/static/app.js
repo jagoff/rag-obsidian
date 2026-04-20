@@ -813,8 +813,79 @@ marked.use({
       const ext = !isNote && /^https?:\/\//.test(href) ? ` target="_blank" rel="noopener noreferrer"` : "";
       return `<a href="${target}"${titleAttr}${ext}>${text}</a>`;
     },
+    // Drop raw HTML blocks/inline emitted by the LLM. marked passes them
+    // through by default which is an XSS surface when the model halluci-
+    // nates <script>/<iframe>/<img onerror> tags or a vault note contains
+    // pasted HTML. Escaping to text preserves the visible content but
+    // removes executable markup.
+    html({ text }) {
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    },
   },
 });
+
+// Post-render sanitiser: parses the marked output into a detached DOM,
+// strips disallowed elements + dangerous attributes, returns cleaned HTML.
+// Belt-and-suspenders with the renderer.html override above — catches
+// anything that slipped through (mostly on-event attrs inside crafted
+// link titles). No external dep.
+const _SAFE_TAGS = new Set([
+  "a", "abbr", "b", "blockquote", "br", "code", "del", "div", "em",
+  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol",
+  "p", "pre", "s", "span", "strong", "sub", "sup", "table", "tbody",
+  "td", "th", "thead", "tr", "ul",
+]);
+const _SAFE_ATTRS = new Set([
+  "href", "title", "alt", "src", "target", "rel", "class", "id",
+  "colspan", "rowspan", "start", "type",
+]);
+
+function _sanitizeNode(node) {
+  // Walk in reverse so we can remove children without indexing surprises.
+  const children = Array.from(node.childNodes);
+  for (const child of children) {
+    if (child.nodeType === Node.ELEMENT_NODE) {
+      const tag = child.tagName.toLowerCase();
+      if (!_SAFE_TAGS.has(tag)) {
+        child.remove();
+        continue;
+      }
+      // Kill all on* handlers + anything not in the safe-attr list.
+      for (const attr of Array.from(child.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith("on") || !_SAFE_ATTRS.has(name)) {
+          child.removeAttribute(attr.name);
+          continue;
+        }
+        // href/src must not be javascript: / data: (except data:image/…)
+        if (name === "href" || name === "src") {
+          const val = attr.value.trim().toLowerCase();
+          const isJs = val.startsWith("javascript:");
+          const isDataNonImg = val.startsWith("data:") && !val.startsWith("data:image/");
+          if (isJs || isDataNonImg) {
+            child.removeAttribute(attr.name);
+          }
+        }
+      }
+      _sanitizeNode(child);
+    }
+  }
+}
+
+function _sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(
+    `<div id="__root">${html}</div>`, "text/html"
+  );
+  const root = doc.getElementById("__root");
+  if (!root) return "";
+  _sanitizeNode(root);
+  return root.innerHTML;
+}
 
 function preprocess(text) {
   // Accept malformed closings (LLM frequently drops one `<` or `>`):
@@ -840,7 +911,7 @@ function postprocess(html) {
 }
 
 function renderMarkdown(text) {
-  return postprocess(marked.parse(preprocess(text)));
+  return _sanitizeHtml(postprocess(marked.parse(preprocess(text))));
 }
 
 // Send --------------------------------------------------------

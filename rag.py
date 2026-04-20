@@ -1590,6 +1590,11 @@ _behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) —
 # the JSONL fallback's cache key stays a distinct type. T10 will collapse
 # both into one after the 7-day observation window.
 _behavior_priors_cache_key_sql: str | None = None
+# Serialises reads + writes of the three globals above. Same motivation as
+# _corpus_cache_lock: the watchdog / behavior loggers can invalidate while
+# CLI/web threads are mid-lookup. RLock in case a reader calls out to a
+# function that re-enters (defensive; today's callers don't).
+_behavior_priors_lock = threading.RLock()
 
 
 def _compute_behavior_priors_from_rows(rows_iter) -> dict:
@@ -1742,9 +1747,10 @@ def _load_behavior_priors() -> dict:
             with _ragvec_state_conn() as conn:
                 max_ts = _sql_max_ts(conn, "rag_behavior")
                 if max_ts is not None:
-                    if (_behavior_priors_cache is not None
-                            and _behavior_priors_cache_key_sql == max_ts):
-                        return _behavior_priors_cache
+                    with _behavior_priors_lock:
+                        if (_behavior_priors_cache is not None
+                                and _behavior_priors_cache_key_sql == max_ts):
+                            return _behavior_priors_cache
                     import sqlite3 as _sqlite3
                     prev_factory = conn.row_factory
                     try:
@@ -1756,9 +1762,10 @@ def _load_behavior_priors() -> dict:
                         conn.row_factory = prev_factory
                     snapshot = _compute_behavior_priors_from_rows(rows)
                     snapshot["hash"] = f"sql:{max_ts}"
-                    _behavior_priors_cache = snapshot
-                    _behavior_priors_cache_key_sql = max_ts
-                    _behavior_priors_cache_key = None
+                    with _behavior_priors_lock:
+                        _behavior_priors_cache = snapshot
+                        _behavior_priors_cache_key_sql = max_ts
+                        _behavior_priors_cache_key = None
                     return snapshot
                 # SQL empty (table has no rows) → fall through to JSONL.
         except Exception as exc:
@@ -1774,16 +1781,18 @@ def _load_behavior_priors() -> dict:
     except OSError:
         cache_key = (0.0, 0)
 
-    if (_behavior_priors_cache is not None
-            and _behavior_priors_cache_key == cache_key
-            and _behavior_priors_cache_key_sql is None):
-        return _behavior_priors_cache
+    with _behavior_priors_lock:
+        if (_behavior_priors_cache is not None
+                and _behavior_priors_cache_key == cache_key
+                and _behavior_priors_cache_key_sql is None):
+            return _behavior_priors_cache
 
     snapshot = _compute_behavior_priors_from_rows(_iter_behavior_jsonl())
     snapshot["hash"] = f"{cache_key[0]:.3f}:{cache_key[1]}"
-    _behavior_priors_cache = snapshot
-    _behavior_priors_cache_key = cache_key
-    _behavior_priors_cache_key_sql = None
+    with _behavior_priors_lock:
+        _behavior_priors_cache = snapshot
+        _behavior_priors_cache_key = cache_key
+        _behavior_priors_cache_key_sql = None
     return snapshot
 
 
@@ -6607,6 +6616,14 @@ def hyde_embed(question: str) -> list[float]:
 # ── SEARCH ────────────────────────────────────────────────────────────────────
 
 _corpus_cache: dict | None = None
+# Serialises reads + invalidations of _corpus_cache and _pagerank_cache.
+# The watchdog thread calls _invalidate_corpus_cache() from its debounce
+# loop while CLI/web threads read _corpus_cache from retrieve()/query();
+# without a lock the `is not None` check + return is not atomic and a
+# reader can see a partially-rebuilt dict. Lock is held briefly only
+# around cache reads/writes — the expensive BM25 / graph / PageRank
+# build happens outside the critical section in local vars.
+_corpus_cache_lock = threading.RLock()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -6629,12 +6646,14 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     global _corpus_cache
     n = col.count()
     cid = str(getattr(col, "id", "") or "")
+    with _corpus_cache_lock:
+        cached = _corpus_cache
     if (
-        _corpus_cache is not None
-        and _corpus_cache["count"] == n
-        and _corpus_cache.get("collection_id") == cid
+        cached is not None
+        and cached["count"] == n
+        and cached.get("collection_id") == cid
     ):
-        return _corpus_cache
+        return cached
 
     data = col.get(include=["documents", "metadatas"])
     docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
@@ -6674,7 +6693,7 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
             for t in raw_links:
                 backlinks.setdefault(t, set()).add(path)
 
-    _corpus_cache = {
+    new_cache = {
         "count": n, "collection_id": cid,
         "ids": ids, "docs": docs, "metas": metas,
         "bm25": bm25, "tags": tags, "folders": folders,
@@ -6682,13 +6701,17 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
         "outlinks": outlinks,    # path → [linked titles]
         "backlinks": backlinks,  # title → {paths that link to it}
     }
-    return _corpus_cache
+    with _corpus_cache_lock:
+        _corpus_cache = new_cache
+    return new_cache
 
 
 def _invalidate_corpus_cache() -> None:
-    global _corpus_cache, _pagerank_cache
-    _corpus_cache = None
-    _pagerank_cache = None
+    global _corpus_cache, _pagerank_cache, _pagerank_cache_cid
+    with _corpus_cache_lock:
+        _corpus_cache = None
+        _pagerank_cache = None
+        _pagerank_cache_cid = None
 
 
 # ── Person-mention enrichment ────────────────────────────────────────────────
@@ -8642,18 +8665,31 @@ def _graph_pagerank(
 
 # Module-level cache for PageRank — invalidated with corpus cache.
 _pagerank_cache: dict[str, float] | None = None
+_pagerank_cache_cid: str | None = None
 
 
 def get_pagerank(col: "SqliteVecCollection") -> dict[str, float]:
-    """Cached PageRank over the wikilink graph. Rebuilt when corpus changes."""
-    global _pagerank_cache
+    """Cached PageRank over the wikilink graph. Rebuilt when corpus changes.
+
+    Invalidation key is the corpus `collection_id` (sqlite-vec's stable
+    UUID — rotates on delete+create). The previous implementation keyed
+    on `id(corpus)` which is the memory address of the dict; that address
+    changes every time `_load_corpus` rebuilds even when the content is
+    identical, causing needless PageRank recomputation on every retrieve
+    after any cache-invalidation nudge.
+    """
+    global _pagerank_cache, _pagerank_cache_cid
     corpus = _load_corpus(col)
-    if _pagerank_cache is not None and corpus.get("_pagerank_id") == id(corpus):
-        return _pagerank_cache
+    cid = corpus.get("collection_id") or ""
+    with _corpus_cache_lock:
+        if _pagerank_cache is not None and _pagerank_cache_cid == cid:
+            return _pagerank_cache
     adj = _build_graph_adj(corpus)
-    _pagerank_cache = _graph_pagerank(adj)
-    corpus["_pagerank_id"] = id(corpus)
-    return _pagerank_cache
+    new_rank = _graph_pagerank(adj)
+    with _corpus_cache_lock:
+        _pagerank_cache = new_rank
+        _pagerank_cache_cid = cid
+    return new_rank
 
 
 def _hop_set(adj: dict[str, set[str]], start: str, hops: int) -> set[str]:

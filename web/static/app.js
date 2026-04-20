@@ -1227,6 +1227,7 @@ async function send(question) {
   let fullText = "";
   let sources = null;
   let confidence = null;
+  let hadProposal = false;
   let metaShown = false;
   let aborted = false;
   // Live tickers for the two long waits (retrieve + generate). Server fires
@@ -1394,12 +1395,17 @@ async function send(question) {
     } else if (event === "sources") {
       sources = parsed.items;
       if (Number.isFinite(parsed.confidence)) confidence = parsed.confidence;
+      // Server marks propose-intent turns so we know to skip the vault
+      // sources panel + web-search button (irrelevant when the user is
+      // CREATING something, not asking about existing notes).
+      if (parsed.propose_intent) hadProposal = true;
     } else if (event === "proposal") {
       // The server emits this after a propose_reminder /
       // propose_calendar_event tool resolves. We render the card
       // immediately so the user sees it while the LLM's narrative
       // keeps streaming. The thinking spinner (if still showing) is
       // torn down on the next token event.
+      hadProposal = true;
       appendProposal(turn, parsed);
       scrollBottom();
     } else if (event === "token") {
@@ -1423,10 +1429,13 @@ async function send(question) {
         ragText.innerHTML = renderMarkdown(fullText);
       }
       const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
-      if (sources && sources.length) {
+      // On propose-intent turns skip the sources panel AND the
+      // web-search fallback — vault retrieval / googling are irrelevant
+      // when the user asked the system to CREATE a reminder/event.
+      if (!hadProposal && sources && sources.length) {
         appendSources(turn, sources, conf);
       }
-      if (question && (!sources || !sources.length || (Number.isFinite(conf) && conf < 1.0))) {
+      if (!hadProposal && question && (!sources || !sources.length || (Number.isFinite(conf) && conf < 1.0))) {
         appendWebSearch(turn, question);
       }
       const feedbackBar = parsed.turn_id

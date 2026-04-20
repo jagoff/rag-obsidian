@@ -86,7 +86,12 @@
       </section>
     </div>
   </div>
-  <script src="/static/vendor/marked.min.js"></script>
-  <script src="/static/app.js?v=2026-04-20-toast"></script>
+  <!-- marked@18.0.2 vendored in web/static/vendor/. SRI hash guards
+       against silent file swap (compromised server, botched re-vendor).
+       Regenerate when upgrading: `cat web/static/vendor/marked.min.js
+       | openssl dgst -sha384 -binary | openssl base64 -A` -->
+  <script src="/static/vendor/marked.min.js"
+          integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"></script>
+  <script src="/static/app.js?v=2026-04-20-no-sources-on-propose"></script>
 </body>
 </html>

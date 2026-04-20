@@ -6,12 +6,10 @@ window query, the state ring, and the markdown writer.
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pytest
 
 import rag
 

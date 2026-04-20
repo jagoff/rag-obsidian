@@ -390,6 +390,8 @@ def _load_vaults_config() -> dict:
     try:
         cfg = json.loads(VAULTS_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
+        # Called during module init (before _silent_log is defined).
+        # User-visible failure mode: empty vault list → default vault used.
         return {"vaults": {}, "current": None}
     cfg.setdefault("vaults", {})
     cfg.setdefault("current", None)
@@ -417,6 +419,62 @@ def _resolve_vault_path() -> Path:
 
 
 VAULT_PATH = _resolve_vault_path()
+# Root of all per-user operational state (query logs, behavior logs,
+# sessions, tuned ranker, caches, OAuth tokens). Created on import with
+# 0o700 so queries.jsonl + behavior.jsonl (PII: literal user prompts +
+# open/save events) aren't world-readable on shared machines. `.config/`
+# isn't used for state — reserved for OAuth `client_secret` JSONs that
+# the user drops in manually.
+
+
+def _ensure_state_dir_secure() -> Path:
+    """Create ~/.local/share/obsidian-rag with 0o700 permissions.
+
+    Idempotent. If the directory already exists with looser perms (e.g.
+    created pre-hardening with umask 022 → 0o755), chmod tightens it.
+    Best-effort: on filesystems that reject chmod (NFS, SMB, FUSE) we
+    swallow the error rather than crash import — the worst case is the
+    dir keeps its previous mode, which matches the old behavior.
+    """
+    root = Path.home() / ".local/share/obsidian-rag"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _write_secret_file(path: Path, content: str) -> None:
+    """Atomic + 0o600 write for OAuth tokens / refresh_tokens / API keys.
+
+    The refresh_token inside a Google OAuth cache permits indefinite
+    access to the user's Gmail + Drive, so the file must never be
+    world- or group-readable. We write to a sibling tempfile, chmod
+    BEFORE the final rename so no observer can read the file while
+    it's still 0o644 from the default umask, then os.replace into
+    place atomically.
+
+    Parent dir gets 0o700 for the same reason (matches _ensure_state_dir_secure
+    for ~/.config/obsidian-rag/, which is where _GOOGLE_TOKEN_PATH and
+    _SPOTIFY_TOKEN_PATH live — separate tree from state).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+_STATE_DIR = _ensure_state_dir_secure()
+
 DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
@@ -426,6 +484,13 @@ BRIEF_STATE_PATH = Path.home() / ".local/share/obsidian-rag/brief_state.jsonl"
 COLLECTION_WRITE_LOCK = Path.home() / ".local/share/obsidian-rag/collection_write.lock"
 COLLECTION_OPS_LOG = Path.home() / ".local/share/obsidian-rag/collection_ops.log"
 COLLECTION_RESET_SENTINEL = Path.home() / ".local/share/obsidian-rag/collection_reset_at"
+# Sink for exceptions that used to be `except Exception: pass`. See
+# `_silent_log()` below — only called from sites where a silent failure
+# could mask a real bug (corrupt cache, data-loss adjacent, reranker
+# unload, contradict JSON parse, feedback golden rebuild). Best-effort
+# sites (optional enrichment, shutdown cleanup, Apple integrations) still
+# use bare `pass`.
+SILENT_ERRORS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/silent_errors.jsonl"
 
 
 # Single-writer queue for best-effort JSONL appends on the response path.
@@ -469,6 +534,37 @@ def _flush_log_queue() -> None:
 atexit.register(_flush_log_queue)
 
 
+def _silent_log(where: str, exc: BaseException) -> None:
+    """Record a swallowed exception without raising or blocking.
+
+    Used at sites where the contract is `silently fall back` (corrupt
+    cache → reset, failed append → skip, JSON parse fail → return None)
+    but the failure could mask a real bug in a subsystem we didn't fully
+    audit: contradict-detector JSON parse, reranker unload, feedback
+    golden rebuild, ranker.json load, session/state persistence.
+
+    Writes one JSON line to `silent_errors.jsonl` through the existing
+    `_LOG_QUEUE` (daemon thread, non-blocking) so the call is the same
+    ~1µs cost as `pass`. Callers keep their silent-fail contract — this
+    adds observability only. The helper itself must never raise; if the
+    queue is full or JSON serialisation throws, we drop the record.
+
+    Sites that are genuinely best-effort (optional enrichment, shutdown
+    cleanup, HTTP posts to bridges that may be down, chmod on NFS/SMB)
+    intentionally keep bare `pass` — see code-review-followup.md.
+    """
+    try:
+        line = json.dumps({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "where": where,
+            "exc_type": type(exc).__name__,
+            "exc": str(exc)[:500],
+        }, ensure_ascii=False) + "\n"
+        _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
+    except Exception:
+        pass
+
+
 def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
     """Append an audit entry to collection_ops.log for any delete_collection call."""
     entry = {
@@ -484,8 +580,8 @@ def _log_collection_op(op: str, collection_name: str, extra: dict | None = None)
         COLLECTION_OPS_LOG.parent.mkdir(parents=True, exist_ok=True)
         with COLLECTION_OPS_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("collection_ops_log_write", exc)
 
 
 class LockHeldError(Exception):
@@ -555,8 +651,8 @@ def log_query_event(event: dict) -> None:
     try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("queries", {"err": repr(exc), "event": event})
 
 
 def log_behavior_event(event: dict) -> None:
@@ -593,8 +689,8 @@ def log_behavior_event(event: dict) -> None:
     try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("behavior", {"err": repr(exc), "event": event})
 
 
 def record_brief_written(
@@ -630,8 +726,8 @@ def record_brief_written(
         }
         with BRIEF_WRITTEN_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("brief_written", {"err": repr(exc), "record": rec if 'rec' in locals() else None})
 
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]")
@@ -713,8 +809,8 @@ def _brief_state_seen(brief_path: str, cited_path: str) -> bool:
             rec = json.loads(line)
             if rec.get("key") == key:
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("brief_state_jsonl_read", exc)
     return False
 
 
@@ -739,8 +835,8 @@ def _brief_state_record(brief_path: str, cited_path: str) -> None:
         }
         with BRIEF_STATE_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("brief_state_jsonl_write", exc)
 
 
 def _diff_brief_signal() -> None:
@@ -820,8 +916,11 @@ def _diff_brief_signal() -> None:
                     "path": cited,
                 })
                 _brief_state_record(brief_path_str, cited)
-    except Exception:
-        pass  # never propagate — brief generation must not fail because of us
+    except Exception as exc:
+        # Brief generation must never fail because of signal diff. Log
+        # so we can notice if this subsystem silently stops producing
+        # kept/deleted events (would degrade ranker-vivo input).
+        _silent_log("diff_brief_signal", exc)
 
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
@@ -874,7 +973,8 @@ def load_session(sid: str) -> dict | None:
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        _silent_log("session_load_json", exc)
         return None
 
 
@@ -990,8 +1090,8 @@ def _set_last_session(sid: str) -> None:
     try:
         LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         LAST_SESSION_FILE.write_text(sid, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("last_session_write", exc)
 
 
 def list_sessions(limit: int = 20) -> list[dict]:
@@ -1002,7 +1102,8 @@ def list_sessions(limit: int = 20) -> list[dict]:
     for p in SESSIONS_DIR.glob("*.json"):
         try:
             s = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            _silent_log("session_list_parse", exc)
             continue
         turns = s.get("turns", [])
         first_q = next((t.get("q", "") for t in turns if t.get("q")), "")
@@ -1080,7 +1181,14 @@ URLS_COLLECTION_NAME = (
 # buffer cómodo y corta colas verbose del LLM cuando no encuentra EOS.
 CHAT_OPTIONS = {
     "temperature": 0, "top_p": 1, "seed": 42,
-    "num_ctx": 3072,
+    # num_ctx MUST match the value used by every other caller to the chat
+    # model (web/server.py _WEB_CHAT_NUM_CTX). When two call sites request
+    # the same model with different num_ctx, ollama reinitialises its KV
+    # cache and the prefix cache for the system prompt is lost — measured
+    # 2026-04-20: 20ms cache-hit prefill vs 4400ms cold-reinit (220× hit).
+    # 4096 is sized to fit system (1300 tok) + context P99 (1500 tok) +
+    # history (up to 1000 tok) without truncation, with a 300-tok margin.
+    "num_ctx": 4096,
     "num_predict": 384,
 }
 # Helpers (paraphrases, HyDE) devuelven 1-3 líneas — cap chico acelera.
@@ -1229,7 +1337,8 @@ def _load_context_cache() -> dict[str, str]:
     if CONTEXT_CACHE_PATH.is_file():
         try:
             _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
-        except Exception:
+        except Exception as exc:
+            _silent_log("context_cache_load", exc)
             _context_cache = {}
     else:
         _context_cache = {}
@@ -1248,6 +1357,43 @@ def _save_context_cache() -> None:
 
 _SUMMARY_CLIENT: ollama.Client | None = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
+_HELPER_CLIENT: "_TimedOllamaProxy | None" = None
+_CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
+
+# Capture the original `ollama.chat` at import time so _TimedOllamaProxy
+# can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
+_ORIGINAL_OLLAMA_CHAT = ollama.chat
+
+
+class _TimedOllamaProxy:
+    """Thin proxy over `ollama.chat` with a production-time timeout.
+
+    Tests that monkeypatch `rag.ollama.chat` expect the wrapped callers to
+    hit the module-level symbol directly — if we always went through
+    `ollama.Client(timeout=...).chat`, the mock would never run because
+    Client has its own httpx session. So: when `ollama.chat` is the
+    original function (no monkeypatch), route through a cached Client
+    with a real timeout. Otherwise, route through `ollama.chat` so test
+    mocks intercept correctly.
+
+    The timeout is a safety ceiling, not a performance knob. In production
+    a wedged ollama daemon raises httpx.ReadTimeout and the caller's
+    existing `except Exception` path handles it. In tests, the proxy is
+    transparent.
+    """
+
+    def __init__(self, timeout: float):
+        self._timeout = timeout
+        self._client: ollama.Client | None = None
+
+    def chat(self, **kwargs):
+        if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
+            # Monkey-patched (test): delegate to the module symbol so the
+            # mock intercepts. Timeout is ignored — tests don't need it.
+            return ollama.chat(**kwargs)
+        if self._client is None:
+            self._client = ollama.Client(timeout=self._timeout)
+        return self._client.chat(**kwargs)
 
 
 def _index_chat_client() -> ollama.Client:
@@ -1277,6 +1423,29 @@ def _summary_client() -> ollama.Client:
     if _SUMMARY_CLIENT is None:
         _SUMMARY_CLIENT = ollama.Client(timeout=45.0)
     return _SUMMARY_CLIENT
+
+
+def _helper_client() -> "_TimedOllamaProxy":
+    """Cached proxy with a 30s timeout for quick helper-model calls
+    (reformulate_query, expand_queries, _judge_sufficiency,
+    _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
+    _TimedOllamaProxy docstring.
+    """
+    global _HELPER_CLIENT
+    if _HELPER_CLIENT is None:
+        _HELPER_CLIENT = _TimedOllamaProxy(timeout=30.0)
+    return _HELPER_CLIENT
+
+
+def _chat_capped_client() -> "_TimedOllamaProxy":
+    """Cached proxy with a 90s timeout for bounded non-streaming chat
+    calls (citation-repair, critique, digest, morning/today narrative,
+    read summary, contradiction detector). Monkey-patch-compatible.
+    """
+    global _CHAT_CAPPED_CLIENT
+    if _CHAT_CAPPED_CLIENT is None:
+        _CHAT_CAPPED_CLIENT = _TimedOllamaProxy(timeout=90.0)
+    return _CHAT_CAPPED_CLIENT
 
 
 def _generate_context_summary(text: str, title: str, folder: str) -> str:
@@ -1367,7 +1536,8 @@ def _load_synthetic_q_cache() -> dict[str, list[str]]:
                 }
             else:
                 _synthetic_q_cache = {}
-        except Exception:
+        except Exception as exc:
+            _silent_log("synthetic_q_cache_load", exc)
             _synthetic_q_cache = {}
     else:
         _synthetic_q_cache = {}
@@ -1384,14 +1554,17 @@ def _save_synthetic_q_cache() -> None:
     _synthetic_q_cache_dirty = False
 
 
-def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str]:
+def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str] | None:
     """Generate 2-4 synthetic questions that this note answers.
 
     Asks the helper model for strict JSON (`format=json`). Deterministic
-    (temp=0, seed=42 via HELPER_OPTIONS). Returns [] on failure or malformed
-    output — callers treat empty as "no synthetic questions" not as an error.
+    (temp=0, seed=42 via HELPER_OPTIONS). Returns:
+      - list[str]: success (possibly empty if the LLM produced no usable
+                   questions after cleaning — the note is a legitimate zero)
+      - None:       transient failure (ollama timeout, malformed JSON,
+                   etc) — caller should NOT cache so the next run retries
 
-    Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1.
+    Bypass: set OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1 (returns []).
     """
     if os.environ.get("OBSIDIAN_RAG_SKIP_SYNTHETIC_Q"):
         return []
@@ -1415,12 +1588,15 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
         raw = resp.message.content.strip()
         data = json.loads(raw)
     except Exception:
-        return []
+        # Transient — do not cache. Next index pass will retry.
+        return None
     qs = None
     if isinstance(data, dict):
         qs = data.get("preguntas") or data.get("questions")
     if not isinstance(qs, list):
-        return []
+        # LLM responded but the shape is wrong. Treat as transient: the
+        # helper occasionally drops out of JSON mode after a cold reload.
+        return None
     cleaned: list[str] = []
     seen: set[str] = set()
     for q in qs[:_SYNTHETIC_Q_CAP]:
@@ -1441,17 +1617,28 @@ def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[st
 
 
 def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) -> list[str]:
-    """Get or generate synthetic questions for a note. Cached by file hash."""
+    """Get or generate synthetic questions for a note. Cached by file hash.
+
+    A None return from _generate_synthetic_questions (transient LLM failure)
+    is NOT cached — the next index pass retries. Only legitimate empty lists
+    (text too short, or LLM successfully produced no useful questions)
+    flow into the cache so the retry budget stays bounded.
+    """
     global _synthetic_q_cache_dirty
     cache = _load_synthetic_q_cache()
     if file_hash in cache:
         return cache[file_hash]
     if len(text) < _SYNTHETIC_Q_MIN_BODY:
         return []
-    qs = _generate_synthetic_questions(text, title, folder)
-    cache[file_hash] = qs
+    result = _generate_synthetic_questions(text, title, folder)
+    if result is None:
+        # Transient failure — don't poison the cache. Return [] for the
+        # caller (the chunk embeds without synthetic prefix this pass) and
+        # let the next indexing pick it up.
+        return []
+    cache[file_hash] = result
     _synthetic_q_cache_dirty = True
-    return qs
+    return result
 
 
 # ── FEEDBACK LOOP ────────────────────────────────────────────────────────────
@@ -1530,6 +1717,11 @@ _behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) —
 # the JSONL fallback's cache key stays a distinct type. T10 will collapse
 # both into one after the 7-day observation window.
 _behavior_priors_cache_key_sql: str | None = None
+# Serialises reads + writes of the three globals above. Same motivation as
+# _corpus_cache_lock: the watchdog / behavior loggers can invalidate while
+# CLI/web threads are mid-lookup. RLock in case a reader calls out to a
+# function that re-enters (defensive; today's callers don't).
+_behavior_priors_lock = threading.RLock()
 
 
 def _compute_behavior_priors_from_rows(rows_iter) -> dict:
@@ -1682,9 +1874,10 @@ def _load_behavior_priors() -> dict:
             with _ragvec_state_conn() as conn:
                 max_ts = _sql_max_ts(conn, "rag_behavior")
                 if max_ts is not None:
-                    if (_behavior_priors_cache is not None
-                            and _behavior_priors_cache_key_sql == max_ts):
-                        return _behavior_priors_cache
+                    with _behavior_priors_lock:
+                        if (_behavior_priors_cache is not None
+                                and _behavior_priors_cache_key_sql == max_ts):
+                            return _behavior_priors_cache
                     import sqlite3 as _sqlite3
                     prev_factory = conn.row_factory
                     try:
@@ -1696,9 +1889,10 @@ def _load_behavior_priors() -> dict:
                         conn.row_factory = prev_factory
                     snapshot = _compute_behavior_priors_from_rows(rows)
                     snapshot["hash"] = f"sql:{max_ts}"
-                    _behavior_priors_cache = snapshot
-                    _behavior_priors_cache_key_sql = max_ts
-                    _behavior_priors_cache_key = None
+                    with _behavior_priors_lock:
+                        _behavior_priors_cache = snapshot
+                        _behavior_priors_cache_key_sql = max_ts
+                        _behavior_priors_cache_key = None
                     return snapshot
                 # SQL empty (table has no rows) → fall through to JSONL.
         except Exception as exc:
@@ -1714,16 +1908,18 @@ def _load_behavior_priors() -> dict:
     except OSError:
         cache_key = (0.0, 0)
 
-    if (_behavior_priors_cache is not None
-            and _behavior_priors_cache_key == cache_key
-            and _behavior_priors_cache_key_sql is None):
-        return _behavior_priors_cache
+    with _behavior_priors_lock:
+        if (_behavior_priors_cache is not None
+                and _behavior_priors_cache_key == cache_key
+                and _behavior_priors_cache_key_sql is None):
+            return _behavior_priors_cache
 
     snapshot = _compute_behavior_priors_from_rows(_iter_behavior_jsonl())
     snapshot["hash"] = f"{cache_key[0]:.3f}:{cache_key[1]}"
-    _behavior_priors_cache = snapshot
-    _behavior_priors_cache_key = cache_key
-    _behavior_priors_cache_key_sql = None
+    with _behavior_priors_lock:
+        _behavior_priors_cache = snapshot
+        _behavior_priors_cache_key = cache_key
+        _behavior_priors_cache_key_sql = None
     return snapshot
 
 
@@ -1806,8 +2002,11 @@ class RankerWeights:
             if RANKER_CONFIG_PATH.is_file():
                 data = json.loads(RANKER_CONFIG_PATH.read_text(encoding="utf-8"))
                 return cls.from_dict(data.get("weights", {}) if isinstance(data, dict) else {})
-        except Exception:
-            pass
+        except Exception as exc:
+            # Corrupt ranker.json silently reverts to hardcoded defaults —
+            # tuning weights lost until next `rag tune --apply`. Log so we
+            # can detect it before eval regressions surface.
+            _silent_log("ranker_config_load", exc)
         return cls.defaults()
 
     def save(self, metadata: dict | None = None) -> None:
@@ -2014,14 +2213,17 @@ def record_feedback(
             FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
             with FEEDBACK_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Explicit user feedback (+1/-1/corrective_path) is the
+            # ground-truth signal ranker-vivo trains on. A silent loss
+            # here shows up as flat eval + no boost on repeated queries.
+            _silent_log("feedback_jsonl_write", exc)
     # Cache invalidation — next load rebuilds from jsonl. Best-effort delete.
     try:
         if FEEDBACK_GOLDEN_PATH.is_file():
             FEEDBACK_GOLDEN_PATH.unlink()
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_golden_cache_delete", exc)
 
 
 def feedback_counts() -> tuple[int, int]:
@@ -2037,14 +2239,18 @@ def feedback_counts() -> tuple[int, int]:
             try:
                 ev = json.loads(line)
             except Exception:
+                # Per-line parse skip is load-bearing: one bad line from
+                # an interrupted write shouldn't fail the whole count.
+                # Logged once via the rebuild path; suppress here to
+                # avoid N log entries per scan.
                 continue
             r = ev.get("rating", 0)
             if r > 0:
                 pos += 1
             elif r < 0:
                 neg += 1
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_counts_read", exc)
     return pos, neg
 
 
@@ -2077,14 +2283,15 @@ def _rebuild_feedback_golden() -> dict:
                     continue
                 try:
                     ev = json.loads(line)
-                except Exception:
+                except Exception as exc:
+                    _silent_log("feedback_jsonl_line_parse", exc)
                     continue
                 tid = ev.get("turn_id")
                 if not tid:
                     continue
                 by_turn[tid] = ev  # later write overrides earlier
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("feedback_golden_rebuild_read", exc)
 
     positives: list[dict] = []
     negatives: list[dict] = []
@@ -2114,7 +2321,13 @@ def _rebuild_feedback_golden() -> dict:
     if queries:
         try:
             embs = embed(queries)
-        except Exception:
+        except Exception as exc:
+            # Zero-vec fallback: dimension mismatch vs real bge-m3
+            # embeddings means these entries never match anything
+            # downstream — feedback effectively dropped. Log so we
+            # notice the ollama outage before the ranker quietly
+            # stops applying user feedback boosts.
+            _silent_log("feedback_golden_embed", exc)
             embs = [[0.0]] * len(queries)
         for (q, bucket, paths), emb in zip(buckets, embs):
             bucket.append({"q": q, "emb": list(emb), "paths": paths})
@@ -2125,8 +2338,8 @@ def _rebuild_feedback_golden() -> dict:
         tmp = FEEDBACK_GOLDEN_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(golden, ensure_ascii=False), encoding="utf-8")
         tmp.replace(FEEDBACK_GOLDEN_PATH)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("feedback_golden_write", exc)
     return golden
 
 
@@ -2577,6 +2790,11 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_ts ON rag_queries(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_session ON rag_queries(session)",
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_cmd_ts ON rag_queries(cmd, ts)",
+            # Composite for "recent queries of session X" — session-scoped
+            # history reads in chat()/web (dashboard, session drawer) go
+            # via (session, ts DESC); without this covering index SQLite
+            # falls back to the session-only index + per-row ts sort.
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_session_ts ON rag_queries(session, ts)",
         ),
     ),
     (
@@ -2596,6 +2814,11 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_ts ON rag_behavior(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path ON rag_behavior(path)",
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_event_ts ON rag_behavior(event, ts)",
+            # Composite for ranker-vivo CTR/dwell aggregates per path within
+            # a time window (_compute_behavior_priors_from_rows scans the
+            # last N days by path). Without it the path-only index requires
+            # a filter pass on ts for every bucket.
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path_ts ON rag_behavior(path, ts)",
         ),
     ),
     (
@@ -3061,6 +3284,7 @@ def _sql_max_ts(conn, table: str) -> str | None:
 # singleton was warmed still gets a valid schema.
 
 _SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+_STATE_DEAD_LETTER_LOG = Path.home() / ".local/share/obsidian-rag/state_dead_letter.jsonl"
 
 
 def _log_sql_state_error(event_type: str, **fields) -> None:
@@ -3080,6 +3304,28 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
         pass
 
 
+def _write_dead_letter(sink: str, payload: dict | str) -> None:
+    """Last-resort synchronous sink when BOTH SQL and JSONL writes fail.
+
+    Opens/closes the file per-call (no queue, no thread) so it still works
+    if the log writer thread died, the main _LOG_QUEUE is full, or the
+    target log dir is read-only. Best-effort: swallows its own errors —
+    there is no lower tier.
+    """
+    try:
+        _STATE_DEAD_LETTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "sink": sink,
+            "payload": payload if isinstance(payload, str) else
+                       json.dumps(payload, ensure_ascii=False, default=str),
+        }
+        with _STATE_DEAD_LETTER_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def _ragvec_state_conn():
     """Open a short-lived sqlite3 connection to ragvec.db with WAL + busy
@@ -3088,14 +3334,30 @@ def _ragvec_state_conn():
     Intentionally does NOT load the sqlite-vec extension — telemetry writes
     only touch rag_*/system_memory_metrics tables. Keeps the writer path
     independent of the vec singleton and safe to call from any thread.
+
+    Thread-safety: check_same_thread=False lets the caller hand this
+    context manager across threads if they want, but the idiomatic usage
+    is one-conn-per-thread. The close in `finally` guarantees the fd is
+    released before the yield frame unwinds — no leaked handles on
+    exception or GC pressure.
     """
     import sqlite3 as _sqlite3
     DB_PATH.mkdir(parents=True, exist_ok=True)
     conn = _sqlite3.connect(str(DB_PATH / "ragvec.db"),
-                            isolation_level=None, check_same_thread=False)
+                            isolation_level=None, check_same_thread=False,
+                            timeout=30.0)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
+        # busy_timeout FIRST — subsequent PRAGMAs then wait on writer lock
+        # instead of returning SQLITE_BUSY immediately. Matches the pattern
+        # in web/conversation_writer._open_sql_conn and the `timeout=` kwarg.
+        conn.execute("PRAGMA busy_timeout=30000")
+        # journal_mode flip takes a brief exclusive lock — skip when
+        # already WAL (idempotent check). Critical under multi-process
+        # stampede at cold cache.
+        cur = conn.execute("PRAGMA journal_mode")
+        row = cur.fetchone()
+        if (row[0] if row else "").lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
@@ -3442,7 +3704,6 @@ class SqliteVecCollection:
     __slots__ = ("_db", "name", "_dim", "_vec", "_meta")
 
     def __init__(self, db: "sqlite3.Connection", name: str, dim: int = 1024):
-        import sqlite3 as _sqlite3  # local alias to avoid name clash
         self._db = db
         self.name = name
         self._dim = dim
@@ -4667,6 +4928,31 @@ _GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/drive.readonly",
 )
 
+
+def _harden_oauth_cache_perms() -> None:
+    """One-shot chmod of OAuth cache files + their containing dir.
+
+    Files written before `_write_secret_file` existed (or by spotipy's
+    own cache path) may still carry umask 022 → 0o644. Tighten them on
+    module import so the refresh_tokens aren't world-readable on
+    multi-user systems. Best-effort — filesystem quirks swallowed.
+    """
+    cfg_dir = Path.home() / ".config/obsidian-rag"
+    if cfg_dir.is_dir():
+        try:
+            cfg_dir.chmod(0o700)
+        except OSError:
+            pass
+    for tok in (_GOOGLE_TOKEN_PATH, _SPOTIFY_TOKEN_PATH):
+        if tok.is_file():
+            try:
+                os.chmod(tok, 0o600)
+            except OSError:
+                pass
+
+
+_harden_oauth_cache_perms()
+
 _CHROME_HISTORY_PATH = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
 # Chrome epoch is 1601-01-01 UTC microseconds (Windows FILETIME).
 _CHROME_EPOCH_OFFSET_S = 11644473600
@@ -5003,8 +5289,7 @@ def _load_google_credentials(allow_interactive: bool = True):
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
             return creds
         except Exception:
             pass
@@ -5018,8 +5303,7 @@ def _load_google_credentials(allow_interactive: bool = True):
         creds = flow.run_local_server(port=0, open_browser=True)
     except Exception:
         return None
-    _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+    _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
     return creds
 
 
@@ -5746,6 +6030,14 @@ def _spotify_client(allow_interactive: bool = True):
             token = auth.get_access_token(as_dict=True)
         if not token:
             return None
+        # spotipy writes the cache with default umask permissions (0o644)
+        # and refreshes on every get_access_token. Tighten to 0o600 post-hoc
+        # — the refresh_token permits indefinite Spotify access.
+        try:
+            if _SPOTIFY_TOKEN_PATH.is_file():
+                os.chmod(_SPOTIFY_TOKEN_PATH, 0o600)
+        except OSError:
+            pass
         return spotipy.Spotify(auth=token["access_token"])
     except Exception:
         return None
@@ -5824,7 +6116,7 @@ def _sync_spotify_notes(vault_root: Path, max_recent: int = 50) -> dict:
                 "---",
                 "source: spotify-top",
                 f"refreshed_date: {today}",
-                f"window: short_term (4 weeks)",
+                "window: short_term (4 weeks)",
                 "tags:",
                 "- spotify",
                 "- system-snapshot",
@@ -6496,7 +6788,7 @@ def hyde_embed(question: str) -> list[float]:
     prompt = (
         f'Write ONE sentence as if from personal notes that directly answers: "{question}"\n\nSentence:'
     )
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
@@ -6508,6 +6800,14 @@ def hyde_embed(question: str) -> list[float]:
 # ── SEARCH ────────────────────────────────────────────────────────────────────
 
 _corpus_cache: dict | None = None
+# Serialises reads + invalidations of _corpus_cache and _pagerank_cache.
+# The watchdog thread calls _invalidate_corpus_cache() from its debounce
+# loop while CLI/web threads read _corpus_cache from retrieve()/query();
+# without a lock the `is not None` check + return is not atomic and a
+# reader can see a partially-rebuilt dict. Lock is held briefly only
+# around cache reads/writes — the expensive BM25 / graph / PageRank
+# build happens outside the critical section in local vars.
+_corpus_cache_lock = threading.RLock()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -6530,12 +6830,14 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     global _corpus_cache
     n = col.count()
     cid = str(getattr(col, "id", "") or "")
+    with _corpus_cache_lock:
+        cached = _corpus_cache
     if (
-        _corpus_cache is not None
-        and _corpus_cache["count"] == n
-        and _corpus_cache.get("collection_id") == cid
+        cached is not None
+        and cached["count"] == n
+        and cached.get("collection_id") == cid
     ):
-        return _corpus_cache
+        return cached
 
     data = col.get(include=["documents", "metadatas"])
     docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
@@ -6575,7 +6877,7 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
             for t in raw_links:
                 backlinks.setdefault(t, set()).add(path)
 
-    _corpus_cache = {
+    new_cache = {
         "count": n, "collection_id": cid,
         "ids": ids, "docs": docs, "metas": metas,
         "bm25": bm25, "tags": tags, "folders": folders,
@@ -6583,13 +6885,17 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
         "outlinks": outlinks,    # path → [linked titles]
         "backlinks": backlinks,  # title → {paths that link to it}
     }
-    return _corpus_cache
+    with _corpus_cache_lock:
+        _corpus_cache = new_cache
+    return new_cache
 
 
 def _invalidate_corpus_cache() -> None:
-    global _corpus_cache, _pagerank_cache
-    _corpus_cache = None
-    _pagerank_cache = None
+    global _corpus_cache, _pagerank_cache, _pagerank_cache_cid
+    with _corpus_cache_lock:
+        _corpus_cache = None
+        _pagerank_cache = None
+        _pagerank_cache_cid = None
 
 
 # ── Person-mention enrichment ────────────────────────────────────────────────
@@ -6993,6 +7299,102 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (norm + 1e-8)
 
 
+# ── Topic-shift detection ─────────────────────────────────────────────────
+# Protege a la conversación de contaminación cross-tópico cuando el usuario
+# cambia de tema abruptamente sin cerrar el hilo anterior. Reportado 2026-04-20:
+# session `web:b03ec059db32` → turno T-1 "cual es mi password de avature?" →
+# turno T "busca informacion sobre mi mama" produjo respuesta mezclada
+# ("tu mamá Monica Ferrari... no hay información sobre su contraseña de Avature"),
+# porque los 6 últimos mensajes de history incluían el hilo de Avature y el
+# chat LLM arrastró la inercia temática.
+#
+# Gate combinado:
+#   1. Anafóricos explícitos ("eso", "ella", "y eso?", "más sobre X") → NO shift
+#      (el follow-up necesita la history para resolver el antecedente).
+#   2. person_fired → SHIFT (nombrar a alguien de 99-Mentions re-frame el turno;
+#      el dossier inyectado por build_person_context es autoritativo).
+#   3. cosine(current, last_user_q) < TOPIC_SHIFT_COSINE → SHIFT.
+#      Umbral 0.40 empírico: en este vault con bge-m3, shifts reales caen en
+#      0.29-0.43, paráfrasis mismo-tema en 0.58+. Bypasseado para queries
+#      <4 tokens (anafóricos que ya capturó (1)).
+
+# Regex local — el gate vive en rag.py (CLI + web ambos lo usan) así que
+# duplicamos el patrón en vez de importar de web/server.py (que a su vez
+# importa rag). Mantener sincronizado con _FOLLOWUP_CUES en web/server.py si
+# cambia.
+_TOPIC_SHIFT_FOLLOWUP_RE = re.compile(
+    r"\b(eso|esa|ese|esto|esta|este|aquello|ella|[eé]l\b(?!\s+[A-ZÁÉÍÓÚ])|"
+    r"ah[ií]|all[íáa]|it\b|this\b|that\b|he\b|she\b|"
+    r"y\s+(de|sobre|con|para|en|c[oó]mo|qu[eé])|"
+    r"c[oó]mo\s+(lo|la|los|las)\s+\w+|"  # "como lo desactivo", "como la uso"
+    r"profundiz[aá]|ampl[ií]a|segu[ií]|contin[uú]a|"
+    r"m[aá]s\s+(sobre|de|al\s+respecto))\b",
+    re.IGNORECASE,
+)
+
+TOPIC_SHIFT_COSINE = 0.40
+
+
+def detect_topic_shift(
+    current_q: str,
+    history: list[dict],
+    *,
+    person_fired: bool,
+) -> tuple[bool, str]:
+    """¿El turno actual cambia de tema vs el anterior? Devuelve (shift, razón).
+
+    - `shift=True` → el caller debería descartar history para este turno.
+    - `razón` es un string corto para logging/observabilidad.
+
+    No muta nada. Pure function, testeable sin vault/session.
+    """
+    if not history:
+        return False, "no-history"
+    # (1) Anafóricos: pronombres, demostrativos, "y X?", "como lo Y". Short
+    # follow-ups (≤2 tokens) también entran acá por construcción — una
+    # query de 1-2 palabras es casi siempre elipsis del turno anterior
+    # ("y?", "más?", "ella?"). 3+ tokens ya puede ser standalone (ej.
+    # "notas de coaching") y cae al cosine gate.
+    if len(current_q.split()) <= 2:
+        return False, "short"
+    if _TOPIC_SHIFT_FOLLOWUP_RE.search(current_q):
+        return False, "anaphoric"
+    # (2) Person-mention gate: build_person_context ya inyectó el dossier de
+    # la persona; history de otros temas es ruido puro. Pero si el turno
+    # anterior menciona a LA MISMA persona, es follow-up mismo-tema
+    # (ej.: "contame sobre mi mama" → "y cuándo cumple años?") → keep.
+    last_user_q = next(
+        (m.get("content") for m in reversed(history) if m.get("role") == "user"),
+        None,
+    )
+    if person_fired:
+        if last_user_q:
+            try:
+                current_people = set(_match_mentions_in_query(current_q))
+                last_people = set(_match_mentions_in_query(last_user_q))
+            except Exception:
+                current_people = last_people = set()
+            if current_people and current_people == last_people:
+                return False, "same-person"
+        return True, "person"
+    # (3) Cosine gate contra el último user turn.
+    if not last_user_q:
+        return False, "no-last-user"
+    try:
+        vecs = embed([current_q, last_user_q])
+        if len(vecs) < 2:
+            return False, "embed-empty"
+        sim = cosine_sim(vecs[0], vecs[1])
+    except Exception as exc:
+        # Silent fallback — embed puede fallar si ollama está caído; en ese
+        # caso preferimos mantener history (fail-safe para follow-ups) antes
+        # que dropearla agresivamente.
+        return False, f"embed-failed:{type(exc).__name__}"
+    if sim < TOPIC_SHIFT_COSINE:
+        return True, f"cosine={sim:.3f}"
+    return False, f"cosine={sim:.3f}"
+
+
 _reranker = None
 _reranker_last_use = 0.0  # monotonic timestamp of most-recent predict()
 
@@ -7019,26 +7421,30 @@ def get_reranker():
 
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
     Also records last-use timestamp so `maybe_unload_reranker()` can evict
-    it from MPS after a configurable idle window.
+    it from MPS after a configurable idle window. Both the timestamp
+    update and the `_reranker is None` check run inside `_reranker_lock`
+    to close a TOCTOU window with the sweeper — otherwise the sweeper
+    could read a stale `_reranker_last_use`, pass the idle check, and
+    unload the model while a concurrent query is mid-prepare. The lock
+    is uncontended on the fast path (<1µs on Python 3.13).
 
     Cold load wall-time is logged to help calibrate the deferred pre-warm
     delay in the idle sweeper (see `maybe_unload_reranker`).
     """
     global _reranker, _reranker_last_use
-    _reranker_last_use = time.time()
-    if _reranker is not None:
-        return _reranker
     with _reranker_lock:
-        if _reranker is None:
-            import torch
-            from sentence_transformers import CrossEncoder
-            if torch.backends.mps.is_available():
-                device = "mps"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
-            _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
+        _reranker_last_use = time.time()
+        if _reranker is not None:
+            return _reranker
+        import torch
+        from sentence_transformers import CrossEncoder
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
     return _reranker
 
 
@@ -7046,15 +7452,18 @@ def maybe_unload_reranker() -> bool:
     """Drop the reranker from MPS if it hasn't been used in
     `_RERANKER_IDLE_TTL` seconds. Call from a background sweeper.
     Returns True if an unload happened.
+
+    Idle check + unload happen atomically under `_reranker_lock` — reading
+    `_reranker_last_use` outside the lock would race with `get_reranker`
+    updating it, potentially unloading a model that a concurrent query
+    just touched (the query holds a local ref so predict() won't crash
+    mid-flight, but the next query pays an unnecessary 5s cold reload).
     """
     global _reranker, _reranker_last_use
-    if _reranker is None:
-        return False
-    idle = time.time() - _reranker_last_use
-    if idle < _RERANKER_IDLE_TTL:
-        return False
     with _reranker_lock:
         if _reranker is None:
+            return False
+        if time.time() - _reranker_last_use < _RERANKER_IDLE_TTL:
             return False
         try:
             import gc
@@ -7065,10 +7474,18 @@ def maybe_unload_reranker() -> bool:
                 if torch.backends.mps.is_available():
                     torch.mps.empty_cache()
             except Exception:
+                # MPS cache drop is best-effort — torch may not be
+                # importable (Intel mac) or MPS backend may be down.
+                # Failing here just means VRAM is freed on next GC cycle.
                 pass
             gc.collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Called out in code-review-followup as a site where silent
+            # failure could mask a real bug. If gc/del on the reranker
+            # throws, we've left _reranker at None but didn't free the
+            # CrossEncoder object — subsequent touch_reranker() will load
+            # a fresh one while the old one leaks until GC catches it.
+            _silent_log("reranker_unload", exc)
     return True
 
 
@@ -7191,7 +7608,7 @@ def expand_queries(question: str) -> list[str]:
         f"Pregunta: {question}"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
@@ -7277,7 +7694,7 @@ def reformulate_and_expand(
         "Línea 3: paráfrasis 2"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 192, "num_ctx": 2048},
@@ -8543,18 +8960,31 @@ def _graph_pagerank(
 
 # Module-level cache for PageRank — invalidated with corpus cache.
 _pagerank_cache: dict[str, float] | None = None
+_pagerank_cache_cid: str | None = None
 
 
 def get_pagerank(col: "SqliteVecCollection") -> dict[str, float]:
-    """Cached PageRank over the wikilink graph. Rebuilt when corpus changes."""
-    global _pagerank_cache
+    """Cached PageRank over the wikilink graph. Rebuilt when corpus changes.
+
+    Invalidation key is the corpus `collection_id` (sqlite-vec's stable
+    UUID — rotates on delete+create). The previous implementation keyed
+    on `id(corpus)` which is the memory address of the dict; that address
+    changes every time `_load_corpus` rebuilds even when the content is
+    identical, causing needless PageRank recomputation on every retrieve
+    after any cache-invalidation nudge.
+    """
+    global _pagerank_cache, _pagerank_cache_cid
     corpus = _load_corpus(col)
-    if _pagerank_cache is not None and corpus.get("_pagerank_id") == id(corpus):
-        return _pagerank_cache
+    cid = corpus.get("collection_id") or ""
+    with _corpus_cache_lock:
+        if _pagerank_cache is not None and _pagerank_cache_cid == cid:
+            return _pagerank_cache
     adj = _build_graph_adj(corpus)
-    _pagerank_cache = _graph_pagerank(adj)
-    corpus["_pagerank_id"] = id(corpus)
-    return _pagerank_cache
+    new_rank = _graph_pagerank(adj)
+    with _corpus_cache_lock:
+        _pagerank_cache = new_rank
+        _pagerank_cache_cid = cid
+    return new_rank
 
 
 def _hop_set(adj: dict[str, set[str]], start: str, hops: int) -> set[str]:
@@ -8739,11 +9169,14 @@ def _surface_generate_reason(pair: dict) -> str:
         "CONEXIÓN:"
     )
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
+            # num_ctx=4096 matches CHAT_OPTIONS / _WEB_CHAT_NUM_CTX. Previous
+            # 2048 value was invalidating the web chat's KV cache every time
+            # the watch thread indexed a note and hit this path.
             options={"temperature": 0, "top_p": 1, "seed": 42,
-                     "num_ctx": 2048, "num_predict": 80},
+                     "num_ctx": 4096, "num_predict": 80},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         reason = (resp.message.content or "").strip().split("\n", 1)[0].strip()
@@ -8815,7 +9248,7 @@ def _suggest_tags_for_note(
         "TAGS:"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options=HELPER_OPTIONS,
@@ -9636,7 +10069,7 @@ def find_contradictions(
     # RAG-trained, hugs the source text, and reliably returns parseable JSON.
     # Cost: ~5-10s per check — only paid on opt-in --counter, acceptable.
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -9862,7 +10295,7 @@ def reformulate_query(
         f"Nueva pregunta: \"{question}\"\n\n"
         "Respondé SOLO con la consulta reformulada, sin explicaciones ni comillas."
     )
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options={**HELPER_OPTIONS, "num_ctx": 2048},
@@ -9901,7 +10334,7 @@ def _compress_turns(turns: list[dict]) -> str:
         "Resumen:"
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
@@ -10440,7 +10873,7 @@ def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tup
         "para completar la información faltante. Solo la sub-query, sin explicar."
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
@@ -10582,6 +11015,23 @@ def collect_ranker_features(
         }
 
     Mirrors `retrieve()` but stops one step short of the weighted sort.
+
+    ⚠️ Feature-pool mismatch caveat (documented 2026-04-20 audit):
+    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=30` (see
+    `tune_cmd` ~L15344-15386). Production callers use different pools:
+    CLI `rag chat` passes `rerank_pool=15`; web `/api/chat` passes
+    `rerank_pool=5`. The weights `rag tune --apply` writes are
+    therefore fit on 30-candidate feature vectors but consumed by
+    retrieve paths that only ever score 5-15. Features that
+    only discriminate outside the runtime top-5 (e.g. a tag match on
+    rank 20 vs. rank 30) can receive spurious non-zero weights.
+
+    No empirical regression measured yet — the hit@5 baseline
+    (76.19%/63.64% CI lower bounds) survives with the mismatch, so
+    leaving this as-is until a dedicated tune-vs-runtime parity study.
+    When that study runs, either (a) bake `k_pool` into ranker.json
+    and have retrieve read it, or (b) align the tune pool to whichever
+    surface dominates user traffic (currently the web chat at pool=5).
     """
     if col.count() == 0:
         return []
@@ -11055,14 +11505,22 @@ def find_contradictions_for_note(
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         helper_raw = resp.message.content.strip()
-    except Exception:
+    except Exception as exc:
+        # Chat timeout / ollama unreachable / model-load OOM. Logging
+        # here lets us distinguish "Ollama down" from "model emits
+        # unparseable JSON" — the latter is the json.loads branch below.
+        _silent_log("contradict_helper_chat", exc)
         return []
     m = re.search(r"\{.*\}", helper_raw, re.DOTALL)
     if not m:
         return []
     try:
         data = json.loads(m.group(0))
-    except Exception:
+    except Exception as exc:
+        # The followup audit explicitly flagged this: qwen2.5:3b used
+        # to emit malformed JSON here, which silently dropped real
+        # contradictions from the index. Now we at least see it.
+        _silent_log("contradict_json_parse", exc)
         return []
     hits = data.get("contradictions") or []
     if not isinstance(hits, list):
@@ -12362,6 +12820,82 @@ def index(reset: bool, no_contradict: bool):
         _run_index(reset=reset, no_contradict=no_contradict)
 
 
+def _watch_filter_path(
+    raw_path: str,
+    vault_path: Path,
+    exclude_folders: tuple[str, ...],
+) -> Path | None:
+    """Filter a filesystem event's path down to a vault-relative Path worth
+    queuing for reindex. Extracted from the `watch()` CLI body so the logic
+    is unit-testable (the CLI itself spawns a watchdog Observer + debounce
+    loop, which is hard to drive from tests).
+
+    Returns the original path (not the resolved one) when:
+      - it ends in `.md`
+      - resolves under `vault_path`
+      - is NOT under any of `exclude_folders` (vault-relative)
+
+    Returns None otherwise. Never raises — malformed paths (nonexistent
+    parents, PermissionError during resolve, unresolvable ValueError) are
+    treated as "don't queue", matching the original handler semantics
+    (the `try/except ValueError: return` pattern it replaces).
+    """
+    if not raw_path.endswith(".md"):
+        return None
+    p = Path(raw_path)
+    try:
+        rel = p.resolve().relative_to(vault_path)
+    except (ValueError, OSError):
+        return None
+    rel_str = str(rel)
+    for folder in exclude_folders:
+        if rel_str.startswith(folder + "/") or rel_str == folder:
+            return None
+    return p
+
+
+def _watch_drain_once(
+    vstate: dict,
+    pending_lock: threading.Lock,
+) -> list[tuple[str, str | None, Path, str | None]]:
+    """Drain one vault's pending set and reindex each file. Extracted from
+    the debounce loop in `watch()` so the two parts that used to be
+    entangled (watchdog.Observer + this loop) can be tested separately.
+
+    Returns a list of `(name, status, path, err)` tuples in drain order:
+      - `name`: vstate["name"], propagated for multi-vault rendering
+      - `status`: return value of `_index_single_file` (indexed/skipped/
+        removed/empty/…) or None if the call raised
+      - `path`: the vault-relative Path when possible, else the absolute Path
+      - `err`: str of the exception when `_index_single_file` raised,
+        else None. Per-file errors NEVER abort the drain — one malformed
+        note must not block the whole batch.
+
+    Caller is responsible for printing / logging the result tuples and
+    for interpreting `status == "skipped"` as a no-op.
+    """
+    with pending_lock:
+        if not vstate["pending"]:
+            return []
+        batch = list(vstate["pending"])
+        vstate["pending"].clear()
+
+    out: list[tuple[str, str | None, Path, str | None]] = []
+    for p in batch:
+        try:
+            status = _index_single_file(vstate["col"], p, vault_path=vstate["path"])
+            err_s: str | None = None
+        except Exception as e:
+            status = None
+            err_s = str(e) or type(e).__name__
+        try:
+            rel: Path = p.relative_to(vstate["path"])
+        except ValueError:
+            rel = p
+        out.append((vstate["name"], status, rel, err_s))
+    return out
+
+
 @cli.command()
 @click.option("--debounce", default=3.0, help="Segundos a esperar antes de reindexar un cambio (default: 3)")
 @click.option("--all-vaults", "all_vaults", is_flag=True,
@@ -12430,19 +12964,9 @@ def watch(debounce: float, all_vaults: bool):
             self.vstate = vstate
 
         def _queue(self, raw_path: str) -> None:
-            if not raw_path.endswith(".md"):
+            p = _watch_filter_path(raw_path, self.vstate["path"], exclude_folders)
+            if p is None:
                 return
-            p = Path(raw_path)
-            try:
-                rel = p.resolve().relative_to(self.vstate["path"])
-            except ValueError:
-                return
-            # Drop files under an excluded folder — see module-level comment
-            # on `exclude_folders` for rationale.
-            rel_str = str(rel)
-            for folder in exclude_folders:
-                if rel_str.startswith(folder + "/") or rel_str == folder:
-                    return
             with pending_lock:
                 self.vstate["pending"].add(p)
 
@@ -12467,29 +12991,19 @@ def watch(debounce: float, all_vaults: bool):
     observer.start()
     console.print(f"[dim]debounce={debounce}s · Ctrl+C para salir[/dim]")
 
+    multi = len(vault_state) > 1
     try:
         while True:
             time.sleep(debounce)
             for vs in vault_state:
-                with pending_lock:
-                    if not vs["pending"]:
-                        continue
-                    batch = list(vs["pending"])
-                    vs["pending"].clear()
-                for p in batch:
-                    try:
-                        status = _index_single_file(vs["col"], p, vault_path=vs["path"])
-                    except Exception as e:
-                        console.print(f"  [red]error[/red] [{vs['name']}] {p.name}: {e}")
+                for name, status, rel, err in _watch_drain_once(vs, pending_lock):
+                    if err is not None:
+                        console.print(f"  [red]error[/red] [{name}] {rel.name}: {err}")
                         continue
                     if status == "skipped":
                         continue
-                    try:
-                        rel = p.relative_to(vs["path"])
-                    except ValueError:
-                        rel = p
                     color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
-                    tag = f"[dim][{vs['name']}][/dim] " if len(vault_state) > 1 else ""
+                    tag = f"[dim][{name}][/dim] " if multi else ""
                     console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
     except KeyboardInterrupt:
         pass
@@ -12833,7 +13347,7 @@ def query(
                 )},
             ]
             try:
-                _repair_resp = ollama.chat(
+                _repair_resp = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=_repair_messages,
                     options=CHAT_OPTIONS,
@@ -12882,7 +13396,7 @@ def query(
         )
         def _run_critique_call() -> str:
             try:
-                _cr = ollama.chat(
+                _cr = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=[
                         {"role": "system", "content": _critique_system},
@@ -13698,7 +14212,7 @@ def chat(
                     )},
                 ]
                 try:
-                    _rresp = ollama.chat(
+                    _rresp = _chat_capped_client().chat(
                         model=resolve_chat_model(),
                         messages=_chat_repair_messages,
                         options=_CLI_CHAT_OPTIONS,
@@ -13735,7 +14249,7 @@ def chat(
             )
             with console.status("[dim][critique…][/dim]", spinner="dots"):
                 try:
-                    _cq_resp = ollama.chat(
+                    _cq_resp = _chat_capped_client().chat(
                         model=resolve_chat_model(),
                         messages=[
                             {"role": "system", "content": _cq_system},
@@ -14721,19 +15235,28 @@ def _log_tune_event(event: dict) -> None:
 
 
 def _backup_ranker_config() -> Path | None:
-    """Copy current ranker.json to a timestamped backup, keeping only 3 newest.
+    """Copy current ranker.json to a pid+timestamped backup, keeping only 3 newest.
 
     Returns the backup Path on success, None if ranker.json doesn't exist yet.
     Prunes backups older than the 3 most recent after writing.
+
+    Filename format: `ranker.{unix_ts}.{pid}.json`. The pid suffix avoids
+    collision when two `rag tune` processes run in the same wall-clock
+    second (manual + cron) — without it the second copy silently overwrote
+    the first. Pruning still uses mtime so the retention window is correct.
+
+    Legacy `ranker.{ts}.json` files (pre-pid) are still matched by the
+    glob + sort + prune flow, so the 7-day backfill is seamless.
     """
     if not RANKER_CONFIG_PATH.is_file():
         return None
     ts = int(time.time())
-    backup = RANKER_CONFIG_PATH.parent / f"ranker.{ts}.json"
+    backup = RANKER_CONFIG_PATH.parent / f"ranker.{ts}.{os.getpid()}.json"
     try:
         import shutil
         shutil.copy2(RANKER_CONFIG_PATH, backup)
-        # Prune: keep only 3 most recent backups
+        # Prune: keep only 3 most recent backups. glob matches both
+        # `ranker.{ts}.json` (legacy) and `ranker.{ts}.{pid}.json` (new).
         backups = sorted(
             RANKER_CONFIG_PATH.parent.glob("ranker.*.json"),
             key=lambda p: p.stat().st_mtime,
@@ -15235,7 +15758,7 @@ def autotag(path: str, apply: bool, max_tags: int):
         "TAGS:"
     )
 
-    resp = ollama.chat(
+    resp = _helper_client().chat(
         model=HELPER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options=HELPER_OPTIONS,
@@ -15773,7 +16296,7 @@ def _render_digest_prompt(week_label: str, ev: dict) -> str:
 
 
 def _generate_digest_narrative(prompt: str) -> str:
-    resp = ollama.chat(
+    resp = _chat_capped_client().chat(
         model=resolve_chat_model(),
         messages=[{"role": "user", "content": prompt}],
         options=CHAT_OPTIONS,
@@ -15908,13 +16431,96 @@ def _path_to_title(corpus: dict, path: str) -> str | None:
     return rev.get(path)
 
 
+def _render_silent_errors_log(n: int, summary: bool) -> None:
+    """Pretty-print the tail of silent_errors.jsonl.
+
+    Lines are schema {ts, where, exc_type, exc}. Malformed lines are
+    dropped silently — this is a diagnostic surface, not a parser.
+
+    Two modes:
+      - list (default): last N entries, newest at the bottom.
+      - summary (--summary flag): aggregate by (where × exc_type), sort
+        by count desc. Surfaces which subsystems fail most often without
+        forcing the user to eyeball dozens of near-identical lines.
+    """
+    if not SILENT_ERRORS_LOG_PATH.is_file():
+        console.print(
+            f"[dim]No hay silent_errors.jsonl aún ({SILENT_ERRORS_LOG_PATH}).[/dim]\n"
+            "[dim]Se escribe sólo cuando un `except Exception: pass` migrado falla; "
+            "vacío = bueno.[/dim]"
+        )
+        return
+    entries: list[dict] = []
+    for line in SILENT_ERRORS_LOG_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            continue
+    if not entries:
+        console.print("[dim]silent_errors.jsonl está vacío — nada que reportar.[/dim]")
+        return
+
+    if summary:
+        from collections import Counter
+        counter: Counter[tuple[str, str]] = Counter()
+        for e in entries:
+            counter[(e.get("where", "?"), e.get("exc_type", "?"))] += 1
+        tbl = Table(
+            title=f"Silent errors · {len(entries)} total · top (where × exc_type)",
+            show_lines=False,
+        )
+        tbl.add_column("count", justify="right", style="yellow")
+        tbl.add_column("where", style="cyan", overflow="fold", max_width=50)
+        tbl.add_column("exc_type", style="red")
+        for (where, exc_type), cnt in counter.most_common(n):
+            tbl.add_row(str(cnt), where, exc_type)
+        console.print(tbl)
+        return
+
+    tail = entries[-n:]
+    tbl = Table(
+        title=f"Últimos {len(tail)} silent errors ({SILENT_ERRORS_LOG_PATH.name})",
+        show_lines=False,
+    )
+    tbl.add_column("ts", style="dim", no_wrap=True)
+    tbl.add_column("where", style="cyan", overflow="fold", max_width=32)
+    tbl.add_column("exc_type", style="red", no_wrap=True)
+    tbl.add_column("exc", style="yellow", overflow="fold", max_width=60)
+    for e in tail:
+        tbl.add_row(
+            (e.get("ts") or "")[-8:],
+            e.get("where") or "?",
+            e.get("exc_type") or "?",
+            (e.get("exc") or "").replace("\n", " ")[:200],
+        )
+    console.print(tbl)
+
+
 @cli.command()
 @click.option("-n", default=20, help="Cantidad de queries a mostrar (default: 20)")
 @click.option("--low-confidence", is_flag=True, help="Solo queries con top_score < 0")
 @click.option("--feedback", "with_feedback", is_flag=True,
               help="Solo turnos con rating (👍/👎), con una columna de feedback")
-def log(n: int, low_confidence: bool, with_feedback: bool):
-    """Inspeccionar el log de queries (últimas N)."""
+@click.option("--silent-errors", "silent_errors", is_flag=True,
+              help="Listar silent_errors.jsonl (writes del _silent_log helper) en vez del queries log")
+@click.option("--summary", is_flag=True,
+              help="Con --silent-errors, agrupa por (where × exc_type) en vez de listar individualmente")
+def log(n: int, low_confidence: bool, with_feedback: bool,
+        silent_errors: bool, summary: bool):
+    """Inspeccionar el log de queries (últimas N).
+
+    Con --silent-errors, lee silent_errors.jsonl y muestra las últimas N
+    excepciones que pasaron por `_silent_log(where, exc)`. Útil para
+    detectar subsistemas que fallan calladamente (context_cache corrupto,
+    feedback_golden_embed offline, contradict JSON parse). Agregar
+    --summary agrupa por (where × exc_type) para ver patrones.
+    """
+    if silent_errors:
+        _render_silent_errors_log(n, summary)
+        return
     if not LOG_PATH.is_file():
         console.print(f"[yellow]No hay log aún en {LOG_PATH}[/yellow]")
         return
@@ -16456,7 +17062,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
     model = resolve_chat_model()
     for it in range(max_iterations):
         with console.status(f"[dim]pensando (iter {it + 1}/{max_iterations})…[/dim]", spinner="dots"):
-            resp = ollama.chat(
+            resp = _chat_capped_client().chat(
                 model=model,
                 messages=messages,
                 tools=tools,
@@ -16609,7 +17215,7 @@ def _weather_comment(question: str, forecast: str) -> str:
         "Sin emojis. Sin saludos. Sin preámbulos."
     )
     try:
-        resp = ollama.chat(
+        resp = _helper_client().chat(
             model=HELPER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={**HELPER_OPTIONS, "num_predict": 80},
@@ -18316,7 +18922,7 @@ def _read_summary_prompt(
 
 def _read_generate_summary(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -20916,7 +21522,7 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
 
 def _generate_morning_narrative(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -21341,7 +21947,7 @@ def _generate_morning_json(prompt: str) -> dict | None:
     if parse fails (caller falls back to the legacy text-based path).
     """
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -21834,7 +22440,7 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
 
 def _generate_today_narrative(prompt: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
@@ -22909,10 +23515,11 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
         'Responde SOLO JSON: {"resolved": true|false, "reason": "<20 palabras"}'
     )
     try:
-        resp = ollama.chat(
+        resp = _chat_capped_client().chat(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "seed": 42, "num_ctx": 2048, "num_predict": 128},
+            # num_ctx=4096 to keep the web chat's KV cache warm (see CHAT_OPTIONS).
+            options={"temperature": 0, "seed": 42, "num_ctx": 4096, "num_predict": 128},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         raw = resp.message.content.strip()
@@ -24352,7 +24959,7 @@ def serve(host: str, port: int):
             tasks_predict_cap = max(predict_cap, 700)
             t_gen0 = time.perf_counter()
             try:
-                resp = ollama.chat(
+                resp = _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
@@ -25602,7 +26209,7 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
     what a live run would do.
     """
     import sqlite3 as _sqlite
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
 
     sqlite_path = DB_PATH / "ragvec.db"
     out: dict = {

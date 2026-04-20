@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 # rag.py vive en el root del proyecto; lo importamos como módulo.
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,8 +46,6 @@ from rag import (  # noqa: E402
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
     SESSION_HISTORY_WINDOW,
-    SYSTEM_RULES,
-    SYSTEM_RULES_WEB,
     _collect_screentime,
     _fmt_hm,
     VAULT_PATH,
@@ -70,9 +68,6 @@ from rag import (  # noqa: E402
     _load_corpus,
     _load_vaults_config,
     _path_to_title,
-    clean_md,
-    is_excluded,
-    parse_frontmatter,
     _pendientes_collect,
     _pendientes_urgent,
     _render_today_prompt,
@@ -81,14 +76,12 @@ from rag import (  # noqa: E402
     ensure_session,
     find_followup_loops,
     get_db,
-    BEHAVIOR_LOG_PATH,
     get_pagerank,
     log_behavior_event,
     log_query_event,
     multi_retrieve,
     new_turn_id,
     record_feedback,
-    reformulate_query,
     resolve_chat_model,
     resolve_vault_paths,
     save_session,
@@ -147,6 +140,44 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
 
 
+# Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
+# command-r leak CJK / Cyrillic / Arabic tokens under context pressure; the
+# chat path strips them from every streamed delta so the client never sees
+# them regardless of what the LLM emits. Whitelists ASCII, Latin (including
+# Spanish diacritics and the Latin-Extended blocks), box-drawing, general
+# punctuation used in markdown, and everything ≥ U+1F000 (emoji + symbols).
+# Kills CJK ideographs + kana + hangul, Cyrillic, Hebrew, Arabic, Syriac,
+# and the fullwidth/halfwidth CJK punctuation block.
+_FOREIGN_SCRIPT_RE = re.compile(
+    "["
+    "\u0400-\u052f"     # Cyrillic + Cyrillic Supplement
+    "\u0530-\u058f"     # Armenian
+    "\u0590-\u05ff"     # Hebrew
+    "\u0600-\u06ff"     # Arabic
+    "\u0700-\u074f"     # Syriac
+    "\u0750-\u077f"     # Arabic Supplement
+    "\u0780-\u07bf"     # Thaana
+    "\u3000-\u303f"     # CJK Symbols and Punctuation (includes 。、)
+    "\u3040-\u309f"     # Hiragana
+    "\u30a0-\u30ff"     # Katakana
+    "\u3400-\u4dbf"     # CJK Unified Ideographs Extension A
+    "\u4e00-\u9fff"     # CJK Unified Ideographs
+    "\uac00-\ud7af"     # Hangul Syllables
+    "\uff00-\uffef"     # Halfwidth and Fullwidth Forms
+    "]"
+)
+
+
+def _strip_foreign_scripts(text: str) -> str:
+    """Remove characters from non-allowed scripts (CJK, Cyrillic, Hebrew,
+    Arabic, …). Preserves Spanish diacritics, ASCII, markdown punctuation,
+    and emoji (≥U+1F000). Safe to call per-token on a streaming delta —
+    characters are dropped individually (no stateful lookahead)."""
+    if not text:
+        return text
+    return _FOREIGN_SCRIPT_RE.sub("", text)
+
+
 _CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
 
 
@@ -176,9 +207,54 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # Set OBSIDIAN_RAG_WEB_CHAT_MODEL to override if you need speed over quality.
 WEB_CHAT_MODEL = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL") or None
 
+# Runtime model override — persisted to disk so it survives server restarts.
+# Takes priority over env / resolve_chat_model() so the user can A/B different
+# models from the UI without editing the launchd plist or redeploying.
+# Format: {"model": "qwen3.6", "set_at": "2026-04-20T15:00:00"}. Absent or
+# malformed → no override active.
+_CHAT_MODEL_OVERRIDE_PATH = Path.home() / ".local/share/obsidian-rag" / "chat-model.json"
+
+
+def _read_chat_model_override() -> str | None:
+    """Load the persistent runtime override if any. Silent on any error —
+    a corrupt or missing file means "no override, use defaults"."""
+    try:
+        raw = _CHAT_MODEL_OVERRIDE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        model = (data or {}).get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _write_chat_model_override(model: str | None) -> None:
+    """Persist or clear the runtime override. None → delete the file."""
+    _CHAT_MODEL_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if model is None:
+        _CHAT_MODEL_OVERRIDE_PATH.unlink(missing_ok=True)
+        return
+    payload = {"model": model,
+               "set_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    tmp = _CHAT_MODEL_OVERRIDE_PATH.with_suffix(_CHAT_MODEL_OVERRIDE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, _CHAT_MODEL_OVERRIDE_PATH)
+
 
 def _resolve_web_chat_model() -> str:
-    """Return the env-override model if set, else whatever rag.py picks."""
+    """Model resolution priority (first match wins):
+      1. Runtime override file (_CHAT_MODEL_OVERRIDE_PATH) — set via
+         POST /api/chat/model from the UI; persists across restarts.
+      2. OBSIDIAN_RAG_WEB_CHAT_MODEL env var — for launchd plist overrides.
+      3. rag.resolve_chat_model() — the CHAT_MODEL_PREFERENCE fallback chain.
+    Not cached: the override file is cheap to re-read (JSON, <200 bytes)
+    and we want runtime flips to take effect on the next /api/chat call
+    with no server restart.
+    """
+    override = _read_chat_model_override()
+    if override:
+        return override
     return WEB_CHAT_MODEL or resolve_chat_model()
 
 
@@ -189,7 +265,11 @@ def _resolve_web_chat_model() -> str:
 # on command-r:35b), saving up to 10s on the first user-facing token.
 # Any per-request variation (context, signals, history) goes in the user
 # message AFTER this static block.
-_WEB_SYSTEM_PROMPT = (
+# v1: versión original 5231 chars (~1307 tok). Preservada como fallback
+# documentado vía env var RAG_WEB_PROMPT_VERSION=v1 — útil si al medir
+# v2 en producción aparece regresión en algún caso no cubierto por el
+# bench. Retirar cuando v2 sume suficiente historia sin incidentes.
+_WEB_SYSTEM_PROMPT_V1 = (
     "Eres un asistente de consulta sobre las notas personales de "
     "Obsidian del usuario. NO sos un modelo de conocimiento general.\n\n"
     "REGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. "
@@ -284,6 +364,20 @@ _WEB_SYSTEM_PROMPT = (
     "tu hija'.\n"
 )
 
+# v2: comprimido 2898 chars (~724 tok), −44% tokens. Mismas REGLAs
+# preservando los anchors visuales que qwen reconoce como patrón
+# (`<<ext>>...<</ext>>`, `[Título](ruta.md)`, `03-Resources/`, `[[Nota]]`).
+# Medido 2026-04-20: prefill cae 1737ms → ~1100ms en el bench A/B
+# gracias al ahorro de ~600 tok del system prompt.
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en otros idiomas o alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO: texto que NO salga literal del CONTEXTO (parafraseo, conectores, opinión, conocimiento general) va envuelto en `<<ext>>...<</ext>>`. Fuera de esos marcadores todo debe ser verificable en el CONTEXTO.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (opcional): si el CONTEXTO sobre una herramienta se queda corto, ofrecé UN link al dominio raíz canónico (https://omnifocus.com, NUNCA paths profundos) al final, una sola línea: `<<ext>>Más info: <URL></ext>>`. No lo ofrezcas si el CONTEXTO ya cubre ni en consultas sobre el vault (tags, búsqueda, notas).\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".'
+
+# Selector con fallback seguro a v1 si el env var toma un valor raro.
+_WEB_SYSTEM_PROMPT = (
+    _WEB_SYSTEM_PROMPT_V1
+    if os.environ.get("RAG_WEB_PROMPT_VERSION", "v2").strip() == "v1"
+    else _WEB_SYSTEM_PROMPT_V2
+)
+
 
 @app.on_event("startup")
 def _warmup() -> None:
@@ -340,6 +434,16 @@ def _warmup() -> None:
                         print("[warmup] bge-m3 local embedder ready", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] local embed skipped: {_exc}", flush=True)
+            # Drain any conversation turns that failed to persist on previous
+            # runs (transient SQL busy / disk full / etc). Best-effort;
+            # survivors stay in the file for the next startup.
+            try:
+                _retried = _retry_pending_conversation_turns()
+                if _retried:
+                    print(f"[warmup] retried {_retried} pending conversation turn(s)",
+                          flush=True)
+            except Exception as _exc:
+                print(f"[warmup] conversation-turn retry failed: {_exc}", flush=True)
         except Exception:
             pass
 
@@ -400,11 +504,45 @@ def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+_CHAT_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:@\-]{1,80}$")
+_TURN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_CHAT_QUESTION_MAX = 8000  # ~2k tokens — chat prompts >8k chars are pathological
+
+
 class ChatRequest(BaseModel):
     question: str
     session_id: str | None = None
     # None → vault activo; "all" → todos los registrados; "name" → ese puntual.
     vault_scope: str | None = None
+
+    @field_validator("question")
+    @classmethod
+    def _check_question(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("question must be non-empty")
+        if len(v) > _CHAT_QUESTION_MAX:
+            raise ValueError(f"question too long (>{_CHAT_QUESTION_MAX} chars)")
+        return v
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _CHAT_SESSION_RE.match(v):
+            raise ValueError("invalid session_id format")
+        return v
+
+    @field_validator("vault_scope")
+    @classmethod
+    def _check_vault_scope(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        # Same character class as session_id but shorter — vault names are
+        # paths / identifiers registered via `rag vault add`.
+        if len(v) > 200 or not re.match(r"^[A-Za-z0-9_./\-]{1,200}$", v):
+            raise ValueError("invalid vault_scope format")
+        return v
 
 
 class FeedbackRequest(BaseModel):
@@ -414,6 +552,22 @@ class FeedbackRequest(BaseModel):
     paths: list[str] | None = None
     session_id: str | None = None
     reason: str | None = None     # short free-text, optional (≤200 chars after trim)
+
+    @field_validator("turn_id")
+    @classmethod
+    def _check_turn_id(cls, v: str) -> str:
+        if not _TURN_ID_RE.match(v):
+            raise ValueError("invalid turn_id format")
+        return v
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _CHAT_SESSION_RE.match(v):
+            raise ValueError("invalid session_id format")
+        return v
 
 
 @app.post("/api/feedback")
@@ -447,10 +601,38 @@ def submit_feedback(req: FeedbackRequest) -> dict:
 # In-memory token bucket for rate limiting: 120 events/min per IP.
 # Stored as {ip: [timestamp, ...]} with a 60s sliding window. No new deps.
 import collections as _collections
+import threading as _threading
 
 _BEHAVIOR_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
 _BEHAVIOR_RATE_LIMIT = 120
 _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
+
+# Chat endpoint bucket — stricter because each hit pins the reranker, chat
+# model, and embedder on MPS; 30 chats/min per IP is plenty for human use
+# and stops an adversarial loop (e.g. browser extension gone rogue) from
+# starving the daemon. Separate from behavior bucket so clicks don't
+# consume chat budget.
+_CHAT_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
+_CHAT_RATE_LIMIT = 30
+_CHAT_RATE_WINDOW = 60.0
+
+# Single lock protects both buckets — contention is effectively nil
+# (list.append under GIL is fast enough that a lock hold measures in µs).
+_RATE_LIMIT_LOCK = _threading.Lock()
+
+
+def _check_rate_limit(bucket: dict[str, list[float]], ip: str,
+                      limit: int, window: float) -> None:
+    """Sliding-window rate limit per-IP. Raises HTTPException 429 on breach."""
+    now = time.time()
+    cutoff = now - window
+    with _RATE_LIMIT_LOCK:
+        events = bucket[ip]
+        while events and events[0] < cutoff:
+            events.pop(0)
+        if len(events) >= limit:
+            raise HTTPException(status_code=429, detail="rate limit exceeded")
+        events.append(now)
 
 _BEHAVIOR_KNOWN_EVENTS = frozenset({
     "open", "open_external", "positive_implicit",
@@ -501,15 +683,8 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
 
     # Rate limit: 120 events/60s per client IP
     client_ip = (request.client.host if request.client else "unknown")
-    now = time.time()
-    bucket = _BEHAVIOR_BUCKETS[client_ip]
-    # Prune old entries
-    cutoff = now - _BEHAVIOR_RATE_WINDOW
-    while bucket and bucket[0] < cutoff:
-        bucket.pop(0)
-    if len(bucket) >= _BEHAVIOR_RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
-    bucket.append(now)
+    _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                      _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
 
     try:
         log_behavior_event({
@@ -535,7 +710,8 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
     never replies — /api/chat then hangs forever. A short /api/tags probe
     catches that state without waiting for a model load.
     """
-    import urllib.request, urllib.error
+    import urllib.request
+    import urllib.error
     try:
         with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=timeout) as r:
             return r.status == 200
@@ -553,6 +729,17 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
 _OLLAMA_STREAM_TIMEOUT = 45.0
 _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 
+# Shared num_ctx for every call to the chat model from this server — the
+# real /api/chat, the preflight probe, and the background prewarmer must
+# all pass the same value. ollama re-initialises the KV cache when a
+# model call arrives with a different num_ctx than the currently-loaded
+# one, and qwen2.5:7b's default (2048) differs from the value the real
+# chat path needs (4096 — see _WEB_CHAT_OPTIONS below). A single drift
+# between preflight and /api/chat forces a full KV reinit and pushes
+# prefill from ~1.5s to ~4.9s (measured 2026-04-20). Defined at module
+# scope so there's one source of truth.
+_WEB_CHAT_NUM_CTX = 4096
+
 
 def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     """Deep probe: does `/api/chat` actually stream a token within `timeout_s`?
@@ -562,13 +749,35 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     This probe sends a 1-token chat against the pinned chat model; if the
     daemon is wedged, httpx raises within the budget. Reuses the streaming
     client so the budget applies uniformly.
+
+    CRITICAL: MUST pass num_ctx=_WEB_CHAT_NUM_CTX. Without it, ollama uses
+    its default (2048 for qwen2.5:7b) which differs from the real /api/chat
+    call (4096), forcing ollama to reinit the KV cache on the next user
+    request. Measured impact: prefill 1.5s → 4.9s (3x slower). See
+    `num_ctx mismatch` comment in the main chat path for the same trap.
+
+    Also MUST include _WEB_SYSTEM_PROMPT as the system message. The probe
+    runs before every /api/chat via _ollama_restart_if_stuck, and if it
+    sends a different prompt (even just [user:"."]) ollama overwrites the
+    slot's KV cache with that short prompt. The next real request then
+    cold-prefills the 1300-token system prompt from scratch. Measured
+    2026-04-20: probe w/o system → prefill 4.9s; probe WITH system →
+    prefill 3.4s (−1.5s per request). The probe itself pays the cold
+    prefill once at startup (~2.5s) and then ~80-100ms on every
+    subsequent call since the system cache already exists.
     """
     try:
         _OLLAMA_STREAM_CLIENT.chat(
             model=_resolve_web_chat_model(),
-            messages=[{"role": "user", "content": "."}],
-            options={"num_predict": 1, "temperature": 0, "seed": 42},
+            messages=[
+                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                {"role": "user", "content": "."},
+            ],
+            options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
+                     "temperature": 0, "seed": 42},
             stream=False,
+            think=False,   # thinking-capable models would otherwise emit
+                           # <think> blocks as "tokens" with empty content
             keep_alive=-1,
         )
         return True
@@ -933,6 +1142,111 @@ def list_vaults() -> dict:
         "registered": registered,
         "current": cfg.get("current"),
     }
+
+
+# ── Chat model runtime switch ────────────────────────────────────────────────
+# Qwen / Llama families ship a new tag every few weeks; hard-coding the
+# default in a launchd plist and restarting the daemon for each A/B is
+# enough friction to stop users from experimenting. These two endpoints
+# let the UI list available local models and pick one at runtime. No
+# server restart, no plist edit — the override is persisted to
+# ~/.local/share/obsidian-rag/chat-model.json and survives daemon restarts.
+
+# Families we want to surface as chat-capable. Everything else (embeddings,
+# rerankers, vision-only, helpers) is filtered out for the picker. This is
+# a denylist by prefix/pattern — easier to maintain as new model families
+# appear than whitelisting exact tags.
+_CHAT_MODEL_FAMILY_DENYLIST = (
+    "bge-",          # embedding models
+    "nomic-embed",
+    "all-minilm",
+    "snowflake-arctic-embed",
+    "mxbai-embed",
+    "jina-embeddings",
+)
+
+
+class ChatModelRequest(BaseModel):
+    model: str | None = None  # None / empty → clear override, revert to defaults
+
+
+@app.get("/api/chat/model")
+def get_chat_model() -> dict:
+    """Return the currently-active chat model + the local catalog.
+
+    Shape:
+      {
+        "current": "qwen2.5:7b",      # what _resolve_web_chat_model() returns
+        "override": "qwen2.5:7b",     # only set if the runtime file has one
+        "env_override": null,         # OBSIDIAN_RAG_WEB_CHAT_MODEL if set
+        "default": "qwen2.5:7b",      # resolve_chat_model() baseline
+        "available": ["qwen2.5:7b", "qwen3.6", ...]   # local, chat-capable
+      }
+
+    The UI uses this to render the selector with the active option marked.
+    """
+    override = _read_chat_model_override()
+    try:
+        available = sorted(
+            m.model for m in ollama.list().models
+            if not any(m.model.startswith(p) for p in _CHAT_MODEL_FAMILY_DENYLIST)
+        )
+    except Exception:
+        available = []
+    try:
+        default = resolve_chat_model()
+    except Exception:
+        default = None
+    return {
+        "current": _resolve_web_chat_model(),
+        "override": override,
+        "env_override": WEB_CHAT_MODEL,
+        "default": default,
+        "available": available,
+    }
+
+
+@app.post("/api/chat/model")
+def set_chat_model(req: ChatModelRequest) -> dict:
+    """Switch the chat model at runtime. Persisted to disk.
+
+    Empty / null `model` clears the override and reverts to the default
+    resolution chain (env var → resolve_chat_model). Validates that the
+    requested model is actually installed locally; rejects unknown tags
+    with 400 so the UI can surface the error instead of the next /api/chat
+    crashing on a missing model.
+
+    Side effect: invalidates the response LRU cache so follow-up queries
+    don't replay a cached response produced by a different model.
+    """
+    requested = (req.model or "").strip() or None
+    if requested is not None:
+        try:
+            available = {m.model for m in ollama.list().models}
+        except Exception:
+            available = set()
+        if requested not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"model '{requested}' not installed locally "
+                       f"(try: ollama pull {requested.split(':')[0]})",
+            )
+    try:
+        _write_chat_model_override(requested)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not persist override: {exc}")
+    # Invalidate response cache so the next identical query doesn't replay
+    # the previous model's answer.
+    try:
+        _CHAT_CACHE.clear()
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "current": _resolve_web_chat_model(),
+        "override": _read_chat_model_override(),
+    }
+
 
 
 @app.get("/api/history")
@@ -2428,9 +2742,14 @@ def _ensure_chat_model_prewarmer() -> None:
                 # thread forever and mask the next real request.
                 _OLLAMA_STREAM_CLIENT.chat(
                     model=model,
-                    messages=[{"role": "user", "content": "."}],
-                    options={"num_predict": 1, "temperature": 0, "seed": 42},
+                    messages=[
+                        {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                        {"role": "user", "content": "."},
+                    ],
+                    options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
+                             "temperature": 0, "seed": 42},
                     stream=False,
+                    think=False,   # match the probe + main chat path
                     keep_alive=-1,
                 )
                 print(f"[chat-prewarm] {model} pinned", flush=True)
@@ -2720,6 +3039,29 @@ def pendientes_api(days: int = 14) -> dict:
     }
 
 
+_CONV_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "conversation_turn_pending.jsonl"
+
+
+def _append_pending_conversation_turn(rec: dict) -> None:
+    """Append a serialisable turn record to the pending-retry file.
+
+    The file is a JSONL ring buffer consumed by _retry_pending_conversation_turns
+    at server startup and (best-effort) periodically. Each record is a
+    self-contained snapshot — vault_root str, session_id, question, answer,
+    sources, confidence, iso timestamp — so re-hydration doesn't need any
+    runtime context.
+    """
+    try:
+        _CONV_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _CONV_PENDING_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # Dead-letter failed too — nothing else we can do without blocking
+        # the SSE response. The LOG_QUEUE error record above is the last
+        # signal the operator gets.
+        pass
+
+
 def _persist_conversation_turn(
     vault_root: Path,
     session_id: str,
@@ -2729,16 +3071,18 @@ def _persist_conversation_turn(
     scores: list[float],
     confidence: float,
 ) -> None:
+    sources_payload = [
+        {"file": m.get("file", ""), "score": float(s)}
+        for m, s in zip(metas, scores)
+    ]
+    ts = datetime.now(timezone.utc)
     try:
         turn = TurnData(
             question=question,
             answer=answer,
-            sources=[
-                {"file": m.get("file", ""), "score": float(s)}
-                for m, s in zip(metas, scores)
-            ],
+            sources=sources_payload,
             confidence=float(confidence),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=ts,
         )
         path = write_turn(vault_root, session_id, turn)
         _LOG_QUEUE.put((
@@ -2750,18 +3094,84 @@ def _persist_conversation_turn(
             }) + "\n",
         ))
     except Exception as exc:
+        # Persist the turn payload to a retry queue on disk so a transient
+        # SQL / fs failure doesn't drop it silently. Consumed at startup by
+        # _retry_pending_conversation_turns. Errors still surface via
+        # LOG_QUEUE for operator visibility, but data is not lost.
+        _append_pending_conversation_turn({
+            "ts": ts.isoformat(timespec="seconds"),
+            "vault_root": str(vault_root),
+            "session_id": session_id,
+            "question": question,
+            "answer": answer,
+            "sources": sources_payload,
+            "confidence": float(confidence),
+            "error": repr(exc),
+        })
         _LOG_QUEUE.put((
             LOG_PATH,
             json.dumps({
                 "kind": "conversation_turn_error",
                 "session_id": session_id,
                 "error": repr(exc),
+                "queued_for_retry": True,
             }) + "\n",
         ))
 
 
+def _retry_pending_conversation_turns() -> int:
+    """Drain _CONV_PENDING_PATH on startup. Returns number of turns retried
+    successfully. Best-effort: failures stay in the file for the next run.
+    """
+    if not _CONV_PENDING_PATH.is_file():
+        return 0
+    try:
+        raw = _CONV_PENDING_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    remaining: list[str] = []
+    retried = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts_str = rec["ts"]
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            turn = TurnData(
+                question=rec["question"],
+                answer=rec["answer"],
+                sources=rec.get("sources", []),
+                confidence=float(rec.get("confidence", 0.0)),
+                timestamp=ts,
+            )
+            write_turn(Path(rec["vault_root"]), rec["session_id"], turn)
+            retried += 1
+        except Exception:
+            # Keep the line for the next retry cycle.
+            remaining.append(line)
+    try:
+        if remaining:
+            _CONV_PENDING_PATH.write_text("\n".join(remaining) + "\n",
+                                           encoding="utf-8")
+        else:
+            _CONV_PENDING_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return retried
+
+
 @app.post("/api/chat")
-def chat(req: ChatRequest) -> StreamingResponse:
+def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    # Rate limit: 30 chat requests / 60s per IP. Each request pins the
+    # chat model + reranker + embedder on MPS — a tight loop from a
+    # runaway client can starve the daemon for legitimate work.
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
@@ -3030,8 +3440,26 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # the LLM knows who the user is talking about before reading the
         # retrieved chunks. Pre-LLM only — never leaked to episodic notes.
         from rag import build_person_context as _build_person_ctx
+        from rag import detect_topic_shift as _detect_topic_shift
         _person_ctx = _build_person_ctx(question)
         _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
+
+        # Topic-shift gate: si la current question cambia de tema vs el turno
+        # anterior, descartamos history para evitar contaminación cross-tópico
+        # del LLM. Caso reportado 2026-04-20: "cual es mi password de avature?"
+        # → "busca informacion sobre mi mama" terminaba mezclando ambos temas
+        # ("no hay info sobre la contraseña de Avature de tu mamá") porque los
+        # 6 últimos mensajes seguían vivos en el prompt. El gate combina
+        # (a) regex anafórico protector, (b) person_context fired, (c) cosine
+        # bge-m3 < 0.40 vs last user Q. Ver `detect_topic_shift` en rag.py.
+        _topic_shifted = False
+        _topic_shift_reason = "no-history"
+        if history:
+            _topic_shifted, _topic_shift_reason = _detect_topic_shift(
+                question, history, person_fired=bool(_person_ctx),
+            )
+            if _topic_shifted:
+                history = []
 
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The
@@ -3082,7 +3510,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
         # and made some calls hang silently — leave it out.
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
-            "num_ctx": 4096,
+            "num_ctx": _WEB_CHAT_NUM_CTX,
             "num_predict": 256,
         }
 
@@ -3234,6 +3662,7 @@ def chat(req: ChatRequest) -> StreamingResponse:
                     tools=CHAT_TOOLS,
                     options=CHAT_TOOL_OPTIONS,
                     stream=False,
+                    think=False,   # see _ollama_chat_probe for rationale
                     keep_alive=OLLAMA_KEEP_ALIVE,
                 )
                 _tmsg = _tr.message
@@ -3363,6 +3792,12 @@ def chat(req: ChatRequest) -> StreamingResponse:
                 messages=final_messages,
                 options=_WEB_CHAT_OPTIONS,
                 stream=True,
+                think=False,   # the user-facing stream never includes a
+                               # <think> preamble. Thinking-capable models
+                               # (qwen3+, deepseek-r1, qwq) otherwise emit
+                               # tokens with empty content.delta and the
+                               # UI sees 0-token responses (measured on
+                               # qwen3.6 2026-04-20).
                 keep_alive=OLLAMA_KEEP_ALIVE,
             ):
                 delta = chunk.message.content or ""
@@ -3411,7 +3846,8 @@ def chat(req: ChatRequest) -> StreamingResponse:
             f"total={_t_total_ms}ms ctx_chars={_ctx_chars} tokens≈{_tok_count} "
             f"confidence={result['confidence']:.3f} "
             f"variants={len(result.get('query_variants',[]))} "
-            f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str}",
+            f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str} "
+            f"topic_shift={_topic_shift_reason}{'!' if _topic_shifted else ''}",
             flush=True,
         )
 
@@ -3434,6 +3870,8 @@ def chat(req: ChatRequest) -> StreamingResponse:
             "top_score": round(float(result["confidence"]), 2),
             "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
             "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
+            "topic_shifted": _topic_shifted,
+            "topic_shift_reason": _topic_shift_reason,
         })
 
         yield _sse("done", {

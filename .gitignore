@@ -54,3 +54,7 @@ secrets.json
 # Windows/Linux artifacts (por si alguien clona en otra plataforma)
 Thumbs.db
 Desktop.ini
+
+# Playwright MCP session artifacts + stray screenshots
+.playwright-mcp/
+ticker-buscando.png

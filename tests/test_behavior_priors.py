@@ -2,9 +2,7 @@
 import json
 import os
 import time
-from pathlib import Path
 from unittest.mock import patch, MagicMock
-import pytest
 
 
 # ── 1. _load_behavior_priors ─────────────────────────────────────────────────
@@ -315,7 +313,6 @@ def test_explore_env_set_fires_at_rate(monkeypatch):
     N = 1000
     # Simulate the probability check: secrets.randbelow(100) < 10
     # We mock secrets.randbelow to return a predictable sequence
-    import rag
     calls = []
 
     original_secrets = __import__("secrets")

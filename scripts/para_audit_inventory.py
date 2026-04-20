@@ -184,14 +184,14 @@ def main():
 
     print(f"Vault: {vault}")
     print(f"Output: {OUTPUT_FILE}")
-    print(f"")
+    print("")
     print(f"{'Bucket':<20} {'Notes':>6}")
     print(f"{'-'*28}")
     for bucket in PARA_BUCKETS:
         print(f"  {bucket:<18} {bucket_counts[bucket]:>6}")
     print(f"{'-'*28}")
     print(f"  {'TOTAL':<18} {total:>6}")
-    print(f"")
+    print("")
     print(f"  Archive opt-out (archive: never): {archive_optout}")
     print(f"  Type opt-out (moc/index/etc):     {type_optout}")
     print(f"  Skipped (skip-zone + errors):     {skipped}")

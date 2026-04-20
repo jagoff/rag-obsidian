@@ -4,7 +4,6 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -157,6 +156,11 @@ def test_concurrent_writes_no_corruption(tmp_vault):
     assert text.count("## Turn ") == 2
     assert "## Turn 1 —" in text
     assert "## Turn 2 —" in text
+    # Order matters — the whole point of the lock is that Turn 1 lands
+    # before Turn 2 in the rendered body. If the append order raced, the
+    # count would still be 2 but the file would be incoherent.
+    assert text.index("## Turn 1 —") < text.index("## Turn 2 —"), \
+        "Turn 1 must render before Turn 2"
     assert "turns: 2" in text
     # Both source files should be in the union
     assert "  - F1.md" in text

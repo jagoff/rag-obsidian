@@ -338,7 +338,11 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
     # Timing log.
     line = _last_chat_timing(capsys.readouterr().out)
     assert line is not None
-    assert "tool_rounds=1" in line
+    # tool_rounds == 2: the keyword pre-router fires one deterministic
+    # round before the LLM-decide loop (which adds a second round).
+    # See pre-router commits ee8ae85..345f343 — both rounds are emitted
+    # even when the LLM tool is the same as the pre-routed one.
+    assert "tool_rounds=2" in line
     m = re.search(r"tool_ms=(\d+)", line)
     assert m and int(m.group(1)) >= 0
     assert "tool_names=weather" in line
@@ -373,28 +377,39 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
     # Collect indices.
     tool_idxs = [i for i, s in enumerate(status_events) if s[0] == "tool"]
     done_idxs = [i for i, s in enumerate(status_events) if s[0] == "tool_done"]
-    # All three `tool` fan-out events emitted before any `tool_done`.
-    assert len(tool_idxs) == 3
-    assert len(done_idxs) == 3
-    assert max(tool_idxs) < min(done_idxs), (
-        f"parallel fan-out violated: tool idxs {tool_idxs}, "
-        f"done idxs {done_idxs}"
+    # Pre-router fires a deterministic round before the LLM-decide loop
+    # (ee8ae85/5680f3b), so the stream contains pre-router tool/tool_done
+    # pairs interleaved with the LLM fan-out. The parallel-fan-out invariant
+    # only applies to the LLM bucket: its ≥3 `tool` events all emit before
+    # any of its `tool_done`. Identify the LLM bucket by taking the last 3
+    # tool_idxs and the last 3 done_idxs — pre-router events came earlier.
+    assert len(tool_idxs) >= 3
+    assert len(done_idxs) >= 3
+    llm_tool_idxs = tool_idxs[-3:]
+    llm_done_idxs = done_idxs[-3:]
+    assert max(llm_tool_idxs) < min(llm_done_idxs), (
+        f"LLM-bucket parallel fan-out violated: tool idxs {llm_tool_idxs}, "
+        f"done idxs {llm_done_idxs}"
     )
 
     tool_names_in_events = {
         s[1] for s in status_events if s[0] == "tool"
     }
-    assert tool_names_in_events == {"weather", "finance_summary", "calendar_ahead"}
+    # The 3 LLM-decided tools must all appear. Pre-router may inject extra
+    # tools (e.g. reminders_due) when the prompt has triggering keywords —
+    # that's a feature, not a failure. Assert the 3 LLM tools are a subset.
+    assert {"weather", "finance_summary", "calendar_ahead"}.issubset(tool_names_in_events)
 
     # Log line.
     line = _last_chat_timing(capsys.readouterr().out)
     assert line is not None
-    assert "tool_rounds=1" in line
-    # All 3 names in tool_names= (order not asserted — parallel).
+    # tool_rounds == 2: pre-router round + LLM-decide round.
+    assert "tool_rounds=2" in line
+    # All 3 LLM names in tool_names= (order not asserted — parallel).
     m = re.search(r"tool_names=([^\s]+)", line)
     assert m
     names = set(m.group(1).split(","))
-    assert names == {"weather", "finance_summary", "calendar_ahead"}
+    assert {"weather", "finance_summary", "calendar_ahead"}.issubset(names)
 
 
 # ── 6. Serial bucket precedes parallel ─────────────────────────────────────
@@ -421,11 +436,18 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
         (data.get("stage"), data.get("name"))
         for ev, data in events if ev == "status"
     ]
-    # search_vault's tool + tool_done must both precede weather's tool event
-    # (serial bucket runs fully before parallel fan-out starts).
+    # search_vault's tool + tool_done must both precede weather's LLM-emitted
+    # tool event (serial bucket runs fully before parallel fan-out starts).
+    # Note: the pre-router fires weather BEFORE the LLM decides anything, so
+    # the first ("tool", "weather") belongs to the pre-router. We want the
+    # LAST ("tool", "weather") — the LLM's decision — as the reference point.
     idx_sv_tool = status_events.index(("tool", "search_vault"))
     idx_sv_done = status_events.index(("tool_done", "search_vault"))
-    idx_w_tool = status_events.index(("tool", "weather"))
+    # Last index of ("tool", "weather").
+    weather_tool_positions = [
+        i for i, s in enumerate(status_events) if s == ("tool", "weather")
+    ]
+    idx_w_tool = weather_tool_positions[-1]
     assert idx_sv_tool < idx_sv_done < idx_w_tool
 
 
@@ -460,7 +482,9 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
     # Timing log.
     line = _last_chat_timing(capsys.readouterr().out)
     assert line is not None
-    assert "tool_rounds=1" in line
+    # tool_rounds == 2: pre-router round + LLM-decide round (see test_chat_
+    # endpoint_tool_path).
+    assert "tool_rounds=2" in line
     assert "tool_names=weather" in line
 
     # Spy on the SECOND ollama.chat call — its messages kwarg should include
@@ -511,5 +535,7 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     # Timing log.
     line = _last_chat_timing(capsys.readouterr().out)
     assert line is not None
-    assert "tool_rounds=3" in line
-    assert "tool_names=weather,weather,weather" in line
+    # tool_rounds == 4: pre-router round + 3 capped LLM rounds.
+    # _TOOL_ROUND_CAP=3 is the LLM-loop cap; pre-router adds one extra.
+    assert "tool_rounds=4" in line
+    assert "tool_names=weather,weather,weather,weather" in line

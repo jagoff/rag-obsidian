@@ -4,7 +4,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -290,7 +290,6 @@ def test_rag_explore_scrubbed_from_eval_env():
     """_run_eval_gate must scrub RAG_EXPLORE from the subprocess env."""
     captured_env = {}
 
-    import subprocess as sp_mod
 
     def fake_run(cmd, **kwargs):
         captured_env.update(kwargs.get("env", {}))

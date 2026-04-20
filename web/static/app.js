@@ -2,6 +2,7 @@ const messagesEl = document.getElementById("messages");
 const form = document.getElementById("composer");
 const input = document.getElementById("input");
 const vaultPicker = document.getElementById("vault-picker");
+const modelPicker = document.getElementById("model-picker");
 const ttsToggle = document.getElementById("tts-toggle");
 const helpBtn = document.getElementById("help-btn");
 const helpModal = document.getElementById("help-modal");
@@ -169,6 +170,78 @@ vaultPicker.addEventListener("change", () => {
 });
 
 loadVaults();
+
+// Chat model picker ------------------------------------------------
+// Runtime switch between installed chat models. The backend persists
+// the choice in ~/.local/share/obsidian-rag/chat-model.json so the
+// selection survives server restarts. No reload needed — the next
+// /api/chat call picks up the override automatically.
+async function loadChatModels() {
+  if (!modelPicker) return;
+  try {
+    const res = await fetch("/api/chat/model");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    modelPicker.innerHTML = "";
+    // Sort so the current one lands first; that's what's active right now.
+    const available = data.available || [];
+    const current = data.current;
+    const rest = available.filter((m) => m !== current);
+    const ordered = current ? [current, ...rest] : rest;
+    for (const name of ordered) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name === current ? `${name} (activo)` : name;
+      modelPicker.appendChild(opt);
+    }
+    // If the current model isn't in `available` (env override pointing to
+    // an external registry), still show it as selected.
+    if (current && !ordered.includes(current)) {
+      const opt = document.createElement("option");
+      opt.value = current;
+      opt.textContent = `${current} (activo)`;
+      modelPicker.insertBefore(opt, modelPicker.firstChild);
+    }
+    modelPicker.value = current || "";
+    modelPicker.dataset.current = current || "";
+  } catch (err) {
+    modelPicker.innerHTML = '<option value="">n/a</option>';
+  }
+}
+
+modelPicker?.addEventListener("change", async () => {
+  const selected = modelPicker.value;
+  const previous = modelPicker.dataset.current || "";
+  if (!selected || selected === previous) return;
+  // Optimistic UI: mark busy; revert on error.
+  modelPicker.disabled = true;
+  try {
+    const res = await fetch("/api/chat/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: selected }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    modelPicker.dataset.current = data.current;
+    // Re-render the "(activo)" marker on the new option.
+    await loadChatModels();
+  } catch (err) {
+    console.error("[chat-model] switch failed:", err);
+    modelPicker.value = previous;
+    // Non-blocking toast via the textarea placeholder would be ideal,
+    // but alert() is the simplest way to surface a validation error
+    // (e.g. model not installed) without more UI plumbing.
+    alert(`No se pudo cambiar el modelo: ${err.message}`);
+  } finally {
+    modelPicker.disabled = false;
+  }
+});
+
+loadChatModels();
 
 // TTS toggle ------------------------------------------------------
 // SVGs defined up-front so renderTtsToggle() can use them on initial
@@ -813,8 +886,79 @@ marked.use({
       const ext = !isNote && /^https?:\/\//.test(href) ? ` target="_blank" rel="noopener noreferrer"` : "";
       return `<a href="${target}"${titleAttr}${ext}>${text}</a>`;
     },
+    // Drop raw HTML blocks/inline emitted by the LLM. marked passes them
+    // through by default which is an XSS surface when the model halluci-
+    // nates <script>/<iframe>/<img onerror> tags or a vault note contains
+    // pasted HTML. Escaping to text preserves the visible content but
+    // removes executable markup.
+    html({ text }) {
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    },
   },
 });
+
+// Post-render sanitiser: parses the marked output into a detached DOM,
+// strips disallowed elements + dangerous attributes, returns cleaned HTML.
+// Belt-and-suspenders with the renderer.html override above — catches
+// anything that slipped through (mostly on-event attrs inside crafted
+// link titles). No external dep.
+const _SAFE_TAGS = new Set([
+  "a", "abbr", "b", "blockquote", "br", "code", "del", "div", "em",
+  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol",
+  "p", "pre", "s", "span", "strong", "sub", "sup", "table", "tbody",
+  "td", "th", "thead", "tr", "ul",
+]);
+const _SAFE_ATTRS = new Set([
+  "href", "title", "alt", "src", "target", "rel", "class", "id",
+  "colspan", "rowspan", "start", "type",
+]);
+
+function _sanitizeNode(node) {
+  // Walk in reverse so we can remove children without indexing surprises.
+  const children = Array.from(node.childNodes);
+  for (const child of children) {
+    if (child.nodeType === Node.ELEMENT_NODE) {
+      const tag = child.tagName.toLowerCase();
+      if (!_SAFE_TAGS.has(tag)) {
+        child.remove();
+        continue;
+      }
+      // Kill all on* handlers + anything not in the safe-attr list.
+      for (const attr of Array.from(child.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith("on") || !_SAFE_ATTRS.has(name)) {
+          child.removeAttribute(attr.name);
+          continue;
+        }
+        // href/src must not be javascript: / data: (except data:image/…)
+        if (name === "href" || name === "src") {
+          const val = attr.value.trim().toLowerCase();
+          const isJs = val.startsWith("javascript:");
+          const isDataNonImg = val.startsWith("data:") && !val.startsWith("data:image/");
+          if (isJs || isDataNonImg) {
+            child.removeAttribute(attr.name);
+          }
+        }
+      }
+      _sanitizeNode(child);
+    }
+  }
+}
+
+function _sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(
+    `<div id="__root">${html}</div>`, "text/html"
+  );
+  const root = doc.getElementById("__root");
+  if (!root) return "";
+  _sanitizeNode(root);
+  return root.innerHTML;
+}
 
 function preprocess(text) {
   // Accept malformed closings (LLM frequently drops one `<` or `>`):
@@ -840,7 +984,7 @@ function postprocess(html) {
 }
 
 function renderMarkdown(text) {
-  return postprocess(marked.parse(preprocess(text)));
+  return _sanitizeHtml(postprocess(marked.parse(preprocess(text))));
 }
 
 // Send --------------------------------------------------------
@@ -859,8 +1003,13 @@ async function send(question) {
   thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
   // Seed the stage label immediately so the user sees "pensando…" on click.
   // Heartbeat/status events replace this with "buscando…" / "generando…"
-  // once they start flowing (~500ms–3s in).
-  thinking.setAttribute("data-stage", "pensando…");
+  // once they start flowing (~500ms–3s in). Rendered as real DOM (not a
+  // ::after pseudo) so the seconds portion can be coloured independently
+  // as a semáforo (verde → amarillo → rojo) once the ticker kicks in.
+  const stageLabelEl = el("span", "stage-label", "pensando…");
+  const stageSecsEl = el("span", "stage-secs");
+  thinking.appendChild(stageLabelEl);
+  thinking.appendChild(stageSecsEl);
   turn.appendChild(thinking);
   scrollBottom();
 
@@ -871,36 +1020,79 @@ async function send(question) {
   let confidence = null;
   let metaShown = false;
   let aborted = false;
-  // Ticker for the `generating` stage — server fires one `status` event
-  // when it starts calling the LLM, then nothing until the first token
-  // arrives ~5-10s later. Pulsing dots alone feel frozen; a running
-  // counter + shifting copy signals forward motion + "ya llega" past
-  // the P50 threshold.
-  let generatingStart = 0;
-  let generatingTimer = null;
-  function stopGeneratingTicker() {
-    if (generatingTimer) {
-      clearInterval(generatingTimer);
-      generatingTimer = null;
+  // Live tickers for the two long waits (retrieve + generate). Server fires
+  // one `status` event per phase and then silence for 2-10s while the
+  // reranker + LLM chew. Without a running counter the dots look frozen
+  // after the first second. One ticker at a time — start a new phase and
+  // the previous stops. 200ms refresh = one decimal fidelity without
+  // shaking the layout (tabular-nums in CSS locks the glyph width).
+  let stageTimer = null;
+  let stageStart = 0;
+  function stopStageTicker() {
+    if (stageTimer) {
+      clearInterval(stageTimer);
+      stageTimer = null;
     }
   }
-  function startGeneratingTicker() {
-    stopGeneratingTicker();
-    generatingStart = performance.now();
+  function formatSecs(ms) {
+    // 1 decimal up to 9.9s, integer after — avoids visual noise past the
+    // threshold where sub-second fidelity stops being useful.
+    const s = ms / 1000;
+    return s < 10 ? s.toFixed(1) : Math.floor(s).toString();
+  }
+  function stageTier(ms) {
+    // Semáforo agnóstico a la fase: los mismos umbrales que disparan el
+    // cambio de copy en retrieveLabel. Verde < 3s (snappy), amarillo < 8s
+    // (trabajando), rojo ≥ 8s (percibido como lento). Mantenerlos
+    // alineados con la copy evita que el color y el texto discrepen.
+    const s = ms / 1000;
+    if (s < 3) return "green";
+    if (s < 8) return "yellow";
+    return "red";
+  }
+  function retrieveLabel(ms) {
+    const s = ms / 1000;
+    // "búsqueda profunda" matches the auto-deep-retrieval branch in the
+    // backend (confidence < 0.10).
+    if (s < 3) return "buscando";
+    if (s < 8) return "revisando notas";
+    return "búsqueda profunda";
+  }
+  function generateLabel(ms) {
+    const s = ms / 1000;
+    if (s < 8)  return "generando";
+    if (s < 15) return "casi listo";
+    return "todavía trabajando";
+  }
+  function startStageTicker(phase) {
+    stopStageTicker();
+    stageStart = performance.now();
+    const labelFn = phase === "generating" ? generateLabel : retrieveLabel;
+    // El contador y el semáforo sólo tienen sentido durante `generating`:
+    // el usuario quiere medir "cuánto lleva generándome la respuesta", no
+    // "cuánto lleva el pipeline entero". Durante `retrieving` actualizamos
+    // sólo la label (buscando → revisando notas → búsqueda profunda) y
+    // mantenemos limpio el span de segundos para que el número arranque
+    // desde 0 recién cuando empieza la generación.
+    const showSecs = phase === "generating";
     const tick = () => {
-      if (!thinking.isConnected) { stopGeneratingTicker(); return; }
-      const s = (performance.now() - generatingStart) / 1000;
-      const whole = Math.floor(s);
-      let copy;
-      if (s < 3) copy = "generando…";
-      else if (s < 8) copy = `generando… (${whole}s)`;
-      else if (s < 15) copy = `casi listo… (${whole}s)`;
-      else copy = `todavía trabajando… (${whole}s)`;
-      thinking.setAttribute("data-stage", copy);
+      if (!thinking.isConnected) { stopStageTicker(); return; }
+      const elapsed = performance.now() - stageStart;
+      stageLabelEl.textContent = showSecs ? `${labelFn(elapsed)} · ` : labelFn(elapsed);
+      if (showSecs) {
+        stageSecsEl.textContent = `${formatSecs(elapsed)}s`;
+        stageSecsEl.setAttribute("data-tier", stageTier(elapsed));
+      } else {
+        stageSecsEl.textContent = "";
+        stageSecsEl.removeAttribute("data-tier");
+      }
     };
     tick();
-    generatingTimer = setInterval(tick, 500);
+    stageTimer = setInterval(tick, 200);
   }
+  // Legacy names kept for minimal diff at call sites below.
+  const stopGeneratingTicker = stopStageTicker;
+  const startGeneratingTicker = () => startStageTicker("generating");
   // Tool-call progress chips — persist across the thinking→token boundary
   // so `status {stage:"tool"}` events keep rendering after the dots
   // disappear. Chips are appended in fire order; duplicates across rounds
@@ -1052,11 +1244,15 @@ async function send(question) {
       clearToolChips();
       turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
     } else if (event === "heartbeat") {
-      const elapsed = parsed.elapsed_s != null
-        ? `${parsed.elapsed_s.toFixed(1)}s`
-        : "";
-      const stage = parsed.stage === "generating" ? "generando" : "trabajando";
-      thinking.setAttribute("data-stage", `${stage}… (${elapsed})`);
+      // Server-side heartbeat is a liveness signal. Only act on it as a
+      // fallback if no client-side ticker is running for this phase (e.g.
+      // the `status` event that would start the ticker never arrived).
+      // Otherwise the local 200ms ticker produces smoother copy and the
+      // heartbeat would flicker it back to the server's 1s cadence.
+      if (!stageTimer) {
+        if (parsed.stage === "generating") startStageTicker("generating");
+        else startStageTicker("retrieving");
+      }
     } else if (event === "status") {
       if (parsed.stage === "tool") {
         const bar = ensureToolsBar();
@@ -1082,9 +1278,24 @@ async function send(question) {
         if (parsed.stage === "generating") {
           stopAllChipPulses();
           startGeneratingTicker();
+        } else if (parsed.stage === "retrieving") {
+          // Server emits `status {stage:"retrieving"}` at the very start
+          // of retrieve(); run the counter from there so the user sees
+          // exactly the time the pipeline has been working.
+          startStageTicker("retrieving");
+        } else if (parsed.stage === "cached") {
+          // Cache replay is sub-100ms end-to-end — no point showing a
+          // running counter. Give a quick visual cue and let the normal
+          // sources/token/done events tear down `thinking`.
+          stopStageTicker();
+          stageLabelEl.textContent = "desde caché";
+          stageSecsEl.textContent = "";
+          stageSecsEl.removeAttribute("data-tier");
         } else {
-          stopGeneratingTicker();
-          thinking.setAttribute("data-stage", "buscando…");
+          // Unknown/unlabelled status (e.g. a future stage name) — fall
+          // back to the retrieve ticker. Guarantees the counter never
+          // stalls at a static label again.
+          if (!stageTimer) startStageTicker("retrieving");
         }
       }
     }

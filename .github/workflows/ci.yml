@@ -18,7 +18,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/ruff-action@v3
         with:
-          src: "rag.py mcp_server.py main.py"
+          # Full project scope — previous config only lint-checked
+          # rag.py/mcp_server.py and skipped web/ + scripts/
+          # (~5.6k lines untouched). The rule set stays at ruff's
+          # default (E/F/W); selection rules and extend-ignore live in
+          # pyproject.toml so local `ruff check` matches CI.
+          src: "rag.py mcp_server.py web scripts"
 
   test:
     name: pytest (py${{ matrix.python-version }})

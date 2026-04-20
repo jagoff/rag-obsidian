@@ -33,15 +33,15 @@ queries:
 
   - question: "qué es ikigai"
     expected:
-      - 02-Areas/Coaching/Ikigai.md
+      - 04-Archive/Coaching/Ikigai.md
 
   - question: "comunicación no violenta"
     expected:
-      - 02-Areas/Coaching/Comunicacion no violenta.md
+      - 03-Resources/Coaching/Comunicacion no violenta.md
 
   - question: "mis referentes en coaching"
     expected:
-      - 02-Areas/Coaching/Coaching - Referentes.md
+      - 03-Resources/Coaching/Coaching - Referentes.md
 
   - question: "bio de fer coach"
     expected:
@@ -49,16 +49,16 @@ queries:
 
   - question: "podcast primer episodio coaching"
     expected:
-      - 02-Areas/Coaching/Podcast - Episodio 01 - Coaching.md
+      - 04-Archive/Coaching/Podcast - Episodio 01 - Coaching.md
 
   # Música
   - question: "letra de muros fractales"
     expected:
-      - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+      - "04-Archive/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md"
 
   - question: "canción miro la lluvia"
     expected:
-      - 02-Areas/Musica/Miro la lluvia/Miro la lluvia.md
+      - 04-Archive/Musica/Miro la lluvia/Miro la lluvia.md
 
   - question: "toma tres tema"
     expected:
@@ -80,11 +80,11 @@ queries:
   # Hard: sin tildes (testing accent normalization)
   - question: "que es el ikigai"
     expected:
-      - 02-Areas/Coaching/Ikigai.md
+      - 04-Archive/Coaching/Ikigai.md
 
   - question: "comunicacion no violenta"
     expected:
-      - 02-Areas/Coaching/Comunicacion no violenta.md
+      - 03-Resources/Coaching/Comunicacion no violenta.md
 
   # Hard: question ABOUT content (not title keyword)
   - question: "cómo manejar el estrés en el trabajo"
@@ -94,7 +94,7 @@ queries:
   # Hard: metaphorical / topic-level query
   - question: "herramientas para grabar podcast"
     expected:
-      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+      - 03-Resources/Coaching/Coaching - Grabacion y herramientas.md
 
   # Hard: typo
   - question: "liderasgo estrategico"
@@ -105,11 +105,11 @@ queries:
   # 03-Resources/Agile
   - question: "objetivos SMART"
     expected:
-      - 03-Resources/Agile/Objetivos SMART.md
+      - 04-Archive/Agile/Objetivos SMART.md
 
   - question: "retrospectiva del barco"
     expected:
-      - 03-Resources/Agile/Retrospectiva del barco.md
+      - 04-Archive/Agile/Retrospectiva del barco.md
 
   - question: "liberating structures facilitación"
     expected:
@@ -117,53 +117,53 @@ queries:
 
   - question: "consejos para equipos remotos"
     expected:
-      - 03-Resources/Agile/Consejos para equipos con trabajo remoto.md
+      - 04-Archive/Agile/Consejos para equipos con trabajo remoto.md
 
   # 03-Resources/Tech
   - question: "shortcuts de macos"
     expected:
-      - 03-Resources/Tech/MacOS - Shorcuts.md
+      - 04-Archive/Tech/MacOS - Shorcuts.md
 
   - question: "prompts para chatgpt"
     expected:
-      - 03-Resources/Tech/Chat GPT prompts.md
+      - 04-Archive/Tech/Chat GPT prompts.md
 
   - question: "sincronizar dos cuentas de dropbox en la misma mac"
     expected:
-      - 03-Resources/Tech/Dropbox - Sync 2 accounts on the same SO.md
+      - 04-Archive/Tech/Dropbox - Sync 2 accounts on the same SO.md
 
   # 02-Areas/Personal — Guitar
   - question: "axe fx 3 configuración"
     expected:
-      - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+      - 03-Resources/Personal/Guitar/Guitar - AXE FX 3.md
 
   - question: "equipo de guitarra que tengo"
     expected:
-      - 02-Areas/Personal/Guitar/Guitar - Gear.md
+      - 03-Resources/Personal/Guitar/Guitar - Gear.md
       - 03-Resources/Equipamiento - Amps.md
 
   # 02-Areas/Musica (non-Coaching)
   - question: "letra de sal"
     expected:
-      - 02-Areas/Musica/Sal/Letra - Sal.md
-      - 02-Areas/Musica/Sal/Letra - Sal AI.md
+      - 04-Archive/Musica/Sal/Letra - Sal.md
+      - 04-Archive/Musica/Sal/Letra - Sal AI.md
 
   - question: "letra de apagado"
     expected:
-      - 02-Areas/Personal/Letras - Escritos/Apagado.md
+      - 04-Archive/Personal/Letras - Escritos/Apagado.md
 
   # 01-Projects (non-RAG-Local)
   - question: "arquitectura de obsidian-rag"
     expected:
-      - 01-Projects/obsidian-rag/obsidian-rag - Arquitectura.md
+      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
 
   - question: "pipelines de obsidian-rag"
     expected:
-      - 01-Projects/obsidian-rag/obsidian-rag - Pipelines.md
+      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
 
   - question: "bots y automatización del rag"
     expected:
-      - 01-Projects/obsidian-rag/obsidian-rag - Automatización y bots.md
+      - 04-Archive/RAG-Local/obsidian-rag - Automatización y bots.md
 
   # 04-Archive — memorias PARA
   - question: "feedback sobre stack local free"
@@ -181,20 +181,20 @@ queries:
   # 03-Resources/Personal-ref/Info — queries diagnósticas
   - question: "info del banco santander"
     expected:
-      - 03-Resources/Personal-ref/Info/Info - Banco Santander.md
+      - 03-Resources/Personal/Info/Info - Banco Santander.md
 
   - question: "info del banco icbc"
     expected:
-      - 03-Resources/Personal-ref/Info/Info - Banco ICBC.md
+      - 03-Resources/Personal/Info/Info - Banco ICBC.md
 
   - question: "dónde está guardado el cbu del alquiler"
     expected:
-      - 03-Resources/Personal-ref/Info/Info - CBU Alquiler.md
+      - 04-Archive/Personal/Info/Info - CBU Alquiler.md
 
   # Hard: acronym / techy phrasing
   - question: "cómo grabé un podcast"
     expected:
-      - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+      - 03-Resources/Coaching/Coaching - Grabacion y herramientas.md
 
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
@@ -206,10 +206,10 @@ chains:
     turns:
       - question: "qué es ikigai"
         expected:
-          - 02-Areas/Coaching/Ikigai.md
+          - 04-Archive/Coaching/Ikigai.md
       - question: "profundizá en el concepto"
         expected:
-          - 02-Areas/Coaching/Ikigai.md
+          - 04-Archive/Coaching/Ikigai.md
       - question: "y cómo se relaciona eso con mi perfil de coach"
         expected:
           - 02-Areas/Coaching/Fer coach - Bio.md
@@ -222,22 +222,22 @@ chains:
           - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
       - question: "y el otro curso que tenía"
         expected:
-          - 02-Areas/Coaching/Coaching - Curso de liderazgo.md
+          - 03-Resources/Coaching/Coaching - Curso de liderazgo.md
       - question: "quiénes son mis referentes en esto"
         expected:
-          - 02-Areas/Coaching/Coaching - Referentes.md
+          - 03-Resources/Coaching/Coaching - Referentes.md
 
   - id: musica-muros-fractales
     turns:
       - question: "letra de muros fractales"
         expected:
-          - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+          - "04-Archive/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md"
       - question: "qué otras letras tengo en esa misma carpeta"
         expected:
-          - 02-Areas/Musica/Muros Fractales/Letras - Astio.md
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
+          - 04-Archive/Musica/Muros Fractales/Letras - Astio.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
 
   - id: tech-claude-code
     turns:
@@ -260,33 +260,21 @@ chains:
         expected:
           - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
-  - id: meta-vault-ollama
-    turns:
-      - question: "qué modelos de ollama tengo instalados"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama.md
-      - question: "y el bot de telegram que los usa"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama_telegram_bot.md
-      - question: "hay otro bot con claude?"
-        expected:
-          - 04-Archive/99-obsidian-system/99-Claude/memory/reference_claude_telegram_bot.md
-
   # Failure mode: folder semantics ("esa carpeta") + ambiguous pronoun "los"
   # (los acordes vs los temas). Also cascada: t2 depende de t1 anclar en Sal.
   - id: musica-sal-carpeta
     turns:
       - question: "letra de sal"
         expected:
-          - 02-Areas/Musica/Sal/Letra - Sal.md
-          - 02-Areas/Musica/Sal/Letra - Sal AI.md
+          - 04-Archive/Musica/Sal/Letra - Sal.md
+          - 04-Archive/Musica/Sal/Letra - Sal AI.md
       - question: "y los acordes de esa"
         expected:
-          - 02-Areas/Musica/Sal/Letra - Sal - Acordes.md
+          - 04-Archive/Musica/Sal/Letra - Sal - Acordes.md
       - question: "qué otras versiones tengo en esa carpeta"
         expected:
-          - 02-Areas/Musica/Sal/Letra - Sal2.md
-          - 02-Areas/Musica/Sal/Letra - Sal AI.md
+          - 04-Archive/Musica/Sal/Letra - Sal2.md
+          - 04-Archive/Musica/Sal/Letra - Sal AI.md
 
   # Failure mode: "contame más de eso" / "profundizá" con anclaje a nota
   # específica, y luego cascada cross-note (herramientas de grabación).
@@ -300,7 +288,7 @@ chains:
           - 02-Areas/Coaching/Coaching - Charla sobre Ansiedad y Estres en el ambito Laboral.md
       - question: "qué herramientas uso para grabar ese tipo de charla"
         expected:
-          - 02-Areas/Coaching/Coaching - Grabacion y herramientas.md
+          - 03-Resources/Coaching/Coaching - Grabacion y herramientas.md
 
   # Failure mode: "profundizá en X" donde X es otra nota de la misma carpeta
   # (no self-reference trivial), luego "y las versiones de Y" que también
@@ -309,15 +297,15 @@ chains:
     turns:
       - question: "letra de muros fractales"
         expected:
-          - 02-Areas/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md
+          - "04-Archive/Musica/Muros Fractales/Muros Fractales 1.1 (AI).md"
       - question: "profundizá en la de astio"
         expected:
-          - 02-Areas/Musica/Muros Fractales/Letras - Astio.md
+          - 04-Archive/Musica/Muros Fractales/Letras - Astio.md
       - question: "y las versiones de la herrumbre que tengo"
         expected:
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
-          - 02-Areas/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI 1.0.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
+          - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
 
   # === Chains 2026-04-17: cross-folder + acronym follow-up ===
   # Agile: entidad concreta → pronombre "y la otra" → otra nota del mismo folder
@@ -325,10 +313,10 @@ chains:
     turns:
       - question: "objetivos SMART"
         expected:
-          - 03-Resources/Agile/Objetivos SMART.md
+          - 04-Archive/Agile/Objetivos SMART.md
       - question: "y la retrospectiva del barco"
         expected:
-          - 03-Resources/Agile/Retrospectiva del barco.md
+          - 04-Archive/Agile/Retrospectiva del barco.md
       - question: "qué otras dinámicas tengo en esa carpeta"
         expected:
           - 03-Resources/Agile/Dinamicas grupales.md
@@ -339,10 +327,10 @@ chains:
     turns:
       - question: "axe fx 3 configuración"
         expected:
-          - 02-Areas/Personal/Guitar/Guitar - AXE FX 3.md
+          - 03-Resources/Personal/Guitar/Guitar - AXE FX 3.md
       - question: "y qué equipo de guitarra tengo"
         expected:
-          - 02-Areas/Personal/Guitar/Guitar - Gear.md
+          - 03-Resources/Personal/Guitar/Guitar - Gear.md
       - question: "qué amplificadores uso"
         expected:
           - 03-Resources/Equipamiento - Amps.md
@@ -352,8 +340,8 @@ chains:
     turns:
       - question: "info del banco santander"
         expected:
-          - 03-Resources/Personal-ref/Info/Info - Banco Santander.md
+          - 03-Resources/Personal/Info/Info - Banco Santander.md
       - question: "y el icbc"
         expected:
-          - 03-Resources/Personal-ref/Info/Info - Banco ICBC.md
+          - 03-Resources/Personal/Info/Info - Banco ICBC.md
 

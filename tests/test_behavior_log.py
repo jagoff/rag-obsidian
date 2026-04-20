@@ -8,10 +8,8 @@ Covers:
 - OSC 8 rendering unchanged when RAG_TRACK_OPENS unset
 """
 import json
-import os
 import subprocess
 import threading
-from pathlib import Path
 
 import pytest
 from click.testing import CliRunner

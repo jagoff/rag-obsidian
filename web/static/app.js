@@ -60,11 +60,19 @@ function renderHistoryPopover() {
   historyPopover.innerHTML = "";
   if (!historyPopoverItems.length) {
     historyPopover.appendChild(el("div", "slash-popover-empty", "sin historial todavía"));
+    // No active descendant when the popover is empty — clear the attr so
+    // screen readers don't announce a stale id.
+    historyPopover.removeAttribute("aria-activedescendant");
     return;
   }
   historyPopoverItems.forEach((q, i) => {
     const row = el("div", "history-item" + (i === historyPopoverIdx ? " active" : ""));
+    // Stable per-row id so aria-activedescendant can point at it. Unique
+    // per open of the popover; regenerated on every render (simpler than
+    // caching across re-renders).
+    row.id = `history-option-${i}`;
     row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", i === historyPopoverIdx ? "true" : "false");
     row.appendChild(el("span", "history-idx", String(i + 1)));
     row.appendChild(el("span", "history-q", q));
     row.addEventListener("mousedown", (ev) => {
@@ -73,10 +81,21 @@ function renderHistoryPopover() {
     });
     row.addEventListener("mouseenter", () => {
       historyPopoverIdx = i;
-      [...historyPopover.children].forEach((c, j) => c.classList.toggle("active", j === historyPopoverIdx));
+      [...historyPopover.children].forEach((c, j) => {
+        c.classList.toggle("active", j === historyPopoverIdx);
+        // Keep aria-selected in sync with the visual state so screen
+        // readers announce the same item the user is hovering.
+        c.setAttribute("aria-selected", j === historyPopoverIdx ? "true" : "false");
+      });
+      historyPopover.setAttribute("aria-activedescendant", `history-option-${historyPopoverIdx}`);
     });
     historyPopover.appendChild(row);
   });
+  // Point aria-activedescendant at whichever row is currently highlighted.
+  // Browsers use this (on a role="listbox") to tell assistive tech which
+  // option inside the listbox has focus, without the listbox itself losing
+  // keyboard focus. Required for ↑/↓ navigation to be announced.
+  historyPopover.setAttribute("aria-activedescendant", `history-option-${historyPopoverIdx}`);
   const active = historyPopover.children[historyPopoverIdx];
   if (active) active.scrollIntoView({ block: "nearest" });
 }
@@ -320,11 +339,17 @@ function renderSlashPopover(items) {
   if (!items.length) {
     const empty = el("div", "slash-popover-empty", "sin comandos — Enter envía al vault");
     slashPopover.appendChild(empty);
+    slashPopover.removeAttribute("aria-activedescendant");
     return;
   }
   items.forEach((c, i) => {
     const row = el("div", "slash-item" + (i === slashIndex ? " active" : ""));
+    // Per-item id so the listbox-level aria-activedescendant on the
+    // container can point at the currently-highlighted row without the
+    // row itself needing keyboard focus.
+    row.id = `slash-option-${i}`;
     row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", i === slashIndex ? "true" : "false");
     row.dataset.cmd = c.cmd;
     const name = el("span", "slash-cmd", c.cmd);
     if (c.arg) {
@@ -345,6 +370,7 @@ function renderSlashPopover(items) {
     });
     slashPopover.appendChild(row);
   });
+  slashPopover.setAttribute("aria-activedescendant", `slash-option-${slashIndex}`);
 }
 
 function updateSlashPopover() {

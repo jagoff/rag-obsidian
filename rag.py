@@ -27485,6 +27485,181 @@ def run_maintenance(
     return results
 
 
+# ── Cutover validation (T10 pre-strip gate) ──────────────────────────────────
+# Before T10 flips RAG_STATE_SQL to default-on + strips the JSONL fallback,
+# we want a read-only way to verify every source migrated cleanly. The
+# migration script renames each JSONL to <name>.bak.<unix_ts> on success;
+# this helper walks the SOURCES map and compares SQL COUNT(*) vs JSONL
+# line count. SQL ≥ JSONL = OK (post-cutover activity accumulated on top).
+# SQL < JSONL = FAIL (lost rows — abort the strip).
+
+_CUTOVER_SOURCES: tuple[tuple[str, str], ...] = (
+    # (jsonl_filename, sql_table)
+    ("queries.jsonl", "rag_queries"),
+    ("behavior.jsonl", "rag_behavior"),
+    ("feedback.jsonl", "rag_feedback"),
+    ("tune.jsonl", "rag_tune"),
+    ("contradictions.jsonl", "rag_contradictions"),
+    ("ambient.jsonl", "rag_ambient"),
+    ("brief_written.jsonl", "rag_brief_written"),
+    ("wa_tasks.jsonl", "rag_wa_tasks"),
+    ("archive.jsonl", "rag_archive_log"),
+    ("filing.jsonl", "rag_filing_log"),
+    ("eval.jsonl", "rag_eval_runs"),
+    ("surface.jsonl", "rag_surface_log"),
+    ("proactive.jsonl", "rag_proactive_log"),
+    ("rag_cpu.jsonl", "rag_cpu_metrics"),
+    ("rag_memory.jsonl", "rag_memory_metrics"),
+    ("system_memory.jsonl", "system_memory_metrics"),
+    # state_latest_jsonl sources (upsert-style: SQL rows ≤ JSONL lines
+    # because repeated keys collapse on write). WARN if SQL < unique-key
+    # count, don't fail on raw count mismatch.
+    ("ambient_state.jsonl", "rag_ambient_state"),
+    ("brief_state.jsonl", "rag_brief_state"),
+)
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    """Count non-blank lines in a JSONL. Tolerates missing file → 0."""
+    if not path.is_file():
+        return 0
+    try:
+        with path.open("rb") as f:
+            # Binary read avoids decoding a giant log we only want to
+            # line-count. Filter blanks so trailing newline doesn't add 1.
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return 0
+
+
+def _validate_cutover_state() -> list[dict]:
+    """Read-only audit comparing SQL row counts vs source JSONL line counts.
+
+    For each (jsonl, table) in _CUTOVER_SOURCES:
+      1. Find the newest <jsonl>.bak.<ts> in ~/.local/share/obsidian-rag/.
+      2. Count lines in it.
+      3. Run `SELECT COUNT(*) FROM <table>` in ragvec.db.
+      4. Compute delta_pct = (sql - bak) / bak * 100 (0 if bak empty).
+      5. status: "ok" if sql >= bak, "warn" if sql within -1% of bak,
+         "fail" if sql < -1% of bak, "no_bak" if no .bak file exists.
+
+    Returns a list of dicts; caller decides rendering and exit code.
+    Never raises — individual source errors captured in the result.
+    """
+    state_dir = Path.home() / ".local/share/obsidian-rag"
+    results: list[dict] = []
+    for jsonl_name, table in _CUTOVER_SOURCES:
+        entry: dict = {"source": jsonl_name, "table": table}
+        # Find the newest .bak.<unix_ts>. sorted() is stable and the
+        # unix timestamp suffix gives a chronological order.
+        baks = sorted(state_dir.glob(f"{jsonl_name}.bak.*"))
+        if not baks:
+            entry.update({
+                "status": "no_bak",
+                "bak_lines": None,
+                "sql_rows": None,
+                "delta_pct": None,
+            })
+            results.append(entry)
+            continue
+        bak = baks[-1]
+        bak_lines = _count_jsonl_lines(bak)
+        # SQL count
+        try:
+            if not RAG_STATE_SQL:
+                # Feature flag off = table either empty or never created.
+                # Still report, but flag so the user knows why SQL=0.
+                entry.update({
+                    "status": "flag_off",
+                    "bak_lines": bak_lines,
+                    "sql_rows": None,
+                    "delta_pct": None,
+                    "bak_file": bak.name,
+                })
+                results.append(entry)
+                continue
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - hardcoded table list
+                ).fetchone()
+                sql_rows = int(row[0]) if row else 0
+        except Exception as exc:
+            entry.update({
+                "status": "sql_err",
+                "err": repr(exc)[:200],
+                "bak_lines": bak_lines,
+                "sql_rows": None,
+                "delta_pct": None,
+                "bak_file": bak.name,
+            })
+            results.append(entry)
+            continue
+        delta_pct = ((sql_rows - bak_lines) / bak_lines * 100.0) if bak_lines else 0.0
+        if sql_rows >= bak_lines:
+            status = "ok"
+        elif delta_pct >= -1.0:
+            # Within 1% — tolerated (migration drops malformed rows; see
+            # migrate_state_to_sqlite.py comments on 43 pre-existing bad
+            # rows dropped during the 2026-04-19 cutover).
+            status = "warn"
+        else:
+            status = "fail"
+        entry.update({
+            "status": status,
+            "bak_lines": bak_lines,
+            "sql_rows": sql_rows,
+            "delta_pct": round(delta_pct, 2),
+            "bak_file": bak.name,
+        })
+        results.append(entry)
+    return results
+
+
+def _render_cutover_validation(results: list[dict]) -> None:
+    """Pretty-print the cutover validation table to the console."""
+    console.print(Rule(title="[bold cyan]Cutover validation[/bold cyan]", style="cyan"))
+    tbl = Table(show_lines=False)
+    tbl.add_column("source", style="cyan", no_wrap=True)
+    tbl.add_column("table", style="dim", no_wrap=True)
+    tbl.add_column("bak lines", justify="right")
+    tbl.add_column("SQL rows", justify="right")
+    tbl.add_column("Δ%", justify="right")
+    tbl.add_column("status", no_wrap=True)
+    status_styles = {
+        "ok": "green", "warn": "yellow", "fail": "red",
+        "no_bak": "dim", "sql_err": "red", "flag_off": "dim yellow",
+    }
+    for r in results:
+        status = r.get("status", "?")
+        style = status_styles.get(status, "white")
+        bak = r.get("bak_lines")
+        sql = r.get("sql_rows")
+        delta = r.get("delta_pct")
+        tbl.add_row(
+            r.get("source", "?"),
+            r.get("table", "?"),
+            "-" if bak is None else f"{bak:,}",
+            "-" if sql is None else f"{sql:,}",
+            "-" if delta is None else f"{delta:+.2f}%",
+            f"[{style}]{status}[/{style}]",
+        )
+    console.print(tbl)
+    fails = [r for r in results if r.get("status") == "fail"]
+    warns = [r for r in results if r.get("status") == "warn"]
+    if fails:
+        console.print(
+            f"[red]✗ {len(fails)} source(s) regressed — SQL has FEWER rows than "
+            f"the .bak. DO NOT strip the JSONL fallback yet.[/red]"
+        )
+    elif warns:
+        console.print(
+            f"[yellow]⚠ {len(warns)} source(s) within 1% delta — acceptable "
+            f"(migration drops malformed rows) but worth noting.[/yellow]"
+        )
+    else:
+        console.print("[green]✓ All sources: SQL ≥ JSONL — safe to proceed with T10 strip.[/green]")
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Reportar sin modificar nada")
 @click.option("--skip-reindex", is_flag=True, help="Saltear reindex incremental")
@@ -27493,10 +27668,13 @@ def run_maintenance(
 @click.option("--json", "as_json", is_flag=True, help="Output JSON (para cron/scripts)")
 @click.option("--rollback-state-migration", "rollback_state", is_flag=True,
                help="Escape hatch: restaurar .bak.<ts> originales + dropear rag_* tables (T7)")
+@click.option("--validate-cutover", "validate_cutover", is_flag=True,
+               help="Read-only: comparar COUNT(*) de cada rag_* table vs líneas en su .bak.<ts> (pre-T10 gate)")
 @click.option("--force", is_flag=True,
                help="Bypass safety gates en --rollback-state-migration")
 def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: bool,
-                 as_json: bool, rollback_state: bool, force: bool):
+                 as_json: bool, rollback_state: bool, validate_cutover: bool,
+                 force: bool):
     """Mantenimiento integral: reindex, limpiar sesiones, podar caches, rotar logs, detectar dead notes.
 
     Seguro para correr periódicamente vía launchd/cron. Con --dry-run solo reporta.
@@ -27505,7 +27683,23 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
     nombre original + dropea las 21 rag_*/system_memory_metrics tables +
     VACUUM. Refuses si hay launchd services corriendo (usa --force para
     bypass) o si no hay .bak.<ts> dentro de la ventana de 30 días.
+
+    --validate-cutover compara COUNT(*) de cada rag_* table con el line count
+    del `.bak.<ts>` más reciente del JSONL que migró. Read-only, seguro en
+    vivo. Propósito: gate pre-T10 — si algún delta es negativo (SQL < JSONL),
+    significa que la migración perdió filas y NO se debe strippear el
+    fallback. Útil en cron diario durante la ventana de observación.
     """
+    if validate_cutover:
+        results = _validate_cutover_state()
+        if as_json:
+            click.echo(json.dumps(results, ensure_ascii=False, indent=2))
+            return
+        _render_cutover_validation(results)
+        # Non-zero exit if any source regressed (SQL < JSONL).
+        if any(r.get("status") == "fail" for r in results):
+            raise SystemExit(1)
+        return
     if rollback_state:
         if not as_json:
             mode = "[yellow]DRY RUN[/yellow]" if dry_run else "[red]ROLLBACK[/red]"

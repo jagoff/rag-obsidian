@@ -745,6 +745,8 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
             options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
                      "temperature": 0, "seed": 42},
             stream=False,
+            think=False,   # thinking-capable models would otherwise emit
+                           # <think> blocks as "tokens" with empty content
             keep_alive=-1,
         )
         return True
@@ -2713,6 +2715,7 @@ def _ensure_chat_model_prewarmer() -> None:
                     options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
                              "temperature": 0, "seed": 42},
                     stream=False,
+                    think=False,   # match the probe + main chat path
                     keep_alive=-1,
                 )
                 print(f"[chat-prewarm] {model} pinned", flush=True)
@@ -3607,6 +3610,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     tools=CHAT_TOOLS,
                     options=CHAT_TOOL_OPTIONS,
                     stream=False,
+                    think=False,   # see _ollama_chat_probe for rationale
                     keep_alive=OLLAMA_KEEP_ALIVE,
                 )
                 _tmsg = _tr.message
@@ -3736,6 +3740,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 messages=final_messages,
                 options=_WEB_CHAT_OPTIONS,
                 stream=True,
+                think=False,   # the user-facing stream never includes a
+                               # <think> preamble. Thinking-capable models
+                               # (qwen3+, deepseek-r1, qwq) otherwise emit
+                               # tokens with empty content.delta and the
+                               # UI sees 0-token responses (measured on
+                               # qwen3.6 2026-04-20).
                 keep_alive=OLLAMA_KEEP_ALIVE,
             ):
                 delta = chunk.message.content or ""

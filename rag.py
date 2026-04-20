@@ -7138,6 +7138,102 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (norm + 1e-8)
 
 
+# ── Topic-shift detection ─────────────────────────────────────────────────
+# Protege a la conversación de contaminación cross-tópico cuando el usuario
+# cambia de tema abruptamente sin cerrar el hilo anterior. Reportado 2026-04-20:
+# session `web:b03ec059db32` → turno T-1 "cual es mi password de avature?" →
+# turno T "busca informacion sobre mi mama" produjo respuesta mezclada
+# ("tu mamá Monica Ferrari... no hay información sobre su contraseña de Avature"),
+# porque los 6 últimos mensajes de history incluían el hilo de Avature y el
+# chat LLM arrastró la inercia temática.
+#
+# Gate combinado:
+#   1. Anafóricos explícitos ("eso", "ella", "y eso?", "más sobre X") → NO shift
+#      (el follow-up necesita la history para resolver el antecedente).
+#   2. person_fired → SHIFT (nombrar a alguien de 99-Mentions re-frame el turno;
+#      el dossier inyectado por build_person_context es autoritativo).
+#   3. cosine(current, last_user_q) < TOPIC_SHIFT_COSINE → SHIFT.
+#      Umbral 0.40 empírico: en este vault con bge-m3, shifts reales caen en
+#      0.29-0.43, paráfrasis mismo-tema en 0.58+. Bypasseado para queries
+#      <4 tokens (anafóricos que ya capturó (1)).
+
+# Regex local — el gate vive en rag.py (CLI + web ambos lo usan) así que
+# duplicamos el patrón en vez de importar de web/server.py (que a su vez
+# importa rag). Mantener sincronizado con _FOLLOWUP_CUES en web/server.py si
+# cambia.
+_TOPIC_SHIFT_FOLLOWUP_RE = re.compile(
+    r"\b(eso|esa|ese|esto|esta|este|aquello|ella|[eé]l\b(?!\s+[A-ZÁÉÍÓÚ])|"
+    r"ah[ií]|all[íáa]|it\b|this\b|that\b|he\b|she\b|"
+    r"y\s+(de|sobre|con|para|en|c[oó]mo|qu[eé])|"
+    r"c[oó]mo\s+(lo|la|los|las)\s+\w+|"  # "como lo desactivo", "como la uso"
+    r"profundiz[aá]|ampl[ií]a|segu[ií]|contin[uú]a|"
+    r"m[aá]s\s+(sobre|de|al\s+respecto))\b",
+    re.IGNORECASE,
+)
+
+TOPIC_SHIFT_COSINE = 0.40
+
+
+def detect_topic_shift(
+    current_q: str,
+    history: list[dict],
+    *,
+    person_fired: bool,
+) -> tuple[bool, str]:
+    """¿El turno actual cambia de tema vs el anterior? Devuelve (shift, razón).
+
+    - `shift=True` → el caller debería descartar history para este turno.
+    - `razón` es un string corto para logging/observabilidad.
+
+    No muta nada. Pure function, testeable sin vault/session.
+    """
+    if not history:
+        return False, "no-history"
+    # (1) Anafóricos: pronombres, demostrativos, "y X?", "como lo Y". Short
+    # follow-ups (≤2 tokens) también entran acá por construcción — una
+    # query de 1-2 palabras es casi siempre elipsis del turno anterior
+    # ("y?", "más?", "ella?"). 3+ tokens ya puede ser standalone (ej.
+    # "notas de coaching") y cae al cosine gate.
+    if len(current_q.split()) <= 2:
+        return False, "short"
+    if _TOPIC_SHIFT_FOLLOWUP_RE.search(current_q):
+        return False, "anaphoric"
+    # (2) Person-mention gate: build_person_context ya inyectó el dossier de
+    # la persona; history de otros temas es ruido puro. Pero si el turno
+    # anterior menciona a LA MISMA persona, es follow-up mismo-tema
+    # (ej.: "contame sobre mi mama" → "y cuándo cumple años?") → keep.
+    last_user_q = next(
+        (m.get("content") for m in reversed(history) if m.get("role") == "user"),
+        None,
+    )
+    if person_fired:
+        if last_user_q:
+            try:
+                current_people = set(_match_mentions_in_query(current_q))
+                last_people = set(_match_mentions_in_query(last_user_q))
+            except Exception:
+                current_people = last_people = set()
+            if current_people and current_people == last_people:
+                return False, "same-person"
+        return True, "person"
+    # (3) Cosine gate contra el último user turn.
+    if not last_user_q:
+        return False, "no-last-user"
+    try:
+        vecs = embed([current_q, last_user_q])
+        if len(vecs) < 2:
+            return False, "embed-empty"
+        sim = cosine_sim(vecs[0], vecs[1])
+    except Exception as exc:
+        # Silent fallback — embed puede fallar si ollama está caído; en ese
+        # caso preferimos mantener history (fail-safe para follow-ups) antes
+        # que dropearla agresivamente.
+        return False, f"embed-failed:{type(exc).__name__}"
+    if sim < TOPIC_SHIFT_COSINE:
+        return True, f"cosine={sim:.3f}"
+    return False, f"cosine={sim:.3f}"
+
+
 _reranker = None
 _reranker_last_use = 0.0  # monotonic timestamp of most-recent predict()
 

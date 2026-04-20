@@ -555,8 +555,8 @@ def log_query_event(event: dict) -> None:
     try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((LOG_PATH, line))
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("queries", {"err": repr(exc), "event": event})
 
 
 def log_behavior_event(event: dict) -> None:
@@ -593,8 +593,8 @@ def log_behavior_event(event: dict) -> None:
     try:
         line = json.dumps(event, ensure_ascii=False) + "\n"
         _LOG_QUEUE.put_nowait((BEHAVIOR_LOG_PATH, line))
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("behavior", {"err": repr(exc), "event": event})
 
 
 def record_brief_written(
@@ -630,8 +630,8 @@ def record_brief_written(
         }
         with BRIEF_WRITTEN_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_dead_letter("brief_written", {"err": repr(exc), "record": rec if 'rec' in locals() else None})
 
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]")
@@ -3061,6 +3061,7 @@ def _sql_max_ts(conn, table: str) -> str | None:
 # singleton was warmed still gets a valid schema.
 
 _SQL_STATE_ERROR_LOG = Path.home() / ".local/share/obsidian-rag/sql_state_errors.jsonl"
+_STATE_DEAD_LETTER_LOG = Path.home() / ".local/share/obsidian-rag/state_dead_letter.jsonl"
 
 
 def _log_sql_state_error(event_type: str, **fields) -> None:
@@ -3080,6 +3081,28 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
         pass
 
 
+def _write_dead_letter(sink: str, payload: dict | str) -> None:
+    """Last-resort synchronous sink when BOTH SQL and JSONL writes fail.
+
+    Opens/closes the file per-call (no queue, no thread) so it still works
+    if the log writer thread died, the main _LOG_QUEUE is full, or the
+    target log dir is read-only. Best-effort: swallows its own errors —
+    there is no lower tier.
+    """
+    try:
+        _STATE_DEAD_LETTER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "sink": sink,
+            "payload": payload if isinstance(payload, str) else
+                       json.dumps(payload, ensure_ascii=False, default=str),
+        }
+        with _STATE_DEAD_LETTER_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def _ragvec_state_conn():
     """Open a short-lived sqlite3 connection to ragvec.db with WAL + busy
@@ -3088,14 +3111,30 @@ def _ragvec_state_conn():
     Intentionally does NOT load the sqlite-vec extension — telemetry writes
     only touch rag_*/system_memory_metrics tables. Keeps the writer path
     independent of the vec singleton and safe to call from any thread.
+
+    Thread-safety: check_same_thread=False lets the caller hand this
+    context manager across threads if they want, but the idiomatic usage
+    is one-conn-per-thread. The close in `finally` guarantees the fd is
+    released before the yield frame unwinds — no leaked handles on
+    exception or GC pressure.
     """
     import sqlite3 as _sqlite3
     DB_PATH.mkdir(parents=True, exist_ok=True)
     conn = _sqlite3.connect(str(DB_PATH / "ragvec.db"),
-                            isolation_level=None, check_same_thread=False)
+                            isolation_level=None, check_same_thread=False,
+                            timeout=30.0)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
+        # busy_timeout FIRST — subsequent PRAGMAs then wait on writer lock
+        # instead of returning SQLITE_BUSY immediately. Matches the pattern
+        # in web/conversation_writer._open_sql_conn and the `timeout=` kwarg.
+        conn.execute("PRAGMA busy_timeout=30000")
+        # journal_mode flip takes a brief exclusive lock — skip when
+        # already WAL (idempotent check). Critical under multi-process
+        # stampede at cold cache.
+        cur = conn.execute("PRAGMA journal_mode")
+        row = cur.fetchone()
+        if (row[0] if row else "").lower() != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"

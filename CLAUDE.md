@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~21k lines) + `mcp_server.py` (thin wrapper) + `tests/` (883 tests, 44 files). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~27k lines) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI server, 5.4k lines + ~5.9k JS/HTML/CSS) + `tests/` (1,173 tests, 66 files). Resist package-split until real friction shows up.
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -80,11 +80,24 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 ### Env vars
 
 - `OBSIDIAN_RAG_VAULT` — override default vault path. Collections are namespaced per resolved path (sha256[:8]).
+- `OLLAMA_KEEP_ALIVE` — passed to every ollama chat/embed call. Code default `"20m"` (`rag.py:1114`); every launchd plist overrides to `-1` so models stay VRAM-resident for the daemon lifetime. Accepts int seconds or duration string.
+- `RAG_STATE_SQL=1` — enables the SQL telemetry store (20 `rag_*` tables in `ragvec/ragvec.db`). Set on every launchd plist since the 2026-04-19 cutover. If unset → code falls back to legacy JSONL writes/reads. Will become default-on + JSONL stripped at T10 (~2026-04-26).
 - `RAG_TRACK_OPENS=1` — switches OSC 8 link scheme from `file://` to `x-rag-open://` so CLI clicks route through `rag open` (ranker-vivo signal capture). Absent = no behavior change.
 - `RAG_EXPLORE=1` — enable ε-exploration in `retrieve()` (10% chance to swap a top-3 result with a rank-4..7 candidate). Set on `morning`/`today` plists to generate counterfactuals. MUST be unset during `rag eval` — the command actively `os.environ.pop`s it and asserts, as a belt-and-suspenders guard.
 - `RAG_RERANKER_IDLE_TTL` — seconds the cross-encoder stays resident before idle-unload (default 900).
 - `RAG_RERANKER_NEVER_UNLOAD` — set to `1` in the web launchd plist to pin the reranker in MPS VRAM permanently; sweeper loop still runs but skips `maybe_unload_reranker()`. Eliminates the 9s cold-reload hit after idle eviction. Cost: ~2-3 GB unified memory pinned. Safe on 36 GB with command-r + qwen3:8b resident.
 - `RAG_LOCAL_EMBED` — set to `1` in the web launchd plist to use in-process `SentenceTransformer("BAAI/bge-m3")` for query embedding instead of ollama HTTP (~10-30ms vs ~140ms). Requires BAAI/bge-m3 cached in `~/.cache/huggingface/hub/` — download once with `python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"` before enabling. Verify cosine >0.999 vs ollama embeddings of same text before enabling in production. Do NOT set for indexing/watch/ingest processes — bulk chunk embedding stays on ollama. Uses CLS pooling (same as ollama gguf).
+- `OBSIDIAN_RAG_NO_APPLE=1` — disables Apple integrations (Calendar, Reminders, Mail, Screen Time) entirely. Useful on non-macOS hosts or when Full Disk Access is not granted.
+- `OBSIDIAN_RAG_MOZE_FOLDER` — override MOZE ETL target folder inside the vault (default `02-Areas/Personal/Finanzas/MOZE`).
+- `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated vault-relative folders `rag watch` must ignore. Default `"03-Resources/WhatsApp"` (WA dumps re-fire the handler dozens of times per minute via periodic ETL; they're picked up by manual/periodic `rag index` instead).
+
+Dev/debug toggles (not set in production):
+
+- `RAG_DEBUG=1` — verbose stderr in the local embed path (`rag.py:6593`).
+- `RAG_RETRIEVE_TIMING=1` — per-stage timing breakdown printed to stderr at the end of `retrieve()`.
+- `RAG_NO_WARMUP=1` — skip the background reranker + bge-m3 + corpus warmup (shaves startup for lightweight commands like `rag stats`, `rag session list`; first query pays the cold-load cost).
+- `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY=1` — short-circuit `get_context_summary()` to empty string. Used by tests + emergency fallback if qwen2.5:3b is unavailable; leaves embeddings without contextual prefix.
+- `OBSIDIAN_RAG_SKIP_SYNTHETIC_Q=1` — same, for `get_synthetic_questions()`.
 
 ## Architecture — invariants
 
@@ -94,9 +107,9 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 query → classify_intent → infer_filters [auto]
       → expand_queries (3 paraphrases, ONE qwen2.5:3b call)
       → embed(variants) batched bge-m3
-      → per variant: ChromaDB sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise)
+      → per variant: sqlite-vec sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise)
       → RRF merge → dedup → expand to parent section (O(1) metadata)
-      → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp16)
+      → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp32)
       → graph expansion (1-hop wikilink neighbors, always on)
       → [auto-deep: if confidence < 0.10, iterative sub-query retrieval]
       → top-k → LLM (streamed)
@@ -127,9 +140,9 @@ Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. E
 | Chat | `resolve_chat_model()`: qwen2.5:7b > qwen3:30b-a3b > command-r > qwen2.5:14b > phi4 | qwen2.5:7b default tras bench 2026-04-18 (total P50 5.9s vs 37s de command-r); fallbacks high-quality disponibles. |
 | Helper | `qwen2.5:3b` | paraphrase/HyDE/reformulation |
 | Embed | `bge-m3` | 1024-dim multilingual |
-| Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float16` forced — do NOT remove (CPU fallback = 3× slower) |
+| Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float32` forced — do NOT switch to fp16 on MPS (score collapse to ~0.001, verified 2026-04-13); CPU fallback = 3× slower. |
 
-All ollama calls: `keep_alive=-1` (VRAM resident). `CHAT_OPTIONS`: `num_ctx=4096, num_predict=768` — don't bump unless prompts grow.
+All ollama calls use `keep_alive=OLLAMA_KEEP_ALIVE` — default `"20m"` in code (`rag.py:1114`), overridden to `-1` (forever) in every launchd plist so deployed models stay VRAM-resident. `CHAT_OPTIONS`: `num_ctx=4096, num_predict=768` — don't bump unless prompts grow.
 
 **Pattern**: helper for cheap rewrites, chat model for judgment. Contradiction detector MUST use chat model (qwen2.5:3b proved non-deterministic + malformed JSON on this task).
 
@@ -182,7 +195,7 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 **Sessions**: JSON per session in `sessions/<id>.json`. TTL 30d, cap 50 turns, history window 6. IDs validated `^[A-Za-z0-9_.:-]{1,64}$`; invalid → mint fresh. WhatsApp passes `wa:<jid>`.
 
-**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread that appends the turn to `00-Inbox/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). Sidecar index at `~/.local/share/obsidian-rag/conversations_index.json` maps `session_id → relative_path` so the folder isn't rescanned on every turn. Atomic write via `os.replace` + `fcntl.flock`. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Indexed automatically by `com.fer.obsidian-rag-watch` (no exclusion rule matches), so conversations become retrievable within one debounce cycle (~3s). Do NOT edit these notes manually — system artifacts. Curate by moving to PARA.
+**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread that appends the turn to `00-Inbox/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). Session → relative path mapping lives in the `rag_conversations_index` SQL table (post-cutover; legacy sidecar `conversations_index.json` remains as read fallback until T10 strip). Atomic write via `os.replace` + `fcntl.flock`. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Indexed automatically by `com.fer.obsidian-rag-watch` (no exclusion rule matches), so conversations become retrievable within one debounce cycle (~3s). Do NOT edit these notes manually — system artifacts. Curate by moving to PARA.
 
 **Ambient agent**: hook in `_index_single_file` on saves within `allowed_folders` (default `["00-Inbox"]`). Config: `~/.local/share/obsidian-rag/ambient.json` (`{jid, enabled, allowed_folders?}`). Skip rules: outside allowed_folders, no config, frontmatter `ambient: skip`, `type: morning-brief|weekly-digest|prep`, dedup 5min. Sends via `whatsapp-bridge` POST (`http://localhost:8080/api/send`). Bridge down = message lost but analysis persists in `ambient.jsonl`.
 

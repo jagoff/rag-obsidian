@@ -14873,19 +14873,28 @@ def _log_tune_event(event: dict) -> None:
 
 
 def _backup_ranker_config() -> Path | None:
-    """Copy current ranker.json to a timestamped backup, keeping only 3 newest.
+    """Copy current ranker.json to a pid+timestamped backup, keeping only 3 newest.
 
     Returns the backup Path on success, None if ranker.json doesn't exist yet.
     Prunes backups older than the 3 most recent after writing.
+
+    Filename format: `ranker.{unix_ts}.{pid}.json`. The pid suffix avoids
+    collision when two `rag tune` processes run in the same wall-clock
+    second (manual + cron) — without it the second copy silently overwrote
+    the first. Pruning still uses mtime so the retention window is correct.
+
+    Legacy `ranker.{ts}.json` files (pre-pid) are still matched by the
+    glob + sort + prune flow, so the 7-day backfill is seamless.
     """
     if not RANKER_CONFIG_PATH.is_file():
         return None
     ts = int(time.time())
-    backup = RANKER_CONFIG_PATH.parent / f"ranker.{ts}.json"
+    backup = RANKER_CONFIG_PATH.parent / f"ranker.{ts}.{os.getpid()}.json"
     try:
         import shutil
         shutil.copy2(RANKER_CONFIG_PATH, backup)
-        # Prune: keep only 3 most recent backups
+        # Prune: keep only 3 most recent backups. glob matches both
+        # `ranker.{ts}.json` (legacy) and `ranker.{ts}.{pid}.json` (new).
         backups = sorted(
             RANKER_CONFIG_PATH.parent.glob("ranker.*.json"),
             key=lambda p: p.stat().st_mtime,

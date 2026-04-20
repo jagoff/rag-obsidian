@@ -136,8 +136,10 @@ def test_citation_repair_replaces_full_on_success(monkeypatch):
     # First call is streaming (generation); second is non-streaming (repair).
     _call_seq = [fake_streaming, fake_nonstreaming]
     _call_idx = {"i": 0}
+    _call_modes: list[bool] = []  # records stream kwarg per call
 
     def fake_chat(model, messages, options, stream, keep_alive):
+        _call_modes.append(stream)
         fn = _call_seq[_call_idx["i"]]
         _call_idx["i"] += 1
         return fn(model, messages, options, stream, keep_alive)
@@ -165,6 +167,13 @@ def test_citation_repair_replaces_full_on_success(monkeypatch):
     assert INITIAL_ANSWER not in result.output
     assert logged.get("citation_repaired") is True
     assert logged.get("bad_citations") == ["99-nonexistent.md"]
+    # Repair call MUST be non-streaming — citation-repair relies on the
+    # full answer coming back in one shot so we can diff/replace. Regression
+    # would silently break the repair path (generator branch returns raw
+    # chunks instead of a single response).
+    assert len(_call_modes) == 2, f"expected 2 chat calls, got {len(_call_modes)}"
+    assert _call_modes[0] is True, "generation call must be streaming"
+    assert _call_modes[1] is False, "repair call must be non-streaming"
 
 
 def test_citation_repair_keeps_original_when_repair_also_bad(monkeypatch):

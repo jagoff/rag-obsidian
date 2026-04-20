@@ -1476,3 +1476,54 @@ html, body {
 .proposal-status.ok { color: var(--green); }
 .proposal-status.err { color: var(--red); }
 .proposal-status.cancelled { color: var(--text-faint); font-style: italic; }
+
+/* ── Toast notifications ────────────────────────────────────────────────
+ * Fixed top-right stack. Used to confirm successful Calendar / Reminders
+ * creation prominently (more visible than the inline chip on the card,
+ * which scrolls out of view once the chat continues).
+ */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg-card);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+  min-width: 200px;
+  max-width: 360px;
+  opacity: 0;
+  transform: translateX(12px);
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
+.toast-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+.toast-ok {
+  border-left: 3px solid var(--green);
+}
+.toast-err {
+  border-left: 3px solid var(--red);
+}
+.toast-info {
+  border-left: 3px solid var(--cyan);
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    transition: opacity 0.01ms;
+    transform: none;
+  }
+}

@@ -735,6 +735,33 @@ function appendWebSearch(parent, query) {
 // corresponding create endpoint; ✗ silently dismisses. Nothing lands in
 // Calendar/Reminders until the user confirms.
 
+// Toast utility — prominent system-level confirmation when reminders/
+// events are created. Not just the inline chip next to the button: the
+// chip is easy to miss if the chat has scrolled. Toast lives top-right,
+// auto-dismisses after 4s, stacks if multiple fire.
+function showToast(message, kind = "ok") {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = el("div", "toast-container");
+    container.id = "toast-container";
+    document.body.appendChild(container);
+  }
+  const toast = el("div", `toast toast-${kind}`, message);
+  container.appendChild(toast);
+  // Animate in on next frame so the browser picks up the transition.
+  requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    toast.addEventListener(
+      "transitionend",
+      () => toast.remove(),
+      { once: true },
+    );
+    // Safety net in case transitionend never fires (e.g. `prefers-reduced-motion`).
+    setTimeout(() => toast.remove(), 500);
+  }, 4000);
+}
+
 function formatIsoDatetime(iso) {
   if (!iso) return "";
   try {
@@ -881,12 +908,25 @@ function appendProposal(parent, payload) {
       status.textContent = kind === "event" ? "  ✓ evento creado" : "  ✓ recordatorio creado";
       status.classList.add("ok");
       card.classList.add("created");
+      // Prominent confirmation. Visible regardless of chat scroll state.
+      showToast(
+        kind === "event"
+          ? "✓ Agregado a tu Calendario"
+          : "✓ Agregado a tus Recordatorios",
+        "ok",
+      );
     } catch (err) {
       delete card.dataset.resolved;
       createBtn.disabled = false;
       cancelBtn.disabled = false;
       status.textContent = `  error: ${err.message}`;
       status.classList.add("err");
+      showToast(
+        kind === "event"
+          ? `✗ No se pudo agregar al Calendario: ${err.message}`
+          : `✗ No se pudo agregar a Recordatorios: ${err.message}`,
+        "err",
+      );
     }
   });
 

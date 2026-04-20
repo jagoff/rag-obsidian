@@ -13237,6 +13237,7 @@ def query(
             "cmd": "query", "q": question, "filters": result.get("filters_applied"),
             "variants": result.get("query_variants"), "paths": [],
             "top_score": None, "t_retrieve": round(t_retrieve, 2), "answered": False,
+            "timing": _round_timing_ms(result.get("timing")),
         })
         if plain:
             click.echo("Sin resultados.")
@@ -13304,6 +13305,7 @@ def query(
             "scores": [round(float(s), 2) for s in result["scores"]],
             "top_score": round(float(result["confidence"]), 2),
             "t_retrieve": round(t_retrieve, 2), "t_gen": 0.0,
+            "timing": _round_timing_ms(result.get("timing")),
             "answered": False, "gated_low_confidence": True,
         })
         if sess is not None:
@@ -14378,6 +14380,7 @@ def chat(
             "citation_repaired": _chat_citation_repaired,
             "critique_fired": critique_active,
             "critique_changed": _chat_critique_changed,
+            "timing": _round_timing_ms(result.get("timing")),
         })
 
         last_turn_id = turn_id
@@ -25810,6 +25813,7 @@ def serve(host: str, port: int):
             "scores": [round(float(s), 2) for s in result["scores"]],
             "top_score": round(float(result["confidence"]), 2),
             "t_retrieve": round(t_retrieve, 2), "t_gen": round(t_gen, 2),
+            "timing": _round_timing_ms(result.get("timing")),
             "answered": True,
         })
 

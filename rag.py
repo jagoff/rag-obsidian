@@ -19624,8 +19624,15 @@ _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
     (r"\ba\s+la\s+tardecita\b", "17:00"),
     (r"\ba\s+la\s+nochecita\b", "20:00"),
     # "tipo N" / "a eso de las N" → "N:00". "Tipo" es idiom rioplatense
-    # de aproximación. Corremos ESTO al final para que "tipo 10" después
-    # de rewrites de weekdays se interprete bien.
+    # de aproximación. La variante "a eso de las N de la mañana/tarde/noche"
+    # necesita su propia regla (se aplica ANTES de la versión bare para
+    # que la bare no le coma el número).
+    (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+ma[ñn]ana\b",
+     lambda m: f"{m.group(1)}:{m.group(2) or '00'} am"),
+    (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+tarde\b",
+     lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
+    (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+noche\b",
+     lambda m: f"{int(m.group(1)) + (0 if int(m.group(1)) >= 12 else 12)}:{m.group(2) or '00'}"),
     (r"\btipo\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),
     (r"\btipo\s+(\d{1,2})\b(?!\s*:)", r"\1:00"),
     (r"\ba\s+eso\s+de\s+las?\s+(\d{1,2}):(\d{2})\b", r"\1:\2"),
@@ -19710,16 +19717,16 @@ def _parse_natural_datetime(
     if isinstance(dt, datetime):
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
-        # Anchor-echo sanity: dateparser sometimes returns the anchor time
-        # back when it only matched the date portion of the input (e.g.
-        # "a las 10 de la mañana" with anchor=15:00 → returns 15:00, not
-        # 10:00). If the input looks time-bearing but the result exactly
-        # matches the anchor's time (down to the minute), distrust and
-        # fall through to LLM.
+        # Anchor-echo sanity: dateparser sometimes echoes the anchor
+        # ENTIRELY (same date AND time) when it only matched a stray token
+        # and treated the rest as context ("a las 10 de la mañana" →
+        # anchor). If the input looks time-bearing and dt == anchor
+        # minute-wise, distrust and fall through to LLM. We intentionally
+        # NO LONGER check hour-only equality — that produced false
+        # positives on valid parses like "friday 15:00" when anchor also
+        # happened to be at 15:00.
         _has_time_marker = bool(_TIME_MARKER_RE.search(s_norm))
-        if _has_time_marker and (
-            dt.hour == anchor.hour and dt.minute == anchor.minute
-        ):
+        if _has_time_marker and dt.replace(second=0, microsecond=0) == anchor.replace(second=0, microsecond=0):
             dt = None
         else:
             return dt

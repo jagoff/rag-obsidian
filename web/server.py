@@ -147,6 +147,44 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
 
 
+# Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
+# command-r leak CJK / Cyrillic / Arabic tokens under context pressure; the
+# chat path strips them from every streamed delta so the client never sees
+# them regardless of what the LLM emits. Whitelists ASCII, Latin (including
+# Spanish diacritics and the Latin-Extended blocks), box-drawing, general
+# punctuation used in markdown, and everything ≥ U+1F000 (emoji + symbols).
+# Kills CJK ideographs + kana + hangul, Cyrillic, Hebrew, Arabic, Syriac,
+# and the fullwidth/halfwidth CJK punctuation block.
+_FOREIGN_SCRIPT_RE = re.compile(
+    "["
+    "\u0400-\u052f"     # Cyrillic + Cyrillic Supplement
+    "\u0530-\u058f"     # Armenian
+    "\u0590-\u05ff"     # Hebrew
+    "\u0600-\u06ff"     # Arabic
+    "\u0700-\u074f"     # Syriac
+    "\u0750-\u077f"     # Arabic Supplement
+    "\u0780-\u07bf"     # Thaana
+    "\u3000-\u303f"     # CJK Symbols and Punctuation (includes 。、)
+    "\u3040-\u309f"     # Hiragana
+    "\u30a0-\u30ff"     # Katakana
+    "\u3400-\u4dbf"     # CJK Unified Ideographs Extension A
+    "\u4e00-\u9fff"     # CJK Unified Ideographs
+    "\uac00-\ud7af"     # Hangul Syllables
+    "\uff00-\uffef"     # Halfwidth and Fullwidth Forms
+    "]"
+)
+
+
+def _strip_foreign_scripts(text: str) -> str:
+    """Remove characters from non-allowed scripts (CJK, Cyrillic, Hebrew,
+    Arabic, …). Preserves Spanish diacritics, ASCII, markdown punctuation,
+    and emoji (≥U+1F000). Safe to call per-token on a streaming delta —
+    characters are dropped individually (no stateful lookahead)."""
+    if not text:
+        return text
+    return _FOREIGN_SCRIPT_RE.sub("", text)
+
+
 _CONV_INDEX_PATH = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
 
 

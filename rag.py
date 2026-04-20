@@ -16431,13 +16431,96 @@ def _path_to_title(corpus: dict, path: str) -> str | None:
     return rev.get(path)
 
 
+def _render_silent_errors_log(n: int, summary: bool) -> None:
+    """Pretty-print the tail of silent_errors.jsonl.
+
+    Lines are schema {ts, where, exc_type, exc}. Malformed lines are
+    dropped silently — this is a diagnostic surface, not a parser.
+
+    Two modes:
+      - list (default): last N entries, newest at the bottom.
+      - summary (--summary flag): aggregate by (where × exc_type), sort
+        by count desc. Surfaces which subsystems fail most often without
+        forcing the user to eyeball dozens of near-identical lines.
+    """
+    if not SILENT_ERRORS_LOG_PATH.is_file():
+        console.print(
+            f"[dim]No hay silent_errors.jsonl aún ({SILENT_ERRORS_LOG_PATH}).[/dim]\n"
+            "[dim]Se escribe sólo cuando un `except Exception: pass` migrado falla; "
+            "vacío = bueno.[/dim]"
+        )
+        return
+    entries: list[dict] = []
+    for line in SILENT_ERRORS_LOG_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            continue
+    if not entries:
+        console.print("[dim]silent_errors.jsonl está vacío — nada que reportar.[/dim]")
+        return
+
+    if summary:
+        from collections import Counter
+        counter: Counter[tuple[str, str]] = Counter()
+        for e in entries:
+            counter[(e.get("where", "?"), e.get("exc_type", "?"))] += 1
+        tbl = Table(
+            title=f"Silent errors · {len(entries)} total · top (where × exc_type)",
+            show_lines=False,
+        )
+        tbl.add_column("count", justify="right", style="yellow")
+        tbl.add_column("where", style="cyan", overflow="fold", max_width=50)
+        tbl.add_column("exc_type", style="red")
+        for (where, exc_type), cnt in counter.most_common(n):
+            tbl.add_row(str(cnt), where, exc_type)
+        console.print(tbl)
+        return
+
+    tail = entries[-n:]
+    tbl = Table(
+        title=f"Últimos {len(tail)} silent errors ({SILENT_ERRORS_LOG_PATH.name})",
+        show_lines=False,
+    )
+    tbl.add_column("ts", style="dim", no_wrap=True)
+    tbl.add_column("where", style="cyan", overflow="fold", max_width=32)
+    tbl.add_column("exc_type", style="red", no_wrap=True)
+    tbl.add_column("exc", style="yellow", overflow="fold", max_width=60)
+    for e in tail:
+        tbl.add_row(
+            (e.get("ts") or "")[-8:],
+            e.get("where") or "?",
+            e.get("exc_type") or "?",
+            (e.get("exc") or "").replace("\n", " ")[:200],
+        )
+    console.print(tbl)
+
+
 @cli.command()
 @click.option("-n", default=20, help="Cantidad de queries a mostrar (default: 20)")
 @click.option("--low-confidence", is_flag=True, help="Solo queries con top_score < 0")
 @click.option("--feedback", "with_feedback", is_flag=True,
               help="Solo turnos con rating (👍/👎), con una columna de feedback")
-def log(n: int, low_confidence: bool, with_feedback: bool):
-    """Inspeccionar el log de queries (últimas N)."""
+@click.option("--silent-errors", "silent_errors", is_flag=True,
+              help="Listar silent_errors.jsonl (writes del _silent_log helper) en vez del queries log")
+@click.option("--summary", is_flag=True,
+              help="Con --silent-errors, agrupa por (where × exc_type) en vez de listar individualmente")
+def log(n: int, low_confidence: bool, with_feedback: bool,
+        silent_errors: bool, summary: bool):
+    """Inspeccionar el log de queries (últimas N).
+
+    Con --silent-errors, lee silent_errors.jsonl y muestra las últimas N
+    excepciones que pasaron por `_silent_log(where, exc)`. Útil para
+    detectar subsistemas que fallan calladamente (context_cache corrupto,
+    feedback_golden_embed offline, contradict JSON parse). Agregar
+    --summary agrupa por (where × exc_type) para ver patrones.
+    """
+    if silent_errors:
+        _render_silent_errors_log(n, summary)
+        return
     if not LOG_PATH.is_file():
         console.print(f"[yellow]No hay log aún en {LOG_PATH}[/yellow]")
         return

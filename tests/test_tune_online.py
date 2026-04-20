@@ -343,8 +343,6 @@ def test_eval_gate_timeout_is_bounded_tightly():
 
     Introspects _run_eval_gate's subprocess.run call and asserts the
     timeout kwarg is ≤ 5 min (our target post-audit)."""
-    import subprocess
-
     captured = {}
 
     def fake_run(cmd, **kwargs):

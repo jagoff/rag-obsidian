@@ -417,6 +417,62 @@ def _resolve_vault_path() -> Path:
 
 
 VAULT_PATH = _resolve_vault_path()
+# Root of all per-user operational state (query logs, behavior logs,
+# sessions, tuned ranker, caches, OAuth tokens). Created on import with
+# 0o700 so queries.jsonl + behavior.jsonl (PII: literal user prompts +
+# open/save events) aren't world-readable on shared machines. `.config/`
+# isn't used for state — reserved for OAuth `client_secret` JSONs that
+# the user drops in manually.
+
+
+def _ensure_state_dir_secure() -> Path:
+    """Create ~/.local/share/obsidian-rag with 0o700 permissions.
+
+    Idempotent. If the directory already exists with looser perms (e.g.
+    created pre-hardening with umask 022 → 0o755), chmod tightens it.
+    Best-effort: on filesystems that reject chmod (NFS, SMB, FUSE) we
+    swallow the error rather than crash import — the worst case is the
+    dir keeps its previous mode, which matches the old behavior.
+    """
+    root = Path.home() / ".local/share/obsidian-rag"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _write_secret_file(path: Path, content: str) -> None:
+    """Atomic + 0o600 write for OAuth tokens / refresh_tokens / API keys.
+
+    The refresh_token inside a Google OAuth cache permits indefinite
+    access to the user's Gmail + Drive, so the file must never be
+    world- or group-readable. We write to a sibling tempfile, chmod
+    BEFORE the final rename so no observer can read the file while
+    it's still 0o644 from the default umask, then os.replace into
+    place atomically.
+
+    Parent dir gets 0o700 for the same reason (matches _ensure_state_dir_secure
+    for ~/.config/obsidian-rag/, which is where _GOOGLE_TOKEN_PATH and
+    _SPOTIFY_TOKEN_PATH live — separate tree from state).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+_STATE_DIR = _ensure_state_dir_secure()
+
 DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
@@ -4808,6 +4864,31 @@ _GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/drive.readonly",
 )
 
+
+def _harden_oauth_cache_perms() -> None:
+    """One-shot chmod of OAuth cache files + their containing dir.
+
+    Files written before `_write_secret_file` existed (or by spotipy's
+    own cache path) may still carry umask 022 → 0o644. Tighten them on
+    module import so the refresh_tokens aren't world-readable on
+    multi-user systems. Best-effort — filesystem quirks swallowed.
+    """
+    cfg_dir = Path.home() / ".config/obsidian-rag"
+    if cfg_dir.is_dir():
+        try:
+            cfg_dir.chmod(0o700)
+        except OSError:
+            pass
+    for tok in (_GOOGLE_TOKEN_PATH, _SPOTIFY_TOKEN_PATH):
+        if tok.is_file():
+            try:
+                os.chmod(tok, 0o600)
+            except OSError:
+                pass
+
+
+_harden_oauth_cache_perms()
+
 _CHROME_HISTORY_PATH = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
 # Chrome epoch is 1601-01-01 UTC microseconds (Windows FILETIME).
 _CHROME_EPOCH_OFFSET_S = 11644473600
@@ -5144,8 +5225,7 @@ def _load_google_credentials(allow_interactive: bool = True):
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
             return creds
         except Exception:
             pass
@@ -5159,8 +5239,7 @@ def _load_google_credentials(allow_interactive: bool = True):
         creds = flow.run_local_server(port=0, open_browser=True)
     except Exception:
         return None
-    _GOOGLE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _GOOGLE_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+    _write_secret_file(_GOOGLE_TOKEN_PATH, creds.to_json())
     return creds
 
 
@@ -5887,6 +5966,14 @@ def _spotify_client(allow_interactive: bool = True):
             token = auth.get_access_token(as_dict=True)
         if not token:
             return None
+        # spotipy writes the cache with default umask permissions (0o644)
+        # and refreshes on every get_access_token. Tighten to 0o600 post-hoc
+        # — the refresh_token permits indefinite Spotify access.
+        try:
+            if _SPOTIFY_TOKEN_PATH.is_file():
+                os.chmod(_SPOTIFY_TOKEN_PATH, 0o600)
+        except OSError:
+            pass
         return spotipy.Spotify(auth=token["access_token"])
     except Exception:
         return None

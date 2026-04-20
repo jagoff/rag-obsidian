@@ -1471,47 +1471,63 @@ async function send(question) {
       scrollBottom();
     } else if (event === "created") {
       // Auto-create happy path: a propose_* tool created a reminder/event
-      // directly. Render a prominent toast with a Deshacer button that
-      // POSTs to the delete endpoint within the toast's 10s lifetime.
+      // directly. Toast with a context-appropriate action:
+      //   - Reminders: "Deshacer" POSTs to /api/reminders/delete (fast,
+      //     works; Reminders.app's AppleScript delete-by-id resolves
+      //     cleanly).
+      //   - Calendar events: "Ver en Calendar" opens the native deep
+      //     link `x-apple-calevent://<UID>` so the user can delete from
+      //     Calendar.app's own UI. Programmatic deletion via AppleScript
+      //     times out on calendars with >1k events (verified 2026-04-20:
+      //     `every event of _cal` takes >30s on a 1334-event calendar,
+      //     and `whose uid is X` errors immediately). EventKit/pyobjc
+      //     would solve it but the dependency weight isn't worth it.
       hadProposal = true;
       const fields = parsed.fields || {};
-      const msg = parsed.kind === "event"
+      const isEvent = parsed.kind === "event";
+      const msg = isEvent
         ? "✓ Agregado a tu Calendario" + (fields.title ? ` · ${fields.title}` : "")
         : "✓ Agregado a tus Recordatorios" + (fields.title ? ` · ${fields.title}` : "");
-      const undoId = parsed.kind === "event" ? parsed.event_uid : parsed.reminder_id;
-      const undoUrl = parsed.kind === "event" ? "/api/calendar/delete" : "/api/reminders/delete";
-      const undoBody = parsed.kind === "event"
-        ? { event_uid: undoId }
-        : { reminder_id: undoId };
-      showToast(msg, {
-        kind: "ok",
-        action: {
-          label: "Deshacer",
-          onClick: async () => {
-            try {
-              const res = await fetch(undoUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(undoBody),
-              });
-              if (!res.ok) {
-                const detail = await res.json().catch(() => ({}));
-                throw new Error(detail.detail || `HTTP ${res.status}`);
-              }
-              showToast(
-                parsed.kind === "event"
-                  ? "✓ Evento eliminado"
-                  : "✓ Recordatorio eliminado",
-                { kind: "info", ms: 3000 },
-              );
-            } catch (err) {
-              showToast(`✗ No se pudo deshacer: ${err.message}`, {
-                kind: "err", ms: 5000,
-              });
-            }
+      if (isEvent) {
+        // Deep-link to the created event. Calendar.app resolves this URL
+        // scheme and opens the inspector where the user can delete.
+        const uid = parsed.event_uid;
+        showToast(msg, {
+          kind: "ok",
+          action: {
+            label: "Ver en Calendar",
+            onClick: async () => {
+              window.location.href = `x-apple-calevent://${uid}`;
+            },
           },
-        },
-      });
+        });
+      } else {
+        const reminderId = parsed.reminder_id;
+        showToast(msg, {
+          kind: "ok",
+          action: {
+            label: "Deshacer",
+            onClick: async () => {
+              try {
+                const res = await fetch("/api/reminders/delete", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ reminder_id: reminderId }),
+                });
+                if (!res.ok) {
+                  const detail = await res.json().catch(() => ({}));
+                  throw new Error(detail.detail || `HTTP ${res.status}`);
+                }
+                showToast("✓ Recordatorio eliminado", { kind: "info", ms: 3000 });
+              } catch (err) {
+                showToast(`✗ No se pudo deshacer: ${err.message}`, {
+                  kind: "err", ms: 5000,
+                });
+              }
+            },
+          },
+        });
+      }
     } else if (event === "token") {
       if (!ragLine) {
         stopGeneratingTicker();

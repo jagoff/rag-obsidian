@@ -307,9 +307,16 @@ def test_sample_weights_respects_search_space():
 
 
 def test_coordinate_refine_improves_or_stays():
-    # Cases where tag_literal > 0 strictly improves hit
-    feats_good = [_feat("right.md", 0.4, tag_hits=3),
-                  _feat("wrong.md", 0.5, tag_hits=0)]
+    # Post-2026-04-20 scoring normalises tag_hits to [0, 1] via
+    # min(n / TAG_HITS_NORM_CAP, 1.0) — so tag_hits=3 now contributes
+    # exactly weights.tag_literal (saturated), not 3×. Gap between the
+    # two candidates' rerank scores has to be small enough that
+    # coordinate_refine can close it within its 0.3× span around the
+    # baseline tag_literal=0.0 (upper bound ~0.06 before saturation).
+    # rerank gap 0.03 + normalised boost cap 1.0 → tag_literal > 0.03
+    # wins, well inside the search span.
+    feats_good = [_feat("right.md", 0.47, tag_hits=3),
+                  _feat("wrong.md", 0.50, tag_hits=0)]
     feats_bad = [_feat("c.md", 0.9, tag_hits=0)]
     cases = [
         {"feats": feats_good, "expected": {"right.md"}},
@@ -324,7 +331,8 @@ def test_coordinate_refine_improves_or_stays():
     refined = rag._coordinate_refine(start, cases, k=5, steps=10)
     refined_score = rag._objective(rag._aggregate([c["metrics"](refined) for c in cases]))
     assert refined_score >= start_score
-    # With enough steps, should find tag_literal > 0 since that wins the "good" case.
+    # With enough steps + normalised tag hits, refine finds tag_literal > 0.03
+    # to close the realistic 0.03 rerank gap.
     assert refined.tag_literal > 0.0
 
 

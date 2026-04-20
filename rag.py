@@ -1300,6 +1300,20 @@ RERANK_TOP = 5     # final chunks after reranking
 PROGRESSIVE_CONTEXT_K = 6   # extra chunks for progressive context (summarized to 1-liners)
                             # bajado 15→6: cada entry cuesta prefill, y con top-5
                             # primary full chunks ya hay cobertura suficiente
+
+# Normalisation caps for unbounded feature values in the post-rerank scoring
+# formula. Pre-2026-04-20, tag_literal*n_tag_matches and dwell_score*log1p(dwell_s)
+# were unbounded and could dominate rerank_logit (typical [0.1, 0.5] for this
+# corpus): a note with 3 matching tags plus weight tag_literal=0.011 contributes
+# +0.033 — fine in isolation but compounded with dwell_score (log1p(600)=6.4)
+# and a big weight, the non-rerank terms can outvote the cross-encoder.
+#
+# Cap to [0, 1] before multiplying by the weight so each signal contributes
+# at most weight_value to the score, regardless of raw signal magnitude.
+# Caps chosen so the common case (1 tag match, ~100s dwell) stays in the
+# linear regime while extreme values saturate instead of dominating.
+TAG_HITS_NORM_CAP = 3       # n_tag_matches >= 3 saturates at 1.0
+DWELL_LOG_NORM_CAP = 5.0    # log1p(dwell_s) >= 5.0 (~150s dwell) saturates at 1.0
 # Reranker confidence threshold. bge-reranker-v2-m3 returns sigmoid-ish
 # scores for this corpus: irrelevant queries sit around 0.005-0.015, borderline
 # around 0.02-0.10, clearly relevant > 0.2. Gate the LLM below this threshold
@@ -10654,7 +10668,10 @@ def retrieve(
             meta_tags = {t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()}
             n_matches = len(query_tag_hits & meta_tags)
             if n_matches:
-                final += weights.tag_literal * n_matches
+                # Normalise n_matches to [0,1] (cap at TAG_HITS_NORM_CAP) so
+                # the tag boost contributes at most `weights.tag_literal` to
+                # the final score regardless of how many tags matched.
+                final += weights.tag_literal * min(n_matches / TAG_HITS_NORM_CAP, 1.0)
         # Graph PageRank: notes with more inbound wikilinks are more
         # authoritative. Score is normalised [0,1] via rank/max_rank.
         if weights.graph_pagerank and pagerank:
@@ -10676,7 +10693,13 @@ def retrieve(
             if weights.click_prior_hour and ch:
                 final += weights.click_prior_hour * ch.get((path, _behavior_hour), 0.0)
             if weights.dwell_score and ds:
-                final += weights.dwell_score * ds.get(path, 0.0)
+                # f["dwell_score"] is log1p(mean_dwell_s); cap at
+                # DWELL_LOG_NORM_CAP so the boost saturates instead of
+                # growing linearly for long sessions (e.g. 10min dwell
+                # log1p≈6.4 — would 6× outweigh a short 30s read).
+                final += weights.dwell_score * min(
+                    ds.get(path, 0.0) / DWELL_LOG_NORM_CAP, 1.0,
+                )
         # Soft ramp: at cos=floor → w=0 (no effect), at cos=1.0 → w=1.0 (full weight).
         # Floor is tunable (weights.feedback_match_floor) so rag tune can find the
         # optimal gate point instead of relying on a hardcoded threshold.
@@ -11175,7 +11198,8 @@ def apply_weighted_scores(
         if weights.recency_always:
             score += weights.recency_always * f["recency_raw"]
         if weights.tag_literal and f["tag_hits"]:
-            score += weights.tag_literal * f["tag_hits"]
+            # Same normalisation as retrieve(): cap at TAG_HITS_NORM_CAP.
+            score += weights.tag_literal * min(f["tag_hits"] / TAG_HITS_NORM_CAP, 1.0)
         if weights.graph_pagerank and f.get("graph_pagerank"):
             score += weights.graph_pagerank * f["graph_pagerank"]
         if weights.click_prior and f.get("click_prior"):
@@ -11185,7 +11209,8 @@ def apply_weighted_scores(
         if weights.click_prior_hour and f.get("click_prior_hour"):
             score += weights.click_prior_hour * f["click_prior_hour"]
         if weights.dwell_score and f.get("dwell_score"):
-            score += weights.dwell_score * f["dwell_score"]
+            # Same cap as retrieve(): log1p(dwell_s) saturates at DWELL_LOG_NORM_CAP.
+            score += weights.dwell_score * min(f["dwell_score"] / DWELL_LOG_NORM_CAP, 1.0)
         pos_w = _soft_feedback_weight(f.get("fb_pos_cos", 0.0), weights.feedback_match_floor)
         if pos_w:
             score += weights.feedback_pos * pos_w

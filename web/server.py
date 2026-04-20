@@ -265,7 +265,11 @@ def _resolve_web_chat_model() -> str:
 # on command-r:35b), saving up to 10s on the first user-facing token.
 # Any per-request variation (context, signals, history) goes in the user
 # message AFTER this static block.
-_WEB_SYSTEM_PROMPT = (
+# v1: versión original 5231 chars (~1307 tok). Preservada como fallback
+# documentado vía env var RAG_WEB_PROMPT_VERSION=v1 — útil si al medir
+# v2 en producción aparece regresión en algún caso no cubierto por el
+# bench. Retirar cuando v2 sume suficiente historia sin incidentes.
+_WEB_SYSTEM_PROMPT_V1 = (
     "Eres un asistente de consulta sobre las notas personales de "
     "Obsidian del usuario. NO sos un modelo de conocimiento general.\n\n"
     "REGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. "
@@ -358,6 +362,20 @@ _WEB_SYSTEM_PROMPT = (
     "del usuario' → 'tu proyecto X'. Si una nota dice 'Grecia es la "
     "hija de Fernando', y Fernando es el usuario, escribí 'Grecia es "
     "tu hija'.\n"
+)
+
+# v2: comprimido 2898 chars (~724 tok), −44% tokens. Mismas REGLAs
+# preservando los anchors visuales que qwen reconoce como patrón
+# (`<<ext>>...<</ext>>`, `[Título](ruta.md)`, `03-Resources/`, `[[Nota]]`).
+# Medido 2026-04-20: prefill cae 1737ms → ~1100ms en el bench A/B
+# gracias al ahorro de ~600 tok del system prompt.
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en otros idiomas o alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO: texto que NO salga literal del CONTEXTO (parafraseo, conectores, opinión, conocimiento general) va envuelto en `<<ext>>...<</ext>>`. Fuera de esos marcadores todo debe ser verificable en el CONTEXTO.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (opcional): si el CONTEXTO sobre una herramienta se queda corto, ofrecé UN link al dominio raíz canónico (https://omnifocus.com, NUNCA paths profundos) al final, una sola línea: `<<ext>>Más info: <URL></ext>>`. No lo ofrezcas si el CONTEXTO ya cubre ni en consultas sobre el vault (tags, búsqueda, notas).\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".'
+
+# Selector con fallback seguro a v1 si el env var toma un valor raro.
+_WEB_SYSTEM_PROMPT = (
+    _WEB_SYSTEM_PROMPT_V1
+    if os.environ.get("RAG_WEB_PROMPT_VERSION", "v2").strip() == "v1"
+    else _WEB_SYSTEM_PROMPT_V2
 )
 
 
@@ -737,11 +755,24 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     call (4096), forcing ollama to reinit the KV cache on the next user
     request. Measured impact: prefill 1.5s → 4.9s (3x slower). See
     `num_ctx mismatch` comment in the main chat path for the same trap.
+
+    Also MUST include _WEB_SYSTEM_PROMPT as the system message. The probe
+    runs before every /api/chat via _ollama_restart_if_stuck, and if it
+    sends a different prompt (even just [user:"."]) ollama overwrites the
+    slot's KV cache with that short prompt. The next real request then
+    cold-prefills the 1300-token system prompt from scratch. Measured
+    2026-04-20: probe w/o system → prefill 4.9s; probe WITH system →
+    prefill 3.4s (−1.5s per request). The probe itself pays the cold
+    prefill once at startup (~2.5s) and then ~80-100ms on every
+    subsequent call since the system cache already exists.
     """
     try:
         _OLLAMA_STREAM_CLIENT.chat(
             model=_resolve_web_chat_model(),
-            messages=[{"role": "user", "content": "."}],
+            messages=[
+                {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                {"role": "user", "content": "."},
+            ],
             options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
                      "temperature": 0, "seed": 42},
             stream=False,
@@ -2711,7 +2742,10 @@ def _ensure_chat_model_prewarmer() -> None:
                 # thread forever and mask the next real request.
                 _OLLAMA_STREAM_CLIENT.chat(
                     model=model,
-                    messages=[{"role": "user", "content": "."}],
+                    messages=[
+                        {"role": "system", "content": _WEB_SYSTEM_PROMPT},
+                        {"role": "user", "content": "."},
+                    ],
                     options={"num_predict": 1, "num_ctx": _WEB_CHAT_NUM_CTX,
                              "temperature": 0, "seed": 42},
                     stream=False,
@@ -3406,8 +3440,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # the LLM knows who the user is talking about before reading the
         # retrieved chunks. Pre-LLM only — never leaked to episodic notes.
         from rag import build_person_context as _build_person_ctx
+        from rag import detect_topic_shift as _detect_topic_shift
         _person_ctx = _build_person_ctx(question)
         _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
+
+        # Topic-shift gate: si la current question cambia de tema vs el turno
+        # anterior, descartamos history para evitar contaminación cross-tópico
+        # del LLM. Caso reportado 2026-04-20: "cual es mi password de avature?"
+        # → "busca informacion sobre mi mama" terminaba mezclando ambos temas
+        # ("no hay info sobre la contraseña de Avature de tu mamá") porque los
+        # 6 últimos mensajes seguían vivos en el prompt. El gate combina
+        # (a) regex anafórico protector, (b) person_context fired, (c) cosine
+        # bge-m3 < 0.40 vs last user Q. Ver `detect_topic_shift` en rag.py.
+        _topic_shifted = False
+        _topic_shift_reason = "no-history"
+        if history:
+            _topic_shifted, _topic_shift_reason = _detect_topic_shift(
+                question, history, person_fired=bool(_person_ctx),
+            )
+            if _topic_shifted:
+                history = []
 
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The
@@ -3794,7 +3846,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             f"total={_t_total_ms}ms ctx_chars={_ctx_chars} tokens≈{_tok_count} "
             f"confidence={result['confidence']:.3f} "
             f"variants={len(result.get('query_variants',[]))} "
-            f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str}",
+            f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str} "
+            f"topic_shift={_topic_shift_reason}{'!' if _topic_shifted else ''}",
             flush=True,
         )
 
@@ -3817,6 +3870,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "top_score": round(float(result["confidence"]), 2),
             "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
             "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
+            "topic_shifted": _topic_shifted,
+            "topic_shift_reason": _topic_shift_reason,
         })
 
         yield _sse("done", {

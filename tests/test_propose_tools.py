@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from unittest.mock import MagicMock
 
-import pytest
 
 from web import tools as web_tools
 

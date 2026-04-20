@@ -344,4 +344,3 @@ chains:
       - question: "y el icbc"
         expected:
           - 03-Resources/Personal/Info/Info - Banco ICBC.md
-

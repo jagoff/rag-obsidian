@@ -1,0 +1,50 @@
+# Pre-commit hooks for obsidian-rag.
+#
+# Install once:
+#   uvx pre-commit install
+#
+# Auto-runs on `git commit`. Skip with `git commit --no-verify` when
+# you know what you're doing (e.g. fix-up commits in mid-rebase).
+#
+# The hooks mirror what CI does, so a pre-commit pass means the PR
+# won't be red on lint. Hooks are intentionally narrow: style only.
+# Tests run separately (`make test` / CI) because they take 60-90s
+# and nobody runs tests on every save.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Keep the ref loosely aligned with CI (.github/workflows/ci.yml uses
+    # ruff-action@v3 which auto-fetches a recent ruff). Bump manually via
+    # Dependabot PRs or `pre-commit autoupdate`.
+    rev: v0.15.11
+    hooks:
+      # Auto-fix safe lint (F401 unused imports, E401 combined imports,
+      # etc). Anything stricter stays manual.
+      - id: ruff-check
+        args: [--fix]
+      # NOTE: intentionally NOT enabling `ruff-format` here. The repo
+      # has never been black/ruff-formatted, so turning it on reformats
+      # ~90 files and nukes git-blame on every touched line. If someone
+      # wants to apply the style, do it in a single dedicated commit
+      # after coordinating with main contributors.
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Trailing whitespace + final newline are the only whitespace rules
+      # that matter for Python + Markdown files in this repo. SVG assets
+      # and lockfiles are excluded — both are tool-generated and churn
+      # whitespace in ways pre-commit shouldn't try to "fix".
+      - id: trailing-whitespace
+        exclude: '^(web/static/vendor/|.*\.lock$|docs/diagrams/.*\.svg$)'
+      - id: end-of-file-fixer
+        exclude: '^(web/static/vendor/|.*\.lock$|docs/diagrams/.*\.svg$)'
+      # Catch accidental stray merge conflict markers.
+      - id: check-merge-conflict
+      # Catch accidental giant files (mostly protects against
+      # accidentally committing a model checkpoint or a db dump).
+      - id: check-added-large-files
+        args: [--maxkb=512]
+        # marked.min.js is ~50KB, fine. If a vendored bundle ever grows
+        # past the cap, add it to this exclude.
+        exclude: '^web/static/vendor/'

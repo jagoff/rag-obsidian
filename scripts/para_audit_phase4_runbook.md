@@ -1,6 +1,6 @@
 # Phase 4: Post-Move Repair — PARA Audit Runbook
 
-**When to run**: immediately after `para_audit_apply.py --apply` reports success and its own summary.  
+**When to run**: immediately after `para_audit_apply.py --apply` reports success and its own summary.
 **Goal**: restore wikilink density, synchronize the corpus index, verify no eval regression.
 
 ---
@@ -77,7 +77,7 @@ rag eval
 
 These are the lower CI bounds from the 2026-04-17 expanded eval floor (42 singles, 12 chains). If either number drops below its floor, something broke — most likely a wikilink that was silently used as a retrieval signal is now dangling, or the moved note's embed_text prefix changed enough to shift cosine similarity below the rerank threshold.
 
-**If both pass**: continue to Step 4.  
+**If both pass**: continue to Step 4.
 **If either fails**: go to the Rollback section.
 
 ---

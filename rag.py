@@ -448,6 +448,39 @@ def _resolve_vault_path() -> Path:
     return _DEFAULT_VAULT
 
 
+def _is_cross_source_target(vault_path: Path) -> bool:
+    """True si este vault debe recibir los ETL cross-source que corren como
+    pre-step de `rag index` (MOZE, WhatsApp, Gmail, Calendar, Reminders,
+    Chrome, Drive, GitHub, Claude, YouTube, Spotify).
+
+    Motivación del guard: los ETLs escriben `.md` files a
+    `vault_path/<folder>/` (ej MOZE → `02-Areas/Personal/Finanzas/MOZE/`)
+    para que el rglob post-sync los absorba. Pre-fix, cualquier invocación
+    con `OBSIDIAN_RAG_VAULT=.../otro-vault rag index` (o post-fix con
+    `rag index --vault otro`) disparaba los 12 syncs contra `otro-vault`,
+    copiando notas MOZE/WA/Gmail/etc. a un vault donde no pertenecen
+    (medido en terreno 2026-04-21: 19 archivos MOZE contaminaron
+    `obsidian-work` en una corrida que intentaba indexar el vault `work`).
+
+    Reglas (en orden):
+      1. Si `vaults.json` tiene `cross_source_target: <name>` explícito Y
+         ese nombre está registrado, SOLO ese vault recibe los ETLs.
+         Incluso `_DEFAULT_VAULT` pierde el privilegio cuando hay override.
+      2. Sin override: back-compat single-vault classic — solo
+         `_DEFAULT_VAULT` (iCloud Notes, hardcoded) es target.
+      3. Cualquier otro caso → False. Usuario con registry multi-vault
+         que quiera que un vault NO-default reciba syncs debe opt-inear
+         explícitamente editando `~/.config/obsidian-rag/vaults.json`:
+         `{"vaults": {...}, "current": "home", "cross_source_target": "home"}`.
+    """
+    vp = vault_path.resolve()
+    cfg = _load_vaults_config()
+    target_name = cfg.get("cross_source_target")
+    if target_name and target_name in cfg.get("vaults", {}):
+        return Path(cfg["vaults"][target_name]).resolve() == vp
+    return vp == _DEFAULT_VAULT.resolve()
+
+
 VAULT_PATH = _resolve_vault_path()
 # Root of all per-user operational state (query logs, behavior logs,
 # sessions, tuned ranker, caches, OAuth tokens). Created on import with
@@ -13804,56 +13837,38 @@ def _index_single_file(
     return "indexed"
 
 
-def _run_index(reset: bool, no_contradict: bool) -> dict:
-    """Core indexing logic. Shared by the `rag index` CLI and the in-chat
-    natural-language reindex intent. Returns stats dict for callers that
-    want to render their own summary.
+def _run_cross_source_etls(vault_path: Path) -> None:
+    """Pre-index hook: corre los 11 ETLs cross-source que escriben `.md`
+    al vault para que el rglob posterior los absorba (MOZE, WhatsApp,
+    Reminders, Calendar, Chrome, Gmail, Drive, GitHub, Claude, YouTube,
+    Spotify).
+
+    Guard crítico: `_is_cross_source_target(vault_path)` decide si este
+    vault es el target canónico. Cuando no lo es (user corrió
+    `OBSIDIAN_RAG_VAULT=.../otro-vault rag index` o `rag index --vault otro`),
+    SKIP todos los syncs y log una única línea explicativa — evita la
+    contaminación medida 2026-04-21 donde los ETLs copiaron 19 archivos
+    MOZE al vault `work`. Para opt-inear a otro vault, editar
+    `~/.config/obsidian-rag/vaults.json` con `"cross_source_target": "<name>"`.
+    Todos los syncs son silent-fail — si una fuente no está disponible
+    (no Apple, no icalBuddy, Chrome locked, no Gmail creds, etc.) el
+    helper devuelve `{"ok": False, "reason": ...}` y el log lo refleja
+    en dim/yellow según corresponda.
     """
-    col = get_db()
-    _invalidate_corpus_cache()
-    # Contradiction check only runs in incremental mode and when not opted out.
-    check_contradictions = not reset and not no_contradict
-
-    # Drain any contradiction checks that got spilled to the pending JSONL on
-    # a previous exit (ctrl-C mid-index, ollama down mid-run, etc). No-op if
-    # the file doesn't exist or is empty.
-    if check_contradictions:
-        try:
-            _retry_pending_contradictions(col)
-        except Exception as exc:
-            _silent_log("contradiction_retry_index", exc)
-
-    if reset:
-        with _collection_write_lock():
-            global _db_singleton, _db_singleton_created_at
-            _db_singleton = None
-            db_key = str(DB_PATH)
-            client = SqliteVecClient(path=db_key)
-            for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
-                try:
-                    _log_collection_op("delete", cname, {"reason": "index --reset"})
-                    client.delete_collection(cname)
-                except Exception:
-                    pass
-            col = client.get_or_create_collection(
-                COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-            )
-            _db_singleton = (db_key, col)
-            _db_singleton_created_at = time.time()
-            COLLECTION_RESET_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
-            COLLECTION_RESET_SENTINEL.write_text(
-                f"{int(_db_singleton_created_at)} {col.id}\n"
-            )
-        console.print("[yellow]Índice borrado (notas + URLs).[/yellow]")
-
-    col_urls = get_urls_db()
-    urls_indexed = 0
+    if not _is_cross_source_target(vault_path):
+        console.print(
+            f"[dim]Cross-source syncs: skip "
+            f"(vault `{vault_path.name}` no es target canónico — "
+            f"seteá `cross_source_target` en ~/.config/obsidian-rag/vaults.json "
+            f"para opt-in)[/dim]"
+        )
+        return
 
     # MOZE export → monthly markdown notes, in-place under the vault so the
     # regular rglob picks them up. Silent if no CSV; hash-skip keeps reruns
     # free when nothing changed.
     try:
-        moze_stats = _sync_moze_notes(VAULT_PATH)
+        moze_stats = _sync_moze_notes(vault_path)
         if moze_stats.get("ok") and moze_stats.get("months_written"):
             console.print(
                 f"[dim]MOZE sync: {moze_stats['months_written']} notas nuevas/modificadas "
@@ -13867,7 +13882,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     # `com.fer.whatsapp-vault-sync` runs every 15 min, just on-demand here so
     # `rag index` always reflects the latest WhatsApp state.
     try:
-        wa_stats = _sync_whatsapp_notes(VAULT_PATH)
+        wa_stats = _sync_whatsapp_notes(vault_path)
         if wa_stats.get("ok") and wa_stats.get("files_written"):
             console.print(
                 f"[dim]WhatsApp sync: {wa_stats['files_written']} notas nuevas/modificadas "
@@ -13896,7 +13911,7 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     ):
         _t_etl = time.perf_counter()
         try:
-            stats = fn(VAULT_PATH)
+            stats = fn(vault_path)
             _ms = int((time.perf_counter() - _t_etl) * 1000)
             if stats.get("ok") and stats.get("files_written"):
                 if kind == "reminders":
@@ -13954,6 +13969,59 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
                 )
         except Exception as exc:
             console.print(f"[yellow]{label} sync falló: {exc}[/yellow]")
+
+
+def _run_index(reset: bool, no_contradict: bool) -> dict:
+    """Core indexing logic. Shared by the `rag index` CLI and the in-chat
+    natural-language reindex intent. Returns stats dict for callers that
+    want to render their own summary.
+    """
+    col = get_db()
+    _invalidate_corpus_cache()
+    # Contradiction check only runs in incremental mode and when not opted out.
+    check_contradictions = not reset and not no_contradict
+
+    # Drain any contradiction checks that got spilled to the pending JSONL on
+    # a previous exit (ctrl-C mid-index, ollama down mid-run, etc). No-op if
+    # the file doesn't exist or is empty.
+    if check_contradictions:
+        try:
+            _retry_pending_contradictions(col)
+        except Exception as exc:
+            _silent_log("contradiction_retry_index", exc)
+
+    if reset:
+        with _collection_write_lock():
+            global _db_singleton, _db_singleton_created_at
+            _db_singleton = None
+            db_key = str(DB_PATH)
+            client = SqliteVecClient(path=db_key)
+            for cname in (COLLECTION_NAME, URLS_COLLECTION_NAME):
+                try:
+                    _log_collection_op("delete", cname, {"reason": "index --reset"})
+                    client.delete_collection(cname)
+                except Exception:
+                    pass
+            col = client.get_or_create_collection(
+                COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            )
+            _db_singleton = (db_key, col)
+            _db_singleton_created_at = time.time()
+            COLLECTION_RESET_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+            COLLECTION_RESET_SENTINEL.write_text(
+                f"{int(_db_singleton_created_at)} {col.id}\n"
+            )
+        console.print("[yellow]Índice borrado (notas + URLs).[/yellow]")
+
+    col_urls = get_urls_db()
+    urls_indexed = 0
+
+    # Cross-source ETLs (MOZE, WhatsApp, Gmail, Calendar, Reminders, Chrome,
+    # Drive, GitHub, Claude, YT, Spotify) escriben `.md` al vault para que
+    # el rglob de abajo los absorba. Se gatean por `_is_cross_source_target`
+    # — solo corren en el vault home canónico, evitando contaminar vaults
+    # secundarios cuando se indexa con `--vault` o env var override.
+    _run_cross_source_etls(VAULT_PATH)
 
     # Build file → chunks_in_db map (once) so we can detect stale/orphan chunks.
     existing_all = col.get(include=["metadatas"])
@@ -14117,8 +14185,15 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 @click.option("--dry-run", is_flag=True, help="Calcular chunks sin escribir (solo para --source non-vault).")
 @click.option("--max-chats", type=int, default=None,
               help="Cap de chats para --source whatsapp (staged rollout / debugging).")
+@click.option("--vault", "vault_scope", default=None,
+              help="Nombre de vault registrado (override per-invocación del activo). "
+                   "Usá `rag vault list` para ver los disponibles. "
+                   "Single-vault only — los cross-source ETLs (MOZE, WA, Gmail, ...) "
+                   "se skippean si el vault no es el target canónico (ver `cross_source_target` "
+                   "en ~/.config/obsidian-rag/vaults.json).")
 def index(reset: bool, no_contradict: bool, source_opt: str | None,
-          since_opt: str | None, dry_run: bool, max_chats: int | None):
+          since_opt: str | None, dry_run: bool, max_chats: int | None,
+          vault_scope: str | None):
     """Indexar notas del vault (incremental, detecta cambios por hash).
 
     En el camino incremental, cada nota nueva o modificada pasa por un check
@@ -14130,7 +14205,51 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
     disponibles) corre el ingester de esa fuente contra la misma colección
     — los chunks aterrizan con `source="<fuente>"` en el metadata y el
     threading por `--source` en `rag query` los filtra.
+
+    Con `--vault NAME` override el vault activo por esta invocación (sin
+    cambiar el `current` del registry). Los pre-syncs cross-source se
+    gatean por vault — solo corren en el target canónico para no
+    contaminar vaults secundarios con notas MOZE/WA/Gmail/etc.
     """
+    # --vault resolution: validar + swap VAULT_PATH globals via _with_vault.
+    # Aplica tanto al path `--source` (cross-source ingesters: el ingester
+    # escribe al vault target en lugar del activo) como al vault-index path
+    # de más abajo. Debe ejecutarse ANTES del source_opt branch para que
+    # el swap esté vigente dentro del ingester.
+    _vault_ctx = None
+    if vault_scope:
+        names = [n.strip() for n in vault_scope.split(",") if n.strip()]
+        if len(names) != 1 or names[0] == "all":
+            console.print(
+                "[red]--vault en `rag index` solo acepta UN vault por invocación.[/red] "
+                "Para multi-vault, corré `rag index --vault X` por cada uno."
+            )
+            return
+        resolved = resolve_vault_paths(names)
+        if not resolved:
+            console.print(
+                f"[red]--vault '{vault_scope}' no resolvió ningún vault registrado.[/red] "
+                "Revisá `rag vault list`."
+            )
+            return
+        _, _vault_path = resolved[0]
+        _vault_ctx = _with_vault(_vault_path)
+        _vault_ctx.__enter__()
+    try:
+        _do_index(reset, no_contradict, source_opt, since_opt, dry_run, max_chats)
+    finally:
+        if _vault_ctx is not None:
+            _vault_ctx.__exit__(None, None, None)
+
+
+def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
+              since_opt: str | None, dry_run: bool, max_chats: int | None) -> None:
+    """Body del comando `index`, extraído a helper para que el caller
+    (`index` CLI) pueda envolverlo en `_with_vault(...)` cuando se pasa
+    `--vault NAME`. Todo lo que estaba inline en `index()` — incluyendo
+    el branch `--source` y la rama vault — vive acá. El caller se encarga
+    del resolver del flag + enter/exit del context manager; este helper
+    asume que `VAULT_PATH` + `COLLECTION_NAME` ya apuntan al vault target."""
     if source_opt:
         src = source_opt.strip().lower()
         if src not in VALID_SOURCES:

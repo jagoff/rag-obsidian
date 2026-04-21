@@ -34,7 +34,7 @@ Excepciones obvias: tareas exploratorias (investigar, responder preguntas, revis
 uv tool install --reinstall --editable .   # reinstall after code changes
 
 # Core
-rag index [--reset] [--no-contradict]      # incremental hash-based; --reset rebuilds
+rag index [--reset] [--no-contradict] [--vault NAME]  # incremental hash-based; --reset rebuilds; --vault override
 rag index --source whatsapp [--reset] [--since ISO] [--dry-run] [--max-chats N]  # WA ingester (Phase 1.a)
 rag watch                                  # watchdog auto-reindex (debounce 3s)
 rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain --source S[,S2] --vault NAME]
@@ -87,7 +87,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 ### Env vars
 
-- `OBSIDIAN_RAG_VAULT` — override default vault path. Collections are namespaced per resolved path (sha256[:8]).
+- `OBSIDIAN_RAG_VAULT` — override default vault path. Collections are namespaced per resolved path (sha256[:8]). En la precedencia multi-vault, gana sobre el `current` del registry. `rag query --vault NAME` y `rag index --vault NAME` son equivalentes por-invocación sin mutar el env. Single-vault only en ambos comandos; para cross-vault query usar `rag chat --vault a,b`. Los cross-source ETLs (MOZE, WhatsApp, Gmail, Reminders, Calendar, Chrome, Drive, GitHub, Claude, YouTube, Spotify) se gatean por `_is_cross_source_target(vault_path)` — por default solo el `_DEFAULT_VAULT` (iCloud Notes) los recibe. Para opt-inear a otro vault agregar `"cross_source_target": "<name>"` al `~/.config/obsidian-rag/vaults.json`. Sin opt-in, `rag index --vault work` skippea los 11 ETLs con un log `[dim]Cross-source syncs: skip[/dim]` y solo indexa las `.md` reales del vault — evita la contaminación medida 2026-04-21 en que los ETLs copiaron 19 archivos MOZE al vault `work`. Tests: `tests/test_vaults.py` (10 casos sobre guard + flag).
 - `OLLAMA_KEEP_ALIVE` — passed to every ollama chat/embed call. Code default `"20m"` (`rag.py:1114`); every launchd plist overrides to `-1` so models stay VRAM-resident for the daemon lifetime. Accepts int seconds or duration string.
 - `RAG_STATE_SQL=1` — historically enabled the SQL telemetry store (20 `rag_*` tables in `ragvec/ragvec.db`). Post-T10 (2026-04-20) the JSONL fallback is gone and the flag is a **no-op** — neither writers nor readers consult it, SQL is the only path. Still set on every launchd plist for deployment-config symmetry / faster rollback if needed.
 - `RAG_TRACK_OPENS=1` — switches OSC 8 link scheme from `file://` to `x-rag-open://` so CLI clicks route through `rag open` (ranker-vivo signal capture). Absent = no behavior change.

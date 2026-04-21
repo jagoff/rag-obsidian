@@ -512,6 +512,222 @@ def test_query_vault_flag_unknown_name_errors_without_touching_db(
     assert "ghost" in out or "no resolvió" in out, result.output
 
 
+# ── `_is_cross_source_target` + pre-sync guard en `rag index` ────────────────
+# Motivación: antes del fix, `rag index` corría 12 ETLs cross-source (MOZE,
+# WhatsApp, Gmail, Calendar, Reminders, Drive, GitHub, Chrome, Claude,
+# YT, Spotify) que escriben `.md` files al `VAULT_PATH` activo. Con
+# `OBSIDIAN_RAG_VAULT` o `rag index --vault X` apuntando a un vault
+# distinto del home, los ETLs contaminaban el vault equivocado (medido
+# en terreno: 19 archivos MOZE copiados a `obsidian-work/02-Areas/Personal/
+# Finanzas/MOZE/` en una corrida que intentaba indexar el vault `work`).
+# El guard `_is_cross_source_target` decide si el vault target recibe los
+# ETLs (default: solo `_DEFAULT_VAULT`; opt-in explícito via registry).
+
+
+def test_is_cross_source_target_default_vault_is_home(tmp_registry, monkeypatch):
+    """El `_DEFAULT_VAULT` (iCloud Notes, back-compat single-vault) siempre
+    es target canónico sin configuración."""
+    # Sin registry ni env var → default vault.
+    assert rag._is_cross_source_target(rag._DEFAULT_VAULT) is True
+
+
+def test_is_cross_source_target_custom_vault_rejected_by_default(
+    tmp_registry, tmp_path,
+):
+    """Un vault custom (no el _DEFAULT_VAULT) sin opt-in explícito no recibe
+    cross-source syncs. Este es EL fix — antes del guard, los ETLs
+    escribían acá sin chequear y contaminaban."""
+    work = tmp_path / "work-vault"; work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"work": str(work)},
+        "current": "work",
+    })
+    assert rag._is_cross_source_target(work) is False
+
+
+def test_is_cross_source_target_explicit_opt_in_via_config(
+    tmp_registry, tmp_path,
+):
+    """Si `cross_source_target` está seteado en `vaults.json`, SOLO ese
+    vault recibe los ETLs — el resto se rechaza (incluido el default)."""
+    home = tmp_path / "home-vault"; home.mkdir()
+    work = tmp_path / "work-vault"; work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(home), "work": str(work)},
+        "current": "home",
+        "cross_source_target": "work",
+    })
+    assert rag._is_cross_source_target(work) is True
+    assert rag._is_cross_source_target(home) is False
+    # Incluso _DEFAULT_VAULT pierde el privilegio cuando hay override.
+    assert rag._is_cross_source_target(rag._DEFAULT_VAULT) is False
+
+
+def test_is_cross_source_target_config_with_unknown_target_falls_back(
+    tmp_registry, tmp_path,
+):
+    """Si `cross_source_target` apunta a un nombre que no existe en
+    `vaults`, el override se ignora y vuelve al back-compat (solo
+    `_DEFAULT_VAULT`)."""
+    work = tmp_path / "work-vault"; work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"work": str(work)},
+        "current": "work",
+        "cross_source_target": "ghost",
+    })
+    assert rag._is_cross_source_target(work) is False
+    assert rag._is_cross_source_target(rag._DEFAULT_VAULT) is True
+
+
+def test_run_cross_source_etls_skips_when_vault_not_target(
+    tmp_registry, tmp_path, monkeypatch,
+):
+    """`_run_cross_source_etls(vault_path)` debe skipear TODOS los sync
+    helpers cuando el vault no es target canónico. Cero llamadas a
+    `_sync_moze_notes`, `_sync_whatsapp_notes`, ni al loop de ETLs."""
+    work = tmp_path / "work-vault"; work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"work": str(work)},
+        "current": "work",
+    })
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"sync helper NO debería llamarse: args={args}")
+
+    for sync_fn in (
+        "_sync_moze_notes", "_sync_whatsapp_notes", "_sync_reminders_notes",
+        "_sync_apple_calendar_notes", "_sync_gmail_notes",
+    ):
+        if hasattr(rag, sync_fn):
+            monkeypatch.setattr(rag, sync_fn, boom)
+
+    # No debe lanzar — el guard corta antes de tocar los syncs.
+    rag._run_cross_source_etls(work)
+
+
+def test_run_cross_source_etls_runs_sync_helpers_for_home_vault(
+    tmp_registry, tmp_path, monkeypatch,
+):
+    """Back-compat: cuando el vault ES el target (default o explícito),
+    los sync helpers corren como siempre. Verifica que MOZE + WhatsApp
+    se invocan con el vault correcto como argumento."""
+    called: dict[str, list[Path]] = {}
+
+    def _spy(name):
+        def _fn(vault_root, *a, **kw):
+            called.setdefault(name, []).append(Path(vault_root))
+            return {"ok": True}   # minimal stat shape; no months_written
+        return _fn
+
+    # Patch moze + wa + los ETLs del loop para que no escriban disco real.
+    monkeypatch.setattr(rag, "_sync_moze_notes", _spy("moze"))
+    monkeypatch.setattr(rag, "_sync_whatsapp_notes", _spy("whatsapp"))
+    for fn_name in (
+        "_sync_reminders_notes", "_sync_apple_calendar_notes",
+        "_sync_chrome_history", "_sync_gmail_notes", "_sync_gdrive_notes",
+        "_sync_github_activity", "_sync_claude_code_transcripts",
+        "_sync_youtube_transcripts", "_sync_spotify_notes",
+    ):
+        if hasattr(rag, fn_name):
+            monkeypatch.setattr(rag, fn_name, _spy(fn_name))
+
+    # Target = _DEFAULT_VAULT (back-compat classic).
+    rag._run_cross_source_etls(rag._DEFAULT_VAULT)
+
+    # MOZE + WhatsApp son los dos syncs siempre invocados primero. El resto
+    # pasa por el loop de tuples — puede haber shape-specific guards, así
+    # que nos bastan los dos principales.
+    assert "moze" in called
+    assert "whatsapp" in called
+    assert called["moze"][0].resolve() == rag._DEFAULT_VAULT.resolve()
+    assert called["whatsapp"][0].resolve() == rag._DEFAULT_VAULT.resolve()
+
+
+# ── CLI: `rag index --vault NAME` ────────────────────────────────────────────
+# Simétrico al `--vault` de query/chat. Redirige `_run_index` al vault
+# nombrado sin cambiar el `current` del registry. Combina con el guard de
+# pre-syncs (arriba): si el vault no es target canónico, los ETLs se
+# skippean y solo se indexan las notas reales del vault.
+
+
+def test_index_vault_flag_routes_to_named_vault(tmp_registry, tmp_path, monkeypatch):
+    """`rag index --vault work` debe correr `_run_index` con
+    `VAULT_PATH` swappeado al vault `work`. Verifica via context manager."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home), "work": str(v_work)},
+        "current": "home",
+    })
+
+    captured: dict = {}
+
+    def fake_run_index(reset, no_contradict):
+        # Capturamos el VAULT_PATH visto desde adentro de _run_index —
+        # debe ser `v_work` (swappeado por _with_vault).
+        captured["vault_path"] = rag.VAULT_PATH
+        return {}
+
+    monkeypatch.setattr(rag, "_run_index", fake_run_index)
+    # vault_write_lock abre un fichero de lock — lo pasamos a un no-op.
+    import contextlib
+    monkeypatch.setattr(rag, "vault_write_lock",
+                        lambda *a, **kw: contextlib.nullcontext())
+
+    result = CliRunner().invoke(
+        rag.cli, ["index", "--vault", "work"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("vault_path") is not None, result.output
+    assert captured["vault_path"].resolve() == v_work.resolve()
+
+
+def test_index_vault_flag_unknown_name_errors_without_running(
+    tmp_registry, tmp_path, monkeypatch,
+):
+    """`rag index --vault ghost` debe fallar claro, sin correr `_run_index`."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home)},
+        "current": "home",
+    })
+
+    def boom(*args, **kwargs):
+        raise AssertionError("_run_index no debería llamarse")
+
+    monkeypatch.setattr(rag, "_run_index", boom)
+
+    result = CliRunner().invoke(rag.cli, ["index", "--vault", "ghost"])
+    assert result.exit_code == 0, result.output
+    out = result.output.lower()
+    assert "ghost" in out or "no resolvió" in out, result.output
+
+
+@pytest.mark.parametrize("scope", ["home,work", "all"])
+def test_index_vault_flag_rejects_multi_vault_scope(
+    tmp_registry, tmp_path, monkeypatch, scope,
+):
+    """`rag index` es single-vault por invocación. Scope 'home,work' o
+    'all' se rechazan con mensaje claro."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home), "work": str(v_work)},
+        "current": "home",
+    })
+
+    def boom(*args, **kwargs):
+        raise AssertionError("_run_index no debería llamarse")
+
+    monkeypatch.setattr(rag, "_run_index", boom)
+
+    result = CliRunner().invoke(rag.cli, ["index", "--vault", scope])
+    assert result.exit_code == 0, result.output
+    out = result.output.lower()
+    assert "un vault" in out or "solo acepta" in out, result.output
+
+
 @pytest.mark.parametrize("scope", ["home,work", "all"])
 def test_query_vault_flag_rejects_multi_vault_scope(
     tmp_registry, tmp_path, monkeypatch, scope,

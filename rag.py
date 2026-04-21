@@ -8754,7 +8754,140 @@ def handle_recent(col: SqliteVecCollection, params: dict, limit: int = 20) -> li
 _AGENDA_SOURCES = frozenset({"calendar", "reminders"})
 
 
-def handle_agenda(col: SqliteVecCollection, params: dict, limit: int = 20) -> list[dict]:
+def _day_window(dt: datetime) -> tuple[float, float]:
+    """Half-open [dt-date 00:00, next-date 00:00) as epoch floats."""
+    start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return (start.timestamp(), end.timestamp())
+
+
+def _weekend_window(sat: datetime) -> tuple[float, float]:
+    """Half-open [sat 00:00, mon 00:00) — covers Sat + Sun inclusive."""
+    start = sat.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=2)
+    return (start.timestamp(), end.timestamp())
+
+
+def _week_window(dt: datetime) -> tuple[float, float]:
+    """ISO-week containing `dt`: Monday 00:00 → next Monday 00:00."""
+    start = (
+        dt - timedelta(days=dt.weekday())
+    ).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return (start.timestamp(), end.timestamp())
+
+
+def _month_window(dt: datetime) -> tuple[float, float]:
+    """Calendar month containing `dt`: day 1 00:00 → next month day 1 00:00."""
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return (start.timestamp(), end.timestamp())
+
+
+def _year_window(dt: datetime) -> tuple[float, float]:
+    """Calendar year containing `dt`: Jan 1 00:00 → next Jan 1 00:00."""
+    start = dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = start.replace(year=start.year + 1)
+    return (start.timestamp(), end.timestamp())
+
+
+def _parse_agenda_window(
+    question: str, *, now: datetime | None = None
+) -> tuple[float, float] | None:
+    """Parse the temporal anchor from an agenda query → (ts_start, ts_end)
+    epoch half-open window. Returns None if no recognizable anchor.
+
+    Dispatch order (narrowest first, so "pasado mañana" doesn't match the
+    "mañana" branch prematurely; "esta semana" isn't captured by "hoy";
+    week/month/year are checked before generic weekday tokens):
+
+    1. Day anchors — "pasado mañana" / "mañana" / "hoy"
+    2. Weekend — "el finde" / "este finde" / "próximo finde"
+    3. Week — "esta semana" / "la semana que viene" / "la próxima semana"
+    4. Month — "este mes" / "el próximo mes" / "el mes que viene"
+    5. Year — "este año" / "el próximo año" / "el año que viene"
+    6. Weekday-specific — "el viernes" / "este sábado" / "el próximo lunes"
+       (via `_parse_natural_datetime` so the weekday math matches the
+        dateparser semantics already battle-tested for the propose tool)
+
+    Window types are intentionally coarse: all times snap to 00:00 local
+    (naive datetime, `RAG_TIMEZONE` default Buenos Aires). Calendar events
+    land on specific hours but the user asking "qué tengo el viernes"
+    wants the full day, not just morning.
+    """
+    if not question:
+        return None
+    anchor = now or datetime.now()
+    q = question.lower()
+
+    # 1. Day anchors — "pasado mañana" before "mañana" ordering matters.
+    if re.search(r"\bpasado\s+ma[ñn]ana\b", q):
+        return _day_window(anchor + timedelta(days=2))
+    if re.search(r"\bma[ñn]ana\b", q):
+        return _day_window(anchor + timedelta(days=1))
+    if re.search(r"\bhoy\b", q):
+        return _day_window(anchor)
+
+    # 2. Weekend — "el finde" / "este finde" / "próximo finde". We resolve
+    # via dateparser because "finde" = "saturday" per the rioplatense
+    # preprocessor already installed upstream.
+    if re.search(r"\b(?:el|este|pr[oó]xim[oa])?\s*finde\b", q):
+        sat = _parse_natural_datetime("el finde", now=anchor)
+        if sat:
+            return _weekend_window(sat)
+
+    # 3. Week — "la semana que viene" / "la próxima semana" / "esta semana"
+    # Next-week matchers BEFORE "esta semana" so both "la próxima semana"
+    # and "esta semana la próxima" route consistently.
+    if re.search(r"\b(?:la\s+semana\s+que\s+vienen?|la\s+pr[oó]xima\s+semana)\b", q):
+        # Next-week Monday: if today is Mon, +7; else +(7-weekday).
+        days_to_next_mon = (7 - anchor.weekday()) % 7 or 7
+        return _week_window(anchor + timedelta(days=days_to_next_mon))
+    if re.search(r"\besta\s+semana\b", q):
+        return _week_window(anchor)
+
+    # 4. Month
+    if re.search(r"\b(?:el\s+mes\s+que\s+vienen?|el\s+pr[oó]xim[oa]\s+mes)\b", q):
+        if anchor.month == 12:
+            nxt = anchor.replace(year=anchor.year + 1, month=1, day=1)
+        else:
+            nxt = anchor.replace(month=anchor.month + 1, day=1)
+        return _month_window(nxt)
+    if re.search(r"\beste\s+mes\b", q):
+        return _month_window(anchor)
+
+    # 5. Year
+    if re.search(r"\b(?:el\s+a[ñn]o\s+que\s+vienen?|el\s+pr[oó]xim[oa]\s+a[ñn]o)\b", q):
+        return _year_window(anchor.replace(year=anchor.year + 1))
+    if re.search(r"\beste\s+a[ñn]o\b", q):
+        return _year_window(anchor)
+
+    # 6. Weekday-specific — delegate the rollforward math to dateparser
+    # via `_parse_natural_datetime` (handles "el viernes" vs "el próximo
+    # viernes" identically — PREFER_DATES_FROM=future).
+    wd = re.search(
+        r"\b(?:el|este|pr[oó]xim[oa])\s+"
+        r"(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b",
+        q,
+    )
+    if wd:
+        dt = _parse_natural_datetime(wd.group(0), now=anchor)
+        if dt:
+            return _day_window(dt)
+
+    return None
+
+
+def handle_agenda(
+    col: SqliteVecCollection,
+    params: dict,
+    limit: int = 20,
+    *,
+    question: str | None = None,
+) -> list[dict]:
     """AGENDA intent — returns calendar events + reminders sorted by
     `created_ts` (start time for calendar events, creation anchor for
     reminders) descending.
@@ -8764,6 +8897,14 @@ def handle_agenda(col: SqliteVecCollection, params: dict, limit: int = 20) -> li
     stay on the recent path (sorted by their own `modified` frontmatter).
     Gmail + WhatsApp are intentionally excluded — they don't carry agenda
     semantics.
+
+    Window filter: when `question` is passed and `_parse_agenda_window`
+    finds a temporal anchor ("hoy" / "esta semana" / "el viernes" / etc),
+    only items whose `created_ts` falls inside [ts_start, ts_end) make
+    it past the filter. Items outside the window ascend/date older are
+    dropped. When no anchor is detected (e.g. "mi agenda" with no
+    temporal cue), the full pool sorts by ts desc and the top-`limit`
+    items survive — same MVP behaviour as the 2026-04-21 initial fix.
 
     Pre-2026-04-21-evening this handler didn't exist and the user's
     "qué tengo esta semana" query fell through to `handle_recent` which
@@ -8778,13 +8919,25 @@ def handle_agenda(col: SqliteVecCollection, params: dict, limit: int = 20) -> li
         if normalize_source(m.get("source")) in _AGENDA_SOURCES
     ]
     files = _filter_files(agenda_metas, params.get("tag"), params.get("folder"))
-    # Sort by created_ts desc (epoch float). Falls back to 0.0 for metas
-    # missing the field — those drift to the bottom but still surface.
+
+    # Temporal-window filter (agenda v2, 2026-04-21 evening). When the
+    # user's question carries a parseable anchor, narrow the pool to the
+    # matching window. Without an anchor (or when question=None because
+    # an older caller didn't pass it), fall back to the original
+    # top-20-by-ts-desc behaviour.
     def _ts(m: dict) -> float:
         try:
             return float(m.get("created_ts") or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    window = _parse_agenda_window(question) if question else None
+    if window is not None:
+        ts_start, ts_end = window
+        # Half-open [start, end): items at exactly end_ts belong to the
+        # next window.
+        files = [m for m in files if ts_start <= _ts(m) < ts_end]
+
     files.sort(key=_ts, reverse=True)
     return files[:limit]
 
@@ -14819,7 +14972,11 @@ def query(
                 )
                 render_file_list("últimas modificadas", files)
         elif intent == "agenda":
-            files = handle_agenda(col, intent_params)
+            # Pass `effective_question` so the temporal-window filter in
+            # `handle_agenda` can narrow to the anchor the user typed
+            # ("hoy" → 1 day, "esta semana" → 7 days, etc). Falls back
+            # to top-20-by-ts-desc when no anchor is detected.
+            files = handle_agenda(col, intent_params, question=effective_question)
             if plain:
                 click.echo(f"{len(files)} item(s) en agenda ({params_str})")
                 for f in files:

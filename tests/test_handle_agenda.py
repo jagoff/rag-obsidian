@@ -206,3 +206,116 @@ def test_agenda_sources_constant_is_locked():
     semantics of this intent change materially. Force a review via
     test rather than silent drift."""
     assert rag._AGENDA_SOURCES == frozenset({"calendar", "reminders"})
+
+
+# ── Window filter (agenda v2, 2026-04-21 evening) ─────────────────────
+
+from datetime import datetime, timedelta
+
+
+def _windowed_corpus(monkeypatch, anchor: datetime):
+    """Install a 5-row corpus with calendar events at spread-out
+    timestamps so window filters have something to accept/reject."""
+    metas = [
+        _fake_meta(
+            file="calendar://a/today",
+            source="calendar",
+            created_ts=anchor.replace(hour=10).timestamp(),
+            note="hoy 10hs",
+        ),
+        _fake_meta(
+            file="calendar://a/tomorrow",
+            source="calendar",
+            created_ts=(anchor + timedelta(days=1)).replace(hour=14).timestamp(),
+            note="mañana 14hs",
+        ),
+        _fake_meta(
+            file="calendar://a/in-3-days",
+            source="calendar",
+            created_ts=(anchor + timedelta(days=3)).replace(hour=9).timestamp(),
+            note="+3 días",
+        ),
+        _fake_meta(
+            file="calendar://a/next-month",
+            source="calendar",
+            created_ts=(anchor + timedelta(days=35)).replace(hour=9).timestamp(),
+            note="mes que viene",
+        ),
+        _fake_meta(
+            file="reminders://x-apple-reminder://TODAY",
+            source="reminders",
+            created_ts=anchor.replace(hour=18).timestamp(),
+            note="reminder hoy",
+        ),
+    ]
+    monkeypatch.setattr(rag, "_load_corpus", lambda col: {"metas": metas})
+    return metas
+
+
+def test_handle_agenda_window_hoy_filters_to_today(monkeypatch):
+    """With question='qué tengo hoy' and 5 events spread 0-35 days, only
+    the 2 same-day events survive the window filter."""
+    anchor = datetime(2026, 4, 22, 10, 30)  # Wed
+    _windowed_corpus(monkeypatch, anchor)
+    # Patch datetime.now() in the window parser's scope so the anchor
+    # is deterministic. The parser already accepts an explicit `now`,
+    # but the handler doesn't forward it (reasonable since production
+    # calls don't pin time). We rely on monkeypatching datetime.now
+    # instead. Simpler: call handle_agenda with an explicit anchor via
+    # the module's datetime patch.
+    monkeypatch.setattr(
+        rag, "datetime",
+        type("D", (), {"now": staticmethod(lambda: anchor)}),
+    )
+    files = rag.handle_agenda(col=None, params={}, question="qué tengo hoy")
+    # Exactly 2 items today: event @10hs + reminder @18hs.
+    assert len(files) == 2
+    paths = {m["file"] for m in files}
+    assert paths == {
+        "calendar://a/today",
+        "reminders://x-apple-reminder://TODAY",
+    }
+
+
+def test_handle_agenda_window_esta_semana(monkeypatch):
+    """Anchor Wed → ISO week Mon-Sun: days 0 (today), +1 (tomorrow),
+    +3 (Saturday) are all within-week; +35 is out."""
+    anchor = datetime(2026, 4, 22, 10, 30)  # Wed, ISO week 17 (Mon 20 - Sun 26)
+    _windowed_corpus(monkeypatch, anchor)
+    monkeypatch.setattr(
+        rag, "datetime",
+        type("D", (), {"now": staticmethod(lambda: anchor)}),
+    )
+    files = rag.handle_agenda(col=None, params={}, question="qué tengo esta semana")
+    paths = {m["file"] for m in files}
+    # 4 items in-week: hoy event, hoy reminder, mañana, +3 days (Sat).
+    # "next-month" is out.
+    assert "calendar://a/next-month" not in paths
+    assert paths == {
+        "calendar://a/today",
+        "calendar://a/tomorrow",
+        "calendar://a/in-3-days",
+        "reminders://x-apple-reminder://TODAY",
+    }
+
+
+def test_handle_agenda_window_no_question_falls_back(monkeypatch):
+    """question=None → no window filter; all 5 items pass (source filter
+    still applies, but 5 are all calendar/reminders here)."""
+    anchor = datetime(2026, 4, 22, 10, 30)
+    _windowed_corpus(monkeypatch, anchor)
+    # No monkeypatch on datetime.now needed — with question=None the
+    # parser is never called.
+    files = rag.handle_agenda(col=None, params={}, question=None)
+    assert len(files) == 5
+
+
+def test_handle_agenda_window_unparseable_question_falls_back(monkeypatch):
+    """question present but no temporal anchor → parser returns None,
+    handler falls back to top-N by ts desc (all pass)."""
+    anchor = datetime(2026, 4, 22, 10, 30)
+    _windowed_corpus(monkeypatch, anchor)
+    # "mi agenda" is an agenda-intent trigger but has no temporal cue —
+    # so window filter is skipped and every source-matching item passes.
+    files = rag.handle_agenda(col=None, params={}, question="mi agenda")
+    assert len(files) == 5

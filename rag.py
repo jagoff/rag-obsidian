@@ -3891,6 +3891,120 @@ def _map_feedback_row(ev: dict) -> dict:
     return out
 
 
+def _read_queries_for_log(
+    n: int, *, low_confidence: bool = False,
+) -> list[dict]:
+    """Read the last N query events from `rag_queries` SQL for the CLI
+    renderer. Returns event-shaped dicts in chronological order (newest
+    last) to match the historical JSONL tail-read shape.
+
+    Post-T10 (2026-04-19) this is the ONLY source — the JSONL
+    `queries.jsonl` path got repurposed for conversation-writer
+    observability events and no longer receives query events, which is
+    why the pre-fix CLI rendered empty rows.
+
+    `low_confidence=True` narrows the SELECT to `top_score <
+    CONFIDENCE_RERANK_MIN` (excludes NULL scores to avoid matching
+    metachat / create-intent turns that never scored anything).
+
+    `turn_id` is hoisted from `extra_json` so the feedback join in the
+    renderer can match without re-parsing the JSON blob for every row.
+
+    Errors swallow + log via `_silent_log` + return [] — matches the
+    degradation semantics of other SQL readers in the module; the CLI
+    prints an empty table rather than blowing up.
+    """
+    if n is None or n <= 0:
+        return []
+    # Always exclude rows with empty `q` — these come from admin-style
+    # events (followup, read, etc) that co-opt `rag_queries` to log their
+    # run metadata but don't represent actual search queries. Pre-T10 the
+    # JSONL tail didn't mix them because the older `log_query_event` path
+    # didn't insert rows with `q=""`; post-T10 `_map_queries_row` hardens
+    # against NOT NULL constraint with `setdefault("q", "")`, so those
+    # admin rows now pile up. Filter them here rather than reshaping the
+    # writers — the table still exposes them for downstream analytics.
+    filters = ["q IS NOT NULL", "q != ''"]
+    params: list = []
+    if low_confidence:
+        filters.append("top_score IS NOT NULL")
+        filters.append("top_score < ?")
+        params.append(CONFIDENCE_RERANK_MIN)
+    where_clause = "WHERE " + " AND ".join(filters)
+    sql = (
+        "SELECT ts, cmd, q, session, mode, top_score, t_retrieve, t_gen,"
+        " answer_len, citation_repaired, critique_fired, critique_changed,"
+        " extra_json"
+        f" FROM rag_queries {where_clause}"
+        " ORDER BY ts DESC LIMIT ?"
+    )
+    params.append(int(n))
+    try:
+        with _ragvec_state_conn() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+    except Exception as exc:
+        _silent_log("rag_log_sql_read", exc)
+        return []
+    # SQL ORDER BY ts DESC → flip to chronological so the renderer scrolls
+    # like tail -f (newest at the bottom).
+    events: list[dict] = []
+    for row in reversed(rows):
+        d = dict(zip(cols, row))
+        extra = d.pop("extra_json", None)
+        if extra:
+            try:
+                ej = json.loads(extra) if isinstance(extra, str) else extra
+            except Exception:
+                ej = None
+            if isinstance(ej, dict):
+                # Only hoist `turn_id` — other extras stay in the blob.
+                # Preserves the minimal surface the renderer needs.
+                tid = ej.get("turn_id")
+                if tid:
+                    d["turn_id"] = tid
+        events.append(d)
+    return events
+
+
+def _read_feedback_map_for_log() -> dict[str, int]:
+    """Read `{turn_id: +1|-1}` from `rag_feedback` for the CLI renderer's
+    thumb-emoji column. Replaces the pre-T10 tail-read of `FEEDBACK_PATH`
+    (`feedback.jsonl`).
+
+    Normalisation: raw rating is any non-zero int; map collapses to +1/-1
+    so the renderer's emoji logic stays unchanged. On duplicate turn_ids
+    the LATEST by `ts` wins — matches user intent when someone flips
+    their thumbs (down → up).
+
+    Rows without `turn_id` (global scope feedback) are skipped — they
+    can't attach to a specific query row in the rendered table.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            # ORDER BY ts ASC so the dict-build loop overwrites older
+            # ratings with newer ones per turn_id (latest wins).
+            cursor = conn.execute(
+                "SELECT turn_id, rating FROM rag_feedback "
+                "WHERE turn_id IS NOT NULL AND turn_id != '' "
+                "ORDER BY ts ASC"
+            )
+            out: dict[str, int] = {}
+            for tid, rating in cursor.fetchall():
+                try:
+                    r = int(rating)
+                except (TypeError, ValueError):
+                    continue
+                if r == 0:
+                    continue
+                out[tid] = 1 if r > 0 else -1
+            return out
+    except Exception as exc:
+        _silent_log("rag_log_feedback_sql_read", exc)
+        return {}
+
+
 def _map_tune_row(ev: dict) -> dict:
     out: dict = {}
     for k in ("ts", "cmd", "samples", "seed", "n_cases", "delta",
@@ -18755,47 +18869,32 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
     detectar subsistemas que fallan calladamente (context_cache corrupto,
     feedback_golden_embed offline, contradict JSON parse). Agregar
     --summary agrupa por (where × exc_type) para ver patrones.
+
+    Post-T10 (2026-04-19) lee de `rag_queries` SQL — el archivo JSONL
+    `queries.jsonl` ahora recibe eventos de otro stream (conversation
+    writer observability) y los campos no coinciden, por lo que el
+    renderer histórico dibujaba filas vacías.
     """
     if silent_errors:
         _render_silent_errors_log(n, summary)
         return
-    if not LOG_PATH.is_file():
-        console.print(f"[yellow]No hay log aún en {LOG_PATH}[/yellow]")
-        return
-    entries: list[dict] = []
-    for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except Exception:
-            continue
-    if low_confidence:
-        entries = [e for e in entries if (e.get("top_score") or 0) < CONFIDENCE_RERANK_MIN]
 
-    # Pre-load feedback so we can annotate (and filter if --feedback).
-    fb_by_turn: dict[str, int] = {}
-    if FEEDBACK_PATH.is_file():
-        try:
-            for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                tid = ev.get("turn_id")
-                if tid:
-                    fb_by_turn[tid] = 1 if ev.get("rating", 0) > 0 else -1
-        except Exception:
-            pass
+    # SQL read replaces the pre-T10 JSONL tail. Pulls enough rows to
+    # satisfy an eventual `--feedback` post-filter without extra
+    # round-trips: fetch N when feedback isn't active, 5*N otherwise
+    # (heuristic — feedback rows are rare, so 5x overprovisioning covers
+    # typical usage without dragging the whole table).
+    fetch_n = n * 5 if with_feedback else n
+    entries = _read_queries_for_log(fetch_n, low_confidence=low_confidence)
+
+    # Feedback annotations: always load so the renderer can paint the
+    # thumb column when any feedback exists, even without --feedback.
+    fb_by_turn = _read_feedback_map_for_log()
 
     if with_feedback:
         entries = [e for e in entries if e.get("turn_id") in fb_by_turn]
-
-    entries = entries[-n:]
+        # Trim to N now that the filter narrowed the set.
+        entries = entries[-n:]
     tbl = Table(title=f"Últimas {len(entries)} queries", show_lines=False)
     tbl.add_column("ts", style="dim")
     tbl.add_column("query", style="cyan", overflow="fold", max_width=45)
@@ -18810,8 +18909,8 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
         score_str = f"{score:+.1f}" if isinstance(score, (int, float)) else "-"
         score_style = "green" if (score or 0) >= 3 else ("yellow" if (score or 0) >= 0 else "red")
         row = [
-            e.get("ts", "")[-8:],
-            e.get("q", ""),
+            (e.get("ts") or "")[-8:],
+            e.get("q") or "",
             f"[{score_style}]{score_str}[/{score_style}]",
         ]
         if with_feedback or fb_by_turn:
@@ -18822,10 +18921,16 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
                 row.append("[green]👍[/green]")
             else:
                 row.append("[red]👎[/red]")
+        # NULL-safe: SQL rows return None for unset numeric fields (metachat
+        # / create-intent turns never populate t_retrieve/t_gen). `.get(k, 0)`
+        # returns None when the KEY IS PRESENT with a None value — the
+        # default only fires on absent keys. Coerce explicitly.
+        t_retrieve = e.get("t_retrieve") or 0.0
+        t_gen = e.get("t_gen") or 0.0
         row.extend([
-            f"{e.get('t_retrieve', 0):.1f}",
-            f"{e.get('t_gen', 0):.1f}",
-            e.get("mode", ""),
+            f"{t_retrieve:.1f}",
+            f"{t_gen:.1f}",
+            e.get("mode") or "",
         ])
         tbl.add_row(*row)
     console.print(tbl)

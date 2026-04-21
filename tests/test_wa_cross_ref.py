@@ -271,6 +271,7 @@ def test_cross_ref_without_propose(vault: Path, wa_db: Path) -> None:
     assert len(ref["messages"]) == 1
 
 
+@pytest.mark.requires_ollama
 def test_cross_ref_with_propose_calendar_event(vault: Path, wa_db: Path) -> None:
     """Message with parseable time ('mañana 19hs') → propose kind=calendar_event."""
     _seed_messages(wa_db, [
@@ -288,6 +289,7 @@ def test_cross_ref_with_propose_calendar_event(vault: Path, wa_db: Path) -> None
     assert "19:00" in ref["propose"]["when_iso"]
 
 
+@pytest.mark.requires_ollama
 def test_cross_ref_with_propose_reminder_date_only(vault: Path, wa_db: Path) -> None:
     """Message with date but no explicit time → propose kind=reminder."""
     _seed_messages(wa_db, [

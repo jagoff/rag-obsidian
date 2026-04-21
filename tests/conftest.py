@@ -8,6 +8,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 
+# Module-level ollama availability check — evaluated ONCE at collection
+# time. Avoids paying the subprocess + HTTP cost per test when 100+ tests
+# share the same skip condition.
+def _has_chat_model() -> bool:
+    """True if `resolve_chat_model()` finds an installed model in ollama.
+    False when ollama is down, not installed, or no CHAT_MODEL_PREFERENCE
+    model is pulled — CI, fresh dev boxes, sandboxed environments."""
+    try:
+        import rag
+        rag.resolve_chat_model()
+        return True
+    except Exception:
+        return False
+
+
+_HAS_CHAT_MODEL: bool = _has_chat_model()
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_no_ollama(request):
+    """Skip tests decorated with `@pytest.mark.requires_ollama` when
+    no ollama chat model is available (CI on ubuntu-latest, machines
+    without ollama pulled).
+
+    The marker is applied at either test or module scope:
+        pytestmark = pytest.mark.requires_ollama      # file-wide
+        @pytest.mark.requires_ollama                  # per-test
+    """
+    if request.node.get_closest_marker("requires_ollama") and not _HAS_CHAT_MODEL:
+        pytest.skip(
+            "requires ollama with a CHAT_MODEL_PREFERENCE model installed "
+            "(e.g. `ollama pull qwen2.5:7b`); not available in this env"
+        )
+
+
 @pytest.fixture(autouse=True)
 def _isolate_vault_path(tmp_path_factory, request):
     """Safety-critical: `rag.VAULT_PATH` resuelve en import-time a

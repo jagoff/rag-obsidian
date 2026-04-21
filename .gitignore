@@ -58,3 +58,6 @@ Desktop.ini
 # Playwright MCP session artifacts + stray screenshots
 .playwright-mcp/
 ticker-buscando.png
+# Local OCR end-to-end scratch captures — used for ad-hoc validation of
+# the ocrmac pipeline, never meant to be versioned.
+ocr-e2e-*.png

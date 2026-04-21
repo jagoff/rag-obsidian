@@ -1,5 +1,6 @@
 """Tests for the nightly online-tune launchd service and RAG_EXPLORE plists."""
 import plistlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,11 +13,21 @@ import rag as rag_module
 
 RAG_BIN = "/usr/local/bin/rag"
 
+# `plutil` is macOS-only — tests that lint plist XML via `plutil -lint` skip
+# on Linux CI (ubuntu-latest). Structural parsing via `plistlib` still runs
+# cross-platform on the other plist tests, so the essential invariants
+# (label, schedule, env vars) stay covered everywhere.
+_HAS_PLUTIL = shutil.which("plutil") is not None
+requires_plutil = pytest.mark.skipif(
+    not _HAS_PLUTIL, reason="plutil is macOS-only; plist XML lint skipped on other platforms"
+)
+
 
 def _parse_plist(xml: str) -> dict:
     return plistlib.loads(xml.encode())
 
 
+@requires_plutil
 def test_online_tune_plist_valid_plist():
     xml = rag_module._online_tune_plist(RAG_BIN)
     result = subprocess.run(
@@ -130,6 +141,7 @@ def test_services_spec_includes_serve():
     assert "com.fer.obsidian-rag-serve" in labels
 
 
+@requires_plutil
 def test_serve_plist_valid_plist():
     xml = rag_module._serve_plist(RAG_BIN)
     result = subprocess.run(
@@ -204,6 +216,7 @@ def test_services_spec_includes_ingesters():
     ("_ingest_reminders_plist", "reminders", 21600), # 6 horas
     ("_ingest_calendar_plist", "calendar", 3600),    # 1 hora
 ])
+@requires_plutil
 def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval):
     """Cada plist de ingester debe ser XML válido + parseable + apuntar al
     comando correcto + tener el interval esperado."""

@@ -327,6 +327,7 @@ def test_gmail_recent_missing_internal_date_is_empty_received_at(monkeypatch):
 # ── 3. No-tool-calls path ──────────────────────────────────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_no_tools_path(chat_env, capsys):
     responses = [
         # Tool-deciding round 1 — no tool_calls.
@@ -369,6 +370,7 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
 # ── 4. Single-tool path ────────────────────────────────────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_tool_path(chat_env, capsys):
     # Stub the weather collector so it returns deterministic JSON.
     chat_env.setattr(
@@ -420,6 +422,7 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
 # ── 5. Parallel tools in one round ─────────────────────────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_parallel_tools(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
     chat_env.setattr(server_mod, "_fetch_finance", lambda anchor: {"spend": 100})
@@ -484,6 +487,7 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
 # ── 6. Serial bucket precedes parallel ─────────────────────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_search", lambda q, k=5: '[]')
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
@@ -523,6 +527,7 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
 # ── 7. Tool exception is caught and stream completes ───────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
     def _blow_up(loc=None):
         raise RuntimeError("api down")
@@ -568,6 +573,7 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
 # ── 8. Round cap respected + nudge appended ────────────────────────────────
 
 
+@pytest.mark.requires_ollama
 def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeypatch):
     """Regression 2026-04-21 (batch B.4): cuando `retrieve()` devuelve
     `float('-inf')` (corpus vacío / meta-chat path), el `[chat-timing]`
@@ -609,6 +615,7 @@ def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeyp
     assert not math.isnan(float(top)), f"done.top_score nan: {top}"
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, monkeypatch):
     """Regression 2026-04-21 (bug #3): cuando la /api/chat llega con
     `history` no vacío (skipping el bloque que computa `_cache_key`) y
@@ -683,6 +690,7 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
     assert "topic_shift=person" in line, line
 
 
+@pytest.mark.requires_ollama
 def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
 

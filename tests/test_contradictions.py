@@ -86,6 +86,7 @@ def test_empty_vault_returns_empty(tmp_path, fake_embed, fake_reranker, scripted
     assert scripted_ollama.state["calls"] == 0
 
 
+@pytest.mark.requires_ollama
 def test_contradiction_detected_and_parsed(col, scripted_ollama):
     _add(col, "c1", "X es rojo según mis notas antiguas del archivo", "rojo.md", "rojo")
     _add(col, "c2", "X es un polígono con cuatro lados regulares", "cuad.md", "cuad")
@@ -118,6 +119,7 @@ def test_complementary_chunks_return_empty(col, scripted_ollama):
 _LONG_ANSWER = "X es definitivamente azul en todas mis notas nuevas del último mes."
 
 
+@pytest.mark.requires_ollama
 def test_json_embedded_in_prose_is_parsed(col, scripted_ollama):
     _add(col, "c1", "X es rojo", "rojo.md", "rojo")
     scripted_ollama(
@@ -153,6 +155,7 @@ def test_non_list_contradictions_returns_empty(col, scripted_ollama):
     assert out == []
 
 
+@pytest.mark.requires_ollama
 def test_exclude_paths_drops_cited_notes(col, scripted_ollama):
     _add(col, "c1", "X es rojo según las notas del año pasado", "rojo.md", "rojo")
     _add(col, "c2", "X era verde oscuro en mis borradores iniciales", "verde.md", "verde")
@@ -167,6 +170,7 @@ def test_exclude_paths_drops_cited_notes(col, scripted_ollama):
     assert out[0]["path"] == "verde.md"
 
 
+@pytest.mark.requires_ollama
 def test_out_of_range_index_is_dropped(col, scripted_ollama):
     _add(col, "c1", "X es rojo según mis notas", "rojo.md", "rojo")
     scripted_ollama(
@@ -204,6 +208,7 @@ def test_ollama_exception_returns_empty(col, fake_reranker, fake_embed, monkeypa
     assert out == []
 
 
+@pytest.mark.requires_ollama
 def test_why_is_truncated_to_200_chars(col, scripted_ollama):
     _add(col, "c1", "X es rojo", "rojo.md", "rojo")
     long_why = "tensión muy larga " * 30  # >> 200 chars
@@ -229,6 +234,7 @@ def test_embed_failure_returns_empty(col, fake_reranker, scripted_ollama, monkey
     assert scripted_ollama.state["calls"] == 0
 
 
+@pytest.mark.requires_ollama
 def test_non_dict_item_in_list_is_skipped(col, scripted_ollama):
     _add(col, "c1", "X es rojo", "rojo.md", "rojo")
     scripted_ollama(
@@ -240,6 +246,7 @@ def test_non_dict_item_in_list_is_skipped(col, scripted_ollama):
     assert out[0]["why"] == "ok"
 
 
+@pytest.mark.requires_ollama
 def test_missing_why_is_empty_string(col, scripted_ollama):
     _add(col, "c1", "X es rojo", "rojo.md", "rojo")
     scripted_ollama('{"contradictions": [{"index": 1}]}')

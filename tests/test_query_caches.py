@@ -174,8 +174,10 @@ def fake_chat(monkeypatch):
 
 
 def test_expand_second_call_hits_cache(fake_chat):
-    out1 = rag.expand_queries("qué hora es?")
-    out2 = rag.expand_queries("qué hora es?")
+    # ≥4 tokens para pasar el perf gate (_EXPAND_MIN_TOKENS) y hit del cache.
+    q = "qué hora es ahora mismo"
+    out1 = rag.expand_queries(q)
+    out2 = rag.expand_queries(q)
     assert out1 == out2
     assert fake_chat["calls"] == 1
 
@@ -205,16 +207,20 @@ def test_expand_eviction_drops_oldest_at_cap(fake_chat, monkeypatch):
     monkeypatch.setattr(rag, "_EXPAND_CACHE_MAX", 3)
     fake_chat["next_response"] = "alt one\nalt two"
 
-    # Queries con ≥3 tokens — las de 1-2 se saltean el LLM (perf gate) y
-    # no pasan por el cache, así que no sirven para validar eviction.
-    for q in ["pregunta uno alfa", "pregunta dos beta", "pregunta tres gamma"]:
+    # Queries con ≥4 tokens — las más cortas se saltean el LLM (perf gate)
+    # y no pasan por el cache, así que no sirven para validar eviction.
+    for q in [
+        "pregunta uno alfa hoy",
+        "pregunta dos beta hoy",
+        "pregunta tres gamma hoy",
+    ]:
         rag.expand_queries(q)
     assert len(rag._expand_cache) == 3
 
-    rag.expand_queries("pregunta cuatro delta")
+    rag.expand_queries("pregunta cuatro delta hoy")
     assert len(rag._expand_cache) == 3
-    assert "pregunta uno alfa" not in rag._expand_cache
-    assert "pregunta cuatro delta" in rag._expand_cache
+    assert "pregunta uno alfa hoy" not in rag._expand_cache
+    assert "pregunta cuatro delta hoy" in rag._expand_cache
 
 
 def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
@@ -224,8 +230,8 @@ def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
     results = []
     errors = []
 
-    # ≥3 tokens para pasar el perf gate y llegar al cache
-    q = "pregunta concurrente varios"
+    # ≥4 tokens para pasar el perf gate y llegar al cache
+    q = "pregunta concurrente varios threads hoy"
 
     def worker():
         try:

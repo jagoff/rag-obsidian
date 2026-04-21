@@ -1,3 +1,4 @@
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -20,6 +21,27 @@ def _clear_query_caches():
     yield
     _rag._embed_cache.clear()
     _rag._expand_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_rag_local_embed_env():
+    """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
+    directly when the CLI group runs for query-like subcommands. Any test that
+    calls `CliRunner().invoke(rag.cli, ["query", ...])` leaks `RAG_LOCAL_EMBED=1`
+    into the process env — and since monkeypatch only reverts values *it* set,
+    the leak contaminates subsequent tests that assume the flag is unset (e.g.
+    `test_retrieve_source_filter.py` with 8-dim mock vec collections).
+
+    Snapshot the flag before each test and restore it after.
+    """
+    before = os.environ.get("RAG_LOCAL_EMBED")
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("RAG_LOCAL_EMBED", None)
+        else:
+            os.environ["RAG_LOCAL_EMBED"] = before
 
 
 @pytest.fixture(autouse=True)

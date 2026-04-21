@@ -6937,8 +6937,51 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 _local_embedder = None
 _local_embedder_lock = threading.Lock()
-_LOCAL_EMBED_ENABLED = os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no")
-LOCAL_EMBED_ENABLED = _LOCAL_EMBED_ENABLED  # public alias — the leading underscore was accidental (it's a config flag, not private)
+
+
+def _local_embed_enabled() -> bool:
+    """Lazy env-var check — callers read fresh so the CLI group can toggle
+    RAG_LOCAL_EMBED before subcommands dispatch (module-level constants baked
+    the value at import, which broke the auto-enable heuristic below).
+    """
+    return os.environ.get("RAG_LOCAL_EMBED", "").strip().lower() not in (
+        "", "0", "false", "no",
+    )
+
+
+# Kept for backwards compatibility with external code referencing the old
+# module-level constant. Reflects env *at import*; do NOT use in new code —
+# call `_local_embed_enabled()` instead so runtime env toggles are honored.
+_LOCAL_EMBED_ENABLED = _local_embed_enabled()
+LOCAL_EMBED_ENABLED = _LOCAL_EMBED_ENABLED  # public alias (pre-existing)
+
+
+# Subcommands that auto-enable RAG_LOCAL_EMBED=1 if the user hasn't set it
+# explicitly. Rule: include only paths that issue ≤ a handful of query
+# embeddings per invocation (interactive retrieval). EXCLUDE bulk paths
+# (index/watch/ingesters) — those stay on ollama to avoid VRAM pressure
+# from embedding 10k+ chunks through the SentenceTransformer singleton.
+_LOCAL_EMBED_AUTO_CMDS: frozenset[str] = frozenset({
+    "query", "chat", "do", "pendientes",
+    "prep", "links", "dupes",
+})
+
+
+def _maybe_auto_enable_local_embed(invoked_subcommand: str | None) -> None:
+    """If the user hasn't set RAG_LOCAL_EMBED explicitly AND the subcommand is
+    query-like, set it to "1" for this process. Falsy explicit values (0/no/
+    false) are treated as a deliberate opt-out and left alone. Truthy values
+    are already correct — no-op.
+
+    Called from the ``cli()`` click group body before subcommand dispatch so
+    ``_local_embed_enabled()`` picks up the flag when retrieve() runs.
+    """
+    if invoked_subcommand not in _LOCAL_EMBED_AUTO_CMDS:
+        return
+    existing = os.environ.get("RAG_LOCAL_EMBED")
+    if existing is not None and existing.strip() != "":
+        return  # user override (truthy or explicit-falsy) — respect it
+    os.environ["RAG_LOCAL_EMBED"] = "1"
 
 
 def _get_local_embedder():
@@ -6994,7 +7037,7 @@ def query_embed_local(texts: list[str]) -> list[list[float]] | None:
     Only intended for the *web chat query* path (1-3 short strings per call).
     Do NOT use from indexing/watch/ingest — those paths should stay on ollama.
     """
-    if not _LOCAL_EMBED_ENABLED:
+    if not _local_embed_enabled():
         return None
     model = _get_local_embedder()
     if model is None:
@@ -10794,16 +10837,18 @@ def retrieve(
     # 4. Retrieve per variant, union IDs.
     #    Non-HyDE path: batch-embed all variants in one Ollama call.
     #    HyDE path: each variant needs its own generated hypothetical, keep per-variant.
-    #    Fast path: when RAG_LOCAL_EMBED=1 (web server only), try in-process
-    #    SentenceTransformer embed first (~10-30ms vs ~140ms HTTP).  Falls back
-    #    to ollama silently if model not cached locally.  Indexing/watch paths
-    #    must not set RAG_LOCAL_EMBED so bulk chunk embeds stay on ollama.
+    #    Fast path: when RAG_LOCAL_EMBED=1 (web/serve plists + auto-enable
+    #    on query-like CLI subcommands via `_maybe_auto_enable_local_embed`),
+    #    try in-process SentenceTransformer embed first (~10-30ms vs ~140ms
+    #    HTTP).  Falls back to ollama silently if model not cached locally.
+    #    Indexing/watch/ingesters stay off the auto-enable allow-list so
+    #    bulk chunk embeds continue on ollama.
     where = build_where(folder, tag, date_range)
     _t0 = time.perf_counter()
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
-        _local_vecs = query_embed_local(variants) if _LOCAL_EMBED_ENABLED else None
+        _local_vecs = query_embed_local(variants) if _local_embed_enabled() else None
         variant_embeds = _local_vecs if _local_vecs is not None else embed(variants)
     _timing["embed_ms"] = (time.perf_counter() - _t0) * 1000
 
@@ -11847,8 +11892,15 @@ class _HighlightGroup(click.Group):
 
 
 @click.group(cls=_HighlightGroup)
-def cli():
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """RAG local para notas de Obsidian."""
+    # Auto-enable RAG_LOCAL_EMBED=1 for query-like subcommands (query, chat,
+    # do, pendientes, prep, links, dupes) unless the user has explicitly set
+    # it. Saves ~100-130ms per query by using the in-process SentenceTransformer
+    # instead of the ollama HTTP round-trip. See rag.py:6970
+    # (`_maybe_auto_enable_local_embed`) + CLAUDE.md §Env vars.
+    _maybe_auto_enable_local_embed(ctx.invoked_subcommand)
 
 
 def file_hash(raw: str) -> str:

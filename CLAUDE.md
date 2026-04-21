@@ -126,13 +126,13 @@ query → classify_intent → infer_filters [auto]
 
 Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. Each chunk: `embed_text` (prefixed `[folder|title|area|#tags]` + contextual summary), `display_text` (raw), `parent` metadata (enclosing section, ≤1200 chars). Hash per file → re-embed only on change. `is_excluded()` skips `.`-prefixed segments.
 
-**Contextual embeddings** (v8→v9): `get_context_summary()` generates a 1-2 sentence document-level summary per note via qwen2.5:3b, prepended to each chunk's `embed_text` as `Contexto: ...`. Cached by file hash in `~/.local/share/obsidian-rag/context_summaries.json`. Notes < 300 chars skip summarization. Improves multi-hop and chain retrieval significantly (+11% chain_success).
+**Contextual embeddings** (v8→v9): `get_context_summary()` generates a 1-2 sentence document-level summary per note via qwen2.5:3b, prepended to each chunk's `embed_text` as `Contexto: ...`. Cached by file hash in `~/.local/share/obsidian-rag/context_summaries.json`. Notes < 300 chars skip summarization. The original commit claimed "+11% chain_success" but that figure was never replicated against the current queries.yaml — treat as unverified.
 
-**Temporal tokens** (v9): `build_prefix()` appends `[recent]`/`[this-month]`/`[this-quarter]`/`[older]` based on `modified`/`created` frontmatter. Shifts embedding space so "current work" queries prefer recent notes without post-hoc boosts.
+**Temporal tokens** (removed 2026-04-20, v10→v11): `temporal_token()` was defined in commit d6e1073 to append `[recent]`/`[this-month]`/`[this-quarter]`/`[older]` to the embedding prefix but was never actually wired into `build_prefix()` (dead code). The 2026-04-20 A/B wired it in (v10) + reindexed + re-ran `rag eval`: singles hit@5 / MRR / chains hit@5 / chain_success all within noise vs the v9 baseline (singles MRR −0.011, others bit-identical). Feature removed (v11) along with the `temporal_token()` function. If recency ever matters empirically, resurrect from git history rather than reintroducing the dead code.
 
 **Graph PageRank**: `_graph_pagerank()` computes authority scores over the wikilink adjacency graph (power iteration, <10ms). Cached per corpus. Used as a tuneable ranking signal (`graph_pagerank` weight) and to sort graph expansion neighbors.
 
-**Schema changes**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v9`). Per-vault suffix = sha256[:8] of resolved path.
+**Schema changes**: bump `_COLLECTION_BASE` (currently `obsidian_notes_v11`). Per-vault suffix = sha256[:8] of resolved path.
 
 ### Model stack
 

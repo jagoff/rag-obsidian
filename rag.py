@@ -29,6 +29,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1179,7 +1180,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v10"  # v10: temporal tokens actually wired into build_prefix (dead-code since v9 commit d6e1073)
+_COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 2026-04-20: 0 impact on hit@5 / MRR vs v9, so reverted the 2026-04-20 wire of dead temporal_token())
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
@@ -6518,52 +6519,8 @@ def extract_wikilinks(text: str) -> list[str]:
     return seen
 
 
-def temporal_token(fm: dict) -> str:
-    """Classify note age into a temporal bucket for embedding prefix.
-
-    Buckets are coarse enough to avoid re-indexing on every day change:
-      recent    → modified within 7 days
-      this-month → within 30 days
-      this-quarter → within 90 days
-      older     → beyond 90 days
-      (empty)   → no date metadata
-
-    The token shifts the embedding vector so queries about "current work"
-    naturally prefer recent notes without needing post-hoc recency boosts.
-    """
-    stamp = fm.get("modified") or fm.get("created")
-    if not stamp or not isinstance(stamp, str):
-        return ""
-    try:
-        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
-        age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
-    except Exception:
-        return ""
-    if age_days <= 7:
-        return "recent"
-    elif age_days <= 30:
-        return "this-month"
-    elif age_days <= 90:
-        return "this-quarter"
-    return "older"
-
-
 def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str:
-    """Build the embedding prefix combining path, frontmatter fields, tags
-    and a coarse temporal bucket.
-
-    The temporal bucket (`[recent]`/`[this-month]`/`[this-quarter]`/`[older]`
-    from `temporal_token(fm)`) is appended at the end — it shifts the
-    embedding space so queries about "current work" naturally prefer recent
-    notes without needing post-hoc recency boosts. See `temporal_token()`
-    for the bucket thresholds.
-
-    NOTE: Prior to 2026-04-20 `temporal_token` was defined but never called
-    from here (dead code since commit d6e1073). That means notes indexed
-    before the v10 bump carry no bucket in their embed_text. Bumping
-    `_COLLECTION_BASE` forces a reindex so the feature goes live.
-    """
+    """Build the embedding prefix combining path, frontmatter fields, and tags."""
     fm_bits = []
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -6589,13 +6546,6 @@ def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str
     header += "]"
     if tags:
         header += " " + " ".join(f"#{t}" for t in tags)
-    # Temporal bucket: appended at the end so a missing/bad timestamp
-    # degrades gracefully (temporal_token returns "" and we skip). Uses
-    # brackets to match the retrieval-time query embedding (callers that
-    # want recency hits can phrase queries like "notas recientes").
-    tok = temporal_token(fm)
-    if tok:
-        header += f" [{tok}]"
     return header
 
 
@@ -13816,6 +13766,174 @@ def _prompt_vault_scope_interactive(cfg: dict) -> list[tuple[str, Path]]:
     return [(name, Path(path)) for name, path in vaults]
 
 
+# ── Chat CLI create-intent handler ─────────────────────────────────────────
+#
+# Invoked by the `rag chat` main loop when `_detect_propose_intent(question)`
+# returns True. Runs a single-round ollama tool-decide call with ONLY the
+# propose_reminder + propose_calendar_event tools exposed (narrow surface
+# = less decision paralysis; see web/server.py history commits for the
+# same discovery). If the LLM emits a tool_call we execute it (which
+# creates the reminder / event via AppleScript) and render a Rich chip
+# in the same `╌ ✓ agregado...` shape as the web UI's inline chip.
+#
+# Returns True if a tool was invoked (loop should `continue` past the
+# query-RAG path); False if the LLM refused to call a tool (caller can
+# fall through to the normal chat flow for a clarifying question turn).
+
+_CHAT_CREATE_OVERRIDE = (
+    "El usuario te pide REGISTRAR un recordatorio o evento en Apple. "
+    "Dos tools disponibles: una para eventos de calendario, otra para "
+    "reminders. Ollama te pasa los schemas — invocalas como tool_calls "
+    "del protocolo, no como texto.\n\n"
+    "Criterio: visitas/cumpleaños/reuniones/turnos/viajes → calendario. "
+    "Tareas/pagos/llamadas → reminder.\n\n"
+    "Título: sustantivo + contexto sin fechas ('cumpleaños de Astor "
+    "el viernes' → título 'cumpleaños de Astor').\n"
+    "Fecha/hora: pasala exactamente como la dijo el usuario. Sin hora, "
+    "la tool detecta sola que es all-day.\n\n"
+    "El único output válido acá es un tool_call en el protocolo."
+)
+
+
+def _render_chat_create_chip(payload: dict, console_) -> None:
+    """Render the inline `╌ ✓ agregado...` chip (Rich variant of the web
+    UI's created-chip) after a successful propose_* tool call. Covers the
+    success payload; errors are rendered differently by the caller.
+    """
+    kind = payload.get("kind")
+    fields = payload.get("fields") or {}
+    title = fields.get("title") or "(sin título)"
+
+    # Date/time presentation — mirrors the web chip's formatIsoDatetime +
+    # formatDateOnly, adapted to terminal output.
+    when_bits: list[str] = []
+    if kind == "event":
+        start_iso = fields.get("start_iso")
+        all_day = fields.get("all_day")
+        if start_iso:
+            try:
+                dt = datetime.fromisoformat(start_iso)
+            except ValueError:
+                dt = None
+            if dt is not None:
+                if all_day:
+                    when_bits.append(dt.strftime("%a %d-%m (todo el día)"))
+                else:
+                    when_bits.append(dt.strftime("%a %d-%m %H:%M"))
+    else:
+        due_iso = fields.get("due_iso")
+        if due_iso:
+            try:
+                dt = datetime.fromisoformat(due_iso)
+            except ValueError:
+                dt = None
+            if dt is not None:
+                when_bits.append(dt.strftime("%a %d-%m %H:%M"))
+        else:
+            when_bits.append("sin fecha")
+
+    kind_label = "agregado al calendario" if kind == "event" else "agregado a recordatorios"
+    parts = [f"[dim]╌[/dim] [green]✓[/green] [dim]{kind_label}[/dim] [dim]·[/dim] {title}"]
+    for w in when_bits:
+        parts.append(f"[dim]·[/dim] [dim]{w}[/dim]")
+    console_.print(" ".join(parts))
+
+
+def _handle_chat_create_intent(question: str) -> bool:
+    """Single-round tool-decide → tool exec → chip render flow.
+
+    Returns True when a propose_* tool fired (caller should skip the rest
+    of the turn's query-RAG path). Returns False on any failure path
+    (LLM refused to emit tool_calls, tool execution error, etc.) — the
+    caller can fall through to normal chat handling.
+    """
+    warmup_async()
+    tools = [propose_reminder, propose_calendar_event]
+    messages = [
+        {"role": "system", "content": _CHAT_CREATE_OVERRIDE},
+        {"role": "user", "content": question},
+    ]
+    try:
+        with console.status("[dim]creando…[/dim]", spinner="dots"):
+            resp = _chat_capped_client().chat(
+                model=resolve_chat_model(),
+                messages=messages,
+                tools=tools,
+                options={"num_ctx": 2048, "num_predict": 256,
+                         "temperature": 0.0, "seed": 42},
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+    except Exception as exc:
+        console.print(f"[red]✗ no pude crear: {exc}[/red]")
+        return False
+
+    msg = resp.message
+    tcalls = list(msg.tool_calls or [])
+    if not tcalls:
+        # LLM chose not to call the tool (rare with the focused prompt).
+        # Fall through to normal chat — the model probably wants to ask
+        # for clarification; caller decides what to do.
+        return False
+
+    # Execute the first tool call (the prompt says ONE tool, but be
+    # defensive). command-r's arg-wrapping quirk is handled same as
+    # `rag do`.
+    tc = tcalls[0]
+    name = tc.function.name
+    args = tc.function.arguments or {}
+    if isinstance(args, dict) and "parameters" in args and isinstance(args["parameters"], (dict, str)):
+        params = args["parameters"]
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        args = params
+    args = {k: v for k, v in args.items() if v not in ("", None)}
+
+    fn = {"propose_reminder": propose_reminder,
+          "propose_calendar_event": propose_calendar_event}.get(name)
+    if fn is None:
+        console.print(f"[red]✗ tool desconocido: {name}[/red]")
+        return False
+
+    try:
+        result_json = fn(**args)
+    except TypeError as exc:
+        console.print(f"[red]✗ args inválidos en {name}: {exc}[/red]")
+        return False
+    except Exception as exc:
+        console.print(f"[red]✗ {name} falló: {exc}[/red]")
+        return False
+
+    try:
+        payload = json.loads(result_json)
+    except Exception:
+        console.print(f"[yellow]⚠ {name} devolvió JSON inválido[/yellow]")
+        return False
+
+    # Route by payload shape.
+    if payload.get("created") is True:
+        _render_chat_create_chip(payload, console)
+        return True
+    if payload.get("needs_clarification"):
+        kind_label = "evento" if payload.get("kind") == "event" else "recordatorio"
+        field_text = (payload.get("fields") or {}).get("due_text") or \
+                     (payload.get("fields") or {}).get("start_text") or ""
+        console.print(
+            f"[yellow]⚠ Fecha/hora ambigua para el {kind_label} "
+            f"(\"{field_text}\"). Aclará y volvé a pedir.[/yellow]"
+        )
+        return True
+    if payload.get("created") is False:
+        err = payload.get("error") or "error desconocido"
+        console.print(f"[red]✗ no pude crear: {err}[/red]")
+        return True
+
+    console.print("[yellow]⚠ propose_* devolvió un payload sin resolución[/yellow]")
+    return False
+
+
 @cli.command()
 @click.option("-k", default=RERANK_TOP, help="Chunks finales por turno")
 @click.option("--folder", default=None, help="Filtrar por carpeta (ej: '02-Areas/Musica')")
@@ -14068,6 +14186,16 @@ def chat(
             break
         if not question:
             continue
+
+        # Create-intent short-circuit — "recordame X", "creá un evento",
+        # "mañana viene Grecia", "calendarizalo". Bypass retrieve + go
+        # straight to propose_reminder / propose_calendar_event tool
+        # calls. Same flow as /api/chat (see web/server.py); shared
+        # _detect_propose_intent. Continues the loop on success so the
+        # rest of the query-path isn't run.
+        if _detect_propose_intent(question):
+            if _handle_chat_create_intent(question):
+                continue
 
         # Rating intent — 👍 / 👎 / /bien / /mal aplicado a la última respuesta.
         # Check ANTES de /save /reindex /etc porque es el token más corto
@@ -19807,6 +19935,106 @@ _TIME_MARKER_RE = re.compile(
 )
 
 
+# ── Create-intent detection (shared by web `/api/chat` + CLI `rag chat`) ─────
+#
+# Moved here from web/server.py so the CLI chat loop can reuse it without
+# importing the FastAPI module. `_detect_propose_intent(q)` returns True
+# when the user's message should trigger propose_reminder /
+# propose_calendar_event tool calls (bypassing vault retrieval).
+#
+# Three branches:
+#   1. Explicit create verb — "recordame X", "creá un evento", "calendarizalo",
+#      "agendá una reunión", "anotá en el calendario".
+#   2. Statement with event noun + temporal anchor + not a question.
+#      "mañana tengo daily", "hay standup el jueves", "me citaron para
+#      entrevista el viernes 3pm".
+#   3. Statement with visit pattern (viene/pasa/llega/visita X) + temporal
+#      + not a question. "mañana viene gracia a casa".
+
+_PROPOSE_INTENT_RE = re.compile(
+    # Reminder triggers.
+    r"\brecord[aá](?:me|te|rme|arme)\b"
+    r"|\bacord[aá](?:te|rme|ate|áte)\b"
+    r"|\bagend[aá]me\b"
+    r"|\bpon[eé](?:me|te|le)?\s+(?:un\s+)?recordatorio\b"
+    r"|\bagreg(?:á|a|ar)\s+(?:un\s+)?recordatorio\b"
+    # Calendar triggers (create verb + event noun). Require the noun to
+    # avoid matching queries like "qué eventos tengo" (already covered by
+    # calendar_ahead read-intent).
+    r"|\b(?:cre[aá]|crear|agend[aá]|bloque[aá]|pon[eé]|agreg[aá])\b"
+    r"[^.?!]*"
+    r"\b(?:evento|reuni[oó]n|cita|turno|llamad[ao]|meeting|appointment)\b"
+    # Calendar-specific verbs that carry create intent on their own —
+    # "calendarizalo", "agendalo/agendala/agendame/agendar", "anotá en el
+    # calendario/agenda", "poné en el calendario/agenda". No event noun
+    # required because these verbs directly mean "put this in the calendar".
+    r"|\bcalendariz(?:á|ar|arl[oa]|al[oa]|ame|armel[oa]|amel[oa])\b"
+    r"|\bagend[aá](?:l[oa]|ame(?:l[oa])?|r|ar)\b"
+    r"|\banot(?:á|ame|arl[oa]|al[oa])\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b"
+    r"|\bpon(?:é|el[oa]|eme|ele)\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b",
+    re.IGNORECASE,
+)
+
+_EVENT_NOUN_RE = re.compile(
+    r"\b(?:reuni[oó]n|evento|cita|turno|llamada|daily|stand-?up|meeting|"
+    r"entrevista|\bcall\b|sync|retro(?:spectiva)?|planning|demo|all.?hands|"
+    r"sprint(?:\s+(?:review|planning))?|visita|clase|entrenamiento|"
+    r"sesi[oó]n|taller|workshop|webinar|conferencia|almuerzo|cena|show|"
+    r"concierto|partido|cumplea[ñn]os|aniversario|viaje|vuelo|appointment|"
+    r"1:1|1on1|one.?on.?one|uno.?a.?uno)\b",
+    re.IGNORECASE,
+)
+
+_VISIT_PATTERN_RE = re.compile(
+    r"\b(?:viene|vienen|viene\s+a|pasa|pasan|llega|llegan|visit[ao]|"
+    r"trae|traen|trae\s+a|recojo|recoger|buscamos|busco|busc[aá]n)\b",
+    re.IGNORECASE,
+)
+
+_TEMPORAL_ANCHOR_RE = re.compile(
+    r"\b(?:ma[ñn]ana|pasado\s+ma[ñn]ana|hoy|esta\s+(?:noche|tarde|ma[ñn]ana)|"
+    r"(?:el|este|pr[oó]xim[oa])\s+(?:lunes|martes|mi[eé]rcoles|jueves|"
+    r"viernes|s[aá]bado|domingo|finde|semana|mes|a[ñn]o)|"
+    r"la\s+semana\s+que\s+vienen?|el\s+(?:finde|mes\s+que\s+vienen?|"
+    r"a[ñn]o\s+que\s+vienen?)|"
+    r"a\s+las?\s+\d|tipo\s+\d|a\s+eso\s+de\s+las|"
+    r"en\s+\d+\s+(?:minutos?|horas?|d[ií]as?|semanas?))\b"
+    r"|\b\d{1,2}\s*(?:hs|h|am|pm)\b|\d{1,2}:\d{2}",
+    re.IGNORECASE,
+)
+
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:qu[eé]|qui[eé]n(?:es)?|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|"
+    r"d[oó]nde|c[oó]mo|por\s+qu[eé]|a\s+qu[eé]|de\s+qu[eé])\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_propose_intent(q: str) -> bool:
+    """Return True if `q` looks like a CREATE request (reminder or event).
+
+    Three-branch detection described at the module-level comment above.
+    Used by both the web chat endpoint (to force the LLM tool-decide
+    round and bypass vault retrieval) and the CLI `rag chat` loop (to
+    route the turn to the tool-calling helper instead of query-RAG).
+    """
+    if not q:
+        return False
+    if _PROPOSE_INTENT_RE.search(q):
+        return True
+    # Implicit branches. Question-word start disqualifies.
+    if _QUESTION_START_RE.match(q):
+        return False
+    has_temporal = bool(_TEMPORAL_ANCHOR_RE.search(q))
+    if not has_temporal:
+        return False
+    if _EVENT_NOUN_RE.search(q):
+        return True
+    if _VISIT_PATTERN_RE.search(q):
+        return True
+    return False
+
+
 def _has_explicit_time(text: str) -> bool:
     """Return True if `text` mentions a specific time of day.
 
@@ -20394,6 +20622,189 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
     if out.startswith("err:"):
         return False, out[4:].strip() or "evento no encontrado"
     return False, "osascript devolvió vacío"
+
+
+# ── Chat-tool wrappers (shared by web /api/chat + CLI rag chat) ──────────
+#
+# Moved here from web/tools.py so the CLI chat loop can register them
+# directly with ollama's tool-calling API. web/tools.py re-exports them
+# as `propose_reminder` / `propose_calendar_event`, unchanged for ollama
+# schema-extraction purposes.
+#
+# Each tool:
+#   1. Parses the when/start text via _parse_natural_datetime.
+#   2. If parse fails (no datetime AND text was non-empty) → returns a
+#      proposal payload with `needs_clarification: true`.
+#   3. Otherwise CREATES the reminder/event via _create_reminder /
+#      _create_calendar_event and returns `{created: true, <id>, fields}`.
+#   4. Calendar events auto-flip to all_day when no time marker detected
+#      in the start text (`_has_explicit_time`).
+
+def propose_reminder(
+    title: str,
+    when: str = "",
+    list: str | None = None,
+    priority: int | None = None,
+    notes: str | None = None,
+    recurrence_text: str | None = None,
+) -> str:
+    """Agregar un recordatorio a Apple Reminders. Si la fecha/hora parsea
+    clara, se CREA automáticamente. Si es ambigua, vuelve como propuesta
+    para confirmación manual.
+
+    Args:
+        title: Texto del recordatorio.
+        when: Fecha/hora en lenguaje natural ("mañana a las 10", "el jueves
+            4pm", "en 2 horas"). Vacío = recordatorio sin fecha.
+        list: Lista de Reminders destino. None = lista default del sistema.
+        priority: 1 (alta), 5 (media), 9 (baja). None = sin prioridad.
+        notes: Texto adicional para el body del recordatorio.
+        recurrence_text: Recurrencia NL ("todos los lunes", "cada 2 semanas").
+
+    Returns:
+        JSON. Si creado: `{kind, created:true, reminder_id, fields}`.
+        Ambiguo: `{kind, proposal_id, needs_clarification:true, fields}`.
+        Error: `{kind, created:false, error, fields}`.
+    """
+    now = datetime.now()
+    due = _parse_natural_datetime(when, now=now) if when and when.strip() else None
+    recurrence = _parse_natural_recurrence(recurrence_text) if recurrence_text else None
+    needs_clarif = bool(when and when.strip()) and due is None
+
+    fields = {
+        "title": title,
+        "due_iso": due.isoformat() if due else None,
+        "due_text": when or "",
+        "list": list,
+        "priority": priority,
+        "notes": notes,
+        "recurrence": recurrence,
+        "recurrence_text": recurrence_text,
+    }
+
+    if needs_clarif:
+        return json.dumps({
+            "kind": "reminder",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "needs_clarification": True,
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    ok, reminder_id = _create_reminder(
+        title, list_name=list,
+        due_dt=due, priority=priority, notes=notes, recurrence=recurrence,
+    )
+    if not ok:
+        return json.dumps({
+            "kind": "reminder",
+            "created": False,
+            "error": reminder_id,
+            "fields": fields,
+        }, ensure_ascii=False)
+    return json.dumps({
+        "kind": "reminder",
+        "created": True,
+        "reminder_id": reminder_id,
+        "fields": fields,
+    }, ensure_ascii=False)
+
+
+def propose_calendar_event(
+    title: str,
+    start: str,
+    end: str | None = None,
+    calendar: str | None = None,
+    location: str | None = None,
+    notes: str | None = None,
+    all_day: bool = False,
+    recurrence_text: str | None = None,
+) -> str:
+    """Agregar un evento a Calendar.app. Si la fecha parsea clara, se CREA
+    automáticamente. Si es ambigua, vuelve como propuesta.
+
+    Auto all-day: si el user no incluyó marcador de hora en `start` (ej.
+    "el miercoles", "cumpleaños de X el viernes"), el tool flippea
+    all_day=True automáticamente. Passar all_day=False explícito para
+    overridear.
+
+    Args:
+        title: Summary del evento.
+        start: Fecha/hora en NL. "jueves 4pm" → timed; "el jueves" → all-day.
+        end: Fecha/hora de fin. None + all_day=True → start + 1 día.
+            None + timed → start + 1h.
+        calendar: Calendario destino. None = primer writable (iCloud).
+        location: Ubicación (string libre).
+        notes: Descripción / notas del evento.
+        all_day: Evento de día completo. Auto-flip si no hay hora en start.
+        recurrence_text: Recurrencia NL.
+
+    Returns:
+        JSON. Si creado: `{kind, created:true, event_uid, fields}`.
+        Ambiguo: `{kind, proposal_id, needs_clarification:true, fields}`.
+        Error: `{kind, created:false, error, fields}`.
+    """
+    now = datetime.now()
+    start_dt = _parse_natural_datetime(start, now=now) if start and start.strip() else None
+    end_dt: datetime | None = None
+    if end and end.strip():
+        end_dt = _parse_natural_datetime(end, now=start_dt or now)
+
+    # Auto all-day detection (see propose_calendar_event docstring in
+    # web/tools.py original for full rationale).
+    if start_dt and not all_day and not _has_explicit_time(start):
+        all_day = True
+
+    if not end_dt:
+        if all_day:
+            _s_midnight = start_dt.replace(hour=0, minute=0, second=0, microsecond=0) if start_dt else None
+            end_dt = _s_midnight + timedelta(days=1) if _s_midnight else None
+            start_dt = _s_midnight
+        elif start_dt:
+            end_dt = start_dt + timedelta(hours=1)
+
+    recurrence = _parse_natural_recurrence(recurrence_text) if recurrence_text else None
+    needs_clarif = start_dt is None
+
+    fields = {
+        "title": title,
+        "start_iso": start_dt.isoformat() if start_dt else None,
+        "start_text": start or "",
+        "end_iso": end_dt.isoformat() if end_dt else None,
+        "end_text": end or "",
+        "calendar": calendar,
+        "location": location,
+        "notes": notes,
+        "all_day": bool(all_day),
+        "recurrence": recurrence,
+        "recurrence_text": recurrence_text,
+    }
+
+    if needs_clarif:
+        return json.dumps({
+            "kind": "event",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "needs_clarification": True,
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    ok, res = _create_calendar_event(
+        title, start_dt, end_dt,
+        calendar=calendar, location=location, notes=notes,
+        all_day=bool(all_day), recurrence=recurrence,
+    )
+    if not ok:
+        return json.dumps({
+            "kind": "event",
+            "created": False,
+            "error": res,
+            "fields": fields,
+        }, ensure_ascii=False)
+    return json.dumps({
+        "kind": "event",
+        "created": True,
+        "event_uid": res,
+        "fields": fields,
+    }, ensure_ascii=False)
 
 
 def _fetch_completed_reminders(

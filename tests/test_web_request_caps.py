@@ -86,19 +86,22 @@ def test_feedback_accepts_paths_at_cap():
 
 
 def test_chat_rejects_oversized_question():
-    """ChatRequest.question cap at 8000 was already in place pre-2026-04-20
-    audit (via a field_validator, not Field(max_length=...)); this test
-    guards against accidental removal during refactors."""
+    """ChatRequest.question cap raised from 8000 to 16000 on 2026-04-20
+    (users sometimes paste long doc excerpts into chat). Test uses
+    16001 to cross the new cap — bump here AND in web/server.py's
+    `_CHAT_QUESTION_MAX` if you raise it again.
+    Implemented via a field_validator, so Pydantic error type is
+    'value_error' (not 'string_too_long' like the Field-based caps)."""
     with pytest.raises(ValidationError) as exc_info:
-        ChatRequest(question="x" * 8001)
+        ChatRequest(question="x" * 16001)
     # field_validator raises ValueError → Pydantic type is "value_error"
     # (not "string_too_long" like the Field-based caps above).
     assert "too long" in str(exc_info.value).lower()
 
 
 def test_chat_accepts_question_at_cap():
-    req = ChatRequest(question="x" * 8000)
-    assert len(req.question) == 8000
+    req = ChatRequest(question="x" * 16000)
+    assert len(req.question) == 16000
 
 
 def test_chat_rejects_empty_question():

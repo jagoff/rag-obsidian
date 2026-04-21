@@ -19,6 +19,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -581,7 +582,7 @@ def chat_page() -> FileResponse:
 
 _CHAT_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:@\-]{1,80}$")
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
-_CHAT_QUESTION_MAX = 8000  # ~2k tokens — chat prompts >8k chars are pathological
+_CHAT_QUESTION_MAX = 16000  # ~4k tokens — bumped from 8000 (2026-04-20) because users sometimes paste long doc excerpts into chat; 16000 still well under CHAT_OPTIONS num_ctx=4096 × 4 chars/token
 
 
 class ChatRequest(BaseModel):
@@ -4986,72 +4987,202 @@ def _dashboard_aggregate(
 
 
 # ── Real-time stream ─────────────────────────────────────────────────────────
-# Tail JSONL logs and emit SSE events. The browser polls /api/dashboard for the
-# heavy aggregations; this endpoint pushes deltas as they happen so KPIs and
-# the live feed update without waiting for the next poll.
+# Poll rag_* SQL tables for new rows and push them as SSE events. The browser
+# polls /api/dashboard for the heavy aggregations; this endpoint streams
+# deltas so KPIs and the live feed update without waiting for the next poll.
+#
+# Post-T10 note: writers no longer touch the `queries.jsonl` / `behavior.jsonl`
+# / `ambient.jsonl` / `contradictions.jsonl` files, so the previous tail-based
+# implementation emitted zero deltas in production. SQL ID-poll is the only
+# viable source now. Each kind maps to a table + a row→event mapper that
+# rebuilds the JSONL-equivalent shape `_stream_payload` expects.
 
-_STREAM_FILES: dict[str, str] = {
-    "query": "queries.jsonl",
-    "feedback": "feedback.jsonl",
-    "ambient": "ambient.jsonl",
-    "contradiction": "contradictions.jsonl",
+# Rows returned per poll per table. Caps runaway growth if a long burst
+# happens between polls; anything over this is silently skipped — the
+# next poll picks up the newest rows (the UI feed is a live tail, not an
+# audit log, so losing intermediate events during a burst is acceptable).
+_STREAM_ROW_CAP = 100
+
+
+def _row_to_query_ev(row: dict) -> dict:
+    """Rebuild the JSONL-shaped event `_stream_payload('query', ...)` expects
+    from a rag_queries row. `extra_json` carries legacy keys like `gated_
+    low_confidence` and `error` — unpack when present, ignore otherwise.
+    """
+    extra: dict = {}
+    raw_extra = row.get("extra_json")
+    if raw_extra:
+        try:
+            extra = json.loads(raw_extra) or {}
+        except Exception:
+            extra = {}
+    paths: list = []
+    raw_paths = row.get("paths_json")
+    if raw_paths:
+        try:
+            paths = json.loads(raw_paths) or []
+        except Exception:
+            paths = []
+    bad: list = []
+    raw_bad = row.get("bad_citations_json")
+    if raw_bad:
+        try:
+            bad = json.loads(raw_bad) or []
+        except Exception:
+            bad = []
+    return {
+        "ts": row.get("ts"),
+        "q": row.get("q"),
+        "cmd": row.get("cmd"),
+        "session": row.get("session"),
+        "top_score": row.get("top_score"),
+        "t_retrieve": row.get("t_retrieve"),
+        "t_gen": row.get("t_gen"),
+        "paths": paths,
+        "bad_citations": bad,
+        "gated_low_confidence": extra.get("gated_low_confidence"),
+        "error": extra.get("error"),
+    }
+
+
+def _row_to_feedback_ev(row: dict) -> dict:
+    """rag_feedback row → event shape `_stream_payload('feedback', ...)`."""
+    extra: dict = {}
+    raw_extra = row.get("extra_json")
+    if raw_extra:
+        try:
+            extra = json.loads(raw_extra) or {}
+        except Exception:
+            extra = {}
+    paths: list = []
+    raw_paths = row.get("paths_json")
+    if raw_paths:
+        try:
+            paths = json.loads(raw_paths) or []
+        except Exception:
+            paths = []
+    return {
+        "ts": row.get("ts"),
+        "rating": row.get("rating"),
+        "q": row.get("q"),
+        "paths": paths,
+        "reason": extra.get("reason"),
+        "corrective_path": extra.get("corrective_path"),
+    }
+
+
+def _row_to_ambient_ev(row: dict) -> dict:
+    """rag_ambient row → event shape `_stream_payload('ambient', ...)`.
+    `wikilinks_applied` lives in `payload_json`; absent → 0."""
+    payload: dict = {}
+    raw_payload = row.get("payload_json")
+    if raw_payload:
+        try:
+            payload = json.loads(raw_payload) or {}
+        except Exception:
+            payload = {}
+    return {
+        "ts": row.get("ts"),
+        "path": row.get("path"),
+        "wikilinks_applied": payload.get("wikilinks_applied", 0),
+    }
+
+
+def _row_to_contradiction_ev(row: dict) -> dict:
+    """rag_contradictions row → event shape `_stream_payload('contradiction',
+    ...)`. The dashboard expects `path` (subject) and `contradicts` (list)."""
+    contradicts: list = []
+    raw = row.get("contradicts_json")
+    if raw:
+        try:
+            contradicts = json.loads(raw) or []
+        except Exception:
+            contradicts = []
+    skipped_val = row.get("skipped")
+    return {
+        "ts": row.get("ts"),
+        "path": row.get("subject_path"),
+        "contradicts": contradicts,
+        "skipped": bool(skipped_val) and skipped_val not in ("", "0", "false", "no"),
+    }
+
+
+# (table, mapper) per stream kind. Mappers rebuild the JSONL-shaped dict that
+# `_stream_payload(kind, ev)` consumes — keeps the downstream shaping logic
+# (which the dashboard JS already depends on) byte-identical.
+_STREAM_SOURCES: dict[str, tuple[str, Callable[[dict], dict]]] = {
+    "query":         ("rag_queries",        _row_to_query_ev),
+    "feedback":      ("rag_feedback",       _row_to_feedback_ev),
+    "ambient":       ("rag_ambient",        _row_to_ambient_ev),
+    "contradiction": ("rag_contradictions", _row_to_contradiction_ev),
 }
+
+
+def _stream_max_id(conn, table: str) -> int:
+    """Starting cursor for a stream — connection-time high-water mark so the
+    client only sees rows written AFTER it connects. Missing table or no rows
+    → 0."""
+    try:
+        row = conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _stream_fetch_since(conn, table: str, last_id: int) -> list[dict]:
+    """Return up to `_STREAM_ROW_CAP` new rows with `id > last_id` ordered by
+    id ascending. Empty list on any error (connection churn, transient lock)
+    — the next poll retries."""
+    try:
+        cur = conn.execute(
+            f"SELECT * FROM {table} WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, _STREAM_ROW_CAP),
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception:
+        return []
 
 
 @app.get("/api/dashboard/stream")
 async def dashboard_stream() -> StreamingResponse:
-    """SSE: tail JSONL logs and push new events as they arrive.
+    """SSE: poll rag_* SQL tables for new rows and push them as events.
 
-    TODO: post-T10 — revisit SSE source. Writers no longer append to these
-    JSONL files (they write directly to rag_* SQL tables), so the tail loop
-    here will emit zero deltas in production. The endpoint stays up to keep
-    the dashboard JS connection alive (heartbeat events still fire) until
-    this is swapped for a short-interval `SELECT ... WHERE id > :last_id`
-    poll against the SQL tables.
+    Each kind tracks its own `last_id` cursor, initialised at connection
+    time from `MAX(id)` so the client only receives rows inserted during
+    the connection. Per poll, one SQL connection is opened, all 4 tables
+    are scanned, then the connection is closed — keeps total connection
+    time short (WAL readers don't block writers but we prefer no-op
+    polls to not hold the conn).
     """
-    data_dir = Path.home() / ".local/share/obsidian-rag"
-    paths = {kind: data_dir / fname for kind, fname in _STREAM_FILES.items()}
-    # Start at current EOF so the client only sees new events.
-    offsets: dict[str, int] = {
-        kind: (p.stat().st_size if p.is_file() else 0) for kind, p in paths.items()
-    }
+    # Cursors per kind — populated lazily on first poll so connection-setup
+    # errors don't kill the SSE stream (the dashboard uses this endpoint as
+    # a heartbeat in addition to a data feed).
+    cursors: dict[str, int | None] = {kind: None for kind in _STREAM_SOURCES}
 
     async def gen():
         last_heartbeat = time.time()
         # Initial hello so the client can flip the indicator immediately.
-        yield _sse("hello", {"t": time.time(), "tracking": list(paths.keys())})
+        yield _sse("hello", {"t": time.time(), "tracking": list(_STREAM_SOURCES)})
         try:
             while True:
-                for kind, path in paths.items():
-                    if not path.is_file():
-                        continue
-                    try:
-                        cur_size = path.stat().st_size
-                    except OSError:
-                        continue
-                    prev = offsets.get(kind, 0)
-                    if cur_size < prev:
-                        # Truncated/rotated — reset and skip.
-                        offsets[kind] = cur_size
-                        continue
-                    if cur_size == prev:
-                        continue
-                    try:
-                        with path.open("rb") as f:
-                            f.seek(prev)
-                            chunk = f.read(cur_size - prev)
-                    except OSError:
-                        continue
-                    offsets[kind] = cur_size
-                    for line in chunk.decode("utf-8", errors="replace").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            ev = json.loads(line)
-                        except Exception:
-                            continue
-                        yield _sse(kind, _stream_payload(kind, ev))
+                try:
+                    with _ragvec_state_conn() as conn:
+                        for kind, (table, mapper) in _STREAM_SOURCES.items():
+                            if cursors[kind] is None:
+                                cursors[kind] = _stream_max_id(conn, table)
+                                continue
+                            rows = _stream_fetch_since(conn, table, cursors[kind])
+                            if not rows:
+                                continue
+                            cursors[kind] = max(int(r.get("id") or 0) for r in rows)
+                            for r in rows:
+                                ev = mapper(r)
+                                yield _sse(kind, _stream_payload(kind, ev))
+                except Exception:
+                    # Transient SQL error — skip this cycle, keep the SSE
+                    # connection up so the dashboard doesn't reconnect.
+                    pass
                 now = time.time()
                 if now - last_heartbeat >= 15:
                     yield _sse("heartbeat", {"t": now})

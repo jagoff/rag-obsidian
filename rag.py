@@ -739,11 +739,62 @@ def record_brief_written(
 
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]")
+_SECTION_HEADER_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$")
 
 
 def _extract_wikilinks_from_markdown(text: str) -> list[str]:
     """Return raw wikilink targets (the part before | or #) from markdown text."""
     return _WIKILINK_RE.findall(text)
+
+
+def _wikilinks_by_section(text: str) -> dict[str, list[str]]:
+    """Group wikilink targets by the `##`/`###` section they appear under.
+
+    Returns a mapping `{section_name: [wikilink_title, ...]}`. Wikilinks
+    above any H2 header are bucketed under `"(preamble)"`. Order preserved
+    per section; duplicates within a section are kept (caller dedups after
+    resolving to paths). H1 titles (single `#`) are ignored — brief
+    frontmatter + intro lines usually live above the first H2.
+    """
+    current = "(preamble)"
+    out: dict[str, list[str]] = {}
+    in_fence = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _SECTION_HEADER_RE.match(stripped)
+        if m:
+            current = m.group(2).strip() or "(unnamed)"
+            continue
+        for wl in _WIKILINK_RE.findall(raw):
+            out.setdefault(current, []).append(wl)
+    return out
+
+
+def _citations_by_section(
+    text: str,
+    title_to_paths: dict[str, set[str]],
+    vault: "Path",
+) -> dict[str, list[str]]:
+    """Section-aware variant of wikilink → path resolution.
+
+    Returns `{section_name: [vault_relative_path, ...]}` with ambiguous
+    / unresolvable titles dropped silently. Sections with no resolved
+    citations are omitted from the output.
+    """
+    by_section = _wikilinks_by_section(text)
+    out: dict[str, list[str]] = {}
+    for section, titles in by_section.items():
+        if not titles:
+            continue
+        resolved, _ambig = _resolve_wikilinks_to_paths(titles, title_to_paths, vault)
+        if resolved:
+            out[section] = resolved
+    return out
 
 
 def _resolve_wikilinks_to_paths(
@@ -7240,6 +7291,7 @@ _warmup_lock = threading.Lock()
 # next touch_reranker() call unloads it; first subsequent query pays
 # ~2-3s to reinit. Override with RAG_RERANKER_IDLE_TTL env var (seconds).
 _RERANKER_IDLE_TTL = float(os.environ.get("RAG_RERANKER_IDLE_TTL", "900"))
+RERANKER_IDLE_TTL = _RERANKER_IDLE_TTL  # public alias — the `_` prefix was accidental (it's a config flag, not private)
 
 
 def get_reranker():
@@ -20762,10 +20814,17 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
     Returns:
         {
           "unread_count": int — total unread in inbox (all-time),
-          "starred": [{subject, from, snippet}] up to 3 recent starred threads,
-          "awaiting_reply": [{subject, from, snippet, days_old}] up to 5
-             threads where the last message is NOT from me and is 3-14d old.
+          "starred": [{subject, from, snippet, thread_id, internal_date_ms}]
+             up to 3 recent starred threads,
+          "awaiting_reply": [{subject, from, snippet, days_old, thread_id,
+             internal_date_ms}] up to 5 threads where the last message is
+             NOT from me and is 3-14d old.
         }
+
+        `thread_id` + `internal_date_ms` are emitted so downstream consumers
+        (web tools → `gmail_recent`) don't have to re-query Gmail to enrich
+        each item. `internal_date_ms` is int milliseconds since epoch;
+        callers convert to ISO timestamp at render time.
     """
     svc = _gmail_service()
     if svc is None:
@@ -20791,12 +20850,15 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
             userId="me", q="is:starred in:inbox newer_than:7d", maxResults=3,
         ).execute()
         for th in r.get("threads", []) or []:
-            meta = _gmail_thread_last_meta(svc, th.get("id") or "")
+            tid = th.get("id") or ""
+            meta = _gmail_thread_last_meta(svc, tid)
             if meta:
                 out["starred"].append({
                     "subject": meta["subject"],
                     "from": meta["from"],
                     "snippet": meta["snippet"],
+                    "thread_id": tid,
+                    "internal_date_ms": meta["internal_date_ms"],
                 })
     except Exception as exc:
         _silent_log('gmail_unread_list', exc)
@@ -20815,7 +20877,8 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
         for th in r.get("threads", []) or []:
             if len(out["awaiting_reply"]) >= 5:
                 break
-            meta = _gmail_thread_last_meta(svc, th.get("id") or "")
+            tid = th.get("id") or ""
+            meta = _gmail_thread_last_meta(svc, tid)
             if not meta:
                 continue
             sender = meta["from"].lower()
@@ -20830,6 +20893,8 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
                 "from": meta["from"],
                 "snippet": meta["snippet"],
                 "days_old": round(days_old, 1),
+                "thread_id": tid,
+                "internal_date_ms": meta["internal_date_ms"],
             })
     except Exception as exc:
         _silent_log('gmail_followup_list', exc)
@@ -23129,8 +23194,10 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         cited_paths, _ambig = _resolve_wikilinks_to_paths(
             wikilinks, c["title_to_paths"], VAULT_PATH,
         )
-        record_brief_written("morning", rel, cited_paths, {})
-        # TODO: enrich citations_by_section by parsing section headers
+        by_section = _citations_by_section(
+            brief_body, c["title_to_paths"], VAULT_PATH,
+        )
+        record_brief_written("morning", rel, cited_paths, by_section)
     except Exception:
         pass
     # Push to WhatsApp if ambient is enabled — landing the brief in the chat
@@ -23631,8 +23698,10 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
         cited_paths, _ambig = _resolve_wikilinks_to_paths(
             wikilinks, c["title_to_paths"], VAULT_PATH,
         )
-        record_brief_written("today", rel, cited_paths, {})
-        # TODO: enrich citations_by_section by parsing section headers
+        by_section = _citations_by_section(
+            narrative, c["title_to_paths"], VAULT_PATH,
+        )
+        record_brief_written("today", rel, cited_paths, by_section)
     except Exception:
         pass
     if _brief_push_to_whatsapp(f"Evening {date_label}", str(rel), narrative):

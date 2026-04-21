@@ -420,10 +420,19 @@ def _load_vaults_config() -> dict:
 
 
 def _save_vaults_config(cfg: dict) -> None:
+    # Atomic write: tmp + replace. Sin esto, un kill -9 o crash entre la
+    # apertura del archivo y el write_text deja `vaults.json` vacío o
+    # parcialmente escrito, y el próximo `_load_vaults_config` cae en el
+    # except → retorna `{"vaults": {}, "current": None}`. El usuario pierde
+    # silenciosamente el registry completo. `os.replace` es atómico en APFS
+    # y ext4; el tmp sibling queda en el mismo directorio para que el rename
+    # no cruce filesystems.
     VAULTS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    VAULTS_CONFIG_PATH.write_text(
+    tmp = VAULTS_CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8",
     )
+    tmp.replace(VAULTS_CONFIG_PATH)
 
 
 def _resolve_vault_path() -> Path:
@@ -2301,41 +2310,49 @@ def _load_behavior_priors() -> dict:
     """
     global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
 
-    try:
-        with _ragvec_state_conn() as conn:
-            max_ts = _sql_max_ts(conn, "rag_behavior")
-            if max_ts is None:
-                # Empty table → return empty snapshot (no JSONL fallback).
-                snapshot = _compute_behavior_priors_from_rows([])
-                snapshot["hash"] = "sql:empty"
+    # `_behavior_priors_lock` fue creado con un comentario de "serialises
+    # reads + writes of the three globals" pero nunca se adquiría. Bajo
+    # carga concurrente del web server (una /api/chat + un home-prewarmer
+    # loop, o dos chat streams en paralelo), dos llamadas podían intercalar
+    # un cache overwrite con un key-freshness check y devolver un snapshot
+    # stale que nunca se refrescaba. Fix: envolver read-then-write en el
+    # RLock pre-existente.
+    with _behavior_priors_lock:
+        try:
+            with _ragvec_state_conn() as conn:
+                max_ts = _sql_max_ts(conn, "rag_behavior")
+                if max_ts is None:
+                    # Empty table → return empty snapshot (no JSONL fallback).
+                    snapshot = _compute_behavior_priors_from_rows([])
+                    snapshot["hash"] = "sql:empty"
+                    _behavior_priors_cache = snapshot
+                    _behavior_priors_cache_key_sql = ""
+                    _behavior_priors_cache_key = None
+                    return snapshot
+                if (_behavior_priors_cache is not None
+                        and _behavior_priors_cache_key_sql == max_ts):
+                    return _behavior_priors_cache
+                import sqlite3 as _sqlite3
+                prev_factory = conn.row_factory
+                try:
+                    conn.row_factory = _sqlite3.Row
+                    rows = list(conn.execute(
+                        "SELECT ts, event, path, dwell_s FROM rag_behavior"
+                    ).fetchall())
+                finally:
+                    conn.row_factory = prev_factory
+                snapshot = _compute_behavior_priors_from_rows(rows)
+                snapshot["hash"] = f"sql:{max_ts}"
                 _behavior_priors_cache = snapshot
-                _behavior_priors_cache_key_sql = ""
+                _behavior_priors_cache_key_sql = max_ts
                 _behavior_priors_cache_key = None
                 return snapshot
-            if (_behavior_priors_cache is not None
-                    and _behavior_priors_cache_key_sql == max_ts):
-                return _behavior_priors_cache
-            import sqlite3 as _sqlite3
-            prev_factory = conn.row_factory
-            try:
-                conn.row_factory = _sqlite3.Row
-                rows = list(conn.execute(
-                    "SELECT ts, event, path, dwell_s FROM rag_behavior"
-                ).fetchall())
-            finally:
-                conn.row_factory = prev_factory
-            snapshot = _compute_behavior_priors_from_rows(rows)
-            snapshot["hash"] = f"sql:{max_ts}"
-            _behavior_priors_cache = snapshot
-            _behavior_priors_cache_key_sql = max_ts
-            _behavior_priors_cache_key = None
+        except Exception as exc:
+            _log_sql_state_error("behavior_priors_sql_read_failed", err=repr(exc))
+            # Degrade to empty snapshot — retrieval stays functional without priors.
+            snapshot = _compute_behavior_priors_from_rows([])
+            snapshot["hash"] = "sql:error"
             return snapshot
-    except Exception as exc:
-        _log_sql_state_error("behavior_priors_sql_read_failed", err=repr(exc))
-        # Degrade to empty snapshot — retrieval stays functional without priors.
-        snapshot = _compute_behavior_priors_from_rows([])
-        snapshot["hash"] = "sql:error"
-        return snapshot
 
 
 class RankerWeights:
@@ -4255,6 +4272,62 @@ class SqliteVecCollection:
                 self._db.execute(
                     f"INSERT INTO {self._vec}(rowid, embedding) VALUES(?, ?)",
                     (rowid, sqlite_vec.serialize_float32(list(emb))),
+                )
+            self._bump_version()
+
+    def update(self, ids, metadatas):
+        """Metadata-only update — keeps the embedding + document untouched.
+
+        Chromadb-era callers (`_maybe_backfill_created_ts` en rag.py:18434)
+        esperan `col.update(ids=..., metadatas=...)`. Sin este método el
+        backfill lazy fallaba con
+        `AttributeError: 'SqliteVecCollection' object has no attribute 'update'`
+        y cada query con `date_range` omitía silenciosamente los chunks
+        pre-temporal (verificado en `web.log` 2026-04-20).
+
+        Updates only the columns present in each meta dict. Missing columns
+        stay at their current value (no NULL clobbering). `extra_json` is
+        fully rewritten from the non-known-cols present in the incoming
+        meta — callers should pass the FULL merged metadata dict (same
+        convention as `add`), not a partial patch.
+        """
+        if not ids:
+            return
+        known = _KNOWN_META_COLS
+        with self._db:
+            for cid, meta in zip(ids, metadatas):
+                if meta is None:
+                    continue
+                # Split into first-class cols vs the extra bag.
+                set_clauses: list[str] = []
+                params: list = []
+                for col in known:
+                    if col not in meta:
+                        continue
+                    v = meta.get(col)
+                    if col == "created_ts":
+                        try:
+                            v = float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            v = None
+                    elif v is not None and not isinstance(v, (int, float, bool, str)):
+                        v = str(v)
+                    set_clauses.append(f"{col}=?")
+                    params.append(v)
+                # Rewrite `extra_json` from every non-known key present in
+                # the payload — mirrors `add()`'s normalization so a roundtrip
+                # add→update stays shape-stable.
+                extra_keys = [k for k in meta.keys() if k not in known]
+                if extra_keys:
+                    extra = {k: meta[k] for k in extra_keys}
+                    set_clauses.append("extra_json=?")
+                    params.append(json.dumps(extra, ensure_ascii=False) if extra else None)
+                if not set_clauses:
+                    continue
+                params.append(cid)
+                self._db.execute(
+                    f"UPDATE {self._meta} SET {', '.join(set_clauses)} WHERE chunk_id=?",
+                    params,
                 )
             self._bump_version()
 

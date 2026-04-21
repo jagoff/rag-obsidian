@@ -2301,6 +2301,12 @@ def _fetch_pagerank_top(col, n: int = 5) -> list[dict]:
         return []
     corpus = _load_corpus(col)
     ranked = sorted(pr_map.items(), key=lambda kv: -kv[1])[:n]
+    # Defensive: `n <= 0` would make `ranked = []` despite a non-empty map,
+    # and a hypothetical cache-invalidation race between `get_pagerank` and
+    # `sorted` could also narrow it to zero rows. Return early rather than
+    # IndexError-ing on `ranked[0][1]`.
+    if not ranked:
+        return []
     max_pr = ranked[0][1] or 1.0
     out: list[dict] = []
     for rank, (path, pr) in enumerate(ranked, start=1):
@@ -3441,6 +3447,29 @@ def _append_pending_conversation_turn(rec: dict) -> None:
         pass
 
 
+def _sanitize_confidence(confidence) -> float:
+    """Clamp NaN/±Inf/None/garbage confidences → 0.0 so they never leak
+    into persisted state. `retrieve()` returns `float('-inf')` when the
+    corpus was empty (meta-chat, zero vec rows); persisting that ended up
+    serialised as `-Infinity` inside `conversation_turn_pending.jsonl`
+    (valid json via allow_nan=True, but no portable YAML/strict-json
+    consumer can round-trip it) and as the literal `-inf` inside the
+    conversation frontmatter (`confidence_avg: -inf`), which then broke
+    the turn-2 averaging with `float("-inf") * 1 + x` propagating as
+    `-inf` forever. Callers that go through `_retry_pending_conversation_turns`
+    may also pass `None`/str from malformed pending records — swallow
+    both into the 0.0 fallback rather than raising.
+    """
+    import math
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(c) or math.isinf(c):
+        return 0.0
+    return c
+
+
 def _persist_conversation_turn(
     vault_root: Path,
     session_id: str,
@@ -3454,13 +3483,14 @@ def _persist_conversation_turn(
         {"file": m.get("file", ""), "score": float(s)}
         for m, s in zip(metas, scores)
     ]
+    clean_conf = _sanitize_confidence(confidence)
     ts = datetime.now(timezone.utc)
     try:
         turn = TurnData(
             question=question,
             answer=answer,
             sources=sources_payload,
-            confidence=float(confidence),
+            confidence=clean_conf,
             timestamp=ts,
         )
         path = write_turn(vault_root, session_id, turn)
@@ -3484,7 +3514,7 @@ def _persist_conversation_turn(
             "question": question,
             "answer": answer,
             "sources": sources_payload,
-            "confidence": float(confidence),
+            "confidence": clean_conf,
             "error": repr(exc),
         })
         _LOG_QUEUE.put((
@@ -3520,11 +3550,15 @@ def _retry_pending_conversation_turns() -> int:
             ts = datetime.fromisoformat(ts_str)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            # Sanitize `confidence` on replay too — legacy pending files
+            # written before _sanitize_confidence existed may carry
+            # -Infinity / NaN, which round-trip through `float(...)` and
+            # silently re-poison the restored frontmatter.
             turn = TurnData(
                 question=rec["question"],
                 answer=rec["answer"],
                 sources=rec.get("sources", []),
-                confidence=float(rec.get("confidence", 0.0)),
+                confidence=_sanitize_confidence(rec.get("confidence", 0.0)),
                 timestamp=ts,
             )
             write_turn(Path(rec["vault_root"]), rec["session_id"], turn)
@@ -3629,6 +3663,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # vault_count) matchea + TTL viva + NO es follow-up. Skipped cuando hay
         # history porque la respuesta depende del contexto de la conversación,
         # que el key actual no refleja.
+        # Nota: `_cache_key` queda pre-inicializado en None porque el topic-
+        # shift gate (~línea 3914) puede reasignar `history = []` DESPUÉS de
+        # este bloque; en ese caso, el PUT path abajo entraba con `_cache_key`
+        # no-bound y deja un `UnboundLocalError` visible en web.log como
+        # `[chat-cache] put failed: cannot access local variable '_cache_key'…`.
+        _cache_key: str | None = None
         if not history:
             try:
                 from rag import get_db_for
@@ -4418,7 +4458,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Cache store — sólo queries sin history (no follow-ups) y con
         # respuesta no-vacía. Keya con el vault_chunks count computado en el
         # cache-get path arriba (mismo scope/model/vault state → misma key).
-        if not history and full.strip():
+        # `_cache_key is not None` cubre el caso donde el turno arrancó con
+        # history (no key computado) y el topic-shift gate reasignó
+        # `history = []` (línea ~3914), dejando este branch alcanzable sin
+        # key válida. Sin el guard, se tiraba `UnboundLocalError` en cada
+        # topic-shift turn.
+        if not history and full.strip() and _cache_key is not None:
             try:
                 _sources_items = [
                     {**_source_payload(m, s), "bar": _score_bar(float(s))}
@@ -5637,13 +5682,43 @@ def _memory_load_history() -> None:
             continue
 
 
+def _persist_with_sqlite_retry(write_fn, error_tag: str) -> None:
+    """Run a one-shot SQL-write closure with transient-lock retry.
+
+    `_memory_persist` + `_cpu_persist` (and historically anything else
+    firing from the per-minute samplers) were dropping ~30 samples/day
+    to `sql_state_errors.jsonl` with `database is locked`, because the
+    bare `_ragvec_state_conn() + _sql_append_event` path has no retry —
+    if any other writer holds the WAL write-lock longer than the
+    `busy_timeout=30s` window (e.g. during `_write_feedback_golden_sql`
+    under embed latency, or a concurrent contradiction worker), the
+    sample is lost. Retrying twice with jittered backoff covers the
+    transient-contention tail without masking real SQL errors (schema
+    drift, disk-full, etc. propagate on the 3rd attempt).
+    """
+    import random as _r
+    import sqlite3 as _sqlite3
+    import time as _t
+    for attempt in range(3):
+        try:
+            write_fn()
+            return
+        except _sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 2:
+                _log_sql_state_error(error_tag, err=repr(exc))
+                return
+            _t.sleep(0.1 + _r.random() * 0.25)
+        except Exception as exc:
+            _log_sql_state_error(error_tag, err=repr(exc))
+            return
+
+
 def _memory_persist(sample: dict) -> None:
-    try:
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_memory_metrics",
                                _map_memory_row(sample))
-    except Exception as exc:
-        _log_sql_state_error("memory_sql_write_failed", err=repr(exc))
+    _persist_with_sqlite_retry(_do, "memory_sql_write_failed")
 
 
 def _memory_trim_file() -> None:
@@ -5886,12 +5961,11 @@ def _cpu_load_history() -> None:
 
 
 def _cpu_persist(sample: dict) -> None:
-    try:
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_cpu_metrics",
                                _map_cpu_row(sample))
-    except Exception as exc:
-        _log_sql_state_error("cpu_sql_write_failed", err=repr(exc))
+    _persist_with_sqlite_retry(_do, "cpu_sql_write_failed")
 
 
 def _cpu_trim_file() -> None:

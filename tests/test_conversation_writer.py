@@ -151,6 +151,75 @@ def test_sequential_turns_accumulate(tmp_vault):
     assert "  - F2.md" in text
 
 
+def test_turn_with_inf_confidence_sanitized_on_second_turn(tmp_vault):
+    """Regression: historical conversation notes persisted
+    `confidence_avg: -inf` (from `retrieve()` returning `float('-inf')`
+    on empty corpora). Subsequent turns would propagate the sentinel
+    forever via `(-inf * k + x) / n = -inf`. The writer now clamps
+    non-finite old_avg to 0.0 as defense-in-depth even if a pre-sanitize
+    note sneaks in.
+    """
+    sid = "web:inf-conf"
+    ts1 = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    # Seed a note with a corrupt `confidence_avg` value on disk.
+    folder = tmp_vault / "00-Inbox" / "conversations"
+    corrupt = folder / "2026-04-21-0900-q.md"
+    corrupt.write_text(
+        "---\n"
+        f"session_id: {sid}\n"
+        "created: 2026-04-21T09:00:00Z\n"
+        "updated: 2026-04-21T09:00:00Z\n"
+        "turns: 1\n"
+        "confidence_avg: -inf\n"
+        "sources: []\n"
+        "tags:\n"
+        "  - conversation\n"
+        "  - rag-chat\n"
+        "---\n"
+        "\n"
+        "## Turn 1 — 09:00\n\n> q\n\na\n\n**Sources**: —\n",
+        encoding="utf-8",
+    )
+    persist_conversation_index_entry(sid, str(corrupt.relative_to(tmp_vault)))
+    # Second turn must not crash + must overwrite the bad avg with a finite
+    # value. With the -inf left unclamped the new_avg would stay -inf.
+    t2 = _turn("q2", "a2", [{"file": "X.md", "score": 0.5}], 0.5, datetime(
+        2026, 4, 21, 9, 5, 0, tzinfo=timezone.utc))
+    p = write_turn(tmp_vault, sid, t2)
+    text = p.read_text(encoding="utf-8")
+    assert "turns: 2" in text
+    assert "-inf" not in text
+    assert "-Inf" not in text
+    # The new avg is finite — exact value doesn't matter for the invariant.
+    fm_end = text.index("\n---\n", 4)
+    fm = text[4:fm_end]
+    avg_line = next(ln for ln in fm.split("\n") if ln.startswith("confidence_avg:"))
+    assert float(avg_line.split(":", 1)[1].strip()) > float("-inf")
+
+
+def test_second_turn_with_first_turn_zero_sources(tmp_vault):
+    """Regression: cuando el turno 1 no tiene sources (p.ej. metachat /
+    propose-intent / retrieval vacío), el frontmatter renderea `sources: []`
+    como texto literal. El parser lo leía de vuelta como string `"[]"` (no
+    lista), y al procesar el turno 2 `isinstance(existing_sources, list)`
+    daba False → `ValueError('sources must be a list')`. Ver
+    `conversation_turn_pending.jsonl`.
+    """
+    sid = "web:zero-sources"
+    ts1 = datetime(2026, 4, 21, 10, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 4, 21, 10, 5, 0, tzinfo=timezone.utc)
+    t1 = _turn("primera", "respuesta", [], 0.3, ts1)
+    p1 = write_turn(tmp_vault, sid, t1)
+    text1 = p1.read_text(encoding="utf-8")
+    assert "sources: []" in text1
+    t2 = _turn("segunda", "respuesta",
+               [{"file": "03-Resources/B.md", "score": 0.6}], 0.6, ts2)
+    p2 = write_turn(tmp_vault, sid, t2)
+    text2 = p2.read_text(encoding="utf-8")
+    assert "turns: 2" in text2
+    assert "  - 03-Resources/B.md" in text2
+
+
 def test_malformed_frontmatter_raises(tmp_vault):
     sid = "web:broken"
     target = tmp_vault / "00-Inbox" / "conversations" / "broken.md"

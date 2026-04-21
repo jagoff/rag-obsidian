@@ -62,11 +62,25 @@ def _open_sql_conn() -> sqlite3.Connection:
     # journal_mode=WAL briefly takes an exclusive lock to flip the header,
     # so skip the write once WAL is already active (idempotent). Saves
     # ~N² contention when multiple fresh conns all race to SET WAL.
-    cur = conn.execute("PRAGMA journal_mode")
-    row = cur.fetchone()
-    current_mode = (row[0] if row else "").lower()
-    if current_mode != "wal":
-        conn.execute("PRAGMA journal_mode=WAL")
+    # Retry the PRAGMA explicitly on a lock conflict — sqlite's C layer can
+    # return SQLITE_BUSY (OperationalError) for PRAGMA statements even with
+    # busy_timeout set, specifically when multiple fresh processes race to
+    # flip an unset journal_mode (verified flaky under mp.Pool(8) hammering).
+    # Each iteration attempts afresh after a short jittered sleep.
+    for attempt in range(10):
+        try:
+            cur = conn.execute("PRAGMA journal_mode")
+            row = cur.fetchone()
+            current_mode = (row[0] if row else "").lower()
+            if current_mode == "wal":
+                break
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 9:
+                raise
+            import time as _t, random as _r
+            _t.sleep(0.05 + _r.random() * 0.15)
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -86,29 +100,50 @@ def _ensure_conversations_table(conn: sqlite3.Connection) -> None:
 def persist_conversation_index_entry(session_id: str, relative_path: str) -> None:
     """Upsert (session_id → relative_path) into rag_conversations_index.
 
-    SQL-only since T10. Safe to call concurrently — BEGIN IMMEDIATE + per-
-    process busy_timeout=10s serialise writes cleanly; no JSON-on-disk lock
-    needed.
+    SQL-only since T10. Safe to call concurrently — BEGIN IMMEDIATE +
+    per-process busy_timeout=30s serialise writes cleanly; no JSON-on-disk
+    lock needed. Under heavy multi-process stampede (verified flaky on
+    mp.Pool(8) in tests), a stray `sqlite3.OperationalError("database is
+    locked")` can still escape busy_timeout on the `CREATE TABLE IF NOT
+    EXISTS` + `BEGIN IMMEDIATE` pair — we retry up to 10 times with
+    jittered backoff before propagating. Each retry opens a fresh
+    connection so a half-locked txn state can't survive.
     """
-    conn = _open_sql_conn()
-    try:
-        _ensure_conversations_table(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        # _sql_upsert is the T1 primitive. Lazy-import to avoid hauling
-        # rag.py into every web module at import time.
-        import rag
-        rag._sql_upsert(
-            conn,
-            "rag_conversations_index",
-            {
-                "session_id": session_id,
-                "relative_path": relative_path,
-                "updated_at": _iso_seconds_now(),
-            },
-            pk_cols=("session_id",),
-        )
-    finally:
-        conn.close()
+    import random as _r
+    import time as _t
+    last_exc: Exception | None = None
+    for attempt in range(10):
+        conn = _open_sql_conn()
+        try:
+            _ensure_conversations_table(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            # _sql_upsert is the T1 primitive. Lazy-import to avoid hauling
+            # rag.py into every web module at import time.
+            import rag
+            rag._sql_upsert(
+                conn,
+                "rag_conversations_index",
+                {
+                    "session_id": session_id,
+                    "relative_path": relative_path,
+                    "updated_at": _iso_seconds_now(),
+                },
+                pk_cols=("session_id",),
+            )
+            return
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower():
+                raise
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        finally:
+            conn.close()
+        _t.sleep(0.05 + _r.random() * 0.15)
+    if last_exc is not None:
+        raise last_exc
 
 
 def get_conversation_path(session_id: str) -> str | None:
@@ -155,6 +190,15 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
                 current_list = []
                 current_key = key
                 meta[key] = current_list
+            elif value == "[]":
+                # `_render_frontmatter` writes empty lists as inline `[]` literal
+                # text. Without this branch the parser stored the string `"[]"`,
+                # failing `isinstance(existing_sources, list)` on the next
+                # turn with `ValueError("sources must be a list")`. Reported
+                # via `conversation_turn_pending.jsonl` on zero-source turns.
+                current_list = None
+                current_key = None
+                meta[key] = []
             else:
                 current_list = None
                 current_key = None
@@ -237,6 +281,12 @@ def _write_turn_body(
             created = meta["created"]
         except (KeyError, ValueError, TypeError) as exc:
             raise ValueError(f"malformed frontmatter in {target}: {exc}")
+        # Defense-in-depth: historical notes persisted pre-sanitize may carry
+        # `confidence_avg: -inf` / `nan`. Without this clamp, subsequent turns
+        # propagate the invalid value forever (`-inf * k + x == -inf`).
+        import math
+        if math.isnan(old_avg) or math.isinf(old_avg):
+            old_avg = 0.0
         new_turns = old_turns + 1
         new_avg = (old_avg * old_turns + turn.confidence) / new_turns
         existing_sources = meta.get("sources", [])

@@ -439,3 +439,136 @@ Después de que el usuario responda §6:
 ---
 
 *Fin del documento. Feedback en /Users/fer/repositories/obsidian-rag/docs/design-cross-source-corpus.md.*
+
+---
+
+## 10. Decisiones del usuario (2026-04-20)
+
+Las 8 preguntas de §6 respondidas. Bloquean la fase 1 — si se revierte alguna,
+re-validar lo ya implementado contra las nuevas restricciones. Ninguna es
+reversible "gratis" una vez que el corpus cross-source existe.
+
+### 10.1 Priorización P0 — **4 fuentes, WhatsApp primero**
+
+Seleccionado: `whatsapp, calendar, gmail, reminders` (orden declarado).
+
+Implicaciones:
+- Fase 1 pasa de ~3 sub-fases a **4 sub-fases** (Calendar, Gmail, WA, Reminders).
+- WhatsApp primero invierte la recomendación técnica del §6.1 que ponía Gmail+Calendar primero por volumen chico y schema limpio. Riesgos resultantes:
+  - ~150k chunks iniciales → ~2-3h de re-embed en MPS (vs ~20min si Calendar hubiera sido 1.a).
+  - Dedup conversacional (§3.3 opción A) sin data de producción para validar — el threshold de colapso ±30min es guess hasta que corra.
+  - Reranker calibration regresiva esperada (§4.1). WhatsApp tiene densidad semántica distinta a notas de vault; el threshold global 0.015 va a quedar mal calibrado hasta re-tunearlo.
+- Reminders agregado al scope. No estaba en el inventario original (§1.2 P3: "Ya consumido por `rag agenda`, duplicarlo como corpus no es obvio"). Se indexa igual — el usuario prefiere tener TODO buscable vía `retrieve()` aunque duplique fuentes de "qué tengo pendiente".
+
+### 10.2 Retention windows — **Default plan**
+
+```python
+RETENTION = {
+    "vault":     None,    # sin expiración
+    "calendar":  None,    # eventos chicos, queda todo
+    "gmail":     365,     # último año
+    "whatsapp":  180,     # últimos 6 meses
+    "messages":  180,     # mismo régimen que WA
+    "reminders": None,    # siempre visibles (son pocas entidades, vida corta)
+}
+```
+
+Combinado con la regla de §3.2 (no expirar chunks accedidos en los últimos 30d). Corpus estimado steady-state: ~100-120k chunks, ~1.2GB en sqlite-vec.
+
+### 10.3 Source weights — **Default jerarquía**
+
+```python
+SOURCE_WEIGHTS = {
+    "vault":     1.00,
+    "calendar":  0.95,
+    "reminders": 0.90,
+    "gmail":     0.85,
+    "whatsapp":  0.75,
+    "messages":  0.75,
+}
+```
+
+Pesos hardcoded (decisión de timing más abajo). Recency half-life per fuente según §4.2:
+- Vault: 5y
+- Calendar/Reminders: 90d
+- Gmail: 180d
+- WhatsApp/Messages: 30d
+
+### 10.4 Encriptación — **FileVault activo**
+
+Validado por el usuario. No implementamos sparse bundle cifrado extra. sqlite-vec queda cleartext en disco; el único mitigador at-rest es FileVault. Documentar en CLAUDE.md para que ningún agente futuro indexe desde un host sin FileVault sin re-validar la decisión.
+
+### 10.5 Opt-out — **Indexá todo**
+
+Decisión consciente de indexar sin filtros:
+- Gmail: incluye banking, 2fa, financial, newsletters, promotions.
+- WhatsApp: incluye chats con números no-resueltos (sin contacto asociado) y grupos.
+
+Implicaciones:
+- **Superficie de datos sensibles máxima**: credenciales, OTPs, tokens bancarios que pasen por mail quedan en el corpus. `retrieve()` puede traerlos en contexto LLM → riesgo de exfiltración si un prompt ataca el sistema.
+- **Mitigación única**: prompt-injection protection en el system rules + el gate `CONFIDENCE_RERANK_MIN` que descarta matches irrelevantes. Ninguna de las dos es defensa robusta contra un atacante con acceso a `POST /api/chat`.
+- **Config file igual se crea**: `~/.local/share/obsidian-rag/cross-source.yaml` queda vacío (sin `exclude_labels` / `exclude_senders` / `exclude_chats`) pero presente, para que el usuario pueda agregar filtros después sin editar código.
+
+### 10.6 OAuth Google — **Mantenido (rompe local-first)**
+
+Decisión del usuario mantener el MCP OAuth del harness de Claude sobre apple-mcp a pesar de la recomendación técnica opuesta (§10.6 original: "Recomendación fuerte: usar apple-mcp, no el OAuth MCP, para P0").
+
+**Esto rompe el principio fundacional declarado en CLAUDE.md línea 4**: "Fully local: Sqlite-vec + Ollama + sentence-transformers. No cloud calls."
+
+Implicaciones:
+- El ingester de Gmail + Calendar hace requests a través del harness de Claude → los headers/metadata de las queries pasan por infraestructura externa.
+- Re-indexing hace ~50k requests a Google API → latency acumulada + rate limits a respetar.
+- Si el harness de Claude cambia políticas / API, el ingester se rompe silenciosamente.
+- CLAUDE.md línea 4 necesita actualizarse a "Mostly local — Gmail+Calendar vía OAuth" para no mentirle a agentes futuros.
+- WhatsApp y Reminders siguen siendo local (bridge SQLite + EventKit).
+
+Decisión registrada para trazabilidad. Si algún auditor (humano o agente) cuestiona después "¿por qué este sistema hace cloud calls si CLAUDE.md dice que no?", la respuesta es "user override 2026-04-20 con full knowledge del tradeoff".
+
+### 10.7 Colección única — **Única (`obsidian_corpus_v8`)**
+
+Una sola colección sqlite-vec con campo `source` como discriminador. Ventajas mantienen el §2.1: cross-rerank coherente, BM25 cache compartido, `find_related` cross-source. Desventaja aceptada: schema migration costosa (todo el corpus existente se re-embedea al bump v7 → v8).
+
+### 10.8 Timing — **Paralelo con pesos hardcoded**
+
+Se arranca fase 1 (ingesta + schema + retrieve extension) en paralelo con el track #1 (feedback loop). Pesos de §10.3 son hardcoded hasta que el feedback loop acumule data suficiente (~2 semanas post-deploy) para calibrarlos.
+
+Riesgo aceptado: los pesos hardcoded son guesses. El primer `rag eval` post-fase 1.a va a regresionar respecto del baseline actual (singles hit@5 78.57% / chains 75.76%) hasta que se re-calibre el threshold de confidence + los weights contra queries cross-source reales.
+
+---
+
+## 11. Plan de ejecución concreto post-decisiones
+
+Con las 8 decisiones arriba, la fase 1 se parte en:
+
+| Sub-fase | Alcance | LOC estim. | Duración estim. | Risk |
+|---|---|---|---|---|
+| **1.a** Calendar PoC | Ingester Google Calendar vía OAuth MCP, schema bump v7→v8 con `source` field, `rag index --source calendar`, source weighting skeleton, retrieve extension mínima | ~600 | 2-3 días | Bajo — valida el approach |
+| **1.b** Gmail | Ingester Gmail OAuth, chunking por mensaje + drop-quoted, parent=thread context, re-indexing incremental vía `historyId` | ~900 | 3-4 días | Medio — volumen alto, OAuth rate limits |
+| **1.c** WhatsApp | Ingester bridge SQLite, agrupamiento conversacional §2.6, dedup post-rerank §3.3 opción A, re-calibración de reranker threshold per-source | ~1000 | 4-5 días | **Alto** — dedup sin data real, ~2-3h de re-embed inicial, calibración manual |
+| **1.d** Reminders | Ingester EventKit, chunking 1-por-reminder, integración con `rag agenda` existente | ~300 | 1-2 días | Bajo — volumen chico, schema simple |
+| **1.e** Apagar workaround | Deprecar `/note` y `/ob` del whatsapp-listener (el corpus ahora los tiene por barrido) | ~100 | 0.5 días | Bajo |
+| **1.f** Re-calibración eval | `queries.yaml` extendido con queries cross-source, re-baseline singles/chains, ajuste de `CONFIDENCE_RERANK_MIN` per-source, validación de pesos | ~50 | 1-2 días | **Alto** — hay que establecer nuevos baselines |
+
+**Total estimado: 12-17 días de trabajo focused, ~3000 LOC + tests.** No es una sesión — es un sprint.
+
+### Orden recomendado
+
+1. **1.a Calendar** primero (minimiza riesgo, valida schema + discriminador).
+2. **1.d Reminders** (volumen chico, mismo patrón que Calendar, multiplica ejercicio del code path sin riesgo grande).
+3. **1.b Gmail** (rate limits, schema más complejo).
+4. **1.c WhatsApp** (el más riesgoso — dejar al final cuando todo lo demás esté calibrado).
+5. **1.f Re-calibración** en paralelo con 1.c (las dos juntas).
+6. **1.e Apagar workaround** cuando 1.c esté estable en producción ≥1 semana.
+
+El usuario pidió "whatsapp, calendar, gmail, reminders" como orden declarado en §10.1. El orden recomendado arriba invierte eso por razones de riesgo — dejo al usuario la decisión final. Si insiste en WhatsApp primero, ejecuto en ese orden pero aceptando que el primer deploy va a tener calibración pobre hasta que las otras 3 fuentes lleguen.
+
+### Próximo paso inmediato
+
+Ejecutar fase 1.a (Calendar PoC) como proof-of-concept del approach. Valida:
+- Schema migration v7 → v8 sin romper el corpus existente.
+- Discriminador `source` en metadata.
+- Source weighting skeleton (Calendar: 0.95, vault: 1.0).
+- `rag index --source calendar` CLI flag.
+- Un `rag query` que devuelva un mix de vault + calendar.
+
+Si 1.a falla o regresa el eval baseline >10pp, re-abrir §10.8 (timing) antes de seguir con 1.b/c/d.

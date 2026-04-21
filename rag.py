@@ -13070,9 +13070,28 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
                 f"[dim]{summary['duration_s']}s[/dim]"
             )
             return
+        if src == "calendar":
+            from scripts.ingest_calendar import run as _ingest_cal
+            summary = _ingest_cal(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(
+                f"{prefix}[bold]Calendar[/bold]: "
+                f"{summary['calendars_scanned']} calendarios · "
+                f"[green]{summary['events_indexed']}[/green] eventos · "
+                f"{summary['events_cancelled']} cancelados · "
+                f"{summary['bootstrapped']} bootstrap / {summary['incremental']} incremental · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp (ready), calendar/gmail/reminders (pending)."
+            f"Scope: whatsapp + calendar (ready), gmail + reminders (pending)."
         )
         return
 

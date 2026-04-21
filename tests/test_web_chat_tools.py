@@ -338,7 +338,11 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
 
-    events, _body = _post_chat("que tal")
+    # Input must NOT match `_detect_metachat_intent` (short-circuits the
+    # retrieval path this test is asserting on). "que tal" was moved into
+    # the metachat bucket 2026-04-21, so switched to a real retrieval-
+    # flavoured query.
+    events, _body = _post_chat("qué hay sobre docker en mis notas")
 
     names = [ev for ev, _ in events]
     # Order expectation.

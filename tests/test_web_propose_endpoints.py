@@ -224,6 +224,17 @@ def test_calendar_create_creator_fails(client, monkeypatch):
     "el jueves a las 4",
     "el miércoles a las 9 voy al médico",
     "mañana a las 15:30",
+    # NEW 2026-04-21 Playwright probe: reminder verbs that weren't
+    # covered previously. Without these, "anotame llamar al plomero el
+    # viernes" fell through to a plain retrieval path and the LLM
+    # fabricated "Se ha registrado tu recordatorio…" without calling
+    # any tool (silent hallucination — user thinks something was saved,
+    # nothing was).
+    "anotame llamar al plomero el viernes",
+    "anotá comprar yerba el lunes",
+    "apuntame revisar el PR mañana",
+    "no te olvides de pagar el alquiler",
+    "no te olvides de llamar al médico mañana",
 ])
 def test_detect_propose_intent_positive(q):
     assert web_server._detect_propose_intent(q) is True

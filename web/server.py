@@ -150,7 +150,67 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
 # and the CLI `rag chat` loop can share it without inverting the
 # web → rag import direction. See rag.py `_detect_propose_intent` for
 # the full regex list + three-branch logic.
-from rag import _detect_propose_intent  # noqa: E402
+from rag import _detect_propose_intent, _detect_metachat_intent  # noqa: E402
+
+
+# Canned replies for the meta-chat short-circuit. Buckets keyed by the
+# class of input; within a bucket we pick one variant by hashing the
+# message + the current minute so the same phrase in a tight window is
+# stable (no user surprise if they re-send) but repeat visits pick
+# different variants (feels alive, not scripted).
+_METACHAT_GREETING = (
+    "¡Hola! Preguntame lo que quieras sobre tus notas, o decime *recordame …* / *agendá …* si querés crear algo.",
+    "Hola 👋 ¿en qué te ayudo? Probá una pregunta sobre tus notas o pedime *recordame …* / *agendá …*.",
+    "¡Buenas! Tirame una pregunta, o decime *recordame X* / *el viernes 20hs X* para crear un recordatorio o evento.",
+)
+_METACHAT_THANKS = (
+    "¡De nada!",
+    "¡Cuando quieras!",
+    "👌",
+)
+_METACHAT_META = (
+    "Puedo responder sobre tus notas, crear recordatorios (*recordame X*) y eventos de calendar (*el viernes 20hs …*). Probá algo.",
+    "Consulto tu vault de Obsidian y creo recordatorios / eventos desde texto libre. ¿Qué necesitás?",
+    "Leo tus notas y armo recordatorios o eventos cuando se los pedís en lenguaje natural. Tirame algo concreto.",
+)
+_METACHAT_BYE = (
+    "¡Hasta luego!",
+    "¡Nos vemos!",
+    "👋",
+)
+
+
+def _metachat_bucket(q: str) -> tuple[str, ...]:
+    """Classify the meta-chat message into a response bucket."""
+    s = q.strip().lower().lstrip("¿ ").lstrip()
+    if s.startswith(("gracias", "muchas gracias", "mil gracias",
+                     "dale gracias", "thanks", "thx")):
+        return _METACHAT_THANKS
+    if s.startswith(("chau", "bye", "adiós", "adios", "nos vemos")):
+        return _METACHAT_BYE
+    if s.startswith(("qué podés", "que podes", "qué sabés", "que sabes",
+                     "cómo funcion", "como funcion", "cómo te us",
+                     "como te us", "qué comandos", "que comandos",
+                     "ayuda", "help", "quién sos", "quien sos",
+                     "quién es este", "quien es este")):
+        return _METACHAT_META
+    return _METACHAT_GREETING
+
+
+def _pick_metachat_reply(q: str, *, now: float | None = None) -> str:
+    """Pick a canned reply for a meta-chat turn.
+
+    Variation seed = hash(q) XOR minute-bucket. Same input within the
+    same minute returns the same variant (stable on retry); different
+    inputs or different minutes rotate. Tests monkey-patch with fixed
+    `now` for determinism.
+    """
+    import hashlib, time as _time
+    bucket = _metachat_bucket(q)
+    ts = now if now is not None else _time.time()
+    minute = int(ts // 60)
+    seed = int(hashlib.sha256(f"{q}|{minute}".encode()).hexdigest()[:8], 16)
+    return bucket[seed % len(bucket)]
 
 
 # Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
@@ -3501,6 +3561,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # pre-router further down.
     is_propose_intent = _detect_propose_intent(question)
 
+    # Meta-chat short-circuit — greetings / thanks / "what can you do".
+    # 2026-04-21 Playwright probe (Fer F.): "hola" produced "Según tus
+    # notas, tenés varias interacciones con diferentes contactos por
+    # WhatsApp..." because `_WEB_SYSTEM_PROMPT` REGLA 1 forces the LLM
+    # to engage with whatever retrieved context it got. Cheapest fix:
+    # detect the bare social / meta turns up front and reply with a
+    # canned line, skipping retrieval + tool-calling + LLM entirely.
+    # Zero latency (<1ms) + no hallucination possible. See
+    # `_detect_metachat_intent` for the matcher shape + rationale.
+    is_metachat = (not is_propose_intent) and _detect_metachat_intent(question)
+
     sid = req.session_id or f"web:{uuid.uuid4().hex[:12]}"
     sess = ensure_session(sid, mode="chat")
     vaults = _resolve_scope(req.vault_scope)
@@ -3510,6 +3581,47 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     def gen():
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
+
+        # Meta-chat short-circuit. Canned responses (varied across
+        # WA-style variants so repeated "hola" doesn't always say the
+        # same thing). Random seeded by minute so the same message in
+        # a tight window picks the same variant; tests can monkey-patch
+        # `_METACHAT_PICKER` to force a specific variant.
+        if is_metachat:
+            reply = _pick_metachat_reply(question)
+            turn_id = new_turn_id()
+            # Stream token-by-token to mimic the shape of a real answer
+            # so the UI's token-append animation still plays — keeps UX
+            # consistent whether or not retrieval ran.
+            yield _sse("sources", {
+                "items": [], "confidence": None, "metachat": True,
+            })
+            yield _sse("status", {"stage": "generating"})
+            for i in range(0, len(reply), 40):
+                yield _sse("token", {"delta": reply[i:i+40]})
+            total_ms = int((time.perf_counter() - _t0) * 1000)
+            yield _sse("done", {
+                "turn_id": turn_id, "elapsed_ms": total_ms,
+                "metachat": True,
+            })
+            # Log + persist turn so the session + analytics see it.
+            try:
+                append_turn(sess, {
+                    "turn_id": turn_id, "q": question,
+                    "a": reply[:500], "metachat": True,
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.metachat", "q": question[:200],
+                    "session": sess["id"], "answered": True,
+                    "t_total": round(total_ms / 1000.0, 3),
+                })
+            except Exception:
+                pass
+            return
 
         history = session_history(sess, window=SESSION_HISTORY_WINDOW)
 

@@ -87,6 +87,71 @@ def test_parse_empty_returns_none():
     assert rag._parse_natural_datetime("   ", now=datetime(2026, 4, 20)) is None
 
 
+# ── Day-only input normalization (2026-04-21 regression) ─────────────────────
+#
+# Before: "mañana" called with now=03:01:35.115 returned 2026-04-22T03:01:35.115
+# — dateparser defaulted the missing time component to the anchor's clock,
+# which made reminders land at whatever hour the bot happened to be running.
+# After: day-only inputs normalize to 09:00 (AR reminders default).
+
+
+def test_day_only_input_normalizes_to_9am():
+    """'mañana' without a clock → 09:00 default, not anchor's hour."""
+    now = datetime(2026, 4, 21, 3, 1, 35, 123456)
+    dt = rag._parse_natural_datetime("mañana", now=now)
+    assert dt is not None
+    assert dt.hour == 9
+    assert dt.minute == 0
+    assert dt.second == 0
+    assert dt.microsecond == 0
+
+
+def test_weekday_only_normalizes_to_9am():
+    now = datetime(2026, 4, 21, 14, 30, 0)  # Tue afternoon
+    dt = rag._parse_natural_datetime("el viernes", now=now)
+    assert dt is not None
+    assert dt.hour == 9
+    assert dt.minute == 0
+
+
+def test_explicit_clock_preserved():
+    """Explicit clock must NOT be overwritten by the 09:00 default."""
+    now = datetime(2026, 4, 21, 3, 1, 35)
+    for q, expected_hour, expected_minute in [
+        ("mañana a las 10", 10, 0),
+        ("el viernes 20hs", 20, 0),
+        ("hoy 18hs", 18, 0),
+        ("el jueves 9am", 9, 0),
+        ("mañana 15:30", 15, 30),
+    ]:
+        dt = rag._parse_natural_datetime(q, now=now)
+        assert dt is not None, q
+        assert dt.hour == expected_hour, f"{q} → hour={dt.hour} expected={expected_hour}"
+        assert dt.minute == expected_minute, f"{q} → minute={dt.minute} expected={expected_minute}"
+
+
+def test_period_markers_respected():
+    """'al mediodía', 'a la tarde' etc. are explicit enough to NOT be
+    overridden by the 09:00 default."""
+    now = datetime(2026, 4, 21, 3, 0, 0)
+    # These are period markers — dateparser resolves them to rough clock
+    # ranges. We only assert they're NOT defaulted to 09:00.
+    dt = rag._parse_natural_datetime("al mediodía", now=now)
+    assert dt is not None
+    # dateparser maps "al mediodía" → 12:00 typically.
+    assert dt.hour != 9 or dt.hour == 12  # either 12 (expected) or at least not the fallback
+
+
+def test_microseconds_always_zeroed():
+    """All paths return a clean datetime — no microseconds leak from anchor."""
+    now = datetime(2026, 4, 21, 3, 1, 35, 123456)
+    for q in ["mañana", "el viernes 20hs", "hoy", "mañana a las 10"]:
+        dt = rag._parse_natural_datetime(q, now=now)
+        if dt is not None:
+            assert dt.microsecond == 0, q
+            assert dt.second == 0, q
+
+
 def test_parse_garbage_returns_none(monkeypatch):
     """Texto no-parseable + LLM fallback que también devuelve null → None."""
     # Forzar que el fallback LLM también devuelva null.

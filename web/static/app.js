@@ -838,6 +838,106 @@ function formatIsoDatetime(iso) {
   }
 }
 
+// ── Created chips (Calendar event / Reminder auto-create confirmations) ───
+//
+// Rendered inline below the LLM's response text, same family as the
+// `╌ fuentes` panel. Scrolls naturally with the conversation; no floating
+// toasts that cover the top bar. Reminders get an inline `deshacer`
+// text-button (Reminders.app's AppleScript delete-by-id is reliable).
+// Calendar events are info-only (delete is unworkable, see the earlier
+// debug trail in git history).
+
+function formatDateOnly(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString("es-AR", {
+      weekday: "short", day: "2-digit", month: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function appendCreatedChip(parent, payload) {
+  const kind = payload.kind;                    // "reminder" | "event"
+  const fields = payload.fields || {};
+  const chip = el("div", `created-chip created-chip-${kind}`);
+
+  // Left block: divider + ✓ + kind label + title + when.
+  const left = el("span", "created-chip-left");
+  left.appendChild(el("span", "created-chip-rule", "╌ "));
+  left.appendChild(el("span", "created-chip-icon", "✓ "));
+  left.appendChild(el(
+    "span", "created-chip-kind",
+    kind === "event" ? "agregado al calendario" : "agregado a recordatorios",
+  ));
+  if (fields.title) {
+    left.appendChild(el("span", "created-chip-title", ` · ${fields.title}`));
+  }
+
+  // When: dates/times formatted es-AR. All-day events show "(todo el día)";
+  // timed events show full datetime. Reminders show due_iso or sin-fecha.
+  let whenText = "";
+  if (kind === "event") {
+    if (fields.start_iso) {
+      whenText = fields.all_day
+        ? ` · ${formatDateOnly(fields.start_iso)} (todo el día)`
+        : ` · ${formatIsoDatetime(fields.start_iso)}`;
+    }
+  } else {
+    whenText = fields.due_iso
+      ? ` · ${formatIsoDatetime(fields.due_iso)}`
+      : " · sin fecha";
+  }
+  if (whenText) left.appendChild(el("span", "created-chip-when", whenText));
+  chip.appendChild(left);
+
+  // Right block: `deshacer` text-button for reminders only (Calendar
+  // events don't get it — no working programmatic delete).
+  if (kind === "reminder" && payload.reminder_id) {
+    const undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "created-chip-undo";
+    undo.textContent = "deshacer";
+    const status = el("span", "created-chip-status", "");
+    undo.addEventListener("click", async () => {
+      if (chip.dataset.resolved) return;
+      chip.dataset.resolved = "pending";
+      undo.disabled = true;
+      status.textContent = " · deshaciendo…";
+      try {
+        const res = await fetch("/api/reminders/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reminder_id: payload.reminder_id }),
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          throw new Error(detail.detail || `HTTP ${res.status}`);
+        }
+        chip.dataset.resolved = "undone";
+        chip.classList.add("dimmed");
+        undo.remove();
+        status.textContent = " · deshecho";
+        status.classList.add("status-ok");
+      } catch (err) {
+        delete chip.dataset.resolved;
+        undo.disabled = false;
+        status.textContent = ` · error: ${err.message}`;
+        status.classList.add("status-err");
+      }
+    });
+    chip.appendChild(undo);
+    chip.appendChild(status);
+  }
+
+  parent.appendChild(chip);
+  return chip;
+}
+
+
 function appendProposal(parent, payload) {
   const kind = payload.kind;                    // "reminder" | "event"
   const fields = payload.fields || {};
@@ -1470,66 +1570,15 @@ async function send(question) {
       appendProposal(turn, parsed);
       scrollBottom();
     } else if (event === "created") {
-      // Auto-create happy path: a propose_* tool created a reminder/event
-      // directly. Toast UX diverges by kind:
-      //
-      //   - Reminders: "Deshacer" POSTs to /api/reminders/delete within
-      //     10s. Reminders.app's AppleScript delete-by-id is fast and
-      //     reliable, so the undo flow works cleanly.
-      //
-      //   - Calendar events: INFO-ONLY toast, no action button. We
-      //     tried:
-      //     (a) AppleScript delete via `whose uid is X` — errors
-      //         immediately on macOS 14+ ("No puede obtenerse event 1
-      //         whose uid = ...").
-      //     (b) Iteration over events of writable calendars — times
-      //         out on calendars >1000 events (measured 30s on a
-      //         1334-event calendar).
-      //     (c) `x-apple-calevent://<UID>` deep link — not a
-      //         recognized URL scheme on macOS (verified with
-      //         `open -u` error kLSApplicationNotFoundErr).
-      //     (d) `calshow://<epoch>` — iOS-only, not macOS.
-      //     The honest path is to just confirm creation and let the
-      //     user go to Calendar.app if they want to edit/delete.
-      //     EventKit via pyobjc would fix this but the dependency
-      //     weight doesn't justify it for a toast undo button.
+      // Auto-create happy path: a propose_* tool created a reminder/event.
+      // Inline chip below the LLM response (same aesthetic as ╌ fuentes)
+      // instead of a floating toast that covers the top bar. Chip stays in
+      // the conversation scroll naturally; Reminders get a `deshacer`
+      // inline link-button (Calendar events don't — AppleScript delete is
+      // unworkable on macOS 14+ with >1k events, as documented earlier).
       hadProposal = true;
-      const fields = parsed.fields || {};
-      const isEvent = parsed.kind === "event";
-      const msg = isEvent
-        ? "✓ Agregado a tu Calendario" + (fields.title ? ` · ${fields.title}` : "")
-        : "✓ Agregado a tus Recordatorios" + (fields.title ? ` · ${fields.title}` : "");
-      if (isEvent) {
-        // No action button: Calendar.app's AppleScript delete is
-        // unworkable. Toast is purely informational; default 4s.
-        showToast(msg, { kind: "ok" });
-      } else {
-        const reminderId = parsed.reminder_id;
-        showToast(msg, {
-          kind: "ok",
-          action: {
-            label: "Deshacer",
-            onClick: async () => {
-              try {
-                const res = await fetch("/api/reminders/delete", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ reminder_id: reminderId }),
-                });
-                if (!res.ok) {
-                  const detail = await res.json().catch(() => ({}));
-                  throw new Error(detail.detail || `HTTP ${res.status}`);
-                }
-                showToast("✓ Recordatorio eliminado", { kind: "info", ms: 3000 });
-              } catch (err) {
-                showToast(`✗ No se pudo deshacer: ${err.message}`, {
-                  kind: "err", ms: 5000,
-                });
-              }
-            },
-          },
-        });
-      }
+      appendCreatedChip(turn, parsed);
+      scrollBottom();
     } else if (event === "token") {
       if (!ragLine) {
         stopGeneratingTicker();

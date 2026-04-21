@@ -33,6 +33,7 @@ for _k, _v in {
 del _k, _v
 
 import atexit
+import concurrent.futures
 import contextlib
 import csv
 import fcntl
@@ -7930,6 +7931,20 @@ _expand_cache_lock = threading.Lock()
 # chat-style questions"; esto es el mismo argumento pero aplicado caso-por-caso
 # en CLI. Override con env var si hace falta recalibrar.
 _EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "4"))
+
+# Dedicated single-thread executor for running `expand_queries` off the
+# retrieve() critical path. One worker is enough — we only fire one
+# expand call per retrieve, and queueing is fine (the semaphore between
+# retrieve calls is natural back-pressure on the helper model). Using a
+# module-level executor (vs spawning a fresh Thread each call) avoids
+# ~0.5-1ms of thread startup overhead amortised across every query.
+_EXPAND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="expand-queries"
+)
+# Hard cap on how long retrieve() will wait for paraphrases before
+# falling back to raw-only. qwen2.5:3b usually returns in 0.8-1.5s; 3.0s
+# covers the p99 plus a slack. Tune via env if the helper model changes.
+_EXPAND_FUTURE_TIMEOUT = float(os.environ.get("RAG_EXPAND_TIMEOUT_S", "3.0"))
 
 
 def expand_queries(question: str) -> list[str]:
@@ -20994,7 +21009,7 @@ _EVENT_NOUN_RE = re.compile(
     r"entrevista|\bcall\b|sync|retro(?:spectiva)?|planning|demo|all.?hands|"
     r"sprint(?:\s+(?:review|planning))?|visita|clase|entrenamiento|"
     r"sesi[oó]n|taller|workshop|webinar|conferencia|almuerzo|cena|show|"
-    r"concierto|partido|cumplea[ñn]os|aniversario|viaje|vuelo|appointment|"
+    r"concierto|partido|cumplea[ñn]os|cumple|aniversario|viaje|vuelo|appointment|"
     r"1:1|1on1|one.?on.?one|uno.?a.?uno)\b",
     re.IGNORECASE,
 )
@@ -21013,7 +21028,19 @@ _TEMPORAL_ANCHOR_RE = re.compile(
     r"a[ñn]o\s+que\s+vienen?)|"
     r"a\s+las?\s+\d|tipo\s+\d|a\s+eso\s+de\s+las|"
     r"en\s+\d+\s+(?:minutos?|horas?|d[ií]as?|semanas?))\b"
-    r"|\b\d{1,2}\s*(?:hs|h|am|pm)\b|\d{1,2}:\d{2}",
+    r"|\b\d{1,2}\s*(?:hs|h|am|pm)\b|\d{1,2}:\d{2}"
+    # Absolute date forms — 2026-04-21 Fer F. probe: "el 26 de Mayo es el
+    # cumple de Astor" fell through every detector because no branch
+    # recognised the "<day> de <month>" anchor. Now covered:
+    #   - "el 26 de mayo" / "el 5 de enero" (with optional leading "el/este/próximo")
+    #   - "26 de mayo" bare
+    #   - "26/05" / "26-05" / "26/5/2026" numeric
+    # `\w+` in Python is Unicode-aware by default so accented month names
+    # like "febrero" / "diciembre" match without explicit listing.
+    r"|\b(?:el|este|pr[oó]xim[oa])?\s*\d{1,2}\s+de\s+"
+    r"(?:enero|febrero|marzo|abril|mayo|junio|julio|"
+    r"agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b"
+    r"|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b",
     re.IGNORECASE,
 )
 

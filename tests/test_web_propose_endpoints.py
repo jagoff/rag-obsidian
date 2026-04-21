@@ -235,6 +235,19 @@ def test_calendar_create_creator_fails(client, monkeypatch):
     "apuntame revisar el PR mañana",
     "no te olvides de pagar el alquiler",
     "no te olvides de llamar al médico mañana",
+    # NEW 2026-04-21 Fer F. second probe: absolute date forms + "cumple"
+    # apócope. "el 26 de Mayo es el cumple de Astor" fell through because:
+    #   1. `_TEMPORAL_ANCHOR_RE` didn't match "<day> de <month>" as an
+    #      absolute anchor (only bare weekdays / "el <weekday>").
+    #   2. `_EVENT_NOUN_RE` had "cumpleaños" but not the AR apócope
+    #      "cumple".
+    # Both regexes extended; now the declaration + event_noun path fires.
+    "el 26 de Mayo es el cumple de Astor",
+    "el 5 de enero viaje a Bariloche",
+    "26 de mayo cumple Astor",
+    "el 12/05 reunión con el abogado",
+    "15/12/2026 aniversario de casamiento",
+    "el cumple de mamá es el 3 de abril",
 ])
 def test_detect_propose_intent_positive(q):
     assert web_server._detect_propose_intent(q) is True

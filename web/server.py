@@ -3786,8 +3786,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             return
 
         if not result["docs"]:
-            yield _sse("empty", {"message": "Sin resultados relevantes."})
-            return
+            # Propose-intent turns don't need vault context — the tool
+            # loop (propose_reminder / propose_calendar_event) creates
+            # things out of thin air. Bailing here with "empty" made the
+            # handler return "Sin resultados relevantes." for inputs like
+            # "el 26 de Mayo es el cumple de Astor" (2026-04-21 Fer F.
+            # Playwright report) which is absurd — the user is declaring
+            # a date, not asking about one. Fall through to the tool
+            # phase when the detector flagged intent.
+            if not is_propose_intent:
+                yield _sse("empty", {"message": "Sin resultados relevantes."})
+                return
 
         # Retrieval signals — previously surfaced as a UI meta bar
         # ("🟡 media · 0.8 · N variantes · M nota(s)"). Removed from the

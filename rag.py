@@ -19117,33 +19117,102 @@ def _fetch_youtube_content(url: str) -> tuple[str, str]:
 
 
 def _read_extract(html: str) -> tuple[str, str]:
-    """Return (title, text). Title from <title>, text from body with scripts/
-    styles/nav/header/footer stripped. Whitespace collapsed. Truncated to
-    _READ_MAX_CHARS so the summary prompt fits the context window.
+    """Return (title, text) by parsing HTML with a real stdlib parser.
+
+    Replaces the pre-2026-04-20 regex-based strip: that approach worked for
+    well-formed pages but malformed markup (unclosed tags, attributes
+    containing `>`, nested scripts) leaked attribute content like
+    `onerror="..."` into the extracted text. When the extracted text
+    lands in a vault note and that note is later rendered in the web
+    UI (via marked.js), a payload like `<img src=x onerror="alert(1)">`
+    could partially survive as visible "alert(1)" text — low-risk in
+    practice (the sanitiser in app.js still strips on render) but
+    defence-in-depth is cheap.
+
+    Uses `html.parser.HTMLParser` from stdlib:
+      - parses structure, not regex — nested tags, self-closing, malformed
+        markup all handled correctly
+      - SKIP_TAGS set with depth counter → nested scripts-in-scripts etc.
+        are skipped fully, not partially
+      - attribute content is never exposed to the output (only
+        handle_data char content is collected)
+      - convert_charrefs=True unescapes entities automatically
+      - on parse error (really malformed input), keeps whatever was
+        collected so far rather than raising — the summary pipeline
+        treats a short extract as a gate ("< 500 chars = error") so
+        partial extraction degrades gracefully into the existing error path
     """
-    import html as _html
-    title = ""
-    m = _READ_TITLE_RE.search(html)
-    if m:
-        title = _READ_TAG_RE.sub("", m.group(1))
-        title = _html.unescape(title)
-        title = _READ_WHITESPACE_RE.sub(" ", title).strip()
-        title = re.sub(r"\s+", " ", title)[:200]
-    stripped = html
-    for tag in _READ_STRIP_TAGS:
-        pattern = re.compile(
-            rf"<{tag}\b[^>]*>.*?</{tag}>",
-            re.IGNORECASE | re.DOTALL,
-        )
-        stripped = pattern.sub(" ", stripped)
-        stripped = re.sub(
-            rf"<{tag}\b[^>]*/?>", " ", stripped, flags=re.IGNORECASE,
-        )
-    stripped = re.sub(r"<!--.*?-->", " ", stripped, flags=re.DOTALL)
-    text = _READ_TAG_RE.sub("\n", stripped)
-    text = _html.unescape(text)
-    text = _READ_WHITESPACE_RE.sub(" ", text)
-    text = _READ_NEWLINES_RE.sub("\n\n", text)
+    from html.parser import HTMLParser
+
+    class _Extractor(HTMLParser):
+        # Tags whose inner content is noise or hostile payload. Both are
+        # tracked with a depth counter so `<script><script>...</script></script>`
+        # (rare but valid-ish) balances correctly.
+        _SKIP = frozenset({
+            "script", "style", "nav", "header", "footer", "aside",
+            "iframe", "noscript", "svg", "math",
+        })
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.title_parts: list[str] = []
+            self.text_parts: list[str] = []
+            self._in_title = False
+            self._skip_depth = 0
+            # Block-level tags insert a newline into text_parts on close
+            # so paragraph structure survives the flattening below.
+            self._block_tags = frozenset({
+                "p", "br", "hr", "li", "div", "section", "article",
+                "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
+                "tr", "td", "th", "pre",
+            })
+
+        def handle_starttag(self, tag: str, attrs) -> None:
+            t = tag.lower()
+            if t == "title" and self._skip_depth == 0:
+                self._in_title = True
+            elif t in self._SKIP:
+                self._skip_depth += 1
+
+        def handle_startendtag(self, tag: str, attrs) -> None:
+            # Void / self-closing tags don't emit data; just inject
+            # newline for <br/>.
+            if tag.lower() == "br" and self._skip_depth == 0:
+                self.text_parts.append("\n")
+
+        def handle_endtag(self, tag: str) -> None:
+            t = tag.lower()
+            if t == "title":
+                self._in_title = False
+            elif t in self._SKIP and self._skip_depth > 0:
+                self._skip_depth -= 1
+            elif t in self._block_tags and self._skip_depth == 0:
+                self.text_parts.append("\n")
+
+        def handle_data(self, data: str) -> None:
+            if self._skip_depth > 0:
+                return
+            if self._in_title:
+                self.title_parts.append(data)
+            else:
+                self.text_parts.append(data)
+
+    ex = _Extractor()
+    try:
+        ex.feed(html)
+        ex.close()
+    except Exception:
+        # Malformed HTML: use whatever got collected up to the error.
+        pass
+
+    title = " ".join(ex.title_parts).strip()
+    title = re.sub(r"\s+", " ", title)[:200]
+
+    text = "".join(ex.text_parts)
+    # Normalise: collapse inline runs of whitespace, then keep paragraph
+    # breaks as double newlines. Strip per-line to drop indentation from
+    # the source HTML's pretty-printing.
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = "\n".join(ln.strip() for ln in text.splitlines())
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) > _READ_MAX_CHARS:

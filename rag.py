@@ -27666,6 +27666,134 @@ def _online_tune_plist(rag_bin: str) -> str:
 """
 
 
+def _ingest_whatsapp_plist(rag_bin: str) -> str:
+    """Cross-source: WhatsApp ingester, cada 15min.
+
+    Incremental por design — lee `messages` con `timestamp > cursor` desde la
+    bridge SQLite, chunka, upsertea. En steady state con 0 mensajes nuevos el
+    run termina en <1s (solo overhead de abrir la DB). Primer run full scan
+    tarda ~1min por 4000 chunks (medido 2026-04-21: 12984 msgs / 65s / 4070
+    chunks). Interval 900s es lo suficientemente freq para que queries tipo
+    "último mensaje de X" no se sientan stale, y lo suficientemente spaced
+    para no competir con watch/serve en CPU.
+
+    `OLLAMA_KEEP_ALIVE=-1` pin's bge-m3 en VRAM para que el embed batch no
+    pague cold-load en cada run. RAG_LOCAL_EMBED NO se setea (el ingester es
+    bulk-embed path → ollama HTTP es el único batching-capable backend).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-whatsapp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>whatsapp</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _ingest_gmail_plist(rag_bin: str) -> str:
+    """Cross-source: Gmail ingester, cada 1h.
+
+    Incremental via `historyId` cursor almacenado en `rag_gmail_state`. Llama
+    a la API de Google Gmail así que respeta rate limits (default quota
+    suficiente para 1 run/h en corpus típico ~50k emails). Cold run (bootstrap
+    365d retention) puede tardar minutos; subsecuent runs son típicamente
+    <30s con cero emails nuevos.
+
+    Interval 3600s (1h) es conservative — Gmail API es cloud-hosted
+    (user override §10.6 rompe local-first pero el tradeoff está documentado)
+    y cada HTTP call cuesta quota. Si querés ingest más frecuente, bajar el
+    interval manual y monitorear `rag log` para ver si golpeaste quota.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-gmail</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>gmail</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _ingest_reminders_plist(rag_bin: str) -> str:
+    """Cross-source: Apple Reminders ingester, cada 6h.
+
+    AppleScript full-scan (~100s en host con 36 reminders). Incremental via
+    content-hash diff post-fetch — solo re-embedea los cambiados. Dado el
+    costo del scan + que Reminders raramente cambian en ventanas cortas, 6h
+    (21600s) balance freshness vs CPU/tiempo wall.
+
+    Local-only (EventKit via osascript); no OAuth quota. Si el AppleScript
+    falla (Full Disk Access denegado, Reminders.app not running), el
+    ingester silent-drops y la próxima corrida lo reintenta.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-reminders</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>reminders</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+  </dict>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -27691,6 +27819,20 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _online_tune_plist(rag_bin)),
         ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",
          _consolidate_plist(rag_bin)),
+        # Cross-source ingesters (2026-04-21) — Phase 1.a-1.d ya implementados
+        # en código; estos plists los ponen en loop para que el corpus
+        # cross-source esté fresh sin intervención manual. Calendar queda
+        # fuera del default hasta que el user configure `~/.calendar-mcp/`
+        # OAuth — cuando exista, agregar `_ingest_calendar_plist` acá.
+        ("com.fer.obsidian-rag-ingest-whatsapp",
+         "com.fer.obsidian-rag-ingest-whatsapp.plist",
+         _ingest_whatsapp_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-gmail",
+         "com.fer.obsidian-rag-ingest-gmail.plist",
+         _ingest_gmail_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-reminders",
+         "com.fer.obsidian-rag-ingest-reminders.plist",
+         _ingest_reminders_plist(rag_bin)),
     ]
 
 

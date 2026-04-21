@@ -403,12 +403,22 @@ def test_coordinate_refine_improves_or_stays():
 
 
 def test_log_tune_event_append(tmp_path, monkeypatch):
+    """Post-T10: tune log writes to rag_tune (SQL)."""
+    import sqlite3
     log = tmp_path / "tune.jsonl"
     monkeypatch.setattr(rag, "TUNE_LOG_PATH", log)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     rag._log_tune_event({"foo": "bar"})
     rag._log_tune_event({"foo": "baz"})
-    lines = log.read_text().splitlines()
-    assert len(lines) == 2
-    e1 = json.loads(lines[0])
-    assert e1["foo"] == "bar"
-    assert "ts" in e1
+    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT ts, extra_json FROM rag_tune ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    extra = json.loads(rows[0]["extra_json"])
+    assert extra["foo"] == "bar"
+    assert rows[0]["ts"]

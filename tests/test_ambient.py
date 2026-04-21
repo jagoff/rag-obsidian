@@ -37,6 +37,11 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
         rag, "AMBIENT_LOG_PATH",
         tmp_path / "ambient.jsonl",
     )
+    # Post-T10: ambient_state + ambient_log write to SQL tables. Redirect
+    # DB_PATH to a test-scoped ragvec.db.
+    db_dir = tmp_path / "state"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(rag, "DB_PATH", db_dir)
     client = _TestVecClient(path=str(tmp_path / "chroma"))
     col = client.get_or_create_collection(
         name="amb_test", metadata={"hnsw:space": "cosine"}
@@ -172,9 +177,18 @@ def test_hook_reanalyzes_on_different_hash(tmp_vault, captured_sends):
     rag._ambient_hook(col, p, "00-Inbox/n.md", "hash2")
     # Both fire — different hashes
     assert len(captured_sends) >= 1  # hook may produce quiet events
-    # State file should have 2 records regardless
-    lines = rag.AMBIENT_STATE_PATH.read_text().splitlines()
-    assert len(lines) == 2
+    # Post-T10: rag_ambient_state upserts by path — 1 row, hash=hash2.
+    import sqlite3
+    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    try:
+        row = conn.execute(
+            "SELECT hash FROM rag_ambient_state WHERE path = ?",
+            ("00-Inbox/n.md",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "hash2"
 
 
 # ── Wikilink auto-apply ──────────────────────────────────────────────────────
@@ -320,14 +334,25 @@ def test_whatsapp_send_returns_false_on_network_error(monkeypatch):
 
 
 def test_ambient_state_records_analysis(tmp_vault):
+    """Post-T10: ambient state lives in rag_ambient_state (SQL)."""
+    import sqlite3
     rag._ambient_state_record("00-Inbox/n.md", "h1", {"wikilinks_applied": 2})
-    assert rag.AMBIENT_STATE_PATH.is_file()
-    line = rag.AMBIENT_STATE_PATH.read_text().strip()
-    e = json.loads(line)
-    assert e["path"] == "00-Inbox/n.md"
-    assert e["hash"] == "h1"
-    assert e["wikilinks_applied"] == 2
-    assert "analyzed_at" in e
+    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT path, hash, analyzed_at, payload_json "
+            "FROM rag_ambient_state WHERE path = ?",
+            ("00-Inbox/n.md",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row["path"] == "00-Inbox/n.md"
+    assert row["hash"] == "h1"
+    payload = json.loads(row["payload_json"] or "{}")
+    assert payload.get("wikilinks_applied") == 2
+    assert row["analyzed_at"] is not None
 
 
 def test_ambient_should_skip_false_without_state(tmp_vault):

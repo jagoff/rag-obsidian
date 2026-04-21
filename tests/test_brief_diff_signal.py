@@ -14,14 +14,35 @@ import rag
 
 @pytest.fixture
 def tmp_sidecars(tmp_path, monkeypatch):
-    """Redirect all brief sidecar paths and behavior log to tmp_path."""
+    """Post-T10: brief state lives in rag_brief_written / rag_brief_state
+    (SQL). Redirect DB_PATH + legacy JSONL paths (kept for the `behavior`
+    assertion helper which now reads SQL too)."""
     bw = tmp_path / "brief_written.jsonl"
     bs = tmp_path / "brief_state.jsonl"
     bl = tmp_path / "behavior.jsonl"
     monkeypatch.setattr(rag, "BRIEF_WRITTEN_PATH", bw)
     monkeypatch.setattr(rag, "BRIEF_STATE_PATH", bs)
     monkeypatch.setattr(rag, "BEHAVIOR_LOG_PATH", bl)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     return {"written": bw, "state": bs, "behavior": bl, "tmp": tmp_path}
+
+
+def _read_behavior_events(tmp_path: Path) -> list[dict]:
+    """Post-T10 substitute for `_read_jsonl(behavior.jsonl)` — read from
+    rag_behavior in the test DB."""
+    import sqlite3
+    db_file = tmp_path / "ragvec.db"
+    if not db_file.is_file():
+        return []
+    conn = sqlite3.connect(str(db_file))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT source, event, path FROM rag_behavior ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
 
 
 @pytest.fixture
@@ -41,17 +62,17 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 def _write_sidecar_entry(path: Path, brief_type: str, brief_rel: str,
                          paths_cited: list[str], age_hours: float = 24.0):
+    """Post-T10: seed rag_brief_written directly with the desired ts."""
     ts = (datetime.now() - timedelta(hours=age_hours)).isoformat(timespec="seconds")
-    rec = {
+    row = {
         "ts": ts,
         "brief_type": brief_type,
         "brief_path": brief_rel,
-        "paths_cited": paths_cited,
-        "citations_by_section": {},
+        "paths_cited_json": paths_cited,
+        "citations_by_section_json": {},
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+    with rag._ragvec_state_conn() as conn:
+        rag._sql_append_event(conn, "rag_brief_written", row)
 
 
 # ── record_brief_written ───────────────────────────────────────────────────────
@@ -59,13 +80,23 @@ def _write_sidecar_entry(path: Path, brief_type: str, brief_rel: str,
 def test_record_brief_written_appends_valid_json(tmp_sidecars):
     paths = ["02-Areas/Foo.md", "03-Resources/Bar.md"]
     rag.record_brief_written("morning", Path("05-Reviews/2026-04-17.md"), paths, {"agenda": paths[:1]})
-    lines = _read_jsonl(tmp_sidecars["written"])
-    assert len(lines) == 1
-    rec = lines[0]
+    # Post-T10: read from rag_brief_written instead of JSONL.
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_sidecars["tmp"] / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT brief_type, brief_path, paths_cited_json, "
+            "citations_by_section_json, ts FROM rag_brief_written"
+        ).fetchall())
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    rec = rows[0]
     assert rec["brief_type"] == "morning"
-    assert rec["paths_cited"] == paths
-    assert "ts" in rec
-    assert rec["citations_by_section"] == {"agenda": paths[:1]}
+    assert json.loads(rec["paths_cited_json"]) == paths
+    assert rec["ts"]
+    assert json.loads(rec["citations_by_section_json"]) == {"agenda": paths[:1]}
 
 
 def test_record_brief_written_noop_on_io_error(tmp_sidecars, monkeypatch):
@@ -88,7 +119,7 @@ def test_record_brief_written_noop_on_io_error(tmp_sidecars, monkeypatch):
 def test_diff_brief_signal_no_sidecar_no_crash(tmp_sidecars, tmp_vault):
     # No brief_written.jsonl at all → should silently return
     rag._diff_brief_signal()
-    assert _read_jsonl(tmp_sidecars["behavior"]) == []
+    assert _read_behavior_events(tmp_sidecars["tmp"]) == []
 
 
 def test_diff_brief_signal_entry_too_young_ignored(tmp_sidecars, tmp_vault):
@@ -98,7 +129,7 @@ def test_diff_brief_signal_entry_too_young_ignored(tmp_sidecars, tmp_vault):
         ["02-Areas/Foo.md"], age_hours=5.0,  # < 18h
     )
     rag._diff_brief_signal()
-    assert _read_jsonl(tmp_sidecars["behavior"]) == []
+    assert _read_behavior_events(tmp_sidecars["tmp"]) == []
 
 
 def test_diff_brief_signal_entry_too_old_ignored(tmp_sidecars, tmp_vault):
@@ -108,7 +139,7 @@ def test_diff_brief_signal_entry_too_old_ignored(tmp_sidecars, tmp_vault):
         ["02-Areas/Foo.md"], age_hours=48.0,  # > 36h
     )
     rag._diff_brief_signal()
-    assert _read_jsonl(tmp_sidecars["behavior"]) == []
+    assert _read_behavior_events(tmp_sidecars["tmp"]) == []
 
 
 # ── _diff_brief_signal: kept vs deleted ───────────────────────────────────────
@@ -140,7 +171,7 @@ def test_diff_kept_and_deleted(tmp_sidecars, tmp_vault):
 
     rag._diff_brief_signal()
 
-    events = _read_jsonl(tmp_sidecars["behavior"])
+    events = _read_behavior_events(tmp_sidecars["tmp"])
     assert len(events) == 3
     by_path = {e["path"]: e["event"] for e in events}
     assert by_path["02-Areas/Ikigai.md"] == "kept"
@@ -158,7 +189,7 @@ def test_diff_brief_file_gone_all_deleted(tmp_sidecars, tmp_vault):
 
     rag._diff_brief_signal()
 
-    events = _read_jsonl(tmp_sidecars["behavior"])
+    events = _read_behavior_events(tmp_sidecars["tmp"])
     assert len(events) == 2
     assert all(e["event"] == "deleted" for e in events)
     assert {e["path"] for e in events} == set(cited)
@@ -177,11 +208,11 @@ def test_diff_dedup_second_call_noop(tmp_sidecars, tmp_vault):
     brief_file.write_text("# Morning brief\n\nNada aqui.\n")
 
     rag._diff_brief_signal()
-    first = _read_jsonl(tmp_sidecars["behavior"])
+    first = _read_behavior_events(tmp_sidecars["tmp"])
     assert len(first) == 1
 
     rag._diff_brief_signal()
-    second = _read_jsonl(tmp_sidecars["behavior"])
+    second = _read_behavior_events(tmp_sidecars["tmp"])
     # Still only 1 event total — no new writes
     assert len(second) == 1
 

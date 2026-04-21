@@ -63,9 +63,12 @@ def _install_stubs(monkeypatch, retrieve_delay_s=0.0):
 
 def test_latency_flag_adds_table_and_snapshot(fake_queries_yaml, tmp_path, monkeypatch):
     import rag
+    import sqlite3
     _install_stubs(monkeypatch)
     eval_log = tmp_path / "eval.jsonl"
     monkeypatch.setattr(rag, "EVAL_LOG_PATH", eval_log)
+    # Post-T10: eval log writes to rag_eval_runs (SQL).
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
 
     runner = CliRunner()
     res = runner.invoke(rag.eval, ["--file", str(fake_queries_yaml), "--latency"])
@@ -74,15 +77,22 @@ def test_latency_flag_adds_table_and_snapshot(fake_queries_yaml, tmp_path, monke
     assert "singles" in res.output
     assert "chains" in res.output
 
-    # Trend log should have a `latency` entry
-    lines = [json.loads(l) for l in eval_log.read_text().splitlines() if l.strip()]
-    assert lines, "no eval.jsonl written"
-    last = lines[-1]
-    assert "latency" in last
-    assert "singles" in last["latency"]
-    assert last["latency"]["singles"]["n"] == 2
+    # Trend log should have an extra_json entry with `latency` inside.
+    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT extra_json FROM rag_eval_runs ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    assert rows, "no row written to rag_eval_runs"
+    extra = json.loads(rows[-1]["extra_json"] or "{}")
+    assert "latency" in extra
+    assert "singles" in extra["latency"]
+    assert extra["latency"]["singles"]["n"] == 2
     for fld in ("p50_ms", "p95_ms", "p99_ms", "mean_ms", "max_ms"):
-        assert fld in last["latency"]["singles"]
+        assert fld in extra["latency"]["singles"]
 
 
 def test_no_latency_flag_omits_table(fake_queries_yaml, tmp_path, monkeypatch):

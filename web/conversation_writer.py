@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import fcntl
-import json
 import os
 import re
 import sqlite3
@@ -11,8 +9,6 @@ from datetime import datetime
 from pathlib import Path
 
 
-_INDEX_PATH: Path = Path.home() / ".local/share/obsidian-rag" / "conversations_index.json"
-
 # ragvec.db lives next to sqlite-vec data. Kept in sync with rag.DB_PATH — if
 # the env var OBSIDIAN_RAG_VAULT changes the vault at runtime the SQL writer
 # still targets the same physical file used by rag.py + SqliteVecClient, since
@@ -21,17 +17,6 @@ _DB_PATH: Path = Path.home() / ".local/share/obsidian-rag" / "ragvec" / "ragvec.
 
 _FRONTMATTER_KEYS = ("session_id", "created", "updated", "turns", "confidence_avg", "sources", "tags")
 _TAGS = ("conversation", "rag-chat")
-
-# 7-day cutover: when set, the index lookup + persistence go through SQL.
-# JSON fallback on read still runs so sessions that started pre-cutover keep
-# finding their on-disk .md. T10 will strip the JSON path entirely.
-_SQL_FLAG_ENV = "RAG_STATE_SQL"
-
-
-def _sql_enabled() -> bool:
-    # Read env each call — tests flip the flag between runs, and this is
-    # cheap (os.environ is a dict lookup).
-    return os.environ.get(_SQL_FLAG_ENV, "").strip() == "1"
 
 
 @dataclass(frozen=True)
@@ -59,25 +44,6 @@ def _iso_z(ts: datetime) -> str:
 def _iso_seconds_now() -> str:
     # Matches T1's convention for `updated_at` on rag_* tables.
     return datetime.now().isoformat(timespec="seconds")
-
-
-def _read_index_json() -> dict[str, str]:
-    try:
-        raw = _INDEX_PATH.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_index_json(mapping: dict[str, str]) -> None:
-    _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _INDEX_PATH.with_suffix(_INDEX_PATH.suffix + ".tmp")
-    tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, _INDEX_PATH)
 
 
 def _open_sql_conn() -> sqlite3.Connection:
@@ -117,88 +83,49 @@ def _ensure_conversations_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def _persist_json_unlocked(session_id: str, relative_path: str) -> None:
-    mapping = _read_index_json()
-    mapping[session_id] = relative_path
-    _write_index_json(mapping)
-
-
-def _persist_index_from_within_write_turn(session_id: str, relative_path: str) -> None:
-    # write_turn's JSON branch already holds the fcntl lock, so the JSON
-    # persist must skip re-locking (flock on a fresh fd would block).
-    # SQL mode has no outer lock — go through the public path to run the
-    # BEGIN IMMEDIATE upsert.
-    if _sql_enabled():
-        persist_conversation_index_entry(session_id, relative_path)
-    else:
-        _persist_json_unlocked(session_id, relative_path)
-
-
 def persist_conversation_index_entry(session_id: str, relative_path: str) -> None:
-    """Upsert (session_id → relative_path) into the active index.
+    """Upsert (session_id → relative_path) into rag_conversations_index.
 
-    Flag ON → SQL UPSERT inside BEGIN IMMEDIATE against rag_conversations_index.
-    Flag OFF → atomic JSON replace under fcntl.flock (legacy path).
-
-    Safe to call standalone (public API). When invoked from inside write_turn
-    in JSON mode, the outer fcntl lock already guards the map and this function
-    bypasses re-locking via the `_sql_enabled()` branch vs. legacy branch.
+    SQL-only since T10. Safe to call concurrently — BEGIN IMMEDIATE + per-
+    process busy_timeout=10s serialise writes cleanly; no JSON-on-disk lock
+    needed.
     """
-    if _sql_enabled():
-        conn = _open_sql_conn()
-        try:
-            _ensure_conversations_table(conn)
-            conn.execute("BEGIN IMMEDIATE")
-            # _sql_upsert is the T1 primitive. Lazy-import to avoid hauling
-            # rag.py into every web module at import time.
-            import rag
-            rag._sql_upsert(
-                conn,
-                "rag_conversations_index",
-                {
-                    "session_id": session_id,
-                    "relative_path": relative_path,
-                    "updated_at": _iso_seconds_now(),
-                },
-                pk_cols=("session_id",),
-            )
-        finally:
-            conn.close()
-        return
-
-    _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _INDEX_PATH.with_suffix(_INDEX_PATH.suffix + ".lock")
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-        try:
-            _persist_json_unlocked(session_id, relative_path)
-        finally:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+    conn = _open_sql_conn()
+    try:
+        _ensure_conversations_table(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        # _sql_upsert is the T1 primitive. Lazy-import to avoid hauling
+        # rag.py into every web module at import time.
+        import rag
+        rag._sql_upsert(
+            conn,
+            "rag_conversations_index",
+            {
+                "session_id": session_id,
+                "relative_path": relative_path,
+                "updated_at": _iso_seconds_now(),
+            },
+            pk_cols=("session_id",),
+        )
+    finally:
+        conn.close()
 
 
 def get_conversation_path(session_id: str) -> str | None:
     """Return the vault-relative path for `session_id`, or None.
 
-    Flag ON → SELECT from rag_conversations_index; fall through to JSON if
-    row missing (7-day cutover safety — pre-cutover sessions still resolve).
-    Flag OFF → JSON lookup only.
+    SQL-only since T10.
     """
-    if _sql_enabled():
-        conn = _open_sql_conn()
-        try:
-            _ensure_conversations_table(conn)
-            row = conn.execute(
-                "SELECT relative_path FROM rag_conversations_index WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            return row[0]
-        # Cutover fallback: JSON may still hold sessions written pre-flag.
-        return _read_index_json().get(session_id)
-
-    return _read_index_json().get(session_id)
+    conn = _open_sql_conn()
+    try:
+        _ensure_conversations_table(conn)
+        row = conn.execute(
+            "SELECT relative_path FROM rag_conversations_index WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row is not None else None
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -333,7 +260,7 @@ def _write_turn_body(
         # still points to an existing (stale by one turn) note — not to a
         # ghost. The inverse order would create the .md and then fail the
         # index upsert, fragmenting the session on the next turn.
-        _persist_index_from_within_write_turn(session_id, str(target.relative_to(vault_root)))
+        persist_conversation_index_entry(session_id, str(target.relative_to(vault_root)))
         _atomic_write(target, new_text)
         return target
 
@@ -356,7 +283,7 @@ def _write_turn_body(
     # SQL-first: if the upsert fails the .md never gets written, so there's
     # no orphaned note on disk to mask the error. The caller (web/server.py)
     # will see the exception and log it as conversation_turn_error.
-    _persist_index_from_within_write_turn(session_id, str(target.relative_to(vault_root)))
+    persist_conversation_index_entry(session_id, str(target.relative_to(vault_root)))
     _atomic_write(target, new_text)
     return target
 
@@ -368,23 +295,12 @@ def write_turn(
     *,
     subfolder: str = "00-Inbox/conversations",
 ) -> Path:
+    """Append one turn to the session's .md + upsert the SQL index.
+
+    SQL-only since T10. Concurrency is bounded by one /api/chat per session
+    at a time + SQLite's busy_timeout in the index upsert; the whole-body
+    fcntl lock from the pre-T10 JSON path is gone.
+    """
     folder = vault_root / subfolder
     folder.mkdir(parents=True, exist_ok=True)
-
-    if _sql_enabled():
-        # SQL path: row-level lock inside persist_conversation_index_entry
-        # serialises index upserts. Same-session concurrent .md writes are
-        # not a production concern (one /api/chat request per session at a
-        # time) — removing the whole-body fcntl lock is the point of T5.
-        return _write_turn_body(vault_root, folder, session_id, turn)
-
-    # Legacy JSON path: whole-body fcntl lock serialises the .md
-    # read-modify-write + index write. Unchanged until T10.
-    _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _INDEX_PATH.with_suffix(_INDEX_PATH.suffix + ".lock")
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-        try:
-            return _write_turn_body(vault_root, folder, session_id, turn)
-        finally:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+    return _write_turn_body(vault_root, folder, session_id, turn)

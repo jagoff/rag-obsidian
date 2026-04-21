@@ -10,6 +10,7 @@ quedarse offline y validar el comportamiento de:
   - log appendea evento con `whatsapp_sent` bool
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,8 @@ def cfg_set(monkeypatch, tmp_path):
     monkeypatch.setattr(
         rag, "AMBIENT_LOG_PATH", tmp_path / "ambient.jsonl"
     )
+    # Post-T10: ambient log writes to rag_ambient in SQL.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
 
     def _set(jid: str | None, enabled: bool = True):
         if jid is None:
@@ -32,6 +35,31 @@ def cfg_set(monkeypatch, tmp_path):
         cfg_path.write_text(json.dumps({"jid": jid, "enabled": enabled}))
 
     return _set
+
+
+def _read_ambient_events(tmp_path: Path) -> list[dict]:
+    import sqlite3
+    db_file = tmp_path / "ragvec.db"
+    if not db_file.is_file():
+        return []
+    conn = sqlite3.connect(str(db_file))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute(
+            "SELECT ts, cmd, path, payload_json FROM rag_ambient ORDER BY id"
+        ).fetchall())
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        ev = {"ts": r["ts"], "cmd": r["cmd"], "path": r["path"]}
+        if r["payload_json"]:
+            try:
+                ev.update(json.loads(r["payload_json"]))
+            except Exception:
+                pass
+        out.append(ev)
+    return out
 
 
 @pytest.fixture
@@ -95,12 +123,8 @@ def test_logs_brief_push_event(cfg_set, captured, tmp_path):
     rag._brief_push_to_whatsapp(
         "Morning 2026-04-15", "05-Reviews/x.md", "hola"
     )
-    log_path = rag.AMBIENT_LOG_PATH
-    assert log_path.exists()
-    lines = [
-        json.loads(l) for l in log_path.read_text().splitlines() if l.strip()
-    ]
-    push_events = [e for e in lines if e.get("cmd") == "brief_push"]
+    events = _read_ambient_events(tmp_path)
+    push_events = [e for e in events if e.get("cmd") == "brief_push"]
     assert len(push_events) == 1
     assert push_events[0]["title"] == "Morning 2026-04-15"
     assert push_events[0]["path"] == "05-Reviews/x.md"
@@ -112,9 +136,6 @@ def test_send_failure_logged_as_false(cfg_set, monkeypatch, tmp_path):
     monkeypatch.setattr(rag, "_ambient_whatsapp_send", lambda j, t: False)
     sent = rag._brief_push_to_whatsapp("X", "y.md", "z")
     assert sent is False
-    log_path = rag.AMBIENT_LOG_PATH
-    push_events = [
-        json.loads(l) for l in log_path.read_text().splitlines() if l.strip()
-        if json.loads(l).get("cmd") == "brief_push"
-    ]
+    events = _read_ambient_events(tmp_path)
+    push_events = [e for e in events if e.get("cmd") == "brief_push"]
     assert push_events[0]["whatsapp_sent"] is False

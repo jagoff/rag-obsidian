@@ -114,18 +114,17 @@ def test_log_query_writes_to_sql_when_flag_on(sql_env):
         conn.close()
 
 
-def test_log_query_writes_to_jsonl_when_flag_off(jsonl_env):
+def test_log_query_writes_to_sql_even_with_flag_off(jsonl_env):
+    """Post-T10: the RAG_STATE_SQL flag is inert — writers always target SQL.
+    Flag-OFF callers still end up in rag_queries, not in a JSONL file."""
     rag.log_query_event({"cmd": "query", "q": "jsonl-ping", "top_score": 0.2})
-    _flush_log_queue()
-    # JSONL written
-    content = rag.LOG_PATH.read_text(encoding="utf-8").strip().splitlines()
-    assert len(content) == 1
-    rec = json.loads(content[0])
-    assert rec["q"] == "jsonl-ping"
-    # No SQL row
+    assert not rag.LOG_PATH.exists(), "JSONL written post-T10 (should be SQL)"
     conn = _open_db(jsonl_env)
     try:
-        assert _count(conn, "rag_queries") == 0
+        row = conn.execute(
+            "SELECT q FROM rag_queries WHERE q = ?", ("jsonl-ping",),
+        ).fetchone()
+        assert row is not None
     finally:
         conn.close()
 
@@ -251,8 +250,10 @@ def test_brief_written_writer_flag_on(sql_env):
         conn.close()
 
 
-def test_sql_write_failure_falls_through_to_jsonl(sql_env, monkeypatch):
-    """If the SQL path raises, the fail-safe JSONL write must still happen."""
+def test_sql_write_failure_logs_and_drops(sql_env, monkeypatch):
+    """Post-T10: if the SQL path raises, the error is logged to
+    sql_state_errors.jsonl and the event is silently dropped (no JSONL
+    fallback write)."""
     orig = rag._sql_append_event
 
     def boom(*a, **kw):
@@ -262,11 +263,11 @@ def test_sql_write_failure_falls_through_to_jsonl(sql_env, monkeypatch):
         rag.log_query_event({"cmd": "query", "q": "boom-test"})
     finally:
         monkeypatch.setattr(rag, "_sql_append_event", orig)
-    _flush_log_queue()
-    # JSONL fallback line must exist
-    text = rag.LOG_PATH.read_text(encoding="utf-8")
-    assert "boom-test" in text
-    # Error log line must exist
+    # No JSONL fallback anymore.
+    assert not rag.LOG_PATH.exists(), (
+        "JSONL fallback fired despite T10 removing that path"
+    )
+    # Error log line must exist.
     err_text = rag._SQL_STATE_ERROR_LOG.read_text(encoding="utf-8")
     assert "queries_sql_write_failed" in err_text
 

@@ -57,7 +57,6 @@ def _reset_caches(monkeypatch) -> None:
     monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
     monkeypatch.setattr(rag, "_feedback_golden_memo", None)
-    monkeypatch.setattr(rag, "_feedback_golden_mtime", 0.0)
     monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", None)
 
 
@@ -73,8 +72,11 @@ def sql_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def jsonl_env(tmp_path, monkeypatch):
-    """Flag OFF."""
-    monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
+    """Legacy flag-OFF fixture — kept for test-signature compatibility.
+    Post-T10 the flag is inert, so this is effectively an alias for sql_env
+    pointing at a tmp DB. Tests that relied on JSONL-only behavior have been
+    rewritten to assert the new SQL-only semantics."""
+    monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     _redirect_jsonl_paths(monkeypatch, tmp_path / "jsonl")
     _reset_caches(monkeypatch)
@@ -137,37 +139,19 @@ def test_behavior_priors_reads_sql_when_flag_on(sql_env):
     assert priors["hash"].startswith("sql:")
 
 
-def test_behavior_priors_falls_back_to_jsonl_when_sql_empty(sql_env):
-    """Flag ON + SQL empty + JSONL has data → return JSONL-based priors."""
+def test_behavior_priors_returns_empty_snapshot_when_sql_empty(sql_env):
+    """Post-T10: SQL-only. Empty rag_behavior → empty priors snapshot.
+    JSONL on disk is ignored (no fallback path)."""
     rag.BEHAVIOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     rag.BEHAVIOR_LOG_PATH.write_text(
         json.dumps({"ts": "2026-04-19T10:00:00", "source": "cli",
-                     "event": "open", "path": "01-Projects/legacy.md"}) + "\n"
-        + json.dumps({"ts": "2026-04-19T10:30:00", "source": "cli",
-                        "event": "open", "path": "01-Projects/legacy.md"}) + "\n",
+                     "event": "open", "path": "01-Projects/legacy.md"}) + "\n",
         encoding="utf-8",
     )
     priors = rag._load_behavior_priors()
-    assert priors["click_prior"]["01-Projects/legacy.md"] == pytest.approx(3 / 12)
-    assert priors["n_events"] == 2
-    assert priors["hash"].startswith("0.") or ":" in priors["hash"]
-
-
-def test_behavior_priors_flag_off_uses_jsonl(jsonl_env):
-    rag.BEHAVIOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rag.BEHAVIOR_LOG_PATH.write_text(
-        json.dumps({"ts": "2026-04-19T10:00:00", "event": "open",
-                     "path": "note.md"}) + "\n",
-        encoding="utf-8",
-    )
-    # Also seed SQL to prove it's not read.
-    _seed_rag_behavior(jsonl_env, [
-        {"ts": "2026-04-19T11:00:00", "event": "open",
-         "path": "should_not_appear.md"},
-    ])
-    priors = rag._load_behavior_priors()
-    assert "note.md" in priors["click_prior"]
-    assert "should_not_appear.md" not in priors["click_prior"]
+    assert priors["click_prior"] == {}
+    assert priors["n_events"] == 0
+    assert priors["hash"] == "sql:empty"
 
 
 def test_feedback_golden_rebuilt_when_source_ts_advances(sql_env):
@@ -206,8 +190,10 @@ def test_feedback_golden_rebuilt_when_source_ts_advances(sql_env):
         conn.close()
 
 
-def test_feedback_golden_bridge_from_json(sql_env):
-    """Flag ON + SQL golden empty + JSON on disk → bridge imports JSON → SQL."""
+def test_feedback_golden_empty_when_no_feedback_rows(sql_env):
+    """Post-T10: SQL-only. With no rag_feedback rows + no golden rows, even if
+    a legacy feedback_golden.json sits on disk, the loader returns an empty
+    snapshot (no JSON bridge)."""
     rag.FEEDBACK_GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     rag.FEEDBACK_GOLDEN_PATH.write_text(json.dumps({
         "positives": [
@@ -217,16 +203,7 @@ def test_feedback_golden_bridge_from_json(sql_env):
         "negatives": [],
     }), encoding="utf-8")
     golden = rag.load_feedback_golden()
-    assert len(golden["positives"]) == 1
-    assert golden["positives"][0]["paths"] == ["01-Projects/bridged.md"]
-    # Subsequent read hits SQL (JSON removal should not break re-reads).
-    rag.FEEDBACK_GOLDEN_PATH.unlink()
-    # Clear memo to force re-read.
-    rag._feedback_golden_memo = None
-    rag._feedback_golden_source_ts_sql = None
-    golden2 = rag.load_feedback_golden()
-    assert len(golden2["positives"]) == 1
-    assert golden2["positives"][0]["paths"] == ["01-Projects/bridged.md"]
+    assert golden == {"positives": [], "negatives": []}
 
 
 def test_behavior_augmented_cases_14d_window(sql_env):
@@ -256,9 +233,9 @@ def test_brief_state_dedup_sql_hit(sql_env):
                                    "01-Projects/NEW.md") is False
 
 
-def test_brief_state_dedup_fallback_jsonl(sql_env):
-    """Flag ON + SQL has no row + JSONL has the pair → seen returns True."""
-    # Write legacy JSONL record directly.
+def test_brief_state_dedup_sql_only(sql_env):
+    """Post-T10: only SQL is consulted. A legacy brief_state.jsonl with the
+    pair but no SQL row → seen returns False (no JSONL fallback)."""
     rag.BRIEF_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     key = "05-Reviews/2026-04-18.md\x0001-Projects/legacy.md"
     rag.BRIEF_STATE_PATH.write_text(
@@ -266,7 +243,7 @@ def test_brief_state_dedup_fallback_jsonl(sql_env):
         encoding="utf-8",
     )
     assert rag._brief_state_seen("05-Reviews/2026-04-18.md",
-                                   "01-Projects/legacy.md") is True
+                                   "01-Projects/legacy.md") is False
 
 
 def test_ambient_state_lookup_sql_returns_analyzed_at(sql_env):
@@ -305,24 +282,23 @@ def test_reader_cache_invalidates_on_new_max_ts(sql_env):
     assert rag._behavior_priors_cache_key_sql != first_key
 
 
-def test_reader_sql_exception_falls_through(sql_env):
-    """Mock _sql_query_window to raise → _behavior_augmented_cases returns
-    JSONL-path result + error is logged."""
+def test_reader_sql_exception_returns_empty(sql_env):
+    """Post-T10: when _sql_query_window raises, _behavior_augmented_cases
+    logs the error and returns an empty list (no JSONL fallback)."""
     import datetime as _dt
     fresh = (_dt.datetime.now() - _dt.timedelta(days=3)).isoformat(
         timespec="seconds")
     rag.BEHAVIOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     rag.BEHAVIOR_LOG_PATH.write_text(
         json.dumps({"ts": fresh, "event": "open", "path": "jsonl.md",
-                     "query": "fallback q"}) + "\n",
+                     "query": "should not be read"}) + "\n",
         encoding="utf-8",
     )
 
     with patch.object(rag, "_sql_query_window",
                        side_effect=RuntimeError("boom")):
         cases = rag._behavior_augmented_cases(days=14)
-    questions = [c["question"] for c in cases]
-    assert "fallback q" in questions
+    assert cases == []
     # Error log should have a record.
     log_txt = rag._SQL_STATE_ERROR_LOG.read_text(encoding="utf-8")
     assert "behavior_augmented_cases_sql_read_failed" in log_txt
@@ -352,8 +328,9 @@ def test_contradictions_sql_read(sql_env):
     assert out[0]["subject_path"] == "01-Projects/s.md"
 
 
-def test_ambient_should_skip_jsonl_fallback(sql_env):
-    """Flag ON but SQL has no row → JSONL scan finds the entry."""
+def test_ambient_should_skip_sql_only(sql_env):
+    """Post-T10: SQL-only. A legacy ambient_state.jsonl with the entry but no
+    rag_ambient_state row → _ambient_should_skip returns False."""
     import time as _time
     rag.AMBIENT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     rag.AMBIENT_STATE_PATH.write_text(
@@ -361,4 +338,4 @@ def test_ambient_should_skip_jsonl_fallback(sql_env):
                      "analyzed_at": _time.time()}) + "\n",
         encoding="utf-8",
     )
-    assert rag._ambient_should_skip("00-Inbox/legacy.md", "xyz") is True
+    assert rag._ambient_should_skip("00-Inbox/legacy.md", "xyz") is False

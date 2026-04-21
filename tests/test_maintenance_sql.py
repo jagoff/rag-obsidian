@@ -190,8 +190,8 @@ def test_rotation_skipped_when_flag_off(jsonl_env, monkeypatch):
         "count": 0, "bytes_freed": 0, "paths": []})
     monkeypatch.setattr(rag, "_chroma_wal_checkpoint", lambda dry_run=False: {
         "ok": True, "before_bytes": 0, "after_bytes": 0})
-    monkeypatch.setattr(rag, "_rebuild_feedback_golden",
-                         lambda: {"positives": [], "negatives": []})
+    monkeypatch.setattr(rag, "_rebuild_feedback_golden_from_sql_feedback",
+                         lambda conn: {"positives": [], "negatives": []})
     monkeypatch.setattr(rag, "find_dead_notes", lambda *a, **k: [])
     monkeypatch.setattr(rag, "get_db", lambda: _DummyCol())
     monkeypatch.setattr(rag, "get_urls_db", lambda: _DummyCol())
@@ -392,8 +392,8 @@ def test_maintenance_summary_includes_sql_section(sql_env, monkeypatch):
         "count": 0, "bytes_freed": 0, "paths": []})
     monkeypatch.setattr(rag, "_chroma_wal_checkpoint", lambda dry_run=False: {
         "ok": True, "before_bytes": 0, "after_bytes": 0})
-    monkeypatch.setattr(rag, "_rebuild_feedback_golden",
-                         lambda: {"positives": [], "negatives": []})
+    monkeypatch.setattr(rag, "_rebuild_feedback_golden_from_sql_feedback",
+                         lambda conn: {"positives": [], "negatives": []})
     monkeypatch.setattr(rag, "find_dead_notes", lambda *a, **k: [])
     monkeypatch.setattr(rag, "get_db", lambda: _DummyCol())
     monkeypatch.setattr(rag, "get_urls_db", lambda: _DummyCol())

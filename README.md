@@ -751,20 +751,6 @@ Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). 
 - **Sesiones**: `wa:<jid>` como session_id literal → un solo thread por bot (un grupo). TTL 30 días.
 - **Tests**: `~/whatsapp-listener/listener.test.ts` cubre URL regexes, `ragRead/Followup/Today`, `enableAmbient`. `bun test listener.test.ts`.
 
-### Bots de Telegram (deprecados)
-
-Los 3 bots de Telegram fueron archivados el 2026-04-15. Código histórico + plists vivos para rollback:
-
-| Antes | Ahora |
-|---|---|
-| `@ragsystemobs_bot` (obsidian-rag-bot) | `~/archive/telegram-2026-04-15/obsidian-rag-bot/DEPRECATED.md` |
-| `@ffeerrr_bot` (claude-telegram-bot) | `~/archive/telegram-2026-04-15/claude-telegram-bot/DEPRECATED.md` |
-| `@rauuuliiitoo_bot` (ollama-telegram / ollama-telegram-bot) | `~/archive/telegram-2026-04-15/ollama-telegram/DEPRECATED.md`, `~/archive/telegram-2026-04-15/ollama-telegram-bot/DEPRECATED.md` |
-
-Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Para rollback: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/.archive-telegram/2026-04-15/com.fer.<bot>.plist`. Migration notes en `~/whatsapp-listener/MIGRATION.md`.
-
----
-
 ## Troubleshooting
 
 | Síntoma | Causa probable | Fix |

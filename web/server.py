@@ -4820,7 +4820,7 @@ def _dashboard_aggregate(
         elif sid.startswith("web:"):
             sources["web"] += 1
         elif sid.startswith("tg:"):
-            sources["telegram"] += 1
+            sources["legacy"] += 1
         else:
             sources["cli"] += 1
 
@@ -5458,7 +5458,7 @@ def _stream_payload(kind: str, ev: dict) -> dict:
         elif sid.startswith("web:"):
             source = "web"
         elif sid.startswith("tg:"):
-            source = "telegram"
+            source = "legacy"
         else:
             source = "cli"
         tr = ev.get("t_retrieve")

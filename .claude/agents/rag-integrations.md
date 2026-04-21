@@ -29,7 +29,7 @@ You are the integrations specialist for `/Users/fer/repositories/obsidian-rag/ra
 - `_brief_push_to_whatsapp(body)` — POST to `http://localhost:8080/api/send`
 - `WHATSAPP_BOT_JID` (RagNet group `120363426178035051@g.us`) skipped — don't fold bot's own traffic back in
 - Anti-loop marker U+200B (zero-width space) — listener prefixes outbound; `_fetch_whatsapp_unread` ignores anything starting with it
-- Status: the WhatsApp listener (`~/whatsapp-listener/listener.ts`, launchd `com.fer.whatsapp-listener`) is the single bot — replaced 3 archived Telegram bots. Don't reintroduce Telegram code paths.
+- Status: the WhatsApp listener (`~/whatsapp-listener/listener.ts`, launchd `com.fer.whatsapp-listener`) is the single bot — don't reintroduce legacy bot code paths.
 - **`com.fer.obsidian-rag-wa-tasks`** plist (NEW 2026-04-17) runs `_wa_extract_actions` over a SQLite window. Tests in `tests/test_wa_tasks.py` (19 deterministic tests; LLM stubbed; fake bridge schema built in-test).
 
 **Weather**:

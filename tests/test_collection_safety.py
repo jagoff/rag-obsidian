@@ -6,6 +6,8 @@ Covers:
 3. _log_collection_op writes a valid JSON line to the ops log.
 4. Sentinel invalidates _db_singleton so get_db() returns a fresh collection.
 5. _collection_write_lock is mutually exclusive between threads.
+6. auto_index_vault skips (kind="skipped_lock_held") when the write lock is held.
+7. _load_corpus rebuilds BM25 cache when the collection UUID rotates (delete+recreate).
 """
 import json
 import os
@@ -199,7 +201,62 @@ def test_collection_write_lock_is_exclusive(tmp_path, monkeypatch):
     )
 
 
-# ── test 6: corpus cache invalidates on collection UUID change ────────────────
+# ── test 6: auto_index_vault skips when write lock is held ────────────────────
+
+
+def test_auto_index_skips_when_lock_held(tmp_path, monkeypatch):
+    """When thread A holds the write lock, auto_index_vault called from thread B
+    must return immediately with kind='skipped_lock_held' without blocking."""
+    monkeypatch.setattr(rag, "COLLECTION_WRITE_LOCK", tmp_path / "lock")
+    monkeypatch.setattr(rag, "COLLECTION_OPS_LOG", tmp_path / "ops.log")
+
+    result_holder: list[dict] = []
+    lock_held = threading.Event()
+    can_release = threading.Event()
+
+    def _hold_lock():
+        with rag._collection_write_lock(timeout=10):
+            lock_held.set()
+            can_release.wait(timeout=5)
+
+    def _run_auto_index():
+        vault_path = tmp_path / "vault"
+        vault_path.mkdir(exist_ok=True)
+        with patch("rag._index_single_file") as mock_isf, \
+             patch("rag._auto_index_state_load", return_value={}), \
+             patch("rag._auto_index_state_save"):
+            mock_isf.return_value = "skipped"
+            result = rag.auto_index_vault(vault_path)
+            result_holder.append(result)
+
+    holder_thread = threading.Thread(target=_hold_lock)
+    holder_thread.start()
+
+    # Wait until the lock is actually held before launching auto_index.
+    assert lock_held.wait(timeout=5), "lock holder thread did not acquire lock in time"
+
+    t_start = time.monotonic()
+    auto_thread = threading.Thread(target=_run_auto_index)
+    auto_thread.start()
+    auto_thread.join(timeout=5)
+    elapsed = time.monotonic() - t_start
+
+    # Release the holder after auto_index should have already returned.
+    can_release.set()
+    holder_thread.join(timeout=5)
+
+    assert len(result_holder) == 1, "auto_index_vault did not return"
+    result = result_holder[0]
+    assert result["kind"] == "skipped_lock_held", (
+        f"Expected kind='skipped_lock_held', got {result['kind']!r}"
+    )
+    # Must return almost immediately — not block waiting for the lock.
+    assert elapsed < 2.0, (
+        f"auto_index_vault blocked for {elapsed:.2f}s — expected near-instant skip"
+    )
+
+
+# ── test 7: corpus cache invalidates on collection UUID change ────────────────
 
 
 def test_corpus_cache_invalidates_on_collection_id_change(monkeypatch):

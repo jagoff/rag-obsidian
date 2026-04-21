@@ -554,7 +554,7 @@ Cada call a `rag_query` con `session_id` extiende la misma sesión que la CLI us
 
 ### WhatsApp listener — bot unificado
 
-Un solo listener consolida los roles que antes ocupaban los 3 bots de Telegram (`@ffeerrr_bot`, `@ragsystemobs_bot`, `@rauuuliiitoo_bot`). Vive en `~/whatsapp-listener/listener.ts`, arranca vía launchd (`com.fer.whatsapp-listener`), y polea el SQLite del bridge local (`com.fer.whatsapp-bridge`, `http://localhost:8080`). Anti-loop con U+200B prefix (ignora mensajes que arrancan con ZWSP — sus propios outputs vía bridge).
+Un único listener corre en `~/whatsapp-listener/listener.ts`, arranca vía launchd (`com.fer.whatsapp-listener`), y polea el SQLite del bridge local (`com.fer.whatsapp-bridge`, `http://localhost:8080`). Anti-loop con U+200B prefix (ignora mensajes que arrancan con ZWSP — sus propios outputs vía bridge).
 
 | Trigger | Comportamiento | Backend |
 |---|---|---|

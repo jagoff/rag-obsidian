@@ -28785,7 +28785,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             # num_ctx=4096 to keep the web chat's KV cache warm (see CHAT_OPTIONS).
-            options={"temperature": 0, "seed": 42, "num_ctx": 4096, "num_predict": 128},
+            options={**CHAT_OPTIONS, "num_predict": 128},
             keep_alive=chat_keep_alive(),
         )
         raw = resp.message.content.strip()
@@ -30251,7 +30251,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
                 {"role": "system", "content": _ENRICH_HELPER_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            options={**HELPER_OPTIONS, "num_predict": 160, "num_ctx": 2048, "format": "json"},
+            options={**CHAT_OPTIONS, "num_predict": 160, "num_ctx": 2048, "format": "json"},
             keep_alive=chat_keep_alive(),
         )
         raw = (rsp.message.content or "").strip()

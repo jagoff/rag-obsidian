@@ -792,6 +792,42 @@ function appendWebSearch(parent, query, inline = false) {
   }
 }
 
+// Fallback cluster — cuando el backend emite `done` con
+// `low_conf_bypass=true`, el vault no tenía info útil y el sistema
+// devolvió un template fijo (no LLM call). En vez de ofrecer solo el
+// link sutil "↗ buscar en internet", renderamos un cluster prominente
+// de 3 botones (Google / YouTube / Wikipedia) para dar escape fácil.
+// Todos los botones son links directos (no API calls, no trackeo).
+// Sigue apareciendo el bloque `📎 contexto relacionado` (YouTube videos
+// de `/api/related`) cuando aplique, DEBAJO del cluster.
+function appendFallbackCluster(parent, query) {
+  if (!query) return;
+  const wrap = el("div", "fallback-cluster");
+  wrap.appendChild(el(
+    "div", "fallback-head",
+    "no encontré eso en tus notas — ¿querés que busque en...?",
+  ));
+  const buttons = el("div", "fallback-buttons");
+  const q = encodeURIComponent(query);
+  const specs = [
+    { cls: "fallback-google",   label: "🔍 Google",    url: `https://www.google.com/search?q=${q}` },
+    { cls: "fallback-youtube",  label: "▶ YouTube",    url: `https://www.youtube.com/results?search_query=${q}` },
+    { cls: "fallback-wiki",     label: "📖 Wikipedia", url: `https://es.wikipedia.org/wiki/Special:Search?search=${q}` },
+  ];
+  for (const s of specs) {
+    const a = document.createElement("a");
+    a.className = `fallback-btn ${s.cls}`;
+    a.href = s.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = s.label;
+    a.title = `${s.label.replace(/^[^\s]+\s*/, '')}: ${query}`;
+    buttons.appendChild(a);
+  }
+  wrap.appendChild(buttons);
+  parent.appendChild(wrap);
+}
+
 // Cross-source enrichment footer: WhatsApp/Calendar/Reminders signals
 // surfaced after the answer streams. Each line: icon + text + optional
 // snippet (italic) + relative time (right-aligned).
@@ -1737,13 +1773,31 @@ async function send(question) {
       // fallback — vault retrieval / googling are irrelevant when the user
       // asked the system to CREATE a reminder/event.
       const mentionMatched = (sources || []).some((s) => s.score >= 5.0);
-      if (!hadProposal && question && ragText && weakAnswer && !mentionMatched) {
-        const target = ragText.lastElementChild || ragText;
-        appendWebSearch(target, question, true);
+      // Low-confidence bypass (backend skipped the LLM call entirely):
+      // mostrar el cluster prominente de "¿querés que busque en...?" con
+      // 3 botones (Google/YouTube/Wikipedia) en vez del link sutil
+      // inline. Razón: si el sistema directamente saltó al template
+      // fijo, el usuario necesita un escape visible, no un hint tímido.
+      // Cuando hay weakAnswer pero NO bypass (el LLM intentó y no
+      // encontró), mantenemos el link inline — el user puede insistir
+      // sin que el layout explote en CTAs.
+      const lowConfBypass = parsed.low_conf_bypass === true;
+      if (!hadProposal && question && weakAnswer && !mentionMatched) {
+        if (lowConfBypass) {
+          appendFallbackCluster(turn, question);
+        } else if (ragText) {
+          const target = ragText.lastElementChild || ragText;
+          appendWebSearch(target, question, true);
+        }
       }
       if (!hadProposal && sources && sources.length) {
         appendSources(turn, sources, conf);
       }
+      // appendRelated() sigue firing cuando el /api/related tiene items
+      // (YouTube videos relacionados). Aparece DEBAJO del cluster (si
+      // bypass) o del inline link (si no). No duplicamos el botón de
+      // YouTube: el cluster es un search link, appendRelated renderea
+      // videos específicos — semánticas distintas, ambos útiles.
       if (!hadProposal && question && weakAnswer && !mentionMatched) {
         appendRelated(turn, question);
       }

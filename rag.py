@@ -9460,9 +9460,26 @@ _CHUNK_AS_DATA_RULE = (
     "fuente.\n\n"
 )
 
+# Name-preservation clause — prepended right after _CHUNK_AS_DATA_RULE on every
+# SYSTEM_RULES* so the model NEVER 'corrects' proper nouns it doesn't recognise.
+# Motivation (2026-04-21): a user asked about "Bizarrap" (Argentine music
+# producer), the vault had no musical info, and the LLM answered refusing about
+# "Bizarra" — silently swapping the proper noun to a more common dictionary
+# word. Unacceptable: proper nouns are the user's ground truth, not the model's.
+_NAME_PRESERVATION_RULE = (
+    "REGLA DE NOMBRES PROPIOS: si el usuario menciona un nombre propio, marca, "
+    "artista, persona, lugar, producto o término técnico en su pregunta, "
+    "copialo TEXTUAL como aparece escrito por el usuario. NUNCA lo 'corrijas' "
+    "aunque te parezca raro, mal escrito o desconocido. Ejemplo: si pregunta "
+    "por 'Bizarrap', NO escribas 'Bizarra' ni 'Vizarrap' ni ninguna variante "
+    "— solo 'Bizarrap'. Si no reconocés el término, tratalo como un nombre "
+    "propio válido que el usuario conoce y vos no.\n\n"
+)
+
 
 SYSTEM_RULES = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Eres un asistente de consulta sobre las notas personales de Obsidian del "
     "usuario. NO sos un modelo de conocimiento general.\n\n"
@@ -9487,6 +9504,7 @@ SYSTEM_RULES = (
 
 SYSTEM_RULES_STRICT = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
     "REGLAS:\n"
@@ -9507,6 +9525,7 @@ SYSTEM_RULES_STRICT = (
 # no sirven cuando el modelo ya es citation-native (command-r RAG-trained).
 SYSTEM_RULES_CHAT = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Respondé SOLO con info literal del CONTEXTO de abajo. "
     "Si no está: 'No tengo esa información en tus notas.' y cortá. "
@@ -9556,6 +9575,7 @@ _SERVE_CHAT_SYSTEM = (
 # without requiring the user to click sources. Identical source/citation/ext rules.
 SYSTEM_RULES_WEB = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Eres un asistente de consulta sobre las notas personales de Obsidian del "
     "usuario. NO sos un modelo de conocimiento general.\n\n"
@@ -9592,6 +9612,7 @@ SYSTEM_RULES_WEB = (
 
 SYSTEM_RULES_LOOKUP = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
     "REGLAS:\n"
@@ -9604,6 +9625,7 @@ SYSTEM_RULES_LOOKUP = (
 
 SYSTEM_RULES_SYNTHESIS = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
     "REGLAS:\n"
@@ -9617,6 +9639,7 @@ SYSTEM_RULES_SYNTHESIS = (
 
 SYSTEM_RULES_COMPARISON = (
     _CHUNK_AS_DATA_RULE
+    + _NAME_PRESERVATION_RULE
     +
     "Asistente sobre notas personales de Obsidian. NO modelo de conocimiento general.\n\n"
     "REGLAS:\n"

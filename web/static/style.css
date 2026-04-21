@@ -393,6 +393,52 @@ html, body {
   white-space: nowrap;
 }
 
+/* Fallback cluster — disparado por el `done` event con
+   low_conf_bypass=true. Más prominente que .web-search-link.inline
+   (cta visible, 3 botones en row) pero más liviano que .enrich-block
+   (sin border top heavy). Tonos por dominio: Google cyan, YouTube
+   rojo, Wikipedia amarillo — no competimos con los colores del
+   badge de confianza, todos wireframe-only en rest. */
+.fallback-cluster {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fallback-head {
+  color: var(--text-dim);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.fallback-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fallback-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 12.5px;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+  white-space: nowrap;
+}
+.fallback-btn:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.fallback-google:hover  { border-color: var(--cyan-dim);   color: var(--cyan); }
+.fallback-youtube:hover { border-color: #a33;              color: var(--red); }
+.fallback-wiki:hover    { border-color: #8a6c33;           color: var(--yellow); }
+
 /* Enrichment footer (WA/Calendar/Reminders cross-refs) ---------- */
 .enrich-block {
   margin-top: 12px;

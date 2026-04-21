@@ -34,6 +34,7 @@ import ollama  # noqa: E402
 
 from rag import (  # noqa: E402
     CHAT_OPTIONS,
+    CONFIDENCE_RERANK_MIN,
     CONTRADICTION_LOG_PATH,
     EVAL_LOG_PATH,
     LOG_PATH,
@@ -4006,6 +4007,136 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "confidence": round(_sanitize_confidence(result["confidence"]), 3),
             "propose_intent": is_propose_intent,
         })
+
+        # Low-confidence bypass — cuando el vault no tiene info útil
+        # (conf < CONFIDENCE_RERANK_MIN), saltamos el ollama.chat call
+        # (5-8s de cold prefill + streamed decode) y devolvemos un
+        # template fijo con la pregunta textual del usuario. Motivos
+        # (2026-04-22):
+        #   a) latencia cae a <100ms (solo retrieve) — el sistema
+        #      percibido "sabe" que no tiene data en vez de esperar para
+        #      recibir un "no tengo info" igual de corto del LLM.
+        #   b) preserva nombres propios: el LLM sin CONTEXTO bajaba a
+        #      apellidos parecidos ("Bizarrap" → "Bizarra") intentando
+        #      matchear algo del pretraining. Con el template echoing
+        #      exacto del input no hay superficie para alucinar.
+        # Gates (cualquiera en false → path normal):
+        #   - conf < CONFIDENCE_RERANK_MIN (0.015, global gate en
+        #     rag.py) → retrieve básicamente devolvió vacío.
+        #   - NO mention hits: si el query pega con 99 Mentions @/ el
+        #     usuario preguntó por una entidad conocida y la respuesta
+        #     debe pasar por el LLM con el mention preamble.
+        #   - NO propose_intent: los turns de "recordame X" / "agendá
+        #     Y" usan el tool loop para crear cosas, no consultan el
+        #     vault.
+        # El `low_conf_bypass=True` en el `done` payload le indica al
+        # frontend que renderee el cluster de fallback ("¿querés buscar
+        # en Google/YouTube/Wikipedia?") en lugar del inline web-search
+        # link del path weakAnswer.
+        _low_conf_bypass = (
+            not is_propose_intent
+            and not _mention_paths
+            and float(result["confidence"]) < CONFIDENCE_RERANK_MIN
+        )
+        if _low_conf_bypass:
+            _t_retrieve_ms = int((_t_retrieve_end - _t_retrieve_start) * 1000)
+            # Escape mínimo de `"` para no romper el template cuando el
+            # usuario mandó comillas literales. UTF-8 + emojis intactos.
+            _q_safe = question.replace('"', '\\"')
+            _bypass_text = f'No tengo info sobre "{_q_safe}" en tus notas.'
+            print(
+                f"[chat-bypass] conf={float(result['confidence']):.4f} "
+                f"reason=low_conf q_words={len(question.split())} "
+                f"retrieve_ms={_t_retrieve_ms}",
+                flush=True,
+            )
+            yield _sse("status", {"stage": "generating"})
+            # Stream en chunks de 40 chars — mismo shape que el
+            # cache-hit path (~línea 3800). El UI ya dispara el
+            # token-ticker en el primer delta, así que la percepción
+            # es idéntica a una respuesta "en vivo" aunque sea canned.
+            for _i in range(0, len(_bypass_text), 40):
+                yield _sse("token", {"delta": _bypass_text[_i:_i + 40]})
+            _bypass_turn_id = new_turn_id()
+            _bypass_total_ms = int((time.perf_counter() - _t0) * 1000)
+            _bypass_top_score = round(
+                _sanitize_confidence(result["confidence"]), 3,
+            )
+            yield _sse("done", {
+                "turn_id": _bypass_turn_id,
+                "top_score": _bypass_top_score,
+                "total_ms": _bypass_total_ms,
+                "retrieve_ms": _t_retrieve_ms,
+                "ttft_ms": _bypass_total_ms,
+                "llm_ms": 0,
+                "low_conf_bypass": True,
+                "bypassed": True,
+            })
+            # Emitimos un `[chat-timing]` shape-stable para los parsers
+            # downstream (dashboards + grep-tooling asumen una línea por
+            # turn). Mismo approach que el cache-hit path (~3820).
+            # `bypassed=1` como tag terminal distingue del cached=1.
+            print(
+                f"[chat-timing] model={_resolve_web_chat_model()} "
+                f"retrieve={_t_retrieve_ms}ms "
+                f"reform=0ms reform_outcome=skipped "
+                f"q_words={len(question.split())} "
+                f"wa=0ms llm_prefill=0ms llm_decode=0ms "
+                f"ttft={_bypass_total_ms}ms total={_bypass_total_ms}ms "
+                f"ctx_chars=0 tokens≈{len(_bypass_text.split())} "
+                f"confidence={_bypass_top_score:.3f} variants=0 "
+                f"tool_rounds=0 tool_ms=0 tool_names= bypassed=1",
+                flush=True,
+            )
+            # Persistimos la conversación + logueamos igual que el path
+            # normal para que analytics y el episodic writer vean el
+            # turno. Tests garantizan que bypass=True queda en el log.
+            try:
+                append_turn(sess, {
+                    "q": question,
+                    "a": _bypass_text,
+                    "paths": [],
+                    "top_score": _bypass_top_score,
+                    "turn_id": _bypass_turn_id,
+                    "low_conf_bypass": True,
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.low_conf_bypass",
+                    "turn_id": _bypass_turn_id,
+                    "session": sess["id"],
+                    "q": question,
+                    "paths": [],
+                    "scores": [],
+                    "top_score": _bypass_top_score,
+                    "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
+                    "t_gen": 0.0,
+                    "low_conf_bypass": True,
+                })
+            except Exception:
+                pass
+            _spawn_conversation_writer(
+                target_args=(
+                    VAULT_PATH,
+                    sess["id"],
+                    req.question,
+                    _bypass_text,
+                    result["metas"],
+                    result["scores"],
+                    result["confidence"],
+                ),
+                name=f"conv-writer-{_bypass_turn_id[:8]}",
+            )
+            _enrich_evt = _emit_enrich(
+                _bypass_turn_id, question, _bypass_text,
+                float(result["confidence"]),
+            )
+            if _enrich_evt:
+                yield _enrich_evt
+            return
 
         is_multi = len(vaults) > 1
         # Cap each chunk at 500 chars on the fast path. With 4 chunks that's

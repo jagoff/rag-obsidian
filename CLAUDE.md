@@ -224,6 +224,10 @@ Callers of `_format_chunk_for_llm`: `build_progressive_context` (primary + multi
 
 Tests: [`tests/test_prompt_injection_defence.py`](tests/test_prompt_injection_defence.py) (61 cases: OTP positives en ES + EN + unaccented, bank secret positives, negative cases for version strings / dates / commit SHAs / prose like "code base", chunk wrapper contract, `REGLA 0` presence + ordering in every `SYSTEM_RULES*`).
 
+### Name-preservation guardrail (2026-04-21)
+
+Separate from prompt-injection, a second always-on clause `_NAME_PRESERVATION_RULE` in `rag.py` (right below `_CHUNK_AS_DATA_RULE`) blocks a distinct failure mode: the LLM "correcting" proper nouns it doesn't recognise. Regression seed: user asked about "Bizarrap" (Argentine producer), the vault had no musical info, the model answered refusing about **"Bizarra"** — silently swapping a rare proper noun for a commoner dictionary word. Rule is prepended right after `_CHUNK_AS_DATA_RULE` in every `SYSTEM_RULES*` (ordering: chunks-as-data → names → variant body) so the model copies user-supplied names TEXTUAL and treats unknown terms as valid proper nouns it doesn't know. Verify with `python -c "import rag; print(rag._NAME_PRESERVATION_RULE[:80])"`. Tests: [`tests/test_name_preservation_rule.py`](tests/test_name_preservation_rule.py) (46 cases: constant presence, per-variant inclusion + ordering + no-duplication, `system_prompt_for_intent()` coverage for every intent incl. `loose=True`).
+
 ### Response-quality post-pipeline
 
 **Citation-repair** (always-on): after generation, `verify_citations(full, metas)` flags invented paths. If non-empty, ONE repair call runs (`resolve_chat_model()` + `CHAT_OPTIONS`, non-streaming, `keep_alive=-1`) with system prompt `"Solo puedes citar las siguientes rutas: [...]. ... No inventes otras."` If repair output also has bad citations or is empty → keep original. On success → replace `full` silently (interactive: reprints via `render_response`; plain: single `click.echo` deferred until AFTER repair + critique). Logs `citation_repaired: bool` to `queries.jsonl`.

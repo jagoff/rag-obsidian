@@ -6,7 +6,7 @@
   --border-strong: #3e3e46;
   --text: #ececed;
   --text-dim: #8a8a90;
-  --text-faint: #6b6b72;  /* bumped from #5a5a60 for 4.5:1 contrast on --bg */
+  --text-faint: #5a5a60;
   --green: #7ee787;
   --cyan: #79c0ff;
   --cyan-dim: #3b7aa1;
@@ -1167,12 +1167,6 @@ kbd {
    el markup ni los bloques originales. Lee los motion tokens del :root.
    ════════════════════════════════════════════════════════════════════════ */
 
-/* Typography refinement — ligaduras terminal-style + features de mono. */
-html, body {
-  font-feature-settings: "calt" 1, "ss01" 1, "liga" 1;
-  text-rendering: optimizeLegibility;
-}
-
 /* Turn rhythm — gaps consistentes usando la escala de spacing. */
 .turn {
   gap: var(--space-3);
@@ -1606,4 +1600,66 @@ html, body {
     transition: opacity 0.01ms;
     transform: none;
   }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   FLAT LOOK — libre de bordes + separadores
+   Override al final de la cascada: setea --border / --border-strong a
+   transparent para que los 46 selectores que los usan como border-color
+   queden chatos. Los indicators de estado (proposal-status, created-chip,
+   feedback-up/down) usan colores de acento (--green/--red/--cyan), así
+   que NO se ven afectados — mantienen su función semántica.
+
+   Restauraciones puntuales para los ~5 sitios que usan las vars como
+   NO-border (scrollbar, dot separator entre tool-chips, hover de botones).
+   ══════════════════════════════════════════════════════════════════════ */
+:root {
+  --border: transparent;
+  --border-strong: transparent;
+}
+
+/* Scrollbar — mantener visible con un gris tenue. */
+* { scrollbar-color: var(--text-faint) transparent; }
+*::-webkit-scrollbar-thumb { background: var(--text-faint); }
+*::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Separador "·" entre tool-chips — restaurar color tenue. */
+.tool-chip + .tool-chip::before { color: var(--text-faint); }
+
+/* Proposal button hover — feedback visual en hover. */
+.proposal-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   NO-BOLD — todas las fuentes en peso regular (400)
+   Override al final de la cascada: neutraliza los font-weight: 500/600/700
+   del archivo + los browser defaults (strong, b, h1-h6, th). El input,
+   topbar, prompts, headers markdown, tablas, kbd, slash-menu, proposal
+   cards, help modal — todo queda en regular. Borrar este bloque para
+   volver a la jerarquía tipográfica por pesos.
+   ══════════════════════════════════════════════════════════════════════ */
+.topbar-title,
+.prompt,
+.topbar-link,
+#input-prompt,
+#help-btn,
+.slash-item .slash-cmd,
+kbd,
+.proposal-title,
+.modal-head h2,
+.modal-card section h3,
+.text.rag h1,
+.text.rag h2,
+.text.rag h3,
+.text.rag h4,
+.text.rag h5,
+.text.rag h6,
+.text.rag th,
+.text.rag strong,
+.text.rag b,
+/* browser defaults fuera de .text.rag --------------------------- */
+h1, h2, h3, h4, h5, h6,
+strong, b, th {
+  font-weight: 400;
 }

@@ -302,38 +302,60 @@ queries:
     note: "synthesis intent: multi-doc sobre un mismo concepto"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Cross-source queries (Phase 1.f — pending real data)
+  # Cross-source queries (Phase 1.f — baselined 2026-04-21)
   # ─────────────────────────────────────────────────────────────────────────
   #
-  # Template for when the Gmail / WhatsApp / Calendar / Reminders ingesters
-  # have populated the corpus. `expected` paths use native-id scheme per
-  # docs/design-cross-source-corpus.md §2.7:
-  #   gmail://thread:<id>::<chunk_idx>
-  #   whatsapp://<chat_jid>/msg:<id>::<chunk_idx>
-  #   calendar://event:<id>::<chunk_idx>
+  # Gold paths use native-id scheme per docs/design-cross-source-corpus.md §2.7:
+  #   gmail://thread/<id>::<chunk_idx>
+  #   whatsapp://<chat_jid>/<first_msg_id>::<chunk_idx>
   #   reminders://<reminder_id>::<chunk_idx>
+  #   calendar://event:<id>::<chunk_idx>  (aún no populated — gated en OAuth setup)
   #
-  # These are accepted as placeholders by
-  # tests/test_eval_bootstrap.py::test_queries_yaml_all_paths_exist_or_placeholder
-  # — the whitelist lives next to that test. UN-comment + fill in real IDs
-  # once `rag index --source <src>` has run against real data.
-  #
-  # - question: "qué le dije a juan sobre la migración"
-  #   expected:
-  #     - gmail://thread:1890f3abcd::0
-  #     - whatsapp://12036304@g.us/msg:ABC123::0
-  #   note: "cross-source: vault+email+WA resolving to same decision"
-  #
-  # - question: "cuándo fue la reunión con juan"
-  #   expected:
-  #     - calendar://event:XYZ789::0
-  #   note: "cross-source: pure calendar lookup"
-  #
-  # - question: "pendientes sobre el proyecto"
-  #   expected:
-  #     - reminders://R-001::0
-  #     - reminders://R-002::0
-  #   note: "cross-source: reminders surfacing for a project theme"
+  # Estas queries arrancaron con el corpus activo post-ingest de 2026-04-21:
+  # 20 chunks gmail + 36 chunks reminders + 4070 chunks WhatsApp.
+  # Cualquier regresión grande acá indica que el scoring/weighting/threshold
+  # está mal calibrado para el mix cross-source (precisamente lo que Phase 1.f
+  # existe para detectar).
+
+  # Reminders — concrete pendings
+  - question: "cuándo tengo que buscar inglés para astor"
+    expected:
+      - reminders://x-apple-reminder://501459A1-CC70-4E9B-B275-87C7AB99A327
+    note: "reminders source — pending literal match por subject"
+
+  - question: "comprar entradas para el en vivo de demos"
+    expected:
+      - reminders://x-apple-reminder://AB6A3BB2-AAE1-460A-B3D2-2FCE7E6A799F
+    note: "reminders — event-specific reminder"
+
+  - question: "trámite libre deuda de expensas para la mudanza"
+    expected:
+      - reminders://x-apple-reminder://4E4F3FAE-3951-4582-950A-B8B57BC00797
+    note: "reminders — multi-word match con folder-mudanza prefix"
+
+  - question: "recordatorio sobre el sistema RAG con claude"
+    expected:
+      - reminders://x-apple-reminder://BB6A5430-5269-435F-8256-C5AF86A173DD
+    note: "reminders — technical topic"
+
+  # Gmail — thread-level
+  - question: "resumen bancario BICA enero 2026"
+    expected:
+      - gmail://thread/19dafe6845b154d2
+    note: "gmail — subject-literal match"
+
+  - question: "completación del curso claude 101"
+    expected:
+      - gmail://thread/19d9c320046e0753
+    note: "gmail — paraphrase del subject inglés"
+
+  # Cross-source: mismo tema, distintas fuentes
+  - question: "fallas de CI en el repo obsidian-rag"
+    expected:
+      - gmail://thread/19db04ea6ec97f1f
+      - gmail://thread/19db03d8d3949f83
+      - gmail://thread/19db035184e265b8
+    note: "gmail — multi-doc sobre el mismo topic (synthesis implícito)"
 
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the

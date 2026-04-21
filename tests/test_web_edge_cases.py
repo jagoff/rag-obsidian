@@ -137,6 +137,188 @@ def test_persist_with_sqlite_retry_propagates_other_errors(monkeypatch):
     assert "no such table" in logged[0][1]
 
 
+def test_retry_pending_conversation_turns_sanitizes_legacy_infinity(
+    tmp_path, monkeypatch,
+):
+    """Regression 2026-04-21 (bug #7): pending records written
+    pre-`_sanitize_confidence` carry `-Infinity` (JSON allow_nan emits that
+    non-standard token) or `null`. `_retry_pending_conversation_turns`
+    used to do `float(rec.get('confidence', 0.0))` which happily re-hydrated
+    `-inf` and pushed it into the frontmatter as `confidence_avg: -inf`,
+    polluting the note with a value that broke the next turn's averaging.
+
+    Tras el fix, el retry pasa por `_sanitize_confidence` → 0.0 finito.
+    Este test seedea un pending file con tres shapes problemáticas y
+    verifica que:
+      1. Las tres se re-aplican sin raise.
+      2. Las notas resultantes tienen `confidence_avg` finito (no `-inf`,
+         no `nan`, no string garbage).
+      3. El pending file queda vacío / borrado porque todas fueron
+         consumidas.
+    """
+    from datetime import datetime, timezone
+
+    from web import server as server_mod
+    from web import conversation_writer as cw
+
+    vault_root = tmp_path / "vault"
+    (vault_root / "00-Inbox" / "conversations").mkdir(parents=True)
+    db_path = tmp_path / "ragvec.db"
+    monkeypatch.setattr(cw, "_DB_PATH", db_path)
+
+    pending_path = tmp_path / "conversation_turn_pending.jsonl"
+    monkeypatch.setattr(server_mod, "_CONV_PENDING_PATH", pending_path)
+
+    # Registros con las tres formas más comunes de "confidence corrupta"
+    # que vimos en pending.jsonl y en logs: -Infinity (json allow_nan),
+    # null (pre-fix caller pasaba None), y un string garbage.
+    base_ts = "2026-04-21T09:00:00+00:00"
+    # Note: los session_ids NO contienen "inf"/"nan" para que el check
+    # de contenido saneado no matchee el sid literal.
+    records = [
+        {
+            "ts": base_ts,
+            "vault_root": str(vault_root),
+            "session_id": "web:legacyA",
+            "question": "q1 con negative-infinity",
+            "answer": "a1",
+            "sources": [],
+            "confidence": float("-inf"),  # json.dumps → "-Infinity"
+            "error": "ValueError prior",
+        },
+        {
+            "ts": base_ts,
+            "vault_root": str(vault_root),
+            "session_id": "web:legacyB",
+            "question": "q2 con null",
+            "answer": "a2",
+            "sources": [],
+            "confidence": None,
+            "error": "ValueError prior",
+        },
+        {
+            "ts": base_ts,
+            "vault_root": str(vault_root),
+            "session_id": "web:legacyC",
+            "question": "q3 con string garbage",
+            "answer": "a3",
+            "sources": [],
+            "confidence": "not-a-number",
+            "error": "ValueError prior",
+        },
+    ]
+    import json as _json
+    pending_path.write_text(
+        "\n".join(_json.dumps(r) for r in records) + "\n",
+        encoding="utf-8",
+    )
+    # `_retry_pending_conversation_turns` importa write_turn y usa el
+    # `Path(rec["vault_root"])` directo; TurnData wraps con timestamp
+    # parseado. No necesitamos monkey-patchar más — el path real ejerce
+    # el código de producción.
+    n_retried = server_mod._retry_pending_conversation_turns()
+    assert n_retried == 3, f"expected 3 retries, got {n_retried}"
+
+    # Las tres notas quedan escritas en 00-Inbox/conversations/.
+    conv_folder = vault_root / "00-Inbox" / "conversations"
+    written = sorted(conv_folder.glob("*.md"))
+    assert len(written) == 3, f"expected 3 notes, got {[p.name for p in written]}"
+
+    # Ninguna carga `-inf` / `nan` en el frontmatter — el sanitizer clampea
+    # a 0.0 finito antes de `_write_frontmatter` (que usa `f"{c:.3f}"`).
+    # Chequeamos SOLO la línea del confidence_avg para no matchear el
+    # session_id por accidente.
+    for p in written:
+        text = p.read_text(encoding="utf-8")
+        avg_line = next(
+            ln for ln in text.splitlines() if ln.startswith("confidence_avg:")
+        )
+        assert "-inf" not in avg_line.lower(), f"{p.name}: {avg_line!r}"
+        assert "nan" not in avg_line.lower(), f"{p.name}: {avg_line!r}"
+        assert "confidence_avg: 0.000" in avg_line, (
+            f"{p.name} no saneado a 0.000: {avg_line!r}"
+        )
+
+    # Pending file queda vacío porque las 3 se consumieron.
+    assert not pending_path.is_file() or pending_path.read_text().strip() == ""
+
+
+def test_behavior_priors_lock_serialises_concurrent_loads(tmp_path, monkeypatch):
+    """Regression 2026-04-21 (bug #8): `_behavior_priors_lock` estaba
+    definido pero `_load_behavior_priors` NO lo adquiría. Dos callers
+    paralelos (home-prewarmer + /api/chat, o dos /api/chat streams)
+    podían intercalar un cache overwrite con el key-freshness check,
+    devolviendo un snapshot stale permanentemente.
+
+    Test approach: amplificar el race inyectando una pausa entre el
+    freshness check y el cache assign en el código real es costoso;
+    en vez de eso verificamos la invariante de seguridad fundamental:
+    20 threads paralelos llamando `_load_behavior_priors()` en un DB
+    poblado devuelven TODOS el mismo snapshot estructuralmente válido
+    (mismos keys, mismo `n_events`, mismo `hash` porque los 3 globales
+    se escriben bajo el RLock y ninguno los ve a medias).
+    """
+    import threading
+    import rag
+
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    # Reset cache globals so el test no lee un snapshot heredado.
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+
+    # Seedear el DB con 40 behavior events sintéticos. Necesitamos
+    # `rag_behavior` poblada para que `_sql_max_ts` devuelva non-None
+    # y el path de rebuild se ejecute.
+    with rag._ragvec_state_conn() as conn:
+        for i in range(40):
+            rag._sql_append_event(conn, "rag_behavior", {
+                "ts": f"2026-04-21T10:00:{i:02d}",
+                "source": "test",
+                "event": "open" if i % 3 else "impression",
+                "path": f"01-Projects/note_{i % 5}.md",
+                "dwell_s": 12.0 if i % 3 else None,
+            })
+
+    # 20 threads paralelos — todos leen del mismo cache y deben
+    # devolver snapshots idénticos post-fix.
+    results: list[dict] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(20)
+
+    def worker():
+        barrier.wait()
+        try:
+            snap = rag._load_behavior_priors()
+            results.append(snap)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert not errors, f"concurrent _load_behavior_priors raised: {errors}"
+    assert len(results) == 20
+
+    # Todos los snapshots son estructuralmente idénticos — el hash es
+    # determinístico sobre MAX(ts), así que si dos threads vieran un
+    # cache a medio escribir los hashes divergirían.
+    first = results[0]
+    for i, s in enumerate(results[1:], start=1):
+        assert s["hash"] == first["hash"], (
+            f"thread {i} snapshot hash {s['hash']!r} != first {first['hash']!r}"
+        )
+        assert s["n_events"] == first["n_events"]
+        assert set(s.keys()) == set(first.keys())
+
+    # Y el snapshot es NO-vacío (los 40 events se foldearon).
+    assert first["n_events"] > 0
+    assert first["hash"].startswith("sql:")
+    assert len(first["click_prior"]) > 0
+
+
 def test_save_vaults_config_is_atomic(tmp_path, monkeypatch):
     """_save_vaults_config must use tmp+replace so a crash mid-write
     never leaves an empty vaults.json (which would silently wipe the

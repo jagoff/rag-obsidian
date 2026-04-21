@@ -1222,9 +1222,16 @@ def last_session_id() -> str | None:
 
 
 def _set_last_session(sid: str) -> None:
+    # Atomic write: tmp + replace. Un crash entre el `write_text` y el
+    # próximo read deja `LAST_SESSION_FILE` vacío → `last_session_id()`
+    # devuelve None → `rag chat --continue` mint-ea una sesión nueva
+    # y pierde la continuity UX. Barato de mitigar con el mismo patrón
+    # que `save_session` / `_save_vaults_config`.
     try:
         LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        LAST_SESSION_FILE.write_text(sid, encoding="utf-8")
+        tmp = LAST_SESSION_FILE.with_suffix(LAST_SESSION_FILE.suffix + ".tmp")
+        tmp.write_text(sid, encoding="utf-8")
+        tmp.replace(LAST_SESSION_FILE)
     except Exception as exc:
         _silent_log("last_session_write", exc)
 

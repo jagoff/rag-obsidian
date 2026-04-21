@@ -3712,7 +3712,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     f"reform=0ms reform_outcome=skipped q_words={len(question.split())} "
                     f"wa=0ms llm_prefill=0ms llm_decode=0ms ttft={_cached_total_ms}ms "
                     f"total={_cached_total_ms}ms ctx_chars=0 tokens≈{len(_text.split())} "
-                    f"confidence={_cached['top_score']:.3f} variants=0 "
+                    # Defense-in-depth: el cached top_score pasa por
+                    # `round(float(...), 3)` en el PUT (línea ~4476). Post
+                    # fix del persist path queda finito, pero saneamos por
+                    # las dudas para que el log de cache-hit no cargue un
+                    # `-inf` si algún día alguien persiste crudo.
+                    f"confidence={_sanitize_confidence(_cached['top_score']):.3f} variants=0 "
                     f"tool_rounds=0 tool_ms=0 tool_names= cached=1",
                     flush=True,
                 )
@@ -3865,7 +3870,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     for m, s in zip(result["metas"], result["scores"])
                 ]
             ),
-            "confidence": round(float(result["confidence"]), 3),
+            "confidence": round(_sanitize_confidence(result["confidence"]), 3),
             "propose_intent": is_propose_intent,
         })
 
@@ -4403,7 +4408,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             f"wa={_t_wa_ms}ms llm_prefill={_t_llm_prefill_ms}ms "
             f"llm_decode={_t_llm_decode_ms}ms ttft={_t_ttft_ms}ms "
             f"total={_t_total_ms}ms ctx_chars={_ctx_chars} tokens≈{_tok_count} "
-            f"confidence={result['confidence']:.3f} "
+            # `retrieve()` devuelve float('-inf') con corpus vacío;
+            # imprimirlo crudo deja `confidence=-inf` en logs que grep
+            # + dashboards interpretan como "error sin sanitizar". Sanear
+            # al print para que el log sea shape-stable (float finito).
+            f"confidence={_sanitize_confidence(result['confidence']):.3f} "
             f"variants={len(result.get('query_variants',[]))} "
             f"tool_rounds={tool_rounds} tool_ms={tool_ms_total} tool_names={_tool_names_str} "
             f"topic_shift={_topic_shift_reason}{'!' if _topic_shifted else ''}",
@@ -4415,7 +4424,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "q": question,
             "a": full,
             "paths": [m.get("file", "") for m in result["metas"]],
-            "top_score": round(float(result["confidence"]), 3),
+            "top_score": round(_sanitize_confidence(result["confidence"]), 3),
             "turn_id": turn_id,
         })
         save_session(sess)
@@ -4426,7 +4435,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "q": question,
             "paths": [m.get("file", "") for m in result["metas"]],
             "scores": [round(float(s), 2) for s in result["scores"]],
-            "top_score": round(float(result["confidence"]), 2),
+            "top_score": round(_sanitize_confidence(result["confidence"]), 2),
             "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
             "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
             "topic_shifted": _topic_shifted,
@@ -4435,7 +4444,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 
         yield _sse("done", {
             "turn_id": turn_id,
-            "top_score": round(float(result["confidence"]), 3),
+            "top_score": round(_sanitize_confidence(result["confidence"]), 3),
             "total_ms": _t_total_ms,
             "retrieve_ms": _t_retrieve_ms,
             "ttft_ms": _t_ttft_ms,
@@ -4472,7 +4481,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 _chat_cache_put(_cache_key, {
                     "text": full,
                     "sources_items": _sources_items,
-                    "top_score": round(float(result["confidence"]), 3),
+                    "top_score": round(_sanitize_confidence(result["confidence"]), 3),
                 })
                 print(f"[chat-cache] PUT {_cache_key} len={len(full)}", flush=True)
             except Exception as _cache_err:

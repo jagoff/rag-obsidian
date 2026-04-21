@@ -568,6 +568,121 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
 # ── 8. Round cap respected + nudge appended ────────────────────────────────
 
 
+def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeypatch):
+    """Regression 2026-04-21 (batch B.4): cuando `retrieve()` devuelve
+    `float('-inf')` (corpus vacío / meta-chat path), el `[chat-timing]`
+    loggeaba `confidence=-inf` crudo. Grep / dashboards levantaban eso
+    como "error sin sanear". Tras el fix, `_sanitize_confidence` clampea
+    a 0.000 para que el log sea shape-stable.
+    """
+    # Stub multi_retrieve para devolver confidence=-inf (caso corpus vacío).
+    def _empty_retrieve(*a, **kw):
+        r = _canned_retrieve_result("x")
+        r["confidence"] = float("-inf")
+        r["scores"] = [float("-inf")] * len(r["metas"])
+        return r
+    monkeypatch.setattr(server_mod, "multi_retrieve", _empty_retrieve)
+
+    mock = _OllamaMock([
+        _mk_msg(content="", tool_calls=None),
+        _mk_stream(["resp"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _body = _post_chat("consulta con corpus vacío")
+    assert events[-1][0] == "done"
+
+    captured = capsys.readouterr()
+    line = _last_chat_timing(captured.out)
+    assert line is not None
+    # Pre-fix: `confidence=-inf`. Post-fix: `confidence=0.000`.
+    assert "confidence=-inf" not in line, f"regression, -inf en timing log: {line}"
+    assert "confidence=0.000" in line, f"falta sanitize: {line}"
+
+    # El SSE `done` event también debe reportar top_score finito.
+    done_event = next(data for ev, data in events if ev == "done")
+    top = done_event.get("top_score")
+    assert top is not None
+    import math
+    assert not math.isinf(float(top)), f"done.top_score inf: {top}"
+    assert not math.isnan(float(top)), f"done.top_score nan: {top}"
+
+
+def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, monkeypatch):
+    """Regression 2026-04-21 (bug #3): cuando la /api/chat llega con
+    `history` no vacío (skipping el bloque que computa `_cache_key`) y
+    luego el topic-shift gate (~línea 3914) reasigna `history = []`, el
+    PUT path entraba con `_cache_key` UnboundLocalError y loggeaba
+    `[chat-cache] put failed: cannot access local variable '_cache_key'`.
+
+    Este test reproduce el escenario exacto:
+      1. `session_history` devuelve turns previos → rama `if not history:`
+         que asigna `_cache_key` se SALTA.
+      2. `detect_topic_shift` devuelve `(True, "person!")` → `history = []`.
+      3. Stream completa normal; assert que NO aparece el UnboundLocalError
+         en stdout y que el cache PUT stub NO se llamó (porque
+         `_cache_key is None` bloquea el branch).
+    """
+    import rag
+    # Un historia non-empty fuerza el path donde `_cache_key` NO se setea.
+    monkeypatch.setattr(
+        server_mod, "session_history",
+        lambda s, window=6: [
+            {"role": "user", "content": "pregunta anterior"},
+            {"role": "assistant", "content": "respuesta anterior"},
+        ],
+    )
+    # Fuerza topic-shift so el gate reasigna `history = []` post-check.
+    monkeypatch.setattr(
+        rag, "detect_topic_shift",
+        lambda q, h, *, person_fired: (True, "person!"),
+    )
+
+    # Overrides el stub del fixture para capturar si se llama al PUT.
+    put_calls: list = []
+    monkeypatch.setattr(
+        server_mod, "_chat_cache_put",
+        lambda key, val: put_calls.append((key, val)),
+    )
+
+    # Flow típico sin tools: un decide-round vacío + streaming final.
+    mock = _OllamaMock([
+        _mk_msg(content="", tool_calls=None),
+        _mk_stream(["nueva ", "respuesta"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _body = _post_chat("cuándo es el cumple de mi mamá")
+
+    # 1. El stream tiene que completar OK.
+    names = [ev for ev, _ in events]
+    assert names[-1] == "done", f"stream no completó: {names}"
+
+    # 2. El UnboundLocalError pre-fix se printeaba a stdout por el
+    #    `print(f"[chat-cache] put failed: {...}", flush=True)`.
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "cannot access local variable '_cache_key'" not in combined, (
+        "regression: UnboundLocalError en cache-put path reapareció"
+    )
+    assert "[chat-cache] put failed" not in combined, (
+        f"cache-put falló por otra razón: {combined[-500:]}"
+    )
+
+    # 3. Con el guard `_cache_key is not None`, el PUT NO debe haberse
+    #    ejecutado (el turno arrancó con history → no había key computada).
+    assert put_calls == [], (
+        f"PUT no debería haberse llamado (topic-shift sin key), got: {put_calls!r}"
+    )
+
+    # 4. El timing line confirma que el path de topic-shift se ejecutó.
+    line = _last_chat_timing(captured.out)
+    assert line is not None
+    assert "topic_shift=person" in line, line
+
+
 def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
 

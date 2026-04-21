@@ -9,6 +9,36 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_silent_errors_log(tmp_path_factory):
+    """Evita que los tests que ejercen paths con `_silent_log` (session
+    JSON corrupto, ranker.json corrupto, synthetic_q_cache corrupto,
+    etc.) contaminen el `~/.local/share/obsidian-rag/silent_errors.jsonl`
+    real del usuario. Pre-fix, 100+ entries aparecían ahí después de
+    cada corrida de suite (session_load_json JSONDecodeError, etc.),
+    haciendo imposible distinguir errores reales de ruido de tests.
+
+    Redirige `SILENT_ERRORS_LOG_PATH` a un archivo en tmp por la
+    duración del test. El `_LOG_QUEUE` worker (daemon thread) sigue
+    drainando al path monkeypatched; el real user dir queda intacto.
+    """
+    import rag as _rag
+    tmp = tmp_path_factory.mktemp("silent_errors") / "silent_errors.jsonl"
+    original = _rag.SILENT_ERRORS_LOG_PATH
+    _rag.SILENT_ERRORS_LOG_PATH = tmp
+    try:
+        yield
+    finally:
+        # Drenar el queue ANTES de restaurar, para que los writes pendientes
+        # que encolan `(SILENT_ERRORS_LOG_PATH, line)` con el path viejo
+        # (ya bound en la tuple) aterricen en tmp y no en el real.
+        try:
+            _rag._LOG_QUEUE.join()
+        except Exception:
+            pass
+        _rag.SILENT_ERRORS_LOG_PATH = original
+
+
+@pytest.fixture(autouse=True)
 def _clear_query_caches():
     """Evita que los LRU de embed/expand_queries contaminen tests.
 

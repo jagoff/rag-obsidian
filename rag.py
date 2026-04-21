@@ -20243,19 +20243,72 @@ def _weather_comment(question: str, forecast: str) -> str:
 
 _CREATED_TS_BACKFILL_DONE = False
 
+# Pseudo-table-name usado en `rag_schema_version` para persistir la completitud
+# del backfill de created_ts a través de restarts. Valor sentinel — no hay
+# tabla real con ese nombre.
+_CREATED_TS_BACKFILL_MARKER = "_created_ts_backfill_complete"
+
+
+def _created_ts_backfill_persisted() -> bool:
+    """Check SQL-persisted flag (survives process restarts).
+
+    Uses `rag_schema_version` as a generic key/value store — registra una
+    fila `(table_name='_created_ts_backfill_complete', version=1)` cuando el
+    backfill termina exitosamente. Los daemons con 100+ restarts (launchd
+    KeepAlive) dejan de re-correr el scan de 3600 chunks + 580 file reads
+    en la primera query con `date_range` post-restart.
+
+    Best-effort: si la query SQL falla (DB lockeada, schema no inicializado),
+    retorna False → el backfill in-memory vuelve a correr una vez.
+    """
+    try:
+        col = get_db()
+        row = col._db.execute(
+            "SELECT version FROM rag_schema_version WHERE table_name = ?",
+            (_CREATED_TS_BACKFILL_MARKER,),
+        ).fetchone()
+        return row is not None and row[0] >= 1
+    except Exception:
+        return False
+
+
+def _mark_created_ts_backfill_persisted() -> None:
+    """Marca el backfill como completado en SQL. Llamar solo tras un
+    `col.update()` exitoso — si la escritura falla, el marker no se setea
+    y la próxima invocación reintenta."""
+    try:
+        col = get_db()
+        col._db.execute(
+            "INSERT INTO rag_schema_version(table_name, version) VALUES(?, 1) "
+            "ON CONFLICT(table_name) DO UPDATE SET version = 1",
+            (_CREATED_TS_BACKFILL_MARKER,),
+        )
+        col._db.commit()
+    except Exception as exc:
+        _silent_log("created_ts_backfill_mark", exc)
+
 
 def _maybe_backfill_created_ts() -> None:
     """Populate `created_ts` on chunks indexed before the temporal-retrieval
     feature landed. Metadata-only update (no re-embedding) — reads each file
     to get frontmatter `created:` or falls back to mtime, then `col.update()`
-    in batches. Idempotent within a process.
+    in batches. Idempotent within a process AND across restarts (via SQL marker).
 
-    Gated by this lazy hook so users don't pay the scan cost until they
-    actually use a date filter. A freshly-reset index will have created_ts
-    on every chunk from the start, so this pass is a no-op and finishes fast.
+    Gated por el lazy hook para que los usuarios no paguen el scan cost hasta
+    que realmente usen un date filter. Un índice fresh-reset tiene created_ts
+    en cada chunk desde el arranque, así que este pass es un no-op y termina
+    rápido. El SQL marker (`_created_ts_backfill_persisted()`) evita re-correr
+    el escaneo en cada restart del web daemon (launchd restarted 149x en
+    ~3 días — medido en web.log 2026-04-21, rastreable por el número de
+    `[idle-sweep] ... disabled` prints).
     """
     global _CREATED_TS_BACKFILL_DONE
     if _CREATED_TS_BACKFILL_DONE:
+        return
+    # SQL persistence check — survives restarts. Si ya corrió en un proceso
+    # anterior y escribió el marker, saltamos directo al fast-path.
+    if _created_ts_backfill_persisted():
+        _CREATED_TS_BACKFILL_DONE = True
         return
     _CREATED_TS_BACKFILL_DONE = True
     try:
@@ -20281,6 +20334,9 @@ def _maybe_backfill_created_ts() -> None:
             continue
         missing.setdefault(file_rel, []).append((id_, dict(m)))
     if not missing:
+        # Nothing to backfill — marker is safe to set so the next process
+        # skips this scan too.
+        _mark_created_ts_backfill_persisted()
         return
     console.print(
         f"[dim]Backfill created_ts en {len(missing)} nota(s) "
@@ -20307,6 +20363,8 @@ def _maybe_backfill_created_ts() -> None:
         B = 500
         for i in range(0, len(update_ids), B):
             col.update(ids=update_ids[i:i + B], metadatas=update_metas[i:i + B])
+        # Success — persist the marker so future processes skip the scan.
+        _mark_created_ts_backfill_persisted()
     except Exception as e:
         console.print(f"[yellow]Backfill created_ts falló: {e}[/yellow]")
 

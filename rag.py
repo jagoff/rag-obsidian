@@ -15739,7 +15739,8 @@ def watch(debounce: float, all_vaults: bool):
 @click.option("--since", "since", default=None,
               help="Filtrar por fecha de creación. Acepta '7d'/'2w'/'3m'/'1y' o ISO (YYYY-MM-DD).")
 @click.option("--hyde", is_flag=True, help="Activa HyDE (mejora con LLMs grandes; con modelos chicos tiende a empeorar)")
-@click.option("--no-multi", is_flag=True, help="Desactiva multi-query expansion")
+@click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −29% P95 singles sin pérdida de quality)")
+@click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
 @click.option("--raw", is_flag=True, help="Skip LLM — muestra chunks recuperados directo")
 @click.option("--loose", is_flag=True, help="Permite prosa externa del LLM (marcada con ⚠)")
@@ -15765,7 +15766,7 @@ def watch(debounce: float, all_vaults: bool):
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
-    hyde: bool, no_multi: bool, no_auto_filter: bool,
+    hyde: bool, multi: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
@@ -15833,9 +15834,16 @@ def query(
     # Reformulate + expand in ONE helper-model call when session history exists.
     # Saves ~0.5-1.5s by eliminating one Ollama round-trip. When no history,
     # expansion happens inside retrieve() as before.
+    # Post 2026-04-21: default multi=OFF (bench mostró −29% P95 singles,
+    # −85% P95 chains, sin pérdida de hit@5/MRR). `--multi` opt-in para
+    # volver al comportamiento previo; `--no-multi` legacy no-op para no
+    # romper scripts existentes.
     effective_question = question
     pre_variants: list[str] | None = None
-    if history and not no_multi:
+    # `no_multi` legacy flag: si está presente, domina sobre `multi` (explícito
+    # gana sobre default). `multi` flag activa paraphrase solo si usuario opt-in.
+    _multi_enabled = multi and not no_multi
+    if history and _multi_enabled:
         try:
             sess_summary = session_summary(sess) if sess else None
             effective_question, pre_variants = reformulate_and_expand(
@@ -15936,7 +15944,7 @@ def query(
     _retrieve_kwargs = dict(
         col=col, question=effective_question, k=k, folder=folder,
         history=history, tag=tag,
-        precise=hyde, multi_query=not no_multi, auto_filter=not no_auto_filter,
+        precise=hyde, multi_query=_multi_enabled, auto_filter=not no_auto_filter,
         date_range=date_range, variants=pre_variants,
         source=source_filter,
     )
@@ -16689,7 +16697,8 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 @click.option("--since", "since", default=None,
               help="Filtrar por fecha de creación. '7d'/'2w'/'3m'/'1y' o ISO. También se auto-detecta en preguntas tipo 'la última semana'.")
 @click.option("--precise", is_flag=True, help="HyDE + reformulación (más preciso, ~5s extra)")
-@click.option("--no-multi", is_flag=True, help="Desactiva multi-query expansion")
+@click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −85% P95 chains sin pérdida de quality)")
+@click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
 @click.option("--session", "session_id", default=None,
               help="ID de sesión (reanuda si existe, crea si no). Admite 'tg:<chat_id>' etc.")
@@ -16707,7 +16716,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 def chat(
     k: int, folder: str | None, tag: str | None,
     since: str | None, precise: bool,
-    no_multi: bool, no_auto_filter: bool,
+    multi: bool, no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
     deep_mode: bool,
     vault_scope: str | None,
@@ -16785,10 +16794,11 @@ def chat(
         flags.append(f"tag: #{tag}")
     if pinned_date_range:
         flags.append(f"desde: {datetime.fromtimestamp(pinned_date_range[0]).strftime('%Y-%m-%d')}")
+    _multi_enabled = multi and not no_multi
     features = []
     if precise:
         features.append("HyDE")
-    if not no_multi:
+    if _multi_enabled:
         features.append("multi-query")
     if not no_auto_filter:
         features.append("auto-filter")
@@ -17122,7 +17132,7 @@ def chat(
             # únicos post-RRF en mayoría de queries → 15 cubre todo.
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
-                multi_query=not no_multi, auto_filter=not no_auto_filter,
+                multi_query=_multi_enabled, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
             )
             # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
@@ -17134,7 +17144,7 @@ def chat(
                     and 0.0 < result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
                 result = multi_retrieve(
                     vaults_resolved, question, k, folder, history, tag, precise,
-                    multi_query=not no_multi, auto_filter=not no_auto_filter,
+                    multi_query=_multi_enabled, auto_filter=not no_auto_filter,
                     date_range=pinned_date_range, summary=sess_summary,
                     deep=True,
                 )

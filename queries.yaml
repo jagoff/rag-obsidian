@@ -256,6 +256,51 @@ queries:
     expected:
       - 03-Resources/Coaching/Coaching - Grabacion y herramientas.md
 
+  # Comparison intent — fires _INTENT_COMPARISON_RE → SYSTEM_RULES_COMPARISON.
+  # Expect BOTH contrasted notes in top-k (OR-any hit still counts, but the
+  # prompt forces "X dice A / Y dice B / Diferencia clave" structure — if
+  # retrieval only brings one side, synthesis loses grounding).
+  - question: "diferencia entre los comandos CLI y los interactivos de claude code"
+    expected:
+      - 03-Resources/Claude/Claude Code - Comandos CLI.md
+      - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
+    note: "comparison intent: ambos sides de la contrastación deben estar"
+
+  - question: "comparame el curso de liderazgo estratégico con el otro curso de liderazgo"
+    expected:
+      - 02-Areas/Coaching/Coaching - Curso de liderazgo estratégico.md
+      - 03-Resources/Coaching/Coaching - Curso de liderazgo.md
+    note: "comparison intent: dos cursos distintos sobre el mismo tópico"
+
+  - question: "arquitectura vs pipelines del rag"
+    expected:
+      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
+      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
+    note: "comparison intent: 'vs' bare — caso canónico de _INTENT_COMPARISON_RE"
+
+  # Synthesis intent — fires _INTENT_SYNTHESIS_RE → SYSTEM_RULES_SYNTHESIS.
+  # Cross-reference aggregation: expect ≥2 notes del mismo dominio en top-k.
+  - question: "sintetizame todo lo que hay sobre obsidian-rag en mi vault"
+    expected:
+      - 01-Projects/RAG-Local/Obsidian RAG Local.md
+      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
+      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
+    note: "synthesis intent: aggregate sobre RAG — top-k debe traer varias"
+
+  - question: "resumime todo lo que tengo sobre coaching"
+    expected:
+      - 03-Resources/Coaching/Coaching - Referentes.md
+      - 02-Areas/Coaching/Fer coach - Bio.md
+      - 03-Resources/Coaching/Comunicacion no violenta.md
+    note: "synthesis intent: cross-ref aggregation sobre coaching"
+
+  - question: "todo lo que hay sobre claude peers"
+    expected:
+      - 03-Resources/Claude/Claude-peers.md
+      - 03-Resources/Claude/Claude Peers - Worker Prompt.md
+      - 03-Resources/Claude/Claude Peers - Team Lead Prompt.md
+    note: "synthesis intent: multi-doc sobre un mismo concepto"
+
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per

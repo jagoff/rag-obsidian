@@ -179,8 +179,8 @@ All ollama calls use `keep_alive=OLLAMA_KEEP_ALIVE` — default `"20m"` in code 
 - `SYSTEM_RULES_STRICT` (default `rag query`, `semantic` intent): forbids external prose.
 - `SYSTEM_RULES` (`--loose`, always in chat): allows `<<ext>>...<</ext>>` rendered dim yellow + ⚠.
 - `SYSTEM_RULES_LOOKUP` (intent `count`/`list`/`recent`): terse 1-2 sentences, exact "No encontré esto en el vault." refusal.
-- `SYSTEM_RULES_SYNTHESIS` (intent `synthesis`, extension point — not yet emitted by `classify_intent`): cross-reference ≥2 overlapping sources, must surface tension.
-- `SYSTEM_RULES_COMPARISON` (intent `comparison`, extension point): explicit `X dice A / Y dice B / Diferencia clave: …` structure.
+- `SYSTEM_RULES_SYNTHESIS` (intent `synthesis`): cross-reference ≥2 overlapping sources, must surface tension. Fires via `_INTENT_SYNTHESIS_RE` — triggers on `resumí/resumime/síntesis/sintetizame/integrame todo lo que hay sobre X`, `qué dice el vault sobre X`, `summary of|synthesis of|synthesize X`. Plain `qué es X` stays `semantic`.
+- `SYSTEM_RULES_COMPARISON` (intent `comparison`): explicit `X dice A / Y dice B / Diferencia clave: …` structure. Fires via `_INTENT_COMPARISON_RE` — triggers on `diferencia(s)? entre X y Y`, `comparame X con Y`, `X vs/versus Y`, `en qué se diferencian X y Y`, `qué distingue X de Y`, `contraste entre X y Y`. Checked BEFORE synthesis (precedence) because `X vs Y` is inherently comparative. 49 tests in [`tests/test_classify_intent.py`](tests/test_classify_intent.py); golden queries in [`queries.yaml`](queries.yaml) at the "Comparison intent" + "Synthesis intent" sections.
 - Routed through `system_prompt_for_intent(intent, loose)` at generation time (both `query()` and `chat()` paths). `--loose` always maps to `SYSTEM_RULES` for every intent.
 
 ### Response-quality post-pipeline

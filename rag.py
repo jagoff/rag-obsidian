@@ -7064,6 +7064,58 @@ def query_embed_local(texts: list[str]) -> list[list[float]] | None:
         return None
 
 
+def _warmup_local_embedder() -> bool:
+    """Preload the in-process bge-m3 SentenceTransformer + one dummy encode.
+
+    Cold-loading ``SentenceTransformer('BAAI/bge-m3')`` on MPS takes ~3 s for
+    the weights plus ~200 ms for MPS JIT on the first encode — ~5 s all-in
+    when you also count the ``sentence_transformers`` import on a fresh
+    interpreter. That cost currently lands on the FIRST call to
+    ``query_embed_local()``, which is the critical path for every channel
+    running with ``RAG_LOCAL_EMBED=1``:
+
+      - Web chat already had this warmup in ``web/server.py:_do_warmup``.
+      - ``rag serve`` (WhatsApp backend) pins ``RAG_LOCAL_EMBED=1`` via
+        launchd but only warmed ollama-embed + reranker → the first WA turn
+        after a daemon restart was paying ~4 s of cold load (confirmed in
+        ``rag_queries.extra_json``: embed_ms 3455/4137/4898 on the first
+        few serve turns, dropping to 262/402 once the model was resident).
+      - ``rag query`` / ``rag chat`` / ``rag do`` auto-enable the flag via
+        ``_maybe_auto_enable_local_embed`` but ``warmup_async`` skipped the
+        local embedder → every one-shot CLI invocation paid the 5 s tax on
+        the main thread instead of in the background warmup window.
+
+    This helper centralises the warmup so both ``warmup_async`` and
+    ``serve`` run the same code. Intentionally best-effort: if the HF cache
+    is missing or MPS is out of memory, callers keep working — the retrieve
+    path will fall back to ollama embed via ``query_embed_local()``
+    returning None.
+
+    Returns True iff the model was loaded AND the dummy encode succeeded,
+    False otherwise (flag disabled, loader returned None, or any exception
+    during load / encode).
+    """
+    if not _local_embed_enabled():
+        return False
+    try:
+        model = _get_local_embedder()
+    except Exception as exc:
+        _silent_log("warmup_local_embedder.load", exc)
+        return False
+    if model is None:
+        return False
+    try:
+        model.encode(
+            ["warmup"],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return True
+    except Exception as exc:
+        _silent_log("warmup_local_embedder.encode", exc)
+        return False
+
+
 def hyde_embed(question: str) -> list[float]:
     """Generate a short hypothetical note sentence and embed it (1 sentence = fast)."""
     prompt = (
@@ -7811,6 +7863,12 @@ def warmup_async() -> None:
             embed(["warmup"])
         except Exception:
             pass
+        # In-process bge-m3 SentenceTransformer (~5s cold load on MPS). The
+        # helper self-gates on `_local_embed_enabled()` so bulk paths that
+        # never enable the flag pay nothing; callers like `rag query`/`chat`
+        # get the expensive load off the critical path of the first retrieve.
+        # Safe to run unconditionally — see `_warmup_local_embedder` docstring.
+        _warmup_local_embedder()
         # Corpus BM25 + vocabulario: ~130ms, se evita en primer retrieve().
         # Tras cargar el corpus, también precomputamos adj + PageRank: ambos
         # se tocan en el primer retrieve (scoring + graph expansion) y
@@ -27619,6 +27677,14 @@ def serve(host: str, port: int):
     get_reranker()
     console.print("[dim]Warming up embedder…[/dim]")
     embed(["warmup"])
+    # In-process bge-m3 SentenceTransformer — launchd sets RAG_LOCAL_EMBED=1
+    # on the serve plist so query embeds go through the MPS fast path. Without
+    # this warmup the FIRST WhatsApp turn after a daemon restart paid ~4s of
+    # cold load on the critical path (confirmed 2026-04-21 in
+    # rag_queries.extra_json: embed_ms 3455/4137/4898 on the first few turns,
+    # dropping to 262/402 once resident). Self-gates on _local_embed_enabled().
+    if _warmup_local_embedder():
+        console.print("[dim]Warming up local bge-m3 embedder…[/dim]")
     console.print("[dim]Loading BM25 corpus…[/dim]")
     _load_corpus(col)
     chat_model = resolve_chat_model()

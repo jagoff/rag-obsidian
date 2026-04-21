@@ -690,7 +690,8 @@ def log_behavior_event(event: dict) -> None:
       ts         — ISO8601 second-precision; injected if absent
       source     — "cli" | "whatsapp" | "web" | "brief"
       event      — "open" | "open_external" | "positive_implicit" |
-                   "negative_implicit" | "kept" | "deleted" | "save" | "explore"
+                   "negative_implicit" | "kept" | "deleted" | "save" |
+                   "explore" | "impression"
       query      — triggering query text, if any
       path       — vault-relative note path
       rank       — 1-indexed rank among results when event occurred
@@ -713,6 +714,76 @@ def log_behavior_event(event: dict) -> None:
             _sql_append_event(conn, "rag_behavior", _map_behavior_row(event))
     except Exception as exc:
         _log_sql_state_error("behavior_sql_write_failed", err=repr(exc))
+
+
+# Throttle: retrieve() can fire hundreds of times per second in tests/eval,
+# and writing N impressions per call to rag_behavior is a lot of I/O that
+# doesn't add signal (noise ~= sqrt(n_impressions) after a point). Cap at
+# one impression batch per (query, top1_path) every 30s — a user running
+# the same query twice counts twice because the timestamp changes, but a
+# pytest loop that hammers retrieve() doesn't flood the table.
+_IMPRESSION_THROTTLE_SECS = 30
+_impression_last_seen: dict[tuple[str, str], float] = {}
+_impression_lock = threading.Lock()
+
+
+def log_impressions(
+    query: str,
+    paths: list[str],
+    *,
+    source: str = "cli",
+    session: str | None = None,
+    cap: int = 10,
+) -> None:
+    """Batch-log the final top-k paths of a `retrieve()` call as impression events.
+
+    Each row counts as denominator-only in CTR arithmetic (`_laplace_ctr`):
+    +1 impression, 0 click. When a user later opens/saves/keeps one of these
+    paths, the positive event adds +1 impression AND +1 click — Laplace
+    smoothing keeps the math stable even when a path appears in an impression
+    batch first. The throttle prevents eval loops / tests from inflating the
+    rag_behavior table; operator-visible traffic is never throttled because
+    successive user queries differ in text or timing.
+
+    `cap` bounds how many paths we log per call — Laplace gives diminishing
+    returns past the top-5 impressions and the rag_behavior row count is the
+    scarce resource (nightly tune reads every event since the cache key).
+    """
+    if not query or not paths:
+        return
+    top1 = paths[0]
+    key = (query, top1)
+    now = time.time()
+    with _impression_lock:
+        last = _impression_last_seen.get(key, 0.0)
+        if now - last < _IMPRESSION_THROTTLE_SECS:
+            return
+        _impression_last_seen[key] = now
+        # Garbage-collect stale entries so the dict doesn't grow unbounded.
+        if len(_impression_last_seen) > 10_000:
+            cutoff = now - _IMPRESSION_THROTTLE_SECS
+            _impression_last_seen.clear()
+            _impression_last_seen[key] = now
+            _ = cutoff  # kept for future per-entry pruning
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    try:
+        with _ragvec_state_conn() as conn:
+            for rank, p in enumerate(paths[:cap], start=1):
+                if not p:
+                    continue
+                row = {
+                    "ts": ts,
+                    "source": source,
+                    "event": "impression",
+                    "query": query,
+                    "path": p,
+                    "rank": rank,
+                    "session": session,
+                }
+                _sql_append_event(conn, "rag_behavior", _map_behavior_row(row))
+    except Exception as exc:
+        _log_sql_state_error("impression_sql_write_failed", err=repr(exc))
 
 
 def record_brief_written(
@@ -1357,6 +1428,14 @@ def is_excluded(rel_path: str) -> bool:
         return True
     if rel_path.startswith("00-Inbox/conversations/"):
         return True
+    # Consolidated episodic-memory originals (Phase 2). The consolidator
+    # moves files from 00-Inbox/conversations/ to 04-Archive/conversations/
+    # YYYY-MM/ after promoting a cluster to PARA. Without this exclusion
+    # the archived raw conversations leak back into retrieval and compete
+    # with the curated consolidated note — same feedback loop we avoided
+    # at the inbox stage.
+    if rel_path.startswith("04-Archive/conversations/"):
+        return True
     return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
@@ -1803,16 +1882,20 @@ RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
 # Positive events: open, positive_implicit, save, kept
 # Negative events: negative_implicit, deleted
 #
-# Approximation note: we don't have full impression logs (we'd need to log
-# every retrieve() call with all returned paths). As a proxy, each behavior
-# event counts as both an impression (denominator) and optionally a click
-# (numerator=1 for positive events, numerator=0 for negative). This means
-# CTR is computed over interactions only, biased toward active paths. When
-# query logs get richer we can improve — for now Laplace smoothing
-# (clicks+1)/(impressions+10) keeps sparse paths from dominating.
+# Approximation note: historically we only counted interaction events
+# (positive + negative) as both click and impression (numerator+denominator).
+# That biased CTR toward already-active paths. As of 2026-04-20, `retrieve()`
+# also emits explicit `impression` events (one per returned path, capped at
+# `top_k`) which count as denominator-only (+1 impression, 0 click). CTR is
+# now measured over real impressions, with Laplace smoothing
+# (clicks+1)/(impressions+10) keeping sparse-interaction paths stable.
 
 _BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept"})
 _BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
+# Denominator-only events: `retrieve()` logs one `impression` row per final
+# result (capped at top_k) so CTR = clicks / real-impressions. Folded into
+# priors arithmetic via _BEHAVIOR_IMPRESSION_ONLY (0 click, +1 impression).
+_BEHAVIOR_IMPRESSION_ONLY = frozenset({"impression"})
 
 _behavior_priors_cache: dict | None = None
 _behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) — JSONL path
@@ -1853,7 +1936,9 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     for ev in rows_iter:
         event_type = _get(ev, "event") or ""
         path = _get(ev, "path") or ""
-        if not path or event_type not in (_BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE):
+        if not path or event_type not in (
+            _BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE | _BEHAVIOR_IMPRESSION_ONLY
+        ):
             continue
 
         n_events += 1
@@ -10735,6 +10820,16 @@ def retrieve(
             file=_sys.stderr,
             flush=True,
         )
+
+    # Impression logging: record what we surfaced so CTR = clicks / real
+    # impressions (previously clicks / interactions only, which inflated
+    # active paths). Throttled + silent per `log_impressions()` contract.
+    try:
+        final_paths = [m.get("file") for m in metas if m.get("file")]
+        if final_paths:
+            log_impressions(question, final_paths, source="cli")
+    except Exception as exc:
+        _silent_log("retrieve.log_impressions", exc)
 
     return {
         "docs": docs,
@@ -23853,6 +23948,72 @@ def find_dead_notes(
     return candidates
 
 
+# ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
+# Promotes recurring conversation clusters from 00-Inbox/conversations/
+# into PARA and archives the originals. All heavy lifting lives in
+# scripts/consolidate_conversations.py — this is just the CLI shim so the
+# command shows up in `rag --help` + the weekly launchd service can invoke
+# it as `rag consolidate`. See plans/episodic-memory.md for rationale.
+
+
+@cli.command()
+@click.option("--window-days", default=14, show_default=True,
+              help="Conversaciones a considerar (por mtime)")
+@click.option("--threshold", default=0.75, show_default=True,
+              help="Cosine mínimo para agrupar (0.0–1.0)")
+@click.option("--min-cluster", default=3, show_default=True,
+              help="Tamaño mínimo de cluster para promover")
+@click.option("--dry-run", is_flag=True,
+              help="Mostrar qué se haría, sin tocar el vault")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emitir summary como JSON (para servicios / scripts)")
+def consolidate(window_days: int, threshold: float, min_cluster: int,
+                dry_run: bool, as_json: bool):
+    """Agrupar conversaciones relacionadas y promover a PARA (Phase 2).
+
+    Barre `00-Inbox/conversations/` buscando clusters semánticamente similares
+    (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
+    de --window-days. Cada cluster se sintetiza en una sola nota consolidada
+    (qwen2.5:7b default) y se promueve a `01-Projects/` o `03-Resources/`
+    según un clasificador de intención (verbos de acción + fechas → project,
+    resto → resource). Los originales se archivan en
+    `04-Archive/conversations/YYYY-MM/` (excluido del índice).
+
+    Corre semanalmente via launchd (Lunes 06:00) — instalable con `rag setup`.
+    """
+    from scripts.consolidate_conversations import run as _run
+    summary = _run(
+        window_days=window_days,
+        threshold=threshold,
+        min_cluster=min_cluster,
+        dry_run=dry_run,
+    )
+    if as_json:
+        click.echo(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+    prefix = "[dry-run] " if dry_run else ""
+    console.print(
+        f"{prefix}{summary['n_conversations']} conversaciones en ventana · "
+        f"{summary['n_clusters']} clusters · "
+        f"[green]{summary['n_promoted']}[/green] promovidos · "
+        f"{summary['n_archived']} archivados · "
+        f"[dim]{summary['duration_s']}s[/dim]"
+    )
+    for c in summary["clusters"]:
+        size = c.get("size", 0)
+        target = c.get("target", "?")
+        title = c.get("title", "(sin título)")
+        if "error" in c:
+            console.print(
+                f"  [red]✗[/red] [{size}] {target}: {title} — "
+                f"[dim]{c['error']}[/dim]"
+            )
+        elif dry_run:
+            console.print(f"  [yellow]→[/yellow] [{size}] {target}: {title}")
+        else:
+            console.print(f"  [green]✓[/green] [{size}] {target}: {title}")
+
+
 @cli.command()
 @click.option("--min-age-days", default=365, show_default=True,
               help="Edad mínima por mtime")
@@ -25122,6 +25283,44 @@ def _archive_plist(rag_bin: str) -> str:
 """
 
 
+def _consolidate_plist(rag_bin: str) -> str:
+    """Weekly episodic-memory consolidation — Mondays 06:00 local. Promotes
+    recurring conversation clusters from 00-Inbox/conversations/ to PARA
+    and archives the originals (see plans/episodic-memory.md Phase 2)."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-consolidate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>consolidate</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>6</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/consolidate.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/consolidate.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _online_tune_plist(rag_bin: str) -> str:
     """Nightly online-tune — every day at 03:30, after Ollama is idle."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -25181,6 +25380,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _wa_tasks_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
          _online_tune_plist(rag_bin)),
+        ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",
+         _consolidate_plist(rag_bin)),
     ]
 
 
@@ -25230,7 +25431,7 @@ def setup(remove: bool):
     if not remove:
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks,online-tune}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks,online-tune,consolidate}}.{{log,error.log}}[/dim]"
         )
 
 

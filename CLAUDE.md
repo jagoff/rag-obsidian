@@ -74,7 +74,7 @@ rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `ope
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
 
 # Automation
-rag setup [--remove]                       # install/remove 9 launchd services
+rag setup [--remove]                       # install/remove 10 launchd services
 
 # Tests
 .venv/bin/python -m pytest tests/ -q

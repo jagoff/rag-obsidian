@@ -118,4 +118,4 @@ def test_services_spec_includes_online_tune():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    assert len(specs) == 9
+    assert len(specs) == 10

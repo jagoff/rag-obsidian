@@ -22124,6 +22124,96 @@ def propose_reminder(
     }, ensure_ascii=False)
 
 
+def _normalize_title_for_dedup(s: str) -> str:
+    """Lowercase + strip accents + collapse whitespace + drop leading
+    "cumpleaños de " / "cumple de " to compare event titles semantically.
+    "Cumpleaños de Astor" and "cumple Astor" should dedup against each
+    other; the raw string match would miss it.
+    """
+    s = unicodedata.normalize("NFD", (s or "")).encode("ascii", "ignore").decode("ascii")
+    s = s.lower().strip()
+    s = re.sub(r"^(?:cumplea?n?os?|cumple|aniversario)\s+(?:de\s+)?", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _find_duplicate_calendar_event(
+    title: str,
+    start_dt: datetime,
+    all_day: bool,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """Return the existing calendar event that matches `title` + `start_dt`
+    closely enough to be considered a duplicate, or None if no dup.
+
+    Match rules:
+      - All-day: same calendar date, normalized-title overlap (substring
+        either way after stripping accents + "cumpleaños de" prefixes).
+      - Timed: start within ±30min of `start_dt`, same title match.
+
+    Only runs when target is within 400 days of `now` to keep icalBuddy
+    query bounded. Events further out (typically yearly cumples the user
+    IS re-declaring) bypass the check — creating the second event is
+    the right move there.
+
+    Silent-fail: any icalBuddy error → None (let the create proceed).
+    """
+    anchor = now or datetime.now()
+    delta_days = (start_dt.date() - anchor.date()).days
+    if delta_days < 0 or delta_days > 400:
+        return None
+    horizon = max(1, delta_days + 2)
+    try:
+        events = _fetch_calendar_ahead(days_ahead=horizon, max_events=400)
+    except Exception:
+        return None
+    if not events:
+        return None
+
+    target_title = _normalize_title_for_dedup(title)
+    if not target_title:
+        return None
+    target_date_iso = start_dt.date().isoformat()
+
+    for ev in events:
+        ev_title = _normalize_title_for_dedup(ev.get("summary") or "")
+        if not ev_title:
+            continue
+        # Title overlap: either direction contains the other (handles
+        # "cumpleaños de Astor" vs "Astor cumple" both mapping to "astor").
+        title_matches = (
+            target_title == ev_title
+            or target_title in ev_title
+            or ev_title in target_title
+        )
+        if not title_matches:
+            continue
+        ev_start_raw = ev.get("start_iso") or ev.get("start") or ""
+        try:
+            ev_start = datetime.fromisoformat(ev_start_raw.replace("Z", "+00:00"))
+            if ev_start.tzinfo is not None:
+                ev_start = ev_start.replace(tzinfo=None)
+        except ValueError:
+            continue
+        if all_day:
+            if ev_start.date().isoformat() == target_date_iso:
+                return {
+                    "summary": ev.get("summary"),
+                    "start_iso": ev_start.isoformat(),
+                    "calendar": ev.get("calendar"),
+                }
+        else:
+            # Timed: accept ±30 min window.
+            if abs((ev_start - start_dt).total_seconds()) <= 30 * 60:
+                return {
+                    "summary": ev.get("summary"),
+                    "start_iso": ev_start.isoformat(),
+                    "calendar": ev.get("calendar"),
+                }
+    return None
+
+
 def propose_calendar_event(
     title: str,
     start: str,
@@ -22201,6 +22291,30 @@ def propose_calendar_event(
             "needs_clarification": True,
             "fields": fields,
         }, ensure_ascii=False)
+
+    # Dedup against existing Calendar events. If the same-ish event is
+    # already on the calendar in the same day (all_day) or overlapping
+    # ±30min window (timed), skip creation and surface the existing one
+    # so the UI can show "ya lo tenés" instead of silently doubling.
+    # Cheap: one icalBuddy call, ~100-300ms. Only fires when the target
+    # date is within 400 days (covers almost every real use case;
+    # further dates typically mean yearly cumples where the user IS
+    # re-declaring on purpose).
+    if start_dt:
+        try:
+            _dup_hit = _find_duplicate_calendar_event(
+                title, start_dt, bool(all_day), now=now,
+            )
+        except Exception:
+            _dup_hit = None
+        if _dup_hit:
+            return json.dumps({
+                "kind": "event",
+                "created": False,
+                "duplicate": True,
+                "existing": _dup_hit,
+                "fields": fields,
+            }, ensure_ascii=False)
 
     ok, res = _create_calendar_event(
         title, start_dt, end_dt,

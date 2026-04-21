@@ -30,7 +30,13 @@ dependencies = [
     # and the indexer silent-skips OCR. Enables queries like "en qué cycle
     # estamos" to hit notes whose informative content sits in a screenshot
     # rather than the markdown body. Toggle OFF with `RAG_OCR=0`.
-    "ocrmac>=1.0",
+    #
+    # The `sys_platform == 'darwin'` PEP 508 marker prevents uv from trying
+    # to install pyobjc-framework-coreml on Linux CI runners, where it
+    # fails at build time with `FileNotFoundError: /usr/bin/sw_vers`.
+    # Runtime code guards with `try: import ocrmac` so the absence is
+    # silent on non-macOS.
+    "ocrmac>=1.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

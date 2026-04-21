@@ -735,19 +735,79 @@ function appendFeedback(parent, ctx) {
   return wrap;
 }
 
+// External enrichment — Spotify + YouTube, fetched when the vault answer
+// is weak (low confidence, empty retrieval). One block, only renders if
+// the backend returned at least one item.
+async function appendRelated(parent, query) {
+  if (!query) return;
+  let items = [];
+  try {
+    const res = await fetch("/api/related", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    items = Array.isArray(data.items) ? data.items : [];
+  } catch { return; }
+  if (!items.length) return;
+  const wrap = el("div", "related");
+  wrap.appendChild(el("div", "related-head", "📎 contexto relacionado"));
+  for (const it of items) {
+    const row = document.createElement("a");
+    row.className = `related-item related-${it.source}`;
+    row.href = it.url;
+    row.target = "_blank";
+    row.rel = "noopener noreferrer";
+    const badge = el("span", "related-badge", it.source);
+    const title = el("span", "related-title", it.title);
+    const sub = el("span", "related-sub", it.subtitle || "");
+    row.appendChild(badge);
+    row.appendChild(title);
+    if (it.subtitle) row.appendChild(sub);
+    wrap.appendChild(row);
+  }
+  parent.appendChild(wrap);
+}
+
 // Web-search escape hatch — surfaces when the vault has weak/no answer
 // (sin sources, o confianza baja). One click → Google búsqueda en pestaña
 // nueva. El usuario decide si vale la pena salir del vault.
-function appendWebSearch(parent, query) {
-  const wrap = el("div", "web-search");
+function appendWebSearch(parent, query, inline = false) {
   const link = document.createElement("a");
-  link.className = "web-search-link";
+  link.className = "web-search-link" + (inline ? " inline" : "");
   link.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
   link.target = "_blank";
   link.rel = "noopener noreferrer";
-  link.textContent = "↗  buscar en internet";
+  link.textContent = "↗ buscar en internet";
   link.title = `Google: ${query}`;
-  wrap.appendChild(link);
+  if (inline) {
+    parent.appendChild(document.createTextNode(" "));
+    parent.appendChild(link);
+  } else {
+    const wrap = el("div", "web-search");
+    wrap.appendChild(link);
+    parent.appendChild(wrap);
+  }
+}
+
+// Cross-source enrichment footer: WhatsApp/Calendar/Reminders signals
+// surfaced after the answer streams. Each line: icon + text + optional
+// snippet (italic) + relative time (right-aligned).
+function appendEnrich(parent, lines) {
+  const wrap = el("div", "enrich-block");
+  wrap.appendChild(el("div", "enrich-head", "📎 contexto relacionado"));
+  for (const ln of lines) {
+    const row = el("div", "enrich-line");
+    row.appendChild(el("span", "enrich-icon", ln.icon || "·"));
+    const textCol = el("span", "enrich-text-col");
+    textCol.appendChild(el("span", "enrich-text", ln.text || ""));
+    if (ln.snippet) textCol.appendChild(el("span", "enrich-snippet", ` — ${ln.snippet}`));
+    row.appendChild(textCol);
+    if (ln.relative) row.appendChild(el("span", "enrich-time", ln.relative));
+    wrap.appendChild(row);
+  }
   parent.appendChild(wrap);
 }
 
@@ -1248,6 +1308,11 @@ marked.use({
   breaks: true,
   gfm: true,
   renderer: {
+    // GFM strikethrough (~text~) destruye paths como `iCloud~md~obsidian`.
+    // Reconstruimos los tildes literales en lugar de emitir <del>.
+    del({ tokens }) {
+      return "~" + this.parser.parseInline(tokens) + "~";
+    },
     link({ href, title, tokens }) {
       const text = this.parser.parseInline(tokens);
       const isNote = href && href.endsWith(".md") && !href.startsWith("http");
@@ -1330,7 +1395,14 @@ function _sanitizeHtml(html) {
   return root.innerHTML;
 }
 
+// Path-link placeholders: detected paths are replaced with PATH_<n>
+// sentinels before marked.parse so neither GFM tokenizers nor markdown
+// link parsing (which can't handle spaces in href) interfere. Postprocess
+// swaps the sentinels for real <a> tags.
+let _pathLinkBuffer = [];
+
 function preprocess(text) {
+  _pathLinkBuffer = [];
   // Accept malformed closings (LLM frequently drops one `<` or `>`):
   //   <<ext>>…<</ext>>   canonical
   //   <<ext>>…</ext>>    one `<` dropped  ← caso real observado
@@ -1344,13 +1416,69 @@ function preprocess(text) {
   out = out.replace(/\[\[([^\]]+)\]\]/g, (_, name) => {
     return `[${name}](${name}.md)`;
   });
+  // Auto-linkify bare paths. Order matters: longest/most-specific patterns
+  // first, and paths inside existing markdown links (`](...)`) are skipped
+  // by negative lookbehind. Each match is stashed; the visible string is
+  // replaced with a non-markdown sentinel so marked won't re-tokenize it.
+  const toFileHref = (p) => {
+    const abs = p.startsWith("~") ? p.replace(/^~/, "/Users/fer") : p;
+    return "file://" + abs.split("/").map(encodeURIComponent).join("/");
+  };
+  const stash = (label, href) => {
+    const idx = _pathLinkBuffer.length;
+    _pathLinkBuffer.push({ label, href });
+    return `\u0000PATH${idx}\u0000`;
+  };
+  // 1. Vault root (with optional subpath). Subpath segments use a
+  //    controlled alphabet (letters, digits, dash, space, dot) so the
+  //    match doesn't bleed into surrounding prose. Notes with spaces
+  //    in names (e.g. "Info - Foo.md") still match within a segment.
+  out = out.replace(
+    /(?<!\]\()(?<![\w/[])~\/Library\/Mobile Documents\/iCloud~md~obsidian\/Documents\/Notes(?:\/[\w\- ]+(?:\.[A-Za-z0-9]+)?)*(?:\.md)?/g,
+    (m) => stash(m, toFileHref(m)),
+  );
+  // 2. PARA-relative paths. Three shapes:
+  //    a) Note file:   00-Inbox/foo.md, 03-Resources/Info/Info - Foo.md
+  //    b) Directory:   02-Areas/Personal/Guitar/  (trailing slash)
+  //    c) Folder leaf: 02-Areas/Personal/Guitar   (no trailing slash)
+  //    Files → obsidian://open. Directories → file:// vault root + path.
+  const vaultRoot = "/Users/fer/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes";
+  out = out.replace(
+    /(?<!\]\()(?<![\w/[])(0[0-5]-[A-Za-z]+(?:\/[\w\-]+(?: [\w\-]+)*)*(?:\.md|\/)?)/g,
+    (m) => {
+      if (m.endsWith(".md")) {
+        return stash(m, m); // obsidian:// (handled in postprocess)
+      }
+      const abs = vaultRoot + "/" + m.replace(/\/$/, "");
+      return stash(m, "file://" + abs.split("/").map(encodeURIComponent).join("/"));
+    },
+  );
+  // 3. Other home-relative paths (no spaces — safe heuristic).
+  out = out.replace(
+    /(?<!\]\()(?<![\w/[])~\/[^\s)`'"]+[^\s)`'".,;:]/g,
+    (m) => stash(m, toFileHref(m)),
+  );
+  // 4. Absolute paths under /Users/, /tmp/, /opt/, etc. (no spaces).
+  out = out.replace(
+    /(?<!\]\()(?<![\w/[])(\/(?:Users|tmp|opt|var|etc|usr|private)\/[^\s)`'"]+[^\s)`'".,;:])/g,
+    (m) => stash(m, toFileHref(m)),
+  );
   return out;
 }
 
 function postprocess(html) {
-  return html
-    .replace(/\u0000EXT_OPEN\u0000/g, '<span class="ext">⚠ ')
-    .replace(/\u0000EXT_CLOSE\u0000/g, "</span>");
+  let out = html
+    .replace(/\u0000EXT_OPEN\u0000/g, "— ")
+    .replace(/\u0000EXT_CLOSE\u0000/g, " —");
+  out = out.replace(/\u0000PATH(\d+)\u0000/g, (_, idx) => {
+    const entry = _pathLinkBuffer[Number(idx)];
+    if (!entry) return "";
+    const isNote = entry.href.endsWith(".md") && !entry.href.startsWith("file:") && !entry.href.startsWith("http");
+    const target = isNote ? obsidianUrl(entry.href) : entry.href;
+    const escapedLabel = entry.label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return `<a href="${target}" title="${escapedLabel.replace(/"/g, "&quot;")}">${escapedLabel}</a>`;
+  });
+  return out;
 }
 
 function renderMarkdown(text) {
@@ -1600,14 +1728,24 @@ async function send(question) {
         ragText.innerHTML = renderMarkdown(fullText);
       }
       const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
-      // On propose-intent turns skip the sources panel AND the
-      // web-search fallback — vault retrieval / googling are irrelevant
-      // when the user asked the system to CREATE a reminder/event.
+      const weakAnswer = !sources || !sources.length || (Number.isFinite(conf) && conf < 1.0);
+      // A mention hit (sentinel score 5.0 from the Mentions folder) means
+      // the question is about an entity in the user's life, not a generic
+      // topic. Skip external enrichment / web search — those would surface
+      // tourism/wikipedia noise instead of the personal context.
+      // On propose-intent turns skip the sources panel AND the web-search
+      // fallback — vault retrieval / googling are irrelevant when the user
+      // asked the system to CREATE a reminder/event.
+      const mentionMatched = (sources || []).some((s) => s.score >= 5.0);
+      if (!hadProposal && question && ragText && weakAnswer && !mentionMatched) {
+        const target = ragText.lastElementChild || ragText;
+        appendWebSearch(target, question, true);
+      }
       if (!hadProposal && sources && sources.length) {
         appendSources(turn, sources, conf);
       }
-      if (!hadProposal && question && (!sources || !sources.length || (Number.isFinite(conf) && conf < 1.0))) {
-        appendWebSearch(turn, question);
+      if (!hadProposal && question && weakAnswer && !mentionMatched) {
+        appendRelated(turn, question);
       }
       const feedbackBar = parsed.turn_id
         ? appendFeedback(turn, {
@@ -1629,12 +1767,19 @@ async function send(question) {
       if (sessionId && !aborted) appendFollowups(turn, sessionId);
       if (ttsEnabled && !aborted && fullText.trim()) speak(fullText);
       scrollBottom();
+    } else if (event === "enrich") {
+      if (Array.isArray(parsed.lines) && parsed.lines.length) {
+        appendEnrich(turn, parsed.lines);
+      }
     } else if (event === "empty") {
       stopGeneratingTicker();
       thinking.remove();
       clearToolChips();
       turn.appendChild(el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`));
-      if (question) appendWebSearch(turn, question);
+      if (question) {
+        appendWebSearch(turn, question);
+        appendRelated(turn, question);
+      }
     } else if (event === "error") {
       stopGeneratingTicker();
       thinking.remove();

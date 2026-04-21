@@ -29459,6 +29459,281 @@ def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
     return events[:max_events]
 
 
+# ── Cross-source enrichment for web chat ─────────────────────────────────
+# After a chat answer streams to the user, run a fast entity extraction +
+# parallel scan of WhatsApp/Calendar/Reminders so the UI can show a
+# "📎 contexto relacionado" footer with cross-channel signals (e.g.
+# "📅 esta reunión ya está en tu calendar mañana 15hs").
+# Wall budget: ~1.5s. Soft-fail per source — never block the answer.
+
+_ENRICH_HELPER_PROMPT = (
+    "Extraé entidades mencionadas en la respuesta sobre las notas del usuario. "
+    "Devolvé SOLO JSON con esta forma exacta: "
+    '{"people":[],"events":[],"topics":[]}. '
+    "people: nombres propios de personas (sin títulos). "
+    "events: reuniones, viajes, llamadas, deadlines. "
+    "topics: 1-3 temas principales. "
+    "Cada lista vacía si no hay nada. NADA fuera del JSON."
+)
+
+
+def extract_enrich_entities(question: str, answer: str) -> dict:
+    """Single helper-LLM pass to mine names/events/topics from the answer.
+    Used by build_enrich_payload to feed cross-source lookups.
+    Returns {"people": [...], "events": [...], "topics": [...]}.
+    Skipped (returns empty) for very short answers or on any error.
+    """
+    empty = {"people": [], "events": [], "topics": []}
+    if not answer or len(answer.strip()) < 40:
+        return empty
+    user_msg = f"Pregunta: {question}\n\nRespuesta:\n{answer[:1500]}"
+    # Reuse the resident chat model (qwen2.5:7b, already pinned via the
+    # web prewarmer) instead of qwen2.5:3b — avoids the 2-5s cold load
+    # that blew the enrich budget repeatedly. JSON-mode + 160 tokens lands
+    # at ~600-900ms warm, well inside the wall ceiling.
+    try:
+        rsp = ollama.chat(
+            model=resolve_chat_model(),
+            messages=[
+                {"role": "system", "content": _ENRICH_HELPER_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            options={**HELPER_OPTIONS, "num_predict": 160, "num_ctx": 2048, "format": "json"},
+            keep_alive=-1,
+        )
+        raw = (rsp.message.content or "").strip()
+        data = json.loads(raw)
+        return {
+            "people": [str(p).strip() for p in (data.get("people") or []) if str(p).strip()][:5],
+            "events": [str(e).strip() for e in (data.get("events") or []) if str(e).strip()][:5],
+            "topics": [str(t).strip() for t in (data.get("topics") or []) if str(t).strip()][:5],
+        }
+    except Exception:
+        return empty
+
+
+def _humanize_relative_es(ts_str: str) -> str:
+    """ISO/SQLite timestamp → 'hoy' / 'ayer' / 'hace 3 días' / 'hace 2 semanas'.
+    Handles both 'YYYY-MM-DD HH:MM:SS±HH:MM' (WA SQLite) and ISO-8601.
+    """
+    if not ts_str:
+        return ""
+    try:
+        s = ts_str.replace("Z", "+00:00")
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T", 1)
+        dt = datetime.fromisoformat(s)
+        # Drop tz so we can subtract from naive datetime.now()
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return ""
+    delta = datetime.now() - dt
+    if delta.days < 0:
+        return ""
+    if delta.days == 0:
+        return "hoy"
+    if delta.days == 1:
+        return "ayer"
+    if delta.days < 7:
+        return f"hace {delta.days} días"
+    weeks = delta.days // 7
+    return f"hace {weeks} semana{'s' if weeks > 1 else ''}"
+
+
+def _enrich_terms(entities: dict, min_len: int = 3) -> list[str]:
+    raw = entities.get("people", []) + entities.get("events", []) + entities.get("topics", [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in raw:
+        k = (t or "").strip().lower()
+        if len(k) < min_len or k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+_CONTACT_NAME_CACHE: dict[str, str] = {}
+
+
+def _apple_contact_name(phone: str) -> str | None:
+    """Look up a phone number in macOS Contacts via osascript. Returns the
+    contact's name or None. Cached in-process — Contacts isn't going to
+    change mid-process and osascript is ~200ms per call. `phone` is
+    normalised to digits-only before query (Contacts stores formatted
+    numbers, the `whose ... contains` predicate matches substrings).
+    """
+    if not _apple_enabled() or not phone:
+        return None
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    if digits in _CONTACT_NAME_CACHE:
+        return _CONTACT_NAME_CACHE[digits] or None
+    import subprocess
+    script = (
+        'tell application "Contacts" to '
+        'set _ppl to (every person whose value of phones contains "' + digits + '")\n'
+        'if (count of _ppl) is 0 then return ""\n'
+        'return name of (item 1 of _ppl)'
+    )
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=3,
+        )
+        name = (res.stdout or "").strip()
+    except Exception:
+        name = ""
+    _CONTACT_NAME_CACHE[digits] = name
+    return name or None
+
+
+def _enrich_wa(entities: dict, days: int = 7, max_hits: int = 2) -> list[dict]:
+    """Recent WhatsApp messages mentioning any entity term. SQLite read-only."""
+    terms = _enrich_terms(entities)
+    if not terms or not WHATSAPP_DB_PATH.is_file():
+        return []
+    import sqlite3
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(sep=" ", timespec="seconds")
+    like_clauses = " OR ".join(["LOWER(content) LIKE ?"] * len(terms))
+    params: list = [cutoff] + [f"%{t.lower()}%" for t in terms]
+    sql = f"""
+      SELECT m.chat_jid, m.content, m.timestamp,
+             COALESCE(c.name, m.chat_jid) AS chat_name
+      FROM messages m
+      LEFT JOIN chats c ON c.jid = m.chat_jid
+      WHERE m.timestamp > ? AND m.content IS NOT NULL AND m.content != ''
+        AND ({like_clauses})
+      ORDER BY m.timestamp DESC
+      LIMIT 50
+    """
+    try:
+        con = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro&immutable=1", uri=True)
+        rows = list(con.execute(sql, params))
+        con.close()
+    except sqlite3.Error:
+        return []
+    seen_chats: set[str] = set()
+    hits: list[dict] = []
+    for jid, content, ts, chat_name in rows:
+        if jid in seen_chats:
+            continue
+        seen_chats.add(jid)
+        snippet = (content or "").replace("\n", " ").strip()[:80]
+        # Pretty label: prefer chat name; fall back to phone (DM) or "grupo"
+        is_group = jid.endswith("@g.us")
+        is_lid = jid.endswith("@lid")  # WhatsApp opaque privacy identifier
+        bare_name = (chat_name or "").strip()
+        # chat_name often falls back to the bare jid (just digits) when the
+        # contact wasn't synced — try Apple Contacts before falling back to
+        # the raw phone (and skip the +<digits> fallback for @lid which is
+        # a privacy identifier, not a real phone).
+        if not bare_name or bare_name == jid or bare_name.isdigit() or bare_name == jid.split("@")[0]:
+            phone = jid.split("@")[0]
+            resolved = None
+            if phone.isdigit() and not is_lid:
+                resolved = _apple_contact_name(phone)
+            if resolved:
+                bare_name = resolved
+            elif is_lid:
+                bare_name = "contacto sin nombre"
+            else:
+                bare_name = (f"+{phone}" if phone.isdigit() else phone) or "WhatsApp"
+        chat_label = f"grupo «{bare_name}»" if is_group else bare_name
+        hits.append({
+            "icon": "💬",
+            "text": f"hablaste en {chat_label}",
+            "snippet": snippet,
+            "relative": _humanize_relative_es(ts),
+            "channel": "wa",
+        })
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+def _enrich_calendar(entities: dict, max_hits: int = 2) -> list[dict]:
+    """Calendar events whose title matches an entity term."""
+    terms = [t.lower() for t in _enrich_terms(entities)]
+    if not terms:
+        return []
+    today = _fetch_calendar_today(max_events=15)
+    ahead = _fetch_calendar_ahead(days_ahead=7, max_events=40)
+    seen: set[str] = set()
+    hits: list[dict] = []
+    for ev in today + ahead:
+        title = (ev.get("title") or "").strip()
+        title_l = title.lower()
+        if not title or title_l in seen:
+            continue
+        if not any(t in title_l for t in terms):
+            continue
+        seen.add(title_l)
+        when = ev.get("start") or ev.get("date_label") or ""
+        time_range = ev.get("time_range") or ""
+        when_label = " ".join(p for p in [when, time_range] if p).strip()
+        hits.append({
+            "icon": "📅",
+            "text": f"está en tu calendar: «{title}»",
+            "snippet": when_label,
+            "relative": "",
+            "channel": "calendar",
+        })
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+def _enrich_reminders(entities: dict, max_hits: int = 2) -> list[dict]:
+    """Reminders whose name matches an entity term."""
+    terms = [t.lower() for t in _enrich_terms(entities)]
+    if not terms:
+        return []
+    items = _fetch_reminders_due(datetime.now(), horizon_days=14, max_items=40)
+    bucket_label = {"overdue": "vencido", "today": "hoy", "upcoming": "próximo", "undated": "sin fecha"}
+    hits: list[dict] = []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        if not any(t in name.lower() for t in terms):
+            continue
+        hits.append({
+            "icon": "✓",
+            "text": f"reminder relacionado: «{name}»",
+            "snippet": bucket_label.get(it.get("bucket", ""), ""),
+            "relative": "",
+            "channel": "reminders",
+        })
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+def build_enrich_payload(question: str, answer: str, top_score: float) -> dict | None:
+    """Compose the cross-source enrichment block for the web chat footer.
+
+    Pipeline: extract entities → fan out to WA/Calendar/Reminders → merge,
+    cap to 5 lines, prioritise Calendar > Reminders > WA. Returns
+    `{"lines": [...], "entities": {...}}` or None when nothing surfaces.
+    Skipped on short answers or low-confidence retrieval.
+    """
+    if not answer or len(answer.strip()) < 40:
+        return None
+    if top_score < CONFIDENCE_RERANK_MIN:
+        return None
+    entities = extract_enrich_entities(question, answer)
+    if not (entities["people"] or entities["events"] or entities["topics"]):
+        return None
+    cal = _enrich_calendar(entities) if _apple_enabled() else []
+    rem = _enrich_reminders(entities) if _apple_enabled() else []
+    wa = _enrich_wa(entities)
+    lines = (cal + rem + wa)[:5]
+    if not lines:
+        return None
+    return {"lines": lines, "entities": entities}
+
+
 def _collect_scoped_tasks_evidence(col, now: datetime, scope: dict) -> dict:
     """`_pendientes_collect` under the hood, then override `reminders` and
     `calendar_range` with scope-aware fetches. Ensures `whatsapp` always

@@ -1342,6 +1342,89 @@ def followups(req: FollowupsRequest) -> dict:
         return {"followups": []}
 
 
+# Related-context (Deezer + YouTube) -----------------------------------------
+# Deezer's public search API needs no auth (CORS-restricted but server-side
+# is fine). Returned every relevant track has a `link` to deezer.com.
+
+
+def _deezer_search(query: str, limit: int = 2) -> list[dict]:
+    import urllib.request
+    import urllib.parse
+    qs = urllib.parse.urlencode({"q": query, "limit": limit})
+    try:
+        with urllib.request.urlopen(f"https://api.deezer.com/search?{qs}", timeout=4) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+    items: list[dict] = []
+    for tr in (data.get("data") or [])[:limit]:
+        artist = (tr.get("artist") or {}).get("name") or ""
+        album = (tr.get("album") or {}).get("title") or ""
+        items.append({
+            "source": "deezer",
+            "kind": "track",
+            "title": tr.get("title") or "",
+            "subtitle": f"{artist} · {album}".strip(" ·"),
+            "url": tr.get("link") or "",
+        })
+    return [i for i in items if i.get("url") and i.get("title")]
+
+
+def _youtube_search(query: str, limit: int = 2) -> list[dict]:
+    key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not key:
+        return []
+    import urllib.request
+    import urllib.parse
+    qs = urllib.parse.urlencode({
+        "part": "snippet", "q": query, "maxResults": limit,
+        "type": "video", "key": key, "relevanceLanguage": "es", "safeSearch": "none",
+    })
+    try:
+        with urllib.request.urlopen(f"https://www.googleapis.com/youtube/v3/search?{qs}", timeout=4) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+    items: list[dict] = []
+    for it in (data.get("items") or [])[:limit]:
+        vid = (it.get("id") or {}).get("videoId")
+        sn = it.get("snippet") or {}
+        if not vid:
+            continue
+        items.append({
+            "source": "youtube",
+            "kind": "video",
+            "title": sn.get("title") or "",
+            "subtitle": sn.get("channelTitle") or "",
+            "url": f"https://www.youtube.com/watch?v={vid}",
+        })
+    return items
+
+
+class RelatedRequest(BaseModel):
+    query: str
+    sources: list[str] | None = None  # subset of ["deezer","youtube"]; None = all
+
+
+@app.post("/api/related")
+def related(req: RelatedRequest) -> dict:
+    """External enrichment: Deezer + YouTube. Returns merged items list.
+    Empty if no API keys present or query is empty. The frontend decides
+    when to call this (low-confidence answers, empty retrieval, etc.) so
+    the endpoint stays dumb and side-effect-free.
+    """
+    q = (req.query or "").strip()
+    if not q or len(q) < 3:
+        return {"items": []}
+    wanted = set(req.sources or ["youtube"])
+    items: list[dict] = []
+    if "deezer" in wanted:
+        items.extend(_deezer_search(q, limit=2))
+    if "youtube" in wanted:
+        items.extend(_youtube_search(q, limit=2))
+    return {"items": items}
+
+
 class TTSRequest(BaseModel):
     text: str
     voice: str = "Monica"
@@ -3613,6 +3696,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     if not vaults:
         raise HTTPException(status_code=400, detail=f"vault '{req.vault_scope}' no encontrado")
 
+    def _emit_enrich(turn_id: str, q: str, answer: str, top_score: float):
+        """Yield an `enrich` SSE event with cross-source signals (WA/Calendar/
+        Reminders). 4s wall budget enforced via ThreadPoolExecutor.
+        Soft-fail per source — never raises into the stream.
+        """
+        print(f"[enrich] start turn={turn_id} top_score={top_score} answer_len={len(answer or '')}", flush=True)
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+        try:
+            from rag import build_enrich_payload
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(build_enrich_payload, q, answer, top_score)
+                _enrich = _fut.result(timeout=4.0)
+            if _enrich:
+                print(f"[enrich] hit lines={len(_enrich.get('lines', []))}", flush=True)
+                return _sse("enrich", {"turn_id": turn_id, **_enrich})
+            print("[enrich] no lines (empty payload)", flush=True)
+        except _FutTimeout:
+            print("[enrich] skipped: 4s budget exceeded", flush=True)
+        except Exception as exc:
+            print(f"[enrich] skipped: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
     def gen():
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
@@ -3695,8 +3800,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 for i in range(0, len(_text), 40):
                     yield _sse("token", {"delta": _text[i:i+40]})
                 _cached_total_ms = int((time.perf_counter() - _t0) * 1000)
+                _cached_turn_id = new_turn_id()
                 yield _sse("done", {
-                    "turn_id": new_turn_id(),
+                    "turn_id": _cached_turn_id,
                     "top_score": _cached["top_score"],
                     "total_ms": _cached_total_ms,
                     "retrieve_ms": 0,
@@ -3704,6 +3810,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "llm_ms": 0,
                     "cached": True,
                 })
+                _enrich_evt = _emit_enrich(
+                    _cached_turn_id, question, _text, float(_cached["top_score"]),
+                )
+                if _enrich_evt:
+                    yield _enrich_evt
                 print(f"[chat-cache] HIT {_cache_key} total={_cached_total_ms}ms", flush=True)
                 # Emit a timing schema-stable line so downstream parsers
                 # (tool_rounds/tool_ms/tool_names) don't see an NaN on
@@ -3862,11 +3973,32 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "filters": _filters,
         }
 
+        # Mention hits (entity dictionary) → synthetic source rows so the
+        # user can see which definitions were injected. `score` set to a
+        # sentinel high value (5.0) and bar to all-filled — these aren't
+        # ranked by the retriever, they're authoritative user-provided.
+        # Uses rag._match_mentions_in_query (same resolver that feeds
+        # build_person_context) so the UI reflects exactly which mention
+        # notes were folded into the LLM preamble.
+        from rag import _match_mentions_in_query as _match_mentions_fn
+        from pathlib import Path as _Path
+        _mention_paths = _match_mentions_fn(question)
+        _mention_sources = [
+            {
+                "file": rel,
+                "note": _Path(rel).stem,
+                "folder": str(_Path(rel).parent),
+                "score": 5.0,
+                "bar": "■■■■■",
+            }
+            for rel in _mention_paths
+        ]
+
         yield _sse("sources", {
             "items": (
                 []
                 if is_propose_intent
-                else [
+                else _mention_sources + [
                     {**_source_payload(m, s), "bar": _score_bar(float(s))}
                     for m, s in zip(result["metas"], result["scores"])
                 ]
@@ -3937,6 +4069,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # 99 Mentions @/, prepend that note's body + Apple Contacts data so
         # the LLM knows who the user is talking about before reading the
         # retrieved chunks. Pre-LLM only — never leaked to episodic notes.
+        # NOTE: this supersedes the earlier web-local `_mentions_block` —
+        # `build_person_context` does the same job with richer output
+        # (Apple Contacts metadata + structured format).
         from rag import build_person_context as _build_person_ctx
         from rag import detect_topic_shift as _detect_topic_shift
         _person_ctx = _build_person_ctx(question)
@@ -3958,6 +4093,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             if _topic_shifted:
                 history = []
+
 
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The
@@ -4464,6 +4600,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             ),
             name=f"conv-writer-{turn_id[:8]}",
         )
+
+        _enrich_evt = _emit_enrich(turn_id, question, full, float(result["confidence"]))
+        if _enrich_evt:
+            yield _enrich_evt
 
         # Cache store — sólo queries sin history (no follow-ups) y con
         # respuesta no-vacía. Keya con el vault_chunks count computado en el

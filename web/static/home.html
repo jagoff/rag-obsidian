@@ -108,14 +108,17 @@
       margin-bottom: 14px;
     }
     .home-head h2 {
-      font-size: 18px;
+      font-size: 26px;
       font-weight: 700;
       color: var(--cyan);
+      letter-spacing: -0.01em;
     }
     .home-head h2 .date {
       color: var(--text-faint);
       font-weight: 400;
-      margin-left: 10px;
+      font-size: 14px;
+      margin-left: 12px;
+      letter-spacing: 0;
     }
     .home-actions { display: flex; gap: 10px; align-items: center; }
     .home-btn {
@@ -136,10 +139,12 @@
     @keyframes refresh-spin { to { transform: rotate(360deg); } }
 
     .status-line {
-      font-size: 11px;
+      font-size: 12px;
       color: var(--text-faint);
-      margin-bottom: 26px;
+      margin-bottom: 28px;
+      padding-top: 4px;
     }
+    .status-line .dot { margin-right: 4px; }
     .status-line .dot { color: var(--green); }
     .status-line .dot.stale { color: var(--yellow); }
     .status-line .dot.gen { color: var(--cyan); }
@@ -485,6 +490,91 @@
       border-radius: 4px;
       color: var(--red);
       font-size: 13px;
+    }
+
+    /* ── Channel identity (family color-coding) ──────────────── */
+    /* Each panel gets a 2px left accent + matching title color so the
+       grid reads by source at a glance. 5 families map by panel id:
+         inbox   → cyan    (things owed to you: gmail, reminders, cal, wa)
+         activity→ green   (your recent actions: notes, inbox captures, vault)
+         signals → yellow  (system alerts: loops, contradictions, low-conf)
+         external→ purple  (outside world: chrome, bookmarks, drive)
+         health  → dim     (deterministic metrics: pagerank, eval, weather, finanzas) */
+    .panel {
+      border-left-width: 2px;
+      border-left-style: solid;
+      border-left-color: var(--border);
+      transition: border-left-color 120ms ease;
+    }
+    .panel .head h3 {
+      font-size: 11.5px;
+      transition: color 120ms ease;
+    }
+
+    /* inbox — cyan */
+    #panel-gmail, #panel-reminders, #panel-calendar, #panel-wa-unreplied {
+      border-left-color: color-mix(in srgb, var(--cyan) 70%, transparent);
+    }
+    #panel-gmail .head h3,
+    #panel-reminders .head h3,
+    #panel-calendar .head h3,
+    #panel-wa-unreplied .head h3 { color: var(--cyan); }
+
+    /* activity — green */
+    #panel-activity, #panel-inbox, [id^="panel-vault-"] {
+      border-left-color: color-mix(in srgb, var(--green) 70%, transparent);
+    }
+    #panel-activity .head h3,
+    #panel-inbox .head h3,
+    [id^="panel-vault-"] .head h3 { color: var(--green); }
+
+    /* signals — yellow */
+    #panel-loops, #panel-aging, #panel-contradictions, #panel-lowconf {
+      border-left-color: color-mix(in srgb, var(--yellow) 70%, transparent);
+    }
+    #panel-loops .head h3,
+    #panel-aging .head h3,
+    #panel-contradictions .head h3,
+    #panel-lowconf .head h3 { color: var(--yellow); }
+
+    /* external — purple */
+    #panel-chrome, #panel-bookmarks, #panel-drive {
+      border-left-color: color-mix(in srgb, var(--purple) 70%, transparent);
+    }
+    #panel-chrome .head h3,
+    #panel-bookmarks .head h3,
+    #panel-drive .head h3 { color: var(--purple); }
+
+    /* health — muted (deterministic metrics, low cognitive weight) */
+    #panel-pagerank, #panel-evaltrend, #panel-weather, #panel-finance {
+      border-left-color: color-mix(in srgb, var(--text-dim) 50%, transparent);
+    }
+    #panel-pagerank .head h3,
+    #panel-evaltrend .head h3,
+    #panel-weather .head h3,
+    #panel-finance .head h3 { color: var(--text-dim); }
+
+    /* Empty panels fade back so active channels pop. Min-height
+       shrinks so a row of empties doesn't waste vertical space. */
+    .panel:has(.empty) {
+      opacity: 0.55;
+      min-height: 80px;
+    }
+    .panel .empty {
+      padding: 14px 0 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .panel .empty::before {
+      content: "";
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 1.5px dashed color-mix(in srgb, var(--text-faint) 60%, transparent);
+      display: block;
+      opacity: 0.5;
     }
 
     @media (max-width: 600px) {

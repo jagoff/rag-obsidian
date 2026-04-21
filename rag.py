@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 """Obsidian RAG — semantic chunking, title prefix, HyDE, hybrid BM25+semantic, reranking."""
 
-import os as _os_bootstrap
+import os
 
-# Pin HF/transformers into offline mode BEFORE any import that transitively
-# pulls huggingface_hub. huggingface_hub reads these envs at module-init and
-# caches the offline flag globally; setting them later (inside a lazy loader)
-# leaves a client that tries HEAD requests and fails on air-gapped setups.
-# Only opt in when the web server has RAG_LOCAL_EMBED=1 — keeps the indexing
-# path (which uses ollama for embeds) unaffected.
-if _os_bootstrap.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
-    _os_bootstrap.environ.setdefault("HF_HUB_OFFLINE", "1")
-    _os_bootstrap.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Pin HF / transformers into offline + quiet mode BEFORE any import that
+# transitively pulls huggingface_hub. These libs read the envs at module-init
+# and cache the offline flag globally; setting them later (inside a lazy
+# loader) leaves a client that tries HEAD requests and fails on air-gapped
+# setups. The reranker + sentence_transformers path both inherit this.
+#
+# `os.environ.setdefault` means an operator who WANTS online mode can still
+# export the var explicitly before launching — we don't overwrite.
+#
+# Consolidated 2026-04-20: was previously split across two blocks (a
+# conditional RAG_LOCAL_EMBED bootstrap + an unconditional block after
+# stdlib imports). Verified no top-level import in this module transitively
+# pulls huggingface_hub — `sentence_transformers` is lazy-imported inside
+# get_reranker() / _get_local_embedder(), so setting the flags once here
+# is sufficient and simpler than the split.
+for _k, _v in {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    # suppresses fd-2 "unauthenticated" warn from huggingface_hub
+    "HF_HUB_VERBOSITY": "error",
+    "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    "TRANSFORMERS_VERBOSITY": "error",
+    "TQDM_DISABLE": "1",
+}.items():
+    os.environ.setdefault(_k, _v)
+del _k, _v
 
 import atexit
 import contextlib
@@ -19,7 +38,6 @@ import csv
 import fcntl
 import hashlib
 import json
-import os
 import queue
 import re
 import secrets
@@ -38,15 +56,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
-# Reranker is cached locally — go offline to skip HF Hub network check + warnings.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-os.environ.setdefault("HF_HUB_VERBOSITY", "error")          # suppresses fd-2 "unauthenticated" warn
-os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("TQDM_DISABLE", "1")
 warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -6741,6 +6750,7 @@ def embed(texts: list[str]) -> list[list[float]]:
 _local_embedder = None
 _local_embedder_lock = threading.Lock()
 _LOCAL_EMBED_ENABLED = os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no")
+LOCAL_EMBED_ENABLED = _LOCAL_EMBED_ENABLED  # public alias — the leading underscore was accidental (it's a config flag, not private)
 
 
 def _get_local_embedder():
@@ -13805,7 +13815,14 @@ def _render_chat_create_chip(payload: dict, console_) -> None:
     title = fields.get("title") or "(sin título)"
 
     # Date/time presentation — mirrors the web chip's formatIsoDatetime +
-    # formatDateOnly, adapted to terminal output.
+    # formatDateOnly, adapted to terminal output. `%a` is locale-dependent
+    # so hard-map weekday to es-AR to match the web UI.
+    _es_wd = ("lun", "mar", "mié", "jue", "vie", "sáb", "dom")
+
+    def _fmt(dt: datetime, time: bool) -> str:
+        base = f"{_es_wd[dt.weekday()]} {dt.strftime('%d-%m')}"
+        return f"{base} {dt.strftime('%H:%M')}" if time else base
+
     when_bits: list[str] = []
     if kind == "event":
         start_iso = fields.get("start_iso")
@@ -13816,10 +13833,10 @@ def _render_chat_create_chip(payload: dict, console_) -> None:
             except ValueError:
                 dt = None
             if dt is not None:
-                if all_day:
-                    when_bits.append(dt.strftime("%a %d-%m (todo el día)"))
-                else:
-                    when_bits.append(dt.strftime("%a %d-%m %H:%M"))
+                when_bits.append(
+                    f"{_fmt(dt, False)} (todo el día)" if all_day
+                    else _fmt(dt, True)
+                )
     else:
         due_iso = fields.get("due_iso")
         if due_iso:
@@ -13828,7 +13845,7 @@ def _render_chat_create_chip(payload: dict, console_) -> None:
             except ValueError:
                 dt = None
             if dt is not None:
-                when_bits.append(dt.strftime("%a %d-%m %H:%M"))
+                when_bits.append(_fmt(dt, True))
         else:
             when_bits.append("sin fecha")
 

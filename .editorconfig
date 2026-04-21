@@ -1,0 +1,39 @@
+root = true
+
+# Default — keep consistent with ruff line-length=100 and the existing
+# Python + markdown code style across the repo.
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# Markdown keeps two trailing spaces as a line-break signal — don't strip.
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off
+
+# YAML and TOML use 2-space indent by convention.
+[*.{yaml,yml,toml}]
+indent_size = 2
+
+# JSON, JavaScript, CSS, HTML: 2-space.
+[*.{json,js,jsx,ts,tsx,css,html}]
+indent_size = 2
+
+# Makefile requires hard tabs — hands off.
+[Makefile]
+indent_style = tab
+
+# Lock files are tool-generated — don't touch.
+[*.lock]
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+# Vendored bundles (marked.min.js, etc.) — same, don't touch.
+[web/static/vendor/**]
+trim_trailing_whitespace = false
+insert_final_newline = false

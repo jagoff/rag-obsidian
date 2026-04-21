@@ -185,7 +185,14 @@ def _calendar_service():
             creds.refresh(Request())
             stored["access_token"] = creds.token
             stored["token"] = creds.token
-            creds_path.write_text(json.dumps(stored), encoding="utf-8")
+            # Atomic tmp + replace. Sin esto, un kill -9 (o reboot) durante
+            # `write_text` deja `credentials.json` half-written y la próxima
+            # invocación cae en el outer `except: return None` → el ingester
+            # silenciosamente deja de sincronizar Calendar y el usuario tiene
+            # que re-OAuthear manualmente. Mismo patrón que `_save_vaults_config`.
+            tmp = creds_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(stored), encoding="utf-8")
+            tmp.replace(creds_path)
         return build("calendar", "v3", credentials=creds, cache_discovery=False)
     except Exception:
         return None

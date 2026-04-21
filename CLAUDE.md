@@ -22,6 +22,12 @@ Tasks that touch ≤2 files go directly to the owning agent (`rag-retrieval`, `r
 
 When peers are active (`mcp__claude-peers__list_peers(scope: "repo")` returns >1), even ≤2-file tasks may need PM coordination — flag overlapping zones before editing.
 
+## Auto-commit + push rule
+
+Cuando termino una feature / functionality / fix / refactor: **commit + `git push origin master` automático, sin preguntar**. Mensaje explica *qué* cambió y *por qué* (no solo "wip"). Incluye el trailer standard (`Generated with ... / Co-Authored-By: Devin`). Si los tests fallan o el build rompe, NO commiteás — arreglás primero.
+
+Excepciones obvias: tareas exploratorias (investigar, responder preguntas, revisar diffs), cambios que el usuario explicitamente pidió no commitear, trabajo a medio camino (fix parcial + deferred-follow-up). Ante duda genuina, commit pero no push.
+
 ## Commands
 
 ```bash

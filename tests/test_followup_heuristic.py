@@ -2,7 +2,7 @@
 
 The function is a pure regex classifier with no heavy deps. We re-declare
 the minimal regex objects here to avoid importing the full server module
-(which pulls in chromadb/ollama). Keep in sync with web/server.py if the
+(which pulls in sqlite-vec/ollama). Keep in sync with web/server.py if the
 patterns change.
 """
 from __future__ import annotations

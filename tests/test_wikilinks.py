@@ -56,7 +56,7 @@ def test_skip_html_tags():
 def vault_with_titles(tmp_path, monkeypatch):
     """Set up a tmp vault with three titled notes whose paths feed
     `_load_corpus`'s `title_to_paths` index. Patches VAULT_PATH and gives
-    a real chroma collection populated with the metadata structure that
+    a real sqlite-vec collection populated with the metadata structure that
     `_load_corpus` expects.
     """
     vault = tmp_path / "vault"
@@ -66,7 +66,7 @@ def vault_with_titles(tmp_path, monkeypatch):
     (vault / "TDD.md").write_text("test driven development.\n")  # short title
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="wl_test", metadata={"hnsw:space": "cosine"}
     )

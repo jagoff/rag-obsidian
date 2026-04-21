@@ -51,7 +51,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed, fake_chat):
     (vault / "00-Inbox").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "LOG_PATH", tmp_path / "queries.jsonl")
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="read_test", metadata={"hnsw:space": "cosine"}
     )

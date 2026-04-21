@@ -4,7 +4,7 @@ flowchart TD
     Trig -->|"rag index"| Bulk[_run_index loop]
     Trig -->|"rag index --reset"| Drop[delete collections] --> Bulk
 
-    Single --> Hash{hash diff<br/>vs Chroma?}
+    Single --> Hash{hash diff<br/>vs vec?}
     Bulk --> Hash
     Hash -->|igual| Skip[skip]
     Hash -->|distinto| ContrCheck{skip_contradict<br/>=False?}

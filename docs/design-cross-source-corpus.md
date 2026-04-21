@@ -70,7 +70,7 @@ Desventajas:
 
 ### 2.2 Collection naming
 
-- Propuesto: `_COLLECTION_BASE = "obsidian_corpus_v8"` (bump desde `obsidian_notes_v7`, rename para reflejar el alcance).
+- Propuesto: `_COLLECTION_BASE = "obsidian_corpus_vN"` (bump desde el `obsidian_notes_v11` vigente, rename para reflejar el alcance).
 - URL sub-index queda paralelo: `obsidian_urls_v1` — los URLs son cross-source por diseño (pueden venir de notas, emails, WhatsApp — el sub-index ya es source-agnostic hoy).
 - Multi-vault suffix (`sha256(VAULT_PATH)[:8]`) se preserva. Para fuentes cross-source, el suffix refleja *la identidad del usuario*, no del vault puntual — queda como está porque la identidad es el vault-owner.
 
@@ -354,11 +354,11 @@ Todo el pipeline de embedding + LLM ya corre local (bge-m3, bge-reranker, comman
 
 ### 5.2 Encriptación en reposo
 
-ChromaDB embebe los `documents` en sqlite cleartext. Para vault eso es aceptable (el vault ya es cleartext en iCloud). Para WhatsApp/Gmail es más sensible — el corpus indexado *es* un corpus de mensajes privados.
+sqlite-vec guarda `documents` en sqlite cleartext. Para vault eso es aceptable (el vault ya es cleartext en iCloud). Para WhatsApp/Gmail es más sensible — el corpus indexado *es* un corpus de mensajes privados.
 
 **Opciones:**
 1. No encriptar (aceptar riesgo, confiar en FileVault del host).
-2. Encriptar la colección Chroma a nivel FS (sparse bundle cifrado, mount on demand).
+2. Encriptar el archivo `ragvec.db` a nivel FS (sparse bundle cifrado, mount on demand).
 3. Persistir sólo embeddings + metadata, re-fetch el documento original por `native_id` al momento de display (caro en latencia).
 
 **Recomendación:** (1) si el host está en FileVault (default macOS moderno). El usuario valida esto.
@@ -391,7 +391,7 @@ Antes de pasar a fase 1 (implementación), el usuario decide:
 
 3. **Source weights.** ¿Estás cómodo con que WhatsApp rankée 0.75× vault? ¿O confiás en tus WA tanto como en tus notas curadas?
 
-4. **Encriptación.** ¿FileVault está activo en este host? Si no, ¿querés ChromaDB en un sparse bundle cifrado?
+4. **Encriptación.** ¿FileVault está activo en este host? Si no, ¿querés `ragvec.db` en un sparse bundle cifrado?
 
 5. **Opt-out.** ¿Hay labels de Gmail / chats de WhatsApp que explícitamente NO querés indexar? (El default propuesto es indexar todo).
 

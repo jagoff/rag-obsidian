@@ -25,7 +25,7 @@ def tmp_vault(tmp_path, monkeypatch):
     # Post-T10: surface log writes to rag_surface_log (SQL). Point DB_PATH
     # at the test dir so writes land in a throwaway ragvec.db.
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="surface_test", metadata={"hnsw:space": "cosine"}
     )

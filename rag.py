@@ -3894,9 +3894,9 @@ def _sanitize_table_suffix(name: str) -> str:
 
 
 class SqliteVecCollection:
-    """sqlite-vec-backed collection with a ChromaDB-compatible API surface.
+    """sqlite-vec-backed collection.
 
-    Exposes the subset of the SqliteVecCollection API used by rag.py:
+    Exposes the subset of the API used by rag.py:
       count(), get(), add(), delete(), query(), .id, .name
     """
 
@@ -3982,8 +3982,8 @@ class SqliteVecCollection:
     @property
     def id(self) -> str:
         """Monotonic schema version bumped on every destructive write.
-        Used by _load_corpus() to detect stale BM25 cache (same role as
-        ChromaDB's collection UUID that changed on delete+recreate)."""
+        Used by _load_corpus() to detect stale BM25 cache — a new `id`
+        signals the collection was destructively rewritten."""
         row = self._db.execute(
             "SELECT version FROM rag_schema_version WHERE table_name = ?",
             (self.name,),
@@ -4004,7 +4004,7 @@ class SqliteVecCollection:
 
     @staticmethod
     def _build_where(where: dict | None) -> tuple[str, list]:
-        """Translate ChromaDB-style `where` to SQL.
+        """Translate a dict-based `where` filter to a SQL WHERE clause.
 
         Supported:
           {field: value}              → `field = ?`
@@ -4248,7 +4248,7 @@ class SqliteVecCollection:
               where=None, include=None) -> dict:
         """Semantic search. Returns batched results: {ids, documents,
         metadatas, distances} each as list[list[...]] — one sublist per
-        query embedding, matching ChromaDB's shape."""
+        query embedding."""
         include = include or ["documents", "metadatas", "distances"]
         want_docs = "documents" in include
         want_metas = "metadatas" in include
@@ -4338,8 +4338,8 @@ class SqliteVecCollection:
 
 
 class SqliteVecClient:
-    """sqlite-vec client replacing chromadb.PersistentClient. All collections share one
-    SQLite file (ragvec.db inside path)."""
+    """sqlite-vec client. All collections share one SQLite file
+    (ragvec.db inside path)."""
 
     def __init__(self, path):
         import sqlite3 as _sqlite3
@@ -27955,7 +27955,7 @@ def _prune_orphan_segment_dirs(dry_run: bool = False) -> dict:
     return out
 
 
-def _chroma_wal_checkpoint(dry_run: bool = False) -> dict:
+def _vec_wal_checkpoint(dry_run: bool = False) -> dict:
     """Run `PRAGMA wal_checkpoint(TRUNCATE)` on ragvec.db.
 
     Safer than VACUUM — doesn't require exclusive lock and truncates the
@@ -28511,7 +28511,7 @@ def run_maintenance(
 
     # 3c. WAL checkpoint (compacts ragvec.db-wal)
     try:
-        results["wal_checkpoint"] = _chroma_wal_checkpoint(dry_run=dry_run)
+        results["wal_checkpoint"] = _vec_wal_checkpoint(dry_run=dry_run)
     except Exception as e:
         results["wal_checkpoint_error"] = str(e)
 

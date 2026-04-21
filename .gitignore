@@ -27,7 +27,7 @@ htmlcov/
 .claude/*
 !.claude/agents/
 
-# MCP server config — paths absolutos user-specific (chroma data-dir).
+# MCP server config — paths absolutos user-specific (sqlite-vec data-dir).
 # Migrar a ${HOME}/... y commitear en otra iteración si se quiere compartir.
 .mcp.json
 

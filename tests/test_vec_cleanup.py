@@ -52,14 +52,14 @@ def test_find_orphan_collections_detects_stale(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _chroma_wal_checkpoint
+# _vec_wal_checkpoint
 # ---------------------------------------------------------------------------
 
 def test_wal_checkpoint_missing_db(tmp_path, monkeypatch):
     """No ragvec.db → returns ok=False."""
     import rag
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    result = rag._chroma_wal_checkpoint(dry_run=False)
+    result = rag._vec_wal_checkpoint(dry_run=False)
     assert not result["ok"]
 
 
@@ -71,7 +71,7 @@ def test_wal_checkpoint_dry_run(tmp_path, monkeypatch):
     client = rag.SqliteVecClient(path=str(tmp_path))
     client.get_or_create_collection("test_col")
 
-    result = rag._chroma_wal_checkpoint(dry_run=True)
+    result = rag._vec_wal_checkpoint(dry_run=True)
     assert result["ok"]
     assert result.get("dry_run")
     assert result["before_bytes"] == result["after_bytes"]
@@ -92,6 +92,6 @@ def test_wal_checkpoint_live(tmp_path, monkeypatch):
     conn.commit()
     # Do NOT close yet so WAL has unflushed content.
 
-    result = rag._chroma_wal_checkpoint(dry_run=False)
+    result = rag._vec_wal_checkpoint(dry_run=False)
     assert result["ok"], result
     conn.close()

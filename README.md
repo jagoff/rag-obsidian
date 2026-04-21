@@ -1,6 +1,6 @@
 # obsidian-rag
 
-RAG local sobre el vault de Obsidian, fully local: ChromaDB + Ollama + sentence-transformers. Sin cloud, sin telemetría.
+RAG local sobre el vault de Obsidian, fully local: sqlite-vec + Ollama + sentence-transformers. Sin cloud, sin telemetría.
 
 > **Para la guía de arquitectura interna y decisiones de diseño, ver [CLAUDE.md](./CLAUDE.md).** Este README es la **referencia operativa**: comandos, flags, paths, schemas, recetas — lo que se olvida y hay que poder buscar.
 
@@ -43,7 +43,7 @@ graph TD
     end
 
     subgraph DB["Storage local<br/>~/.local/share/obsidian-rag/"]
-        Chroma[("ChromaDB<br/>obsidian_notes_v7<br/>+ obsidian_urls_v1")]
+        Vec[("sqlite-vec (ragvec.db)<br/>obsidian_notes_v11<br/>+ obsidian_urls_v1")]
         Sessions["sessions/*.json"]
         QLog["queries.jsonl"]
         CLog["contradictions.jsonl"]
@@ -64,12 +64,12 @@ graph TD
 
     Vault --> Watch & IndexCmd
     Watch & IndexCmd --> Embed
-    Embed --> Chroma
+    Embed --> Vec
     Query --> Embed
     Query --> Helper
     Query --> Reranker
     Query --> Chat
-    Chroma --> Query
+    Vec --> Query
     Query --> Sessions & QLog
     Counter --> CLog
 
@@ -105,7 +105,7 @@ rag setup                                  # instala launchd: watch + digest
 
 | Path | Qué guarda |
 |---|---|
-| `~/.local/share/obsidian-rag/chroma/` | ChromaDB persistente. Dos collections: `obsidian_notes_v7_<sha8>` (chunks) + `obsidian_urls_v1_<sha8>` (URLs con contexto embebido). Sufijo sha8 por vault. |
+| `~/.local/share/obsidian-rag/ragvec/` | sqlite-vec persistente (archivo `ragvec.db`). Dos collections: `obsidian_notes_v11_<sha8>` (chunks) + `obsidian_urls_v1_<sha8>` (URLs con contexto embebido). Sufijo sha8 por vault. |
 | `~/.local/share/obsidian-rag/sessions/<id>.json` | Sesiones conversacionales (1 archivo por sesión) |
 | `~/.local/share/obsidian-rag/last_session` | Pointer a la última session id usada (`--continue`/`--resume`) |
 | `~/.local/share/obsidian-rag/queries.jsonl` | Log append-only de cada query/chat/links event |
@@ -181,7 +181,7 @@ flowchart TD
     History -->|no| Expand
     Reform --> Expand[expand_queries<br/>3 paraphrases]
     Expand --> Embed[batch embed<br/>bge-m3]
-    Embed --> Per["por variante:<br/>ChromaDB sem + BM25"]
+    Embed --> Per["por variante:<br/>sqlite-vec sem + BM25"]
     Per --> RRF[RRF merge + dedup]
     RRF --> Parent[expand to parent section]
     Parent --> Rerank[cross-encoder rerank<br/>MPS+fp16]
@@ -204,7 +204,7 @@ flowchart TD
     Trig -->|"rag index"| Bulk[_run_index loop]
     Trig -->|"rag index --reset"| Drop[delete collections] --> Bulk
 
-    Single --> Hash{hash diff<br/>vs Chroma?}
+    Single --> Hash{hash diff<br/>vs vec?}
     Bulk --> Hash
     Hash -->|igual| Skip[skip]
     Hash -->|distinto| ContrCheck{skip_contradict<br/>=False?}
@@ -368,7 +368,7 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 | `rag vault add <name> <path>` | Registra un vault con un alias. |
 | `rag vault use <name>` | Cambia el vault activo (persistente en `vaults.json`). |
 | `rag vault current` | Muestra cuál se va a usar y por qué (env var / registry / default). |
-| `rag vault remove <name>` | Quita del registry (no borra chunks de Chroma). |
+| `rag vault remove <name>` | Quita del registry (no borra chunks del vector store). |
 
 ### Ambient Agent
 
@@ -437,7 +437,7 @@ obsidian-rag-mcp   # se lanza por Claude Code on demand, no manualmente
 
 ## Multi-vault (`rag vault`)
 
-Registry en `~/.config/obsidian-rag/vaults.json` con `{vaults: {name: path}, current: name}`. Cada vault obtiene su propia colección de Chroma automáticamente — namespacing por `sha256(VAULT_PATH)[:8]` sobre `_COLLECTION_BASE`. Switchear no contamina datos.
+Registry en `~/.config/obsidian-rag/vaults.json` con `{vaults: {name: path}, current: name}`. Cada vault obtiene su propia colección sqlite-vec automáticamente — namespacing por `sha256(VAULT_PATH)[:8]` sobre `_COLLECTION_BASE`. Switchear no contamina datos.
 
 **Precedencia** al resolver vault activo:
 
@@ -682,7 +682,7 @@ rag eval                                     # baseline contra queries.yaml
 1. Editar `_COLLECTION_BASE` (ej. `obsidian_notes_v8`) en `rag.py`.
 2. `uv tool install --reinstall --editable .`
 3. `rag index --reset` → drop ambas collections + reindex.
-4. (Opcional) borrar collections viejas: `rag.get_db()` se construye on demand, las viejas quedan huérfanas en `~/.local/share/obsidian-rag/chroma/` — se pueden listar con un script Python o ignorar.
+4. (Opcional) borrar collections viejas: `rag.get_db()` se construye on demand, las viejas quedan huérfanas en `~/.local/share/obsidian-rag/ragvec/ragvec.db` (tablas `vec_*_<hash>` / `meta_*_<hash>` con sufijo previo) — se pueden inspeccionar con `sqlite3 ragvec.db ".tables"` y dropear manualmente, o ignorar.
 
 ### Migrar a otro vault temporalmente
 ```bash
@@ -774,7 +774,7 @@ Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Par
 | `rag chat --counter` da false positives | Query-time detector usa command-r ya, debería estar bien | Si pasa, mirar `helper_raw` en `queries.jsonl`. Tunear el prompt en `find_contradictions`. |
 | Phase 2 contradictions ruidosas en frontmatter | command-r flagueando matices como contradicción | Bajar verbosidad: `rag index --no-contradict` para una corrida; o tunear el prompt. |
 | `rag links` devuelve solo imágenes | Filtro de media no está actualizado | Revisar `_IMAGE_EXT_RE`. Re-correr `rag links --rebuild`. |
-| Tests fallan con `chromadb` errors | Tmp path conflicts o cache stale | Borrar `tests/__pycache__/`, re-correr. |
+| Tests fallan con `sqlite-vec` errors | Tmp path conflicts o cache stale | Borrar `tests/__pycache__/`, re-correr. |
 | URL collection vacía después de upgrade | Auto-backfill aún no disparó | `rag links "anything"` lo trigerea, o forzar con `rag links --rebuild`. |
 | Sesión no se reanuda con `--resume` | `last_session` pointer apunta a una sesión borrada | `rag session list` para ver vivas, `--session <id>` explícito. |
 | `rag setup` falla al cargar | Plist ya cargado o sintaxis inválida | `launchctl unload <path>` manual + ver `launchctl error`. |
@@ -792,7 +792,7 @@ Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Par
 1. **HyDE con qwen2.5:3b empeora hit@5 (95→90 en queries.yaml)**. El modelo chico drift-ea el hipotético del fraseo real. Default OFF. Re-medir solo si el helper sube de tier (≥7B).
 2. **qwen2.5:3b es no-determinista incluso con `temp=0 seed=42`** sobre judgment tasks (contradicciones). Mismo caso da FP primera vez, empty segunda. Y emite JSON malformado con frecuencia. Por eso los detectores de contradicción usan **command-r**, no helper.
 3. **Reranker pierde 3× performance si cae a CPU**. La línea `device="mps"+fp16` en `get_reranker()` es crítica en uv venvs (donde el auto-detect falla).
-4. **ChromaDB + BM25 sobre el GIL están serializados**. ThreadPoolExecutor sobre los retrievals los hizo 3× MÁS LENTOS en M3 Max. NO paralelizar.
+4. **sqlite-vec + BM25 sobre el GIL están serializados**. ThreadPoolExecutor sobre los retrievals los hizo 3× MÁS LENTOS en M3 Max. NO paralelizar.
 5. **Cache del corpus invalidado por `col.count()` delta**. Update de chunks que no cambia el count NO invalida — aceptable para chat dentro del mismo proceso (cold→warm: 341ms → 2ms).
 6. **CONFIDENCE_RERANK_MIN = 0.015** calibrado para `bge-reranker-v2-m3` sobre este vault. Irrelevantes ~0.005-0.015, borderline 0.02-0.10, claramente relevantes > 0.2. Re-calibrar si el reranker cambia.
 7. **Per-file cap en `find_urls` = 2**. Sin esto, una sola nota domina los top-K (descubierto al ver 10 imágenes del mismo archivo en la primera versión).

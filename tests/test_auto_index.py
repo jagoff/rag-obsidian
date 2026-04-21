@@ -17,7 +17,7 @@ import rag
 @pytest.fixture
 def tmp_setup(tmp_path, monkeypatch):
     """Aisla DB + state path + ambient/filing logs en tmp."""
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "AUTO_INDEX_STATE_PATH", tmp_path / "auto_index_state.json")
     # No queremos hooks ambient ni embeds reales en estos tests.
     monkeypatch.setattr(rag, "AMBIENT_CONFIG_PATH", tmp_path / "ambient.json")

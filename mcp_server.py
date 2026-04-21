@@ -26,7 +26,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("obsidian-rag")
 
 # Lazy-import `rag` — Claude Code spawns one MCP server per session, and
-# importing rag.py pulls in torch + sentence-transformers + chromadb (~4 GB
+# importing rag.py pulls in torch + sentence-transformers + sqlite-vec (~4 GB
 # RSS per instance). Three idle sessions = 12 GB wasted and OOM thrash when
 # command-r (19 GB) tries to load. Defer until a tool is actually called;
 # idle MCPs then stay at ~50 MB.

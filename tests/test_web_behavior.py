@@ -2,7 +2,7 @@
 
 Strategy: build a minimal FastAPI test app that mirrors the /api/behavior
 handler logic exactly, with rag symbols substituted by test stubs. This avoids
-importing the full server.py (which pulls in chromadb/ollama/sentence-trans).
+importing the full server.py (which pulls in sqlite-vec/ollama/sentence-trans).
 """
 from __future__ import annotations
 

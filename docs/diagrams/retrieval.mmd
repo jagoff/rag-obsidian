@@ -7,7 +7,7 @@ flowchart TD
     History -->|no| Expand
     Reform --> Expand["expand_queries<br/>3 paraphrases<br/>(ollama: qwen2.5:3b)"]
     Expand --> Embed["batch embed<br/>(ollama: bge-m3)"]
-    Embed --> Per["por variante:<br/>ChromaDB sem + BM25"]
+    Embed --> Per["por variante:<br/>sqlite-vec sem + BM25"]
     Per --> RRF[RRF merge + dedup]
     RRF --> Parent[expand to parent section]
     Parent --> Rerank["cross-encoder rerank<br/>bge-reranker-v2-m3<br/>MPS+fp16"]

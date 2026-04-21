@@ -46,7 +46,7 @@ Tres niveles conceptuales:
 │  ← pura función, sin side-effects de negocio    │
 ├─────────────────────────────────────────────────┤
 │  NIVEL 1: Índices                               │
-│  obsidian_notes_v7 (chunks + metadata)          │
+│  obsidian_notes_v11 (chunks + metadata)         │
 │  obsidian_urls_v1 (URL + contexto)              │
 │  title_to_paths / outlinks / backlinks          │
 │  queries.jsonl · contradictions.jsonl           │
@@ -80,7 +80,7 @@ graph TB
     end
 
     subgraph "Storage local"
-        Chroma[("ChromaDB<br/>notes_v7 + urls_v1")]
+        Vec[("sqlite-vec (ragvec.db)<br/>notes_v11 + urls_v1")]
         JSONL["jsonl logs<br/>queries + contradictions"]
         Sess["sessions/*.json"]
         Plists["launchd plists"]
@@ -104,9 +104,9 @@ graph TB
     LAUNCHD --> CLI
 
     Index --> Embed
-    Index --> Chroma
+    Index --> Vec
     Retrieve --> Embed & Helper & Chat & Reranker
-    Retrieve --> Chroma
+    Retrieve --> Vec
     Prims --> Chat & Helper
 
     Retrieve --> Sess & JSONL
@@ -125,7 +125,7 @@ graph TB
 |---|---|---|
 | `rag.py` | CLI + todas las primitivas + pipelines | Llamadas de red externas (solo localhost) |
 | `mcp_server.py` | Wrapper fino sobre las primitivas para Claude Code | Lógica nueva — delega a `rag.py` |
-| ChromaDB | Almacén vectorial persistente | Ser fuente de verdad — reconstructible del vault |
+| sqlite-vec (`ragvec.db`) | Almacén vectorial persistente | Ser fuente de verdad — reconstructible del vault |
 | Ollama | Servir embeddings + LLMs locales | Persistir estado de negocio |
 | WhatsApp listener | Adapter texto/voz → `rag` CLI vía bridge local | Mantener historial del RAG (usa `rag` para eso) |
 | launchd | Mantener `watch`/`morning`/`digest` vivos | Saber qué hace cada comando |
@@ -145,28 +145,28 @@ sequenceDiagram
     participant ISF as _index_single_file
     participant CR as find_contradictions_for_note
     participant Chat as command-r
-    participant Chroma as ChromaDB
+    participant Vec as sqlite-vec
     participant URLs as URL sub-index
     participant FM as frontmatter
     participant Log as contradictions.jsonl
 
     FS->>Watch: FileModifiedEvent
     Watch->>ISF: path
-    ISF->>Chroma: get(where={file: path})<br/>→ existing chunks + hash
+    ISF->>Vec: get(where={file: path})<br/>→ existing chunks + hash
     Note over ISF: hash diff? → si no cambió, return "skipped"
     ISF->>ISF: parse_frontmatter, clean_md, extract_wikilinks
     alt skip_contradict == False
         ISF->>CR: body, exclude={self}
-        CR->>Chroma: embed + rerank
+        CR->>Vec: embed + rerank
         CR->>Chat: JSON prompt estricto
         Chat-->>CR: contradictions: [...]
         CR->>FM: write `contradicts: [...]`
         CR->>Log: append entry
         CR-->>ISF: updated raw (si FM cambió)
     end
-    ISF->>Chroma: delete old chunks + insert new
+    ISF->>Vec: delete old chunks + insert new
     ISF->>URLs: _index_urls (extract + embed context)
-    URLs->>Chroma: upsert urls rows
+    URLs->>Vec: upsert urls rows
     ISF->>ISF: _invalidate_corpus_cache
     opt path en 00-Inbox/
         ISF->>Ambient: _ambient_hook<br/>(wikilinks auto + dupes/related ping)
@@ -184,7 +184,7 @@ sequenceDiagram
     participant Sess as session
     participant H as helper (qwen2.5:3b)
     participant R as retrieve()
-    participant Chr as ChromaDB
+    participant Vec as sqlite-vec
     participant BM25 as BM25
     participant Rer as reranker (MPS)
     participant LLM as command-r
@@ -434,7 +434,7 @@ stateDiagram-v2
 | Transición | Comando / primitiva | Escribe |
 |---|---|---|
 | `∅ → Captured` | `rag capture`, `/note`, voice + caption | `00-Inbox/YYYY-MM-DD-HHMM-*.md` |
-| `Captured → Indexed` | `_index_single_file` (via `rag watch` o `rag index`) | ChromaDB chunks + URLs |
+| `Captured → Indexed` | `_index_single_file` (via `rag watch` o `rag index`) | sqlite-vec chunks + URLs |
 | `InInbox → Triaged` | `rag inbox --apply` | Mueve archivo + frontmatter tags + wikilinks |
 | `Indexed → Flagged` | `find_contradictions_for_note` (phase 2) | `contradicts:` en frontmatter + `contradictions.jsonl` |
 | `Retrievable → Linked` | `rag wikilinks suggest --apply` | `[[wrapped]]` menciones en body |
@@ -445,12 +445,12 @@ stateDiagram-v2
 
 ## 5. State management
 
-### 5.1 ChromaDB collections
+### 5.1 sqlite-vec collections
 
 ```mermaid
 graph LR
     V[vault path] --> H["sha8 hash<br/>(solo si no-default)"]
-    H --> B1[obsidian_notes_v7<br/>main collection]
+    H --> B1[obsidian_notes_v11<br/>main collection]
     H --> B2[obsidian_urls_v1<br/>URL sub-index]
     B1 --> C1["~4608 chunks<br/>en vault actual"]
     B2 --> C2["~1887 URLs<br/>en vault actual"]
@@ -601,8 +601,8 @@ Ver §5.3 arriba. Principio: **todo lo que puede ser automático lo es**. El usu
 
 ### Concurrencia
 
-- **ChromaDB**: single-writer (no concurrent writes desde múltiples procesos al mismo DB). En la práctica: `rag watch` puede chocar con `rag index` manual. Mitigación: evitar correr `rag index` mientras `watch` está procesando un cambio. Lo deseable: poner un file lock; TODO futuro.
-- **BM25 + ChromaDB + GIL**: serializados por el GIL de Python. Paralelizar con `ThreadPoolExecutor` dio 3× MÁS LENTO en M3 Max (medido). No paralelizar.
+- **sqlite-vec**: single-writer (no concurrent writes desde múltiples procesos al mismo DB). En la práctica: `rag watch` puede chocar con `rag index` manual. Mitigación: evitar correr `rag index` mientras `watch` está procesando un cambio. Lo deseable: poner un file lock; TODO futuro.
+- **BM25 + sqlite-vec + GIL**: serializados por el GIL de Python. Paralelizar con `ThreadPoolExecutor` dio 3× MÁS LENTO en M3 Max (medido). No paralelizar.
 - **Ollama**: thread-safe del lado servidor; queremos un solo modelo en VRAM (por eso `OLLAMA_KEEP_ALIVE=-1`).
 - **Sessions**: write atómico (tmp + replace). Múltiples procesos pueden leer simultáneamente sin issue.
 
@@ -612,10 +612,10 @@ Ver §5.3 arriba. Principio: **todo lo que puede ser automático lo es**. El usu
 |---|---|---|
 | Ollama muere | `rag query` tira error de connection | `brew services start ollama` → reintentar |
 | Reranker cae a CPU | Query 3× más lenta | Verificar `get_reranker()` fuerza `device="mps"+fp16`; no removerlo |
-| ChromaDB corrupt | `col.count()` tira excepción | `rag index --reset` desde cero (~30 min) |
-| Vault desaparece (iCloud disconnect) | `rag` dice "índice vacío" aunque Chroma tiene data | Verificar `$OBSIDIAN_RAG_VAULT`; esperar que iCloud monte |
+| sqlite-vec corrupt | `col.count()` tira excepción | `rag index --reset` desde cero (~30 min) |
+| Vault desaparece (iCloud disconnect) | `rag` dice "índice vacío" aunque `ragvec.db` tiene data | Verificar `$OBSIDIAN_RAG_VAULT`; esperar que iCloud monte |
 | launchd service crashea | No auto-fire del digest/morning | `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-<name>` |
-| Chroma collection mismatch (vault movido) | Queries devuelven 0 resultados | Reindex; `_vault_slug` cambió con el path |
+| vec collection mismatch (vault movido) | Queries devuelven 0 resultados | Reindex; `_vault_slug` cambió con el path |
 | Tests fallan después de edit | `_URLS_BACKFILL_DONE` latch persistente entre tests | Fixture ya resetea; si aparece en test nuevo, monkeypatch a False |
 
 ### Data flow en fallo parcial
@@ -663,7 +663,7 @@ Patrón que emergió de las últimas 10 features:
 4. **Agregar CLI wrapper** con Click. Flags: siempre ofrecer `--plain` si hay output consumible por scripts/bots, `--dry-run` si es destructivo. `--apply` para comandos "propose y ejecuta".
 
 5. **Tests en `tests/test_<feature>.py`** usando los patrones existentes:
-   - Fixture con tmp_path vault + Chroma stub.
+   - Fixture con tmp_path vault + sqlite-vec stub.
    - Monkeypatch `rag.embed`, `rag.get_reranker`, `rag.ollama.chat` para evitar LLM real.
    - Cobertura: happy path, edge case vacío, error handling.
 
@@ -677,7 +677,7 @@ Patrón que emergió de las últimas 10 features:
 
 - ❌ Agregar un LLM call en el hot path del retrieve sin medir — termina siendo un cuello de botella.
 - ❌ Usar helper para judgment — FP rate lo hace inservible.
-- ❌ Paralelizar BM25 + ChromaDB — GIL serializa igual.
+- ❌ Paralelizar BM25 + sqlite-vec — GIL serializa igual.
 - ❌ Tocar `_invalidate_corpus_cache()` heuristics sin medir.
 - ❌ Docs que dupliquen código — apuntar a `rag.py` con línea si hace falta; dejar que el doc explique el POR QUÉ.
 - ❌ Remover `device="mps"+fp16` de `get_reranker()` — cae a CPU en uv venvs.

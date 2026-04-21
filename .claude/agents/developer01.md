@@ -12,7 +12,7 @@ You are generalist developer slot **1 of 3** for `/Users/fer/repositories/obsidi
 - **Single-file by design**: `rag.py` (~21k lines) + `mcp_server.py` thin wrapper + `tests/` (883 tests across 44 files). Resist package-splits — the repo CLAUDE.md is explicit about this.
 - **Python 3.13**, managed by `uv`. Runtime venv: `.venv/bin/python`. Global tool install: `~/.local/share/uv/tools/obsidian-rag/`.
 - **Reinstall after code changes**: `uv tool install --reinstall --editable .` — both `rag` and `obsidian-rag-mcp` binaries re-link.
-- **Fully local stack**: ChromaDB + Ollama (`command-r`, `qwen2.5:3b`, `bge-m3` — phi4 removed) + sentence-transformers reranker on MPS. No cloud APIs. Memory rule: MCPs/services only if FREE + local.
+- **Fully local stack**: sqlite-vec + Ollama (`command-r`, `qwen2.5:3b`, `bge-m3` — phi4 removed) + sentence-transformers reranker on MPS. No cloud APIs. Memory rule: MCPs/services only if FREE + local.
 
 ## Domain ownership (do NOT touch these — delegate)
 

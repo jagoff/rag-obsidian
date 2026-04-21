@@ -188,7 +188,7 @@ def test_rotation_skipped_when_flag_off(jsonl_env, monkeypatch):
     monkeypatch.setattr(rag, "_find_orphan_collections", lambda: [])
     monkeypatch.setattr(rag, "_prune_orphan_segment_dirs", lambda dry_run=False: {
         "count": 0, "bytes_freed": 0, "paths": []})
-    monkeypatch.setattr(rag, "_chroma_wal_checkpoint", lambda dry_run=False: {
+    monkeypatch.setattr(rag, "_vec_wal_checkpoint", lambda dry_run=False: {
         "ok": True, "before_bytes": 0, "after_bytes": 0})
     monkeypatch.setattr(rag, "_rebuild_feedback_golden_from_sql_feedback",
                          lambda conn: {"positives": [], "negatives": []})
@@ -390,7 +390,7 @@ def test_maintenance_summary_includes_sql_section(sql_env, monkeypatch):
     monkeypatch.setattr(rag, "_find_orphan_collections", lambda: [])
     monkeypatch.setattr(rag, "_prune_orphan_segment_dirs", lambda dry_run=False: {
         "count": 0, "bytes_freed": 0, "paths": []})
-    monkeypatch.setattr(rag, "_chroma_wal_checkpoint", lambda dry_run=False: {
+    monkeypatch.setattr(rag, "_vec_wal_checkpoint", lambda dry_run=False: {
         "ok": True, "before_bytes": 0, "after_bytes": 0})
     monkeypatch.setattr(rag, "_rebuild_feedback_golden_from_sql_feedback",
                          lambda conn: {"positives": [], "negatives": []})

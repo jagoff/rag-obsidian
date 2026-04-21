@@ -1,5 +1,5 @@
 """Tests for `rag insights` primitives: normalization, log loading, gap/hot
-detection, orphan scanning. Pure functions — no LLM, no Chroma."""
+detection, orphan scanning. Pure functions — no LLM, no sqlite-vec."""
 
 import json
 from datetime import datetime, timedelta

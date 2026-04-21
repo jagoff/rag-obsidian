@@ -68,7 +68,7 @@ def test_extract_ignores_url_inside_markdown_link():
     assert len(out) == 1
 
 
-# ── find_urls (with stubbed embed/reranker/chroma) ──────────────────────────
+# ── find_urls (with stubbed embed/reranker/vec) ──────────────────────────
 
 
 class _FakeReranker:
@@ -90,7 +90,7 @@ def fake_reranker(monkeypatch):
 
 @pytest.fixture
 def urls_col(tmp_path, fake_embed, fake_reranker, monkeypatch):
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     c = client.get_or_create_collection(
         name="urls_test", metadata={"hnsw:space": "cosine"}
     )

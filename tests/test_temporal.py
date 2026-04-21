@@ -1,7 +1,7 @@
 """Temporal retrieval — detect intent, parse --since, filter on created_ts.
 
 Clock is frozen via monkeypatch of `rag._now_dt` so range assertions are
-stable. No Chroma in these tests; we only exercise the pure-Python helpers
+stable. No sqlite-vec in these tests; we only exercise the pure-Python helpers
 and the where-clause builder.
 """
 import pytest

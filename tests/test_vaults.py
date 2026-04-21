@@ -288,7 +288,7 @@ def test_collection_name_adds_hash_for_custom_path(tmp_path):
 
 
 def test_get_db_for_returns_distinct_collections_per_vault(tmp_path, monkeypatch):
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     v1 = tmp_path / "v1"; v1.mkdir()
     v2 = tmp_path / "v2"; v2.mkdir()
     c1 = rag.get_db_for(v1)
@@ -309,7 +309,7 @@ def test_get_db_for_returns_distinct_collections_per_vault(tmp_path, monkeypatch
 @pytest.fixture
 def two_vaults(tmp_path, monkeypatch):
     """Dos tmp vaults con contenidos distintos, cada uno con su colección."""
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "embed", lambda ts: [[1.0, 0.0, 0.0, 0.0] for _ in ts])
     # Forzamos nombres de colección reproducibles.
     v1 = tmp_path / "v1"; v1.mkdir()

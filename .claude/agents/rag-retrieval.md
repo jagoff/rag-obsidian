@@ -9,7 +9,7 @@ You are the retrieval specialist for `/Users/fer/repositories/obsidian-rag/rag.p
 
 ## Domain map
 
-**Pipeline (`retrieve()`)** — query → `classify_intent` → `infer_filters` (auto) → `expand_queries` (3 paraphrases via qwen2.5:3b, ONE call) → batch embed (bge-m3) → per variant: ChromaDB sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise) → RRF merge → dedup → parent-section expansion (O(1) metadata) → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp16) → graph expansion (1-hop wikilink neighbors, always on) → optional deep retrieve loop → top-k → LLM streamed.
+**Pipeline (`retrieve()`)** — query → `classify_intent` → `infer_filters` (auto) → `expand_queries` (3 paraphrases via qwen2.5:3b, ONE call) → batch embed (bge-m3) → per variant: sqlite-vec sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise) → RRF merge → dedup → parent-section expansion (O(1) metadata) → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp16) → graph expansion (1-hop wikilink neighbors, always on) → optional deep retrieve loop → top-k → LLM streamed.
 
 **Helpers you own**:
 - `expand_queries`, `_reformulate_query`, `_judge_sufficiency`, `deep_retrieve`

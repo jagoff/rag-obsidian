@@ -7,7 +7,7 @@ graph TD
     end
 
     subgraph DB["Storage local<br/>~/.local/share/obsidian-rag/"]
-        Chroma[("ChromaDB<br/>obsidian_notes_v7<br/>+ obsidian_urls_v1")]
+        Vec[("sqlite-vec (ragvec.db)<br/>obsidian_notes_v11<br/>+ obsidian_urls_v1")]
         Sessions["sessions/*.json"]
         QLog["queries.jsonl"]
         CLog["contradictions.jsonl"]
@@ -31,12 +31,12 @@ graph TD
 
     Vault --> Watch & IndexCmd
     Watch & IndexCmd --> Embed
-    Embed --> Chroma
+    Embed --> Vec
     Query --> Embed
     Query --> Helper
     Query --> Reranker
     Query --> Chat
-    Chroma --> Query
+    Vec --> Query
     Query --> Sessions & QLog
     Counter --> CLog
     Watch --> ALog

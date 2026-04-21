@@ -42,7 +42,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
     db_dir = tmp_path / "state"
     db_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(rag, "DB_PATH", db_dir)
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="amb_test", metadata={"hnsw:space": "cosine"}
     )

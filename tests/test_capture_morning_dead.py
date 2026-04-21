@@ -31,7 +31,7 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
     (vault / "00-Inbox").mkdir(parents=True)
     (vault / "05-Reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="cmd_test", metadata={"hnsw:space": "cosine"}
     )

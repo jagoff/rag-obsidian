@@ -32,7 +32,7 @@ def tmp_vault(tmp_path, monkeypatch):
         return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
     monkeypatch.setattr(rag, "embed", fake_embed)
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="filing_test", metadata={"hnsw:space": "cosine"}
     )

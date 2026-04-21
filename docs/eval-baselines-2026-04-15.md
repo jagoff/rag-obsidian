@@ -11,7 +11,7 @@ pueda medirse contra estos números.
 - **Modelos**: `bge-m3` (embed), `BAAI/bge-reranker-v2-m3` (cross-encoder, MPS+fp16),
   `qwen2.5:3b` (helper para reformulate), `command-r:latest` (chat — no se usa
   acá porque eval es retrieval-only).
-- **Index**: colección `obsidian_notes_v7` (vault personal del user; size != CI).
+- **Index**: colección `obsidian_notes_v7` (vigente al 2026-04-15; hoy está en `obsidian_notes_v11`). Vault personal del user; size != CI.
 
 ## Singles
 

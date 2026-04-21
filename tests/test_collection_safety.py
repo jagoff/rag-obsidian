@@ -45,7 +45,7 @@ def test_find_orphan_never_orphans_base_collections(tmp_path, monkeypatch):
     fake_client = MagicMock()
     fake_client.list_collections.return_value = all_cols
 
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     # Redirect ops log so we don't touch the real one.
     monkeypatch.setattr(rag, "COLLECTION_OPS_LOG", tmp_path / "ops.log")
 
@@ -80,7 +80,7 @@ def test_find_orphan_protects_base_when_collection_name_is_suffixed(tmp_path, mo
 
     monkeypatch.setattr(rag, "COLLECTION_NAME", suffixed_name)
     monkeypatch.setattr(rag, "URLS_COLLECTION_NAME", suffixed_urls)
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "COLLECTION_OPS_LOG", tmp_path / "ops.log")
 
     with patch("rag.SqliteVecClient", return_value=fake_client):
@@ -133,8 +133,8 @@ def test_sentinel_invalidates_db_singleton(tmp_path, monkeypatch):
 
     sentinel_path = tmp_path / "sentinel"
     monkeypatch.setattr(rag, "COLLECTION_RESET_SENTINEL", sentinel_path)
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "chroma")
-    (tmp_path / "chroma").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
+    (tmp_path / "ragvec").mkdir(parents=True, exist_ok=True)
 
     # Reset module-level singleton so the test is isolated.
     monkeypatch.setattr(rag, "_db_singleton", None)

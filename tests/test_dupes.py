@@ -16,7 +16,7 @@ def vault_with_dupes(tmp_path, monkeypatch):
     (vault / "c.md").write_text("contenido completamente distinto.")
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="dupes_test", metadata={"hnsw:space": "cosine"}
     )

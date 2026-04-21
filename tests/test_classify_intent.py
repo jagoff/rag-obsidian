@@ -55,7 +55,7 @@ def test_recent_intent(q):
     "diferencias entre qwen y command-r",
     "compará bge-m3 con nomic-embed",
     "comparar claude y gpt-4",
-    "comparame sqlite-vec vs chroma",
+    "comparame sqlite-vec vs qdrant",
     "qwen3 vs qwen2.5",
     "qwen3 versus qwen2.5",
     "compare LoRA and QLoRA",

@@ -53,7 +53,7 @@ def scripted_ollama(monkeypatch):
 
 @pytest.fixture
 def col(tmp_path, fake_embed, fake_reranker):
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     c = client.get_or_create_collection(
         name="contradict_test", metadata={"hnsw:space": "cosine"}
     )

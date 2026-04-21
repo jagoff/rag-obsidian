@@ -267,7 +267,7 @@ def test_retrieve_applies_positive_boost(tmp_path, fb_tmp, fake_embed, monkeypat
     """
     from rag import SqliteVecClient as _TestVecClient
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="feedback_test", metadata={"hnsw:space": "cosine"}
     )
@@ -319,7 +319,7 @@ def test_retrieve_applies_negative_penalty(tmp_path, fb_tmp, fake_embed, monkeyp
     """
     from rag import SqliteVecClient as _TestVecClient
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="feedback_penalty_test", metadata={"hnsw:space": "cosine"}
     )
@@ -362,7 +362,7 @@ def test_retrieve_boost_path_not_in_pool_gets_injected(tmp_path, fb_tmp, fake_em
     """Si un path 👍 no fue recuperado por semantic+BM25, debe inyectarse al pool."""
     from rag import SqliteVecClient as _TestVecClient
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="feedback_inject_test", metadata={"hnsw:space": "cosine"}
     )
@@ -391,7 +391,7 @@ def test_retrieve_boost_path_not_in_pool_gets_injected(tmp_path, fb_tmp, fake_em
     monkeypatch.setattr(rag, "expand_to_parent", lambda d, m: d)
     monkeypatch.setattr(rag, "has_recency_cue", lambda q: False)
     monkeypatch.setattr(rag, "expand_queries", lambda q: [q])
-    # Forzamos RETRIEVE_K=1 para que ChromaDB semántico SOLO traiga relevant.md.
+    # Forzamos RETRIEVE_K=1 para que sqlite-vec semántico SOLO traiga relevant.md.
     monkeypatch.setattr(rag, "RETRIEVE_K", 1)
 
     rag.record_feedback("t1", 1, "busco algo", ["hidden.md"])

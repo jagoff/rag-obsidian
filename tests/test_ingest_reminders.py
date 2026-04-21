@@ -35,7 +35,7 @@ def tmp_vault_col(tmp_path, monkeypatch):
     conn.close()
 
     from rag import SqliteVecClient as _C
-    client = _C(path=str(tmp_path / "chroma"))
+    client = _C(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="rem_test", metadata={"hnsw:space": "cosine"}
     )

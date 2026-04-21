@@ -2,7 +2,7 @@
 #
 # Each case fakes a (question, answer, chunks) input and declares which chunk
 # paths SHOULD be flagged as contradictions. The evaluator builds a one-shot
-# in-memory ChromaDB from `chunks`, calls find_contradictions, and reports
+# in-memory sqlite-vec collection from `chunks`, calls find_contradictions, and reports
 # precision/recall against `expected`.
 #
 # Case shape:

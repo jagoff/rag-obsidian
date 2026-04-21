@@ -1,7 +1,7 @@
 """Tests para el ranker auto-tuning — RankerWeights, feature extraction,
 apply_weighted_scores, feedback augmentation, y el sweep del `rag tune`.
 
-Lo que NO cubrimos acá: `collect_ranker_features` end-to-end (requiere ChromaDB
+Lo que NO cubrimos acá: `collect_ranker_features` end-to-end (requiere sqlite-vec
 poblada + reranker real; test de integración aparte). Cubrimos la función pura
 de scoring (`apply_weighted_scores`), la mecánica de sampling/refinement,
 y el parsing de feedback.jsonl.

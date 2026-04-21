@@ -55,7 +55,7 @@ def synthetic_col(monkeypatch, tmp_path):
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
 
     from rag import SqliteVecClient as _C
-    client = _C(path=str(tmp_path / "chroma"))
+    client = _C(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="synth_retrieve_test", metadata={"hnsw:space": "cosine"}
     )

@@ -17,7 +17,7 @@ def fake_embed(monkeypatch):
 
 @pytest.fixture
 def tmp_urls_col(tmp_path, monkeypatch, fake_embed):
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="urls_test", metadata={"hnsw:space": "cosine"}
     )

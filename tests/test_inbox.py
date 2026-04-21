@@ -33,7 +33,7 @@ def vault_with_corpus(tmp_path, monkeypatch, fake_embed):
     (vault / "02-Areas/Música").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 
-    client = _TestVecClient(path=str(tmp_path / "chroma"))
+    client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="inbox_test", metadata={"hnsw:space": "cosine"}
     )

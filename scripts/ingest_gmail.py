@@ -562,7 +562,7 @@ def run(
     email, profile_hid = get_profile(service)
     account_id = email or "unknown@gmail"
 
-    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec" / "ragvec.db"))
+    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
     _ensure_state_table(state_conn)
     if reset:
         _reset_cursor(state_conn)

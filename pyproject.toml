@@ -44,6 +44,7 @@ obsidian-rag-mcp = "mcp_server:main"
 
 [tool.setuptools]
 py-modules = ["rag", "mcp_server"]
+packages = ["scripts", "web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

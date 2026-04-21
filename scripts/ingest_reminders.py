@@ -229,9 +229,16 @@ def _parse_reminder_line(line: str) -> Reminder | None:
     )
 
 
-def _default_fetch(timeout: float = 60.0) -> list[Reminder]:
+def _default_fetch(timeout: float = 180.0) -> list[Reminder]:
     """Default fetcher — real AppleScript. Silently returns [] when Apple
-    integrations are disabled or the script fails."""
+    integrations are disabled or the script fails.
+
+    Timeout default 180s: el AppleScript itera todas las reminders de todas
+    las listas (36 en el host de test = 98s medidos el 2026-04-21). Setting
+    muy bajo causaba un `0 fetched` silencioso en hosts con muchas listas.
+    Subsecuente runs incrementales son rapidísimos (solo nuevas/cambiadas)
+    pero el primer full-scan puede tardar minutos.
+    """
     if not rag._apple_enabled():
         return []
     out = rag._osascript(_REMINDERS_ALL_SCRIPT, timeout=timeout)
@@ -451,7 +458,10 @@ def run(
 
     col = vault_col if vault_col is not None else rag.get_db()
 
-    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec" / "ragvec.db"))
+    # rag.DB_PATH already points at `.../ragvec/` — do NOT append an extra
+    # `ragvec/` segment (that produced `.../ragvec/ragvec/ragvec.db` and an
+    # "unable to open database file" on a clean host).
+    state_conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
     _ensure_state_table(state_conn)
     if reset:
         _reset_state(state_conn)

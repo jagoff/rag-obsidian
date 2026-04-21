@@ -522,6 +522,31 @@ def run(
             })
             continue
         promoted_path = promote(vault, target_folder, cluster, title, body)
+        # Pre-check before archiving originals: if the synthesized note
+        # didn't land on disk with non-trivial content, we'd end up with
+        # orphan originals moved to 04-Archive/ and no consolidated note
+        # to cite them. Bail out — the cluster gets retried next run.
+        # `promote()` writes via os.replace so we never see a half-written
+        # tmp file, but the file could still be missing if the fs ran out
+        # of space or the path was unwritable. Threshold 200 bytes is
+        # below the smallest plausible consolidated note (frontmatter +
+        # 1-line body) so it only fires on truly empty writes.
+        try:
+            promoted_ok = (
+                promoted_path.is_file()
+                and promoted_path.stat().st_size > 200
+            )
+        except OSError:
+            promoted_ok = False
+        if not promoted_ok:
+            summary["clusters"].append({
+                "size": len(cluster), "target": target_folder,
+                "title": title, "error": "promoted_note_missing_or_empty",
+                "promoted_path": str(promoted_path.relative_to(vault))
+                if promoted_path.is_file() else None,
+                "paths": [c.rel_path for c in cluster],
+            })
+            continue
         archived_paths = archive_originals(vault, cluster)
         summary["n_promoted"] += 1
         summary["n_archived"] += len(archived_paths)

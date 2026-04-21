@@ -421,6 +421,80 @@ def test_run_empty_inbox_is_noop(tmp_vault: Path, monkeypatch):
     assert summary["n_promoted"] == 0
 
 
+def test_run_bails_when_promoted_note_missing(tmp_vault: Path, monkeypatch):
+    """Pre-check safety: if `promote()` returns but the file didn't land
+    (or landed empty), originals must NOT be moved to 04-Archive/. They
+    stay in 00-Inbox/ so the next run can retry. Without this guard we'd
+    end up with orphan archives and no consolidated note to cite them."""
+    for i in range(3):
+        _seed_conversation(
+            tmp_vault, session_id=f"web:x-{i}",
+            question=f"tema repetido {i}",
+            answer="misma respuesta.",
+        )
+
+    def _fake_embed(texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    # Fake promote: returns a path but doesn't write the file (simulates
+    # fs full or permissions failure mid-write).
+    def _fake_promote(vault_root, target_folder, cluster, title, body):
+        return vault_root / target_folder / "ghost.md"
+
+    monkeypatch.setattr(rag, "embed", _fake_embed)
+    monkeypatch.setattr(cc, "synthesize_cluster",
+                        lambda cluster, model=None: ("T", "B"))
+    monkeypatch.setattr(cc, "promote", _fake_promote)
+    monkeypatch.setattr(cc, "CONSOLIDATION_LOG", tmp_vault / "consolidation.log")
+
+    summary = cc.run(vault_root=tmp_vault, window_days=14, dry_run=False)
+    assert summary["n_clusters"] == 1
+    # The pre-check fires — no promotion, no archive.
+    assert summary["n_promoted"] == 0
+    assert summary["n_archived"] == 0
+    # Originals untouched in 00-Inbox (the key invariant).
+    remaining = list((tmp_vault / "00-Inbox" / "conversations").glob("*.md"))
+    assert len(remaining) == 3
+    # Error is reported for observability.
+    assert any(
+        c.get("error") == "promoted_note_missing_or_empty"
+        for c in summary["clusters"]
+    )
+
+
+def test_run_bails_when_promoted_note_is_empty(tmp_vault: Path, monkeypatch):
+    """Same guard but for the case where the file exists but the write
+    was truncated (tmp→replace gone wrong or zero-byte body)."""
+    for i in range(3):
+        _seed_conversation(
+            tmp_vault, session_id=f"web:x-{i}",
+            question=f"tema repetido {i}",
+            answer="misma respuesta.",
+        )
+
+    def _fake_embed(texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    def _fake_promote_empty(vault_root, target_folder, cluster, title, body):
+        target_dir = vault_root / target_folder
+        target_dir.mkdir(parents=True, exist_ok=True)
+        p = target_dir / "tiny.md"
+        p.write_text("x\n", encoding="utf-8")  # 2 bytes, below 200 threshold
+        return p
+
+    monkeypatch.setattr(rag, "embed", _fake_embed)
+    monkeypatch.setattr(cc, "synthesize_cluster",
+                        lambda cluster, model=None: ("T", "B"))
+    monkeypatch.setattr(cc, "promote", _fake_promote_empty)
+    monkeypatch.setattr(cc, "CONSOLIDATION_LOG", tmp_vault / "consolidation.log")
+
+    summary = cc.run(vault_root=tmp_vault, window_days=14, dry_run=False)
+    assert summary["n_promoted"] == 0
+    assert summary["n_archived"] == 0
+    remaining = list((tmp_vault / "00-Inbox" / "conversations").glob("*.md"))
+    assert len(remaining) == 3
+
+
 # ── launchd wiring ────────────────────────────────────────────────────────
 
 def test_consolidate_plist_renders_valid_schedule():

@@ -397,3 +397,111 @@ def test_cli_index_source_whatsapp_dry_run(monkeypatch):
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
     assert "[dry-run]" in result.output
+
+
+# ── _speaker_label: resolver wiring con phone index ──────────────────────
+
+def _mk_speaker_msg(*, sender: str = "", chat_name: str = "", is_from_me: bool = False,
+                    content: str = "hola",
+                    chat_jid: str = "5491112345678@s.whatsapp.net") -> iw.WAMessage:
+    """Minimal WAMessage for _speaker_label tests.
+
+    Kept separate from the positional `_mk_msg` higher up in the file
+    (which uses `(mid, jid, sender, content, ts, from_me=...)` shape); this
+    keyword-only variant keeps the speaker-label tests self-documenting
+    without breaking the chunker test suite.
+    """
+    return iw.WAMessage(
+        id="msg1", chat_jid=chat_jid, chat_name=chat_name,
+        sender=sender, content=content, timestamp=1700000000.0,
+        is_from_me=is_from_me, media_type=None,
+    )
+
+
+def test_speaker_label_from_me_always_yo() -> None:
+    """is_from_me dominates — sender/chat_name ignored."""
+    m = _mk_speaker_msg(is_from_me=True, sender="whatever@s.whatsapp.net",
+                        chat_name="Family")
+    assert iw._speaker_label(m) == "yo"
+
+
+def test_speaker_label_resolves_dossier_name(tmp_path, monkeypatch) -> None:
+    """JID con phone registrado en 99-Mentions/X.md → nombre del dossier."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Maria.md").write_text(
+        "- **Teléfono**: +54 9 342 430 3891\n", encoding="utf-8",
+    )
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+
+    m = _mk_speaker_msg(sender="5493424303891@s.whatsapp.net", chat_name="Maria chat")
+    assert iw._speaker_label(m) == "Maria"
+
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+
+
+def test_speaker_label_masks_unmapped_phone(tmp_path, monkeypatch) -> None:
+    """JID sin dossier match → last-4 masked ('…3891'), NOT full JID."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)  # empty folder, no dossiers
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+
+    m = _mk_speaker_msg(sender="5493424303891@s.whatsapp.net", chat_name="desconocido")
+    label = iw._speaker_label(m)
+    assert label.startswith("…"), f"expected masked, got {label!r}"
+    assert "3891" in label
+    # Must NOT leak the full phone number
+    assert "5493424303891" not in label
+
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+
+
+def test_speaker_label_empty_sender_falls_back_to_chat_name(tmp_path, monkeypatch) -> None:
+    """sender='' + chat_name='Juan' → 'Juan' (1-on-1 chat sin JID sender)."""
+    (tmp_path / "04-Archive/99-obsidian-system/99-Mentions").mkdir(parents=True)
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+
+    m = _mk_speaker_msg(sender="", chat_name="Juan")
+    assert iw._speaker_label(m) == "Juan"
+
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+
+
+def test_speaker_label_invariant_in_chunk_body(tmp_path, monkeypatch) -> None:
+    """Chunks generados via chunk_conversation usan el speaker resolved.
+    Full flow: dossier con phone → chunk body empieza con 'Maria:' en lugar
+    del JID numérico."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Maria.md").write_text(
+        "- **Teléfono**: +54 9 342 430 3891\n", encoding="utf-8",
+    )
+    rag._phone_index_cache = None
+    rag._mentions_cache = None
+    monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+
+    msgs = [
+        _mk_speaker_msg(sender="5493424303891@s.whatsapp.net", chat_name="Maria",
+                content="hola"),
+        _mk_speaker_msg(sender="5493424303891@s.whatsapp.net", chat_name="Maria",
+                content="como estas"),
+    ]
+    # Same sender, back-to-back → one group.
+    groups = iw.chunk_conversation(msgs, same_speaker_window_s=300.0,
+                                    min_merge_chars=0, max_chars=1000)
+    assert len(groups) == 1
+    rendered = iw._render_window(groups[0])
+    assert "Maria:" in rendered
+    assert "5493424303891" not in rendered
+
+    rag._phone_index_cache = None
+    rag._mentions_cache = None

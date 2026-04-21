@@ -232,13 +232,16 @@ def read_messages(
 def _speaker_label(msg: WAMessage) -> str:
     if msg.is_from_me:
         return "yo"
-    # Prefer the sender short name if available; fall back to chat_name
-    # (common for 1-on-1 where sender == chat_jid).
-    s = msg.sender or msg.chat_name
-    # JID-form (digits@s.whatsapp.net) → strip the suffix for readability.
-    if "@" in s:
-        s = s.split("@", 1)[0]
-    return s or "desconocido"
+    # Resolve JID → nombre legible via phone index de dossiers (99 Mentions).
+    # Fallback cascade dentro de `rag._resolve_sender_to_name`:
+    #   1. dossier match por phone digits  → "Maria" / "Grecia"
+    #   2. last-4 masked                   → "…3891"  (evita filtrar PII)
+    #   3. local-part del JID sin digits   → name literal
+    #   4. empty sender                    → `fallback` (chat_name)
+    #   5. all empty                       → "?"
+    # Pasamos `chat_name` como fallback para 1-on-1 chats donde el sender
+    # puede venir vacío y `chats.name` ya tiene el nombre de la persona.
+    return rag._resolve_sender_to_name(msg.sender, fallback=msg.chat_name or "")
 
 
 def _render_window(messages: list[WAMessage]) -> str:

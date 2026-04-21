@@ -197,3 +197,101 @@ def test_match_query_respects_cap(
 ])
 def test_normalise_phone_digits(raw, expected: str) -> None:
     assert rag._normalise_phone_digits(raw) == expected
+
+
+# ── Centralized parsers (_parse_dossier_phones / _parse_dossier_emails) ────
+
+def test_parse_dossier_phones_all_labels() -> None:
+    """Todos los labels sinónimos de "phone" matchean el mismo regex
+    ahora — antes, `- Cel: ...` entraba al mentions index pero NO al
+    phone index."""
+    body = (
+        "- **Teléfono**: +54 9 1111 2222\n"
+        "- **Tel**: +54 9 3333 4444\n"
+        "- **Cel**: +54 9 5555 6666\n"
+        "- **Celular**: +54 9 7777 8888\n"
+        "- **Phone**: +1 555 999 0000\n"
+        "- **Móvil**: +54 9 0000 1111\n"
+        "- **Mobile**: +1 000 222 3333\n"
+        "- **WhatsApp**: +54 9 2222 3333\n"
+        "- **WA**: +54 9 4444 5555\n"
+    )
+    phones = rag._parse_dossier_phones(body)
+    assert len(phones) == 9, f"expected 9 phones, got {len(phones)}: {phones}"
+    # Each entry is digit-only
+    assert all(p.isdigit() for p in phones)
+
+
+def test_parse_dossier_phones_dedup() -> None:
+    """Same phone listed under two labels returns once."""
+    body = (
+        "- **Teléfono**: +54 9 1111 2222\n"
+        "- **Cel**: +549 1111 2222\n"  # same number, different formatting
+    )
+    phones = rag._parse_dossier_phones(body)
+    assert len(phones) == 1
+    assert phones[0] == "5491111222"[:-1] + "2222"[-4:] or phones[0] == "549" + "1111" + "2222"
+    # More flexible: same digit-normalized form
+    assert rag._normalise_phone_digits("+54 9 1111 2222") == phones[0]
+
+
+def test_parse_dossier_phones_short_drop() -> None:
+    """<8 digits gets filtered — floor for placeholder guards."""
+    body = "- **Teléfono**: 123-4567\n"  # 7 digits
+    assert rag._parse_dossier_phones(body) == []
+
+
+def test_parse_dossier_phones_case_insensitive() -> None:
+    body = "- **TELEFONO**: +54 9 1111 2222\n"
+    assert rag._parse_dossier_phones(body) == [rag._normalise_phone_digits("+54 9 1111 2222")]
+
+
+def test_parse_dossier_phones_bullet_variants() -> None:
+    """`-` y `*` bullets ambos aceptados."""
+    body = (
+        "- **Teléfono**: +54 9 1111 2222\n"
+        "* **Cel**: +54 9 3333 4444\n"
+    )
+    assert len(rag._parse_dossier_phones(body)) == 2
+
+
+def test_parse_dossier_phones_bold_optional() -> None:
+    """Bold `**` labels son opcionales."""
+    body = (
+        "- Teléfono: +54 9 1111 2222\n"
+        "- **Cel**: +54 9 3333 4444\n"
+    )
+    assert len(rag._parse_dossier_phones(body)) == 2
+
+
+def test_parse_dossier_phones_empty_body() -> None:
+    assert rag._parse_dossier_phones("") == []
+    assert rag._parse_dossier_phones(None) == []  # type: ignore[arg-type]
+
+
+def test_parse_dossier_emails_all_labels() -> None:
+    body = (
+        "- **Email**: a@ex.com\n"
+        "- **E-Mail**: b@ex.com\n"
+        "- **Correo**: c@ex.com\n"
+    )
+    emails = rag._parse_dossier_emails(body)
+    assert emails == ["a@ex.com", "b@ex.com", "c@ex.com"]
+
+
+def test_parse_dossier_emails_lowercased() -> None:
+    body = "- **Email**: MiXeD@EXAMPLE.COM\n"
+    assert rag._parse_dossier_emails(body) == ["mixed@example.com"]
+
+
+def test_parse_dossier_emails_dedup() -> None:
+    body = (
+        "- **Email**: same@ex.com\n"
+        "- **Correo**: SAME@ex.com\n"
+    )
+    assert rag._parse_dossier_emails(body) == ["same@ex.com"]
+
+
+def test_parse_dossier_emails_empty_body() -> None:
+    assert rag._parse_dossier_emails("") == []
+    assert rag._parse_dossier_emails(None) == []  # type: ignore[arg-type]

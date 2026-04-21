@@ -7438,17 +7438,36 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-# Dossier body parsing: bullet-line pattern `- **Email**: X` / `- **Teléfono**: Y`.
-# Alt forms accepted: `- Email:`, `* Email:`, leading whitespace. Case-insensitive.
-# Phones are digit-normalised (stripped of `+`, spaces, dashes, parens) and
-# indexed under the last 8+ digits (last-8 matches AR local numbers where the
-# country code is sometimes present, sometimes not). Emails are lower-cased.
+# Dossier body parsing — centralizado. Antes de 2026-04-21 habían TRES
+# regexes divergentes para parsear el bullet `- **Teléfono**: ...`:
+#   1. `_MENTIONS_PHONE_RE` (label amplio: tel|phone|cel|whatsapp|wa...)
+#   2. `_parse_mention_dossier` (label estrecho: solo "Teléfono")
+#   3. `_MENTIONS_EMAIL_RE` (análogo para email)
+# Los 2 phone regexes daban resultados distintos: un dossier con `- Cel: X`
+# entraba al `_load_mentions_index` pero NO al `_load_phone_index`, dejando
+# el WA-sender resolver ciego a ese contacto. Consolidado acá en 2 helpers
+# pequeños que cada caller usa — si querés agregar un label nuevo, tocás
+# una constante y los 2 índices se sincronizan.
+#
+# Alt forms aceptadas: `- Email:`, `* Email:`, `- **Email**:`, leading
+# whitespace. Case-insensitive. Phones digit-normalised (strip `+`, spaces,
+# dashes, parens). Emails lower-cased.
+
+# Etiquetas de phone en dossiers — sincronizado con lo que soporta
+# `_parse_dossier_phones`.
+_DOSSIER_PHONE_LABELS = (
+    "tel[eé]fono|tel[eé]f|tel|phone|celular|cel|m[oó]vil|mobile|whatsapp|wa"
+)
+_DOSSIER_EMAIL_LABELS = "e-?mail|email|correo"
+
+# Un regex por concepto. `^` + MULTILINE para anclar a línea individual;
+# label case-insensitive; opcional bold `**...**`.
 _MENTIONS_EMAIL_RE = re.compile(
-    r"^\s*[-*]\s*\*{0,2}(?:e-?mail|email|correo)\*{0,2}\s*:\s*([^\s<>]+@[^\s<>]+)\s*$",
+    rf"^\s*[-*]\s*\*{{0,2}}(?:{_DOSSIER_EMAIL_LABELS})\*{{0,2}}\s*:\s*([^\s<>]+@[^\s<>]+)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _MENTIONS_PHONE_RE = re.compile(
-    r"^\s*[-*]\s*\*{0,2}(?:tel[eé]fono|tel[eé]f|tel|phone|celular|cel|whatsapp|wa)\*{0,2}"
+    rf"^\s*[-*]\s*\*{{0,2}}(?:{_DOSSIER_PHONE_LABELS})\*{{0,2}}"
     r"\s*:\s*(\+?[\d\s().\-]{7,})\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -7459,6 +7478,42 @@ def _normalise_phone_digits(raw: str) -> str:
     remaining digit count is < 8 (too short to be a real phone; drop)."""
     digits = re.sub(r"\D", "", raw or "")
     return digits if len(digits) >= 8 else ""
+
+
+def _parse_dossier_phones(body: str) -> list[str]:
+    """Return all phone numbers in a dossier body as digits-only strings.
+
+    Canonical parser for the `- **Teléfono**: …` / `- Cel: …` / `- WA: …`
+    bullets. Reused by `_load_mentions_index` (outbound: query → dossier),
+    `_load_phone_index` (inbound: WA sender → dossier), and
+    `_parse_mention_dossier` (dossier metadata extraction).
+
+    Filters entries whose digit-normalized form is < 8 digits (too short
+    to be a real phone). Preserves order of occurrence. Deduplicates —
+    the same phone listed twice returns once.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _MENTIONS_PHONE_RE.finditer(body or ""):
+        digits = _normalise_phone_digits(m.group(1))
+        if digits and digits not in seen:
+            seen.add(digits)
+            out.append(digits)
+    return out
+
+
+def _parse_dossier_emails(body: str) -> list[str]:
+    """Return all email addresses in a dossier body as lowercased strings.
+    Same unification rationale as `_parse_dossier_phones` — one place to
+    fix the regex or add labels."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _MENTIONS_EMAIL_RE.finditer(body or ""):
+        email = (m.group(1) or "").strip().lower()
+        if email and "@" in email and email not in seen:
+            seen.add(email)
+            out.append(email)
+    return out
 
 
 def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
@@ -7528,19 +7583,17 @@ def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
                         elif line and not line.startswith(" "):
                             in_aliases = False
         # Body-level email + phone enrichment — index the dossier by its
-        # contact info so queries with email/phone can resolve to it.
-        for m in _MENTIONS_EMAIL_RE.finditer(txt):
-            email = m.group(1).strip().lower()
-            if email and "@" in email:
-                idx[_fold(email)] = rel
-        for m in _MENTIONS_PHONE_RE.finditer(txt):
-            digits = _normalise_phone_digits(m.group(1))
-            if digits:
-                # Index full digits AND last-8 (AR "9" prefix variance:
-                # "+5493425476623" vs "3425476623" both resolve).
-                idx[digits] = rel
-                if len(digits) > 8:
-                    idx[digits[-8:]] = rel
+        # contact info so queries with email/phone can resolve to it. Both
+        # come from the centralized parsers `_parse_dossier_emails/phones`
+        # so this index + `_load_phone_index` stay in sync on label support.
+        for email in _parse_dossier_emails(txt):
+            idx[_fold(email)] = rel
+        for digits in _parse_dossier_phones(txt):
+            # Index full digits AND last-8 (AR "9" prefix variance:
+            # "+5493425476623" vs "3425476623" both resolve).
+            idx[digits] = rel
+            if len(digits) > 8:
+                idx[digits[-8:]] = rel
     with _mentions_cache_lock:
         _mentions_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
     return idx
@@ -23404,17 +23457,15 @@ def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dic
         txt = p.read_text(encoding="utf-8")
     except Exception:
         return out
-    # Body fallback for the phone: the `- **Teléfono**: …` line lives
-    # outside frontmatter, so parse it separately from the aliases block.
-    phone_match = re.search(
-        r"Tel[eé]fono\s*\**\s*:\s*([^\n]+)", txt, re.IGNORECASE,
-    )
-    if phone_match:
-        raw_phone = phone_match.group(1).strip()
-        # Skip obvious placeholders like "+54 9 ...".
-        digits = "".join(c for c in raw_phone if c.isdigit())
-        if len(digits) >= 10:
-            out["phone_digits"] = digits
+    # Phone via centralized parser — matches the full label set (tel|phone|
+    # cel|whatsapp|wa|…), not just "Teléfono". Before 2026-04-21 this regex
+    # was narrower than `_MENTIONS_PHONE_RE` en el mentions index, dejando
+    # a contactos con `- Cel: +54...` fuera del phone_digits. Mantengo el
+    # floor original de 10 dígitos (el dossier_phones helper usa 8; 10 es
+    # más estricto para evitar que placeholders tipo "+54 9 ..." entren).
+    phones = [d for d in _parse_dossier_phones(txt) if len(d) >= 10]
+    if phones:
+        out["phone_digits"] = phones[0]
     if not txt.startswith("---\n"):
         return out
     end = txt.find("\n---", 4)

@@ -25,6 +25,12 @@ dependencies = [
     "google-auth-oauthlib>=1.2",
     "youtube-transcript-api>=1.0",
     "dateparser>=1.2",
+    # OCR on embedded images during indexing (rag.py:_ocr_image). Uses Apple
+    # Vision via pyobjc — macOS-only. On non-macOS hosts the import fails
+    # and the indexer silent-skips OCR. Enables queries like "en qué cycle
+    # estamos" to hit notes whose informative content sits in a screenshot
+    # rather than the markdown body. Toggle OFF with `RAG_OCR=0`.
+    "ocrmac>=1.0",
 ]
 
 [project.optional-dependencies]

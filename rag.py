@@ -3556,6 +3556,22 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_system_memory_metrics_ts ON system_memory_metrics(ts)",
         ),
     ),
+    (
+        # OCR cache — texto extraído por Apple Vision de imágenes embebidas
+        # en las notas. Clave primaria = path absoluto de la imagen; mtime
+        # es el invalidador (si la imagen se updatea, el hash_with_images
+        # del chunk tambien cambia y el indexer re-OCRea). Sin TTL — el
+        # texto no envejece, solo cambia cuando la imagen cambia.
+        "rag_ocr_cache",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_ocr_cache ("
+            " image_path TEXT PRIMARY KEY,"
+            " mtime REAL NOT NULL,"
+            " text TEXT NOT NULL,"
+            " ocr_at REAL NOT NULL"
+            ")",
+        ),
+    ),
 )
 
 
@@ -7338,6 +7354,14 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 _local_embedder = None
 _local_embedder_lock = threading.Lock()
+# Fires when `_get_local_embedder` finishes loading bge-m3 AND the first
+# encode has succeeded (via `_warmup_local_embedder` or an inline call).
+# `query_embed_local` checks this before entering the lock so a one-shot
+# CLI query that races the background warmup doesn't block the main
+# thread for 5-12s — it returns None and the caller falls back to ollama
+# embed (~150ms consistent). Once the Event is set, subsequent calls in
+# the same process take the fast in-process path.
+_local_embedder_ready = threading.Event()
 
 
 def _local_embed_enabled() -> bool:
@@ -7433,12 +7457,30 @@ def query_embed_local(texts: list[str]) -> list[list[float]] | None:
     """Embed `texts` in-process via BAAI/bge-m3 SentenceTransformer.
 
     Returns a list of 1024-dim float vectors, or None if the in-process model
-    is unavailable (caller should fall back to `embed()`).
+    is unavailable OR still cold-loading (caller should fall back to
+    `embed()`).
 
-    Only intended for the *web chat query* path (1-3 short strings per call).
-    Do NOT use from indexing/watch/ingest — those paths should stay on ollama.
+    Non-blocking design: if `_local_embedder_ready` is not yet set, return
+    None immediately instead of blocking on `_get_local_embedder()`'s lock.
+    Rationale: on one-shot CLI (`rag query`) the background warmup thread
+    races the main thread, and lock contention used to pin the main at
+    10-12s (measured 2026-04-21 in `rag_queries.extra_json`: embed_ms
+    12014ms while a fresh warmup was loading bge-m3 on MPS). Falling back
+    to ollama embed (~150ms) is strictly better for cold one-shots than
+    waiting for a local load that only pays off across many queries.
+
+    Long-running processes (`rag serve`, `rag chat`, `rag do`, web server)
+    eagerly warmup at startup, so the Event is typically set before the
+    first user query arrives — they get the fast in-process path.
+
+    Only intended for query-path embeds (1-3 short strings per call).
+    Do NOT use from indexing/watch/ingest — those stay on ollama.
     """
     if not _local_embed_enabled():
+        return None
+    # Non-blocking readiness check. If the warmup hasn't finished yet,
+    # bail so the caller uses ollama instead of waiting on our lock.
+    if not _local_embedder_ready.is_set():
         return None
     model = _get_local_embedder()
     if model is None:
@@ -7501,10 +7543,15 @@ def _warmup_local_embedder() -> bool:
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        return True
     except Exception as exc:
         _silent_log("warmup_local_embedder.encode", exc)
         return False
+    # Only signal ready after the first encode succeeded — the load alone
+    # isn't enough because MPS JIT on the first forward pass can still
+    # add ~200ms. This gates `query_embed_local` from spinning on a model
+    # that would still pay JIT on its first real call.
+    _local_embedder_ready.set()
+    return True
 
 
 def hyde_embed(question: str) -> list[float]:
@@ -14201,6 +14248,252 @@ def _ambient_hook(
     })
 
 
+# ── OCR on embedded images (Apple Vision via ocrmac) ─────────────────────────
+# Indexer hook: el body de una nota se enriquece con el texto OCR de sus
+# imágenes embebidas ANTES del chunking. Sin esto, notas tipo link-hub
+# (filename descriptivo + body = un link + un `![[screenshot.png]]`) eran
+# invisibles al retrieval — el reranker solo ve el body textual y no tiene
+# forma de leer la captura. Con OCR, el texto de la imagen (ej. tabla de
+# dev cycles en una screenshot) se concatena al body y aterriza en un
+# chunk indexable.
+#
+# Cache: SQL `rag_ocr_cache`, key = image abs path, invalidado por mtime.
+# Sin TTL — el texto no envejece, solo cambia cuando la imagen cambia.
+# El hash del chunk `_index_single_file` se computa sobre raw + mtimes de
+# imágenes (`_file_hash_with_images`) así que una imagen actualizada
+# fuerza reindex aunque el markdown no cambie.
+#
+# Soft deps: `ocrmac` + pyobjc son macOS-only. Import fallido → silent
+# skip. Env `RAG_OCR=0` desactiva explícitamente.
+
+try:
+    from ocrmac import ocrmac as _ocrmac_module
+except Exception:  # noqa: BLE001 — pyobjc init puede fallar, no solo ImportError
+    _ocrmac_module = None  # type: ignore[assignment]
+
+# Extensiones de imagen soportadas (Apple Vision handlea todas via Core Image).
+_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif", ".bmp", ".tiff", ".tif",
+})
+
+# Min confidence para considerar un texto OCR. ocrmac devuelve [0,1] por
+# annotation. Umbral bajo (0.3) porque para tablas / screenshots la
+# confianza real suele ser 0.5+ pero algunas palabras de una o dos letras
+# bajan; preferimos falsos-positivos leves (ruido) a pérdida de señal
+# (tabla de números ej. "10.54" es crítica y puede scorear 0.5-0.7).
+_OCR_MIN_CONFIDENCE = 0.3
+
+# Regex para extraer embeds de imagen. Dos formatos:
+#   - Wikilink Obsidian:  ![[folder/image.png]]  o  ![[image.png|alias]]
+#   - Markdown estándar:  ![alt text](path/to/image.png)
+_EMBED_WIKILINK_RE = re.compile(r"!\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]")
+_EMBED_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)")
+
+
+def _extract_embedded_images(body: str, note_path: Path, vault_root: Path) -> list[Path]:
+    """Parse `body` para encontrar imágenes embebidas y devolver paths
+    absolutos (solo las que existen en disco). Formatos soportados:
+    wikilink Obsidian (`![[img.png]]`) y markdown estándar (`![alt](p.png)`).
+
+    Resolución de paths (en orden):
+      1. URL externa (http/https/data:) → skip.
+      2. Path absoluto → se usa tal cual si existe.
+      3. Path relativo a `note_path.parent` → se prueba ahí primero.
+      4. Solo nombre de archivo (ej. `![[captura.png]]`) → scan del vault
+         entero por filename match (Obsidian default behavior cuando no
+         hay path).
+
+    Ignora:
+      - Extensiones no-imagen (`.md`, `.pdf`, `.canvas`, ...) — la función
+        es específica para OCR, no para todos los embeds.
+      - Imágenes referenciadas pero no encontradas en disco (broken
+        links) — silent skip.
+      - URLs externas (no fetcheamos; la política es 100% local).
+    """
+    if not body:
+        return []
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def _resolve_and_add(candidate: str) -> None:
+        # Skip externals.
+        low = candidate.strip().lower()
+        if not low or low.startswith(("http://", "https://", "data:", "ftp://")):
+            return
+        # Skip non-image extensions (embeds de notas/pdfs/canvas no aplican).
+        ext = Path(candidate).suffix.lower()
+        if ext not in _IMAGE_EXTENSIONS:
+            return
+        # Absolute path.
+        p = Path(candidate)
+        if p.is_absolute():
+            if p.is_file() and p.resolve() not in seen:
+                seen.add(p.resolve())
+                out.append(p)
+            return
+        # Relative to note parent.
+        rel = (note_path.parent / candidate).resolve()
+        if rel.is_file() and rel not in seen:
+            seen.add(rel)
+            out.append(rel)
+            return
+        # Filename-only wikilink: scan vault.
+        if "/" not in candidate and "\\" not in candidate:
+            try:
+                matches = list(vault_root.rglob(candidate))
+            except OSError:
+                matches = []
+            for m in matches:
+                if m.is_file() and m.resolve() not in seen:
+                    seen.add(m.resolve())
+                    out.append(m)
+                    return
+
+    for m in _EMBED_WIKILINK_RE.finditer(body):
+        _resolve_and_add(m.group(1))
+    for m in _EMBED_MARKDOWN_RE.finditer(body):
+        _resolve_and_add(m.group(1))
+    return out
+
+
+def _ocr_image(image_path: Path) -> str:
+    """OCR `image_path` usando Apple Vision (ocrmac). Resultado cacheado
+    en `rag_ocr_cache` SQL table, key = abs path, invalidación por mtime.
+
+    Returns `""` (no crash) en cualquiera de estos casos:
+      - env `RAG_OCR=0` — usuario desactivó OCR explícitamente.
+      - `_ocrmac_module is None` — import falló (non-macOS / pyobjc roto).
+      - imagen no existe o stat falla.
+      - ocrmac lanza — imagen corrupta, formato raro, memory issue.
+
+    Filtra annotations por confianza ≥ `_OCR_MIN_CONFIDENCE` (0.3). El
+    texto resultante es la concatenación space-separated de todas las
+    annotations que pasaron el umbral — suficiente para que el chunker
+    downstream (que tokeniza por whitespace) encuentre matches.
+    """
+    if os.environ.get("RAG_OCR", "").strip() == "0":
+        return ""
+    if _ocrmac_module is None:
+        return ""
+    try:
+        mtime = image_path.stat().st_mtime
+    except OSError:
+        return ""
+    abs_key = str(image_path.resolve())
+
+    # Cache read.
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT mtime, text FROM rag_ocr_cache WHERE image_path = ?",
+                (abs_key,),
+            ).fetchone()
+            if row is not None and abs(row[0] - mtime) < 1e-6:
+                return row[1] or ""
+    except Exception as exc:
+        _silent_log("ocr_cache_read", exc)
+        # Continuamos al OCR real si la cache falla — no bloqueamos el
+        # indexer por problemas de estado.
+
+    # OCR real.
+    try:
+        annotations = _ocrmac_module.OCR(
+            abs_key, language_preference=["es-ES", "en-US"],
+        ).recognize()
+    except Exception as exc:
+        _silent_log(f"ocr_recognize:{abs_key}", exc)
+        return ""
+
+    # annotations = [(text, confidence, bbox), ...]. Filtramos por umbral
+    # y concatenamos. Separador ` ` (no `\n`) porque el chunker split
+    # por whitespace lo mismo, y keep el tamaño compacto.
+    texts = [
+        t for (t, c, _bbox) in annotations
+        if isinstance(t, str) and t and c >= _OCR_MIN_CONFIDENCE
+    ]
+    out = " ".join(texts).strip()
+
+    # Cache write (best-effort; no rompe el indexer si falla).
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO rag_ocr_cache "
+                "(image_path, mtime, text, ocr_at) VALUES (?, ?, ?, ?)",
+                (abs_key, float(mtime), out, time.time()),
+            )
+    except Exception as exc:
+        _silent_log(f"ocr_cache_write:{abs_key}", exc)
+
+    return out
+
+
+def _enrich_body_with_ocr(
+    body: str, note_path: Path, vault_root: Path,
+    images_source: str | None = None,
+) -> str:
+    """Retorna `body` extendido con el texto OCR de sus imágenes embebidas.
+
+    Para cada imagen encontrada por `_extract_embedded_images`, corre
+    `_ocr_image` y concatena el texto extraído al final del body con un
+    marker HTML-comment que identifica la imagen (user-grep-friendly,
+    no visible en render de Markdown).
+
+    `images_source`: opcional, el texto desde el cual extraer embeds. Default
+    = `body`. Usado por el indexer para extraer del `raw` (pre-`clean_md`)
+    pero apendear al `text` (post-`clean_md`) — `clean_md` convierte los
+    `![[img.png]]` a `!img.png` (matchea la misma regex de wikilinks) y
+    eso pierde el embed. Pasando el `raw` como `images_source`, el parser
+    sigue viendo los `![[...]]` intactos.
+
+    Imágenes cuyo OCR devuelve "" (cache miss + OCR empty, ocrmac
+    desactivado, imagen vacía) se skippean sin agregar marker — evita
+    contaminar el body con placeholders vacíos.
+
+    Retorna `body` intacto si no hay imágenes embebidas.
+    """
+    src = images_source if images_source is not None else body
+    images = _extract_embedded_images(src, note_path, vault_root)
+    if not images:
+        return body
+    parts: list[str] = [body]
+    for img in images:
+        text = _ocr_image(img)
+        if not text:
+            continue
+        # Marker: path relativo al vault si posible (más legible), fallback
+        # al filename. HTML-comment style porque markdown lo oculta en
+        # renders de Obsidian — el user no lo ve a menos que mire el source.
+        try:
+            rel_marker = str(img.resolve().relative_to(vault_root.resolve()))
+        except ValueError:
+            rel_marker = img.name
+        parts.append(f"\n\n<!-- OCR: {rel_marker} -->\n{text}")
+    return "".join(parts)
+
+
+def _file_hash_with_images(raw: str, note_path: Path, vault_root: Path) -> str:
+    """Hash del archivo + firmas mtime de sus imágenes embebidas.
+
+    Sin esto, el indexer skippea reindex cuando el .md no cambió pero
+    una imagen embebida sí (caso típico: tomé una screenshot nueva, la
+    guardé con el mismo nombre, pero la nota contenedora no cambió). El
+    OCR cache está invalidado por mtime pero el indexer nunca llegaría
+    a re-chunkear. Combinando los mtimes de las imágenes al hash base,
+    un cambio en cualquier imagen fuerza reindex de la nota.
+    """
+    base = file_hash(raw)
+    images = _extract_embedded_images(raw, note_path, vault_root)
+    if not images:
+        return base
+    sig_parts: list[str] = [base]
+    for p in sorted(images, key=lambda x: str(x)):
+        try:
+            sig_parts.append(f"{p}:{p.stat().st_mtime}")
+        except OSError:
+            sig_parts.append(f"{p}:missing")
+    return file_hash("\n".join(sig_parts))
+
+
 def _index_single_file(
     col: SqliteVecCollection, path: Path, skip_contradict: bool = False,
     vault_path: Path | None = None,
@@ -14236,7 +14529,11 @@ def _index_single_file(
         return "empty"
 
     raw = path.read_text(encoding="utf-8", errors="ignore")
-    h = file_hash(raw)
+    # Hash incluye mtimes de imágenes embebidas — si una screenshot en la
+    # nota se updateó pero el .md no cambió, seguimos forzando reindex
+    # para picar el OCR nuevo. `_file_hash_with_images` devuelve el hash
+    # base cuando la nota no tiene embeds (no overhead para la mayoría).
+    h = _file_hash_with_images(raw, path, vault)
     if existing_hash == h:
         return "skipped"
 
@@ -14245,6 +14542,12 @@ def _index_single_file(
     tags = _normalize_fm_tags(fm)
     outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
     text = clean_md(raw)
+    # Enriquecimiento OCR: texto de imágenes embebidas se concatena al body
+    # antes del chunking. `images_source=raw` porque clean_md() strippea
+    # los `![[img.png]]` y el extractor los necesita intactos. No-op
+    # cuando la nota no tiene embeds o ocrmac no está disponible. Cache
+    # SQL por (image_path, mtime) evita re-OCR en reruns.
+    text = _enrich_body_with_ocr(text, path, vault, images_source=raw)
 
     # Contradiction check runs before re-embedding so we only pay once. The
     # collection still holds the old version of this note if any — we exclude
@@ -14555,7 +14858,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         doc_id_prefix = str(path.relative_to(VAULT_PATH))
         folder = str(path.relative_to(VAULT_PATH).parent)
         raw = path.read_text(encoding="utf-8", errors="ignore")
-        h = file_hash(raw)
+        # Hash con mtimes de imágenes embebidas — paridad con
+        # `_index_single_file`: una screenshot updateada (sin cambio en el
+        # .md) fuerza reindex para picar el OCR nuevo.
+        h = _file_hash_with_images(raw, path, VAULT_PATH)
 
         # Skip unchanged files (hash matches what's stored)
         existing = file_to_chunks.get(doc_id_prefix, [])
@@ -14567,6 +14873,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         tags = _normalize_fm_tags(fm)
         outlinks = extract_wikilinks(raw)
         text = clean_md(raw)
+        # OCR enrichment: concat el texto de imágenes embebidas al body
+        # antes del chunking. `images_source=raw` porque clean_md() strippea
+        # los `![[img.png]]`. Gated por cache + ocrmac availability.
+        text = _enrich_body_with_ocr(text, path, VAULT_PATH, images_source=raw)
 
         # Before touching the collection for this file, check whether the
         # incoming content contradicts anything already in the vault. When

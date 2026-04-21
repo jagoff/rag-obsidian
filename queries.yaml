@@ -6,6 +6,66 @@
 #   - note:      optional human comment on intent (not used by the evaluator)
 #
 # Add more queries over time. Keep them representative of real usage.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# When + how to add queries (expansion protocol — read before editing)
+# ─────────────────────────────────────────────────────────────────────────
+# The `rag tune` + nightly online-tune + auto-rollback gate all live on
+# the hit@5 / MRR / chain_success numbers from THIS file. A query that
+# measures nothing meaningful makes tuning noisier. Follow the
+# protocol below to keep this golden set useful.
+#
+# 1. COVERAGE GAP first. Before adding a query, check which folders are
+#    under-represented:
+#      cd <repo> && .venv/bin/python - <<'PY'
+#      import yaml; d = yaml.safe_load(open("queries.yaml"))
+#      from collections import Counter
+#      f = Counter(p.split("/",1)[0]
+#                  for q in d["queries"]
+#                  for p in q["expected"])
+#      print(f.most_common())
+#      PY
+#    Under-represented folder (<5 queries) → prioritise that folder.
+#    Otherwise expansion just inflates the singles count without widening
+#    coverage.
+#
+# 2. SINGLES template — atomic question, 1-3 expected paths:
+#      - question: "<natural user phrasing, lowercase, no trailing ?>"
+#        expected:
+#          - 03-Resources/<folder>/<note>.md
+#          - 03-Resources/<folder>/<related>.md  # optional 2nd hit
+#        note: "<1-line intent; why this is a real query>"  # optional
+#    Guidelines:
+#      • Use the exact wording you'd type yourself — don't sanitise.
+#      • Avoid leaking note titles into the question literally (that's
+#        a BM25 freebie; real queries paraphrase).
+#      • 1-2 expected paths ideal. More = weaker signal (harder to
+#        diagnose regressions per-query).
+#
+# 3. CHAINS template — multi-turn, tests session_id + seen_titles gate:
+#      - turns:
+#          - question: "<opening question>"
+#            expected:
+#              - path/to/note1.md
+#          - question: "<follow-up — should resolve a different chunk>"
+#            expected:
+#              - path/to/note2.md
+#            note: "must surface DIFFERENT note than turn 1"
+#    Guidelines:
+#      • Chains measure chain_success = BOTH turns hit. The second turn's
+#        expected MUST differ from the first's — otherwise you're just
+#        testing memoisation.
+#      • Keep chains to 2-3 turns. Longer chains amplify noise.
+#
+# 4. VERIFY every expected path exists in the vault:
+#      .venv/bin/python -m pytest tests/test_eval_bootstrap.py::test_queries_yaml_all_paths_exist_or_placeholder -q
+#    This test runs in CI and will fail the build on a typo.
+#
+# 5. AFTER adding, re-run `rag eval` and compare the hit@5 + MRR with CI
+#    bounds. If the baseline floor drops outside the prior CI, the new
+#    queries are either too hard (fix paths) or measuring something
+#    real. Document the new floor in CLAUDE.md.
+# ─────────────────────────────────────────────────────────────────────────
 
 queries:
   # RAG system itself

@@ -8571,6 +8571,54 @@ _INTENT_RECENT_RE = re.compile(
     r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|este\s+mes|hoy)\b",
     re.IGNORECASE,
 )
+# Agenda: temporal *browsing* (not specific-event lookup). Distinguishes
+# "qué tengo esta semana" (user wants calendar events + reminders ahead)
+# from "últimas notas modificadas" (recent intent, vault-only).
+#
+# Pre-2026-04-21-evening both fell into `recent` via the "esta semana" /
+# "hoy" tokens → `handle_recent` sorted *vault* notes by `modified` desc
+# and never consulted the calendar/reminders sources. Now that the corpus
+# has 368 calendar chunks the overlap is user-facing: a real query `qué
+# tengo esta semana` returned the top-20 most-recently-modified vault
+# notes, dropping all calendar events.
+#
+# Checked BEFORE `recent` in `classify_intent` so "qué tengo esta semana"
+# lands on the source-aware handler. "Notas modificadas" explicit cues
+# still hit recent because the agenda regex never contains the
+# "modificad[aos]" / "notas recientes" tokens.
+_INTENT_AGENDA_RE = re.compile(
+    r"\b("
+    # Posesivo + calendar-flavored noun: "mi agenda", "mis eventos",
+    # "mi calendario", "mis reuniones", "mis turnos", "mis citas",
+    # "mis pendientes". NOT "mi nota" — that would cross the boundary.
+    r"m[ií][s]?\s+(?:agenda|eventos?|calendario|reuniones?|turnos?|citas?|pendientes?)\b"
+    # "qué tengo X" + temporal anchor. Covers the canonical bug query
+    # "qué tengo esta semana" plus variants: "qué tengo hoy", "qué
+    # tengo mañana", "qué tengo el viernes", "qué tengo el próximo
+    # lunes", etc.
+    r"|qu[eé]\s+tengo\s+(?:el\s+|la\s+|los\s+|las\s+)?"
+    r"(?:hoy|ma[ñn]ana|esta\s+semana|este\s+mes|"
+    r"(?:el|este|pr[oó]xim[oa])\s+(?:lunes|martes|mi[eé]rcoles|jueves|"
+    r"viernes|s[aá]bado|domingo|finde|semana|mes|a[ñn]o))"
+    # "qué hay|tenemos X" (agenda browsing, no possessive). "programado"
+    # as a standalone temporal cue covers "qué hay programado para hoy".
+    r"|qu[eé]\s+(?:hay|tenemos)\s+"
+    r"(?:hoy|ma[ñn]ana|esta\s+semana|este\s+mes|programad[oa]|"
+    r"(?:el|este|pr[oó]xim[oa])\s+(?:lunes|martes|mi[eé]rcoles|jueves|"
+    r"viernes|s[aá]bado|domingo|finde|semana|mes))"
+    # "qué <event-noun> tengo|hay|tenemos" — drops the temporal anchor
+    # because the event noun alone carries the agenda semantic. Narrow
+    # list: eventos/reuniones/citas/turnos/meetings. Does NOT include
+    # "workshop" / "taller" because those fire on specific lookups too
+    # ("cuándo es el workshop de AI Engineer") and we want those on
+    # semantic.
+    r"|qu[eé]\s+(?:eventos?|reuniones?|citas?|turnos?|meetings?)\s+"
+    r"(?:tengo|hay|tenemos)\b"
+    # "agenda de/del/para X" — "agenda del viernes", "agenda para mañana".
+    r"|agenda\s+(?:de|del|para)\s+\w+"
+    r")",
+    re.IGNORECASE,
+)
 # Comparison: two-term contrasts — "X vs Y", "diferencia entre X y Y",
 # "comparar X con Y", "en qué se diferencian X y Y", "compare X and Y".
 # Checked BEFORE synthesis because "X vs Y" is inherently comparative.
@@ -8609,13 +8657,17 @@ def classify_intent(
     question: str, known_tags: set[str], known_folders: set[str]
 ) -> tuple[str, dict]:
     """Detect query intent. Returns (intent, params) where intent is one of
-    'count', 'list', 'recent', 'comparison', 'synthesis', 'semantic' and
-    params carries extracted filters.
+    'count', 'list', 'recent', 'agenda', 'comparison', 'synthesis',
+    'semantic' and params carries extracted filters.
 
     Intent detection is deliberately strict (regex over known verbs) so natural
     questions stay on the semantic path. Ambiguous queries fall through to
     'semantic'. `comparison` / `synthesis` are narrow aggregation/contrast
     triggers routed to their own system prompts via `system_prompt_for_intent`.
+
+    `agenda` is checked BEFORE `recent` because they share temporal tokens
+    ("hoy" / "esta semana" / "este mes") — see `_INTENT_AGENDA_RE` docstring
+    for the rationale.
     """
     params: dict = {}
 
@@ -8641,6 +8693,10 @@ def classify_intent(
         return "count", params
     if _INTENT_LIST_RE.search(question):
         return "list", params
+    # Agenda before recent: "qué tengo esta semana" used to hit recent via
+    # "esta semana"; now it lands on the source-aware agenda handler.
+    if _INTENT_AGENDA_RE.search(question):
+        return "agenda", params
     if _INTENT_RECENT_RE.search(question):
         return "recent", params
     # Comparison before synthesis: "X vs Y" / "diferencia entre X y Y" is
@@ -8692,6 +8748,44 @@ def handle_recent(col: SqliteVecCollection, params: dict, limit: int = 20) -> li
     files = _filter_files(c["metas"], params.get("tag"), params.get("folder"))
     # Sort by modified date (ISO string sorts lexicographically correctly).
     files.sort(key=lambda m: m.get("modified") or m.get("created") or "", reverse=True)
+    return files[:limit]
+
+
+_AGENDA_SOURCES = frozenset({"calendar", "reminders"})
+
+
+def handle_agenda(col: SqliteVecCollection, params: dict, limit: int = 20) -> list[dict]:
+    """AGENDA intent — returns calendar events + reminders sorted by
+    `created_ts` (start time for calendar events, creation anchor for
+    reminders) descending.
+
+    Distinguished from RECENT by filtering on the cross-source `source`
+    metadata: only `calendar` + `reminders` chunks surface. `vault` notes
+    stay on the recent path (sorted by their own `modified` frontmatter).
+    Gmail + WhatsApp are intentionally excluded — they don't carry agenda
+    semantics.
+
+    Pre-2026-04-21-evening this handler didn't exist and the user's
+    "qué tengo esta semana" query fell through to `handle_recent` which
+    listed the top-20 most-recently-modified *vault* notes — calendar was
+    invisible regardless of how many events were indexed.
+    """
+    c = _load_corpus(col)
+    # Source gate first (cheap `normalize_source` lookup per meta) so the
+    # downstream dedup + filtering loop works on the narrowed pool.
+    agenda_metas = [
+        m for m in c["metas"]
+        if normalize_source(m.get("source")) in _AGENDA_SOURCES
+    ]
+    files = _filter_files(agenda_metas, params.get("tag"), params.get("folder"))
+    # Sort by created_ts desc (epoch float). Falls back to 0.0 for metas
+    # missing the field — those drift to the bottom but still surface.
+    def _ts(m: dict) -> float:
+        try:
+            return float(m.get("created_ts") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    files.sort(key=_ts, reverse=True)
     return files[:limit]
 
 
@@ -9100,12 +9194,12 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
     """Return the appropriate system prompt for a given intent + mode.
 
     If loose → always SYSTEM_RULES (preserves --loose behaviour for every intent).
-    Else: count/list/recent → SYSTEM_RULES_LOOKUP; synthesis → SYSTEM_RULES_SYNTHESIS;
+    Else: count/list/recent/agenda → SYSTEM_RULES_LOOKUP; synthesis → SYSTEM_RULES_SYNTHESIS;
     comparison → SYSTEM_RULES_COMPARISON; semantic or unknown → SYSTEM_RULES_STRICT.
     """
     if loose:
         return SYSTEM_RULES
-    if intent in ("count", "list", "recent"):
+    if intent in ("count", "list", "recent", "agenda"):
         return SYSTEM_RULES_LOOKUP
     if intent == "synthesis":
         return SYSTEM_RULES_SYNTHESIS
@@ -14724,6 +14818,17 @@ def query(
                     f"[bold cyan]{len(files)}[/bold cyan] nota(s) recientes [dim]({params_str})[/dim]"
                 )
                 render_file_list("últimas modificadas", files)
+        elif intent == "agenda":
+            files = handle_agenda(col, intent_params)
+            if plain:
+                click.echo(f"{len(files)} item(s) en agenda ({params_str})")
+                for f in files:
+                    click.echo(f["file"])
+            else:
+                console.print(
+                    f"[bold cyan]{len(files)}[/bold cyan] item(s) en agenda [dim]({params_str})[/dim]"
+                )
+                render_file_list("agenda (calendar + reminders)", files)
         log_query_event({
             "cmd": "query", "q": question, "intent": intent, "params": intent_params,
             "count": len(files) if intent != "count" else n,

@@ -10,9 +10,9 @@
 #     ~2-3 min wall. If you're iterating on something unrelated to
 #     retrieval, don't run it on every commit, only before pushing.
 
-.PHONY: help install test test-all lint format eval eval-fast \
+.PHONY: help install test test-all test-fast lint format eval eval-fast \
         silent-errors silent-summary clean tune tune-apply \
-        stats ruff check
+        stats ruff check coverage
 
 # Default target: show the list.
 help:
@@ -26,8 +26,16 @@ install:  ## Re-install the editable uv tool (after Python code changes)
 test:  ## Fast suite: pytest -q skipping @pytest.mark.slow
 	.venv/bin/python -m pytest tests/ -q -m "not slow" --tb=short
 
-test-all:  ## Full suite including slow tests
+test-fast:  ## Parallel suite via pytest-xdist (-n auto, skips slow)
+	.venv/bin/python -m pytest tests/ -q -m "not slow" -n auto --tb=short
+
+test-all:  ## Full suite including slow tests (sequential — slow tests share state)
 	.venv/bin/python -m pytest tests/ -q --tb=short
+
+coverage:  ## Coverage report (terminal + HTML at htmlcov/index.html)
+	.venv/bin/python -m pytest tests/ -q -m "not slow" \
+	  --cov=rag --cov=web --cov=mcp_server \
+	  --cov-report=term-missing --cov-report=html
 
 lint:  ## ruff check (CI parity)
 	uvx ruff check

@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0"]
+dev = ["pytest>=9.0", "pytest-xdist>=3.6", "pytest-cov>=5.0"]
 # Spotify recently-played ingest (`rag index` picks up per-day notes
 # under 03-Resources/Spotify/). Opt-in because it needs a user-supplied
 # `~/.config/obsidian-rag/spotify_client.json` with OAuth client ID +

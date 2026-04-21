@@ -99,6 +99,16 @@ INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 
 
+# Perf gate for citation-repair: when the initial answer has > this many bad
+# citations, skip the repair round-trip entirely. The heuristic: 4+ invented
+# paths means the response is likely hallucinated throughout (not a single
+# typo), and a one-shot repair call trying to rewrite under the same context
+# is unlikely to produce a clean answer — you just pay 5-8s of non-streaming
+# LLM latency for nothing. Below this threshold (≤3) the repair is worth it.
+# Override via env `RAG_CITATION_REPAIR_MAX_BAD` (0 disables repair entirely).
+_CITATION_REPAIR_MAX_BAD = int(os.environ.get("RAG_CITATION_REPAIR_MAX_BAD", "3"))
+
+
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
     """Check that every .md reference in the LLM response points at a path
     that was actually retrieved. Returns list of (label, path) for unverified
@@ -13904,11 +13914,14 @@ def query(
     # ── Task 1: Citation-repair loop ─────────────────────────────────────────
     # Runs always (not gated on plain — plain outputs are consumed programmatically
     # so silent repair is safe and desirable). Repair fires only when bad citations
-    # are detected. Single repair call; if repair also has bad citations or is
-    # empty, keep the original full.
+    # are detected AND their count is ≤ _CITATION_REPAIR_MAX_BAD (rag.py:109).
+    # Rationale for the perf gate: 4+ invented paths means the response is likely
+    # hallucinated throughout; a single repair call costs 5-8s of non-streaming
+    # LLM latency and rarely salvages heavily hallucinated outputs. Single repair
+    # call; if repair also has bad citations or is empty, keep the original full.
     citation_repaired = False
     bad = verify_citations(full, result["metas"])
-    if bad:
+    if bad and len(bad) <= _CITATION_REPAIR_MAX_BAD:
         valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
         if valid_paths:
             _repair_system = (
@@ -15021,9 +15034,13 @@ def chat(
         )
 
         # ── Citation-repair loop (chat path) ──────────────────────────────────
+        # Same perf gate as the query path: skip the repair round-trip when more
+        # than _CITATION_REPAIR_MAX_BAD citations are invented — the response is
+        # likely hallucinated throughout, and a single repair call won't salvage
+        # it. See rag.py:109 for the constant.
         _chat_citation_repaired = False
         _chat_bad = verify_citations(full, result["metas"])
-        if _chat_bad:
+        if _chat_bad and len(_chat_bad) <= _CITATION_REPAIR_MAX_BAD:
             _chat_valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
             if _chat_valid_paths:
                 _chat_repair_system = (
@@ -20583,7 +20600,12 @@ _TEMPORAL_ANCHOR_RE = re.compile(
 )
 
 _QUESTION_START_RE = re.compile(
-    r"^\s*(?:qu[eé]|qui[eé]n(?:es)?|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|"
+    # Opcional `¿` inicial (rioplatense/es típicamente abre preguntas así).
+    # 2026-04-21 regression: "¿qué hago el viernes 20hs?" se colaba como
+    # propose-intent por branch 4 (declaration+time) porque el regex antiguo
+    # exigía la palabra interrogativa como primer carácter no-blanco, sin
+    # contemplar el `¿`. Mismo fix que se hizo en whatsapp-listener.
+    r"^\s*¿?\s*(?:qu[eé]|qui[eé]n(?:es)?|cu[aá]ndo|cu[aá]nto|cu[aá]nta|cu[aá]l|"
     r"d[oó]nde|c[oó]mo|por\s+qu[eé]|a\s+qu[eé]|de\s+qu[eé])\b",
     re.IGNORECASE,
 )
@@ -20610,6 +20632,21 @@ def _detect_propose_intent(q: str) -> bool:
     if _EVENT_NOUN_RE.search(q):
         return True
     if _VISIT_PATTERN_RE.search(q):
+        return True
+    # Branch 4 — declaration with explicit clock time. Mirror of the
+    # whatsapp-listener `detectCalendarIntent` branch 3 (commit 8a08192).
+    # Regression 2026-04-21 Fer F.: "el viernes 20hs tengo que ir de Seba"
+    # was handled correctly on WA (branch 3 added there) but the web chat
+    # still fell through to the generic RAG prose because this function
+    # didn't catch it. The missing branch is also what CLI `rag chat`
+    # consults, so it now picks up declarations there too.
+    #
+    # Signal: `_has_explicit_time` (20hs / 15:30 / a las 10 / 8pm /
+    # medianoche / al mediodía) + the already-checked `has_temporal` (el
+    # viernes / mañana / ...) + not a question. That combo is rarely
+    # ambiguous — the user doesn't need an event noun like "reunión" for
+    # us to realize they're describing a scheduled moment.
+    if _has_explicit_time(q):
         return True
     return False
 

@@ -259,6 +259,131 @@ def test_citation_repair_keeps_original_when_repair_returns_empty(monkeypatch):
     assert logged.get("citation_repaired") is False
 
 
+def test_citation_repair_skipped_when_too_many_bad_citations(monkeypatch):
+    """Perf gate: when the initial answer has > `_CITATION_REPAIR_MAX_BAD`
+    bad citations, the repair call is NOT made (the response is likely
+    hallucinated throughout and a single-shot repair won't salvage it —
+    not worth the 5-8s round-trip). Original answer is kept, repair is
+    skipped, and only the streaming generation call happens."""
+    _apply_base_patches(monkeypatch, _fake_retrieve_result("01-Projects/nota.md"))
+
+    INITIAL_ANSWER = "Respuesta con muchas citas inventadas."
+
+    call_modes: list[bool] = []
+
+    def fake_chat(model, messages, options, stream, keep_alive):
+        call_modes.append(stream)
+        if stream:
+            def gen():
+                yield _FakeResponse(INITIAL_ANSWER)
+            return gen()
+        return _FakeResponse("should_not_be_called")
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+
+    # 5 bad citations > default _CITATION_REPAIR_MAX_BAD of 3 → skip repair.
+    many_bad = [
+        ("Fake1", "99-a.md"),
+        ("Fake2", "99-b.md"),
+        ("Fake3", "99-c.md"),
+        ("Fake4", "99-d.md"),
+        ("Fake5", "99-e.md"),
+    ]
+    monkeypatch.setattr(rag, "verify_citations", lambda text, metas: many_bad)
+
+    logged = {}
+    monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
+
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+
+    assert result.exit_code == 0, result.output
+    assert INITIAL_ANSWER in result.output
+    # Only the streaming generation call — NO repair call was made.
+    assert call_modes == [True], f"expected only streaming call, got {call_modes}"
+    assert logged.get("citation_repaired") is False
+
+
+def test_citation_repair_fires_for_few_bad_citations(monkeypatch):
+    """Repair still fires when bad citations are ≤ _CITATION_REPAIR_MAX_BAD.
+    Sanity regression: the perf gate must not kill the normal repair path."""
+    _apply_base_patches(monkeypatch, _fake_retrieve_result("01-Projects/nota.md"))
+
+    INITIAL = "Respuesta inicial con cita mala."
+    REPAIRED = "Respuesta reparada con cita buena."
+
+    def fake_streaming(model, messages, options, stream, keep_alive):
+        yield _FakeResponse(INITIAL)
+
+    def fake_nonstreaming(model, messages, options, stream, keep_alive):
+        return _FakeResponse(REPAIRED)
+
+    _call_seq = [fake_streaming, fake_nonstreaming]
+    _call_idx = {"i": 0}
+
+    def fake_chat(model, messages, options, stream, keep_alive):
+        fn = _call_seq[_call_idx["i"]]
+        _call_idx["i"] += 1
+        return fn(model, messages, options, stream, keep_alive)
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+
+    # 2 bad citations ≤ 3 (default threshold) → repair fires normally.
+    two_bad = [("Fake1", "99-a.md"), ("Fake2", "99-b.md")]
+    verify_call = {"count": 0}
+    def fake_verify(text, metas):
+        verify_call["count"] += 1
+        return two_bad if verify_call["count"] == 1 else []
+
+    monkeypatch.setattr(rag, "verify_citations", fake_verify)
+
+    logged = {}
+    monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
+
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+
+    assert result.exit_code == 0, result.output
+    assert REPAIRED in result.output
+    assert logged.get("citation_repaired") is True
+
+
+def test_citation_repair_bad_threshold_env_override(monkeypatch):
+    """`RAG_CITATION_REPAIR_MAX_BAD=0` disables repair entirely.
+
+    Confirms the env override path works; does NOT assert a specific count
+    beyond "one bad citation is enough to skip when threshold is 0".
+    """
+    monkeypatch.setattr(rag, "_CITATION_REPAIR_MAX_BAD", 0)
+    _apply_base_patches(monkeypatch, _fake_retrieve_result("01-Projects/nota.md"))
+
+    INITIAL = "Respuesta original."
+
+    call_modes: list[bool] = []
+
+    def fake_chat(model, messages, options, stream, keep_alive):
+        call_modes.append(stream)
+        if stream:
+            def gen():
+                yield _FakeResponse(INITIAL)
+            return gen()
+        return _FakeResponse("SHOULD_NOT_FIRE")
+
+    monkeypatch.setattr(rag.ollama, "chat", fake_chat)
+    monkeypatch.setattr(rag, "verify_citations", lambda text, metas: [("Fake", "99-a.md")])
+
+    logged = {}
+    monkeypatch.setattr(rag, "log_query_event", lambda ev: logged.update(ev))
+
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["query", "--plain", "--no-multi", "test question"])
+
+    assert result.exit_code == 0, result.output
+    assert INITIAL in result.output
+    assert call_modes == [True], f"expected only streaming call, got {call_modes}"
+    assert logged.get("citation_repaired") is False
+
+
 # ── 3. --critique flag ────────────────────────────────────────────────────────
 
 

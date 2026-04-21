@@ -1575,19 +1575,37 @@ def _wrap_untrusted(content: str, label: str = "CONTENIDO") -> str:
 
 # Keep models resident in VRAM between queries — avoids 2-3s cold reload.
 # Ollama accepts -1 (forever, as int) or a duration string like "30m".
-# Default changed from -1 (forever) to "20m" on 2026-04-17 after the Mac
-# started freezing: -1 pins command-r (~19 GB) permanently as wired memory,
-# and on a 36 GB unified-memory Mac that blocks the kernel from swapping
-# anything, so any app that grows triggers a beachball. "20m" lets the
-# daemon reclaim VRAM when the user walks away from chat; the first query
-# after the idle window pays a 2-3s cold load but the rest of macOS stays
-# responsive. Override with OLLAMA_KEEP_ALIVE env var per deploy.
+#
+# Historia del default:
+#   - Pre-2026-04-17: `-1` (forever)
+#   - 2026-04-17: → `"20m"` tras el Mac freeze — `-1` pineaba command-r
+#     (~19 GB) permanentemente como wired memory, y en 36 GB unificados eso
+#     bloqueaba al kernel de swappear, triggereando beachballs cuando otra
+#     app crecía.
+#   - 2026-04-21: → `-1` (volvemos). Desde el 2026-04-18 el default de
+#     chat model es **qwen2.5:7b (~4.7 GB)** no command-r (~19 GB). Stack
+#     actual pinned: qwen2.5:7b (4.7) + qwen2.5:3b helper (2) +
+#     bge-m3 (1) ≈ 8 GB — holgado en 36 GB. Los launchd plists (web, serve,
+#     morning, today, ...) ya corren con `-1` sin causar freeze — evidencia
+#     empírica a favor de que el problema original era command-r, no `-1`.
+#     Alinea el CLI one-shot con la infra real y elimina el 2-3s cold-load
+#     cuando pasaste >20min sin queries.
+#
+# ⚠️ ROLLBACK: si volvés a sentir la Mac pesada (beachballs, RAM pressure
+# alta en Activity Monitor), exportá `OLLAMA_KEEP_ALIVE=20m` (o "5m") en
+# tu shell ANTES de la primera invocación de `rag`. O revertí este commit.
+# El env var override sigue funcionando en cualquier dirección.
+#
+# ⚠️ FALLBACK RISK: `resolve_chat_model()` cae a command-r (~19 GB) si
+# qwen2.5:7b + qwen3:30b-a3b no están. En ese caso el Mac freeze puede
+# volver — setear OLLAMA_KEEP_ALIVE=20m manualmente hasta que vuelva a
+# haber un modelo chico disponible.
 def _parse_keep_alive(val: str) -> int | str:
     try:
         return int(val)
     except ValueError:
         return val
-OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "20m"))
+OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "-1"))
 
 
 _CHAT_MODEL_RESOLVED: str | None = None

@@ -13089,9 +13089,29 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
                 f"[dim]{summary['duration_s']}s[/dim]"
             )
             return
+        if src == "gmail":
+            from scripts.ingest_gmail import run as _ingest_gm
+            summary = _ingest_gm(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            mode = "bootstrap" if summary.get("bootstrapped") else "incremental"
+            console.print(
+                f"{prefix}[bold]Gmail[/bold] ({mode}): "
+                f"{summary['messages_seen']} mensajes · "
+                f"{summary['threads_built']} threads · "
+                f"[green]{summary['threads_indexed']}[/green] indexados · "
+                f"{summary['threads_deleted']} borrados · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp + calendar (ready), gmail + reminders (pending)."
+            f"Scope: whatsapp + calendar + gmail (ready), reminders (pending)."
         )
         return
 

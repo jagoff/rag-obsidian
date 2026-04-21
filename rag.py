@@ -26928,7 +26928,7 @@ def _collect_scoped_tasks_evidence_multi(
     all_contrad: list[dict] = []
     stale_days = 14
     for vname, vpath in (vaults or []):
-        with _sup(Exception):
+        with contextlib.suppress(Exception):
             loops = _pendientes_extract_loops_fast(vpath, days=14, max_items=40)
             loops.sort(key=lambda x: x.get("age_days", 0), reverse=True)
             for loop in loops:
@@ -26937,7 +26937,7 @@ def _collect_scoped_tasks_evidence_multi(
             activo = [x for x in loops if x.get("age_days", 0) < stale_days][:5]
             all_stale.extend(stale)
             all_activo.extend(activo)
-        with _sup(Exception):
+        with contextlib.suppress(Exception):
             # Contradictions log is per-vault via CONTRADICTION_LOG_PATH which
             # is global — but we'll still iterate to keep the interface
             # symmetric if per-vault logs appear later.

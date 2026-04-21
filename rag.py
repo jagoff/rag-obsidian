@@ -22165,6 +22165,76 @@ def _fetch_whatsapp_window(
 WA_CROSS_REF_LIMIT = 3
 
 
+# Informal nickname → how the bot addresses the user ("Fer, ¿te agendo…?").
+# Source priority: first `aliases:` entry in `Yo.md` (user-chosen informal
+# form) > last token of "Apellido / nombre completo" body line (works for
+# AR format "Ferrari Fernando" → Fernando) > None (bot falls back to no-
+# name phrasing). Cached per Yo.md mtime so edits propagate without restart.
+_user_nickname_cache: tuple[float, str | None] | None = None
+_user_nickname_cache_lock = threading.Lock()
+
+
+def _load_user_nickname(vault_root: Path | None = None) -> str | None:
+    """Return the short form the bot should use to address the user, or
+    None if Yo.md is missing / has no extractable name.
+
+    Resolution rules:
+      1. If `Yo.md` frontmatter has `aliases:` with ≥1 non-empty entry,
+         use the first (user-chosen informal form — "Fer", "Fede", etc.).
+      2. Else parse the body line `- **Apellido / nombre completo**: X Y`,
+         take the last whitespace-separated token (AR convention is
+         "Apellido Nombre" → last token = nombre de pila).
+      3. Else None.
+
+    Cached by Yo.md mtime.
+    """
+    global _user_nickname_cache
+    root = (vault_root or VAULT_PATH) / _MENTIONS_FOLDER / "Yo.md"
+    if not root.is_file():
+        return None
+    try:
+        mtime = root.stat().st_mtime
+    except OSError:
+        return None
+    with _user_nickname_cache_lock:
+        if _user_nickname_cache and _user_nickname_cache[0] == mtime:
+            return _user_nickname_cache[1]
+
+    try:
+        txt = root.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    nick: str | None = None
+    # Step 1 — aliases.
+    dossier = _parse_mention_dossier("Yo.md", vault_root=(vault_root or VAULT_PATH) / _MENTIONS_FOLDER)
+    # _parse_mention_dossier expects a path relative to vault_root; we
+    # pass the MENTIONS dir as the root so "Yo.md" resolves there.
+    if dossier.get("aliases"):
+        candidate = dossier["aliases"][0].strip()
+        if candidate:
+            nick = candidate
+
+    # Step 2 — body fallback. Matches `- **Apellido / nombre completo**: Foo Bar`
+    # or the lenient `Apellido / nombre completo: Foo Bar`. Skips empty values.
+    if nick is None:
+        import re as _re
+        m = _re.search(
+            r"Apellido\s*/\s*nombre\s+completo\s*\**\s*:\s*(.+?)(?:\n|$)",
+            txt, _re.IGNORECASE,
+        )
+        if m:
+            full = m.group(1).strip()
+            if full:
+                tokens = full.split()
+                if tokens:
+                    nick = tokens[-1]
+
+    with _user_nickname_cache_lock:
+        _user_nickname_cache = (mtime, nick)
+    return nick
+
+
 def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dict:
     """Extract `{name, aliases}` from a 99-Mentions/ dossier.
 
@@ -27161,12 +27231,24 @@ def serve(host: str, port: int):
         except Exception:
             wa_cross_ref = None
 
+        # User nickname → lets the listener personalize outgoing messages
+        # ("Fer, te agendo?"). Resolved from 99-Mentions/Yo.md aliases or
+        # the "nombre completo" body line. None if unknown → listener
+        # falls back to name-less phrasing. Cached by mtime so edits
+        # propagate without a reload.
+        try:
+            user_nickname = _load_user_nickname()
+        except Exception:
+            user_nickname = None
+
         if not force and not qfolder and not qtag:
             cached = _cache_get(cache_key)
             if cached is not None:
                 cached = {**cached, "cached": True}
                 if wa_cross_ref is not None:
                     cached["wa_cross_ref"] = wa_cross_ref
+                if user_nickname is not None:
+                    cached["user_nickname"] = user_nickname
                 return cached
 
         # Session
@@ -27349,6 +27431,8 @@ def serve(host: str, port: int):
             # WhatsApp activity is often the actual answer the user wanted.
             if wa_cross_ref is not None:
                 gated_payload["wa_cross_ref"] = wa_cross_ref
+            if user_nickname is not None:
+                gated_payload["user_nickname"] = user_nickname
             return gated_payload
 
         # Dynamic top-k: high-confidence hits ya traen la respuesta en los 3
@@ -27442,6 +27526,8 @@ def serve(host: str, port: int):
             _cache_put(cache_key, payload)
         if wa_cross_ref is not None:
             payload["wa_cross_ref"] = wa_cross_ref
+        if user_nickname is not None:
+            payload["user_nickname"] = user_nickname
         return payload
 
     # ── /chat — LLM directo, sin retrieval ──────────────────────────────────

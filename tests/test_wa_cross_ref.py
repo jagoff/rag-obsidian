@@ -336,3 +336,112 @@ def test_cross_ref_skips_past_dates(vault: Path, wa_db: Path) -> None:
     # The message surfaces but no propose (dt <= anchor).
     if ref is not None:
         assert ref["propose"] is None
+
+
+# ── _load_user_nickname ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def vault_with_yo(tmp_path: Path) -> Path:
+    """Vault with a Yo.md dossier (body-only, no aliases)."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Yo.md").write_text(
+        "[[Yo|@Yo]]\n"
+        "- **Relación**: \n"
+        "- **Apellido / nombre completo**: Ferrari Fernando\n"
+        "- **Cumpleaños**: 19/07/1981\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_nickname_from_body_last_token(vault_with_yo: Path) -> None:
+    """AR convention: 'Apellido Nombre' → last token = nombre de pila."""
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(vault_with_yo) == "Fernando"
+
+
+def test_nickname_prefers_aliases_over_body(tmp_path: Path) -> None:
+    """User-declared alias wins — the `Fer` in aliases beats `Fernando`
+    extracted from the body."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Yo.md").write_text(
+        "---\n"
+        "type: mention\n"
+        "aliases:\n"
+        "  - Fer\n"
+        "  - Fernando\n"
+        "---\n"
+        "- **Apellido / nombre completo**: Ferrari Fernando\n",
+        encoding="utf-8",
+    )
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(tmp_path) == "Fer"
+
+
+def test_nickname_inline_aliases(tmp_path: Path) -> None:
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Yo.md").write_text(
+        "---\naliases: [Fede, Federico Serra]\n---\n"
+        "- body content\n",
+        encoding="utf-8",
+    )
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(tmp_path) == "Fede"
+
+
+def test_nickname_none_when_yo_missing(tmp_path: Path) -> None:
+    (tmp_path / "04-Archive/99-obsidian-system/99-Mentions").mkdir(parents=True)
+    # No Yo.md written.
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(tmp_path) is None
+
+
+def test_nickname_none_when_body_field_empty(tmp_path: Path) -> None:
+    """Empty 'Apellido / nombre completo' → no fallback name."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Yo.md").write_text(
+        "- **Apellido / nombre completo**:\n",
+        encoding="utf-8",
+    )
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(tmp_path) is None
+
+
+def test_nickname_cached_by_mtime(tmp_path: Path) -> None:
+    """Subsequent calls with unchanged mtime return the cached value."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    yo = mentions / "Yo.md"
+    yo.write_text(
+        "- **Apellido / nombre completo**: García Lucía\n",
+        encoding="utf-8",
+    )
+    rag._user_nickname_cache = None
+    assert rag._load_user_nickname(tmp_path) == "Lucía"
+    # Simulate no mtime change → must hit cache (even if we tamper with
+    # the file but preserve mtime, the result is stable).
+    cached_before = rag._user_nickname_cache
+    assert cached_before is not None
+    assert rag._load_user_nickname(tmp_path) == "Lucía"
+    assert rag._user_nickname_cache is cached_before
+
+
+def test_cross_ref_independent_of_nickname(vault: Path, wa_db: Path) -> None:
+    """`_build_wa_cross_ref` must not require a nickname to function —
+    nickname is a pure UI concern surfaced via a different payload field."""
+    _seed_messages(wa_db, [
+        ("m1", "grecia-direct@s.whatsapp.net", "+g", "hola",
+         "2026-04-19 10:00:00", 0, ""),
+    ])
+    with patch.object(rag, "WHATSAPP_DB_PATH", wa_db), \
+         patch.object(rag, "VAULT_PATH", vault):
+        rag._mentions_cache = None
+        rag._user_nickname_cache = None
+        ref = rag._build_wa_cross_ref("qué sabés de Grecia")
+    assert ref is not None
+    # Cross-ref payload doesn't embed nickname — serve handler attaches it.
+    assert "user_nickname" not in ref

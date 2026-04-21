@@ -28682,6 +28682,63 @@ def _consolidate_plist(rag_bin: str) -> str:
 """
 
 
+def _maintenance_plist(rag_bin: str) -> str:
+    """Daily housekeeping — every day at 04:00, after online-tune.
+
+    Background (2026-04-21 hardening pass): with 15 services writing to
+    ragvec.db concurrently (watch, serve, 4 ingesters, morning/today,
+    etc.), the WAL grows unbounded between manual invocations. Observed
+    in production: 126 MB WAL against a 206 MB main DB, none of the
+    rotatable tables (rag_queries, rag_behavior, rag_contradictions)
+    trimmed, auto_vacuum=0. Reads degrade as sqlite scans the WAL on
+    each query; external backup tools that only copy `ragvec.db` miss
+    126 MB of data.
+
+    `rag maintenance` does: (1) WAL checkpoint(TRUNCATE) — compacts the
+    -wal file back to KBs; (2) log-table rotation — deletes rows older
+    than the configured TTL from the 6 rotatable telemetry tables;
+    (3) conditional VACUUM — only if page_count*page_size exceeds
+    last_vacuum_size by >500 MB (VACUUM takes an exclusive lock, so
+    we gate it). See `_vec_wal_checkpoint` + `_rotate_telemetry_logs`
+    in rag.py for the implementation.
+
+    Scheduled at 04:00 specifically so online-tune (03:30) has fully
+    released its SQL connections before VACUUM can acquire the
+    exclusive lock. `RunAtLoad=false` — first run happens at the next
+    04:00, so `rag setup` doesn't block on a potentially-long VACUUM.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-maintenance</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>maintenance</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/maintenance.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/maintenance.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _online_tune_plist(rag_bin: str) -> str:
     """Nightly online-tune — every day at 03:30, after Ollama is idle."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -28915,6 +28972,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _wa_tasks_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
          _online_tune_plist(rag_bin)),
+        ("com.fer.obsidian-rag-maintenance", "com.fer.obsidian-rag-maintenance.plist",
+         _maintenance_plist(rag_bin)),
         ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",
          _consolidate_plist(rag_bin)),
         # Cross-source ingesters (2026-04-21) — Phase 1.a-1.d ya implementados

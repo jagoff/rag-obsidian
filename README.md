@@ -825,3 +825,16 @@ Plists archivados en `~/Library/LaunchAgents/.archive-telegram/2026-04-15/`. Par
 | `tests/test_vaults.py` | Registry add/use/remove + precedence (env > registry > default) + per-vault collection |
 
 Correr: `.venv/bin/python -m pytest tests/ -q`. pytest está en `[project.optional-dependencies].dev`. Los modelos se monkeypatchean donde hace falta (no se llama Ollama ni se carga el reranker de verdad).
+
+### Targets rápidos
+
+| Target | Qué corre | Tiempo aprox |
+|---|---|---|
+| `make test` | Suite secuencial `-m "not slow"` | ~100s |
+| `make test-fast` | Paralelo con `pytest-xdist -n auto` (skip slow) | ~47s (2.1× speedup) |
+| `make test-all` | Suite completa, incluyendo `@pytest.mark.slow` | ~110s |
+| `make coverage` | `pytest-cov` sobre `rag.py + web + mcp_server` (HTML en `htmlcov/`) | ~50s |
+
+Cobertura actual (2026-04-20): total 54% (rag.py 55%, web/server.py 38%, mcp_server.py 85%, web/conversation_writer.py 95%). El gap está concentrado en `web/server.py` (endpoints que requieren Ollama + vault real — la mayoría no están ejercitados por unit tests).
+
+`pytest-xdist` y `pytest-cov` son opcionales: `uv pip install pytest-xdist pytest-cov` dentro del venv local (ya están listadas en `[project.optional-dependencies].dev`).

@@ -251,51 +251,76 @@ def test_recency_cue_only_applies_when_flag_true():
     assert top[0]["path"] == "a.md"
 
 
-# ── feedback.jsonl augmentation ─────────────────────────────────────────────
+# ── rag_feedback SQL augmentation (post-T10 2026-04-21 migration) ──────
+#
+# Pre-T10 this read from feedback.jsonl; after the SQL cutover the live
+# reader queries rag_feedback with json_extract on extra_json. Tests
+# use direct SQL inserts via `_map_feedback_row` + `_sql_append_event`
+# to stay isolated from `record_feedback`'s side-effects (golden cache
+# clear + golden rebuild).
+
+
+def _sql_feedback_env(tmp_path, monkeypatch):
+    """Redirect DB_PATH and create the minimum schema for rag_feedback."""
+    import sqlite3 as _sqlite3
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    db = tmp_path / "ragvec.db"
+    conn = _sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_schema_version ("
+        " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
+    )
+    rag._ensure_telemetry_tables(conn)
+    return conn
+
+
+def _insert_feedback(conn, **kwargs):
+    rag._sql_append_event(conn, "rag_feedback", rag._map_feedback_row(kwargs))
 
 
 def test_augmentation_extracts_corrective_paths(tmp_path, monkeypatch):
-    fb = tmp_path / "feedback.jsonl"
-    fb.write_text(
-        json.dumps({
-            "ts": "2026-04-15", "q": "como instalo claude peers",
-            "rating": -1, "paths": ["wrong.md"],
-            "corrective_path": "01-Projects/mcp/peers.md",
-        }) + "\n"
-        + json.dumps({
-            "ts": "2026-04-15", "q": "qué es ikigai",
-            "rating": 1, "paths": ["02-Areas/ikigai.md"],
-            # sin corrective_path → se ignora
-        }) + "\n"
-        + json.dumps({
-            "ts": "2026-04-15", "q": "sesión",
-            "scope": "session",
-            "corrective_path": "x.md",
-        }) + "\n"
-        + json.dumps({
-            "ts": "2026-04-15", "q": "como instalo claude peers",
-            "corrective_path": "02-Areas/mcp-peers.md",  # duplicate query
-        }) + "\n"
+    conn = _sql_feedback_env(tmp_path, monkeypatch)
+    # Row 1: corrective feedback on "como instalo claude peers"
+    _insert_feedback(
+        conn, ts="2026-04-15", q="como instalo claude peers",
+        rating=-1, paths=["wrong.md"],
+        corrective_path="01-Projects/mcp/peers.md",
     )
-    monkeypatch.setattr(rag, "FEEDBACK_PATH", fb)
+    # Row 2: positive feedback without corrective_path → ignored
+    _insert_feedback(
+        conn, ts="2026-04-15", q="qué es ikigai", rating=1,
+        paths=["02-Areas/ikigai.md"],
+    )
+    # Row 3: session-scoped → ignored
+    _insert_feedback(
+        conn, ts="2026-04-15", q="sesión", scope="session",
+        corrective_path="x.md",
+    )
+    # Row 4: duplicate query → ignored (first occurrence wins)
+    _insert_feedback(
+        conn, ts="2026-04-15", q="como instalo claude peers",
+        corrective_path="02-Areas/mcp-peers.md",
+    )
     cases = rag._feedback_augmented_cases()
     assert len(cases) == 1
     assert cases[0]["question"] == "como instalo claude peers"
     assert cases[0]["expected"] == ["01-Projects/mcp/peers.md"]
+    conn.close()
 
 
-def test_augmentation_empty_when_no_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(rag, "FEEDBACK_PATH", tmp_path / "nope.jsonl")
+def test_augmentation_empty_when_no_rows(tmp_path, monkeypatch):
+    """Empty rag_feedback table (fresh DB) → []."""
+    conn = _sql_feedback_env(tmp_path, monkeypatch)
     assert rag._feedback_augmented_cases() == []
+    conn.close()
 
 
 def test_augmentation_skips_short_queries(tmp_path, monkeypatch):
-    fb = tmp_path / "feedback.jsonl"
-    fb.write_text(
-        json.dumps({"q": "hi", "corrective_path": "x.md"}) + "\n"
-    )
-    monkeypatch.setattr(rag, "FEEDBACK_PATH", fb)
+    conn = _sql_feedback_env(tmp_path, monkeypatch)
+    _insert_feedback(conn, q="hi", corrective_path="x.md")
     assert rag._feedback_augmented_cases(min_len=4) == []
+    conn.close()
 
 
 # ── _score_case + _aggregate ────────────────────────────────────────────────

@@ -2312,26 +2312,6 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     }
 
 
-def _iter_behavior_jsonl() -> list[dict]:
-    """Yield parsed events from behavior.jsonl. Silent on missing/corrupt."""
-    if not BEHAVIOR_LOG_PATH.is_file():
-        return []
-    out: list[dict] = []
-    try:
-        raw = BEHAVIOR_LOG_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
-    return out
-
-
 def _load_behavior_priors() -> dict:
     """Read behavior events and return an immutable aggregated snapshot.
 
@@ -2824,31 +2804,28 @@ def record_feedback(
 
 
 def feedback_counts() -> tuple[int, int]:
-    """Return (positives, negatives) from the raw log — cheap scan, no embeddings."""
-    pos = neg = 0
-    if not FEEDBACK_PATH.is_file():
-        return 0, 0
+    """Return (positives, negatives) from rag_feedback SQL — strict ±1
+    count, ignores rating=0 and NULL.
+
+    Post-T10 (2026-04-19): feedback.jsonl is gone (only .bak remains).
+    Pre-fix the caller `rag insights` showed 0/0 silently. SQL is the
+    only source.
+    """
     try:
-        for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                # Per-line parse skip is load-bearing: one bad line from
-                # an interrupted write shouldn't fail the whole count.
-                # Logged once via the rebuild path; suppress here to
-                # avoid N log entries per scan.
-                continue
-            r = ev.get("rating", 0)
-            if r > 0:
-                pos += 1
-            elif r < 0:
-                neg += 1
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT "
+                " SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END)"
+                " FROM rag_feedback"
+            ).fetchone()
     except Exception as exc:
-        _silent_log("feedback_counts_read", exc)
-    return pos, neg
+        _silent_log("feedback_counts_sql_read", exc)
+        return 0, 0
+    if row is None:
+        return 0, 0
+    pos, neg = row
+    return int(pos or 0), int(neg or 0)
 
 
 _feedback_golden_memo: dict | None = None
@@ -13713,32 +13690,55 @@ def proactive_push(kind: str, message: str, *, snooze_hours: int | None = None) 
 
 
 def _scan_queries_log(days: int = 14) -> list[dict]:
-    """Lee LOG_PATH (queries.jsonl) y devuelve events dentro de la ventana."""
-    if not LOG_PATH.is_file():
-        return []
+    """Read rag_queries SQL events from the last `days`, ordered
+    chronologically. Returns event-shaped dicts with `extra_json` keys
+    hoisted to top-level so downstream callers (`rag emergent`,
+    `rag dashboard`) see the same shape they had pre-T10 JSONL.
+
+    Post-T10 (2026-04-19) fix: the JSONL file was repurposed for
+    conversation-writer observability, so tail-reading it surfaced
+    wrong-schema events. Those callers rendered empty/wrong data
+    silently. SQL is now the only source.
+
+    Excludes admin-style rows with empty `q` (cmd='followup' / 'read')
+    to match the renderer expectations — emergent clusters queries,
+    dashboard counts them, neither wants noise rows.
+    """
     cutoff = datetime.now() - timedelta(days=days)
-    out: list[dict] = []
+    since_iso = cutoff.isoformat(timespec="seconds")
+    sql = (
+        "SELECT ts, cmd, q, session, mode, top_score, t_retrieve, t_gen,"
+        " answer_len, citation_repaired, critique_fired, critique_changed,"
+        " extra_json"
+        " FROM rag_queries WHERE ts >= ? AND q IS NOT NULL AND q != ''"
+        " ORDER BY ts ASC"
+    )
     try:
-        for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        with _ragvec_state_conn() as conn:
+            cursor = conn.execute(sql, (since_iso,))
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+    except Exception as exc:
+        _silent_log("scan_queries_log_sql_read", exc)
+        return []
+    events: list[dict] = []
+    for row in rows:
+        d = dict(zip(cols, row))
+        extra = d.pop("extra_json", None)
+        if extra:
             try:
-                ev = json.loads(line)
+                ej = json.loads(extra) if isinstance(extra, str) else extra
             except Exception:
-                continue
-            ts_raw = ev.get("ts") or ev.get("timestamp")
-            if not ts_raw:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_raw)
-            except Exception:
-                continue
-            if ts >= cutoff:
-                out.append(ev)
-    except Exception:
-        pass
-    return out
+                ej = None
+            if isinstance(ej, dict):
+                # Hoist ALL extra_json keys to top-level so callers that
+                # read q_reformulated / answered / gated_low_confidence
+                # / turn_id don't need to re-parse JSON per event. Don't
+                # clobber existing SQL columns.
+                for k, v in ej.items():
+                    d.setdefault(k, v)
+        events.append(d)
+    return events
 
 
 def _cluster_queries(qs: list[str], threshold: float = 0.75) -> list[list[int]]:
@@ -13891,24 +13891,28 @@ def patterns(last: int, min_share: float, dry_run: bool, push: bool):
     una razón específica supera --min-share de ellos, pingea WA con
     sugerencia de acción.
     """
-    if not FEEDBACK_PATH.is_file():
-        console.print("[dim]sin feedback log todavía[/dim]")
-        return
+    # Post-T10: rag_feedback SQL is the only source. `reason` lives in
+    # extra_json (not a first-class column), so json_extract pulls it.
     events: list[dict] = []
     try:
-        for line in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            if ev.get("rating", 0) < 0 and ev.get("reason"):
-                events.append(ev)
-    except Exception:
+        with _ragvec_state_conn() as conn:
+            sql = (
+                "SELECT q, rating,"
+                " json_extract(extra_json, '$.reason') AS reason"
+                " FROM rag_feedback"
+                " WHERE rating < 0"
+                "   AND json_extract(extra_json, '$.reason') IS NOT NULL"
+                "   AND json_extract(extra_json, '$.reason') != ''"
+                " ORDER BY ts DESC LIMIT ?"
+            )
+            rows = conn.execute(sql, (last,)).fetchall()
+    except Exception as exc:
+        _silent_log("patterns_feedback_sql_read", exc)
+        console.print("[yellow]error leyendo feedback SQL[/yellow]")
         return
-    events = events[-last:]
+    # Flip back to ASC so recency-weighting reads naturally later.
+    for q, rating, reason in reversed(rows):
+        events.append({"q": q, "rating": rating, "reason": reason})
     if len(events) < 5:
         console.print(f"[dim]pocos 👎 con razón para analizar ({len(events)})[/dim]")
         return
@@ -17689,31 +17693,38 @@ _TUNE_SPACE = {
 
 
 def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
-    """Mine feedback.jsonl for corrective_path events — each is a gold
-    (query, expected_paths) tuple. Skip session-scope, deduplicate queries
-    by normalised form, drop entries where the corrective path is empty or
-    the query is too short to be useful.
+    """Mine rag_feedback SQL for `corrective_path` events — each is a
+    gold (query, [corrective_path]) tuple that `rag tune` consumes as
+    positive training signal. Skips session-scope, deduplicates queries
+    by normalised form (lowercase + collapsed whitespace), drops
+    entries where the corrective path is empty or the query is shorter
+    than `min_len`.
+
+    Post-T10 (2026-04-19) reads from SQL — `corrective_path` lives
+    inside `extra_json` since it isn't a first-class column. Pre-fix
+    the pre-T10 JSONL parser returned [] against the stale file and
+    `rag tune` silently lost all corrective signal.
     """
-    if not FEEDBACK_PATH.is_file():
+    sql = (
+        "SELECT q, json_extract(extra_json, '$.corrective_path') AS cp"
+        " FROM rag_feedback"
+        " WHERE (scope IS NULL OR scope != 'session')"
+        "   AND q IS NOT NULL AND q != ''"
+        "   AND json_extract(extra_json, '$.corrective_path') IS NOT NULL"
+        "   AND json_extract(extra_json, '$.corrective_path') != ''"
+        " ORDER BY ts ASC"
+    )
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(sql).fetchall()
+    except Exception as exc:
+        _silent_log("feedback_augmented_cases_sql_read", exc)
         return []
     seen_q: set[str] = set()
     out: list[dict] = []
-    try:
-        raw = FEEDBACK_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in raw:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        if ev.get("scope") == "session":
-            continue
-        q = (ev.get("q") or "").strip()
-        cp = (ev.get("corrective_path") or "").strip()
+    for q_raw, cp_raw in rows:
+        q = (q_raw or "").strip()
+        cp = (cp_raw or "").strip()
         if not q or not cp or len(q) < min_len:
             continue
         key = " ".join(q.lower().split())

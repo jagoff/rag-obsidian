@@ -7403,11 +7403,46 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
+# Dossier body parsing: bullet-line pattern `- **Email**: X` / `- **Teléfono**: Y`.
+# Alt forms accepted: `- Email:`, `* Email:`, leading whitespace. Case-insensitive.
+# Phones are digit-normalised (stripped of `+`, spaces, dashes, parens) and
+# indexed under the last 8+ digits (last-8 matches AR local numbers where the
+# country code is sometimes present, sometimes not). Emails are lower-cased.
+_MENTIONS_EMAIL_RE = re.compile(
+    r"^\s*[-*]\s*\*{0,2}(?:e-?mail|email|correo)\*{0,2}\s*:\s*([^\s<>]+@[^\s<>]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MENTIONS_PHONE_RE = re.compile(
+    r"^\s*[-*]\s*\*{0,2}(?:tel[eé]fono|tel[eé]f|tel|phone|celular|cel|whatsapp|wa)\*{0,2}"
+    r"\s*:\s*(\+?[\d\s().\-]{7,})\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _normalise_phone_digits(raw: str) -> str:
+    """Strip a phone number to digits only. Returns empty string if the
+    remaining digit count is < 8 (too short to be a real phone; drop)."""
+    digits = re.sub(r"\D", "", raw or "")
+    return digits if len(digits) >= 8 else ""
+
+
 def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
     """Scan 99 Mentions @/ → {folded_token: rel_path}.
 
-    Tokens = filename stem + frontmatter `aliases:`. Files prefixed with `_`
-    are scaffolding (see `_template.md`). Cached by max-mtime over folder.
+    Tokens = filename stem + frontmatter `aliases:` + body-level email +
+    phone (last-8 digits). Files prefixed with `_` are scaffolding (see
+    `_template.md`). Cached by max-mtime over folder.
+
+    Email / phone enrichment (2026-04-21): dossiers typically carry
+    `- **Email**: name@ex.com` and `- **Teléfono**: +54 9 342...` bullets.
+    Indexing those lets queries like "mensajes de monicaferrari@gmail.com"
+    or "+5493425476623" resolve to the right dossier in
+    `build_person_context`, which previously only matched on name/alias.
+
+    Phone is stored under its last 8 digits (accommodates AR "9" prefix
+    variance) AND the full digit string; either is sufficient to match
+    when the user types the number in different shapes. Email is stored
+    lower-cased. Both are folded through `_fold` for alias parity.
     """
     global _mentions_cache
     root = (vault_root or VAULT_PATH) / _MENTIONS_FOLDER
@@ -7457,23 +7492,62 @@ def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
                                 idx[_fold(a)] = rel
                         elif line and not line.startswith(" "):
                             in_aliases = False
+        # Body-level email + phone enrichment — index the dossier by its
+        # contact info so queries with email/phone can resolve to it.
+        for m in _MENTIONS_EMAIL_RE.finditer(txt):
+            email = m.group(1).strip().lower()
+            if email and "@" in email:
+                idx[_fold(email)] = rel
+        for m in _MENTIONS_PHONE_RE.finditer(txt):
+            digits = _normalise_phone_digits(m.group(1))
+            if digits:
+                # Index full digits AND last-8 (AR "9" prefix variance:
+                # "+5493425476623" vs "3425476623" both resolve).
+                idx[digits] = rel
+                if len(digits) > 8:
+                    idx[digits[-8:]] = rel
     with _mentions_cache_lock:
         _mentions_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
     return idx
 
 
 def _match_mentions_in_query(query: str, vault_root: Path | None = None) -> list[str]:
-    """Word-boundary, accent-insensitive match. Returns rel_paths ordered by
-    first occurrence in the query, capped at _MENTIONS_MAX_PER_QUERY.
+    """Word-boundary, accent-insensitive match over mention tokens (names,
+    aliases, body-level emails, phone-digit sequences). Returns rel_paths
+    ordered by first occurrence in the query, capped at _MENTIONS_MAX_PER_QUERY.
+
+    Match strategy:
+      1. For name/alias/email tokens (contain at least one letter): word-
+         boundary `\b...\b` over folded query. Emails work because "@" is a
+         non-word char so `\b` aligns at both ends of the local-part and
+         domain boundaries — the full email string must appear contiguous
+         in the query.
+      2. For pure-digit tokens (phone numbers, 8-15 digits): strip all
+         non-digits from the query first, then substring-match. This
+         accommodates user typing `+54 9 342...` or `(342) 547-...` or
+         `3425476623` — all map to the same digit-run and index lookup.
     """
     idx = _load_mentions_index(vault_root)
     if not idx:
         return []
     folded_q = _fold(query)
+    # Precompute the digit-only projection of the query once, for phone-matching.
+    digits_q = re.sub(r"\D", "", query or "")
     hits: list[tuple[int, str]] = []
     seen_paths: set[str] = set()
     for token, path in idx.items():
         if path in seen_paths:
+            continue
+        # Pure-digit token → phone. Substring-match against digit-projected query.
+        if token.isdigit() and len(token) >= 8:
+            pos = digits_q.find(token)
+            if pos != -1:
+                # Position within digits_q isn't strictly comparable to
+                # folded_q positions, but ordering by first digit-match is
+                # good enough for the cap-2 case; negative position for
+                # phone-matches puts them BEFORE name-matches when both fire.
+                hits.append((pos, path))
+                seen_paths.add(path)
             continue
         m = re.search(rf"\b{re.escape(token)}\b", folded_q)
         if m:

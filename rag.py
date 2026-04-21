@@ -12087,6 +12087,30 @@ def _log_contradictions(
         _log_sql_state_error("contradictions_sql_write_failed", err=repr(exc))
 
 
+def _frontmatter_contradicts_set(path: Path) -> set[str]:
+    """Return the current `contradicts:` set from disk, or empty.
+
+    Idempotency helper for the async path — used by
+    `_check_and_flag_contradictions` to short-circuit before writing the
+    frontmatter when the set hasn't changed. Without this, the async
+    daemon path would create a re-index loop: daemon writes frontmatter
+    → watch detects mtime bump → re-index → daemon detects same
+    contradictions → writes identical frontmatter → ad infinitum.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return set()
+    try:
+        fm = parse_frontmatter(raw) or {}
+    except Exception:
+        return set()
+    current = fm.get("contradicts") or []
+    if not isinstance(current, list):
+        return set()
+    return {str(p) for p in current if p}
+
+
 def _update_contradicts_frontmatter(path: Path, contradicts: list[str]) -> bool:
     """Write/replace `contradicts: [...]` in the note's YAML frontmatter.
 
@@ -12155,6 +12179,11 @@ def _check_and_flag_contradictions(
     if not contrad:
         return None  # ran cleanly, nothing to flag — no log entry
     paths = [c["path"] for c in contrad]
+    # Idempotence guard: if the on-disk set already matches, skip the write +
+    # log + console alert entirely. Otherwise the async daemon path would
+    # bounce watch → reindex → daemon → rewrite same frontmatter → watch …
+    if _frontmatter_contradicts_set(path) == set(paths):
+        return None
     if not _update_contradicts_frontmatter(path, paths):
         _log_contradictions(doc_id_prefix, skipped="error")
         return None
@@ -12170,6 +12199,207 @@ def _check_and_flag_contradictions(
     helper_raw = contrad[0].get("_helper_raw", "") if contrad else ""
     _log_contradictions(doc_id_prefix, contrad=contrad, helper_raw=helper_raw)
     return (new_raw, file_hash(new_raw))
+
+
+# ── CONTRADICTION ASYNC DAEMON ───────────────────────────────────────────────
+# Detecting contradictions at index time is a ~5-10s chat-model call (see
+# `find_contradictions_for_note`). When it ran synchronously inside
+# `_index_single_file`, every `rag watch` save blocked for 10s+ before the
+# user's edit felt "saved". Bulk `rag index` paid the same cost per file.
+#
+# This section lifts the check onto a registered daemon thread, mirroring the
+# pattern from `web/server.py:_CONV_WRITERS` + `_drain_conversation_writers`:
+#
+#   * `_spawn_contradiction_worker` runs the check on a daemon thread and
+#     registers it in `_CONTRA_WRITERS` so shutdown can drain it.
+#   * `_drain_contradiction_workers` (called via `atexit`) joins in-flight
+#     workers up to 10s (more laxer than web's 5s because the chat model
+#     is slower than a SQL upsert); stragglers self-persist to the pending
+#     JSONL via the exception path and get retried at next startup.
+#   * `_retry_pending_contradictions` consumes the pending file when the
+#     next `rag index` / `rag watch` boots.
+#   * `_dispatch_contradiction_check` is the replacement call-site: sync by
+#     default when `_CONTRADICTION_ASYNC` is false (tests), daemon-thread
+#     when true (production).
+#
+# The async path returns `None` to the caller — i.e. `_index_single_file`
+# proceeds with the pre-check raw/hash, and the `contradicts:` frontmatter
+# lands seconds later. Watch picks up the frontmatter write as a new edit
+# and re-indexes with the now-flagged content. The second pass is cheap:
+# `_update_contradicts_frontmatter` no-ops when the contradict set hasn't
+# changed (added here as part of the async fix to close the loop).
+#
+# Tests can disable the async path via `_CONTRADICTION_ASYNC=0` in the env,
+# or monkeypatch `_dispatch_contradiction_check` directly. Most existing
+# tests already stub `_check_and_flag_contradictions` to a no-op so they
+# are unaffected.
+
+_CONTRA_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "contradiction_pending.jsonl"
+_CONTRA_WRITERS_LOCK = threading.Lock()
+_CONTRA_WRITERS: "set[threading.Thread]" = set()
+# Env knob: set to "0" in tests that assert on post-index frontmatter state.
+# Default enabled — production code benefits from non-blocking index.
+_CONTRADICTION_ASYNC_ENV = os.environ.get("_CONTRADICTION_ASYNC", "1")
+
+
+def _contradiction_async_enabled() -> bool:
+    """Resolved at call time (not module-load) so tests can flip it
+    via `monkeypatch.setenv` without reloading `rag`.
+    """
+    return os.environ.get("_CONTRADICTION_ASYNC", _CONTRADICTION_ASYNC_ENV) != "0"
+
+
+def _append_pending_contradiction(rec: dict) -> None:
+    """Spill a contradiction-check payload to the retry JSONL. Best-effort."""
+    try:
+        _CONTRA_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _CONTRA_PENDING_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        _silent_log("contradiction_pending_write", exc)
+
+
+def _contradiction_worker_wrapper(
+    col: SqliteVecCollection,
+    path: Path,
+    text: str,
+    doc_id_prefix: str,
+) -> None:
+    """Daemon body: run `_check_and_flag_contradictions`, self-deregister.
+
+    Any exception (chat model down, file moved mid-check, fs write fail)
+    spills to the pending JSONL so the next `rag index` / `rag watch`
+    boot can retry. We still remove ourselves from `_CONTRA_WRITERS` in
+    the `finally` — the set must not leak threads.
+    """
+    try:
+        _check_and_flag_contradictions(col, path, text, doc_id_prefix)
+    except Exception as exc:
+        _silent_log("contradiction_worker_exception", exc)
+        _append_pending_contradiction({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "path": str(path),
+            "text": text,
+            "doc_id_prefix": doc_id_prefix,
+            "error": repr(exc),
+        })
+    finally:
+        with _CONTRA_WRITERS_LOCK:
+            _CONTRA_WRITERS.discard(threading.current_thread())
+
+
+def _spawn_contradiction_worker(
+    col: SqliteVecCollection,
+    path: Path,
+    text: str,
+    doc_id_prefix: str,
+) -> threading.Thread:
+    """Launch the contradiction check on a daemon thread + register it."""
+    t = threading.Thread(
+        target=_contradiction_worker_wrapper,
+        args=(col, path, text, doc_id_prefix),
+        name=f"contradict-{doc_id_prefix}",
+        daemon=True,
+    )
+    with _CONTRA_WRITERS_LOCK:
+        _CONTRA_WRITERS.add(t)
+    t.start()
+    return t
+
+
+def _drain_contradiction_workers(timeout: float = 10.0) -> None:
+    """On CLI exit, give in-flight contradiction workers up to 10s to
+    finish. Stragglers self-persist to the pending JSONL via the
+    exception path in `_contradiction_worker_wrapper` and get re-applied
+    at next startup. We never block indefinitely — a wedged chat model
+    must not prevent process exit.
+
+    Idempotent: safe to register multiple times (atexit dedups by
+    callable identity) and safe to call manually from tests.
+    """
+    with _CONTRA_WRITERS_LOCK:
+        pending = list(_CONTRA_WRITERS)
+    if not pending:
+        return
+    deadline = time.monotonic() + float(timeout)
+    for t in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+    with _CONTRA_WRITERS_LOCK:
+        stragglers = [t for t in _CONTRA_WRITERS if t.is_alive()]
+    if stragglers:
+        try:
+            _silent_log(
+                "contradiction_shutdown_timeout",
+                RuntimeError(f"{len(stragglers)} workers still running"),
+            )
+        except Exception:
+            pass
+
+
+atexit.register(_drain_contradiction_workers)
+
+
+def _retry_pending_contradictions(col: SqliteVecCollection) -> int:
+    """Drain `_CONTRA_PENDING_PATH` on startup. Returns number of entries
+    successfully re-dispatched. Best-effort: failures stay in the file
+    for the next run. Each surviving entry keeps its original text +
+    doc_id_prefix so the retry sees the same content even if the file
+    on disk was further modified.
+    """
+    if not _CONTRA_PENDING_PATH.is_file():
+        return 0
+    try:
+        raw = _CONTRA_PENDING_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return 0
+    remaining: list[str] = []
+    retried = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            p = Path(rec["path"])
+            if not p.is_file():
+                # File went away; drop the entry silently.
+                continue
+            _spawn_contradiction_worker(col, p, rec["text"], rec["doc_id_prefix"])
+            retried += 1
+        except Exception:
+            remaining.append(line)
+    try:
+        if remaining:
+            _CONTRA_PENDING_PATH.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+        else:
+            _CONTRA_PENDING_PATH.unlink(missing_ok=True)
+    except Exception as exc:
+        _silent_log("contradiction_pending_rewrite", exc)
+    return retried
+
+
+def _dispatch_contradiction_check(
+    col: SqliteVecCollection,
+    path: Path,
+    text: str,
+    doc_id_prefix: str,
+) -> tuple[str, str] | None:
+    """Unified entry point for the index-time contradiction check.
+
+    * When `_CONTRADICTION_ASYNC` is on (default), spawns a daemon thread
+      and returns `None` immediately — the frontmatter `contradicts:` flag
+      lands seconds later, after which watch re-indexes naturally.
+    * When off (tests / debug), runs synchronously and returns the
+      `(new_raw, new_hash)` tuple the caller needs to re-parse if the
+      frontmatter was rewritten. Preserves the pre-async behavior verbatim.
+    """
+    if _contradiction_async_enabled():
+        _spawn_contradiction_worker(col, path, text, doc_id_prefix)
+        return None
+    return _check_and_flag_contradictions(col, path, text, doc_id_prefix)
 
 
 # ── AMBIENT AGENT ────────────────────────────────────────────────────────────
@@ -12878,8 +13108,15 @@ def _index_single_file(
     # Contradiction check runs before re-embedding so we only pay once. The
     # collection still holds the old version of this note if any — we exclude
     # `doc_id_prefix` from the candidate set regardless.
+    #
+    # `_dispatch_contradiction_check` is sync (returns `(raw, hash)` tuple)
+    # when `_CONTRADICTION_ASYNC=0` is set (tests / debug), or async (returns
+    # `None`, spawns daemon thread) in production. On the async path the
+    # frontmatter `contradicts:` lands seconds later and watch re-indexes
+    # naturally; idempotence inside `_check_and_flag_contradictions` prevents
+    # the loop from repeating when the set hasn't changed.
     if not skip_contradict:
-        updated = _check_and_flag_contradictions(col, path, text, doc_id_prefix)
+        updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
         if updated:
             raw, h = updated
             fm = parse_frontmatter(raw)
@@ -12974,6 +13211,15 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     _invalidate_corpus_cache()
     # Contradiction check only runs in incremental mode and when not opted out.
     check_contradictions = not reset and not no_contradict
+
+    # Drain any contradiction checks that got spilled to the pending JSONL on
+    # a previous exit (ctrl-C mid-index, ollama down mid-run, etc). No-op if
+    # the file doesn't exist or is empty.
+    if check_contradictions:
+        try:
+            _retry_pending_contradictions(col)
+        except Exception as exc:
+            _silent_log("contradiction_retry_index", exc)
 
     if reset:
         with _collection_write_lock():
@@ -13150,8 +13396,13 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
         # incoming content contradicts anything already in the vault. When
         # it does, the note's frontmatter is rewritten in place and we pick
         # up the new raw/hash here.
+        #
+        # Uses `_dispatch_contradiction_check` so bulk `rag index` doesn't
+        # block on a 5-10s chat-model call per file — the daemon thread
+        # writes `contradicts:` in the background and the next incremental
+        # pass picks it up (idempotent if unchanged).
         if check_contradictions:
-            updated = _check_and_flag_contradictions(col, path, text, doc_id_prefix)
+            updated = _dispatch_contradiction_check(col, path, text, doc_id_prefix)
             if updated:
                 raw, h = updated
                 fm = parse_frontmatter(raw)
@@ -13519,6 +13770,17 @@ def watch(debounce: float, all_vaults: bool):
     if not vault_state:
         console.print("[red]No hay vaults observables.[/red]")
         return
+
+    # Retry any contradiction-check payloads that got spilled to disk on a
+    # previous exit (ctrl-C, ollama unreachable, etc). Each pending entry
+    # re-enters the daemon queue and self-clears once it runs. Per-vault
+    # loop because _retry_pending_contradictions is keyed on the collection
+    # (we don't want to dispatch for the wrong vault).
+    for vstate in vault_state:
+        try:
+            _retry_pending_contradictions(vstate["col"])
+        except Exception as exc:
+            _silent_log("contradiction_retry_watch", exc)
 
     class Handler(FileSystemEventHandler):
         def __init__(self, vstate: dict):
@@ -20530,6 +20792,30 @@ _TIME_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Narrower counterpart used by `_parse_natural_datetime` to decide whether
+# the input had an EXPLICIT clock — i.e. a specific hour the user meant.
+# `_TIME_MARKER_RE` above also matches `mañana` as a "time marker" because
+# it doubles as period-of-day ("a la mañana"), but on its own "mañana"
+# is a day word. When the input is day-only we want to normalize to a
+# default hour (09:00) instead of echoing dateparser's leak of the
+# anchor's runtime hour + microseconds (the "2026-04-22T03:01:35.115"
+# bug reported 2026-04-21).
+#
+# Matches:
+#   - Digit clocks: 20hs / 20h / 20:30 / 8am / 4pm / 14:00
+#   - Period words only when preceded by "a la/las/medio/eso de" →
+#     "a la mañana" (≈09:00), "a la tarde" (≈16:00), "al mediodía"
+#     (12:00). Bare "mañana"/"tarde"/"noche" DO NOT qualify.
+_CLOCK_RE_EXPLICIT = re.compile(
+    r"\d{1,2}\s*(?:hs?|h|am|pm|:)"
+    r"|\d{1,2}:\d{2}"
+    r"|\ba\s+las?\s+\d{1,2}"
+    r"|\b(?:al|a\s+la)\s+(?:medio.?d[ií]a|medianoche|ma[ñn]ana|tarde|noche|"
+    r"tardecita|nochecita)\b"
+    r"|\beso\s+de\s+las?\s+\d{1,2}",
+    re.IGNORECASE,
+)
+
 
 # ── Create-intent detection (shared by web `/api/chat` + CLI `rag chat`) ─────
 #
@@ -20547,10 +20833,85 @@ _TIME_MARKER_RE = re.compile(
 #   3. Statement with visit pattern (viene/pasa/llega/visita X) + temporal
 #      + not a question. "mañana viene gracia a casa".
 
+# Bare meta-chat messages — greetings, thanks, "what can you do". They
+# should NOT go through retrieval + the `_WEB_SYSTEM_PROMPT` "engancháte
+# con el contexto" rule, which otherwise produces "Según tus notas, tenés
+# varias interacciones con diferentes contactos por WhatsApp..." for a
+# simple "hola" (reported 2026-04-21 Playwright probe, Fer F.). The web
+# handler short-circuits with a canned response; CLI/WA use their own
+# flows but can borrow the detector for consistency.
+#
+# Matching strategy: tight. False negatives ("qué tal el proyecto") are
+# fine — they route through the normal retrieve pipeline and get a useful
+# answer. False positives (a real question matched as meta) are bad —
+# user gets a canned "¡Hola!" instead of a real answer.
+_METACHAT_RE = re.compile(
+    # Optional opening "¿" (rioplatense question mark). Hoisted out of the
+    # per-alternative list so every branch gets it — previously only meta-
+    # question alternatives carried the `¿?\s*` prefix, so "¿cómo estás?"
+    # didn't match.
+    r"^\s*¿?\s*(?:"
+    # Greetings
+    r"hola|holi|holis|buenas(?:\s+tardes|\s+noches|\s+d[ií]as)?|buen\s+d[ií]a|"
+    r"hi|hey|hello|saludos|qu[eé]\s+tal|qu[eé]\s+onda|c[oó]mo\s+(?:est[aá]s|and[aá]s|va)|"
+    # Thanks / closings (bare, not followed by content)
+    r"gracias|muchas\s+gracias|mil\s+gracias|dale\s+gracias|thanks|thx|"
+    r"chau|bye|adi[oó]s|nos\s+vemos|"
+    # Meta-questions about the bot
+    r"qu[eé]\s+pod[eé]s\s+hacer|"
+    r"qu[eé]\s+sab[eé]s\s+hacer|"
+    r"c[oó]mo\s+(?:funcion[aá]s|te\s+us[oa]|te\s+uso)|"
+    r"qu[eé]\s+comandos\s+(?:hay|tenes|ten[eé]s|ten[eé]i?s)|"
+    r"ayuda|help|"
+    r"qui[eé]n\s+sos|qui[eé]n\s+es\s+este\s+bot"
+    r")"
+    # Optional very short trailing text (up to 20 chars), then end.
+    # This lets "hola, cómo estás?" through but rejects long queries
+    # that happen to start with "hola".
+    r"\s*[!?.¡¿,:;]*\s*.{0,20}$",
+    re.IGNORECASE,
+)
+
+
+def _detect_metachat_intent(q: str) -> bool:
+    """Return True if `q` is a bare greeting / thank-you / meta-question
+    about the bot. Used by the web `/api/chat` handler to short-circuit
+    retrieval + LLM generation with a canned response — otherwise the
+    _WEB_SYSTEM_PROMPT "engancháte con el CONTEXTO" rule produces
+    fabricated "según tus notas..." prose for inputs that have no real
+    question to answer.
+
+    Tight matcher by design: false-negative "qué tal el proyecto" → still
+    routes through retrieve (good); false-positive "hola" → canned reply
+    (fine). See `_METACHAT_RE` for the full pattern list.
+    """
+    if not q:
+        return False
+    s = q.strip()
+    if not s:
+        return False
+    # Only fire on short messages — long queries that happen to start
+    # with "hola" ("hola necesito saber X") should still hit retrieval.
+    if len(s) > 40:
+        return False
+    return bool(_METACHAT_RE.match(s))
+
+
 _PROPOSE_INTENT_RE = re.compile(
-    # Reminder triggers.
-    r"\brecord[aá](?:me|te|rme|arme)\b"
-    r"|\bacord[aá](?:te|rme|ate|áte)\b"
+    # Reminder triggers. `anot[aá](?:me|rme)` + `apunt[aá](?:me|rme)` +
+    # `no te olvides de` added 2026-04-21 after the Fer F. Playwright probe
+    # found that "anotame llamar al plomero el viernes" fell through to a
+    # plain retrieval path and the LLM fabricated "Se ha registrado tu
+    # recordatorio…" without calling any tool (silent hallucination —
+    # user thinks something was saved, nothing was). Mirrors
+    # `detectReminderIntent` in whatsapp-listener/listener.ts which already
+    # covered these verbs.
+    r"\brecord[aá](?:me|te|rme|arme|d)?\b"
+    r"|\brecu[eé]rda(?:me)?\b"
+    r"|\bacord[aá](?:te|rme|ate|áte|me)\b"
+    r"|\banot[aá](?:me|rme)?\b"
+    r"|\bapunt[aá](?:me|rme)?\b"
+    r"|\bno\s+te\s+olvides(?:\s+de)?\b"
     r"|\bagend[aá]me\b"
     r"|\bpon[eé](?:me|te|le)?\s+(?:un\s+)?recordatorio\b"
     r"|\bagreg(?:á|a|ar)\s+(?:un\s+)?recordatorio\b"
@@ -20566,7 +20927,6 @@ _PROPOSE_INTENT_RE = re.compile(
     # required because these verbs directly mean "put this in the calendar".
     r"|\bcalendariz(?:á|ar|arl[oa]|al[oa]|ame|armel[oa]|amel[oa])\b"
     r"|\bagend[aá](?:l[oa]|ame(?:l[oa])?|r|ar)\b"
-    r"|\banot(?:á|ame|arl[oa]|al[oa])\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b"
     r"|\bpon(?:é|el[oa]|eme|ele)\s+(?:en\s+)?(?:el\s+|la\s+)?(?:calendario|agenda)\b",
     re.IGNORECASE,
 )
@@ -20738,6 +21098,32 @@ def _parse_natural_datetime(
         if _has_time_marker and dt.replace(second=0, microsecond=0) == anchor.replace(second=0, microsecond=0):
             dt = None
         else:
+            # No EXPLICIT clock time in the input → dateparser defaulted
+            # to the anchor's time component ("mañana" with anchor=
+            # 03:01:35.115 returns tomorrow at 03:01:35.115). That leaks
+            # the bot's runtime hour + microseconds into the reminder's
+            # due_iso; users see "recordame X mañana" produce
+            # "2026-04-22T03:01:35.115539" (reported 2026-04-21 Playwright
+            # probe, Fer F.).
+            #
+            # `_TIME_MARKER_RE` is too broad for this guard — it flags
+            # "mañana" (the day word) as a time marker because the same
+            # literal is also used as period-of-day ("a la mañana" ≈
+            # 09:00). Use `_CLOCK_RE_EXPLICIT` below to require a
+            # digit-bearing clock or a period-word preceded by "a la…".
+            # Without that, every day-only input like "mañana" /
+            # "el viernes" / "hoy" fell into the else branch and kept
+            # the leaked anchor time.
+            #
+            # Normalize day-only inputs to a sensible default hour:
+            # 09:00 AR-local is the slot Siri uses when users create
+            # day-only reminders via dictation. Zero out seconds /
+            # microseconds for clock-bearing inputs so downstream ISOs
+            # are clean.
+            if not _CLOCK_RE_EXPLICIT.search(s_norm):
+                dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
+            else:
+                dt = dt.replace(second=0, microsecond=0)
             return dt
 
     # LLM fallback. Prompt explicitly flags rioplatense so the helper

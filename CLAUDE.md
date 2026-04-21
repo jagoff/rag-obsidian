@@ -131,6 +131,17 @@ query → classify_intent → infer_filters [auto]
 
 **Auto-deep retrieval**: when top rerank score < `CONFIDENCE_DEEP_THRESHOLD` (0.10), `deep_retrieve()` auto-triggers: helper model judges sufficiency → generates focused sub-query → second retrieve pass → merge results. Max 3 iterations. Disable with `--no-deep`.
 
+**Rerank pool** (`RERANK_POOL_MAX = 15`, dropped from 30 on 2026-04-21): cap on candidates scored by the cross-encoder. `rag eval --latency` bench sweep (pool=30/25/20/15 × 60 singles + 30 chains):
+
+| pool | singles hit@5 | singles MRR | chains MRR | singles P50 | singles P95 |
+|---|---|---|---|---|---|
+| 30 | 71.67% | 0.679 | 0.740 | 2157 ms | 4704 ms |
+| 25 | 71.67% | 0.679 | 0.740 | 1899 ms | 2333 ms |
+| 20 | 71.67% | 0.681 | 0.757 | 1458 ms | 1914 ms |
+| **15** | **71.67%** | **0.681** | **0.790** | **1163 ms** | **1577 ms** |
+
+Pool=15 domina: hit@5 bit-identical, MRR chains **+5pp** (less noise in the rerank head), P95 singles **−66%** (−3.1s). The pre-existing comment claiming "pool=25 pierde 1 hit (90.48% vs 95.24%)" was measured against a smaller/older `queries.yaml` and does not reproduce on the current corpus. Web `/api/chat` still passes `rerank_pool=5` explicitly; CLI inherits the default. `rag tune` now fits weights on pool=15 feature vectors (old weights fit on pool=30 should be re-tuned — default weights are unaffected).
+
 **Corpus cache** (`_load_corpus`): BM25 + vocab built once, invalidated by `col.count()` delta. Cold 341ms → warm 2ms. Do not touch without re-measuring.
 
 **Cache locks (concurrency invariants)** — the web server hits rag from multiple threads concurrently, so every module-level cache that gets written more than once is protected:

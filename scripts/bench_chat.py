@@ -44,7 +44,8 @@ def run_query(
     """Ejecuta una query completa (retrieve + LLM streaming) y devuelve timing.
 
     Mirror-ea el flujo de rag.py `chat()` loop: multi_retrieve con no_deep,
-    rerank_pool=15, luego ollama.chat con _CLI_CHAT_OPTIONS. No lee stdin.
+    pool=RERANK_POOL_MAX default, luego ollama.chat con _CLI_CHAT_OPTIONS.
+    No lee stdin.
     """
     history = history or []
     t_turn = time.perf_counter()
@@ -55,7 +56,6 @@ def run_query(
         folder=None, history=history, tag=None, precise=False,
         multi_query=True, auto_filter=True,
         date_range=None, summary=None,
-        rerank_pool=15,
     )
     retrieve_ms = int((time.perf_counter() - t_retrieve) * 1000)
 

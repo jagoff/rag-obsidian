@@ -1314,7 +1314,7 @@ def cleanup_sessions(ttl_days: int = SESSION_TTL_DAYS) -> int:
 EMBED_MODEL = "bge-m3"  # multilingual (ES/EN), 1024-dim
 # Chat model preference: first available wins.
 # Orden tras bench 2026-04-18 (ver scripts/bench_chat.py, 5 queries × 2 runs
-# warm sobre vault work, rerank_pool=15, num_ctx=4096):
+# warm sobre vault work, rerank_pool default, num_ctx=4096):
 #   qwen2.5:7b     — total P50 5.9s, best 3.2s (dense, Q4_K_M, 4.7 GB)
 #   qwen3:30b-a3b  — total P50 7.6s (MoE 3B activos, buena quality, 18 GB)
 #   command-r:35b  — total P50 37s (RAG-trained pero prefill+decode 10x slower)
@@ -1675,10 +1675,30 @@ def is_excluded(rel_path: str) -> bool:
     return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
-# 2 métodos el pool crudo llega a 70-80 únicos. Cap a 30 ahorra ~500ms vs 40
-# (30×50ms=1.5s vs 40×50ms=2s). Pool=25 probado: pierde 1 hit en eval (90.48%
-# vs 95.24%); pool=30 es el sweet spot validado empíricamente.
-RERANK_POOL_MAX = 30
+# 2 métodos el pool crudo llega a 70-80 únicos. Cap más chico = menos pares
+# a scorear = menos latencia.
+#
+# Bench 2026-04-21 sobre `rag eval --latency` (60 singles + 30 chains, vault
+# warm, RAG_LOCAL_EMBED=1, k=5):
+#
+#   pool=30  singles hit@5=71.67%  MRR=0.679  chains MRR=0.740  P50/P95= 2157/4704ms
+#   pool=25  singles hit@5=71.67%  MRR=0.679  chains MRR=0.740  P50/P95= 1899/2333ms
+#   pool=20  singles hit@5=71.67%  MRR=0.681  chains MRR=0.757  P50/P95= 1458/1914ms
+#   pool=15  singles hit@5=71.67%  MRR=0.681  chains MRR=0.790  P50/P95= 1163/1577ms
+#
+# Pool=15 gana en todo: mantiene hit@5 bit-identical, mejora MRR de chains
+# (0.740→0.790, +5pp recall@5) por menos noise en la cabeza del ranking,
+# y corta latencia P95 singles 66% (-3.1s). El comentario previo ("pool=25
+# pierde 1 hit 90.48% vs 95.24%") fue medido sobre un queries.yaml anterior;
+# con el set actual (cross-source queries incluidas) no se reproduce. El
+# trade-off rerank_pool vs quality ya lo absorbía `rag chat` (rerank_pool=15
+# hardcoded) — este commit lo extiende a todos los callers.
+#
+# Nota: `rag tune --apply` ajusta weights sobre `k_pool=RERANK_POOL_MAX` (ver
+# `find_ranker_weights`). Bajar el default invalida weights viejos — re-corré
+# `rag tune --apply` si venías usando tuning custom. Weights default (todos
+# en 0 salvo recency_cue) no se ven afectados.
+RERANK_POOL_MAX = 15
 RERANK_TOP = 5     # final chunks after reranking
 PROGRESSIVE_CONTEXT_K = 6   # extra chunks for progressive context (summarized to 1-liners)
                             # bajado 15→6: cada entry cuesta prefill, y con top-5
@@ -12685,22 +12705,20 @@ def collect_ranker_features(
 
     Mirrors `retrieve()` but stops one step short of the weighted sort.
 
-    ⚠️ Feature-pool mismatch caveat (documented 2026-04-20 audit):
-    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=30` (see
-    `tune_cmd` ~L15344-15386). Production callers use different pools:
-    CLI `rag chat` passes `rerank_pool=15`; web `/api/chat` passes
-    `rerank_pool=5`. The weights `rag tune --apply` writes are
-    therefore fit on 30-candidate feature vectors but consumed by
-    retrieve paths that only ever score 5-15. Features that
-    only discriminate outside the runtime top-5 (e.g. a tag match on
-    rank 20 vs. rank 30) can receive spurious non-zero weights.
+    ⚠️ Feature-pool mismatch caveat (documented 2026-04-20 audit, re-scoped
+    2026-04-21 when RERANK_POOL_MAX dropped 30→15):
+    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=15`. Production
+    callers use different pools: CLI (`rag query`, `rag chat`) inherits the
+    default (15); web `/api/chat` passes `rerank_pool=5`. Weights that
+    `rag tune --apply` writes are fit on 15-candidate feature vectors but
+    consumed by retrieve paths that score 5-15 at runtime. Closer than the
+    pre-2026-04-21 30-vs-{5,15} gap, but web surface remains mismatched.
 
-    No empirical regression measured yet — the hit@5 baseline
-    (76.19%/63.64% CI lower bounds) survives with the mismatch, so
-    leaving this as-is until a dedicated tune-vs-runtime parity study.
-    When that study runs, either (a) bake `k_pool` into ranker.json
-    and have retrieve read it, or (b) align the tune pool to whichever
-    surface dominates user traffic (currently the web chat at pool=5).
+    No empirical regression measured (hit@5 unchanged pool=30→15; see
+    bench block next to `RERANK_POOL_MAX`). When the tune-vs-runtime parity
+    study happens, either (a) bake `k_pool` into ranker.json and have
+    retrieve read it, or (b) align the tune pool to the dominant surface
+    (currently web chat at pool=5).
     """
     if col.count() == 0:
         return []
@@ -16807,16 +16825,13 @@ def chat(
         _t_turn_start = time.perf_counter()
         _t_retrieve_start = time.perf_counter()
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
-            # rerank_pool=15 balancea quality/latency:
-            #   - pool=30 (default) × batch_size=1 = 3s rerank por pasada MPS
-            #   - pool=15 procesa en 1 batch, ~500-800ms
-            #   - multi-query (3 variantes) × 2 vaults genera <15 candidates
-            #     únicos post-RRF en mayoría de queries → 15 cubre todo.
+            # Pool default (RERANK_POOL_MAX=15, ver bench 2026-04-21 arriba).
+            # Multi-query (3 variantes) × N vaults genera <15 candidates
+            # únicos post-RRF en mayoría de queries → 15 cubre todo.
             result = multi_retrieve(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=not no_multi, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
-                rerank_pool=15,
             )
             # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
             # match en el vault, deep no va a encontrar nada nuevo).
@@ -16830,7 +16845,6 @@ def chat(
                     multi_query=not no_multi, auto_filter=not no_auto_filter,
                     date_range=pinned_date_range, summary=sess_summary,
                     deep=True,
-                    rerank_pool=15,
                 )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")

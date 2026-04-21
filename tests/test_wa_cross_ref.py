@@ -93,7 +93,9 @@ def test_parse_mention_dossier_without_frontmatter(vault: Path) -> None:
         "04-Archive/99-obsidian-system/99-Mentions/Grecia.md",
         vault_root=vault,
     )
-    assert d == {"name": "Grecia", "aliases": []}
+    # `phone_digits` added 2026-04-21 alongside `name` / `aliases` — the
+    # Grecia fixture has no phone line so the field is empty.
+    assert d == {"name": "Grecia", "aliases": [], "phone_digits": ""}
 
 
 def test_parse_mention_dossier_with_aliases(vault: Path) -> None:
@@ -428,6 +430,78 @@ def test_nickname_cached_by_mtime(tmp_path: Path) -> None:
     assert cached_before is not None
     assert rag._load_user_nickname(tmp_path) == "Lucía"
     assert rag._user_nickname_cache is cached_before
+
+
+# ── _load_phone_index + _resolve_sender_to_name ────────────────────────────
+
+
+@pytest.fixture
+def vault_with_phones(tmp_path: Path) -> Path:
+    """Vault with Mentions dossiers carrying phones for sender resolution."""
+    mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
+    mentions.mkdir(parents=True)
+    (mentions / "Grecia.md").write_text(
+        "[[Grecia|@Grecia]]\n"
+        "- **Relación**: hija\n"
+        "- **Teléfono**: +54 9 342 5153999\n",
+        encoding="utf-8",
+    )
+    (mentions / "Seba.md").write_text(
+        "---\naliases: [Sebastián]\n---\n"
+        "- **Teléfono**: +54 9 11 8765 4321\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_phone_index_extracts_digits(vault_with_phones: Path) -> None:
+    rag._phone_index_cache = None
+    idx = rag._load_phone_index(vault_root=vault_with_phones)
+    # Digits-only keys; both entries present.
+    assert "5493425153999" in idx
+    assert idx["5493425153999"] == "Grecia"
+    assert "5491187654321" in idx
+    assert idx["5491187654321"] == "Seba"
+
+
+def test_resolve_sender_with_matching_phone(vault_with_phones: Path) -> None:
+    rag._phone_index_cache = None
+    # Full JID with suffix.
+    assert rag._resolve_sender_to_name(
+        "5493425153999@s.whatsapp.net", vault_root=vault_with_phones,
+    ) == "Grecia"
+    # Bare digits.
+    assert rag._resolve_sender_to_name(
+        "5493425153999", vault_root=vault_with_phones,
+    ) == "Grecia"
+
+
+def test_resolve_sender_unmapped_shows_last_4(vault_with_phones: Path) -> None:
+    """Unknown senders render as `…8025` (last 4 digits), not the full JID.
+    Otherwise groups with unknown members show like `34084894028025` which
+    is unreadable noise."""
+    rag._phone_index_cache = None
+    assert rag._resolve_sender_to_name(
+        "34084894028025@s.whatsapp.net", vault_root=vault_with_phones,
+    ) == "…8025"
+
+
+def test_resolve_sender_empty_uses_fallback(vault_with_phones: Path) -> None:
+    rag._phone_index_cache = None
+    assert rag._resolve_sender_to_name(
+        "", fallback="Grecia's group", vault_root=vault_with_phones,
+    ) == "Grecia's group"
+
+
+def test_resolve_sender_trailing_digits_match(vault_with_phones: Path) -> None:
+    """Country-code variations: a JID stored as `+54 9 342 5153999` in the
+    dossier should still match if WA reports the sender as a longer/
+    shorter variant. Implemented as suffix-overlap fallback."""
+    rag._phone_index_cache = None
+    # Incoming without country prefix, dossier stored with it.
+    assert rag._resolve_sender_to_name(
+        "3425153999", vault_root=vault_with_phones,
+    ) == "Grecia"
 
 
 def test_cross_ref_independent_of_nickname(vault: Path, wa_db: Path) -> None:

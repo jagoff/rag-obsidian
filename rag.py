@@ -23248,20 +23248,33 @@ def _load_user_nickname(vault_root: Path | None = None) -> str | None:
 
 
 def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dict:
-    """Extract `{name, aliases}` from a 99-Mentions/ dossier.
+    """Extract `{name, aliases, phone_digits}` from a 99-Mentions/ dossier.
 
     `name` is the filename stem. `aliases` are frontmatter `aliases:` entries
     (both inline `[a, b]` and multiline `  - a`), empty list if missing or
-    parse fails. Returns `{"name": "", "aliases": []}` if the file is
-    unreadable — caller should treat as "entity with no cross-ref possible".
+    parse fails. `phone_digits` is the digits-only normalization of the
+    `- **Teléfono**: …` body line (used by the WA cross-ref render to map
+    JID senders → human names). Returns sensible empty defaults on
+    unreadable files — caller treats as "entity with no cross-ref possible".
     """
     root = vault_root or VAULT_PATH
     p = root / rel_path
-    out: dict = {"name": p.stem, "aliases": []}
+    out: dict = {"name": p.stem, "aliases": [], "phone_digits": ""}
     try:
         txt = p.read_text(encoding="utf-8")
     except Exception:
         return out
+    # Body fallback for the phone: the `- **Teléfono**: …` line lives
+    # outside frontmatter, so parse it separately from the aliases block.
+    phone_match = re.search(
+        r"Tel[eé]fono\s*\**\s*:\s*([^\n]+)", txt, re.IGNORECASE,
+    )
+    if phone_match:
+        raw_phone = phone_match.group(1).strip()
+        # Skip obvious placeholders like "+54 9 ...".
+        digits = "".join(c for c in raw_phone if c.isdigit())
+        if len(digits) >= 10:
+            out["phone_digits"] = digits
     if not txt.startswith("---\n"):
         return out
     end = txt.find("\n---", 4)
@@ -23290,6 +23303,88 @@ def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dic
                 in_aliases = False
     out["aliases"] = aliases
     return out
+
+
+# Reverse index: phone_digits → entity name (filename stem). Built lazily
+# from 99-Mentions/ dossiers, cached by the folder mtime (same invalidation
+# strategy as `_mentions_cache`). Used by `_lookup_wa_mentions_for_entity`
+# to resolve group-message senders (JIDs like 34084894028025@s.whatsapp.net)
+# into human names when the JID happens to belong to a known Mention.
+_phone_index_cache: dict | None = None
+_phone_index_cache_lock = threading.Lock()
+
+
+def _load_phone_index(vault_root: Path | None = None) -> dict[str, str]:
+    """Return `{phone_digits: entity_name}` for every 99-Mentions/ dossier
+    that declares a phone number in its body. Digits-only keys so lookups
+    can tolerate `+54 9 …` formatting differences. Caches per MAX(mtime)
+    of the mentions folder; same invalidation as `_load_mentions_index`.
+    """
+    global _phone_index_cache
+    root = (vault_root or VAULT_PATH) / _MENTIONS_FOLDER
+    if not root.exists():
+        return {}
+    files = [p for p in root.glob("*.md") if not p.name.startswith("_")]
+    mtime_max = max((p.stat().st_mtime for p in files), default=0.0)
+    cache_key = str(root.resolve())
+    with _phone_index_cache_lock:
+        if (
+            _phone_index_cache
+            and _phone_index_cache.get("key") == cache_key
+            and _phone_index_cache.get("mtime") == mtime_max
+        ):
+            return _phone_index_cache["index"]
+    idx: dict[str, str] = {}
+    for p in files:
+        try:
+            d = _parse_mention_dossier(
+                str(p.relative_to(vault_root or VAULT_PATH)),
+                vault_root=vault_root or VAULT_PATH,
+            )
+        except Exception:
+            continue
+        digits = d.get("phone_digits") or ""
+        if len(digits) >= 10:
+            idx[digits] = d["name"]
+    with _phone_index_cache_lock:
+        _phone_index_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
+    return idx
+
+
+def _resolve_sender_to_name(
+    sender_raw: str,
+    fallback: str = "",
+    *,
+    vault_root: Path | None = None,
+) -> str:
+    """Resolve a WA message sender (JID or phone) to a human-friendly
+    name. Fallback strategies, in order:
+
+      1. If `sender_raw` is empty → `fallback` (usually the chat name).
+      2. Strip `@s.whatsapp.net` / `@g.us` suffix.
+      3. If the digits-only form matches a Mention dossier's `Teléfono`
+         line → return the dossier filename stem ("Grecia", "Seba").
+      4. If digits long enough, show `…<last 4>` (`"…8025"`) instead of
+         the full JID number — groups of unmapped senders become
+         readable.
+      5. Otherwise return whatever we had after stripping.
+    """
+    s = (sender_raw or "").strip()
+    if not s:
+        return fallback or "?"
+    local = s.split("@")[0]
+    digits = "".join(c for c in local if c.isdigit())
+    if len(digits) >= 10:
+        idx = _load_phone_index(vault_root=vault_root)
+        if digits in idx:
+            return idx[digits]
+        # Also try matching the last 10-13 digits against any dossier
+        # phone (handles stored numbers with/without country code).
+        for k, v in idx.items():
+            if k.endswith(digits[-10:]) or digits.endswith(k[-10:]):
+                return v
+        return f"…{digits[-4:]}"
+    return local or fallback or "?"
 
 
 def _lookup_wa_mentions_for_entity(
@@ -23392,8 +23487,17 @@ def _lookup_wa_mentions_for_entity(
             continue
         chat_name = r["chat_name"] or ""
         is_from_me = bool(r["is_from_me"])
-        who = "yo" if is_from_me else (
-            (r["sender"] or "").split("@")[0] or chat_name or "?"
+        # 2026-04-21 pushname fix: raw JID senders in groups were surfacing
+        # as "34084894028025" — noise. Resolve via phone → Mentions lookup
+        # first, then fall back to "…<last 4>" if unmapped. For DMs where
+        # the sender is already human-named through `chat_name`, prefer
+        # that.
+        who = (
+            "yo" if is_from_me
+            else _resolve_sender_to_name(
+                r["sender"] or "", fallback=chat_name,
+                vault_root=vault_root,
+            )
         )
         # Match classification — "chat" wins when the chat name contains
         # the token (dedicated conversation OR their group), even if the

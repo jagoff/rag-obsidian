@@ -156,7 +156,6 @@ def test_retry_pending_conversation_turns_sanitizes_legacy_infinity(
       3. El pending file queda vacío / borrado porque todas fueron
          consumidas.
     """
-    from datetime import datetime, timezone
 
     from web import server as server_mod
     from web import conversation_writer as cw

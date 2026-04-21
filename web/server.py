@@ -205,7 +205,8 @@ def _pick_metachat_reply(q: str, *, now: float | None = None) -> str:
     inputs or different minutes rotate. Tests monkey-patch with fixed
     `now` for determinism.
     """
-    import hashlib, time as _time
+    import hashlib
+    import time as _time
     bucket = _metachat_bucket(q)
     ts = now if now is not None else _time.time()
     minute = int(ts // 60)

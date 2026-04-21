@@ -5,7 +5,6 @@ window, keeping the highest-scored. Non-WA sources pass through.
 """
 from __future__ import annotations
 
-import pytest
 
 import rag
 

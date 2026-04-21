@@ -12,7 +12,6 @@ Uses the same offline test harness as `test_retrieve_synthetic_eval.py`
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 

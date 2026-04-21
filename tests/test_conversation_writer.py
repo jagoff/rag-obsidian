@@ -1,7 +1,5 @@
-import json
 import multiprocessing as mp
 import sqlite3
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 

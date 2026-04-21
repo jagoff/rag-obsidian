@@ -19,8 +19,6 @@ Tres piezas bajo test:
      obtiene el texto OCR, concatena al body con un marker que el user
      puede ver (pero no corrompe el display original del markdown).
 """
-import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -281,7 +279,8 @@ def test_ocr_image_cache_invalidates_on_mtime_change(
     assert "first" in t1
 
     # Modificamos la imagen — mtime cambia.
-    import os, time
+    import os
+    import time
     time.sleep(0.05)
     img.write_bytes(b"v2 newer")
     os.utime(img, None)   # bump mtime explícitamente

@@ -2,9 +2,7 @@
 
 Post-T10: behavior priors read from rag_behavior (SQL) only.
 """
-import json
 import os
-import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 

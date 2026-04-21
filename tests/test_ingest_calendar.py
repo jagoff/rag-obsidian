@@ -12,8 +12,6 @@ and assert parsing / chunking / upsert semantics. Covers:
 """
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta
 
 import pytest
 

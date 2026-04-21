@@ -79,7 +79,8 @@ def _open_sql_conn() -> sqlite3.Connection:
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() or attempt == 9:
                 raise
-            import time as _t, random as _r
+            import time as _t
+            import random as _r
             _t.sleep(0.05 + _r.random() * 0.15)
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn

@@ -9,7 +9,6 @@ Scope: temp-vault fixtures only. No live Apple Contacts / WA bridge / LLM.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest

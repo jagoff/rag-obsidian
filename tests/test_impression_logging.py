@@ -7,7 +7,6 @@ and `_compute_behavior_priors_from_rows` treats them as denominator-only.
 """
 from __future__ import annotations
 
-import time
 
 import pytest
 

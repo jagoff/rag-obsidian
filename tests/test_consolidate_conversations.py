@@ -244,7 +244,7 @@ def test_promote_writes_frontmatter_and_origin_wikilinks(tmp_vault: Path):
     text = written.read_text(encoding="utf-8")
     assert text.startswith("---\n")
     assert "type: consolidated-conversation" in text
-    assert f"source_conversations: 2" in text
+    assert "source_conversations: 2" in text
     assert "Body de prueba con [[Coaching]]." in text
     # Archive wikilinks present
     assert "## Conversaciones originales" in text

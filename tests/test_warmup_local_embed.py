@@ -22,7 +22,6 @@ This module locks in:
 5. `warmup_async()` skips the helper when the flag is falsy (consistent
    with the existing `_local_embed_enabled()` gate).
 """
-import os
 import threading
 import types
 

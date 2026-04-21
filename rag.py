@@ -50,9 +50,10 @@ import traceback
 import unicodedata
 import uuid
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     import numpy as np
@@ -108,6 +109,53 @@ BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 # LLM latency for nothing. Below this threshold (≤3) the repair is worth it.
 # Override via env `RAG_CITATION_REPAIR_MAX_BAD` (0 disables repair entirely).
 _CITATION_REPAIR_MAX_BAD = int(os.environ.get("RAG_CITATION_REPAIR_MAX_BAD", "3"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Adaptive pipeline routing (Improvement #3, Fase A — scaffolding no-op)
+# ──────────────────────────────────────────────────────────────────────
+# Per-intent dispatch: cuando RAG_ADAPTIVE_ROUTING=1 el pipeline puede
+# skipear stages (expand_queries en comparison/synthesis, citation-repair
+# en lookup fast-path) y ajustar rerank_pool / num_ctx / chat_model según
+# el intent clasificado. Default OFF = pipeline legacy bit-identical.
+# RAG_FORCE_FULL_PIPELINE=1 es un debug override que corre todos los
+# stages aun con adaptive ON — útil para A/B local del overhead del
+# dispatch sin los skips. Ver docs/improvement-3-adaptive-routing-design.md.
+_LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
+_LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
+
+# Per-intent rerank pool override. Synthesis/comparison necesitan más pool
+# porque tienen que cubrir ≥2 fuentes independientes en top-5 (SYSTEM_RULES
+# las obliga a cross-reference). Pool=15 global se midió óptimo en bench
+# 2026-04-21 para el mix completo, pero para synthesis/comparison colapsa
+# a 1 nota con múltiples chunks. Bump solo en esos intents.
+_RERANK_POOL_BY_INTENT: dict[str, int] = {
+    "comparison": int(os.environ.get("RAG_COMPARISON_POOL", "30")),
+    "synthesis": int(os.environ.get("RAG_SYNTHESIS_POOL", "30")),
+}
+
+# Intents donde expand_queries NO aporta (paraphrases del "X vs Y" meten
+# ruido lexical que empeora BM25 de los términos importantes). Precedente:
+# web/server.py ya hardcodea multi_query=False por esta razón.
+_EXPAND_SKIP_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
+
+# Intents donde graph expansion corre siempre (override GRAPH_EXPANSION_GATE).
+# Para cross-reference queries el 1-hop wikilink es la señal más importante
+# después del rerank — es donde aparece la nota "relacionada pero no del
+# mismo chunk" que synthesis necesita mencionar.
+_GRAPH_ALWAYS_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
+
+
+def _adaptive_routing() -> bool:
+    """True si RAG_ADAPTIVE_ROUTING=1 Y RAG_FORCE_FULL_PIPELINE!=1.
+
+    Leído on demand (no cacheado) para que tests puedan monkey-patch
+    os.environ sin reload del módulo. Micro-costo de os.environ.get en el
+    hot path es negligible (~1μs).
+    """
+    if os.environ.get("RAG_FORCE_FULL_PIPELINE") == "1":
+        return False
+    return os.environ.get("RAG_ADAPTIVE_ROUTING") == "1"
 
 
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
@@ -3641,6 +3689,62 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " text TEXT NOT NULL,"
             " ocr_at REAL NOT NULL"
             ")",
+        ),
+    ),
+    (
+        # Entity extraction (Improvement #2) — canonical entity store
+        # populated by GLiNER (or qwen2.5:3b fallback) during indexing.
+        # Discriminador: (normalized, entity_type) — "juan" como person es
+        # distinto de "juan" como organization. Aliases guardan variantes
+        # de forma (Juan/JP/Juancito) sin duplicar filas. Default OFF via
+        # RAG_EXTRACT_ENTITIES=0 — las tablas quedan vacías y cualquier
+        # handle_entity_lookup() detecta empty + fallback a semantic.
+        "rag_entities",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_entities ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " canonical_name TEXT NOT NULL,"
+            " normalized TEXT NOT NULL,"
+            " entity_type TEXT NOT NULL,"
+            " aliases TEXT,"
+            " first_seen_ts REAL,"
+            " last_seen_ts REAL,"
+            " mention_count INTEGER DEFAULT 0,"
+            " confidence REAL,"
+            " extra_json TEXT,"
+            " UNIQUE(normalized, entity_type)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS idx_entities_normalized ON rag_entities(normalized)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_type ON rag_entities(entity_type)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_canonical ON rag_entities(canonical_name)",
+        ),
+    ),
+    (
+        # Entity mentions (Improvement #2) — 1:N relation chunk→entity.
+        # Poblada junto a rag_entities durante indexing. handle_entity_lookup()
+        # hace SELECT chunk_id FROM rag_entity_mentions WHERE entity_id=?
+        # ORDER BY ts DESC LIMIT 200 para el pre-rerank pool. Índice compuesto
+        # (entity_id, ts DESC) es el hot path — sin él la query es O(n)
+        # sobre toda la tabla. FK CASCADE: DELETE entity borra mentions
+        # automáticamente. UNIQUE(entity_id, chunk_id) previene duplicados
+        # si el mismo chunk menciona a la misma entidad dos veces.
+        "rag_entity_mentions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_entity_mentions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " entity_id INTEGER NOT NULL REFERENCES rag_entities(id) ON DELETE CASCADE,"
+            " chunk_id TEXT NOT NULL,"
+            " source TEXT,"
+            " ts REAL,"
+            " snippet TEXT,"
+            " confidence REAL,"
+            " UNIQUE(entity_id, chunk_id)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS idx_mentions_entity ON rag_entity_mentions(entity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mentions_chunk ON rag_entity_mentions(chunk_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mentions_source ON rag_entity_mentions(source)",
+            "CREATE INDEX IF NOT EXISTS idx_mentions_ts ON rag_entity_mentions(ts)",
+            "CREATE INDEX IF NOT EXISTS idx_mentions_entity_ts ON rag_entity_mentions(entity_id, ts DESC)",
         ),
     ),
 )
@@ -33507,6 +33611,256 @@ def _pendientes_render_rich(ev: dict, urgent: list[str], now: datetime) -> None:
     if total_items == 0:
         console.print()
         console.print("[bold green]✨ Todo limpio — sin pendientes trackeados.[/bold green]")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# NLI grounding (Improvement #1, Fase A — standalone module, no pipeline integration)
+# ──────────────────────────────────────────────────────────────────────
+# Claim-level validation: splits LLM response into atomic claims and
+# classifies each vs retrieved chunks as entails|neutral|contradicts.
+# Complement to verify_citations() (path existence) — this adds content
+# grounding. Fase A = module only; Fase B integrates into query()/chat().
+# Default OFF via RAG_NLI_GROUNDING=0 — no effect on existing pipeline.
+# Ver docs/improvement-1-nli-integration-plan.md para el diseño completo.
+
+
+@dataclass
+class Claim:
+    """Atomic claim extracted from an LLM response.
+
+    Attributes:
+        text: The claim text (1-300 chars after strip).
+        start_char: Offset in original response (UI highlighting).
+        end_char: End offset in original response.
+        is_refusal: True for "No encontré..." patterns — skip NLI on these.
+    """
+    text: str
+    start_char: int = 0
+    end_char: int = 0
+    is_refusal: bool = False
+
+
+@dataclass
+class ClaimGrounding:
+    """Result of NLI grounding for a single claim."""
+    text: str
+    verdict: Literal["entails", "neutral", "contradicts"]
+    evidence_chunk_id: str | None = None
+    evidence_span: str | None = None
+    score: float = 0.0
+    start_char: int = 0
+    end_char: int = 0
+
+
+@dataclass
+class GroundingResult:
+    """Aggregated NLI grounding for a full response."""
+    claims: list[ClaimGrounding] = field(default_factory=list)
+    claims_total: int = 0
+    claims_supported: int = 0
+    claims_contradicted: int = 0
+    claims_neutral: int = 0
+    nli_ms: int = 0
+
+
+# Refusal patterns — skip NLI on these, they're not factual claims.
+# Match is case-insensitive over the whole claim text.
+_REFUSAL_PATTERNS = (
+    r"^no encontr[eé]\b",
+    r"^no hay\s+(?:ning[úu]n|informaci[óo]n)\b",
+    r"^no tengo (?:esa\s+)?informaci[óo]n\b",
+    r"^i (?:don'?t|did not|didn'?t) find\b",
+    r"^i could not find\b",
+    r"^no information found\b",
+)
+_REFUSAL_RE = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
+
+
+def _is_refusal(text: str) -> bool:
+    """True if the text matches a known refusal pattern."""
+    return bool(_REFUSAL_RE.match(text.strip()))
+
+
+def split_claims(text: str) -> list[Claim]:
+    """Split an LLM response into atomic claims for NLI grounding.
+
+    Strategy (regex-based, no spacy dependency required):
+    1. Detect refusal upfront → single Claim with is_refusal=True
+    2. Preserve markdown code fences (```...```) as single claims
+    3. Preserve markdown bullet/ordered lists (consecutive - * + 1. lines) as one claim
+    4. Preserve markdown tables (|...|...| rows) as one claim
+    5. Split remaining prose on sentence boundaries (`[.!?]+\\s+`)
+    6. Drop claims < 8 chars (punctuation-only fragments)
+
+    Fase A = regex implementation. Fase B may swap for spacy-es if precision needed.
+
+    Args:
+        text: The LLM response text.
+
+    Returns:
+        List of Claim objects with char offsets preserved for UI highlighting.
+        Empty list if text is empty/whitespace.
+    """
+    if not text or not text.strip():
+        return []
+
+    stripped = text.strip()
+
+    # Early detection of refusal — single claim, no further splitting
+    if _is_refusal(stripped):
+        idx = text.find(stripped)
+        return [Claim(
+            text=stripped,
+            start_char=idx if idx >= 0 else 0,
+            end_char=(idx if idx >= 0 else 0) + len(stripped),
+            is_refusal=True,
+        )]
+
+    # Strategy: extract code fences + tables + lists as atomic blocks,
+    # then split prose between them on sentence boundaries.
+    claims: list[Claim] = []
+
+    code_fence_re = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+    table_re = re.compile(r"^(\|[^\n]*\|\s*\n){2,}", re.MULTILINE)
+    list_re = re.compile(
+        r"^(?:[-*+]\s+[^\n]+\n?){2,}|^(?:\d+\.\s+[^\n]+\n?){2,}",
+        re.MULTILINE,
+    )
+
+    blocks: list[tuple[int, int, str]] = []
+    for pattern in (code_fence_re, table_re, list_re):
+        for m in pattern.finditer(text):
+            blocks.append((m.start(), m.end(), m.group(0).strip()))
+
+    # Sort blocks by start, skip overlaps (previous wins)
+    blocks.sort(key=lambda b: b[0])
+    merged: list[tuple[int, int, str]] = []
+    for start, end, btext in blocks:
+        if merged and start < merged[-1][1]:
+            continue
+        merged.append((start, end, btext))
+
+    cursor = 0
+    for start, end, btext in merged:
+        if start > cursor:
+            prose = text[cursor:start]
+            claims.extend(_split_prose(prose, cursor))
+        if btext and len(btext) >= 8:
+            claims.append(Claim(
+                text=btext,
+                start_char=start,
+                end_char=end,
+                is_refusal=False,
+            ))
+        cursor = end
+
+    if cursor < len(text):
+        prose = text[cursor:]
+        claims.extend(_split_prose(prose, cursor))
+
+    # If no blocks at all, just split the whole text as prose
+    if not merged:
+        claims = _split_prose(text, 0)
+
+    return claims
+
+
+def _split_prose(prose: str, base_offset: int) -> list[Claim]:
+    """Split prose on sentence boundaries. Helper for split_claims().
+
+    Returns list of Claim objects with offsets relative to the original
+    response (base_offset + local_offset).
+    """
+    if not prose or not prose.strip():
+        return []
+
+    claims: list[Claim] = []
+    # Sentence boundary: punctuation followed by whitespace + capital letter.
+    sentence_re = re.compile(r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡])")
+    parts = sentence_re.split(prose)
+
+    offset = 0
+    for part in parts:
+        if not part:
+            continue
+        stripped = part.strip()
+        if len(stripped) < 8:
+            offset += len(part) + 1
+            continue
+        local_idx = part.find(stripped)
+        claim_start = base_offset + offset + (local_idx if local_idx >= 0 else 0)
+        claims.append(Claim(
+            text=stripped,
+            start_char=claim_start,
+            end_char=claim_start + len(stripped),
+            is_refusal=False,
+        ))
+        offset += len(part) + 1
+
+    return claims
+
+
+def ground_claims_nli(
+    claims: list[Claim],
+    docs: list[str],
+    metas: list[dict],
+    *,
+    threshold_contradicts: float = 0.7,
+    cosine_threshold: float = 0.5,
+    max_claims: int = 20,
+) -> GroundingResult | None:
+    """Stub for NLI grounding (Fase B will implement actual NLI inference).
+
+    Fase A: returns a GroundingResult with all claims marked "neutral"
+    (safe default). This lets callers integrate the API shape without
+    depending on the NLI model being loaded.
+
+    Fase B will:
+        1. Load mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 via CrossEncoder
+        2. For each claim: embed + cosine prefilter top-3 chunks
+        3. Run NLI on (claim, chunk) pairs → entails/neutral/contradicts
+        4. Apply thresholds: score >= threshold_contradicts → entails
+                           [threshold-0.2, threshold) → neutral
+                           < threshold-0.2 → contradicts
+
+    Args:
+        claims: list of Claim objects from split_claims()
+        docs: retrieved chunk display_text (parallel to metas)
+        metas: retrieved chunk metadata dicts (file, note, chunk_id, etc.)
+        threshold_contradicts: NLI score threshold for marking contradicts
+        cosine_threshold: minimum cosine for prefilter (skip irrelevant chunks)
+        max_claims: safety gate — skip if claims > max_claims (cost explosion)
+
+    Returns:
+        GroundingResult with per-claim verdicts + aggregate counts.
+        None if inputs empty or max_claims exceeded.
+    """
+    if not claims or not docs:
+        return None
+    if len(claims) > max_claims:
+        return None
+
+    groundings: list[ClaimGrounding] = []
+    for c in claims:
+        # Fase A stub: neutral by default (safe — no false positives).
+        # Refusals also stay neutral (no NLI needed).
+        # Fase B will run actual NLI here for non-refusal claims.
+        groundings.append(ClaimGrounding(
+            text=c.text,
+            verdict="neutral",
+            score=0.0,
+            start_char=c.start_char,
+            end_char=c.end_char,
+        ))
+
+    return GroundingResult(
+        claims=groundings,
+        claims_total=len(groundings),
+        claims_supported=sum(1 for g in groundings if g.verdict == "entails"),
+        claims_contradicted=sum(1 for g in groundings if g.verdict == "contradicts"),
+        claims_neutral=sum(1 for g in groundings if g.verdict == "neutral"),
+        nli_ms=0,
+    )
 
 
 if __name__ == "__main__":

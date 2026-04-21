@@ -268,6 +268,46 @@ def test_preprocess_tipo_N():
     assert "saturday" in out.lower()
 
 
+def test_preprocess_despues_de_actividad_stripped():
+    """'el miercoles después de gimnasia' → 'wednesday' (strip la
+    actividad). Usuario reportó que esto terminaba en martes (LLM
+    malinterpretaba 'después de gimnasia' como 'el día después').
+    Cubrir contracciones: después del / luego de la / tras el."""
+    pp = rag._preprocess_rioplatense_datetime
+    assert pp("el miercoles después de gimnasia").lower() == "wednesday"
+    assert pp("el jueves después del trabajo").lower() == "thursday"
+    assert pp("el viernes luego de la reunión").lower() == "friday"
+    assert pp("el lunes tras el entrenamiento").lower() == "monday"
+
+
+def test_preprocess_despues_de_temporal_preserved():
+    """Cuando la palabra tras 'después de/del' es un temporal (mañana,
+    almuerzo, semana, etc.), NO strippear — es parte del anclaje."""
+    pp = rag._preprocess_rioplatense_datetime
+    # "después de mañana" = "day after tomorrow" (no lo tocamos acá,
+    # queda al LLM fallback).
+    assert "ma" in pp("después de mañana").lower()
+    # "antes del almuerzo" — el almuerzo es una referencia temporal
+    # ("media mañana"), debe preservarse.
+    assert "almuerzo" in pp("mañana antes del almuerzo").lower()
+
+
+def test_parse_despues_de_gimnasia_bugfix(monkeypatch):
+    """Usuario reportó: 'el miercoles después de gimnasia' creaba
+    evento el martes. Post-fix, el preprocessor strippea 'después de
+    gimnasia' y dateparser resuelve 'wednesday' → próximo miércoles."""
+    fake_client = MagicMock()
+    fake_client.chat.side_effect = RuntimeError("no debería llamarse")
+    monkeypatch.setattr(rag, "_helper_client", lambda: fake_client)
+    now = datetime(2026, 4, 20, 15, 0, 0)  # lunes
+    dt = rag._parse_natural_datetime(
+        "el miercoles después de gimnasia", now=now,
+    )
+    assert dt is not None
+    assert dt.weekday() == 2  # miércoles
+    assert dt.date().isoformat() == "2026-04-22"
+
+
 def test_preprocess_a_las_bare():
     """'a las N' → 'N:00' (dateparser interpreta 'a las 10' como día 10)."""
     assert rag._preprocess_rioplatense_datetime("a las 10") == "10:00"

@@ -1179,7 +1179,7 @@ CHAT_MODEL_PREFERENCE = (
 )
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
-_COLLECTION_BASE = "obsidian_notes_v9"  # v9: contextual embeddings + temporal tokens + graph PageRank
+_COLLECTION_BASE = "obsidian_notes_v10"  # v10: temporal tokens actually wired into build_prefix (dead-code since v9 commit d6e1073)
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
@@ -6550,7 +6550,20 @@ def temporal_token(fm: dict) -> str:
 
 
 def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str:
-    """Build the embedding prefix combining path, frontmatter fields, and tags."""
+    """Build the embedding prefix combining path, frontmatter fields, tags
+    and a coarse temporal bucket.
+
+    The temporal bucket (`[recent]`/`[this-month]`/`[this-quarter]`/`[older]`
+    from `temporal_token(fm)`) is appended at the end — it shifts the
+    embedding space so queries about "current work" naturally prefer recent
+    notes without needing post-hoc recency boosts. See `temporal_token()`
+    for the bucket thresholds.
+
+    NOTE: Prior to 2026-04-20 `temporal_token` was defined but never called
+    from here (dead code since commit d6e1073). That means notes indexed
+    before the v10 bump carry no bucket in their embed_text. Bumping
+    `_COLLECTION_BASE` forces a reindex so the feature goes live.
+    """
     fm_bits = []
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -6576,6 +6589,13 @@ def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str
     header += "]"
     if tags:
         header += " " + " ".join(f"#{t}" for t in tags)
+    # Temporal bucket: appended at the end so a missing/bad timestamp
+    # degrades gracefully (temporal_token returns "" and we skip). Uses
+    # brackets to match the retrieval-time query embedding (callers that
+    # want recency hits can phrase queries like "notas recientes").
+    tok = temporal_token(fm)
+    if tok:
+        header += f" [{tok}]"
     return header
 
 
@@ -19696,6 +19716,23 @@ _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
     # Diminutives are noise for dateparser.
     (r"\bhoritas?\b", "horas"),
     (r"\bminutit[oa]s?\b", "minutos"),
+    # "después/antes/luego/tras de <actividad>" — temporal idiom for
+    # "time-of-day relative to an activity", not a date. "El miércoles
+    # después de gimnasia" means Wednesday at gym-end time, NOT the day
+    # after gym. Strip the verb + optional `de[l]` + optional article +
+    # <word> block when <word> is an activity noun (not a temporal
+    # anchor). "tras" typically doesn't take `de` in rioplatense
+    # ("tras el entrenamiento"), hence both `de...` and bare article
+    # are optional. Allow list preserves "después de mañana" (day
+    # after tomorrow), "antes del almuerzo" (late morning), etc.
+    (
+        r"\s+(?:despu[eé]s|antes|luego|tras)\s+"
+        r"(?:(?:del|de\s+(?:la|el|los|las)|de)\s+)?"
+        r"(?:(?:la|el|los|las)\s+)?"
+        r"(?!ma[ñn]ana|hoy|ayer|medio\s*d[ií]a|medianoche|almuerzo|desayuno|"
+        r"cena|comida|semana|mes|a[ñn]o)\w+",
+        "",
+    ),
     # "pasado mañana" — dateparser 1.4 falla silenciosamente en es;
     # el inglés "day after tomorrow" lo resuelve perfectamente.
     (r"\bpasado\s+ma[ñn]ana\b", "day after tomorrow"),

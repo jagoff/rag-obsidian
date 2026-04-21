@@ -690,17 +690,20 @@ def log_query_event(event: dict) -> None:
 
     Best-effort, never raises, non-blocking semantics for the caller. On SQL
     error, logs to sql_state_errors.jsonl and silently drops the event (no
-    JSONL fallback post-T10).
+    JSONL fallback post-T10). Uses `_sql_write_with_retry` to absorb
+    transient lock windows — this is a hot path (20+ events per query
+    session across chat/query/morning/etc) so dropping silently is
+    analytics data-loss.
     """
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
     except Exception:
         return
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_queries", _map_queries_row(event))
-    except Exception as exc:
-        _log_sql_state_error("queries_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "queries_sql_write_failed")
 
 
 def log_behavior_event(event: dict) -> None:
@@ -729,11 +732,11 @@ def log_behavior_event(event: dict) -> None:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
     except Exception:
         return
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_behavior", _map_behavior_row(event))
-    except Exception as exc:
-        _log_sql_state_error("behavior_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "behavior_sql_write_failed")
 
 
 # Throttle: retrieve() can fire hundreds of times per second in tests/eval,
@@ -787,7 +790,8 @@ def log_impressions(
             _ = cutoff  # kept for future per-entry pruning
 
     ts = datetime.now().isoformat(timespec="seconds")
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             for rank, p in enumerate(paths[:cap], start=1):
                 if not p:
@@ -802,8 +806,7 @@ def log_impressions(
                     "session": session,
                 }
                 _sql_append_event(conn, "rag_behavior", _map_behavior_row(row))
-    except Exception as exc:
-        _log_sql_state_error("impression_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "impression_sql_write_failed")
 
 
 def record_brief_written(
@@ -818,15 +821,14 @@ def record_brief_written(
     On SQL error: logs to sql_state_errors.jsonl and silently drops (no JSONL
     fallback post-T10).
     """
-    try:
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(
                 conn, "rag_brief_written",
                 _map_brief_written_row(brief_type, str(brief_path),
                                         paths_cited, citations_by_section),
             )
-    except Exception as exc:
-        _log_sql_state_error("brief_written_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "brief_written_sql_write_failed")
 
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]")
@@ -950,13 +952,12 @@ def _brief_state_record(brief_path: str, cited_path: str) -> None:
     """Mark this (brief_path, cited_path) pair as processed. Upsert on
     pk=pair_key. SQL-only since T10; on error, logs to sql_state_errors.jsonl
     and drops — next run will re-emit the signal rather than silently losing it."""
-    try:
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_upsert(conn, "rag_brief_state",
                         _map_brief_state_row(brief_path, cited_path),
                         ("pair_key",))
-    except Exception as exc:
-        _log_sql_state_error("brief_state_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "brief_state_sql_write_failed")
 
 
 def _diff_brief_signal() -> None:
@@ -3577,6 +3578,40 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
+
+
+def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 3) -> None:
+    """Run a SQL-write closure with transient-lock retry + silent-fail logging.
+
+    Pre-2026-04-21 every rag_* writer (`log_query_event`, `log_behavior_event`,
+    `record_brief_written`, `_ambient_log_event`, `_contradiction_log`, …)
+    silently dropped events on `sqlite3.OperationalError("database is
+    locked")` — visible in `sql_state_errors.jsonl` as 30+ recent
+    `memory_sql_write_failed` / `cpu_sql_write_failed` entries before the
+    memory/cpu samplers got retry logic. Lock contention windows longer
+    than the 30s `busy_timeout` (e.g. during `_write_feedback_golden_sql`
+    + `embed()` under cold ollama, or concurrent contradiction workers)
+    still escape busy-timeout and surface as OperationalError.
+
+    Same 3-attempt + jittered-backoff shape as web.server._persist_with_sqlite_retry.
+    Non-lock SQL errors (schema drift, disk-full, etc.) propagate on the
+    first failure — no point retrying those.
+    """
+    import random as _r
+    import sqlite3 as _sqlite3
+    import time as _t
+    for attempt in range(attempts):
+        try:
+            write_fn()
+            return
+        except _sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                _log_sql_state_error(error_tag, err=repr(exc))
+                return
+            _t.sleep(0.1 + _r.random() * 0.25)
+        except Exception as exc:
+            _log_sql_state_error(error_tag, err=repr(exc))
+            return
 
 
 @contextlib.contextmanager
@@ -9935,7 +9970,8 @@ def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
     rag_surface_log. Mismo timestamp en todas para poder agrupar la corrida
     al leer. SQL-only since T10."""
     ts = datetime.now().isoformat(timespec="seconds")
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(
                 conn, "rag_surface_log",
@@ -9946,8 +9982,7 @@ def _surface_log_run(summary: dict, pairs: list[dict]) -> None:
                     conn, "rag_surface_log",
                     _map_surface_row({"ts": ts, "cmd": "surface_pair", **p}),
                 )
-    except Exception as exc:
-        _log_sql_state_error("surface_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "surface_sql_write_failed")
 
 
 def _suggest_tags_for_note(
@@ -10289,11 +10324,11 @@ def _filing_log_proposal(proposal: dict, decision: str | None = None) -> None:
     event = {"ts": ts, "cmd": "filing_proposal", **proposal}
     if decision is not None:
         event["decision"] = decision
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_filing_log", _map_filing_row(event))
-    except Exception as exc:
-        _log_sql_state_error("filing_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "filing_sql_write_failed")
 
 
 # ── FILING fase 3: personalización por k-NN sobre decisiones pasadas ─────────
@@ -12444,12 +12479,11 @@ def _log_contradictions(
         "helper_raw": helper_raw,
         "skipped": skipped,
     }
-    try:
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_contradictions",
                                _map_contradiction_row(event))
-    except Exception as exc:
-        _log_sql_state_error("contradictions_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "contradictions_sql_write_failed")
 
 
 def _frontmatter_contradicts_set(path: Path) -> set[str]:
@@ -12833,12 +12867,12 @@ def _proactive_save_state(state: dict) -> None:
 
 def _proactive_log(event: dict) -> None:
     full = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_proactive_log",
                                _map_proactive_row(full))
-    except Exception as exc:
-        _log_sql_state_error("proactive_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "proactive_sql_write_failed")
 
 
 def _proactive_can_push(kind: str) -> tuple[bool, str]:
@@ -13233,23 +13267,23 @@ def _ambient_should_skip(doc_id_prefix: str, h: str) -> bool:
 
 def _ambient_state_record(doc_id_prefix: str, h: str, payload: dict) -> None:
     analyzed_at = time.time()
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_upsert(conn, "rag_ambient_state",
                         _map_ambient_state_row(doc_id_prefix, h,
                                                 analyzed_at, payload),
                         ("path",))
-    except Exception as exc:
-        _log_sql_state_error("ambient_state_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "ambient_state_sql_write_failed")
 
 
 def _ambient_log_event(event: dict) -> None:
     e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_ambient", _map_ambient_row(e))
-    except Exception as exc:
-        _log_sql_state_error("ambient_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "ambient_sql_write_failed")
 
 
 def _ambient_whatsapp_send(jid: str, text: str) -> bool:
@@ -16418,12 +16452,11 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
             entry["chains"] = chains_snap
         if latency_snap:
             entry["latency"] = latency_snap
-        try:
+        def _do() -> None:
             with _ragvec_state_conn() as conn:
                 _sql_append_event(conn, "rag_eval_runs",
                                    _map_eval_row(entry))
-        except Exception as exc:
-            _log_sql_state_error("eval_sql_write_failed", err=repr(exc))
+        _sql_write_with_retry(_do, "eval_sql_write_failed")
 
     if gate_failed:
         raise SystemExit(1)
@@ -16654,11 +16687,11 @@ def _coordinate_refine(
 
 def _log_tune_event(event: dict) -> None:
     ev = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_tune", _map_tune_row(ev))
-    except Exception as exc:
-        _log_sql_state_error("tune_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "tune_sql_write_failed")
 
 
 def _backup_ranker_config() -> Path | None:
@@ -23700,28 +23733,37 @@ def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
     except Exception:
         return None
 
-    cur = data.get("current", {})
-    cur_code = cur.get("weather_code", 0)
+    # `dict.get(key, default)` returns the default ONLY when key is missing —
+    # if the key exists with value `null` (Open-Meteo emits this during
+    # geo/sensor outages), `.get()` returns None and `round(None)` raises
+    # TypeError. The `or` short-circuit catches both missing-key and
+    # null-value cases. Same pattern below for daily series.
+    cur = data.get("current", {}) or {}
+    cur_code = cur.get("weather_code") or 0
     cur_desc = _WMO_WEATHER_CODES.get(cur_code, f"Código {cur_code}")
-    cur_temp = str(round(cur.get("temperature_2m", 0)))
+    cur_temp = str(round(cur.get("temperature_2m") or 0))
 
-    daily = data.get("daily", {})
-    dates = daily.get("time", [])
-    maxs = daily.get("temperature_2m_max", [])
-    mins = daily.get("temperature_2m_min", [])
-    rain_probs = daily.get("precipitation_probability_max", [])
-    codes = daily.get("weather_code", [])
+    daily = data.get("daily", {}) or {}
+    dates = daily.get("time", []) or []
+    maxs = daily.get("temperature_2m_max", []) or []
+    mins = daily.get("temperature_2m_min", []) or []
+    rain_probs = daily.get("precipitation_probability_max", []) or []
+    codes = daily.get("weather_code", []) or []
 
     days: list[dict] = []
     for i, d in enumerate(dates):
-        code = codes[i] if i < len(codes) else 0
+        code = codes[i] if i < len(codes) and codes[i] is not None else 0
+        # `mins[i]` / `maxs[i]` may be None even with len(...) > i.
+        min_v = mins[i] if i < len(mins) else None
+        max_v = maxs[i] if i < len(maxs) else None
+        rain_v = rain_probs[i] if i < len(rain_probs) else None
         days.append({
             "date": d,
-            "minC": str(round(mins[i])) if i < len(mins) else "",
-            "maxC": str(round(maxs[i])) if i < len(maxs) else "",
+            "minC": str(round(min_v)) if min_v is not None else "",
+            "maxC": str(round(max_v)) if max_v is not None else "",
             "avgC": "",
             "description": _WMO_WEATHER_CODES.get(code, f"Código {code}"),
-            "chanceofrain": rain_probs[i] if i < len(rain_probs) else 0,
+            "chanceofrain": rain_v if rain_v is not None else 0,
             "chanceofthunder": 0,
         })
 
@@ -25530,12 +25572,11 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
         "items": n_new,
         "path": str(note_path.relative_to(VAULT_PATH)),
     }
-    try:
+    def _do_wa_log() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_wa_tasks",
                                _map_wa_tasks_row(_wa_log_event))
-    except Exception as exc:
-        _log_sql_state_error("wa_tasks_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do_wa_log, "wa_tasks_sql_write_failed")
 
     rel = note_path.relative_to(VAULT_PATH)
     verb = "creado" if created else "actualizado"
@@ -26041,12 +26082,12 @@ def _append_archive_batch(batch_path: Path, entry: dict) -> None:
 
 def _log_archive_event(event: dict) -> None:
     e = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-    try:
+
+    def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_archive_log",
                                _map_archive_row(e))
-    except Exception as exc:
-        _log_sql_state_error("archive_sql_write_failed", err=repr(exc))
+    _sql_write_with_retry(_do, "archive_sql_write_failed")
 
 
 def _archive_move_one(

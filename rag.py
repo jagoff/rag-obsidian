@@ -1269,6 +1269,119 @@ CHAT_MODEL_PREFERENCE = (
 HELPER_MODEL = "qwen2.5:3b"      # fast, for internal rewrites (multi-query, HyDE, reformulate)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # cross-encoder, multilingual, MPS-friendly
 _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 2026-04-20: 0 impact on hit@5 / MRR vs v9, so reverted the 2026-04-20 wire of dead temporal_token())
+
+# ── Cross-source corpus (Phase 1, 2026-04-20 user decisions §10) ──────────
+# The collection stays at v11 (no rename / no re-embed) — source discrimination
+# is done purely via a new `source` metadata field with "vault" as the
+# default for backward compat. Old chunks without `source` are read as
+# "vault" throughout the pipeline (see meta.get("source") or "vault").
+#
+# The actual ingest paths (WhatsApp, Gmail, Calendar, Reminders) register
+# non-vault sources and set `source` explicitly in their metadata. Retrieval
+# applies a per-source weight + recency decay in `apply_weighted_scores`
+# so non-vault chunks can be surfaced in the same pool without re-calibrating
+# the core reranker.
+#
+# OAuth Google is used for Gmail + Calendar per user override — this breaks
+# the "no cloud calls" invariant declared at the top of CLAUDE.md. Tracked
+# in docs/design-cross-source-corpus.md §10.6.
+VALID_SOURCES: frozenset[str] = frozenset(
+    {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages"}
+)
+
+# Per-source weight applied multiplicatively to the final rerank+feature
+# score. Vault stays at 1.00 so the default path is a no-op; anything
+# non-vault gets softly down-weighted to reflect editorial trust.
+SOURCE_WEIGHTS: dict[str, float] = {
+    "vault":     1.00,
+    "calendar":  0.95,
+    "reminders": 0.90,
+    "gmail":     0.85,
+    "whatsapp":  0.75,
+    "messages":  0.75,
+}
+
+# Recency half-life per source, in days. None → no decay applied (chunks
+# from this source are ranked purely on semantic match + static weight).
+# A halflife of H days means a chunk aged H days old gets scored at 0.5×
+# its fresh value via recency_boost_for_source(); 2H days → 0.25×, etc.
+# Rationale per source (from §4.2 of the design doc):
+#   - vault / calendar: events and notes don't age, skip decay
+#   - gmail / reminders: mid-term — a 6-month old email is context, not noise
+#   - whatsapp / messages: conversational — a 2-month-old WA rarely matters
+SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
+    "vault":     None,
+    "calendar":  None,
+    "reminders":   90.0,
+    "gmail":      180.0,
+    "whatsapp":    30.0,
+    "messages":    30.0,
+}
+
+# Retention windows per source, in days. None → keep forever. Used at
+# INGEST time (the ingester drops rows older than this) + as a hard
+# upper bound for the cleanup path. Notes aren't touched by this
+# (vault retention is manual).
+SOURCE_RETENTION_DAYS: dict[str, int | None] = {
+    "vault":     None,
+    "calendar":  None,
+    "reminders": None,
+    "gmail":      365,
+    "whatsapp":   180,
+    "messages":   180,
+}
+
+
+def normalize_source(value: object, *, default: str = "vault") -> str:
+    """Return a valid source string, falling back to `default` on anything
+    that isn't in `VALID_SOURCES`. Used wherever we read `meta.get("source")`
+    from possibly-legacy metadata."""
+    if isinstance(value, str) and value in VALID_SOURCES:
+        return value
+    return default
+
+
+def source_weight(source: str) -> float:
+    """Per-source multiplier applied to the final score. Unknown source →
+    0.50 (half the vault baseline, same band as messages/whatsapp) — this
+    is defensive and should never hit in practice since `normalize_source`
+    filters unknowns upstream."""
+    return SOURCE_WEIGHTS.get(source, 0.50)
+
+
+def source_recency_multiplier(
+    source: str, created_ts: float | str | None, *, now: float | None = None,
+) -> float:
+    """Exponential decay multiplier in [0, 1] based on the per-source
+    halflife. Returns 1.0 for sources with no halflife configured or when
+    `created_ts` is missing/unparseable. `created_ts` accepts epoch seconds
+    (float) or ISO-8601 string (matches the format used everywhere else in
+    the metadata).
+    """
+    halflife = SOURCE_RECENCY_HALFLIFE_DAYS.get(source)
+    if halflife is None or halflife <= 0:
+        return 1.0
+    if created_ts is None:
+        return 1.0
+    try:
+        if isinstance(created_ts, (int, float)):
+            ts_epoch = float(created_ts)
+        else:
+            # Accept ISO-8601 with or without timezone; naive → assume local.
+            s = str(created_ts)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            ts_epoch = dt.timestamp()
+    except (TypeError, ValueError):
+        return 1.0
+    now_epoch = now if now is not None else time.time()
+    age_days = max(0.0, (now_epoch - ts_epoch) / 86400.0)
+    # 2 ** -(age / halflife) → 1.0 at age=0, 0.5 at age=halflife, 0.25 at 2×halflife
+    import math as _math
+    return float(_math.pow(2.0, -(age_days / halflife)))
+
+
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
@@ -10350,6 +10463,7 @@ def retrieve(
     exclude_paths: set[str] | None = None,
     exclude_path_prefixes: tuple[str, ...] | None = None,
     seen_titles: list[str] | set[str] | None = None,
+    source: str | list[str] | set[str] | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
@@ -10362,6 +10476,12 @@ def retrieve(
     helper interpreted the list as "avoid these" and drifted off-topic.
     As a post-rerank score shift it only reorders within the already-
     relevant pool, so semantically correct results still win.
+
+    `source`, when provided, restricts the returned candidates to the given
+    source(s) — string like `"vault"` or iterable of strings like
+    `{"vault", "calendar"}`. Applied post-rerank (the filter is cheap and
+    keeps the reranker's mental model — which was tuned on mixed inputs —
+    unchanged). Legacy rows without a `source` field default to `"vault"`.
 
     Pipeline:
       - optional history-aware reformulation (precise), with optional `summary`
@@ -10602,6 +10722,16 @@ def retrieve(
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
+    # Source filter (Phase 1 cross-source): restrict the candidate pool to
+    # the requested source(s). Normalized to a frozenset of strings; None /
+    # empty → no filter. Legacy rows without `source` default to "vault"
+    # via normalize_source() so `source="vault"` keeps old behavior.
+    allowed_sources: frozenset[str] | None = None
+    if source is not None:
+        if isinstance(source, str):
+            allowed_sources = frozenset({source}) if source else None
+        else:
+            allowed_sources = frozenset(s for s in source if s) or None
     # Seen-title penalty: normalise caller's input to a case-insensitive
     # set for O(1) membership checks inside the hot scoring loop. Empty
     # → no-op. Matching is on note title (stem), not chunk body.
@@ -10613,6 +10743,10 @@ def retrieve(
         meta = c[1] if isinstance(c[1], dict) else {}
         path = meta.get("file", "")
         if path in ignored:
+            continue
+        # Source-discriminator filter + scoring adjustment.
+        src = normalize_source(meta.get("source"))
+        if allowed_sources is not None and src not in allowed_sources:
             continue
         final = float(s)
         rec_raw = recency_boost(meta) if (apply_recency or weights.recency_always) else 0.0
@@ -10676,6 +10810,17 @@ def retrieve(
             note_title = str(meta.get("note") or "").strip().lower()
             if note_title and note_title in seen_title_set:
                 final -= SEEN_TITLE_PENALTY
+        # Cross-source multiplicative adjustment. For `vault` (default)
+        # both factors are 1.0 — no-op. Non-vault sources get a static
+        # trust weight × exponential recency decay. Applied last so it
+        # composes with every upstream signal, preserving their relative
+        # ordering within a source but globally down-weighting less-
+        # trusted sources relative to the vault baseline.
+        src_mult = source_weight(src) * source_recency_multiplier(
+            src, meta.get("created_ts"),
+        )
+        if src_mult != 1.0:
+            final *= src_mult
         final_pairs.append((c, e, final))
     scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
     scored = scored_all[:k]
@@ -10909,6 +11054,8 @@ def deep_retrieve(
     rerank_pool: int | None = None,
     exclude_paths: set[str] | None = None,
     exclude_path_prefixes: tuple[str, ...] | None = None,
+    seen_titles: list[str] | set[str] | None = None,
+    source: str | list[str] | set[str] | None = None,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -10923,6 +11070,8 @@ def deep_retrieve(
         date_range=date_range, summary=summary, variants=variants,
         rerank_pool=rerank_pool, exclude_paths=exclude_paths,
         exclude_path_prefixes=exclude_path_prefixes,
+        seen_titles=seen_titles,
+        source=source,
     )
     if not result["docs"]:
         return result
@@ -10947,6 +11096,7 @@ def deep_retrieve(
             multi_query=False, auto_filter=False, date_range=date_range,
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
+            source=source,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -11200,6 +11350,16 @@ def apply_weighted_scores(
         neg_w = _soft_feedback_weight(f.get("fb_neg_cos", 0.0), weights.feedback_match_floor)
         if neg_w:
             score -= weights.feedback_neg * neg_w
+        # Cross-source multiplicative adjustment (Phase 1): static weight
+        # per source × per-source exponential recency decay. For `vault`
+        # (default) both factors are 1.0 so this is a no-op on legacy data.
+        # `source` is pulled via normalize_source() so legacy rows without
+        # the field cleanly default to "vault".
+        src = normalize_source(f["meta"].get("source"))
+        created = f["meta"].get("created_ts")
+        src_mult = source_weight(src) * source_recency_multiplier(src, created)
+        if src_mult != 1.0:
+            score *= src_mult
         scored.append((score, f))
     scored.sort(key=lambda x: x[0], reverse=True)
     out: list[dict] = []
@@ -11265,6 +11425,7 @@ def multi_retrieve(
     exclude_paths: set[str] | None = None,
     exclude_path_prefixes: tuple[str, ...] | None = None,
     seen_titles: list[str] | set[str] | None = None,
+    source: str | list[str] | set[str] | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -11276,6 +11437,10 @@ def multi_retrieve(
     (print_query_header, render_sources, etc.) no necesite cambios.
     `filters_applied` refleja los filtros inferidos en el primer vault
     que retornó algo (suficiente para mostrar en el header).
+
+    `source`, when provided, passes through to retrieve() as a cross-source
+    filter (vault/calendar/gmail/whatsapp/reminders/messages). Threaded
+    unchanged to both the deep and shallow paths.
     """
     if not vaults:
         return {
@@ -11296,6 +11461,7 @@ def multi_retrieve(
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
             seen_titles=seen_titles,
+            source=source,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -11316,6 +11482,7 @@ def multi_retrieve(
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
             seen_titles=seen_titles,
+            source=source,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -12432,6 +12599,10 @@ def _index_single_file(
         "tags": ",".join(tags), "hash": h,
         "outlinks": ",".join(outlinks),
         "created_ts": created_ts,
+        # Cross-source discriminator (Phase 1). Old rows without this field
+        # default to "vault" via `normalize_source` at read time, so this is
+        # pure forward-compat — no re-embed required on upgrade.
+        "source": "vault",
     }
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -12701,6 +12872,9 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             "tags": ",".join(tags),
             "hash": h,
             "outlinks": ",".join(outlinks),
+            # Cross-source discriminator (Phase 1). See `_index_single_file`
+            # for the same field on the incremental path.
+            "source": "vault",
         }
         for field in FM_SEARCHABLE_FIELDS:
             v = fm.get(field)
@@ -12995,6 +13169,8 @@ def watch(debounce: float, all_vaults: bool):
               help="Desactiva retrieval iterativo automático (deep retrieve)")
 @click.option("--critique", is_flag=True,
               help="Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario")
+@click.option("--source", "source_opt", default=None,
+              help="Filtrar por fuente cross-source (coma-separado): vault,calendar,gmail,whatsapp,reminders,messages")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
@@ -13002,6 +13178,7 @@ def query(
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
+    source_opt: str | None,
 ):
     """Consulta única contra las notas."""
     warmup_async()
@@ -13101,11 +13278,25 @@ def query(
         return
 
     t_start = time.perf_counter()
+    # Parse --source; accept csv, validate against VALID_SOURCES, reject unknowns
+    # early (fails fast instead of silently returning empty from retrieve).
+    source_filter: frozenset[str] | None = None
+    if source_opt:
+        parts = [s.strip().lower() for s in source_opt.split(",") if s.strip()]
+        unknown = [s for s in parts if s not in VALID_SOURCES]
+        if unknown:
+            console.print(
+                f"[red]Fuente inválida:[/red] {unknown}. "
+                f"Permitidas: {sorted(VALID_SOURCES)}"
+            )
+            return
+        source_filter = frozenset(parts)
     _retrieve_kwargs = dict(
         col=col, question=effective_question, k=k, folder=folder,
         history=history, tag=tag,
         precise=hyde, multi_query=not no_multi, auto_filter=not no_auto_filter,
         date_range=date_range, variants=pre_variants,
+        source=source_filter,
     )
 
     def _do_retrieve():

@@ -242,3 +242,128 @@ def test_ingester_plists_no_rag_explore():
         assert "RAG_EXPLORE" not in env, (
             f"{fn_name} leaks RAG_EXPLORE — retrieval flag on an ingester"
         )
+
+
+# ── Setup: Apple Contacts warmup (2026-04-21) ────────────────────────────────
+
+def test_setup_warmup_runs_when_cache_missing(tmp_path, monkeypatch):
+    """Setup (no --remove) trigger a pre-build del Contacts index cuando el
+    disk cache no existe. Mockea el index loader para verificar la call sin
+    hablar con osascript real."""
+    import subprocess
+    from click.testing import CliRunner
+
+    # Redirect everything to tmp so we don't touch the user's real launchd / cache.
+    monkeypatch.setattr(rag_module, "_LAUNCH_AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(rag_module, "_RAG_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rag_module, "_CONTACTS_PHONE_INDEX_PATH", tmp_path / "no-cache.json")
+    monkeypatch.setattr(rag_module, "_rag_binary", lambda: RAG_BIN)
+    # Fake rag binary that exists
+    rag_bin_path = tmp_path / "rag-bin"
+    rag_bin_path.write_text("#!/bin/sh\nexit 0\n")
+    rag_bin_path.chmod(0o755)
+    monkeypatch.setattr(rag_module, "_rag_binary", lambda: str(rag_bin_path))
+    # Avoid real launchctl calls
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: type("P", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
+    )
+
+    called = {"n": 0}
+    def _fake_loader(ttl_s=86400):
+        called["n"] += 1
+        return {"5491112345678": "Juan Pérez"}  # non-empty → warmup succeeded
+    monkeypatch.setattr(rag_module, "_load_contacts_phone_index", _fake_loader)
+
+    result = CliRunner().invoke(rag_module.setup, [])
+    assert result.exit_code == 0, result.output
+    assert called["n"] == 1, "warmup must be called exactly once"
+    assert "contacts cache" in result.output
+    assert "phones indexados" in result.output or "1 phones" in result.output
+
+
+def test_setup_warmup_skipped_when_cache_fresh(tmp_path, monkeypatch):
+    """Si el disk cache existe y está dentro del TTL, NO re-build (evita el
+    dump de 85s en re-run diarios de `rag setup`)."""
+    import subprocess
+    from click.testing import CliRunner
+
+    cache_path = tmp_path / "contacts.json"
+    cache_path.write_text('{"ts": 0, "index": {"1234567890": "X"}}', encoding="utf-8")
+
+    monkeypatch.setattr(rag_module, "_LAUNCH_AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(rag_module, "_RAG_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rag_module, "_CONTACTS_PHONE_INDEX_PATH", cache_path)
+    rag_bin_path = tmp_path / "rag-bin"
+    rag_bin_path.write_text("#!/bin/sh\nexit 0\n")
+    rag_bin_path.chmod(0o755)
+    monkeypatch.setattr(rag_module, "_rag_binary", lambda: str(rag_bin_path))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: type("P", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
+    )
+
+    called = {"n": 0}
+    def _fake_loader(ttl_s=86400):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(rag_module, "_load_contacts_phone_index", _fake_loader)
+
+    result = CliRunner().invoke(rag_module.setup, [])
+    assert result.exit_code == 0, result.output
+    assert called["n"] == 0, "fresh cache → no warmup needed"
+    assert "phones indexados" not in result.output
+
+
+def test_setup_warmup_silent_on_empty_contacts(tmp_path, monkeypatch):
+    """Si el dump devuelve índice vacío (Contacts.app restringido o sin
+    teléfonos), setup imprime un warning pero no aborta."""
+    import subprocess
+    from click.testing import CliRunner
+
+    monkeypatch.setattr(rag_module, "_LAUNCH_AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(rag_module, "_RAG_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rag_module, "_CONTACTS_PHONE_INDEX_PATH", tmp_path / "no-cache.json")
+    rag_bin_path = tmp_path / "rag-bin"
+    rag_bin_path.write_text("#!/bin/sh\nexit 0\n")
+    rag_bin_path.chmod(0o755)
+    monkeypatch.setattr(rag_module, "_rag_binary", lambda: str(rag_bin_path))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: type("P", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
+    )
+
+    monkeypatch.setattr(rag_module, "_load_contacts_phone_index", lambda ttl_s=86400: {})
+
+    result = CliRunner().invoke(rag_module.setup, [])
+    assert result.exit_code == 0, result.output
+    assert "contacts cache vacío" in result.output
+    assert "mask fallback" in result.output
+
+
+def test_setup_remove_skips_warmup(tmp_path, monkeypatch):
+    """`rag setup --remove` NO debe warmear el cache (es destructivo)."""
+    import subprocess
+    from click.testing import CliRunner
+
+    monkeypatch.setattr(rag_module, "_LAUNCH_AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(rag_module, "_RAG_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(rag_module, "_CONTACTS_PHONE_INDEX_PATH", tmp_path / "no-cache.json")
+    rag_bin_path = tmp_path / "rag-bin"
+    rag_bin_path.write_text("#!/bin/sh\nexit 0\n")
+    rag_bin_path.chmod(0o755)
+    monkeypatch.setattr(rag_module, "_rag_binary", lambda: str(rag_bin_path))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: type("P", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
+    )
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        rag_module, "_load_contacts_phone_index",
+        lambda ttl_s=86400: called.update({"n": called["n"] + 1}) or {},
+    )
+
+    result = CliRunner().invoke(rag_module.setup, ["--remove"])
+    assert result.exit_code == 0, result.output
+    assert called["n"] == 0, "--remove must not trigger warmup"

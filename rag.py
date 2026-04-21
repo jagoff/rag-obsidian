@@ -27931,9 +27931,53 @@ def setup(remove: bool):
             console.print(f"[red]✗[/red] falló cargar {label}: {stderr.strip()}")
 
     if not remove:
+        # Pre-build Apple Contacts disk cache. La primera invocación del
+        # resolver `_resolve_sender_to_name` dispara `_load_contacts_phone_index()`
+        # que dumpea el address book completo via osascript — ~85s para ~350
+        # contactos en el host del autor. Si `rag setup` no lo calienta, ese
+        # costo lo paga la primera query cross-source post-install (suele ser
+        # `rag serve` handling un WA inbound). Pre-buildearlo acá mueve el
+        # hit al setup, donde el user ya está esperando.
+        #
+        # Silent-fail: si Contacts.app está restringido o el dump falla, el
+        # resolver degrada al mask fallback (`…XXXX`) — no bloquea el setup.
+        # Solo corre si el cache en disk no existe o expiró (TTL 24h).
+        try:
+            cache_path = _CONTACTS_PHONE_INDEX_PATH
+            cache_stale = (
+                not cache_path.is_file()
+                or (time.time() - cache_path.stat().st_mtime) > _CONTACTS_PHONE_INDEX_TTL_S
+            )
+            if cache_stale:
+                console.print()
+                console.print(
+                    "[dim]Pre-building Apple Contacts phone index "
+                    "(primer run, ~1-2min)…[/dim]"
+                )
+                t0 = time.time()
+                idx = _load_contacts_phone_index()
+                if idx:
+                    console.print(
+                        f"[green]✓[/green] contacts cache: "
+                        f"{len(idx)} phones indexados en {time.time()-t0:.1f}s"
+                    )
+                else:
+                    console.print(
+                        "[yellow]·[/yellow] contacts cache vacío "
+                        "(Contacts.app no accesible o sin teléfonos) — "
+                        "el resolver usa mask fallback"
+                    )
+        except Exception as exc:
+            _silent_log("setup_contacts_warmup", exc)
+            console.print(
+                "[yellow]·[/yellow] contacts cache warmup falló — continuá sin ello"
+            )
+
         console.print()
         console.print(
-            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,wa-tasks,online-tune,consolidate}}.{{log,error.log}}[/dim]"
+            f"[dim]Logs en {_RAG_LOG_DIR}/{{watch,digest,morning,today,emergent,patterns,archive,"
+            f"wa-tasks,online-tune,consolidate,ingest-whatsapp,ingest-gmail,ingest-reminders}}"
+            f".{{log,error.log}}[/dim]"
         )
 
 

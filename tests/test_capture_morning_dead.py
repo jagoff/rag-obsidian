@@ -66,14 +66,14 @@ def test_capture_writes_to_inbox(tmp_vault):
 def test_capture_with_extra_tags_and_source(tmp_vault):
     path = rag.capture_note(
         "voice transcript",
-        tags=["voice", "telegram"],
-        source="tg:123",
+        tags=["voice", "whatsapp"],
+        source="wa:123",
     )
     txt = path.read_text()
     assert "- capture" in txt
     assert "- voice" in txt
-    assert "- telegram" in txt
-    assert "source: tg:123" in txt
+    assert "- whatsapp" in txt
+    assert "source: wa:123" in txt
 
 
 def test_capture_dedups_on_filename_collision(tmp_vault):

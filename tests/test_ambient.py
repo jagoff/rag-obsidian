@@ -70,7 +70,7 @@ def _write_config(path: Path, enabled: bool = True, jid: str = "1203634261780350
     }))
 
 
-def _write_legacy_telegram_config(path: Path):
+def _write_legacy_bot_config(path: Path):
     """Schema viejo — se usa para verificar bwcompat (debe ser rechazado)."""
     path.write_text(json.dumps({
         "chat_id": "123", "bot_token": "fake-token", "enabled": True,
@@ -269,11 +269,11 @@ def test_ambient_config_rejects_corrupt_json(tmp_vault):
     assert rag._ambient_config() is None
 
 
-def test_ambient_config_rejects_legacy_telegram_schema(tmp_vault):
+def test_ambient_config_rejects_legacy_bot_schema(tmp_vault):
     """Bwcompat: schema viejo (chat_id/bot_token) debe devolver None para que
     el usuario re-habilite contra el bot de WhatsApp.
     """
-    _write_legacy_telegram_config(rag.AMBIENT_CONFIG_PATH)
+    _write_legacy_bot_config(rag.AMBIENT_CONFIG_PATH)
     assert rag._ambient_config() is None
 
 

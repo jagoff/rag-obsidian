@@ -183,7 +183,7 @@ def _url_link_style(url: str, base: str) -> str:
 def to_obsidian_url(path: str, vault_name: str | None = None) -> str:
     """`obsidian://open?vault=<name>&file=<encoded>` for a vault-relative .md path.
 
-    Used by `--plain` outputs that go to WhatsApp / Telegram / other chat
+    Used by `--plain` outputs that go to WhatsApp / other chat
     surfaces — those render bare URLs as clickable but ignore markdown link
     syntax. Click on mobile opens the note straight in Obsidian.
     Vault name defaults to `VAULT_PATH.name` (matches how Obsidian names vaults
@@ -1095,12 +1095,12 @@ def _diff_brief_signal() -> None:
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 # Persist multi-turn conversation so follow-ups ("profundizá", pronouns without
 # antecedent) can reference prior turns. Shared across `rag chat`, `rag query
-# --continue`, MCP `rag_query(session_id=...)`, and the Telegram bots (which
-# pass `tg:<chat_id>` as id).
+# --continue`, MCP `rag_query(session_id=...)`, and the WhatsApp listener (which
+# passes `wa:<jid>` as id).
 #
 # Storage: one JSON file per session under SESSIONS_DIR. LAST_SESSION_FILE
 # holds the most recent id so `--continue` / `--resume` can default to it.
-# Caller-supplied ids are allowed (needed for Telegram chat_id), validated
+# Caller-supplied ids are allowed (needed for WhatsApp JIDs), validated
 # against SESSION_ID_RE.
 
 SESSIONS_DIR = Path.home() / ".local/share/obsidian-rag/sessions"
@@ -4986,7 +4986,7 @@ def _with_vault(vault_path: Path):
 def auto_index_vault(vault_path: Path) -> dict:
     """Detecta cambios en `vault_path` y reindexa lo necesario. Retorna
     {scanned, indexed, removed, kind, took_ms} donde kind ∈
-    {"first_time", "incremental", "no_changes"}.
+    {"first_time", "incremental", "no_changes", "skipped_lock_held"}.
 
     Estrategia:
       - Vault vacío → first_time, escanea todo + indexa.
@@ -4995,9 +4995,30 @@ def auto_index_vault(vault_path: Path) -> dict:
         ya hace su propio hash gate (skip si content no cambió de verdad).
       - Limpia orphans (archivos en el índice que ya no están en disco).
       - Actualiza last_check_at al final.
+
+    If the collection write lock is held by another process (e.g. rag index
+    --reset), skips this cycle immediately and returns kind="skipped_lock_held".
+    Watch will trigger again on the next file change; chat has already started.
     """
     import time as _t
     t0 = _t.perf_counter()
+
+    # Non-blocking lock probe: if a reset or another heavy writer holds the
+    # lock, skip this entire auto-index cycle rather than racing or waiting.
+    # Individual _index_single_file calls acquire the lock themselves (10s
+    # timeout), so watch-triggered single-file writes still serialize correctly.
+    try:
+        with _collection_write_lock(blocking=False):
+            pass  # just probe; real acquire happens inside _index_single_file
+    except LockHeldError:
+        _log_collection_op("auto_index_skipped", str(vault_path), {"reason": "write_lock_held"})
+        return {
+            "scanned": 0,
+            "indexed": 0,
+            "removed": 0,
+            "kind": "skipped_lock_held",
+            "took_ms": int((_t.perf_counter() - t0) * 1000),
+        }
     state = _auto_index_state_load()
     key = _vault_state_key(vault_path)
     last_check = float(state.get(key, 0.0))
@@ -13571,7 +13592,7 @@ def _dispatch_contradiction_check(
 # Reactivo al filesystem: cuando una nota nueva aparece (o cambia) en 00-Inbox,
 # el agente corre análisis sin LLM (dupes + related + wikilinks) y:
 #   - auto-aplica wikilinks (regex determinística, segura)
-#   - envía un mensaje Telegram con los findings + cambios
+#   - envía un mensaje WhatsApp con los findings + cambios
 #
 # Config (escrita por el bot vía `/enable_ambient`): JSON en
 # `~/.local/share/obsidian-rag/ambient.json` con `{jid, enabled}`.
@@ -13991,7 +14012,7 @@ def _ambient_config() -> dict | None:
       case-sensitive (matchean vs path relativos del vault), trailing
       slashes normalizados.
 
-    Backward compat: si detecta `chat_id`/`bot_token` (schema Telegram viejo)
+    Backward compat: si detecta `chat_id`/`bot_token` (legacy bot schema)
     loggea warning una vez y retorna None — el usuario debe re-habilitar
     desde el bot de WhatsApp para regenerar la config.
     """
@@ -14004,11 +14025,11 @@ def _ambient_config() -> dict | None:
     if c.get("enabled") is False:
         return None
     if c.get("chat_id") or c.get("bot_token"):
-        # Old Telegram schema — refuse silently (the CLI `ambient status`
+        # Legacy bot schema — refuse silently (the CLI `ambient status`
         # surfaces this; stderr-log would pollute watch.log on every save).
         _ambient_log_event({
             "cmd": "ambient_config",
-            "warning": "telegram_config_ignored",
+            "warning": "legacy_bot_config_ignored",
             "hint": "Re-habilitar desde el bot de WhatsApp (schema ahora es {jid, enabled}).",
         })
         return None
@@ -21241,7 +21262,7 @@ def wikilinks_suggest(
 # ── QUICK CAPTURE (rag capture) ──────────────────────────────────────────────
 # Atomic building block: take a string (from stdin or arg) and land it in the
 # vault as a fresh Inbox note. Used directly by the user and indirectly by the
-# Telegram voice-to-note path.
+# WhatsApp voice capture path.
 
 _CAPTURE_FOLDER = "00-Inbox"
 
@@ -21300,7 +21321,7 @@ def capture_note(
 @click.option("--tag", "tags", multiple=True,
               help="Tag extra (además de 'capture'). Repetible.")
 @click.option("--source", default=None,
-              help="Etiqueta de origen (ej: 'voice', 'telegram', 'cli')")
+              help="Etiqueta de origen (ej: 'voice', 'whatsapp', 'cli')")
 @click.option("--title", default=None,
               help="Título custom (slug del filename). Default: primera línea.")
 @click.option("--plain", is_flag=True, help="Salida plana (ruta only)")
@@ -21310,7 +21331,7 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
 
     Uso:
       rag capture "idea suelta"
-      echo "nota" | rag capture --stdin --tag voice --source telegram
+      echo "nota" | rag capture --stdin --tag voice --source whatsapp
     """
     if from_stdin:
         import sys
@@ -29124,7 +29145,7 @@ def ambient_status():
             if raw.get("chat_id") or raw.get("bot_token"):
                 console.print(
                     "[yellow]Deshabilitado[/yellow] — config tiene schema viejo "
-                    "(chat_id/bot_token de Telegram). Re-habilitá con "
+                    "(chat_id/bot_token del bot anterior). Re-habilitá con "
                     "/enable_ambient en el bot de WhatsApp."
                 )
             else:

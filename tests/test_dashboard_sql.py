@@ -310,5 +310,8 @@ def test_dashboard_sql_sources_breakdown(sql_env):
     d = web_server._dashboard_compute_sql(days=7)
     assert d["sources"].get("whatsapp") == 2  # wa: session + serve cmd
     assert d["sources"].get("web") == 1
-    assert d["sources"].get("telegram") == 1
+    # Post-2026-04 rename: `tg:` sessions count as "legacy" (bot was
+    # deprecated in favor of WhatsApp listener; the bucket stays as a
+    # grouping for any old `tg:*` session_ids still in rag_queries).
+    assert d["sources"].get("legacy") == 1
     assert d["sources"].get("cli") == 1

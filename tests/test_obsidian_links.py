@@ -1,7 +1,7 @@
 """Tests para `to_obsidian_url` y `convert_obsidian_links`.
 
 Cubren el rewrite de citaciones en --plain → URLs `obsidian://` clickeables
-en chat surfaces (WhatsApp, Telegram). El rewrite tiene que:
+en chat surfaces (WhatsApp). El rewrite tiene que:
   - encodear paths con espacios y caracteres especiales
   - preservar la label en `[Label](path.md)` como prefijo "Label: <url>"
   - manejar la forma bare `[path.md]` (default de command-r) sin doble-procesar

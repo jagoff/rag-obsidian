@@ -39,9 +39,9 @@ def test_roundtrip(sessions_tmp):
 
 
 def test_ensure_session_keeps_valid_custom_id(sessions_tmp):
-    sess = rag.ensure_session("tg:12345", mode="telegram")
+    sess = rag.ensure_session("tg:12345", mode="legacy")
     assert sess["id"] == "tg:12345"
-    assert sess["mode"] == "telegram"
+    assert sess["mode"] == "legacy"
     assert sess["turns"] == []
 
 
@@ -53,11 +53,11 @@ def test_ensure_session_mints_fresh_id_for_invalid_input(sessions_tmp):
 
 
 def test_ensure_session_returns_existing_when_id_matches(sessions_tmp):
-    s1 = rag.ensure_session("tg:777", mode="telegram")
+    s1 = rag.ensure_session("tg:777", mode="legacy")
     rag.append_turn(s1, {"q": "uno", "a": "a1"})
     rag.save_session(s1)
 
-    s2 = rag.ensure_session("tg:777", mode="telegram")
+    s2 = rag.ensure_session("tg:777", mode="legacy")
     assert s2["id"] == "tg:777"
     assert len(s2["turns"]) == 1
     assert s2["turns"][0]["q"] == "uno"

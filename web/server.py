@@ -1829,19 +1829,19 @@ def _source_payload(meta: dict, score: float) -> dict:
     }
 
 
+# Thin wrappers al par canónico en rag.py — mantienen la API estable acá
+# sin duplicar la calibración (2026-04-21: rag.py expone thresholds
+# calibrados contra la distribución real de `rag_queries.top_score`).
+from rag import confidence_badge as _rag_confidence_badge  # noqa: E402
+from rag import score_bar as _rag_score_bar  # noqa: E402
+
+
 def _confidence_badge(score: float) -> tuple[str, str]:
-    if score >= 3.0:
-        return ("🟢", f"alta · {score:.1f}")
-    if score >= 0.0:
-        return ("🟡", f"media · {score:.1f}")
-    return ("🔴", f"baja · {score:.1f}")
+    return _rag_confidence_badge(score)
 
 
 def _score_bar(score: float, width: int = 5) -> str:
-    clipped = max(-5.0, min(10.0, score))
-    normalized = (clipped + 5.0) / 15.0
-    filled = int(round(normalized * width))
-    return "■" * filled + "□" * (width - filled)
+    return _rag_score_bar(score, width=width)
 
 
 # ── Intent detection: tasks / agenda / pendientes ────────────────────────────

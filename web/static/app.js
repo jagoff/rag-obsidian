@@ -595,17 +595,21 @@ function appendMeta(parent, bits) {
   parent.appendChild(m);
 }
 
-// Confidence badge — mirrors server's _confidence_badge (score ≥3 verde,
-// ≥0 amarillo, <0 rojo). Renderizado como pill en el header de fuentes.
+// Confidence badge — mirrors server's `confidence_badge()` in rag.py.
+// Calibrated 2026-04-21 against real `rag_queries.top_score` distribution
+// (n=904): p50=0.14, p75=0.48, p95=0.97. Pre-calibración usaba thresholds
+// para score range [-5, 10] que nunca se triggereaban — todo se renderizaba
+// "media · amarillo" independientemente del quality real. Constantes
+// sincronizadas con rag.py `SCORE_BADGE_LOW_HIGH` / `SCORE_BADGE_MID_HIGH`.
 function confidenceBadge(score) {
   const s = Number.isFinite(score) ? score : 0;
-  let level = "mid";
-  let label = "media";
-  if (s >= 3.0) { level = "high"; label = "alta"; }
-  else if (s < 0) { level = "low"; label = "baja"; }
+  let level = "low";
+  let label = "baja";
+  if (s >= 0.50) { level = "high"; label = "alta"; }
+  else if (s >= 0.10) { level = "mid"; label = "media"; }
   const span = el("span", `conf-pill conf-${level}`);
   span.title = `score top rerank: ${s.toFixed(2)}`;
-  span.textContent = `confianza ${label} · ${s.toFixed(1)}`;
+  span.textContent = `confianza ${label} · ${s.toFixed(2)}`;
   return span;
 }
 
@@ -1202,8 +1206,13 @@ function appendSources(parent, items, confidence) {
     if (seen.has(s.file)) continue;
     seen.add(s.file);
     const row = el("div", "source-row");
+    // Source-row tone — post-2026-04-21 recalibration del score_bar (mapping
+    // [0, 1.0] → 5 cells), con estos thresholds de cells matcheamos los del
+    // badge: alta ≥ 0.50 ≈ 3+ cells · media ≥ 0.10 ≈ 1+ cell · baja < 1 cell.
+    // Pre-calibración usaba filled >= 4/2/0 bajo un mapping [-5, 10] que
+    // concentraba todas las respuestas en el bucket "mid" (2 cells).
     const filled = (s.bar.match(/■/g) || []).length;
-    const tone = filled >= 4 ? "good" : filled >= 2 ? "mid" : "low";
+    const tone = filled >= 3 ? "good" : filled >= 1 ? "mid" : "low";
     const bar = el("span", `bar bar-${tone}`);
     bar.textContent = s.bar;
     row.appendChild(bar);

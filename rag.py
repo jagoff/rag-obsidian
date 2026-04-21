@@ -9718,19 +9718,53 @@ def get_vocabulary(col: SqliteVecCollection) -> tuple[set[str], set[str]]:
 
 # ── UX HELPERS ────────────────────────────────────────────────────────────────
 
+# Calibración de score basada en distribución REAL medida 2026-04-21 sobre
+# `rag_queries.top_score` (n=904):
+#   min=-Inf (sentinel) · p25=0.090 · p50=0.140 · p75=0.480 ·
+#   p90=0.930 · p95=0.970 · p99=1.080 · max=1.120
+#
+# Pre-calibración el código usaba thresholds asumiendo score range [-5, 10]
+# (>= 3.0 alta, >= 0.0 media, sino baja). Eso nunca se triggereaba "alta"
+# porque p99 real es 1.08, ni llega al 3.0. Toda respuesta se renderizaba
+# "media · amarillo" independientemente de quality real. Misma calibración
+# rota hacía que `score_bar()` muestre 2/5 barras en un score=0.3 que en
+# realidad está arriba de la mediana.
+#
+# Post-calibración (estos thresholds):
+#   - `baja` (rojo): score < 0.10 → matches CONFIDENCE_DEEP_THRESHOLD
+#     del backend (abajo de este valor auto-deep retrieval fires, vault
+#     shaky). Cubre bottom ~25% del tráfico real.
+#   - `media` (amarillo): 0.10 <= score < 0.50 → respuestas normales.
+#     Cubre ~50% middle band.
+#   - `alta` (verde): score >= 0.50 → p75 band y arriba, match fuerte.
+#
+# `score_bar()` mapea linealmente [0.0, 1.0] → 5 cells (saturando a 5
+# cells arriba de 1.0, que es p99+). Scores negativos (-Inf sentinel)
+# caen a 0 cells.
+SCORE_BADGE_LOW_HIGH = 0.10   # boundary baja/media (== CONFIDENCE_DEEP_THRESHOLD)
+SCORE_BADGE_MID_HIGH = 0.50   # boundary media/alta (~ p75 observado)
+SCORE_BAR_MAX = 1.0           # score que satura la barra al máximo
+
+
 def confidence_badge(score: float) -> tuple[str, str]:
-    """Return (emoji, label) based on reranker logit score."""
-    if score >= 3.0:
-        return ("🟢", f"alta · {score:.1f}")
-    if score >= 0.0:
-        return ("🟡", f"media · {score:.1f}")
-    return ("🔴", f"baja · {score:.1f}")
+    """Return (emoji, label) based on reranker score.
+
+    Calibrated 2026-04-21 against real `rag_queries.top_score` distribution
+    (n=904): p50=0.14, p75=0.48, p95=0.97. Ver constantes `SCORE_BADGE_*`.
+    """
+    if score >= SCORE_BADGE_MID_HIGH:
+        return ("🟢", f"alta · {score:.2f}")
+    if score >= SCORE_BADGE_LOW_HIGH:
+        return ("🟡", f"media · {score:.2f}")
+    return ("🔴", f"baja · {score:.2f}")
 
 
 def score_bar(score: float, width: int = 5) -> str:
-    """Visual bar from reranker score. Maps score ∈ [-5, 10] to filled cells."""
-    clipped = max(-5.0, min(10.0, score))
-    normalized = (clipped + 5.0) / 15.0  # 0..1
+    """Visual bar from reranker score. Maps score ∈ [0, SCORE_BAR_MAX] to
+    filled cells. Scores arriba de SCORE_BAR_MAX (p99+) saturan full bar;
+    scores negativos (p.ej. -Inf sentinel de vault vacío) caen a 0 cells."""
+    clipped = max(0.0, min(SCORE_BAR_MAX, score))
+    normalized = clipped / SCORE_BAR_MAX  # 0..1
     filled = int(round(normalized * width))
     return "■" * filled + "□" * (width - filled)
 

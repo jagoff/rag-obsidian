@@ -223,19 +223,25 @@ def test_golden_cross_source_paths_have_native_id_format():
     import re
     data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
 
-    # Patterns based on docs/design-cross-source-corpus.md §2.7.
+    # Patterns based on actual ingester output (scripts/ingest_*.py).
     # Reminders: `reminders://<id>` where <id> can itself contain `://` (Apple URLs)
     # Gmail:     `gmail://thread/<id>`
     # WhatsApp:  `whatsapp://<chat_jid>/<msg_id>`
-    # Calendar:  `calendar://event:<id>`
+    # Calendar:  `calendar://<calendar_id>/<event_id>` (calendar_id is an email
+    #            per Google's API, e.g. "fernandoferrari@gmail.com")
     # Messages:  `messages://<id>`
+    #
+    # Calendar format drift note: the original design doc (§2.7) proposed
+    # `calendar://event:<id>` but the implementation (_event_file_key at
+    # scripts/ingest_calendar.py) uses the two-segment form parallel to
+    # WhatsApp. Test follows the implementation (ground truth).
     SOURCE_PATTERNS = [
         (re.compile(r"^gmail://thread/[\w\-]+$"),
          "gmail://thread/<id>"),
         (re.compile(r"^whatsapp://[\w@\.\-]+/[\w\-]+$"),
          "whatsapp://<chat_jid>/<msg_id>"),
-        (re.compile(r"^calendar://(event:)?[\w\-]+$"),
-         "calendar://event:<id>"),
+        (re.compile(r"^calendar://[\w@\.\-]+/[\w\-]+$"),
+         "calendar://<calendar_id>/<event_id>"),
         (re.compile(r"^reminders://.+[^/]$"),
          "reminders://<id> (sin trailing slash)"),
         (re.compile(r"^messages://[\w\-]+$"),

@@ -357,6 +357,37 @@ queries:
       - gmail://thread/19db035184e265b8
     note: "gmail — multi-doc sobre el mismo topic (synthesis implícito)"
 
+  # Calendar — event-specific lookups (populated 2026-04-21 post-Calendar API
+  # enable). 368 chunks indexados del calendar `fernandoferrari@gmail.com`.
+  # Se usan event IDs reales del corpus actual; si el evento se edita / borra
+  # la query va a fallar — actualizar contra `sqlite3 ragvec.db "SELECT file
+  # FROM meta_obsidian_notes_v11 WHERE source='calendar' AND document LIKE
+  # '%<subject>%'"`.
+  - question: "turno con el psicólogo martín segal"
+    expected:
+      - calendar://fernandoferrari@gmail.com/77gam5n17pld1tc2i3anlonqi5
+    note: "calendar — turno profesional recurrente, subject-literal"
+
+  - question: "workshop de AI Engineer sobre sistemas RAG"
+    expected:
+      - calendar://fernandoferrari@gmail.com/0vqo081rthdblder0qnpvi5o9j
+    note: "calendar — workshop técnico, paraphrase del subject"
+
+  - question: "despedida de jardín de astor"
+    expected:
+      - calendar://fernandoferrari@gmail.com/_60ojed268d2k6b9l6cp3eb9k70okcba271246b9p68rjiha48ksk2ha26o
+    note: "calendar — evento familiar puntual"
+
+  - question: "reunión con Max de brightscout sobre ops"
+    expected:
+      - calendar://fernandoferrari@gmail.com/2u4a0vkqls67bq9dee4g40f3gi
+    note: "calendar — reunión de trabajo recurrente con atendee resolution"
+
+  - question: "turno con erica franzen"
+    expected:
+      - calendar://fernandoferrari@gmail.com/369o0b149snreaiip2ul95emmb
+    note: "calendar — turno profesional one-off, subject-literal"
+
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per

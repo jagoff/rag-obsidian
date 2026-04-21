@@ -112,6 +112,32 @@ _CITATION_REPAIR_MAX_BAD = int(os.environ.get("RAG_CITATION_REPAIR_MAX_BAD", "3"
 
 
 # ──────────────────────────────────────────────────────────────────────
+# NLI grounding gate helpers (Improvement #1, Fase B — on-demand env reading)
+# ──────────────────────────────────────────────────────────────────────
+def _nli_grounding_enabled() -> bool:
+    return os.environ.get("RAG_NLI_GROUNDING", "").strip() not in ("", "0", "false", "no")
+
+
+def _nli_contradicts_threshold() -> float:
+    try:
+        return float(os.environ.get("RAG_NLI_CONTRADICTS_THRESHOLD", "0.7"))
+    except (ValueError, TypeError):
+        return 0.7
+
+
+def _nli_skip_intents() -> frozenset[str]:
+    intents_str = os.environ.get("RAG_NLI_SKIP_INTENTS", "count,list,recent,agenda")
+    return frozenset(s.strip() for s in intents_str.split(",") if s.strip())
+
+
+def _nli_max_claims() -> int:
+    try:
+        return int(os.environ.get("RAG_NLI_MAX_CLAIMS", "20"))
+    except (ValueError, TypeError):
+        return 20
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Adaptive pipeline routing (Improvement #3, Fase A — scaffolding no-op)
 # ──────────────────────────────────────────────────────────────────────
 # Per-intent dispatch: cuando RAG_ADAPTIVE_ROUTING=1 el pipeline puede
@@ -145,6 +171,12 @@ _EXPAND_SKIP_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
 # mismo chunk" que synthesis necesita mencionar.
 _GRAPH_ALWAYS_INTENTS: frozenset[str] = frozenset({"comparison", "synthesis"})
 
+# Intents metadata-only que no necesitan reformulate_query (handlers devuelven
+# metadata directo sin LLM). Fase B skipea el helper call ~1-2s con history.
+_METADATA_ONLY_INTENTS: frozenset[str] = frozenset(
+    {"count", "list", "recent", "agenda", "entity_lookup"}
+)
+
 
 def _adaptive_routing() -> bool:
     """True si RAG_ADAPTIVE_ROUTING=1 Y RAG_FORCE_FULL_PIPELINE!=1.
@@ -156,6 +188,13 @@ def _adaptive_routing() -> bool:
     if os.environ.get("RAG_FORCE_FULL_PIPELINE") == "1":
         return False
     return os.environ.get("RAG_ADAPTIVE_ROUTING") == "1"
+
+
+def _should_skip_reformulate(intent: str) -> bool:
+    """Fase B: cuando adaptive routing ON, metadata-only intents saltean reformulate."""
+    if not _adaptive_routing():
+        return False
+    return intent in _METADATA_ONLY_INTENTS
 
 
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
@@ -9322,6 +9361,23 @@ _INTENT_AGENDA_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+# Entity lookup: person-centric retrieval — "con quién hablé de X",
+# "qué dice Juan sobre Y", "todos los mails de Fernando", "mensajes de Max".
+# Checked AFTER agenda (temporal wins) but BEFORE recent (entity is more
+# specific than "recientes"). Avoids broad "con\s+\w+\s+cu[aá]ndo" which
+# overlaps with agenda.
+_INTENT_ENTITY_LOOKUP_RE = re.compile(
+    r"\b("
+    r"con\s+qui[eé]n\s+habl[eé]|"
+    r"a\s+qui[eé]n\s+le\s+mand[eé]|"
+    r"a\s+qui[eé]n\s+(?:le\s+)?dije|"
+    r"qu[eé]\s+(?:dice|dijo|me\s+dijo)\s+\w+\s+(?:sobre|de|acerca\s+de)|"
+    r"todo\s+lo\s+(?:de|sobre|que\s+tengo\s+de)\s+\w+|"
+    r"todos?\s+los?\s+(?:mensajes?|mails?|notas?|chats?|correos?)\s+(?:de|con)\s+\w+|"
+    r"(?:mensajes?|mails?|notas?|chats?|correos?|conversaciones?)\s+(?:de|con)\s+\w+"
+    r")",
+    re.IGNORECASE,
+)
 # Comparison: two-term contrasts — "X vs Y", "diferencia entre X y Y",
 # "comparar X con Y", "en qué se diferencian X y Y", "compare X and Y".
 # Checked BEFORE synthesis because "X vs Y" is inherently comparative.
@@ -9400,6 +9456,11 @@ def classify_intent(
     # "esta semana"; now it lands on the source-aware agenda handler.
     if _INTENT_AGENDA_RE.search(question):
         return "agenda", params
+    # Entity lookup AFTER agenda but BEFORE recent: person-centric retrieval
+    # is more specific than "recientes". "notas recientes de juan" doesn't
+    # match the entity regex (no "recientes" token), so recent still wins.
+    if _INTENT_ENTITY_LOOKUP_RE.search(question):
+        return "entity_lookup", params
     if _INTENT_RECENT_RE.search(question):
         return "recent", params
     # Comparison before synthesis: "X vs Y" / "diferencia entre X y Y" is
@@ -9643,6 +9704,141 @@ def handle_agenda(
 
     files.sort(key=_ts, reverse=True)
     return files[:limit]
+
+
+def resolve_entity_from_query(question: str, sql_conn) -> tuple[str, int] | None:
+    """Extrae referencia a entidad en la query y resuelve contra rag_entities.
+
+    Returns (canonical_name, entity_id) o None si no hay match.
+    Ver docs/improvement-2-entity-retrieval-plan.md §2.
+    """
+    q_lower = question.lower()
+    # Patterns priorizados: los específicos primero, para que "qué dice max
+    # sobre ops" capture "max" y no "ops".
+    _patterns = (
+        r"qu[eé]\s+(?:dice|dijo|me\s+dijo)\s+(\w+)",
+        r"todo\s+lo\s+(?:de|sobre|que\s+tengo\s+de)\s+(\w+)",
+        r"todos?\s+l[oa]s?\s+(?:mensajes?|mails?|notas?|chats?|correos?|conversaciones?)\s+(?:de|con)\s+(\w+)",
+        r"(?:mensajes?|mails?|notas?|chats?|correos?|conversaciones?)\s+(?:de|con)\s+(\w+)",
+        r"(?:con|a|sobre)\s+(\w+)",
+    )
+    candidate_raw = None
+    for pat in _patterns:
+        m = re.search(pat, q_lower)
+        if m:
+            cand = m.group(1).strip()
+            if cand and len(cand) >= 2 and cand not in {"el", "la", "los", "las", "un", "una"}:
+                candidate_raw = cand
+                break
+    if not candidate_raw:
+        return None
+    candidate = _normalize_entity_name(candidate_raw)
+
+    try:
+        row = sql_conn.execute(
+            "SELECT id, canonical_name FROM rag_entities WHERE normalized = ? LIMIT 1",
+            (candidate,)
+        ).fetchone()
+        if row:
+            return (row[1], row[0])
+
+        try:
+            from rapidfuzz import fuzz
+        except ImportError:
+            return None
+
+        all_entities = sql_conn.execute(
+            "SELECT id, canonical_name, aliases FROM rag_entities"
+        ).fetchall()
+        scored: list = []
+        for eid, canonical, aliases_json in all_entities:
+            score = fuzz.token_set_ratio(candidate, canonical.lower())
+            if aliases_json:
+                try:
+                    for alias in json.loads(aliases_json):
+                        score = max(score, fuzz.token_set_ratio(candidate, alias.lower()))
+                except (ValueError, TypeError):
+                    pass
+            if score >= 85:
+                scored.append((score, eid, canonical))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        return (scored[0][2], scored[0][1])
+    except Exception as exc:
+        try:
+            _silent_log("entity_resolve_error", exc)
+        except Exception:
+            pass
+        return None
+
+
+def handle_entity_lookup(
+    col,
+    params: dict,
+    limit: int = 20,
+    *,
+    question: str | None = None,
+) -> list:
+    """ENTITY_LOOKUP intent — chunks mencionando entity resuelta,
+    opcionalmente filtrados por ventana temporal. Returns [] si entity no
+    resolvible → caller cae a semantic retrieve.
+    """
+    if not question:
+        return []
+    try:
+        with _ragvec_state_conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]
+            if count == 0:
+                return []
+            entity_result = resolve_entity_from_query(question, conn)
+            if entity_result is None:
+                return []
+            _canonical_name, entity_id = entity_result
+            mention_rows = conn.execute(
+                "SELECT chunk_id, ts FROM rag_entity_mentions "
+                "WHERE entity_id = ? ORDER BY ts DESC LIMIT 200",
+                (entity_id,)
+            ).fetchall()
+    except Exception as exc:
+        try:
+            _silent_log("entity_lookup_sql_failed", exc)
+        except Exception:
+            pass
+        return []
+
+    if not mention_rows:
+        return []
+
+    mention_chunk_ids = {row[0] for row in mention_rows}
+    mention_ts_by_id = {row[0]: row[1] for row in mention_rows}
+
+    c = _load_corpus(col)
+    metas = []
+    for m in c["metas"]:
+        cid = m.get("chunk_id") or m.get("file")
+        if cid in mention_chunk_ids:
+            m_copy = dict(m)
+            m_copy["_entity_ts"] = mention_ts_by_id.get(cid, 0.0)
+            metas.append(m_copy)
+
+    tag = params.get("tag")
+    folder = params.get("folder")
+    try:
+        metas = _filter_files(metas, tag, folder)
+    except Exception:
+        pass
+
+    try:
+        window = _parse_agenda_window(question) if question else None
+    except Exception:
+        window = None
+    if window is not None:
+        ts_start, ts_end = window
+        metas = [m for m in metas if ts_start <= m.get("_entity_ts", 0.0) < ts_end]
+
+    metas.sort(key=lambda m: m.get("_entity_ts", 0.0), reverse=True)
+    return metas[:limit]
 
 
 def render_file_list(title: str, files: list[dict]) -> None:
@@ -12403,9 +12599,16 @@ def retrieve(
     exclude_path_prefixes: tuple[str, ...] | None = None,
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
+    intent: str | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
-       { docs, metas, scores, confidence, search_query, filters_applied, query_variants }
+       { docs, metas, scores, confidence, search_query, filters_applied,
+         query_variants, fast_path }
+
+    `intent` (optional, Improvement #3 Fase C): caller-detected intent. When
+    adaptive routing is ON + intent == "semantic" (or None=default) + top-1
+    rerank score > `_LOOKUP_THRESHOLD`, `fast_path=True` en el result y el
+    caller puede elegir LLM chico + num_ctx reducido + skip citation-repair.
 
     `seen_titles`, when provided, applies a soft post-rerank penalty
     (`SEEN_TITLE_PENALTY`) to candidates whose note title was already
@@ -12438,6 +12641,7 @@ def retrieve(
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
             "search_query": question, "filters_applied": {}, "query_variants": [question],
             "timing": dict(_timing),
+            "fast_path": False,
         }
 
     # 1. Reformulate vs history (precise mode)
@@ -12545,6 +12749,7 @@ def retrieve(
             "search_query": search_query, "filters_applied": filters_applied,
             "query_variants": variants,
             "timing": dict(_timing),
+            "fast_path": False,
         }
 
     # 4b. Feedback signals (👍/👎 del usuario sobre queries similares previas).
@@ -12939,6 +13144,17 @@ def retrieve(
     except Exception as exc:
         _silent_log("retrieve.log_impressions", exc)
 
+    # Fase C fast-path marker (Improvement #3): adaptive routing ON + intent
+    # semantic (o None) + top-1 rerank > _LOOKUP_THRESHOLD → caller puede
+    # optar por LLM chico + num_ctx reducido + skip citation-repair.
+    _effective_intent = intent if intent is not None else "semantic"
+    _fast_path = bool(
+        _adaptive_routing()
+        and _effective_intent == "semantic"
+        and final_scores
+        and float(final_scores[0]) > _LOOKUP_THRESHOLD
+    )
+
     return {
         "docs": docs,
         "metas": metas,
@@ -12956,6 +13172,7 @@ def retrieve(
         # only emitted to stderr behind RAG_RETRIEVE_TIMING=1; now always
         # available in-process so callers can decide what to persist.
         "timing": dict(_timing),
+        "fast_path": _fast_path,
     }
 
 
@@ -33715,6 +33932,74 @@ def _is_refusal(text: str) -> bool:
     return bool(_REFUSAL_RE.match(text.strip()))
 
 
+# NLI model state + lazy loader (Fase B.1)
+_NLI_MODEL_NAME = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+_NLI_IDLE_TTL = float(os.environ.get("RAG_NLI_IDLE_TTL", "900"))
+_NLI_NEVER_UNLOAD = os.environ.get("RAG_NLI_NEVER_UNLOAD", "").strip() not in ("", "0", "false", "no")
+
+_nli_model = None
+_nli_last_use: float = 0.0
+_nli_lock = threading.Lock()
+
+
+def _torch_mps_empty_cache() -> None:
+    """Best-effort MPS cache drop. No-op if torch/MPS unavailable."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def get_nli_model():
+    """Lazy-load NLI model (mDeBERTa-v3-base-xnli-multilingual-nli-2mil7).
+
+    Device: mps > cuda > cpu. fp32 forced (fp16 on MPS breaks scores).
+    Thread-safe via _nli_lock. Returns None if load fails.
+    """
+    global _nli_model, _nli_last_use
+    with _nli_lock:
+        _nli_last_use = time.time()
+        if _nli_model is not None:
+            return _nli_model
+        try:
+            import torch
+            from sentence_transformers import CrossEncoder
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+            _nli_model = CrossEncoder(_NLI_MODEL_NAME, max_length=512, device=device)
+        except Exception as exc:
+            _silent_log("nli_load_failed", exc)
+            return None
+    return _nli_model
+
+
+def maybe_unload_nli_model(force: bool = False) -> bool:
+    """Drop NLI model from MPS if idle > _NLI_IDLE_TTL. Same pattern as reranker."""
+    global _nli_model, _nli_last_use
+    with _nli_lock:
+        if _nli_model is None:
+            return False
+        if not force and _NLI_NEVER_UNLOAD:
+            return False
+        if not force and time.time() - _nli_last_use < _NLI_IDLE_TTL:
+            return False
+        try:
+            import gc
+            del _nli_model
+            _nli_model = None
+            _torch_mps_empty_cache()
+            gc.collect()
+        except Exception as exc:
+            _silent_log("nli_unload", exc)
+    return True
+
+
 def split_claims(text: str) -> list[Claim]:
     """Split an LLM response into atomic claims for NLI grounding.
 
@@ -33875,17 +34160,69 @@ def ground_claims_nli(
         return None
 
     groundings: list[ClaimGrounding] = []
-    for c in claims:
-        # Fase A stub: neutral by default (safe — no false positives).
-        # Refusals also stay neutral (no NLI needed).
-        # Fase B will run actual NLI here for non-refusal claims.
-        groundings.append(ClaimGrounding(
-            text=c.text,
-            verdict="neutral",
-            score=0.0,
-            start_char=c.start_char,
-            end_char=c.end_char,
-        ))
+    nli_start = time.time()
+
+    try:
+        model = get_nli_model()
+        for c in claims:
+            if c.is_refusal:
+                groundings.append(ClaimGrounding(
+                    text=c.text, verdict="neutral", score=0.0,
+                    start_char=c.start_char, end_char=c.end_char,
+                ))
+                continue
+            if model is None:
+                groundings.append(ClaimGrounding(
+                    text=c.text, verdict="neutral", score=0.0,
+                    start_char=c.start_char, end_char=c.end_char,
+                ))
+                continue
+            try:
+                import numpy as np
+                pairs = [(c.text, doc) for doc in docs]
+                scores = model.predict(pairs, convert_to_numpy=True)
+                # Shape (N_docs, 3) con columnas [entailment, neutral, contradiction]
+                best_entail_idx = int(np.argmax(scores[:, 0]))
+                best_entail_score = float(scores[best_entail_idx, 0])
+                best_contradict_idx = int(np.argmax(scores[:, 2]))
+                best_contradict_score = float(scores[best_contradict_idx, 2])
+
+                if best_entail_score > threshold_contradicts and best_entail_score > best_contradict_score:
+                    verdict: "Literal['entails', 'neutral', 'contradicts']" = "entails"
+                    evidence_idx = best_entail_idx
+                elif best_contradict_score > threshold_contradicts:
+                    verdict = "contradicts"
+                    evidence_idx = best_contradict_idx
+                else:
+                    verdict = "neutral"
+                    evidence_idx = best_entail_idx
+
+                evidence_span = docs[evidence_idx][:200]
+                evidence_chunk_id = metas[evidence_idx].get("chunk_id") or metas[evidence_idx].get("file")
+
+                groundings.append(ClaimGrounding(
+                    text=c.text,
+                    verdict=verdict,
+                    evidence_chunk_id=evidence_chunk_id,
+                    evidence_span=evidence_span,
+                    score=best_entail_score if verdict == "entails" else best_contradict_score,
+                    start_char=c.start_char,
+                    end_char=c.end_char,
+                ))
+            except Exception as exc:
+                _silent_log("nli_inference_failed", exc)
+                groundings.append(ClaimGrounding(
+                    text=c.text, verdict="neutral", score=0.0,
+                    start_char=c.start_char, end_char=c.end_char,
+                ))
+    except Exception as exc:
+        _silent_log("nli_grounding_failed", exc)
+        groundings = [ClaimGrounding(
+            text=c.text, verdict="neutral", score=0.0,
+            start_char=c.start_char, end_char=c.end_char,
+        ) for c in claims]
+
+    nli_ms = int((time.time() - nli_start) * 1000)
 
     return GroundingResult(
         claims=groundings,
@@ -33893,8 +34230,230 @@ def ground_claims_nli(
         claims_supported=sum(1 for g in groundings if g.verdict == "entails"),
         claims_contradicted=sum(1 for g in groundings if g.verdict == "contradicts"),
         claims_neutral=sum(1 for g in groundings if g.verdict == "neutral"),
-        nli_ms=0,
+        nli_ms=nli_ms,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Entity extraction (Improvement #2, Fase B — extractor helpers)
+# ──────────────────────────────────────────────────────────────────────
+# GLiNER zero-shot NER multilingüe para popular rag_entities +
+# rag_entity_mentions durante indexing. Default OFF via RAG_EXTRACT_ENTITIES=0.
+_ENTITY_CONFIDENCE_MIN = float(os.environ.get("RAG_ENTITY_CONFIDENCE_MIN", "0.70"))
+_ENTITY_LABELS = ("person", "organization", "location", "event")
+
+_gliner_model = None
+_gliner_lock = threading.Lock()
+_gliner_load_failed = False
+
+
+def _entity_extraction_enabled() -> bool:
+    return os.environ.get("RAG_EXTRACT_ENTITIES", "").strip() not in ("", "0", "false", "no")
+
+
+def _get_gliner_model():
+    """Lazy load GLiNER multi-v2.1. Sticky-failure: no retry after first fail."""
+    global _gliner_model, _gliner_load_failed
+    with _gliner_lock:
+        if _gliner_load_failed:
+            return None
+        if _gliner_model is not None:
+            return _gliner_model
+        try:
+            from gliner import GLiNER
+        except ImportError:
+            _gliner_load_failed = True
+            try:
+                _silent_log("gliner_import_failed", Exception("gliner package not installed"))
+            except Exception:
+                pass
+            return None
+        try:
+            _gliner_model = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
+            return _gliner_model
+        except Exception as exc:
+            _gliner_load_failed = True
+            try:
+                _silent_log("gliner_load_failed", exc)
+            except Exception:
+                pass
+            return None
+
+
+def _normalize_entity_name(name: str) -> str:
+    """Lowercase + accent-strip + whitespace collapse."""
+    if not name:
+        return ""
+    try:
+        folded = _fold(name)
+    except Exception:
+        import unicodedata as _ud
+        normalized = _ud.normalize("NFD", str(name).lower())
+        folded = "".join(c for c in normalized if _ud.category(c) != "Mn")
+    return " ".join(folded.split())
+
+
+def _cluster_entities(candidates: list) -> dict:
+    """Agrupa (text, type, confidence) por (normalized, type)."""
+    clusters: dict = {}
+    for text, etype, conf in candidates:
+        if not text or not etype:
+            continue
+        norm = _normalize_entity_name(text)
+        if not norm:
+            continue
+        key = (norm, etype)
+        if key not in clusters:
+            clusters[key] = {"forms": [], "scores": []}
+        clusters[key]["forms"].append(text.strip())
+        clusters[key]["scores"].append(float(conf))
+
+    result: dict = {}
+    for (norm, etype), data in clusters.items():
+        forms = data["forms"]
+        canonical = max(set(forms), key=lambda f: (forms.count(f), len(f)))
+        aliases = sorted(set(forms) - {canonical})
+        confidence = sum(data["scores"]) / len(data["scores"])
+        result[(norm, etype)] = {
+            "canonical": canonical,
+            "aliases": aliases,
+            "confidence": confidence,
+            "count": len(forms),
+        }
+    return result
+
+
+def _extract_entities_single(text: str) -> list:
+    """Extract entities from one chunk via GLiNER."""
+    if not text or not text.strip():
+        return []
+    model = _get_gliner_model()
+    if model is None:
+        return []
+    try:
+        raw = model.predict_entities(text, list(_ENTITY_LABELS))
+    except Exception as exc:
+        try:
+            _silent_log("gliner_predict_failed", exc)
+        except Exception:
+            pass
+        return []
+    out = []
+    for e in raw:
+        score = float(e.get("score", 0.0))
+        if score < _ENTITY_CONFIDENCE_MIN:
+            continue
+        etext = (e.get("text") or "").strip()
+        elabel = (e.get("label") or "").lower().strip()
+        if etext and elabel in _ENTITY_LABELS:
+            out.append((etext, elabel, score))
+    return out
+
+
+def _extract_entities_batch(texts: list) -> list:
+    """Batch: list-of-clustered-dicts paralelo al input."""
+    if not texts:
+        return []
+    return [_cluster_entities(_extract_entities_single(t)) for t in texts]
+
+
+def _upsert_entities_for_chunk(
+    conn,
+    entities: dict,
+    chunk_id: str,
+    source: str,
+    ts: float,
+    snippet: str = "",
+) -> int:
+    """Upsert entities + mentions. Returns count of entities touched."""
+    if not entities or not chunk_id:
+        return 0
+    count = 0
+    for (norm, etype), data in entities.items():
+        try:
+            row = conn.execute(
+                "SELECT id, mention_count, first_seen_ts, confidence FROM rag_entities "
+                "WHERE normalized=? AND entity_type=?",
+                (norm, etype),
+            ).fetchone()
+            aliases_json = json.dumps(data["aliases"]) if data.get("aliases") else None
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO rag_entities "
+                    "(canonical_name, normalized, entity_type, aliases, "
+                    " first_seen_ts, last_seen_ts, mention_count, confidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (data["canonical"], norm, etype, aliases_json,
+                     ts, ts, 1, data["confidence"]),
+                )
+                entity_id = cur.lastrowid
+            else:
+                entity_id = row[0]
+                new_conf = (
+                    (row[3] * row[1] + data["confidence"]) / (row[1] + 1)
+                    if row[3] else data["confidence"]
+                )
+                conn.execute(
+                    "UPDATE rag_entities SET last_seen_ts=?, mention_count=mention_count+1, "
+                    " confidence=?, aliases=COALESCE(?, aliases) "
+                    "WHERE id=?",
+                    (ts, new_conf, aliases_json, entity_id),
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO rag_entity_mentions "
+                "(entity_id, chunk_id, source, ts, snippet, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (entity_id, chunk_id, source, ts, snippet[:200] if snippet else "", data["confidence"]),
+            )
+            count += 1
+        except Exception as exc:
+            try:
+                _silent_log("entity_upsert_failed", exc)
+            except Exception:
+                pass
+    conn.commit()
+    return count
+
+
+def _extract_and_index_entities_for_chunks(
+    chunks,
+    ids: list,
+    metadatas: list,
+    source: str,
+) -> None:
+    """High-level: batch extract + upsert. Silent-fail."""
+    if not _entity_extraction_enabled() or not chunks or not ids:
+        return
+
+    def _get_display(c):
+        if isinstance(c, tuple) and len(c) >= 2:
+            return c[1]
+        if isinstance(c, str):
+            return c
+        return ""
+
+    texts = [_get_display(c) for c in chunks]
+    try:
+        all_entities = _extract_entities_batch(texts)
+    except Exception as exc:
+        try:
+            _silent_log("entity_extraction_batch_failed", exc)
+        except Exception:
+            pass
+        return
+    try:
+        with _ragvec_state_conn() as conn:
+            for chunk_id, meta, entities, text in zip(ids, metadatas, all_entities, texts):
+                if not entities:
+                    continue
+                ts = float(meta.get("created_ts") or meta.get("ts") or time.time())
+                snippet = text[:200] if text else ""
+                _upsert_entities_for_chunk(conn, entities, chunk_id, source, ts, snippet)
+    except Exception as exc:
+        try:
+            _silent_log("entity_upsert_conn_failed", exc)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -7769,26 +7769,36 @@ def _fetch_contact(stem: str, *, email: str | None = None, canonical: str | None
 # index. Rationale: substring matching via `whose value of phones contains
 # "25376519"` fails when the stored value has separators ("+54 9 342 537
 # 6519"). Digits-normalized index sidesteps that entirely.
+#
+# Performance (2026-04-21 v2 — bulk ops): el script anterior iteraba con
+# `repeat with p in people` + `repeat with ph in phones of p` = ~1000
+# round-trips osascript↔Contacts (cada `name of p`, `phones of p`,
+# `value of ph` es un IPC call). Medido: 85s / 354 contactos en M4.
+#
+# Fix: bulk operations — `name of every person` + `value of phones of
+# every person` = 2 IPC calls totales, independiente del count. Measured
+# 0.5s / 374 phone entries (170× speedup). AppleScript maneja la
+# pairing name-with-phones-list via índices paralelos; Python parsea el
+# output line-by-line como antes.
 _CONTACTS_DUMP_SCRIPT = """
 tell application "Contacts"
   set _out to ""
-  repeat with p in people
-    try
-      set _name to name of p
-      repeat with ph in phones of p
-        try
-          set _val to value of ph as string
-          set _out to _out & _name & "|" & _val & linefeed
-        end try
-      end repeat
-    end try
+  set _names to name of every person
+  set _all_phones to value of phones of every person
+  set _n to count of _names
+  repeat with i from 1 to _n
+    set _nm to item i of _names
+    set _phs to item i of _all_phones
+    repeat with _ph in _phs
+      set _out to _out & _nm & "|" & (_ph as string) & linefeed
+    end repeat
   end repeat
   return _out
 end tell
 """
 
-_CONTACTS_PHONE_INDEX_TTL_S = 86400  # 24h — contactos raramente cambian + dump es lento
-_CONTACTS_DUMP_TIMEOUT_S = 120       # vault del autor: ~6min para 354 contactos (iteración nested)
+_CONTACTS_PHONE_INDEX_TTL_S = 86400  # 24h — contactos raramente cambian
+_CONTACTS_DUMP_TIMEOUT_S = 30        # bulk-op dump: 0.5s medido; 30s da 60× margen
 _CONTACTS_PHONE_INDEX_PATH = DB_PATH.parent / "contacts_phone_index.json"
 _contacts_phone_index: dict | None = None  # {"ts": float, "index": dict[digits, name]}
 
@@ -27844,6 +27854,50 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
 """
 
 
+def _ingest_calendar_plist(rag_bin: str) -> str:
+    """Cross-source: Google Calendar ingester, cada 1h.
+
+    Incremental via `syncToken` cursor por calendar en `rag_calendar_state`.
+    Google Calendar API (cloud-hosted — user override §10.6 rompe local-first).
+    Bootstrap pulls 2y history + 180d future (§2.6 del design doc), subsequent
+    runs son típicamente <10s (singleEvents=True expand RRULEs per instance, pero
+    el delta típico es chico).
+
+    Interval 3600s (1h) alineado con Gmail — ambos son Google OAuth cloud y
+    los eventos de Calendar no cambian tan frecuentemente que valga la pena
+    bajarlo. Requiere `~/.calendar-mcp/gcp-oauth.keys.json` + `credentials.json`
+    (correr el OAuth flow manual antes del primer run); sin esos archivos el
+    ingester silent-drops (loader retorna None).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-ingest-calendar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>index</string>
+    <string>--source</string>
+    <string>calendar</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _ingest_reminders_plist(rag_bin: str) -> str:
     """Cross-source: Apple Reminders ingester, cada 6h.
 
@@ -27912,9 +27966,10 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _consolidate_plist(rag_bin)),
         # Cross-source ingesters (2026-04-21) — Phase 1.a-1.d ya implementados
         # en código; estos plists los ponen en loop para que el corpus
-        # cross-source esté fresh sin intervención manual. Calendar queda
-        # fuera del default hasta que el user configure `~/.calendar-mcp/`
-        # OAuth — cuando exista, agregar `_ingest_calendar_plist` acá.
+        # cross-source esté fresh sin intervención manual. Calendar se skipea
+        # al install si `~/.calendar-mcp/credentials.json` no existe — el
+        # usuario corre el OAuth flow primero (ver docstring de
+        # `_ingest_calendar_plist`), después re-corre `rag setup`.
         ("com.fer.obsidian-rag-ingest-whatsapp",
          "com.fer.obsidian-rag-ingest-whatsapp.plist",
          _ingest_whatsapp_plist(rag_bin)),
@@ -27924,6 +27979,9 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-ingest-reminders",
          "com.fer.obsidian-rag-ingest-reminders.plist",
          _ingest_reminders_plist(rag_bin)),
+        ("com.fer.obsidian-rag-ingest-calendar",
+         "com.fer.obsidian-rag-ingest-calendar.plist",
+         _ingest_calendar_plist(rag_bin)),
     ]
 
 
@@ -27959,6 +28017,18 @@ def setup(remove: bool):
             else:
                 console.print(f"[dim]· no estaba instalado: {label}[/dim]")
             continue
+        # Calendar gate: sin OAuth config, instalar el plist sólo loggearía
+        # errors cada hora. Skipear con nota — el user re-corre `rag setup`
+        # tras el OAuth flow.
+        if label == "com.fer.obsidian-rag-ingest-calendar":
+            cal_creds = Path.home() / ".calendar-mcp" / "credentials.json"
+            if not cal_creds.is_file():
+                console.print(
+                    f"[yellow]·[/yellow] skip {label}: falta "
+                    f"[dim]~/.calendar-mcp/credentials.json[/dim] "
+                    f"(correr OAuth flow primero)"
+                )
+                continue
         plist_path.write_text(content, encoding="utf-8")
         try:
             subprocess.run(
@@ -29199,6 +29269,59 @@ def serve(host: str, port: int):
         console.print("\n[yellow]Stopped.[/yellow]")
 
 
+def _corpus_breakdown_by_source() -> list[tuple[str, int, str]]:
+    """Return `[(source_label, count, last_indexed_iso)]` sorted desc by count.
+
+    Pulls per-source chunk counts directly from the meta table. `last_indexed`
+    comes from `rag_*_state` tables when available (reminders/gmail/whatsapp
+    ingesters all maintain one); falls back to the content hash mtime on disk
+    for `vault`. Sources without a state table show "—".
+
+    Used by `rag stats` for the cross-source breakdown. Silent-fails per
+    source — a missing state table doesn't break the overall report.
+    """
+    try:
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(f"file:{DB_PATH / 'ragvec.db'}?mode=ro", uri=True)
+    except Exception:
+        return []
+    try:
+        cur = con.cursor()
+        # Some meta tables don't have `source` column (pre-schema). Probe first.
+        meta_table = f"meta_{COLLECTION_NAME}"
+        try:
+            rows = cur.execute(
+                f'SELECT COALESCE(source, "vault") AS src, COUNT(*) '
+                f'FROM "{meta_table}" GROUP BY src ORDER BY 2 DESC'
+            ).fetchall()
+        except Exception:
+            return []
+        # Per-source last_indexed. Las state tables son specific por ingester
+        # — nombre + column del timestamp vivien en scripts/ingest_*.py.
+        last_ts: dict[str, str] = {}
+        for src, state_tbl, ts_col in [
+            ("whatsapp", "rag_whatsapp_state", "updated_at"),
+            ("gmail", "rag_gmail_state", "updated_at"),
+            ("reminders", "rag_reminders_state", "last_seen_ts"),
+            ("calendar", "rag_calendar_state", "updated_at"),
+        ]:
+            try:
+                r = cur.execute(
+                    f'SELECT MAX({ts_col}) FROM "{state_tbl}"'
+                ).fetchone()
+                if r and r[0]:
+                    # Normalize numeric (epoch) timestamps to ISO.
+                    if isinstance(r[0], (int, float)):
+                        last_ts[src] = datetime.fromtimestamp(r[0]).isoformat(timespec="minutes")
+                    else:
+                        last_ts[src] = str(r[0])[:16]  # truncate to `YYYY-MM-DDTHH:MM`
+            except Exception:
+                continue
+        return [(src, cnt, last_ts.get(src, "—")) for src, cnt in rows]
+    finally:
+        con.close()
+
+
 @cli.command()
 def stats():
     """Estado del índice."""
@@ -29209,6 +29332,26 @@ def stats():
     except Exception:
         urls_count = 0
     console.print(f"[cyan]Chunks indexados:[/cyan] {count}")
+
+    # Cross-source breakdown. Solo renderea si hay ≥2 sources en el corpus —
+    # en un deploy vault-only no aporta nada.
+    breakdown = _corpus_breakdown_by_source()
+    distinct_sources = {src for src, _, _ in breakdown}
+    if len(distinct_sources) >= 2:
+        tbl = Table(
+            show_header=True, box=None, pad_edge=False, padding=(0, 1),
+            title_style="cyan", title="Por source",
+        )
+        tbl.add_column("source", style="bold")
+        tbl.add_column("chunks", justify="right")
+        tbl.add_column("%", justify="right", style="dim")
+        tbl.add_column("last indexed", style="dim")
+        total = sum(cnt for _, cnt, _ in breakdown)
+        for src, cnt, last_ts in breakdown:
+            pct = f"{100 * cnt / total:.1f}%" if total else "—"
+            tbl.add_row(src or "(null)", f"{cnt:,}", pct, last_ts)
+        console.print(tbl)
+
     console.print(f"[cyan]URLs indexadas:[/cyan] {urls_count}  [dim]({URLS_COLLECTION_NAME})[/dim]")
     # Identificar la fuente del vault (env / registry / default) ayuda al
     # debug en setups multi-vault.

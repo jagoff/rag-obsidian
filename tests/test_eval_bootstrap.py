@@ -182,3 +182,90 @@ def test_bootstrap_ci_deterministic_with_seed():
     a = run()
     b = run()
     assert a == b
+
+
+def test_golden_paths_never_have_chunk_index_suffix():
+    """Golden `expected` paths must NEVER end with `::<N>` (the chunk index
+    internal ID). The eval matcher compares against `m.get("file", "")` which
+    strips that suffix — a `::0` trailing in the golden silently fails every
+    match without surfacing why.
+
+    Regression: 2026-04-21 pass de Phase 1.f tuning. Los primeros 7 placeholders
+    cross-source fueron escritos con `::0` trailing y eval reportó 7/7 fails
+    "cross-source rompe retrieval" — falso positivo. El fix fue quitar `::0`;
+    este test asegura que la repetición del bug dispare en CI y no en
+    debugging de eval regressions.
+    """
+    import re
+    data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
+    bad: list[str] = []
+    for q in (data.get("queries") or []):
+        for p in (q.get("expected") or []):
+            if re.search(r"::\d+$", p):
+                bad.append(p)
+    for chain in (data.get("chains") or []):
+        for turn in (chain.get("turns") or []):
+            for p in (turn.get("expected") or []):
+                if re.search(r"::\d+$", p):
+                    bad.append(p)
+    assert not bad, (
+        "expected paths end with `::N` chunk index suffix — eval matcher "
+        "compares against `meta['file']` which doesn't include it, so these "
+        "paths silently fail every retrieve:\n  " + "\n  ".join(bad[:10])
+    )
+
+
+def test_golden_cross_source_paths_have_native_id_format():
+    """Paths con source-prefix (gmail://, whatsapp://, etc.) must follow
+    the format retrieve() returns — no trailing slash, no extra segments
+    beyond what the ingester writes.
+    """
+    import re
+    data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
+
+    # Patterns based on docs/design-cross-source-corpus.md §2.7.
+    # Reminders: `reminders://<id>` where <id> can itself contain `://` (Apple URLs)
+    # Gmail:     `gmail://thread/<id>`
+    # WhatsApp:  `whatsapp://<chat_jid>/<msg_id>`
+    # Calendar:  `calendar://event:<id>`
+    # Messages:  `messages://<id>`
+    SOURCE_PATTERNS = [
+        (re.compile(r"^gmail://thread/[\w\-]+$"),
+         "gmail://thread/<id>"),
+        (re.compile(r"^whatsapp://[\w@\.\-]+/[\w\-]+$"),
+         "whatsapp://<chat_jid>/<msg_id>"),
+        (re.compile(r"^calendar://(event:)?[\w\-]+$"),
+         "calendar://event:<id>"),
+        (re.compile(r"^reminders://.+[^/]$"),
+         "reminders://<id> (sin trailing slash)"),
+        (re.compile(r"^messages://[\w\-]+$"),
+         "messages://<id>"),
+    ]
+    CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
+                             "reminders://", "messages://")
+
+    bad: list[str] = []
+
+    def _check(p: str) -> None:
+        if not p.startswith(CROSS_SOURCE_PREFIXES):
+            return
+        # Identify which source this is
+        for pattern, _ in SOURCE_PATTERNS:
+            if pattern.match(p):
+                return
+        # No source pattern matched — bad format
+        bad.append(p)
+
+    for q in (data.get("queries") or []):
+        for p in (q.get("expected") or []):
+            _check(p)
+    for chain in (data.get("chains") or []):
+        for turn in (chain.get("turns") or []):
+            for p in (turn.get("expected") or []):
+                _check(p)
+    assert not bad, (
+        "cross-source expected paths don't match the format retrieve() returns.\n"
+        "Valid formats:\n" +
+        "\n".join(f"  {desc}" for _, desc in SOURCE_PATTERNS) +
+        "\nBad:\n  " + "\n  ".join(bad[:10])
+    )

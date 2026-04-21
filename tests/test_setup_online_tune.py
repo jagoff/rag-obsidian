@@ -163,9 +163,11 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 11 base servicios + 3 ingesters cross-source (WhatsApp/Gmail/Reminders).
-    # Calendar no entra aún porque depende de OAuth config manual.
-    assert len(specs) == 14
+    # 11 base servicios + 4 ingesters cross-source
+    # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
+    # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
+    # pero el plist siempre está en el spec.
+    assert len(specs) == 15
 
 
 # ── Cross-source ingesters (2026-04-21) ────────────────────────────────────
@@ -176,12 +178,14 @@ def test_services_spec_includes_ingesters():
     assert "com.fer.obsidian-rag-ingest-whatsapp" in labels
     assert "com.fer.obsidian-rag-ingest-gmail" in labels
     assert "com.fer.obsidian-rag-ingest-reminders" in labels
+    assert "com.fer.obsidian-rag-ingest-calendar" in labels
 
 
 @pytest.mark.parametrize("fn_name,expected_source,expected_interval", [
     ("_ingest_whatsapp_plist", "whatsapp", 900),     # 15 min
     ("_ingest_gmail_plist", "gmail", 3600),          # 1 hora
     ("_ingest_reminders_plist", "reminders", 21600), # 6 horas
+    ("_ingest_calendar_plist", "calendar", 3600),    # 1 hora
 ])
 def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval):
     """Cada plist de ingester debe ser XML válido + parseable + apuntar al

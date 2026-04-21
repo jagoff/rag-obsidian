@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~27k lines) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI server, 5.4k lines + ~5.9k JS/HTML/CSS) + `tests/` (1,173 tests, 66 files). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~28.7k lines) + `mcp_server.py` (thin wrapper) + `web/` (FastAPI server, 5.7k lines + ~7.7k JS/HTML/CSS) + `tests/` (1,438 tests, 83 files). Resist package-split until real friction shows up.
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -244,6 +244,8 @@ Every post-expansion metric sits inside the prior floor's CI on the smaller set 
 **Post prompt-per-intent + citation-repair (2026-04-19):** Singles `hit@5 88.10% [76.19, 97.62] · MRR 0.767 [0.643, 0.869]` — identical hit@5, MRR within CI. Chains `hit@5 81.82% [66.67, 93.94] · MRR 0.636 [0.505, 0.773] · chain_success 58.33% [33.33, 83.33]` — +3pp hit@5, +8pp chain_success, both inside prior CI so treat as noise until replicated. Floor unchanged for auto-rollback gate (still 76.19% / 63.64%).
 
 **Post golden-set re-mapping (2026-04-20):** vault reorg (PARA moves: many notes `02-Areas/Coaching/*` → `03-Resources/Coaching/*`, `03-Resources/{Agile,Tech}/*` → `04-Archive/*`, etc.) left 33 of 65 `expected` paths in `queries.yaml` pointing at dead files, artificially cratering eval to singles hit@5 26% / chains 33%. Golden rebuilt by auto-mapping 31 unique paths via filename-stem lookup to the closest surviving note (prefer non-archive, bias `01→02→03→04` for tie-breaks) and dropping one chain whose source notes (`reference_{claude,ollama}_telegram_bot.md`) no longer exist. Post-rebuild eval: Singles `hit@5 78.57% [64.29, 90.48] · MRR 0.696 [0.554, 0.810]`; Chains `hit@5 75.76% [60.61, 90.91] · MRR 0.641 [0.510, 0.788]`. Both CIs overlap the 2026-04-19 run — within noise band. Floor unchanged (76.19% / 63.64%); current singles 78.57% and chains 75.76% pass the auto-rollback gate.
+
+**Post-T10 (2026-04-20, after JSONL-fallback strip, commit `81e32b4`):** Singles `hit@5 78.57% [64.29, 90.48] · MRR 0.696 [0.554, 0.810] · recall@5 76.19% · n=42`; Chains `hit@5 86.67% [73.33, 96.67] · MRR 0.728 [0.594, 0.850] · chain_success 63.64% [36.36, 90.91] · turns=30 chains=11`. Singles **bit-identical** vs pre-T10 (expected — T10 is pure storage refactor, retrieval pipeline untouched); chains drifted +11pp inside prior CI (same noise band). Latency: singles p95 2797ms, chains p95 3406ms — slight uptick vs pre-T10 (2447/3003ms) attributable to SQL being the only write path (no JSONL-queue offload anymore). Still ×5 below any action threshold. Floor gate passed at the exact chain_success boundary (63.64%) — fine this run but worth re-measuring next tune cycle.
 
 **Prior floor (2026-04-17, post-title-in-rerank, n=21 singles / 9 chains):** Singles `hit@5 90.48% · MRR 0.821`; Chains `hit@5 80.00% · MRR 0.627 · chain_success 55.56%`. Kept for historical trend, but do not compare new numbers against it without overlapping CIs.
 

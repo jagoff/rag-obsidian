@@ -7711,6 +7711,146 @@ def _fetch_contact(stem: str, *, email: str | None = None, canonical: str | None
     return result
 
 
+# Apple Contacts full dump — one osascript call returns `name|phone` lines
+# for every contact × every phone. Parsed once per TTL into a digits→name
+# index. Rationale: substring matching via `whose value of phones contains
+# "25376519"` fails when the stored value has separators ("+54 9 342 537
+# 6519"). Digits-normalized index sidesteps that entirely.
+_CONTACTS_DUMP_SCRIPT = """
+tell application "Contacts"
+  set _out to ""
+  repeat with p in people
+    try
+      set _name to name of p
+      repeat with ph in phones of p
+        try
+          set _val to value of ph as string
+          set _out to _out & _name & "|" & _val & linefeed
+        end try
+      end repeat
+    end try
+  end repeat
+  return _out
+end tell
+"""
+
+_CONTACTS_PHONE_INDEX_TTL_S = 86400  # 24h — contactos raramente cambian + dump es lento
+_CONTACTS_DUMP_TIMEOUT_S = 120       # vault del autor: ~6min para 354 contactos (iteración nested)
+_CONTACTS_PHONE_INDEX_PATH = DB_PATH.parent / "contacts_phone_index.json"
+_contacts_phone_index: dict | None = None  # {"ts": float, "index": dict[digits, name]}
+
+
+def _load_contacts_phone_index(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict[str, str]:
+    """Return `{digits_normalized: name}` for every contact's phone.
+
+    Three-tier lookup strategy:
+      1. In-memory module-level cache (process lifetime).
+      2. Disk cache at `_CONTACTS_PHONE_INDEX_PATH` (24h TTL default).
+      3. osascript dump of the whole address book — slow (~1s per contact,
+         ~6min for 350 contacts due to nested AppleScript iteration).
+
+    Each phone indexed under:
+      - The full digit string (after stripping non-digits)
+      - Its last-8-digit suffix (AR "9" prefix variance)
+
+    Silent-fails on permission denied / missing osascript / Contacts app
+    unavailable → empty dict. Lock reuses `_contacts_cache_lock`.
+    """
+    global _contacts_phone_index
+    now = time.time()
+
+    # Tier 1: in-memory
+    with _contacts_cache_lock:
+        if (_contacts_phone_index is not None
+                and now - _contacts_phone_index["ts"] < ttl_s):
+            return _contacts_phone_index["index"]
+
+    # Tier 2: disk cache
+    try:
+        if _CONTACTS_PHONE_INDEX_PATH.is_file():
+            disk_age = now - _CONTACTS_PHONE_INDEX_PATH.stat().st_mtime
+            if disk_age < ttl_s:
+                payload = json.loads(_CONTACTS_PHONE_INDEX_PATH.read_text(encoding="utf-8"))
+                idx = payload.get("index") or {}
+                with _contacts_cache_lock:
+                    _contacts_phone_index = {"ts": now, "index": idx}
+                return idx
+    except Exception as exc:
+        _silent_log("contacts_phone_index_disk_read", exc)
+
+    # Tier 3: full osascript dump
+    out = ""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", _CONTACTS_DUMP_SCRIPT],
+            capture_output=True, text=True, timeout=_CONTACTS_DUMP_TIMEOUT_S,
+        )
+        if proc.returncode == 0:
+            out = proc.stdout or ""
+    except Exception as exc:
+        _silent_log("contacts_dump_osascript", exc)
+
+    idx: dict[str, str] = {}
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        name, phone = line.split("|", 1)
+        name = name.strip()
+        digits = "".join(c for c in phone if c.isdigit())
+        if not name or len(digits) < 8:
+            continue
+        idx.setdefault(digits, name)
+        if len(digits) > 8:
+            idx.setdefault(digits[-8:], name)
+
+    # Persist to disk only if we got real data — avoid caching empty dicts
+    # on transient osascript failures.
+    if idx:
+        try:
+            _CONTACTS_PHONE_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _CONTACTS_PHONE_INDEX_PATH.write_text(
+                json.dumps({"ts": now, "index": idx}), encoding="utf-8",
+            )
+        except Exception as exc:
+            _silent_log("contacts_phone_index_disk_write", exc)
+
+    with _contacts_cache_lock:
+        _contacts_phone_index = {"ts": now, "index": idx}
+    return idx
+
+
+def _fetch_contact_by_phone(digits: str) -> dict | None:
+    """Find a Contacts entry by phone digits. Returns a contact-shaped dict
+    (`{full_name, phones, emails, birthday}` — same shape as `_fetch_contact`
+    for compat) or None when not found.
+
+    Lookup is digit-normalized via `_load_contacts_phone_index` — the
+    index is built once per TTL from a full-address-book dump, bypassing
+    AppleScript's `contains` matching (which fails when the stored phone
+    has separators: "+54 9 342 537 6519" doesn't contain "25376519" as a
+    substring).
+
+    Matches both the full digit string AND its last-8 suffix so WA JIDs
+    with `+549` country code resolve to Contacts stored without it.
+    """
+    if not digits:
+        return None
+    digits = "".join(c for c in digits if c.isdigit())
+    if len(digits) < 8:
+        return None
+    idx = _load_contacts_phone_index()
+    if not idx:
+        return None
+    # Prefer full-digit match; fall back to last-8 suffix.
+    name = idx.get(digits) or idx.get(digits[-8:])
+    if not name:
+        return None
+    # Minimal contact-shaped dict for compat with `_fetch_contact` callers.
+    # The index doesn't store phones/emails/birthday back-references to keep
+    # memory bounded; fetch those on demand via `_fetch_contact` if needed.
+    return {"full_name": name, "phones": [], "emails": [], "birthday": ""}
+
+
 def build_person_context(query: str, vault_root: Path | None = None) -> str | None:
     """Detect mentions in query, build LLM preamble. Returns None if no match.
 
@@ -23364,10 +23504,15 @@ def _resolve_sender_to_name(
       2. Strip `@s.whatsapp.net` / `@g.us` suffix.
       3. If the digits-only form matches a Mention dossier's `Teléfono`
          line → return the dossier filename stem ("Grecia", "Seba").
-      4. If digits long enough, show `…<last 4>` (`"…8025"`) instead of
+      4. Consult Apple Contacts by phone suffix (`_fetch_contact_by_phone`).
+         Cached per last-8-digits key, silent-fail on permission denied.
+         Returns the contact's `full_name` when present — "María Pérez"
+         rather than the dossier stem lets user display familiar contact
+         casing without editing the vault.
+      5. If digits long enough, show `…<last 4>` (`"…8025"`) instead of
          the full JID number — groups of unmapped senders become
-         readable.
-      5. Otherwise return whatever we had after stripping.
+         readable without leaking PII.
+      6. Otherwise return whatever we had after stripping.
     """
     s = (sender_raw or "").strip()
     if not s:
@@ -23383,6 +23528,12 @@ def _resolve_sender_to_name(
         for k, v in idx.items():
             if k.endswith(digits[-10:]) or digits.endswith(k[-10:]):
                 return v
+        # Dossier miss — fall through to Apple Contacts before masking.
+        # This gives a name automatically for every WA contact that lives
+        # in Contacts.app, without forcing manual `99 Mentions/` creation.
+        contact = _fetch_contact_by_phone(digits)
+        if contact and contact.get("full_name"):
+            return contact["full_name"]
         return f"…{digits[-4:]}"
     return local or fallback or "?"
 

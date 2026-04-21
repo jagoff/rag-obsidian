@@ -519,3 +519,122 @@ def test_cross_ref_independent_of_nickname(vault: Path, wa_db: Path) -> None:
     assert ref is not None
     # Cross-ref payload doesn't embed nickname — serve handler attaches it.
     assert "user_nickname" not in ref
+
+
+# ── Apple Contacts fallback (2026-04-21) ──────────────────────────────────
+
+# Helper to mock Apple Contacts without hitting osascript.
+def _mock_contacts_index(monkeypatch, index: dict[str, str]) -> None:
+    """Install a fake `_load_contacts_phone_index` returning `index`.
+    Resets the cache first so previous tests don't leak."""
+    rag._contacts_phone_index = None
+    rag._contacts_cache.clear()
+    monkeypatch.setattr(rag, "_load_contacts_phone_index", lambda ttl_s=3600: index)
+
+
+def test_resolve_sender_apple_contacts_fallback(vault_with_phones, monkeypatch):
+    """Unknown dossier phone → consult Apple Contacts before masking.
+
+    Mocks `_load_contacts_phone_index` to avoid hitting the user's real
+    address book. The index is digits→name; the resolver consults it after
+    exhausting the dossier fallback.
+    """
+    rag._phone_index_cache = None
+    unknown = "5491188887777"
+    _mock_contacts_index(monkeypatch, {unknown: "Juan Pérez",
+                                         unknown[-8:]: "Juan Pérez"})
+    name = rag._resolve_sender_to_name(
+        f"{unknown}@s.whatsapp.net", vault_root=vault_with_phones,
+    )
+    assert name == "Juan Pérez"
+
+
+def test_resolve_sender_apple_contacts_miss_falls_through_to_mask(
+    vault_with_phones, monkeypatch,
+):
+    """Contacts index is empty → mask last-4 (legacy behaviour preserved)."""
+    rag._phone_index_cache = None
+    _mock_contacts_index(monkeypatch, {})
+    out = rag._resolve_sender_to_name(
+        "34084894028025@s.whatsapp.net", vault_root=vault_with_phones,
+    )
+    assert out == "…8025"
+
+
+def test_resolve_sender_dossier_wins_over_contacts(vault_with_phones, monkeypatch):
+    """Dossier match takes precedence — Apple Contacts is the TERTIARY
+    fallback. A dossier lookup must not trigger the Contacts index load."""
+    rag._phone_index_cache = None
+    called = []
+
+    def _sentinel(ttl_s=3600):
+        called.append("loaded")
+        return {}
+
+    rag._contacts_phone_index = None
+    rag._contacts_cache.clear()
+    monkeypatch.setattr(rag, "_load_contacts_phone_index", _sentinel)
+    # Grecia's phone is in vault_with_phones dossiers.
+    name = rag._resolve_sender_to_name(
+        "5493425153999@s.whatsapp.net", vault_root=vault_with_phones,
+    )
+    assert name == "Grecia"
+    # Contacts index must NOT have been consulted — dossier hit short-circuits.
+    assert called == []
+
+
+def test_fetch_contact_by_phone_uses_last8_fallback(monkeypatch):
+    """`_fetch_contact_by_phone` tries full-digits first, then last-8 suffix.
+    Handles AR "9" prefix variance (phone in Contacts stored without country
+    code; WA reports with `+549`)."""
+    rag._contacts_phone_index = None
+    rag._contacts_cache.clear()
+    # Index has only the last-8 form (as if user stored "43824567" without
+    # country code); full digits "5491143824567" must still resolve.
+    _mock_contacts_index(monkeypatch, {"43824567": "Ana"})
+    got = rag._fetch_contact_by_phone("5491143824567")
+    assert got is not None
+    assert got["full_name"] == "Ana"
+
+
+def test_fetch_contact_by_phone_short_digits_skips(monkeypatch):
+    """<8 digits → no Contacts lookup + None result (guards against
+    misfires on CBU-like short numeric tokens)."""
+    rag._contacts_phone_index = None
+    rag._contacts_cache.clear()
+    called = []
+    monkeypatch.setattr(
+        rag, "_load_contacts_phone_index",
+        lambda ttl_s=3600: called.append("x") or {},
+    )
+    assert rag._fetch_contact_by_phone("123") is None
+    assert rag._fetch_contact_by_phone("") is None
+    assert rag._fetch_contact_by_phone(None) is None
+    assert called == [], "short digits must skip the index load"
+
+
+def test_contacts_phone_index_caches_per_ttl(monkeypatch):
+    """Index is built once per TTL. Subsequent calls within the window
+    reuse the cached dict without re-running osascript."""
+    rag._contacts_phone_index = None
+    rag._contacts_cache.clear()
+    call_count = {"n": 0}
+
+    def _fake_subprocess_run(cmd, capture_output=False, text=False, timeout=None):
+        call_count["n"] += 1
+        class _P:
+            returncode = 0
+            stdout = "Juan Pérez|+54 9 11 8888 7777\n"
+            stderr = ""
+        return _P()
+
+    monkeypatch.setattr(rag.subprocess, "run", _fake_subprocess_run)
+    a = rag._load_contacts_phone_index()
+    b = rag._load_contacts_phone_index()
+    c = rag._load_contacts_phone_index()
+    assert a is b is c, "same cached dict reused"
+    assert call_count["n"] == 1, f"expected 1 osascript call, got {call_count['n']}"
+    # Index has the digits-normalized form.
+    assert a["5491188887777"] == "Juan Pérez"
+    assert a["88887777"] == "Juan Pérez"
+    rag._contacts_phone_index = None

@@ -56,6 +56,7 @@ packages = ["scripts", "web"]
 testpaths = ["tests"]
 markers = [
     "slow: multi-process stress tests (>1s wall; opt-out with `-m 'not slow'`)",
+    "real_vault: test reads the real vault (opt-out of `_isolate_vault_path` autouse). Read-only operations only — writes MUST use monkeypatch.",
 ]
 
 [tool.ruff]

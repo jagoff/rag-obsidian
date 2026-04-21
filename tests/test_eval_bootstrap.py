@@ -12,6 +12,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.mark.real_vault
 def test_queries_yaml_all_paths_exist_or_placeholder():
     """Every `expected` path must either:
       1. Exist as a real file in the vault, OR
@@ -26,6 +27,9 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     email / WhatsApp / calendar entries. The corpus uses `source://native_id`
     scheme (per §2.7); those strings aren't filesystem paths so we whitelist
     the prefix rather than `Path.is_file()`.
+
+    Marked `@pytest.mark.real_vault` — opts out of the `_isolate_vault_path`
+    autouse so `rag.VAULT_PATH` points at the real vault. READ-ONLY.
     """
     import rag
     vault = rag.VAULT_PATH

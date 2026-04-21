@@ -9,6 +9,73 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_vault_path(tmp_path_factory, request):
+    """Safety-critical: `rag.VAULT_PATH` resuelve en import-time a
+    `_DEFAULT_VAULT` (el iCloud Obsidian real del usuario) si no hay
+    override en env o vaults.json. Sin este fixture, cualquier test que
+    llame a código que toque `VAULT_PATH / ...` (p.ej. el loop agéntico
+    de `rag do`, `_index_single_file`, ingesters, `rag capture`) escribiría
+    al vault de producción — ~34 tests puntuales usan
+    `monkeypatch.setattr(rag, "VAULT_PATH", ...)` per-test, pero los 2k+
+    restantes no. Gap auditado 2026-04-21 en el hardening pass.
+
+    Esta autouse apunta `rag.VAULT_PATH` a un tmp dir único por test
+    (via `tmp_path_factory.mktemp`, no session-wide para evitar state
+    leak entre tests) y restaura el valor original al teardown.
+
+    Opt-out: tests que genuinamente necesitan leer el vault real (p.ej.
+    validación de queries.yaml contra paths vivos, benchmarks de retrieval
+    contra el corpus real) deben decorarse con `@pytest.mark.real_vault`.
+    Estos tests NO reciben el tmp dir — `rag.VAULT_PATH` queda apuntando
+    al vault real. Solo READ-ONLY tests deberían usar este marker;
+    cualquier test que escriba al vault DEBE usar monkeypatch.
+
+    Compatibilidad con los ~34 tests que ya monkeypatchean VAULT_PATH:
+    al ser pytest's `monkeypatch` function-scoped y al desarmarse en
+    LIFO antes de las autouse-no-deps (esta fixture no pide monkeypatch
+    como arg), la secuencia es:
+      1. Setup: VAULT_PATH = tmp (direct assign)
+      2. Test opcionalmente hace `monkeypatch.setattr(rag, "VAULT_PATH", vault_test)`
+      3. Test corre con VAULT_PATH = vault_test
+      4. monkeypatch.undo() → VAULT_PATH vuelve a tmp (NO a `snap_original`,
+         porque monkeypatch snapshoteó el valor tmp cuando el test llamó
+         a setattr)
+      5. Esta fixture's finally → VAULT_PATH = snap_original
+
+    Drift detection (mismo patrón que `_stabilize_rag_state`): si un test
+    mutó `rag.VAULT_PATH` directamente (bypasseando monkeypatch), lo
+    detectamos porque después del undo la VAULT_PATH no coincide con
+    `tmp`. Emitimos warning + restauramos. En la práctica ningún test
+    hace esto hoy, pero el guard previene regresiones silenciosas.
+    """
+    # Opt-out: tests marcados con `real_vault` NO reciben tmp redirect.
+    # Se confía en el autor del test para no escribir; el marker es
+    # equivalente a "I know what I'm doing".
+    if request.node.get_closest_marker("real_vault"):
+        yield None
+        return
+
+    import rag as _rag
+    snap_original = _rag.VAULT_PATH
+    tmp = tmp_path_factory.mktemp("vault_isolated")
+    _rag.VAULT_PATH = tmp
+    try:
+        yield tmp
+    finally:
+        # monkeypatch.undo() ya corrió (LIFO: esta fixture no depende de
+        # monkeypatch → tears down después de él). Cualquier drift vs
+        # `tmp` es mutación directa que bypasseó monkeypatch.
+        current = _rag.VAULT_PATH
+        if current != tmp:
+            warnings.warn(
+                f"rag.VAULT_PATH leaked from test (expected {tmp}, "
+                f"now {current}); restoring to module default",
+                stacklevel=2,
+            )
+        _rag.VAULT_PATH = snap_original
+
+
+@pytest.fixture(autouse=True)
 def _isolate_silent_errors_log(tmp_path_factory):
     """Evita que los tests que ejercen paths con `_silent_log` (session
     JSON corrupto, ranker.json corrupto, synthetic_q_cache corrupto,

@@ -163,11 +163,28 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 11 base servicios + 4 ingesters cross-source
+    # 12 base servicios + 4 ingesters cross-source
     # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
     # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
     # pero el plist siempre está en el spec.
-    assert len(specs) == 15
+    # Base roster: watch, serve, digest, morning, today, emergent, patterns,
+    # archive, wa-tasks, online-tune, maintenance (2026-04-21 hardening),
+    # consolidate.
+    assert len(specs) == 16
+
+
+def test_services_spec_includes_maintenance():
+    """Added 2026-04-21: daily `rag maintenance` at 04:00 compacts WAL +
+    rotates telemetry logs + conditional VACUUM. Without it the WAL grew
+    to 126 MB against a 206 MB main DB in production."""
+    specs = rag_module._services_spec(RAG_BIN)
+    labels = {s[0] for s in specs}
+    assert "com.fer.obsidian-rag-maintenance" in labels
+    # Plist content sanity: matches the 04:00 schedule + RunAtLoad=false.
+    plist = rag_module._maintenance_plist(RAG_BIN)
+    assert "<key>Hour</key><integer>4</integer>" in plist
+    assert "<key>RunAtLoad</key><false/>" in plist
+    assert "<string>maintenance</string>" in plist
 
 
 # ── Cross-source ingesters (2026-04-21) ────────────────────────────────────

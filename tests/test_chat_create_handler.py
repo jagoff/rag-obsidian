@@ -61,8 +61,12 @@ def test_handle_chat_create_intent_happy_reminder(monkeypatch):
     ])
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame llamar a mama mañana 10am")
-    assert ok is True
+    handled, created = rag._handle_chat_create_intent("recordame llamar a mama mañana 10am")
+    assert handled is True
+    # Reminder creado → created_info lleva el id para el /undo del CLI.
+    assert created is not None
+    assert created["kind"] == "reminder"
+    assert created["reminder_id"] == "x-apple-reminderkit://ABC"
     # Verify ollama was called with the propose tools.
     _, kwargs = fake_client.chat.call_args
     tool_names = [fn.__name__ for fn in kwargs["tools"]]
@@ -92,8 +96,11 @@ def test_handle_chat_create_intent_happy_event_allday(monkeypatch):
     ])
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("el miercoles viene Grecia, agendalo")
-    assert ok is True
+    handled, created = rag._handle_chat_create_intent("el miercoles viene Grecia, agendalo")
+    assert handled is True
+    # Events no exponen un undo — created_info debe ser None para que el
+    # CLI no ofrezca `/undo` (matches web UX).
+    assert created is None
 
 
 # ── LLM chose not to call tool ──────────────────────────────────────────────
@@ -108,8 +115,9 @@ def test_handle_chat_create_intent_no_toolcall_returns_false(monkeypatch):
     fake_client.chat.return_value = _fake_ollama_response([])  # no tools
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame algo impreciso")
-    assert ok is False
+    handled, created = rag._handle_chat_create_intent("recordame algo impreciso")
+    assert handled is False
+    assert created is None
 
 
 # ── needs_clarification path ────────────────────────────────────────────────
@@ -132,8 +140,10 @@ def test_handle_chat_create_intent_needs_clarification(monkeypatch):
     ])
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame x un día de estos")
-    assert ok is True
+    handled, created = rag._handle_chat_create_intent("recordame x un día de estos")
+    assert handled is True
+    # needs_clarification → no create → no undo offered.
+    assert created is None
 
 
 # ── create failed (Apple disabled, etc) ─────────────────────────────────────
@@ -161,9 +171,10 @@ def test_handle_chat_create_intent_create_failed(monkeypatch):
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
     # Error is caught + reported but handler resolved this turn →
-    # returns True (don't fallthrough to query-RAG).
-    ok = rag._handle_chat_create_intent("creá evento miercoles")
-    assert ok is True
+    # handled=True (don't fallthrough to query-RAG), no undo affordance.
+    handled, created = rag._handle_chat_create_intent("creá evento miercoles")
+    assert handled is True
+    assert created is None
 
 
 # ── unknown tool name ──────────────────────────────────────────────────────
@@ -178,8 +189,9 @@ def test_handle_chat_create_intent_unknown_tool(monkeypatch):
     ])
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame x")
-    assert ok is False
+    handled, created = rag._handle_chat_create_intent("recordame x")
+    assert handled is False
+    assert created is None
 
 
 # ── ollama.chat threw ──────────────────────────────────────────────────────
@@ -192,8 +204,9 @@ def test_handle_chat_create_intent_ollama_exception(monkeypatch):
     fake_client.chat.side_effect = RuntimeError("ollama caído")
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame x mañana 10am")
-    assert ok is False
+    handled, created = rag._handle_chat_create_intent("recordame x mañana 10am")
+    assert handled is False
+    assert created is None
 
 
 # ── command-r arg wrapping ─────────────────────────────────────────────────
@@ -222,8 +235,9 @@ def test_handle_chat_create_intent_commandr_args_unwrap(monkeypatch):
     ])
     monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
 
-    ok = rag._handle_chat_create_intent("recordame llamar mañana 10am")
-    assert ok is True
+    handled, created = rag._handle_chat_create_intent("recordame llamar mañana 10am")
+    assert handled is True
+    assert created is not None and created["reminder_id"] == "ID"
     # Verifica que el tool REAL fue llamado con los args desenvuelto.
     args, _ = create_mock.call_args
     assert args[0] == "llamar"

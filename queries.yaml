@@ -404,3 +404,63 @@ chains:
       - question: "y el icbc"
         expected:
           - 03-Resources/Personal/Info/Info - Banco ICBC.md
+
+# ─────────────────────────────────────────────────────────────────────────
+# Cross-source template (Phase 1.f scaffolding — NOT consumed by `rag eval` yet)
+# ─────────────────────────────────────────────────────────────────────────
+# Once the cross-source corpus has production data (WhatsApp + Calendar +
+# Gmail + Reminders all indexed with real volume), move queries from this
+# template into the `queries:` / `chains:` sections above and extend the
+# eval harness to accept non-vault `expected` paths (source-prefixed
+# pseudo-URIs like `whatsapp://<chat_jid>/<msg_id>`). Until then the
+# eval gate is vault-only and these entries are documentation.
+#
+# Format per source:
+#
+#   # WhatsApp — expected uses the doc_id scheme from
+#   # scripts/ingest_whatsapp.py: `whatsapp://<chat_jid>/<first_msg_id>`.
+#   - question: "el wa donde juan cerró la fecha del viernes"
+#     expected:
+#       - whatsapp://120363...@g.us/ABC123
+#     source_hint: whatsapp   # feeds --source whatsapp filter
+#
+#   # Calendar — doc_id: `calendar://<calendar_id>/<event_id>`.
+#   - question: "la reunión con Juan del martes"
+#     expected:
+#       - calendar://work@x.com/abc123
+#     source_hint: calendar
+#
+#   # Gmail — doc_id: `gmail://<thread_id>`.
+#   - question: "el email de Juan sobre la migración"
+#     expected:
+#       - gmail://thread:1890f3abcd
+#     source_hint: gmail
+#
+#   # Reminders — doc_id: `reminders://<id>`.
+#   - question: "la tarea de llamar al banco"
+#     expected:
+#       - reminders://x-apple-reminderkit://REMCDReminder/UUID-HERE
+#     source_hint: reminders
+#
+# Chain example (cross-source — first vault, then gmail):
+#
+#   - id: cross-decisiones-DB
+#     turns:
+#       - question: "qué decidimos sobre la migración de DB"
+#         expected:
+#           - 02-Areas/Tech/Decisiones-DB.md
+#       - question: "dónde está el thread donde juan mandó los requerimientos"
+#         expected:
+#           - gmail://thread:XXXX
+#         source_hint: gmail
+#
+# Calibration checklist for Phase 1.f (run once production data exists):
+#   1. Add 5-10 cross-source singles per source (total ~25-40 new).
+#   2. Add 3-5 cross-source chains spanning 2+ sources.
+#   3. Run `rag eval` with the extended set. Singles hit@5 + chains
+#      hit@5 MUST sit inside the pre-expansion CI (or document new floor).
+#   4. Tune `CONFIDENCE_RERANK_MIN_PER_SOURCE` (rag.py) — use gap queries
+#      (`rag log --low-confidence`) per source to find the optimal gate.
+#   5. Re-validate `SOURCE_WEIGHTS` — start with the §10.3 defaults
+#      (vault 1.00 → messages 0.75), compare against an A/B where all
+#      weights = 1.00. If scoring parity is better, drop the weights.

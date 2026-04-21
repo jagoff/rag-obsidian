@@ -1641,6 +1641,36 @@ DWELL_LOG_NORM_CAP = 5.0    # log1p(dwell_s) >= 5.0 (~150s dwell) saturates at 1
 # around 0.02-0.10, clearly relevant > 0.2. Gate the LLM below this threshold
 # to skip hallucinated answers from unrelated chunks.
 CONFIDENCE_RERANK_MIN = 0.015
+# Per-source override of CONFIDENCE_RERANK_MIN. Different corpora have
+# different semantic density: WhatsApp / messages are conversational (short,
+# context-dependent), Calendar / Reminders are structured but short (rarely
+# score high by cosine alone), Gmail sits between those two and vault. The
+# global 0.015 was calibrated against vault-only; dialing it down for
+# short-text sources avoids refusing legitimate matches.
+#
+# Status (2026-04-21): all entries set to the global baseline as
+# *scaffolding* — no production cross-source data yet to calibrate against.
+# When `rag eval` + behavior priors accumulate signal from real queries
+# hitting mixed corpora, tune these down (expected: WA 0.008-0.010,
+# Calendar 0.012, Gmail 0.010-0.012, Reminders 0.012). Until then this is
+# a no-op surface that lets us tune without editing code paths.
+CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
+    "vault":     0.015,   # calibrated
+    "calendar":  0.015,   # scaffolding — tune with data
+    "gmail":     0.015,   # scaffolding — tune with data
+    "reminders": 0.015,   # scaffolding — tune with data
+    "whatsapp":  0.015,   # scaffolding — tune with data
+    "messages":  0.015,   # scaffolding — tune with data
+}
+
+
+def confidence_threshold_for_source(source: str | None) -> float:
+    """Return the confidence gate for a given top-result source. Unknown
+    or missing source → global baseline. All per-source entries currently
+    equal the baseline; values are tuned by `rag eval` + behavior data."""
+    if not source:
+        return CONFIDENCE_RERANK_MIN
+    return CONFIDENCE_RERANK_MIN_PER_SOURCE.get(source, CONFIDENCE_RERANK_MIN)
 # Auto-deep threshold: below this score, retrieve() auto-triggers deep_retrieve
 # for a second pass. Between CONFIDENCE_RERANK_MIN and 0.3 (solid hit). Set at
 # 0.10 — borderline queries that would answer but weakly benefit most from
@@ -7916,17 +7946,51 @@ _INTENT_RECENT_RE = re.compile(
     r"\b(recientes?|modificad[aos]{1,2}|[uú]ltim[aos]{1,2}\s+notas?|esta\s+semana|este\s+mes|hoy)\b",
     re.IGNORECASE,
 )
+# Comparison: two-term contrasts — "X vs Y", "diferencia entre X y Y",
+# "comparar X con Y", "en qué se diferencian X y Y", "compare X and Y".
+# Checked BEFORE synthesis because "X vs Y" is inherently comparative.
+_INTENT_COMPARISON_RE = re.compile(
+    r"\b("
+    r"diferencia[s]?\s+entre|"
+    r"en\s+qu[eé]\s+se\s+diferencian|"
+    r"qu[eé]\s+distingue|"
+    r"compar[aá](?:me|r)?\b|"
+    r"compare\b|"
+    r"\bvs\.?\b|\bversus\b|"
+    r"contraste\s+entre"
+    r")",
+    re.IGNORECASE,
+)
+# Synthesis: cross-source aggregation cues — "resumí todo lo que hay sobre X",
+# "síntesis/resumen de X", "qué dice el vault sobre X", "integrá todo sobre X".
+# Deliberately narrow: a plain "qué es X" stays semantic — synthesis only
+# fires when the user is explicitly asking for cross-reference/aggregation.
+_INTENT_SYNTHESIS_RE = re.compile(
+    r"\b("
+    r"res[uú]m(?:e|í|ime|ir|en)\s+(?:todo\s+|lo\s+que\s+(?:hay|s[eé]|tengo|encuentres)\s+)?(?:sobre|de|acerca\s+de)|"
+    r"res[uú]men\s+(?:de|sobre|acerca\s+de)|"
+    r"s[ií]ntesis\s+(?:de|sobre|acerca\s+de)|"
+    r"sintetiz[aá](?:me|r)?\b|"
+    r"integr[aá](?:me|r)?\s+(?:todo|lo)\b|"
+    r"qu[eé]\s+(?:dice|hay|s[eé])\s+(?:en\s+)?(?:el\s+)?vault\s+(?:sobre|de|acerca\s+de)|"
+    r"todo\s+lo\s+que\s+(?:hay|s[eé]|tengo|encuentres)\s+sobre|"
+    r"summary\s+of|synthesis\s+of|synthesi[sz]e"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def classify_intent(
     question: str, known_tags: set[str], known_folders: set[str]
 ) -> tuple[str, dict]:
     """Detect query intent. Returns (intent, params) where intent is one of
-    'count', 'list', 'recent', 'semantic' and params carries extracted filters.
+    'count', 'list', 'recent', 'comparison', 'synthesis', 'semantic' and
+    params carries extracted filters.
 
     Intent detection is deliberately strict (regex over known verbs) so natural
     questions stay on the semantic path. Ambiguous queries fall through to
-    'semantic'.
+    'semantic'. `comparison` / `synthesis` are narrow aggregation/contrast
+    triggers routed to their own system prompts via `system_prompt_for_intent`.
     """
     params: dict = {}
 
@@ -7954,6 +8018,12 @@ def classify_intent(
         return "list", params
     if _INTENT_RECENT_RE.search(question):
         return "recent", params
+    # Comparison before synthesis: "X vs Y" / "diferencia entre X y Y" is
+    # inherently comparative even if it could loosely read as aggregation.
+    if _INTENT_COMPARISON_RE.search(question):
+        return "comparison", params
+    if _INTENT_SYNTHESIS_RE.search(question):
+        return "synthesis", params
     return "semantic", {}
 
 
@@ -8231,8 +8301,8 @@ def system_prompt_for_intent(intent: str, loose: bool) -> str:
     """Return the appropriate system prompt for a given intent + mode.
 
     If loose → always SYSTEM_RULES (preserves --loose behaviour for every intent).
-    Else: count/list/recent → SYSTEM_RULES_LOOKUP; semantic or unknown → SYSTEM_RULES_STRICT.
-    synthesis/comparison: extension points for future classify_intent buckets.
+    Else: count/list/recent → SYSTEM_RULES_LOOKUP; synthesis → SYSTEM_RULES_SYNTHESIS;
+    comparison → SYSTEM_RULES_COMPARISON; semantic or unknown → SYSTEM_RULES_STRICT.
     """
     if loose:
         return SYSTEM_RULES
@@ -13109,9 +13179,28 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
                 f"[dim]{summary['duration_s']}s[/dim]"
             )
             return
+        if src == "reminders":
+            from scripts.ingest_reminders import run as _ingest_rem
+            summary = _ingest_rem(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(
+                f"{prefix}[bold]Reminders[/bold]: "
+                f"{summary['reminders_fetched']} fetched · "
+                f"[green]{summary['reminders_indexed']}[/green] indexados · "
+                f"{summary['reminders_unchanged']} sin cambios · "
+                f"{summary['reminders_deleted']} borrados · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp + calendar + gmail (ready), reminders (pending)."
+            f"Scope: whatsapp + calendar + gmail + reminders (ready)."
         )
         return
 
@@ -13527,14 +13616,20 @@ def query(
     # to detect the gate and offer `/capture` to record the unanswered query
     # as a `pregunta-abierta` note — closing the "vault no sabe → vault aprende"
     # loop without dropping the user back to silence.
-    if result["confidence"] < CONFIDENCE_RERANK_MIN and not force:
+    #
+    # Threshold is per-source: the top result's `source` meta field picks
+    # the gate. Default (vault) preserves the historical 0.015. Non-vault
+    # sources currently share the baseline until real data calibrates them.
+    _top_src = (result.get("metas") or [{}])[0].get("source")
+    _gate = confidence_threshold_for_source(_top_src)
+    if result["confidence"] < _gate and not force:
         suggestion = (
             "Mandá `/capture pregunta-abierta: " + question
             + "` para guardarla como pregunta abierta y que la próxima vez la encuentre."
         )
         msg = (
             f"No tengo esa información en tus notas. "
-            f"(top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
+            f"(top rerank score: {result['confidence']:+.2f} < {_gate}; "
             f"usá --force para llamar al LLM igual)\n\n"
             f"{suggestion}"
         )
@@ -13544,7 +13639,7 @@ def query(
             console.print()
             console.print(
                 f"[yellow]No tengo esa información en tus notas.[/yellow] "
-                f"[dim](top rerank score: {result['confidence']:+.2f} < {CONFIDENCE_RERANK_MIN}; "
+                f"[dim](top rerank score: {result['confidence']:+.2f} < {_gate}; "
                 f"usá --force para llamar al LLM igual)[/dim]"
             )
             console.print(f"[dim]💡 {suggestion}[/dim]")
@@ -14084,13 +14179,19 @@ def _render_chat_create_chip(payload: dict, console_) -> None:
     console_.print(" ".join(parts))
 
 
-def _handle_chat_create_intent(question: str) -> bool:
+def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
     """Single-round tool-decide → tool exec → chip render flow.
 
-    Returns True when a propose_* tool fired (caller should skip the rest
-    of the turn's query-RAG path). Returns False on any failure path
-    (LLM refused to emit tool_calls, tool execution error, etc.) — the
-    caller can fall through to normal chat handling.
+    Returns `(handled, created_info)`:
+      - `handled=True` → a propose_* tool fired (caller should skip the
+        rest of the turn's query-RAG path).
+      - `handled=False` → LLM refused to emit tool_calls, tool execution
+        error, etc. Caller can fall through to normal chat handling.
+      - `created_info` is a dict `{"kind": "reminder"|"event",
+        "reminder_id"?: str, "title": str}` when the create succeeded and
+        the caller can offer an undo affordance. None for
+        needs_clarification / create_failed / events (Calendar.app
+        AppleScript delete is unreliable — undo not offered).
     """
     warmup_async()
     tools = [propose_reminder, propose_calendar_event]
@@ -14110,7 +14211,7 @@ def _handle_chat_create_intent(question: str) -> bool:
             )
     except Exception as exc:
         console.print(f"[red]✗ no pude crear: {exc}[/red]")
-        return False
+        return False, None
 
     msg = resp.message
     tcalls = list(msg.tool_calls or [])
@@ -14118,7 +14219,7 @@ def _handle_chat_create_intent(question: str) -> bool:
         # LLM chose not to call the tool (rare with the focused prompt).
         # Fall through to normal chat — the model probably wants to ask
         # for clarification; caller decides what to do.
-        return False
+        return False, None
 
     # Execute the first tool call (the prompt says ONE tool, but be
     # defensive). command-r's arg-wrapping quirk is handled same as
@@ -14140,27 +14241,41 @@ def _handle_chat_create_intent(question: str) -> bool:
           "propose_calendar_event": propose_calendar_event}.get(name)
     if fn is None:
         console.print(f"[red]✗ tool desconocido: {name}[/red]")
-        return False
+        return False, None
 
     try:
         result_json = fn(**args)
     except TypeError as exc:
         console.print(f"[red]✗ args inválidos en {name}: {exc}[/red]")
-        return False
+        return False, None
     except Exception as exc:
         console.print(f"[red]✗ {name} falló: {exc}[/red]")
-        return False
+        return False, None
 
     try:
         payload = json.loads(result_json)
     except Exception:
         console.print(f"[yellow]⚠ {name} devolvió JSON inválido[/yellow]")
-        return False
+        return False, None
 
     # Route by payload shape.
     if payload.get("created") is True:
         _render_chat_create_chip(payload, console)
-        return True
+        kind = payload.get("kind") or "reminder"
+        fields = payload.get("fields") or {}
+        # Only reminders expose a stable id for programmatic delete;
+        # Calendar.app AppleScript delete is unreliable, so we don't offer
+        # undo for events (matches the web UX).
+        if kind == "reminder" and payload.get("reminder_id"):
+            console.print(
+                "[dim]╌ /undo para deshacer (mientras sea el último create).[/dim]"
+            )
+            return True, {
+                "kind": "reminder",
+                "reminder_id": payload["reminder_id"],
+                "title": fields.get("title") or "",
+            }
+        return True, None
     if payload.get("needs_clarification"):
         kind_label = "evento" if payload.get("kind") == "event" else "recordatorio"
         field_text = (payload.get("fields") or {}).get("due_text") or \
@@ -14169,14 +14284,14 @@ def _handle_chat_create_intent(question: str) -> bool:
             f"[yellow]⚠ Fecha/hora ambigua para el {kind_label} "
             f"(\"{field_text}\"). Aclará y volvé a pedir.[/yellow]"
         )
-        return True
+        return True, None
     if payload.get("created") is False:
         err = payload.get("error") or "error desconocido"
         console.print(f"[red]✗ no pude crear: {err}[/red]")
-        return True
+        return True, None
 
     console.print("[yellow]⚠ propose_* devolvió un payload sin resolución[/yellow]")
-    return False
+    return False, None
 
 
 @cli.command()
@@ -14396,6 +14511,11 @@ def chat(
     last_question = ""
     last_sources: list[dict] = []
     last_turn_id: str | None = None
+    # last_created: the most recent reminder/event the chat auto-created
+    # (via propose_* tool call). Populated by _handle_chat_create_intent;
+    # consumed by `/undo`. Only reminders are undo-able — events are None
+    # because Calendar.app AppleScript delete is unreliable.
+    last_created: dict | None = None
     # critique_active: session-local flag, does NOT persist to sessions/*.json
     critique_active = critique
     # If resuming, seed last_* from final turn so `/save` works immediately.
@@ -14439,8 +14559,42 @@ def chat(
         # _detect_propose_intent. Continues the loop on success so the
         # rest of the query-path isn't run.
         if _detect_propose_intent(question):
-            if _handle_chat_create_intent(question):
+            handled, created_info = _handle_chat_create_intent(question)
+            if handled:
+                if created_info is not None:
+                    last_created = created_info
                 continue
+
+        # /undo — delete the most recent chat-created reminder. Only
+        # reminders expose a stable id for programmatic delete; events
+        # aren't tracked (Calendar.app AppleScript delete unreliable,
+        # matches web UX which shows no undo for events). Session-local
+        # (last_created cleared after a successful delete so /undo twice
+        # doesn't re-delete nothing).
+        if question == "/undo":
+            if last_created is None:
+                console.print(
+                    "[yellow]No hay recordatorio reciente para deshacer.[/yellow]"
+                )
+                continue
+            if last_created.get("kind") != "reminder":
+                console.print(
+                    "[yellow]El último item creado fue un evento — "
+                    "borralo desde Calendar.app (AppleScript delete no es "
+                    "confiable).[/yellow]"
+                )
+                continue
+            rid = last_created.get("reminder_id", "")
+            title = last_created.get("title") or "(sin título)"
+            ok, msg = _delete_reminder(rid)
+            if ok:
+                console.print(
+                    f"[dim]╌ [/dim][green]✓[/green] [dim]borrado · {title}[/dim]"
+                )
+                last_created = None
+            else:
+                console.print(f"[red]✗ no pude borrar: {msg}[/red]")
+            continue
 
         # Rating intent — 👍 / 👎 / /bien / /mal aplicado a la última respuesta.
         # Check ANTES de /save /reindex /etc porque es el token más corto
@@ -26191,18 +26345,48 @@ def _collect_scoped_tasks_evidence(col, now: datetime, scope: dict) -> dict:
     Single-vault version kept for callers that pass a sqlite-vec collection
     directly (rag morning/today still use this). Multi-vault tasks-mode
     uses `_collect_scoped_tasks_evidence_multi` instead.
+
+    Reminders / Calendar / WhatsApp fetchers run in parallel — each is an
+    independent IPC round-trip (osascript / icalBuddy / sqlite) so serial
+    execution wasted wall-clock for no gain. Silent-fail contract preserved
+    per-future.
     """
-    from contextlib import suppress as _sup
+    from concurrent.futures import ThreadPoolExecutor
     ev = _pendientes_collect(col, now, days=14)
-    with _sup(Exception):
-        ev["reminders"] = _fetch_reminders_due(
-            now, horizon_days=int(scope["reminders_horizon"]), max_items=40,
-        )
-    with _sup(Exception):
-        ev["calendar_range"] = _fetch_calendar_ahead(int(scope["calendar_ahead"]))
-    if not ev.get("whatsapp"):
-        with _sup(Exception):
-            ev["whatsapp"] = _fetch_whatsapp_unread(hours=24, max_chats=8)
+
+    def _reminders():
+        try:
+            return _fetch_reminders_due(
+                now, horizon_days=int(scope["reminders_horizon"]), max_items=40,
+            )
+        except Exception:
+            return None
+
+    def _calendar():
+        try:
+            return _fetch_calendar_ahead(int(scope["calendar_ahead"]))
+        except Exception:
+            return None
+
+    def _whatsapp():
+        try:
+            return _fetch_whatsapp_unread(hours=24, max_chats=8)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_rem = ex.submit(_reminders)
+        f_cal = ex.submit(_calendar)
+        f_wa = ex.submit(_whatsapp) if not ev.get("whatsapp") else None
+        rem = f_rem.result()
+        cal = f_cal.result()
+        wa = f_wa.result() if f_wa else None
+    if rem is not None:
+        ev["reminders"] = rem
+    if cal is not None:
+        ev["calendar_range"] = cal
+    if wa is not None:
+        ev["whatsapp"] = wa
     return ev
 
 
@@ -26216,24 +26400,58 @@ def _collect_scoped_tasks_evidence_multi(
     The user asked for both personal (`home`) and work (`work`) vaults to
     surface their open loops in the tasks-mode answer. Without this, the
     work vault's pending items were invisible on WhatsApp/web queries.
+
+    All 6 system fetchers run in a ThreadPoolExecutor — each is an
+    independent network / IPC call (osascript, icalBuddy, sqlite, Google
+    HTTP, Open-Meteo HTTP), and serial execution added ~3-5s to tasks-mode
+    latency for no correctness win. Each fetcher already silent-fails; the
+    wrapper captures exceptions per-future so one slow/broken service can't
+    take down the others.
     """
-    from contextlib import suppress as _sup
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _safe(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+
     ev: dict = {}
-    # System services — not vault-specific
-    with _sup(Exception):
-        ev["mail_unread"] = _fetch_mail_unread()
-    with _sup(Exception):
-        ev["reminders"] = _fetch_reminders_due(
-            now, horizon_days=int(scope["reminders_horizon"]), max_items=40,
+    # System services — fan out in parallel. Max_workers matches the fetcher
+    # count so each gets a thread; overhead is negligible vs the seconds
+    # saved. No shared mutable state — each worker returns a plain value.
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_mail = ex.submit(_safe, _fetch_mail_unread)
+        f_rem = ex.submit(
+            _safe, _fetch_reminders_due, now,
+            int(scope["reminders_horizon"]), 40,
         )
-    with _sup(Exception):
-        ev["calendar_range"] = _fetch_calendar_ahead(int(scope["calendar_ahead"]))
-    with _sup(Exception):
-        ev["whatsapp"] = _fetch_whatsapp_unread(hours=24, max_chats=8)
-    with _sup(Exception):
-        ev["weather"] = _fetch_weather_rain()
-    with _sup(Exception):
-        ev["gmail"] = _fetch_gmail_evidence(now)
+        f_cal = ex.submit(
+            _safe, _fetch_calendar_ahead, int(scope["calendar_ahead"]),
+        )
+        f_wa = ex.submit(_safe, _fetch_whatsapp_unread, 24, 8)
+        f_weather = ex.submit(_safe, _fetch_weather_rain)
+        f_gmail = ex.submit(_safe, _fetch_gmail_evidence, now)
+
+        mail_v = f_mail.result()
+        rem_v = f_rem.result()
+        cal_v = f_cal.result()
+        wa_v = f_wa.result()
+        weather_v = f_weather.result()
+        gmail_v = f_gmail.result()
+
+    if mail_v is not None:
+        ev["mail_unread"] = mail_v
+    if rem_v is not None:
+        ev["reminders"] = rem_v
+    if cal_v is not None:
+        ev["calendar_range"] = cal_v
+    if wa_v is not None:
+        ev["whatsapp"] = wa_v
+    if weather_v is not None:
+        ev["weather"] = weather_v
+    if gmail_v is not None:
+        ev["gmail"] = gmail_v
 
     # Per-vault — loops + contradictions. Stale threshold mirrors
     # `_pendientes_collect` (14 days). Cap per vault at 8 to avoid blowing
@@ -26695,8 +26913,11 @@ def serve(host: str, port: int):
         if not result["docs"]:
             return {"answer": "", "sources": [], "t_retrieve": round(t_retrieve, 3)}
 
-        # Confidence gate
-        if result["confidence"] < CONFIDENCE_RERANK_MIN and not force:
+        # Confidence gate — per-source threshold (scaffolding today: all
+        # sources equal the baseline until production data calibrates them).
+        _top_src = (result.get("metas") or [{}])[0].get("source")
+        _gate = confidence_threshold_for_source(_top_src)
+        if result["confidence"] < _gate and not force:
             if sess:
                 append_turn(sess, {"q": question, "a": None, "gated": True,
                                    "paths": [m.get("file", "") for m in result["metas"]],

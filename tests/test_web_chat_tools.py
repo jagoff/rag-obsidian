@@ -260,6 +260,70 @@ def test_tool_wrappers_silent_fail(monkeypatch):
     assert isinstance(out, str)
 
 
+def test_gmail_recent_consumes_enriched_evidence(monkeypatch):
+    """TODO-2 regression: gmail_recent must pull thread_id + internal_date_ms
+    from _fetch_gmail_evidence directly (no secondary _gmail_service re-query).
+    Also verifies the internal_date_ms → received_at ISO conversion.
+    """
+    fake_ev = {
+        "unread_count": 7,
+        "awaiting_reply": [
+            {
+                "subject": "Proyecto X",
+                "from": "juan@example.com",
+                "snippet": "dale cuando puedas",
+                "days_old": 4.2,
+                "thread_id": "tid-aaa",
+                "internal_date_ms": 1_713_200_000_000,  # 2024-04-15 ~14:53 UTC
+            },
+        ],
+        "starred": [
+            {
+                "subject": "Importante",
+                "from": "ana@example.com",
+                "snippet": "ojo con esto",
+                "thread_id": "tid-bbb",
+                "internal_date_ms": 1_713_300_000_000,
+            },
+        ],
+    }
+    monkeypatch.setattr(tools_mod, "_fetch_gmail_evidence", lambda now: fake_ev)
+
+    out = gmail_recent()
+    parsed = json.loads(out)
+    assert parsed["unread_count"] == 7
+    assert len(parsed["threads"]) == 2
+    # awaiting first, then starred (gmail_recent's documented ordering).
+    t0, t1 = parsed["threads"]
+    assert t0["kind"] == "awaiting_reply"
+    assert t0["thread_id"] == "tid-aaa"
+    assert t0["subject"] == "Proyecto X"
+    assert t0["days_old"] == 4.2
+    # received_at = local ISO 'YYYY-MM-DDTHH:MM' derived from internal_date_ms.
+    assert t0["received_at"]
+    assert "T" in t0["received_at"] and t0["received_at"].count(":") == 1
+    assert t1["kind"] == "starred"
+    assert t1["thread_id"] == "tid-bbb"
+    assert t1["received_at"]
+
+
+def test_gmail_recent_missing_internal_date_is_empty_received_at(monkeypatch):
+    """If _fetch_gmail_evidence emits an item without internal_date_ms (fallback
+    path on gmail_thread_last_meta failure), received_at falls back to ''."""
+    fake_ev = {
+        "unread_count": 1,
+        "awaiting_reply": [
+            {"subject": "s", "from": "x@y.com", "snippet": "", "days_old": 0.0,
+             "thread_id": "tid-x", "internal_date_ms": 0},
+        ],
+        "starred": [],
+    }
+    monkeypatch.setattr(tools_mod, "_fetch_gmail_evidence", lambda now: fake_ev)
+    parsed = json.loads(gmail_recent())
+    assert parsed["threads"][0]["thread_id"] == "tid-x"
+    assert parsed["threads"][0]["received_at"] == ""
+
+
 # ── 3. No-tool-calls path ──────────────────────────────────────────────────
 
 

@@ -30,8 +30,6 @@ from rag import (  # noqa: E402
     _agent_tool_weather,
     _fetch_gmail_evidence,
     _fetch_reminders_due,
-    _gmail_service,
-    _gmail_thread_last_meta,
 )
 
 
@@ -119,28 +117,27 @@ def gmail_recent() -> str:
     Returns:
         JSON `{unread_count: int, threads: [...]}`. Error → ambos vacíos.
     """
-    # TODO: _fetch_gmail_evidence does not emit thread_id/received_at; we
-    # re-query the Gmail service directly to enrich with thread_id + ISO
-    # received_at. If creds/deps/network fail, return degraded shape.
     try:
         now = datetime.now()
         ev = _fetch_gmail_evidence(now) or {}
         unread_count = int(ev.get("unread_count") or 0)
         threads: list[dict] = []
 
-        svc = _gmail_service()
-
         def _mk_thread(kind: str, item: dict) -> dict:
-            base = {
+            ms = int(item.get("internal_date_ms") or 0)
+            received_at = (
+                datetime.fromtimestamp(ms / 1000.0).isoformat(timespec="minutes")
+                if ms else ""
+            )
+            return {
                 "kind": kind,
                 "from": item.get("from", ""),
                 "subject": item.get("subject", ""),
                 "snippet": item.get("snippet", ""),
                 "days_old": item.get("days_old"),
-                "thread_id": "",
-                "received_at": "",
+                "thread_id": item.get("thread_id", ""),
+                "received_at": received_at,
             }
-            return base
 
         awaiting = list(ev.get("awaiting_reply") or [])
         starred = list(ev.get("starred") or [])
@@ -154,53 +151,6 @@ def gmail_recent() -> str:
             if len(threads) >= 8:
                 break
             threads.append(_mk_thread("starred", item))
-
-        if svc is not None and threads:
-            # Enrich with thread_id + received_at by re-querying the same
-            # filters and matching by subject+from. Keeps degraded shape on
-            # any single-thread failure.
-            try:
-                enrich_items: list[dict] = []
-                try:
-                    q = (
-                        "in:inbox newer_than:14d older_than:3d "
-                        "-category:promotions -category:social "
-                        "-category:updates -category:forums"
-                    )
-                    r = svc.users().threads().list(userId="me", q=q, maxResults=15).execute()
-                    for th in r.get("threads", []) or []:
-                        tid = th.get("id") or ""
-                        meta = _gmail_thread_last_meta(svc, tid)
-                        if meta:
-                            enrich_items.append({"thread_id": tid, "meta": meta})
-                except Exception:
-                    pass
-                try:
-                    r2 = svc.users().threads().list(
-                        userId="me", q="is:starred in:inbox newer_than:7d", maxResults=3,
-                    ).execute()
-                    for th in r2.get("threads", []) or []:
-                        tid = th.get("id") or ""
-                        meta = _gmail_thread_last_meta(svc, tid)
-                        if meta:
-                            enrich_items.append({"thread_id": tid, "meta": meta})
-                except Exception:
-                    pass
-
-                by_key = {
-                    (e["meta"].get("subject", ""), e["meta"].get("from", "")): e
-                    for e in enrich_items
-                }
-                for t in threads:
-                    key = (t["subject"], t["from"])
-                    e = by_key.get(key)
-                    if e:
-                        t["thread_id"] = e["thread_id"]
-                        ms = int(e["meta"].get("internal_date_ms") or 0)
-                        if ms:
-                            t["received_at"] = datetime.fromtimestamp(ms / 1000.0).isoformat(timespec="minutes")
-            except Exception:
-                pass
 
         return json.dumps({"unread_count": unread_count, "threads": threads}, ensure_ascii=False)
     except Exception:

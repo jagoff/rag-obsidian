@@ -4206,8 +4206,8 @@ def _auto_index_state_save(state: dict) -> None:
         AUTO_INDEX_STATE_PATH.write_text(
             json.dumps(state, indent=2), encoding="utf-8",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("auto_index_state_save", exc)
 
 
 def _vault_state_key(vault_path: Path) -> str:
@@ -8510,8 +8510,8 @@ def save_note(
     # Index immediately so it's searchable right away.
     try:
         _index_single_file(col, path)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("capture.index_single_file", exc)
 
     return path
 
@@ -9716,8 +9716,8 @@ def _apply_filing_move(
     # gatillar un check O(n²) costoso en un apply-batch.
     try:
         _index_single_file(col, dst, skip_contradict=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        _silent_log("inbox.apply.index_single_file", exc)
     return {
         "src": src_rel,
         "dst": str(dst.relative_to(VAULT_PATH)),
@@ -9809,8 +9809,8 @@ def _rollback_filing_batch(col: SqliteVecCollection, batch_path: Path) -> list[d
             shutil.move(str(dst_full), str(src_full))
             try:
                 _index_single_file(col, src_full, skip_contradict=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                _silent_log("inbox.undo.index_single_file", exc)
             r["ok"] = True
         except Exception as ex:
             r["error"] = str(ex)
@@ -10327,8 +10327,8 @@ def retrieve(
         # this process. Idempotent; cheap when there's nothing to do.
         try:
             _maybe_backfill_created_ts()
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("retrieve.backfill_created_ts", exc)
         filters_applied["since"] = datetime.fromtimestamp(date_range[0]).strftime("%Y-%m-%d")
         filters_applied["until"] = datetime.fromtimestamp(date_range[1]).strftime("%Y-%m-%d")
 
@@ -10421,8 +10421,8 @@ def retrieve(
                 if eid not in seen_ids:
                     seen_ids.add(eid)
                     merged_ordered.append(eid)
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("retrieve.boost_path_injection", exc)
 
     # 5a. Cap pool antes de fetch/rerank. El reranker es O(n) en pares y
     #     domina la latencia de la query (~50ms/par en MPS fp32). Un pool
@@ -10655,10 +10655,10 @@ def retrieve(
                         )
                         graph_docs.append(best_doc)
                         graph_metas.append(best_meta)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as exc:
+                    _silent_log("graph_expand.neighbor_fetch", exc)
+        except Exception as exc:
+            _silent_log("graph_expand.outer", exc)
     _timing["graph_expand_ms"] = (time.perf_counter() - _t0) * 1000
 
     # ── ε-exploration toggle ─────────────────────────────────────────────────
@@ -11002,8 +11002,8 @@ def collect_ranker_features(
                 if eid not in seen_ids:
                     seen_ids.add(eid)
                     merged_ordered.append(eid)
-        except Exception:
-            pass
+        except Exception as exc:
+            _silent_log("retrieve.boost_path_injection", exc)
 
     merged_ordered = merged_ordered[:k_pool]
     if not merged_ordered:
@@ -11281,6 +11281,15 @@ _COMMAND_GROUPS: list[tuple[str, list[str]]] = [
 
 
 class _HighlightGroup(click.Group):
+    """Click Group subclass that renders ``rag --help`` with highlighted sub-command
+    sections (Core, Productivity, Automation, Quality, Maintenance, etc.).
+
+    The standard click formatter lists every command under a single heading. We
+    override :meth:`format_commands` to group commands into the buckets defined
+    by :data:`_HELP_GROUPS` and emit one section per bucket, which keeps the
+    top-level help readable once the CLI grew past ~40 sub-commands.
+    """
+
     def format_commands(self, ctx, formatter):
         all_cmds: dict[str, click.Command] = {}
         for name in self.list_commands(ctx):

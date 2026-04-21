@@ -14455,6 +14455,10 @@ def watch(debounce: float, all_vaults: bool):
               help="Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario")
 @click.option("--source", "source_opt", default=None,
               help="Filtrar por fuente cross-source (coma-separado): vault,calendar,gmail,whatsapp,reminders,messages")
+@click.option("--vault", "vault_scope", default=None,
+              help="Nombre de vault registrado (override per-invocación del activo). "
+                   "Usá `rag vault list` para ver los disponibles. "
+                   "Single-vault only — para cross-vault usá `rag chat --vault a,b`.")
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
@@ -14463,6 +14467,7 @@ def query(
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
     source_opt: str | None,
+    vault_scope: str | None,
 ):
     """Consulta única contra las notas."""
     warmup_async()
@@ -14470,7 +14475,42 @@ def query(
     date_range: tuple[float, float] | None = None
     if since:
         date_range = (parse_since(since), time.time())
-    col = get_db()
+
+    # `--vault NAME` — override per-invocación del vault activo. Se resuelve
+    # ANTES del `get_db()` para que todo el pipeline downstream (intent
+    # shortcuts, find_related, render_related, build_progressive_context)
+    # siga viendo un único `col` y no requiera cambios. Cross-vault queda
+    # en `rag chat --vault a,b` — `query` single-vault por ahora porque
+    # multi_retrieve + intents + related tiene suficiente divergencia para
+    # merecer un cambio separado (y el caso común "un vault puntual"
+    # justifica el flag sin ese scope).
+    if vault_scope:
+        names = [n.strip() for n in vault_scope.split(",") if n.strip()]
+        if len(names) != 1 or names[0] == "all":
+            msg = (
+                "--vault en `rag query` solo acepta UN vault por invocación. "
+                "Para cross-vault usá `rag chat --vault a,b`."
+            )
+            if plain:
+                click.echo(msg)
+            else:
+                console.print(f"[red]{msg}[/red]")
+            return
+        resolved = resolve_vault_paths(names)
+        if not resolved:
+            msg = (
+                f"--vault '{vault_scope}' no resolvió ningún vault registrado. "
+                "Revisá `rag vault list`."
+            )
+            if plain:
+                click.echo(msg)
+            else:
+                console.print(f"[red]{msg}[/red]")
+            return
+        _, _vault_path = resolved[0]
+        col = get_db_for(_vault_path)
+    else:
+        col = get_db()
     if col.count() == 0:
         if plain:
             click.echo("Índice vacío. Ejecuta: rag index")

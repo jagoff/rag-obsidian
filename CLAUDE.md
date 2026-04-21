@@ -37,7 +37,7 @@ uv tool install --reinstall --editable .   # reinstall after code changes
 rag index [--reset] [--no-contradict]      # incremental hash-based; --reset rebuilds
 rag index --source whatsapp [--reset] [--since ISO] [--dry-run] [--max-chats N]  # WA ingester (Phase 1.a)
 rag watch                                  # watchdog auto-reindex (debounce 3s)
-rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain --source S[,S2]]
+rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain --source S[,S2] --vault NAME]
 rag chat [--counter --no-deep --session ID --resume] # /save /reindex (or NL) work; create-intent tool-calling (`recordame X`, `cumple de Y el viernes`)
 rag do "instrucción" [--yes --max-iterations 8]  # tool-calling agent loop
 rag stats                                  # models + index status

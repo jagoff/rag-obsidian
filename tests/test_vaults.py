@@ -390,3 +390,155 @@ def _fake_reranker():
         def predict(self, pairs, show_progress_bar=False, **_):
             return [1.0] * len(pairs)
     return _R()
+
+
+# ── CLI: rag query --vault ────────────────────────────────────────────────────
+# Sanidad: el query command acepta override per-invocación del vault activo
+# igual que el env var OBSIDIAN_RAG_VAULT / `rag vault use`. Evita tener que
+# switchear el current del registry para una consulta única contra un vault
+# distinto (ej. `rag query --vault work "dev cycles"`). Single-vault only
+# por ahora — cross-vault sigue siendo territorio de `rag chat --vault a,b`.
+
+
+class _FakeCountedCollection:
+    """Colección mínima: count() > 0 para pasar el guard de `query()` y no
+    disparar el `Índice vacío.` early-return."""
+    def count(self):
+        return 1
+
+
+def _stub_query_pipeline_past_retrieve(monkeypatch):
+    """Monkeypatches comunes para que `rag query` llegue hasta el retrieve()
+    sin tocar ollama, embeddings reales ni el reranker. Los tests que corren
+    después del retrieve con este stub deben pasar `retrieve` vía monkeypatch
+    a lo que quieran ejercer. Acá short-circuiteamos devolviendo un result
+    vacío — el comando imprime 'Sin resultados.' y sale limpio.
+    """
+    monkeypatch.setattr(rag, "warmup_async", lambda: None)
+    monkeypatch.setattr(rag, "get_vocabulary", lambda col: ([], []))
+    monkeypatch.setattr(rag, "classify_intent", lambda q, tags, folders: ("semantic", {}))
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: {
+        "docs": [], "metas": [], "scores": [], "confidence": 0.0,
+        "filters_applied": {}, "query_variants": [], "timing": {},
+    })
+    monkeypatch.setattr(rag, "log_query_event", lambda ev: None)
+
+
+def test_query_vault_flag_routes_to_named_vault(tmp_registry, tmp_path, monkeypatch):
+    """`--vault work` debe resolver `work` contra el registry y abrir su
+    colección vía `get_db_for`, sin tocar el `get_db()` del vault activo."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home), "work": str(v_work)},
+        "current": "home",
+    })
+
+    captured_paths: list[Path] = []
+
+    def fake_get_db_for(path):
+        captured_paths.append(Path(path))
+        return _FakeCountedCollection()
+
+    def boom_get_db():
+        raise AssertionError("get_db() no debe llamarse cuando --vault está seteado")
+
+    monkeypatch.setattr(rag, "get_db_for", fake_get_db_for)
+    monkeypatch.setattr(rag, "get_db", boom_get_db)
+    _stub_query_pipeline_past_retrieve(monkeypatch)
+
+    result = CliRunner().invoke(
+        rag.cli, ["query", "--plain", "--no-multi", "--vault", "work", "test"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured_paths) == 1, captured_paths
+    assert captured_paths[0].resolve() == v_work.resolve()
+
+
+def test_query_without_vault_uses_default_get_db(tmp_registry, tmp_path, monkeypatch):
+    """Sin `--vault` el flujo debe seguir usando `get_db()` (vault activo),
+    conservando el comportamiento pre-flag."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home)},
+        "current": "home",
+    })
+
+    get_db_called = {"n": 0}
+
+    def fake_get_db():
+        get_db_called["n"] += 1
+        return _FakeCountedCollection()
+
+    def boom_get_db_for(path):
+        raise AssertionError(f"get_db_for({path}) no debe llamarse sin --vault")
+
+    monkeypatch.setattr(rag, "get_db", fake_get_db)
+    monkeypatch.setattr(rag, "get_db_for", boom_get_db_for)
+    _stub_query_pipeline_past_retrieve(monkeypatch)
+
+    result = CliRunner().invoke(rag.cli, ["query", "--plain", "--no-multi", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert get_db_called["n"] == 1
+
+
+def test_query_vault_flag_unknown_name_errors_without_touching_db(
+    tmp_registry, tmp_path, monkeypatch,
+):
+    """`--vault ghost` sin registry match debe fallar claro, sin abrir ninguna
+    colección ni llamar retrieve/LLM."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home)},
+        "current": "home",
+    })
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"no debería llamarse: args={args}")
+
+    monkeypatch.setattr(rag, "warmup_async", lambda: None)
+    monkeypatch.setattr(rag, "get_db", boom)
+    monkeypatch.setattr(rag, "get_db_for", boom)
+    monkeypatch.setattr(rag, "retrieve", boom)
+
+    result = CliRunner().invoke(
+        rag.cli, ["query", "--plain", "--vault", "ghost", "test"],
+    )
+
+    assert result.exit_code == 0, result.output
+    out = result.output.lower()
+    assert "ghost" in out or "no resolvió" in out, result.output
+
+
+@pytest.mark.parametrize("scope", ["home,work", "all"])
+def test_query_vault_flag_rejects_multi_vault_scope(
+    tmp_registry, tmp_path, monkeypatch, scope,
+):
+    """`rag query` no soporta cross-vault retrieval en esta primera iteración
+    (la ruta multi_retrieve + intent shortcuts + render_related tiene suficiente
+    divergencia como para merecer un cambio separado). Para cross-vault queda
+    `rag chat --vault a,b`. Debe rechazarse con mensaje claro, sin tocar DB."""
+    v_home = tmp_path / "home"; v_home.mkdir()
+    v_work = tmp_path / "work"; v_work.mkdir()
+    rag._save_vaults_config({
+        "vaults": {"home": str(v_home), "work": str(v_work)},
+        "current": "home",
+    })
+
+    def boom(*args, **kwargs):
+        raise AssertionError(f"no debería llamarse: args={args}")
+
+    monkeypatch.setattr(rag, "warmup_async", lambda: None)
+    monkeypatch.setattr(rag, "get_db", boom)
+    monkeypatch.setattr(rag, "get_db_for", boom)
+    monkeypatch.setattr(rag, "retrieve", boom)
+
+    result = CliRunner().invoke(
+        rag.cli, ["query", "--plain", "--vault", scope, "test"],
+    )
+
+    assert result.exit_code == 0, result.output
+    out = result.output.lower()
+    assert "rag chat" in out or "un vault" in out or "solo acepta" in out, result.output

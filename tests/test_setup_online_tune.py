@@ -116,6 +116,49 @@ def test_services_spec_includes_online_tune():
     assert "com.fer.obsidian-rag-online-tune" in labels
 
 
+def test_services_spec_includes_serve():
+    """rag serve is the hot path for WhatsApp — must ship with `rag setup`.
+
+    Regression guard: the plist used to be hand-installed and got out of
+    sync (corrupted, unregistered). Registering it in _services_spec() is
+    the fix; this test prevents it from being accidentally removed again.
+    """
+    specs = rag_module._services_spec(RAG_BIN)
+    labels = [s[0] for s in specs]
+    assert "com.fer.obsidian-rag-serve" in labels
+
+
+def test_serve_plist_valid_plist():
+    xml = rag_module._serve_plist(RAG_BIN)
+    result = subprocess.run(
+        ["plutil", "-lint", "-"],
+        input=xml.encode(),
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_serve_plist_port_7832_and_keepalive():
+    d = _parse_plist(rag_module._serve_plist(RAG_BIN))
+    args = d["ProgramArguments"]
+    assert args[0] == RAG_BIN
+    assert args[1] == "serve"
+    assert "7832" in args  # listener.ts hardcodes this port
+    assert d["KeepAlive"] is True
+    assert d["RunAtLoad"] is True
+
+
+def test_serve_plist_warm_model_env():
+    """Serve exists to keep models warm — without these env vars the
+    whole point of the service evaporates (reranker unloads after 15min
+    idle, bge-m3 pays HTTP round-trip, ollama drops the chat model)."""
+    d = _parse_plist(rag_module._serve_plist(RAG_BIN))
+    env = d.get("EnvironmentVariables", {})
+    assert env.get("OLLAMA_KEEP_ALIVE") == "-1"
+    assert env.get("RAG_RERANKER_NEVER_UNLOAD") == "1"
+    assert env.get("RAG_LOCAL_EMBED") == "1"
+
+
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    assert len(specs) == 10
+    assert len(specs) == 11

@@ -19837,10 +19837,21 @@ def _parse_natural_datetime(
 
     anchor = now or datetime.now()
     s_norm = _preprocess_rioplatense_datetime(s)
+    # Timezone: explicit Argentina (UTC-3) by default, overridable via
+    # RAG_TIMEZONE. Without this, dateparser's absolute-date parsing on
+    # inputs with offsets or UTC Z-suffix could shift the final datetime
+    # relative to what the user meant. Naive datetimes (no offset in
+    # input) pass through unchanged; only affects ISO strings / RFC
+    # forms that carry tzinfo. We then strip tzinfo below so the rest
+    # of the codebase (AppleScript creators, log timestamps) sees a
+    # naive local datetime.
+    _tz = os.environ.get("RAG_TIMEZONE", "").strip() or "America/Argentina/Buenos_Aires"
     settings = {
         "RELATIVE_BASE": anchor,
         "PREFER_DATES_FROM": "future" if prefer_future else "current_period",
         "RETURN_AS_TIMEZONE_AWARE": False,
+        "TIMEZONE": _tz,
+        "TO_TIMEZONE": _tz,
     }
     try:
         import dateparser  # noqa: PLC0415
@@ -19879,17 +19890,23 @@ def _parse_natural_datetime(
     _hint_line = f' Hint: "{s_norm}"' if s_norm != s else ""
     prompt = (
         "Parseá esta fecha/hora en lenguaje natural. "
-        "El usuario habla español argentino (rioplatense) — idioms como "
-        "'la semana que viene' (~7 días después), 'a la tardecita' (~17:00), "
-        "'a la nochecita' (~20:00), 'a la noche' (~20:00), 'tempranito' (~7:00), "
+        "El usuario habla español argentino (rioplatense). "
+        "Zona horaria: Argentina (UTC-3). Semana arranca el LUNES "
+        "(convención ISO: lunes=1, domingo=7).\n"
+        "Idioms rioplatense frecuentes: "
+        "'la semana que viene' (~7 días después, próximo lunes), "
+        "'a la tardecita' (~17:00), 'a la nochecita' (~20:00), "
+        "'a la noche' (~20:00), 'tempranito' (~7:00), "
         "'el finde' (sábado), '18hs' (18:00), 'a eso de las X' (~X:00), "
-        "'4 de la tarde' (16:00), son frecuentes.\n"
-        f"Ahora es {anchor.strftime('%Y-%m-%d %H:%M')} ({_es_anchor_day}). "
+        "'4 de la tarde' (16:00), 'tipo X' (~X:00).\n"
+        f"Ahora es {anchor.strftime('%Y-%m-%d %H:%M')} ({_es_anchor_day}) "
+        "en hora local Argentina. "
         "Si el usuario dice un día de la semana sin más contexto "
         "('el jueves'), asumí el PRÓXIMO de esa semana (rollforward). "
         "Si no dio hora, usá 09:00.\n\n"
         f'Texto: "{s}"{_hint_line}\n\n'
         'Respondé SOLO con JSON válido: {"iso": "YYYY-MM-DDTHH:MM"} '
+        '(sin offset, hora local argentina) '
         'o {"iso": null} si no hay fecha clara. '
         "Sin prosa, sin bloques de código."
     )

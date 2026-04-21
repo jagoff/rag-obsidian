@@ -1608,6 +1608,62 @@ def _parse_keep_alive(val: str) -> int | str:
 OLLAMA_KEEP_ALIVE = _parse_keep_alive(os.environ.get("OLLAMA_KEEP_ALIVE", "-1"))
 
 
+# Modelos >10 GB cuya wired-pin en 36 GB unified bloquea el kernel de
+# swappear — reproduce el 2026-04-17 Mac freeze. Detectados por nombre
+# exacto (no substring) para evitar false-positives. Si resolve_chat_model()
+# cae a alguno de estos, `chat_keep_alive()` clampea a `_LARGE_KEEP_ALIVE`
+# independientemente de OLLAMA_KEEP_ALIVE — guard defensivo sin requerir
+# intervención manual post-freeze.
+_LARGE_CHAT_MODELS = frozenset({
+    "qwen3:30b-a3b",       # ~18 GB MoE
+    "command-r:latest",    # ~19 GB
+    "command-r",           # alias sin tag (por si CHAT_MODEL_PREFERENCE cambia)
+    "command-r:35b",       # tag explícito si alguien lo agrega
+})
+_LARGE_KEEP_ALIVE = "20m"  # safe cap para modelos grandes
+
+
+def chat_keep_alive(model: str | None = None) -> int | str:
+    """Keep_alive para calls al chat model, clampeado para modelos grandes.
+
+    Guard contra el 2026-04-17 Mac-freeze regression: si el chat model
+    efectivo es command-r (~19 GB) o qwen3:30b-a3b (~18 GB),
+    OLLAMA_KEEP_ALIVE=-1 los pinearía como wired memory en 36 GB unified,
+    bloqueando swap del kernel.
+
+    Args:
+        model: modelo efectivo a usar en la próxima call a ollama. Si es
+            None, se resuelve via `resolve_chat_model()`. Pasarlo explícito
+            desde sitios como `web/server.py._resolve_web_chat_model()`
+            donde el usuario puede overridear el modelo runtime desde la UI.
+
+    Lógica:
+      - Chat model NO está en _LARGE_CHAT_MODELS → devolver OLLAMA_KEEP_ALIVE
+        tal cual (respeta env var del usuario).
+      - Chat model SÍ está en _LARGE_CHAT_MODELS → clampear a _LARGE_KEEP_ALIVE
+        ("20m"), a menos que el usuario haya seteado RAG_KEEP_ALIVE_LARGE_MODEL
+        explícitamente (opt-out consciente — para quien tenga >64 GB).
+
+    Llamar desde todo call site que use chat model (resolve_chat_model() o
+    _resolve_web_chat_model()). Helper + embed model (qwen2.5:3b, bge-m3)
+    son chicos (<3 GB) y siguen usando OLLAMA_KEEP_ALIVE directo.
+    """
+    if model is None:
+        try:
+            model = resolve_chat_model()
+        except RuntimeError:
+            # Si no hay ningún chat model instalado, no podemos clampear por
+            # nombre — devolvemos OLLAMA_KEEP_ALIVE raw. El caller va a fallar
+            # igual al hacer la call, no es nuestro problema.
+            return OLLAMA_KEEP_ALIVE
+    if model in _LARGE_CHAT_MODELS:
+        override = os.environ.get("RAG_KEEP_ALIVE_LARGE_MODEL")
+        if override:
+            return _parse_keep_alive(override)
+        return _LARGE_KEEP_ALIVE
+    return OLLAMA_KEEP_ALIVE
+
+
 _CHAT_MODEL_RESOLVED: str | None = None
 
 
@@ -10785,7 +10841,7 @@ def _surface_generate_reason(pair: dict) -> str:
             # the watch thread indexed a note and hit this path.
             options={"temperature": 0, "top_p": 1, "seed": 42,
                      "num_ctx": 4096, "num_predict": 80},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         reason = (resp.message.content or "").strip().split("\n", 1)[0].strip()
     except Exception:
@@ -11664,7 +11720,7 @@ def find_contradictions(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         raw = resp.message.content.strip()
     except Exception:
@@ -13253,7 +13309,7 @@ def find_contradictions_for_note(
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         helper_raw = resp.message.content.strip()
     except Exception as exc:
@@ -15825,7 +15881,7 @@ def query(
             messages=messages,
             options=CHAT_OPTIONS,
             stream=True,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
     else:
@@ -15840,7 +15896,7 @@ def query(
                 messages=messages,
                 options=CHAT_OPTIONS,
                 stream=True,
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
                 live.update(Text("".join(parts)))
@@ -15879,7 +15935,7 @@ def query(
                     messages=_repair_messages,
                     options=CHAT_OPTIONS,
                     stream=False,
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    keep_alive=chat_keep_alive(),
                 )
                 _repair_full = (_repair_resp.message.content or "").strip()
                 if _repair_full:
@@ -15931,7 +15987,7 @@ def query(
                     ],
                     options=CHAT_OPTIONS,
                     stream=False,
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    keep_alive=chat_keep_alive(),
                 )
                 return (_cr.message.content or "").strip()
             except Exception:
@@ -16321,7 +16377,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
                 tools=tools,
                 options={"num_ctx": 2048, "num_predict": 256,
                          "temperature": 0.0, "seed": 42},
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=chat_keep_alive(),
             )
     except Exception as exc:
         console.print(f"[red]✗ no pude crear: {exc}[/red]")
@@ -16951,7 +17007,7 @@ def chat(
                 messages=messages,
                 options=_CLI_CHAT_OPTIONS,
                 stream=True,
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=chat_keep_alive(),
             ):
                 if _t_first_token is None and chunk.message.content:
                     _t_first_token = time.perf_counter()
@@ -16997,7 +17053,7 @@ def chat(
                         messages=_chat_repair_messages,
                         options=_CLI_CHAT_OPTIONS,
                         stream=False,
-                        keep_alive=OLLAMA_KEEP_ALIVE,
+                        keep_alive=chat_keep_alive(),
                     )
                     _rfull = (_rresp.message.content or "").strip()
                     if _rfull:
@@ -17037,7 +17093,7 @@ def chat(
                         ],
                         options=_CLI_CHAT_OPTIONS,
                         stream=False,
-                        keep_alive=OLLAMA_KEEP_ALIVE,
+                        keep_alive=chat_keep_alive(),
                     )
                     _cq_full = (_cq_resp.message.content or "").strip()
                 except Exception:
@@ -19049,7 +19105,7 @@ def _generate_digest_narrative(prompt: str) -> str:
         model=resolve_chat_model(),
         messages=[{"role": "user", "content": prompt}],
         options=CHAT_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
+        keep_alive=chat_keep_alive(),
     )
     return (resp.message.content or "").strip()
 
@@ -19800,6 +19856,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
     console.print(Panel(f"[bold cyan]{instruction}[/bold cyan]", border_style="cyan"))
 
     model = resolve_chat_model()
+    _keep_alive = chat_keep_alive(model)
     for it in range(max_iterations):
         with console.status(f"[dim]pensando (iter {it + 1}/{max_iterations})…[/dim]", spinner="dots"):
             resp = _chat_capped_client().chat(
@@ -19807,7 +19864,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
                 messages=messages,
                 tools=tools,
                 options=CHAT_OPTIONS,
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=_keep_alive,
             )
 
         msg = resp.message
@@ -21071,7 +21128,7 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
             stream=True,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
         # Same WA/TG-friendly link rewrite as `query --plain`.
@@ -21084,7 +21141,7 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
                 messages=[{"role": "user", "content": prompt}],
                 options=CHAT_OPTIONS,
                 stream=True,
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
         full = "".join(parts)
@@ -21735,7 +21792,7 @@ def _read_generate_summary(prompt: str) -> str:
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         return (resp.message.content or "").strip()
     except Exception:
@@ -26043,7 +26100,7 @@ def _generate_morning_narrative(prompt: str) -> str:
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         return (resp.message.content or "").strip()
     except Exception:
@@ -26468,7 +26525,7 @@ def _generate_morning_json(prompt: str) -> dict | None:
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
             format="json",
         )
         raw = (resp.message.content or "").strip()
@@ -26963,7 +27020,7 @@ def _generate_today_narrative(prompt: str) -> str:
             model=resolve_chat_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         return (resp.message.content or "").strip()
     except Exception:
@@ -28088,7 +28145,7 @@ def _followup_judge(loop_text: str, candidate_snippet: str) -> tuple[bool, str]:
             messages=[{"role": "user", "content": prompt}],
             # num_ctx=4096 to keep the web chat's KV cache warm (see CHAT_OPTIONS).
             options={"temperature": 0, "seed": 42, "num_ctx": 4096, "num_predict": 128},
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         raw = resp.message.content.strip()
     except Exception:
@@ -29554,7 +29611,7 @@ def extract_enrich_entities(question: str, answer: str) -> dict:
                 {"role": "user", "content": user_msg},
             ],
             options={**HELPER_OPTIONS, "num_predict": 160, "num_ctx": 2048, "format": "json"},
-            keep_alive=-1,
+            keep_alive=chat_keep_alive(),
         )
         raw = (rsp.message.content or "").strip()
         data = json.loads(raw)
@@ -30139,7 +30196,7 @@ def serve(host: str, port: int):
             messages=[{"role": "user", "content": "hi"}],
             options={**CHAT_OPTIONS, "num_predict": 1},
             stream=True,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(chat_model),
         ):
             pass
     except Exception:
@@ -30304,7 +30361,7 @@ def serve(host: str, port: int):
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    keep_alive=chat_keep_alive(),
                 )
                 answer = (resp.message.content or "").strip()
             except Exception as exc:
@@ -30480,7 +30537,7 @@ def serve(host: str, port: int):
         for chunk in ollama.chat(
             model=resolve_chat_model(), messages=messages,
             options={**CHAT_OPTIONS, "num_predict": predict_cap},
-            stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+            stream=True, keep_alive=chat_keep_alive(),
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
@@ -30555,7 +30612,7 @@ def serve(host: str, port: int):
             for chunk in ollama.chat(
                 model=resolve_chat_model(), messages=messages,
                 options={**CHAT_OPTIONS, "num_predict": predict_cap},
-                stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+                stream=True, keep_alive=chat_keep_alive(),
             ):
                 parts.append(chunk.message.content)
         except Exception as exc:

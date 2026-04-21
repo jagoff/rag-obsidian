@@ -47,6 +47,7 @@ from rag import (  # noqa: E402
     _sql_append_event,
     MORNING_FOLDER,
     OLLAMA_KEEP_ALIVE,
+    chat_keep_alive,
     SESSION_HISTORY_WINDOW,
     _collect_screentime,
     _fmt_hm,
@@ -908,8 +909,9 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     subsequent call since the system cache already exists.
     """
     try:
+        _probe_model = _resolve_web_chat_model()
         _OLLAMA_STREAM_CLIENT.chat(
-            model=_resolve_web_chat_model(),
+            model=_probe_model,
             messages=[
                 {"role": "system", "content": _WEB_SYSTEM_PROMPT},
                 {"role": "user", "content": "."},
@@ -919,7 +921,7 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
             stream=False,
             think=False,   # thinking-capable models would otherwise emit
                            # <think> blocks as "tokens" with empty content
-            keep_alive=-1,
+            keep_alive=chat_keep_alive(_probe_model),
         )
         return True
     except Exception:
@@ -1318,7 +1320,7 @@ def followups(req: FollowupsRequest) -> dict:
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.3, "seed": 42, "num_predict": 220, "num_ctx": 2048},
             format="json",
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         )
         raw = (resp.message.content or "").strip() or "{}"
         data = json.loads(raw)
@@ -2283,7 +2285,7 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
             messages=messages,
             options=tasks_options,
             stream=True,
-            keep_alive=OLLAMA_KEEP_ALIVE,
+            keep_alive=chat_keep_alive(),
         ):
             delta = chunk.message.content or ""
             if delta:
@@ -3137,10 +3139,13 @@ def _ensure_chat_model_prewarmer() -> None:
                     continue
                 model = _resolve_web_chat_model()
                 # Tiny ping — 1 token is enough to re-pin KV cache + model weights.
-                # options=keep_alive=-1 instructs ollama to hold the model forever,
-                # overriding its internal eviction pressure. Uses the bounded
-                # streaming client so a stuck-load daemon can't wedge this
-                # thread forever and mask the next real request.
+                # keep_alive se resuelve via chat_keep_alive(model): -1 (forever)
+                # para modelos chicos, "20m" para grandes (guard 2026-04-21 post
+                # Mac-freeze regression). El prewarm interval (~240s) queda por
+                # debajo del clamp de 20m, así que modelos grandes siguen warm
+                # entre pings sin pinearse wired forever.
+                # Uses the bounded streaming client so a stuck-load daemon can't
+                # wedge this thread forever and mask the next real request.
                 _OLLAMA_STREAM_CLIENT.chat(
                     model=model,
                     messages=[
@@ -3151,7 +3156,7 @@ def _ensure_chat_model_prewarmer() -> None:
                              "temperature": 0, "seed": 42},
                     stream=False,
                     think=False,   # match the probe + main chat path
-                    keep_alive=-1,
+                    keep_alive=chat_keep_alive(model),
                 )
                 print(f"[chat-prewarm] {model} pinned", flush=True)
             except Exception as exc:
@@ -4491,7 +4496,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     options=CHAT_TOOL_OPTIONS,
                     stream=False,
                     think=False,   # see _ollama_chat_probe for rationale
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    keep_alive=chat_keep_alive(_web_model),
                 )
                 _tmsg = _tr.message
                 _tcalls = list(_tmsg.tool_calls or [])
@@ -4630,7 +4635,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                # tokens with empty content.delta and the
                                # UI sees 0-token responses (measured on
                                # qwen3.6 2026-04-20).
-                keep_alive=OLLAMA_KEEP_ALIVE,
+                keep_alive=chat_keep_alive(_web_model),
             ):
                 delta = chunk.message.content or ""
                 if not delta:

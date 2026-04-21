@@ -12939,14 +12939,68 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
 @cli.command()
 @click.option("--reset", is_flag=True, help="Borrar índice antes de reindexar")
 @click.option("--no-contradict", is_flag=True, help="Saltear el check de contradicciones en notas nuevas/modificadas")
-def index(reset: bool, no_contradict: bool):
+@click.option("--source", "source_opt", default=None,
+              help="Indexar desde una fuente non-vault (whatsapp, calendar, gmail, reminders). Omitir = vault.")
+@click.option("--since", "since_opt", default=None,
+              help="ISO timestamp — acotar el ingest al rango (>=). Solo para sources non-vault.")
+@click.option("--dry-run", is_flag=True, help="Calcular chunks sin escribir (solo para --source non-vault).")
+@click.option("--max-chats", type=int, default=None,
+              help="Cap de chats para --source whatsapp (staged rollout / debugging).")
+def index(reset: bool, no_contradict: bool, source_opt: str | None,
+          since_opt: str | None, dry_run: bool, max_chats: int | None):
     """Indexar notas del vault (incremental, detecta cambios por hash).
 
     En el camino incremental, cada nota nueva o modificada pasa por un check
     de contradicciones contra el resto del vault. Con `--reset` se omite
     (full reindex haría O(n²) llamadas al helper). `--no-contradict` lo
     saltea también en incremental.
+
+    Con `--source whatsapp` (o calendar/gmail/reminders, cuando estén
+    disponibles) corre el ingester de esa fuente contra la misma colección
+    — los chunks aterrizan con `source="<fuente>"` en el metadata y el
+    threading por `--source` en `rag query` los filtra.
     """
+    if source_opt:
+        src = source_opt.strip().lower()
+        if src not in VALID_SOURCES:
+            console.print(
+                f"[red]Fuente inválida:[/red] {src}. "
+                f"Permitidas: {sorted(VALID_SOURCES - {'vault'})} (+ vault default)."
+            )
+            return
+        if src == "vault":
+            # Treat as no-op flag — vault indexing has its own path.
+            with vault_write_lock("index"):
+                _run_index(reset=reset, no_contradict=no_contradict)
+            return
+        if src == "whatsapp":
+            from scripts.ingest_whatsapp import run as _ingest_wa
+            summary = _ingest_wa(
+                since_iso=since_opt,
+                reset=bool(reset),
+                max_chats=max_chats,
+                dry_run=bool(dry_run),
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(
+                f"{prefix}[bold]WhatsApp[/bold]: "
+                f"{summary['messages_read']} msgs · "
+                f"{summary['messages_after_retention']} nuevos · "
+                f"{summary['chunks_built']} chunks · "
+                f"[green]{summary['chunks_written']}[/green] indexados · "
+                f"{summary['chats_touched']} chats · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
+        console.print(
+            f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
+            f"Scope: whatsapp (ready), calendar/gmail/reminders (pending)."
+        )
+        return
+
     with vault_write_lock("index"):
         _run_index(reset=reset, no_contradict=no_contradict)
 
@@ -25238,6 +25292,58 @@ def _watch_plist(rag_bin: str) -> str:
 """
 
 
+def _serve_plist(rag_bin: str) -> str:
+    """Persistent `rag serve` HTTP query server on port 7832.
+
+    This is the hot path for the WhatsApp listener (and any other bot
+    integration): it keeps the reranker, bge-m3 embedder, BM25 corpus, and
+    chat model warm in memory so each request skips the ~5-10s subprocess
+    cold-start that listener.ts's fallback pays per message.
+
+    Env vars mirror the web plist: OLLAMA_KEEP_ALIVE=-1 (models pinned in
+    VRAM forever), RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder stays resident,
+    no 9s reload after idle eviction), RAG_LOCAL_EMBED=1 (in-process
+    SentenceTransformer for query embedding, ~10-30ms vs ~140ms via ollama
+    HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10).
+
+    KeepAlive + RunAtLoad mean launchd will resurrect it if it crashes or
+    the host reboots. ThrottleInterval=30 prevents crash loops from burning
+    CPU.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>serve</string>
+    <string>--port</string>
+    <string>7832</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
+    <key>RAG_LOCAL_EMBED</key><string>1</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/serve.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/serve.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _digest_plist(rag_bin: str) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25555,6 +25661,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     return [
         ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
          _watch_plist(rag_bin)),
+        ("com.fer.obsidian-rag-serve", "com.fer.obsidian-rag-serve.plist",
+         _serve_plist(rag_bin)),
         ("com.fer.obsidian-rag-digest", "com.fer.obsidian-rag-digest.plist",
          _digest_plist(rag_bin)),
         ("com.fer.obsidian-rag-morning", "com.fer.obsidian-rag-morning.plist",

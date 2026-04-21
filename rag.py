@@ -19807,6 +19807,26 @@ _TIME_MARKER_RE = re.compile(
 )
 
 
+def _has_explicit_time(text: str) -> bool:
+    """Return True if `text` mentions a specific time of day.
+
+    Used by propose_calendar_event to decide between all-day vs timed
+    event: if the user said "el miercoles viene Grecia" without a time
+    → all-day; "el miercoles a las 4pm" → 16:00-17:00 timed slot.
+
+    Matches any of:
+      - `a las N` / `las N` / `N hora(s)` / `N minuto(s)`
+      - `al mediodía` / `a la medianoche` / `a la mañana|tarde|noche`
+      - `tardecita` / `nochecita` / `tempranito` / `tempran*`
+      - Digit patterns: `18hs`, `18h`, `10am`, `4pm`, `14:30`
+
+    Pure substring regex, no side effects — safe for tool fast path.
+    """
+    if not text:
+        return False
+    return bool(_TIME_MARKER_RE.search(text))
+
+
 def _parse_natural_datetime(
     text: str,
     now: datetime | None = None,

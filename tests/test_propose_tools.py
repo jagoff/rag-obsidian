@@ -158,13 +158,65 @@ def test_propose_event_auto_creates_when_start_is_clear(monkeypatch):
     assert data["created"] is True
     assert data["event_uid"] == "UID-ABC-123"
     assert data["fields"]["start_iso"] == "2026-04-23T16:00:00"
-    # Default end = start + 1h
+    # start has an explicit time ("4pm") → timed event, end = start+1h.
     assert data["fields"]["end_iso"] == "2026-04-23T17:00:00"
+    assert data["fields"]["all_day"] is False
     # _create_calendar_event debe recibir start_dt y end_dt correctos.
     args, kwargs = create_mock.call_args
     assert args[0] == "reunión con equipo"
     assert args[1] == datetime(2026, 4, 23, 16, 0, 0)
     assert args[2] == datetime(2026, 4, 23, 17, 0, 0)
+    assert kwargs["all_day"] is False
+
+
+def test_propose_event_auto_all_day_when_no_time(monkeypatch):
+    """Usuario: 'el miercoles viene Grecia a casa' (sin hora) → all-day
+    event. Antes: defaulteaba a 00:00-01:00. Ahora: all_day=True, full
+    day block."""
+    import rag
+    monkeypatch.setattr(
+        rag, "_parse_natural_datetime",
+        lambda *a, **kw: datetime(2026, 4, 22, 0, 0, 0),  # wednesday 00:00
+    )
+    monkeypatch.setattr(rag, "_parse_natural_recurrence", lambda txt: None)
+    create_mock = MagicMock(return_value=(True, "UID-ALL-DAY"))
+    monkeypatch.setattr(rag, "_create_calendar_event", create_mock)
+
+    out = web_tools.propose_calendar_event(
+        title="Grecia viene a casa", start="el miercoles",
+    )
+    data = json.loads(out)
+    assert data["created"] is True
+    assert data["fields"]["all_day"] is True
+    # start normalised a 00:00, end al día siguiente 00:00 (convención all-day).
+    assert data["fields"]["start_iso"] == "2026-04-22T00:00:00"
+    assert data["fields"]["end_iso"] == "2026-04-23T00:00:00"
+    args, kwargs = create_mock.call_args
+    assert args[1] == datetime(2026, 4, 22, 0, 0, 0)
+    assert args[2] == datetime(2026, 4, 23, 0, 0, 0)
+    assert kwargs["all_day"] is True
+
+
+def test_propose_event_respects_explicit_all_day_false(monkeypatch):
+    """Si el caller pasa all_day=False explícito, NO auto-flip aunque
+    el start no tenga hora. Permite al LLM overridear si realmente
+    quiere un timed event a medianoche."""
+    import rag
+    # Input con hora explícita para que auto-all-day NO se active.
+    monkeypatch.setattr(
+        rag, "_parse_natural_datetime",
+        lambda *a, **kw: datetime(2026, 4, 22, 9, 0, 0),
+    )
+    monkeypatch.setattr(rag, "_parse_natural_recurrence", lambda txt: None)
+    create_mock = MagicMock(return_value=(True, "UID"))
+    monkeypatch.setattr(rag, "_create_calendar_event", create_mock)
+
+    # start "el miercoles 9am" — sí hay hora explícita → timed
+    web_tools.propose_calendar_event(
+        title="x", start="el miercoles 9am",
+    )
+    _, kwargs = create_mock.call_args
+    assert kwargs["all_day"] is False
 
 
 def test_propose_event_explicit_end_passed_to_create(monkeypatch):

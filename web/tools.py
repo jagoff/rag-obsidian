@@ -389,8 +389,24 @@ def propose_calendar_event(
     end_dt: datetime | None = None
     if end and end.strip():
         end_dt = rag._parse_natural_datetime(end, now=start_dt or now)
-    if start_dt and end_dt is None:
-        end_dt = start_dt + timedelta(hours=1)
+
+    # Auto all-day detection: if the user gave a date but NO time-of-day
+    # marker ("el miercoles viene Grecia", "cumpleaños el 15"), this is
+    # naturally an all-day event, not a 00:00 midnight blip. Only flip
+    # when the caller didn't explicitly set all_day — respect explicit
+    # all_day=False if the LLM decided otherwise.
+    if start_dt and not all_day and not rag._has_explicit_time(start):
+        all_day = True
+
+    # End date: explicit wins, then all-day convention (start + 1 day,
+    # normalised to midnight), otherwise start + 1h for timed events.
+    if not end_dt:
+        if all_day:
+            _s_midnight = start_dt.replace(hour=0, minute=0, second=0, microsecond=0) if start_dt else None
+            end_dt = _s_midnight + timedelta(days=1) if _s_midnight else None
+            start_dt = _s_midnight
+        elif start_dt:
+            end_dt = start_dt + timedelta(hours=1)
 
     recurrence = (
         rag._parse_natural_recurrence(recurrence_text) if recurrence_text else None

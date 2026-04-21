@@ -1764,7 +1764,21 @@ async function send(question) {
         ragText.innerHTML = renderMarkdown(fullText);
       }
       const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
+      // Two thresholds — conflating them polluted the UI with YouTube videos
+      // on queries where the vault answered correctly.
+      //
+      // `weakAnswer` (inline "↗ buscar en internet" link, cheap): conf < 1.0
+      // es laxo a propósito — un link hint sutil sirve incluso cuando el
+      // vault respondió OK pero el usuario podría querer cross-reference.
+      //
+      // `vaultReallyFailed` (YouTube API call, costoso + ruidoso): solo
+      // cuando NO hay sources O conf < 0.10 (mismo threshold del backend
+      // CONFIDENCE_DEEP_THRESHOLD — "abajo de esto el vault no respondió").
+      // Pre-fix (2026-04-21): "en que ciclo estamos?" con conf=0.3 y
+      // `dev cycles.md` como top source disparaba YouTube con videos
+      // genéricos de PHP — el signal más ruidoso del sistema.
       const weakAnswer = !sources || !sources.length || (Number.isFinite(conf) && conf < 1.0);
+      const vaultReallyFailed = !sources || !sources.length || (Number.isFinite(conf) && conf < 0.10);
       // A mention hit (sentinel score 5.0 from the Mentions folder) means
       // the question is about an entity in the user's life, not a generic
       // topic. Skip external enrichment / web search — those would surface
@@ -1793,12 +1807,12 @@ async function send(question) {
       if (!hadProposal && sources && sources.length) {
         appendSources(turn, sources, conf);
       }
-      // appendRelated() sigue firing cuando el /api/related tiene items
-      // (YouTube videos relacionados). Aparece DEBAJO del cluster (si
-      // bypass) o del inline link (si no). No duplicamos el botón de
-      // YouTube: el cluster es un search link, appendRelated renderea
-      // videos específicos — semánticas distintas, ambos útiles.
-      if (!hadProposal && question && weakAnswer && !mentionMatched) {
+      // appendRelated() renderea YouTube videos específicos. Usamos el
+      // threshold ESTRICTO (vaultReallyFailed): solo si NO hay sources o
+      // conf < 0.10. Queries con respuesta correcta + confidence 0.1-1.0
+      // no deben disparar YouTube — el vault ya respondió bien y videos
+      // genéricos son ruido. Ver comentario arriba de los thresholds.
+      if (!hadProposal && question && vaultReallyFailed && !mentionMatched) {
         appendRelated(turn, question);
       }
       const feedbackBar = parsed.turn_id

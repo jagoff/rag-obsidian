@@ -58,6 +58,7 @@ rag archive [--apply --force --gate 20]    # move dead → 04-Archive/ (dry-run 
 rag morning [--dry-run]                    # daily brief → 05-Reviews/YYYY-MM-DD.md
 rag today [--dry-run]                      # EOD closure → 05-Reviews/YYYY-MM-DD-evening.md
 rag digest [--week YYYY-WNN --days N]      # weekly narrative → 05-Reviews/YYYY-WNN.md
+rag consolidate [--window-days 14 --threshold 0.75 --min-cluster 3 --dry-run --json]  # episodic memory Phase 2 → PARA
 
 # Ambient agent
 rag ambient status|disable|test [path]|log [-n N]

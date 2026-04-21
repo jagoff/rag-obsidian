@@ -1382,10 +1382,72 @@ def source_recency_multiplier(
     return float(_math.pow(2.0, -(age_days / halflife)))
 
 
+def _conv_dedup_window(
+    scored_pairs: list[tuple], *, window_s: float = 1800.0,
+) -> list[tuple]:
+    """Collapse WhatsApp (and `messages`) chunks within a time window
+    per `chat_jid`. Input: list of (candidate, expanded_text, score) tuples
+    sorted by score descending. Returns a filtered list preserving the
+    original order, dropping any WA/messages chunk whose `chat_jid`
+    already has a higher-scored representative within ±`window_s` of its
+    `first_ts`.
+
+    Rationale (design doc §3.3 option A): a single conversation can yield
+    5-10 adjacent chunks that all fire on the same query. Without dedup,
+    the top-k degenerates into "the same conversation shown 5 different
+    ways" and the LLM's context is filled with near-duplicates. Keeping
+    the top-scored chunk per conversation-window preserves granularity
+    ("the specific message where X said Y") while cutting noise.
+
+    Non-WA sources pass through unchanged — vault, calendar, gmail,
+    reminders either don't have this failure mode (vault is already deduped
+    by hash per file) or the window semantics don't apply (calendar events
+    are points in time, not windows).
+
+    Intentionally simple O(n²) scan per chat — the pool is capped at
+    ~RERANK_POOL_MAX so the constant factor is negligible (<1ms for 40
+    candidates).
+    """
+    if not scored_pairs:
+        return scored_pairs
+    # Per-chat: list of first_ts values already accepted. We compare each
+    # incoming WA candidate against these and skip if any is within window.
+    kept_by_chat: dict[str, list[float]] = {}
+    out: list[tuple] = []
+    for pair in scored_pairs:
+        candidate, expanded, score = pair
+        meta = candidate[1] if isinstance(candidate[1], dict) else {}
+        src = meta.get("source") or "vault"
+        # Only apply to conversational sources — WhatsApp today, SMS later.
+        if src not in ("whatsapp", "messages"):
+            out.append(pair)
+            continue
+        jid = meta.get("chat_jid") or meta.get("file") or ""
+        first_ts = meta.get("first_ts")
+        try:
+            first_ts = float(first_ts) if first_ts is not None else None
+        except (TypeError, ValueError):
+            first_ts = None
+        if not jid or first_ts is None:
+            # Missing metadata — can't dedup safely, keep the chunk.
+            out.append(pair)
+            continue
+        # Already accepted something in this chat within window?
+        accepted = kept_by_chat.get(jid, [])
+        if any(abs(first_ts - prior_ts) <= window_s for prior_ts in accepted):
+            continue
+        accepted.append(first_ts)
+        kept_by_chat[jid] = accepted
+        out.append(pair)
+    return out
+
+
+
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
 # Versioned independently from the main collection.
 _URLS_COLLECTION_BASE = "obsidian_urls_v1"
+
 # Per-vault suffix so multiple vaults don't share a collection.
 _vault_slug = hashlib.sha256(str(VAULT_PATH.resolve()).encode()).hexdigest()[:8]
 COLLECTION_NAME = (
@@ -10823,6 +10885,19 @@ def retrieve(
             final *= src_mult
         final_pairs.append((c, e, final))
     scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
+    # Conversational dedup (§3.3 option A) — WhatsApp chunks from the same
+    # chat within ±30min tend to echo each other (same turn, different
+    # framings). After rerank, collapse them by keeping only the top-scored
+    # one. This runs against scored_all (pre top-k slice) so the slice
+    # sees a diverse pool. Chats sampled one-per-window, sources other
+    # than WhatsApp untouched.
+    #
+    # 30min window is a best-guess gradual decay of conversational salience
+    # — a message referenced from 35min later is probably a distinct
+    # thought; same-minute follow-ups almost always are. No calibration
+    # against production yet (Phase 1.f).
+    if scored_all:
+        scored_all = _conv_dedup_window(scored_all, window_s=1800.0)
     scored = scored_all[:k]
     # `extras`: candidates beyond top-k, still reranker-ordered. Used by
     # `build_progressive_context` to avoid a redundant semantic col.query —

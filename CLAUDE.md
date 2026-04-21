@@ -6,7 +6,7 @@ Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 
-Fully local: Sqlite-vec + Ollama + sentence-transformers. No cloud calls.
+Fully local: Sqlite-vec + Ollama + sentence-transformers. **Exception**: Gmail + Calendar cross-source ingesters (Phase 1.b/c, pending) use OAuth Google via the Claude harness MCP — user override 2026-04-20, see `docs/design-cross-source-corpus.md §10.6`. WhatsApp + Reminders stay local (bridge SQLite + EventKit).
 
 ## Agent dispatch rule
 
@@ -35,8 +35,9 @@ uv tool install --reinstall --editable .   # reinstall after code changes
 
 # Core
 rag index [--reset] [--no-contradict]      # incremental hash-based; --reset rebuilds
+rag index --source whatsapp [--reset] [--since ISO] [--dry-run] [--max-chats N]  # WA ingester (Phase 1.a)
 rag watch                                  # watchdog auto-reindex (debounce 3s)
-rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain]
+rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain --source S[,S2]]
 rag chat [--counter --no-deep --session ID --resume] # /save /reindex (or NL) work; create-intent tool-calling (`recordame X`, `cumple de Y el viernes`)
 rag do "instrucción" [--yes --max-iterations 8]  # tool-calling agent loop
 rag stats                                  # models + index status
@@ -261,6 +262,28 @@ Never claim improvement without re-running `rag eval`. Helper LLM calls (`expand
 **HyDE with qwen2.5:3b drops singles hit@5 ~5pp**. HyDE is opt-in (`--hyde`); re-measure if helper model changes.
 
 **`seen_titles` in `reformulate_query` regressed chains** (2026-04-17). Injecting "notas ya consultadas: [...]" into the helper prompt as a diversity nudge dropped chains hit@5 −16pp (80→64) and chain_success −33pp (55.56→22.22). The helper treats the list as "avoid these" and drifts off-topic. The kwarg remains on the signature (callers in eval pass it via `_titles_from_paths`) but is intentionally unused in the prompt. Future: try as a soft *reranker* hint (penalty on already-seen chunks post-rerank) instead of an LLM instruction.
+
+## Cross-source corpus (Phase 1, in progress — 2026-04-20 decisions)
+
+The corpus is no longer vault-only. Per `docs/design-cross-source-corpus.md` + §10 user decisions, `retrieve()` is now source-aware and the sqlite-vec collection holds chunks from multiple sources via a `source` metadata discriminator. Collection stays at `obsidian_notes_v11` (no rename / no re-embed) — legacy vault rows without `source` are read as `"vault"` via `normalize_source()`.
+
+**Constants** (`rag.py:~1288`): `VALID_SOURCES` (frozenset of 6), `SOURCE_WEIGHTS` (vault 1.00 → WA 0.75), `SOURCE_RECENCY_HALFLIFE_DAYS` (None for vault/calendar, 30d for WA/messages, 90d for reminders, 180d for gmail), `SOURCE_RETENTION_DAYS` (None for vault/calendar/reminders, 180 for WA/messages, 365 for gmail).
+
+**Helpers**: `normalize_source(v, default="vault")` → safe legacy-row read; `source_weight(src)` → lookup + 0.50 fallback; `source_recency_multiplier(src, created_ts, now)` → exponential decay `2**-(age/halflife)` in [0,1], accepts epoch float or ISO-8601 string (Zulu Z), clamps future-ts at 1.0, None-halflife short-circuits to 1.0.
+
+**Scoring** (inside `retrieve()` post-rerank loop + in `apply_weighted_scores()` for eval parity): after the existing scoring formula produces `final`, multiply by `source_weight(src) * source_recency_multiplier(src, created_ts)`. Vault default → `1.0 * 1.0` = no-op. Old vault data completely untouched.
+
+**Filter** (retrieve/deep_retrieve/multi_retrieve `source` kwarg + `rag query --source S[,S2]`): string or iterable of strings; restricts candidate pool post-rerank. Unknown sources from the CLI are rejected upfront with a helpful error. Legacy vault path: `source=None` or `source="vault"` → identical to pre-Phase-1 behavior.
+
+**Conversational dedup** (`_conv_dedup_window`, applied post-scoring pre top-k slice): collapses WhatsApp/messages chunks from the same `chat_jid` within a ±30min window — keeps only the highest-scored. Non-WA sources pass through unchanged. Intentionally simple O(n²) — pool is capped at `RERANK_POOL_MAX`, constant factor negligible.
+
+### WhatsApp ingester — Phase 1.a (`scripts/ingest_whatsapp.py`, `rag index --source whatsapp`)
+
+Reads from `~/repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db` in read-only immutable mode. Filters empty content, `status@broadcast` pseudo-chat, and anything older than 180d. Timestamps (Go RFC3339 with nanoseconds / Z suffix / numeric) parsed defensively. Conversational chunking (§2.6 option A): groups same-sender contiguous messages within 5min windows; splits on speaker change OR >=5min gap OR >800 chars; merges undersized groups (<150 chars) into temporally-nearest neighbor in the same chat. Parent window ±10 messages, 1200 char cap. Embed prefix `[source=whatsapp | chat=X | from=Y] {body}`; display text stays raw. doc_ids are `whatsapp://{chat_jid}/{first_msg_id}::{idx}` — stable across bridge DB compactions. Idempotent upsert (delete prior by `file` key + add). Incremental cursor in `rag_whatsapp_state(chat_jid, last_ts, last_msg_id)`; `--reset` wipes, `--since ISO` overrides uniformly. CLI flags: `--bridge-db`, `--since`, `--reset`, `--max-chats`, `--max-messages`, `--dry-run`, `--json`.
+
+### Upcoming (declared order): Calendar, Gmail, Reminders
+
+Per user §10.1 — WhatsApp done, next is Calendar (§10.6 OAuth path), then Gmail, then Reminders. Re-calibration of threshold per source + eval baseline (§10.8 + §11 phase 1.f) is deferred until all 4 sources land so it runs against the full cross-source mix.
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 

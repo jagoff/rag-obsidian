@@ -540,6 +540,16 @@ def _warmup() -> None:
     _ensure_home_prewarmer()
     _ensure_chat_model_prewarmer()
 
+    # Memory-pressure watchdog — evita beachballs si el server + otras apps
+    # saturan los 36 GB unified memory. Fires keep_alive=0 sobre el chat
+    # model a los >85%, force-unload del reranker si sigue alto. Ver doc
+    # extensa en rag.py alrededor de `_system_memory_used_pct()`.
+    try:
+        from rag import start_memory_pressure_watchdog
+        start_memory_pressure_watchdog()
+    except Exception as _exc:
+        print(f"[warmup] memory-pressure watchdog skipped: {_exc}", flush=True)
+
     def _do_warmup() -> None:
         try:
             from rag import get_db_for

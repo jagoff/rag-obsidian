@@ -8597,10 +8597,18 @@ def get_reranker():
     return _reranker
 
 
-def maybe_unload_reranker() -> bool:
+def maybe_unload_reranker(force: bool = False) -> bool:
     """Drop the reranker from MPS if it hasn't been used in
     `_RERANKER_IDLE_TTL` seconds. Call from a background sweeper.
     Returns True if an unload happened.
+
+    Args:
+        force: bypass the idle check. Used by the memory-pressure watchdog
+            (`_handle_memory_pressure`) under macOS RAM pressure, where
+            freeing ~300 MB of wired MPS memory is more valuable than
+            avoiding the next cold reload. Concurrent `predict()` holds a
+            local ref so it won't crash mid-flight — the next query just
+            pays a 5s cold load.
 
     Idle check + unload happen atomically under `_reranker_lock` — reading
     `_reranker_last_use` outside the lock would race with `get_reranker`
@@ -8612,7 +8620,7 @@ def maybe_unload_reranker() -> bool:
     with _reranker_lock:
         if _reranker is None:
             return False
-        if time.time() - _reranker_last_use < _RERANKER_IDLE_TTL:
+        if not force and time.time() - _reranker_last_use < _RERANKER_IDLE_TTL:
             return False
         try:
             import gc
@@ -8636,6 +8644,216 @@ def maybe_unload_reranker() -> bool:
             # a fresh one while the old one leaks until GC catches it.
             _silent_log("reranker_unload", exc)
     return True
+
+
+# ── Memory-pressure watchdog ──────────────────────────────────────────────
+# Background daemon que monitorea la presión de memoria del sistema y
+# proactivamente descarga modelos de VRAM cuando pasa un umbral.
+#
+# Motivación (2026-04-21 post-commit `3ef6645` + `982f9cb`):
+# `chat_keep_alive()` ya protege del caso "modelo grande pineado forever"
+# (auto-clamp a "20m" si el chat model es command-r / qwen3:30b-a3b). Pero
+# queda un edge case: usuario corriendo simultáneamente `rag do` + web +
+# otras apps pesadas satura los 36 GB unified igualmente, porque:
+#   (a) `OLLAMA_MAX_LOADED_MODELS=2` NO es VRAM-aware — permite 2 slots sin
+#       chequear si la suma cabe en RAM (ollama documented behaviour).
+#   (b) Helper model + embed model + chat model + reranker ocupan ~8 GB
+#       pinned forever; si además el usuario abre Claude Code + Chrome con
+#       50 tabs, wired + compressed + active puede empujar a >90% usage y
+#       triggerear el beachball incluso con qwen2.5:7b como default.
+#
+# Solución: thread daemon que muestrea `vm_stat` + `sysctl hw.memsize` cada
+# `RAG_MEMORY_PRESSURE_INTERVAL` segundos (default 60s). Si el pct used ≥
+# `RAG_MEMORY_PRESSURE_THRESHOLD` (default 85%), escala:
+#   1. Ollama chat model → keep_alive=0 (unload). Libera ~4.7 GB (qwen2.5:7b).
+#   2. Re-chequea; si sigue alto, `maybe_unload_reranker(force=True)`.
+#      Libera ~300 MB de MPS.
+#
+# CLI one-shot (rag query / chat / do que terminan en <60s) NO dispara el
+# watchdog — no hay contención real y el overhead del thread no aporta.
+# Solo long-running daemons (`rag serve`, web server) lo arrancan.
+#
+# Env vars:
+#   - RAG_MEMORY_PRESSURE_DISABLE=1   → no arrancar watchdog (testing / CI)
+#   - RAG_MEMORY_PRESSURE_THRESHOLD=N → umbral % (default 85)
+#   - RAG_MEMORY_PRESSURE_INTERVAL=N  → sampling cada N segundos (default 60)
+
+_memory_watchdog_started = False
+_memory_watchdog_lock = threading.Lock()
+
+
+def _system_memory_used_pct() -> float | None:
+    """Return macOS system memory usage as % used, or None si no se puede medir.
+
+    Fórmula: (wired + active + compressed) / total_bytes.
+    Excluye "free" + "inactive" (macOS los cuenta como disponibles para
+    reclaim — inactive es page cache + dirty reusable). Este cálculo mide
+    la memoria REALMENTE comprometida — si sube >85% el kernel empieza
+    a swappear agresivo y dispara beachballs.
+
+    Zero-dep: shell-outs a `vm_stat` + `sysctl hw.memsize` (ambos ship
+    con macOS). psutil no está en pyproject.toml a propósito (evita
+    agregar dep binaria para un solo uso).
+
+    Linux / otros: fallback a None — el watchdog se desactiva silencioso.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        vm_out = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=2, check=False,
+        ).stdout
+        total_out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=2, check=False,
+        ).stdout
+        total_bytes = int(total_out.strip())
+        if total_bytes <= 0:
+            return None
+        page_size = 4096
+        stats: dict[str, float] = {}
+        for line in vm_out.splitlines():
+            if "page size of" in line:
+                m = re.search(r"page size of (\d+)", line)
+                if m:
+                    page_size = int(m.group(1))
+                continue
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            val = val.strip().rstrip(".")
+            try:
+                stats[key.strip()] = float(val)
+            except ValueError:
+                continue
+        wired = stats.get("Pages wired down", 0) * page_size
+        active = stats.get("Pages active", 0) * page_size
+        compressed = stats.get("Pages occupied by compressor", 0) * page_size
+        used = wired + active + compressed
+        return (used / total_bytes) * 100.0
+    except Exception:
+        return None
+
+
+def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
+    """Respuesta escalonada a un evento de memory pressure.
+
+    Paso 1: unload del chat model vía ollama keep_alive=0.
+    Paso 2: re-medir; si sigue ≥ threshold, force-unload del reranker.
+
+    Ambos pasos son best-effort — cualquier excepción se loggea y el
+    watchdog sigue corriendo. Retorna un dict con lo que se hizo, útil
+    para tests y métricas futuras.
+    """
+    actions: dict = {
+        "pct_before": round(pct_before, 2),
+        "threshold": threshold,
+        "chat_unloaded": False,
+        "reranker_unloaded": False,
+        "chat_model": None,
+        "pct_after_chat": None,
+        "pct_after_reranker": None,
+    }
+
+    # Paso 1: chat model
+    try:
+        chat_model = resolve_chat_model()
+    except RuntimeError:
+        chat_model = None
+    actions["chat_model"] = chat_model
+    if chat_model:
+        try:
+            import ollama as _ollama
+            _ollama.chat(
+                model=chat_model,
+                messages=[{"role": "user", "content": "."}],
+                options={"num_predict": 1},
+                keep_alive=0,
+            )
+            actions["chat_unloaded"] = True
+        except Exception as exc:
+            _silent_log("memory_watchdog_unload_chat", exc)
+
+    # Paso 2: re-medir y decidir reranker
+    pct_after = _system_memory_used_pct()
+    actions["pct_after_chat"] = round(pct_after, 2) if pct_after is not None else None
+    if pct_after is not None and pct_after >= threshold:
+        try:
+            if maybe_unload_reranker(force=True):
+                actions["reranker_unloaded"] = True
+            pct_after2 = _system_memory_used_pct()
+            actions["pct_after_reranker"] = round(pct_after2, 2) if pct_after2 is not None else None
+        except Exception as exc:
+            _silent_log("memory_watchdog_unload_reranker", exc)
+    return actions
+
+
+def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
+    """Loop del thread daemon. Corre hasta que el proceso termina."""
+    while True:
+        try:
+            time.sleep(interval)
+            pct = _system_memory_used_pct()
+            if pct is None:
+                continue
+            if pct >= threshold:
+                actions = _handle_memory_pressure(pct, threshold)
+                # Emitir evento visible en stderr para debug. No SQL porque
+                # la tabla rag_memory_metrics está reservada para muestreos
+                # periódicos del web dashboard (distinct concern).
+                print(
+                    f"[memory-watchdog] pressure={actions['pct_before']}% "
+                    f"threshold={threshold}% "
+                    f"chat_unloaded={actions['chat_unloaded']} "
+                    f"reranker_unloaded={actions['reranker_unloaded']} "
+                    f"pct_after={actions.get('pct_after_chat')}%",
+                    flush=True,
+                )
+        except Exception as exc:
+            _silent_log("memory_watchdog_loop", exc)
+
+
+def start_memory_pressure_watchdog() -> bool:
+    """Arrancar el watchdog como daemon thread. Idempotente.
+
+    Retorna True si se arrancó (o ya estaba arrancado), False si se
+    skippeó por `RAG_MEMORY_PRESSURE_DISABLE=1` o por plataforma no-darwin.
+
+    Llamar desde el startup de long-running processes: `rag serve`, web
+    server FastAPI startup, ambient agent daemon. El CLI one-shot NO
+    necesita el watchdog (el proceso termina antes del primer tick).
+    """
+    global _memory_watchdog_started
+    with _memory_watchdog_lock:
+        if _memory_watchdog_started:
+            return True
+        if os.environ.get("RAG_MEMORY_PRESSURE_DISABLE") == "1":
+            return False
+        if sys.platform != "darwin":
+            # `_system_memory_used_pct` devuelve None en no-darwin — sin
+            # métrica, el watchdog es un no-op que gasta un thread.
+            return False
+        try:
+            threshold = float(os.environ.get("RAG_MEMORY_PRESSURE_THRESHOLD", "85"))
+        except ValueError:
+            threshold = 85.0
+        try:
+            interval = int(os.environ.get("RAG_MEMORY_PRESSURE_INTERVAL", "60"))
+        except ValueError:
+            interval = 60
+        t = threading.Thread(
+            target=_memory_pressure_watchdog_loop,
+            args=(threshold, interval),
+            name="rag-memory-watchdog",
+            daemon=True,
+        )
+        t.start()
+        _memory_watchdog_started = True
+        print(
+            f"[memory-watchdog] started threshold={threshold}% interval={interval}s",
+            flush=True,
+        )
+        return True
 
 
 def warmup_async() -> None:
@@ -30202,6 +30420,11 @@ def serve(host: str, port: int):
     except Exception:
         pass  # Best-effort; si falla la primera query paga el costo.
     console.print("[green]All models warm.[/green]")
+
+    # Arrancar el memory-pressure watchdog — evita beachballs si `rag do` +
+    # web server + otras apps saturan los 36 GB mientras serve está corriendo.
+    # Ver comentario extenso arriba de `_system_memory_used_pct()`.
+    start_memory_pressure_watchdog()
 
     # ── Response cache — queries repetidas instantáneas ─────────────────────
     # WA users retype consultas idénticas ("llueve hoy?", "test") con alta

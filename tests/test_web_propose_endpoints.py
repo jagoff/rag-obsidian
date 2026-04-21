@@ -210,6 +210,20 @@ def test_calendar_create_creator_fails(client, monkeypatch):
     "mañana pasa el plomero a casa",
     "el jueves llega mi vieja",
     "mañana viene mi hermana a casa",
+    # NEW 2026-04-21: declaration with explicit clock time. Regression
+    # after the Fer F. web-chat report: "el viernes 20hs tengo que ir de
+    # Seba" slipped through every branch and got a generic RAG response
+    # instead of a propose card. Branch 4 now catches any
+    # (temporal anchor + explicit time) even without an event noun /
+    # visit verb. "el jueves a las 4" moved here from negative — it used
+    # to be flagged ambiguous, but the preview + confirm UX downstream
+    # lets the user cancel if it wasn't what they meant.
+    "el viernes 20hs tengo que ir de Seba",
+    "el lunes a las 10am dentista",
+    "hoy 18hs parte el vuelo",
+    "el jueves a las 4",
+    "el miércoles a las 9 voy al médico",
+    "mañana a las 15:30",
 ])
 def test_detect_propose_intent_positive(q):
     assert web_server._detect_propose_intent(q) is True
@@ -228,10 +242,17 @@ def test_detect_propose_intent_positive(q):
     "quién viene mañana",
     "quiénes vienen el jueves",
     "cuándo viene el plomero",
+    # NEW: `¿`-prefixed question form (rioplatense); _QUESTION_START_RE
+    # didn't accept the opening mark pre-fix so these used to slip in.
+    "¿qué hago el viernes 20hs?",
+    "¿cuándo pasa Grecia?",
     # Bare event noun without temporal → not enough signal
     "tengo reunión",
-    # Temporal without event noun or visit pattern → ambiguous
-    "el jueves a las 4",
+    # Temporal without event noun / visit pattern / explicit time → still
+    # ambiguous. "el viernes compromiso" names something but gives no
+    # clock, so branch 4 declines.
+    "el viernes compromiso",
+    "el viernes tengo algo",
     "",
     None,
 ])

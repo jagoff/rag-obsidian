@@ -26,6 +26,17 @@ feature proposal: if <30% of edges carry a verb like `implementa`,
   When to run: before committing to any graph-edge typing work.
   Sampling + `--window N` lets you probe different context widths.
 
+### `calibrate_thresholds.py`
+Empirical percentile distribution of `top_score` over `rag_queries`
+for the last N days (default 30). Reports where each hardcoded gate
+(`CONFIDENCE_RERANK_MIN`, `CONFIDENCE_DEEP_THRESHOLD`,
+`GRAPH_EXPANSION_GATE`) sits in the distribution, plus the observed
+rates of `gated_low_confidence`, `bad_citations`, `critique_changed`.
+
+  When to run: before tweaking any confidence gate in `rag.py`, to
+  verify the proposed value isn't too aggressive on the current
+  corpus. Read-only; does not modify anything.
+
 ## Vault structural audits (PARA flow)
 
 Four interlocking scripts that audit vault organisation against the

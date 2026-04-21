@@ -444,12 +444,17 @@ def test_speaker_label_resolves_dossier_name(tmp_path, monkeypatch) -> None:
 
 
 def test_speaker_label_masks_unmapped_phone(tmp_path, monkeypatch) -> None:
-    """JID sin dossier match → last-4 masked ('…3891'), NOT full JID."""
+    """JID sin dossier match + sin Contacts match → last-4 masked ('…3891').
+    Mockea Apple Contacts al vacío para que el test no dependa del address
+    book del host (que sí tiene a Maria en el entorno del autor)."""
     mentions = tmp_path / "04-Archive/99-obsidian-system/99-Mentions"
     mentions.mkdir(parents=True)  # empty folder, no dossiers
     rag._phone_index_cache = None
     rag._mentions_cache = None
+    rag._contacts_phone_index = None
     monkeypatch.setattr(rag, "VAULT_PATH", tmp_path)
+    # No dossier AND no Contacts match → mask fallback fires.
+    monkeypatch.setattr(rag, "_load_contacts_phone_index", lambda ttl_s=86400: {})
 
     m = _mk_speaker_msg(sender="5493424303891@s.whatsapp.net", chat_name="desconocido")
     label = iw._speaker_label(m)
@@ -460,6 +465,7 @@ def test_speaker_label_masks_unmapped_phone(tmp_path, monkeypatch) -> None:
 
     rag._phone_index_cache = None
     rag._mentions_cache = None
+    rag._contacts_phone_index = None
 
 
 def test_speaker_label_empty_sender_falls_back_to_chat_name(tmp_path, monkeypatch) -> None:

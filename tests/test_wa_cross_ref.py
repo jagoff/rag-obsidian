@@ -613,11 +613,19 @@ def test_fetch_contact_by_phone_short_digits_skips(monkeypatch):
     assert called == [], "short digits must skip the index load"
 
 
-def test_contacts_phone_index_caches_per_ttl(monkeypatch):
+def test_contacts_phone_index_caches_per_ttl(monkeypatch, tmp_path):
     """Index is built once per TTL. Subsequent calls within the window
-    reuse the cached dict without re-running osascript."""
+    reuse the cached dict without re-running osascript.
+
+    Isolates from the real disk cache at `~/.local/share/obsidian-rag/
+    contacts_phone_index.json` by redirecting `_CONTACTS_PHONE_INDEX_PATH`
+    to a tmp file that doesn't exist — forces tier 3 (osascript) to fire
+    on the first call so the call_count assertion is meaningful.
+    """
     rag._contacts_phone_index = None
     rag._contacts_cache.clear()
+    # Redirect disk cache to non-existent tmp path (tier 2 miss → tier 3 runs).
+    monkeypatch.setattr(rag, "_CONTACTS_PHONE_INDEX_PATH", tmp_path / "no-such-cache.json")
     call_count = {"n": 0}
 
     def _fake_subprocess_run(cmd, capture_output=False, text=False, timeout=None):

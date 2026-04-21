@@ -91,11 +91,12 @@ def test_keeps_both_paraphrases_when_nouns_preserved(fake_ollama):
 
 def test_query_without_proper_nouns_keeps_all_paraphrases(fake_ollama):
     # Sin nombres propios no hay guardrail; lo que devuelva qwen queda.
+    # Query de 4+ tokens para pasar el gate corto.
     fake_ollama["next_response"] = (
         "qué tal va todo hoy?\n"
         "cómo anda el día?"
     )
-    variants = rag.expand_queries("qué hora es?")
+    variants = rag.expand_queries("qué tal anda todo hoy?")
     assert len(variants) == 3   # original + 2
 
 
@@ -118,3 +119,43 @@ def test_deduplicates_echo_of_original(fake_ollama):
     assert variants[0] == "qué usa Adam Jones?"
     assert len(variants) == 2
     assert "rig" in variants[1]
+
+
+# ── Short-query gate (perf) ───────────────────────────────────────────────────
+# El costo del helper qwen2.5:3b (~1-3s) no se amortiza en queries cortas: el
+# recall marginal es chico y el usuario percibe la latencia. Gate actual: saltar
+# cuando la query tiene <4 tokens ("qué hora es?", "dame resumen", "llueve?").
+# Cuatro tokens o más disparan la expansión como antes.
+
+
+@pytest.mark.parametrize("short_query", [
+    "llueve?",
+    "qué hora es?",
+    "dame resumen hoy",
+])
+def test_skips_expansion_for_short_queries(short_query, fake_ollama):
+    """Queries de ≤3 tokens devuelven solo el original — NO llaman al LLM."""
+    called = {"n": 0}
+
+    def counting_chat(**kwargs):
+        called["n"] += 1
+        return type("R", (), {"message": type("M", (), {"content": "p1\np2"})()})()
+
+    fake_ollama["next_response"] = "dummy\nresponse"
+    # Override fake_chat for this test to count calls
+    import rag as _rag
+    _rag.ollama.chat = counting_chat
+
+    variants = rag.expand_queries(short_query)
+    assert variants == [short_query]
+    assert called["n"] == 0, f"LLM no debería llamarse para '{short_query}'"
+
+
+def test_expands_queries_with_4_plus_tokens(fake_ollama):
+    """Queries de 4+ tokens sí disparan la expansión."""
+    fake_ollama["next_response"] = (
+        "reformulación alternativa uno\n"
+        "reformulación alternativa dos"
+    )
+    variants = rag.expand_queries("qué tal anda todo")  # 4 tokens
+    assert len(variants) == 3  # original + 2 paráfrasis

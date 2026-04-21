@@ -7811,6 +7811,15 @@ _EXPAND_CACHE_MAX = 256
 _expand_cache: "dict[str, list[str]]" = {}
 _expand_cache_lock = threading.Lock()
 
+# Perf gate — queries con MENOS de este nº de tokens se saltan la expansión
+# (el helper qwen2.5:3b cuesta 1-3s y aporta recall marginal sobre queries
+# cortas tipo "qué hora es", "dame resumen hoy", "llueve?"). Umbral subido
+# de 3 → 4 tras bench 2026-04-21: el web server ya desactivaba multi-query
+# entero (`web/server.py:3648`) porque "sólo mejora recall marginalmente en
+# chat-style questions"; esto es el mismo argumento pero aplicado caso-por-caso
+# en CLI. Override con env var si hace falta recalibrar.
+_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "4"))
+
 
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
@@ -7820,12 +7829,13 @@ def expand_queries(question: str) -> list[str]:
     paráfrasis que droppean tokens propios del original. Sin esto, qwen2.5:3b
     generaba 'el actor Adam Jones' / 'el intérprete X', desviando el recall.
 
-    Perf gate: queries de 1-2 tokens se saltan la expansión — el LLM helper
-    aporta poco recall marginal sobre queries tan cortas (e.g. "llueve?",
-    "test") contra el costo de 1-3s por call.
+    Perf gate: queries con ``len(tokens) < _EXPAND_MIN_TOKENS`` (default 4) se
+    saltan la expansión — el LLM helper aporta poco recall marginal sobre
+    queries tan cortas (e.g. "llueve?", "qué hora es?", "dame resumen hoy")
+    contra el costo de 1-3s por call. Ajustable vía ``RAG_EXPAND_MIN_TOKENS``.
     """
     tokens = question.strip().split()
-    if len(tokens) <= 2:
+    if len(tokens) < _EXPAND_MIN_TOKENS:
         return [question]
     with _expand_cache_lock:
         hit = _expand_cache.get(question)

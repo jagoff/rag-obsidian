@@ -51,7 +51,7 @@ import unicodedata
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -2404,6 +2404,7 @@ class RankerWeights:
               + recency_cue        * recency_raw      [si has_recency_cue]
               + recency_always     * recency_raw      [siempre]
               + tag_literal        * n_tag_matches    [tags literales en la query]
+              + title_match        * coverage_query   [filename/title overlap]
               + graph_pagerank     * (pr/max_pr)      [wikilink authority]
               + click_prior        * ctr_path         [behavior: path CTR]
               + click_prior_folder * ctr_folder       [behavior: folder CTR]
@@ -2414,11 +2415,16 @@ class RankerWeights:
                 where ramp(c, f) = max(0, (c - f) / (1 - f))
                 and floor = weights.feedback_match_floor (default 0.80, tunable)
 
-    New behavior knobs default to 0.0 — inert until rag tune learns weights.
-    Backward compatible: old ranker.json without these keys falls back to 0.0.
+    `title_match` default 0.15 (no-zero): señal estructural, no aprendida —
+    arranca activo desde el día uno para rescatar notas con título match pero
+    body pobre (ej. notas tipo link-hub). Tuneable via `rag tune` igual que
+    el resto; rango en `_TUNE_SPACE`.
+
+    Otros behavior knobs default 0.0 — inert until rag tune learns weights.
+    Backward compatible: old ranker.json without these keys falls back to defaults.
     """
     __slots__ = (
-        "recency_cue", "recency_always", "tag_literal",
+        "recency_cue", "recency_always", "tag_literal", "title_match",
         "feedback_pos", "feedback_neg", "feedback_match_floor", "graph_pagerank",
         "click_prior", "click_prior_folder", "click_prior_hour", "dwell_score",
     )
@@ -2428,6 +2434,7 @@ class RankerWeights:
         recency_cue: float = 0.1,
         recency_always: float = 0.0,
         tag_literal: float = 0.0,
+        title_match: float = 0.15,
         feedback_pos: float = FEEDBACK_POSITIVE_BOOST,
         feedback_neg: float = FEEDBACK_NEGATIVE_PENALTY,
         feedback_match_floor: float = 0.80,
@@ -2440,6 +2447,7 @@ class RankerWeights:
         self.recency_cue = float(recency_cue)
         self.recency_always = float(recency_always)
         self.tag_literal = float(tag_literal)
+        self.title_match = float(title_match)
         self.feedback_pos = float(feedback_pos)
         self.feedback_neg = float(feedback_neg)
         self.feedback_match_floor = float(feedback_match_floor)
@@ -2516,6 +2524,126 @@ def get_ranker_weights() -> RankerWeights:
 def _invalidate_ranker_weights() -> None:
     global _ranker_weights_cache
     _ranker_weights_cache = None
+
+
+# Stopwords ES+EN usadas por `_tokenize_for_title_match` para que queries con
+# palabras funcionales ("en qué cycle estamos?") no inflen el score. Lista
+# mínima — solo palabras de alta frecuencia y poca carga semántica; hacer
+# más exhaustiva baja la sensitividad del boost para queries naturales. No
+# incluye "cycle"/"cycles" ni palabras que podrían ser parte de un título.
+_TITLE_MATCH_STOPWORDS = frozenset({
+    # Spanish: determinantes, conjunciones, preposiciones, WH, auxiliares
+    "de", "del", "la", "las", "el", "los", "un", "una", "unos", "unas",
+    "en", "al", "que", "qué", "como", "cómo", "cuando", "cuándo",
+    "donde", "dónde", "quien", "quién", "cual", "cuál", "por", "para",
+    "con", "sin", "sobre", "entre", "hasta", "desde", "es", "son",
+    "esta", "este", "estos", "estas", "ese", "esa", "esos", "esas",
+    "aca", "alla", "aqui", "aquella", "aquel", "aquellos", "aquellas",
+    "no", "si", "sí", "mas", "más", "muy", "tambien", "también",
+    "se", "le", "les", "me", "te", "nos", "os", "yo", "tu", "vos",
+    "mi", "mis", "tus", "su", "sus", "ya", "muy",
+    # English: determiners, conjunctions, prepositions, WH, auxiliaries
+    "of", "the", "an", "to", "at", "on", "for", "with", "from", "as",
+    "by", "into", "out", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "what", "how", "when", "where",
+    "who", "whom", "which", "this", "these", "those", "my", "your",
+    "his", "her", "its", "our", "their", "it", "and", "or", "but",
+    "so", "if", "then", "than", "there", "here", "there",
+})
+
+
+def _tokenize_for_title_match(text: str) -> set[str]:
+    """Normalize `text` → set of significant tokens for title/filename match.
+
+    Pipeline: lowercase → NFD accent-strip → split on non-alphanumeric
+    (handles `-`, `_`, spaces, punctuation) → drop tokens <2 chars →
+    drop ES/EN stopwords. Returns a set; order doesn't matter for the
+    coverage score computed by `_title_match_score`.
+    """
+    if not text:
+        return set()
+    n = unicodedata.normalize("NFD", text.lower())
+    stripped = "".join(c for c in n if not unicodedata.combining(c))
+    tokens = re.split(r"[^a-z0-9]+", stripped)
+    return {
+        t for t in tokens
+        if len(t) >= 2 and t not in _TITLE_MATCH_STOPWORDS
+    }
+
+
+def _title_match_score(query: str, meta: dict) -> float:
+    """Coverage en [0.0, 1.0] — fracción de tokens significativos del
+    `query` que aparecen en el filename stem, note title, o project
+    folder del `meta`.
+
+    Motivación (medido 2026-04-21): el rerank (bge-reranker-v2-m3) scorea
+    primariamente por contenido del body. Una nota cuyo filename/title
+    es match semántico para el query pero cuyo body es flaco (ej.
+    `dev cycles.md` = link + embed de imagen) recibe rerank score ~0.0
+    y cae por debajo del confidence gate (CONFIDENCE_RERANK_MIN). El
+    boost `title_match` recupera estas notas sumando al score final una
+    fracción proporcional a la coverage filename/title.
+
+    Reglas de matching:
+      - Ambos lados lowercased + accent-folded (NFD strip).
+      - Tokens split por non-alphanumerics (dev-cycles → {dev, cycles}).
+      - Stopwords ES+EN removidas de ambos lados (ver `_TITLE_MATCH_STOPWORDS`).
+      - Tokens <2 chars descartados (noise floor).
+      - Prefix match ≥4 chars: maneja plurales simples (cycle ↔ cycles),
+        sufijos comunes. Tokens cortos requieren match exacto.
+      - Coverage es sobre tokens del QUERY (qué fracción de lo que el
+        user pregunta está en el title), no sobre los del title.
+          - "cycles" vs "dev cycles" → 1.0 (todos los query tokens match)
+          - "en qué cycle estamos" vs "dev cycles" → 0.5 (cycle match,
+            estamos no; en/qué son stopwords y no cuentan)
+      - Segmentos de path: solo se incluyen los middle segments cuando
+        depth ≥ 3 (ej. `01-Projects/aws-tagging/_index.md` → `aws-tagging`
+        sí cuenta porque es el proyecto; `03-Resources/dev.md` → `03-Resources`
+        NO cuenta porque es folder top-level taxonómico PARA).
+
+    Returns 0.0 on empty query, empty/none file+note, or zero overlap.
+    """
+    if not query or not query.strip():
+        return 0.0
+    q_tokens = _tokenize_for_title_match(query)
+    if not q_tokens:
+        return 0.0
+
+    raw_file = meta.get("file") or ""
+    path_obj = PurePosixPath(raw_file) if raw_file else None
+    stem = path_obj.stem if path_obj else ""
+    title = meta.get("note") or ""
+
+    title_parts: list[str] = [stem, title]
+    # Middle path segments (proyectos): depth ≥ 3 → include parts[1:-1].
+    # Path `01-Projects/aws-tagging/_index.md`.parts = ("01-Projects",
+    # "aws-tagging", "_index.md") → middle = ("aws-tagging",). Depth 2
+    # (`03-Resources/dev.md`) NO incluye el top-level folder — es
+    # taxonomy PARA, no señal semántica de título.
+    if path_obj is not None and len(path_obj.parts) >= 3:
+        title_parts.extend(path_obj.parts[1:-1])
+
+    t_tokens: set[str] = set()
+    for part in title_parts:
+        t_tokens |= _tokenize_for_title_match(part)
+    if not t_tokens:
+        return 0.0
+
+    matched = 0
+    for q in q_tokens:
+        for t in t_tokens:
+            if q == t:
+                matched += 1
+                break
+            # Prefix match ≥4 chars: cycle ↔ cycles, reporte ↔ reportes,
+            # project ↔ projection (ambos dirección, ambiguo pero raro).
+            if (
+                len(q) >= 4 and len(t) >= 4
+                and q.startswith(t[:4]) and t.startswith(q[:4])
+            ):
+                matched += 1
+                break
+    return matched / len(q_tokens)
 
 
 def match_literal_tags(question: str, tag_vocab: set[str]) -> set[str]:
@@ -11943,6 +12071,15 @@ def retrieve(
                 # the tag boost contributes at most `weights.tag_literal` to
                 # the final score regardless of how many tags matched.
                 final += weights.tag_literal * min(n_matches / TAG_HITS_NORM_CAP, 1.0)
+        # Title/filename coverage boost: rescata notas cuyo filename o title
+        # matchea semánticamente el query pero cuyo body tiene poca señal
+        # (ej. link-hub notes como `dev cycles.md` = link + embed de imagen).
+        # Gate por weight > 0 para que el cálculo se skipee cuando el
+        # usuario deshabilita el boost via `rag tune` (defensivo).
+        if weights.title_match:
+            _tm = _title_match_score(question, meta)
+            if _tm > 0.0:
+                final += weights.title_match * _tm
         # Graph PageRank: notes with more inbound wikilinks are more
         # authoritative. Score is normalised [0,1] via rank/max_rank.
         if weights.graph_pagerank and pagerank:
@@ -12490,6 +12627,10 @@ def collect_ranker_features(
             "rerank": float(s),
             "recency_raw": float(rec_raw),
             "tag_hits": int(n_tag),
+            # Title/filename coverage — pure function del query + meta,
+            # precomputable igual que el resto de features. Se consume en
+            # apply_weighted_scores gated por weights.title_match.
+            "title_match": float(_title_match_score(question, meta)),
             "fb_pos_cos": float(boost_paths.get(path, 0.0)),
             "fb_neg_cos": float(penalty_paths.get(path, 0.0)),
             "ignored": path in ignored_set,
@@ -12527,6 +12668,10 @@ def apply_weighted_scores(
         if weights.tag_literal and f["tag_hits"]:
             # Same normalisation as retrieve(): cap at TAG_HITS_NORM_CAP.
             score += weights.tag_literal * min(f["tag_hits"] / TAG_HITS_NORM_CAP, 1.0)
+        if weights.title_match and f.get("title_match"):
+            # Paridad con retrieve(): coverage ya está en [0,1] (fracción de
+            # query tokens matcheadas), no necesita normalización adicional.
+            score += weights.title_match * f["title_match"]
         if weights.graph_pagerank and f.get("graph_pagerank"):
             score += weights.graph_pagerank * f["graph_pagerank"]
         if weights.click_prior and f.get("click_prior"):
@@ -17106,6 +17251,7 @@ _TUNE_SPACE = {
     "recency_cue":        (0.0, 0.35),   # default 0.10
     "recency_always":     (0.0, 0.10),   # default 0.00 (new signal)
     "tag_literal":        (0.0, 0.20),   # default 0.00 (new signal)
+    "title_match":        (0.0, 0.40),   # default 0.15 — filename/title coverage boost
     "feedback_pos":       (0.0, 0.15),   # default 0.03
     "feedback_neg":       (0.0, 0.50),   # default 0.15
     "feedback_match_floor": (0.60, 0.95),  # default 0.80 — soft ramp floor; preserves pre-refactor hard-gate behavior at default

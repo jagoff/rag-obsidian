@@ -22139,6 +22139,302 @@ def _fetch_whatsapp_window(
     return out[:WA_TASKS_MAX_CHATS]
 
 
+# ── WhatsApp cross-reference for entity queries ─────────────────────────────
+# When the user asks about a person from 99-Mentions/ (e.g. "qué sabés de
+# Grecia"), surface the last N WhatsApp messages where that person is the
+# chat name or appears in the content. If any message carries a parseable
+# datetime commitment ("nos vemos mañana 19hs"), produce a propose payload
+# so the UI can offer to create a reminder/calendar event inline.
+#
+# Design choices:
+#   - Read directly from the bridge SQLite (ro). The vault index is
+#     15-min stale; the bridge is seconds fresh. Tradeoff: we can't
+#     ride the RAG relevance signal, but for "última actividad con X"
+#     freshness matters more than semantic similarity.
+#   - Match on chat name first (exact), content second (substring).
+#     Chat-name matches are always more relevant than content hits
+#     because they're 1:1 (a chat called "Grecia" is probably the
+#     direct chat with her), whereas content hits may mention her
+#     in passing in a group.
+#   - Cap at WA_CROSS_REF_LIMIT (3) — the user picked "últimos 3, sin
+#     filtro temporal" in the UX round, so no `since` clause.
+#   - Propose uses the SAME `_parse_natural_datetime` + `_has_explicit_time`
+#     already wired to the /chat tool-calling surface, so the render
+#     matches the inline create-intent chips from web + CLI chat.
+
+WA_CROSS_REF_LIMIT = 3
+
+
+def _parse_mention_dossier(rel_path: str, vault_root: Path | None = None) -> dict:
+    """Extract `{name, aliases}` from a 99-Mentions/ dossier.
+
+    `name` is the filename stem. `aliases` are frontmatter `aliases:` entries
+    (both inline `[a, b]` and multiline `  - a`), empty list if missing or
+    parse fails. Returns `{"name": "", "aliases": []}` if the file is
+    unreadable — caller should treat as "entity with no cross-ref possible".
+    """
+    root = vault_root or VAULT_PATH
+    p = root / rel_path
+    out: dict = {"name": p.stem, "aliases": []}
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except Exception:
+        return out
+    if not txt.startswith("---\n"):
+        return out
+    end = txt.find("\n---", 4)
+    if end == -1:
+        return out
+    fm = txt[4:end]
+    aliases: list[str] = []
+    in_aliases = False
+    for line in fm.split("\n"):
+        if line.startswith("aliases:"):
+            rest = line.split(":", 1)[1].strip()
+            if rest.startswith("[") and rest.endswith("]"):
+                for a in rest[1:-1].split(","):
+                    a = a.strip().strip("'\"")
+                    if a:
+                        aliases.append(a)
+            else:
+                in_aliases = True
+            continue
+        if in_aliases:
+            if line.startswith("  - "):
+                a = line[4:].strip().strip("'\"")
+                if a:
+                    aliases.append(a)
+            elif line and not line.startswith(" "):
+                in_aliases = False
+    out["aliases"] = aliases
+    return out
+
+
+def _lookup_wa_mentions_for_entity(
+    mention_rel_path: str,
+    limit: int = WA_CROSS_REF_LIMIT,
+    *,
+    vault_root: Path | None = None,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Return the last `limit` WhatsApp messages relevant to the person in
+    `mention_rel_path` (vault-relative path of the 99-Mentions/ dossier).
+
+    Match strategy — chat-name > content hit. For each candidate message,
+    the relevance is:
+      - `match`: "chat" if `chats.name` equals the entity name/alias
+                 (case-insensitive, accent-insensitive), "content" if
+                 `messages.content` contains the token instead.
+
+    Deduplicates by message id. Orders newest first. Skips the bot JID,
+    status broadcasts, empty/media-only messages. Caps result at `limit`.
+
+    Returns `[]` on any error (missing DB, SQL failure, unreadable dossier)
+    — callers treat the cross-ref as absent.
+    """
+    db = db_path or WHATSAPP_DB_PATH
+    if not db.is_file():
+        return []
+    dossier = _parse_mention_dossier(mention_rel_path, vault_root=vault_root)
+    tokens: list[str] = [dossier["name"]] + list(dossier["aliases"])
+    tokens = [t.strip() for t in tokens if t and len(t.strip()) >= _MENTIONS_MIN_TOKEN_LEN]
+    if not tokens:
+        return []
+
+    import sqlite3
+    try:
+        con = sqlite3.connect(
+            f"file:{db}?mode=ro", uri=True, timeout=5.0,
+        )
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        # Build WHERE clause: chat name matches OR content contains any token.
+        # Use COLLATE NOCASE for chat name; content LIKE is already
+        # case-insensitive for ASCII but we OR a folded variant to catch
+        # accented tokens.
+        or_clauses: list[str] = []
+        params: list = []
+        for t in tokens:
+            # chats.name contains token (word-ish match — "Grecia's group"
+            # should match entity "Grecia"; dedicated-chat matches are
+            # boosted in the post-fetch sort).
+            or_clauses.append("LOWER(c.name) LIKE LOWER(?)")
+            params.append(f"%{t}%")
+            # messages.content contains token (substring)
+            or_clauses.append("m.content LIKE ?")
+            params.append(f"%{t}%")
+        where = " OR ".join(or_clauses)
+        sql = f"""
+            SELECT
+              m.id AS id,
+              m.chat_jid AS jid,
+              m.sender AS sender,
+              m.content AS content,
+              m.timestamp AS ts,
+              m.is_from_me AS is_from_me,
+              m.media_type AS media_type,
+              c.name AS chat_name
+            FROM messages m
+            LEFT JOIN chats c ON c.jid = m.chat_jid
+            WHERE m.chat_jid != ?
+              AND m.chat_jid NOT LIKE '%status@broadcast'
+              AND ({where})
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+        """
+        # Overfetch 6× the limit: content-LIKE may match our own quoting
+        # of the entity in outbound messages; we also want headroom to
+        # promote chat-name hits (match="chat") over scattered content
+        # hits after the post-fetch re-sort.
+        rows = con.execute(
+            sql, (WHATSAPP_BOT_JID, *params, limit * 6),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+    lower_tokens = [t.lower() for t in tokens]
+    seen_ids: set[str] = set()
+    candidates: list[dict] = []
+    for r in rows:
+        msg_id = r["id"] or ""
+        if msg_id and msg_id in seen_ids:
+            continue
+        content = (r["content"] or "").strip().replace("\n", " ")
+        if not content and r["media_type"]:
+            content = f"[{r['media_type']}]"
+        if not content:
+            continue
+        chat_name = r["chat_name"] or ""
+        is_from_me = bool(r["is_from_me"])
+        who = "yo" if is_from_me else (
+            (r["sender"] or "").split("@")[0] or chat_name or "?"
+        )
+        # Match classification — "chat" wins when the chat name contains
+        # the token (dedicated conversation OR their group), even if the
+        # content doesn't. This is the signal we want to boost because it
+        # means ~every message in that chat is about them.
+        chat_lower = chat_name.lower()
+        content_lower = content.lower()
+        hit_chat = any(t in chat_lower for t in lower_tokens)
+        hit_content = any(t in content_lower for t in lower_tokens)
+        match = "chat" if hit_chat else ("content" if hit_content else "other")
+        candidates.append({
+            "id": msg_id,
+            "ts": r["ts"] or "",
+            "who": who,
+            "text": content[:400],
+            "chat_name": chat_name,
+            "jid": r["jid"] or "",
+            "is_from_me": is_from_me,
+            "match": match,
+        })
+        seen_ids.add(msg_id)
+
+    # Promote chat-name hits over content hits, then newest first within
+    # each bucket. A dedicated chat with the person (or their group) is
+    # nearly always more relevant than a scattered mention in some other
+    # conversation — even if the scattered one is newer.
+    chat_hits = sorted(
+        (c for c in candidates if c["match"] == "chat"),
+        key=lambda c: c["ts"], reverse=True,
+    )
+    other_hits = sorted(
+        (c for c in candidates if c["match"] != "chat"),
+        key=lambda c: c["ts"], reverse=True,
+    )
+    return (chat_hits + other_hits)[:limit]
+
+
+def _build_wa_cross_ref(
+    query: str,
+    *,
+    now: datetime | None = None,
+    vault_root: Path | None = None,
+) -> dict | None:
+    """Assemble the WhatsApp cross-reference payload for a factual query.
+
+    Returns `None` if:
+      - No entity from 99-Mentions/ appears in the query, OR
+      - No WA messages found for that entity.
+
+    Otherwise returns::
+
+        {
+          "entity": "Grecia",
+          "mention_path": "04-Archive/.../Grecia.md",
+          "messages": [{ts, who, text, chat_name, is_from_me, match}, ...],
+          "propose": {
+            "kind": "calendar_event" | "reminder",
+            "title": "...",
+            "when_iso": "2026-04-16T19:00:00",
+            "source_msg_idx": 0,
+          } | null,
+        }
+
+    `propose` is non-null only when at least one message contains a
+    parseable datetime. When multiple messages have datetimes, the newest
+    wins. `kind` is "calendar_event" if the message has an explicit time
+    (hinting at a real meet-up), else "reminder" (day-only). Matches the
+    kind selection logic in `propose_reminder` / `propose_calendar_event`
+    so the UX is consistent across surfaces.
+    """
+    mentions = _match_mentions_in_query(query, vault_root=vault_root)
+    if not mentions:
+        return None
+    mention_path = mentions[0]  # first mention wins — already ordered by occurrence
+    dossier = _parse_mention_dossier(mention_path, vault_root=vault_root)
+    entity_name = dossier["name"] or Path(mention_path).stem
+    msgs = _lookup_wa_mentions_for_entity(
+        mention_path, vault_root=vault_root,
+    )
+    if not msgs:
+        return None
+
+    # Detect commitment: iterate msgs newest→oldest, parse each text for
+    # a datetime. First hit wins. Skip outbound messages (is_from_me) —
+    # "nos vemos mañana" coming from yo is an invitation we already know
+    # about; the value of the cross-ref is surfacing OTHERS' commitments
+    # back at us.
+    anchor = now or datetime.now()
+    propose: dict | None = None
+    for idx, m in enumerate(msgs):
+        if m["is_from_me"]:
+            continue
+        text = m["text"]
+        dt = _parse_natural_datetime(text, now=anchor)
+        if dt is None:
+            continue
+        # Must be in the future — past dates in chat history aren't
+        # actionable (e.g. "te vi ayer" → dt = yesterday, skip).
+        if dt <= anchor:
+            continue
+        has_time = _has_explicit_time(text)
+        # Title: fall back on a short, human-readable hint. The user will
+        # see the msg text above the propose card, so the title is mostly
+        # for calendar/reminder display.
+        short_text = text.strip()
+        if len(short_text) > 60:
+            short_text = short_text[:57] + "…"
+        propose = {
+            "kind": "calendar_event" if has_time else "reminder",
+            "title": f"{entity_name}: {short_text}",
+            "when_iso": dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source_msg_idx": idx,
+        }
+        break
+
+    return {
+        "entity": entity_name,
+        "mention_path": mention_path,
+        "messages": msgs,
+        "propose": propose,
+    }
+
+
 def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -> dict:
     """LLM-extract action items from a chat window.
 
@@ -26853,10 +27149,25 @@ def serve(host: str, port: int):
         # de cache. Skip cuando `force` (usuario pidió re-run) o filtros
         # explícitos (cambian la respuesta sin cambiar la pregunta).
         cache_key = f"{sid or ''}|{qfolder or ''}|{qtag or ''}|{loose}|{question}"
+
+        # WhatsApp cross-reference — when the query mentions a person from
+        # 99-Mentions/, surface the last 3 WA messages + optional propose
+        # card. Computed fresh on every call (bypasses the 5min cache)
+        # because bridge messages arrive continuously; the cache holds the
+        # expensive LLM answer, not the cheap SQL lookup. Failure returns
+        # None silently — absent cross_ref is valid state.
+        try:
+            wa_cross_ref = _build_wa_cross_ref(question)
+        except Exception:
+            wa_cross_ref = None
+
         if not force and not qfolder and not qtag:
             cached = _cache_get(cache_key)
             if cached is not None:
-                return {**cached, "cached": True}
+                cached = {**cached, "cached": True}
+                if wa_cross_ref is not None:
+                    cached["wa_cross_ref"] = wa_cross_ref
+                return cached
 
         # Session
         sess = ensure_session(sid, mode="serve") if sid else None
@@ -27033,6 +27344,11 @@ def serve(host: str, port: int):
             }
             if not qfolder and not qtag:
                 _cache_put(cache_key, gated_payload)
+            # WA cross-ref goes on top of the gated payload too — even when
+            # the vault has nothing to say about an entity, their recent
+            # WhatsApp activity is often the actual answer the user wanted.
+            if wa_cross_ref is not None:
+                gated_payload["wa_cross_ref"] = wa_cross_ref
             return gated_payload
 
         # Dynamic top-k: high-confidence hits ya traen la respuesta en los 3
@@ -27120,8 +27436,12 @@ def serve(host: str, port: int):
             "t_retrieve": round(t_retrieve, 3), "t_gen": round(t_gen, 3),
         }
         # Cache only fresh successful answers (no force, no filters).
+        # Note: cache the payload WITHOUT wa_cross_ref so the next hit
+        # gets a fresh lookup — added after _cache_put below.
         if not force and not qfolder and not qtag:
             _cache_put(cache_key, payload)
+        if wa_cross_ref is not None:
+            payload["wa_cross_ref"] = wa_cross_ref
         return payload
 
     # ── /chat — LLM directo, sin retrieval ──────────────────────────────────

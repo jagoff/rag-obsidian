@@ -13,24 +13,63 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_queries_yaml_all_paths_exist_or_placeholder():
-    """Every `expected` path must either exist in the vault OR clearly be a
-    synthetic/placeholder path (starts with 'tests/'). No typos."""
+    """Every `expected` path must either:
+      1. Exist as a real file in the vault, OR
+      2. Start with a known cross-source native-id prefix
+         (`gmail://`, `whatsapp://`, `calendar://`, `reminders://`, `messages://`)
+         — these are doc_ids, not filesystem paths. Valid ONLY as placeholders
+         until the ingester lands real data; still fail if the prefix is unknown.
+    Typos fail this test — every vault-relative path is checked for real.
+
+    Rationale (Phase 1.f prep): with the cross-source corpus shipped
+    (docs/design-cross-source-corpus.md §10), golden queries can now reference
+    email / WhatsApp / calendar entries. The corpus uses `source://native_id`
+    scheme (per §2.7); those strings aren't filesystem paths so we whitelist
+    the prefix rather than `Path.is_file()`.
+    """
     import rag
     vault = rag.VAULT_PATH
     if not vault.is_dir():
         pytest.skip("vault not mounted in this environment")
+
+    # Cross-source native-id prefixes = placeholders acceptable before the
+    # ingester populates the corpus. Kept in sync with rag.VALID_SOURCES.
+    CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
+                             "reminders://", "messages://")
+
+    def _path_ok(p: str) -> bool:
+        if p.startswith(CROSS_SOURCE_PREFIXES):
+            return True
+        return (vault / p).is_file()
+
     data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
     missing: list[str] = []
     for q in (data.get("queries") or []):
         for p in q.get("expected") or []:
-            if not (vault / p).is_file():
+            if not _path_ok(p):
                 missing.append(p)
     for chain in (data.get("chains") or []):
         for turn in chain.get("turns") or []:
             for p in turn.get("expected") or []:
-                if not (vault / p).is_file():
+                if not _path_ok(p):
                     missing.append(p)
     assert not missing, "Expected paths missing from vault:\n  " + "\n  ".join(missing[:10])
+
+
+def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
+    """Sanity: the whitelist in the path-existence test must track
+    rag.VALID_SOURCES. If a new source is added there, add it here too, or
+    document why it's file-backed (like vault)."""
+    import rag
+    CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
+                             "reminders://", "messages://"}
+    # vault is file-backed → not a prefix
+    expected_whitelisted = rag.VALID_SOURCES - {"vault"}
+    prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
+    assert prefix_sources == expected_whitelisted, (
+        f"Whitelist drift: prefixes {prefix_sources} vs VALID_SOURCES-vault "
+        f"{expected_whitelisted}. Update test_queries_yaml_all_paths_exist_or_placeholder."
+    )
 
 
 def test_queries_yaml_has_underrepresented_folders():

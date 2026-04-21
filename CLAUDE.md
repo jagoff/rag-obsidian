@@ -325,7 +325,9 @@ Apple Reminders via AppleScript (local, same trust boundary as the morning brief
 ### Remaining (Phase 1.e + 1.f)
 
 - **Phase 1.e — apagar workaround** (gated on 1.c stable in prod ≥1 week): deprecar `/note` + `/ob` del whatsapp-listener ahora que el corpus captura WA por barrido. ~100 LOC, mostly external repo.
-- **Phase 1.f — re-calibración eval**: `queries.yaml` extendido con queries cross-source, re-baseline singles/chains con el corpus mixto, ajustar `CONFIDENCE_RERANK_MIN` per-source (hoy global 0.015), validar los `SOURCE_WEIGHTS` hardcoded. Deferred until real cross-source data accumulates in production (feedback loop needs ~2 semanas per §10.8).
+- **Phase 1.f — re-calibración eval** *(infra shipped 2026-04-21, tuning pending real data)*:
+  - **Infra shipped**: `CONFIDENCE_RERANK_MIN_PER_SOURCE` dict en `rag.py` (scaffolding — todos los valores = baseline 0.015 hoy) + helper `confidence_threshold_for_source(source)` con fallback al global. Invocado en `query()` y `rag serve` sobre `source` del top-result meta. Tests: [`tests/test_confidence_threshold_per_source.py`](tests/test_confidence_threshold_per_source.py) (9 casos). El test `tests/test_eval_bootstrap.py::test_queries_yaml_all_paths_exist_or_placeholder` ahora acepta paths con prefijos `gmail://` / `whatsapp://` / `calendar://` / `reminders://` / `messages://` como placeholders válidos; sanity-test aparte `test_queries_yaml_cross_source_prefixes_cover_all_valid_sources` detecta drift contra `VALID_SOURCES`. Template de queries cross-source está comentado en [`queries.yaml`](queries.yaml) listo para un-commentar cuando los ingesters populen el corpus.
+  - **Tuning pending**: re-correr `rag eval` + bajar per-source thresholds empíricamente (expected: WA 0.008-0.010, Calendar 0.012, Gmail 0.010-0.012, Reminders 0.012) una vez que los ingesters hayan corrido ≥1 semana + haya feedback data. Validar los `SOURCE_WEIGHTS` hardcoded (vault 1.00 / calendar 0.95 / reminders 0.90 / gmail 0.85 / WA 0.75 / messages 0.75) contra queries reales. Deferred per §10.8.
 
 ## On-disk state (`~/.local/share/obsidian-rag/`)
 

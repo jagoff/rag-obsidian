@@ -1710,32 +1710,45 @@ _CONTEXT_MIN_BODY = 300  # chars — skip summary for notes shorter than this
 
 _context_cache: dict[str, str] | None = None
 _context_cache_dirty = False
+# Serialises initialisation, mutation, and json.dumps over `_context_cache`.
+# Web chat + CLI index + watch threads all hit these helpers concurrently:
+# without this lock, two threads can both see `_context_cache is None`, both
+# parse the JSON file (wasted work), and the last-writer's reference wins;
+# worse, `_save_context_cache` can json.dumps a dict that another thread is
+# mutating and raise `dictionary changed size during iteration`.
+_context_cache_lock = threading.Lock()
 
 
 def _load_context_cache() -> dict[str, str]:
     """Load {file_hash: summary} from disk. Lazy, once per process."""
     global _context_cache
-    if _context_cache is not None:
-        return _context_cache
-    if CONTEXT_CACHE_PATH.is_file():
-        try:
-            _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
-        except Exception as exc:
-            _silent_log("context_cache_load", exc)
+    with _context_cache_lock:
+        if _context_cache is not None:
+            return _context_cache
+        if CONTEXT_CACHE_PATH.is_file():
+            try:
+                _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
+            except Exception as exc:
+                _silent_log("context_cache_load", exc)
+                _context_cache = {}
+        else:
             _context_cache = {}
-    else:
-        _context_cache = {}
-    return _context_cache
+        return _context_cache
 
 
 def _save_context_cache() -> None:
     """Persist context cache to disk if dirty."""
     global _context_cache_dirty
-    if not _context_cache_dirty or _context_cache is None:
-        return
+    with _context_cache_lock:
+        if not _context_cache_dirty or _context_cache is None:
+            return
+        # Serialise inside the lock so a concurrent mutator can't change the
+        # dict mid-dump. json.dumps over a few thousand short summaries is
+        # sub-millisecond — the hold is negligible.
+        payload = json.dumps(_context_cache, ensure_ascii=False)
+        _context_cache_dirty = False
     CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONTEXT_CACHE_PATH.write_text(json.dumps(_context_cache, ensure_ascii=False))
-    _context_cache_dirty = False
+    CONTEXT_CACHE_PATH.write_text(payload)
 
 
 _SUMMARY_CLIENT: ollama.Client | None = None
@@ -1874,13 +1887,19 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
     """Get or generate the contextual summary for a note. Cached by file hash."""
     global _context_cache_dirty
     cache = _load_context_cache()
-    if file_hash in cache:
-        return cache[file_hash]
+    # Read under the lock: guards against a concurrent `_save_context_cache`
+    # (or a pruning pass) mutating the dict between our `in` check and lookup.
+    with _context_cache_lock:
+        if file_hash in cache:
+            return cache[file_hash]
     if len(text) < _CONTEXT_MIN_BODY:
         return ""
+    # LLM call happens OUTSIDE the lock — holding it for ~1-3s would
+    # serialise every concurrent summary request across the process.
     summary = _generate_context_summary(text, title, folder)
-    cache[file_hash] = summary
-    _context_cache_dirty = True
+    with _context_cache_lock:
+        cache[file_hash] = summary
+        _context_cache_dirty = True
     return summary
 
 
@@ -1904,39 +1923,45 @@ _SYNTHETIC_Q_MAX_CHARS = 120 # per-question char cap
 
 _synthetic_q_cache: dict[str, list[str]] | None = None
 _synthetic_q_cache_dirty = False
+# Same rationale as `_context_cache_lock` — serialises lazy init, mutation,
+# and json.dumps against concurrent index/web/chat callers.
+_synthetic_q_cache_lock = threading.Lock()
 
 
 def _load_synthetic_q_cache() -> dict[str, list[str]]:
     """Load {file_hash: [questions]} from disk. Lazy, once per process."""
     global _synthetic_q_cache
-    if _synthetic_q_cache is not None:
-        return _synthetic_q_cache
-    if SYNTHETIC_Q_CACHE_PATH.is_file():
-        try:
-            data = json.loads(SYNTHETIC_Q_CACHE_PATH.read_text())
-            if isinstance(data, dict):
-                _synthetic_q_cache = {
-                    k: [str(q) for q in v if isinstance(q, str)]
-                    for k, v in data.items() if isinstance(v, list)
-                }
-            else:
+    with _synthetic_q_cache_lock:
+        if _synthetic_q_cache is not None:
+            return _synthetic_q_cache
+        if SYNTHETIC_Q_CACHE_PATH.is_file():
+            try:
+                data = json.loads(SYNTHETIC_Q_CACHE_PATH.read_text())
+                if isinstance(data, dict):
+                    _synthetic_q_cache = {
+                        k: [str(q) for q in v if isinstance(q, str)]
+                        for k, v in data.items() if isinstance(v, list)
+                    }
+                else:
+                    _synthetic_q_cache = {}
+            except Exception as exc:
+                _silent_log("synthetic_q_cache_load", exc)
                 _synthetic_q_cache = {}
-        except Exception as exc:
-            _silent_log("synthetic_q_cache_load", exc)
+        else:
             _synthetic_q_cache = {}
-    else:
-        _synthetic_q_cache = {}
-    return _synthetic_q_cache
+        return _synthetic_q_cache
 
 
 def _save_synthetic_q_cache() -> None:
     """Persist synthetic questions cache to disk if dirty."""
     global _synthetic_q_cache_dirty
-    if not _synthetic_q_cache_dirty or _synthetic_q_cache is None:
-        return
+    with _synthetic_q_cache_lock:
+        if not _synthetic_q_cache_dirty or _synthetic_q_cache is None:
+            return
+        payload = json.dumps(_synthetic_q_cache, ensure_ascii=False)
+        _synthetic_q_cache_dirty = False
     SYNTHETIC_Q_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SYNTHETIC_Q_CACHE_PATH.write_text(json.dumps(_synthetic_q_cache, ensure_ascii=False))
-    _synthetic_q_cache_dirty = False
+    SYNTHETIC_Q_CACHE_PATH.write_text(payload)
 
 
 def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str] | None:
@@ -2013,18 +2038,23 @@ def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) 
     """
     global _synthetic_q_cache_dirty
     cache = _load_synthetic_q_cache()
-    if file_hash in cache:
-        return cache[file_hash]
+    # Read + write under the same lock that `_save_synthetic_q_cache` uses, so
+    # a concurrent dumps can't race our mutation.
+    with _synthetic_q_cache_lock:
+        if file_hash in cache:
+            return cache[file_hash]
     if len(text) < _SYNTHETIC_Q_MIN_BODY:
         return []
+    # LLM call outside the lock — see `get_context_summary` for the rationale.
     result = _generate_synthetic_questions(text, title, folder)
     if result is None:
         # Transient failure — don't poison the cache. Return [] for the
         # caller (the chunk embeds without synthetic prefix this pass) and
         # let the next indexing pick it up.
         return []
-    cache[file_hash] = result
-    _synthetic_q_cache_dirty = True
+    with _synthetic_q_cache_lock:
+        cache[file_hash] = result
+        _synthetic_q_cache_dirty = True
     return result
 
 
@@ -4339,7 +4369,33 @@ class SqliteVecCollection:
 
 class SqliteVecClient:
     """sqlite-vec client. All collections share one SQLite file
-    (ragvec.db inside path)."""
+    (ragvec.db inside path).
+
+    Concurrency contract — READ THIS BEFORE ADDING PARALLELISM:
+
+    - The connection uses `check_same_thread=False` + `isolation_level=None`
+      (autocommit) + WAL + NORMAL synchronous. Multiple threads can issue
+      statements on the same connection; SQLite serialises them internally.
+    - Readers are **eventually consistent**, not snapshot-isolated. A query
+      that runs mid-write may see the post-write state for some rows and the
+      pre-write state for others (WAL gives durability, not MVCC snapshots
+      at the Python API level since we autocommit). Good enough for the
+      retrieval pipeline, which tolerates a chunk appearing/disappearing
+      between calls.
+    - Writes are serialised **at the application layer** by
+      `_collection_write_lock()` — the module-wide file lock under
+      `~/.local/share/obsidian-rag/.collection-ops.lock`. DO NOT rely on
+      SQLite's busy_timeout alone for correctness; the write lock also
+      guards the JSONL audit trail + schema-version bump.
+    - Telemetry writes inside `RAG_STATE_SQL` tables use explicit
+      `BEGIN IMMEDIATE` + `COMMIT` wrappers (see `_sql_upsert`) because
+      they batch multiple rows. Vec writes (`col.add`) are single-row and
+      run under autocommit.
+
+    If you add snapshot reads (e.g. "give me a consistent view during a
+    long analytical scan"), wrap the read in `BEGIN DEFERRED` / `COMMIT`
+    explicitly — autocommit + WAL is not enough.
+    """
 
     def __init__(self, path):
         import sqlite3 as _sqlite3
@@ -7108,6 +7164,12 @@ _MENTION_FIELD_RE = re.compile(
 )
 
 _mentions_cache: dict | None = None
+# Serialises `_load_mentions_index` — multiple query paths hit it in
+# parallel (retrieve()'s mention-boost + ambient hook + followup), and
+# concurrent rebuilds would re-scan the folder + redundantly overwrite
+# `_mentions_cache`. Lock is cheap: the load is cached by max-mtime so
+# steady-state hits never do disk I/O under the lock.
+_mentions_cache_lock = threading.Lock()
 _contacts_cache: dict[str, dict | None] = {}
 _contacts_cache_lock = threading.Lock()
 _contacts_permission_warned = False
@@ -7168,12 +7230,13 @@ def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
     files = [p for p in root.glob("*.md") if not p.name.startswith("_")]
     mtime_max = max((p.stat().st_mtime for p in files), default=0.0)
     cache_key = str(root.resolve())
-    if (
-        _mentions_cache
-        and _mentions_cache.get("key") == cache_key
-        and _mentions_cache.get("mtime") == mtime_max
-    ):
-        return _mentions_cache["index"]
+    with _mentions_cache_lock:
+        if (
+            _mentions_cache
+            and _mentions_cache.get("key") == cache_key
+            and _mentions_cache.get("mtime") == mtime_max
+        ):
+            return _mentions_cache["index"]
 
     idx: dict[str, str] = {}
     for p in files:
@@ -7208,7 +7271,8 @@ def _load_mentions_index(vault_root: Path | None = None) -> dict[str, str]:
                                 idx[_fold(a)] = rel
                         elif line and not line.startswith(" "):
                             in_aliases = False
-    _mentions_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
+    with _mentions_cache_lock:
+        _mentions_cache = {"key": cache_key, "mtime": mtime_max, "index": idx}
     return idx
 
 
@@ -8224,6 +8288,43 @@ SYSTEM_RULES_CHAT = (
     "Si no está: 'No tengo esa información en tus notas.' y cortá. "
     "Citá notas como [Título](ruta) usando la ruta exacta del chunk. "
     "Directo, viñetas cortas, sin intro.\n"
+)
+
+# System prompt para el endpoint /chat de `rag serve` — es el que usa el
+# listener de WhatsApp para bare text sin intent de búsqueda ("hola",
+# "gracias", "qué podés hacer"). NO hace retrieval; va al LLM pelado.
+#
+# Bug 2026-04-21: el prompt viejo ("no inventes info sobre las notas")
+# dejaba al modelo libre de responder preguntas factuales sobre el mundo
+# ("Que sabes de Grecia" → párrafo enciclopédico tipo Wikipedia). Ese
+# output, sin citas, es indistinguible para el usuario de una respuesta
+# basada en el vault — viola la invariante "fuente única: notas del
+# usuario" del sistema.
+#
+# Fix de doble capa con el listener: primero `detectFactualIntent` en
+# listener.ts rutea esos casos al `/query` con RAG (así o bien citan del
+# vault o el confidence-gate responde "No tengo esa información..."); este
+# prompt es el belt-and-suspenders para los casos que el router falla en
+# detectar. Regla dura: NO prosa sobre el tema, solo redirect a /search.
+_SERVE_CHAT_SYSTEM = (
+    "Sos el bot de WhatsApp del vault de Obsidian del usuario. NO sos "
+    "un modelo de conocimiento general — no sabés del mundo, solo de "
+    "las notas del usuario, y este endpoint ni siquiera tiene acceso a "
+    "las notas.\n\n"
+    "REGLA 1 — META-CHAT: respondé breve (1-2 líneas) SOLO a saludos "
+    "('hola', 'gracias', 'cómo estás'), meta-preguntas sobre el bot "
+    "('qué podés hacer', 'cómo usás', 'qué comandos hay') y ping "
+    "conversacional sin contenido. Para meta-preguntas sobre el bot, "
+    "mencioná `/help`.\n\n"
+    "REGLA 2 — PREGUNTAS DE CONTENIDO: cualquier pregunta que pida "
+    "información sobre un tema, entidad, persona, lugar, concepto, "
+    "historia, definición, 'qué sabés de X', 'qué es X', 'quién es X', "
+    "'cómo funciona X', 'cuándo pasó X' — respondé EXACTO: "
+    "'Para eso buscá en tus notas: `/search <tu pregunta>`.' y cortá. "
+    "NADA de biografía, definiciones, datos históricos, geografía, "
+    "ciencia general, opiniones sobre el tema. NO sos Wikipedia.\n\n"
+    "REGLA 3 — NUNCA inventes información sobre las notas del usuario. "
+    "Si te piden algo sobre sus notas, redirigí a `/search`.\n"
 )
 
 # Web chat variant — slightly more room than CLI strict but still source-bound.
@@ -27028,14 +27129,8 @@ def serve(host: str, port: int):
     # tocar el vault. Reusa el command-r warm del serve, sin pagar retrieve
     # ni rerank (~3-5s típico para respuestas cortas vs 15-30s del /query).
     # Mantiene continuidad por session_id. El bot WA rutea bare text acá y
-    # /search|/rag al /query.
-    _CHAT_SYSTEM = (
-        "Sos un asistente conversacional amigable en WhatsApp. Respondé "
-        "corto y directo — 1-3 líneas salvo que te pregunten algo técnico "
-        "donde haga falta más. No inventes información sobre las notas del "
-        "usuario; si te preguntan algo que requiere buscar en sus notas, "
-        "sugerile usar `/search <pregunta>`."
-    )
+    # /search|/rag al /query. System prompt en `_SERVE_CHAT_SYSTEM` (módulo)
+    # — ver comentarios en la definición para el razonamiento de las reglas.
 
     def _handle_chat(body: dict) -> dict:
         message = body.get("message", "").strip()
@@ -27047,7 +27142,7 @@ def serve(host: str, port: int):
         sess = ensure_session(sid, mode="chat") if sid else None
         history = session_history(sess) if sess else None
 
-        messages = [{"role": "system", "content": _CHAT_SYSTEM}]
+        messages = [{"role": "system", "content": _SERVE_CHAT_SYSTEM}]
         if history:
             messages += history
         messages.append({"role": "user", "content": message})
@@ -27694,12 +27789,14 @@ def _prune_context_cache(col: "SqliteVecCollection") -> int:
         h = m.get("hash", "")
         if h:
             live_hashes.add(h)
-    stale = [k for k in cache if k not in live_hashes]
-    for k in stale:
-        del cache[k]
+    with _context_cache_lock:
+        stale = [k for k in cache if k not in live_hashes]
+        for k in stale:
+            del cache[k]
+        if stale:
+            global _context_cache_dirty
+            _context_cache_dirty = True
     if stale:
-        global _context_cache_dirty
-        _context_cache_dirty = True
         _save_context_cache()
     return len(stale)
 
@@ -27715,12 +27812,14 @@ def _prune_synthetic_q_cache(col: "SqliteVecCollection") -> int:
         h = m.get("hash", "")
         if h:
             live_hashes.add(h)
-    stale = [k for k in cache if k not in live_hashes]
-    for k in stale:
-        del cache[k]
+    with _synthetic_q_cache_lock:
+        stale = [k for k in cache if k not in live_hashes]
+        for k in stale:
+            del cache[k]
+        if stale:
+            global _synthetic_q_cache_dirty
+            _synthetic_q_cache_dirty = True
     if stale:
-        global _synthetic_q_cache_dirty
-        _synthetic_q_cache_dirty = True
         _save_synthetic_q_cache()
     return len(stale)
 

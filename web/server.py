@@ -3291,6 +3291,75 @@ def pendientes_api(days: int = 14) -> dict:
 
 _CONV_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "conversation_turn_pending.jsonl"
 
+# Track in-flight conversation-writer threads so the shutdown hook can
+# drain them. We stay with daemon=True (a wedged SQL write must not block
+# process exit) but give the event loop a 5s join window — enough for a
+# normal SQL upsert + atomic file write. Turns still in flight after the
+# timeout fall through to `_append_pending_conversation_turn`'s retry file
+# via the exception path in `_persist_conversation_turn`, or were already
+# persisted but logged after the deadline (acceptable).
+_CONV_WRITERS_LOCK = threading.Lock()
+_CONV_WRITERS: "set[threading.Thread]" = set()
+
+
+def _spawn_conversation_writer(
+    target_args: tuple,
+    name: str,
+) -> threading.Thread:
+    """Launch `_persist_conversation_turn` on a daemon thread while
+    registering it for the shutdown-drain hook. The wrapper removes the
+    thread from the tracker on completion (success or failure) so the set
+    doesn't grow unbounded across sessions.
+    """
+    def _wrapper() -> None:
+        try:
+            _persist_conversation_turn(*target_args)
+        finally:
+            with _CONV_WRITERS_LOCK:
+                _CONV_WRITERS.discard(threading.current_thread())
+
+    t = threading.Thread(target=_wrapper, name=name, daemon=True)
+    with _CONV_WRITERS_LOCK:
+        _CONV_WRITERS.add(t)
+    t.start()
+    return t
+
+
+@app.on_event("shutdown")
+def _drain_conversation_writers() -> None:
+    """On server stop, give in-flight conversation writers up to 5s to
+    finish. Any that don't make it land in the retry queue on disk via
+    `_append_pending_conversation_turn` (the writer's own except path) and
+    will be re-applied at next startup by `_retry_pending_conversation_turns`.
+
+    We do NOT block indefinitely — a wedged SQL write should never prevent
+    the process from exiting.
+    """
+    with _CONV_WRITERS_LOCK:
+        pending = list(_CONV_WRITERS)
+    if not pending:
+        return
+    import time as _time
+    deadline = _time.monotonic() + 5.0
+    for t in pending:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+    with _CONV_WRITERS_LOCK:
+        stragglers = [t for t in _CONV_WRITERS if t.is_alive()]
+    if stragglers:
+        try:
+            _LOG_QUEUE.put((
+                LOG_PATH,
+                json.dumps({
+                    "kind": "conversation_writer_shutdown_timeout",
+                    "count": len(stragglers),
+                }) + "\n",
+            ))
+        except Exception:
+            pass
+
 
 def _append_pending_conversation_turn(rec: dict) -> None:
     """Append a serialisable turn record to the pending-retry file.
@@ -4212,9 +4281,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "llm_ms": _t_llm_decode_ms,
         })
 
-        threading.Thread(
-            target=_persist_conversation_turn,
-            args=(
+        _spawn_conversation_writer(
+            target_args=(
                 VAULT_PATH,
                 sess["id"],
                 req.question,
@@ -4223,9 +4291,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 result["scores"],
                 result["confidence"],
             ),
-            daemon=True,
             name=f"conv-writer-{turn_id[:8]}",
-        ).start()
+        )
 
         # Cache store — sólo queries sin history (no follow-ups) y con
         # respuesta no-vacía. Keya con el vault_chunks count computado en el

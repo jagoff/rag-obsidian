@@ -3778,6 +3778,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     client_ip = (request.client.host if request.client else "unknown")
     _check_rate_limit(_CHAT_BUCKETS, client_ip,
                       _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
+    # Device classification for telemetry + downstream decisions. El
+    # User-Agent header es el source más reliable — iPhone vs iPad vs Mac
+    # desktop vs otra Mac. Loggeado en `rag_queries.extra_json.device`
+    # en los 3 log_query_event sites abajo. Ver rag._classify_device
+    # para la política + ejemplos.
+    try:
+        import rag as _rag_mod
+        _client_device = _rag_mod._classify_device(
+            request.headers.get("User-Agent", "")
+        )
+    except Exception:
+        _client_device = "other"
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
@@ -3935,6 +3947,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "session": sess["id"], "answered": True,
                     "t_total": round(total_ms / 1000.0, 3),
                     "intent": _meta_intent,
+                    # device: iphone/ipad/mac/linux/windows/android/other
+                    # — habilita `SELECT device, AVG(...) GROUP BY 1` en analytics
+                    "device": _client_device,
                 })
             except Exception:
                 pass
@@ -4307,6 +4322,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # Intent echoed from the retrieve result so telemetry
                     # is symmetric with the `cmd=web` path above.
                     "intent": result.get("intent") if isinstance(result, dict) else None,
+                    "device": _client_device,
                 })
             except Exception:
                 pass
@@ -4904,6 +4920,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # `result["intent"]`. Closes the 42% gap in intent telemetry
             # measured 2026-04-22.
             "intent": result.get("intent"),
+            # Device classificado del User-Agent — iphone/ipad/mac/linux/
+            # windows/android/other. Habilita analytics por device y es
+            # prerequisito para layout adaptativo (mac-term mobile).
+            "device": _client_device,
         })
 
         yield _sse("done", {

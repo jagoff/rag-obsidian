@@ -956,6 +956,59 @@ _USER_QUERY_CMDS: frozenset[str] = frozenset({
 })
 
 
+# Device classifier — parsea User-Agent para discriminar entre iPhone,
+# iPad, Mac, Linux, Windows, Android, other. Habilita:
+#   - analytics por dispositivo (`SELECT device, AVG(t_retrieve) FROM
+#     rag_queries WHERE cmd='web' GROUP BY 1`)
+#   - layout adaptativo en el frontend (CSS responsive + aesthetic
+#     mac-term en mobile)
+#   - decisiones futuras de pipeline distinto por device (menos chunks
+#     en iPhone, respuesta más corta, etc.)
+#
+# Política: allowlist-based por tokens discriminativos (no full parse
+# del UA — el formato es inconsistente y los parsers full-blown
+# (httpagentparser, ua-parser) son dependency overkill para esto). 
+# Orden de precedencia explícito en `_DEVICE_TOKENS`:
+#   1. iphone   — UA contiene "iPhone"
+#   2. ipad     — "iPad"
+#   3. android  — "Android" (gana sobre Linux porque Android UA trae
+#                 "Linux" como kernel; queremos discriminar el telefono)
+#   4. mac      — "Macintosh"
+#   5. windows  — "Windows"
+#   6. linux    — "Linux" / "X11"
+#   7. other    — nada matchea o UA vacío (default conservative)
+#
+# Casos conocidos:
+#   - iPadOS en "Request Desktop Site" (modo desde 2019) envía UA de
+#     Mac sin el token "iPad" → clasifica como "mac" (lo que pide).
+#   - curl/python-requests/bots → "other" (no son web chat sessions).
+_DEVICE_TOKENS: list[tuple[str, str]] = [
+    ("iphone", "iphone"),
+    ("ipad", "ipad"),
+    ("android", "android"),
+    ("macintosh", "mac"),
+    ("windows", "windows"),
+    ("linux", "linux"),
+    ("x11", "linux"),
+]
+
+
+def _classify_device(user_agent: str | None) -> str:
+    """Clasifica el User-Agent a un device string del dominio cerrado:
+    {iphone, ipad, mac, linux, windows, android, other}.
+
+    Ver `_DEVICE_TOKENS` para la política de precedencia + rationale.
+    Empty/None/trash → "other" (no inventa). Case-insensitive.
+    """
+    if not user_agent or not isinstance(user_agent, str):
+        return "other"
+    ua_lower = user_agent.lower()
+    for token, device in _DEVICE_TOKENS:
+        if token in ua_lower:
+            return device
+    return "other"
+
+
 def is_user_query(cmd: str | None, q: str | None) -> bool:
     """Return True if the `rag_queries` row represents an actual user query.
 

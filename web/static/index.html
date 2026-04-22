@@ -2,9 +2,20 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- viewport-fit=cover: permite que el bg llegue hasta los bordes en iPhones
+       con notch / Dynamic Island; la safe-area-inset-* del CSS evita que el
+       contenido quede tapado por la isla. -->
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <!-- iOS Safari: status-bar + app-like behaviour si el user 'Add to Home Screen'.
+       El color matchea var(--bg) del CSS para que la barra superior del iPhone
+       se funda con la app en vez de quedar un gap blanco. -->
+  <meta name="theme-color" content="#1a1a1f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag">
   <title>rag</title>
-  <link rel="stylesheet" href="/static/style.css?v=2026-04-20-inline-chip">
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-22-mobile-responsive">
 </head>
 <body>
   <header id="topbar">

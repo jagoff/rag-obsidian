@@ -601,11 +601,20 @@ def _warmup() -> None:
                     print(f"[warmup] reranker skipped: {_exc}", flush=True)
             if os.environ.get("RAG_LOCAL_EMBED", "").strip() not in ("", "0", "false", "no"):
                 try:
-                    from rag import _get_local_embedder as _gle
-                    _mdl = _gle()
-                    if _mdl is not None:
-                        _mdl.encode(["warmup"], show_progress_bar=False)
-                        print("[warmup] bge-m3 local embedder ready", flush=True)
+                    # `_warmup_local_embedder()` es el único helper que, además
+                    # de cargar el modelo y hacer un dummy encode, setea el
+                    # `_local_embedder_ready.Event` que `query_embed_local()`
+                    # checkea como gate non-blocking. Antes del 2026-04-22
+                    # este startup llamaba `_get_local_embedder()` + `.encode`
+                    # directo, lo que cargaba el modelo pero NO seteaba el
+                    # Event → cada `/api/chat` caía al fallback ollama
+                    # (~140ms vs ~10-30ms local). Ver
+                    # test_web_local_embed_warmup.py para el contrato.
+                    from rag import _warmup_local_embedder
+                    if _warmup_local_embedder():
+                        print("[warmup] bge-m3 local embedder ready (event set)", flush=True)
+                    else:
+                        print("[warmup] bge-m3 local embedder skipped (load/encode failed)", flush=True)
                 except Exception as _exc:
                     print(f"[warmup] local embed skipped: {_exc}", flush=True)
             # Drain any conversation turns that failed to persist on previous

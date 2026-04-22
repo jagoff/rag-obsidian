@@ -32659,6 +32659,108 @@ def _corpus_breakdown_by_source() -> list[tuple[str, int, str]]:
         con.close()
 
 
+def rag_health_report() -> dict:
+    """Resumen compacto de la salud operativa del runtime.
+
+    Devuelve un dict con tres claves:
+
+      ``feature_deps``:
+        Lista de strings describiendo features que estan default-ON por
+        env pero cuya dependencia importable NO esta disponible — es decir,
+        la feature aparenta estar activa pero falla silenciosamente en
+        producción.  Hoy cubre:
+
+          - RAG_EXTRACT_ENTITIES ON + gliner ausente (28+ dropping
+            `gliner_import_failed` a silent_errors.jsonl/dia cuando el
+            paquete `obsidian-rag[entities]` no se instaló).
+
+        El operador las ve en `rag stats` y puede ejecutar
+        `uv pip install obsidian-rag[entities]` o `export RAG_EXTRACT_ENTITIES=0`
+        para silenciar el warning.
+
+      ``silent_errors_24h``:
+        `{where: count}` agregando todas las entradas de
+        `SILENT_ERRORS_LOG_PATH` con `ts` dentro de las ultimas 24h.
+        Tolerancia total a corrupción: líneas no-JSON o sin `ts` se
+        skipean silenciosamente.
+
+      ``sql_state_errors_24h``:
+        Mismo shape pero sobre `_SQL_STATE_ERROR_LOG`, agrupado por
+        `event`. Permite detectar de un vistazo si el retry wrapper
+        esta absorbiendo contención o si algún error no-transient está
+        escalando (e.g. `disk I/O error`).
+
+    Todo read-only; nunca raisea (siempre retorna un dict con las 3
+    claves, aunque los valores sean vacíos).
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    report: dict = {
+        "feature_deps": [],
+        "silent_errors_24h": {},
+        "sql_state_errors_24h": {},
+    }
+
+    # ── silent_errors.jsonl / sql_state_errors.jsonl rollup ──
+    # (computed first so the feature_deps block below can also infer a
+    # degraded feature from repeated failures even when the sticky flag
+    # hasn't been set in THIS process — `rag stats` itself never calls
+    # `_get_gliner_model`, but the indexer/ingesters did, and their
+    # misses land in the shared log.)
+    cutoff = _dt.now() - _td(hours=24)
+
+    def _rollup(path: Path, key_field: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        try:
+            if not path.is_file():
+                return counts
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    try:
+                        # ts format: "YYYY-MM-DDTHH:MM:SS"
+                        rec_dt = _dt.fromisoformat(ts.rstrip("Z"))
+                    except Exception:
+                        continue
+                    if rec_dt < cutoff:
+                        continue
+                    key = rec.get(key_field) or "(unknown)"
+                    counts[key] = counts.get(key, 0) + 1
+        except Exception:
+            pass
+        return counts
+
+    report["silent_errors_24h"] = _rollup(SILENT_ERRORS_LOG_PATH, "where")
+    report["sql_state_errors_24h"] = _rollup(_SQL_STATE_ERROR_LOG, "event")
+
+    # ── feature deps ──
+    # RAG_EXTRACT_ENTITIES default ON + gliner soft-dep. Flag on EITHER
+    # the sticky in-process marker (this process tried + failed) OR
+    # recent 24h evidence from the shared log (other processes keep
+    # failing). Ensures `rag stats` surfaces the issue even though
+    # `rag stats` itself never imports gliner.
+    gliner_evidence = (
+        report["silent_errors_24h"].get("gliner_import_failed", 0)
+        + report["silent_errors_24h"].get("gliner_load_failed", 0)
+    )
+    if _entity_extraction_enabled() and (_gliner_load_failed or gliner_evidence > 0):
+        report["feature_deps"].append(
+            "RAG_EXTRACT_ENTITIES=1 pero `gliner` no se pudo importar — "
+            "entity extraction roto (corre `uv pip install obsidian-rag[entities]` "
+            "o seteá `RAG_EXTRACT_ENTITIES=0` para silenciar)"
+        )
+
+    return report
+
+
 @cli.command()
 def stats():
     """Estado del índice."""
@@ -32730,6 +32832,44 @@ def stats():
     pos, neg = feedback_counts()
     if pos or neg:
         console.print(f"[cyan]Feedback:[/cyan] 👍 {pos} · 👎 {neg}  [dim]({FEEDBACK_PATH})[/dim]")
+
+    # ── Health ─────────────────────────────────────────────────────────────
+    # Features ON por default con deps faltantes + rollup de últimas 24h
+    # de silent_errors.jsonl y sql_state_errors.jsonl. Antes de este panel
+    # el operador no tenía forma de saber que RAG_EXTRACT_ENTITIES=1 estaba
+    # roto sin hacer `cat ~/.local/share/obsidian-rag/silent_errors.jsonl`.
+    try:
+        hr = rag_health_report()
+    except Exception:
+        hr = {"feature_deps": [], "silent_errors_24h": {}, "sql_state_errors_24h": {}}
+
+    deps = hr.get("feature_deps") or []
+    se24 = hr.get("silent_errors_24h") or {}
+    sse24 = hr.get("sql_state_errors_24h") or {}
+
+    if deps or se24 or sse24:
+        console.print()
+        console.print("[bold cyan]Health (últimas 24h):[/bold cyan]")
+        for msg in deps:
+            # `markup=False`: the message may contain `[entities]`, `[nli]`
+            # literals that rich would otherwise interpret as style tags
+            # and silently drop.
+            console.print(f"  ⚠ {msg}", style="yellow", markup=False, highlight=False)
+        if se24:
+            # Ordenado por count desc — el operador quiere ver el más ruidoso primero.
+            top = sorted(se24.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            console.print(
+                "  silent_errors: "
+                + ", ".join(f"{k}={v}" for k, v in top),
+                style="dim", markup=False,
+            )
+        if sse24:
+            top = sorted(sse24.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            console.print(
+                "  sql_state_errors: "
+                + ", ".join(f"{k}={v}" for k, v in top),
+                style="dim", markup=False,
+            )
 
 
 @cli.command("open")
@@ -35580,6 +35720,45 @@ _gliner_model = None
 _gliner_lock = threading.Lock()
 _gliner_load_failed = False
 
+# Feature-dep warnings already emitted in this process. Gate for
+# `_warn_feature_dep_once()`: we want the operator to see ONE stderr line
+# per (feature, dep) the first time a default-ON soft-dep fails, but NOT
+# spam every retry/call. `silent_errors.jsonl` keeps the audit trail;
+# this is just the top-of-session heads-up. Module-level mutable set,
+# since threading.Lock protection would be overkill for an
+# idempotent-append-of-str operation.
+_WARNED_FEATURE_DEPS: set[tuple[str, str]] = set()
+
+
+def _warn_feature_dep_once(feature: str, dep: str) -> None:
+    """Emit one stderr line the first time a default-ON feature's
+    soft-dep fails to import / load in this process.
+
+    Before this (2026-04-22 audit), `RAG_EXTRACT_ENTITIES=1` (default ON)
+    + `gliner` missing produced 28+ `gliner_import_failed` per day in
+    `silent_errors.jsonl` with zero operator-visible signal. Now the
+    first miss prints a single line like::
+
+        [feature: entities] dep `gliner` not available — install with
+          `uv pip install obsidian-rag[entities]` or set RAG_EXTRACT_ENTITIES=0
+
+    Subsequent calls for the same (feature, dep) are no-ops. Process
+    restart resets the set — this is by design, so operators see the
+    warning every new session until they act on it.
+    """
+    key = (feature, dep)
+    if key in _WARNED_FEATURE_DEPS:
+        return
+    _WARNED_FEATURE_DEPS.add(key)
+    try:
+        sys.stderr.write(
+            f"[feature: {feature}] dep `{dep}` not available — install the "
+            f"`obsidian-rag[{feature}]` extra or disable the feature via env.\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 
 def _entity_extraction_enabled() -> bool:
     """True cuando RAG_EXTRACT_ENTITIES no está seteada a "0"/"false"/"no".
@@ -35631,6 +35810,10 @@ def _get_gliner_model():
                 _silent_log("gliner_import_failed", Exception("gliner package not installed"))
             except Exception:
                 pass
+            # Surface ONCE per process on stderr so the operator knows the
+            # entity-extraction path is degraded — otherwise the failure is
+            # invisible unless they grep silent_errors.jsonl.
+            _warn_feature_dep_once("entities", "gliner")
             return None
         try:
             _gliner_model = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
@@ -35641,6 +35824,7 @@ def _get_gliner_model():
                 _silent_log("gliner_load_failed", exc)
             except Exception:
                 pass
+            _warn_feature_dep_once("entities", "gliner")
             return None
 
 

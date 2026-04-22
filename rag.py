@@ -149,6 +149,9 @@ def _nli_max_claims() -> int:
 # dispatch sin los skips. Ver docs/improvement-3-adaptive-routing-design.md.
 _LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
 _LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
+# num_ctx reducido para el fast-path lookup (respuestas cortas, contexto pequeño).
+# Alinea con HELPER_OPTIONS (qwen2.5:3b usa 2048 en helper tasks). Override via env.
+_LOOKUP_NUM_CTX = int(os.environ.get("RAG_LOOKUP_NUM_CTX", "2048"))
 
 # Per-intent rerank pool override. Synthesis/comparison necesitan más pool
 # porque tienen que cubrir ≥2 fuentes independientes en top-5 (SYSTEM_RULES
@@ -16312,6 +16315,7 @@ def query(
         precise=hyde, multi_query=_multi_enabled, auto_filter=not no_auto_filter,
         date_range=date_range, variants=pre_variants,
         source=source_filter,
+        intent=intent,
     )
 
     def _do_retrieve():
@@ -16461,6 +16465,13 @@ def query(
     else:
         messages = [{"role": "user", "content": f"{rules_full}\n{_person_block}CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
 
+    # Adaptive fast-path (Improvement #3 Fase C): lookup queries use smaller model
+    # + reduced num_ctx. With RAG_ADAPTIVE_ROUTING=0 (default) fast_path is always
+    # False → bit-identical behavior vs master.
+    _fast_path = result.get("fast_path", False)
+    _gen_model = _LOOKUP_MODEL if _fast_path else resolve_chat_model()
+    _gen_options = {**CHAT_OPTIONS, "num_ctx": _LOOKUP_NUM_CTX} if _fast_path else CHAT_OPTIONS
+
     t_gen_start = time.perf_counter()
     parts: list[str] = []
     if plain:
@@ -16468,9 +16479,9 @@ def query(
         # mutate `full` after generation. The single `click.echo` for plain mode
         # fires after both passes complete (see below, after critique block).
         for chunk in ollama.chat(
-            model=resolve_chat_model(),
+            model=_gen_model,
             messages=messages,
-            options=CHAT_OPTIONS,
+            options=_gen_options,
             stream=True,
             keep_alive=chat_keep_alive(),
         ):
@@ -16483,9 +16494,9 @@ def query(
         from rich.live import Live
         with Live("", console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(
-                model=resolve_chat_model(),
+                model=_gen_model,
                 messages=messages,
-                options=CHAT_OPTIONS,
+                options=_gen_options,
                 stream=True,
                 keep_alive=chat_keep_alive(),
             ):
@@ -16504,9 +16515,12 @@ def query(
     # hallucinated throughout; a single repair call costs 5-8s of non-streaming
     # LLM latency and rarely salvages heavily hallucinated outputs. Single repair
     # call; if repair also has bad citations or is empty, keep the original full.
+    # Fast-path (Improvement #3): skip citation-repair when fast_path=True — the
+    # lookup model + small num_ctx produces short answers where hallucinated paths
+    # are rare, and the 5-8s repair call would negate the latency win.
     citation_repaired = False
     bad = verify_citations(full, result["metas"])
-    if bad and len(bad) <= _CITATION_REPAIR_MAX_BAD:
+    if not _fast_path and bad and len(bad) <= _CITATION_REPAIR_MAX_BAD:
         valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
         if valid_paths:
             _repair_system = (
@@ -16654,6 +16668,7 @@ def query(
         "contradictions": [{"path": c["path"], "why": c["why"]} for c in contrad] if counter else None,
         "mode": "raw" if raw else ("loose" if loose else "strict"),
         "plain": plain,
+        "fast_path": _fast_path,
     })
 
     if sess is not None:
@@ -17570,6 +17585,12 @@ def chat(
         history.append({"role": "user", "content": question})
 
         _t_retrieve_ms = int((time.perf_counter() - _t_retrieve_start) * 1000)
+        # Adaptive fast-path (Improvement #3 Fase C, chat path): single-vault
+        # retrieve sets fast_path based on score; multi-vault always False.
+        # intent=None default in multi_retrieve → retrieve treats as "semantic",
+        # so fast_path activates on score alone (correct for chat multi-turn).
+        _chat_fast_path = result.get("fast_path", False)
+        _chat_model = _LOOKUP_MODEL if _chat_fast_path else resolve_chat_model()
         console.print()
         parts: list[str] = []
         print("\x1b[1;36mrag ›\x1b[0m ", end="", flush=True)
@@ -17577,11 +17598,12 @@ def chat(
         # — mismatch fuerza KV-cache reinit (~20-40s penalty). Mirror de
         # _WEB_CHAT_OPTIONS. num_predict=256 da room para respuestas largas
         # sin runaway (web usa 100, pero CLI tolera más verbosity).
-        _CLI_CHAT_OPTIONS = {
-            **CHAT_OPTIONS,
-            "num_ctx": 4096,
-            "num_predict": 256,
-        }
+        # Fast-path override: _LOOKUP_NUM_CTX (2048) con el modelo pequeño.
+        _CLI_CHAT_OPTIONS = (
+            {**CHAT_OPTIONS, "num_ctx": _LOOKUP_NUM_CTX, "num_predict": 256}
+            if _chat_fast_path
+            else {**CHAT_OPTIONS, "num_ctx": 4096, "num_predict": 256}
+        )
         # Breve pausa para que MPS drene el rerank antes del prefill en
         # VRAM compartida — evita 20-40s de contención GPU.
         time.sleep(0.2)
@@ -17596,7 +17618,7 @@ def chat(
         _t_first_token: float | None = None
         with Live(placeholder, console=console, refresh_per_second=12, transient=True) as live:
             for chunk in ollama.chat(
-                model=resolve_chat_model(),
+                model=_chat_model,
                 messages=messages,
                 options=_CLI_CHAT_OPTIONS,
                 stream=True,
@@ -17624,9 +17646,12 @@ def chat(
         # than _CITATION_REPAIR_MAX_BAD citations are invented — the response is
         # likely hallucinated throughout, and a single repair call won't salvage
         # it. See rag.py:109 for the constant.
+        # Fast-path (Improvement #3): skip repair when _chat_fast_path=True
+        # (same rationale as query path — small model + small num_ctx rarely
+        # hallucinates paths, and repair cost would negate latency win).
         _chat_citation_repaired = False
         _chat_bad = verify_citations(full, result["metas"])
-        if _chat_bad and len(_chat_bad) <= _CITATION_REPAIR_MAX_BAD:
+        if not _chat_fast_path and _chat_bad and len(_chat_bad) <= _CITATION_REPAIR_MAX_BAD:
             _chat_valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
             if _chat_valid_paths:
                 _chat_repair_system = (
@@ -17739,6 +17764,7 @@ def chat(
             "critique_fired": critique_active,
             "critique_changed": _chat_critique_changed,
             "timing": _round_timing_ms(result.get("timing")),
+            "fast_path": _chat_fast_path,
         })
 
         last_turn_id = turn_id

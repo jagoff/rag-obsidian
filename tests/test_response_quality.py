@@ -85,7 +85,7 @@ def _apply_base_patches(monkeypatch, retrieve_result=None):
 ])
 def test_system_prompt_loose_always_returns_system_rules(intent):
     result = rag.system_prompt_for_intent(intent, loose=True)
-    assert result is rag.SYSTEM_RULES
+    assert result == rag.SYSTEM_RULES
 
 
 @pytest.mark.parametrize("intent,expected_attr", [
@@ -99,9 +99,12 @@ def test_system_prompt_loose_always_returns_system_rules(intent):
     ("",           "SYSTEM_RULES_STRICT"),
 ])
 def test_system_prompt_strict_routes_by_intent(intent, expected_attr):
+    # Post 2026-04-22: system_prompt_for_intent resuelve via load_prompt
+    # cada call (para que env overrides apliquen en runtime). Igualdad
+    # de contenido en vez de identidad.
     result = rag.system_prompt_for_intent(intent, loose=False)
     expected = getattr(rag, expected_attr)
-    assert result is expected
+    assert result == expected
 
 
 # ── 2. Citation-repair loop ───────────────────────────────────────────────────

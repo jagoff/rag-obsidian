@@ -68,6 +68,29 @@ obsidian-rag-mcp = "mcp_server:main"
 py-modules = ["rag", "mcp_server"]
 packages = ["scripts", "web"]
 
+# Include prompts/**/*.md in the installed tool bundle. Without this,
+# `uv tool install --editable .` copies rag.py but skips the prompts/
+# directory, and `load_prompt()` raises FileNotFoundError at import time
+# when the tool runs from ~/.local/share/uv/tools/obsidian-rag/ instead
+# of the repo.
+[tool.setuptools.package-data]
+"*" = ["prompts/**/*.md"]
+
+[tool.setuptools.data-files]
+"share/obsidian-rag/prompts/rules" = ["prompts/rules/chunk_as_data.v1.md", "prompts/rules/name_preservation.v1.md"]
+"share/obsidian-rag/prompts/intents" = [
+  "prompts/intents/system_rules.v1.md",
+  "prompts/intents/strict.v1.md",
+  "prompts/intents/chat.v1.md",
+  "prompts/intents/web.v1.md",
+  "prompts/intents/lookup.v1.md",
+  "prompts/intents/synthesis.v1.md",
+  "prompts/intents/synthesis.v2.md",
+  "prompts/intents/comparison.v1.md",
+  "prompts/intents/comparison.v2.md",
+  "prompts/intents/serve_meta.v1.md",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

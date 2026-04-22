@@ -109,16 +109,18 @@ def test_lookup_prompt_still_has_refusal():
 
 
 def test_system_prompt_for_intent_dispatches_synthesis():
+    # Post 2026-04-22 retorna string fresco por call (no identity) — ver
+    # test_prompt_loader.py para la explicación del cambio de contrato.
     assert rag.system_prompt_for_intent("synthesis", loose=False) \
-        is rag.SYSTEM_RULES_SYNTHESIS
+        == rag.SYSTEM_RULES_SYNTHESIS
 
 
 def test_system_prompt_for_intent_dispatches_comparison():
     assert rag.system_prompt_for_intent("comparison", loose=False) \
-        is rag.SYSTEM_RULES_COMPARISON
+        == rag.SYSTEM_RULES_COMPARISON
 
 
 def test_system_prompt_for_intent_loose_always_uses_system_rules():
     """`--loose` override debe seguir funcionando para todos los intents."""
     for intent in ("synthesis", "comparison", "count", "list", "semantic"):
-        assert rag.system_prompt_for_intent(intent, loose=True) is rag.SYSTEM_RULES
+        assert rag.system_prompt_for_intent(intent, loose=True) == rag.SYSTEM_RULES

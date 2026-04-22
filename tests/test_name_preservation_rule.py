@@ -142,7 +142,7 @@ def test_system_prompt_for_intent_loose_path_carries_both_rules(intent: str) -> 
     # loose=True collapses to SYSTEM_RULES for every intent — still must
     # carry both rules.
     prompt = rag.system_prompt_for_intent(intent, loose=True)
-    assert prompt is rag.SYSTEM_RULES
+    assert prompt == rag.SYSTEM_RULES
     assert "REGLA 0" in prompt
     assert "REGLA DE NOMBRES PROPIOS" in prompt
     assert rag._NAME_PRESERVATION_RULE in prompt

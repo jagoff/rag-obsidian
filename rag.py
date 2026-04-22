@@ -921,6 +921,58 @@ def _collection_write_lock(timeout: int = 300, blocking: bool = True):
         lock_fh.close()
 
 
+# User-facing query cmds — set allowlist-style.
+#
+# Gap histórico: `log_query_event()` es el writer genérico para
+# `rag_queries`, y varios comandos de tipo job/ingester lo reusaron por
+# conveniencia (`rag followup`, `rag read`, etc.). Resultado (auditoría
+# 2026-04-22, 7 días): 611/1667 rows tenían `q=""` porque no eran
+# queries del usuario — eran corridas de jobs loggeando counts en
+# `extra_json`.
+#
+# Eso distorsiona TODO análisis agregado:
+#   - "cache hit rate 0%" era 0/1056 con q no vacío → 0/445 de queries
+#     reales
+#   - "top_score distribution" incluía 0 para jobs que nunca hicieron
+#     retrieve
+#
+# La política correcta sería separar tablas (`rag_command_runs`), pero
+# eso rompería consumers de `rag_queries` (dashboards, eval). Mientras
+# tanto, exponemos `is_user_query(cmd, q)` para que los análisis filtren
+# correctamente, y los tests impiden que un cmd nuevo se cuele al
+# allowlist sin pensarlo.
+_USER_QUERY_CMDS: frozenset[str] = frozenset({
+    "query",           # CLI one-shot
+    "chat",            # CLI interactive
+    "do",              # rag do <instruccion> (tool-calling)
+    "links",           # rag links "<query>"
+    "prep",            # rag prep <tema>
+    "web",             # /api/chat principal
+    "web.chat.metachat",            # metachat short-circuit
+    "web.chat.low_conf_bypass",     # low-conf fallback (aún es query)
+    "serve",           # rag serve (mic-drop handler)
+    "serve.chat",      # rag serve → chat endpoint
+    "serve.received",  # whatsapp inbound → rag serve
+})
+
+
+def is_user_query(cmd: str | None, q: str | None) -> bool:
+    """Return True if the `rag_queries` row represents an actual user query.
+
+    `q` kept as a parameter for symmetry + future flexibility (some slash
+    commands send `q=""` on purpose), but the current contract is
+    cmd-based: if the cmd is in the allowlist, it's a user query
+    regardless of `q` content.
+
+    Unknown cmds default to False — this is deliberate.  Any new cmd
+    must be added to `_USER_QUERY_CMDS` after review, so a new job
+    command can't silently pollute analytics.
+    """
+    if not cmd:
+        return False
+    return cmd in _USER_QUERY_CMDS
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
@@ -32879,13 +32931,22 @@ def rag_health_report() -> dict:
                 report["cache_stats"]["rows"] = 0
                 report["cache_stats"]["total_hits"] = 0
             try:
+                # IMPORTANTE: filtrar por `cmd IN (user query cmds)` — antes
+                # del 2026-04-22 el denominador contaba también rows de
+                # `cmd=followup`/`cmd=read` (611 de 1667 en 7 días) que
+                # son jobs no queries. El helper `is_user_query()` expone
+                # el allowlist central; aquí materializamos la cláusula
+                # SQL desde el set para mantener coherencia single-source.
+                _placeholders = ",".join("?" * len(_USER_QUERY_CMDS))
                 _row2 = _hc_conn.execute(
                     "SELECT "
                     " SUM(CASE WHEN extra_json LIKE '%\"cache_hit\":true%' THEN 1 ELSE 0 END),"
                     " COUNT(*) "
                     "FROM rag_queries "
                     "WHERE ts > datetime('now','-1 day') "
-                    "  AND q IS NOT NULL AND q != ''"
+                    "  AND q IS NOT NULL AND q != '' "
+                    f"  AND cmd IN ({_placeholders})",
+                    tuple(_USER_QUERY_CMDS),
                 ).fetchone()
                 _hits = int(_row2[0] or 0)
                 _total = int(_row2[1] or 0)

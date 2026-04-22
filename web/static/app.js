@@ -317,6 +317,7 @@ const SLASH_COMMANDS = [
   { cmd: "/model",   desc: "modelo de chat en uso" },
   { cmd: "/save",    desc: "guardar conversación en 00-Inbox", arg: "[título]" },
   { cmd: "/reindex", desc: "reindex incremental en background" },
+  { cmd: "/redo",    desc: "regenerar última respuesta (opcional: pista)", arg: "[pista]" },
   { cmd: "/tts",     desc: "alternar voz (Mónica)" },
 ];
 
@@ -634,6 +635,15 @@ const COPY_SVG = `
     <rect x="9" y="9" width="13" height="13" rx="2"/>
     <path d="M5 15V5a2 2 0 0 1 2-2h10"/>
   </svg>`;
+// Redo icon — circular arrow. Click on the feedback bar regenerates
+// the last response (same server path as `/redo`). Matches the stroke
+// weight of THUMB_*_SVG / COPY_SVG so the row stays visually uniform.
+const REDO_SVG = `
+  <svg class="fb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M3 12a9 9 0 1 0 3-6.7"/>
+    <polyline points="3 4 3 10 9 10"/>
+  </svg>`;
 function appendFeedback(parent, ctx) {
   const wrap = el("div", "feedback");
   const prompt = el("span", "feedback-prompt", "¿útil?");
@@ -850,12 +860,32 @@ function appendFeedback(parent, ctx) {
     (hasCandidates ? cardNodes[0] || field : field).focus();
   }
 
+  // Redo button — regenerate without hint. Separate from `/redo <hint>`
+  // (keyboard path); this is the one-click "give me another take".
+  // Disabled when the user already submitted a rating (rare: you don't
+  // typically redo *after* giving feedback — that pushes new telemetry
+  // that muddies the signal for the original turn).
+  const redo = document.createElement("button");
+  redo.type = "button";
+  redo.className = "fb-btn fb-redo";
+  redo.setAttribute("aria-label", "regenerar respuesta");
+  redo.title = "regenerar respuesta (/redo para pista)";
+  redo.innerHTML = `${REDO_SVG}<span class="fb-label">regenerar</span>`;
+  redo.addEventListener("click", () => {
+    if (wrap.dataset.sent) return;
+    if (!ctx.turn_id) return;
+    redo.disabled = true;
+    redo.classList.add("picked");
+    send("(redo)", { redo_turn_id: ctx.turn_id });
+  });
+
   up.addEventListener("click", () => submit(1));
   down.addEventListener("click", openNegativeFeedback);
 
   wrap.appendChild(prompt);
   wrap.appendChild(up);
   wrap.appendChild(down);
+  wrap.appendChild(redo);
   wrap.appendChild(status);
   parent.appendChild(wrap);
   return wrap;
@@ -1694,8 +1724,20 @@ function renderMarkdown(text) {
   return _sanitizeHtml(postprocess(marked.parse(preprocess(text))));
 }
 
+// Last turn_id from the most recent RAG response — captured in the
+// SSE `done` event below. Used by `/redo` and the ↻ button in the
+// feedback bar to regenerate without requiring the client to remember
+// the original question (the server resolves it from rag_queries SQL
+// by this turn_id; see _resolve_redo_question in web/server.py).
+let lastTurnId = null;
+
 // Send --------------------------------------------------------
-async function send(question) {
+// `opts.redo_turn_id` + `opts.hint` are optional — when present the
+// server resolves the original question from SQL and regenerates with
+// an optional soft-steer. `question` is still required by the Pydantic
+// validator (non-empty); pass "(redo)" or similar as placeholder when
+// redo_turn_id is set.
+async function send(question, opts = {}) {
   if (pending) return;
   pending = true;
   lastUserQuestion = question;
@@ -1825,10 +1867,17 @@ async function send(question) {
   }
 
   try {
+    const reqBody = {
+      question,
+      session_id: sessionId,
+      vault_scope: vaultScope || null,
+    };
+    if (opts.redo_turn_id) reqBody.redo_turn_id = opts.redo_turn_id;
+    if (opts.hint) reqBody.hint = opts.hint;
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, session_id: sessionId, vault_scope: vaultScope || null }),
+      body: JSON.stringify(reqBody),
       signal: currentController.signal,
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -1999,6 +2048,10 @@ async function send(question) {
             session_id: sessionId,
           })
         : null;
+      // Capture the turn_id so `/redo` and ↻ can regenerate without the
+      // client needing to remember the original question (server resolves
+      // it from rag_queries SQL). Also used by the redo button below.
+      if (parsed.turn_id) lastTurnId = parsed.turn_id;
       if (fullText.trim()) {
         if (feedbackBar) {
           appendCopyButton(feedbackBar, () => buildMarkdownExport(question, fullText, sources));
@@ -2212,6 +2265,24 @@ async function handleSlashCommand(raw) {
     } catch (err) {
       pushSystemMessage("err", `reindex: ${err.message}`);
     }
+    return true;
+  }
+  if (cmd === "/redo") {
+    // Regenerate the last turn, optionally with a soft-steer hint.
+    // Falls back to a user-visible hint when there's no lastTurnId
+    // yet (fresh session with zero turns).
+    input.value = "";
+    autoGrow();
+    if (!lastTurnId) {
+      pushSystemMessage("err", "no hay respuesta previa para regenerar");
+      return true;
+    }
+    const hint = (arg || "").trim();
+    // Placeholder question — server ignores it when redo_turn_id is set
+    // (resolves the real q from rag_queries SQL), but the Pydantic
+    // ChatRequest validator requires non-empty question.
+    await send(hint ? `(redo: ${hint})` : "(redo)",
+               { redo_turn_id: lastTurnId, hint: hint || null });
     return true;
   }
   // Unknown /foo — let send() handle it so the LLM can answer instead of

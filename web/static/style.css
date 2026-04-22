@@ -597,6 +597,21 @@ html, body {
   border-color: var(--red);
   background: color-mix(in srgb, var(--red) 12%, transparent);
 }
+/* Redo button — cyan to distinguish from the binary feedback buttons
+   (green/red). Clicking "regenerar" isn't a quality signal, it's a
+   request for a retry, so it gets its own colour semantics. */
+.fb-btn.fb-redo .fb-icon { color: var(--cyan); }
+.fb-btn.fb-redo:hover:not(:disabled),
+.fb-btn.fb-redo:hover:not(:disabled) .fb-icon { color: var(--cyan); }
+.fb-btn.fb-redo:hover:not(:disabled)          { border-color: var(--cyan); }
+.fb-btn.fb-redo.picked,
+.fb-btn.fb-redo.picked .fb-icon {
+  color: var(--cyan);
+}
+.fb-btn.fb-redo.picked {
+  border-color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 12%, transparent);
+}
 .fb-btn.dimmed {
   opacity: 0.35;
   border-color: var(--border);

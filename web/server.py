@@ -697,6 +697,17 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     # None → vault activo; "all" → todos los registrados; "name" → ese puntual.
     vault_scope: str | None = None
+    # Regeneration: pass a previous turn_id to re-ask that same question.
+    # The handler resolves `q` from rag_queries (by turn_id in extra_json)
+    # and uses it as the effective question, so the client can call /redo
+    # without having kept the question text locally. `hint` is an optional
+    # soft-steer that gets concatenated ("la pregunta — enfocá: <hint>")
+    # to redirect the answer without reformulating from scratch.
+    # When redo_turn_id is set, `question` becomes a placeholder — the
+    # client should still send "(redo)" or similar non-empty string to
+    # satisfy the non-empty validator.
+    redo_turn_id: str | None = Field(None, max_length=80)
+    hint: str | None = Field(None, max_length=500)
 
     @field_validator("question")
     @classmethod
@@ -705,6 +716,15 @@ class ChatRequest(BaseModel):
             raise ValueError("question must be non-empty")
         if len(v) > _CHAT_QUESTION_MAX:
             raise ValueError(f"question too long (>{_CHAT_QUESTION_MAX} chars)")
+        return v
+
+    @field_validator("redo_turn_id")
+    @classmethod
+    def _check_redo_turn_id(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _TURN_ID_RE.match(v):
+            raise ValueError("invalid redo_turn_id format")
         return v
 
     @field_validator("session_id")
@@ -3799,6 +3819,38 @@ def _retry_pending_conversation_turns() -> int:
     return retried
 
 
+def _resolve_redo_question(turn_id: str) -> tuple[str | None, str | None]:
+    """Resolve the original question from a previous turn_id.
+
+    `turn_id` is not a first-class column of `rag_queries` — it lives in
+    `extra_json` (see `_map_queries_row()`). We query by the JSON path
+    and return `(q, session)` from the latest matching row, or (None, None)
+    if not found.
+
+    Scoped to rag_queries because every web chat turn is logged there via
+    log_query_event(). The lookup is O(log n) via the index on `ts`, then
+    a sequential scan over extra_json matches — fine for single-lookup
+    semantics (redo is rare vs new chat).
+    """
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT q, session FROM rag_queries"
+                " WHERE json_extract(extra_json, '$.turn_id') = ?"
+                " ORDER BY ts DESC LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 — log + fail gracefully
+        print(f"[redo] sql lookup failed: {type(exc).__name__}: {exc}", flush=True)
+        return None, None
+    if row is None:
+        return None, None
+    q = (row[0] or "").strip() or None
+    session = (row[1] or "").strip() or None
+    return q, session
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # Rate limit: 30 chat requests / 60s per IP. Each request pins the
@@ -3819,7 +3871,43 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         )
     except Exception:
         _client_device = "other"
-    question = req.question.strip()
+
+    # ── /redo path ───────────────────────────────────────────────────────
+    # If the client sent redo_turn_id, resolve the original question from
+    # rag_queries (SQL), optionally prepending a hint to soft-steer the
+    # regeneration. This keeps the endpoint uniform (same SSE stream, same
+    # downstream retrieve + generate pipeline) — the only difference is
+    # that `question` is loaded from persistence + possibly augmented.
+    # Session preservation: if the client didn't pass session_id, we
+    # inherit the one from the original turn, so the regenerated answer
+    # lands in the same conversation.
+    _redo_hint: str | None = None
+    _redo_of: str | None = None
+    if req.redo_turn_id:
+        _orig_q, _orig_session = _resolve_redo_question(req.redo_turn_id)
+        if not _orig_q:
+            raise HTTPException(
+                status_code=404,
+                detail=f"turn_id '{req.redo_turn_id}' no encontrado en rag_queries",
+            )
+        _redo_of = req.redo_turn_id
+        _redo_hint = (req.hint or "").strip() or None
+        if _redo_hint:
+            # Soft-steer: concatenate with a clear separator so the LLM
+            # retriever sees both signals. We don't modify the original
+            # q in SQL — the hint is ephemeral to this regeneration.
+            question = f"{_orig_q} — enfocá en: {_redo_hint}"
+        else:
+            question = _orig_q
+        # Inherit the session from the original turn unless the client
+        # overrode it. Preserves conversation continuity.
+        if not req.session_id and _orig_session:
+            # Pydantic models are immutable by default but session_id
+            # has no frozen=True guard — assign via object.__setattr__
+            # to stay type-safe.
+            object.__setattr__(req, "session_id", _orig_session)
+    else:
+        question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty question")
 
@@ -4953,6 +5041,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # windows/android/other. Habilita analytics por device y es
             # prerequisito para layout adaptativo (mac-term mobile).
             "device": _client_device,
+            # Redo metadata — non-null only when the client called /redo
+            # via redo_turn_id. Let analytics count how often users
+            # regenerate + whether hint-assisted redos land better
+            # answers than bare redos (top_score delta).
+            "redo_of_turn_id": _redo_of,
+            "redo_hint": _redo_hint,
         })
 
         yield _sse("done", {

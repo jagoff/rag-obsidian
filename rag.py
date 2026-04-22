@@ -9353,6 +9353,33 @@ _RERANKER_IDLE_TTL = float(os.environ.get("RAG_RERANKER_IDLE_TTL", "900"))
 RERANKER_IDLE_TTL = _RERANKER_IDLE_TTL  # public alias — the `_` prefix was accidental (it's a config flag, not private)
 
 
+def _resolve_reranker_model_path() -> str:
+    """Return the model path the reranker should load.
+
+    Priority:
+      1. `RAG_RERANKER_FT_PATH` env (explicit fine-tuned model dir)
+      2. `~/.cache/obsidian-rag/reranker-ft-current` symlink if present
+      3. Hardcoded `RERANKER_MODEL` baseline
+
+    GC#2.B (2026-04-22): fine-tune shipped via `scripts/finetune_reranker.py`
+    promotes a checkpoint through the symlink only after passing the eval
+    gate. Absent or broken symlink → baseline stays in effect.
+    """
+    explicit = os.environ.get("RAG_RERANKER_FT_PATH", "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+    current = Path.home() / ".cache" / "obsidian-rag" / "reranker-ft-current"
+    try:
+        if current.exists():
+            # Resolve symlinks to avoid CrossEncoder sometimes choking on them.
+            resolved = current.resolve()
+            if resolved.exists():
+                return str(resolved)
+    except Exception:
+        pass
+    return RERANKER_MODEL
+
+
 def get_reranker():
     """Lazy-load cross-encoder reranker on the best available accelerator.
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
@@ -9386,7 +9413,8 @@ def get_reranker():
             device = "cuda"
         else:
             device = "cpu"
-        _reranker = CrossEncoder(RERANKER_MODEL, max_length=512, device=device)
+        model_path = _resolve_reranker_model_path()
+        _reranker = CrossEncoder(model_path, max_length=512, device=device)
     return _reranker
 
 

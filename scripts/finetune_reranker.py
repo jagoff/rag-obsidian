@@ -16,14 +16,26 @@ Usage:
   python scripts/finetune_reranker.py --no-eval     # skip the gate (debug only)
   python scripts/finetune_reranker.py --epochs 3 --lr 2e-5
 
+  # Alternative: consume pairs pre-exported by scripts/export_training_pairs.py
+  # (2026-04-22). That miner uses rag_behavior events (copies, opens, dwells)
+  # as additional positives — 10x more signal than rag_feedback alone once
+  # the user has used the system for a few days. The JSONL shape is
+  # {query, positive, negatives, source, ...} — see export_training_pairs.py.
+  python scripts/export_training_pairs.py --days 30 -o /tmp/pairs.jsonl
+  python scripts/finetune_reranker.py --pairs-from /tmp/pairs.jsonl
+
 Caveats:
   - Uses `corrective_path` from `rag_feedback.extra_json` as clean single
     positive when available. Falls back to all turn paths when absent
     (noisy but usable).
   - Gated on `RAG_FINETUNE_MIN_CORRECTIVES` (default 20). Below this,
     aborts with exit 5 — the signal is too weak for meaningful fine-tune.
+    NOTE: gate only applies to the default (SQL) source. When using
+    --pairs-from, the user already curated the signal in the miner so the
+    gate is bypassed (tuning the min-negatives flag there instead).
   - Hard negatives mined via retrieve() top-K, excluding the corrective_path
-    when present.
+    when present. When using --pairs-from, negatives come pre-mined from
+    impression history in the miner (no runtime retrieve needed).
   - The eval gate is strict: no regression on either singles or chains hit@5.
 """
 from __future__ import annotations
@@ -357,6 +369,64 @@ def _print_val_summary(val_predictions):
               f"(positive > negative by this much; should be > 0)", file=sys.stderr)
 
 
+def _load_pairs_from_jsonl(
+    jsonl_path: Path, vault_root: Path, hard_neg_k: int,
+) -> list[dict]:
+    """Convert export_training_pairs.py-style JSONL rows into the
+    `{text1, text2, label}` format the CrossEncoder trainer consumes.
+
+    Input shape (one per line, matches scripts/export_training_pairs.py):
+      {"query": str, "positive": "<vault-rel>", "negatives": [str, ...],
+       "source": str, "turn_id": str|None, "ts": str}
+
+    Output per row yields up to 1 + hard_neg_k training pairs:
+      - 1 positive: {text1: query, text2: first-800-chars-of-positive, label: 1.0}
+      - up to hard_neg_k negatives: same text1, each negative's doc, label 0.0
+
+    Paths whose vault file is unreadable (gone, permissions) are skipped
+    with a tally. Counting skips explicitly so the operator sees how much
+    of the export landed in the training set.
+    """
+    if not jsonl_path.is_file():
+        raise FileNotFoundError(f"pairs file not found: {jsonl_path}")
+
+    pairs: list[dict] = []
+    rows_seen = 0
+    skipped_unreadable = 0
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line_idx, raw in enumerate(f, start=1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                print(f"  [skip] line {line_idx}: bad JSON ({exc})",
+                      file=sys.stderr)
+                continue
+            query = (row.get("query") or "").strip()
+            positive = (row.get("positive") or "").strip()
+            if not query or not positive:
+                continue
+            rows_seen += 1
+            pos_doc = _path_to_doc(positive, vault_root)
+            if pos_doc is None:
+                skipped_unreadable += 1
+                continue
+            pairs.append({"text1": query, "text2": pos_doc, "label": 1.0})
+            # Cap negatives per row at hard_neg_k so the ratio stays sane.
+            for neg_path in (row.get("negatives") or [])[:hard_neg_k]:
+                neg_doc = _path_to_doc(str(neg_path).strip(), vault_root)
+                if neg_doc is None:
+                    skipped_unreadable += 1
+                    continue
+                pairs.append({"text1": query, "text2": neg_doc, "label": 0.0})
+    print(f"  JSONL rows seen: {rows_seen} "
+          f"(skipped unreadable paths: {skipped_unreadable})",
+          file=sys.stderr)
+    return pairs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -367,33 +437,62 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--hard-neg-k", type=int, default=5)
+    ap.add_argument("--pairs-from", type=str, default=None,
+                    metavar="JSONL",
+                    help=("Consume pre-exported training pairs from a JSONL "
+                          "file (produced by scripts/export_training_pairs.py). "
+                          "Skips the default SQL-based _fetch_feedback_pairs() + "
+                          "runtime hard-neg mining; the JSONL already carries "
+                          "history-based hard negs."))
     args = ap.parse_args()
 
     print("== GC#2.C — fine-tune reranker ==", file=sys.stderr)
 
-    # 1. Feedback rows
-    rows = _fetch_feedback_pairs()
-    print(f"  Feedback positives (with paths): {len(rows)}", file=sys.stderr)
-    if len(rows) < 10:
-        print("  Not enough feedback data — need ≥10 rated-positive turns with "
-              "paths. Aborting.", file=sys.stderr)
-        sys.exit(2)
-
-    min_correctives = int(os.environ.get("RAG_FINETUNE_MIN_CORRECTIVES", "20"))
-    rows_with_corrective = [r for r in rows if r.get("corrective_path")]
-    print(f"  Rows with corrective_path: {len(rows_with_corrective)} "
-          f"(min required: {min_correctives})", file=sys.stderr)
-    if len(rows_with_corrective) < min_correctives:
-        print(f"  Not enough corrective_path signal — need ≥{min_correctives}, "
-              f"got {len(rows_with_corrective)}.", file=sys.stderr)
-        print("  Use `rag chat` + thumbs-down on failed turns to generate more. "
-              "Aborting.", file=sys.stderr)
-        sys.exit(5)
-
-    # 2. Build pairs
     col = rag.get_db()
     vault_root = rag._resolve_vault_path()
-    pairs = _build_training_pairs(rows, col, vault_root, hard_neg_k=args.hard_neg_k)
+
+    # Two code paths depending on the data source:
+    #   - --pairs-from <jsonl>: skip the SQL fetch + runtime retrieve hard-neg
+    #     mining. The miner has already done that work offline with richer
+    #     signal (rag_behavior events + impression history).
+    #   - default: the original rag_feedback-only path with runtime retrieve.
+    if args.pairs_from:
+        jsonl_path = Path(args.pairs_from).expanduser().resolve()
+        print(f"  Loading pre-mined pairs from: {jsonl_path}", file=sys.stderr)
+        pairs = _load_pairs_from_jsonl(
+            jsonl_path, vault_root, hard_neg_k=args.hard_neg_k,
+        )
+        if len(pairs) < 20:
+            # Lower bar than the SQL path's 10-row gate because each JSONL
+            # row already yields 1 + up to N negatives, so 20 training
+            # pairs = ~4-6 queries worth — still too low, abort.
+            print(f"  Not enough training pairs from JSONL ({len(pairs)} < 20). "
+                  f"Re-export with --days wider or --min-negatives 0. Aborting.",
+                  file=sys.stderr)
+            sys.exit(2)
+    else:
+        # 1. Feedback rows
+        rows = _fetch_feedback_pairs()
+        print(f"  Feedback positives (with paths): {len(rows)}", file=sys.stderr)
+        if len(rows) < 10:
+            print("  Not enough feedback data — need ≥10 rated-positive turns with "
+                  "paths. Aborting.", file=sys.stderr)
+            sys.exit(2)
+
+        min_correctives = int(os.environ.get("RAG_FINETUNE_MIN_CORRECTIVES", "20"))
+        rows_with_corrective = [r for r in rows if r.get("corrective_path")]
+        print(f"  Rows with corrective_path: {len(rows_with_corrective)} "
+              f"(min required: {min_correctives})", file=sys.stderr)
+        if len(rows_with_corrective) < min_correctives:
+            print(f"  Not enough corrective_path signal — need ≥{min_correctives}, "
+                  f"got {len(rows_with_corrective)}.", file=sys.stderr)
+            print("  Use `rag chat` + thumbs-down on failed turns to generate more. "
+                  "Aborting.", file=sys.stderr)
+            sys.exit(5)
+
+        # 2. Build pairs
+        pairs = _build_training_pairs(rows, col, vault_root, hard_neg_k=args.hard_neg_k)
+
     pos = sum(1 for p in pairs if p["label"] == 1.0)
     neg = sum(1 for p in pairs if p["label"] == 0.0)
     print(f"  Training pairs: total={len(pairs)} pos={pos} neg={neg}",

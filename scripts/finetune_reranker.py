@@ -369,7 +369,7 @@ def main():
     ap.add_argument("--hard-neg-k", type=int, default=5)
     args = ap.parse_args()
 
-    print("== GC#2.B — fine-tune reranker ==", file=sys.stderr)
+    print("== GC#2.C — fine-tune reranker ==", file=sys.stderr)
 
     # 1. Feedback rows
     rows = _fetch_feedback_pairs()

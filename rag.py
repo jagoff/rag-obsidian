@@ -11018,9 +11018,13 @@ SYSTEM_RULES_SYNTHESIS = (
     "1. SOLO info literal del CONTEXTO. Sin parafraseos, intros ni conocimiento externo.\n"
     "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
     "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders — siempre ruta real.\n"
-    "3. Cuando ≥2 fuentes se solapan, citalas explícitamente y señalá acuerdo o tensión entre ellas. "
+    "3. Síntesis requiere ≥2 fuentes distintas que se solapan. Si el CONTEXTO "
+    "tiene <2 fuentes relevantes al tema, responder EXACTO: "
+    "'No hay suficientes fuentes en el vault para sintetizar esto.' y cortar. "
+    "NUNCA inventar una síntesis con 1 sola fuente — eso es paráfrasis, no síntesis.\n"
+    "4. Cuando hay ≥2 fuentes, citalas explícitamente y señalá acuerdo o tensión entre ellas. "
     "No suavices contradicciones — si dos notas dicen cosas distintas, indicalo.\n"
-    "4. Formato: síntesis integrada con viñetas si hay múltiples puntos, sin intro vacía.\n"
+    "5. Formato: síntesis integrada con viñetas si hay múltiples puntos, sin intro vacía.\n"
 )
 
 SYSTEM_RULES_COMPARISON = (
@@ -11032,10 +11036,13 @@ SYSTEM_RULES_COMPARISON = (
     "1. SOLO info literal del CONTEXTO. Sin parafraseos, intros ni conocimiento externo.\n"
     "2. Citar ruta al mencionar nota: formato [Título](VALOR), donde VALOR es "
     "el string exacto del chunk `[ruta: VALOR]`. Nada de placeholders — siempre ruta real.\n"
-    "3. Estructurá la respuesta como: '[Fuente A] dice X / [Fuente B] dice Y / "
-    "Diferencia clave: …' cuando la pregunta implica comparación. "
-    "Si solo hay una fuente relevante, respondé directamente sin forzar la estructura.\n"
-    "4. Formato: contraste explícito, sin intro vacía.\n"
+    "3. Comparación requiere ≥2 fuentes distintas (una por cada lado de la comparación). "
+    "Si el CONTEXTO tiene <2 fuentes relevantes, responder EXACTO: "
+    "'No hay suficientes fuentes en el vault para comparar esto.' y cortar. "
+    "NUNCA inventes el lado faltante desde conocimiento general aun si sabés la respuesta.\n"
+    "4. Cuando hay ≥2 fuentes, estructurá la respuesta como: "
+    "'[Fuente A] dice X / [Fuente B] dice Y / Diferencia clave: …'.\n"
+    "5. Formato: contraste explícito, sin intro vacía.\n"
 )
 
 

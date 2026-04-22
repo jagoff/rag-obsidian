@@ -509,6 +509,9 @@ def upsert_chunks(
         })
 
     col.add(ids=ids, embeddings=embeddings, documents=docs, metadatas=metas)
+    # Entity extraction — keep `rag_entities` fresh as WA history grows.
+    # Gated by `_entity_extraction_enabled()` + silent-fail if gliner absent.
+    rag._extract_and_index_entities_for_chunks(docs, ids, metas, "whatsapp")
     return len(chunks)
 
 

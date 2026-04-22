@@ -453,6 +453,9 @@ def upsert_threads(col, threads: list[GmailThread]) -> int:
             "parent": _format_thread_parent(t),
         })
     col.add(ids=ids, embeddings=embeddings, documents=bodies, metadatas=metas)
+    # Entity extraction — senders / organizations mentioned in email threads.
+    # Gated by `_entity_extraction_enabled()` + silent-fail if gliner absent.
+    rag._extract_and_index_entities_for_chunks(bodies, ids, metas, "gmail")
     return len(threads)
 
 

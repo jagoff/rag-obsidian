@@ -396,6 +396,9 @@ def upsert_reminders(col, reminders: list[Reminder]) -> int:
             "parent": body,
         })
     col.add(ids=ids, embeddings=embeddings, documents=bodies, metadatas=metas)
+    # Entity extraction — people / projects mentioned in reminder bodies.
+    # Gated by `_entity_extraction_enabled()` + silent-fail if gliner absent.
+    rag._extract_and_index_entities_for_chunks(bodies, ids, metas, "reminders")
     return len(reminders)
 
 

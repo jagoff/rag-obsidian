@@ -448,6 +448,9 @@ def upsert_events(col, events: list[CalEvent]) -> int:
             "parent": body,
         })
     col.add(ids=ids, embeddings=embeddings, documents=bodies, metadatas=metas)
+    # Entity extraction — attendees / organizers / locations in event bodies.
+    # Gated by `_entity_extraction_enabled()` + silent-fail if gliner absent.
+    rag._extract_and_index_entities_for_chunks(bodies, ids, metas, "calendar")
     return len(events)
 
 

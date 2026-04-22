@@ -315,10 +315,20 @@ def test_gliner_sticky_failure_on_import_error(reset_gliner_state, monkeypatch):
 # _extract_and_index_entities_for_chunks (high-level)
 # ──────────────────────────────────────────────────────────────────────
 
-def test_extract_and_index_disabled_by_default(monkeypatch):
-    """Default OFF → no-op."""
+def test_extract_and_index_no_crash_on_default(monkeypatch):
+    """Post-flip (2026-04-21): default ON. Must not crash when gliner is
+    missing (silent-fail via sticky flag) nor when gliner is present but
+    the input is trivial."""
     monkeypatch.delenv("RAG_EXTRACT_ENTITIES", raising=False)
-    # Should not crash
+    # Should not crash regardless of gliner availability
+    rag._extract_and_index_entities_for_chunks(
+        ["text"], ["id1"], [{"ts": 1.0}], "vault"
+    )
+
+
+def test_extract_and_index_disabled_when_flag_off(monkeypatch):
+    """Explicit RAG_EXTRACT_ENTITIES=0 → no-op even with gliner installed."""
+    monkeypatch.setenv("RAG_EXTRACT_ENTITIES", "0")
     rag._extract_and_index_entities_for_chunks(
         ["text"], ["id1"], [{"ts": 1.0}], "vault"
     )
@@ -330,6 +340,7 @@ def test_extract_and_index_empty_inputs(monkeypatch):
 
 
 def test_entity_extraction_enabled_reads_env(monkeypatch):
+    # Post 2026-04-21: default ON. Only "0"/"false"/"no" disable.
     monkeypatch.setenv("RAG_EXTRACT_ENTITIES", "1")
     assert rag._entity_extraction_enabled() is True
 
@@ -339,5 +350,12 @@ def test_entity_extraction_enabled_reads_env(monkeypatch):
     monkeypatch.setenv("RAG_EXTRACT_ENTITIES", "false")
     assert rag._entity_extraction_enabled() is False
 
-    monkeypatch.delenv("RAG_EXTRACT_ENTITIES", raising=False)
+    monkeypatch.setenv("RAG_EXTRACT_ENTITIES", "no")
     assert rag._entity_extraction_enabled() is False
+
+    # Unset / empty string → default ON (post-flip invariant)
+    monkeypatch.delenv("RAG_EXTRACT_ENTITIES", raising=False)
+    assert rag._entity_extraction_enabled() is True
+
+    monkeypatch.setenv("RAG_EXTRACT_ENTITIES", "")
+    assert rag._entity_extraction_enabled() is True

@@ -15447,6 +15447,12 @@ def _index_single_file(
             documents=display_texts,
             metadatas=metadatas,
         )
+    # Entity extraction — populates rag_entities + rag_entity_mentions so
+    # `RAG_ENTITY_LOOKUP` (default ON post-2026-04-21) stays fresh as the
+    # vault evolves. Gated by `_entity_extraction_enabled()` + silent-fail
+    # if gliner isn't installed. Runs outside the collection-write lock
+    # (writes to telemetry.db, separate file / WAL).
+    _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
     # URL sub-index runs in lockstep — same hash gate, same liveness window.
     try:
         _index_urls(get_urls_db(), doc_id_prefix, raw, path.stem, folder, tags)
@@ -15774,6 +15780,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             metadatas=metadatas,
         )
         added_chunks += len(ids)
+        # Entity extraction — see `_index_single_file` for the same hook
+        # on the incremental path; same invariants (gated by
+        # `_entity_extraction_enabled`, silent-fail if gliner absent).
+        _extract_and_index_entities_for_chunks(display_texts, ids, metadatas, "vault")
         # URL sub-index, same hash gate as the chunk index above.
         try:
             urls_indexed += _index_urls(col_urls, doc_id_prefix, raw, path.stem, folder, tags)
@@ -34633,7 +34643,21 @@ _gliner_load_failed = False
 
 
 def _entity_extraction_enabled() -> bool:
-    return os.environ.get("RAG_EXTRACT_ENTITIES", "").strip() not in ("", "0", "false", "no")
+    """True cuando RAG_EXTRACT_ENTITIES no está seteada a "0"/"false"/"no".
+
+    **Default ON tras 2026-04-21** — popula `rag_entities` +
+    `rag_entity_mentions` durante indexing (vault + cross-source ingesters)
+    para que `RAG_ENTITY_LOOKUP` (también default ON) no dependa solo del
+    one-shot `scripts/backfill_entities.py`. Si `gliner` no está instalado,
+    `_extract_entities_batch()` hace sticky-fail silencioso — sin costo ni
+    log spam en entornos que no optaron por `[entities]`.
+
+    Setear a "0"/"false"/"no" para desactivar la extracción durante indexing
+    aun con `gliner` disponible (útil para acelerar `rag index --reset` si
+    se prefiere correr el backfill después).
+    """
+    val = os.environ.get("RAG_EXTRACT_ENTITIES", "").strip().lower()
+    return val not in ("0", "false", "no")
 
 
 def _get_gliner_model():

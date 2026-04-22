@@ -17699,6 +17699,16 @@ def query(
         "t_gen": round(t_gen, 2),
         "answer_len": len(full),
         "bad_citations": [p for _, p in bad],
+        # Post 2026-04-22 telemetry expansion — the existing `citation_repaired`
+        # boolean tells us the outcome but not the input. Without these two
+        # fields we cannot validate empirically whether the threshold
+        # `_CITATION_REPAIR_MAX_BAD` (default 2) is well-calibrated. Spec:
+        #   bad_citations_count      = len(bad) produced by verify_citations()
+        #   citation_repair_attempted = bad_count ∈ (0, _CITATION_REPAIR_MAX_BAD]
+        # Downstream analysis: GROUP BY bad_citations_count, citation_repaired
+        # → if count=3 has >60% repair success, bump threshold to 3.
+        "bad_citations_count": len(bad),
+        "citation_repair_attempted": 0 < len(bad) <= _CITATION_REPAIR_MAX_BAD,
         "citation_repaired": citation_repaired,
         "critique_fired": critique_fired,
         "critique_changed": critique_changed,
@@ -18802,6 +18812,12 @@ def chat(
             "paths": [m.get("file", "") for m in result["metas"]],
             "scores": [round(float(s), 2) for s in result["scores"]],
             "top_score": round(float(result["confidence"]), 2),
+            # Post 2026-04-22 telemetry — mirror del query() path. Sin estos
+            # dos numeritos no podíamos medir empíricamente si
+            # `_CITATION_REPAIR_MAX_BAD` está bien calibrado. Ver
+            # test_citation_repair_telemetry.py para el SQL analysis.
+            "bad_citations_count": len(_chat_pp.bad_citations),
+            "citation_repair_attempted": 0 < len(_chat_pp.bad_citations) <= _CITATION_REPAIR_MAX_BAD,
             "citation_repaired": _chat_citation_repaired,
             "critique_fired": critique_active,
             "critique_changed": _chat_critique_changed,

@@ -872,6 +872,15 @@ def _check_rate_limit(bucket: dict[str, list[float]], ip: str,
 _BEHAVIOR_KNOWN_EVENTS = frozenset({
     "open", "open_external", "positive_implicit",
     "negative_implicit", "kept", "deleted", "save",
+    # "copy" (2026-04-22): user copied text from a RAG response (web Cmd+C
+    # selection inside a .turn, or CLI `/copy`). Implicit positive signal
+    # — typically stronger than a 👍 because the user did something with
+    # the content, not just reacted to it. `path` carries the top source
+    # at the time of the copy (best-effort inference: we can't exactly
+    # attribute the copied substring to a chunk, so we pin rank=1). The
+    # copied text length is gated client-side (≥20 chars) to skip
+    # accidental copies of short labels / path fragments.
+    "copy",
 })
 _BEHAVIOR_SESSION_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,80}$")
 
@@ -907,6 +916,18 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
     # Validate path stays inside vault (no traversal)
     if req.path is not None:
         p = req.path
+        # Cross-source native ids (calendar://, whatsapp://, gmail://) are
+        # not vault-relative paths — they can't be consumed by the ranker-
+        # vivo CTR aggregator (keyed on vault-relative paths). Reject with
+        # 400 so clients get immediate feedback instead of silent drop.
+        # Also catches any pathological attempt to sneak a URI via the path
+        # field. Belt + suspenders: the client-side listener in app.js
+        # already filters these out before POSTing.
+        if "://" in p:
+            raise HTTPException(
+                status_code=400,
+                detail="path must be vault-relative (no URI schemes)",
+            )
         if p.startswith("/") or ".." in p.split("/"):
             raise HTTPException(status_code=400, detail="path must be vault-relative")
         try:

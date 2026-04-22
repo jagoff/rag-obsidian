@@ -2634,7 +2634,15 @@ RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
 # now measured over real impressions, with Laplace smoothing
 # (clicks+1)/(impressions+10) keeping sparse-interaction paths stable.
 
-_BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept"})
+_BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept",
+                                # "copy" (2026-04-22): user copied text from
+                                # a RAG response. Emitted by web (Cmd+C listener
+                                # on `.turn[data-turn-id]` selection >=20 chars)
+                                # and CLI (/copy handler). Stronger signal than
+                                # a 👍 — the user took action with the content,
+                                # not just reacted to it. Folded into CTR the
+                                # same way as open/save: +1 click, +1 impression.
+                                "copy"})
 _BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
 # Denominator-only events: `retrieve()` logs one `impression` row per final
 # result (capped at top_k) so CTR = clicks / real-impressions. Folded into
@@ -19424,6 +19432,10 @@ def chat(
         # /copy — copia la última respuesta al clipboard via pbcopy.
         # Útil en CLI donde seleccionar + Cmd-C rompe la línea de
         # streaming. Fail silent si pbcopy no está (Linux sin xclip).
+        # Además: log implícito como behavior event "copy" si la copia
+        # fue exitosa, con el top source como path inferido. Paralelo
+        # del copy-event en web/static/app.js — ambos alimentan el
+        # ranker-vivo con señal implícita positiva más fuerte que un 👍.
         if question == "/copy":
             if not last_assistant:
                 console.print("[yellow]No hay respuesta previa para copiar.[/yellow]")
@@ -19431,6 +19443,26 @@ def chat(
                 console.print(
                     f"[dim]✓ respuesta copiada al clipboard ({len(last_assistant)} chars).[/dim]"
                 )
+                # Inferir top source vault-relativo (skip cross-source
+                # URIs como calendar://, whatsapp://). Fire-and-forget —
+                # un fallo no debe romper el flow del chat.
+                try:
+                    _top_path = ""
+                    for _m in last_sources:
+                        _p = _m.get("file", "")
+                        if _p and "://" not in _p:
+                            _top_path = _p
+                            break
+                    if _top_path:
+                        log_behavior_event({
+                            "source": "cli",
+                            "event": "copy",
+                            "query": last_question or None,
+                            "path": _top_path,
+                            "rank": 1,
+                        })
+                except Exception as exc:
+                    _silent_log("chat_copy_behavior_log", exc)
             else:
                 console.print("[yellow]No pude copiar (pbcopy no disponible?).[/yellow]")
             continue

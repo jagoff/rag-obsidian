@@ -544,6 +544,62 @@ stopBtn.addEventListener("click", () => {
   if (currentController) currentController.abort();
 });
 
+// ── Copy-as-implicit-positive (2026-04-22) ──────────────────────────────
+// When the user copies text from a RAG response, that's a stronger
+// implicit positive than a 👍 — they're actually using the content.
+// We attribute the copy to (turn_id, query, top_source_path) via the
+// data-* attributes the `done` handler pins on the turn wrap, and POST
+// it to /api/behavior with event="copy".
+//
+// Gates, in order:
+//   1. Selection text length ≥ 20 chars — below that it's usually a
+//      label fragment / path piece, not real content.
+//   2. Selection must be inside a `.turn[data-turn-id]` — skips copies
+//      from system messages (/help, /stats), composer, topbar, etc.
+//   3. data-top-path must be present — means the turn had a vault-
+//      relative top source (cross-source turns don't get it).
+//   4. Fire-and-forget — no retry, no await on the outer event.
+//
+// Observable in `rag_behavior`:
+//   event='copy' source='web' path=<top> query=<q> rank=1
+// Feeds the ranker-vivo via _compute_behavior_priors_from_rows() the
+// same way clicks/opens do — higher-quality signal because the user
+// took action.
+document.addEventListener("copy", () => {
+  try {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    const text = (sel.toString() || "").trim();
+    if (text.length < 20) return;
+    // The ancestor `.turn` that owns this selection — use the anchor
+    // node, since that's where the selection started.
+    let node = sel.anchorNode;
+    if (node && node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+    if (!node) return;
+    const turn = node.closest && node.closest(".turn[data-turn-id]");
+    if (!turn) return;
+    const payload = {
+      source: "web",
+      event: "copy",
+      query: turn.dataset.q || null,
+      path: turn.dataset.topPath || null,
+      rank: turn.dataset.topPath ? 1 : null,
+      session: turn.dataset.session || null,
+    };
+    // No path → no signal worth logging (ranker-vivo keys on path).
+    if (!payload.path) return;
+    fetch("/api/behavior", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true,  // survive tab close / nav mid-flight
+    }).catch(() => { /* silent — copy shouldn't nag the user */ });
+  } catch {
+    /* Any DOM / selection API hiccup: swallow. The user's copy still
+       worked natively; we just lost the telemetry. */
+  }
+});
+
 // Tool-call chip labels — backend emits raw tool names (search_vault,
 // read_note, …); UI shows a Spanish-friendly short form. Unknown names
 // fall back to the raw identifier so new tools still render.
@@ -2052,6 +2108,26 @@ async function send(question, opts = {}) {
       // client needing to remember the original question (server resolves
       // it from rag_queries SQL). Also used by the redo button below.
       if (parsed.turn_id) lastTurnId = parsed.turn_id;
+      // Pin enough metadata on the turn DOM element so the global `copy`
+      // listener below can attribute a selection to a (turn, query, top
+      // source) tuple without a side-channel. Truncated query keeps the
+      // attribute value short (DOM attrs pay a memory price per node;
+      // CSS selectors on them stay cheap for <500 chars).
+      if (parsed.turn_id) {
+        turn.dataset.turnId = parsed.turn_id;
+        if (question) {
+          turn.dataset.q = question.length > 300
+            ? question.slice(0, 300) : question;
+        }
+        const topPath = (sources && sources[0] && sources[0].file) || "";
+        if (topPath && topPath.indexOf("://") === -1) {
+          // Skip cross-source ids (calendar://, whatsapp://) — those
+          // are not vault-relative paths and /api/behavior will 400
+          // on them (VAULT_PATH.resolve() relative_to check).
+          turn.dataset.topPath = topPath;
+        }
+        if (sessionId) turn.dataset.session = sessionId;
+      }
       if (fullText.trim()) {
         if (feedbackBar) {
           appendCopyButton(feedbackBar, () => buildMarkdownExport(question, fullText, sources));

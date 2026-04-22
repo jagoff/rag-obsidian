@@ -30666,6 +30666,12 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     `OLLAMA_KEEP_ALIVE=-1` pin's bge-m3 en VRAM para que el embed batch no
     pague cold-load en cada run. RAG_LOCAL_EMBED NO se setea (el ingester es
     bulk-embed path → ollama HTTP es el único batching-capable backend).
+
+    `RunAtLoad=true` (2026-04-22): garantiza run inmediato al instalar o
+    post-reboot; sin esto el primer refresh se demoraba hasta 15min tras
+    cargar el servicio — suficiente para que "último mensaje de X" post-
+    arranque del Mac devuelva data stale. El incremental cost es chico (<1s
+    cuando no hay nuevos).
     """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30688,7 +30694,7 @@ def _ingest_whatsapp_plist(rag_bin: str) -> str:
     <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
   </dict>
   <key>StartInterval</key><integer>900</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-whatsapp.error.log</string>
 </dict>
@@ -30731,7 +30737,7 @@ def _ingest_gmail_plist(rag_bin: str) -> str:
     <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-gmail.error.log</string>
 </dict>
@@ -30775,7 +30781,7 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
     <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-calendar.error.log</string>
 </dict>
@@ -30784,12 +30790,20 @@ def _ingest_calendar_plist(rag_bin: str) -> str:
 
 
 def _ingest_reminders_plist(rag_bin: str) -> str:
-    """Cross-source: Apple Reminders ingester, cada 6h.
+    """Cross-source: Apple Reminders ingester, cada 1h.
 
-    AppleScript full-scan (~100s en host con 36 reminders). Incremental via
-    content-hash diff post-fetch — solo re-embedea los cambiados. Dado el
-    costo del scan + que Reminders raramente cambian en ventanas cortas, 6h
-    (21600s) balance freshness vs CPU/tiempo wall.
+    AppleScript full-scan (~7-100s dependiendo de cuántos reminders). Incremental
+    via content-hash diff post-fetch — solo re-embedea los cambiados. En steady
+    state con 0 cambios el run termina en ~7s (solo el scan sin embedding).
+
+    Interval bajado de 6h → 1h (2026-04-22): empíricamente "37 fetched · 0
+    indexados · 0 borrados · 7s" — el costo es negligible y reminders es la
+    fuente MÁS dinámica en el día a día del usuario (marcar como done, crear
+    nuevos). Alineado con gmail/calendar (1h) así las queries tipo "qué tengo
+    esta semana" + "qué reminders pendientes" devuelven data fresh.
+
+    `RunAtLoad=true`: corre inmediatamente al instalar / post-reboot, no hay
+    que esperar 1h para ver el primer refresh.
 
     Local-only (EventKit via osascript); no OAuth quota. Si el AppleScript
     falla (Full Disk Access denegado, Reminders.app not running), el
@@ -30815,8 +30829,8 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
     <key>TERM</key><string>dumb</string>
     <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
   </dict>
-  <key>StartInterval</key><integer>21600</integer>
-  <key>RunAtLoad</key><false/>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/ingest-reminders.error.log</string>
 </dict>

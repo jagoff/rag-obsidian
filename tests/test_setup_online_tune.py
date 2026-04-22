@@ -110,6 +110,38 @@ def test_watch_plist_uses_all_vaults():
     assert args.index("--all-vaults") > args.index("watch")
 
 
+@pytest.mark.parametrize("plist_fn,label,expected_interval", [
+    (rag_module._ingest_whatsapp_plist, "whatsapp", 900),
+    (rag_module._ingest_gmail_plist,    "gmail",    3600),
+    (rag_module._ingest_calendar_plist, "calendar", 3600),
+    (rag_module._ingest_reminders_plist, "reminders", 3600),
+])
+def test_ingester_plists_run_at_load_and_interval(plist_fn, label, expected_interval):
+    """Regression (2026-04-22): reminders estaba en interval 6h (21600s) y
+    los 4 ingesters tenían RunAtLoad=false. Post-reboot ninguno refresheaba
+    inmediatamente, y reminders quedaba >17h stale en uso normal.
+
+    Fix:
+      - `RunAtLoad=true` en los 4 → corrida inmediata al cargar el service.
+      - Reminders interval 21600 → 3600 (alineado con gmail/calendar).
+
+    Este test guardspora los intervals exactos y la bandera RunAtLoad.
+    """
+    d = _parse_plist(plist_fn(RAG_BIN))
+    assert d.get("RunAtLoad") is True, (
+        f"ingest-{label} plist must have RunAtLoad=true so launchd "
+        "runs it immediately at install/reboot. Otherwise the first "
+        "refresh waits up to the full StartInterval which makes data "
+        "stale in the window after boot."
+    )
+    assert d.get("StartInterval") == expected_interval, (
+        f"ingest-{label} StartInterval drifted from {expected_interval}s; "
+        "validate the trade-off before changing (reminders in particular "
+        "is local-only so interval shrinks are cheap; gmail/calendar hit "
+        "OAuth quotas so 1h is the floor)."
+    )
+
+
 def test_digest_plist_no_rag_explore():
     d = _parse_plist(rag_module._digest_plist(RAG_BIN))
     env = d.get("EnvironmentVariables", {})
@@ -228,10 +260,10 @@ def test_services_spec_includes_ingesters():
 
 
 @pytest.mark.parametrize("fn_name,expected_source,expected_interval", [
-    ("_ingest_whatsapp_plist", "whatsapp", 900),     # 15 min
-    ("_ingest_gmail_plist", "gmail", 3600),          # 1 hora
-    ("_ingest_reminders_plist", "reminders", 21600), # 6 horas
-    ("_ingest_calendar_plist", "calendar", 3600),    # 1 hora
+    ("_ingest_whatsapp_plist", "whatsapp", 900),    # 15 min
+    ("_ingest_gmail_plist", "gmail", 3600),         # 1 hora
+    ("_ingest_reminders_plist", "reminders", 3600), # 1 hora (bajado desde 6h el 2026-04-22)
+    ("_ingest_calendar_plist", "calendar", 3600),   # 1 hora
 ])
 @requires_plutil
 def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval):
@@ -258,10 +290,14 @@ def test_ingester_plist_valid_plist(fn_name, expected_source, expected_interval)
     # 4. StartInterval esperado
     assert d["StartInterval"] == expected_interval
 
-    # 5. RunAtLoad=False — no queremos que el primer install arranque un
-    #    full-scan agresivo (el WA bootstrap tarda ~1min, Reminders 100s).
-    #    Primer run espera a StartInterval.
-    assert d["RunAtLoad"] is False
+    # 5. RunAtLoad=True (2026-04-22 flip): los runs steady-state cuestan <30s
+    #    (gmail/calendar api incremental via cursor, WA <1s con 0 nuevos,
+    #    reminders 7s). El bootstrap full-scan (que motivó el false original)
+    #    solo corre la primera vez que un ingester toca un corpus vacío — ya
+    #    pasó en todos. Sin RunAtLoad, el primer refresh post-reboot / post-
+    #    install del user demora hasta StartInterval (hasta 1h), dejando
+    #    "qué tengo esta semana" con data stale.
+    assert d["RunAtLoad"] is True
 
     # 6. OLLAMA_KEEP_ALIVE=-1 en env — el ingester emite un batch de embeds
     #    con bge-m3; sin esto, cada corrida paga cold-load.

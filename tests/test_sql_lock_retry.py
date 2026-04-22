@@ -95,20 +95,29 @@ def test_sql_write_with_retry_backoff_upper_bound_increased():
         assert 0.15 <= s <= 0.5, f"sleep {s}s outside [0.15, 0.5]"
 
 
-def test_sql_write_with_retry_non_lock_errors_fail_fast():
-    """Disk-full, schema drift, constraint violations etc. must NOT retry —
-    they don't resolve by waiting, and retrying just wastes latency."""
-    calls = {"n": 0}
+def test_sql_write_with_retry_non_transient_errors_fail_fast():
+    """Schema drift, constraint violations, corruption etc. must NOT retry —
+    they don't resolve by waiting, and retrying just wastes latency.
 
-    def writer():
-        calls["n"] += 1
-        raise sqlite3.OperationalError("disk I/O error")
+    Post 2026-04-22 `disk I/O error` se considera transient y se reintenta
+    (ver test_sql_disk_io_retry.py para esa expansión + justificación
+    empírica). Este test usa errores que SÍ son permanentes."""
+    for non_transient in (
+        "no such table: rag_queries",  # schema drift
+        "UNIQUE constraint failed",     # dup row
+        "database disk image is malformed",  # corruption
+    ):
+        calls = {"n": 0}
 
-    with patch("time.sleep"):
-        rag._sql_write_with_retry(writer, "test_tag")
+        def writer():
+            calls["n"] += 1
+            raise sqlite3.OperationalError(non_transient)
 
-    assert calls["n"] == 1, \
-        "disk I/O error is not transient — should not retry"
+        with patch("time.sleep"):
+            rag._sql_write_with_retry(writer, "test_tag")
+
+        assert calls["n"] == 1, \
+            f"{non_transient!r} is not transient — should fail fast"
 
 
 # ── semantic_cache_store: now uses retry wrapper ──────────────────────────────
@@ -194,11 +203,14 @@ def test_sql_read_with_retry_returns_on_transient_lock():
     assert calls["n"] == 3
 
 
-def test_sql_read_with_retry_non_lock_propagates_as_default():
-    """Non-lock errors degrade to default — same contract as
-    _sql_write_with_retry, so reads never raise into caller land."""
+def test_sql_read_with_retry_non_transient_propagates_as_default():
+    """Non-transient errors degrade to default — same contract as
+    _sql_write_with_retry, so reads never raise into caller land.
+
+    Post 2026-04-22 `disk I/O error` es transient y se reintenta;
+    usamos un error realmente no-transient aqui."""
     def reader():
-        raise sqlite3.OperationalError("disk I/O error")
+        raise sqlite3.OperationalError("no such table: rag_queries")
 
     with patch("time.sleep"):
         out = rag._sql_read_with_retry(reader, "test_tag", default=[])

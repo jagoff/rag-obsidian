@@ -4546,8 +4546,39 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
         pass
 
 
+# Errores de `sqlite3.OperationalError` que son TRANSIENT — vale la pena
+# reintentar. Comparación sub-string lowercase vs `str(exc).lower()`.
+#
+#   "locked"         → `database is locked`, lock contention normal
+#                       (WAL checkpoint, bulk writer activo, etc.)
+#   "disk i/o error" → fsync falla transient, tipicamente cuando varios
+#                       writers flushean al mismo tiempo bajo carga.
+#                       DB integrity sigue ok; al segundo intento, cuando
+#                       el OS termina lo que estaba haciendo, el write
+#                       pasa. Auditoría 2026-04-22: 56 ocurrencias en
+#                       `sql_state_errors.jsonl` en 2 días, en clusters
+#                       de duplicados en el mismo segundo.
+#
+# Explícitamente NO está en la lista:
+#   "no such table"                    → schema drift, retry no ayuda
+#   "database disk image is malformed" → corrupción, retry empeora
+#   "UNIQUE constraint failed"         → bug del caller, no transient
+#   "disk is full" / "no space left"   → retry sin beneficio; dejar fail-fast
+_TRANSIENT_SQL_ERROR_TOKENS: tuple[str, ...] = (
+    "locked",
+    "disk i/o error",
+)
+
+
+def _is_transient_sql_error(exc: Exception) -> bool:
+    """True si el mensaje del OperationalError matchea algún token
+    transient — vale la pena reintentar."""
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _TRANSIENT_SQL_ERROR_TOKENS)
+
+
 def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> None:
-    """Run a SQL-write closure with transient-lock retry + silent-fail logging.
+    """Run a SQL-write closure with transient-error retry + silent-fail logging.
 
     Pre-2026-04-21 every rag_* writer (`log_query_event`, `log_behavior_event`,
     `record_brief_written`, `_ambient_log_event`, `_contradiction_log`, …)
@@ -4569,9 +4600,15 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> Non
     a typical WAL-checkpoint stall without blowing up latency for the
     non-contended happy path.
 
-    Non-lock SQL errors (schema drift, disk-full, etc.) propagate on the
-    first failure — no point retrying those. Same contract as
-    ``web.server._persist_with_sqlite_retry``.
+    **2026-04-22 expansion**: reintentamos también `disk I/O error` (antes
+    caía al primer intento). 47/56 ocurrencias en un día eran fsync
+    contention transient — el segundo intento pasa limpio. La lista de
+    errores transient está centralizada en `_TRANSIENT_SQL_ERROR_TOKENS`
+    para mantener consistencia con `_sql_read_with_retry`.
+
+    Non-transient SQL errors (schema drift, UNIQUE violations, disk-full,
+    corruption) propagate on the first failure — no point retrying those.
+    Same contract as ``web.server._persist_with_sqlite_retry``.
     """
     import random as _r
     import sqlite3 as _sqlite3
@@ -4581,7 +4618,7 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> Non
             write_fn()
             return
         except _sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+            if not _is_transient_sql_error(exc) or attempt == attempts - 1:
                 _log_sql_state_error(error_tag, err=repr(exc))
                 return
             _t.sleep(0.15 + _r.random() * 0.35)
@@ -4593,18 +4630,20 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> Non
 def _sql_read_with_retry(
     read_fn, error_tag: str, *, default=None, attempts: int = 5,
 ):
-    """Run a SQL-read closure with transient-lock retry + silent-fail fallback.
+    """Run a SQL-read closure with transient-error retry + silent-fail fallback.
 
     Symmetric to ``_sql_write_with_retry`` but for read paths (SELECT,
     EXPLAIN, etc.) that currently just ``try: ... except: log + degrade``
-    without ever retrying a transient lock. The audit 2026-04-22 found 52
+    without ever retrying a transient error. The audit 2026-04-22 found 52
     ``feedback_golden_sql_read_failed`` entries — the read side of the
     feedback snapshot was losing retrievability signal silently whenever
     a concurrent indexer held the WAL briefly.
 
+    Shares the transient-error allowlist (`_TRANSIENT_SQL_ERROR_TOKENS`)
+    with the write helper: `database is locked` + `disk I/O error`.
     Returns ``read_fn()``'s value on success, or ``default`` after all
-    retries are exhausted or a non-lock error fires. Never raises into
-    caller land — matches the existing read-path contract.
+    retries are exhausted or a non-transient error fires. Never raises
+    into caller land — matches the existing read-path contract.
     """
     import random as _r
     import sqlite3 as _sqlite3
@@ -4613,7 +4652,7 @@ def _sql_read_with_retry(
         try:
             return read_fn()
         except _sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+            if not _is_transient_sql_error(exc) or attempt == attempts - 1:
                 _log_sql_state_error(error_tag, err=repr(exc))
                 return default
             _t.sleep(0.15 + _r.random() * 0.35)

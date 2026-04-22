@@ -3453,6 +3453,325 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
     return boost, penalty
 
 
+# ── Semantic response cache (Game-changer #1, 2026-04-22) ────────────────────
+# Caches full responses keyed by query embedding + corpus_hash, so repeated or
+# near-duplicate queries against an unchanged vault skip the full retrieve +
+# generate pipeline (1-15s) and return in <100ms.
+#
+# Measured motivation (rag_queries, 2026-04-22): 14 queries repeated ≥10×
+# each. Ej: "mis proyectos actuales con obsidian" 29× (total 20s wasted);
+# "llueve hoy?" 18× × 6.5s = 117s; "qué aproximación tengo al coaching" 26×.
+#
+# Lookup: cosine similarity vs cached q_embeddings within the same
+# corpus_hash + ts within ttl_seconds. Cosine ≥ _SEMANTIC_CACHE_COSINE returns
+# a hit.  Corpus_hash invalidation: col.count() + top-N file mtimes; any vault
+# churn changes the hash and the cache becomes unreachable (old rows pruned
+# on `rag maintenance`).
+
+# Tuning knobs (env override). Defaults err on the side of correctness —
+# high cosine threshold, short TTL — so the cache rarely serves a stale
+# answer on a non-trivial corpus change.
+_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.97"))
+_SEMANTIC_CACHE_DEFAULT_TTL = int(os.environ.get("RAG_CACHE_TTL_DEFAULT", "86400"))  # 24h
+_SEMANTIC_CACHE_RECENT_TTL = int(os.environ.get("RAG_CACHE_TTL_RECENT", "600"))  # 10 min
+_SEMANTIC_CACHE_MAX_ROWS = int(os.environ.get("RAG_CACHE_MAX_ROWS", "2000"))
+_SEMANTIC_CACHE_ENABLED = os.environ.get("RAG_CACHE_ENABLED", "1").strip() not in ("0", "false", "no", "")
+
+
+def _semantic_cache_enabled() -> bool:
+    """Check at call-time so tests can flip the env without re-importing."""
+    val = os.environ.get("RAG_CACHE_ENABLED", "1").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+# In-memory memo of corpus_hash so we don't re-stat files on every query.
+# Invalidated by chunk-count delta — same invariant `_load_corpus()` already
+# uses so the cache follows the same life-cycle as the BM25/vocab cache.
+_corpus_hash_memo: dict = {"hash": None, "chunk_count": None, "last_ts": 0.0}
+_corpus_hash_lock = threading.Lock()
+
+
+def _compute_corpus_hash(col) -> str:
+    """Cheap fingerprint of the current corpus. sha256 of:
+      - chunk count (col.count())
+      - top-10 most-recently-modified .md files' mtime + relative path
+
+    Returns "" if col is unavailable. The hash MUST change when a new note
+    is added / an existing note is edited, so we snapshot file mtimes under
+    `_resolve_vault_path()` filtered to .md. Cross-source ingesters touch
+    rag_* SQL state but not .md files — acceptable: their content is small
+    compared to vault and a manual cache clear is trivial.
+    """
+    try:
+        import hashlib
+        chunk_count = int(col.count())
+    except Exception:
+        return ""
+    try:
+        vault = _resolve_vault_path()
+        md_files: list[tuple[float, str]] = []
+        for p in vault.rglob("*.md"):
+            try:
+                rel = str(p.relative_to(vault))
+                if is_excluded(rel):
+                    continue
+                md_files.append((p.stat().st_mtime, rel))
+            except Exception:
+                continue
+        md_files.sort(key=lambda x: -x[0])
+        # Top-10 most recent only — enough to detect "someone edited a note"
+        # without having to stat every file on every query.
+        top = md_files[:10]
+        h = hashlib.sha256()
+        h.update(f"{chunk_count}".encode())
+        for mt, rel in top:
+            h.update(f"\n{mt:.0f}|{rel}".encode())
+        return h.hexdigest()[:16]
+    except Exception:
+        return f"ccount:{chunk_count}"
+
+
+def _corpus_hash_cached(col) -> str:
+    """Cached version of _compute_corpus_hash — re-computes only when chunk
+    count changes (same trigger as _load_corpus invalidation)."""
+    try:
+        cnt = int(col.count())
+    except Exception:
+        return ""
+    with _corpus_hash_lock:
+        if _corpus_hash_memo["hash"] and _corpus_hash_memo["chunk_count"] == cnt:
+            return _corpus_hash_memo["hash"]
+    h = _compute_corpus_hash(col)
+    with _corpus_hash_lock:
+        _corpus_hash_memo["hash"] = h
+        _corpus_hash_memo["chunk_count"] = cnt
+        _corpus_hash_memo["last_ts"] = time.time()
+    return h
+
+
+def _embedding_to_blob(emb) -> tuple[bytes, int]:
+    """Serialise embedding → float32 LE blob. Same format as rag_feedback_golden."""
+    import numpy as np
+    arr = np.asarray(emb, dtype="<f4")
+    return arr.tobytes(), int(arr.shape[0])
+
+
+def _blob_to_embedding(blob: bytes, dim: int):
+    import numpy as np
+    return np.frombuffer(blob, dtype="<f4", count=dim)
+
+
+def _ttl_for_intent(intent: str | None) -> int:
+    """TTL seconds by intent. recent/agenda → short (vault churn matters for
+    "what's new" queries); semantic/synthesis/comparison/count/list → long.
+
+    Env overrides: RAG_CACHE_TTL_RECENT (default 600), RAG_CACHE_TTL_DEFAULT
+    (default 86400).
+    """
+    if intent in ("recent", "agenda"):
+        return _SEMANTIC_CACHE_RECENT_TTL
+    return _SEMANTIC_CACHE_DEFAULT_TTL
+
+
+def semantic_cache_lookup(
+    q_embedding,
+    corpus_hash: str,
+    *,
+    cosine_threshold: float | None = None,
+    now: float | None = None,
+) -> dict | None:
+    """Find a cached response whose q_embedding has cosine ≥ threshold vs the
+    given embedding, within the same corpus_hash and within its TTL window.
+
+    Returns the row dict (question, response, paths, scores, top_score, intent,
+    hit_id, cosine, cached_ts, age_seconds) or None on miss.
+
+    Linear scan over rows matching corpus_hash — acceptable for n up to a
+    few thousand (cache capped by _SEMANTIC_CACHE_MAX_ROWS). Errors on read
+    degrade to "no hit" (retrieval proceeds normally).
+    """
+    if not _semantic_cache_enabled() or not corpus_hash:
+        return None
+    threshold = cosine_threshold if cosine_threshold is not None else _SEMANTIC_CACHE_COSINE
+    now = now if now is not None else time.time()
+    try:
+        import numpy as np
+        q = np.asarray(q_embedding, dtype="<f4")
+        qn = float(np.linalg.norm(q))
+        if qn == 0:
+            return None
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, question, q_embedding, dim, intent, ttl_seconds,"
+                " response, paths_json, scores_json, top_score"
+                " FROM rag_response_cache WHERE corpus_hash = ?"
+                " ORDER BY ts DESC LIMIT ?",
+                (corpus_hash, _SEMANTIC_CACHE_MAX_ROWS),
+            ).fetchall()
+    except Exception as exc:
+        _log_sql_state_error("semantic_cache_lookup_failed", err=repr(exc))
+        return None
+
+    best_cos = -1.0
+    best = None
+    for row in rows:
+        rid, ts_str, question, blob, dim, intent, ttl_seconds, response, paths_json, scores_json, top_score = row
+        # TTL filter — parse ts as ISO-8601.
+        try:
+            cached_ts = datetime.fromisoformat(ts_str).timestamp()
+        except Exception:
+            continue
+        age = now - cached_ts
+        if age > (ttl_seconds or _SEMANTIC_CACHE_DEFAULT_TTL):
+            continue
+        try:
+            e = _blob_to_embedding(blob, int(dim))
+            if e.shape[0] != q.shape[0]:
+                continue
+            en = float(np.linalg.norm(e))
+            if en == 0:
+                continue
+            cos = float(np.dot(q, e)) / (qn * en)
+        except Exception:
+            continue
+        if cos >= threshold and cos > best_cos:
+            best_cos = cos
+            best = {
+                "id": int(rid),
+                "question": question,
+                "response": response,
+                "paths": json.loads(paths_json) if paths_json else [],
+                "scores": json.loads(scores_json) if scores_json else [],
+                "top_score": float(top_score) if top_score is not None else None,
+                "intent": intent,
+                "cosine": cos,
+                "cached_ts": cached_ts,
+                "age_seconds": age,
+            }
+    # Async hit-count bump — best-effort, don't block the cache hit on SQL write.
+    if best is not None:
+        try:
+            with _ragvec_state_conn() as conn:
+                conn.execute(
+                    "UPDATE rag_response_cache SET hit_count = hit_count + 1,"
+                    " last_hit_ts = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), best["id"]),
+                )
+                conn.commit()
+        except Exception as exc:
+            _log_sql_state_error("semantic_cache_hit_bump_failed", err=repr(exc))
+    return best
+
+
+def semantic_cache_store(
+    q_embedding,
+    *,
+    question: str,
+    response: str,
+    paths: list[str],
+    scores: list[float],
+    top_score: float | None,
+    intent: str | None,
+    corpus_hash: str,
+    ttl_seconds: int | None = None,
+    extra: dict | None = None,
+) -> bool:
+    """Persist a response to the cache. Returns True on success.
+
+    Skipped silently if:
+      - cache disabled (RAG_CACHE_ENABLED=0)
+      - corpus_hash empty (couldn't compute)
+      - response is empty / a refusal marker (top_score < 0.015)
+    """
+    if not _semantic_cache_enabled() or not corpus_hash:
+        return False
+    if not response or not response.strip():
+        return False
+    # Skip storing low-confidence refusals — they'd serve stale nothing-answers
+    # and poison the cache for the same query after the vault grew content.
+    if top_score is not None and top_score < 0.015:
+        return False
+    try:
+        blob, dim = _embedding_to_blob(q_embedding)
+        ttl = int(ttl_seconds) if ttl_seconds is not None else _ttl_for_intent(intent)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_response_cache"
+                " (ts, question, q_embedding, dim, corpus_hash, intent,"
+                "  ttl_seconds, response, paths_json, scores_json,"
+                "  top_score, hit_count, last_hit_ts, extra_json)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    now_iso, question, blob, dim, corpus_hash, intent,
+                    ttl, response,
+                    json.dumps(paths, ensure_ascii=False),
+                    json.dumps(scores),
+                    top_score, 0, None,
+                    json.dumps(extra, ensure_ascii=False) if extra else None,
+                ),
+            )
+            conn.commit()
+        return True
+    except Exception as exc:
+        _log_sql_state_error("semantic_cache_store_failed", err=repr(exc))
+        return False
+
+
+def semantic_cache_clear(corpus_hash: str | None = None) -> int:
+    """DELETE cached rows (all, or only those matching a corpus_hash).
+
+    Returns number of rows deleted. Errors degrade to 0.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            if corpus_hash:
+                cur = conn.execute(
+                    "DELETE FROM rag_response_cache WHERE corpus_hash = ?",
+                    (corpus_hash,),
+                )
+            else:
+                cur = conn.execute("DELETE FROM rag_response_cache")
+            conn.commit()
+            return int(cur.rowcount or 0)
+    except Exception as exc:
+        _log_sql_state_error("semantic_cache_clear_failed", err=repr(exc))
+        return 0
+
+
+def semantic_cache_stats() -> dict:
+    """Return summary stats for debugging: total rows, distinct corpus_hashes,
+    total hits, age histogram. Used by `rag cache stats`.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            n_rows = int(conn.execute("SELECT COUNT(*) FROM rag_response_cache").fetchone()[0] or 0)
+            n_hashes = int(conn.execute(
+                "SELECT COUNT(DISTINCT corpus_hash) FROM rag_response_cache"
+            ).fetchone()[0] or 0)
+            total_hits = int(conn.execute(
+                "SELECT COALESCE(SUM(hit_count), 0) FROM rag_response_cache"
+            ).fetchone()[0] or 0)
+            # Oldest + newest ts for an age snapshot.
+            rows = conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM rag_response_cache"
+            ).fetchone()
+            oldest, newest = (rows or (None, None))
+        return {
+            "rows": n_rows,
+            "corpus_hashes": n_hashes,
+            "hits": total_hits,
+            "oldest_ts": oldest,
+            "newest_ts": newest,
+            "enabled": _semantic_cache_enabled(),
+            "cosine_threshold": _SEMANTIC_CACHE_COSINE,
+            "default_ttl_s": _SEMANTIC_CACHE_DEFAULT_TTL,
+        }
+    except Exception as exc:
+        _log_sql_state_error("semantic_cache_stats_failed", err=repr(exc))
+        return {"error": repr(exc)}
+
+
 # ── SQL state store (T1 foundation, split to telemetry.db 2026-04-21) ────────
 # Telemetry lives in telemetry.db — separate file from ragvec.db since the
 # 2026-04-21 split. `rag_*` tables (disjoint from sqlite-vec's `vec_*` /
@@ -3901,6 +4220,46 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS idx_mentions_source ON rag_entity_mentions(source)",
             "CREATE INDEX IF NOT EXISTS idx_mentions_ts ON rag_entity_mentions(ts)",
             "CREATE INDEX IF NOT EXISTS idx_mentions_entity_ts ON rag_entity_mentions(entity_id, ts DESC)",
+        ),
+    ),
+    (
+        # Semantic response cache (Game-changer #1, 2026-04-22). Keyed by the
+        # query embedding (binary BLOB, float32 little-endian — same format as
+        # rag_feedback_golden). Lookup strategy: linear cosine scan over rows
+        # whose corpus_hash matches current and ts within TTL — O(n) but n is
+        # small (cache capped, old rows pruned). No sqlite-vec index here: we
+        # want exact cosine per-row + TTL filter in a single pass.
+        #
+        # Motivation from telemetry.db (2026-04-22): 14 queries repeated ≥10×
+        # each in rag_queries. "mis proyectos actuales con obsidian" 29× at
+        # avg 0.7s = 20s wasted; "llueve hoy?" 18× × 6.5s = 117s. Semantic
+        # cache with cosine>0.95 + corpus_hash invalidation collapses these
+        # to <100ms end-to-end.
+        #
+        # corpus_hash: sha256(col.count() + top-10 file mtimes) — invalidates
+        # on vault churn. intent stored for TTL heuristics (recent/agenda
+        # short, semantic long).
+        "rag_response_cache",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_response_cache ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " question TEXT NOT NULL,"
+            " q_embedding BLOB NOT NULL,"
+            " dim INTEGER NOT NULL,"
+            " corpus_hash TEXT NOT NULL,"
+            " intent TEXT,"
+            " ttl_seconds INTEGER NOT NULL,"
+            " response TEXT NOT NULL,"
+            " paths_json TEXT,"
+            " scores_json TEXT,"
+            " top_score REAL,"
+            " hit_count INTEGER NOT NULL DEFAULT 0,"
+            " last_hit_ts TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_response_cache_corpus ON rag_response_cache(corpus_hash, ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_response_cache_ts ON rag_response_cache(ts)",
         ),
     ),
 )
@@ -16298,6 +16657,8 @@ def watch(debounce: float, all_vaults: bool):
               help="Desactiva retrieval iterativo automático (deep retrieve)")
 @click.option("--critique", is_flag=True,
               help="Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario")
+@click.option("--no-cache", is_flag=True,
+              help="Skippea el semantic response cache (GC#1 2026-04-22). Útil para debugging.")
 @click.option("--source", "source_opt", default=None,
               help="Filtrar por fuente cross-source (coma-separado): vault,calendar,gmail,whatsapp,reminders,messages")
 @click.option("--vault", "vault_scope", default=None,
@@ -16311,6 +16672,7 @@ def query(
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
+    no_cache: bool,
     source_opt: str | None,
     vault_scope: str | None,
 ):
@@ -16362,6 +16724,64 @@ def query(
         else:
             console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
+
+    # ── Semantic cache lookup (GC#1 2026-04-22) ─────────────────────────────
+    # Hits only for exact / near-duplicate queries against an unchanged vault.
+    # Skipped if --no-cache, --raw, --force, --counter, --critique, --source,
+    # session context (history mutates retrieval), or any filter that changes
+    # the answer (--folder/--tag/--since). Keeps the cache scope minimal and
+    # consistent — we never serve a cached answer under a different retrieval
+    # envelope than the one that produced it.
+    _cache_skippable = (
+        no_cache or raw or force or counter or critique or source_opt
+        or folder or tag or since or session_id or continue_
+    )
+    _cache_emb = None
+    _cache_hash = ""
+    if not _cache_skippable and _semantic_cache_enabled():
+        try:
+            _cache_emb = embed([question])[0]
+            _cache_hash = _corpus_hash_cached(col)
+            hit = semantic_cache_lookup(_cache_emb, _cache_hash)
+            if hit is not None:
+                _age_m = int(hit["age_seconds"] // 60)
+                _cos = hit["cosine"]
+                _cached_response = hit["response"]
+                _cached_paths = hit["paths"]
+                _cached_top = hit["top_score"]
+                if plain:
+                    click.echo(convert_obsidian_links(_cached_response))
+                else:
+                    console.print(render_response(_cached_response))
+                    if _cached_paths:
+                        _src_line = " · ".join(
+                            f"[dim]{p}[/dim]" for p in _cached_paths[:5]
+                        )
+                        console.print(_src_line)
+                    console.print(
+                        f"[dim]⚡ cache hit · cos={_cos:.3f} · age={_age_m}m · "
+                        f"score≈{_cached_top:.2f}[/dim]"
+                        if _cached_top is not None else
+                        f"[dim]⚡ cache hit · cos={_cos:.3f} · age={_age_m}m[/dim]"
+                    )
+                log_query_event({
+                    "cmd": "query",
+                    "turn_id": new_turn_id(),
+                    "q": question,
+                    "cache_hit": True,
+                    "cache_cosine": round(_cos, 4),
+                    "cache_age_seconds": int(hit["age_seconds"]),
+                    "paths": _cached_paths,
+                    "top_score": round(_cached_top, 2) if _cached_top is not None else None,
+                    "t_retrieve": 0.0,
+                    "t_gen": 0.0,
+                    "answer_len": len(_cached_response),
+                    "mode": "cache",
+                })
+                return
+        except Exception as _cache_exc:
+            _silent_log("semantic_cache_lookup_query", _cache_exc)
+            _cache_emb = None
 
     # Session resolution: --continue picks up last_session_id unless --session
     # is also given. If neither is present, we don't touch the session store.
@@ -16907,6 +17327,33 @@ def query(
         except Exception as _nli_exc:
             _silent_log("nli_grounding_query", _nli_exc)
 
+    # ── Semantic cache store (GC#1 2026-04-22) ──────────────────────────────
+    # Store AFTER citation-repair + critique + NLI so `full` is the definitive
+    # answer. Skip store if any of the "envelope-changing" opts were active
+    # (same rules as lookup skip) — we never want to cache under one set of
+    # flags and serve under another. `_cache_emb` is populated by the lookup
+    # code above when caching was eligible; reuse it.
+    _cache_stored = False
+    if (not _cache_skippable) and _cache_emb is not None and _cache_hash:
+        try:
+            # Dedup paths preserving order — multiple chunks from the same
+            # file would render as duplicate sources in the cache-hit panel.
+            _cache_paths = list(dict.fromkeys(
+                m.get("file", "") for m in result["metas"] if m.get("file")
+            ))
+            _cache_stored = semantic_cache_store(
+                _cache_emb,
+                question=question,
+                response=full,
+                paths=_cache_paths,
+                scores=[round(float(s), 2) for s in result["scores"][:len(_cache_paths)]],
+                top_score=round(float(result["confidence"]), 2),
+                intent=intent,
+                corpus_hash=_cache_hash,
+            )
+        except Exception as _cache_exc:
+            _silent_log("semantic_cache_store_query", _cache_exc)
+
     query_turn_id = new_turn_id()
     log_query_event({
         "cmd": "query",
@@ -16938,6 +17385,8 @@ def query(
         "fast_path": _fast_path,
         "nli_ms": _nli_ms_logged,
         "grounding_summary": _nli_grounding_summary,
+        "cache_hit": False,
+        "cache_stored": _cache_stored,
     })
 
     if sess is not None:
@@ -22229,6 +22678,61 @@ def bookmarks_sync(profile: str | None):
         f"[green]✓ Total:[/green] {stats['total']} bookmarks en "
         f"{stats['profiles']} profile(s)"
     )
+
+
+# ── Semantic response cache management (GC#1 2026-04-22) ─────────────────────
+
+
+@cli.group()
+def cache():
+    """Semantic response cache — hits para queries repetidas sobre vault unchanged."""
+
+
+@cache.command("stats")
+def cache_stats():
+    """Mostrar stats del cache: rows, hits totales, corpus_hashes distintos, edad."""
+    stats = semantic_cache_stats()
+    if "error" in stats:
+        console.print(f"[red]Error leyendo el cache: {stats['error']}[/red]")
+        return
+    console.print("[bold]Semantic response cache[/bold]")
+    console.print(f"  enabled         : {'[green]yes[/green]' if stats['enabled'] else '[red]no[/red]'}")
+    console.print(f"  rows            : {stats['rows']}")
+    console.print(f"  corpus_hashes   : {stats['corpus_hashes']}")
+    console.print(f"  total hits      : {stats['hits']}")
+    console.print(f"  cosine threshold: {stats['cosine_threshold']:.3f}")
+    console.print(f"  default TTL     : {stats['default_ttl_s']}s")
+    if stats.get("oldest_ts"):
+        console.print(f"  oldest row      : {stats['oldest_ts']}")
+    if stats.get("newest_ts"):
+        console.print(f"  newest row      : {stats['newest_ts']}")
+
+
+@cache.command("clear")
+@click.option("--all", "clear_all", is_flag=True,
+              help="Borrar todas las filas (todos los corpus_hashes). "
+                   "Sin esta flag solo se borran las del corpus_hash actual.")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def cache_clear(clear_all: bool, yes: bool):
+    """Limpiar el cache. Por default solo borra filas del corpus actual."""
+    if clear_all:
+        if not yes:
+            if not click.confirm("¿Borrar TODAS las filas del cache?"):
+                return
+        n = semantic_cache_clear()
+        console.print(f"[green]✓[/green] {n} filas borradas (todos los corpus_hashes).")
+        return
+    try:
+        col = get_db()
+        h = _corpus_hash_cached(col)
+    except Exception as exc:
+        console.print(f"[red]No pude resolver corpus_hash actual: {exc}[/red]")
+        return
+    if not h:
+        console.print("[yellow]Corpus_hash vacío (¿índice ausente?). Usá --all para borrar todo.[/yellow]")
+        return
+    n = semantic_cache_clear(corpus_hash=h)
+    console.print(f"[green]✓[/green] {n} filas borradas para corpus_hash={h}.")
 
 
 @bookmarks.command("stats")

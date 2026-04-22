@@ -64,11 +64,12 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # from live JSONL shapes (wa_tasks, archive_log, filing_log, eval_runs,
     # surface_log, proactive_log, cpu_metrics, memory_metrics,
     # system_memory_metrics) + 1 OCR cache (rag_ocr_cache, 2026-04-21) +
-    # 2 entity tables (rag_entities, rag_entity_mentions, Improvement #2 Fase A) =
-    # 24 tables total.
+    # 2 entity tables (rag_entities, rag_entity_mentions, Improvement #2 Fase A) +
+    # 1 response cache (rag_response_cache, GC#1 2026-04-22) =
+    # 25 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 24
+    assert len(expected) == 25
     c.close()
 
 

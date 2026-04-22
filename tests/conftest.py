@@ -156,6 +156,22 @@ def _clear_query_caches():
 
 
 @pytest.fixture(autouse=True)
+def _disable_semantic_response_cache(monkeypatch):
+    """GC#1 (2026-04-22): semantic response cache is ENABLED by default. In
+    tests this causes cross-contamination — test A stores a stubbed response,
+    test B (same query via monkeypatched chat) gets a cache hit from A and
+    skips its own chat stub entirely.
+
+    Disable the cache for every test by default. Tests that specifically
+    exercise the cache (test_semantic_cache.py) override via
+    `monkeypatch.setenv('RAG_CACHE_ENABLED', '1')` — env precedence means
+    the per-test setenv wins over this autouse setting.
+    """
+    monkeypatch.setenv("RAG_CACHE_ENABLED", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_rag_local_embed_env():
     """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
     directly when the CLI group runs for query-like subcommands. Any test that

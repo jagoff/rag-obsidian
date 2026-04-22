@@ -3476,10 +3476,16 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
 # churn changes the hash and the cache becomes unreachable (old rows pruned
 # on `rag maintenance`).
 
-# Tuning knobs (env override). Defaults err on the side of correctness —
-# high cosine threshold, short TTL — so the cache rarely serves a stale
-# answer on a non-trivial corpus change.
-_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.97"))
+# Tuning knobs (env override). Defaults balance correctness vs hit rate.
+#
+# **2026-04-22 tuning**: threshold 0.97 → 0.93 after the audit found 0.00%
+# hit rate on 1056 queries over 7 days, with 14 queries repeated ≥10×.
+# bge-m3 puts same-meaning paraphrases at ~0.93-0.96 ("qué es ikigai"
+# vs "qué es el ikigai"); at 0.97 those miss. 0.93 is the sweet spot
+# empirically — still too high for unrelated queries (typically ~0.80)
+# so false positives stay rare. Operator can override via RAG_CACHE_COSINE
+# if they see stale answers leaking through.
+_SEMANTIC_CACHE_COSINE = float(os.environ.get("RAG_CACHE_COSINE", "0.93"))
 _SEMANTIC_CACHE_DEFAULT_TTL = int(os.environ.get("RAG_CACHE_TTL_DEFAULT", "86400"))  # 24h
 _SEMANTIC_CACHE_RECENT_TTL = int(os.environ.get("RAG_CACHE_TTL_RECENT", "600"))  # 10 min
 _SEMANTIC_CACHE_MAX_ROWS = int(os.environ.get("RAG_CACHE_MAX_ROWS", "2000"))
@@ -32739,6 +32745,14 @@ def rag_health_report() -> dict:
         "feature_deps": [],
         "silent_errors_24h": {},
         "sql_state_errors_24h": {},
+        # Post 2026-04-22 audit: surfacing cache stats in rag stats so the
+        # operator can spot "0 hits on 1000 queries" without raw SQL.
+        "cache_stats": {
+            "rows": None,
+            "total_hits": None,
+            "hit_rate_24h": None,
+            "threshold": _SEMANTIC_CACHE_COSINE,
+        },
     }
 
     # ── silent_errors.jsonl / sql_state_errors.jsonl rollup ──
@@ -32798,6 +32812,46 @@ def rag_health_report() -> dict:
             "entity extraction roto (corre `uv pip install obsidian-rag[entities]` "
             "o seteá `RAG_EXTRACT_ENTITIES=0` para silenciar)"
         )
+
+    # ── cache_stats: tamaño de la tabla + hit rate 24h ──
+    # Lee de `rag_response_cache` + cuenta `"cache_hit":true` en
+    # `rag_queries.extra_json`. Degrada gracefully si la tabla no existe
+    # o la conexión falla (DB nueva, telemetry.db missing en un host
+    # recién clonado, etc.) — el panel siempre renderea, con valores
+    # None cuando no hay datos.
+    try:
+        with _ragvec_state_conn() as _hc_conn:
+            try:
+                _row = _hc_conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(hit_count), 0) "
+                    "FROM rag_response_cache"
+                ).fetchone()
+                report["cache_stats"]["rows"] = int(_row[0] or 0)
+                report["cache_stats"]["total_hits"] = int(_row[1] or 0)
+            except Exception:
+                # Tabla no existe aún — DB fresca pre-GC#1.
+                report["cache_stats"]["rows"] = 0
+                report["cache_stats"]["total_hits"] = 0
+            try:
+                _row2 = _hc_conn.execute(
+                    "SELECT "
+                    " SUM(CASE WHEN extra_json LIKE '%\"cache_hit\":true%' THEN 1 ELSE 0 END),"
+                    " COUNT(*) "
+                    "FROM rag_queries "
+                    "WHERE ts > datetime('now','-1 day') "
+                    "  AND q IS NOT NULL AND q != ''"
+                ).fetchone()
+                _hits = int(_row2[0] or 0)
+                _total = int(_row2[1] or 0)
+                if _total > 0:
+                    report["cache_stats"]["hit_rate_24h"] = _hits / _total
+            except Exception:
+                pass
+    except Exception:
+        # _ragvec_state_conn failed to open (missing DB, locked beyond
+        # retry, etc.). Leave the None defaults — `rag stats` renders
+        # "cache: (unavailable)" in that branch.
+        pass
 
     return report
 
@@ -32887,8 +32941,13 @@ def stats():
     deps = hr.get("feature_deps") or []
     se24 = hr.get("silent_errors_24h") or {}
     sse24 = hr.get("sql_state_errors_24h") or {}
+    cs = hr.get("cache_stats") or {}
 
-    if deps or se24 or sse24:
+    # Cache panel siempre se renderiza si la tabla existe (rows is not None),
+    # aunque hit_rate sea 0 — el operador quiere ver "0 hits" para diagnosticar.
+    _has_cache_info = cs.get("rows") is not None
+
+    if deps or se24 or sse24 or _has_cache_info:
         console.print()
         console.print("[bold cyan]Health (últimas 24h):[/bold cyan]")
         for msg in deps:
@@ -32896,6 +32955,28 @@ def stats():
             # literals that rich would otherwise interpret as style tags
             # and silently drop.
             console.print(f"  ⚠ {msg}", style="yellow", markup=False, highlight=False)
+        if _has_cache_info:
+            _rows = cs.get("rows", 0) or 0
+            _hit_rate = cs.get("hit_rate_24h")
+            _thr = cs.get("threshold")
+            _hit_rate_str = (
+                f"{_hit_rate:.1%}" if isinstance(_hit_rate, (int, float)) else "—"
+            )
+            _thr_str = f"{_thr:.2f}" if isinstance(_thr, (int, float)) else "—"
+            _line = (
+                f"  semantic cache: rows={_rows}, hit_rate(24h)={_hit_rate_str}, "
+                f"cosine_threshold={_thr_str}"
+            )
+            # Si hit rate es 0% sobre >50 queries, marcar en amarillo — señal
+            # de que el cache no está absorbiendo queries repetidas.
+            if (isinstance(_hit_rate, (int, float)) and _hit_rate < 0.01
+                    and _rows < 50):
+                console.print(
+                    _line + "  ⚠ tabla casi vacía (revisar sql_state_errors)",
+                    style="yellow", markup=False,
+                )
+            else:
+                console.print(_line, style="dim", markup=False)
         if se24:
             # Ordenado por count desc — el operador quiere ver el más ruidoso primero.
             top = sorted(se24.items(), key=lambda kv: kv[1], reverse=True)[:6]

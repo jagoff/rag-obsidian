@@ -21755,131 +21755,7 @@ def detect_orphan_notes(
     return sorted(orphans)
 
 
-def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
-    """Salud operativa de la telemetría en la ventana de N días.
-
-    Devuelve:
-      - intent_populated_pct: % de queries (filtradas por is_user_query) que
-        exponen `intent` no-vacío en rag_queries.extra_json.
-      - ctr_by_source: CTR Laplace-smoothed (clicks+1)/(impressions+10) por
-        valor de rag_behavior.source. NULL/empty → bucket "unknown".
-      - feedback_gaps: top-N queries con ≥2 repeticiones sin ningún rating
-        en rag_feedback joineadas por turn_id (ambos lados limitados a la
-        ventana). Ordenado por count desc.
-    Degradación graciosa: tablas faltantes o vacías → estructura con counts
-    en 0 y listas vacías, sin excepciones.
-    """
-    import sqlite3 as _sqlite3
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
-    intent_populated = 0
-    intent_total = 0
-    source_acc: dict[str, list[int]] = {}
-    gaps: list[dict] = []
-
-    if not Path(db_path).exists():
-        return {
-            "window_days": days,
-            "total_user_queries": 0,
-            "intent_populated": 0,
-            "intent_populated_pct": 0.0,
-            "ctr_by_source": {},
-            "feedback_gaps": [],
-        }
-
-    conn = _sqlite3.connect(str(db_path))
-    try:
-        try:
-            q_rows = conn.execute(
-                "SELECT cmd, q, extra_json FROM rag_queries WHERE ts >= ?",
-                (cutoff,),
-            ).fetchall()
-        except _sqlite3.Error:
-            q_rows = []
-
-        per_q: dict[str, dict] = {}
-        for cmd, q, extra_json in q_rows:
-            if not is_user_query(cmd, q):
-                continue
-            intent_total += 1
-            intent_val: str | None = None
-            turn_id: str | None = None
-            if extra_json:
-                try:
-                    ej = json.loads(extra_json)
-                except (ValueError, TypeError):
-                    ej = None
-                if isinstance(ej, dict):
-                    raw = ej.get("intent")
-                    if isinstance(raw, str) and raw.strip():
-                        intent_val = raw.strip()
-                    tid = ej.get("turn_id")
-                    if isinstance(tid, str) and tid.strip():
-                        turn_id = tid.strip()
-            if intent_val:
-                intent_populated += 1
-            if q:
-                norm = _normalize_query_for_grouping(q)
-                if norm:
-                    entry = per_q.setdefault(norm, {"q": q, "count": 0, "turn_ids": []})
-                    entry["count"] += 1
-                    if turn_id:
-                        entry["turn_ids"].append(turn_id)
-
-        try:
-            b_rows = conn.execute(
-                "SELECT source, event FROM rag_behavior WHERE ts >= ?",
-                (cutoff,),
-            ).fetchall()
-        except _sqlite3.Error:
-            b_rows = []
-        for source, event in b_rows:
-            key = source.strip() if isinstance(source, str) and source.strip() else "unknown"
-            acc = source_acc.setdefault(key, [0, 0])
-            acc[1] += 1
-            if event in _BEHAVIOR_POSITIVE:
-                acc[0] += 1
-
-        try:
-            rated_rows = conn.execute(
-                "SELECT DISTINCT turn_id FROM rag_feedback "
-                "WHERE ts >= ? AND turn_id IS NOT NULL AND turn_id != ''",
-                (cutoff,),
-            ).fetchall()
-            rated_ids = {r[0] for r in rated_rows}
-        except _sqlite3.Error:
-            rated_ids = set()
-
-        for entry in per_q.values():
-            if entry["count"] < 2:
-                continue
-            if any(t in rated_ids for t in entry["turn_ids"]):
-                continue
-            gaps.append({"q": entry["q"], "count": entry["count"]})
-        gaps.sort(key=lambda x: x["count"], reverse=True)
-        gaps = gaps[:top_n]
-    finally:
-        conn.close()
-
-    intent_pct = (intent_populated / intent_total * 100.0) if intent_total else 0.0
-    ctr_by_source = {
-        s: {
-            "clicks": acc[0],
-            "impressions": acc[1],
-            "ctr": (acc[0] + 1) / (acc[1] + 10),
-        }
-        for s, acc in source_acc.items()
-    }
-    return {
-        "window_days": days,
-        "total_user_queries": intent_total,
-        "intent_populated": intent_populated,
-        "intent_populated_pct": round(intent_pct, 2),
-        "ctr_by_source": ctr_by_source,
-        "feedback_gaps": gaps,
-    }
-
-
-@cli.group(invoke_without_command=True)
+@cli.command()
 @click.option("--days", default=INSIGHTS_DEFAULT_WINDOW_DAYS, show_default=True,
               help="Ventana en días del log a analizar")
 @click.option("--min-gap", default=INSIGHTS_GAP_MIN_OCCURRENCES, show_default=True,
@@ -21888,15 +21764,12 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
               help="Mínimo de repeticiones para flaggear una hot query")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON estructurado")
 @click.option("--plain", is_flag=True, help="Output texto plano (bot-friendly)")
-@click.pass_context
-def insights(ctx: click.Context, days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
+def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
     """Patrones en queries.jsonl: gaps, hot queries, notas huérfanas.
 
     Output-only — no escribe, no modifica vault, no llama al LLM. Surface los
     patrones y vos decidís qué acción tomar (escribir nota, archivar, etc.).
     """
-    if ctx.invoked_subcommand is not None:
-        return
     t0 = time.perf_counter()
     since = datetime.now() - timedelta(days=days)
     entries = _load_query_entries(since)
@@ -21997,83 +21870,6 @@ def insights(ctx: click.Context, days: int, min_gap: int, min_hot: int, as_json:
 
     if not (gaps or hots or orphans):
         console.print("[green]✓ sin patrones detectados en la ventana.[/green]")
-
-
-@insights.command("telemetry-health")
-@click.option("--days", default=7, show_default=True,
-              help="Ventana en días sobre rag_queries/rag_behavior/rag_feedback")
-@click.option("--json", "as_json", is_flag=True, help="Output JSON estructurado")
-@click.option("--plain", is_flag=True, help="Output texto plano (bot-friendly)")
-def insights_telemetry_health(days: int, as_json: bool, plain: bool):
-    """Salud de la telemetría: intent coverage, CTR por source, feedback gaps."""
-    report = telemetry_health(DB_PATH / _TELEMETRY_DB_FILENAME, days=days)
-
-    if as_json:
-        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
-        return
-
-    if plain:
-        lines = [
-            f"Telemetry health · últimos {report['window_days']}d · "
-            f"{report['total_user_queries']} user queries",
-            f"intent populated: {report['intent_populated']}/"
-            f"{report['total_user_queries']} ({report['intent_populated_pct']}%)",
-        ]
-        if report["ctr_by_source"]:
-            lines.append("\nCTR por source (Laplace-smoothed):")
-            for s, stats in sorted(report["ctr_by_source"].items()):
-                lines.append(
-                    f"  · {s}: {stats['clicks']}/{stats['impressions']} "
-                    f"= {stats['ctr']:.3f}"
-                )
-        else:
-            lines.append("\nCTR por source: sin eventos.")
-        if report["feedback_gaps"]:
-            lines.append("\nFeedback gaps (queries repetidas sin rating):")
-            for g in report["feedback_gaps"]:
-                lines.append(f"  · ({g['count']}×) {g['q']}")
-        else:
-            lines.append("\nFeedback gaps: ninguno.")
-        click.echo("\n".join(lines))
-        return
-
-    console.print(Panel(
-        f"Telemetry health · últimos {report['window_days']}d · "
-        f"{report['total_user_queries']} user queries",
-        title="🩺 Telemetry", style="cyan", border_style="cyan",
-    ))
-    console.print(
-        f"[bold]Intent coverage[/bold]: "
-        f"{report['intent_populated']}/{report['total_user_queries']} "
-        f"([green]{report['intent_populated_pct']}%[/green])"
-    )
-    console.print()
-
-    if report["ctr_by_source"]:
-        tbl = Table(title="CTR por source (Laplace)", show_header=True, box=None)
-        tbl.add_column("source", style="cyan")
-        tbl.add_column("clicks", justify="right", style="green")
-        tbl.add_column("impressions", justify="right", style="dim")
-        tbl.add_column("ctr", justify="right")
-        for s, stats in sorted(report["ctr_by_source"].items()):
-            tbl.add_row(s, str(stats["clicks"]), str(stats["impressions"]),
-                        f"{stats['ctr']:.3f}")
-        console.print(tbl)
-        console.print()
-    else:
-        console.print("[dim]sin eventos en rag_behavior[/dim]")
-        console.print()
-
-    if report["feedback_gaps"]:
-        tbl = Table(title="Feedback gaps (queries repetidas sin rating)",
-                    show_header=True, box=None)
-        tbl.add_column("×", justify="right", style="yellow")
-        tbl.add_column("query", style="cyan", overflow="fold")
-        for g in report["feedback_gaps"]:
-            tbl.add_row(str(g["count"]), g["q"])
-        console.print(tbl)
-    else:
-        console.print("[green]✓ sin feedback gaps en la ventana.[/green]")
 
 
 # ── AGENT LOOP ────────────────────────────────────────────────────────────────

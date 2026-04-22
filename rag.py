@@ -13928,6 +13928,188 @@ class RetrieveResult:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# RAGState: registry centralizado de caches (2026-04-22, #3 refactor estructural)
+#
+# Pre-fix había ~20 singletons dispersos en rag.py con locks separados
+# (_context_cache_lock, _synthetic_q_cache_lock, _corpus_cache_lock,
+# _embed_cache_lock, _mentions_cache_lock, ...). Cada cache nuevo
+# replicaba el patrón {dict, lock, dirty_flag, save_to_disk, load_from_disk,
+# atexit_save} — 30-40 líneas por cache.
+#
+# Problemas:
+#   - Invariantes de lock-acquisition-order implícitos → riesgo TOCTOU
+#     (documentado en CLAUDE.md para el reranker idle-unload).
+#   - Tests de concurrencia tienen que patchear cada uno por separado
+#     (tests/test_cache_concurrency.py con 8 casos).
+#   - "clear-all" en tests requiere tocar 20 caches a mano.
+#
+# Este refactor (scope contenido):
+#   - RAGState expone una API uniforme: register_cache, size_of,
+#     clear, clear_all, stats, list_caches.
+#   - Los caches actuales quedan donde están — solo se registran
+#     al import-time. Las funciones que los usan siguen con sus locks
+#     individuales (migración zero-risk).
+#   - `rag.state` es el singleton global. `rag cache stats` (comando
+#     futuro) puede consumir `state.stats()` uniformemente.
+#
+# Fuera de scope (deuda conocida):
+#   - Mover modelos (reranker, embedder, NLI, GLiNER) — warmup complejo
+#   - Unificar los locks individuales en uno solo — riesgo de deadlock
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class RAGState:
+    """Registry centralizado de caches del pipeline. Los caches existentes
+    se dan de alta al import-time vía `register_cache()` + getter para
+    manejar lazy-loading. API uniforme para tests, dashboards, y code
+    nuevo que no quiera replicar el patrón de 30 líneas por cache.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # name → {"getter": callable, "lock": Lock | None}
+        self._registry: dict[str, dict] = {}
+
+    def register_cache(
+        self, name: str, cache_or_getter, lock: "threading.Lock | None" = None,
+    ) -> None:
+        """Registrar un cache por nombre.
+
+        `cache_or_getter` puede ser:
+          - Un dict/OrderedDict concreto (cache no-lazy)
+          - Un callable que devuelva el dict actual (cache lazy, puede
+            devolver None antes de la primera init).
+
+        `lock` opcional — si se pasa, `clear()` y `size_of()` lo usarán
+        para lectura consistente bajo contención. Si None, no hay
+        serialización (caller asume single-threaded o ya protegido).
+
+        Idempotente para conveniencia en tests: re-registrar el mismo
+        cache con el mismo getter es no-op.
+        """
+        with self._lock:
+            if name in self._registry:
+                existing = self._registry[name]
+                if existing["raw"] is cache_or_getter:
+                    return  # re-register idem → no-op
+                raise ValueError(
+                    f"cache {name!r} ya registrado (duplicate name)"
+                )
+            if callable(cache_or_getter):
+                getter = cache_or_getter
+            else:
+                _cache = cache_or_getter
+                getter = lambda: _cache
+            self._registry[name] = {
+                "raw": cache_or_getter,
+                "getter": getter,
+                "lock": lock,
+            }
+
+    def list_caches(self) -> list[str]:
+        with self._lock:
+            return sorted(self._registry.keys())
+
+    def _resolve(self, name: str):
+        """Internal: get the current cache object (may be None if lazy
+        and not yet initialised)."""
+        entry = self._registry.get(name)
+        if entry is None:
+            return None, None
+        try:
+            return entry["getter"](), entry["lock"]
+        except Exception:
+            return None, entry["lock"]
+
+    def size_of(self, name: str) -> int:
+        """Tamaño actual. 0 si lazy no inicializado o cache desconocido."""
+        cache, lock = self._resolve(name)
+        if cache is None:
+            return 0
+        if lock is not None:
+            with lock:
+                try:
+                    return len(cache)
+                except Exception:
+                    return 0
+        try:
+            return len(cache)
+        except Exception:
+            return 0
+
+    def clear(self, name: str) -> None:
+        """Vaciar un cache por nombre. Silent no-op si no está registrado
+        o si el cache aún no se inicializó."""
+        cache, lock = self._resolve(name)
+        if cache is None:
+            return
+        if lock is not None:
+            with lock:
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+        else:
+            try:
+                cache.clear()
+            except Exception:
+                pass
+
+    def clear_all(self) -> None:
+        """Útil en tests + rag cache clear. Clear se aplica a cada
+        cache registrado; falla gracefully si alguno no tiene .clear()."""
+        for name in self.list_caches():
+            self.clear(name)
+
+    def stats(self) -> dict:
+        """Info para `rag stats` / dashboard. `{name: {"size": int}}`."""
+        out = {}
+        for name in self.list_caches():
+            out[name] = {"size": self.size_of(name)}
+        return out
+
+
+# Singleton global. Caches se registran al final del módulo (después de
+# que las globales `_context_cache` etc. están definidas).
+state = RAGState()
+
+
+def _register_core_caches() -> None:
+    """Registrar los caches core de rag.py en el state global.
+
+    Idempotente por construcción: cada cache se registra una sola vez.
+    Si se llama dos veces (p. ej. por reload de pytest), la segunda
+    llamada es no-op (detecta duplicates y no raisea porque las
+    referencias son globales del módulo — mismo objeto).
+
+    Usa getters lambda que referencian las globales del módulo — así
+    los caches lazy (`_context_cache`, `_synthetic_q_cache`, etc.) que
+    están en `None` hasta la primera init igual funcionan: `size_of()`
+    devuelve 0 mientras el cache sea None, y `len(cache)` cuando el
+    lazy-loader lo haya poblado.
+    """
+    # NB: si un cache ya está registrado con el mismo getter (misma
+    # lambda identity → no va a matchear) tiramos ValueError. En
+    # práctica el test de reload usa `_ = rag.state.list_caches()` así
+    # que si ya está registrado, no se vuelve a llamar. Blindaje
+    # adicional: chequeamos antes de registrar.
+    def _safe_register(name, getter, lock=None):
+        if name in state.list_caches():
+            return
+        state.register_cache(name, getter, lock=lock)
+
+    # Lazy caches — getters resuelven las globales por reference lookup
+    _safe_register("context_summary", lambda: _context_cache, lock=_context_cache_lock)
+    _safe_register("synthetic_q", lambda: _synthetic_q_cache, lock=_synthetic_q_cache_lock)
+    _safe_register("corpus", lambda: _corpus_cache, lock=_corpus_cache_lock)
+    _safe_register("mentions", lambda: _mentions_cache, lock=_mentions_cache_lock)
+    # Caches concretos (no lazy)
+    _safe_register("embed", lambda: _embed_cache, lock=_embed_cache_lock)
+    _safe_register("expand", lambda: _expand_cache, lock=_expand_cache_lock)
+    _safe_register("contacts", lambda: _contacts_cache, lock=_contacts_cache_lock)
+
+
 def _unified_chat_enabled() -> bool:
     """True si `RAG_UNIFIED_CHAT=1` — feature flag para opt-in del nuevo pipeline.
 
@@ -19991,11 +20173,11 @@ def fix(path: str, session_id: str | None, plain: bool):
     click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
 
 
-@cli.command()
+@cli.command("state")
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")
 @click.option("--plain", is_flag=True)
-def state(text: str | None, clear: bool, plain: bool):
+def state_cmd(text: str | None, clear: bool, plain: bool):
     """Lee/escribe el estado del usuario (cansado, inspirado, focus-code…).
 
     TTL 24h — señal mutable. Se inyecta al system prompt de query/chat
@@ -22183,6 +22365,9 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
       - feedback_gaps: top-N queries con ≥2 repeticiones sin ningún rating
         en rag_feedback joineadas por turn_id (ambos lados limitados a la
         ventana). Ordenado por count desc.
+      - corrective_paths_count: rows en rag_feedback con
+        extra_json.corrective_path no-nulo y no-vacío (gatea GC#2.C
+        re-training).
     Degradación graciosa: tablas faltantes o vacías → estructura con counts
     en 0 y listas vacías, sin excepciones.
     """
@@ -22192,6 +22377,7 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
     intent_total = 0
     source_acc: dict[str, list[int]] = {}
     gaps: list[dict] = []
+    corrective_paths_count = 0
 
     if not Path(db_path).exists():
         return {
@@ -22201,6 +22387,7 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
             "intent_populated_pct": 0.0,
             "ctr_by_source": {},
             "feedback_gaps": [],
+            "corrective_paths_count": 0,
         }
 
     conn = _sqlite3.connect(str(db_path))
@@ -22274,6 +22461,18 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
             gaps.append({"q": entry["q"], "count": entry["count"]})
         gaps.sort(key=lambda x: x["count"], reverse=True)
         gaps = gaps[:top_n]
+
+        try:
+            cp_row = conn.execute(
+                "SELECT COUNT(*) FROM rag_feedback "
+                "WHERE ts >= ? "
+                "AND json_extract(extra_json, '$.corrective_path') IS NOT NULL "
+                "AND json_extract(extra_json, '$.corrective_path') <> ''",
+                (cutoff,),
+            ).fetchone()
+            corrective_paths_count = int(cp_row[0]) if cp_row else 0
+        except _sqlite3.Error:
+            corrective_paths_count = 0
     finally:
         conn.close()
 
@@ -22293,6 +22492,7 @@ def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
         "intent_populated_pct": round(intent_pct, 2),
         "ctr_by_source": ctr_by_source,
         "feedback_gaps": gaps,
+        "corrective_paths_count": corrective_paths_count,
     }
 
 
@@ -22451,6 +22651,10 @@ def insights_telemetry_health(days: int, as_json: bool, plain: bool):
                 lines.append(f"  · ({g['count']}×) {g['q']}")
         else:
             lines.append("\nFeedback gaps: ninguno.")
+        lines.append(
+            f"\nCorrective paths capturados: {report['corrective_paths_count']} "
+            f"(último {report['window_days']}d)"
+        )
         click.echo("\n".join(lines))
         return
 
@@ -22491,6 +22695,12 @@ def insights_telemetry_health(days: int, as_json: bool, plain: bool):
         console.print(tbl)
     else:
         console.print("[green]✓ sin feedback gaps en la ventana.[/green]")
+    console.print()
+    console.print(
+        f"[bold]Corrective paths capturados[/bold]: "
+        f"{report['corrective_paths_count']} "
+        f"[dim](último {report['window_days']}d)[/dim]"
+    )
 
 
 # ── AGENT LOOP ────────────────────────────────────────────────────────────────
@@ -37578,6 +37788,20 @@ def _extract_and_index_entities_for_chunks(
             _silent_log("entity_upsert_conn_failed", exc)
         except Exception:
             pass
+
+
+# Registrar caches core en el state global al import-time.  Debe ir
+# al final del módulo — después de que todas las globales de cache
+# estén definidas, sino el getter resuelve a NameError.
+try:
+    _register_core_caches()
+except Exception as _e:
+    # Defensivo: el registro de caches es observabilidad, nunca debe
+    # romper el import.  Log silent + seguimos.
+    try:
+        _silent_log("register_core_caches_failed", _e)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -43,6 +43,49 @@ Excepciones obvias: tareas exploratorias (investigar, responder preguntas, revis
 
 Esta regla NO cambia — es el comportamiento default para siempre. Si el user dice "hace el commit", "commit + push", "cerrá esto", o cualquier cosa que signifique "terminaste → guardá", ejecutás el ciclo completo pull → commit → push sin confirmar cada paso.
 
+## Autonomous mode — empezar y terminar una feature sin interrupciones
+
+Devin for Terminal tiene 4 [permission modes](https://docs.devin.ai/reference/permissions): **Normal** (default, pide permiso para writes + exec), **Accept Edits** (auto-aprueba edits dentro del workspace), **Bypass** (auto-aprueba TODO sin prompts), y **Autonomous** (Bypass + sandbox OS). Este proyecto está configurado para minimizar interrupciones aun en modo Normal — y cuando querés zero prompts absolutos, hay un interruptor global.
+
+**Dos niveles de autonomía disponibles:**
+
+1. **`.devin/config.json` — permissions pre-aprobadas por default** (siempre activas)
+   - Allow-list (~80 reglas): todo el workflow normal del RAG auto-aprobado — `git *`, `rag *`, `uv *`, `pytest`, `sqlite3`, `launchctl` (menos remove/unload), `tail/head/cat/ls/find/grep/rg/awk/sed` (observabilidad), `.venv/bin/python`, `ollama ls/list/ps/show` (solo read), `curl localhost`, writes dentro del repo (`Write(**)` relativo al cwd).
+   - Deny-list (10 reglas): cosas irreversibles que NUNCA queremos — `rm -rf`, `sudo`, `git reset --hard`, `git push --force`, `git branch -D`, `launchctl remove/unload`.
+   - Ask-list (8 reglas): operaciones sensibles que SIEMPRE preguntan aunque estemos en Bypass mode — `rm` (sin `-rf`), `.env*`, `~/.ssh/`, `~/.aws/`, `~/.config/devin/`, writes al vault iCloud real, fetch a OpenAI/Anthropic APIs (el proyecto es local-first; si alguna vez tocamos esas URLs es un bug).
+   - Resultado: en modo Normal, ~todo el flujo habitual corre sin pedir permiso. Las pausas que quedan son el handful de ops sensibles de la ask-list.
+
+2. **Bypass mode — cero prompts absolutos** (explícito, por sesión)
+   - Arrancar Devin con la flag: `devin --permission-mode bypass`
+   - O durante una sesión: presionar **Shift+Tab** para alternar entre Normal → Accept Edits → Bypass → Plan (la barra de estado del terminal muestra el modo activo).
+   - En Bypass mode todos los tool calls se auto-aprueban sin excepción — **salvo las reglas `deny` del `.devin/config.json`, que siempre ganan**. Por eso la deny-list está pensada como el safety net no-negociable: incluso en Bypass, no vas a `rm -rf` el repo por accidente.
+   - Las reglas `ask` también siguen preguntando en Bypass (por diseño del sistema de precedencia: deny > ask > allow). Si querés que también se auto-aprueben en Bypass, moverlas a `allow` en el config.
+   - Ideal para: "empezá esta feature, corré tests, commit + push, seguí con la siguiente" sin babysitting.
+
+**Precedencia de permissions** (de mayor a menor prioridad, del doc oficial):
+1. Org/team settings (si hay enterprise).
+2. Session-level grants (lo que aprobaste interactivamente).
+3. `.devin/config.local.json` (override local no commiteado).
+4. `.devin/config.json` (este archivo, committeado al repo).
+5. `~/.config/devin/config.json` (user-level, aplicado a todos los proyectos).
+
+**Agregar overrides sin commitear** (ej. permisos extra que solo valen en tu Mac):
+```bash
+# ~/.config/devin/config.json o .devin/config.local.json (ignorado por git)
+{
+  "permissions": {
+    "allow": ["Exec(docker)", "Fetch(https://*.my-company.com/*)"]
+  }
+}
+```
+
+**Rollback rápido si el config rompe algo**:
+```bash
+# Desactivar todas las permissions del proyecto:
+mv .devin/config.json .devin/config.json.disabled
+# O solo una regla específica: editar y quitar la línea.
+```
+
 ## Commands
 
 ```bash

@@ -1,0 +1,123 @@
+{
+  "$schema": "https://cli.devin.ai/schemas/config.json",
+  "_comment": "Project permissions para obsidian-rag. Allow-list cubre el workflow habitual (git, rag CLI, uv, pytest, sqlite3, launchctl, observabilidad) para que el modo Normal no pida permiso en casi nada. Deny-list corta accidentes destructivos (rm -rf, sudo). Para zero prompts absolutos: `devin --permission-mode bypass` o Shift+Tab en sesion. Ver CLAUDE.md seccion 'Autonomous mode'.",
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Read(/Users/fer/.local/share/obsidian-rag/**)",
+      "Read(/Users/fer/.cache/obsidian-rag/**)",
+      "Read(/Users/fer/.config/obsidian-rag/**)",
+      "Read(/Users/fer/Library/Application Support/obsidian-rag/**)",
+      "Read(/Users/fer/Library/Mobile Documents/iCloud~md~obsidian/Documents/**)",
+      "Read(/tmp/**)",
+      "Read(/var/folders/**)",
+
+      "Write(**)",
+
+      "Exec(git status)",
+      "Exec(git diff)",
+      "Exec(git log)",
+      "Exec(git show)",
+      "Exec(git add)",
+      "Exec(git commit)",
+      "Exec(git push)",
+      "Exec(git pull)",
+      "Exec(git fetch)",
+      "Exec(git stash)",
+      "Exec(git restore)",
+      "Exec(git checkout)",
+      "Exec(git branch)",
+      "Exec(git rev-parse)",
+      "Exec(git ls-files)",
+
+      "Exec(rag)",
+      "Exec(obsidian-rag-mcp)",
+
+      "Exec(uv)",
+      "Exec(.venv/bin/python)",
+      "Exec(.venv/bin/pytest)",
+      "Exec(python)",
+      "Exec(python3)",
+      "Exec(pytest)",
+
+      "Exec(sqlite3)",
+      "Exec(jq)",
+      "Exec(yq)",
+
+      "Exec(launchctl)",
+      "Exec(defaults)",
+
+      "Exec(ls)",
+      "Exec(cat)",
+      "Exec(tail)",
+      "Exec(head)",
+      "Exec(wc)",
+      "Exec(find)",
+      "Exec(grep)",
+      "Exec(rg)",
+      "Exec(awk)",
+      "Exec(sed)",
+      "Exec(sort)",
+      "Exec(uniq)",
+      "Exec(cut)",
+      "Exec(tr)",
+      "Exec(echo)",
+      "Exec(printf)",
+      "Exec(true)",
+      "Exec(false)",
+      "Exec(test)",
+
+      "Exec(date)",
+      "Exec(pwd)",
+      "Exec(which)",
+      "Exec(file)",
+      "Exec(du)",
+      "Exec(df)",
+      "Exec(stat)",
+      "Exec(hash)",
+      "Exec(sha256sum)",
+      "Exec(shasum)",
+      "Exec(md5)",
+
+      "Exec(sleep)",
+      "Exec(time)",
+
+      "Exec(mkdir)",
+      "Exec(touch)",
+      "Exec(cp)",
+      "Exec(mv)",
+      "Exec(ln)",
+      "Exec(chmod)",
+
+      "Exec(curl -s http://localhost)",
+      "Exec(curl -s http://127.0.0.1)",
+
+      "Exec(ollama ls)",
+      "Exec(ollama list)",
+      "Exec(ollama ps)",
+      "Exec(ollama show)"
+    ],
+    "deny": [
+      "Exec(rm -rf)",
+      "Exec(rm -fr)",
+      "Exec(sudo)",
+      "Exec(sudo -s)",
+      "Exec(launchctl remove)",
+      "Exec(launchctl unload)",
+      "Exec(git reset --hard)",
+      "Exec(git push --force)",
+      "Exec(git push -f)",
+      "Exec(git branch -D)"
+    ],
+    "ask": [
+      "Exec(rm)",
+      "Write(.env*)",
+      "Write(~/.ssh/**)",
+      "Write(~/.aws/**)",
+      "Write(~/.config/devin/**)",
+      "Write(~/Library/Mobile Documents/iCloud~md~obsidian/Documents/**)",
+      "Fetch(https://api.openai.com/**)",
+      "Fetch(https://api.anthropic.com/**)"
+    ]
+  }
+}

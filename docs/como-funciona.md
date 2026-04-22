@@ -233,6 +233,93 @@ Detecta cuando una nota se contradice con otra del vault. Tres fases:
 
 ---
 
+## El ranker-vivo
+
+"Ranker-vivo" es la mecánica por la que el sistema aprende de vos con el tiempo y va mejorando el orden de los resultados sin que lo entrenes de cero.
+
+### Qué es
+
+El reranker (ese modelo que reordena candidatos por relevancia) tiene unos pesos configurables. Por default viene con pesos base. Pero a medida que usás el sistema, se van registrando "señales" sobre qué resultados fueron útiles y cuáles no — y periódicamente (`rag tune` automático, diario a las 3:30am) re-calibra los pesos con esas señales.
+
+### Las señales que se acumulan
+
+Cada interacción con una respuesta del RAG genera un evento en el archivo `~/.local/share/obsidian-rag/behavior.jsonl` (y la tabla SQL `rag_behavior`):
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                 SEÑALES POSITIVAS (suman al CTR)                     │
+├──────────────────────────────────────────────────────────────────────┤
+│  copy        │ copiaste texto de la respuesta (Cmd+C ≥20 chars)      │
+│  open        │ abriste una nota citada (clickeaste un link)          │
+│  save        │ guardaste la respuesta como nota                      │
+│  kept        │ aceptaste una propuesta del ambient agent             │
+│  positive_   │ otras señales positivas implícitas                    │
+│    implicit  │                                                       │
+├──────────────────────────────────────────────────────────────────────┤
+│                 SEÑALES NEGATIVAS (restan)                           │
+├──────────────────────────────────────────────────────────────────────┤
+│  negative_   │ señales negativas implícitas                          │
+│    implicit  │                                                       │
+│  deleted     │ borraste una propuesta del ambient agent              │
+├──────────────────────────────────────────────────────────────────────┤
+│                 DENOMINATOR (el "mostraste")                         │
+├──────────────────────────────────────────────────────────────────────┤
+│  impression  │ un chunk apareció en los resultados mostrados al user │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+También hay señales **explícitas** que vos disparás a mano:
+- `rag rate +` o `rag rate -` (o `👍` / `👎` en chat/web)
+- `rag fix <path>` — decile al sistema cuál era la nota correcta
+
+### El loop completo
+
+```
+  hacés una pregunta
+       │
+       ▼
+  retrieve te muestra 5-8 chunks  ─────▶  evento IMPRESSION × N
+       │                                  (denominator)
+       │
+       ▼
+  vos hacés algo:
+  ┌─── clickeás una cita        ─────▶  evento OPEN
+  ├─── copiás texto (Cmd+C)     ─────▶  evento COPY
+  ├─── /save <título>           ─────▶  evento SAVE
+  ├─── 👍 / 👎                  ─────▶  evento POSITIVE / NEGATIVE
+  └─── nada (ignoraste)         ─────▶  no hay evento, pero hay impression
+       │
+       ▼
+  cada evento va a behavior.jsonl + tabla rag_behavior
+       │
+       ▼
+  diario a las 3:30am:
+  `rag tune --apply` toma los eventos + queries.yaml + feedback.jsonl
+  y corre un random search sobre los pesos del ranker — el winner se
+  persiste a ~/.config/obsidian-rag/ranker.json
+       │
+       ▼
+  próxima query usa los pesos nuevos → mejor ranking
+```
+
+### Cómo verlo funcionar
+
+El dashboard web (`/dashboard`) tiene un panel **Señales al ranker-vivo · últimos N días** con los counts por tipo de evento. Si está vacío, significa que todavía no hay tráfico suficiente. Podés "sembrar" el loop:
+
+1. Hacer una query en chat o web.
+2. Copiar al menos 20 caracteres de la respuesta con Cmd+C.
+3. Recargar `/dashboard` → debería aparecer `copy 1 · web 1`.
+
+### Rollback
+
+Si un tune nuevo empeoró las cosas:
+
+```bash
+rag tune --rollback          # restaura el backup más reciente de ranker.json
+```
+
+---
+
 ## Los modelos que usa (y para qué)
 
 ```
@@ -281,7 +368,8 @@ Detecta cuando una nota se contradice con otra del vault. Tres fases:
  ├── last_session               ◀── pointer a la última usada
  ├── queries.jsonl              ◀── log de cada query/chat
  ├── contradictions.jsonl       ◀── contradicciones detectadas
- ├── behavior.jsonl             ◀── eventos de "abrí esta nota"
+ ├── behavior.jsonl             ◀── eventos del ranker-vivo
+ │                                   (copy/open/save/kept/impression/...)
  ├── feedback.jsonl             ◀── 👍/👎 y correcciones
  ├── ambient.json               ◀── config del Ambient Agent
  ├── ambient.jsonl              ◀── eventos del Ambient

@@ -205,6 +205,8 @@ Reindex incremental + limpia sesiones viejas + rota logs + detecta dead notes. B
 ### online-tune (diario 3:30am)
 Re-tunea los pesos del ranker con los events de behavior de los últimos 14 días. Guarda backup antes. Rollback: `rag tune --rollback`.
 
+Este servicio es el motor del "ranker-vivo": cada copy/open/save que hacés durante el día se acumula en `behavior.jsonl`, y a la madrugada el random search sobre los pesos encuentra la configuración que maximiza hit@k + MRR. La próxima vez que hacés una query, los resultados vienen mejor rankeados. Ver [como-funciona.md#el-ranker-vivo](./como-funciona.md#el-ranker-vivo) para el loop completo.
+
 ### ingest-* (cada 1h / 15min)
 Sincronizan datos externos al índice. Cada uno escribe a su `.log` respectivo. El de WhatsApp corre más frecuente (15 min) porque los chats cambian más rápido.
 

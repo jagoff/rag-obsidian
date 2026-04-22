@@ -421,6 +421,14 @@ rag dashboard
 rag dashboard --days 30
 ```
 
+Si además tenés el web server corriendo (`rag serve` o el servicio launchd `com.fer.obsidian-rag-web`), entrá a `/dashboard` en el browser y vas a ver:
+
+- **KPIs** arriba (queries totales, latencia, feedback positivo, etc).
+- **Señales al ranker-vivo** (panel nuevo): cuántos eventos implícitos llegaron en la ventana — `copy`, `open`, `save`, `kept`, `positive_implicit` (suman al CTR), `negative_implicit`, `deleted` y `impression` (el denominator). Si está vacío, te dice qué hacer para empezar a alimentarlo (copiar/guardar/ratear una respuesta).
+- **Charts** abajo (queries por día, top folders, etc.).
+
+Más sobre el ranker-vivo en [como-funciona.md](./como-funciona.md#el-ranker-vivo).
+
 ### `rag eval`
 Evalúa el retriever contra `queries.yaml` (golden set).
 

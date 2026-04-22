@@ -2258,6 +2258,39 @@ def _chat_capped_client() -> "_TimedOllamaProxy":
     return _CHAT_CAPPED_CLIENT
 
 
+def _context_summary_enabled() -> bool:
+    """True si el operador opta in a la feature de context summary.
+
+    **Default SKIP post 2026-04-22**.  Evidencia empírica que motivó el
+    flip:
+
+        `~/.local/share/obsidian-rag/context_summaries.json`  →  {}  (0 entries)
+        corpus actual: 1259 chunks, 7 con "Contexto:" (0.56%)
+
+    La feature estaba efectivamente off en producción mucho antes de este
+    commit — el cache JSON vacío y <1% de chunks con contextualización
+    significa que el claim original "+11% chain_success" (nunca replicado
+    contra el queries.yaml actual) no puede estar activo.
+
+    Política:
+      - `RAG_CONTEXT_SUMMARY=1`       → opt-in explícito (nuevo)
+      - `OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY` set → skip (legacy opt-out,
+        sigue respetado y GANA sobre el opt-in si ambos están seteados)
+      - sin nada → **skip** (default nuevo)
+
+    Reactivación requiere reindex completo (`rag index --reset`) para
+    poblar el cache + eval × 3 para validar ganancia real antes de
+    recomendar el merge.
+    """
+    # Legacy opt-out sigue ganando (defensivo: plists/scripts viejos que
+    # lo setean no deben tener comportamiento ambiguo si alguien también
+    # setea el opt-in nuevo).
+    if os.environ.get("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY"):
+        return False
+    val = os.environ.get("RAG_CONTEXT_SUMMARY", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
 def _generate_context_summary(text: str, title: str, folder: str) -> str:
     """Generate a 1-2 sentence context summary for a note using the helper model.
 
@@ -2265,12 +2298,11 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
     inherit global context when embedded. Kept short (~30-50 tokens) to avoid
     dominating the chunk embedding.
 
-    Bypass: set OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY=1 to skip this step
-    entirely (e.g. during bulk indexing of a large new vault where the
-    incremental quality bump is not worth the wall-clock cost — the
-    watch service will fill summaries in later as files change).
+    **Default SKIP post 2026-04-22**. Ver `_context_summary_enabled()` para
+    la política + justificación empírica. Opt-in explícito requiere
+    `RAG_CONTEXT_SUMMARY=1`.
     """
-    if os.environ.get("OBSIDIAN_RAG_SKIP_CONTEXT_SUMMARY"):
+    if not _context_summary_enabled():
         return ""
     # Truncate to avoid blowing helper context window (1024 tokens ≈ 4k chars)
     body = text[:2000]

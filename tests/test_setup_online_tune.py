@@ -224,14 +224,15 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 12 base servicios + 4 ingesters cross-source
+    # 13 base servicios + 4 ingesters cross-source
     # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
     # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
     # pero el plist siempre está en el spec.
-    # Base roster: watch, serve, digest, morning, today, emergent, patterns,
-    # archive, wa-tasks, online-tune, maintenance (2026-04-21 hardening),
-    # consolidate.
-    assert len(specs) == 16
+    # Base roster: watch, serve, web (agregado 2026-04-22 — pre-fix estaba
+    # instalado manualmente fuera de setup), digest, morning, today,
+    # emergent, patterns, archive, wa-tasks, online-tune, maintenance
+    # (2026-04-21 hardening), consolidate.
+    assert len(specs) == 17
 
 
 def test_services_spec_includes_maintenance():

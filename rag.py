@@ -16186,6 +16186,12 @@ def query(
         sess = ensure_session(session_id, mode="query") if session_id else None
     history = session_history(sess) if sess else None
 
+    # Early intent classification for adaptive skip-reformulate (Improvement #3 Fase B.3).
+    # Compute vocabulary once here; reused for the post-reformulate classify_intent call
+    # so we avoid calling get_vocabulary(col) twice on the hot path.
+    known_tags, known_folders = get_vocabulary(col)
+    _raw_intent, _ = classify_intent(question, known_tags, known_folders)
+
     # Reformulate + expand in ONE helper-model call when session history exists.
     # Saves ~0.5-1.5s by eliminating one Ollama round-trip. When no history,
     # expansion happens inside retrieve() as before.
@@ -16198,26 +16204,30 @@ def query(
     # `no_multi` legacy flag: si está presente, domina sobre `multi` (explícito
     # gana sobre default). `multi` flag activa paraphrase solo si usuario opt-in.
     _multi_enabled = multi and not no_multi
-    if history and _multi_enabled:
-        try:
-            sess_summary = session_summary(sess) if sess else None
-            effective_question, pre_variants = reformulate_and_expand(
-                question, history, summary=sess_summary
-            )
-        except Exception:
-            effective_question = question
-    elif history:
-        # Multi-query disabled but still need reformulation
-        try:
-            sess_summary = session_summary(sess) if sess else None
-            effective_question = reformulate_query(question, history, summary=sess_summary)
-        except Exception:
-            effective_question = question
+    # Fase B.3: skip reformulate para metadata-only intents cuando adaptive routing ON.
+    # Con RAG_ADAPTIVE_ROUTING=0 (default) _should_skip_reformulate() siempre False
+    # → comportamiento bit-identical al anterior.
+    if not _should_skip_reformulate(_raw_intent):
+        if history and _multi_enabled:
+            try:
+                sess_summary = session_summary(sess) if sess else None
+                effective_question, pre_variants = reformulate_and_expand(
+                    question, history, summary=sess_summary
+                )
+            except Exception:
+                effective_question = question
+        elif history:
+            # Multi-query disabled but still need reformulation
+            try:
+                sess_summary = session_summary(sess) if sess else None
+                effective_question = reformulate_query(question, history, summary=sess_summary)
+            except Exception:
+                effective_question = question
 
     # Intent routing: aggregate/list/recent queries don't need the retrieval
     # pipeline + LLM — they want a metadata scan. Fall through to semantic
     # otherwise. User-supplied --folder/--tag override classifier params.
-    known_tags, known_folders = get_vocabulary(col)
+    # (known_tags, known_folders already computed above — no second get_vocabulary call)
     intent, intent_params = classify_intent(effective_question, known_tags, known_folders)
     if intent != "semantic":
         if folder:

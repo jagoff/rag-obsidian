@@ -94,10 +94,9 @@ def test_detect_rating_intent(text, expected):
 
 def _read_sql_feedback(tmp_path) -> list[dict]:
     """Read rag_feedback rows from the test DB as event-shaped dicts.
-    rag.DB_PATH is a directory — the actual sqlite file lives at
-    DB_PATH / 'ragvec.db'."""
+    rag.DB_PATH is a directory — post-split the file is telemetry.db."""
     import sqlite3
-    db_file = tmp_path / "ragvec.db"
+    db_file = tmp_path / rag._TELEMETRY_DB_FILENAME
     conn = sqlite3.connect(str(db_file))
     conn.row_factory = sqlite3.Row
     try:

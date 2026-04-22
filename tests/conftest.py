@@ -204,6 +204,7 @@ def _stabilize_rag_state():
     import rag as _rag
     snap_sql_flag = _rag.RAG_STATE_SQL
     snap_db_path = _rag.DB_PATH
+    snap_telemetry_db = _rag._TELEMETRY_DB_FILENAME
     try:
         yield
     finally:
@@ -214,7 +215,7 @@ def _stabilize_rag_state():
         except Exception:
             pass
 
-        # (b) Detect flag/DB_PATH drift — restore + warn.
+        # (b) Detect flag/DB_PATH/_TELEMETRY_DB_FILENAME drift — restore + warn.
         if _rag.RAG_STATE_SQL is not snap_sql_flag:
             warnings.warn(
                 f"RAG_STATE_SQL leaked from test (was {snap_sql_flag}, "
@@ -229,3 +230,10 @@ def _stabilize_rag_state():
                 stacklevel=2,
             )
             _rag.DB_PATH = snap_db_path
+        if _rag._TELEMETRY_DB_FILENAME != snap_telemetry_db:
+            warnings.warn(
+                f"rag._TELEMETRY_DB_FILENAME leaked from test (was {snap_telemetry_db!r}, "
+                f"now {_rag._TELEMETRY_DB_FILENAME!r}); restoring",
+                stacklevel=2,
+            )
+            _rag._TELEMETRY_DB_FILENAME = snap_telemetry_db

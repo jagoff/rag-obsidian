@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import rag
 from web import conversation_writer
 from web.conversation_writer import (
     TurnData,
@@ -19,9 +20,10 @@ from web.conversation_writer import (
 def tmp_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     (vault / "00-Inbox" / "conversations").mkdir(parents=True)
-    # Post-T10: index lives in rag_conversations_index inside ragvec.db —
-    # redirect _DB_PATH at a throwaway DB so no test mutates real state.
-    monkeypatch.setattr(conversation_writer, "_DB_PATH", tmp_path / "ragvec.db")
+    # Post-T10 split: index lives in rag_conversations_index in telemetry.db.
+    # _resolve_telemetry_db_path() reads rag.DB_PATH dynamically, so patching
+    # DB_PATH is sufficient — no _DB_PATH module attr needed.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     return vault
 
 
@@ -236,20 +238,19 @@ def test_malformed_frontmatter_raises(tmp_vault):
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Post-T10: writer is SQL-only. Redirect _DB_PATH at a throwaway DB."""
-    db = tmp_path / "ragvec.db"
-    monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
-    return db
+    """Post-T10 split: writer targets telemetry.db via _resolve_telemetry_db_path().
+    Patch rag.DB_PATH so the resolver lands in tmp_path instead of the live dir."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    return tmp_path / rag._TELEMETRY_DB_FILENAME
 
 
 @pytest.fixture
 def flag_off(tmp_path, monkeypatch):
     """Legacy flag-OFF fixture — kept for test-signature compatibility.
     Post-T10 the flag is inert, so this is an alias for sql_env."""
-    db = tmp_path / "ragvec.db"
-    monkeypatch.setattr(conversation_writer, "_DB_PATH", db)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     monkeypatch.delenv("RAG_STATE_SQL", raising=False)
-    return db
+    return tmp_path / rag._TELEMETRY_DB_FILENAME
 
 
 def _select_row(db_path: Path, sid: str):
@@ -322,8 +323,6 @@ def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
     # Simulate a commit failure deep inside _sql_upsert by making conn.commit
     # raise. The public writer API in web/server.py wraps write_turn in
     # try/except — here we verify that layer's contract via the same pattern.
-    import rag
-
     def boom(*_a, **_kw):
         raise sqlite3.OperationalError("simulated commit failure")
 
@@ -354,14 +353,15 @@ def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
 
 def _worker_upsert(args):
     db_path, proc_id = args
-    # Child process: reset module globals. monkeypatch does not cross
-    # the fork/spawn boundary.
-    from web import conversation_writer as cw
-
-    cw._DB_PATH = Path(db_path)
+    # Child process: monkeypatch does not cross the fork/spawn boundary.
+    # Route _resolve_telemetry_db_path() to our tmp dir by setting rag.DB_PATH
+    # to the parent of db_path (telemetry.db filename stays "telemetry.db").
+    import rag as _rag
+    _rag.DB_PATH = Path(db_path).parent
     for i in range(10):
         sid = f"wa:proc{proc_id}-turn{i}"
         rel = f"00-Inbox/conversations/{proc_id}-{i}.md"
+        from web import conversation_writer as cw
         cw.persist_conversation_index_entry(sid, rel)
 
 

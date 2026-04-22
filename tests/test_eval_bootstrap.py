@@ -143,7 +143,8 @@ def test_bootstrap_ci_basic_shape():
             assert res.exit_code == 0, res.output
 
         import sqlite3
-        conn = sqlite3.connect(str(db_dir / "ragvec.db"))
+        import rag as _rag
+        conn = sqlite3.connect(str(db_dir / _rag._TELEMETRY_DB_FILENAME))
         conn.row_factory = sqlite3.Row
         try:
             rows = list(conn.execute(

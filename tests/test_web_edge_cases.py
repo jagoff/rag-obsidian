@@ -158,12 +158,15 @@ def test_retry_pending_conversation_turns_sanitizes_legacy_infinity(
     """
 
     from web import server as server_mod
-    from web import conversation_writer as cw
+    from web import conversation_writer as cw  # noqa: F401 — ensure module loads
+    import rag
 
     vault_root = tmp_path / "vault"
     (vault_root / "00-Inbox" / "conversations").mkdir(parents=True)
-    db_path = tmp_path / "ragvec.db"
-    monkeypatch.setattr(cw, "_DB_PATH", db_path)
+    # Post 2026-04-21 split: conversation_writer reads rag.DB_PATH dynamically
+    # and appends _TELEMETRY_DB_FILENAME. Redirect both so this test stays
+    # hermetic without poking a private symbol that no longer exists.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
 
     pending_path = tmp_path / "conversation_turn_pending.jsonl"
     monkeypatch.setattr(server_mod, "_CONV_PENDING_PATH", pending_path)

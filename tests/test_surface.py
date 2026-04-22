@@ -22,8 +22,7 @@ def tmp_vault(tmp_path, monkeypatch):
     vault.mkdir()
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     monkeypatch.setattr(rag, "SURFACE_LOG_PATH", tmp_path / "surface.jsonl")
-    # Post-T10: surface log writes to rag_surface_log (SQL). Point DB_PATH
-    # at the test dir so writes land in a throwaway ragvec.db.
+    # Post-T10 split: surface log writes to rag_surface_log (telemetry.db).
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
@@ -325,7 +324,7 @@ def test_is_moc_heuristics(meta, expected):
 
 def _read_surface_rows(db_dir: Path) -> list[dict]:
     import sqlite3
-    conn = sqlite3.connect(str(db_dir / "ragvec.db"))
+    conn = sqlite3.connect(str(db_dir / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(

@@ -22,7 +22,7 @@ from web import server as web_server
 
 
 def _open_db(tmp_path: Path) -> sqlite3.Connection:
-    db = tmp_path / "ragvec.db"
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     conn = sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(

@@ -78,7 +78,7 @@ def test_latency_flag_adds_table_and_snapshot(fake_queries_yaml, tmp_path, monke
     assert "chains" in res.output
 
     # Trend log should have an extra_json entry with `latency` inside.
-    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn = sqlite3.connect(str(tmp_path / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(

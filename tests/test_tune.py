@@ -264,7 +264,7 @@ def _sql_feedback_env(tmp_path, monkeypatch):
     """Redirect DB_PATH and create the minimum schema for rag_feedback."""
     import sqlite3 as _sqlite3
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    db = tmp_path / "ragvec.db"
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     conn = _sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
@@ -435,7 +435,7 @@ def test_log_tune_event_append(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     rag._log_tune_event({"foo": "bar"})
     rag._log_tune_event({"foo": "baz"})
-    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn = sqlite3.connect(str(tmp_path / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(

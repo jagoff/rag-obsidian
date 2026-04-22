@@ -51,11 +51,12 @@ def sql_env(tmp_path, monkeypatch):
     # Path.home() reads $HOME on POSIX so the env override is enough, but
     # some helpers cache Path.home() at import time. `_cleanup_bak_files`
     # computes state_dir at call time, so no extra patching required.
-    # Initialise the DB so telemetry tables exist.
-    conn = _open_db(db_dir / "ragvec.db")
+    # Initialise telemetry.db so _sql_rotate_log_tables / _rollback_state_migration
+    # find the tables via _ragvec_state_conn().
+    conn = _open_db(db_dir / rag._TELEMETRY_DB_FILENAME)
     conn.close()
     yield {"home": home, "state_dir": state_dir, "db_dir": db_dir,
-            "db_path": db_dir / "ragvec.db"}
+            "db_path": db_dir / rag._TELEMETRY_DB_FILENAME}
 
 
 @pytest.fixture
@@ -69,10 +70,10 @@ def jsonl_env(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "RAG_STATE_SQL", False)
     monkeypatch.setattr(rag, "DB_PATH", db_dir)
     monkeypatch.setenv("HOME", str(home))
-    conn = _open_db(db_dir / "ragvec.db")
+    conn = _open_db(db_dir / rag._TELEMETRY_DB_FILENAME)
     conn.close()
     yield {"home": home, "state_dir": state_dir, "db_dir": db_dir,
-            "db_path": db_dir / "ragvec.db"}
+            "db_path": db_dir / rag._TELEMETRY_DB_FILENAME}
 
 
 def _seed_rows(conn: sqlite3.Connection, table: str, tss: list[str],

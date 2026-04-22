@@ -640,6 +640,18 @@ def _write_secret_file(path: Path, content: str) -> None:
 _STATE_DIR = _ensure_state_dir_secure()
 
 DB_PATH = Path.home() / ".local/share/obsidian-rag/ragvec"
+# Telemetry DB file — intentionally separate from ragvec.db (sqlite-vec + meta_*).
+# Pre-2026-04-21 both workloads shared one file + one WAL; bulk writes from the
+# indexer (`rag index`, `watch`, cross-source ingesters) were blocking hot-path
+# telemetry writes and causing 70+ `database is locked` drops per day to
+# sql_state_errors.jsonl (queries_sql_write_failed, behavior_sql_write_failed,
+# feedback_golden_sql_read_failed). Splitting the file gives each workload its
+# own WAL and eliminates cross-workload lock contention. Module-level so tests
+# can monkeypatch for isolation. The 4 ingester state tables (rag_whatsapp_state,
+# rag_gmail_state, rag_calendar_state, rag_reminders_state) stay in ragvec.db
+# because scripts/ingest_*.py open their own conn directly; moving them would
+# lose cursors and force full-rescan on next run.
+_TELEMETRY_DB_FILENAME = "telemetry.db"
 LOG_PATH = Path.home() / ".local/share/obsidian-rag/queries.jsonl"
 EVAL_LOG_PATH = Path.home() / ".local/share/obsidian-rag/eval.jsonl"
 BEHAVIOR_LOG_PATH = Path.home() / ".local/share/obsidian-rag/behavior.jsonl"
@@ -3398,16 +3410,18 @@ def feedback_signals_for_query(q_embedding: list[float]) -> tuple[dict[str, floa
     return boost, penalty
 
 
-# ── SQL state store (T1: foundation) ──────────────────────────────────────────
-# Feature-flagged migration of JSONL telemetry files into ragvec.db under the
-# `rag_*` table namespace (disjoint from sqlite-vec's `vec_*` / `meta_*`). When
-# RAG_STATE_SQL=1, SqliteVecClient.__init__ calls _ensure_telemetry_tables() to
-# create schemas + register rows in rag_schema_version. Writers/readers are
-# swapped in later tasks (T3/T4) — this task is pure additive scaffolding.
+# ── SQL state store (T1 foundation, split to telemetry.db 2026-04-21) ────────
+# Telemetry lives in telemetry.db — separate file from ragvec.db since the
+# 2026-04-21 split. `rag_*` tables (disjoint from sqlite-vec's `vec_*` /
+# `meta_*`) hold queries/behavior/feedback/tune/contradictions/ambient/brief/
+# cpu/memory metrics + entity graph + OCR cache. `_ragvec_state_conn()`
+# handles opening telemetry.db with idempotent `_ensure_telemetry_tables`.
 #
-# Durability: telemetry writes set `PRAGMA synchronous=NORMAL` (WAL mode
-# already set by SqliteVecClient). Concurrent writers across processes
-# serialize via SQLite's busy_timeout; readers run in parallel (WAL).
+# Durability: telemetry writes set `PRAGMA synchronous=NORMAL` and
+# `PRAGMA journal_mode=WAL`. Concurrent writers across processes serialize
+# via SQLite's busy_timeout on telemetry.db's own WAL; the indexer's bulk
+# writes to ragvec.db no longer block hot-path telemetry writes. Readers run
+# in parallel (WAL).
 
 RAG_STATE_SQL = os.environ.get("RAG_STATE_SQL", "").strip() == "1"
 
@@ -4067,8 +4081,13 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 3) -> Non
 
 @contextlib.contextmanager
 def _ragvec_state_conn():
-    """Open a short-lived sqlite3 connection to ragvec.db with WAL + busy
+    """Open a short-lived sqlite3 connection to telemetry.db with WAL + busy
     timeout, ensure telemetry tables exist, yield the conn, then close.
+
+    telemetry.db lives next to ragvec.db under DB_PATH. Pre-2026-04-21 the
+    rag_* tables shared ragvec.db with the sqlite-vec workload; the split
+    eliminates bulk-indexer-vs-hot-path WAL contention (see
+    _TELEMETRY_DB_FILENAME).
 
     Intentionally does NOT load the sqlite-vec extension — telemetry writes
     only touch rag_*/system_memory_metrics tables. Keeps the writer path
@@ -4082,7 +4101,7 @@ def _ragvec_state_conn():
     """
     import sqlite3 as _sqlite3
     DB_PATH.mkdir(parents=True, exist_ok=True)
-    conn = _sqlite3.connect(str(DB_PATH / "ragvec.db"),
+    conn = _sqlite3.connect(str(DB_PATH / _TELEMETRY_DB_FILENAME),
                             isolation_level=None, check_same_thread=False,
                             timeout=30.0)
     try:
@@ -4097,6 +4116,7 @@ def _ragvec_state_conn():
         row = cur.fetchone()
         if (row[0] if row else "").lower() != "wal":
             conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_version ("
             " table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
@@ -5108,11 +5128,11 @@ class SqliteVecClient:
         )
         self._db.commit()
         self._collections: dict[str, SqliteVecCollection] = {}
-        # Feature-flagged SQL state-store foundation (T1 of JSONL→SQLite
-        # migration). OFF by default; gated by RAG_STATE_SQL=1 env var.
-        # Hot path (vec reads/writes) is untouched when flag is off.
-        if RAG_STATE_SQL:
-            _ensure_telemetry_tables(self._db)
+        # Post 2026-04-21 split: telemetry tables live in telemetry.db (see
+        # _TELEMETRY_DB_FILENAME + _ragvec_state_conn). SqliteVecClient no
+        # longer creates rag_* tables on ragvec.db — that was a safety net
+        # for a pre-T10 code path that's gone. RAG_STATE_SQL env is still
+        # respected by plist trail-config but now a no-op here.
 
     def get_or_create_collection(self, name: str, metadata=None):
         # metadata arg ignored (was `{"hnsw:space": "cosine"}`); sqlite-vec
@@ -31725,7 +31745,23 @@ def stats():
         if _vcfg["current"] and _vcfg["current"] in _vcfg["vaults"]:
             vault_src = f"registry · {_vcfg['current']}"
     console.print(f"[cyan]Vault:[/cyan] {VAULT_PATH}  [dim]({vault_src})[/dim]")
-    console.print(f"[cyan]DB:[/cyan] {DB_PATH}")
+    console.print(f"[cyan]DB dir:[/cyan] {DB_PATH}")
+
+    def _fmt_db_size(p: Path) -> str:
+        try:
+            b = p.stat().st_size
+            wal = p.with_suffix(p.suffix + "-wal")
+            wal_b = wal.stat().st_size if wal.is_file() else 0
+            total_mb = (b + wal_b) / (1024 * 1024)
+            wal_note = f" + WAL {wal_b / (1024*1024):.1f}MB" if wal_b else ""
+            return f"{total_mb:.1f}MB{wal_note}"
+        except OSError:
+            return "[dim](missing)[/dim]"
+
+    ragvec_db = DB_PATH / "ragvec.db"
+    telemetry_db = DB_PATH / _TELEMETRY_DB_FILENAME
+    console.print(f"[cyan]  ragvec.db:[/cyan]    {_fmt_db_size(ragvec_db)}  [dim](vec + meta + ingester cursors)[/dim]")
+    console.print(f"[cyan]  telemetry.db:[/cyan] {_fmt_db_size(telemetry_db)}  [dim](rag_* telemetry + entity graph + OCR cache)[/dim]")
     console.print(f"[cyan]Colección:[/cyan] {COLLECTION_NAME}")
     console.print(f"[cyan]Embed model:[/cyan] {EMBED_MODEL}")
     try:
@@ -32528,14 +32564,15 @@ def _prune_orphan_segment_dirs(dry_run: bool = False) -> dict:
     return out
 
 
-def _vec_wal_checkpoint(dry_run: bool = False) -> dict:
-    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on ragvec.db.
+def _wal_checkpoint_for(sqlite_path: Path, *, dry_run: bool = False) -> dict:
+    """Run `PRAGMA wal_checkpoint(TRUNCATE)` against an arbitrary sqlite file.
 
     Safer than VACUUM — doesn't require exclusive lock and truncates the
     write-ahead log after flushing. Returns {before_bytes, after_bytes, ok}.
+    Helper for post-split maintenance: ragvec.db and telemetry.db each have
+    their own WAL and need independent checkpoints.
     """
-    sqlite_path = DB_PATH / "ragvec.db"
-    wal_path = DB_PATH / "ragvec.db-wal"
+    wal_path = sqlite_path.with_suffix(sqlite_path.suffix + "-wal")
     if not sqlite_path.is_file():
         return {"ok": False, "reason": "no sqlite file"}
     before = sqlite_path.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
@@ -32553,6 +32590,22 @@ def _vec_wal_checkpoint(dry_run: bool = False) -> dict:
         return {"ok": False, "reason": str(e), "before_bytes": before}
     after = sqlite_path.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
     return {"ok": True, "before_bytes": before, "after_bytes": after}
+
+
+def _vec_wal_checkpoint(dry_run: bool = False) -> dict:
+    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on ragvec.db (sqlite-vec workload)."""
+    return _wal_checkpoint_for(DB_PATH / "ragvec.db", dry_run=dry_run)
+
+
+def _telemetry_wal_checkpoint(dry_run: bool = False) -> dict:
+    """Run `PRAGMA wal_checkpoint(TRUNCATE)` on telemetry.db.
+
+    Post 2026-04-21 split — telemetry.db is the hot-path writes target (queries,
+    behavior, memory/cpu metrics). Separate WAL from ragvec.db, so an
+    unconditional checkpoint is fired in run_maintenance to keep the WAL
+    bounded even when --skip-logs bypasses _sql_rotate_log_tables.
+    """
+    return _wal_checkpoint_for(DB_PATH / _TELEMETRY_DB_FILENAME, dry_run=dry_run)
 
 
 # ── SQL log rotation (T7) ────────────────────────────────────────────────────
@@ -32642,7 +32695,8 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
     import sqlite3 as _sqlite
     from datetime import datetime as _dt
 
-    sqlite_path = DB_PATH / "ragvec.db"
+    # Post 2026-04-21 split: rag_* log-style tables live in telemetry.db.
+    sqlite_path = DB_PATH / _TELEMETRY_DB_FILENAME
     out: dict = {
         "rows_deleted": {},
         "wal_checkpoint": None,
@@ -32695,7 +32749,8 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             conn.commit()
 
         # WAL checkpoint once after all deletes — cheaper than N checkpoints.
-        wal_path = DB_PATH / "ragvec.db-wal"
+        # Post-split: telemetry.db-wal (not ragvec.db-wal).
+        wal_path = DB_PATH / (_TELEMETRY_DB_FILENAME + "-wal")
         before_wal = sqlite_path.stat().st_size + (
             wal_path.stat().st_size if wal_path.is_file() else 0
         )
@@ -32970,9 +33025,14 @@ def _rollback_state_migration(*, force: bool = False,
                                   src=str(bak_path), dst=str(dest), err=repr(e))
 
     # 4. DROP rag_* tables in one transaction + clear schema_version rows.
-    sqlite_path = DB_PATH / "ragvec.db"
+    # Post 2026-04-21 split: rag_* tables now live in telemetry.db, not
+    # ragvec.db. Rollback drops from the new file. If the operator is
+    # rolling back to a pre-split checkpoint they should `git revert`
+    # first (per CLAUDE.md rollback procedure), which restores the old
+    # code that re-reads ragvec.db.
+    sqlite_path = DB_PATH / _TELEMETRY_DB_FILENAME
     if sqlite_path.is_file():
-        wal_path = DB_PATH / "ragvec.db-wal"
+        wal_path = DB_PATH / (_TELEMETRY_DB_FILENAME + "-wal")
         before_bytes = sqlite_path.stat().st_size + (
             wal_path.stat().st_size if wal_path.is_file() else 0
         )
@@ -33082,11 +33142,19 @@ def run_maintenance(
     except Exception as e:
         results["orphan_segments_error"] = str(e)
 
-    # 3c. WAL checkpoint (compacts ragvec.db-wal)
+    # 3c. WAL checkpoint — post-split we have two files with two WALs.
+    # ragvec.db-wal compacts here; telemetry.db-wal compacts inside
+    # _sql_rotate_log_tables (step 8) so it's always covered when logs
+    # run, and we also fire an unconditional telemetry checkpoint below
+    # so --skip-logs doesn't starve it.
     try:
         results["wal_checkpoint"] = _vec_wal_checkpoint(dry_run=dry_run)
     except Exception as e:
         results["wal_checkpoint_error"] = str(e)
+    try:
+        results["wal_checkpoint_telemetry"] = _telemetry_wal_checkpoint(dry_run=dry_run)
+    except Exception as e:
+        results["wal_checkpoint_telemetry_error"] = str(e)
 
     # 4. Context cache pruning
     try:

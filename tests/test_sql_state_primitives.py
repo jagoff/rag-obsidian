@@ -35,7 +35,7 @@ def _fresh_conn(path: Path) -> sqlite3.Connection:
 
 @pytest.fixture
 def conn(tmp_path):
-    c = _fresh_conn(tmp_path / "ragvec.db")
+    c = _fresh_conn(tmp_path / rag._TELEMETRY_DB_FILENAME)
     yield c
     c.close()
 
@@ -50,7 +50,7 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
 
 
 def test_ensure_telemetry_tables_idempotent(tmp_path):
-    db = tmp_path / "ragvec.db"
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     c = _fresh_conn(db)
     before = _table_names(c)
     rag._ensure_telemetry_tables(c)
@@ -272,7 +272,7 @@ def _writer_worker(args):
 
 
 def test_concurrent_writers_no_starvation(tmp_path):
-    db = tmp_path / "ragvec.db"
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     c = _fresh_conn(db)
     c.close()
 

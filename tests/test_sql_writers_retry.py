@@ -121,7 +121,7 @@ def test_log_query_event_lands_in_sql_when_writer_is_healthy(tmp_path, monkeypat
     """End-to-end: a working writer persists the event to rag_queries."""
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     rag.log_query_event({"cmd": "test_ok", "q": "ping"})
-    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn = sqlite3.connect(str(tmp_path / rag._TELEMETRY_DB_FILENAME))
     try:
         rows = conn.execute(
             "SELECT cmd, q FROM rag_queries WHERE cmd = ?",

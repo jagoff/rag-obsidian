@@ -7,8 +7,8 @@ Each log/state writer in rag.py (plus web/server.py samplers) must:
   - NOT dual-write on the happy path
 
 Feature-flag + DB path are patched per test via monkeypatch. `_ragvec_state_conn`
-reads `rag.DB_PATH` and constructs `DB_PATH / "ragvec.db"`, so pointing DB_PATH
-at tmp_path is sufficient to isolate each test.
+reads `rag.DB_PATH` and constructs `DB_PATH / rag._TELEMETRY_DB_FILENAME`, so pointing
+DB_PATH at tmp_path is sufficient to isolate each test.
 """
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ def _count(conn, table: str, where: str = "", params: tuple = ()) -> int:
 
 
 def _open_db(tmp_path: Path) -> sqlite3.Connection:
-    """Open the on-disk ragvec.db the writers created + apply T1 DDL so the
+    """Open the on-disk telemetry.db the writers created + apply T1 DDL so the
     test can SELECT against the same schema that was populated."""
-    db = tmp_path / "ragvec.db"
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     conn = sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
@@ -45,7 +45,7 @@ def _open_db(tmp_path: Path) -> sqlite3.Connection:
 
 @pytest.fixture
 def sql_env(tmp_path, monkeypatch):
-    """Flag ON + DB_PATH redirected. Writers will use tmp_path/ragvec.db."""
+    """Flag ON + DB_PATH redirected. Writers will use tmp_path/telemetry.db."""
     monkeypatch.setattr(rag, "RAG_STATE_SQL", True)
     monkeypatch.setattr(web_server, "RAG_STATE_SQL", True)
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)

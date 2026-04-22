@@ -177,9 +177,9 @@ def test_hook_reanalyzes_on_different_hash(tmp_vault, captured_sends):
     rag._ambient_hook(col, p, "00-Inbox/n.md", "hash2")
     # Both fire — different hashes
     assert len(captured_sends) >= 1  # hook may produce quiet events
-    # Post-T10: rag_ambient_state upserts by path — 1 row, hash=hash2.
+    # Post-T10 split: rag_ambient_state lives in telemetry.db.
     import sqlite3
-    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    conn = sqlite3.connect(str(rag.DB_PATH / rag._TELEMETRY_DB_FILENAME))
     try:
         row = conn.execute(
             "SELECT hash FROM rag_ambient_state WHERE path = ?",
@@ -334,10 +334,10 @@ def test_whatsapp_send_returns_false_on_network_error(monkeypatch):
 
 
 def test_ambient_state_records_analysis(tmp_vault):
-    """Post-T10: ambient state lives in rag_ambient_state (SQL)."""
+    """Post-T10 split: ambient state lives in rag_ambient_state (telemetry.db)."""
     import sqlite3
     rag._ambient_state_record("00-Inbox/n.md", "h1", {"wikilinks_applied": 2})
-    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    conn = sqlite3.connect(str(rag.DB_PATH / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(

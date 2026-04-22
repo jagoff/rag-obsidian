@@ -187,7 +187,7 @@ def test_filing_log_writes_sql(tmp_vault, tmp_path):
             "neighbors": []}
     rag._filing_log_proposal(prop)
 
-    conn = sqlite3.connect(str(tmp_path / "ragvec.db"))
+    conn = sqlite3.connect(str(tmp_path / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(
@@ -219,9 +219,9 @@ def test_cli_file_dry_run_end_to_end(tmp_vault, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "00-Inbox/note.md" in result.output
     assert "02-Areas/Musica" in result.output
-    # Post-T10: log debe tener al menos una propuesta en rag_filing_log.
+    # Post-T10 split: log debe tener al menos una propuesta en rag_filing_log (telemetry.db).
     import sqlite3
-    conn = sqlite3.connect(str(rag.DB_PATH / "ragvec.db"))
+    conn = sqlite3.connect(str(rag.DB_PATH / rag._TELEMETRY_DB_FILENAME))
     try:
         n = conn.execute("SELECT COUNT(*) FROM rag_filing_log").fetchone()[0]
     finally:

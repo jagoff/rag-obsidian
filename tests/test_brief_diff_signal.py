@@ -28,10 +28,9 @@ def tmp_sidecars(tmp_path, monkeypatch):
 
 
 def _read_behavior_events(tmp_path: Path) -> list[dict]:
-    """Post-T10 substitute for `_read_jsonl(behavior.jsonl)` — read from
-    rag_behavior in the test DB."""
+    """Post-T10 split substitute — read from rag_behavior in telemetry.db."""
     import sqlite3
-    db_file = tmp_path / "ragvec.db"
+    db_file = tmp_path / rag._TELEMETRY_DB_FILENAME
     if not db_file.is_file():
         return []
     conn = sqlite3.connect(str(db_file))
@@ -80,9 +79,9 @@ def _write_sidecar_entry(path: Path, brief_type: str, brief_rel: str,
 def test_record_brief_written_appends_valid_json(tmp_sidecars):
     paths = ["02-Areas/Foo.md", "03-Resources/Bar.md"]
     rag.record_brief_written("morning", Path("05-Reviews/2026-04-17.md"), paths, {"agenda": paths[:1]})
-    # Post-T10: read from rag_brief_written instead of JSONL.
+    # Post-T10 split: read from rag_brief_written in telemetry.db.
     import sqlite3
-    conn = sqlite3.connect(str(tmp_sidecars["tmp"] / "ragvec.db"))
+    conn = sqlite3.connect(str(tmp_sidecars["tmp"] / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(

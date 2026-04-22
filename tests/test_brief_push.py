@@ -39,7 +39,7 @@ def cfg_set(monkeypatch, tmp_path):
 
 def _read_ambient_events(tmp_path: Path) -> list[dict]:
     import sqlite3
-    db_file = tmp_path / "ragvec.db"
+    db_file = tmp_path / rag._TELEMETRY_DB_FILENAME
     if not db_file.is_file():
         return []
     conn = sqlite3.connect(str(db_file))

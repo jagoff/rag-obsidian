@@ -9,11 +9,14 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ragvec.db lives next to sqlite-vec data. Kept in sync with rag.DB_PATH — if
-# the env var OBSIDIAN_RAG_VAULT changes the vault at runtime the SQL writer
-# still targets the same physical file used by rag.py + SqliteVecClient, since
-# both resolve via Path.home() identically in this codebase.
-_DB_PATH: Path = Path.home() / ".local/share/obsidian-rag" / "ragvec" / "ragvec.db"
+# Telemetry DB lives next to ragvec.db (post-2026-04-21 split). We resolve
+# the path dynamically via rag.DB_PATH + rag._TELEMETRY_DB_FILENAME so tests
+# that monkeypatch DB_PATH (e.g. tmp_path fixtures) keep working without
+# having to also patch this module. Lazy import avoids pulling rag.py at
+# module load time — only when the writer first needs to open a conn.
+def _resolve_telemetry_db_path() -> Path:
+    import rag
+    return rag.DB_PATH / rag._TELEMETRY_DB_FILENAME
 
 _FRONTMATTER_KEYS = ("session_id", "created", "updated", "turns", "confidence_avg", "sources", "tags")
 _TAGS = ("conversation", "rag-chat")
@@ -51,9 +54,10 @@ def _open_sql_conn() -> sqlite3.Connection:
     # the writer coexists with the long-lived vec client without lock
     # contention. check_same_thread=False because the caller is a daemon
     # thread spawned per /api/chat turn.
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db_path = _resolve_telemetry_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
-        str(_DB_PATH), isolation_level=None, check_same_thread=False, timeout=30.0
+        str(db_path), isolation_level=None, check_same_thread=False, timeout=30.0
     )
     # busy_timeout FIRST — every subsequent PRAGMA then honours it instead
     # of returning SQLITE_BUSY immediately. Critical under multi-process

@@ -8,8 +8,8 @@ Each flag-gated reader in rag.py must:
   - invalidate cache when MAX(ts) advances
 
 Feature-flag + DB path are patched per test via monkeypatch. `_ragvec_state_conn`
-reads `rag.DB_PATH` and constructs `DB_PATH / "ragvec.db"`, so pointing DB_PATH
-at tmp_path is sufficient to isolate each test.
+reads `rag.DB_PATH` and constructs `DB_PATH / rag._TELEMETRY_DB_FILENAME`, so pointing
+DB_PATH at tmp_path is sufficient to isolate each test.
 """
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ import rag
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 def _open_db(tmp_path: Path) -> sqlite3.Connection:
-    """Open the on-disk ragvec.db with T1 DDL applied."""
-    db = tmp_path / "ragvec.db"
+    """Open the on-disk telemetry.db with T1 DDL applied."""
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
     conn = sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(

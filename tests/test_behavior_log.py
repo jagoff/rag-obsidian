@@ -25,7 +25,7 @@ import rag
 
 
 def _read_behavior_rows(db_dir: Path) -> list[dict]:
-    conn = sqlite3.connect(str(db_dir / "ragvec.db"))
+    conn = sqlite3.connect(str(db_dir / rag._TELEMETRY_DB_FILENAME))
     conn.row_factory = sqlite3.Row
     try:
         rows = list(conn.execute(
@@ -101,7 +101,7 @@ def test_injects_ts_when_missing(behavior_path, flush_log):
 def test_empty_dict_is_noop(behavior_path, flush_log):
     rag.log_behavior_event({})
     # SQL DB file may or may not exist; if it does, rag_behavior is empty.
-    db_file = behavior_path / "ragvec.db"
+    db_file = behavior_path / rag._TELEMETRY_DB_FILENAME
     if db_file.is_file():
         assert _read_behavior_rows(behavior_path) == []
 
@@ -215,7 +215,7 @@ def test_open_missing_path_exits_1_no_event(tmp_vault, behavior_path, monkeypatc
     assert result.exit_code == 1
     assert len(calls) == 0
     # No DB file required — nothing was written.
-    db_file = behavior_path / "ragvec.db"
+    db_file = behavior_path / rag._TELEMETRY_DB_FILENAME
     if db_file.is_file():
         assert _read_behavior_rows(behavior_path) == []
 

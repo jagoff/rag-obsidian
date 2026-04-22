@@ -13817,6 +13817,95 @@ def build_where(
     return {"$and": conditions}
 
 
+@dataclass
+class RetrieveResult:
+    """Shape contractual de lo que `retrieve()` y `multi_retrieve()` devuelven.
+
+    Pre 2026-04-22 esto era un dict plano con ~13 claves opcionales. Cada
+    uno de los ~196 call sites en rag.py + web/server.py accedía con un
+    mix de `result["x"]` (asume) y `result.get("x", default)` (defensivo).
+    Agregar un campo nuevo (como `intent` hoy) requería tocar 4 returns +
+    todos los call sites defensivamente — sin check automático.
+
+    Con la dataclass:
+      - Type-safety: `result.intent` es `str | None` conocido.
+      - IDE autocomplete.
+      - `dataclasses.fields()` para introspección / tests.
+      - Retrocompat 100%: `result["docs"]` y `result.get("x")` siguen
+        funcionando vía `__getitem__` + `get()`. Los ~196 call sites
+        legacy no necesitan migrar.
+
+    Campos:
+      docs, metas, scores        — listas paralelas de longitud k
+      confidence                 — top score post-rerank (reranker score)
+      search_query               — query efectiva (tras reformulate)
+      filters_applied            — {folder, tag, date_range} inferidos
+      query_variants             — paráfrasis del HyDE/expand
+      timing                     — stage breakdown en ms
+      fast_path                  — True si el adaptive routing hit score>=0.6
+      graph_docs/graph_metas     — 1-hop wikilink neighbors
+      extras                     — metadata adicional (mentions, etc.)
+      intent                     — count/list/recent/agenda/synthesis/comparison/semantic
+      vault_scope                — nombres de vaults cubiertos (multi-vault)
+    """
+    docs: list[str]
+    metas: list[dict]
+    scores: list[float]
+    confidence: float
+    search_query: str = ""
+    filters_applied: dict = field(default_factory=dict)
+    query_variants: list[str] = field(default_factory=list)
+    timing: dict[str, float] = field(default_factory=dict)
+    fast_path: bool = False
+    graph_docs: list[str] = field(default_factory=list)
+    graph_metas: list[dict] = field(default_factory=list)
+    extras: dict = field(default_factory=dict)
+    intent: str | None = None
+    vault_scope: list[str] = field(default_factory=list)
+
+    # ── Retrocompat dict access ─────────────────────────────────────────
+
+    def __getitem__(self, key: str):
+        """`result["docs"]` sigue funcionando — llama a getattr bajo la capucha."""
+        if not hasattr(self, key):
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value) -> None:
+        """Legacy call sites a veces hacen `result["x"] = y` (sobre todo en
+        los loops de pre/post-process). Delegate a setattr; raisea
+        AttributeError → KeyError si no existe."""
+        if not hasattr(self, key):
+            raise KeyError(f"unknown field: {key!r}")
+        setattr(self, key, value)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def get(self, key: str, default=None):
+        """Imita `dict.get` — retorna default si el atributo no existe."""
+        return getattr(self, key, default)
+
+    def keys(self):
+        """Imita `dict.keys` para iteración legacy."""
+        import dataclasses as _dc
+        return [f.name for f in _dc.fields(self)]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RetrieveResult":
+        """Construye desde un dict (migración gradual + fixtures legacy).
+        Ignora keys desconocidas silently (tolerancia forward-compat)."""
+        import dataclasses as _dc
+        valid = {f.name for f in _dc.fields(cls)}
+        kwargs = {k: v for k, v in d.items() if k in valid}
+        # Rellena obligatorios faltantes con defaults razonables (caso
+        # `{"docs": [], ...}` que podría venir de un test)
+        for req in ("docs", "metas", "scores"):
+            kwargs.setdefault(req, [])
+        kwargs.setdefault("confidence", float("-inf"))
+        return cls(**kwargs)
+
+
 def retrieve(
     col: SqliteVecCollection,
     question: str,
@@ -13873,17 +13962,12 @@ def retrieve(
     _t_retrieve_start = time.perf_counter()
     _timing: dict[str, float] = {}
     if _col_count == 0:
-        return {
-            "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
-            "search_query": question, "filters_applied": {}, "query_variants": [question],
-            "timing": dict(_timing),
-            "fast_path": False,
-            # Echo the caller-provided intent so the web chat endpoint
-            # (and any other caller) can log it without re-classifying.
-            # 2026-04-22 audit: 700/1667 (42%) of queries from cmd=web had
-            # no `intent` in extra_json because retrieve() never exposed it.
-            "intent": intent,
-        }
+        return RetrieveResult(
+            docs=[], metas=[], scores=[], confidence=float("-inf"),
+            search_query=question, query_variants=[question],
+            timing=dict(_timing),
+            intent=intent,
+        )
 
     # 1. Reformulate vs history (precise mode)
     search_query = question
@@ -14396,30 +14480,31 @@ def retrieve(
         and float(final_scores[0]) > _LOOKUP_THRESHOLD
     )
 
-    return {
-        "docs": docs,
-        "metas": metas,
-        "scores": final_scores,
-        "confidence": top_score,
-        "search_query": search_query,
-        "filters_applied": filters_applied,
-        "query_variants": variants,
-        "graph_docs": graph_docs,
-        "graph_metas": graph_metas,
-        "extras": extras,
-        # Per-stage timing breakdown (embed/sem/bm25/rrf/fetch/parent_expand/
-        # rerank/graph_expand/total — all in ms). Surfaced so callers can
-        # log it to queries.jsonl for latency regression analysis. Previously
-        # only emitted to stderr behind RAG_RETRIEVE_TIMING=1; now always
-        # available in-process so callers can decide what to persist.
-        "timing": dict(_timing),
-        "fast_path": _fast_path,
-        # Echo the caller-provided intent. Pre 2026-04-22 this was kept in
-        # the internal scope and the web `/api/chat` endpoint never got it
-        # back, so 42% of the tracing (cmd=web) had no intent populated in
-        # `rag_queries.extra_json`. See test_intent_logging_web.py.
-        "intent": intent,
-    }
+    # Per-stage timing breakdown (embed/sem/bm25/rrf/fetch/parent_expand/
+    # rerank/graph_expand/total — all in ms). Surfaced so callers can log
+    # it to queries.jsonl for latency regression analysis. Previously only
+    # emitted to stderr behind RAG_RETRIEVE_TIMING=1; now always available
+    # in-process so callers can decide what to persist.
+    #
+    # `intent` echo: the web `/api/chat` endpoint passes intent so the
+    # log_query_event can persist it — pre 2026-04-22, 42% of `cmd=web`
+    # rows in rag_queries.extra_json had intent=NULL because retrieve()
+    # never exposed it. See test_intent_logging_web.py.
+    return RetrieveResult(
+        docs=docs,
+        metas=metas,
+        scores=final_scores,
+        confidence=top_score,
+        search_query=search_query,
+        filters_applied=filters_applied,
+        query_variants=variants,
+        graph_docs=graph_docs,
+        graph_metas=graph_metas,
+        extras=extras,
+        timing=dict(_timing),
+        fast_path=_fast_path,
+        intent=intent,
+    )
 
 
 # ── Agentic / deep retrieval ─────────────────────────────────────────────────
@@ -14879,14 +14964,12 @@ def multi_retrieve(
     unchanged to both the deep and shallow paths.
     """
     if not vaults:
-        return {
-            "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
-            "search_query": question, "filters_applied": {}, "query_variants": [question],
-            "vault_scope": [],
-            # Echo intent even in the empty-vaults early-return so callers
-            # can uniformly do `result.get("intent")` to populate telemetry.
-            "intent": intent,
-        }
+        return RetrieveResult(
+            docs=[], metas=[], scores=[], confidence=float("-inf"),
+            search_query=question, query_variants=[question],
+            vault_scope=[],
+            intent=intent,
+        )
     _retrieve_fn = deep_retrieve if deep else retrieve
 
     # Camino corto: un solo vault → evitamos el overhead de merge.
@@ -14903,7 +14986,9 @@ def multi_retrieve(
             source=source,
             intent=intent,
         )
-        # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
+        # Solo anotamos si hay >=2 en scope el display (innecesario para
+        # uno). Via __setitem__ funciona con RetrieveResult y con dicts
+        # legacy (tests que mockean _retrieve_fn con un dict plano).
         r["vault_scope"] = [name]
         return r
 
@@ -14944,21 +15029,19 @@ def multi_retrieve(
     all_items.sort(key=lambda x: -x[0])
     top = all_items[:k]
     top_score = top[0][0] if top else float("-inf")
-    return {
-        "docs": [d for _, d, _ in top],
-        "metas": [m for _, _, m in top],
-        "scores": [s for s, _, _ in top],
-        "confidence": top_score,
-        "search_query": question,
-        "filters_applied": filters_applied,
-        "query_variants": variants or [question],
-        "vault_scope": [n for n, _ in vaults],
-        "graph_docs": [d for d, _ in all_graph],
-        "graph_metas": [m for _, m in all_graph],
-        # Echo the caller-provided intent so the web `/api/chat` handler
-        # (and any other multi-vault caller) can log it without re-classifying.
-        "intent": intent,
-    }
+    return RetrieveResult(
+        docs=[d for _, d, _ in top],
+        metas=[m for _, _, m in top],
+        scores=[s for s, _, _ in top],
+        confidence=top_score,
+        search_query=question,
+        filters_applied=filters_applied,
+        query_variants=variants or [question],
+        vault_scope=[n for n, _ in vaults],
+        graph_docs=[d for d, _ in all_graph],
+        graph_metas=[m for _, m in all_graph],
+        intent=intent,
+    )
 
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────

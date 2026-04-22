@@ -1,4 +1,4 @@
-"""Fine-tune bge-reranker-v2-m3 on user feedback (GC#2.B, 2026-04-22).
+"""Fine-tune bge-reranker-v2-m3 on user feedback (GC#2.B/2.C, 2026-04-22).
 
 Pipeline:
   1. Load feedback pairs from rag_feedback ⋈ rag_queries (via turn_id).
@@ -17,11 +17,14 @@ Usage:
   python scripts/finetune_reranker.py --epochs 3 --lr 2e-5
 
 Caveats:
-  - 55 positive pairs × 4 paths avg = ~220 noisy positive examples.
-  - `corrective_path` would yield cleaner signals — current data has 0 rows
-    with it. A rating=1 on a 5-chunk turn means "I liked the answer" not
-    "chunk X was the golden one".
-  - The gate is strict: no regression on either singles or chains hit@5.
+  - Uses `corrective_path` from `rag_feedback.extra_json` as clean single
+    positive when available. Falls back to all turn paths when absent
+    (noisy but usable).
+  - Gated on `RAG_FINETUNE_MIN_CORRECTIVES` (default 20). Below this,
+    aborts with exit 5 — the signal is too weak for meaningful fine-tune.
+  - Hard negatives mined via retrieve() top-K, excluding the corrective_path
+    when present.
+  - The eval gate is strict: no regression on either singles or chains hit@5.
 """
 from __future__ import annotations
 
@@ -59,14 +62,15 @@ def _fetch_feedback_pairs() -> list[dict]:
     with rag._ragvec_state_conn() as conn:
         cursor = conn.execute(
             """
-            SELECT f.rating, f.turn_id, f.q, q.paths_json, q.scores_json
+            SELECT f.rating, f.turn_id, f.q, q.paths_json, q.scores_json,
+                   json_extract(f.extra_json, '$.corrective_path') AS cp
             FROM rag_feedback f
             LEFT JOIN rag_queries q ON json_extract(q.extra_json, '$.turn_id') = f.turn_id
             WHERE f.rating = 1
             ORDER BY f.ts DESC
             """
         )
-        for rating, turn_id, q, paths_json, scores_json in cursor.fetchall():
+        for rating, turn_id, q, paths_json, scores_json, cp in cursor.fetchall():
             if not q or not paths_json:
                 continue
             try:
@@ -77,18 +81,17 @@ def _fetch_feedback_pairs() -> list[dict]:
                 scores = json.loads(scores_json) if scores_json else []
             except Exception:
                 scores = []
-            # Filter cross-source native ids — they aren't filesystem paths
-            # and fetching their document text requires the retrieve pipeline;
-            # keep only vault-style paths (no `://` scheme).
             vault_paths = [p for p in paths if "://" not in p]
             if not vault_paths:
                 continue
+            corrective_path = cp.strip() if isinstance(cp, str) and cp.strip() else None
             rows.append({
                 "rating": int(rating),
                 "turn_id": turn_id or "",
                 "q": q,
                 "paths": vault_paths,
                 "scores": scores,
+                "corrective_path": corrective_path,
             })
     return rows
 
@@ -141,22 +144,32 @@ def _build_training_pairs(
     text1: user question
     text2: document excerpt (first 800 chars of the path)
     label: 1.0 (positive) or 0.0 (mined hard negative)
+
+    Branching on `corrective_path`:
+      - present: that single path is the ONLY positive (label=1.0). Hard negs
+        mined from retrieve() top-K excluding the corrective_path.
+      - absent: every path in the rated-positive turn is a positive (noisy
+        fallback). Hard negs exclude all turn paths.
     """
     pairs: list[dict] = []
     seen = 0
     skipped_unreadable = 0
     for row in feedback_rows:
         seen += 1
-        positive_paths = set(row["paths"])
-        # Positives: each path in the rated-positive turn
-        for p in positive_paths:
+        corrective = row.get("corrective_path")
+        if corrective:
+            positives = [corrective]
+            exclude = {corrective}
+        else:
+            positives = list(row["paths"])
+            exclude = set(row["paths"])
+        for p in positives:
             doc = _path_to_doc(p, vault_root)
             if doc is None:
                 skipped_unreadable += 1
                 continue
             pairs.append({"text1": row["q"], "text2": doc, "label": 1.0})
-        # Hard negatives: top-10 retrieved that AREN'T in positive_paths
-        hard_negs = _mine_hard_negatives(row["q"], positive_paths, col)[:hard_neg_k]
+        hard_negs = _mine_hard_negatives(row["q"], exclude, col)[:hard_neg_k]
         for p in hard_negs:
             doc = _path_to_doc(p, vault_root)
             if doc is None:
@@ -350,7 +363,7 @@ def main():
                     help="Build pairs and print counts; no training or eval.")
     ap.add_argument("--no-eval", action="store_true",
                     help="Skip the `rag eval` gate (debug only).")
-    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--hard-neg-k", type=int, default=5)
@@ -365,6 +378,17 @@ def main():
         print("  Not enough feedback data — need ≥10 rated-positive turns with "
               "paths. Aborting.", file=sys.stderr)
         sys.exit(2)
+
+    min_correctives = int(os.environ.get("RAG_FINETUNE_MIN_CORRECTIVES", "20"))
+    rows_with_corrective = [r for r in rows if r.get("corrective_path")]
+    print(f"  Rows with corrective_path: {len(rows_with_corrective)} "
+          f"(min required: {min_correctives})", file=sys.stderr)
+    if len(rows_with_corrective) < min_correctives:
+        print(f"  Not enough corrective_path signal — need ≥{min_correctives}, "
+              f"got {len(rows_with_corrective)}.", file=sys.stderr)
+        print("  Use `rag chat` + thumbs-down on failed turns to generate more. "
+              "Aborting.", file=sys.stderr)
+        sys.exit(5)
 
     # 2. Build pairs
     col = rag.get_db()

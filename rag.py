@@ -3337,10 +3337,18 @@ def load_feedback_golden() -> dict:
       - Rebuild from rag_feedback when stale OR the golden table is empty.
       - On any SQL error → return an empty snapshot (feedback signal disabled
         until the DB is readable again — retrieval stays functional).
+
+    **2026-04-22 tuning**: the audit found 52 ``feedback_golden_sql_read_failed``
+    entries in one day. The root cause was transient WAL lock contention
+    during concurrent bulk indexing — not a permanent failure. Routing
+    the read block through ``_sql_read_with_retry`` gives it the same
+    5-attempt + jittered-backoff contract the writers already had, so
+    transient locks no longer silently disable the feedback signal for
+    retrieval.
     """
     global _feedback_golden_memo, _feedback_golden_source_ts_sql
 
-    try:
+    def _read():
         with _ragvec_state_conn() as conn:
             source_ts = _sql_max_ts(conn, "rag_feedback")
             meta_ts = _feedback_golden_meta_ts(conn)
@@ -3355,33 +3363,33 @@ def load_feedback_golden() -> dict:
 
             if need_rebuild:
                 rebuilt = _rebuild_feedback_golden_from_sql_feedback(conn)
-                _feedback_golden_memo = rebuilt
-                _feedback_golden_source_ts_sql = (
-                    _feedback_golden_meta_ts(conn) or source_ts or "")
-                return rebuilt
+                return ("rebuilt", rebuilt,
+                        _feedback_golden_meta_ts(conn) or source_ts or "")
 
             # Cache hit on current source_ts.
             if (_feedback_golden_memo is not None
                     and _feedback_golden_source_ts_sql == (meta_ts or "")
                     and not table_empty):
-                return _feedback_golden_memo
+                return ("memo", _feedback_golden_memo, None)
 
             if not table_empty:
                 loaded = _read_feedback_golden_sql(conn)
-                _feedback_golden_memo = loaded
-                _feedback_golden_source_ts_sql = meta_ts or ""
-                return loaded
+                return ("loaded", loaded, meta_ts or "")
 
             # Nothing in either table → empty snapshot.
-            empty = {"positives": [], "negatives": []}
-            _feedback_golden_memo = empty
-            _feedback_golden_source_ts_sql = ""
-            return empty
-    except Exception as exc:
-        _log_sql_state_error("feedback_golden_sql_read_failed",
-                              err=repr(exc))
-        # Degrade to empty snapshot — no JSONL fallback post-T10.
-        return {"positives": [], "negatives": []}
+            return ("empty", {"positives": [], "negatives": []}, "")
+
+    result = _sql_read_with_retry(
+        _read, "feedback_golden_sql_read_failed",
+        default=("error", {"positives": [], "negatives": []}, None),
+    )
+    kind, payload, new_ts = result
+    if kind == "memo":
+        return payload
+    _feedback_golden_memo = payload
+    if new_ts is not None:
+        _feedback_golden_source_ts_sql = new_ts
+    return payload
 
 
 def _soft_feedback_weight(cos: float, floor: float) -> float:
@@ -3691,10 +3699,22 @@ def semantic_cache_store(
     # and poison the cache for the same query after the vault grew content.
     if top_score is not None and top_score < 0.015:
         return False
+    # Pre-2026-04-22 this function did a bare try/except around the INSERT
+    # and silent-failed on the first `database is locked` — which
+    # accounted for 314 of the sql_state_errors.jsonl entries over one
+    # day. Routing through _sql_write_with_retry gives us the same
+    # 5-attempt + jittered-backoff contract every other telemetry writer
+    # uses, so transient WAL contention during a concurrent bulk indexer
+    # or helper-embed no longer poisons the cache path.
     try:
         blob, dim = _embedding_to_blob(q_embedding)
         ttl = int(ttl_seconds) if ttl_seconds is not None else _ttl_for_intent(intent)
         now_iso = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        _log_sql_state_error("semantic_cache_store_failed", err=repr(exc))
+        return False
+
+    def _do_insert():
         with _ragvec_state_conn() as conn:
             conn.execute(
                 "INSERT INTO rag_response_cache"
@@ -3712,10 +3732,9 @@ def semantic_cache_store(
                 ),
             )
             conn.commit()
-        return True
-    except Exception as exc:
-        _log_sql_state_error("semantic_cache_store_failed", err=repr(exc))
-        return False
+
+    _sql_write_with_retry(_do_insert, "semantic_cache_store_failed")
+    return True
 
 
 def semantic_cache_clear(corpus_hash: str | None = None) -> int:
@@ -4447,7 +4466,7 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
         pass
 
 
-def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 3) -> None:
+def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> None:
     """Run a SQL-write closure with transient-lock retry + silent-fail logging.
 
     Pre-2026-04-21 every rag_* writer (`log_query_event`, `log_behavior_event`,
@@ -4460,9 +4479,19 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 3) -> Non
     + `embed()` under cold ollama, or concurrent contradiction workers)
     still escape busy-timeout and surface as OperationalError.
 
-    Same 3-attempt + jittered-backoff shape as web.server._persist_with_sqlite_retry.
+    **2026-04-22 tuning**: defaults bumped to attempts=5 and backoff range
+    0.15–0.5s after an audit found ~115 `queries_sql_write_failed` +
+    34 `behavior_sql_write_failed` + 46 `memory_sql_write_failed` events
+    over one day despite the retry wrapper being wired. Hypothesis (post-
+    split): the old 3×(0.1–0.35s) = ~0.75s total budget was still inside
+    the contention window of a concurrent bulk write + helper-embed. 5×
+    attempts at 0.15–0.5s → ~1.3s total retry budget, enough to outwait
+    a typical WAL-checkpoint stall without blowing up latency for the
+    non-contended happy path.
+
     Non-lock SQL errors (schema drift, disk-full, etc.) propagate on the
-    first failure — no point retrying those.
+    first failure — no point retrying those. Same contract as
+    ``web.server._persist_with_sqlite_retry``.
     """
     import random as _r
     import sqlite3 as _sqlite3
@@ -4475,10 +4504,43 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 3) -> Non
             if "locked" not in str(exc).lower() or attempt == attempts - 1:
                 _log_sql_state_error(error_tag, err=repr(exc))
                 return
-            _t.sleep(0.1 + _r.random() * 0.25)
+            _t.sleep(0.15 + _r.random() * 0.35)
         except Exception as exc:
             _log_sql_state_error(error_tag, err=repr(exc))
             return
+
+
+def _sql_read_with_retry(
+    read_fn, error_tag: str, *, default=None, attempts: int = 5,
+):
+    """Run a SQL-read closure with transient-lock retry + silent-fail fallback.
+
+    Symmetric to ``_sql_write_with_retry`` but for read paths (SELECT,
+    EXPLAIN, etc.) that currently just ``try: ... except: log + degrade``
+    without ever retrying a transient lock. The audit 2026-04-22 found 52
+    ``feedback_golden_sql_read_failed`` entries — the read side of the
+    feedback snapshot was losing retrievability signal silently whenever
+    a concurrent indexer held the WAL briefly.
+
+    Returns ``read_fn()``'s value on success, or ``default`` after all
+    retries are exhausted or a non-lock error fires. Never raises into
+    caller land — matches the existing read-path contract.
+    """
+    import random as _r
+    import sqlite3 as _sqlite3
+    import time as _t
+    for attempt in range(attempts):
+        try:
+            return read_fn()
+        except _sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                _log_sql_state_error(error_tag, err=repr(exc))
+                return default
+            _t.sleep(0.15 + _r.random() * 0.35)
+        except Exception as exc:
+            _log_sql_state_error(error_tag, err=repr(exc))
+            return default
+    return default
 
 
 @contextlib.contextmanager

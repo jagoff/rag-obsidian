@@ -8659,7 +8659,10 @@ def _get_local_embedder():
     return _local_embedder
 
 
-def query_embed_local(texts: list[str]) -> list[list[float]] | None:
+def query_embed_local(
+    texts: list[str],
+    wait_ready_timeout: float | None = None,
+) -> list[list[float]] | None:
     """Embed `texts` in-process via BAAI/bge-m3 SentenceTransformer.
 
     Returns a list of 1024-dim float vectors, or None if the in-process model
@@ -8679,15 +8682,33 @@ def query_embed_local(texts: list[str]) -> list[list[float]] | None:
     eagerly warmup at startup, so the Event is typically set before the
     first user query arrives — they get the fast in-process path.
 
+    `wait_ready_timeout` (2026-04-22): opcional, segundos a esperar por el
+    Event si aún no está set. `None` o 0 mantiene la semántica legacy
+    (bail inmediato). Útil para CLI one-shot donde el warmup async
+    arranca ~100-300ms antes del primer embed y podríamos atraparlo
+    con un timeout corto (disk cache caliente → bge-m3 load <1s).
+    Medido en `rag_queries` últimos 30d: CLI retrieve p50=11.9s vs
+    web 2.8s — el gap principal es que CLI siempre cae al ollama
+    embed (~150ms extra por variant, +700-1000ms total tras el
+    multi-query expansion). Con timeout=1.5s, la gran mayoría de
+    disco-caliente atrapan el local embedder.
+
     Only intended for query-path embeds (1-3 short strings per call).
     Do NOT use from indexing/watch/ingest — those stay on ollama.
     """
     if not _local_embed_enabled():
         return None
-    # Non-blocking readiness check. If the warmup hasn't finished yet,
-    # bail so the caller uses ollama instead of waiting on our lock.
+    # Readiness check. Default: non-blocking (None if not set). When a
+    # timeout is passed, block up to `wait_ready_timeout` seconds on the
+    # Event. On one-shot CLI paths this lets us catch a warmup that's
+    # milliseconds from completing instead of falling back to ollama.
     if not _local_embedder_ready.is_set():
-        return None
+        if wait_ready_timeout and wait_ready_timeout > 0:
+            if not _local_embedder_ready.wait(timeout=float(wait_ready_timeout)):
+                return None  # timed out → caller falls back to ollama
+            # else: Event fired during the wait, proceed normally
+        else:
+            return None
     model = _get_local_embedder()
     if model is None:
         return None
@@ -14694,7 +14715,27 @@ def retrieve(
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
-        _local_vecs = query_embed_local(variants) if _local_embed_enabled() else None
+        # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 1500ms) for the
+        # background warmup to set the _local_embedder_ready Event before
+        # falling back to ollama. Rationale: in CLI one-shot, warmup_async
+        # starts ~100-300ms before retrieve but often still hasn't finished
+        # loading bge-m3 when we hit this line. Pre-fix, that gap meant
+        # every CLI query paid the ollama-embed round trip (~150ms × N
+        # variants). With a short blocking wait, we catch warmup
+        # completions that arrive in the 0.5-1.5s window (typical when the
+        # HF cache is warm on disk). Configurable via env — set
+        # `RAG_LOCAL_EMBED_WAIT_MS=0` to restore legacy non-blocking
+        # behaviour, `RAG_LOCAL_EMBED_WAIT_MS=3000` for colder disks.
+        try:
+            _wait_ms_str = os.environ.get("RAG_LOCAL_EMBED_WAIT_MS")
+            _wait_s = (float(_wait_ms_str) / 1000.0
+                       if _wait_ms_str is not None else 1.5)
+        except ValueError:
+            _wait_s = 1.5
+        _local_vecs = (
+            query_embed_local(variants, wait_ready_timeout=_wait_s)
+            if _local_embed_enabled() else None
+        )
         variant_embeds = _local_vecs if _local_vecs is not None else embed(variants)
     _timing["embed_ms"] = (time.perf_counter() - _t0) * 1000
 
@@ -18194,6 +18235,47 @@ def query(
 ):
     """Consulta única contra las notas."""
     warmup_async()
+
+    # ── Create-intent short-circuit (2026-04-22) ────────────────────────────
+    # `rag query "mandarle mensaje a mamá a las 18"` y similares son
+    # create-intents: el usuario quiere CREAR un recordatorio o evento en
+    # Apple, no buscar info en el vault. Pre-fix, el pipeline RAG completo
+    # corría: retrieve (~10s CLI) + LLM (~60-70s) buscando información que
+    # no existía en el vault porque la query era imperativa, no semántica.
+    # Medición real en rag_queries (últimos 30d):
+    #   "mandarle un mensaje a mi mamá a las 18.50…" → 66.7s total
+    #   "enviale un mensaje a mi mamá a las 18.50…"  → 79.4s total
+    # Con este short-circuit: ~3-5s (sólo la decisión tool-call de ollama).
+    # Paridad con `rag chat` que ya hace el mismo check (rag.py:~19656).
+    # Regex false-positive → `_handle_chat_create_intent` devuelve
+    # `handled=False` y el flow cae en la RAG normal sin haber gastado
+    # ciclo extra (la ventana de ollama es la misma que habría pagado).
+    if _detect_propose_intent(question):
+        _t_propose_start = time.perf_counter()
+        handled, _created = _handle_chat_create_intent(question)
+        if handled:
+            # El chip ya se renderizó dentro del handler. Logueamos el
+            # short-circuit a rag_queries con t_retrieve=0 para que el
+            # análisis de latencia por intent vea claro que esta clase
+            # de query tiene cost constante y no escala con corpus.
+            _elapsed = time.perf_counter() - _t_propose_start
+            try:
+                # log_query_event flattens unknown keys into extra_json
+                # via _map_queries_row. Passing a nested `extra_json: {...}`
+                # would double-nest; top-level keys land in extra_json
+                # automatically (see rag.py `_map_queries_row`).
+                log_query_event({
+                    "cmd": "query",
+                    "q": question,
+                    "t_retrieve": 0.0,
+                    "t_gen": round(_elapsed, 3),
+                    "propose_intent_short_circuit": True,
+                    "intent": "create",
+                })
+            except Exception:
+                pass
+            return
+
     # Explicit --since wins over auto-detect; both are pushed through retrieve().
     date_range: tuple[float, float] | None = None
     if since:

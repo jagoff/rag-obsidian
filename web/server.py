@@ -4470,6 +4470,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # is symmetric with the `cmd=web` path above.
                     "intent": result.get("intent") if isinstance(result, dict) else None,
                     "device": _client_device,
+                    # Stage timing parity with the main web path
+                    # (2026-04-22). In the bypass path there's no LLM
+                    # call — ttft_ms == total_ms and llm_* are zero.
+                    "ttft_ms": int(_bypass_total_ms),
+                    "llm_prefill_ms": 0,
+                    "llm_decode_ms": 0,
+                    "total_ms": int(_bypass_total_ms),
                 })
             except Exception:
                 pass
@@ -5077,6 +5084,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # answers than bare redos (top_score delta).
             "redo_of_turn_id": _redo_of,
             "redo_hint": _redo_hint,
+            # Stage-level timing (ms, integer) — 2026-04-22 gap fix.
+            # Pre-fix these values were emitted only to the SSE `done`
+            # event for the browser, never persisted. That meant the
+            # dashboard couldn't distinguish between "retrieve is slow"
+            # vs "LLM is slow" vs "TTFT is slow" — only the coarse
+            # t_retrieve + t_gen columns. Persisting here unlocks:
+            #   - ttft_ms: percepción del user. Sub-segundo = sweet
+            #     spot. El delta vs total_ms mide cuánto "espera"
+            #     explícitamente el user.
+            #   - llm_prefill_ms: cost del context assembly (antes de
+            #     emitir el primer token). Útil para medir impacto de
+            #     prefix-cache hits + context size changes.
+            #   - llm_decode_ms: tokens/s puro. Foco para speculative
+            #     decoding (GC#2.D).
+            #   - total_ms: crosscheck t_retrieve + t_gen (column
+            #     values) vs lo que realmente midió el endpoint.
+            "ttft_ms": int(_t_ttft_ms),
+            "llm_prefill_ms": int(_t_llm_prefill_ms),
+            "llm_decode_ms": int(_t_llm_decode_ms),
+            "total_ms": int(_t_total_ms),
         })
 
         yield _sse("done", {

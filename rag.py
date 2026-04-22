@@ -13382,6 +13382,11 @@ def retrieve(
             "search_query": question, "filters_applied": {}, "query_variants": [question],
             "timing": dict(_timing),
             "fast_path": False,
+            # Echo the caller-provided intent so the web chat endpoint
+            # (and any other caller) can log it without re-classifying.
+            # 2026-04-22 audit: 700/1667 (42%) of queries from cmd=web had
+            # no `intent` in extra_json because retrieve() never exposed it.
+            "intent": intent,
         }
 
     # 1. Reformulate vs history (precise mode)
@@ -13913,6 +13918,11 @@ def retrieve(
         # available in-process so callers can decide what to persist.
         "timing": dict(_timing),
         "fast_path": _fast_path,
+        # Echo the caller-provided intent. Pre 2026-04-22 this was kept in
+        # the internal scope and the web `/api/chat` endpoint never got it
+        # back, so 42% of the tracing (cmd=web) had no intent populated in
+        # `rag_queries.extra_json`. See test_intent_logging_web.py.
+        "intent": intent,
     }
 
 
@@ -14355,6 +14365,7 @@ def multi_retrieve(
     exclude_path_prefixes: tuple[str, ...] | None = None,
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
+    intent: str | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -14376,6 +14387,9 @@ def multi_retrieve(
             "docs": [], "metas": [], "scores": [], "confidence": float("-inf"),
             "search_query": question, "filters_applied": {}, "query_variants": [question],
             "vault_scope": [],
+            # Echo intent even in the empty-vaults early-return so callers
+            # can uniformly do `result.get("intent")` to populate telemetry.
+            "intent": intent,
         }
     _retrieve_fn = deep_retrieve if deep else retrieve
 
@@ -14391,6 +14405,7 @@ def multi_retrieve(
             exclude_path_prefixes=exclude_path_prefixes,
             seen_titles=seen_titles,
             source=source,
+            intent=intent,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para uno).
         r["vault_scope"] = [name]
@@ -14412,6 +14427,7 @@ def multi_retrieve(
             exclude_path_prefixes=exclude_path_prefixes,
             seen_titles=seen_titles,
             source=source,
+            intent=intent,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -14443,6 +14459,9 @@ def multi_retrieve(
         "vault_scope": [n for n, _ in vaults],
         "graph_docs": [d for d, _ in all_graph],
         "graph_metas": [m for _, m in all_graph],
+        # Echo the caller-provided intent so the web `/api/chat` handler
+        # (and any other multi-vault caller) can log it without re-classifying.
+        "intent": intent,
     }
 
 
@@ -18503,6 +18522,15 @@ def chat(
         sess_summary = session_summary(sess)
         _t_turn_start = time.perf_counter()
         _t_retrieve_start = time.perf_counter()
+        # Classify intent before retrieve so it rides through multi_retrieve
+        # → retrieve → result dict, and the log_query_event below picks it
+        # up via `result.get("intent")`. Pre 2026-04-22 the chat path had no
+        # intent field anywhere in its `rag_queries` rows — symmetric gap
+        # with web/server.py (closed separately).
+        try:
+            _chat_turn_intent, _ = classify_intent(question, set(), set())
+        except Exception:
+            _chat_turn_intent = None
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
             # Pool default (RERANK_POOL_MAX=15, ver bench 2026-04-21 arriba).
             # Multi-query (3 variantes) × N vaults genera <15 candidates
@@ -18511,6 +18539,7 @@ def chat(
                 vaults_resolved, question, k, folder, history, tag, precise,
                 multi_query=_multi_enabled, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
+                intent=_chat_turn_intent,
             )
             # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
             # match en el vault, deep no va a encontrar nada nuevo).
@@ -18524,6 +18553,7 @@ def chat(
                     multi_query=_multi_enabled, auto_filter=not no_auto_filter,
                     date_range=pinned_date_range, summary=sess_summary,
                     deep=True,
+                    intent=_chat_turn_intent,
                 )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")
@@ -18808,6 +18838,10 @@ def chat(
             "fast_path": _chat_fast_path,
             "nli_ms": _chat_nli_ms,
             "grounding_summary": _chat_nli_summary,
+            # Echo intent from result so `cmd=chat` lines up with the web +
+            # query paths in `rag_queries.extra_json`. Pre 2026-04-22 this
+            # field was silently dropped by `chat()`'s own log_query_event.
+            "intent": result.get("intent"),
         })
 
         last_turn_id = turn_id

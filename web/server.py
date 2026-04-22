@@ -3913,10 +3913,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             except Exception:
                 pass
             try:
+                # Metachat fires before retrieve(), so we classify intent
+                # inline to keep telemetry consistent with the other paths.
+                # Failure is non-fatal — the event still goes through.
+                try:
+                    import rag as _rag_m
+                    _meta_intent, _ = _rag_m.classify_intent(question, set(), set())
+                except Exception:
+                    _meta_intent = None
                 log_query_event({
                     "cmd": "web.chat.metachat", "q": question[:200],
                     "session": sess["id"], "answered": True,
                     "t_total": round(total_ms / 1000.0, 3),
+                    "intent": _meta_intent,
                 })
             except Exception:
                 pass
@@ -4090,11 +4099,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # answers the next one (confirmed 2026-04-19).
             _own_conv = _own_conversation_path(sid)
             _exclude = {_own_conv} if _own_conv else None
+            # Classify intent here (regex-only, no LLM call) and thread it
+            # through `multi_retrieve`. Pre 2026-04-22 the web path never
+            # passed intent → retrieve() saw intent=None → adaptive
+            # routing could never kick in, and the 3 `log_query_event`
+            # sites below had no intent to log (42% of traffic lost intent
+            # in extra_json). See tests/test_intent_logging_web.py.
+            try:
+                import rag as _rag_mod
+                _intent_for_log, _ = _rag_mod.classify_intent(
+                    search_question, set(), set())
+            except Exception:
+                _intent_for_log = None
             result = multi_retrieve(
                 vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
                 rerank_pool=5, exclude_paths=_exclude,
                 exclude_path_prefixes=("00-Inbox/conversations/",),
+                intent=_intent_for_log,
             )
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
@@ -4273,6 +4295,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "t_retrieve": round(_t_retrieve_ms / 1000.0, 3),
                     "t_gen": 0.0,
                     "low_conf_bypass": True,
+                    # Intent echoed from the retrieve result so telemetry
+                    # is symmetric with the `cmd=web` path above.
+                    "intent": result.get("intent") if isinstance(result, dict) else None,
                 })
             except Exception:
                 pass
@@ -4866,6 +4891,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "t_gen": round(max(0, _t_total_ms - _t_retrieve_ms) / 1000.0, 3),
             "topic_shifted": _topic_shifted,
             "topic_shift_reason": _topic_shift_reason,
+            # Intent classified in the pipeline, echoed back via
+            # `result["intent"]`. Closes the 42% gap in intent telemetry
+            # measured 2026-04-22.
+            "intent": result.get("intent"),
         })
 
         yield _sse("done", {

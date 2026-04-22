@@ -202,13 +202,19 @@ def _should_skip_reformulate(intent: str) -> bool:
 
 
 def _entity_lookup_enabled() -> bool:
-    """True si RAG_ENTITY_LOOKUP=1 (truthy exacto, igual que _adaptive_routing).
+    """True cuando RAG_ENTITY_LOOKUP no está seteada a "0"/"false"/"no".
 
-    Default OFF → entity_lookup intent cae a semantic retrieve (legacy behavior).
-    Con RAG_ENTITY_LOOKUP=1 → handle_entity_lookup() hace dispatch desde query()
-    con fall-through a semantic si la entity no resuelve o la tabla está vacía.
+    **Default ON tras 2026-04-21** — backfill de entidades corrido sobre el
+    corpus (2022 entities / 6520 mentions / 71% coverage). Handler tiene
+    fall-through a semantic cuando la tabla está vacía o la entity no
+    resuelve → no hay riesgo de regresión; el peor caso es +1 SQL query
+    (~10ms) antes de caer al pipeline legacy.
+
+    Para volver al comportamiento legacy (100% semantic, sin dispatch de
+    `handle_entity_lookup`): `export RAG_ENTITY_LOOKUP=0`.
     """
-    return os.environ.get("RAG_ENTITY_LOOKUP") == "1"
+    val = os.environ.get("RAG_ENTITY_LOOKUP", "").strip().lower()
+    return val not in ("0", "false", "no")
 
 
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:

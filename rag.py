@@ -11396,6 +11396,223 @@ def print_sources(result: dict) -> None:
     console.print(render_sources(result["metas"], result["scores"]))
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Chat UX helpers — slash commands del loop interactivo de `rag chat`.
+#
+# Factorizados fuera del cuerpo de `chat()` para que sean testeables en
+# aislamiento (el loop original tiene I/O + state mutables + stream de
+# LLM entrelazados). Cada helper es side-effect-heavy en producción
+# (console.print / subprocess / Obsidian.app) pero acepta inyectar
+# dependencias como `opener=` para tests sin mock-all-console.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# Historial persistente de input() — arrow-up / Ctrl-R recover de query pasadas.
+_CHAT_READLINE_HISTORY = Path.home() / ".local/share/obsidian-rag/chat_readline_history"
+# Max entries que persistimos en disco. 500 son ~100 KB — negligible.
+_CHAT_READLINE_HISTORY_MAX = 500
+
+
+def _chat_help_text() -> str:
+    """Texto del `/help` — documento canonical de los comandos del chat.
+
+    Mantener ALINEADO con los handlers del loop en `chat()`. Si agregás
+    un slash command nuevo, actualizá este texto también —
+    `test_chat_help_covers_all_slash_commands` te va a recordar si lo
+    omitís."""
+    return (
+        "\n[bold green]Comandos del chat[/bold green]\n"
+        "\n"
+        "  [cyan]/help[/cyan]             Muestra este mensaje\n"
+        "  [cyan]/sources[/cyan]          Re-imprime las fuentes de la última respuesta\n"
+        "  [cyan]/open [dim]<n>[/dim][/cyan]        Abre la fuente #n en Obsidian.app (1-indexed)\n"
+        "  [cyan]/copy[/cyan]             Copia la última respuesta al clipboard\n"
+        "  [cyan]/stats[/cyan]            Info de la sesión (turnos, avg top_score, scope)\n"
+        "  [cyan]/save[/cyan]             Guarda la última respuesta como nota nueva\n"
+        "  [cyan]/reindex [dim][reset][/dim][/cyan]  Reindex incremental (o full --reset)\n"
+        "  [cyan]/inbox [dim][apply|undo][/dim][/cyan]  Filing assistant sobre 00-Inbox\n"
+        "  [cyan]/links [dim]<q>[/dim][/cyan]       Buscar URLs por texto\n"
+        "  [cyan]/critique[/cyan]         Toggle auto-critique para turnos siguientes\n"
+        "  [cyan]/undo[/cyan]             Deshace el último recordatorio creado\n"
+        "  [cyan]/cls[/cyan]              Limpia pantalla + conversación (mantiene sesión)\n"
+        "  [cyan]/exit[/cyan]             Salir\n"
+        "\n"
+        "[bold green]Atajos naturales[/bold green]\n"
+        "  [dim]· [/dim][bold]👍[/bold] [dim]o[/dim] [bold]+[/bold]        Rating positivo a la última respuesta\n"
+        "  [dim]· [/dim][bold]👎[/bold] [dim]o[/dim] [bold]-[/bold]        Rating negativo (pide path correctivo)\n"
+        "  [dim]· [/dim][bold]recordame X[/bold]   Crea recordatorio sin retrieve\n"
+        "  [dim]· [/dim][bold]guardá la respuesta[/bold]   Equivalente a /save\n"
+        "  [dim]· [/dim][bold]donde está el link a X[/bold]  Equivalente a /links\n"
+        "\n"
+        "[bold green]Keybinds[/bold green]\n"
+        "  [dim]· [/dim]↑ / ↓            Historial de preguntas (readline)\n"
+        "  [dim]· [/dim]Ctrl-R           Buscar en el historial\n"
+        "  [dim]· [/dim]Ctrl-C / Ctrl-D  Salir del chat\n"
+    )
+
+
+def _chat_render_last_sources(
+    metas: list[dict] | None, scores: list[float] | None = None,
+) -> None:
+    """Re-imprime las sources de la última respuesta.
+
+    Separado de `print_sources(result)` porque el chat mantiene
+    `last_sources` + `last_scores` como state mutable, no un dict
+    `result` entero. Contrato: empty metas → print "no hay respuesta
+    previa" y return. Nunca raisea."""
+    if not metas:
+        console.print("[yellow]No hay respuesta previa con fuentes.[/yellow]")
+        return
+    if scores is None:
+        scores = [0.0] * len(metas)
+    console.print()
+    console.print(Rule(title="[dim]Fuentes[/dim]", style="dim", characters="╌"))
+    console.print(render_sources(metas, scores))
+
+
+def _chat_open_nth_source(
+    metas: list[dict], n: int, opener=None,
+) -> bool:
+    """Abre la fuente #n (1-indexed) de la última respuesta.
+
+    Acepta `opener=` como callable para tests. En producción el default
+    es `_default_note_opener` que invoca `open` (macOS) sobre el path
+    absoluto vault-resolved.
+
+    Skipea silently:
+      - metas vacío (no hay última respuesta)
+      - n fuera de rango (<1 o >len(metas))
+      - paths tipo `gmail://…` / `whatsapp://…` (cross-source IDs que
+        no son archivos del vault — Obsidian.app no sabe abrirlos)
+
+    Retorna True si la apertura se intentó (opener fue llamado), False
+    en cualquier bail-out. No raisea."""
+    if not metas:
+        console.print("[yellow]No hay respuesta previa para abrir.[/yellow]")
+        return False
+    if n < 1 or n > len(metas):
+        console.print(
+            f"[yellow]Índice fuera de rango: hay {len(metas)} fuentes, "
+            f"usá 1..{len(metas)}.[/yellow]"
+        )
+        return False
+    path = metas[n - 1].get("file", "")
+    if not path:
+        console.print("[yellow]Esa fuente no tiene path — no se puede abrir.[/yellow]")
+        return False
+    if "://" in path:
+        console.print(
+            f"[yellow]`{path}` es un ID cross-source (gmail/whatsapp/…) — "
+            "no se abre en Obsidian.[/yellow]"
+        )
+        return False
+    if opener is None:
+        opener = _default_note_opener
+    try:
+        opener(path)
+        return True
+    except Exception as exc:
+        console.print(f"[red]No pude abrir {path}: {exc}[/red]")
+        return False
+
+
+def _default_note_opener(vault_relative_path: str) -> None:
+    """Opener real: resuelve el path contra VAULT_PATH y lanza
+    `open` (macOS) para que Obsidian.app — como default .md handler —
+    lo abra en el vault correcto."""
+    import subprocess
+    resolved = VAULT_PATH / vault_relative_path
+    subprocess.run(["open", str(resolved)], check=False)
+
+
+def _chat_copy_to_clipboard(text: str) -> bool:
+    """Copia `text` al clipboard del sistema via `pbcopy` (macOS).
+
+    Retorna True si el copy se completó, False si:
+      - text vacío (no-op intencional)
+      - `pbcopy` no disponible (Linux sin xclip, SSH session)
+      - cualquier otro error del subprocess
+
+    No raisea — el chat loop continúa aunque el clipboard falle."""
+    if not text:
+        return False
+    import subprocess
+    try:
+        with subprocess.Popen(
+            ["pbcopy"], stdin=subprocess.PIPE,
+        ) as proc:
+            proc.stdin.write(text.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
+def _chat_session_stats(sess: dict, vault_scope: list[str]) -> dict:
+    """Resume stats de la sesión actual para mostrar en `/stats`.
+
+    Devuelve un dict con keys estables:
+      session_id     — str
+      n_turns        — int (len de sess["turns"])
+      vault_scope    — list[str] de nombres de vaults activos
+      avg_top_score  — float o None (None distingue "sin data" de "todo 0")
+
+    Helper puro; el render del panel vive en el loop del chat."""
+    turns = sess.get("turns") or []
+    scores = [
+        t["top_score"] for t in turns
+        if isinstance(t.get("top_score"), (int, float))
+    ]
+    avg = sum(scores) / len(scores) if scores else None
+    return {
+        "session_id": sess.get("id", ""),
+        "n_turns": len(turns),
+        "vault_scope": list(vault_scope),
+        "avg_top_score": avg,
+    }
+
+
+def _chat_setup_readline() -> Path | None:
+    """Configura historial persistente para `input()` en el chat loop.
+
+    Carga el archivo si existe (arrow-up recupera preguntas viejas) y
+    registra un atexit para persistir al salir. Cap a
+    `_CHAT_READLINE_HISTORY_MAX` entries para que no crezca infinito.
+
+    Retorna el path del history file, o None si `readline` no está
+    disponible (raro en macOS/Linux — libedit siempre está; solo falla
+    en PyPy o embebido).
+
+    Idempotente: llamar múltiples veces es no-op tras el primero
+    (readline mantiene el set_history_length global)."""
+    try:
+        import readline
+    except ImportError:
+        return None
+    path = _CHAT_READLINE_HISTORY
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                readline.read_history_file(str(path))
+            except Exception:
+                # Corrupt history file — no bloquear el chat.
+                pass
+        readline.set_history_length(_CHAT_READLINE_HISTORY_MAX)
+
+        # Best-effort persist on exit. Si falla (disk full, permisos),
+        # el próximo startup arranca con lo que haya.
+        import atexit
+        def _save():
+            try:
+                readline.write_history_file(str(path))
+            except Exception:
+                pass
+        atexit.register(_save)
+        return path
+    except Exception:
+        return None
+
+
 def find_related(
     col: SqliteVecCollection,
     source_metas: list[dict],
@@ -18389,9 +18606,13 @@ def chat(
     console.print(Panel(
         f"[bold green]RAG Obsidian — Chat[/bold green]\n{subtitle}\n"
         f"{vault_line}\n{session_line}\n"
-        "[dim]/save · /reindex [reset] · /links <q> · /inbox [apply|undo] · +/- feedback · /cls · /exit[/dim]",
+        "[dim]/help para ver todos los comandos · +/- feedback · /cls · /exit[/dim]",
         border_style="green",
     ))
+
+    # Readline history: arrow-up recupera preguntas de sesiones pasadas +
+    # Ctrl-R busca. atexit persiste al salir. Idempotente si ya se llamó.
+    _chat_setup_readline()
 
     # Buffer de notices de daemon threads (index BG) — drenado en cada
     # turno ANTES del prompt para no corromper la línea de input().
@@ -18471,6 +18692,11 @@ def chat(
     last_assistant = ""
     last_question = ""
     last_sources: list[dict] = []
+    # Paralelo a last_sources para que `/sources` pueda re-imprimir la tabla
+    # con score bars. No persistido en sess["turns"] (ya se guardan paths
+    # pero no scores — seguirá funcionando igual con defaults de 0.0 si
+    # resumís una sesión vieja sin scores).
+    last_scores: list[float] = []
     last_turn_id: str | None = None
     # last_created: the most recent reminder/event the chat auto-created
     # (via propose_* tool call). Populated by _handle_chat_create_intent;
@@ -18511,6 +18737,64 @@ def chat(
             console.print("[dim]Hasta luego.[/dim]")
             break
         if not question:
+            continue
+
+        # /help — tabla de slash commands + NL shortcuts + keybinds.
+        # Antes del resto de dispatchers para que siempre esté disponible
+        # aun cuando el user se olvide qué comandos hay.
+        if question == "/help" or question == "/?":
+            console.print(_chat_help_text(), markup=True, highlight=False)
+            continue
+
+        # /sources — re-imprime las fuentes de la última respuesta.
+        # Solo funciona si ya hubo un turn; antes muestra un mensaje
+        # amable. Usa `last_sources` + `last_scores` que el loop mantiene.
+        if question == "/sources":
+            _chat_render_last_sources(last_sources, last_scores)
+            continue
+
+        # /open <n> — abre la fuente #n (1-indexed) del top-k retrieved
+        # en Obsidian.app. Útil para ir a leer/editar la nota sin salir
+        # del chat. Cross-source paths (gmail://, whatsapp://) se skipean
+        # amables porque Obsidian no los abre.
+        if question == "/open" or question.startswith("/open "):
+            _rest = question[len("/open"):].strip()
+            if not _rest or not _rest.isdigit():
+                console.print(
+                    "[yellow]Uso: /open <n>  — donde n es el número de fuente "
+                    "(1..k) de la última respuesta.[/yellow]"
+                )
+            else:
+                _chat_open_nth_source(last_sources, int(_rest))
+            continue
+
+        # /copy — copia la última respuesta al clipboard via pbcopy.
+        # Útil en CLI donde seleccionar + Cmd-C rompe la línea de
+        # streaming. Fail silent si pbcopy no está (Linux sin xclip).
+        if question == "/copy":
+            if not last_assistant:
+                console.print("[yellow]No hay respuesta previa para copiar.[/yellow]")
+            elif _chat_copy_to_clipboard(last_assistant):
+                console.print(
+                    f"[dim]✓ respuesta copiada al clipboard ({len(last_assistant)} chars).[/dim]"
+                )
+            else:
+                console.print("[yellow]No pude copiar (pbcopy no disponible?).[/yellow]")
+            continue
+
+        # /stats — info de la sesión actual: session_id, n_turns, vault
+        # scope, avg top_score. Para debugging rápido y visibilidad sin
+        # tener que consultar telemetría SQL.
+        if question == "/stats":
+            _stats = _chat_session_stats(sess, scope_names)
+            console.print()
+            console.print("[bold cyan]Sesión actual[/bold cyan]")
+            console.print(f"  [dim]id:[/dim]        {_stats['session_id']}")
+            console.print(f"  [dim]turnos:[/dim]    {_stats['n_turns']}")
+            console.print(f"  [dim]vault:[/dim]     {' + '.join(_stats['vault_scope'])}")
+            _avg = _stats["avg_top_score"]
+            _avg_str = f"{_avg:.3f}" if _avg is not None else "—"
+            console.print(f"  [dim]top_score avg:[/dim] {_avg_str}")
             continue
 
         # Create-intent short-circuit — "recordame X", "creá un evento",
@@ -18636,6 +18920,7 @@ def chat(
             last_assistant = ""
             last_question = ""
             last_sources = []
+            last_scores = []
             console.clear()
             console.print("[dim]Conversación borrada. Sesión sigue activa.[/dim]")
             continue
@@ -18925,6 +19210,7 @@ def chat(
         last_assistant = full
         last_question = question
         last_sources = list(result["metas"])
+        last_scores = list(result.get("scores") or [])
 
         contrad: list[dict] = []
         if counter:

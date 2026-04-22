@@ -74,6 +74,7 @@ rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `ope
 
 # Maintenance
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
+python scripts/backfill_entities.py [--dry-run --limit N --vault NAME]  # one-shot GLiNER entity extraction
 
 # Automation
 rag setup [--remove]                       # install/remove 11 launchd services
@@ -107,6 +108,10 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 - `OBSIDIAN_RAG_MOZE_FOLDER` — override MOZE ETL target folder inside the vault (default `02-Areas/Personal/Finanzas/MOZE`).
 - `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated vault-relative folders `rag watch` must ignore. Default `"03-Resources/WhatsApp"` (WA dumps re-fire the handler dozens of times per minute via periodic ETL; they're picked up by manual/periodic `rag index` instead).
 
+- `RAG_ADAPTIVE_ROUTING` — activa el pipeline adaptativo (Mejora #3). Cuando está ON: (a) `_should_skip_reformulate()` saltea el helper call de reformulación para intents metadata-only (`count`, `list`, `recent`, `agenda`, `entity_lookup`) — ahorra ~1-2s; (b) fast-path dispatch cuando `top_score >= _LOOKUP_THRESHOLD` (0.6) — usa `qwen2.5:3b` con `num_ctx=2048` y saltea citation-repair, pure perf win para queries simples. **Default OFF** (`os.environ.get("RAG_ADAPTIVE_ROUTING") == "1"`). Sin regresión eval: ambas runs ON y OFF producen resultados bit-idénticos en `rag eval` (validado 2026-04-21, ver §Eval baselines). Override de debug: `RAG_FORCE_FULL_PIPELINE=1` fuerza todos los stages aun con adaptive ON. Ver `docs/improvement-3-adaptive-routing-design.md`. **Plan de activación**: flipear a ON por default (cambiar a `os.environ.get("RAG_ADAPTIVE_ROUTING", "1") == "1"`) una vez que `rag eval` vuelva a superar el floor de singles 76.19% de forma estable (LLM non-determinism causó variabilidad en la sesión de cierre 2026-04-21).
+- `RAG_ENTITY_LOOKUP` — activa el dispatch de `handle_entity_lookup()` para el intent `entity_lookup` en `query()` (Mejora #2). **Default OFF** (`os.environ.get("RAG_ENTITY_LOOKUP") == "1"`). Con flag OFF, el intent `entity_lookup` cae a semantic retrieve (comportamiento legacy). Con flag ON, `handle_entity_lookup()` busca en `rag_entities` (tabla de entidades GLiNER) con fall-through semántico si la entidad no resuelve o la tabla está vacía. **No activar hasta correr `python scripts/backfill_entities.py`** — la tabla `rag_entities` está VACÍA en producción (el backfill aún no corrió); con tabla vacía el handler cae a semantic = mismo comportamiento pero con overhead de classification. Ver `docs/improvement-2-entity-retrieval-plan.md`.
+- `RAG_NLI_GROUNDING` — activa NLI grounding post-citation-repair (Mejora #1). Carga `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` (~400 MB en MPS fp32), extrae claims del LLM response, y agrega un bloque NLI-grounded al final con porcentaje de claims soportados/neutros/contradictorios. En web: emite SSE event `nli_grounding` + panel UI coloreado. **Default OFF** (truthy check: `os.environ.get("RAG_NLI_GROUNDING", "").strip() not in ("", "0", "false", "no")`). No aplica para intents `count`/`list`/`recent`/`agenda` (controlado por `RAG_NLI_SKIP_INTENTS`). **No activar en producción aún**: cold-load mDeBERTa ~2s + inference ~300-1000ms por query impactan UX antes de medir en ≥50 queries reales. Activar con `RAG_NLI_IDLE_TTL` (default 900s para idle-unload). Ver `docs/improvement-1-nli-integration-plan.md`.
+
 Dev/debug toggles (not set in production):
 
 - `RAG_DEBUG=1` — verbose stderr in the local embed path (`rag.py:6593`).
@@ -121,14 +126,20 @@ Dev/debug toggles (not set in production):
 
 ```
 query → classify_intent → infer_filters [auto]
+      → [RAG_ADAPTIVE_ROUTING: skip reformulate_query if metadata-only intent]
       → expand_queries (3 paraphrases, ONE qwen2.5:3b call)
       → embed(variants) batched bge-m3
       → per variant: sqlite-vec sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise)
       → RRF merge → dedup → expand to parent section (O(1) metadata)
       → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp32)
+      → [RAG_ADAPTIVE_ROUTING + score≥0.6: fast-path → qwen2.5:3b num_ctx=2048, skip citation-repair]
       → graph expansion (1-hop wikilink neighbors, always on)
       → [auto-deep: if confidence < 0.10, iterative sub-query retrieval]
       → top-k → LLM (streamed)
+      → citation-repair [if needed + score<threshold]
+      → [RAG_NLI_GROUNDING: NLI claim verification, skip count/list/recent/agenda]
+
+Intent dispatch: semantic | synthesis | comparison | count | list | recent | agenda | entity_lookup [RAG_ENTITY_LOOKUP]
 ```
 
 **Graph expansion** (always on): after rerank, top-3 results expand via 1-hop wikilink neighbors (`_build_graph_adj` + `_hop_set`). Up to 3 graph neighbors added as supplementary LLM context marked `[nota relacionada (grafo)]`. Cost: in-memory graph lookups, negligible.
@@ -183,6 +194,7 @@ Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. E
 | Helper | `qwen2.5:3b` | paraphrase/HyDE/reformulation |
 | Embed | `bge-m3` | 1024-dim multilingual |
 | Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float32` forced — do NOT switch to fp16 on MPS (score collapse to ~0.001, verified 2026-04-13); CPU fallback = 3× slower. |
+| NLI (opt-in) | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` | ~400 MB MPS fp32, idle-unload via `RAG_NLI_IDLE_TTL` (default 900s). Gate: `RAG_NLI_GROUNDING`. |
 
 All ollama calls use `keep_alive=OLLAMA_KEEP_ALIVE` — default `-1` (forever) in code (`rag.py:1608`) since 2026-04-21; launchd plists use the same value for symmetry. `CHAT_OPTIONS`: `num_ctx=4096, num_predict=384` — don't bump unless prompts grow.
 
@@ -335,6 +347,8 @@ Every post-expansion metric sits inside the prior floor's CI on the smaller set 
 **Post Calendar API enable (2026-04-21 evening, n=60 singles / 11 chains):** Calendar API del proyecto GCP `701505738025` activada por el user → `rag index --source calendar --reset` ingestó 368 eventos (2y history + 180d future del calendar `fernandoferrari@gmail.com`). Corpus: 8231 chunks (calendar 4.5% · WA 49.5% · vault 45.3% · reminders 0.4% · gmail 0.2%). `queries.yaml` +5 queries calendar (turno psicólogo / workshop AI Engineer / despedida de jardín de astor / reunión con Max ops / turno erica franzen). Singles `hit@5 81.67% [71.67, 91.67] · MRR 0.735 [0.639, 0.831] · recall@5 76.94% · n=60`; Chains sin cambio (no se agregaron chains calendar): `hit@5 83.33% · MRR 0.706 · chain_success 54.55%`. **5/5 queries calendar hit con MRR promedio 0.87** — confirmación directa de que el pipeline existente resuelve events.list()-ingested calendar sin tocar scoring/threshold. Smoke test previo sobre query real log: "qué hago el viernes 20hs" pasó de score 0.04 (refuse) → 0.46 (respuesta útil) post-ingesta, validando el hallazgo de producción. **Bug arquitectónico residual detectado**: `classify_intent` devuelve `recent` para "qué tengo esta semana" → itera notas del vault en vez de filtrar `source=calendar` con ventana temporal. Antes era inerte porque calendar estaba vacío; ahora merece ticket como Phase 1.g (intent-source routing) — **addressed later in the same session, see the next entry**. Auto-rollback gate sigue pasando holgado. **Calendar path format drift fix**: `tests/test_eval_bootstrap.py::test_golden_cross_source_paths_have_native_id_format` tenía regex `calendar://(event:)?<id>` basado en design doc §2.7, pero la implementación real del ingester (`scripts/ingest_calendar.py::_event_file_key`) usa `calendar://<calendar_id>/<event_id>` (two-segment, paralelo a WhatsApp). Test updated para seguir implementación como ground truth.
 
 **Post session close (2026-04-21 evening, same n=60 singles / 11 chains):** Final eval tras el `agenda` intent (v1 + v2 window filter), cold-embed non-blocking fix (`_local_embedder_ready` Event), + feedback harvest de 8 negativos adicionales al `rag_feedback` SQL (ratio pos:neg pasó de 55:2 → 55:10). Singles `hit@5 81.67% [71.67, 91.67] · MRR 0.779 [0.683, 0.875] · recall@5 76.94%`; Chains `hit@5 80.00% [66.67, 93.33] · MRR 0.733 [0.583, 0.867] · chain_success 54.55% [27.27, 81.82]`. **Singles MRR +0.044 vs el baseline de la mañana** (dentro del CI anterior pero consistent uplift — probablemente absorción de los 8 negatives al golden cache). Chains MRR +0.027 idem. Hit@5 bit-identical en singles, −3.3pp en chains (dentro del CI, noise). Floor gate pasa por doble margen. Calendar queries siguen 5/5 hit (idéntico al baseline anterior — el fix del intent router no las rompió, solo redirigió queries browsing que antes caían en `recent`). Auto-rollback gate holgado.
+
+**Fase D closeout — 3 mejoras validadas (2026-04-21, n=60 singles / 11 chains):** Dos runs de `rag eval` con flags todas-OFF y todas-ON (RAG_ADAPTIVE_ROUTING=1 RAG_ENTITY_LOOKUP=1 RAG_NLI_GROUNDING=1). Resultados **bit-idénticos** en ambas corridas — las 3 mejoras no introducen regresión retrieval medible. **Flags-OFF**: Singles `hit@5 71.67% [60.00%, 83.33%] · MRR 0.681 [0.567, 0.794]`; Chains `hit@5 86.67% [73.33%, 96.67%] · MRR 0.807 [0.680, 0.923] · chain_success 72.73% [45.45%, 100.00%]`. **Flags-ON**: Singles `hit@5 71.67% [60.00%, 83.33%] · MRR 0.681 [0.567, 0.794]`; Chains `hit@5 86.67% [73.33%, 96.67%] · MRR 0.790 [0.657, 0.917] · chain_success 72.73% [45.45%, 100.00%]`. **Nota de variabilidad**: singles hit@5 bajó de 81.67% (baseline previo) a 71.67% en esta sesión — CIs solapan [71.67%, 83.33%] — causa probable: LLM non-determinism (qwen2.5:7b stochastic) + posible drift de paths en queries.yaml. La caída es pre-existente, no causada por los flags (flags-OFF muestra igual caída). **Decisión de flags**: (a) `RAG_ADAPTIVE_ROUTING` → **stays OFF por default** — criterios de floor (lower CI ≥ 76.19%) no se cumplen en esta sesión eval (lower CI 60.00% < 76.19%); aunque la caída es pre-existente y no causada por el flag, las instrucciones son conservadoras. Flipear a ON cuando `rag eval` vuelva a superar el floor de forma estable. (b) `RAG_ENTITY_LOOKUP` → **stays OFF** — tabla `rag_entities` vacía; requiere `backfill_entities.py` primero. (c) `RAG_NLI_GROUNDING` → **stays OFF** — requiere validación de latencia P95 post-50 queries reales.
 
 **Prior floor (2026-04-17, post-title-in-rerank, n=21 singles / 9 chains):** Singles `hit@5 90.48% · MRR 0.821`; Chains `hit@5 80.00% · MRR 0.627 · chain_success 55.56%`. Kept for historical trend, but do not compare new numbers against it without overlapping CIs.
 

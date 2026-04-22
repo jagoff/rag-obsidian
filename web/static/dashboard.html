@@ -211,6 +211,67 @@
     .kpi-value.purple { color: var(--purple); }
     .kpi-value.orange { color: var(--orange); }
 
+    /* Signals panel (2026-04-22) — implicit events al ranker-vivo */
+    .signals-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 16px;
+    }
+    .signals-panel h3 {
+      font-size: 13px;
+      color: var(--text);
+      margin: 0 0 10px 0;
+      font-weight: 600;
+    }
+    .signals-window {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-weight: 400;
+      margin-left: 6px;
+    }
+    .signals-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      align-items: baseline;
+    }
+    .signal-cell {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+      padding: 2px 0;
+      min-width: 64px;
+    }
+    .signal-label {
+      font-size: 10px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .signal-value {
+      font-size: 20px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .signal-value.green  { color: var(--green); }
+    .signal-value.cyan   { color: var(--cyan); }
+    .signal-value.yellow { color: var(--yellow); }
+    .signal-value.red    { color: var(--red); }
+    .signal-sub {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .signals-empty {
+      color: var(--text-faint);
+      font-size: 12px;
+      padding: 4px 0;
+    }
+
     /* Chart grid */
     .charts {
       display: grid;

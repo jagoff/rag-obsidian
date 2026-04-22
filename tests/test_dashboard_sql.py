@@ -290,6 +290,72 @@ def test_dashboard_sql_hourly_heatmap_24_entries(sql_env):
     assert total == 8
 
 
+def test_dashboard_signals_panel_present(sql_env):
+    """/api/dashboard payload must include `signals` with counts per event
+    type within the window. Part of the ranker-vivo visibility loop
+    (2026-04-22) — the user needs to see at a glance whether copy/open/
+    save signals are flowing."""
+    now = datetime.now()
+    # Seed rag_behavior with diverse events within the window.
+    events = [
+        {"ts": (now - timedelta(minutes=1)).isoformat(timespec="seconds"),
+         "source": "web", "event": "copy", "path": "a.md", "rank": 1},
+        {"ts": (now - timedelta(minutes=2)).isoformat(timespec="seconds"),
+         "source": "web", "event": "copy", "path": "b.md", "rank": 1},
+        {"ts": (now - timedelta(minutes=3)).isoformat(timespec="seconds"),
+         "source": "cli", "event": "copy", "path": "c.md", "rank": 1},
+        {"ts": (now - timedelta(minutes=4)).isoformat(timespec="seconds"),
+         "source": "web", "event": "open",  "path": "d.md", "rank": 2},
+        {"ts": (now - timedelta(minutes=5)).isoformat(timespec="seconds"),
+         "source": "cli", "event": "impression", "path": "e.md", "rank": 3},
+    ]
+    _seed_sql(sql_env["tmp"], "rag_behavior", events, rag._map_behavior_row)
+
+    d = web_server._dashboard_compute_sql(days=7)
+
+    # Shape: always present, even when there's no signal.
+    assert "signals" in d, "payload must carry signals key"
+    sig = d["signals"]
+    assert "counts" in sig and "by_source" in sig and "window_days" in sig
+    assert sig["window_days"] == 7
+
+    # Counts match what we seeded.
+    assert sig["counts"].get("copy") == 3
+    assert sig["counts"].get("open") == 1
+    assert sig["counts"].get("impression") == 1
+
+    # Source breakdown preserves both dimensions.
+    copy_src = sig["by_source"].get("copy", {})
+    assert copy_src.get("web") == 2
+    assert copy_src.get("cli") == 1
+
+
+def test_dashboard_signals_empty_when_no_events(sql_env):
+    """Fresh DB → signals present with empty counts (no KeyError /
+    missing-key crashes on the frontend)."""
+    d = web_server._dashboard_compute_sql(days=7)
+    assert "signals" in d
+    assert d["signals"]["counts"] == {}
+    assert d["signals"]["by_source"] == {}
+
+
+def test_dashboard_signals_respects_window(sql_env):
+    """Events older than `days` cutoff must NOT appear in signals."""
+    old = datetime.now() - timedelta(days=60)
+    new = datetime.now() - timedelta(hours=1)
+    events = [
+        {"ts": old.isoformat(timespec="seconds"),
+         "source": "web", "event": "copy", "path": "old.md", "rank": 1},
+        {"ts": new.isoformat(timespec="seconds"),
+         "source": "web", "event": "copy", "path": "new.md", "rank": 1},
+    ]
+    _seed_sql(sql_env["tmp"], "rag_behavior", events, rag._map_behavior_row)
+
+    d = web_server._dashboard_compute_sql(days=7)
+    # Only the recent event — old one is outside the 7d window.
+    assert d["signals"]["counts"].get("copy") == 1
+
+
 def test_dashboard_sql_sources_breakdown(sql_env):
     """wa:/web:/cli:/tg: session + serve-cmd rule → sources counts match."""
     now = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)

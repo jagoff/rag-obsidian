@@ -282,6 +282,12 @@ function buildLayout(d) {
     </div>
 
     <div class="kpis" id="kpis"></div>
+    <div class="signals-panel" id="signals-panel" role="region" aria-labelledby="signals-title">
+      <h3 id="signals-title">Señales al ranker-vivo <span class="signals-window" id="signals-window">—</span></h3>
+      <div class="signals-grid" id="signals-grid">
+        <div class="signals-empty">esperando eventos…</div>
+      </div>
+    </div>
     <div class="health" id="health"></div>
 
     <div class="charts">
@@ -575,6 +581,7 @@ function refresh(d) {
 
   renderHealth(d);
   renderFeedbackPanel(d.feedback || {});
+  renderSignalsPanel(d.signals || {});
 
   // Queries per day
   const qDays = Object.keys(d.queries_per_day);
@@ -868,6 +875,66 @@ function renderHealth(d) {
       </div>
     </div>
   `;
+}
+
+// ── Signals panel (2026-04-22) ─────────────────────────────────────────
+// Renderiza las señales implícitas al ranker-vivo en los últimos N días:
+// open / copy / save / kept / positive_implicit (CTR numerators) vs
+// impression (denominator). Fuente: rag_behavior agregado por el
+// backend en /api/dashboard.signals.
+//
+// Motivación: pre-fix no había forma de saber si las modificaciones del
+// UX (corrective-path picker, copy events, etc) estaban efectivamente
+// alimentando al ranker. Ahora el user ve en una fila si la columna
+// CTR-numerator está siendo alimentada.
+
+// Presentation order — positivos (CTR numerator) primero, impression
+// al final como denominador. Emojis pegados al label así la fila se
+// lee como "📋 copy · 42" visible de un vistazo.
+const SIGNAL_LABELS = [
+  { key: "copy",               label: "copy",       cls: "cyan",   desc: "user copió contenido del RAG" },
+  { key: "open",               label: "open",       cls: "green",  desc: "abrió la nota desde una cita" },
+  { key: "save",               label: "save",       cls: "green",  desc: "guardó la respuesta como nota" },
+  { key: "kept",               label: "kept",       cls: "green",  desc: "mantuvo una propuesta del ambient agent" },
+  { key: "positive_implicit",  label: "positive",   cls: "green",  desc: "señal positiva implícita" },
+  { key: "negative_implicit",  label: "negative",   cls: "red",    desc: "señal negativa implícita" },
+  { key: "deleted",            label: "deleted",    cls: "red",    desc: "borró una propuesta del ambient agent" },
+  { key: "impression",         label: "impression", cls: "yellow", desc: "chunk mostrado al user (denominator)" },
+];
+
+function renderSignalsPanel(signals) {
+  const grid = document.getElementById("signals-grid");
+  const win = document.getElementById("signals-window");
+  if (!grid) return;
+  const counts = signals.counts || {};
+  const bySource = signals.by_source || {};
+  const days = signals.window_days || state.days || 30;
+  if (win) win.textContent = `· últimos ${days}d`;
+
+  // Include event types that have any count; skip zero-count rows so
+  // the panel doesn't get noisy with 7+ always-empty cells on a fresh
+  // install. The empty-state message below kicks in when everything
+  // is zero.
+  const visible = SIGNAL_LABELS.filter(s => (counts[s.key] || 0) > 0);
+  if (!visible.length) {
+    grid.innerHTML = `<div class="signals-empty">aún no hay señales en los últimos ${days}d — copiá / guardá / rateá una respuesta para empezar a alimentar al ranker-vivo</div>`;
+    return;
+  }
+  grid.innerHTML = visible.map(s => {
+    const n = counts[s.key] || 0;
+    const src = bySource[s.key] || {};
+    const srcBits = Object.entries(src)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k} ${v}`)
+      .join(" · ");
+    return `
+      <div class="signal-cell" title="${s.desc}${srcBits ? '\n\n' + srcBits : ''}">
+        <span class="signal-label">${s.label}</span>
+        <span class="signal-value ${s.cls}">${n}</span>
+        ${srcBits ? `<span class="signal-sub">${srcBits}</span>` : ""}
+      </div>
+    `;
+  }).join("");
 }
 
 // ── Feedback panel — actionable signals to improve the RAG ────────────────

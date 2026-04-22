@@ -5226,11 +5226,15 @@ def _dashboard_compute(days: int = 30) -> dict:
         return _dashboard_compute_sql(days)
     except Exception as exc:
         _log_sql_state_error("dashboard_sql_compute_failed", err=repr(exc))
-        return _dashboard_aggregate(
+        payload = _dashboard_aggregate(
             queries=[], all_queries=[], fb_entries=[], ambient_entries=[],
             contra_entries=[], filing_recent=[], tune_entries=[],
             surface_entries=[], days=days,
         )
+        # Shape parity: always emit `signals` key so the dashboard JS
+        # doesn't branch between "normal" and "fallback" payloads.
+        payload.setdefault("signals", {"counts": {}, "by_source": {}, "window_days": days})
+        return payload
 
 
 # ── Dashboard event-row helpers ─────────────────────────────────────────────
@@ -5309,6 +5313,40 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
         filing_rows = _sql_query_window(conn, "rag_filing_log", cutoff_iso)
         tune_rows = _sql_query_window(conn, "rag_tune", ancient_iso)
         surface_rows = _sql_query_window(conn, "rag_surface_log", ancient_iso)
+        # Implicit signals KPI (2026-04-22): count rag_behavior events
+        # grouped by type in the dashboard window. Feeds the "signals"
+        # panel so the user can see at a glance whether the ranker-vivo
+        # is being fed (opens, copies, saves, corrective-path
+        # selections, etc.). Keyed on `event`; source breakdown
+        # (web/cli) is a secondary dimension.
+        behavior_signal_counts: dict[str, int] = {}
+        behavior_signal_by_source: dict[str, dict[str, int]] = {}
+        try:
+            # Two grouped SELECTs — cheap even over 30 days of events;
+            # rag_behavior has an ix_rag_behavior_event_ts index for this
+            # exact access pattern.
+            for ev_type, n in conn.execute(
+                "SELECT event, COUNT(*) FROM rag_behavior "
+                "WHERE ts >= ? GROUP BY event",
+                (cutoff_iso,),
+            ).fetchall():
+                if ev_type:
+                    behavior_signal_counts[str(ev_type)] = int(n)
+            for ev_type, src, n in conn.execute(
+                "SELECT event, source, COUNT(*) FROM rag_behavior "
+                "WHERE ts >= ? GROUP BY event, source",
+                (cutoff_iso,),
+            ).fetchall():
+                if ev_type and src:
+                    behavior_signal_by_source.setdefault(
+                        str(ev_type), {}
+                    )[str(src)] = int(n)
+        except Exception as exc:
+            # Silently degrade — the dashboard shouldn't 500 because of
+            # a missing column or a schema mismatch from an older DB.
+            _log_sql_state_error(
+                "dashboard_signals_sql_read_failed", err=repr(exc),
+            )
 
     _Q_JSON = ("variants", "paths", "scores", "filters", "bad_citations")
     _F_JSON = ("paths",)
@@ -5353,7 +5391,7 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
     # and rag_surface_log preserves `cmd` as a column.
     surface_entries = [_dashboard_sql_row_to_event(r) for r in surface_rows]
 
-    return _dashboard_aggregate(
+    payload = _dashboard_aggregate(
         queries=queries,
         all_queries=all_queries,
         fb_entries=fb_entries,
@@ -5364,6 +5402,14 @@ def _dashboard_compute_sql(days: int = 30) -> dict:
         surface_entries=surface_entries,
         days=days,
     )
+    # Signals panel — additive, non-breaking. Dashboard.js reads
+    # payload.signals optionally; old clients just ignore it.
+    payload["signals"] = {
+        "counts": behavior_signal_counts,
+        "by_source": behavior_signal_by_source,
+        "window_days": days,
+    }
+    return payload
 
 
 def _dashboard_aggregate(

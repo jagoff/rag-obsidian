@@ -54,7 +54,7 @@ def test_chat_help_covers_all_slash_commands():
     out = rag._chat_help_text()
     for cmd in ("/help", "/sources", "/open", "/copy", "/stats",
                 "/save", "/reindex", "/inbox", "/links", "/undo",
-                "/critique", "/cls", "/exit"):
+                "/critique", "/redo", "/cls", "/exit"):
         assert cmd in out, f"el comando {cmd!r} debe estar en /help"
 
 

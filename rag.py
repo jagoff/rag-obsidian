@@ -11481,6 +11481,7 @@ def _chat_help_text() -> str:
         "  [cyan]/inbox [dim][apply|undo][/dim][/cyan]  Filing assistant sobre 00-Inbox\n"
         "  [cyan]/links [dim]<q>[/dim][/cyan]       Buscar URLs por texto\n"
         "  [cyan]/critique[/cyan]         Toggle auto-critique para turnos siguientes\n"
+        "  [cyan]/redo [dim][pista][/dim][/cyan]    Regenera la última respuesta (opcional: pista)\n"
         "  [cyan]/undo[/cyan]             Deshace el último recordatorio creado\n"
         "  [cyan]/cls[/cyan]              Limpia pantalla + conversación (mantiene sesión)\n"
         "  [cyan]/exit[/cyan]             Salir\n"
@@ -19583,6 +19584,45 @@ def chat(
             state_label = "[critique on]" if critique_active else "[critique off]"
             console.print(f"[dim]{state_label}[/dim]")
             continue
+
+        # /redo [pista] — regenera la última respuesta, opcionalmente con
+        # una pista que se concatena a la query efectiva. El caso típico:
+        # la respuesta vino mediocre y querés retry sin re-escribir la
+        # pregunta — o querés empujarla en una dirección ("enfocate en X")
+        # sin reformularla de cero.
+        #
+        # Implementación: mutuamos `question` a la query efectiva y dejamos
+        # que el flow normal del loop (retrieve + LLM + render) corra. Sin
+        # `continue`, el fall-through usa la nueva query como si el user
+        # la hubiese tipeado. El precio: redos consecutivos con hint
+        # acumulan (el segundo hint se pega sobre el first-augmented query
+        # vía last_question). En la práctica es raro; si pasa, `/cls`
+        # resetea el estado. Queda documentado acá antes que invertir en
+        # state mutable extra.
+        #
+        # Paralelo del web /redo (/api/chat con redo_turn_id + hint) —
+        # ambos hacen re-retrieve completo (no hay short-circuit que
+        # reuse sources previos). Elegido por simplicidad: el golden
+        # cache ya hace el retrieve barato (~2ms warm).
+        if question == "/redo" or question.startswith("/redo "):
+            if not last_question:
+                console.print(
+                    "[yellow]No hay respuesta previa para regenerar. "
+                    "Hacé una pregunta primero.[/yellow]"
+                )
+                continue
+            _hint = question[len("/redo"):].strip()
+            if _hint:
+                question = f"{last_question} — enfocá en: {_hint}"
+                console.print(f"[dim]↻ regenerando con pista: {_hint}[/dim]")
+            else:
+                question = last_question
+                _preview = last_question[:70] + ("…" if len(last_question) > 70 else "")
+                console.print(f"[dim]↻ regenerando: {_preview}[/dim]")
+            # Fall-through: no continue. El resto del loop trata
+            # `question` como una pregunta fresca — retrieve, LLM, sources,
+            # feedback — y al final del turn `last_question = question`
+            # (~19863) actualiza el estado.
 
         # /inbox [apply|undo] — filing assistant sobre 00-Inbox, dispatch al
         # mismo callback que `rag file` standalone. Sin args: dry-run.

@@ -220,15 +220,30 @@ _METADATA_ONLY_INTENTS: frozenset[str] = frozenset(
 
 
 def _adaptive_routing() -> bool:
-    """True si RAG_ADAPTIVE_ROUTING=1 Y RAG_FORCE_FULL_PIPELINE!=1.
+    """True si adaptive routing está habilitado (default ON desde 2026-04-22).
 
     Leído on demand (no cacheado) para que tests puedan monkey-patch
     os.environ sin reload del módulo. Micro-costo de os.environ.get en el
     hot path es negligible (~1μs).
+
+    **Default flip (2026-04-22)**: la Fase C está completa desde el commit
+    `89ccc0e` y CLAUDE.md documenta "bit-idéntico en eval ON vs OFF".  El
+    bloqueante histórico era no poder medir el efecto real — pre-fix el
+    98.4% de las queries tenía intent=NULL en `rag_queries.extra_json`.
+    El commit `cfac737` pobló esa columna para `cmd=web` y `cmd=chat`, así
+    que ya hay data para validar la ganancia (~1-2s en intents metadata-
+    only: count/list/recent/agenda/entity_lookup) sin adivinar.
+
+    Rollback: `export RAG_ADAPTIVE_ROUTING=0` → pipeline legacy bit-idéntico.
+    Debug escape: `RAG_FORCE_FULL_PIPELINE=1` ignora todos los skips aun con
+    adaptive ON (útil para A/B local del overhead de dispatch sin los skips).
     """
     if os.environ.get("RAG_FORCE_FULL_PIPELINE") == "1":
         return False
-    return os.environ.get("RAG_ADAPTIVE_ROUTING") == "1"
+    val = os.environ.get("RAG_ADAPTIVE_ROUTING", "").strip().lower()
+    # Default ON: empty / unset / "1" / "true" / "yes" → True.
+    # Explicit OFF: "0" / "false" / "no" → False.
+    return val not in ("0", "false", "no")
 
 
 def _should_skip_reformulate(intent: str) -> bool:
@@ -3384,8 +3399,12 @@ def load_feedback_golden() -> dict:
         default=("error", {"positives": [], "negatives": []}, None),
     )
     kind, payload, new_ts = result
+    # Observability: hit = in-memory memo reused; miss = SQL read / rebuild /
+    # empty / error (cualquier path no-memo implica lectura a disco/CPU).
     if kind == "memo":
+        record_cache_event("feedback_golden", hits=1)
         return payload
+    record_cache_event("feedback_golden", misses=1)
     _feedback_golden_memo = payload
     if new_ts is not None:
         _feedback_golden_source_ts_sql = new_ts
@@ -3664,6 +3683,7 @@ def semantic_cache_lookup(
             }
     # Async hit-count bump — best-effort, don't block the cache hit on SQL write.
     if best is not None:
+        record_cache_event("semantic", hits=1)
         try:
             with _ragvec_state_conn() as conn:
                 conn.execute(
@@ -3674,6 +3694,8 @@ def semantic_cache_lookup(
                 conn.commit()
         except Exception as exc:
             _log_sql_state_error("semantic_cache_hit_bump_failed", err=repr(exc))
+    else:
+        record_cache_event("semantic", misses=1)
     return best
 
 
@@ -8075,6 +8097,74 @@ _embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 _embed_cache_lock = threading.Lock()
 
 
+# ── Cache hit/miss observability (2026-04-22) ────────────────────────────────
+# Registry thread-safe para loguear hit rates de los caches in-process.
+# Antes de esto los caches (_embed_cache, _corpus_cache, _feedback_golden_memo,
+# semantic_cache) eran opacos: no sabíamos si estaban bien dimensionados, ni
+# si sus invalidation triggers eran correctos, ni qué % de queries se
+# beneficia de cada uno. Ahora cada cache reporta via record_cache_event()
+# y el snapshot agregado se loguea en rag_queries.extra_json por query,
+# facilitando análisis downstream con SQL sobre telemetry.db.
+#
+# API mínima: record_cache_event(name, hits, misses) — call-site agrega a los
+# counters globales. `cache_stats_snapshot()` devuelve dict con ratios por
+# cache. `cache_stats_reset()` limpia los counters (usado por `rag cache
+# clear` para empezar de cero una ventana de medición).
+
+_cache_stats: dict[str, dict[str, int]] = {}
+_cache_stats_lock = threading.Lock()
+
+
+def record_cache_event(name: str, *, hits: int = 0, misses: int = 0) -> None:
+    """Registra hit/miss counts para el cache `name`.
+
+    Thread-safe. Los call-sites pueden acumular hits O misses en batch
+    (ej. un `embed()` con batch=5 puede tener 3 hits + 2 misses).
+
+    No-op si hits y misses son ambos 0.
+    """
+    if hits == 0 and misses == 0:
+        return
+    with _cache_stats_lock:
+        s = _cache_stats.get(name)
+        if s is None:
+            s = {"hits": 0, "misses": 0}
+            _cache_stats[name] = s
+        s["hits"] += hits
+        s["misses"] += misses
+
+
+def cache_stats_snapshot() -> dict[str, dict[str, float]]:
+    """Devuelve el snapshot acumulado de hit/miss por cache.
+
+    Keys per entry: `hits`, `misses`, `total`, `ratio` (hits/total, 0 si
+    total=0). Ratio redondeado a 4 decimales para estabilidad de JSON.
+
+    Ideal para loggear en `rag_queries.extra_json` y analizar downstream:
+        SELECT json_extract(extra_json, '$.cache_stats.embed.ratio')
+        FROM rag_queries WHERE cmd='query' ORDER BY ts DESC LIMIT 100;
+    """
+    with _cache_stats_lock:
+        snap = {k: dict(v) for k, v in _cache_stats.items()}
+    out: dict[str, dict[str, float]] = {}
+    for name, s in snap.items():
+        total = int(s["hits"] + s["misses"])
+        ratio = (s["hits"] / total) if total > 0 else 0.0
+        out[name] = {
+            "hits": int(s["hits"]),
+            "misses": int(s["misses"]),
+            "total": total,
+            "ratio": round(ratio, 4),
+        }
+    return out
+
+
+def cache_stats_reset() -> None:
+    """Limpia los counters. Útil para empezar una nueva ventana de medición."""
+    with _cache_stats_lock:
+        _cache_stats.clear()
+
+
 def embed(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
@@ -8090,6 +8180,9 @@ def embed(texts: list[str]) -> list[list[float]]:
                 _embed_cache.move_to_end(t)
             cached.append(val)
     missing_idx = [i for i, v in enumerate(cached) if v is None]
+    # Report hit/miss counts — batch-level para evitar N calls al registry.
+    _hits = len(texts) - len(missing_idx)
+    record_cache_event("embed", hits=_hits, misses=len(missing_idx))
     if not missing_idx:
         return cached  # type: ignore[return-value]
     missing_texts = [texts[i] for i in missing_idx]
@@ -8403,8 +8496,10 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
         and cached["count"] == n
         and cached.get("collection_id") == cid
     ):
+        record_cache_event("corpus", hits=1)
         return cached
 
+    record_cache_event("corpus", misses=1)
     data = col.get(include=["documents", "metadatas"])
     docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
 
@@ -17620,6 +17715,10 @@ def query(
         # query() state pre-fix; extra_json logging made 97% of rag_queries
         # rows show `intent=NULL`, breaking any analytics on intent share.
         "intent": intent,
+        # Cache observability (2026-04-22) — snapshot acumulado de hit rates
+        # al momento de loggear esta query. Permite SQL analytics downstream:
+        # json_extract(extra_json, '$.cache_stats.embed.ratio') por ej.
+        "cache_stats": cache_stats_snapshot(),
     })
 
     if sess is not None:
@@ -22873,22 +22972,47 @@ def cache():
 
 @cache.command("stats")
 def cache_stats():
-    """Mostrar stats del cache: rows, hits totales, corpus_hashes distintos, edad."""
+    """Mostrar stats del cache: rows, hits totales, corpus_hashes distintos, edad.
+
+    Incluye además los counters in-process de hit/miss ratios para los caches
+    del retrieval pipeline (embed, corpus, feedback_golden, semantic), útil
+    para dimensionar LRUs y detectar invalidation triggers agresivos.
+    """
     stats = semantic_cache_stats()
     if "error" in stats:
         console.print(f"[red]Error leyendo el cache: {stats['error']}[/red]")
         return
-    console.print("[bold]Semantic response cache[/bold]")
+    console.print("[bold]Semantic response cache (persistente, SQL)[/bold]")
     console.print(f"  enabled         : {'[green]yes[/green]' if stats['enabled'] else '[red]no[/red]'}")
     console.print(f"  rows            : {stats['rows']}")
     console.print(f"  corpus_hashes   : {stats['corpus_hashes']}")
-    console.print(f"  total hits      : {stats['hits']}")
+    console.print(f"  total hits (DB) : {stats['hits']}")
     console.print(f"  cosine threshold: {stats['cosine_threshold']:.3f}")
     console.print(f"  default TTL     : {stats['default_ttl_s']}s")
     if stats.get("oldest_ts"):
         console.print(f"  oldest row      : {stats['oldest_ts']}")
     if stats.get("newest_ts"):
         console.print(f"  newest row      : {stats['newest_ts']}")
+
+    # In-process cache counters (reset on process restart). Útil como
+    # sanity check en sesiones largas: embed > 70% hit rate esperable en
+    # chat multi-turn, corpus > 95% (invalida solo en index deltas),
+    # feedback_golden casi siempre 100% post-primera carga.
+    in_proc = cache_stats_snapshot()
+    if in_proc:
+        console.print()
+        console.print("[bold]In-process caches (sesión actual)[/bold]")
+        for name in sorted(in_proc.keys()):
+            s = in_proc[name]
+            ratio_pct = s["ratio"] * 100
+            color = "green" if ratio_pct >= 70 else ("yellow" if ratio_pct >= 30 else "red")
+            console.print(
+                f"  {name:16s}: {s['hits']:>6}/{s['total']:<6}  "
+                f"[{color}]{ratio_pct:5.1f}%[/{color}]  hit rate"
+            )
+    else:
+        console.print()
+        console.print("[dim]In-process caches: sin eventos en esta sesión.[/dim]")
 
 
 @cache.command("clear")

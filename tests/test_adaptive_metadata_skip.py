@@ -20,8 +20,15 @@ def test_skip_when_adaptive_on_and_metadata_intent(monkeypatch, intent):
 
 @pytest.mark.parametrize("intent", ["count", "list", "recent", "agenda", "entity_lookup", "semantic"])
 def test_no_skip_when_adaptive_off(monkeypatch, intent):
-    """Adaptive OFF (default) → never skip (legacy)."""
-    monkeypatch.delenv("RAG_ADAPTIVE_ROUTING", raising=False)
+    """Adaptive explícitamente OFF (rollback vía `RAG_ADAPTIVE_ROUTING=0`)
+    → pipeline legacy bit-idéntico: nunca skippea, cualquier intent.
+
+    Pre 2026-04-22 el default era OFF y este test validaba el happy path.
+    Post-flip, para mantener la semántica del test (legacy behaviour),
+    seteamos el env explícito en 0. El default ON se cubre en
+    `test_adaptive_routing_default.py` y en el test parametrizado de
+    arriba (`test_skip_when_adaptive_on_and_metadata_intent`)."""
+    monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "0")
     monkeypatch.delenv("RAG_FORCE_FULL_PIPELINE", raising=False)
     assert rag._should_skip_reformulate(intent) is False
 

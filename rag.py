@@ -30242,7 +30242,15 @@ def _serve_plist(rag_bin: str) -> str:
     VRAM forever), RAG_RERANKER_NEVER_UNLOAD=1 (cross-encoder stays resident,
     no 9s reload after idle eviction), RAG_LOCAL_EMBED=1 (in-process
     SentenceTransformer for query embedding, ~10-30ms vs ~140ms via ollama
-    HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10).
+    HTTP), RAG_STATE_SQL=1 (deployment symmetry — no-op post-T10),
+    HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 (close the race where HEAD
+    probes to huggingface.co fire BEFORE rag.py's module-init setdefault —
+    see test_plist_web_serve.py for rationale; was causing 64× [local-embed]
+    unavailable + fallback-to-ollama in web.error.log pre-2026-04-22),
+    RAG_MEMORY_PRESSURE_INTERVAL=20 (the default 60s missed the MPS-OOM
+    window measured in web.error.log; 20s gives the watchdog 3 samples per
+    minute to catch memory pressure before Metal returns
+    `kIOGPUCommandBufferCallbackErrorOutOfMemory`).
 
     KeepAlive + RunAtLoad mean launchd will resurrect it if it crashes or
     the host reboots. ThrottleInterval=30 prevents crash loops from burning
@@ -30271,12 +30279,86 @@ def _serve_plist(rag_bin: str) -> str:
     <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
     <key>RAG_LOCAL_EMBED</key><string>1</string>
     <key>RAG_STATE_SQL</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
+    <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/serve.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/serve.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _web_plist(rag_bin: str) -> str:
+    """Persistent FastAPI web UI + SSE chat endpoint on port 8765.
+
+    Historical gap (2026-04-22): this plist was installed manually once (Apr
+    19 2026) and therefore had no single source of truth for its env vars.
+    The manual version was missing HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1,
+    so `sentence_transformers` hit huggingface.co on every cold load; the
+    2026-04-22 `web.error.log` had **64 `[local-embed] unavailable
+    (couldn't connect to huggingface.co)` entries** that silently dropped
+    the daemon back to ollama embed (~140ms vs ~10-30ms in-process).
+
+    It also lacked RAG_MEMORY_PRESSURE_INTERVAL, which the default of 60s
+    left too coarse — `web.error.log` recorded **23 MPS Metal command-
+    buffer OOMs** (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) that
+    happened inside the 60s sampling window. 20s gives the watchdog 3
+    chances per minute to unload the chat model / reranker before the
+    next MPS encoding starves.
+
+    Note: the entry point is `python web/server.py` directly (not `rag
+    web`), so env vars set via `os.environ.setdefault` at the top of rag.py
+    run only after FastAPI's module graph is already partly loaded —
+    anything that transitively pulls huggingface_hub before
+    `from rag import ...` misses the setdefault. Setting the offline flags
+    in the plist dict eliminates that race.
+    """
+    venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+    web_server = Path(__file__).resolve().parent / "web" / "server.py"
+    working_dir = Path(__file__).resolve().parent
+    # Youtube key is optional — include only if present in the env to avoid
+    # hard-coding a secret at setup time. Most installs leave it blank.
+    youtube_key = os.environ.get("YOUTUBE_API_KEY", "")
+    yt_line = (
+        f"    <key>YOUTUBE_API_KEY</key><string>{youtube_key}</string>\n"
+        if youtube_key else ""
+    )
+    chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen2.5:7b")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-web</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{venv_python}</string>
+    <string>{web_server}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>OBSIDIAN_RAG_WEB_CHAT_MODEL</key><string>{chat_model}</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+    <key>RAG_LOCAL_EMBED</key><string>1</string>
+    <key>RAG_RERANKER_NEVER_UNLOAD</key><string>1</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+    <key>HF_HUB_OFFLINE</key><string>1</string>
+    <key>TRANSFORMERS_OFFLINE</key><string>1</string>
+    <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
+{yt_line}  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>WorkingDirectory</key><string>{working_dir}</string>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/web.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/web.error.log</string>
 </dict>
 </plist>
 """
@@ -30845,6 +30927,12 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _watch_plist(rag_bin)),
         ("com.fer.obsidian-rag-serve", "com.fer.obsidian-rag-serve.plist",
          _serve_plist(rag_bin)),
+        # Web UI daemon — previously installed manually outside `rag setup`
+        # (Apr 2026), which left HF_HUB_OFFLINE + RAG_MEMORY_PRESSURE_INTERVAL
+        # missing in the actual plist and produced 64× [local-embed] falls +
+        # 23× MPS Metal OOMs. Now generated from source.
+        ("com.fer.obsidian-rag-web", "com.fer.obsidian-rag-web.plist",
+         _web_plist(rag_bin)),
         ("com.fer.obsidian-rag-digest", "com.fer.obsidian-rag-digest.plist",
          _digest_plist(rag_bin)),
         ("com.fer.obsidian-rag-morning", "com.fer.obsidian-rag-morning.plist",

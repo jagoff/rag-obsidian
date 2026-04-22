@@ -649,7 +649,7 @@ function appendFeedback(parent, ctx) {
   down.innerHTML = `${THUMB_DOWN_SVG}<span class="fb-label">no ayudó</span>`;
   const status = el("span", "feedback-status", "");
 
-  async function submit(rating, reason) {
+  async function submit(rating, reason, correctivePath) {
     if (wrap.dataset.sent) return;
     wrap.dataset.sent = "1";
     up.disabled = true;
@@ -667,10 +667,13 @@ function appendFeedback(parent, ctx) {
           paths: ctx.paths,
           session_id: ctx.session_id,
           reason: reason || null,
+          corrective_path: correctivePath || null,
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      status.textContent = rating > 0 ? "  gracias — anotado" : "  anotado — seguimos afinando";
+      let label = rating > 0 ? "  gracias — anotado" : "  anotado — seguimos afinando";
+      if (correctivePath) label = "  anotado + corrección — ranker aprende";
+      status.textContent = label;
       status.classList.add(rating > 0 ? "ok" : "warn");
     } catch (err) {
       status.textContent = "  no pude registrar";
@@ -683,20 +686,117 @@ function appendFeedback(parent, ctx) {
     }
   }
 
-  function openReasonInput() {
+  // 👎 flow: pre-2026-04-22 was a plain text input ("¿qué faltó?"). Now
+  // mirrors the CLI corrective_path prompt (rag.py:~18997): show the top-5
+  // source cards as selectable, plus "ninguna" option + optional free-text.
+  // Selecting a card inserts a clean (query, positive) pair into rag_feedback
+  // that `rag tune` consumes as augmentation — see _feedback_augmented_cases().
+  function openNegativeFeedback() {
     if (wrap.dataset.reasonOpen || wrap.dataset.sent) return;
     wrap.dataset.reasonOpen = "1";
     down.classList.add("picked");
     up.classList.add("dimmed");
 
-    const row = el("div", "feedback-reason");
+    const row = el("div", "feedback-corrective");
+
+    // Filter candidates: vault-relative only (skip calendar://, whatsapp://
+    // etc — same invariant the server enforces on the way in). De-dupe,
+    // cap at 5, match the CLI's candidate-build logic.
+    const candidates = [];
+    const seen = new Set();
+    for (const src of (ctx.sources || [])) {
+      const p = src && src.file;
+      if (!p || p.indexOf("://") !== -1 || seen.has(p)) continue;
+      seen.add(p);
+      candidates.push(src);
+      if (candidates.length >= 5) break;
+    }
+
+    const hasCandidates = candidates.length > 0;
+    const header = el("div", "fb-corr-header",
+      hasCandidates
+        ? "¿cuál era el path correcto? elegí uno o escribí el tuyo — opcional"
+        : "¿qué faltó? (opcional)"
+    );
+    row.appendChild(header);
+
+    let selectedPath = null;
+    const cardNodes = [];
+
+    if (hasCandidates) {
+      const grid = el("div", "fb-corr-grid");
+      candidates.forEach((src, idx) => {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "fb-corr-card";
+        card.setAttribute("aria-pressed", "false");
+        const score = Number.isFinite(src.score) ? src.score : null;
+        const title = (src.title || src.file || `fuente ${idx + 1}`).toString();
+        const path = src.file || "";
+        card.innerHTML = `
+          <span class="fb-corr-num">${idx + 1}</span>
+          <span class="fb-corr-body">
+            <span class="fb-corr-title">${escapeHtml(title)}</span>
+            <span class="fb-corr-path">${escapeHtml(path)}</span>
+          </span>
+          ${score !== null ? `<span class="fb-corr-score">${score.toFixed(2)}</span>` : ""}
+        `;
+        card.addEventListener("click", () => {
+          if (selectedPath === path) {
+            // Toggle off.
+            selectedPath = null;
+            card.classList.remove("picked");
+            card.setAttribute("aria-pressed", "false");
+          } else {
+            selectedPath = path;
+            cardNodes.forEach((c) => {
+              c.classList.remove("picked");
+              c.setAttribute("aria-pressed", "false");
+            });
+            noneBtn.classList.remove("picked");
+            noneBtn.setAttribute("aria-pressed", "false");
+            card.classList.add("picked");
+            card.setAttribute("aria-pressed", "true");
+          }
+        });
+        cardNodes.push(card);
+        grid.appendChild(card);
+      });
+
+      const noneBtn = document.createElement("button");
+      noneBtn.type = "button";
+      noneBtn.className = "fb-corr-card fb-corr-none";
+      noneBtn.setAttribute("aria-pressed", "false");
+      noneBtn.innerHTML = `<span class="fb-corr-body"><span class="fb-corr-title">ninguna de estas</span><span class="fb-corr-path">el correcto no apareció entre las fuentes</span></span>`;
+      noneBtn.addEventListener("click", () => {
+        if (selectedPath === "__none__") {
+          selectedPath = null;
+          noneBtn.classList.remove("picked");
+          noneBtn.setAttribute("aria-pressed", "false");
+        } else {
+          selectedPath = "__none__";
+          cardNodes.forEach((c) => {
+            c.classList.remove("picked");
+            c.setAttribute("aria-pressed", "false");
+          });
+          noneBtn.classList.add("picked");
+          noneBtn.setAttribute("aria-pressed", "true");
+        }
+      });
+      grid.appendChild(noneBtn);
+      row.appendChild(grid);
+    }
+
     const field = document.createElement("input");
     field.type = "text";
     field.className = "fb-reason-input";
-    field.placeholder = "¿qué faltó? (opcional) — ej: falta la nota X, muy genérico";
+    field.placeholder = hasCandidates
+      ? "…o pegá el path real (ej: 02-Areas/Salud/postura.md) — opcional"
+      : "¿qué faltó? ej: falta la nota X, muy genérico";
     field.maxLength = 200;
     field.setAttribute("aria-label", "motivo (opcional)");
 
+    const actions = el("div", "fb-corr-actions");
     const send = document.createElement("button");
     send.type = "button";
     send.className = "fb-text-btn";
@@ -708,28 +808,50 @@ function appendFeedback(parent, ctx) {
     skip.textContent = "omitir";
 
     async function commit() {
-      const reason = field.value.trim();
+      const freeText = field.value.trim();
+      let corrective = null;
+      let reason = null;
+      // Precedence: free-text path input > card selection > "ninguna".
+      // "ninguna" leaves corrective null but preserves the rating signal +
+      // any free-text reason. A free-text entry that looks like a path
+      // (contains "/" or ends with .md) is treated as corrective_path;
+      // otherwise as a reason note.
+      if (freeText && (freeText.indexOf("/") !== -1 || /\.md$/i.test(freeText))) {
+        corrective = freeText;
+      } else if (selectedPath && selectedPath !== "__none__") {
+        corrective = selectedPath;
+        if (freeText) reason = freeText;
+      } else if (freeText) {
+        reason = freeText;
+      }
       row.remove();
-      await submit(-1, reason);
+      await submit(-1, reason, corrective);
+    }
+
+    function cancel() {
+      row.remove();
+      delete wrap.dataset.reasonOpen;
+      down.classList.remove("picked");
+      up.classList.remove("dimmed");
     }
 
     field.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") { ev.preventDefault(); commit(); }
-      else if (ev.key === "Escape") { row.remove(); delete wrap.dataset.reasonOpen;
-        down.classList.remove("picked"); up.classList.remove("dimmed"); }
+      else if (ev.key === "Escape") { cancel(); }
     });
     send.addEventListener("click", commit);
     skip.addEventListener("click", commit);
 
-    row.appendChild(field);
-    row.appendChild(send);
-    row.appendChild(skip);
+    actions.appendChild(field);
+    actions.appendChild(send);
+    actions.appendChild(skip);
+    row.appendChild(actions);
     wrap.appendChild(row);
-    field.focus();
+    (hasCandidates ? cardNodes[0] || field : field).focus();
   }
 
   up.addEventListener("click", () => submit(1));
-  down.addEventListener("click", openReasonInput);
+  down.addEventListener("click", openNegativeFeedback);
 
   wrap.appendChild(prompt);
   wrap.appendChild(up);
@@ -737,6 +859,17 @@ function appendFeedback(parent, ctx) {
   wrap.appendChild(status);
   parent.appendChild(wrap);
   return wrap;
+}
+
+// Small HTML escape — enough for titles and paths (no markup expected),
+// keeps us off innerHTML-injection for user-controlled frontmatter titles.
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // External enrichment — Spotify + YouTube, fetched when the vault answer
@@ -1860,6 +1993,9 @@ async function send(question) {
             turn_id: parsed.turn_id,
             q: question,
             paths: (sources || []).map((s) => s.file).filter(Boolean),
+            // Pass the full source objects so the 👎 corrective flow can
+            // render selectable cards with title + score, not just bare paths.
+            sources: sources || [],
             session_id: sessionId,
           })
         : null;

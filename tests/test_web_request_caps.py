@@ -82,6 +82,44 @@ def test_feedback_accepts_paths_at_cap():
     assert len(req.paths) == 50
 
 
+# ── FeedbackRequest.corrective_path (2026-04-22) ─────────────────────────────
+# Mirrors the CLI corrective prompt (rag.py:~18997). Pre-fix the web had no
+# way to surface the positive signal — rag_feedback had 0 web-sourced rows
+# with corrective_path, starving the reranker fine-tune of clean pairs from
+# 80% of traffic.
+
+
+def test_feedback_accepts_corrective_path():
+    payload = {**_valid_feedback_base(), "rating": -1,
+               "corrective_path": "02-Areas/Salud/postura.md"}
+    req = FeedbackRequest(**payload)
+    assert req.corrective_path == "02-Areas/Salud/postura.md"
+
+
+def test_feedback_corrective_path_optional():
+    """Corrective_path is always optional — a bare rating must still parse."""
+    req = FeedbackRequest(**_valid_feedback_base())
+    assert req.corrective_path is None
+
+
+def test_feedback_rejects_oversized_corrective_path():
+    """Cap at 512 chars — longest realistic vault path is ~300 but we want
+    a buffer without letting a multi-KB payload through."""
+    payload = {**_valid_feedback_base(), "rating": -1,
+               "corrective_path": "x" * 513}
+    with pytest.raises(ValidationError) as exc_info:
+        FeedbackRequest(**payload)
+    assert "string_too_long" in str(exc_info.value)
+
+
+def test_feedback_accepts_corrective_path_at_cap():
+    payload = {**_valid_feedback_base(), "rating": -1,
+               "corrective_path": "x" * 512}
+    req = FeedbackRequest(**payload)
+    assert req.corrective_path is not None
+    assert len(req.corrective_path) == 512
+
+
 # ── ChatRequest caps (pre-existing) ──────────────────────────────────────────
 
 

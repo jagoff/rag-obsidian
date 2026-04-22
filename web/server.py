@@ -738,6 +738,13 @@ class FeedbackRequest(BaseModel):
     paths: list[str] | None = Field(None, max_length=50)
     session_id: str | None = None
     reason: str | None = Field(None, max_length=500)     # short free-text, optional (≤200 chars after trim)
+    # Vault-relative path the user marked as the correct one when the
+    # retrieve failed. Mirrors the CLI corrective_path flow (rag.py:~18997,
+    # commit 23f2899 / 2026-04-22). Before this, rag_feedback had 0 web-sourced
+    # rows with corrective_path — the fine-tune of the reranker was starved of
+    # clean (query, positive, negative) triplets from the 80% of traffic that
+    # comes through the web. Cap at 512 chars (longest realistic vault path).
+    corrective_path: str | None = Field(None, max_length=512)
 
     @field_validator("turn_id")
     @classmethod
@@ -768,16 +775,38 @@ def submit_feedback(req: FeedbackRequest) -> dict:
     Optional `reason` lets the user jot a short note when clicking 👎
     ("genérico", "faltó la nota X", "mezcla temas") — grouped later by
     `rag insights` to surface common failure modes.
+
+    Optional `corrective_path` is a vault-relative path the user picked
+    as the correct one among the top-5 shown. When present it overrides
+    `reason` to "corrective" (the sentinel `_feedback_augmented_cases()`
+    keys on to mine augmentation triplets for `rag tune`). This is the
+    web-side counterpart of the CLI chat corrective prompt (2026-04-22)
+    — without it the fine-tune was starved of signal from 80% of the
+    user traffic.
     """
     if not req.turn_id or req.rating not in (1, -1):
         raise HTTPException(status_code=400, detail="turn_id + rating ±1 requeridos")
-    reason = (req.reason or "").strip()[:200] or None
+    corrective_path = (req.corrective_path or "").strip() or None
+    if corrective_path and "://" in corrective_path:
+        # Reject cross-source native ids (calendar://, whatsapp://, gmail://).
+        # Not a vault-relative path — `_feedback_augmented_cases()` can't
+        # consume it as a positive. Silent drop + keep the rating anyway.
+        corrective_path = None
+    # When the user picked a corrective_path we override the reason to
+    # "corrective" (this is the sentinel _feedback_augmented_cases() keys
+    # on to mine augmentation pairs for `rag tune`). If they only wrote a
+    # free-text reason without picking a path, keep their reason as-is.
+    if corrective_path:
+        reason: str | None = "corrective"
+    else:
+        reason = (req.reason or "").strip()[:200] or None
     record_feedback(
         turn_id=req.turn_id,
         rating=req.rating,
         q=(req.q or "").strip(),
         paths=req.paths or [],
         reason=reason,
+        corrective_path=corrective_path,
         session_id=req.session_id,
     )
     return {"ok": True}

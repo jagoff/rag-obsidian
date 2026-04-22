@@ -656,6 +656,127 @@ html, body {
 .fb-text-btn.fb-text-muted { color: var(--text-faint); }
 .fb-text-btn.fb-text-muted:hover { color: var(--text-dim); }
 
+/* ── Corrective-path picker (👎 flow, 2026-04-22) ────────────────────
+   Mirrors the CLI corrective prompt (rag.py:~18997). When the user
+   clicks 👎 we surface the top-5 source cards as selectable, plus a
+   "ninguna" option, so they can pin which path was actually correct.
+   That signal feeds `rag tune` via `_feedback_augmented_cases()` as a
+   clean (query, positive) pair.
+   Collapsible into the existing `.feedback` row; when open it takes
+   flex-basis: 100% and stacks header → grid → actions vertically. */
+.feedback-corrective {
+  flex-basis: 100%;
+  margin-top: 6px;
+  padding-left: 2ch;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.fb-corr-header {
+  color: var(--text-faint);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+
+.fb-corr-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 720px;
+}
+
+.fb-corr-card {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+  width: 100%;
+}
+.fb-corr-card:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.fb-corr-card.picked {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, var(--bg-elev));
+  color: var(--text);
+}
+
+.fb-corr-num {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  min-width: 1.2em;
+  font-size: 11px;
+}
+.fb-corr-card.picked .fb-corr-num { color: var(--green); }
+
+.fb-corr-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;  /* allow text-overflow on children */
+}
+.fb-corr-title {
+  color: var(--cyan);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fb-corr-path {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fb-corr-score {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  min-width: 2.5em;
+  text-align: right;
+}
+.fb-corr-card.picked .fb-corr-score { color: var(--green); }
+
+.fb-corr-none {
+  border-style: dashed;
+  opacity: 0.85;
+}
+.fb-corr-none .fb-corr-title { color: var(--text-dim); font-weight: 400; }
+.fb-corr-none.picked {
+  border-style: solid;
+  border-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 10%, var(--bg-elev));
+}
+.fb-corr-none.picked .fb-corr-title { color: var(--text); }
+
+.fb-corr-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Respect reduced-motion — the picker already has minimal animation
+   but belt-and-suspenders for the transitions. */
+@media (prefers-reduced-motion: reduce) {
+  .fb-corr-card { transition: none; }
+}
+
 /* Empty / error states ------------------------------------------ */
 .empty {
   color: var(--yellow);

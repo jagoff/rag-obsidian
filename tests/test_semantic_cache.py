@@ -394,3 +394,105 @@ def test_cache_concurrent_stores_dont_crash(clean_cache_env):
     assert success_count["n"] >= 10, f"expected ≥10 successful stores, got {success_count['n']}"
     stats = rag.semantic_cache_stats()
     assert stats["rows"] == success_count["n"]
+
+
+# ── 7. Background (async) stores — 2026-04-22 perf fix ──────────────────────
+
+
+def test_background_store_enqueues_and_commits(clean_cache_env):
+    """background=True returns immediately, row is visible after draining queue.
+
+    Pre-fix `semantic_cache_store()` blocked the hot path 1-1.3s on WAL
+    contention (retry budget 5×~0.25s). background=True hands the write to
+    the rag-bg-sql-writer daemon so the caller unblocks in ~µs. Draining
+    _BACKGROUND_SQL_QUEUE.join() makes the write observable via lookup.
+    """
+    emb = _emb(1.0, 0.5, dim=32)
+    t0 = time.perf_counter()
+    ok = rag.semantic_cache_store(
+        emb, question="bg-q", response="bg-ans",
+        paths=["p.md"], scores=[0.9], top_score=0.9,
+        intent=None, corpus_hash="HBG",
+        background=True,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    assert ok is True, "background enqueue should always return True after gating"
+    # The caller must NOT have blocked on a SQL commit. Even on a slow
+    # macOS laptop the queue put + argument packing should be well under 50ms.
+    assert elapsed_ms < 50, f"background store took {elapsed_ms:.1f}ms, expected <50ms"
+
+    # Drain the worker so the INSERT actually commits before we assert visibility.
+    rag._BACKGROUND_SQL_QUEUE.join()
+
+    hit = rag.semantic_cache_lookup(emb, corpus_hash="HBG")
+    assert hit is not None, "background-stored row must be readable after queue drain"
+    assert hit["response"] == "bg-ans"
+    assert hit["paths"] == ["p.md"]
+
+
+def test_background_store_respects_gating(clean_cache_env):
+    """Gating (empty response, refusal top_score, disabled cache, empty corpus_hash)
+    must reject BEFORE reaching the background queue — no worker work wasted.
+    """
+    emb = _emb(1.0, 0.0, dim=32)
+    # Empty response
+    assert rag.semantic_cache_store(
+        emb, question="q", response="",
+        paths=[], scores=[], top_score=0.9,
+        intent=None, corpus_hash="H", background=True,
+    ) is False
+    # Refusal top_score
+    assert rag.semantic_cache_store(
+        emb, question="q", response="No encontré.",
+        paths=[], scores=[], top_score=0.005,
+        intent=None, corpus_hash="H", background=True,
+    ) is False
+    # Empty corpus_hash
+    assert rag.semantic_cache_store(
+        emb, question="q", response="ans",
+        paths=[], scores=[], top_score=0.9,
+        intent=None, corpus_hash="", background=True,
+    ) is False
+    # Drain and confirm no rows landed.
+    rag._BACKGROUND_SQL_QUEUE.join()
+    stats = rag.semantic_cache_stats()
+    assert stats["rows"] == 0, "gated stores must not enqueue any work"
+
+
+def test_background_store_does_not_block_under_contention(clean_cache_env, monkeypatch):
+    """background=True must return in <100ms even if the underlying write
+    is forced into its full retry budget (simulated via a slow connection).
+
+    This is the specific regression we fixed: pre-2026-04-22 the caller
+    blocked 1-1.3s on WAL contention. With background=True, the worker
+    absorbs the retry budget off-thread so the user query returns before
+    the write even finishes.
+    """
+    import contextlib as _contextlib
+    import time as _time
+
+    # Install a fake conn opener that sleeps 500ms per retry attempt (simulating
+    # a busy_timeout wait). The foreground call must still return quickly
+    # because it only enqueues.
+    original = rag._ragvec_state_conn
+
+    @_contextlib.contextmanager
+    def slow_conn():
+        _time.sleep(0.5)
+        with original() as c:
+            yield c
+
+    monkeypatch.setattr(rag, "_ragvec_state_conn", slow_conn)
+
+    emb = _emb(1.0, 0.0, dim=32)
+    t0 = _time.perf_counter()
+    ok = rag.semantic_cache_store(
+        emb, question="slow-q", response="slow-ans",
+        paths=[], scores=[], top_score=0.9,
+        intent=None, corpus_hash="HSLOW",
+        background=True,
+    )
+    elapsed_ms = (_time.perf_counter() - t0) * 1000
+    assert ok is True
+    # The foreground must NOT have waited for the 500ms slow commit.
+    assert elapsed_ms < 100, f"background store blocked {elapsed_ms:.1f}ms under slow-conn, expected <100ms"

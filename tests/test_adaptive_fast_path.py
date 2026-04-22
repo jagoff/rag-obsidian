@@ -61,3 +61,39 @@ def test_retrieve_accepts_intent_kwarg():
     for intent in ("semantic", "comparison", "synthesis", None):
         result = rag.retrieve(col, "test", k=5, folder=None, intent=intent)
         assert "fast_path" in result
+
+
+def test_lookup_num_ctx_default_is_4096():
+    """Fast-path num_ctx default bumped to 4096 (2026-04-22).
+
+    Pre-fix default 2048 truncó el context antes del chunk relevante en
+    queries de alta confianza, devolviendo refuses falsos aunque el doc
+    estaba en el top-5 del rerank. Reproducible con
+    `RAG_FORCE_FULL_PIPELINE=1 rag query "curso de liderazgo estratégico"`
+    (responde bien) vs sin la flag (responde "No tengo esa información"
+    pre-2048, responde bien post-4096).
+
+    El default es env-overridable vía RAG_LOOKUP_NUM_CTX pero el valor
+    sin override debe ser 4096 para evitar la regresión.
+    """
+    assert rag._LOOKUP_NUM_CTX == 4096, (
+        f"_LOOKUP_NUM_CTX default debe ser 4096 (fue {rag._LOOKUP_NUM_CTX}). "
+        "Ver CLAUDE.md § adaptive routing — 2048 causaba refuses falsos."
+    )
+
+
+def test_lookup_num_ctx_env_override_works(monkeypatch):
+    """RAG_LOOKUP_NUM_CTX env override sigue funcionando post-bump del default.
+
+    Operadores con presión de memoria pueden forzar num_ctx=2048 manualmente
+    aceptando el tradeoff de refuses falsos ocasionales. El módulo se
+    evalúa al import → usamos importlib.reload para validar el hot-path.
+    """
+    import importlib
+    monkeypatch.setenv("RAG_LOOKUP_NUM_CTX", "8192")
+    reloaded = importlib.reload(rag)
+    try:
+        assert reloaded._LOOKUP_NUM_CTX == 8192
+    finally:
+        monkeypatch.delenv("RAG_LOOKUP_NUM_CTX", raising=False)
+        importlib.reload(rag)

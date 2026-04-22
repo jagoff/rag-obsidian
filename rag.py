@@ -723,6 +723,19 @@ def _flush_log_queue() -> None:
 atexit.register(_flush_log_queue)
 
 
+# ── Silent-log alerting ──────────────────────────────────────────────────────
+# Tracks how many swallowed exceptions have been recorded since the last alert.
+# When the count exceeds _SILENT_LOG_ALERT_THRESHOLD within a
+# _SILENT_LOG_ALERT_INTERVAL window, a one-liner is printed to stderr so the
+# operator notices telemetry degradation without having to grep the file.
+# Set RAG_SILENT_LOG_ALERT_THRESHOLD to a very large value (e.g. 999999) to
+# effectively mute the alert in environments where silent errors are expected.
+_SILENT_LOG_COUNTER: dict = {"count": 0, "last_alert_ts": 0.0}
+_SILENT_LOG_COUNTER_LOCK = threading.Lock()
+_SILENT_LOG_ALERT_THRESHOLD = int(os.environ.get("RAG_SILENT_LOG_ALERT_THRESHOLD", "20"))
+_SILENT_LOG_ALERT_INTERVAL = 3600.0  # seconds between repeated alerts (1h)
+
+
 def _silent_log(where: str, exc: BaseException) -> None:
     """Record a swallowed exception without raising or blocking.
 
@@ -741,6 +754,11 @@ def _silent_log(where: str, exc: BaseException) -> None:
     Sites that are genuinely best-effort (optional enrichment, shutdown
     cleanup, HTTP posts to bridges that may be down, chmod on NFS/SMB)
     intentionally keep bare `pass` — see code-review-followup.md.
+
+    When the number of silent errors recorded in the current window
+    exceeds _SILENT_LOG_ALERT_THRESHOLD, a WARNING is printed to stderr
+    (at most once per _SILENT_LOG_ALERT_INTERVAL). Override threshold via
+    RAG_SILENT_LOG_ALERT_THRESHOLD env var.
     """
     try:
         line = json.dumps({
@@ -752,6 +770,20 @@ def _silent_log(where: str, exc: BaseException) -> None:
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
     except Exception:
         pass
+    with _SILENT_LOG_COUNTER_LOCK:
+        _SILENT_LOG_COUNTER["count"] += 1
+        _now = time.time()
+        if (
+            _SILENT_LOG_COUNTER["count"] >= _SILENT_LOG_ALERT_THRESHOLD
+            and _now - _SILENT_LOG_COUNTER["last_alert_ts"] > _SILENT_LOG_ALERT_INTERVAL
+        ):
+            sys.stderr.write(
+                f"[rag/telemetry] WARNING: {_SILENT_LOG_COUNTER['count']} silent errors "
+                f"en la última hora (ver ~/.local/share/obsidian-rag/silent_errors.jsonl)\n"
+            )
+            sys.stderr.flush()
+            _SILENT_LOG_COUNTER["last_alert_ts"] = _now
+            _SILENT_LOG_COUNTER["count"] = 0
 
 
 def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
@@ -16706,6 +16738,49 @@ def query(
                 contrad = _run_counter()
             render_contradictions(contrad)
 
+    # ── NLI grounding (opt-in, Improvement #1) ───────────────────────────────
+    # Runs AFTER citation-repair + critique so `full` is the final answer.
+    # With RAG_NLI_GROUNDING unset (default) the block is a no-op: zero LLM
+    # calls, zero latency cost. Panel is Rich-only (non-plain) — plain output
+    # already delivered to the caller above so we add the panel after.
+    _nli_grounding_summary: dict | None = None
+    _nli_ms_logged = 0
+    if _nli_grounding_enabled() and intent not in _nli_skip_intents():
+        try:
+            _nli_claims = split_claims(full)
+            if _nli_claims:
+                _nli_result = ground_claims_nli(
+                    _nli_claims, result["docs"], result["metas"],
+                    threshold_contradicts=_nli_contradicts_threshold(),
+                    max_claims=_nli_max_claims(),
+                )
+                if _nli_result is not None:
+                    _nli_ms_logged = _nli_result.nli_ms
+                    _nli_grounding_summary = {
+                        "claims_total": _nli_result.claims_total,
+                        "supported": _nli_result.claims_supported,
+                        "contradicted": _nli_result.claims_contradicted,
+                        "neutral": _nli_result.claims_neutral,
+                    }
+                    if not plain:
+                        _verdict_lines = []
+                        for _g in _nli_result.claims:
+                            _snip = _g.text[:80]
+                            if _g.verdict == "entails":
+                                _verdict_lines.append(f"[green]✓[/green] {_snip}")
+                            elif _g.verdict == "contradicts":
+                                _verdict_lines.append(f"[red]✗[/red] {_snip}")
+                            else:
+                                _verdict_lines.append(f"[dim]·[/dim] {_snip}")
+                        from rich.panel import Panel as _NliPanel
+                        console.print(_NliPanel(
+                            "\n".join(_verdict_lines),
+                            title="[dim]NLI grounding[/dim]",
+                            border_style="dim",
+                        ))
+        except Exception as _nli_exc:
+            _silent_log("nli_grounding_query", _nli_exc)
+
     query_turn_id = new_turn_id()
     log_query_event({
         "cmd": "query",
@@ -16735,6 +16810,8 @@ def query(
         "mode": "raw" if raw else ("loose" if loose else "strict"),
         "plain": plain,
         "fast_path": _fast_path,
+        "nli_ms": _nli_ms_logged,
+        "grounding_summary": _nli_grounding_summary,
     })
 
     if sess is not None:
@@ -17514,6 +17591,7 @@ def chat(
         is_link, link_q = detect_link_intent(question)
         if is_link:
             search_q = link_q or question
+            t0 = time.perf_counter()
             # Backfill PRIMERO (fuera del status spinner) — si la URL DB
             # está vacía, su mensaje "indexando ~1 min" tiene que ser
             # visible al usuario, no enterrado bajo el "buscando URLs…".
@@ -17528,6 +17606,7 @@ def chat(
                 "cmd": "links", "q": search_q, "via": "chat",
                 "n_results": len(items),
                 "top_url": items[0]["url"] if items else None,
+                "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
             })
             continue
 
@@ -17805,6 +17884,48 @@ def chat(
                 )
             render_contradictions(contrad)
 
+        # ── NLI grounding (opt-in, chat path, Improvement #1) ─────────────────
+        # Post citation-repair + critique — `full` is final here. No intent
+        # variable in chat (no per-turn intent dispatch), so skip the intent
+        # check and run grounding unconditionally when the flag is ON.
+        # Default OFF → zero-cost no-op.
+        _chat_nli_summary: dict | None = None
+        _chat_nli_ms = 0
+        if _nli_grounding_enabled():
+            try:
+                _chat_nli_claims = split_claims(full)
+                if _chat_nli_claims:
+                    _chat_nli_result = ground_claims_nli(
+                        _chat_nli_claims, result["docs"], result["metas"],
+                        threshold_contradicts=_nli_contradicts_threshold(),
+                        max_claims=_nli_max_claims(),
+                    )
+                    if _chat_nli_result is not None:
+                        _chat_nli_ms = _chat_nli_result.nli_ms
+                        _chat_nli_summary = {
+                            "claims_total": _chat_nli_result.claims_total,
+                            "supported": _chat_nli_result.claims_supported,
+                            "contradicted": _chat_nli_result.claims_contradicted,
+                            "neutral": _chat_nli_result.claims_neutral,
+                        }
+                        _chat_nli_lines = []
+                        for _g in _chat_nli_result.claims:
+                            _s = _g.text[:80]
+                            if _g.verdict == "entails":
+                                _chat_nli_lines.append(f"[green]✓[/green] {_s}")
+                            elif _g.verdict == "contradicts":
+                                _chat_nli_lines.append(f"[red]✗[/red] {_s}")
+                            else:
+                                _chat_nli_lines.append(f"[dim]·[/dim] {_s}")
+                        from rich.panel import Panel as _NliPanel
+                        console.print(_NliPanel(
+                            "\n".join(_chat_nli_lines),
+                            title="[dim]NLI grounding[/dim]",
+                            border_style="dim",
+                        ))
+            except Exception as _nli_exc:
+                _silent_log("nli_grounding_chat", _nli_exc)
+
         turn_id = new_turn_id()
         append_turn(sess, {
             "q": question,
@@ -17831,6 +17952,8 @@ def chat(
             "critique_changed": _chat_critique_changed,
             "timing": _round_timing_ms(result.get("timing")),
             "fast_path": _chat_fast_path,
+            "nli_ms": _chat_nli_ms,
+            "grounding_summary": _chat_nli_summary,
         })
 
         last_turn_id = turn_id
@@ -20263,6 +20386,7 @@ def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
     Output-only — no escribe, no modifica vault, no llama al LLM. Surface los
     patrones y vos decidís qué acción tomar (escribir nota, archivar, etc.).
     """
+    t0 = time.perf_counter()
     since = datetime.now() - timedelta(days=days)
     entries = _load_query_entries(since)
     gaps = detect_gap_queries(entries, min_occurrences=min_gap)
@@ -20273,6 +20397,7 @@ def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
         "cmd": "insights", "window_days": days,
         "n_entries": len(entries), "n_gaps": len(gaps),
         "n_hots": len(hots), "n_orphans": len(orphans),
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
     if as_json:
@@ -21143,6 +21268,7 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         console.print("[yellow]Pasá una query o usá --rebuild.[/yellow]")
         return
     warmup_async()
+    t0 = time.perf_counter()
     items = find_urls(query, k=k, folder=folder, tag=tag, source=source)
     if open_idx is not None:
         if not (1 <= open_idx <= len(items)):
@@ -21164,6 +21290,7 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         "cmd": "links", "q": query, "n_results": len(items),
         "folder": folder, "tag": tag,
         "top_url": items[0]["url"] if items else None,
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
 
@@ -21176,6 +21303,7 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
 @click.option("--plain", is_flag=True, help="Salida plana sin colores")
 def dupes(threshold: float, folder: str | None, limit: int, plain: bool):
     """Buscar pares de notas potencialmente duplicadas (centroides similares)."""
+    t0 = time.perf_counter()
     pairs = find_duplicate_notes(col=get_db(), threshold=threshold, folder=folder, limit=limit)
     if not pairs:
         msg = f"Sin pares con cosine ≥ {threshold}."
@@ -21208,6 +21336,7 @@ def dupes(threshold: float, folder: str | None, limit: int, plain: bool):
     log_query_event({
         "cmd": "dupes", "threshold": threshold, "folder": folder,
         "n_pairs": len(pairs),
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
 
@@ -21899,6 +22028,7 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
         "n_sources": len(sources_main), "n_related": len(related),
         "n_urls": len(urls), "answer_len": len(full),
         "t_gen": round(t_gen, 2),
+        "timing": _round_timing_ms({"total_ms": t_gen * 1000}),
     })
 
     if save:
@@ -22800,6 +22930,7 @@ def read_cmd(url: str, save: bool, plain: bool):
         raise SystemExit(1)
 
     col = get_db()
+    t0 = time.perf_counter()
     try:
         result = ingest_read_url(col, url, save=save)
     except RuntimeError as e:
@@ -22812,6 +22943,7 @@ def read_cmd(url: str, save: bool, plain: bool):
         "text_len": result.get("text_len", 0),
         "n_related": len(result.get("related") or []),
         "n_tags": len(result.get("tags") or []),
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
     if plain:
@@ -28216,6 +28348,7 @@ def dead(min_age_days: int, query_window_days: int, limit: int,
     mtime > N días + fuera de Inbox/Archive/Reviews. No borra nada.
     """
     col = get_db()
+    t0 = time.perf_counter()
     items = find_dead_notes(
         col, VAULT_PATH, LOG_PATH,
         min_age_days=min_age_days,
@@ -28233,6 +28366,7 @@ def dead(min_age_days: int, query_window_days: int, limit: int,
         "cmd": "dead", "min_age_days": min_age_days,
         "query_window_days": query_window_days,
         "folder": folder, "n_candidates": len(items),
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
     if not items:
@@ -29085,6 +29219,7 @@ def followup(days: int, status: str | None, as_json: bool, plain: bool,
     si hay evidencia semántica de follow-through en notas posteriores.
     """
     col = get_db()
+    t0 = time.perf_counter()
     items = find_followup_loops(col, VAULT_PATH, days=days, stale_days=stale_days)
     if status:
         items = [it for it in items if it["status"] == status]
@@ -29096,6 +29231,7 @@ def followup(days: int, status: str | None, as_json: bool, plain: bool,
     log_query_event({
         "cmd": "followup", "days": days, "status": status,
         "n_loops": len(items), "counts": counts,
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
     if as_json:
@@ -34055,10 +34191,23 @@ def _torch_mps_empty_cache() -> None:
 
 
 def get_nli_model():
-    """Lazy-load NLI model (mDeBERTa-v3-base-xnli-multilingual-nli-2mil7).
+    """Lazy-load NLI cross-encoder for claim-level grounding (Improvement #1, Fase B).
 
-    Device: mps > cuda > cpu. fp32 forced (fp16 on MPS breaks scores).
-    Thread-safe via _nli_lock. Returns None if load fails.
+    Model: MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 —
+    multilingual NLI that classifies (claim, evidence_chunk) pairs as
+    entails | neutral | contradicts. Used by ground_response() to add a
+    content-validity layer on top of verify_citations() (path-existence only).
+
+    Memory: ~600 MB unified memory (MPS, fp32). Device priority: mps > cuda > cpu.
+    fp32 forced — fp16 on MPS collapses all scores to ~0.001 (same failure mode
+    as the cross-encoder reranker, empirically verified 2026-04-13).
+
+    Thread-safety: double-checked locking via _nli_lock (threading.Lock).
+    The `_nli_model is not None` check inside the lock prevents two concurrent
+    callers from each paying the ~2s cold-load cost (same pattern as get_reranker).
+    Do NOT read or write _nli_model without holding _nli_lock — maybe_unload_nli_model()
+    can set it to None from a background thread at any time.
+    Returns None if load fails; caller (ground_response) marks all claims neutral.
     """
     global _nli_model, _nli_last_use
     with _nli_lock:
@@ -34354,7 +34503,23 @@ def _entity_extraction_enabled() -> bool:
 
 
 def _get_gliner_model():
-    """Lazy load GLiNER multi-v2.1. Sticky-failure: no retry after first fail."""
+    """Lazy-load GLiNER zero-shot NER model for entity extraction (Improvement #2).
+
+    Model: urchade/gliner_multi-v2.1 — multilingual zero-shot entity extractor.
+    Populates rag_entities + rag_entity_mentions during indexing when
+    RAG_EXTRACT_ENTITIES=1. Labels: person, organization, location, event.
+    Called only during indexing — NOT on the retrieve() hot path.
+
+    Memory: ~300-500 MB (CPU only; GLiNER.from_pretrained has no device kwarg).
+
+    Thread-safety: double-checked locking via _gliner_lock (threading.Lock).
+    Do NOT read or write _gliner_model without holding _gliner_lock — the global
+    can be None either because it hasn't loaded yet or because a prior attempt
+    failed. Sticky-failure: _gliner_load_failed is set True on ImportError or load
+    exception and is never reset in-process; subsequent calls return None immediately
+    without re-attempting the import (avoids repeated heavy import overhead).
+    Returns None if gliner package is missing or model load fails.
+    """
     global _gliner_model, _gliner_load_failed
     with _gliner_lock:
         if _gliner_load_failed:

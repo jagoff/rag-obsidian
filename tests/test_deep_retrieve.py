@@ -190,3 +190,84 @@ def test_confidence_deep_threshold_within_expected_range():
     # Must be above CONFIDENCE_RERANK_MIN (the refuse gate) — otherwise
     # deep_retrieve would fire on queries we already refused.
     assert rag.CONFIDENCE_DEEP_THRESHOLD > rag.CONFIDENCE_RERANK_MIN
+
+
+# ── Wall-time timeout (2026-04-22 fix) ───────────────────────────────────────
+
+
+def test_deep_retrieve_respects_wall_time_timeout(monkeypatch):
+    """Aunque el juez siga diciendo "insuficiente" indefinidamente, el loop
+    del deep-retrieve DEBE salir cuando pasa _DEEP_MAX_SECONDS.
+
+    Motivación: el peor query de los últimos 7d tuvo t_retrieve=202.6s — cada
+    iteración bajo contención extrema de Ollama puede tardar 60-70s. Sin
+    timeout absoluto, 3 iters = ~200s. El guard garantiza que ninguna query
+    bloquee más de `_DEEP_MAX_SECONDS` en retrieve.
+
+    Simulamos: `retrieve()` devuelve nuevos chunks rápido pero el juez siempre
+    dice insuficiente. Forzamos `_DEEP_MAX_SECONDS` a 0.1s y hacemos que el
+    juez consuma 50ms simulados → segunda iteración debería quedar afuera.
+    """
+    import time as _time
+
+    first = _res(["a.md"], [0.05])
+    # Retornamos nuevos chunks cada vez para que `added==0` early-exit NO
+    # cortocircuite antes del timeout.
+    passes = [first] + [_res([f"new{i}.md"], [0.04 + i * 0.01]) for i in range(10)]
+    retrieve_mock = MagicMock(side_effect=passes)
+
+    # Juez siempre insuficiente y lentito — consume tiempo wall-clock real.
+    # El sleep del judge debe ser > _DEEP_MAX_SECONDS para que el guard
+    # dispare en la segunda iteración del loop (pre-fix corría las 2 iters
+    # del `range(1, _DEEP_MAX_ITERS)` = 2 loops + first pass = 3 calls).
+    def slow_judge(*args, **kwargs):
+        _time.sleep(0.15)
+        return (False, "keep going")
+
+    monkeypatch.setattr(rag, "retrieve", retrieve_mock)
+    monkeypatch.setattr(rag, "_judge_sufficiency", slow_judge)
+    monkeypatch.setattr(rag, "_DEEP_MAX_SECONDS", 0.1)
+
+    t0 = _time.perf_counter()
+    rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+    elapsed = _time.perf_counter() - t0
+
+    # Expected: first pass (1) + loop iter 1 (judge 150ms > timeout 100ms
+    # triggers the guard on iter 2) = 2 calls total, NOT 3 (= _DEEP_MAX_ITERS).
+    assert retrieve_mock.call_count < rag._DEEP_MAX_ITERS, (
+        f"timeout guard no disparó: {retrieve_mock.call_count} calls "
+        f"en {elapsed:.3f}s (esperado <{rag._DEEP_MAX_ITERS})"
+    )
+    # Sanity: el elapsed debe ser cercano al budget + 1 pase del judge,
+    # nunca 2 × 150ms + overhead = ~300ms+.
+    assert elapsed < 0.35, f"deep_retrieve tardó {elapsed:.3f}s — timeout no cortó bien"
+
+
+def test_deep_max_seconds_default_is_30():
+    """Default `_DEEP_MAX_SECONDS` = 30s tras el fix 2026-04-22.
+
+    Un default demasiado alto (ej: 120s) deja el bug latente; uno muy bajo
+    (ej: 5s) cortaría queries legítimas que necesitan deep retrieval en
+    hardware lento. 30s es el sweet spot: >P99 normal (~38s p99 prod), pero
+    <runaway range observado (60-200s).
+
+    Override vía `RAG_DEEP_MAX_SECONDS` env var para operadores que quieran
+    forzar más holgura en hardware con recursos abundantes.
+    """
+    # Reload no hace falta; lo leemos directo desde el módulo post-import.
+    assert rag._DEEP_MAX_SECONDS == 30.0, (
+        f"_DEEP_MAX_SECONDS default debe ser 30s (fue {rag._DEEP_MAX_SECONDS}). "
+        "Ver CLAUDE.md § deep_retrieve timeout guard."
+    )
+
+
+def test_deep_max_seconds_env_override(monkeypatch):
+    """RAG_DEEP_MAX_SECONDS sobreescribe el default."""
+    import importlib
+    monkeypatch.setenv("RAG_DEEP_MAX_SECONDS", "60")
+    reloaded = importlib.reload(rag)
+    try:
+        assert reloaded._DEEP_MAX_SECONDS == 60.0
+    finally:
+        monkeypatch.delenv("RAG_DEEP_MAX_SECONDS", raising=False)
+        importlib.reload(rag)

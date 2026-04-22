@@ -20,6 +20,45 @@ class _FakeResponse:
         self.message = _FakeMessage(content)
 
 
+# Frozen reference moment used across every datetime.now() call in this file.
+# Wednesday 2026-04-21 15:00:00 local — chosen to avoid midnight/weekend edge
+# cases while still exercising the "today window" logic. Changing this value
+# requires revisiting _set_mtime offsets in every test below (grep for
+# `_FROZEN_NOW` to find the coupling sites).
+_FROZEN_NOW = datetime(2026, 4, 21, 15, 0, 0)
+
+
+def _install_frozen_now(monkeypatch, frozen: datetime):
+    """Monkeypatchea `rag.datetime` con una subclase que fija `.now()` y
+    `.today()` a `frozen`. Todo lo demás (constructor, fromisoformat,
+    timedelta aritmética, strftime) queda heredado del `datetime` stdlib.
+    """
+    real_datetime = datetime
+
+    class _FrozenDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return frozen.replace(tzinfo=tz)
+            return frozen
+
+        @classmethod
+        def today(cls):
+            return frozen
+
+    monkeypatch.setattr(rag, "datetime", _FrozenDateTime)
+    return frozen
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """Pinea `rag.datetime.now()` a _FROZEN_NOW para eliminar flakies de
+    timing (midnight boundary, CI clock drift). No dependemos de
+    `freezegun` (no está en deps — monkeypatch de datetime subclass alcanza).
+    """
+    return _install_frozen_now(monkeypatch, _FROZEN_NOW)
+
+
 @pytest.fixture
 def fake_embed(monkeypatch):
     def _embed(texts):
@@ -28,7 +67,7 @@ def fake_embed(monkeypatch):
 
 
 @pytest.fixture
-def tmp_vault(tmp_path, monkeypatch, fake_embed):
+def tmp_vault(tmp_path, monkeypatch, fake_embed, frozen_now):
     vault = tmp_path / "vault"
     (vault / "00-Inbox").mkdir(parents=True)
     (vault / "05-Reviews").mkdir(parents=True)
@@ -72,7 +111,7 @@ NARRATIVE_STUB = (
 def test_today_evidence_empty_vault(tmp_vault):
     vault, _, tmp_path = tmp_vault
     ev = rag._collect_today_evidence(
-        datetime.now(), vault,
+        _FROZEN_NOW, vault,
         query_log=tmp_path / "q.jsonl",
         contradiction_log=tmp_path / "c.jsonl",
     )
@@ -87,7 +126,7 @@ def test_today_picks_up_modified_today(tmp_vault):
     vault, _, tmp_path = tmp_vault
     p = vault / "02-Areas" / "today.md"
     p.write_text("cuerpo de hoy")
-    now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=15, minute=0, second=0, microsecond=0)
     _set_mtime(p, now)
     ev = rag._collect_today_evidence(
         now + timedelta(minutes=5), vault,
@@ -102,10 +141,10 @@ def test_today_excludes_yesterday(tmp_vault):
     vault, _, tmp_path = tmp_vault
     p = vault / "02-Areas" / "yesterday.md"
     p.write_text("vieja de ayer")
-    yesterday = datetime.now().replace(hour=22, minute=0) - timedelta(days=1)
+    yesterday = _FROZEN_NOW.replace(hour=22, minute=0) - timedelta(days=1)
     _set_mtime(p, yesterday)
     ev = rag._collect_today_evidence(
-        datetime.now(), vault,
+        _FROZEN_NOW, vault,
         query_log=tmp_path / "q.jsonl",
         contradiction_log=tmp_path / "c.jsonl",
     )
@@ -117,7 +156,7 @@ def test_today_excludes_reviews_folder(tmp_vault):
     vault, _, tmp_path = tmp_vault
     p = vault / "05-Reviews" / "2026-04-15.md"
     p.write_text("morning brief")
-    now = datetime.now()
+    now = _FROZEN_NOW
     _set_mtime(p, now - timedelta(minutes=10))
     ev = rag._collect_today_evidence(
         now, vault,
@@ -132,7 +171,7 @@ def test_today_inbox_capture_routed_to_inbox_bucket(tmp_vault):
     vault, _, tmp_path = tmp_vault
     p = vault / "00-Inbox" / "cap.md"
     p.write_text("captura rápida")
-    now = datetime.now().replace(hour=10, minute=30, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=10, minute=30, second=0, microsecond=0)
     _set_mtime(p, now)
     ev = rag._collect_today_evidence(
         now + timedelta(minutes=5), vault,
@@ -151,7 +190,7 @@ def test_today_inbox_untagged_flag(tmp_vault):
     p1.write_text("sin tags")
     p2 = vault / "00-Inbox" / "tagged.md"
     p2.write_text("---\ntags:\n- area/health\n---\nbody")
-    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=12, minute=0, second=0, microsecond=0)
     _set_mtime(p1, now)
     _set_mtime(p2, now)
     ev = rag._collect_today_evidence(
@@ -170,7 +209,7 @@ def test_today_midnight_boundary(tmp_vault):
     p_today.write_text("justo después")
     p_yest = vault / "02-Areas" / "just-before.md"
     p_yest.write_text("justo antes")
-    now = datetime.now().replace(hour=0, minute=5, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=0, minute=5, second=0, microsecond=0)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     _set_mtime(p_today, today_start + timedelta(seconds=1))
     _set_mtime(p_yest, today_start - timedelta(seconds=1))
@@ -187,7 +226,7 @@ def test_today_midnight_boundary(tmp_vault):
 def test_today_low_conf_queries_today_only(tmp_vault):
     vault, _, tmp_path = tmp_vault
     ql = tmp_path / "q.jsonl"
-    now = datetime.now().replace(hour=14, minute=0, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=14, minute=0, second=0, microsecond=0)
     today_ts = now.replace(hour=10, minute=0).isoformat(timespec="seconds")
     yest_ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
     entries = [
@@ -210,7 +249,7 @@ def test_today_low_conf_queries_today_only(tmp_vault):
 def test_today_contradictions_today_only(tmp_vault):
     vault, _, tmp_path = tmp_vault
     contr = tmp_path / "c.jsonl"
-    now = datetime.now().replace(hour=16, minute=0, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=16, minute=0, second=0, microsecond=0)
     today_entry = {
         "ts": now.replace(hour=11, minute=0).isoformat(timespec="seconds"),
         "cmd": "contradict_index",
@@ -239,7 +278,7 @@ def test_today_todo_frontmatter_in_window(tmp_vault):
     vault, _, tmp_path = tmp_vault
     p = vault / "02-Areas" / "with-todo.md"
     p.write_text("---\ntodo:\n- algo\ndue: 2026-05-01\n---\nbody")
-    now = datetime.now().replace(hour=13, minute=0, second=0, microsecond=0)
+    now = _FROZEN_NOW.replace(hour=13, minute=0, second=0, microsecond=0)
     _set_mtime(p, now)
     ev = rag._collect_today_evidence(
         now + timedelta(minutes=1), vault,
@@ -276,7 +315,7 @@ def test_today_cli_dry_run_does_not_write(tmp_vault, monkeypatch):
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", tmp_path / "c.jsonl")
     p = vault / "02-Areas" / "activity.md"
     p.write_text("algo hoy")
-    _set_mtime(p, datetime.now() - timedelta(minutes=5))
+    _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
     monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))
@@ -299,7 +338,7 @@ def test_today_cli_writes_evening_suffix_and_frontmatter(tmp_vault, monkeypatch)
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", tmp_path / "c.jsonl")
     p = vault / "02-Areas" / "activity.md"
     p.write_text("algo hoy")
-    _set_mtime(p, datetime.now() - timedelta(minutes=5))
+    _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
     monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))
@@ -307,7 +346,7 @@ def test_today_cli_writes_evening_suffix_and_frontmatter(tmp_vault, monkeypatch)
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["today", "--plain"])
     assert result.exit_code == 0
-    date_label = datetime.now().strftime("%Y-%m-%d")
+    date_label = _FROZEN_NOW.strftime("%Y-%m-%d")
     expected = vault / "05-Reviews" / f"{date_label}-evening.md"
     assert expected.is_file(), result.output
     body = expected.read_text()
@@ -322,13 +361,13 @@ def test_today_cli_does_not_collide_with_morning_file(tmp_vault, monkeypatch):
     vault, _, tmp_path = tmp_vault
     monkeypatch.setattr(rag, "LOG_PATH", tmp_path / "q.jsonl")
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", tmp_path / "c.jsonl")
-    date_label = datetime.now().strftime("%Y-%m-%d")
+    date_label = _FROZEN_NOW.strftime("%Y-%m-%d")
     morning_file = vault / "05-Reviews" / f"{date_label}.md"
     morning_file.write_text("morning brief existente")
 
     p = vault / "02-Areas" / "a.md"
     p.write_text("contenido")
-    _set_mtime(p, datetime.now() - timedelta(minutes=5))
+    _set_mtime(p, _FROZEN_NOW - timedelta(minutes=5))
 
     monkeypatch.setattr(rag, "resolve_chat_model", lambda: "stub")
     monkeypatch.setattr(rag.ollama, "chat", _fake_chat(NARRATIVE_STUB))

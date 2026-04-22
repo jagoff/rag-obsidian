@@ -1028,6 +1028,13 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
     : '<span class="dot loading">●</span> cargando canales…';
   els.status.innerHTML = dot;
 
+  const slowTimer = setTimeout(() => {
+    if (inflight) {
+      els.status.innerHTML = '⏱ tardando más de lo normal — Ollama puede estar offline';
+      els.status.classList.add("status-slow");
+    }
+  }, 8000);
+
   try {
     const resp = await fetch(`/api/home?regenerate=${regenerate ? "true" : "false"}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1056,6 +1063,8 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
     els.error.innerHTML = `<div class="error">error: ${esc(err.message || String(err))}</div>`;
     els.status.innerHTML = '<span class="dot stale">●</span> error — reintentá';
   } finally {
+    clearTimeout(slowTimer);
+    els.status.classList.remove("status-slow");
     // Cache hit returns in ~300ms — faster than perception. Hold the
     // spinner + disabled state long enough that the click registers as
     // feedback. Slow regenerate paths already exceed this floor.

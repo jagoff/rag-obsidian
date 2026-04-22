@@ -539,6 +539,31 @@ def _warmup() -> None:
     _load_home_cache()
     _ensure_home_prewarmer()
     _ensure_chat_model_prewarmer()
+    _ensure_reranker_prewarmer()
+    _ensure_corpus_prewarmer()
+
+    # Record this daemon startup in rag_ambient so restart count is queryable
+    # via SQL instead of grepping web.log.
+    try:
+        import importlib.metadata as _imeta
+        _rag_ver: str | None = _imeta.version("obsidian-rag")
+    except Exception:
+        _rag_ver = None
+    try:
+        _startup_payload: dict = {
+            "pid": os.getpid(),
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        }
+        if _rag_ver:
+            _startup_payload["version"] = _rag_ver
+        with _ragvec_state_conn() as _sc:
+            _sql_append_event(_sc, "rag_ambient", {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "cmd": "serve.startup",
+                "payload_json": _startup_payload,
+            })
+    except Exception as _exc:
+        print(f"[warmup] startup event skipped: {_exc}", flush=True)
 
     # Memory-pressure watchdog — evita beachballs si el server + otras apps
     # saturan los 36 GB unified memory. Fires keep_alive=0 sobre el chat
@@ -2585,28 +2610,29 @@ _EVAL_BASELINE = {
 
 
 def _fetch_eval_trend(n: int = 10) -> dict | None:
-    """Tail the last `n` entries of eval.jsonl and pair them with the
-    hardcoded baseline. Silent-fail (returns None) if the log is missing —
-    the CLI writes it only after the first `rag eval` run.
+    """Tail the last `n` eval runs from rag_eval_runs and pair with baseline.
+    Returns None when the table is missing or empty (SQL-only since T10).
     """
-    if not EVAL_LOG_PATH.is_file():
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, extra_json FROM rag_eval_runs"
+                " ORDER BY ts DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+    except Exception:
+        return None
+    if not rows:
         return None
     history: list[dict] = []
-    try:
-        with EVAL_LOG_PATH.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    history.append(json.loads(line))
-                except Exception:
-                    continue
-    except OSError:
-        return None
-    if not history:
-        return None
-    history = history[-n:]
+    for row in reversed(rows):
+        entry: dict = {"ts": row[0]}
+        if row[1]:
+            try:
+                entry.update(json.loads(row[1]))
+            except Exception:
+                pass
+        history.append(entry)
     return {
         "latest": history[-1],
         "baseline": dict(_EVAL_BASELINE),
@@ -3176,6 +3202,64 @@ def _ensure_chat_model_prewarmer() -> None:
             time.sleep(_CHAT_PREWARM_INTERVAL)
 
     threading.Thread(target=loop, name="chat-model-prewarmer", daemon=True).start()
+
+
+_RERANKER_PREWARMER_STARTED = False
+
+
+def _ensure_reranker_prewarmer() -> None:
+    """Load the cross-encoder once in a background thread. Idempotent.
+
+    Fires unconditionally — covers launches without RAG_RERANKER_NEVER_UNLOAD=1
+    where _do_warmup skips the reranker. Eliminates the 9s cold-load hit on
+    the first retrieve after startup.
+    """
+    global _RERANKER_PREWARMER_STARTED
+    if _RERANKER_PREWARMER_STARTED:
+        return
+    _RERANKER_PREWARMER_STARTED = True
+
+    def _load() -> None:
+        try:
+            from rag import get_reranker as _get_rr
+            _get_rr()
+            print("[prewarm] reranker loaded", flush=True)
+        except Exception as exc:
+            print(f"[prewarm] reranker skipped: {exc}", flush=True)
+
+    threading.Thread(target=_load, name="reranker-prewarmer", daemon=True).start()
+
+
+_CORPUS_PREWARMER_STARTED = False
+
+
+def _ensure_corpus_prewarmer() -> None:
+    """Warm the BM25 corpus cache in a background thread. Idempotent.
+
+    _load_corpus is O(1) on warm re-runs (cached), so safe to call even if
+    _do_warmup already triggered it for the same vault.
+    """
+    global _CORPUS_PREWARMER_STARTED
+    if _CORPUS_PREWARMER_STARTED:
+        return
+    _CORPUS_PREWARMER_STARTED = True
+
+    def _load() -> None:
+        try:
+            from rag import get_db_for
+            for _name, path in resolve_vault_paths(None):
+                try:
+                    col = get_db_for(path)
+                    if col.count():
+                        _load_corpus(col)
+                        print(f"[prewarm] corpus warm for {path}", flush=True)
+                except Exception:
+                    pass
+                break
+        except Exception as exc:
+            print(f"[prewarm] corpus skipped: {exc}", flush=True)
+
+    threading.Thread(target=_load, name="corpus-prewarmer", daemon=True).start()
 
 
 # ── Response cache ──────────────────────────────────────────────────────
@@ -6429,6 +6513,72 @@ async def system_cpu_stream() -> StreamingResponse:
             "Connection": "keep-alive",
         },
     )
+
+
+@app.get("/api/system-metrics")
+def system_metrics_api(hours: int = 24) -> dict:
+    """Last `hours` of rows from rag_cpu_metrics + rag_memory_metrics (default 24h).
+
+    Each row has by_category already parsed from JSON.
+    Returns empty lists when the tables are missing or the window is empty.
+    """
+    hours = max(1, min(hours, 168))
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    cpu_rows: list[dict] = []
+    mem_rows: list[dict] = []
+    try:
+        with _ragvec_state_conn() as conn:
+            try:
+                for r in conn.execute(
+                    "SELECT ts, total_pct, ncores, interval_s, by_category_json, top_json"
+                    " FROM rag_cpu_metrics WHERE ts >= ? ORDER BY ts ASC",
+                    (cutoff,),
+                ).fetchall():
+                    row: dict = {
+                        "ts": r[0], "total_pct": r[1],
+                        "ncores": r[2], "interval_s": r[3],
+                    }
+                    if r[4]:
+                        try:
+                            row["by_category"] = json.loads(r[4])
+                        except Exception:
+                            pass
+                    if r[5]:
+                        try:
+                            row["top"] = json.loads(r[5])
+                        except Exception:
+                            pass
+                    cpu_rows.append(row)
+            except Exception:
+                pass
+            try:
+                for r in conn.execute(
+                    "SELECT ts, total_mb, by_category_json, top_json, vm_json"
+                    " FROM rag_memory_metrics WHERE ts >= ? ORDER BY ts ASC",
+                    (cutoff,),
+                ).fetchall():
+                    row = {"ts": r[0], "total_mb": r[1]}
+                    if r[2]:
+                        try:
+                            row["by_category"] = json.loads(r[2])
+                        except Exception:
+                            pass
+                    if r[3]:
+                        try:
+                            row["top"] = json.loads(r[3])
+                        except Exception:
+                            pass
+                    if r[4]:
+                        try:
+                            row["vm"] = json.loads(r[4])
+                        except Exception:
+                            pass
+                    mem_rows.append(row)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return {"hours": hours, "cpu": cpu_rows, "memory": mem_rows}
 
 
 if __name__ == "__main__":

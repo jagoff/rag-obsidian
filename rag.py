@@ -50,6 +50,7 @@ import traceback
 import unicodedata
 import uuid
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -1994,8 +1995,12 @@ console = Console()
 
 CONTEXT_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/context_summaries.json"
 _CONTEXT_MIN_BODY = 300  # chars — skip summary for notes shorter than this
+# In-memory LRU cap. Long-running web daemon + large vaults can grow the
+# dict without bound (1 entry per unique chunk hash). LRU keeps memory
+# bounded while preserving the working set. Disk persistence is unchanged.
+_CONTEXT_CACHE_MAX = int(os.environ.get("RAG_CONTEXT_CACHE_MAX", "5000"))
 
-_context_cache: dict[str, str] | None = None
+_context_cache: "OrderedDict[str, str] | None" = None
 _context_cache_dirty = False
 # Serialises initialisation, mutation, and json.dumps over `_context_cache`.
 # Web chat + CLI index + watch threads all hit these helpers concurrently:
@@ -2014,12 +2019,12 @@ def _load_context_cache() -> dict[str, str]:
             return _context_cache
         if CONTEXT_CACHE_PATH.is_file():
             try:
-                _context_cache = json.loads(CONTEXT_CACHE_PATH.read_text())
+                _context_cache = OrderedDict(json.loads(CONTEXT_CACHE_PATH.read_text()))
             except Exception as exc:
                 _silent_log("context_cache_load", exc)
-                _context_cache = {}
+                _context_cache = OrderedDict()
         else:
-            _context_cache = {}
+            _context_cache = OrderedDict()
         return _context_cache
 
 
@@ -2178,6 +2183,7 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
     # (or a pruning pass) mutating the dict between our `in` check and lookup.
     with _context_cache_lock:
         if file_hash in cache:
+            cache.move_to_end(file_hash)  # LRU: mark as recently used
             return cache[file_hash]
     if len(text) < _CONTEXT_MIN_BODY:
         return ""
@@ -2186,6 +2192,9 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
     summary = _generate_context_summary(text, title, folder)
     with _context_cache_lock:
         cache[file_hash] = summary
+        cache.move_to_end(file_hash)
+        while len(cache) > _CONTEXT_CACHE_MAX:
+            cache.popitem(last=False)  # evict least-recently-used
         _context_cache_dirty = True
     return summary
 
@@ -2207,8 +2216,10 @@ SYNTHETIC_Q_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/synthetic_ques
 _SYNTHETIC_Q_MIN_BODY = 300  # chars — same threshold as context summary
 _SYNTHETIC_Q_CAP = 4         # hard upper bound on questions per note
 _SYNTHETIC_Q_MAX_CHARS = 120 # per-question char cap
+# Same LRU cap rationale as _CONTEXT_CACHE_MAX.
+_SYNTHETIC_Q_CACHE_MAX = int(os.environ.get("RAG_SYNTHETIC_Q_CACHE_MAX", "5000"))
 
-_synthetic_q_cache: dict[str, list[str]] | None = None
+_synthetic_q_cache: "OrderedDict[str, list[str]] | None" = None
 _synthetic_q_cache_dirty = False
 # Same rationale as `_context_cache_lock` — serialises lazy init, mutation,
 # and json.dumps against concurrent index/web/chat callers.
@@ -2225,17 +2236,17 @@ def _load_synthetic_q_cache() -> dict[str, list[str]]:
             try:
                 data = json.loads(SYNTHETIC_Q_CACHE_PATH.read_text())
                 if isinstance(data, dict):
-                    _synthetic_q_cache = {
-                        k: [str(q) for q in v if isinstance(q, str)]
+                    _synthetic_q_cache = OrderedDict(
+                        (k, [str(q) for q in v if isinstance(q, str)])
                         for k, v in data.items() if isinstance(v, list)
-                    }
+                    )
                 else:
-                    _synthetic_q_cache = {}
+                    _synthetic_q_cache = OrderedDict()
             except Exception as exc:
                 _silent_log("synthetic_q_cache_load", exc)
-                _synthetic_q_cache = {}
+                _synthetic_q_cache = OrderedDict()
         else:
-            _synthetic_q_cache = {}
+            _synthetic_q_cache = OrderedDict()
         return _synthetic_q_cache
 
 
@@ -2329,6 +2340,7 @@ def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) 
     # a concurrent dumps can't race our mutation.
     with _synthetic_q_cache_lock:
         if file_hash in cache:
+            cache.move_to_end(file_hash)  # LRU: mark as recently used
             return cache[file_hash]
     if len(text) < _SYNTHETIC_Q_MIN_BODY:
         return []
@@ -2341,6 +2353,9 @@ def get_synthetic_questions(text: str, file_hash: str, title: str, folder: str) 
         return []
     with _synthetic_q_cache_lock:
         cache[file_hash] = result
+        cache.move_to_end(file_hash)
+        while len(cache) > _SYNTHETIC_Q_CACHE_MAX:
+            cache.popitem(last=False)  # evict least-recently-used
         _synthetic_q_cache_dirty = True
     return result
 
@@ -7566,7 +7581,7 @@ def semantic_chunks(
 # queries — cachear ahorra ~50-150ms por hit dentro del proceso. Capacidad
 # calibrada: 512 strings × 1024 dims × 4B ≈ 2MB, ruido en memoria.
 _EMBED_CACHE_MAX = 512
-_embed_cache: "dict[str, list[float]]" = {}
+_embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 _embed_cache_lock = threading.Lock()
 
 
@@ -7574,8 +7589,16 @@ def embed(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     # Fast path: todos los textos ya cacheados.
+    # Batch read under one lock to prevent inter-item eviction races between
+    # concurrent request threads. move_to_end on each hit keeps LRU order
+    # accurate so hot embeddings are never wrongly evicted mid-batch.
     with _embed_cache_lock:
-        cached = [_embed_cache.get(t) for t in texts]
+        cached = []
+        for t in texts:
+            val = _embed_cache.get(t)
+            if val is not None:
+                _embed_cache.move_to_end(t)
+            cached.append(val)
     missing_idx = [i for i, v in enumerate(cached) if v is None]
     if not missing_idx:
         return cached  # type: ignore[return-value]
@@ -7603,13 +7626,10 @@ def embed(texts: list[str]) -> list[list[float]]:
     fresh = resp.embeddings
     with _embed_cache_lock:
         for t, v in zip(missing_texts, fresh):
-            if len(_embed_cache) >= _EMBED_CACHE_MAX:
-                # Drop oldest (dict preserva orden de inserción en 3.7+).
-                try:
-                    _embed_cache.pop(next(iter(_embed_cache)))
-                except StopIteration:
-                    pass
             _embed_cache[t] = v
+            _embed_cache.move_to_end(t)  # new key → MRU end
+            while len(_embed_cache) > _EMBED_CACHE_MAX:
+                _embed_cache.popitem(last=False)  # evict least-recently-used
     for idx, v in zip(missing_idx, fresh):
         cached[idx] = v
     return cached  # type: ignore[return-value]
@@ -9153,7 +9173,7 @@ def _extract_proper_nouns(text: str) -> set[str]:
 # Cache LRU de paráfrasis por query. Temperature=0 + seed=42 → determinístico,
 # cachear es gratis. Las queries se repiten bastante entre chat turns y bots.
 _EXPAND_CACHE_MAX = 256
-_expand_cache: "dict[str, list[str]]" = {}
+_expand_cache: "OrderedDict[str, list[str]]" = OrderedDict()
 _expand_cache_lock = threading.Lock()
 
 # Perf gate — queries con MENOS de este nº de tokens se saltan la expansión
@@ -9198,6 +9218,8 @@ def expand_queries(question: str) -> list[str]:
         return [question]
     with _expand_cache_lock:
         hit = _expand_cache.get(question)
+        if hit is not None:
+            _expand_cache.move_to_end(question)  # LRU: mark as recently used
     if hit is not None:
         return list(hit)
     prompt = (
@@ -9243,12 +9265,10 @@ def expand_queries(question: str) -> list[str]:
             break
     result = [question] + kept
     with _expand_cache_lock:
-        if len(_expand_cache) >= _EXPAND_CACHE_MAX:
-            try:
-                _expand_cache.pop(next(iter(_expand_cache)))
-            except StopIteration:
-                pass
         _expand_cache[question] = result
+        _expand_cache.move_to_end(question)
+        while len(_expand_cache) > _EXPAND_CACHE_MAX:
+            _expand_cache.popitem(last=False)  # evict least-recently-used
     return list(result)
 
 
@@ -16073,8 +16093,35 @@ def watch(debounce: float, all_vaults: bool):
     for name, vpath in vaults:
         try:
             col = get_db_for(vpath)
+        except PermissionError:
+            console.print(
+                f"[red]✗ {name}: sin permisos para abrir la DB[/red]\n"
+                f"[dim]Revisá permisos: [cyan]ls -la {vpath}[/cyan][/dim]"
+            )
+            continue
         except Exception as e:
-            console.print(f"[red]vault {name}: no se pudo abrir colección[/red] ({e})")
+            _err = str(e).lower()
+            if "ollama" in _err or "connect" in _err or "111" in _err:
+                console.print(
+                    f"[red]✗ {name}: Ollama no responde[/red]\n"
+                    f"[dim]Arrancá el daemon: [cyan]ollama serve[/cyan][/dim]"
+                )
+            elif "locked" in _err or "corrupt" in _err or "malformed" in _err or "database" in _err:
+                console.print(
+                    f"[red]✗ {name}: DB posiblemente corrupta o bloqueada[/red]\n"
+                    f"[dim]Reset: [cyan]rag index --reset[/cyan] "
+                    f"(rebuild, lleva minutos)[/dim]"
+                )
+            elif "no such file" in _err or "not found" in _err:
+                console.print(
+                    f"[red]✗ {name}: vault path no existe[/red]\n"
+                    f"[dim]Revisá: [cyan]rag vault list[/cyan][/dim]"
+                )
+            else:
+                console.print(
+                    f"[red]✗ {name}: no se pudo abrir colección — {e}[/red]\n"
+                    f"[dim]Si persiste: [cyan]rag index --reset[/cyan][/dim]"
+                )
             continue
         vault_state.append({
             "name": name,
@@ -28280,13 +28327,15 @@ def find_dead_notes(
               help="Cosine mínimo para agrupar (0.0–1.0)")
 @click.option("--min-cluster", default=3, show_default=True,
               help="Tamaño mínimo de cluster para promover")
-@click.option("--dry-run", is_flag=True,
-              help="Mostrar qué se haría, sin tocar el vault")
+@click.option("--apply", is_flag=True,
+              help="Escribir cambios al vault (default: dry-run)")
 @click.option("--json", "as_json", is_flag=True,
               help="Emitir summary como JSON (para servicios / scripts)")
 def consolidate(window_days: int, threshold: float, min_cluster: int,
-                dry_run: bool, as_json: bool):
+                apply: bool, as_json: bool):
     """Agrupar conversaciones relacionadas y promover a PARA (Phase 2).
+
+    Por default es dry-run — pasá --apply para escribir al vault.
 
     Barre `00-Inbox/conversations/` buscando clusters semánticamente similares
     (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
@@ -28297,7 +28346,9 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
     `04-Archive/conversations/YYYY-MM/` (excluido del índice).
 
     Corre semanalmente via launchd (Lunes 06:00) — instalable con `rag setup`.
+    El plist generado incluye --apply; re-corré `rag setup` si actualizaste.
     """
+    dry_run = not apply  # invertimos: --apply activa, default es dry-run
     from scripts.consolidate_conversations import run as _run
     summary = _run(
         window_days=window_days,
@@ -29669,6 +29720,7 @@ def _consolidate_plist(rag_bin: str) -> str:
   <array>
     <string>{rag_bin}</string>
     <string>consolidate</string>
+    <string>--apply</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -31276,6 +31328,11 @@ def serve(host: str, port: int):
                     "t_retrieve": round(t_retrieve_tasks, 3),
                     "t_gen": round(t_gen, 3),
                     "answer_len": len(answer),
+                    "timing": _round_timing_ms({
+                        "total_ms": (t_retrieve_tasks + t_gen) * 1000,
+                        "retrieve_ms": t_retrieve_tasks * 1000,
+                        "gen_ms": t_gen * 1000,
+                    }),
                 })
             except Exception:
                 pass
@@ -31516,6 +31573,7 @@ def serve(host: str, port: int):
                 "cmd": "serve.chat", "q": message[:200],
                 "session": sid, "t_gen": round(t_gen, 2),
                 "answered": True,
+                "timing": _round_timing_ms({"total_ms": t_gen * 1000}),
             })
         except Exception:
             pass
@@ -33882,6 +33940,7 @@ def pendientes(days: int, plain: bool):
     """
     col = get_db()
     now = datetime.now()
+    t0 = time.perf_counter()
     ev = _pendientes_collect(col, now, days=days)
     urgent = _pendientes_urgent(ev, now)
 
@@ -33899,6 +33958,7 @@ def pendientes(days: int, plain: bool):
             "low_conf": len(ev.get("low_conf") or []),
             "calendar": len(ev.get("calendar") or []),
         },
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
 
     if plain:

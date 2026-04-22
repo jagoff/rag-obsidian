@@ -106,10 +106,47 @@ BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 # citations, skip the repair round-trip entirely. The heuristic: 4+ invented
 # paths means the response is likely hallucinated throughout (not a single
 # typo), and a one-shot repair call trying to rewrite under the same context
-# is unlikely to produce a clean answer — you just pay 5-8s of non-streaming
-# LLM latency for nothing. Below this threshold (≤3) the repair is worth it.
+# is unlikely to produce a clean answer — you just pay 1-2s of non-streaming
+# LLM latency for nothing. Below this threshold (≤2) the repair is worth it.
+# Default lowered from 3 → 2 on 2026-04-22 Game-changer #3: empirical pattern
+# is "1 typo repair-works, 2 bad still sometimes fixable, 3+ rarely salvages".
 # Override via env `RAG_CITATION_REPAIR_MAX_BAD` (0 disables repair entirely).
-_CITATION_REPAIR_MAX_BAD = int(os.environ.get("RAG_CITATION_REPAIR_MAX_BAD", "3"))
+_CITATION_REPAIR_MAX_BAD = int(os.environ.get("RAG_CITATION_REPAIR_MAX_BAD", "2"))
+
+
+# Post-processing model (citation-repair + critique). Both tasks are structured
+# rewrites under a fixed-paths constraint — they don't need the large chat
+# model. Empirical latency on a typical 200-token rewrite:
+#   qwen2.5:7b (default chat)  → ~5-8s
+#   qwen2.5:3b (helper model)  → ~1-2s
+# Helper model is already resident (used by expand_queries, reformulate, etc.)
+# so no extra load pressure. Override via `RAG_POSTPROCESS_MODEL`:
+#   unset / "helper"   → HELPER_MODEL (qwen2.5:3b), default
+#   "legacy" / "chat"  → resolve_chat_model() (pre-2026-04-22 behavior)
+#   "<model-name>"     → explicit ollama tag, advanced override
+_POSTPROCESS_MODEL_OVERRIDE = os.environ.get("RAG_POSTPROCESS_MODEL", "").strip().lower()
+
+
+def _postprocess_model() -> str:
+    """Resolve which model to use for citation-repair + critique.
+
+    Returns HELPER_MODEL (qwen2.5:3b) by default — see _POSTPROCESS_MODEL_OVERRIDE.
+    """
+    if _POSTPROCESS_MODEL_OVERRIDE in ("legacy", "chat"):
+        return resolve_chat_model()
+    if _POSTPROCESS_MODEL_OVERRIDE and _POSTPROCESS_MODEL_OVERRIDE not in ("helper", "small"):
+        return _POSTPROCESS_MODEL_OVERRIDE
+    return HELPER_MODEL
+
+
+# Options for the repair/critique call. Must match num_ctx of other callers
+# of the same model to avoid KV-cache re-init (see comment on CHAT_OPTIONS
+# re. the 4400ms cold-reinit penalty when num_ctx drifts). Repair prompt
+# includes the full retrieval context (~1500 tok P99) so num_ctx=4096 is
+# required — critique needs the same for source-verification.
+# Built lazily so tests that mutate CHAT_OPTIONS don't leak into repair/critique.
+def _postprocess_options() -> dict:
+    return {**CHAT_OPTIONS}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -16716,12 +16753,16 @@ def query(
                 )},
             ]
             try:
+                # GC#3 2026-04-22: qwen2.5:3b (helper model) replaces resolve_chat_model()
+                # — repair is a structured rewrite under a fixed-paths constraint, the
+                # 7b chat model is overkill. Measured: 5-8s → 1-2s on typical 200-tok
+                # responses. Override via RAG_POSTPROCESS_MODEL (see _postprocess_model).
                 _repair_resp = _chat_capped_client().chat(
-                    model=resolve_chat_model(),
+                    model=_postprocess_model(),
                     messages=_repair_messages,
-                    options=CHAT_OPTIONS,
+                    options=_postprocess_options(),
                     stream=False,
-                    keep_alive=chat_keep_alive(),
+                    keep_alive=chat_keep_alive(_postprocess_model()),
                 )
                 _repair_full = (_repair_resp.message.content or "").strip()
                 if _repair_full:
@@ -16765,15 +16806,17 @@ def query(
         )
         def _run_critique_call() -> str:
             try:
+                # GC#3 2026-04-22: critique also uses the helper model (qwen2.5:3b).
+                # Same rationale as repair — structured rewrite, small-model sufficient.
                 _cr = _chat_capped_client().chat(
-                    model=resolve_chat_model(),
+                    model=_postprocess_model(),
                     messages=[
                         {"role": "system", "content": _critique_system},
                         {"role": "user", "content": _critique_user},
                     ],
-                    options=CHAT_OPTIONS,
+                    options=_postprocess_options(),
                     stream=False,
-                    keep_alive=chat_keep_alive(),
+                    keep_alive=chat_keep_alive(_postprocess_model()),
                 )
                 return (_cr.message.content or "").strip()
             except Exception:
@@ -17894,12 +17937,13 @@ def chat(
                     )},
                 ]
                 try:
+                    # GC#3 2026-04-22: helper model for chat repair too (see query path).
                     _rresp = _chat_capped_client().chat(
-                        model=resolve_chat_model(),
+                        model=_postprocess_model(),
                         messages=_chat_repair_messages,
-                        options=_CLI_CHAT_OPTIONS,
+                        options=_postprocess_options(),
                         stream=False,
-                        keep_alive=chat_keep_alive(),
+                        keep_alive=chat_keep_alive(_postprocess_model()),
                     )
                     _rfull = (_rresp.message.content or "").strip()
                     if _rfull:
@@ -17931,15 +17975,16 @@ def chat(
             )
             with console.status("[dim][critique…][/dim]", spinner="dots"):
                 try:
+                    # GC#3 2026-04-22: helper model for chat critique (see query path).
                     _cq_resp = _chat_capped_client().chat(
-                        model=resolve_chat_model(),
+                        model=_postprocess_model(),
                         messages=[
                             {"role": "system", "content": _cq_system},
                             {"role": "user", "content": _cq_user},
                         ],
-                        options=_CLI_CHAT_OPTIONS,
+                        options=_postprocess_options(),
                         stream=False,
-                        keep_alive=chat_keep_alive(),
+                        keep_alive=chat_keep_alive(_postprocess_model()),
                     )
                     _cq_full = (_cq_resp.message.content or "").strip()
                 except Exception:

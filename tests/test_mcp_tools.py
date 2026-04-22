@@ -261,3 +261,205 @@ def test_load_rag_is_idempotent_and_thread_safe():
         if original is not None:
             sys.modules["rag"] = original
         ms._rag = None
+
+
+# ── Write tools (2026-04-22) ─────────────────────────────────────────────────
+# New tools that have filesystem / Apple-DB side effects. Validation hooks
+# tested here with a fake rag module — full E2E (real capture_note writing
+# to a real vault) is covered in test_capture_cmd.py / test_reminders_api.py.
+
+
+def test_rag_capture_empty_text_returns_error(fake_rag):
+    out = mcp_server.rag_capture("")
+    assert out["created"] is False
+    assert "empty" in out["error"].lower()
+
+
+def test_rag_capture_whitespace_only_text_returns_error(fake_rag):
+    out = mcp_server.rag_capture("   \n\t  ")
+    assert out["created"] is False
+
+
+def test_rag_capture_delegates_to_rag_capture_note(fake_rag, tmp_path):
+    """Happy path: rag_capture calls rag.capture_note, auto-indexes, and
+    returns the vault-relative path."""
+    vault = fake_rag.VAULT_PATH
+    written = vault / "00-Inbox" / "2026-04-22-1234-test.md"
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_text("dummy", encoding="utf-8")
+    fake_rag.capture_note.return_value = written
+
+    out = mcp_server.rag_capture("una idea nueva",
+                                 tags=["mcp"], source="test")
+    assert out["created"] is True
+    assert out["path"] == "00-Inbox/2026-04-22-1234-test.md"
+    # capture_note received the text + tags + source.
+    fake_rag.capture_note.assert_called_once()
+    call_kwargs = fake_rag.capture_note.call_args.kwargs
+    assert call_kwargs["tags"] == ["mcp"]
+    assert call_kwargs["source"] == "test"
+    # Auto-index fires after write.
+    fake_rag._index_single_file.assert_called_once()
+
+
+def test_rag_capture_propagates_value_error(fake_rag):
+    """ValueError from capture_note surfaces as {created:false, error:...}"""
+    fake_rag.capture_note.side_effect = ValueError("disk full or whatever")
+    out = mcp_server.rag_capture("text")
+    assert out["created"] is False
+    assert "disk full" in out["error"]
+
+
+def test_rag_save_note_empty_text_or_title_returns_error(fake_rag):
+    assert mcp_server.rag_save_note("", "title")["created"] is False
+    assert mcp_server.rag_save_note("body", "")["created"] is False
+    assert mcp_server.rag_save_note("body", "   ")["created"] is False
+
+
+def test_rag_save_note_rejects_absolute_folder(fake_rag):
+    out = mcp_server.rag_save_note(
+        "body", "title", folder="/etc/passwd",
+    )
+    assert out["created"] is False
+    assert "invalid folder" in out["error"] or "vault root" in out["error"]
+
+
+def test_rag_save_note_rejects_traversal(fake_rag):
+    out = mcp_server.rag_save_note(
+        "body", "title", folder="../../escape",
+    )
+    assert out["created"] is False
+
+
+def test_rag_save_note_writes_and_indexes(fake_rag, tmp_path, monkeypatch):
+    """Happy path: writes a well-formed note + auto-indexes."""
+    # Use a real _slug (the fake_rag fixture mocks everything, including _slug).
+    import rag as real_rag
+    fake_rag._slug = real_rag._slug
+
+    out = mcp_server.rag_save_note(
+        "body del contenido", "Mi Nota", folder="02-Areas/Test",
+        tags=["experiment", "mcp"],
+    )
+    assert out["created"] is True
+    assert out["path"].startswith("02-Areas/Test/")
+    assert out["path"].endswith(".md")
+    written = fake_rag.VAULT_PATH / out["path"]
+    assert written.is_file()
+    body = written.read_text(encoding="utf-8")
+    assert "# Mi Nota" in body
+    assert "body del contenido" in body
+    assert "type: note" in body
+    # Tags are in frontmatter.
+    assert "  - experiment" in body
+    assert "  - mcp" in body
+    # Auto-index fires.
+    fake_rag._index_single_file.assert_called_once()
+
+
+def test_rag_save_note_collision_suffix(fake_rag, tmp_path):
+    """Second save with same title gets -2 suffix."""
+    import rag as real_rag
+    fake_rag._slug = real_rag._slug
+
+    out1 = mcp_server.rag_save_note("a", "Same Title", folder="00-Inbox")
+    out2 = mcp_server.rag_save_note("b", "Same Title", folder="00-Inbox")
+    assert out1["created"] is True
+    assert out2["created"] is True
+    assert out1["path"] != out2["path"]
+    assert out2["path"].endswith("-2.md")
+
+
+def test_rag_create_reminder_forwards_args_and_parses_json(fake_rag):
+    """rag_create_reminder is a thin wrapper: it passes kwargs to
+    propose_reminder and parses the JSON response to a dict."""
+    fake_rag.propose_reminder.return_value = (
+        '{"kind":"reminder","created":true,"reminder_id":"R-123",'
+        '"fields":{"title":"comprar café","due_iso":"2026-04-23T10:00:00"}}'
+    )
+    out = mcp_server.rag_create_reminder(
+        title="comprar café", when="mañana 10am",
+        priority=5, notes="sin filtro",
+    )
+    assert out["created"] is True
+    assert out["reminder_id"] == "R-123"
+    assert out["kind"] == "reminder"
+
+    fake_rag.propose_reminder.assert_called_once()
+    call_kwargs = fake_rag.propose_reminder.call_args.kwargs
+    assert call_kwargs["title"] == "comprar café"
+    assert call_kwargs["when"] == "mañana 10am"
+    # The MCP arg is `reminder_list` but propose_reminder takes `list`.
+    assert "list" in call_kwargs
+    assert call_kwargs["priority"] == 5
+    assert call_kwargs["notes"] == "sin filtro"
+
+
+def test_rag_create_reminder_handles_ambiguous_date(fake_rag):
+    """needs_clarification passthrough."""
+    fake_rag.propose_reminder.return_value = (
+        '{"kind":"reminder","needs_clarification":true,'
+        '"proposal_id":"prop-abc","fields":{"title":"X","due_iso":null}}'
+    )
+    out = mcp_server.rag_create_reminder(title="X", when="algún día")
+    assert out.get("needs_clarification") is True
+    assert out["proposal_id"] == "prop-abc"
+    # created is NOT present in ambiguous case.
+    assert "created" not in out or out["created"] is False
+
+
+def test_rag_create_reminder_malformed_json_still_returns_dict(fake_rag):
+    """If propose_reminder ever returns non-JSON, we don't crash."""
+    fake_rag.propose_reminder.return_value = "not json at all {"
+    out = mcp_server.rag_create_reminder(title="X")
+    assert out["created"] is False
+    assert "json" in out["error"].lower()
+    assert out["raw"] == "not json at all {"
+
+
+def test_rag_create_event_forwards_args(fake_rag):
+    fake_rag.propose_calendar_event.return_value = (
+        '{"kind":"event","created":true,"event_uid":"E-777",'
+        '"fields":{"title":"reunión","start_iso":"2026-04-24T10:00:00"}}'
+    )
+    out = mcp_server.rag_create_event(
+        title="reunión", start="jueves 10am",
+        location="Oficina", all_day=False,
+    )
+    assert out["created"] is True
+    assert out["event_uid"] == "E-777"
+    fake_rag.propose_calendar_event.assert_called_once()
+    call_kwargs = fake_rag.propose_calendar_event.call_args.kwargs
+    assert call_kwargs["title"] == "reunión"
+    assert call_kwargs["start"] == "jueves 10am"
+    assert call_kwargs["location"] == "Oficina"
+    assert call_kwargs["all_day"] is False
+
+
+def test_rag_followup_delegates_and_filters(fake_rag):
+    """rag_followup calls find_followup_loops + optionally filters by status
+    + honors limit."""
+    fake_rag.find_followup_loops.return_value = [
+        {"status": "stale", "age_days": 40, "kind": "todo",
+         "source_note": "A.md", "loop_text": "llamar a Juan"},
+        {"status": "activo", "age_days": 10, "kind": "checkbox",
+         "source_note": "B.md", "loop_text": "[ ] revisar contrato"},
+        {"status": "resolved", "age_days": 5, "kind": "inline",
+         "source_note": "C.md", "loop_text": "tenía que cerrar X"},
+    ]
+    # No filter, default limit → all 3.
+    all_loops = mcp_server.rag_followup(days=30)
+    assert len(all_loops) == 3
+
+    stale_only = mcp_server.rag_followup(days=30, status="stale")
+    assert len(stale_only) == 1
+    assert stale_only[0]["status"] == "stale"
+
+    # Limit respected.
+    limited = mcp_server.rag_followup(days=30, limit=2)
+    assert len(limited) == 2
+
+
+def test_rag_followup_empty_list_is_ok(fake_rag):
+    fake_rag.find_followup_loops.return_value = []
+    assert mcp_server.rag_followup(days=30) == []

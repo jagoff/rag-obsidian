@@ -1,11 +1,21 @@
 """MCP server exposing the Obsidian RAG as tools for Claude Code.
 
 Runs over stdio. Registered in `~/.claude.json` or Claude Code settings.
-Tools:
+
+Read-only tools (always safe):
   - rag_query:      retrieve top-k parent-expanded chunks for a question
   - rag_read_note:  read a full note from the vault by relative path
   - rag_list_notes: list notes filtered by folder and/or tag
+  - rag_links:      find URLs by semantic context (no LLM paraphrasing)
   - rag_stats:      index metadata (chunk count, models, collection)
+  - rag_followup:   list open loops (todos sin cerrar) in the vault
+
+Write tools (create files / Apple DB rows — use when the user asks to
+"capture/save/add/create" something, not for read queries):
+  - rag_capture:          write a quick note to 00-Inbox/ (idempotent name)
+  - rag_save_note:        write a note with explicit title/folder (generic)
+  - rag_create_reminder:  add an Apple Reminder (auto-creates if date is clear)
+  - rag_create_event:     add an Apple Calendar event (auto-creates if date clear)
 """
 
 from __future__ import annotations
@@ -273,6 +283,317 @@ def rag_stats() -> dict:
         "reranker": rag.RERANKER_MODEL,
         "vault_path": str(rag.VAULT_PATH),
     }
+
+
+# ── Write-side tools (2026-04-22) ────────────────────────────────────────────
+# These are distinct from the read tools above because they have side effects
+# on the filesystem (capture / save_note) or Apple data stores (Reminders /
+# Calendar). The idle-killer semantics still apply (30m hot, 2h cold) — a
+# capture/save loads `rag` and auto-indexes the new note for retrievability.
+#
+# Design notes:
+#   - No confirmation UI: the MCP host (Claude Code) is the one deciding to
+#     call these, and it already carries the user's instruction. We don't
+#     add a second prompt.
+#   - `rag_capture` and `rag_save_note` are *not* equivalent: capture is
+#     opinionated (always 00-Inbox, auto-stamped filename, frontmatter tags
+#     include "capture"), save_note is flexible (user picks folder + title).
+#   - Reminders + Calendar wrap `propose_reminder` / `propose_calendar_event`
+#     which return a JSON string with either `created:true` or
+#     `needs_clarification:true`. We return the parsed dict — the caller
+#     decides what to do (ask the user for a clearer date, or report
+#     success).
+
+
+@mcp.tool()
+def rag_capture(
+    text: str,
+    tags: list[str] | None = None,
+    source: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """Write a quick note to the Obsidian vault's 00-Inbox/ folder.
+
+    This is the MCP equivalent of `rag capture "text"` — use it when the
+    user says "capturá esto", "anotá esto", "guardalo en el inbox", or
+    otherwise wants an idea landed in the vault without fussing over
+    folder/title. Filename is auto-stamped (YYYY-MM-DD-HHMM-<slug>.md)
+    with collision suffixing (-2, -3, …).
+
+    After writing, the note is immediately indexed so subsequent
+    `rag_query` calls can retrieve it without waiting for `rag watch`.
+
+    Args:
+        text: Body of the note (non-empty). Markdown is preserved.
+        tags: Optional tag list (no '#' prefix). "capture" is added
+            automatically.
+        source: Optional source tag (e.g. "voice", "chat", "mcp") — ends
+            up in the frontmatter for later filtering.
+        title: Optional explicit title. When None, the first non-empty
+            line of the text is slugified.
+
+    Returns:
+        {"path": "00-Inbox/YYYY-MM-DD-HHMM-<slug>.md", "created": true}
+        On empty text: {"created": false, "error": "<reason>"}.
+    """
+    _touch()
+    rag = _load_rag()
+    if not text or not text.strip():
+        return {"created": False, "error": "empty text"}
+    try:
+        path = rag.capture_note(
+            text, tags=list(tags) if tags else None,
+            source=source, title=title,
+        )
+    except ValueError as exc:
+        return {"created": False, "error": str(exc)}
+    # Index immediately so the note is retrievable right away.
+    try:
+        rag._index_single_file(rag.get_db(), path, skip_contradict=True)
+    except Exception:
+        # Non-fatal — `rag watch` or next `rag index` will catch it.
+        pass
+    rel = path.relative_to(rag.VAULT_PATH)
+    return {"path": str(rel), "created": True}
+
+
+@mcp.tool()
+def rag_save_note(
+    text: str,
+    title: str,
+    folder: str = "00-Inbox",
+    tags: list[str] | None = None,
+) -> dict:
+    """Write a note to an explicit vault folder with an explicit title.
+
+    Use this when the user names the destination (e.g. "guardalo en
+    02-Areas/Salud" or "creá una nota llamada 'Postura al andar'"). For
+    unopinionated quick captures, prefer `rag_capture`.
+
+    The folder is created if it doesn't exist. The filename is <title>.md
+    with collision suffixing (-2, -3, …) on the basename. Frontmatter:
+    `created`, `type: note`, and the tag list (no "capture" default).
+
+    Args:
+        text: Body of the note.
+        title: Explicit title — used verbatim as H1 and slugified for
+            filename. Must be non-empty.
+        folder: Vault-relative folder (e.g. "02-Areas/Salud",
+            "03-Resources/Ideas"). Must not escape the vault root.
+            Defaults to "00-Inbox" for parity with `rag_capture`.
+        tags: Optional tag list (no '#' prefix), no defaults added.
+
+    Returns:
+        {"path": "<folder>/<slug>.md", "created": true}
+        On invalid input: {"created": false, "error": "<reason>"}.
+    """
+    _touch()
+    rag = _load_rag()
+    if not text or not text.strip():
+        return {"created": False, "error": "empty text"}
+    if not title or not title.strip():
+        return {"created": False, "error": "empty title"}
+    # Folder sanity — reject absolute paths + traversal before we
+    # normalize. Stripping slashes first would silently accept
+    # "/etc/passwd" as "etc/passwd", which the VAULT_PATH / resolve
+    # guard below usually catches but we want early-reject UX.
+    folder_raw = (folder or "00-Inbox").strip()
+    if folder_raw.startswith("/") or folder_raw.startswith("~"):
+        return {"created": False, "error": "invalid folder (absolute path)"}
+    folder = folder_raw.strip("/")
+    if not folder or ".." in folder.split("/"):
+        return {"created": False, "error": "invalid folder"}
+
+    target_dir = rag.VAULT_PATH / folder
+    try:
+        target_dir.resolve().relative_to(rag.VAULT_PATH.resolve())
+    except ValueError:
+        return {"created": False, "error": "folder escapes vault root"}
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    slug = rag._slug(title, maxlen=80)
+    candidate = target_dir / f"{slug}.md"
+    i = 2
+    while candidate.exists():
+        candidate = target_dir / f"{slug}-{i}.md"
+        i += 1
+
+    from datetime import datetime
+    now = datetime.now()
+    fm_lines = [
+        "---",
+        f"created: '{now.isoformat(timespec='seconds')}'",
+        "type: note",
+    ]
+    if tags:
+        fm_lines.append("tags:")
+        for t in tags:
+            t = str(t).lstrip("#").strip()
+            if t:
+                fm_lines.append(f"  - {t}")
+    fm_lines.append("---")
+    body = f"# {title.strip()}\n\n{text.strip()}\n"
+    candidate.write_text("\n".join(fm_lines) + "\n" + body, encoding="utf-8")
+
+    # Index immediately.
+    try:
+        rag._index_single_file(rag.get_db(), candidate, skip_contradict=True)
+    except Exception:
+        pass
+
+    rel = candidate.relative_to(rag.VAULT_PATH)
+    return {"path": str(rel), "created": True}
+
+
+@mcp.tool()
+def rag_create_reminder(
+    title: str,
+    when: str = "",
+    reminder_list: str | None = None,
+    priority: int | None = None,
+    notes: str | None = None,
+    recurrence: str | None = None,
+) -> dict:
+    """Create an Apple Reminder. Requires macOS + Reminders.app access.
+
+    Use when the user says "recordame X", "acordame de Y mañana", "ponete
+    una alarma", etc. If `when` parses unambiguously (dateparser on a
+    Spanish/English natural phrase), the reminder is created directly;
+    otherwise the tool returns `needs_clarification:true` so the caller
+    can ask the user for a more specific date.
+
+    Args:
+        title: Reminder text (what you need to do).
+        when: Natural-language date/time ("mañana 10am", "jueves 4pm",
+            "en 2 horas"). Leave empty for a reminder without due date.
+        reminder_list: Target list name. None = Reminders.app default.
+        priority: 1 (high), 5 (medium), 9 (low). None = no priority.
+        notes: Extra text for the body.
+        recurrence: Natural-language recurrence ("todos los lunes",
+            "cada 2 semanas"). None = one-shot.
+
+    Returns:
+        Parsed JSON from propose_reminder. Shape depends on outcome:
+          - Created: {"kind":"reminder", "created":true, "reminder_id":"...",
+                      "fields":{...}}
+          - Ambiguous date: {"kind":"reminder", "needs_clarification":true,
+                             "proposal_id":"prop-uuid", "fields":{...}}
+          - Failure: {"kind":"reminder", "created":false, "error":"...",
+                      "fields":{...}}
+    """
+    _touch()
+    rag = _load_rag()
+    import json as _json
+    raw = rag.propose_reminder(
+        title=title,
+        when=when,
+        list=reminder_list,
+        priority=priority,
+        notes=notes,
+        recurrence_text=recurrence,
+    )
+    try:
+        return _json.loads(raw)
+    except Exception as exc:
+        return {"kind": "reminder", "created": False,
+                "error": f"json decode failed: {exc}",
+                "raw": raw}
+
+
+@mcp.tool()
+def rag_create_event(
+    title: str,
+    start: str,
+    end: str | None = None,
+    calendar: str | None = None,
+    location: str | None = None,
+    notes: str | None = None,
+    all_day: bool = False,
+    recurrence: str | None = None,
+) -> dict:
+    """Create an Apple Calendar event. Requires macOS + Calendar.app access.
+
+    Use when the user says "agendá X el jueves", "cumple de Y el 15",
+    "reunión mañana 10am", etc. Auto-flips to all-day when `start` has
+    no time marker (e.g. "el miércoles", "cumpleaños de X el viernes").
+    Dedups against existing events on the same day/time window, so
+    repeated calls don't litter the calendar.
+
+    Args:
+        title: Event summary.
+        start: Natural-language date/time ("jueves 4pm" → timed, "el
+            jueves" → all-day). Required; empty string returns
+            needs_clarification.
+        end: End date/time. None + all_day → start + 1 day.
+            None + timed → start + 1 hour.
+        calendar: Target calendar name. None = first writable (typically
+            iCloud).
+        location: Free-text location.
+        notes: Event description / notes.
+        all_day: Force all-day. Auto-flips True when `start` has no
+            time marker; pass False explicitly to override.
+        recurrence: Natural-language recurrence.
+
+    Returns:
+        Parsed JSON from propose_calendar_event. Same shape as
+        rag_create_reminder (created / needs_clarification / error).
+    """
+    _touch()
+    rag = _load_rag()
+    import json as _json
+    raw = rag.propose_calendar_event(
+        title=title,
+        start=start,
+        end=end,
+        calendar=calendar,
+        location=location,
+        notes=notes,
+        all_day=all_day,
+        recurrence_text=recurrence,
+    )
+    try:
+        return _json.loads(raw)
+    except Exception as exc:
+        return {"kind": "event", "created": False,
+                "error": f"json decode failed: {exc}",
+                "raw": raw}
+
+
+@mcp.tool()
+def rag_followup(
+    days: int = 30,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List open loops in the vault — things you said you'd do that aren't
+    closed.
+
+    Scans frontmatter todos, unchecked `- [ ]` checkboxes, and imperative
+    clauses ("tengo que X", "pendiente Y", "revisar Z") in recently
+    modified notes. Each loop is classified as resolved / stale / activo
+    based on whether there's semantic evidence of follow-through in
+    later notes.
+
+    Use when the user asks "qué tengo pendiente?", "loops abiertos",
+    "qué quedó sin cerrar?".
+
+    Args:
+        days: Lookback window in days (default 30).
+        status: Filter by status — 'stale', 'activo', 'resolved', or None
+            for all.
+        limit: Max items to return (default 50).
+
+    Returns:
+        List of {"status", "age_days", "kind", "source_note", "loop_text",
+        ...} dicts. Empty list if no loops found.
+    """
+    _touch()
+    rag = _load_rag()
+    col = rag.get_db()
+    items = rag.find_followup_loops(col, rag.VAULT_PATH, days=days)
+    if status:
+        items = [it for it in items if it.get("status") == status]
+    return items[: max(1, int(limit))]
 
 
 def main() -> None:

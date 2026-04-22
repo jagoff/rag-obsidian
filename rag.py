@@ -18444,12 +18444,59 @@ def chat(
             if not last_turn_id:
                 console.print("[yellow]Todavía no hay respuesta para calificar.[/yellow]")
                 continue
+
+            # Rating negativo: pedir corrective_path (opcional) para enriquecer
+            # la señal. Pre-2026-04-22 `rag_feedback` tenía 0 filas con
+            # `corrective_path` — el fine-tune del reranker quedó sin data
+            # limpia para triplets (query, positive, negative). Este prompt
+            # cierra ese loop: cuando el user dice "no", le ofrecemos marcar
+            # cuál era el path correcto entre los top-k retrieved.
+            corrective_path: str | None = None
+            if rating < 0 and last_sources:
+                _candidate_paths: list[str] = []
+                for _m in last_sources:
+                    _p = _m.get("file", "")
+                    if _p and "://" not in _p and _p not in _candidate_paths:
+                        _candidate_paths.append(_p)
+                    if len(_candidate_paths) >= 5:
+                        break
+                if _candidate_paths:
+                    console.print(
+                        "[dim]¿cuál era el path correcto? (enter para skip, "
+                        "número de 1-{}, o pegá un path vault-relativo)[/dim]".format(
+                            len(_candidate_paths)
+                        )
+                    )
+                    for _i, _p in enumerate(_candidate_paths, 1):
+                        console.print(f"  [dim]{_i}. {_p}[/dim]")
+                    try:
+                        _ans = click.prompt(
+                            "   corrective path", default="",
+                            show_default=False,
+                        ).strip()
+                    except (KeyboardInterrupt, EOFError):
+                        _ans = ""
+                    if _ans:
+                        if _ans.isdigit():
+                            _idx = int(_ans) - 1
+                            if 0 <= _idx < len(_candidate_paths):
+                                corrective_path = _candidate_paths[_idx]
+                        else:
+                            # Texto libre: asumimos que es un path vault-relativo.
+                            # No lo validamos contra el filesystem — el user
+                            # puede marcar un path que todavía no existe
+                            # (ej. "@pregunta-abierta/X" indica que falta).
+                            corrective_path = _ans
+
             record_feedback(
                 last_turn_id, rating, last_question,
                 [m.get("file", "") for m in last_sources if m.get("file")],
+                corrective_path=corrective_path,
+                reason="corrective" if corrective_path else None,
             )
             label = "positivo" if rating > 0 else "negativo"
-            console.print(f"[dim]✓ feedback {label} guardado.[/dim]")
+            _extra = f" + corrective_path={corrective_path!r}" if corrective_path else ""
+            console.print(f"[dim]✓ feedback {label} guardado{_extra}.[/dim]")
             continue
 
         # /cls — limpia la pantalla y borra la conversación: turnos persistidos,

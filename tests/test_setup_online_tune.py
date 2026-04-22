@@ -93,6 +93,23 @@ def test_watch_plist_no_rag_explore():
     assert "RAG_EXPLORE" not in env
 
 
+def test_watch_plist_uses_all_vaults():
+    """Regression (2026-04-22): pre-fix the plist invoked `rag watch` bare,
+    which defaults to the active vault only — the non-active vault (`work`
+    in the user's current 2-vault setup) silently went un-watched. The plist
+    MUST pass `--all-vaults` so launchd covers every registered vault in a
+    single process."""
+    d = _parse_plist(rag_module._watch_plist(RAG_BIN))
+    args = d.get("ProgramArguments", [])
+    assert "watch" in args, f"expected `watch` subcommand, got {args}"
+    assert "--all-vaults" in args, (
+        f"watch plist must include --all-vaults to cover every registered "
+        f"vault; got args={args}"
+    )
+    # Order invariant: --all-vaults must come AFTER the subcommand.
+    assert args.index("--all-vaults") > args.index("watch")
+
+
 def test_digest_plist_no_rag_explore():
     d = _parse_plist(rag_module._digest_plist(RAG_BIN))
     env = d.get("EnvironmentVariables", {})

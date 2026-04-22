@@ -30194,6 +30194,16 @@ def _rag_binary() -> str:
 
 
 def _watch_plist(rag_bin: str) -> str:
+    """Persistent watchdog observing ALL registered vaults in a single process.
+
+    `--all-vaults` (2026-04-22): prior plist invoked `rag watch` bare, which
+    defaults to the active vault only — a 2-vault setup (e.g. home + work)
+    left the non-active vault silently un-watched. New notes in `work`
+    required a manual `rag index --vault work`. With `--all-vaults` a single
+    watchdog observer monitors every registered vault in one process
+    (sqlite-vec + sentence-transformers imported once, not per vault), so
+    ~3-4 GB of RAM savings vs. running a second watch service.
+    """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -30203,6 +30213,7 @@ def _watch_plist(rag_bin: str) -> str:
   <array>
     <string>{rag_bin}</string>
     <string>watch</string>
+    <string>--all-vaults</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

@@ -22,11 +22,26 @@ Tasks that touch ≤2 files go directly to the owning agent (`rag-retrieval`, `r
 
 When peers are active (`mcp__claude-peers__list_peers(scope: "repo")` returns >1), even ≤2-file tasks may need PM coordination — flag overlapping zones before editing.
 
-## Auto-commit + push rule
+## Auto-pull + commit + push rule
 
-Cuando termino una feature / functionality / fix / refactor: **commit + `git push origin master` automático, sin preguntar**. Mensaje explica *qué* cambió y *por qué* (no solo "wip"). Incluye el trailer standard (`Generated with ... / Co-Authored-By: Devin`). Si los tests fallan o el build rompe, NO commiteás — arreglás primero.
+**Regla universal: cuando termino ALGO — feature, fix, refactor, limpieza, ajuste — el ciclo es siempre `git pull → git commit → git push origin master`. Sin preguntar.**
+
+1. **Pull primero** (`git pull --rebase origin master` si hay cambios locales sin push, o `git pull` si el working tree está limpio). Evita que otro proceso — el user en su Mac, un cron, un Devin en paralelo — genere merge conflicts silenciosos.
+2. **Commit** con un mensaje **completo y en palabras simples** de lo que hice, no jerga técnica seca. Formato esperado:
+   - **Subject line**: `tipo(scope): resumen corto en español rioplatense (1 línea, ~70 chars)`
+   - **Cuerpo**: explicación en párrafos cortos que cualquier humano (no solo yo en 6 meses) pueda leer: **qué cambié**, **por qué** lo cambié, **cómo lo medí** si aplica, y **cómo revertir** si rompe algo. Evitar tecnicismos gratuitos — si uso un término especializado (LoRA, RRF, idle-unload), que quede claro qué es en contexto.
+   - **Trailer estándar Devin** al final:
+     ```
+     Generated with [Devin](https://cli.devin.ai/docs)
+     Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+     ```
+3. **Push** (`git push origin master`) inmediatamente después del commit. Si el pull del paso 1 hizo rebase y hay conflicts, los resolvés vos sin preguntar — nunca push con conflicts sin resolver.
+
+Si los tests fallan o el build rompe, **NO commiteás** — arreglás primero.
 
 Excepciones obvias: tareas exploratorias (investigar, responder preguntas, revisar diffs), cambios que el usuario explicitamente pidió no commitear, trabajo a medio camino (fix parcial + deferred-follow-up). Ante duda genuina, commit pero no push.
+
+Esta regla NO cambia — es el comportamiento default para siempre. Si el user dice "hace el commit", "commit + push", "cerrá esto", o cualquier cosa que signifique "terminaste → guardá", ejecutás el ciclo completo pull → commit → push sin confirmar cada paso.
 
 ## Commands
 

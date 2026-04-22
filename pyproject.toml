@@ -59,6 +59,16 @@ spotify = ["spotipy>=2.23"]
 # which is why it's opt-in rather than core.
 # Install: `uv pip install obsidian-rag[entities]`
 entities = ["gliner>=0.2.26"]
+# Speech-to-text (2026-04-22 MVP) via faster-whisper. Enables the
+# `rag transcribe <audio>` command to turn WhatsApp voice memos, iOS
+# Voice Memos, meeting recordings into searchable text for the vault.
+# Soft dependency: the transcribe command raises RuntimeError with a
+# clear install hint when this extra isn't installed (rag.py:_load_whisper_model).
+# faster-whisper pulls ctranslate2 (~50MB) + needs ffmpeg on PATH to
+# decode anything beyond WAV. Model weights (~480MB for "small")
+# auto-download on first use to ~/.cache/huggingface/hub/.
+# Install: `uv tool install --reinstall --editable '.[stt]'`
+stt = ["faster-whisper>=1.0.0"]
 
 [project.scripts]
 rag = "rag:cli"

@@ -4569,6 +4569,30 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_response_cache_ts ON rag_response_cache(ts)",
         ),
     ),
+    (
+        # Audio transcription cache (2026-04-22, STT MVP). When `rag transcribe
+        # <audio>` runs, the result is memoised here keyed by absolute path +
+        # mtime. Re-running on the same unchanged audio is near-instant (SQL
+        # lookup, no model load). Changing the file's mtime invalidates.
+        #
+        # Sin TTL — el texto transcripto no caduca, solo cambia cuando el
+        # audio cambia. Same pattern as rag_ocr_cache (4466).
+        #
+        # Nullable `duration_s` + `language` para MVP — faster-whisper los
+        # reporta pero tolerate None si la librería cambia de shape.
+        "rag_audio_transcripts",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_audio_transcripts ("
+            " audio_path TEXT PRIMARY KEY,"
+            " mtime REAL NOT NULL,"
+            " text TEXT NOT NULL,"
+            " language TEXT,"
+            " duration_s REAL,"
+            " model TEXT NOT NULL,"
+            " transcribed_at REAL NOT NULL"
+            ")",
+        ),
+    ),
 )
 
 
@@ -15153,6 +15177,17 @@ def retrieve(
 # sufficiency judgment and sub-query generation.
 
 _DEEP_MAX_ITERS = 3
+# Timeout absoluto de `deep_retrieve()` en segundos. Default 30s. Motivación
+# (audit 2026-04-22): el peor query de los últimos 7d tuvo `t_retrieve=202.6s`
+# — factor 5x sobre el P99 normal de ~38s. Causa: `_DEEP_MAX_ITERS=3` sin
+# límite de wall-time absoluto, combinado con contención intermitente de
+# Ollama (reranker idle-unload + cold-load del chat model + 3 pases de
+# `retrieve()` cada uno con `expand_queries()` + BM25 + semantic + rerank)
+# puede estirar cada iteración de ~5s nominal a ~60-70s. Con el guard,
+# el pipeline garantiza que ninguna query bloquee >30s en retrieve aunque
+# el juez siga pidiendo sub-queries. Override por env para hosts con más
+# memoria + recursos sobrados: `export RAG_DEEP_MAX_SECONDS=60`.
+_DEEP_MAX_SECONDS = float(os.environ.get("RAG_DEEP_MAX_SECONDS", "30"))
 
 
 def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tuple[bool, str]:
@@ -15237,7 +15272,15 @@ def deep_retrieve(
     seen_chunks = {m.get("file", "") + "::" + d[:50] for d, m in zip(all_docs, all_metas)}
     seen_graph = {gm.get("file", "") for gm in all_graph_metas if gm.get("file")}
 
+    # Wall-time anchor: aunque el loop tiene `_DEEP_MAX_ITERS` + `added==0`
+    # early-exits, bajo contención de recursos cada `retrieve()` puede durar
+    # 60-70s → 3 iters = 200s (bug medido 2026-04-22). El timeout absoluto
+    # garantiza que ninguna query inflame el tail del pipeline.
+    _deep_t0 = time.perf_counter()
+
     for iteration in range(1, _DEEP_MAX_ITERS):
+        if time.perf_counter() - _deep_t0 > _DEEP_MAX_SECONDS:
+            break
         sufficient, sub_query = _judge_sufficiency(question, all_docs, all_metas)
         if sufficient or not sub_query:
             break
@@ -38543,6 +38586,256 @@ def _extract_and_index_entities_for_chunks(
             _silent_log("entity_upsert_conn_failed", exc)
         except Exception:
             pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STT — Speech-to-text via faster-whisper (2026-04-22 MVP)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Why: the vault ingests text, images (OCR), YouTube transcripts — but NOT
+# audio. WhatsApp voice memos, iOS Voice Memos, meeting recordings are
+# invisible to retrieve(). `rag transcribe <audio>` closes that gap.
+#
+# This MVP covers:
+#   - `rag transcribe <path>` — standalone CLI: transcribe one file, print text
+#   - module-level `transcribe_audio(path, model, language)` — reusable from
+#     future callers (WA ingester, rag capture --audio, web drag-and-drop)
+#   - SQL cache (rag_audio_transcripts) keyed by abs path + mtime — same
+#     pattern as rag_ocr_cache: re-transcribing a file that hasn't changed
+#     is an O(1) SQL lookup instead of a multi-second whisper run
+#
+# Deliberately OUT of MVP scope:
+#   - WA audio ingestion (scope creep — opens vault write decisions)
+#   - Web UI drag-drop (needs /api/transcribe endpoint + CORS etc)
+#   - Metal / MPS acceleration (faster-whisper on CPU works fine on M-series
+#     for small/base models; scale up later if needed)
+#   - Chunking for audios >30min (faster-whisper handles it internally via
+#     VAD; we just pass through)
+#
+# Dependency: `faster-whisper` is optional (stt extras group in
+# pyproject.toml). A soft-import with a helpful error message means the
+# rest of rag keeps working on machines that don't want to install it.
+
+_WHISPER_MODEL_DEFAULT = "small"
+_whisper_model_cache: dict[str, object] = {}
+
+
+def _load_whisper_model(name: str):
+    """Lazy-load + memoise a WhisperModel. Raises RuntimeError with a
+    concrete install command when faster-whisper isn't available — never
+    silent, because a missing dep here means the user asked for
+    transcription and we couldn't do it.
+
+    Thread-safe: the dict.setdefault pattern below is atomic under the
+    GIL. Loading the same model in two threads at once might duplicate
+    work once, but won't corrupt state.
+    """
+    if name in _whisper_model_cache:
+        return _whisper_model_cache[name]
+    try:
+        from faster_whisper import WhisperModel  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper no está instalado. "
+            "`uv tool install --reinstall --editable '.[stt]'` "
+            "o `uv pip install 'obsidian-rag[stt]'`"
+        ) from exc
+    # compute_type="int8" for CPU — 4-8× faster than float32, imperceptible
+    # quality drop for small/base. Switch to "int8_float16" when Metal
+    # acceleration is wired up.
+    model = WhisperModel(name, device="cpu", compute_type="int8")
+    _whisper_model_cache.setdefault(name, model)
+    return _whisper_model_cache[name]
+
+
+def _audio_transcript_cache_get(abs_path: str, mtime: float) -> dict | None:
+    """Look up the cache by (path, mtime). Returns None on miss or DB
+    unavailable — a miss just means we re-transcribe, not fail."""
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT text, language, duration_s, model, transcribed_at "
+                "FROM rag_audio_transcripts WHERE audio_path = ? AND mtime = ?",
+                (abs_path, mtime),
+            ).fetchone()
+    except Exception as exc:
+        _silent_log("audio_transcript_cache_read_failed", exc)
+        return None
+    if not row:
+        return None
+    return {
+        "text": row[0], "language": row[1],
+        "duration_s": row[2], "model": row[3],
+        "transcribed_at": row[4],
+        "cached": True,
+    }
+
+
+def _audio_transcript_cache_put(
+    abs_path: str, mtime: float, text: str,
+    language: str | None, duration_s: float | None, model: str,
+) -> None:
+    """Upsert a transcript into the cache. Best-effort — if the DB write
+    fails we return the transcript anyway so the user doesn't lose it."""
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO rag_audio_transcripts "
+                "(audio_path, mtime, text, language, duration_s, model, transcribed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (abs_path, mtime, text, language, duration_s, model, time.time()),
+            )
+    except Exception as exc:
+        _silent_log("audio_transcript_cache_write_failed", exc)
+
+
+def transcribe_audio(
+    path: str | Path,
+    *,
+    model: str = _WHISPER_MODEL_DEFAULT,
+    language: str | None = None,
+    use_cache: bool = True,
+) -> dict:
+    """Transcribe an audio file with faster-whisper + SQL cache.
+
+    Args:
+        path: Path to the audio file. Any format ffmpeg reads (mp3, m4a,
+            wav, opus, mp4, ogg, flac, aac, …).
+        model: faster-whisper model name. Options: tiny / base / small /
+            medium / large-v3 / …. Default "small" (~480MB, balanced).
+        language: Force a language code (e.g. "es", "en"). None = auto-
+            detect.
+        use_cache: When True (default), skip the whisper run if we already
+            have a transcript for this (abs_path, mtime) in
+            rag_audio_transcripts. Set False to force re-transcription
+            (useful when testing new models).
+
+    Returns:
+        {"text": str, "language": str, "duration_s": float, "model": str,
+         "cached": bool, "transcribed_at": float}
+
+    Raises:
+        FileNotFoundError: path doesn't exist.
+        RuntimeError: faster-whisper not installed (see _load_whisper_model).
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"audio file not found: {p}")
+    abs_path = str(p)
+    mtime = p.stat().st_mtime
+
+    if use_cache:
+        hit = _audio_transcript_cache_get(abs_path, mtime)
+        if hit is not None:
+            return hit
+
+    wm = _load_whisper_model(model)
+    segments_iter, info = wm.transcribe(
+        abs_path, language=language, beam_size=1, vad_filter=True,
+    )
+    # faster-whisper returns a generator — materialise eagerly so the
+    # caller can consume `text` without worrying about iterator
+    # exhaustion. On long audios this is O(N) memory but N is the
+    # transcript, not the audio samples.
+    parts: list[str] = []
+    for seg in segments_iter:
+        # Each segment has .text with leading/trailing spaces; strip +
+        # collapse intra-sentence double-spaces.
+        t = (seg.text or "").strip()
+        if t:
+            parts.append(t)
+    full_text = " ".join(parts).strip()
+    result = {
+        "text": full_text,
+        "language": getattr(info, "language", None) or language,
+        "duration_s": float(getattr(info, "duration", 0.0)) or None,
+        "model": model,
+        "cached": False,
+        "transcribed_at": time.time(),
+    }
+    if use_cache and full_text:
+        _audio_transcript_cache_put(
+            abs_path, mtime, full_text,
+            result["language"], result["duration_s"], model,
+        )
+    return result
+
+
+@cli.command()
+@click.argument("audio_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--model", default=_WHISPER_MODEL_DEFAULT, show_default=True,
+              help="Modelo de faster-whisper: tiny/base/small/medium/large-v3")
+@click.option("--lang", "language", default=None,
+              help="Forzar idioma (ej: es, en). None = auto-detect")
+@click.option("--no-cache", "no_cache", is_flag=True,
+              help="Forzar re-transcripción, ignorando cache")
+@click.option("--json", "as_json", is_flag=True,
+              help="Salida JSON con metadata (text, language, duration_s, cached)")
+def transcribe(audio_path: str, model: str, language: str | None,
+               no_cache: bool, as_json: bool):
+    """Transcribir un archivo de audio a texto con faster-whisper.
+
+    Cache automático en SQL (rag_audio_transcripts) keyeado por path +
+    mtime — re-correr sobre un audio sin cambios es instantáneo.
+
+    Uso:
+      rag transcribe audio.m4a                 # modelo small, auto-lang
+      rag transcribe voice.opus --lang es      # forzar español
+      rag transcribe talk.wav --model base     # modelo más chico (+rápido)
+      rag transcribe note.mp3 --json           # JSON con metadata
+
+    Requiere `faster-whisper` (dep opcional `stt`):
+      uv tool install --reinstall --editable '.[stt]'
+    """
+    t0 = time.perf_counter()
+    try:
+        result = transcribe_audio(
+            audio_path, model=model, language=language,
+            use_cache=not no_cache,
+        )
+    except RuntimeError as exc:
+        # Dependencia faltante — mensaje claro + exit con código distinto
+        # al genérico para que scripts puedan distinguir.
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(6)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(2)
+
+    elapsed = time.perf_counter() - t0
+    log_query_event({
+        "cmd": "transcribe",
+        "q": f"[audio] {Path(audio_path).name}",
+        "t_retrieve": round(elapsed, 3),
+        "extra_json": {
+            "audio_path": str(Path(audio_path).resolve()),
+            "model": model,
+            "language": result.get("language"),
+            "duration_s": result.get("duration_s"),
+            "cached": bool(result.get("cached")),
+            "text_len": len(result.get("text") or ""),
+        },
+    })
+
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False))
+        return
+
+    text = result.get("text") or ""
+    if not text:
+        console.print("[yellow]Sin texto transcripto (audio vacío o silencio).[/yellow]")
+        return
+
+    # Human output: texto principal + footer con metadata.
+    click.echo(text)
+    cached_tag = " [dim](caché)[/dim]" if result.get("cached") else ""
+    lang = result.get("language") or "?"
+    dur = result.get("duration_s")
+    dur_str = f"{dur:.1f}s" if isinstance(dur, (int, float)) else "?"
+    console.print(
+        f"\n[dim]── {model} · {lang} · {dur_str} audio · "
+        f"{elapsed:.1f}s tiempo · {len(text)} chars{cached_tag}[/dim]"
+    )
 
 
 # Registrar caches core en el state global al import-time.  Debe ir

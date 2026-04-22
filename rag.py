@@ -8396,6 +8396,148 @@ def _invalidate_corpus_cache() -> None:
         _pagerank_cache_cid = None
 
 
+# ── Typo normalization (Game-changer #1 Phase 2, 2026-04-22) ─────────────────
+# Motivation: bge-m3 embeddings are character-sensitive; measured in telemetry
+# "cycle" vs "clycle" vs "diclo" all produce different top_scores (0.95 vs 0.0
+# vs 0.02) for the same intent. A vocab-bounded typo corrector catches the
+# common case without inventing corrections from a general-purpose dictionary.
+#
+# Gate: only fires when the first retrieval pass returned top_score < 0.10
+# (borderline or refusal). Normal-confidence queries never pay the cost.
+# Scope: only vault vocab (BM25 tokens), so we won't "correct" unknown proper
+# nouns into common dictionary words. Combined with _NAME_PRESERVATION_RULE
+# downstream, this path is safe for names the model doesn't recognise.
+
+_TYPO_NORM_MIN_TOKEN = 4           # skip tokens < 4 chars (high false-positive rate)
+_TYPO_NORM_MAX_DISTANCE = 2        # levenshtein edit distance cap
+_TYPO_NORM_MIN_CANDIDATE_LEN = 4   # candidates from vocab must be ≥ this
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Classic DP edit distance. Short inputs (len ≤ 30) — fine to inline."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(
+                prev[j] + 1,         # deletion
+                curr[j - 1] + 1,     # insertion
+                prev[j - 1] + (ca != cb),  # substitution
+            )
+        prev = curr
+    return prev[-1]
+
+
+def _corpus_vocab_set(col) -> set[str]:
+    """Return the set of normalised BM25 tokens from the loaded corpus.
+
+    Uses the cached BM25Okapi's `idf` dict (word → score) — no extra scan.
+    Only tokens ≥ _TYPO_NORM_MIN_CANDIDATE_LEN chars long are kept, same
+    floor as the matcher below.
+    """
+    try:
+        cache = _load_corpus(col)
+    except Exception:
+        return set()
+    bm25 = cache.get("bm25")
+    if bm25 is None or not hasattr(bm25, "idf"):
+        return set()
+    return {
+        w for w in bm25.idf.keys()
+        if isinstance(w, str) and len(w) >= _TYPO_NORM_MIN_CANDIDATE_LEN
+    }
+
+
+def maybe_normalize_typos(question: str, col) -> str | None:
+    """Find a typo-corrected version of `question` using only tokens present
+    in the corpus vocabulary. Returns the corrected string, or None if no
+    correction was found (or every token is already a vocab word or a
+    number).
+
+    Rules:
+      - Only tokens ≥ _TYPO_NORM_MIN_TOKEN chars are considered.
+      - Numeric tokens are left alone.
+      - Token must be ABSENT from vocab to be a correction candidate.
+      - Candidate = vocab word with levenshtein ≤ _TYPO_NORM_MAX_DISTANCE.
+      - If multiple candidates are equally close, pick the one with the
+        highest BM25 IDF (more distinctive → more likely the intended term).
+      - Case-preserving: the replacement adopts the casing pattern of the
+        original token (all-lower → lower, capitalised → capitalised).
+    """
+    if not question or not question.strip():
+        return None
+    try:
+        cache = _load_corpus(col)
+        bm25 = cache.get("bm25") if cache else None
+    except Exception:
+        return None
+    if bm25 is None or not hasattr(bm25, "idf"):
+        return None
+    vocab = _corpus_vocab_set(col)
+    if not vocab:
+        return None
+
+    idf = bm25.idf
+
+    # Tokenise preserving original surface form for replacement — we match
+    # against the normalised form (same rule as _tokenize: NFD + lower).
+    def _norm_token(t: str) -> str:
+        n = unicodedata.normalize("NFD", t.lower())
+        return "".join(c for c in n if not unicodedata.combining(c))
+
+    # Split preserving whitespace + punctuation so we can rebuild the string.
+    parts = re.findall(r"\S+|\s+", question)
+    changed = False
+    for i, part in enumerate(parts):
+        if part.isspace():
+            continue
+        # Strip leading/trailing punctuation; keep the original for rebuild.
+        m = re.match(r"^(\W*)(\w+)(\W*)$", part, flags=re.UNICODE)
+        if not m:
+            continue
+        prefix, token, suffix = m.groups()
+        if len(token) < _TYPO_NORM_MIN_TOKEN or token.isdigit():
+            continue
+        normalised = _norm_token(token)
+        if normalised in vocab:
+            continue  # already a vocab word
+        # Candidates: vocab words within edit distance.
+        best_word: str | None = None
+        best_dist: int = _TYPO_NORM_MAX_DISTANCE + 1
+        best_idf: float = -1.0
+        for w in vocab:
+            # Length filter: edit distance ≥ |len(a) - len(b)|.
+            if abs(len(w) - len(normalised)) > _TYPO_NORM_MAX_DISTANCE:
+                continue
+            d = _levenshtein(normalised, w)
+            if d > _TYPO_NORM_MAX_DISTANCE:
+                continue
+            score = float(idf.get(w, 0.0))
+            # Prefer closer distance; break ties by higher idf.
+            if d < best_dist or (d == best_dist and score > best_idf):
+                best_word = w
+                best_dist = d
+                best_idf = score
+        if best_word is None:
+            continue
+        # Preserve casing: all-lower → all-lower; Title → Title.
+        if token[0].isupper() and token[1:].islower():
+            replacement = best_word.capitalize()
+        elif token.isupper():
+            replacement = best_word.upper()
+        else:
+            replacement = best_word
+        parts[i] = f"{prefix}{replacement}{suffix}"
+        changed = True
+    return "".join(parts) if changed else None
+
+
 # ── Person-mention enrichment ────────────────────────────────────────────────
 # When a chat query mentions a person/entity by name, inject the matching
 # 99 Mentions @/<name>.md body + Apple Contacts data as a preamble so the LLM
@@ -13744,6 +13886,7 @@ def deep_retrieve(
     exclude_path_prefixes: tuple[str, ...] | None = None,
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
+    intent: str | None = None,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -13760,6 +13903,7 @@ def deep_retrieve(
         exclude_path_prefixes=exclude_path_prefixes,
         seen_titles=seen_titles,
         source=source,
+        intent=intent,
     )
     if not result["docs"]:
         return result
@@ -13785,6 +13929,7 @@ def deep_retrieve(
             rerank_pool=rerank_pool, exclude_paths=exclude_paths,
             exclude_path_prefixes=exclude_path_prefixes,
             source=source,
+            intent=intent,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -16974,6 +17119,40 @@ def query(
         with console.status("[dim]buscando…[/dim]", spinner="dots"):
             result = _do_retrieve()
     t_retrieve = time.perf_counter() - t_start
+
+    # ── Typo normalization (GC#1 Phase 2, 2026-04-22) ───────────────────────
+    # Vault-vocab-bounded typo corrector. Fires only on borderline retrievals
+    # (top_score < 0.10) — healthy queries never pay the cost. Re-retrieves
+    # with the corrected string; if the new confidence beats the original we
+    # switch to the corrected result. If no improvement, keep the original
+    # (typo correction was a false alarm).
+    _typo_corrected: str | None = None
+    if (result.get("docs")
+            and result.get("confidence", 0.0) < 0.10
+            and not raw
+            and not _cache_skippable  # never typo-correct under filter envelope
+            ):
+        try:
+            corrected = maybe_normalize_typos(question, col)
+            if corrected and corrected != question:
+                retry_kwargs = dict(_retrieve_kwargs)
+                retry_kwargs["question"] = corrected
+                retry_result = retrieve(**retry_kwargs)
+                _orig_conf = result.get("confidence", 0.0)
+                if (retry_result.get("docs")
+                        and retry_result.get("confidence", 0.0) > _orig_conf + 0.02):
+                    _typo_corrected = corrected
+                    result = retry_result
+                    effective_question = corrected
+                    if not plain:
+                        console.print(
+                            f"[dim]💡 ¿quisiste decir \"{corrected}\"? "
+                            f"(score: {retry_result['confidence']:.2f} vs original "
+                            f"{_orig_conf:.2f})[/dim]"
+                        )
+        except Exception as _typo_exc:
+            _silent_log("typo_normalize_query", _typo_exc)
+
     if not result["docs"]:
         log_query_event({
             "cmd": "query", "q": question, "filters": result.get("filters_applied"),
@@ -17387,6 +17566,7 @@ def query(
         "grounding_summary": _nli_grounding_summary,
         "cache_hit": False,
         "cache_stored": _cache_stored,
+        "typo_corrected": _typo_corrected,
     })
 
     if sess is not None:

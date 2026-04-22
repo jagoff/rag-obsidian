@@ -16922,6 +16922,7 @@ def query(
                     "t_gen": 0.0,
                     "answer_len": len(_cached_response),
                     "mode": "cache",
+                    "intent": hit.get("intent"),
                 })
                 return
         except Exception as _cache_exc:
@@ -17159,6 +17160,7 @@ def query(
             "variants": result.get("query_variants"), "paths": [],
             "top_score": None, "t_retrieve": round(t_retrieve, 2), "answered": False,
             "timing": _round_timing_ms(result.get("timing")),
+            "intent": intent,
         })
         if plain:
             click.echo("Sin resultados.")
@@ -17234,6 +17236,7 @@ def query(
             "t_retrieve": round(t_retrieve, 2), "t_gen": 0.0,
             "timing": _round_timing_ms(result.get("timing")),
             "answered": False, "gated_low_confidence": True,
+            "intent": intent,
         })
         if sess is not None:
             append_turn(sess, {
@@ -17567,6 +17570,10 @@ def query(
         "cache_hit": False,
         "cache_stored": _cache_stored,
         "typo_corrected": _typo_corrected,
+        # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
+        # query() state pre-fix; extra_json logging made 97% of rag_queries
+        # rows show `intent=NULL`, breaking any analytics on intent share.
+        "intent": intent,
     })
 
     if sess is not None:

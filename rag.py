@@ -187,9 +187,17 @@ def _nli_max_claims() -> int:
 # dispatch sin los skips. Ver docs/improvement-3-adaptive-routing-design.md.
 _LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
 _LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
-# num_ctx reducido para el fast-path lookup (respuestas cortas, contexto pequeño).
-# Alinea con HELPER_OPTIONS (qwen2.5:3b usa 2048 en helper tasks). Override via env.
-_LOOKUP_NUM_CTX = int(os.environ.get("RAG_LOOKUP_NUM_CTX", "2048"))
+# num_ctx para el fast-path lookup. Default 4096 tras medición 2026-04-22
+# que detectó refuses falsos con 2048: queries de alta confianza (top_score
+# 1.18) respondían "No tengo esa información" aunque el chunk relevante
+# estaba en el top-5 del rerank. Causa: system prompt + rules + 5 chunks
+# + graph neighbors frecuentemente superan los 2048 tokens, y qwen2.5:3b
+# ve un contexto truncado al primer chunk (típicamente el más corto, no el
+# más relevante). 4096 cabe el context típico sin truncation + qwen2.5:3b
+# todavía es ~2x más rápido que el modelo 7b full. Reproducible:
+# `RAG_FORCE_FULL_PIPELINE=1 rag query "curso de liderazgo estratégico"`
+# (responde bien) vs sin la flag (refuse falso pre-fix). Override via env.
+_LOOKUP_NUM_CTX = int(os.environ.get("RAG_LOOKUP_NUM_CTX", "4096"))
 
 # Per-intent rerank pool override. Synthesis/comparison necesitan más pool
 # porque tienen que cubrir ≥2 fuentes independientes en top-5 (SYSTEM_RULES
@@ -792,6 +800,83 @@ def _flush_log_queue() -> None:
 
 
 atexit.register(_flush_log_queue)
+
+
+# ── Background SQL write queue ────────────────────────────────────────────────
+# Fire-and-forget channel for SQL writes that don't need synchronous
+# confirmation on the user-visible path. Current consumer: `semantic_cache_store(
+# background=True)` from `query()` / `chat()` — the store happens AFTER the
+# response is already rendered, so the user never waits. Previously routing
+# through `_sql_write_with_retry` directly burned the 1–1.3s retry budget on
+# the hot thread under WAL contention (audit 2026-04-22 found ~314
+# semantic_cache_store_failed events clustered in <1-min bursts, each one
+# blocking the query thread ~1.3s before giving up).
+#
+# Design mirrors `_LOG_QUEUE`: unbounded queue + single daemon worker +
+# bounded atexit drain. Drops on shutdown are acceptable because the cache
+# is a speed optimization, not a correctness path.
+_BACKGROUND_SQL_QUEUE: queue.Queue = queue.Queue()
+
+
+def _background_sql_writer_loop() -> None:
+    while True:
+        item = _BACKGROUND_SQL_QUEUE.get()
+        try:
+            if item is None:
+                return
+            write_fn, error_tag = item
+            try:
+                _sql_write_with_retry(write_fn, error_tag)
+            except Exception as exc:
+                # _sql_write_with_retry already silent-logs its own errors;
+                # this outer guard catches any bug in the retry helper itself
+                # (e.g. argument misuse) so the worker thread never dies.
+                _log_sql_state_error(error_tag, err=repr(exc))
+        finally:
+            _BACKGROUND_SQL_QUEUE.task_done()
+
+
+_BACKGROUND_SQL_THREAD = threading.Thread(
+    target=_background_sql_writer_loop, daemon=True, name="rag-bg-sql-writer"
+)
+_BACKGROUND_SQL_THREAD.start()
+
+
+def _enqueue_background_sql(write_fn, error_tag: str) -> None:
+    """Queue a SQL write for the background worker. Never raises.
+
+    The write_fn must accept no args and handle its own conn open/close
+    (same contract as `_sql_write_with_retry`). error_tag is forwarded to
+    `_log_sql_state_error` if the retry budget is exhausted.
+
+    If the queue put fails (should never happen — unbounded queue) the
+    write is dropped silently to preserve the no-raise contract of the
+    hot path.
+    """
+    try:
+        _BACKGROUND_SQL_QUEUE.put_nowait((write_fn, error_tag))
+    except Exception:
+        pass
+
+
+def _flush_background_sql_queue() -> None:
+    """Drain pending background SQL writes on interpreter shutdown.
+
+    Bounded wait: the daemon worker might be stuck on a slow WAL
+    checkpoint or a concurrent writer holding an exclusive lock. We cap
+    the join at 2s so `atexit` doesn't hang process termination. Any
+    pending items beyond the cap are silently dropped — the semantic
+    cache is a perf optimization, not a correctness path, so dropping
+    on shutdown is acceptable.
+    """
+    try:
+        _BACKGROUND_SQL_QUEUE.put_nowait(None)
+        _BACKGROUND_SQL_THREAD.join(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_flush_background_sql_queue)
 
 
 # ── Silent-log alerting ──────────────────────────────────────────────────────
@@ -3856,6 +3941,7 @@ def semantic_cache_store(
     corpus_hash: str,
     ttl_seconds: int | None = None,
     extra: dict | None = None,
+    background: bool = False,
 ) -> bool:
     """Persist a response to the cache. Returns True on success.
 
@@ -3863,6 +3949,21 @@ def semantic_cache_store(
       - cache disabled (RAG_CACHE_ENABLED=0)
       - corpus_hash empty (couldn't compute)
       - response is empty / a refusal marker (top_score < 0.015)
+
+    ``background=True`` queues the INSERT on the SQL writer worker thread
+    and returns immediately (True if enqueued, False if cache gating rejects
+    the row). Used from ``query()`` / ``chat()`` so the 1-1.3s retry budget
+    of ``_sql_write_with_retry`` no longer inflates user-visible latency
+    when the DB is under contention. Pre-2026-04-22 audit found ~314
+    ``semantic_cache_store_failed`` entries clustered in ~1-min bursts
+    (concurrent writers, e.g. test runs + web traffic) — background mode
+    preserves the retry attempts without stealing hot-path time.
+
+    ``background=False`` (default) keeps the legacy synchronous contract:
+    the function blocks until the write is committed (or the retry budget
+    is exhausted), so callers that need ``lookup()`` to see the row
+    immediately after ``store()`` (e.g. tests, manual CLI repair flows)
+    can still opt into sync.
     """
     if not _semantic_cache_enabled() or not corpus_hash:
         return False
@@ -3871,6 +3972,16 @@ def semantic_cache_store(
     # Skip storing low-confidence refusals — they'd serve stale nothing-answers
     # and poison the cache for the same query after the vault grew content.
     if top_score is not None and top_score < 0.015:
+        return False
+    # Skip storing refusals even when top_score is HIGH. Regression 2026-04-22:
+    # queries con top_score 1.18 (alta confianza del retrieve) cayeron en un
+    # refuse falso del LLM (fast-path qwen2.5:3b con num_ctx truncado) y se
+    # cachearon como "No tengo esa información". Cada query similar subsequente
+    # servía el refuse cacheado perpetuamente — cache poisoning clásico.
+    # Usamos el mismo detector que NLI grounding (`_is_refusal()`) para
+    # consistencia; si el LLM devolvió un refuse, no importa qué diga el
+    # score del retrieve — el response es inútil y envenenaría al cache.
+    if _is_refusal(response):
         return False
     # Pre-2026-04-22 this function did a bare try/except around the INSERT
     # and silent-failed on the first `database is locked` — which
@@ -3905,6 +4016,10 @@ def semantic_cache_store(
                 ),
             )
             conn.commit()
+
+    if background:
+        _enqueue_background_sql(_do_insert, "semantic_cache_store_failed")
+        return True
 
     _sql_write_with_retry(_do_insert, "semantic_cache_store_failed")
     return True
@@ -18660,6 +18775,12 @@ def query(
             _cache_paths = list(dict.fromkeys(
                 m.get("file", "") for m in result["metas"] if m.get("file")
             ))
+            # background=True: INSERT runs on the rag-bg-sql-writer daemon so
+            # the user-visible latency is not inflated by the 1-1.3s retry
+            # budget under WAL contention. The return value (True) no longer
+            # reflects write-commit success — it only signals "enqueued".
+            # That's the tradeoff for the hot path; the ~314 failures/day
+            # still land in sql_state_errors.jsonl with the same error tag.
             _cache_stored = semantic_cache_store(
                 _cache_emb,
                 question=question,
@@ -18669,6 +18790,7 @@ def query(
                 top_score=round(float(result["confidence"]), 2),
                 intent=intent,
                 corpus_hash=_cache_hash,
+                background=True,
             )
         except Exception as _cache_exc:
             _silent_log("semantic_cache_store_query", _cache_exc)
@@ -36933,6 +37055,567 @@ _REFUSAL_RE = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
 def _is_refusal(text: str) -> bool:
     """True if the text matches a known refusal pattern."""
     return bool(_REFUSAL_RE.match(text.strip()))
+
+
+# ── `rag feedback` subgroup ─────────────────────────────────────────────
+# Generar, rescatar y ver señal de feedback para ranker-vivo + GC#2.C.
+#
+# Tres subcomandos self-contained (no tocan chat() ni web/):
+#   - status    : progress hacia los 20 corrective_paths del gate
+#   - backfill  : agregar corrective_path a turns existentes sin él
+#   - harvest   : labelear queries recent low-confidence sin feedback
+#
+# Contract: nunca sobre-escribe un corrective_path explícito existente.
+# Todos los updates invalidan el golden cache (same pattern que
+# record_feedback) para que el próximo retrieve() vea la señal fresca.
+
+_FEEDBACK_GATE_TARGET = 20  # sincroniza con RAG_FINETUNE_MIN_CORRECTIVES default
+
+
+def _feedback_stats() -> dict:
+    """Count feedback rows bucketed by rating + presence of corrective_path.
+
+    Returns dict with keys: total, pos, neg, with_cp, pos_no_cp, neg_no_cp.
+    All zeros on DB error (degradación graciosa).
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT "
+                " COUNT(*), "
+                " SUM(CASE WHEN rating=1 THEN 1 ELSE 0 END), "
+                " SUM(CASE WHEN rating=-1 THEN 1 ELSE 0 END), "
+                " SUM(CASE WHEN json_extract(extra_json,'$.corrective_path') IS NOT NULL"
+                "          AND json_extract(extra_json,'$.corrective_path') <> '' "
+                "     THEN 1 ELSE 0 END), "
+                " SUM(CASE WHEN rating=1 AND (json_extract(extra_json,'$.corrective_path') IS NULL"
+                "          OR json_extract(extra_json,'$.corrective_path') = '') "
+                "     THEN 1 ELSE 0 END), "
+                " SUM(CASE WHEN rating=-1 AND (json_extract(extra_json,'$.corrective_path') IS NULL"
+                "          OR json_extract(extra_json,'$.corrective_path') = '') "
+                "     THEN 1 ELSE 0 END) "
+                "FROM rag_feedback"
+            ).fetchone()
+            return {
+                "total": int(row[0] or 0),
+                "pos": int(row[1] or 0),
+                "neg": int(row[2] or 0),
+                "with_cp": int(row[3] or 0),
+                "pos_no_cp": int(row[4] or 0),
+                "neg_no_cp": int(row[5] or 0),
+            }
+    except Exception:
+        return {"total": 0, "pos": 0, "neg": 0, "with_cp": 0,
+                "pos_no_cp": 0, "neg_no_cp": 0}
+
+
+def _set_feedback_corrective_path(feedback_id: int, corrective_path: str) -> bool:
+    """Update rag_feedback.extra_json.corrective_path for a specific row.
+
+    Uses json_set() so other extra_json fields stay intact. Invalidates the
+    golden cache (same pattern as record_feedback) so retrieve() picks up
+    the new positive signal on the next call.
+
+    Returns True on success, False on any SQL error. Never raises.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "UPDATE rag_feedback "
+                "SET extra_json = json_set(COALESCE(extra_json, '{}'), "
+                "                          '$.corrective_path', ?) "
+                "WHERE id = ?",
+                (corrective_path, feedback_id),
+            )
+            try:
+                conn.execute("DELETE FROM rag_feedback_golden")
+                conn.execute(
+                    "DELETE FROM rag_feedback_golden_meta "
+                    "WHERE k='last_built_source_ts'"
+                )
+            except Exception:
+                pass
+        global _feedback_golden_memo, _feedback_golden_source_ts_sql
+        _feedback_golden_memo = None
+        _feedback_golden_source_ts_sql = None
+        return True
+    except Exception as exc:
+        try:
+            _log_sql_state_error("feedback_update_cp_failed", err=repr(exc))
+        except Exception:
+            pass
+        return False
+
+
+def _feedback_rows_without_cp(
+    rating_filter: str, since_days: int, limit: int,
+) -> list[dict]:
+    """List recent rag_feedback rows that lack a corrective_path.
+
+    Args:
+      rating_filter: 'pos' | 'neg' | 'both'.
+      since_days: window from today (default 30 = last month).
+      limit: max rows returned.
+
+    Returns list of dicts {id, ts, turn_id, rating, q, paths} ordered by ts DESC.
+    """
+    where = [
+        "(json_extract(extra_json,'$.corrective_path') IS NULL "
+        " OR json_extract(extra_json,'$.corrective_path') = '')",
+        f"ts > datetime('now', '-{int(since_days)} days')",
+    ]
+    if rating_filter == "pos":
+        where.append("rating = 1")
+    elif rating_filter == "neg":
+        where.append("rating = -1")
+    sql = (
+        "SELECT id, ts, turn_id, rating, q, paths_json "
+        "FROM rag_feedback "
+        "WHERE " + " AND ".join(where) + " "
+        "ORDER BY ts DESC "
+        "LIMIT ?"
+    )
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(sql, (int(limit),)).fetchall()
+            out: list[dict] = []
+            for rid, ts, turn_id, rating, q, paths_json in rows:
+                try:
+                    paths = json.loads(paths_json) if paths_json else []
+                except Exception:
+                    paths = []
+                out.append({
+                    "id": int(rid),
+                    "ts": ts or "",
+                    "turn_id": turn_id or "",
+                    "rating": int(rating),
+                    "q": q or "",
+                    "paths": [p for p in paths if isinstance(p, str) and p],
+                })
+            return out
+    except Exception:
+        return []
+
+
+def _harvest_candidates(
+    since_days: int, confidence_below: float, limit: int,
+) -> list[dict]:
+    """Recent queries with top_score below threshold and no explicit feedback.
+
+    Same logic as the rag-feedback-harvester skill: queries the user never
+    rated that the system itself flagged as low-confidence.
+    """
+    sql = (
+        "SELECT q.id, q.ts, q.q, q.top_score, q.cmd, q.session, "
+        "       q.paths_json, q.scores_json "
+        "FROM rag_queries q "
+        f"WHERE q.ts > datetime('now', '-{int(since_days)} days') "
+        "  AND q.top_score IS NOT NULL "
+        "  AND q.top_score < ? "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM rag_feedback f "
+        "    WHERE f.q = q.q "
+        "      AND ABS(julianday(f.ts) - julianday(q.ts)) < 1"
+        "  ) "
+        "  AND length(q.q) > 4 "
+        "  AND q.q NOT IN ('test','probando','hola','ping') "
+        "ORDER BY q.top_score ASC, q.ts DESC "
+        "LIMIT ?"
+    )
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                sql, (float(confidence_below), int(limit))
+            ).fetchall()
+            out: list[dict] = []
+            for qid, ts, q, score, cmd, session, paths_json, scores_json in rows:
+                try:
+                    paths = json.loads(paths_json) if paths_json else []
+                except Exception:
+                    paths = []
+                try:
+                    scores = json.loads(scores_json) if scores_json else []
+                except Exception:
+                    scores = []
+                out.append({
+                    "id": int(qid),
+                    "ts": ts or "",
+                    "q": q or "",
+                    "top_score": float(score) if score is not None else 0.0,
+                    "cmd": cmd or "",
+                    "session": session or "",
+                    "paths": [p for p in paths if isinstance(p, str) and p],
+                    "scores": scores,
+                })
+            return out
+    except Exception:
+        return []
+
+
+def _feedback_insert_harvested(
+    *, q: str, rating: int, paths: list[str],
+    original_query_id: int | None = None,
+    corrective_path: str | None = None,
+) -> bool:
+    """Insert a new rag_feedback row from the harvest flow.
+
+    Tagged source='harvester' + original_query_id in extra_json so the
+    row can be traced back to the rag_queries entry that originated it.
+    When corrective_path is provided, stores it inside extra_json as well.
+
+    Generates a fresh turn_id (12 hex chars) — harvest rows aren't tied
+    to an existing chat turn.
+    """
+    import secrets
+    turn_id = secrets.token_hex(6)  # 12 hex chars
+    event: dict = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "turn_id": turn_id,
+        "rating": 1 if rating > 0 else -1,
+        "q": q,
+        "paths": [p for p in (paths or []) if p],
+        "scope": "turn",
+        # Unknown-to-_map_feedback_row keys land in extra_json flat.
+        "source": "harvester",
+    }
+    if original_query_id is not None:
+        event["original_query_id"] = int(original_query_id)
+    if corrective_path:
+        event["corrective_path"] = corrective_path
+        event["reason"] = "corrective"
+    try:
+        with _ragvec_state_conn() as conn:
+            _sql_append_event(conn, "rag_feedback", _map_feedback_row(event))
+            try:
+                conn.execute("DELETE FROM rag_feedback_golden")
+                conn.execute(
+                    "DELETE FROM rag_feedback_golden_meta "
+                    "WHERE k='last_built_source_ts'"
+                )
+            except Exception:
+                pass
+        global _feedback_golden_memo, _feedback_golden_source_ts_sql
+        _feedback_golden_memo = None
+        _feedback_golden_source_ts_sql = None
+        return True
+    except Exception as exc:
+        try:
+            _log_sql_state_error("harvester_insert_failed", err=repr(exc))
+        except Exception:
+            pass
+        return False
+
+
+@cli.group()
+def feedback():
+    """Ver, rescatar y generar señal de feedback para ranker-vivo + GC#2.C.
+
+    Tres subcomandos:
+      • `rag feedback status`    — progress hacia los 20 corrective_paths
+        del gate de fine-tune (GC#2.C).
+      • `rag feedback backfill`  — agregar corrective_path a turns que
+        ya están en rag_feedback pero que no lo tienen (rescata data
+        histórica que `rag chat + 👎` no capturó).
+      • `rag feedback harvest`   — labelear queries recientes con
+        top_score bajo que aún no tienen thumbs (equivalente CLI del
+        skill `rag-feedback-harvester` de Claude Code, usable standalone).
+
+    Todos los subcomandos invalidan el golden cache para que el próximo
+    retrieve() vea la señal fresca. Sin --yes: siempre confirma antes
+    de cada insert/update para evitar registros accidentales.
+    """
+
+
+@feedback.command("status")
+def feedback_status():
+    """Dashboard de señal de feedback y progreso hacia el gate de fine-tune.
+
+    Muestra:
+      • Total feedback (positivos / negativos)
+      • Con corrective_path  (desbloquea GC#2.C cuando ≥20)
+      • Sin corrective_path por rating (candidatos a `rag feedback backfill`)
+      • Comando exacto para re-disparar el fine-tune si el gate está open.
+    """
+    s = _feedback_stats()
+    target = _FEEDBACK_GATE_TARGET
+    remaining = max(0, target - s["with_cp"])
+    console.print()
+    console.print("[bold]Feedback status[/bold]")
+    console.print(f"  Total:         [cyan]{s['total']}[/cyan] "
+                  f"(+1: {s['pos']}, −1: {s['neg']})")
+    console.print(f"  Con corrective: [bold green]{s['with_cp']}[/bold green] "
+                  f"/ {target} para gate  "
+                  + (f"[yellow](faltan {remaining})[/yellow]"
+                     if remaining > 0 else "[bold green](gate open!)[/bold green]"))
+    console.print(f"  Sin corrective: {s['pos_no_cp']} positivos + "
+                  f"{s['neg_no_cp']} negativos = "
+                  f"[yellow]{s['pos_no_cp'] + s['neg_no_cp']}[/yellow] candidatos a backfill")
+    console.print()
+    if remaining > 0:
+        console.print(f"[dim]Próximo paso: [bold]rag feedback backfill[/bold] "
+                      f"— rescatar corrective_path de los turns existentes.[/dim]")
+        console.print(f"[dim]              [bold]rag feedback harvest[/bold] "
+                      f"— labelear queries low-confidence sin feedback.[/dim]")
+    else:
+        console.print(f"[bold green]Gate open — re-disparar fine-tune:[/bold green]")
+        console.print(f"  [cyan]python scripts/finetune_reranker.py --epochs 2[/cyan]")
+    console.print()
+
+
+@feedback.command("backfill")
+@click.option("--limit", default=15, show_default=True,
+              help="Cuántos turns presentar como máximo.")
+@click.option("--rating", type=click.Choice(["pos", "neg", "both"]),
+              default="both", show_default=True,
+              help="Filtrar por rating: pos (+1), neg (−1), o both (ambos).")
+@click.option("--since", default=30, show_default=True,
+              help="Ventana en días.")
+def feedback_backfill(limit: int, rating: str, since: int):
+    """Agregar corrective_path a turns en rag_feedback que no lo tienen.
+
+    Rescata data histórica que `rag chat + 👎` no capturó (el prompt interactivo
+    existe desde commit 23f2899, los 55 turns positivos previos nunca lo vieron).
+
+    Por cada turn muestra query + top-5 paths. Aceptás:
+      • número 1-5  → marcar ese path como corrective
+      • texto libre → corrective_path custom (vault-relative)
+      • s / enter   → skip
+      • q           → quit temprano
+
+    Updates idempotentes: si corrés el comando dos veces sobre el mismo turn,
+    el segundo run sobreescribe el corrective_path del primero (no duplica rows).
+    """
+    stats_before = _feedback_stats()
+    target = _FEEDBACK_GATE_TARGET
+    remaining_before = max(0, target - stats_before["with_cp"])
+    console.print()
+    console.print("[bold]Backfill de corrective_path[/bold]")
+    console.print(f"  Actual: [cyan]{stats_before['with_cp']}[/cyan] / {target}  "
+                  f"(faltan [yellow]{remaining_before}[/yellow])")
+    console.print(f"  Filtros: rating={rating}, since={since}d, limit={limit}")
+    console.print()
+
+    rows = _feedback_rows_without_cp(rating, since, limit)
+    if not rows:
+        console.print(f"[dim]Sin rows para backfillear (rating={rating}, "
+                      f"últimos {since}d). Probá --since 60 o --rating both.[/dim]")
+        return
+
+    console.print(f"Rows a revisar: [bold]{len(rows)}[/bold]\n")
+    applied = 0
+    skipped = 0
+    quit_early = False
+    for i, row in enumerate(rows, 1):
+        label = ("[green]+1[/green]" if row["rating"] > 0
+                 else "[red]−1[/red]")
+        console.print(f"[bold cyan]{i}/{len(rows)}[/bold cyan]  {label}  "
+                      f"[dim]{row['ts']}[/dim]")
+        console.print(f"  Query: [italic]{row['q'][:100]}[/italic]")
+        if not row["paths"]:
+            console.print("  [dim](sin paths en paths_json — skip automático)[/dim]")
+            skipped += 1
+            console.print()
+            continue
+        for j, p in enumerate(row["paths"][:5], 1):
+            console.print(f"    {j}. {p}")
+        ans = click.prompt(
+            "  Corrective? [1-5 / path libre / s skip / q quit]",
+            default="s", show_default=False,
+        ).strip()
+        if ans.lower() == "q":
+            quit_early = True
+            break
+        if ans.lower() in ("s", "skip", ""):
+            skipped += 1
+            console.print()
+            continue
+        cp: str | None = None
+        if ans.isdigit():
+            idx = int(ans) - 1
+            top5 = row["paths"][:5]
+            if 0 <= idx < len(top5):
+                cp = top5[idx]
+            else:
+                console.print("  [red]Índice fuera de rango, skip.[/red]\n")
+                skipped += 1
+                continue
+        else:
+            cp = ans
+        if not cp:
+            skipped += 1
+            console.print()
+            continue
+        if _set_feedback_corrective_path(row["id"], cp):
+            applied += 1
+            console.print(f"  [green]✓[/green] corrective_path = {cp}")
+        else:
+            console.print("  [red]✗ error actualizando en SQL[/red]")
+        console.print()
+
+    stats_after = _feedback_stats()
+    remaining_after = max(0, target - stats_after["with_cp"])
+    console.print()
+    console.print("[bold]Resumen[/bold]")
+    console.print(f"  Applied: [green]{applied}[/green]  |  "
+                  f"Skipped: {skipped}"
+                  + ("  |  [yellow]quit early[/yellow]" if quit_early else ""))
+    console.print(f"  corrective_paths: [cyan]{stats_before['with_cp']}[/cyan]"
+                  f" → [green]{stats_after['with_cp']}[/green]")
+    if remaining_after == 0 and remaining_before > 0:
+        console.print()
+        console.print("[bold green]🎯 Gate desbloqueado![/bold green] Re-disparar fine-tune:")
+        console.print("  [cyan]python scripts/finetune_reranker.py --epochs 2[/cyan]")
+    elif remaining_after > 0:
+        console.print(f"  Faltan [yellow]{remaining_after}[/yellow] para "
+                      f"desbloquear el gate ({target}).")
+    console.print()
+
+
+@feedback.command("harvest")
+@click.option("--limit", default=15, show_default=True,
+              help="Cuántos candidatos presentar como máximo.")
+@click.option("--since", default=14, show_default=True,
+              help="Días atrás a escanear (default ventana del ranker-vivo).")
+@click.option("--confidence-below", "confidence_below", default=0.2,
+              show_default=True,
+              help="Sólo queries con top_score < este valor.")
+def feedback_harvest(limit: int, since: int, confidence_below: float):
+    """Labelear queries recientes low-confidence sin feedback explícito.
+
+    Equivalente CLI del skill `rag-feedback-harvester` de Claude Code —
+    usable standalone desde la terminal. Iterá sobre rag_queries de los
+    últimos N días con top_score < threshold y sin rows en rag_feedback
+    para la misma q (dedup por q + ts ±1 día).
+
+    Por cada candidato mostrá query + top-5 resultados. Aceptás:
+      • 1-5  → +1 sobre ese path (el ranker aprende "ése era el correcto")
+      • -    → −1 sobre todos los paths devueltos (golden cache negativo)
+      • c    → corrección: pregunta el path correcto, inserta DOS rows
+               (−1 de los vistos + +1 del correcto) en transacción
+      • s / enter → skip
+      • q    → quit
+
+    Tags source='harvester' + original_query_id en extra_json para trazabilidad.
+    """
+    cands = _harvest_candidates(since, confidence_below, limit)
+    console.print()
+    console.print("[bold]Harvest de queries low-confidence[/bold]")
+    console.print(f"  Filtros: since={since}d, top_score<{confidence_below}, limit={limit}")
+    console.print()
+    if not cands:
+        console.print(f"[dim]Sin candidatos (no hay queries low-confidence sin "
+                      f"feedback en los últimos {since}d). Probá --since 30 o "
+                      f"--confidence-below 0.3.[/dim]")
+        return
+
+    console.print(f"Candidatos: [bold]{len(cands)}[/bold]\n")
+    pos = neg = corrective = skipped = 0
+    quit_early = False
+    for i, c in enumerate(cands, 1):
+        console.print(f"[bold cyan]{i}/{len(cands)}[/bold cyan]  "
+                      f"[dim]{c['ts']} · cmd={c['cmd']} · "
+                      f"score={c['top_score']:.3f}[/dim]")
+        console.print(f"  Query: [italic]{c['q'][:100]}[/italic]")
+        if not c["paths"]:
+            console.print("  [dim](sin paths — skip)[/dim]\n")
+            skipped += 1
+            continue
+        for j, p in enumerate(c["paths"][:5], 1):
+            score_str = ""
+            if j - 1 < len(c["scores"]):
+                try:
+                    score_str = f"  [dim]({float(c['scores'][j - 1]):.3f})[/dim]"
+                except Exception:
+                    pass
+            console.print(f"    {j}. {p}{score_str}")
+        ans = click.prompt(
+            "  ¿Qué tal? [1-5 +1, - neg, c correctivo, s skip, q quit]",
+            default="s", show_default=False,
+        ).strip().lower()
+        if ans == "q":
+            quit_early = True
+            break
+        if ans in ("s", "skip", ""):
+            skipped += 1
+            console.print()
+            continue
+        if ans == "-":
+            ok = _feedback_insert_harvested(
+                q=c["q"], rating=-1, paths=c["paths"],
+                original_query_id=c["id"],
+            )
+            if ok:
+                neg += 1
+                console.print(f"  [red]✓ −1 guardado[/red] (todos los paths marcados)")
+            else:
+                console.print("  [red]✗ error SQL[/red]")
+        elif ans == "c":
+            # Correctivo: pedí el path correcto
+            cp = click.prompt("    Path correcto (vault-relative)",
+                              default="", show_default=False).strip()
+            if not cp:
+                console.print("  [dim]Path vacío, skip.[/dim]")
+                skipped += 1
+                console.print()
+                continue
+            # Dos inserts: −1 de los vistos + +1 del correcto con corrective
+            ok1 = _feedback_insert_harvested(
+                q=c["q"], rating=-1, paths=c["paths"],
+                original_query_id=c["id"],
+            )
+            ok2 = _feedback_insert_harvested(
+                q=c["q"], rating=1, paths=[cp],
+                original_query_id=c["id"], corrective_path=cp,
+            )
+            if ok1 and ok2:
+                corrective += 1
+                console.print(f"  [green]✓ correctivo guardado[/green] "
+                              f"(−1 paths vistos + +1 {cp})")
+            else:
+                console.print(f"  [red]✗ error SQL (ok1={ok1}, ok2={ok2})[/red]")
+        elif ans.isdigit():
+            idx = int(ans) - 1
+            top5 = c["paths"][:5]
+            if 0 <= idx < len(top5):
+                chosen = top5[idx]
+                ok = _feedback_insert_harvested(
+                    q=c["q"], rating=1, paths=[chosen],
+                    original_query_id=c["id"],
+                )
+                if ok:
+                    pos += 1
+                    console.print(f"  [green]✓ +1 guardado[/green] ({chosen})")
+                else:
+                    console.print("  [red]✗ error SQL[/red]")
+            else:
+                console.print("  [red]Índice fuera de rango, skip.[/red]")
+                skipped += 1
+        else:
+            console.print(f"  [yellow]Opción '{ans}' no reconocida, skip.[/yellow]")
+            skipped += 1
+        console.print()
+
+    console.print()
+    console.print("[bold]Resumen harvest[/bold]")
+    console.print(f"  +1: [green]{pos}[/green]  "
+                  f"| −1: [red]{neg}[/red]  "
+                  f"| correctivo: [yellow]{corrective}[/yellow]  "
+                  f"| skip: {skipped}"
+                  + ("  |  [yellow]quit early[/yellow]" if quit_early else ""))
+    console.print("  [dim]Golden cache invalidado — próxima query rebuildea.[/dim]")
+    stats = _feedback_stats()
+    remaining = max(0, _FEEDBACK_GATE_TARGET - stats["with_cp"])
+    if remaining == 0:
+        console.print()
+        console.print("[bold green]🎯 Gate de fine-tune desbloqueado![/bold green]")
+        console.print("  [cyan]python scripts/finetune_reranker.py --epochs 2[/cyan]")
+    elif corrective > 0:
+        console.print(f"  Gate: {stats['with_cp']}/{_FEEDBACK_GATE_TARGET} "
+                      f"(faltan {remaining}).")
+    console.print()
+
+
+# ── /end `rag feedback` subgroup ────────────────────────────────────────
 
 
 # NLI model state + lazy loader (Fase B.1)

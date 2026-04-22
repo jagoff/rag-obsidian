@@ -128,6 +128,9 @@ rag eval [--latency --max-p95-ms N]        # queries.yaml → hit@k, MRR, recall
 rag tune [--samples 500] [--apply] [--online --days 14] [--rollback]  # offline + online ranker-vivo loop
 rag log [-n 20] [--low-confidence]
 rag dashboard [--days 30]                  # analytics: scores, latency, topics, PageRank
+rag feedback status                        # progress hacia los 20 corrective_paths del gate GC#2.C
+rag feedback backfill [--limit N --rating pos|neg|both --since DAYS]  # agregar corrective_path a turns existentes
+rag feedback harvest [--limit N --since DAYS --confidence-below F]    # labelear queries low-conf sin thumbs
 rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `open` path (ranker-vivo click tracking)
 
 # Maintenance
@@ -353,7 +356,11 @@ Behavior priors (`_load_behavior_priors()`): read from `rag_behavior` (SQL), cac
 - **Run 2 noisy** (`~/.cache/obsidian-rag/reranker-ft-20260422-182127/`, 2.1 GB, gate=0 override, 3 epochs, ver [`docs/finetune-run-2026-04-22.md`](docs/finetune-run-2026-04-22.md)): **mismo −3.3pp chains**. Loss convergió de 0.96 a 0.13 (overfitting claro en epoch 3); val margin +0.455 (pos 0.515 vs neg 0.060). El modelo aprendió muy bien la data ruidosa — por eso regresionó chains. **Gate E2E validado**: detectó la regresión y NO promovió. Conclusión firme: sin `corrective_path` limpios, el fine-tune no supera baseline con esta config — hace falta la señal limpia, no más epochs.
 - **Fix aplicado**: [`scripts/finetune_reranker.py`](scripts/finetune_reranker.py) ahora lee `corrective_path` de `rag_feedback.extra_json` y lo usa como único positivo cuando está presente. Fallback a todos los paths cuando no.
 - **Gate pre-training**: `RAG_FINETUNE_MIN_CORRECTIVES` (default 20). Aborta con exit 5 si la señal limpia es insuficiente.
-- **Cómo generar data**: `rag chat` + thumbs-down en turnos malos — el prompt pide el path correcto (commit `23f2899`). La web UI tiene el mismo picker (commit `33ed3f0`). O el skill `rag-feedback-harvester` para labeleo batch.
+- **Cómo generar data**:
+  - `rag chat` + thumbs-down en turnos malos — el prompt pide el path correcto (commit `23f2899`). La web UI tiene el mismo picker (commit `33ed3f0`).
+  - `rag feedback backfill` — rescata corrective_path de turns ya en `rag_feedback` que no lo tienen (aplica a los 55 positivos del run del 2026-04-22 que no recibieron el prompt — el commit 23f2899 es posterior). Muestra query + top-5 del turn, aceptás [1-5]/texto libre/skip/quit. Update in-place via `json_set()`, nunca duplica rows.
+  - `rag feedback harvest` — equivalente CLI del skill `rag-feedback-harvester` de Claude Code. Lista queries recent low-confidence sin thumbs y pide [+N/-/c/s/q]. Tagged `source='harvester'` + `original_query_id` en `extra_json` para trazabilidad.
+  - `rag feedback status` — progress hacia los 20 del gate + breakdown por bucket (pos_no_cp / neg_no_cp) + comando exacto para re-disparar el fine-tune cuando el gate está open.
 - **Monitoreo**: `sqlite3 ~/.local/share/obsidian-rag/ragvec/ragvec.db "SELECT COUNT(*) FROM rag_feedback WHERE json_extract(extra_json, '\$.corrective_path') IS NOT NULL AND json_extract(extra_json, '\$.corrective_path') <> ''"` — conteo directo de corrective_paths disponibles.
 - **Re-trigger**: `python scripts/finetune_reranker.py --epochs 2` una vez que el gate lo permita (2 epochs, no 3 — la loss convergió a 0.22 en epoch 2 en el run noisy; epoch 3 es overfit puro). El gate de `rag eval` decide promoción via symlink `~/.cache/obsidian-rag/reranker-ft-current`.
 

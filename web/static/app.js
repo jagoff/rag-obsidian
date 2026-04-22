@@ -1445,6 +1445,107 @@ function appendProposal(parent, payload) {
   return card;
 }
 
+// ── Dwell-per-chunk observer (2026-04-22) ──────────────────────────────
+// When a source-row scrolls into view we start a timer; when it scrolls
+// out we compute the sustained viewport time and — if ≥ the threshold —
+// emit a behavior `open` event with dwell_ms attached. This is the
+// passive counterpart to the active `copy` event (db2a169) and feeds
+// the ranker-vivo with attention signal that a plain "did the user
+// click" boolean can't capture.
+//
+// Design choices:
+//   - Single module-level IntersectionObserver (IO) shared across all
+//     turns. Per-row observers would multiply listener cost with every
+//     new turn and never get garbage-collected.
+//   - threshold: [0, 0.5] — we fire at the boundary *and* when half the
+//     row is visible. The former marks "user scrolled past"; the latter
+//     marks "user actually paused on it".
+//   - Minimum dwell: 1500ms (tests can tune it down). Below that the
+//     user basically skimmed; above it they read something.
+//   - We re-use `event='open'` instead of inventing `dwell` so the
+//     existing CTR aggregator in _compute_behavior_priors_from_rows
+//     counts it as a click without any schema/aggregator change. The
+//     dwell_ms value still rides along for anyone who wants richer
+//     analytics later.
+//   - Fire-and-forget POST — the user's session never notices our
+//     telemetry calls, especially not when they're leaving the page.
+const _DWELL_MIN_MS = 1500;
+const _DWELL_MAX_MS = 5 * 60 * 1000;  // 5min cap — sanity upper bound
+const _dwellStart = new WeakMap();  // row element → Date.now() when entered
+const _dwellReported = new WeakSet();  // row elements that already emitted
+
+const _dwellObserver = (typeof IntersectionObserver !== "undefined")
+  ? new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const row = entry.target;
+        if (entry.isIntersecting) {
+          // Start the timer if we haven't already.
+          if (!_dwellStart.has(row)) {
+            _dwellStart.set(row, Date.now());
+          }
+        } else {
+          // Row left the viewport → compute dwell + maybe emit.
+          const start = _dwellStart.get(row);
+          _dwellStart.delete(row);
+          if (start == null || _dwellReported.has(row)) continue;
+          const elapsed = Date.now() - start;
+          if (elapsed < _DWELL_MIN_MS || elapsed > _DWELL_MAX_MS) continue;
+          _dwellReported.add(row);
+          _emitDwell(row, elapsed);
+        }
+      }
+    }, { threshold: [0, 0.5] })
+  : null;
+
+function _emitDwell(row, dwellMs) {
+  const payload = {
+    source: "web",
+    event: "open",  // reuse the existing positive CTR signal (see commit db2a169)
+    path: row.dataset.path || null,
+    rank: row.dataset.rank ? Number(row.dataset.rank) : null,
+    query: row.dataset.q || null,
+    dwell_ms: Math.floor(dwellMs),
+    session: row.dataset.session || null,
+  };
+  if (!payload.path) return;
+  try {
+    fetch("/api/behavior", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true,  // survive nav/tab close
+    }).catch(() => { /* silent — dwell telemetry never blocks UX */ });
+  } catch { /* same */ }
+}
+
+function _observeDwell(rows) {
+  if (!_dwellObserver) return;
+  for (const r of rows) _dwellObserver.observe(r);
+}
+
+// On page hide (tab backgrounded, nav) flush whatever is still in-flight.
+// Without this, a user who reads a source for 10s and then switches tabs
+// before scrolling away never emits the event — the IO callback only
+// fires on intersection transitions.
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden") return;
+    // For every row currently being timed, if the elapsed is within the
+    // valid range, flush it now (keepalive=true). Subsequent visibility
+    // changes won't double-emit because we add to _dwellReported.
+    const rows = document.querySelectorAll(".source-row[data-path]");
+    for (const row of rows) {
+      if (_dwellReported.has(row)) continue;
+      const start = _dwellStart.get(row);
+      if (start == null) continue;
+      const elapsed = Date.now() - start;
+      if (elapsed < _DWELL_MIN_MS || elapsed > _DWELL_MAX_MS) continue;
+      _dwellReported.add(row);
+      _emitDwell(row, elapsed);
+    }
+  });
+}
+
 function appendSources(parent, items, confidence) {
   const wrap = el("div", "sources");
   const head = el("div", "sources-rule");
@@ -1452,9 +1553,17 @@ function appendSources(parent, items, confidence) {
   if (Number.isFinite(confidence)) head.appendChild(confidenceBadge(confidence));
   wrap.appendChild(head);
   const seen = new Set();
+  // Collect rows for the dwell observer below — we instrument each
+  // source-row with data-* attrs so the IntersectionObserver callback
+  // can attribute a dwell event to (path, rank, query, session) without
+  // a side-channel.
+  const rows = [];
+  const parentTurn = parent.closest ? parent.closest(".turn") : null;
+  let rank = 0;
   for (const s of items) {
     if (seen.has(s.file)) continue;
     seen.add(s.file);
+    rank += 1;
     const row = el("div", "source-row");
     // Source-row tone — post-2026-04-21 recalibration del score_bar (mapping
     // [0, 1.0] → 5 cells), con estos thresholds de cells matcheamos los del
@@ -1474,9 +1583,23 @@ function appendSources(parent, items, confidence) {
     path.href = obsidianUrl(s.file);
     path.title = s.file;
     row.appendChild(path);
+    // Dwell tracking metadata — vault-relative paths only (the server
+    // rejects ones with :// since commit db2a169). Cross-source ids
+    // get the attrs dropped so the observer skips them entirely.
+    if (s.file && s.file.indexOf("://") === -1) {
+      row.dataset.path = s.file;
+      row.dataset.rank = String(rank);
+      if (parentTurn && parentTurn.dataset.q) row.dataset.q = parentTurn.dataset.q;
+      if (parentTurn && parentTurn.dataset.session) row.dataset.session = parentTurn.dataset.session;
+    }
     wrap.appendChild(row);
+    rows.push(row);
   }
   parent.appendChild(wrap);
+  // Attach dwell observer if any rows qualify (skip cross-source-only
+  // turns where no row has data-path).
+  const trackable = rows.filter((r) => r.dataset && r.dataset.path);
+  if (trackable.length) _observeDwell(trackable);
 }
 
 // Build the markdown exported by the copy button. Includes the question,

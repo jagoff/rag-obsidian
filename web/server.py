@@ -942,6 +942,15 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
     _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
                       _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
 
+    # The BehaviorRequest surface uses `dwell_ms` (higher-resolution,
+    # matches the JS IntersectionObserver timer output), but the SQL
+    # schema column is `dwell_s` (per _map_behavior_row at rag.py:4962).
+    # The aggregator reader `_compute_behavior_priors_from_rows` only
+    # SELECTs `dwell_s` from the table (rag.py:2902), so any dwell_ms
+    # that falls through to `extra_json` is effectively lost to the
+    # ranker-vivo priors. Convert here so the dwell signal lands in
+    # the column the aggregator actually reads.
+    dwell_s = (req.dwell_ms / 1000.0) if req.dwell_ms is not None else None
     try:
         log_behavior_event({
             "source": req.source,
@@ -949,7 +958,7 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
             "query": req.query,
             "path": req.path,
             "rank": req.rank,
-            "dwell_ms": req.dwell_ms,
+            "dwell_s": dwell_s,
             "session": req.session,
         })
     except Exception as exc:

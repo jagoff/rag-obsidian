@@ -851,6 +851,37 @@ function appendEnrich(parent, lines) {
   parent.appendChild(wrap);
 }
 
+// NLI grounding panel — claim-level verdicts (entails / neutral / contradicts).
+// Emitted after `done` when RAG_NLI_GROUNDING=1. Collapsed by default so the
+// response stays clean; power users can expand to inspect the evidence.
+function renderGrounding(data, container) {
+  if (!data || data.total === 0) return;
+  const details = el("details", "grounding-panel");
+  const parts = [];
+  if (data.supported)    parts.push(`✓ ${data.supported}`);
+  if (data.contradicted) parts.push(`✗ ${data.contradicted}`);
+  if (data.neutral)      parts.push(`· ${data.neutral}`);
+  const summary = document.createElement("summary");
+  summary.className = "grounding-summary";
+  summary.textContent = `${parts.join(" / ")} claims`;
+  details.appendChild(summary);
+  const ul = document.createElement("ul");
+  ul.className = "grounding-list";
+  for (const claim of (data.claims || [])) {
+    const li = document.createElement("li");
+    li.className = `grounding-claim grounding-claim-${claim.verdict}`;
+    const icon = claim.verdict === "entails"     ? "✓"
+               : claim.verdict === "contradicts" ? "✗" : "·";
+    li.appendChild(document.createTextNode(`${icon} ${claim.text}`));
+    if (claim.evidence_note) {
+      li.appendChild(el("small", "grounding-note", ` (${claim.evidence_note})`));
+    }
+    ul.appendChild(li);
+  }
+  details.appendChild(ul);
+  container.appendChild(details);
+}
+
 // ── Proposal cards ─────────────────────────────────────────────────────────
 //
 // The server fires an SSE `proposal` event whenever the LLM invokes
@@ -1847,6 +1878,10 @@ async function send(question) {
     } else if (event === "enrich") {
       if (Array.isArray(parsed.lines) && parsed.lines.length) {
         appendEnrich(turn, parsed.lines);
+      }
+    } else if (event === "grounding") {
+      if (parsed.total > 0) {
+        renderGrounding(parsed, turn);
       }
     } else if (event === "empty") {
       stopGeneratingTicker();

@@ -483,6 +483,42 @@ html, body {
   flex-shrink: 0;
 }
 
+/* NLI grounding panel (RAG_NLI_GROUNDING=1) ---------------------- */
+.grounding-panel {
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-top: 1px dashed var(--border);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.grounding-panel > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  list-style: none;
+  user-select: none;
+}
+.grounding-panel > summary::-webkit-details-marker { display: none; }
+.grounding-list {
+  margin: 6px 0 0 0;
+  padding: 0 0 0 0.8em;
+  list-style: none;
+}
+.grounding-claim {
+  padding: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grounding-claim-entails    { color: var(--green); }
+.grounding-claim-contradicts { color: var(--red); }
+.grounding-claim-neutral    { color: var(--text-faint); }
+.grounding-note {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
 /* Feedback bar --------------------------------------------------- */
 .feedback {
   margin-top: 8px;

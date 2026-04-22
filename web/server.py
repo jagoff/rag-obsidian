@@ -3734,6 +3734,65 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             print(f"[enrich] skipped: {type(exc).__name__}: {exc}", flush=True)
         return None
 
+    def _emit_grounding(turn_id: str, full: str, docs: list, metas: list, question: str) -> str | None:
+        """Compute NLI grounding for the LLM response and return an SSE event
+        string, or None if skipped or unavailable.
+        Silent-fail — never raises into the stream.
+        """
+        try:
+            import rag as _rag
+            if not _rag._nli_grounding_enabled():
+                return None
+            if not full.strip() or not docs:
+                return None
+            _intent, _ = _rag.classify_intent(question, set(), set())
+            if _intent in _rag._nli_skip_intents():
+                return None
+            claims = _rag.split_claims(full)
+            grounding = _rag.ground_claims_nli(
+                claims, docs, metas,
+                threshold_contradicts=_rag._nli_contradicts_threshold(),
+                max_claims=_rag._nli_max_claims(),
+            )
+            if grounding is None or grounding.claims_total == 0:
+                return None
+            _metas_by_cid: dict = {}
+            for _m in metas:
+                _cid = _m.get("chunk_id") or _m.get("file", "")
+                if _cid:
+                    _metas_by_cid[_cid] = _m
+            _claims_payload = []
+            for _cg in grounding.claims:
+                _note = ""
+                if _cg.evidence_chunk_id:
+                    _em = _metas_by_cid.get(_cg.evidence_chunk_id)
+                    _note = str(_em.get("note", ""))[:60] if _em else str(_cg.evidence_chunk_id)[:60]
+                _claims_payload.append({
+                    "text": _cg.text,
+                    "verdict": _cg.verdict,
+                    "score": round(_cg.score, 3),
+                    "evidence_span": (_cg.evidence_span or "")[:200],
+                    "evidence_note": _note,
+                })
+            print(
+                f"[nli-grounding] turn={turn_id} total={grounding.claims_total} "
+                f"entails={grounding.claims_supported} contradicts={grounding.claims_contradicted} "
+                f"nli_ms={grounding.nli_ms}",
+                flush=True,
+            )
+            return _sse("grounding", {
+                "turn_id": turn_id,
+                "claims": _claims_payload,
+                "total": grounding.claims_total,
+                "supported": grounding.claims_supported,
+                "contradicted": grounding.claims_contradicted,
+                "neutral": grounding.claims_neutral,
+                "nli_ms": grounding.nli_ms,
+            })
+        except Exception as exc:
+            print(f"[nli-grounding] skipped: {type(exc).__name__}: {exc}", flush=True)
+            return None
+
     def gen():
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
@@ -4750,6 +4809,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _enrich_evt = _emit_enrich(turn_id, question, full, float(result["confidence"]))
         if _enrich_evt:
             yield _enrich_evt
+
+        _grounding_evt = _emit_grounding(turn_id, full, result["docs"], result["metas"], question)
+        if _grounding_evt:
+            yield _grounding_evt
 
         # Cache store — sólo queries sin history (no follow-ups) y con
         # respuesta no-vacía. Keya con el vault_chunks count computado en el

@@ -13906,6 +13906,340 @@ class RetrieveResult:
         return cls(**kwargs)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Unified chat turn pipeline (2026-04-22, #1 de los 4 refactors estructurales)
+#
+# Pre-fix: CLI `chat()` + web `/api/chat` tenían implementaciones paralelas del
+# core del turn (classify → retrieve → LLM → post-process → log). Cada feature
+# nueva (intent logueo, device classifier, bad_citations_count) requería tocar
+# ~4 call sites y 50% chance de olvidar alguno. Features divergían con el
+# tiempo (topic-shift solo en web, /sources solo en CLI).
+#
+# Refactor: el pipeline core vive en `run_chat_turn(req) → ChatTurnResult`.
+# CLI + web llaman a esta función y solo manejan su I/O (terminal con Rich vs
+# SSE). Feature flag `RAG_UNIFIED_CHAT=1` para opt-in gradual; el path legacy
+# queda intacto hasta cutover completo.
+#
+# Fuera de scope para esta iteración:
+#   - Slash commands, readline, feedback interactivo → viven en CLI loop
+#   - SSE event protocol → vive en /api/chat endpoint
+#   - Metachat short-circuit, propose-intent, low-conf bypass → el caller los
+#     detecta ANTES de invocar run_chat_turn (short-circuit temprano)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _unified_chat_enabled() -> bool:
+    """True si `RAG_UNIFIED_CHAT=1` — feature flag para opt-in del nuevo pipeline.
+
+    Default OFF hasta validar con eval 3× que el comportamiento es
+    bit-idéntico al legacy path. Respeta los flags falsy estándar.
+    """
+    val = os.environ.get("RAG_UNIFIED_CHAT", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+@dataclass
+class ChatTurnRequest:
+    """Input del pipeline unificado.
+
+    `question`, `vaults` son obligatorios. El resto son parámetros de
+    configuración del turn (critique, filters, etc.) con defaults razonables
+    para el caso CLI-chat típico. El caller (CLI chat() loop o web /api/chat
+    handler) llena solo los campos que necesita distintos del default.
+    """
+    question: str
+    vaults: list[tuple[str, "Path"]]
+    history: list[dict] = field(default_factory=list)
+    session_summary: str | None = None
+    loose: bool = False
+    critique: bool = False
+    counter: bool = False
+    deep: bool = False
+    multi_query: bool = False
+    auto_filter: bool = True
+    precise: bool = False
+    date_range: tuple[float, float] | None = None
+    folder: str | None = None
+    tag: str | None = None
+    rerank_pool: int | None = None
+    exclude_paths: set[str] | None = None
+    exclude_path_prefixes: tuple[str, ...] | None = None
+    seen_titles: list[str] | None = None
+    source: str | None = None
+    k: int = 4
+    # Telemetría
+    device: str = "other"   # iphone/ipad/mac/linux/windows/android/other
+    cmd: str = "chat"       # chat | web | serve.chat | query | …
+
+
+@dataclass
+class ChatTurnResult:
+    """Output del pipeline unificado.
+
+    Contiene TODO lo que el caller necesita para renderizar + loggear un
+    turno. El caller:
+      - renderiza `answer` con su UI (Rich / SSE / plain stdout)
+      - muestra sources via `retrieve_result.metas` / `.scores`
+      - loggea llamando `result.to_log_event(cmd=..., session_id=...)`
+    """
+    answer: str
+    retrieve_result: "RetrieveResult"
+    intent: str | None = None
+    prompt_version: str = ""
+    # Citation-repair telemetry (post-GC#3 + 2026-04-22 audit)
+    bad_citations: list[tuple[str, str]] = field(default_factory=list)
+    bad_citations_count: int = 0
+    citation_repair_attempted: bool = False
+    citation_repaired: bool = False
+    critique_fired: bool = False
+    critique_changed: bool = False
+    # Optional NLI grounding — opt-in via RAG_NLI_GROUNDING
+    nli_summary: dict | None = None
+    nli_ms: int | None = None
+    # Timing breakdown en ms (total / retrieve / gen)
+    timing: dict = field(default_factory=dict)
+    # turn_id único para cross-referenciar con rag_feedback + rag_behavior
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # Meta flags para discriminar paths especiales (sin retrieval real)
+    metachat: bool = False
+    empty_vaults: bool = False
+    # Pregunta original del usuario. Se preserva separada del
+    # `retrieve_result.search_query` (que puede haber sido reformulado).
+    question: str = ""
+
+    def to_log_event(self, cmd: str, session_id: str) -> dict:
+        """Serializa a dict compatible con `log_query_event()`.
+
+        Centraliza el shape que antes estaba duplicado en los 4 call
+        sites de log_query_event (web + chat + query + low_conf_bypass).
+        Agregar un campo nuevo = agregar al dataclass + mapear acá una
+        vez, no 4 veces.
+        """
+        rr = self.retrieve_result
+        # Preferir question original del usuario; fallback al search_query
+        # reformulado si está presente.
+        q_str = self.question or rr.search_query or ""
+        return {
+            "cmd": cmd,
+            "turn_id": self.turn_id,
+            "session": session_id,
+            "q": q_str,
+            "paths": [m.get("file", "") for m in (rr.metas or [])],
+            "scores": [round(float(s), 2) for s in (rr.scores or [])],
+            "top_score": round(float(rr.confidence), 2) if rr.confidence != float("-inf") else 0.0,
+            "t_retrieve": round(
+                (self.timing.get("retrieve_ms") or 0) / 1000.0, 3,
+            ),
+            "t_gen": round(
+                (self.timing.get("t_gen_ms") or 0) / 1000.0, 3,
+            ),
+            "timing": _round_timing_ms(rr.timing),
+            "bad_citations": [p for _, p in self.bad_citations],
+            "bad_citations_count": self.bad_citations_count,
+            "citation_repair_attempted": self.citation_repair_attempted,
+            "citation_repaired": self.citation_repaired,
+            "critique_fired": self.critique_fired,
+            "critique_changed": self.critique_changed,
+            "fast_path": rr.fast_path,
+            "intent": self.intent,
+            "prompt_version": self.prompt_version,
+            "nli_ms": self.nli_ms,
+            "grounding_summary": self.nli_summary,
+        }
+
+
+def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
+    """Pipeline unificado: classify → retrieve → LLM → post-process.
+
+    Este es el REPLACEMENT del core duplicado entre `chat()` CLI y
+    `/api/chat` web. Callers pasan el request estructurado, recibe el
+    resultado final listo para renderizar + loggear.
+
+    Empty vaults → short-circuit con answer amable, sin LLM call.
+    Empty retrieve (corpus vacío o sin matches) → same.
+
+    Este primer scaffolding **no hace streaming** — acumula el output del
+    LLM antes de retornar. Está OK para CLI (imprime al final) y web (SSE
+    puede wrappear). Streaming incremental queda para V2 del refactor.
+
+    NO invoca metachat / propose-intent / low-conf-bypass — esos son
+    short-circuits responsabilidad del caller ANTES de llegar acá.
+    """
+    t_total_start = time.perf_counter()
+
+    # Empty vaults fast-path — no vault registrado / resueltos vacíos.
+    # Return temprano con un ChatTurnResult bien-formado así el caller
+    # puede loggear uniformemente vía to_log_event.
+    if not req.vaults:
+        empty_rr = RetrieveResult(
+            docs=[], metas=[], scores=[], confidence=float("-inf"),
+            search_query=req.question, query_variants=[req.question],
+        )
+        return ChatTurnResult(
+            answer="Sin vault para consultar. Registrá uno con `rag vault add`.",
+            retrieve_result=empty_rr,
+            empty_vaults=True,
+            question=req.question,
+            timing={
+                "total_ms": int((time.perf_counter() - t_total_start) * 1000),
+                "retrieve_ms": 0,
+                "t_gen_ms": 0,
+            },
+        )
+
+    # 1. Classify intent — regex-only, sub-millisecond. Resultado se
+    # pasa a multi_retrieve para que adaptive routing aplique.
+    try:
+        intent_value, _intent_params = classify_intent(
+            req.question, set(), set(),
+        )
+    except Exception:
+        intent_value = None
+
+    # 2. Retrieve (multi-vault aware — funciona aun con 1 vault).
+    t_retrieve_start = time.perf_counter()
+    retrieve_result = multi_retrieve(
+        req.vaults, req.question, req.k, req.folder, req.history, req.tag,
+        req.precise,
+        multi_query=req.multi_query,
+        auto_filter=req.auto_filter,
+        date_range=req.date_range,
+        summary=req.session_summary,
+        deep=req.deep,
+        rerank_pool=req.rerank_pool,
+        exclude_paths=req.exclude_paths,
+        exclude_path_prefixes=req.exclude_path_prefixes,
+        seen_titles=req.seen_titles,
+        source=req.source,
+        intent=intent_value,
+    )
+    t_retrieve_ms = int((time.perf_counter() - t_retrieve_start) * 1000)
+
+    # 3. Si el retrieve vino vacío, no vale disparar LLM.
+    if not retrieve_result.docs:
+        return ChatTurnResult(
+            answer="Sin resultados relevantes.",
+            retrieve_result=retrieve_result,
+            intent=intent_value,
+            prompt_version=prompt_version_for(
+                _prompt_name_for_intent(intent_value, req.loose), "latest",
+            ),
+            question=req.question,
+            timing={
+                "total_ms": int((time.perf_counter() - t_total_start) * 1000),
+                "retrieve_ms": t_retrieve_ms,
+                "t_gen_ms": 0,
+            },
+        )
+
+    # 4. Resolve prompt + version (respeta canary env overrides).
+    rules, prompt_ver = system_prompt_with_version(intent_value, req.loose)
+
+    # 5. Build context (single-vault via progressive_context; multi-vault
+    # annotates con [vault: name] outside the chunk fences). Mantiene la
+    # lógica del loop legacy que ya probaba OK en prod.
+    if len(req.vaults) > 1:
+        def _fmt_multi(d, m):
+            return f"[vault: {m.get('_vault', '?')}] " + _format_chunk_for_llm(d, m, role="nota")
+        context = "\n\n---\n\n".join(
+            _fmt_multi(d, m)
+            for d, m in zip(retrieve_result.docs, retrieve_result.metas)
+        )
+    else:
+        _, _col_path = req.vaults[0]
+        _col = get_db_for(_col_path)
+        context = build_progressive_context(
+            _col, retrieve_result.docs, retrieve_result.metas, req.question,
+            extras=retrieve_result.extras,
+        )
+    if retrieve_result.graph_docs:
+        graph_section = "\n\n---\n\n".join(
+            _format_chunk_for_llm(d, m, role="nota relacionada (grafo)")
+            for d, m in zip(retrieve_result.graph_docs, retrieve_result.graph_metas)
+        )
+        context = f"{context}\n\n--- CONTEXTO EXPANDIDO POR GRAFO ---\n\n{graph_section}"
+
+    user_block = user_prompt_block()
+    rules_full = f"{user_block}{rules}" if user_block else rules
+    person_ctx = build_person_context(req.question)
+    person_block = f"{person_ctx}\n\n---\n\n" if person_ctx else ""
+
+    if req.history:
+        messages = (
+            [{"role": "system",
+              "content": f"{rules_full}\n{person_block}CONTEXTO:\n{context}"}]
+            + req.history
+            + [{"role": "user", "content": req.question}]
+        )
+    else:
+        messages = [{"role": "user", "content": (
+            f"{rules_full}\n{person_block}CONTEXTO:\n{context}\n\n"
+            f"PREGUNTA: {req.question}\n\nRESPUESTA:"
+        )}]
+
+    # 6. LLM call — fast-path si corresponde + streaming accumulated.
+    fast_path = retrieve_result.fast_path
+    gen_model = _LOOKUP_MODEL if fast_path else resolve_chat_model()
+    gen_options = (
+        {**CHAT_OPTIONS, "num_ctx": _LOOKUP_NUM_CTX, "num_predict": 256}
+        if fast_path
+        else {**CHAT_OPTIONS, "num_ctx": 4096, "num_predict": 256}
+    )
+    t_gen_start = time.perf_counter()
+    parts: list[str] = []
+    try:
+        for chunk in ollama.chat(
+            model=gen_model,
+            messages=messages,
+            options=gen_options,
+            stream=True,
+            keep_alive=chat_keep_alive(gen_model),
+        ):
+            parts.append(chunk.message.content or "")
+    except Exception as exc:
+        # LLM falló (modelo no disponible, timeout, etc.). Retornamos
+        # un ChatTurnResult con answer vacío; caller puede mostrar error.
+        parts = [f"(error LLM: {exc})"]
+    full = "".join(parts).strip()
+    t_gen_ms = int((time.perf_counter() - t_gen_start) * 1000)
+
+    # 7. Post-process (citation-repair + critique + NLI en paralelo).
+    pp = run_parallel_post_process(
+        full,
+        docs=retrieve_result.docs,
+        metas=retrieve_result.metas,
+        context=context,
+        question=req.question,
+        fast_path=fast_path,
+        critique=req.critique,
+        intent=intent_value,
+    )
+
+    # 8. Ensamblado final.
+    return ChatTurnResult(
+        answer=pp.full,
+        retrieve_result=retrieve_result,
+        intent=intent_value,
+        prompt_version=prompt_ver,
+        bad_citations=pp.bad_citations,
+        bad_citations_count=len(pp.bad_citations),
+        citation_repair_attempted=(
+            0 < len(pp.bad_citations) <= _CITATION_REPAIR_MAX_BAD
+        ),
+        citation_repaired=pp.citation_repaired,
+        critique_fired=pp.critique_fired,
+        critique_changed=pp.critique_changed,
+        nli_summary=getattr(pp, "nli_summary", None),
+        nli_ms=getattr(pp, "nli_ms", None),
+        question=req.question,
+        timing={
+            "total_ms": int((time.perf_counter() - t_total_start) * 1000),
+            "retrieve_ms": t_retrieve_ms,
+            "t_gen_ms": t_gen_ms,
+        },
+    )
+
+
 def retrieve(
     col: SqliteVecCollection,
     question: str,
@@ -21838,7 +22172,131 @@ def detect_orphan_notes(
     return sorted(orphans)
 
 
-@cli.command()
+def telemetry_health(db_path: Path, days: int = 7, top_n: int = 10) -> dict:
+    """Salud operativa de la telemetría en la ventana de N días.
+
+    Devuelve:
+      - intent_populated_pct: % de queries (filtradas por is_user_query) que
+        exponen `intent` no-vacío en rag_queries.extra_json.
+      - ctr_by_source: CTR Laplace-smoothed (clicks+1)/(impressions+10) por
+        valor de rag_behavior.source. NULL/empty → bucket "unknown".
+      - feedback_gaps: top-N queries con ≥2 repeticiones sin ningún rating
+        en rag_feedback joineadas por turn_id (ambos lados limitados a la
+        ventana). Ordenado por count desc.
+    Degradación graciosa: tablas faltantes o vacías → estructura con counts
+    en 0 y listas vacías, sin excepciones.
+    """
+    import sqlite3 as _sqlite3
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    intent_populated = 0
+    intent_total = 0
+    source_acc: dict[str, list[int]] = {}
+    gaps: list[dict] = []
+
+    if not Path(db_path).exists():
+        return {
+            "window_days": days,
+            "total_user_queries": 0,
+            "intent_populated": 0,
+            "intent_populated_pct": 0.0,
+            "ctr_by_source": {},
+            "feedback_gaps": [],
+        }
+
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        try:
+            q_rows = conn.execute(
+                "SELECT cmd, q, extra_json FROM rag_queries WHERE ts >= ?",
+                (cutoff,),
+            ).fetchall()
+        except _sqlite3.Error:
+            q_rows = []
+
+        per_q: dict[str, dict] = {}
+        for cmd, q, extra_json in q_rows:
+            if not is_user_query(cmd, q):
+                continue
+            intent_total += 1
+            intent_val: str | None = None
+            turn_id: str | None = None
+            if extra_json:
+                try:
+                    ej = json.loads(extra_json)
+                except (ValueError, TypeError):
+                    ej = None
+                if isinstance(ej, dict):
+                    raw = ej.get("intent")
+                    if isinstance(raw, str) and raw.strip():
+                        intent_val = raw.strip()
+                    tid = ej.get("turn_id")
+                    if isinstance(tid, str) and tid.strip():
+                        turn_id = tid.strip()
+            if intent_val:
+                intent_populated += 1
+            if q:
+                norm = _normalize_query_for_grouping(q)
+                if norm:
+                    entry = per_q.setdefault(norm, {"q": q, "count": 0, "turn_ids": []})
+                    entry["count"] += 1
+                    if turn_id:
+                        entry["turn_ids"].append(turn_id)
+
+        try:
+            b_rows = conn.execute(
+                "SELECT source, event FROM rag_behavior WHERE ts >= ?",
+                (cutoff,),
+            ).fetchall()
+        except _sqlite3.Error:
+            b_rows = []
+        for source, event in b_rows:
+            key = source.strip() if isinstance(source, str) and source.strip() else "unknown"
+            acc = source_acc.setdefault(key, [0, 0])
+            acc[1] += 1
+            if event in _BEHAVIOR_POSITIVE:
+                acc[0] += 1
+
+        try:
+            rated_rows = conn.execute(
+                "SELECT DISTINCT turn_id FROM rag_feedback "
+                "WHERE ts >= ? AND turn_id IS NOT NULL AND turn_id != ''",
+                (cutoff,),
+            ).fetchall()
+            rated_ids = {r[0] for r in rated_rows}
+        except _sqlite3.Error:
+            rated_ids = set()
+
+        for entry in per_q.values():
+            if entry["count"] < 2:
+                continue
+            if any(t in rated_ids for t in entry["turn_ids"]):
+                continue
+            gaps.append({"q": entry["q"], "count": entry["count"]})
+        gaps.sort(key=lambda x: x["count"], reverse=True)
+        gaps = gaps[:top_n]
+    finally:
+        conn.close()
+
+    intent_pct = (intent_populated / intent_total * 100.0) if intent_total else 0.0
+    ctr_by_source = {
+        s: {
+            "clicks": acc[0],
+            "impressions": acc[1],
+            "ctr": (acc[0] + 1) / (acc[1] + 10),
+        }
+        for s, acc in source_acc.items()
+    }
+    return {
+        "window_days": days,
+        "total_user_queries": intent_total,
+        "intent_populated": intent_populated,
+        "intent_populated_pct": round(intent_pct, 2),
+        "ctr_by_source": ctr_by_source,
+        "feedback_gaps": gaps,
+    }
+
+
+@cli.group(invoke_without_command=True)
 @click.option("--days", default=INSIGHTS_DEFAULT_WINDOW_DAYS, show_default=True,
               help="Ventana en días del log a analizar")
 @click.option("--min-gap", default=INSIGHTS_GAP_MIN_OCCURRENCES, show_default=True,
@@ -21847,12 +22305,15 @@ def detect_orphan_notes(
               help="Mínimo de repeticiones para flaggear una hot query")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON estructurado")
 @click.option("--plain", is_flag=True, help="Output texto plano (bot-friendly)")
-def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
+@click.pass_context
+def insights(ctx: click.Context, days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
     """Patrones en queries.jsonl: gaps, hot queries, notas huérfanas.
 
     Output-only — no escribe, no modifica vault, no llama al LLM. Surface los
     patrones y vos decidís qué acción tomar (escribir nota, archivar, etc.).
     """
+    if ctx.invoked_subcommand is not None:
+        return
     t0 = time.perf_counter()
     since = datetime.now() - timedelta(days=days)
     entries = _load_query_entries(since)
@@ -21953,6 +22414,83 @@ def insights(days: int, min_gap: int, min_hot: int, as_json: bool, plain: bool):
 
     if not (gaps or hots or orphans):
         console.print("[green]✓ sin patrones detectados en la ventana.[/green]")
+
+
+@insights.command("telemetry-health")
+@click.option("--days", default=7, show_default=True,
+              help="Ventana en días sobre rag_queries/rag_behavior/rag_feedback")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON estructurado")
+@click.option("--plain", is_flag=True, help="Output texto plano (bot-friendly)")
+def insights_telemetry_health(days: int, as_json: bool, plain: bool):
+    """Salud de la telemetría: intent coverage, CTR por source, feedback gaps."""
+    report = telemetry_health(DB_PATH / _TELEMETRY_DB_FILENAME, days=days)
+
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+
+    if plain:
+        lines = [
+            f"Telemetry health · últimos {report['window_days']}d · "
+            f"{report['total_user_queries']} user queries",
+            f"intent populated: {report['intent_populated']}/"
+            f"{report['total_user_queries']} ({report['intent_populated_pct']}%)",
+        ]
+        if report["ctr_by_source"]:
+            lines.append("\nCTR por source (Laplace-smoothed):")
+            for s, stats in sorted(report["ctr_by_source"].items()):
+                lines.append(
+                    f"  · {s}: {stats['clicks']}/{stats['impressions']} "
+                    f"= {stats['ctr']:.3f}"
+                )
+        else:
+            lines.append("\nCTR por source: sin eventos.")
+        if report["feedback_gaps"]:
+            lines.append("\nFeedback gaps (queries repetidas sin rating):")
+            for g in report["feedback_gaps"]:
+                lines.append(f"  · ({g['count']}×) {g['q']}")
+        else:
+            lines.append("\nFeedback gaps: ninguno.")
+        click.echo("\n".join(lines))
+        return
+
+    console.print(Panel(
+        f"Telemetry health · últimos {report['window_days']}d · "
+        f"{report['total_user_queries']} user queries",
+        title="🩺 Telemetry", style="cyan", border_style="cyan",
+    ))
+    console.print(
+        f"[bold]Intent coverage[/bold]: "
+        f"{report['intent_populated']}/{report['total_user_queries']} "
+        f"([green]{report['intent_populated_pct']}%[/green])"
+    )
+    console.print()
+
+    if report["ctr_by_source"]:
+        tbl = Table(title="CTR por source (Laplace)", show_header=True, box=None)
+        tbl.add_column("source", style="cyan")
+        tbl.add_column("clicks", justify="right", style="green")
+        tbl.add_column("impressions", justify="right", style="dim")
+        tbl.add_column("ctr", justify="right")
+        for s, stats in sorted(report["ctr_by_source"].items()):
+            tbl.add_row(s, str(stats["clicks"]), str(stats["impressions"]),
+                        f"{stats['ctr']:.3f}")
+        console.print(tbl)
+        console.print()
+    else:
+        console.print("[dim]sin eventos en rag_behavior[/dim]")
+        console.print()
+
+    if report["feedback_gaps"]:
+        tbl = Table(title="Feedback gaps (queries repetidas sin rating)",
+                    show_header=True, box=None)
+        tbl.add_column("×", justify="right", style="yellow")
+        tbl.add_column("query", style="cyan", overflow="fold")
+        for g in report["feedback_gaps"]:
+            tbl.add_row(str(g["count"]), g["q"])
+        console.print(tbl)
+    else:
+        console.print("[green]✓ sin feedback gaps en la ventana.[/green]")
 
 
 # ── AGENT LOOP ────────────────────────────────────────────────────────────────

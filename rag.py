@@ -200,6 +200,16 @@ def _should_skip_reformulate(intent: str) -> bool:
     return intent in _METADATA_ONLY_INTENTS
 
 
+def _entity_lookup_enabled() -> bool:
+    """True si RAG_ENTITY_LOOKUP=1 (truthy exacto, igual que _adaptive_routing).
+
+    Default OFF → entity_lookup intent cae a semantic retrieve (legacy behavior).
+    Con RAG_ENTITY_LOOKUP=1 → handle_entity_lookup() hace dispatch desde query()
+    con fall-through a semantic si la entity no resuelve o la tabla está vacía.
+    """
+    return os.environ.get("RAG_ENTITY_LOOKUP") == "1"
+
+
 def verify_citations(response_text: str, metas: list[dict]) -> list[tuple[str, str]]:
     """Check that every .md reference in the LLM response points at a path
     that was actually retrieved. Returns list of (label, path) for unverified
@@ -7817,6 +7827,11 @@ _corpus_cache: dict | None = None
 # around cache reads/writes — the expensive BM25 / graph / PageRank
 # build happens outside the critical section in local vars.
 _corpus_cache_lock = threading.RLock()
+# BM25 concurrency guard — see CLAUDE.md invariant "BM25 GIL-serialised — do NOT
+# parallelise" (measured 3× slower when wrapped in ThreadPoolExecutor on M3 Max).
+# Lock() (not RLock) is intentional: even nested calls from the same thread must
+# fail fast, because nesting would indicate a latent parallelism bug in retrieve().
+_bm25_inflight_lock = threading.Lock()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -8546,35 +8561,51 @@ def bm25_search(
     folder: str | None, tag: str | None = None,
     date_range: tuple[float, float] | None = None,
 ) -> list[str]:
-    """Keyword search using BM25 over the full collection."""
-    c = _load_corpus(col)
-    if c["bm25"] is None:
-        return []
+    """Keyword search using BM25 over the full collection.
 
-    scores = c["bm25"].get_scores(_tokenize(query))
-    ids, metas = c["ids"], c["metas"]
-
-    if folder or tag or date_range:
-        def in_range(m: dict) -> bool:
-            if not date_range:
-                return True
-            ts = m.get("created_ts")
-            if ts is None:
-                return False
-            return date_range[0] <= float(ts) <= date_range[1]
-        valid = [
-            i for i, m in enumerate(metas)
-            if (not folder or _folder_matches(m.get("file", ""), folder))
-            and (not tag or tag in m.get("tags", ""))
-            and in_range(m)
-        ]
-        if not valid:
+    GIL-serialised by design — CLAUDE.md invariant (measured 3× slower when
+    parallelised on M3 Max). A non-blocking lock guards against accidental
+    ThreadPoolExecutor wrapping: raises RuntimeError immediately instead of
+    silently serialising, which would hide the bug and make the invariant
+    impossible to detect from a stack trace.
+    """
+    if not _bm25_inflight_lock.acquire(blocking=False):
+        raise RuntimeError(
+            "bm25_search llamado en paralelo — es GIL-serialised por diseño "
+            "(CLAUDE.md línea 126, medido 3× slower paralelo en M3 Max). "
+            "Revisá el stack si vino de un ThreadPoolExecutor."
+        )
+    try:
+        c = _load_corpus(col)
+        if c["bm25"] is None:
             return []
-        top = sorted(valid, key=lambda i: scores[i], reverse=True)[:k]
-    else:
-        top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
 
-    return [ids[i] for i in top]
+        scores = c["bm25"].get_scores(_tokenize(query))
+        ids, metas = c["ids"], c["metas"]
+
+        if folder or tag or date_range:
+            def in_range(m: dict) -> bool:
+                if not date_range:
+                    return True
+                ts = m.get("created_ts")
+                if ts is None:
+                    return False
+                return date_range[0] <= float(ts) <= date_range[1]
+            valid = [
+                i for i, m in enumerate(metas)
+                if (not folder or _folder_matches(m.get("file", ""), folder))
+                and (not tag or tag in m.get("tags", ""))
+                and in_range(m)
+            ]
+            if not valid:
+                return []
+            top = sorted(valid, key=lambda i: scores[i], reverse=True)[:k]
+        else:
+            top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+
+        return [ids[i] for i in top]
+    finally:
+        _bm25_inflight_lock.release()
 
 
 def rrf_merge(sem_ids: list[str], bm25_ids: list[str], rrf_k: int = 60) -> list[str]:
@@ -16232,6 +16263,41 @@ def query(
     # otherwise. User-supplied --folder/--tag override classifier params.
     # (known_tags, known_folders already computed above — no second get_vocabulary call)
     intent, intent_params = classify_intent(effective_question, known_tags, known_folders)
+
+    # ── Entity lookup dispatch (Improvement #2, Fase B) ──────────────────────
+    # Placed BEFORE the metadata-dispatch block so we can fall-through to the
+    # semantic pipeline when handle_entity_lookup() returns [] or flag is OFF.
+    # The `if intent != "semantic"` block below unconditionally returns — no
+    # fall-through is possible from inside it.
+    if intent == "entity_lookup":
+        if _entity_lookup_enabled():
+            _el_files = handle_entity_lookup(col, intent_params, question=effective_question)
+            if _el_files:
+                _el_params_str = (
+                    ", ".join(f"{k}={v}" for k, v in intent_params.items() if v)
+                    or "sin filtros"
+                )
+                if plain:
+                    click.echo(f"{len(_el_files)} nota(s) ({_el_params_str})")
+                    for _f in _el_files:
+                        click.echo(_f["file"])
+                else:
+                    console.print()
+                    console.print(
+                        f"[bold cyan]{len(_el_files)}[/bold cyan] nota(s) "
+                        f"[dim]({_el_params_str})[/dim]"
+                    )
+                    render_file_list("menciones de entidad", _el_files)
+                log_query_event({
+                    "cmd": "query", "q": question, "intent": intent,
+                    "params": intent_params, "count": len(_el_files),
+                    "mode": "entity_lookup",
+                })
+                return
+            # Empty list → fall-through to semantic pipeline
+        # Flag OFF or empty → override intent so metadata-dispatch block skips it
+        intent = "semantic"
+
     if intent != "semantic":
         if folder:
             intent_params["folder"] = folder

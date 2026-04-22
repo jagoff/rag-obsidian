@@ -17449,56 +17449,49 @@ def query(
     if not plain:
         console.print(render_response(full))
 
-    # ── Task 1: Citation-repair loop ─────────────────────────────────────────
-    # Runs always (not gated on plain — plain outputs are consumed programmatically
-    # so silent repair is safe and desirable). Repair fires only when bad citations
-    # are detected AND their count is ≤ _CITATION_REPAIR_MAX_BAD (rag.py:109).
-    # Rationale for the perf gate: 4+ invented paths means the response is likely
-    # hallucinated throughout; a single repair call costs 5-8s of non-streaming
-    # LLM latency and rarely salvages heavily hallucinated outputs. Single repair
-    # call; if repair also has bad citations or is empty, keep the original full.
-    # Fast-path (Improvement #3): skip citation-repair when fast_path=True — the
-    # lookup model + small num_ctx produces short answers where hallucinated paths
-    # are rare, and the 5-8s repair call would negate the latency win.
-    citation_repaired = False
-    bad = verify_citations(full, result["metas"])
-    if not _fast_path and bad and len(bad) <= _CITATION_REPAIR_MAX_BAD:
-        valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
-        if valid_paths:
-            _repair_system = (
-                "Solo puedes citar las siguientes rutas: "
-                + ", ".join(valid_paths)
-                + ". Responde la misma pregunta usando SOLO esas rutas. No inventes otras."
+    # ── Post-processing: repair + critique + NLI en paralelo ─────────────────
+    # Previously 3 secuential non-streaming LLM calls (5-8s repair + 3-5s
+    # critique + 0.3-1s NLI = hasta 13s invisibles tras el stream). Con
+    # `run_parallel_post_process` corren concurrentemente cuando hay ≥2
+    # tareas activas (ThreadPoolExecutor). Merge priority: repair gana
+    # sobre critique cuando ambos mutan (repair tiene gate explícito de
+    # verify_citations). Rollback: `RAG_PARALLEL_POSTPROCESS=0`.
+    _pp_status_needed = (not plain) and (
+        critique or _nli_grounding_enabled()
+    )
+    if _pp_status_needed:
+        with console.status("[dim]post-process (repair + critique + nli)…[/dim]", spinner="dots"):
+            _pp = run_parallel_post_process(
+                full,
+                docs=result["docs"],
+                metas=result["metas"],
+                context=context,
+                question=question,
+                fast_path=_fast_path,
+                critique=critique,
+                intent=intent,
             )
-            _repair_messages = [
-                {"role": "system", "content": _repair_system},
-                {"role": "user", "content": (
-                    f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
-                )},
-            ]
-            try:
-                # GC#3 2026-04-22: qwen2.5:3b (helper model) replaces resolve_chat_model()
-                # — repair is a structured rewrite under a fixed-paths constraint, the
-                # 7b chat model is overkill. Measured: 5-8s → 1-2s on typical 200-tok
-                # responses. Override via RAG_POSTPROCESS_MODEL (see _postprocess_model).
-                _repair_resp = _chat_capped_client().chat(
-                    model=_postprocess_model(),
-                    messages=_repair_messages,
-                    options=_postprocess_options(),
-                    stream=False,
-                    keep_alive=chat_keep_alive(_postprocess_model()),
-                )
-                _repair_full = (_repair_resp.message.content or "").strip()
-                if _repair_full:
-                    _repair_bad = verify_citations(_repair_full, result["metas"])
-                    if not _repair_bad:
-                        full = _repair_full
-                        citation_repaired = True
-                        if not plain:
-                            # Reprint repaired answer (OSC 8 hyperlinks intact via render_response)
-                            console.print(render_response(full))
-            except Exception:
-                pass  # Keep original on any repair failure
+    else:
+        _pp = run_parallel_post_process(
+            full,
+            docs=result["docs"],
+            metas=result["metas"],
+            context=context,
+            question=question,
+            fast_path=_fast_path,
+            critique=critique,
+            intent=intent,
+        )
+    full = _pp.full
+    bad = _pp.bad_citations
+    citation_repaired = _pp.citation_repaired
+    critique_fired = _pp.critique_fired
+    critique_changed = _pp.critique_changed
+
+    # Re-render if any of the post-process tasks mutated `full` (single
+    # render regardless of which task won the merge).
+    if (citation_repaired or critique_changed) and not plain:
+        console.print(render_response(full))
 
     # Report unverified citations that remain after repair (in interactive mode).
     if bad and not citation_repaired and not plain:
@@ -17506,58 +17499,6 @@ def query(
         console.print("[bold red]⚠ Citas no verificadas:[/bold red]")
         for label, path in bad:
             console.print(f"  [red]• {label} → {path}[/red] [dim](no está en los chunks recuperados)[/dim]")
-
-    # ── Task 3: Critique (opt-in) ─────────────────────────────────────────────
-    # Fires after citation-repair. Single non-streaming call. Replaces `full`
-    # only when the critique output (stripped) differs from the original.
-    critique_fired = critique
-    critique_changed = False
-    if critique:
-        _critique_system = (
-            "Evalúa si la respuesta responde la pregunta usando SOLO las fuentes provistas. "
-            "Si es correcta, devuélvela tal cual. "
-            "Si es incorrecta o incompleta, regenerá una respuesta mejor usando SOLO esas fuentes. "
-            "No expliques tu evaluación — devolvé solo la respuesta final."
-        )
-        _retrieved_paths_str = "\n".join(
-            m.get("file", "") for m in result["metas"] if m.get("file")
-        )
-        _critique_user = (
-            f"Pregunta: {question}\n\n"
-            f"Respuesta original:\n{full}\n\n"
-            f"Fuentes disponibles:\n{_retrieved_paths_str}\n\n"
-            f"Contexto de las fuentes:\n{context}"
-        )
-        def _run_critique_call() -> str:
-            try:
-                # GC#3 2026-04-22: critique also uses the helper model (qwen2.5:3b).
-                # Same rationale as repair — structured rewrite, small-model sufficient.
-                _cr = _chat_capped_client().chat(
-                    model=_postprocess_model(),
-                    messages=[
-                        {"role": "system", "content": _critique_system},
-                        {"role": "user", "content": _critique_user},
-                    ],
-                    options=_postprocess_options(),
-                    stream=False,
-                    keep_alive=chat_keep_alive(_postprocess_model()),
-                )
-                return (_cr.message.content or "").strip()
-            except Exception:
-                return ""
-        if not plain:
-            with console.status("[dim][critique…][/dim]", spinner="dots"):
-                _crit_full = _run_critique_call()
-        else:
-            _crit_full = _run_critique_call()
-        if _crit_full:
-            import re as _re
-            _norm = lambda s: _re.sub(r'\s+', ' ', s.strip())
-            if _norm(_crit_full) != _norm(full):
-                full = _crit_full
-                critique_changed = True
-                if not plain:
-                    console.print(render_response(full))
 
     # ── Plain-mode single echo ────────────────────────────────────────────────
     # Deferred from the stream-collection block above so citation-repair and
@@ -17588,48 +17529,31 @@ def query(
                 contrad = _run_counter()
             render_contradictions(contrad)
 
-    # ── NLI grounding (opt-in, Improvement #1) ───────────────────────────────
-    # Runs AFTER citation-repair + critique so `full` is the final answer.
-    # With RAG_NLI_GROUNDING unset (default) the block is a no-op: zero LLM
-    # calls, zero latency cost. Panel is Rich-only (non-plain) — plain output
-    # already delivered to the caller above so we add the panel after.
-    _nli_grounding_summary: dict | None = None
-    _nli_ms_logged = 0
-    if _nli_grounding_enabled() and intent not in _nli_skip_intents():
+    # ── NLI grounding panel (Improvement #1) ─────────────────────────────────
+    # NLI ya se ejecutó dentro de run_parallel_post_process (en paralelo con
+    # repair/critique). Acá solo renderizamos el panel cuando rich mode + hay
+    # resultado + intent no fue skippable (el helper ya aplica ese gate).
+    _nli_grounding_summary: dict | None = _pp.nli_summary
+    _nli_ms_logged = _pp.nli_ms
+    if _pp.nli_result is not None and not plain:
         try:
-            _nli_claims = split_claims(full)
-            if _nli_claims:
-                _nli_result = ground_claims_nli(
-                    _nli_claims, result["docs"], result["metas"],
-                    threshold_contradicts=_nli_contradicts_threshold(),
-                    max_claims=_nli_max_claims(),
-                )
-                if _nli_result is not None:
-                    _nli_ms_logged = _nli_result.nli_ms
-                    _nli_grounding_summary = {
-                        "claims_total": _nli_result.claims_total,
-                        "supported": _nli_result.claims_supported,
-                        "contradicted": _nli_result.claims_contradicted,
-                        "neutral": _nli_result.claims_neutral,
-                    }
-                    if not plain:
-                        _verdict_lines = []
-                        for _g in _nli_result.claims:
-                            _snip = _g.text[:80]
-                            if _g.verdict == "entails":
-                                _verdict_lines.append(f"[green]✓[/green] {_snip}")
-                            elif _g.verdict == "contradicts":
-                                _verdict_lines.append(f"[red]✗[/red] {_snip}")
-                            else:
-                                _verdict_lines.append(f"[dim]·[/dim] {_snip}")
-                        from rich.panel import Panel as _NliPanel
-                        console.print(_NliPanel(
-                            "\n".join(_verdict_lines),
-                            title="[dim]NLI grounding[/dim]",
-                            border_style="dim",
-                        ))
+            _verdict_lines = []
+            for _g in _pp.nli_result.claims:
+                _snip = _g.text[:80]
+                if _g.verdict == "entails":
+                    _verdict_lines.append(f"[green]✓[/green] {_snip}")
+                elif _g.verdict == "contradicts":
+                    _verdict_lines.append(f"[red]✗[/red] {_snip}")
+                else:
+                    _verdict_lines.append(f"[dim]·[/dim] {_snip}")
+            from rich.panel import Panel as _NliPanel
+            console.print(_NliPanel(
+                "\n".join(_verdict_lines),
+                title="[dim]NLI grounding[/dim]",
+                border_style="dim",
+            ))
         except Exception as _nli_exc:
-            _silent_log("nli_grounding_query", _nli_exc)
+            _silent_log("nli_grounding_panel_query", _nli_exc)
 
     # ── Semantic cache store (GC#1 2026-04-22) ──────────────────────────────
     # Store AFTER citation-repair + critique + NLI so `full` is the definitive
@@ -18681,90 +18605,41 @@ def chat(
             f"· llm {_t_llm_ms}ms[/dim]"
         )
 
-        # ── Citation-repair loop (chat path) ──────────────────────────────────
-        # Same perf gate as the query path: skip the repair round-trip when more
-        # than _CITATION_REPAIR_MAX_BAD citations are invented — the response is
-        # likely hallucinated throughout, and a single repair call won't salvage
-        # it. See rag.py:109 for the constant.
-        # Fast-path (Improvement #3): skip repair when _chat_fast_path=True
-        # (same rationale as query path — small model + small num_ctx rarely
-        # hallucinates paths, and repair cost would negate latency win).
-        _chat_citation_repaired = False
-        _chat_bad = verify_citations(full, result["metas"])
-        if not _chat_fast_path and _chat_bad and len(_chat_bad) <= _CITATION_REPAIR_MAX_BAD:
-            _chat_valid_paths = [m.get("file", "") for m in result["metas"] if m.get("file")]
-            if _chat_valid_paths:
-                _chat_repair_system = (
-                    "Solo puedes citar las siguientes rutas: "
-                    + ", ".join(_chat_valid_paths)
-                    + ". Responde la misma pregunta usando SOLO esas rutas. No inventes otras."
+        # ── Post-processing: repair + critique + NLI en paralelo ──────────────
+        # Mismo helper que query(). Merge priority: repair > critique. NLI
+        # corre en paralelo y no muta full (solo agrega panel + logs).
+        _chat_pp_status_needed = critique_active or _nli_grounding_enabled()
+        if _chat_pp_status_needed:
+            with console.status("[dim]post-process (repair + critique + nli)…[/dim]", spinner="dots"):
+                _chat_pp = run_parallel_post_process(
+                    full,
+                    docs=result["docs"],
+                    metas=result["metas"],
+                    context=context,
+                    question=question,
+                    fast_path=_chat_fast_path,
+                    critique=critique_active,
+                    intent=result.get("intent"),
                 )
-                _chat_repair_messages = [
-                    {"role": "system", "content": _chat_repair_system},
-                    {"role": "user", "content": (
-                        f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
-                    )},
-                ]
-                try:
-                    # GC#3 2026-04-22: helper model for chat repair too (see query path).
-                    _rresp = _chat_capped_client().chat(
-                        model=_postprocess_model(),
-                        messages=_chat_repair_messages,
-                        options=_postprocess_options(),
-                        stream=False,
-                        keep_alive=chat_keep_alive(_postprocess_model()),
-                    )
-                    _rfull = (_rresp.message.content or "").strip()
-                    if _rfull:
-                        _rbad = verify_citations(_rfull, result["metas"])
-                        if not _rbad:
-                            full = _rfull
-                            _chat_citation_repaired = True
-                            console.print(render_response(full))
-                except Exception as exc:
-                    _silent_log('chat_citation_repair_stream', exc)
+        else:
+            _chat_pp = run_parallel_post_process(
+                full,
+                docs=result["docs"],
+                metas=result["metas"],
+                context=context,
+                question=question,
+                fast_path=_chat_fast_path,
+                critique=critique_active,
+                intent=result.get("intent"),
+            )
+        full = _chat_pp.full
+        _chat_citation_repaired = _chat_pp.citation_repaired
+        _chat_critique_changed = _chat_pp.critique_changed
 
-        # ── Critique (opt-in, chat path) ──────────────────────────────────────
-        _chat_critique_changed = False
-        if critique_active:
-            _cq_system = (
-                "Evalúa si la respuesta responde la pregunta usando SOLO las fuentes provistas. "
-                "Si es correcta, devuélvela tal cual. "
-                "Si es incorrecta o incompleta, regenerá una respuesta mejor usando SOLO esas fuentes. "
-                "No expliques tu evaluación — devolvé solo la respuesta final."
-            )
-            _cq_paths_str = "\n".join(
-                m.get("file", "") for m in result["metas"] if m.get("file")
-            )
-            _cq_user = (
-                f"Pregunta: {question}\n\n"
-                f"Respuesta original:\n{full}\n\n"
-                f"Fuentes disponibles:\n{_cq_paths_str}\n\n"
-                f"Contexto de las fuentes:\n{context}"
-            )
-            with console.status("[dim][critique…][/dim]", spinner="dots"):
-                try:
-                    # GC#3 2026-04-22: helper model for chat critique (see query path).
-                    _cq_resp = _chat_capped_client().chat(
-                        model=_postprocess_model(),
-                        messages=[
-                            {"role": "system", "content": _cq_system},
-                            {"role": "user", "content": _cq_user},
-                        ],
-                        options=_postprocess_options(),
-                        stream=False,
-                        keep_alive=chat_keep_alive(_postprocess_model()),
-                    )
-                    _cq_full = (_cq_resp.message.content or "").strip()
-                except Exception:
-                    _cq_full = ""
-            if _cq_full:
-                import re as _re
-                _norm_chat = lambda s: _re.sub(r'\s+', ' ', s.strip())
-                if _norm_chat(_cq_full) != _norm_chat(full):
-                    full = _cq_full
-                    _chat_critique_changed = True
-                    console.print(render_response(full))
+        # Single re-render if anything mutated (no duplicate renders even when
+        # both repair+critique fired, gracias al merge del helper).
+        if _chat_citation_repaired or _chat_critique_changed:
+            console.print(render_response(full))
 
         history.append({"role": "assistant", "content": full})
         history = history[-SESSION_HISTORY_WINDOW:]
@@ -18781,47 +18656,31 @@ def chat(
                 )
             render_contradictions(contrad)
 
-        # ── NLI grounding (opt-in, chat path, Improvement #1) ─────────────────
-        # Post citation-repair + critique — `full` is final here. No intent
-        # variable in chat (no per-turn intent dispatch), so skip the intent
-        # check and run grounding unconditionally when the flag is ON.
-        # Default OFF → zero-cost no-op.
-        _chat_nli_summary: dict | None = None
-        _chat_nli_ms = 0
-        if _nli_grounding_enabled():
+        # ── NLI grounding panel (Improvement #1) ──────────────────────────────
+        # NLI ya corrió dentro de run_parallel_post_process. Render del panel
+        # solo acá. Default OFF → _chat_pp.nli_result es None y el block es
+        # no-op.
+        _chat_nli_summary: dict | None = _chat_pp.nli_summary
+        _chat_nli_ms = _chat_pp.nli_ms
+        if _chat_pp.nli_result is not None:
             try:
-                _chat_nli_claims = split_claims(full)
-                if _chat_nli_claims:
-                    _chat_nli_result = ground_claims_nli(
-                        _chat_nli_claims, result["docs"], result["metas"],
-                        threshold_contradicts=_nli_contradicts_threshold(),
-                        max_claims=_nli_max_claims(),
-                    )
-                    if _chat_nli_result is not None:
-                        _chat_nli_ms = _chat_nli_result.nli_ms
-                        _chat_nli_summary = {
-                            "claims_total": _chat_nli_result.claims_total,
-                            "supported": _chat_nli_result.claims_supported,
-                            "contradicted": _chat_nli_result.claims_contradicted,
-                            "neutral": _chat_nli_result.claims_neutral,
-                        }
-                        _chat_nli_lines = []
-                        for _g in _chat_nli_result.claims:
-                            _s = _g.text[:80]
-                            if _g.verdict == "entails":
-                                _chat_nli_lines.append(f"[green]✓[/green] {_s}")
-                            elif _g.verdict == "contradicts":
-                                _chat_nli_lines.append(f"[red]✗[/red] {_s}")
-                            else:
-                                _chat_nli_lines.append(f"[dim]·[/dim] {_s}")
-                        from rich.panel import Panel as _NliPanel
-                        console.print(_NliPanel(
-                            "\n".join(_chat_nli_lines),
-                            title="[dim]NLI grounding[/dim]",
-                            border_style="dim",
-                        ))
+                _chat_nli_lines = []
+                for _g in _chat_pp.nli_result.claims:
+                    _s = _g.text[:80]
+                    if _g.verdict == "entails":
+                        _chat_nli_lines.append(f"[green]✓[/green] {_s}")
+                    elif _g.verdict == "contradicts":
+                        _chat_nli_lines.append(f"[red]✗[/red] {_s}")
+                    else:
+                        _chat_nli_lines.append(f"[dim]·[/dim] {_s}")
+                from rich.panel import Panel as _NliPanel
+                console.print(_NliPanel(
+                    "\n".join(_chat_nli_lines),
+                    title="[dim]NLI grounding[/dim]",
+                    border_style="dim",
+                ))
             except Exception as _nli_exc:
-                _silent_log("nli_grounding_chat", _nli_exc)
+                _silent_log("nli_grounding_panel_chat", _nli_exc)
 
         turn_id = new_turn_id()
         append_turn(sess, {
@@ -35713,6 +35572,322 @@ def _split_prose(prose: str, base_offset: int) -> list[Claim]:
         offset += len(part) + 1
 
     return claims
+
+
+@dataclass
+class PostProcessResult:
+    """Resultado agregado de `run_parallel_post_process()`.
+
+    El helper ejecuta hasta 3 tareas de post-procesamiento concurrentemente
+    (citation-repair, critique, NLI grounding) y retorna el estado mergeado.
+    Diseñado para encapsular los 4 bloques inline previos (query + chat
+    ×repair + critique) con un único call site por caller.
+    """
+    full: str                                  # texto final (post-merge)
+    bad_citations: list[tuple[str, str]] = field(default_factory=list)
+    citation_repaired: bool = False
+    critique_fired: bool = False
+    critique_changed: bool = False
+    nli_summary: dict | None = None
+    nli_ms: int = 0
+    nli_result: "GroundingResult | None" = None
+    timing_ms: dict = field(default_factory=dict)  # wall/repair/critique/nli
+
+
+def _pp_task_repair(
+    full_orig: str,
+    bad: list[tuple[str, str]],
+    metas: list[dict],
+    context: str,
+    question: str,
+) -> dict:
+    """Citation-repair task — para ejecutar en el ThreadPoolExecutor.
+
+    Condición de disparo: `bad` no vacío, cantidad ≤ _CITATION_REPAIR_MAX_BAD,
+    existe al menos un path válido. Misma gate que el bloque inline original.
+    Return: {ran, ok, full, ms}. ok=True solo si el repair output pasa
+    verify_citations sin bad.
+    """
+    t0 = time.perf_counter()
+    valid_paths = [m.get("file", "") for m in metas if m.get("file")]
+    if not bad or len(bad) > _CITATION_REPAIR_MAX_BAD or not valid_paths:
+        return {"ran": False, "ok": False, "full": None, "ms": 0}
+    repair_system = (
+        "Solo puedes citar las siguientes rutas: "
+        + ", ".join(valid_paths)
+        + ". Responde la misma pregunta usando SOLO esas rutas. No inventes otras."
+    )
+    messages = [
+        {"role": "system", "content": repair_system},
+        {"role": "user", "content": (
+            f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"
+        )},
+    ]
+    try:
+        resp = _chat_capped_client().chat(
+            model=_postprocess_model(),
+            messages=messages,
+            options=_postprocess_options(),
+            stream=False,
+            keep_alive=chat_keep_alive(_postprocess_model()),
+        )
+        repair_full = (resp.message.content or "").strip()
+    except Exception as exc:
+        _silent_log("postprocess_repair_failed", exc)
+        return {"ran": True, "ok": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}
+
+    if not repair_full:
+        return {"ran": True, "ok": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}
+
+    repair_bad = verify_citations(repair_full, metas)
+    ok = not repair_bad
+    return {
+        "ran": True,
+        "ok": ok,
+        "full": repair_full if ok else None,
+        "ms": int((time.perf_counter() - t0) * 1000),
+    }
+
+
+def _pp_task_critique(
+    full_orig: str,
+    metas: list[dict],
+    context: str,
+    question: str,
+) -> dict:
+    """Critique task — regenera la respuesta si el chat model no la aprueba.
+
+    Corre siempre sobre `full_orig` (no sobre el repair output) porque en
+    paralelo no podemos esperar al repair. Merge priority en el caller:
+    repair gana sobre critique cuando ambos mutan (ver docstring de
+    run_parallel_post_process).
+    """
+    t0 = time.perf_counter()
+    critique_system = (
+        "Evalúa si la respuesta responde la pregunta usando SOLO las fuentes provistas. "
+        "Si es correcta, devuélvela tal cual. "
+        "Si es incorrecta o incompleta, regenerá una respuesta mejor usando SOLO esas fuentes. "
+        "No expliques tu evaluación — devolvé solo la respuesta final."
+    )
+    paths_str = "\n".join(m.get("file", "") for m in metas if m.get("file"))
+    critique_user = (
+        f"Pregunta: {question}\n\n"
+        f"Respuesta original:\n{full_orig}\n\n"
+        f"Fuentes disponibles:\n{paths_str}\n\n"
+        f"Contexto de las fuentes:\n{context}"
+    )
+    try:
+        resp = _chat_capped_client().chat(
+            model=_postprocess_model(),
+            messages=[
+                {"role": "system", "content": critique_system},
+                {"role": "user", "content": critique_user},
+            ],
+            options=_postprocess_options(),
+            stream=False,
+            keep_alive=chat_keep_alive(_postprocess_model()),
+        )
+        crit_full = (resp.message.content or "").strip()
+    except Exception as exc:
+        _silent_log("postprocess_critique_failed", exc)
+        return {"ran": True, "changed": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}
+
+    if not crit_full:
+        return {"ran": True, "changed": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}
+
+    # Normalise whitespace for comparison — avoid spurious "changed" when the
+    # LLM just reflowed the paragraph.
+    norm = lambda s: re.sub(r"\s+", " ", s.strip())
+    changed = norm(crit_full) != norm(full_orig)
+    return {
+        "ran": True,
+        "changed": changed,
+        "full": crit_full if changed else None,
+        "ms": int((time.perf_counter() - t0) * 1000),
+    }
+
+
+def _pp_task_nli(
+    full_orig: str,
+    docs: list[str],
+    metas: list[dict],
+) -> dict:
+    """NLI grounding task — no muta el texto, solo clasifica claims.
+
+    Return dict con summary (claims_total/supported/contradicted/neutral),
+    ms, y el raw GroundingResult para render del panel en el caller.
+    """
+    t0 = time.perf_counter()
+    try:
+        claims = split_claims(full_orig)
+    except Exception as exc:
+        _silent_log("postprocess_nli_split_failed", exc)
+        return {"ran": False, "summary": None, "raw": None, "ms": 0}
+
+    if not claims:
+        return {"ran": False, "summary": None, "raw": None, "ms": 0}
+
+    try:
+        result = ground_claims_nli(
+            claims, docs, metas,
+            threshold_contradicts=_nli_contradicts_threshold(),
+            max_claims=_nli_max_claims(),
+        )
+    except Exception as exc:
+        _silent_log("postprocess_nli_failed", exc)
+        return {"ran": False, "summary": None, "raw": None, "ms": int((time.perf_counter() - t0) * 1000)}
+
+    if result is None:
+        return {"ran": False, "summary": None, "raw": None, "ms": 0}
+
+    summary = {
+        "claims_total": result.claims_total,
+        "supported": result.claims_supported,
+        "contradicted": result.claims_contradicted,
+        "neutral": result.claims_neutral,
+    }
+    # Preserve the GroundingResult's internal ms (inference-only timing) so
+    # callers that log `nli_ms` get the same value they did pre-refactor.
+    # The task's own wall-clock includes split_claims + the launch overhead
+    # which is not what "nli_ms" historically meant.
+    return {
+        "ran": True,
+        "summary": summary,
+        "raw": result,
+        "ms": int(result.nli_ms or 0),
+    }
+
+
+def _pp_parallel_enabled() -> bool:
+    """Env toggle para debugging: `RAG_PARALLEL_POSTPROCESS=0` fuerza
+    secuencial. Default on — sin env var, usa threads cuando hay ≥2 tareas.
+    """
+    val = os.environ.get("RAG_PARALLEL_POSTPROCESS", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def run_parallel_post_process(
+    full_orig: str,
+    *,
+    docs: list[str],
+    metas: list[dict],
+    context: str,
+    question: str,
+    fast_path: bool,
+    critique: bool,
+    intent: str | None,
+) -> PostProcessResult:
+    """Ejecuta citation-repair + critique + NLI en paralelo y mergea.
+
+    Parallelization rules:
+      - Fast-path bypass: cuando `fast_path=True` (lookup intents con score
+        alto), skip repair (mismo gate que el código inline original).
+      - Critique: solo si `critique=True`.
+      - NLI: solo si `RAG_NLI_GROUNDING` ON y `intent` no en _nli_skip_intents.
+
+    Merge priority cuando múltiples tareas quieren mutar `full`:
+      1. **Repair wins over critique**. Rationale: critique corre sobre
+         `full_orig` (que tenía citations inválidas); aunque regenere con
+         citations válidas, preferimos el repair que tiene un gate explícito
+         de verify_citations. Critique podría haber cambiado prosa y retenido
+         citations inválidas.
+      2. Solo repair OK → full = repaired.
+      3. Solo critique changed → full = critiqued.
+      4. Nada → full = full_orig.
+
+    NLI nunca muta `full`; se agrega al result en paralelo.
+
+    Threading safety:
+      - Todas las tareas leen full_orig + metas/docs/context/question (read-only).
+      - Cada tarea hace su propia llamada a ollama (HTTP client thread-safe).
+      - NLI accede a mDeBERTa singleton con lock interno en get_nli_model.
+      - No shared mutable state entre tasks.
+
+    Args:
+        full_orig: texto del LLM stream (post-generation).
+        docs, metas: retrieved chunks del retrieve().
+        context: contexto construido (build_progressive_context output).
+        question: query original.
+        fast_path: flag de adaptive routing (skip repair si True).
+        critique: flag `--critique` (opt-in critique pass).
+        intent: intent clasificado (gate para NLI).
+
+    Returns: PostProcessResult con full mergeado + flags + timing.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    wall_start = time.perf_counter()
+    bad = verify_citations(full_orig, metas)
+
+    # Figure out which tasks to run
+    do_repair = (not fast_path) and bool(bad)
+    do_critique = bool(critique)
+    do_nli = _nli_grounding_enabled() and (intent not in _nli_skip_intents())
+
+    result = PostProcessResult(full=full_orig, bad_citations=bad,
+                                critique_fired=do_critique)
+
+    if not (do_repair or do_critique or do_nli):
+        result.timing_ms = {"wall": int((time.perf_counter() - wall_start) * 1000)}
+        return result
+
+    tasks: dict[str, tuple] = {}
+    if do_repair:
+        tasks["repair"] = (_pp_task_repair, (full_orig, bad, metas, context, question))
+    if do_critique:
+        tasks["critique"] = (_pp_task_critique, (full_orig, metas, context, question))
+    if do_nli:
+        tasks["nli"] = (_pp_task_nli, (full_orig, docs, metas))
+
+    # Execute — parallel when ≥2 tasks AND the env toggle is on. Sequential
+    # single-task path avoids thread overhead + preserves determinism for
+    # existing tests that mock ollama.chat with an in-order call sequence.
+    outcomes: dict[str, dict] = {}
+    if len(tasks) >= 2 and _pp_parallel_enabled():
+        with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+            futs = {name: ex.submit(fn, *args) for name, (fn, args) in tasks.items()}
+            for name, fut in futs.items():
+                try:
+                    outcomes[name] = fut.result(timeout=60)
+                except Exception as exc:
+                    _silent_log(f"postprocess_{name}_future_failed", exc)
+                    outcomes[name] = {"ran": False, "ok": False, "changed": False,
+                                       "full": None, "summary": None, "raw": None,
+                                       "ms": 0}
+    else:
+        for name, (fn, args) in tasks.items():
+            try:
+                outcomes[name] = fn(*args)
+            except Exception as exc:
+                _silent_log(f"postprocess_{name}_seq_failed", exc)
+                outcomes[name] = {"ran": False, "ok": False, "changed": False,
+                                   "full": None, "summary": None, "raw": None,
+                                   "ms": 0}
+
+    # Merge — repair wins over critique
+    repair_out = outcomes.get("repair", {})
+    critique_out = outcomes.get("critique", {})
+    nli_out = outcomes.get("nli", {})
+
+    if repair_out.get("ok") and repair_out.get("full"):
+        result.full = repair_out["full"]
+        result.citation_repaired = True
+    elif critique_out.get("changed") and critique_out.get("full"):
+        result.full = critique_out["full"]
+        result.critique_changed = True
+
+    if nli_out.get("ran"):
+        result.nli_summary = nli_out.get("summary")
+        result.nli_ms = int(nli_out.get("ms") or 0)
+        result.nli_result = nli_out.get("raw")
+
+    result.timing_ms = {
+        "wall": int((time.perf_counter() - wall_start) * 1000),
+        "repair": int(repair_out.get("ms") or 0),
+        "critique": int(critique_out.get("ms") or 0),
+        "nli": int(nli_out.get("ms") or 0),
+    }
+    return result
 
 
 def ground_claims_nli(

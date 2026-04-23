@@ -34907,16 +34907,53 @@ def serve(host: str, port: int):
             # than a slightly longer response.
             tasks_predict_cap = max(predict_cap, 700)
             t_gen0 = time.perf_counter()
+
+            # ── Streaming + TTFT tracking (2026-04-22) ─────────────────
+            # Pre-fix el call era `chat(...)` síncrono no-streaming: el
+            # main thread bloqueaba hasta el last token (15-70s medidos
+            # en serve.tasks). Post-fix iteramos chunks y capturamos
+            # TTFT (time-to-first-token) en ms.
+            #
+            # Por qué: streaming aquí NO baja wall-time percibido por
+            # WhatsApp (el listener igual espera el JSON completo antes
+            # de enviar el mensaje — WA no tiene streaming nativo). Pero
+            # habilita dos cosas:
+            #
+            #   1. TTFT como métrica distinta de t_gen: diagnóstica si
+            #      los 40-70s outliers (casos con Gmail + Apple Mail)
+            #      son prefill largo (TTFT alto) o decode slow
+            #      (TTFT bajo, t_gen alto). Rag_queries.extra_json.ttft_ms
+            #      permite refinar futuras optimizaciones con data
+            #      concreta en vez de hunches.
+            #   2. Early-stop futuro: iterar chunks abre la puerta a
+            #      detectar cierre natural (ej. triple newline + final
+            #      separator) y abortar la generación antes del cap.
+            #      No lo implementamos acá para no cambiar comportamiento
+            #      (hoy = mismo payload al cliente), pero el fundamento
+            #      queda.
+            #
+            # Clientes non-WA (CLI directo, scripts) podrían en el
+            # futuro consumir el endpoint via streaming (chunked transfer)
+            # y ver mejora real. Para WA, `answer` final sigue siendo
+            # la concatenación full — idempotente con el pre-fix.
+            parts: list[str] = []
+            ttft_ms: int | None = None
             try:
-                resp = _chat_capped_client().chat(
+                for chunk in _chat_capped_client().chat(
                     model=resolve_chat_model(),
                     messages=messages,
                     options={**CHAT_OPTIONS, "num_predict": tasks_predict_cap},
+                    stream=True,
                     keep_alive=chat_keep_alive(),
-                )
-                answer = (resp.message.content or "").strip()
+                ):
+                    content = chunk.message.content
+                    if content:
+                        if ttft_ms is None:
+                            ttft_ms = int((time.perf_counter() - t_gen0) * 1000)
+                        parts.append(content)
             except Exception as exc:
                 return {"error": f"LLM falló: {exc}"}
+            answer = "".join(parts).strip()
             t_gen = time.perf_counter() - t_gen0
 
             query_turn_id = new_turn_id()
@@ -34943,10 +34980,19 @@ def serve(host: str, port: int):
                     "t_retrieve": round(t_retrieve_tasks, 3),
                     "t_gen": round(t_gen, 3),
                     "answer_len": len(answer),
+                    # TTFT (time-to-first-token) en ms. Separado de t_gen
+                    # para distinguir prefill del decode: ttft_ms alto +
+                    # t_gen proporcional = prefill lento (contexto largo,
+                    # probablemente por Gmail/Apple Mail). ttft_ms bajo +
+                    # t_gen alto = decode lento (MPS contention, model
+                    # size). Los outliers 40-70s de serve.tasks se
+                    # diagnostican con este campo.
+                    "ttft_ms": ttft_ms,
                     "timing": _round_timing_ms({
                         "total_ms": (t_retrieve_tasks + t_gen) * 1000,
                         "retrieve_ms": t_retrieve_tasks * 1000,
                         "gen_ms": t_gen * 1000,
+                        "ttft_ms": ttft_ms,
                     }),
                 })
             except Exception:
@@ -34961,6 +35007,10 @@ def serve(host: str, port: int):
                 "urgent_count": len(urgent),
                 "t_retrieve": round(t_retrieve_tasks, 3),
                 "t_gen": round(t_gen, 3),
+                # Exponé TTFT al cliente por si quiere mostrar "respondiendo..."
+                # con timing real. WA listener lo ignora; CLI/scripts custom
+                # pueden loggearlo o pintarlo.
+                "ttft_ms": ttft_ms,
                 "turn_id": query_turn_id,
             }
             # Cachear igual que queries normales — respuestas idénticas en <5min

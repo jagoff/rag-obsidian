@@ -37488,25 +37488,182 @@ def stats():
             )
 
 
+def _resolve_nth_source_from_last_query(
+    nth: int, session: str | None,
+) -> dict | None:
+    """Resolve the Nth source (1-indexed) from the most recent rag_queries row.
+
+    When ``session`` is given, scope la última query a esa session. Si no,
+    busca la última query global (cualquier session). Returns dict::
+
+        {
+            "path": str,              # vault-relative
+            "original_query_id": int,
+            "query": str,
+            "session": str | None,
+            "total_sources": int,     # len(paths_json) en esa row
+        }
+
+    o None si:
+      - nth es < 1 o > total_sources
+      - no hay rag_queries row (session=X sin queries, o DB vacía)
+      - la row existe pero paths_json está vacío / corrupto
+
+    Motivación (2026-04-23): el usuario necesita un shortcut de 2
+    keystrokes para generar training signal de clicks sin registrar
+    el URL handler de x-rag-open://. `rag open --nth 3` abre el #3
+    del último retrieve + loggea el behavior event con
+    `original_query_id` poblado automáticamente. Signal quality igual
+    que un path_match del backfill pero inline.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            # Pickeamos la última query CON paths_json populado, saltéando
+            # metachat / empty-retrieve / degenerate rows (esas tienen
+            # paths_json=NULL y no aportan nada a un --nth). Sin este
+            # filter, queries como "Hola" (metachat) se convierten en "la
+            # última" y --nth reporta "no hay rag_queries row previa"
+            # aunque haya queries reales de hace 30 segundos.
+            if session:
+                row = conn.execute(
+                    "SELECT id, q, session, paths_json FROM rag_queries"
+                    " WHERE session = ?"
+                    " AND paths_json IS NOT NULL"
+                    " AND paths_json != '[]'"
+                    " AND paths_json != ''"
+                    " ORDER BY ts DESC LIMIT 1",
+                    (session,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id, q, session, paths_json FROM rag_queries"
+                    " WHERE paths_json IS NOT NULL"
+                    " AND paths_json != '[]'"
+                    " AND paths_json != ''"
+                    " ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+        if not row:
+            return None
+        qid, q, sess, paths_json = row
+        if not paths_json:
+            return None
+        try:
+            paths = json.loads(paths_json)
+        except Exception:
+            return None
+        if not isinstance(paths, list) or not paths:
+            return None
+        if nth < 1 or nth > len(paths):
+            return {
+                "path": None,
+                "original_query_id": int(qid),
+                "query": q,
+                "session": sess,
+                "total_sources": len(paths),
+                "out_of_range": True,
+            }
+        return {
+            "path": str(paths[nth - 1]),
+            "original_query_id": int(qid),
+            "query": q,
+            "session": sess,
+            "total_sources": len(paths),
+            "out_of_range": False,
+        }
+    except Exception as exc:
+        _log_sql_state_error(
+            "resolve_nth_source_failed", err=repr(exc),
+        )
+        return None
+
+
 @cli.command("open")
-@click.argument("path")
+@click.argument("path", required=False, default=None)
+@click.option("--nth", type=int, default=None,
+              help="Abrir el N-ésimo source (1-indexed) del último rag_queries. "
+                   "Alternativa a pasar PATH — auto-rellena `original_query_id` "
+                   "y `rank` en el behavior event.")
 @click.option("--query", default=None, help="Triggering query, forwarded to behavior log")
 @click.option("--rank", default=None, type=int, help="1-indexed rank among results when opened")
 @click.option("--source", default="cli", help="Event source: cli | whatsapp | web | brief")
-@click.option("--session", default=None, help="Session id, forwarded to behavior log")
-def open_cmd(path: str, query: str | None, rank: int | None, source: str, session: str | None):
+@click.option("--session", default=None,
+              help="Session id, forwarded to behavior log. Con --nth, "
+                   "scopea la búsqueda del último query a esa session.")
+def open_cmd(
+    path: str | None, nth: int | None, query: str | None,
+    rank: int | None, source: str, session: str | None,
+):
     """Open a vault note and record an open event in behavior.jsonl.
 
-    PATH may be vault-relative (e.g. 01-Projects/foo.md) or absolute.
-    The file is opened via macOS `open` (hands off to the default .md handler).
-    An open event is appended to ~/.local/share/obsidian-rag/behavior.jsonl
-    for use by the ranker-vivo pipeline.
+    Dos modos de uso:
 
-    When RAG_TRACK_OPENS=1 terminals emit x-rag-open:// URIs instead of
-    file:// — registering `rag open` as the x-rag-open handler routes clicks
-    through this command so every note-open from query results is logged.
+      • `rag open 02-Areas/nota.md`  — PATH explícito (vault-relative o
+        absoluto). Se abre vía macOS `open`; si está dentro del vault
+        emite `event=open`, si no `event=open_external`.
+
+      • `rag open --nth 3`           — abre el N-ésimo source del último
+        `rag_queries` (opcionalmente scoped por `--session`). Auto-
+        rellena `original_query_id`, `query`, y `rank` en el behavior
+        event, produciendo un par de training clean para el ranker-vivo
+        fine-tune — sin que el user tenga que registrar el URL handler
+        de `x-rag-open://` en macOS.
+
+    Un evento de open se appendea a ~/.local/share/obsidian-rag/
+    behavior.jsonl + rag_behavior SQL.
+
+    Flag RAG_TRACK_OPENS=1 cambia los OSC 8 links a `x-rag-open://` —
+    registrando `rag open` como handler de ese scheme, los clicks en el
+    terminal se routean por acá (mode 1, path-explícito).
     """
     import subprocess
+
+    # Validar modo: path XOR --nth, no ambos ni ninguno.
+    if path is not None and nth is not None:
+        click.echo(
+            "error: --nth y PATH son mutuamente excluyentes. "
+            "Pasá uno o el otro, no ambos.",
+            err=True,
+        )
+        raise SystemExit(2)
+    if path is None and nth is None:
+        click.echo(
+            "error: pasá un PATH o --nth N. Ejemplos:\n"
+            "  rag open 02-Areas/nota.md\n"
+            "  rag open --nth 3",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    # Modo --nth: resolver desde la última rag_queries row.
+    _resolved_from_nth: dict | None = None
+    if nth is not None:
+        _resolved_from_nth = _resolve_nth_source_from_last_query(
+            nth=int(nth), session=session,
+        )
+        if _resolved_from_nth is None:
+            click.echo(
+                "error: no hay rag_queries row previa"
+                + (f" para session={session!r}" if session else "")
+                + ". Correr `rag query <...>` o `rag chat` primero.",
+                err=True,
+            )
+            raise SystemExit(1)
+        if _resolved_from_nth.get("out_of_range"):
+            total = _resolved_from_nth["total_sources"]
+            click.echo(
+                f"error: --nth {nth} fuera de rango. La última query tuvo "
+                f"{total} source(s).",
+                err=True,
+            )
+            raise SystemExit(1)
+        path = _resolved_from_nth["path"]
+        # Heredar query / session del resolved si el user no los pasó.
+        if query is None and _resolved_from_nth.get("query"):
+            query = _resolved_from_nth["query"]
+        if session is None and _resolved_from_nth.get("session"):
+            session = _resolved_from_nth["session"]
+        if rank is None:
+            rank = int(nth)
 
     p = Path(path)
     if not p.is_absolute():
@@ -37532,6 +37689,12 @@ def open_cmd(path: str, query: str | None, rank: int | None, source: str, sessio
             ev["rank"] = rank
         if session is not None:
             ev["session"] = session
+        # `--nth` inyecta el original_query_id para que el ranker-vivo
+        # construya el training pair sin tener que adivinar (vs el
+        # fallback del `rag behavior backfill`, que usa heurísticas
+        # temporales + path match). Señal directa = mayor calidad.
+        if _resolved_from_nth is not None:
+            ev["original_query_id"] = int(_resolved_from_nth["original_query_id"])
         log_behavior_event(ev)
     else:
         ev_ext: dict = {"source": source, "event": "open_external"}
@@ -37542,6 +37705,14 @@ def open_cmd(path: str, query: str | None, rank: int | None, source: str, sessio
         log_behavior_event(ev_ext)
 
     subprocess.run(["open", str(resolved)])
+
+    # Feedback al user sobre qué se abrió (solo en modo --nth, donde
+    # no pasó el path explícito). Útil como confirmación.
+    if _resolved_from_nth is not None:
+        click.echo(
+            f"✓ opened #{nth}: {path}  "
+            f"(query: {(_resolved_from_nth['query'] or '')[:60]!r})"
+        )
 
 
 @cli.group()

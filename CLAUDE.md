@@ -161,6 +161,7 @@ rag feedback backfill [--limit N --rating pos|neg|both --since DAYS]  # agregar 
 rag behavior backfill [--dry-run --window-minutes N --limit N]  # linkea opens huérfanos (original_query_id NULL) al rag_queries.id — +training signal
 rag feedback harvest [--limit N --since DAYS --confidence-below F]    # labelear queries low-conf sin thumbs
 rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `open` path (ranker-vivo click tracking)
+rag open --nth N [--session ID]  # shortcut: abre el N-ésimo source del último rag_queries + auto-fill original_query_id (sin setup de x-rag-open handler)
 
 # Maintenance
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping

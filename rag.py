@@ -23853,11 +23853,17 @@ def _render_silent_errors_log(n: int, summary: bool) -> None:
 @click.option("--low-confidence", is_flag=True, help="Solo queries con top_score < 0")
 @click.option("--feedback", "with_feedback", is_flag=True,
               help="Solo turnos con rating (👍/👎), con una columna de feedback")
+@click.option("--slow", is_flag=True,
+              help="Feature #13: solo queries 'slow' — total latency > --slower-than ms "
+                   "(default 5000). Ordenadas por total DESC.")
+@click.option("--slower-than", "slower_than_ms", default=5000, show_default=True,
+              help="Umbral en ms de total latency (retrieve+gen) para --slow.")
 @click.option("--silent-errors", "silent_errors", is_flag=True,
               help="Listar silent_errors.jsonl (writes del _silent_log helper) en vez del queries log")
 @click.option("--summary", is_flag=True,
               help="Con --silent-errors, agrupa por (where × exc_type) en vez de listar individualmente")
 def log(n: int, low_confidence: bool, with_feedback: bool,
+        slow: bool, slower_than_ms: int,
         silent_errors: bool, summary: bool):
     """Inspeccionar el log de queries (últimas N).
 
@@ -23866,6 +23872,11 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
     detectar subsistemas que fallan calladamente (context_cache corrupto,
     feedback_golden_embed offline, contradict JSON parse). Agregar
     --summary agrupa por (where × exc_type) para ver patrones.
+
+    --slow filtra queries cuyo total latency (retrieve+gen) supera
+    --slower-than ms (default 5000) — útil para identificar outliers
+    y detectar regresiones de perf. Ordena por total DESC para mostrar
+    los peores casos primero.
 
     Post-T10 (2026-04-19) lee de `rag_queries` SQL — el archivo JSONL
     `queries.jsonl` ahora recibe eventos de otro stream (conversation
@@ -23881,7 +23892,8 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
     # round-trips: fetch N when feedback isn't active, 5*N otherwise
     # (heuristic — feedback rows are rare, so 5x overprovisioning covers
     # typical usage without dragging the whole table).
-    fetch_n = n * 5 if with_feedback else n
+    # --slow needs a bigger pool to find outliers — fetch 20x N.
+    fetch_n = n * 20 if slow else (n * 5 if with_feedback else n)
     entries = _read_queries_for_log(fetch_n, low_confidence=low_confidence)
 
     # Feedback annotations: always load so the renderer can paint the
@@ -23892,7 +23904,20 @@ def log(n: int, low_confidence: bool, with_feedback: bool,
         entries = [e for e in entries if e.get("turn_id") in fb_by_turn]
         # Trim to N now that the filter narrowed the set.
         entries = entries[-n:]
-    tbl = Table(title=f"Últimas {len(entries)} queries", show_lines=False)
+
+    if slow:
+        # Compute total latency (retrieve + gen) and filter/sort.
+        def _total_ms(e: dict) -> float:
+            return float(e.get("t_retrieve") or 0) + float(e.get("t_gen") or 0)
+        entries = [e for e in entries if _total_ms(e) > slower_than_ms]
+        entries.sort(key=_total_ms, reverse=True)
+        entries = entries[:n]
+    title = (
+        f"Queries más lentas ({len(entries)}, >{slower_than_ms}ms)"
+        if slow
+        else f"Últimas {len(entries)} queries"
+    )
+    tbl = Table(title=title, show_lines=False)
     tbl.add_column("ts", style="dim")
     tbl.add_column("query", style="cyan", overflow="fold", max_width=45)
     tbl.add_column("score", justify="right")

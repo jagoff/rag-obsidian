@@ -86,6 +86,31 @@ mv .devin/config.json .devin/config.json.disabled
 # O solo una regla específica: editar y quitar la línea.
 ```
 
+## Zsh tab-completion (`_rag`)
+
+Hay un completion script hand-written en [`completions/_rag`](completions/_rag) con descriptions por subcomando, flags, sub-grupos anidados (ambient/session/vault/...), y helpers dinámicos (`_rag_vaults` lee `rag vault list`, `_rag_sessions` lee `rag session list`, `--source` abre el set cross-source como choices, `--vault` sugiere los registrados). Startup nativo de zsh (~10-50ms por Tab), no spawnea Python como haría el completion automático de Click (~350ms warm / 1s cold).
+
+**Instalación one-shot** (una vez por máquina):
+
+```bash
+cp completions/_rag ~/.oh-my-zsh/custom/completions/_rag
+rm -f ~/.zcompdump* /tmp/_zcomp*       # invalidar el cache de compinit
+exec zsh                                # o abrir una nueva terminal
+```
+
+Cualquier dir dentro de `$fpath` sirve (no hace falta OMZ — Homebrew zsh usa `/usr/local/share/zsh/site-functions/`, macOS stock usa `/usr/share/zsh/site-functions/`).
+
+**Regenerar tras cambiar el árbol de Click** (nuevo subcomando, nuevo flag, nuevo choice):
+
+```bash
+.venv/bin/python scripts/gen_zsh_completion.py > completions/_rag
+cp completions/_rag ~/.oh-my-zsh/custom/completions/_rag
+rm -f ~/.zcompdump*
+exec zsh
+```
+
+El generador ([`scripts/gen_zsh_completion.py`](scripts/gen_zsh_completion.py)) camina el árbol de Click, emite `_arguments`/`_describe` nativos, detecta `click.Choice`/`click.Path`/`click.File` → actions correctas, y escapa single-quotes con el truco `'\''`. No regenera automáticamente en CI — quedó a ojo del dev que toca el CLI; si el completion queda stale, peor caso: Tab no sugiere el flag nuevo (no rompe nada).
+
 ## Commands
 
 ```bash

@@ -173,6 +173,26 @@ def test_ext_block_still_renders_with_warning():
     assert "<</ext>>" not in r
 
 
+def test_ext_block_malformed_closing_tag_still_renders():
+    """qwen2.5:7b a veces emite closings mal formados — `</ext>>` con
+    un `<` faltante es el caso más frecuente (observado en producción
+    2026-04-23). El regex permisivo tiene que matchear las 4 variantes
+    (canónico, falta-<, falta->, ambos faltan) para que el CLI los
+    renderice igual que el frontend web, que ya era permisivo.
+    """
+    variants = [
+        "X. <<ext>>ctx</ext>> Y.",     # falta un `<` en la closing
+        "X. <<ext>>ctx<</ext> Y.",     # falta un `>` en la closing
+        "X. <<ext>>ctx</ext> Y.",      # faltan ambos
+    ]
+    for text in variants:
+        r = _plain(rag.render_response(text))
+        assert "⚠" in r, f"no renderizó warning para variante:\n{text!r}\n→ {r!r}"
+        assert "ctx" in r
+        # El contenido de la tag no debe quedar wrapped en los delimiters.
+        assert "<<ext>>" not in r, f"tag leaked en output para {text!r}: {r!r}"
+
+
 # ── Combinaciones (el caso real que motivó esto) ─────────────────────────────
 
 

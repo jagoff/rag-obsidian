@@ -237,7 +237,17 @@ def _format_reminders_block(raw: str) -> str:
     if not dated and not undated:
         return "### Recordatorios\n_Sin recordatorios pendientes._\n"
 
-    lines: list[str] = ["### Recordatorios"]
+    # Header con counts explícitos. Pre-fix qwen2.5:7b a veces contaba
+    # mal ("tres tareas para llamar al dentista" cuando había una sola);
+    # emitir N/M literal en el header le da al modelo un ancla numérica
+    # para no alucinar totales. Medido 2026-04-23 en scratch_eval.
+    header_bits: list[str] = []
+    if dated:
+        header_bits.append(f"{len(dated)} con fecha")
+    if undated:
+        header_bits.append(f"{len(undated)} sin fecha")
+    header = f"### Recordatorios ({', '.join(header_bits)})"
+    lines: list[str] = [header]
     if dated:
         lines.append("**Con fecha:**")
         for it in dated:
@@ -277,13 +287,12 @@ def _format_calendar_block(raw: str) -> str:
     if not data:
         return "### Calendario\n_Sin eventos en el horizonte._\n"
 
-    lines: list[str] = ["### Calendario"]
-    for ev in data:
-        if not isinstance(ev, dict):
-            continue
+    # Count explícito en header (ver comentario en _format_reminders_block).
+    valid_events = [ev for ev in data if isinstance(ev, dict) and str(ev.get("title", "")).strip()]
+    header = f"### Calendario ({len(valid_events)} evento{'s' if len(valid_events) != 1 else ''})"
+    lines: list[str] = [header]
+    for ev in valid_events:
         title = str(ev.get("title", "")).strip()
-        if not title:
-            continue
         date_label = str(ev.get("date_label", "")).strip()
         time_range = str(ev.get("time_range", "")).strip()
         parts: list[str] = []
@@ -313,12 +322,16 @@ def _format_gmail_block(raw: str) -> str:
     unread = int(data.get("unread_count") or 0)
     if not threads and unread == 0:
         return "### Mails\n_Sin mails pendientes._\n"
-    lines = ["### Mails"]
+    # Count explícito en header (ver comentario en _format_reminders_block).
+    valid_threads = [t for t in threads if isinstance(t, dict)]
+    header_bits: list[str] = []
+    if valid_threads:
+        header_bits.append(f"{len(valid_threads)} hilo{'s' if len(valid_threads) != 1 else ''}")
     if unread:
-        lines.append(f"_{unread} no leídos en total._")
-    for t in threads:
-        if not isinstance(t, dict):
-            continue
+        header_bits.append(f"{unread} no leído{'s' if unread != 1 else ''}")
+    header = f"### Mails ({', '.join(header_bits)})" if header_bits else "### Mails"
+    lines = [header]
+    for t in valid_threads:
         frm = str(t.get("from", "")).strip()
         subj = str(t.get("subject", "")).strip()
         kind = str(t.get("kind", "")).strip()
@@ -422,6 +435,47 @@ def _pick_metachat_reply(q: str, *, now: float | None = None) -> str:
     minute = int(ts // 60)
     seed = int(hashlib.sha256(f"{q}|{minute}".encode()).hexdigest()[:8], 16)
     return bucket[seed % len(bucket)]
+
+
+# ── Degenerate query short-circuit (2026-04-23) ──────────────────────
+# Queries con <2 caracteres alfanuméricos (ej. "x", "?", "?¡@#") caían
+# al retrieve + rerank y devolvían chunks random de WhatsApp porque el
+# matching semántico sobre un input casi vacío es puro ruido. Medido en
+# scratch_eval: `?¡@#` → 395 chars de contenido WA sin relación. Ahora
+# devolvemos una respuesta canned antes de tocar retrieve/LLM,
+# invitando al usuario a reformular.
+_DEGENERATE_REPLIES: tuple[str, ...] = (
+    "No entendí tu pregunta. Podés reformularla con más detalle?",
+    "Necesito un poco más de contexto. Qué querés consultar de tus notas?",
+    "Tu mensaje parece muy corto o sin contenido. Preguntame algo concreto sobre el vault.",
+)
+
+
+def _is_degenerate_query(q: str) -> bool:
+    """True si la query tiene <2 caracteres alfanuméricos totales.
+
+    Evita que `"x"`, `"?"`, `"?¡@#"`, strings de puro símbolo, o cadenas
+    vacías disparen el pipeline full — no hay suficiente señal para que
+    el retrieve devuelva algo útil ni para que el LLM produzca una
+    respuesta honesta. Metachat tiene su propio short-circuit; esta
+    función se encarga de lo que no alcanza ni siquiera a ser saludo.
+    """
+    if not q or not q.strip():
+        return True
+    alphanum = sum(1 for c in q if c.isalnum())
+    return alphanum < 2
+
+
+def _pick_degenerate_reply(q: str, *, now: float | None = None) -> str:
+    """Pick a canned reply for a degenerate-query turn. Same seeding as
+    metachat (hash(q) XOR minute-bucket) so retries stay stable.
+    """
+    import hashlib
+    import time as _time
+    ts = now if now is not None else _time.time()
+    minute = int(ts // 60)
+    seed = int(hashlib.sha256(f"{q}|{minute}".encode()).hexdigest()[:8], 16)
+    return _DEGENERATE_REPLIES[seed % len(_DEGENERATE_REPLIES)]
 
 
 # Post-stream filter enforcing REGLA 0 at the byte level. qwen2.5:7b and
@@ -621,14 +675,17 @@ _WEB_SYSTEM_PROMPT_V1 = (
     "REGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. "
     "TOTALMENTE PROHIBIDO emitir tokens en chino, japonés, coreano, "
     "árabe, ruso, alemán, portugués, italiano, francés o cualquier "
-    "idioma que no sea español. Si el contexto recuperado contiene "
-    "fragmentos en otros idiomas (ej. citas en inglés, nombres "
-    "propios, código), citalos textualmente entre comillas pero el "
-    "resto de tu respuesta TIENE QUE estar en español. Si la "
-    "pregunta del usuario está en otro idioma, traducila a español "
-    "mentalmente y respondé en español. Esta regla es ABSOLUTA — "
-    "ni siquiera caracteres sueltos en otro alfabeto (汉字, "
-    "русский, etc.) están permitidos en tu output.\n\n"
+    "idioma que no sea español — aunque el CONTEXTO contenga chats "
+    "de WhatsApp con contactos brasileros, argentinos de otros "
+    "países o notas con fragmentos no-español, la respuesta TIENE QUE "
+    "estar íntegramente en español rioplatense. Si el contexto "
+    "recuperado contiene fragmentos en otros idiomas (ej. citas en "
+    "inglés, nombres propios, código), citalos textualmente entre "
+    "comillas pero el resto de tu respuesta TIENE QUE estar en "
+    "español. Si la pregunta del usuario está en otro idioma, "
+    "traducila a español mentalmente y respondé en español. Esta "
+    "regla es ABSOLUTA — ni siquiera caracteres sueltos en otro "
+    "alfabeto (汉字, русский, etc.) están permitidos en tu output.\n\n"
     "REGLA 1 — ENGÁNCHATE CON EL CONTEXTO QUE RECIBÍS:\n"
     "  • El CONTEXTO abajo es lo que el retriever consideró más "
     "relacionado con la pregunta. Tu trabajo es leerlo y resumir lo "
@@ -678,19 +735,18 @@ _WEB_SYSTEM_PROMPT_V1 = (
     "no citas; tienen que aparecer en la respuesta. Ejemplo: si un "
     "chunk dice 'tutorial: https://x.com/y', escribí 'tutorial: "
     "https://x.com/y', no 'tutorial disponible'.\n\n"
-    "REGLA 4.6 — LINK A DOCS OFICIALES (opcional, condicionado): si el "
-    "CONTEXTO sobre una herramienta/producto se queda corto Y la "
-    "pregunta se beneficiaría de docs oficiales (ej: 'cómo configuro X', "
-    "'qué features tiene Y'), podés ofrecer UN link a la documentación "
-    "oficial al final, envuelto en `<<ext>>...<</ext>>`. Restricciones "
-    "duras:\n"
-    "  • Sólo el dominio raíz canónico (ej: https://omnifocus.com, "
-    "https://obsidian.md). NUNCA inventes paths profundos "
-    "(/docs/v3/foo) — si no estás 100% seguro de la URL exacta, usá "
-    "el root.\n"
-    "  • Una sola línea, formato: `<<ext>>Más info: <URL></ext>>`.\n"
-    "  • NO ofrecer link si el CONTEXTO ya cubre la pregunta, ni para "
-    "consultas sobre las notas mismas (vault, tags, búsqueda).\n\n"
+    "REGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): "
+    "TOTALMENTE PROHIBIDO para queries sobre personas ('qué sabés "
+    "de X', 'hablame de Y'), eventos, recordatorios, mails, gastos, "
+    "WhatsApp, calendario o cualquier dato del vault. SOLO aplica "
+    "cuando (a) la pregunta nombra EXPLÍCITAMENTE un software / "
+    "herramienta / producto externo (ej: 'cómo configuro OmniFocus', "
+    "'qué features tiene Obsidian'), (b) el CONTEXTO del vault se "
+    "queda corto para lo que se pide, y (c) tenés certeza del dominio "
+    "raíz oficial. Formato: una sola línea al final, "
+    "`<<ext>>Más info: <dominio-raíz></ext>>`. NUNCA inventes paths "
+    "profundos. En TODOS los demás casos NO agregues link externo, "
+    "aunque la respuesta quede breve. Ante duda, NO lo incluyas.\n\n"
     "REGLA 5 — SEGUÍ EL HILO: esta es una conversación, no preguntas "
     "sueltas. Los mensajes previos (user/assistant de arriba) son "
     "contexto vivo. Si la pregunta nueva usa pronombres ('ella', "
@@ -707,7 +763,18 @@ _WEB_SYSTEM_PROMPT_V1 = (
     "hija'; 'las notas del usuario' → 'tus notas'; 'el proyecto X "
     "del usuario' → 'tu proyecto X'. Si una nota dice 'Grecia es la "
     "hija de Fernando', y Fernando es el usuario, escribí 'Grecia es "
-    "tu hija'.\n"
+    "tu hija'.\n\n"
+    "REGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias "
+    "personas distintas (ej: una 'María' contacto + otra 'María' de "
+    "otro chat + un 'Mario'), NUNCA mezcles sus atributos. Si no "
+    "podés distinguir a quién pertenece cada dato, decí explícitamente "
+    "'hay varias personas con ese nombre en tus notas' y listá lo más "
+    "seguro. PROHIBIDO inventar parentesco ('María es tu hermana/o', "
+    "'es tu prima') si el CONTEXTO no lo afirma LITERALMENTE con esa "
+    "palabra — si una nota dice 'mi prima María' y otra 'María "
+    "Fernández, colega', NO unifiques. Respetá el género y pronombres "
+    "como aparecen en cada cita — no los 'corrijas' al género de la "
+    "persona preguntada.\n"
 )
 
 # v2: comprimido 2898 chars (~724 tok), −44% tokens. Mismas REGLAs
@@ -715,7 +782,16 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # (`<<ext>>...<</ext>>`, `[Título](ruta.md)`, `03-Resources/`, `[[Nota]]`).
 # Medido 2026-04-20: prefill cae 1737ms → ~1100ms en el bench A/B
 # gracias al ahorro de ~600 tok del system prompt.
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en otros idiomas o alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO: texto que NO salga literal del CONTEXTO (parafraseo, conectores, opinión, conocimiento general) va envuelto en `<<ext>>...<</ext>>`. Fuera de esos marcadores todo debe ser verificable en el CONTEXTO.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (opcional): si el CONTEXTO sobre una herramienta se queda corto, ofrecé UN link al dominio raíz canónico (https://omnifocus.com, NUNCA paths profundos) al final, una sola línea: `<<ext>>Más info: <URL></ext>>`. No lo ofrezcas si el CONTEXTO ya cubre ni en consultas sobre el vault (tags, búsqueda, notas).\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".'
+#
+# 2026-04-23: endurecemos REGLA 4.6 + agregamos REGLA 7 (anti-fusión de
+# personas). El scratch_eval automático mostró que el LLM pegaba
+# `<<ext>>Más info: https://omnifocus.com</ext>>` en queries sobre
+# personas ("hablame de María", "qué eventos tengo") — leyó la URL del
+# prompt como ejemplo copiable. También fusionaba info de 2+ personas
+# del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
+# incluir portugués e italiano explícitamente (contagion bajo fast-path
+# WA con contactos brasileros).
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO: texto que NO salga literal del CONTEXTO (parafraseo, conectores, opinión, conocimiento general) va envuelto en `<<ext>>...<</ext>>`. Fuera de esos marcadores todo debe ser verificable en el CONTEXTO.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -4237,6 +4313,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # `_detect_metachat_intent` for the matcher shape + rationale.
     is_metachat = (not is_propose_intent) and _detect_metachat_intent(question)
 
+    # 2026-04-23: degenerate-query short-circuit. Inputs sin ≥2 chars
+    # alfanuméricos (ej. "x", "?¡@#") caían al retrieve y devolvían
+    # chunks random porque el matching semántico de un string casi
+    # vacío no tiene signal. Devolvemos canned "no entendí, reformulá"
+    # antes de tocar ninguna pieza pesada. No es metachat (no es saludo
+    # ni thanks) — tiene su propio bucket para que el logging lo
+    # distinga en analytics.
+    is_degenerate = (
+        not is_propose_intent
+        and not is_metachat
+        and _is_degenerate_query(question)
+    )
+
     sid = req.session_id or f"web:{uuid.uuid4().hex[:12]}"
     sess = ensure_session(sid, mode="chat")
     vaults = _resolve_scope(req.vault_scope)
@@ -4327,6 +4416,41 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     def gen():
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
+
+        # Degenerate query short-circuit. Devuelve canned reply e
+        # invita a reformular. No loggea como metachat (bucket propio
+        # en analytics: `web.chat.degenerate`).
+        if is_degenerate:
+            reply = _pick_degenerate_reply(question)
+            turn_id = new_turn_id()
+            yield _sse("sources", {
+                "items": [], "confidence": None, "metachat": True,
+            })
+            yield _sse("status", {"stage": "generating"})
+            for i in range(0, len(reply), 40):
+                yield _sse("token", {"delta": reply[i:i+40]})
+            total_ms = int((time.perf_counter() - _t0) * 1000)
+            yield _sse("done", {
+                "turn_id": turn_id, "elapsed_ms": total_ms,
+                "metachat": True,
+            })
+            try:
+                append_turn(sess, {
+                    "turn_id": turn_id, "q": question,
+                    "a": reply[:500], "metachat": True,
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.degenerate", "q": question[:200],
+                    "session": sess["id"], "answered": True,
+                    "t_total": round(total_ms / 1000.0, 3),
+                })
+            except Exception:
+                pass
+            return
 
         # Meta-chat short-circuit. Canned responses (varied across
         # WA-style variants so repeated "hola" doesn't always say the

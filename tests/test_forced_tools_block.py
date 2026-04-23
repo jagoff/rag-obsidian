@@ -202,6 +202,76 @@ def test_unknown_tool_falls_back_to_raw_string():
     assert "foo" in out or "bar" in out
 
 
+# ── counts explícitos en header (2026-04-23) ─────────────────────────
+
+
+def test_reminders_due_header_includes_dated_and_undated_counts():
+    """El header debe expresar N con fecha / M sin fecha para anclar al
+    LLM y evitar que cuente mal ('tres tareas' cuando había una).
+    """
+    fmt = _import_helper()
+    raw = json.dumps({
+        "dated": [
+            {"id": "r1", "name": "A", "due": "2026-04-24T10:00", "bucket": "upcoming"},
+        ],
+        "undated": [
+            {"id": "r2", "name": "B", "due": "", "bucket": "undated"},
+            {"id": "r3", "name": "C", "due": "", "bucket": "undated"},
+        ],
+    }, ensure_ascii=False)
+    out = fmt("reminders_due", raw)
+    # Expect "1 con fecha, 2 sin fecha" en el header.
+    assert "1 con fecha" in out, f"header sin count `con fecha`:\n{out}"
+    assert "2 sin fecha" in out, f"header sin count `sin fecha`:\n{out}"
+
+
+def test_reminders_due_header_only_dated():
+    fmt = _import_helper()
+    raw = json.dumps({
+        "dated": [{"name": "A", "due": "2026-04-24T10:00", "bucket": "upcoming"}],
+        "undated": [],
+    }, ensure_ascii=False)
+    out = fmt("reminders_due", raw)
+    assert "1 con fecha" in out
+    # No debe mencionar "sin fecha" cuando no hay items de esa categoría.
+    assert "sin fecha" not in out.lower().replace("_sin recordatorios pendientes._", "")
+
+
+def test_calendar_ahead_header_includes_event_count():
+    fmt = _import_helper()
+    raw = json.dumps([
+        {"title": "A", "date_label": "hoy", "time_range": ""},
+        {"title": "B", "date_label": "mañana", "time_range": ""},
+        {"title": "C", "date_label": "pasado", "time_range": ""},
+    ], ensure_ascii=False)
+    out = fmt("calendar_ahead", raw)
+    assert "3 eventos" in out, f"esperaba '3 eventos' en header:\n{out}"
+
+
+def test_calendar_ahead_header_singular_for_one_event():
+    fmt = _import_helper()
+    raw = json.dumps([
+        {"title": "Solo uno", "date_label": "hoy", "time_range": ""},
+    ], ensure_ascii=False)
+    out = fmt("calendar_ahead", raw)
+    # Singular "evento" no "eventos".
+    assert "1 evento)" in out, f"esperaba '1 evento)' en header (singular):\n{out}"
+
+
+def test_gmail_recent_header_includes_thread_count():
+    fmt = _import_helper()
+    raw = json.dumps({
+        "unread_count": 12,
+        "threads": [
+            {"kind": "awaiting_reply", "from": "a@b.com", "subject": "s1"},
+            {"kind": "starred", "from": "c@d.com", "subject": "s2"},
+        ],
+    }, ensure_ascii=False)
+    out = fmt("gmail_recent", raw)
+    assert "2 hilos" in out
+    assert "12 no leídos" in out
+
+
 # ── integration: compose multiple blocks ──────────────────────────────
 
 

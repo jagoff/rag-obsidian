@@ -90,7 +90,13 @@ BARE_PATH_RE = re.compile(r"\[([^\[\]\n]+?\.md)\]")
 # vault-relative path. Bare URL form catches naked https:// in prose.
 URL_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 BARE_URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+")
-EXT_RE = re.compile(r"<<ext>>(.*?)<<\/ext>>", re.DOTALL)
+# 2026-04-23: permisivo frente a closing tags malformados — qwen2.5:7b a
+# veces emite `</ext>>` (un `<` faltante) o `<</ext>` (un `>` faltante)
+# en vez del canónico `<</ext>>`. El frontend web ya usaba un regex
+# igual de permisivo (web/static/app.js `<{1,2}\/ext>{1,2}`). Antes,
+# el CLI (`rag query --plain`) dejaba esas variantes literales en la
+# terminal. Ahora matcheamos las 4 variantes y las renderemos igual.
+EXT_RE = re.compile(r"<<ext>>(.*?)<{1,2}\/ext>{1,2}", re.DOTALL)
 # Fenced code blocks: ```lang\nbody\n```  — lang is optional.
 CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+.\-]*\n?(.*?)\n?```", re.DOTALL)
 # Inline code: `literal` (no newlines, no empties). Skipped inside fences
@@ -33299,6 +33305,59 @@ def _maintenance_plist(rag_bin: str) -> str:
 """
 
 
+def _auto_harvest_plist(rag_bin: str) -> str:
+    """Nightly auto-harvest — every day at 03:00, before online-tune (03:30).
+
+    Corre `rag feedback auto-harvest` sobre queries low-confidence de las
+    últimas 24h sin feedback explícito. Un LLM-as-judge decide qué chunk
+    responde mejor cada query y sólo inserta rows cuando la confianza
+    del juez es ≥ 0.8. Los rows tienen source='auto-harvester' en
+    extra_json para poder auditarlos por separado del harvester manual.
+
+    Programado a las 03:00 para que el online-tune de 03:30 ya vea la
+    señal fresca que generó el auto-harvest. El ollama está idle a esa
+    hora (después del day-use, antes de los daemons que ingestan).
+
+    RunAtLoad=false — no conviene blockear rag setup con un run completo.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-auto-harvest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>feedback</string>
+    <string>auto-harvest</string>
+    <string>--since</string>
+    <string>1</string>
+    <string>--limit</string>
+    <string>20</string>
+    <string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/auto-harvest.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/auto-harvest.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _online_tune_plist(rag_bin: str) -> str:
     """Nightly online-tune — every day at 03:30, after Ollama is idle."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -33550,6 +33609,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _archive_plist(rag_bin)),
         ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
          _wa_tasks_plist(rag_bin)),
+        ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
+         _auto_harvest_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
          _online_tune_plist(rag_bin)),
         ("com.fer.obsidian-rag-maintenance", "com.fer.obsidian-rag-maintenance.plist",
@@ -39303,6 +39364,360 @@ def feedback_harvest(limit: int, since: int, confidence_below: float):
     elif corrective > 0:
         console.print(f"  Gate: {stats['with_cp']}/{_FEEDBACK_GATE_TARGET} "
                       f"(faltan {remaining}).")
+    console.print()
+
+
+# ── auto-harvest: LLM-as-judge nocturno para corrective_path ────────────
+# Feature #1 del 2026-04-23: harvester autónomo que labelea queries
+# low-confidence sin feedback explícito, usando un LLM como juez. El
+# objetivo es desbloquear el gate del fine-tune del reranker (GC#2.C)
+# sin depender de que el usuario se siente a labelear manualmente con
+# `rag feedback harvest` (interactive CLI) o el skill de Claude Code.
+#
+# Flujo:
+# 1. `_harvest_candidates()` (ya existe) lista queries recent con
+#    top_score bajo y sin feedback.
+# 2. Para cada candidato, `_auto_harvest_snippets()` lee los top-5 paths
+#    y devuelve snippets representativos (primer heading + 400 chars).
+# 3. `_auto_harvest_judge()` llama al modelo (qwen2.5:7b por default,
+#    override por env) con prompt estructurado → JSON con verdict +
+#    confidence. Si el judge está seguro de cuál chunk es el correcto,
+#    devuelve {"verdict": "<path>", "confidence": 0.0-1.0}.
+# 4. Si confidence >= min_judge_conf (default 0.8), `auto_harvest()`
+#    inserta una fila en rag_feedback con source='auto-harvester' +
+#    corrective_path. Si el verdict es "none" con confidence alta,
+#    inserta una fila -1 sobre todos los paths vistos.
+# 5. `rag feedback auto-harvest` command + plist nocturno (03:00 AM,
+#    antes del online-tune a las 03:30) ejecutan el loop completo
+#    sin intervención.
+#
+# Design choices:
+# - Temperature=0, seed=42, format=json (HELPER_OPTIONS + num_ctx=4096)
+#   → determinismo para reproducir decisiones.
+# - Judge model default: qwen2.5:7b (balance entre calidad del juicio
+#   y latencia). Env override RAG_AUTO_HARVEST_JUDGE_MODEL.
+# - Conservative threshold: min_judge_conf=0.8 default. Preferimos NO
+#   insertar ruido vs. insertar rows inciertas — la data de fine-tune
+#   ruidosa ya tumbó el gate una vez (ver docs/finetune-run-2026-04-22).
+# - Paths de "verdict" se validan contra la lista de candidatos: si el
+#   judge inventa un path (hallucination), skip. Nunca aceptamos paths
+#   inventados.
+# - source='auto-harvester' en extra_json (distinto de 'harvester' manual)
+#   para poder filtrarlos / auditarlos por separado.
+
+_AUTO_HARVEST_JUDGE_MODEL = os.environ.get(
+    "RAG_AUTO_HARVEST_JUDGE_MODEL", "qwen2.5:7b"
+).strip()
+_AUTO_HARVEST_MIN_CONF = float(
+    os.environ.get("RAG_AUTO_HARVEST_MIN_CONF", "0.8")
+)
+_AUTO_HARVEST_SNIPPET_CHARS = int(
+    os.environ.get("RAG_AUTO_HARVEST_SNIPPET_CHARS", "400")
+)
+
+
+def _auto_harvest_snippets(
+    paths: list[str], vault: Path | None = None, n_chars: int | None = None,
+) -> list[tuple[str, str]]:
+    """Read top-5 paths, return (path, snippet) tuples.
+
+    Snippet = first non-empty line (treated as title/heading) + up to
+    n_chars of body. Non-existent files get an empty snippet — the
+    judge will still see the path but can skip it.
+
+    Defensive: never raises. Missing vault / unreadable files → empty
+    snippets. The judge prompt handles empty snippets gracefully.
+    """
+    if vault is None:
+        vault = _resolve_vault_path()
+    if n_chars is None:
+        n_chars = _AUTO_HARVEST_SNIPPET_CHARS
+    out: list[tuple[str, str]] = []
+    for p in paths[:5]:
+        full = vault / p
+        try:
+            text = full.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            out.append((p, ""))
+            continue
+        # Strip YAML frontmatter if present.
+        if text.startswith("---\n"):
+            end = text.find("\n---", 4)
+            if end > 0:
+                text = text[end + 4:].lstrip("\n")
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            out.append((p, ""))
+            continue
+        title = lines[0][:120]
+        body = " ".join(lines[1:])[:n_chars]
+        snippet = f"{title} — {body}" if body else title
+        out.append((p, snippet))
+    return out
+
+
+def _auto_harvest_judge(
+    q: str,
+    candidates: list[tuple[str, str]],
+    *,
+    model: str | None = None,
+) -> dict | None:
+    """Ask the helper LLM which candidate path best answers the query.
+
+    Args:
+      q: the user query.
+      candidates: list of (path, snippet) tuples — the top-5 retrieved.
+      model: override the judge model (default RAG_AUTO_HARVEST_JUDGE_MODEL
+             → qwen2.5:7b).
+
+    Returns:
+      dict {"verdict": "<path>|null", "confidence": float in [0,1],
+            "reason": str} on success, or None on any transient failure
+      (ollama timeout, malformed JSON, etc). Callers MUST tolerate None.
+
+    The verdict "null" (JSON null or the string "none"/"ninguno") means
+    "no candidate is a good answer" — the caller interprets that as a
+    negative signal over the whole list when confidence is high.
+    """
+    if not candidates:
+        return None
+    judge_model = (model or _AUTO_HARVEST_JUDGE_MODEL).strip()
+    if not judge_model:
+        return None
+    lines = [
+        f"Pregunta del usuario: \"{q}\"",
+        "",
+        "Candidatos (path + snippet del archivo):",
+    ]
+    for i, (path, snippet) in enumerate(candidates, 1):
+        snippet = snippet or "[archivo vacío o ilegible]"
+        lines.append(f"{i}. {path}")
+        lines.append(f"   {snippet}")
+    lines.extend([
+        "",
+        "Decidí cuál de los candidatos responde MEJOR la pregunta. "
+        "Si ninguno es una respuesta razonable, devolvé verdict=\"none\".",
+        "",
+        "Respondé JSON estricto sin preámbulo:",
+        "{\"verdict\": \"<path exacto de la lista o 'none'>\", "
+        "\"confidence\": <0.0 a 1.0>, "
+        "\"reason\": \"<explicación corta en una frase>\"}",
+    ])
+    prompt = "\n".join(lines)
+    try:
+        resp = _summary_client().chat(
+            model=judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_ctx": 4096, "num_predict": 200},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = resp.message.content.strip()
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    verdict = data.get("verdict")
+    conf = data.get("confidence")
+    reason = data.get("reason", "")
+    if verdict is None or isinstance(verdict, str) and verdict.strip().lower() in ("none", "ninguno", "null", ""):
+        normalized_verdict = None
+    elif isinstance(verdict, str):
+        normalized_verdict = verdict.strip()
+    else:
+        return None
+    try:
+        conf_f = float(conf) if conf is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    conf_f = max(0.0, min(1.0, conf_f))
+    return {
+        "verdict": normalized_verdict,
+        "confidence": conf_f,
+        "reason": str(reason)[:200] if reason else "",
+    }
+
+
+def auto_harvest(
+    *,
+    since_days: int = 1,
+    confidence_below: float = 0.3,
+    min_judge_conf: float | None = None,
+    limit: int = 15,
+    dry_run: bool = False,
+    model: str | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Run one pass of auto-harvest: find low-conf queries, ask judge,
+    insert rows when the judge is confident enough.
+
+    Returns a dict with stats:
+      {processed, judged_positive, judged_negative, skipped_low_conf,
+       skipped_invalid_path, skipped_judge_failed, errors}
+
+    Never raises. Uses `_auto_harvest_judge()` which tolerates ollama
+    failures by returning None. Dry-run mode mirrors a real run but
+    skips all DB writes — useful for CI / previewing the cron output.
+    """
+    if min_judge_conf is None:
+        min_judge_conf = _AUTO_HARVEST_MIN_CONF
+    stats = {
+        "processed": 0,
+        "judged_positive": 0,
+        "judged_negative": 0,
+        "skipped_low_conf": 0,
+        "skipped_invalid_path": 0,
+        "skipped_judge_failed": 0,
+        "skipped_empty_paths": 0,
+        "errors": 0,
+    }
+    candidates = _harvest_candidates(since_days, confidence_below, limit)
+    stats["processed"] = len(candidates)
+    if not candidates:
+        return stats
+    try:
+        vault = _resolve_vault_path()
+    except Exception:
+        vault = None
+    for c in candidates:
+        paths = c.get("paths") or []
+        if not paths:
+            stats["skipped_empty_paths"] += 1
+            continue
+        snippets = _auto_harvest_snippets(paths[:5], vault=vault)
+        verdict = _auto_harvest_judge(c["q"], snippets, model=model)
+        if verdict is None:
+            stats["skipped_judge_failed"] += 1
+            if verbose:
+                console.print(f"  [dim]judge failed: {c['q'][:60]}[/dim]")
+            continue
+        conf = verdict["confidence"]
+        vpath = verdict["verdict"]
+        if conf < min_judge_conf:
+            stats["skipped_low_conf"] += 1
+            if verbose:
+                console.print(
+                    f"  [dim]low conf ({conf:.2f}): {c['q'][:60]}[/dim]"
+                )
+            continue
+        if vpath is None:
+            # Judge says "none of these answer the query" with high
+            # confidence → insert a single −1 row over the seen paths.
+            if not dry_run:
+                ok = _feedback_insert_harvested(
+                    q=c["q"], rating=-1, paths=paths[:5],
+                    original_query_id=c["id"],
+                )
+                if not ok:
+                    stats["errors"] += 1
+                    continue
+            stats["judged_negative"] += 1
+            if verbose:
+                console.print(
+                    f"  [red]−1[/red] ({conf:.2f}) {c['q'][:60]}"
+                )
+            continue
+        # Guard against hallucinated paths: verdict must be exactly
+        # one of the candidate paths (case-sensitive, no fuzzy match).
+        if vpath not in paths:
+            stats["skipped_invalid_path"] += 1
+            if verbose:
+                console.print(
+                    f"  [yellow]hallucinated path:[/yellow] {vpath[:80]}"
+                )
+            continue
+        if not dry_run:
+            ok = _feedback_insert_harvested(
+                q=c["q"], rating=1, paths=[vpath],
+                original_query_id=c["id"], corrective_path=vpath,
+            )
+            if not ok:
+                stats["errors"] += 1
+                continue
+        stats["judged_positive"] += 1
+        if verbose:
+            console.print(
+                f"  [green]+1[/green] ({conf:.2f}) {c['q'][:50]} → {vpath}"
+            )
+    return stats
+
+
+@feedback.command("auto-harvest")
+@click.option("--limit", default=20, show_default=True,
+              help="Cuántos candidatos procesar como máximo.")
+@click.option("--since", default=1, show_default=True,
+              help="Ventana en días para candidatos (default 1 = últimas 24h).")
+@click.option("--confidence-below", "confidence_below", default=0.3,
+              show_default=True,
+              help="Sólo queries con top_score < este valor.")
+@click.option("--min-judge-conf", "min_judge_conf", default=None, type=float,
+              help=f"Mínima confidence del judge para insertar (default "
+                   f"{_AUTO_HARVEST_MIN_CONF}).")
+@click.option("--model", "model", default=None,
+              help=f"Override del judge model (default {_AUTO_HARVEST_JUDGE_MODEL}).")
+@click.option("--dry-run", is_flag=True,
+              help="No insertar filas — sólo mostrar lo que haría.")
+@click.option("--verbose", "-v", is_flag=True,
+              help="Imprimir el resultado del judge por candidato.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output machine-readable JSON (para launchd logs).")
+def feedback_auto_harvest(
+    limit: int,
+    since: int,
+    confidence_below: float,
+    min_judge_conf: float | None,
+    model: str | None,
+    dry_run: bool,
+    verbose: bool,
+    as_json: bool,
+):
+    """Auto-labelear queries low-confidence usando LLM-as-judge.
+
+    Corre el mismo loop que `rag feedback harvest` pero sin prompts —
+    un modelo (default qwen2.5:7b) decide qué chunk responde cada query
+    y sólo se insertan filas cuando la confianza del juez ≥ --min-judge-conf
+    (default 0.8). Diseñado para correr nocturno desde launchd y acumular
+    señal limpia para el gate de fine-tune (GC#2.C, 20 corrective_paths).
+
+    Filas insertadas llevan source='auto-harvester' en extra_json —
+    distinto del harvester interactivo ('harvester') para poder auditar
+    la calidad de las decisiones automáticas por separado.
+    """
+    stats = auto_harvest(
+        since_days=since,
+        confidence_below=confidence_below,
+        min_judge_conf=min_judge_conf,
+        limit=limit,
+        dry_run=dry_run,
+        model=model,
+        verbose=verbose,
+    )
+    if as_json:
+        # click.echo bypasses Rich's soft-wrap so launchd logs can parse
+        # the JSON deterministically (one line).
+        click.echo(json.dumps(stats))
+        return
+    console.print()
+    console.print("[bold]Auto-harvest summary[/bold]"
+                  + ("  [yellow](dry-run)[/yellow]" if dry_run else ""))
+    console.print(f"  Processed: [cyan]{stats['processed']}[/cyan]  "
+                  f"| +1: [green]{stats['judged_positive']}[/green]  "
+                  f"| −1: [red]{stats['judged_negative']}[/red]")
+    console.print(f"  Skipped — low conf: {stats['skipped_low_conf']}, "
+                  f"invalid path: {stats['skipped_invalid_path']}, "
+                  f"judge failed: {stats['skipped_judge_failed']}, "
+                  f"empty paths: {stats['skipped_empty_paths']}")
+    if stats["errors"]:
+        console.print(f"  [red]SQL errors: {stats['errors']}[/red]")
+    if not dry_run and stats["judged_positive"] > 0:
+        fb = _feedback_stats()
+        remaining = max(0, _FEEDBACK_GATE_TARGET - fb["with_cp"])
+        console.print(f"  Gate: [cyan]{fb['with_cp']}[/cyan]"
+                      f" / {_FEEDBACK_GATE_TARGET}  "
+                      + (f"[yellow](faltan {remaining})[/yellow]"
+                         if remaining > 0
+                         else "[bold green](gate open!)[/bold green]"))
     console.print()
 
 

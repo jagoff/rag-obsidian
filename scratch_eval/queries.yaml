@@ -36,6 +36,10 @@ queries:
       max_latency_ms: 45000
       target_latency_ms: 20000
       allow_refusal: false
+      # Fix 2026-04-23 (REGLA 4.6): el prompt ya no debe inyectar
+      # links externos en queries planning. omnifocus.com era el
+      # ejemplo del prompt que el LLM copiaba literal.
+      forbid_substrings: ["omnifocus.com", "reactjs.org"]
     notes: >
       Dispara reminders_due + calendar_ahead por el _PLANNING_PAT.
       La respuesta debe mencionar pendientes o eventos sin leakear
@@ -117,6 +121,10 @@ queries:
       target_latency_ms: 12000
       require_substrings: ["mar"]
       allow_refusal: false
+      # Fix 2026-04-23 (REGLA 7): NO fusionar personas. María es mujer
+      # — el LLM decía "María es tu hermano" (masculino) antes del fix.
+      # También NO debe pegar link externo en queries person.
+      forbid_substrings: ["es tu hermano", "omnifocus.com"]
 
   - id: el_fallthrough_react
     category: entity_lookup
@@ -193,6 +201,10 @@ queries:
       max_latency_ms: 45000
       target_latency_ms: 15000
       allow_refusal: true
+      # Fix 2026-04-23 (REGLA 0 endurecida): el fast-path WA con
+      # contactos brasileros leakaba palabras portuguesas en la
+      # respuesta. Estas son las señales más claras de regresión.
+      forbid_substrings: ["em março", "uma conversa", "contigo em"]
     notes: >
       Tiene que pasar por el fast-path (qwen2.5:3b num_ctx=4096) si
       detecta ≥2 chunks WA en top-3.

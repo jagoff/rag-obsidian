@@ -241,6 +241,21 @@ def apply_checks(run: QueryRun, q: dict, global_leak_patterns: list[str]) -> Non
             )
         )
 
+    # Substrings prohibidos. Permite banear cosas como URLs que el
+    # prompt prohibe (`omnifocus.com` en queries person), cross-source
+    # contamination ("es tu hermano"), idiomas foráneos ("em março"),
+    # o tokens de control que no deberían leakear.
+    forbid = checks_cfg.get("forbid_substrings") or []
+    if forbid:
+        found = [s for s in forbid if s.lower() in answer.lower()]
+        run.checks.append(
+            CheckResult(
+                "no_forbidden_substrings",
+                not found,
+                f"leaked={found}" if found else "ok",
+            )
+        )
+
     # No-leak de tool names (unless opt-out por la query).
     if checks_cfg.get("forbid_leak_patterns", True):
         leaked = _contains_any(answer, global_leak_patterns)

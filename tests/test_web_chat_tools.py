@@ -735,3 +735,187 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     # _TOOL_ROUND_CAP=3 is the LLM-loop cap; pre-router adds one extra.
     assert "tool_rounds=4" in line
     assert "tool_names=weather,weather,weather,weather" in line
+
+
+# ── 9. Empty-retrieve bail must NOT swallow pre-router-covered queries ────
+
+
+def _empty_retrieve_result(query: str = "x") -> dict:
+    """`docs=[]` + `confidence=-inf` — shape de un retrieve vacío real."""
+    return {
+        "docs": [],
+        "metas": [],
+        "scores": [],
+        "confidence": float("-inf"),
+        "search_query": query,
+        "filters_applied": {},
+        "query_variants": [query],
+        "vault_scope": ["default"],
+    }
+
+
+@pytest.mark.requires_ollama
+def test_empty_retrieve_with_forced_tools_skips_bail(chat_env, monkeypatch):
+    """Regression 2026-04-22 (Fer F.): "qué tengo para hacer esta semana?"
+    matchea `reminders_due` + `calendar_ahead` via `_detect_tool_intent`,
+    pero si el retrieve devuelve `docs=[]` (por cualquier razón transitoria
+    o un corpus sin notas lexicalmente cercanas), el handler bailaba con
+    `event: empty` + 'Sin resultados relevantes.' ANTES de llegar al pre-
+    router de tools — el user veía "no hay nada" aunque los tools habrían
+    listado los pendientes reales. Fix: si `docs=[]` pero el query matchea
+    el pre-router, NO bailar — dejar pasar al tool loop.
+    """
+    monkeypatch.setattr(
+        server_mod, "multi_retrieve",
+        lambda *a, **kw: _empty_retrieve_result(a[1] if len(a) >= 2 else "x"),
+    )
+    monkeypatch.setattr(
+        server_mod, "_fetch_reminders_due", lambda anchor: {"dated": [], "undated": []},
+    )
+    monkeypatch.setattr(
+        server_mod, "_fetch_calendar_ahead", lambda n, max_events=40: [],
+    )
+
+    mock = _OllamaMock([
+        # Pre-router replaces CONTEXTO with tool output + the LLM tool-
+        # deciding round runs (RAG_WEB_TOOL_LLM_DECIDE=1 en chat_env).
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["listo"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("que tengo para hacer esta semana?")
+    names = [ev for ev, _ in events]
+
+    # CONTRATO: ningún `empty` event; el tool loop ejecutó.
+    assert "empty" not in names, (
+        f"empty bail disparó a pesar de tools forzados: {names}"
+    )
+    assert names[-1] == "done"
+
+    # El pre-router disparó al menos reminders_due + calendar_ahead.
+    tool_names_called = {
+        data.get("name")
+        for ev, data in events
+        if ev == "status" and data.get("stage") == "tool"
+    }
+    assert "reminders_due" in tool_names_called
+    assert "calendar_ahead" in tool_names_called
+
+
+@pytest.mark.requires_ollama
+def test_empty_retrieve_without_forced_tools_still_bails(chat_env, monkeypatch):
+    """No-regression: cuando el retrieve viene vacío Y el query no matchea
+    el pre-router, el bail `Sin resultados relevantes.` sigue firing. Solo
+    queremos bypassear el bail cuando hay una vía clara de respuesta (tool).
+    """
+    monkeypatch.setattr(
+        server_mod, "multi_retrieve",
+        lambda *a, **kw: _empty_retrieve_result(a[1] if len(a) >= 2 else "x"),
+    )
+    # Sin stub de ollama — el bail debe disparar antes de llegar al LLM.
+
+    events, _ = _post_chat("pasame el output de mi script de ayer")
+    names = [ev for ev, _ in events]
+    assert "empty" in names
+    # El mensaje del `empty` event es el canned.
+    empty_payload = next(data for ev, data in events if ev == "empty")
+    assert "Sin resultados" in empty_payload.get("message", "")
+
+
+@pytest.mark.requires_ollama
+def test_low_conf_bypass_with_forced_tools_skips_bypass(chat_env, monkeypatch):
+    """Regression 2026-04-22 (mismo user report): si el retrieve devuelve
+    docs pero confidence < CONFIDENCE_RERANK_MIN (0.015), el handler
+    normalmente corta con 'No tengo info sobre "..." en tus notas.' +
+    fallback cluster (Google/YouTube/Wiki). Cuando el query matchea el
+    pre-router — "qué tengo para hacer esta semana?" → reminders_due +
+    calendar_ahead — ese bypass esconde los datos reales que los tools
+    habrían servido. Fix: si hay forced tools, NO bypasar, correr tools.
+    """
+    def _low_conf_retrieve(*a, **kw):
+        r = _canned_retrieve_result(a[1] if len(a) >= 2 else "x")
+        r["confidence"] = 0.005  # below CONFIDENCE_RERANK_MIN=0.015
+        r["scores"] = [0.005, 0.003]
+        return r
+    monkeypatch.setattr(server_mod, "multi_retrieve", _low_conf_retrieve)
+    monkeypatch.setattr(
+        server_mod, "_fetch_reminders_due", lambda anchor: {"dated": [], "undated": []},
+    )
+    monkeypatch.setattr(
+        server_mod, "_fetch_calendar_ahead", lambda n, max_events=40: [],
+    )
+
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["ok"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("que tengo para hacer esta semana?")
+
+    # CONTRATO: el `done` event NO lleva `low_conf_bypass: true` cuando hay
+    # forced tools — el handler debe haber seguido al tool loop en lugar
+    # de servir el template "No tengo info sobre '...' en tus notas.".
+    done_event = next(data for ev, data in events if ev == "done")
+    assert done_event.get("low_conf_bypass") is not True, (
+        f"low_conf_bypass firing a pesar de forced tools: {done_event!r}"
+    )
+
+    # Verifica que los tools del pre-router ejecutaron.
+    tool_names_called = {
+        data.get("name")
+        for ev, data in events
+        if ev == "status" and data.get("stage") == "tool"
+    }
+    assert "reminders_due" in tool_names_called
+    assert "calendar_ahead" in tool_names_called
+
+
+@pytest.mark.requires_ollama
+def test_low_conf_bypass_without_forced_tools_still_fires(chat_env, monkeypatch):
+    """No-regression: cuando no hay forced tools, el bypass sigue firing
+    (template canned, ahorro de 5-8s de LLM cold prefill sobre queries
+    donde el vault claramente no tiene data)."""
+    def _low_conf_retrieve(*a, **kw):
+        r = _canned_retrieve_result(a[1] if len(a) >= 2 else "x")
+        r["confidence"] = 0.003
+        r["scores"] = [0.003, 0.002]
+        return r
+    monkeypatch.setattr(server_mod, "multi_retrieve", _low_conf_retrieve)
+
+    events, _ = _post_chat("qué película ver esta noche")
+    done_event = next(data for ev, data in events if ev == "done")
+    assert done_event.get("low_conf_bypass") is True, (
+        f"bypass debió firing sin forced tools: {done_event!r}"
+    )
+
+
+# ── 10. Metachat SSE: `metachat: true` flag in sources + done ─────────────
+
+
+def test_metachat_sources_event_flags_metachat_true():
+    """UI contract (2026-04-22): el `event: sources` de un reply de
+    metachat ("Hola") debe llevar `metachat: true` para que el frontend
+    skippee el link inline "↗ buscar en internet" (que se mostraba por
+    `sources.length === 0 && confidence === null`). Sin la flag la UX
+    era inconsistente — el canned reply era correcto pero aparecía un
+    CTA de Google absurdo al costado.
+    """
+    client = TestClient(app)
+    resp = client.post(
+        "/api/chat",
+        json={"question": "Hola", "vault_scope": None, "session_id": None},
+    )
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+
+    sources_event = next(data for ev, data in events if ev == "sources")
+    assert sources_event.get("metachat") is True, (
+        f"sources event falta flag metachat=true: {sources_event!r}"
+    )
+    # El done event también lo marca (documentación defensiva).
+    done_event = next(data for ev, data in events if ev == "done")
+    assert done_event.get("metachat") is True

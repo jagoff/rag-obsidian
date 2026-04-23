@@ -1947,6 +1947,13 @@ async function send(question, opts = {}) {
   let sources = null;
   let confidence = null;
   let hadProposal = false;
+  // Metachat flag: el backend marca `metachat: true` en sources + done
+  // cuando el turno fue servido por el short-circuit canned reply ("Hola",
+  // "gracias", "qué podés hacer"). Sin sources + confidence=null la lógica
+  // de "weakAnswer" abajo dispararía `↗ buscar en internet` + `appendRelated`
+  // (YouTube) al lado del saludo — una UX absurda. Este flag bloquea esos
+  // fallbacks para canned replies.
+  let isMetachat = false;
   let metaShown = false;
   let aborted = false;
   // Live tickers for the two long waits (retrieve + generate). Server fires
@@ -2136,6 +2143,12 @@ async function send(question, opts = {}) {
       // sources panel + web-search button (irrelevant when the user is
       // CREATING something, not asking about existing notes).
       if (parsed.propose_intent) hadProposal = true;
+      // Metachat flag: cuando el short-circuit sirvió un canned reply
+      // ("Hola", "gracias"), el backend marca `metachat: true` acá. La
+      // bandera apaga todos los CTAs de fallback (buscar en internet,
+      // YouTube related, fallback cluster) para que el saludo no termine
+      // con un link a Google "Hola" al costado.
+      if (parsed.metachat) isMetachat = true;
     } else if (event === "proposal") {
       // The server emits this when the tool returned `needs_clarification`
       // (ambiguous datetime) OR when the auto-create failed with an
@@ -2175,6 +2188,11 @@ async function send(question, opts = {}) {
         ragText.classList.remove("pending");
         ragText.innerHTML = renderMarkdown(fullText);
       }
+      // Belt-and-suspenders: el backend marca `metachat: true` también
+      // en el done event. Si el sources event llegó sin la flag por
+      // algún motivo (SSE parcial, versión desincronizada), todavía
+      // podemos detectar acá y apagar los fallbacks.
+      if (parsed.metachat) isMetachat = true;
       const conf = Number.isFinite(confidence) ? confidence : parsed.top_score;
       // Two thresholds — conflating them polluted the UI with YouTube videos
       // on queries where the vault answered correctly.
@@ -2208,7 +2226,12 @@ async function send(question, opts = {}) {
       // encontró), mantenemos el link inline — el user puede insistir
       // sin que el layout explote en CTAs.
       const lowConfBypass = parsed.low_conf_bypass === true;
-      if (!hadProposal && question && weakAnswer && !mentionMatched) {
+      // `isMetachat` bloquea los 3 fallbacks abajo. Un canned reply de
+      // metachat ("Hola") viene sin sources y con confidence=null — sin
+      // el gate, la lógica de `weakAnswer` dispara `↗ buscar en internet`
+      // (link a Google) + `appendRelated` (YouTube). Absurdo para un
+      // saludo; el backend ya dio una respuesta conversacional canned.
+      if (!hadProposal && !isMetachat && question && weakAnswer && !mentionMatched) {
         if (lowConfBypass) {
           appendFallbackCluster(turn, question);
         } else if (ragText) {
@@ -2216,7 +2239,7 @@ async function send(question, opts = {}) {
           appendWebSearch(target, question, true);
         }
       }
-      if (!hadProposal && sources && sources.length) {
+      if (!hadProposal && !isMetachat && sources && sources.length) {
         appendSources(turn, sources, conf);
       }
       // appendRelated() renderea YouTube videos específicos. Usamos el
@@ -2224,7 +2247,7 @@ async function send(question, opts = {}) {
       // conf < 0.10. Queries con respuesta correcta + confidence 0.1-1.0
       // no deben disparar YouTube — el vault ya respondió bien y videos
       // genéricos son ruido. Ver comentario arriba de los thresholds.
-      if (!hadProposal && question && vaultReallyFailed && !mentionMatched) {
+      if (!hadProposal && !isMetachat && question && vaultReallyFailed && !mentionMatched) {
         appendRelated(turn, question);
       }
       const feedbackBar = parsed.turn_id

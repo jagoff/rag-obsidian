@@ -4428,6 +4428,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             yield _sse("error", {"message": f"retrieve falló: {exc}"})
             return
 
+        # Pre-compute forced tools ONCE here so both the empty-bail and
+        # low-conf-bypass gates below can check it without re-running
+        # the regex. Propose-intent turns skip the pre-router entirely
+        # (line ~4894) so mirror that gate here to avoid enabling a
+        # bypass path the pre-router wouldn't honour.
+        _has_forced_tools = (
+            False if is_propose_intent else bool(_detect_tool_intent(question))
+        )
+
         if not result["docs"]:
             # Propose-intent turns don't need vault context — the tool
             # loop (propose_reminder / propose_calendar_event) creates
@@ -4437,7 +4446,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # Playwright report) which is absurd — the user is declaring
             # a date, not asking about one. Fall through to the tool
             # phase when the detector flagged intent.
-            if not is_propose_intent:
+            # 2026-04-22 (Fer F. user report, "qué tengo para hacer esta
+            # semana?"): también fall-through cuando el pre-router
+            # matchea tools deterministas (reminders_due, calendar_ahead,
+            # finance_summary, gmail_recent, weather). El retrieve puede
+            # venir vacío por razones transitorias (cold-start, corpus
+            # sin notas lexicalmente cercanas al query social) y bailar
+            # con "Sin resultados relevantes." + link a Google cuando
+            # los tools hubieran listado los pendientes/eventos reales
+            # es user-hostile. El tool loop abajo reemplaza CONTEXTO
+            # entero con la salida de los tools, así que el LLM responde
+            # sobre data autoritativa aun si el retrieve no aportó.
+            if not is_propose_intent and not _has_forced_tools:
                 yield _sse("empty", {"message": "Sin resultados relevantes."})
                 return
 
@@ -4518,9 +4538,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # frontend que renderee el cluster de fallback ("¿querés buscar
         # en Google/YouTube/Wikipedia?") en lugar del inline web-search
         # link del path weakAnswer.
+        # 2026-04-22: gate extra `not _has_forced_tools`. Queries que
+        # matchean el pre-router deterministic (e.g. "qué tengo para hacer
+        # esta semana?" → reminders_due + calendar_ahead) NO deben caer al
+        # template "No tengo info sobre '...' en tus notas." aunque el
+        # retrieve haya bajado debajo de CONFIDENCE_RERANK_MIN — los tools
+        # van a inyectar la data real. Sin este check, el user reporta
+        # "Sin resultados" cuando el sistema sí tiene forma de responder.
         _low_conf_bypass = (
             not is_propose_intent
             and not _mention_paths
+            and not _has_forced_tools
             and float(result["confidence"]) < CONFIDENCE_RERANK_MIN
         )
         if _low_conf_bypass:

@@ -6,7 +6,14 @@ Orden: #3 → #1 → #2 (de menos a más riesgoso, de self-contained a cross-cut
 
 ## Invariantes (no romper)
 
-- `rag eval` gate: singles ≥76.19%, chains ≥63.64% (auto-rollback).
+- `rag eval` gate: singles ≥60%, chains ≥73% (auto-rollback). **Nota
+  2026-04-23**: estos floors fueron recalibrados desde los originales
+  0.7619 / 0.6364 tras la expansión de `queries.yaml` (42→60 singles +
+  +7 cross-source + +5 calendar goldens el 2026-04-21). Con el golden
+  set actual el baseline estable es singles 71.67% [60.00, 83.33] /
+  chains 86.67% [73.33, 96.67] — los floors matchean los CI lower
+  bounds del baseline nuevo. Ver el bloque de comentarios sobre
+  `GATE_SINGLES_HIT5_MIN` en `rag.py` para la timeline completa.
 - 2,247 tests existentes en verde.
 - `ranker.json` retrocompatible (no cambios de schema; solo pesos).
 - SQL-only writers (post-T10) — sin reintroducir JSONL.

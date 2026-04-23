@@ -23118,12 +23118,44 @@ def _restore_ranker_backup(backup: Path) -> bool:
         return False
 
 
-# CI gate thresholds — derived from post-title-in-rerank floor (2026-04-17).
-# Bootstrap 95% CI lower bounds: singles n=42, chains n=33 turns.
-# Singles floor: hit@5 90.48% CI lower bound = 76.19%
-# Chains floor:  hit@5 80.00% CI lower bound = 63.64%
-GATE_SINGLES_HIT5_MIN = 0.7619
-GATE_CHAINS_HIT5_MIN = 0.6364
+# CI gate thresholds — recalibrados 2026-04-23 post queries.yaml expansion.
+#
+# Timeline de los floors:
+#
+#   2026-04-17  n=42 singles / 33 turns  → singles 90.48% [76.19, 97.62]
+#                                          chains  80.00% [63.64, 93.94]
+#               → floors originales: 0.7619 / 0.6364 (CI lower bounds)
+#
+#   2026-04-21  queries.yaml expandido 42→60 singles (+6 synthesis/comparison,
+#               +7 cross-source placeholders, +5 calendar goldens). Las queries
+#               nuevas son INTENCIONALMENTE más difíciles — el retrieve pipeline
+#               no regresionó.
+#
+#   2026-04-23  n=60 / 30 turns stable baseline (desde 2026-04-22):
+#                 singles 71.67% [60.00, 83.33]  ← estado actual
+#                 chains  86.67% [73.33, 96.67]
+#
+#               Los floors viejos (0.7619 / 0.6364) ya no son compatibles con
+#               el golden set actual — singles 71.67% < 76.19% dispararía
+#               auto-rollback en TODA corrida, making `rag tune --online` un
+#               no-op perpetuo. Los nuevos floors matchean la misma filosofía
+#               (CI lower bound del baseline actual = "95% confianza de que
+#               una corrida bajo esto es regresión real, no noise").
+#
+# Overrides via env para fine-tune local sin tocar código:
+#   RAG_EVAL_GATE_SINGLES_MIN="0.70"  → más estricto
+#   RAG_EVAL_GATE_CHAINS_MIN="0.80"   → idem
+#
+# **Re-calibrar cuando**: expansión material de queries.yaml, cambio
+# estructural en retrieve() (ej. nuevo modelo de embeddings), o si 5+
+# corridas consecutivas bordean el floor sin regresión real.
+
+GATE_SINGLES_HIT5_MIN = float(
+    os.environ.get("RAG_EVAL_GATE_SINGLES_MIN", "0.60")
+)
+GATE_CHAINS_HIT5_MIN = float(
+    os.environ.get("RAG_EVAL_GATE_CHAINS_MIN", "0.73")
+)
 
 
 def _run_eval_gate() -> tuple[float | None, float | None, str]:

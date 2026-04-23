@@ -150,6 +150,212 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
 
 
+# ── Forced-tool output renderer (2026-04-22, Fer F. report) ──────────
+# Before: the pre-router dumped raw JSON under a `## {tool_name}` header
+# into the CONTEXTO block. qwen2.5:7b reacted badly — dropped `undated`
+# items, invented reminders that weren't in the feed, and occasionally
+# seeded citation artifacts like `[[calendar_ahead]]` because the tool
+# name leaked as a wikilink-ish token.
+#
+# The helper below renders each forced-tool result as tidy markdown the
+# LLM can cite without inventing: Spanish bucket labels, explicit empty
+# states, dedup by (name, due), no tool-name leak, graceful fallback on
+# malformed JSON (so a tool exception never crashes the request). Plays
+# nicely with REGLA 1 ("engancháte SIEMPRE con el CONTEXTO") because the
+# block lives INSIDE the CONTEXTO slot the LLM is pinned on.
+#
+# Shapes assumed (see web/tools.py):
+#   reminders_due  → {"dated": [{name,due,bucket,list}], "undated":[...]}
+#   calendar_ahead → [{title, date_label, time_range}]
+#   gmail_recent   → {"unread_count": int, "threads": [{kind,from,...}]}
+#   finance_summary→ dict with variable fields (passthrough JSON, pretty)
+#   weather        → plain string (already friendly)
+#   unknown tool   → header + raw content (name allowed as disambiguator)
+_BUCKET_ES: dict[str, str] = {
+    "overdue": "vencido",
+    "today": "hoy",
+    "upcoming": "próximo",
+}
+
+
+def _format_forced_tool_output(name: str, raw: str) -> str:
+    """Render one forced-tool result as markdown for the CONTEXTO block.
+
+    Never raises — malformed / non-JSON input falls through to a raw
+    passthrough under the tool's Spanish section header. Tool name is
+    NEVER leaked for known tools (prevents `[[calendar_ahead]]` citation
+    artifacts observed in production). Unknown tools include the name
+    as a disambiguator since we can't invent a friendly label.
+    """
+    if name == "reminders_due":
+        return _format_reminders_block(raw)
+    if name == "calendar_ahead":
+        return _format_calendar_block(raw)
+    if name == "gmail_recent":
+        return _format_gmail_block(raw)
+    if name == "finance_summary":
+        return _format_finance_block(raw)
+    if name == "weather":
+        return _format_weather_block(raw)
+    # Unknown tool → keep raw JSON available but wrap in a labeled
+    # section so it doesn't merge visually with the next block.
+    return f"### Datos ({name})\n{raw}\n"
+
+
+def _format_reminders_block(raw: str) -> str:
+    """Render Apple Reminders JSON as two sub-sections: 'Con fecha' and
+    'Sin fecha'. Dedupes by (name, due) — AppleScript occasionally returns
+    the same reminder twice across recurring-instance boundaries.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Recordatorios\n{raw}\n"
+    if not isinstance(data, dict):
+        return f"### Recordatorios\n{raw}\n"
+
+    def _dedup(items):
+        seen: set[tuple[str, str]] = set()
+        out: list[dict] = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            nm = str(it.get("name", "")).strip()
+            du = str(it.get("due", "")).strip()
+            if not nm:
+                continue
+            key = (nm, du)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+        return out
+
+    dated = _dedup(data.get("dated"))
+    undated = _dedup(data.get("undated"))
+
+    if not dated and not undated:
+        return "### Recordatorios\n_Sin recordatorios pendientes._\n"
+
+    lines: list[str] = ["### Recordatorios"]
+    if dated:
+        lines.append("**Con fecha:**")
+        for it in dated:
+            nm = str(it.get("name", "")).strip()
+            due = str(it.get("due", "")).strip()
+            bucket = str(it.get("bucket", "")).strip().lower()
+            date_part, _, time_part = due.partition("T")
+            time_str = time_part[:5] if time_part else ""
+            stamp = f"{date_part} {time_str}".strip() if date_part else ""
+            tag_es = _BUCKET_ES.get(bucket, "")
+            # Only prefix a tag for overdue/today (urgency signal).
+            # Upcoming is the default forward-looking state; leaving it
+            # unmarked reduces noise without losing information.
+            prefix = f"[{tag_es}] " if tag_es in ("vencido", "hoy") else ""
+            body = f"{stamp} · {nm}" if stamp else nm
+            lines.append(f"- {prefix}{body}")
+    if undated:
+        lines.append("**Sin fecha:**")
+        for it in undated:
+            nm = str(it.get("name", "")).strip()
+            lines.append(f"- {nm}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_calendar_block(raw: str) -> str:
+    """Render calendar events as a bulleted list. Does NOT dedup — the
+    same recurring event across multiple days must show up N times so the
+    user sees 'cumpleaños de Astor' twice if it falls on two rendered
+    dates.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Calendario\n{raw}\n"
+    if not isinstance(data, list):
+        return f"### Calendario\n{raw}\n"
+    if not data:
+        return "### Calendario\n_Sin eventos en el horizonte._\n"
+
+    lines: list[str] = ["### Calendario"]
+    for ev in data:
+        if not isinstance(ev, dict):
+            continue
+        title = str(ev.get("title", "")).strip()
+        if not title:
+            continue
+        date_label = str(ev.get("date_label", "")).strip()
+        time_range = str(ev.get("time_range", "")).strip()
+        parts: list[str] = []
+        if date_label:
+            parts.append(date_label)
+        if time_range:
+            parts.append(time_range)
+        prefix = " ".join(parts)
+        if prefix:
+            lines.append(f"- {prefix} · {title}")
+        else:
+            lines.append(f"- {title}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_gmail_block(raw: str) -> str:
+    """Render Gmail evidence as 'Mails' section with awaiting-reply and
+    starred threads as bullets. Keeps the tool name out of the output.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Mails\n{raw}\n"
+    if not isinstance(data, dict):
+        return f"### Mails\n{raw}\n"
+    threads = data.get("threads") or []
+    unread = int(data.get("unread_count") or 0)
+    if not threads and unread == 0:
+        return "### Mails\n_Sin mails pendientes._\n"
+    lines = ["### Mails"]
+    if unread:
+        lines.append(f"_{unread} no leídos en total._")
+    for t in threads:
+        if not isinstance(t, dict):
+            continue
+        frm = str(t.get("from", "")).strip()
+        subj = str(t.get("subject", "")).strip()
+        kind = str(t.get("kind", "")).strip()
+        tag = {"awaiting_reply": "esperando respuesta", "starred": "starred"}.get(kind, kind)
+        tag_str = f" [{tag}]" if tag else ""
+        lines.append(f"- {frm} · {subj}{tag_str}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_finance_block(raw: str) -> str:
+    """Finance summary is a dict with month, totals, top categories. Render
+    under 'Gastos' section. Passthrough pretty JSON if shape is unexpected
+    — the LLM handles a raw dict fine when there's a section header.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Gastos\n{raw}\n"
+    if not isinstance(data, dict) or not data:
+        return "### Gastos\n_Sin datos financieros._\n"
+    try:
+        pretty = json.dumps(data, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        pretty = raw
+    return f"### Gastos\n```json\n{pretty}\n```\n"
+
+
+def _format_weather_block(raw: str) -> str:
+    """Weather tool already returns a human-friendly string — just wrap it
+    in a section header so it doesn't visually bleed into adjacent blocks.
+    """
+    body = (raw or "").strip()
+    if not body:
+        return "### Clima\n_Sin datos del clima._\n"
+    return f"### Clima\n{body}\n"
+
+
 # Create-intent detection moved to rag.py so both the web chat endpoint
 # and the CLI `rag chat` loop can share it without inverting the
 # web → rag import direction. See rag.py `_detect_propose_intent` for
@@ -4971,9 +5177,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # vault context is noise. Replacing the CONTEXTO block (the
                 # canonical anchor for REGLA 1) makes the LLM use the tool
                 # output as its sole evidence.
+                #
+                # Each tool output goes through `_format_forced_tool_output`
+                # to render it as tidy markdown (Spanish bucket labels,
+                # dedup, explicit empty states) instead of raw JSON under a
+                # `## {tool_name}` header. Pre-fix qwen2.5:7b dropped
+                # undated items and occasionally seeded `[[calendar_ahead]]`
+                # citation artifacts because the tool name leaked as a
+                # wikilink-ish token. See helper docstring for details.
                 _datos_block = ""
                 for _n, _res, _ in _forced_results:
-                    _datos_block += f"\n## {_n}\n{_res}\n"
+                    _datos_block += "\n" + _format_forced_tool_output(_n, _res) + "\n"
                 for _msg in reversed(tool_messages):
                     if _msg.get("role") == "user":
                         _msg["content"] = (

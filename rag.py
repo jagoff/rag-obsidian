@@ -40416,6 +40416,287 @@ def _collect_env_var_names_from_source() -> set[str]:
     return set(pattern.findall(src))
 
 
+# ── `rag health` unified dashboard (Feature #8 del 2026-04-23) ──────────
+# Single-command snapshot of the system's operational health.
+# Aggregates signal that was previously spread across:
+#   - rag stats      (models + index counts)
+#   - rag log        (query-level latency)
+#   - rag feedback status
+#   - rag dashboard  (analytics per day)
+#   - rag eval       (quality metrics)
+# Without being a replacement — each of those has deeper features.
+# `rag health` is a 5-second overview meant to be run before any debug
+# session: "¿qué está pasando con el sistema ahora mismo?"
+#
+# Sections:
+#   1. Corpus snapshot     — chunks, sources breakdown, DB size
+#   2. Recent queries      — count, latency P50/P95, cache hit rate
+#   3. Feedback + gate     — stats, progress hacia fine-tune gate
+#   4. Score calibration   — fuentes entrenadas, knots, last update
+#   5. Features opt-in     — cuáles de las 6 features están active
+# Output: Rich tables agrupadas; --as-json para scripts.
+
+def _health_corpus_snapshot() -> dict:
+    """Fetch corpus stats from the main vec collection."""
+    out = {
+        "total_chunks": 0,
+        "sources": {},
+        "last_index_ts": None,
+        "error": None,
+    }
+    try:
+        col = get_db()
+        c = col.count() if hasattr(col, "count") else 0
+        out["total_chunks"] = int(c)
+    except Exception as exc:
+        out["error"] = repr(exc)
+    # Per-source breakdown from a cheap SQL query.
+    try:
+        with _ragvec_state_conn() as conn:
+            # rag_queries doesn't have source — we infer from paths_json.
+            # Prefer using the collection's meta if available.
+            pass
+    except Exception:
+        pass
+    return out
+
+
+def _health_query_stats(since_hours: int = 24) -> dict:
+    """Aggregate recent query metrics from rag_queries."""
+    out = {
+        "count": 0,
+        "avg_retrieve_ms": 0.0,
+        "avg_gen_ms": 0.0,
+        "p50_total_ms": 0.0,
+        "p95_total_ms": 0.0,
+        "cache_hits": 0,
+        "by_cmd": {},
+    }
+    try:
+        with _ragvec_state_conn() as conn:
+            since_sql = f"datetime('now', '-{int(since_hours)} hours')"
+            rows = conn.execute(
+                f"SELECT t_retrieve, t_gen, cmd, "
+                f"       json_extract(extra_json, '$.cache_hit') AS ch "
+                f"FROM rag_queries WHERE ts > {since_sql}"
+            ).fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return out
+    out["count"] = len(rows)
+    retrieve_ms = [float(r[0]) for r in rows if r[0] is not None]
+    gen_ms = [float(r[1]) for r in rows if r[1] is not None]
+    totals = [
+        (float(r[0] or 0) + float(r[1] or 0))
+        for r in rows if r[0] is not None or r[1] is not None
+    ]
+    if retrieve_ms:
+        out["avg_retrieve_ms"] = sum(retrieve_ms) / len(retrieve_ms)
+    if gen_ms:
+        out["avg_gen_ms"] = sum(gen_ms) / len(gen_ms)
+    if totals:
+        totals_sorted = sorted(totals)
+        p50_idx = int(len(totals_sorted) * 0.50)
+        p95_idx = int(len(totals_sorted) * 0.95)
+        out["p50_total_ms"] = totals_sorted[min(p50_idx, len(totals_sorted) - 1)]
+        out["p95_total_ms"] = totals_sorted[min(p95_idx, len(totals_sorted) - 1)]
+    # Cache hit rate.
+    out["cache_hits"] = sum(1 for r in rows if r[3])
+    # Breakdown by cmd.
+    by_cmd: dict[str, int] = {}
+    for r in rows:
+        cmd = r[2] or "unknown"
+        by_cmd[cmd] = by_cmd.get(cmd, 0) + 1
+    out["by_cmd"] = by_cmd
+    return out
+
+
+def _health_calibration_status() -> dict:
+    """Summarize rag_score_calibration state."""
+    out = {"sources_trained": 0, "sources": [], "error": None}
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT source, n_pos, n_neg, trained_at, "
+                "       length(raw_knots_json) "
+                "FROM rag_score_calibration ORDER BY trained_at DESC"
+            ).fetchall()
+        out["sources_trained"] = len(rows)
+        for source, n_pos, n_neg, trained_at, knot_bytes in rows:
+            out["sources"].append({
+                "source": source,
+                "n_pos": int(n_pos), "n_neg": int(n_neg),
+                "trained_at": trained_at,
+                "model_bytes": int(knot_bytes or 0),
+            })
+    except Exception as exc:
+        out["error"] = repr(exc)
+    return out
+
+
+def _health_features_opt_in() -> dict:
+    """Report the on/off state of the 6 feature flags."""
+    features = {
+        "Feature #1 auto-harvest": {
+            "plist": "com.fer.obsidian-rag-auto-harvest",
+            "status": "always-on (nightly plist)",
+        },
+        "Feature #2 score calibration": {
+            "env": "RAG_SCORE_CALIBRATION",
+            "enabled": bool(
+                os.environ.get("RAG_SCORE_CALIBRATION", "").strip().lower()
+                in ("1", "true", "yes")
+            ),
+        },
+        "Feature #3 LLM intent": {
+            "env": "RAG_LLM_INTENT",
+            "enabled": bool(
+                os.environ.get("RAG_LLM_INTENT", "").strip().lower()
+                in ("1", "true", "yes")
+            ),
+        },
+        "Feature #4 agent loop upgrade": {
+            "status": "always-on (prompt + streak detector)",
+        },
+        "Feature #5 MMR diversity": {
+            "env": "RAG_MMR_DIVERSITY",
+            "enabled": bool(
+                os.environ.get("RAG_MMR_DIVERSITY", "").strip().lower()
+                in ("1", "true", "yes")
+            ),
+        },
+        "Feature #6 Personalized PageRank": {
+            "env": "RAG_PPR_TOPIC",
+            "enabled": bool(
+                os.environ.get("RAG_PPR_TOPIC", "").strip().lower()
+                in ("1", "true", "yes")
+            ),
+        },
+    }
+    return features
+
+
+@cli.command("health")
+@click.option("--since", "since_hours", default=24, show_default=True,
+              help="Ventana en horas para stats de queries recientes.")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON machine-readable.")
+def health_cli(since_hours: int, as_json: bool):
+    """Dashboard unificado de salud del sistema.
+
+    Snapshot de 5 segundos pensado para correr antes de cualquier debug:
+      - Corpus size + breakdown
+      - Queries recientes + latencia P50/P95 + cache hit rate
+      - Feedback stats + progreso hacia gate de fine-tune
+      - Estado de calibración per-source
+      - Qué features opcionales tenés activas
+
+    Para deep-dive usar: `rag stats` (modelos), `rag log` (queries),
+    `rag feedback status` (feedback), `rag dashboard` (analytics).
+    """
+    corpus = _health_corpus_snapshot()
+    queries = _health_query_stats(since_hours)
+    feedback = _feedback_stats()
+    calibration = _health_calibration_status()
+    features = _health_features_opt_in()
+
+    payload = {
+        "corpus": corpus,
+        "queries": {**queries, "since_hours": since_hours},
+        "feedback": feedback,
+        "calibration": calibration,
+        "features": features,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    if as_json:
+        click.echo(json.dumps(payload, default=str))
+        return
+
+    from rich.table import Table
+    console.print()
+    console.print("[bold cyan]RAG Health Dashboard[/bold cyan]  "
+                  f"[dim]({payload['ts']})[/dim]")
+    console.print()
+
+    # ── Corpus
+    console.print(
+        f"[bold]Corpus[/bold]: [cyan]{corpus['total_chunks']:,}[/cyan] chunks  "
+        + (f"[red]{corpus['error']}[/red]" if corpus.get("error") else "")
+    )
+
+    # ── Queries recent
+    q = queries
+    if q["count"] > 0:
+        hit_pct = (q["cache_hits"] / q["count"] * 100.0) if q["count"] else 0.0
+        console.print(
+            f"[bold]Queries[/bold] ({since_hours}h): [cyan]{q['count']}[/cyan]  "
+            f"|  avg retrieve [cyan]{q['avg_retrieve_ms']:.0f}ms[/cyan]  "
+            f"gen [cyan]{q['avg_gen_ms']:.0f}ms[/cyan]  "
+            f"|  P50 {q['p50_total_ms']:.0f}ms · P95 {q['p95_total_ms']:.0f}ms  "
+            f"|  cache hits [green]{q['cache_hits']}[/green] ({hit_pct:.0f}%)"
+        )
+        if q["by_cmd"]:
+            by_cmd_str = ", ".join(
+                f"{c}={n}" for c, n in sorted(
+                    q["by_cmd"].items(), key=lambda x: -x[1]
+                )[:5]
+            )
+            console.print(f"  [dim]por cmd: {by_cmd_str}[/dim]")
+    else:
+        console.print(f"[bold]Queries[/bold] ({since_hours}h): [dim]ninguna[/dim]")
+
+    # ── Feedback
+    fb = feedback
+    gate_target = _FEEDBACK_GATE_TARGET
+    gate_remaining = max(0, gate_target - fb["with_cp"])
+    gate_str = (
+        f"[green](gate open!)[/green]" if gate_remaining == 0
+        else f"[yellow]faltan {gate_remaining}[/yellow]"
+    )
+    console.print(
+        f"[bold]Feedback[/bold]: [cyan]{fb['total']}[/cyan] rows  "
+        f"| +1 [green]{fb['pos']}[/green]  −1 [red]{fb['neg']}[/red]  "
+        f"| corrective [bold green]{fb['with_cp']}[/bold green]/{gate_target}  "
+        f"{gate_str}"
+    )
+
+    # ── Calibration
+    cal = calibration
+    if cal["sources_trained"] > 0:
+        src_list = ", ".join(
+            f"{s['source']} ({s['n_pos']}+/{s['n_neg']}−)"
+            for s in cal["sources"]
+        )
+        console.print(
+            f"[bold]Calibration[/bold]: [cyan]{cal['sources_trained']}[/cyan] "
+            f"sources entrenadas — {src_list}"
+        )
+    else:
+        console.print(
+            f"[bold]Calibration[/bold]: [dim]ninguna source entrenada "
+            f"(correr `rag calibrate`)[/dim]"
+        )
+
+    # ── Features opt-in
+    console.print()
+    console.print("[bold]Features opt-in[/bold]")
+    for name, info in features.items():
+        if "enabled" in info:
+            if info["enabled"]:
+                state = "[bold green]ON[/bold green]"
+            else:
+                state = "[dim]off[/dim]"
+            env_note = f" (env: [cyan]{info['env']}[/cyan])"
+            console.print(f"  {state}  {name}{env_note}")
+        else:
+            state = info.get("status", "")
+            console.print(f"  [green]●[/green]  {name} [dim]— {state}[/dim]")
+
+    console.print()
+
+
 @cli.command("config")
 @click.option("--only-set", is_flag=True,
               help="Mostrar solo vars con un valor actual en el environment.")

@@ -203,6 +203,25 @@ Requiere registrar `rag open` como handler de `x-rag-open://` en macOS.
 ### `RAG_STATE_SQL=1`
 Históricamente activaba el SQL store para telemetría. **No-op desde 2026-04-20** — SQL es el único path.
 
+### `RAG_LLM_INTENT_SHADOW=1`
+Opt-in shadow mode del LLM intent classifier (Feature #3) — **sin cambiar routing**. Cuando está ON, cada query dispara la clasificación LLM además del regex, y loguea ambas predicciones a `rag_queries.extra_json.intent_shadow = {llm, regex, agree, latency_ms, llm_timed_out}`. El routing sigue usando el regex; shadow es puro measurement para evaluar si vale la pena cablear el router LLM full de Opción C.
+
+**Uso típico** (pre-decisión de Opción C):
+
+```bash
+export RAG_LLM_INTENT_SHADOW=1
+# correr el uso normal por ~1 semana → juntar N~500 queries
+sqlite3 ~/.local/share/obsidian-rag/ragvec/telemetry.db \
+  "SELECT json_extract(extra_json, '\$.intent_shadow.agree'), COUNT(*) \
+   FROM rag_queries WHERE extra_json LIKE '%intent_shadow%' GROUP BY 1"
+# si agree >95%: LLM no agrega valor, skip C
+# si agree 80-95%: analizar disagreements por bucket, C probablemente útil
+```
+
+**Costo**: +150-500ms por query (qwen2.5:3b helper, primera vez). El `_intent_llm_cache` LRU-500 hace que queries repetidas sean gratis. Solo se ejecuta en callers de `run_chat_turn` + `rag query` CLI — no aplica a serve.chat/tasks/weather/metachat (esos no pasan por el classifier).
+
+**Rollback**: apagar la var (`unset RAG_LLM_INTENT_SHADOW`). Sin ella el código es no-op.
+
 ---
 
 ## Semantic response cache (GC#1, post-2026-04-23)

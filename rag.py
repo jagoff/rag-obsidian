@@ -11713,6 +11713,101 @@ def _classify_intent_llm(
     return intent
 
 
+# ── LLM intent shadow mode (Opción C Fase 0 — observability, 2026-04-23) ────
+# Flag independiente de `RAG_LLM_INTENT` para correr el LLM classifier en
+# SHADOW mode: siempre predice (no solo en fallthrough-to-semantic), loguea
+# ambas predicciones a `extra_json.intent_shadow`, y **NO cambia el routing**.
+#
+# Uso: pasada previa a Opción C (router con LLM classifier real). Sin datos
+# de agreement regex-vs-LLM en la distribución real de queries del usuario,
+# es imposible decidir si C vale la pena.
+#
+# Preguntas que el shadow mode responde:
+#   1. ¿Con qué frecuencia el LLM clasifica DIFERENTE al regex?
+#   2. De los disagreements, ¿cuál es la categoría dominante? (ej. regex
+#      dice 'semantic' pero LLM dice 'entity_lookup' indica que el regex
+#      de entity_lookup está sub-cubierto.)
+#   3. ¿Qué % de las 'semantic' del regex se pueden upgradear a otra
+#      intent? Si es <5%, Opción C no mueve la aguja.
+#
+# Cost: +150-500ms por query (qwen2.5:3b helper). Con `_intent_llm_cache`
+# LRU-500 → queries repetidas son gratis. Opt-in para no inflar todos los
+# paths del daemon; recomendado prenderlo por 1 semana en la máquina del
+# dev para juntar N~500 queries con ambas predicciones, después apagar.
+#
+# Default OFF. Env: `RAG_LLM_INTENT_SHADOW=1`.
+
+_INTENT_LLM_SHADOW_ENABLED_ENV = "RAG_LLM_INTENT_SHADOW"
+
+
+def _llm_intent_shadow_enabled() -> bool:
+    """Check at call-time so tests can monkeypatch env without re-importing."""
+    return os.environ.get(
+        _INTENT_LLM_SHADOW_ENABLED_ENV, "",
+    ).strip().lower() in ("1", "true", "yes")
+
+
+def compute_intent_shadow(
+    question: str, regex_intent: str,
+) -> dict | None:
+    """Run the LLM classifier in shadow mode + return comparison metadata.
+
+    Returns dict::
+
+        {
+            "llm": <llm_intent>,
+            "regex": <regex_intent>,
+            "agree": bool,
+            "latency_ms": int,
+            "llm_timed_out": bool,  # True if LLM returned None
+        }
+
+    or None if:
+      - shadow mode disabled (env not set)
+      - question empty/whitespace
+      - caller passed invalid regex_intent
+
+    NEVER raises — errors downgrade to None so the caller can log a
+    missing-shadow event instead of failing the query. The returned
+    `llm_timed_out` flag distinguishes "helper unavailable" from
+    "user agreed" so downstream analytics can exclude timeouts from
+    agreement rate computation.
+
+    Cached via the same `_intent_llm_cache` as the fallback path —
+    repeated queries cost 0 LLM calls after first seen.
+    """
+    if not _llm_intent_shadow_enabled():
+        return None
+    if not question or not question.strip():
+        return None
+    if not isinstance(regex_intent, str) or not regex_intent:
+        return None
+    t0 = time.perf_counter()
+    try:
+        llm_intent = _classify_intent_llm(question)
+    except Exception:
+        llm_intent = None
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    if llm_intent is None:
+        # LLM helper unavailable / timeout / JSON parse error. Log the
+        # miss explicitly so the operator can see if the shadow is
+        # actually working (vs silently not firing).
+        return {
+            "llm": None,
+            "regex": regex_intent,
+            "agree": False,
+            "latency_ms": elapsed_ms,
+            "llm_timed_out": True,
+        }
+    return {
+        "llm": llm_intent,
+        "regex": regex_intent,
+        "agree": (llm_intent == regex_intent),
+        "latency_ms": elapsed_ms,
+        "llm_timed_out": False,
+    }
+
+
 def classify_intent(
     question: str, known_tags: set[str], known_folders: set[str]
 ) -> tuple[str, dict]:
@@ -15588,6 +15683,11 @@ class ChatTurnResult:
     cache_hit: bool = False
     cache_probe: dict | None = None
     cache_stored: bool = False
+    # LLM intent shadow mode (Opción C Fase 0 — observability, 2026-04-23).
+    # Populado cuando `RAG_LLM_INTENT_SHADOW=1`; dict con {llm, regex, agree,
+    # latency_ms, llm_timed_out} o None cuando el flag está OFF. Se emite a
+    # `extra_json.intent_shadow` para análisis downstream.
+    intent_shadow: dict | None = None
 
     def to_log_event(self, cmd: str, session_id: str) -> dict:
         """Serializa a dict compatible con `log_query_event()`.
@@ -15631,6 +15731,10 @@ class ChatTurnResult:
             "cache_hit": self.cache_hit,
             "cache_stored": self.cache_stored,
             "cache_probe": self.cache_probe,
+            # Intent shadow observability (Opción C Fase 0 — 2026-04-23).
+            # None en production default; populado cuando
+            # RAG_LLM_INTENT_SHADOW=1 para medir agreement regex vs LLM.
+            "intent_shadow": self.intent_shadow,
         }
 
 
@@ -15681,6 +15785,15 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         )
     except Exception:
         intent_value = None
+
+    # 1.1 LLM intent shadow mode (opt-in via RAG_LLM_INTENT_SHADOW=1):
+    # log lo que el LLM hubiera clasificado, sin cambiar routing. Pre-Opción C
+    # observability. No-op cuando el flag está OFF. Ver `compute_intent_shadow`.
+    _intent_shadow = (
+        compute_intent_shadow(req.question, intent_value or "semantic")
+        if intent_value is not None
+        else None
+    )
 
     # 1.5 Semantic cache lookup (post 2026-04-23). Eligibility mirrors the
     # `query()` CLI rules: skip when anything mutates retrieval semantics
@@ -15761,6 +15874,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
                     question=req.question,
                     cache_hit=True,
                     cache_probe=_cache_probe,
+                    intent_shadow=_intent_shadow,
                     timing={
                         "total_ms": int((time.perf_counter() - t_total_start) * 1000),
                         "retrieve_ms": 0,
@@ -15810,6 +15924,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
             cache_hit=False,
             cache_probe=_cache_probe,
             cache_stored=False,
+            intent_shadow=_intent_shadow,
             timing={
                 "total_ms": int((time.perf_counter() - t_total_start) * 1000),
                 "retrieve_ms": t_retrieve_ms,
@@ -15958,6 +16073,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         cache_hit=False,
         cache_probe=_cache_probe,
         cache_stored=_cache_stored,
+        intent_shadow=_intent_shadow,
         timing={
             "total_ms": int((time.perf_counter() - t_total_start) * 1000),
             "retrieve_ms": t_retrieve_ms,
@@ -20229,6 +20345,12 @@ def query(
     # (known_tags, known_folders already computed above — no second get_vocabulary call)
     intent, intent_params = classify_intent(effective_question, known_tags, known_folders)
 
+    # LLM intent shadow (Opción C Fase 0 observability, 2026-04-23).
+    # No-op cuando RAG_LLM_INTENT_SHADOW está apagado. Se loguea a
+    # `extra_json.intent_shadow` al final del turno para medir agreement
+    # regex-vs-LLM antes de cablear un router LLM real.
+    _intent_shadow_query = compute_intent_shadow(effective_question, intent)
+
     # ── Entity lookup dispatch (Improvement #2, Fase B) ──────────────────────
     # Placed BEFORE the metadata-dispatch block so we can fall-through to the
     # semantic pipeline when handle_entity_lookup() returns [] or flag is OFF.
@@ -20771,6 +20893,8 @@ def query(
         "cache_hit": False,
         "cache_stored": _cache_stored,
         "cache_probe": _cache_probe,
+        # Intent shadow observability (Opción C Fase 0 — 2026-04-23).
+        "intent_shadow": _intent_shadow_query,
         "typo_corrected": _typo_corrected,
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries

@@ -2004,6 +2004,49 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return inter / union
 
 
+def _compute_adaptive_k(
+    scores: list[float], *, k_default: int, min_k: int = 2,
+    gap_ratio: float = 0.35,
+) -> int:
+    """Decide how many top-k results to keep based on score distribution.
+
+    Feature #14 del 2026-04-23. Scans the sorted scores (highest first) and
+    finds the first significant drop: if (prev - cur) / |prev| > gap_ratio,
+    the cur candidate is "noticeably worse" and we truncate there.
+
+    Reduces prefill token consumption when the top-1 clearly dominates
+    (easy queries). Never goes below `min_k` — a rerank that returned
+    4 equally-good candidates shouldn't collapse to 1. Never exceeds
+    the input length or k_default.
+
+    Conservative: if scores are all negative, noise-level, or NaN, falls
+    back to k_default. Never raises.
+
+    Examples:
+      [1.2, 0.1, 0.05, 0.02]   gap_ratio=0.35 → k=1 but clamped to min_k=2
+      [1.2, 1.1, 0.2, 0.1]     gap_ratio=0.35 → k=2 (drop between #2 and #3)
+      [1.0, 0.9, 0.8, 0.7]     gap_ratio=0.35 → k=k_default (no clear drop)
+    """
+    if not scores:
+        return k_default
+    n = min(len(scores), k_default)
+    if n <= min_k:
+        return n
+    # Scan for the first significant drop.
+    for i in range(1, n):
+        prev = scores[i - 1]
+        cur = scores[i]
+        if prev <= 0:
+            # Avoid division surprises on negative scores — just bail to
+            # k_default. All-negative scenario = no clear signal.
+            continue
+        drop = (prev - cur) / abs(prev)
+        if drop >= gap_ratio:
+            # Found a cliff: keep up to and including index i-1.
+            return max(min_k, i)
+    return n
+
+
 def _apply_mmr_reorder(
     scored_pairs: list[tuple],
     *,
@@ -16196,7 +16239,22 @@ def retrieve(
             scored_all, lambda_=_mmr_lambda,
             pool_size=max(int(k * _mmr_pool_mult), k + 5),
         )
-    scored = scored_all[:k]
+    # Feature #14 (2026-04-23): adaptive k — cuando el top-1 domina
+    # claramente al resto, reducir k ahorra prefill tokens sin perder
+    # calidad. Busca el primer gap significativo en los top scores y
+    # trunca ahí. Default OFF hasta validar con eval.
+    _adaptive_k = os.environ.get("RAG_ADAPTIVE_K", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    k_effective = k
+    if _adaptive_k and len(scored_all) >= 2:
+        k_effective = _compute_adaptive_k(
+            [s for _, _, s in scored_all[:k]],
+            k_default=k,
+            min_k=int(os.environ.get("RAG_ADAPTIVE_K_MIN", "2")),
+            gap_ratio=float(os.environ.get("RAG_ADAPTIVE_K_GAP", "0.35")),
+        )
+    scored = scored_all[:k_effective]
     # `extras`: candidates beyond top-k, still reranker-ordered. Used by
     # `build_progressive_context` to avoid a redundant semantic col.query —
     # these already went through BM25+sem merge + cross-encoder rerank, so

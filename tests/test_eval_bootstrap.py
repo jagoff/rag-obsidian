@@ -39,7 +39,8 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     # Cross-source native-id prefixes = placeholders acceptable before the
     # ingester populates the corpus. Kept in sync with rag.VALID_SOURCES.
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
-                             "reminders://", "messages://")
+                             "reminders://", "messages://",
+                             "contacts://", "calls://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -66,7 +67,8 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     document why it's file-backed (like vault)."""
     import rag
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
-                             "reminders://", "messages://"}
+                             "reminders://", "messages://",
+                             "contacts://", "calls://"}
     # vault is file-backed → not a prefix
     expected_whitelisted = rag.VALID_SOURCES - {"vault"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
@@ -251,9 +253,18 @@ def test_golden_cross_source_paths_have_native_id_format():
          "reminders://<id> (sin trailing slash)"),
         (re.compile(r"^messages://[\w\-]+$"),
          "messages://<id>"),
+        # Contacts: ZUNIQUEID from AddressBook-v22.abcddb (UUID or
+        # "ABPerson" format). Allow trailing alnum + `-` + `:`.
+        (re.compile(r"^contacts://[\w\-:]+$"),
+         "contacts://<ZUNIQUEID>"),
+        # Calls: ZUNIQUE_ID from CallHistory.storedata (GUID format,
+        # e.g. "E62FDF87-D5B0-4A1E-AF1F-9E340D8DF3C3").
+        (re.compile(r"^calls://[\w\-]+$"),
+         "calls://<ZUNIQUE_ID>"),
     ]
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
-                             "reminders://", "messages://")
+                             "reminders://", "messages://",
+                             "contacts://", "calls://")
 
     bad: list[str] = []
 

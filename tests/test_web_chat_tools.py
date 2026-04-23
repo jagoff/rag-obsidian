@@ -348,9 +348,13 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
     names = [ev for ev, _ in events]
     # Order expectation.
     assert names[0] == "session"
-    assert ("status", {"stage": "retrieving"}) in events
+    # Status events now carry `intent` (added 2026-04-22 commit 73c3138).
+    # The stage value is what matters here — match on that, not the whole dict.
+    assert any(ev == "status" and data.get("stage") == "retrieving"
+               for ev, data in events), f"missing retrieving status in {events}"
     assert "sources" in names
-    assert ("status", {"stage": "generating"}) in events
+    assert any(ev == "status" and data.get("stage") == "generating"
+               for ev, data in events), f"missing generating status in {events}"
     assert names[-1] == "done"
     # No tool-related status events.
     for _ev, data in events:

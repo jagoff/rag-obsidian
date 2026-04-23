@@ -174,8 +174,9 @@ def fake_chat(monkeypatch):
 
 
 def test_expand_second_call_hits_cache(fake_chat):
-    # ≥4 tokens para pasar el perf gate (_EXPAND_MIN_TOKENS) y hit del cache.
-    q = "qué hora es ahora mismo"
+    # ≥6 tokens para pasar el perf gate (_EXPAND_MIN_TOKENS, bumped a 6 el
+    # 2026-04-22 post-audit) y hit del cache.
+    q = "qué hora es ahora mismo hoy exactamente"
     out1 = rag.expand_queries(q)
     out2 = rag.expand_queries(q)
     assert out1 == out2
@@ -207,20 +208,21 @@ def test_expand_eviction_drops_oldest_at_cap(fake_chat, monkeypatch):
     monkeypatch.setattr(rag, "_EXPAND_CACHE_MAX", 3)
     fake_chat["next_response"] = "alt one\nalt two"
 
-    # Queries con ≥4 tokens — las más cortas se saltean el LLM (perf gate)
-    # y no pasan por el cache, así que no sirven para validar eviction.
+    # Queries con ≥6 tokens — las más cortas se saltean el LLM (perf gate
+    # bumped a 6 el 2026-04-22) y no pasan por el cache, así que no sirven
+    # para validar eviction.
     for q in [
-        "pregunta uno alfa hoy",
-        "pregunta dos beta hoy",
-        "pregunta tres gamma hoy",
+        "pregunta uno alfa que viene hoy",
+        "pregunta dos beta que viene hoy",
+        "pregunta tres gamma que viene hoy",
     ]:
         rag.expand_queries(q)
     assert len(rag._expand_cache) == 3
 
-    rag.expand_queries("pregunta cuatro delta hoy")
+    rag.expand_queries("pregunta cuatro delta que viene hoy")
     assert len(rag._expand_cache) == 3
-    assert "pregunta uno alfa hoy" not in rag._expand_cache
-    assert "pregunta cuatro delta hoy" in rag._expand_cache
+    assert "pregunta uno alfa que viene hoy" not in rag._expand_cache
+    assert "pregunta cuatro delta que viene hoy" in rag._expand_cache
 
 
 def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
@@ -230,8 +232,9 @@ def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
     results = []
     errors = []
 
-    # ≥4 tokens para pasar el perf gate y llegar al cache
-    q = "pregunta concurrente varios threads hoy"
+    # ≥6 tokens para pasar el perf gate (bumped 4→6 el 2026-04-22) y
+    # llegar al cache.
+    q = "pregunta concurrente varios threads hoy en simultaneo"
 
     def worker():
         try:

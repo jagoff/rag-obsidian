@@ -84,19 +84,20 @@ def test_keeps_both_paraphrases_when_nouns_preserved(fake_ollama):
         "qué equipo de sonido usa Adam Jones?\n"
         "cuál es el rig de Adam Jones?"
     )
-    variants = rag.expand_queries("qué usa Adam Jones?")
+    # 6+ tokens para pasar el gate corto (post-2026-04-22 bumped de 4→6).
+    variants = rag.expand_queries("qué banda de sonido usa Adam Jones hoy?")
     assert len(variants) == 3  # original + 2 válidas
     assert all("Adam" in v for v in variants)
 
 
 def test_query_without_proper_nouns_keeps_all_paraphrases(fake_ollama):
     # Sin nombres propios no hay guardrail; lo que devuelva qwen queda.
-    # Query de 4+ tokens para pasar el gate corto.
+    # Query de 6+ tokens para pasar el gate corto.
     fake_ollama["next_response"] = (
         "qué tal va todo hoy?\n"
         "cómo anda el día?"
     )
-    variants = rag.expand_queries("qué tal anda todo hoy?")
+    variants = rag.expand_queries("qué tal anda todo esto que viene")
     assert len(variants) == 3   # original + 2
 
 
@@ -110,13 +111,14 @@ def test_ollama_failure_returns_just_original(fake_ollama, monkeypatch):
 
 def test_deduplicates_echo_of_original(fake_ollama):
     # Si el modelo devuelve la pregunta original como "paráfrasi", se ignora.
+    # 6+ tokens para pasar el gate corto.
     fake_ollama["next_response"] = (
-        "qué usa Adam Jones?\n"
+        "qué usa Adam Jones para tocar?\n"
         "cuál es el rig de Adam Jones?"
     )
-    variants = rag.expand_queries("qué usa Adam Jones?")
-    # Original + solo la verdadera paráfrasi.
-    assert variants[0] == "qué usa Adam Jones?"
+    variants = rag.expand_queries("qué usa Adam Jones para tocar?")
+    # Original + solo la verdadera paráfrasi (la otra es eco del original).
+    assert variants[0] == "qué usa Adam Jones para tocar?"
     assert len(variants) == 2
     assert "rig" in variants[1]
 
@@ -124,17 +126,20 @@ def test_deduplicates_echo_of_original(fake_ollama):
 # ── Short-query gate (perf) ───────────────────────────────────────────────────
 # El costo del helper qwen2.5:3b (~1-3s) no se amortiza en queries cortas: el
 # recall marginal es chico y el usuario percibe la latencia. Gate actual: saltar
-# cuando la query tiene <4 tokens ("qué hora es?", "dame resumen", "llueve?").
-# Cuatro tokens o más disparan la expansión como antes.
+# cuando la query tiene <6 tokens (bumped de 4→6 el 2026-04-22 post-audit).
+# "qué tal anda todo", "info banco santander", "llueve hoy?", "axe fx 3 config"
+# todos skipean. Seis tokens o más disparan la expansión.
 
 
 @pytest.mark.parametrize("short_query", [
     "llueve?",
     "qué hora es?",
     "dame resumen hoy",
+    "qué tal anda todo",          # 4 tokens — ahora skipea post-flip
+    "info banco santander cuenta", # 4 tokens
 ])
 def test_skips_expansion_for_short_queries(short_query, fake_ollama):
-    """Queries de ≤3 tokens devuelven solo el original — NO llaman al LLM."""
+    """Queries de ≤5 tokens devuelven solo el original — NO llaman al LLM."""
     called = {"n": 0}
 
     def counting_chat(**kwargs):
@@ -151,11 +156,11 @@ def test_skips_expansion_for_short_queries(short_query, fake_ollama):
     assert called["n"] == 0, f"LLM no debería llamarse para '{short_query}'"
 
 
-def test_expands_queries_with_4_plus_tokens(fake_ollama):
-    """Queries de 4+ tokens sí disparan la expansión."""
+def test_expands_queries_with_6_plus_tokens(fake_ollama):
+    """Queries de 6+ tokens sí disparan la expansión (post-2026-04-22 bumped)."""
     fake_ollama["next_response"] = (
         "reformulación alternativa uno\n"
         "reformulación alternativa dos"
     )
-    variants = rag.expand_queries("qué tal anda todo")  # 4 tokens
+    variants = rag.expand_queries("qué tal anda todo hoy en el trabajo")  # 8 tokens
     assert len(variants) == 3  # original + 2 paráfrasis

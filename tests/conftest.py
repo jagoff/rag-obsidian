@@ -172,6 +172,23 @@ def _disable_semantic_response_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _force_log_query_event_sync(monkeypatch):
+    """Perf audit 2026-04-22: ``log_query_event`` pasó a async por default
+    (queue daemon `_BACKGROUND_SQL_QUEUE`) para eliminar el 1.3s retry
+    budget del hot path del usuario. Tests como `test_rag_writers_sql`,
+    `test_telemetry_intent_logged`, `test_vaults`, etc. asumen contract
+    sincrónico — llaman `log_query_event(evt)` y luego leen
+    `rag_queries` en la misma secuencia.
+
+    Forzamos sync para TODOS los tests por default. Tests que
+    específicamente ejercen el path async (si alguno futuro lo hace)
+    pueden override con `monkeypatch.setenv("RAG_LOG_QUERY_ASYNC", "1")`.
+    """
+    monkeypatch.setenv("RAG_LOG_QUERY_ASYNC", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_rag_local_embed_env():
     """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
     directly when the CLI group runs for query-like subcommands. Any test that

@@ -11173,12 +11173,112 @@ _INTENT_SYNTHESIS_RE = re.compile(
 )
 
 
+_INTENT_LLM_ENABLED = os.environ.get(
+    "RAG_LLM_INTENT", ""
+).strip().lower() in ("1", "true", "yes")
+_INTENT_LLM_MODEL = os.environ.get(
+    "RAG_LLM_INTENT_MODEL", "qwen2.5:3b"
+).strip() or "qwen2.5:3b"
+_INTENT_LLM_TIMEOUT_S = float(os.environ.get("RAG_LLM_INTENT_TIMEOUT", "2.0"))
+
+_INTENT_LLM_VALID = frozenset({
+    "count", "list", "recent", "agenda", "entity_lookup",
+    "comparison", "synthesis", "semantic",
+})
+
+# LRU cache for the LLM classifier result: {question.lower(): (intent, ts)}.
+# TTL per-entry: 3600s. Capped to 500 entries — evict oldest when full.
+_intent_llm_cache: "collections.OrderedDict[str, tuple[str, float]]" = None  # type: ignore[assignment]
+_intent_llm_cache_lock = threading.Lock()
+_INTENT_LLM_CACHE_TTL_S = 3600.0
+_INTENT_LLM_CACHE_MAX = 500
+
+
+def _ensure_intent_llm_cache() -> None:
+    """Lazy-init the OrderedDict cache (module load order safety)."""
+    global _intent_llm_cache
+    if _intent_llm_cache is None:
+        import collections as _c
+        _intent_llm_cache = _c.OrderedDict()
+
+
+def _classify_intent_llm(
+    question: str, *, model: str | None = None,
+) -> str | None:
+    """Ask the helper LLM to classify an otherwise-'semantic' query.
+
+    Returns one of the 8 valid intents, or None on any transient failure
+    (ollama timeout, JSON parse error, unknown intent, etc). Caller MUST
+    tolerate None and fall back to the regex result ('semantic').
+
+    Cached per-process by lowercased question. TTL 1h; capped at 500
+    entries. Thread-safe via OrderedDict + lock.
+    """
+    if not question or not question.strip():
+        return None
+    q_key = question.strip().lower()
+    _ensure_intent_llm_cache()
+    now = time.time()
+    with _intent_llm_cache_lock:
+        entry = _intent_llm_cache.get(q_key)
+        if entry is not None:
+            intent, ts = entry
+            if now - ts < _INTENT_LLM_CACHE_TTL_S:
+                # Bump to most-recently-used.
+                _intent_llm_cache.move_to_end(q_key)
+                return intent
+            else:
+                _intent_llm_cache.pop(q_key, None)
+    judge_model = (model or _INTENT_LLM_MODEL).strip() or _INTENT_LLM_MODEL
+    # Concise few-shot prompt optimized for qwen2.5:3b. Spanish examples
+    # because the user's queries are in Spanish-rioplatense dominantly.
+    prompt = (
+        f"Clasificá la siguiente pregunta en UNA de estas categorías:\n"
+        f"- count      : preguntas que piden un CONTEO (ej. 'cuántas notas tengo')\n"
+        f"- list       : listados sin pregunta (ej. 'listame proyectos')\n"
+        f"- recent     : filtrado por fecha reciente (ej. 'notas de esta semana')\n"
+        f"- agenda     : qué tengo hoy/mañana/esta semana (calendario/reminders)\n"
+        f"- entity_lookup: buscar info sobre una persona/empresa (ej. 'qué sé de María')\n"
+        f"- comparison : comparar X vs Y (ej. 'A vs B', 'diferencia entre X y Y')\n"
+        f"- synthesis  : síntesis/resumen global (ej. 'resumí todo sobre X')\n"
+        f"- semantic   : búsqueda abierta (default — si no calza otra)\n\n"
+        f"Pregunta: {question}\n\n"
+        f"Respondé JSON estricto: {{\"intent\": \"<uno de los 8>\"}}"
+    )
+    try:
+        resp = _summary_client().chat(
+            model=judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_ctx": 2048, "num_predict": 40},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = resp.message.content.strip()
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    intent = data.get("intent")
+    if not isinstance(intent, str):
+        return None
+    intent = intent.strip().lower()
+    if intent not in _INTENT_LLM_VALID:
+        return None
+    # Write-through cache with FIFO eviction.
+    with _intent_llm_cache_lock:
+        _intent_llm_cache[q_key] = (intent, now)
+        while len(_intent_llm_cache) > _INTENT_LLM_CACHE_MAX:
+            _intent_llm_cache.popitem(last=False)
+    return intent
+
+
 def classify_intent(
     question: str, known_tags: set[str], known_folders: set[str]
 ) -> tuple[str, dict]:
     """Detect query intent. Returns (intent, params) where intent is one of
     'count', 'list', 'recent', 'agenda', 'comparison', 'synthesis',
-    'semantic' and params carries extracted filters.
+    'entity_lookup', 'semantic' and params carries extracted filters.
 
     Intent detection is deliberately strict (regex over known verbs) so natural
     questions stay on the semantic path. Ambiguous queries fall through to
@@ -11188,6 +11288,14 @@ def classify_intent(
     `agenda` is checked BEFORE `recent` because they share temporal tokens
     ("hoy" / "esta semana" / "este mes") — see `_INTENT_AGENDA_RE` docstring
     for the rationale.
+
+    LLM fallback (Feature #3 del 2026-04-23, opt-in via RAG_LLM_INTENT=1):
+    When the regex walk falls through to 'semantic', optionally call
+    qwen2.5:3b with a structured prompt to second-guess — the LLM can
+    catch intents phrased non-canonically ("cuántos archivos tengo sobre
+    X" skips the count regex because of the preposition). Cached per
+    query; timeout 2s; fails open to 'semantic'. Default OFF because
+    the extra call adds 150-500ms per miss.
     """
     params: dict = {}
 
@@ -11230,6 +11338,14 @@ def classify_intent(
         return "comparison", params
     if _INTENT_SYNTHESIS_RE.search(question):
         return "synthesis", params
+
+    # LLM fallback (only when all regexes fell through). Preserves existing
+    # `params` (tag/folder) — the LLM only upgrades the intent label.
+    if _INTENT_LLM_ENABLED:
+        llm_intent = _classify_intent_llm(question)
+        if llm_intent and llm_intent != "semantic":
+            return llm_intent, params
+
     return "semantic", {}
 
 

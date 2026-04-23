@@ -1,0 +1,798 @@
+{
+  "timestamp": "20260423-104942",
+  "total": 20,
+  "passed": 20,
+  "failed": 0,
+  "runs": [
+    {
+      "id": "ft_planning_semana",
+      "category": "forced_tools",
+      "question": "qué tengo para hacer esta semana",
+      "latency_ms": 6411,
+      "answer": "Tenés un cumpleaños de Astor mañana y otro el día siguiente. En los recordatorios, hay tres tareas para llamar al dentista el 24 de abril a las 10:00. También tenés pendientes arreglar los mosquiteros para la mudanza, comprar entradas para el concierto de Demos y pedir asistentes medicamentos al psiquiatra.",
+      "sources_count": 4,
+      "confidence": 0.662,
+      "metachat": false,
+      "turn_id": "9dbfa419fce8",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=308"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "6411ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_planning_hoy",
+      "category": "forced_tools",
+      "question": "qué tengo hoy",
+      "latency_ms": 24,
+      "answer": "Tenés un cumpleaños de Astor para mañana. `<<ext>>Y también uno al día siguiente, pero no mencionaste la hora exacta en ninguna nota.</ext>>`",
+      "sources_count": 4,
+      "confidence": 0.003,
+      "metachat": false,
+      "turn_id": "9ab15a1463dd",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=141"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "24ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_pendientes",
+      "category": "forced_tools",
+      "question": "qué pendientes tengo",
+      "latency_ms": 4393,
+      "answer": "vos tenés tres pendientes en tu lista de recordatorios:\n\n- Llamar al dentista, que está programado para las 10h del día 24/04/2026.\n- La mudanza: Arreglar mosquiteros, que no tiene una fecha específica.\n- Comprar las entradas para el en vivo de Demos, también sin una fecha específica.\n\nTodos estos están programados para la próxima semana.",
+      "sources_count": 4,
+      "confidence": 1.018,
+      "metachat": false,
+      "turn_id": "280e015aff78",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=340"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "4393ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_agenda",
+      "category": "forced_tools",
+      "question": "qué eventos tengo próximos",
+      "latency_ms": 23026,
+      "answer": "Tenés próximos los siguientes eventos:\n\n1. **Nerdear.la - 9na edición**: Del 19 al 22 de octubre.\n2. **Grecia viene a la tarde**: El 22 de abril, a las 9 AM.\n3. **Tienes que ir de Seba**: El 24 de abril, a las 8 PM.\n\n`<<ext>>Más info: https://omnifocus.com</ext>>`",
+      "sources_count": 4,
+      "confidence": 0.075,
+      "metachat": false,
+      "turn_id": "1bf6f54346ba",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=264"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "23026ms vs cap 45000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 23026ms > target 20000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_mails",
+      "category": "forced_tools",
+      "question": "qué mails pendientes tengo",
+      "latency_ms": 16764,
+      "answer": "No tenés ningún mail pendiente mencionado en el contexto. Los recordatorios son todos de Apple y están relacionados con llamadas al dentista, una mudanza, comprar entradas y pedir asistentes medicamentos. Si querés ver tus mails, tenés que revisar tu cliente de correo o la carpeta correspondiente en Obsidian.",
+      "sources_count": 4,
+      "confidence": 0.096,
+      "metachat": false,
+      "turn_id": "9a899a96fb48",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=310"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "16764ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_que_sabes_astor",
+      "category": "entity_lookup",
+      "question": "qué sabés de Astor",
+      "latency_ms": 15892,
+      "answer": "Tenés un hijo llamado Ferrari Astor, nacido el 25 de mayo de 2011. Va al jardín de infantes Lujan y vivís en Derqui 2273, Santa Fe, Argentina.\n\nSegún tus conversaciones, Astor participa de actividades como fútbol, donde pasaste un buen día viéndolo jugar. También estás pendiente de su educación, ya que mencionaste buscar un instituto de inglés cerca de la casa de María, posiblemente para él.\n\n`<<ext>>En resumen, Astor es tu hijo y participa en actividades escolares y deportivas, como fútbol, y estás involucrado en su educación y cuidado.<<ext>>`",
+      "sources_count": 5,
+      "confidence": 0.11,
+      "metachat": false,
+      "turn_id": "d1bb6f24155c",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=551"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "15892ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 15892ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_contame_juli",
+      "category": "entity_lookup",
+      "question": "contame de Juli",
+      "latency_ms": 21548,
+      "answer": "Juli 🥰 es tu hija y ha estado compartiendo su día a través de WhatsApp. Ayer, volvió de una visita donde comieron helado y llovió mucho, pero no pudieron sacar fotos. También estuvo divirtiéndose y jugando con la idea de que está \"rompiendo corazones\". Hablaron sobre un viaje que Juli 🥰 planea hacer con su tío Cami a Santiago, donde se quedarán hasta el 30 de este mes. Al respecto del pasaje para el viaje, te ofreciste en regalarle uno ya que cuesta 68 mil pesos y necesitaría ida y vuelta. Juli 🥰 también mencionó que le gustó el video de su cumpleaños.",
+      "sources_count": 4,
+      "confidence": 0.105,
+      "metachat": false,
+      "turn_id": "a492db5894ff",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=558"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "21548ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 21548ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_informacion_fernando",
+      "category": "entity_lookup",
+      "question": "información sobre Fernando",
+      "latency_ms": 14738,
+      "answer": "Tenés un contacto llamado Fernando Ferrero, que tiene el teléfono +54 9 342 549-9707 y el email fernando.d.ferrero@gmail.com. También tenés una charla programada con él para el 30 de abril a las 16:00hs en la reunión virtual https://meet.avature.cloud/FernandoYMarco.\n\nEn cuanto al WhatsApp, estás organizando un viaje a los molinos con Pablo. La idea es que vayan por tu casa en la media mañana del viernes o sábado, pero aún no se confirmó el día exacto. También tenés un mensaje de Emilio Andrés Ayala sobre un presupuesto para pintura interior, donde menciona su DNI y detalles técnicos.\n\nSi necesitás más información sobre Fernando, podés contactarlo directamente por teléfono o email.",
+      "sources_count": 5,
+      "confidence": 0.157,
+      "metachat": false,
+      "turn_id": "f407758e9bca",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=690"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "14738ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 14738ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_hablame_maria",
+      "category": "entity_lookup",
+      "question": "hablame de María",
+      "latency_ms": 17014,
+      "answer": "María es tu hermano. Conversan principalmente por WhatsApp, compartiendo cotidianidades y preocupaciones. En una conversación, te preguntó sobre las ortodoncias de Juli, mencionando que ya se las ajustaron bien. También hablaron sobre la beca para Juli, donde María indicó que le dan 100 pesos al mes y que necesita mantener una nota para recibirlo. Además, discutieron sobre la manutención, recordándote que tu hermano mencionó que su pareja está enferma y no puede pagarla.\n\nEn otra conversación, María se quejaba de que rara vez compartes actitudes juntos, estando a \"medio centímetro\" de tu madre. También comentó sobre Lolo, quien vino a buscarlo para andar en bicicleta. En una tarde, María contó que comió budín y torta, lo que la hizo reírse toda la tarde.\n\n`<<ext>>Más info: https://omnifocus.com</ext>>`",
+      "sources_count": 5,
+      "confidence": 0.201,
+      "metachat": false,
+      "turn_id": "7c6fe2d6d60a",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=813"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "17014ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 17014ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_fallthrough_react",
+      "category": "entity_lookup",
+      "question": "qué sabés de React",
+      "latency_ms": 10937,
+      "answer": "`<<ext>>No tengo información específica sobre React en el contexto proporcionado. Sin embargo, si tenés dudas o necesitás ayuda con algo relacionado a React, podés profundizar en tus notas o buscar recursos online. <<ext>>Más info: <https://reactjs.org></ext>>\"",
+      "sources_count": 4,
+      "confidence": 0.024,
+      "metachat": false,
+      "turn_id": "370e1a59ec0b",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=261"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "10937ms vs cap 30000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_hola",
+      "category": "metachat",
+      "question": "hola",
+      "latency_ms": 27,
+      "answer": "¡Hola! Preguntame lo que quieras sobre tus notas, o decime *recordame …* / *agendá …* si querés crear algo.",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "ccca9d18f42a",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=107"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "27ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_gracias",
+      "category": "metachat",
+      "question": "gracias",
+      "latency_ms": 21,
+      "answer": "¡De nada!",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "26559af85eb2",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=9"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "21ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_chau",
+      "category": "metachat",
+      "question": "chau",
+      "latency_ms": 19,
+      "answer": "¡Hasta luego!",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "6260513ae63e",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=13"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "19ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "sv_meditacion",
+      "category": "semantic_vault",
+      "question": "qué apunté sobre meditación",
+      "latency_ms": 3264,
+      "answer": "No tengo info sobre \"qué apunté sobre meditación\" en tus notas.",
+      "sources_count": 4,
+      "confidence": 0.014,
+      "metachat": false,
+      "turn_id": "4c53a6d564bd",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=63"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "3264ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "sv_ikigai",
+      "category": "semantic_vault",
+      "question": "qué es ikigai según mis notas",
+      "latency_ms": 9280,
+      "answer": "Según tus notas, Ikigai es un concepto japonés que combina el amor por lo que haces, lo que puedes hacer bien y lo que el mundo necesita. Esencialmente, se trata de encontrar la intersección entre tus pasiones, las habilidades que tienes, y lo que puede ser beneficioso para los demás. `<<ext>>`En resumen, Ikigai es sobre vivir una vida plena y significativa al hacer algo que te gusta y que aporta valor.`</ext>>`",
+      "sources_count": 4,
+      "confidence": 0.155,
+      "metachat": false,
+      "turn_id": "585cf32d021d",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=415"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "9280ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "wa_charla_maria",
+      "category": "whatsapp",
+      "question": "qué charlamos con María en marzo",
+      "latency_ms": 10627,
+      "answer": "Tu hija tuvo uma conversa importante contigo em março. Elas falaram sobre a manutenção dela, o pedido de juízo e algumas discussões que surgiram entre vocês. También te contou que ela pediu para ficar com você, mas não recebeu resposta. A conversa foi bastante tensa e cheia de desentendimentos.",
+      "sources_count": 5,
+      "confidence": 0.063,
+      "metachat": false,
+      "turn_id": "f4220a0a27f3",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=295"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "10627ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "wa_mensajes_juli",
+      "category": "whatsapp",
+      "question": "mensajes con Juli sobre mudanza",
+      "latency_ms": 11399,
+      "answer": "Vos tenés varios mensajes con Juli sobre la mudanza. Ella te contó que se va a Santiago el lunes con tu primo Cami y regresa el 30 de ese mes para ir al colegio. Tanto vos como Juli decís que está bien, pero vos estás esperando el jueves para empezar la mudanza y vas a estar ocupado los miércoles, jueves y viernes.",
+      "sources_count": 4,
+      "confidence": 0.174,
+      "metachat": false,
+      "turn_id": "6b5a894fb0d7",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=316"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11399ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_muy_corto",
+      "category": "edge_cases",
+      "question": "x",
+      "latency_ms": 3090,
+      "answer": "No tengo info sobre \"x\" en tus notas.",
+      "sources_count": 4,
+      "confidence": 0.015,
+      "metachat": false,
+      "turn_id": "71334feb9881",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=37"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "3090ms vs cap 15000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_simbolos",
+      "category": "edge_cases",
+      "question": "?¡@#",
+      "latency_ms": 9446,
+      "answer": "SI, tenés notas sobre WhatsApp. En una conversación con el número 120363422109180263@g.us, vos discutís sobre WebRTC y cómo implementarlo para compartir ofertas de manera segura a través de un QR. También mencionás que deberías rehacer algo relacionado con torneos.\n\nEn otra conversación con el número 221178299957300@lid, vos hablás sobre almohadones y avisas a Joa que saldrá con una banqueta.",
+      "sources_count": 4,
+      "confidence": 0.016,
+      "metachat": false,
+      "turn_id": "5bbf9ce7c5c9",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=395"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "9446ms vs cap 15000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 9446ms > target 5000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_hipotetica_absurda",
+      "category": "edge_cases",
+      "question": "cuál es la capital de Marte",
+      "latency_ms": 7345,
+      "answer": "No tenés información sobre la capital de Marte en el contexto que me mostraste. Las notas hablan sobre contactos, un podcast y conversaciones por WhatsApp, pero no mencionan nada relacionado con Marte o sus características geográficas. `<<ext>>La capital de Marte no está definida oficialmente ya que la superficie del planeta no tiene ciudades habitadas por humanos.</ext>>`",
+      "sources_count": 4,
+      "confidence": 0.074,
+      "metachat": false,
+      "turn_id": "a290ea8ae59b",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=375"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "7345ms vs cap 30000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    }
+  ]
+}

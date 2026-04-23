@@ -1,0 +1,237 @@
+# Batería de queries para scratch_eval/run_eval.py.
+#
+# Categorías en orden de prioridad para lo que acabamos de tocar:
+#   1. forced_tools    — ejerce _format_forced_tool_output (pre-router)
+#   2. entity_lookup   — ejerce el regex ampliado de _INTENT_ENTITY_LOOKUP_RE
+#   3. metachat        — short-circuit antes del LLM, debe ser <500ms
+#   4. semantic_vault  — retrieval + LLM estándar
+#   5. whatsapp        — fast-path de WA (threshold 0.05)
+#   6. edge_cases      — queries degeneradas que no deben crashear
+
+# Anti-leak patterns comunes a TODAS las queries (los fix los prohíben).
+# Declarados acá y aplicados por default en el runner a menos que la query
+# los desactive con `forbid_leak_patterns: false`.
+_leak_patterns_global:
+  - "[[reminders_due]]"
+  - "[[calendar_ahead]]"
+  - "[[gmail_recent]]"
+  - "[[finance_summary]]"
+  - "[[weather]]"
+  - "## reminders_due"
+  - "## calendar_ahead"
+  - "## gmail_recent"
+  - "## finance_summary"
+
+queries:
+  # ── forced_tools ─────────────────────────────────────────────────────
+  # Estas ejercen el pre-router que dispara reminders_due + calendar_ahead
+  # + gmail_recent + finance_summary y los formatea con
+  # _format_forced_tool_output. Pre-fix: droppeaba items undated, leakaba
+  # tool names como wikilinks. Post-fix: secciones Spanish clean.
+
+  - id: ft_planning_semana
+    category: forced_tools
+    question: qué tengo para hacer esta semana
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: false
+    notes: >
+      Dispara reminders_due + calendar_ahead por el _PLANNING_PAT.
+      La respuesta debe mencionar pendientes o eventos sin leakear
+      [[reminders_due]] ni saltarse items sin fecha.
+
+  - id: ft_planning_hoy
+    category: forced_tools
+    question: qué tengo hoy
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: false
+
+  - id: ft_pendientes
+    category: forced_tools
+    question: qué pendientes tengo
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: false
+
+  - id: ft_agenda
+    category: forced_tools
+    question: qué eventos tengo próximos
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: false
+
+  - id: ft_mails
+    category: forced_tools
+    question: qué mails pendientes tengo
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: true
+    notes: >
+      allow_refusal true porque gmail puede estar vacío o con token
+      expirado; sólo chequeamos que no crashee ni leakee.
+
+  # ── entity_lookup ────────────────────────────────────────────────────
+  # Regex ampliado el 2026-04-22: "qué sabés de X", "contame de X",
+  # "información sobre X", etc. Dispara handle_entity_lookup → SQL
+  # directo sobre rag_entities (~200ms vs ~7s del semantic full).
+  # Fallback a semantic si la entidad no está en la tabla.
+
+  - id: el_que_sabes_astor
+    category: entity_lookup
+    question: qué sabés de Astor
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 12000
+      require_substrings: ["astor"]
+      allow_refusal: false
+
+  - id: el_contame_juli
+    category: entity_lookup
+    question: contame de Juli
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 12000
+      require_substrings: ["juli"]
+      allow_refusal: false
+
+  - id: el_informacion_fernando
+    category: entity_lookup
+    question: información sobre Fernando
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 12000
+      require_substrings: ["fernando"]
+      allow_refusal: false
+
+  - id: el_hablame_maria
+    category: entity_lookup
+    question: hablame de María
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 12000
+      require_substrings: ["mar"]
+      allow_refusal: false
+
+  - id: el_fallthrough_react
+    category: entity_lookup
+    question: qué sabés de React
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 15000
+      allow_refusal: true
+    notes: >
+      Entidad no persona. Handler debería fall-through a semantic sin
+      crashear. allow_refusal=true porque el vault puede no tener React.
+
+  # ── metachat ─────────────────────────────────────────────────────────
+  # Short-circuit ANTES del LLM. Debe ser ultra rápido (<2s).
+  # Implementado en _detect_metachat_intent + _METACHAT_* respuestas
+  # canned.
+
+  - id: mc_hola
+    category: metachat
+    question: hola
+    checks:
+      max_latency_ms: 2000
+      target_latency_ms: 500
+      allow_refusal: true
+    notes: >
+      Short-circuit con respuesta canned (3 variantes rotando por
+      hash(msg+minute)). No debe tocar el LLM ni el retriever.
+
+  - id: mc_gracias
+    category: metachat
+    question: gracias
+    checks:
+      max_latency_ms: 2000
+      target_latency_ms: 500
+      allow_refusal: true
+
+  - id: mc_chau
+    category: metachat
+    question: chau
+    checks:
+      max_latency_ms: 2000
+      target_latency_ms: 500
+      allow_refusal: true
+
+  # ── semantic_vault ───────────────────────────────────────────────────
+  # Queries que dependen del contenido del vault del usuario. Todo el
+  # pipeline: retrieve → rerank → LLM.
+
+  - id: sv_meditacion
+    category: semantic_vault
+    question: qué apunté sobre meditación
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: true
+
+  - id: sv_ikigai
+    category: semantic_vault
+    question: qué es ikigai según mis notas
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 20000
+      allow_refusal: true
+
+  # ── whatsapp ─────────────────────────────────────────────────────────
+  # Fast-path post-2026-04-22: source=whatsapp explícito o ≥2 de top-3
+  # matches con source=whatsapp y top1_score > RAG_WA_FAST_PATH_THRESHOLD
+  # (default 0.05).
+
+  - id: wa_charla_maria
+    category: whatsapp
+    question: qué charlamos con María en marzo
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 15000
+      allow_refusal: true
+    notes: >
+      Tiene que pasar por el fast-path (qwen2.5:3b num_ctx=4096) si
+      detecta ≥2 chunks WA en top-3.
+
+  - id: wa_mensajes_juli
+    category: whatsapp
+    question: mensajes con Juli sobre mudanza
+    checks:
+      max_latency_ms: 45000
+      target_latency_ms: 15000
+      allow_refusal: true
+
+  # ── edge_cases ───────────────────────────────────────────────────────
+  # Queries degeneradas. El sistema debe responder o rechazar cortés,
+  # NUNCA crashear ni devolver 500.
+
+  - id: ec_muy_corto
+    category: edge_cases
+    question: x
+    checks:
+      max_latency_ms: 15000
+      target_latency_ms: 5000
+      allow_refusal: true
+
+  - id: ec_simbolos
+    category: edge_cases
+    question: "?¡@#"
+    checks:
+      max_latency_ms: 15000
+      target_latency_ms: 5000
+      allow_refusal: true
+
+  - id: ec_hipotetica_absurda
+    category: edge_cases
+    question: cuál es la capital de Marte
+    checks:
+      max_latency_ms: 30000
+      target_latency_ms: 10000
+      allow_refusal: true
+    notes: >
+      La respuesta correcta es "no está en tus notas". Debe refuse
+      educadamente, NO inventar.

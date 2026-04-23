@@ -40,7 +40,7 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     # ingester populates the corpus. Kept in sync with rag.VALID_SOURCES.
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
-                             "contacts://", "calls://")
+                             "contacts://", "calls://", "safari://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -68,7 +68,7 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     import rag
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
-                             "contacts://", "calls://"}
+                             "contacts://", "calls://", "safari://"}
     # vault is file-backed → not a prefix
     expected_whitelisted = rag.VALID_SOURCES - {"vault"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
@@ -261,10 +261,16 @@ def test_golden_cross_source_paths_have_native_id_format():
         # e.g. "E62FDF87-D5B0-4A1E-AF1F-9E340D8DF3C3").
         (re.compile(r"^calls://[\w\-]+$"),
          "calls://<ZUNIQUE_ID>"),
+        # Safari: three sub-paths, one per entity kind.
+        #   safari://history/<history_item_id>  — INTEGER from History.db
+        #   safari://bm/<WebBookmarkUUID>       — UUID from Bookmarks.plist
+        #   safari://rl/<WebBookmarkUUID>       — Reading List subtree
+        (re.compile(r"^safari://(history|bm|rl)/[\w\-:]+$"),
+         "safari://{history|bm|rl}/<id>"),
     ]
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
-                             "contacts://", "calls://")
+                             "contacts://", "calls://", "safari://")
 
     bad: list[str] = []
 

@@ -1777,7 +1777,7 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls"}
+     "contacts", "calls", "safari"}
 )
 
 # Per-source weight applied multiplicatively to the final rerank+feature
@@ -1789,6 +1789,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calendar":  0.95,
     "reminders": 0.90,
     "gmail":     0.85,
+    "safari":    0.80,   # browsing signal: rich titles + URLs, same band as calls
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
@@ -1808,6 +1809,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "calendar":  None,
     "reminders":   90.0,
     "gmail":      180.0,
+    "safari":      90.0,   # browsing context ages mid-term
     "whatsapp":    30.0,
     "messages":    30.0,
     "calls":       30.0,
@@ -1823,6 +1825,7 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "calendar":  None,
     "reminders": None,
     "gmail":      365,
+    "safari":     180,
     "whatsapp":   180,
     "messages":   180,
     "calls":      180,
@@ -2280,6 +2283,7 @@ CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "calendar":  0.015,   # scaffolding — tune with data
     "gmail":     0.015,   # scaffolding — tune with data
     "reminders": 0.015,   # scaffolding — tune with data
+    "safari":    0.015,   # scaffolding — tune with data
     "calls":     0.015,   # scaffolding — tune with data
     "whatsapp":  0.015,   # scaffolding — tune with data
     "messages":  0.015,   # scaffolding — tune with data
@@ -18733,9 +18737,41 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 extra=f"{missed} missed" if missed else "",
             ))
             return
+        if src == "safari":
+            from scripts.ingest_safari import run as _ingest_saf
+            summary = _ingest_saf(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+                since_iso=since_opt,
+            )
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            # Two-track total — history URLs + bookmarks + reading list —
+            # collapsed into one summary line via `_fmt_ingest_summary`.
+            total = (summary["history_fetched"]
+                     + summary["bookmarks_fetched"]
+                     + summary["reading_list_fetched"])
+            indexed = summary["history_indexed"] + summary["bookmarks_indexed"]
+            deleted = summary["history_deleted"] + summary["bookmarks_deleted"]
+            rl = summary["reading_list_fetched"]
+            console.print(_fmt_ingest_summary(
+                "safari",
+                total=total,
+                indexed=indexed,
+                deleted=deleted,
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+                extra=(
+                    f"history {summary['history_indexed']} · "
+                    f"bm {summary['bookmarks_indexed']} · "
+                    f"rl {rl}"
+                ),
+            ))
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp + calendar + gmail + reminders + contacts + calls (ready)."
+            f"Scope: whatsapp + calendar + gmail + reminders + contacts + calls + safari (ready)."
         )
         return
 

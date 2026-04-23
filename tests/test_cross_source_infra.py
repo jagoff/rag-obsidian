@@ -20,23 +20,25 @@ import rag
 # ── Constants ───────────────────────────────────────────────────────────────
 
 def test_valid_sources_contains_expected():
-    # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls.
-    # Anchor test so future additions don't silently grow the surface.
+    # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls
+    # + Phase 2 added safari. Anchor test so future additions don't
+    # silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
         {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-         "contacts", "calls"}
+         "contacts", "calls", "safari"}
     )
 
 
 def test_source_weights_dict_covers_every_valid_source():
     # Hierarchy: vault > contacts ≈ calendar > reminders > gmail
-    #          > calls > whatsapp = messages.
+    #          > safari ≈ calls > whatsapp = messages.
     assert set(rag.SOURCE_WEIGHTS) == rag.VALID_SOURCES
     assert rag.SOURCE_WEIGHTS["vault"] == 1.00
     assert rag.SOURCE_WEIGHTS["contacts"] == 0.95
     assert rag.SOURCE_WEIGHTS["calendar"] == 0.95
     assert rag.SOURCE_WEIGHTS["reminders"] == 0.90
     assert rag.SOURCE_WEIGHTS["gmail"] == 0.85
+    assert rag.SOURCE_WEIGHTS["safari"] == 0.80
     assert rag.SOURCE_WEIGHTS["calls"] == 0.80
     assert rag.SOURCE_WEIGHTS["whatsapp"] == 0.75
     assert rag.SOURCE_WEIGHTS["messages"] == 0.75

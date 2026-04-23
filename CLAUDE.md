@@ -121,6 +121,7 @@ rag index [--reset] [--no-contradict] [--vault NAME]  # incremental hash-based; 
 rag index --source whatsapp [--reset] [--since ISO] [--dry-run] [--max-chats N]  # WA ingester (Phase 1.a)
 rag index --source contacts [--reset] [--dry-run]    # Apple Contacts ingester (Phase 1.e) — corpus + phone→name helper
 rag index --source calls [--reset] [--since ISO] [--dry-run]  # CallHistory ingester (Phase 1.f) — llamadas perdidas/entrantes/salientes, enriquecidas con Contacts
+rag index --source safari [--reset] [--since ISO] [--dry-run] [--max-urls N] [--skip-bookmarks]  # Safari History + Bookmarks + Reading List (Phase 2)
 rag watch                                  # watchdog auto-reindex (debounce 3s)
 rag query "text" [--hyde --no-multi --raw --loose --force --counter --no-deep --session ID --continue --plain --source S[,S2] --vault NAME]
 rag chat [--counter --no-deep --session ID --resume] # /save /reindex (or NL) work; create-intent tool-calling (`recordame X`, `cumple de Y el viernes`)
@@ -532,6 +533,20 @@ macOS/iOS CallHistory via direct SQLite read on `~/Library/Application Support/C
 **Enrichment via Contacts**: the chunk body headline uses `ingest_contacts.resolve_phone(ZADDRESS)` to show human names instead of raw digits. Fallback chain: resolved Contact → `ZNAME` cached by Apple at call time → raw address → "(desconocido)". Headline phrasing is BM25-friendly: "Llamada perdida de Juli" / "Llamada saliente a Astor" so queries like "llamadas perdidas de Juli" hit without relying on embeddings alone.
 
 State: `rag_calls_state(call_uid, content_hash, last_seen_ts, updated_at)`. Calls are effectively immutable once logged, so the hash mostly guards against Apple's rare retroactive edits. Stale deletion when a `ZUNIQUE_ID` rolls off Apple's retention window (macOS keeps a few months). doc_ids are `calls://<ZUNIQUE_ID>::0`. Retention 180d (matches WhatsApp/messages — equally ephemeral), source weight 0.80 (between gmail 0.85 and whatsapp 0.75 — log entries are factual but semantically thin), recency halflife 30d (who-called-yesterday is critical, who-called-six-months-ago is trivia). CLI flags: `--reset`, `--dry-run`, `--since ISO` (hard floor, intersects with retention), `--retention-days N` (override default 180; 0 disables), `--db` (override path), `--json`. Tests: [`tests/test_ingest_calls.py`](tests/test_ingest_calls.py) (34 cases).
+
+### Safari ingester — Phase 2 (`scripts/ingest_safari.py`, `rag index --source safari`)
+
+Dos fuentes, un solo ingester: `~/Library/Safari/History.db` (SQLite) + `~/Library/Safari/Bookmarks.plist` (binary plist que incluye Reading List como subtree `com.apple.ReadingList`). Complementa el inline Chrome ETL existente (`rag.py:_sync_chrome_history` escribe `.md` al vault) — Safari va por la arquitectura source-prefixed (chunks en la DB vectorial directo, sin polución al vault).
+
+**Historia**: SQL JOIN `history_items ← history_visits`. Filtra `load_successful=1` (drop 404s + red fails) + `redirect_source IS NULL` (drop 301/302 intermediate hops), agrega por URL (no por visita — 7407 visitas aplastadas a ~3800 URLs únicas), agarra el título más reciente non-empty como display. Retention 180d sobre `last_visit`. Cap `max_urls=5000` por run (configurable) para evitar runs multi-minute en historial largo. doc_ids: `safari://history/<history_item_id>::0`.
+
+**Bookmarks**: recursive walk del plist tree, skippeando folders internos (`BookmarksBar`, `BookmarksMenu`) y nodos Proxy (Historial placeholder, Reading List shortcut). URIDictionary.title gana sobre Title directo para leaves. Reading List entries cargan `ReadingList.PreviewText` que se concatena al título con ` — ` (rico para BM25 en "artículo que guardé sobre X"). doc_ids: `safari://bm/<UUID>::0` para bookmarks, `safari://rl/<UUID>::0` para Reading List — prefix distinto porque un UUID podría moverse entre bookmarks ↔ RL y necesitamos delete surgical por el otro prefix al migrar.
+
+**State**: dos tablas separadas — `rag_safari_history_state(history_item_id INTEGER PK, content_hash, last_seen_ts, updated_at)` + `rag_safari_bookmark_state(bookmark_uuid TEXT PK, content_hash, ...)`. Diff + stale delete por cada una. Content hash del history excluye `first_visit_ts` (estable por definición) pero incluye `last_visit_ts` + `visit_count` para detectar nuevas visitas. Bookmark hash incluye `is_reading_list` flag para detectar el movimiento RL↔bookmarks.
+
+Source weight 0.80 (mismo banda que calls — signal factual rico pero no curado por el usuario como Contacts). Halflife 90d (browsing context ages mid-term; no es conversacional como WA pero tampoco permanente como Calendar). Retention 180d. CLI flags: `--reset`, `--dry-run`, `--since ISO`, `--retention-days N`, `--max-urls N` (default 5000), `--skip-bookmarks`, `--history-db`, `--bookmarks-plist`, `--json`. Tests: [`tests/test_ingest_safari.py`](tests/test_ingest_safari.py) (37 cases).
+
+**Note on SQLite contention**: cuando `rag serve` / `web/server.py` está corriendo, el primer `rag index --source safari` puede pegar `database is locked` en el bookmarks bulk-add (1000+ rows en una transacción + GLiNER entity extraction concurrente). Reintentá — el state de history ya se commiteó en la primera tanda, así que el retry solo procesa bookmarks. Long-term fix: serializar con `vault_write_lock` el branch de safari (TODO, no-blocker por ahora).
 
 ### Remaining (Phase 1.g, 1.h + 2)
 

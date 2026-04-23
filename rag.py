@@ -36697,6 +36697,114 @@ def serve(host: str, port: int):
                 _cache_put(cache_key, tasks_payload)
             return tasks_payload
 
+        # ── Semantic cache (SQL) — segundo layer post LRU miss (2026-04-23) ──
+        # Espeja el wiring de /api/chat (web/server.py). El LRU arriba
+        # (línea ~36410) captura repetidos exactos dentro del proceso;
+        # el SQL cache matchea paraphrases + persiste cross-restart.
+        # Gates: no history (follow-ups cambian con el contexto), no force
+        # (usuario pidió re-run), no filters (cambian la respuesta), y el
+        # question no es de weather/tasks (esos ya short-circuitean con
+        # su propio path time-sensitive arriba, no llegan acá).
+        _serve_sem_emb = None
+        _serve_sem_hash = ""
+        _serve_sem_probe: dict | None = None
+        _serve_sem_eligible = (
+            not history
+            and not force
+            and not qfolder
+            and not qtag
+        )
+        if _serve_sem_eligible:
+            try:
+                if _semantic_cache_enabled():
+                    _serve_sem_emb = embed([question])[0]
+                    _serve_sem_hash = _corpus_hash_cached(col)
+                    _serve_sem_hit, _serve_sem_probe = semantic_cache_lookup(
+                        _serve_sem_emb, _serve_sem_hash, return_probe=True,
+                    )
+                    if _serve_sem_hit is not None:
+                        # Reconstruir el payload en el shape que el listener
+                        # espera (answer/sources/confidence/t_retrieve/t_gen).
+                        _sem_paths = _serve_sem_hit.get("paths") or []
+                        _sem_scores = _serve_sem_hit.get("scores") or []
+                        _sem_top = _serve_sem_hit.get("top_score") or 0.0
+                        _sem_text = _serve_sem_hit["response"]
+                        from pathlib import Path as _SvP
+                        _sem_sources = [
+                            {
+                                "note": _SvP(p).stem,
+                                "path": p,
+                                "score": round(float(s), 2),
+                            }
+                            for p, s in zip(_sem_paths, _sem_scores)
+                        ]
+                        _sem_payload = {
+                            "answer": _sem_text,
+                            "sources": _sem_sources,
+                            "confidence": round(float(_sem_top), 2),
+                            "t_retrieve": 0.0,
+                            "t_gen": 0.0,
+                            "cached": True,
+                            "cache_layer": "semantic",
+                        }
+                        if wa_cross_ref is not None:
+                            _sem_payload["wa_cross_ref"] = wa_cross_ref
+                        if user_nickname is not None:
+                            _sem_payload["user_nickname"] = user_nickname
+                        # Hidratar el LRU así el próximo exact-repeat
+                        # pega O(1) sin re-embed + re-lookup.
+                        try:
+                            _cache_put(cache_key, {
+                                k: v for k, v in _sem_payload.items()
+                                if k not in ("wa_cross_ref", "user_nickname")
+                            })
+                        except Exception:
+                            pass
+                        # Session append — la conversación continúa normal.
+                        _sem_turn_id = new_turn_id()
+                        if sess:
+                            try:
+                                append_turn(sess, {
+                                    "q": question,
+                                    "a": _sem_text,
+                                    "paths": _sem_paths,
+                                    "top_score": round(float(_sem_top), 3),
+                                    "turn_id": _sem_turn_id,
+                                    "cached": True,
+                                    "cache_layer": "semantic",
+                                })
+                                save_session(sess)
+                            except Exception:
+                                pass
+                        try:
+                            log_query_event({
+                                "cmd": "serve.cached_semantic",
+                                "q": question[:200],
+                                "session": sid,
+                                "turn_id": _sem_turn_id,
+                                "answered": True,
+                                "cache_hit": True,
+                                "cache_probe": _serve_sem_probe,
+                                "cache_layer": "semantic",
+                                "cache_cosine": round(
+                                    float(_serve_sem_hit["cosine"]), 4,
+                                ),
+                                "cache_age_seconds": int(
+                                    _serve_sem_hit["age_seconds"]
+                                ),
+                                "paths": _sem_paths,
+                                "top_score": round(float(_sem_top), 2),
+                                "t_retrieve": 0.0,
+                                "t_gen": 0.0,
+                            })
+                        except Exception:
+                            pass
+                        return _sem_payload
+            except Exception as _serve_sem_exc:
+                _silent_log("serve_semantic_cache_lookup", _serve_sem_exc)
+                _serve_sem_emb = None
+                _serve_sem_hash = ""
+
         # Reformulate + expand (merged when history available)
         effective = question
         pre_variants: list[str] | None = None
@@ -36886,6 +36994,37 @@ def serve(host: str, port: int):
         # gets a fresh lookup — added after _cache_put below.
         if not force and not qfolder and not qtag:
             _cache_put(cache_key, payload)
+            # Semantic cache store (SQL, persistent). Piggyback sobre el
+            # embed + corpus_hash ya computados en el lookup arriba
+            # (~línea 36720). background=True — serve es long-running
+            # daemon; el atexit drop del CLI no aplica. Mismo gate que
+            # semantic_cache_store aplica internamente (refusal detector,
+            # low top_score, empty response).
+            if _serve_sem_emb is not None and _serve_sem_hash:
+                try:
+                    _serve_sem_cache_paths = list(dict.fromkeys(
+                        m.get("file", "")
+                        for m in (result.get("metas") or [])
+                        if m.get("file")
+                    ))
+                    semantic_cache_store(
+                        _serve_sem_emb,
+                        question=question,
+                        response=answer,
+                        paths=_serve_sem_cache_paths,
+                        scores=[
+                            round(float(s), 2)
+                            for s in (result.get("scores") or [])[:len(_serve_sem_cache_paths)]
+                        ],
+                        top_score=round(float(result["confidence"]), 2),
+                        intent=None,
+                        corpus_hash=_serve_sem_hash,
+                        background=True,
+                    )
+                except Exception as _serve_sem_put_exc:
+                    _silent_log(
+                        "serve_semantic_cache_store", _serve_sem_put_exc,
+                    )
         if wa_cross_ref is not None:
             payload["wa_cross_ref"] = wa_cross_ref
         if user_nickname is not None:

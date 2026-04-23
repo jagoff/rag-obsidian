@@ -4705,6 +4705,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # no-bound y deja un `UnboundLocalError` visible en web.log como
         # `[chat-cache] put failed: cannot access local variable '_cache_key'…`.
         _cache_key: str | None = None
+        # ── Semantic cache (SQL, persistent, paraphrase-tolerant). 2026-04-23.
+        # Second-layer fallback: exact-string LRU arriba captura repetidos
+        # exactos dentro de TTL 5min. El semantic cache persiste 24h y
+        # matchea paraphrases ("qué es ikigai" vs "qué es el ikigai") vía
+        # cosine del embedding bge-m3. Llenamos _semantic_cache_emb/hash
+        # acá para reusarlos en el PUT path al final (si hubo miss).
+        _semantic_cache_emb = None
+        _semantic_cache_hash = ""
+        _semantic_cache_probe: dict | None = None
         if not history:
             try:
                 from rag import get_db_for
@@ -4780,6 +4789,154 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 })
                 save_session(sess)
                 return
+
+        # ── Semantic cache (SQL) — segundo layer post LRU miss ────────────
+        # Cubre: paraphrases + reinicios del server + TTL largo (24h) vs el
+        # LRU (exact-match lowercased + 5min + in-memory).
+        # Gates: no history, single-vault (corpus_hash es per-col),
+        # no propose_intent (create actions NO son queries), cache enabled.
+        _semantic_eligible = (
+            not history
+            and not is_propose_intent
+            and len(vaults) == 1
+        )
+        if _semantic_eligible:
+            try:
+                from rag import (
+                    embed as _rag_embed,
+                    _corpus_hash_cached,
+                    semantic_cache_lookup,
+                    _semantic_cache_enabled,
+                )
+                if _semantic_cache_enabled():
+                    from rag import get_db_for as _rag_get_db_for
+                    _sem_col = _rag_get_db_for(vaults[0][1])
+                    _semantic_cache_emb = _rag_embed([question])[0]
+                    _semantic_cache_hash = _corpus_hash_cached(_sem_col)
+                    _sem_hit, _semantic_cache_probe = semantic_cache_lookup(
+                        _semantic_cache_emb, _semantic_cache_hash,
+                        return_probe=True,
+                    )
+                    if _sem_hit is not None:
+                        # Replay SSE same shape as LRU hit above. We
+                        # synthesize `sources_items` from the cached paths +
+                        # scores — minimal meta (file/note/folder/score/bar)
+                        # since we don't have the full meta rows anymore.
+                        from pathlib import Path as _SemP
+                        _sem_paths = _sem_hit.get("paths") or []
+                        _sem_scores = _sem_hit.get("scores") or []
+                        _sem_top = _sem_hit.get("top_score")
+                        if _sem_top is None:
+                            _sem_top = 0.0
+                        _sem_text = _sem_hit["response"]
+                        _sem_sources = [
+                            {
+                                "file": _p,
+                                "note": _SemP(_p).stem,
+                                "folder": str(_SemP(_p).parent),
+                                "score": round(float(_s), 3),
+                                "bar": _score_bar(float(_s)),
+                            }
+                            for _p, _s in zip(_sem_paths, _sem_scores)
+                        ]
+                        yield _sse("status", {"stage": "cached"})
+                        if not is_propose_intent:
+                            yield _sse("sources", {
+                                "items": _sem_sources,
+                                "confidence": _sem_top,
+                            })
+                        for _i in range(0, len(_sem_text), 40):
+                            yield _sse("token", {"delta": _sem_text[_i:_i + 40]})
+                        _sem_total_ms = int((time.perf_counter() - _t0) * 1000)
+                        _sem_turn_id = new_turn_id()
+                        yield _sse("done", {
+                            "turn_id": _sem_turn_id,
+                            "top_score": _sem_top,
+                            "total_ms": _sem_total_ms,
+                            "retrieve_ms": 0,
+                            "ttft_ms": _sem_total_ms,
+                            "llm_ms": 0,
+                            "cached": True,
+                            "cache_layer": "semantic",
+                        })
+                        _sem_enrich_evt = _emit_enrich(
+                            _sem_turn_id, question, _sem_text, float(_sem_top),
+                        )
+                        if _sem_enrich_evt:
+                            yield _sem_enrich_evt
+                        print(
+                            f"[chat-cache] SEMANTIC HIT "
+                            f"cos={_sem_hit['cosine']:.3f} "
+                            f"age={int(_sem_hit['age_seconds'] // 60)}m "
+                            f"total={_sem_total_ms}ms",
+                            flush=True,
+                        )
+                        # Emit the `[chat-timing]` schema-stable line so
+                        # downstream parsers (tool_rounds/tool_ms) don't see
+                        # NaN on cache-hit turns.
+                        print(
+                            f"[chat-timing] model={_resolve_web_chat_model()} "
+                            f"retrieve=0ms reform=0ms reform_outcome=skipped "
+                            f"q_words={len(question.split())} wa=0ms "
+                            f"llm_prefill=0ms llm_decode=0ms "
+                            f"ttft={_sem_total_ms}ms total={_sem_total_ms}ms "
+                            f"ctx_chars=0 tokens≈{len(_sem_text.split())} "
+                            f"confidence={_sanitize_confidence(_sem_top):.3f} "
+                            f"variants=0 tool_rounds=0 tool_ms=0 tool_names= "
+                            f"cached=1 cache_layer=semantic",
+                            flush=True,
+                        )
+                        # Hydrate LRU so next-turn exact-match hits O(1).
+                        if _cache_key is not None:
+                            try:
+                                _chat_cache_put(_cache_key, {
+                                    "text": _sem_text,
+                                    "sources_items": _sem_sources,
+                                    "top_score": _sem_top,
+                                })
+                            except Exception:
+                                pass
+                        try:
+                            append_turn(sess, {
+                                "q": question,
+                                "a": _sem_text,
+                                "paths": _sem_paths,
+                                "top_score": _sem_top,
+                                "turn_id": _sem_turn_id,
+                            })
+                            save_session(sess)
+                        except Exception:
+                            pass
+                        try:
+                            log_query_event({
+                                "cmd": "web.chat.cached_semantic",
+                                "q": question[:200],
+                                "session": sess["id"],
+                                "turn_id": _sem_turn_id,
+                                "answered": True,
+                                "t_total": round(_sem_total_ms / 1000.0, 3),
+                                "cache_hit": True,
+                                "cache_probe": _semantic_cache_probe,
+                                "cache_layer": "semantic",
+                                "cache_cosine": round(_sem_hit["cosine"], 4),
+                                "cache_age_seconds": int(_sem_hit["age_seconds"]),
+                                "paths": _sem_paths,
+                                "top_score": _sem_top,
+                                "device": _client_device,
+                            })
+                        except Exception:
+                            pass
+                        return
+            except Exception as _sem_exc:
+                print(
+                    f"[chat-cache] semantic lookup failed: "
+                    f"{type(_sem_exc).__name__}: {_sem_exc}",
+                    flush=True,
+                )
+                # Cache lookup is a perf optimization — fall back to the
+                # normal pipeline. Reset emb/hash so PUT also skips.
+                _semantic_cache_emb = None
+                _semantic_cache_hash = ""
 
         # Fail fast if ollama is in the "stuck-load" state — accepts HTTP
         # but never responds. Two-layer probe: /api/tags is the cheap
@@ -5886,6 +6043,48 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 print(f"[chat-cache] PUT {_cache_key} len={len(full)}", flush=True)
             except Exception as _cache_err:
                 print(f"[chat-cache] put failed: {_cache_err}", flush=True)
+            # Semantic cache store (SQL, persistent). Piggyback on the
+            # embed + corpus_hash already computed in the lookup path
+            # above (~line 4814). background=True is fine here — web
+            # server is a long-running daemon so the atexit drop that
+            # bit `rag query` CLI doesn't apply. Same store gates as
+            # any other caller (refusal detector, low top_score,
+            # empty response) fire inside `semantic_cache_store`.
+            if _semantic_cache_emb is not None and _semantic_cache_hash:
+                try:
+                    from rag import semantic_cache_store as _rag_sem_store
+                    _sem_cache_paths = list(dict.fromkeys(
+                        m.get("file", "")
+                        for m in (result.get("metas") or [])
+                        if m.get("file")
+                    ))
+                    _rag_sem_store(
+                        _semantic_cache_emb,
+                        question=question,
+                        response=full,
+                        paths=_sem_cache_paths,
+                        scores=[
+                            round(float(s), 2)
+                            for s in (result.get("scores") or [])[:len(_sem_cache_paths)]
+                        ],
+                        top_score=round(
+                            _sanitize_confidence(result["confidence"]), 2,
+                        ),
+                        intent=None,
+                        corpus_hash=_semantic_cache_hash,
+                        background=True,
+                    )
+                    print(
+                        f"[chat-cache] SEMANTIC PUT hash={_semantic_cache_hash} "
+                        f"len={len(full)}",
+                        flush=True,
+                    )
+                except Exception as _sem_put_err:
+                    print(
+                        f"[chat-cache] semantic put failed: "
+                        f"{type(_sem_put_err).__name__}: {_sem_put_err}",
+                        flush=True,
+                    )
 
     def guarded():
         """Increment/decrement the global chat-in-flight counter around

@@ -4786,6 +4786,37 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Learned paraphrases (Feature #9 del 2026-04-23). Queries that
+        # received rating=1 feedback are a source of proof that their
+        # paraphrases worked — the rerank + LLM answered correctly. We
+        # persist those paraphrases per query so `expand_queries()` can
+        # skip the qwen2.5:3b call when it has a learned set.
+        #
+        # q_normalized: lowercased + stripped, PRIMARY KEY of the set
+        #   (multiple rows per query allowed, keyed by paraphrase).
+        # paraphrase: the alternative phrasing that helped.
+        # hit_count: how many positive-rated queries used this paraphrase.
+        #   Threshold ≥ 2 before we trust it; 1-hit is noise.
+        # last_used_ts + created_ts: for LRU eviction when table grows.
+        #
+        # UNIQUE(q_normalized, paraphrase) prevents dupes; INSERT ...
+        # ON CONFLICT DO UPDATE SET hit_count = hit_count + 1.
+        "rag_learned_paraphrases",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_learned_paraphrases ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " q_normalized TEXT NOT NULL,"
+            " paraphrase TEXT NOT NULL,"
+            " hit_count INTEGER NOT NULL DEFAULT 1,"
+            " created_ts TEXT NOT NULL,"
+            " last_used_ts TEXT NOT NULL,"
+            " UNIQUE(q_normalized, paraphrase)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_paraphrases_q ON rag_learned_paraphrases(q_normalized)",
+            "CREATE INDEX IF NOT EXISTS ix_paraphrases_hits ON rag_learned_paraphrases(hit_count DESC)",
+        ),
+    ),
+    (
         # Per-source score calibration (Feature #2 del 2026-04-23). Cross-
         # encoder (bge-reranker-v2-m3) produces scores in wildly different
         # ranges per source — measured on production telemetry:
@@ -10969,6 +11000,92 @@ _EXPAND_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 _EXPAND_FUTURE_TIMEOUT = float(os.environ.get("RAG_EXPAND_TIMEOUT_S", "3.0"))
 
 
+_LEARNED_PARA_MIN_HITS = int(
+    os.environ.get("RAG_LEARNED_PARA_MIN_HITS", "2")
+)
+_LEARNED_PARA_ENABLED = os.environ.get(
+    "RAG_LEARNED_PARAPHRASES", "1"
+).strip().lower() not in ("0", "false", "no")
+
+
+def _normalize_q(q: str) -> str:
+    """Canonical form used as lookup key for learned paraphrases.
+
+    Lowercase + strip + collapse internal whitespace. Keeps Unicode
+    (Spanish chars) and punctuation intact — they're signal for matching
+    user phrasing patterns.
+    """
+    return re.sub(r"\s+", " ", (q or "").strip().lower())
+
+
+def _lookup_learned_paraphrases(question: str, *, limit: int = 2) -> list[str]:
+    """Return up to `limit` paraphrases learned for this exact query.
+
+    Uses q_normalized equality — no fuzzy matching (yet). Requires
+    hit_count >= _LEARNED_PARA_MIN_HITS (default 2) to be trusted.
+    Updates last_used_ts as a side effect so stale entries can be
+    evicted later. Never raises; returns [] on any failure.
+    """
+    if not _LEARNED_PARA_ENABLED:
+        return []
+    key = _normalize_q(question)
+    if not key:
+        return []
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT paraphrase, hit_count FROM rag_learned_paraphrases "
+                "WHERE q_normalized = ? AND hit_count >= ? "
+                "ORDER BY hit_count DESC, last_used_ts DESC LIMIT ?",
+                (key, _LEARNED_PARA_MIN_HITS, int(limit)),
+            ).fetchall()
+            if not rows:
+                return []
+            # Bump last_used_ts so we keep track of which paraphrases
+            # actually serve traffic. Single UPDATE with IN-list.
+            now_ts = datetime.now().isoformat(timespec="seconds")
+            para_texts = [r[0] for r in rows if r[0]]
+            if para_texts:
+                placeholders = ",".join(["?"] * len(para_texts))
+                conn.execute(
+                    f"UPDATE rag_learned_paraphrases "
+                    f"SET last_used_ts = ? "
+                    f"WHERE q_normalized = ? AND paraphrase IN ({placeholders})",
+                    [now_ts, key, *para_texts],
+                )
+            return para_texts
+    except Exception:
+        return []
+
+
+def _record_learned_paraphrase(
+    q: str, paraphrase: str, *, now_ts: str | None = None,
+) -> bool:
+    """Upsert a (query, paraphrase) pair into rag_learned_paraphrases.
+
+    Increments hit_count on conflict. Used by `rag paraphrases train` to
+    bulk-populate from historical feedback rows. Never raises.
+    """
+    q_norm = _normalize_q(q)
+    paraphrase = (paraphrase or "").strip()
+    if not q_norm or not paraphrase or paraphrase.lower() == q_norm:
+        return False
+    ts = now_ts or datetime.now().isoformat(timespec="seconds")
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_learned_paraphrases "
+                "(q_normalized, paraphrase, hit_count, created_ts, last_used_ts) "
+                "VALUES (?, ?, 1, ?, ?) "
+                "ON CONFLICT(q_normalized, paraphrase) DO UPDATE SET "
+                "  hit_count = hit_count + 1, last_used_ts = excluded.last_used_ts",
+                (q_norm, paraphrase, ts, ts),
+            )
+        return True
+    except Exception:
+        return False
+
+
 def expand_queries(question: str) -> list[str]:
     """Generate 2 paraphrases for multi-query retrieval. Returns [original, p1, p2].
 
@@ -10981,6 +11098,12 @@ def expand_queries(question: str) -> list[str]:
     saltan la expansión — el LLM helper aporta poco recall marginal sobre
     queries tan cortas (e.g. "llueve?", "qué hora es?", "dame resumen hoy")
     contra el costo de 1-3s por call. Ajustable vía ``RAG_EXPAND_MIN_TOKENS``.
+
+    Learned paraphrases (Feature #9 del 2026-04-23): si hay paraphrases
+    históricamente exitosas (rating=1 con ≥2 hits) para esta query,
+    las devolvemos directamente — skip LLM call (~500ms-2s saved).
+    Populated por `rag paraphrases train` desde rag_feedback. Flag
+    RAG_LEARNED_PARAPHRASES (default ON).
     """
     tokens = question.strip().split()
     if len(tokens) < _EXPAND_MIN_TOKENS:
@@ -10991,6 +11114,17 @@ def expand_queries(question: str) -> list[str]:
             _expand_cache.move_to_end(question)  # LRU: mark as recently used
     if hit is not None:
         return list(hit)
+    # Learned-paraphrases short-circuit: if we have ≥2-hit paraphrases
+    # for this exact query, use them and skip the LLM call.
+    learned = _lookup_learned_paraphrases(question, limit=2)
+    if learned:
+        result = [question] + learned
+        with _expand_cache_lock:
+            _expand_cache[question] = result
+            _expand_cache.move_to_end(question)
+            while len(_expand_cache) > _EXPAND_CACHE_MAX:
+                _expand_cache.popitem(last=False)
+        return list(result)
     prompt = (
         "Reformulá esta pregunta de DOS maneras distintas — distintas "
         "palabras clave, mismo sentido. Nombres propios (personas, bandas, "
@@ -40414,6 +40548,179 @@ def _collect_env_var_names_from_source() -> set[str]:
         r'((?:OBSIDIAN_RAG|RAG|OLLAMA)_[A-Z][A-Z0-9_]*)["\']'
     )
     return set(pattern.findall(src))
+
+
+# ── `rag paraphrases` subgroup (Feature #9 del 2026-04-23) ──────────────
+# Training + inspection for learned paraphrases. Populates the
+# rag_learned_paraphrases table from historical feedback so
+# expand_queries() can skip the LLM call when we have signal.
+
+@cli.group()
+def paraphrases():
+    """Learned paraphrases desde feedback — train, stats, clear.
+
+    `expand_queries()` (el que genera las 2 reformulaciones para multi-
+    query retrieval) usa primero paraphrases aprendidas antes de llamar
+    al LLM. Reduce latencia (~500ms por query con learned) y conserva
+    las phrases que sabemos que funcionaron.
+
+    Fuente de training: rag_feedback rating=1 × rag_queries.variants_json.
+    """
+
+
+def _train_paraphrases_from_feedback(
+    since_days: int = 90, dry_run: bool = False,
+) -> dict:
+    """Scan positive-rated feedback + their query variants, persist pairs.
+
+    Returns stats: {processed, persisted, skipped_no_variants, errors}.
+    Idempotent — INSERT ON CONFLICT increments hit_count.
+    """
+    stats = {
+        "processed": 0, "persisted": 0, "skipped_no_variants": 0, "errors": 0,
+    }
+    try:
+        with _ragvec_state_conn() as conn:
+            # Join rag_feedback (rating=1) with rag_queries via (q, ts
+            # within 1 day) to recover the variants that retrieved the
+            # successful answer.
+            rows = conn.execute(
+                f"SELECT f.q, q.variants_json "
+                f"FROM rag_feedback f "
+                f"LEFT JOIN rag_queries q "
+                f"  ON q.q = f.q "
+                f"  AND ABS(julianday(q.ts) - julianday(f.ts)) < 1 "
+                f"WHERE f.rating = 1 "
+                f"  AND f.ts > datetime('now', '-{int(since_days)} days') "
+                f"  AND q.variants_json IS NOT NULL "
+                f"  AND q.variants_json != '' "
+            ).fetchall()
+    except Exception as exc:
+        stats["errors"] += 1
+        return stats
+    for q, variants_json in rows:
+        stats["processed"] += 1
+        if not variants_json:
+            stats["skipped_no_variants"] += 1
+            continue
+        try:
+            variants = json.loads(variants_json)
+        except Exception:
+            stats["errors"] += 1
+            continue
+        if not isinstance(variants, list):
+            stats["errors"] += 1
+            continue
+        q_norm = _normalize_q(q or "")
+        if not q_norm:
+            continue
+        for v in variants:
+            if not isinstance(v, str):
+                continue
+            v_norm = _normalize_q(v)
+            if not v_norm or v_norm == q_norm:
+                continue
+            if dry_run:
+                stats["persisted"] += 1
+                continue
+            if _record_learned_paraphrase(q, v):
+                stats["persisted"] += 1
+            else:
+                stats["errors"] += 1
+    return stats
+
+
+@paraphrases.command("train")
+@click.option("--since", default=90, show_default=True,
+              help="Ventana de días sobre rag_feedback rating=1.")
+@click.option("--dry-run", is_flag=True,
+              help="No persistir — sólo reportar qué se haría.")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON machine-readable.")
+def paraphrases_train(since: int, dry_run: bool, as_json: bool):
+    """Entrenar paraphrases learned desde rag_feedback histórico.
+
+    Extrae pares (query_original, paraphrase) de feedback positivo y
+    los upsertea en rag_learned_paraphrases. El próximo `expand_queries()`
+    va a usar las learned antes del LLM call para las queries coincidentes.
+    """
+    result = _train_paraphrases_from_feedback(since_days=since, dry_run=dry_run)
+    if as_json:
+        click.echo(json.dumps(result))
+        return
+    console.print()
+    mode = " [yellow](dry-run)[/yellow]" if dry_run else ""
+    console.print(f"[bold]Paraphrase training{mode}[/bold]")
+    console.print(f"  Processed: [cyan]{result['processed']}[/cyan] feedback rows  "
+                  f"| Persisted: [green]{result['persisted']}[/green] pairs")
+    console.print(f"  Skipped (no variants): {result['skipped_no_variants']}  "
+                  f"| Errors: {result['errors']}")
+    console.print()
+
+
+@paraphrases.command("stats")
+@click.option("--limit", default=15, show_default=True,
+              help="Cuántas top rows mostrar.")
+def paraphrases_stats(limit: int):
+    """Ver paraphrases learned con más hits + totales agregados."""
+    try:
+        with _ragvec_state_conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM rag_learned_paraphrases"
+            ).fetchone()[0]
+            trusted = conn.execute(
+                "SELECT COUNT(*) FROM rag_learned_paraphrases WHERE hit_count >= ?",
+                (_LEARNED_PARA_MIN_HITS,),
+            ).fetchone()[0]
+            top = conn.execute(
+                "SELECT q_normalized, paraphrase, hit_count, last_used_ts "
+                "FROM rag_learned_paraphrases "
+                "ORDER BY hit_count DESC, last_used_ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    except Exception as exc:
+        console.print(f"[red]Error: {exc!r}[/red]")
+        return
+    console.print()
+    console.print(f"[bold]Learned paraphrases[/bold]")
+    console.print(f"  Total: [cyan]{total}[/cyan]  "
+                  f"| Trusted (≥{_LEARNED_PARA_MIN_HITS} hits): "
+                  f"[green]{trusted}[/green]")
+    console.print()
+    if top:
+        from rich.table import Table
+        table = Table(show_lines=False, header_style="bold")
+        table.add_column("Hits", style="cyan", width=5)
+        table.add_column("Query")
+        table.add_column("Paraphrase")
+        table.add_column("Last used", style="dim")
+        for q, p, hits, ts in top:
+            table.add_row(str(hits), (q or "")[:40], (p or "")[:40], ts or "")
+        console.print(table)
+    else:
+        console.print("[dim]Sin rows. Correr `rag paraphrases train` primero.[/dim]")
+    console.print()
+
+
+@paraphrases.command("clear")
+@click.option("--yes", is_flag=True, help="No confirmar.")
+def paraphrases_clear(yes: bool):
+    """Borrar todas las paraphrases learned."""
+    if not yes:
+        confirm = click.prompt(
+            "Vas a borrar TODAS las paraphrases learned. ¿Seguro? [y/N]",
+            default="n", show_default=False,
+        )
+        if confirm.strip().lower() not in ("y", "s", "yes", "si"):
+            console.print("[dim]Cancelado.[/dim]")
+            return
+    try:
+        with _ragvec_state_conn() as conn:
+            cur = conn.execute("DELETE FROM rag_learned_paraphrases")
+            n = cur.rowcount or 0
+        console.print(f"[green]✓[/green] Borradas {n} rows.")
+    except Exception as exc:
+        console.print(f"[red]Error: {exc!r}[/red]")
 
 
 # ── `rag health` unified dashboard (Feature #8 del 2026-04-23) ──────────

@@ -67,11 +67,12 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 2 entity tables (rag_entities, rag_entity_mentions, Improvement #2 Fase A) +
     # 1 response cache (rag_response_cache, GC#1 2026-04-22) +
     # 1 audio transcript cache (rag_audio_transcripts, STT MVP 2026-04-22) +
-    # 1 score calibration (rag_score_calibration, Feature #2 2026-04-23) =
-    # 27 tables total.
+    # 1 score calibration (rag_score_calibration, Feature #2 2026-04-23) +
+    # 1 learned paraphrases (rag_learned_paraphrases, Feature #9 2026-04-23) =
+    # 28 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 27
+    assert len(expected) == 28
     c.close()
 
 

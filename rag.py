@@ -40260,6 +40260,255 @@ def train_calibration(
     return result
 
 
+# ── `rag config` command (Feature #7 del 2026-04-23) ────────────────────
+# Lista todas las env vars del sistema con sus valores actuales + defaults
+# + descriptions (para las curadas). Útil para:
+#  - Debug: "cuál es el valor actual de X?" sin tener que hacer
+#    export a ciegas.
+#  - Onboarding: ver todos los knobs que el sistema expone.
+#  - Verificación: comparar entre máquinas / launchd plists / shells.
+#
+# Approach híbrido:
+#  - Dict curado _CONFIG_VARS con 30 vars principales (descripciones,
+#    tipos, rangos sugeridos).
+#  - Scan del código para detectar todas las env vars RAG_*/OBSIDIAN_RAG_*
+#    que NO estén en el curado, y mostrar sólo current value.
+# Output opciones: tabla Rich default, --json machine-readable, --only-set
+# filter, --filter PATTERN substring search.
+
+_CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
+    # (name, default, type, description)
+    # — Core
+    ("OBSIDIAN_RAG_VAULT", "", "path",
+     "Override del vault activo. Gana sobre vaults.json y _DEFAULT_VAULT."),
+    ("RAG_TIMEZONE", "America/Argentina/Buenos_Aires", "tz",
+     "IANA tz usado por _parse_natural_datetime para ISO con tzinfo."),
+    ("RAG_STATE_SQL", "1", "bool",
+     "Post-T10 es no-op (SQL es el único path). Seteado en launchd plists para simetría."),
+
+    # — Ollama / models
+    ("OLLAMA_KEEP_ALIVE", "-1", "duration",
+     "Pinea modelos ollama en VRAM indefinidamente. '20m', '-1' forever, etc."),
+    ("RAG_KEEP_ALIVE_LARGE_MODEL", "", "duration",
+     "Opt-out del auto-clamp de chat_keep_alive() para modelos grandes."),
+    ("RAG_LOCAL_EMBED", "", "bool",
+     "Usa SentenceTransformer(BAAI/bge-m3) in-process para query embed (vs ollama HTTP)."),
+    ("OBSIDIAN_RAG_WEB_CHAT_MODEL", "", "str",
+     "Override del chat model para el web server. Default: resolve_chat_model()."),
+    ("RAG_LOOKUP_MODEL", "qwen2.5:3b", "str",
+     "Modelo usado en el fast-path del adaptive routing."),
+    ("RAG_LOOKUP_NUM_CTX", "4096", "int",
+     "Context window del fast-path LLM. Bumped desde 2048 (2026-04-22 refuse bug)."),
+
+    # — Retrieve / ranking
+    ("RAG_LOOKUP_THRESHOLD", "0.6", "float",
+     "Score mínimo del top-1 para disparar el fast-path de adaptive routing."),
+    ("RAG_ADAPTIVE_ROUTING", "1", "bool",
+     "Activa el pipeline adaptativo — fast-path dispatch + skip reformulate para metadata intents."),
+    ("RAG_EXPLORE", "", "bool",
+     "ε-exploration: 10% chance de swap top-3 con rank 4-7. Generado counterfactuals para tune online."),
+    ("RAG_EXPAND_MIN_TOKENS", "4", "int",
+     "Queries con <N tokens skippean expand_queries() (paraphrase)."),
+
+    # — Feature #2 & friends
+    ("RAG_SCORE_CALIBRATION", "", "bool",
+     "Feature #2: aplicar calibración isotónica per-source a rerank scores."),
+    ("RAG_AUTO_HARVEST_JUDGE_MODEL", "qwen2.5:7b", "str",
+     "Feature #1: modelo LLM-as-judge del auto-harvest nocturno."),
+    ("RAG_AUTO_HARVEST_MIN_CONF", "0.8", "float",
+     "Feature #1: confidence mínima del judge para insertar row."),
+
+    # — Feature #3
+    ("RAG_LLM_INTENT", "", "bool",
+     "Feature #3: fallback LLM post-regex cuando classify_intent devuelve 'semantic'."),
+    ("RAG_LLM_INTENT_MODEL", "qwen2.5:3b", "str",
+     "Feature #3: modelo usado en el fallback."),
+
+    # — Feature #4
+    ("RAG_AGENT_UNPRODUCTIVE_CAP", "3", "int",
+     "Feature #4: cuántos tool calls improductivos consecutivos disparan el nudge en `rag do`."),
+
+    # — Feature #5
+    ("RAG_MMR_DIVERSITY", "", "bool",
+     "Feature #5: activa el pass MMR post-rerank para diversidad en top-k."),
+    ("RAG_MMR_LAMBDA", "0.7", "float",
+     "Feature #5: lambda relevance-vs-diversity. 1.0 = pure relevance (MMR no-op), 0.0 = pure diversity."),
+
+    # — Feature #6
+    ("RAG_PPR_TOPIC", "", "bool",
+     "Feature #6: Personalized PageRank topic-aware con seed = top-K rerank."),
+    ("RAG_PPR_SEED_K", "5", "int",
+     "Feature #6: cuántos top del rerank usar como seeds del PPR."),
+
+    # — WhatsApp fast-path (workaround hasta que Feature #2 reemplace)
+    ("RAG_WA_FAST_PATH", "1", "bool",
+     "Fast-path para WhatsApp queries (branches 1 + 2). Workaround hasta calibración activa."),
+    ("RAG_WA_FAST_PATH_THRESHOLD", "0.05", "float",
+     "Threshold del branch 2 del WA fast-path — detectar queries WA implícitos."),
+    ("RAG_WA_SKIP_PARAPHRASE", "1", "bool",
+     "Skip expand_queries() cuando caller explícita source='whatsapp' (único)."),
+
+    # — Reranker
+    ("RAG_RERANKER_IDLE_TTL", "900", "int",
+     "Segundos que el cross-encoder queda resident antes del idle-unload."),
+    ("RAG_RERANKER_NEVER_UNLOAD", "", "bool",
+     "Pin reranker en MPS VRAM permanentemente. Seteado en web+serve plists."),
+    ("RAG_RERANKER_FT_PATH", "", "path",
+     "Path a un fine-tuned reranker (override del base bge-reranker-v2-m3)."),
+
+    # — Memory
+    ("RAG_MEMORY_PRESSURE_DISABLE", "", "bool",
+     "Desactiva el memory-pressure watchdog (Mac freeze guard)."),
+    ("RAG_MEMORY_PRESSURE_THRESHOLD", "85", "int",
+     "% de memoria usada que dispara el watchdog (default 85)."),
+    ("RAG_MEMORY_PRESSURE_INTERVAL", "60", "int",
+     "Intervalo en segundos de sampling del memory-pressure watchdog."),
+
+    # — Semantic cache (GC#1)
+    ("RAG_CACHE_ENABLED", "1", "bool",
+     "Activar semantic response cache (GC#1) + typo normalization."),
+    ("RAG_CACHE_TTL_DEFAULT", "86400", "int",
+     "TTL default en segundos para entradas del cache (24h)."),
+    ("RAG_CACHE_COSINE", "0.93", "float",
+     "Threshold de cosine similarity para el cache hit."),
+
+    # — Entity extraction (Improvement #2)
+    ("RAG_ENTITY_LOOKUP", "1", "bool",
+     "Activar handle_entity_lookup() para el intent entity_lookup."),
+    ("RAG_EXTRACT_ENTITIES", "1", "bool",
+     "Popular rag_entities + rag_entity_mentions durante indexing."),
+
+    # — OCR
+    ("RAG_OCR", "1", "bool",
+     "OCR en imágenes embebidas durante indexing (Apple Vision, macOS only)."),
+
+    # — Misc
+    ("OBSIDIAN_RAG_NO_APPLE", "", "bool",
+     "Desactiva integraciones Apple (Calendar, Reminders, Mail, Screen Time)."),
+    ("RAG_TRACK_OPENS", "", "bool",
+     "Cambia OSC-8 links de file:// a x-rag-open:// para rutear clicks via `rag open`."),
+    ("RAG_DEBUG", "", "bool",
+     "Emite logs extra de debug al stderr."),
+    ("RAG_LOG_QUERY_ASYNC", "1", "bool",
+     "Escribir rag_queries async (off-thread) para no bloquear retrieve."),
+)
+
+
+def _collect_env_var_names_from_source() -> set[str]:
+    """Scan rag.py for all RAG_*/OBSIDIAN_RAG_*/OLLAMA_* env var references.
+
+    Returns a set of var names. Used to surface env vars in `rag config`
+    output that aren't in the curated _CONFIG_VARS — gives them minimal
+    coverage (name + current value, no description).
+
+    Best-effort: parses via regex, not AST. Any false positives get shown
+    with no description which is fine.
+    """
+    import re as _re
+    try:
+        src = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return set()
+    pattern = _re.compile(
+        r'(?:os\.environ\.get|os\.environ\[)\s*\(?\s*["\']'
+        r'((?:OBSIDIAN_RAG|RAG|OLLAMA)_[A-Z][A-Z0-9_]*)["\']'
+    )
+    return set(pattern.findall(src))
+
+
+@cli.command("config")
+@click.option("--only-set", is_flag=True,
+              help="Mostrar solo vars con un valor actual en el environment.")
+@click.option("--filter", "filter_pattern", default=None,
+              help="Substring para filtrar por nombre (case-insensitive).")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON machine-readable.")
+def config_cli(only_set: bool, filter_pattern: str | None, as_json: bool):
+    """Ver todas las env vars del sistema con sus valores actuales + defaults.
+
+    Útil para debug ('¿qué valor tiene RAG_X ahora mismo?') y onboarding
+    (ver todos los knobs expuestos). Muestra primero las ~40 vars curadas
+    con descripciones, después un bloque de vars no-documentadas
+    detectadas automáticamente del source (name + current value, sin
+    description).
+    """
+    filter_low = (filter_pattern or "").strip().lower()
+    curated_names = {name for name, *_ in _CONFIG_VARS}
+    all_names_in_src = _collect_env_var_names_from_source()
+    uncurated = sorted(all_names_in_src - curated_names)
+
+    entries: list[dict] = []
+    for name, default, type_, desc in _CONFIG_VARS:
+        cur = os.environ.get(name, "")
+        if only_set and not cur:
+            continue
+        if filter_low and filter_low not in name.lower():
+            continue
+        entries.append({
+            "name": name, "default": default, "type": type_,
+            "description": desc, "current": cur,
+            "is_set": bool(cur), "curated": True,
+        })
+
+    for name in uncurated:
+        cur = os.environ.get(name, "")
+        if only_set and not cur:
+            continue
+        if filter_low and filter_low not in name.lower():
+            continue
+        entries.append({
+            "name": name, "default": "", "type": "",
+            "description": "", "current": cur,
+            "is_set": bool(cur), "curated": False,
+        })
+
+    if as_json:
+        click.echo(json.dumps(entries, indent=2))
+        return
+
+    # Rich table rendering — two sections: curated + uncurated.
+    from rich.table import Table
+    console.print()
+    curated_entries = [e for e in entries if e["curated"]]
+    uncurated_entries = [e for e in entries if not e["curated"]]
+
+    if curated_entries:
+        table = Table(
+            title=f"Env vars curadas ({len(curated_entries)})",
+            show_lines=False, header_style="bold",
+            title_justify="left", title_style="bold cyan",
+        )
+        table.add_column("Name", style="cyan", no_wrap=True)
+        table.add_column("Current", style="green")
+        table.add_column("Default", style="dim")
+        table.add_column("Description")
+        for e in curated_entries:
+            cur_disp = e["current"][:40] if e["current"] else "[dim](unset)[/dim]"
+            def_disp = e["default"] if e["default"] else "[dim]—[/dim]"
+            table.add_row(e["name"], cur_disp, def_disp, e["description"][:80])
+        console.print(table)
+
+    if uncurated_entries:
+        console.print()
+        console.print(
+            f"[bold yellow]No-documentadas "
+            f"({len(uncurated_entries)})[/bold yellow]  "
+            "[dim]— detectadas por scan del source, sin descripción curada[/dim]"
+        )
+        for e in uncurated_entries:
+            cur = f"[green]{e['current'][:50]}[/green]" if e["current"] else "[dim](unset)[/dim]"
+            console.print(f"  [cyan]{e['name']:40s}[/cyan]  {cur}")
+
+    console.print()
+    n_set = sum(1 for e in entries if e["is_set"])
+    console.print(
+        f"[bold]Total:[/bold] {len(entries)} vars, "
+        f"[green]{n_set} con valor[/green], "
+        f"[dim]{len(entries) - n_set} unset[/dim]"
+    )
+    console.print()
+
+
 @cli.command("calibrate")
 @click.option("--since", default=90, show_default=True,
               help="Ventana en días de feedback a usar para entrenar.")

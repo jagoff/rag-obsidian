@@ -24159,6 +24159,17 @@ _AGENT_SYSTEM = (
     "Tenés tools para buscar, leer y listar notas del vault, y para PROPONER "
     "creaciones o modificaciones. No ejecutás writes vos — sólo los proponés "
     "vía `propose_write`; el usuario los confirma después.\n\n"
+    "PROCESO DE TRABAJO (Feature #4, 2026-04-23):\n"
+    "En tu primer mensaje, ANTES de llamar tools, escribí un PLAN breve en "
+    "prosa (3-5 oraciones, sin lista numerada larga): qué información necesitás "
+    "buscar, qué orden de tools vas a usar, qué output esperás producir. Esto "
+    "te ayuda a vos mismo a no divagar y al usuario a seguir lo que hacés.\n"
+    "Después de cada tool call, si el resultado NO es lo que esperabas, hacelo "
+    "explícito en 1 oración antes del siguiente tool call ('no encontré X, "
+    "voy a probar Y'). Esto es self-reflection y evita loops inútiles.\n"
+    "Si tres tool calls consecutivos no aportan información útil, pará y "
+    "respondé honestamente que no pudiste completar la tarea. Preferimos un "
+    "'no pude hacer X porque Z' corto a seis iteraciones improductivas.\n\n"
     "Reglas:\n"
     "1. Antes de proponer writes, usá search/read/list para juntar contexto "
     "   del vault real. No inventes paths ni contenidos.\n"
@@ -24212,6 +24223,31 @@ def do(instruction: str, yes: bool, max_iterations: int):
 
     model = resolve_chat_model()
     _keep_alive = chat_keep_alive(model)
+
+    # Track consecutive "unproductive" tool results to detect loops.
+    # A result is unproductive when:
+    #   - Tool returned an error string starting with "Error:"
+    #   - Tool returned "Sin resultados" / "no encontrado" (semantic search)
+    # After 3 consecutive unproductive calls, we inject a synthetic message
+    # telling the LLM to stop looping and answer honestly.
+    _unproductive_streak = 0
+    _UNPRODUCTIVE_CAP = int(os.environ.get("RAG_AGENT_UNPRODUCTIVE_CAP", "3"))
+
+    def _is_unproductive(result_str: str) -> bool:
+        if not isinstance(result_str, str):
+            return False
+        lowered = result_str.strip().lower()
+        if not lowered:
+            return True
+        # Heuristics: tool errors + empty-search signals.
+        if lowered.startswith("error"):
+            return True
+        if lowered.startswith("sin resultados") or lowered.startswith("sin candidatos"):
+            return True
+        if "no encontrado" in lowered[:80] or "not found" in lowered[:80]:
+            return True
+        return False
+
     for it in range(max_iterations):
         with console.status(f"[dim]pensando (iter {it + 1}/{max_iterations})…[/dim]", spinner="dots"):
             resp = _chat_capped_client().chat(
@@ -24229,6 +24265,15 @@ def do(instruction: str, yes: bool, max_iterations: int):
             "content": msg.content or "",
             "tool_calls": [tc.model_dump() for tc in (msg.tool_calls or [])],
         })
+
+        # Show the LLM's "thinking" / plan text between tool batches. This
+        # is especially useful on the first iteration when the new agent
+        # prompt asks for an upfront plan — the user can see the strategy
+        # before any tool fires. Also surfaces self-reflection mid-loop.
+        inline_text = (msg.content or "").strip()
+        if inline_text and msg.tool_calls:
+            console.print()
+            console.print(f"[dim italic]{inline_text[:400]}[/dim italic]")
 
         if not msg.tool_calls:
             # Final answer.
@@ -24263,11 +24308,38 @@ def do(instruction: str, yes: bool, max_iterations: int):
                     result = f"Error de argumentos en {name}: {e}"
                 except Exception as e:
                     result = f"Error ejecutando {name}: {e}"
+            result_str = result if isinstance(result, str) else json.dumps(result)
+            # Unproductive streak tracking (Feature #4).
+            if _is_unproductive(result_str):
+                _unproductive_streak += 1
+            else:
+                _unproductive_streak = 0
             messages.append({
                 "role": "tool",
                 "name": name,
-                "content": result if isinstance(result, str) else json.dumps(result),
+                "content": result_str,
             })
+        # After a full batch of tool calls, if the streak hit the cap inject
+        # a system-ish nudge before the next LLM turn. This breaks the loop
+        # on the LLM side — the user's instruction wasn't achievable with
+        # the available context, and we'd rather a quick honest answer than
+        # burning iterations trying the same thing.
+        if _unproductive_streak >= _UNPRODUCTIVE_CAP:
+            console.print(
+                f"  [yellow]⚠ {_unproductive_streak} tool calls sin progreso "
+                f"— pidiendo cierre.[/yellow]"
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Detectamos {_unproductive_streak} tool calls consecutivos "
+                    "sin información útil. Parece que la instrucción no se puede "
+                    "completar con el contexto del vault. Respondé en una oración "
+                    "qué intentaste y por qué no pudiste completarlo. No sigas "
+                    "llamando tools."
+                ),
+            })
+            _unproductive_streak = 0
     else:
         console.print(f"[yellow]⚠ Cap de {max_iterations} iteraciones alcanzado.[/yellow]")
 

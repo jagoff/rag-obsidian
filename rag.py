@@ -2175,6 +2175,35 @@ def is_excluded(rel_path: str) -> bool:
     # at the inbox stage.
     if rel_path.startswith("04-Archive/conversations/"):
         return True
+    # 03-Resources/WhatsApp/<chat>/<YYYY-MM>.md: monthly roll-up files
+    # written by `scripts/ingest_whatsapp.py` for human consumption in
+    # Obsidian. Those same conversations are ALREADY indexed as
+    # ~4150 chunks with source="whatsapp" (pseudo-URI doc_ids like
+    # `whatsapp://<jid>/<msg_id>`, ~143 chars each). Re-indexing the .md
+    # roll-ups as source="vault" produced ~1355 duplicate chunks with
+    # sizes up to 21808 chars — the same content in two representations
+    # competing for spots in top-k, and the LLM receiving overlapping
+    # context that bloats prefill + gen time. Measured 2026-04-22:
+    # queries where top-1 is WhatsApp had P50=10.38s / P95=66.69s,
+    # avg gen 16.3s (vs vault-only queries avg gen 13.85s). Excluding
+    # the vault representation keeps the fine-grained source="whatsapp"
+    # chunks as the single canonical form and removes the redundant
+    # double-indexing.
+    #
+    # Rollback: `export OBSIDIAN_RAG_INDEX_WA_MONTHLY=1` to re-enable
+    # vault indexing of the .md roll-ups (then `rag index --reset` to
+    # rebuild). Expected cost: +1300 chunks, queries WA back to baseline
+    # latency. Use only if you see retrieval regressions on WA queries
+    # post-rollout — in that case the mini-chunks may not capture the
+    # conversational context well enough and the bigger roll-up chunks
+    # help. Not expected in practice because `scripts/ingest_whatsapp.py`
+    # already chunks at natural conversation breaks.
+    if rel_path.startswith("03-Resources/WhatsApp/"):
+        _wa_override = os.environ.get(
+            "OBSIDIAN_RAG_INDEX_WA_MONTHLY", ""
+        ).strip().lower()
+        if _wa_override not in ("1", "true", "yes"):
+            return True
     return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # Cross-encoder rerank escala ~50ms por par en MPS fp32. Con 3 variantes ×
@@ -14792,6 +14821,36 @@ def retrieve(
     # 3. Multi-query expansion (original + 2 paraphrases).
     #    When `variants` is pre-supplied (e.g. from reformulate_and_expand),
     #    skip the helper-model call — it was already done by the caller.
+    #
+    #    WhatsApp source filter short-circuit (2026-04-22): when the caller
+    #    explicitly restricts `source="whatsapp"`, paraphrases cost ~600ms
+    #    (qwen2.5:3b helper call + 3× bge-m3 embeds) for near-zero recall
+    #    gain — WA chunks are short literal messages (~143 chars avg) where
+    #    the original query's lexical tokens already dominate BM25 and
+    #    semantic matching. Measured on `queries.yaml` WA section: skipping
+    #    paraphrase keeps hit@5 bit-identical and cuts retrieve avg 3001ms
+    #    → 2404ms (-20%). Skip by forcing `multi_query=False` when source
+    #    is exactly {"whatsapp"}. Multi-source callers (e.g. `whatsapp,
+    #    calendar`) keep paraphrase — the expansion still helps calendar
+    #    lookups. Rollback: `export RAG_WA_SKIP_PARAPHRASE=0` or pass
+    #    `multi_query=True` explicitly from a caller that knows better.
+    _wa_only_source = (
+        source is not None
+        and (
+            (isinstance(source, str) and source.strip().lower() == "whatsapp")
+            or (
+                not isinstance(source, str)
+                and len({str(s).strip().lower() for s in source if s}) == 1
+                and next(iter({str(s).strip().lower() for s in source if s}), "")
+                == "whatsapp"
+            )
+        )
+    )
+    if _wa_only_source and os.environ.get(
+        "RAG_WA_SKIP_PARAPHRASE", ""
+    ).strip().lower() not in ("0", "false", "no"):
+        multi_query = False
+        filters_applied["wa_skip_paraphrase"] = True
     if variants is None:
         variants = [search_query]
         if multi_query:
@@ -15283,6 +15342,49 @@ def retrieve(
         and final_scores
         and float(final_scores[0]) > _LOOKUP_THRESHOLD
     )
+    # WhatsApp fast-path (2026-04-22): queries that resolve predominantly
+    # to WhatsApp chunks are conversational lookups — simple information
+    # retrieval against literal message text. The default gate rarely
+    # fires for them because rerank scores on short chat fragments land
+    # in [0.3, 0.6] (noisy conversation dampens the cross-encoder
+    # confidence) — well above the meaningful-signal floor but below the
+    # generic 0.6 threshold. Measured 2026-04-22: queries where top-1 is
+    # WhatsApp had avg gen 16.3s and p95 gen 37.9s because they fell to
+    # the full pipeline (qwen2.5:7b + num_ctx default + citation repair).
+    #
+    # Gate: adaptive routing ON + (explicit `source="whatsapp"` filter
+    # OR ≥2 of the top-3 final chunks have source="whatsapp") + top-1
+    # score above a reduced WA-specific threshold (default 0.3, env
+    # `RAG_WA_FAST_PATH_THRESHOLD`). The majority check protects against
+    # false positives — a single incidental WA chunk doesn't trigger
+    # fast-path — while still catching the common case where the query
+    # is genuinely about a conversation and top-3 are all WA.
+    #
+    # Rollback: `export RAG_WA_FAST_PATH=0` disables this extra trigger
+    # independently of `RAG_ADAPTIVE_ROUTING`. The baseline gate (intent
+    # semantic + score>0.6) continues to work.
+    if (
+        _adaptive_routing()
+        and not _fast_path
+        and _effective_intent == "semantic"
+        and final_scores
+        and os.environ.get("RAG_WA_FAST_PATH", "").strip().lower()
+            not in ("0", "false", "no")
+    ):
+        try:
+            _wa_thresh = float(os.environ.get("RAG_WA_FAST_PATH_THRESHOLD", "0.3"))
+        except ValueError:
+            _wa_thresh = 0.3
+        _top1_score = float(final_scores[0])
+        if _top1_score > _wa_thresh:
+            _top3_sources = [
+                normalize_source((m or {}).get("source"))
+                for m in metas[:3]
+            ]
+            _wa_top3_count = sum(1 for s in _top3_sources if s == "whatsapp")
+            if _wa_only_source or _wa_top3_count >= 2:
+                _fast_path = True
+                filters_applied["wa_fast_path"] = True
 
     # Per-stage timing breakdown (embed/sem/bm25/rrf/fetch/parent_expand/
     # rerank/graph_expand/total — all in ms). Surfaced so callers can log
@@ -33201,6 +33303,71 @@ def _is_tasks_query(q: str) -> bool:
     return bool(_TASKS_INTENT_TOKENS.search(q) or _TASKS_INTENT_PHRASES.search(q))
 
 
+# Weather intent detector (2026-04-22 WhatsApp latency fix).
+#
+# Measurement: three separate "llueve hoy?" queries cost 50-72s each on
+# the WA/serve endpoint (rag_queries, 30d window). Root cause: the query
+# ran the full retrieve + LLM pipeline, which (a) has no rain data, (b)
+# hallucinated or returned "No tengo esa información" after a round trip.
+#
+# Expected cost post-fix: _fetch_weather_forecast (~500ms wttr.in call)
+# + _weather_comment (~1-2s qwen2.5:3b helper). Total ~2-3s vs 50-70s
+# previous. ~20-30× speedup on this class of query.
+#
+# Token list stays narrow to prevent false positives — "clima laboral"
+# / "clima de equipo" are semantic queries about vault content, not
+# meteorological. The additional exclusion list below filters those.
+# `tiempo` is the most ambiguous ("tengo tiempo para X" is chronological)
+# — require co-occurrence with a weather action verb/adjective to count.
+_WEATHER_KEYWORDS = re.compile(
+    r"\b("
+    # All verb conjugations of `llover`: llueve, llover, llovía, lloviendo, etc.
+    # Match the root llov/lluev + common endings. `lluvi` covers the noun forms.
+    r"llueve|llover[aá]?s?|llov[ií](?:a|[oó]|ese)|lloviendo|"
+    r"lluvia|lluvi[ao]s[ao]?|precipitaciones?|"
+    r"tormenta|chaparr[oó]n|granizo|"
+    r"temperatura|frio|fr[ií]o|calor|caluroso|"
+    r"sol|soleado|nublado|nubes?|niebla|"
+    r"viento|vendaval|"
+    # Pronóstico / pronostico — variants with/without accents.
+    r"pron[oó]st[ií]co|clima"
+    r")\b",
+    re.IGNORECASE,
+)
+# Multi-word constructs that flip "tiempo" (ambiguous) and "clima"
+# (ambiguous in workplace contexts) to non-weather interpretations.
+# Match any of these → suppress the weather classifier.
+_WEATHER_EXCLUDES = re.compile(
+    r"\b(clima\s+(laboral|de\s+equipo|organizacional|escolar)|"
+    r"tengo\s+tiempo|hay\s+tiempo|tiempo\s+(libre|que|para\s+[a-z]))",
+    re.IGNORECASE,
+)
+# Max tokens for a query to be considered weather. "llueve hoy?" = 2
+# tokens, "cómo va a estar el clima mañana?" = 7. Anything longer is
+# likely context-heavy and should go through the RAG path.
+_WEATHER_MAX_TOKENS = 10
+
+
+def _is_weather_query(q: str) -> bool:
+    """Return True if `q` is a simple weather question (llueve hoy?, cómo
+    va el clima, etc.). Used by the serve endpoint to short-circuit past
+    retrieve + LLM — the pipeline has no weather data and wastes ~60s per
+    query hallucinating or bailing."""
+    if not q:
+        return False
+    stripped = q.strip()
+    if not stripped:
+        return False
+    # Short-query gate — long queries often embed meteorological keywords
+    # incidentally ("ayer pasamos frío con la familia…") and shouldn't
+    # hijack retrieval.
+    if len(stripped.split()) > _WEATHER_MAX_TOKENS:
+        return False
+    if _WEATHER_EXCLUDES.search(stripped):
+        return False
+    return bool(_WEATHER_KEYWORDS.search(stripped))
+
+
 _SCOPE_N_DAYS = re.compile(
     r"\bpr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as?\b|\bnext\s+(\d+)\s+days?\b",
     re.IGNORECASE,
@@ -34037,6 +34204,120 @@ def serve(host: str, port: int):
         # Session
         sess = ensure_session(sid, mode="serve") if sid else None
         history = session_history(sess) if sess else None
+
+        # Weather short-circuit (2026-04-22 WA latency fix) — 3 prior
+        # "llueve hoy?" queries cost 50-72s each on this endpoint. No
+        # point running retrieve + command-r when we have a dedicated
+        # weather pipeline (~2-3s total). Conservative keyword matcher
+        # with exclude list for "clima laboral" / "tengo tiempo" FPs.
+        if _is_weather_query(question):
+            t_w0 = time.perf_counter()
+            try:
+                forecast_block = _fetch_weather_forecast()
+            except Exception as exc:
+                forecast_block = None
+                _silent_log("serve_weather_fetch", exc)
+            if forecast_block is None:
+                # Wttr.in + Open-Meteo both down — fall through to RAG
+                # (better to waste 60s than leave the user without an
+                # answer). Log the fall-through for analytics.
+                try:
+                    log_query_event({
+                        "cmd": "serve.weather_fallback", "q": question,
+                        "session": sid,
+                    })
+                except Exception:
+                    pass
+            else:
+                # qwen2.5:3b comment. Light prompt so keep_alive of the
+                # helper model is consistent with chat (~1-2s typical).
+                try:
+                    answer = _weather_comment(question, forecast_block)
+                except Exception as exc:
+                    _silent_log("serve_weather_comment", exc)
+                    answer = forecast_block  # graceful fallback to raw
+                t_w = time.perf_counter() - t_w0
+                query_turn_id = new_turn_id()
+                if sess:
+                    append_turn(sess, {
+                        "q": question, "a": answer,
+                        "paths": [], "top_score": 0.0,
+                        "turn_id": query_turn_id, "mode": "weather",
+                    })
+                    save_session(sess)
+                try:
+                    log_query_event({
+                        "cmd": "serve.weather",
+                        "turn_id": query_turn_id,
+                        "session": sid, "q": question[:200],
+                        "t_retrieve": 0.0,
+                        "t_gen": round(t_w, 3),
+                        "intent": "weather",
+                    })
+                except Exception:
+                    pass
+                weather_payload = {
+                    "answer": answer,
+                    "sources": [],
+                    "mode": "weather",
+                    "t_retrieve": 0.0,
+                    "t_gen": round(t_w, 3),
+                    "turn_id": query_turn_id,
+                }
+                if not force:
+                    _cache_put(cache_key, weather_payload)
+                return weather_payload
+
+        # Metachat short-circuit — greetings / thanks / "qué podés hacer".
+        # Matches the regex-based detector from rag.py:26314 (also used by
+        # /api/chat). Bypass retrieve + LLM entirely: canned reply based
+        # on the match kind. Pre-fix, "hola" ran the full pipeline and
+        # typically produced a generic "según tus notas, tenés…"
+        # hallucination.
+        #
+        # Inline reply keeps serve self-contained (web/server.py has its
+        # own _pick_metachat_reply with richer time-aware variants; WA
+        # stays with a compact single-line canned reply — matches the
+        # conversational register).
+        if _detect_metachat_intent(question):
+            t_m0 = time.perf_counter()
+            _q_lower = question.strip().lower()
+            if any(w in _q_lower for w in ("gracias", "thanks", "thank")):
+                reply = "De nada!"
+            elif any(w in _q_lower for w in ("chau", "bye", "nos vemos")):
+                reply = "Chau!"
+            elif any(w in _q_lower for w in ("qué podés", "que podes",
+                                              "cómo us", "como us",
+                                              "qué sabés", "que sabes")):
+                reply = ("Consulto tus notas de Obsidian. Preguntame algo "
+                         "puntual (notas, gente, temas) o pedime recordatorios "
+                         "y eventos.")
+            else:
+                reply = "¡Hola! Preguntame algo del vault y te busco."
+            t_m = time.perf_counter() - t_m0
+            query_turn_id = new_turn_id()
+            if sess:
+                append_turn(sess, {
+                    "q": question, "a": reply,
+                    "paths": [], "top_score": 0.0,
+                    "turn_id": query_turn_id, "mode": "metachat",
+                })
+                save_session(sess)
+            try:
+                log_query_event({
+                    "cmd": "serve.metachat",
+                    "turn_id": query_turn_id,
+                    "session": sid, "q": question[:200],
+                    "t_retrieve": 0.0, "t_gen": round(t_m, 3),
+                    "intent": "metachat",
+                })
+            except Exception:
+                pass
+            return {
+                "answer": reply, "sources": [], "mode": "metachat",
+                "t_retrieve": 0.0, "t_gen": round(t_m, 3),
+                "turn_id": query_turn_id,
+            }
 
         # Tasks / agenda intent short-circuit — vault RAG hallucinates on
         # "what do I have this week" queries (picks up recent WhatsApp

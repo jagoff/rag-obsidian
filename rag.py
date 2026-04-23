@@ -11262,12 +11262,58 @@ _RECENCY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Temporal lookup cues (Feature #10 del 2026-04-23) ───────────────────
+# Patterns más específicos que recency: el usuario está preguntando por
+# un evento/mención pasado concreto ("la última vez que hablé de X",
+# "hace unos días escribí sobre Y", "cuándo fue la última vez que").
+# Disparan un BOOST MULTIPLICATIVO sobre el recency_cue weight — el
+# rerank normal elige la nota correcta por semantic, pero en empates
+# el cue temporal prefiere la más reciente.
+#
+# Diferencia con `has_recency_cue`:
+#  - has_recency_cue captures "recientes", "este mes" — el user quiere
+#    MUCHAS notas ordenadas por fecha (list-like intent).
+#  - has_temporal_lookup_cue captures "última vez", "hace días/semanas",
+#    "cuándo fue" — el user busca UN evento puntual ordenado por fecha.
+# La distinción importa porque el primero lleva a 'recent' intent
+# (handle_recent, vault-only sorted by modified); el segundo queda en
+# semantic pero con el boost del recency_cue weight amplificado.
+
+_TEMPORAL_LOOKUP_RE = re.compile(
+    r"\b("
+    r"[uú]ltima\s+vez\s+que|"                        # "la última vez que"
+    r"cu[aá]ndo\s+fue\s+la\s+[uú]ltima|"              # "cuándo fue la última"
+    r"cu[aá]ndo\s+(?:hab(?:l[eé]|lamos)|escrib[iíi]|"
+    r"mencion[eé]|dije|dijo|pens[eé]|dijimos)|"      # "cuándo hablé/escribí/etc."
+    r"hace\s+(?:unos|un|dos|tres|cuatro|pocos?)\s+"
+    r"(?:d[ií]as?|semanas?|mes(?:es)?|a[nñ]os?)|"    # "hace unos días/semanas/meses"
+    r"hace\s+(?:poco|tiempo|mucho)|"                 # "hace poco"
+    r"recuerdo\s+(?:que\s+)?(?:hab(?:l[eé]|lamos)|"
+    r"dije|escrib[iíí]|mencion[eé])|"                # "recuerdo que hablé de"
+    r"en\s+alg[uú]n\s+momento|"                      # "en algún momento hablé"
+    r"la\s+otra\s+vez"                               # "la otra vez"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def has_recency_cue(question: str) -> bool:
     """True when the query asks for time-sorted results — triggers a recency
     boost in the reranker composite score.
     """
     return bool(_RECENCY_RE.search(question))
+
+
+def has_temporal_lookup_cue(question: str) -> bool:
+    """True when the user is asking about a SPECIFIC past event in time —
+    'última vez que', 'hace unos días', 'cuándo hablé de X', etc.
+
+    Triggers a multiplicative boost to weights.recency_cue inside retrieve()
+    so that semantically-tied candidates resolve by recency. Orthogonal to
+    `has_recency_cue`: a query can match both (and gets extra boost) or
+    only one (different retrieval behaviour).
+    """
+    return bool(_TEMPORAL_LOOKUP_RE.search(question))
 
 
 def recency_boost(meta: dict, half_life_days: float = 90.0) -> float:
@@ -15922,7 +15968,18 @@ def retrieve(
     # term `recency_always` applies the same decay without a cue gate — lets
     # the tuner learn "recent notes should always get a small push" without
     # overriding evergreen queries.
+    #
+    # Feature #10 (2026-04-23): when the query has a temporal-lookup cue
+    # ("la última vez que", "hace unos días", "cuándo hablé"), multiply
+    # the recency_cue weight by _TEMPORAL_LOOKUP_BOOST so ties break
+    # toward the most recent note. Orthogonal to `apply_recency`: both
+    # can fire simultaneously (boost cumulative).
     apply_recency = has_recency_cue(question)
+    _temporal_lookup = has_temporal_lookup_cue(question)
+    _temporal_boost = float(os.environ.get("RAG_TEMPORAL_LOOKUP_BOOST", "3.0"))
+    if _temporal_lookup:
+        # Treat it as a recency cue AND amplify the weight.
+        apply_recency = True
     # Tag literal boost: tags in the question that match vault vocab. Not
     # applied as a hard filter (infer_filters already does that when the
     # user types `#tag`) — here it's a soft ranking signal that survives
@@ -16009,7 +16066,12 @@ def retrieve(
         final = float(s)
         rec_raw = recency_boost(meta) if (apply_recency or weights.recency_always) else 0.0
         if apply_recency:
-            final += weights.recency_cue * rec_raw
+            # Feature #10: when the query has a temporal-lookup cue,
+            # multiply the recency contribution so fresh notes win ties.
+            _cue_weight = weights.recency_cue
+            if _temporal_lookup:
+                _cue_weight = _cue_weight * _temporal_boost
+            final += _cue_weight * rec_raw
         if weights.recency_always:
             final += weights.recency_always * rec_raw
         if query_tag_hits and weights.tag_literal:

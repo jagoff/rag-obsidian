@@ -1948,6 +1948,114 @@ def _conv_dedup_window(
     return out
 
 
+# ── MMR diversity re-ranking (Feature #5 del 2026-04-23) ─────────────────
+# Post cross-encoder re-rank, re-order the candidate pool balancing
+# relevance (rerank score) vs diversity (token overlap w/ already-selected
+# docs). Reduces redundancy in top-k: if three chunks say the same thing
+# in slightly different words, MMR promotes a chunk from a different angle.
+#
+# Algorithm (Carbonell & Goldstein 1998 adapted to our tuple shape):
+#   Let D = candidate pool sorted by relevance.
+#   Pick S = {top-1}.
+#   While |S| < k and D \ S non-empty:
+#       for each d in D \ S:
+#           mmr(d) = λ · rel(d) - (1-λ) · max_{d' ∈ S} sim(d, d')
+#       pick arg-max → append to S.
+#
+# sim() here is Jaccard over word tokens of the first ~600 chars of each
+# doc. Cheap + dependency-free (no extra embeddings needed); captures
+# near-duplicates at the word level without fancy semantic similarity.
+# λ default 0.7 (bias toward relevance). 1.0 = pure relevance (MMR no-op);
+# 0.0 = pure diversity (ignores rerank scores).
+#
+# Gate:
+#   RAG_MMR_DIVERSITY=1 to enable (default OFF — conservative rollout).
+#   Operates on the pool of up to `pool_size` candidates. Remaining pool
+#   order preserved (not reordered), so the extras_pairs slice stays
+#   reranker-ordered.
+
+_MMR_DIVERSITY_ENABLED = os.environ.get(
+    "RAG_MMR_DIVERSITY", ""
+).strip().lower() in ("1", "true", "yes")
+
+_MMR_SNIPPET_CHARS = 600  # chars of each doc to tokenize for Jaccard
+_MMR_TOKEN_RE = re.compile(r"[a-záéíóúñü0-9]+", re.IGNORECASE)
+
+
+def _mmr_tokens(text: str) -> frozenset[str]:
+    """Tokens used for Jaccard similarity — first ~600 chars, word chars
+    only, lowercased. Returns frozenset (hashable, set-op friendly)."""
+    if not text:
+        return frozenset()
+    sample = text[:_MMR_SNIPPET_CHARS].lower()
+    return frozenset(_MMR_TOKEN_RE.findall(sample))
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard similarity — |a ∩ b| / |a ∪ b|. Empty inputs → 0.0."""
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def _apply_mmr_reorder(
+    scored_pairs: list[tuple],
+    *,
+    lambda_: float = 0.7,
+    pool_size: int | None = None,
+) -> list[tuple]:
+    """Re-order the first `pool_size` items of `scored_pairs` using MMR.
+
+    Input: list of (candidate, expanded_text, score) sorted by score desc.
+    Output: same length; first `pool_size` entries reordered to balance
+    relevance with diversity; remainder preserved unchanged.
+
+    O(pool_size²) — fine because pool_size is typically 15-30. The first
+    item is always kept (highest relevance), subsequent items selected
+    greedily by max MMR score.
+    """
+    if not scored_pairs:
+        return scored_pairs
+    lambda_ = max(0.0, min(1.0, lambda_))
+    if pool_size is None or pool_size >= len(scored_pairs):
+        pool = scored_pairs[:]
+        tail: list[tuple] = []
+    else:
+        pool = scored_pairs[:pool_size]
+        tail = scored_pairs[pool_size:]
+    if len(pool) <= 1:
+        return scored_pairs
+    # Precompute token sets for the pool.
+    tokens: list[frozenset[str]] = []
+    for _, expanded, _ in pool:
+        tokens.append(_mmr_tokens(expanded if isinstance(expanded, str) else ""))
+    selected_idx: list[int] = [0]  # always keep the highest-relevance first
+    remaining = list(range(1, len(pool)))
+    while remaining:
+        best_idx = None
+        best_mmr = -1e18
+        for i in remaining:
+            rel = float(pool[i][2])
+            max_sim = 0.0
+            for j in selected_idx:
+                sim = _jaccard(tokens[i], tokens[j])
+                if sim > max_sim:
+                    max_sim = sim
+            mmr = lambda_ * rel - (1.0 - lambda_) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+        if best_idx is None:
+            break
+        selected_idx.append(best_idx)
+        remaining.remove(best_idx)
+    reordered = [pool[i] for i in selected_idx]
+    return reordered + tail
+
 
 # Separate collection for URL-context embeddings — the URL-finder pipeline
 # scores against the prose around each link, not the link string itself.
@@ -15773,6 +15881,31 @@ def retrieve(
     # against production yet (Phase 1.f).
     if scored_all:
         scored_all = _conv_dedup_window(scored_all, window_s=1800.0)
+    # MMR diversity pass (Feature #5, 2026-04-23). Post-rerank, re-order
+    # the candidate pool balancing relevance (cross-encoder score) vs
+    # diversity (Jaccard token overlap with already-selected docs). When
+    # the top-k has 3 chunks of the same note OR chunks that echo the
+    # same content from different files, MMR promotes the less-redundant
+    # alternatives at similar rerank score.
+    #
+    # Gate:
+    # 1. Flag RAG_MMR_DIVERSITY must be truthy (default OFF — conservative).
+    # 2. Pool size must exceed k (nothing to reorder if <=k).
+    # 3. Intent must be 'semantic' / 'synthesis' — for 'count' / 'list' /
+    #    'recent' / 'agenda' / 'entity_lookup' the user wants the literal
+    #    top by score, not diversity-balanced.
+    #
+    # No-op on empty pools. Weighted by lambda (RAG_MMR_LAMBDA, default 0.7):
+    # higher → more relevance-driven; lower → more diversity.
+    if scored_all and _MMR_DIVERSITY_ENABLED:
+        _mmr_lambda = float(os.environ.get("RAG_MMR_LAMBDA", "0.7"))
+        # Only reorder inside the top (k * mmr_pool_multiplier) to keep
+        # cost bounded. Default 3× k, e.g. reorder the top-15 of a k=5.
+        _mmr_pool_mult = float(os.environ.get("RAG_MMR_POOL_MULTIPLIER", "3.0"))
+        scored_all = _apply_mmr_reorder(
+            scored_all, lambda_=_mmr_lambda,
+            pool_size=max(int(k * _mmr_pool_mult), k + 5),
+        )
     scored = scored_all[:k]
     # `extras`: candidates beyond top-k, still reranker-ordered. Used by
     # `build_progressive_context` to avoid a redundant semantic col.query —

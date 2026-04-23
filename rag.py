@@ -9957,8 +9957,11 @@ def get_reranker():
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
     auto-detect falls back to CPU in some venvs, costing ~3× on rerank.
 
-    NOTE: fp16 on MPS breaks bge-reranker-v2-m3 (collapses all scores to
-    ~0.001, verified empirically on 2026-04-13). Keep fp32.
+    NOTE (2026-04-13): fp16 on MPS reportedly broke bge-reranker-v2-m3
+    (collapsed all scores to ~0.001). `RAG_RERANKER_FP16=1` opt-ins into
+    a post-load `.half()` conversion so we can A/B re-verify whether that
+    regression still reproduces on current torch/sentence-transformers —
+    default stays fp32 until we have clean eval numbers.
 
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
     Also records last-use timestamp so `maybe_unload_reranker()` can evict
@@ -9987,6 +9990,16 @@ def get_reranker():
             device = "cpu"
         model_path = _resolve_reranker_model_path()
         _reranker = CrossEncoder(model_path, max_length=512, device=device)
+        # Optional fp16 conversion on MPS. Behind `RAG_RERANKER_FP16`
+        # (default OFF) while we A/B the latency-vs-quality trade-off.
+        # Post-load `.half()` is safer than passing torch_dtype into the
+        # CrossEncoder constructor (no risk of mismatched projection-head
+        # dtypes if the model_kwargs path changes shape in future ST).
+        if os.environ.get("RAG_RERANKER_FP16", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                _reranker.model = _reranker.model.half()
+            except Exception as exc:
+                _silent_log("reranker_fp16_convert_failed", exc)
     return _reranker
 
 
@@ -34551,12 +34564,35 @@ def serve(host: str, port: int):
             messages = [{"role": "user",
                          "content": f"{rules_full}\nCONTEXTO:\n{context}\n\nPREGUNTA: {question}\n\nRESPUESTA:"}]
 
+        # Adaptive fast-path consumption (2026-04-22 WA latency fix).
+        # `retrieve()` already sets result["fast_path"] when the
+        # baseline gate (semantic intent + score>0.6) or the
+        # WA-specific gate (score>0.3 + majority-WA top-3) fires
+        # — per the _fast_path block in retrieve() at rag.py:~15339.
+        # Previously the serve endpoint ignored the marker and always
+        # used resolve_chat_model() + num_ctx=4096. Measured in
+        # rag_queries (CLI, 7d): fast_path=1 avg t_gen=3.1s vs
+        # fast_path=0 avg 8.5s — 2.75× speedup pure compute win
+        # by switching to `_LOOKUP_MODEL` (qwen2.5:3b) + smaller
+        # num_ctx. Same pattern as `rag chat` (rag.py:~20310) and
+        # `rag query` (rag.py:~18963).
+        _serve_fast_path = bool(result.get("fast_path", False))
+        _serve_gen_model = (
+            _LOOKUP_MODEL if _serve_fast_path else resolve_chat_model()
+        )
+        _serve_gen_options = (
+            {**CHAT_OPTIONS, "num_ctx": _LOOKUP_NUM_CTX,
+             "num_predict": predict_cap}
+            if _serve_fast_path
+            else {**CHAT_OPTIONS, "num_predict": predict_cap}
+        )
+
         t_gen0 = time.perf_counter()
         parts: list[str] = []
         for chunk in ollama.chat(
-            model=resolve_chat_model(), messages=messages,
-            options={**CHAT_OPTIONS, "num_predict": predict_cap},
-            stream=True, keep_alive=chat_keep_alive(),
+            model=_serve_gen_model, messages=messages,
+            options=_serve_gen_options,
+            stream=True, keep_alive=chat_keep_alive(_serve_gen_model),
         ):
             parts.append(chunk.message.content)
         t_gen = time.perf_counter() - t_gen0
@@ -34577,6 +34613,8 @@ def serve(host: str, port: int):
         log_query_event({
             "cmd": "serve", "q": question,
             "filters": result.get("filters_applied"),
+            "fast_path": _serve_fast_path,
+            "gen_model": _serve_gen_model,
             "variants": result.get("query_variants"),
             "paths": [m.get("file", "") for m in result["metas"]],
             "scores": [round(float(s), 2) for s in result["scores"]],

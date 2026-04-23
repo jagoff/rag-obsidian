@@ -205,6 +205,37 @@ Históricamente activaba el SQL store para telemetría. **No-op desde 2026-04-20
 
 ---
 
+## Semantic response cache (GC#1, post-2026-04-23)
+
+El cache guarda respuestas completas indexadas por embedding de la query + `corpus_hash`. Queries repetidas (o near-paraphrases) sobre un vault sin cambios recientes devuelven en <100ms en vez de 5-20s. Las siguientes vars tunean su comportamiento — por default está prendido con umbrales conservadores.
+
+### `RAG_CACHE_ENABLED=1`
+Master switch. `0`/`false`/`no` desactiva lookup + store. Por default prendido.
+
+```bash
+export RAG_CACHE_ENABLED=0    # apagar el cache entero
+```
+
+### `RAG_CACHE_COSINE`
+Umbral de cosine similarity sobre embeddings bge-m3 para considerar un hit. Default **0.93** — paraphrases del mismo concepto ("qué es ikigai" vs "qué es el ikigai") caen en 0.93-0.96. Más estricto (0.97) = menos hits pero menos riesgo de servir una respuesta de un concepto distinto; más permisivo (0.85) = más hits pero potencial falsos positivos.
+
+```bash
+export RAG_CACHE_COSINE=0.95   # más conservador
+```
+
+### `RAG_CACHE_TTL_DEFAULT` / `RAG_CACHE_TTL_RECENT`
+TTL en segundos. `DEFAULT` (86400 = 24h) aplica a intents `semantic`/`synthesis`/`count`/`list`/`comparison`; `RECENT` (600 = 10 min) aplica a intents `recent`/`agenda` (queries tipo "qué pasó esta semana" expiran rápido porque el corpus cambia).
+
+```bash
+export RAG_CACHE_TTL_DEFAULT=3600    # 1h para queries "estables"
+export RAG_CACHE_TTL_RECENT=120      # 2 min para queries temporales
+```
+
+### `RAG_CACHE_MAX_ROWS`
+Máximo de filas a escanear por lookup. Default 2000 (lineal — cheap hasta unas miles de filas). El cleanup manual es via `rag cache clear`.
+
+---
+
 ## Paths / folders
 
 ### `OBSIDIAN_RAG_MOZE_FOLDER`

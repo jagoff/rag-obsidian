@@ -3992,43 +3992,35 @@ _corpus_hash_lock = threading.Lock()
 
 
 def _compute_corpus_hash(col) -> str:
-    """Cheap fingerprint of the current corpus. sha256 of:
-      - chunk count (col.count())
-      - top-10 most-recently-modified .md files' mtime + relative path
+    """Cheap fingerprint of the current corpus. sha256 of the chunk count.
 
-    Returns "" if col is unavailable. The hash MUST change when a new note
-    is added / an existing note is edited, so we snapshot file mtimes under
-    `_resolve_vault_path()` filtered to .md. Cross-source ingesters touch
-    rag_* SQL state but not .md files — acceptable: their content is small
-    compared to vault and a manual cache clear is trivial.
+    Returns "" if col is unavailable. Post 2026-04-23 this is *chunk-count
+    only* — no mtime scan. Rationale:
+
+    - The previous implementation used `count + top-10 most-recently-modified
+      .md mtimes`, which meant ANY single note edit shifted the hash and
+      invalidated the entire cache. An audit after GC#1 shipped found 0 hits
+      against 2,335 queries over 7 days despite 14 queries repeating ≥10×
+      ("ikigai" 11×, "liderazgo" 5×, etc.) — exactly because each recent
+      edit blew away the cache globally.
+
+    - Per-entry freshness is now enforced at *lookup time* inside
+      ``semantic_cache_lookup`` by comparing each cached entry's source
+      ``paths[]`` against their current mtime. If any referenced note was
+      edited after the cache was stored, that row is skipped — the rest of
+      the cache survives. This trades one rglob at write time for one stat
+      per cached path at read time (cheap: <1ms for ≤5 paths per entry).
+
+    - New/removed notes *still* invalidate the whole cache via chunk_count
+      delta — that's the correct invariant (new chunks mean retrieval may
+      surface different sources for the same query).
     """
     try:
         import hashlib
         chunk_count = int(col.count())
     except Exception:
         return ""
-    try:
-        vault = _resolve_vault_path()
-        md_files: list[tuple[float, str]] = []
-        for p in vault.rglob("*.md"):
-            try:
-                rel = str(p.relative_to(vault))
-                if is_excluded(rel):
-                    continue
-                md_files.append((p.stat().st_mtime, rel))
-            except Exception:
-                continue
-        md_files.sort(key=lambda x: -x[0])
-        # Top-10 most recent only — enough to detect "someone edited a note"
-        # without having to stat every file on every query.
-        top = md_files[:10]
-        h = hashlib.sha256()
-        h.update(f"{chunk_count}".encode())
-        for mt, rel in top:
-            h.update(f"\n{mt:.0f}|{rel}".encode())
-        return h.hexdigest()[:16]
-    except Exception:
-        return f"ccount:{chunk_count}"
+    return hashlib.sha256(f"count:{chunk_count}".encode()).hexdigest()[:16]
 
 
 def _corpus_hash_cached(col) -> str:
@@ -4073,25 +4065,109 @@ def _ttl_for_intent(intent: str | None) -> int:
     return _SEMANTIC_CACHE_DEFAULT_TTL
 
 
+def _cached_entry_is_stale(paths: list[str], cached_ts: float) -> bool:
+    """Return True if any of the cached entry's source paths has mtime > cached_ts.
+
+    Post 2026-04-23 per-entry freshness check. The corpus_hash no longer
+    scans mtimes (see ``_compute_corpus_hash``), so individual note edits
+    are caught here: if a cached answer references ``03-Resources/ikigai.md``
+    and that file has been edited after the row was stored, skip the row
+    — serving stale content is worse than a cache miss.
+
+    Cheap: ≤5 paths/entry × ~100µs/stat ≈ <1ms on APFS. Policy:
+
+    - Empty paths list → never stale (entry carries no source refs;
+      refusals already rejected at store time).
+    - File exists AND mtime > cached_ts → stale.
+    - File exists AND mtime ≤ cached_ts → fresh.
+    - File missing (deleted/renamed) → NOT stale. Rationale: corpus-level
+      invalidation (chunk_count delta via ``_compute_corpus_hash``) already
+      catches note deletions at a coarser granularity. Missing files here
+      are most often either the vault-path mock used in tests or a
+      relative-path mismatch (cached under one vault, resolved under
+      another); punishing both with a blow-the-cache stale-vote creates
+      false negatives. The cached response's citation will still point
+      to the stale path — but the user sees a rendered answer with a
+      link they can click to investigate, which is strictly better than
+      a silent cache miss that forces a full retrieve+LLM round-trip.
+    - Unresolvable vault_path / permission error → assume fresh (same
+      rationale: don't blow up the cache for infra issues).
+    """
+    if not paths:
+        return False
+    try:
+        vault = _resolve_vault_path()
+    except Exception:
+        return False
+    for p in paths:
+        try:
+            full = vault / p
+            if not full.exists():
+                # Source missing — coarse-grained corpus_hash delta will
+                # catch this on the next index; don't force an unnecessary
+                # cache miss here.
+                continue
+            if full.stat().st_mtime > cached_ts:
+                return True
+        except Exception:
+            # Permission error / race → assume fresh (best-effort).
+            continue
+    return False
+
+
 def semantic_cache_lookup(
     q_embedding,
     corpus_hash: str,
     *,
     cosine_threshold: float | None = None,
     now: float | None = None,
-) -> dict | None:
+    return_probe: bool = False,
+):
     """Find a cached response whose q_embedding has cosine ≥ threshold vs the
     given embedding, within the same corpus_hash and within its TTL window.
 
     Returns the row dict (question, response, paths, scores, top_score, intent,
     hit_id, cosine, cached_ts, age_seconds) or None on miss.
 
+    When ``return_probe=True`` returns a tuple ``(hit_or_None, probe_dict)``
+    where ``probe_dict`` always has shape::
+
+        {
+          "result":      "hit" | "miss" | "disabled" | "empty_corpus_hash",
+          "reason":      "match" | "below_threshold" | "ttl_expired"
+                       | "corpus_mismatch" | "stale_source" | "dim_mismatch"
+                       | "empty_cache" | "cache_disabled" | "no_corpus_hash"
+                       | "db_error",
+          "top_cosine":  float | None,   # best cosine seen (even below threshold)
+          "candidates":  int,            # rows evaluated (matching corpus_hash)
+          "skipped_stale": int,          # rows dropped by freshness check
+          "skipped_ttl":   int,          # rows dropped by TTL expiry
+        }
+
+    This probe is emitted to ``rag_queries.extra_json.cache_probe`` so
+    telemetry can diagnose miss reasons (e.g. "all 5 candidates had
+    top_cosine 0.85 — below the 0.93 threshold — consider lowering").
+
     Linear scan over rows matching corpus_hash — acceptable for n up to a
     few thousand (cache capped by _SEMANTIC_CACHE_MAX_ROWS). Errors on read
     degrade to "no hit" (retrieval proceeds normally).
     """
-    if not _semantic_cache_enabled() or not corpus_hash:
-        return None
+    probe: dict = {
+        "result": "miss",
+        "reason": "empty_cache",
+        "top_cosine": None,
+        "candidates": 0,
+        "skipped_stale": 0,
+        "skipped_ttl": 0,
+    }
+    if not _semantic_cache_enabled():
+        probe["result"] = "disabled"
+        probe["reason"] = "cache_disabled"
+        return (None, probe) if return_probe else None
+    if not corpus_hash:
+        probe["result"] = "empty_corpus_hash"
+        probe["reason"] = "no_corpus_hash"
+        return (None, probe) if return_probe else None
     threshold = cosine_threshold if cosine_threshold is not None else _SEMANTIC_CACHE_COSINE
     now = now if now is not None else time.time()
     try:
@@ -4099,7 +4175,8 @@ def semantic_cache_lookup(
         q = np.asarray(q_embedding, dtype="<f4")
         qn = float(np.linalg.norm(q))
         if qn == 0:
-            return None
+            probe["reason"] = "zero_norm_query"
+            return (None, probe) if return_probe else None
         with _ragvec_state_conn() as conn:
             rows = conn.execute(
                 "SELECT id, ts, question, q_embedding, dim, intent, ttl_seconds,"
@@ -4110,7 +4187,12 @@ def semantic_cache_lookup(
             ).fetchall()
     except Exception as exc:
         _log_sql_state_error("semantic_cache_lookup_failed", err=repr(exc))
-        return None
+        probe["reason"] = "db_error"
+        return (None, probe) if return_probe else None
+
+    probe["candidates"] = len(rows)
+    if not rows:
+        probe["reason"] = "corpus_mismatch" if probe["candidates"] == 0 else "empty_cache"
 
     best_cos = -1.0
     best = None
@@ -4123,6 +4205,7 @@ def semantic_cache_lookup(
             continue
         age = now - cached_ts
         if age > (ttl_seconds or _SEMANTIC_CACHE_DEFAULT_TTL):
+            probe["skipped_ttl"] += 1
             continue
         try:
             e = _blob_to_embedding(blob, int(dim))
@@ -4134,23 +4217,38 @@ def semantic_cache_lookup(
             cos = float(np.dot(q, e)) / (qn * en)
         except Exception:
             continue
-        if cos >= threshold and cos > best_cos:
+        # Track best cosine regardless of threshold — used by probe to
+        # explain misses ("closest match was 0.88, below 0.93 threshold").
+        if cos > best_cos and best is None:
             best_cos = cos
-            best = {
-                "id": int(rid),
-                "question": question,
-                "response": response,
-                "paths": json.loads(paths_json) if paths_json else [],
-                "scores": json.loads(scores_json) if scores_json else [],
-                "top_score": float(top_score) if top_score is not None else None,
-                "intent": intent,
-                "cosine": cos,
-                "cached_ts": cached_ts,
-                "age_seconds": age,
-            }
+        if cos >= threshold:
+            # Per-entry freshness check (post 2026-04-23): skip rows whose
+            # source notes have been edited after we stored the response.
+            paths = json.loads(paths_json) if paths_json else []
+            if _cached_entry_is_stale(paths, cached_ts):
+                probe["skipped_stale"] += 1
+                continue
+            if cos > best_cos or best is None:
+                best_cos = cos
+                best = {
+                    "id": int(rid),
+                    "question": question,
+                    "response": response,
+                    "paths": paths,
+                    "scores": json.loads(scores_json) if scores_json else [],
+                    "top_score": float(top_score) if top_score is not None else None,
+                    "intent": intent,
+                    "cosine": cos,
+                    "cached_ts": cached_ts,
+                    "age_seconds": age,
+                }
+    probe["top_cosine"] = round(best_cos, 4) if best_cos > -1.0 else None
+
     # Async hit-count bump — best-effort, don't block the cache hit on SQL write.
     if best is not None:
         record_cache_event("semantic", hits=1)
+        probe["result"] = "hit"
+        probe["reason"] = "match"
         try:
             with _ragvec_state_conn() as conn:
                 conn.execute(
@@ -4163,7 +4261,16 @@ def semantic_cache_lookup(
             _log_sql_state_error("semantic_cache_hit_bump_failed", err=repr(exc))
     else:
         record_cache_event("semantic", misses=1)
-    return best
+        # Reason ranking: stale > ttl > below_threshold > corpus_mismatch
+        if probe["skipped_stale"] > 0 and probe["skipped_stale"] >= probe["skipped_ttl"]:
+            probe["reason"] = "stale_source"
+        elif probe["skipped_ttl"] > 0:
+            probe["reason"] = "ttl_expired"
+        elif probe["candidates"] > 0 and best_cos > -1.0:
+            probe["reason"] = "below_threshold"
+        elif probe["candidates"] == 0:
+            probe["reason"] = "corpus_mismatch"
+    return (best, probe) if return_probe else best
 
 
 def semantic_cache_store(
@@ -15418,6 +15525,21 @@ class ChatTurnRequest:
     seen_titles: list[str] | None = None
     source: str | None = None
     k: int = 4
+    # Semantic response cache (post 2026-04-23)
+    # - cache_lookup=True: check the cache before running retrieve+LLM.
+    # - cache_store=True: persist the final answer after post-process.
+    # Both default to True; callers that must NOT hit/store cache (raw/force/
+    # counter/critique/session-history/source-filter paths) opt out.
+    # The helper itself additionally skips cache automatically when
+    # req.history has turns or req.source/folder/tag/date_range are set —
+    # those all change retrieval semantics and would serve stale answers.
+    cache_lookup: bool = True
+    cache_store: bool = True
+    # cache_background: False forces synchronous store (one-shot CLIs like
+    # `rag query` that exit within 2s of calling store → atexit drops the
+    # write). Long-running processes (web server, serve.chat) can keep
+    # background=True to hide the 1-1.3s retry budget from the user.
+    cache_background: bool = True
     # Telemetría
     device: str = "other"   # iphone/ipad/mac/linux/windows/android/other
     cmd: str = "chat"       # chat | web | serve.chat | query | …
@@ -15457,6 +15579,15 @@ class ChatTurnResult:
     # Pregunta original del usuario. Se preserva separada del
     # `retrieve_result.search_query` (que puede haber sido reformulado).
     question: str = ""
+    # Semantic cache fields (post 2026-04-23 — populated by run_chat_turn
+    # when cache_lookup is enabled).
+    # - cache_hit: True si la respuesta vino del cache (LLM NO fue invocado).
+    # - cache_probe: detalle del lookup (result/reason/top_cosine/candidates).
+    #   Se emite a extra_json aún si el caller ignoró el hit (ej. log-only).
+    # - cache_stored: True si el turno se persistió al cache post-generate.
+    cache_hit: bool = False
+    cache_probe: dict | None = None
+    cache_stored: bool = False
 
     def to_log_event(self, cmd: str, session_id: str) -> dict:
         """Serializa a dict compatible con `log_query_event()`.
@@ -15496,6 +15627,10 @@ class ChatTurnResult:
             "prompt_version": self.prompt_version,
             "nli_ms": self.nli_ms,
             "grounding_summary": self.nli_summary,
+            # Semantic cache observability (post 2026-04-23).
+            "cache_hit": self.cache_hit,
+            "cache_stored": self.cache_stored,
+            "cache_probe": self.cache_probe,
         }
 
 
@@ -15547,6 +15682,102 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
     except Exception:
         intent_value = None
 
+    # 1.5 Semantic cache lookup (post 2026-04-23). Eligibility mirrors the
+    # `query()` CLI rules: skip when anything mutates retrieval semantics
+    # (session history, source/folder/tag/date filter, counter-contradict,
+    # critique auto-review, precise reformulation, multi-vault scope).
+    # Single-vault only — cross-vault cache keys would need a combined
+    # corpus_hash across cols; not worth the complexity for a corner case.
+    _cache_eligible = (
+        req.cache_lookup
+        and not req.history          # chat turns 2+ depend on prior turns
+        and not req.source           # source filter changes candidate pool
+        and not req.folder
+        and not req.tag
+        and not req.date_range
+        and not req.counter          # counter fires contradiction radar
+        and not req.critique         # critique re-runs LLM; cache would skip that
+        and not req.precise          # precise does its own pre-retrieve reformulation
+        and len(req.vaults) == 1     # single-vault only (corpus_hash is per-col)
+    )
+    _cache_emb = None
+    _cache_hash = ""
+    _cache_probe: dict | None = None
+    if not req.cache_lookup:
+        _cache_probe = {
+            "result": "skipped",
+            "reason": "cache_lookup_disabled",
+            "top_cosine": None,
+            "candidates": 0,
+        }
+    elif not _cache_eligible:
+        _cache_probe = {
+            "result": "skipped",
+            "reason": "flags_skip",
+            "top_cosine": None,
+            "candidates": 0,
+        }
+    elif not _semantic_cache_enabled():
+        _cache_probe = {
+            "result": "disabled",
+            "reason": "cache_disabled",
+            "top_cosine": None,
+            "candidates": 0,
+        }
+    else:
+        try:
+            _col = get_db_for(req.vaults[0][1])
+            _cache_emb = embed([req.question])[0]
+            _cache_hash = _corpus_hash_cached(_col)
+            _hit, _cache_probe = semantic_cache_lookup(
+                _cache_emb, _cache_hash, return_probe=True,
+            )
+            if _hit is not None:
+                # Short-circuit: synthesize a RetrieveResult from the cached
+                # paths so `to_log_event` can log them. We don't have docs
+                # (we skip retrieve) — callers that need docs for source
+                # rendering should use `retrieve_result.metas` which carries
+                # file + source fields minimally.
+                _cached_paths = _hit.get("paths", [])
+                _cached_scores = _hit.get("scores", [])
+                _cached_metas = [
+                    {"file": p, "source": "cache"} for p in _cached_paths
+                ]
+                _cached_rr = RetrieveResult(
+                    docs=["" for _ in _cached_paths],
+                    metas=_cached_metas,
+                    scores=[float(s) for s in _cached_scores],
+                    confidence=float(_hit["top_score"]) if _hit.get("top_score") is not None else 0.0,
+                    search_query=req.question,
+                    query_variants=[req.question],
+                    fast_path=False,
+                    intent=_hit.get("intent") or intent_value,
+                )
+                return ChatTurnResult(
+                    answer=_hit["response"],
+                    retrieve_result=_cached_rr,
+                    intent=_hit.get("intent") or intent_value,
+                    prompt_version="cache",
+                    question=req.question,
+                    cache_hit=True,
+                    cache_probe=_cache_probe,
+                    timing={
+                        "total_ms": int((time.perf_counter() - t_total_start) * 1000),
+                        "retrieve_ms": 0,
+                        "t_gen_ms": 0,
+                    },
+                )
+        except Exception as _cache_exc:
+            _silent_log("semantic_cache_lookup_run_chat_turn", _cache_exc)
+            _cache_emb = None
+            if _cache_probe is None:
+                _cache_probe = {
+                    "result": "error",
+                    "reason": "lookup_exception",
+                    "top_cosine": None,
+                    "candidates": 0,
+                }
+
     # 2. Retrieve (multi-vault aware — funciona aun con 1 vault).
     t_retrieve_start = time.perf_counter()
     retrieve_result = multi_retrieve(
@@ -15576,6 +15807,9 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
                 _prompt_name_for_intent(intent_value, req.loose), "latest",
             ),
             question=req.question,
+            cache_hit=False,
+            cache_probe=_cache_probe,
+            cache_stored=False,
             timing={
                 "total_ms": int((time.perf_counter() - t_total_start) * 1000),
                 "retrieve_ms": t_retrieve_ms,
@@ -15666,6 +15900,44 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         intent=intent_value,
     )
 
+    # 7.5 Semantic cache store (post 2026-04-23). Only if the lookup was
+    # eligible + actually ran (`_cache_emb` populated) + the store was
+    # requested. Mirrors `query()` CLI's store gate (_is_refusal /
+    # empty / low-confidence rows are rejected inside semantic_cache_store).
+    _cache_stored = False
+    if (
+        req.cache_store
+        and _cache_eligible
+        and _cache_emb is not None
+        and _cache_hash
+        and pp.full
+    ):
+        try:
+            _cache_paths = list(dict.fromkeys(
+                m.get("file", "") for m in (retrieve_result.metas or [])
+                if m.get("file")
+            ))
+            _cache_stored = semantic_cache_store(
+                _cache_emb,
+                question=req.question,
+                response=pp.full,
+                paths=_cache_paths,
+                scores=[
+                    round(float(s), 2)
+                    for s in (retrieve_result.scores or [])[:len(_cache_paths)]
+                ],
+                top_score=(
+                    round(float(retrieve_result.confidence), 2)
+                    if retrieve_result.confidence != float("-inf")
+                    else None
+                ),
+                intent=intent_value,
+                corpus_hash=_cache_hash,
+                background=req.cache_background,
+            )
+        except Exception as _cache_exc:
+            _silent_log("semantic_cache_store_run_chat_turn", _cache_exc)
+
     # 8. Ensamblado final.
     return ChatTurnResult(
         answer=pp.full,
@@ -15683,6 +15955,9 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         nli_summary=getattr(pp, "nli_summary", None),
         nli_ms=getattr(pp, "nli_ms", None),
         question=req.question,
+        cache_hit=False,
+        cache_probe=_cache_probe,
+        cache_stored=_cache_stored,
         timing={
             "total_ms": int((time.perf_counter() - t_total_start) * 1000),
             "retrieve_ms": t_retrieve_ms,
@@ -19815,7 +20090,7 @@ def query(
             console.print("[red]Índice vacío. Ejecuta: rag index[/red]")
         return
 
-    # ── Semantic cache lookup (GC#1 2026-04-22) ─────────────────────────────
+    # ── Semantic cache lookup (GC#1 2026-04-22, instrumented 2026-04-23) ────
     # Hits only for exact / near-duplicate queries against an unchanged vault.
     # Skipped if --no-cache, --raw, --force, --counter, --critique, --source,
     # session context (history mutates retrieval), or any filter that changes
@@ -19828,11 +20103,30 @@ def query(
     )
     _cache_emb = None
     _cache_hash = ""
-    if not _cache_skippable and _semantic_cache_enabled():
+    _cache_probe: dict | None = None
+    if _cache_skippable:
+        _cache_probe = {
+            "result": "skipped",
+            "reason": "flags_skip",
+            "top_cosine": None,
+            "candidates": 0,
+        }
+    elif not _semantic_cache_enabled():
+        _cache_probe = {
+            "result": "disabled",
+            "reason": "cache_disabled",
+            "top_cosine": None,
+            "candidates": 0,
+        }
+    else:
         try:
             _cache_emb = embed([question])[0]
             _cache_hash = _corpus_hash_cached(col)
-            hit = semantic_cache_lookup(_cache_emb, _cache_hash)
+            # return_probe=True → tuple (hit_or_None, probe_dict). Probe
+            # is always populated so extra_json can explain misses.
+            hit, _cache_probe = semantic_cache_lookup(
+                _cache_emb, _cache_hash, return_probe=True
+            )
             if hit is not None:
                 _age_m = int(hit["age_seconds"] // 60)
                 _cos = hit["cosine"]
@@ -19861,6 +20155,7 @@ def query(
                     "cache_hit": True,
                     "cache_cosine": round(_cos, 4),
                     "cache_age_seconds": int(hit["age_seconds"]),
+                    "cache_probe": _cache_probe,
                     "paths": _cached_paths,
                     "top_score": round(_cached_top, 2) if _cached_top is not None else None,
                     "t_retrieve": 0.0,
@@ -19873,6 +20168,13 @@ def query(
         except Exception as _cache_exc:
             _silent_log("semantic_cache_lookup_query", _cache_exc)
             _cache_emb = None
+            if _cache_probe is None:
+                _cache_probe = {
+                    "result": "error",
+                    "reason": "lookup_exception",
+                    "top_cosine": None,
+                    "candidates": 0,
+                }
 
     # Session resolution: --continue picks up last_session_id unless --session
     # is also given. If neither is present, we don't touch the session store.
@@ -20378,12 +20680,26 @@ def query(
         except Exception as _nli_exc:
             _silent_log("nli_grounding_panel_query", _nli_exc)
 
-    # ── Semantic cache store (GC#1 2026-04-22) ──────────────────────────────
+    # ── Semantic cache store (GC#1 2026-04-22, durability fix 2026-04-23) ──
     # Store AFTER citation-repair + critique + NLI so `full` is the definitive
     # answer. Skip store if any of the "envelope-changing" opts were active
     # (same rules as lookup skip) — we never want to cache under one set of
     # flags and serve under another. `_cache_emb` is populated by the lookup
     # code above when caching was eligible; reuse it.
+    #
+    # **2026-04-23 fix**: `background=False` (was True). The original design
+    # enqueued the INSERT on a daemon worker to avoid the 1-1.3s retry budget
+    # on the hot path, but the `rag query` process exits within 2s (the
+    # atexit drain cap) of this call — and when telemetry.db is contended
+    # (memory/cpu/impression samplers write there too) the retry budget
+    # outlasts the 2s drain, so the write gets dropped on exit. Audit of
+    # 2,335 queries over 7 days found `rag_response_cache` had 0 real rows
+    # despite 14 queries repeating ≥10× each.
+    #
+    # Synchronous store blocks `return` for up to 1.3s worst-case — but the
+    # user has ALREADY seen the rendered response at this point, so the only
+    # perceived effect is that the terminal prompt returns a moment later.
+    # No user-visible latency regression; cache durability restored.
     _cache_stored = False
     if (not _cache_skippable) and _cache_emb is not None and _cache_hash:
         try:
@@ -20392,12 +20708,6 @@ def query(
             _cache_paths = list(dict.fromkeys(
                 m.get("file", "") for m in result["metas"] if m.get("file")
             ))
-            # background=True: INSERT runs on the rag-bg-sql-writer daemon so
-            # the user-visible latency is not inflated by the 1-1.3s retry
-            # budget under WAL contention. The return value (True) no longer
-            # reflects write-commit success — it only signals "enqueued".
-            # That's the tradeoff for the hot path; the ~314 failures/day
-            # still land in sql_state_errors.jsonl with the same error tag.
             _cache_stored = semantic_cache_store(
                 _cache_emb,
                 question=question,
@@ -20407,7 +20717,7 @@ def query(
                 top_score=round(float(result["confidence"]), 2),
                 intent=intent,
                 corpus_hash=_cache_hash,
-                background=True,
+                background=False,
             )
         except Exception as _cache_exc:
             _silent_log("semantic_cache_store_query", _cache_exc)
@@ -20460,6 +20770,7 @@ def query(
         "grounding_summary": _nli_grounding_summary,
         "cache_hit": False,
         "cache_stored": _cache_stored,
+        "cache_probe": _cache_probe,
         "typo_corrected": _typo_corrected,
         # GC#2.A telemetry fix 2026-04-22 — intent lived only in top-level
         # query() state pre-fix; extra_json logging made 97% of rag_queries
@@ -26534,13 +26845,108 @@ def cache():
     """Semantic response cache — hits para queries repetidas sobre vault unchanged."""
 
 
+def _cache_telemetry_stats(days: int = 7) -> dict:
+    """Cross-reference rag_queries.extra_json against rag_response_cache
+    to compute real-world hit rate + miss-reason distribution + saved latency.
+
+    Returns dict::
+
+        {
+            "window_days": int,
+            "eligible": int,        # rows where cache_probe was populated
+            "hits": int,            # rows with extra_json.cache_hit = true
+            "hit_rate_pct": float,  # hits / eligible * 100
+            "miss_reasons": {reason: count, ...},
+            "top_queries": [(question, hit_count), ...],  # from rag_response_cache
+            "saved_ms_avg": float,  # avg t_gen_ms of cache misses
+            "saved_ms_total": float,  # saved_ms_avg × hits (rough)
+        }
+
+    Errors degrade to empty fields — never raises. Used by ``rag cache stats``.
+    """
+    out: dict = {
+        "window_days": days,
+        "eligible": 0,
+        "hits": 0,
+        "hit_rate_pct": 0.0,
+        "miss_reasons": {},
+        "top_queries": [],
+        "saved_ms_avg": 0.0,
+        "saved_ms_total": 0.0,
+    }
+    try:
+        with _ragvec_state_conn() as conn:
+            # Eligible = rows where cache_probe was populated (the lookup path
+            # ran). cache_probe is a JSON object in extra_json; if present
+            # AND result != 'skipped'/'disabled' it's a real lookup attempt.
+            rows = conn.execute(
+                "SELECT json_extract(extra_json, '$.cache_probe.result') AS res,"
+                "       json_extract(extra_json, '$.cache_probe.reason') AS reason,"
+                "       json_extract(extra_json, '$.cache_hit') AS hit,"
+                "       t_gen"
+                " FROM rag_queries"
+                " WHERE ts > datetime('now', ?)"
+                "   AND json_extract(extra_json, '$.cache_probe') IS NOT NULL",
+                (f"-{int(days)} days",),
+            ).fetchall()
+            miss_latencies: list[float] = []
+            for res, reason, hit, t_gen in rows:
+                # Skip rows where the cache was explicitly disabled or not
+                # attempted — they distort hit rate analysis.
+                if res in ("skipped", "disabled"):
+                    continue
+                out["eligible"] += 1
+                if hit:
+                    out["hits"] += 1
+                else:
+                    if reason:
+                        out["miss_reasons"][reason] = out["miss_reasons"].get(reason, 0) + 1
+                    # Only count non-cached t_gen for "saved latency" estimate.
+                    # Cached rows have t_gen=0 by construction.
+                    if t_gen is not None and float(t_gen) > 0:
+                        miss_latencies.append(float(t_gen))
+            if out["eligible"] > 0:
+                out["hit_rate_pct"] = round(100.0 * out["hits"] / out["eligible"], 2)
+            if miss_latencies:
+                avg_ms = sum(miss_latencies) / len(miss_latencies) * 1000.0
+                out["saved_ms_avg"] = round(avg_ms, 1)
+                out["saved_ms_total"] = round(avg_ms * out["hits"], 0)
+
+            # Top cached queries by hit_count — shows which questions are
+            # actually benefiting from the cache in production.
+            top_rows = conn.execute(
+                "SELECT question, hit_count, intent, last_hit_ts"
+                " FROM rag_response_cache"
+                " WHERE hit_count > 0"
+                " ORDER BY hit_count DESC LIMIT 10"
+            ).fetchall()
+            out["top_queries"] = [
+                {
+                    "question": q[:80] if q else "",
+                    "hit_count": int(hc or 0),
+                    "intent": intent,
+                    "last_hit_ts": lts,
+                }
+                for q, hc, intent, lts in top_rows
+            ]
+    except Exception as exc:
+        _log_sql_state_error("cache_telemetry_stats_failed", err=repr(exc))
+    return out
+
+
 @cache.command("stats")
-def cache_stats():
+@click.option("--days", default=7, show_default=True, type=int,
+              help="Ventana en días para hit-rate telemetry.")
+def cache_stats(days: int):
     """Mostrar stats del cache: rows, hits totales, corpus_hashes distintos, edad.
 
     Incluye además los counters in-process de hit/miss ratios para los caches
     del retrieval pipeline (embed, corpus, feedback_golden, semantic), útil
     para dimensionar LRUs y detectar invalidation triggers agresivos.
+
+    Con `--days N` agrega hit rate real del período desde
+    `rag_queries.extra_json.cache_probe` + distribución de miss reasons +
+    ahorro de latencia estimado + top queries cacheadas.
     """
     stats = semantic_cache_stats()
     if "error" in stats:
@@ -26557,6 +26963,40 @@ def cache_stats():
         console.print(f"  oldest row      : {stats['oldest_ts']}")
     if stats.get("newest_ts"):
         console.print(f"  newest row      : {stats['newest_ts']}")
+
+    # Hit-rate telemetry desde rag_queries (últimos N días).
+    tel = _cache_telemetry_stats(days=days)
+    if tel["eligible"] > 0:
+        console.print()
+        console.print(f"[bold]Telemetría últimos {tel['window_days']} días[/bold]")
+        hr = tel["hit_rate_pct"]
+        hr_color = "green" if hr >= 15 else ("yellow" if hr >= 5 else "red")
+        console.print(
+            f"  queries elegibles : {tel['eligible']}"
+        )
+        console.print(
+            f"  cache hits        : [bold {hr_color}]{tel['hits']}[/bold {hr_color}]  "
+            f"([{hr_color}]{hr:.1f}%[/{hr_color}] hit rate)"
+        )
+        if tel["saved_ms_avg"] > 0 and tel["hits"] > 0:
+            saved_s = tel["saved_ms_total"] / 1000.0
+            console.print(
+                f"  ahorro estimado   : ~{tel['saved_ms_avg']/1000:.1f}s/query × "
+                f"{tel['hits']} hits ≈ [green]{saved_s:.0f}s[/green] ({saved_s/60:.1f} min)"
+            )
+        if tel["miss_reasons"]:
+            console.print()
+            console.print("  [dim]miss reasons:[/dim]")
+            for reason, cnt in sorted(tel["miss_reasons"].items(), key=lambda x: -x[1]):
+                console.print(f"    {reason:20s}: {cnt}")
+        if tel["top_queries"]:
+            console.print()
+            console.print("  [dim]top queries cacheadas (hit_count):[/dim]")
+            for q in tel["top_queries"][:10]:
+                console.print(
+                    f"    [cyan]{q['hit_count']:>3}×[/cyan]  "
+                    f"{q['question']}"
+                )
 
     # In-process cache counters (reset on process restart). Útil como
     # sanity check en sesiones largas: embed > 70% hit rate esperable en

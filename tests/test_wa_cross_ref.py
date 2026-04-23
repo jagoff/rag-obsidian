@@ -271,14 +271,28 @@ def test_cross_ref_without_propose(vault: Path, wa_db: Path) -> None:
     assert len(ref["messages"]) == 1
 
 
-@pytest.mark.requires_ollama
-def test_cross_ref_with_propose_calendar_event(vault: Path, wa_db: Path) -> None:
-    """Message with parseable time ('mañana 19hs') → propose kind=calendar_event."""
+def test_cross_ref_with_propose_calendar_event(vault: Path, wa_db: Path, monkeypatch) -> None:
+    """Message with parseable time ('mañana 19hs') → propose kind=calendar_event.
+
+    Mockea `_parse_natural_datetime` + `_has_explicit_time` para evitar
+    dependencia de ollama (2026-04-22: flaky bajo carga concurrente de
+    tests — el helper qwen2.5:3b timeouteaba con ~10-12s durante la suite
+    completa, aunque pasaba aislado en <2s). El propósito del test es
+    verificar la orquestación de `_build_wa_cross_ref` (detección de
+    propose + shape de la respuesta), no el parseo real del datetime que
+    ya está testeado separado en `test_parse_datetime_*` con ollama real.
+    """
     _seed_messages(wa_db, [
         ("m1", "grecia-direct@s.whatsapp.net", "+g",
          "nos vemos mañana 19hs dale?", "2026-04-21 10:00:00", 0, ""),
     ])
     anchor = datetime(2026, 4, 21, 12, 0, 0)
+    # Mock: el msg con "mañana 19hs" → dt 2026-04-22 19:00 (futuro, con tiempo)
+    expected_dt = datetime(2026, 4, 22, 19, 0, 0)
+    monkeypatch.setattr(rag, "_parse_natural_datetime",
+                        lambda text, now=None, **kw: expected_dt)
+    monkeypatch.setattr(rag, "_has_explicit_time", lambda text: True)
+
     with patch.object(rag, "WHATSAPP_DB_PATH", wa_db), \
          patch.object(rag, "VAULT_PATH", vault):
         rag._mentions_cache = None
@@ -289,14 +303,24 @@ def test_cross_ref_with_propose_calendar_event(vault: Path, wa_db: Path) -> None
     assert "19:00" in ref["propose"]["when_iso"]
 
 
-@pytest.mark.requires_ollama
-def test_cross_ref_with_propose_reminder_date_only(vault: Path, wa_db: Path) -> None:
-    """Message with date but no explicit time → propose kind=reminder."""
+def test_cross_ref_with_propose_reminder_date_only(vault: Path, wa_db: Path, monkeypatch) -> None:
+    """Message with date but no explicit time → propose kind=reminder.
+
+    Mockea `_parse_natural_datetime` + `_has_explicit_time` — mismo
+    rationale que el test de calendar_event (ver docstring). Evita
+    timeout de ollama bajo carga concurrente de la test suite.
+    """
     _seed_messages(wa_db, [
         ("m1", "grecia-direct@s.whatsapp.net", "+g",
          "el viernes vamos a la playa", "2026-04-19 15:00:00", 0, ""),
     ])
     anchor = datetime(2026, 4, 21, 12, 0, 0)  # monday
+    # Mock: "el viernes" → dt 2026-04-24 (viernes), sin tiempo explícito
+    expected_dt = datetime(2026, 4, 24, 0, 0, 0)
+    monkeypatch.setattr(rag, "_parse_natural_datetime",
+                        lambda text, now=None, **kw: expected_dt)
+    monkeypatch.setattr(rag, "_has_explicit_time", lambda text: False)
+
     with patch.object(rag, "WHATSAPP_DB_PATH", wa_db), \
          patch.object(rag, "VAULT_PATH", vault):
         rag._mentions_cache = None

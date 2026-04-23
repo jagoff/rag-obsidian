@@ -271,7 +271,44 @@ def _own_conversation_path(session_id: str) -> str | None:
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="obsidian-rag web", docs_url=None, redoc_url=None)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+# Cache-Control para /static/* — assets inmutables en prod (versionados por
+# fichero, reload del server pushea bytes nuevos al disk). Pre-2026-04-22 no
+# había header → cada reload del browser refetcheaba el bundle entero
+# (~50-100ms por asset, peor en mobile/WiFi lento). Con `max-age=3600` el
+# browser cachea 1h y la navegación entre páginas (home/dashboard/chat) es
+# instant. `public` permite que proxies intermediate cacheen (irrelevante en
+# localhost pero es higiene). ETag lo maneja StaticFiles automáticamente
+# vía If-None-Match → con cache válido el response es 304 sin body.
+#
+# Trade-off: si el user pushea un hotfix a `web/static/app.js` y tiene el
+# browser abierto, no lo ve hasta que expire el cache o haga hard-reload
+# (⌘⇧R). Para dev usar `OBSIDIAN_RAG_STATIC_NO_CACHE=1` que setea max-age=0.
+class _CachedStaticFiles(StaticFiles):
+    """StaticFiles subclass que agrega Cache-Control a cada response."""
+
+    def __init__(self, *args, max_age: int = 3600, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._max_age = max_age
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if hasattr(response, "headers"):
+            response.headers["Cache-Control"] = (
+                f"public, max-age={self._max_age}"
+                if self._max_age > 0
+                else "no-cache, no-store, must-revalidate"
+            )
+        return response
+
+
+_STATIC_MAX_AGE = 0 if os.environ.get("OBSIDIAN_RAG_STATIC_NO_CACHE") == "1" else 3600
+app.mount(
+    "/static",
+    _CachedStaticFiles(directory=STATIC_DIR, max_age=_STATIC_MAX_AGE),
+    name="static",
+)
 
 # CORS: same-origin only. The server is bound to 127.0.0.1 by the
 # launchd plist, so cross-origin requests would come from a browser
@@ -4161,7 +4198,14 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             )
             _cached = _chat_cache_get(_cache_key)
             if _cached:
-                # Replay completo como SSE. El UI no distingue cached de live.
+                # Replay completo como SSE. Status `cached` NO es redundante
+                # aunque el `done` event también lleve `cached: True` — el
+                # UI lo consume en app.js:2346 para mostrar el label "desde
+                # caché" y detener el ticker inmediatamente (sub-100ms
+                # replay no merece running counter). Sin este event, el
+                # ticker quedaría en "retrieving" hasta el `done`. Audit
+                # 2026-04-22 propuso removerlo como "1-2ms savings"; el
+                # gap es UX-breaking, no perf win. NO remover.
                 yield _sse("status", {"stage": "cached"})
                 if not is_propose_intent:
                     yield _sse("sources", {

@@ -66,6 +66,7 @@ logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import click
+import difflib
 import sqlite_vec
 import ollama
 import yaml
@@ -75,6 +76,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import track
 from rich.rule import Rule
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -24551,35 +24553,299 @@ def _agent_tool_weather(location: str | None = None) -> str:
 _AGENT_PENDING_WRITES: list[dict] = []
 
 
-def _agent_tool_propose_write(path: str, content: str, rationale: str = "") -> str:
-    """Proponer crear o sobreescribir una nota del vault. NO escribe
+# ── Scribe helpers (Fase A, 2026-04-23) ────────────────────────────────────
+# Historia: el apply loop original tenía una línea nefasta —
+#   if full.exists(): full = full.with_name(f"{full.stem} ({HHMMSS}).md")
+# → cualquier overwrite se transformaba en un duplicado silencioso con
+# sufijo temporal. El usuario pedía "agregá X a mi nota Y" y terminaba
+# con `Y (183022).md`. El fix rompe el path en 3 primitivas:
+#   - propose_write(overwrite=False) = create-only (default conservador)
+#   - propose_write(overwrite=True)   = overwrite explícito + backup
+#   - append_to_note(...)             = append al final o bajo heading
+# Cada entry en _AGENT_PENDING_WRITES lleva `kind` ∈ {create,overwrite,append}
+# para que el apply sepa qué operación hacer.
+
+
+def _scribe_validate_path(path: str) -> str | None:
+    """Shared path validation for propose_write + append_to_note.
+    Returns an error string or None if the path is acceptable.
+    Checks: endswith .md, not in dotfolder, resolved stays inside VAULT_PATH.
+    Does NOT check existence — that's caller-specific."""
+    if not path.endswith(".md"):
+        return "Error: path debe terminar en .md"
+    if is_excluded(path):
+        return "Error: path en dotfolder rechazado"
+    try:
+        full = (VAULT_PATH / path).resolve()
+        full.relative_to(VAULT_PATH.resolve())
+    except (ValueError, OSError):
+        return "Error: path fuera del vault"
+    return None
+
+
+def _scribe_backup_path(full: Path) -> Path:
+    """Return a timestamped backup sibling for `full`. Shape:
+    `<file>.bak.<unix_ts>`. Matches the `.bak.<ts>` convention used by
+    the T10 state migration so `rag free --skip-baks` already knows
+    how to prune them on the `rag maintenance` cycle."""
+    return full.with_name(f"{full.name}.bak.{int(time.time())}")
+
+
+def _scribe_insert_under_heading(body: str, section: str, content: str) -> str:
+    """Insert `content` right after the line that matches `section`
+    exactly (full-line match, anchored with ^ and $). Raises ValueError
+    if the heading is not found — callers should have validated with
+    `_scribe_heading_exists()` first.
+
+    Insertion shape: newline + content + newline, keeping whatever
+    followed the heading intact (blank lines, next heading, etc).
+    """
+    pattern = rf"^{re.escape(section)}\s*$"
+    match = re.search(pattern, body, re.MULTILINE)
+    if match is None:
+        raise ValueError(f"section {section!r} no está en el body")
+    insert_at = match.end()
+    snippet = "\n" + content.rstrip("\n") + "\n"
+    return body[:insert_at] + snippet + body[insert_at:]
+
+
+def _scribe_heading_exists(body: str, section: str) -> bool:
+    """True iff `section` appears as a standalone line in body. Used by
+    the tool to validate BEFORE registering the pending entry — we'd
+    rather fail early than discover the heading is missing at apply time."""
+    pattern = rf"^{re.escape(section)}\s*$"
+    return re.search(pattern, body, re.MULTILINE) is not None
+
+
+def _scribe_append_to_body(body: str, content: str) -> str:
+    """Append `content` to the end of `body` with a blank-line separator
+    if needed. Guarantees a single trailing newline so subsequent appends
+    keep the file clean."""
+    if not body.endswith("\n"):
+        body = body + "\n"
+    if not body.endswith("\n\n"):
+        body = body + "\n"
+    return body + content.rstrip("\n") + "\n"
+
+
+def _scribe_apply_entry(entry: dict, col) -> None:
+    """Apply one pending scribe entry to the vault. Creates a backup
+    `<path>.bak.<unix_ts>` for any operation that mutates an existing
+    file (overwrite, append). Re-indexes the affected file via
+    `_index_single_file` so subsequent retrieves see the update.
+
+    Raises:
+        RuntimeError: unknown kind, or kind="create" but path already
+            exists (defensive — propose_write should have caught this).
+    """
+    kind = entry.get("kind", "create")
+    rel_path = entry["path"]
+    full = (VAULT_PATH / rel_path).resolve()
+    full.parent.mkdir(parents=True, exist_ok=True)
+
+    if kind == "create":
+        if full.exists():
+            raise RuntimeError(
+                f"path ya existe: {rel_path} "
+                "(use propose_write con overwrite=True si querés reemplazar)"
+            )
+        full.write_text(entry["content"], encoding="utf-8")
+    elif kind == "overwrite":
+        if full.exists():
+            bak = _scribe_backup_path(full)
+            bak.write_bytes(full.read_bytes())
+        full.write_text(entry["content"], encoding="utf-8")
+    elif kind == "append":
+        if not full.is_file():
+            raise RuntimeError(f"nota no encontrada: {rel_path}")
+        bak = _scribe_backup_path(full)
+        bak.write_bytes(full.read_bytes())
+        old = full.read_text(encoding="utf-8", errors="ignore")
+        section = entry.get("section")
+        if section:
+            new = _scribe_insert_under_heading(old, section, entry["content"])
+        else:
+            new = _scribe_append_to_body(old, entry["content"])
+        full.write_text(new, encoding="utf-8")
+    else:
+        raise RuntimeError(f"kind desconocido: {kind!r}")
+
+    try:
+        _index_single_file(col, full)
+    except Exception:
+        pass
+
+
+def _scribe_render_diff(entry: dict) -> str:
+    """Build a unified-diff preview for a pending entry. For `create`
+    returns a `+` prefixed preview of the first ~20 lines (there is no
+    old body to diff against). For `overwrite` + `append` reads the
+    current on-disk content and runs `difflib.unified_diff`.
+
+    Output is capped at ~40 lines to keep the terminal readable; the
+    tail is replaced with a `... (N líneas más)` marker.
+    """
+    kind = entry.get("kind", "create")
+    if kind == "create":
+        new_lines = entry["content"].splitlines()
+        preview = "\n".join(f"+ {line}" for line in new_lines[:20])
+        if len(new_lines) > 20:
+            preview += f"\n+ ... ({len(new_lines) - 20} líneas más)"
+        return preview
+
+    full = (VAULT_PATH / entry["path"]).resolve()
+    if not full.is_file():
+        return "# (archivo no existe al momento del preview — modificado externamente?)"
+    old = full.read_text(encoding="utf-8", errors="ignore")
+    if kind == "overwrite":
+        new = entry["content"]
+    elif kind == "append":
+        section = entry.get("section")
+        if section:
+            try:
+                new = _scribe_insert_under_heading(old, section, entry["content"])
+            except ValueError:
+                return f"# (heading {section!r} desapareció entre propose y preview)"
+        else:
+            new = _scribe_append_to_body(old, entry["content"])
+    else:
+        return ""
+
+    lines = list(difflib.unified_diff(
+        old.splitlines(keepends=False),
+        new.splitlines(keepends=False),
+        fromfile=entry["path"],
+        tofile=entry["path"],
+        lineterm="",
+        n=3,
+    ))
+    if len(lines) > 40:
+        lines = lines[:40] + [f"... ({len(lines) - 40} líneas más)"]
+    return "\n".join(lines)
+
+
+def _agent_tool_propose_write(
+    path: str, content: str, rationale: str = "", overwrite: bool = False,
+) -> str:
+    """Proponer crear o sobrescribir una nota del vault. NO escribe
     inmediatamente — registra la propuesta para que el usuario confirme.
 
     Usá esta tool para crear notas resumen, agregar notas derivadas, o
     guardar outputs. Siempre bajo rutas del vault (00-Inbox/, 01-Projects/,
     02-Areas/, 03-Resources/). Nunca en dotfolders.
 
+    Por default NO sobrescribe si el path ya existe — devuelve error
+    sugiriendo `append_to_note` (para agregar contenido preservando lo
+    anterior) o `overwrite=True` (para reemplazar todo, con backup
+    automático). Este default conservador reemplaza el comportamiento
+    legacy (<2026-04-23) que creaba un duplicado con sufijo (HHMMSS).md
+    silenciosamente cuando había colisión.
+
     Args:
         path: Ruta relativa al vault. Debe terminar en .md.
         content: Contenido markdown completo (incluye frontmatter si querés).
         rationale: Breve justificación (por qué esta nota).
+        overwrite: Si True y el path existe, propone reemplazar el archivo
+            entero. Se crea un backup `<path>.bak.<unix_ts>` antes del
+            write efectivo. Ignorado si el path no existe.
 
     Returns:
-        Mensaje de confirmación registrado.
+        Mensaje de confirmación registrado o error explícito.
     """
-    if not path.endswith(".md"):
-        return "Error: path debe terminar en .md"
-    if is_excluded(path):
-        return "Error: path en dotfolder rechazado"
-    _AGENT_PENDING_WRITES.append({"path": path, "content": content, "rationale": rationale})
-    return f"Propuesta registrada: {path} ({len(content)} chars). El usuario verá la acción antes de ejecutarse."
+    err = _scribe_validate_path(path)
+    if err:
+        return err
+    full = (VAULT_PATH / path).resolve()
+    path_exists = full.is_file()
+    if path_exists and not overwrite:
+        return (
+            f"Error: '{path}' ya existe. Pasá overwrite=True para reemplazar "
+            f"todo el archivo (con backup automático), o usá append_to_note "
+            f"para agregar contenido al final o bajo un heading existente."
+        )
+    kind = "overwrite" if (path_exists and overwrite) else "create"
+    _AGENT_PENDING_WRITES.append({
+        "kind": kind, "path": path, "content": content, "rationale": rationale,
+    })
+    label = "Sobrescritura" if kind == "overwrite" else "Creación"
+    return (
+        f"{label} propuesta: {path} ({len(content)} chars). "
+        f"El usuario verá el diff antes de ejecutar."
+    )
+
+
+def _agent_tool_append_to_note(
+    path: str, content: str, section: str | None = None, rationale: str = "",
+) -> str:
+    """Agregar contenido a una nota existente SIN reescribirla entera.
+
+    Dos modos:
+      - section=None: append al final del body (después del último
+        contenido, con blank-line separator automática).
+      - section="## Heading exacto": insertar `content` justo después
+        de esa línea. Match case-sensitive de línea completa (no
+        substring). Si el heading no existe, devuelve error explícito.
+
+    NO escribe inmediatamente — registra la propuesta con diff para
+    confirmación. Crea backup `<path>.bak.<unix_ts>` al momento del apply.
+
+    Preferida sobre `propose_write(overwrite=True)` cuando el usuario
+    pide AGREGAR información a una nota existente; overwrite es
+    destructivo (reemplaza todo), append es aditivo.
+
+    Args:
+        path: Ruta relativa al vault, terminando en .md. Debe existir.
+        content: Texto markdown a insertar. No se valida estructura —
+            el caller es responsable de pasar contenido bien-formado.
+        section: Heading bajo el cual insertar (ej. "## Pendientes",
+            "### Notas de hoy"). Debe empezar con "#" y coincidir
+            exactamente con una línea de la nota. None = append al final.
+        rationale: Justificación breve (aparece en el diff preview).
+
+    Returns:
+        Confirmación con ubicación exacta, o error explícito si el path
+        no existe / heading no encontrado / validación de path falla.
+    """
+    err = _scribe_validate_path(path)
+    if err:
+        return err
+    full = (VAULT_PATH / path).resolve()
+    if not full.is_file():
+        return f"Error: nota no encontrada: {path}"
+    if section is not None:
+        if not section.startswith("#"):
+            return (
+                "Error: section debe empezar con '#' y ser un heading "
+                "markdown completo (ej. '## Pendientes')"
+            )
+        body = full.read_text(encoding="utf-8", errors="ignore")
+        if not _scribe_heading_exists(body, section):
+            return (
+                f"Error: heading {section!r} no existe en {path}. "
+                "Usá propose_write con overwrite=True para agregar el "
+                "heading, o revisá el nombre exacto."
+            )
+    _AGENT_PENDING_WRITES.append({
+        "kind": "append",
+        "path": path,
+        "content": content,
+        "section": section,
+        "rationale": rationale,
+    })
+    where = f"bajo {section!r}" if section else "al final del body"
+    return (
+        f"Append propuesto: {path} ({len(content)} chars) {where}. "
+        "El usuario verá el diff antes de ejecutar."
+    )
 
 
 _AGENT_SYSTEM = (
     "Sos un asistente agéntico sobre un vault de Obsidian personal. "
     "Tenés tools para buscar, leer y listar notas del vault, y para PROPONER "
-    "creaciones o modificaciones. No ejecutás writes vos — sólo los proponés "
-    "vía `propose_write`; el usuario los confirma después.\n\n"
+    "cambios — crear notas nuevas (`propose_write`), agregar contenido a "
+    "notas existentes (`append_to_note`), o reemplazar una nota entera "
+    "(`propose_write` con overwrite=True). No ejecutás writes vos — sólo "
+    "los proponés; el usuario los confirma viendo el diff antes de ejecutar.\n\n"
     "PROCESO DE TRABAJO (Feature #4, 2026-04-23):\n"
     "En tu primer mensaje, ANTES de llamar tools, escribí un PLAN breve en "
     "prosa (3-5 oraciones, sin lista numerada larga): qué información necesitás "
@@ -24591,10 +24857,23 @@ _AGENT_SYSTEM = (
     "Si tres tool calls consecutivos no aportan información útil, pará y "
     "respondé honestamente que no pudiste completar la tarea. Preferimos un "
     "'no pude hacer X porque Z' corto a seis iteraciones improductivas.\n\n"
+    "CÓMO ELEGIR LA TOOL DE WRITE CORRECTA (Fase A scribe, 2026-04-23):\n"
+    "- Si el usuario pide AGREGAR algo a una nota existente ('agregá X a mi "
+    "  nota Y', 'sumá un item a la lista de pendientes de Z'), usá "
+    "  `append_to_note` — preserva todo el contenido previo y solo agrega "
+    "  lo nuevo al final o bajo un heading específico.\n"
+    "- Si el usuario pide CREAR una nota nueva ('creá una nota sobre X', "
+    "  'armá un resumen de Y'), usá `propose_write` sin overwrite (default).\n"
+    "- Si el usuario pide REEMPLAZAR completamente el contenido de una nota "
+    "  ('reescribí esta nota desde cero', 'limpiá mi nota Y'), usá "
+    "  `propose_write` con overwrite=True. El apply loop crea un backup "
+    "  `.bak.<timestamp>` automáticamente antes de sobrescribir.\n"
+    "- NO uses overwrite=True cuando el usuario solo quiere agregar algo — "
+    "  append es siempre más seguro que overwrite.\n\n"
     "Reglas:\n"
     "1. Antes de proponer writes, usá search/read/list para juntar contexto "
     "   del vault real. No inventes paths ni contenidos.\n"
-    "2. Las notas propuestas deben vivir bajo 00-Inbox/, 01-Projects/, "
+    "2. Las notas NUEVAS deben vivir bajo 00-Inbox/, 01-Projects/, "
     "   02-Areas/ o 03-Resources/. Default: 00-Inbox/ para capturas nuevas.\n"
     "3. Incluí frontmatter YAML válido con `created`, `tags` del vocabulario "
     "   existente cuando sea posible, y `related: [[wikilink]]` a notas "
@@ -24631,6 +24910,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
         _agent_tool_read_note,
         _agent_tool_list_notes,
         _agent_tool_propose_write,
+        _agent_tool_append_to_note,
         _agent_tool_weather,
     ]
     tool_fns = {fn.__name__: fn for fn in tools}
@@ -24767,40 +25047,62 @@ def do(instruction: str, yes: bool, max_iterations: int):
     # Show pending writes, confirm each.
     if _AGENT_PENDING_WRITES:
         console.print()
-        console.print(Rule(title="[bold yellow]Writes propuestos[/bold yellow]", style="yellow"))
+        console.print(Rule(title="[bold yellow]Cambios propuestos[/bold yellow]", style="yellow"))
         col = get_db()
+        _kind_label = {
+            "create": ("Crear", "Crear?"),
+            "overwrite": ("Sobrescribir", "Sobrescribir (backup .bak.<ts> auto)?"),
+            "append": ("Agregar", "Aplicar append?"),
+        }
         for i, w in enumerate(_AGENT_PENDING_WRITES, 1):
+            kind = w.get("kind", "create")
+            label, prompt_text = _kind_label.get(kind, (kind, "Aplicar?"))
             console.print()
-            console.print(f"[bold]{i}. {w['path']}[/bold]  [dim]({len(w['content'])} chars)[/dim]")
+            header = f"[bold]{i}. [{label}] {w['path']}[/bold]"
+            if kind == "append" and w.get("section"):
+                header += f"  [dim]bajo {w['section']!r}[/dim]"
+            header += f"  [dim]({len(w['content'])} chars)[/dim]"
+            console.print(header)
             if w.get("rationale"):
                 console.print(f"   [dim italic]{w['rationale']}[/dim italic]")
-            console.print(Markdown(w["content"][:600] + ("…" if len(w["content"]) > 600 else "")))
+            # Diff preview: unified diff para overwrite/append, + preview
+            # para create. Renderizado con Syntax lexer=diff para los verdes
+            # y rojos nativos del terminal.
+            diff_text = _scribe_render_diff(w)
+            if diff_text:
+                try:
+                    console.print(Syntax(
+                        diff_text, "diff",
+                        theme="ansi_dark", background_color="default",
+                        word_wrap=True,
+                    ))
+                except Exception:
+                    # Fallback defensivo: si Syntax falla por cualquier razón
+                    # (pygments missing, theme error), mostrar el diff plano.
+                    console.print(f"[dim]{diff_text}[/dim]")
 
             if yes:
                 apply = True
             else:
                 try:
-                    resp = console.input("   [bold green]Crear?[/bold green] [y/N] ").strip().lower()
+                    resp = console.input(
+                        f"   [bold green]{prompt_text}[/bold green] [y/N] "
+                    ).strip().lower()
                 except (KeyboardInterrupt, EOFError):
                     console.print("   [yellow]cancelado[/yellow]")
                     break
                 apply = resp in ("y", "s", "yes", "si", "sí")
 
             if apply:
-                full = VAULT_PATH / w["path"]
-                full.parent.mkdir(parents=True, exist_ok=True)
-                if full.exists():
-                    full = full.with_name(f"{full.stem} ({datetime.now().strftime('%H%M%S')}).md")
-                full.write_text(w["content"], encoding="utf-8")
                 try:
-                    _index_single_file(col, full)
-                except Exception:
-                    pass
-                console.print(f"   [green]✓ escrito:[/green] {full.relative_to(VAULT_PATH)}")
+                    _scribe_apply_entry(w, col)
+                    console.print(f"   [green]✓ aplicado:[/green] {w['path']}")
+                except Exception as e:
+                    console.print(f"   [red]✗ error al aplicar: {e}[/red]")
             else:
                 console.print("   [dim]saltado[/dim]")
     else:
-        console.print("[dim](sin writes propuestos)[/dim]")
+        console.print("[dim](sin cambios propuestos)[/dim]")
 
 
 _WEATHER_ES: dict[str, str] = {
@@ -36791,6 +37093,158 @@ def session_cleanup(days: int):
     """Purga sesiones viejas."""
     removed = cleanup_sessions(ttl_days=days)
     console.print(f"[cyan]{removed}[/cyan] sesión(es) borrada(s) (TTL {days}d)")
+
+
+# ── session export (Feature #12 del 2026-04-23) ─────────────────────────
+# Snapshot de una sesión completa a una .md nota del vault. Útil para
+# preservar conversaciones importantes en PARA (01-Projects o 03-Resources)
+# donde van a ser indexadas como contenido de primera clase.
+#
+# Sin folders new_nodeado: se escribe a 00-Inbox/ por default (es el patrón
+# del resto del vault; el user mueve manualmente si quiere). Sobreescribir
+# PREVENIDO: si el path existe, se agrega un sufijo timestamp.
+
+def _render_session_to_markdown(sess: dict, *, include_sources: bool = True) -> str:
+    """Convierte una sesión a markdown con frontmatter + turns.
+
+    Frontmatter incluye: created, modified, session_id, tags=[conversation],
+    source = "rag session export".
+    """
+    sid = sess.get("id", "unknown")
+    created = sess.get("created_at", "")
+    updated = sess.get("updated_at", "")
+    turns = sess.get("turns") or []
+    first_q = (turns[0].get("q") if turns else "") or "Conversación sin título"
+    title = first_q[:80].strip().rstrip("?!.,;:") or "Conversación"
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"created: {created}")
+    lines.append(f"modified: {updated}")
+    lines.append(f"session_id: {sid}")
+    lines.append(f"n_turns: {len(turns)}")
+    lines.append(f"mode: {sess.get('mode', 'chat')}")
+    lines.append("tags: [conversation, rag-export]")
+    lines.append(f"source: rag session export")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"> Exportada de la sesión `{sid}` — {len(turns)} turnos, "
+                 f"creada {created}.")
+    lines.append("")
+
+    for i, turn in enumerate(turns, 1):
+        q = turn.get("q") or ""
+        a = turn.get("a") or ""
+        lines.append(f"## Turno {i}")
+        lines.append("")
+        lines.append(f"**Pregunta:** {q}")
+        lines.append("")
+        if turn.get("q_reformulated"):
+            lines.append(f"*Reformulada:* {turn['q_reformulated']}")
+            lines.append("")
+        lines.append("**Respuesta:**")
+        lines.append("")
+        lines.append(a.strip() if a else "*(sin respuesta)*")
+        lines.append("")
+        paths = turn.get("paths") or []
+        if include_sources and paths:
+            lines.append("**Sources:**")
+            for p in paths[:5]:
+                lines.append(f"- [[{p}]]")
+            if len(paths) > 5:
+                lines.append(f"- *...y {len(paths) - 5} más*")
+            lines.append("")
+    return "\n".join(lines)
+
+
+@session.command("export")
+@click.argument("sid", required=False, default=None)
+@click.option("--folder", default="00-Inbox",
+              show_default=True,
+              help="Carpeta destino (vault-relative).")
+@click.option("--filename", default=None,
+              help="Override del filename (sin .md). "
+                   "Default: YYYY-MM-DD-HHMM-<sid>.md")
+@click.option("--no-sources", is_flag=True,
+              help="No incluir los paths de los sources en cada turno.")
+@click.option("--stdout", "to_stdout", is_flag=True,
+              help="Imprimir el markdown a stdout en lugar de escribir al vault.")
+@click.option("--force", is_flag=True,
+              help="Sobreescribir si el archivo existe (default: agrega sufijo).")
+def session_export(
+    sid: str | None, folder: str, filename: str | None,
+    no_sources: bool, to_stdout: bool, force: bool,
+):
+    """Exportar una sesión a una nota markdown del vault.
+
+    Ejemplos:
+        rag session export               # última sesión → 00-Inbox/
+        rag session export a3f2b1        # sesión específica
+        rag session export --folder 01-Projects/notes
+        rag session export --stdout      # imprimir sin escribir
+
+    La nota incluye frontmatter con session_id + tags, y cada turno
+    con pregunta, respuesta reformulada (si existe) y sources como
+    wikilinks. Post-escritura trigger un re-index del archivo.
+    """
+    target_sid = sid or last_session_id()
+    if not target_sid:
+        console.print("[red]No hay sesión activa[/red] — pasá un SID explícito.")
+        return
+    sess = load_session(target_sid)
+    if not sess:
+        console.print(f"[red]Sesión no encontrada: {target_sid}[/red]")
+        return
+    if not sess.get("turns"):
+        console.print(f"[yellow]Sesión vacía (sin turnos): {target_sid}[/yellow]")
+        return
+
+    md = _render_session_to_markdown(sess, include_sources=not no_sources)
+
+    if to_stdout:
+        click.echo(md)
+        return
+
+    # Compute filename.
+    from datetime import datetime as _dt
+    ts = _dt.now().strftime("%Y-%m-%d-%H%M")
+    base_name = filename or f"{ts}-conversation-{target_sid[:8]}"
+    if not base_name.endswith(".md"):
+        base_name += ".md"
+
+    try:
+        vault = _resolve_vault_path()
+    except Exception as exc:
+        console.print(f"[red]Error resolving vault: {exc!r}[/red]")
+        return
+    target_dir = vault / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / base_name
+    if target_path.exists() and not force:
+        # Agregar sufijo timestamp second-level para evitar colisión.
+        suffix = _dt.now().strftime("%S")
+        stem = target_path.stem
+        target_path = target_dir / f"{stem}-{suffix}.md"
+
+    try:
+        target_path.write_text(md, encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[red]Error writing {target_path}: {exc!r}[/red]")
+        return
+
+    rel = target_path.relative_to(vault)
+    console.print(f"[green]✓[/green] Exportada a [cyan]{rel}[/cyan]  "
+                  f"[dim]({len(md)} chars, {len(sess.get('turns', []))} turns)[/dim]")
+
+    # Best-effort reindex so the note is searchable immediately.
+    try:
+        col = get_db()
+        _index_single_file(col, target_path)
+        console.print(f"  [dim]reindexed OK[/dim]")
+    except Exception:
+        pass
 
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────

@@ -10614,11 +10614,34 @@ def start_memory_pressure_watchdog() -> bool:
 def warmup_async() -> None:
     """Dispara en background la carga del reranker, bge-m3 y corpus BM25.
 
-    El reranker cold load cuesta ~5s (sentence-transformers + pesos fp32 en
-    MPS). bge-m3 primer embed cuesta ~1s (warmup del cliente Ollama). El
-    corpus load es ~130ms. Todo esto pasa secuencial en el path del primer
-    query — aquí lo solapamos con el CLI arg parse + session resolution +
-    intent classification + reformulate (que toman colectivamente ~0.5-2s).
+    Desde 2026-04-22 los 5 warmup targets corren en **threads paralelos**
+    en vez de secuencial. Pre-fix el `_run` serializaba:
+
+        get_reranker()              # 5s cold MPS
+        embed(["warmup"])           # 5s cold ollama bge-m3
+        _warmup_local_embedder()    # 5s cold in-process bge-m3 MPS
+        _load_corpus + get_pagerank # 130ms
+        chat warmup × 2             # 5s cold ollama qwen2.5:7b
+
+    Total secuencial ≈ 20s desde el start. El main thread del CLI entra a
+    `retrieve()` al ~1-2s post-warmup-start — mucho antes de que el Event
+    `_local_embedder_ready` dispare (recién al 15s en el path legacy). El
+    wait de 1500ms en `query_embed_local` se agotaba y caía a `embed()`
+    ollama que **tampoco estaba warm** (el ollama warmup llegaba tras el
+    reranker) → cold load ollama bge-m3 en el path crítico = 6-12s embed.
+    Medido en rag_queries.extra_json.timing: embed_ms 10277/11375/12014
+    en outliers producción 2026-04-22 (CLI `query`).
+
+    Post-fix: 5 threads paralelos. MPS y ollama HTTP son independientes
+    (ollama es proceso externo, MPS tiene su propio cuda-equivalent
+    context) — corren simultáneos sin contention. El bottleneck pasa de
+    20s suma a ~5s max individual. El Event `_local_embedder_ready`
+    dispara a los ~5s en vez de 15s. El main thread que hace wait(5s)
+    catcha el Event a tiempo en la mayoría de los casos.
+
+    Si el wait local timea, el fallback ollama también está warm ya → el
+    `embed()` del fallback cuesta 140ms (caliente) en vez de 6-12s
+    (frío).
 
     Idempotente por proceso. Opt-out via RAG_NO_WARMUP=1 para scripts
     livianos (rag stats, rag session list) que no necesitan retrieval.
@@ -10631,43 +10654,50 @@ def warmup_async() -> None:
             return
         _warmup_started = True
 
-    def _run() -> None:
-        # Reranker: costo dominante (~5s cold).
+    # ── 5 targets, paralelos ──────────────────────────────────────────────
+    # Cada target en su propio thread daemon. El coordinator thread
+    # (`rag-warmup`) arranca los 5 y termina — no hace join porque el
+    # main thread no espera al warmup (es best-effort asynchronous).
+    # Los targets individuales son silent-fail para no matar el proceso.
+
+    def _wu_reranker() -> None:
         try:
             get_reranker()
         except Exception:
             pass
-        # bge-m3 warm: primera llamada al servidor Ollama inicializa cliente
-        # y fuerza keep_alive — siguientes embeds responden <150ms.
+
+    def _wu_ollama_embed() -> None:
+        # bge-m3 warm: fuerza a ollama a cargar + pinear el modelo de embed.
+        # Crítico: si el local embedder falla o timea, el fallback `embed()`
+        # pega contra este ollama. Sin este warmup, el fallback paga el
+        # cold load ollama (5-10s adicionales).
         try:
             embed(["warmup"])
         except Exception:
             pass
-        # In-process bge-m3 SentenceTransformer (~5s cold load on MPS). The
-        # helper self-gates on `_local_embed_enabled()` so bulk paths that
-        # never enable the flag pay nothing; callers like `rag query`/`chat`
-        # get the expensive load off the critical path of the first retrieve.
-        # Safe to run unconditionally — see `_warmup_local_embedder` docstring.
+
+    def _wu_local_embed() -> None:
+        # In-process bge-m3 SentenceTransformer (~5s cold load on MPS).
+        # Self-gates on _local_embed_enabled() — bulk paths que nunca
+        # activan el flag skippean gratis. Sets _local_embedder_ready
+        # Event al terminar → query_embed_local catcha inmediatamente.
         _warmup_local_embedder()
-        # Corpus BM25 + vocabulario: ~130ms, se evita en primer retrieve().
-        # Tras cargar el corpus, también precomputamos adj + PageRank: ambos
-        # se tocan en el primer retrieve (scoring + graph expansion) y
-        # cuestan ~30-50ms combinados sobre vault de ~500 notas.
+
+    def _wu_corpus() -> None:
         try:
             col = get_db()
             _load_corpus(col)
             get_pagerank(col)
         except Exception:
             pass
-        # Chat model pre-warmup (2026-04-22): ~5s cold load de qwen2.5:7b en
-        # ollama la primera vez que se pega al endpoint chat. Pre-fix el
-        # warmup solo tocaba embed + reranker, entonces `rag query` one-shot
-        # seguía pagando ese cold-load en el path crítico de la generación.
-        # Un `ollama.chat(num_predict=1, num_ctx=64)` con un prompt mínimo
-        # forza el load + pin (keep_alive=-1 o 20m según `chat_keep_alive`)
-        # sin gastar tokens apreciables. Helper model (qwen2.5:3b) también
-        # se warmea porque lo llama `expand_queries` / `reformulate_query`
-        # en el mismo camino del primer retrieve.
+
+    def _wu_chat_models() -> None:
+        # Chat model + helper pre-warmup: ~5s cold load cada uno. Ollama
+        # serializa GPU calls (OLLAMA_MAX_LOADED_MODELS default 2) pero
+        # el load inicial es concurrente con los otros threads (MPS vs
+        # ollama daemon son PIDs distintos). Estos dos sí se serializan
+        # entre sí dentro del mismo thread para respetar el VRAM
+        # presupuesto de ollama.
         try:
             _chat_model = resolve_chat_model()
             ollama.chat(
@@ -10687,6 +10717,23 @@ def warmup_async() -> None:
             )
         except Exception:
             pass
+
+    def _run() -> None:
+        targets = [
+            ("reranker", _wu_reranker),
+            ("ollama-embed", _wu_ollama_embed),
+            ("local-embed", _wu_local_embed),
+            ("corpus", _wu_corpus),
+            ("chat-models", _wu_chat_models),
+        ]
+        threads = [
+            threading.Thread(target=fn, name=f"rag-warmup-{name}", daemon=True)
+            for name, fn in targets
+        ]
+        for t in threads:
+            t.start()
+        # No join — el warmup es fire-and-forget. Cada target signala su
+        # readiness por su propio mecanismo (Event, cache, ollama keep_alive).
 
     t = threading.Thread(target=_run, name="rag-warmup", daemon=True)
     t.start()
@@ -15235,23 +15282,31 @@ def retrieve(
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
-        # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 1500ms) for the
-        # background warmup to set the _local_embedder_ready Event before
-        # falling back to ollama. Rationale: in CLI one-shot, warmup_async
-        # starts ~100-300ms before retrieve but often still hasn't finished
-        # loading bge-m3 when we hit this line. Pre-fix, that gap meant
-        # every CLI query paid the ollama-embed round trip (~150ms × N
-        # variants). With a short blocking wait, we catch warmup
-        # completions that arrive in the 0.5-1.5s window (typical when the
-        # HF cache is warm on disk). Configurable via env — set
-        # `RAG_LOCAL_EMBED_WAIT_MS=0` to restore legacy non-blocking
-        # behaviour, `RAG_LOCAL_EMBED_WAIT_MS=3000` for colder disks.
+        # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 4000ms desde
+        # 2026-04-22) for the background warmup to set the
+        # _local_embedder_ready Event before falling back to ollama.
+        # Rationale: in CLI one-shot, warmup_async starts ~100-300ms
+        # before retrieve. El `_warmup_local_embedder()` tarda ~5s cold
+        # load en MPS + first encode. Post paralelización del warmup
+        # (5 threads vs 1 secuencial), los 5 targets arrancan
+        # simultáneos a t=0 del warmup. El local embed termina a t≈5s.
+        # Con el default histórico de 1500ms el wait timeaba **siempre**
+        # en CLI one-shot → fallback a `embed()` ollama que tampoco
+        # estaba warm (el ollama embed warmup iba detrás del reranker
+        # en la versión secuencial) → cold load ollama 6-12s.
+        # 4000ms cubre el caso normal (warmup paralelo completa a 5s,
+        # main thread llega a retrieve a ~1-2s, wait desde ahí = max 4s
+        # antes del Event fire). Si aún timea, el fallback ollama ya
+        # está warm (otro thread paralelo lo cubrió) → 140ms round-trip.
+        # Configurable via env — `RAG_LOCAL_EMBED_WAIT_MS=0` restaura
+        # legacy non-blocking, `RAG_LOCAL_EMBED_WAIT_MS=6000` para
+        # colder disks donde SentenceTransformer tarda más en cargar.
         try:
             _wait_ms_str = os.environ.get("RAG_LOCAL_EMBED_WAIT_MS")
             _wait_s = (float(_wait_ms_str) / 1000.0
-                       if _wait_ms_str is not None else 1.5)
+                       if _wait_ms_str is not None else 4.0)
         except ValueError:
-            _wait_s = 1.5
+            _wait_s = 4.0
         _local_vecs = (
             query_embed_local(variants, wait_ready_timeout=_wait_s)
             if _local_embed_enabled() else None

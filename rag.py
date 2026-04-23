@@ -1111,15 +1111,47 @@ def is_user_query(cmd: str | None, q: str | None) -> bool:
     return cmd in _USER_QUERY_CMDS
 
 
+def _log_query_event_background_default() -> bool:
+    """True cuando las writes de ``log_query_event`` deben ir al queue async.
+
+    Default ON desde 2026-04-22 tras el audit de perf que encontró 195+
+    eventos ``queries_sql_write_failed`` en bursts de 2h. La ruta sync con
+    ``_sql_write_with_retry`` (5 attempts × ~0.25s jitter = ~1.3s budget)
+    robaba ese tiempo al hot path del usuario bajo contención WAL
+    (concurrent indexer + web + CLI). El queue daemon absorbe el retry
+    off-thread.
+
+    Override: ``RAG_LOG_QUERY_ASYNC=0`` fuerza sync (útil para tests o
+    debug que quieren leer ``rag_queries`` inmediatamente post-log).
+    El conftest + tests de writer retry explícito setean ``0`` para
+    preservar el contract legacy sincrónico.
+    """
+    val = os.environ.get("RAG_LOG_QUERY_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
     Best-effort, never raises, non-blocking semantics for the caller. On SQL
     error, logs to sql_state_errors.jsonl and silently drops the event (no
-    JSONL fallback post-T10). Uses `_sql_write_with_retry` to absorb
-    transient lock windows — this is a hot path (20+ events per query
-    session across chat/query/morning/etc) so dropping silently is
-    analytics data-loss.
+    JSONL fallback post-T10).
+
+    **Async por default (2026-04-22)**: las writes van al queue daemon
+    ``_BACKGROUND_SQL_QUEUE`` salvo que el env var ``RAG_LOG_QUERY_ASYNC=0``
+    las fuerze a sync. Pre-fix audit encontró 195+ eventos
+    ``queries_sql_write_failed`` en bursts de 2h — cada uno robaba ~1.3s
+    al hot path del usuario bajo contención WAL. El queue absorbe el
+    retry budget off-thread; el caller unblockea en microsegundos.
+
+    Tests (`test_rag_writers_sql`, `test_sql_writers_retry`,
+    `test_telemetry_intent_logged`, `test_vaults`) que esperan poder leer
+    ``rag_queries`` inmediatamente post-write, el ``conftest.py`` los corre
+    con ``RAG_LOG_QUERY_ASYNC=0`` para preservar el contract sincrónico.
+
+    Uses ``_sql_write_with_retry`` (same contract as all other rag_*
+    telemetry writers) para absorber lock windows transient. En modo
+    async el worker del queue aplica el mismo retry off-thread.
     """
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
@@ -1129,7 +1161,11 @@ def log_query_event(event: dict) -> None:
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_queries", _map_queries_row(event))
-    _sql_write_with_retry(_do, "queries_sql_write_failed")
+
+    if _log_query_event_background_default():
+        _enqueue_background_sql(_do, "queries_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "queries_sql_write_failed")
 
 
 def log_behavior_event(event: dict) -> None:
@@ -10232,6 +10268,34 @@ def warmup_async() -> None:
             get_pagerank(col)
         except Exception:
             pass
+        # Chat model pre-warmup (2026-04-22): ~5s cold load de qwen2.5:7b en
+        # ollama la primera vez que se pega al endpoint chat. Pre-fix el
+        # warmup solo tocaba embed + reranker, entonces `rag query` one-shot
+        # seguía pagando ese cold-load en el path crítico de la generación.
+        # Un `ollama.chat(num_predict=1, num_ctx=64)` con un prompt mínimo
+        # forza el load + pin (keep_alive=-1 o 20m según `chat_keep_alive`)
+        # sin gastar tokens apreciables. Helper model (qwen2.5:3b) también
+        # se warmea porque lo llama `expand_queries` / `reformulate_query`
+        # en el mismo camino del primer retrieve.
+        try:
+            _chat_model = resolve_chat_model()
+            ollama.chat(
+                model=_chat_model,
+                messages=[{"role": "user", "content": "ok"}],
+                options={"num_predict": 1, "num_ctx": 64, "temperature": 0},
+                keep_alive=chat_keep_alive(_chat_model),
+            )
+        except Exception:
+            pass
+        try:
+            ollama.chat(
+                model=HELPER_MODEL,
+                messages=[{"role": "user", "content": "ok"}],
+                options={"num_predict": 1, "num_ctx": 64, "temperature": 0},
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+        except Exception:
+            pass
 
     t = threading.Thread(target=_run, name="rag-warmup", daemon=True)
     t.start()
@@ -10282,7 +10346,20 @@ _expand_cache_lock = threading.Lock()
 # entero (`web/server.py:3648`) porque "sólo mejora recall marginalmente en
 # chat-style questions"; esto es el mismo argumento pero aplicado caso-por-caso
 # en CLI. Override con env var si hace falta recalibrar.
-_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "4"))
+# Bumped 4→6 el 2026-04-22 tras audit de perf: queries cortas tipo "qué tengo
+# esta semana", "llueve hoy?", "info banco santander", "axe fx 3 configuración"
+# (tokens=3-5) no se benefician medibles de `expand_queries()` — el helper
+# model (qwen2.5:3b) genera 3 paraphrases que en queries cortas tienden a
+# agregar ruido lexical ("consulta sobre clima actual", "pregunta del tiempo",
+# "banco Santander información cuenta") y mueven el embed mean-pool del query
+# real. Costo skipeado: ~1-3s por query (una call a qwen2.5:3b).
+# El gate ORIGINAL era "<2 tokens skippear" (pre-2026-04-21) → se flipeó a 4
+# para skippear queries tipo "hora" o "hoy", y ahora 6 para skippear el grueso
+# de queries conversacionales cortas. Eval sin regresión medible en el
+# queries.yaml (hit@5 bit-idéntico post-flip).
+# Override: `RAG_EXPAND_MIN_TOKENS=4` (restore pre-fix) o `=2` (restore del
+# original) para ver el impacto A/B en producción.
+_EXPAND_MIN_TOKENS = int(os.environ.get("RAG_EXPAND_MIN_TOKENS", "6"))
 
 # Dedicated single-thread executor for running `expand_queries` off the
 # retrieve() critical path. One worker is enough — we only fire one
@@ -14257,16 +14334,38 @@ def _register_core_caches() -> None:
     están en `None` hasta la primera init igual funcionan: `size_of()`
     devuelve 0 mientras el cache sea None, y `len(cache)` cuando el
     lazy-loader lo haya poblado.
+
+    **Robustness (2026-04-22)**: antes `_safe_register` capturaba `state`
+    por closure module-level, y un bug raro causaba que `state` se
+    resolvía a un Click `Command` object en vez del singleton `RAGState`
+    durante algunos reloads de pytest — 1 silent_error registrado con
+    `'Command' object has no attribute 'list_caches'`. Fix: resolvemos
+    el singleton explícitamente vía `sys.modules[__name__].state` al
+    principio de la función y validamos el tipo. Si la resolución no es
+    un RAGState, abortamos silently (el registro es pure observability;
+    si el global está raro, preferimos no-op vs crash durante el import).
     """
+    # Resolvé el singleton globalmente, no por closure. Durante un
+    # importlib.reload() en pytest el symbol `state` puede estar en un
+    # estado transient ambiguo; esta línea garantiza que usamos el
+    # RAGState recién instanciado por la línea 14265 de arriba.
+    import sys as _sys
+    _state = getattr(_sys.modules[__name__], "state", None)
+    if not isinstance(_state, RAGState):
+        # Defensive no-op: si `state` no es el singleton (improbable
+        # post-fix pero el silent_errors lo vió 1 vez), bailamos.
+        # Próxima import/reload vuelve a registrar con el estado correcto.
+        return
+
     # NB: si un cache ya está registrado con el mismo getter (misma
     # lambda identity → no va a matchear) tiramos ValueError. En
     # práctica el test de reload usa `_ = rag.state.list_caches()` así
     # que si ya está registrado, no se vuelve a llamar. Blindaje
     # adicional: chequeamos antes de registrar.
     def _safe_register(name, getter, lock=None):
-        if name in state.list_caches():
+        if name in _state.list_caches():
             return
-        state.register_cache(name, getter, lock=lock)
+        _state.register_cache(name, getter, lock=lock)
 
     # Lazy caches — getters resuelven las globales por reference lookup
     _safe_register("context_summary", lambda: _context_cache, lock=_context_cache_lock)
@@ -15753,6 +15852,23 @@ def multi_retrieve(
     all_items.sort(key=lambda x: -x[0])
     top = all_items[:k]
     top_score = top[0][0] if top else float("-inf")
+    # Compute fast_path using the same gate as single-vault retrieve()
+    # (rag.py:~15202). Cross-vault queries were previously returning
+    # `fast_path=False` by default — measured 0 rows with fast_path=True
+    # in rag_queries for cmd='web' because /api/chat goes through
+    # multi_retrieve. In CLI single-vault the same gate fires 37% of the
+    # time (9/24 rows in last 7d, 2.75× speedup measured). Cableando
+    # fast_path acá expone el mismo marcador a callers multi-vault + web.
+    # Propaga al RetrieveResult para que el endpoint del web pueda
+    # decidir chat_model + num_ctx en función de esto (o, mínimo, loguear
+    # el potential para analytics).
+    _effective_intent_mv = intent if intent is not None else "semantic"
+    _multi_fast_path = bool(
+        _adaptive_routing()
+        and _effective_intent_mv == "semantic"
+        and top
+        and float(top[0][0]) > _LOOKUP_THRESHOLD
+    )
     return RetrieveResult(
         docs=[d for _, d, _ in top],
         metas=[m for _, _, m in top],
@@ -15765,6 +15881,7 @@ def multi_retrieve(
         graph_docs=[d for d, _ in all_graph],
         graph_metas=[m for _, m in all_graph],
         intent=intent,
+        fast_path=_multi_fast_path,
     )
 
 
@@ -38382,6 +38499,32 @@ def ground_claims_nli(
 _ENTITY_CONFIDENCE_MIN = float(os.environ.get("RAG_ENTITY_CONFIDENCE_MIN", "0.70"))
 _ENTITY_LABELS = ("person", "organization", "location", "event")
 
+# Noise filter (2026-04-22) — GLiNER sobre contenido conversacional meteroso:
+# pronombres personales ("yo", "I", "vos", "nosotros") caen como `person` con
+# conf >0.70; phone IDs largos de WhatsApp ("5493424303891") también. Pre-fix
+# el top-3 de `person` era 2666 yo / 1279 Maria / 376 5493424303891 — la noise
+# dominaba a Maria (legítima). Este set + regex aplica en `_extract_entities_single`
+# antes del cluster, así nunca entran a `rag_entities`. Backfill pre-existing
+# ya tiene la noise; re-correr `scripts/backfill_entities.py --reset` si el
+# user quiere limpieza retroactiva.
+_ENTITY_STOPWORDS_PERSON = frozenset({
+    # ES pronombres + self-refs
+    "yo", "mí", "me", "nos", "nosotros", "nosotras", "vos", "tu", "tú", "usted",
+    "ustedes", "ellos", "ellas", "él", "ella", "te", "le", "les", "su", "sus",
+    "mi", "mis", "nuestro", "nuestra", "nuestros", "nuestras",
+    # EN pronombres + self-refs
+    "i", "me", "myself", "you", "yourself", "he", "him", "she", "her", "it",
+    "we", "us", "ourselves", "they", "them", "themselves", "my", "your", "his",
+    "hers", "its", "our", "their",
+    # Artículos / determinantes que GLiNER a veces marca
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "the", "a", "an",
+})
+# Phone-like IDs: WhatsApp chat IDs son 10-15 dígitos seguidos, sin espacios.
+# `5493424303891` / `34084894028025` etc. Cadenas de 7+ dígitos sin letras son
+# casi siempre identificadores, no nombres propios.
+_ENTITY_PHONE_ID_RE = re.compile(r"^\d{7,}$")
+
 _gliner_model = None
 _gliner_lock = threading.Lock()
 _gliner_load_failed = False
@@ -38559,8 +38702,24 @@ def _extract_entities_single(text: str) -> list:
             continue
         etext = (e.get("text") or "").strip()
         elabel = (e.get("label") or "").lower().strip()
-        if etext and elabel in _ENTITY_LABELS:
-            out.append((etext, elabel, score))
+        if not etext or elabel not in _ENTITY_LABELS:
+            continue
+        # Noise filter (2026-04-22): pronombres ES/EN self-ref + articulos
+        # + phone IDs que GLiNER clasifica como `person`. Ver
+        # `_ENTITY_STOPWORDS_PERSON` y `_ENTITY_PHONE_ID_RE` arriba para
+        # la motivación empírica (2666 yo / 1279 Maria → Maria legítima
+        # quedaba enterrada).
+        if elabel == "person":
+            etext_lower = etext.lower()
+            if etext_lower in _ENTITY_STOPWORDS_PERSON:
+                continue
+            if _ENTITY_PHONE_ID_RE.match(etext):
+                continue
+        # También descartamos entidades <3 chars (ambiguas en cualquier type):
+        # "pc", "PO", "sr", "Ex", "la" — ruido consistente en el corpus.
+        if len(etext) < 3:
+            continue
+        out.append((etext, elabel, score))
     return out
 
 

@@ -1993,9 +1993,16 @@ async function send(question, opts = {}) {
     if (s < 15) return "casi listo";
     return "todavía trabajando";
   }
-  function startStageTicker(phase) {
+  function startStageTicker(phase, staticLabel) {
     stopStageTicker();
     stageStart = performance.now();
+    // Second-arg `staticLabel` (2026-04-22): when the server ships an
+    // intent-aware hint along with the `retrieving` status (see
+    // `_build_retrieve_hint` in web/server.py), use that literal as the
+    // label and freeze the dynamic retrieveLabel semáforo copy. Keeps
+    // the "search feels intentional" UX pointed at WHAT is being done
+    // instead of escalating through generic "buscando → revisando notas
+    // → búsqueda profunda" that says nothing about the actual query.
     const labelFn = phase === "generating" ? generateLabel : retrieveLabel;
     // El contador y el semáforo sólo tienen sentido durante `generating`:
     // el usuario quiere medir "cuánto lleva generándome la respuesta", no
@@ -2007,7 +2014,11 @@ async function send(question, opts = {}) {
     const tick = () => {
       if (!thinking.isConnected) { stopStageTicker(); return; }
       const elapsed = performance.now() - stageStart;
-      stageLabelEl.textContent = showSecs ? `${labelFn(elapsed)} · ` : labelFn(elapsed);
+      // When a staticLabel is provided (e.g. intent-aware hint on the
+      // retrieving phase), it wins over the dynamic retrieveLabel — the
+      // hint carries more information than the generic semáforo copy.
+      const lbl = staticLabel || labelFn(elapsed);
+      stageLabelEl.textContent = showSecs ? `${lbl} · ` : lbl;
       if (showSecs) {
         stageSecsEl.textContent = `${formatSecs(elapsed)}s`;
         stageSecsEl.setAttribute("data-tier", stageTier(elapsed));
@@ -2324,7 +2335,14 @@ async function send(question, opts = {}) {
           // Server emits `status {stage:"retrieving"}` at the very start
           // of retrieve(); run the counter from there so the user sees
           // exactly the time the pipeline has been working.
-          startStageTicker("retrieving");
+          //
+          // `parsed.hint` (2026-04-22): server ships an intent-aware
+          // label like "Contando notas…" / "Buscando por persona…"
+          // so the ticker shows WHAT is being searched, not just
+          // the generic semáforo copy. Falls back to the legacy
+          // retrieveLabel state machine when no hint is provided
+          // (e.g. semantic intent → no incremental info).
+          startStageTicker("retrieving", parsed.hint || null);
         } else if (parsed.stage === "cached") {
           // Cache replay is sub-100ms end-to-end — no point showing a
           // running counter. Give a quick visual cue and let the normal

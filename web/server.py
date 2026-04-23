@@ -3849,6 +3849,40 @@ def _retry_pending_conversation_turns() -> int:
     return retried
 
 
+def _build_retrieve_hint(intent: str | None) -> str | None:
+    """Return a human-friendly hint for the SSE `status {stage:"retrieving"}`
+    event based on the classified intent.
+
+    Mapped to short, action-describing strings so the ticker label in the
+    browser tells the user WHAT is being searched — not just that *something*
+    is happening. Generic "semantic" (the default) returns None because it
+    has no incremental info over the existing "buscando…" ticker.
+
+    Intent vocabulary matches `rag.classify_intent` (see `rag.py` for the
+    canonical set). Unknown intents return None — the client falls back to
+    its legacy ticker copy.
+
+    Added 2026-04-22 as a UX-latency fix: measured web retrieve p90 = 25s;
+    during that wait the user had no signal about the retrieval path. The
+    hint closes the gap without changing any actual timing.
+    """
+    if not intent:
+        return None
+    # Keep each hint ≤ 48 chars so it fits the thinking-line in one row
+    # even on mobile. Avoid trailing period — the ticker already suffixes
+    # the elapsed seconds after the label.
+    return {
+        "count":         "Contando notas…",
+        "list":          "Listando notas…",
+        "recent":        "Revisando notas recientes…",
+        "agenda":        "Revisando tu agenda…",
+        "entity_lookup": "Buscando por persona u organización…",
+        "comparison":    "Comparando fuentes…",
+        "synthesis":     "Sintetizando fuentes…",
+        "create":        "Interpretando pedido de creación…",
+    }.get(intent)
+
+
 def _resolve_redo_question(turn_id: str) -> tuple[str | None, str | None]:
     """Resolve the original question from a previous turn_id.
 
@@ -4227,7 +4261,33 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         #      "algo mas sobre ella" → concat produces "tenes notas sobre
         #      Grecia? tenes algo mas sobre ella?" which retrieves the
         #      Grecia notes at top (~+0.20 rerank score).
-        yield _sse("status", {"stage": "retrieving"})
+        # Early intent classification for the `retrieving` hint.
+        # `classify_intent` is pure regex, sub-millisecond. Paying it once
+        # extra here buys us a contextual hint for the user — "Contando
+        # notas…" / "Buscando por persona u organización…" etc — instead
+        # of the generic ticker label. Zero-latency UX win on the ~2-10s
+        # retrieve window.
+        #
+        # Gap addressed: measured p50 web retrieve = 2.8s, p90 = 25s.
+        # Before, the user stared at "buscando…" without knowing WHAT was
+        # being searched. Now the status label reflects the actual intent
+        # path the retriever will take, so long waits feel less opaque.
+        _early_intent = None
+        _early_hint = None
+        try:
+            import rag as _rag_mod_hint
+            _early_intent, _ = _rag_mod_hint.classify_intent(
+                question, set(), set(),
+            )
+            _early_hint = _build_retrieve_hint(_early_intent)
+        except Exception:
+            pass
+        _retrieving_status = {"stage": "retrieving"}
+        if _early_hint:
+            _retrieving_status["hint"] = _early_hint
+        if _early_intent:
+            _retrieving_status["intent"] = _early_intent
+        yield _sse("status", _retrieving_status)
 
         _t_reform_start = time.perf_counter()
         # Follow-up resolution: antes llamábamos a reformulate_query (qwen2.5:3b,
@@ -5104,6 +5164,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "llm_prefill_ms": int(_t_llm_prefill_ms),
             "llm_decode_ms": int(_t_llm_decode_ms),
             "total_ms": int(_t_total_ms),
+            # fast_path marker (Improvement #3): True when adaptive routing
+            # judged the query eligible for the small-model fast path
+            # (semantic intent + top-1 rerank > 0.6). Today `/api/chat`
+            # does NOT yet switch to _LOOKUP_MODEL when this fires — the
+            # web endpoint is still on the default chat model. Logging
+            # the marker lets us measure the potential speedup in
+            # production (CLI data shows 8.5s → 3.1s = 2.75× on fast-path
+            # hits). When the endpoint is wired to honour it, this same
+            # column surfaces the realised gain.
+            "fast_path": bool(result.get("fast_path", False)),
         })
 
         yield _sse("done", {

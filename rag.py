@@ -40617,6 +40617,214 @@ def _collect_env_var_names_from_source() -> set[str]:
 # rag_learned_paraphrases table from historical feedback so
 # expand_queries() can skip the LLM call when we have signal.
 
+# ── `rag context` subgroup (Feature #11 del 2026-04-23) ─────────────────
+# Token budget tracking + context inspection tools. Complementa
+# `session_summary()` (que ya comprime turns viejos) dando visibilidad
+# de cuánto context se está usando en cada componente del prompt.
+#
+# Utility helpers:
+#   _estimate_tokens(text): ~chars/4 rule, ajustable por env.
+#   _context_budget_status(est, num_ctx): dict con ratio + warning level.
+#
+# CLI:
+#   rag context estimate "<texto>"   → token count estimado
+#   rag context budget               → session-aware budget check
+#                                     (con --session ID específico)
+
+_TOKENS_PER_CHAR = float(os.environ.get("RAG_TOKENS_PER_CHAR", "0.25"))
+_CONTEXT_BUDGET_WARN = float(os.environ.get("RAG_CONTEXT_BUDGET_WARN", "0.80"))
+
+
+def _estimate_tokens(text: str | None) -> int:
+    """Estimate token count for a string. Rule of thumb: ~4 chars per token
+    for English/Spanish mix with tokenizers like BPE.
+
+    Tunable via RAG_TOKENS_PER_CHAR (default 0.25 = 4 chars/token).
+    Returns 0 for empty/None.
+
+    Not exact — for precise counts use tiktoken or the model's tokenizer.
+    This is for budget-tracking observability, not enforcement.
+    """
+    if not text:
+        return 0
+    return int(len(text) * _TOKENS_PER_CHAR) + 1
+
+
+def _context_budget_status(est_tokens: int, num_ctx: int = 4096) -> dict:
+    """Classify a prompt by context-budget utilization.
+
+    Returns:
+      {
+        "tokens_est": int,
+        "num_ctx": int,
+        "ratio": float in [0, ...],
+        "level": "ok" | "warn" | "over",
+      }
+
+    level:
+      - "ok"   : ratio < _CONTEXT_BUDGET_WARN (default 0.80)
+      - "warn" : ratio in [warn, 1.0)
+      - "over" : ratio >= 1.0 — prompt excede el num_ctx, truncation
+                 will happen.
+    """
+    num_ctx = max(1, int(num_ctx))
+    tokens_est = max(0, int(est_tokens))
+    ratio = tokens_est / num_ctx
+    if ratio >= 1.0:
+        level = "over"
+    elif ratio >= _CONTEXT_BUDGET_WARN:
+        level = "warn"
+    else:
+        level = "ok"
+    return {
+        "tokens_est": tokens_est,
+        "num_ctx": num_ctx,
+        "ratio": round(ratio, 3),
+        "level": level,
+    }
+
+
+@cli.group()
+def context():
+    """Context budget + session inspection helpers.
+
+    Utilidades para debug de sesiones largas: ¿cuántos tokens pesan mis
+    turns? ¿estoy cerca del num_ctx? ¿vale la pena /save una sesión?
+
+    Comandos:
+      - `rag context estimate "texto"`: token count estimado de un string.
+      - `rag context budget --session SID`: chequeo de budget sobre una
+        sesión específica.
+    """
+
+
+@context.command("estimate")
+@click.argument("text_arg", required=False, default="")
+@click.option("--file", "file_arg", type=click.Path(exists=True),
+              default=None, help="Estimar desde un archivo.")
+@click.option("--num-ctx", default=4096, show_default=True,
+              help="Context window model-specific para calcular ratio.")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON.")
+def context_estimate(
+    text_arg: str, file_arg: str | None, num_ctx: int, as_json: bool,
+):
+    """Estimar token count de un texto + clasificar vs num_ctx.
+
+    Ejemplos:
+      rag context estimate "mi query de prueba"
+      rag context estimate --file prompt.txt --num-ctx 8192
+      echo "texto stdin" | rag context estimate
+    """
+    if file_arg:
+        try:
+            text = Path(file_arg).read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            console.print(f"[red]Error leyendo {file_arg}: {exc!r}[/red]")
+            return
+    elif text_arg:
+        text = text_arg
+    else:
+        # Leer de stdin si disponible.
+        import sys
+        if not sys.stdin.isatty():
+            text = sys.stdin.read()
+        else:
+            click.echo("Usage: rag context estimate \"<texto>\" | --file PATH "
+                       "| stdin", err=True)
+            return
+    tokens = _estimate_tokens(text)
+    budget = _context_budget_status(tokens, num_ctx)
+    if as_json:
+        click.echo(json.dumps({
+            "chars": len(text), **budget,
+        }))
+        return
+    console.print()
+    color = {"ok": "green", "warn": "yellow", "over": "red"}[budget["level"]]
+    console.print(f"[bold]Token estimate[/bold]")
+    console.print(f"  chars:    {len(text):,}")
+    console.print(f"  tokens:   [cyan]~{tokens:,}[/cyan]")
+    console.print(f"  num_ctx:  {num_ctx:,}")
+    console.print(f"  ratio:    [{color}]{budget['ratio'] * 100:.1f}%[/{color}]  "
+                  f"({budget['level']})")
+    console.print()
+
+
+@context.command("budget")
+@click.option("--session", "session_id", default=None,
+              help="Session ID. Default: última sesión activa.")
+@click.option("--num-ctx", default=4096, show_default=True,
+              help="Context window asumido.")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON.")
+def context_budget(session_id: str | None, num_ctx: int, as_json: bool):
+    """Chequear el presupuesto de context de una sesión actual.
+
+    Suma los tokens estimados de todos los turns de la sesión + el
+    summary comprimido (si existe) y reporta utilización vs num_ctx.
+    Útil antes de correr `rag chat --resume SID` sobre una sesión
+    cargada para prever si va a haber truncation.
+    """
+    sid = session_id or last_session_id()
+    if not sid:
+        console.print("[dim]Sin sesión activa.[/dim]")
+        return
+    sess = load_session(sid)
+    if not sess:
+        console.print(f"[red]Sesión no encontrada: {sid}[/red]")
+        return
+    turns = sess.get("turns") or []
+    total_chars = 0
+    per_turn: list[dict] = []
+    for i, t in enumerate(turns):
+        q = t.get("q") or ""
+        a = t.get("a") or ""
+        tc = len(q) + len(a)
+        total_chars += tc
+        per_turn.append({
+            "idx": i,
+            "chars": tc,
+            "tokens_est": _estimate_tokens(q + a),
+        })
+    summary_text = (sess.get("compressed_history") or {}).get("summary", "")
+    summary_tokens = _estimate_tokens(summary_text)
+    total_tokens = _estimate_tokens("x" * total_chars) + summary_tokens
+    budget = _context_budget_status(total_tokens, num_ctx)
+
+    if as_json:
+        click.echo(json.dumps({
+            "session": sid,
+            "n_turns": len(turns),
+            "summary_tokens": summary_tokens,
+            "total_tokens": total_tokens,
+            "per_turn": per_turn,
+            **budget,
+        }))
+        return
+
+    console.print()
+    color = {"ok": "green", "warn": "yellow", "over": "red"}[budget["level"]]
+    console.print(f"[bold]Session budget:[/bold] {sid}")
+    console.print(f"  turns: [cyan]{len(turns)}[/cyan]  "
+                  f"| summary: {summary_tokens:,} tok  "
+                  f"| total: [cyan]~{total_tokens:,}[/cyan] tok")
+    console.print(f"  budget: [{color}]{budget['ratio']*100:.1f}%[/{color}] "
+                  f"of num_ctx={num_ctx:,}  ({budget['level']})")
+    if budget["level"] == "warn":
+        console.print("  [yellow]Próximo al límite — considerá /save o "
+                      "`rag session cleanup`.[/yellow]")
+    elif budget["level"] == "over":
+        console.print("  [red]Excede num_ctx — vas a ver truncation. "
+                      "Correr /save + iniciar sesión nueva.[/red]")
+    console.print()
+
+
+# ── `rag paraphrases` subgroup (Feature #9 del 2026-04-23) ──────────────
+# Training + inspection for learned paraphrases. Populates the
+# rag_learned_paraphrases table from historical feedback so
+# expand_queries() can skip the LLM call when we have signal.
+
 @cli.group()
 def paraphrases():
     """Learned paraphrases desde feedback — train, stats, clear.

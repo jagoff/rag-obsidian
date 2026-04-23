@@ -11078,7 +11078,21 @@ _INTENT_ENTITY_LOOKUP_RE = re.compile(
     r"qu[eé]\s+(?:dice|dijo|me\s+dijo)\s+\w+\s+(?:sobre|de|acerca\s+de)|"
     r"todo\s+lo\s+(?:de|sobre|que\s+tengo\s+de)\s+\w+|"
     r"todos?\s+los?\s+(?:mensajes?|mails?|notas?|chats?|correos?)\s+(?:de|con)\s+\w+|"
-    r"(?:mensajes?|mails?|notas?|chats?|correos?|conversaciones?)\s+(?:de|con)\s+\w+"
+    r"(?:mensajes?|mails?|notas?|chats?|correos?|conversaciones?)\s+(?:de|con)\s+\w+|"
+    # 2026-04-22: "tell me about X" — frases canónicas para queries
+    # person-centric que dominan el tráfico natural. Measured 2026-04-22
+    # (Fer F. benchmark): "que sabes de Astor?" ruteaba a `semantic` y
+    # tomaba 7.7s (retrieve + rerank + LLM) cuando el handler directo
+    # (handle_entity_lookup) resuelve en ~200ms via SQL + metas sort.
+    # Handler self-gated: si la entidad no existe en rag_entities,
+    # returns [] y el caller cae a semantic → "que sabés de React?"
+    # sigue funcionando como semantic con ~+10ms extra del fallback.
+    r"qu[eé]\s+sab[eé]s?\s+(?:de|sobre|acerca\s+de)\s+\w+|"
+    r"qu[eé]\s+conoc[eé]s?\s+(?:de|sobre|acerca\s+de)\s+\w+|"
+    r"cont[aá]me\s+(?:de|sobre|acerca\s+de)\s+\w+|"
+    r"habl[aá]me\s+(?:de|sobre|acerca\s+de)\s+\w+|"
+    r"dec[ií]me\s+(?:de|sobre|acerca\s+de)\s+\w+|"
+    r"informaci[oó]n\s+(?:de|sobre|acerca\s+de)\s+\w+"
     r")",
     re.IGNORECASE,
 )

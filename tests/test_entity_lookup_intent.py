@@ -30,6 +30,26 @@ FOLDERS: set[str] = set()
     "notas de erica",
     "conversaciones con max",
     "correos de seba",
+    # 2026-04-22: patrones canónicos de "tell me about person" que faltaban.
+    # Son frases que dominan las queries naturales sobre personas; sin estas
+    # reglas el classifier los mandaba a `semantic`, gastando 7-8s en
+    # retrieve+LLM cuando el handler directo (SQL + metas sort) resuelve en
+    # ~200ms. Handler self-gated: si la entidad no existe en rag_entities,
+    # returns [] y el caller cae a semantic igual — sin regresión funcional
+    # para queries sobre temas abstractos ("qué sabés de React").
+    "que sabes de Astor",
+    "que sabés de Fernando",
+    "qué sabes de max?",
+    "qué sabés de juli?",
+    "contame de fernando",
+    "contame sobre seba",
+    "contame acerca de juan",
+    "hablame de max",
+    "hablame sobre fernando",
+    "decime de juan",
+    "decime sobre max",
+    "información de fernando",
+    "informacion sobre max",
 ])
 def test_entity_lookup_fires(q):
     intent, _ = rag.classify_intent(q, TAGS, FOLDERS)

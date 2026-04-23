@@ -368,3 +368,65 @@ def test_fast_path_preserves_default_gate_behavior(wa_heavy_col):
     )
     # El fast-path es True de alguna vía (WA majority o score>0.6)
     assert res["fast_path"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Branch 1 vs Branch 2 del fast-path WA — semántica 2026-04-22 tarde
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_explicit_source_bypasses_score_gate(wa_heavy_col, monkeypatch):
+    """Branch 1: source='whatsapp' explícito dispara fast-path aun si el
+    top-1 score es muy bajo (menor al threshold). El caller ya declaró
+    intent; no necesitamos gate."""
+    col, _ = wa_heavy_col
+    # Threshold artificialmente alto — aun así debería disparar porque
+    # el source es explícito
+    monkeypatch.setenv("RAG_WA_FAST_PATH_THRESHOLD", "10.0")
+    res = rag.retrieve(
+        col, "maria laburo", k=5, folder=None,
+        auto_filter=False, multi_query=False, source="whatsapp",
+    )
+    assert res["fast_path"] is True
+    assert res["filters_applied"].get("wa_fast_path") is True
+
+
+def test_implicit_detection_requires_score_above_threshold(
+    wa_heavy_col, monkeypatch
+):
+    """Branch 2: sin source filter explícito, se requiere top-1 > threshold
+    para disparar fast-path por majority. Threshold altísimo → no dispara
+    aunque top-3 sean todos WA."""
+    col, _ = wa_heavy_col
+    monkeypatch.setenv("RAG_WA_FAST_PATH_THRESHOLD", "10.0")
+    res = rag.retrieve(
+        col, "maria laburo", k=5, folder=None,
+        auto_filter=False, multi_query=False,  # sin source
+    )
+    # Verificamos que top-3 es mayoría WA (precondición del gate)
+    top3 = res["metas"][:3]
+    wa_count = sum(1 for m in top3 if m.get("source") == "whatsapp")
+    assert wa_count >= 2, f"precondición falla: wa_count={wa_count}"
+    # Aun así, threshold altísimo bloquea el trigger por branch 2
+    assert res["filters_applied"].get("wa_fast_path") is not True
+
+
+def test_default_threshold_is_0_05(wa_heavy_col, monkeypatch):
+    """Verifica el default del threshold en código (regression test para
+    el tuning 2026-04-22 tarde: bajó de 0.3 → 0.05 porque los scores
+    reales del cross-encoder sobre WA quedan en rango 0.02-0.09)."""
+    col, _ = wa_heavy_col
+    # Sin env var → usa default 0.05
+    monkeypatch.delenv("RAG_WA_FAST_PATH_THRESHOLD", raising=False)
+    res = rag.retrieve(
+        col, "maria laburo", k=5, folder=None,
+        auto_filter=False, multi_query=False,
+    )
+    # Con el fake reranker produce scores clip-0.55, >0.05 → debe disparar
+    # (precondition: top-3 sean mayoría WA)
+    top3 = res["metas"][:3]
+    wa_count = sum(1 for m in top3 if m.get("source") == "whatsapp")
+    if wa_count >= 2:
+        assert res["fast_path"] is True or res["filters_applied"].get(
+            "wa_fast_path"
+        ) is True

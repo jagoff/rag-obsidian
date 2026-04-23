@@ -8294,6 +8294,31 @@ def _normalize_fm_tags(fm: dict) -> list[str]:
     return [s] if s else []
 
 
+def _normalize_fm_aliases(fm: dict) -> list[str]:
+    """Normalize frontmatter ``aliases:`` to list[str].
+
+    Obsidian accepts the list form (``aliases: [Maru, Marucha]``), the YAML
+    block list (``aliases:\\n  - Maru\\n  - Marucha``, which PyYAML already
+    hydrates into a Python list), and the scalar form (``aliases: Maru``).
+    Generalized post 2026-04-22 — before this, the aliases parser only ran
+    inside ``99-Mentions/`` dossiers, so a vault note with ``aliases:`` in
+    the FM lost that signal at retrieval time.
+
+    Treats ``aliases``, ``alias`` (singular) as equivalent keys since both
+    appear in the wild."""
+    raw = fm.get("aliases")
+    if raw is None:
+        raw = fm.get("alias")
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [s for a in raw if (s := str(a).strip())]
+    # Scalar string: treat as a single alias (no comma-splitting — aliases
+    # commonly contain commas in "Last, First" form).
+    s = str(raw).strip()
+    return [s] if s else []
+
+
 def extract_frontmatter_tags(text: str) -> list[str]:
     """Extract tags list from YAML frontmatter (kept for backwards compat)."""
     return _normalize_fm_tags(parse_frontmatter(text))
@@ -8328,8 +8353,270 @@ def extract_wikilinks(text: str) -> list[str]:
     return seen
 
 
-def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str:
-    """Build the embedding prefix combining path, frontmatter fields, and tags."""
+# Inline Obsidian tag `#tag` — same character class as the query-side regex
+# at rag.py:3258 (infer_filters). Pre-2026-04-22 this was only matched in
+# queries; the indexer ignored body-level `#tag` usage entirely, leaving
+# "journal with #idea inline" invisible to tag filtering + embedding.
+_INLINE_TAG_RE = re.compile(r"(?<![\w`/])#([A-Za-zÀ-ÿ0-9_][A-Za-zÀ-ÿ0-9_\-/]{1,})")
+# Strip backtick-fenced code (```…```) and inline code (`…`) before scanning
+# so `#include`, `#!/bin/bash`, `#define`, etc. don't pollute the tag set.
+_FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def extract_inline_tags(text: str) -> list[str]:
+    """Return Obsidian-style inline tags from markdown body, order preserved,
+    deduped. Ignores tags inside fenced or inline code blocks and refuses to
+    treat markdown headers (`# H1`, `## H2`) as tags (the lookbehind requires
+    a non-word char *other than whitespace* before the `#`, so `\\n# H1` is
+    rejected because the `H` is followed by a space — `# H` is a header, not
+    `#H`).
+
+    Obsidian tag conventions (https://help.obsidian.md/tags):
+      - `#tag`, `#tag-with-dash`, `#group/subgroup`, `#a1b2`
+      - Must start with a letter or underscore (digit-only → rejected)
+      - Can contain letters, digits, `_`, `-`, `/`
+      - Min 2 chars after the `#` (same floor as the query-side regex)
+    """
+    # Strip code before scanning.
+    scrub = _FENCED_CODE_RE.sub("", text)
+    scrub = _INLINE_CODE_RE.sub("", scrub)
+    seen: list[str] = []
+    for m in _INLINE_TAG_RE.finditer(scrub):
+        tag = m.group(1).strip()
+        # Header guard: if what follows the `#` is a single token and the
+        # original match was at column 0 preceded by a newline (or start),
+        # we still want it — the lookbehind already requires non-whitespace.
+        # The remaining case is markdown headers: `# H1` → after `#` there's
+        # a space, so the regex wouldn't match (needs `#\w`). Good.
+        if not tag or tag in seen:
+            continue
+        # Reject digit-only tags (Obsidian rejects these too).
+        stripped = tag.replace("-", "").replace("_", "").replace("/", "")
+        if stripped.isdigit():
+            continue
+        seen.append(tag)
+    return seen
+
+
+# Task checkbox detection — handles bullet styles (`-`, `*`, `+`) and
+# numbered lists (`1.`, `2)`), any indent depth, and both lowercase `[x]`
+# + uppercase `[X]` for done. The captured group distinguishes open vs done.
+_TASK_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s+\[([ xX])\]\s+(.+?)\s*$",
+    re.MULTILINE,
+)
+
+# Max # of open task bodies we surface to the embedding prefix. Keeps the
+# prefix from ballooning on notes like "lista de 100 pendientes".
+_TASKS_TEXT_CAP = 10
+# Per-task body trimmed to this many chars in the prefix — enough to be
+# semantically useful, short enough to avoid domination.
+_TASK_TEXT_CHARS = 80
+
+
+def extract_tasks(body: str) -> dict:
+    """Parse Obsidian / GFM task list items. Returns
+    ``{"open": int, "done": int, "texts": [str, ...]}``.
+
+    ``texts`` is the ordered list of the first N open-task bodies (up to
+    ``_TASKS_TEXT_CAP``), trimmed per-item to ``_TASK_TEXT_CHARS``. Done
+    tasks never enter ``texts`` — they're fulfilled, not pending, and
+    including them would bias "qué tengo pendiente?" retrieval toward
+    completed items.
+    """
+    open_ct = 0
+    done_ct = 0
+    texts: list[str] = []
+    for m in _TASK_RE.finditer(body):
+        mark = m.group(1)
+        content = m.group(2).strip()
+        if mark == " ":
+            open_ct += 1
+            if content and len(texts) < _TASKS_TEXT_CAP:
+                texts.append(content[:_TASK_TEXT_CHARS])
+        else:
+            done_ct += 1
+    return {"open": open_ct, "done": done_ct, "texts": texts}
+
+
+# Frontmatter generalization — fields to skip from the embedded prefix
+# because they're plugin/internal noise, not user intent. Extends the
+# original FM_SEARCHABLE_FIELDS allowlist with a blacklist pattern:
+# anything that starts with `_`, plus common noisy keys.
+#
+# The original `FM_SEARCHABLE_FIELDS` allowlist is kept — those fields
+# render as `key=value` in the prefix for backward compat. Everything
+# NOT in the allowlist / blacklist / already-handled set falls through
+# the generalized path below (`_FM_GENERIC_FIELDS_IN_PREFIX`).
+_FM_BLACKLIST = frozenset({
+    # Obsidian internal (plugin state, positions, etc.)
+    "position", "id", "uuid",
+    # Obsidian core already-handled keys — extracted explicitly, no need
+    # to duplicate them in the generic pass.
+    "tags", "aliases", "related", "cssclass", "cssclasses", "publish",
+    # Fields with structured meaning for the RAG pipeline (handled elsewhere)
+    "contradicts", "archived_at", "archived_from", "archived_reason",
+    # Hashes / IDs / timestamps that won't help semantic match
+    "hash", "sha", "md5", "checksum",
+})
+# Per-value cap to stop a single field from dominating the prefix.
+_FM_VALUE_CHARS = 200
+# Total cap across all generic FM fields (hard budget — once we exhaust
+# this the rest are dropped). Keeps a pathological YAML blob from
+# exploding the embedding context.
+_FM_GENERIC_BUDGET = 800
+
+
+def _format_fm_value(v) -> str | None:
+    """Render a frontmatter value for inclusion in the prefix.
+
+    Rules:
+      - ``None``, empty string → ``None`` (caller skips the field)
+      - scalar (str/int/float/bool) → ``str(v)`` capped at ``_FM_VALUE_CHARS``
+      - list/tuple → comma-joined string-rendered elements, capped
+      - dict / other → ``None`` (not worth the complexity)
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        s = str(v).strip()
+        if not s:
+            return None
+        return s[:_FM_VALUE_CHARS]
+    if isinstance(v, (list, tuple)):
+        parts: list[str] = []
+        for item in v:
+            if item is None:
+                continue
+            if isinstance(item, (str, int, float, bool)):
+                s = str(item).strip()
+                if s:
+                    parts.append(s)
+        if not parts:
+            return None
+        return ", ".join(parts)[:_FM_VALUE_CHARS]
+    return None
+
+
+# Wikilink expansion — opt-in via `RAG_WIKILINK_EXPANSION=1`. When active,
+# the indexer looks up each outlink target file inside the vault, reads
+# the first ~200 chars of its cleaned body, and concatenates them to the
+# caller's prefix as `Relacionada [[Target]]: <resumen>`. Caps below stop
+# a hub note with 50 links from exploding the prefix.
+_WIKILINK_EXPANSION_N = 5           # max targets expanded per chunk prefix
+_WIKILINK_SUMMARY_CHARS = 160       # per-target snippet size
+_WIKILINK_TOTAL_BUDGET = 1200       # hard cap across all expansions
+
+
+def _wikilink_expansion_enabled() -> bool:
+    return os.environ.get("RAG_WIKILINK_EXPANSION", "").strip().lower() in {
+        "1", "true", "yes",
+    }
+
+
+def _resolve_wikilink_target(title: str, vault_root: Path) -> Path | None:
+    """Find a `.md` file in the vault whose stem matches ``title``.
+
+    Obsidian wikilink resolution is stem-based (case-insensitive on macOS).
+    We match case-insensitive and prefer shorter paths when multiple
+    candidates exist (vault-root > nested folder > archive).
+    """
+    if not title:
+        return None
+    wanted = title.strip().lower()
+    best: Path | None = None
+    best_depth = 10**9
+    try:
+        for p in vault_root.rglob(f"{title}.md"):
+            if p.stem.lower() != wanted:
+                continue
+            depth = len(p.relative_to(vault_root).parts)
+            if depth < best_depth:
+                best = p
+                best_depth = depth
+    except OSError:
+        return None
+    if best is not None:
+        return best
+    # Case-insensitive fallback (rglob is case-sensitive on non-APFS mounts).
+    try:
+        for p in vault_root.rglob("*.md"):
+            if p.stem.lower() == wanted:
+                depth = len(p.relative_to(vault_root).parts)
+                if depth < best_depth:
+                    best = p
+                    best_depth = depth
+    except OSError:
+        pass
+    return best
+
+
+def _wikilink_expansion_bits(
+    outlinks: list[str], vault_root: Path | None, self_path: Path | None,
+) -> list[str]:
+    """Build `Relacionada [[Title]]: <snippet>` lines for up to N outlinks.
+
+    Gracefully skips missing targets, cyclic self-links, and files that
+    fail to read. Bounded by `_WIKILINK_EXPANSION_N` items and
+    `_WIKILINK_TOTAL_BUDGET` total chars.
+    """
+    if not outlinks or vault_root is None:
+        return []
+    bits: list[str] = []
+    budget = _WIKILINK_TOTAL_BUDGET
+    for title in outlinks[: _WIKILINK_EXPANSION_N * 3]:  # headroom for skips
+        if len(bits) >= _WIKILINK_EXPANSION_N or budget <= 0:
+            break
+        target = _resolve_wikilink_target(title, vault_root)
+        if target is None:
+            continue
+        if self_path is not None and target.resolve() == self_path.resolve():
+            continue  # self-link — skip
+        try:
+            raw = target.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        # Strip frontmatter + wikilinks for a clean text preview; collapse
+        # whitespace so the snippet is a single-line blurb.
+        body = clean_md(raw)
+        body = re.sub(r"\s+", " ", body).strip()
+        if not body:
+            continue
+        snippet = body[:_WIKILINK_SUMMARY_CHARS]
+        line = f"Relacionada [[{title}]]: {snippet}"
+        if len(line) > budget:
+            line = line[:budget]
+        bits.append(line)
+        budget -= len(line)
+    return bits
+
+
+def build_prefix(
+    note_title: str, folder: str, tags: list[str], fm: dict,
+    *,
+    aliases: list[str] | None = None,
+    task_stats: dict | None = None,
+    wikilink_bits: list[str] | None = None,
+) -> str:
+    """Build the embedding prefix combining path, frontmatter fields, and tags.
+
+    Additions (post 2026-04-22 indexing-extras pass):
+      - ``aliases``: surfaced right after the note title so queries using
+        informal nicknames (``Marucha`` vs the file ``Maria.md``) still
+        semantic-match.
+      - Generalized frontmatter: all string/list-valued FM keys outside
+        the legacy ``FM_SEARCHABLE_FIELDS`` allowlist and the
+        ``_FM_BLACKLIST`` are surfaced as ``key=value`` (capped per
+        ``_FM_VALUE_CHARS`` and total ``_FM_GENERIC_BUDGET``).
+      - ``task_stats``: ``{"open": n, "done": n, "texts": [...]}`` from
+        :func:`extract_tasks`. If ``open > 0`` the prefix carries a
+        ``Tareas abiertas: N`` hint plus the first few task bodies so
+        "qué tengo pendiente?" peeks them via embedding.
+      - ``wikilink_bits``: pre-computed ``Relacionada [[X]]: summary``
+        lines (opt-in via ``RAG_WIKILINK_EXPANSION``); the resolver runs
+        in ``_index_single_file`` and passes the result through.
+    """
     fm_bits = []
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
@@ -8349,12 +8636,56 @@ def build_prefix(note_title: str, folder: str, tags: list[str], fm: dict) -> str
         if rel_titles:
             fm_bits.append("related=" + ", ".join(rel_titles))
 
+    # Generalized frontmatter pass — any custom key that isn't handled
+    # explicitly above nor blacklisted. Respects a total char budget so
+    # pathological YAML blobs can't dominate the prefix.
+    handled = set(FM_SEARCHABLE_FIELDS) | _FM_BLACKLIST
+    generic_budget = _FM_GENERIC_BUDGET
+    for key, val in fm.items():
+        if not isinstance(key, str) or key.startswith("_"):
+            continue
+        if key in handled:
+            continue
+        formatted = _format_fm_value(val)
+        if formatted is None:
+            continue
+        fragment = f"{key}={formatted}"
+        if len(fragment) > generic_budget:
+            break
+        fm_bits.append(fragment)
+        generic_budget -= len(fragment)
+        if generic_budget <= 0:
+            break
+
     header = f"[{folder} | {note_title}"
+    # Aliases: embed informal forms ("Marucha", "Johnny") so queries
+    # using them still match the canonical note. Cheap — 1-3 extra tokens.
+    if aliases:
+        alias_str = ", ".join(aliases[:8])
+        header += f" | aliases={alias_str}"
     if fm_bits:
         header += " | " + " ".join(fm_bits)
     header += "]"
     if tags:
         header += " " + " ".join(f"#{t}" for t in tags)
+
+    # Task hint — surfaces open-task count + first N task bodies so
+    # "qué tengo pendiente?" embedding finds notes with actual pending
+    # work, not just notes that mention tasks in passing.
+    if task_stats:
+        n_open = int(task_stats.get("open") or 0)
+        if n_open > 0:
+            lines = [f"Tareas abiertas: {n_open}"]
+            for t in (task_stats.get("texts") or [])[:_TASKS_TEXT_CAP]:
+                lines.append(f"- {t}")
+            header += "\n" + "\n".join(lines)
+
+    # Wikilink expansion (opt-in) — append each expanded target as its
+    # own line so the embedder sees the summary tokens adjacent to the
+    # caller's body.
+    if wikilink_bits:
+        header += "\n" + "\n".join(wikilink_bits)
+
     return header
 
 
@@ -8390,14 +8721,31 @@ def semantic_chunks(
     text: str, note_title: str, folder: str, tags: list[str], fm: dict,
     context_summary: str = "",
     synthetic_questions: list[str] | None = None,
+    *,
+    aliases: list[str] | None = None,
+    task_stats: dict | None = None,
+    wikilink_bits: list[str] | None = None,
 ) -> list[tuple[str, str, str]]:
     """
     Split text into semantic chunks.
     Returns list of (embed_text, display_text, parent_text).
     Short notes (< MIN_CHUNK) emit one chunk with just the prefix + body so they
     are still retrievable.
+
+    Keyword-only extensions (post 2026-04-22 indexing-extras pass):
+      - ``aliases``: frontmatter ``aliases:`` list, threaded into the prefix
+        so informal nicknames match the canonical note.
+      - ``task_stats``: output of :func:`extract_tasks`; when present and
+        non-trivial, seeds a ``Tareas abiertas: N`` hint.
+      - ``wikilink_bits``: pre-resolved ``Relacionada [[X]]: summary`` lines
+        (opt-in via ``RAG_WIKILINK_EXPANSION``).
     """
-    prefix = build_prefix(note_title, folder, tags, fm)
+    prefix = build_prefix(
+        note_title, folder, tags, fm,
+        aliases=aliases,
+        task_stats=task_stats,
+        wikilink_bits=wikilink_bits,
+    )
     # Synthetic questions: bias the chunk embedding toward question-shaped
     # queries that this note answers. Prepended BEFORE the context summary so
     # question tokens sit near the top of the embedding window.
@@ -9957,11 +10305,13 @@ def get_reranker():
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
     auto-detect falls back to CPU in some venvs, costing ~3× on rerank.
 
-    NOTE (2026-04-13): fp16 on MPS reportedly broke bge-reranker-v2-m3
-    (collapsed all scores to ~0.001). `RAG_RERANKER_FP16=1` opt-ins into
-    a post-load `.half()` conversion so we can A/B re-verify whether that
-    regression still reproduces on current torch/sentence-transformers —
-    default stays fp32 until we have clean eval numbers.
+    NOTE: fp16 on MPS is NOT a win for bge-reranker-v2-m3. Two A/Bs so far:
+      - 2026-04-13: post-load `.half()` collapsed all scores to ~0.001.
+      - 2026-04-22: model_kwargs={"torch_dtype": torch.float16} kept quality
+        intact (singles hit@5 identical, MRR +0.009 within CI) but wall-time
+        on 60 queries went 63s → 121s (~2× slower). MPS does not have
+        efficient fp16 kernels for the xlm-roberta backbone — the dtype
+        cast overhead dominates. Keep fp32. See CLAUDE.md §Eval baselines.
 
     Thread-safe: el warmup async lo toca en paralelo con el path principal.
     Also records last-use timestamp so `maybe_unload_reranker()` can evict
@@ -9990,16 +10340,6 @@ def get_reranker():
             device = "cpu"
         model_path = _resolve_reranker_model_path()
         _reranker = CrossEncoder(model_path, max_length=512, device=device)
-        # Optional fp16 conversion on MPS. Behind `RAG_RERANKER_FP16`
-        # (default OFF) while we A/B the latency-vs-quality trade-off.
-        # Post-load `.half()` is safer than passing torch_dtype into the
-        # CrossEncoder constructor (no risk of mismatched projection-head
-        # dtypes if the model_kwargs path changes shape in future ST).
-        if os.environ.get("RAG_RERANKER_FP16", "").strip().lower() in ("1", "true", "yes"):
-            try:
-                _reranker.model = _reranker.model.half()
-            except Exception as exc:
-                _silent_log("reranker_fp16_convert_failed", exc)
     return _reranker
 
 
@@ -15358,24 +15698,43 @@ def retrieve(
     # WhatsApp fast-path (2026-04-22): queries that resolve predominantly
     # to WhatsApp chunks are conversational lookups — simple information
     # retrieval against literal message text. The default gate rarely
-    # fires for them because rerank scores on short chat fragments land
-    # in [0.3, 0.6] (noisy conversation dampens the cross-encoder
-    # confidence) — well above the meaningful-signal floor but below the
-    # generic 0.6 threshold. Measured 2026-04-22: queries where top-1 is
-    # WhatsApp had avg gen 16.3s and p95 gen 37.9s because they fell to
-    # the full pipeline (qwen2.5:7b + num_ctx default + citation repair).
+    # fires for them because the cross-encoder bge-reranker-v2-m3 scores
+    # short chat fragments (~143 chars avg) very low compared to vault
+    # notes — measured on post-reindex corpus 2026-04-22:
     #
-    # Gate: adaptive routing ON + (explicit `source="whatsapp"` filter
-    # OR ≥2 of the top-3 final chunks have source="whatsapp") + top-1
-    # score above a reduced WA-specific threshold (default 0.3, env
-    # `RAG_WA_FAST_PATH_THRESHOLD`). The majority check protects against
-    # false positives — a single incidental WA chunk doesn't trigger
-    # fast-path — while still catching the common case where the query
-    # is genuinely about a conversation and top-3 are all WA.
+    #   query "qué charlamos con María en marzo sobre laburo"  → 0.056
+    #   query "mensajes con Juli sobre su mudanza"              → 0.092
+    #   query "lo que me contó Flor sobre el presupuesto"       → 0.054
+    #
+    # All of these are well below the default fast-path threshold (0.6)
+    # AND below the originally planned WA-specific threshold (0.3), yet
+    # the top-3 results are legitimately WA chunks about the right
+    # conversation. The low scores are an artifact of the reranker's
+    # absolute calibration on conversational text, NOT a signal of low
+    # match quality. Measured 2026-04-22: queries with top-1 WA had
+    # avg gen 16.3s and p95 gen 37.9s because they fell to the full
+    # pipeline (qwen2.5:7b + num_ctx default + citation repair).
+    #
+    # Gate has two branches:
+    #
+    #   1. Caller explicitly passed `source="whatsapp"` → fast-path
+    #      unconditionally when adaptive routing is ON. The caller
+    #      declared intent; no score gate needed. This is the common
+    #      path for WhatsApp-only queries from the CLI, web, and MCP.
+    #
+    #   2. Implicit WA detection (≥2 of top-3 chunks have source=
+    #      "whatsapp" AND top-1 score > `RAG_WA_FAST_PATH_THRESHOLD`,
+    #      default 0.05). The low threshold matches the realistic score
+    #      range for WA content; the majority check guards against a
+    #      single incidental WA chunk flipping the pipeline.
     #
     # Rollback: `export RAG_WA_FAST_PATH=0` disables this extra trigger
-    # independently of `RAG_ADAPTIVE_ROUTING`. The baseline gate (intent
-    # semantic + score>0.6) continues to work.
+    # (both branches) independently of `RAG_ADAPTIVE_ROUTING`. The
+    # baseline gate (intent semantic + score>0.6) continues to work.
+    # To restore the 2026-04-22 initial threshold-0.3 behaviour, export
+    # `RAG_WA_FAST_PATH_THRESHOLD=0.3` (measured: disabled branch 2
+    # entirely for real queries, branch 1 still fires on explicit
+    # source filter).
     if (
         _adaptive_routing()
         and not _fast_path
@@ -15384,20 +15743,30 @@ def retrieve(
         and os.environ.get("RAG_WA_FAST_PATH", "").strip().lower()
             not in ("0", "false", "no")
     ):
-        try:
-            _wa_thresh = float(os.environ.get("RAG_WA_FAST_PATH_THRESHOLD", "0.3"))
-        except ValueError:
-            _wa_thresh = 0.3
-        _top1_score = float(final_scores[0])
-        if _top1_score > _wa_thresh:
-            _top3_sources = [
-                normalize_source((m or {}).get("source"))
-                for m in metas[:3]
-            ]
-            _wa_top3_count = sum(1 for s in _top3_sources if s == "whatsapp")
-            if _wa_only_source or _wa_top3_count >= 2:
-                _fast_path = True
-                filters_applied["wa_fast_path"] = True
+        if _wa_only_source:
+            # Branch 1: caller explicit — trust the intent, no score gate
+            _fast_path = True
+            filters_applied["wa_fast_path"] = True
+        else:
+            # Branch 2: implicit detection — require majority + score
+            try:
+                _wa_thresh = float(
+                    os.environ.get("RAG_WA_FAST_PATH_THRESHOLD", "0.05")
+                )
+            except ValueError:
+                _wa_thresh = 0.05
+            _top1_score = float(final_scores[0])
+            if _top1_score > _wa_thresh:
+                _top3_sources = [
+                    normalize_source((m or {}).get("source"))
+                    for m in metas[:3]
+                ]
+                _wa_top3_count = sum(
+                    1 for s in _top3_sources if s == "whatsapp"
+                )
+                if _wa_top3_count >= 2:
+                    _fast_path = True
+                    filters_applied["wa_fast_path"] = True
 
     # Per-stage timing breakdown (embed/sem/bm25/rrf/fetch/parent_expand/
     # rerank/graph_expand/total — all in ms). Surfaced so callers can log
@@ -17549,7 +17918,7 @@ def _index_single_file(
 
     folder = str(path.relative_to(vault).parent)
     fm = parse_frontmatter(raw)
-    tags = _normalize_fm_tags(fm)
+    fm_tags = _normalize_fm_tags(fm)
     outlinks = extract_wikilinks(raw)  # parsed on raw; clean_md strips the syntax
     text = clean_md(raw)
     # Enriquecimiento OCR: texto de imágenes embebidas se concatena al body
@@ -17558,6 +17927,19 @@ def _index_single_file(
     # cuando la nota no tiene embeds o ocrmac no está disponible. Cache
     # SQL por (image_path, mtime) evita re-OCR en reruns.
     text = _enrich_body_with_ocr(text, path, vault, images_source=raw)
+
+    # Inline tags — ``#tag`` escritos en el body (post 2026-04-22). Se
+    # mergean con los de frontmatter preservando orden (FM primero,
+    # inline después) y deduplicando. Antes de este cambio el indexer
+    # los ignoraba, así que notas como "journal con #idea" eran
+    # invisibles al filtrado por tag.
+    inline_tags = extract_inline_tags(text)
+    tags = list(fm_tags)
+    seen_tags = {t for t in tags}
+    for t in inline_tags:
+        if t not in seen_tags:
+            tags.append(t)
+            seen_tags.add(t)
 
     # Contradiction check runs before re-embedding so we only pay once. The
     # collection still holds the old version of this note if any — we exclude
@@ -17574,9 +17956,33 @@ def _index_single_file(
         if updated:
             raw, h = updated
             fm = parse_frontmatter(raw)
-            tags = _normalize_fm_tags(fm)
+            fm_tags = _normalize_fm_tags(fm)
             outlinks = extract_wikilinks(raw)
-            # text is derived from clean_md (strips frontmatter), unchanged.
+            # Re-merge inline tags — the body text is derived from clean_md
+            # (no frontmatter mutation) so inline_tags stays valid.
+            tags = list(fm_tags)
+            seen_tags = {t for t in tags}
+            for t in inline_tags:
+                if t not in seen_tags:
+                    tags.append(t)
+                    seen_tags.add(t)
+
+    # Aliases (generalizado post 2026-04-22) — antes sólo se parseaban en
+    # `99-Mentions/`; ahora cualquier nota con `aliases:` en el FM los
+    # surface al prefix + extra_json. Handle both scalar and list forms.
+    aliases = _normalize_fm_aliases(fm)
+
+    # Tasks — contar pendientes + recoger texto de las primeras N abiertas
+    # para que el embedding las vea. Ver `extract_tasks` para los caps.
+    task_stats = extract_tasks(text)
+
+    # Wikilink expansion (opt-in via `RAG_WIKILINK_EXPANSION=1`). Resolve
+    # cada outlink al .md del vault y extrae una firma corta (clean body
+    # truncado) que se concatena al prefix. Caps arriba evitan que un hub
+    # con 50 links explote el prefix.
+    wikilink_bits: list[str] = []
+    if _wikilink_expansion_enabled():
+        wikilink_bits = _wikilink_expansion_bits(outlinks, vault, path)
 
     # Contextual embedding: generate or retrieve cached document-level summary
     ctx_summary = get_context_summary(text, h, path.stem, folder)
@@ -17586,6 +17992,9 @@ def _index_single_file(
         text, path.stem, folder, tags, fm,
         context_summary=ctx_summary,
         synthetic_questions=synth_qs,
+        aliases=aliases,
+        task_stats=task_stats,
+        wikilink_bits=wikilink_bits,
     )
     if not chunks:
         _invalidate_corpus_cache()
@@ -17613,6 +18022,17 @@ def _index_single_file(
         # pure forward-compat — no re-embed required on upgrade.
         "source": "vault",
     }
+    # Aliases → `extra_json` (list form preserved). Downstream readers
+    # merge `extra_json` into the meta dict via `_row_to_meta`, so
+    # `meta["aliases"]` comes back as the original list.
+    if aliases:
+        base_meta["aliases"] = aliases
+    # Task counts → `extra_json` as primitive ints. `open_tasks` is the
+    # useful signal; `done_tasks` is bookkeeping (nice-to-have for
+    # analytics / "qué cerré esta semana").
+    if task_stats["open"] or task_stats["done"]:
+        base_meta["open_tasks"] = task_stats["open"]
+        base_meta["done_tasks"] = task_stats["done"]
     for field in FM_SEARCHABLE_FIELDS:
         v = fm.get(field)
         if v not in (None, ""):
@@ -36418,6 +36838,291 @@ def _rollback_state_migration(*, force: bool = False,
     return out
 
 
+# ── `rag free` — cleanup de bloat sin romper ─────────────────────────────────
+# Cuatro categorias, cada una gateada por sanity checks independientes:
+#   (a) Tablas legacy en ragvec.db que ya viven (con mas filas) en telemetry.db.
+#       La sanity gate es `telemetry.count >= ragvec.count` por tabla. Si
+#       ragvec.db quedo con mas filas (caso extremo tras un crash), se marca
+#       `warn` y NO se dropea — preservar data > recuperar espacio.
+#   (b) `.bak.<unix_ts>` mas viejos que min_age_days (default 30d). Son los
+#       backups de T10 (1776624525 ≈ 2026-04-20) que quedaron congelados.
+#   (c) Logs `.archived*` mas viejos que min_age_days (mtime).
+#   (d) Snapshots `ranker.<ts>.<pid>.json` — retener los N mas nuevos (default 3)
+#       para poder rollback; el resto es candidato. `ranker.json` vivo NUNCA
+#       se toca (no tiene ts en el nombre).
+#
+# Safety:
+#   - Whitelist implicito: solo tablas en `_TELEMETRY_DDL` (= `_ROLLBACK_TABLES`).
+#     Las 4 state tables cross-source (`rag_whatsapp_state` etc) NO estan ahi y
+#     sobreviven. `meta_*`, `vec_*`, `obsidian_*` ni siquiera se consideran.
+#   - Preflight: refusa si `com.fer.obsidian-rag-*` launchd services vivos
+#     (bypass con --force).
+#   - Dry-run por default. `--apply --yes` para ejecutar.
+#   - DROP en transaction + VACUUM fuera.
+
+_RAG_FREE_MIN_AGE_DAYS_DEFAULT = 30
+_RAG_FREE_RANKER_KEEP_DEFAULT = 3
+
+
+def _rag_free_plan_tables() -> list[dict]:
+    """Inventario de tablas legacy en ragvec.db comparadas con telemetry.db.
+
+    Returns list of {table, ragvec_count, telemetry_count, status}. `status`
+    is "safe" (telemetry >= ragvec, OK to drop) or "warn" (ragvec ahead —
+    blocks the drop). Solo considera tablas en `_TELEMETRY_DDL`.
+    """
+    import sqlite3 as _sqlite3
+    ragvec_path = DB_PATH / "ragvec.db"
+    telemetry_path = DB_PATH / _TELEMETRY_DB_FILENAME
+    if not ragvec_path.is_file():
+        return []
+    out: list[dict] = []
+    rc = _sqlite3.connect(str(ragvec_path))
+    tc = None
+    try:
+        ragvec_tables = {
+            r[0] for r in rc.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if telemetry_path.is_file():
+            tc = _sqlite3.connect(str(telemetry_path))
+            telemetry_tables = {
+                r[0] for r in tc.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        else:
+            telemetry_tables = set()
+        for t in _ROLLBACK_TABLES:
+            if t not in ragvec_tables:
+                continue
+            try:
+                ragvec_count = rc.execute(
+                    f"SELECT COUNT(*) FROM {t}"
+                ).fetchone()[0]
+            except Exception:
+                continue
+            if tc is not None and t in telemetry_tables:
+                try:
+                    telemetry_count = tc.execute(
+                        f"SELECT COUNT(*) FROM {t}"
+                    ).fetchone()[0]
+                except Exception:
+                    telemetry_count = 0
+            else:
+                telemetry_count = 0
+            status = "safe" if telemetry_count >= ragvec_count else "warn"
+            out.append({
+                "table": t,
+                "ragvec_count": ragvec_count,
+                "telemetry_count": telemetry_count,
+                "status": status,
+            })
+    finally:
+        try:
+            rc.close()
+        except Exception:
+            pass
+        if tc is not None:
+            try:
+                tc.close()
+            except Exception:
+                pass
+    return out
+
+
+def _rag_free_plan_baks(
+    *,
+    min_age_days: int = _RAG_FREE_MIN_AGE_DAYS_DEFAULT,
+    now_ts: float | None = None,
+    state_dir: Path | None = None,
+) -> list[dict]:
+    """`.bak.<unix_ts>` con ts del nombre mas viejo que min_age_days."""
+    state_dir = state_dir or (Path.home() / ".local/share/obsidian-rag")
+    if not state_dir.is_dir():
+        return []
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - min_age_days * 86400
+    out: list[dict] = []
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        try:
+            idx = name.rindex(".bak.")
+        except ValueError:
+            continue
+        suffix = name[idx + len(".bak."):]
+        if not suffix.isdigit():
+            continue
+        try:
+            file_ts = int(suffix)
+        except ValueError:
+            continue
+        if file_ts > cutoff:
+            continue  # mas nuevo que la ventana — todavia util
+        try:
+            size = f.stat().st_size
+        except Exception:
+            continue
+        out.append({"path": f, "bytes": size, "ts": file_ts})
+    return out
+
+
+def _rag_free_plan_archived_logs(
+    *,
+    min_age_days: int = _RAG_FREE_MIN_AGE_DAYS_DEFAULT,
+    now_ts: float | None = None,
+    state_dir: Path | None = None,
+) -> list[dict]:
+    """Logs con `.archived` en el nombre y mtime > min_age_days."""
+    state_dir = state_dir or (Path.home() / ".local/share/obsidian-rag")
+    if not state_dir.is_dir():
+        return []
+    now = now_ts if now_ts is not None else time.time()
+    cutoff = now - min_age_days * 86400
+    out: list[dict] = []
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        if ".archived" not in f.name:
+            continue
+        try:
+            st = f.stat()
+        except Exception:
+            continue
+        if st.st_mtime > cutoff:
+            continue
+        out.append({"path": f, "bytes": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def _rag_free_plan_ranker_snapshots(
+    *,
+    keep: int = _RAG_FREE_RANKER_KEEP_DEFAULT,
+    state_dir: Path | None = None,
+) -> list[dict]:
+    """`ranker.<ts>.<pid>.json`: retiene los `keep` mas nuevos (por ts del
+    nombre) para rollback; el resto es candidato. `ranker.json` vivo (sin
+    ts) NUNCA es candidato — es el estado vigente del ranker-vivo.
+    """
+    state_dir = state_dir or (Path.home() / ".local/share/obsidian-rag")
+    if not state_dir.is_dir():
+        return []
+    pat = re.compile(r"^ranker\.(\d+)\.\d+\.json$")
+    entries: list[dict] = []
+    for f in state_dir.iterdir():
+        if not f.is_file():
+            continue
+        m = pat.match(f.name)
+        if not m:
+            continue
+        try:
+            ts = int(m.group(1))
+            size = f.stat().st_size
+        except Exception:
+            continue
+        entries.append({"path": f, "bytes": size, "ts": ts})
+    # Mas nuevo primero; el exceso a partir del indice `keep` son candidatos.
+    entries.sort(key=lambda e: e["ts"], reverse=True)
+    return entries[keep:]
+
+
+def _rag_free_execute(
+    *,
+    plan_tables: list[dict],
+    plan_baks: list[dict],
+    plan_logs: list[dict],
+    plan_ranker: list[dict],
+) -> dict:
+    """Aplica el plan. DROP+VACUUM la DB, unlink() los archivos.
+
+    Retorna {tables_dropped, files_removed, bytes_reclaimed_files,
+    bytes_reclaimed_db, errors}.
+    """
+    import sqlite3 as _sqlite3
+    out: dict = {
+        "tables_dropped": [],
+        "files_removed": [],
+        "bytes_reclaimed_files": 0,
+        "bytes_reclaimed_db": 0,
+        "errors": [],
+    }
+
+    # 1. DROP tablas safe en ragvec.db
+    safe_tables = [t["table"] for t in plan_tables if t["status"] == "safe"]
+    if safe_tables:
+        ragvec_path = DB_PATH / "ragvec.db"
+        wal_path = DB_PATH / "ragvec.db-wal"
+        before_bytes = 0
+        if ragvec_path.is_file():
+            before_bytes = ragvec_path.stat().st_size + (
+                wal_path.stat().st_size if wal_path.is_file() else 0
+            )
+        conn = _sqlite3.connect(str(ragvec_path), isolation_level=None)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN")
+            for t in safe_tables:
+                try:
+                    conn.execute(f"DROP TABLE IF EXISTS {t}")
+                    out["tables_dropped"].append(t)
+                except Exception as e:
+                    out["errors"].append(f"drop {t}: {e}")
+            # Tambien limpiamos filas de rag_schema_version para las tablas
+            # dropeadas — sin esto, futuras invocaciones de
+            # `_ensure_telemetry_tables()` en ragvec.db re-crearian tablas
+            # vacias (no lo hacen post-T10, pero defensive).
+            if out["tables_dropped"]:
+                placeholders = ",".join("?" for _ in out["tables_dropped"])
+                conn.execute(
+                    f"DELETE FROM rag_schema_version "
+                    f"WHERE table_name IN ({placeholders})",
+                    out["tables_dropped"],
+                )
+            conn.execute("COMMIT")
+        except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            out["errors"].append(f"transaction: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        # VACUUM fuera de la transaction
+        try:
+            conn = _sqlite3.connect(str(ragvec_path), isolation_level=None)
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        except Exception as e:
+            out["errors"].append(f"vacuum: {e}")
+        if ragvec_path.is_file():
+            after_bytes = ragvec_path.stat().st_size + (
+                wal_path.stat().st_size if wal_path.is_file() else 0
+            )
+            out["bytes_reclaimed_db"] = max(0, before_bytes - after_bytes)
+
+    # 2. Borrar archivos (.bak, .archived, ranker snapshots)
+    for entry in plan_baks + plan_logs + plan_ranker:
+        p: Path = entry["path"]
+        try:
+            size = p.stat().st_size if p.is_file() else 0
+            p.unlink()
+            out["files_removed"].append(str(p))
+            out["bytes_reclaimed_files"] += size
+        except Exception as e:
+            out["errors"].append(f"unlink {p}: {e}")
+
+    return out
+
+
 def run_maintenance(
     *,
     dry_run: bool = False,
@@ -37104,6 +37809,197 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
 
     console.print()
     console.print(f"  [dim]Done in {results.get('took_ms', 0)}ms[/dim]")
+
+
+@cli.command()
+@click.option("--apply", is_flag=True,
+              help="Ejecutar cleanup. Sin esto es dry-run (default).")
+@click.option("--yes", is_flag=True,
+              help="Confirmacion obligatoria para --apply. Sin esto imprime plan y sale.")
+@click.option("--force", is_flag=True,
+              help="Bypass del preflight que refusa con launchd services activos.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output JSON (para scripts)")
+@click.option("--min-age-days", default=_RAG_FREE_MIN_AGE_DAYS_DEFAULT,
+              show_default=True,
+              help="Edad minima para .bak.<ts> (por ts del nombre) y .archived* (por mtime)")
+@click.option("--ranker-keep", default=_RAG_FREE_RANKER_KEEP_DEFAULT,
+              show_default=True,
+              help="Snapshots ranker.<ts>.<pid>.json a conservar (los mas nuevos)")
+@click.option("--skip-tables", is_flag=True,
+              help="No dropear tablas legacy en ragvec.db")
+@click.option("--skip-baks", is_flag=True,
+              help="No borrar .bak.<unix_ts>")
+@click.option("--skip-logs", is_flag=True,
+              help="No borrar *.archived* viejos")
+@click.option("--skip-ranker", is_flag=True,
+              help="No borrar snapshots ranker.<ts>.json redundantes")
+def free(apply: bool, yes: bool, force: bool, as_json: bool,
+         min_age_days: int, ranker_keep: int,
+         skip_tables: bool, skip_baks: bool,
+         skip_logs: bool, skip_ranker: bool):
+    """Liberar espacio sin romper.
+
+    Dropea tablas legacy en ragvec.db que ya viven (con mas filas) en
+    telemetry.db, borra .bak.<ts> de la migracion T10, logs .archived* y
+    snapshots ranker.<ts>.json redundantes. Todo con safety checks.
+
+    Sin flags es dry-run. Ejecutar con: `rag free --apply --yes`.
+    """
+    # 1. Construir el plan
+    tables = [] if skip_tables else _rag_free_plan_tables()
+    baks = [] if skip_baks else _rag_free_plan_baks(min_age_days=min_age_days)
+    archived_logs = [] if skip_logs else _rag_free_plan_archived_logs(min_age_days=min_age_days)
+    ranker_snaps = [] if skip_ranker else _rag_free_plan_ranker_snapshots(keep=ranker_keep)
+
+    bytes_files = sum(p["bytes"] for p in baks + archived_logs + ranker_snaps)
+    safe_tables = [t for t in tables if t["status"] == "safe"]
+    warn_tables = [t for t in tables if t["status"] == "warn"]
+
+    plan: dict = {
+        "tables": tables,
+        "baks": [
+            {"path": str(p["path"]), "bytes": p["bytes"], "ts": p["ts"]}
+            for p in baks
+        ],
+        "archived_logs": [
+            {"path": str(p["path"]), "bytes": p["bytes"], "mtime": p["mtime"]}
+            for p in archived_logs
+        ],
+        "ranker_snapshots": [
+            {"path": str(p["path"]), "bytes": p["bytes"], "ts": p["ts"]}
+            for p in ranker_snaps
+        ],
+        "total_bytes_reclaimable": bytes_files,
+        "applied": False,
+        "ragvec_bytes_freed": 0,
+        "refused": None,
+        "tables_dropped": [],
+        "files_removed": 0,
+        "errors": [],
+    }
+
+    # Preflight: si apply+yes, services vivos bloquean salvo --force
+    if apply and yes:
+        pids = _pgrep_obsidian_rag()
+        if pids and not force:
+            plan["refused"] = (
+                f"pgrep matched {len(pids)} com.fer.obsidian-rag pid(s): "
+                f"{' '.join(pids)}. Stop launchd services o pasa --force."
+            )
+            if as_json:
+                click.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+                raise click.exceptions.Exit(1)
+            console.print(f"[red]Refused:[/red] {plan['refused']}")
+            raise click.exceptions.Exit(1)
+
+    # Dry-run o --apply sin --yes: imprime el plan y sale
+    if not apply or not yes:
+        if as_json:
+            click.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+            return
+        mode = (
+            "[yellow]dry-run[/yellow]" if not apply
+            else "[yellow]plan (falta --yes)[/yellow]"
+        )
+        console.print(Rule(title=f"[bold cyan]rag free[/bold cyan] {mode}", style="cyan"))
+        console.print()
+
+        if tables:
+            tbl = Table(title="Tablas legacy en ragvec.db", show_header=True)
+            tbl.add_column("tabla", style="cyan")
+            tbl.add_column("ragvec.db", justify="right")
+            tbl.add_column("telemetry.db", justify="right")
+            tbl.add_column("status")
+            for t in tables:
+                style = "green" if t["status"] == "safe" else "yellow"
+                tbl.add_row(
+                    t["table"],
+                    f"{t['ragvec_count']:,}",
+                    f"{t['telemetry_count']:,}",
+                    f"[{style}]{t['status']}[/{style}]",
+                )
+            console.print(tbl)
+            console.print(
+                f"  [green]{len(safe_tables)} safe (drop + VACUUM)[/green] "
+                f"/ [yellow]{len(warn_tables)} warn (preservadas)[/yellow]"
+            )
+            console.print()
+
+        if baks:
+            total = sum(p["bytes"] for p in baks)
+            console.print(
+                f"[bold].bak.<unix_ts> (migracion T10, >{min_age_days}d):[/bold] "
+                f"{len(baks)} archivos, {total:,} bytes"
+            )
+        if archived_logs:
+            total = sum(p["bytes"] for p in archived_logs)
+            console.print(
+                f"[bold]Logs .archived* (mtime >{min_age_days}d):[/bold] "
+                f"{len(archived_logs)} archivos, {total:,} bytes"
+            )
+        if ranker_snaps:
+            total = sum(p["bytes"] for p in ranker_snaps)
+            console.print(
+                f"[bold]Snapshots ranker.<ts>.json "
+                f"(conservando {ranker_keep} nuevos):[/bold] "
+                f"{len(ranker_snaps)} archivos, {total:,} bytes"
+            )
+        console.print()
+        console.print(f"[bold]Archivos recuperables:[/bold] {bytes_files:,} bytes")
+        if safe_tables:
+            console.print(
+                "[dim]Tablas DB: el espacio real se libera tras --apply + VACUUM.[/dim]"
+            )
+        console.print()
+        if apply and not yes:
+            console.print(
+                "[yellow]Se requiere --yes junto con --apply para ejecutar.[/yellow]"
+            )
+        else:
+            console.print("[dim]Proximo paso: rag free --apply --yes[/dim]")
+        return
+
+    # Ejecutar
+    result = _rag_free_execute(
+        plan_tables=tables,
+        plan_baks=baks,
+        plan_logs=archived_logs,
+        plan_ranker=ranker_snaps,
+    )
+    plan["applied"] = True
+    plan["tables_dropped"] = result["tables_dropped"]
+    plan["files_removed"] = len(result["files_removed"])
+    plan["ragvec_bytes_freed"] = result["bytes_reclaimed_db"]
+    plan["total_bytes_reclaimable"] = (
+        result["bytes_reclaimed_files"] + result["bytes_reclaimed_db"]
+    )
+    plan["errors"] = result["errors"]
+
+    if as_json:
+        click.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+        return
+
+    console.print(Rule(title="[bold green]rag free — applied[/bold green]", style="green"))
+    console.print()
+    mb_db = result["bytes_reclaimed_db"] / (1024 * 1024)
+    mb_files = result["bytes_reclaimed_files"] / (1024 * 1024)
+    console.print(
+        f"  [bold]Tablas dropeadas:[/bold] {len(result['tables_dropped'])} "
+        f"(ragvec.db liberado: {mb_db:.1f} MB tras VACUUM)"
+    )
+    console.print(
+        f"  [bold]Archivos borrados:[/bold] {len(result['files_removed'])} "
+        f"({mb_files:.1f} MB)"
+    )
+    if result["errors"]:
+        console.print(f"  [red]{len(result['errors'])} errores:[/red]")
+        for e in result["errors"][:5]:
+            console.print(f"    [dim]{e}[/dim]")
+    console.print(
+        f"  [bold]Total liberado:[/bold] "
+        f"{(mb_db + mb_files):.1f} MB"
+    )
 
 
 # ── UNIFIED PENDIENTES DASHBOARD (rag pendientes) ───────────────────────────

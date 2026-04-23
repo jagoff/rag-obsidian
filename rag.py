@@ -18562,6 +18562,42 @@ def index(reset: bool, no_contradict: bool, source_opt: str | None,
             _vault_ctx.__exit__(None, None, None)
 
 
+def _fmt_ingest_summary(
+    name: str,
+    *,
+    total: int | None = None,
+    indexed: int = 0,
+    deleted: int = 0,
+    duration_s: float = 0.0,
+    dry_run: bool = False,
+    extra: str = "",
+) -> str:
+    """Render a minimal one-line CLI summary for an ingester run.
+
+    Format: `[dry · ]{name}[: {total}][ · +{indexed}][ · -{deleted}][ · {extra}] · {time}s`
+
+    Design: single middle-dot-separated line, no bold, no decorative
+    color markup. Zero deltas are suppressed (nothing to show when a
+    run was a no-op). `total` is optional — sources without a "live
+    corpus count" (calendar, gmail — delta-only sync) omit it.
+
+    Kept intentionally dumb and pure so a unit test covers the grammar
+    without needing to exercise each ingester individually."""
+    parts: list[str] = []
+    if dry_run:
+        parts.append("dry")
+    head = f"{name}: {total}" if total is not None else name
+    parts.append(head)
+    if indexed:
+        parts.append(f"+{indexed}")
+    if deleted:
+        parts.append(f"-{deleted}")
+    if extra:
+        parts.append(extra)
+    parts.append(f"{round(duration_s, 2)}s")
+    return " · ".join(parts)
+
+
 def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
               since_opt: str | None, dry_run: bool, max_chats: int | None) -> None:
     """Body del comando `index`, extraído a helper para que el caller
@@ -18591,19 +18627,16 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 max_chats=max_chats,
                 dry_run=bool(dry_run),
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            console.print(
-                f"{prefix}[bold]WhatsApp[/bold]: "
-                f"{summary['messages_read']} msgs · "
-                f"{summary['messages_after_retention']} nuevos · "
-                f"{summary['chunks_built']} chunks · "
-                f"[green]{summary['chunks_written']}[/green] indexados · "
-                f"{summary['chats_touched']} chats · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            console.print(_fmt_ingest_summary(
+                "whatsapp",
+                total=summary["messages_read"],
+                indexed=summary["chunks_written"],
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+            ))
             return
         if src == "calendar":
             from scripts.ingest_calendar import run as _ingest_cal
@@ -18611,18 +18644,19 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 reset=bool(reset),
                 dry_run=bool(dry_run),
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            console.print(
-                f"{prefix}[bold]Calendar[/bold]: "
-                f"{summary['calendars_scanned']} calendarios · "
-                f"[green]{summary['events_indexed']}[/green] eventos · "
-                f"{summary['events_cancelled']} cancelados · "
-                f"{summary['bootstrapped']} bootstrap / {summary['incremental']} incremental · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            # Calendar doesn't expose a corpus total — omit it; show
+            # events added + cancelled as delta/deletion.
+            console.print(_fmt_ingest_summary(
+                "calendar",
+                indexed=summary["events_indexed"],
+                deleted=summary.get("events_cancelled", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+                extra="bootstrap" if summary.get("bootstrapped") else "",
+            ))
             return
         if src == "gmail":
             from scripts.ingest_gmail import run as _ingest_gm
@@ -18630,19 +18664,17 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 reset=bool(reset),
                 dry_run=bool(dry_run),
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            mode = "bootstrap" if summary.get("bootstrapped") else "incremental"
-            console.print(
-                f"{prefix}[bold]Gmail[/bold] ({mode}): "
-                f"{summary['messages_seen']} mensajes · "
-                f"{summary['threads_built']} threads · "
-                f"[green]{summary['threads_indexed']}[/green] indexados · "
-                f"{summary['threads_deleted']} borrados · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            console.print(_fmt_ingest_summary(
+                "gmail",
+                indexed=summary["threads_indexed"],
+                deleted=summary.get("threads_deleted", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+                extra="bootstrap" if summary.get("bootstrapped") else "",
+            ))
             return
         if src == "reminders":
             from scripts.ingest_reminders import run as _ingest_rem
@@ -18650,18 +18682,17 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 reset=bool(reset),
                 dry_run=bool(dry_run),
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            console.print(
-                f"{prefix}[bold]Reminders[/bold]: "
-                f"{summary['reminders_fetched']} fetched · "
-                f"[green]{summary['reminders_indexed']}[/green] indexados · "
-                f"{summary['reminders_unchanged']} sin cambios · "
-                f"{summary['reminders_deleted']} borrados · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            console.print(_fmt_ingest_summary(
+                "reminders",
+                total=summary["reminders_fetched"],
+                indexed=summary["reminders_indexed"],
+                deleted=summary.get("reminders_deleted", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+            ))
             return
         if src == "contacts":
             from scripts.ingest_contacts import run as _ingest_con
@@ -18669,18 +18700,17 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 reset=bool(reset),
                 dry_run=bool(dry_run),
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            console.print(
-                f"{prefix}[bold]Contacts[/bold]: "
-                f"{summary['contacts_fetched']} contactos ({summary['sources_scanned']} fuentes) · "
-                f"[green]{summary['contacts_indexed']}[/green] indexados · "
-                f"{summary['contacts_unchanged']} sin cambios · "
-                f"{summary['contacts_deleted']} borrados · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            console.print(_fmt_ingest_summary(
+                "contacts",
+                total=summary["contacts_fetched"],
+                indexed=summary["contacts_indexed"],
+                deleted=summary.get("contacts_deleted", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+            ))
             return
         if src == "calls":
             from scripts.ingest_calls import run as _ingest_cl
@@ -18689,19 +18719,19 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 dry_run=bool(dry_run),
                 since_iso=since_opt,
             )
-            prefix = "\\[dry-run] " if dry_run else ""
             if "error" in summary:
                 console.print(f"[red]✗[/red] {summary['error']}")
                 return
-            console.print(
-                f"{prefix}[bold]Calls[/bold]: "
-                f"{summary['calls_fetched']} llamadas "
-                f"([yellow]{summary['missed_calls']}[/yellow] perdidas) · "
-                f"[green]{summary['calls_indexed']}[/green] indexadas · "
-                f"{summary['calls_unchanged']} sin cambios · "
-                f"{summary['calls_deleted']} borradas · "
-                f"[dim]{summary['duration_s']}s[/dim]"
-            )
+            missed = summary.get("missed_calls", 0)
+            console.print(_fmt_ingest_summary(
+                "calls",
+                total=summary["calls_fetched"],
+                indexed=summary["calls_indexed"],
+                deleted=summary.get("calls_deleted", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+                extra=f"{missed} missed" if missed else "",
+            ))
             return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "

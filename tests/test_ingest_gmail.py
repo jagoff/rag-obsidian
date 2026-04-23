@@ -379,9 +379,10 @@ def test_cli_index_source_gmail_routes(monkeypatch):
     from click.testing import CliRunner
     result = CliRunner().invoke(rag.index, ["--source", "gmail"])
     assert result.exit_code == 0, result.output
-    assert "Gmail" in result.output
+    assert "gmail" in result.output
+    # `bootstrap` renders as extra token; `threads_indexed=5` as `+5`.
     assert "bootstrap" in result.output
-    assert "5 indexados" in result.output
+    assert "+5" in result.output
     assert called["reset"] is False
 
 
@@ -401,4 +402,4 @@ def test_cli_index_source_gmail_dry_run(monkeypatch):
     result = CliRunner().invoke(rag.index, ["--source", "gmail", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
-    assert "[dry-run]" in result.output
+    assert "dry · " in result.output

@@ -368,8 +368,10 @@ def test_cli_index_source_whatsapp_routes(fake_bridge, tmp_vault_col, monkeypatc
     from click.testing import CliRunner
     result = CliRunner().invoke(rag.index, ["--source", "whatsapp"])
     assert result.exit_code == 0, result.output
-    assert "WhatsApp" in result.output
-    assert "2 chunks" in result.output
+    assert "whatsapp" in result.output
+    # Minimal format: `whatsapp: {total} · +{indexed} · {time}s` — the
+    # indexed count is `chunks_written` (=2 here) rendered as `+2`.
+    assert "+2" in result.output
     assert called.get("reset") is False
     assert called.get("dry_run") is False
 
@@ -396,7 +398,7 @@ def test_cli_index_source_whatsapp_dry_run(monkeypatch):
     result = CliRunner().invoke(rag.index, ["--source", "whatsapp", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
-    assert "[dry-run]" in result.output
+    assert "dry · " in result.output
 
 
 # ── _speaker_label: resolver wiring con phone index ──────────────────────

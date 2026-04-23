@@ -391,8 +391,10 @@ def test_cli_index_source_calendar_routes(monkeypatch):
     from click.testing import CliRunner
     result = CliRunner().invoke(rag.index, ["--source", "calendar"])
     assert result.exit_code == 0, result.output
-    assert "Calendar" in result.output
-    assert "15 eventos" in result.output
+    assert "calendar" in result.output
+    # Minimal format: calendar has no corpus total — the events-indexed
+    # count (15 here) renders as `+15`.
+    assert "+15" in result.output
     assert called["reset"] is False
     assert called["dry_run"] is False
 
@@ -413,7 +415,7 @@ def test_cli_index_source_calendar_dry_run(monkeypatch):
     result = CliRunner().invoke(rag.index, ["--source", "calendar", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
-    assert "[dry-run]" in result.output
+    assert "dry · " in result.output
 
 
 def test_cli_index_source_calendar_reports_error(monkeypatch):

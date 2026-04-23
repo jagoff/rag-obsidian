@@ -375,9 +375,10 @@ def test_cli_index_source_reminders_routes(monkeypatch):
     from click.testing import CliRunner
     result = CliRunner().invoke(rag.index, ["--source", "reminders"])
     assert result.exit_code == 0, result.output
-    assert "Reminders" in result.output
-    assert "42 fetched" in result.output
-    assert "3 indexados" in result.output
+    assert "reminders" in result.output
+    # Minimal format: `reminders: {fetched} · +{indexed} · {time}s`.
+    assert "reminders: 42" in result.output
+    assert "+3" in result.output
     assert called["reset"] is False
     assert called["dry_run"] is False
 
@@ -400,7 +401,7 @@ def test_cli_index_source_reminders_dry_run(monkeypatch):
     result = CliRunner().invoke(rag.index, ["--source", "reminders", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
-    assert "[dry-run]" in result.output
+    assert "dry · " in result.output
 
 
 def test_cli_index_source_reminders_reports_error(monkeypatch):

@@ -1,0 +1,803 @@
+{
+  "timestamp": "20260423-122007",
+  "total": 20,
+  "passed": 20,
+  "failed": 0,
+  "runs": [
+    {
+      "id": "ft_planning_semana",
+      "category": "forced_tools",
+      "question": "qué tengo para hacer esta semana",
+      "latency_ms": 14832,
+      "answer": "Tenés un cumpleaños de Astor mañana y otro el día después. También tenés que llamar al dentista el 24 de abril, así que anotá eso en tu agenda. Además, hay varios recordatorios sin fecha como arreglar los mosquiteros, comprar entradas para Demos y pedir asistentes medicamentos al psiquiatra.",
+      "sources_count": 4,
+      "confidence": 0.672,
+      "metachat": false,
+      "turn_id": "28364f63b898",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=292"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "14832ms vs cap 45000ms"
+        },
+        {
+          "name": "no_forbidden_substrings",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_planning_hoy",
+      "category": "forced_tools",
+      "question": "qué tengo hoy",
+      "latency_ms": 13609,
+      "answer": "Tenés un cumpleaños de Astor mañana. No hay otros recordatorios para hoy.",
+      "sources_count": 4,
+      "confidence": 0.029,
+      "metachat": false,
+      "turn_id": "d6bd26b5f7f6",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=73"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "13609ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_pendientes",
+      "category": "forced_tools",
+      "question": "qué pendientes tengo",
+      "latency_ms": 12477,
+      "answer": "Tenes 3 pendientes:\n\n1. Llamar al dentista, a la hora de 10h mañana.\n2. Arreglar mosquiteros para la mudanza.\n3. Comprar las entradas para el en vivo de Demos.\n\nno te olvides de esas!",
+      "sources_count": 4,
+      "confidence": 1.024,
+      "metachat": false,
+      "turn_id": "6afe4e34c376",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=183"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "12477ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_agenda",
+      "category": "forced_tools",
+      "question": "qué eventos tengo próximos",
+      "latency_ms": 11550,
+      "answer": "Tenés próximos los siguientes eventos:\n\n- **Nerdear.la - 9na edición**: Del 19 al 22 de octubre.\n- **Grecia viene el 22 de abril**: Todo el día, con recordatorios para las 6 y 9 PM.\n- **Seba**: Tenés que ir a buscarlo/a a las 6 PM del 22 de abril.\n\nEstos son los eventos más cercanos en tus notas.",
+      "sources_count": 4,
+      "confidence": 0.106,
+      "metachat": false,
+      "turn_id": "3b4a2d05f5f6",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=297"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11550ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ft_mails",
+      "category": "forced_tools",
+      "question": "qué mails pendientes tengo",
+      "latency_ms": 8692,
+      "answer": "No tenés ningún mail pendiente mencionado en tus recordatorios. Todos los items son tareas o recordatorios sin referencia a correos electrónicos.",
+      "sources_count": 4,
+      "confidence": 0.086,
+      "metachat": false,
+      "turn_id": "56ff4aea1588",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=145"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "8692ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_que_sabes_astor",
+      "category": "entity_lookup",
+      "question": "qué sabés de Astor",
+      "latency_ms": 15336,
+      "answer": "Tenés un hijo llamado Ferrari Astor, nacido el 25 de mayo de 2011. Va al jardín de infantes Lujan y vive en Derqui 2273, Santa Fe, Argentina. Su mamá, María, te menciona que Grecia (presumiblemente un amigo o familiar) viene a tu casa el viernes a las 19hs. También se habla de buscar un instituto de inglés para Astor, cerca de la casa de María.\n\nEn cuanto a cómo estuvo hoy en futbol, parece que estuvo bien, aunque no te sientas muy bien tú mismo.",
+      "sources_count": 5,
+      "confidence": 0.129,
+      "metachat": false,
+      "turn_id": "6e3368c5642a",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=450"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "15336ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 15336ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_contame_juli",
+      "category": "entity_lookup",
+      "question": "contame de Juli",
+      "latency_ms": 14343,
+      "answer": "Juli 🥰 es tu amiga o compañera con la que mantienes conversaciones frecuentes por WhatsApp. Parece que estuvo viajando y te contó sobre su experiencia, aunque no sacaron muchas fotos. También hablaste sobre un video de su cumpleaños y mencionaste que le gustó. Juli 🥰 también planea irse con tu tío a Bobadilla para unas vacaciones, partiendo el lunes y regresando el 30 del mes. Te preguntó qué opinas al respecto y si estás de acuerdo con que vaya.",
+      "sources_count": 4,
+      "confidence": 0.108,
+      "metachat": false,
+      "turn_id": "2dd9a9eaf97d",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=450"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "14343ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 14343ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_informacion_fernando",
+      "category": "entity_lookup",
+      "question": "información sobre Fernando",
+      "latency_ms": 13114,
+      "answer": "Tenés un contacto llamado Fernando Ferrero, que no es el mismo que vos (Fernando Ferrari). Vos sos guitarrista y trabajás en Avature. Tuviste una charla con Fernando Ferrero el 30 de abril a las 16:00hs, programada para MeetAvature. También tenés conversaciones por WhatsApp con Pablo y Emilío, coordinando encuentros para los molinos y un presupuesto para pintura.\n\n¿Querés saber algo en particular sobre Fernando Ferrero o te refieres a otro Fernando?",
+      "sources_count": 5,
+      "confidence": 0.188,
+      "metachat": false,
+      "turn_id": "23489d4a5af1",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=453"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "13114ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 13114ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_hablame_maria",
+      "category": "entity_lookup",
+      "question": "hablame de María",
+      "latency_ms": 14293,
+      "answer": "Tu hermana María es una persona cercana a ti. Parece estar involucrada en varios aspectos de tu vida cotidiana, especialmente relacionados con tus hijos y tareas diarias.\n\nMaría ha estado ayudándote con asuntos como las ortodoncias de Juli, sugiriendo ejercicios para mejorar su pronunciación. También te ha informado sobre la beca que Juli necesita mantener para recibir una ayuda económica mensual.\n\nEn conversaciones más personales, María se muestra preocupada por tu bienestar y te anima a descansar cuando estás enfermo. A veces, también comparte situaciones cotidianas con ella, como las actividades de tus hijos o los planes que tienes.\n\nMaría parece ser alguien muy presente en tu vida diaria, ofreciéndote apoyo y compartiendo detalles sobre lo que ocurre en casa.",
+      "sources_count": 5,
+      "confidence": 0.213,
+      "metachat": false,
+      "turn_id": "e5b429c09c45",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=773"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "14293ms vs cap 30000ms"
+        },
+        {
+          "name": "latency_within_soft_target",
+          "passed": true,
+          "detail": "WARN 14293ms > target 12000ms"
+        },
+        {
+          "name": "required_substrings_present",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_forbidden_substrings",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "not_refusing",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "el_fallthrough_react",
+      "category": "entity_lookup",
+      "question": "qué sabés de React",
+      "latency_ms": 8391,
+      "answer": "No tengo información específica sobre React en tus notas. Las menciones más cercanas son referencias a Git y GitHub, pero no hay detalles sobre React. Si tenés alguna nota o contexto adicional sobre React, podés compartirlo y te ayudaré con más precisión.",
+      "sources_count": 4,
+      "confidence": 0.039,
+      "metachat": false,
+      "turn_id": "f33209410b72",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=255"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "8391ms vs cap 30000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_hola",
+      "category": "metachat",
+      "question": "hola",
+      "latency_ms": 16,
+      "answer": "¡Buenas! Tirame una pregunta, o decime *recordame X* / *el viernes 20hs X* para crear un recordatorio o evento.",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "656727a7f722",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=111"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "16ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_gracias",
+      "category": "metachat",
+      "question": "gracias",
+      "latency_ms": 11,
+      "answer": "¡De nada!",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "989b6522cbb9",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=9"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "mc_chau",
+      "category": "metachat",
+      "question": "chau",
+      "latency_ms": 11,
+      "answer": "¡Nos vemos!",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "e03901c86d71",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=11"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11ms vs cap 2000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "sv_meditacion",
+      "category": "semantic_vault",
+      "question": "qué apunté sobre meditación",
+      "latency_ms": 11788,
+      "answer": "Según tus notas, mencionaste practicar atención plena (mindfulness), meditación o respiración consciente para centrarse en el presente y evitar anticiparse al futuro o imaginar escenarios posibles.",
+      "sources_count": 4,
+      "confidence": 0.019,
+      "metachat": false,
+      "turn_id": "ffa46fd7d18c",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=197"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11788ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "sv_ikigai",
+      "category": "semantic_vault",
+      "question": "qué es ikigai según mis notas",
+      "latency_ms": 13277,
+      "answer": "Según tus notas, Ikigai es un concepto japonés que combina el amor por lo que haces, lo que puedes hacer bien y lo que el mundo necesita. Esencialmente, se trata de encontrar la intersección entre tus pasiones, las habilidades que tienes, y lo que puede ser beneficioso para los demás. Los recursos que mencionaste incluyen talleres gratuitos en YouTube, pruebas de personalidad, cursos en plataformas como Udemy y Coursera, y otros programas que buscan ayudarte a descubrir tu Ikigai.",
+      "sources_count": 4,
+      "confidence": 0.157,
+      "metachat": false,
+      "turn_id": "cfc6e2055169",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=485"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "13277ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "wa_charla_maria",
+      "category": "whatsapp",
+      "question": "qué charlamos con María en marzo",
+      "latency_ms": 11948,
+      "answer": "Tu hija tuvo un chat muy raro con María en marzo. Parecía que todo era negativo, y ella decía que ya no veía a vos como antes. También mencionaba que te había pedido ser su papá, pero ahora las cosas no son como antes. Hubo conflictos sobre el celular e incluso llegó a un juicio por una supuesta pelea con un auto. Ella decía que ya no confiaba en lo que decías porque siempre mentías y nunca creía tus palabras. En resumen, parecía que la relación había terminado de manera abrupta.",
+      "sources_count": 5,
+      "confidence": 0.059,
+      "metachat": false,
+      "turn_id": "77cd772e47b3",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=484"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "11948ms vs cap 45000ms"
+        },
+        {
+          "name": "no_forbidden_substrings",
+          "passed": true,
+          "detail": "ok"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "wa_mensajes_juli",
+      "category": "whatsapp",
+      "question": "mensajes con Juli sobre mudanza",
+      "latency_ms": 13315,
+      "answer": "Vos tenés varios mensajes con Juli sobre la mudanza. Ella te contó que el miércoles irá con su abuela y que el jueves estará en la nueva casa para ayudar. Tú dijiste que te ibas a ocupar de la mudanza los días miércoles, jueves y viernes. También comentaste que estás viendo un anime nuevo llamado Dorohedoro.\n\nSegún tus mensajes, parece que estás colaborando en la mudanza y Juli está emocionada por irse a vivir con su tío en Santiago de vacaciones.",
+      "sources_count": 4,
+      "confidence": 0.192,
+      "metachat": false,
+      "turn_id": "41e320bfe0b5",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=451"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "13315ms vs cap 45000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_muy_corto",
+      "category": "edge_cases",
+      "question": "x",
+      "latency_ms": 25,
+      "answer": "No entendí tu pregunta. Podés reformularla con más detalle?",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "4d9237fccce2",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=59"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "25ms vs cap 15000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_simbolos",
+      "category": "edge_cases",
+      "question": "?¡@#",
+      "latency_ms": 15,
+      "answer": "Tu mensaje parece muy corto o sin contenido. Preguntame algo concreto sobre el vault.",
+      "sources_count": 0,
+      "confidence": null,
+      "metachat": true,
+      "turn_id": "706507b8455e",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=85"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "15ms vs cap 15000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "ec_hipotetica_absurda",
+      "category": "edge_cases",
+      "question": "cuál es la capital de Marte",
+      "latency_ms": 8546,
+      "answer": "Vos no mencionou nada sobre Marte ou sua capital. A nota mais próxima que tenho é sobre Laura, da Foro de Capital, e Maria, do WhatsApp, mas no há informações sobre a capital de Marte em seus conteúdos.",
+      "sources_count": 4,
+      "confidence": 0.102,
+      "metachat": false,
+      "turn_id": "f26eeaab4880",
+      "error": "",
+      "checks": [
+        {
+          "name": "no_transport_error",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "name": "non_empty_answer",
+          "passed": true,
+          "detail": "len=202"
+        },
+        {
+          "name": "latency_within_hard_cap",
+          "passed": true,
+          "detail": "8546ms vs cap 30000ms"
+        },
+        {
+          "name": "no_tool_name_leak",
+          "passed": true,
+          "detail": "ok"
+        }
+      ],
+      "passed": true
+    }
+  ]
+}

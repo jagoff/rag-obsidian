@@ -713,11 +713,19 @@ _WEB_SYSTEM_PROMPT_V1 = (
     "Podés referirte implícitamente: 'según tus notas', 'en tu nota "
     "sobre X', 'tenés una nota al respecto'. Todo lo demás se ve en "
     "la lista de fuentes — no la dupliques en el cuerpo.\n\n"
-    "REGLA 3 — MARCAR EXTERNO: si agregás texto que NO sale "
-    "textualmente del contexto (intros, parafraseos, conectores, "
-    "opinión, conocimiento general), envolvelo en `<<ext>>...<</ext>>`. "
-    "Fuera de esos marcadores TODO debe ser verificable palabra por "
-    "palabra en el contexto.\n\n"
+    "REGLA 3 — MARCAR EXTERNO: el marcador `<<ext>>...<</ext>>` es "
+    "EXCEPCIONAL, no rutinario. Usalo SOLO cuando agregues una de "
+    "estas 3 cosas: (a) conocimiento general externo al CONTEXTO "
+    "(ej: 'React es una librería de UI de Meta' cuando el CONTEXTO "
+    "no tiene React), (b) opinión tuya / inferencia que NO se "
+    "deriva del CONTEXTO, (c) link a docs oficiales permitido por "
+    "REGLA 4.6. Parafraseo rutinario del CONTEXTO, reordenamientos, "
+    "síntesis, conectores ('también', 'además', 'en resumen'), y "
+    "resúmenes — TODO eso NO lleva marcador. Si podés defender una "
+    "oración como 'esto es lo que dice el CONTEXTO con otras "
+    "palabras' o 'es una reorganización de datos del CONTEXTO', NO "
+    "la envuelvas. Usar `<<ext>>` en cada oración es un BUG — marca "
+    "sólo lo genuinamente externo. Ante duda, NO marques.\n\n"
     "REGLA 4 — FORMATO: 2-4 oraciones o lista corta de viñetas. Dato "
     "clave en la primera oración; contexto mínimo (qué hace, cómo se "
     "invoca) después. Si la pregunta apunta a un comando, "
@@ -791,7 +799,7 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
 # incluir portugués e italiano explícitamente (contagion bajo fast-path
 # WA con contactos brasileros).
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO: texto que NO salga literal del CONTEXTO (parafraseo, conectores, opinión, conocimiento general) va envuelto en `<<ext>>...<</ext>>`. Fuera de esos marcadores todo debe ser verificable en el CONTEXTO.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -2130,6 +2138,186 @@ def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:
     if scope == "all":
         return resolve_vault_paths(["all"])
     return resolve_vault_paths([scope])
+
+
+# Palabras portuguesas/gallegas que qwen2.5:7b ocasionalmente leakea
+# bajo contextos WhatsApp con contactos brasileros (o notas scrapeadas
+# de fuentes en portugués). REGLA 0 del prompt ya las prohíbe
+# textualmente pero el modelo igual se contagia del lenguaje del
+# CONTEXTO. Este filter es la última barrera: reemplaza palabra-por-
+# palabra a su equivalente español. Medido 2026-04-23 en scratch_eval:
+# 1/20 respuestas tenía "do´mañá" literal (galego) pese al prompt
+# endurecido. Conservador: sólo pares alta-confianza donde la palabra
+# portuguesa/gallega NO existe (o es muy rara) en español.
+_IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    # Orden crítico: frases multi-palabra PRIMERO. Si aplicáramos las
+    # reglas atomicas antes, "em março" → "em marzo" (palabra "em"
+    # quedaría como galego en la respuesta).
+    (r"\buma\s+conversa\b", "una conversación"),
+    (r"\buma\s+conversação\b", "una conversación"),
+    (r"\bem\s+março\b", "en marzo"),
+    (r"\bem\s+maio\b", "en mayo"),
+    (r"\bem\s+junho\b", "en junio"),
+    (r"\bem\s+julho\b", "en julio"),
+    (r"\bem\s+setembro\b", "en septiembre"),
+    (r"\bem\s+outubro\b", "en octubre"),
+    (r"\bem\s+novembro\b", "en noviembre"),
+    (r"\bem\s+dezembro\b", "en diciembre"),
+    (r"\bem\s+fevereiro\b", "en febrero"),
+    (r"\bcontigo\s+em\b", "contigo en"),
+    # Meses (único sentido en portugués — en español todos tienen
+    # otra grafía).
+    (r"\bmarço\b", "marzo"),
+    (r"\bmaio\b", "mayo"),
+    (r"\bjunho\b", "junio"),
+    (r"\bjulho\b", "julio"),
+    (r"\bsetembro\b", "septiembre"),
+    (r"\boutubro\b", "octubre"),
+    (r"\bnovembro\b", "noviembre"),
+    (r"\bdezembro\b", "diciembre"),
+    (r"\bfevereiro\b", "febrero"),
+    # Tiempo (palabras que NO existen en español).
+    (r"\bhoje\b", "hoy"),
+    (r"\bontem\b", "ayer"),
+    (r"\bamanhã\b", "mañana"),
+    # Galego: "mañá" + variantes con apóstrofe ascii / unicode prime /
+    # backtick. Incluimos formas truncadas que el LLM emite cuando
+    # "trata" de españolizar el galego a medias ("do´man", "do´mañ",
+    # "do´mana") — captura cualquier "do[apóstrofe]ma[nñ][a|á]?".
+    (r"\bdo['´`]ma[nñ][áa]?\b", "mañana"),
+    (r"\bmañá\b", "mañana"),
+    # Pronombres claros (pt).
+    (r"\bnão\b", "no"),
+    # "sim" podría ser "sim" de simulación en español técnico — prefix
+    # la palabra con word-boundary y usamos case-insensitive para no
+    # cazar SIM en siglas.
+    (r"\bsim\b", "sí"),
+    # Cantidad (pt).
+    (r"\bmuito\b", "mucho"),
+    (r"\bmuita\b", "mucha"),
+    (r"\bmuitos\b", "muchos"),
+    (r"\bmuitas\b", "muchas"),
+    # Cortesía.
+    (r"\bobrigado\b", "gracias"),
+    (r"\bobrigada\b", "gracias"),
+    # Verbos comunes (pt — conjugaciones que no existen en español).
+    (r"\besqueças\b", "olvides"),       # "no te esqueças" → "no te olvides"
+    (r"\besqueça\b", "olvide"),
+    (r"\bdessas\b", "de esas"),         # "no te esqueças dessas"
+    (r"\bdesses\b", "de esos"),
+)
+_IBERIAN_LEAK_COMPILED: tuple[tuple[re.Pattern, str], ...] = tuple(
+    (re.compile(pat, re.IGNORECASE), repl)
+    for pat, repl in _IBERIAN_LEAK_REPLACEMENTS
+)
+
+# Palabras que INICIAN una frase multi-palabra del dict anterior. Cuando
+# el streaming filter ve un candidate que TERMINA con una de estas más
+# whitespace opcional, retiene la palabra en el buffer porque la
+# próxima llegada podría completar el compound (`em ` + `março` →
+# `em março` → `en marzo`). Mantener en sync con los compounds de
+# `_IBERIAN_LEAK_REPLACEMENTS` que son multi-palabra.
+_COMPOUND_STARTER_TAIL_RE = re.compile(
+    r"\b(uma|em|contigo)(\s+\S*)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _replace_iberian_leaks(text: str) -> str:
+    """Apply the _IBERIAN_LEAK_REPLACEMENTS regexes in order. Safe on
+    non-string / empty input. Preserves case for common cases via
+    `IGNORECASE` on the regex side — but the replacement is lowercase,
+    so mixed-case originals ("Março" → "marzo") normalise to lowercase.
+    That's acceptable: the leak itself is a model quirk, not a stylistic
+    choice we want to preserve.
+    """
+    if not text:
+        return text
+    out = text
+    for pat, repl in _IBERIAN_LEAK_COMPILED:
+        out = pat.sub(repl, out)
+    return out
+
+
+class _IberianLeakFilter:
+    """Streaming filter chained después de `_InlineCitationStripper` que
+    reemplaza leaks portugueses/gallegos con su equivalente español.
+
+    Problema de diseño: las frases multi-palabra ("em março", "contigo
+    em", "uma conversa") llegan partidas entre chunks del stream (peor
+    caso: ollama chunk_size=1). Si emitimos cada palabra al llegar a un
+    boundary, la regex compuesta nunca matchea porque los fragmentos
+    ya fueron emitidos por separado.
+
+    Solución: **retener compound starters**. Cuando el candidate de
+    emit TERMINA con "em ", "uma " o "contigo " (las 3 palabras que
+    inician compounds en `_IBERIAN_LEAK_REPLACEMENTS`), retenemos ese
+    starter en el buffer esperando la siguiente palabra. Cuando llega,
+    el buffer tiene "em março" completa y la regla dispara. Ver
+    `_COMPOUND_STARTER_TAIL_RE` — mantenerlo sincronizado con los
+    compounds multi-palabra al agregar frases nuevas.
+
+    API:
+      - `.feed(chunk)` acumula; emite hasta el último boundary menos
+        cualquier compound starter pendiente al final.
+      - `.flush()` drena el buffer aplicando replace.
+      - Idempotente: texto ya en español pasa sin modificar.
+    """
+
+    _MAX_HOLD = 200  # cap de emergencia contra tokens gigantes sin espacios.
+    _BOUNDARY_CHARS = " \t\n.,!?;:()[]{}\"'·"
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buf += chunk
+        # Último boundary (espacio / puntuación) en el buffer.
+        last_boundary = -1
+        for ch in self._BOUNDARY_CHARS:
+            idx = self._buf.rfind(ch)
+            if idx > last_boundary:
+                last_boundary = idx
+        if last_boundary == -1:
+            # Nada que emitir todavía. Flush de emergencia si el buffer
+            # explotó (un token gigante sin espacios — caso raro).
+            if len(self._buf) > self._MAX_HOLD:
+                out = _replace_iberian_leaks(self._buf)
+                self._buf = ""
+                return out
+            return ""
+        candidate = self._buf[:last_boundary + 1]
+        # Clave para el streaming de compounds: si el candidate TERMINA
+        # con un "starter" de frase compuesta ("em ", "uma ", "contigo
+        # "), lo retenemos en el buffer porque podría completar una
+        # frase cuando lleguen más chars. Sin este safeguard, con
+        # chunk_size=1 el candidate "hola em " emitiría "em" antes de
+        # ver "março" y la regla `em\s+março` nunca dispararía.
+        m = _COMPOUND_STARTER_TAIL_RE.search(candidate)
+        if m:
+            starter_start = m.start()
+            if starter_start == 0:
+                # El candidate es sólo el starter + espacios — no hay
+                # nada que emitir por ahora. Esperamos más chunks.
+                if len(self._buf) > self._MAX_HOLD:
+                    out = _replace_iberian_leaks(self._buf)
+                    self._buf = ""
+                    return out
+                return ""
+            # Retener desde el starter; emitir todo lo anterior.
+            to_emit = self._buf[:starter_start]
+            self._buf = self._buf[starter_start:]
+            return _replace_iberian_leaks(to_emit)
+        to_emit = candidate
+        self._buf = self._buf[last_boundary + 1:]
+        return _replace_iberian_leaks(to_emit)
+
+    def flush(self) -> str:
+        tail = self._buf
+        self._buf = ""
+        return _replace_iberian_leaks(tail)
 
 
 class _InlineCitationStripper:
@@ -5493,6 +5681,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 
         parts: list[str] = []
         stripper = _InlineCitationStripper()
+        # 2026-04-23: chain de filtro de leaks portugueses/gallegos
+        # (qwen2.5:7b se contagia del CONTEXTO de WhatsApp con
+        # contactos brasileros). Idempotente sobre texto en español —
+        # el costo es un regex scan por emit. Buffer adds ~1 palabra
+        # de lag al streaming, irrelevante para UX.
+        iberian = _IberianLeakFilter()
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
@@ -5517,13 +5711,22 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _first_token_logged = True
                 filtered = stripper.feed(delta)
                 if filtered:
-                    parts.append(filtered)
-                    yield _sse("token", {"delta": filtered})
+                    cleaned = iberian.feed(filtered)
+                    if cleaned:
+                        parts.append(cleaned)
+                        yield _sse("token", {"delta": cleaned})
             # Flush any tail that was held back waiting for a close-paren.
             tail = stripper.flush()
             if tail:
-                parts.append(tail)
-                yield _sse("token", {"delta": tail})
+                cleaned_tail = iberian.feed(tail)
+                if cleaned_tail:
+                    parts.append(cleaned_tail)
+                    yield _sse("token", {"delta": cleaned_tail})
+            # Final drain del buffer iberian (residual que no vio boundary).
+            final_tail = iberian.flush()
+            if final_tail:
+                parts.append(final_tail)
+                yield _sse("token", {"delta": final_tail})
         except Exception as exc:
             yield _sse("error", {"message": f"LLM falló: {exc}"})
             return

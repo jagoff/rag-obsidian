@@ -158,6 +158,7 @@ rag log [-n 20] [--low-confidence]
 rag dashboard [--days 30]                  # analytics: scores, latency, topics, PageRank
 rag feedback status                        # progress hacia los 20 corrective_paths del gate GC#2.C
 rag feedback backfill [--limit N --rating pos|neg|both --since DAYS]  # agregar corrective_path a turns existentes
+rag behavior backfill [--dry-run --window-minutes N --limit N]  # linkea opens huérfanos (original_query_id NULL) al rag_queries.id — +training signal
 rag feedback harvest [--limit N --since DAYS --confidence-below F]    # labelear queries low-conf sin thumbs
 rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `open` path (ranker-vivo click tracking)
 

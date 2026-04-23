@@ -41800,6 +41800,326 @@ def _context_budget_status(est_tokens: int, num_ctx: int = 4096) -> dict:
     }
 
 
+# ── `rag behavior` subgroup ─────────────────────────────────────────────
+# Tooling sobre rag_behavior para el training signal del ranker-vivo.
+#
+# Motivación (2026-04-23): el ranker-vivo entrena con pairs (query, chosen
+# path) derivados de eventos `open` en rag_behavior. El link semántico al
+# rag_queries.id original se hace via `extra_json.original_query_id`, pero
+# solo está populado post-instrumentación (~20 de 33 opens reales). El resto
+# son huérfanos — el ranker no puede construir un positive example sin
+# conocer qué query disparó ese open. Backfillear por proximidad temporal
+# rescata esos ~13-20 opens huérfanos = +40-60% de signal disponible.
+
+_BEHAVIOR_BACKFILL_DEFAULT_WINDOW_MIN = 10
+_BEHAVIOR_BACKFILL_DEFAULT_LIMIT = 500
+
+
+def _behavior_backfill_candidates(limit: int) -> list[dict]:
+    """Fetch open events that have no `original_query_id` in extra_json.
+
+    Returns newest first. Shape per row: ``{id, ts, path, query, source,
+    session, extra_json_raw}``. `session` se extrae de extra_json como
+    optional hint.
+    """
+    out: list[dict] = []
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, path, query, source, extra_json"
+                " FROM rag_behavior"
+                " WHERE event='open'"
+                " AND (extra_json IS NULL"
+                "      OR json_extract(extra_json, '$.original_query_id') IS NULL)"
+                " ORDER BY ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        for rid, ts, path, q, src, extra_raw in rows:
+            sess = None
+            try:
+                if extra_raw:
+                    _ej = json.loads(extra_raw)
+                    sess = _ej.get("session") or _ej.get("session_id")
+            except Exception:
+                sess = None
+            out.append({
+                "id": int(rid),
+                "ts": ts,
+                "path": path,
+                "query": q,
+                "source": src,
+                "session": sess,
+                "extra_json_raw": extra_raw,
+            })
+    except Exception as exc:
+        _log_sql_state_error("behavior_backfill_candidates_failed", err=repr(exc))
+    return out
+
+
+def _behavior_backfill_find_match(
+    orphan_ts: str,
+    orphan_path: str | None,
+    orphan_session: str | None,
+    window_minutes: int,
+) -> dict | None:
+    """Find the closest rag_queries row to this orphan open event.
+
+    Match policy (more specific → more permissive):
+      1. Same session (rag_queries.session = orphan_session) within window:
+         strongest signal. If multiple, pick the one with the smallest
+         |Δt| to orphan_ts.
+      2. Any session within window, whose paths_json CONTAINS orphan_path:
+         medium signal — the query surfaced this path, so the subsequent
+         open is likely a click on it.
+      3. Any session within window, closest by timestamp: fallback. Less
+         certain but still better than discarding the signal entirely.
+
+    Returns dict or None. Dict shape: ``{query_id, ts, q, session,
+    match_policy: "same_session"|"path_match"|"time_nearest", delta_s: int}``.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            # Policy 1: same-session
+            if orphan_session:
+                row = conn.execute(
+                    "SELECT id, ts, q, session FROM rag_queries"
+                    " WHERE session = ?"
+                    " AND ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
+                    " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    " LIMIT 1",
+                    (orphan_session, orphan_ts,
+                     int(window_minutes) * 60, orphan_ts),
+                ).fetchone()
+                if row:
+                    return {
+                        "query_id": int(row[0]),
+                        "ts": row[1],
+                        "q": row[2],
+                        "session": row[3],
+                        "match_policy": "same_session",
+                        "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
+                    }
+
+            # Policy 2: any session within window, path match.
+            if orphan_path:
+                row = conn.execute(
+                    "SELECT id, ts, q, session FROM rag_queries"
+                    " WHERE ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
+                    " AND paths_json LIKE ?"
+                    " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                    " LIMIT 1",
+                    (orphan_ts, int(window_minutes) * 60,
+                     f"%{orphan_path}%", orphan_ts),
+                ).fetchone()
+                if row:
+                    return {
+                        "query_id": int(row[0]),
+                        "ts": row[1],
+                        "q": row[2],
+                        "session": row[3],
+                        "match_policy": "path_match",
+                        "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
+                    }
+
+            # Policy 3: any session within window, closest by time.
+            row = conn.execute(
+                "SELECT id, ts, q, session FROM rag_queries"
+                " WHERE ABS(strftime('%s', ts) - strftime('%s', ?)) <= ?"
+                " ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC"
+                " LIMIT 1",
+                (orphan_ts, int(window_minutes) * 60, orphan_ts),
+            ).fetchone()
+            if row:
+                return {
+                    "query_id": int(row[0]),
+                    "ts": row[1],
+                    "q": row[2],
+                    "session": row[3],
+                    "match_policy": "time_nearest",
+                    "delta_s": _behavior_delta_seconds(orphan_ts, row[1]),
+                }
+    except Exception as exc:
+        _log_sql_state_error("behavior_backfill_match_failed", err=repr(exc))
+    return None
+
+
+def _behavior_delta_seconds(ts_a: str, ts_b: str) -> int:
+    """|Δt| in seconds between two ISO-8601 timestamps. Errors → -1."""
+    try:
+        _a = datetime.fromisoformat(ts_a.replace("Z", "+00:00"))
+        _b = datetime.fromisoformat(ts_b.replace("Z", "+00:00"))
+        # Normalize tz — if one is naive treat both as naive for delta.
+        if _a.tzinfo is None:
+            _b = _b.replace(tzinfo=None) if _b.tzinfo else _b
+        elif _b.tzinfo is None:
+            _a = _a.replace(tzinfo=None)
+        return abs(int((_a - _b).total_seconds()))
+    except Exception:
+        return -1
+
+
+def _behavior_backfill_apply(row_id: int, extra_raw: str | None,
+                             query_id: int, match_policy: str,
+                             delta_s: int) -> bool:
+    """UPDATE rag_behavior.extra_json para agregar original_query_id +
+    tracing fields del backfill. Returns True on success."""
+    try:
+        extra = json.loads(extra_raw) if extra_raw else {}
+    except Exception:
+        extra = {}
+    extra["original_query_id"] = int(query_id)
+    # Provenance — útil para auditar después qué fue backfilleado vs
+    # populado en línea por el path-original del tracking.
+    extra["backfilled"] = True
+    extra["backfill_match_policy"] = match_policy
+    if delta_s >= 0:
+        extra["backfill_delta_s"] = int(delta_s)
+
+    def _do():
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "UPDATE rag_behavior SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), int(row_id)),
+            )
+            conn.commit()
+
+    try:
+        _sql_write_with_retry(_do, "behavior_backfill_apply_failed")
+        return True
+    except Exception as exc:
+        _log_sql_state_error("behavior_backfill_apply_failed", err=repr(exc))
+        return False
+
+
+@cli.group()
+def behavior():
+    """Tooling sobre rag_behavior para el training signal del ranker-vivo.
+
+    Subcomandos:
+      • `rag behavior backfill`  — linkea opens huérfanos al rag_queries.id
+        original por proximidad temporal + session match. Rescata ~40-60%
+        de los opens que se registraron pre-instrumentación sin
+        `original_query_id`, desbloqueando más training pairs para el
+        fine-tune del reranker.
+
+    Los eventos en rag_behavior también son fuente para `rag dashboard`,
+    `rag feedback harvest`, y el entrenamiento del ranker-vivo
+    (`rag tune`). Cualquier cambio aquí afecta downstream.
+    """
+
+
+@behavior.command("backfill")
+@click.option("--dry-run", is_flag=True,
+              help="Mostrar qué se actualizaría sin escribir.")
+@click.option("--window-minutes", default=_BEHAVIOR_BACKFILL_DEFAULT_WINDOW_MIN,
+              show_default=True, type=int,
+              help="Ventana en minutos para matchear orphan con rag_queries.")
+@click.option("--limit", default=_BEHAVIOR_BACKFILL_DEFAULT_LIMIT,
+              show_default=True, type=int,
+              help="Máximo de opens huérfanos a procesar por corrida.")
+@click.option("--as-json", "as_json", is_flag=True,
+              help="Output JSON (machine-readable).")
+def behavior_backfill(dry_run: bool, window_minutes: int, limit: int,
+                      as_json: bool):
+    """Backfillear `original_query_id` en open events huérfanos.
+
+    Scan rag_behavior WHERE event='open' AND extra_json.original_query_id
+    IS NULL, para cada uno encuentra el rag_queries.id más cercano por
+    proximidad temporal + session match (3 policies en cascada: misma
+    session → path match → nearest by time). UPDATE marca la fila con
+    `backfilled=true` para trazabilidad.
+
+    Seguro por default: dry-run muestra el plan sin escribir. Aplicar
+    directamente con `--no-dry-run` (falta la flag `--dry-run`).
+    """
+    orphans = _behavior_backfill_candidates(limit=limit)
+    if not orphans:
+        if as_json:
+            click.echo(json.dumps({"orphans": 0, "matched": 0, "updated": 0}))
+        else:
+            console.print(
+                "[green]No hay opens huérfanos sin original_query_id.[/green] "
+                "Cache telemetría está consistente."
+            )
+        return
+
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+    for orphan in orphans:
+        match = _behavior_backfill_find_match(
+            orphan_ts=orphan["ts"],
+            orphan_path=orphan["path"],
+            orphan_session=orphan["session"],
+            window_minutes=window_minutes,
+        )
+        if match is None:
+            unmatched.append(orphan)
+        else:
+            matched.append({**orphan, "match": match})
+
+    if as_json:
+        click.echo(json.dumps({
+            "orphans": len(orphans),
+            "matched": len(matched),
+            "unmatched": len(unmatched),
+            "window_minutes": window_minutes,
+            "dry_run": dry_run,
+            "updated": 0 if dry_run else None,  # filled below if applied
+            "by_policy": _group_by_policy(matched),
+        }, default=str))
+
+    if not as_json:
+        console.print(
+            f"[bold]rag behavior backfill[/bold]  "
+            f"[dim](ventana ±{window_minutes} min, limit {limit})[/dim]"
+        )
+        console.print(f"  huérfanos         : [cyan]{len(orphans)}[/cyan]")
+        console.print(f"  matcheables       : [green]{len(matched)}[/green]")
+        console.print(f"  sin match         : [yellow]{len(unmatched)}[/yellow]")
+        if matched:
+            console.print()
+            console.print("  [dim]breakdown por policy:[/dim]")
+            for policy, count in _group_by_policy(matched).items():
+                console.print(f"    {policy:20s}: {count}")
+
+    if dry_run:
+        if not as_json:
+            console.print()
+            console.print(
+                "[yellow]Dry-run: sin cambios en rag_behavior.[/yellow]  "
+                "Re-correr sin --dry-run para aplicar."
+            )
+        return
+
+    updated = 0
+    for m in matched:
+        if _behavior_backfill_apply(
+            row_id=m["id"],
+            extra_raw=m["extra_json_raw"],
+            query_id=m["match"]["query_id"],
+            match_policy=m["match"]["match_policy"],
+            delta_s=m["match"]["delta_s"],
+        ):
+            updated += 1
+
+    if as_json:
+        click.echo(json.dumps({"updated": updated}))
+    else:
+        console.print()
+        console.print(
+            f"[green]✓[/green] {updated}/{len(matched)} opens backfilleados."
+        )
+
+
+def _group_by_policy(matched: list[dict]) -> dict[str, int]:
+    """Aggregate count per match_policy para summary reporting."""
+    counts: dict[str, int] = {}
+    for m in matched:
+        p = (m.get("match") or {}).get("match_policy", "unknown")
+        counts[p] = counts.get(p, 0) + 1
+    return counts
+
+
 @cli.group()
 def context():
     """Context budget + session inspection helpers.
@@ -42228,6 +42548,80 @@ def _health_calibration_status() -> dict:
     return out
 
 
+def _health_training_signal(since_days: int = 7) -> dict:
+    """Signal flywheel para el ranker-vivo fine-tune (2026-04-23).
+
+    Métricas que responden "cuánto dato de training estoy cosechando"
+    + "cuánto falta para habilitar el próximo fine-tune":
+
+      • impressions / opens / CTR: el denominador del entrenamiento.
+        CTR objetivo para desbloquear un 3er fine-tune con signal real
+        ≥ 1% sostenido durante el período (ver docs/finetune-run-*.md).
+      • orphan_opens: opens sin `original_query_id` en extra_json.
+        `rag behavior backfill` los rescata — visible acá para que
+        el operador sepa cuándo correr el comando.
+      • feedback_with_cp / feedback_gate: progreso hacia
+        ``_FEEDBACK_GATE_TARGET`` (20 corrective_paths). Duplicado
+        con la sección Feedback pero acá reportado como window-scoped
+        para trending.
+
+    Fail-closed: errores en SQL devuelven zeros + ``error`` key,
+    nunca raise.
+    """
+    out = {
+        "window_days": int(since_days),
+        "impressions": 0,
+        "opens": 0,
+        "ctr_pct": 0.0,
+        "orphan_opens": 0,
+        "backfilled_opens": 0,
+        "feedback_with_cp": 0,
+        "feedback_gate_target": _FEEDBACK_GATE_TARGET,
+    }
+    try:
+        since_clause = f"-{int(since_days)} days"
+        with _ragvec_state_conn() as conn:
+            out["impressions"] = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_behavior"
+                " WHERE event='impression' AND ts > datetime('now', ?)",
+                (since_clause,),
+            ).fetchone()[0] or 0)
+            out["opens"] = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_behavior"
+                " WHERE event='open' AND ts > datetime('now', ?)",
+                (since_clause,),
+            ).fetchone()[0] or 0)
+            # Orphan opens are all-time (not window-scoped) porque el
+            # backfill command puede recoger opens viejos tambien.
+            out["orphan_opens"] = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_behavior"
+                " WHERE event='open'"
+                " AND (extra_json IS NULL OR"
+                "      json_extract(extra_json, '$.original_query_id') IS NULL)"
+            ).fetchone()[0] or 0)
+            out["backfilled_opens"] = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_behavior"
+                " WHERE event='open'"
+                " AND json_extract(extra_json, '$.backfilled') = 1"
+            ).fetchone()[0] or 0)
+            # Feedback rows con corrective_path dentro del período.
+            out["feedback_with_cp"] = int(conn.execute(
+                "SELECT COUNT(*) FROM rag_feedback"
+                " WHERE json_extract(extra_json, '$.corrective_path') IS NOT NULL"
+                " AND json_extract(extra_json, '$.corrective_path') != ''"
+                " AND ts > datetime('now', ?)",
+                (since_clause,),
+            ).fetchone()[0] or 0)
+        if out["impressions"] > 0:
+            out["ctr_pct"] = round(
+                100.0 * out["opens"] / out["impressions"], 3,
+            )
+    except Exception as exc:
+        out["error"] = repr(exc)
+        _log_sql_state_error("health_training_signal_failed", err=repr(exc))
+    return out
+
+
 def _health_features_opt_in() -> dict:
     """Report the on/off state of the 6 feature flags."""
     features = {
@@ -42293,11 +42687,17 @@ def health_cli(since_hours: int, as_json: bool):
     feedback = _feedback_stats()
     calibration = _health_calibration_status()
     features = _health_features_opt_in()
+    # Training signal flywheel — CTR + orphan opens + feedback gate.
+    # Ventana de 7 días por default; `since_hours` ≤ 48 tiene poco signal
+    # así que el widget muestra siempre 7d (orthogonal a since_hours que
+    # aplica a la sección Queries).
+    training = _health_training_signal(since_days=7)
 
     payload = {
         "corpus": corpus,
         "queries": {**queries, "since_hours": since_hours},
         "feedback": feedback,
+        "training_signal": training,
         "calibration": calibration,
         "features": features,
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -42354,6 +42754,41 @@ def health_cli(since_hours: int, as_json: bool):
         f"| corrective [bold green]{fb['with_cp']}[/bold green]/{gate_target}  "
         f"{gate_str}"
     )
+
+    # ── Training signal flywheel
+    ts_stat = training
+    if "error" not in ts_stat:
+        ctr = ts_stat["ctr_pct"]
+        # CTR color ladder: <0.5% rojo, 0.5-1% amarillo, ≥1% verde.
+        if ctr >= 1.0:
+            ctr_color = "green"
+        elif ctr >= 0.5:
+            ctr_color = "yellow"
+        else:
+            ctr_color = "red"
+        orphan_str = (
+            f" | orphans [yellow]{ts_stat['orphan_opens']}[/yellow]"
+            f" (run [cyan]rag behavior backfill[/cyan])"
+            if ts_stat["orphan_opens"] > 0
+            else f" | orphans [green]{ts_stat['orphan_opens']}[/green]"
+        )
+        console.print(
+            f"[bold]Training signal[/bold] ({ts_stat['window_days']}d): "
+            f"impressions [cyan]{ts_stat['impressions']:,}[/cyan] / "
+            f"opens [cyan]{ts_stat['opens']}[/cyan] / "
+            f"CTR [bold {ctr_color}]{ctr:.2f}%[/bold {ctr_color}]"
+            f"{orphan_str}"
+        )
+        if ts_stat["backfilled_opens"] > 0:
+            console.print(
+                f"  [dim]backfilled: {ts_stat['backfilled_opens']} opens "
+                "linked via `rag behavior backfill`[/dim]"
+            )
+    else:
+        console.print(
+            "[bold]Training signal[/bold]: "
+            f"[red]error: {ts_stat['error']}[/red]"
+        )
 
     # ── Calibration
     cal = calibration

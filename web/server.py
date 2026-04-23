@@ -39,6 +39,8 @@ from rag import (  # noqa: E402
     EVAL_LOG_PATH,
     LOG_PATH,
     _LOG_QUEUE,
+    _LOOKUP_MODEL,
+    _LOOKUP_NUM_CTX,
     RAG_STATE_SQL,
     _log_sql_state_error,
     _map_cpu_row,
@@ -4238,10 +4240,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Kick off WhatsApp fetch in parallel with retrieve so the SQLite
         # round-trip (25-180ms) overlaps with the heavier retrieval work
         # instead of stacking sequentially before the LLM call.
+        #
+        # Gated on query intent (2026-04-22): el fetch sólo se dispara
+        # cuando la pregunta menciona WhatsApp — mismo regex que el
+        # check más abajo para decidir la inyección al prompt. Pre-fix
+        # el submit ocurría SIEMPRE aunque en ~70% de queries el
+        # resultado se descartaba sin usarse. Ahorra 25-180ms de I/O
+        # SQLite al messages.db del bridge en la gran mayoría del
+        # tráfico web. El check es un regex plano sobre `question`
+        # (disponible desde el inicio del endpoint), sub-microsegundo.
         from concurrent.futures import ThreadPoolExecutor
-        _wa_executor = ThreadPoolExecutor(max_workers=1)
+        _wa_in_query = bool(
+            re.search(r"\b(whatsapp|\bwa\b|mensaje|chat de|último[s]? chat)",
+                      question, re.IGNORECASE)
+        )
+        _wa_executor: ThreadPoolExecutor | None = None
+        _wa_future = None
         _t_wa_start = time.perf_counter()
-        _wa_future = _wa_executor.submit(_fetch_whatsapp_unread, 24, 8)
+        if _wa_in_query:
+            _wa_executor = ThreadPoolExecutor(max_workers=1)
+            _wa_future = _wa_executor.submit(_fetch_whatsapp_unread, 24, 8)
 
         # Conversation-aware reformulation is a qwen2.5:3b call that costs
         # 0.6-2s. Only worth paying for short follow-ups that rely on prior
@@ -4336,12 +4354,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # routing could never kick in, and the 3 `log_query_event`
             # sites below had no intent to log (42% of traffic lost intent
             # in extra_json). See tests/test_intent_logging_web.py.
-            try:
-                import rag as _rag_mod
-                _intent_for_log, _ = _rag_mod.classify_intent(
-                    search_question, set(), set())
-            except Exception:
-                _intent_for_log = None
+            #
+            # Reuse del early-hint classification (2026-04-22): el path de
+            # arriba ya clasificó `question` para armar el status hint.
+            # Cuando el query es standalone (no follow-up) `question ==
+            # search_question` → podemos reusar `_early_intent` sin la
+            # segunda call a classify_intent. Follow-ups concatenan
+            # `last_user_q + question` → el intent puede diferir, así que
+            # recomputamos. Ahorro estimado: ~30-50μs × 70% de tráfico
+            # (mayoría son queries standalone).
+            if search_question == question and _early_intent is not None:
+                _intent_for_log = _early_intent
+            else:
+                try:
+                    import rag as _rag_mod
+                    _intent_for_log, _ = _rag_mod.classify_intent(
+                        search_question, set(), set())
+                except Exception:
+                    _intent_for_log = None
             result = multi_retrieve(
                 vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
@@ -4577,22 +4607,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Telemetry: log the post-retrieve wait, not wall time — so a 0ms
         # `wa_wait` means the SQLite read overlapped fully with retrieve.
         _t_wa_wait_start = time.perf_counter()
-        try:
-            wa_recent = _wa_future.result(timeout=2.0)
-        except Exception:
+        if _wa_future is None:
+            # WA fetch wasn't dispatched — query doesn't mention WhatsApp.
+            # Empty list signals the downstream injection block to skip.
             wa_recent = []
-        finally:
-            _wa_executor.shutdown(wait=False)
+        else:
+            try:
+                wa_recent = _wa_future.result(timeout=2.0)
+            except Exception:
+                wa_recent = []
+            finally:
+                if _wa_executor is not None:
+                    _wa_executor.shutdown(wait=False)
         _t_wa_end = time.perf_counter()
         _t_wa_wait_ms = int((_t_wa_end - _t_wa_wait_start) * 1000)
-        # WA block gated on query intent — antes se inyectaba en CADA chat,
-        # agregando ~500-1000ms de prefill innecesario. Ahora sólo se incluye
-        # si la pregunta menciona WhatsApp explícitamente. El fetch paralelo
-        # se sigue haciendo (telemetry + /api/home consumption) — sólo el
-        # prompt injection es el que filtra.
-        _wa_in_query = bool(
-            re.search(r"\b(whatsapp|\bwa\b|mensaje|chat de|último[s]? chat)", question, re.IGNORECASE)
-        )
+        # `_wa_in_query` ya se computó arriba (antes del submit) — mismo
+        # regex. Pre-2026-04-22 se recalculaba acá con mismo valor; el fix
+        # del fetch condicional lo movió al inicio del endpoint para
+        # gate-ear también la submit del WA fetch (no sólo la injection).
         if wa_recent and _wa_in_query:
             total_msgs = sum(int(w.get("count", 0)) for w in wa_recent)
             wa_block_lines = [
@@ -4726,9 +4758,23 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # stable definition that keeps the cache warm. cache_prompt was
         # tested as an explicit option but is not in ollama's accepted set
         # and made some calls hang silently — leave it out.
+        #
+        # Fast-path dispatch (2026-04-22, Improvement #3 Fase D web-wire):
+        # Cuando retrieve() devuelve `fast_path=True` (adaptive routing
+        # judged it semantic + high confidence OR WA majority + threshold
+        # per `RAG_WA_FAST_PATH`), switch to _LOOKUP_MODEL (qwen2.5:3b) +
+        # `_LOOKUP_NUM_CTX` (4096). Pre-fix el endpoint ignoraba el flag
+        # y corría qwen2.5:7b siempre — audit medio 8.5s gen p50 en web
+        # vs 3.1s potencial en fast-path (CLI data, 7d). El switch es
+        # local al streaming block (tool loop de arriba sigue usando el
+        # modelo completo porque queremos tool-calling robustness).
+        _fast_path = bool(result.get("fast_path", False))
+        _web_model_full = _resolve_web_chat_model()
+        _web_model = _LOOKUP_MODEL if _fast_path else _web_model_full
+        _web_num_ctx = _LOOKUP_NUM_CTX if _fast_path else _WEB_CHAT_NUM_CTX
         _WEB_CHAT_OPTIONS = {
             **CHAT_OPTIONS,
-            "num_ctx": _WEB_CHAT_NUM_CTX,
+            "num_ctx": _web_num_ctx,
             "num_predict": 256,
         }
 
@@ -4741,10 +4787,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # If prefill variance returns to 20s+ range, first suspect num_ctx
         # drift, not MPS contention.
 
-        _web_model = _resolve_web_chat_model()
         print(
             f"[chat-model-keepalive] model={_web_model} keep_alive={OLLAMA_KEEP_ALIVE}"
-            f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']}",
+            f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']} fast_path={_fast_path}",
             flush=True,
         )
 
@@ -5166,13 +5211,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "total_ms": int(_t_total_ms),
             # fast_path marker (Improvement #3): True when adaptive routing
             # judged the query eligible for the small-model fast path
-            # (semantic intent + top-1 rerank > 0.6). Today `/api/chat`
-            # does NOT yet switch to _LOOKUP_MODEL when this fires — the
-            # web endpoint is still on the default chat model. Logging
-            # the marker lets us measure the potential speedup in
-            # production (CLI data shows 8.5s → 3.1s = 2.75× on fast-path
-            # hits). When the endpoint is wired to honour it, this same
-            # column surfaces the realised gain.
+            # (semantic intent + top-1 rerank > 0.6, OR WA majority per
+            # `RAG_WA_FAST_PATH`). Desde 2026-04-22 el endpoint SÍ honra
+            # el flag: `_web_model` switcha a `_LOOKUP_MODEL` (qwen2.5:3b)
+            # + `num_ctx=_LOOKUP_NUM_CTX` (4096). Pre-fix loggeaba el
+            # marker pero seguía generando con qwen2.5:7b → pérdida de
+            # 2.75× speedup medido en prod (CLI 7d). Esta columna ahora
+            # surfacea la ganancia real cuando `fast_path=True`.
             "fast_path": bool(result.get("fast_path", False)),
         })
 

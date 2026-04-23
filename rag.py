@@ -1052,7 +1052,7 @@ _USER_QUERY_CMDS: frozenset[str] = frozenset({
 #
 # Política: allowlist-based por tokens discriminativos (no full parse
 # del UA — el formato es inconsistente y los parsers full-blown
-# (httpagentparser, ua-parser) son dependency overkill para esto). 
+# (httpagentparser, ua-parser) son dependency overkill para esto).
 # Orden de precedencia explícito en `_DEVICE_TOKENS`:
 #   1. iphone   — UA contiene "iPhone"
 #   2. ipad     — "iPad"
@@ -1776,7 +1776,8 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # the "no cloud calls" invariant declared at the top of CLAUDE.md. Tracked
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
-    {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages"}
+    {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
+     "contacts", "calls"}
 )
 
 # Per-source weight applied multiplicatively to the final rerank+feature
@@ -1784,9 +1785,11 @@ VALID_SOURCES: frozenset[str] = frozenset(
 # non-vault gets softly down-weighted to reflect editorial trust.
 SOURCE_WEIGHTS: dict[str, float] = {
     "vault":     1.00,
+    "contacts":  0.95,   # editorial trust — user-curated metadata
     "calendar":  0.95,
     "reminders": 0.90,
     "gmail":     0.85,
+    "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
     "messages":  0.75,
 }
@@ -1796,16 +1799,18 @@ SOURCE_WEIGHTS: dict[str, float] = {
 # A halflife of H days means a chunk aged H days old gets scored at 0.5×
 # its fresh value via recency_boost_for_source(); 2H days → 0.25×, etc.
 # Rationale per source (from §4.2 of the design doc):
-#   - vault / calendar: events and notes don't age, skip decay
+#   - vault / calendar / contacts: people/events/notes don't age, skip decay
 #   - gmail / reminders: mid-term — a 6-month old email is context, not noise
-#   - whatsapp / messages: conversational — a 2-month-old WA rarely matters
+#   - whatsapp / messages / calls: conversational — a 2-month-old trace rarely matters
 SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "vault":     None,
+    "contacts":  None,
     "calendar":  None,
     "reminders":   90.0,
     "gmail":      180.0,
     "whatsapp":    30.0,
     "messages":    30.0,
+    "calls":       30.0,
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -1814,11 +1819,13 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
 # (vault retention is manual).
 SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "vault":     None,
+    "contacts":  None,
     "calendar":  None,
     "reminders": None,
     "gmail":      365,
     "whatsapp":   180,
     "messages":   180,
+    "calls":      180,
 }
 
 
@@ -2269,9 +2276,11 @@ CONFIDENCE_RERANK_MIN = 0.015
 # a no-op surface that lets us tune without editing code paths.
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
     "vault":     0.015,   # calibrated
+    "contacts":  0.015,   # scaffolding — tune with data
     "calendar":  0.015,   # scaffolding — tune with data
     "gmail":     0.015,   # scaffolding — tune with data
     "reminders": 0.015,   # scaffolding — tune with data
+    "calls":     0.015,   # scaffolding — tune with data
     "whatsapp":  0.015,   # scaffolding — tune with data
     "messages":  0.015,   # scaffolding — tune with data
 }
@@ -8618,11 +8627,11 @@ def build_prefix(
         in ``_index_single_file`` and passes the result through.
     """
     fm_bits = []
-    for field in FM_SEARCHABLE_FIELDS:
-        v = fm.get(field)
+    for fm_key in FM_SEARCHABLE_FIELDS:
+        v = fm.get(fm_key)
         if v is None or v == "":
             continue
-        fm_bits.append(f"{field}={v}")
+        fm_bits.append(f"{fm_key}={v}")
     # related links add useful semantic signal (other notes this one points to)
     related = fm.get("related") or []
     if isinstance(related, list) and related:
@@ -18033,10 +18042,10 @@ def _index_single_file(
     if task_stats["open"] or task_stats["done"]:
         base_meta["open_tasks"] = task_stats["open"]
         base_meta["done_tasks"] = task_stats["done"]
-    for field in FM_SEARCHABLE_FIELDS:
-        v = fm.get(field)
+    for fm_key in FM_SEARCHABLE_FIELDS:
+        v = fm.get(fm_key)
         if v not in (None, ""):
-            base_meta[field] = str(v)
+            base_meta[fm_key] = str(v)
 
     metadatas = [dict(base_meta, parent=p) for p in parent_texts]
     # Serialize delete+add so concurrent indexers can't leave the collection
@@ -18367,10 +18376,10 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
             # for the same field on the incremental path.
             "source": "vault",
         }
-        for field in FM_SEARCHABLE_FIELDS:
-            v = fm.get(field)
+        for fm_key in FM_SEARCHABLE_FIELDS:
+            v = fm.get(fm_key)
             if v not in (None, ""):
-                base_meta[field] = str(v)
+                base_meta[fm_key] = str(v)
 
         metadatas = []
         for p in parent_texts:
@@ -18599,9 +18608,49 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 f"[dim]{summary['duration_s']}s[/dim]"
             )
             return
+        if src == "contacts":
+            from scripts.ingest_contacts import run as _ingest_con
+            summary = _ingest_con(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(
+                f"{prefix}[bold]Contacts[/bold]: "
+                f"{summary['contacts_fetched']} contactos ({summary['sources_scanned']} fuentes) · "
+                f"[green]{summary['contacts_indexed']}[/green] indexados · "
+                f"{summary['contacts_unchanged']} sin cambios · "
+                f"{summary['contacts_deleted']} borrados · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
+        if src == "calls":
+            from scripts.ingest_calls import run as _ingest_cl
+            summary = _ingest_cl(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+                since_iso=since_opt,
+            )
+            prefix = "\\[dry-run] " if dry_run else ""
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(
+                f"{prefix}[bold]Calls[/bold]: "
+                f"{summary['calls_fetched']} llamadas "
+                f"([yellow]{summary['missed_calls']}[/yellow] perdidas) · "
+                f"[green]{summary['calls_indexed']}[/green] indexadas · "
+                f"{summary['calls_unchanged']} sin cambios · "
+                f"{summary['calls_deleted']} borradas · "
+                f"[dim]{summary['duration_s']}s[/dim]"
+            )
+            return
         console.print(
             f"[yellow]Fuente '{src}' todavía no implementada.[/yellow] "
-            f"Scope: whatsapp + calendar + gmail + reminders (ready)."
+            f"Scope: whatsapp + calendar + gmail + reminders + contacts + calls (ready)."
         )
         return
 
@@ -38809,13 +38858,13 @@ def feedback_status():
                   f"[yellow]{s['pos_no_cp'] + s['neg_no_cp']}[/yellow] candidatos a backfill")
     console.print()
     if remaining > 0:
-        console.print(f"[dim]Próximo paso: [bold]rag feedback backfill[/bold] "
-                      f"— rescatar corrective_path de los turns existentes.[/dim]")
-        console.print(f"[dim]              [bold]rag feedback harvest[/bold] "
-                      f"— labelear queries low-confidence sin feedback.[/dim]")
+        console.print("[dim]Próximo paso: [bold]rag feedback backfill[/bold] "
+                      "— rescatar corrective_path de los turns existentes.[/dim]")
+        console.print("[dim]              [bold]rag feedback harvest[/bold] "
+                      "— labelear queries low-confidence sin feedback.[/dim]")
     else:
-        console.print(f"[bold green]Gate open — re-disparar fine-tune:[/bold green]")
-        console.print(f"  [cyan]python scripts/finetune_reranker.py --epochs 2[/cyan]")
+        console.print("[bold green]Gate open — re-disparar fine-tune:[/bold green]")
+        console.print("  [cyan]python scripts/finetune_reranker.py --epochs 2[/cyan]")
     console.print()
 
 
@@ -39003,7 +39052,7 @@ def feedback_harvest(limit: int, since: int, confidence_below: float):
             )
             if ok:
                 neg += 1
-                console.print(f"  [red]✓ −1 guardado[/red] (todos los paths marcados)")
+                console.print("  [red]✓ −1 guardado[/red] (todos los paths marcados)")
             else:
                 console.print("  [red]✗ error SQL[/red]")
         elif ans == "c":

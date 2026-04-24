@@ -1698,8 +1698,14 @@ body {
   border-radius: 10px;
   max-width: 560px;
   width: 100%;
-  max-height: 80vh;
+  /* `dvh` en lugar de `vh` para excluir el address bar dinámico de iOS
+     Safari. `min(...)` con safe-area-inset evita que el modal se
+     superponga con notch/Dynamic Island/home-indicator. */
+  max-height: min(80dvh, calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 32px));
   overflow: auto;
+  /* Scroll dentro del modal no rebota el body. */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 18px 22px 22px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
@@ -1722,9 +1728,34 @@ body {
   font-size: 20px;
   line-height: 1;
   cursor: pointer;
-  padding: 2px 6px;
+  /* Tap target >=44x44 (Apple HIG / WCAG 2.5.5). El "×" sigue siendo
+     visualmente chico (20px) pero el área clickeable es 44px. */
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 8px;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .modal-close:hover { color: var(--text); }
+.modal-close:active {
+  background: var(--hover);
+}
+
+/* Mobile: padding más chico en el .modal contenedor para que el card
+   aproveche más viewport. Respeto safe-area top/bottom así no se
+   solapa con notch / home-indicator. */
+@media (max-width: 480px) {
+  .modal {
+    padding: 16px;
+    padding-top: max(16px, env(safe-area-inset-top, 16px));
+    padding-bottom: max(16px, env(safe-area-inset-bottom, 16px));
+  }
+}
+
 .modal-card section {
   margin-top: 14px;
 }
@@ -1742,6 +1773,50 @@ body {
   gap: 6px 14px;
   margin: 0;
   font-size: 12.5px;
+}
+
+/* Mobile (≤480px): stack dt sobre dd, font 13.5px. La grilla 2-col por
+   default deja whitespace incómodo en pantallas <=375px y wrap del dd
+   a 1-2 palabras por línea. Stack vertical le da el ancho completo al
+   dd. */
+@media (max-width: 480px) {
+  .kb-list {
+    grid-template-columns: 1fr !important;
+    gap: 4px 0;
+    font-size: 13.5px;
+  }
+  .kb-list dt {
+    margin-top: 8px;
+  }
+  .kb-list dt:first-of-type {
+    margin-top: 0;
+  }
+  .kb-list dd {
+    padding-left: 4px;
+    color: var(--text-dim);
+  }
+}
+
+/* Mobile: stack dt sobre dd (1 columna) para que en pantallas <=480px
+   el texto no quede apretado en una grilla 2-col que deja whitespace
+   raro y wrap fragmentado del dd. Font sube a 13.5px (más legible).
+*/
+@media (max-width: 480px) {
+  .kb-list {
+    grid-template-columns: 1fr;
+    gap: 4px 0;
+    font-size: 13.5px;
+  }
+  .kb-list dt {
+    margin-top: 8px;
+  }
+  .kb-list dt:first-of-type {
+    margin-top: 0;
+  }
+  .kb-list dd {
+    padding-left: 4px;
+    color: var(--text-dim);
+  }
 }
 .kb-list dt {
   color: var(--text-dim);
@@ -5369,8 +5444,14 @@ body {
   border-radius: 10px;
   max-width: 560px;
   width: 100%;
-  max-height: 80vh;
+  /* `dvh` en lugar de `vh` para excluir el address bar dinámico de iOS
+     Safari. `min(...)` con safe-area-inset evita que el modal se
+     superponga con notch/Dynamic Island/home-indicator. */
+  max-height: min(80dvh, calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 32px));
   overflow: auto;
+  /* Scroll dentro del modal no rebota el body. */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 18px 22px 22px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
@@ -5393,7 +5474,17 @@ body {
   font-size: 20px;
   line-height: 1;
   cursor: pointer;
-  padding: 2px 6px;
+  /* Tap target >=44x44 (Apple HIG / WCAG 2.5.5). El "×" sigue siendo
+     visualmente chico (20px) pero el área clickeable es 44px. */
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 8px;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .modal-close:hover { color: var(--text); }
 .modal-card section {
@@ -5413,6 +5504,28 @@ body {
   gap: 6px 14px;
   margin: 0;
   font-size: 12.5px;
+}
+
+/* Mobile (≤480px): stack dt sobre dd, font 13.5px. La grilla 2-col por
+   default deja whitespace incómodo en pantallas <=375px y wrap del dd
+   a 1-2 palabras por línea. Stack vertical le da el ancho completo al
+   dd. */
+@media (max-width: 480px) {
+  .kb-list {
+    grid-template-columns: 1fr !important;
+    gap: 4px 0;
+    font-size: 13.5px;
+  }
+  .kb-list dt {
+    margin-top: 8px;
+  }
+  .kb-list dt:first-of-type {
+    margin-top: 0;
+  }
+  .kb-list dd {
+    padding-left: 4px;
+    color: var(--text-dim);
+  }
 }
 .kb-list dt {
   color: var(--text-dim);

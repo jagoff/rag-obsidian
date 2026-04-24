@@ -191,3 +191,90 @@ def test_viewport_meta_includes_viewport_fit_cover():
         "meta viewport sin viewport-fit=cover deja barras negras en "
         "iPhone con notch al lanzar la PWA en standalone"
     )
+
+
+# ── Help modal mobile UX (audit 2026-04-24) ────────────────────────────────
+
+
+def test_close_button_has_44px_tap_target():
+    """Close `×` button del help modal debe ser 44x44 mínimo (Apple HIG /
+    WCAG 2.5.5). Pre-fix era 23.6875px de ancho — falla regular del pulgar
+    al tocar el "x" en mobile."""
+    assert "min-width: 44px" in _STYLE_CSS
+    assert "min-height: 44px" in _STYLE_CSS, (
+        ".modal-close necesita min-width + min-height de 44px (Apple HIG / "
+        "WCAG 2.5.5 AAA). Sin esto el botón es 23x44 y falla el tap mobile."
+    )
+
+
+def test_modal_card_uses_dvh_for_max_height():
+    """Modal usa `dvh` (dynamic viewport) en lugar de `vh` (static) para
+    que el address bar de iOS Safari no deje al modal con overflow al
+    aparecer/desaparecer."""
+    assert "max-height: min(80dvh," in _STYLE_CSS, (
+        "modal-card max-height debe usar dvh — sin esto en iOS el modal "
+        "queda con altura fija y se sale por debajo cuando el address "
+        "bar reaparece"
+    )
+
+
+def test_modal_respects_safe_area_inset():
+    """El padding del modal en mobile debe respetar safe-area-inset-top
+    y bottom para no superponerse con notch / Dynamic Island / home
+    indicator."""
+    assert "env(safe-area-inset-top" in _STYLE_CSS
+    assert "env(safe-area-inset-bottom" in _STYLE_CSS
+    # En el bloque @media (max-width: 480px) del .modal hay max() con
+    # safe-area-inset.
+    idx = _STYLE_CSS.find("@media (max-width: 480px)")
+    assert idx > 0
+    # Buscar `.modal {` en alguno de los bloques @media (max-width: 480px).
+    found = False
+    while idx > 0:
+        end = _STYLE_CSS.find("@media", idx + 50)
+        block = _STYLE_CSS[idx:end if end > 0 else len(_STYLE_CSS)]
+        if "padding-top: max(" in block and "safe-area-inset-top" in block:
+            found = True
+            break
+        idx = _STYLE_CSS.find("@media (max-width: 480px)", idx + 50)
+    assert found, (
+        ".modal en mobile (<=480px) debe usar max(16px, env(safe-area-inset-top)) "
+        "en padding-top — sino el modal se solapa con el notch en iPhone X+"
+    )
+
+
+def test_kb_list_stacks_vertically_on_small_screens():
+    """En mobile (<=480px) el `.kb-list` cambia a 1 columna (stack
+    dt sobre dd) en lugar de la grilla 2-col del desktop. La grilla
+    angosta deja whitespace incómodo y el dd wrappea a 1-2 palabras
+    por línea."""
+    # Buscar el @media (max-width: 480px) que tenga kb-list con 1fr.
+    needle = ".kb-list {\n    grid-template-columns: 1fr"
+    assert needle in _STYLE_CSS, (
+        "@media (max-width: 480px) debe forzar `grid-template-columns: 1fr` "
+        "en .kb-list para stack vertical en mobile"
+    )
+
+
+def test_body_has_overflow_x_hidden_for_layout_safety():
+    """Defensa en profundidad: si algún child se overflow horizontal
+    (ej. #quick-chips con max-width hard-coded), el body lo clipea
+    en lugar de hacer al doc más ancho que el viewport.
+
+    Bug histórico: pre-fix, #quick-chips forzaba body a 760px en mobile
+    y el modal de /help renderaba off-screen porque `position: fixed`
+    cubría el body wider, no el viewport real."""
+    assert "overflow-x: hidden" in _STYLE_CSS, (
+        "html/body necesitan `overflow-x: hidden` como safety net para "
+        "que un child overflow no rompa position:fixed en otros lados"
+    )
+
+
+def test_quick_chips_max_width_responsive():
+    """`#quick-chips { max-width: 760px }` rompía el layout mobile —
+    el container se forzaba a 760px en viewports de 375px. Fix:
+    `min(760px, 100%)` para que en mobile fitee el viewport."""
+    assert "max-width: min(760px, 100%)" in _STYLE_CSS, (
+        "#quick-chips max-width debe ser responsive (min(760px, 100%)) "
+        "en lugar de hard-coded 760px"
+    )

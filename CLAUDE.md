@@ -298,6 +298,7 @@ rag open --nth N [--session ID]  # shortcut: abre el N-ésimo source del último
 rag maintenance [--dry-run --skip-reindex --skip-logs --json]  # all-in-one housekeeping
 rag free [--apply --yes --force --json --min-age-days N --ranker-keep N --skip-{tables,baks,logs,ranker}]  # liberar espacio sin romper: dropea tablas legacy en ragvec.db (sanity-checked contra telemetry.db), borra .bak.<ts> de T10, logs .archived* viejos, snapshots ranker.<ts>.json redundantes
 python scripts/backfill_entities.py [--dry-run --limit N --vault NAME]  # one-shot GLiNER entity extraction
+python scripts/audit_telemetry_health.py [--days 7] [--json]  # data-first health audit: errores SQL/silent, latency outliers, cache probe distribution, DB sizes; primer comando antes de cualquier "auditá el sistema"
 
 # Automation
 rag setup [--remove]                       # install/remove 11 launchd services
@@ -743,6 +744,18 @@ Primitives in `rag.py` (`# ── SQL state store (T1: foundation) ──` secti
 - `_sql_append_event(conn, table, row)`, `_sql_upsert(conn, table, row, pk_cols)`, `_sql_query_window(conn, table, since_ts, ...)`, `_sql_max_ts(conn, table)`
 
 Writer contract (post-T10): single-row BEGIN/COMMIT into SQL. On exception, log the error to `sql_state_errors.jsonl` and **silently drop the event** — no JSONL fallback. Callers never see a raised exception. Reader contract: SQL-only. Readers return empty snapshots (behavior priors, feedback golden, behavior-augmented cases, contradictions) or False/None (brief_state, ambient_state lookups) on SQL error; retrieval pipeline stays functional without priors until the DB is readable again.
+
+#### Invariantes del telemetry stack (audit 2026-04-24)
+
+Tres reglas que el código tiene que respetar — violar cualquiera deja bugs latentes que el audit del 2026-04-24 encontró tras 6 días de degradación silenciosa.
+
+1. **Todo silent-error sink llama `_bump_silent_log_counter()`**. Cualquier función nueva tipo `_log_X_error(...)` que escribe a un `.jsonl` y devuelve sin raisear DEBE invocar el helper en `rag.py` post-write. Sin esto, el alerting a stderr (threshold `RAG_SILENT_LOG_ALERT_THRESHOLD=20/h`) queda parcial — es exactamente cómo 1756 errores SQL en 6 días no dispararon un solo alert. Pre-fix `_silent_log` lo bumpeba pero `_log_sql_state_error` no. Tests: `tests/test_silent_log_alerting.py`.
+
+2. **Async writer = paquete completo de 4 cambios**. Cuando un writer pasa a usar `_enqueue_background_sql`: (a) helper de gate per-writer (`_log_X_event_background_default()`), (b) caller con branch sync/async, (c) autouse fixture en conftest que setea `RAG_LOG_X_ASYNC=0`, (d) doc del env var en este CLAUDE.md. Tocar solo (a)+(b) deja tests rotos en producción y la próxima persona descubre el override por accidente. Tests: `tests/test_sql_async_writers.py`.
+
+3. **Readers SQL: retry + stale-cache fallback, nunca empty default que sobrescriba memo**. `_load_behavior_priors` y `load_feedback_golden` son los modelos. En error path, devolver el cache previo SIN tocar `_X_memo`. El bug clásico que esto previene: el `default=("error", {empty}, None)` del retry era asignado al memo, envenenando el cache hasta que `source_ts` cambiara. Tests: `tests/test_sql_reader_retry.py`.
+
+Diagnóstico data-first: correr `python scripts/audit_telemetry_health.py --days 7` antes de cualquier "auditá el sistema" — agrega los 5 queries que reprodujeron el audit 2026-04-24 en 1 segundo (errores SQL/silent, latency outliers, cache probe distribution, DB sizes). Primer comando del workflow.
 
 **Drift fixes (2026-04-21 evening)** — four CLI readers still tail-read JSONL files that post-T10 either no longer receive the expected events or got repurposed for another log stream. All migrated to SQL:
 

@@ -31611,6 +31611,161 @@ def _fetch_drive_evidence(now: datetime, days: int = 5, max_items: int = 5) -> d
     return {"files": files_out, "window_days": days}
 
 
+# ── Drive on-demand search (chat tool) ───────────────────────────────────────
+# Motivación (2026-04-24, user report Fer F.): el user pidió "busca en mi
+# google drive y decime cuánto adeuda alexis de la macbook pro" y el chat
+# respondió sobre la única planilla snapshoteada (`Lista de precios
+# Online`, modificada <48h) — sin buscar realmente en Drive. El snapshot
+# diario (`_sync_gdrive_notes`) sólo trae los 4 docs más recientes con
+# 8000 chars de body — insuficiente para responder queries sobre archivos
+# viejos o grandes. Este helper expone una búsqueda on-demand en la API
+# de Drive: dado un query en lenguaje natural, filtra stopwords, arma un
+# `fullText contains` y exporta el body de los top-N archivos.
+#
+# Comparte `_drive_service()` con el brief evidence path — mismas creds
+# (`~/.config/google-drive-mcp/`), misma refresh-token semantics, silent-
+# fail cuando falta auth (y el chat cae de vuelta al retrieve del vault).
+_GDRIVE_SEARCH_STOPWORDS: frozenset[str] = frozenset({
+    # Articles / conjunctions / prepositions (ES + EN, deduped into one set).
+    "a", "al", "an", "and", "ante", "at", "bajo", "but", "by", "con",
+    "contra", "de", "del", "desde", "durante", "e", "el", "en", "entre",
+    "for", "from", "hacia", "hasta", "in", "la", "las", "lo", "los",
+    "mediante", "o", "of", "on", "or", "para", "pero", "por", "segun",
+    "sin", "sobre", "the", "to", "tras", "un", "una", "unas", "unos",
+    "with", "y",
+    # Pronouns / interrogatives that show up in command phrasing (ES + EN).
+    "mi", "mis", "tu", "tus", "me", "te", "se", "le", "les", "nos", "yo",
+    "que", "qué", "como", "cómo", "cuando", "cuándo", "cuanto", "cuánto",
+    "donde", "dónde", "quien", "quién", "cual", "cuál",
+    "my", "your", "our", "his", "her", "its", "their", "is", "are", "was",
+    "were", "i", "you", "we", "they", "he", "she", "it",
+    # Command / filler verbs (Spanish rioplatense + neutral).
+    "busca", "buscá", "buscar", "buscame", "decime", "deci", "dime",
+    "contame", "quiero", "necesito", "quisiera", "saber", "ver", "mirar",
+    "revisar", "chequear", "chequeame", "favor", "fijate", "fijame",
+    # Drive-self-reference (redundant as a search token when the query is
+    # already scoped to Drive — "busca X en mi drive" → tokens=[X]).
+    "drive", "gdrive", "google", "doc", "docs", "documento", "documentos",
+    "sheet", "sheets", "planilla", "planillas", "spreadsheet",
+    "spreadsheets", "slide", "slides", "presentacion", "presentación",
+    "presentaciones", "archivo", "archivos", "file", "files",
+})
+
+
+def _drive_search_tokens(query: str, max_tokens: int = 6) -> list[str]:
+    """Extract up to `max_tokens` meaningful keywords from a natural-language
+    query. Lowercases, drops punctuation, filters `_GDRIVE_SEARCH_STOPWORDS`,
+    de-duplicates preserving order. Empty → []."""
+    # Normalize: lowercase, strip punctuation except inner apostrophes/dashes.
+    cleaned = re.sub(r"[^\w\s\-']", " ", query.lower(), flags=re.UNICODE)
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in cleaned.split():
+        tok = tok.strip("-'")
+        if len(tok) < 2:
+            continue
+        if tok in _GDRIVE_SEARCH_STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= max_tokens:
+            break
+    return out
+
+
+_GDRIVE_EXPORT_MIME: dict[str, str] = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.presentation": "text/plain",
+}
+
+
+def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 3500) -> str:
+    """Buscar archivos en Google Drive por contenido y devolver body exportado.
+
+    Args:
+        query: Pregunta o keywords en lenguaje natural. Stopwords ES/EN se
+            filtran automáticamente (ej. "busca en mi drive info de alexis
+            y la macbook pro" → tokens ["info", "alexis", "macbook", "pro"]).
+        max_files: Máximo de archivos a devolver con body (1–8, default 5).
+        body_cap: Máx caracteres de body por archivo (default 3500).
+
+    Returns:
+        JSON string con `{query_used, tokens, files: [{name, path, mime,
+        modified, link, body}]}`. Si falta auth o la API falla, devuelve
+        `{"files": [], "error": "..."}`. Nunca raisea — el chat loop
+        renderea esto en el CONTEXTO directamente.
+    """
+    max_files = max(1, min(8, int(max_files)))
+    body_cap = max(500, min(8000, int(body_cap)))
+    tokens = _drive_search_tokens(query or "")
+    if not tokens:
+        return json.dumps({
+            "files": [], "tokens": [], "query_used": "",
+            "error": "query vacía después de filtrar stopwords",
+        }, ensure_ascii=False)
+
+    svc = _drive_service()
+    if svc is None:
+        return json.dumps({
+            "files": [], "tokens": tokens, "query_used": " ".join(tokens),
+            "error": "no_google_credentials",
+        }, ensure_ascii=False)
+
+    # Drive's `fullText contains 'a b c'` matches files whose indexed text
+    # has all of those tokens (space-separated acts as AND, not phrase).
+    # Escape single quotes per the API spec: ' → \\'.
+    joined = " ".join(tokens).replace("\\", "\\\\").replace("'", "\\'")
+    q = f"fullText contains '{joined}' and trashed = false"
+    try:
+        resp = svc.files().list(
+            q=q,
+            orderBy="modifiedTime desc",
+            pageSize=max_files,
+            fields=(
+                "files(id,name,mimeType,modifiedTime,webViewLink,"
+                "lastModifyingUser(displayName))"
+            ),
+            spaces="drive",
+        ).execute()
+    except Exception as exc:
+        return json.dumps({
+            "files": [], "tokens": tokens, "query_used": " ".join(tokens),
+            "error": f"search_failed: {str(exc)[:120]}",
+        }, ensure_ascii=False)
+
+    raw_files = resp.get("files") or []
+    out_files: list[dict] = []
+    for f in raw_files[:max_files]:
+        mime = f.get("mimeType") or ""
+        label = _GDRIVE_MIME_LABEL.get(mime, "archivo")
+        body_text = ""
+        export_mime = _GDRIVE_EXPORT_MIME.get(mime)
+        if export_mime:
+            try:
+                raw = svc.files().export(fileId=f["id"], mimeType=export_mime).execute()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="ignore")
+                body_text = (raw or "").strip()[:body_cap]
+            except Exception:
+                body_text = ""
+        out_files.append({
+            "name": f.get("name") or "(sin nombre)",
+            "mime_label": label,
+            "modified": f.get("modifiedTime") or "",
+            "link": f.get("webViewLink") or "",
+            "modifier": (f.get("lastModifyingUser") or {}).get("displayName") or "",
+            "body": body_text,
+        })
+    return json.dumps({
+        "tokens": tokens,
+        "query_used": " ".join(tokens),
+        "files": out_files,
+    }, ensure_ascii=False)
+
+
 # ── Chrome bookmarks used (History join Bookmarks) ───────────────────────────
 # Bookmarks live in a JSON tree, visits live in SQLite; join by URL to surface
 # which *saved* pages the user reached for recently. Distinct signal from raw

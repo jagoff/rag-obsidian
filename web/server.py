@@ -144,6 +144,14 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)s?\b|bandeja\s+de\s+entrada"),
     ("calendar_ahead",  {}, r"calendari|\beventos?\b|\bcitas?\b|reuni[oó]n|\bagendas?\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
     ("weather",         {}, r"\bclimas?\b|\btiempos?\b|llov|lluvia|temperatur|pron[oó]stico"),
+    # Drive: "drive" alone es ambiguo (también es una palabra EN genérica),
+    # pero "google drive", "en mi drive", "mi drive" o keywords
+    # Drive-específicas (planilla, spreadsheet, sheet, doc, presentación)
+    # son señal clara. "drive_search" es el único tool del pre-router que
+    # recibe args dinámicos — la query cruda del user se inyecta en
+    # `_detect_tool_intent` con key `query`, y el helper de rag filtra
+    # stopwords internamente. Ver `_agent_tool_drive_search` para la lógica.
+    ("drive_search",    {}, r"\bgoogle\s*drive\b|\b(en\s+)?(mi|tu)\s+drive\b|\bplanillas?\b|\bspreadsheets?\b|\bsheets?\b|\bpresentaci[oó]n\b|\bpresentaciones\b"),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
@@ -153,10 +161,23 @@ _TOOL_INTENT_COMPILED = tuple(
 def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     """Deterministic keyword → tool routing. Returns (name, args) tuples
     to execute BEFORE the LLM tool-deciding call. Empty list = no forced
-    tools (LLM decides freely)."""
+    tools (LLM decides freely).
+
+    `drive_search` receives the raw query as its `query` arg — the tool
+    helper filters stopwords internally. All other tools have static
+    args from their rule entry.
+    """
     if not q:
         return []
-    return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
+    out: list[tuple[str, dict]] = []
+    for name, args, rx in _TOOL_INTENT_COMPILED:
+        if not rx.search(q):
+            continue
+        if name == "drive_search":
+            out.append((name, {"query": q}))
+        else:
+            out.append((name, dict(args)))
+    return out
 
 
 # Metadata por tool source-specific, usada para componer el hint de
@@ -213,6 +234,18 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         ),
         "item_shape": "- <tarea> (<fecha si tiene>)",
         "empty_phrase": "No tenés recordatorios pendientes",
+    },
+    "drive_search": {
+        "label": "tu Google Drive",
+        "live_section": "### Google Drive",
+        "digest_hint": (
+            "La sección live trae los archivos encontrados con su body "
+            "exportado. Si el user pidió un dato concreto (precio, deuda, "
+            "cantidad), citálo TEXTUAL del body si está; si no aparece, "
+            "decí explícitamente que buscaste y no encontraste ese dato."
+        ),
+        "item_shape": "- <nombre del archivo> (<tipo>) · <dato relevante o 'sin match'>",
+        "empty_phrase": "No encontré nada en tu Google Drive que matchee",
     },
 }
 
@@ -359,6 +392,13 @@ def _is_empty_tool_output(name: str, raw: str) -> bool:
             not (data.get("dated") or [])
             and not (data.get("undated") or [])
         )
+    if name == "drive_search":
+        # Empty = no files AND an error OR no files without an error (both
+        # mean "nothing to show"). Auth errors also count as empty so the
+        # fallback CONTEXTO-preserve branch kicks in.
+        if not isinstance(data, dict):
+            return False
+        return not (data.get("files") or [])
     return False
 
 
@@ -409,6 +449,8 @@ def _format_forced_tool_output(name: str, raw: str) -> str:
         return _format_finance_block(raw)
     if name == "weather":
         return _format_weather_block(raw)
+    if name == "drive_search":
+        return _format_drive_block(raw)
     # Unknown tool → keep raw JSON available but wrap in a labeled
     # section so it doesn't merge visually with the next block.
     return f"### Datos ({name})\n{raw}\n"
@@ -588,6 +630,80 @@ def _format_weather_block(raw: str) -> str:
     if not body:
         return "### Clima\n_Sin datos del clima._\n"
     return f"### Clima\n{body}\n"
+
+
+def _format_drive_block(raw: str) -> str:
+    """Render `drive_search` output as a `### Google Drive` section.
+
+    Shape esperado del tool (web/tools.drive_search → rag._agent_tool_drive_search):
+        {tokens: [...], query_used: "a b c", files: [{name, mime_label,
+         modified, link, body}], error?: "..."}
+
+    Por archivo: header con nombre + tipo + fecha + link (un solo bullet),
+    seguido de un bloque de body entre líneas en blanco. Cap defensivo del
+    body a 2500 chars acá (aunque el helper ya lo capea a 3500) por si
+    algún día elevamos el cap en la tool pero no queremos explotar el
+    CONTEXTO acá. Auth / API errors se renderizan como "_Sin resultados
+    (motivo: ...)._" para que el LLM lo comunique al user honestamente
+    en vez de inventar contenido.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Google Drive\n{raw}\n"
+    if not isinstance(data, dict):
+        return f"### Google Drive\n{raw}\n"
+
+    files = data.get("files") or []
+    tokens = data.get("tokens") or []
+    err = data.get("error") or ""
+    query_used = data.get("query_used") or ""
+
+    header = "### Google Drive"
+    if query_used:
+        header = f"{header} (búsqueda: {query_used})"
+
+    if not files:
+        reason_bits: list[str] = []
+        if err == "no_google_credentials":
+            reason_bits.append("auth de Drive no configurada")
+        elif err.startswith("search_failed"):
+            reason_bits.append("falló la API de Drive")
+        elif err == "query vacía después de filtrar stopwords":
+            reason_bits.append("la pregunta no tenía keywords buscables")
+        elif err:
+            reason_bits.append(err)
+        else:
+            reason_bits.append(
+                f"ningún archivo matchea {tokens!r}" if tokens
+                else "ningún archivo matchea la búsqueda"
+            )
+        return f"{header}\n_Sin resultados ({'; '.join(reason_bits)})._\n"
+
+    # Defensive body cap (ver docstring).
+    BODY_CAP = 2500
+
+    lines: list[str] = [header]
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name", "")).strip() or "(sin nombre)"
+        mime = str(f.get("mime_label", "")).strip() or "archivo"
+        modified = str(f.get("modified", "")).strip()
+        link = str(f.get("link", "")).strip()
+        date_part = modified.split("T")[0] if modified else ""
+        bits: list[str] = [f"**{name}**", f"({mime})"]
+        if date_part:
+            bits.append(f"· modificado {date_part}")
+        if link:
+            bits.append(f"· [abrir]({link})")
+        lines.append("- " + " ".join(bits))
+        body = str(f.get("body", "")).strip()
+        if body:
+            lines.append("")
+            lines.append(body[:BODY_CAP])
+            lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 # Create-intent detection moved to rag.py so both the web chat endpoint

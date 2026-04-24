@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rag import (  # noqa: E402
+    _agent_tool_drive_search,
     _agent_tool_read_note,
     _agent_tool_search,
     _agent_tool_weather,
@@ -32,7 +33,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 9 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 10 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -40,6 +41,7 @@ Routing por palabra clave (si aparece → llamá la tool):
 - mail/correo/email/gmail/inbox → gmail_recent
 - evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
 - clima/tiempo/lluvia/temperatura/pronóstico → weather
+- google drive/drive/planilla/spreadsheet/sheet/doc/documento/presentación → drive_search(query='<keywords extraídos>'). Extraé los tokens útiles (nombres propios, sustantivos concretos) y descartá "busca", "decime", "en mi", "drive" — ej. "busca en mi drive qué me adeuda Alexis de la macbook pro" → drive_search(query='alexis macbook pro adeuda').
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
@@ -234,6 +236,27 @@ def weather(location: str | None = None) -> str:
     return _agent_tool_weather(location)
 
 
+def drive_search(query: str, max_files: int = 5) -> str:
+    """Buscar archivos en Google Drive por contenido y devolver body exportado.
+
+    Usalo cuando el user pide explícitamente buscar en Drive, o cuando la
+    pregunta alude a una planilla / doc / presentación que NO está en el
+    CONTEXTO del vault (el snapshot diario sólo trae 4 docs recientes).
+
+    Args:
+        query: Keywords separadas por espacio (ej. "alexis macbook pro").
+            Extraé los tokens útiles del pedido — descartá artículos,
+            "busca", "decime", "google drive", etc. Tokens vacíos → error.
+        max_files: Cantidad de archivos a devolver con body (1–8, default 5).
+
+    Returns:
+        JSON `{tokens, query_used, files: [{name, mime_label, modified,
+        link, body}]}`. Body viene exportado a text/csv/plain (capado a
+        3500 chars). Error / sin auth → `{files: [], error: "..."}`.
+    """
+    return _agent_tool_drive_search(query, max_files=max_files)
+
+
 # Chat-exposed tool wrappers for reminder/event creation. Real logic
 # lives in rag.py so the CLI rag chat loop can reuse it without the
 # web → rag → web circular import. These re-exports keep the ollama
@@ -252,6 +275,7 @@ CHAT_TOOLS: list[Callable] = [
     finance_summary,
     calendar_ahead,
     weather,
+    drive_search,
     propose_reminder,
     propose_calendar_event,
 ]
@@ -264,6 +288,7 @@ PARALLEL_SAFE: set[str] = {
     "calendar_ahead",
     "reminders_due",
     "gmail_recent",
+    "drive_search",
     "propose_reminder",
     "propose_calendar_event",
 }

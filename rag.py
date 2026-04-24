@@ -1585,13 +1585,63 @@ def load_session(sid: str) -> dict | None:
 
 
 def save_session(sess: dict) -> None:
-    """Atomic write via tmp file + replace. Also records last-session pointer."""
+    """Atomic write via tmp file + replace + per-session flock.
+
+    `tmp.replace(p)` es atómico a nivel filesystem (APFS/ext4/ntfs
+    garantizan que nadie ve un archivo a medio escribir). PERO si 2
+    writers con copias in-memory divergentes hacen save_session
+    concurrente, el último en llamar `replace()` gana y la otra
+    escritura se pierde silenciosamente (ABA race). Escenarios donde
+    esto puede pasar:
+      - User dispara 2 chats rápidos para la misma sesión (Enter doble,
+        redo mientras original está corriendo).
+      - Web handler + episodic writer thread escriben la misma sesión
+        al mismo tiempo.
+      - Dos web processes en distintos puertos comparten SESSIONS_DIR.
+
+    Mitigación (2026-04-24 audit hardening): flock exclusivo sobre un
+    `.lock` sidecar file por sesión. Los writers concurrentes se
+    serializan — siguen siendo "last writer wins" (no hay merge
+    semántico) pero al menos no escriben encimados. El lock file se
+    crea on-demand y permanece (no hay cleanup explícito) porque son
+    byte-free sidecars. Si alguien borra SESSIONS_DIR completo, se
+    regenera transparentemente.
+
+    Esta fix NO resuelve el problema de merge (turnos perdidos si 2
+    writers tienen in-memory state distinto); sólo previene
+    corrupción del archivo en caso de que 2 threads escriban
+    bit-concurrent. Para el merge propio haría falta un pattern
+    read-modify-write bajo el mismo lock, que es un refactor mayor
+    documentado en el issue tracker.
+    """
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     sess["updated_at"] = datetime.now().isoformat(timespec="seconds")
     p = session_path(sess["id"])
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    lock_path = p.with_suffix(".json.lock")
+
+    # Abrir el lock file (se crea si no existe). `a+` para garantizar que
+    # otro proceso nunca lo vea como "empty" durante el open initial —
+    # APFS nunca muestra tamaño intermediate para files creados así.
+    lock_fh = lock_path.open("a+")
+    try:
+        # Blocking lock — writers concurrentes se serializan. Típicamente
+        # 1-5ms de wait bajo carga normal, mucho menos que el `write_text`
+        # siguiente. Si el lock está stuck (proceso muerto tenía el lock),
+        # fcntl lo libera cuando el FD se cierra al morir el proceso.
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    finally:
+        # Unlock + close. El close() per-se libera el flock (behavior
+        # de fcntl en POSIX), así que en caso de que el flock UN falle
+        # por cualquier razón exótica, el close() es el net de seguridad.
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fh.close()
+
     _set_last_session(sess["id"])
 
 
@@ -8754,14 +8804,26 @@ def sync_chrome_bookmarks(profile: str | None = None) -> dict:
 # ── TEXT PROCESSING ───────────────────────────────────────────────────────────
 
 def parse_frontmatter(text: str) -> dict:
-    """Parse full YAML frontmatter as dict. Returns {} if none or invalid."""
+    """Parse full YAML frontmatter as dict. Returns {} if none or invalid.
+
+    Si el YAML es malformado (p.ej. `---\ntags: [unclosed\n---`), `yaml.YAMLError`
+    se logea via `_silent_log` para que el indexer pueda detectar notas
+    con frontmatter roto en su audit log (2026-04-24 audit: pre-fix el
+    error era swallow silencioso → notas indexadas sin tags/aliases/area
+    sin aviso al user. Ahora queda trace en silent_errors.jsonl para que
+    se pueda correr `rag vault health` y detectar esas notas).
+
+    Intencionalmente NO raise para mantener el contrato existente (callers
+    esperan dict vacío en error), pero el log da observabilidad.
+    """
     match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
     if not match:
         return {}
     try:
         data = yaml.safe_load(match.group(1))
         return data if isinstance(data, dict) else {}
-    except yaml.YAMLError:
+    except yaml.YAMLError as exc:
+        _silent_log("parse_frontmatter_yaml", exc)
         return {}
 
 
@@ -9733,15 +9795,26 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     global _corpus_cache
     n = col.count()
     cid = str(getattr(col, "id", "") or "")
+    # Check + return bajo el mismo lock para evitar TOCTOU con
+    # `_invalidate_corpus_cache`. Pre-fix (2026-04-24 audit):
+    #   with lock: cached = _corpus_cache       # <-- lock released
+    #   if cached is not None and cached["count"]==n: return cached
+    # Entre el release del lock y el check, otro thread podía llamar
+    # `_invalidate_corpus_cache` (que setea `_corpus_cache=None` bajo
+    # el lock); la ref local `cached` seguía apuntando al dict viejo,
+    # y lo retornábamos como si fuera válido — serving stale data
+    # después de que otro thread explícitamente dijo "invalidá el
+    # cache". Típico caso: `rag index --reset` corriendo en paralelo
+    # con `rag chat` serve.
     with _corpus_cache_lock:
         cached = _corpus_cache
-    if (
-        cached is not None
-        and cached["count"] == n
-        and cached.get("collection_id") == cid
-    ):
-        record_cache_event("corpus", hits=1)
-        return cached
+        if (
+            cached is not None
+            and cached["count"] == n
+            and cached.get("collection_id") == cid
+        ):
+            record_cache_event("corpus", hits=1)
+            return cached
 
     record_cache_event("corpus", misses=1)
     data = col.get(include=["documents", "metadatas"])

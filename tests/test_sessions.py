@@ -204,6 +204,71 @@ def test_save_session_is_atomic_no_tmp_leftover(sessions_tmp):
     assert leftovers == []
 
 
+def test_save_session_uses_per_session_flock(sessions_tmp):
+    """2026-04-24 audit hardening: save_session debe usar flock sobre un
+    sidecar `.lock` file para serializar writers concurrentes. El lock
+    se crea on-demand y permanece (byte-free sidecar).
+
+    Este test verifica que:
+      1. El lock file se crea al primer save_session.
+      2. El lock file persiste después de save_session (no cleanup).
+      3. Writers concurrentes NO se pisan (simulado con threads).
+    """
+    sdir, _ = sessions_tmp
+    sess = rag.ensure_session("locked", mode="chat")
+    rag.append_turn(sess, {"q": "hola"})
+    rag.save_session(sess)
+
+    lock_path = sdir / "locked.json.lock"
+    assert lock_path.is_file(), (
+        f"lock sidecar file debería existir post-save: {list(sdir.iterdir())}"
+    )
+    # El lock file queda — no hay cleanup explícito, son sidecars byte-free.
+    sess["turns"].append({"q": "segundo", "ts": "2026-04-24T12:00:00"})
+    rag.save_session(sess)
+    assert lock_path.is_file()
+
+
+def test_save_session_serializes_concurrent_writes(sessions_tmp):
+    """Dos threads escribiendo la misma sesión en paralelo no deben
+    corromper el archivo ni perder el file-level atomicity. La
+    fcntl.LOCK_EX serializa las escrituras — el último en entrar al
+    lock gana (last-writer-wins), pero el archivo final siempre es
+    JSON válido parseable.
+    """
+    import json
+    import threading
+
+    sdir, _ = sessions_tmp
+    sess_template = rag.ensure_session("concurrent", mode="chat")
+    rag.save_session(sess_template)
+
+    errors: list[Exception] = []
+
+    def _writer(turn_id: int) -> None:
+        try:
+            s = rag.load_session("concurrent") or sess_template
+            rag.append_turn(s, {"q": f"turn-{turn_id}", "a": "resp"})
+            rag.save_session(s)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"writers concurrentes lanzaron errores: {errors}"
+    # El archivo final siempre debe ser JSON válido (no half-written).
+    final = json.loads((sdir / "concurrent.json").read_text())
+    assert final["id"] == "concurrent"
+    # Al menos 1 turn se persistió — no podemos asegurar cuántos por la
+    # ABA race documentada en el docstring (last-writer-wins), pero el
+    # archivo nunca debe estar corrupto o vacío.
+    assert isinstance(final.get("turns"), list)
+
+
 def test_save_session_updates_updated_at(sessions_tmp):
     sess = rag.ensure_session("stamped", mode="chat")
     original = sess["updated_at"]

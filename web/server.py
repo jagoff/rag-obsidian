@@ -5577,6 +5577,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # local al streaming block (tool loop de arriba sigue usando el
         # modelo completo porque queremos tool-calling robustness).
         _fast_path = bool(result.get("fast_path", False))
+        # Tracks si hubo downgrade runtime por pre-router tools (ver bloque
+        # de pre-router más abajo). False por default; el log del endpoint
+        # lo expone como `fast_path_downgraded` en extra_json para que el
+        # analytics pueda medir cuán seguido el adaptive routing pierde
+        # efectividad por entradas híbridas tool+semantic.
+        _fast_path_downgraded = False
         _web_model_full = _resolve_web_chat_model()
         _web_model = _LOOKUP_MODEL if _fast_path else _web_model_full
         _web_num_ctx = _LOOKUP_NUM_CTX if _fast_path else _WEB_CHAT_NUM_CTX
@@ -5727,6 +5733,50 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         break
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
+
+                # Fast-path downgrade cuando el pre-router fired tools.
+                # Racional (2026-04-24, medido en prod el 2026-04-23):
+                # `_fast_path` fue calibrado por `retrieve()` para queries
+                # semánticas simples donde el CONTEXTO es ~500 tok de vault
+                # chunks — qwen2.5:3b es eficiente ahí. Pero cuando el
+                # pre-router matchea (reminders_due, calendar_ahead,
+                # finance_summary, weather, gmail_recent) el CONTEXTO se
+                # REEMPLAZA con la salida formateada de esos tools — fácil
+                # 2-4K tokens de listas. qwen2.5:3b en M3 Max prefillea a
+                # ~2.5ms/tok → 3K tokens = 7.5s sólo en prefill, vs qwen2.5:7b
+                # que prefillea a ~0.5ms/tok (mejor flash-attention
+                # throughput en modelos más grandes) → 3K tokens = 1.5s.
+                # Ejemplo medido: "qué pendientes tengo" fast_path=1 +
+                # tool_rounds=1 → prefill=11595ms, total=16.3s. Post-
+                # downgrade (qwen2.5:7b) mismo tool output → prefill estimado
+                # ~2s, total ~5s. Gate: si pre-router fired AND fast_path
+                # estaba en True, disable fast-path PARA ESTA QUERY — usar
+                # _web_model_full + _WEB_CHAT_NUM_CTX para el streaming
+                # final. Todo lo calculado arriba (fast_path marker en el
+                # log, status SSE) se mantiene consistente: el marker en
+                # telemetría es bool(result["fast_path"]) y refleja lo que
+                # retrieve() decidió ANTES de ver los tools — así el
+                # analytics sigue midiendo la cobertura del adaptive
+                # routing. El downgrade es local al código de streaming.
+                # Rollback: `export RAG_FAST_PATH_KEEP_WITH_TOOLS=1` para
+                # restaurar el comportamiento pre-fix.
+                if _fast_path and os.environ.get(
+                    "RAG_FAST_PATH_KEEP_WITH_TOOLS", ""
+                ).strip().lower() in ("", "0", "false", "no"):
+                    _fast_path_downgraded = True
+                    _web_model = _web_model_full
+                    _WEB_CHAT_OPTIONS = {
+                        **CHAT_OPTIONS,
+                        "num_ctx": _WEB_CHAT_NUM_CTX,
+                        "num_predict": 256,
+                    }
+                    print(
+                        f"[chat-fast-path-downgrade] pre-router fired "
+                        f"({len(_forced_tools)} tools); switching "
+                        f"{_LOOKUP_MODEL}→{_web_model} num_ctx="
+                        f"{_WEB_CHAT_OPTIONS['num_ctx']}",
+                        flush=True,
+                    )
 
             # Gate the LLM tool-deciding loop. Empirically the LLM rarely
             # picks tools beyond what the pre-router already fired (REGLA 1
@@ -6050,6 +6100,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # 2.75× speedup medido en prod (CLI 7d). Esta columna ahora
             # surfacea la ganancia real cuando `fast_path=True`.
             "fast_path": bool(result.get("fast_path", False)),
+            # Downgrade marker — True cuando el pre-router fired tools y
+            # el endpoint cambió runtime de _LOOKUP_MODEL (qwen2.5:3b) a
+            # qwen2.5:7b porque el contexto inflado por el tool output
+            # era letal para prefill en el modelo chico (ver bloque de
+            # downgrade en pre-router). Desacoplado del marker `fast_path`
+            # — `fast_path=True + fast_path_downgraded=True` significa
+            # "retrieve() pensó fast-path, pero la realidad del pre-router
+            # mandó downgrade". Util para medir cobertura real del
+            # adaptive routing vs lo que realmente corrió.
+            "fast_path_downgraded": bool(_fast_path_downgraded),
             # Retrieval stage timing — desde 2026-04-23, también para
             # el web endpoint. Incluye embed_ms / sem_ms / bm25_ms /
             # rrf_ms / reranker_ms / total_ms. Pre-fix solo el CLI

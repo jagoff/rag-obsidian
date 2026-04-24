@@ -111,6 +111,19 @@ export RAG_LOCAL_EMBED=1
 
 Para CLI one-shot (`rag query`, `rag chat`, `rag do`, `rag prep`, etc.) ya se activa solo. Usalo para `rag serve` / web server.
 
+### `RAG_FAST_PATH_KEEP_WITH_TOOLS` (default off)
+Rollback del auto-downgrade en `/api/chat` cuando el pre-router matchea tools estando en fast-path. Medido el 2026-04-23: query "qué pendientes tengo" disparaba `fast_path=True` (qwen2.5:3b + 4096 ctx) y además matchea el `_PLANNING_PAT` → `reminders_due + calendar_ahead` que inflan el CONTEXTO a 2-4K tokens. qwen2.5:3b prefillea eso a ~2.5ms/tok → `llm_prefill=11595ms, total=16.3s`.
+
+El downgrade runtime cambia al modelo full (qwen2.5:7b, ~0.5ms/tok prefill) cuando detecta `_fast_path=True AND _forced_tools!=[]`. El marker `fast_path` en telemetry no cambia; se agrega `fast_path_downgraded=True` cuando dispara.
+
+```bash
+# Restaurar comportamiento pre-fix (mantener qwen2.5:3b aunque el
+# pre-router haya inyectado tool output).
+export RAG_FAST_PATH_KEEP_WITH_TOOLS=1
+```
+
+Solo afecta `/api/chat` (web). El CLI y `rag serve` no usan pre-router regex con tools, así que no necesitan el gate.
+
 ### `RAG_LOCAL_EMBED_WAIT_MS` (default `6000`)
 Milisegundos que `retrieve()` espera para que el warmup del embedder local dispare el Event antes de caer a Ollama. **Default bumped 4000→6000 el 2026-04-23** tras observar producción: 4 CLI `query` consecutivas (2026-04-23T15:14-15:15) mostraron `embed_ms=4005` exacto — el wait timeaba justo antes del Event fire (~5s cold load en M3 Max), y el user pagaba 4s gratis de espera + 5ms de fallback Ollama warm.
 

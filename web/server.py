@@ -116,12 +116,20 @@ from web.tools import (  # noqa: E402
 # tengo hoy", "qué hay mañana". These are ambiguous enough that we fire
 # BOTH reminders_due AND calendar_ahead (via the shared pattern below)
 # so the LLM has tasks + events to build a picture of the timeframe.
+# Plurals: `\bX\b` no matchea "Xs" porque la `s` es word-char y el
+# segundo `\b` requiere transición word→non-word. User report 2026-04-24:
+# "cuales son mis ultimos mails?" devolvía info de WhatsApp porque el
+# pre-router regex fallaba en plurales españoles ("mails", "correos",
+# "eventos", "días", "semanas"…). Fix: sufijo `s?` antes del word-boundary
+# en cada token que aparece flexionado en español rioplatense. "clima" y
+# "tiempo" no tienen plural natural en este contexto pero los normalizamos
+# por consistencia (no introduce falsos positivos relevantes).
 _PLANNING_PAT = (
-    r"\bsemana\b|\bhoy\b|\bma[ñn]ana\b|pasado\s+ma[ñn]ana|\bd[ií]a\b|c[oó]mo\s+viene"
+    r"\bsemanas?\b|\bhoy\b|\bma[ñn]ana\b|pasado\s+ma[ñn]ana|\bd[ií]as?\b|c[oó]mo\s+viene"
     # "qué tengo / hay / tenés" only counts as planning when followed by a
     # temporal token (hoy, mañana, semana, día, agenda, pendiente) so that
     # "qué tengo sobre coaching" doesn't fire calendar + reminders.
-    r"|qu[eé]\s+(tengo|hay|ten[eé]s)\b(?=.{0,40}\b(hoy|ma[ñn]ana|semana|d[ií]a|agenda|pendient|tarea|recordator)\b)"
+    r"|qu[eé]\s+(tengo|hay|ten[eé]s)\b(?=.{0,40}\b(hoy|ma[ñn]ana|semanas?|d[ií]as?|agendas?|pendient|tarea|recordator)\b)"
 )
 
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
@@ -133,9 +141,9 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("reminders_due",   {}, r"pendient|tarea|to.?do|recordator|" + _PLANNING_PAT),
     # "inbox" / "bandeja" alone are too generic — Obsidian PARA uses
     # "00-Inbox" heavily. Require an explicit mail signal.
-    ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)\b|bandeja\s+de\s+entrada"),
-    ("calendar_ahead",  {}, r"calendari|\bevento\b|\bcita\b|reuni[oó]n|\bagenda\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
-    ("weather",         {}, r"\bclima\b|\btiempo\b|llov|lluvia|temperatur|pron[oó]stico"),
+    ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)s?\b|bandeja\s+de\s+entrada"),
+    ("calendar_ahead",  {}, r"calendari|\beventos?\b|\bcitas?\b|reuni[oó]n|\bagendas?\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
+    ("weather",         {}, r"\bclimas?\b|\btiempos?\b|llov|lluvia|temperatur|pron[oó]stico"),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
@@ -149,6 +157,84 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     if not q:
         return []
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
+
+
+# Etiqueta humana (español rioplatense) por tool, usada para componer el
+# hint de "intención explícita" que le pasamos al LLM cuando el pre-router
+# disparó un tool source-specific. El primer string es cómo nombramos la
+# fuente cuando el user pregunta por ella ("preguntó por tus mails"); el
+# segundo es el header de la sección en CONTEXTO que renderea
+# `_format_forced_tool_output` — el LLM tiene que anclar ahí su respuesta.
+# Tools que NO son source-specific (weather, finance_summary) no tienen
+# entrada acá porque no tiene sentido un fallback "busqué X y no encontré"
+# cuando X es el clima o un resumen financiero autogenerado.
+_SOURCE_INTENT_LABEL: dict[str, tuple[str, str]] = {
+    "gmail_recent": ("tus mails/correos", "### Mails"),
+    "calendar_ahead": ("tu calendario/agenda/eventos", "### Calendario"),
+    "reminders_due": ("tus recordatorios/pendientes", "### Recordatorios"),
+}
+
+
+def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
+    """Compone un system message turn-scoped que le dice al LLM:
+    "el user preguntó EXPLÍCITAMENTE por X; priorizá esa sección y, si
+    está vacía, reconocelo antes de mencionar otras fuentes".
+
+    Motivación (2026-04-24, Fer F. user report): el user preguntó "cuales
+    son mis ultimos mails?" y el sistema respondió resumiendo un hilo de
+    WhatsApp (Joana Gonzales sobre plantas) porque el retrieve devolvió
+    notas y chunks de WA con confidence=0.064 — bajo pero no bypass — y
+    el LLM obedeció REGLA 1 ("engancháte con el CONTEXTO") sin distinguir
+    que el user pidió específicamente mails. El fix de la regex (que
+    ahora sí matchea plurales españoles) hace que `gmail_recent` se
+    dispare y la sección "### Mails" aparezca en CONTEXTO — pero si está
+    vacía el LLM puede seguir respondiendo sobre otras secciones sin
+    reconocer el gap. Este hint fuerza:
+
+    1. Anclar la respuesta en la sección que corresponde a la fuente
+       pedida ("### Mails" para `gmail_recent`, etc).
+    2. Si esa sección está vacía o no responde lo que el user pidió,
+       DECIRLO explícitamente ("busqué en tus mails y no encontré nada")
+       ANTES de ofrecer un fallback de otras secciones.
+    3. Nunca responder sobre WhatsApp/notas como si fueran la respuesta
+       principal cuando el user pidió una fuente específica.
+
+    Devuelve None si ninguna de las tools disparadas es source-specific
+    (p.ej. solo weather) — en ese caso no hay hint que agregar y el
+    system prompt default es suficiente.
+    """
+    labels: list[tuple[str, str]] = []
+    for name in forced_tool_names:
+        if name in _SOURCE_INTENT_LABEL:
+            labels.append(_SOURCE_INTENT_LABEL[name])
+    if not labels:
+        return None
+    # Join "tus mails", "tu calendario" → "tus mails y tu calendario"
+    # (2 fuentes) o "tus mails, tu calendario y tus recordatorios" (3+).
+    name_parts = [lbl[0] for lbl in labels]
+    section_parts = [lbl[1] for lbl in labels]
+    if len(name_parts) == 1:
+        joined_names = name_parts[0]
+        joined_sections = section_parts[0]
+    elif len(name_parts) == 2:
+        joined_names = f"{name_parts[0]} y {name_parts[1]}"
+        joined_sections = f"{section_parts[0]} y {section_parts[1]}"
+    else:
+        joined_names = ", ".join(name_parts[:-1]) + f" y {name_parts[-1]}"
+        joined_sections = ", ".join(section_parts[:-1]) + f" y {section_parts[-1]}"
+    return (
+        f"INTENCIÓN EXPLÍCITA DEL USUARIO: preguntó por {joined_names}. "
+        f"Anclá tu respuesta en la sección {joined_sections} del CONTEXTO. "
+        f"Si esa sección está vacía o no menciona lo que el usuario "
+        f"específicamente pregunta, RECONOCELO EXPLÍCITO al comienzo de "
+        f"tu respuesta con una frase del tipo 'Busqué en {joined_names} "
+        f"y no encontré nada relevante'. Recién DESPUÉS, si hay contenido "
+        f"útil en otras secciones (WhatsApp, notas, etc.), ofrecelo como "
+        f"fallback con aclaración explícita ('te dejo X por si ayuda'). "
+        f"PROHIBIDO responder sobre WhatsApp, notas u otras fuentes como "
+        f"si fueran la respuesta principal cuando el usuario pidió "
+        f"específicamente {joined_names}."
+    )
 
 
 # ── Forced-tool output renderer (2026-04-22, Fer F. report) ──────────
@@ -5240,9 +5326,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # the regex. Propose-intent turns skip the pre-router entirely
         # (line ~4894) so mirror that gate here to avoid enabling a
         # bypass path the pre-router wouldn't honour.
-        _has_forced_tools = (
-            False if is_propose_intent else bool(_detect_tool_intent(question))
+        # 2026-04-24: capturamos la LISTA además del bool para poder
+        # reusarla más abajo al armar el `_system_msgs` — si alguno de
+        # los tools disparados es source-specific (gmail_recent,
+        # calendar_ahead, reminders_due) le agregamos al LLM un hint
+        # que fuerza "si la sección pedida está vacía, decilo antes de
+        # fallback-ear a otra fuente". El tool loop de más abajo también
+        # llama _detect_tool_intent con el mismo `question` — se podría
+        # DRY reutilizando esta variable, pero por ahora el regex scan
+        # es sub-microsegundo y preservamos esa call local para no
+        # acoplar los dos sitios.
+        _forced_tool_pairs: list[tuple[str, dict]] = (
+            [] if is_propose_intent else _detect_tool_intent(question)
         )
+        _has_forced_tools = bool(_forced_tool_pairs)
 
         if not result["docs"]:
             # Propose-intent turns don't need vault context — the tool
@@ -5606,6 +5703,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 {"role": "system", "content": _WEB_SYSTEM_PROMPT},
                 {"role": "system", "content": _WEB_TOOL_ADDENDUM},
             ]
+            # Source-specific intent hint (2026-04-24, Fer F. user report):
+            # si el pre-router fired un tool source-specific (gmail_recent,
+            # calendar_ahead, reminders_due), agregamos un 3er system msg
+            # turn-scoped que le dice al LLM "el user preguntó por X, anclá
+            # ahí, si está vacío decilo antes de fallback-ear". Antes el LLM
+            # veía "### Mails" vacía en CONTEXTO y seguía respondiendo sobre
+            # WhatsApp/notas como si fueran la respuesta principal, sin
+            # reconocer que el user pidió mails específicamente.
+            #
+            # Prefix cache impact: el hint es turn-scoped y se agrega en
+            # ~10-20% del tráfico (estimado por cobertura de las 3 regex
+            # source-specific). Para esos turns el prefix cache de ollama
+            # queda cold en el 3er system msg (los 2 primeros siguen
+            # byte-identical). Tradeoff aceptable: el hint evita respuestas
+            # user-hostile — prefijos 1&2 siguen dominando la latencia.
+            _src_hint = _build_source_intent_hint(
+                [name for name, _args in _forced_tool_pairs]
+            )
+            if _src_hint:
+                _system_msgs.append({"role": "system", "content": _src_hint})
             _turn_history = history or []
         tool_messages: list[dict] = (
             _system_msgs

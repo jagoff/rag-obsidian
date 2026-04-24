@@ -893,7 +893,107 @@ def test_low_conf_bypass_without_forced_tools_still_fires(chat_env, monkeypatch)
     )
 
 
-# ── 10. Metachat SSE: `metachat: true` flag in sources + done ─────────────
+# ── 10. Source-specific intent hint — bug report 2026-04-24 ──────────────
+
+
+@pytest.mark.requires_ollama
+def test_source_intent_hint_injected_when_pre_router_fires_gmail(
+    chat_env, monkeypatch,
+):
+    """Regression 2026-04-24 (Fer F. user report): "cuales son mis ultimos
+    mails?" enganchó `gmail_recent` en el pre-router (tras fix de regex
+    plurals) pero el LLM seguía respondiendo sobre WhatsApp/notas como si
+    fueran la respuesta principal. Fix: inyectar un 3er system msg
+    turn-scoped (`_build_source_intent_hint`) que le dice al LLM "anclá
+    en '### Mails', si está vacío decilo ANTES de fallback".
+
+    Este test verifica que cuando una query dispara `gmail_recent` vía
+    pre-router, el `messages=` que recibe `ollama.chat` incluye un system
+    message adicional con la frase 'INTENCIÓN EXPLÍCITA' y el texto de
+    fallback esperado ('Busqué en tus mails/correos').
+    """
+    monkeypatch.setattr(
+        tools_mod, "_fetch_gmail_evidence",
+        lambda now: {"unread_count": 0, "awaiting_reply": [], "starred": []},
+    )
+
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),         # tool-deciding round, no extra tools
+        _mk_stream(["ok"]),             # final streaming
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("cuales son mis ultimos mails?")
+    assert events, "SSE stream vacío"
+
+    # El pre-router debe haber ejecutado `gmail_recent`.
+    tool_names_called = {
+        data.get("name")
+        for ev, data in events
+        if ev == "status" and data.get("stage") == "tool"
+    }
+    assert "gmail_recent" in tool_names_called, (
+        f"pre-router NO disparó gmail_recent (bug regex plurals vuelto?); "
+        f"tools ejecutados: {tool_names_called}"
+    )
+
+    # Primer call a ollama.chat = tool-deciding round.
+    first_call = mock.calls[0]
+    messages = first_call.get("messages") or []
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    # Default = 2 system msgs (_WEB_SYSTEM_PROMPT + _WEB_TOOL_ADDENDUM).
+    # Con source-specific intent agregamos el 3er: el hint.
+    assert len(system_msgs) >= 3, (
+        f"Esperaba ≥3 system messages (hint incluido), got {len(system_msgs)}"
+    )
+    hint_msg = system_msgs[-1]["content"]
+    assert "INTENCIÓN EXPLÍCITA" in hint_msg, (
+        f"El 3er system msg no parece el hint source-specific: "
+        f"{hint_msg[:200]!r}"
+    )
+    assert "tus mails/correos" in hint_msg
+    assert "Busqué en tus mails/correos" in hint_msg
+    assert "### Mails" in hint_msg
+
+
+@pytest.mark.requires_ollama
+def test_source_intent_hint_omitted_when_no_source_specific_tools(
+    chat_env, monkeypatch,
+):
+    """No-regression: queries que NO disparan tools source-specific no
+    deben pagar la inyección del hint (prefix cache se mantiene warm).
+    Query "hola" no matchea ningún regex del pre-router → solo 2 system
+    msgs en el stack.
+    """
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["hola!"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    # "dame info sobre grecia" — query semántica de vault sin pre-router match.
+    events, _ = _post_chat("dame info sobre grecia")
+    if not mock.calls:
+        # Metachat bypass o low-conf bypass pudo firing — en ese caso el
+        # test no aplica (no hubo call a ollama). La ausencia de hint se
+        # verifica vía ausencia del msg en tool_messages, que requiere
+        # una call real.
+        pytest.skip("sin llamada a ollama.chat (bypass path)")
+
+    first_call = mock.calls[0]
+    messages = first_call.get("messages") or []
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    # Esperamos exactamente 2 (prompt + addendum), NO 3.
+    assert len(system_msgs) == 2, (
+        f"hint se inyectó sin pre-router match (no debería): "
+        f"{len(system_msgs)} system msgs"
+    )
+    assert not any("INTENCIÓN EXPLÍCITA" in m["content"] for m in system_msgs)
+
+
+# ── 11. Metachat SSE: `metachat: true` flag in sources + done ─────────────
 
 
 def test_metachat_sources_event_flags_metachat_true():

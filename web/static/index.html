@@ -12,10 +12,49 @@
        se funda con la app en vez de quedar un gap blanco. -->
   <meta name="theme-color" content="#1a1a1f">
   <meta name="apple-mobile-web-app-capable" content="yes">
+  <!-- mobile-web-app-capable: equivalente cross-browser (Chrome Android /
+       Edge / Samsung). iOS sigue mirando apple-mobile-web-app-capable; lo
+       dejamos igual para compat. -->
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="rag">
   <title>rag</title>
+
+  <!-- ── PWA wiring ────────────────────────────────────────────────
+       Manifest + icons + splash screens. Regenerar con
+       `.venv/bin/python scripts/gen_pwa_assets.py` si cambia branding.
+  -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+
+  <!-- iPhone splash screens (portrait). Un media query por device para
+       que iOS levante el PNG del tamaño exacto. Regenerados por
+       scripts/gen_pwa_assets.py (ver el archivo para la lista completa). -->
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-x.png"
+        media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xr.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xs-max.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-mini.png"
+        media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12.png"
+        media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-pro-max.png"
+        media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro.png"
+        media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro-max.png"
+        media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro.png"
+        media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
+        media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+
   <link rel="stylesheet" href="/static/style.css?v=2026-04-22-mobile-responsive">
+  <script src="/static/pwa/register-sw.js" defer></script>
 </head>
 <body>
   <header id="topbar">

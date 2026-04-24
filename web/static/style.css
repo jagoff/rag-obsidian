@@ -54,6 +54,43 @@ html, body {
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* iOS standalone PWA polish — todo opt-in para native-feel sin romper
+     la web en browser normal:
+       · text-size-adjust: iOS reescala el texto en landscape por default
+         (presume que la web "no está pensada para mobile" y bumpea fonts
+         unilateralmente). 100% lo desactiva — ya somos responsive.
+       · tap-highlight-color: el flash gris al tapear links/buttons no
+         existe en apps nativas; transparent lo mata.
+       · -webkit-touch-callout: none evita el menú contextual "Copiar /
+         Compartir" al long-press en elementos UI (sigue andando dentro
+         de textarea/input/output via overrides más abajo). */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Pull-to-refresh/bounce off en el container raíz — en una PWA standalone
+   el bounce de WebKit delata que "es una webview"; native apps suelen
+   anclar el scroll al contenido. El `contain` también previene que el
+   gesto propague scroll al parent (iOS rebota todo el body si no). */
+html {
+  overscroll-behavior-y: none;
+}
+
+/* Text selection: permitida en mensajes del chat y en inputs; deshabilitada
+   en chrome (topbar, botones, tabs) para que los long-press no abran el
+   menú de selección por accidente al scrollear. El `#messages` override
+   devuelve select al contenido útil. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+#messages, #messages *, textarea, input, .md-output, .md-output *,
+.message, .message *, .answer, .answer *, pre, code, kbd {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 #topbar {
@@ -61,7 +98,11 @@ html, body {
   top: 0;
   right: 0;
   left: 0;
-  padding: 16px 20px 10px;
+  /* padding-top suma safe-area-inset-top para dejar el notch / Dynamic
+     Island libres cuando se corre en PWA standalone (sin safari chrome).
+     En browser normal safe-area-inset-top = 0 → no afecta. El
+     `env(..., 0)` fallback protege contra browsers viejos. */
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 20px 10px;
   background: linear-gradient(180deg, var(--bg) 70%, transparent 100%);
   z-index: 10;
   font-size: 12px;
@@ -2017,9 +2058,12 @@ strong, b, th {
  * ═══════════════════════════════════════════════════════════════════════*/
 
 @media (max-width: 640px) {
-  /* Topbar: esconder controles secundarios. Logo + help siguen visibles. */
+  /* Topbar: esconder controles secundarios. Logo + help siguen visibles.
+     Mismo patrón de safe-area-inset-top que el breakpoint desktop —
+     bajo PWA standalone en iPhone el topbar sube al área del notch y
+     queda el logo tapado si no compensamos. */
   #topbar {
-    padding: 10px 12px 8px;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 8px;
   }
   .topbar-inner {
     gap: 8px;

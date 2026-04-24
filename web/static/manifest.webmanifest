@@ -1,0 +1,65 @@
+{
+  "name": "rag · obsidian-rag",
+  "short_name": "rag",
+  "id": "/chat",
+  "start_url": "/chat",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#1a1a1f",
+  "theme_color": "#1a1a1f",
+  "lang": "es",
+  "dir": "ltr",
+  "description": "Chat sobre tu vault Obsidian — local, privado, contextual.",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/static/pwa/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/pwa/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/pwa/icon-192-maskable.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/static/pwa/icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Chat",
+      "short_name": "Chat",
+      "description": "Conversación nueva con el vault",
+      "url": "/chat",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Home",
+      "short_name": "Home",
+      "description": "Resumen del día + pendientes",
+      "url": "/",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "description": "Analytics del corpus",
+      "url": "/dashboard",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

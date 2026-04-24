@@ -111,6 +111,51 @@ exec zsh
 
 El generador ([`scripts/gen_zsh_completion.py`](scripts/gen_zsh_completion.py)) camina el árbol de Click, emite `_arguments`/`_describe` nativos, detecta `click.Choice`/`click.Path`/`click.File` → actions correctas, y escapa single-quotes con el truco `'\''`. No regenera automáticamente en CI — quedó a ojo del dev que toca el CLI; si el completion queda stale, peor caso: Tab no sugiere el flag nuevo (no rompe nada).
 
+## PWA (iOS add-to-home-screen)
+
+El web server sirve una [PWA](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps) instalable en iPhone que corre en pantalla completa (sin chrome de Safari) con splash screen custom y shell cacheado offline. El wiring está en:
+
+- [`web/static/manifest.webmanifest`](web/static/manifest.webmanifest) — `start_url=/chat`, `display=standalone`, icons (192/512 any + maskable), shortcuts a home/chat/dashboard.
+- [`web/static/sw.js`](web/static/sw.js) — service worker. Estrategia: stale-while-revalidate para el shell (/, /chat, /dashboard), cache-first para `/static/**` con refresh oportunista, network-only para `/api/**` (no cacheamos streams SSE ni respuestas privadas del RAG).
+- [`web/static/pwa/register-sw.js`](web/static/pwa/register-sw.js) — registra el SW desde los 3 HTML + muestra banner de "Agregar a pantalla de inicio" en iOS la primera vez (dismisseable, persiste en `localStorage`).
+- FastAPI routes [`/manifest.webmanifest`](web/server.py) y [`/sw.js`](web/server.py) — servidos desde root (no desde `/static/`) porque el SW scope debe ser `/` para controlar todas las páginas; [`web/server.py:1034-1059`](web/server.py).
+- [`scripts/gen_pwa_assets.py`](scripts/gen_pwa_assets.py) — genera icons + splash screens para 10 modelos de iPhone (X → 16 Pro Max) usando Pillow.
+
+**Instalar en iPhone** (el user, no el dev):
+
+1. Abrir [ra.ai/chat](https://ra.ai/chat) en **Safari** (no Chrome — Chrome iOS no soporta PWA install).
+2. Tocar el botón **Compartir** (↑ con flechita) en la barra inferior.
+3. Scrollear hasta **"Agregar a pantalla de inicio"** → tocar.
+4. Confirmar el nombre ("rag") y tocar **Agregar**.
+5. Cerrar Safari. El icono aparece en home screen como una app nativa.
+
+Al abrir el icono el user ve: splash screen minimal con `rag·` centrado (el mismo logo del icon) durante el boot (~300ms), luego el chat directo, sin barra de Safari. Safe-area respetada (notch / Dynamic Island) vía `viewport-fit=cover` + `env(safe-area-inset-*)` en el CSS.
+
+**Regenerar assets** (cuando cambie branding, o Apple saque un iPhone nuevo):
+
+```bash
+.venv/bin/python scripts/gen_pwa_assets.py [--print-html]
+```
+
+Genera 17 PNGs en `web/static/pwa/` (icons + maskable + apple-touch-icon + favicons + 10 splash screens). `--print-html` imprime el snippet de `<link rel="apple-touch-startup-image">` para pegar en los 3 HTML si se agregó/cambió un device.
+
+**Forzar update del SW** (cuando rompe algo o querés wipe del cache en un user):
+
+En la consola del browser (DevTools → Application → Service Workers):
+```js
+navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()))
+caches.keys().then(ks => ks.forEach(k => caches.delete(k)))
+```
+
+O bumpear `CACHE_VERSION` en [`web/static/sw.js`](web/static/sw.js) — el nuevo SW borra los caches viejos en el `activate` handler automáticamente.
+
+**Limitaciones conocidas iOS**:
+- No hay `beforeinstallprompt` en Safari → no se puede triggerear el flow de install programáticamente. Por eso mostramos el banner manual.
+- Push notifications sólo desde iOS 16.4 y sólo cuando la PWA está instalada en home screen.
+- Safari agresivo matando el SW (~20-30s de idle) → stale-while-revalidate es la estrategia correcta (no cache-first exclusivo).
+
+Tests: [`tests/test_web_pwa.py`](tests/test_web_pwa.py) (9 casos: manifest mime+body+cache, SW headers+body, files-on-disk, 3 HTML wiring, shortcut routes válidas).
+
 ## Commands
 
 ```bash

@@ -1016,6 +1016,49 @@ def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# ── PWA endpoints ─────────────────────────────────────────────────────
+# El manifest y el service worker DEBEN servirse desde la raíz para que
+# el SW pueda controlar el scope "/" (home + /chat + /dashboard). Un SW
+# servido en /static/sw.js sólo cubre /static/** — inútil para nosotros.
+# Podríamos mandar el header `Service-Worker-Allowed: /` para extender
+# el scope sin mover el archivo, pero tener los archivos físicos en
+# /static/ + un proxy controller acá es más simple que toquetear
+# middlewares de StaticFiles.
+#
+# Cache del manifest: 1 día (cambia raro, pero no queremos que un bump
+# de icons quede invisible por semanas). El SW mismo: `no-cache` para
+# que updates al archivo JS se detecten al toque (browser lo chequea
+# a cada navegación por spec). Sin este `no-cache` los updates del SW
+# pueden tardar hasta 24h en llegar al device del usuario — incluso con
+# `updateViaCache: "none"` en el register().
+@app.get("/manifest.webmanifest")
+def manifest() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "manifest.webmanifest",
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/sw.js")
+def service_worker() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={
+            # no-cache fuerza el browser a revalidar con ETag/Last-Modified
+            # en cada request. No es no-store — si el server responde 304,
+            # el browser usa el JS cacheado. Este es el setting que
+            # recomienda la spec SW para archivos SW.
+            "Cache-Control": "no-cache",
+            # Permite cambiar el scope del SW en el futuro sin mover
+            # el archivo (no lo necesitamos hoy porque ya está en root,
+            # pero lo dejamos como hint declarativo).
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
 _CHAT_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:@\-]{1,80}$")
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _CHAT_QUESTION_MAX = 16000  # ~4k tokens — bumped from 8000 (2026-04-20) because users sometimes paste long doc excerpts into chat; 16000 still well under CHAT_OPTIONS num_ctx=4096 × 4 chars/token

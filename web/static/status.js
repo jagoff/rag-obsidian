@@ -907,49 +907,118 @@
     });
   }
 
-  // ── Heatmap mock (PREVIEW) ──────────────────────────────────────────
-  // Generate 7 rows × 24 cols de cuadraditos con un patrón semi-random
-  // pero determinístico, para que el diseño se vea con datos verosímiles
-  // (no todos verdes, no todos random). Real version leerá de un endpoint
-  // que persiste samples del status probe por hora.
-  function buildHeatmapMock() {
-    const container = document.getElementById("heatmap-mock");
-    if (!container) return;
-    const days = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
-    // Patrón verosímil: la mayoría 100%; algunos spikes de 95/low los
-    // jueves y domingos a las 3-4am (ingest heavy); 99s aislados.
-    function classFor(d, h) {
-      if ((d === 3 && h === 3) || (d === 6 && h === 4)) return "uptime-low";  // downtime real
-      if ((d === 3 && h === 4) || (d === 6 && h === 5)) return "uptime-95";   // recovery
-      if ((h === 3 || h === 4) && d % 2 === 0) return "uptime-99";             // ingest slowdowns
-      if (h >= 2 && h <= 5 && d === 0) return "uptime-99";                      // monday morning warmup
-      if (d === 6 && h === 23) return "uptime-none";                            // sin data futura
-      return "uptime-100";
+  // ── Uptime heatmap card (real) ──────────────────────────────────────
+  // /api/status/uptime devuelve un row por servicio core, cada uno con
+  // 168 buckets (7d × 24h) ordenados cronológicamente (viejo → nuevo).
+  // Para cada bucket: uptime_pct (0..100 o null si sin samples).
+  //
+  // Nota: hay 5 servicios en _UPTIME_TRACKED_SERVICES (web, ollama,
+  // rag-db, telemetry, vault). Cada uno se renderea como una fila con
+  // label + grid de 168 celdas coloreadas por uptime%.
+
+  const $heatmap = document.getElementById("heatmap");
+  const $uptimeHeadline = document.getElementById("uptime-headline");
+  const $uptimeHeadlineUnit = document.getElementById("uptime-headline-unit");
+  const $uptimeMeta = document.getElementById("uptime-meta");
+
+  async function fetchUptime() {
+    try {
+      const resp = await fetch("/api/status/uptime", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderUptime(data);
+    } catch (e) {
+      console.error("[status] uptime fetch failed", e);
+      if ($uptimeMeta) $uptimeMeta.textContent = "sin datos";
     }
+  }
+
+  function renderUptime(payload) {
+    const services = Array.isArray(payload.services) ? payload.services : [];
+    if (!services.length || !$heatmap) {
+      if ($uptimeHeadline) $uptimeHeadline.textContent = "—";
+      if ($uptimeMeta) $uptimeMeta.textContent = "sin datos";
+      if ($heatmap) $heatmap.innerHTML = "";
+      return;
+    }
+
+    // Headline: avg uptime de los 5 servicios (filtrando nulls). Si todos
+    // los services son null (nueva install, sin samples todavía), mostrar
+    // "esperando datos" en vez de un 0% engañoso.
+    const withData = services.filter((s) => s.uptime_pct_7d != null);
+    if (withData.length === 0) {
+      $uptimeHeadline.textContent = "—";
+      $uptimeHeadlineUnit.textContent = "esperando datos";
+      $uptimeMeta.textContent = `0/${services.length} servicios con samples`;
+      $uptimeMeta.className = "insight-delta neutral";
+    } else {
+      const avg = withData.reduce((s, x) => s + x.uptime_pct_7d, 0) / withData.length;
+      $uptimeHeadline.textContent = `${avg.toFixed(2)}%`;
+      $uptimeHeadlineUnit.textContent = "uptime promedio 7d";
+      const totalSamples = services.reduce((s, x) => s + (x.samples_7d || 0), 0);
+      $uptimeMeta.textContent = `${withData.length}/${services.length} con datos · ${totalSamples} samples`;
+      // Color del meta según el avg.
+      if (avg >= 99.5) $uptimeMeta.className = "insight-delta better";
+      else if (avg >= 95) $uptimeMeta.className = "insight-delta worse";
+      else $uptimeMeta.className = "insight-delta bad";
+    }
+
+    // Construir 1 fila por servicio + axis labels al final.
+    $heatmap.innerHTML = "";
     const frag = document.createDocumentFragment();
-    for (let d = 0; d < 7; d++) {
+    for (const svc of services) {
       const row = document.createElement("div");
       row.className = "heatmap-row";
+
       const label = document.createElement("span");
       label.className = "heatmap-label";
-      label.textContent = days[d];
+      label.textContent = svc.label || svc.id;
+      label.title = svc.uptime_pct_7d != null
+        ? `${svc.label}: ${svc.uptime_pct_7d.toFixed(2)}% uptime · ${svc.samples_7d} samples 7d`
+        : `${svc.label}: sin samples todavía`;
       row.appendChild(label);
+
       const grid = document.createElement("div");
-      grid.className = "heatmap-grid";
-      for (let h = 0; h < 24; h++) {
+      grid.className = "heatmap-grid heatmap-grid-168";
+      const buckets = svc.buckets || [];
+      for (const b of buckets) {
         const cell = document.createElement("div");
-        cell.className = `heatmap-cell ${classFor(d, h)}`;
-        cell.title = `${days[d]} ${String(h).padStart(2, "0")}h`;
+        cell.className = `heatmap-cell ${uptimeClass(b.uptime_pct)}`;
+        // Tooltip: "lun 14h · 99.2% · 5 samples" o "lun 14h · sin datos".
+        const ts = b.ts ? new Date(b.ts) : null;
+        const tsLabel = ts ? fmtBucketTs(ts) : "—";
+        cell.title = b.uptime_pct != null
+          ? `${tsLabel} · ${b.uptime_pct.toFixed(1)}% · ${b.samples} samples`
+          : `${tsLabel} · sin datos`;
         grid.appendChild(cell);
       }
       row.appendChild(grid);
       frag.appendChild(row);
     }
+
+    // Axis: 4 marcas (hace 7d, 5d, 3d, 1d, hoy) — ayuda a orientarse.
     const axis = document.createElement("div");
-    axis.className = "heatmap-axis";
-    axis.innerHTML = "<span>00</span><span>06</span><span>12</span><span>18</span><span>24</span>";
+    axis.className = "heatmap-axis heatmap-axis-7d";
+    axis.innerHTML = "<span>-7d</span><span>-5d</span><span>-3d</span><span>-1d</span><span>hoy</span>";
     frag.appendChild(axis);
-    container.appendChild(frag);
+
+    $heatmap.appendChild(frag);
+  }
+
+  function uptimeClass(pct) {
+    if (pct == null) return "uptime-none";
+    if (pct >= 99.5) return "uptime-100";
+    if (pct >= 95) return "uptime-99";
+    if (pct >= 80) return "uptime-95";
+    return "uptime-low";
+  }
+
+  function fmtBucketTs(d) {
+    const days = ["dom", "lun", "mar", "mié", "jue", "vie", "sáb"];
+    const day = days[d.getDay()];
+    const h = String(d.getHours()).padStart(2, "0");
+    const dom = d.getDate();
+    return `${day} ${dom} · ${h}h`;
   }
 
   // Kick-off: primer fetch inmediato + loop + insights.
@@ -958,8 +1027,8 @@
   fetchErrors();
   fetchFreshness();
   fetchLogs();
+  fetchUptime();
   wireLogsFilters();
-  buildHeatmapMock();
   startLoop();
 
   // El refresh manual también refresca los insights reales, sin reset
@@ -970,6 +1039,7 @@
     fetchErrors();
     fetchFreshness();
     fetchLogs();
+    fetchUptime();
   });
 
   // Loops separados alineados con los TTL server-side:
@@ -985,9 +1055,11 @@
   // leaks si el SPA se re-mounteara) y pausar/resumir en
   // `visibilitychange` (cuando la pestaña va a background no tiene
   // sentido seguir polleando — el server timea cache de 30-60s).
-  const INSIGHT_PERIODS = { lat: 60000, err: 30000, fresh: 30000, logs: 15000 };
-  const INSIGHT_FNS = { lat: fetchLatency, err: fetchErrors, fresh: fetchFreshness, logs: fetchLogs };
-  const insightIvs = { lat: null, err: null, fresh: null, logs: null };
+  // uptime: cache 90s → poll 120s (los buckets horarios cambian de a
+  // poco, no hace falta refetchear seguido).
+  const INSIGHT_PERIODS = { lat: 60000, err: 30000, fresh: 30000, logs: 15000, uptime: 120000 };
+  const INSIGHT_FNS = { lat: fetchLatency, err: fetchErrors, fresh: fetchFreshness, logs: fetchLogs, uptime: fetchUptime };
+  const insightIvs = { lat: null, err: null, fresh: null, logs: null, uptime: null };
 
   function startInsightLoops() {
     for (const k of Object.keys(insightIvs)) {
@@ -1028,6 +1100,7 @@
         fetchErrors();
         fetchFreshness();
         fetchLogs();
+        fetchUptime();
       }
     }
   });

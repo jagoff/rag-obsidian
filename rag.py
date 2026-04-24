@@ -5325,6 +5325,35 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_reminder_wa_pushed(pushed_at)",
         ),
     ),
+    (
+        # Status probe samples — one row per (timestamp, service_id) for
+        # the uptime heatmap on /status. Populated by web/server.py
+        # `_persist_status_samples` que se cuelga al final de cada
+        # `_status_build_payload` con un rate-limit de ~60s para mantener
+        # la tabla chica.
+        #
+        # Keep window: 8 días (1 más que el heatmap UI muestra) para que
+        # el query de "últimos 7d" siempre tenga data sin border effects.
+        # Pruning manual via `DELETE WHERE ts < datetime('now', '-8 days')`
+        # — no agregamos un cron especial, lo limpia cualquier write que
+        # detecte la cota; en proyección de 60s × 5 services × 7d = 50k
+        # rows max, que es nada.
+        #
+        # status: ok | warn | down | unknown — espeja el contract del
+        # `/api/status` payload top-level. Sin enum CHECK constraint para
+        # permitir extensiones futuras (e.g. "starting", "draining").
+        "rag_status_samples",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_status_samples ("
+            " ts TEXT NOT NULL,"
+            " service_id TEXT NOT NULL,"
+            " status TEXT NOT NULL,"
+            " PRIMARY KEY (ts, service_id)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_status_samples_service_ts "
+            "ON rag_status_samples(service_id, ts)",
+        ),
+    ),
 )
 
 
@@ -11333,14 +11362,97 @@ def _fold_for_match(s: str) -> str:
     return "".join(c for c in n if not unicodedata.combining(c))
 
 
+def _recent_contact_keys(channel: str, limit: int = 20) -> list[str]:
+    """Devuelve las "keys" (digits del teléfono o emails lowercased) de los
+    contactos a los que el user mandó WhatsApp / mail más recientemente,
+    ordenados por recency DESC sin duplicados. Lee del audit log
+    (`rag_ambient` table en telemetry.db) los últimos eventos
+    `whatsapp_user_send` / `whatsapp_user_reply` (channel=``phone``) o
+    ``mail_user_send`` (channel=``email``).
+
+    Útil para el picker de ``/wzp`` y ``/mail``: al typear el comando con
+    espacio sin más el popover muestra los recents primero (way más
+    útil que orden alfabético — los contactos que más se usan suelen
+    repetirse). Si la tabla está vacía / la DB no existe / falla la
+    lectura → ``[]`` (silent fail, el caller cae al orden alfabético).
+
+    Args:
+        channel: ``phone`` | ``email``. Otros valores → [].
+        limit: Cantidad máxima de keys distintas a devolver. El query
+            mismo lee 5x este número de events para asegurar que tras
+            dedupe queden ``limit`` distintas (worst-case real: el user
+            acaba de mandar 5 mensajes a la misma persona).
+
+    Returns:
+        Lista de digit strings (``["5491155555555", "5493426265810", ...]``)
+        para channel=phone, o emails lowercased para channel=email.
+        Sin duplicados; orden = más reciente primero.
+    """
+    if channel not in ("phone", "email"):
+        return []
+    if limit <= 0:
+        return []
+    cmds = (("whatsapp_user_send", "whatsapp_user_reply") if channel == "phone"
+            else ("mail_user_send",))
+    field = "jid" if channel == "phone" else "to"
+
+    # Read 5x more events than needed because the same JID can repeat.
+    fetch_n = max(20, limit * 5)
+    rows: list[tuple] = []
+    try:
+        with _ragvec_state_conn() as conn:
+            placeholders = ",".join("?" for _ in cmds)
+            rows = conn.execute(
+                f"SELECT payload_json FROM rag_ambient "
+                f"WHERE cmd IN ({placeholders}) "
+                f"ORDER BY id DESC LIMIT ?",
+                (*cmds, fetch_n),
+            ).fetchall()
+    except Exception as exc:
+        _silent_log("recent_contact_keys", exc)
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for (payload_json,) in rows:
+        if not payload_json:
+            continue
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            continue
+        raw = payload.get(field) or ""
+        if not raw:
+            continue
+        if channel == "phone":
+            # Strip non-digits — JIDs vienen como "549...@s.whatsapp.net"
+            # o "120363...@g.us"; tomamos sólo los dígitos antes del @.
+            digits = "".join(c for c in raw.split("@", 1)[0] if c.isdigit())
+            if not digits or len(digits) < 8:
+                continue
+            key = digits
+        else:
+            key = raw.strip().lower()
+            if "@" not in key:
+                continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _fuzzy_filter_contacts(q: str, kind: str = "any", limit: int = 20) -> list[dict]:
     """Filtro fuzzy del cache de contactos para el picker de /wzp y /mail.
 
     Args:
         q: Substring a matchear contra ``name`` (case-insensitive,
             sin acentos vía ``_fold_for_match``). Vacío → primeros
-            ``limit`` contactos en orden alfabético (placeholder visual
-            apenas el user typea ``/wzp ``).
+            ``limit`` contactos en orden de **recency** (los últimos a
+            los que el user le mandó algo en ese canal), con fallback
+            a orden alfabético si no hay recents en el ambient log.
         kind: ``phone`` | ``email`` | ``any``. Filtra contactos que
             tengan al menos un valor del canal pedido. ``/wzp`` necesita
             ``phone``; ``/mail`` necesita ``email``.
@@ -11349,9 +11461,13 @@ def _fuzzy_filter_contacts(q: str, kind: str = "any", limit: int = 20) -> list[d
     Returns:
         Lista de ``{name, phones, emails, score}`` ordenada por:
           1. score DESC (3 exact > 2 prefix > 1 substring > 0 sin query)
-          2. name ASC (alfabético, case-insensitive)
+          2. Para query="": recents primero (preserve ambient-log order),
+             alphabetical para el resto.
+          3. Para query con texto: name ASC (alfabético, case-insensitive)
+             como tie-breaker.
 
-        Si el cache está frío / osascript silently-fails, devuelve [].
+        Si el cache de contactos está frío / osascript silently-fails,
+        devuelve [].
     """
     # Clamp limit a [1, 100] — los tests esperan que limit=0 se trate
     # como 1 (UI defensiva) y limit>100 se trate como 100 (cota de payload).
@@ -11368,10 +11484,65 @@ def _fuzzy_filter_contacts(q: str, kind: str = "any", limit: int = 20) -> list[d
 
     qfold = _fold_for_match(q.strip())
     if not qfold:
-        # Sin query: primeros N en orden alfabético folded (acentos plegados),
-        # con score=0. Sin esto "Ágatha" caería al final por codepoint orden.
-        ordered = sorted(contacts, key=lambda c: _fold_for_match(c["name"]))
-        return [{**c, "score": 0} for c in ordered[:limit]]
+        # Sin query: prioridad a recents (los contactos a los que el user
+        # mandó WA / mail más recientemente). Si no hay recents → fallback
+        # a orden alfabético. Para `kind="any"` consultamos ambos canales
+        # y mergeamos manteniendo recency global.
+        recent_keys: list[str] = []
+        if kind_norm == "phone":
+            recent_keys = _recent_contact_keys("phone", limit=limit)
+        elif kind_norm == "email":
+            recent_keys = _recent_contact_keys("email", limit=limit)
+        elif kind_norm == "any":
+            # Merge interleaved: tomamos recents de ambos canales y los
+            # ordenamos por recency global. Como `_recent_contact_keys`
+            # ya ordena por recency dentro del canal, alcanza con
+            # concatenar — el dedupe final por contacto preserva el
+            # primer hit (el más reciente entre los dos canales).
+            recent_keys = (_recent_contact_keys("phone", limit=limit) +
+                           _recent_contact_keys("email", limit=limit))
+
+        recents: list[dict] = []
+        used_names: set[str] = set()
+        if recent_keys:
+            for key in recent_keys:
+                # Match contra los contactos disponibles. Para phone keys
+                # comparamos digit-normalized (igual que el cache index);
+                # para emails comparamos lowercased.
+                match = None
+                if "@" in key:
+                    # email key (channel=email o branch any)
+                    for c in contacts:
+                        emails_lower = [e.lower() for e in c.get("emails", []) if e]
+                        if key in emails_lower:
+                            match = c
+                            break
+                else:
+                    # phone digits key — match contra cualquier phone del
+                    # contacto, digit-normalized + tolerante al sufijo de
+                    # 8 dígitos (mismo patrón que `_fetch_contact_by_phone`).
+                    for c in contacts:
+                        for ph in c.get("phones", []) or []:
+                            phd = "".join(ch for ch in ph if ch.isdigit())
+                            if phd == key or (len(key) >= 8 and phd.endswith(key[-8:])):
+                                match = c
+                                break
+                        if match:
+                            break
+                if match and match["name"] not in used_names:
+                    used_names.add(match["name"])
+                    recents.append({**match, "score": 0})
+                    if len(recents) >= limit:
+                        break
+
+        # Resto: alfabético folded, excluyendo los que ya están en recents.
+        ordered_alpha = sorted(
+            (c for c in contacts if c["name"] not in used_names),
+            key=lambda c: _fold_for_match(c["name"]),
+        )
+        rest_needed = max(0, limit - len(recents))
+        rest = [{**c, "score": 0} for c in ordered_alpha[:rest_needed]]
+        return recents + rest
 
     scored: list[dict] = []
     for c in contacts:
@@ -45168,18 +45339,25 @@ def _pendientes_recent_contradictions(
 
     Reads from rag_contradictions (SQL-only since T10). The `log_path` arg
     is retained for call-site compatibility but no longer consulted. On SQL
-    error: empty list.
+    error: empty list (after retry budget — `_sql_read_with_retry` swallows
+    transient `database is locked` + `disk I/O error` for up to 5 attempts
+    with jittered backoff, so a brief writer holding the WAL doesn't blank
+    the home page's contradictions panel).
     """
     cutoff = now - timedelta(days=days)
     cutoff_iso = cutoff.isoformat(timespec="seconds")
     out: list[dict] = []
 
-    try:
+    def _do_read():
         with _ragvec_state_conn() as conn:
-            rows = _sql_query_window(conn, "rag_contradictions", cutoff_iso)
-    except Exception as exc:
-        _log_sql_state_error("contradictions_sql_read_failed",
-                              err=repr(exc))
+            return _sql_query_window(conn, "rag_contradictions", cutoff_iso)
+
+    rows = _sql_read_with_retry(
+        _do_read,
+        "contradictions_sql_read_failed",
+        default=None,
+    )
+    if rows is None:
         return []
 
     # Newest-first: rows come ordered by ts ASC; reverse.

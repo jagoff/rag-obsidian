@@ -882,6 +882,21 @@
     .heatmap-cell.uptime-95  { background: var(--yellow); }
     .heatmap-cell.uptime-low { background: var(--red); }
     .heatmap-cell.uptime-none { background: var(--border); opacity: 0.4; }
+    /* Grid 168 cols (7d × 24h) — cell muy chiquita, height fijo en vez de
+       aspect-ratio 1:1 que daría celdas de <2px de alto en width angosto.
+       12px de alto da una banda comoda para distinguir colores. */
+    .heatmap-grid-168 {
+      grid-template-columns: repeat(168, minmax(0, 1fr));
+      gap: 1px;
+    }
+    .heatmap-grid-168 .heatmap-cell {
+      aspect-ratio: auto;
+      height: 12px;
+      min-width: 0;
+      border-radius: 1px;
+    }
+    /* Axis con 5 marcas — el -50px de padding-left compensa la columna
+       del label (heatmap-label tiene width 42px + 8px gap). */
     .heatmap-axis {
       display: flex;
       padding-left: 50px;
@@ -895,10 +910,16 @@
       flex: 1;
       text-align: center;
     }
+    /* heatmap-axis-7d: 5 marcas equidistantes (-7d/-5d/-3d/-1d/hoy)
+       cada 25% del ancho. */
+    .heatmap-axis-7d span:first-child { text-align: left; }
+    .heatmap-axis-7d span:last-child { text-align: right; }
 
     @media (max-width: 640px) {
       .insights { grid-template-columns: 1fr; }
       .heatmap-grid { grid-template-columns: repeat(24, 1fr); }
+      .heatmap-grid-168 { grid-template-columns: repeat(168, minmax(0, 1fr)); }
+      .heatmap-grid-168 .heatmap-cell { height: 10px; }
       .heatmap-cell { min-width: 0; }
       .log-list { font-size: 10.5px; }
       .log-list li { grid-template-columns: 48px 56px 1fr; }
@@ -1116,17 +1137,22 @@
         </ul>
       </article>
 
-      <!-- #5 Uptime heatmap — PREVIEW (datos dummy) -->
-      <article class="insight-card insight-preview" aria-label="Uptime heatmap 7 días">
+      <!-- #5 Uptime heatmap — REAL
+           Fuente: /api/status/uptime. Persiste samples del status probe
+           cada 60s en rag_status_samples; los buckets horarios se
+           computan en el endpoint. Initial state (tabla vacía) → todo
+           gris con tooltip "esperando datos"; después de 1h de uso
+           empieza a poblarse, después de 7d está full. -->
+      <article class="insight-card" id="insight-uptime" aria-label="Uptime heatmap 7 días">
         <div class="insight-head">
           <h2>uptime · 7d × 24h</h2>
-          <span class="preview-badge">vista previa</span>
+          <span class="insight-meta" id="uptime-meta">—</span>
         </div>
         <div class="insight-big">
-          <span class="insight-big-value">99.4%</span>
-          <span class="insight-big-unit">uptime 7d</span>
+          <span class="insight-big-value" id="uptime-headline">—</span>
+          <span class="insight-big-unit" id="uptime-headline-unit">uptime 7d</span>
         </div>
-        <div id="heatmap-mock" aria-hidden="true"></div>
+        <div id="heatmap" aria-hidden="true"></div>
       </article>
     </section>
 
@@ -1136,6 +1162,6 @@
     </main>
   </div>
 
-  <script src="/static/status.js?v=2026-04-24-logs-card" defer></script>
+  <script src="/static/status.js?v=2026-04-24-uptime-card" defer></script>
 </body>
 </html>

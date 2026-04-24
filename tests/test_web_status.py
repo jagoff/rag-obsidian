@@ -233,11 +233,11 @@ def test_status_page_has_insights_section():
     assert 'id="insight-logs"' in body
     assert 'id="logs-list"' in body
     assert 'id="logs-summary"' in body
-    # 1 preview badge restante (heatmap uptime — sigue siendo dummy).
+    # 0 preview badges — todos los 5 cards son reales.
     # Buscamos la clase aplicada en el markup (<span class="preview-badge">)
     # para no contar la definición CSS inline.
-    assert body.count('class="preview-badge"') == 1
-    assert 'id="heatmap-mock"' in body
+    assert body.count('class="preview-badge"') == 0
+    assert 'id="heatmap"' in body
 
 
 # ── /api/status/errors — error-budget endpoint ──────────────────────
@@ -380,7 +380,7 @@ def test_status_page_freshness_has_real_ids():
     assert 'id="fresh-summary"' in body
     # Preview badge ahora es 1 (solo heatmap uptime sigue siendo dummy;
     # log-tail dejó de ser preview cuando se conectó a /api/status/logs).
-    assert body.count('class="preview-badge"') == 1
+    assert body.count('class="preview-badge"') == 0
 
 
 # ── /api/status/freshness — freshness matrix endpoint ───────────────
@@ -496,6 +496,165 @@ def test_read_start_interval_fallback():
     assert _server._read_start_interval_s("com.nonexistent.label.12345") is None
 
 
+def test_status_page_uptime_has_real_ids():
+    """El HTML del card #5 tiene los ids del componente real (no más
+    preview badge)."""
+    body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
+    assert 'id="insight-uptime"' in body
+    assert 'id="heatmap"' in body
+    assert 'id="uptime-headline"' in body
+    assert 'id="uptime-meta"' in body
+    # Card #5 ya no tiene preview-badge — todos los 5 cards reales.
+    # El único `class="preview-badge"` posible sería en CSS o vacío.
+    # Buscamos que no haya ningún badge aplicado en markup.
+    assert 'class="preview-badge"' not in body
+    # `id="heatmap-mock"` ya no existe (renombrado a heatmap).
+    assert 'id="heatmap-mock"' not in body
+
+
+# ── /api/status/uptime — heatmap endpoint ───────────────────────────
+
+def test_api_uptime_payload_shape():
+    """GET /api/status/uptime devuelve services con buckets 168-len."""
+    resp = _client.get("/api/status/uptime?nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["window_days"] == 7
+    assert d["bucket_hours"] == 1
+    assert isinstance(d["services"], list)
+    # Hardcoded 5 servicios core.
+    assert len(d["services"]) == 5
+    for s in d["services"]:
+        for k in ("id", "label", "uptime_pct_7d", "samples_7d", "buckets"):
+            assert k in s, f"{s.get('id')} falta {k!r}"
+        # 168 buckets siempre (7d × 24h), aunque la mayoría sean null.
+        assert len(s["buckets"]) == 168
+        for b in s["buckets"]:
+            assert "ts" in b and "uptime_pct" in b and "samples" in b
+            assert b["uptime_pct"] is None or 0.0 <= b["uptime_pct"] <= 100.0
+
+
+def test_api_uptime_services_match_tracked_set():
+    """Los 5 servicios devueltos coinciden con _UPTIME_TRACKED_SERVICES."""
+    resp = _client.get("/api/status/uptime?nocache=1")
+    d = resp.json()
+    ids = [s["id"] for s in d["services"]]
+    expected = ["web-self", "ollama", "rag-db", "telemetry-db", "vault"]
+    assert ids == expected, f"orden / ids inesperados: {ids}"
+
+
+def test_uptime_build_with_synthetic_samples(tmp_path, monkeypatch):
+    """Insertar samples sintéticos a lo largo de varias horas y verificar
+    que los buckets horarios + uptime_pct se computan correctamente.
+
+    Caso: 3 horas distintas, mix ok/down → bucket_pct = ok/total.
+    """
+    import rag
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+
+    now = datetime.now()
+    # Hora -2: 4 samples ok, 1 down → 80%.
+    # Hora -1: 5 samples ok → 100%.
+    # Hora actual: 2 ok + 2 warn (warn no cuenta como ok) → 50%.
+    h2 = now - timedelta(hours=2, minutes=15)
+    h1 = now - timedelta(hours=1, minutes=15)
+    h0 = now - timedelta(minutes=5)
+    samples = []
+    for i in range(4):
+        samples.append((
+            (h2 + timedelta(minutes=i)).isoformat(timespec="seconds"),
+            "web-self", "ok",
+        ))
+    # ts único — `h2 + 4 minutes` para no chocar con i=0 (que usa h2 + 0)
+    # bajo el constraint PRIMARY KEY (ts, service_id).
+    samples.append(((h2 + timedelta(minutes=4)).isoformat(timespec="seconds"),
+                    "web-self", "down"))
+    for i in range(5):
+        samples.append((
+            (h1 + timedelta(minutes=i)).isoformat(timespec="seconds"),
+            "web-self", "ok",
+        ))
+    for i in range(2):
+        samples.append((
+            (h0 + timedelta(minutes=i)).isoformat(timespec="seconds"),
+            "web-self", "ok",
+        ))
+        samples.append((
+            (h0 + timedelta(minutes=i, seconds=30)).isoformat(timespec="seconds"),
+            "web-self", "warn",
+        ))
+
+    with rag._ragvec_state_conn() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO rag_status_samples (ts, service_id, status) VALUES (?, ?, ?)",
+            samples,
+        )
+
+    # Invalidar caches de servidor.
+    with _server._UPTIME_CACHE_LOCK:
+        _server._UPTIME_CACHE["ts"] = 0.0
+        _server._UPTIME_CACHE["payload"] = None
+
+    payload = _server._status_uptime_build_payload()
+    web_svc = next((s for s in payload["services"] if s["id"] == "web-self"), None)
+    assert web_svc is not None
+    assert web_svc["samples_7d"] == 14  # 5 + 5 + 4 (h0 = 2 ok + 2 warn)
+
+    # uptime_pct_7d = ok_total / samples_total = (4 + 5 + 2) / 14 = 11/14 ≈ 78.57%
+    assert abs(web_svc["uptime_pct_7d"] - (11/14 * 100)) < 0.5
+
+    # Verificar buckets puntuales (los 3 con datos).
+    buckets_with_data = [b for b in web_svc["buckets"] if b["samples"] > 0]
+    assert len(buckets_with_data) >= 3
+
+
+def test_persist_status_samples_rate_limits(tmp_path, monkeypatch):
+    """`_persist_status_samples` debería respetar el rate-limit de 60s
+    — múltiples calls back-to-back resultan en un solo INSERT batch."""
+    import rag
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+
+    # Reset rate-limit clock + cache.
+    with _server._STATUS_SAMPLE_LOCK:
+        _server._STATUS_SAMPLE_LAST_TS["ts"] = 0.0
+
+    fake_payload = {
+        "categories": [
+            {"id": "core", "services": [
+                {"id": "web-self", "status": "ok"},
+                {"id": "ollama", "status": "ok"},
+                {"id": "vault", "status": "warn"},
+            ]},
+        ],
+    }
+
+    # Primera llamada → 3 samples insertados.
+    _server._persist_status_samples(fake_payload)
+
+    # Segunda llamada inmediata → no debería escribir más (rate-limit).
+    _server._persist_status_samples(fake_payload)
+    _server._persist_status_samples(fake_payload)
+
+    with rag._ragvec_state_conn() as conn:
+        rows = conn.execute(
+            "SELECT service_id, status FROM rag_status_samples ORDER BY service_id"
+        ).fetchall()
+
+    # 3 rows insertadas (1 por servicio rastreado), no 9.
+    assert len(rows) == 3
+    sids = sorted(r[0] for r in rows)
+    assert sids == ["ollama", "vault", "web-self"]
+    # vault tiene status "warn", los demás "ok".
+    by_id = dict(rows)
+    assert by_id["vault"] == "warn"
+    assert by_id["web-self"] == "ok"
+
+
 def test_status_page_logs_has_real_ids():
     """El HTML del card #4 tiene ids + filtros."""
     body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
@@ -510,7 +669,7 @@ def test_status_page_logs_has_real_ids():
     assert 'data-level="warn"' in body
     assert 'data-level="error"' in body
     # Preview badges ahora sólo 1 (el heatmap uptime).
-    assert body.count('class="preview-badge"') == 1
+    assert body.count('class="preview-badge"') == 0
 
 
 # ── /api/status/logs — log-tail endpoint ────────────────────────────

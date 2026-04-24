@@ -8423,7 +8423,13 @@ def _status_build_payload() -> dict:
 
 @app.get("/api/status")
 def api_status(nocache: int = 0) -> dict:
-    """JSON health dump para la /status page. `?nocache=1` fuerza refresh."""
+    """JSON health dump para la /status page. `?nocache=1` fuerza refresh.
+
+    Side effect: alimenta `rag_status_samples` con un sample del estado
+    actual de los servicios core (rate-limited a 60s globalmente). La
+    persistencia es necesaria para el heatmap del card #5 — el resto de
+    los cards se computan on-demand de fuentes pre-existentes.
+    """
     now = time.monotonic()
     with _STATUS_CACHE_LOCK:
         cached = _STATUS_CACHE["payload"]
@@ -8433,6 +8439,10 @@ def api_status(nocache: int = 0) -> dict:
         with _STATUS_CACHE_LOCK:
             _STATUS_CACHE["payload"] = payload
             _STATUS_CACHE["ts"] = now
+        # Hook de persistencia para el heatmap del uptime card (#5).
+        # Rate-limited internamente a 60s; cualquier excepción se traga
+        # para no bajar el endpoint principal.
+        _persist_status_samples(payload)
         return payload
     return cached
 
@@ -9353,6 +9363,231 @@ def status_logs(
             _LOGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
         return payload
     return entry["payload"]
+
+
+# ── /api/status/uptime — heatmap 7d × 24h por servicio core ──────────
+# Feed el card #5 del insights grid. Este es el único de los 5 cards
+# que requiere persistencia histórica — los anteriores se computan
+# on-demand de fuentes existentes (rag_queries para latency, jsonl
+# logs para errors+log-tail, file mtimes para freshness).
+#
+# Strategy: hookear `_persist_status_samples` al final de cada
+# `_status_build_payload`. Como /api/status se cachea 3s + se llama
+# cada 10s desde el frontend cuando hay un user mirando, samplear
+# cada call sería ~6 inserts/min × 5 services = 30/min = 43k/día.
+# Rate-limit a 60s mantiene ~5 inserts/min × 5 services = 7.2k/día,
+# que × 7d = 50k rows total. Manejable para un sqlite con índice
+# (service_id, ts).
+#
+# Cuando NO hay user mirando /status, no samplea — es la limitación
+# aceptada de v1. Pro version: cron-driven probe cada 60s sin importar
+# si hay user. TODO si el heatmap muestra muchos huecos en horas que
+# el user no estaba activo.
+#
+# Initial state: tabla vacía → heatmap todo gris ("sin datos"). Después
+# de 1h de uso, top-right corner se llena. Después de 7d, full.
+#
+# Schema del payload /api/status/uptime:
+#   {
+#     "window_days": 7,
+#     "services": [
+#       {
+#         "id": "web-self",
+#         "label": "Web daemon",
+#         "uptime_pct_7d": 99.4,
+#         "buckets": [
+#           # 168 buckets ordenados de viejo a nuevo, fila por día
+#           # × hora. {"ts": "2026-04-18T00", "uptime_pct": 100.0,
+#           # "samples": 5} o null si no hay samples.
+#           ...
+#         ]
+#       }, ...
+#     ]
+#   }
+
+# Servicios core que rastreamos en el heatmap. Hardcoded porque queremos
+# UI estable (no surgir/desaparecer filas según qué servicios estén en el
+# catálogo en un momento dado).
+_UPTIME_TRACKED_SERVICES: tuple[tuple[str, str], ...] = (
+    ("web-self", "web"),
+    ("ollama", "ollama"),
+    ("rag-db", "rag-db"),
+    ("telemetry-db", "telemetry"),
+    ("vault", "vault"),
+)
+_UPTIME_TRACKED_IDS = frozenset(s[0] for s in _UPTIME_TRACKED_SERVICES)
+
+_STATUS_SAMPLE_RATE_LIMIT_S = 60.0
+_STATUS_SAMPLE_LAST_TS = {"ts": 0.0}  # monotonic time of last sample write
+_STATUS_SAMPLE_LOCK = threading.Lock()
+
+# Pruning del rag_status_samples — corremos un DELETE de filas viejas
+# de vez en cuando para mantener la tabla acotada. No agregamos un cron
+# especial; cada N samples chequeamos. 7d cap para el query + 1d de
+# safety buffer = 8d.
+_UPTIME_PRUNE_AFTER_S = 8 * 86400  # 8 días
+_UPTIME_PRUNE_EVERY_N_SAMPLES = 200  # ~prune cada 4-6h en uso normal
+
+
+def _persist_status_samples(payload: dict) -> None:
+    """Insert one row per `_UPTIME_TRACKED_SERVICES` con su current status.
+
+    Rate-limited a `_STATUS_SAMPLE_RATE_LIMIT_S` (1 minute) globalmente —
+    aunque /api/status se llame cada 10s, sólo escribimos cada 60s. El
+    rate-limit usa monotonic time, no ts ISO, para evitar problemas de
+    clock skew.
+
+    Best-effort: cualquier excepción se traga con un print al stderr.
+    Una falla de SQL acá no debería bajar el endpoint /api/status que
+    es lo que está sirviendo al user en este momento.
+    """
+    now = time.monotonic()
+    with _STATUS_SAMPLE_LOCK:
+        if (now - _STATUS_SAMPLE_LAST_TS["ts"]) < _STATUS_SAMPLE_RATE_LIMIT_S:
+            return
+        _STATUS_SAMPLE_LAST_TS["ts"] = now
+
+    ts_iso = datetime.now().isoformat(timespec="seconds")
+    samples: list[tuple[str, str, str]] = []
+    for cat in payload.get("categories", []):
+        for svc in cat.get("services", []):
+            sid = svc.get("id")
+            if sid in _UPTIME_TRACKED_IDS:
+                samples.append((ts_iso, sid, svc.get("status") or "unknown"))
+
+    if not samples:
+        return
+
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO rag_status_samples "
+                "(ts, service_id, status) VALUES (?, ?, ?)",
+                samples,
+            )
+            # Pruning ocasional. Hacemos un COUNT cheap y, si crece más
+            # allá del cap esperado, borramos lo viejo. 1-in-N
+            # comprobación para que el cost amortice.
+            import random
+            if random.random() < (1.0 / _UPTIME_PRUNE_EVERY_N_SAMPLES):
+                conn.execute(
+                    "DELETE FROM rag_status_samples WHERE ts < datetime('now', '-8 days')"
+                )
+    except Exception as e:
+        print(f"[status_samples] warn: persist failed: {type(e).__name__}: {e}", flush=True)
+
+
+# Cache para el endpoint /uptime — el query es relativamente caro
+# (window function sobre 50k rows agrupadas por hora), TTL más largo
+# que los otros cards porque los buckets de uptime cambian de a poco.
+_UPTIME_CACHE_TTL = 90.0
+_UPTIME_CACHE: dict = {"ts": 0.0, "payload": None}
+_UPTIME_CACHE_LOCK = threading.Lock()
+
+
+def _status_uptime_build_payload() -> dict:
+    """Compute 7d × 24h heatmap por servicio. Para cada bucket horario,
+    `uptime_pct = ok_count / total_count * 100`. Buckets sin samples
+    quedan con `uptime_pct=null` y la UI los pinta gris transparente.
+
+    Genera 168 buckets por servicio en orden cronológico (viejo → nuevo)
+    para que el frontend pueda renderizar la grid sin re-ordenar.
+    """
+    now = datetime.now()
+    bucket_count = 168
+    services_out: list[dict] = []
+
+    try:
+        with _ragvec_state_conn() as conn:
+            for service_id, label in _UPTIME_TRACKED_SERVICES:
+                # Bucket por hora: count total + count(status='ok'). El
+                # uptime_pct sale luego en Python para tener control sobre
+                # los nulls. Filter por service_id para hit del covering
+                # index.
+                rows = conn.execute(
+                    """
+                    SELECT
+                        strftime('%Y-%m-%dT%H', ts) AS bucket,
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_count
+                    FROM rag_status_samples
+                    WHERE service_id = ?
+                      AND ts >= datetime('now', '-7 days')
+                    GROUP BY bucket
+                    """,
+                    (service_id,),
+                ).fetchall()
+                by_bucket = {r[0]: (int(r[1] or 0), int(r[2] or 0)) for r in rows}
+
+                # Generar 168 buckets en orden cronológico. Cada bucket es
+                # el inicio de la hora (HH:00) en local time.
+                buckets: list[dict] = []
+                current = now.replace(minute=0, second=0, microsecond=0)
+                ok_total = 0
+                samples_total = 0
+                for i in range(bucket_count - 1, -1, -1):
+                    t = current - timedelta(hours=i)
+                    key = t.strftime("%Y-%m-%dT%H")
+                    bucket_data = by_bucket.get(key)
+                    if bucket_data is not None and bucket_data[0] > 0:
+                        total, ok_count = bucket_data
+                        uptime = (ok_count / total) * 100.0
+                        ok_total += ok_count
+                        samples_total += total
+                        buckets.append({
+                            "ts": key + ":00:00",
+                            "uptime_pct": round(uptime, 1),
+                            "samples": total,
+                        })
+                    else:
+                        buckets.append({
+                            "ts": key + ":00:00",
+                            "uptime_pct": None,
+                            "samples": 0,
+                        })
+
+                uptime_7d = (ok_total / samples_total * 100.0) if samples_total > 0 else None
+                services_out.append({
+                    "id": service_id,
+                    "label": label,
+                    "uptime_pct_7d": round(uptime_7d, 2) if uptime_7d is not None else None,
+                    "samples_7d": samples_total,
+                    "buckets": buckets,
+                })
+    except Exception as e:
+        print(f"[status_uptime] warn: build failed: {type(e).__name__}: {e}", flush=True)
+        # Returns lista vacía — frontend muestra "sin datos" en heatmap.
+
+    return {
+        "window_days": 7,
+        "bucket_hours": 1,
+        "services": services_out,
+    }
+
+
+@app.get("/api/status/uptime")
+def status_uptime(nocache: int = 0) -> dict:
+    """7-día heatmap horario por servicio core. Lee rag_status_samples
+    (poblado por _persist_status_samples cada 60s al hit /api/status).
+    Cacheado 90s — los buckets horarios cambian lento. ?nocache=1 fuerza
+    refresh.
+
+    Cuando recién se instala (table vacía), todos los buckets vienen
+    null y la UI muestra el heatmap gris con un tooltip "esperando
+    datos". Después de unas horas de uso normal, los recientes se
+    pueblan; después de 7d el cuadro está full.
+    """
+    now_mono = time.monotonic()
+    with _UPTIME_CACHE_LOCK:
+        cached = _UPTIME_CACHE["payload"]
+        fresh = (now_mono - _UPTIME_CACHE["ts"]) < _UPTIME_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _status_uptime_build_payload()
+        with _UPTIME_CACHE_LOCK:
+            _UPTIME_CACHE["payload"] = payload
+            _UPTIME_CACHE["ts"] = now_mono
+        return payload
+    return cached
 
 
 @app.get("/status")

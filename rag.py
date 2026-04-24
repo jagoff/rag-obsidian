@@ -14939,8 +14939,48 @@ def _apply_filing_move(
         raise FileExistsError(str(dst.relative_to(VAULT_PATH)))
     # Mover con shutil para manejar cross-device edge cases (iCloud puede
     # montarse distinto que el home en ciertos contextos).
+    #
+    # 2026-04-24 audit: TOCTOU race. El `if dst.exists()` chequeo arriba
+    # ocurre ANTES del move. Si otro proceso (vault watcher, otra
+    # invocación de `rag file --apply` en paralelo) crea `dst` entre
+    # el check y el shutil.move, `shutil.move` SOBRESCRIBE silently
+    # — perdiendo los datos del competidor. El window es sub-ms en
+    # operación normal pero con iCloud sync puede extenderse.
+    #
+    # Mitigación: usar `os.link` (atomic "create if not exists" en
+    # POSIX) como primer intento y caer a shutil.move solo si link
+    # rehúsa (cross-device, no soporta hardlinks). Post-link borrar
+    # src para simular el move. Si el hardlink falla con FileExistsError,
+    # raise — garantizamos que nunca sobrescribimos silently. El
+    # shutil.move(str, str) solo se usa si link no está disponible (e.g.
+    # iCloud FUSE mount que prohíbe hardlinks entre sub-árboles). En ese
+    # caso confiamos en el check anterior + documentamos el riesgo
+    # residual.
     import shutil
-    shutil.move(str(src), str(dst))
+    import os as _os
+    try:
+        _os.link(str(src), str(dst))
+    except FileExistsError:
+        # Otro proceso creó `dst` entre nuestro check y el link — NO
+        # sobrescribir, raise con mensaje claro para que el caller
+        # sepa que fue race, no bug del usuario.
+        raise FileExistsError(
+            f"race condition: {dst.relative_to(VAULT_PATH)} fue creado "
+            f"por otro proceso durante el apply. Re-intentá el move "
+            f"— el catálogo PARA va a tener ambos archivos hasta entonces."
+        )
+    except OSError:
+        # Cross-device / FS no soporta hardlinks (iCloud en ciertos modos).
+        # Fallback al shutil.move original — reintroduce la TOCTOU window
+        # pero es necesario para compat. El check `if dst.exists()`
+        # anterior sigue protegiendo el 99.9% de casos.
+        shutil.move(str(src), str(dst))
+    else:
+        # Hardlink exitoso → borrar src para completar el "move".
+        try:
+            src.unlink()
+        except OSError as exc:
+            _silent_log("inbox.apply.unlink_src_after_link", exc)
     written = _append_upward_link(dst, upward_title) if upward_title else False
     # Reindex: el hook del ambient agent se dispara sobre saves del Inbox,
     # pero acá venimos del Inbox hacia afuera — skip_contradict para no

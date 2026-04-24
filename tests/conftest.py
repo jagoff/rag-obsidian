@@ -86,8 +86,27 @@ def _isolate_vault_path(tmp_path_factory, request):
     # Opt-out: tests marcados con `real_vault` NO reciben tmp redirect.
     # Se confía en el autor del test para no escribir; el marker es
     # equivalente a "I know what I'm doing".
+    #
+    # 2026-04-24: antes el opt-out hacía `yield None` a secas, heredando
+    # cualquier VAULT_PATH stale que un test anterior hubiera dejado
+    # (drift por mutación directa + monkeypatch.undo se desarma al
+    # tmp capturado, no al _DEFAULT_VAULT). Los tests real_vault
+    # assumen que VAULT_PATH apunta al vault real del user —
+    # forzamos esa invariante explícitamente antes de ceder el
+    # control, y restauramos a snap_original al teardown (mismo patrón
+    # que la branch normal). Fix para falla intermitente de
+    # `test_queries_yaml_all_paths_exist_or_placeholder` en full suite
+    # run (passa en isolation, fallaba solo tras que otros tests
+    # movieran VAULT_PATH).
     if request.node.get_closest_marker("real_vault"):
-        yield None
+        import rag as _rag
+        snap_real = _rag.VAULT_PATH
+        # Re-resolve al default real (el que había en import-time).
+        _rag.VAULT_PATH = _rag._DEFAULT_VAULT
+        try:
+            yield None
+        finally:
+            _rag.VAULT_PATH = snap_real
         return
 
     import rag as _rag

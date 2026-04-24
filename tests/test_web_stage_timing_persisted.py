@@ -71,7 +71,11 @@ def test_extra_json_contract_timing_breakdown_persisted():
     # scaneamos 6000 bytes desde el marker para cubrirlo completo.
     web_idx = src.find('"cmd": "web",')
     assert web_idx >= 0, "main web log_query_event block not found"
-    nearby = src[web_idx : web_idx + 6000]
+    # 2026-04-24: ventana bumped 6000→10000 porque los bloques de docstring
+    # inline crecieron (audit hardening + intent hints + CONTEXTO
+    # preservation comments). La clave `"timing"` quedaba ~6.5k chars
+    # después del marker. 10000 da headroom para los próximos audits.
+    nearby = src[web_idx : web_idx + 10000]
     # The timing key should land in extra_json via _round_timing_ms
     assert "\"timing\"" in nearby, (
         "timing key missing from web log_query_event payload"

@@ -1711,6 +1711,77 @@ def get_session_info(sid: str) -> dict:
     }
 
 
+@app.get("/api/sessions")
+def list_web_sessions(limit: int = 40) -> dict:
+    """List recent chat sessions for the sidebar (claude.ai-style history).
+
+    Filters to sessions that originated from the web chat (id starts with
+    `web:` — see `/api/chat` where `sid = req.session_id or f"web:{uuid…}"`).
+    CLI sessions (mode="ask", "do") are excluded so the sidebar doesn't show
+    noise from `rag ask` / `rag do` experiments.
+
+    Returns newest-first with: id, title (first non-empty question, trimmed),
+    updated_at, turns count. The UI uses `title` as the display label and
+    renders "sin título" as fallback for empty sessions.
+    """
+    from rag import list_sessions  # noqa: PLC0415
+    limit = max(1, min(int(limit or 40), 200))
+    # Over-fetch 2x so filtering (web-only, non-empty) still yields `limit`.
+    raw = list_sessions(limit=limit * 2)
+    out: list[dict] = []
+    for s in raw:
+        sid = (s.get("id") or "").strip()
+        if not sid.startswith("web:"):
+            continue
+        first_q = (s.get("first_q") or "").strip()
+        turns = int(s.get("turns") or 0)
+        if turns == 0 and not first_q:
+            continue  # empty session — skip
+        title = first_q[:80] if first_q else "sin título"
+        out.append({
+            "id": sid,
+            "title": title,
+            "turns": turns,
+            "updated_at": s.get("updated_at", ""),
+            "created_at": s.get("created_at", ""),
+        })
+        if len(out) >= limit:
+            break
+    return {"sessions": out}
+
+
+@app.get("/api/session/{sid}/turns")
+def get_session_turns(sid: str) -> dict:
+    """Return full turn history for rehydrating the chat UI from sidebar click.
+
+    Unlike `/api/session/{sid}` (metadata only), this returns the
+    `{q, a, paths, ts}` tuples needed to re-render the conversation bubbles.
+    `paths` is kept for source-row rendering; other fields (citations,
+    scoring metadata) are left out — the user is viewing a historical
+    snapshot, not reopening the retrieval context.
+    """
+    from rag import load_session  # noqa: PLC0415
+    sess = load_session(sid)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session no encontrada")
+    turns = sess.get("turns", []) or []
+    out_turns: list[dict] = []
+    for t in turns:
+        out_turns.append({
+            "q": (t.get("q") or ""),
+            "a": (t.get("a") or ""),
+            "paths": list(t.get("paths") or []),
+            "ts": t.get("ts", ""),
+        })
+    return {
+        "id": sess.get("id", sid),
+        "mode": sess.get("mode", ""),
+        "created_at": sess.get("created_at", ""),
+        "updated_at": sess.get("updated_at", ""),
+        "turns": out_turns,
+    }
+
+
 class SaveRequest(BaseModel):
     session_id: str
     title: str | None = None

@@ -7,6 +7,15 @@ const ttsToggle = document.getElementById("tts-toggle");
 const helpBtn = document.getElementById("help-btn");
 const helpModal = document.getElementById("help-modal");
 const stopBtn = document.getElementById("stop-btn");
+// Mobile Tier 1 controls — pueden ser null en páginas legacy que todavía
+// no renderizan el HTML nuevo (deployment window). Todos los accesos van
+// gated con optional chaining para que la ausencia no crashee el boot.
+const sendBtn = document.getElementById("send-btn");
+const menuBtn = document.getElementById("menu-btn");
+const menuSheet = document.getElementById("menu-sheet");
+const sheetVaultPicker = document.getElementById("sheet-vault-picker");
+const sheetModelPicker = document.getElementById("sheet-model-picker");
+const sheetTtsToggle = document.getElementById("sheet-tts-toggle");
 
 const SESSION_KEY = "obsidian-rag:session";
 const VAULT_KEY = "obsidian-rag:vault";
@@ -407,8 +416,23 @@ function autoGrow() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
 }
+
+// Send button: enabled ↔ disabled según si hay texto en el input.
+// Mobile-only UI (desktop usa Enter), pero el update es barato y corre
+// en ambos contextos. Evita mandar un submit vacío si el user tapea
+// el botón con input en blanco.
+function updateSendBtnState() {
+  if (!sendBtn) return;
+  const hasText = input.value.trim().length > 0;
+  // Si estamos en medio de un stream el send está oculto (stop-btn
+  // visible); el disabled no importa en ese caso, pero lo seteamos
+  // por prolijidad del estado interno.
+  sendBtn.disabled = !hasText || pending;
+}
+
 input.addEventListener("input", () => {
   autoGrow();
+  updateSendBtnState();
   updateSlashPopover();
   if (!historyPopover.hidden) hideHistoryPopover();
 });
@@ -1923,6 +1947,10 @@ async function send(question, opts = {}) {
   pushHistory(question);
   input.disabled = true;
   stopBtn.hidden = false;
+  // Mobile Tier 1: mientras el LLM stream está activo, el send-btn se
+  // oculta (el stop lo reemplaza en el mismo slot). El user tapea stop
+  // para abortar — no necesita recordar Esc ni keyboard shortcut.
+  if (sendBtn) sendBtn.hidden = true;
   currentController = new AbortController();
 
   const turn = appendTurn();
@@ -2110,10 +2138,23 @@ async function send(question, opts = {}) {
     pending = false;
     input.disabled = false;
     stopBtn.hidden = true;
+    // Mobile Tier 1: restaurar visibilidad del send-btn + recalcular
+    // disabled (el input quedó vacío post-clear, entonces va a quedar
+    // disabled hasta que el user tipee de nuevo — UX correcto).
+    if (sendBtn) sendBtn.hidden = false;
     currentController = null;
     input.value = "";
     autoGrow();
-    input.focus();
+    updateSendBtnState();
+    // En mobile NO refocuseamos el input — eso reabre el keyboard y
+    // tapa la respuesta recién streameada. En desktop sí mantenemos el
+    // focus para que el user siga preguntando sin clickear.
+    // Heurística: matchMedia (max-width: 640px) = mobile breakpoint
+    // que empareja con el CSS.
+    const isMobileViewport = window.matchMedia("(max-width: 640px)").matches;
+    if (!isMobileViewport) {
+      input.focus();
+    }
   }
 
   function handleEvent(raw) {
@@ -2261,6 +2302,11 @@ async function send(question, opts = {}) {
             session_id: sessionId,
           })
         : null;
+      // Sidebar list se actualiza tras cada turn confirmado — la sesión
+      // nueva aparece en "recientes" apenas el primer turn cierra, o
+      // sube al tope si es un turn de continuación. Silent-fail para
+      // tests / páginas legacy sin sidebar. 2026-04-24.
+      try { if (typeof refreshSessions === "function") refreshSessions(); } catch {}
       // Capture the turn_id so `/redo` and ↻ can regenerate without the
       // client needing to remember the original question (server resolves
       // it from rag_queries SQL). Also used by the redo button below.
@@ -2418,6 +2464,12 @@ async function handleSlashCommand(raw) {
     return true;
   }
   if (cmd === "/new") {
+    // Abort in-flight antes de limpiar — sin esto el stream viejo
+    // seguiría apendeando al DOM nuevo. 2026-04-24.
+    if (currentController) {
+      try { currentController.abort(); } catch (_) {}
+      currentController = null;
+    }
     sessionId = null;
     sessionStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SESSION_KEY); // legacy cleanup
@@ -2425,6 +2477,10 @@ async function handleSlashCommand(raw) {
     input.value = "";
     autoGrow();
     pushSystemMessage("meta", "nueva sesión — historial en blanco");
+    // Refresca la sidebar para que la sesión viejita aparezca en
+    // recientes (o desaparezca si quedó vacía). Silent-fail: la
+    // sidebar puede no estar montada (tests, legacy pages).
+    try { if (typeof refreshSessions === "function") refreshSessions(); } catch {}
     return true;
   }
   if (cmd === "/tts") {
@@ -2541,23 +2597,27 @@ form.addEventListener("submit", async (e) => {
   send(q);
 });
 
-// Click the "rag" title in the topbar → clear the visible conversation.
+// Click on the "rag" brand → clear the visible conversation.
 // Mirrors `/cls`: wipes the DOM + aborts in-flight, but keeps the session
 // id and the up-arrow query history intact. Server-side turns and arrow
 // history survive so the user can keep the thread going after clicking.
-const brand = document.querySelector(".topbar-title");
-if (brand) {
+//
+// Post-sidebar (2026-04-24): hay DOS instancias de `.topbar-title` — el
+// brand del #mobile-header (sólo visible en mobile) y el de la sidebar
+// (visible en desktop). Bindeamos a ambos con querySelectorAll para
+// que funcione en los dos breakpoints.
+const clearView = () => {
+  if (currentController) currentController.abort();
+  messagesEl.innerHTML = "";
+  input.value = "";
+  autoGrow();
+  input.focus();
+};
+document.querySelectorAll(".topbar-title").forEach((brand) => {
   brand.style.cursor = "pointer";
   brand.setAttribute("role", "button");
   brand.setAttribute("tabindex", "0");
   brand.setAttribute("title", "Click para limpiar la vista");
-  const clearView = () => {
-    if (currentController) currentController.abort();
-    messagesEl.innerHTML = "";
-    input.value = "";
-    autoGrow();
-    input.focus();
-  };
   brand.addEventListener("click", clearView);
   brand.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" || ev.key === " ") {
@@ -2565,7 +2625,7 @@ if (brand) {
       clearView();
     }
   });
-}
+});
 
 // Auto-submit when arriving from a deep-link like /chat?q=foo
 (() => {
@@ -2576,3 +2636,506 @@ if (brand) {
   input.value = seed;
   setTimeout(() => send(seed), 50);
 })();
+
+// ═══════════════════════════════════════════════════════════════════════
+// Mobile Tier 1 wiring (2026-04-23)
+// ═══════════════════════════════════════════════════════════════════════
+// 3 piezas:
+//   a) En mobile blur el input al boot — el autofocus HTML hace que iOS
+//      abra el keyboard al entrar, tapando medio viewport. Esperamos a
+//      que el user tapee el input (o el send-btn) para prender el KB.
+//   b) Sheet-menu handlers: abrir con ⋯, cerrar con backdrop / X / Esc.
+//      Al abrir, sincronizamos options y value desde los selects
+//      originales del topbar — single-source-of-truth sigue siendo
+//      vault-picker / model-picker / tts-toggle en el DOM.
+//   c) Change handlers del sheet: propagar value al original + disparar
+//      un `change` event para que los listeners existentes corran sin
+//      tocar (persistencia localStorage, fetch a /api/..., etc.).
+// ═══════════════════════════════════════════════════════════════════════
+
+(function initMobileTier1() {
+  const mqMobile = window.matchMedia("(max-width: 640px)");
+
+  // ── (a) Blur inicial en mobile — previene keyboard auto-abre ─────
+  // El input tiene autofocus en el HTML (desktop vibe). iOS respeta eso
+  // y abre el teclado al instante del load. En un chat con mensajes
+  // previos visibles, el keyboard tapando media pantalla al abrir la
+  // PWA se siente invasivo. Blur in-line: casi imperceptible pero mata
+  // el keyboard auto-open.
+  // NO corre cuando el user llegó vía deep-link (/chat?q=...) porque
+  // ahí el submit ya pasó y el keyboard tiene sentido. Detectamos eso
+  // via URLSearchParams.
+  if (mqMobile.matches) {
+    const seed = new URLSearchParams(window.location.search).get("q");
+    if (!seed) {
+      // requestAnimationFrame espera al primer paint para que el blur
+      // corra después del autofocus sin race. `input.blur()` seguido
+      // de focus más tarde (al tap) funciona limpio en iOS Safari.
+      requestAnimationFrame(() => {
+        try { input.blur(); } catch (_) {}
+      });
+    }
+  }
+
+  // ── (b) Sheet open/close ──────────────────────────────────────────
+  if (menuBtn && menuSheet) {
+    menuBtn.addEventListener("click", () => openSheet());
+    // Close: backdrop + botón X (ambos llevan data-close-sheet).
+    menuSheet.addEventListener("click", (e) => {
+      const t = e.target;
+      if (t && (t.hasAttribute("data-close-sheet") ||
+                t.closest("[data-close-sheet]"))) {
+        closeSheet();
+      }
+    });
+    // Esc key cierra. Se integra con el handler global de Esc más
+    // arriba sin conflictos porque ese chequea `helpModal.hidden` y
+    // `currentController` — agregar una pre-verificación del sheet.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !menuSheet.hidden) {
+        closeSheet();
+      }
+    });
+  }
+
+  // ── (c) Sync bidireccional sheet ↔ originales ─────────────────────
+  if (sheetVaultPicker && vaultPicker) {
+    sheetVaultPicker.addEventListener("change", () => {
+      vaultPicker.value = sheetVaultPicker.value;
+      vaultPicker.dispatchEvent(new Event("change"));
+    });
+  }
+  if (sheetModelPicker && modelPicker) {
+    sheetModelPicker.addEventListener("change", () => {
+      modelPicker.value = sheetModelPicker.value;
+      modelPicker.dispatchEvent(new Event("change"));
+    });
+  }
+  if (sheetTtsToggle && ttsToggle) {
+    // TTS toggle es un button (no select). Tap en el sheet = click en
+    // el original → el handler original toggle state + persiste.
+    sheetTtsToggle.addEventListener("click", () => {
+      ttsToggle.click();
+      // Re-sync el visual state del sheet (aria-pressed, label text)
+      // inmediatamente después del click.
+      syncSheetFromOriginals();
+    });
+  }
+
+  // Initial state del send button (antes del primer input event).
+  updateSendBtnState();
+})();
+
+function openSheet() {
+  if (!menuSheet) return;
+  // Antes de mostrar, copiar estado actual de los originales para que
+  // el sheet arranque con values correctos aunque el user haya cambiado
+  // vault/modelo en otra tab desde la última apertura.
+  syncSheetFromOriginals();
+  menuSheet.hidden = false;
+  if (menuBtn) menuBtn.setAttribute("aria-expanded", "true");
+  // Focus el primer control interactivo — importante para VoiceOver y
+  // para users de keyboard físico (bluetooth en iPhone).
+  const firstFocusable = menuSheet.querySelector("select, button, a");
+  if (firstFocusable) firstFocusable.focus();
+}
+
+function closeSheet() {
+  if (!menuSheet) return;
+  menuSheet.hidden = true;
+  if (menuBtn) {
+    menuBtn.setAttribute("aria-expanded", "false");
+    // Devolver focus al botón que abrió el sheet (a11y best practice).
+    menuBtn.focus();
+  }
+}
+
+/**
+ * Copia options + value + state desde los pickers/toggle originales
+ * del topbar al sheet. Se corre al abrir y después de interactions
+ * que puedan cambiar el estado (como el TTS toggle click).
+ */
+function syncSheetFromOriginals() {
+  // Vault picker: copiar el innerHTML completo (options + selected).
+  if (sheetVaultPicker && vaultPicker) {
+    sheetVaultPicker.innerHTML = vaultPicker.innerHTML;
+    sheetVaultPicker.value = vaultPicker.value;
+  }
+  // Model picker: idem.
+  if (sheetModelPicker && modelPicker) {
+    sheetModelPicker.innerHTML = modelPicker.innerHTML;
+    sheetModelPicker.value = modelPicker.value;
+  }
+  // TTS toggle: reflejar aria-pressed + actualizar el label textual.
+  if (sheetTtsToggle && ttsToggle) {
+    const pressed = ttsToggle.getAttribute("aria-pressed") === "true";
+    sheetTtsToggle.setAttribute("aria-pressed", pressed ? "true" : "false");
+    const stateLabel = sheetTtsToggle.querySelector(".sheet-toggle-state");
+    if (stateLabel) stateLabel.textContent = pressed ? "on" : "off";
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Sidebar (2026-04-24) — claude.ai-style
+// ═══════════════════════════════════════════════════════════════════════
+// Responsabilidades:
+//   1) Collapse toggle desktop → icon-only + persist en localStorage.
+//   2) Mobile drawer: hamburger abre, X/backdrop/Esc cierran.
+//   3) Fetch + render de /api/sessions con click-to-hydrate.
+//   4) New-chat button wiring (misma lógica que `/new` + UI niceties).
+//   5) Search filter client-side sobre la lista de sesiones.
+//
+// Single source of truth sigue siendo #vault-picker / #model-picker /
+// #tts-toggle — la sidebar los contiene directamente ahora, así que
+// NADA cambia en la lógica de persistencia/selección. La sidebar sólo
+// agrega sessions + collapse + mobile drawer.
+// ═══════════════════════════════════════════════════════════════════════
+
+const SIDEBAR_COLLAPSED_KEY = "obsidian-rag:sidebar-collapsed";
+
+const sidebar = document.getElementById("sidebar");
+const sidebarOpenBtn = document.getElementById("sidebar-open-btn");
+const sidebarCloseBtn = document.getElementById("sidebar-close-btn");
+const sidebarCollapseBtn = document.getElementById("sidebar-collapse-btn");
+const newChatBtn = document.getElementById("new-chat-btn");
+const mobileNewBtn = document.getElementById("mobile-new-btn");
+const sessionsList = document.getElementById("sessions-list");
+const sessionsSearch = document.getElementById("sessions-search");
+const sessionsRefreshBtn = document.getElementById("sessions-refresh-btn");
+
+// Cache de la última respuesta de /api/sessions — el search filter
+// trabaja sobre esta memoria en vez de re-pegarle al server a cada
+// tecleada. Se refresca en los hooks de refreshSessions().
+let sessionsCache = [];
+
+// ── Collapse state (desktop) ─────────────────────────────────────────
+function applySidebarCollapsed(collapsed) {
+  if (!sidebar) return;
+  sidebar.setAttribute("data-state", collapsed ? "collapsed" : "expanded");
+  if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.setAttribute("aria-pressed", collapsed ? "true" : "false");
+    sidebarCollapseBtn.setAttribute(
+      "aria-label",
+      collapsed ? "Expandir sidebar" : "Colapsar sidebar"
+    );
+  }
+}
+
+function initSidebarCollapse() {
+  if (!sidebar || !sidebarCollapseBtn) return;
+  // En mobile el collapsed se ignora (CSS media query sobreescribe al
+  // estado `open`); igual leemos el flag persistido para respetarlo en
+  // desktop. Default: expanded.
+  const saved = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  applySidebarCollapsed(saved);
+  sidebarCollapseBtn.addEventListener("click", () => {
+    const isCollapsed = sidebar.getAttribute("data-state") === "collapsed";
+    const next = !isCollapsed;
+    applySidebarCollapsed(next);
+    try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0"); } catch {}
+  });
+}
+
+// ── Mobile drawer open/close ─────────────────────────────────────────
+function openSidebarMobile() {
+  if (!sidebar) return;
+  sidebar.setAttribute("data-state", "open");
+  if (sidebarOpenBtn) sidebarOpenBtn.setAttribute("aria-expanded", "true");
+  // Focus el primer control interactivo — a11y + keyboard users.
+  const firstFocusable = sidebar.querySelector(
+    "button:not([hidden]):not([disabled]), a[href], select, input"
+  );
+  if (firstFocusable) firstFocusable.focus({ preventScroll: true });
+}
+
+function closeSidebarMobile() {
+  if (!sidebar) return;
+  // Restaurar el estado desktop persistido (expanded / collapsed)
+  // cuando cerramos el drawer mobile. Así el desktop no se rompe si
+  // el user redimensiona la ventana mientras tenía el drawer abierto.
+  const savedCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  sidebar.setAttribute("data-state", savedCollapsed ? "collapsed" : "expanded");
+  if (sidebarOpenBtn) {
+    sidebarOpenBtn.setAttribute("aria-expanded", "false");
+    sidebarOpenBtn.focus({ preventScroll: true });
+  }
+}
+
+function initSidebarMobile() {
+  if (!sidebar) return;
+  if (sidebarOpenBtn) {
+    sidebarOpenBtn.addEventListener("click", openSidebarMobile);
+  }
+  if (sidebarCloseBtn) {
+    sidebarCloseBtn.addEventListener("click", closeSidebarMobile);
+  }
+  // Backdrop sibling: listener directo — el click en el backdrop
+  // (sólo visible en mobile via CSS) cierra el drawer.
+  const backdrop = document.getElementById("sidebar-backdrop");
+  if (backdrop) backdrop.addEventListener("click", closeSidebarMobile);
+  // Cualquier otro [data-sidebar-close] (el X dentro del sidebar, etc.)
+  // también cierra. Delegado a nivel document para no duplicar.
+  document.addEventListener("click", (e) => {
+    const t = e.target;
+    if (!t) return;
+    if (t.hasAttribute && t.hasAttribute("data-sidebar-close")) {
+      closeSidebarMobile();
+      return;
+    }
+    const ancestor = t.closest && t.closest("[data-sidebar-close]");
+    if (ancestor) closeSidebarMobile();
+  });
+  // Esc cierra si el drawer está abierto (sólo relevante en mobile
+  // — en desktop el drawer no tiene estado "open"). Se integra con
+  // el handler Esc global porque sólo reaccionamos cuando data-state
+  // es exactamente "open".
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (sidebar.getAttribute("data-state") === "open") {
+      closeSidebarMobile();
+    }
+  });
+}
+
+// ── New-chat buttons ─────────────────────────────────────────────────
+function triggerNewChat() {
+  // Reusa la lógica del slash command /new (abort + clear + refresh).
+  // No podemos llamar handleSlashCommand("/new") directamente sin meter
+  // "/new" como texto visible en el input — duplicamos el bloque acá.
+  if (currentController) {
+    try { currentController.abort(); } catch (_) {}
+    currentController = null;
+  }
+  sessionId = null;
+  sessionStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_KEY);
+  messagesEl.innerHTML = "";
+  input.value = "";
+  autoGrow();
+  pushSystemMessage("meta", "nueva sesión — historial en blanco");
+  refreshSessions();
+  // En mobile cerramos el drawer tras el click — el user quiere escribir.
+  closeSidebarMobile();
+  const isMobileViewport = window.matchMedia("(max-width: 767px)").matches;
+  if (!isMobileViewport) input.focus();
+}
+
+function initNewChatButtons() {
+  if (newChatBtn) newChatBtn.addEventListener("click", triggerNewChat);
+  if (mobileNewBtn) mobileNewBtn.addEventListener("click", triggerNewChat);
+}
+
+// ── Sessions list: fetch + render + click to hydrate ─────────────────
+async function refreshSessions() {
+  if (!sessionsList) return;
+  try {
+    const res = await fetch("/api/sessions?limit=40", {
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    sessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
+    renderSessions(getFilterText());
+  } catch (err) {
+    sessionsList.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = "sessions-empty sessions-error";
+    li.textContent = "no se pudo cargar el historial";
+    sessionsList.appendChild(li);
+  }
+}
+
+function getFilterText() {
+  if (!sessionsSearch) return "";
+  return (sessionsSearch.value || "").trim().toLowerCase();
+}
+
+function renderSessions(filter) {
+  if (!sessionsList) return;
+  sessionsList.innerHTML = "";
+  const q = (filter || "").trim().toLowerCase();
+  const items = q
+    ? sessionsCache.filter((s) => (s.title || "").toLowerCase().includes(q))
+    : sessionsCache;
+  if (!items.length) {
+    const li = document.createElement("li");
+    li.className = "sessions-empty";
+    li.textContent = q
+      ? "sin coincidencias"
+      : "sin conversaciones aún — escribí algo en el chat";
+    sessionsList.appendChild(li);
+    return;
+  }
+  for (const s of items) {
+    const li = document.createElement("li");
+    li.className = "session-item";
+    li.setAttribute("role", "button");
+    li.setAttribute("tabindex", "0");
+    li.setAttribute("data-session-id", s.id);
+    li.setAttribute("title", s.title || "sin título");
+    if (s.id === sessionId) {
+      li.setAttribute("aria-current", "true");
+    }
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = s.title || "sin título";
+    li.appendChild(title);
+    const meta = document.createElement("span");
+    meta.className = "session-meta";
+    meta.textContent = formatSessionMeta(s);
+    li.appendChild(meta);
+    li.addEventListener("click", () => loadSession(s.id));
+    li.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        loadSession(s.id);
+      }
+    });
+    sessionsList.appendChild(li);
+  }
+}
+
+function formatSessionMeta(s) {
+  // Compacto: "N turns · YYYY-MM-DD HH:MM"
+  const bits = [];
+  if (Number.isFinite(s.turns)) bits.push(`${s.turns} turn${s.turns === 1 ? "" : "s"}`);
+  if (s.updated_at) {
+    const t = String(s.updated_at).slice(0, 16).replace("T", " ");
+    bits.push(t);
+  }
+  return bits.join(" · ");
+}
+
+async function loadSession(sid) {
+  if (!sid) return;
+  if (sid === sessionId && messagesEl.childElementCount > 0) {
+    // Ya estamos en esta sesión y tiene contenido — solo cerramos el
+    // drawer mobile y focuseamos el input.
+    closeSidebarMobile();
+    return;
+  }
+  // Abort in-flight antes de cambiar de sesión.
+  if (currentController) {
+    try { currentController.abort(); } catch (_) {}
+    currentController = null;
+  }
+  try {
+    const res = await fetch(`/api/session/${encodeURIComponent(sid)}/turns`, {
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    hydrateTurns(data);
+    sessionId = data.id || sid;
+    sessionStorage.setItem(SESSION_KEY, sessionId);
+    // Marcar la sesión como current en la UI.
+    sessionsList.querySelectorAll(".session-item").forEach((el) => {
+      if (el.getAttribute("data-session-id") === sessionId) {
+        el.setAttribute("aria-current", "true");
+      } else {
+        el.removeAttribute("aria-current");
+      }
+    });
+    closeSidebarMobile();
+    const isMobileViewport = window.matchMedia("(max-width: 767px)").matches;
+    if (!isMobileViewport) input.focus();
+  } catch (err) {
+    pushSystemMessage("err", `no se pudo cargar la sesión: ${err.message}`);
+  }
+}
+
+function hydrateTurns(data) {
+  messagesEl.innerHTML = "";
+  const turns = Array.isArray(data && data.turns) ? data.turns : [];
+  if (!turns.length) {
+    pushSystemMessage("meta", "sesión vacía");
+    return;
+  }
+  for (const t of turns) {
+    const turn = appendTurn();
+    if (t.q) appendLine(turn, "user", t.q);
+    if (t.a) {
+      // Use the same rendering path as live streams: append "rag" line,
+      // then parse as Markdown so code blocks / lists look right. We
+      // render as a one-shot (not streaming) since the turn is historical.
+      const line = document.createElement("div");
+      line.className = "line";
+      const prompt = document.createElement("span");
+      prompt.className = "prompt rag";
+      prompt.textContent = "rag ›";
+      const text = document.createElement("span");
+      text.className = "text rag md-output";
+      try {
+        text.innerHTML = renderMarkdown(t.a);
+      } catch {
+        text.textContent = t.a;
+      }
+      line.appendChild(prompt);
+      line.appendChild(text);
+      turn.appendChild(line);
+    }
+  }
+  scrollBottom();
+  // Meta inline: cuántas turns se cargaron.
+  pushSystemMessage(
+    "meta",
+    `sesión cargada · ${turns.length} turn${turns.length === 1 ? "" : "s"}`
+  );
+}
+
+// ── Search filter (client-side over sessionsCache) ───────────────────
+function initSessionsSearch() {
+  if (!sessionsSearch) return;
+  let debounceTimer = null;
+  sessionsSearch.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => renderSessions(getFilterText()), 80);
+  });
+  sessionsSearch.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      sessionsSearch.value = "";
+      renderSessions("");
+    }
+  });
+  if (sessionsRefreshBtn) {
+    sessionsRefreshBtn.addEventListener("click", refreshSessions);
+  }
+}
+
+// ── Keyboard shortcut: ⌘\ / Ctrl+\ toggles collapse ──────────────────
+function initSidebarShortcut() {
+  document.addEventListener("keydown", (e) => {
+    const cmd = e.metaKey || e.ctrlKey;
+    if (cmd && e.key === "\\") {
+      e.preventDefault();
+      if (!sidebar || !sidebarCollapseBtn) return;
+      // En mobile el shortcut abre/cierra el drawer; en desktop colapsa.
+      const isMobile = window.matchMedia("(max-width: 767px)").matches;
+      if (isMobile) {
+        if (sidebar.getAttribute("data-state") === "open") {
+          closeSidebarMobile();
+        } else {
+          openSidebarMobile();
+        }
+      } else {
+        sidebarCollapseBtn.click();
+      }
+    }
+  });
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────
+if (sidebar) {
+  initSidebarCollapse();
+  initSidebarMobile();
+  initNewChatButtons();
+  initSessionsSearch();
+  initSidebarShortcut();
+  // Primera carga de sesiones — no bloquea boot; si falla, el user ve
+  // "no se pudo cargar el historial" y puede reintentar con el refresh
+  // button.
+  refreshSessions();
+}

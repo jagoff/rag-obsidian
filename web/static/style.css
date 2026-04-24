@@ -1256,7 +1256,9 @@ body {
   margin-left: 12px;
 }
 
-/* Stop button inside the composer. Only visible while pending. */
+/* Stop button inside the composer. Only visible while pending.
+   En desktop 26×26 (estilo terminal minimalist). En mobile se agranda a
+   44×44 por HIG iOS — el .stop-btn-active override más abajo lo hace. */
 .stop-btn {
   background: transparent;
   border: 1px solid var(--border);
@@ -1277,6 +1279,49 @@ body {
   transition: color 120ms ease, border-color 120ms ease;
 }
 .stop-btn:hover { color: var(--red); border-color: var(--red); }
+/* Un CSS rule con `display` explícita pisa la semántica del HTML
+   `hidden` attribute (que es equivalente a `display:none`). Declaramos
+   el override explícito — sin esto, toglear `.hidden = true` desde JS
+   no oculta el botón si el CSS lo puso como `inline-flex`. */
+.stop-btn[hidden], .send-btn[hidden] { display: none !important; }
+
+/* Send button — mobile-only en default (desktop sigue con Enter). Mismo
+   slot del flex que el stop-btn; cuando `pending=true` el JS toglea
+   el hidden attribute de ambos. Touch-target 44×44 spec HIG. */
+.send-btn {
+  display: none;  /* desktop: escondido, el user tiene Enter */
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  padding: 0;
+  border-radius: 10px;
+  cursor: pointer;
+  align-self: center;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+.send-btn:not([disabled]) { color: var(--accent); border-color: var(--accent); }
+.send-btn:not([disabled]):hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.send-btn:not([disabled]):active {
+  /* :active feedback — iOS no expone haptic API para web, pero un
+     scale(.96) en el active cubre la pérdida perceptual. */
+  transform: scale(0.96);
+}
+.send-btn[disabled] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
 
 /* Confidence pill in the sources header ------------------------- */
 .sources-rule {
@@ -2107,6 +2152,225 @@ strong, b, th {
   #messages {
     padding-bottom: 120px;
   }
+
+  /* ── Mobile Tier 1 controls ──────────────────────────────────────
+     Send button: visible siempre en mobile (resuelve el "no hay cómo
+     enviar" del audit). Stop button: agrandado a 44×44 para cumplir
+     el touch-target mínimo HIG iOS (default 26×26 era untappable).
+     Help button: mismo bump. Ambos conservan el estilo visual del
+     desktop, sólo cambia el sizing. */
+  .send-btn {
+    display: inline-flex;
+  }
+  .stop-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    font-size: 14px;
+  }
+  #help-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+  }
+  /* Overflow menu button (⋯) — mobile-only. Mismo sizing que help
+     para que quede un row de 2 botones iguales a la derecha del
+     topbar. `.topbar-btn-mobile` class se esconde en desktop. */
+  #menu-btn {
+    display: inline-flex;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+    font-size: 18px;
+    line-height: 1;
+  }
+  #menu-btn:active {
+    transform: scale(0.96);
+  }
+  /* Input-wrap gap: sumar un poquito para que los 2-3 botones no se
+     encimen. El gap del desktop era 8px; con 3 controles en mobile
+     (input + send + stop) o 2 (input + send|stop) queda apretado. */
+  #input-wrap {
+    gap: 6px;
+  }
+  /* Input crece hasta max 30vh — evita que textos largos empujen el
+     chat fuera de la pantalla cuando el keyboard está abierto. */
+  #input {
+    max-height: 30vh;
+  }
+}
+
+/* En desktop el menu-btn no tiene sentido — todos los controles que
+   exponelo ya están visibles en el topbar. Se oculta siempre en >640px. */
+.topbar-btn-mobile { display: none; }
+
+/* ── Sheet (bottom-sheet modal) ────────────────────────────────────
+   Pattern inspirado en iOS action sheets: card al bottom, slide-up
+   animation, backdrop con blur leve. Usa las mismas tokens de motion
+   (--ease-out, --dur-slow) que el resto del chrome.
+   Se diseña mobile-first pero funciona fine en desktop también — si
+   alguien redimensiona chico la ventana. */
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  align-items: end;   /* bottom-sheet — card pegado al bottom */
+  pointer-events: auto;
+}
+.sheet[hidden] { display: none; }
+.sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  animation: sheetFadeIn var(--dur-base) var(--ease-out);
+}
+.sheet-card {
+  position: relative;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border-strong);
+  border-radius: 18px 18px 0 0;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  box-shadow: var(--shadow-lg);
+  max-height: 80vh;
+  overflow-y: auto;
+  animation: sheetSlideUp var(--dur-slow) var(--ease-out);
+}
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 12px;
+}
+.sheet-head h2 {
+  font-size: 15px;
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+.sheet-close {
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  /* Touch target: 44×44 aunque el × visual sea chico. */
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+}
+.sheet-close:hover { color: var(--text); }
+.sheet-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sheet-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sheet-row > label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+.sheet-row select {
+  /* Native select con polish mínimo — en iOS abre picker rueda nativa,
+     no queremos reinventar. El padding generoso asegura tap target. */
+  appearance: auto;
+  -webkit-appearance: auto;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 12px;
+  font-size: 16px;   /* 16px evita auto-zoom iOS al focusear */
+  font-family: inherit;
+  min-height: 44px;
+}
+.sheet-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  min-height: 44px;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.sheet-toggle .tts-icon {
+  /* Reutiliza el mismo icon del topbar toggle. Placeholder redondito si
+     el #tts-toggle original no está pintado (primer load antes de JS). */
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.sheet-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sheet-toggle[aria-pressed="true"] .tts-icon { opacity: 1; }
+.sheet-toggle-label { flex: 1; text-align: left; }
+.sheet-toggle-state {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.sheet-toggle[aria-pressed="true"] .sheet-toggle-state { color: var(--accent); }
+.sheet-toggle:active { transform: scale(0.98); }
+.sheet-nav {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.sheet-nav a {
+  flex: 1;
+  text-align: center;
+  padding: 12px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.sheet-nav a:hover { border-color: var(--accent); color: var(--accent); }
+
+@keyframes sheetFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes sheetSlideUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+/* Reduced-motion users: sin slide, sólo fade. */
+@media (prefers-reduced-motion: reduce) {
+  .sheet-card { animation: sheetFadeIn var(--dur-base) var(--ease-out); }
 }
 
 
@@ -2127,11 +2391,16 @@ strong, b, th {
   .msg .bubble {
     max-width: 100%;
   }
-  /* Help button con padding mayor para ser touch-target (≥44×44). */
+  /* Help button con padding mayor para ser touch-target (≥44×44).
+     NOTA: el breakpoint 640px arriba ya setea 44×44 para help-btn.
+     Esta regla antes decía 36×36 (legacy, pre-Mobile Tier 1) y pisaba
+     el valor del 640px por specificity igual + orden cascade. La
+     corrimos a 44×44 para mantener el mínimo HIG iOS en todos los
+     breakpoints mobile. */
   #help-btn {
-    min-width: 36px;
-    min-height: 36px;
-    padding: 6px 10px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
   }
   /* Topbar title más compact. */
   .topbar-title {
@@ -2153,4 +2422,626 @@ strong, b, th {
     padding-left: env(safe-area-inset-left, 0);
     padding-right: env(safe-area-inset-right, 0);
   }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Sidebar (2026-04-24) — claude.ai-style
+ * ═══════════════════════════════════════════════════════════════════════
+ * Reemplaza al viejo #topbar en /chat. Layout:
+ *   · desktop ≥768px: fixed column izquierda, 260px (expanded) / 64px
+ *     (collapsed). #chat corre con margin-left matching. El #topbar
+ *     ya no se usa en esta página, pero sus rules siguen en el CSS por
+ *     compat (home/dashboard todavía lo usan — este layout es /chat-
+ *     only).
+ *   · mobile <768px: off-screen por default, slidea in como drawer
+ *     sobre la UI cuando #sidebar.data-state="open". El #mobile-header
+ *     (hamburger) reemplaza al viejo #menu-btn.
+ * ═══════════════════════════════════════════════════════════════════════*/
+
+:root {
+  --sidebar-w: 260px;
+  --sidebar-w-mini: 64px;
+  --sidebar-bg: #17171c;
+  --sidebar-border: #2a2a32;
+  --sidebar-hover: #23232a;
+  --sidebar-active: #2d2d36;
+}
+
+/* ── Mobile header (hamburger + brand) ─────────────────────────────── */
+
+#mobile-header {
+  display: none;   /* desktop default; activated in mobile breakpoint */
+}
+
+@media (max-width: 767px) {
+  #mobile-header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: calc(52px + env(safe-area-inset-top, 0px));
+    padding: env(safe-area-inset-top, 0px) 6px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: linear-gradient(180deg, var(--bg) 85%, transparent 100%);
+    z-index: 20;
+    pointer-events: auto;
+  }
+  .mobile-brand {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--cyan);
+    margin: 0;
+    letter-spacing: 0.01em;
+    flex: 1;
+    text-align: center;
+  }
+  .mobile-brand span {
+    color: var(--text-faint);
+    font-weight: 400;
+  }
+  /* Hamburger + new-chat botones usan .icon-btn — cumplen 44×44 por
+     padding/min-width definidos en el bloque .icon-btn universal. */
+}
+
+/* ── Sidebar shell ─────────────────────────────────────────────────── */
+
+#sidebar {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--sidebar-w);
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  /* Safe-area para el notch del iPhone en landscape. */
+  padding-left: env(safe-area-inset-left, 0);
+  transition: width var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+  /* Prevent body text selection when dragging over the sidebar. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#sidebar[data-state="collapsed"] {
+  width: var(--sidebar-w-mini);
+}
+
+#sidebar-backdrop.sidebar-backdrop {
+  display: none;   /* sólo se muestra en mobile cuando data-state="open" */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  z-index: 25;   /* under #sidebar (30), over page content */
+  animation: sheetFadeIn var(--dur-base) var(--ease-out);
+}
+
+.sidebar-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;   /* children handle their own scroll */
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 10px 10px;
+  gap: 10px;
+}
+
+/* ── Top row: brand + collapse/close ───────────────────────────────── */
+
+.sidebar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
+  min-height: 28px;
+}
+
+.sidebar-brand {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--cyan);
+  letter-spacing: 0.01em;
+  flex: 1;
+  overflow: hidden;
+  cursor: pointer;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.sidebar-brand:hover { opacity: 0.78; }
+.sidebar-brand-full {
+  white-space: nowrap;
+}
+.sidebar-brand-full span {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.sidebar-brand-mini {
+  display: none;
+  font-size: 18px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-brand-full { display: none; }
+#sidebar[data-state="collapsed"] .sidebar-brand-mini {
+  display: inline;
+  text-align: center;
+  width: 100%;
+}
+
+.sidebar-collapse-btn {
+  flex-shrink: 0;
+  transition: transform var(--dur-base) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+#sidebar[data-state="collapsed"] .sidebar-collapse-btn .icon-collapse {
+  transform: rotate(180deg);
+}
+/* Close button: desktop hidden, mobile visible (toggled en el mobile
+   breakpoint más abajo). Specificity con #sidebar prefix para ganarle
+   al `.icon-btn { display: inline-flex }` genérico que aparece más
+   abajo en el cascade. */
+#sidebar .sidebar-close-btn {
+  display: none;
+}
+
+/* ── New-chat button (claude.ai hero) ──────────────────────────────── */
+
+.sidebar-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  min-height: 40px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.sidebar-new-btn:hover {
+  background: var(--sidebar-hover);
+  border-color: var(--border-strong);
+  color: var(--cyan);
+}
+.sidebar-new-btn:active { transform: scale(0.98); }
+.sidebar-new-btn .icon-new { flex-shrink: 0; }
+.sidebar-btn-label {
+  flex: 1;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-new-btn {
+  justify-content: center;
+  padding: 10px 0;
+}
+#sidebar[data-state="collapsed"] .sidebar-btn-label { display: none; }
+
+/* ── Search input ──────────────────────────────────────────────────── */
+
+.sidebar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: 34px;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.sidebar-search:focus-within {
+  border-color: var(--border-strong);
+}
+.sidebar-search .icon-search {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.sidebar-search input[type="search"] {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  padding: 6px 0;
+  min-width: 0;
+}
+.sidebar-search input::placeholder { color: var(--text-faint); }
+.sidebar-search input::-webkit-search-cancel-button { appearance: none; }
+
+#sidebar[data-state="collapsed"] .sidebar-search { display: none; }
+
+/* ── Sessions list ─────────────────────────────────────────────────── */
+
+.sidebar-sessions {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 -4px;
+  padding: 0 4px;
+  /* Subtle scrollbar — match the minimalist chrome. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.sidebar-sessions::-webkit-scrollbar { width: 6px; }
+.sidebar-sessions::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+.sidebar-sessions::-webkit-scrollbar-track { background: transparent; }
+
+.sidebar-section-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  padding: 10px 8px 6px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-section-label {
+  justify-content: center;
+}
+#sidebar[data-state="collapsed"] .sidebar-section-label > span { display: none; }
+
+.icon-btn-sm {
+  background: transparent;
+  border: 0;
+  color: var(--text-faint);
+  padding: 3px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.icon-btn-sm:hover { color: var(--text); background: var(--sidebar-hover); }
+
+.sessions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.session-item {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.session-item:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
+.session-item[aria-current="true"] {
+  background: var(--sidebar-active);
+  color: var(--cyan);
+  border-color: var(--border-strong);
+}
+.session-item .session-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-item .session-meta {
+  display: block;
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+
+.sessions-empty {
+  padding: 14px 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: center;
+  font-style: italic;
+}
+.sessions-empty.sessions-error { color: var(--red); font-style: normal; }
+
+#sidebar[data-state="collapsed"] .sidebar-sessions {
+  /* In collapsed mode, sessions list is mostly unusable — just dots.
+     Keep the scroll area but compact the items to icon-ish. */
+  overflow: hidden;
+}
+#sidebar[data-state="collapsed"] .session-item {
+  padding: 8px 6px;
+  text-align: center;
+  font-size: 11px;
+}
+#sidebar[data-state="collapsed"] .session-item .session-title {
+  /* Just show first 2 chars as a "pill". */
+  max-width: 44px;
+  margin: 0 auto;
+}
+#sidebar[data-state="collapsed"] .session-item .session-meta { display: none; }
+
+/* ── Footer: pickers + actions ─────────────────────────────────────── */
+
+.sidebar-footer {
+  border-top: 1px solid var(--sidebar-border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /* Safe-area para home indicator en PWA standalone. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.sidebar-footer-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+}
+.sidebar-footer-row > label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  min-width: 48px;
+  flex-shrink: 0;
+}
+
+/* Override del style genérico de los pickers (que asumía topbar) para
+   que ocupen todo el ancho disponible dentro de la sidebar. */
+#sidebar #vault-picker,
+#sidebar #model-picker {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  font-size: 12px;
+  padding: 5px 24px 5px 8px;
+  background-color: var(--bg);
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-controls { display: none; }
+
+.sidebar-footer-actions {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-actions {
+  grid-template-columns: 1fr;
+}
+
+/* ── Generic icon-btn used across sidebar + mobile-header ──────────── */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  min-height: 36px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.icon-btn:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.icon-btn-glyph {
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+}
+.icon-btn-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Help button in sidebar: override el width:26px hardcoded del topbar
+   viejo para que ocupe todo el grid cell (tal como voz/home/dashboard). */
+#sidebar #help-btn {
+  width: auto;
+  height: auto;
+  padding: 8px 10px;
+  justify-content: flex-start;
+  margin-left: 0;
+  font-weight: normal;
+}
+
+/* TTS toggle in sidebar: mimic the sheet-toggle look (pressed = cyan). */
+#sidebar #tts-toggle {
+  /* Override the original topbar-btn styling for sidebar use. */
+  color: var(--text-dim);
+  background: transparent;
+}
+#sidebar #tts-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+#sidebar #tts-toggle .tts-icon {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+#sidebar #tts-toggle[aria-pressed="true"] .tts-icon { opacity: 1; }
+
+#sidebar[data-state="collapsed"] .icon-btn {
+  justify-content: center;
+  padding: 10px 0;
+  gap: 0;
+}
+#sidebar[data-state="collapsed"] .icon-btn-label { display: none; }
+
+/* ── #chat layout shift: reserve left space for sidebar ────────────── */
+
+@media (min-width: 768px) {
+  #chat {
+    /* Reserve room for the sidebar. The transition matches the
+       sidebar's width transition so the content shift stays smooth
+       when toggling collapsed/expanded. */
+    padding-left: calc(var(--sidebar-w) + 24px);
+    transition: padding-left var(--dur-base) var(--ease-out);
+  }
+  #sidebar[data-state="collapsed"] ~ #chat {
+    padding-left: calc(var(--sidebar-w-mini) + 24px);
+  }
+}
+
+/* ── Mobile layout ─────────────────────────────────────────────────── */
+
+@media (max-width: 767px) {
+  /* Sidebar off-screen por default; desliza con data-state="open". */
+  #sidebar {
+    width: min(86vw, 320px);
+    transform: translateX(-100%);
+    border-right: 1px solid var(--sidebar-border);
+    box-shadow: none;
+  }
+  #sidebar[data-state="open"] {
+    transform: translateX(0);
+    box-shadow: var(--shadow-lg);
+  }
+  /* El "collapsed" no aplica en mobile — no hay sidebar visible al
+     mismo tiempo que el chat. Forzamos expanded layout visualmente. */
+  #sidebar[data-state="collapsed"] { width: min(86vw, 320px); }
+  #sidebar[data-state="collapsed"] .sidebar-brand-full { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-brand-mini { display: none; }
+  #sidebar[data-state="collapsed"] .sidebar-search { display: flex; }
+  #sidebar[data-state="collapsed"] .sidebar-footer-controls { display: flex; }
+  #sidebar[data-state="collapsed"] .sidebar-footer-actions {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  #sidebar[data-state="collapsed"] .icon-btn {
+    justify-content: flex-start;
+    padding: 8px 10px;
+    gap: 8px;
+  }
+  #sidebar[data-state="collapsed"] .icon-btn-label { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-btn-label { display: inline; }
+  #sidebar[data-state="collapsed"] .sidebar-new-btn {
+    justify-content: flex-start;
+    padding: 10px 12px;
+  }
+  #sidebar[data-state="collapsed"] .session-item {
+    padding: 8px 10px;
+    text-align: left;
+    font-size: 13px;
+  }
+  #sidebar[data-state="collapsed"] .session-item .session-meta {
+    display: block;
+  }
+  #sidebar[data-state="collapsed"] .session-item .session-title {
+    max-width: none;
+  }
+  #sidebar[data-state="collapsed"] .sidebar-section-label {
+    justify-content: space-between;
+  }
+  #sidebar[data-state="collapsed"] .sidebar-section-label > span {
+    display: inline;
+  }
+
+  /* Backdrop sibling del sidebar — se activa cuando la sidebar está
+     abierta en mobile. Click en el backdrop cierra (data-sidebar-close). */
+  #sidebar[data-state="open"] ~ #sidebar-backdrop {
+    display: block;
+  }
+
+  /* Override del bloque legacy `@media (max-width: 640px)` que escondía
+     #tts-toggle, #vault-picker, #model-picker cuando vivían en el
+     topbar. Ahora viven en la sidebar — queremos que sigan visibles
+     dentro de ella en mobile. */
+  #sidebar #tts-toggle { display: inline-flex; }
+  #sidebar #vault-picker,
+  #sidebar #model-picker,
+  #sidebar #vault-picker-label,
+  #sidebar #model-picker-label { display: revert; }
+  #sidebar #vault-picker,
+  #sidebar #model-picker {
+    /* `revert` devuelve a `display: inline-block` (select default). La
+       sidebar-footer-row lo quiere como flex item full-width. */
+    display: block;
+    width: 100%;
+  }
+
+  /* Collapse button → hide in mobile (no makes sense when drawer).
+     Close button (X) takes over. Specificity con #sidebar prefix para
+     vencer al `.icon-btn` genérico. */
+  #sidebar .sidebar-collapse-btn { display: none; }
+  #sidebar .sidebar-close-btn { display: inline-flex; }
+
+  /* #chat bajo la sidebar: respeta el mobile-header fijo arriba. */
+  #chat {
+    padding-top: calc(58px + env(safe-area-inset-top, 0px));
+  }
+}
+
+/* Reduced-motion: no animation, corte seco. */
+@media (prefers-reduced-motion: reduce) {
+  #sidebar,
+  #chat {
+    transition: none;
+  }
+  #sidebar .sidebar-backdrop { animation: none; }
 }

@@ -29982,6 +29982,38 @@ _QUESTION_START_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Imperativos de consulta — el user pide ver/listar algo existente, no
+# crear. "decime/contame/dime/mostrame/tirame/dale, decime" son formas
+# comunes rioplatenses equivalentes a "¿qué ...?". Sin este check, queries
+# como "decime que tengo para la semana que viene" caían al branch 3
+# propose-intent (visit_pattern matcheaba "viene" dentro de "que viene")
+# y el flow terminaba con el LLM alucinando un tool_call fake (2026-04-24
+# Fer F. report). Por diseño solo cubre inicio de string — si aparece
+# en el medio del texto no descalifica.
+_IMPERATIVE_QUERY_RE = re.compile(
+    r"^\s*¿?\s*(?:dec[ií]me|cont[aá]me|dime|d[ií]game|mostr[aá]me|"
+    r"most[eé]ename|tir[aá]me|dale\s+dec[ií]me|list[aá]me|list[aá]|"
+    r"mostr[aá]|muestra(?:me)?|enumer[aá](?:me)?)\b",
+    re.IGNORECASE,
+)
+
+# Matchea frases temporales idiomáticas donde "viene/vienen" es parte del
+# idiom (semana/mes/año/finde que viene = next week/month/year/weekend),
+# no un verbo de visita. El stripping lo usa `_detect_propose_intent`
+# para evitar que el VISIT_PATTERN confunda "la semana que viene" con
+# una visita real ("Juan viene el viernes").
+_TEMPORAL_VIENE_IDIOM_RE = re.compile(
+    # IMPORTANTE: `mes(?:es)?` en vez de `meses?` — el suffix `s?` solo
+    # hace opcional la última letra, así que `meses?` matchea "mese"
+    # y "meses" pero NO "mes" singular. Mismo trato para "día/días"
+    # y otros singulares/plurales donde el plural agrega >1 char.
+    r"\b(?:la|el|este|esta|pr[oó]xim[oa])\s+"
+    r"(?:semanas?|mes(?:es)?|a[ñn]os?|fin(?:es)?\s+de\s+semanas?|findes?|"
+    r"d[ií]as?|tardes?|ma[ñn]anas?|noches?)\s+"
+    r"que\s+vienen?\b",
+    re.IGNORECASE,
+)
+
 
 def _detect_propose_intent(q: str) -> bool:
     """Return True if `q` looks like a CREATE request (reminder or event).
@@ -29995,15 +30027,24 @@ def _detect_propose_intent(q: str) -> bool:
         return False
     if _PROPOSE_INTENT_RE.search(q):
         return True
-    # Implicit branches. Question-word start disqualifies.
-    if _QUESTION_START_RE.match(q):
+    # Disqualifiers antes de los branches implícitos — cualquiera de los
+    # dos gates descarta la query como propose sin importar temporal/visit.
+    # (a) Question-word start ("¿qué hago el viernes?").
+    # (b) Imperative-query start ("decime qué tengo la semana que viene")
+    #     — son formas de pedir info sobre lo existente, no create.
+    if _QUESTION_START_RE.match(q) or _IMPERATIVE_QUERY_RE.match(q):
         return False
     has_temporal = bool(_TEMPORAL_ANCHOR_RE.search(q))
     if not has_temporal:
         return False
     if _EVENT_NOUN_RE.search(q):
         return True
-    if _VISIT_PATTERN_RE.search(q):
+    # Antes del visit-pattern check, strip los idioms "X que viene" donde
+    # "viene" no es visita sino parte del temporal anchor (la semana que
+    # viene / el año que viene / etc.). Sin esto, "decime qué tengo la
+    # semana que viene" caía acá con match false-positive sobre "viene".
+    q_stripped = _TEMPORAL_VIENE_IDIOM_RE.sub("", q)
+    if _VISIT_PATTERN_RE.search(q_stripped):
         return True
     # Branch 4 — declaration with explicit clock time. Mirror of the
     # whatsapp-listener `detectCalendarIntent` branch 3 (commit 8a08192).

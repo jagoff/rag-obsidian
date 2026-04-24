@@ -2822,22 +2822,24 @@ strong, b, th {
 }
 .sessions-empty.sessions-error { color: var(--red); font-style: normal; }
 
-#sidebar[data-state="collapsed"] .sidebar-sessions {
-  /* In collapsed mode, sessions list is mostly unusable — just dots.
-     Keep the scroll area but compact the items to icon-ish. */
-  overflow: hidden;
+/* En collapsed mode (desktop only) el historial desaparece completo —
+   los títulos truncados a 2-3 chars ("Hol", "cua…") no son útiles ni
+   legibles, distraen más que ayudan. El user que quiere ver la lista
+   expande la sidebar. `margin-top:auto` en el footer compensa por el
+   espacio que antes llenaba .sidebar-sessions con flex:1, así los
+   iconos quedan pegados abajo.
+   Scopeado a @media ≥768px porque en mobile el estado "collapsed" es
+   un leftover persistido (el sidebar mobile abre como drawer full-
+   width y no tiene variante icon-only). Sin scope, un user que tenía
+   collapsed en desktop abriría el drawer mobile sin el historial. */
+@media (min-width: 768px) {
+  #sidebar[data-state="collapsed"] .sidebar-sessions {
+    display: none;
+  }
+  #sidebar[data-state="collapsed"] .sidebar-footer {
+    margin-top: auto;
+  }
 }
-#sidebar[data-state="collapsed"] .session-item {
-  padding: 8px 6px;
-  text-align: center;
-  font-size: 11px;
-}
-#sidebar[data-state="collapsed"] .session-item .session-title {
-  /* Just show first 2 chars as a "pill". */
-  max-width: 44px;
-  margin: 0 auto;
-}
-#sidebar[data-state="collapsed"] .session-item .session-meta { display: none; }
 
 /* ── Footer: pickers + actions ─────────────────────────────────────── */
 

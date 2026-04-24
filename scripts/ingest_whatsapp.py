@@ -625,6 +625,7 @@ def scan_wa_images_for_citas(
     """
     summary = {
         "images_seen": 0, "ocr_ok": 0, "cita_created": 0,
+        "reminder_created": 0, "note_classified": 0,
         "duplicate": 0, "ambiguous": 0, "no_cita": 0, "low_confidence": 0,
         "errors": 0,
     }
@@ -700,6 +701,10 @@ def scan_wa_images_for_citas(
             dec = result.get("decision") or ""
             if dec == "cita":
                 summary["cita_created"] += 1
+            elif dec == "reminder":
+                summary["reminder_created"] += 1
+            elif dec == "note":
+                summary["note_classified"] += 1
             elif dec == "duplicate":
                 summary["duplicate"] += 1
             elif dec == "ambiguous":
@@ -933,6 +938,8 @@ def main() -> None:
             f"images: {img.get('images_seen', 0)} seen · "
             f"{img.get('ocr_ok', 0)} ocr · "
             f"{img.get('cita_created', 0)} citas · "
+            f"{img.get('reminder_created', 0)} recordatorios · "
+            f"{img.get('note_classified', 0)} notes · "
             f"{img.get('duplicate', 0)} dup · "
             f"{img.get('ambiguous', 0)} ambig · "
             f"{img.get('errors', 0)} err"

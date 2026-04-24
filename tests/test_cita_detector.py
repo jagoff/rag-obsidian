@@ -1,20 +1,28 @@
-"""Tests del detector de citas a partir de texto OCR.
+"""Tests del detector OCR → event / reminder / note.
 
-Cubre:
+El detector clasifica texto OCR de una imagen en 3 kinds:
+  - `event`: cita / turno / reunión → `propose_calendar_event`
+  - `reminder`: tarea / compra / factura → `propose_reminder` (con path
+    de la imagen en el `notes` del reminder, ya que Apple Reminders no
+    soporta attachments vía AppleScript)
+  - `note`: info sin acción → no-op
+
+Cobertura:
   1. Env gate `RAG_CITA_DETECT` (on/off).
-  2. `_normalize_ocr_for_hash` — lowercase + whitespace collapse.
-  3. `_ocr_hash_key` — determinismo + insensibilidad a espacios.
-  4. `_detect_cita_from_ocr` — helper calls con mocks: happy path,
-     malformed JSON, exception, shape inválida, clamp de confidence,
-     normalización de tipos (is_cita=1, confidence="0.8").
-  5. `_maybe_create_cita_from_ocr` — dedup sidecar, low-confidence
-     persistencia, ambiguous (sin fecha), create happy path, duplicate
-     path, error silent-fail.
-  6. Integración con `_enrich_body_with_ocr` — el body OCR enrichment
-     se preserva aunque el detector se llame (regresión potencial sobre
-     `rag eval` en notas con screenshots).
+  2. `_normalize_ocr_for_hash` + `_ocr_hash_key` — whitespace / case
+     insensitive, determinismo, discriminación de contenidos distintos.
+  3. `_detect_cita_from_ocr` — helper con mocks: happy path event /
+     reminder / note, malformed JSON, exception, bad shape, clamp de
+     confidence, normalización de tipos, backward-compat con schema viejo
+     `{is_cita, start}` (los LLMs/tests antiguos siguen funcionando).
+  4. `_maybe_create_cita_from_ocr` — dedup sidecar, low-confidence
+     persistencia, ambiguous (event sin fecha), event happy path,
+     reminder happy path (con fecha y sin fecha), note no-op, duplicate
+     path, error silent-fail, confidence override.
+  5. Integración con `_enrich_body_with_ocr` — body enrichment no se
+     rompe cuando el detector fire.
 
-Sin red ni ollama real: todos los LLM calls están mockeados.
+Sin red ni ollama real: todos los LLM + osascript calls están mockeados.
 """
 from __future__ import annotations
 
@@ -50,7 +58,7 @@ class _FakeHelperResponse:
 
 def _mock_helper_client(monkeypatch, *, content: str | None = None, exc: Exception | None = None):
     """Reemplaza `rag._helper_client()` por un stub que devuelve `content`
-    o lanza `exc`. Retorna el mock para inspección."""
+    o lanza `exc`. Retorna la lista de calls para inspección."""
     calls: list[dict] = []
 
     class _Stub:
@@ -62,6 +70,30 @@ def _mock_helper_client(monkeypatch, *, content: str | None = None, exc: Excepti
 
     stub = _Stub()
     monkeypatch.setattr(rag, "_helper_client", lambda: stub)
+    return calls
+
+
+def _stub_propose_calendar_event(monkeypatch, result: dict):
+    import json as _json
+    calls: list[dict] = []
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        return _json.dumps(result, ensure_ascii=False)
+
+    monkeypatch.setattr(rag, "propose_calendar_event", _fake)
+    return calls
+
+
+def _stub_propose_reminder(monkeypatch, result: dict):
+    import json as _json
+    calls: list[dict] = []
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        return _json.dumps(result, ensure_ascii=False)
+
+    monkeypatch.setattr(rag, "propose_reminder", _fake)
     return calls
 
 
@@ -143,19 +175,44 @@ def test_detect_returns_none_for_short_text(monkeypatch):
     assert rag._detect_cita_from_ocr("") is None
 
 
-def test_detect_happy_path_returns_normalized_dict(monkeypatch):
+def test_detect_event_returns_normalized_dict(monkeypatch):
     _mock_helper_client(monkeypatch, content=(
-        '{"is_cita": true, "title": "Turno dentista", "start": "mañana 10hs", '
+        '{"kind": "event", "title": "Turno dentista", "when": "mañana 10hs", '
         '"location": "Av. Santa Fe 1234", "confidence": 0.92}'
     ))
     out = rag._detect_cita_from_ocr("Turno dentista mañana a las 10hs Av Santa Fe 1234")
     assert out == {
-        "is_cita": True,
+        "kind": "event",
         "title": "Turno dentista",
-        "start": "mañana 10hs",
+        "when": "mañana 10hs",
         "location": "Av. Santa Fe 1234",
         "confidence": 0.92,
     }
+
+
+def test_detect_reminder_returns_normalized_dict(monkeypatch):
+    """Tarea sin fecha estricta → kind='reminder', when puede estar vacío."""
+    _mock_helper_client(monkeypatch, content=(
+        '{"kind": "reminder", "title": "Pagar luz", '
+        '"when": "antes del 15", "location": "", "confidence": 0.85}'
+    ))
+    out = rag._detect_cita_from_ocr("Factura Edenor vencimiento antes del 15")
+    assert out is not None
+    assert out["kind"] == "reminder"
+    assert out["title"] == "Pagar luz"
+    assert out["when"] == "antes del 15"
+    assert out["confidence"] == 0.85
+
+
+def test_detect_note_returns_normalized_dict(monkeypatch):
+    """Info sin acción → kind='note'."""
+    _mock_helper_client(monkeypatch, content=(
+        '{"kind": "note", "title": "Receta ibuprofeno", '
+        '"when": "", "location": "", "confidence": 0.6}'
+    ))
+    out = rag._detect_cita_from_ocr("Receta: Ibuprofeno 400mg cada 8hs por 5 días")
+    assert out is not None
+    assert out["kind"] == "note"
 
 
 def test_detect_malformed_json_returns_none(monkeypatch):
@@ -175,7 +232,7 @@ def test_detect_non_dict_shape_returns_none(monkeypatch):
 
 def test_detect_clamps_confidence_to_unit_interval(monkeypatch):
     _mock_helper_client(monkeypatch, content=(
-        '{"is_cita": true, "title": "X", "start": "mañana", '
+        '{"kind": "event", "title": "X", "when": "mañana", '
         '"location": "", "confidence": 9.5}'
     ))
     out = rag._detect_cita_from_ocr("texto OCR largo suficiente para pasar el gate")
@@ -183,20 +240,21 @@ def test_detect_clamps_confidence_to_unit_interval(monkeypatch):
     assert out["confidence"] == 1.0
 
 
-def test_detect_normalizes_integer_is_cita_to_bool(monkeypatch):
-    """Algunos LLMs devuelven 1/0 en vez de true/false. Lo toleramos."""
+def test_detect_invalid_kind_falls_back_to_note(monkeypatch):
+    """Si el helper inventa un kind desconocido ('xyz'), lo normalizamos a
+    'note' (el más seguro — no dispara acción)."""
     _mock_helper_client(monkeypatch, content=(
-        '{"is_cita": 1, "title": "X", "start": "mañana", '
-        '"location": "", "confidence": 0.8}'
+        '{"kind": "xyz", "title": "raro", "when": "", '
+        '"location": "", "confidence": 0.5}'
     ))
     out = rag._detect_cita_from_ocr("texto OCR largo suficiente para pasar el gate")
     assert out is not None
-    assert out["is_cita"] is True
+    assert out["kind"] == "note"
 
 
 def test_detect_normalizes_string_confidence_to_float(monkeypatch):
     _mock_helper_client(monkeypatch, content=(
-        '{"is_cita": true, "title": "X", "start": "m", '
+        '{"kind": "event", "title": "X", "when": "m", '
         '"location": "", "confidence": "0.75"}'
     ))
     out = rag._detect_cita_from_ocr("texto OCR largo suficiente para pasar el gate")
@@ -204,33 +262,33 @@ def test_detect_normalizes_string_confidence_to_float(monkeypatch):
     assert out["confidence"] == 0.75
 
 
-def test_detect_is_cita_false_returns_dict_not_none(monkeypatch):
-    """Respuesta 'no es cita' aún es válida — retorna dict, caller decide
-    qué hacer. None solo es para errores."""
+# ── Backward-compat: schema viejo {is_cita, start} ─────────────────────────
+
+
+def test_detect_backward_compat_is_cita_true_maps_to_event(monkeypatch):
+    """Modelos / tests con el schema viejo (`is_cita=True`, `start=...`) se
+    mapean transparentemente al schema nuevo (`kind='event'`, `when=...`)."""
+    _mock_helper_client(monkeypatch, content=(
+        '{"is_cita": true, "title": "Turno", "start": "mañana 10hs", '
+        '"location": "Palermo", "confidence": 0.9}'
+    ))
+    out = rag._detect_cita_from_ocr("Turno dentista mañana a las 10hs Palermo")
+    assert out is not None
+    assert out["kind"] == "event"
+    assert out["when"] == "mañana 10hs"
+
+
+def test_detect_backward_compat_is_cita_false_maps_to_note(monkeypatch):
     _mock_helper_client(monkeypatch, content=(
         '{"is_cita": false, "title": "", "start": "", '
         '"location": "", "confidence": 0.0}'
     ))
-    out = rag._detect_cita_from_ocr("foto de un meme sin fecha ni hora ni nada")
+    out = rag._detect_cita_from_ocr("foto de un meme sin fecha ni hora")
     assert out is not None
-    assert out["is_cita"] is False
+    assert out["kind"] == "note"
 
 
-# ── _maybe_create_cita_from_ocr ────────────────────────────────────────────
-
-
-def _stub_propose_calendar_event(monkeypatch, result: dict):
-    """Reemplaza `rag.propose_calendar_event` para no tocar Calendar.app
-    en los tests. Retorna una lista con las llamadas para inspección."""
-    import json as _json
-    calls: list[dict] = []
-
-    def _fake(**kwargs):
-        calls.append(kwargs)
-        return _json.dumps(result, ensure_ascii=False)
-
-    monkeypatch.setattr(rag, "propose_calendar_event", _fake)
-    return calls
+# ── _maybe_create_cita_from_ocr: gating ────────────────────────────────────
 
 
 def test_maybe_create_returns_none_when_disabled(monkeypatch, _clean_state):
@@ -246,7 +304,12 @@ def test_maybe_create_returns_none_for_short_text(monkeypatch, _clean_state):
     assert rag._maybe_create_cita_from_ocr("corto", img, source="test") is None
 
 
-def test_maybe_create_dedup_short_circuits_on_second_call(monkeypatch, _clean_state, tmp_path):
+# ── _maybe_create_cita_from_ocr: dedup sidecar ─────────────────────────────
+
+
+def test_maybe_create_dedup_short_circuits_on_second_call(
+    monkeypatch, _clean_state, tmp_path,
+):
     """Llamar dos veces con el mismo texto = 1 sola llamada al detector +
     1 sola al propose_calendar_event. Segunda llamada devuelve cached row."""
     detect_calls = []
@@ -254,7 +317,7 @@ def test_maybe_create_dedup_short_circuits_on_second_call(monkeypatch, _clean_st
     def _fake_detect(text):
         detect_calls.append(text)
         return {
-            "is_cita": True, "title": "Turno", "start": "mañana 10hs",
+            "kind": "event", "title": "Turno", "when": "mañana 10hs",
             "location": "", "confidence": 0.95,
         }
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", _fake_detect)
@@ -272,6 +335,7 @@ def test_maybe_create_dedup_short_circuits_on_second_call(monkeypatch, _clean_st
     )
     assert r1 is not None
     assert r1["decision"] == "cita"
+    assert r1["kind"] == "event"
     assert r1["event_uid"] == "UID-123"
     assert r1.get("cached") is False
 
@@ -288,64 +352,52 @@ def test_maybe_create_dedup_short_circuits_on_second_call(monkeypatch, _clean_st
     assert len(propose_calls) == 1
 
 
-def test_maybe_create_low_confidence_persists_and_does_not_create(
+# ── _maybe_create_cita_from_ocr: event branch ──────────────────────────────
+
+
+def test_maybe_create_event_happy_path(monkeypatch, _clean_state, tmp_path):
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "event", "title": "Turno dentista",
+        "when": "martes 15hs", "location": "Palermo", "confidence": 0.9,
+    })
+    _stub_propose_calendar_event(monkeypatch, {
+        "kind": "event", "created": True, "event_uid": "UID-EV", "fields": {},
+    })
+    img = tmp_path / "ev.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "Turno dentista martes 15hs Palermo", img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "cita"
+    assert out["kind"] == "event"
+    assert out["event_uid"] == "UID-EV"
+
+
+def test_maybe_create_event_missing_when_is_ambiguous(
     monkeypatch, _clean_state, tmp_path,
 ):
+    """kind='event' pero when='' → no creamos ciegamente."""
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": True, "title": "?", "start": "tal vez",
-        "location": "", "confidence": 0.3,
-    })
-    propose_calls = _stub_propose_calendar_event(monkeypatch, {})
-
-    img = tmp_path / "borderline.png"
-    img.write_bytes(b"x")
-    out = rag._maybe_create_cita_from_ocr(
-        "texto suficientemente largo para pasar el gate", img, source="test",
-    )
-    assert out is not None
-    assert out["decision"] == "low_confidence"
-    assert out["event_uid"] is None
-    assert len(propose_calls) == 0  # no debería llamar propose
-
-
-def test_maybe_create_is_cita_false_persists_as_no(monkeypatch, _clean_state, tmp_path):
-    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": False, "title": "", "start": "",
-        "location": "", "confidence": 0.0,
-    })
-    _stub_propose_calendar_event(monkeypatch, {})
-
-    img = tmp_path / "meme.png"
-    img.write_bytes(b"x")
-    out = rag._maybe_create_cita_from_ocr(
-        "foto de un meme con mucho texto pero sin fechas", img, source="test",
-    )
-    assert out is not None
-    assert out["decision"] == "no"
-
-
-def test_maybe_create_missing_start_is_ambiguous(monkeypatch, _clean_state, tmp_path):
-    """Detector dice is_cita=True pero start="" → no creamos evento, persist
-    'ambiguous'."""
-    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": True, "title": "reunión", "start": "",
+        "kind": "event", "title": "reunión", "when": "",
         "location": "oficina", "confidence": 0.9,
     })
     propose_calls = _stub_propose_calendar_event(monkeypatch, {})
-
     img = tmp_path / "sin_fecha.png"
     img.write_bytes(b"x")
     out = rag._maybe_create_cita_from_ocr(
-        "texto suficientemente largo que menciona una reunión sin fecha", img, source="test",
+        "texto suficientemente largo que menciona una reunión sin fecha",
+        img, source="test",
     )
     assert out is not None
     assert out["decision"] == "ambiguous"
+    assert out["kind"] == "event"
     assert len(propose_calls) == 0
 
 
-def test_maybe_create_duplicate_path_persists_duplicate(monkeypatch, _clean_state, tmp_path):
+def test_maybe_create_event_duplicate_path(monkeypatch, _clean_state, tmp_path):
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": True, "title": "cumple Flor", "start": "26 de mayo",
+        "kind": "event", "title": "cumple Flor", "when": "26 de mayo",
         "location": "", "confidence": 0.9,
     })
     _stub_propose_calendar_event(monkeypatch, {
@@ -353,22 +405,25 @@ def test_maybe_create_duplicate_path_persists_duplicate(monkeypatch, _clean_stat
         "existing": {"uid": "UID-EXISTING", "title": "cumple Flor"},
         "fields": {},
     })
-
     img = tmp_path / "dup.png"
     img.write_bytes(b"x")
     out = rag._maybe_create_cita_from_ocr(
-        "mañana es el cumple de Flor 26 de mayo yearly", img, source="test",
+        "mañana es el cumple de Flor 26 de mayo yearly",
+        img, source="test",
     )
     assert out is not None
     assert out["decision"] == "duplicate"
     assert out["event_uid"] == "UID-EXISTING"
 
 
-def test_maybe_create_silent_fail_when_propose_raises(monkeypatch, _clean_state, tmp_path):
+def test_maybe_create_event_silent_fail_when_propose_raises(
+    monkeypatch, _clean_state, tmp_path,
+):
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": True, "title": "Turno", "start": "mañana 10hs",
+        "kind": "event", "title": "Turno", "when": "mañana 10hs",
         "location": "", "confidence": 0.9,
     })
+
     def _boom(**kwargs):
         raise RuntimeError("osascript falló")
     monkeypatch.setattr(rag, "propose_calendar_event", _boom)
@@ -376,21 +431,155 @@ def test_maybe_create_silent_fail_when_propose_raises(monkeypatch, _clean_state,
     img = tmp_path / "e.png"
     img.write_bytes(b"x")
     out = rag._maybe_create_cita_from_ocr(
-        "texto suficientemente largo que describe un turno", img, source="test",
+        "texto suficientemente largo que describe un turno",
+        img, source="test",
     )
     assert out is not None
     assert out["decision"] == "error"
+
+
+# ── _maybe_create_cita_from_ocr: reminder branch ───────────────────────────
+
+
+def test_maybe_create_reminder_with_date(monkeypatch, _clean_state, tmp_path):
+    """Reminder con deadline → `propose_reminder` + persist."""
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "reminder", "title": "Pagar luz",
+        "when": "antes del 15", "location": "", "confidence": 0.85,
+    })
+    calls = _stub_propose_reminder(monkeypatch, {
+        "kind": "reminder", "created": True, "reminder_id": "RID-1",
+        "fields": {},
+    })
+    img = tmp_path / "factura.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "Factura Edenor vencimiento antes del 15/05",
+        img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "reminder"
+    assert out["kind"] == "reminder"
+    assert out["reminder_id"] == "RID-1"
+    assert out["event_uid"] is None
+    # El path de la imagen debe estar en el notes blob del reminder.
+    assert len(calls) == 1
+    assert str(img) in calls[0]["notes"]
+    assert "Imagen:" in calls[0]["notes"]
+
+
+def test_maybe_create_reminder_without_date(monkeypatch, _clean_state, tmp_path):
+    """Reminder sin fecha (lista de compras) → se crea igual."""
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "reminder", "title": "Compras",
+        "when": "", "location": "", "confidence": 0.8,
+    })
+    calls = _stub_propose_reminder(monkeypatch, {
+        "kind": "reminder", "created": True, "reminder_id": "RID-2",
+        "fields": {},
+    })
+    img = tmp_path / "shopping.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "Lista compras: huevos tomates pan aceite papel cocina",
+        img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "reminder"
+    assert out["reminder_id"] == "RID-2"
+    assert len(calls) == 1
+    assert calls[0]["when"] == ""  # sin fecha
+
+
+def test_maybe_create_reminder_silent_fail(monkeypatch, _clean_state, tmp_path):
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "reminder", "title": "Pagar luz",
+        "when": "antes del 15", "location": "", "confidence": 0.9,
+    })
+
+    def _boom(**kwargs):
+        raise RuntimeError("osascript reminders falló")
+    monkeypatch.setattr(rag, "propose_reminder", _boom)
+    img = tmp_path / "r.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "Factura a pagar antes del 15 de mayo",
+        img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "error"
+    assert out["kind"] == "reminder"
+
+
+# ── _maybe_create_cita_from_ocr: note branch ───────────────────────────────
+
+
+def test_maybe_create_note_is_noop_for_calendar_and_reminders(
+    monkeypatch, _clean_state, tmp_path,
+):
+    """kind='note' → no llama ni a `propose_calendar_event` ni a
+    `propose_reminder`. Solo persist para dedup."""
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "note", "title": "Receta ibuprofeno",
+        "when": "", "location": "", "confidence": 0.8,
+    })
+    cal_calls = _stub_propose_calendar_event(monkeypatch, {})
+    rem_calls = _stub_propose_reminder(monkeypatch, {})
+
+    img = tmp_path / "receta.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "Receta médica: ibuprofeno 400mg cada 8hs por 5 días",
+        img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "note"
+    assert out["kind"] == "note"
+    assert out["event_uid"] is None
+    assert out["reminder_id"] is None
+    assert len(cal_calls) == 0
+    assert len(rem_calls) == 0
+
+
+# ── _maybe_create_cita_from_ocr: confidence thresholds ─────────────────────
+
+
+def test_maybe_create_low_confidence_persists_and_does_not_act(
+    monkeypatch, _clean_state, tmp_path,
+):
+    """Confidence bajo el umbral → persist 'low_confidence' sin invocar
+    ninguno de los propose_*."""
+    monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
+        "kind": "event", "title": "?", "when": "tal vez",
+        "location": "", "confidence": 0.3,
+    })
+    cal_calls = _stub_propose_calendar_event(monkeypatch, {})
+    rem_calls = _stub_propose_reminder(monkeypatch, {})
+
+    img = tmp_path / "borderline.png"
+    img.write_bytes(b"x")
+    out = rag._maybe_create_cita_from_ocr(
+        "texto suficientemente largo para pasar el gate",
+        img, source="test",
+    )
+    assert out is not None
+    assert out["decision"] == "low_confidence"
+    assert out["event_uid"] is None
+    assert out["reminder_id"] is None
+    assert len(cal_calls) == 0
+    assert len(rem_calls) == 0
 
 
 def test_maybe_create_min_confidence_override(monkeypatch, _clean_state, tmp_path):
     """`rag scan-citas --min-confidence 0.5` — el override debería permitir
     que una confidence de 0.6 (por debajo del 0.7 default) califique."""
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", lambda t: {
-        "is_cita": True, "title": "Turno", "start": "mañana",
+        "kind": "event", "title": "Turno", "when": "mañana",
         "location": "", "confidence": 0.6,
     })
     propose_calls = _stub_propose_calendar_event(monkeypatch, {
-        "kind": "event", "created": True, "event_uid": "UID-OVERRIDE", "fields": {},
+        "kind": "event", "created": True, "event_uid": "UID-OVERRIDE",
+        "fields": {},
     })
 
     img = tmp_path / "borderline-override.png"
@@ -404,11 +593,12 @@ def test_maybe_create_min_confidence_override(monkeypatch, _clean_state, tmp_pat
     assert out_default["decision"] == "low_confidence"
     assert len(propose_calls) == 0
 
-    # Con override a 0.5, un HASH DIFERENTE (otra imagen, otro texto) debería crear.
+    # Con override a 0.5, un HASH DIFERENTE (otra imagen, otro texto) crea.
     img2 = tmp_path / "other.png"
     img2.write_bytes(b"y")
     out_override = rag._maybe_create_cita_from_ocr(
-        "otro texto distinto sobre un turno mañana", img2, source="test",
+        "otro texto distinto sobre un turno mañana",
+        img2, source="test",
         min_confidence=0.5,
     )
     assert out_override is not None
@@ -435,11 +625,12 @@ def test_enrich_body_still_appends_ocr_when_detector_fires(
     monkeypatch.setattr(rag, "_ocr_image", lambda p: ocr_text)
 
     detect_calls = []
+
     def _fake_detect(text):
         detect_calls.append(text)
         return {
-            "is_cita": True, "title": "Turno dentista",
-            "start": "martes 15hs", "location": "Palermo", "confidence": 0.95,
+            "kind": "event", "title": "Turno dentista",
+            "when": "martes 15hs", "location": "Palermo", "confidence": 0.95,
         }
     monkeypatch.setattr(rag, "_detect_cita_from_ocr", _fake_detect)
     # Stub propose para no tocar Calendar.

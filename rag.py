@@ -5038,18 +5038,64 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " image_path TEXT,"
             " source TEXT NOT NULL,"
             " decision TEXT NOT NULL,"
+            " kind TEXT,"
             " title TEXT,"
             " start_text TEXT,"
             " location TEXT,"
             " confidence REAL,"
             " event_uid TEXT,"
+            " reminder_id TEXT,"
             " created_at REAL NOT NULL"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_cita_detections_source ON rag_cita_detections(source)",
             "CREATE INDEX IF NOT EXISTS ix_cita_detections_created ON rag_cita_detections(created_at)",
+            # NOTE: el índice sobre `kind` NO va acá. En DBs preexistentes
+            # (commit 1d55b27 → este) la tabla ya existe sin la columna
+            # `kind`; el CREATE TABLE IF NOT EXISTS arriba no la agrega,
+            # y un CREATE INDEX sobre columna inexistente revienta el
+            # batch DDL entero (afecta a todo `_ensure_telemetry_tables`
+            # vía el ROLLBACK). El índice se crea adentro de
+            # `_migrate_cita_detections_add_kind` DESPUÉS del ALTER que
+            # suma la columna.
         ),
     ),
 )
+
+
+def _migrate_cita_detections_add_kind(conn) -> None:
+    """Idempotent ALTER para DBs pre-2026-04-23 tarde que ya tienen la tabla
+    `rag_cita_detections` con el schema inicial (solo `event_uid`, sin
+    `kind` ni `reminder_id`).
+
+    Sqlite no soporta `ADD COLUMN IF NOT EXISTS` — intentamos el ALTER y
+    tragamos la OperationalError si la columna ya existe. Idempotente:
+    correr esto varias veces es no-op.
+
+    Llamado desde `_ensure_telemetry_tables` después del `CREATE TABLE IF
+    NOT EXISTS`. Instalaciones nuevas ya tienen las columnas en el DDL;
+    instalaciones existentes las suman acá.
+    """
+    import sqlite3 as _sqlite3
+    for col_ddl in (
+        "ALTER TABLE rag_cita_detections ADD COLUMN kind TEXT",
+        "ALTER TABLE rag_cita_detections ADD COLUMN reminder_id TEXT",
+    ):
+        try:
+            conn.execute(col_ddl)
+        except _sqlite3.OperationalError as exc:
+            # "duplicate column name: kind" → ya migrado, no-op.
+            if "duplicate column" not in str(exc).lower():
+                # Cualquier otro error lo ignoramos — si la tabla no existe
+                # es imposible (el DDL previo la crea) y cualquier otro
+                # issue se manifestará ruidosamente en el primer INSERT.
+                pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_cita_detections_kind "
+            "ON rag_cita_detections(kind)"
+        )
+    except Exception:
+        pass
 
 
 def _ensure_telemetry_tables(conn) -> None:
@@ -5084,6 +5130,15 @@ def _ensure_telemetry_tables(conn) -> None:
     except _sqlite3.Error:
         conn.execute("ROLLBACK")
         raise
+    # Lazy schema migrations — corren FUERA de la transaction principal
+    # porque ALTER TABLE no siempre es transactable y no queremos abortar
+    # el DDL batch entero si un ALTER de una sola columna falla.
+    try:
+        _migrate_cita_detections_add_kind(conn)
+    except Exception:
+        # Silent-fail: si la migration rompe, el INSERT usará el subset
+        # de columnas que sí existen (writer también es defensivo).
+        pass
 
 
 # Columns that hold JSON payloads. Non-primitive values in a row dict are
@@ -19066,15 +19121,25 @@ def _file_hash_with_images(raw: str, note_path: Path, vault_root: Path) -> str:
     return file_hash("\n".join(sig_parts))
 
 
-# ── Cita-from-image detector ────────────────────────────────────────────────
+# ── OCR → intent detector (event / reminder / note) ────────────────────────
 #
 # El OCR extrae texto de imágenes embebidas (Apple Vision, ver `_ocr_image`).
-# Esa misma rama ahora se extiende: si el texto parece una cita / turno /
-# evento, el helper qwen2.5:3b lo parsea a `{title, start, location}` y
-# dispara `propose_calendar_event` — que ya tiene auto all-day, parse NL
-# de fechas, dedup contra Calendar.app y osascript write.
+# Esa misma rama se extiende acá: el helper qwen2.5:3b clasifica el texto
+# en tres kinds y extrae datos estructurados:
 #
-# Triple salvaguarda contra dupes:
+#   - `event`: cita, turno, reunión, cumple, vuelo — cosa con fecha y/o
+#     hora específica que va al calendario. Dispara `propose_calendar_event`.
+#   - `reminder`: tarea, to-do, factura a pagar, lista de compras, llamar
+#     a X — acción a hacer, con o sin deadline. Dispara `propose_reminder`
+#     con el path de la imagen en el campo `notes` (Apple Reminders no
+#     soporta attachments vía AppleScript; el path en `notes` es lo más
+#     cercano — queda como texto grep-friendly en la app).
+#   - `note`: info sin acción — receta médica sin fecha, foto de código,
+#     meme, captura de UI, texto de referencia. No-op: la nota OCR ya se
+#     guardó en el vault (si el trigger fue `rag capture --image` o el
+#     indexer), nada más para hacer.
+#
+# Triple salvaguarda contra dupes (preservada del diseño original):
 #   1. Sidecar `rag_cita_detections` keyed por `sha256(normalized_ocr)[:16]` —
 #      impide dos llamadas al helper para el mismo texto, aunque llegue por
 #      rutas distintas (indexer, `rag capture --image`, `rag scan-citas`,
@@ -19092,15 +19157,18 @@ def _file_hash_with_images(raw: str, note_path: Path, vault_root: Path) -> str:
 # se vuelve no-op. OCR body enrichment sigue igual — es feature ortogonal.
 
 # Umbral de confianza auto-create. qwen2.5:3b con temp=0 + seed=42 devuelve
-# scores consistentes; 0.70 filtra ambigüedades ("me viste el video de
-# Messi martes pasado" no es cita) pero pasa casos reales ("turno dentista
-# miércoles 15hs consultorio Palermo" → 0.9+). Override por `rag scan-citas
-# --min-confidence 0.5` para barridos agresivos.
+# scores consistentes; 0.70 filtra ambigüedades pero pasa casos reales
+# ("turno dentista miércoles 15hs consultorio Palermo" → 0.9+). Override
+# por `rag scan-citas --min-confidence 0.5` para barridos agresivos.
 _CITA_MIN_CONFIDENCE = 0.70
 
 # OCR más corto que esto no tiene suficiente señal (ej. screenshot de un
 # botón con "OK"). Skipeamos sin gastar helper call.
 _CITA_MIN_CHARS = 20
+
+# Kinds válidos del detector. `note` = no-op (solo se loggea). El resto
+# dispara acción.
+_CITA_VALID_KINDS = frozenset({"event", "reminder", "note"})
 
 
 def _cita_detect_enabled() -> bool:
@@ -19127,52 +19195,69 @@ def _ocr_hash_key(ocr_text: str) -> str:
 
 
 _CITA_PROMPT_SYSTEM = (
-    "Sos un extractor de citas / turnos / eventos a partir de texto OCR "
+    "Sos un clasificador de tareas agendables a partir de texto OCR "
     "crudo. El texto viene de una imagen — puede tener errores de "
     "reconocimiento (acentos perdidos, palabras cortadas, líneas "
-    "mezcladas, chrome de app). Tu único trabajo es decidir si el texto "
-    "describe UN evento con fecha / hora a agendar, y extraer los datos."
+    "mezcladas, chrome de app). Tu trabajo es decidir si el texto "
+    "describe un EVENTO de calendario, un RECORDATORIO/tarea, o "
+    "simplemente INFORMACIÓN sin acción agendable. Y extraer los datos."
 )
 
 _CITA_PROMPT_USER_TEMPLATE = (
     "Texto OCR de la imagen (puede estar ruidoso):\n"
     "<OCR>\n{ocr}\n</OCR>\n\n"
     "Devolvé JSON estricto, sin preámbulos, con estas llaves:\n"
-    "  is_cita (bool): true solo si hay evento con fecha o día identificable.\n"
-    "  title (str): título corto y descriptivo del evento (p.ej. 'Turno "
-    "Dr. García', 'Cumple de Flor', 'Entrevista Moka'). Si el texto no "
-    "nombra persona/servicio, usá el tipo ('cita médica', 'reunión', "
-    "'turno'). Máximo 80 caracteres.\n"
-    "  start (str): fecha/hora tal cual aparece en el texto, en lenguaje "
-    "natural — pasale lo que el dateparser entiende: 'martes 15hs', "
-    "'15/05 10:00', 'mañana 14hs', 'el viernes', '26 de mayo'. NO "
-    "inventes horario si no está en el texto.\n"
-    "  location (str): dirección, consultorio, link de Zoom, nombre del "
-    "lugar si aparece. '' si no hay.\n"
+    "  kind (str): 'event' | 'reminder' | 'note'\n"
+    "    - 'event': cita, turno, reunión, cumple, vuelo, clase, "
+    "entrevista — cosas con fecha Y/O hora específica que van al "
+    "calendario (ej. 'Turno dentista martes 15hs', 'Cumple Flor 26 "
+    "de mayo', 'Vuelo AR1234 15/06 08:20').\n"
+    "    - 'reminder': tarea, to-do, factura a pagar, lista de compras, "
+    "llamar/contactar a alguien, devolver algo, renovar documento — "
+    "algo a HACER, con o sin deadline (ej. 'Pagar luz antes del 15', "
+    "'Comprar huevos tomates pan', 'Llamar al plomero').\n"
+    "    - 'note': información pura sin acción — receta médica sin "
+    "fecha, foto de código, meme, captura de UI, texto de referencia, "
+    "imagen decorativa (ej. 'Ibuprofeno 400mg cada 8hs', 'Error 500 "
+    "stack trace', una foto familiar cualquiera).\n"
+    "  title (str): título corto y descriptivo (<80 chars). Para event "
+    "nombrá persona/servicio si aparece. Para reminder usá verbo + "
+    "objeto ('Pagar luz', 'Comprar huevos'). Para note describí qué es.\n"
+    "  when (str): fecha/hora/día en NL tal como aparece en el texto. "
+    "'' si no hay. Usá lo que el dateparser entiende: 'martes 15hs', "
+    "'15/05 10:00', 'mañana 14hs', 'el viernes', '26 de mayo', 'antes "
+    "del 15'. NO inventes horario si no está en el texto.\n"
+    "  location (str): dirección, consultorio, link de Zoom, negocio — "
+    "relevante para event y a veces para reminder. '' si no aplica.\n"
     "  confidence (float 0.0–1.0): qué tan seguro estás. Alto (≥0.8) si "
-    "hay marcadores claros (palabra 'turno'/'cita'/'appointment' + fecha "
-    "+ hora). Medio (0.5–0.8) si falta uno. Bajo (<0.5) si es ambiguo.\n\n"
-    "Si NO es una cita (meme, código, conversación sin fecha concreta, "
-    "screenshot de UI), devolvé {{\"is_cita\": false, \"title\": \"\", "
-    "\"start\": \"\", \"location\": \"\", \"confidence\": 0.0}}.\n\n"
-    "IMPORTANTE: solo UN evento por respuesta. Si el texto tiene varios "
-    "turnos, agarrá el más próximo en el tiempo."
+    "los marcadores del kind son claros. Medio (0.5–0.8) si hay "
+    "ambigüedad. Bajo (<0.5) si casi no hay pistas.\n\n"
+    "Si NO está claro qué es, usá kind='note' con confidence baja.\n"
+    "Si el texto tiene varios items, agarrá el más importante / "
+    "próximo en el tiempo."
 )
 
 
 def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
-    """Helper call qwen2.5:3b con format=json: ¿este texto OCR es una cita?
+    """Helper call qwen2.5:3b con format=json: clasifica el texto OCR como
+    event, reminder o note, y extrae {title, when, location}.
 
     Returns:
-      - dict con shape `{is_cita, title, start, location, confidence}` —
+      - dict con shape `{kind, title, when, location, confidence}` —
         normalizado y validado. NUNCA raise.
       - None si: `RAG_CITA_DETECT=0`, ocr_text vacío o muy corto, helper
         timeout / unreachable, JSON malformado, shape inválida.
 
-    Callers deben chequear `None` + `is_cita=True` + `confidence >=
-    threshold` antes de crear evento — el helper a veces devuelve
-    `is_cita=True` con `confidence=0.3`, lo cual es una "no-cita con
-    dudas" que no queremos auto-agendar.
+    Callers deben chequear `None` + `kind in {event, reminder}` +
+    `confidence >= threshold` antes de crear algo — el helper a veces
+    devuelve `kind='event'` con `confidence=0.3`, lo cual es una
+    clasificación dudosa que no queremos auto-agendar.
+
+    Backward-compat con el schema viejo `{is_cita, start}`: si el modelo
+    (o un test monkeypatched) devuelve las keys viejas, las mapeamos:
+    `is_cita=True` → `kind='event'`, `is_cita=False` → `kind='note'`,
+    `start` → `when`. Eso hace que el upgrade sea transparente para
+    callers externos.
     """
     if not _cita_detect_enabled():
         return None
@@ -19180,9 +19265,8 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
     if len(text) < _CITA_MIN_CHARS:
         return None
     # Cap para controlar el prompt size — 1500 chars cubre el 99% de
-    # screenshots reales (una invitación de cumpleaños rara vez tiene
-    # más texto). Cortar el final es OK: el título / fecha suele estar
-    # al principio del OCR (Apple Vision scanea top→bottom, left→right).
+    # screenshots reales. Cortar el final es OK: el título / fecha suele
+    # estar al principio del OCR (Apple Vision scanea top→bottom).
     capped = text[:1500]
     prompt = _CITA_PROMPT_USER_TEMPLATE.format(ocr=capped)
     try:
@@ -19192,7 +19276,7 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
                 {"role": "system", "content": _CITA_PROMPT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
-            options={**HELPER_OPTIONS, "num_predict": 160, "num_ctx": 2048},
+            options={**HELPER_OPTIONS, "num_predict": 180, "num_ctx": 2048},
             keep_alive=OLLAMA_KEEP_ALIVE,
             format="json",
         )
@@ -19203,14 +19287,23 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    # Normalización defensiva — el helper a veces devuelve tipos inesperados
-    # (ej. confidence como string "0.8" o is_cita como 1/0). Convertimos
-    # con tolerancia y clampeamos el float al rango válido.
+    # Normalización defensiva — el helper a veces devuelve tipos raros.
     try:
-        is_cita = bool(data.get("is_cita"))
+        # Backward-compat: schema viejo usaba `is_cita` + `start`.
+        kind_raw = data.get("kind")
+        if kind_raw is None and "is_cita" in data:
+            kind_raw = "event" if data.get("is_cita") else "note"
+        kind = str(kind_raw or "note").strip().lower()
+        if kind not in _CITA_VALID_KINDS:
+            kind = "note"
+
         title = str(data.get("title") or "").strip()[:120]
-        start = str(data.get("start") or "").strip()[:200]
+        when_raw = data.get("when")
+        if when_raw is None and "start" in data:
+            when_raw = data.get("start")
+        when = str(when_raw or "").strip()[:200]
         location = str(data.get("location") or "").strip()[:200]
+
         conf_raw = data.get("confidence")
         if isinstance(conf_raw, str):
             try:
@@ -19223,9 +19316,9 @@ def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
         _silent_log("cita_detect_normalize", exc)
         return None
     return {
-        "is_cita": is_cita,
+        "kind": kind,
         "title": title,
-        "start": start,
+        "when": when,
         "location": location,
         "confidence": confidence,
     }
@@ -19238,21 +19331,27 @@ def _maybe_create_cita_from_ocr(
     *,
     min_confidence: float | None = None,
 ) -> dict | None:
-    """Pipeline OCR→detector→event + sidecar dedup (silent-fail).
+    """Pipeline OCR → classifier → action (event / reminder / note) con
+    sidecar dedup. Silent-fail en cada paso.
 
-    Flujo:
-      1. `RAG_CITA_DETECT=0`? → None.
-      2. Hash normalizado del OCR → ya existe en `rag_cita_detections`?
-         → devolver el row anterior sin re-invocar helper / calendar.
-      3. `_detect_cita_from_ocr(ocr_text)` — si None o `is_cita=False` o
-         confidence < threshold → persist "no" / "low_confidence" y return.
-      4. `propose_calendar_event(title, start, location=...)` — si devolvió
-         error o needs_clarification → persist "ambiguous" sin evento.
-      5. Evento creado → persist "cita" con `event_uid` y devolver dict.
+    Flujo por kind:
+      - `kind="event"` + when parseable → `propose_calendar_event`. Persist
+        decision="cita" con `event_uid` (o "duplicate" si ya estaba, o
+        "error", o "ambiguous" si el parser de fecha no lo resolvió).
+      - `kind="event"` + when="" → persist "ambiguous" sin crear.
+      - `kind="reminder"` → `propose_reminder` (con o sin fecha). El path
+        de la imagen se incluye en `notes` para que quede referenciado
+        en Apple Reminders (no hay attachment API). Persist "reminder" +
+        `reminder_id`.
+      - `kind="note"` → no-op. Persist "note" para que re-runs skippeen.
 
     `source` arg se propaga al sidecar para auditoría ("index" / "capture"
-    / "scan-citas" / "whatsapp" / "watch"). `min_confidence` override local
-    cuando el caller es `rag scan-citas --min-confidence 0.5`.
+    / "scan-citas" / "whatsapp"). `min_confidence` override local cuando
+    el caller es `rag scan-citas --min-confidence 0.5`.
+
+    Returns dict con shape unificada:
+      `{cached: bool, decision: str, kind: str, title, when, location,
+        confidence, event_uid, reminder_id}`.
 
     NUNCA raise — cada paso tiene try/except silent-log.
     """
@@ -19271,8 +19370,9 @@ def _maybe_create_cita_from_ocr(
     try:
         with _ragvec_state_conn() as conn:
             row = conn.execute(
-                "SELECT decision, title, start_text, location, confidence, "
-                "event_uid, created_at FROM rag_cita_detections WHERE ocr_hash = ?",
+                "SELECT decision, kind, title, start_text, location, "
+                "confidence, event_uid, reminder_id, created_at "
+                "FROM rag_cita_detections WHERE ocr_hash = ?",
                 (key,),
             ).fetchone()
     except Exception as exc:
@@ -19282,12 +19382,16 @@ def _maybe_create_cita_from_ocr(
         return {
             "cached": True,
             "decision": row[0],
-            "title": row[1],
-            "start": row[2],
-            "location": row[3],
-            "confidence": row[4],
-            "event_uid": row[5],
-            "created_at": row[6],
+            "kind": row[1] or "",
+            "title": row[2],
+            "when": row[3],
+            # Backward-compat alias para callers que esperan `start`.
+            "start": row[3],
+            "location": row[4],
+            "confidence": row[5],
+            "event_uid": row[6],
+            "reminder_id": row[7],
+            "created_at": row[8],
         }
 
     # Step 2: run detector.
@@ -19297,115 +19401,224 @@ def _maybe_create_cita_from_ocr(
         return None
 
     now_ts = time.time()
+    kind = detected.get("kind") or "note"
+    title = detected.get("title") or ""
+    when = detected.get("when") or ""
+    location = detected.get("location") or ""
+    confidence = float(detected.get("confidence") or 0.0)
 
-    # Step 3: below-threshold or non-cita — persist "no" so dedup wins next time.
-    if not detected.get("is_cita") or detected.get("confidence", 0.0) < threshold:
-        decision = "low_confidence" if detected.get("is_cita") else "no"
+    # Step 3: below-threshold — persist so dedup wins next time.
+    if confidence < threshold:
         _persist_cita_detection(
-            ocr_hash=key, image_path=img_str, source=source, decision=decision,
-            title=detected.get("title", ""), start_text=detected.get("start", ""),
-            location=detected.get("location", ""),
-            confidence=detected.get("confidence", 0.0),
-            event_uid=None, created_at=now_ts,
+            ocr_hash=key, image_path=img_str, source=source,
+            decision="low_confidence", kind=kind,
+            title=title, start_text=when, location=location,
+            confidence=confidence, event_uid=None, reminder_id=None,
+            created_at=now_ts,
         )
-        return {
-            "cached": False,
-            "decision": decision,
-            "title": detected.get("title", ""),
-            "start": detected.get("start", ""),
-            "location": detected.get("location", ""),
-            "confidence": detected.get("confidence", 0.0),
-            "event_uid": None,
-        }
+        return _cita_result(
+            cached=False, decision="low_confidence", kind=kind,
+            title=title, when=when, location=location,
+            confidence=confidence,
+        )
 
-    title = detected.get("title") or "Cita"
-    start_text = detected.get("start") or ""
-    location = detected.get("location") or None
-    confidence = detected.get("confidence", 0.0)
-
-    if not start_text:
-        # is_cita=True pero sin fecha parseable — no creamos ciegamente.
+    # Step 4: route by kind.
+    if kind == "note":
+        # Nothing to schedule. Persist so we don't re-invoke the helper.
         _persist_cita_detection(
-            ocr_hash=key, image_path=img_str, source=source, decision="ambiguous",
-            title=title, start_text=start_text, location=location or "",
-            confidence=confidence, event_uid=None, created_at=now_ts,
+            ocr_hash=key, image_path=img_str, source=source,
+            decision="note", kind="note",
+            title=title, start_text=when, location=location,
+            confidence=confidence, event_uid=None, reminder_id=None,
+            created_at=now_ts,
         )
-        return {
-            "cached": False, "decision": "ambiguous",
-            "title": title, "start": start_text, "location": location or "",
-            "confidence": confidence, "event_uid": None,
-        }
+        return _cita_result(
+            cached=False, decision="note", kind="note",
+            title=title, when=when, location=location,
+            confidence=confidence,
+        )
 
-    # Step 4: propose_calendar_event — reutiliza NL parse + dedup + osascript.
-    notes_blob = f"Auto-detectado de OCR ({source}): {image_path}\n\n{text[:500]}"
+    if kind == "event":
+        if not when:
+            # Event classification without a parseable date — persist as
+            # ambiguous (user can re-evaluate manually, and dedup won't
+            # re-call helper for the same OCR text).
+            _persist_cita_detection(
+                ocr_hash=key, image_path=img_str, source=source,
+                decision="ambiguous", kind="event",
+                title=title, start_text=when, location=location,
+                confidence=confidence, event_uid=None, reminder_id=None,
+                created_at=now_ts,
+            )
+            return _cita_result(
+                cached=False, decision="ambiguous", kind="event",
+                title=title, when=when, location=location,
+                confidence=confidence,
+            )
+        event_title = title or "Cita"
+        notes_blob = f"Auto-detectado de OCR ({source}): {image_path}\n\n{text[:500]}"
+        try:
+            result_json = propose_calendar_event(
+                title=event_title, start=when,
+                location=(location or None), notes=notes_blob,
+            )
+            result = json.loads(result_json)
+        except Exception as exc:
+            _silent_log("cita_propose_event", exc)
+            result = {"created": False, "error": str(exc)}
+
+        event_uid = None
+        decision = "error"
+        if isinstance(result, dict):
+            if result.get("duplicate"):
+                decision = "duplicate"
+                existing = result.get("existing") or {}
+                event_uid = existing.get("uid") or existing.get("event_uid")
+            elif result.get("created"):
+                decision = "cita"
+                event_uid = result.get("event_uid")
+            elif result.get("needs_clarification"):
+                decision = "ambiguous"
+            else:
+                decision = "error"
+
+        _persist_cita_detection(
+            ocr_hash=key, image_path=img_str, source=source,
+            decision=decision, kind="event",
+            title=event_title, start_text=when, location=location,
+            confidence=confidence, event_uid=event_uid, reminder_id=None,
+            created_at=now_ts,
+        )
+        return _cita_result(
+            cached=False, decision=decision, kind="event",
+            title=event_title, when=when, location=location,
+            confidence=confidence, event_uid=event_uid,
+        )
+
+    # kind == "reminder"
+    reminder_title = title or "Tarea"
+    # Apple Reminders NO soporta attachments vía AppleScript; el path de
+    # la imagen queda en el body del reminder para referencia — Reminders.
+    # app lo muestra como texto, grep-friendly desde CLI también.
+    notes_blob = (
+        f"Imagen: {image_path}\n"
+        f"Origen: {source}\n\n"
+        f"{text[:500]}"
+    )
     try:
-        result_json = propose_calendar_event(
-            title=title,
-            start=start_text,
-            location=location,
+        result_json = propose_reminder(
+            title=reminder_title,
+            when=when,  # puede ser "" — `propose_reminder` lo tolera
             notes=notes_blob,
         )
         result = json.loads(result_json)
     except Exception as exc:
-        _silent_log("cita_propose_call", exc)
+        _silent_log("cita_propose_reminder", exc)
         result = {"created": False, "error": str(exc)}
 
-    event_uid = None
+    reminder_id = None
     decision = "error"
     if isinstance(result, dict):
-        if result.get("duplicate"):
-            # `_find_duplicate_calendar_event` agarró un match — ya estaba
-            # en Calendar.app. Igual lo guardamos para que reindex no
-            # re-invoque helper + dup check.
-            decision = "duplicate"
-            existing = result.get("existing") or {}
-            event_uid = existing.get("uid") or existing.get("event_uid")
-        elif result.get("created"):
-            decision = "cita"
-            event_uid = result.get("event_uid")
+        if result.get("created"):
+            decision = "reminder"
+            reminder_id = result.get("reminder_id")
         elif result.get("needs_clarification"):
             decision = "ambiguous"
         else:
             decision = "error"
 
     _persist_cita_detection(
-        ocr_hash=key, image_path=img_str, source=source, decision=decision,
-        title=title, start_text=start_text, location=location or "",
-        confidence=confidence, event_uid=event_uid, created_at=now_ts,
+        ocr_hash=key, image_path=img_str, source=source,
+        decision=decision, kind="reminder",
+        title=reminder_title, start_text=when, location=location,
+        confidence=confidence, event_uid=None, reminder_id=reminder_id,
+        created_at=now_ts,
     )
+    return _cita_result(
+        cached=False, decision=decision, kind="reminder",
+        title=reminder_title, when=when, location=location,
+        confidence=confidence, reminder_id=reminder_id,
+    )
+
+
+def _cita_result(
+    *, cached: bool, decision: str, kind: str, title: str, when: str,
+    location: str, confidence: float,
+    event_uid: str | None = None, reminder_id: str | None = None,
+) -> dict:
+    """Shape uniforme de retorno para `_maybe_create_cita_from_ocr`.
+    Incluye `start` como alias de `when` para backward-compat con callers
+    que esperan el schema viejo (tests pre-2026-04-23 tarde, renders del
+    CLI anteriores al routing por kind).
+    """
     return {
-        "cached": False,
+        "cached": bool(cached),
         "decision": decision,
+        "kind": kind,
         "title": title,
-        "start": start_text,
-        "location": location or "",
-        "confidence": confidence,
+        "when": when,
+        "start": when,  # alias
+        "location": location,
+        "confidence": float(confidence),
         "event_uid": event_uid,
+        "reminder_id": reminder_id,
     }
 
 
 def _persist_cita_detection(
     *, ocr_hash: str, image_path: str, source: str, decision: str,
-    title: str, start_text: str, location: str, confidence: float,
-    event_uid: str | None, created_at: float,
+    kind: str | None, title: str, start_text: str, location: str,
+    confidence: float,
+    event_uid: str | None, reminder_id: str | None, created_at: float,
 ) -> None:
-    """INSERT OR IGNORE — si otro caller ganó la carrera, respetamos su fila.
-    Silent-fail.
+    """INSERT OR IGNORE en `rag_cita_detections`.
+
+    Si otro caller ganó la carrera (mismo `ocr_hash` persistido primero),
+    respetamos su fila — por eso OR IGNORE y no OR REPLACE. Silent-fail:
+    excepciones log-only, no bloquean el caller.
+
+    Incluye columnas `kind` + `reminder_id` post-2026-04-23. Instalaciones
+    viejas sin la migration lazy (`_migrate_cita_detections_add_kind`) van
+    a fallar el INSERT por columnas inexistentes; el except genérico lo
+    captura y persistimos con el subset mínimo (best-effort degradation).
     """
     try:
         with _ragvec_state_conn() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO rag_cita_detections "
-                "(ocr_hash, image_path, source, decision, title, start_text, "
-                "location, confidence, event_uid, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(ocr_hash, image_path, source, decision, kind, title, "
+                "start_text, location, confidence, event_uid, reminder_id, "
+                "created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    ocr_hash, image_path, source, decision, title, start_text,
-                    location, float(confidence), event_uid, float(created_at),
+                    ocr_hash, image_path, source, decision, kind, title,
+                    start_text, location, float(confidence), event_uid,
+                    reminder_id, float(created_at),
                 ),
             )
     except Exception as exc:
         _silent_log(f"cita_sidecar_write:{ocr_hash}", exc)
+        # Fallback: retry con subset pre-kind/reminder_id (pre-migration
+        # schema). Protege operadores que corrieron el feature original
+        # (commit 1d55b27) y NO bajaron `_migrate_cita_detections_add_kind`
+        # todavía (ej. tests que instancian un DB bare sin
+        # `_ensure_telemetry_tables`).
+        try:
+            with _ragvec_state_conn() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO rag_cita_detections "
+                    "(ocr_hash, image_path, source, decision, title, "
+                    "start_text, location, confidence, event_uid, "
+                    "created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        ocr_hash, image_path, source, decision, title,
+                        start_text, location, float(confidence),
+                        event_uid, float(created_at),
+                    ),
+                )
+        except Exception as exc2:
+            _silent_log(f"cita_sidecar_write_fallback:{ocr_hash}", exc2)
 
 
 def _index_single_file(
@@ -27889,31 +28102,50 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
         rel = note_path.relative_to(VAULT_PATH)
         if plain:
             click.echo(str(rel))
-            if cita_result and cita_result.get("decision") == "cita":
-                click.echo(f"evento: {cita_result.get('event_uid')}")
+            if cita_result:
+                dec = cita_result.get("decision")
+                if dec == "cita":
+                    click.echo(f"evento: {cita_result.get('event_uid')}")
+                elif dec == "reminder":
+                    click.echo(f"recordatorio: {cita_result.get('reminder_id')}")
             return
         console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
         if cita_result:
             dec = cita_result.get("decision")
+            title_s = cita_result.get("title") or ""
+            when_s = cita_result.get("when") or cita_result.get("start") or ""
+            loc_s = cita_result.get("location") or ""
             if dec == "cita":
                 console.print(
                     f"[bold green]📅 Evento creado:[/bold green] "
-                    f"[cyan]{cita_result.get('title')}[/cyan] — "
-                    f"[dim]{cita_result.get('start')}[/dim]"
-                    + (f" · {cita_result.get('location')}" if cita_result.get("location") else "")
+                    f"[cyan]{title_s}[/cyan] — [dim]{when_s}[/dim]"
+                    + (f" · {loc_s}" if loc_s else "")
+                )
+            elif dec == "reminder":
+                tail = f" — [dim]{when_s}[/dim]" if when_s else " [dim](sin fecha)[/dim]"
+                console.print(
+                    f"[bold magenta]✓ Recordatorio creado:[/bold magenta] "
+                    f"[cyan]{title_s}[/cyan]{tail}"
+                )
+                console.print(
+                    f"  [dim]Imagen adjunta: {image_path}[/dim]"
                 )
             elif dec == "duplicate":
                 console.print(
                     f"[yellow]📅 Ya estaba en el calendario:[/yellow] "
-                    f"[dim]{cita_result.get('title')}[/dim]"
+                    f"[dim]{title_s}[/dim]"
                 )
             elif dec == "ambiguous":
                 console.print(
                     "[dim]📅 Parece una cita pero la fecha es ambigua — "
                     "no se agendó. Revisá la nota.[/dim]"
                 )
+            elif dec == "note":
+                # Info sin acción — la nota ya quedó en 00-Inbox, nada
+                # más que hacer. Silent por default para no ruido.
+                pass
             elif dec in ("no", "low_confidence"):
-                # Silent: no es cita o el helper dudó. Nada que mostrar.
+                # Silent: el helper no clasificó o no tuvo confianza.
                 pass
         return
 
@@ -27974,19 +28206,27 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
 
     Uso:
       rag scan-citas ~/Desktop/Screenshots          # dry-run
-      rag scan-citas ~/Downloads --apply             # crea eventos
+      rag scan-citas ~/Downloads --apply             # crea eventos + reminders
       rag scan-citas . --apply --min-confidence 0.5  # más agresivo
 
     El folder NO tiene que estar adentro del vault — podés pasar
     `~/Downloads`, `/tmp`, lo que sea. Cada imagen (.png .jpg .jpeg
     .heic .webp .gif .bmp .tiff .tif) se OCR-ea (cache en
-    `rag_ocr_cache` por abs path + mtime), pasa por qwen2.5:3b, y si
-    el detector devuelve `is_cita=True` con confidence ≥ umbral,
-    se crea el evento (o se muestra en dry-run).
+    `rag_ocr_cache` por abs path + mtime), pasa por qwen2.5:3b, y el
+    detector clasifica en 3 kinds:
+
+      - event    → cita / turno / reunión → Calendar.app
+      - reminder → tarea / compra / factura → Apple Reminders (con
+                   path de la imagen en el body del recordatorio)
+      - note     → info sin acción (receta, meme, código) → no-op
+
+    Con `--apply`: cada event crea un evento, cada reminder crea un
+    recordatorio. Notes no hacen nada (solo se loggean). Sin `--apply`
+    es dry-run y muestra la clasificación.
 
     Dedup: el sidecar `rag_cita_detections` persiste hash-based decisions
     — re-correr sobre la misma carpeta no gasta llamadas al helper ni
-    duplica eventos.
+    duplica eventos / recordatorios.
     """
     # Collect images — respect _IMAGE_EXTENSIONS del module OCR.
     pattern = "**/*" if recursive else "*"
@@ -28009,10 +28249,11 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
 
     # Counters for summary.
     counts = {
-        "cita": 0, "duplicate": 0, "no": 0, "low_confidence": 0,
+        "cita": 0, "reminder": 0, "note": 0, "duplicate": 0,
+        "no": 0, "low_confidence": 0,
         "ambiguous": 0, "error": 0, "skipped": 0,
     }
-    rows: list[tuple[str, str, float, str, str]] = []
+    rows: list[tuple[str, str, str, float, str, str]] = []
 
     for img in sorted(images, key=lambda p: str(p)):
         try:
@@ -28039,6 +28280,7 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
                 counts["skipped"] += 1
                 continue
             dec = result.get("decision") or "error"
+            kind = result.get("kind") or ""
         else:
             # Dry-run: sólo correr el detector (sin sidecar write que
             # podría afectar un apply posterior). Es una decisión de
@@ -28055,72 +28297,92 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
             if detected is None:
                 counts["skipped"] += 1
                 continue
-            if not detected.get("is_cita"):
-                dec = "no"
-            elif detected.get("confidence", 0.0) < threshold:
+            kind = detected.get("kind") or "note"
+            if detected.get("confidence", 0.0) < threshold:
                 dec = "low_confidence"
+            elif kind == "note":
+                dec = "note"
+            elif kind == "event":
+                # Dry-run: would be either "cita" or "ambiguous" (if
+                # `when` is empty). Predecirlo sin llamar a
+                # `_parse_natural_datetime` es aproximado pero útil.
+                dec = "cita" if (detected.get("when") or "") else "ambiguous"
+            elif kind == "reminder":
+                dec = "reminder"
             else:
-                dec = "cita"  # would-be created
+                dec = "error"
             result = {
                 "decision": dec,
+                "kind": kind,
                 "title": detected.get("title", ""),
-                "start": detected.get("start", ""),
+                "when": detected.get("when", ""),
+                "start": detected.get("when", ""),
                 "location": detected.get("location", ""),
                 "confidence": detected.get("confidence", 0.0),
                 "event_uid": None,
+                "reminder_id": None,
             }
 
         counts[dec] = counts.get(dec, 0) + 1
         rows.append((
             str(img.relative_to(folder)) if img.is_relative_to(folder) else str(img),
             dec,
+            kind or "-",
             float(result.get("confidence", 0.0) or 0.0),
             str(result.get("title", ""))[:60],
-            str(result.get("start", ""))[:40],
+            str(result.get("when", "") or result.get("start", ""))[:40],
         ))
 
     # Render.
     if plain:
-        for path_s, dec, conf, title_s, start_s in rows:
-            click.echo(f"{path_s}\t{dec}\t{conf:.2f}\t{title_s}\t{start_s}")
+        for path_s, dec, kind_s, conf, title_s, when_s in rows:
+            click.echo(f"{path_s}\t{dec}\t{kind_s}\t{conf:.2f}\t{title_s}\t{when_s}")
         return
 
     from rich.table import Table
     t = Table(show_header=True, header_style="bold")
     t.add_column("Imagen", overflow="fold")
     t.add_column("Decisión")
+    t.add_column("Tipo")
     t.add_column("Conf", justify="right")
     t.add_column("Título")
     t.add_column("Cuándo")
-    for path_s, dec, conf, title_s, start_s in rows:
+    for path_s, dec, kind_s, conf, title_s, when_s in rows:
         dec_style = {
-            "cita": "green", "duplicate": "yellow",
+            "cita": "green", "reminder": "magenta", "note": "cyan",
+            "duplicate": "yellow",
             "no": "dim", "low_confidence": "dim",
             "ambiguous": "yellow", "error": "red",
         }.get(dec, "white")
         t.add_row(
             path_s,
             f"[{dec_style}]{dec}[/{dec_style}]",
+            kind_s,
             f"{conf:.2f}",
             title_s,
-            start_s,
+            when_s,
         )
     console.print(t)
     console.print(
         f"[bold]Resumen[/bold] · "
         f"[green]cita={counts.get('cita',0)}[/green] "
+        f"[magenta]reminder={counts.get('reminder',0)}[/magenta] "
+        f"[cyan]note={counts.get('note',0)}[/cyan] "
         f"[yellow]dup={counts.get('duplicate',0)}[/yellow] "
-        f"[dim]no={counts.get('no',0)}[/dim] "
         f"[dim]low={counts.get('low_confidence',0)}[/dim] "
         f"[yellow]ambig={counts.get('ambiguous',0)}[/yellow] "
         f"[red]err={counts.get('error',0)}[/red] "
         f"[dim]skip={counts.get('skipped',0)}[/dim]"
     )
-    if not do_apply and counts.get("cita", 0) > 0:
-        console.print(
-            f"[dim]→ {counts.get('cita', 0)} candidatas. "
-            f"Correlo con [bold]--apply[/bold] para agendar.[/dim]"
-        )
+    if not do_apply:
+        actionable = counts.get("cita", 0) + counts.get("reminder", 0)
+        if actionable > 0:
+            console.print(
+                f"[dim]→ {actionable} candidatas "
+                f"({counts.get('cita',0)} eventos + {counts.get('reminder',0)} "
+                f"recordatorios). Correlo con [bold]--apply[/bold] para "
+                f"crearlas.[/dim]"
+            )
 
 
 # ── URL INGEST (rag read) ────────────────────────────────────────────────────

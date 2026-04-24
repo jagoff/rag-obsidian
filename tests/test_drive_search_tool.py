@@ -242,6 +242,177 @@ def test_drive_search_name_fallback_for_name_only_match(monkeypatch):
     assert "fullText contains 'adeuda alexis macbook pro'" in q_arg
 
 
+def test_drive_search_expands_name_aliases_from_whatsapp(monkeypatch):
+    """Regression 2026-04-24 iter 3 (Fer F.): `name contains 'alexis'`
+    no matchea "Alex - Cuotas Macbook" porque 'alex' y 'alexis' son
+    tokens distintos. Fix: `_resolve_person_aliases` consulta WhatsApp
+    contacts, descubre "Alexis Herrera" / "Alexis Venturino", y agrega
+    variantes (herrera, venturino, full names + diminutivo 'alex')
+    al name-OR chain. Con esto, `name contains 'alex'` matchea el
+    archivo aunque el user escriba "alexis" literal."""
+    listing = [{
+        "id": "file_alex",
+        "name": "Alex - Cuotas Macbook",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "modifiedTime": "2026-04-17T16:46:42.000Z",
+        "webViewLink": "",
+        "lastModifyingUser": {},
+    }]
+    svc = _FakeDriveService(listing, {"file_alex": "..."})
+    monkeypatch.setattr(rag, "_drive_service", lambda: svc)
+
+    # Monkeypatch `_resolve_person_aliases` to simulate WA returning
+    # "alex" + full names when user says "alexis".
+    def _fake_aliases(name: str):
+        return (("alex", "herrera", "venturino") if name.lower() == "alexis"
+                else ())
+    monkeypatch.setattr(rag, "_resolve_person_aliases", _fake_aliases)
+
+    out = rag._agent_tool_drive_search("qué tengo de Alexis")
+    parsed = json.loads(out)
+    assert parsed["tokens"] == ["alexis"]
+    assert len(parsed["files"]) == 1
+    assert parsed["files"][0]["name"] == "Alex - Cuotas Macbook"
+
+    # El query debe incluir `name contains` con las aliases expandidas.
+    q_arg = svc._files.list_calls[0]["q"]
+    assert "name contains 'alexis'" in q_arg
+    assert "name contains 'alex'" in q_arg
+    assert "name contains 'herrera'" in q_arg
+    assert "name contains 'venturino'" in q_arg
+
+
+def test_drive_search_no_alias_for_non_name_tokens(monkeypatch):
+    """Si el alias resolver devuelve empty (porque el token no es un
+    nombre conocido — ej. "macbook", "adeuda", "factura"), el query NO
+    debe incluir clauses extra. Solo las del token original. Evita
+    amplificar queries con tokens "no-nombre" cuyos "diminutivos" son
+    ruido (ej. "macbook" → prefijo "macb" matchea archivos random)."""
+    listing = []
+    svc = _FakeDriveService(listing, {})
+    monkeypatch.setattr(rag, "_drive_service", lambda: svc)
+
+    # Everything returns empty aliases — simulates non-person tokens.
+    monkeypatch.setattr(rag, "_resolve_person_aliases", lambda _n: ())
+
+    out = rag._agent_tool_drive_search("la factura de macbook pro")
+    _ = json.loads(out)
+
+    q_arg = svc._files.list_calls[0]["q"]
+    # Sólo los 2 tokens originales ≥5 chars deben aparecer en name-OR:
+    # "factura" y "macbook". "pro" (3) queda fuera por threshold.
+    assert "name contains 'factura'" in q_arg
+    assert "name contains 'macbook'" in q_arg
+    # No debe aparecer 'macb' (diminutivo falso) ni 'fact' (diminutivo falso)
+    # porque ninguna fuente reconoció esos tokens como personas.
+    assert "name contains 'macb'" not in q_arg
+    assert "name contains 'fact'" not in q_arg
+
+
+def test_resolve_person_aliases_diminutive_for_known_person(monkeypatch):
+    """Cuando WhatsApp reconoce a 'Alexis Herrera', el resolver agrega
+    'alex' como diminutivo (first-4-chars) además de los tokens
+    extraídos del nombre completo ('herrera', 'alexis herrera')."""
+    # Limpiar cache (test aislado).
+    rag._PERSON_ALIAS_CACHE.clear()
+
+    # Fake WhatsApp DB con un solo match.
+    class _FakeCursor:
+        def fetchall(self):
+            return [("Alexis Herrera",)]
+
+    class _FakeCon:
+        def execute(self, *_a, **_kw):
+            return _FakeCursor()
+        def close(self):
+            pass
+
+    import sqlite3  # noqa: F401 — ensured imported by rag
+    monkeypatch.setattr(rag, "WHATSAPP_DB_PATH", rag.Path("/tmp/fake_wa.db"))
+    # Simular file existente y sqlite.connect devuelve nuestro fake.
+    monkeypatch.setattr(
+        rag.Path, "is_file", lambda self: True,
+        raising=False,
+    )
+    import sqlite3 as _sq
+    monkeypatch.setattr(
+        _sq, "connect", lambda *_a, **_kw: _FakeCon(),
+    )
+
+    # Apple Contacts + mentions off.
+    monkeypatch.setattr(rag, "_osascript_contact_search", lambda *_a, **_kw: None)
+    monkeypatch.setattr(rag, "_load_mentions_index", lambda: {})
+
+    aliases = rag._resolve_person_aliases("alexis")
+    # Debe incluir 'alex' (first-4-chars de 'alexis'), 'herrera' (token
+    # del full name), y el full name 'alexis herrera'. NO debe incluir
+    # 'alexis' (original, discarded).
+    assert "alex" in aliases
+    assert "herrera" in aliases
+    assert "alexis herrera" in aliases
+    assert "alexis" not in aliases
+
+
+def test_resolve_person_aliases_no_diminutive_for_unknown(monkeypatch):
+    """Si ninguna fuente reconoce el token como persona conocida, NO
+    agregamos el prefijo diminutivo. Evita ruido tipo 'macb' para
+    'macbook' o 'adeu' para 'adeuda'."""
+    rag._PERSON_ALIAS_CACHE.clear()
+
+    # Todas las fuentes vacías.
+    monkeypatch.setattr(rag.Path, "is_file", lambda self: False, raising=False)
+    monkeypatch.setattr(rag, "_osascript_contact_search", lambda *_a, **_kw: None)
+    monkeypatch.setattr(rag, "_load_mentions_index", lambda: {})
+
+    aliases = rag._resolve_person_aliases("macbook")
+    assert aliases == ()
+
+
+def test_resolve_person_aliases_cached(monkeypatch):
+    """Second call with same name hits cache — no extra I/O. Verificamos
+    con un counter: si el SQLite connect se llamara de nuevo, el counter
+    subiría."""
+    rag._PERSON_ALIAS_CACHE.clear()
+
+    call_counter = {"n": 0}
+
+    class _CountingCon:
+        def execute(self, *_a, **_kw):
+            call_counter["n"] += 1
+            class _C:
+                def fetchall(self_inner):
+                    return [("Alexis Herrera",)]
+            return _C()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(rag.Path, "is_file", lambda self: True, raising=False)
+    import sqlite3 as _sq
+    monkeypatch.setattr(_sq, "connect", lambda *_a, **_kw: _CountingCon())
+    monkeypatch.setattr(rag, "_osascript_contact_search", lambda *_a, **_kw: None)
+    monkeypatch.setattr(rag, "_load_mentions_index", lambda: {})
+
+    rag._resolve_person_aliases("alexis")
+    first_count = call_counter["n"]
+    rag._resolve_person_aliases("alexis")
+    assert call_counter["n"] == first_count, "cache should have prevented the 2nd WA lookup"
+
+
+def test_clean_alias_strips_emojis_and_punct():
+    # Literal emoji + punct suelto.
+    assert rag._clean_alias("Maria 🍷") == "maria"
+    assert rag._clean_alias("Pepe (hermano)") == "pepe hermano"
+    assert rag._clean_alias("(amiga)") == "amiga"
+    # Conserva apóstrofes y guiones en medio de palabra.
+    assert rag._clean_alias("O'Brien") == "o'brien"
+    assert rag._clean_alias("Jean-Luc") == "jean-luc"
+    # Preserva acentos + ñ.
+    assert rag._clean_alias("Sebastián Núñez") == "sebastián núñez"
+    # Vacío queda vacío.
+    assert rag._clean_alias("") == ""
+    assert rag._clean_alias("🔥💪") == ""
+
+
 def test_drive_search_short_tokens_only_falls_back_to_fulltext(monkeypatch):
     """Si TODOS los tokens son <5 chars (caso raro), no agregamos name-OR
     chain y usamos sólo `fullText contains`. Esto evita queries con cero

@@ -145,14 +145,17 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("gmail_recent",    {}, r"\b(mail|correo|e.?mail|gmail)s?\b|bandeja\s+de\s+entrada"),
     ("calendar_ahead",  {}, r"calendari|\beventos?\b|\bcitas?\b|reuni[oó]n|\bagendas?\b|pr[oó]xim[ao]s?\s+d[ií]as|" + _PLANNING_PAT),
     ("weather",         {}, r"\bclimas?\b|\btiempos?\b|llov|lluvia|temperatur|pron[oó]stico"),
-    # Drive: "drive" alone es ambiguo (también es una palabra EN genérica),
-    # pero "google drive", "en mi drive", "mi drive" o keywords
-    # Drive-específicas (planilla, spreadsheet, sheet, doc, presentación)
-    # son señal clara. "drive_search" es el único tool del pre-router que
-    # recibe args dinámicos — la query cruda del user se inyecta en
+    # Drive: "drive" alone es ambiguo (también es una palabra EN genérica,
+    # "drive-thru", "hard drive"), pero "drive" precedido por
+    # google/en/mi/tu/del/al/a/sobre es señal clara de la intent
+    # "buscar en Google Drive". También disparan keywords
+    # Drive-específicas (planilla, spreadsheet, sheet, presentación).
+    # "drive_search" es el único tool del pre-router que recibe args
+    # dinámicos — la query cruda del user se inyecta en
     # `_detect_tool_intent` con key `query`, y el helper de rag filtra
-    # stopwords internamente. Ver `_agent_tool_drive_search` para la lógica.
-    ("drive_search",    {}, r"\bgoogle\s*drive\b|\b(en\s+)?(mi|tu)\s+drive\b|\bplanillas?\b|\bspreadsheets?\b|\bsheets?\b|\bpresentaci[oó]n\b|\bpresentaciones\b"),
+    # stopwords + resuelve aliases internamente. Ver
+    # `_agent_tool_drive_search` para la lógica completa.
+    ("drive_search",    {}, r"(?:google\s*|(?:en|mi|tu|del|al|a|sobre)\s+)drive\b|\bplanillas?\b|\bspreadsheets?\b|\bsheets?\b|\bpresentaci[oó]n\b|\bpresentaciones\b"),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES

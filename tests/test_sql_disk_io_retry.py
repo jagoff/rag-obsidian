@@ -76,9 +76,10 @@ def test_sql_write_retry_handles_disk_io_error():
     with patch("time.sleep"):
         rag._sql_write_with_retry(writer, "test_tag")
 
-    assert calls["n"] == 5, (
+    # Post 2026-04-23 el default es 8 attempts (bumped de 5).
+    assert calls["n"] == 8, (
         f"disk I/O error es transient (fsync contention) — debe reintentar "
-        f"5 veces antes de darse por vencido. Got {calls['n']} calls."
+        f"8 veces antes de darse por vencido. Got {calls['n']} calls."
     )
 
 
@@ -186,7 +187,7 @@ def test_sql_read_retry_non_transient_fail_fast():
 
 def test_sql_write_retry_still_handles_database_locked():
     """El fix nuevo no debe romper el comportamiento original de
-    reintentar `database is locked`."""
+    reintentar `database is locked`. Post 2026-04-23: 8 attempts."""
     calls = {"n": 0}
 
     def writer():
@@ -196,7 +197,7 @@ def test_sql_write_retry_still_handles_database_locked():
     with patch("time.sleep"):
         rag._sql_write_with_retry(writer, "test_tag")
 
-    assert calls["n"] == 5
+    assert calls["n"] == 8
 
 
 def test_sql_read_retry_still_handles_database_locked():

@@ -66,10 +66,17 @@ def _isolate_sql_state_error_log(tmp_path, monkeypatch):
 # ── _sql_write_with_retry: attempts + backoff invariants ──────────────────────
 
 
-def test_sql_write_with_retry_default_attempts_is_5():
-    """Pre-2026-04-22 el default era 3 intentos. Subimos a 5 porque la
-    ventana de contención medida en queries_sql_write_failed era más
-    larga que ~0.75s (= 3 × 0.25s backoff promedio)."""
+def test_sql_write_with_retry_default_attempts_is_8():
+    """Evolución del default:
+
+    - Pre-2026-04-22: 3 intentos (budget ~0.75s). Demasiado corto bajo
+      contention sostenida.
+    - 2026-04-22: bumped a 5 (budget ~1.3s). Todavía quedaba corto bajo
+      3+ writers concurrentes (queries + memory + cpu samplers alineados).
+    - 2026-04-23: bumped a 8 (budget ~4s). Match del `_persist_with_sqlite_retry`
+      de web/server.py. Hot-path callers que no toleran 4s pasan
+      `attempts=3` explícito.
+    """
     calls = {"n": 0}
 
     def writer():
@@ -79,8 +86,8 @@ def test_sql_write_with_retry_default_attempts_is_5():
     with patch("time.sleep"):  # compress the backoff
         rag._sql_write_with_retry(writer, "test_tag")
 
-    assert calls["n"] == 5, \
-        f"expected 5 retry attempts (post 2026-04-22), got {calls['n']}"
+    assert calls["n"] == 8, \
+        f"expected 8 retry attempts (post 2026-04-23), got {calls['n']}"
 
 
 def test_sql_write_with_retry_succeeds_on_attempt_3(tmp_path, monkeypatch):
@@ -113,12 +120,12 @@ def test_sql_write_with_retry_backoff_upper_bound_increased():
     with patch("time.sleep", fake_sleep):
         rag._sql_write_with_retry(writer, "test_tag")
 
-    # 4 sleeps between 5 attempts. Each must be >=0.15 (new floor) and
-    # <=0.5 (new ceiling = 0.15 + 0.35). Tests the constants used in
-    # `_sql_write_with_retry` without hard-coding them at the call site.
-    assert len(sleeps) == 4, f"expected 4 backoff sleeps, got {len(sleeps)}"
+    # 7 sleeps between 8 attempts (post 2026-04-23 bump). Each must be
+    # >=0.15 (floor) and <=0.6 (ceiling = 0.15 + 0.45). Tests las
+    # constantes sin hard-codearlas al call site.
+    assert len(sleeps) == 7, f"expected 7 backoff sleeps, got {len(sleeps)}"
     for s in sleeps:
-        assert 0.15 <= s <= 0.5, f"sleep {s}s outside [0.15, 0.5]"
+        assert 0.15 <= s <= 0.6, f"sleep {s}s outside [0.15, 0.6]"
 
 
 def test_sql_write_with_retry_non_transient_errors_fail_fast():

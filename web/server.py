@@ -7336,7 +7336,9 @@ def _memory_load_history() -> None:
             continue
 
 
-def _persist_with_sqlite_retry(write_fn, error_tag: str) -> None:
+def _persist_with_sqlite_retry(
+    write_fn, error_tag: str, *, attempts: int = 8,
+) -> None:
     """Run a one-shot SQL-write closure with transient-lock retry.
 
     `_memory_persist` + `_cpu_persist` (and historically anything else
@@ -7346,22 +7348,41 @@ def _persist_with_sqlite_retry(write_fn, error_tag: str) -> None:
     if any other writer holds the WAL write-lock longer than the
     `busy_timeout=30s` window (e.g. during `_write_feedback_golden_sql`
     under embed latency, or a concurrent contradiction worker), the
-    sample is lost. Retrying twice with jittered backoff covers the
-    transient-contention tail without masking real SQL errors (schema
-    drift, disk-full, etc. propagate on the 3rd attempt).
+    sample is lost.
+
+    **2026-04-23 tuning**: bumped attempts 3→8 + backoff max 0.25→0.6
+    (total budget ~4s vs 0.75s pre). Audit del sql_state_errors.jsonl
+    mostró 258 `queries_sql_write_failed` + 64 samples perdidos en las
+    últimas semanas — el old budget de 3 intentos × ~0.35s se quedaba
+    corto bajo bursts coordinados (memory+cpu samplers alineados cada
+    60s + el queries writer concurrente). 4s es suficiente para esperar
+    un WAL checkpoint stall sin bloquear indefinidamente. Callers que
+    están en el hot path del usuario (donde 4s de delay es visible)
+    deben pasar `attempts=3` explícito para preservar el comportamiento
+    tight; los samplers + backfill writers usan el default bumped.
+
+    Expanded error transience: además de "locked", también reintenta
+    "disk I/O error" — audit mostró 92 `disk I/O error` transitorios
+    que el primer intento fallaba y el segundo pasaba limpio.
     """
     import random as _r
     import sqlite3 as _sqlite3
     import time as _t
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             write_fn()
             return
         except _sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == 2:
+            msg = str(exc).lower()
+            _is_transient = (
+                "locked" in msg
+                or "disk i/o" in msg
+                or "disk io" in msg
+            )
+            if not _is_transient or attempt == attempts - 1:
                 _log_sql_state_error(error_tag, err=repr(exc))
                 return
-            _t.sleep(0.1 + _r.random() * 0.25)
+            _t.sleep(0.15 + _r.random() * 0.45)
         except Exception as exc:
             _log_sql_state_error(error_tag, err=repr(exc))
             return
@@ -7397,6 +7418,13 @@ def _start_memory_sampler() -> None:
     _memory_load_history()
 
     def loop() -> None:
+        import random as _r
+        # Initial jitter: duerma 0-30s random antes del primer sample para
+        # no alinearse con otros samplers (cpu, memory_pressure_watchdog,
+        # queries writer) que arrancan al mismo startup. Sin jitter cada 60s
+        # los 3 writers colisionaban simultáneo, saturaban el WAL lock, y
+        # uno perdía el sample (~64/semana en el audit 2026-04-23).
+        time.sleep(_r.uniform(0, 30))
         trim_counter = 0
         while True:
             sample = _sample_memory()
@@ -7408,7 +7436,9 @@ def _start_memory_sampler() -> None:
                 if trim_counter >= 60:  # once an hour
                     _memory_trim_file()
                     trim_counter = 0
-            time.sleep(_MEMORY_SAMPLE_INTERVAL)
+            # Per-cycle jitter ±5s para evitar drift hacia realineamiento
+            # después del primer offset. Rango [55, 65] sobre interval 60s.
+            time.sleep(_MEMORY_SAMPLE_INTERVAL + _r.uniform(-5, 5))
 
     threading.Thread(target=loop, name="memory-sampler", daemon=True).start()
 
@@ -7642,13 +7672,20 @@ def _start_cpu_sampler() -> None:
     _cpu_load_history()
 
     def loop() -> None:
+        import random as _r
         state: dict = {}
         # Prime the baseline, then wait a full interval before the first
         # real sample so the delta is meaningful.
         _sample_cpu(state)
+        # Initial jitter 0-30s para desynchroñar el primer write con el
+        # memory-sampler. Ver el comentario equivalente en
+        # `_start_memory_sampler` para el razonamiento.
+        time.sleep(_r.uniform(0, 30))
         trim_counter = 0
         while True:
-            time.sleep(_CPU_SAMPLE_INTERVAL)
+            # Per-cycle jitter ±5s; evita la re-sincronización progresiva
+            # hacia colisiones con otros samplers.
+            time.sleep(_CPU_SAMPLE_INTERVAL + _r.uniform(-5, 5))
             sample = _sample_cpu(state)
             if sample:
                 with _CPU_LOCK:

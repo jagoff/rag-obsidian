@@ -254,15 +254,20 @@ function renderGmail(g) {
   const unreadCount = g.unread_count || 0;
   const total = awaiting.length + starred.length;
   if (total === 0 && unreadCount === 0) return panel("gmail", "gmail", 0, "");
-  let html = "";
+  let html = "<ul>";
+  // Unread-count summary as a regular `<li>` so it inherits `.panel li a`
+  // (color: inherit + no underline). Antes 2026-04-24 era un
+  // `<div class="meta"><a></a></div>` standalone que caía al default del
+  // browser (azul brillante + underline) y desentonaba del resto del panel.
+  // Bucket "today" (cyan) replica el patrón visual de los demás items.
   if (unreadCount) {
-    html += `<div class="meta" style="margin-bottom:6px;">`
-      + linked("https://mail.google.com/mail/u/0/#inbox",
-          `${unreadCount} sin leer en INBOX`,
-          { external: true, title: "abrir bandeja" })
-      + `</div>`;
+    html += `<li>
+      <span class="bucket today">INBOX</span>
+      ${linked("https://mail.google.com/mail/u/0/#inbox",
+          `<b>${unreadCount} sin leer</b>`,
+          { external: true, title: "abrir bandeja" })}
+    </li>`;
   }
-  html += "<ul>";
   if (awaiting.length) {
     html += awaiting.slice(0, 5).map((m) => `<li>
       <span class="bucket overdue">${(m.days_old || 0)}d</span>

@@ -34,7 +34,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 13 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 14 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -59,7 +59,8 @@ Crear cosas nuevas (se agregan automáticamente, el usuario puede deshacer):
 
 Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
 - "enviale / mandale un mensaje a <Contacto> que diga: <texto>" / "decile a <Contacto>: <texto>" / "escribile a <Contacto>: <texto>" → propose_whatsapp_send(contact_name="<Contacto>", message_text="<texto literal>").
-- El tool NO envía: devuelve una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
+- "respondele a <Contacto> al mensaje del <hint>: <texto>" / "contestale a <Contacto>: <texto>" / "responde el último de <Contacto>: <texto>" → propose_whatsapp_reply(contact_name="<Contacto>", message_text="<texto literal>", when_hint="<hint opcional>"). Es DISTINTO al send — acá el user quiere responder a UN mensaje específico que recibió, no iniciar un thread. Pasale el hint que el user dijo ("el del almuerzo", "el último", "el de las 14:30", "el de ayer") en `when_hint`. Si no especificó hint, dejá `when_hint=None` (agarra el más reciente). El tool resuelve el message_id automáticamente — el user no tiene que copiar ningún ID.
+- Ambos tools NO envían: devuelven una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
 - Si el contacto no se resuelve (el tool devuelve `error: not_found` o `no_phone`), avisale al user que no encontraste a la persona en sus Contactos y sugerile que pase el nombre completo o el teléfono.
 - En tu respuesta textual: "Te dejo el mensaje armado para <Nombre>, revisalo y tocá Enviar si está ok." (1-2 oraciones, que quede claro que NO se envió todavía). NO repitas el texto del mensaje — la card ya lo muestra.
 
@@ -330,6 +331,7 @@ from rag import (  # noqa: E402
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,
+    propose_whatsapp_reply,
 )
 
 
@@ -347,6 +349,7 @@ CHAT_TOOLS: list[Callable] = [
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,
+    propose_whatsapp_reply,
 ]
 
 TOOL_FNS: dict[str, Callable] = {fn.__name__: fn for fn in CHAT_TOOLS}
@@ -378,4 +381,5 @@ PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_reminder",
     "propose_calendar_event",
     "propose_whatsapp_send",
+    "propose_whatsapp_reply",
 }

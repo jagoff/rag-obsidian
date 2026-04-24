@@ -1325,17 +1325,54 @@ function appendWhatsAppProposal(parent, payload) {
   const fields = payload.fields || {};
   const proposalId = payload.proposal_id || "";
   const err = fields.error || null;
+  // `whatsapp_reply` is the reply variant — adds a quote preview above the
+  // textarea and ships `reply_to` in the POST body. `whatsapp_message`
+  // (existing send) keeps working unchanged. Distinguishing on `kind`
+  // (not just on the presence of `reply_to`) so a missing-target reply
+  // still renders as a reply card with the warning visible.
+  const isReply = payload.kind === "whatsapp_reply";
+  const replyTo = fields.reply_to || null;
+  const replyHint = fields.reply_to_hint || "";
+  const replyWarn = fields.reply_to_warning || "";
 
-  const card = el("div", "proposal proposal-whatsapp");
+  const card = el("div", `proposal proposal-whatsapp${isReply ? " proposal-whatsapp-reply" : ""}`);
 
   const head = el("div", "proposal-head");
-  head.appendChild(el("span", "proposal-icon", "💬"));
-  head.appendChild(el("span", "proposal-kind", "Mensaje de WhatsApp"));
+  head.appendChild(el("span", "proposal-icon", isReply ? "↩" : "💬"));
+  head.appendChild(el("span", "proposal-kind", isReply ? "Responder en WhatsApp" : "Mensaje de WhatsApp"));
   card.appendChild(head);
 
   const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
   const recipientLine = el("div", "proposal-title", `Para: ${recipientLabel}`);
   card.appendChild(recipientLine);
+
+  // Reply variant: render the original message as a styled blockquote
+  // above the textarea, mimicking WhatsApp's reply UI (left border in
+  // the contact's accent color, muted bg, smaller text).
+  if (isReply) {
+    if (replyTo) {
+      const quote = el("div", "proposal-wa-quote");
+      const senderName = recipientLabel;
+      const head2 = el("div", "proposal-wa-quote-sender", senderName);
+      const text = el("div", "proposal-wa-quote-text",
+        (replyTo.original_text || "").trim() || "(mensaje sin texto)");
+      const ts = replyTo.original_ts
+        ? el("div", "proposal-wa-quote-ts", replyTo.original_ts)
+        : null;
+      quote.appendChild(head2);
+      quote.appendChild(text);
+      if (ts) quote.appendChild(ts);
+      card.appendChild(quote);
+    } else if (replyWarn) {
+      // Reply target couldn't be resolved — surface the warning + offer to
+      // send without quote anyway. The hint helps the user remember what
+      // they originally asked for.
+      const hintLabel = replyHint ? ` ("${replyHint}")` : "";
+      const warn = el("div", "proposal-warn proposal-wa-warn",
+        `⚠ ${replyWarn}${hintLabel ? " " + hintLabel : ""}`);
+      card.appendChild(warn);
+    }
+  }
 
   // Editable textarea for the message body.
   const textarea = document.createElement("textarea");
@@ -1406,14 +1443,26 @@ function appendWhatsAppProposal(parent, payload) {
     status.classList.remove("ok", "err");
 
     try {
+      const sendBody = {
+        jid: fields.jid,
+        message_text: body,
+        proposal_id: proposalId,
+      };
+      // Forward the reply_to context when this card is a reply with a
+      // resolved target. The bridge currently ignores it (no native
+      // quote support — see rag._whatsapp_send_to_jid docstring) but
+      // the audit log records the message_id so we can correlate.
+      if (isReply && replyTo && replyTo.message_id) {
+        sendBody.reply_to = {
+          message_id: replyTo.message_id,
+          original_text: (replyTo.original_text || "").slice(0, 1024),
+          sender_jid: replyTo.sender_jid || "",
+        };
+      }
       const res = await fetch("/api/whatsapp/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jid: fields.jid,
-          message_text: body,
-          proposal_id: proposalId,
-        }),
+        body: JSON.stringify(sendBody),
       });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
@@ -1441,14 +1490,15 @@ function appendWhatsAppProposal(parent, payload) {
 
 
 function appendProposal(parent, payload) {
-  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message"
+  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message" | "whatsapp_reply"
   const fields = payload.fields || {};
   const needsClarif = payload.needs_clarification === true;
 
-  // whatsapp_message uses its own renderer — different fields (jid,
-  // contact_name, message_text), different actions (Enviar / Editar /
-  // Cancelar), different endpoint (/api/whatsapp/send).
-  if (kind === "whatsapp_message") {
+  // whatsapp_message / whatsapp_reply use their own renderer — different
+  // fields (jid, contact_name, message_text + optional reply_to),
+  // different actions (Enviar / Editar / Cancelar), different endpoint
+  // (/api/whatsapp/send for both — reply ships an extra reply_to field).
+  if (kind === "whatsapp_message" || kind === "whatsapp_reply") {
     return appendWhatsAppProposal(parent, payload);
   }
 

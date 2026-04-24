@@ -19510,7 +19510,13 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
     return _whatsapp_send_to_jid(jid, text, anti_loop=True)
 
 
-def _whatsapp_send_to_jid(jid: str, text: str, *, anti_loop: bool = True) -> bool:
+def _whatsapp_send_to_jid(
+    jid: str,
+    text: str,
+    *,
+    anti_loop: bool = True,
+    reply_to: dict | None = None,
+) -> bool:
     """Low-level POST al bridge local. Dos modos:
 
     - ``anti_loop=True`` (default, usado por ``_ambient_whatsapp_send``):
@@ -19522,6 +19528,24 @@ def _whatsapp_send_to_jid(jid: str, text: str, *, anti_loop: bool = True) -> boo
       vía ``propose_whatsapp_send``), porque el prefix se vería como un
       char raro en el WhatsApp del contacto.
 
+    ``reply_to`` (optional): cuando el caller quiere responder a un
+    mensaje específico con quote nativo de WhatsApp. Shape esperado:
+    ``{"message_id": str, "original_text": str, "sender_jid": str?}``.
+
+    Estado actual: el bridge local (whatsapp-mcp/whatsapp-bridge,
+    `main.go:707-771`) **NO soporta ``ContextInfo``/``QuotedMessage``**
+    out of the box — `SendMessageRequest` solo acepta
+    ``{recipient, message, media_path}`` y construye `msg.Conversation`
+    plano. Por eso pasamos el ``reply_to`` al payload pero el bridge lo
+    ignora silenciosamente; el mensaje sale como reply normal sin la
+    cita boxed que ves en la UI nativa de WhatsApp. La info igualmente
+    se loguea via el caller (auditoría + traceability) y la UI del
+    chat web muestra el contexto del mensaje original al user.
+
+    Cuando el bridge agregue soporte de quote, este helper ya pasa el
+    campo — bumpean el bridge y empiezan a salir las citas nativas sin
+    cambiar el cliente.
+
     Retorna True en 2xx del bridge, False en cualquier otra cosa
     (unreachable, 4xx, 5xx, timeout 10s).
     """
@@ -19529,10 +19553,22 @@ def _whatsapp_send_to_jid(jid: str, text: str, *, anti_loop: bool = True) -> boo
     payload_text = text
     if anti_loop and not text.startswith(_AMBIENT_ANTILOOP_MARKER):
         payload_text = _AMBIENT_ANTILOOP_MARKER + text
-    data = json.dumps({
+    body: dict = {
         "recipient": jid,
         "message": payload_text,
-    }).encode("utf-8")
+    }
+    if reply_to and isinstance(reply_to, dict):
+        # Forward-compatible: el bridge actual ignora estos campos pero
+        # cuando agreguen ContextInfo los va a leer sin necesidad de
+        # tocar el cliente. Ver docstring arriba.
+        rt_id = reply_to.get("message_id") or reply_to.get("id")
+        if rt_id:
+            body["reply_to"] = {
+                "message_id": str(rt_id),
+                "original_text": str(reply_to.get("original_text") or reply_to.get("text") or "")[:1024],
+                "sender_jid": str(reply_to.get("sender_jid") or reply_to.get("from_jid") or ""),
+            }
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         AMBIENT_WHATSAPP_BRIDGE_URL, data=data,
         headers={"Content-Type": "application/json"},
@@ -19633,6 +19669,385 @@ def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
     }
     return json.dumps({
         "kind": "whatsapp_message",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": fields,
+    }, ensure_ascii=False)
+
+
+# ── WhatsApp REPLY (quote) — resolve target + propose tool ──────────────────
+#
+# Pattern: "respondele a Juan al mensaje del almuerzo: confirmo, voy yo".
+# El user no quiere copiar message-IDs — los resolvemos vía:
+#   1. Contact → JID (existing `_whatsapp_jid_from_contact`).
+#   2. Last-N inbound del bridge SQLite (`messages.db`) filtrado por
+#      `chat_jid` + `is_from_me=0` + `when_hint` opcional.
+#
+# El bridge actual (whatsapp-mcp main.go) NO soporta ContextInfo/quote,
+# así que el reply sale como mensaje plano. La UI del chat web muestra
+# igualmente la cita arriba del textarea para que el user vea a qué
+# está respondiendo. Cuando el bridge agregue soporte de quote, el
+# campo `reply_to` ya viaja en el POST y empieza a renderear nativo.
+
+WHATSAPP_BRIDGE_DB_PATH = (
+    Path.home()
+    / "repositories" / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
+)
+
+
+def _parse_when_hint(hint: str | None) -> tuple[float | None, float | None, str | None]:
+    """Parse a free-form Spanish time hint into a (ts_low, ts_high, kind) window.
+
+    Returns ``(low, high, kind)`` where ``low``/``high`` are epoch seconds
+    or ``None`` (open-ended), and ``kind`` is a label for debug/audit
+    (``"latest"``, ``"today"``, ``"yesterday"``, ``"hh:mm"``,
+    ``"keyword:almuerzo"``, etc.). Used by ``_whatsapp_resolve_reply_target``
+    to narrow the message window before scoring candidates.
+
+    Parser shallow-on-purpose: cubre los patterns que el user dice de
+    verdad, no aspira a NLU completo. Si no matchea nada → ventana
+    abierta + ``kind="latest"`` (caller agarra el más reciente).
+
+    Cubre:
+      - ``None`` / "" / "el último" / "lo último" / "el más reciente"
+        → ``(None, None, "latest")``
+      - "hoy" → desde 00:00 hoy
+      - "ayer" → 00:00 ayer .. 00:00 hoy
+      - "esta mañana" / "esta tarde" / "esta noche" → ventana del día
+      - "del [hh:mm]" / "[hh:mm]" → ±10 min hoy
+      - "hace N min/horas" → ventana relativa
+      - keyword "almuerzo"/"cena"/"desayuno" → bandas horarias del día
+    """
+    if not hint:
+        return (None, None, "latest")
+    h = hint.strip().lower()
+    if not h:
+        return (None, None, "latest")
+
+    now = datetime.now()
+    # "el último", "lo último", "el más reciente", "lo más reciente"
+    if re.search(r"\b(?:el|lo)\s+(?:último|ultimo|m[aá]s\s+reciente)\b", h):
+        return (None, None, "latest")
+    if h in {"último", "ultimo", "el último", "el ultimo", "lo último", "lo ultimo"}:
+        return (None, None, "latest")
+
+    today_start = datetime(now.year, now.month, now.day).timestamp()
+    yesterday_start = today_start - 24 * 3600
+    if "ayer" in h:
+        return (yesterday_start, today_start, "yesterday")
+    if "anteayer" in h or "antes de ayer" in h:
+        return (today_start - 2 * 24 * 3600, yesterday_start, "anteayer")
+    if "esta mañana" in h or "esta manana" in h or "hoy a la mañana" in h:
+        return (today_start, today_start + 12 * 3600, "morning")
+    if "esta tarde" in h or "hoy a la tarde" in h:
+        return (today_start + 12 * 3600, today_start + 19 * 3600, "afternoon")
+    if "esta noche" in h or "hoy a la noche" in h:
+        return (today_start + 19 * 3600, today_start + 28 * 3600, "evening")
+    if h == "hoy" or "de hoy" in h:
+        return (today_start, today_start + 24 * 3600, "today")
+
+    # "hace N minutos/horas"
+    m = re.search(r"\bhace\s+(\d+)\s*(min|minuto|minutos|h|hora|horas)\b", h)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        sec = n * 60 if unit.startswith("min") else n * 3600
+        anchor = now.timestamp() - sec
+        # ventana de ±30% para tolerar imprecisión
+        slack = max(600.0, sec * 0.3)
+        return (anchor - slack, anchor + slack, f"hace_{n}{unit}")
+
+    # "del 13:45" / "13:45" / "a las 14:30"
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", h)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            anchor = datetime(now.year, now.month, now.day, hh, mm).timestamp()
+            return (anchor - 600, anchor + 600, f"{hh:02d}:{mm:02d}")
+
+    # Keywords culinarias / contextuales: bandas horarias razonables del día.
+    if "almuerzo" in h or "almorzar" in h:
+        return (today_start + 12 * 3600, today_start + 15 * 3600, "keyword:almuerzo")
+    if "desayuno" in h or "desayunar" in h:
+        return (today_start + 6 * 3600, today_start + 11 * 3600, "keyword:desayuno")
+    if "merienda" in h:
+        return (today_start + 16 * 3600, today_start + 19 * 3600, "keyword:merienda")
+    if "cena" in h or "cenar" in h:
+        return (today_start + 20 * 3600, today_start + 27 * 3600, "keyword:cena")
+
+    # Fallback: keyword-only — devolvemos ventana de últimas 24h y dejamos
+    # que el caller filtre por contenido si quiere (no lo hacemos acá para
+    # no acoplar este parser al texto del mensaje).
+    return (now.timestamp() - 24 * 3600, None, f"keyword:{h[:32]}")
+
+
+def _whatsapp_resolve_reply_target(
+    contact_name: str,
+    when_hint: str | None = None,
+    *,
+    db_path: Path | str | None = None,
+    keyword: str | None = None,
+) -> dict:
+    """Resolve a "responder a X" request to a concrete WhatsApp message.
+
+    Pipeline:
+      1. ``_whatsapp_jid_from_contact(contact_name)`` → JID candidates.
+      2. ``_parse_when_hint(when_hint)`` → (low, high, kind) window.
+      3. Scan ``messages.db`` for last inbound (``is_from_me=0``) message
+         in the contact's 1:1 chat that fits the window. Optional
+         ``keyword`` substring match (case-insensitive) on the content,
+         útil cuando el hint trae una palabra clave ("del almuerzo",
+         "del médico", "del cumple").
+      4. Return ``{"message_id", "text", "ts", "ts_iso", "from_jid",
+         "chat_jid", "warning"?}`` o ``{"error": ...}``.
+
+    Returns shape:
+      - hit:    ``{"message_id", "text", "ts", "ts_iso", "from_jid",
+                 "chat_jid", "when_kind", "candidates_seen"}``
+      - miss:   ``{"error": "no_match", "candidates_seen": int,
+                 "contact_full_name": str, "when_kind": str}``
+      - error:  ``{"error": "<reason>"}``
+
+    Personal 1:1 chats only (chat_jid `<digits>@s.whatsapp.net`). Group
+    replies (`@g.us`) intencionalmente NO soportadas — la UX de "respondele
+    a Juan" en grupos es ambigua (Juan podría tener varios mensajes en
+    chats distintos). Defer hasta que el user lo pida.
+    """
+    cn = (contact_name or "").strip()
+    if not cn:
+        return {"error": "empty_contact"}
+    try:
+        lookup = _whatsapp_jid_from_contact(cn)
+    except Exception as exc:
+        return {"error": f"contact_lookup_failed: {str(exc)[:80]}"}
+    if not lookup.get("jid"):
+        err = lookup.get("error") or "not_found"
+        return {"error": f"contact_{err}", "contact_full_name": lookup.get("full_name")}
+
+    primary_jid = lookup["jid"]
+    full_name = lookup.get("full_name") or cn
+
+    # Build last-10-digit suffix candidates to match `chat_jid` flexibly:
+    # Apple Contacts may have "+5491155555555" while bridge stores
+    # "5491155555555@s.whatsapp.net" — both end in the same 10 digits.
+    suffixes: set[str] = set()
+    primary_local = primary_jid.split("@")[0]
+    d = re.sub(r"\D+", "", primary_local)
+    if len(d) >= 8:
+        suffixes.add(d[-10:] if len(d) >= 10 else d)
+    for ph in (lookup.get("phones") or []):
+        d2 = re.sub(r"\D+", "", ph or "")
+        if len(d2) >= 8:
+            suffixes.add(d2[-10:] if len(d2) >= 10 else d2)
+
+    low, high, when_kind = _parse_when_hint(when_hint)
+
+    import sqlite3 as _sqlite3
+    db = Path(db_path) if db_path else WHATSAPP_BRIDGE_DB_PATH
+    if not db.exists():
+        return {"error": f"bridge_db_missing: {db}"}
+
+    try:
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except _sqlite3.Error as exc:
+        return {"error": f"bridge_db_open_failed: {str(exc)[:80]}"}
+
+    try:
+        # Pull recent inbound messages from any chat whose JID local-part
+        # ends in one of our suffixes. We do this client-side to keep the
+        # SQL portable and bounded — practical inbound volume per contact
+        # is in the low thousands so a 200-row scan is plenty.
+        cur = conn.execute(
+            "SELECT id, chat_jid, sender, content, timestamp "
+            "FROM messages "
+            "WHERE is_from_me = 0 "
+            "  AND chat_jid LIKE '%@s.whatsapp.net' "
+            "  AND content IS NOT NULL AND content != '' "
+            "ORDER BY timestamp DESC "
+            "LIMIT 500"
+        )
+        rows = cur.fetchall()
+    except _sqlite3.Error as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"error": f"bridge_db_query_failed: {str(exc)[:80]}"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    kw = (keyword or "").strip().lower() or None
+    candidates_seen = 0
+    best: dict | None = None
+    for mid, chat_jid, sender, content, ts_raw in rows:
+        local = (chat_jid or "").split("@")[0]
+        ldigits = re.sub(r"\D+", "", local)
+        if not ldigits:
+            continue
+        if suffixes and not any(ldigits.endswith(s) for s in suffixes):
+            continue
+        ts = _parse_bridge_timestamp(ts_raw)
+        if ts is None:
+            continue
+        if low is not None and ts < low:
+            continue
+        if high is not None and ts >= high:
+            continue
+        candidates_seen += 1
+        if kw and kw not in (content or "").lower():
+            continue
+        # Rows are ordered by timestamp DESC, so first match in window = newest.
+        best = {
+            "message_id": mid,
+            "text": content or "",
+            "ts": ts,
+            "ts_iso": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+            "from_jid": chat_jid,
+            "chat_jid": chat_jid,
+            "sender": sender or "",
+        }
+        break
+
+    if best is None:
+        return {
+            "error": "no_match",
+            "candidates_seen": candidates_seen,
+            "contact_full_name": full_name,
+            "when_kind": when_kind,
+        }
+    best["when_kind"] = when_kind
+    best["candidates_seen"] = candidates_seen
+    best["contact_full_name"] = full_name
+    return best
+
+
+def _parse_bridge_timestamp(raw: object) -> float | None:
+    """Parse the bridge's RFC3339-ish timestamp into epoch seconds.
+
+    The whatsapp-mcp bridge stores timestamps as Go time strings (e.g.
+    ``2026-04-24 18:55:15-03:00``). SQLite returns them as TEXT; numeric
+    inputs (legacy) are also tolerated. Returns ``None`` on parse failure.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except Exception:
+            return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Go often emits "YYYY-MM-DD HH:MM:SS±ZZ:ZZ" — datetime.fromisoformat
+    # handles "T" separators natively in 3.11+; for the space variant we
+    # swap it manually.
+    candidate = s.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(candidate).timestamp()
+    except ValueError:
+        pass
+    # Last-resort: strip timezone and try naive parse.
+    try:
+        bare = re.sub(r"[+-]\d{2}:?\d{2}$", "", candidate)
+        return datetime.fromisoformat(bare).timestamp()
+    except Exception:
+        return None
+
+
+def propose_whatsapp_reply(
+    contact_name: str,
+    message_text: str,
+    when_hint: str | None = None,
+) -> str:
+    """Draft a WhatsApp REPLY (quote) for confirmation. DOES NOT send.
+
+    Igual que ``propose_whatsapp_send`` siempre devuelve
+    ``needs_clarification=True`` para que la UI muestre la card y el
+    user confirme. El delta es la resolución del mensaje original a
+    citar — el LLM le pasa el ``contact_name`` y un ``when_hint`` libre
+    ("el almuerzo", "el último", "el de las 14:30", "el de ayer") y el
+    helper busca el inbound más reciente que matchee.
+
+    Args:
+        contact_name: Destinatario tal como aparece en Apple Contacts.
+        message_text: Texto literal de la respuesta a mandar.
+        when_hint: Hint en español rioplatense del mensaje a citar.
+            Default ``None`` → más reciente inbound del contacto.
+            Soporta "el último", "ayer", "hoy", "esta mañana",
+            "[hh:mm]", "del almuerzo/cena/desayuno", "hace 2 horas",
+            etc. Ver ``_parse_when_hint`` para cobertura.
+
+    Returns:
+        JSON ``{kind: "whatsapp_reply", proposal_id, needs_clarification,
+        fields: {contact_name, message_text, jid?, full_name?, error?,
+        reply_to?: {message_id, original_text, original_ts, sender_jid},
+        reply_to_hint?, reply_to_warning?}}``.
+
+        Si el contacto no se resuelve, ``fields.error`` llega seteado
+        (``not_found``/``no_phone``/``empty_query``) — la UI desactiva
+        [Enviar]. Si el contacto resuelve pero NO se encuentra mensaje
+        original que citar, ``fields.reply_to`` queda en ``null`` y
+        ``fields.reply_to_warning`` explica al user qué pasó (la UI
+        ofrece igual la opción de mandar el reply sin quote).
+
+    Important: en este momento el bridge local NO soporta el quote
+    nativo de WhatsApp (ver docstring de ``_whatsapp_send_to_jid``), así
+    que aunque la UI muestre el preview boxed-quote y el endpoint
+    propague el ``reply_to``, el mensaje sale como texto plano del lado
+    del receptor. La info de qué mensaje se quiso citar queda en el
+    audit log (``ambient.jsonl``: ``cmd=whatsapp_user_reply``).
+    """
+    lookup = _whatsapp_jid_from_contact(contact_name)
+    fields: dict = {
+        "contact_name": contact_name,
+        "message_text": message_text or "",
+        "jid": lookup["jid"],
+        "full_name": lookup["full_name"],
+        "error": lookup["error"],
+        "reply_to_hint": when_hint or "",
+        "reply_to": None,
+        "reply_to_warning": None,
+    }
+    # Try to resolve the original message — only meaningful if the
+    # contact lookup itself succeeded (otherwise we'd just propagate the
+    # same error twice).
+    if lookup["jid"]:
+        try:
+            target = _whatsapp_resolve_reply_target(contact_name, when_hint)
+        except Exception as exc:
+            target = {"error": f"resolver_failed: {str(exc)[:80]}"}
+        if target.get("error"):
+            err = target["error"]
+            label = (when_hint or "el último").strip()
+            if err == "no_match":
+                fields["reply_to_warning"] = (
+                    f"no encontré el mensaje '{label}' de "
+                    f"{lookup['full_name'] or contact_name}; "
+                    "podés mandarlo igual sin la cita."
+                )
+            elif err.startswith("bridge_db_"):
+                fields["reply_to_warning"] = (
+                    "no pude leer la base del bridge de WhatsApp; "
+                    "podés mandar el mensaje sin cita."
+                )
+            else:
+                fields["reply_to_warning"] = (
+                    f"no se pudo resolver el mensaje original ({err[:60]}); "
+                    "podés mandarlo igual sin la cita."
+                )
+        else:
+            fields["reply_to"] = {
+                "message_id": target["message_id"],
+                "original_text": (target.get("text") or "")[:512],
+                "original_ts": target.get("ts_iso") or "",
+                "sender_jid": target.get("from_jid") or "",
+                "when_kind": target.get("when_kind") or "",
+            }
+    return json.dumps({
+        "kind": "whatsapp_reply",
         "proposal_id": f"prop-{uuid.uuid4()}",
         "needs_clarification": True,
         "fields": fields,
@@ -30858,6 +31273,23 @@ _PROPOSE_INTENT_RE = re.compile(
     r"|dec[ií]le|decirle)"
     r"\s+(?:[^.?!]{0,40})?"
     r"(?:un\s+(?:mensaje|whats.?app|wzp|wsp|texto|chat)"
+    r"|a\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)"
+    # WhatsApp-REPLY triggers (2026-04-24 wa-reply feature). Verbos rioplatenses
+    # de "responder a un mensaje" — distinto del send a un tercero porque acá
+    # el target es un mensaje específico, no un contacto en abstracto.
+    # Forms cubiertas:
+    #   - "respondele a Juan ..."
+    #   - "contestale a Grecia ..."
+    #   - "replyle a Pedro ..."
+    #   - "responde el mensaje de X ..."
+    #   - "contesta el último de Mariana ..."
+    # Sin "le" trailing también aceptamos cuando aparece "el mensaje/último/wzp".
+    r"|\b(?:respond[eé](?:le|rle|sele)?"
+    r"|contest[aá](?:le|rle|sele)?"
+    r"|reply\s*le?|replic[aá](?:le|rle)?)"
+    r"\s+(?:[^.?!]{0,60})?"
+    r"(?:el\s+(?:mensaje|[uú]ltimo|wzp|wsp|whats.?app)"
+    r"|al\s+(?:mensaje|wzp|wsp)"
     r"|a\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)",
     re.IGNORECASE,
 )

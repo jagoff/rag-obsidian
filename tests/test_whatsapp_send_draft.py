@@ -247,10 +247,14 @@ def test_propose_whatsapp_send_handles_empty_message(monkeypatch):
 
 def test_whatsapp_send_endpoint_happy_path(monkeypatch):
     captured = {}
-    def _fake_send(jid, text, anti_loop=True):
+    # `reply_to` kwarg added 2026-04-24 (wa-reply feature). Accepted but
+    # unused on the plain send path — keeps the fake signature aligned
+    # with the real helper so the endpoint can pass it transparently.
+    def _fake_send(jid, text, anti_loop=True, reply_to=None):
         captured["jid"] = jid
         captured["text"] = text
         captured["anti_loop"] = anti_loop
+        captured["reply_to"] = reply_to
         return True
     monkeypatch.setattr(_server, "_whatsapp_send_to_jid", _fake_send, raising=False)
     # Also patch the attr on the rag module (endpoint imports it lazily).

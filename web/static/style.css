@@ -2023,6 +2023,58 @@ kbd {
   background: rgba(126, 231, 135, 0.08);
 }
 
+/* WhatsApp REPLY proposal — shows the original incoming message as a
+ * styled blockquote ABOVE the textarea, mimicking the boxed citation
+ * that WhatsApp renders natively in the reply UI. Visual cues:
+ *   - left-border in the WhatsApp green/accent
+ *   - muted background (subtle differentiation from the response area)
+ *   - smaller font + line-height for the quoted text
+ *   - timestamp italic & dim — secondary info
+ *
+ * Note: el bridge local todavía no soporta el quote nativo (ver
+ * rag._whatsapp_send_to_jid docstring), así que el receptor en su
+ * WhatsApp ve el reply como un mensaje plano. La cita es para que el
+ * user EMISOR sepa a qué le está respondiendo antes de tocar Enviar. */
+.proposal-wa-quote {
+  margin: 4px 0 8px 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--green, #25d366);
+  background: var(--bg-soft, rgba(126, 231, 135, 0.05));
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.35;
+  max-width: 100%;
+  overflow: hidden;
+}
+.proposal-wa-quote-sender {
+  font-weight: 600;
+  color: var(--green, #25d366);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+.proposal-wa-quote-text {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* clamp to ~3 lines so very long quoted messages don't dominate the card */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.proposal-wa-quote-ts {
+  margin-top: 3px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-style: italic;
+}
+.proposal-wa-warn {
+  /* slightly tighter spacing than the generic .proposal-warn — the warning
+     replaces the quote slot, so it should feel inline, not modal */
+  margin: 4px 0 6px 0;
+  font-size: 12px;
+}
+
 /* ── Created chips (inline confirmation after auto-create) ────────────
  * Styled to match the existing ╌ fuentes rule-line aesthetic. Appears
  * below the rag response; scrolls with the chat. Reminders include an

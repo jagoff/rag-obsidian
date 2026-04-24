@@ -7658,18 +7658,25 @@ def _status_fmt_age(seconds: float) -> str:
 
 
 def _status_grade_daemon(label: str, name: str) -> dict:
-    """Grade KeepAlive daemon: running = ok, anything else = down."""
+    """Grade KeepAlive daemon: running = ok, anything else = down.
+
+    El payload incluye `label` + `running` + `loaded` para que la UI
+    decida qué botón mostrar (start / stop) y si la acción puede
+    fallar de antemano.
+    """
     info = _launchctl_print_fields(label)
     if info is None:
         return {"id": label, "name": name, "kind": "daemon", "status": "down",
-                "detail": "no cargado en launchd"}
+                "detail": "no cargado en launchd",
+                "label": label, "loaded": False, "running": False}
     state = info.get("state", "")
     pid = info.get("pid")
     last_exit = info.get("last exit code", "")
     if state == "running":
         detail = f"pid {pid}" if pid else "running"
         resp = {"id": label, "name": name, "kind": "daemon", "status": "ok",
-                "detail": detail}
+                "detail": detail,
+                "label": label, "loaded": True, "running": True}
         if pid:
             resp["pid"] = pid
         return resp
@@ -7677,7 +7684,8 @@ def _status_grade_daemon(label: str, name: str) -> dict:
     if last_exit and last_exit not in ("(never exited)", "0"):
         det = f"crashed · exit {last_exit}"
     return {"id": label, "name": name, "kind": "daemon", "status": "down",
-            "detail": det}
+            "detail": det,
+            "label": label, "loaded": True, "running": False}
 
 
 def _status_grade_scheduled(label: str, name: str) -> dict:
@@ -7693,25 +7701,32 @@ def _status_grade_scheduled(label: str, name: str) -> dict:
     info = _launchctl_print_fields(label)
     if info is None:
         return {"id": label, "name": name, "kind": "scheduled", "status": "warn",
-                "detail": "no cargado"}
+                "detail": "no cargado",
+                "label": label, "loaded": False, "running": False}
     state = info.get("state", "")
     runs = info.get("runs", "0")
     last_exit = info.get("last exit code", "(never exited)")
     if state == "running":
         pid = info.get("pid", "?")
         return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
-                "detail": f"corriendo · pid {pid} · runs {runs}"}
+                "detail": f"corriendo · pid {pid} · runs {runs}",
+                "label": label, "loaded": True, "running": True,
+                "pid": str(pid)}
     if last_exit == "0":
         return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
-                "detail": f"última OK · runs {runs}"}
+                "detail": f"última OK · runs {runs}",
+                "label": label, "loaded": True, "running": False}
     if last_exit == "(never exited)":
         if runs == "0":
             return {"id": label, "name": name, "kind": "scheduled", "status": "warn",
-                    "detail": "aún no corrió"}
+                    "detail": "aún no corrió",
+                    "label": label, "loaded": True, "running": False}
         return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
-                "detail": f"runs {runs}"}
+                "detail": f"runs {runs}",
+                "label": label, "loaded": True, "running": False}
     return {"id": label, "name": name, "kind": "scheduled", "status": "down",
-            "detail": f"última exit {last_exit} · runs {runs}"}
+            "detail": f"última exit {last_exit} · runs {runs}",
+            "label": label, "loaded": True, "running": False}
 
 
 def _status_probe_self() -> dict:
@@ -8028,6 +8043,85 @@ def api_status(nocache: int = 0) -> dict:
             _STATUS_CACHE["ts"] = now
         return payload
     return cached
+
+
+# ── /api/status/action — start / stop launchd-controlled services ────
+# Permite "trigger digest now" o "stop ambient agent" desde la UI sin
+# tener que abrir terminal y acordarse del label exacto. Whitelist
+# estricta: solo labels que ya estan en _STATUS_CATALOG (los `target`
+# de daemon + scheduled). Cualquier otro label devuelve 400.
+#
+# Acciones soportadas:
+#   start -> `launchctl kickstart gui/<uid>/<label>` (launchd corre el
+#            job ahora, sin esperar al siguiente trigger). Si esta
+#            running, no-op (kickstart no relanza por default).
+#   stop  -> `launchctl kill SIGTERM gui/<uid>/<label>` (manda senal al
+#            proceso; para daemons KeepAlive launchd lo restartea solo,
+#            para scheduled/oneshot se va y queda not-running).
+#
+# El server NO tiene auth (ver CLAUDE.md sobre el modo LAN-exposed):
+# el whitelist es la unica defensa. Es OK porque los labels son todos
+# `com.fer.*` propios del usuario y el subset es chico (~25). Si
+# alguien con acceso de red dispara un kickstart del digest, el peor
+# caso es que el digest corra unos minutos antes - no perdida de datos.
+
+
+def _status_actionable_labels() -> set[str]:
+    """Set of labels que la UI puede start/stop. Derivado del catalogo
+    para no hardcodear dos veces - si un servicio esta en el catalogo
+    como daemon/scheduled, es actionable."""
+    return {
+        e["target"] for e in _STATUS_CATALOG
+        if e.get("kind") in ("daemon", "scheduled") and e.get("target")
+    }
+
+
+class StatusActionRequest(BaseModel):
+    label: str
+    action: str  # "start" | "stop"
+
+
+@app.post("/api/status/action")
+def status_action(req: StatusActionRequest) -> dict:
+    """Disparar o parar un servicio launchd controlado. Whitelist-only."""
+    label = (req.label or "").strip()
+    action = (req.action or "").strip().lower()
+    if action not in ("start", "stop"):
+        raise HTTPException(status_code=400,
+                            detail=f"action invalida: {action!r} (esperaba start|stop)")
+    if label not in _status_actionable_labels():
+        raise HTTPException(status_code=400,
+                            detail=f"label no whitelisted: {label!r}")
+
+    target = f"gui/{_launchd_uid_cached()}/{label}"
+    if action == "start":
+        cmd = ["/bin/launchctl", "kickstart", target]
+    else:  # stop
+        cmd = ["/bin/launchctl", "kill", "SIGTERM", target]
+
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10.0, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        raise HTTPException(status_code=500,
+                            detail=f"launchctl fallo: {type(e).__name__}: {e}")
+
+    # Invalidar cache para que el proximo /api/status refleje el cambio
+    # (kickstart cambia state a running en <1s; sin esto la UI mostraria
+    # info vieja por hasta 3s - el TTL del cache).
+    with _STATUS_CACHE_LOCK:
+        _STATUS_CACHE["ts"] = 0.0
+        _STATUS_CACHE["payload"] = None
+
+    return {
+        "ok": out.returncode == 0,
+        "label": label,
+        "action": action,
+        "returncode": out.returncode,
+        "stdout": (out.stdout or "").strip(),
+        "stderr": (out.stderr or "").strip(),
+    }
 
 
 @app.get("/status")

@@ -403,3 +403,141 @@ def test_cli_index_source_gmail_dry_run(monkeypatch):
     assert result.exit_code == 0, result.output
     assert called["dry_run"] is True
     assert "dry · " in result.output
+
+
+# ── 2026-04-24 audit: cursor advancement post-ingest ─────────────────────
+
+
+class _FakeGmailWithChangingProfile:
+    """Variant of `_FakeGmail` que devuelve un historyId DIFERENTE cada
+    vez que se llama getProfile. Permite validar que el ingester usa el
+    hid fresco post-ingest, no el pre-run.
+    """
+    def __init__(self, *, initial_hid: str, fresh_hid: str,
+                 messages: dict | None = None,
+                 list_response: dict | None = None,
+                 history_response: dict | None = None,
+                 history_raise: str | None = None):
+        self._hids = [initial_hid, fresh_hid]  # FIFO
+        self._call_count = 0
+        self._messages = messages or {}
+        self._list_response = list_response or {"messages": [], "nextPageToken": None}
+        self._history_response = history_response or {"history": [], "historyId": initial_hid}
+        self._history_raise = history_raise
+
+    def users(self): return self
+
+    def getProfile(self, userId):
+        # Return next HID from FIFO (first call = initial, second = fresh).
+        hid = self._hids[min(self._call_count, len(self._hids) - 1)]
+        self._call_count += 1
+        return _ExecProxy({"emailAddress": "me@x.com", "historyId": hid})
+
+    def messages(self): return _Messages(self)
+    def history(self): return _History(self)
+
+
+def test_run_bootstrap_advances_cursor_to_fresh_hid(tmp_vault_col):
+    """2026-04-24 audit fix: después de un initial bootstrap (stored_hid
+    was None), el cursor debe avanzar al `historyId` fresco re-fetcheado
+    post-ingest, no al `profile_hid` pre-run. Sin esto, mensajes que
+    llegan DURANTE el fetch de 365 días caen en un gap.
+    """
+    import time as _t
+    from scripts import ingest_gmail as ig_mod
+    fresh_ms = int(_t.time() * 1000)
+    raws = {
+        "m1": _mk_raw("m1", "t1", "S", "juan@x", "body1", fresh_ms),
+    }
+    svc = _FakeGmailWithChangingProfile(
+        initial_hid="1000",
+        fresh_hid="2000",  # post-ingest historyId (simula mensajes nuevos en Gmail)
+        messages=raws,
+        list_response={"messages": [{"id": "m1"}]},
+    )
+    ig_mod.run(svc=svc, vault_col=tmp_vault_col)
+
+    # Leer el cursor persistido. Debería ser "2000" (fresco) no "1000".
+    import sqlite3
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        row = conn.execute(
+            "SELECT history_id FROM rag_gmail_state WHERE account_id = ?",
+            ("me@x.com",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "state row no se persistió"
+    assert row[0] == "2000", (
+        f"cursor debería avanzar al historyId fresco '2000', "
+        f"got '{row[0]}' (bug pre-fix: usaba el stale profile_hid)"
+    )
+
+
+def test_run_fallback_bootstrap_does_not_loop_with_stale_hid(tmp_vault_col):
+    """2026-04-24 audit: si el path incremental tira 410 Gone
+    (history expired), entramos al fallback bootstrap. Pre-fix,
+    `new_hid` caía a `profile_hid` (pre-fetch) porque el else branch
+    no existía → próximo run: mismo 410 → loop infinito de bootstraps.
+
+    Post-fix: `get_profile(service)` se llama SIEMPRE post-ingest, así
+    que el cursor avanza a un hid NUEVO y el próximo run procesa
+    incremental desde ahí (si el hid nuevo también expira, al menos
+    avanzamos).
+    """
+    import sqlite3
+    import time as _t
+    from scripts import ingest_gmail as ig_mod
+
+    # Seed: stored_hid="500" (existe, not None → no initial bootstrap).
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_gmail_state ("
+            " account_id TEXT PRIMARY KEY, history_id TEXT,"
+            " last_msg_id TEXT, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_gmail_state VALUES (?, ?, ?, ?)",
+            ("me@x.com", "500", "", "2026-04-24"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    fresh_ms = int(_t.time() * 1000)
+    raws = {"m1": _mk_raw("m1", "t1", "S", "juan@x", "body1", fresh_ms)}
+
+    # _FakeGmailWithChangingProfile con initial=1000 (irrelevante porque
+    # apply_history tira None) y fresh=3000 (el hid post-bootstrap).
+    # `history_raise` con mensaje de 404 fuerza el return ([], [], None)
+    # en apply_history → triggers fallback bootstrap.
+    svc = _FakeGmailWithChangingProfile(
+        initial_hid="1000",
+        fresh_hid="3000",
+        messages=raws,
+        list_response={"messages": [{"id": "m1"}]},
+        history_raise="404 historyId not found",  # triggers fallback
+    )
+    summary = ig_mod.run(svc=svc, vault_col=tmp_vault_col)
+
+    # Verificar que entró al path de fallback bootstrap.
+    assert summary.get("bootstrapped") is True, (
+        f"esperaba fallback bootstrap cuando apply_history devuelve "
+        f"latest_hid=None, got summary: {summary}"
+    )
+    # Y que el cursor avanzó a "3000" (fresh), no "1000" (profile_hid pre-fetch).
+    conn = sqlite3.connect(str(state_path))
+    try:
+        row = conn.execute(
+            "SELECT history_id FROM rag_gmail_state WHERE account_id = ?",
+            ("me@x.com",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "3000", (
+        f"fallback bootstrap debería avanzar a hid fresco '3000', "
+        f"got '{row[0]}' — pre-fix loopeaba con '1000' (stale)"
+    )

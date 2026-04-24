@@ -319,6 +319,36 @@ def test_run_reset_wipes_cursor(fake_bridge, tmp_vault_col):
     assert summary["messages_after_retention"] > 0
 
 
+def test_run_desync_guard_blocks_cursor_advance(
+    fake_bridge, tmp_vault_col, monkeypatch,
+):
+    """Si upsert_chunks reporta N > 0 pero la DB no tiene los chunks,
+    el cursor NO debe avanzar — así la próxima corrida reintenta.
+
+    Regresión 2026-04-24: el ingester WA del user reportó
+    `messages_processed=14394` durante varias corridas pero la collection
+    tenía 0 chunks con source=whatsapp. El cursor igual avanzaba y el
+    desync se volvía invisible. Fix: probe post-upsert que valida al
+    menos 1 chunk en la DB antes de persistir el cursor.
+    """
+    # Monkeypatch upsert_chunks para retornar N > 0 pero NO escribir.
+    def _fake_upsert(col, chunks):
+        return len(chunks)  # lies — says it wrote but didn't
+    monkeypatch.setattr(iw, "upsert_chunks", _fake_upsert)
+
+    summary = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col)
+    # Summary tiene el error explicativo.
+    assert "error" in summary
+    assert "desync" in summary["error"].lower()
+    assert "cursor" in summary["error"].lower()
+    # La próxima corrida (sin el monkeypatch) DEBE reprocesar desde 0
+    # porque el cursor nunca avanzó.
+    monkeypatch.undo()
+    summary2 = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col)
+    assert summary2["messages_after_retention"] > 0
+    assert summary2["chunks_written"] > 0
+
+
 def test_run_dry_run_writes_nothing(fake_bridge, tmp_vault_col):
     summary = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col, dry_run=True)
     assert summary["chunks_built"] > 0

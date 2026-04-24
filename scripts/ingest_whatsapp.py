@@ -882,6 +882,36 @@ def run(
     written = upsert_chunks(col, chunks)
     summary["chunks_written"] = written
 
+    # Sanity check post-upsert: si el batch afirma haber escrito N chunks
+    # pero la DB no refleja al menos 1 de ellos, no avanzamos el cursor —
+    # la próxima corrida va a re-intentar. Previene el desync silencioso
+    # reportado 2026-04-24: el cursor indicaba "14394 procesados" pero la
+    # collection tenía 0 chunks con source="whatsapp". Chequeamos una
+    # muestra (el primer chunk_id) en lugar del conteo total — el get por
+    # id es O(1) y suficiente para detectar la falla macro.
+    if written > 0 and chunks:
+        sample_id = _chunk_doc_id(chunks[0], 0)
+        try:
+            probe = col.get(ids=[sample_id], include=[])
+            if not probe.get("ids"):
+                summary["error"] = (
+                    f"desync: upsert reportó {written} chunks pero el id "
+                    f"{sample_id!r} no está en la collection — cursor NOT "
+                    "advanced, próxima corrida reintenta"
+                )
+                summary["duration_s"] = round(time.perf_counter() - t0, 2)
+                state_conn.close()
+                return summary
+        except Exception as exc:
+            # Si la probe misma falla, tratamos como desync conservador
+            # (igual de peligroso que un 0-rows response).
+            summary["error"] = (
+                f"desync probe failed: {exc!r} — cursor NOT advanced"
+            )
+            summary["duration_s"] = round(time.perf_counter() - t0, 2)
+            state_conn.close()
+            return summary
+
     # Advance per-chat cursors to the latest timestamp seen this run.
     latest: dict[str, tuple[float, str]] = {}
     for m in filtered:

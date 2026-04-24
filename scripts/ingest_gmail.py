@@ -578,6 +578,14 @@ def run(
     fetch_ids: list[str] = []
     delete_tids: list[str] = []
 
+    # Fallback-bootstrap flag: True si entramos al bootstrap desde el
+    # path incremental (history expired, 410 Gone). Se propaga al
+    # cursor advancement abajo para que NO se confíe en `profile_hid`
+    # (que fue capturado ANTES de la re-bootstrap y por ende puede
+    # ser stale respecto del conjunto de mensajes que acabamos de
+    # procesar).
+    latest_hid: str | None = None
+    fallback_bootstrap = False
     if mode_bootstrap:
         fetch_ids = list_recent_messages(
             service,
@@ -588,12 +596,13 @@ def run(
     else:
         add_ids, del_tids, latest_hid = apply_history(service, stored_hid)
         if latest_hid is None:
-            # History expired → bootstrap.
+            # History expired → fallback bootstrap.
             fetch_ids = list_recent_messages(
                 service, days=INITIAL_WINDOW_DAYS,
                 max_results=max_messages or MAX_MESSAGES_PER_RUN,
             )
             summary["bootstrapped"] = True
+            fallback_bootstrap = True
         else:
             fetch_ids = add_ids[: max_messages or MAX_MESSAGES_PER_RUN]
             delete_tids = del_tids
@@ -618,13 +627,36 @@ def run(
         d = delete_threads(col, delete_tids)
         summary["threads_deleted"] = d
 
-        # Advance cursor. Prefer the API-reported historyId (mode 2) over
-        # the getProfile one (mode 1) since it's always the freshest post-run.
-        new_hid = profile_hid if mode_bootstrap else None
-        if not mode_bootstrap:
-            # Need to fetch fresh historyId after ingesting — walk the API again.
-            _, hid2 = get_profile(service)
-            new_hid = hid2 or profile_hid
+        # Advance cursor. 2026-04-24 audit fix: SIEMPRE re-fetch el
+        # historyId post-ingest via `get_profile(service)` en vez de
+        # confiar en `profile_hid` (capturado al inicio del run, stale).
+        # Relevante especialmente para:
+        #
+        # 1. `mode_bootstrap=True` (stored_hid era None): pre-fix usábamos
+        #    el `profile_hid` pre-bootstrap. Si Gmail recibe mensajes
+        #    DURANTE el fetch de 365 días, esos mensajes caen en un gap —
+        #    el próximo `apply_history(profile_hid)` devuelve un rango
+        #    que ya parcialmente procesamos, pero cualquier mensaje
+        #    recibido entre `get_profile()` inicial y el upsert_threads
+        #    queda sin cursor que lo capture.
+        #
+        # 2. `fallback_bootstrap=True` (incremental tiró 410 Gone):
+        #    pre-fix el path incremental sí refetcheaba via
+        #    `get_profile()`, pero el fallback bootstrap NO lo hacía.
+        #    Usábamos `profile_hid` (stale) → próxima corrida mismo 410
+        #    → loop infinito de bootstraps con mensajes perdidos en el
+        #    gap entre cada refetch.
+        #
+        # Post-fix: `fresh_hid = get_profile(service)` siempre; caemos a
+        # `latest_hid` (del apply_history) si disponible, y solo como
+        # último recurso a `profile_hid` (si el get_profile post-ingest
+        # falla por network). Así garantizamos que el cursor es lo más
+        # adelantado posible sin perder mensajes.
+        try:
+            _, fresh_hid = get_profile(service)
+        except Exception:
+            fresh_hid = None
+        new_hid = fresh_hid or latest_hid or profile_hid
         if new_hid:
             # 2026-04-24 audit: BEGIN IMMEDIATE serializa escrituras del
             # cursor `history_id` si 2 ingesters corren en paralelo

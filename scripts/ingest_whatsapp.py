@@ -624,8 +624,8 @@ def scan_wa_images_for_citas(
     devuelve un summary vacío sin leer el bridge.
     """
     summary = {
-        "images_seen": 0, "ocr_ok": 0, "cita_created": 0,
-        "reminder_created": 0, "note_classified": 0,
+        "images_seen": 0, "ocr_ok": 0, "vlm_captioned": 0,
+        "cita_created": 0, "reminder_created": 0, "note_classified": 0,
         "duplicate": 0, "ambiguous": 0, "no_cita": 0, "low_confidence": 0,
         "errors": 0,
     }
@@ -634,6 +634,14 @@ def scan_wa_images_for_citas(
         return summary
 
     store_root = bridge_db.parent
+    # Reset del budget VLM al arrancar el scan. Cada ingest pass tiene su
+    # propio cap — evita que un WA ingest anterior en el mismo proceso
+    # (por ej. daemon de cron que procesa varias veces por hora) se coma
+    # el budget de este run.
+    try:
+        rag._vlm_caption_budget_reset()
+    except Exception:
+        pass
     try:
         last_ts = 0.0 if reset_cursor else _load_media_cursor(state_conn)
     except Exception:
@@ -667,11 +675,15 @@ def scan_wa_images_for_citas(
             max_ts_processed = max(max_ts_processed, ts)
             continue
 
+        # Wrapper unificado: OCR + fallback a VLM caption si el OCR no
+        # fue suficiente. Muchas imágenes de WhatsApp son fotos puras
+        # (selfies, paisajes, memes) donde OCR devuelve "" — el VLM
+        # captionea y el detector cita puede decidir sobre eso.
         try:
-            ocr_text = rag._ocr_image(img_path)
+            ocr_text, img_source = rag._image_text_or_caption(img_path)
         except Exception as exc:
             try:
-                rag._silent_log(f"wa_scan_ocr:{img_path}", exc)
+                rag._silent_log(f"wa_scan_read:{img_path}", exc)
             except Exception:
                 pass
             summary["errors"] += 1
@@ -682,7 +694,10 @@ def scan_wa_images_for_citas(
             max_ts_processed = max(max_ts_processed, ts)
             continue
 
-        summary["ocr_ok"] += 1
+        if img_source == "vlm":
+            summary["vlm_captioned"] += 1
+        else:
+            summary["ocr_ok"] += 1
 
         try:
             result = rag._maybe_create_cita_from_ocr(
@@ -937,6 +952,7 @@ def main() -> None:
         print(
             f"images: {img.get('images_seen', 0)} seen · "
             f"{img.get('ocr_ok', 0)} ocr · "
+            f"{img.get('vlm_captioned', 0)} vlm · "
             f"{img.get('cita_created', 0)} citas · "
             f"{img.get('reminder_created', 0)} recordatorios · "
             f"{img.get('note_classified', 0)} notes · "

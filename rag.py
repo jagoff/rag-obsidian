@@ -4818,6 +4818,38 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # VLM caption cache — texto generado por un modelo vision-language
+        # (qwen2.5vl:3b via ollama) cuando el OCR de Apple Vision devuelve
+        # vacío o muy poco texto. Captionea fotos, diagramas, gráficos,
+        # whiteboards, paisajes — imágenes que OCR no puede leer porque no
+        # hay texto, pero que siguen teniendo información útil para el
+        # retrieval (ej. "foto de Astor y Flor en la playa 2024").
+        #
+        # Misma invariante que `rag_ocr_cache`: clave = path absoluto, mtime
+        # como invalidador. Si la imagen se modifica, el caption se regenera.
+        # `_file_hash_with_images` de la nota contenedora ya suma mtimes
+        # de imágenes al hash, así que un cambio fuerza re-chunking.
+        #
+        # Sin TTL — el contenido visual no envejece, solo cambia cuando
+        # la imagen cambia.
+        #
+        # `model` guarda qué VLM generó el caption — si en el futuro el
+        # operador cambia `RAG_VLM_MODEL` (ej. qwen2.5vl:3b → 7b), los
+        # captions viejos quedan marcados con el modelo anterior. Útil
+        # para debugging y para forzar re-caption selectivo si se detecta
+        # que el modelo viejo era peor.
+        "rag_vlm_captions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_vlm_captions ("
+            " image_path TEXT PRIMARY KEY,"
+            " mtime REAL NOT NULL,"
+            " caption TEXT NOT NULL,"
+            " model TEXT NOT NULL,"
+            " captioned_at REAL NOT NULL"
+            ")",
+        ),
+    ),
+    (
         # Entity extraction (Improvement #2) — canonical entity store
         # populated by GLiNER (or qwen2.5:3b fallback) during indexing.
         # Discriminador: (normalized, entity_type) — "juan" como person es
@@ -16344,31 +16376,40 @@ def retrieve(
     if precise:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
-        # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 4000ms desde
-        # 2026-04-22) for the background warmup to set the
-        # _local_embedder_ready Event before falling back to ollama.
-        # Rationale: in CLI one-shot, warmup_async starts ~100-300ms
-        # before retrieve. El `_warmup_local_embedder()` tarda ~5s cold
-        # load en MPS + first encode. Post paralelización del warmup
-        # (5 threads vs 1 secuencial), los 5 targets arrancan
-        # simultáneos a t=0 del warmup. El local embed termina a t≈5s.
-        # Con el default histórico de 1500ms el wait timeaba **siempre**
-        # en CLI one-shot → fallback a `embed()` ollama que tampoco
-        # estaba warm (el ollama embed warmup iba detrás del reranker
-        # en la versión secuencial) → cold load ollama 6-12s.
-        # 4000ms cubre el caso normal (warmup paralelo completa a 5s,
-        # main thread llega a retrieve a ~1-2s, wait desde ahí = max 4s
-        # antes del Event fire). Si aún timea, el fallback ollama ya
-        # está warm (otro thread paralelo lo cubrió) → 140ms round-trip.
+        # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 6000ms desde
+        # 2026-04-23, bumped desde 4000ms) for the background warmup to
+        # set the _local_embedder_ready Event before falling back to
+        # ollama. Rationale: in CLI one-shot, warmup_async starts
+        # ~100-300ms before retrieve. El `_warmup_local_embedder()`
+        # tarda ~5s cold load en MPS + first encode. Post
+        # paralelización del warmup (5 threads vs 1 secuencial), los 5
+        # targets arrancan simultáneos a t=0 del warmup. El local embed
+        # termina a t≈5s. Con el default histórico de 1500ms el wait
+        # timeaba **siempre** en CLI one-shot → fallback a `embed()`
+        # ollama que tampoco estaba warm (el ollama embed warmup iba
+        # detrás del reranker en la versión secuencial) → cold load
+        # ollama 6-12s.
+        #
+        # 2026-04-23: bump 4000→6000ms tras observar en prod (CLI `query`
+        # 2026-04-23T15:14-15:15) un patrón repetido de embed_ms=4005
+        # exacto — el wait de 4s timea justo antes del Event fire (~5s
+        # cold load on M3 Max). El fallback ollama ya estaba warm (5ms)
+        # pero el user pagaba 4s gratis. Con 6000ms el Event dispara
+        # dentro del wait (warmup≈5s + margen 1s) → embed cae a ~30ms
+        # (MPS encode) en la misma query. En el caso donde el warmup
+        # también timea (disk cold, HF cache lejos), el fallback ollama
+        # sigue siendo 140ms warm → cap final ~6.1s (igual que antes era
+        # 4.1s + otro posible cold). Trade-off: CLI warm path no cambia
+        # (Event ya set); cold path mejora de 4005ms→~50ms (-99%).
         # Configurable via env — `RAG_LOCAL_EMBED_WAIT_MS=0` restaura
-        # legacy non-blocking, `RAG_LOCAL_EMBED_WAIT_MS=6000` para
+        # legacy non-blocking, `RAG_LOCAL_EMBED_WAIT_MS=10000` para
         # colder disks donde SentenceTransformer tarda más en cargar.
         try:
             _wait_ms_str = os.environ.get("RAG_LOCAL_EMBED_WAIT_MS")
             _wait_s = (float(_wait_ms_str) / 1000.0
-                       if _wait_ms_str is not None else 4.0)
+                       if _wait_ms_str is not None else 6.0)
         except ValueError:
-            _wait_s = 4.0
+            _wait_s = 6.0
         _local_vecs = (
             query_embed_local(variants, wait_ready_timeout=_wait_s)
             if _local_embed_enabled() else None
@@ -19043,6 +19084,268 @@ def _ocr_image(image_path: Path) -> str:
     return out
 
 
+# ── VLM caption fallback ────────────────────────────────────────────────────
+#
+# Hay imágenes en el vault que NO tienen texto (o tienen muy poquito) pero sí
+# información visual relevante — fotos familiares, diagramas de arquitectura,
+# whiteboards dibujados, gráficos de torta, screenshots puramente gráficos,
+# paisajes, flyers de eventos en imagen. Con OCR solo, esas imágenes son
+# invisibles al retrieval aunque la nota contenedora las describa parcialmente
+# en texto.
+#
+# La solución: cuando OCR devuelve vacío (o menos de `_VLM_FALLBACK_MIN_OCR`
+# chars), corremos un modelo vision-language local (qwen2.5vl:3b vía ollama)
+# con un prompt que pide descripción grep-friendly + transcripción de texto
+# visible. El caption resultante se concatena al body igual que el OCR, pero
+# con un marker distinto (`<!-- VLM-caption: -->`) para que sea grepable.
+#
+# Cache: tabla `rag_vlm_captions` keyed por `(abs_path, mtime)` — misma
+# invariante que `rag_ocr_cache`. El hash del chunk (`_file_hash_with_images`)
+# suma mtimes de imágenes, así que una imagen nueva fuerza re-chunking aunque
+# el .md no haya cambiado — y por mtime invalidation, también fuerza
+# re-caption.
+#
+# Silent-fail total:
+#   - `RAG_VLM_CAPTION=0` → feature off, wrapper devuelve lo que dé OCR.
+#   - ollama no responde / timeout → return "" (el OCR text gana si había).
+#   - Modelo no existe (usuario no corrió `ollama pull qwen2.5vl:3b`) →
+#     hint en stderr UNA vez por proceso + return "".
+#   - Budget per-run excedido → return "" sin llamar a ollama (safety net
+#     contra loops infinitos o primer indexing de vaults gigantes).
+#
+# Costo real a considerar: qwen2.5vl:3b ocupa ~4 GB en RAM, ~2-4s por imagen
+# en MPS. Primera corrida de `rag index --reset` sobre un vault con 500
+# imágenes sin OCR = ~25 min. Por eso `RAG_VLM_CAPTION_MAX_PER_RUN=500`
+# default — el cap previene que un bug o un corpus inesperadamente grande
+# se coma el día. Override con la var env.
+
+VLM_MODEL = os.environ.get("RAG_VLM_MODEL", "").strip() or "qwen2.5vl:3b"
+
+# Chars mínimos de OCR para NO hacer fallback al VLM. 20 = threshold sano
+# empíricamente: menos que esto suele ser ruido de OCR ("OK", "x", "•"), más
+# es probable que sea texto real valioso que no necesita caption encima.
+_VLM_FALLBACK_MIN_OCR = 20
+
+# Longitud máxima del caption post-procesado. 500 chars = 1-2 oraciones
+# descriptivas sin inflar el chunk. El prompt pide <80 palabras pero algunos
+# modelos ignoran el cap — truncamos por las dudas.
+_VLM_CAPTION_MAX_CHARS = 500
+
+# Budget per-process. Protege contra runaway loops y contra primer indexing
+# de vault gigante. El counter es module-global (single-process assumption
+# del indexer). Override con `RAG_VLM_CAPTION_MAX_PER_RUN`.
+_VLM_CAPTION_MAX_PER_RUN = int(os.environ.get("RAG_VLM_CAPTION_MAX_PER_RUN", "500"))
+_vlm_caption_calls_used: int = 0
+
+# Warned-once set por nombre de modelo. Evita spam en stderr cuando el
+# usuario no tiene el VLM pulled y cada imagen falla con "model not found".
+_vlm_model_missing_warned: set[str] = set()
+
+# Cliente ollama dedicado para VLM. Timeout más alto (60s) que helper text
+# porque qwen2.5vl en MPS tarda 2-4s warm / hasta 10s en cold-load.
+_VLM_CLIENT: "ollama.Client | None" = None
+
+
+def _vlm_caption_enabled() -> bool:
+    """True salvo `RAG_VLM_CAPTION=0/false/no` explícito. Default ON."""
+    val = os.environ.get("RAG_VLM_CAPTION", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _vlm_client() -> "ollama.Client":
+    """Lazy-init singleton. 60s timeout cubre cold-load del modelo (~10s en
+    MPS primera vez) + inference típica (~2-4s)."""
+    global _VLM_CLIENT
+    if _VLM_CLIENT is None:
+        _VLM_CLIENT = ollama.Client(timeout=60.0)
+    return _VLM_CLIENT
+
+
+def _vlm_caption_budget_reset() -> None:
+    """Reinicia el contador de llamadas. Llamado por el CLI al arrancar
+    comandos de indexing (`rag index`, `rag watch`, `rag scan-citas`) para
+    que cada run tenga su propio budget limpio. Tests también resetean
+    entre casos para aislar."""
+    global _vlm_caption_calls_used
+    _vlm_caption_calls_used = 0
+
+
+def _vlm_caption_budget_available() -> bool:
+    return _vlm_caption_calls_used < _VLM_CAPTION_MAX_PER_RUN
+
+
+def _vlm_caption_budget_consume() -> None:
+    global _vlm_caption_calls_used
+    _vlm_caption_calls_used += 1
+
+
+# Prompt del VLM. Español rioplatense-neutral, optimizado para retrieval:
+# pide (a) transcripción de texto visible si lo hay, (b) descripción de
+# escena grep-friendly, (c) nombres propios y fechas si aparecen. El
+# formato es prosa libre sin markdown porque el chunker normaliza eso.
+_VLM_CAPTION_PROMPT = (
+    "Describí qué hay en esta imagen en 1-2 oraciones (≤80 palabras). "
+    "Si hay texto visible en la imagen (letreros, títulos, nombres, "
+    "fechas, números), transcribilo literal al principio. Si es una "
+    "foto, mencioná objetos/personas/escena; si es un diagrama, qué "
+    "representa; si es una captura de UI, qué app/pantalla. "
+    "Sé específico — evitá 'una imagen' o 'una foto'. "
+    "Sin markdown, sin comillas, sin preámbulos. "
+    "Respondé en español."
+)
+
+
+def _caption_image(image_path: Path) -> str:
+    """VLM caption de `image_path` — fallback cuando el OCR devolvió poco.
+
+    Returns caption string (máx `_VLM_CAPTION_MAX_CHARS` chars) o "" en
+    cualquiera de estos casos (silent-fail):
+      - `RAG_VLM_CAPTION=0` — feature off.
+      - stat falla (imagen no existe o sin permisos).
+      - budget per-run excedido.
+      - ollama timeout / unreachable.
+      - modelo no pulled — imprime hint en stderr UNA vez por proceso.
+      - response vacío o mal-formed.
+
+    Cache: `rag_vlm_captions` con key `(abs_path, mtime)`. Re-correr sobre
+    la misma imagen es O(1) SQL lookup — NO vuelve a llamar al modelo.
+    """
+    if not _vlm_caption_enabled():
+        return ""
+    try:
+        mtime = image_path.stat().st_mtime
+    except OSError:
+        return ""
+    abs_key = str(image_path.resolve())
+
+    # Cache read.
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT mtime, caption FROM rag_vlm_captions WHERE image_path = ?",
+                (abs_key,),
+            ).fetchone()
+            if row is not None and abs(row[0] - mtime) < 1e-6:
+                return row[1] or ""
+    except Exception as exc:
+        _silent_log("vlm_caption_cache_read", exc)
+        # Seguimos — cache roto no bloquea VLM call.
+
+    # Budget gate — DESPUÉS del cache read (cache hits no cuentan contra
+    # el budget, solo las invocaciones reales al modelo).
+    if not _vlm_caption_budget_available():
+        return ""
+
+    # VLM call.
+    try:
+        resp = _vlm_client().chat(
+            model=VLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": _VLM_CAPTION_PROMPT,
+                "images": [abs_key],
+            }],
+            options={
+                "temperature": 0,
+                "seed": 42,
+                "num_predict": 120,
+                # num_ctx dejamos que el servidor elija — imagen + prompt
+                # +  caption caben cómodo en el default de qwen2.5vl.
+            },
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+    except Exception as exc:
+        # Detectamos "model not found" → hint one-shot. Otros errores
+        # (timeout, network) silent-fail normal.
+        msg = str(exc).lower()
+        if ("not found" in msg or "pull" in msg) and VLM_MODEL not in _vlm_model_missing_warned:
+            _vlm_model_missing_warned.add(VLM_MODEL)
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"\n[obsidian-rag] VLM caption skipped: modelo '{VLM_MODEL}' "
+                    f"no está disponible en ollama. Corré:\n"
+                    f"    ollama pull {VLM_MODEL}\n"
+                    f"Para desactivar el caption fallback: "
+                    f"export RAG_VLM_CAPTION=0\n\n"
+                )
+            except Exception:
+                pass
+        _silent_log(f"vlm_caption:{abs_key}", exc)
+        return ""
+
+    # Budget se consume SOLO cuando efectivamente llamamos al modelo (éxito
+    # o respuesta vacía — no cuando falló el pull). Evita que un modelo
+    # no-pulled queme budget en el primer intento y deje el resto sin
+    # siquiera intentar.
+    _vlm_caption_budget_consume()
+
+    # Normalización del output.
+    try:
+        raw = resp.message.content or ""
+    except Exception:
+        raw = ""
+    caption = raw.strip()
+    # Strip markdown residual + comillas extra si el modelo ignoró el prompt.
+    caption = caption.strip("`\"' \n\r\t").replace("\n\n", " ").replace("\n", " ")
+    caption = caption[:_VLM_CAPTION_MAX_CHARS]
+
+    # Cache write (también cacheamos captions vacíos — así no re-intentamos
+    # en cada index run una imagen que el VLM no supo captionar).
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO rag_vlm_captions "
+                "(image_path, mtime, caption, model, captioned_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (abs_key, float(mtime), caption, VLM_MODEL, time.time()),
+            )
+    except Exception as exc:
+        _silent_log(f"vlm_caption_cache_write:{abs_key}", exc)
+
+    return caption
+
+
+def _image_text_or_caption(image_path: Path) -> tuple[str, str]:
+    """Wrapper unificado: devuelve `(text, source)` donde source es uno de:
+      - `"ocr"`: el texto viene de Apple Vision (había texto reconocible).
+      - `"vlm"`: OCR fue vacío/poco → fallback al VLM para captionear.
+      - `""`: ni OCR ni VLM aportaron nada (imagen sin señal).
+
+    Orden: OCR primero (barato, determinístico, local). Si el OCR devuelve
+    menos de `_VLM_FALLBACK_MIN_OCR` chars, se intenta VLM. Si VLM
+    también vacío, devolvemos lo que dé OCR (que puede ser "" o un
+    fragmento corto) preferentemente como `"ocr"` — el OCR corto todavía
+    tiene más chance de ser verdadero texto de la imagen que un caption
+    inventado.
+
+    Es el punto de entrada que deben usar los callers (`_enrich_body_with_ocr`,
+    `rag scan-citas`, `rag capture --image`, WA ingester). NUNCA raise.
+    """
+    try:
+        ocr_text = _ocr_image(image_path)
+    except Exception as exc:
+        _silent_log(f"image_text_ocr:{image_path}", exc)
+        ocr_text = ""
+
+    if ocr_text and len(ocr_text.strip()) >= _VLM_FALLBACK_MIN_OCR:
+        return ocr_text, "ocr"
+
+    # Fallback VLM — solo si está habilitado.
+    try:
+        caption = _caption_image(image_path)
+    except Exception as exc:
+        _silent_log(f"image_text_vlm:{image_path}", exc)
+        caption = ""
+
+    if caption:
+        return caption, "vlm"
+    if ocr_text:
+        # OCR corto pero no vacío — preferible a nada.
+        return ocr_text, "ocr"
+    return "", ""
+
+
 def _enrich_body_with_ocr(
     body: str, note_path: Path, vault_root: Path,
     images_source: str | None = None,
@@ -19073,7 +19376,11 @@ def _enrich_body_with_ocr(
         return body
     parts: list[str] = [body]
     for img in images:
-        text = _ocr_image(img)
+        # Wrapper unificado: OCR primero, fallback a VLM si OCR vacío/corto.
+        # El `source` ∈ {"ocr", "vlm", ""} gobierna el marker que elegimos
+        # abajo — importante para grep/debug y para distinguir texto
+        # literal (OCR) de descripción inferida (VLM).
+        text, source = _image_text_or_caption(img)
         if not text:
             continue
         # Marker: path relativo al vault si posible (más legible), fallback
@@ -19083,14 +19390,16 @@ def _enrich_body_with_ocr(
             rel_marker = str(img.resolve().relative_to(vault_root.resolve()))
         except ValueError:
             rel_marker = img.name
-        parts.append(f"\n\n<!-- OCR: {rel_marker} -->\n{text}")
+        marker = "VLM-caption" if source == "vlm" else "OCR"
+        parts.append(f"\n\n<!-- {marker}: {rel_marker} -->\n{text}")
         # Cita-from-image detector hook. Corre DESPUÉS del append para
         # que el body enrichment siempre gane — si el detector crashea o
-        # el helper está caído, el OCR sigue llegando al chunker tal cual.
-        # Silent-fail triple: la función ya es silent, pero envolvemos en
-        # try/except por las dudas. El sidecar `rag_cita_detections`
-        # dedupe across reindex runs, así que llamar en cada index pass
-        # no cuesta más que 1 sqlite hit por imagen ya procesada.
+        # el helper está caído, el OCR/caption sigue llegando al chunker
+        # tal cual. Silent-fail triple: la función ya es silent, pero
+        # envolvemos en try/except por las dudas. El detector es
+        # source-agnóstico: un caption VLM que dice "flyer cumple Flor 26
+        # de mayo" clasifica igual de bien que el OCR literal del mismo
+        # flyer.
         try:
             _maybe_create_cita_from_ocr(text, img, source="index")
         except Exception as exc:
@@ -28048,25 +28357,31 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
     automáticamente en Calendar (auto-undo 10s en el flow de chat; aquí
     imprime el event_uid y podés borrarlo a mano si es false positive).
     """
-    # Image-first branch: if --image supplied, text is optional (OCR fills it).
+    # Image-first branch: if --image supplied, text is optional (wrapper fills it).
     if image_path is not None:
+        # Reset del budget VLM por-run — cada `rag capture --image` es su
+        # propia oportunidad de caption sin chocar contra un cap de un run
+        # anterior en el mismo proceso.
+        _vlm_caption_budget_reset()
         ocr_text = ""
+        img_source = ""
         try:
-            ocr_text = _ocr_image(image_path)
+            ocr_text, img_source = _image_text_or_caption(image_path)
         except Exception as exc:
-            msg = f"OCR falló: {exc}"
+            msg = f"Lectura de imagen falló: {exc}"
             click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
             return
         if not ocr_text.strip():
             msg = (
-                f"OCR de {image_path.name} devolvió vacío — revisá que "
-                f"ocrmac esté instalado (`uv pip install ocrmac`) y que la "
-                f"imagen no sea solo gráficos."
+                f"Ni OCR ni VLM pudieron leer {image_path.name}. "
+                f"Revisá: ocrmac instalado (`uv pip install ocrmac`), "
+                f"VLM pulled (`ollama pull {VLM_MODEL}`), y que la "
+                f"imagen no esté corrupta."
             )
             click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
             return
-        # Merge OCR con texto opcional (si el user pasó ambos, se prepende el
-        # comentario del user antes del OCR crudo).
+        # Merge OCR/caption con texto opcional (si el user pasó ambos, se
+        # prepende el comentario del user antes del texto de la imagen).
         user_blurb = (text or "").strip()
         if from_stdin and not user_blurb:
             import sys
@@ -28075,7 +28390,10 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
         body_parts.append(f"![[{image_path.name}]]")
         if user_blurb:
             body_parts.append(user_blurb)
-        body_parts.append(f"<!-- OCR: {image_path} -->\n{ocr_text}")
+        # Marker discrimina OCR literal vs VLM-inferred caption. Útil si en
+        # el futuro el usuario busca "solo texto real" vs "descripción IA".
+        text_marker = "VLM-caption" if img_source == "vlm" else "OCR"
+        body_parts.append(f"<!-- {text_marker}: {image_path} -->\n{ocr_text}")
         note_text = "\n\n".join(body_parts)
         try:
             note_path = capture_note(
@@ -28110,6 +28428,15 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
                     click.echo(f"recordatorio: {cita_result.get('reminder_id')}")
             return
         console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
+        if img_source == "vlm":
+            # Transparencia: el usuario tiene derecho a saber que el texto
+            # no vino de OCR literal sino de una descripción inferida. El
+            # caption puede estar equivocado (VLMs halucinan), y es
+            # importante que el usuario lo sepa para reality-check la nota.
+            console.print(
+                f"  [dim]Fuente del texto: VLM caption ({VLM_MODEL}) — "
+                f"OCR estaba vacío[/dim]"
+            )
         if cita_result:
             dec = cita_result.get("decision")
             title_s = cita_result.get("title") or ""
@@ -28247,24 +28574,35 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
             f"umbral={threshold:.2f}"
         )
 
-    # Counters for summary.
+    # Reset del budget VLM al arrancar el barrido. Sin esto, un run
+    # anterior en el mismo proceso (poco común en CLI one-shot, pero
+    # posible si el user hace múltiples `rag scan-citas` encadenados en
+    # un shell script) dejaría el cap ya consumido.
+    _vlm_caption_budget_reset()
+
+    # Counters for summary. `vlm_captioned` cuenta cuántas imágenes usaron
+    # el fallback VLM (OCR vacío/corto); útil para el usuario saber qué
+    # porción del vault se beneficia del modelo de visión.
     counts = {
         "cita": 0, "reminder": 0, "note": 0, "duplicate": 0,
         "no": 0, "low_confidence": 0,
         "ambiguous": 0, "error": 0, "skipped": 0,
+        "vlm_captioned": 0,
     }
     rows: list[tuple[str, str, str, float, str, str]] = []
 
     for img in sorted(images, key=lambda p: str(p)):
         try:
-            ocr_text = _ocr_image(img)
+            ocr_text, img_source = _image_text_or_caption(img)
         except Exception as exc:
-            _silent_log(f"scan_citas_ocr:{img}", exc)
+            _silent_log(f"scan_citas_read:{img}", exc)
             counts["skipped"] += 1
             continue
         if not ocr_text or len(ocr_text.strip()) < _CITA_MIN_CHARS:
             counts["skipped"] += 1
             continue
+        if img_source == "vlm":
+            counts["vlm_captioned"] += 1
 
         if do_apply:
             try:
@@ -28374,6 +28712,11 @@ def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
         f"[red]err={counts.get('error',0)}[/red] "
         f"[dim]skip={counts.get('skipped',0)}[/dim]"
     )
+    if counts.get("vlm_captioned", 0) > 0:
+        console.print(
+            f"[dim]↳ {counts.get('vlm_captioned', 0)} imágenes sin OCR "
+            f"se captionearon vía VLM ({VLM_MODEL}).[/dim]"
+        )
     if not do_apply:
         actionable = counts.get("cita", 0) + counts.get("reminder", 0)
         if actionable > 0:

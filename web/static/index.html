@@ -61,7 +61,7 @@
        Sidebar claude.ai-style (2026-04-24)
        ══════════════════════════════════════════════════════════════════
        Replaces the old topbar. Single source of truth para pickers/TTS
-       (vault-picker, model-picker, tts-toggle) — app.js sigue leyendo
+       (vault-picker, chat-mode-toggle, tts-toggle) — app.js sigue leyendo
        esos IDs directo. Estados:
          · desktop >=768px: visible por default, expandida (260px) o
            colapsada a icon-only (64px). El user toggle con el botón
@@ -197,11 +197,21 @@
             </select>
           </div>
           <div class="sidebar-footer-row">
-            <label id="model-picker-label" for="model-picker">modelo</label>
-            <select id="model-picker" aria-label="Modelo de chat"
-                    title="Modelo LLM · persistente">
-              <option value="">…</option>
-            </select>
+            <label id="chat-mode-label" for="chat-mode-toggle">modo</label>
+            <div id="chat-mode-toggle"
+                 class="chat-mode-toggle"
+                 role="radiogroup"
+                 aria-labelledby="chat-mode-label">
+              <button type="button" role="radio" aria-checked="true"
+                      data-mode="auto" class="chat-mode-btn"
+                      title="Auto — el sistema elige según la query">auto</button>
+              <button type="button" role="radio" aria-checked="false"
+                      data-mode="fast" class="chat-mode-btn"
+                      title="Rápido — modelo chico, respuestas literales">rápido</button>
+              <button type="button" role="radio" aria-checked="false"
+                      data-mode="deep" class="chat-mode-btn"
+                      title="Profundo — modelo grande, razonamiento">profundo</button>
+            </div>
           </div>
         </div>
         <div class="sidebar-footer-actions">
@@ -313,22 +323,11 @@
                 </svg>
               </button>
             </div>
-            <!-- Toolbar-right: modelo activo (badge + chevron) + mic
-                 (placeholder para dictado, "próximamente") + stop/send. -->
+            <!-- Toolbar-right: mic (placeholder para dictado,
+                 "próximamente") + stop/send. El modo (auto/rápido/
+                 profundo) vive ahora en la sidebar como segmented
+                 toggle — ya no hay badge acá. -->
             <div class="composer-actions-right">
-              <button id="composer-model-badge" type="button"
-                      class="composer-model-badge"
-                      aria-label="Modelo activo — click para cambiar"
-                      title="Cambiar modelo de chat">
-                <span class="composer-model-name">…</span>
-                <svg class="composer-model-chevron"
-                     width="10" height="10" viewBox="0 0 24 24"
-                     aria-hidden="true" fill="none" stroke="currentColor"
-                     stroke-width="2.2" stroke-linecap="round"
-                     stroke-linejoin="round">
-                  <polyline points="6 9 12 15 18 9"/>
-                </svg>
-              </button>
               <button id="composer-mic-btn" type="button"
                       class="composer-icon-btn"
                       aria-label="Dictado (próximamente)"

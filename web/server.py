@@ -6221,7 +6221,61 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             ).strip() not in ("", "0", "false", "no")
             # `_propose_intent` set earlier (pre-router gate); reuse to avoid
             # re-running the regex.
-            _skip_llm_tool_round = not _llm_tool_decide and not _propose_intent
+            #
+            # Safety-net fallback (2026-04-24, user report iter 7): si el
+            # pre-router regex NO engancho tool alguno Y la retrieve del
+            # vault devolvió confianza débil (< CONFIDENCE_DEEP_THRESHOLD
+            # = 0.10 — "vault really failed" según la calibración global),
+            # prendemos el LLM tool-decide round como safety-net. Cubre
+            # el gap de sinónimos/phrasings que el regex no anticipó —
+            # p.ej. "qué correspondencia tengo?", "mostrame mi agenda de
+            # mayo", "tenés algo en el inbox?". Sin este fallback la
+            # query caía al vault retrieve y si el vault no tenía nada
+            # semánticamente cercano, el user quedaba sin respuesta útil.
+            #
+            # Tradeoff: +10-30s en las queries que caen en este branch
+            # (cold prefill de qwen2.5:7b sobre ~9k chars). Estimado
+            # <10% del tráfico — el 80%+ tiene match de regex o vault
+            # strong, el 10%+ restante cae a bypass canned antes de
+            # llegar acá. La racional empírica original ("el LLM rara
+            # vez agrega valor si el pre-router no matcheó") era válida
+            # cuando el regex cubría la mayoría de los casos; cuando el
+            # regex falla, el LLM ES el plan B.
+            from rag import CONFIDENCE_DEEP_THRESHOLD as _CONF_DEEP_THRESHOLD
+            _pre_router_missed = not _forced_tool_pairs
+            _vault_retrieve_weak = (
+                float(result.get("confidence") or 0.0) < _CONF_DEEP_THRESHOLD
+            )
+            # Mention-hit guard: cuando el query pega con el resolver de
+            # Mentions @/ (p.ej. "qué sabés de Bizarrap" → match contra
+            # `99 Mentions @/bizarrap.md`), `build_person_context` ya
+            # inyectó un preamble authoritative en el system prompt del
+            # turn. No hay gap que tapar con el LLM tool-decide — el LLM
+            # tiene la data que necesita. Skippeamos el fallback para no
+            # pagar 10-30s extras en queries que ya están respondidas.
+            _has_mention_hit = bool(_mention_paths)
+            _llm_fallback_needed = (
+                _pre_router_missed
+                and _vault_retrieve_weak
+                and not _has_mention_hit
+            )
+            _skip_llm_tool_round = (
+                not _llm_tool_decide
+                and not _propose_intent
+                and not _llm_fallback_needed
+            )
+            # Log explícito cuando el fallback se activa — útil para tunear
+            # el threshold si vemos que dispara demasiado seguido (cost)
+            # o muy poco (cobertura insuficiente). `[chat-llm-fallback]`
+            # tag es greppable desde el web.log.
+            if _llm_fallback_needed and not _llm_tool_decide and not _propose_intent:
+                print(
+                    f"[chat-llm-fallback] pre-router miss + conf="
+                    f"{float(result.get('confidence') or 0.0):.3f} "
+                    f"< {_CONF_DEEP_THRESHOLD} — running LLM tool-decide "
+                    f"as safety net",
+                    flush=True,
+                )
 
             for _round_idx in range(_TOOL_ROUND_CAP):
                 if _skip_llm_tool_round:

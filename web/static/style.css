@@ -164,8 +164,7 @@ body {
   color: var(--text-faint);
 }
 
-#vault-picker,
-#model-picker {
+#vault-picker {
   background: var(--bg-elev);
   color: var(--text);
   border: 1px solid var(--border);
@@ -183,28 +182,51 @@ body {
   transition: border-color 0.15s, color 0.15s;
 }
 
-#vault-picker:hover, #vault-picker:focus,
-#model-picker:hover, #model-picker:focus {
+#vault-picker:hover, #vault-picker:focus {
   border-color: var(--border-strong);
   color: var(--cyan);
 }
 
-#model-picker-label {
+/* Chat mode toggle (sidebar) ---------------------------------------
+   Segmented 3-state radio group. Replaces the old #model_picker select.
+   Active state uses the same accent treatment as other "active" chips
+   in the UI. Keep ARIA radiogroup contract intact (keyboard nav lives
+   in app.js).                                                       */
+#chat-mode-label {
   color: var(--text-faint);
 }
-
-/* Model picker gets a touch more width room because model tags
-   (e.g. `qwen2.5:7b`, `qwen3.6`, `command-r:35b`) are longer than
-   the usual vault names. Keeping the same font-size + height so
-   the two selects line up in the topbar without visual jitter. */
-#model-picker {
-  min-width: 110px;
-  max-width: 180px;
+.chat-mode-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  width: 100%;
 }
-
-#model-picker:disabled {
-  opacity: 0.6;
-  cursor: wait;
+.chat-mode-btn {
+  flex: 1;
+  padding: 4px 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.chat-mode-btn:not(:last-child) {
+  border-right: 1px solid var(--border);
+}
+.chat-mode-btn:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+.chat-mode-btn[aria-checked="true"] {
+  background: var(--accent);
+  color: var(--bg);
+}
+.chat-mode-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 #chat {
@@ -1268,47 +1290,6 @@ body {
   box-shadow: var(--focus-ring);
 }
 
-/* Model badge — pill con nombre del modelo activo + chevron.
-   Click: focusea el #model-picker de la sidebar (si está collapsed
-   se expande primero). Hover da feedback visual. */
-.composer-model-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
-  border-radius: 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
-  white-space: nowrap;
-  max-width: 160px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.composer-model-badge:hover {
-  background: var(--bg-elev);
-  color: var(--text);
-  border-color: var(--border);
-}
-.composer-model-badge:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-.composer-model-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.composer-model-chevron {
-  flex-shrink: 0;
-  opacity: 0.7;
-}
 
 #input {
   flex: 1;
@@ -2246,8 +2227,8 @@ strong, b, th {
   #tts-toggle,
   #vault-picker-label,
   #vault-picker,
-  #model-picker-label,
-  #model-picker,
+  #chat-mode-label,
+  #chat-mode-toggle,
   .topbar-link {
     display: none;
   }
@@ -2932,10 +2913,9 @@ strong, b, th {
   flex-shrink: 0;
 }
 
-/* Override del style genérico de los pickers (que asumía topbar) para
-   que ocupen todo el ancho disponible dentro de la sidebar. */
-#sidebar #vault-picker,
-#sidebar #model-picker {
+/* Override del style genérico del vault picker (que asumía topbar) para
+   que ocupe todo el ancho disponible dentro de la sidebar. */
+#sidebar #vault-picker {
   flex: 1;
   min-width: 0;
   max-width: none;
@@ -3114,21 +3094,21 @@ strong, b, th {
   }
 
   /* Override del bloque legacy `@media (max-width: 640px)` que escondía
-     #tts-toggle, #vault-picker, #model-picker cuando vivían en el
+     #tts-toggle, #vault-picker, #chat-mode-toggle cuando vivían en el
      topbar. Ahora viven en la sidebar — queremos que sigan visibles
      dentro de ella en mobile. */
   #sidebar #tts-toggle { display: inline-flex; }
   #sidebar #vault-picker,
-  #sidebar #model-picker,
+  #sidebar #chat-mode-toggle,
   #sidebar #vault-picker-label,
-  #sidebar #model-picker-label { display: revert; }
-  #sidebar #vault-picker,
-  #sidebar #model-picker {
+  #sidebar #chat-mode-label { display: revert; }
+  #sidebar #vault-picker {
     /* `revert` devuelve a `display: inline-block` (select default). La
        sidebar-footer-row lo quiere como flex item full-width. */
     display: block;
     width: 100%;
   }
+  #sidebar #chat-mode-toggle { display: flex; width: 100%; }
 
   /* Collapse button → hide in mobile (no makes sense when drawer).
      Close button (X) takes over. Specificity con #sidebar prefix para

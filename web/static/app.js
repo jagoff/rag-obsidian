@@ -2,7 +2,7 @@ const messagesEl = document.getElementById("messages");
 const form = document.getElementById("composer");
 const input = document.getElementById("input");
 const vaultPicker = document.getElementById("vault-picker");
-const modelPicker = document.getElementById("model-picker");
+const chatModeToggle = document.getElementById("chat-mode-toggle");
 const ttsToggle = document.getElementById("tts-toggle");
 const helpBtn = document.getElementById("help-btn");
 const helpModal = document.getElementById("help-modal");
@@ -14,7 +14,7 @@ const sendBtn = document.getElementById("send-btn");
 const menuBtn = document.getElementById("menu-btn");
 const menuSheet = document.getElementById("menu-sheet");
 const sheetVaultPicker = document.getElementById("sheet-vault-picker");
-const sheetModelPicker = document.getElementById("sheet-model-picker");
+
 const sheetTtsToggle = document.getElementById("sheet-tts-toggle");
 
 const SESSION_KEY = "obsidian-rag:session";
@@ -199,77 +199,61 @@ vaultPicker.addEventListener("change", () => {
 
 loadVaults();
 
-// Chat model picker ------------------------------------------------
-// Runtime switch between installed chat models. The backend persists
-// the choice in ~/.local/share/obsidian-rag/chat-model.json so the
-// selection survives server restarts. No reload needed — the next
-// /api/chat call picks up the override automatically.
-async function loadChatModels() {
-  if (!modelPicker) return;
-  try {
-    const res = await fetch("/api/chat/model");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    modelPicker.innerHTML = "";
-    // Sort so the current one lands first; that's what's active right now.
-    const available = data.available || [];
-    const current = data.current;
-    const rest = available.filter((m) => m !== current);
-    const ordered = current ? [current, ...rest] : rest;
-    for (const name of ordered) {
-      const opt = document.createElement("option");
-      opt.value = name;
-      opt.textContent = name === current ? `${name} (activo)` : name;
-      modelPicker.appendChild(opt);
-    }
-    // If the current model isn't in `available` (env override pointing to
-    // an external registry), still show it as selected.
-    if (current && !ordered.includes(current)) {
-      const opt = document.createElement("option");
-      opt.value = current;
-      opt.textContent = `${current} (activo)`;
-      modelPicker.insertBefore(opt, modelPicker.firstChild);
-    }
-    modelPicker.value = current || "";
-    modelPicker.dataset.current = current || "";
-  } catch (err) {
-    modelPicker.innerHTML = '<option value="">n/a</option>';
+// Chat mode toggle (auto/fast/deep) ---------------------------------
+// Reemplaza el antiguo model-picker. El mode le dice al backend cómo
+// despachar la generación:
+//   · auto:   let adaptive routing decide (default, recomendado)
+//   · fast:   fuerza qwen2.5:3b (respuestas literales, ~2s)
+//   · deep:   fuerza qwen2.5:7b (razonamiento, ~8s)
+// Persiste en localStorage; se manda como `mode` en el POST /api/chat.
+// El endpoint legacy POST /api/chat/model sigue existiendo como escape
+// hatch para devs (env var OBSIDIAN_RAG_WEB_CHAT_MODEL o override file).
+const CHAT_MODE_KEY = "rag-chat-mode";
+const VALID_MODES = new Set(["auto", "fast", "deep"]);
+
+function getChatMode() {
+  const raw = localStorage.getItem(CHAT_MODE_KEY);
+  return VALID_MODES.has(raw) ? raw : "auto";
+}
+
+function setChatMode(mode) {
+  if (!VALID_MODES.has(mode)) mode = "auto";
+  localStorage.setItem(CHAT_MODE_KEY, mode);
+  if (!chatModeToggle) return;
+  for (const btn of chatModeToggle.querySelectorAll(".chat-mode-btn")) {
+    btn.setAttribute(
+      "aria-checked",
+      btn.dataset.mode === mode ? "true" : "false",
+    );
   }
 }
 
-modelPicker?.addEventListener("change", async () => {
-  const selected = modelPicker.value;
-  const previous = modelPicker.dataset.current || "";
-  if (!selected || selected === previous) return;
-  // Optimistic UI: mark busy; revert on error.
-  modelPicker.disabled = true;
-  try {
-    const res = await fetch("/api/chat/model", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: selected }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${res.status}`);
+if (chatModeToggle) {
+  chatModeToggle.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".chat-mode-btn");
+    if (btn) setChatMode(btn.dataset.mode);
+  });
+  // Keyboard navigation: arrow keys cycle between the 3 radios (ARIA
+  // radiogroup contract). Left/Up → anterior; Right/Down → siguiente.
+  chatModeToggle.addEventListener("keydown", (ev) => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(ev.key)) {
+      return;
     }
-    const data = await res.json();
-    modelPicker.dataset.current = data.current;
-    // Re-render the "(activo)" marker on the new option.
-    await loadChatModels();
-  } catch (err) {
-    console.error("[chat-model] switch failed:", err);
-    modelPicker.value = previous;
-    // Non-blocking toast via the textarea placeholder would be ideal,
-    // but alert() is the simplest way to surface a validation error
-    // (e.g. model not installed) without more UI plumbing.
-    alert(`No se pudo cambiar el modelo: ${err.message}`);
-  } finally {
-    modelPicker.disabled = false;
-  }
-});
-
-loadChatModels();
+    ev.preventDefault();
+    const buttons = Array.from(
+      chatModeToggle.querySelectorAll(".chat-mode-btn"),
+    );
+    const current = buttons.findIndex(
+      (b) => b.getAttribute("aria-checked") === "true",
+    );
+    const dir =
+      ev.key === "ArrowRight" || ev.key === "ArrowDown" ? 1 : -1;
+    const next = (current + dir + buttons.length) % buttons.length;
+    setChatMode(buttons[next].dataset.mode);
+    buttons[next].focus();
+  });
+  setChatMode(getChatMode()); // init from localStorage
+}
 
 // TTS toggle ------------------------------------------------------
 // SVGs defined up-front so renderTtsToggle() can use them on initial
@@ -2152,6 +2136,7 @@ async function send(question, opts = {}) {
       question,
       session_id: sessionId,
       vault_scope: vaultScope || null,
+      mode: getChatMode(),
     };
     if (opts.redo_turn_id) reqBody.redo_turn_id = opts.redo_turn_id;
     if (opts.hint) reqBody.hint = opts.hint;
@@ -2771,12 +2756,6 @@ document.querySelectorAll(".topbar-title").forEach((brand) => {
       vaultPicker.dispatchEvent(new Event("change"));
     });
   }
-  if (sheetModelPicker && modelPicker) {
-    sheetModelPicker.addEventListener("change", () => {
-      modelPicker.value = sheetModelPicker.value;
-      modelPicker.dispatchEvent(new Event("change"));
-    });
-  }
   if (sheetTtsToggle && ttsToggle) {
     // TTS toggle es un button (no select). Tap en el sheet = click en
     // el original → el handler original toggle state + persiste.
@@ -2826,11 +2805,6 @@ function syncSheetFromOriginals() {
   if (sheetVaultPicker && vaultPicker) {
     sheetVaultPicker.innerHTML = vaultPicker.innerHTML;
     sheetVaultPicker.value = vaultPicker.value;
-  }
-  // Model picker: idem.
-  if (sheetModelPicker && modelPicker) {
-    sheetModelPicker.innerHTML = modelPicker.innerHTML;
-    sheetModelPicker.value = modelPicker.value;
   }
   // TTS toggle: reflejar aria-pressed + actualizar el label textual.
   if (sheetTtsToggle && ttsToggle) {
@@ -3256,77 +3230,23 @@ updateChatEmptyState();
 // ═══════════════════════════════════════════════════════════════════════
 // Composer toolbar wiring (2026-04-24) — claude.ai-style controls
 // ═══════════════════════════════════════════════════════════════════════
-// Tres piezas nuevas en la bottom-row del composer:
+// Dos piezas activas en la bottom-row del composer:
 //   · #composer-plus-btn     → abre el help modal (MVP; más adelante
 //                               puede ser un menú de attach/voice/etc)
-//   · #composer-model-badge  → muestra el modelo activo, al click
-//                               scrollea a la sidebar + focusea el
-//                               #model-picker (si el sidebar está
-//                               collapsed lo expande primero)
 //   · #composer-mic-btn      → stub "próximamente" — whisper-cli STT
 //                               ya existe en el proyecto pero wiring
 //                               al browser es otro feature
 // + Quick-chips: al click rellenan #input con data-query y submitean.
+// (El badge de modelo se removió junto con el model-picker cuando
+// pasamos al toggle de modo auto/rápido/profundo en la sidebar.)
 // ═══════════════════════════════════════════════════════════════════════
 
 const composerPlusBtn = document.getElementById("composer-plus-btn");
-const composerModelBadge = document.getElementById("composer-model-badge");
-const composerModelName = composerModelBadge?.querySelector(".composer-model-name");
 const composerMicBtn = document.getElementById("composer-mic-btn");
 
 // ── Plus button: abre el help modal (atajos + slash commands) ──
 if (composerPlusBtn && helpBtn) {
   composerPlusBtn.addEventListener("click", () => helpBtn.click());
-}
-
-// ── Model badge: refleja el valor actual del #model-picker de la
-// sidebar, y al click expande la sidebar + focusea el picker para que
-// el user cambie el modelo con la dropdown nativa. Es un shortcut
-// visual que evita tener que navegar a la sidebar para saber qué
-// modelo se está usando. ──
-function updateComposerModelBadge() {
-  if (!composerModelName || !modelPicker) return;
-  const selected = modelPicker.options[modelPicker.selectedIndex];
-  const label = (selected?.textContent || "").trim();
-  // El texto del option suele ser "qwen2.5:7b (activo)" — limpiamos el
-  // sufijo para no duplicar la info visual (el badge ya implica "activo").
-  composerModelName.textContent = label.replace(/\s*\(activo\)\s*$/i, "")
-                                       .replace(/\s*\(disponible\)\s*$/i, "")
-                                       || "modelo";
-}
-if (modelPicker) {
-  modelPicker.addEventListener("change", updateComposerModelBadge);
-  // MutationObserver para cuando el modelPicker se popula async (fetch
-  // de /api/chat/model). Sin esto el badge arranca en "…" y no se
-  // actualiza nunca hasta que el user cambia manualmente.
-  new MutationObserver(updateComposerModelBadge)
-    .observe(modelPicker, { childList: true, characterData: true, subtree: true });
-  updateComposerModelBadge();
-}
-if (composerModelBadge && modelPicker) {
-  composerModelBadge.addEventListener("click", () => {
-    // En desktop collapsed, expandir primero — sin esto el <select>
-    // queda invisible detrás del sidebar colapsado.
-    const isCollapsed = sidebar?.getAttribute("data-state") === "collapsed";
-    const isDesktop = window.matchMedia("(min-width: 768px)").matches;
-    if (isCollapsed && isDesktop) {
-      sidebarCollapseBtn?.click();
-    }
-    // En mobile, abrir el drawer.
-    const isMobile = window.matchMedia("(max-width: 767px)").matches;
-    if (isMobile && typeof openSidebarMobile === "function") {
-      openSidebarMobile();
-    }
-    // Scroll + focus + abrir la dropdown nativa. showPicker() es Chrome
-    // 99+ / Safari 16.4+ — si no existe, focus() al menos lleva el
-    // keyboard nav ahí y el user toca Space/Enter para abrir.
-    setTimeout(() => {
-      modelPicker.focus();
-      if (typeof modelPicker.showPicker === "function") {
-        try { modelPicker.showPicker(); } catch (_) {}
-      }
-    }, 120);
-  });
 }
 
 // ── Mic button: stub — muestra un system message explicando que viene. ──

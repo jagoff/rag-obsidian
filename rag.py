@@ -894,10 +894,67 @@ atexit.register(_flush_background_sql_queue)
 # operator notices telemetry degradation without having to grep the file.
 # Set RAG_SILENT_LOG_ALERT_THRESHOLD to a very large value (e.g. 999999) to
 # effectively mute the alert in environments where silent errors are expected.
+#
+# Audit 2026-04-24: el counter pre-fix SOLO lo incrementaba `_silent_log()`.
+# `_log_sql_state_error()` (donde van todos los fails de SQL writes/reads via
+# `_sql_write_with_retry` + readers) escribía directo al jsonl sin tocar el
+# counter. Resultado: 1756 errores SQL en 6 días (post semantic-cache wiring
+# 2026-04-22) nunca dispararon un solo alert — el operador quedó ciego al
+# bug más grave de los últimos 6 días. Fix: `_bump_silent_log_counter()`
+# helper compartido + invocado desde ambas funciones. El counter es unificado
+# — un spike de errores en cualquiera de los dos paths dispara la misma
+# notificación a stderr.
 _SILENT_LOG_COUNTER: dict = {"count": 0, "last_alert_ts": 0.0}
 _SILENT_LOG_COUNTER_LOCK = threading.Lock()
 _SILENT_LOG_ALERT_THRESHOLD = int(os.environ.get("RAG_SILENT_LOG_ALERT_THRESHOLD", "20"))
 _SILENT_LOG_ALERT_INTERVAL = 3600.0  # seconds between repeated alerts (1h)
+
+
+def _bump_silent_log_counter() -> None:
+    """Incrementa el counter compartido de silent errors y, si pasó el
+    threshold dentro del interval window, escribe una WARNING a stderr.
+
+    Usado por `_silent_log` (swallowed exceptions generales) y
+    `_log_sql_state_error` (fails del SQL write/read path). Counter único
+    para que un spike en cualquier sink dispare la misma señal.
+
+    Orden de operaciones: mutación del state bajo lock primero, stderr
+    write después SIN lock. Si stderr falla (pipe closed, disk full, etc.)
+    el counter ya se reseteó correctamente — evitamos el bug donde un
+    stderr broken dejaba el counter clavado en >= threshold y cada bump
+    siguiente re-disparaba el write condition inútilmente.
+
+    Jamás raisea — si el lock, time, o stderr fallan, se come la excepción
+    (silent-fail contract de las funciones caller).
+    """
+    alert_count = None
+    try:
+        with _SILENT_LOG_COUNTER_LOCK:
+            _SILENT_LOG_COUNTER["count"] += 1
+            _now = time.time()
+            if (
+                _SILENT_LOG_COUNTER["count"] >= _SILENT_LOG_ALERT_THRESHOLD
+                and _now - _SILENT_LOG_COUNTER["last_alert_ts"] > _SILENT_LOG_ALERT_INTERVAL
+            ):
+                # Captura el count ANTES del reset para incluirlo en el mensaje.
+                alert_count = _SILENT_LOG_COUNTER["count"]
+                _SILENT_LOG_COUNTER["last_alert_ts"] = _now
+                _SILENT_LOG_COUNTER["count"] = 0
+    except Exception:
+        return
+
+    # Stderr write fuera del lock — I/O blocking no bloquea otros bumps.
+    # Si falla, el counter ya está consistente.
+    if alert_count is not None:
+        try:
+            sys.stderr.write(
+                f"[rag/telemetry] WARNING: {alert_count} silent errors "
+                f"en la última hora (ver ~/.local/share/obsidian-rag/"
+                f"silent_errors.jsonl + sql_state_errors.jsonl)\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _silent_log(where: str, exc: BaseException) -> None:
@@ -934,20 +991,7 @@ def _silent_log(where: str, exc: BaseException) -> None:
         _LOG_QUEUE.put_nowait((SILENT_ERRORS_LOG_PATH, line))
     except Exception:
         pass
-    with _SILENT_LOG_COUNTER_LOCK:
-        _SILENT_LOG_COUNTER["count"] += 1
-        _now = time.time()
-        if (
-            _SILENT_LOG_COUNTER["count"] >= _SILENT_LOG_ALERT_THRESHOLD
-            and _now - _SILENT_LOG_COUNTER["last_alert_ts"] > _SILENT_LOG_ALERT_INTERVAL
-        ):
-            sys.stderr.write(
-                f"[rag/telemetry] WARNING: {_SILENT_LOG_COUNTER['count']} silent errors "
-                f"en la última hora (ver ~/.local/share/obsidian-rag/silent_errors.jsonl)\n"
-            )
-            sys.stderr.flush()
-            _SILENT_LOG_COUNTER["last_alert_ts"] = _now
-            _SILENT_LOG_COUNTER["count"] = 0
+    _bump_silent_log_counter()
 
 
 def _log_collection_op(op: str, collection_name: str, extra: dict | None = None) -> None:
@@ -5427,6 +5471,14 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
     pollute analytics. Post-T10 this is the only visible signal when a SQL
     writer/reader raises — the fallback path is gone, so the event is
     dropped after logging here.
+
+    Audit 2026-04-24: pre-fix esta función NO incrementaba el counter
+    compartido `_SILENT_LOG_COUNTER` que dispara el stderr alert a los 20
+    errores/hora. Resultado: 1756 fails SQL en 6 días (curva
+    102/38/123/456/946/91 del 19 al 24/04) sin una sola señal audible —
+    el operador quedó ciego al bug más grave del período. Post-fix el
+    bump al counter unifica la observabilidad: un spike en CUALQUIERA de
+    las dos sinks dispara el mismo alert.
     """
     try:
         _SQL_STATE_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -5436,6 +5488,7 @@ def _log_sql_state_error(event_type: str, **fields) -> None:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
+    _bump_silent_log_counter()
 
 
 # Errores de `sqlite3.OperationalError` que son TRANSIENT — vale la pena

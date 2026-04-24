@@ -4613,6 +4613,74 @@ def _sanitize_confidence(confidence) -> float:
     return c
 
 
+def _validate_retrieve_result(result: dict) -> dict:
+    """Normaliza y valida el shape que devuelve `multi_retrieve()` in-place.
+
+    El chat endpoint consume `result["docs"]`, `["metas"]`, `["scores"]`,
+    `["confidence"]` en múltiples sitios (zip loops, frontmatter, LLM
+    context). Si alguno está mal formado — longitudes distintas, metas
+    que no son dicts, confidence que es None/NaN — el handler crashea
+    con `KeyError`/`TypeError` a mitad del SSE stream (respuesta 500
+    después de que el frontend ya mostró "generando…") o peor, silent
+    mis-attribution: el `zip(metas, scores)` trunca al corto y el user
+    ve fuentes con scores desalineados.
+
+    Esta helper normaliza el dict UNA vez, inmediatamente después del
+    retrieve, para que el resto del handler pueda asumir:
+      - `docs`, `metas`, `scores` son listas del MISMO largo.
+      - cada meta es un dict (nunca None, str, int).
+      - `confidence` es un float válido (nunca NaN/Inf/None/str).
+
+    Si las longitudes discrepan las trunca al minimo común y loguea
+    `[retrieve-shape-mismatch]` para diagnóstico — mucho mejor que
+    silent mis-attribution. La truncación es defensiva, no punitiva:
+    preferimos que el user vea 2 fuentes correctas que 3 con 1
+    desalineada. Muta `result` in-place porque los callers esperan el
+    mismo objeto que devolvió `multi_retrieve` (el dict también carga
+    `query_variants`, `filters_applied`, `fast_path`, `intent`, etc.
+    que no queremos perder al copiar).
+
+    Introducido 2026-04-24 como defense-in-depth tras audit que
+    encontró 3 sitios con crashes latentes: `result["confidence"]`
+    (line ~5517), `m["file"]` en set comprehension (line ~5519), y
+    zips de metas/scores + docs/metas sin validación (lines 5556,
+    5722). Todos pasaban tests con retrieves mockeados "perfectos"
+    pero explotarían si `rag.py` devolviera un shape raro (bug
+    downstream, data corruption, Ollama OOM mid-embedding, etc.).
+    """
+    docs = list(result.get("docs") or [])
+    metas_raw = list(result.get("metas") or [])
+    scores = list(result.get("scores") or [])
+
+    # Coerce cada meta a dict — si viene None/str/int por bug downstream,
+    # reemplazamos con {} vacío (el source_payload renderer sabe manejar
+    # ese caso con .get()). Preservamos el orden para no desalinear
+    # contra docs/scores.
+    metas: list[dict] = []
+    for m in metas_raw:
+        metas.append(m if isinstance(m, dict) else {})
+
+    # Truncar al minimo común si hay mismatch. Prefer warning silencioso
+    # vs crash + mis-attribution.
+    n = min(len(docs), len(metas), len(scores))
+    if n < max(len(docs), len(metas), len(scores)):
+        print(
+            f"[retrieve-shape-mismatch] docs={len(docs)} metas={len(metas)} "
+            f"scores={len(scores)} → truncating to {n} for safety",
+            flush=True,
+        )
+
+    result["docs"] = docs[:n]
+    result["metas"] = metas[:n]
+    result["scores"] = scores[:n]
+    # Confidence: siempre float válido. `_sanitize_confidence` ya cubre
+    # NaN/Inf/None/str/garbage, pero lo llamamos explícito para que el
+    # resto del handler pueda asumir que `result["confidence"]` es
+    # siempre accesible sin KeyError y siempre numeric.
+    result["confidence"] = _sanitize_confidence(result.get("confidence"))
+    return result
+
+
 def _persist_conversation_turn(
     vault_root: Path,
     session_id: str,
@@ -5460,6 +5528,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 exclude_path_prefixes=("00-Inbox/conversations/",),
                 intent=_intent_for_log,
             )
+            # Normalizar shape del result ANTES de cualquier acceso
+            # downstream. Garantiza len(docs) == len(metas) == len(scores),
+            # metas dicts (nunca None/str), confidence float válido.
+            # Defense-in-depth contra bugs en rag.py o Ollama mid-embed.
+            # Ver `_validate_retrieve_result` docstring para detalle.
+            result = _validate_retrieve_result(result)
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
             yield _sse("error", {"message": f"retrieve falló: {exc}"})
@@ -5516,7 +5590,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # confidence is low, or acknowledge when only one note exists).
         _conf = float(result["confidence"])
         _, _conf_label = _confidence_badge(_conf)
-        _n_notes = len({m["file"] for m in result["metas"]})
+        # `.get("file", "")` defensive: aunque `_validate_retrieve_result`
+        # garantiza que cada meta es un dict, no podemos asumir que
+        # siempre tiene la key `"file"` (rag.py metadata schema podría
+        # migrar y dejar notas viejas sin el campo). Set con "" como
+        # fallback dedupea correctamente — múltiples metas sin file
+        # colapsan a una única entrada vacía en el count.
+        _n_notes = len({m.get("file", "") for m in result["metas"]})
         _n_variants = len(result.get("query_variants", []))
         _filters = result.get("filters_applied") or {}
         retrieval_signals = {

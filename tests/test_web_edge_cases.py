@@ -337,3 +337,144 @@ def test_save_vaults_config_is_atomic(tmp_path, monkeypatch):
     import json
     loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert loaded == cfg
+
+
+# ── `_validate_retrieve_result` — defense-in-depth regressor ──────────────
+
+
+class TestValidateRetrieveResult:
+    """Audit 2026-04-24 surfaced 3 sitios en web/server.py donde el handler
+    accedía a `result["confidence"]` / `m["file"]` / `zip(metas, scores)`
+    sin validar el shape. `_validate_retrieve_result` corre una vez después
+    del retrieve y garantiza invariantes para el resto del handler.
+
+    Tests cubren:
+      1. Happy path: shape correcto → passthrough.
+      2. Lengths mismatch → truncate al min común + log.
+      3. Metas malformadas (None/str/int) → coerce a `{}`.
+      4. Confidence None/NaN/Inf/str → 0.0 via `_sanitize_confidence`.
+      5. Missing keys → default vacío sin crash.
+    """
+
+    def test_happy_path_preserves_shape(self):
+        from web.server import _validate_retrieve_result
+        result = {
+            "docs": ["doc1", "doc2"],
+            "metas": [{"file": "A.md"}, {"file": "B.md"}],
+            "scores": [0.9, 0.7],
+            "confidence": 0.85,
+            "query_variants": ["v1"],  # extra fields preservados
+        }
+        out = _validate_retrieve_result(result)
+        assert out is result  # mutación in-place
+        assert len(out["docs"]) == 2
+        assert len(out["metas"]) == 2
+        assert len(out["scores"]) == 2
+        assert out["confidence"] == 0.85
+        assert out["query_variants"] == ["v1"]  # preservado
+
+    def test_mismatch_truncates_to_min(self, capsys):
+        """docs=3, metas=2, scores=3 → truncate todos a 2."""
+        from web.server import _validate_retrieve_result
+        result = {
+            "docs": ["d1", "d2", "d3"],
+            "metas": [{"file": "A.md"}, {"file": "B.md"}],
+            "scores": [0.9, 0.8, 0.7],
+            "confidence": 0.5,
+        }
+        _validate_retrieve_result(result)
+        assert len(result["docs"]) == 2
+        assert len(result["metas"]) == 2
+        assert len(result["scores"]) == 2
+        # El tercer doc/score se descartó — el handler ya no puede mis-attribuir.
+        assert "d3" not in result["docs"]
+        # Log del mismatch visible para operators.
+        out = capsys.readouterr().out
+        assert "[retrieve-shape-mismatch]" in out
+        assert "docs=3" in out
+        assert "metas=2" in out
+        assert "truncating to 2" in out
+
+    def test_metas_non_dict_coerced_to_empty_dict(self):
+        """Si rag.py devuelve un meta None/str/int (bug downstream), el
+        validator lo reemplaza con `{}` para que `m.get("file", "")`
+        después no crashee."""
+        from web.server import _validate_retrieve_result
+        result = {
+            "docs": ["d1", "d2", "d3", "d4"],
+            "metas": [{"file": "A.md"}, None, "broken", 42],
+            "scores": [0.9, 0.8, 0.7, 0.6],
+            "confidence": 0.5,
+        }
+        _validate_retrieve_result(result)
+        # Los 3 malformados se reemplazaron con `{}`, sin perder slot.
+        assert len(result["metas"]) == 4
+        assert result["metas"][0] == {"file": "A.md"}
+        assert result["metas"][1] == {}
+        assert result["metas"][2] == {}
+        assert result["metas"][3] == {}
+
+    def test_confidence_sanitized(self):
+        """NaN / Inf / None / str → 0.0. float válido pasa."""
+        import math
+        from web.server import _validate_retrieve_result
+        for bad in (float("nan"), float("inf"), float("-inf"), None, "xyz", [], {}):
+            result = {"docs": [], "metas": [], "scores": [], "confidence": bad}
+            _validate_retrieve_result(result)
+            conf = result["confidence"]
+            assert isinstance(conf, float)
+            assert not math.isnan(conf)
+            assert not math.isinf(conf)
+            assert conf == 0.0
+
+    def test_missing_keys_default_to_empty(self):
+        """Result completamente vacío (caller esperaba {"docs":[],...} pero
+        le llegó {}) no crashea."""
+        from web.server import _validate_retrieve_result
+        result: dict = {}
+        _validate_retrieve_result(result)
+        assert result["docs"] == []
+        assert result["metas"] == []
+        assert result["scores"] == []
+        assert result["confidence"] == 0.0
+
+    def test_none_values_handled_like_missing(self):
+        """Si rag.py devuelve `None` en alguna key (en vez de lista vacía),
+        lo tratamos igual que missing — no crashamos con `TypeError:
+        'NoneType' object is not iterable`."""
+        from web.server import _validate_retrieve_result
+        result = {
+            "docs": None,
+            "metas": None,
+            "scores": None,
+            "confidence": None,
+        }
+        _validate_retrieve_result(result)
+        assert result["docs"] == []
+        assert result["metas"] == []
+        assert result["scores"] == []
+        assert result["confidence"] == 0.0
+
+    def test_all_empty_is_valid(self):
+        """Retrieve sin hits — `docs=[]`, `metas=[]`, `scores=[]` es
+        estado legítimo. No debe tratarse como mismatch."""
+        from web.server import _validate_retrieve_result
+        result = {
+            "docs": [], "metas": [], "scores": [],
+            "confidence": float("-inf"),  # sentinel de rag.py
+        }
+        _validate_retrieve_result(result)
+        assert result["docs"] == []
+        assert result["confidence"] == 0.0  # -inf sanitized
+
+    def test_only_missing_confidence_crashes_handler_fix(self):
+        """Regression: handler acceso `float(result["confidence"])` sin
+        .get(), crasheaba si rag.py omitía la key. Post-fix: validator
+        normaliza → `result["confidence"] = 0.0`."""
+        from web.server import _validate_retrieve_result
+        result = {"docs": ["d"], "metas": [{"file": "A"}], "scores": [0.5]}
+        # No hay "confidence" — pre-fix sería KeyError en float(result["confidence"]).
+        _validate_retrieve_result(result)
+        assert result["confidence"] == 0.0
+        # Ahora el handler puede hacer float(result["confidence"]) sin riesgo.
+        assert isinstance(result["confidence"], float)

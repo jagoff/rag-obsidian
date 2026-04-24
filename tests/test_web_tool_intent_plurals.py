@@ -255,9 +255,10 @@ def test_hint_forbids_vague_fallback_vocabulary():
 
 def test_source_intent_label_covers_exactly_source_specific_tools():
     """`_SOURCE_INTENT_LABEL` debe tener entradas para los tools que
-    buscan data real del usuario (gmail, calendar, reminders, drive) y
-    NO tener entradas para weather / finance_summary (no son "fuentes"
-    buscables — son resúmenes autogenerados).
+    buscan data real del usuario (gmail, calendar, reminders, drive,
+    whatsapp_pending, whatsapp_search) y NO tener entradas para
+    weather / finance_summary (no son "fuentes" buscables — son
+    resúmenes autogenerados).
     """
     assert set(_SOURCE_INTENT_LABEL.keys()) == {
         "gmail_recent",
@@ -265,6 +266,7 @@ def test_source_intent_label_covers_exactly_source_specific_tools():
         "reminders_due",
         "drive_search",
         "whatsapp_pending",
+        "whatsapp_search",
     }
     # Cada entrada tiene la forma (etiqueta_humana, section_header).
     for name, (label, section) in _SOURCE_INTENT_LABEL.items():

@@ -28,12 +28,13 @@ from rag import (  # noqa: E402
     _agent_tool_read_note,
     _agent_tool_search,
     _agent_tool_weather,
+    _agent_tool_whatsapp_search,
     _fetch_gmail_evidence,
     _fetch_reminders_due,
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 12 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 13 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -42,7 +43,8 @@ Routing por palabra clave (si aparece → llamá la tool):
 - evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
 - clima/tiempo/lluvia/temperatura/pronóstico → weather
 - google drive/drive/planilla/spreadsheet/sheet/doc/documento/presentación → drive_search(query='<keywords extraídos>'). Extraé los tokens útiles (nombres propios, sustantivos concretos) y descartá "busca", "decime", "en mi", "drive" — ej. "busca en mi drive qué me adeuda Alexis de la macbook pro" → drive_search(query='alexis macbook pro adeuda').
-- whatsapp/wzp/wsp/chat pendiente/respuesta pendiente → whatsapp_pending. Devuelve los chats donde el user debe responder. Usalo también en queries "qué tengo pendiente esta semana/hoy" — los chats pendientes cuentan como tarea pendiente semántica.
+- whatsapp/wzp/wsp + "chat pendiente"/"respuesta pendiente"/"qué tengo pendiente" → whatsapp_pending. Devuelve la LISTA de chats donde el user debe responder (último inbound sin reply). Sólo lista chats; NO busca en contenido. Usalo también en queries "qué tengo pendiente esta semana/hoy" — los chats pendientes cuentan como tarea pendiente semántica.
+- "qué me dijo X / qué me mandó X / cuándo hablamos de Y / el chat donde X mencionó Z / dónde charlamos sobre W" → whatsapp_search(query='<tema o palabras clave>', contact='<nombre opcional>'). Busca DENTRO del contenido de los mensajes WhatsApp (4500+ chunks indexados). Si el user nombra un contacto explícito ("qué me dijo Juan sobre la deuda") pasá `contact='Juan'` para filtrar; si la pregunta es genérica ("dónde charlamos sobre la mudanza") dejá `contact=None`. Es DISTINTO a `whatsapp_pending` — éste busca por CONTENIDO, no lista chats abiertos.
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
@@ -264,6 +266,33 @@ def drive_search(query: str, max_files: int = 5) -> str:
     return _agent_tool_drive_search(query, max_files=max_files)
 
 
+def whatsapp_search(query: str, contact: str | None = None, k: int = 5) -> str:
+    """Buscar en mis conversaciones de WhatsApp por contenido (semantic + BM25 + rerank).
+
+    Distinto a `whatsapp_pending` (que sólo lista chats sin respuesta):
+    este tool busca DENTRO del contenido de los mensajes indexados
+    (corpus WA local, ~4500 chunks). Usalo cuando el user pregunta
+    "qué me dijo X sobre Y", "cuándo hablamos de Z con M", "el chat
+    donde N mencionó algo".
+
+    Args:
+        query: Tema/palabras clave a buscar en lenguaje natural
+            (ej. "deuda macbook", "turno con el doctor", "mudanza").
+        contact: Nombre del contacto a filtrar (resolved via Apple
+            Contacts → JID). Si no se resuelve, busca sin filtro y
+            agrega un `warning` al output.
+        k: Cantidad máxima de mensajes a devolver (1–8, default 5).
+
+    Returns:
+        JSON `{query, contact_filter, messages: [{jid, contact, ts,
+        who: "inbound"|"outbound", text, score}], warning?, error?}`.
+        Snippets capados a 400 chars. Si retrieve raisea o el corpus
+        está vacío → `{messages: [], error: "..."}`.
+    """
+    k = max(1, min(8, int(k)))
+    return _agent_tool_whatsapp_search(query, contact=contact, k=k)
+
+
 def whatsapp_pending(hours: int = 48, max_chats: int = 10) -> str:
     """WhatsApp chats esperando respuesta del user — último inbound sin reply.
 
@@ -314,6 +343,7 @@ CHAT_TOOLS: list[Callable] = [
     weather,
     drive_search,
     whatsapp_pending,
+    whatsapp_search,
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,
@@ -329,6 +359,7 @@ PARALLEL_SAFE: set[str] = {
     "gmail_recent",
     "drive_search",
     "whatsapp_pending",
+    "whatsapp_search",
     "propose_reminder",
     "propose_calendar_event",
     # `propose_whatsapp_send` intencionalmente NO está acá: aunque el tool

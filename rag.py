@@ -16548,6 +16548,13 @@ def retrieve(
     scores = reranker.predict(pairs, show_progress_bar=False)
     _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
 
+    # Capturar el comienzo del score-loop block (scoring + recency + tag +
+    # title_match + PPR + behavior priors). Este rango es el gap más
+    # grande entre rerank_ms y graph_expand_ms según producción 2026-04-24:
+    # queries web mostraban total_ms≈5000 con sum-of-stages≈1500, 3.5s
+    # unaccounted. Ver _timing["score_loop_ms"] asignación más abajo.
+    _t_score_loop_start = time.perf_counter()
+
     # Recency boost: when the query carries a temporal cue ("últimamente",
     # "este mes", "recientes"…), reweight by how fresh each note is. Second
     # term `recency_always` applies the same decay without a cue gate — lets
@@ -16821,6 +16828,11 @@ def retrieve(
         final_scores = raw_scores
     top_score = final_scores[0] if final_scores else float("-inf")
     extras: list[tuple[str, dict]] = [(e, c[1]) for c, e, _ in extras_pairs]
+
+    # Cerrar el score-loop timing ANTES del graph-expand. Cubre scoring +
+    # recency + tag_literal + title_match + PPR + behavior_priors + sort +
+    # calibration. El graph-expand se mide aparte.
+    _timing["score_loop_ms"] = (time.perf_counter() - _t_score_loop_start) * 1000
 
     # ── Graph expansion: weighted 2-hop wikilink neighbors of top results ──
     # Adds context from linked notes that didn't match semantically but are

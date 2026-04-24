@@ -123,7 +123,15 @@ def test_retrieve_timing_keys_expected(monkeypatch):
     timing = result["timing"]
     # The full-pass timing dict always has these keys populated.
     # Rounding/type is checked separately in _round_timing_ms tests.
-    expected_keys = {"embed_ms", "sem_ms", "bm25_ms", "rrf_ms", "rerank_ms", "total_ms"}
+    # `score_loop_ms` added 2026-04-24 para cubrir el gap entre
+    # rerank_ms y graph_expand_ms (recency + tag + title_match + PPR +
+    # behavior_priors + sort + calibration). Pre-fix el bloque era
+    # invisible en el timing dict — prod mostraba `total_ms=5000` con
+    # sum-of-stages=1500 y 3.5s unaccounted.
+    expected_keys = {
+        "embed_ms", "sem_ms", "bm25_ms", "rrf_ms", "rerank_ms",
+        "score_loop_ms", "total_ms",
+    }
     missing = expected_keys - set(timing.keys())
     assert not missing, f"expected timing keys missing: {missing}"
     # All values should be positive floats (perf_counter deltas).

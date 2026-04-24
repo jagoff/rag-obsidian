@@ -2425,6 +2425,133 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     return {"ok": True, "jid": jid}
 
 
+class MailSendRequest(BaseModel):
+    to: str
+    subject: str
+    body: str
+    cc: str | None = None
+    bcc: str | None = None
+    proposal_id: str | None = None  # for audit — id of the draft the UI confirmed
+
+
+@app.post("/api/mail/send")
+def mail_send(req: MailSendRequest) -> dict:
+    """Execute a Gmail send after the user clicked [Enviar] on a
+    ``propose_mail_send`` proposal card.
+
+    Flow idéntico al de WhatsApp:
+      1. `propose_mail_send` (chat tool) genera la propuesta + emite SSE
+         `proposal` con ``kind="mail"``.
+      2. La UI renderiza la card con [Enviar] / [Editar] / [Descartar]
+         + textareas editables para subject / body.
+      3. En [Enviar] la UI postea acá con `{to, subject, body, cc?,
+         bcc?, proposal_id?}`. Llamamos a ``rag._send_gmail`` que usa
+         los creds gmail.modify de ``~/.gmail-mcp/credentials.json``.
+
+    Errores:
+      - 400 si `to` vacío / inválido, o `body` vacío (subject vacío se
+        rellena con "(sin asunto)" silenciosamente).
+      - 502 si Gmail API rechaza (creds revocadas, rate limit, etc.) —
+        devolvemos el ``error`` del helper como detail.
+
+    Rate-limit implícito: mismo bucket que ``/api/chat`` porque reusa la
+    auth del mismo OAuth client. No se loggea el body (privacy) —
+    solo el event + to + proposal_id para correlacionar con el turno.
+    """
+    to_clean = (req.to or "").strip()
+    body_clean = (req.body or "").strip()
+    if not to_clean or "@" not in to_clean:
+        raise HTTPException(status_code=400, detail="to inválido (debe ser un email con @)")
+    if not body_clean:
+        raise HTTPException(status_code=400, detail="body vacío")
+    from rag import _send_gmail  # noqa: PLC0415
+    result = _send_gmail(
+        to_clean,
+        (req.subject or "").strip() or "(sin asunto)",
+        body_clean,
+        cc=req.cc,
+        bcc=req.bcc,
+    )
+    if not result.get("ok"):
+        detail = result.get("error") or "Gmail API no respondió"
+        raise HTTPException(status_code=502, detail=f"mail no enviado: {detail}")
+    try:
+        import rag as _rag  # noqa: PLC0415
+        _rag._ambient_log_event({
+            "cmd": "mail_user_send",
+            "to": to_clean,
+            "len": len(body_clean),
+            "proposal_id": req.proposal_id or "",
+            "message_id": result.get("message_id", ""),
+            "sent": True,
+        })
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "to": to_clean,
+        "message_id": result.get("message_id", ""),
+        "thread_id": result.get("thread_id", ""),
+    }
+
+
+@app.get("/api/contacts")
+def list_contacts(q: str = "", kind: str = "any", limit: int = 20) -> dict:
+    """Contact picker para el popover de ``/wzp`` y ``/mail`` del web chat.
+
+    Filtra el cache local de Apple Contacts (``_load_contacts_phone_index``)
+    por substring normalizado del nombre — sin acentos, case-insensitive.
+    No usa embeddings a propósito: los nombres son strings cortos (≤20
+    chars) donde los embeddings no agregan relevancia real y sí latencia.
+
+    Query params:
+        q: Substring a matchear (plegado con ``_fold``). Vacío → primeros
+            ``limit`` contactos ordenados alfabéticamente (útil para
+            mostrar algo apenas el user typea ``/wzp ``).
+        kind: ``phone`` | ``email`` | ``any``. Filtra contactos que
+            tengan el canal requerido — para ``/wzp`` el popover pide
+            ``phone`` (sin teléfono no podemos mandar WA) y para
+            ``/mail`` pide ``email``.
+        limit: Máx. resultados (1–100, default 20).
+
+    Returns:
+        ``{contacts: [{name, phones, emails, score}], query, kind}``.
+        ``score`` es 3 (exacto) / 2 (prefix) / 1 (substring) / 0 (sin
+        query — orden alfabético). Si el cache está frío / osascript
+        falla silently, devuelve lista vacía con los mismos headers.
+
+    **Seguridad**: este endpoint expone nombre + teléfono + email de
+    todos los contactos del user. No hay auth — el server está bound
+    a ``127.0.0.1`` por default; si se expone al LAN (ver
+    ``OBSIDIAN_RAG_ALLOW_LAN`` en ``web/server.py`` y ``CLAUDE.md``)
+    el riesgo queda en el mismo perímetro que el resto de la data
+    del vault. No loggear los resultados.
+    """
+    from rag import _fuzzy_filter_contacts  # noqa: PLC0415
+    kind_norm = (kind or "any").strip().lower()
+    if kind_norm not in {"any", "phone", "email"}:
+        kind_norm = "any"
+    # `int(limit or 20)` no anda con limit=0 (cae al default de 20). FastAPI
+    # ya nos da 20 cuando el query param falta — acá sólo clampamos el rango.
+    limit_norm = max(1, min(100, int(limit) if isinstance(limit, int) else 20))
+    try:
+        contacts = _fuzzy_filter_contacts(q or "", kind=kind_norm, limit=limit_norm)
+    except Exception as exc:
+        # Silent-fail: el popover no puede bloquear el chat. Devolvemos
+        # vacío y loggeamos para debugging.
+        try:
+            import rag as _rag  # noqa: PLC0415
+            _rag._silent_log("api_contacts", exc)
+        except Exception:
+            pass
+        contacts = []
+    return {
+        "contacts": contacts,
+        "query": q or "",
+        "kind": kind_norm,
+    }
+
+
 @app.get("/api/model")
 def get_chat_model() -> dict:
     """Return the chat model that /api/chat would use right now."""
@@ -8165,6 +8292,194 @@ def status_action(req: StatusActionRequest) -> dict:
         "stdout": (out.stdout or "").strip(),
         "stderr": (out.stderr or "").strip(),
     }
+
+
+# ── /api/status/latency — serie p50/p95 para el sparkline del /status ─
+# Lee rag_queries (cmd LIKE 'web%', extra_json.total_ms) y bucketiza las
+# últimas 24h en percentiles horarios con window functions (nearest-rank,
+# mismo método que test_analytics_p50_over_ttft_ms). Suma un baseline 7d
+# para que la UI muestre "last-hour p95 vs typical p95" — la regresión
+# de latencia es el síntoma más común que el semáforo binario no captura.
+#
+# Presupuesto: típicamente ~24h × ~50 queries/h ~= 1200 rows (ix_rag_
+# queries_cmd_ts covering index la vuelve sub-50ms). Cacheado 60s porque
+# los buckets horarios no cambian mid-hour y el /status polea cada 10s.
+#
+# Schema del payload (contract con status.js):
+#   {
+#     "window_hours": 24, "bucket": "hour",
+#     "series": [                  # 25 elementos (hora actual incluida)
+#       {"ts": "2026-04-24T12:00:00Z", "count": 42,
+#        "p50_ms": 2100, "p95_ms": 8700, "p99_ms": 14200}, ...
+#     ],
+#     "summary": {
+#       "p50_1h_ms": ..., "p95_1h_ms": ...,
+#       "p50_baseline_ms": ..., "p95_baseline_ms": ...,   # 7d percentiles
+#       "delta_p95_pct": -15.3,                           # vs baseline
+#       "count_24h": 342,
+#     },
+#   }
+# Valores null para buckets vacíos (el frontend les pone gap en el SVG).
+
+_LATENCY_CACHE_TTL = 60.0
+_LATENCY_CACHE: dict = {"ts": 0.0, "payload": None}
+_LATENCY_CACHE_LOCK = threading.Lock()
+
+
+def _status_latency_build_payload() -> dict:
+    """Build the latency series + summary payload for /api/status/latency.
+
+    Percentiles use the nearest-rank method per SQL window function — the
+    same pattern as test_web_stage_timing_persisted::test_analytics_p50_
+    over_ttft_ms so the contract stays consistent across analytics surfaces.
+    Empty buckets are filled with nulls so the frontend gets a predictable
+    25-element series (24 hours back + current) regardless of traffic.
+    """
+    now = datetime.now(timezone.utc)
+    series: list[dict] = []
+    summary: dict = {
+        "p50_1h_ms": None,
+        "p95_1h_ms": None,
+        "p50_baseline_ms": None,
+        "p95_baseline_ms": None,
+        "delta_p95_pct": None,
+        "count_24h": 0,
+    }
+
+    try:
+        with _ragvec_state_conn() as conn:
+            # Per-hour percentiles for the last 24h. `cmd LIKE 'web%'`
+            # cubre 'web' + 'web.chat.low_conf_bypass' (y cualquier futuro
+            # 'web.chat.*' que mantenga el prefix convention).
+            rows = conn.execute(
+                """
+                WITH base AS (
+                    SELECT
+                        strftime('%Y-%m-%dT%H:00:00Z', ts) AS bucket,
+                        CAST(json_extract(extra_json, '$.total_ms') AS INTEGER) AS v
+                    FROM rag_queries
+                    WHERE cmd LIKE 'web%'
+                      AND ts >= datetime('now', '-24 hours')
+                      AND json_extract(extra_json, '$.total_ms') IS NOT NULL
+                ),
+                ranked AS (
+                    SELECT
+                        bucket, v,
+                        ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY v) AS rn,
+                        COUNT(*) OVER (PARTITION BY bucket) AS n
+                    FROM base
+                )
+                SELECT
+                    bucket,
+                    MAX(n) AS count,
+                    MIN(CASE WHEN rn * 1.0 / n >= 0.5  THEN v END) AS p50,
+                    MIN(CASE WHEN rn * 1.0 / n >= 0.95 THEN v END) AS p95,
+                    MIN(CASE WHEN rn * 1.0 / n >= 0.99 THEN v END) AS p99
+                FROM ranked
+                GROUP BY bucket
+                ORDER BY bucket
+                """,
+            ).fetchall()
+            by_bucket = {r[0]: r for r in rows}
+
+            # Emitir 25 buckets (24h atrás + hora actual) en orden cronológico.
+            # Los huecos quedan con count=0/None para que el sparkline dibuje
+            # un gap visible en vez de interpolar una línea falsa.
+            current = now.replace(minute=0, second=0, microsecond=0)
+            for i in range(24, -1, -1):
+                t = current - timedelta(hours=i)
+                key = t.strftime("%Y-%m-%dT%H:00:00Z")
+                r = by_bucket.get(key)
+                if r is not None:
+                    series.append({
+                        "ts": key,
+                        "count": int(r[1] or 0),
+                        "p50_ms": int(r[2]) if r[2] is not None else None,
+                        "p95_ms": int(r[3]) if r[3] is not None else None,
+                        "p99_ms": int(r[4]) if r[4] is not None else None,
+                    })
+                else:
+                    series.append({
+                        "ts": key,
+                        "count": 0,
+                        "p50_ms": None,
+                        "p95_ms": None,
+                        "p99_ms": None,
+                    })
+
+            # Last-hour = último bucket con data (puede no ser la hora
+            # actual si aún no hubo queries esta hora).
+            last_with_data = next(
+                (s for s in reversed(series) if s["count"] > 0), None,
+            )
+            if last_with_data is not None:
+                summary["p50_1h_ms"] = last_with_data["p50_ms"]
+                summary["p95_1h_ms"] = last_with_data["p95_ms"]
+            summary["count_24h"] = sum(s["count"] for s in series)
+
+            # Baseline 7d (un solo percentile global, no por hora) — sirve
+            # como "typical p95" contra el que comparamos la última hora.
+            baseline = conn.execute(
+                """
+                WITH base AS (
+                    SELECT CAST(json_extract(extra_json, '$.total_ms') AS INTEGER) AS v
+                    FROM rag_queries
+                    WHERE cmd LIKE 'web%'
+                      AND ts >= datetime('now', '-7 days')
+                      AND json_extract(extra_json, '$.total_ms') IS NOT NULL
+                ),
+                ranked AS (
+                    SELECT v,
+                        ROW_NUMBER() OVER (ORDER BY v) AS rn,
+                        COUNT(*) OVER () AS n
+                    FROM base
+                )
+                SELECT
+                    MIN(CASE WHEN rn * 1.0 / n >= 0.5  THEN v END) AS p50,
+                    MIN(CASE WHEN rn * 1.0 / n >= 0.95 THEN v END) AS p95
+                FROM ranked
+                """,
+            ).fetchone()
+            if baseline is not None:
+                summary["p50_baseline_ms"] = int(baseline[0]) if baseline[0] is not None else None
+                summary["p95_baseline_ms"] = int(baseline[1]) if baseline[1] is not None else None
+                if summary["p95_1h_ms"] and summary["p95_baseline_ms"]:
+                    delta = (
+                        (summary["p95_1h_ms"] - summary["p95_baseline_ms"])
+                        / summary["p95_baseline_ms"]
+                        * 100.0
+                    )
+                    summary["delta_p95_pct"] = round(delta, 1)
+    except Exception as e:
+        # Telemetry DB locked / schema missing: devolver payload neutral
+        # en vez de 500ear el /status. El frontend muestra "—" y el
+        # semáforo global sigue funcionando con el resto de sus probes.
+        print(f"[status_latency] warn: build failed: {type(e).__name__}: {e}", flush=True)
+
+    return {
+        "window_hours": 24,
+        "bucket": "hour",
+        "series": series,
+        "summary": summary,
+    }
+
+
+@app.get("/api/status/latency")
+def status_latency(nocache: int = 0) -> dict:
+    """Hourly p50/p95/p99 series of /api/chat total_ms over the last 24h
+    plus a 7d baseline for delta computation. Drives the latency sparkline
+    on /status. Cached 60s; `?nocache=1` forces refresh."""
+    now = time.monotonic()
+    with _LATENCY_CACHE_LOCK:
+        cached = _LATENCY_CACHE["payload"]
+        fresh = (now - _LATENCY_CACHE["ts"]) < _LATENCY_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _status_latency_build_payload()
+        with _LATENCY_CACHE_LOCK:
+            _LATENCY_CACHE["payload"] = payload
+            _LATENCY_CACHE["ts"] = now
+        return payload
+    return cached
 
 
 @app.get("/status")

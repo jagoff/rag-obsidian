@@ -536,11 +536,20 @@ def test_tool_addendum_mentions_whatsapp_reply():
     assert "respondele" in addendum.lower() or "contestale" in addendum.lower()
 
 
-def test_tool_addendum_count_is_14():
+def test_tool_addendum_count_matches_actual_tool_list():
+    """El número en el header del addendum (`Tenés N tools…`) debe
+    matchear con el length de CHAT_TOOLS — sino el LLM lee un count
+    desactualizado y a veces deja de llamar el último tool registrado.
+
+    El número crece cuando se registran tools nuevas (15 con el
+    propose_mail_send agregado en 2026-04-24). Este test es flexible
+    al count exacto pero estricto en la consistencia entre el texto y
+    la lista real."""
     addendum = _tools._WEB_TOOL_ADDENDUM
-    # Sanity: the count claim in the addendum must match the actual list.
-    assert "14 tools" in addendum
-    assert len(_tools.CHAT_TOOLS) == 14
+    actual = len(_tools.CHAT_TOOLS)
+    assert f"{actual} tools" in addendum, (
+        f"addendum dice un count distinto al actual ({actual} tools en CHAT_TOOLS)"
+    )
 
 
 # ── 7. Pre-router (`_detect_propose_intent`) routing ──────────────────────

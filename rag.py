@@ -11098,12 +11098,17 @@ tell application "Contacts"
   set _out to ""
   set _names to name of every person
   set _all_phones to value of phones of every person
+  set _all_emails to value of emails of every person
   set _n to count of _names
   repeat with i from 1 to _n
     set _nm to item i of _names
     set _phs to item i of _all_phones
+    set _ems to item i of _all_emails
     repeat with _ph in _phs
-      set _out to _out & _nm & "|" & (_ph as string) & linefeed
+      set _out to _out & _nm & tab & "P" & tab & (_ph as string) & linefeed
+    end repeat
+    repeat with _em in _ems
+      set _out to _out & _nm & tab & "E" & tab & (_em as string) & linefeed
     end repeat
   end repeat
   return _out
@@ -11113,48 +11118,117 @@ end tell
 _CONTACTS_PHONE_INDEX_TTL_S = 86400  # 24h — contactos raramente cambian
 _CONTACTS_DUMP_TIMEOUT_S = 30        # bulk-op dump: 0.5s medido; 30s da 60× margen
 _CONTACTS_PHONE_INDEX_PATH = DB_PATH.parent / "contacts_phone_index.json"
-_contacts_phone_index: dict | None = None  # {"ts": float, "index": dict[digits, name]}
+_CONTACTS_CACHE_SCHEMA = 2           # v2 (2026-04-24): agrega `contacts` list
+                                     # con name+phones+emails para alimentar
+                                     # el picker de /wzp y /mail.
+# Cache shape v2:
+#   {"ts": float, "schema": 2,
+#    "index":    {digits_normalized: name},   # backward-compat lookup por tel.
+#    "contacts": [{"name": str,
+#                  "phones": [str],
+#                  "emails": [str]}, ...]}
+_contacts_phone_index: dict | None = None
 
 
-def _load_contacts_phone_index(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict[str, str]:
-    """Return `{digits_normalized: name}` for every contact's phone.
+def _parse_contacts_dump(out: str) -> tuple[dict[str, str], list[dict]]:
+    """Parse el output del osascript dump (formato tab-sep: ``name<TAB>P<TAB>phone``
+    o ``name<TAB>E<TAB>email``) y construye en una sola pasada:
 
-    Three-tier lookup strategy:
-      1. In-memory module-level cache (process lifetime).
-      2. Disk cache at `_CONTACTS_PHONE_INDEX_PATH` (24h TTL default).
-      3. osascript dump of the whole address book — slow (~1s per contact,
-         ~6min for 350 contacts due to nested AppleScript iteration).
+      1. Index ``{digits_normalized: name}`` para lookups por teléfono
+         (bajo el digit string completo + su sufijo de 8 dígitos para
+         tolerar el prefix "+549" de WA JIDs).
+      2. Lista ``[{name, phones, emails}]`` con un dict por contacto
+         único (mergea phones/emails del mismo nombre, dedup-eados).
 
-    Each phone indexed under:
-      - The full digit string (after stripping non-digits)
-      - Its last-8-digit suffix (AR "9" prefix variance)
+    Líneas con formato inválido se descartan silently. Phone numbers
+    con <8 dígitos se descartan (probablemente extensiones internas).
+    """
+    idx: dict[str, str] = {}
+    by_name: dict[str, dict] = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            name, kind, value = parts
+        elif "|" in line:
+            # Legacy v1 dump format (`name|phone`, sin emails). Mantenemos
+            # el parsing para que tests viejos + cualquier disk cache que
+            # hubiera escapado del schema bump sigan funcionando.
+            name, value = line.split("|", 1)
+            kind = "P"
+        else:
+            continue
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
+        rec = by_name.setdefault(name, {"name": name, "phones": [], "emails": []})
+        if kind == "P":
+            digits = "".join(c for c in value if c.isdigit())
+            if len(digits) < 8:
+                continue
+            idx.setdefault(digits, name)
+            if len(digits) > 8:
+                idx.setdefault(digits[-8:], name)
+            if value not in rec["phones"]:
+                rec["phones"].append(value)
+        elif kind == "E":
+            if value not in rec["emails"]:
+                rec["emails"].append(value)
+    contacts = sorted(by_name.values(), key=lambda c: c["name"].lower())
+    return idx, contacts
 
-    Silent-fails on permission denied / missing osascript / Contacts app
-    unavailable → empty dict. Lock reuses `_contacts_cache_lock`.
+
+def _ensure_contacts_cache(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict:
+    """Three-tier loader que devuelve el cache dict con shape v2 (ver
+    ``_CONTACTS_CACHE_SCHEMA``). Construye los dos índices en una sola
+    pasada osascript — los callers piden lo que les sirva
+    (``_load_contacts_phone_index`` el dict, ``_load_contacts_list`` la
+    lista). Silent-fail: ante cualquier error devuelve cache vacío.
+
+    Tiers:
+      1. In-memory module-level (`_contacts_phone_index`).
+      2. Disk cache en `_CONTACTS_PHONE_INDEX_PATH` (24h TTL). Si el
+         schema en disco != 2 (cache viejo de v1), forza re-dump.
+      3. osascript dump del address book entero (~0.5s para 350
+         contactos en M4, dump bulk-op).
     """
     global _contacts_phone_index
     now = time.time()
 
-    # Tier 1: in-memory
+    # Tier 1: in-memory. Acepta sólo cache shape v2 (con schema=2). Si
+    # algún caller (test) inyecta un cache sin schema, lo trata como
+    # stale y forza tier-2/3 — más conservador.
     with _contacts_cache_lock:
-        if (_contacts_phone_index is not None
-                and now - _contacts_phone_index["ts"] < ttl_s):
-            return _contacts_phone_index["index"]
+        cached = _contacts_phone_index
+        if (cached is not None
+                and cached.get("schema") == _CONTACTS_CACHE_SCHEMA
+                and now - cached["ts"] < ttl_s):
+            return cached
 
-    # Tier 2: disk cache
+    # Tier 2: disk cache. Sólo aceptamos schema v2 — un cache v1 (sin
+    # `contacts` list) se descarta y forzamos re-dump. La idea es no
+    # quedar atrapados sirviendo data viejo para el picker; el dump
+    # bulk-op es ~0.5s así que el costo de re-dumpear una vez es bajo.
     try:
         if _CONTACTS_PHONE_INDEX_PATH.is_file():
             disk_age = now - _CONTACTS_PHONE_INDEX_PATH.stat().st_mtime
             if disk_age < ttl_s:
                 payload = json.loads(_CONTACTS_PHONE_INDEX_PATH.read_text(encoding="utf-8"))
-                idx = payload.get("index") or {}
-                with _contacts_cache_lock:
-                    _contacts_phone_index = {"ts": now, "index": idx}
-                return idx
+                if payload.get("schema") == _CONTACTS_CACHE_SCHEMA:
+                    cache = {
+                        "ts": now,
+                        "schema": _CONTACTS_CACHE_SCHEMA,
+                        "index": payload.get("index") or {},
+                        "contacts": payload.get("contacts") or [],
+                    }
+                    with _contacts_cache_lock:
+                        _contacts_phone_index = cache
+                    return cache
+                # else: schema viejo (v1 o ausente) → fallthrough a tier 3
     except Exception as exc:
         _silent_log("contacts_phone_index_disk_read", exc)
 
-    # Tier 3: full osascript dump
+    # Tier 3: osascript dump
     out = ""
     try:
         proc = subprocess.run(
@@ -11166,33 +11240,143 @@ def _load_contacts_phone_index(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict
     except Exception as exc:
         _silent_log("contacts_dump_osascript", exc)
 
-    idx: dict[str, str] = {}
-    for line in out.splitlines():
-        if "|" not in line:
-            continue
-        name, phone = line.split("|", 1)
-        name = name.strip()
-        digits = "".join(c for c in phone if c.isdigit())
-        if not name or len(digits) < 8:
-            continue
-        idx.setdefault(digits, name)
-        if len(digits) > 8:
-            idx.setdefault(digits[-8:], name)
+    idx, contacts = _parse_contacts_dump(out)
+    cache = {
+        "ts": now,
+        "schema": _CONTACTS_CACHE_SCHEMA,
+        "index": idx,
+        "contacts": contacts,
+    }
 
-    # Persist to disk only if we got real data — avoid caching empty dicts
-    # on transient osascript failures.
-    if idx:
+    # Persist sólo si hay data real (evita cachear dicts vacíos en fallos
+    # transitorios de osascript / permisos).
+    if idx or contacts:
         try:
             _CONTACTS_PHONE_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
             _CONTACTS_PHONE_INDEX_PATH.write_text(
-                json.dumps({"ts": now, "index": idx}), encoding="utf-8",
+                json.dumps({
+                    "ts": now,
+                    "schema": _CONTACTS_CACHE_SCHEMA,
+                    "index": idx,
+                    "contacts": contacts,
+                }),
+                encoding="utf-8",
             )
         except Exception as exc:
             _silent_log("contacts_phone_index_disk_write", exc)
 
     with _contacts_cache_lock:
-        _contacts_phone_index = {"ts": now, "index": idx}
+        _contacts_phone_index = cache
+    return cache
+
+
+def _load_contacts_phone_index(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> dict[str, str]:
+    """Return `{digits_normalized: name}` for every contact's phone.
+
+    Wrapper sobre ``_ensure_contacts_cache`` que devuelve la referencia
+    estable al sub-dict de lookup por dígitos (shape histórica).
+    Backwards-compat con ``_fetch_contact_by_phone`` y otros callers que
+    esperan dict[str, str], y con tests que comparan identidad (``is``)
+    de dicts entre llamadas consecutivas dentro del mismo TTL.
+    """
+    cache = _ensure_contacts_cache(ttl_s)
+    idx = cache.get("index")
+    if idx is None:
+        # Defensivo: garantizar que cache["index"] siempre sea un dict
+        # para que la siguiente llamada devuelva el mismo objeto.
+        cache["index"] = {}
+        idx = cache["index"]
     return idx
+
+
+def _load_contacts_list(ttl_s: int = _CONTACTS_PHONE_INDEX_TTL_S) -> list[dict]:
+    """Return ``[{name, phones, emails}]`` ordenado alfabéticamente.
+
+    Comparte el cache con ``_load_contacts_phone_index`` — un solo dump
+    osascript construye ambas estructuras. Útil para el picker del web
+    chat (``/wzp`` y ``/mail``) y cualquier otro consumidor que necesite
+    iterar contactos por nombre + canales.
+
+    Si el disk cache es v1 (sin "schema" key, sólo `index`), devuelve []
+    sin forzar re-dump — el popover muestra vacío hasta que el TTL del
+    cache expira y se regenera con v2 (osascript bulk-op ~0.5s).
+    """
+    return _ensure_contacts_cache(ttl_s).get("contacts") or []
+
+
+def _fold_for_match(s: str) -> str:
+    """Lowercase + strip diacritics. ``Maria José`` → ``maria jose``.
+    Idéntico al patrón usado en ``_match_mentions_in_query``."""
+    n = unicodedata.normalize("NFD", (s or "").lower())
+    return "".join(c for c in n if not unicodedata.combining(c))
+
+
+def _fuzzy_filter_contacts(q: str, kind: str = "any", limit: int = 20) -> list[dict]:
+    """Filtro fuzzy del cache de contactos para el picker de /wzp y /mail.
+
+    Args:
+        q: Substring a matchear contra ``name`` (case-insensitive,
+            sin acentos vía ``_fold_for_match``). Vacío → primeros
+            ``limit`` contactos en orden alfabético (placeholder visual
+            apenas el user typea ``/wzp ``).
+        kind: ``phone`` | ``email`` | ``any``. Filtra contactos que
+            tengan al menos un valor del canal pedido. ``/wzp`` necesita
+            ``phone``; ``/mail`` necesita ``email``.
+        limit: Máx. resultados (caller normaliza a [1, 100]).
+
+    Returns:
+        Lista de ``{name, phones, emails, score}`` ordenada por:
+          1. score DESC (3 exact > 2 prefix > 1 substring > 0 sin query)
+          2. name ASC (alfabético, case-insensitive)
+
+        Si el cache está frío / osascript silently-fails, devuelve [].
+    """
+    # Clamp limit a [1, 100] — los tests esperan que limit=0 se trate
+    # como 1 (UI defensiva) y limit>100 se trate como 100 (cota de payload).
+    limit = max(1, min(100, int(limit or 1)))
+    contacts = _load_contacts_list()
+    if not contacts:
+        return []
+    kind_norm = (kind or "any").strip().lower()
+    if kind_norm == "phone":
+        contacts = [c for c in contacts if c.get("phones")]
+    elif kind_norm == "email":
+        contacts = [c for c in contacts if c.get("emails")]
+    # else "any" → no kind filter
+
+    qfold = _fold_for_match(q.strip())
+    if not qfold:
+        # Sin query: primeros N en orden alfabético folded (acentos plegados),
+        # con score=0. Sin esto "Ágatha" caería al final por codepoint orden.
+        ordered = sorted(contacts, key=lambda c: _fold_for_match(c["name"]))
+        return [{**c, "score": 0} for c in ordered[:limit]]
+
+    scored: list[dict] = []
+    for c in contacts:
+        nfold = _fold_for_match(c["name"])
+        # Scoring jerárquico (3 > 2 > 1). Importa que un match exacto de
+        # token (ej. "Garcia" en "Garcia Jose" o en "Jose Garcia") gane
+        # contra un mero prefix del full name. Sin esto, "garcia" rankearía
+        # "Jose Garcia" antes que "Garcia Jose" porque el segundo es un
+        # full-name-prefix (score 2) pero el primero es exact-token (3).
+        if nfold == qfold:
+            score = 3  # full name == query
+        else:
+            tokens = nfold.split()
+            if any(t == qfold for t in tokens):
+                score = 3  # un token entero == query (ej. "Jose" en "Maria Jose")
+            elif nfold.startswith(qfold):
+                score = 2  # prefix del full name (cubre apellidos compuestos)
+            elif any(t.startswith(qfold) for t in tokens):
+                score = 2  # algún token empieza con query (ej. "Gar" en "Garcia")
+            elif qfold in nfold:
+                score = 1  # substring del full name (último recurso)
+            else:
+                continue
+        scored.append({**c, "score": score})
+
+    scored.sort(key=lambda c: (-c["score"], c["name"].lower()))
+    return scored[:limit]
 
 
 def _fetch_contact_by_phone(digits: str) -> dict | None:
@@ -32337,6 +32521,64 @@ def propose_calendar_event(
         "event_uid": res,
         "fields": fields,
     }, ensure_ascii=False)
+
+
+def propose_mail_send(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+) -> str:
+    """Draft a Gmail message for confirmation. DOES NOT send.
+
+    Mirror intencional de ``propose_whatsapp_send``: acción destructiva a
+    un tercero → siempre volvemos ``needs_clarification=True`` para que la
+    UI muestre la tarjeta con [Enviar] / [Editar] / [Descartar]. Auto-send
+    nunca es aceptable; el user confirma explícitamente con un click.
+
+    El body se envía via ``_send_gmail`` (scope gmail.modify), disparado
+    por ``POST /api/mail/send`` cuando el user toca [Enviar] en la UI.
+    Acá solo armamos el draft + validamos que el destinatario parezca
+    un email razonable.
+
+    Args:
+        to: Destinatario (email válido — se valida contiene ``@``).
+        subject: Asunto. Vacío → "(sin asunto)".
+        body: Cuerpo text/plain. Vacío permitido — el user puede
+            editarlo en el textarea de la tarjeta antes de mandar.
+        cc: Opcional. Comma-separated si hay varios destinatarios.
+        bcc: Opcional. Comma-separated si hay varios.
+
+    Returns:
+        JSON ``{kind: "mail", proposal_id, needs_clarification: True,
+        fields: {to, subject, body, cc?, bcc?, error?}}``. ``error`` se
+        setea si el to no parsea como email (la tarjeta igual se renderiza
+        para que el user edite el destinatario antes de enviar).
+    """
+    to_clean = (to or "").strip()
+    subj_clean = (subject or "").strip() or "(sin asunto)"
+    body_clean = body or ""
+    error: str | None = None
+    if not to_clean:
+        error = "empty_to"
+    elif "@" not in to_clean:
+        error = "invalid_email"
+    fields = {
+        "to": to_clean,
+        "subject": subj_clean,
+        "body": body_clean,
+        "cc": (cc or "").strip() or None,
+        "bcc": (bcc or "").strip() or None,
+        "error": error,
+    }
+    return json.dumps({
+        "kind": "mail",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": fields,
+    }, ensure_ascii=False)
+
 
 
 def _fetch_completed_reminders(

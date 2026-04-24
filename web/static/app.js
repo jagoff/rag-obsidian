@@ -312,6 +312,17 @@ const SLASH_COMMANDS = [
   { cmd: "/reindex", desc: "reindex incremental en background" },
   { cmd: "/redo",    desc: "regenerar última respuesta (opcional: pista)", arg: "[pista]" },
   { cmd: "/tts",     desc: "alternar voz (Mónica)" },
+  // Shortcuts para acciones de creación — reescriben a lenguaje natural
+  // y van al pipeline LLM normal (tool-calling con propose_*). La UI
+  // rendereiza la tarjeta de confirmación como cualquier otra propuesta
+  // — el slash solo es azúcar sintáctica para evitarle al user tipear
+  // "mandale un mensaje a X que diga ...". `/wzp` y `/mail` muestran
+  // además un popover fuzzy con los contactos cacheados (ver
+  // `contactsPopover` más abajo).
+  { cmd: "/wzp",     desc: "enviar WhatsApp a un contacto", arg: "[contacto]: [mensaje]" },
+  { cmd: "/mail",    desc: "enviar email (Gmail)", arg: "[email]: [asunto] — [cuerpo]" },
+  { cmd: "/rem",     desc: "crear recordatorio", arg: "[texto] [cuándo]" },
+  { cmd: "/evt",     desc: "agendar evento", arg: "[título] [cuándo]" },
 ];
 
 const slashPopover = document.getElementById("slash-popover");
@@ -395,6 +406,192 @@ function completeSlash(c) {
   hideSlashPopover();
 }
 
+// ── Popover de contactos para /wzp + /mail ────────────────────────────
+// Activa cuando el input matchea `/wzp <texto>` o `/mail <texto>`. Muestra
+// hasta 20 contactos del cache de Apple Contacts filtrados por substring
+// normalizado (sin acentos) — fetch a /api/contacts. Reusa la
+// infraestructura visual del slash-popover (mismo CSS, mismo aria-listbox).
+//
+// Decisiones de diseño:
+//   - Debounce 80ms entre fetches: balance entre "sentir vivo" mientras
+//     tipeás y no martillar el endpoint con cada keystroke. El backend
+//     filtra ~350 contactos en sub-ms; el bottleneck es el round-trip.
+//   - El popover convive con el slash-popover sin colisionar: cuando el
+//     user todavía no metió espacio (estado `/wzp`), muestra el slash
+//     popover; cuando metió espacio (`/wzp `), cierra el slash y abre
+//     el contacts popover.
+//   - "Letra-por-letra" como pidió Fer (2026-04-24): cada keystroke
+//     dispara updateContactsPopover. No esperamos hasta que termine de
+//     tipear el contacto entero — eso permite descubrir contactos que
+//     no recuerda con qué letra arrancan ("Fer" matchea "Alfredo").
+const contactsPopover = document.getElementById("contacts-popover");
+let contactsIndex = 0;
+let contactsItems = [];          // [{name, phones, emails, score}]
+let contactsFetchAbort = null;   // AbortController del fetch en curso
+let contactsDebounceTimer = null;
+let contactsLastQuery = null;    // string|null — último query ya fetchedo
+
+function _contactsCommandSpec(value) {
+  // Devuelve {cmd, kind, query} si el input está en estado `/wzp <X>`
+  // o `/mail <X>` (con al menos un espacio post-comando). Null en otro
+  // caso. `query` es el texto tras el espacio — vacío al recién tipear
+  // el espacio inicial.
+  if (!value || !value.startsWith("/")) return null;
+  const spaceIdx = value.indexOf(" ");
+  if (spaceIdx < 0) return null;
+  const cmd = value.slice(0, spaceIdx).toLowerCase();
+  if (cmd !== "/wzp" && cmd !== "/mail") return null;
+  // Solo el primer "argumento" — si el user ya escribió `: <mensaje>`,
+  // el contacto ya quedó atrás y no queremos seguir mostrando el picker.
+  // Detectamos eso buscando un `:` en el resto.
+  const rest = value.slice(spaceIdx + 1);
+  const colonIdx = rest.indexOf(":");
+  if (colonIdx >= 0) return null;
+  // El "query" es lo que el user tipeó como nombre de contacto, hasta el
+  // próximo espacio (single-token) — para soportar nombres compuestos
+  // ("Maria Jose") tomamos todo el rest sin trim para no perder el space.
+  return {
+    cmd,
+    kind: cmd === "/wzp" ? "phone" : "email",
+    query: rest,
+  };
+}
+
+function renderContactsPopover(items) {
+  contactsPopover.innerHTML = "";
+  if (!items.length) {
+    contactsPopover.appendChild(el(
+      "div", "slash-popover-empty",
+      "sin contactos — Enter manda al chat igual",
+    ));
+    contactsPopover.removeAttribute("aria-activedescendant");
+    return;
+  }
+  items.forEach((c, i) => {
+    const row = el("div", "slash-item" + (i === contactsIndex ? " active" : ""));
+    row.id = `contacts-option-${i}`;
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", i === contactsIndex ? "true" : "false");
+    row.dataset.name = c.name;
+    // Estructura visual: nombre del contacto a la izquierda, hint
+    // (primer phone o email truncado) a la derecha. Reusa las mismas
+    // clases que el slash popover para consistencia.
+    const nameSpan = el("span", "slash-cmd", c.name);
+    row.appendChild(nameSpan);
+    let hint = "";
+    if (c.phones && c.phones.length) hint = c.phones[0];
+    else if (c.emails && c.emails.length) hint = c.emails[0];
+    if (hint) row.appendChild(el("span", "slash-desc", hint));
+    row.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      pickContact(c);
+    });
+    row.addEventListener("mouseenter", () => {
+      contactsIndex = i;
+      renderContactsPopover(contactsItems);
+    });
+    contactsPopover.appendChild(row);
+  });
+  contactsPopover.setAttribute("aria-activedescendant", `contacts-option-${contactsIndex}`);
+}
+
+function hideContactsPopover() {
+  contactsPopover.hidden = true;
+  contactsItems = [];
+  contactsIndex = 0;
+  contactsLastQuery = null;
+  if (contactsFetchAbort) {
+    try { contactsFetchAbort.abort(); } catch (_) {}
+    contactsFetchAbort = null;
+  }
+  if (contactsDebounceTimer) {
+    clearTimeout(contactsDebounceTimer);
+    contactsDebounceTimer = null;
+  }
+}
+
+async function _doContactsFetch(spec) {
+  // Cancelamos el fetch anterior si quedó en vuelo — el último query
+  // gana. Sin esto, una respuesta lenta podría sobreescribir la UI
+  // después de que el user ya tipeó más letras.
+  if (contactsFetchAbort) {
+    try { contactsFetchAbort.abort(); } catch (_) {}
+  }
+  const ac = new AbortController();
+  contactsFetchAbort = ac;
+  try {
+    const url = `/api/contacts?q=${encodeURIComponent(spec.query.trim())}` +
+                `&kind=${spec.kind}&limit=20`;
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Por si el spec cambió entre el fetch y la respuesta — comparamos
+    // contra el estado actual del input. Si el user salió del estado
+    // contacts-popover (ej. tipeó `:`), descartamos.
+    const liveSpec = _contactsCommandSpec(input.value);
+    if (!liveSpec || liveSpec.cmd !== spec.cmd || liveSpec.kind !== spec.kind) {
+      return;
+    }
+    contactsItems = data.contacts || [];
+    contactsIndex = 0;
+    contactsPopover.hidden = false;
+    renderContactsPopover(contactsItems);
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    // Silent-fail: el popover no debe gritar al usuario. Cerramos y
+    // dejamos que tipee el nombre a mano.
+    hideContactsPopover();
+  }
+}
+
+function updateContactsPopover() {
+  const spec = _contactsCommandSpec(input.value);
+  if (!spec) {
+    if (!contactsPopover.hidden) hideContactsPopover();
+    return;
+  }
+  // Cerrar el slash popover si está abierto — el contacts popover toma
+  // su lugar visual una vez que el user pasó el espacio post-comando.
+  if (!slashPopover.hidden) hideSlashPopover();
+  // Misma query que la última fetched → no re-pedimos.
+  const queryKey = `${spec.kind}:${spec.query}`;
+  if (queryKey === contactsLastQuery) return;
+  contactsLastQuery = queryKey;
+  // Debounce 80ms — si el user sigue tipeando, se cancela.
+  if (contactsDebounceTimer) clearTimeout(contactsDebounceTimer);
+  contactsDebounceTimer = setTimeout(() => {
+    contactsDebounceTimer = null;
+    _doContactsFetch(spec);
+  }, 80);
+}
+
+function pickContact(c) {
+  // Reemplaza el "query" actual (texto post-comando) por el nombre
+  // elegido + ": " para que el user pase a tipear el mensaje. El cmd
+  // (`/wzp` o `/mail`) se preserva; el resto del input también si el
+  // user había escrito algo después (defensive — normalmente no hay
+  // nada).
+  const spec = _contactsCommandSpec(input.value);
+  if (!spec) {
+    hideContactsPopover();
+    return;
+  }
+  // Para `/mail` queremos el email, no el nombre — el LLM necesita un
+  // address válido. Para `/wzp` el nombre alcanza (propose_whatsapp_send
+  // resuelve el JID).
+  let pickedToken = c.name;
+  if (spec.kind === "email") {
+    pickedToken = (c.emails && c.emails[0]) || c.name;
+  }
+  input.value = `${spec.cmd} ${pickedToken}: `;
+  autoGrow();
+  input.focus();
+  // Caret al final para que el user empiece a tipear el mensaje.
+  const len = input.value.length;
+  input.setSelectionRange(len, len);
+  hideContactsPopover();
+}
+
 // Input autogrow + enter-to-send --------------------------------
 function autoGrow() {
   input.style.height = "auto";
@@ -418,6 +615,10 @@ input.addEventListener("input", () => {
   autoGrow();
   updateSendBtnState();
   updateSlashPopover();
+  // El contacts popover se actualiza también en cada keystroke. Si el
+  // input no matchea `/wzp <X>` ni `/mail <X>`, la función se cierra
+  // sola — barato (un check de prefix + indexOf).
+  updateContactsPopover();
   if (!historyPopover.hidden) hideHistoryPopover();
 });
 
@@ -446,6 +647,36 @@ input.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       e.preventDefault();
       hideSlashPopover();
+      return;
+    }
+  }
+  // Contacts popover navigation — misma UX que el slash popover. Cuando
+  // está visible (tipo /wzp <q> o /mail <q>) las flechas mueven el
+  // highlight, Tab/Enter pickean, Escape cierra y deja al user seguir
+  // tipeando libre. Si está vacío (no hubo matches) no interceptamos
+  // teclas — Enter manda el chat con el texto literal.
+  if (!contactsPopover.hidden && contactsItems.length) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      contactsIndex = (contactsIndex + 1) % contactsItems.length;
+      renderContactsPopover(contactsItems);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      contactsIndex = (contactsIndex - 1 + contactsItems.length) % contactsItems.length;
+      renderContactsPopover(contactsItems);
+      return;
+    }
+    if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      e.preventDefault();
+      const pick = contactsItems[contactsIndex];
+      if (pick) pickContact(pick);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideContactsPopover();
       return;
     }
   }
@@ -526,9 +757,16 @@ input.addEventListener("keydown", (e) => {
 input.addEventListener("blur", () => {
   // Small delay so a mousedown on a slash-item still registers before the
   // popover disappears.
-  setTimeout(() => { hideSlashPopover(); hideHistoryPopover(); }, 120);
+  setTimeout(() => {
+    hideSlashPopover();
+    hideHistoryPopover();
+    hideContactsPopover();
+  }, 120);
 });
-input.addEventListener("focus", updateSlashPopover);
+input.addEventListener("focus", () => {
+  updateSlashPopover();
+  updateContactsPopover();
+});
 
 // Global keyboard shortcuts -------------------------------------
 document.addEventListener("keydown", (e) => {
@@ -1489,8 +1727,157 @@ function appendWhatsAppProposal(parent, payload) {
 }
 
 
+// Mail-specific proposal card. Mismo modelo que WhatsApp — el send es
+// destructivo a un tercero, el user confirma con click. Distinto en:
+//   1. Tres campos editables: To / Subject / Body (vs un solo textarea).
+//   2. POST a /api/mail/send (no /api/whatsapp/send).
+//   3. El error de validación ("invalid_email") se surface a la
+//      izquierda del campo To en vez de bloquear el botón — el user
+//      puede arreglar el destinatario sin descartar el draft.
+function appendMailProposal(parent, payload) {
+  const fields = payload.fields || {};
+  const proposalId = payload.proposal_id || "";
+  const err = fields.error || null;
+
+  const card = el("div", "proposal proposal-mail");
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", "✉"));
+  head.appendChild(el("span", "proposal-kind", "Email"));
+  card.appendChild(head);
+
+  // Tres inputs/textareas editables. Reusa la clase `.proposal-wa-text`
+  // del WhatsApp draft para que el styling sea consistente — son las
+  // mismas premisas (text area dentro de la card, focus visible).
+  const toInput = document.createElement("input");
+  toInput.type = "email";
+  toInput.className = "proposal-wa-text";
+  toInput.value = fields.to || "";
+  toInput.placeholder = "destinatario@ejemplo.com";
+  const toRow = el("div", "proposal-meta-row");
+  toRow.appendChild(el("span", "proposal-meta-label", "para"));
+  toRow.appendChild(toInput);
+  card.appendChild(toRow);
+
+  const subjInput = document.createElement("input");
+  subjInput.type = "text";
+  subjInput.className = "proposal-wa-text";
+  subjInput.value = fields.subject || "";
+  subjInput.placeholder = "Asunto";
+  const subjRow = el("div", "proposal-meta-row");
+  subjRow.appendChild(el("span", "proposal-meta-label", "asunto"));
+  subjRow.appendChild(subjInput);
+  card.appendChild(subjRow);
+
+  const bodyArea = document.createElement("textarea");
+  bodyArea.className = "proposal-wa-text";
+  bodyArea.rows = 5;
+  bodyArea.value = fields.body || "";
+  bodyArea.placeholder = "Cuerpo del mail";
+  card.appendChild(bodyArea);
+
+  if (err) {
+    const errMap = {
+      "empty_to": "Falta el destinatario.",
+      "invalid_email": `"${fields.to}" no parece un email válido (debe tener @).`,
+    };
+    const msg = errMap[err] || `Error: ${err}`;
+    card.appendChild(el("div", "proposal-warn", `⚠ ${msg}`));
+  }
+
+  const actions = el("div", "proposal-actions");
+  const sendBtn = document.createElement("button");
+  sendBtn.type = "button";
+  sendBtn.className = "proposal-btn proposal-btn-create";
+  sendBtn.textContent = "✈ Enviar";
+  // No deshabilitamos por error — el user puede arreglar el `to` y reintentar.
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "proposal-btn proposal-btn-cancel";
+  cancelBtn.textContent = "✗ Descartar";
+  const status = el("span", "proposal-status", "");
+  actions.appendChild(sendBtn);
+  actions.appendChild(cancelBtn);
+  actions.appendChild(status);
+  card.appendChild(actions);
+
+  cancelBtn.addEventListener("click", () => {
+    if (card.dataset.resolved) return;
+    card.dataset.resolved = "cancelled";
+    sendBtn.disabled = true;
+    cancelBtn.disabled = true;
+    toInput.disabled = true;
+    subjInput.disabled = true;
+    bodyArea.disabled = true;
+    status.textContent = "  descartado";
+    status.classList.add("cancelled");
+    card.classList.add("dimmed");
+  });
+
+  sendBtn.addEventListener("click", async () => {
+    if (card.dataset.resolved) return;
+    const toVal = toInput.value.trim();
+    const subjVal = subjInput.value.trim();
+    const bodyVal = bodyArea.value.trim();
+    if (!toVal || !toVal.includes("@")) {
+      status.textContent = "  destinatario inválido";
+      status.classList.add("err");
+      return;
+    }
+    if (!bodyVal) {
+      status.textContent = "  cuerpo vacío";
+      status.classList.add("err");
+      return;
+    }
+    card.dataset.resolved = "sending";
+    sendBtn.disabled = true;
+    cancelBtn.disabled = true;
+    toInput.disabled = true;
+    subjInput.disabled = true;
+    bodyArea.disabled = true;
+    status.textContent = "  enviando…";
+    status.classList.remove("ok", "err");
+
+    try {
+      const res = await fetch("/api/mail/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: toVal,
+          subject: subjVal || "(sin asunto)",
+          body: bodyVal,
+          proposal_id: proposalId,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      card.dataset.resolved = "sent";
+      status.textContent = `  ✓ enviado a ${toVal}`;
+      status.classList.add("ok");
+      card.classList.add("created");
+      showToast(`✓ Mail enviado a ${toVal}`, "ok");
+    } catch (err) {
+      delete card.dataset.resolved;
+      sendBtn.disabled = false;
+      cancelBtn.disabled = false;
+      toInput.disabled = false;
+      subjInput.disabled = false;
+      bodyArea.disabled = false;
+      status.textContent = `  error: ${err.message}`;
+      status.classList.add("err");
+      showToast(`✗ No se pudo enviar mail: ${err.message}`, "err");
+    }
+  });
+
+  parent.appendChild(card);
+  return card;
+}
+
+
 function appendProposal(parent, payload) {
-  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message" | "whatsapp_reply"
+  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message" | "whatsapp_reply" | "mail"
   const fields = payload.fields || {};
   const needsClarif = payload.needs_clarification === true;
 
@@ -1500,6 +1887,10 @@ function appendProposal(parent, payload) {
   // (/api/whatsapp/send for both — reply ships an extra reply_to field).
   if (kind === "whatsapp_message" || kind === "whatsapp_reply") {
     return appendWhatsAppProposal(parent, payload);
+  }
+  // mail: tres campos editables (to / subject / body) + POST a /api/mail/send.
+  if (kind === "mail") {
+    return appendMailProposal(parent, payload);
   }
 
   const card = el("div", `proposal proposal-${kind}`);
@@ -2858,6 +3249,74 @@ async function handleSlashCommand(raw) {
     // ChatRequest validator requires non-empty question.
     await send(hint ? `(redo: ${hint})` : "(redo)",
                { redo_turn_id: lastTurnId, hint: hint || null });
+    return true;
+  }
+  // ── Shortcuts para acciones de creación ────────────────────────────
+  // Estos 4 reescriben el slash a una frase natural que matchea el
+  // routing del `_WEB_TOOL_ADDENDUM` y va al pipeline LLM normal —
+  // termina llamando a propose_whatsapp_send / propose_mail_send /
+  // propose_reminder / propose_calendar_event y mostrando la tarjeta
+  // de confirmación. La razón de no esquivar al LLM es flexibilidad:
+  // "mandale a Grecia: que llego en 10" puede tener fechas relativas,
+  // citas, o variantes de saludo que el LLM puede normalizar.
+  if (cmd === "/wzp") {
+    if (!arg) {
+      pushSystemMessage("err", "uso: /wzp <contacto>: <mensaje>");
+      input.value = "/wzp ";
+      autoGrow();
+      input.focus();
+      return true;
+    }
+    // Si el user escribió "Grecia: hola" lo dejamos parseable; si solo
+    // tipeó "Grecia hola" igual el LLM lo mete a propose_whatsapp_send.
+    // Usamos "mandale" porque está en el routing y es rioplatense
+    // (más natural que "envíale").
+    const rewritten = `mandale un mensaje por whatsapp a ${arg}`;
+    input.value = "";
+    autoGrow();
+    await send(rewritten);
+    return true;
+  }
+  if (cmd === "/mail") {
+    if (!arg) {
+      pushSystemMessage("err", "uso: /mail <email>: <asunto> — <cuerpo>");
+      input.value = "/mail ";
+      autoGrow();
+      input.focus();
+      return true;
+    }
+    const rewritten = `mandale un mail a ${arg}`;
+    input.value = "";
+    autoGrow();
+    await send(rewritten);
+    return true;
+  }
+  if (cmd === "/rem") {
+    if (!arg) {
+      pushSystemMessage("err", "uso: /rem <texto> [cuándo]");
+      input.value = "/rem ";
+      autoGrow();
+      input.focus();
+      return true;
+    }
+    const rewritten = `recordame ${arg}`;
+    input.value = "";
+    autoGrow();
+    await send(rewritten);
+    return true;
+  }
+  if (cmd === "/evt") {
+    if (!arg) {
+      pushSystemMessage("err", "uso: /evt <título> [cuándo]");
+      input.value = "/evt ";
+      autoGrow();
+      input.focus();
+      return true;
+    }
+    const rewritten = `agendá un evento: ${arg}`;
+    input.value = "";
+    autoGrow();
+    await send(rewritten);
     return true;
   }
   // Unknown /foo — let send() handle it so the LLM can answer instead of

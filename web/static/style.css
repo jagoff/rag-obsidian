@@ -2075,6 +2075,36 @@ kbd {
   font-size: 12px;
 }
 
+/* ── Mail proposal (kind="mail") ──────────────────────────────────────
+ * Reusa la mayoría del styling de WhatsApp (`.proposal-wa-text` para
+ * los inputs/textareas) — la diferencia es que tiene 3 campos
+ * editables (to / subject / body) en filas separadas con label arriba.
+ * El send-button toma el mismo realce sutil porque también es
+ * destructivo (no se puede unsend un mail). */
+.proposal-mail .proposal-wa-text {
+  /* el input email + subject heredan font-size del textarea por
+   * defecto; achicamos a 13px para que la card se vea apretada
+   * (los headers tipo "para" / "asunto" son cortos) */
+  min-height: auto;
+  resize: none;
+}
+.proposal-mail textarea.proposal-wa-text {
+  /* solo el body es resizable + multiline */
+  resize: vertical;
+}
+.proposal-mail .proposal-meta-row {
+  align-items: center;
+}
+.proposal-mail .proposal-meta-row .proposal-wa-text {
+  /* en filas con label, el input toma el resto del ancho */
+  flex: 1;
+  min-width: 0;
+}
+.proposal-mail .proposal-btn-create {
+  /* mismo realce que WhatsApp — destructivo */
+  background: rgba(126, 231, 135, 0.08);
+}
+
 /* ── Created chips (inline confirmation after auto-create) ────────────
  * Styled to match the existing ╌ fuentes rule-line aesthetic. Appears
  * below the rag response; scrolls with the chat. Reminders include an

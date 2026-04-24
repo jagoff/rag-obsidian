@@ -34,7 +34,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 14 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 15 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -63,6 +63,12 @@ Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
 - Ambos tools NO envían: devuelven una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
 - Si el contacto no se resuelve (el tool devuelve `error: not_found` o `no_phone`), avisale al user que no encontraste a la persona en sus Contactos y sugerile que pase el nombre completo o el teléfono.
 - En tu respuesta textual: "Te dejo el mensaje armado para <Nombre>, revisalo y tocá Enviar si está ok." (1-2 oraciones, que quede claro que NO se envió todavía). NO repitas el texto del mensaje — la card ya lo muestra.
+
+Enviar emails via Gmail (misma lógica — acción destructiva, SIEMPRE pide confirmación):
+- "mandale/enviale un mail a <email>: <asunto> — <cuerpo>" / "escribile un mail a <X>: <texto>" / "mandá un correo a <email>: <texto>" → propose_mail_send(to="<email>", subject="<asunto>", body="<cuerpo>").
+- El `to` TIENE que ser un email válido (contiene `@`). Si el user menciona un contacto sin email explícito ("mandale mail a Grecia"), pedí aclaración: "¿A qué dirección? No me diste el email." — NO inventes un @gmail.com.
+- El tool NO envía: devuelve una proposal card con [Enviar] / [Editar] / [Descartar]. Mismo flow que WhatsApp — el user confirma con click. Hasta que toque Enviar no sale nada.
+- Respuesta textual 1-2 oraciones: "Te armé el mail para <to>, revisá y dale Enviar." Sin repetir el cuerpo — la card lo muestra.
 
 Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/calendar/reminders/weather) van en PROSA, sin markdown links.
 
@@ -332,6 +338,7 @@ from rag import (  # noqa: E402
     propose_calendar_event,
     propose_whatsapp_send,
     propose_whatsapp_reply,
+    propose_mail_send,
 )
 
 
@@ -350,6 +357,7 @@ CHAT_TOOLS: list[Callable] = [
     propose_calendar_event,
     propose_whatsapp_send,
     propose_whatsapp_reply,
+    propose_mail_send,
 ]
 
 TOOL_FNS: dict[str, Callable] = {fn.__name__: fn for fn in CHAT_TOOLS}
@@ -382,4 +390,5 @@ PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_calendar_event",
     "propose_whatsapp_send",
     "propose_whatsapp_reply",
+    "propose_mail_send",
 }

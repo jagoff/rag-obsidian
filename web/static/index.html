@@ -299,6 +299,13 @@
       <div id="composer-inner">
         <div id="slash-popover" class="slash-popover" hidden role="listbox" aria-label="Comandos"></div>
         <div id="history-popover" class="slash-popover history-popover" hidden role="listbox" aria-label="Historial"></div>
+        <!-- Popover de contactos — aparece cuando el user escribe `/wzp `
+             o `/mail ` para que pueda elegir un contacto del cache de
+             Apple Contacts en vez de tipearlo a mano. Reusa el styling
+             de `.slash-popover` (mismo listbox / item / activedescendant
+             contract) — la única diferencia es la fuente de datos
+             (fetch a /api/contacts en vez de SLASH_COMMANDS literal). -->
+        <div id="contacts-popover" class="slash-popover contacts-popover" hidden role="listbox" aria-label="Contactos"></div>
         <!-- Composer card — layout claude.ai post-primer-mensaje:
              fila 1 textarea, fila 2 botones alineados a la derecha.
              Los IDs #input, #send-btn, #stop-btn se preservan intactos
@@ -468,6 +475,10 @@
           <dt><code>/save</code> <span class="arg">[título]</span></dt><dd>guardar conversación en 00-Inbox</dd>
           <dt><code>/reindex</code></dt><dd>reindex incremental en background</dd>
           <dt><code>/tts</code></dt><dd>alternar lectura en voz alta</dd>
+          <dt><code>/wzp</code> <span class="arg">[contacto]: [mensaje]</span></dt><dd>enviar WhatsApp (popover de contactos al tipear)</dd>
+          <dt><code>/mail</code> <span class="arg">[email]: [asunto] — [cuerpo]</span></dt><dd>enviar email (Gmail)</dd>
+          <dt><code>/rem</code> <span class="arg">[texto] [cuándo]</span></dt><dd>crear recordatorio</dd>
+          <dt><code>/evt</code> <span class="arg">[título] [cuándo]</span></dt><dd>agendar evento</dd>
         </dl>
       </section>
     </div>

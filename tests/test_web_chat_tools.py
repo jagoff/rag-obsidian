@@ -203,8 +203,8 @@ def _post_chat(question: str = "hola") -> tuple[list[tuple[str, dict]], str]:
 
 
 def test_tools_module_exports():
-    assert len(CHAT_TOOLS) == 14
-    assert len(TOOL_FNS) == 14
+    assert len(CHAT_TOOLS) == 15
+    assert len(TOOL_FNS) == 15
     assert PARALLEL_SAFE == {
         "weather", "finance_summary", "calendar_ahead",
         "reminders_due", "gmail_recent", "drive_search",

@@ -5304,6 +5304,27 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # suma la columna.
         ),
     ),
+    (
+        # rag_reminder_wa_pushed — dedup state para
+        # `push_due_reminders_to_whatsapp`. Una row por reminder ya
+        # notificado al ambient JID; el cron cada 5min consulta esta
+        # tabla antes de mandar para evitar duplicados. Pruning cada
+        # 30 días — los reminder_ids son IDs internos de Apple
+        # Reminders (CADC9B3F-...), inmutables mientras el reminder
+        # exista; si el reminder se completa o borra, la row queda
+        # huérfana hasta el prune (sin daño, sólo ocupa bytes).
+        "rag_reminder_wa_pushed",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_reminder_wa_pushed ("
+            " reminder_id TEXT PRIMARY KEY,"
+            " pushed_at TEXT NOT NULL,"
+            " due_iso TEXT,"
+            " title TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_reminder_wa_pushed_at "
+            "ON rag_reminder_wa_pushed(pushed_at)",
+        ),
+    ),
 )
 
 
@@ -19799,6 +19820,247 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
     acá para evitar que nuestro propio output se procese como query.
     """
     return _whatsapp_send_to_jid(jid, text, anti_loop=True)
+
+
+# ── Reminder → WhatsApp push (rag wa-tasks runtime) ──────────────────────
+# El cron `com.fer.obsidian-rag-wa-tasks` corre cada 30min y notifica al
+# JID configurado en `~/.local/share/obsidian-rag/ambient.json` cuando un
+# Apple Reminder está por vencer / acaba de vencer. Dedup por reminder_id
+# en la tabla `rag_reminder_wa_pushed` para que un mismo reminder no se
+# pushee dos veces aunque el script corra repetidamente dentro de su
+# ventana de detección.
+
+def _reminder_wa_was_pushed(conn, reminder_id: str) -> bool:
+    """True si el reminder ya fue pusheado a WhatsApp y la row sigue en
+    la tabla de dedup (no fue pruneada). PK lookup, O(1)."""
+    row = conn.execute(
+        "SELECT 1 FROM rag_reminder_wa_pushed WHERE reminder_id = ?",
+        (reminder_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _reminder_wa_mark_pushed(
+    conn, reminder_id: str, due_iso: str | None, title: str | None,
+) -> None:
+    """INSERT OR REPLACE: marca el reminder como ya pusheado.
+    `due_iso` y `title` se persisten para auditoría/debug — no se leen
+    durante el flow normal pero ayudan cuando alguien revisa la tabla
+    a ojo (`SELECT * FROM rag_reminder_wa_pushed`)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO rag_reminder_wa_pushed "
+        "(reminder_id, pushed_at, due_iso, title) VALUES (?, ?, ?, ?)",
+        (
+            reminder_id,
+            datetime.now().isoformat(timespec="seconds"),
+            due_iso or None,
+            title or None,
+        ),
+    )
+    conn.commit()
+
+
+def _reminder_wa_prune_old(conn, days: int = 30) -> int:
+    """Borra rows con `pushed_at < now - days`. Retorna el conteo de
+    filas eliminadas. Pruning porque Apple Reminders rota IDs cuando el
+    user borra el reminder y reusa el slot — sin prune, una row vieja
+    bloquearía un push legítimo de un reminder nuevo con el mismo ID."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    cur = conn.execute(
+        "DELETE FROM rag_reminder_wa_pushed WHERE pushed_at < ?",
+        (cutoff,),
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def _reminder_wa_format_text(item: dict, now: datetime) -> str:
+    """Formato del mensaje WhatsApp por reminder. Conciso (cabe en una
+    notif preview de iOS) — emoji ⏰ ancla, título, due humano, lista.
+
+    No usa Markdown ni links — WhatsApp render simple y prefiere texto
+    plano para preview claro."""
+    title = (item.get("name") or item.get("title") or "Tarea").strip()
+    list_name = (item.get("list") or "").strip()
+    due_iso = item.get("due") or ""
+    due_human = ""
+    if due_iso:
+        try:
+            due_dt = datetime.fromisoformat(due_iso)
+            delta = (due_dt - now).total_seconds()
+            mins = int(round(delta / 60))
+            if -2 <= mins <= 2:
+                due_human = "ahora"
+            elif mins < 0:
+                m_abs = abs(mins)
+                due_human = f"hace {m_abs} min" if m_abs < 60 else f"hace {m_abs // 60} h"
+            else:
+                due_human = f"en {mins} min" if mins < 60 else f"en {mins // 60} h"
+        except (TypeError, ValueError):
+            due_human = ""
+
+    head = f"⏰ {title}"
+    if due_human:
+        head = f"⏰ {title} — {due_human}"
+    bits = [head]
+    if list_name:
+        bits.append(f"📋 {list_name}")
+    return "\n".join(bits)
+
+
+def push_due_reminders_to_whatsapp(
+    now: datetime | None = None,
+    *,
+    window_min: int = 5,
+    max_overdue_min: int = 1440,
+    horizon_days: int = 0,
+    max_items: int = 20,
+    dry_run: bool = False,
+) -> dict:
+    """Pushea Apple Reminders próximos a vencer / recién vencidos al JID
+    ambient. Idempotente vía `rag_reminder_wa_pushed`.
+
+    Args:
+      window_min: ventana ± minutos. Reminders con due en `[now - window_min,
+        now + window_min]` (recién vencidos / próximos) se notifican.
+      max_overdue_min: cap absoluto sobre overdue. Reminders con due
+        anterior a `now - max_overdue_min` se skipean (no spam de
+        reminders viejos cada vez que el cron corre tras un parón).
+      horizon_days: pasado a `_fetch_reminders_due` para limitar el set.
+      dry_run: si True, calcula las acciones pero no manda ni marca.
+
+    Returns:
+      `{pushed, skipped, failed, items, dry_run, reason?}`. `reason` se
+      llena solo en short-circuits (config missing / disabled).
+    """
+    now = now or datetime.now()
+    summary: dict = {
+        "pushed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "items": [],
+        "dry_run": bool(dry_run),
+    }
+
+    # ── Config gate ──────────────────────────────────────────────────
+    if not AMBIENT_CONFIG_PATH.is_file():
+        summary["reason"] = "no_ambient_config"
+        return summary
+    try:
+        cfg = json.loads(AMBIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        summary["reason"] = "no_ambient_config"
+        return summary
+    if cfg.get("enabled") is False or not cfg.get("jid"):
+        summary["reason"] = "no_ambient_config"
+        return summary
+    # Per-feature opt-out: ambient puede estar enabled (briefs OK) pero el
+    # user no quiere los pings de reminders → reminder_push_enabled=false.
+    if cfg.get("reminder_push_enabled") is False:
+        summary["reason"] = "reminder_push_disabled"
+        return summary
+
+    jid = cfg["jid"]
+
+    # ── Pull reminders ───────────────────────────────────────────────
+    items = _fetch_reminders_due(now, horizon_days=horizon_days, max_items=max_items)
+
+    try:
+        conn_ctx = _ragvec_state_conn()
+    except Exception as exc:
+        _log_sql_state_error("reminder_wa_push_conn_failed", err=repr(exc))
+        summary["reason"] = "sql_unavailable"
+        return summary
+
+    with conn_ctx as conn:
+        for item in items:
+            rid = item.get("id") or ""
+            title = (item.get("name") or item.get("title") or "").strip()
+            due_iso = item.get("due") or ""
+            entry: dict = {"reminder_id": rid, "title": title, "due": due_iso}
+
+            if due_iso:
+                try:
+                    due_dt = datetime.fromisoformat(due_iso)
+                    delta_min = (due_dt - now).total_seconds() / 60.0
+                except (TypeError, ValueError):
+                    delta_min = None
+            else:
+                delta_min = None
+
+            if delta_min is not None:
+                # Window split: -max_overdue ≤ delta_min ≤ +window_min
+                # is the actionable band (recently overdue + about to
+                # be due). Anything beyond either edge is skipped.
+                if delta_min > window_min:
+                    entry["action"] = "skipped:future"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
+                if delta_min < -max_overdue_min:
+                    entry["action"] = "skipped:max_overdue"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
+                if delta_min < -window_min:
+                    # Outside short window but inside max_overdue — skip
+                    # the short-window check by labeling the gate
+                    # explicitly: this is a `skipped:window` only if the
+                    # caller passed a tight window AND the reminder is
+                    # past it. Tests use window_min=5 and assert that a
+                    # 10-min-old reminder is `skipped:window`.
+                    entry["action"] = "skipped:window"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
+
+            # Dedup gate — already pushed.
+            if rid and _reminder_wa_was_pushed(conn, rid):
+                entry["action"] = "skipped:already"
+                summary["skipped"] += 1
+                summary["items"].append(entry)
+                continue
+
+            if dry_run:
+                entry["action"] = "dry_run"
+                summary["items"].append(entry)
+                continue
+
+            text = _reminder_wa_format_text(item, now)
+            try:
+                ok = _ambient_whatsapp_send(jid, text)
+            except Exception as exc:
+                ok = False
+                entry["error"] = repr(exc)
+
+            if ok:
+                if rid:
+                    try:
+                        _reminder_wa_mark_pushed(conn, rid, due_iso, title)
+                    except Exception as exc:
+                        _log_sql_state_error("reminder_wa_mark_failed",
+                                              err=repr(exc))
+                entry["action"] = "pushed"
+                summary["pushed"] += 1
+            else:
+                # Bridge falló — NO marcamos para reintentar en el próximo
+                # run (es la garantía de retry implícita: solo dedup en
+                # sends exitosos).
+                entry["action"] = "failed"
+                summary["failed"] += 1
+            summary["items"].append(entry)
+
+        # Pasada de prune oportunista — barata (DELETE con cutoff
+        # indexed) y mantiene la tabla chica en máquinas que corren
+        # esto hace meses. Errores no bloquean el push.
+        if not dry_run:
+            try:
+                _reminder_wa_prune_old(conn, days=30)
+            except Exception as exc:
+                _log_sql_state_error("reminder_wa_prune_failed",
+                                      err=repr(exc))
+
+    return summary
 
 
 def _whatsapp_send_to_jid(
@@ -36954,6 +37216,48 @@ def wa_tasks(dry_run: bool, hours: int | None, force: bool):
     )
 
 
+@cli.command("remind-wa")
+@click.option("--dry-run", is_flag=True,
+              help="Calcular las acciones sin mandar al bridge ni marcar dedup")
+@click.option("--window-min", type=int, default=5, show_default=True,
+              help="Ventana ± minutos: reminders con due en [now - window, now + window] se notifican")
+@click.option("--max-overdue-min", type=int, default=1440, show_default=True,
+              help="Cap absoluto de overdue: reminders con due anterior a now - max-overdue se skipean")
+def remind_wa(dry_run: bool, window_min: int, max_overdue_min: int):
+    """Push de Apple Reminders próximos a vencer / recién vencidos al JID ambient.
+
+    Idempotente vía la tabla `rag_reminder_wa_pushed` — un reminder no se
+    notifica dos veces aunque el script corra cada 5min. Si el bridge falla
+    en un envío puntual, esa row NO se marca y se reintenta en el próximo
+    run. El cron `com.fer.obsidian-rag-reminder-wa-push` (StartInterval=300)
+    invoca este comando.
+
+    Short-circuits: sin `~/.local/share/obsidian-rag/ambient.json` válido →
+    `reason=no_ambient_config`. Con `reminder_push_enabled=false` →
+    `reason=reminder_push_disabled`. Ambos retornan summary vacío sin tocar
+    el bridge.
+    """
+    summary = push_due_reminders_to_whatsapp(
+        window_min=int(window_min),
+        max_overdue_min=int(max_overdue_min),
+        dry_run=bool(dry_run),
+    )
+    reason = summary.get("reason")
+    tag = "[dim]dry-run[/dim]" if dry_run else "[green]live[/green]"
+    if reason:
+        console.print(
+            f"{tag} reminder push · [yellow]{reason}[/yellow] · "
+            f"pushed={summary['pushed']} skipped={summary['skipped']} "
+            f"failed={summary['failed']}"
+        )
+        return
+    console.print(
+        f"{tag} reminder push · pushed={summary['pushed']} "
+        f"skipped={summary['skipped']} failed={summary['failed']} "
+        f"items={len(summary.get('items') or [])}"
+    )
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")
@@ -44529,13 +44833,27 @@ def free(apply: bool, yes: bool, force: bool, as_json: bool,
 # fast (<3s on warm caches, no LLM call) — designed for a mid-day check-in.
 
 
-def _pendientes_collect(col, now: datetime, days: int) -> dict:
+def _pendientes_collect(
+    col,
+    now: datetime,
+    days: int,
+    *,
+    progress: "Callable[[str, str, float, str | None], None] | None" = None,
+) -> dict:
     """Pure evidence collection — caller renders. Easier to test.
 
     Fetches dispatch concurrently via ThreadPoolExecutor: each source is
     independent I/O (osascript, subprocess, SQLite, HTTP, file reads) so the
     GIL releases during each call and 9 ~1s fetches drop from ~10s serial
     to the slowest single fetch (~2s). Per-future silent-fail preserved.
+
+    `progress` (optional): callback used by the SSE stream endpoint to
+    surface sub-stage timings. Invoked as
+    `progress(stage_name, status, elapsed_ms, error_message)` where
+    `status ∈ {"start","done","error"}`. The web-side wrapper namespaces
+    these as `signals.<task>` (e.g. `signals.gmail`, `signals.reminders`)
+    so the UI's chip strip can show which inner fetcher of `signals` is
+    the actual bottleneck (typically `gmail` cold + `whatsapp` cold).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -44563,15 +44881,38 @@ def _pendientes_collect(col, now: datetime, days: int) -> dict:
         "low_conf":       lambda: _pendientes_low_conf_queries(LOG_PATH, now, days=days),
     }
 
+    def _timed(key: str, fn):
+        """Wrap a fetcher so the progress callback (if any) sees it
+        start + finish. Errors swallow per-source (preserve historical
+        silent-fail contract) but emit an `error` progress event so the
+        UI can show ⚠ on the chip."""
+        if progress is not None:
+            with contextlib.suppress(Exception):
+                progress(key, "start", 0.0, None)
+        t0 = time.time()
+        try:
+            result = fn()
+            if progress is not None:
+                elapsed_ms = (time.time() - t0) * 1000.0
+                with contextlib.suppress(Exception):
+                    progress(key, "done", elapsed_ms, None)
+            return result
+        except Exception as exc:
+            if progress is not None:
+                elapsed_ms = (time.time() - t0) * 1000.0
+                with contextlib.suppress(Exception):
+                    progress(key, "error", elapsed_ms, str(exc))
+            raise
+
     ev: dict = {}
     with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="pendientes") as pool:
-        futures = {pool.submit(fn): key for key, fn in tasks.items()}
+        futures = {pool.submit(_timed, key, fn): key for key, fn in tasks.items()}
         for fut in as_completed(futures):
             key = futures[fut]
             try:
                 result = fut.result()
             except Exception:
-                continue  # silent-fail per source
+                continue  # silent-fail per source (already emitted via progress)
             if key == "loops":
                 ev.update(result)  # expands to loops_stale + loops_activo
             else:

@@ -10842,6 +10842,28 @@ def _osascript_contact_search(predicate: str, value: str) -> dict | None:
     """
     global _contacts_permission_warned
     safe = (value or "").replace('"', '\\"')
+    # Pre-flight: asegurar que Contacts.app esté corriendo en background.
+    # Observado 2026-04-24 (Fer F.): sin esto, osascript fallaba con
+    # `Contacts got an error: Application isn't running. (-600)` cuando
+    # el user no tenía Contacts.app abierto, bloqueando
+    # `_whatsapp_jid_from_contact` → el proposal card aparecía con
+    # error="not_found" para contactos que existían. Ni `launch
+    # application` ni un `launch` adentro del `tell` block arreglan el
+    # -600 (el tell intenta bindar al app ya corriendo y falla antes de
+    # poder ejecutar launch). La única forma confiable es un subprocess
+    # `open -a Contacts --background` separado. Idempotente — si ya
+    # está corriendo, returno inmediato. `--background` evita que robe
+    # focus de la terminal o del browser del user.
+    try:
+        subprocess.run(
+            ["open", "-a", "Contacts", "--background"],
+            check=False, timeout=2.0,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # Silent-fail: si `open` falla, el osascript de abajo va a
+        # fallar con -600 igual y terminamos en el warning branch.
+        pass
     script = f'''
 on run
     tell application "Contacts"
@@ -19442,6 +19464,11 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
     so the chat can ask the user to be more specific.
     """
     query = (contact_name or "").strip()
+    # Strip leading `@` that the LLM sometimes emits for contact names —
+    # habit from Obsidian wikilinks `@Person` and Twitter-style mentions.
+    # Apple Contacts doesn't care about the sigil; we do.
+    if query.startswith("@"):
+        query = query.lstrip("@").strip()
     if not query:
         return {"jid": None, "full_name": None, "phones": [], "error": "empty_query"}
     # Reuse the existing osascript-backed contact lookup. Passes `query`

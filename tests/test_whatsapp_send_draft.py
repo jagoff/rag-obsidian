@@ -131,6 +131,35 @@ def test_jid_from_contact_empty_query():
     assert out["jid"] is None
 
 
+def test_jid_from_contact_strips_leading_at_sign(monkeypatch):
+    """El LLM a veces pasa el nombre con un `@` leading (hábito de
+    wikilinks tipo `@Grecia`). Apple Contacts no resuelve con el sigil,
+    entonces lo stripeamos defensive. Observed 2026-04-24: turn
+    `7aeb51f212cd` recibió `contact_name="@Grecia"` → not_found."""
+    captured = {}
+    def _fake_fetch(stem, email=None, canonical=None):
+        captured["stem"] = stem
+        captured["canonical"] = canonical
+        return {
+            "full_name": "Grecia Ferrari",
+            "phones": ["+5491155555555"],
+            "emails": [], "birthday": "",
+        }
+    monkeypatch.setattr(rag, "_fetch_contact", _fake_fetch)
+    out = rag._whatsapp_jid_from_contact("@Grecia")
+    assert out["error"] is None
+    assert out["jid"] == "5491155555555@s.whatsapp.net"
+    # The `@` should NOT reach Apple Contacts.
+    assert "@" not in captured["stem"]
+    assert "@" not in captured["canonical"]
+    # Multiple @ signs (paranoid) also get stripped.
+    out2 = rag._whatsapp_jid_from_contact("@@Grecia")
+    assert out2["error"] is None
+    # Only-@ query degenerates to empty.
+    out3 = rag._whatsapp_jid_from_contact("@")
+    assert out3["error"] == "empty_query"
+
+
 def test_jid_from_contact_not_found(monkeypatch):
     monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
     out = rag._whatsapp_jid_from_contact("Unicornio Imaginario")
@@ -307,6 +336,42 @@ def test_tool_addendum_mentions_whatsapp_send():
 
 
 # ── 6. Enrich hang fix (related sub-bug reported in the same turn) ─────────
+
+
+def test_detect_propose_intent_matches_whatsapp_send_verbs():
+    """Regresión 2026-04-24 iter2 (Fer F.): "enviale un mensaje a Grecia:
+    hola prueba" caía como prose — `_detect_propose_intent` devolvía False
+    y el LLM generaba texto sin llamar al tool. Fix: agregar los verbos
+    rioplatenses de enviar (con encliticos -le/-rle) al `_PROPOSE_INTENT_RE`.
+    """
+    # MUST match: send intent a un tercero.
+    positives = [
+        "enviale un mensaje a Grecia que diga: hola prueba",
+        "Enviale un mensje a Grecia ahora que diga: Yo soy EL RA",
+        "mandale un wzp a grecia que diga hola",
+        "mandá un mensaje a grecia",
+        "decile a grecia que llamo al medico",
+        "escribile a Papá que ya llegué",
+        "avisale a Juan que voy en camino",
+        "mandale a Grecia que me confirme",
+    ]
+    for q in positives:
+        assert rag._detect_propose_intent(q) is True, (
+            f"propose_intent debería ser True para {q!r}"
+        )
+
+    # MUST NOT match: queries de lectura que involucran mensajería.
+    negatives = [
+        "cuales son los ultimos wzp con grecia",    # read
+        "qué mensaje me mandó grecia",               # read (pasado)
+        "le envié a juan la plata",                  # declaration, past
+        "enviame un resumen de los mensajes",        # self-directed (no -le)
+        "decime que tengo para hoy",                 # imperative query
+    ]
+    for q in negatives:
+        assert rag._detect_propose_intent(q) is False, (
+            f"propose_intent NO debería ser True para {q!r}"
+        )
 
 
 def test_emit_enrich_hung_worker_does_not_block_stream(monkeypatch):

@@ -193,6 +193,74 @@ def test_drive_search_happy_path(monkeypatch):
     assert "trashed = false" in q_arg
 
 
+def test_drive_search_name_fallback_for_name_only_match(monkeypatch):
+    """Regresión 2026-04-24 iter 2 (Fer F.): cuando el usuario pregunta por
+    tokens que VIVEN en el NOMBRE del archivo pero NO en su contenido
+    indexado (caso típico: spreadsheet con nombre descriptivo "Alex -
+    Cuotas Macbook" pero contenido sólo numérico — cuotas, fechas), el
+    strict `fullText contains 'token1 token2'` devolvía 0 matches y el
+    chat respondía "no encontré nada en Drive". Fix: agregamos
+    `name contains 'tokenX'` OR por cada token ≥5 chars al clause, así
+    cualquiera de esos tokens presentes en el nombre dispara match aunque
+    el body no los tenga."""
+    listing = [{
+        "id": "planilla_alex",
+        "name": "Alex - Cuotas Macbook",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "modifiedTime": "2026-04-17T16:46:42.000Z",
+        "webViewLink": "https://docs.google.com/spreadsheets/d/planilla_alex/edit",
+        "lastModifyingUser": {"displayName": "Fer F."},
+    }]
+    bodies = {
+        "planilla_alex": "Cuotas,Precio,Fecha\nCuota 01,200000,14/11/2025\nFaltan,730000,",
+    }
+    svc = _FakeDriveService(listing, bodies)
+    monkeypatch.setattr(rag, "_drive_service", lambda: svc)
+
+    out = rag._agent_tool_drive_search(
+        "busca en mi drive cuánto adeuda alexis de la macbook pro"
+    )
+    parsed = json.loads(out)
+
+    # El tokenizer produce tokens ≥5 chars (alexis/macbook/adeuda) + "pro" (3).
+    assert parsed["tokens"] == ["adeuda", "alexis", "macbook", "pro"]
+    assert len(parsed["files"]) == 1
+    assert parsed["files"][0]["name"] == "Alex - Cuotas Macbook"
+    assert "730000" in parsed["files"][0]["body"]
+
+    q_arg = svc._files.list_calls[0]["q"]
+    # El nuevo shape tiene un OR-chain con name contains sólo para tokens
+    # ≥5 chars — "pro" queda fuera para no inflar con falsos positivos.
+    assert "name contains 'alexis'" in q_arg
+    assert "name contains 'macbook'" in q_arg
+    assert "name contains 'adeuda'" in q_arg
+    # "pro" (3 chars) NO debe estar en el name-OR chain — demasiado
+    # genérico, matchea todo tipo de archivos ("Resume pro", "AWS
+    # pricing"…).
+    assert "name contains 'pro'" not in q_arg
+    # fullText AND sigue siendo el first-match más barato.
+    assert "fullText contains 'adeuda alexis macbook pro'" in q_arg
+
+
+def test_drive_search_short_tokens_only_falls_back_to_fulltext(monkeypatch):
+    """Si TODOS los tokens son <5 chars (caso raro), no agregamos name-OR
+    chain y usamos sólo `fullText contains`. Esto evita queries con cero
+    tokens específicos que traerían falsos positivos masivos (p.ej.
+    "dame mail pro" → name contains 'pro' matchea cualquier cosa)."""
+    listing = []
+    svc = _FakeDriveService(listing, {})
+    monkeypatch.setattr(rag, "_drive_service", lambda: svc)
+
+    # "app" + "dev" + "ceo" — todos ≤4 chars.
+    out = rag._agent_tool_drive_search("buscá app dev ceo")
+    _ = json.loads(out)
+
+    q_arg = svc._files.list_calls[0]["q"]
+    # Sólo fullText — sin name-OR chain.
+    assert "fullText contains 'app dev ceo'" in q_arg
+    assert "name contains" not in q_arg
+
+
 def test_drive_search_api_error_is_silent(monkeypatch):
     class _BoomService:
         def files(self):

@@ -31717,8 +31717,38 @@ def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 350
     # Drive's `fullText contains 'a b c'` matches files whose indexed text
     # has all of those tokens (space-separated acts as AND, not phrase).
     # Escape single quotes per the API spec: ' → \\'.
+    #
+    # 2026-04-24 regression (Fer F. report): "alexis macbook pro" no
+    # devolvía el spreadsheet "Alex - Cuotas Macbook" porque el contenido
+    # del file son sólo números + fechas (celdas del spreadsheet), SIN
+    # las palabras "alexis" / "macbook" indexadas como fullText. Pero
+    # el NOMBRE del archivo sí las tiene. Fix: OR entre `fullText
+    # contains` (tokens AND) y `name contains` (cualquier token). Drive
+    # limita a 1 `name contains` por clause — usamos un `or` chain
+    # explícito por token. Esto surfacea spreadsheets / docs con nombres
+    # descriptivos aunque su contenido sea numérico. Trade-off: puede
+    # traer falsos positivos si un token común ("pro", "info") matchea
+    # nombres genéricos — mitigado por el tokenizer que filtra stopwords
+    # + cap de `max_files` + ordenar por `modifiedTime desc`.
     joined = " ".join(tokens).replace("\\", "\\\\").replace("'", "\\'")
-    q = f"fullText contains '{joined}' and trashed = false"
+    # name_or solo con tokens "específicos" (≥5 chars) — descarta palabras
+    # cortas como "pro" / "info" / "app" / "foo" que producen demasiados
+    # falsos positivos por matchear nombres de archivos genéricos. El
+    # umbral 5 es empírico: "alexis" (6), "macbook" (7), "adeuda" (6),
+    # "factura" (7) — todos quedan. "pro" (3), "mail" (4), "doc" (3) no.
+    name_tokens = [t for t in tokens if len(t) >= 5]
+    if name_tokens:
+        name_or = " or ".join(
+            f"name contains '{t.replace(chr(92), chr(92)*2).replace(chr(39), chr(92)+chr(39))}'"
+            for t in name_tokens
+        )
+        q = (
+            f"(fullText contains '{joined}' or ({name_or})) "
+            "and trashed = false"
+        )
+    else:
+        # Si todos los tokens son muy cortos, confiamos sólo en fullText.
+        q = f"fullText contains '{joined}' and trashed = false"
     try:
         resp = svc.files().list(
             q=q,

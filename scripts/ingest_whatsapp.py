@@ -148,11 +148,29 @@ def _save_media_cursor(
 
 
 def _load_cursor(conn: sqlite3.Connection, chat_jid: str) -> float:
-    row = conn.execute(
-        "SELECT last_ts FROM rag_whatsapp_state WHERE chat_jid = ?",
-        (chat_jid,),
-    ).fetchone()
-    return float(row[0]) if row else 0.0
+    """Retorna el cursor (last_ts) para un chat_jid, o 0.0 si no existe.
+
+    2026-04-24 audit: el row puede existir pero con `last_ts = NULL`
+    (corrupción manual, migración parcial). Sin el guard `row[0] is not
+    None`, `float(None)` lanza TypeError y el caller no distingue entre
+    "no cursor" vs "cursor corrupto" — ambos terminan re-procesando
+    TODOS los mensajes desde epoch. Con el guard, NULL se trata igual
+    que missing (re-process desde 0), pero si el row futuro se
+    arregla, seguimos leyendo correcto.
+    """
+    try:
+        row = conn.execute(
+            "SELECT last_ts FROM rag_whatsapp_state WHERE chat_jid = ?",
+            (chat_jid,),
+        ).fetchone()
+        if row and row[0] is not None:
+            return float(row[0])
+    except (sqlite3.Error, TypeError, ValueError):
+        # DB corrupta / tipo inesperado → fallback seguro a 0.0.
+        # El caller hará re-process desde epoch, worst-case lento pero
+        # nunca crash.
+        pass
+    return 0.0
 
 
 def _save_cursor(
@@ -870,9 +888,34 @@ def run(
         ts_id = latest.get(m.chat_jid)
         if ts_id is None or m.timestamp > ts_id[0]:
             latest[m.chat_jid] = (m.timestamp, m.id)
-    for jid, (ts, mid) in latest.items():
-        _save_cursor(state_conn, jid, ts, mid)
-    state_conn.commit()
+    # 2026-04-24 audit: wrap cursor writes en BEGIN IMMEDIATE para
+    # serializar escrituras concurrentes (cron + manual `rag index
+    # --source whatsapp` corriendo en paralelo). BEGIN IMMEDIATE
+    # adquiere el write-lock de sqlite antes de cualquier escritura,
+    # así que 2 ingesters no pueden escribir cursors al mismo tiempo.
+    # Sin esto, ambos podían leer el cursor viejo, procesar los
+    # mismos mensajes, y escribir el cursor final con los timestamps
+    # propios — con las filas de upsert_chunks potencialmente
+    # duplicadas. Ahora el 2do writer espera al 1ro.
+    #
+    # Rollback si la contención es excesiva (poco probable, son
+    # writes de 1-10 cursors per run): cambiar a `BEGIN DEFERRED` o
+    # eliminar el `execute("BEGIN IMMEDIATE")` → vuelve al commit
+    # implícito del driver.
+    try:
+        state_conn.execute("BEGIN IMMEDIATE")
+        for jid, (ts, mid) in latest.items():
+            _save_cursor(state_conn, jid, ts, mid)
+        state_conn.commit()
+    except sqlite3.Error:
+        # Rollback en error — la próxima corrida re-intenta con
+        # cursor viejo (peor caso: re-procesa algunos mensajes,
+        # idempotente via `col.delete()` en upsert_chunks).
+        try:
+            state_conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
 
     # Image → cita detector. Corre DESPUÉS del ingest de mensajes para que
     # un fallo en el detector no bloquee la indexación normal de chats.

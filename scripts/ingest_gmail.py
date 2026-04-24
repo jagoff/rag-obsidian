@@ -626,8 +626,22 @@ def run(
             _, hid2 = get_profile(service)
             new_hid = hid2 or profile_hid
         if new_hid:
-            _save_history_id(state_conn, account_id, str(new_hid))
-            state_conn.commit()
+            # 2026-04-24 audit: BEGIN IMMEDIATE serializa escrituras del
+            # cursor `history_id` si 2 ingesters corren en paralelo
+            # (cron + manual). Sin esto, el 2do escritor podía pisar
+            # el `history_id` del 1ro con un valor stale que leyó
+            # antes del commit del 1ro → próxima corrida re-procesa
+            # el mismo rango history.
+            try:
+                state_conn.execute("BEGIN IMMEDIATE")
+                _save_history_id(state_conn, account_id, str(new_hid))
+                state_conn.commit()
+            except sqlite3.Error:
+                try:
+                    state_conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
     else:
         summary["threads_indexed"] = len(threads)
         summary["threads_deleted"] = len(delete_tids)

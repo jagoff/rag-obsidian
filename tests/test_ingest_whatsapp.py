@@ -513,3 +513,81 @@ def test_speaker_label_invariant_in_chunk_body(tmp_path, monkeypatch) -> None:
 
     rag._phone_index_cache = None
     rag._mentions_cache = None
+
+
+# ── Audit 2026-04-24 hardening: _load_cursor NULL guard + atomic saves ───
+
+
+def test_load_cursor_handles_null_last_ts(tmp_path):
+    """Pre-audit: si `rag_whatsapp_state.last_ts` era NULL (corrupción
+    manual o migración parcial), `float(row[0])` lanzaba TypeError que
+    propagaba hasta arriba — re-procesaba TODOS los mensajes desde
+    epoch en esta y todas las próximas corridas (no había recover).
+    Post-fix: NULL se trata como missing, cursor vuelve a 0.0 sin
+    crash."""
+    state_db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(state_db))
+    conn.execute(
+        "CREATE TABLE rag_whatsapp_state ("
+        " chat_jid TEXT PRIMARY KEY, last_ts REAL, last_msg_id TEXT,"
+        " updated_at TEXT NOT NULL)"
+    )
+    # Row existe pero last_ts es NULL.
+    conn.execute(
+        "INSERT INTO rag_whatsapp_state (chat_jid, last_ts, last_msg_id, updated_at) "
+        "VALUES (?, NULL, 'x', '2026-04-24')",
+        ("broken-jid",),
+    )
+    conn.commit()
+
+    # No debería lanzar TypeError; debería devolver 0.0 gracefully.
+    result = iw._load_cursor(conn, "broken-jid")
+    assert result == 0.0
+    # Chat no existe → 0.0 también.
+    assert iw._load_cursor(conn, "missing-jid") == 0.0
+    conn.close()
+
+
+def test_load_cursor_handles_corrupt_value_gracefully(tmp_path):
+    """Si alguien mete un string no-numérico en last_ts, no crash."""
+    state_db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(state_db))
+    conn.execute(
+        "CREATE TABLE rag_whatsapp_state ("
+        " chat_jid TEXT PRIMARY KEY, last_ts TEXT, last_msg_id TEXT,"
+        " updated_at TEXT NOT NULL)"
+    )
+    # Valor no parseable como float.
+    conn.execute(
+        "INSERT INTO rag_whatsapp_state (chat_jid, last_ts, last_msg_id, updated_at) "
+        "VALUES (?, 'not-a-number', 'x', '2026-04-24')",
+        ("corrupt-jid",),
+    )
+    conn.commit()
+
+    # Debería fallback a 0.0 via el except ValueError.
+    result = iw._load_cursor(conn, "corrupt-jid")
+    assert result == 0.0
+    conn.close()
+
+
+def test_load_cursor_valid_row_returns_float(tmp_path):
+    """No-regresión: happy path con last_ts legítimo devuelve float."""
+    state_db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(state_db))
+    conn.execute(
+        "CREATE TABLE rag_whatsapp_state ("
+        " chat_jid TEXT PRIMARY KEY, last_ts REAL, last_msg_id TEXT,"
+        " updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO rag_whatsapp_state (chat_jid, last_ts, last_msg_id, updated_at) "
+        "VALUES (?, 1713400000.5, 'msg-abc', '2026-04-24')",
+        ("ana@s.whatsapp.net",),
+    )
+    conn.commit()
+
+    result = iw._load_cursor(conn, "ana@s.whatsapp.net")
+    assert result == 1713400000.5
+    assert isinstance(result, float)
+    conn.close()

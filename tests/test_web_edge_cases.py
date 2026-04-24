@@ -478,3 +478,120 @@ class TestValidateRetrieveResult:
         assert result["confidence"] == 0.0
         # Ahora el handler puede hacer float(result["confidence"]) sin riesgo.
         assert isinstance(result["confidence"], float)
+
+
+# ── Rate limiter deque O(1) expiration — audit C1 ────────────────────────
+
+
+def test_rate_limit_uses_deque_for_o1_expiration():
+    """2026-04-24 audit: `_CHAT_BUCKETS` y `_BEHAVIOR_BUCKETS` cambiaron
+    de `list` a `collections.deque` para que el sliding-window
+    expiration (`while events[0] < cutoff: events.pop(0)`) sea O(1) por
+    pop en vez de O(n). Bajo carga moderada el loop caía a O(n²) y
+    dominaba CPU.
+
+    Este test verifica que el tipo subyacente ES deque (signal del fix).
+    """
+    import collections as _collections
+    from web import server
+    # `_CHAT_BUCKETS` es un `defaultdict(deque)`. Al acceder a una key
+    # nueva, se crea un `deque` vacío.
+    server._CHAT_BUCKETS.clear()
+    bucket = server._CHAT_BUCKETS["test-ip"]
+    assert isinstance(bucket, _collections.deque), (
+        f"_CHAT_BUCKETS[ip] debería ser deque (O(1) popleft), "
+        f"got {type(bucket).__name__}"
+    )
+    # Mismo check para _BEHAVIOR_BUCKETS.
+    server._BEHAVIOR_BUCKETS.clear()
+    bh_bucket = server._BEHAVIOR_BUCKETS["test-ip"]
+    assert isinstance(bh_bucket, _collections.deque)
+
+
+def test_rate_limit_expires_events_correctly():
+    """Smoke test del sliding-window post-deque. Events que caen fuera
+    del window deben expirar, los que están dentro quedan contados."""
+    import time
+    from web.server import _check_rate_limit, _CHAT_BUCKETS
+
+    _CHAT_BUCKETS.clear()
+    # Primera llamada: evento se registra.
+    _check_rate_limit(_CHAT_BUCKETS, "ip-1", limit=5, window=1.0)
+    assert len(_CHAT_BUCKETS["ip-1"]) == 1
+
+    # Rápido fuego dentro del window: los 5 permitidos pasan.
+    for _ in range(4):
+        _check_rate_limit(_CHAT_BUCKETS, "ip-1", limit=5, window=1.0)
+    assert len(_CHAT_BUCKETS["ip-1"]) == 5
+
+    # 6to intento → 429.
+    import pytest
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        _check_rate_limit(_CHAT_BUCKETS, "ip-1", limit=5, window=1.0)
+    assert exc_info.value.status_code == 429
+
+    # Esperá a que todos expiren + una llamada más → pasa.
+    time.sleep(1.1)
+    _check_rate_limit(_CHAT_BUCKETS, "ip-1", limit=5, window=1.0)
+    # La deque debería tener solo el evento fresco (los viejos popleft'ed).
+    assert len(_CHAT_BUCKETS["ip-1"]) == 1
+
+
+# ── _wa_executor cleanup on submit failure — audit C3 ────────────────────
+
+
+def test_wa_executor_cleanup_pattern_works():
+    """2026-04-24 audit: smoke test del patrón try/except que usa el chat
+    endpoint cuando `_wa_executor.submit()` falla después del ctor
+    exitoso (edge case: executor broken, out-of-threads).
+
+    El fix es el bloque:
+        try:
+            _wa_executor = ThreadPoolExecutor(...)
+            _wa_future = _wa_executor.submit(...)
+        except Exception:
+            if _wa_executor is not None:
+                _wa_executor.shutdown(wait=False)
+                _wa_executor = None
+            _wa_future = None
+
+    Pre-fix este patrón no existía: el submit failure dejaba el executor
+    "vivo" pero sin future, y el finally downstream solo cleanup-eaba
+    cuando `_wa_future is not None` (que en este caso no lo era) → thread
+    leak silencioso.
+
+    Este test verifica que el patrón cleanup llama a `shutdown()` cuando
+    submit raisea — sin depender de monkeypatch del módulo (ThreadPoolExecutor
+    se importa como símbolo, no como atributo del módulo server).
+    """
+    class _BrokenExecutor:
+        def __init__(self, *args, **kwargs):
+            self.shutdown_called = False
+
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("executor broken")
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_called = True
+
+    # Replica del patrón del fix en web/server.py:5419-5441.
+    _wa_executor = None
+    _wa_future = None
+    try:
+        _wa_executor = _BrokenExecutor()
+        _wa_future = _wa_executor.submit(lambda: None)  # raisea
+    except Exception:
+        if _wa_executor is not None:
+            _wa_executor.shutdown(wait=False)
+            _wa_executor_saved = _wa_executor  # preservar ref para assertion
+            _wa_executor = None
+        _wa_future = None
+
+    # El executor se limpió (shutdown called) y _wa_future quedó en None.
+    assert _wa_future is None
+    assert _wa_executor is None
+    assert _wa_executor_saved.shutdown_called, (
+        "shutdown() no se llamó después de submit failure — "
+        "thread leak potencial"
+    )

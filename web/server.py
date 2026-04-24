@@ -1458,7 +1458,7 @@ def submit_feedback(req: FeedbackRequest) -> dict:
 import collections as _collections
 import threading as _threading
 
-_BEHAVIOR_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
+_BEHAVIOR_BUCKETS: dict[str, _collections.deque] = _collections.defaultdict(_collections.deque)
 _BEHAVIOR_RATE_LIMIT = 120
 _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
 
@@ -1467,24 +1467,34 @@ _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
 # and stops an adversarial loop (e.g. browser extension gone rogue) from
 # starving the daemon. Separate from behavior bucket so clicks don't
 # consume chat budget.
-_CHAT_BUCKETS: dict[str, list[float]] = _collections.defaultdict(list)
+_CHAT_BUCKETS: dict[str, _collections.deque] = _collections.defaultdict(_collections.deque)
 _CHAT_RATE_LIMIT = 30
 _CHAT_RATE_WINDOW = 60.0
 
 # Single lock protects both buckets — contention is effectively nil
-# (list.append under GIL is fast enough that a lock hold measures in µs).
+# (deque.append under GIL is fast enough that a lock hold measures in µs).
+# 2026-04-24 audit: cambio `list` → `collections.deque` para que la
+# expiración del sliding window sea O(1) con `popleft()` en vez de
+# O(n) con `list.pop(0)`. Bajo carga moderada (1000+ req/min) el
+# loop `while events and events[0] < cutoff: events.pop(0)` podía
+# converger a O(n²) y dominar CPU del handler. Deque hace el shift
+# constant-time. Los tests que hacen `_CHAT_BUCKETS.clear()` siguen
+# funcionando igual (deque soporta `.clear()`).
 _RATE_LIMIT_LOCK = _threading.Lock()
 
 
-def _check_rate_limit(bucket: dict[str, list[float]], ip: str,
+def _check_rate_limit(bucket: dict[str, "_collections.deque"], ip: str,
                       limit: int, window: float) -> None:
     """Sliding-window rate limit per-IP. Raises HTTPException 429 on breach."""
     now = time.time()
     cutoff = now - window
     with _RATE_LIMIT_LOCK:
         events = bucket[ip]
+        # `popleft()` O(1) en deque. Antes con `list.pop(0)` cada remoción
+        # era O(len(events)) → bajo carga con 30 events en ventana el
+        # loop completo caía a O(n²). Cambio a deque baja el cost a O(n).
         while events and events[0] < cutoff:
-            events.pop(0)
+            events.popleft()
         if len(events) >= limit:
             raise HTTPException(status_code=429, detail="rate limit exceeded")
         events.append(now)
@@ -5407,8 +5417,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         _wa_future = None
         _t_wa_start = time.perf_counter()
         if _wa_in_query:
-            _wa_executor = ThreadPoolExecutor(max_workers=1)
-            _wa_future = _wa_executor.submit(_fetch_whatsapp_unread, 24, 8)
+            # Crear el executor + submit en un try/except que garantice
+            # cleanup si submit falla (raro: RuntimeError si el executor
+            # quedó broken, ResourceError si no hay threads libres).
+            # 2026-04-24 audit: pre-fix, si `submit` lanzaba después de
+            # que `ThreadPoolExecutor()` tuvo éxito, el executor quedaba
+            # "vivo" pero sin future y el finally downstream (que chequea
+            # `if _wa_future is None`) ni siquiera entraba al path con
+            # el shutdown. Thread leak silencioso. Ahora si falla submit,
+            # shutdown inmediato y dejamos ambos en None — el handler
+            # downstream trata el caso como "WA fetch no fired".
+            try:
+                _wa_executor = ThreadPoolExecutor(max_workers=1)
+                _wa_future = _wa_executor.submit(_fetch_whatsapp_unread, 24, 8)
+            except Exception as _exc:
+                print(
+                    f"[chat-wa-executor-submit-failed] {type(_exc).__name__}: {_exc}",
+                    flush=True,
+                )
+                if _wa_executor is not None:
+                    _wa_executor.shutdown(wait=False)
+                    _wa_executor = None
+                _wa_future = None
 
         # Conversation-aware reformulation is a qwen2.5:3b call that costs
         # 0.6-2s. Only worth paying for short follow-ups that rely on prior

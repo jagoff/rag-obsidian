@@ -584,11 +584,28 @@ app.mount(
 #      which would open the API to every page in the browser.
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402 — must go after `app = FastAPI(...)`
 
+# LAN IP privada (192.168.x.x / 10.x.x.x / 172.16-31.x.x) se permite sólo
+# cuando OBSIDIAN_RAG_ALLOW_LAN=1 — empareja con OBSIDIAN_RAG_BIND_HOST=
+# 0.0.0.0 para exponer la PWA al iPhone vía `http://192.168.x.x:8765`.
+# Sin el flag el regex se mantiene igual que antes (localhost only).
+_allow_lan = os.environ.get("OBSIDIAN_RAG_ALLOW_LAN", "").strip().lower() in ("1", "true", "yes")
+if _allow_lan:
+    # RFC1918 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. Nada más.
+    # Refuses file:// y cualquier IP pública.
+    _cors_regex = (
+        r"^http://("
+        r"127\.0\.0\.1|localhost|"
+        r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+        r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+        r"192\.168\.\d{1,3}\.\d{1,3}"
+        r")(:[0-9]+)?$"
+    )
+else:
+    _cors_regex = r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$"
+
 app.add_middleware(
     CORSMiddleware,
-    # Regex matches localhost / 127.0.0.1 with any port or no port.
-    # Refuses anything else, including file:// and 0.0.0.0.
-    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$",
+    allow_origin_regex=_cors_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -7874,4 +7891,10 @@ def system_metrics_api(hours: int = 24) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+    # Bind host: default 127.0.0.1 (localhost-only, el estándar). Para
+    # exponer el server al LAN (ej. PWA en iPhone, accede por
+    # `http://192.168.x.x:8765`), setear OBSIDIAN_RAG_BIND_HOST=0.0.0.0.
+    # Ojo: sin auth, cualquiera en el mismo WiFi puede leer el vault —
+    # úsalo sólo en red doméstica confiable.
+    bind_host = os.environ.get("OBSIDIAN_RAG_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    uvicorn.run(app, host=bind_host, port=8765, log_level="info")

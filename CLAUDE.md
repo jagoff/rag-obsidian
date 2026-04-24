@@ -156,6 +156,36 @@ O bumpear `CACHE_VERSION` en [`web/static/sw.js`](web/static/sw.js) — el nuevo
 
 Tests: [`tests/test_web_pwa.py`](tests/test_web_pwa.py) (9 casos: manifest mime+body+cache, SW headers+body, files-on-disk, 3 HTML wiring, shortcut routes válidas).
 
+### Exponer la PWA al LAN (iPhone accede por IP del Mac)
+
+`ra.ai` está mapeado a `127.0.0.1` en `/etc/hosts` + Caddy con `tls internal` → funciona sólo desde el Mac local. Para que el iPhone instale la PWA desde el mismo WiFi hay que exponer el server uvicorn al LAN:
+
+**Dos env vars emparejadas** (ambas deben estar seteadas, o ninguna):
+
+- `OBSIDIAN_RAG_BIND_HOST=0.0.0.0` — uvicorn bindea a todas las interfaces (default `127.0.0.1`). Ver [`web/server.py`](web/server.py) en el `__main__`.
+- `OBSIDIAN_RAG_ALLOW_LAN=1` — extiende el regex de CORS a los 3 rangos privados [RFC1918](https://datatracker.ietf.org/doc/html/rfc1918): `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. Sin este flag, aunque el puerto esté accesible el browser bloquea el CORS porque el Origin no matchea localhost. Ver [`web/server.py`](web/server.py) sobre el bloque `CORSMiddleware`.
+
+Ambas están seteadas en [`~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist`](~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist). Para aplicar tras editar el plist: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist`. (`kickstart -k` re-lanza el process pero NO relee las env vars — hay que hacer bootout+bootstrap para que agarre cambios del plist).
+
+**Tradeoff importante sobre HTTPS y el SW**:
+
+iOS registra service workers sólo en "secure contexts" (HTTPS o `localhost`). Una IP LAN HTTP (`http://192.168.x.x:8765`) **no es secure context** → el SW no se registra → **se pierde el offline cache** y el "instant-on" desde cache al reabrir.
+
+Lo que **sí funciona sobre HTTP LAN** (el 90% del feel nativo): icon en home screen, splash screen, fullscreen standalone (sin chrome de Safari), Dynamic Island respetado. En red doméstica con el Mac prendido el impacto es nulo porque el fetch al Mac es ~20ms.
+
+Para **full PWA con SW** sobre LAN, la ruta es: (1) agregar un bloque Caddy para la IP del Mac (además del `ra.ai`) con `tls internal`, (2) exportar el root CA de Caddy (`~/Library/Application Support/Caddy/pki/authorities/local/root.crt`) al iPhone vía AirDrop, (3) Settings → General → VPN & Device Management → Install Profile → Trust. Post-trust el iPhone acepta el cert self-signed y el SW registra como si fuera HTTPS público.
+
+**Seguridad**: el server **no tiene auth**. En modo LAN-exposed cualquiera en el mismo WiFi puede leer el vault. Safe en red doméstica con WiFi privado; NUNCA activar en café/coworking/airport. Rollback a localhost-only:
+
+```bash
+# Sacar las dos env vars del plist y recargar
+sed -i '' '/OBSIDIAN_RAG_ALLOW_LAN\|OBSIDIAN_RAG_BIND_HOST/,/<\/string>/d' ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist
+```
+
+Los defaults del código (`127.0.0.1` + regex localhost-only) se preservan si las env vars no están — sin estas dos variables setedas el server se comporta idéntico a antes.
+
 ## Commands
 
 ```bash

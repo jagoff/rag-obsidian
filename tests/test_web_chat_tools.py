@@ -993,6 +993,131 @@ def test_source_intent_hint_omitted_when_no_source_specific_tools(
     assert not any("INTENCIÓN EXPLÍCITA" in m["content"] for m in system_msgs)
 
 
+# ── 10.5. CONTEXTO preservation cuando todos los tools del pre-router vuelven vacíos ─
+
+
+@pytest.mark.requires_ollama
+def test_empty_tool_output_preserves_vault_context(chat_env, monkeypatch):
+    """Regression 2026-04-24 iteración 2 (Fer F.): el user preguntó
+    "cuales son mis ultimos mails?", el pre-router disparó `gmail_recent`
+    (tras fix plurales), pero el tool vino vacío (no había starred ni
+    awaiting-reply). La lógica original REEMPLAZABA el CONTEXTO entero
+    con el tool output vacío → descartaba el retrieve del vault (que
+    podía incluir `03-Resources/Gmail/YYYY-MM-DD.md` con mails indexados)
+    → el LLM respondía "te dejo otras fuentes que podrían ayudarte" de
+    forma genérica, sin material para resumir.
+
+    Fix: cuando `_is_empty_tool_output` es True para TODOS los
+    `_forced_results`, preservamos el CONTEXTO original del vault y
+    agregamos el tool output como sección "CONSULTAS EN VIVO (todas
+    vacías)". Así el LLM tiene las notas del vault disponibles como
+    fallback concreto.
+
+    Este test stubbea `gmail_recent` para que devuelva vacío, deja el
+    `multi_retrieve` canned (que retorna 2 notas del vault), y verifica
+    que el `user` msg enviado al LLM contiene BOTH el CONTEXTO del vault
+    Y el marker de CONSULTAS EN VIVO.
+    """
+    # gmail_recent → empty.
+    monkeypatch.setattr(
+        tools_mod, "_fetch_gmail_evidence",
+        lambda now: {"unread_count": 0, "awaiting_reply": [], "starred": []},
+    )
+
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),   # tool-deciding round
+        _mk_stream(["ok"]),       # streaming final
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("cuales son mis ultimos mails?")
+    assert mock.calls, "se esperaba al menos una call a ollama.chat"
+
+    # En la PRIMERA call (tool-deciding round, pre-router ya inyectó
+    # el user_content nuevo) el user msg debería incluir:
+    #   1. Al menos una marca del CONTEXTO del vault (canned: "doc 1 body"
+    #      o "doc 2 body" o "01-Projects/a.md").
+    #   2. El marker "CONSULTAS EN VIVO" del tool empty.
+    #   3. La sección rendered "### Mails" con "_Sin mails pendientes._".
+    first_call = mock.calls[0]
+    messages = first_call.get("messages") or []
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    assert user_msgs, "no hay user msg en las messages del LLM"
+    user_content = user_msgs[-1]["content"]
+
+    # CONTEXTO original del vault preservado.
+    assert "CONTEXTO:" in user_content, (
+        f"CONTEXTO del vault no preservado cuando tool output es empty. "
+        f"user_content[:300]={user_content[:300]!r}"
+    )
+    # Alguna evidencia de las notas canneadas por _canned_retrieve_result.
+    # Los docs canned tienen path "01-Projects/a.md" + "02-Areas/b.md"
+    # y bodies "doc 1 body" + "doc 2 body".
+    assert ("doc 1 body" in user_content) or ("doc 2 body" in user_content) or (
+        "01-Projects/a.md" in user_content or "02-Areas/b.md" in user_content
+    ), f"contenido del vault no aparece en el user msg: {user_content[:500]!r}"
+
+    # Marker de tools vacíos + header de gmail.
+    assert "CONSULTAS EN VIVO" in user_content, (
+        f"marker de 'consultas en vivo vacías' no aparece: "
+        f"{user_content[:500]!r}"
+    )
+    assert "### Mails" in user_content
+    assert "_Sin mails pendientes._" in user_content
+
+
+@pytest.mark.requires_ollama
+def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
+    """No-regresión: cuando el pre-router dispara un tool con DATA (no
+    empty), el comportamiento original se mantiene — el CONTEXTO se
+    reemplaza con el tool output y el vault se descarta (era la decisión
+    de diseño original: tool output es authoritative > vault retrieve).
+    """
+    # gmail_recent → con data (starred thread).
+    monkeypatch.setattr(
+        tools_mod, "_fetch_gmail_evidence",
+        lambda now: {
+            "unread_count": 3,
+            "awaiting_reply": [],
+            "starred": [{
+                "subject": "Proyecto Alpha",
+                "from": "juan@example.com",
+                "snippet": "necesito tu feedback",
+                "thread_id": "tid-1",
+                "internal_date_ms": 1_730_000_000_000,
+            }],
+        },
+    )
+
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["ok"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("revisar mails")
+    assert mock.calls, "se esperaba al menos una call a ollama.chat"
+
+    first_call = mock.calls[0]
+    messages = first_call.get("messages") or []
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    user_content = user_msgs[-1]["content"]
+
+    # Flag del comportamiento "authoritative": el prefijo hace explícita
+    # la sustitución ("no del vault").
+    assert "CONTEXTO (datos en vivo, no del vault)" in user_content
+    # El marker de "CONSULTAS EN VIVO todas vacías" NO debe aparecer
+    # porque el tool sí trajo data.
+    assert "CONSULTAS EN VIVO" not in user_content
+    # La retrieve canned no debe estar — el CONTEXTO fue reemplazado.
+    assert "doc 1 body" not in user_content
+    assert "doc 2 body" not in user_content
+    # La data del tool sí aparece.
+    assert "Proyecto Alpha" in user_content
+
+
 # ── 11. Metachat SSE: `metachat: true` flag in sources + done ─────────────
 
 

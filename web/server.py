@@ -229,12 +229,72 @@ def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
         f"específicamente pregunta, RECONOCELO EXPLÍCITO al comienzo de "
         f"tu respuesta con una frase del tipo 'Busqué en {joined_names} "
         f"y no encontré nada relevante'. Recién DESPUÉS, si hay contenido "
-        f"útil en otras secciones (WhatsApp, notas, etc.), ofrecelo como "
-        f"fallback con aclaración explícita ('te dejo X por si ayuda'). "
-        f"PROHIBIDO responder sobre WhatsApp, notas u otras fuentes como "
-        f"si fueran la respuesta principal cuando el usuario pidió "
-        f"específicamente {joined_names}."
+        f"en otras secciones del CONTEXTO (notas del vault, WhatsApp, "
+        f"etc.), RESUMILO CONCRETAMENTE con el nombre de la nota/chat y "
+        f"1-2 frases de QUÉ dice — nunca te quedes en el genérico 'te dejo "
+        f"otras fuentes que podrían ayudarte': eso es inútil para el "
+        f"usuario. Ejemplo del shape esperado: 'Busqué en tus mails y "
+        f"no encontré nada reciente, pero en tu nota <NOMBRE> aparece: "
+        f"<RESUMEN BREVE>'. PROHIBIDO responder sobre WhatsApp, notas u "
+        f"otras fuentes como si fueran la respuesta principal cuando el "
+        f"usuario pidió específicamente {joined_names}."
     )
+
+
+# Empty-output detection por tool — shape-aware. Usado para decidir si el
+# pre-router debe REEMPLAZAR el CONTEXTO (comportamiento original cuando
+# el tool trae data fresca) o PRESERVARLO como fallback (cuando el tool
+# vino vacío y las notas retrieveadas pueden servir).
+#
+# Motivación (2026-04-24, iteración 2 del mismo user report): tras el fix
+# de plurales + hint, el user preguntó "cuales son mis ultimos mails?"
+# y el sistema respondió "Busqué en tus mails y no encontré nada, te
+# dejo otras fuentes que podrían ayudarte" — correcto en el
+# reconocimiento de intent, pero GENÉRICO en el fallback. Causa: el pre-
+# router reemplazó el CONTEXTO entero con el output de gmail_recent
+# (que vino vacío → sólo "_Sin mails pendientes._"), descartando la
+# retrieve del vault que había devuelto `03-Resources/Gmail/2026-04-22.md`
+# (el digest de mails indexado). Sin material en CONTEXTO, el LLM
+# resolvió el fallback con una frase abstracta. Este helper permite
+# detectar empty-state y preservar el vault retrieve en ese caso.
+def _is_empty_tool_output(name: str, raw: str) -> bool:
+    """True si el tool devolvió un shape que semánticamente significa
+    'no hay nada'. Empty-test por tool:
+
+    - ``gmail_recent`` → ``threads == []`` AND ``unread_count == 0``.
+    - ``calendar_ahead`` → lista vacía.
+    - ``reminders_due`` → ``dated == []`` AND ``undated == []``.
+    - ``finance_summary`` / ``weather`` → siempre ``False`` (tienen output
+      útil aun cuando los números son todos cero — un mes sin gastos es
+      data válida, no ausencia de data).
+
+    Malformed JSON (no debería pasar — los tools escriben shapes bien
+    definidos) devuelve ``False`` conservativamente: si no puedo parsear,
+    no asumo que es empty; dejo que el LLM decida con el string crudo.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if name == "gmail_recent":
+        if not isinstance(data, dict):
+            return False
+        threads = data.get("threads") or []
+        try:
+            unread = int(data.get("unread_count") or 0)
+        except (TypeError, ValueError):
+            unread = 0
+        return not threads and unread == 0
+    if name == "calendar_ahead":
+        return isinstance(data, list) and not data
+    if name == "reminders_due":
+        if not isinstance(data, dict):
+            return False
+        return (
+            not (data.get("dated") or [])
+            and not (data.get("undated") or [])
+        )
+    return False
 
 
 # ── Forced-tool output renderer (2026-04-22, Fer F. report) ──────────
@@ -5909,15 +5969,41 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # undated items and occasionally seeded `[[calendar_ahead]]`
                 # citation artifacts because the tool name leaked as a
                 # wikilink-ish token. See helper docstring for details.
+                #
+                # 2026-04-24 (iteración 2, Fer F. report): excepción al
+                # replacement cuando TODOS los tools disparados vinieron
+                # vacíos — en ese caso preservamos el CONTEXTO original del
+                # vault y agregamos el tool output como sección explícita
+                # "CONSULTAS EN VIVO (todas vacías)". Racional: si el user
+                # preguntó por "últimos mails" y `gmail_recent` vino vacío,
+                # pero el retrieve pulló `03-Resources/Gmail/2026-04-22.md`
+                # (digest indexado de mails), queremos que el LLM pueda
+                # usar ese digest como fallback concreto en vez de
+                # contestar "te dejo otras fuentes" en abstracto. Con el
+                # tool output reemplazando, el vault material se descartaba
+                # y el LLM no tenía de qué resumir.
                 _datos_block = ""
                 for _n, _res, _ in _forced_results:
                     _datos_block += "\n" + _format_forced_tool_output(_n, _res) + "\n"
+                _all_tools_empty = all(
+                    _is_empty_tool_output(_n, _res)
+                    for _n, _res, _ in _forced_results
+                )
                 for _msg in reversed(tool_messages):
                     if _msg.get("role") == "user":
-                        _msg["content"] = (
-                            f"CONTEXTO (datos en vivo, no del vault):\n{_datos_block}\n\n"
-                            f"PREGUNTA: {question}\n\nRESPUESTA:"
-                        )
+                        if _all_tools_empty:
+                            _msg["content"] = (
+                                f"{_person_block}CONTEXTO:\n{context}\n\n"
+                                f"CONSULTAS EN VIVO (todas vacías — el "
+                                f"pre-router consultó estas fuentes y no "
+                                f"encontró nada reciente):\n{_datos_block}\n\n"
+                                f"PREGUNTA: {question}\n\nRESPUESTA:"
+                            )
+                        else:
+                            _msg["content"] = (
+                                f"CONTEXTO (datos en vivo, no del vault):\n{_datos_block}\n\n"
+                                f"PREGUNTA: {question}\n\nRESPUESTA:"
+                            )
                         break
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms

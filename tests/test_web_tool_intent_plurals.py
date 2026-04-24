@@ -36,6 +36,7 @@ from web.server import (
     _SOURCE_INTENT_LABEL,
     _build_source_intent_hint,
     _detect_tool_intent,
+    _is_empty_tool_output,
 )
 
 
@@ -235,3 +236,100 @@ def test_source_intent_label_covers_exactly_source_specific_tools():
             f"{name}: section header debe ser '### X' (matchea el output de "
             f"_format_forced_tool_output), got {section!r}"
         )
+
+
+# ── 4. `_is_empty_tool_output` — shape-aware empty detection ───────────────
+
+
+class TestIsEmptyToolOutput:
+    """Cubre los 5 tools del pre-router + edge cases de JSON malformado."""
+
+    # gmail_recent
+    def test_gmail_empty_when_no_threads_no_unread(self):
+        import json
+        raw = json.dumps({"unread_count": 0, "threads": []})
+        assert _is_empty_tool_output("gmail_recent", raw) is True
+
+    def test_gmail_not_empty_when_has_threads(self):
+        import json
+        raw = json.dumps({
+            "unread_count": 0,
+            "threads": [{"kind": "starred", "subject": "x", "from": "a@b.com"}],
+        })
+        assert _is_empty_tool_output("gmail_recent", raw) is False
+
+    def test_gmail_not_empty_when_has_unread(self):
+        import json
+        raw = json.dumps({"unread_count": 5, "threads": []})
+        assert _is_empty_tool_output("gmail_recent", raw) is False
+
+    def test_gmail_malformed_unread_falls_back_to_zero(self):
+        """unread_count no-numérico se trata como 0 — es defensivo, no
+        debería pasar en prod pero si pasa, no queremos crashear."""
+        import json
+        raw = json.dumps({"unread_count": "whatever", "threads": []})
+        assert _is_empty_tool_output("gmail_recent", raw) is True
+
+    # calendar_ahead
+    def test_calendar_empty_when_list_empty(self):
+        assert _is_empty_tool_output("calendar_ahead", "[]") is True
+
+    def test_calendar_not_empty_when_has_events(self):
+        import json
+        raw = json.dumps([{"title": "reunión", "date_label": "mañana"}])
+        assert _is_empty_tool_output("calendar_ahead", raw) is False
+
+    # reminders_due
+    def test_reminders_empty_when_both_empty(self):
+        import json
+        raw = json.dumps({"dated": [], "undated": []})
+        assert _is_empty_tool_output("reminders_due", raw) is True
+
+    def test_reminders_not_empty_when_dated(self):
+        import json
+        raw = json.dumps({
+            "dated": [{"name": "pagar luz", "due": "2026-05-01"}],
+            "undated": [],
+        })
+        assert _is_empty_tool_output("reminders_due", raw) is False
+
+    def test_reminders_not_empty_when_undated(self):
+        import json
+        raw = json.dumps({
+            "dated": [],
+            "undated": [{"name": "comprar café"}],
+        })
+        assert _is_empty_tool_output("reminders_due", raw) is False
+
+    # finance_summary / weather → no empty-state semantics.
+    def test_finance_always_not_empty(self):
+        """finance_summary con todos los campos en 0 sigue siendo data
+        válida ("tu mes fue cero gastos" es una respuesta útil), no
+        empty-state."""
+        assert _is_empty_tool_output("finance_summary", "{}") is False
+        import json
+        raw = json.dumps({"total_month": 0, "top_categories": []})
+        assert _is_empty_tool_output("finance_summary", raw) is False
+
+    def test_weather_always_not_empty(self):
+        """weather es passthrough string — siempre tiene output utilizable."""
+        assert _is_empty_tool_output("weather", '"cielo despejado, 20°C"') is False
+        assert _is_empty_tool_output("weather", '""') is False
+
+    # Edge cases.
+    def test_malformed_json_returns_false(self):
+        """JSON roto → conservador, return False (no asumir empty)."""
+        assert _is_empty_tool_output("gmail_recent", "not json") is False
+        assert _is_empty_tool_output("gmail_recent", "") is False
+
+    def test_unknown_tool_returns_false(self):
+        """Tool no mapeado: conservador, return False."""
+        assert _is_empty_tool_output("unknown_tool", "{}") is False
+
+    def test_gmail_non_dict_returns_false(self):
+        """JSON parsea pero no es dict (p.ej. lista)."""
+        assert _is_empty_tool_output("gmail_recent", "[]") is False
+
+    def test_reminders_non_dict_returns_false(self):
+        """Igual que gmail, reminders espera dict."""
+        assert _is_empty_tool_output("reminders_due", "null") is False

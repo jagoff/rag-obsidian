@@ -3139,3 +3139,36 @@ if (sidebar) {
   // button.
   refreshSessions();
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Empty state toggle (2026-04-24) — claude.ai landing pattern
+// ═══════════════════════════════════════════════════════════════════════
+// `body.chat-empty` se activa cuando #messages no tiene ningún .line
+// (o sea: no hubo todavía un turn real de user/rag). En empty state la
+// CSS centra el composer verticalmente y muestra el #empty-hero.
+//
+// Usamos MutationObserver en vez de llamar updateEmptyState() en cada
+// appendTurn / clearView / hydrateTurns / pushSystemMessage para no tener
+// que recordar en 8 lugares distintos. El observer cubre cualquier mutación
+// del subtree de #messages automáticamente.
+//
+// `.line` como criterio (no cualquier .turn) para que las meta-only
+// notifications como "nueva sesión — historial en blanco" NO saquen al
+// chat del estado empty — el hero sigue visible hasta que el user
+// efectivamente pregunta algo o se hidrata una sesión con turns reales.
+// ═══════════════════════════════════════════════════════════════════════
+
+function updateChatEmptyState() {
+  const hasRealTurn = messagesEl.querySelector(".line") !== null;
+  document.body.classList.toggle("chat-empty", !hasRealTurn);
+}
+
+// Observa childList + subtree: cualquier mutación de #messages (append de
+// turn, clear por /cls, hydrate de session) dispara el check.
+const __messagesObserver = new MutationObserver(updateChatEmptyState);
+__messagesObserver.observe(messagesEl, { childList: true, subtree: true });
+
+// Run once on boot antes de que el observer registre algún evento — el
+// default HTML tiene #messages vacío, entonces arrancamos en chat-empty.
+updateChatEmptyState();

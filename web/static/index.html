@@ -53,7 +53,7 @@
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
 
-  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-composer">
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-empty">
   <script src="/static/pwa/register-sw.js" defer></script>
 </head>
 <body>
@@ -251,6 +251,18 @@
        aria-hidden="true"></div>
 
   <main id="chat">
+    <!-- Empty-state hero: visible cuando body.chat-empty (el JS toggla la
+         clase via MutationObserver sobre #messages). Replica el landing
+         de claude.ai — greeting centrado + subtitle sutil. Una vez que
+         aparece el primer turn real (.line.user o .line.rag) la clase
+         se remueve y el hero desaparece; el composer vuelve al bottom. -->
+    <section id="empty-hero" aria-hidden="true">
+      <h1 class="empty-hero-title">¿en qué te ayudo?</h1>
+      <p class="empty-hero-sub">
+        preguntale al vault —
+        <kbd>/</kbd> comandos · <kbd>⌘</kbd><kbd>K</kbd> foco · <kbd>⌘</kbd><kbd>/</kbd> ayuda
+      </p>
+    </section>
     <div id="messages"></div>
     <form id="composer" autocomplete="off">
       <div id="composer-inner">
@@ -349,6 +361,6 @@
        | openssl dgst -sha384 -binary | openssl base64 -A` -->
   <script src="/static/vendor/marked.min.js"
           integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"></script>
-  <script src="/static/app.js?v=2026-04-24-composer"></script>
+  <script src="/static/app.js?v=2026-04-24-empty"></script>
 </body>
 </html>

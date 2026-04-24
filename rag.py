@@ -26154,6 +26154,12 @@ def _agent_tool_weather(location: str | None = None) -> str:
 
 
 _AGENT_PENDING_WRITES: list[dict] = []
+_AGENT_PENDING_WRITES_lock = threading.Lock()
+# Guards `_AGENT_PENDING_WRITES` against concurrent append/clear/iterate.
+# Hoy el único caller es `do()` en un solo thread, pero `_agent_tool_*` son
+# importadas por `web/tools.py` y los read-tools ya se ejecutan en un thread
+# pool. Si `propose_write` / `append_to_note` se exponen al web en el futuro,
+# esta cobertura evita una race sigilosa en .append() bajo GIL.
 
 
 # ── Scribe helpers (Fase A, 2026-04-23) ────────────────────────────────────
@@ -26367,9 +26373,10 @@ def _agent_tool_propose_write(
             f"para agregar contenido al final o bajo un heading existente."
         )
     kind = "overwrite" if (path_exists and overwrite) else "create"
-    _AGENT_PENDING_WRITES.append({
-        "kind": kind, "path": path, "content": content, "rationale": rationale,
-    })
+    with _AGENT_PENDING_WRITES_lock:
+        _AGENT_PENDING_WRITES.append({
+            "kind": kind, "path": path, "content": content, "rationale": rationale,
+        })
     label = "Sobrescritura" if kind == "overwrite" else "Creación"
     return (
         f"{label} propuesta: {path} ({len(content)} chars). "
@@ -26428,13 +26435,14 @@ def _agent_tool_append_to_note(
                 "Usá propose_write con overwrite=True para agregar el "
                 "heading, o revisá el nombre exacto."
             )
-    _AGENT_PENDING_WRITES.append({
-        "kind": "append",
-        "path": path,
-        "content": content,
-        "section": section,
-        "rationale": rationale,
-    })
+    with _AGENT_PENDING_WRITES_lock:
+        _AGENT_PENDING_WRITES.append({
+            "kind": "append",
+            "path": path,
+            "content": content,
+            "section": section,
+            "rationale": rationale,
+        })
     where = f"bajo {section!r}" if section else "al final del body"
     return (
         f"Append propuesto: {path} ({len(content)} chars) {where}. "
@@ -26506,7 +26514,8 @@ def do(instruction: str, yes: bool, max_iterations: int):
     final uno por uno (o todos con --yes).
     """
     warmup_async()
-    _AGENT_PENDING_WRITES.clear()
+    with _AGENT_PENDING_WRITES_lock:
+        _AGENT_PENDING_WRITES.clear()
 
     tools = [
         _agent_tool_search,
@@ -26648,7 +26657,11 @@ def do(instruction: str, yes: bool, max_iterations: int):
         console.print(f"[yellow]⚠ Cap de {max_iterations} iteraciones alcanzado.[/yellow]")
 
     # Show pending writes, confirm each.
-    if _AGENT_PENDING_WRITES:
+    # Snapshot atómico bajo lock — iterar afuera para no retener el lock
+    # durante prompts interactivos de Rich (pueden bloquear minutos).
+    with _AGENT_PENDING_WRITES_lock:
+        _pending_snapshot = list(_AGENT_PENDING_WRITES)
+    if _pending_snapshot:
         console.print()
         console.print(Rule(title="[bold yellow]Cambios propuestos[/bold yellow]", style="yellow"))
         col = get_db()
@@ -26657,7 +26670,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
             "overwrite": ("Sobrescribir", "Sobrescribir (backup .bak.<ts> auto)?"),
             "append": ("Agregar", "Aplicar append?"),
         }
-        for i, w in enumerate(_AGENT_PENDING_WRITES, 1):
+        for i, w in enumerate(_pending_snapshot, 1):
             kind = w.get("kind", "create")
             label, prompt_text = _kind_label.get(kind, (kind, "Aplicar?"))
             console.print()

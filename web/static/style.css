@@ -1213,10 +1213,9 @@ body {
               box-shadow var(--dur-fast) var(--ease-out);
 }
 
-#input-wrap:focus-within {
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-md), var(--focus-ring);
-}
+/* NOTA: el focus state del wrap está definido abajo (bloque "Composer
+   glow") — border-color cyan-dim + 1px ring sutil. Evitamos duplicar
+   acá para que no haya conflictos de cascade. */
 
 .composer-row {
   display: flex;
@@ -1750,8 +1749,11 @@ kbd {
     transform var(--dur-fast) var(--ease-out);
 }
 
-/* Focus-visible — cyan glow ring en todo interactivo. Solo keyboard nav. */
-#input:focus-visible,
+/* Focus-visible — cyan glow ring en todo interactivo. Solo keyboard nav.
+   #input se excluye a propósito: el ring va en el #input-wrap card
+   (outer container) via :focus-within, no en el textarea mismo —
+   sin esto se veía doble borde (uno en el card y otro dentro
+   alrededor del textarea). 2026-04-24. */
 #vault-picker:focus-visible,
 .topbar-link:focus-visible,
 .topbar-btn:focus-visible,

@@ -111,6 +111,24 @@ export RAG_LOCAL_EMBED=1
 
 Para CLI one-shot (`rag query`, `rag chat`, `rag do`, `rag prep`, etc.) ya se activa solo. Usalo para `rag serve` / web server.
 
+### `RAG_LOCAL_EMBED_WAIT_MS` (default `6000`)
+Milisegundos que `retrieve()` espera para que el warmup del embedder local dispare el Event antes de caer a Ollama. **Default bumped 4000→6000 el 2026-04-23** tras observar producción: 4 CLI `query` consecutivas (2026-04-23T15:14-15:15) mostraron `embed_ms=4005` exacto — el wait timeaba justo antes del Event fire (~5s cold load en M3 Max), y el user pagaba 4s gratis de espera + 5ms de fallback Ollama warm.
+
+Con 6000ms el Event dispara dentro del budget en ~5s, el user recibe el path MPS (~30ms encode) en la misma query. Si el warmup también timea (disk frío), el fallback Ollama warm sigue siendo ~140ms → cap final ~6.14s.
+
+```bash
+# Rollback a pre-2026-04-23
+export RAG_LOCAL_EMBED_WAIT_MS=4000
+
+# Legacy non-blocking (siempre fallback Ollama, sin esperar local)
+export RAG_LOCAL_EMBED_WAIT_MS=0
+
+# Macs con HDD externa o spinning disk (SentenceTransformer load >6s)
+export RAG_LOCAL_EMBED_WAIT_MS=10000
+```
+
+Self-contained: no cambia warmup_async ni el path long-running (serve/web), donde el Event ya está set pre-query.
+
 ---
 
 ## Pipeline tuning

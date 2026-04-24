@@ -10,7 +10,9 @@ queued behind the reranker). Measured `embed_ms` 10-12s in outliers.
 
 Post-fix the 5 targets spawn as parallel daemon threads. Max individual
 ~5s, total wall ~5s. The Event fires around 5s — matches the new wait
-default of 4000ms (`RAG_LOCAL_EMBED_WAIT_MS`).
+default of 6000ms (`RAG_LOCAL_EMBED_WAIT_MS`). Bumped desde 4000ms el
+2026-04-23 tras observar en prod un patrón repetido de embed_ms=4005
+exacto: el wait timeaba justo antes del Event fire.
 
 These tests are source-level: we can't actually trigger a cold-load in CI
 without keeping ~500MB HF cache around.
@@ -77,23 +79,25 @@ def test_warmup_threads_are_daemon():
     )
 
 
-def test_local_embed_wait_default_bumped_to_4s():
-    """The default `RAG_LOCAL_EMBED_WAIT_MS` in retrieve() must be 4000ms
-    (4.0s) to match the parallel warmup completion time. The legacy 1500ms
-    timed out before the Event fired."""
+def test_local_embed_wait_default_bumped_to_6s():
+    """The default `RAG_LOCAL_EMBED_WAIT_MS` in retrieve() must be 6000ms
+    (6.0s) tras 2026-04-23. Pre-fix de 4000ms timeaba JUSTO antes del
+    Event fire (~5s cold load on M3 Max) — producción mostró un patrón
+    repetido de embed_ms=4005 exacto en CLI `query` (2026-04-23T15:14).
+    El bump cubre el cold load con margen de 1s."""
     # Find the retrieve() wait ternary — search from the `_wait_s = (`
     # assignment which is unique to this block.
     idx = RAG_PY.find("_wait_ms_str = os.environ.get(\"RAG_LOCAL_EMBED_WAIT_MS\")")
     assert idx >= 0, "retrieve() wait block not found"
     block = RAG_PY[idx : idx + 500]
-    # Expect `else 4.0)` as the default branch of the ternary
-    assert "else 4.0)" in block, (
-        f"expected `else 4.0)` as the new default in the wait ternary;"
+    # Expect `else 6.0)` as the default branch of the ternary
+    assert "else 6.0)" in block, (
+        f"expected `else 6.0)` as the new default in the wait ternary;"
         f" block was: {block!r}"
     )
-    # The except-ValueError fallback should also be 4.0, not 1.5
-    assert "_wait_s = 4.0" in block, (
-        f"except-ValueError fallback needs to use 4.0s; block: {block!r}"
+    # The except-ValueError fallback should also be 6.0, not 4.0
+    assert "_wait_s = 6.0" in block, (
+        f"except-ValueError fallback needs to use 6.0s; block: {block!r}"
     )
 
 

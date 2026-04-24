@@ -76,6 +76,7 @@ from rag import (  # noqa: E402
     _pendientes_collect,
     _pendientes_urgent,
     _render_today_prompt,
+    _round_timing_ms,
     _tasks_services_consulted as _rag_tasks_services_consulted,
     append_turn,
     ensure_session,
@@ -6049,6 +6050,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # 2.75× speedup medido en prod (CLI 7d). Esta columna ahora
             # surfacea la ganancia real cuando `fast_path=True`.
             "fast_path": bool(result.get("fast_path", False)),
+            # Retrieval stage timing — desde 2026-04-23, también para
+            # el web endpoint. Incluye embed_ms / sem_ms / bm25_ms /
+            # rrf_ms / reranker_ms / total_ms. Pre-fix solo el CLI
+            # `query` + `chat` persistían este dict; el web emitía el
+            # t_retrieve agregado pero no el breakdown interno. Con
+            # `timing` en extra_json, el SQL puede distinguir "retrieve
+            # lento por embed (warmup race)" vs "retrieve lento por
+            # reranker (cold MPS)" sin tener que reproducir en CLI.
+            # Requisito para diagnosticar los outliers de web que
+            # mostraban `retrieve_ms` 4-6s warm sin desglose accesible.
+            "timing": _round_timing_ms(result.get("timing")),
         })
 
         yield _sse("done", {

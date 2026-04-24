@@ -56,6 +56,38 @@ def test_extra_json_contract_normal_path():
     )
 
 
+def test_extra_json_contract_timing_breakdown_persisted():
+    """Post-2026-04-23 el web endpoint también persiste el dict `timing`
+    devuelto por retrieve() (embed_ms / sem_ms / bm25_ms / rrf_ms /
+    reranker_ms / total_ms). Sin esto no se puede diagnosticar por qué
+    `retrieve_ms` es alto en casos warm (4-6s) — si es embed (warmup
+    race) o reranker (cold MPS).
+
+    Pre-fix sólo el CLI `query` + `chat` persistían este dict; el web
+    emitía el t_retrieve agregado pero no el breakdown."""
+    src = (ROOT / "web" / "server.py").read_text(encoding="utf-8")
+    # Buscamos el bloque log_query_event con cmd="web" (NO bypass).
+    # El bloque es largo (~70 líneas) por todos los docstrings inline;
+    # scaneamos 6000 bytes desde el marker para cubrirlo completo.
+    web_idx = src.find('"cmd": "web",')
+    assert web_idx >= 0, "main web log_query_event block not found"
+    nearby = src[web_idx : web_idx + 6000]
+    # The timing key should land in extra_json via _round_timing_ms
+    assert "\"timing\"" in nearby, (
+        "timing key missing from web log_query_event payload"
+    )
+    assert "_round_timing_ms" in nearby, (
+        "_round_timing_ms not wired — timing dict must go through "
+        "the shared rounder to stay shape-stable with CLI rows"
+    )
+    # And the import should be in place at the top of the file (in the
+    # `from rag import (...)` block — scan the first 5000 bytes to cover
+    # the multi-line import list comfortably).
+    assert "_round_timing_ms" in src[:5000], (
+        "_round_timing_ms import missing from web/server.py top imports"
+    )
+
+
 def test_extra_json_contract_low_conf_bypass():
     """The low_conf_bypass path also persists stage timing so analytics
     can filter `cmd='web.chat.low_conf_bypass'` rows with the same SQL

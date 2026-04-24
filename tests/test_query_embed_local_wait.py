@@ -145,29 +145,35 @@ def test_env_var_overrides_default_wait(monkeypatch, tmp_path):
     """`retrieve()` reads `RAG_LOCAL_EMBED_WAIT_MS` from env and passes it
     through as seconds. Set to 0 → legacy bail, set to 3000 → 3s wait.
 
+    2026-04-23: default bumped 4.0→6.0 tras observar en prod el patrón de
+    `embed_ms=4005` exacto — el wait timeaba justo antes del Event fire.
+
     We test the env parsing directly on the pattern used in retrieve():
     """
-    # Mirror the env-parsing block in rag.py:14729-14734
+    # Mirror the env-parsing block in retrieve() (rag.py)
     def _compute_wait_s() -> float:
         import os
         try:
             raw = os.environ.get("RAG_LOCAL_EMBED_WAIT_MS")
-            return float(raw) / 1000.0 if raw is not None else 1.5
+            return float(raw) / 1000.0 if raw is not None else 6.0
         except ValueError:
-            return 1.5
+            return 6.0
 
     monkeypatch.delenv("RAG_LOCAL_EMBED_WAIT_MS", raising=False)
-    assert _compute_wait_s() == 1.5  # default
+    assert _compute_wait_s() == 6.0  # default (post 2026-04-23)
 
     monkeypatch.setenv("RAG_LOCAL_EMBED_WAIT_MS", "0")
     assert _compute_wait_s() == 0.0  # legacy opt-out
 
     monkeypatch.setenv("RAG_LOCAL_EMBED_WAIT_MS", "3000")
-    assert _compute_wait_s() == 3.0  # cold-disk user
+    assert _compute_wait_s() == 3.0  # shorter wait (fast disk)
+
+    monkeypatch.setenv("RAG_LOCAL_EMBED_WAIT_MS", "10000")
+    assert _compute_wait_s() == 10.0  # longer wait (cold disk)
 
     # Parse error falls back to default.
     monkeypatch.setenv("RAG_LOCAL_EMBED_WAIT_MS", "notanumber")
-    assert _compute_wait_s() == 1.5
+    assert _compute_wait_s() == 6.0
 
 
 # ── Idempotence: setting the Event twice is a no-op (regression guard) ─────

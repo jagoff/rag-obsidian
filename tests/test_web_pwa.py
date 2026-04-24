@@ -170,3 +170,26 @@ def test_manifest_shortcuts_point_to_valid_routes():
     valid_routes = {"/", "/chat", "/dashboard"}
     for sc in shortcuts:
         assert sc["url"] in valid_routes, f"shortcut url {sc['url']} not routable"
+
+
+def test_api_chat_get_redirects_to_chat_ui():
+    """Regresión 2026-04-24 (Fer F.): el user tenía bookmark a
+    `/api/chat` (la ruta del endpoint, no del UI). FastAPI devolvía
+    `{"detail":"Method Not Allowed"}` porque el endpoint solo acepta POST.
+    ~256 405s observadas en `web.log` antes del fix. Ahora GET devuelve
+    un redirect 307 a `/chat` para que el browser muestre el UI.
+    """
+    # `follow_redirects=False` para que podamos assertir el 307 literal.
+    resp = _client.get("/api/chat", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/chat"
+
+
+def test_api_chat_still_rejects_other_methods():
+    """Sanity: PUT/DELETE siguen cayendo con 405 (no queremos que el
+    redirect los ataje también — si un cliente programático hace un
+    verb raro es bug del cliente y queremos que se rompa visible)."""
+    resp = _client.put("/api/chat", json={})
+    assert resp.status_code == 405
+    resp = _client.delete("/api/chat")
+    assert resp.status_code == 405

@@ -156,6 +156,16 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     # stopwords + resuelve aliases internamente. Ver
     # `_agent_tool_drive_search` para la lógica completa.
     ("drive_search",    {}, r"(?:google\s*|(?:en|mi|tu|del|al|a|sobre)\s+)drive\b|\bplanillas?\b|\bspreadsheets?\b|\bsheets?\b|\bpresentaci[oó]n\b|\bpresentaciones\b"),
+    # WhatsApp: "qué tengo pendiente" sin contexto WA explícito también
+    # dispara el tool — los chats sin respuesta son parte del "pending
+    # bucket" semántico del user (reportado 2026-04-24 Fer F.: "me
+    # faltan las conversaciones de wzp relativa a la pregunta" cuando
+    # preguntó por pendientes de la semana). Keywords explícitos
+    # (whatsapp/wzp/wsp/chats) también gatillan. `chats?` por sí solo
+    # es aceptable porque las otras apps de chat del user (Slack,
+    # Messages) no están integradas al RAG todavía — en la práctica
+    # "chat" == WhatsApp en este setup.
+    ("whatsapp_pending", {}, r"whats.?app|\bwzp\b|\bwsp\b|\bchats?\b|mensajes?\s+sin|pendient\w*\s+(de\s+)?(responder|contestar|respuesta)|" + _PLANNING_PAT),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
@@ -250,6 +260,21 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         ),
         "item_shape": "- <nombre del archivo> (<tipo>) · <dato relevante o 'sin match'>",
         "empty_phrase": "No encontré nada en tu Google Drive que matchee",
+    },
+    "whatsapp_pending": {
+        "label": "tus chats de WhatsApp esperando respuesta",
+        "live_section": "### WhatsApp",
+        "digest_hint": (
+            "La sección live trae los chats donde el user debe el próximo "
+            "mensaje (último inbound sin reply). Si en el CONTEXTO hay "
+            "notas de `03-Resources/WhatsApp/<contacto>/YYYY-MM.md` con "
+            "más contexto de esos chats, podés complementar. NUNCA "
+            "inventes conversaciones de WhatsApp — si la sección live "
+            "está vacía decilo explícitamente en vez de citar otras "
+            "fuentes como si fueran WA."
+        ),
+        "item_shape": "- <contacto> (hace <Xh/d>): <último mensaje>",
+        "empty_phrase": "No hay chats de WhatsApp esperando tu respuesta",
     },
 }
 
@@ -403,6 +428,9 @@ def _is_empty_tool_output(name: str, raw: str) -> bool:
         if not isinstance(data, dict):
             return False
         return not (data.get("files") or [])
+    if name == "whatsapp_pending":
+        # Shape: list of chat dicts. Empty list = no chats waiting for reply.
+        return isinstance(data, list) and not data
     return False
 
 
@@ -455,6 +483,8 @@ def _format_forced_tool_output(name: str, raw: str) -> str:
         return _format_weather_block(raw)
     if name == "drive_search":
         return _format_drive_block(raw)
+    if name == "whatsapp_pending":
+        return _format_whatsapp_block(raw)
     # Unknown tool → keep raw JSON available but wrap in a labeled
     # section so it doesn't merge visually with the next block.
     return f"### Datos ({name})\n{raw}\n"
@@ -707,6 +737,49 @@ def _format_drive_block(raw: str) -> str:
             lines.append("")
             lines.append(body[:BODY_CAP])
             lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _format_whatsapp_block(raw: str) -> str:
+    """Render `whatsapp_pending` output as a `### WhatsApp` section.
+
+    Shape esperado: list of `{jid, name, last_snippet, hours_waiting}`
+    (ver `_fetch_whatsapp_unreplied`). Formatea cada chat como bullet
+    con contacto bold, tiempo esperando humanizado ("hace 3h" / "hace
+    2d"), y el snippet del último mensaje. Dedupe por (jid, snippet)
+    porque el shape del fetcher ya dedupea por jid — redundante pero
+    defensivo ante shape drift.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### WhatsApp\n{raw}\n"
+    if not isinstance(data, list):
+        return f"### WhatsApp\n{raw}\n"
+    if not data:
+        return "### WhatsApp\n_Sin chats esperando tu respuesta._\n"
+
+    chats = [c for c in data if isinstance(c, dict) and str(c.get("name", "")).strip()]
+    header = f"### WhatsApp ({len(chats)} chat{'s' if len(chats) != 1 else ''} esperando respuesta)"
+    lines: list[str] = [header]
+    for chat in chats:
+        name = str(chat.get("name", "")).strip()
+        snippet = str(chat.get("last_snippet", "")).strip()
+        try:
+            hours = float(chat.get("hours_waiting") or 0)
+        except (TypeError, ValueError):
+            hours = 0.0
+        # Humanize wait time: <24h → "Xh", ≥24h → "Xd".
+        if hours < 1:
+            age = "recién"
+        elif hours < 24:
+            age = f"hace {int(hours)}h"
+        else:
+            age = f"hace {int(hours / 24)}d"
+        line = f"- **{name}** ({age})"
+        if snippet:
+            line += f": {snippet}"
+        lines.append(line)
     return "\n".join(lines) + "\n"
 
 
@@ -5045,6 +5118,21 @@ def _resolve_redo_question(turn_id: str) -> tuple[str | None, str | None]:
     return q, session
 
 
+@app.get("/api/chat")
+def chat_get_redirect():
+    """Defensive redirect for users who bookmark or navigate to the API
+    endpoint instead of the UI. `/api/chat` is the POST/SSE programmatic
+    endpoint; the human-facing chat lives at `/chat`. Without this,
+    hitting the URL in a browser returned `{"detail":"Method Not
+    Allowed"}` (FastAPI's default 405) — ~256 such 405s observed in the
+    web.log the first time the user tripped on it. 307 preserves the
+    method if the caller is a programmatic client that for some reason
+    issued GET; browsers just follow to the HTML UI.
+    """
+    from fastapi.responses import RedirectResponse  # noqa: PLC0415
+    return RedirectResponse(url="/chat", status_code=307)
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # Rate limit: 30 chat requests / 60s per IP. Each request pins the
@@ -6436,43 +6524,77 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
 
-                # Drive sources (2026-04-24, user report Fer F. iter 3):
-                # Cuando drive_search disparó y encontró archivos, re-emitimos
-                # el `sources` SSE event con los links de Drive prepended al
-                # listado original. El user pidió explícitamente que "lo
-                # primero que se vea en fuentes sea el link al doc de
-                # Drive". El frontend hace `sources = parsed.items` en cada
-                # evento, así que esta segunda emisión REEMPLAZA la lista
-                # en UI sin requerir lógica extra del cliente (el render
-                # detecta URLs por regex y genera anchors externos).
+                # External sources re-emit (2026-04-24, iter 3 + 4):
+                # Cuando drive_search / whatsapp_pending disparan, agregamos
+                # sus resultados como sources para que la UI muestre un link
+                # directo al doc/chat *antes* de las fuentes del vault. El
+                # frontend reemplaza la lista en cada evento — esta segunda
+                # emisión pisa la inicial. `_drive_source_items` primero
+                # (Drive suele tener el match más específico), luego
+                # `_wa_source_items` (chats pendientes). Dedupe por `file`
+                # lo maneja el frontend (`seen.add(s.file)`).
                 _drive_source_items: list[dict] = []
+                _wa_source_items: list[dict] = []
                 for _n, _res, _ in _forced_results:
-                    if _n != "drive_search":
-                        continue
-                    try:
-                        _drive_payload = json.loads(_res)
-                    except Exception:
-                        continue
-                    if not isinstance(_drive_payload, dict):
-                        continue
-                    for _f in (_drive_payload.get("files") or [])[:5]:
-                        if not isinstance(_f, dict):
+                    if _n == "drive_search":
+                        try:
+                            _drive_payload = json.loads(_res)
+                        except Exception:
                             continue
-                        _link = str(_f.get("link") or "").strip()
-                        _name = str(_f.get("name") or "").strip()
-                        if not _link or not _link.startswith(("http://", "https://")):
+                        if not isinstance(_drive_payload, dict):
                             continue
-                        _drive_source_items.append({
-                            "file": _link,
-                            "note": _name or "(sin nombre)",
-                            "folder": "Google Drive",
-                            "score": 5.0,
-                            "bar": "■■■■■",
-                        })
-                if _drive_source_items:
+                        for _f in (_drive_payload.get("files") or [])[:5]:
+                            if not isinstance(_f, dict):
+                                continue
+                            _link = str(_f.get("link") or "").strip()
+                            _name = str(_f.get("name") or "").strip()
+                            if not _link or not _link.startswith(("http://", "https://")):
+                                continue
+                            _drive_source_items.append({
+                                "file": _link,
+                                "note": _name or "(sin nombre)",
+                                "folder": "Google Drive",
+                                "score": 5.0,
+                                "bar": "■■■■■",
+                            })
+                    elif _n == "whatsapp_pending":
+                        try:
+                            _wa_payload = json.loads(_res)
+                        except Exception:
+                            continue
+                        if not isinstance(_wa_payload, list):
+                            continue
+                        for _chat in _wa_payload[:5]:
+                            if not isinstance(_chat, dict):
+                                continue
+                            _name = str(_chat.get("name") or "").strip()
+                            _jid = str(_chat.get("jid") or "").strip()
+                            if not _name or not _jid:
+                                continue
+                            # JID → deeplink al chat. Tres formas:
+                            #   - `@s.whatsapp.net` = DM, phone en prefix
+                            #     → `https://wa.me/<phone>` (web/app).
+                            #   - `@g.us` = grupo → no hay URL público,
+                            #     fallback a WhatsApp Web root.
+                            #   - `@lid` = participante sin resolver en
+                            #     grupo, también fallback.
+                            _phone = _jid.split("@")[0] if "@" in _jid else ""
+                            if _jid.endswith("@s.whatsapp.net") and _phone.isdigit():
+                                _link = f"https://wa.me/{_phone}"
+                            else:
+                                _link = "https://web.whatsapp.com/"
+                            _wa_source_items.append({
+                                "file": _link,
+                                "note": _name,
+                                "folder": "WhatsApp",
+                                "score": 5.0,
+                                "bar": "■■■■■",
+                            })
+                if _drive_source_items or _wa_source_items:
                     yield _sse("sources", {
                         "items": (
                             _drive_source_items
+                            + _wa_source_items
                             + _mention_sources
                             + [
                                 {**_source_payload(_m, _s), "bar": _score_bar(float(_s))}

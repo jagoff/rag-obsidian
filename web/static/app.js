@@ -1655,6 +1655,44 @@ function buildMarkdownExport(question, answer, sources) {
   return parts.join("\n\n");
 }
 
+// Copy helper — wraps navigator.clipboard con fallback a execCommand por
+// si el browser no está en secure context o el permission fue denegado.
+// Devuelve true si la copia funcionó, false si ambos paths fallaron.
+async function copyTextToClipboard(text) {
+  // Path preferido: Clipboard API moderna. Requiere secure context
+  // (HTTPS o localhost). Si el browser no la expone o tira permission
+  // error, caemos al fallback.
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      /* fall through */
+    }
+  }
+  // Fallback: textarea invisible + document.execCommand("copy"). Funciona
+  // en HTTP non-localhost y browsers viejos. Deprecated pero sigue vivo
+  // en Chrome/Safari/Firefox actuales (2026). El textarea se monta fuera
+  // de viewport para no causar scroll/flash.
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.left = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Copy button — sits on the .line holding the rag response; copies raw
 // markdown (fullText), not rendered HTML, so it pastes cleanly into
 // Obsidian, notes, or another chat.
@@ -1666,16 +1704,34 @@ function appendCopyButton(parent, getText) {
   btn.title = "copiar markdown";
   btn.innerHTML = `${COPY_SVG}<span class="msg-action-label">copiar</span>`;
   btn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(getText());
+    const text = typeof getText === "function" ? getText() : "";
+    const label = btn.querySelector(".msg-action-label");
+    if (!text || !text.trim()) {
+      btn.classList.add("err");
+      if (label) label.textContent = "sin texto";
+      setTimeout(() => {
+        btn.classList.remove("err");
+        if (label) label.textContent = "copiar";
+      }, 1400);
+      return;
+    }
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
       btn.classList.add("done");
-      btn.querySelector(".msg-action-label").textContent = "copiado";
+      if (label) label.textContent = "copiado";
       setTimeout(() => {
         btn.classList.remove("done");
-        btn.querySelector(".msg-action-label").textContent = "copiar";
+        if (label) label.textContent = "copiar";
       }, 1200);
-    } catch {
+    } else {
+      // Error visible — el user tocó "copiar" y nada pasaba. Ahora al
+      // menos se entera y puede seleccionar con ⌘A / ⌘C manualmente.
       btn.classList.add("err");
+      if (label) label.textContent = "falló — ⌘C manual";
+      setTimeout(() => {
+        btn.classList.remove("err");
+        if (label) label.textContent = "copiar";
+      }, 2400);
     }
   });
   parent.appendChild(btn);
@@ -3076,6 +3132,19 @@ function hydrateTurns(data) {
       line.appendChild(prompt);
       line.appendChild(text);
       turn.appendChild(line);
+    }
+    // Copy button por turn — sin esto el historial era read-only. Usamos
+    // buildMarkdownExport con los paths guardados en la sesión como
+    // pseudo-sources (no tenemos score, pero sí el file name para el
+    // wikilink [[Nota]]). 2026-04-24.
+    if (t.a && t.a.trim()) {
+      const actions = el("div", "msg-actions");
+      const pseudoSources = (t.paths || []).map((p) => ({ file: p }));
+      appendCopyButton(
+        actions,
+        () => buildMarkdownExport(t.q || "", t.a || "", pseudoSources),
+      );
+      turn.appendChild(actions);
     }
   }
   scrollBottom();

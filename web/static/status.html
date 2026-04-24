@@ -438,6 +438,343 @@
       font-size: 12px;
     }
 
+    /* ── Insights grid ─────────────────────────────────────────────────
+       5 cards que cubren lo que el semáforo binario no ve: latencia,
+       errores agrupados, freshness de datos, log-tail, uptime histórico.
+       Una sola es real hoy (#1 latency); las otras 4 tienen flag
+       [vista previa] con datos dummy hasta que las shippeemos de
+       verdad. Layout auto-fit para que en desktop entren 2-3 cards por
+       fila y en mobile se apilen. */
+    .insights {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .insight-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 180px;
+      position: relative;
+    }
+
+    /* Cards .insight-preview llevan un ribbon diagonal sutil en la
+       esquina y un tono apagado para que no se confundan con las reales.
+       Acento izquierdo en purple para distinguir de las status cards
+       (que usan green/yellow/red por estado). */
+    .insight-card.insight-preview {
+      border-left: 3px solid color-mix(in srgb, var(--purple) 70%, transparent);
+      background: color-mix(in srgb, var(--bg-card) 94%, transparent);
+    }
+
+    .insight-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .insight-head h3 {
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+    }
+    .insight-meta {
+      font-size: 10.5px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .preview-badge {
+      font-size: 9.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      background: color-mix(in srgb, var(--purple) 20%, transparent);
+      color: var(--purple);
+      padding: 2px 7px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    /* Big-number row — stat grande + delta chico al lado. Usado por la
+       card de latencia y se reusa para el donut de errores. */
+    .insight-big {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+    .insight-big-value {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.05;
+    }
+    .insight-big-unit {
+      font-size: 13px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+    .insight-delta {
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .insight-delta.better { color: var(--green); }
+    .insight-delta.worse { color: var(--yellow); }
+    .insight-delta.bad { color: var(--red); }
+    .insight-delta.neutral { color: var(--text-faint); }
+
+    /* Sparkline SVG — p50 y p95 superpuestas. Las líneas se dibujan
+       via JS (status.js `renderSparkline`). Área sutil bajo p95 para
+       dar peso visual sin saturar. */
+    .sparkline {
+      width: 100%;
+      height: 64px;
+      display: block;
+      overflow: visible;
+    }
+    .sparkline .sl-axis {
+      stroke: var(--grid);
+      stroke-width: 1;
+    }
+    .sparkline .sl-p50 {
+      stroke: var(--green);
+      stroke-width: 1.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .sparkline .sl-p95 {
+      stroke: var(--yellow);
+      stroke-width: 1.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .sparkline .sl-p95-area {
+      fill: color-mix(in srgb, var(--yellow) 12%, transparent);
+      stroke: none;
+    }
+    .sparkline .sl-baseline {
+      stroke: var(--text-faint);
+      stroke-width: 1;
+      stroke-dasharray: 2 3;
+      fill: none;
+      opacity: 0.5;
+    }
+    .sparkline .sl-dot {
+      fill: var(--bg);
+      stroke-width: 1.5;
+    }
+    .sparkline .sl-gap-hint {
+      /* vertical tick en buckets sin data para que no se interpole */
+      stroke: var(--text-faint);
+      stroke-width: 1;
+      opacity: 0.25;
+    }
+
+    .insight-legend {
+      display: flex;
+      gap: 14px;
+      font-size: 10.5px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+    }
+    .insight-legend .dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    .insight-legend .dot.p50 { background: var(--green); }
+    .insight-legend .dot.p95 { background: var(--yellow); }
+    .insight-legend .dot.baseline { background: var(--text-faint); }
+
+    /* Donut (error budget) — mismo viewBox 80×80 que en otros dashboards. */
+    .insight-donut-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      align-items: center;
+    }
+    .donut {
+      width: 80px;
+      height: 80px;
+      flex-shrink: 0;
+    }
+    .donut .donut-bg { fill: none; stroke: var(--border); stroke-width: 10; }
+    .donut .donut-ok { fill: none; stroke: var(--green); stroke-width: 10; stroke-linecap: butt; }
+    .donut .donut-err { fill: none; stroke: var(--red); stroke-width: 10; stroke-linecap: butt; }
+    .donut-center {
+      text-anchor: middle;
+      dominant-baseline: central;
+      font-size: 13px;
+      font-weight: 700;
+      fill: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .insight-breakdown {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .insight-breakdown li {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .insight-breakdown .cause {
+      color: var(--text-dim);
+      font-family: inherit;
+    }
+    .insight-breakdown .count { color: var(--text); font-weight: 600; }
+
+    /* Freshness matrix (table compacta). */
+    .fresh-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11.5px;
+      font-variant-numeric: tabular-nums;
+    }
+    .fresh-table td {
+      padding: 5px 6px;
+      border-bottom: 1px solid var(--sep);
+    }
+    .fresh-table tr:last-child td { border-bottom: none; }
+    .fresh-table .fresh-source { color: var(--text); font-weight: 500; }
+    .fresh-table .fresh-age { color: var(--text-dim); text-align: right; }
+    .fresh-table .fresh-drift-ok { color: var(--green); }
+    .fresh-table .fresh-drift-warn { color: var(--yellow); }
+    .fresh-table .fresh-drift-down { color: var(--red); }
+    .fresh-bar {
+      display: inline-block;
+      width: 50px;
+      height: 5px;
+      border-radius: 3px;
+      background: var(--border);
+      position: relative;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    .fresh-bar::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: currentColor;
+    }
+    .fresh-bar.pct-low::after  { width: 25%; background: var(--green); }
+    .fresh-bar.pct-mid::after  { width: 60%; background: var(--yellow); }
+    .fresh-bar.pct-high::after { width: 95%; background: var(--red); }
+
+    /* Log tail */
+    .log-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .log-list li {
+      display: grid;
+      grid-template-columns: 54px 68px 1fr;
+      gap: 8px;
+      padding: 3px 6px;
+      border-radius: 4px;
+      align-items: baseline;
+    }
+    .log-list li:hover { background: var(--hover); }
+    .log-list .log-ts { color: var(--text-faint); font-size: 10.5px; }
+    .log-list .log-src {
+      color: var(--text-dim);
+      font-size: 10px;
+      text-transform: lowercase;
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: var(--bg-elev);
+      text-align: center;
+      justify-self: start;
+    }
+    .log-list .log-level-WARN { color: var(--yellow); }
+    .log-list .log-level-ERROR { color: var(--red); font-weight: 600; }
+    .log-list .log-msg {
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Uptime heatmap 7d × 24h. Cada celda 10×10px para que en desktop
+       entre cómodo y en mobile se escale con el container. */
+    .heatmap-row { display: flex; align-items: center; gap: 8px; }
+    .heatmap-label {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      width: 42px;
+      flex-shrink: 0;
+    }
+    .heatmap-grid {
+      display: grid;
+      grid-template-columns: repeat(24, 1fr);
+      gap: 2px;
+      flex: 1;
+    }
+    .heatmap-cell {
+      aspect-ratio: 1;
+      border-radius: 2px;
+      background: var(--border);
+      min-width: 6px;
+    }
+    .heatmap-cell.uptime-100 { background: var(--green); }
+    .heatmap-cell.uptime-99  { background: color-mix(in srgb, var(--green) 70%, var(--bg-elev)); }
+    .heatmap-cell.uptime-95  { background: var(--yellow); }
+    .heatmap-cell.uptime-low { background: var(--red); }
+    .heatmap-cell.uptime-none { background: var(--border); opacity: 0.4; }
+    .heatmap-axis {
+      display: flex;
+      padding-left: 50px;
+      gap: 2px;
+      font-size: 9px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      margin-top: 4px;
+    }
+    .heatmap-axis span {
+      flex: 1;
+      text-align: center;
+    }
+
+    @media (max-width: 640px) {
+      .insights { grid-template-columns: 1fr; }
+      .heatmap-grid { grid-template-columns: repeat(24, 1fr); }
+      .heatmap-cell { min-width: 0; }
+      .log-list { font-size: 10.5px; }
+      .log-list li { grid-template-columns: 48px 56px 1fr; }
+    }
+
     /* Loading / error states. */
     .loading {
       text-align: center;
@@ -494,11 +831,167 @@
       </div>
     </header>
 
+    <!-- ── Insights grid ──────────────────────────────────────────────
+         5 cards con lo que el semáforo binario no captura. Sólo la
+         primera (latencia) es real en este momento; las otras 4 tienen
+         badge [vista previa] y datos dummy para que se pueda validar
+         el layout antes de shippear cada backend. El orden refleja la
+         prioridad de shipping (latency primero, uptime último). -->
+    <section class="insights" id="insights" aria-label="Salud del sistema">
+      <!-- #1 Latencia /api/chat — REAL -->
+      <article class="insight-card" id="insight-latency" aria-label="Latencia api chat">
+        <div class="insight-head">
+          <h3>latencia /api/chat · 24h</h3>
+          <span class="insight-meta" id="lat-count">—</span>
+        </div>
+        <div class="insight-big">
+          <span class="insight-big-value" id="lat-p95-1h">—</span>
+          <span class="insight-big-unit">ms · p95 1h</span>
+          <span class="insight-delta neutral" id="lat-p95-delta">—</span>
+        </div>
+        <svg class="sparkline" id="lat-sparkline" viewBox="0 0 400 64"
+             preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="insight-legend">
+          <span><span class="dot p50"></span>p50</span>
+          <span><span class="dot p95"></span>p95</span>
+          <span><span class="dot baseline"></span>baseline 7d</span>
+        </div>
+      </article>
+
+      <!-- #2 Error-budget donut — PREVIEW (datos dummy) -->
+      <article class="insight-card insight-preview" aria-label="Error budget">
+        <div class="insight-head">
+          <h3>error budget · 24h</h3>
+          <span class="preview-badge">vista previa</span>
+        </div>
+        <div class="insight-donut-row">
+          <svg class="donut" viewBox="0 0 80 80" aria-hidden="true">
+            <!-- 99.2% OK dummy. C=2π*r con r=32 ≈ 201.06. -->
+            <circle class="donut-bg" cx="40" cy="40" r="32"></circle>
+            <circle class="donut-ok" cx="40" cy="40" r="32"
+                    stroke-dasharray="199.5 201.06"
+                    stroke-dashoffset="0"
+                    transform="rotate(-90 40 40)"></circle>
+            <text class="donut-center" x="40" y="40">99.2%</text>
+          </svg>
+          <div>
+            <div class="insight-big">
+              <span class="insight-big-value">12</span>
+              <span class="insight-big-unit">errores · 1,534 req</span>
+            </div>
+            <ul class="insight-breakdown" style="margin-top:6px">
+              <li><span class="cause">ollama_timeout</span><span class="count">5</span></li>
+              <li><span class="cause">sql_lock</span><span class="count">3</span></li>
+              <li><span class="cause">sse_disconnect</span><span class="count">2</span></li>
+              <li><span class="cause">oauth_expired</span><span class="count">2</span></li>
+            </ul>
+          </div>
+        </div>
+      </article>
+
+      <!-- #3 Freshness matrix — PREVIEW (datos dummy) -->
+      <article class="insight-card insight-preview" aria-label="Freshness de datos">
+        <div class="insight-head">
+          <h3>freshness datos</h3>
+          <span class="preview-badge">vista previa</span>
+        </div>
+        <div class="insight-big">
+          <span class="insight-big-value">5<span style="color:var(--text-faint);font-weight:500">/6</span></span>
+          <span class="insight-big-unit">fuentes al día</span>
+        </div>
+        <table class="fresh-table">
+          <tr>
+            <td class="fresh-source">vault</td>
+            <td class="fresh-age">hace 4m</td>
+            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
+          </tr>
+          <tr>
+            <td class="fresh-source">whatsapp</td>
+            <td class="fresh-age">hace 11m</td>
+            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
+          </tr>
+          <tr>
+            <td class="fresh-source">gmail</td>
+            <td class="fresh-age">hace 2h</td>
+            <td><span class="fresh-bar pct-mid"></span><span class="fresh-drift-warn">drift 1.3×</span></td>
+          </tr>
+          <tr>
+            <td class="fresh-source">calendar</td>
+            <td class="fresh-age">hace 6h</td>
+            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
+          </tr>
+          <tr>
+            <td class="fresh-source">reminders</td>
+            <td class="fresh-age">hace 1h</td>
+            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
+          </tr>
+          <tr>
+            <td class="fresh-source">web_corpus</td>
+            <td class="fresh-age">hace 18h</td>
+            <td><span class="fresh-bar pct-high"></span><span class="fresh-drift-down">stale</span></td>
+          </tr>
+        </table>
+      </article>
+
+      <!-- #4 Log tail — PREVIEW (datos dummy) -->
+      <article class="insight-card insight-preview" aria-label="Actividad reciente">
+        <div class="insight-head">
+          <h3>actividad reciente · WARN/ERROR</h3>
+          <span class="preview-badge">vista previa</span>
+        </div>
+        <ul class="log-list">
+          <li>
+            <span class="log-ts">hace 2m</span>
+            <span class="log-src">web</span>
+            <span class="log-msg log-level-WARN">ollama probe slow (8.2s &gt; 6s budget)</span>
+          </li>
+          <li>
+            <span class="log-ts">hace 14m</span>
+            <span class="log-src">wa</span>
+            <span class="log-msg log-level-ERROR">bridge timeout fetching chat history</span>
+          </li>
+          <li>
+            <span class="log-ts">hace 37m</span>
+            <span class="log-src">web</span>
+            <span class="log-msg log-level-WARN">SQL retry 1/3 on rag_queries insert</span>
+          </li>
+          <li>
+            <span class="log-ts">hace 1h</span>
+            <span class="log-src">ingest</span>
+            <span class="log-msg log-level-ERROR">gmail OAuth token expired (refresh triggered)</span>
+          </li>
+          <li>
+            <span class="log-ts">hace 2h</span>
+            <span class="log-src">chat</span>
+            <span class="log-msg log-level-WARN">semantic cache miss rate spiked (72%)</span>
+          </li>
+          <li>
+            <span class="log-ts">hace 4h</span>
+            <span class="log-src">web</span>
+            <span class="log-msg log-level-WARN">reranker MPS init took 14.3s (cold)</span>
+          </li>
+        </ul>
+      </article>
+
+      <!-- #5 Uptime heatmap — PREVIEW (datos dummy) -->
+      <article class="insight-card insight-preview" aria-label="Uptime heatmap 7 días">
+        <div class="insight-head">
+          <h3>uptime · 7d × 24h</h3>
+          <span class="preview-badge">vista previa</span>
+        </div>
+        <div class="insight-big">
+          <span class="insight-big-value">99.4%</span>
+          <span class="insight-big-unit">uptime 7d</span>
+        </div>
+        <div id="heatmap-mock" aria-hidden="true"></div>
+      </article>
+    </section>
+
     <div id="content">
       <div class="loading">Consultando servicios</div>
     </div>
   </div>
 
-  <script src="/static/status.js" defer></script>
+  <script src="/static/status.js?v=2026-04-24-insights" defer></script>
 </body>
 </html>

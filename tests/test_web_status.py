@@ -106,6 +106,129 @@ def test_api_status_counts_match_services():
     assert total_counted == total_services
 
 
+# ── /api/status/latency — sparkline endpoint ────────────────────────
+# Feed el card #1 del insights grid. Payload contract testeado por
+# shape + 25 buckets + cómputo correcto de percentiles con data sintética.
+
+def test_api_latency_payload_shape():
+    """GET /api/status/latency devuelve window_hours + bucket + series + summary."""
+    resp = _client.get("/api/status/latency?nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["window_hours"] == 24
+    assert d["bucket"] == "hour"
+    assert isinstance(d["series"], list)
+    assert isinstance(d["summary"], dict)
+    for k in (
+        "p50_1h_ms", "p95_1h_ms",
+        "p50_baseline_ms", "p95_baseline_ms",
+        "delta_p95_pct", "count_24h",
+    ):
+        assert k in d["summary"], f"summary falta {k!r}"
+
+
+def test_api_latency_series_has_25_buckets():
+    """La serie siempre tiene 25 elementos (24h atrás + hora actual),
+    aún cuando no hay data en rag_queries. Sin esto el frontend se
+    queda sin eje X estable y el sparkline se comprime raro."""
+    resp = _client.get("/api/status/latency?nocache=1")
+    d = resp.json()
+    assert len(d["series"]) == 25, (
+        f"serie debería tener 25 buckets (24h back + current), tiene {len(d['series'])}"
+    )
+    # Cada bucket tiene el mismo schema.
+    for s in d["series"]:
+        assert "ts" in s
+        assert "count" in s and isinstance(s["count"], int)
+        # p50/p95/p99 pueden ser null en horas sin queries.
+        for k in ("p50_ms", "p95_ms", "p99_ms"):
+            assert k in s
+            assert s[k] is None or isinstance(s[k], int)
+
+
+def test_api_latency_percentiles_with_fake_data(tmp_path, monkeypatch):
+    """Insert rows sintéticas en rag_queries (cmd='web' + extra_json.total_ms)
+    y verificar que p50 / p95 salen computados via json_extract + window-
+    function nearest-rank. Esto prueba end-to-end que el frontend va a
+    ver los números correctos cuando haya data.
+
+    Nota: el /api/status/latency cache es sensible a DB_PATH. Seteamos
+    DB_PATH al tmp_path ANTES de instanciar el TestClient acá porque el
+    _client module-level ya apuntó al DB real; así que llamamos al build
+    function directamente (saltea el cache + TestClient) — más
+    determinístico para tests.
+    """
+    import rag
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+
+    # 10 queries sintéticas, todas en la hora actual, total_ms en pasos
+    # de 1000 de 1000..10000. El p50 de [1000..10000] por nearest-rank
+    # lower-median es 5000, el p95 es 10000 (último cruzando 0.95).
+    for i, ms in enumerate([1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]):
+        rag.log_query_event({
+            "cmd": "web", "q": f"q{i}",
+            "t_retrieve": 1.0, "t_gen": 3.0,
+            "ttft_ms": 500, "llm_prefill_ms": 500, "llm_decode_ms": 2500,
+            "total_ms": ms,
+        })
+
+    # Llamar al build directo para saltarse el módulo-level cache y el
+    # DB_PATH del TestClient (ambos apuntan al DB real).
+    payload = _server._status_latency_build_payload()
+    # Contract: 25 buckets + summary completo.
+    assert len(payload["series"]) == 25
+    # El único bucket con data es el current (último); chequear sus
+    # percentiles.
+    buckets_with_data = [s for s in payload["series"] if s["count"] > 0]
+    assert len(buckets_with_data) == 1, (
+        f"solo la hora actual debería tener data, encontré {len(buckets_with_data)}"
+    )
+    current = buckets_with_data[0]
+    assert current["count"] == 10
+    # Nearest-rank percentiles sobre [1000..10000]: p50=5000, p95=10000.
+    assert current["p50_ms"] == 5000
+    assert current["p95_ms"] == 10000
+    # Summary: last-hour == current bucket, count_24h == 10.
+    assert payload["summary"]["p50_1h_ms"] == 5000
+    assert payload["summary"]["p95_1h_ms"] == 10000
+    assert payload["summary"]["count_24h"] == 10
+
+
+def test_api_latency_handles_empty_db_gracefully(tmp_path, monkeypatch):
+    """Con rag_queries vacía, el endpoint devuelve 25 buckets vacíos +
+    summary con nulls, no 500. Sin esto la /status page rompe en una
+    instalación fresh o después de wipe de telemetría."""
+    import rag
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+
+    payload = _server._status_latency_build_payload()
+    assert len(payload["series"]) == 25
+    assert all(s["count"] == 0 for s in payload["series"])
+    assert payload["summary"]["p50_1h_ms"] is None
+    assert payload["summary"]["p95_1h_ms"] is None
+    assert payload["summary"]["delta_p95_pct"] is None
+    assert payload["summary"]["count_24h"] == 0
+
+
+def test_status_page_has_insights_section():
+    """El HTML tiene la sección insights con las 5 cards + badges de
+    vista previa en 4 de ellas (las 4 que aún no están implementadas).
+    Si alguien mueve/borra esto, la validación del layout se pierde."""
+    body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
+    assert 'id="insights"' in body
+    assert 'id="insight-latency"' in body
+    assert 'id="lat-sparkline"' in body
+    assert 'id="lat-p95-1h"' in body
+    # 4 preview badges (una por card mockup).
+    assert body.count('preview-badge') >= 4
+    # Heatmap placeholder (mock #5).
+    assert 'id="heatmap-mock"' in body
+
+
 # ── Grading helpers ──────────────────────────────────────────────────
 
 def test_grade_daemon_running_is_ok():

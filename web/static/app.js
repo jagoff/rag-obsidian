@@ -1695,10 +1695,17 @@ function appendWhatsAppProposal(parent, payload) {
   const replyWarn = fields.reply_to_warning || "";
 
   const card = el("div", `proposal proposal-whatsapp${isReply ? " proposal-whatsapp-reply" : ""}`);
+  // a11y: ver comentario en appendProposal — region landmark con
+  // aria-labelledby al heading del card.
+  card.setAttribute("role", "region");
 
   const head = el("div", "proposal-head");
   head.appendChild(el("span", "proposal-icon", isReply ? "↩" : "💬"));
-  head.appendChild(el("span", "proposal-kind", isReply ? "Responder en WhatsApp" : "Mensaje de WhatsApp"));
+  const waHeadId = `proposal-head-${Math.random().toString(36).slice(2, 9)}`;
+  const waHeadLabel = el("span", "proposal-kind", isReply ? "Responder en WhatsApp" : "Mensaje de WhatsApp");
+  waHeadLabel.id = waHeadId;
+  head.appendChild(waHeadLabel);
+  card.setAttribute("aria-labelledby", waHeadId);
   card.appendChild(head);
 
   const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
@@ -1876,10 +1883,17 @@ function appendMailProposal(parent, payload) {
   const err = fields.error || null;
 
   const card = el("div", "proposal proposal-mail");
+  // a11y: ver comentario en appendProposal — region landmark con
+  // aria-labelledby al heading del card.
+  card.setAttribute("role", "region");
 
   const head = el("div", "proposal-head");
   head.appendChild(el("span", "proposal-icon", "✉"));
-  head.appendChild(el("span", "proposal-kind", "Email"));
+  const mailHeadId = `proposal-head-${Math.random().toString(36).slice(2, 9)}`;
+  const mailHeadLabel = el("span", "proposal-kind", "Email");
+  mailHeadLabel.id = mailHeadId;
+  head.appendChild(mailHeadLabel);
+  card.setAttribute("aria-labelledby", mailHeadId);
   card.appendChild(head);
 
   // Tres inputs/textareas editables. Reusa la clase `.proposal-wa-text`
@@ -2030,13 +2044,24 @@ function appendProposal(parent, payload) {
   }
 
   const card = el("div", `proposal proposal-${kind}`);
+  // a11y: cada propuesta es una región interactiva con form-like
+  // semantics (campos + 2 botones). role="region" + aria-labelledby
+  // la convierten en un landmark navegable por screen reader.
+  card.setAttribute("role", "region");
 
   const head = el("div", "proposal-head");
   head.appendChild(el("span", "proposal-icon", kind === "event" ? "📅" : "✓"));
-  head.appendChild(el(
+  // ID único en el head para que aria-labelledby del card lo
+  // referencie. Math.random sirve — son cards efímeras (no se
+  // serializan ni se buscan), no necesitamos un counter global.
+  const headLabelId = `proposal-head-${Math.random().toString(36).slice(2, 9)}`;
+  const headLabel = el(
     "span", "proposal-kind",
     kind === "event" ? "Nuevo evento" : "Nuevo recordatorio",
-  ));
+  );
+  headLabel.id = headLabelId;
+  head.appendChild(headLabel);
+  card.setAttribute("aria-labelledby", headLabelId);
   card.appendChild(head);
 
   const title = el("div", "proposal-title", fields.title || "(sin título)");
@@ -2467,7 +2492,12 @@ function appendCopyButton(parent, getText) {
   btn.className = "msg-action copy-btn";
   btn.setAttribute("aria-label", "copiar respuesta");
   btn.title = "copiar markdown";
-  btn.innerHTML = `${COPY_SVG}<span class="msg-action-label">copiar</span>`;
+  // a11y: aria-live="polite" sobre el label que muta de
+  // "copiar" → "copiado" / "sin texto" / "falló — ⌘C manual" para que
+  // VoiceOver / NVDA anuncien el cambio. Sin esto el feedback visual
+  // se pierde para usuarios de screen reader. "polite" no interrumpe
+  // (no es un error crítico).
+  btn.innerHTML = `${COPY_SVG}<span class="msg-action-label" aria-live="polite" aria-atomic="true">copiar</span>`;
   btn.addEventListener("click", async () => {
     const text = typeof getText === "function" ? getText() : "";
     const label = btn.querySelector(".msg-action-label");
@@ -3647,26 +3677,26 @@ document.querySelectorAll(".topbar-title").forEach((brand) => {
 
 (function initMobileTier1() {
   const mqMobile = window.matchMedia("(max-width: 640px)");
+  // pointer:coarse cubre tablets / iPad además de phones (matchMedia
+  // 640px es solo viewport-width). Evitar autofocus en cualquier
+  // touch device — todos abren keyboard on focus.
+  const isTouch = window.matchMedia("(pointer: coarse)").matches;
 
-  // ── (a) Blur inicial en mobile — previene keyboard auto-abre ─────
-  // El input tiene autofocus en el HTML (desktop vibe). iOS respeta eso
-  // y abre el teclado al instante del load. En un chat con mensajes
-  // previos visibles, el keyboard tapando media pantalla al abrir la
-  // PWA se siente invasivo. Blur in-line: casi imperceptible pero mata
-  // el keyboard auto-open.
-  // NO corre cuando el user llegó vía deep-link (/chat?q=...) porque
-  // ahí el submit ya pasó y el keyboard tiene sentido. Detectamos eso
-  // via URLSearchParams.
-  if (mqMobile.matches) {
-    const seed = new URLSearchParams(window.location.search).get("q");
-    if (!seed) {
-      // requestAnimationFrame espera al primer paint para que el blur
-      // corra después del autofocus sin race. `input.blur()` seguido
-      // de focus más tarde (al tap) funciona limpio en iOS Safari.
-      requestAnimationFrame(() => {
-        try { input.blur(); } catch (_) {}
-      });
-    }
+  // ── (a) Focus inicial: solo desktop, nunca touch ──────────────────
+  // El HTML autofocus se quitó (a11y audit lote 2, 2026-04-25): en iOS
+  // Safari abría el teclado al cargar la página y tapaba el empty-hero.
+  // Ahora el focus inicial lo decide JS y solo corre en desktop. Para
+  // deep-links (/chat?q=...) el submit es inmediato, no tocamos focus
+  // — el flujo de send() ya gestiona el blur.
+  const seed = new URLSearchParams(window.location.search).get("q");
+  if (!seed && !isTouch && !mqMobile.matches) {
+    // requestAnimationFrame espera al primer paint para que el focus
+    // corra después de que el layout esté estable (el composer puede
+    // estar centrado en empty-state, focusear antes del layout deja
+    // el caret en posición rara).
+    requestAnimationFrame(() => {
+      try { input.focus({ preventScroll: true }); } catch (_) {}
+    });
   }
 
   // ── (b) Sheet open/close ──────────────────────────────────────────

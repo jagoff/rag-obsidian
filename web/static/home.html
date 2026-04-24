@@ -13,7 +13,7 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="rag">
-  <title>rag</title>
+  <title>rag · home</title>
   <script>
     (function () {
       try {
@@ -263,6 +263,26 @@
     @media (prefers-reduced-motion: reduce) {
       #refresh-stages .stage[data-status="start"] .gly { animation: none; }
     }
+    /* ── Sub-stage row (children of `signals` parent chip) ──
+       Renders inline below the parent in a thin row of smaller chips
+       so the user reads the breakdown vertically: parent + 9 children
+       without breaking the wrap layout horribly. */
+    #refresh-stages .substage-row {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      margin-left: 14px;
+      padding: 2px 0 2px 10px;
+      border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      flex-basis: 100%;
+    }
+    #refresh-stages .stage.substage {
+      padding: 1px 6px;
+      font-size: 10px;
+      opacity: 0.85;
+    }
+    #refresh-stages .stage.substage .gly { width: 8px; font-size: 9px; }
+    #refresh-stages .stage.substage .ms { font-size: 9px; }
 
     /* ── Urgent banner ──────────────────────────────────────────── */
     .urgent {
@@ -692,7 +712,7 @@
       opacity: 0.5;
     }
 
-    @media (max-width: 600px) {
+    @media (max-width: 640px) {
       .grid { grid-template-columns: 1fr; }
       main#home { padding: 64px 12px 40px; }
       .home-head { flex-wrap: wrap; }
@@ -700,9 +720,10 @@
   </style>
 </head>
 <body>
+  <a href="#home" class="skip-link">Saltar al contenido</a>
   <header id="topbar">
     <div class="topbar-inner">
-      <h1 class="topbar-title">rag <span>· home</span></h1>
+      <h1 class="topbar-title">rag <span aria-hidden="true">· home</span></h1>
       <div class="topbar-meta">
         <a class="topbar-link" href="/chat">chat →</a>
         <a class="topbar-link" href="/dashboard">dashboard →</a>
@@ -710,13 +731,24 @@
       </div>
     </div>
   </header>
-  <div id="progress" role="progressbar" aria-hidden="true"></div>
-  <main id="home">
+  <!-- Indeterminate shimmer: purely decorative. The numeric/textual progress
+       state lives en .status-line (role=status, aria-live=polite). Si esta
+       barra alguna vez transmite porcentaje real, sumar role=progressbar +
+       aria-valuenow/min/max — y eliminar aria-hidden. -->
+  <div id="progress" aria-hidden="true"></div>
+  <main id="home" tabindex="-1">
     <div class="home-head">
       <h2>hoy<span class="date" id="date-label">—</span></h2>
     </div>
-    <div class="status-line" id="status-line">cargando…</div>
-    <div id="refresh-stages" aria-live="polite" aria-label="progreso del refresh"></div>
+    <!-- Status line: el textContent cambia con cada estado (cargando,
+         brief generado, error). role=status + aria-live=polite hace que
+         SR anuncie el cambio sin interrumpir; aria-atomic=true fuerza a
+         leer toda la línea (no sólo el delta del nodo modificado). -->
+    <div class="status-line" id="status-line"
+         role="status" aria-live="polite" aria-atomic="true">cargando…</div>
+    <!-- Stage progress: refresh por SSE. role=region + aria-label hace
+         que SR la trate como landmark navegable durante el refresh. -->
+    <div id="refresh-stages" role="region" aria-live="polite" aria-label="progreso del refresh"></div>
     <div id="urgent-wrap"></div>
     <div id="narrative-wrap"></div>
     <div class="grid" id="panels"></div>
@@ -727,6 +759,6 @@
   <script src="/static/vendor/marked.min.js"
           integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"
           defer></script>
-  <script src="/static/home.js?v=2026-04-24-stream-progress" defer></script>
+  <script src="/static/home.js?v=2026-04-24-stream-substages" defer></script>
 </body>
 </html>

@@ -34013,6 +34013,203 @@ def _agent_tool_whatsapp_search(
     return json.dumps(out, ensure_ascii=False)
 
 
+def _agent_tool_whatsapp_thread(
+    contact_name: str,
+    max_messages: int = 15,
+    days: int = 7,
+) -> str:
+    """Leer los últimos N mensajes literales de un chat 1:1 con un contacto.
+
+    Distinto a `_agent_tool_whatsapp_search` (búsqueda semántica por
+    contenido sobre el corpus indexado): acá vamos directo al SQLite
+    del bridge (`messages.db`) y traemos las últimas N filas del chat
+    de ese contacto, en orden cronológico (DESC por timestamp). El uso
+    típico es que el LLM lo combine con `propose_calendar_event` —
+    "fijate qué quedamos con Juan ayer y agendalo": el chat agente
+    pide los mensajes, ve "el jueves 4pm" en el último inbound, y
+    arma la propuesta de evento. NO hay regex de detección de
+    reuniones — el LLM parsea el thread.
+
+    Args:
+        contact_name: Nombre tal como aparece en Apple Contacts.
+        max_messages: Mensajes a devolver. Cap duro 1–30 para no
+            inflar el CONTEXTO del LLM.
+        days: Ventana en días hacia atrás. Cap duro 1–30 (mismo
+            motivo: contexto).
+
+    Returns:
+        JSON string ``{contact_name, jid, messages: [{ts, who:
+        "inbound"|"outbound", text}], count, days_back}``. En orden
+        cronológico ascendente (más viejo → más nuevo) para que el
+        LLM lea el thread como una conversación normal.
+
+        Si el contacto no se resuelve → ``{"messages": [], "error":
+        "contact_not_found", "contact_name": ...}``.
+        Si el bridge DB no existe → ``{"messages": [], "error":
+        "bridge_db_missing"}``.
+        Otros fallos → ``{"messages": [], "error": "..."}``. Silent-
+        fail: NUNCA propaga excepciones — el chat loop se rompe.
+
+    Notes:
+        - Sólo chats 1:1 (`@s.whatsapp.net`). Grupos (`@g.us`) NO
+          soportados — la UX de "qué hablamos con X" en grupo es
+          ambigua (X podría ser cualquiera del grupo).
+        - JID matching por suffix de últimos 10 dígitos, igual que
+          `_whatsapp_resolve_reply_target` — robusto a variaciones de
+          country-code y al `9` mobile prefix de AR.
+        - `text` capado a 400 chars/mensaje.
+    """
+    cn = (contact_name or "").strip()
+    if not cn:
+        return json.dumps({
+            "messages": [],
+            "error": "empty_contact",
+            "contact_name": "",
+        }, ensure_ascii=False)
+
+    # Hard caps — el LLM verboso (o un user pidiendo "todo el chat")
+    # podría meter max=999 / days=365 y fundirnos el num_ctx. 30/30 es
+    # suficiente para ~todos los casos de "qué hablamos los últimos N
+    # días" sin romper el budget.
+    max_messages = max(1, min(30, int(max_messages)))
+    days = max(1, min(30, int(days)))
+
+    try:
+        lookup = _whatsapp_jid_from_contact(cn)
+    except Exception as exc:
+        return json.dumps({
+            "messages": [],
+            "error": f"contact_lookup_failed: {str(exc)[:80]}",
+            "contact_name": cn,
+        }, ensure_ascii=False)
+
+    if not lookup.get("jid"):
+        err = lookup.get("error") or "not_found"
+        return json.dumps({
+            "messages": [],
+            "error": "contact_not_found",
+            "contact_name": cn,
+            "lookup_error": err,
+        }, ensure_ascii=False)
+
+    primary_jid = lookup["jid"]
+    full_name = lookup.get("full_name") or cn
+
+    # Build last-10-digit suffix candidates — same logic as
+    # `_whatsapp_resolve_reply_target` so cross-country contacts and
+    # mobile-prefix variants ("+5491134567890" vs "1134567890") match.
+    suffixes: set[str] = set()
+    primary_local = primary_jid.split("@")[0]
+    d = re.sub(r"\D+", "", primary_local)
+    if len(d) >= 8:
+        suffixes.add(d[-10:] if len(d) >= 10 else d)
+    for ph in (lookup.get("phones") or []):
+        d2 = re.sub(r"\D+", "", ph or "")
+        if len(d2) >= 8:
+            suffixes.add(d2[-10:] if len(d2) >= 10 else d2)
+
+    if not suffixes:
+        return json.dumps({
+            "messages": [],
+            "error": "contact_no_phone_digits",
+            "contact_name": full_name,
+        }, ensure_ascii=False)
+
+    db = WHATSAPP_BRIDGE_DB_PATH
+    if not db.exists():
+        return json.dumps({
+            "messages": [],
+            "error": "bridge_db_missing",
+            "contact_name": full_name,
+        }, ensure_ascii=False)
+
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except _sqlite3.Error as exc:
+        return json.dumps({
+            "messages": [],
+            "error": f"bridge_db_open_failed: {str(exc)[:80]}",
+            "contact_name": full_name,
+        }, ensure_ascii=False)
+
+    # Pull a windowed superset and filter client-side. SQL `LIKE
+    # '%XXXXXXXXXX@s.whatsapp.net'` would work for a single suffix,
+    # but Apple Contacts can return multiple phones → multiple
+    # suffixes; doing the suffix match in Python keeps the SQL stable
+    # and bounded. 1500 rows is enough headroom for a chat that the
+    # user might have spammed with stickers/media in the last 30 days.
+    cutoff = datetime.now().timestamp() - days * 86400.0
+    try:
+        cur = conn.execute(
+            "SELECT id, chat_jid, sender, content, timestamp, is_from_me "
+            "FROM messages "
+            "WHERE chat_jid LIKE '%@s.whatsapp.net' "
+            "  AND content IS NOT NULL AND content != '' "
+            "ORDER BY timestamp DESC "
+            "LIMIT 1500"
+        )
+        rows = cur.fetchall()
+    except _sqlite3.Error as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return json.dumps({
+            "messages": [],
+            "error": f"bridge_db_query_failed: {str(exc)[:80]}",
+            "contact_name": full_name,
+        }, ensure_ascii=False)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    matched_jid: str | None = None
+    collected: list[dict] = []
+    for _mid, chat_jid, _sender, content, ts_raw, is_from_me in rows:
+        local = (chat_jid or "").split("@")[0]
+        ldigits = re.sub(r"\D+", "", local)
+        if not ldigits:
+            continue
+        if not any(ldigits.endswith(s) for s in suffixes):
+            continue
+        ts = _parse_bridge_timestamp(ts_raw)
+        if ts is None:
+            continue
+        if ts < cutoff:
+            # Rows are DESC by ts — once we cross the cutoff, every
+            # subsequent row is older. We can `break` to short-circuit
+            # the scan.
+            break
+        if matched_jid is None:
+            matched_jid = chat_jid
+        collected.append({
+            "ts": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+            "ts_epoch": ts,
+            "who": "outbound" if bool(is_from_me) else "inbound",
+            "text": str(content or "").strip()[:400],
+        })
+        if len(collected) >= max_messages:
+            break
+
+    # `collected` is DESC (newest first). Flip to ASC for chronological
+    # readability — the LLM consumes the thread top-to-bottom like a
+    # human reading the chat.
+    collected.reverse()
+    for m in collected:
+        m.pop("ts_epoch", None)
+
+    return json.dumps({
+        "contact_name": full_name,
+        "jid": matched_jid or primary_jid,
+        "messages": collected,
+        "count": len(collected),
+        "days_back": days,
+    }, ensure_ascii=False)
+
+
 def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 3500) -> str:
     """Buscar archivos en Google Drive por contenido y devolver body exportado.
 

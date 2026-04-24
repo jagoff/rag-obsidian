@@ -93,10 +93,10 @@
     <!-- El click-to-clearView se ata a `.topbar-title` en app.js (se
          dejó el class name para no duplicar código — renombrar cuando
          toquemos más el JS).
-         <p> en vez de <h1>: WCAG 2.4.6 quiere un solo h1 por documento;
-         el h1 canónico vive en la sidebar (línea 114) que está siempre
-         en el DOM. El brand mobile es decorativo + click-target, no un
-         heading semántico. -->
+         Brand mobile como párrafo (no heading): WCAG 2.4.6 quiere un
+         solo top-level heading por documento; el heading canónico vive
+         en la sidebar (línea 118) que está siempre en el DOM. Este
+         brand es decorativo + click-target, no un heading semántico. -->
     <p class="topbar-title mobile-brand">rag <span>· chat</span></p>
     <button id="mobile-new-btn" class="icon-btn" type="button"
             aria-label="Nueva conversación" title="Nueva conversación">

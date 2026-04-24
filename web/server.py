@@ -4706,7 +4706,7 @@ def home_api(regenerate: bool = False) -> Response:
 
 
 @app.get("/api/home/stream")
-def home_stream(regenerate: bool = False) -> StreamingResponse:
+async def home_stream(request: Request, regenerate: bool = False) -> StreamingResponse:
     """SSE companion to `/api/home`. Streams stage events as the 14-fetcher
     fan-out runs so the UI can show what's happening live (fetcher name +
     elapsed_ms on done, "timeout" / "error" on bail). Final `done` event
@@ -4717,14 +4717,24 @@ def home_stream(regenerate: bool = False) -> StreamingResponse:
         status ∈ {"start","done","error","timeout"}
     - `done` ({payload})
     - `error` ({message}) — only on hard failure (today_evidence aborts).
+
+    Disconnect handling: if the client closes the EventSource mid-stream
+    (e.g. user navigates away), the generator detects it via
+    `request.is_disconnected()` and (a) signals the worker thread to stop
+    submitting new sub-fetchers via `cancel_event`, (b) bails out so the
+    server stops yielding into a dead pipe. In-flight fetchers can't be
+    interrupted (Python threads aren't preemptable), but the cancellation
+    short-circuits any sub-stages that haven't started — which matters
+    most for `signals` (9 internal fetchers).
     """
+    import asyncio
     import queue as _queue
-    import concurrent.futures as _cf
     from contextlib import suppress
 
     _ensure_home_prewarmer()
     q: _queue.Queue = _queue.Queue()
     SENTINEL = object()
+    cancel_event = threading.Event()
 
     def _on_progress(stage: str, status: str, elapsed_ms: float, err: str | None) -> None:
         evt = {"stage": stage, "status": status, "elapsed_ms": round(elapsed_ms, 1)}
@@ -4734,7 +4744,11 @@ def home_stream(regenerate: bool = False) -> StreamingResponse:
 
     def _runner() -> None:
         try:
-            payload = _home_compute(regenerate=regenerate, progress=_on_progress)
+            payload = _home_compute(
+                regenerate=regenerate,
+                progress=_on_progress,
+                cancel_event=cancel_event,
+            )
             q.put(("done", payload))
         except HTTPException as exc:
             q.put(("error", {"message": str(exc.detail)}))
@@ -4743,11 +4757,15 @@ def home_stream(regenerate: bool = False) -> StreamingResponse:
         finally:
             q.put((SENTINEL, None))
 
-    def _gen():
+    async def _gen():
         # Heartbeat so reverse-proxies / Safari don't kill the connection
         # while the slowest fetcher (signals, ~25s cold) is still running.
         # 14s is comfortably under the typical 30s idle-disconnect window.
         HEARTBEAT_S = 14.0
+        # Disconnect probe — every iteration checks if the client is
+        # still there. 1s is a balance between snappy cancel and
+        # overhead (each probe is ~50µs).
+        DISCONNECT_PROBE_S = 1.0
         # Hard cap matches the worst-case sum of per-fetcher budgets
         # (today=30 + signals=45 + tail=15 cushion). Anything past this
         # means a fetcher is wedged — emit an explicit error.
@@ -4758,49 +4776,94 @@ def home_stream(regenerate: bool = False) -> StreamingResponse:
 
         # Initial event so the UI knows the stream is alive even before
         # the first fetcher finishes (today_evidence cold path = 4-30s).
-        yield _sse("hello", {"stages": [
-            "today", "signals", "tomorrow", "forecast",
-            "pagerank", "chrome", "eval", "followup",
-            "drive", "wa_unreplied", "bookmarks", "vaults",
-            "finance", "youtube",
-        ]})
+        # Top-level stages + the 9 sub-fetchers of `signals` (which
+        # itself is the dominant bottleneck on cold start). The UI
+        # uses this list to seed placeholder chips so users see the
+        # full surface from t=0.
+        yield _sse("hello", {
+            "stages": [
+                "today", "signals", "tomorrow", "forecast",
+                "pagerank", "chrome", "eval", "followup",
+                "drive", "wa_unreplied", "bookmarks", "vaults",
+                "finance", "youtube",
+            ],
+            "substages": {
+                "signals": [
+                    "signals.mail_unread", "signals.reminders",
+                    "signals.calendar", "signals.whatsapp",
+                    "signals.weather", "signals.gmail",
+                    "signals.loops", "signals.contradictions",
+                    "signals.low_conf",
+                ],
+            },
+        })
 
         t0 = time.time()
+        last_event = t0
         finished = False
-        while not finished:
-            elapsed = time.time() - t0
-            if elapsed > HARD_CAP_S:
-                yield _sse("error", {
-                    "message": f"home-compute excedió {HARD_CAP_S:.0f}s",
-                })
-                break
-            try:
-                kind, payload = q.get(timeout=HEARTBEAT_S)
-            except _queue.Empty:
-                # No event in HEARTBEAT_S — flush a comment to keep the
-                # connection warm. SSE spec: lines starting with `:` are
-                # comments, ignored by the client.
-                yield ": keepalive\n\n"
-                continue
+        loop = asyncio.get_running_loop()
 
-            if kind is SENTINEL:
-                finished = True
-                break
-            yield _sse(kind, payload)
-            if kind == "done":
-                # Persist + cache so the next /api/home is instant.
+        try:
+            while not finished:
+                elapsed = time.time() - t0
+                if elapsed > HARD_CAP_S:
+                    yield _sse("error", {
+                        "message": f"home-compute excedió {HARD_CAP_S:.0f}s",
+                    })
+                    cancel_event.set()
+                    break
+
+                # Disconnect probe before blocking on the queue.
                 with suppress(Exception):
-                    body = json.dumps(payload, default=str).encode()
-                    now = time.time()
-                    _HOME_STATE["payload"] = payload
-                    _HOME_STATE["body"] = body
-                    _HOME_STATE["ts"] = now
-                    _persist_home_cache(body, now)
-                finished = True
-                break
-            if kind == "error":
-                finished = True
-                break
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        print("[home-stream] client disconnected, cancelling",
+                              file=sys.stderr)
+                        break
+
+                # `queue.get` is sync + blocking — run in a thread so we
+                # don't starve the event loop (which needs to serve
+                # other requests + run is_disconnected probes).
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, lambda: q.get(timeout=DISCONNECT_PROBE_S),
+                        ),
+                        timeout=DISCONNECT_PROBE_S + 0.5,
+                    )
+                except (_queue.Empty, asyncio.TimeoutError):
+                    # No event in DISCONNECT_PROBE_S — emit heartbeat
+                    # if we're approaching the proxy idle window.
+                    if time.time() - last_event >= HEARTBEAT_S:
+                        yield ": keepalive\n\n"
+                        last_event = time.time()
+                    continue
+
+                last_event = time.time()
+                if kind is SENTINEL:
+                    finished = True
+                    break
+                yield _sse(kind, payload)
+                if kind == "done":
+                    # Persist + cache so the next /api/home is instant.
+                    with suppress(Exception):
+                        body = json.dumps(payload, default=str).encode()
+                        now = time.time()
+                        _HOME_STATE["payload"] = payload
+                        _HOME_STATE["body"] = body
+                        _HOME_STATE["ts"] = now
+                        _persist_home_cache(body, now)
+                    finished = True
+                    break
+                if kind == "error":
+                    finished = True
+                    break
+        finally:
+            # Always set the cancel event so a wedged worker doesn't
+            # keep submitting new sub-fetchers behind our back. Already-
+            # running fetchers will finish naturally (warming caches)
+            # but won't queue more work.
+            cancel_event.set()
 
     return StreamingResponse(
         _gen(),
@@ -5026,6 +5089,7 @@ def _chat_cache_put(key: str, payload: dict) -> None:
 def _home_compute(
     regenerate: bool = False,
     progress: "Callable[[str, str, float, str | None], None] | None" = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> dict:
     """Centralizer — aggregates every information channel the user cares
     about into one JSON payload. Powers the home page.
@@ -5045,6 +5109,11 @@ def _home_compute(
     `progress(stage, status, elapsed_ms, error_message)` where status is one
     of "start" | "done" | "error" | "timeout". Used by the SSE stream
     endpoint to surface live fetcher state to the UI.
+
+    `cancel_event` (optional): if set mid-compute (e.g. SSE client
+    disconnected), abandon waiting on remaining futures and shut the
+    pool down with `cancel_futures=True`. Already-running fetchers
+    finish naturally to warm caches; pending ones are dropped.
     """
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import suppress
@@ -5093,7 +5162,21 @@ def _home_compute(
             _timed, "today", _collect_today_evidence,
             now, VAULT_PATH, LOG_PATH, CONTRADICTION_LOG_PATH,
         )
-        fut_signals     = pool.submit(_timed, "signals", _pendientes_collect, col, now, 14)
+        # Signals fans out 9 sub-fetchers internally — surface them as
+        # `signals.<name>` sub-stages so the UI can pinpoint which inner
+        # fetcher is the actual bottleneck (cold gmail / whatsapp /
+        # mail_unread typically dominate the 5-7s of `signals` total).
+        def _signals_progress(
+            name: str, status: str, elapsed_ms: float, err: str | None,
+        ) -> None:
+            if progress is not None:
+                with suppress(Exception):
+                    progress(f"signals.{name}", status, elapsed_ms, err)
+
+        fut_signals     = pool.submit(
+            _timed, "signals",
+            lambda: _pendientes_collect(col, now, 14, progress=_signals_progress),
+        )
         fut_tomorrow    = pool.submit(_timed, "tomorrow", _fetch_calendar_ahead, 1, 10)
         fut_forecast    = pool.submit(_timed, "forecast", _fetch_weather_forecast)
         fut_pagerank    = pool.submit(_timed, "pagerank", _fetch_pagerank_top, col, 5)
@@ -5115,6 +5198,11 @@ def _home_compute(
         import concurrent.futures as _cf
 
         def _await(name: str, fut, timeout: float, default=None):
+            # Honor cancel_event: if the SSE client bailed, stop waiting
+            # for remaining futures (the worker thread keeps running to
+            # warm caches but its data is no longer consumed).
+            if cancel_event is not None and cancel_event.is_set():
+                return default
             try:
                 return fut.result(timeout=timeout)
             except _cf.TimeoutError:
@@ -5172,12 +5260,18 @@ def _home_compute(
         signals["youtube_watched"] = youtube_watched
     finally:
         # Detach stragglers; they continue warming caches for the next call.
-        pool.shutdown(wait=False)
+        # On SSE-client disconnect (cancel_event set), drop pending
+        # futures via cancel_futures=True so we don't keep submitting
+        # work no one's waiting for. Already-running fetchers finish
+        # naturally — Python threads can't be preempted.
+        cancel = cancel_event is not None and cancel_event.is_set()
+        pool.shutdown(wait=False, cancel_futures=cancel)
         if timings:
             ranked = sorted(timings.items(), key=lambda kv: -kv[1])
             summary = " ".join(f"{k}={v:.1f}s" for k, v in ranked if v >= 0.2)
             if summary:
-                print(f"[home-compute] {summary} total={time.time() - t_submit:.1f}s",
+                tag = "cancelled " if cancel else ""
+                print(f"[home-compute] {tag}{summary} total={time.time() - t_submit:.1f}s",
                       file=sys.stderr)
 
     today_total = (

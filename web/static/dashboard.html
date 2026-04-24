@@ -824,6 +824,49 @@
       border: 0;
     }
 
+    /* ── a11y: skip-link + tap targets (audit LOTE 4) ────────────────
+       dashboard.html no incluye style.css, así que el bloque global de
+       a11y que L1 agregó al CSS compartido NO aplica acá. Re-implementa-
+       mos lo mínimo inline: skip-link visible al recibir foco, y
+       min-height 44px para botones cuando el puntero es coarse (touch)
+       o el viewport es <= 640px (mobile). Las "chips" de ventana de
+       tiempo (.memcard-window button) están en la lista por default;
+       en desktop quedan compactas como antes (3px 10px).
+    */
+    .skip-link {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: var(--cyan);
+      color: var(--bg);
+      padding: 8px 14px;
+      border-radius: 0 0 8px 0;
+      font-weight: 700;
+      font-size: 13px;
+      text-decoration: none;
+      z-index: 9999;
+      transform: translateY(-110%);
+      transition: transform 120ms ease-out;
+    }
+    .skip-link:focus,
+    .skip-link:focus-visible {
+      transform: translateY(0);
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+    /* Main landmark con tabindex=-1 no debe mostrar outline al recibir
+       foco programático desde el skip-link (no es interactivo). */
+    main:focus,
+    main:focus-visible {
+      outline: none;
+    }
+    @media (pointer: coarse), (max-width: 640px) {
+      header button,
+      .memcard-window button {
+        min-height: 44px;
+      }
+    }
+
     /* Loading state */
     .loading {
       text-align: center;
@@ -852,6 +895,7 @@
   </style>
 </head>
 <body>
+  <a href="#content" class="skip-link">Saltar al contenido</a>
   <div class="container">
     <header>
       <h1>rag <span>· dashboard</span></h1>
@@ -861,6 +905,7 @@
         <button class="live" id="live-toggle" data-state="off" type="button" aria-pressed="false" aria-label="Pausar o reanudar actualizaciones en vivo">
           <span class="dot" aria-hidden="true"></span><span id="live-label">conectando…</span>
         </button>
+        <label for="days-picker" class="sr-only">Seleccionar período</label>
         <select id="days-picker" aria-label="Período">
           <option value="7">7 días</option>
           <option value="14">14 días</option>
@@ -878,7 +923,7 @@
       </div>
     </header>
 
-    <div id="content">
+    <main id="content" tabindex="-1">
       <div class="skel-ticker skeleton" aria-hidden="true"></div>
       <div class="skel-kpis" aria-hidden="true">
         <div class="skel-kpi skeleton"></div>
@@ -901,8 +946,13 @@
         <div class="skel-chart skeleton"></div>
         <div class="skel-chart skeleton"></div>
       </div>
-      <span class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard</span>
-    </div>
+    </main>
+    <!-- Persistent SR-only live region. Lives OUTSIDE <main> on purpose:
+         buildLayout() replaces #content.innerHTML on every theme/days
+         change, which would clobber a status node nested inside. Keeping
+         it here means JS can re-text it across rebuilds without losing
+         the live-region wiring. -->
+    <span id="dashboard-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard</span>
   </div>
 
   <script src="/static/dashboard.js" defer></script>

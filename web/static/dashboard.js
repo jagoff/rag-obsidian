@@ -142,12 +142,33 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// Hard cleanup on tab close / navigation: visibilitychange handles
+// "tab hidden" but does NOT reliably fire on close, and the MEM/CPU
+// EventSources are independent of state.evtSrc — without this hook
+// they leak as zombie connections from the browser's PoV until GC.
+window.addEventListener("beforeunload", () => {
+  try { if (state.evtSrc) state.evtSrc.close(); } catch (_) {}
+  try { if (state.poll) clearInterval(state.poll); } catch (_) {}
+  try { if (MEM && MEM.es) MEM.es.close(); } catch (_) {}
+  try { if (CPU && CPU.es) CPU.es.close(); } catch (_) {}
+});
+
 // Initial boot
 load(true);
 startPolling();
 startStream();
 
 // ── Loading + polling ─────────────────────────────────────────────────────
+
+// SR live-region: dashboard.html has `<span id="dashboard-status"
+// role="status" aria-live="polite">` sitting OUTSIDE <main>. It
+// survives buildLayout() rebuilds (which clobber #content.innerHTML)
+// so we can re-text it across the whole load lifecycle. Politely
+// (not assertively) — we don't want to interrupt SR users every poll.
+function announceStatus(msg) {
+  const node = document.getElementById("dashboard-status");
+  if (node) node.textContent = msg;
+}
 
 async function load(showSkeleton) {
   if (showSkeleton && state.built) {
@@ -171,12 +192,16 @@ async function load(showSkeleton) {
       cpuInit();
     }
     refresh(d);
+    announceStatus(`Datos del dashboard actualizados (${d.kpis.total_queries} queries en ${state.days} días)`);
   } catch (err) {
     if (!state.built) {
-      el.content.innerHTML = `<div class="loading" style="color:var(--red)">error: ${err.message}</div>`;
+      // role=alert + aria-live=assertive so SR users get the error even
+      // if they were on another part of the page when the fetch failed.
+      el.content.innerHTML = `<div class="loading" style="color:var(--red)" role="alert" aria-live="assertive">error: ${err.message}</div>`;
     } else {
       el.metaUpdated.textContent = `error ${err.message}`;
     }
+    announceStatus(`Error al cargar datos del dashboard: ${err.message}`);
   }
 }
 
@@ -270,29 +295,38 @@ function setLiveState(s, label) {
 // ── Layout (built once) ───────────────────────────────────────────────────
 
 function buildLayout(d) {
+  // Each major block is a `<section aria-labelledby>` wrapping its h2.
+  // Why: the layout is built dynamically from a flat string of <div>s,
+  // which means screen readers couldn't find landmarks via the rotor.
+  // Wrapping in `<section>` (a sectioning content element) + giving the
+  // visible h2 an id and pointing aria-labelledby at it = each region
+  // shows up named in the rotor without changing visible markup.
+  // Ticker keeps role="log" but live="off" — the global `live-toggle`
+  // (header) pauses the upstream stream, so we don't also force SR to
+  // announce every sample as it arrives (P2 #9, see audit notes).
   el.content.innerHTML = `
-    <div class="ticker">
+    <section class="ticker" aria-labelledby="sec-ticker">
       <div class="ticker-head">
-        <h2>Eventos en vivo</h2>
+        <h2 id="sec-ticker">Eventos en vivo</h2>
         <span style="font-size:11px;color:var(--text-faint)" id="ticker-meta">esperando…</span>
       </div>
-      <div class="ticker-list" id="ticker-list" role="log" aria-live="polite" aria-relevant="additions" aria-label="Eventos en vivo">
+      <div class="ticker-list" id="ticker-list" role="log" aria-live="off" aria-relevant="additions" aria-label="Eventos en vivo (usar el botón en vivo del header para pausar)">
         <div class="ticker-empty">sin eventos todavía. cuando llegue una query, aparecerá acá.</div>
       </div>
-    </div>
+    </section>
 
-    <div class="kpis" id="kpis"></div>
-    <div class="signals-panel" id="signals-panel" role="region" aria-labelledby="signals-title">
+    <section class="kpis" id="kpis" aria-label="Indicadores clave"></section>
+    <section class="signals-panel" id="signals-panel" aria-labelledby="signals-title">
       <h3 id="signals-title">Señales al ranker-vivo <span class="signals-window" id="signals-window">—</span></h3>
       <div class="signals-grid" id="signals-grid">
         <div class="signals-empty">esperando eventos…</div>
       </div>
-    </div>
-    <div class="health" id="health"></div>
+    </section>
+    <section class="health" id="health" aria-label="Salud del sistema"></section>
 
     <div class="charts">
-      <div class="chart-card wide" id="card-memory">
-        <h2>Memoria del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp</span> <span id="mem-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+      <section class="chart-card wide" id="card-memory" aria-labelledby="sec-memory">
+        <h2 id="sec-memory">Memoria del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp</span> <span id="mem-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
         <div class="memcard-grid">
           <div class="memcard-main">
             <div class="memcard-head">
@@ -307,17 +341,17 @@ function buildLayout(d) {
                 <button data-min="1440">24h</button>
               </div>
             </div>
-            <div class="memcard-chart-wrap"><canvas id="ch-memory"></canvas></div>
+            <div class="memcard-chart-wrap"><canvas id="ch-memory" aria-label="Gráfico de uso de memoria por categoría (rag, ollama, sqlite-vec, whatsapp) en el tiempo"></canvas></div>
           </div>
           <div class="memcard-top">
             <h3>Top procesos</h3>
             <ul id="mem-top-list"><li><span class="name">—</span></li></ul>
           </div>
         </div>
-      </div>
+      </section>
 
-      <div class="chart-card wide" id="card-cpu">
-        <h2>CPU del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp · % de 1 core</span> <span id="cpu-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
+      <section class="chart-card wide" id="card-cpu" aria-labelledby="sec-cpu">
+        <h2 id="sec-cpu">CPU del rag <span style="font-size:11px;font-weight:400;color:var(--text-faint);margin-left:6px;">rag + ollama + sqlite-vec + whatsapp · % de 1 core</span> <span id="cpu-live-dot" style="font-size:10px;font-weight:400;color:var(--green);margin-left:8px;">● live</span></h2>
         <div class="memcard-grid">
           <div class="memcard-main">
             <div class="memcard-head">
@@ -332,89 +366,89 @@ function buildLayout(d) {
                 <button data-min="1440">24h</button>
               </div>
             </div>
-            <div class="memcard-chart-wrap"><canvas id="ch-cpu"></canvas></div>
+            <div class="memcard-chart-wrap"><canvas id="ch-cpu" aria-label="Gráfico de uso de CPU por categoría (rag, ollama, sqlite-vec, whatsapp) en el tiempo"></canvas></div>
           </div>
           <div class="memcard-top">
             <h3>Top procesos</h3>
             <ul id="cpu-top-list"><li><span class="name">—</span></li></ul>
           </div>
         </div>
-      </div>
+      </section>
 
-      <div class="chart-card">
-        <h2>Queries por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-queries-day"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
+      <section class="chart-card" aria-labelledby="sec-queries-day">
+        <h2 id="sec-queries-day">Queries por dia</h2>
+        <div class="chart-wrap"><canvas id="ch-queries-day" aria-label="Gráfico de barras: queries por día en el período seleccionado"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
 
-      <div class="chart-card wide">
-        <h2>Feedback accionable — señales para mejorar el RAG</h2>
+      <section class="chart-card wide" aria-labelledby="sec-feedback">
+        <h2 id="sec-feedback">Feedback accionable — señales para mejorar el RAG</h2>
         <div id="feedback-panel"></div>
-      </div>
+      </section>
 
-      <div class="chart-card">
-        <h2>Latencia total (p50 diario)</h2>
-        <div class="chart-wrap"><canvas id="ch-latency"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Distribucion de scores</h2>
-        <div class="chart-wrap"><canvas id="ch-scores"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Actividad por hora</h2>
-        <div class="chart-wrap"><canvas id="ch-hours"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Origen de queries</h2>
-        <div class="chart-wrap"><canvas id="ch-sources"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Comandos</h2>
-        <div class="chart-wrap"><canvas id="ch-cmds"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Hot topics</h2>
-        <div class="chart-wrap"><canvas id="ch-topics"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card" id="card-keywords">
-        <h2>Keywords del chat <span id="kw-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
+      <section class="chart-card" aria-labelledby="sec-latency">
+        <h2 id="sec-latency">Latencia total (p50 diario)</h2>
+        <div class="chart-wrap"><canvas id="ch-latency" aria-label="Gráfico de líneas: latencia total p50 y p95 por día (segundos)"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-scores">
+        <h2 id="sec-scores">Distribucion de scores</h2>
+        <div class="chart-wrap"><canvas id="ch-scores" aria-label="Histograma de scores de retrieval por bucket (0.0 a 1.0)"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-hours">
+        <h2 id="sec-hours">Actividad por hora</h2>
+        <div class="chart-wrap"><canvas id="ch-hours" aria-label="Gráfico de barras: cantidad de queries por hora del día (0h a 23h)"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-sources">
+        <h2 id="sec-sources">Origen de queries</h2>
+        <div class="chart-wrap"><canvas id="ch-sources" aria-label="Gráfico de dona: origen de las queries (whatsapp, web, cli, etc.)"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-cmds">
+        <h2 id="sec-cmds">Comandos</h2>
+        <div class="chart-wrap"><canvas id="ch-cmds" aria-label="Gráfico de barras horizontales: comandos rag más usados"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-topics">
+        <h2 id="sec-topics">Hot topics</h2>
+        <div class="chart-wrap"><canvas id="ch-topics" aria-label="Gráfico de barras horizontales: temas calientes en el período"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" id="card-keywords" aria-labelledby="sec-keywords">
+        <h2 id="sec-keywords">Keywords del chat <span id="kw-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
         <div id="kw-cloud" class="kw-cloud" aria-label="Nube de palabras más usadas en chat"></div>
-      </div>
-      <div class="chart-card">
-        <h2>Score trend (promedio diario)</h2>
-        <div class="chart-wrap"><canvas id="ch-score-trend"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Feedback por día (positivo vs negativo)</h2>
-        <div class="chart-wrap"><canvas id="ch-feedback-trend"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Ambient hooks por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-ambient"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card">
-        <h2>Contradicciones por dia</h2>
-        <div class="chart-wrap"><canvas id="ch-contra"></canvas><div class="chart-empty">sin datos en el período</div></div>
-      </div>
-      <div class="chart-card" id="card-index">
-        <h2>Index</h2>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-score-trend">
+        <h2 id="sec-score-trend">Score trend (promedio diario)</h2>
+        <div class="chart-wrap"><canvas id="ch-score-trend" aria-label="Gráfico de líneas: score promedio diario en el período"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-feedback-trend">
+        <h2 id="sec-feedback-trend">Feedback por día (positivo vs negativo)</h2>
+        <div class="chart-wrap"><canvas id="ch-feedback-trend" aria-label="Gráfico de barras apiladas: feedback positivo y negativo por día"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-ambient">
+        <h2 id="sec-ambient">Ambient hooks por dia</h2>
+        <div class="chart-wrap"><canvas id="ch-ambient" aria-label="Gráfico de barras: ambient hooks ejecutados por día"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" aria-labelledby="sec-contra">
+        <h2 id="sec-contra">Contradicciones por dia</h2>
+        <div class="chart-wrap"><canvas id="ch-contra" aria-label="Gráfico de barras: contradicciones detectadas en indexación por día"></canvas><div class="chart-empty">sin datos en el período</div></div>
+      </section>
+      <section class="chart-card" id="card-index" aria-labelledby="sec-index">
+        <h2 id="sec-index">Index</h2>
         <div id="index-content"></div>
-      </div>
-      <div class="chart-card" id="card-latency-stats">
-        <h2>Latencia (percentiles)</h2>
+      </section>
+      <section class="chart-card" id="card-latency-stats" aria-labelledby="sec-latency-stats">
+        <h2 id="sec-latency-stats">Latencia (percentiles)</h2>
         <div id="latency-stats-content"></div>
-      </div>
-      <div class="chart-card" id="card-tune">
-        <h2>Historial de tune</h2>
+      </section>
+      <section class="chart-card" id="card-tune" aria-labelledby="sec-tune">
+        <h2 id="sec-tune">Historial de tune</h2>
         <div id="tune-content"></div>
-      </div>
-      <div class="chart-card" id="card-screentime-apps">
-        <h2>Pantalla · top apps</h2>
-        <div class="chart-wrap"><canvas id="ch-screentime-apps"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
-      </div>
-      <div class="chart-card" id="card-screentime-daily">
-        <h2>Pantalla · diario <span id="screentime-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
-        <div class="chart-wrap"><canvas id="ch-screentime-daily"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
-      </div>
+      </section>
+      <section class="chart-card" id="card-screentime-apps" aria-labelledby="sec-screentime-apps">
+        <h2 id="sec-screentime-apps">Pantalla · top apps</h2>
+        <div class="chart-wrap"><canvas id="ch-screentime-apps" aria-label="Gráfico de barras horizontales: top apps usadas según Screen Time"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
+      </section>
+      <section class="chart-card" id="card-screentime-daily" aria-labelledby="sec-screentime-daily">
+        <h2 id="sec-screentime-daily">Pantalla · diario <span id="screentime-total" style="font-size:11px;font-weight:400;color:var(--text-faint)"></span></h2>
+        <div class="chart-wrap"><canvas id="ch-screentime-daily" aria-label="Gráfico de barras: tiempo de pantalla diario según Screen Time"></canvas><div class="chart-empty">sin datos (knowledgeC.db)</div></div>
+      </section>
     </div>
   `;
 
@@ -689,7 +723,7 @@ function refresh(d) {
         rows += `<tr><td style="color:var(--cyan)">${cell}</td><td>${pr.score}</td></tr>`;
       }
     }
-    idxEl.innerHTML = `<table class="stats-table">${rows}</table>`;
+    idxEl.innerHTML = `<table class="stats-table"><caption class="sr-only">Estadísticas del index del vault: chunks, notas, títulos únicos, tags, carpetas y top notas por PageRank</caption>${rows}</table>`;
   } else {
     idxEl.innerHTML = '<div style="color:var(--text-faint);text-align:center;padding:20px">index no disponible</div>';
   }
@@ -698,7 +732,8 @@ function refresh(d) {
   const ls = d.latency_stats;
   document.getElementById("latency-stats-content").innerHTML = `
     <table class="stats-table">
-      <tr><th></th><th>p50</th><th>p95</th></tr>
+      <caption class="sr-only">Latencia por etapa (retrieve, generate, total) en segundos para los percentiles 50 y 95</caption>
+      <tr><th scope="col"><span class="sr-only">Etapa</span></th><th scope="col">p50</th><th scope="col">p95</th></tr>
       <tr><td>Retrieve</td><td>${ls.retrieve_p50}s</td><td>${ls.retrieve_p95}s</td></tr>
       <tr><td>Generate</td><td>${ls.generate_p50}s</td><td>${ls.generate_p95}s</td></tr>
       <tr><td style="font-weight:700">Total</td><td style="font-weight:700">${ls.total_p50}s</td><td style="font-weight:700">${ls.total_p95}s</td></tr>
@@ -1073,22 +1108,27 @@ function renderTicker() {
       let tag = "";
       let scoreCell = score != null ? score.toFixed(2) : "—";
       let latencyCell = ev.latency != null ? ev.latency + "s" : "—";
+      // Each phase tag gets an sr-only label so SR users hear "en curso",
+      // "error" or "rechazada" instead of just the colored icon — the
+      // SVG itself stays aria-hidden because the surrounding cells
+      // (score "…"/err/gate) repeat the info visually but with text
+      // that screen readers DO pick up.
       if (ev.phase === "in_flight") {
-        tag = `<span class="tag-icon" style="color:var(--cyan)">${icon("refresh", { size: 12, cls: "spin" })}</span>`;
+        tag = `<span class="tag-icon" style="color:var(--cyan)"><span class="sr-only">en curso</span>${icon("refresh", { size: 12, cls: "spin" })}</span>`;
         scoreCell = '<span style="color:var(--cyan)">…</span>';
         latencyCell = '<span style="color:var(--cyan)">en curso</span>';
       } else if (ev.phase === "error") {
-        tag = `<span class="tag-icon" style="color:var(--red)">${icon("warning", { size: 12 })}</span>`;
+        tag = `<span class="tag-icon" style="color:var(--red)"><span class="sr-only">error</span>${icon("warning", { size: 12 })}</span>`;
         scoreCell = '<span style="color:var(--red)">err</span>';
         latencyCell = `<span style="color:var(--red)" title="${escapeHtml(ev.error || "")}">${escapeHtml((ev.error || "fallo").slice(0, 40))}</span>`;
       } else if (ev.gated) {
-        tag = `<span class="tag-icon" style="color:var(--text-faint)">${icon("ban", { size: 12 })}</span>`;
+        tag = `<span class="tag-icon" style="color:var(--text-faint)"><span class="sr-only">rechazada por gate</span>${icon("ban", { size: 12 })}</span>`;
       }
       return `
         <div class="ticker-item">
           <span class="t-time">${timeOf(ev.ts)}</span>
           <span class="t-source ${ev.source || "cli"}">${ev.source || "cli"}</span>
-          <span class="t-q" title="${escapeHtml(ev.q || "")}">${tag}<a href="${escapeHtml(chatQueryHref(ev.q || ""))}" style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;" title="reintentar en chat">${escapeHtml(ev.q || "(sin texto)")}</a></span>
+          <span class="t-q" title="${escapeHtml(ev.q || "")}">${tag}<a href="${escapeHtml(chatQueryHref(ev.q || ""))}" style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;" title="reintentar en chat" aria-label="Reintentar en chat: ${escapeHtml(ev.q || "(sin texto)")}">${escapeHtml(ev.q || "(sin texto)")}</a></span>
           <span class="t-score ${scoreCls}">${scoreCell}</span>
           <span class="t-latency">${latencyCell}</span>
         </div>

@@ -311,6 +311,72 @@ def test_stream_endpoint_emits_error_on_today_evidence_failure(monkeypatch, stub
     assert "done" not in kinds, "should not emit done after a hard error"
 
 
+def test_hello_event_advertises_signals_substages(stub_fetchers):
+    """The `hello` event must declare every sub-fetcher of `signals`
+    so the UI can paint the nested chip strip from t=0. The 9 names
+    match `_pendientes_collect`'s task dict 1:1."""
+    from web.server import app
+
+    expected_subs = {
+        "signals.mail_unread", "signals.reminders", "signals.calendar",
+        "signals.whatsapp", "signals.weather", "signals.gmail",
+        "signals.loops", "signals.contradictions", "signals.low_conf",
+    }
+    with TestClient(app) as client:
+        with client.stream("GET", "/api/home/stream?regenerate=false") as resp:
+            body = b"".join(resp.iter_bytes()).decode()
+
+    events = _parse_sse(body)
+    hello = next(p for ev, p in events if ev == "hello")
+    assert "substages" in hello, hello
+    subs = set(hello["substages"].get("signals", []))
+    assert subs == expected_subs, f"missing or extra: {subs ^ expected_subs}"
+
+
+def test_pendientes_progress_callback_emits_substages(monkeypatch):
+    """`_pendientes_collect(progress=cb)` must call cb start+done for
+    each of the 9 inner fetchers so the SSE stream can surface them
+    as `signals.<name>` sub-stages."""
+    import rag
+
+    expected = {
+        "mail_unread", "reminders", "calendar", "whatsapp",
+        "weather", "gmail", "loops", "contradictions", "low_conf",
+    }
+
+    # Stub each underlying fetcher to a no-op so we don't hit real
+    # services. _pendientes_collect uses these via lambdas inside the
+    # task dict — patching the rag.* names is enough.
+    monkeypatch.setattr(rag, "_fetch_mail_unread", lambda: [])
+    monkeypatch.setattr(rag, "_fetch_reminders_due",
+                        lambda now, horizon_days=1, max_items=30: [])
+    monkeypatch.setattr(rag, "_fetch_calendar_today", lambda: [])
+    monkeypatch.setattr(rag, "_fetch_whatsapp_unread",
+                        lambda hours, max_chats: [])
+    monkeypatch.setattr(rag, "_fetch_weather_rain", lambda: None)
+    monkeypatch.setattr(rag, "_fetch_gmail_evidence", lambda now: {})
+    monkeypatch.setattr(rag, "_pendientes_extract_loops_fast",
+                        lambda vault, days=14, max_items=40: [])
+    monkeypatch.setattr(rag, "_pendientes_recent_contradictions",
+                        lambda log, now, days=14, max_items=5: [])
+    monkeypatch.setattr(rag, "_pendientes_low_conf_queries",
+                        lambda log, now, days=14: [])
+
+    seen_starts: set[str] = set()
+    seen_dones: set[str] = set()
+
+    def cb(stage, status, elapsed_ms, err):
+        if status == "start":
+            seen_starts.add(stage)
+        elif status == "done":
+            seen_dones.add(stage)
+
+    from datetime import datetime
+    rag._pendientes_collect(None, datetime.now(), 14, progress=cb)
+    assert seen_starts == expected, f"missing starts: {expected - seen_starts}"
+    assert seen_dones == expected, f"missing dones: {expected - seen_dones}"
+
+
 def test_stream_done_persists_into_home_state_cache(stub_fetchers):
     """After a successful stream, `/api/home` (non-stream) should serve
     the same payload from cache without re-running the fan-out — the

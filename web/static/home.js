@@ -68,25 +68,53 @@ const STAGE_LABELS = {
   vaults: "actividad vault",
   finance: "finanzas",
   youtube: "YouTube visto",
+  // Sub-stages of `signals` — match server-side keys (`_pendientes_collect`).
+  "signals.mail_unread": "mail.app",
+  "signals.reminders": "reminders",
+  "signals.calendar": "calendar.app",
+  "signals.whatsapp": "whatsapp",
+  "signals.weather": "weather",
+  "signals.gmail": "gmail",
+  "signals.loops": "loops",
+  "signals.contradictions": "contradicciones",
+  "signals.low_conf": "low-conf",
 };
-const STAGE_SLOW_MS = 5000;  // > 5s ⇒ visualmente "lento" (cuello de botella)
+const STAGE_SLOW_MS = 5000;     // top-level: > 5s = bottleneck
+const SUBSTAGE_SLOW_MS = 2000;  // sub-stages: > 2s ya es señal de cola
 
-function _stageId(name) { return "stg-" + name.replace(/[^a-z0-9_-]/gi, "-"); }
+function _stageId(name) { return "stg-" + name.replace(/[^a-z0-9_.-]/gi, "-"); }
 
-function renderStageList(stages, totalMs) {
+function _isSubStage(name) { return typeof name === "string" && name.includes("."); }
+
+function _chipHtml(name, isSub) {
+  const cls = isSub ? "stage substage" : "stage";
+  return `
+    <span class="${cls}" id="${_stageId(name)}" data-status="pending" data-name="${name}">
+      <span class="gly">○</span>
+      <span class="lbl">${STAGE_LABELS[name] || name}</span>
+      <span class="ms"></span>
+    </span>`;
+}
+
+function renderStageList(stages, totalMs, substages = {}) {
   if (!els.stages) return;
   const head = `
     <div class="rs-head">
       <span>refresh — paso a paso</span>
       <span class="rs-total">${(totalMs / 1000).toFixed(1)}s</span>
     </div>`;
-  const chips = stages.map((name) => `
-    <span class="stage" id="${_stageId(name)}" data-status="pending" data-name="${name}">
-      <span class="gly">○</span>
-      <span class="lbl">${STAGE_LABELS[name] || name}</span>
-      <span class="ms"></span>
-    </span>
-  `).join("");
+  // Render top-level chips. When a parent has sub-stages, the parent
+  // chip is followed by its children (smaller font + indent) so the
+  // breakdown reads top-down: "pendientes" → 9 sub-fetchers under it.
+  const chips = stages.map((name) => {
+    let html = _chipHtml(name, false);
+    const subs = substages[name];
+    if (Array.isArray(subs) && subs.length) {
+      const subWrap = subs.map((sn) => _chipHtml(sn, true)).join("");
+      html += `<span class="substage-row">${subWrap}</span>`;
+    }
+    return html;
+  }).join("");
   els.stages.innerHTML = head + chips;
   els.stages.classList.add("active");
 }
@@ -108,7 +136,11 @@ function updateStage(name, status, elapsedMs, errorMsg) {
       ms.textContent = "";
     }
   }
-  if (status === "done" && elapsedMs >= STAGE_SLOW_MS) {
+  // Slow threshold: tighter for sub-stages (their parent gets the
+  // umbrella threshold). 9 sub-fetchers × 5s each would saturate the
+  // strip in yellow even when none was actually a problem.
+  const slowMs = _isSubStage(name) ? SUBSTAGE_SLOW_MS : STAGE_SLOW_MS;
+  if (status === "done" && elapsedMs >= slowMs) {
     node.dataset.slow = "1";
   } else {
     delete node.dataset.slow;
@@ -166,9 +198,9 @@ const SKELETON_PANELS = [
 
 function renderSkeletons() {
   const html = SKELETON_PANELS.map((label) => `
-    <section class="panel loading" aria-busy="true">
+    <section class="panel loading" aria-busy="true" aria-label="Cargando ${esc(label)}">
       <div class="head">
-        <h3>${label}</h3>
+        <h3>${esc(label)}</h3>
         <span class="count">…</span>
       </div>
       <div class="skel-line w80"></div>
@@ -214,7 +246,7 @@ function panel(id, title, count, bodyHtml, emptyText = "sin actividad") {
       <div class="head">
         <h3>${esc(title)}</h3>
         <span class="count">${countStr}</span>
-        <button class="collapse-btn" type="button" aria-label="Colapsar/expandir" title="Colapsar / expandir">
+        <button class="collapse-btn" type="button" aria-label="Colapsar/expandir" aria-expanded="true" title="Colapsar / expandir">
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
                stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="18 15 12 9 6 15"/>
@@ -277,8 +309,14 @@ function applyPanelState() {
     const autoEmpty = !!p.querySelector(".empty");
     const pri = panelPriority(p.id);
     p.style.order = autoEmpty ? 1000 + pri : pri;
-    if (collapsed.has(p.id)) p.classList.add("user-collapsed");
+    const isCollapsed = collapsed.has(p.id);
+    if (isCollapsed) p.classList.add("user-collapsed");
     else p.classList.remove("user-collapsed");
+    // Keep aria-expanded en sincronía con el estado visual del panel.
+    // Render() emite aria-expanded="true" por default; aquí lo flipeamos
+    // a "false" si el user lo dejó colapsado en una sesión previa.
+    const btn = p.querySelector(".collapse-btn");
+    if (btn) btn.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
   });
 }
 
@@ -295,7 +333,8 @@ function renderReminders(items) {
     const disabled = rid ? "" : "disabled";
     const cbTitle = rid ? "Marcar como completada" : "Sin id — no se puede completar desde acá";
     return `<li data-reminder-id="${esc(rid)}" data-reminder-idx="${i}">
-      <button class="rem-check" type="button" aria-label="Completar" title="${esc(cbTitle)}" ${disabled}>
+      <button class="rem-check" type="button" role="checkbox" aria-checked="false"
+              aria-label="Completar" title="${esc(cbTitle)}" ${disabled}>
         <svg class="rem-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <polyline points="20 6 9 17 4 12"/>
@@ -540,9 +579,15 @@ function chatHref(q) {
 
 // Helper: wrap a label in <a> if href is non-empty, else plain.
 // opts.noteData = { path, rank, query } adds data-note-* attrs for click tracking.
+//
+// rel siempre incluye `noopener` por seguridad (incluso en links internos
+// como obsidian:// o /chat?q=…): bloquea que el destino acceda a
+// window.opener si por algún motivo se abriera en otra tab. Para
+// target=_blank sumamos `noreferrer` (no fugar Referer al externo).
 function linked(href, html, opts = {}) {
   if (!href) return html;
-  const target = opts.external ? ` target="_blank" rel="noopener noreferrer"` : "";
+  const rel = opts.external ? "noopener noreferrer" : "noopener";
+  const target = opts.external ? ` target="_blank" rel="${rel}"` : ` rel="${rel}"`;
   const title = opts.title ? ` title="${esc(opts.title)}"` : "";
   let data = "";
   if (opts.noteData) {
@@ -763,8 +808,11 @@ function renderYouTubeWatched(items) {
     const title = truncate(v.title || v.url || "", 60);
     const when = v.last_visit_iso ? fmtDate(v.last_visit_iso) : "";
     const vid = v.video_id || "";
+    // alt descriptivo (no decorativo) — el SR puede no estar leyendo el
+    // <a> adyacente si el user navega por imágenes. Prefijo "Thumbnail:"
+    // para que quede claro que es una representación visual del video.
     const thumb = vid
-      ? `<img src="https://i.ytimg.com/vi/${esc(vid)}/mqdefault.jpg" alt="" loading="lazy"
+      ? `<img src="https://i.ytimg.com/vi/${esc(vid)}/mqdefault.jpg" alt="Thumbnail: ${esc(title)}" loading="lazy"
              style="width:72px;height:40px;object-fit:cover;border-radius:3px;flex:0 0 auto;background:var(--border);">`
       : "";
     return `<li style="display:flex;gap:10px;align-items:flex-start;">
@@ -1115,8 +1163,8 @@ function loadViaStream(regenerate) {
 
     es.addEventListener("hello", (ev) => {
       try {
-        const { stages } = JSON.parse(ev.data);
-        renderStageList(stages || [], 0);
+        const { stages, substages } = JSON.parse(ev.data);
+        renderStageList(stages || [], 0, substages || {});
         stagesAnnounced = true;
         // Tick the total counter once a second so a wedged fetcher is
         // visually obvious (numero sigue subiendo aun cuando ningún
@@ -1191,12 +1239,31 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
     if (regenerate) {
       // Manual refresh → stream so user sees per-stage progress.
       data = await loadViaStream(true);
+    } else if (firstLoad) {
+      // First load on a cold cache also streams — otherwise the user
+      // stares at skeletons for 30-45s with no signal of progress.
+      // We probe /api/home first to peek the cache; only stream if
+      // the server returns the warming placeholder. This avoids
+      // burning a stream connection when the pre-warmer already
+      // hydrated the disk cache.
+      const probe = await fetch(`/api/home?regenerate=false`);
+      if (!probe.ok) throw new Error(`HTTP ${probe.status}`);
+      const probeData = await probe.json();
+      if (probeData.warming) {
+        // Backend has nothing yet → upgrade to stream so the user
+        // sees the 14 fetchers running live instead of waiting
+        // blindly. This replaces the old short-poll loop, which
+        // showed nothing for 30s and then a sudden render.
+        data = await loadViaStream(false);
+      } else {
+        data = probeData;
+      }
     } else {
       const resp = await fetch(`/api/home?regenerate=false`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       data = await resp.json();
     }
-    if (data.warming) {
+    if (data && data.warming) {
       // Backend pre-warmer is still computing the first payload. Keep
       // skeletons up and short-poll so we catch the real payload as soon
       // as it lands (waiting for the 60s auto-refresh stalls the UI up
@@ -1233,9 +1300,11 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
       els.progress.classList.remove("active");
     }, remain);
     // Linger the stage list briefly so the user reads the final timings
-    // (where the bottleneck was) before it collapses. Only meaningful
-    // when we actually streamed (regenerate=true).
-    if (regenerate) clearStageList(2200);
+    // (where the bottleneck was) before it collapses. Stream paths:
+    // (a) manual refresh, (b) first cold load that fell back to stream.
+    if (els.stages && els.stages.classList.contains("active")) {
+      clearStageList(2200);
+    }
   }
 }
 
@@ -1267,9 +1336,13 @@ els.panels.addEventListener("click", (ev) => {
   const p = btn.closest(".panel");
   if (!p) return;
   const set = getCollapsedSet();
-  if (p.classList.toggle("user-collapsed")) set.add(p.id);
+  const isCollapsed = p.classList.toggle("user-collapsed");
+  if (isCollapsed) set.add(p.id);
   else set.delete(p.id);
   saveCollapsedSet(set);
+  // SR feedback: aria-expanded refleja el estado visible del body del
+  // panel. Cuando isCollapsed=true → body oculto → aria-expanded="false".
+  btn.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
 });
 
 // Event delegation on the panels container: the reminders list is
@@ -1285,6 +1358,9 @@ els.panels.addEventListener("click", async (ev) => {
   if (li.classList.contains("completed") || li.classList.contains("completing")) return;
   li.classList.add("completing");
   btn.disabled = true;
+  // Optimistic UI: marcamos aria-checked=true antes del await para que el
+  // SR escuche el toggle inmediato. Si la POST falla, revertimos abajo.
+  btn.setAttribute("aria-checked", "true");
   try {
     const res = await fetch("/api/reminders/complete", {
       method: "POST",
@@ -1303,6 +1379,8 @@ els.panels.addEventListener("click", async (ev) => {
     li.classList.remove("completing");
     li.classList.add("complete-err");
     btn.disabled = false;
+    // Rollback aria-checked: la operación falló, sigue sin estar completa.
+    btn.setAttribute("aria-checked", "false");
     btn.title = `Error: ${err.message}`;
   }
 });

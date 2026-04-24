@@ -1561,3 +1561,59 @@ def test_metachat_sources_event_flags_metachat_true():
     # El done event también lo marca (documentación defensiva).
     done_event = next(data for ev, data in events if ev == "done")
     assert done_event.get("metachat") is True
+
+
+# ── WhatsApp deep-links: source citations + proposal recipient ────────────
+
+
+def test_app_js_has_whatsapp_href_helper():
+    """`waHref()` convierte un `whatsapp://<jid>/<msg_id>` o JID crudo a
+    `https://wa.me/<phone>` para 1:1 chats. Universal link funciona en
+    iOS/Android (abre la app de WhatsApp en el chat correspondiente)
+    y en desktop redirige a web.whatsapp.com.
+
+    Devuelve "" para grupos (`@g.us`) porque WhatsApp no expone
+    deep-link a grupos."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function waHref(uri)" in js, (
+        "waHref helper missing — sin esto las citations whatsapp:// "
+        "del chat no se pueden abrir en la app"
+    )
+    # Lista negativa: groups no deben tener wa.me link.
+    assert "@g.us" in js
+    # Smoke del prefijo wa.me.
+    assert "https://wa.me/" in js
+
+
+def test_app_js_renders_whatsapp_sources_as_wa_me_links():
+    """En `appendSources()`, las fuentes con `s.file` empezando con
+    `whatsapp://` deben generar un `<a href="https://wa.me/...">` para
+    1:1 chats. Para grupos, span plano (no engañar al user con un link
+    que abre la home de WhatsApp en lugar del grupo)."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    # appendSources debe distinguir whatsapp:// de https:// y de paths
+    # vault. Buscar el flag `isWA` o similar.
+    assert "isWA" in js or "whatsapp://" in js
+    # waHref se invoca dentro de appendSources.
+    assert "waHref(s.file)" in js, (
+        "appendSources no llama a waHref → las citations WA siguen "
+        "rotas (apuntan a obsidian://whatsapp:// que no abre nada)"
+    )
+
+
+def test_app_js_makes_whatsapp_proposal_recipient_clickable():
+    """En la tarjeta de propuesta de WhatsApp, el name del recipient
+    ("Para: <name>") debe ser clickable y abrir el chat en la app de
+    WhatsApp para que el user pueda verificar la conversación antes
+    de mandar."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "waHref(fields.jid" in js, (
+        "appendWhatsAppProposal no genera link en el recipient — el "
+        "name de 'Para: <X>' debería ser clickable a wa.me/<phone>"
+    )

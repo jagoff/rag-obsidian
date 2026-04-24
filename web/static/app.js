@@ -1581,7 +1581,22 @@ function appendWhatsAppProposal(parent, payload) {
   card.appendChild(head);
 
   const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
-  const recipientLine = el("div", "proposal-title", `Para: ${recipientLabel}`);
+  const recipientHref = waHref(fields.jid || "");
+  const recipientLine = el("div", "proposal-title");
+  recipientLine.appendChild(document.createTextNode("Para: "));
+  if (recipientHref) {
+    // Click → abre el chat en WhatsApp app vía wa.me universal link.
+    // No reemplaza la acción [Enviar]: solo permite "verificar antes
+    // de mandar" abriendo la conversación existente en otro tab.
+    const a = el("a", "proposal-wa-link", recipientLabel);
+    a.href = recipientHref;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = "Abrir chat con " + recipientLabel + " en WhatsApp";
+    recipientLine.appendChild(a);
+  } else {
+    recipientLine.appendChild(document.createTextNode(recipientLabel));
+  }
   card.appendChild(recipientLine);
 
   // Reply variant: render the original message as a styled blockquote
@@ -2175,32 +2190,58 @@ function appendSources(parent, items, confidence) {
     const bar = el("span", `bar bar-${tone}`);
     bar.textContent = s.bar;
     row.appendChild(bar);
-    // External URL (Drive, web docs, etc.) vs vault-local path:
-    // Drive sources come in with `s.file = "https://docs.google.com/..."`
-    // and `s.folder = "Google Drive"` — render as a direct anchor with
-    // `target="_blank"` so clicking abre el doc en Drive, no en Obsidian.
-    // Vault-local files keep obsidian:// so doble-click abre la nota.
+    // Tres tipos de fuente con tratamiento distinto:
+    //  - External URL (Drive, web docs, etc.): href directo a `target="_blank"`.
+    //  - WhatsApp 1:1 (`whatsapp://<phone>@s.whatsapp.net/<msg>`): wa.me/<phone>
+    //    universal link que abre el chat en la app de WhatsApp. Grupos
+    //    (`@g.us`) no tienen deep-link público — se renderean como texto.
+    //  - Vault-local (.md path): obsidian:// para que doble-click abra la nota.
     const isExternal = typeof s.file === "string" && /^https?:\/\//i.test(s.file);
-    const note = el("a", "note", s.note || s.file);
-    note.href = isExternal ? s.file : obsidianUrl(s.file);
-    note.title = s.file;
-    if (isExternal) {
-      note.target = "_blank";
-      note.rel = "noopener noreferrer";
+    const isWA = typeof s.file === "string" && s.file.indexOf("whatsapp://") === 0;
+    const waUrl = isWA ? waHref(s.file) : "";
+    // `wantsBlank` = true para external + WA-with-link → target=_blank.
+    const wantsBlank = isExternal || (isWA && waUrl);
+    // `linkable` = true cuando podemos generar un href útil. Si es WA
+    // group (sin waUrl) renderemos el row sin <a>.
+    const linkable = isExternal || waUrl || !isWA;
+
+    let noteEl;
+    if (linkable) {
+      noteEl = el("a", "note", s.note || s.file);
+      noteEl.href = isExternal ? s.file : (waUrl || obsidianUrl(s.file));
+      if (wantsBlank) {
+        noteEl.target = "_blank";
+        noteEl.rel = "noopener noreferrer";
+      }
+    } else {
+      // WA group sin deep-link: span plano para no engañar al user con
+      // un link que no hace nada cuando lo toca.
+      noteEl = el("span", "note", s.note || s.file);
     }
-    row.appendChild(note);
-    // For externals, mostrar el folder label ("Google Drive") en lugar
-    // del URL completo — más legible que la URL crudota. Para vault
-    // files se mantiene el path original (comportamiento previo).
-    const pathLabel = isExternal ? (s.folder || "externo") : s.file;
-    const path = el("a", "path", pathLabel);
-    path.href = isExternal ? s.file : obsidianUrl(s.file);
-    path.title = s.file;
-    if (isExternal) {
-      path.target = "_blank";
-      path.rel = "noopener noreferrer";
+    noteEl.title = s.file;
+    row.appendChild(noteEl);
+
+    // Path/folder label: en externals mostramos el folder ("Google
+    // Drive"), en WA mostramos "WhatsApp" en lugar del JID feo, en
+    // vault el path .md original.
+    let pathLabel;
+    if (isExternal) pathLabel = s.folder || "externo";
+    else if (isWA) pathLabel = s.folder || "WhatsApp";
+    else pathLabel = s.file;
+
+    let pathEl;
+    if (linkable) {
+      pathEl = el("a", "path", pathLabel);
+      pathEl.href = isExternal ? s.file : (waUrl || obsidianUrl(s.file));
+      if (wantsBlank) {
+        pathEl.target = "_blank";
+        pathEl.rel = "noopener noreferrer";
+      }
+    } else {
+      pathEl = el("span", "path", pathLabel);
     }
-    row.appendChild(path);
+    pathEl.title = s.file;
+    row.appendChild(pathEl);
     // Dwell tracking metadata — vault-relative paths only (the server
     // rejects ones with :// since commit db2a169). Cross-source ids
     // get the attrs dropped so the observer skips them entirely.
@@ -2400,6 +2441,36 @@ function scrollBottom() {
 
 function obsidianUrl(filePath) {
   return "obsidian://open?file=" + encodeURIComponent(filePath);
+}
+
+// Convierte un `whatsapp://<jid>/<msg_id>` o un JID crudo a un universal
+// link `https://wa.me/<phone>` que abre la app de WhatsApp en el chat
+// correspondiente. iOS + Android lo manejan vía universal links; en
+// desktop redirige a web.whatsapp.com.
+//
+// Returns "" para:
+//  - Inputs vacíos / inválidos
+//  - Group JIDs (`@g.us`): WhatsApp NO expone deep-link a grupos, así
+//    que mostrar el link sería engañoso. El caller renderea el row
+//    como texto plano en ese caso.
+//
+// Notar que WhatsApp NO permite deep-link a un mensaje específico
+// (sólo al chat), así que el `msg_id` del URI se descarta — alcanza
+// con abrir la conversación.
+function waHref(uri) {
+  if (!uri || typeof uri !== "string") return "";
+  let jid = uri;
+  if (jid.indexOf("whatsapp://") === 0) {
+    jid = jid.slice("whatsapp://".length);
+    const slash = jid.indexOf("/");
+    if (slash >= 0) jid = jid.slice(0, slash);
+  }
+  // Group JIDs (`@g.us`) no tienen deep-link público.
+  if (jid.indexOf("@g.us") >= 0) return "";
+  // 1:1 chat: extraer dígitos antes del @s.whatsapp.net.
+  const phone = jid.split("@")[0];
+  if (/^\d{6,}$/.test(phone)) return "https://wa.me/" + phone;
+  return "";
 }
 
 // Markdown via marked. Dos transformaciones se aplican ANTES de marked:

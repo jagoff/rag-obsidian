@@ -57,15 +57,22 @@ def _open_db(path: Path) -> sqlite3.Connection | None:
         return None
 
 
-def _audit_sql_errors(days: int) -> dict:
+def _audit_sql_errors(days: int, *, since_ts: str | None = None) -> dict:
     """Cuenta + distribuye los errores swallowed de los últimos N días.
 
     Cruza ambos logs (silent_errors + sql_state_errors). Devuelve top
     causas + curva diaria — para detectar cuándo empezó la degradación
     cruzando contra `git log --since=...`.
+
+    `since_ts` (ISO 8601) es un cutoff adicional — útil para filtrar
+    pollution histórica pre-fix y ver solo señal post-deploy. Si está
+    presente, eventos con ts < since_ts se ignoran AUNQUE estén dentro
+    de la ventana de days. Útil para `--since '2026-04-24T17:53:00'`
+    (cuando deployó la fixture de aislamiento de logs).
     """
     cutoff = datetime.now() - timedelta(days=days)
     cutoff_iso = cutoff.isoformat(timespec="seconds")
+    effective_cutoff = max(cutoff_iso, since_ts) if since_ts else cutoff_iso
     out = {
         "total_errors": 0,
         "by_event": Counter(),
@@ -73,6 +80,7 @@ def _audit_sql_errors(days: int) -> dict:
         "by_log_file": {"sql_state": 0, "silent_errors": 0},
         "test_pollution_hits": 0,
         "files_missing": [],
+        "since_ts_applied": since_ts,
     }
     for log_path, label in (
         (SQL_ERRORS_LOG, "sql_state"),
@@ -91,7 +99,7 @@ def _audit_sql_errors(days: int) -> dict:
                 except json.JSONDecodeError:
                     continue
                 ts = rec.get("ts", "")
-                if ts < cutoff_iso:
+                if ts < effective_cutoff:
                     continue
                 out["total_errors"] += 1
                 out["by_log_file"][label] += 1
@@ -203,7 +211,10 @@ def _audit_db_size() -> dict:
 def _render_text(report: dict) -> str:
     out = []
     out.append("=" * 72)
-    out.append(f"obsidian-rag telemetry health audit — últimos {report['days']} días")
+    title = f"obsidian-rag telemetry health audit — últimos {report['days']} días"
+    if report.get("since"):
+        title += f" (desde {report['since']})"
+    out.append(title)
     out.append("=" * 72)
     out.append("")
 
@@ -324,13 +335,19 @@ def main() -> int:
         help="Ventana de análisis en días (default 7)",
     )
     parser.add_argument(
+        "--since",
+        help=("Cutoff adicional (ISO8601) — ignora eventos antes de este ts "
+              "aunque estén dentro de la ventana de days. Útil para excluir "
+              "pollution histórica pre-fix. Ej: --since 2026-04-24T17:53:00"),
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Output JSON en lugar de texto legible",
     )
     args = parser.parse_args()
 
-    report: dict = {"days": args.days}
-    report["sql_errors"] = _audit_sql_errors(args.days)
+    report: dict = {"days": args.days, "since": args.since}
+    report["sql_errors"] = _audit_sql_errors(args.days, since_ts=args.since)
     report["db_size"] = _audit_db_size()
 
     conn = _open_db(TELEMETRY_DB)

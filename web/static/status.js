@@ -12,6 +12,12 @@
 // Auto-refresh: 10s default. Pausable con el toggle. La pestaña también
 // pausa automáticamente cuando está oculta (document.hidden) para no
 // gastar subprocess.run en el server mientras el user está en otra app.
+//
+// Acciones inline (▶ ejecutar / ■ parar): para servicios launchd-
+// controlled (kind=daemon|scheduled), el backend incluye `label` +
+// `running` en cada service y la UI muestra un botón que hace
+// POST /api/status/action. Util para "trigger digest now" sin abrir
+// terminal y acordarse del label exacto.
 
 (function () {
   "use strict";
@@ -125,15 +131,102 @@
       detailHTML = detailHTML.replace(safe, `<a href="${safe}" target="_blank" rel="noopener">${safe}</a>`);
     }
 
+    // Action button — solo para servicios launchd-controlled (svc.label
+    // viene del backend para daemon/scheduled). running=true → stop;
+    // running=false → start.
+    const hasAction = typeof svc.label === "string" && svc.label.length > 0;
+    let actionsHTML = "";
+    if (hasAction) {
+      const isRunning = svc.running === true;
+      const action = isRunning ? "stop" : "start";
+      const labelText = isRunning ? "parar" : "ejecutar";
+      const icon = isRunning ? "■" : "▶";
+      const cls = isRunning ? "service-action stop" : "service-action start";
+      const ariaTitle = `${labelText} ${escapeHTML(svc.name || svc.label)}`;
+      actionsHTML = `
+        <button type="button" class="${cls}"
+                data-label="${escapeHTML(svc.label)}"
+                data-action="${action}"
+                aria-label="${ariaTitle}"
+                title="${ariaTitle}">
+          <span class="action-icon" aria-hidden="true">${icon}</span>
+          <span class="action-label">${labelText}</span>
+        </button>
+      `;
+    }
+
     el.innerHTML = `
       <span class="service-dot" aria-hidden="true"></span>
       <div class="service-main">
         <div class="service-name">${escapeHTML(svc.name || svc.id || "?")}</div>
         <div class="service-detail">${detailHTML}</div>
       </div>
+      ${actionsHTML}
       <span class="service-kind kind-${svc.kind || "probe"}">${escapeHTML(svc.kind || "probe")}</span>
     `;
+
+    // Wire action button (si hay).
+    const btn = el.querySelector("button.service-action");
+    if (btn) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        triggerAction(btn);
+      });
+    }
     return el;
+  }
+
+  // ── Start / stop launchd services ───────────────────────────────────
+  // POST /api/status/action con {label, action}. Bloquea el botón con
+  // un placeholder "…" mientras la request está in-flight para evitar
+  // doble-click. Al terminar, refresca el payload entero (tick) para
+  // que el state on-screen sea fresh — el server ya invalida su cache.
+  async function triggerAction(btn) {
+    const label = btn.getAttribute("data-label");
+    const action = btn.getAttribute("data-action");
+    if (!label || !action) return;
+    if (btn.dataset.busy === "1") return;
+
+    const iconEl = btn.querySelector(".action-icon");
+    const labelEl = btn.querySelector(".action-label");
+    const prevIcon = iconEl ? iconEl.textContent : "";
+    const prevLabel = labelEl ? labelEl.textContent : "";
+    btn.dataset.busy = "1";
+    btn.disabled = true;
+    if (iconEl) iconEl.textContent = "…";
+    if (labelEl) labelEl.textContent = action === "start" ? "lanzando" : "parando";
+
+    try {
+      const resp = await fetch("/api/status/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, action }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.ok === false) {
+        const msg = data.detail || data.stderr || data.stdout || `HTTP ${resp.status}`;
+        showActionBanner(`${action} ${label}: ${msg}`, "err");
+      } else {
+        showActionBanner(`${action === "start" ? "ejecutando" : "parando"} ${label}…`, "ok");
+      }
+    } catch (e) {
+      showActionBanner(`${action} ${label}: ${e.message || e}`, "err");
+    } finally {
+      btn.dataset.busy = "0";
+      btn.disabled = false;
+      if (iconEl) iconEl.textContent = prevIcon;
+      if (labelEl) labelEl.textContent = prevLabel;
+      // Re-fetch para que el botón rote a stop/start si correspondió.
+      tick(true);
+    }
+  }
+
+  function showActionBanner(msg, kind) {
+    const banner = document.createElement("div");
+    banner.className = kind === "err" ? "error-banner" : "info-banner";
+    banner.textContent = msg;
+    $content.prepend(banner);
+    setTimeout(() => banner.remove(), 3500);
   }
 
   function escapeHTML(s) {

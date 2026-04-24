@@ -299,7 +299,7 @@
 
     .service {
       display: grid;
-      grid-template-columns: auto 1fr auto;
+      grid-template-columns: auto 1fr auto auto;
       align-items: center;
       gap: 12px;
       padding: 10px 12px;
@@ -379,6 +379,65 @@
     .service-kind.kind-scheduled { color: var(--purple); }
     .service-kind.kind-probe     { color: var(--text-faint); }
 
+    .service-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 9px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: background 0.12s, border-color 0.12s, color 0.12s;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .service-action:hover {
+      background: var(--hover);
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
+    .service-action:disabled {
+      opacity: 0.55;
+      cursor: progress;
+    }
+    .service-action.start {
+      color: var(--green);
+      border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+    }
+    .service-action.start:hover {
+      color: var(--green);
+      background: color-mix(in srgb, var(--green) 10%, transparent);
+      border-color: color-mix(in srgb, var(--green) 60%, var(--border));
+    }
+    .service-action.stop {
+      color: var(--red);
+      border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+    }
+    .service-action.stop:hover {
+      color: var(--red);
+      background: color-mix(in srgb, var(--red) 10%, transparent);
+      border-color: color-mix(in srgb, var(--red) 60%, var(--border));
+    }
+    .service-action .action-icon {
+      font-size: 9px;
+      line-height: 1;
+    }
+
+    .info-banner {
+      background: color-mix(in srgb, var(--green) 10%, transparent);
+      border: 1px solid color-mix(in srgb, var(--green) 38%, transparent);
+      color: var(--green);
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 14px;
+      font-size: 12px;
+    }
+
     /* Loading / error states. */
     .loading {
       text-align: center;
@@ -409,6 +468,9 @@
       .overall-counts { grid-column: 1 / -1; justify-content: space-around; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--sep); }
       .services { grid-template-columns: 1fr; }
       .service-kind { display: none; }
+      .service { grid-template-columns: auto 1fr auto; }
+      .service-action .action-label { display: none; }
+      .service-action { padding: 4px 7px; }
     }
   </style>
 </head>

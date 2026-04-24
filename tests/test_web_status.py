@@ -275,3 +275,200 @@ def test_status_js_exists():
     # Sanity: fetchea /api/status y tiene auto-refresh.
     assert "/api/status" in js
     assert "setInterval" in js or "setTimeout" in js
+
+
+# ── Action button payload shape ──────────────────────────────────────
+
+def test_grade_daemon_includes_label_and_running_when_running():
+    """daemon running → payload tiene label + loaded=True + running=True."""
+    with patch.object(_server, "_launchctl_print_fields",
+                      return_value={"state": "running", "pid": "777"}):
+        r = _server._status_grade_daemon("com.fer.fake", "Fake daemon")
+    assert r["label"] == "com.fer.fake"
+    assert r["loaded"] is True
+    assert r["running"] is True
+
+
+def test_grade_daemon_includes_label_when_not_loaded():
+    """daemon no cargado → loaded=False, running=False (UI no debe ofrecer stop)."""
+    with patch.object(_server, "_launchctl_print_fields", return_value=None):
+        r = _server._status_grade_daemon("com.fer.fake", "Fake daemon")
+    assert r["label"] == "com.fer.fake"
+    assert r["loaded"] is False
+    assert r["running"] is False
+
+
+def test_grade_scheduled_never_run_includes_label_loaded_and_running_false():
+    """scheduled "aún no corrió" → loaded=True, running=False (UI ofrece start)."""
+    with patch.object(_server, "_launchctl_print_fields",
+                      return_value={"state": "not running",
+                                    "runs": "0",
+                                    "last exit code": "(never exited)"}):
+        r = _server._status_grade_scheduled("com.fer.fake", "Fake job")
+    assert r["label"] == "com.fer.fake"
+    assert r["loaded"] is True
+    assert r["running"] is False
+    # El detalle "aún no corrió" sigue intacto para que la UI lo pinte.
+    assert "aún no corrió" in r["detail"]
+
+
+def test_grade_scheduled_running_now_includes_label_and_running_true():
+    """scheduled corriendo ahora → running=True (UI ofrece stop)."""
+    with patch.object(_server, "_launchctl_print_fields",
+                      return_value={"state": "running", "pid": "999", "runs": "4"}):
+        r = _server._status_grade_scheduled("com.fer.fake", "Fake job")
+    assert r["label"] == "com.fer.fake"
+    assert r["running"] is True
+    assert r["loaded"] is True
+
+
+# ── /api/status/action endpoint ──────────────────────────────────────
+
+def test_status_action_rejects_invalid_action():
+    """action != start|stop → 400."""
+    r = _client.post("/api/status/action",
+                     json={"label": "com.fer.obsidian-rag-digest",
+                           "action": "delete"})
+    assert r.status_code == 400
+    assert "action" in r.json()["detail"].lower()
+
+
+def test_status_action_rejects_label_not_in_whitelist():
+    """label fuera del catálogo → 400 (defensa principal contra abuso)."""
+    r = _client.post("/api/status/action",
+                     json={"label": "com.fer.MALICIOUS",
+                           "action": "start"})
+    assert r.status_code == 400
+    assert "whitelisted" in r.json()["detail"].lower()
+
+
+def test_status_action_rejects_empty_label():
+    """label vacío → 400."""
+    r = _client.post("/api/status/action",
+                     json={"label": "", "action": "start"})
+    assert r.status_code == 400
+
+
+def test_status_action_start_invokes_kickstart():
+    """action=start → corre `launchctl kickstart gui/<uid>/<label>`."""
+    label = "com.fer.obsidian-rag-digest"  # known to be in catalog
+    assert label in _server._status_actionable_labels()
+
+    import subprocess
+    captured = {}
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return FakeCompleted()
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        r = _client.post("/api/status/action",
+                         json={"label": label, "action": "start"})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ok"] is True
+    assert j["action"] == "start"
+    assert j["label"] == label
+    # Verify launchctl was called with kickstart + gui/<uid>/<label>
+    assert captured["cmd"][0] == "/bin/launchctl"
+    assert captured["cmd"][1] == "kickstart"
+    assert captured["cmd"][2].startswith("gui/")
+    assert captured["cmd"][2].endswith(f"/{label}")
+
+
+def test_status_action_stop_invokes_kill_sigterm():
+    """action=stop → corre `launchctl kill SIGTERM gui/<uid>/<label>`."""
+    label = "com.fer.obsidian-rag-digest"
+
+    import subprocess
+    captured = {}
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return FakeCompleted()
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        r = _client.post("/api/status/action",
+                         json={"label": label, "action": "stop"})
+    assert r.status_code == 200
+    assert r.json()["action"] == "stop"
+    assert captured["cmd"][0] == "/bin/launchctl"
+    assert captured["cmd"][1] == "kill"
+    assert captured["cmd"][2] == "SIGTERM"
+    assert captured["cmd"][3].endswith(f"/{label}")
+
+
+def test_status_action_invalidates_cache():
+    """Tras un kickstart, la próxima request a /api/status debe regenerar
+    el payload (no devolver el cache viejo de antes de la acción).
+    Sin esto el user vería 'aún no corrió' por hasta 3s después de
+    haber clickeado start, lo que rompe la sensación de feedback."""
+    label = "com.fer.obsidian-rag-digest"
+
+    # Warm el cache primero.
+    _client.get("/api/status")
+    with _server._STATUS_CACHE_LOCK:
+        assert _server._STATUS_CACHE["payload"] is not None
+
+    import subprocess
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    with patch.object(subprocess, "run", return_value=FakeCompleted()):
+        _client.post("/api/status/action",
+                     json={"label": label, "action": "start"})
+
+    # Cache debe estar invalidado.
+    with _server._STATUS_CACHE_LOCK:
+        assert _server._STATUS_CACHE["payload"] is None
+        assert _server._STATUS_CACHE["ts"] == 0.0
+
+
+def test_status_actionable_labels_covers_known_jobs():
+    """El whitelist incluye los servicios que el usuario quiere poder
+    disparar manualmente desde la UI. Si alguien remueve un job del
+    catálogo, este test los flagea para que sea decisión consciente."""
+    labels = _server._status_actionable_labels()
+    must_include = {
+        "com.fer.obsidian-rag-digest",
+        "com.fer.obsidian-rag-morning",
+        "com.fer.obsidian-rag-today",
+        "com.fer.obsidian-rag-wake-up",
+        "com.fer.obsidian-rag-maintenance",
+        "com.fer.obsidian-rag-web",  # daemon
+        "com.fer.obsidian-rag-watch",  # daemon
+    }
+    missing = must_include - labels
+    assert not missing, f"faltan en el whitelist: {missing}"
+
+
+def test_status_actionable_labels_excludes_probes():
+    """Los probes (web-self, ollama, vault, etc.) NO son actionable
+    (son derived, no servicios launchd). Si alguien por error agrega un
+    `target` a un probe, este test rompe."""
+    labels = _server._status_actionable_labels()
+    # Probes que sabemos no tienen `target`:
+    forbidden = {"web-self", "ollama", "rag-db", "telemetry-db", "vault",
+                 "wa-db", "tunnel-url"}
+    assert not (labels & forbidden), f"probes coladas en whitelist: {labels & forbidden}"
+
+
+def test_status_js_includes_action_button_wiring():
+    """Sanity check: status.js sabe sobre /api/status/action + svc.label."""
+    js = (_STATIC_DIR / "status.js").read_text(encoding="utf-8")
+    assert "/api/status/action" in js
+    assert "svc.label" in js
+    assert "service-action" in js
+
+
+def test_status_html_includes_action_button_styles():
+    """status.html tiene CSS para .service-action (start/stop pills)."""
+    html = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
+    assert ".service-action" in html
+    assert ".service-action.start" in html
+    assert ".service-action.stop" in html

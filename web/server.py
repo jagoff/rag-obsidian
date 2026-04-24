@@ -159,207 +159,82 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     return [(name, dict(args)) for name, args, rx in _TOOL_INTENT_COMPILED if rx.search(q)]
 
 
-# Metadata por tool source-specific, usada para componer el hint de
-# "intención explícita" que se le pasa al LLM cuando el pre-router
-# disparó un tool. Campos:
-#   label         — cómo nombramos la fuente al user ("tus mails/correos").
-#   live_section  — header de la sección fresca en CONTEXTO que renderea
-#                   `_format_forced_tool_output` (p.ej. "### Mails").
-#   digest_hint   — dónde más buscar items indexados en el CONTEXTO si la
-#                   live section está vacía. Para mails: las notas de
-#                   03-Resources/Gmail/YYYY-MM-DD.md usan un `## <asunto>`
-#                   por mail con From/Date/Snippet debajo — extraer esos
-#                   H2 da un listado crudo de "mis últimos mails" que el
-#                   user espera. Otros sources tienen su propio formato.
-#   item_shape    — ejemplo del formato que debe usar cada bullet en la
-#                   respuesta final, para que el LLM no invente prosa
-#                   cuando el user pidió un listado.
-#   empty_phrase  — frase explícita cuando NO hay nada ni live ni en
-#                   digest. Reemplaza el vago "te dejo otras fuentes".
-#
-# Weather / finance_summary NO están acá porque no son "fuentes" que el
-# user busca — son resúmenes autogenerados sin concepto de ausencia.
-_SOURCE_INTENT_META: dict[str, dict[str, str]] = {
-    "gmail_recent": {
-        "label": "tus mails/correos",
-        "live_section": "### Mails",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas del vault del tipo "
-            "`03-Resources/Gmail/YYYY-MM-DD.md` (cada `## <asunto>` "
-            "dentro es UN mail, con su **From:**, **Date:** y **Snippet:**), "
-            "extraé esos asuntos y listálos uno por línea — son LITERALMENTE "
-            "los últimos mails del usuario. NO digas 'en tu nota' ni "
-            "menciones la ruta de la nota: los asuntos SON los mails."
-        ),
-        "item_shape": "- <asunto> (de <remitente>)",
-        "empty_phrase": "No encontré mails recientes en tu corpus",
-    },
-    "calendar_ahead": {
-        "label": "tu calendario/agenda/eventos",
-        "live_section": "### Calendario",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas con eventos (morning brief, "
-            "agenda del día), extraé los títulos de los eventos y listálos."
-        ),
-        "item_shape": "- <título> (<fecha/hora>)",
-        "empty_phrase": "No tenés eventos en el horizonte",
-    },
-    "reminders_due": {
-        "label": "tus recordatorios/pendientes",
-        "live_section": "### Recordatorios",
-        "digest_hint": (
-            "Si en el CONTEXTO hay notas que mencionan tareas pendientes "
-            "(morning/evening brief, PARA projects), extraelas y listálas."
-        ),
-        "item_shape": "- <tarea> (<fecha si tiene>)",
-        "empty_phrase": "No tenés recordatorios pendientes",
-    },
-}
-
-
-# Retrocompatibilidad: el helper previo `_SOURCE_INTENT_LABEL` es un
-# mapping más chico (label + section) que usan los tests directos.
-# Lo mantenemos derivado de `_SOURCE_INTENT_META` para no romper imports
-# viejos ni tener dos sources of truth que puedan divergir.
+# Etiqueta humana (español rioplatense) por tool, usada para componer el
+# hint de "intención explícita" que le pasamos al LLM cuando el pre-router
+# disparó un tool source-specific. El primer string es cómo nombramos la
+# fuente cuando el user pregunta por ella ("preguntó por tus mails"); el
+# segundo es el header de la sección en CONTEXTO que renderea
+# `_format_forced_tool_output` — el LLM tiene que anclar ahí su respuesta.
+# Tools que NO son source-specific (weather, finance_summary) no tienen
+# entrada acá porque no tiene sentido un fallback "busqué X y no encontré"
+# cuando X es el clima o un resumen financiero autogenerado.
 _SOURCE_INTENT_LABEL: dict[str, tuple[str, str]] = {
-    name: (meta["label"], meta["live_section"])
-    for name, meta in _SOURCE_INTENT_META.items()
+    "gmail_recent": ("tus mails/correos", "### Mails"),
+    "calendar_ahead": ("tu calendario/agenda/eventos", "### Calendario"),
+    "reminders_due": ("tus recordatorios/pendientes", "### Recordatorios"),
 }
 
 
 def _build_source_intent_hint(forced_tool_names: list[str]) -> str | None:
-    """Compone un system message turn-scoped que le dice al LLM cómo
-    responder cuando el user preguntó explícitamente por una fuente
-    concreta (mails / calendario / recordatorios).
+    """Compone un system message turn-scoped que le dice al LLM:
+    "el user preguntó EXPLÍCITAMENTE por X; priorizá esa sección y, si
+    está vacía, reconocelo antes de mencionar otras fuentes".
 
-    El hint combina:
+    Motivación (2026-04-24, Fer F. user report): el user preguntó "cuales
+    son mis ultimos mails?" y el sistema respondió resumiendo un hilo de
+    WhatsApp (Joana Gonzales sobre plantas) porque el retrieve devolvió
+    notas y chunks de WA con confidence=0.064 — bajo pero no bypass — y
+    el LLM obedeció REGLA 1 ("engancháte con el CONTEXTO") sin distinguir
+    que el user pidió específicamente mails. El fix de la regex (que
+    ahora sí matchea plurales españoles) hace que `gmail_recent` se
+    dispare y la sección "### Mails" aparezca en CONTEXTO — pero si está
+    vacía el LLM puede seguir respondiendo sobre otras secciones sin
+    reconocer el gap. Este hint fuerza:
 
-    1. Dónde buscar primero (la sección live del tool: "### Mails").
-    2. Dónde buscar si la live está vacía (notas indexadas del vault con
-       formato conocido — p.ej. 03-Resources/Gmail/YYYY-MM-DD.md tiene
-       un H2 por mail, listar esos H2 == listar los últimos mails).
-    3. Formato de respuesta esperado (viñetas, shape por item).
-    4. Qué PROHIBIR explícitamente (decir "tus notas" / "otras fuentes" /
-       "te dejo esto por si ayuda" — vocabulario abstracto que no le
-       sirve al user cuando pidió una lista concreta).
-    5. Frase canned cuando NO hay nada (reemplaza el vago "te dejo
-       otras fuentes").
+    1. Anclar la respuesta en la sección que corresponde a la fuente
+       pedida ("### Mails" para `gmail_recent`, etc).
+    2. Si esa sección está vacía o no responde lo que el user pidió,
+       DECIRLO explícitamente ("busqué en tus mails y no encontré nada")
+       ANTES de ofrecer un fallback de otras secciones.
+    3. Nunca responder sobre WhatsApp/notas como si fueran la respuesta
+       principal cuando el user pidió una fuente específica.
 
-    Motivación histórica (2026-04-24, user report iter 1-3):
-
-    - Iter 1: regex plurales faltaba → `gmail_recent` no disparaba → el
-      sistema respondía con WhatsApp sin reconocer intent.
-    - Iter 2: con el tool disparando pero vacío, el CONTEXTO se reemplazaba
-      → LLM sin material para fallback → "te dejo otras fuentes" abstracto.
-    - Iter 3 (este): con el CONTEXTO preservado, el LLM tiene notas de
-      `03-Resources/Gmail/*.md` disponibles, PERO hablaba de "tu nota
-      del 22 de abril" y "fuentes" en lugar de extraer los asuntos de
-      los mails. User feedback textual: "en vez de fuentes (que no tiene
-      sentido porque son notas de obsidian) trae los titulos de los
-      mails". Este hint ahora explicita el formato deseado.
-
-    Devuelve None si ninguna tool es source-specific (solo weather o
-    finance_summary). En ese caso no hay hint que agregar y el system
-    prompt default alcanza.
+    Devuelve None si ninguna de las tools disparadas es source-specific
+    (p.ej. solo weather) — en ese caso no hay hint que agregar y el
+    system prompt default es suficiente.
     """
-    metas = [_SOURCE_INTENT_META[n] for n in forced_tool_names
-             if n in _SOURCE_INTENT_META]
-    if not metas:
+    labels: list[tuple[str, str]] = []
+    for name in forced_tool_names:
+        if name in _SOURCE_INTENT_LABEL:
+            labels.append(_SOURCE_INTENT_LABEL[name])
+    if not labels:
         return None
-
-    def _join(parts: list[str]) -> str:
-        if len(parts) == 1:
-            return parts[0]
-        if len(parts) == 2:
-            return f"{parts[0]} y {parts[1]}"
-        return ", ".join(parts[:-1]) + f" y {parts[-1]}"
-
-    labels = [m["label"] for m in metas]
-    sections = [m["live_section"] for m in metas]
-    joined_labels = _join(labels)
-    joined_sections = _join(sections)
-    digest_block = "\n".join(f"  • {m['digest_hint']}" for m in metas)
-    shape_block = "\n".join(f"  • {m['item_shape']}" for m in metas)
-    empty_phrase = _join([m["empty_phrase"] for m in metas])
-
+    # Join "tus mails", "tu calendario" → "tus mails y tu calendario"
+    # (2 fuentes) o "tus mails, tu calendario y tus recordatorios" (3+).
+    name_parts = [lbl[0] for lbl in labels]
+    section_parts = [lbl[1] for lbl in labels]
+    if len(name_parts) == 1:
+        joined_names = name_parts[0]
+        joined_sections = section_parts[0]
+    elif len(name_parts) == 2:
+        joined_names = f"{name_parts[0]} y {name_parts[1]}"
+        joined_sections = f"{section_parts[0]} y {section_parts[1]}"
+    else:
+        joined_names = ", ".join(name_parts[:-1]) + f" y {name_parts[-1]}"
+        joined_sections = ", ".join(section_parts[:-1]) + f" y {section_parts[-1]}"
     return (
-        f"INTENCIÓN EXPLÍCITA DEL USUARIO: pidió {joined_labels}. "
-        f"Tu tarea es devolver un LISTADO CONCRETO, no un resumen abstracto "
-        f"ni una referencia a 'fuentes' del sistema.\n\n"
-        f"ORDEN DE BÚSQUEDA en el CONTEXTO:\n"
-        f"  1. Sección live {joined_sections}: si tiene items, listálos.\n"
-        f"  2. Si la sección live está vacía, buscá en el resto del "
-        f"CONTEXTO data indexada de esta fuente:\n{digest_block}\n\n"
-        f"FORMATO DE RESPUESTA — lista con viñetas, un item por línea:\n"
-        f"{shape_block}\n\n"
-        f"PROHIBIDO:\n"
-        f"  • Decir 'en tu nota X', 'en tus fuentes', 'te dejo otras "
-        f"fuentes que podrían ayudarte', 'revisá tus notas' — el user "
-        f"pidió los items directamente, no una meta-referencia.\n"
-        f"  • Mencionar rutas del vault (`03-Resources/...`, "
-        f"`04-Archive/...`) ni el sistema PARA.\n"
-        f"  • Resumir en prosa cuando la pregunta exige un listado.\n"
-        f"  • Responder sobre WhatsApp u otras fuentes como si fueran la "
-        f"respuesta principal cuando el usuario pidió {joined_labels}.\n\n"
-        f"SI NO HAY DATA NI LIVE NI INDEXADA: respondé exactamente "
-        f"'{empty_phrase}' — sin agregar sugerencias de fallback."
+        f"INTENCIÓN EXPLÍCITA DEL USUARIO: preguntó por {joined_names}. "
+        f"Anclá tu respuesta en la sección {joined_sections} del CONTEXTO. "
+        f"Si esa sección está vacía o no menciona lo que el usuario "
+        f"específicamente pregunta, RECONOCELO EXPLÍCITO al comienzo de "
+        f"tu respuesta con una frase del tipo 'Busqué en {joined_names} "
+        f"y no encontré nada relevante'. Recién DESPUÉS, si hay contenido "
+        f"útil en otras secciones (WhatsApp, notas, etc.), ofrecelo como "
+        f"fallback con aclaración explícita ('te dejo X por si ayuda'). "
+        f"PROHIBIDO responder sobre WhatsApp, notas u otras fuentes como "
+        f"si fueran la respuesta principal cuando el usuario pidió "
+        f"específicamente {joined_names}."
     )
-
-
-# Empty-output detection por tool — shape-aware. Usado para decidir si el
-# pre-router debe REEMPLAZAR el CONTEXTO (comportamiento original cuando
-# el tool trae data fresca) o PRESERVARLO como fallback (cuando el tool
-# vino vacío y las notas retrieveadas pueden servir).
-#
-# Motivación (2026-04-24, iteración 2 del mismo user report): tras el fix
-# de plurales + hint, el user preguntó "cuales son mis ultimos mails?"
-# y el sistema respondió "Busqué en tus mails y no encontré nada, te
-# dejo otras fuentes que podrían ayudarte" — correcto en el
-# reconocimiento de intent, pero GENÉRICO en el fallback. Causa: el pre-
-# router reemplazó el CONTEXTO entero con el output de gmail_recent
-# (que vino vacío → sólo "_Sin mails pendientes._"), descartando la
-# retrieve del vault que había devuelto `03-Resources/Gmail/2026-04-22.md`
-# (el digest de mails indexado). Sin material en CONTEXTO, el LLM
-# resolvió el fallback con una frase abstracta. Este helper permite
-# detectar empty-state y preservar el vault retrieve en ese caso.
-def _is_empty_tool_output(name: str, raw: str) -> bool:
-    """True si el tool devolvió un shape que semánticamente significa
-    'no hay nada'. Empty-test por tool:
-
-    - ``gmail_recent`` → ``threads == []`` AND ``unread_count == 0``.
-    - ``calendar_ahead`` → lista vacía.
-    - ``reminders_due`` → ``dated == []`` AND ``undated == []``.
-    - ``finance_summary`` / ``weather`` → siempre ``False`` (tienen output
-      útil aun cuando los números son todos cero — un mes sin gastos es
-      data válida, no ausencia de data).
-
-    Malformed JSON (no debería pasar — los tools escriben shapes bien
-    definidos) devuelve ``False`` conservativamente: si no puedo parsear,
-    no asumo que es empty; dejo que el LLM decida con el string crudo.
-    """
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return False
-    if name == "gmail_recent":
-        if not isinstance(data, dict):
-            return False
-        threads = data.get("threads") or []
-        try:
-            unread = int(data.get("unread_count") or 0)
-        except (TypeError, ValueError):
-            unread = 0
-        return not threads and unread == 0
-    if name == "calendar_ahead":
-        return isinstance(data, list) and not data
-    if name == "reminders_due":
-        if not isinstance(data, dict):
-            return False
-        return (
-            not (data.get("dated") or [])
-            and not (data.get("undated") or [])
-        )
-    return False
 
 
 # ── Forced-tool output renderer (2026-04-22, Fer F. report) ──────────
@@ -1309,16 +1184,6 @@ class ChatRequest(BaseModel):
     # satisfy the non-empty validator.
     redo_turn_id: str | None = Field(None, max_length=80)
     hint: str | None = Field(None, max_length=500)
-    # User-facing mode selector (2026-04-24): "auto" | "fast" | "deep".
-    # Gates `_fast_path` in the streaming block. None → treated as "auto"
-    # (adaptive routing from `retrieve()`). Invalid strings → silent
-    # fallback to "auto" (validated in the endpoint body, NOT in a
-    # field_validator — we explicitly tolerate garbage here so that old
-    # curl scripts, MCP clients, and PWA builds that pre-date the UI
-    # control keep working without 400s). The legacy /api/chat/model
-    # endpoints remain as a developer escape hatch for forcing a specific
-    # chat model tag.
-    mode: str | None = Field(None, max_length=16)
 
     @field_validator("question")
     @classmethod
@@ -2343,7 +2208,14 @@ def get_chat_model() -> dict:
         "available": ["qwen2.5:7b", "qwen3.6", ...]   # local, chat-capable
       }
 
-    The UI uses this to render the selector with the active option marked.
+    Legacy. The UI consumes POST /api/chat with
+    {mode: auto|fast|deep} since 2026-04-24. These endpoints remain
+    alive as a developer escape hatch for forcing a specific installed
+    chat model via env var (OBSIDIAN_RAG_WEB_CHAT_MODEL) or persisted
+    override file (~/.local/share/obsidian-rag/chat-model.json). The
+    mode knob only switches between _LOOKUP_MODEL (qwen2.5:3b) and the
+    resolved chat model; this endpoint is still the only way to swap
+    the chat model tag itself without a restart.
     """
     override = _read_chat_model_override()
     try:
@@ -2378,6 +2250,15 @@ def set_chat_model(req: ChatModelRequest) -> dict:
 
     Side effect: invalidates the response LRU cache so follow-up queries
     don't replay a cached response produced by a different model.
+
+    Legacy. The UI consumes POST /api/chat with
+    {mode: auto|fast|deep} since 2026-04-24. These endpoints remain
+    alive as a developer escape hatch for forcing a specific installed
+    chat model via env var (OBSIDIAN_RAG_WEB_CHAT_MODEL) or persisted
+    override file (~/.local/share/obsidian-rag/chat-model.json). The
+    mode knob only switches between _LOOKUP_MODEL (qwen2.5:3b) and the
+    resolved chat model; this endpoint is still the only way to swap
+    the chat model tag itself without a restart.
     """
     requested = (req.model or "").strip() or None
     if requested is not None:
@@ -5899,64 +5780,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # vs 3.1s potencial en fast-path (CLI data, 7d). El switch es
         # local al streaming block (tool loop de arriba sigue usando el
         # modelo completo porque queremos tool-calling robustness).
-        # ── Mode gate (2026-04-24) ──────────────────────────────────
-        # `mode` is a user-facing knob sent from the web UI that overrides
-        # the adaptive `fast_path` marker produced by `retrieve()`. Three
-        # branches:
-        #
-        #   - mode="auto"  → honour whatever retrieve() decided
-        #                    (`result["fast_path"]`). This is the default
-        #                    and mirrors pre-mode behaviour.
-        #   - mode="fast"  → force `_fast_path=True` (qwen2.5:3b +
-        #                    _LOOKUP_NUM_CTX). User explicitly asks for
-        #                    the quick/lookup model even if retrieve()
-        #                    judged the query complex.
-        #   - mode="deep"  → force `_fast_path=False` (full chat model +
-        #                    _WEB_CHAT_NUM_CTX). User explicitly asks for
-        #                    the full model even when retrieve() thought
-        #                    fast-path was fine.
-        #
-        # Invalid / unknown values → silent fallback to "auto". We never
-        # 400 here: old curl scripts, MCP clients, and PWA builds that
-        # pre-date this knob keep working transparently.
-        #
-        # IMPORTANT: the `_fast_path_downgraded` logic below (pre-router
-        # detects tools + context would bloat) stays ORTHOGONAL to `mode`.
-        # Even with `mode="fast"`, if the pre-router fires tools the
-        # downgrade kicks in to protect prefill latency. That's a safety
-        # rail against context bloat that users shouldn't be able to
-        # bypass by picking the wrong mode — the downgrade isn't about
-        # what the user wanted, it's about what prefill can physically
-        # handle on the small model with 3K+ tokens of tool output.
-        # `mode_origin` captures whether the client sent ANY value for the
-        # field (including garbage) vs. not sending it at all. This lets
-        # analytics measure how often users override the adaptive routing
-        # separately from how often they hit us with broken payloads.
-        mode_origin = "request" if req.mode is not None else "default"
-        _raw_mode = (req.mode or "").strip().lower()
-        if _raw_mode in {"auto", "fast", "deep"}:
-            mode = _raw_mode
-        else:
-            # Unknown / empty-after-strip / accented / typo → silent "auto".
-            # Covers "rápido", "thinking", "", whitespace-only, etc. We
-            # never 400: old curl scripts, MCP, and pre-feature PWA builds
-            # that don't send a mode (or send a different vocabulary) must
-            # keep working unchanged.
-            mode = "auto"
-
-        if mode == "fast":
-            _fast_path = True
-        elif mode == "deep":
-            _fast_path = False
-        else:  # "auto"
-            _fast_path = bool(result.get("fast_path", False))
+        _fast_path = bool(result.get("fast_path", False))
         # Tracks si hubo downgrade runtime por pre-router tools (ver bloque
         # de pre-router más abajo). False por default; el log del endpoint
         # lo expone como `fast_path_downgraded` en extra_json para que el
         # analytics pueda medir cuán seguido el adaptive routing pierde
-        # efectividad por entradas híbridas tool+semantic. El downgrade
-        # corre aunque el user haya pedido `mode="fast"` — es protección
-        # contra prefill bloat, no una decisión de routing.
+        # efectividad por entradas híbridas tool+semantic.
         _fast_path_downgraded = False
         _web_model_full = _resolve_web_chat_model()
         _web_model = _LOOKUP_MODEL if _fast_path else _web_model_full
@@ -6096,41 +5925,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # undated items and occasionally seeded `[[calendar_ahead]]`
                 # citation artifacts because the tool name leaked as a
                 # wikilink-ish token. See helper docstring for details.
-                #
-                # 2026-04-24 (iteración 2, Fer F. report): excepción al
-                # replacement cuando TODOS los tools disparados vinieron
-                # vacíos — en ese caso preservamos el CONTEXTO original del
-                # vault y agregamos el tool output como sección explícita
-                # "CONSULTAS EN VIVO (todas vacías)". Racional: si el user
-                # preguntó por "últimos mails" y `gmail_recent` vino vacío,
-                # pero el retrieve pulló `03-Resources/Gmail/2026-04-22.md`
-                # (digest indexado de mails), queremos que el LLM pueda
-                # usar ese digest como fallback concreto en vez de
-                # contestar "te dejo otras fuentes" en abstracto. Con el
-                # tool output reemplazando, el vault material se descartaba
-                # y el LLM no tenía de qué resumir.
                 _datos_block = ""
                 for _n, _res, _ in _forced_results:
                     _datos_block += "\n" + _format_forced_tool_output(_n, _res) + "\n"
-                _all_tools_empty = all(
-                    _is_empty_tool_output(_n, _res)
-                    for _n, _res, _ in _forced_results
-                )
                 for _msg in reversed(tool_messages):
                     if _msg.get("role") == "user":
-                        if _all_tools_empty:
-                            _msg["content"] = (
-                                f"{_person_block}CONTEXTO:\n{context}\n\n"
-                                f"CONSULTAS EN VIVO (todas vacías — el "
-                                f"pre-router consultó estas fuentes y no "
-                                f"encontró nada reciente):\n{_datos_block}\n\n"
-                                f"PREGUNTA: {question}\n\nRESPUESTA:"
-                            )
-                        else:
-                            _msg["content"] = (
-                                f"CONTEXTO (datos en vivo, no del vault):\n{_datos_block}\n\n"
-                                f"PREGUNTA: {question}\n\nRESPUESTA:"
-                            )
+                        _msg["content"] = (
+                            f"CONTEXTO (datos en vivo, no del vault):\n{_datos_block}\n\n"
+                            f"PREGUNTA: {question}\n\nRESPUESTA:"
+                        )
                         break
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
@@ -6161,7 +5964,23 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # routing. El downgrade es local al código de streaming.
                 # Rollback: `export RAG_FAST_PATH_KEEP_WITH_TOOLS=1` para
                 # restaurar el comportamiento pre-fix.
-                if _fast_path and os.environ.get(
+                #
+                # Mode interaction (2026-04-24): the gate below uses
+                # `_could_have_fast`, NOT the effective `_fast_path`, so
+                # the downgrade fires whenever the small-model path was a
+                # plausible destination — either `retrieve()` judged
+                # fast_path=True OR the user forced `mode="fast"`. That
+                # keeps the downgrade orthogonal to the mode knob:
+                #   - mode="auto" + retrieve=True → original behavior, fires.
+                #   - mode="fast" + retrieve=False → user forced small-model,
+                #     downgrade MUST fire to protect prefill.
+                #   - mode="deep" + retrieve=True → user asked for full model
+                #     already, but pre-router bloat is real; marker still
+                #     fires so analytics can count "pre-router engaged on a
+                #     query retrieve wanted to fast-path". Physical
+                #     reassignment is a no-op (already on full model).
+                _could_have_fast = bool(result.get("fast_path", False)) or mode == "fast"
+                if _could_have_fast and os.environ.get(
                     "RAG_FAST_PATH_KEEP_WITH_TOOLS", ""
                 ).strip().lower() in ("", "0", "false", "no"):
                     _fast_path_downgraded = True
@@ -6175,7 +5994,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         f"[chat-fast-path-downgrade] pre-router fired "
                         f"({len(_forced_tools)} tools); switching "
                         f"{_LOOKUP_MODEL}→{_web_model} num_ctx="
-                        f"{_WEB_CHAT_OPTIONS['num_ctx']}",
+                        f"{_WEB_CHAT_OPTIONS['num_ctx']} mode={mode}",
                         flush=True,
                     )
 

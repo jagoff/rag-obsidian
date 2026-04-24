@@ -479,11 +479,23 @@ input.addEventListener("keydown", (e) => {
   if ((e.key === "ArrowUp" || e.key === "ArrowDown") &&
       !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey &&
       history.length > 0) {
+    // Solo abrir el popover de history cuando la flecha sería un no-op
+    // en el texto — o sea, cursor al inicio exacto (ArrowUp) / al
+    // final exacto (ArrowDown). Antes la regla era "la primera / última
+    // línea visual", lo que rompía la UX en mensajes multi-línea:
+    // moverse por el texto con las flechas disparaba el popover y
+    // molestaba (Fer F. 2026-04-24). Con caret === 0 / caret === length
+    // el user recupera el comportamiento estándar de textarea — ArrowUp
+    // en medio del texto mueve el cursor una línea arriba, sin popover.
+    // Selección activa (start !== end) también bloquea — no queremos
+    // "pisar" una selección del user.
     const v = input.value;
-    const caret = input.selectionStart;
-    const edgeOk = e.key === "ArrowUp"
-      ? !v.slice(0, caret).includes("\n")
-      : !v.slice(caret).includes("\n");
+    const caretStart = input.selectionStart;
+    const caretEnd = input.selectionEnd;
+    const hasSelection = caretStart !== caretEnd;
+    const edgeOk = !hasSelection && (e.key === "ArrowUp"
+      ? caretStart === 0
+      : caretStart === v.length);
     if (edgeOk) {
       e.preventDefault();
       openHistoryPopover();

@@ -1124,6 +1124,112 @@ def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
     assert "Proyecto Alpha" in user_content
 
 
+# ── 10.7. `source_specific` flag en el done event ─────────────────────────
+
+
+@pytest.mark.requires_ollama
+def test_done_event_flags_source_specific_true_for_gmail_query(
+    chat_env, monkeypatch,
+):
+    """UI contract (2026-04-24, Fer F. user report iter 4): el `event: done`
+    debe llevar `source_specific: true` cuando el pre-router disparó un
+    tool mapeado a una fuente concreta del user (gmail_recent /
+    calendar_ahead / reminders_due). El frontend usa el flag para apagar
+    el CTA "↗ buscar en internet" (Google no sabe qué mails pendientes
+    tengo yo) + el fallback YouTube.
+    """
+    monkeypatch.setattr(
+        tools_mod, "_fetch_gmail_evidence",
+        lambda now: {"unread_count": 0, "awaiting_reply": [], "starred": []},
+    )
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["ok"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("cuales son mis ultimos mails?")
+    done_payload = next(data for ev, data in events if ev == "done")
+    assert done_payload.get("source_specific") is True, (
+        f"done event debe llevar source_specific=true cuando gmail_recent "
+        f"fired: {done_payload!r}"
+    )
+
+
+@pytest.mark.requires_ollama
+def test_done_event_flags_source_specific_false_for_generic_query(
+    chat_env, monkeypatch,
+):
+    """No-regresión: queries que no matchean ningún tool del pre-router
+    emiten `source_specific: false` (o ausencia). El CTA "buscar en
+    internet" sigue activo para esos turns si la confianza es baja.
+    """
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["respuesta"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("dame info sobre grecia")
+    done_payload = next(
+        (data for ev, data in events if ev == "done"),
+        None,
+    )
+    if done_payload is None:
+        # Bypass path → skippable, el flag no aplica.
+        pytest.skip("bypass path: no done event")
+    assert done_payload.get("source_specific") is not True, (
+        f"source_specific=true en query que no matchea pre-router: "
+        f"{done_payload!r}"
+    )
+
+
+@pytest.mark.requires_ollama
+def test_done_event_flags_source_specific_false_for_weather_only(
+    chat_env, monkeypatch,
+):
+    """El pre-router dispara `weather` para queries de clima, pero weather
+    NO está en `_SOURCE_INTENT_META` (no tiene sentido "busqué el clima
+    y no encontré" — weather es passthrough de data externa, no una
+    "fuente" del user). Por lo tanto el `source_specific` flag queda en
+    false aunque el pre-router haya fired.
+    """
+    monkeypatch.setattr(
+        tools_mod, "_agent_tool_weather",
+        lambda loc=None: "Santa Fe: 22°C, despejado",
+    )
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),
+        _mk_stream(["ok"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    # "va a llover?" matchea solo el regex de weather (`llov`), no toca
+    # `_PLANNING_PAT` (hoy/mañana/semana) que dispararía calendar_ahead
+    # + reminders_due — y esos sí son source-specific. Query intencional-
+    # mente sin tokens temporales para aislar weather.
+    events, _ = _post_chat("va a llover?")
+    done_payload = next(data for ev, data in events if ev == "done")
+    # Confirmamos que el pre-router efectivamente fired weather (y nada
+    # más), si no el test no verifica lo que prometió verificar.
+    tool_names_called = [
+        data.get("name")
+        for ev, data in events
+        if ev == "status" and data.get("stage") == "tool"
+    ]
+    assert tool_names_called == ["weather"], (
+        f"query de weather aislada debería disparar SOLO weather, "
+        f"pero el pre-router lanzó: {tool_names_called}"
+    )
+    assert done_payload.get("source_specific") is not True, (
+        f"weather-only query NO debería flagear source_specific=true: "
+        f"{done_payload!r}"
+    )
+
+
 # ── 11. Metachat SSE: `metachat: true` flag in sources + done ─────────────
 
 

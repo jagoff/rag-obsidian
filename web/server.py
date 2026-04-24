@@ -5978,7 +5978,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 
         print(
             f"[chat-model-keepalive] model={_web_model} keep_alive={OLLAMA_KEEP_ALIVE}"
-            f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']} fast_path={_fast_path}",
+            f" num_ctx={_WEB_CHAT_OPTIONS['num_ctx']} fast_path={_fast_path}"
+            f" mode={mode} mode_origin={mode_origin}",
             flush=True,
         )
 
@@ -6531,6 +6532,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "retrieve_ms": _t_retrieve_ms,
             "ttft_ms": _t_ttft_ms,
             "llm_ms": _t_llm_decode_ms,
+            # Source-specific flag (2026-04-24, Fer F. user report iter 4):
+            # true cuando el pre-router disparó un tool mapeado a una
+            # fuente concreta del user (gmail_recent / calendar_ahead /
+            # reminders_due — las que viven en `_SOURCE_INTENT_META`).
+            # El frontend lo usa para apagar CTAs de "buscar en internet"
+            # y el cluster YouTube, que no tienen sentido cuando la
+            # pregunta es inherentemente sobre data local — Google no
+            # sabe qué mails pendientes tengo yo, ni qué recordatorios
+            # cargué en Apple Reminders. Tools como `weather` /
+            # `finance_summary` NO flaguean (no son "fuentes" buscables,
+            # son passthrough / resúmenes).
+            "source_specific": any(
+                name in _SOURCE_INTENT_META
+                for name, _args in _forced_tool_pairs
+            ),
         })
 
         _spawn_conversation_writer(

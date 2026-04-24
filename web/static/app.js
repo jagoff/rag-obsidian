@@ -2323,12 +2323,20 @@ async function send(question, opts = {}) {
       // encontró), mantenemos el link inline — el user puede insistir
       // sin que el layout explote en CTAs.
       const lowConfBypass = parsed.low_conf_bypass === true;
+      // `isSourceSpecific` (2026-04-24, Fer F. user report iter 4): el
+      // backend marca `source_specific: true` en el done event cuando
+      // el pre-router disparó un tool de fuente concreta del user
+      // (gmail_recent / calendar_ahead / reminders_due). Google no tiene
+      // acceso a mis mails pendientes ni a mis recordatorios de Apple —
+      // el CTA "↗ buscar en internet" y el cluster YouTube son ruido en
+      // esas queries. El gate apaga ambos.
+      const isSourceSpecific = parsed.source_specific === true;
       // `isMetachat` bloquea los 3 fallbacks abajo. Un canned reply de
       // metachat ("Hola") viene sin sources y con confidence=null — sin
       // el gate, la lógica de `weakAnswer` dispara `↗ buscar en internet`
       // (link a Google) + `appendRelated` (YouTube). Absurdo para un
       // saludo; el backend ya dio una respuesta conversacional canned.
-      if (!hadProposal && !isMetachat && question && weakAnswer && !mentionMatched) {
+      if (!hadProposal && !isMetachat && !isSourceSpecific && question && weakAnswer && !mentionMatched) {
         if (lowConfBypass) {
           appendFallbackCluster(turn, question);
         } else if (ragText) {
@@ -2344,7 +2352,9 @@ async function send(question, opts = {}) {
       // conf < 0.10. Queries con respuesta correcta + confidence 0.1-1.0
       // no deben disparar YouTube — el vault ya respondió bien y videos
       // genéricos son ruido. Ver comentario arriba de los thresholds.
-      if (!hadProposal && !isMetachat && question && vaultReallyFailed && !mentionMatched) {
+      // `isSourceSpecific` también bloquea YouTube — preguntar por
+      // mails/calendar/reminders nunca debería terminar en una playlist.
+      if (!hadProposal && !isMetachat && !isSourceSpecific && question && vaultReallyFailed && !mentionMatched) {
         appendRelated(turn, question);
       }
       const feedbackBar = parsed.turn_id

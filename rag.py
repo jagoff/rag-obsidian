@@ -31070,14 +31070,50 @@ GMAIL_SCOPES = [
 
 
 def _gmail_service():
-    """Authed Gmail API client, or None. Refreshes the access token in place
-    when expired and persists it back to `credentials.json` so the next call
-    doesn't re-refresh. Shares creds with the `gmail-send` MCP.
+    """Authed Gmail API client, or None.
+
+    Intenta 2 paths de OAuth en orden:
+
+    1. **`~/.config/obsidian-rag/google_token.json`** (vía
+       `_load_google_credentials`). Este es el token que usan el
+       ingester de Gmail + Calendar + Drive + morning brief — se
+       refresca solo via google-auth-oauthlib y es el path que el user
+       re-autentica con `rag auth google` / primera corrida
+       interactiva. Scopes: `gmail.readonly + drive.readonly` — suficiente
+       para LECTURA (que es todo lo que hacen `_fetch_gmail_evidence` y
+       `_sync_gmail_notes`).
+
+    2. **`~/.gmail-mcp/credentials.json`** (legacy, shared con gmail-mcp
+       NPM). Scopes más amplios (`gmail.modify`) pero el refresh token
+       tiende a caducar porque Google lo revoca si la OAuth app está en
+       "Testing" mode y pasaron >7d. Lo mantenemos como fallback para no
+       romper setups viejos que tengan solo este token, pero ya no es el
+       path canónico.
+
+    Retorna None si ambos fallan (caller maneja silent-fail). Rollback
+    al comportamiento pre-iter5: borrar el bloque (1) y dejar solo (2).
+    Motivo del cambio (2026-04-24, user report iter 5): el token en (2)
+    se revocó y `_fetch_gmail_evidence` devolvía vacío silenciosamente
+    → el user preguntaba "cuales son mis ultimos mails?" y el sistema
+    decía "no encontré mails recientes" aunque el inbox estaba lleno.
     """
+    try:
+        from googleapiclient.discovery import build
+    except ImportError:
+        return None
+
+    # Path primario: google_token.json (self-refreshing, alive).
+    try:
+        creds = _load_google_credentials(allow_interactive=False)
+        if creds is not None and creds.valid:
+            return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        _silent_log("gmail_service_primary", exc)
+
+    # Fallback: ~/.gmail-mcp/credentials.json (legacy, may be revoked).
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
     except ImportError:
         return None
     creds_path = GMAIL_CREDS_DIR / "credentials.json"
@@ -31101,7 +31137,8 @@ def _gmail_service():
             stored["access_token"] = creds.token
             creds_path.write_text(json.dumps(stored), encoding="utf-8")
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
-    except Exception:
+    except Exception as exc:
+        _silent_log("gmail_service_fallback", exc)
         return None
 
 
@@ -31137,8 +31174,9 @@ def _gmail_thread_last_meta(svc, thread_id: str) -> dict | None:
 
 
 def _fetch_gmail_evidence(now: datetime) -> dict:
-    """Gmail signals for the morning brief. Hits Gmail API ~3-10 times
-    (<2s total with cached discovery). Silent-fail on any error.
+    """Gmail signals for the morning brief + on-demand "últimos mails"
+    queries. Hits Gmail API ~5-15 times (<3s total with cached discovery).
+    Silent-fail on any error.
 
     Returns:
         {
@@ -31148,6 +31186,13 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
           "awaiting_reply": [{subject, from, snippet, days_old, thread_id,
              internal_date_ms}] up to 5 threads where the last message is
              NOT from me and is 3-14d old.
+          "recent": [{subject, from, snippet, thread_id, internal_date_ms}]
+             up to 8 most-recent inbox threads regardless of flags. 2026-04-24
+             (user report iter 5): el tool original solo devolvía starred +
+             awaiting — para un user con inbox-zero-ish ambos vienen vacíos
+             aunque tenga mails perfectamente navegables en el inbox. "últimos
+             mails" significa "los más recientes", no "los flagueados". Este
+             bucket tapa ese gap.
         }
 
         `thread_id` + `internal_date_ms` are emitted so downstream consumers
@@ -31163,7 +31208,12 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
     except Exception:
         return {}
     me_lower = (profile.get("emailAddress") or "").lower()
-    out: dict = {"unread_count": 0, "starred": [], "awaiting_reply": []}
+    out: dict = {
+        "unread_count": 0,
+        "starred": [],
+        "awaiting_reply": [],
+        "recent": [],
+    }
 
     # Unread count — INBOX label metadata gives exact thread/message counts
     # without scanning messages. Cheaper and accurate vs resultSizeEstimate.
@@ -31227,6 +31277,51 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
             })
     except Exception as exc:
         _silent_log('gmail_followup_list', exc)
+
+    # Recent inbox — los últimos 8 hilos del inbox sin filtrar por flag.
+    # Es el bucket que responde "cuales son mis ultimos mails?" cuando el
+    # user no tiene nada starred ni awaiting (inbox-zero workflow típico).
+    # Mantenemos la query acotada con `newer_than:30d` para que el scan no
+    # se vaya de un mes: si el user no tocó Gmail en un mes, los 8 más
+    # viejos no son "últimos" en el sentido útil. Excluimos promotions /
+    # social / updates / forums por el mismo motivo que awaiting (el user
+    # considera "mails reales" los que no caen en esas subcategorías —
+    # Gmail los separa por diseño). Si eventualmente pide "últimas newsletters"
+    # o similar, agregamos otro bucket.
+    try:
+        q_recent = (
+            "in:inbox newer_than:30d "
+            "-category:promotions -category:social "
+            "-category:updates -category:forums"
+        )
+        r = svc.users().threads().list(
+            userId="me", q=q_recent, maxResults=8,
+        ).execute()
+        # Dedup contra starred/awaiting — si el user tiene un mail starred
+        # que también es el más reciente, no queremos listarlo dos veces.
+        # Set de thread_ids ya agregados en las secciones previas.
+        _seen_tids: set[str] = {
+            str(it.get("thread_id") or "")
+            for bucket in ("starred", "awaiting_reply")
+            for it in out[bucket]
+        }
+        for th in r.get("threads", []) or []:
+            tid = th.get("id") or ""
+            if tid in _seen_tids:
+                continue
+            meta = _gmail_thread_last_meta(svc, tid)
+            if not meta:
+                continue
+            out["recent"].append({
+                "subject": meta["subject"],
+                "from": meta["from"],
+                "snippet": meta["snippet"],
+                "thread_id": tid,
+                "internal_date_ms": meta["internal_date_ms"],
+            })
+            _seen_tids.add(tid)
+    except Exception as exc:
+        _silent_log('gmail_recent_list', exc)
 
     return out
 

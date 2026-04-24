@@ -112,7 +112,22 @@ def reminders_due(days_ahead: int = 7) -> str:
 
 
 def gmail_recent() -> str:
-    """Gmail reciente: no leídos, starred, awaiting-reply (≤8 threads).
+    """Gmail reciente: awaiting-reply, starred, y últimos del inbox (≤12).
+
+    Orden de prioridad en el JSON que sirve al LLM:
+      1. `awaiting_reply` — hilos donde el user le debe respuesta a
+         alguien (más actionable).
+      2. `starred` — hilos flagueados manualmente por el user.
+      3. `recent` — últimos N del inbox sin filtros de status. Tapamos el
+         gap de iter 5 (user report 2026-04-24): con starred+awaiting
+         vacíos, el tool devolvía `_Sin mails pendientes._` aunque el
+         inbox tuviera mails perfectamente navegables. "últimos mails"
+         para el user = "los más recientes", no "los flagueados".
+
+    Cap a 12 (3*4) en total porque son 3 buckets y queremos margen pero
+    sin inundar el CONTEXTO. Dedup implícito: `_fetch_gmail_evidence`
+    elimina del bucket `recent` los thread_ids que ya aparecen en
+    starred/awaiting, así que iterar los 3 no repite.
 
     Returns:
         JSON `{unread_count: int, threads: [...]}`. Error → ambos vacíos.
@@ -141,16 +156,21 @@ def gmail_recent() -> str:
 
         awaiting = list(ev.get("awaiting_reply") or [])
         starred = list(ev.get("starred") or [])
+        recent = list(ev.get("recent") or [])
 
-        # awaiting first (more actionable), then starred; cap 8.
+        CAP = 12
         for item in awaiting:
-            if len(threads) >= 8:
+            if len(threads) >= CAP:
                 break
             threads.append(_mk_thread("awaiting_reply", item))
         for item in starred:
-            if len(threads) >= 8:
+            if len(threads) >= CAP:
                 break
             threads.append(_mk_thread("starred", item))
+        for item in recent:
+            if len(threads) >= CAP:
+                break
+            threads.append(_mk_thread("recent", item))
 
         return json.dumps({"unread_count": unread_count, "threads": threads}, ensure_ascii=False)
     except Exception:

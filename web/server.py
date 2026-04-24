@@ -543,11 +543,20 @@ def _format_gmail_block(raw: str) -> str:
         header_bits.append(f"{unread} no leído{'s' if unread != 1 else ''}")
     header = f"### Mails ({', '.join(header_bits)})" if header_bits else "### Mails"
     lines = [header]
+    # Mapping kind → etiqueta entre corchetes. `recent` es el default
+    # (últimos del inbox sin filtros) y NO lleva tag — sería ruido
+    # visual: "- Fer F · Asunto [recent]". Si el mail vino del bucket
+    # flagueado (awaiting_reply o starred) sí ponemos el tag porque es
+    # signal útil para el user ("este hilo te espera respuesta").
     for t in valid_threads:
         frm = str(t.get("from", "")).strip()
         subj = str(t.get("subject", "")).strip()
         kind = str(t.get("kind", "")).strip()
-        tag = {"awaiting_reply": "esperando respuesta", "starred": "starred"}.get(kind, kind)
+        tag = {
+            "awaiting_reply": "esperando respuesta",
+            "starred": "starred",
+            "recent": "",
+        }.get(kind, kind)
         tag_str = f" [{tag}]" if tag else ""
         lines.append(f"- {frm} · {subj}{tag_str}")
     return "\n".join(lines) + "\n"
@@ -6160,25 +6169,38 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # retrieve() decidió ANTES de ver los tools — así el
                 # analytics sigue midiendo la cobertura del adaptive
                 # routing. El downgrade es local al código de streaming.
-                # Rollback: `export RAG_FAST_PATH_KEEP_WITH_TOOLS=1` para
-                # restaurar el comportamiento pre-fix.
-                if _fast_path and os.environ.get(
+                # Rollback: exportar el env var con cualquier valor
+                # truthy para restaurar el comportamiento pre-fix.
+                #
+                # Mode interaction (2026-04-24): el gate usa
+                # `_could_have_fast` — True cuando (a) retrieve() decidió
+                # fast_path O (b) el user mandó `mode="fast"`. Loggeamos
+                # `fast_path_downgraded=True` aunque el user haya pedido
+                # `mode="deep"` siempre que retrieve() hubiera ido por
+                # fast: es un evento semántico que dice "había intención
+                # de fast-path y el pre-router la bloqueó". El cambio
+                # efectivo de modelo sólo aplica si ya estábamos en fast
+                # (si `_fast_path` era False por `mode="deep"`, ya
+                # estábamos en full, no hay nada que downgradear).
+                _could_have_fast = bool(result.get("fast_path", False)) or mode == "fast"
+                if _could_have_fast and os.environ.get(
                     "RAG_FAST_PATH_KEEP_WITH_TOOLS", ""
                 ).strip().lower() in ("", "0", "false", "no"):
                     _fast_path_downgraded = True
-                    _web_model = _web_model_full
-                    _WEB_CHAT_OPTIONS = {
-                        **CHAT_OPTIONS,
-                        "num_ctx": _WEB_CHAT_NUM_CTX,
-                        "num_predict": 256,
-                    }
-                    print(
-                        f"[chat-fast-path-downgrade] pre-router fired "
-                        f"({len(_forced_tools)} tools); switching "
-                        f"{_LOOKUP_MODEL}→{_web_model} num_ctx="
-                        f"{_WEB_CHAT_OPTIONS['num_ctx']}",
-                        flush=True,
-                    )
+                    if _fast_path:
+                        _web_model = _web_model_full
+                        _WEB_CHAT_OPTIONS = {
+                            **CHAT_OPTIONS,
+                            "num_ctx": _WEB_CHAT_NUM_CTX,
+                            "num_predict": 256,
+                        }
+                        print(
+                            f"[chat-fast-path-downgrade] pre-router fired "
+                            f"({len(_forced_tools)} tools); switching "
+                            f"{_LOOKUP_MODEL}→{_web_model} num_ctx="
+                            f"{_WEB_CHAT_OPTIONS['num_ctx']}",
+                            flush=True,
+                        )
 
             # Gate the LLM tool-deciding loop. Empirically the LLM rarely
             # picks tools beyond what the pre-router already fired (REGLA 1
@@ -6501,7 +6523,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # marker pero seguía generando con qwen2.5:7b → pérdida de
             # 2.75× speedup medido en prod (CLI 7d). Esta columna ahora
             # surfacea la ganancia real cuando `fast_path=True`.
-            "fast_path": bool(result.get("fast_path", False)),
+            #
+            # NOTE (2026-04-24): loggeamos el `_fast_path` EFECTIVO — el
+            # valor realmente usado en la generación tras aplicar el
+            # mode gate. Si el user mandó `mode="fast"` o `mode="deep"`,
+            # puede diferir de `result["fast_path"]` (la decisión del
+            # adaptive routing). Para distinguir override del user vs
+            # decisión automática, cruzar contra `mode` + `mode_origin`
+            # más abajo.
+            "fast_path": bool(_fast_path),
             # Downgrade marker — True cuando el pre-router fired tools y
             # el endpoint cambió runtime de _LOOKUP_MODEL (qwen2.5:3b) a
             # qwen2.5:7b porque el contexto inflado por el tool output
@@ -6510,8 +6540,30 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # — `fast_path=True + fast_path_downgraded=True` significa
             # "retrieve() pensó fast-path, pero la realidad del pre-router
             # mandó downgrade". Util para medir cobertura real del
-            # adaptive routing vs lo que realmente corrió.
+            # adaptive routing vs lo que realmente corrió. También fires
+            # cuando el user pidió `mode="fast"` y el pre-router matched
+            # tools — el downgrade es safety rail de prefill, no routing.
             "fast_path_downgraded": bool(_fast_path_downgraded),
+            # Chat mode override (2026-04-24, feature "modo rápido/profundo"):
+            # captura el knob user-facing que el web UI manda. `chat_mode`
+            # es uno de {"auto","fast","deep"} post-validación (invalid →
+            # silent "auto"). `chat_mode_origin` es "request" cuando el
+            # cliente incluyó el campo (valor válido O inválido) y
+            # "default" cuando el campo estaba ausente/null. Juntos
+            # contestan: (a) cuán seguido los users overridean el
+            # adaptive routing? (b) en qué dirección? (c) hay clientes
+            # rotos mandando garbage? Esencial para decidir si el
+            # adaptive routing necesita retuning.
+            #
+            # **Nota sobre el nombre**: loggeamos `chat_mode`, no `mode`,
+            # porque la tabla `rag_queries` YA tiene una columna `mode`
+            # (string libre para command type: "query"/"chat"/"do"/etc).
+            # Si usáramos `"mode"` como key en el extra_json dict, el
+            # merge de log_query_event la mapearía a la columna
+            # preexistente y perderíamos el valor del UI. El prefix
+            # `chat_` separa el namespace y mantiene la analítica limpia.
+            "chat_mode": mode,
+            "chat_mode_origin": mode_origin,
             # Retrieval stage timing — desde 2026-04-23, también para
             # el web endpoint. Incluye embed_ms / sem_ms / bm25_ms /
             # rrf_ms / reranker_ms / total_ms. Pre-fix solo el CLI
@@ -6657,6 +6709,483 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 @app.get("/dashboard")
 def dashboard_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "dashboard.html")
+
+
+# ── /status — service health page ────────────────────────────────────
+# Una página sola que lista TODOS los componentes que el sistema necesita
+# para funcionar — db, ollama, tunnel, whatsapp, los 20+ daemons +
+# scheduled jobs — con un semáforo (verde/amarillo/rojo) por servicio.
+# Pensado para "prendí la Mac y chequeo qué está vivo de un vistazo" sin
+# tener que acordarse de 20 labels de launchctl.
+#
+# Semántica de estados:
+#   ok       (verde)  → el servicio está funcionando como corresponde.
+#   warn     (amarillo) → loaded pero aún no corrió, o info faltante
+#                         (ej. scheduled sin primera corrida todavía).
+#   down     (rojo)   → debería estar corriendo y no está, o última
+#                        corrida terminó con exit != 0.
+#
+# Tres "kinds" de check:
+#   daemon    → KeepAlive=true; debería estar running 24/7.
+#   scheduled → StartCalendarInterval/StartInterval/RunAtLoad-oneshot;
+#               se gradúa por last-exit-code (pasa la mayor parte del
+#               tiempo not-running por diseño).
+#   probe     → HTTP/filesystem probe directo (Ollama, DB file, web
+#               self, vault, tunnel URL freshness).
+#
+# Las checks corren en ThreadPoolExecutor para que el endpoint responda
+# en <500ms aun con ~25 targets (cada launchctl print son ~20-40ms).
+
+
+_STATUS_LAUNCHD_UID: int | None = None
+
+
+def _launchd_uid_cached() -> int:
+    global _STATUS_LAUNCHD_UID
+    if _STATUS_LAUNCHD_UID is None:
+        _STATUS_LAUNCHD_UID = os.getuid()
+    return _STATUS_LAUNCHD_UID
+
+
+def _launchctl_print_fields(label: str, timeout: float = 3.0) -> dict[str, str] | None:
+    """Run `launchctl print gui/<uid>/<label>` and parse top-level fields.
+
+    Returns None si el servicio no está cargado (launchctl exit != 0).
+    Sólo extrae las keys top-level del bloque principal — las nested
+    (endpoints, sockets, domain) las descartamos porque inflan el output
+    y no las usamos. La heurística es "línea que empieza con exactamente
+    UN tab"; nested bloques empiezan con 2+ tabs.
+    """
+    try:
+        out = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{_launchd_uid_cached()}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    fields: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        # Top-level key: exactamente un leading tab, no dos.
+        if not (line.startswith("\t") and not line.startswith("\t\t")):
+            continue
+        stripped = line.strip()
+        if " = " not in stripped:
+            continue
+        k, _, v = stripped.partition(" = ")
+        k = k.strip()
+        v = v.strip()
+        if k and k not in fields:
+            fields[k] = v
+    return fields
+
+
+def _status_fmt_size(n: int) -> str:
+    """Byte count → human string (5 MB, 123 KB, 1.2 GB)."""
+    if n < 1024:
+        return f"{n} B"
+    size = float(n)
+    for unit in ("KB", "MB", "GB", "TB"):
+        size /= 1024.0
+        if size < 1024.0:
+            # 1 decimal si es <10, 0 si es >=10 (más compacto)
+            return f"{size:.1f} {unit}" if size < 10 else f"{size:.0f} {unit}"
+    return f"{size:.0f} PB"
+
+
+def _status_fmt_age(seconds: float) -> str:
+    """Segundos → "hace 3m" / "hace 2h" / "hace 5d"."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"hace {int(seconds)}s"
+    mins = seconds / 60.0
+    if mins < 60:
+        return f"hace {int(mins)}m"
+    hours = mins / 60.0
+    if hours < 24:
+        return f"hace {int(hours)}h"
+    days = hours / 24.0
+    return f"hace {int(days)}d"
+
+
+def _status_grade_daemon(label: str, name: str) -> dict:
+    """Grade KeepAlive daemon: running = ok, anything else = down."""
+    info = _launchctl_print_fields(label)
+    if info is None:
+        return {"id": label, "name": name, "kind": "daemon", "status": "down",
+                "detail": "no cargado en launchd"}
+    state = info.get("state", "")
+    pid = info.get("pid")
+    last_exit = info.get("last exit code", "")
+    if state == "running":
+        detail = f"pid {pid}" if pid else "running"
+        resp = {"id": label, "name": name, "kind": "daemon", "status": "ok",
+                "detail": detail}
+        if pid:
+            resp["pid"] = pid
+        return resp
+    det = "not running"
+    if last_exit and last_exit not in ("(never exited)", "0"):
+        det = f"crashed · exit {last_exit}"
+    return {"id": label, "name": name, "kind": "daemon", "status": "down",
+            "detail": det}
+
+
+def _status_grade_scheduled(label: str, name: str) -> dict:
+    """Grade scheduled/oneshot job: last-exit-code drives the light.
+
+    - state=running → ok (corriendo justo ahora)
+    - exit 0 → ok
+    - exit N (nonzero) → down
+    - never exited + runs=0 → warn (loaded, no corrió todavía)
+    - never exited + runs>0 → ok (inusual pero válido)
+    - no cargado → warn (no down porque algunos están desactivados a mano)
+    """
+    info = _launchctl_print_fields(label)
+    if info is None:
+        return {"id": label, "name": name, "kind": "scheduled", "status": "warn",
+                "detail": "no cargado"}
+    state = info.get("state", "")
+    runs = info.get("runs", "0")
+    last_exit = info.get("last exit code", "(never exited)")
+    if state == "running":
+        pid = info.get("pid", "?")
+        return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
+                "detail": f"corriendo · pid {pid} · runs {runs}"}
+    if last_exit == "0":
+        return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
+                "detail": f"última OK · runs {runs}"}
+    if last_exit == "(never exited)":
+        if runs == "0":
+            return {"id": label, "name": name, "kind": "scheduled", "status": "warn",
+                    "detail": "aún no corrió"}
+        return {"id": label, "name": name, "kind": "scheduled", "status": "ok",
+                "detail": f"runs {runs}"}
+    return {"id": label, "name": name, "kind": "scheduled", "status": "down",
+            "detail": f"última exit {last_exit} · runs {runs}"}
+
+
+def _status_probe_self() -> dict:
+    return {"id": "web-self", "name": "Web server (FastAPI)", "kind": "probe",
+            "status": "ok", "detail": f"pid {os.getpid()}"}
+
+
+def _status_probe_ollama() -> dict:
+    t0 = time.monotonic()
+    ok = _ollama_alive(timeout=2.0)
+    ms = int((time.monotonic() - t0) * 1000)
+    if ok:
+        return {"id": "ollama", "name": "Ollama (LLM runtime)", "kind": "probe",
+                "status": "ok", "detail": f"/api/tags {ms}ms"}
+    return {"id": "ollama", "name": "Ollama (LLM runtime)", "kind": "probe",
+            "status": "down", "detail": f"no responde /api/tags ({ms}ms)"}
+
+
+def _status_probe_rag_db() -> dict:
+    """Check ragvec.db exists + is readable. Size + mtime for visibility."""
+    try:
+        from rag import DB_PATH as _DB_DIR  # noqa: PLC0415
+        dbf = _DB_DIR / "ragvec.db"
+        if not dbf.is_file():
+            return {"id": "rag-db", "name": "RAG DB (ragvec)", "kind": "probe",
+                    "status": "down", "detail": f"falta {dbf}"}
+        st = dbf.stat()
+        age = time.time() - st.st_mtime
+        return {"id": "rag-db", "name": "RAG DB (ragvec)", "kind": "probe",
+                "status": "ok",
+                "detail": f"{_status_fmt_size(st.st_size)} · modif. {_status_fmt_age(age)}"}
+    except Exception as e:
+        return {"id": "rag-db", "name": "RAG DB (ragvec)", "kind": "probe",
+                "status": "down", "detail": f"{type(e).__name__}: {e}"}
+
+
+def _status_probe_telemetry_db() -> dict:
+    try:
+        from rag import DB_PATH as _DB_DIR  # noqa: PLC0415
+        dbf = _DB_DIR / "telemetry.db"
+        if not dbf.is_file():
+            return {"id": "telemetry-db", "name": "Telemetry DB", "kind": "probe",
+                    "status": "warn", "detail": "aún no creada"}
+        st = dbf.stat()
+        age = time.time() - st.st_mtime
+        return {"id": "telemetry-db", "name": "Telemetry DB", "kind": "probe",
+                "status": "ok",
+                "detail": f"{_status_fmt_size(st.st_size)} · modif. {_status_fmt_age(age)}"}
+    except Exception as e:
+        return {"id": "telemetry-db", "name": "Telemetry DB", "kind": "probe",
+                "status": "warn", "detail": f"{type(e).__name__}: {e}"}
+
+
+def _status_probe_vault() -> dict:
+    try:
+        if not VAULT_PATH.is_dir():
+            return {"id": "vault", "name": "Obsidian vault", "kind": "probe",
+                    "status": "down", "detail": f"no existe {VAULT_PATH}"}
+        return {"id": "vault", "name": "Obsidian vault", "kind": "probe",
+                "status": "ok", "detail": str(VAULT_PATH)}
+    except Exception as e:
+        return {"id": "vault", "name": "Obsidian vault", "kind": "probe",
+                "status": "down", "detail": f"{type(e).__name__}: {e}"}
+
+
+def _status_probe_wa_db() -> dict:
+    try:
+        if not WHATSAPP_DB_PATH.is_file():
+            return {"id": "wa-db", "name": "WhatsApp bridge SQLite", "kind": "probe",
+                    "status": "warn", "detail": "no existe (bridge todavía no inició)"}
+        st = WHATSAPP_DB_PATH.stat()
+        age = time.time() - st.st_mtime
+        return {"id": "wa-db", "name": "WhatsApp bridge SQLite", "kind": "probe",
+                "status": "ok",
+                "detail": f"{_status_fmt_size(st.st_size)} · modif. {_status_fmt_age(age)}"}
+    except Exception as e:
+        return {"id": "wa-db", "name": "WhatsApp bridge SQLite", "kind": "probe",
+                "status": "warn", "detail": f"{type(e).__name__}: {e}"}
+
+
+def _status_probe_tunnel_url() -> dict:
+    """Read ~/.local/share/obsidian-rag/cloudflared-url.txt to surface the
+    current public URL and its freshness. Tunnel watcher re-writes this
+    file whenever it re-establishes the quick-tunnel.
+    """
+    try:
+        url_file = Path.home() / ".local/share/obsidian-rag/cloudflared-url.txt"
+        if not url_file.is_file():
+            return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
+                    "status": "warn", "detail": "sin archivo cloudflared-url.txt"}
+        url = url_file.read_text(encoding="utf-8", errors="replace").strip()
+        st = url_file.stat()
+        age = time.time() - st.st_mtime
+        if not url:
+            return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
+                    "status": "warn", "detail": "archivo vacío"}
+        return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
+                "status": "ok", "detail": f"{url} · {_status_fmt_age(age)}",
+                "meta": {"url": url}}
+    except Exception as e:
+        return {"id": "tunnel-url", "name": "Tunnel URL", "kind": "probe",
+                "status": "warn", "detail": f"{type(e).__name__}: {e}"}
+
+
+# Catálogo de servicios. Orden = orden de aparición en la UI.
+# "category" agrupa en secciones; "kind" dispatchea al helper correcto.
+_STATUS_CATALOG: list[dict] = [
+    # Core: sin esto no hay sistema.
+    {"category": "core", "category_label": "Core", "kind": "self", "id": "web-self"},
+    {"category": "core", "category_label": "Core", "kind": "ollama", "id": "ollama"},
+    {"category": "core", "category_label": "Core", "kind": "rag_db", "id": "rag-db"},
+    {"category": "core", "category_label": "Core", "kind": "telemetry_db", "id": "telemetry-db"},
+    {"category": "core", "category_label": "Core", "kind": "vault", "id": "vault"},
+    {"category": "core", "category_label": "Core", "kind": "daemon",
+     "target": "com.fer.obsidian-rag-web", "name": "Web daemon (launchd)"},
+    {"category": "core", "category_label": "Core", "kind": "scheduled",
+     "target": "com.fer.ollama-env", "name": "Ollama env shim"},
+
+    # Tunnel: HTTPS público vía Cloudflare.
+    {"category": "tunnel", "category_label": "Cloudflare tunnel", "kind": "daemon",
+     "target": "com.fer.obsidian-rag-cloudflare-tunnel", "name": "Tunnel (quick)"},
+    {"category": "tunnel", "category_label": "Cloudflare tunnel", "kind": "daemon",
+     "target": "com.fer.obsidian-rag-cloudflare-tunnel-watcher", "name": "Tunnel watcher"},
+    {"category": "tunnel", "category_label": "Cloudflare tunnel", "kind": "daemon",
+     "target": "com.fer.cloudflared", "name": "cloudflared (base)"},
+    {"category": "tunnel", "category_label": "Cloudflare tunnel", "kind": "tunnel_url",
+     "id": "tunnel-url"},
+
+    # WhatsApp: bridge + listener + vault sync.
+    {"category": "whatsapp", "category_label": "WhatsApp", "kind": "daemon",
+     "target": "com.fer.whatsapp-bridge", "name": "Bridge (Go)"},
+    {"category": "whatsapp", "category_label": "WhatsApp", "kind": "daemon",
+     "target": "com.fer.whatsapp-listener", "name": "Listener (ambient agent)"},
+    {"category": "whatsapp", "category_label": "WhatsApp", "kind": "scheduled",
+     "target": "com.fer.whatsapp-vault-sync", "name": "Vault sync"},
+    {"category": "whatsapp", "category_label": "WhatsApp", "kind": "wa_db", "id": "wa-db"},
+
+    # Cross-source ingesters.
+    {"category": "ingest", "category_label": "Cross-source ingesters", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-ingest-gmail", "name": "Gmail"},
+    {"category": "ingest", "category_label": "Cross-source ingesters", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-ingest-calendar", "name": "Calendar"},
+    {"category": "ingest", "category_label": "Cross-source ingesters", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-ingest-reminders", "name": "Reminders"},
+    {"category": "ingest", "category_label": "Cross-source ingesters", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-ingest-whatsapp", "name": "WhatsApp → vault"},
+    {"category": "ingest", "category_label": "Cross-source ingesters", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-wa-tasks", "name": "WA tasks extractor"},
+
+    # Briefs + automation.
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-morning", "name": "Morning brief"},
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-today", "name": "Today brief"},
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-digest", "name": "Digest"},
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "daemon",
+     "target": "com.fer.obsidian-rag-watch", "name": "rag watch (ambient)"},
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
+     "target": "com.fer.morning-briefing", "name": "Morning briefing (legacy)"},
+
+    # Maintenance + vault health.
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-maintenance", "name": "Maintenance"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-online-tune", "name": "Online tune (ranker-vivo)"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-patterns", "name": "Patterns (radar)"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-emergent", "name": "Emergent radar"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-archive", "name": "Archive"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-consolidate", "name": "Consolidate"},
+    {"category": "maintenance", "category_label": "Maintenance + vault health", "kind": "scheduled",
+     "target": "com.fer.mcp-orphan-reaper", "name": "MCP orphan reaper"},
+
+    # Optional: servicios que corren pero no son críticos para el chat.
+    {"category": "optional", "category_label": "Optional", "kind": "daemon",
+     "target": "com.fer.obsidian-rag-serve", "name": "rag serve (HTTP API)"},
+]
+
+
+def _status_dispatch_one(entry: dict) -> dict:
+    """Run the correct grader for a single catalog entry."""
+    kind = entry["kind"]
+    if kind == "self":
+        r = _status_probe_self()
+    elif kind == "ollama":
+        r = _status_probe_ollama()
+    elif kind == "rag_db":
+        r = _status_probe_rag_db()
+    elif kind == "telemetry_db":
+        r = _status_probe_telemetry_db()
+    elif kind == "vault":
+        r = _status_probe_vault()
+    elif kind == "wa_db":
+        r = _status_probe_wa_db()
+    elif kind == "tunnel_url":
+        r = _status_probe_tunnel_url()
+    elif kind == "daemon":
+        r = _status_grade_daemon(entry["target"], entry.get("name", entry["target"]))
+    elif kind == "scheduled":
+        r = _status_grade_scheduled(entry["target"], entry.get("name", entry["target"]))
+    else:
+        r = {"id": entry.get("id", entry.get("target", kind)),
+             "name": entry.get("name", kind), "kind": kind,
+             "status": "warn", "detail": f"kind desconocido: {kind}"}
+    r["category"] = entry["category"]
+    r["category_label"] = entry["category_label"]
+    return r
+
+
+# Cache corto del payload entero — si la UI auto-refreshea cada 5s, no
+# queremos hacer 25 subprocess.run por cada request. 3s es suficiente
+# para que un F5 manual vea cambios recientes sin hammerear launchctl.
+_STATUS_CACHE: dict = {"ts": 0.0, "payload": None}
+_STATUS_CACHE_TTL = 3.0
+_STATUS_CACHE_LOCK = threading.Lock()
+
+
+def _status_build_payload() -> dict:
+    """Run todos los checks en paralelo y agruparlos por categoría.
+
+    El payload final tiene shape:
+      {
+        "generated_at": "ISO-8601 UTC",
+        "overall": "ok" | "degraded" | "down",
+        "counts": {"ok": N, "warn": N, "down": N},
+        "categories": [
+           {"id": "core", "label": "Core", "services": [ {...}, ... ]},
+           ...
+        ]
+      }
+
+    `overall` surfaces un estado agregado del sistema:
+      - down  si algún servicio de `core` está down (el chat no funciona)
+      - down  si Ollama o rag-db están down (lo mismo)
+      - degraded si hay algún warn o down en no-core
+      - ok    si todo verde
+    """
+    import concurrent.futures  # noqa: PLC0415
+
+    results: list[dict] = [{} for _ in _STATUS_CATALOG]
+    # Thread pool con >1 worker aun para checks rápidos — el cuello es
+    # los ~25 `launchctl print` (20-40ms c/u). Con 8 workers, ~100ms
+    # total vs. 800ms seriales.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(_status_dispatch_one, entry): i
+                for i, entry in enumerate(_STATUS_CATALOG)}
+        for fut in concurrent.futures.as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                entry = _STATUS_CATALOG[i]
+                results[i] = {
+                    "id": entry.get("id", entry.get("target", "?")),
+                    "name": entry.get("name", "?"),
+                    "kind": entry.get("kind", "?"),
+                    "status": "down",
+                    "detail": f"error del check: {type(e).__name__}: {e}",
+                    "category": entry["category"],
+                    "category_label": entry["category_label"],
+                }
+
+    # Agrupar manteniendo el orden del catálogo.
+    categories: list[dict] = []
+    cat_index: dict[str, int] = {}
+    counts = {"ok": 0, "warn": 0, "down": 0}
+    core_down = False
+    any_non_ok = False
+    for svc in results:
+        cat_id = svc["category"]
+        if cat_id not in cat_index:
+            cat_index[cat_id] = len(categories)
+            categories.append({"id": cat_id, "label": svc["category_label"],
+                               "services": []})
+        categories[cat_index[cat_id]]["services"].append(svc)
+        st = svc.get("status", "down")
+        counts[st] = counts.get(st, 0) + 1
+        if st != "ok":
+            any_non_ok = True
+        if cat_id == "core" and st == "down":
+            core_down = True
+
+    overall = "ok"
+    if core_down:
+        overall = "down"
+    elif any_non_ok:
+        overall = "degraded"
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "overall": overall,
+        "counts": counts,
+        "categories": categories,
+    }
+
+
+@app.get("/api/status")
+def api_status(nocache: int = 0) -> dict:
+    """JSON health dump para la /status page. `?nocache=1` fuerza refresh."""
+    now = time.monotonic()
+    with _STATUS_CACHE_LOCK:
+        cached = _STATUS_CACHE["payload"]
+        fresh = (now - _STATUS_CACHE["ts"]) < _STATUS_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _status_build_payload()
+        with _STATUS_CACHE_LOCK:
+            _STATUS_CACHE["payload"] = payload
+            _STATUS_CACHE["ts"] = now
+        return payload
+    return cached
+
+
+@app.get("/status")
+def status_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "status.html")
 
 
 def _collect_screentime_daily(

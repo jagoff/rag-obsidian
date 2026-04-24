@@ -324,6 +324,123 @@ def test_gmail_recent_missing_internal_date_is_empty_received_at(monkeypatch):
     assert parsed["threads"][0]["received_at"] == ""
 
 
+def test_gmail_recent_surfaces_inbox_bucket_when_awaiting_starred_empty(monkeypatch):
+    """Iter 5 regression (2026-04-24, Fer F. user report): si el user tiene
+    inbox-zero-ish (nada starred, nada awaiting), el tool original
+    devolvía `threads: []` y el LLM respondía "no encontré mails
+    recientes" — aunque el inbox del user tuviera perfectamente mails
+    navegables. El bucket `recent` agregado en `_fetch_gmail_evidence`
+    tapa ese gap: son los últimos N del inbox sin filtros de status.
+
+    Este test verifica que cuando awaiting/starred vienen vacíos pero
+    `recent` trae items, `gmail_recent` los surface con `kind="recent"`
+    y el shape esperado (subject/from/received_at).
+    """
+    fake_ev = {
+        "unread_count": 0,
+        "awaiting_reply": [],
+        "starred": [],
+        "recent": [
+            {
+                "subject": "Aviso de débito automático",
+                "from": "Santander <avisos@santander.com.ar>",
+                "snippet": "Monto U$S9,99 Comercio APPLECOM BILL",
+                "thread_id": "tid-r1",
+                "internal_date_ms": 1_713_400_000_000,
+            },
+            {
+                "subject": "CI passed: main (abc123)",
+                "from": "GitHub <notifications@github.com>",
+                "snippet": "All jobs succeeded",
+                "thread_id": "tid-r2",
+                "internal_date_ms": 1_713_300_000_000,
+            },
+        ],
+    }
+    monkeypatch.setattr(tools_mod, "_fetch_gmail_evidence", lambda now: fake_ev)
+
+    parsed = json.loads(gmail_recent())
+    # Unread count passthrough (0 acá, bien).
+    assert parsed["unread_count"] == 0
+    # Los 2 recents aparecen con kind="recent".
+    assert len(parsed["threads"]) == 2
+    t0, t1 = parsed["threads"]
+    assert t0["kind"] == "recent"
+    assert t0["subject"] == "Aviso de débito automático"
+    assert t0["thread_id"] == "tid-r1"
+    assert t0["received_at"]  # ISO string derivado de internal_date_ms
+    assert t1["kind"] == "recent"
+    assert t1["subject"] == "CI passed: main (abc123)"
+
+
+def test_gmail_recent_priority_order_awaiting_starred_recent(monkeypatch):
+    """Con los 3 buckets llenos, el orden en `threads` es:
+    awaiting_reply → starred → recent. Prioridad por actionability:
+    mails esperando respuesta del user son más urgentes que starred
+    viejos, y ambos más útiles que el último de la lista general.
+    """
+    fake_ev = {
+        "unread_count": 2,
+        "awaiting_reply": [
+            {"subject": "aw1", "from": "a@x.com", "snippet": "",
+             "days_old": 5.0, "thread_id": "aw-1", "internal_date_ms": 1_000_000_000_000},
+        ],
+        "starred": [
+            {"subject": "st1", "from": "b@x.com", "snippet": "",
+             "thread_id": "st-1", "internal_date_ms": 1_100_000_000_000},
+        ],
+        "recent": [
+            {"subject": "re1", "from": "c@x.com", "snippet": "",
+             "thread_id": "re-1", "internal_date_ms": 1_200_000_000_000},
+            {"subject": "re2", "from": "d@x.com", "snippet": "",
+             "thread_id": "re-2", "internal_date_ms": 1_210_000_000_000},
+        ],
+    }
+    monkeypatch.setattr(tools_mod, "_fetch_gmail_evidence", lambda now: fake_ev)
+
+    parsed = json.loads(gmail_recent())
+    kinds = [t["kind"] for t in parsed["threads"]]
+    assert kinds == ["awaiting_reply", "starred", "recent", "recent"]
+    # thread_ids también respetan el orden.
+    tids = [t["thread_id"] for t in parsed["threads"]]
+    assert tids == ["aw-1", "st-1", "re-1", "re-2"]
+
+
+def test_gmail_recent_caps_at_12_total_threads(monkeypatch):
+    """El cap de 12 threads evita que una invocación con todos los
+    buckets a tope infle el CONTEXTO con >12 items."""
+    # 5 awaiting + 5 starred + 8 recent = 18 → cap a 12.
+    fake_ev = {
+        "unread_count": 0,
+        "awaiting_reply": [
+            {"subject": f"aw{i}", "from": "a@x.com", "snippet": "",
+             "days_old": 3.0, "thread_id": f"aw-{i}",
+             "internal_date_ms": 1_000_000_000_000 + i}
+            for i in range(5)
+        ],
+        "starred": [
+            {"subject": f"st{i}", "from": "b@x.com", "snippet": "",
+             "thread_id": f"st-{i}",
+             "internal_date_ms": 1_100_000_000_000 + i}
+            for i in range(5)
+        ],
+        "recent": [
+            {"subject": f"re{i}", "from": "c@x.com", "snippet": "",
+             "thread_id": f"re-{i}",
+             "internal_date_ms": 1_200_000_000_000 + i}
+            for i in range(8)
+        ],
+    }
+    monkeypatch.setattr(tools_mod, "_fetch_gmail_evidence", lambda now: fake_ev)
+
+    parsed = json.loads(gmail_recent())
+    assert len(parsed["threads"]) == 12
+    # Se cortó al llegar al cap — los primeros 5 awaiting + 5 starred +
+    # 2 recent completan los 12.
+    kinds = [t["kind"] for t in parsed["threads"]]
+    assert kinds == ["awaiting_reply"] * 5 + ["starred"] * 5 + ["recent"] * 2
+
+
 # ── 3. No-tool-calls path ──────────────────────────────────────────────────
 
 

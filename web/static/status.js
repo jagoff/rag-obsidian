@@ -524,6 +524,144 @@
     return Math.round(ms) + "ms";
   }
 
+  // ── Error budget card (real) ────────────────────────────────────────
+  // /api/status/errors devuelve total + by_source + breakdown top-N +
+  // delta vs 24h previas. Dibujamos el donut por proporción silent-vs-
+  // sql (los únicos 2 sources hoy), la lista top-N con un dot coloreado
+  // por source para lectura rápida.
+
+  const $errTotal = document.getElementById("err-total");
+  const $errSplit = document.getElementById("err-split");
+  const $errDelta = document.getElementById("err-delta");
+  const $errBreakdown = document.getElementById("err-breakdown");
+  const $errDonut = document.getElementById("err-donut");
+
+  async function fetchErrors() {
+    try {
+      const resp = await fetch("/api/status/errors", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderErrors(data);
+    } catch (e) {
+      console.error("[status] errors fetch failed", e);
+      if ($errTotal) $errTotal.textContent = "—";
+      if ($errDelta) {
+        $errDelta.textContent = "sin datos";
+      }
+    }
+  }
+
+  function renderErrors(payload) {
+    const total = payload.total_errors | 0;
+    const bySrc = payload.by_source || { silent: 0, sql: 0 };
+    const breakdown = Array.isArray(payload.breakdown) ? payload.breakdown : [];
+
+    // Big value + split subtitle.
+    $errTotal.textContent = total.toLocaleString("es-AR");
+    $errSplit.textContent = total === 0
+      ? "errores · sin actividad"
+      : `errores · ${bySrc.sql || 0} sql · ${bySrc.silent || 0} silent`;
+
+    // Delta: >+20% rojo, >+5% amarillo, negativo verde.
+    if (payload.delta_pct != null) {
+      const d = payload.delta_pct;
+      const arrow = d > 0 ? "↑" : d < 0 ? "↓" : "→";
+      const cls = d > 20 ? "bad" : d > 5 ? "worse" : d < -5 ? "better" : "neutral";
+      $errDelta.className = `insight-delta ${cls}`;
+      $errDelta.textContent = `${arrow} ${Math.abs(d).toFixed(1)}% vs 24h atrás`;
+      $errDelta.title = `Prev 24h: ${(payload.total_errors_prev_24h || 0).toLocaleString("es-AR")} errores`;
+    } else {
+      $errDelta.className = "insight-delta neutral";
+      $errDelta.textContent = "sin baseline";
+    }
+
+    drawErrorDonut($errDonut, total, bySrc);
+    renderErrorBreakdown($errBreakdown, breakdown);
+  }
+
+  // Dos arcos sobre una circunferencia (r=32, C≈201.06). El primero
+  // (sql, rojo) arranca desde las 12h; el segundo (silent, yellow)
+  // continúa. Si hay 0 errores, mostramos sólo el bg y un check-text.
+  function drawErrorDonut(svg, total, bySrc) {
+    if (!svg) return;
+    // Reset: remove any arc previously drawn (keep bg + center text
+    // templates if they exist).
+    svg.querySelectorAll(".donut-sql, .donut-silent, .donut-center").forEach((n) => n.remove());
+    const ns = "http://www.w3.org/2000/svg";
+    const r = 32;
+    const circumference = 2 * Math.PI * r;
+
+    if (total === 0) {
+      const t = document.createElementNS(ns, "text");
+      t.setAttribute("class", "donut-center");
+      t.setAttribute("x", 40);
+      t.setAttribute("y", 40);
+      t.setAttribute("fill", "var(--green)");
+      t.textContent = "0";
+      svg.appendChild(t);
+      return;
+    }
+
+    const sqlFrac = (bySrc.sql || 0) / total;
+    const silentFrac = (bySrc.silent || 0) / total;
+
+    // Arc #1: sql (red). Arranca desde -90° (12h).
+    if (sqlFrac > 0) {
+      const arc = document.createElementNS(ns, "circle");
+      arc.setAttribute("class", "donut-sql");
+      arc.setAttribute("cx", 40);
+      arc.setAttribute("cy", 40);
+      arc.setAttribute("r", r);
+      arc.setAttribute("stroke-dasharray", `${(circumference * sqlFrac).toFixed(2)} ${circumference.toFixed(2)}`);
+      arc.setAttribute("transform", "rotate(-90 40 40)");
+      svg.appendChild(arc);
+    }
+    // Arc #2: silent (yellow). Offset por la porción sql.
+    if (silentFrac > 0) {
+      const arc = document.createElementNS(ns, "circle");
+      arc.setAttribute("class", "donut-silent");
+      arc.setAttribute("cx", 40);
+      arc.setAttribute("cy", 40);
+      arc.setAttribute("r", r);
+      arc.setAttribute("stroke-dasharray", `${(circumference * silentFrac).toFixed(2)} ${circumference.toFixed(2)}`);
+      // dashoffset NEGATIVO corre el arc (direction del stroke sigue
+      // CCW en SVG sin transform extra).
+      arc.setAttribute("stroke-dashoffset", `${(-circumference * sqlFrac).toFixed(2)}`);
+      arc.setAttribute("transform", "rotate(-90 40 40)");
+      svg.appendChild(arc);
+    }
+
+    // Center text: total compacto (e.g. "1k", "1.2k").
+    const t = document.createElementNS(ns, "text");
+    t.setAttribute("class", "donut-center");
+    t.setAttribute("x", 40);
+    t.setAttribute("y", 40);
+    t.textContent = fmtCompact(total);
+    svg.appendChild(t);
+  }
+
+  function fmtCompact(n) {
+    if (n < 1000) return String(n);
+    if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+    return Math.round(n / 1000) + "k";
+  }
+
+  function renderErrorBreakdown(ul, items) {
+    if (!ul) return;
+    if (!items.length) {
+      ul.innerHTML = `<li><span class="cause" style="color:var(--green)">sin errores</span><span class="count">0</span></li>`;
+      return;
+    }
+    ul.innerHTML = items.slice(0, 7).map((it) => {
+      const srcCls = it.source === "sql" ? "src-sql"
+        : it.source === "silent" ? "src-silent"
+        : "src-mixed";
+      const keyEsc = escapeHTML(it.key);
+      const cnt = Number(it.count || 0).toLocaleString("es-AR");
+      return `<li><span class="cause" title="${keyEsc}"><span class="src-dot ${srcCls}"></span>${keyEsc}</span><span class="count">${cnt}</span></li>`;
+    }).join("");
+  }
+
   // ── Heatmap mock (PREVIEW) ──────────────────────────────────────────
   // Generate 7 rows × 24 cols de cuadraditos con un patrón semi-random
   // pero determinístico, para que el diseño se vea con datos verosímiles
@@ -572,17 +710,26 @@
   // Kick-off: primer fetch inmediato + loop + insights.
   tick(true);
   fetchLatency();
+  fetchErrors();
   buildHeatmapMock();
   startLoop();
 
-  // Ligar refresh manual para también refetchear latency (no dejar el
-  // sparkline stale si el user clickeó "refrescar" porque notó algo
-  // raro).
-  const _origRefresh = $refreshNow.onclick;
-  $refreshNow.addEventListener("click", () => fetchLatency());
+  // El refresh manual también refresca los insights reales, sin reset
+  // del mock heatmap (que es estático). Evita el user tener que pensar
+  // "¿qué está stale?" cuando clickea ↻.
+  $refreshNow.addEventListener("click", () => {
+    fetchLatency();
+    fetchErrors();
+  });
 
-  // Refetch del latency cada 60s (alineado con el cache TTL server-side).
+  // Loops separados alineados con los TTL server-side:
+  //   - latency: cache 60s → poll 60s
+  //   - errors:  cache 30s → poll 30s (los errores son "eventos", más
+  //     volátiles que la latencia agregada)
   setInterval(() => {
     if (!document.hidden) fetchLatency();
   }, 60000);
+  setInterval(() => {
+    if (!document.hidden) fetchErrors();
+  }, 30000);
 })();

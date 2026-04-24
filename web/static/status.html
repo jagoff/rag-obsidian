@@ -614,6 +614,25 @@
     .donut .donut-bg { fill: none; stroke: var(--border); stroke-width: 10; }
     .donut .donut-ok { fill: none; stroke: var(--green); stroke-width: 10; stroke-linecap: butt; }
     .donut .donut-err { fill: none; stroke: var(--red); stroke-width: 10; stroke-linecap: butt; }
+    /* Por fuente — el error-donut del /status usa estos 2 colores en
+       vez del ok/err binario para mostrar la proporción silent-vs-sql. */
+    .donut .donut-sql { fill: none; stroke: var(--red); stroke-width: 10; stroke-linecap: butt; }
+    .donut .donut-silent { fill: none; stroke: var(--yellow); stroke-width: 10; stroke-linecap: butt; }
+
+    /* Mini-dot coloreado dentro del breakdown list para identificar
+       source sin leer texto. Un dot chiquito a la izquierda de cada
+       `cause`. */
+    .insight-breakdown .src-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    .insight-breakdown .src-dot.src-sql { background: var(--red); }
+    .insight-breakdown .src-dot.src-silent { background: var(--yellow); }
+    .insight-breakdown .src-dot.src-mixed { background: var(--text-faint); }
     .donut-center {
       text-anchor: middle;
       dominant-baseline: central;
@@ -858,32 +877,28 @@
         </div>
       </article>
 
-      <!-- #2 Error-budget donut — PREVIEW (datos dummy) -->
-      <article class="insight-card insight-preview" aria-label="Error budget">
+      <!-- #2 Error-budget donut — REAL
+           Fuente: /api/status/errors (silent_errors.jsonl +
+           sql_state_errors.jsonl). El donut visualiza la proporción
+           silent vs sql de los errores (mixto-amarillo / sql-rojo),
+           el número grande es el total 24h + delta vs las 24h previas,
+           la lista muestra los top-N `where`/`event` por count. -->
+      <article class="insight-card" id="insight-errors" aria-label="Error budget">
         <div class="insight-head">
-          <h3>error budget · 24h</h3>
-          <span class="preview-badge">vista previa</span>
+          <h3>errores sistema · 24h</h3>
+          <span class="insight-meta" id="err-delta">—</span>
         </div>
         <div class="insight-donut-row">
-          <svg class="donut" viewBox="0 0 80 80" aria-hidden="true">
-            <!-- 99.2% OK dummy. C=2π*r con r=32 ≈ 201.06. -->
+          <svg class="donut" id="err-donut" viewBox="0 0 80 80" aria-hidden="true">
             <circle class="donut-bg" cx="40" cy="40" r="32"></circle>
-            <circle class="donut-ok" cx="40" cy="40" r="32"
-                    stroke-dasharray="199.5 201.06"
-                    stroke-dashoffset="0"
-                    transform="rotate(-90 40 40)"></circle>
-            <text class="donut-center" x="40" y="40">99.2%</text>
           </svg>
           <div>
             <div class="insight-big">
-              <span class="insight-big-value">12</span>
-              <span class="insight-big-unit">errores · 1,534 req</span>
+              <span class="insight-big-value" id="err-total">—</span>
+              <span class="insight-big-unit" id="err-split">errores</span>
             </div>
-            <ul class="insight-breakdown" style="margin-top:6px">
-              <li><span class="cause">ollama_timeout</span><span class="count">5</span></li>
-              <li><span class="cause">sql_lock</span><span class="count">3</span></li>
-              <li><span class="cause">sse_disconnect</span><span class="count">2</span></li>
-              <li><span class="cause">oauth_expired</span><span class="count">2</span></li>
+            <ul class="insight-breakdown" id="err-breakdown" style="margin-top:6px">
+              <li><span class="cause" style="color:var(--text-faint)">cargando…</span></li>
             </ul>
           </div>
         </div>
@@ -992,6 +1007,6 @@
     </div>
   </div>
 
-  <script src="/static/status.js?v=2026-04-24-insights" defer></script>
+  <script src="/static/status.js?v=2026-04-24-errors-card" defer></script>
 </body>
 </html>

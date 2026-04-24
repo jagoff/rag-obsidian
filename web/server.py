@@ -38,10 +38,12 @@ from rag import (  # noqa: E402
     CONTRADICTION_LOG_PATH,
     EVAL_LOG_PATH,
     LOG_PATH,
+    SILENT_ERRORS_LOG_PATH,
     _LOG_QUEUE,
     _LOOKUP_MODEL,
     _LOOKUP_NUM_CTX,
     RAG_STATE_SQL,
+    _SQL_STATE_ERROR_LOG,
     _enqueue_background_sql,
     _log_sql_state_error,
     _map_cpu_row,
@@ -8487,6 +8489,200 @@ def status_latency(nocache: int = 0) -> dict:
         with _LATENCY_CACHE_LOCK:
             _LATENCY_CACHE["payload"] = payload
             _LATENCY_CACHE["ts"] = now
+        return payload
+    return cached
+
+
+# ── /api/status/errors — error-budget para el donut del /status ──────
+# Feed el card #2 del insights grid. Lee los 2 jsonl de errores que el
+# rag.py ya mantiene:
+#
+#   ~/.local/share/obsidian-rag/silent_errors.jsonl
+#     — una línea por `except Exception: pass` migrado a `_silent_log`
+#       (contradict parse, reranker unload, OAuth refresh, wiki ingest,
+#       semantic cache, etc.). Schema: {ts, where, exc_type, exc}.
+#
+#   ~/.local/share/obsidian-rag/sql_state_errors.jsonl
+#     — una línea por fail de SQL write/read post-retry-budget (1756 en
+#       6 días en el audit de 2026-04-24, mayoritariamente `database is
+#       locked` por contention). Schema: {ts, event, err}.
+#
+# El rollup lógico vive también en rag.py/rag_stats (`_rollup`), pero
+# ahí está enterrado dentro de una función grande. Reimplementamos
+# acá en ~15 líneas para no forzar un refactor en rag.py.
+#
+# Presupuesto: scan lineal de ambos files (~50-200 MB combinados en
+# prod típico). Cacheado 30s — los errores son "eventos", no continuos,
+# y 30s de latencia en la dashboard está bien. La lectura usa un cutoff
+# por `ts` ISO parsing; líneas malformed se skipean tolerantes.
+#
+# Schema del payload:
+#   {
+#     "window_hours": 24,
+#     "total_errors": 458,
+#     "by_source": {"silent": 120, "sql": 338},
+#     "breakdown": [                    # top-N con count desc
+#       {"key": "contradictions_sql_read_failed", "count": 289, "source": "sql"},
+#       ...
+#     ],
+#     "total_errors_prev_24h": 312,      # 24-48h atrás — para delta
+#     "delta_pct": 46.8,                  # vs prev_24h
+#   }
+
+_ERRORS_CACHE_TTL = 30.0
+_ERRORS_CACHE: dict = {"ts": 0.0, "payload": None}
+_ERRORS_CACHE_LOCK = threading.Lock()
+
+# Cuántos `where/event` distintos mostramos en la breakdown antes de
+# colapsar el resto en `other`. 6 es el sweet spot — entra en la card
+# sin scroll y cubre el 90% de los errores típicos según el audit.
+_ERRORS_BREAKDOWN_TOP_N = 6
+
+
+def _rollup_error_log(path: Path, key_field: str, source: str,
+                      cutoff: datetime, upper: datetime | None = None,
+                      ) -> tuple[int, dict[str, int]]:
+    """Read a JSONL error log (silent_errors / sql_state_errors) and
+    roll up by `key_field` for entries whose `ts` is in [cutoff, upper).
+
+    Returns (total_count, {key: count, ...}).
+    Tolerant: missing ts / malformed JSON / missing key_field are skipped
+    silently — these are best-effort diagnostic logs, not auditable.
+    """
+    total = 0
+    counts: dict[str, int] = {}
+    if not path.is_file():
+        return total, counts
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ts = rec.get("ts")
+                if not ts:
+                    continue
+                try:
+                    rec_dt = datetime.fromisoformat(ts.rstrip("Z"))
+                except Exception:
+                    continue
+                if rec_dt < cutoff:
+                    continue
+                if upper is not None and rec_dt >= upper:
+                    continue
+                key = rec.get(key_field) or "(unknown)"
+                counts[key] = counts.get(key, 0) + 1
+                total += 1
+    except Exception as e:
+        print(f"[status_errors] warn: rollup of {path.name} failed: {type(e).__name__}: {e}", flush=True)
+    return total, counts
+
+
+def _status_errors_build_payload() -> dict:
+    """Build the error-budget payload for /api/status/errors.
+
+    Two passes per log file: current 24h window + prev 24h window (for
+    the delta vs yesterday). The prev window is best-effort — if the
+    files were rotated recently, we return 0 and the frontend shows
+    `sin baseline` in the delta slot.
+    """
+    now = datetime.now()
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_48h = now - timedelta(hours=48)
+
+    payload: dict = {
+        "window_hours": 24,
+        "total_errors": 0,
+        "by_source": {"silent": 0, "sql": 0},
+        "breakdown": [],
+        "total_errors_prev_24h": 0,
+        "delta_pct": None,
+    }
+
+    try:
+        # Current window: last 24h.
+        silent_total, silent_counts = _rollup_error_log(
+            SILENT_ERRORS_LOG_PATH, "where", "silent", cutoff_24h,
+        )
+        sql_total, sql_counts = _rollup_error_log(
+            _SQL_STATE_ERROR_LOG, "event", "sql", cutoff_24h,
+        )
+
+        # Previous window: 24-48h ago. Mismo rollup con ventana desplazada.
+        silent_prev, _ = _rollup_error_log(
+            SILENT_ERRORS_LOG_PATH, "where", "silent", cutoff_48h, cutoff_24h,
+        )
+        sql_prev, _ = _rollup_error_log(
+            _SQL_STATE_ERROR_LOG, "event", "sql", cutoff_48h, cutoff_24h,
+        )
+
+        payload["total_errors"] = silent_total + sql_total
+        payload["by_source"] = {"silent": silent_total, "sql": sql_total}
+        payload["total_errors_prev_24h"] = silent_prev + sql_prev
+
+        # Merge both dicts into a single (key, count, source) list, sort
+        # by count desc, slice top-N, collapse the rest into `other`.
+        merged: list[tuple[str, int, str]] = []
+        for key, count in silent_counts.items():
+            merged.append((key, count, "silent"))
+        for key, count in sql_counts.items():
+            merged.append((key, count, "sql"))
+        merged.sort(key=lambda t: t[1], reverse=True)
+
+        top = merged[:_ERRORS_BREAKDOWN_TOP_N]
+        rest = merged[_ERRORS_BREAKDOWN_TOP_N:]
+        breakdown: list[dict] = [
+            {"key": k, "count": c, "source": s} for (k, c, s) in top
+        ]
+        if rest:
+            breakdown.append({
+                "key": "(other)",
+                "count": sum(c for _k, c, _s in rest),
+                "source": "mixed",
+            })
+        payload["breakdown"] = breakdown
+
+        # Delta vs prev 24h. Guard contra división por cero cuando prev=0
+        # (nuevo sistema o log rotado): reportamos None en vez de inf.
+        if payload["total_errors_prev_24h"] > 0:
+            delta = (
+                (payload["total_errors"] - payload["total_errors_prev_24h"])
+                / payload["total_errors_prev_24h"]
+                * 100.0
+            )
+            payload["delta_pct"] = round(delta, 1)
+    except Exception as e:
+        print(f"[status_errors] warn: build failed: {type(e).__name__}: {e}", flush=True)
+
+    return payload
+
+
+@app.get("/api/status/errors")
+def status_errors(nocache: int = 0) -> dict:
+    """Error-budget de las últimas 24h: total + breakdown top-N por
+    `where`/`event` + delta vs las 24h previas. Drives el donut card
+    del /status. Cacheado 30s; ?nocache=1 fuerza refresh.
+
+    Fuentes: silent_errors.jsonl (swallowed exceptions) + sql_state_
+    errors.jsonl (SQL write/read fails post-retry-budget). No cubre
+    /api/chat error rate directo — esas fallas típicamente no logean
+    una row en rag_queries, así que no tenemos denominador limpio de
+    "requests". Mostramos counts absolutos + delta vs ayer, que es
+    honesto y alineado con cómo vive la telemetría hoy.
+    """
+    now = time.monotonic()
+    with _ERRORS_CACHE_LOCK:
+        cached = _ERRORS_CACHE["payload"]
+        fresh = (now - _ERRORS_CACHE["ts"]) < _ERRORS_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _status_errors_build_payload()
+        with _ERRORS_CACHE_LOCK:
+            _ERRORS_CACHE["payload"] = payload
+            _ERRORS_CACHE["ts"] = now
         return payload
     return cached
 

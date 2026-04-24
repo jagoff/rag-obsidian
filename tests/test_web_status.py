@@ -216,17 +216,185 @@ def test_api_latency_handles_empty_db_gracefully(tmp_path, monkeypatch):
 
 def test_status_page_has_insights_section():
     """El HTML tiene la sección insights con las 5 cards + badges de
-    vista previa en 4 de ellas (las 4 que aún no están implementadas).
+    vista previa en las cards aún no implementadas.
     Si alguien mueve/borra esto, la validación del layout se pierde."""
     body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
     assert 'id="insights"' in body
     assert 'id="insight-latency"' in body
     assert 'id="lat-sparkline"' in body
     assert 'id="lat-p95-1h"' in body
-    # 4 preview badges (una por card mockup).
-    assert body.count('preview-badge') >= 4
-    # Heatmap placeholder (mock #5).
+    # Card #2 (errors) ya no es preview — tiene su propio id + elementos.
+    assert 'id="insight-errors"' in body
+    assert 'id="err-total"' in body
+    assert 'id="err-donut"' in body
+    assert 'id="err-breakdown"' in body
+    # 3 preview badges restantes (freshness + log-tail + heatmap uptime).
+    # Buscamos la clase aplicada en el markup (<span class="preview-badge">)
+    # para no contar la definición CSS inline.
+    assert body.count('class="preview-badge"') == 3
     assert 'id="heatmap-mock"' in body
+
+
+# ── /api/status/errors — error-budget endpoint ──────────────────────
+# Usa los jsonl que rag.py ya mantiene (silent_errors + sql_state_errors).
+# Tests escriben fixtures temporales y verifican rollup + delta.
+
+def _write_jsonl_errors(path, entries):
+    """Helper: escribir `entries` (lista de dict) como jsonl en path."""
+    import json as _json
+    lines = [_json.dumps(e, ensure_ascii=False) + "\n" for e in entries]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def test_api_errors_payload_shape():
+    """GET /api/status/errors devuelve los campos del contract."""
+    resp = _client.get("/api/status/errors?nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    for k in ("window_hours", "total_errors", "by_source", "breakdown",
+              "total_errors_prev_24h", "delta_pct"):
+        assert k in d, f"falta {k!r}"
+    assert d["window_hours"] == 24
+    assert isinstance(d["breakdown"], list)
+    assert "silent" in d["by_source"]
+    assert "sql" in d["by_source"]
+
+
+def test_api_errors_rollup_with_synthetic_logs(tmp_path, monkeypatch):
+    """Escribir entries sintéticas a los 2 jsonl y verificar que el
+    rollup agrupa + cuenta + ordena correctamente. Cubre también:
+      - Filtro por ventana 24h (entry más vieja se excluye)
+      - Top-N (pedimos más de N entries distintas para forzar (other))
+      - by_source por cada jsonl
+    """
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+
+    now = datetime.now()
+    recent = now - timedelta(hours=2)
+    old = now - timedelta(hours=30)  # fuera de la ventana 24h
+
+    # 3× `reranker_unload` + 2× `google_token_refresh` + 1× `old_bug`
+    # (old_bug fuera de ventana, se descarta)
+    _write_jsonl_errors(silent_log, [
+        {"ts": recent.isoformat(timespec="seconds"), "where": "reranker_unload", "exc_type": "X", "exc": "x"},
+        {"ts": recent.isoformat(timespec="seconds"), "where": "reranker_unload", "exc_type": "X", "exc": "x"},
+        {"ts": recent.isoformat(timespec="seconds"), "where": "reranker_unload", "exc_type": "X", "exc": "x"},
+        {"ts": recent.isoformat(timespec="seconds"), "where": "google_token_refresh", "exc_type": "X", "exc": "x"},
+        {"ts": recent.isoformat(timespec="seconds"), "where": "google_token_refresh", "exc_type": "X", "exc": "x"},
+        {"ts": old.isoformat(timespec="seconds"), "where": "old_bug", "exc_type": "X", "exc": "x"},
+    ])
+    # 10× `queries_sql_write_failed` (el top)
+    _write_jsonl_errors(sql_log, [
+        {"ts": recent.isoformat(timespec="seconds"), "event": "queries_sql_write_failed", "err": "x"}
+        for _ in range(10)
+    ])
+
+    # Invalidar el cache module-level porque tests anteriores llenaron
+    # con el DB real; pedir fresh.
+    with _server._ERRORS_CACHE_LOCK:
+        _server._ERRORS_CACHE["ts"] = 0.0
+        _server._ERRORS_CACHE["payload"] = None
+
+    payload = _server._status_errors_build_payload()
+    # 5 silent (3 reranker + 2 google, el old se excluye) + 10 sql = 15.
+    assert payload["total_errors"] == 15
+    assert payload["by_source"] == {"silent": 5, "sql": 10}
+    # Breakdown ordenado por count desc: queries_sql (10) > reranker (3) > google (2).
+    assert payload["breakdown"][0]["key"] == "queries_sql_write_failed"
+    assert payload["breakdown"][0]["count"] == 10
+    assert payload["breakdown"][0]["source"] == "sql"
+    assert payload["breakdown"][1]["key"] == "reranker_unload"
+    assert payload["breakdown"][1]["count"] == 3
+    assert payload["breakdown"][1]["source"] == "silent"
+    assert payload["breakdown"][2]["key"] == "google_token_refresh"
+    assert payload["breakdown"][2]["count"] == 2
+
+
+def test_api_errors_delta_vs_prev_window(tmp_path, monkeypatch):
+    """Delta vs las 24h previas se computa cuando hay entries en
+    [now-48h, now-24h). Sin entries previas → delta_pct=None, nunca
+    inf por división por cero."""
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+
+    now = datetime.now()
+    recent = now - timedelta(hours=2)
+    prev = now - timedelta(hours=30)  # en la ventana [24h, 48h)
+
+    # 20 errores hoy, 10 ayer → delta = +100%
+    _write_jsonl_errors(silent_log, [
+        {"ts": recent.isoformat(timespec="seconds"), "where": "x", "exc_type": "X", "exc": "x"}
+        for _ in range(20)
+    ] + [
+        {"ts": prev.isoformat(timespec="seconds"), "where": "x", "exc_type": "X", "exc": "x"}
+        for _ in range(10)
+    ])
+    sql_log.write_text("", encoding="utf-8")  # empty
+
+    with _server._ERRORS_CACHE_LOCK:
+        _server._ERRORS_CACHE["ts"] = 0.0
+        _server._ERRORS_CACHE["payload"] = None
+    payload = _server._status_errors_build_payload()
+    assert payload["total_errors"] == 20
+    assert payload["total_errors_prev_24h"] == 10
+    assert payload["delta_pct"] == 100.0
+
+
+def test_api_errors_no_logs_returns_empty_gracefully(tmp_path, monkeypatch):
+    """Sin jsonl files (install fresh / logs rotados), el endpoint
+    devuelve 0 + breakdown=[] sin 500ear."""
+    missing_silent = tmp_path / "does-not-exist-silent.jsonl"
+    missing_sql = tmp_path / "does-not-exist-sql.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", missing_silent)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", missing_sql)
+
+    with _server._ERRORS_CACHE_LOCK:
+        _server._ERRORS_CACHE["ts"] = 0.0
+        _server._ERRORS_CACHE["payload"] = None
+    payload = _server._status_errors_build_payload()
+    assert payload["total_errors"] == 0
+    assert payload["breakdown"] == []
+    assert payload["delta_pct"] is None
+
+
+def test_api_errors_top_n_collapses_rest_to_other(tmp_path, monkeypatch):
+    """Cuando hay más de 6 where/event distintos, el 7º en adelante se
+    agrega en el bucket `(other)` para que la UI no overflow."""
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+
+    now = datetime.now()
+    recent = now - timedelta(hours=1)
+    # 10 where distintos, todos con count=1 (orden ascendente
+    # alfabético tie-break por el sort).
+    entries = [
+        {"ts": recent.isoformat(timespec="seconds"), "where": f"w{i:02d}", "exc_type": "X", "exc": "x"}
+        for i in range(10)
+    ]
+    _write_jsonl_errors(silent_log, entries)
+    sql_log.write_text("", encoding="utf-8")
+
+    with _server._ERRORS_CACHE_LOCK:
+        _server._ERRORS_CACHE["ts"] = 0.0
+        _server._ERRORS_CACHE["payload"] = None
+    payload = _server._status_errors_build_payload()
+    # 6 top + 1 (other) = 7 items en breakdown.
+    assert len(payload["breakdown"]) == 7
+    other = payload["breakdown"][-1]
+    assert other["key"] == "(other)"
+    # 10 total - 6 top = 4 en other.
+    assert other["count"] == 4
+    assert other["source"] == "mixed"
 
 
 # ── Grading helpers ──────────────────────────────────────────────────

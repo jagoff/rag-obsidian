@@ -31278,22 +31278,27 @@ def _fetch_gmail_evidence(now: datetime) -> dict:
     except Exception as exc:
         _silent_log('gmail_followup_list', exc)
 
-    # Recent inbox — los últimos 8 hilos del inbox sin filtrar por flag.
-    # Es el bucket que responde "cuales son mis ultimos mails?" cuando el
-    # user no tiene nada starred ni awaiting (inbox-zero workflow típico).
-    # Mantenemos la query acotada con `newer_than:30d` para que el scan no
-    # se vaya de un mes: si el user no tocó Gmail en un mes, los 8 más
-    # viejos no son "últimos" en el sentido útil. Excluimos promotions /
-    # social / updates / forums por el mismo motivo que awaiting (el user
-    # considera "mails reales" los que no caen en esas subcategorías —
-    # Gmail los separa por diseño). Si eventualmente pide "últimas newsletters"
-    # o similar, agregamos otro bucket.
+    # Recent inbox — los últimos 8 hilos del inbox sin filtrar por flag y
+    # SIN exclusiones de categoría. Es el bucket que responde literal
+    # "cuales son mis ultimos mails?" — el user quiere ver todo lo que el
+    # Gmail le muestra en la pantalla de inbox, no una vista filtrada.
+    #
+    # 2026-04-24 iter 6 (Fer F. user decision): antes excluíamos
+    # promotions/social/updates/forums (heredado del morning brief donde
+    # esconder newsletters + GitHub notifications hace sentido). Pero
+    # para "últimos mails" el user quiere literal los 8 más recientes
+    # del inbox tal cual Gmail los ordena. `category:updates` en particular
+    # atrapa GitHub notifications, Stripe receipts, Anthropic updates —
+    # todo "mail real" para un dev. Si eventualmente se siente ruidoso
+    # (promotions puras de Mercadolibre), rollback poniendo
+    # `-category:promotions` nuevamente. Rollback parcial no pasa tests
+    # nuevos porque los fake_ev no filtran por esas labels.
+    #
+    # Mantenemos `newer_than:30d` para acotar el scan: si el user no
+    # tocó Gmail en un mes, los 8 más viejos no son "últimos" en el
+    # sentido útil.
     try:
-        q_recent = (
-            "in:inbox newer_than:30d "
-            "-category:promotions -category:social "
-            "-category:updates -category:forums"
-        )
+        q_recent = "in:inbox newer_than:30d"
         r = svc.users().threads().list(
             userId="me", q=q_recent, maxResults=8,
         ).execute()

@@ -5005,6 +5005,50 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             ")",
         ),
     ),
+    (
+        # Cita-from-image audit trail (2026-04-23). Every time OCR text is
+        # evaluated by `_detect_cita_from_ocr` we record the outcome here.
+        # Primary key = sha256 of the normalized OCR text (whitespace-
+        # collapsed, lowercased, first 16 hex chars) so multiple callers
+        # (indexer, `rag capture --image`, `rag scan-citas`, WhatsApp media
+        # hook, chat-caption regex) see the same row and dedup transparently:
+        # the same screenshot passed through any path creates at most one
+        # event.
+        #
+        # Rows with `decision='cita'` carry the Calendar event UID returned
+        # by `_create_calendar_event` so a later undo or re-scan can reason
+        # about state. Rows with `decision='no'` or `'low_confidence'` also
+        # get persisted — that way re-running `rag scan-citas` over a
+        # processed folder skips the helper call for non-citas, saving
+        # ~300-500ms per image on subsequent runs.
+        #
+        # Sin TTL. Si el user borra el evento manualmente, el sidecar no se
+        # sincroniza — preferimos un no-op "ya lo procesamos" sobre crear un
+        # segundo evento igual. Cleanup manual via `rag maintenance` en una
+        # iteración futura si se llena (no expected: ~1KB por row).
+        #
+        # `propose_calendar_event` aparte tiene su propio dedup contra el
+        # calendario real (`_find_duplicate_calendar_event`). Esta tabla
+        # cubre el caso pre-propose: dos rutas distintas al MISMO OCR text
+        # no deben gastar dos helper calls + dos proposals.
+        "rag_cita_detections",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_cita_detections ("
+            " ocr_hash TEXT PRIMARY KEY,"
+            " image_path TEXT,"
+            " source TEXT NOT NULL,"
+            " decision TEXT NOT NULL,"
+            " title TEXT,"
+            " start_text TEXT,"
+            " location TEXT,"
+            " confidence REAL,"
+            " event_uid TEXT,"
+            " created_at REAL NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_cita_detections_source ON rag_cita_detections(source)",
+            "CREATE INDEX IF NOT EXISTS ix_cita_detections_created ON rag_cita_detections(created_at)",
+        ),
+    ),
 )
 
 
@@ -5221,7 +5265,7 @@ def _is_transient_sql_error(exc: Exception) -> bool:
     return any(tok in msg for tok in _TRANSIENT_SQL_ERROR_TOKENS)
 
 
-def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> None:
+def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 8) -> None:
     """Run a SQL-write closure with transient-error retry + silent-fail logging.
 
     Pre-2026-04-21 every rag_* writer (`log_query_event`, `log_behavior_event`,
@@ -5237,12 +5281,21 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> Non
     **2026-04-22 tuning**: defaults bumped to attempts=5 and backoff range
     0.15–0.5s after an audit found ~115 `queries_sql_write_failed` +
     34 `behavior_sql_write_failed` + 46 `memory_sql_write_failed` events
-    over one day despite the retry wrapper being wired. Hypothesis (post-
-    split): the old 3×(0.1–0.35s) = ~0.75s total budget was still inside
-    the contention window of a concurrent bulk write + helper-embed. 5×
-    attempts at 0.15–0.5s → ~1.3s total retry budget, enough to outwait
-    a typical WAL-checkpoint stall without blowing up latency for the
-    non-contended happy path.
+    over one day despite the retry wrapper being wired. 5× attempts at
+    0.15–0.5s → ~1.3s total retry budget.
+
+    **2026-04-23 tuning**: defaults bumped again attempts=5→8, backoff
+    jitter max 0.5→0.6s (budget ~4s pero sub-2s en el caso común de 2-3
+    attempts). Audit del sql_state_errors.jsonl seguía mostrando 258
+    `queries_sql_write_failed` en las últimas 2 semanas — el budget de
+    1.3s era insuficiente cuando el queries writer + memory/cpu samplers
+    + feedback_golden refresh se alineaban (3+ writers concurrentes).
+    4s matchea el `_persist_with_sqlite_retry` de web/server.py post-fix
+    + mantiene el mismo criterio metodológico ("tolerar WAL checkpoint
+    stall sin bloquear indefinidamente"). Hot-path callers que no pueden
+    tolerar 4s de delay bajo contention deben pasar `attempts=3`
+    explícito (ej. semantic_cache_store con `background=True` — el store
+    espera en off-thread, así que más retry es fine).
 
     **2026-04-22 expansion**: reintentamos también `disk I/O error` (antes
     caía al primer intento). 47/56 ocurrencias en un día eran fsync
@@ -5265,7 +5318,7 @@ def _sql_write_with_retry(write_fn, error_tag: str, *, attempts: int = 5) -> Non
             if not _is_transient_sql_error(exc) or attempt == attempts - 1:
                 _log_sql_state_error(error_tag, err=repr(exc))
                 return
-            _t.sleep(0.15 + _r.random() * 0.35)
+            _t.sleep(0.15 + _r.random() * 0.45)
         except Exception as exc:
             _log_sql_state_error(error_tag, err=repr(exc))
             return
@@ -18976,6 +19029,17 @@ def _enrich_body_with_ocr(
         except ValueError:
             rel_marker = img.name
         parts.append(f"\n\n<!-- OCR: {rel_marker} -->\n{text}")
+        # Cita-from-image detector hook. Corre DESPUÉS del append para
+        # que el body enrichment siempre gane — si el detector crashea o
+        # el helper está caído, el OCR sigue llegando al chunker tal cual.
+        # Silent-fail triple: la función ya es silent, pero envolvemos en
+        # try/except por las dudas. El sidecar `rag_cita_detections`
+        # dedupe across reindex runs, así que llamar en cada index pass
+        # no cuesta más que 1 sqlite hit por imagen ya procesada.
+        try:
+            _maybe_create_cita_from_ocr(text, img, source="index")
+        except Exception as exc:
+            _silent_log(f"cita_detect_enrich:{img}", exc)
     return "".join(parts)
 
 
@@ -19000,6 +19064,348 @@ def _file_hash_with_images(raw: str, note_path: Path, vault_root: Path) -> str:
         except OSError:
             sig_parts.append(f"{p}:missing")
     return file_hash("\n".join(sig_parts))
+
+
+# ── Cita-from-image detector ────────────────────────────────────────────────
+#
+# El OCR extrae texto de imágenes embebidas (Apple Vision, ver `_ocr_image`).
+# Esa misma rama ahora se extiende: si el texto parece una cita / turno /
+# evento, el helper qwen2.5:3b lo parsea a `{title, start, location}` y
+# dispara `propose_calendar_event` — que ya tiene auto all-day, parse NL
+# de fechas, dedup contra Calendar.app y osascript write.
+#
+# Triple salvaguarda contra dupes:
+#   1. Sidecar `rag_cita_detections` keyed por `sha256(normalized_ocr)[:16]` —
+#      impide dos llamadas al helper para el mismo texto, aunque llegue por
+#      rutas distintas (indexer, `rag capture --image`, `rag scan-citas`,
+#      WhatsApp hook).
+#   2. `_find_duplicate_calendar_event` adentro de `propose_calendar_event`
+#      (segunda capa a nivel calendar real).
+#   3. Confidence floor `_CITA_MIN_CONFIDENCE` descarta casos borderline.
+#
+# Silent-fail en todos los niveles: fallo de OCR, helper timeout, JSON
+# malformado, sqlite lock, osascript error — ninguno propaga. El indexer y
+# los ingesters siguen funcionando sin citas nuevas.
+#
+# Rollback: `export RAG_CITA_DETECT=0`. Con eso `_detect_cita_from_ocr`
+# devuelve None de una (sin helper call) y `_maybe_create_cita_from_ocr`
+# se vuelve no-op. OCR body enrichment sigue igual — es feature ortogonal.
+
+# Umbral de confianza auto-create. qwen2.5:3b con temp=0 + seed=42 devuelve
+# scores consistentes; 0.70 filtra ambigüedades ("me viste el video de
+# Messi martes pasado" no es cita) pero pasa casos reales ("turno dentista
+# miércoles 15hs consultorio Palermo" → 0.9+). Override por `rag scan-citas
+# --min-confidence 0.5` para barridos agresivos.
+_CITA_MIN_CONFIDENCE = 0.70
+
+# OCR más corto que esto no tiene suficiente señal (ej. screenshot de un
+# botón con "OK"). Skipeamos sin gastar helper call.
+_CITA_MIN_CHARS = 20
+
+
+def _cita_detect_enabled() -> bool:
+    """True salvo `RAG_CITA_DETECT=0/false/no` explícito. Default ON."""
+    val = os.environ.get("RAG_CITA_DETECT", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _normalize_ocr_for_hash(ocr_text: str) -> str:
+    """Lowercase + whitespace-collapsed para que dos OCR passes sobre la
+    misma imagen colisionen en el hash aunque ocrmac produzca orden de
+    palabras distinto entre runs (raro, pero posible con tablas).
+    """
+    return " ".join((ocr_text or "").lower().split())
+
+
+def _ocr_hash_key(ocr_text: str) -> str:
+    """SHA256 (primeros 16 hex chars) del texto normalizado. PRIMARY KEY de
+    `rag_cita_detections`. 16 chars = 64 bits, colisión accidental ~irreal
+    para la cardinalidad esperada (≤ miles de imágenes por user).
+    """
+    norm = _normalize_ocr_for_hash(ocr_text)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+_CITA_PROMPT_SYSTEM = (
+    "Sos un extractor de citas / turnos / eventos a partir de texto OCR "
+    "crudo. El texto viene de una imagen — puede tener errores de "
+    "reconocimiento (acentos perdidos, palabras cortadas, líneas "
+    "mezcladas, chrome de app). Tu único trabajo es decidir si el texto "
+    "describe UN evento con fecha / hora a agendar, y extraer los datos."
+)
+
+_CITA_PROMPT_USER_TEMPLATE = (
+    "Texto OCR de la imagen (puede estar ruidoso):\n"
+    "<OCR>\n{ocr}\n</OCR>\n\n"
+    "Devolvé JSON estricto, sin preámbulos, con estas llaves:\n"
+    "  is_cita (bool): true solo si hay evento con fecha o día identificable.\n"
+    "  title (str): título corto y descriptivo del evento (p.ej. 'Turno "
+    "Dr. García', 'Cumple de Flor', 'Entrevista Moka'). Si el texto no "
+    "nombra persona/servicio, usá el tipo ('cita médica', 'reunión', "
+    "'turno'). Máximo 80 caracteres.\n"
+    "  start (str): fecha/hora tal cual aparece en el texto, en lenguaje "
+    "natural — pasale lo que el dateparser entiende: 'martes 15hs', "
+    "'15/05 10:00', 'mañana 14hs', 'el viernes', '26 de mayo'. NO "
+    "inventes horario si no está en el texto.\n"
+    "  location (str): dirección, consultorio, link de Zoom, nombre del "
+    "lugar si aparece. '' si no hay.\n"
+    "  confidence (float 0.0–1.0): qué tan seguro estás. Alto (≥0.8) si "
+    "hay marcadores claros (palabra 'turno'/'cita'/'appointment' + fecha "
+    "+ hora). Medio (0.5–0.8) si falta uno. Bajo (<0.5) si es ambiguo.\n\n"
+    "Si NO es una cita (meme, código, conversación sin fecha concreta, "
+    "screenshot de UI), devolvé {{\"is_cita\": false, \"title\": \"\", "
+    "\"start\": \"\", \"location\": \"\", \"confidence\": 0.0}}.\n\n"
+    "IMPORTANTE: solo UN evento por respuesta. Si el texto tiene varios "
+    "turnos, agarrá el más próximo en el tiempo."
+)
+
+
+def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
+    """Helper call qwen2.5:3b con format=json: ¿este texto OCR es una cita?
+
+    Returns:
+      - dict con shape `{is_cita, title, start, location, confidence}` —
+        normalizado y validado. NUNCA raise.
+      - None si: `RAG_CITA_DETECT=0`, ocr_text vacío o muy corto, helper
+        timeout / unreachable, JSON malformado, shape inválida.
+
+    Callers deben chequear `None` + `is_cita=True` + `confidence >=
+    threshold` antes de crear evento — el helper a veces devuelve
+    `is_cita=True` con `confidence=0.3`, lo cual es una "no-cita con
+    dudas" que no queremos auto-agendar.
+    """
+    if not _cita_detect_enabled():
+        return None
+    text = (ocr_text or "").strip()
+    if len(text) < _CITA_MIN_CHARS:
+        return None
+    # Cap para controlar el prompt size — 1500 chars cubre el 99% de
+    # screenshots reales (una invitación de cumpleaños rara vez tiene
+    # más texto). Cortar el final es OK: el título / fecha suele estar
+    # al principio del OCR (Apple Vision scanea top→bottom, left→right).
+    capped = text[:1500]
+    prompt = _CITA_PROMPT_USER_TEMPLATE.format(ocr=capped)
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[
+                {"role": "system", "content": _CITA_PROMPT_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            options={**HELPER_OPTIONS, "num_predict": 160, "num_ctx": 2048},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            format="json",
+        )
+        raw = resp.message.content.strip()
+        data = json.loads(raw)
+    except Exception as exc:
+        _silent_log("cita_detect_helper", exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Normalización defensiva — el helper a veces devuelve tipos inesperados
+    # (ej. confidence como string "0.8" o is_cita como 1/0). Convertimos
+    # con tolerancia y clampeamos el float al rango válido.
+    try:
+        is_cita = bool(data.get("is_cita"))
+        title = str(data.get("title") or "").strip()[:120]
+        start = str(data.get("start") or "").strip()[:200]
+        location = str(data.get("location") or "").strip()[:200]
+        conf_raw = data.get("confidence")
+        if isinstance(conf_raw, str):
+            try:
+                conf_raw = float(conf_raw)
+            except ValueError:
+                conf_raw = 0.0
+        confidence = float(conf_raw or 0.0)
+        confidence = max(0.0, min(1.0, confidence))
+    except Exception as exc:
+        _silent_log("cita_detect_normalize", exc)
+        return None
+    return {
+        "is_cita": is_cita,
+        "title": title,
+        "start": start,
+        "location": location,
+        "confidence": confidence,
+    }
+
+
+def _maybe_create_cita_from_ocr(
+    ocr_text: str,
+    image_path: Path,
+    source: str,
+    *,
+    min_confidence: float | None = None,
+) -> dict | None:
+    """Pipeline OCR→detector→event + sidecar dedup (silent-fail).
+
+    Flujo:
+      1. `RAG_CITA_DETECT=0`? → None.
+      2. Hash normalizado del OCR → ya existe en `rag_cita_detections`?
+         → devolver el row anterior sin re-invocar helper / calendar.
+      3. `_detect_cita_from_ocr(ocr_text)` — si None o `is_cita=False` o
+         confidence < threshold → persist "no" / "low_confidence" y return.
+      4. `propose_calendar_event(title, start, location=...)` — si devolvió
+         error o needs_clarification → persist "ambiguous" sin evento.
+      5. Evento creado → persist "cita" con `event_uid` y devolver dict.
+
+    `source` arg se propaga al sidecar para auditoría ("index" / "capture"
+    / "scan-citas" / "whatsapp" / "watch"). `min_confidence` override local
+    cuando el caller es `rag scan-citas --min-confidence 0.5`.
+
+    NUNCA raise — cada paso tiene try/except silent-log.
+    """
+    if not _cita_detect_enabled():
+        return None
+    text = (ocr_text or "").strip()
+    if len(text) < _CITA_MIN_CHARS:
+        return None
+    threshold = (
+        float(min_confidence) if min_confidence is not None else _CITA_MIN_CONFIDENCE
+    )
+    key = _ocr_hash_key(text)
+    img_str = str(image_path) if image_path else ""
+
+    # Step 1: dedup lookup. Si ya lo procesamos antes, short-circuit.
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT decision, title, start_text, location, confidence, "
+                "event_uid, created_at FROM rag_cita_detections WHERE ocr_hash = ?",
+                (key,),
+            ).fetchone()
+    except Exception as exc:
+        _silent_log("cita_sidecar_read", exc)
+        row = None
+    if row is not None:
+        return {
+            "cached": True,
+            "decision": row[0],
+            "title": row[1],
+            "start": row[2],
+            "location": row[3],
+            "confidence": row[4],
+            "event_uid": row[5],
+            "created_at": row[6],
+        }
+
+    # Step 2: run detector.
+    detected = _detect_cita_from_ocr(text)
+    if detected is None:
+        # Helper unavailable / malformed — NO persist. Reintentamos next run.
+        return None
+
+    now_ts = time.time()
+
+    # Step 3: below-threshold or non-cita — persist "no" so dedup wins next time.
+    if not detected.get("is_cita") or detected.get("confidence", 0.0) < threshold:
+        decision = "low_confidence" if detected.get("is_cita") else "no"
+        _persist_cita_detection(
+            ocr_hash=key, image_path=img_str, source=source, decision=decision,
+            title=detected.get("title", ""), start_text=detected.get("start", ""),
+            location=detected.get("location", ""),
+            confidence=detected.get("confidence", 0.0),
+            event_uid=None, created_at=now_ts,
+        )
+        return {
+            "cached": False,
+            "decision": decision,
+            "title": detected.get("title", ""),
+            "start": detected.get("start", ""),
+            "location": detected.get("location", ""),
+            "confidence": detected.get("confidence", 0.0),
+            "event_uid": None,
+        }
+
+    title = detected.get("title") or "Cita"
+    start_text = detected.get("start") or ""
+    location = detected.get("location") or None
+    confidence = detected.get("confidence", 0.0)
+
+    if not start_text:
+        # is_cita=True pero sin fecha parseable — no creamos ciegamente.
+        _persist_cita_detection(
+            ocr_hash=key, image_path=img_str, source=source, decision="ambiguous",
+            title=title, start_text=start_text, location=location or "",
+            confidence=confidence, event_uid=None, created_at=now_ts,
+        )
+        return {
+            "cached": False, "decision": "ambiguous",
+            "title": title, "start": start_text, "location": location or "",
+            "confidence": confidence, "event_uid": None,
+        }
+
+    # Step 4: propose_calendar_event — reutiliza NL parse + dedup + osascript.
+    notes_blob = f"Auto-detectado de OCR ({source}): {image_path}\n\n{text[:500]}"
+    try:
+        result_json = propose_calendar_event(
+            title=title,
+            start=start_text,
+            location=location,
+            notes=notes_blob,
+        )
+        result = json.loads(result_json)
+    except Exception as exc:
+        _silent_log("cita_propose_call", exc)
+        result = {"created": False, "error": str(exc)}
+
+    event_uid = None
+    decision = "error"
+    if isinstance(result, dict):
+        if result.get("duplicate"):
+            # `_find_duplicate_calendar_event` agarró un match — ya estaba
+            # en Calendar.app. Igual lo guardamos para que reindex no
+            # re-invoque helper + dup check.
+            decision = "duplicate"
+            existing = result.get("existing") or {}
+            event_uid = existing.get("uid") or existing.get("event_uid")
+        elif result.get("created"):
+            decision = "cita"
+            event_uid = result.get("event_uid")
+        elif result.get("needs_clarification"):
+            decision = "ambiguous"
+        else:
+            decision = "error"
+
+    _persist_cita_detection(
+        ocr_hash=key, image_path=img_str, source=source, decision=decision,
+        title=title, start_text=start_text, location=location or "",
+        confidence=confidence, event_uid=event_uid, created_at=now_ts,
+    )
+    return {
+        "cached": False,
+        "decision": decision,
+        "title": title,
+        "start": start_text,
+        "location": location or "",
+        "confidence": confidence,
+        "event_uid": event_uid,
+    }
+
+
+def _persist_cita_detection(
+    *, ocr_hash: str, image_path: str, source: str, decision: str,
+    title: str, start_text: str, location: str, confidence: float,
+    event_uid: str | None, created_at: float,
+) -> None:
+    """INSERT OR IGNORE — si otro caller ganó la carrera, respetamos su fila.
+    Silent-fail.
+    """
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO rag_cita_detections "
+                "(ocr_hash, image_path, source, decision, title, start_text, "
+                "location, confidence, event_uid, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ocr_hash, image_path, source, decision, title, start_text,
+                    location, float(confidence), event_uid, float(created_at),
+                ),
+            )
+    except Exception as exc:
+        _silent_log(f"cita_sidecar_write:{ocr_hash}", exc)
 
 
 def _index_single_file(
@@ -27408,15 +27814,110 @@ def capture_note(
               help="Etiqueta de origen (ej: 'voice', 'whatsapp', 'cli')")
 @click.option("--title", default=None,
               help="Título custom (slug del filename). Default: primera línea.")
+@click.option("--image", "image_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None,
+              help="Path a una imagen — OCR el texto, creá la nota con ese "
+                   "contenido, y si parece una cita, agendala automáticamente.")
 @click.option("--plain", is_flag=True, help="Salida plana (ruta only)")
 def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
-            source: str | None, title: str | None, plain: bool):
+            source: str | None, title: str | None,
+            image_path: Path | None, plain: bool):
     """Capturar una nota rápida al 00-Inbox/ del vault.
 
     Uso:
       rag capture "idea suelta"
       echo "nota" | rag capture --stdin --tag voice --source whatsapp
+      rag capture --image ~/Desktop/turno-dentista.png
+
+    Con `--image`, OCR-ea la imagen con Apple Vision (gratis, local), crea
+    una nota con el texto extraído + referencia al archivo original, y si
+    el detector identifica una cita / turno / evento con fecha → lo agenda
+    automáticamente en Calendar (auto-undo 10s en el flow de chat; aquí
+    imprime el event_uid y podés borrarlo a mano si es false positive).
     """
+    # Image-first branch: if --image supplied, text is optional (OCR fills it).
+    if image_path is not None:
+        ocr_text = ""
+        try:
+            ocr_text = _ocr_image(image_path)
+        except Exception as exc:
+            msg = f"OCR falló: {exc}"
+            click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+            return
+        if not ocr_text.strip():
+            msg = (
+                f"OCR de {image_path.name} devolvió vacío — revisá que "
+                f"ocrmac esté instalado (`uv pip install ocrmac`) y que la "
+                f"imagen no sea solo gráficos."
+            )
+            click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+            return
+        # Merge OCR con texto opcional (si el user pasó ambos, se prepende el
+        # comentario del user antes del OCR crudo).
+        user_blurb = (text or "").strip()
+        if from_stdin and not user_blurb:
+            import sys
+            user_blurb = sys.stdin.read().strip()
+        body_parts = []
+        body_parts.append(f"![[{image_path.name}]]")
+        if user_blurb:
+            body_parts.append(user_blurb)
+        body_parts.append(f"<!-- OCR: {image_path} -->\n{ocr_text}")
+        note_text = "\n\n".join(body_parts)
+        try:
+            note_path = capture_note(
+                note_text,
+                tags=list(tags) + ["image"],
+                source=source or "image-capture",
+                title=title,
+            )
+        except ValueError as e:
+            click.echo(str(e)) if plain else console.print(f"[red]{e}[/red]")
+            return
+        try:
+            _index_single_file(get_db(), note_path, skip_contradict=True)
+        except Exception:
+            pass
+        # Cita detector — silent-fail, no bloquea el capture normal.
+        cita_result: dict | None = None
+        try:
+            cita_result = _maybe_create_cita_from_ocr(
+                ocr_text, image_path, source="capture",
+            )
+        except Exception as exc:
+            _silent_log(f"cita_detect_capture:{image_path}", exc)
+        rel = note_path.relative_to(VAULT_PATH)
+        if plain:
+            click.echo(str(rel))
+            if cita_result and cita_result.get("decision") == "cita":
+                click.echo(f"evento: {cita_result.get('event_uid')}")
+            return
+        console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
+        if cita_result:
+            dec = cita_result.get("decision")
+            if dec == "cita":
+                console.print(
+                    f"[bold green]📅 Evento creado:[/bold green] "
+                    f"[cyan]{cita_result.get('title')}[/cyan] — "
+                    f"[dim]{cita_result.get('start')}[/dim]"
+                    + (f" · {cita_result.get('location')}" if cita_result.get("location") else "")
+                )
+            elif dec == "duplicate":
+                console.print(
+                    f"[yellow]📅 Ya estaba en el calendario:[/yellow] "
+                    f"[dim]{cita_result.get('title')}[/dim]"
+                )
+            elif dec == "ambiguous":
+                console.print(
+                    "[dim]📅 Parece una cita pero la fecha es ambigua — "
+                    "no se agendó. Revisá la nota.[/dim]"
+                )
+            elif dec in ("no", "low_confidence"):
+                # Silent: no es cita o el helper dudó. Nada que mostrar.
+                pass
+        return
+
+    # Text-only branch (legacy).
     if from_stdin:
         import sys
         text = sys.stdin.read()
@@ -27442,6 +27943,184 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
         click.echo(str(rel))
     else:
         console.print(f"[green]✓ Capturado:[/green] [bold cyan]{rel}[/bold cyan]")
+
+
+# ── SCAN-CITAS (rag scan-citas) ──────────────────────────────────────────────
+# Barrido masivo de un folder arbitrario (NO acotado al vault) buscando
+# citas en screenshots. Usa el mismo _ocr_image + _detect_cita_from_ocr +
+# _maybe_create_cita_from_ocr — con el sidecar `rag_cita_detections`
+# deduplica contra runs previos, así que correrlo dos veces sobre la
+# misma carpeta es O(n) en sqlite hits, cero llamadas al helper.
+#
+# Default DRY-RUN: imprime lo que haría sin crear nada. `--apply` flippea
+# a modo real. Pensado para limpiar Downloads / Desktop / Screenshots de
+# golpe sin riesgo.
+
+
+@cli.command(name="scan-citas")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False,
+                                          dir_okay=True, path_type=Path))
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Crear los eventos de verdad. Sin esto es dry-run (default).")
+@click.option("--min-confidence", "min_conf", type=float, default=None,
+              help=f"Override del umbral ({_CITA_MIN_CONFIDENCE} default). "
+                   f"Bajá a 0.5 para barridos agresivos.")
+@click.option("--recursive/--no-recursive", default=True,
+              help="Bajar a subdirs. Default: sí.")
+@click.option("--plain", is_flag=True, help="Salida plana (ruta + decisión por línea).")
+def scan_citas(folder: Path, do_apply: bool, min_conf: float | None,
+               recursive: bool, plain: bool):
+    """Escanear un folder entero por citas en imágenes y agendarlas.
+
+    Uso:
+      rag scan-citas ~/Desktop/Screenshots          # dry-run
+      rag scan-citas ~/Downloads --apply             # crea eventos
+      rag scan-citas . --apply --min-confidence 0.5  # más agresivo
+
+    El folder NO tiene que estar adentro del vault — podés pasar
+    `~/Downloads`, `/tmp`, lo que sea. Cada imagen (.png .jpg .jpeg
+    .heic .webp .gif .bmp .tiff .tif) se OCR-ea (cache en
+    `rag_ocr_cache` por abs path + mtime), pasa por qwen2.5:3b, y si
+    el detector devuelve `is_cita=True` con confidence ≥ umbral,
+    se crea el evento (o se muestra en dry-run).
+
+    Dedup: el sidecar `rag_cita_detections` persiste hash-based decisions
+    — re-correr sobre la misma carpeta no gasta llamadas al helper ni
+    duplica eventos.
+    """
+    # Collect images — respect _IMAGE_EXTENSIONS del module OCR.
+    pattern = "**/*" if recursive else "*"
+    all_candidates = [p for p in folder.glob(pattern) if p.is_file()]
+    images = [p for p in all_candidates if p.suffix.lower() in _IMAGE_EXTENSIONS]
+    if not images:
+        msg = f"Sin imágenes en {folder}."
+        click.echo(msg) if plain else console.print(f"[yellow]{msg}[/yellow]")
+        return
+
+    threshold = float(min_conf) if min_conf is not None else _CITA_MIN_CONFIDENCE
+    mode = "APPLY" if do_apply else "DRY-RUN"
+    if not plain:
+        console.print(
+            f"[bold]Scan-citas[/bold] · "
+            f"[cyan]{folder}[/cyan] · {len(images)} imágenes · "
+            f"[{'green' if do_apply else 'yellow'}]{mode}[/] · "
+            f"umbral={threshold:.2f}"
+        )
+
+    # Counters for summary.
+    counts = {
+        "cita": 0, "duplicate": 0, "no": 0, "low_confidence": 0,
+        "ambiguous": 0, "error": 0, "skipped": 0,
+    }
+    rows: list[tuple[str, str, float, str, str]] = []
+
+    for img in sorted(images, key=lambda p: str(p)):
+        try:
+            ocr_text = _ocr_image(img)
+        except Exception as exc:
+            _silent_log(f"scan_citas_ocr:{img}", exc)
+            counts["skipped"] += 1
+            continue
+        if not ocr_text or len(ocr_text.strip()) < _CITA_MIN_CHARS:
+            counts["skipped"] += 1
+            continue
+
+        if do_apply:
+            try:
+                result = _maybe_create_cita_from_ocr(
+                    ocr_text, img, source="scan-citas",
+                    min_confidence=threshold,
+                )
+            except Exception as exc:
+                _silent_log(f"scan_citas_create:{img}", exc)
+                counts["error"] += 1
+                continue
+            if result is None:
+                counts["skipped"] += 1
+                continue
+            dec = result.get("decision") or "error"
+        else:
+            # Dry-run: sólo correr el detector (sin sidecar write que
+            # podría afectar un apply posterior). Es una decisión de
+            # UX — preferimos que dry-run NO persista 'no' en el sidecar
+            # así un apply posterior re-evalúa (el user puede haber
+            # bajado el threshold). El cache de OCR sí persiste (es
+            # barato y deseable).
+            try:
+                detected = _detect_cita_from_ocr(ocr_text)
+            except Exception as exc:
+                _silent_log(f"scan_citas_detect:{img}", exc)
+                counts["error"] += 1
+                continue
+            if detected is None:
+                counts["skipped"] += 1
+                continue
+            if not detected.get("is_cita"):
+                dec = "no"
+            elif detected.get("confidence", 0.0) < threshold:
+                dec = "low_confidence"
+            else:
+                dec = "cita"  # would-be created
+            result = {
+                "decision": dec,
+                "title": detected.get("title", ""),
+                "start": detected.get("start", ""),
+                "location": detected.get("location", ""),
+                "confidence": detected.get("confidence", 0.0),
+                "event_uid": None,
+            }
+
+        counts[dec] = counts.get(dec, 0) + 1
+        rows.append((
+            str(img.relative_to(folder)) if img.is_relative_to(folder) else str(img),
+            dec,
+            float(result.get("confidence", 0.0) or 0.0),
+            str(result.get("title", ""))[:60],
+            str(result.get("start", ""))[:40],
+        ))
+
+    # Render.
+    if plain:
+        for path_s, dec, conf, title_s, start_s in rows:
+            click.echo(f"{path_s}\t{dec}\t{conf:.2f}\t{title_s}\t{start_s}")
+        return
+
+    from rich.table import Table
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("Imagen", overflow="fold")
+    t.add_column("Decisión")
+    t.add_column("Conf", justify="right")
+    t.add_column("Título")
+    t.add_column("Cuándo")
+    for path_s, dec, conf, title_s, start_s in rows:
+        dec_style = {
+            "cita": "green", "duplicate": "yellow",
+            "no": "dim", "low_confidence": "dim",
+            "ambiguous": "yellow", "error": "red",
+        }.get(dec, "white")
+        t.add_row(
+            path_s,
+            f"[{dec_style}]{dec}[/{dec_style}]",
+            f"{conf:.2f}",
+            title_s,
+            start_s,
+        )
+    console.print(t)
+    console.print(
+        f"[bold]Resumen[/bold] · "
+        f"[green]cita={counts.get('cita',0)}[/green] "
+        f"[yellow]dup={counts.get('duplicate',0)}[/yellow] "
+        f"[dim]no={counts.get('no',0)}[/dim] "
+        f"[dim]low={counts.get('low_confidence',0)}[/dim] "
+        f"[yellow]ambig={counts.get('ambiguous',0)}[/yellow] "
+        f"[red]err={counts.get('error',0)}[/red] "
+        f"[dim]skip={counts.get('skipped',0)}[/dim]"
+    )
+    if not do_apply and counts.get("cita", 0) > 0:
+        console.print(
+            f"[dim]→ {counts.get('cita', 0)} candidatas. "
+            f"Correlo con [bold]--apply[/bold] para agendar.[/dim]"
+        )
 
 
 # ── URL INGEST (rag read) ────────────────────────────────────────────────────
@@ -42895,6 +43574,7 @@ def _health_training_signal(since_days: int = 7) -> dict:
     Fail-closed: errores en SQL devuelven zeros + ``error`` key,
     nunca raise.
     """
+    import sqlite3 as _sqlite3
     out = {
         "window_days": int(since_days),
         "impressions": 0,
@@ -42905,44 +43585,76 @@ def _health_training_signal(since_days: int = 7) -> dict:
         "feedback_with_cp": 0,
         "feedback_gate_target": _FEEDBACK_GATE_TARGET,
     }
+    since_clause = f"-{int(since_days)} days"
+
+    def _count(conn, key: str, sql: str, params: tuple = ()) -> None:
+        """Run one COUNT + populate out[key].
+
+        Degrades gracefully:
+          - "no such table" (test env without schema) → silent, key stays 0.
+            Loggearlo espameaba `health_training_signal_failed` cada vez que
+            un test + integration call invocaba `rag health` contra una DB
+            tmp sin todas las tablas. No es un bug en prod.
+          - Otros errores SQL → loguear + key stays 0, pero NO raise (otras
+            keys igual se computan en llamadas subsecuentes al helper).
+        """
+        try:
+            row = conn.execute(sql, params).fetchone()
+            out[key] = int(row[0] or 0) if row else 0
+        except _sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "no such table" in msg:
+                # Benign in test environments; don't pollute error log.
+                return
+            _log_sql_state_error(
+                "health_training_signal_partial",
+                err=f"{key}: {exc!r}",
+            )
+        except Exception as exc:
+            _log_sql_state_error(
+                "health_training_signal_partial",
+                err=f"{key}: {exc!r}",
+            )
+
     try:
-        since_clause = f"-{int(since_days)} days"
         with _ragvec_state_conn() as conn:
-            out["impressions"] = int(conn.execute(
-                "SELECT COUNT(*) FROM rag_behavior"
-                " WHERE event='impression' AND ts > datetime('now', ?)",
-                (since_clause,),
-            ).fetchone()[0] or 0)
-            out["opens"] = int(conn.execute(
-                "SELECT COUNT(*) FROM rag_behavior"
-                " WHERE event='open' AND ts > datetime('now', ?)",
-                (since_clause,),
-            ).fetchone()[0] or 0)
+            _count(conn, "impressions",
+                   "SELECT COUNT(*) FROM rag_behavior"
+                   " WHERE event='impression' AND ts > datetime('now', ?)",
+                   (since_clause,))
+            _count(conn, "opens",
+                   "SELECT COUNT(*) FROM rag_behavior"
+                   " WHERE event='open' AND ts > datetime('now', ?)",
+                   (since_clause,))
             # Orphan opens are all-time (not window-scoped) porque el
             # backfill command puede recoger opens viejos tambien.
-            out["orphan_opens"] = int(conn.execute(
-                "SELECT COUNT(*) FROM rag_behavior"
-                " WHERE event='open'"
-                " AND (extra_json IS NULL OR"
-                "      json_extract(extra_json, '$.original_query_id') IS NULL)"
-            ).fetchone()[0] or 0)
-            out["backfilled_opens"] = int(conn.execute(
-                "SELECT COUNT(*) FROM rag_behavior"
-                " WHERE event='open'"
-                " AND json_extract(extra_json, '$.backfilled') = 1"
-            ).fetchone()[0] or 0)
+            _count(conn, "orphan_opens",
+                   "SELECT COUNT(*) FROM rag_behavior"
+                   " WHERE event='open'"
+                   " AND (extra_json IS NULL OR"
+                   "      json_extract(extra_json, '$.original_query_id') IS NULL)")
+            _count(conn, "backfilled_opens",
+                   "SELECT COUNT(*) FROM rag_behavior"
+                   " WHERE event='open'"
+                   " AND json_extract(extra_json, '$.backfilled') = 1")
             # Feedback rows con corrective_path dentro del período.
-            out["feedback_with_cp"] = int(conn.execute(
-                "SELECT COUNT(*) FROM rag_feedback"
-                " WHERE json_extract(extra_json, '$.corrective_path') IS NOT NULL"
-                " AND json_extract(extra_json, '$.corrective_path') != ''"
-                " AND ts > datetime('now', ?)",
-                (since_clause,),
-            ).fetchone()[0] or 0)
+            _count(conn, "feedback_with_cp",
+                   "SELECT COUNT(*) FROM rag_feedback"
+                   " WHERE json_extract(extra_json, '$.corrective_path') IS NOT NULL"
+                   " AND json_extract(extra_json, '$.corrective_path') != ''"
+                   " AND ts > datetime('now', ?)",
+                   (since_clause,))
         if out["impressions"] > 0:
             out["ctr_pct"] = round(
                 100.0 * out["opens"] / out["impressions"], 3,
             )
+    except _sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "no such table" in msg or "unable to open" in msg:
+            # Test env / DB missing — silent degrade.
+            return out
+        out["error"] = repr(exc)
+        _log_sql_state_error("health_training_signal_failed", err=repr(exc))
     except Exception as exc:
         out["error"] = repr(exc)
         _log_sql_state_error("health_training_signal_failed", err=repr(exc))

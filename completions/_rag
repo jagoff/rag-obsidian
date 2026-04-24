@@ -40,12 +40,18 @@ _rag_cmd() {
             subcommands=(
                 'ambient:Ambient Agent: reacciona a capturas en 00-Inbox con wikilinks+dupes+related.'
                 'archive:Mover notas muertas a 04-Archive/ preservando la jerarquía PARA.'
+                'ask:Preguntar al vault — alias minimalista de `rag query`.'
+                'auto-tag:Sugerir + (opcional) aplicar tags a notas sin tags via LLM.'
                 'autotag:Sugerir tags para una nota usando el vocabulario existente del vault.'
+                'behavior:Tooling sobre rag_behavior para el training signal del ranker-vivo.'
                 'bookmarks:Indexar bookmarks de Chrome al sub-índice de URLs (rag links).'
                 'cache:Semantic response cache — hits para queries repetidas sobre vault unchanged.'
+                'calibrate:Entrenar calibración de scores per-source desde rag_feedback.'
                 'capture:Capturar una nota rápida al 00-Inbox/ del vault.'
                 'chat:Chat interactivo con tus notas.'
+                'config:Ver todas las env vars del sistema con sus valores actuales + defaults.'
                 'consolidate:Agrupar conversaciones relacionadas y promover a PARA (Phase 2).'
+                'context:Context budget + session inspection helpers.'
                 'dashboard:Analytics dashboard — métricas del pipeline sobre queries.jsonl.'
                 'dead:Listar notas candidatas a archivar (dead code del vault).'
                 'digest:Weekly narrative digest del vault (Contradiction Radar fase 3).'
@@ -60,6 +66,8 @@ _rag_cmd() {
                 'free:Liberar espacio sin romper.'
                 'gaps:Detectar temas consultados repetidamente sin respuesta en el vault.'
                 'graph:Exportar un Obsidian canvas con la vecindad de una nota por wikilinks.'
+                'health:Dashboard unificado de salud del sistema.'
+                'hygiene:Vault hygiene scan — notas sin tags, sin links, huérfanas, vacías.'
                 'ignore:Manejar lista de notas hard-ignore.'
                 'inbox:Triar notas de Inbox: sugerir destino + tags + wikilinks + duplicados.'
                 'index:Indexar notas del vault (incremental, detecta cambios por hash).'
@@ -69,16 +77,19 @@ _rag_cmd() {
                 'maintenance:Mantenimiento integral: reindex, limpiar sesiones, podar caches, rotar logs, detectar dead notes.'
                 'morning:Brief matutino: qué pasó ayer + qué enfocar hoy.'
                 'open:Open a vault note and record an open event in behavior.jsonl.'
+                'paraphrases:Learned paraphrases desde feedback — train, stats, clear.'
                 'patterns:Alerta cuando una razón de feedback domina.'
                 'pendientes:Dashboard unificado: todo lo que espera tu atención ahora mismo.'
                 'prep:Preparar un brief de contexto sobre una persona / proyecto / tema.'
                 'query:Consulta única contra las notas.'
                 'rate:Aplica rating +/-/0/1/👍/👎 al último turno de una sesión.'
                 'read:Ingerir una URL externa como nota estructurada en el vault.'
+                'scan-citas:Escanear un folder entero por citas en imágenes y agendarlas.'
                 'serve:Persistent HTTP query server — keeps models warm between requests.'
                 'session:Administrar sesiones conversacionales (list / show / clear / cleanup).'
                 'setup:Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo'
                 'silence:Silenciar o desilenciar notificaciones proactivas por kind.'
+                'snapshot:Portable backup/restore de artifacts ML + feedback.'
                 'spotify-auth:One-shot Spotify OAuth bootstrap. Opens browser for consent, caches'
                 'state:Lee/escribe el estado del usuario (cansado, inspirado, focus-code…).'
                 'stats:Estado del índice.'
@@ -86,6 +97,7 @@ _rag_cmd() {
                 'timeline:Ver notas ordenadas por fecha de modificación (más recientes primero).'
                 'today:Cierre del día: qué pasó hoy + cabos sueltos + semillas para mañana.'
                 'transcribe:Transcribir un archivo de audio a texto con faster-whisper.'
+                'trends:Análisis temático de queries recientes.'
                 'tune:Auto-calibrar pesos del ranker sobre un golden set.'
                 'vault:Multi-vault: registrar / cambiar / listar vaults de Obsidian.'
                 'wa-tasks:Extrae tareas, preguntas y compromisos de WhatsApp al Inbox.'
@@ -99,12 +111,18 @@ _rag_cmd() {
             case $line[1] in
                 ambient) _rag_cmd_ambient ;;
                 archive) _rag_cmd_archive ;;
+                ask) _rag_cmd_ask ;;
+                auto-tag) _rag_cmd_auto_tag ;;
                 autotag) _rag_cmd_autotag ;;
+                behavior) _rag_cmd_behavior ;;
                 bookmarks) _rag_cmd_bookmarks ;;
                 cache) _rag_cmd_cache ;;
+                calibrate) _rag_cmd_calibrate ;;
                 capture) _rag_cmd_capture ;;
                 chat) _rag_cmd_chat ;;
+                config) _rag_cmd_config ;;
                 consolidate) _rag_cmd_consolidate ;;
+                context) _rag_cmd_context ;;
                 dashboard) _rag_cmd_dashboard ;;
                 dead) _rag_cmd_dead ;;
                 digest) _rag_cmd_digest ;;
@@ -119,6 +137,8 @@ _rag_cmd() {
                 free) _rag_cmd_free ;;
                 gaps) _rag_cmd_gaps ;;
                 graph) _rag_cmd_graph ;;
+                health) _rag_cmd_health ;;
+                hygiene) _rag_cmd_hygiene ;;
                 ignore) _rag_cmd_ignore ;;
                 inbox) _rag_cmd_inbox ;;
                 index) _rag_cmd_index ;;
@@ -128,16 +148,19 @@ _rag_cmd() {
                 maintenance) _rag_cmd_maintenance ;;
                 morning) _rag_cmd_morning ;;
                 open) _rag_cmd_open ;;
+                paraphrases) _rag_cmd_paraphrases ;;
                 patterns) _rag_cmd_patterns ;;
                 pendientes) _rag_cmd_pendientes ;;
                 prep) _rag_cmd_prep ;;
                 query) _rag_cmd_query ;;
                 rate) _rag_cmd_rate ;;
                 read) _rag_cmd_read ;;
+                scan-citas) _rag_cmd_scan_citas ;;
                 serve) _rag_cmd_serve ;;
                 session) _rag_cmd_session ;;
                 setup) _rag_cmd_setup ;;
                 silence) _rag_cmd_silence ;;
+                snapshot) _rag_cmd_snapshot ;;
                 spotify-auth) _rag_cmd_spotify_auth ;;
                 state) _rag_cmd_state ;;
                 stats) _rag_cmd_stats ;;
@@ -145,6 +168,7 @@ _rag_cmd() {
                 timeline) _rag_cmd_timeline ;;
                 today) _rag_cmd_today ;;
                 transcribe) _rag_cmd_transcribe ;;
+                trends) _rag_cmd_trends ;;
                 tune) _rag_cmd_tune ;;
                 vault) _rag_cmd_vault ;;
                 wa-tasks) _rag_cmd_wa_tasks ;;
@@ -260,11 +284,62 @@ _rag_cmd_archive() {
         '--plain[Salida plana (src\tdst por línea)]'
 }
 
+_rag_cmd_ask() {
+    _arguments \
+        '--quick[Modo rápido: skippea deep retrieve + multi-query (TTFT <2s).]' \
+        '--source=[Filtrar por fuente (vault,calendar,gmail,whatsapp,...).]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)' \
+        '--session=[ID de sesión — conectar con historial existente.]:SESSION:_rag_sessions' \
+        '--continue[Reanuda la última sesión.]' \
+        '--plain[Salida plana sin UI — pipes / scripts.]' \
+        '1:QUESTION:'
+}
+
+_rag_cmd_auto_tag() {
+    _arguments \
+        '--limit=[Máximo de notas a procesar.]:LIMIT:' \
+        '--max-tags=[Tags máximos por nota.]:MAX_TAGS:' \
+        '--allow-new[Permitir que el LLM proponga tags fuera del vocab.]' \
+        '--model=[Override del modelo (default qwen2.5:3b).]:MODEL:' \
+        '--apply[Escribir tags al frontmatter. Sin esto = dry-run.]' \
+        '--yes[Con --apply, no pedir confirmación por nota.]' \
+        '--as-json[Output JSON con sugerencias + estado.]'
+}
+
 _rag_cmd_autotag() {
     _arguments \
         '--apply[Escribir los tags al frontmatter (por defecto solo imprime)]' \
         '--max-tags=[Cantidad máxima de tags a sugerir]:MAX_TAGS:' \
         '1:PATH:'
+}
+
+_rag_cmd_behavior() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'backfill:Backfillear `original_query_id` en open events huérfanos.'
+            )
+            _describe -t subcommands "rag behavior subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                backfill) _rag_cmd_behavior_backfill ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_behavior_backfill() {
+    _arguments \
+        '--dry-run[Mostrar qué se actualizaría sin escribir.]' \
+        '--window-minutes=[Ventana en minutos para matchear orphan con rag_queries.]:WINDOW_MINUTES:' \
+        '--limit=[Máximo de opens huérfanos a procesar por corrida.]:LIMIT:' \
+        '--as-json[Output JSON (machine-readable).]'
 }
 
 _rag_cmd_bookmarks() {
@@ -339,7 +414,16 @@ _rag_cmd_cache_clear() {
 }
 
 _rag_cmd_cache_stats() {
-    :
+    _arguments \
+        '--days=[Ventana en días para hit-rate telemetry.]:DAYS:'
+}
+
+_rag_cmd_calibrate() {
+    _arguments \
+        '--since=[Ventana en días de feedback a usar para entrenar.]:SINCE:' \
+        '--min-pairs=[Mínimo de pares (pos+neg) para entrenar una source.]:MIN_PAIRS:' \
+        '--dry-run[Calcular los knots pero no persistir.]' \
+        '--as-json[Output JSON machine-readable (para launchd logs).]'
 }
 
 _rag_cmd_capture() {
@@ -348,6 +432,7 @@ _rag_cmd_capture() {
         '--tag=[Tag extra (además de '\''capture'\''). Repetible.]:TAGS:' \
         '--source=[Etiqueta de origen (ej: '\''voice'\'', '\''whatsapp'\'', '\''cli'\'')]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)' \
         '--title=[Título custom (slug del filename). Default: primera línea.]:TITLE:' \
+        '--image=[Path a una imagen — OCR el texto, creá la nota con ese contenido, y si parece una cita, agendala automáticamente.]:IMAGE_PATH:_files' \
         '--plain[Salida plana (ruta only)]' \
         '1:TEXT:'
 }
@@ -371,6 +456,13 @@ _rag_cmd_chat() {
         '--critique[Auto-critique: el LLM evalúa su propia respuesta y la regenera si es necesario]'
 }
 
+_rag_cmd_config() {
+    _arguments \
+        '--only-set[Mostrar solo vars con un valor actual en el environment.]' \
+        '--filter=[Substring para filtrar por nombre (case-insensitive).]:FILTER_PATTERN:' \
+        '--as-json[Output JSON machine-readable.]'
+}
+
 _rag_cmd_consolidate() {
     _arguments \
         '--window-days=[Conversaciones a considerar (por mtime)]:WINDOW_DAYS:' \
@@ -378,6 +470,45 @@ _rag_cmd_consolidate() {
         '--min-cluster=[Tamaño mínimo de cluster para promover]:MIN_CLUSTER:' \
         '--apply[Escribir cambios al vault (default: dry-run)]' \
         '--json[Emitir summary como JSON (para servicios / scripts)]'
+}
+
+_rag_cmd_context() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'budget:Chequear el presupuesto de context de una sesión actual.'
+                'estimate:Estimar token count de un texto + clasificar vs num_ctx.'
+            )
+            _describe -t subcommands "rag context subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                budget) _rag_cmd_context_budget ;;
+                estimate) _rag_cmd_context_estimate ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_context_budget() {
+    _arguments \
+        '--session=[Session ID. Default: última sesión activa.]:SESSION:_rag_sessions' \
+        '--num-ctx=[Context window asumido.]:NUM_CTX:' \
+        '--as-json[Output JSON.]'
+}
+
+_rag_cmd_context_estimate() {
+    _arguments \
+        '--file=[Estimar desde un archivo.]:FILE_ARG:_files' \
+        '--num-ctx=[Context window model-specific para calcular ratio.]:NUM_CTX:' \
+        '--as-json[Output JSON.]' \
+        '1:TEXT_ARG:'
 }
 
 _rag_cmd_dashboard() {
@@ -445,6 +576,7 @@ _rag_cmd_feedback() {
         subcmd)
             local -a subcommands
             subcommands=(
+                'auto-harvest:Auto-labelear queries low-confidence usando LLM-as-judge.'
                 'backfill:Agregar corrective_path a turns en rag_feedback que no lo tienen.'
                 'harvest:Labelear queries recientes low-confidence sin feedback explícito.'
                 'status:Dashboard de señal de feedback y progreso hacia el gate de fine-tune.'
@@ -453,12 +585,25 @@ _rag_cmd_feedback() {
             ;;
         args)
             case $line[1] in
+                auto-harvest) _rag_cmd_feedback_auto_harvest ;;
                 backfill) _rag_cmd_feedback_backfill ;;
                 harvest) _rag_cmd_feedback_harvest ;;
                 status) _rag_cmd_feedback_status ;;
             esac
             ;;
     esac
+}
+
+_rag_cmd_feedback_auto_harvest() {
+    _arguments \
+        '--limit=[Cuántos candidatos procesar como máximo.]:LIMIT:' \
+        '--since=[Ventana en días para candidatos (default 1 = últimas 24h).]:SINCE:' \
+        '--confidence-below=[Sólo queries con top_score < este valor.]:CONFIDENCE_BELOW:' \
+        '--min-judge-conf=[Mínima confidence del judge para insertar (default 0.8).]:MIN_JUDGE_CONF:' \
+        '--model=[Override del judge model (default qwen2.5:7b).]:MODEL:' \
+        '--dry-run[No insertar filas — sólo mostrar lo que haría.]' \
+        '(--verbose -v){--verbose,-v}[Imprimir el resultado del judge por candidato.]' \
+        '--json[Output machine-readable JSON (para launchd logs).]'
 }
 
 _rag_cmd_feedback_backfill() {
@@ -533,6 +678,20 @@ _rag_cmd_graph() {
         '--depth=[Niveles de vecindad (1 = solo vecinos directos, 2 = vecinos de vecinos)]:DEPTH:' \
         '--output=[Ruta .canvas de salida (default: 00-Inbox/graph-{note}.canvas)]:OUTPUT:' \
         '1:NOTE_TITLE:'
+}
+
+_rag_cmd_health() {
+    _arguments \
+        '--since=[Ventana en horas para stats de queries recientes.]:SINCE_HOURS:' \
+        '--as-json[Output JSON machine-readable.]'
+}
+
+_rag_cmd_hygiene() {
+    _arguments \
+        '--empty-threshold=[Chars por debajo de los cuales una nota se considera vacía.]:EMPTY_THRESHOLD:' \
+        '--stale-days=[Días sin modificar tras los cuales una nota es stale.]:STALE_DAYS:' \
+        '--sample=[Cuántas paths de sample mostrar por categoría.]:SAMPLE:' \
+        '--as-json[Output JSON machine-readable.]'
 }
 
 _rag_cmd_ignore() {
@@ -650,6 +809,8 @@ _rag_cmd_log() {
         '-n=[Cantidad de queries a mostrar (default: 20)]:N:' \
         '--low-confidence[Solo queries con top_score < 0]' \
         '--feedback[Solo turnos con rating (👍/👎), con una columna de feedback]' \
+        '--slow[Feature #13: solo queries '\''slow'\'' — total latency > --slower-than ms (default 5000). Ordenadas por total DESC.]' \
+        '--slower-than=[Umbral en ms de total latency (retrieve+gen) para --slow.]:SLOWER_THAN_MS:' \
         '--silent-errors[Listar silent_errors.jsonl (writes del _silent_log helper) en vez del queries log]' \
         '--summary[Con --silent-errors, agrupa por (where × exc_type) en vez de listar individualmente]'
 }
@@ -675,11 +836,55 @@ _rag_cmd_morning() {
 
 _rag_cmd_open() {
     _arguments \
+        '--nth=[Abrir el N-ésimo source (1-indexed) del último rag_queries. Alternativa a pasar PATH — auto-rellena `original_query_id` y `rank` en el behavior event.]:NTH:' \
         '--query=[Triggering query, forwarded to behavior log]:QUERY:' \
         '--rank=[1-indexed rank among results when opened]:RANK:' \
         '--source=[Event source: cli | whatsapp | web | brief]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)' \
-        '--session=[Session id, forwarded to behavior log]:SESSION:_rag_sessions' \
+        '--session=[Session id, forwarded to behavior log. Con --nth, scopea la búsqueda del último query a esa session.]:SESSION:_rag_sessions' \
         '1:PATH:'
+}
+
+_rag_cmd_paraphrases() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'clear:Borrar todas las paraphrases learned.'
+                'stats:Ver paraphrases learned con más hits + totales agregados.'
+                'train:Entrenar paraphrases learned desde rag_feedback histórico.'
+            )
+            _describe -t subcommands "rag paraphrases subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                clear) _rag_cmd_paraphrases_clear ;;
+                stats) _rag_cmd_paraphrases_stats ;;
+                train) _rag_cmd_paraphrases_train ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_paraphrases_clear() {
+    _arguments \
+        '--yes[No confirmar.]'
+}
+
+_rag_cmd_paraphrases_stats() {
+    _arguments \
+        '--limit=[Cuántas top rows mostrar.]:LIMIT:'
+}
+
+_rag_cmd_paraphrases_train() {
+    _arguments \
+        '--since=[Ventana de días sobre rag_feedback rating=1.]:SINCE:' \
+        '--dry-run[No persistir — sólo reportar qué se haría.]' \
+        '--as-json[Output JSON machine-readable.]'
 }
 
 _rag_cmd_patterns() {
@@ -747,6 +952,16 @@ _rag_cmd_read() {
         '1:URL:'
 }
 
+_rag_cmd_scan_citas() {
+    _arguments \
+        '--apply[Crear los eventos de verdad. Sin esto es dry-run (default).]' \
+        '--min-confidence=[Override del umbral (0.7 default). Bajá a 0.5 para barridos agresivos.]:MIN_CONF:' \
+        '(--recursive --no-recursive)--recursive[Bajar a subdirs. Default: sí.]' \
+        '(--recursive --no-recursive)--no-recursive[Bajar a subdirs. Default: sí.]' \
+        '--plain[Salida plana (ruta + decisión por línea).]' \
+        '1:FOLDER:_path_files -/'
+}
+
 _rag_cmd_serve() {
     _arguments \
         '--host=[Bind address]:HOST:' \
@@ -765,6 +980,7 @@ _rag_cmd_session() {
             subcommands=(
                 'cleanup:Purga sesiones viejas.'
                 'clear:Borra una sesión por id.'
+                'export:Exportar una sesión a una nota markdown del vault.'
                 'list:Lista las sesiones recientes.'
                 'show:Muestra los turnos de una sesión.'
             )
@@ -774,6 +990,7 @@ _rag_cmd_session() {
             case $line[1] in
                 cleanup) _rag_cmd_session_cleanup ;;
                 clear) _rag_cmd_session_clear ;;
+                export) _rag_cmd_session_export ;;
                 list) _rag_cmd_session_list ;;
                 show) _rag_cmd_session_show ;;
             esac
@@ -789,6 +1006,16 @@ _rag_cmd_session_cleanup() {
 _rag_cmd_session_clear() {
     _arguments \
         '--yes[No pedir confirmación]' \
+        '1:SID:'
+}
+
+_rag_cmd_session_export() {
+    _arguments \
+        '--folder=[Carpeta destino (vault-relative).]:FOLDER:' \
+        '--filename=[Override del filename (sin .md). Default: YYYY-MM-DD-HHMM-<sid>.md]:FILENAME:' \
+        '--no-sources[No incluir los paths de los sources en cada turno.]' \
+        '--stdout[Imprimir el markdown a stdout en lugar de escribir al vault.]' \
+        '--force[Sobreescribir si el archivo existe (default: agrega sufijo).]' \
         '1:SID:'
 }
 
@@ -812,6 +1039,54 @@ _rag_cmd_silence() {
         '--off[Re-activar el kind (sacar del silenciado)]' \
         '--list[Listar silenciados actuales]' \
         '1:KIND:'
+}
+
+_rag_cmd_snapshot() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'create:Crear snapshot del estado actual.'
+                'list:Listar snapshots en ~/.local/share/obsidian-rag/snapshots/.'
+                'restore:Restaurar un snapshot creado con `rag snapshot create`.'
+            )
+            _describe -t subcommands "rag snapshot subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                create) _rag_cmd_snapshot_create ;;
+                list) _rag_cmd_snapshot_list ;;
+                restore) _rag_cmd_snapshot_restore ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_snapshot_create() {
+    _arguments \
+        '--output=[Path destino. Default: ~/.local/share/obsidian-rag/snapshots/<ts>.json]:OUTPUT_PATH:' \
+        '--as-json[Imprimir a stdout en lugar de escribir a archivo.]'
+}
+
+_rag_cmd_snapshot_list() {
+    _arguments \
+        '--limit=[Cuántos snapshots mostrar.]:LIMIT:'
+}
+
+_rag_cmd_snapshot_restore() {
+    _arguments \
+        '--skip-ranker[No restaurar ranker.json.]' \
+        '--skip-calibration[No restaurar score_calibration.]' \
+        '--skip-paraphrases[No restaurar learned_paraphrases.]' \
+        '--skip-feedback[No restaurar feedback rows.]' \
+        '--yes[No confirmar antes de aplicar.]' \
+        '--as-json[Output JSON con stats.]' \
+        '1:SNAP_PATH:_files'
 }
 
 _rag_cmd_spotify_auth() {
@@ -861,6 +1136,13 @@ _rag_cmd_transcribe() {
         '--no-cache[Forzar re-transcripción, ignorando cache]' \
         '--json[Salida JSON con metadata (text, language, duration_s, cached)]' \
         '1:AUDIO_PATH:_files'
+}
+
+_rag_cmd_trends() {
+    _arguments \
+        '--days=[Ventana en días para análisis.]:DAYS:' \
+        '--top=[Cuántos items top mostrar por categoría.]:TOP:' \
+        '--as-json[Output JSON machine-readable.]'
 }
 
 _rag_cmd_tune() {

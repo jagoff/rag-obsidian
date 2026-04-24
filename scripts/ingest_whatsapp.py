@@ -109,9 +109,42 @@ _STATE_TABLE_DDL = (
     ")"
 )
 
+# Cursor para el scan de imágenes (cita detector). Separado del cursor de
+# mensajes porque: (a) el user puede hacer `--reset` para re-ingestar chats
+# sin querer re-OCR todas las imágenes (caro: ~1-2s por imagen entre OCR +
+# helper call), (b) queremos un reset independiente si en algún momento
+# agregamos lógica nueva al detector y hay que re-procesar. Key fija
+# `global` porque no nos interesa cursor per-chat — el sidecar
+# `rag_cita_detections` ya deduplica a nivel hash de OCR.
+_MEDIA_STATE_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS rag_wa_media_state ("
+    " scope TEXT PRIMARY KEY,"
+    " last_ts REAL NOT NULL,"
+    " updated_at TEXT NOT NULL"
+    ")"
+)
+
 
 def _ensure_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(_STATE_TABLE_DDL)
+    conn.execute(_MEDIA_STATE_TABLE_DDL)
+
+
+def _load_media_cursor(conn: sqlite3.Connection, scope: str = "global") -> float:
+    row = conn.execute(
+        "SELECT last_ts FROM rag_wa_media_state WHERE scope = ?", (scope,),
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def _save_media_cursor(
+    conn: sqlite3.Connection, last_ts: float, scope: str = "global",
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO rag_wa_media_state (scope, last_ts, updated_at) "
+        "VALUES (?, ?, ?)",
+        (scope, float(last_ts), datetime.now().isoformat(timespec="seconds")),
+    )
 
 
 def _load_cursor(conn: sqlite3.Connection, chat_jid: str) -> float:
@@ -515,6 +548,183 @@ def upsert_chunks(
     return len(chunks)
 
 
+# ── Image → cita detector ──────────────────────────────────────────────────
+#
+# El bridge de WhatsApp-MCP guarda los attachments en
+# `<store>/<chat_jid>/<filename>`. La tabla `messages` tiene `media_type`
+# (ej. 'image') + `filename`. Para cada imagen nueva desde el último
+# cursor la OCR-eamos con Apple Vision y la pasamos al detector de citas
+# — si devuelve `is_cita=True` con confidence ≥ umbral, se agenda evento
+# directo vía `rag._maybe_create_cita_from_ocr` (mismo pipeline que el
+# indexer del vault y `rag capture --image`).
+#
+# Dedup: el sidecar `rag_cita_detections` impide double-create aunque un
+# forward de imagen la haga llegar por dos chats distintos.
+#
+# Silent-fail total: cualquier excepción en OCR, detector o propose
+# calendar event NUNCA propaga — el ETL de WA sigue funcionando aunque
+# el subsistema de citas esté caído.
+
+
+def _read_recent_image_messages(
+    bridge_db: Path,
+    since_ts: float,
+    *,
+    max_images: int | None = None,
+    exclude_jids: frozenset[str] = HARDCODED_EXCLUDE_JIDS,
+) -> list[tuple[str, str, float]]:
+    """Return [(chat_jid, filename, ts), ...] for every image message newer
+    than `since_ts`. Sorted ascending by timestamp so a mid-run crash
+    resumes cleanly with the max ts of the processed batch.
+    """
+    if not bridge_db.is_file():
+        return []
+    conn = sqlite3.connect(f"file:{bridge_db}?mode=ro&immutable=1", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT chat_jid, filename, timestamp FROM messages "
+            "WHERE media_type = 'image' AND filename IS NOT NULL "
+            "AND filename != '' "
+            "ORDER BY timestamp ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[tuple[str, str, float]] = []
+    for r in rows:
+        jid = str(r["chat_jid"])
+        if jid in exclude_jids:
+            continue
+        ts = _parse_bridge_ts(r["timestamp"])
+        if ts is None or ts <= since_ts:
+            continue
+        out.append((jid, str(r["filename"]), ts))
+        if max_images is not None and len(out) >= max_images:
+            break
+    return out
+
+
+def scan_wa_images_for_citas(
+    bridge_db: Path,
+    state_conn: sqlite3.Connection,
+    *,
+    max_images: int | None = None,
+    reset_cursor: bool = False,
+) -> dict:
+    """Escaneá imágenes nuevas del bridge WA, OCR + cita detector.
+
+    Returns: dict con contadores {images_seen, ocr_ok, cita_created,
+    duplicate, no_cita, errors}.
+
+    Silent-fail: cada imagen está en su propio try/except. Una imagen
+    corrupta o un helper caído NO bloquea el resto del batch ni el
+    ingester de mensajes.
+
+    Requiere que `rag._cita_detect_enabled()` sea True. Si `RAG_CITA_DETECT=0`
+    devuelve un summary vacío sin leer el bridge.
+    """
+    summary = {
+        "images_seen": 0, "ocr_ok": 0, "cita_created": 0,
+        "duplicate": 0, "ambiguous": 0, "no_cita": 0, "low_confidence": 0,
+        "errors": 0,
+    }
+    if not rag._cita_detect_enabled():
+        summary["skipped"] = "RAG_CITA_DETECT=0"
+        return summary
+
+    store_root = bridge_db.parent
+    try:
+        last_ts = 0.0 if reset_cursor else _load_media_cursor(state_conn)
+    except Exception:
+        last_ts = 0.0
+
+    try:
+        records = _read_recent_image_messages(
+            bridge_db, since_ts=last_ts, max_images=max_images,
+        )
+    except Exception as exc:
+        # Defensive: bridge DB locked / corrupt → skip silently.
+        try:
+            rag._silent_log("wa_scan_images_read", exc)
+        except Exception:
+            pass
+        summary["errors"] += 1
+        return summary
+
+    summary["images_seen"] = len(records)
+    if not records:
+        return summary
+
+    max_ts_processed = last_ts
+    for chat_jid, filename, ts in records:
+        # Build absolute path. Bridge layout: <store>/<chat_jid>/<filename>.
+        img_path = store_root / chat_jid / filename
+        if not img_path.is_file():
+            # File in DB but missing on disk — user may have pruned the
+            # store, or the bridge is still downloading. Advance cursor
+            # so we don't re-try forever.
+            max_ts_processed = max(max_ts_processed, ts)
+            continue
+
+        try:
+            ocr_text = rag._ocr_image(img_path)
+        except Exception as exc:
+            try:
+                rag._silent_log(f"wa_scan_ocr:{img_path}", exc)
+            except Exception:
+                pass
+            summary["errors"] += 1
+            max_ts_processed = max(max_ts_processed, ts)
+            continue
+
+        if not ocr_text or len(ocr_text.strip()) < 20:
+            max_ts_processed = max(max_ts_processed, ts)
+            continue
+
+        summary["ocr_ok"] += 1
+
+        try:
+            result = rag._maybe_create_cita_from_ocr(
+                ocr_text, img_path, source="whatsapp",
+            )
+        except Exception as exc:
+            try:
+                rag._silent_log(f"wa_scan_detect:{img_path}", exc)
+            except Exception:
+                pass
+            summary["errors"] += 1
+            max_ts_processed = max(max_ts_processed, ts)
+            continue
+
+        if result is not None:
+            dec = result.get("decision") or ""
+            if dec == "cita":
+                summary["cita_created"] += 1
+            elif dec == "duplicate":
+                summary["duplicate"] += 1
+            elif dec == "ambiguous":
+                summary["ambiguous"] += 1
+            elif dec == "low_confidence":
+                summary["low_confidence"] += 1
+            elif dec == "no":
+                summary["no_cita"] += 1
+            else:
+                summary["errors"] += 1
+        max_ts_processed = max(max_ts_processed, ts)
+
+    # Save cursor only if we actually advanced.
+    if max_ts_processed > last_ts:
+        try:
+            _save_media_cursor(state_conn, max_ts_processed)
+            state_conn.commit()
+        except Exception as exc:
+            try:
+                rag._silent_log("wa_scan_cursor_save", exc)
+            except Exception:
+                pass
+    return summary
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────
 
 def _retention_cutoff(now: float | None = None) -> float:
@@ -534,6 +744,8 @@ def run(
     max_messages: int | None = None,
     dry_run: bool = False,
     vault_col=None,
+    scan_images: bool = True,
+    max_images: int | None = None,
 ) -> dict:
     """Incremental ingest. Returns a summary dict with counts + timing.
 
@@ -641,6 +853,27 @@ def run(
     for jid, (ts, mid) in latest.items():
         _save_cursor(state_conn, jid, ts, mid)
     state_conn.commit()
+
+    # Image → cita detector. Corre DESPUÉS del ingest de mensajes para que
+    # un fallo en el detector no bloquee la indexación normal de chats.
+    # `reset=True` también resetea el cursor de imágenes (consistencia: el
+    # user que pide full re-scan de mensajes probablemente también quiere
+    # re-evaluar imágenes). Silent-fail — summary.image_scan queda vacío
+    # si algo explota.
+    image_summary: dict = {}
+    if scan_images and rag._cita_detect_enabled():
+        try:
+            image_summary = scan_wa_images_for_citas(
+                db, state_conn, max_images=max_images, reset_cursor=reset,
+            )
+        except Exception as exc:
+            try:
+                rag._silent_log("wa_scan_images_outer", exc)
+            except Exception:
+                pass
+            image_summary = {"error": str(exc)}
+    summary["image_scan"] = image_summary
+
     state_conn.close()
 
     summary["duration_s"] = round(time.perf_counter() - t0, 2)
@@ -665,6 +898,11 @@ def main() -> None:
                      help="Compute chunks but don't write to the index")
     ap.add_argument("--json", action="store_true",
                      help="Emit summary as JSON")
+    ap.add_argument("--skip-images", action="store_true",
+                     help="No escanear imágenes nuevas por citas")
+    ap.add_argument("--max-images", type=int, default=None,
+                     help="Cap a N imágenes por run (sobre todo en el primer "
+                          "ingest tras instalar el detector)")
     args = ap.parse_args()
 
     summary = run(
@@ -674,6 +912,8 @@ def main() -> None:
         max_chats=args.max_chats,
         max_messages=args.max_messages,
         dry_run=bool(args.dry_run),
+        scan_images=not bool(args.skip_images),
+        max_images=args.max_images,
     )
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -687,6 +927,16 @@ def main() -> None:
         f"{summary['chats_touched']} chats · "
         f"{summary['duration_s']}s"
     )
+    img = summary.get("image_scan") or {}
+    if img.get("images_seen"):
+        print(
+            f"images: {img.get('images_seen', 0)} seen · "
+            f"{img.get('ocr_ok', 0)} ocr · "
+            f"{img.get('cita_created', 0)} citas · "
+            f"{img.get('duplicate', 0)} dup · "
+            f"{img.get('ambiguous', 0)} ambig · "
+            f"{img.get('errors', 0)} err"
+        )
     if "error" in summary:
         print(f"[error] {summary['error']}")
 

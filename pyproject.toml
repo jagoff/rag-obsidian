@@ -106,6 +106,7 @@ testpaths = ["tests"]
 markers = [
     "slow: multi-process stress tests (>1s wall; opt-out with `-m 'not slow'`)",
     "real_vault: test reads the real vault (opt-out of `_isolate_vault_path` autouse). Read-only operations only — writes MUST use monkeypatch.",
+    "real_apple: test is allowed to hit the user's real Apple Reminders / Calendar / Contacts (opt-out of `_isolate_apple_integrations` autouse that sets OBSIDIAN_RAG_NO_APPLE=1). Use only for integration smokes; cleanup is the test's responsibility.",
     "requires_ollama: test calls ollama via `resolve_chat_model()` or equivalent. Auto-skipped when no CHAT_MODEL_PREFERENCE model is installed (CI on ubuntu-latest, sandbox environments).",
     "live: end-to-end live tests that spawn `rag serve` + hit ollama with real queries. Double opt-in: requires `RAG_E2E_LIVE=1` env var AND `-m live` or default-skips. ~60s warmup; NOT run in default `pytest tests/` sweep.",
 ]

@@ -44,6 +44,54 @@ def _skip_if_no_ollama(request):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_apple_integrations(request, monkeypatch):
+    """Safety-critical: bloquear escrituras a Apple Reminders / Calendar /
+    Contacts reales durante los tests.
+
+    `rag._apple_enabled()` devuelve `True` por default a menos que
+    `OBSIDIAN_RAG_NO_APPLE=1` esté seteada — y `propose_reminder` /
+    `propose_calendar_event` usan eso como único gate antes de llamar
+    `osascript` con `make new reminder` / `make new event`. Si un test
+    ejercita esos code paths sin mockear `_create_reminder` /
+    `_create_calendar_event` / `_osascript`, termina creando entidades
+    reales en Reminders.app / Calendar.app del user.
+
+    Gap documentado 2026-04-24 Fer F. report: durante una pytest run
+    de 2h el test `test_semantic_skipped_when_propose_intent`
+    (tests/test_web_chat_semantic_cache.py) disparó
+    `_post_chat("recordame llamar a mamá a las 18")` con el propose
+    path "parcialmente stubbed" (su propio comentario) — cada corrida
+    creaba un `llamar a mamá @ 18:00 hoy` en Reminders del user. Idem
+    `test_propose_intent_blocks_bypass` con `recordame comprar pan mañana`.
+    La única razón de que no explote en los ~30+ tests que mockean
+    `_osascript` explícitamente es que ellos saben que hay que hacerlo;
+    los que usan el propose path end-to-end olvidan.
+
+    Fix defensivo: setear `OBSIDIAN_RAG_NO_APPLE=1` por default ANTES
+    de cada test. `_apple_enabled` lee `os.environ.get` puro sin
+    caching, así que la env var se aplica en cada call. Cualquier flow
+    que pase por ese guard hace early-return con mensaje `"Apple
+    integration deshabilitada"` y cero osascript invocation — seguro.
+
+    Opt-out: tests que genuinamente quieren ejercitar la integración
+    real (hoy no hay ninguno en la suite) pueden decorarse con
+    `@pytest.mark.real_apple` para saltar el override.
+
+    Compatible con los tests que ya hacen
+    `monkeypatch.setattr(rag, "_apple_enabled", lambda: True)` por
+    sí mismos: ese patch corre DESPUÉS del env var set, y es
+    function-scoped, así que gana. Los tests tipo
+    `test_reminder_create_extended.py` siguen viendo `_apple_enabled()`
+    devolver True y sus osascript mockeados se ejecutan como antes.
+    """
+    if request.node.get_closest_marker("real_apple"):
+        yield
+        return
+    monkeypatch.setenv("OBSIDIAN_RAG_NO_APPLE", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_vault_path(tmp_path_factory, request):
     """Safety-critical: `rag.VAULT_PATH` resuelve en import-time a
     `_DEFAULT_VAULT` (el iCloud Obsidian real del usuario) si no hay

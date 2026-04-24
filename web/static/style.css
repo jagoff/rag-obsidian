@@ -1114,8 +1114,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  max-height: 260px;
+  /* Cap dinámico — `dvh` excluye chrome dinámico (address bar iOS).
+     En landscape iPhone 14 (390px tall) el composer queda en ~y=158
+     dejando ~134px arriba; 60dvh=234px no overflow gracias al min(). */
+  max-height: min(260px, 60dvh);
   overflow-y: auto;
+  /* Momentum scroll en iOS legacy + bounce contenido (no propaga al body). */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
   font-size: 12.5px;
 }
@@ -1131,6 +1137,10 @@ body {
   cursor: pointer;
   color: var(--text-dim);
   transition: background 90ms ease, color 90ms ease;
+  /* Mobile: matar el delay de 300ms del tap + el zoom doble-tap del
+     viewport. Hace que el feedback visual sea inmediato. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .slash-item:hover,
 .slash-item.active {
@@ -1160,6 +1170,58 @@ body {
   color: var(--text-faint);
   font-style: italic;
 }
+
+/* ── Mobile / touch — best practices ────────────────────────────────────
+   Apple HIG + WCAG 2.5.5 piden tap targets >=44x44px y body text >=15px
+   en mobile. En desktop (>640px, pointer fine) los defaults compactos
+   de arriba siguen rigiendo. Activamos overrides cuando:
+     - viewport <=640px (móviles típicos), o
+     - pointer:coarse (touch screens también en tablets/landscape).
+*/
+@media (max-width: 640px), (pointer: coarse) {
+  .slash-popover {
+    /* Más padding interno para sentir el tacto. */
+    padding: 8px;
+    /* Cap más agresivo en mobile — máx 50dvh para nunca tapar la mitad
+       del chat aunque el cache de contactos tenga muchos matches. */
+    max-height: min(320px, 50dvh);
+    /* Body sube a 14px en mobile; los rows individuales suben a 15/13. */
+    font-size: 14px;
+    /* Defensivo: notch / Dynamic Island si el popover se acerca al
+       borde superior (raro pero pasa con pop arriba en pantalla chica). */
+    margin-top: env(safe-area-inset-top, 0);
+  }
+  .slash-item {
+    /* Tap target: 12px vertical * 2 + 19-20px line-height = ~44px alto
+       (Apple HIG 44pt, WCAG 2.5.5 AAA 44x44 CSS px). Crítico para que
+       la selección con el pulgar no falle. */
+    padding: 12px 12px;
+    /* Stack vertical en lugar de auto 1fr — name arriba en 15px, hint
+       (phone/email) abajo en 13px atenuado. Evita la truncation
+       horizontal de números largos como "+5491145238999" que en la
+       versión desktop quedaba con "..." al medio. */
+    grid-template-columns: 1fr;
+    gap: 2px;
+    align-items: stretch;
+  }
+  .slash-item .slash-cmd {
+    font-size: 15px;
+    /* Nombres largos como "BBI - Fernando Rodríguez (ADS)" pueden
+       wrappear en mobile en lugar de truncar. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .slash-item .slash-desc {
+    font-size: 13px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .history-popover .slash-item {
+    /* Misma altura tap-friendly también para el popover de historial. */
+    padding: 12px 12px;
+  }
+}
+
 
 .history-popover {
   left: 0;

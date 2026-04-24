@@ -42,6 +42,7 @@ from rag import (  # noqa: E402
     _LOOKUP_MODEL,
     _LOOKUP_NUM_CTX,
     RAG_STATE_SQL,
+    _enqueue_background_sql,
     _log_sql_state_error,
     _map_cpu_row,
     _map_memory_row,
@@ -8757,6 +8758,25 @@ def _memory_load_history() -> None:
             continue
 
 
+def _metrics_background_default() -> bool:
+    """True cuando las writes de los samplers (CPU/memory metrics) deben ir
+    al background queue en vez de sync.
+
+    Default ON tras audit 2026-04-24: los samplers corren en daemon threads
+    cada 60s y contenían por el WAL lock de telemetry.db con el resto de
+    los writers (queries, behavior, impressions, semantic_cache,
+    feedback_golden). Pre-fix había 66 `memory_sql_write_failed` + 34
+    `cpu_sql_write_failed` en `sql_state_errors.jsonl` (subset de los 1756
+    errores totales del periodo 19-24 Abr). Los reads del dashboard +
+    `rag insights` toleran 1-2s de delay sin regresión observable.
+
+    Override: `RAG_METRICS_ASYNC=0` fuerza sync (útil si se sospecha que
+    el daemon worker está saturado).
+    """
+    val = os.environ.get("RAG_METRICS_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def _persist_with_sqlite_retry(
     write_fn, error_tag: str, *, attempts: int = 8,
 ) -> None:
@@ -8810,11 +8830,27 @@ def _persist_with_sqlite_retry(
 
 
 def _memory_persist(sample: dict) -> None:
+    """Memory metrics sampler write — daemon thread every 60s.
+
+    Fire-and-forget via background queue (2026-04-24): pre-fix había 66
+    `memory_sql_write_failed` en `sql_state_errors.jsonl` por contención
+    WAL contra los otros writers de telemetry.db. El sampler no tiene
+    consumidor sync — los reads (dashboard, `rag insights`) toleran
+    delays 1-2s sin problema.
+
+    Rollback: `RAG_METRICS_ASYNC=0` fuerza sync (útil si se sospecha que
+    el daemon worker está saturado y samples se están perdiendo en la
+    cola — aunque ese caso es más una señal de un bug en otro lado).
+    """
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_memory_metrics",
                                _map_memory_row(sample))
-    _persist_with_sqlite_retry(_do, "memory_sql_write_failed")
+
+    if _metrics_background_default():
+        _enqueue_background_sql(_do, "memory_sql_write_failed")
+    else:
+        _persist_with_sqlite_retry(_do, "memory_sql_write_failed")
 
 
 def _memory_trim_file() -> None:
@@ -9066,11 +9102,18 @@ def _cpu_load_history() -> None:
 
 
 def _cpu_persist(sample: dict) -> None:
+    """CPU metrics sampler — daemon every 60s. Same rationale que
+    `_memory_persist`: fire-and-forget via `_enqueue_background_sql`,
+    override con `RAG_METRICS_ASYNC=0`."""
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_cpu_metrics",
                                _map_cpu_row(sample))
-    _persist_with_sqlite_retry(_do, "cpu_sql_write_failed")
+
+    if _metrics_background_default():
+        _enqueue_background_sql(_do, "cpu_sql_write_failed")
+    else:
+        _persist_with_sqlite_retry(_do, "cpu_sql_write_failed")
 
 
 def _cpu_trim_file() -> None:

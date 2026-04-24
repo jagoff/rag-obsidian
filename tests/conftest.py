@@ -235,6 +235,25 @@ def _force_log_query_event_sync(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _force_behavior_and_metrics_sync(monkeypatch):
+    """Audit 2026-04-24: `log_behavior_event`, `log_impressions`, y los
+    samplers de cpu/memory metrics pasaron a async por default (mismo
+    queue que log_query_event) para aliviar la contención WAL contra
+    telemetry.db. Mismo problema que `_force_log_query_event_sync`:
+    los tests asumen contract sincrónico y leen `rag_behavior` +
+    `rag_cpu_metrics` + `rag_memory_metrics` inmediatamente después
+    de escribir.
+
+    Forzamos sync para TODOS los tests. Override per-test con
+    `monkeypatch.setenv("RAG_LOG_BEHAVIOR_ASYNC", "1")` o
+    `RAG_METRICS_ASYNC=1`.
+    """
+    monkeypatch.setenv("RAG_LOG_BEHAVIOR_ASYNC", "0")
+    monkeypatch.setenv("RAG_METRICS_ASYNC", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_rag_local_embed_env():
     """`_maybe_auto_enable_local_embed` (rag.py:6970) mutates `os.environ`
     directly when the CLI group runs for query-like subcommands. Any test that

@@ -1138,6 +1138,28 @@ def _log_query_event_background_default() -> bool:
     return val not in ("0", "false", "no")
 
 
+def _log_behavior_event_background_default() -> bool:
+    """True cuando las writes de ``log_behavior_event`` + ``log_impressions``
+    deben ir al queue async.
+
+    Default ON tras el audit 2026-04-24: **156** `impression_sql_write_failed`
+    + **34** `behavior_sql_write_failed` en 6 días (curva:
+    102/38/123/456/946/91 errors/día entre 19-24 Abr), post-semantic-cache
+    wiring que agregó un 3er writer concurrente contra telemetry.db.
+    Behavior + impressions son high-volume fire-and-forget (cada click/
+    open/save del user + cada batch de top-k post-retrieve), y ninguno
+    necesita confirmación sync — los reads (`_load_behavior_priors`,
+    `_read_queries_for_log`) corren nightly o bajo demanda con tolerance
+    natural a eventos delayed 1-2s.
+
+    Override: ``RAG_LOG_BEHAVIOR_ASYNC=0`` fuerza sync (tests que leen
+    ``rag_behavior`` inmediatamente post-write; conftest setea ``0`` para
+    preservar contract sincrónico del suite completo).
+    """
+    val = os.environ.get("RAG_LOG_BEHAVIOR_ASYNC", "").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def log_query_event(event: dict) -> None:
     """Insert a query event into rag_queries.
 
@@ -1206,7 +1228,11 @@ def log_behavior_event(event: dict) -> None:
     def _do() -> None:
         with _ragvec_state_conn() as conn:
             _sql_append_event(conn, "rag_behavior", _map_behavior_row(event))
-    _sql_write_with_retry(_do, "behavior_sql_write_failed")
+
+    if _log_behavior_event_background_default():
+        _enqueue_background_sql(_do, "behavior_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "behavior_sql_write_failed")
 
 
 # Throttle: retrieve() can fire hundreds of times per second in tests/eval,
@@ -1276,7 +1302,11 @@ def log_impressions(
                     "session": session,
                 }
                 _sql_append_event(conn, "rag_behavior", _map_behavior_row(row))
-    _sql_write_with_retry(_do, "impression_sql_write_failed")
+
+    if _log_behavior_event_background_default():
+        _enqueue_background_sql(_do, "impression_sql_write_failed")
+    else:
+        _sql_write_with_retry(_do, "impression_sql_write_failed")
 
 
 def record_brief_written(
@@ -31643,6 +31673,12 @@ _GDRIVE_SEARCH_STOPWORDS: frozenset[str] = frozenset({
     "busca", "buscá", "buscar", "buscame", "decime", "deci", "dime",
     "contame", "quiero", "necesito", "quisiera", "saber", "ver", "mirar",
     "revisar", "chequear", "chequeame", "favor", "fijate", "fijame",
+    # "tener/haber/ser/estar" conjugations frecuentes — son verbos
+    # genéricos que inflan name-OR sin aportar (ej. "tengo la planilla
+    # de alexis" → name contains 'tengo' matchea "Tengo que firmar...").
+    "tengo", "tenés", "tiene", "tienen", "tenemos", "hay", "había",
+    "hubo", "habría", "era", "eran", "fue", "fueron", "estaba",
+    "estaban", "está", "están", "estamos", "son", "soy", "eres",
     # Drive-self-reference (redundant as a search token when the query is
     # already scoped to Drive — "busca X en mi drive" → tokens=[X]).
     "drive", "gdrive", "google", "doc", "docs", "documento", "documentos",
@@ -31680,6 +31716,221 @@ _GDRIVE_EXPORT_MIME: dict[str, str] = {
     "application/vnd.google-apps.spreadsheet": "text/csv",
     "application/vnd.google-apps.presentation": "text/plain",
 }
+
+
+# ── Person/contact alias resolution (cross-source) ──────────────────────────
+# Motivación (2026-04-24, user report Fer F. iter 3): aunque el user dice
+# "Alexis", en WhatsApp / Contacts aparece como "Alexis Herrera", y el
+# archivo de Drive que contiene su info está nombrado "Alex - Cuotas
+# Macbook" (diminutivo). Drive `name contains 'alexis'` no matchea "Alex"
+# porque el tokenizer de fullText trata "alexis" y "alex" como tokens
+# diferentes. Resultado: drive_search encontraba la planilla sólo porque
+# "macbook" sí coincidía con el nombre. Para queries donde el único hint
+# es el nombre de la persona (ej. "lo de Alexis", "planilla de Mama"),
+# esto fallaba silenciosamente.
+#
+# Solución: resolver nombres a TODAS sus variantes conocidas antes de
+# armar la query. Fuentes consultadas en orden:
+#
+#   1. **WhatsApp contacts** (SQLite local del bridge, ~10ms): es la fuente
+#      más rica del user — probablemente tiene a todos sus contactos
+#      directos con el nombre completo ("Alexis Herrera" vs "Alexis V.").
+#   2. **Apple Contacts** (AppleScript, ~100-500ms): backup/complemento,
+#      puede tener gente que no está en WA (trabajo, familia extendida).
+#   3. **99-Mentions/** del vault: notas manuales de personas frequentes
+#      con alias/canonical explícitos en frontmatter.
+#
+# Se cachea en un dict módulo-level — repetir el mismo nombre en un
+# segundo turn / query es gratis. Silent-fail: cualquier fuente puede
+# faltar sin romper el resto. Cache bounded a 256 entradas (LRU manual
+# — la 257a entrada evicta la más vieja por orden de inserción).
+
+_PERSON_ALIAS_CACHE: dict[str, tuple[str, ...]] = {}
+_PERSON_ALIAS_CACHE_MAX = 256
+
+# Punctuation / emoji chars that WhatsApp contact names frequently use as
+# decoration ("Maria 🍷", "Pepe (hermano)"). Strip them so we don't
+# pollute Drive `name contains` clauses with literal garbage that would
+# never match file names.
+_ALIAS_STRIP_RE = re.compile(r"[^a-záéíóúñü\s'-]", flags=re.IGNORECASE)
+
+
+def _clean_alias(raw: str) -> str:
+    """Normalize a WhatsApp/Contacts chunk for use as a Drive name-match
+    token: lowercase, strip decorative emoji/punctuation, collapse
+    whitespace, trim. Returns empty string if nothing useful remains.
+
+    Preserves: letters (incl. acentos + ñ/ü), spaces, apostrophes,
+    hyphens. Strips: emojis, parens, brackets, digits, punctuation.
+    """
+    cleaned = _ALIAS_STRIP_RE.sub(" ", (raw or "").lower())
+    # Collapse whitespace + trim. Hyphens/apostrophes in middle of words
+    # are preserved (ej. "jean-luc", "o'brien").
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _resolve_person_aliases(name: str) -> tuple[str, ...]:
+    """Resolver un nombre a variantes conocidas (diminutivos, apellidos,
+    alias) via WhatsApp + Apple Contacts + mentions index.
+
+    Args:
+        name: Token corto (típicamente un nombre de pila o apellido).
+            Lowercase-normalizado; acentos no se tocan porque Drive
+            `name contains` respeta unicode.
+
+    Returns:
+        Tupla de strings deduplicadas, ordenadas shortest-first (strings
+        cortos tienen más poder de match como substring en Drive). Cap
+        a 8 variantes para que la query Drive no se infle.
+
+        El `name` original NO aparece en el output (lo agregamos aparte
+        en el caller). Tokens <3 chars se filtran — demasiado genéricos
+        para producir matches útiles en Drive.
+
+    Performance: ~10ms si el caché del proceso está caliente; ~50-500ms
+    fresh (SQLite + AppleScript). Para una query con 3 tokens name-like
+    el costo está en el orden de 1-2s worst-case, aceptable para un
+    tool que ya tarda ~1s contra Drive.
+    """
+    name_clean = (name or "").strip().lower()
+    if len(name_clean) < 3:
+        return ()
+
+    cached = _PERSON_ALIAS_CACHE.get(name_clean)
+    if cached is not None:
+        return cached
+
+    candidates: set[str] = set()
+    # Flag: did ANY source (WA / AC / mentions) recognize this as a
+    # known person? Si no, tratamos el token como NO-nombre y saltamos
+    # el diminutivo heurístico (evita agregar "macb" cuando el user
+    # pregunta por "macbook"). Si alguna fuente pegó, aunque sea con
+    # una sola variante, asumimos que es un nombre propio y entonces
+    # sí tiene sentido generar el prefijo diminutivo.
+    is_known_person = False
+
+    # 1. WhatsApp contacts (SQLite). Substring-match insensible a caso.
+    #    El bridge guarda `chats.name` como lo ve WhatsApp (full name
+    #    registrado en el perfil del contacto). Tomamos name + tokens
+    #    individuales ≥3 chars. Stripping de paréntesis, emojis,
+    #    paréntesis-sueltos, y otros caracteres no-alfabéticos que
+    #    contaminan el output (ej. "Maria (amiga)" splitea en tokens
+    #    `[maria, (amiga)]` — el segundo es puro noise para Drive).
+    if WHATSAPP_DB_PATH.is_file():
+        try:
+            import sqlite3
+            con = sqlite3.connect(
+                f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=2.0,
+            )
+            try:
+                rows = con.execute(
+                    "SELECT DISTINCT name FROM chats "
+                    "WHERE name IS NOT NULL AND LOWER(name) LIKE ? LIMIT 10",
+                    (f"%{name_clean}%",),
+                ).fetchall()
+            finally:
+                con.close()
+            for (chat_name,) in rows or []:
+                if not chat_name:
+                    continue
+                cn_clean = _clean_alias(chat_name.lower())
+                if cn_clean:
+                    candidates.add(cn_clean)
+                    is_known_person = True
+                for tok in cn_clean.split():
+                    tok_stripped = _clean_alias(tok)
+                    if tok_stripped and len(tok_stripped) >= 3:
+                        candidates.add(tok_stripped)
+        except sqlite3.Error:
+            pass
+        except Exception:
+            pass
+
+    # 2. Apple Contacts via osascript — usa el helper ya probado con
+    #    timeout de 3s + cache interno. Retorna `{full_name, phones,
+    #    emails, birthday}` o None.
+    ac = _osascript_contact_search("name contains", name_clean)
+    if ac and ac.get("full_name"):
+        fn = _clean_alias(ac["full_name"])
+        if fn:
+            candidates.add(fn)
+            is_known_person = True
+            for tok in fn.split():
+                if len(tok) >= 3:
+                    candidates.add(tok)
+
+    # 3. Mentions index del vault. Si el user ya creó `99-Mentions/Seba.md`
+    #    con alias "Sebas" / "Sebastián", ambos terminan en el índice
+    #    apuntando al mismo path — tomamos los tokens del índice que
+    #    matchean el input (prefix/suffix share). Emails del índice
+    #    (contienen "@") se descartan porque los nombres de archivo en
+    #    Drive raramente incluyen email literal.
+    try:
+        idx = _load_mentions_index()
+        for token, path in (idx or {}).items():
+            if not isinstance(token, str) or len(token) < 3:
+                continue
+            if "@" in token:
+                continue
+            if name_clean in token or token in name_clean:
+                tok_clean = _clean_alias(token)
+                if tok_clean and len(tok_clean) >= 3:
+                    candidates.add(tok_clean)
+                    is_known_person = True
+                stem = Path(path).stem.lower() if path else ""
+                stem_clean = _clean_alias(stem)
+                if stem_clean and len(stem_clean) >= 3:
+                    candidates.add(stem_clean)
+                    is_known_person = True
+    except Exception:
+        pass
+
+    # 4. Diminutivos/prefijos para nombres propios ES — regla empírica:
+    #    el diminutivo típico es el first-4-chars del nombre ("Alexis"
+    #    → "Alex", "Federico" → "Fede", "Sebastián" → "Seba", "Mauricio"
+    #    → "Mauri" truncado). SÓLO aplica cuando alguna fuente (WA / AC /
+    #    mentions) reconoció el token como persona — evita agregar "macb"
+    #    cuando el user pregunta por "macbook" o "adeu" cuando pregunta
+    #    por "adeuda". Para cada candidato ≥5 chars de 1 sola palabra,
+    #    agregamos su prefijo de 4 chars si matchea al name_clean como
+    #    super/subcadena.
+    if is_known_person:
+        for c in list(candidates):
+            if " " in c or len(c) < 5 or len(c) > 20:
+                continue
+            if not (name_clean in c or c in name_clean):
+                continue
+            prefix4 = c[:4]
+            if len(prefix4) >= 3 and prefix4 != name_clean:
+                candidates.add(prefix4)
+
+        # También probamos el prefijo del `name_clean` original — cubre
+        # el caso inverso: user dice "Alexis" (aparece en WA/AC) →
+        # agregamos "alex" como variante diminutiva, aunque "alex" no
+        # esté literalmente en ningún contacto como token separado.
+        if len(name_clean) >= 5 and " " not in name_clean:
+            candidates.add(name_clean[:4])
+
+    # Remove the original name (the caller already has it in the query)
+    # + strip over-long artifacts (max 30 chars — longer ones are likely
+    # full paths or noise that wouldn't be file-name components anyway).
+    candidates.discard(name_clean)
+    result = tuple(sorted(
+        (c for c in candidates if 3 <= len(c) <= 30),
+        key=len,
+    )[:8])
+
+    # Bounded cache with simple LRU-like eviction — evict the oldest
+    # insertion when full. Python dicts preserve insertion order since
+    # 3.7 so `next(iter(...))` is the oldest key.
+    if len(_PERSON_ALIAS_CACHE) >= _PERSON_ALIAS_CACHE_MAX:
+        try:
+            oldest = next(iter(_PERSON_ALIAS_CACHE))
+            del _PERSON_ALIAS_CACHE[oldest]
+        except StopIteration:
+            pass
+    _PERSON_ALIAS_CACHE[name_clean] = result
+    return result
 
 
 def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 3500) -> str:
@@ -31737,6 +31988,28 @@ def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 350
     # umbral 5 es empírico: "alexis" (6), "macbook" (7), "adeuda" (6),
     # "factura" (7) — todos quedan. "pro" (3), "mail" (4), "doc" (3) no.
     name_tokens = [t for t in tokens if len(t) >= 5]
+
+    # Alias expansion (2026-04-24 iter 3): el user dice "alexis" pero el
+    # archivo se llama "Alex - Cuotas Macbook". `name contains 'alexis'`
+    # NO matchea "Alex" porque son tokens distintos. Fix: por cada token
+    # ≥5 chars, resolvemos via `_resolve_person_aliases` (WhatsApp +
+    # Apple Contacts + mentions) para traer diminutivos, apellidos y
+    # alias conocidos del contacto. El resultado se agrega al name-OR
+    # chain. Dedup insensible a caso. Cap a 10 aliases totales para
+    # mantener la query Drive bounded.
+    expanded: list[str] = list(name_tokens)
+    seen_lc = {t.lower() for t in expanded}
+    for t in name_tokens:
+        for alias in _resolve_person_aliases(t):
+            if alias.lower() not in seen_lc and 3 <= len(alias) <= 30:
+                expanded.append(alias)
+                seen_lc.add(alias.lower())
+            if len(expanded) >= 10:
+                break
+        if len(expanded) >= 10:
+            break
+    name_tokens = expanded
+
     if name_tokens:
         name_or = " or ".join(
             f"name contains '{t.replace(chr(92), chr(92)*2).replace(chr(39), chr(92)+chr(39))}'"

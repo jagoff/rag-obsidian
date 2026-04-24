@@ -1526,6 +1526,15 @@ def _warmup() -> None:
     except Exception as _exc:
         print(f"[warmup] memory-pressure watchdog skipped: {_exc}", flush=True)
 
+    # WAL checkpointer — libera páginas del WAL cada 30s para que los
+    # writers concurrentes (queries, behavior, cache) no peguen contra el
+    # busy_timeout bajo carga sostenida. Audit 2026-04-24.
+    try:
+        from rag import start_wal_checkpointer
+        start_wal_checkpointer()
+    except Exception as _exc:
+        print(f"[warmup] wal-checkpointer skipped: {_exc}", flush=True)
+
     def _do_warmup() -> None:
         try:
             from rag import get_db_for

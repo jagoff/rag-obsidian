@@ -1172,42 +1172,44 @@ body {
 }
 
 /* ── Mobile / touch — best practices ────────────────────────────────────
-   Apple HIG + WCAG 2.5.5 piden tap targets >=44x44px y body text >=15px
-   en mobile. En desktop (>640px, pointer fine) los defaults compactos
-   de arriba siguen rigiendo. Activamos overrides cuando:
-     - viewport <=640px (móviles típicos), o
-     - pointer:coarse (touch screens también en tablets/landscape).
+   Apple HIG + WCAG 2.5.5 AAA piden tap targets >=44x44px y body text
+   >=15px en mobile. La altura del popover es el problema más sutil:
+   posicionado con `bottom: 100% + 6px`, si su max-height excede la
+   distancia del input al borde superior del viewport, los items
+   primeros se renderean fuera de pantalla (clipped al top).
+
+   Por eso usamos un cap doble:
+     - cap absoluto chiquito (280px portrait, 150px landscape)
+     - cap relativo `calc(100dvh - reserved)` que ajusta a viewports
+       compactos (landscape iPhone 390px tall, etc.)
+
+   Activamos cuando viewport <=640px O pointer:coarse (incluye tablets
+   con touchscreen + iPads).
 */
 @media (max-width: 640px), (pointer: coarse) {
   .slash-popover {
-    /* Más padding interno para sentir el tacto. */
     padding: 8px;
-    /* Cap más agresivo en mobile — máx 50dvh para nunca tapar la mitad
-       del chat aunque el cache de contactos tenga muchos matches. */
-    max-height: min(320px, 50dvh);
-    /* Body sube a 14px en mobile; los rows individuales suben a 15/13. */
+    /* Portrait: 280px o 100dvh-380 (lo que sea más chico). En iPhone
+       SE (667px) → min(280, 287)=280. En iPhone 14 (844px) → 280
+       directamente. Reserva 380px para input + quick-chips + safe-bottom
+       + algo de margen visual al header. */
+    max-height: min(280px, calc(100dvh - 380px));
     font-size: 14px;
     /* Defensivo: notch / Dynamic Island si el popover se acerca al
-       borde superior (raro pero pasa con pop arriba en pantalla chica). */
+       borde superior (puede pasar en landscape compacto). */
     margin-top: env(safe-area-inset-top, 0);
   }
   .slash-item {
-    /* Tap target: 12px vertical * 2 + 19-20px line-height = ~44px alto
-       (Apple HIG 44pt, WCAG 2.5.5 AAA 44x44 CSS px). Crítico para que
-       la selección con el pulgar no falle. */
+    /* Tap target: 12px vertical * 2 + 19-20px line-height = ~44px alto. */
     padding: 12px 12px;
-    /* Stack vertical en lugar de auto 1fr — name arriba en 15px, hint
-       (phone/email) abajo en 13px atenuado. Evita la truncation
-       horizontal de números largos como "+5491145238999" que en la
-       versión desktop quedaba con "..." al medio. */
+    /* Stack vertical para evitar truncar números argentinos largos
+       ("+5491145238999"). Name arriba 15px, hint abajo 13px atenuado. */
     grid-template-columns: 1fr;
     gap: 2px;
     align-items: stretch;
   }
   .slash-item .slash-cmd {
     font-size: 15px;
-    /* Nombres largos como "BBI - Fernando Rodríguez (ADS)" pueden
-       wrappear en mobile en lugar de truncar. */
     white-space: normal;
     overflow-wrap: anywhere;
   }
@@ -1217,8 +1219,41 @@ body {
     overflow-wrap: anywhere;
   }
   .history-popover .slash-item {
-    /* Misma altura tap-friendly también para el popover de historial. */
     padding: 12px 12px;
+  }
+}
+
+/* Landscape compacto (iPhone landscape, ej. 844x390) — el espacio
+   arriba del input es ~130px, así que el popover debe caber en eso.
+   Reducimos cap a 130px y volvemos al layout horizontal compacto
+   (grid auto 1fr, name + hint en una línea) para que entren más rows
+   visibles aunque sea con texto más chico. Tap target sigue >=44px
+   por el padding 11px*2 + 22px line-height. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .slash-popover {
+    /* En iPhone 14 landscape (390px tall), input.top ~ 136 → arriba
+       sólo hay ~128px. Cap a 110px para tener un margen visual al
+       borde superior y respetar el notch en landscape. */
+    max-height: min(110px, calc(100dvh - 270px));
+    padding: 6px;
+  }
+  .slash-item {
+    padding: 11px 12px;
+    grid-template-columns: auto 1fr;
+    gap: 10px;
+    align-items: baseline;
+  }
+  .slash-item .slash-cmd {
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .slash-item .slash-desc {
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 }
 

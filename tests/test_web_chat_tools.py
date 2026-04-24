@@ -953,8 +953,14 @@ def test_source_intent_hint_injected_when_pre_router_fires_gmail(
         f"{hint_msg[:200]!r}"
     )
     assert "tus mails/correos" in hint_msg
-    assert "Busqué en tus mails/correos" in hint_msg
+    # El hint debe decirle al LLM que extraiga asuntos de las notas
+    # `03-Resources/Gmail/` en vez de hablar de "fuentes" abstractas
+    # (user feedback iter 3).
+    assert "03-Resources/Gmail" in hint_msg
+    assert "asunto" in hint_msg.lower()
     assert "### Mails" in hint_msg
+    # Frase canned para empty-state en vez del vago "te dejo otras fuentes".
+    assert "No encontré mails recientes en tu corpus" in hint_msg
 
 
 @pytest.mark.requires_ollama

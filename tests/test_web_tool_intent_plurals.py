@@ -155,10 +155,19 @@ def test_hint_for_single_source_gmail():
     # Etiqueta humana + sección CONTEXTO correctas.
     assert "tus mails/correos" in hint
     assert "### Mails" in hint
-    # Instrucción de reconocer vacío ANTES de fallback.
-    assert "Busqué en tus mails/correos" in hint
-    # Prohibición explícita de derivar a otras fuentes.
+    # El hint le dice al LLM que extraiga los asuntos de las notas de
+    # `03-Resources/Gmail/` — ese era el user feedback literal en iter 3.
+    assert "03-Resources/Gmail" in hint
+    assert "asunto" in hint.lower()
+    # Formato de respuesta esperado (listado, no prosa).
+    assert "LISTADO CONCRETO" in hint
+    assert "- <asunto>" in hint or "<asunto>" in hint
+    # Frase canned cuando no hay data (empty_phrase concreto, no vago).
+    assert "No encontré mails recientes en tu corpus" in hint
+    # Prohibiciones explícitas: el vocabulario que molestaba al user.
     assert "PROHIBIDO" in hint
+    assert "en tu nota" in hint
+    assert "otras fuentes que podrían ayudarte" in hint
     assert "WhatsApp" in hint
 
 
@@ -167,6 +176,7 @@ def test_hint_for_single_source_calendar():
     assert hint is not None
     assert "tu calendario/agenda/eventos" in hint
     assert "### Calendario" in hint
+    assert "No tenés eventos en el horizonte" in hint
 
 
 def test_hint_for_single_source_reminders():
@@ -174,6 +184,7 @@ def test_hint_for_single_source_reminders():
     assert hint is not None
     assert "tus recordatorios/pendientes" in hint
     assert "### Recordatorios" in hint
+    assert "No tenés recordatorios pendientes" in hint
 
 
 def test_hint_mixes_two_sources_with_y():
@@ -184,6 +195,11 @@ def test_hint_mixes_two_sources_with_y():
     assert hint is not None
     assert "tus recordatorios/pendientes y tu calendario/agenda/eventos" in hint
     assert "### Recordatorios y ### Calendario" in hint
+    # Ambos empty_phrase presentes, unidos con "y".
+    assert (
+        "No tenés recordatorios pendientes y No tenés eventos en el horizonte"
+        in hint
+    )
 
 
 def test_hint_mixes_three_sources_with_comma_and_y():
@@ -198,6 +214,8 @@ def test_hint_mixes_three_sources_with_comma_and_y():
     assert "### Mails" in hint
     assert "### Calendario" in hint
     assert "### Recordatorios" in hint
+    # Los 3 digest hints aparecen (uno por source).
+    assert "03-Resources/Gmail" in hint
 
 
 def test_hint_ignores_non_source_tools_when_mixed():
@@ -209,11 +227,27 @@ def test_hint_ignores_non_source_tools_when_mixed():
         ["reminders_due", "calendar_ahead", "weather"]
     )
     assert hint is not None
-    # reminders + calendar están; weather NO debe aparecer en el hint
-    # (solo tiene entrada en _SOURCE_INTENT_LABEL los 3 source-specific).
+    # reminders + calendar están; weather NO debe aparecer en el hint.
     assert "tus recordatorios/pendientes" in hint
     assert "tu calendario/agenda/eventos" in hint
     assert "clima" not in hint.lower()
+
+
+def test_hint_forbids_vague_fallback_vocabulary():
+    """El user feedback iter 3: "en vez de fuentes (que no tiene sentido
+    porque son notas de obsidian) trae los titulos de los mails".
+    El hint debe PROHIBIR explícitamente el vocabulario abstracto.
+    """
+    hint = _build_source_intent_hint(["gmail_recent"])
+    assert hint is not None
+    # Verificamos que las frases prohibidas están nombradas en el bloque
+    # PROHIBIDO (listadas para que el LLM sepa qué evitar).
+    assert "en tus fuentes" in hint
+    assert "te dejo otras fuentes" in hint
+    assert "revisá tus notas" in hint
+    # También prohíbe mencionar rutas PARA — el user no debería ver
+    # "03-Resources/..." en la respuesta final.
+    assert "Mencionar rutas del vault" in hint
 
 
 # ── 3. Config sanity ────────────────────────────────────────────────────────

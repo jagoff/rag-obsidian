@@ -2324,27 +2324,54 @@ def delete_calendar_event(req: CalendarDeleteRequest) -> dict:
     return {"ok": True, "message": msg}
 
 
+class WhatsAppReplyTarget(BaseModel):
+    """Optional reply context for `/api/whatsapp/send` — when the user
+    clicked [Enviar] on a `propose_whatsapp_reply` card, the UI ships
+    the resolved original message so the bridge can wire a native quote
+    when it gains support (currently the bridge ignores these fields,
+    see ``rag._whatsapp_send_to_jid`` docstring; the audit log keeps
+    `message_id` regardless so we can correlate later)."""
+    message_id: str
+    original_text: str | None = ""
+    sender_jid: str | None = ""
+
+
 class WhatsAppSendRequest(BaseModel):
     jid: str                      # e.g. "5491234567890@s.whatsapp.net"
     message_text: str             # literal message body (no anti-loop prefix)
     proposal_id: str | None = None  # for audit — id of the draft the UI confirmed
+    reply_to: WhatsAppReplyTarget | None = None  # populated when this is a reply
 
 
 @app.post("/api/whatsapp/send")
 def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     """Execute a WhatsApp send after the user clicked [Enviar] on a
-    ``propose_whatsapp_send`` proposal card in the chat UI.
+    ``propose_whatsapp_send`` (or ``propose_whatsapp_reply``) proposal
+    card in the chat UI.
 
     Flow:
       1. `propose_whatsapp_send` (chat tool) resolves contact → JID and
          emits an SSE `proposal` event with ``kind="whatsapp_message"``.
+         For replies the tool is `propose_whatsapp_reply` and the kind is
+         ``"whatsapp_reply"`` — the card carries an extra ``reply_to``
+         field with the resolved original message.
       2. The UI renders a card with the drafted text and [Enviar] /
-         [Editar] / [Cancelar] buttons.
+         [Editar] / [Cancelar] buttons. When it's a reply the original
+         message is shown above the textarea as a styled blockquote.
       3. On [Enviar] the UI POSTs to this endpoint with `{jid,
-         message_text, proposal_id}`. We call `_whatsapp_send_to_jid`
-         with ``anti_loop=False`` so the zero-width space prefix (used
-         for bot-to-self traffic) doesn't leak to a third-party's
-         WhatsApp.
+         message_text, proposal_id, reply_to?}`. We call
+         `_whatsapp_send_to_jid` with ``anti_loop=False`` so the
+         zero-width space prefix (used for bot-to-self traffic) doesn't
+         leak to a third-party's WhatsApp.
+
+    Replies (``reply_to`` present):
+      - The bridge today (`whatsapp-mcp/whatsapp-bridge/main.go:707`)
+        does NOT support `ContextInfo`/`QuotedMessage` — the message
+        ships as plain text without WhatsApp's native boxed-quote UI.
+        We still pass the field forward so when the bridge adds quote
+        support it works without client changes.
+      - The audit log records ``reply_to_id`` so we can correlate the
+        outbound message with the original incoming message later.
 
     Returns ``{ok: true, jid}`` on success, raises 400/502 on bridge
     unreachable or 4xx/5xx. Rate-limited by the same IP bucket as
@@ -2357,8 +2384,23 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
         raise HTTPException(status_code=400, detail="jid inválido (debe ser '<digits>@s.whatsapp.net' o '<id>@g.us')")
     if not body:
         raise HTTPException(status_code=400, detail="message_text vacío")
+    reply_to_payload: dict | None = None
+    reply_to_id = ""
+    if req.reply_to:
+        reply_to_id = (req.reply_to.message_id or "").strip()
+        if not reply_to_id:
+            raise HTTPException(status_code=400, detail="reply_to.message_id vacío")
+        reply_to_payload = {
+            "message_id": reply_to_id,
+            "original_text": req.reply_to.original_text or "",
+            "sender_jid": req.reply_to.sender_jid or "",
+        }
     from rag import _whatsapp_send_to_jid  # noqa: PLC0415
-    ok = _whatsapp_send_to_jid(jid, body, anti_loop=False)
+    ok = _whatsapp_send_to_jid(
+        jid, body,
+        anti_loop=False,
+        reply_to=reply_to_payload,
+    )
     if not ok:
         # Can't distinguish "bridge down" from "bridge rejected" cheaply
         # — the helper swallows the HTTP code. Return 502 (bad gateway)
@@ -2371,10 +2413,11 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     try:
         import rag as _rag  # noqa: PLC0415
         _rag._ambient_log_event({
-            "cmd": "whatsapp_user_send",
+            "cmd": "whatsapp_user_reply" if reply_to_payload else "whatsapp_user_send",
             "jid": jid,
             "len": len(body),
             "proposal_id": req.proposal_id or "",
+            "reply_to_id": reply_to_id,
             "sent": True,
         })
     except Exception:

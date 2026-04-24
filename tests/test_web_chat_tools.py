@@ -1617,3 +1617,68 @@ def test_app_js_makes_whatsapp_proposal_recipient_clickable():
         "appendWhatsAppProposal no genera link en el recipient — el "
         "name de 'Para: <X>' debería ser clickable a wa.me/<phone>"
     )
+
+
+# ── Contacts popover keyboard nav (verified manualmente con Playwright) ───
+
+
+def test_app_js_wires_arrowdown_arrowup_in_contacts_popover():
+    """↑/↓ deben mover el highlight entre contactos. Verificado a mano
+    con Playwright — el handler vive en el global keydown listener
+    cuando `contactsPopover.hidden === false`. Si alguien refactorea
+    los handlers y quita esto, el user pierde la nav por teclado."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    # El handler debe chequear contactsPopover.hidden y actualizar
+    # contactsIndex con ArrowDown/Up.
+    assert "contactsPopover.hidden" in js
+    assert "ArrowDown" in js and "ArrowUp" in js
+    # Búsqueda más estricta: el handler de ArrowDown debe incrementar
+    # contactsIndex (cíclicamente vía modulo).
+    assert "(contactsIndex + 1) % contactsItems.length" in js, (
+        "ArrowDown handler en contacts popover roto/missing — el user "
+        "no puede navegar la lista con teclado"
+    )
+    assert "contactsIndex - 1 + contactsItems.length" in js, (
+        "ArrowUp handler en contacts popover roto/missing"
+    )
+
+
+def test_app_js_wires_tab_and_enter_to_pick_contact():
+    """Tab y Enter deben seleccionar el contacto highlighted. Tab es la
+    convención de autocomplete; Enter es la que más espera el user
+    (símil a Gmail / Slack)."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    # Buscar el bloque del handler que matchea Tab o Enter dentro del
+    # contacts popover y llama a pickContact.
+    # Heurística: ambas keys deben aparecer en el mismo `if`.
+    assert 'e.key === "Tab" || (e.key === "Enter"' in js, (
+        "Tab + Enter no pican el contacto highlighted — el user tiene "
+        "que usar el mouse aunque ya esté con foco en el input"
+    )
+    assert "pickContact(pick)" in js
+
+
+def test_app_js_wires_escape_to_close_contacts_popover():
+    """Esc debe cerrar el popover sin perder lo tipeado en el input.
+    Convención universal (Gmail / Slack / Notion / VSCode)."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent /
+          "web" / "static" / "app.js").read_text(encoding="utf-8")
+    # Buscar Escape dentro del contacts popover handler.
+    # Heurística: contactsPopover y Escape en proximidad.
+    # Buscamos la 2da ocurrencia (la 1ra está en updateContactsPopover,
+    # la 2da en el keydown handler). Heurística más estricta: buscar
+    # `contactsPopover.hidden && contactsItems.length` que es el guard
+    # del keydown handler.
+    cidx = js.find('!contactsPopover.hidden && contactsItems.length')
+    assert cidx > 0, "keydown handler de contacts popover no encontrado"
+    block = js[cidx:cidx + 1500]
+    assert 'Escape' in block, (
+        "Esc no cierra el contacts popover — el user queda atrapado "
+        "con el popover abierto si cambia de idea"
+    )
+    assert 'hideContactsPopover()' in block

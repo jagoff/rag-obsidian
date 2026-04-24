@@ -135,59 +135,12 @@
         </button>
       </header>
 
-      <!-- New chat button — claude.ai pattern (prominent, full-width).
-           En collapsed mode se achica a sólo icon. -->
-      <button id="new-chat-btn" class="sidebar-new-btn" type="button"
-              title="Nueva conversación (olvida historial)">
-        <svg class="icon-new" width="16" height="16" viewBox="0 0 24 24"
-             aria-hidden="true" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 5v14"/>
-          <path d="M5 12h14"/>
-        </svg>
-        <span class="sidebar-btn-label">nueva conversación</span>
-      </button>
-
-      <!-- Search input — filtra la lista de sesiones client-side por
-           substring case-insensitive sobre el título. No pegamos al
-           server (las sesiones ya vienen en memoria). -->
-      <div class="sidebar-search" role="search">
-        <svg class="icon-search" width="14" height="14" viewBox="0 0 24 24"
-             aria-hidden="true" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="11" cy="11" r="8"/>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
-        <input id="sessions-search" type="search"
-               placeholder="buscar en recientes…"
-               aria-label="Buscar en conversaciones recientes"
-               autocomplete="off">
-      </div>
-
-      <!-- Sessions list. Populated por fetch a /api/sessions en boot y
-           tras cada /new o /save. Click en un item → hidrata los turns
-           en el área principal. -->
-      <nav class="sidebar-sessions" aria-label="Conversaciones recientes">
-        <div class="sidebar-section-label">
-          <span>recientes</span>
-          <button id="sessions-refresh-btn" class="icon-btn-sm" type="button"
-                  aria-label="Refrescar lista" title="Refrescar">
-            <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"
-                 fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="23 4 23 10 17 10"/>
-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
-          </button>
-        </div>
-        <ul id="sessions-list" class="sessions-list" role="list">
-          <li class="sessions-empty" data-empty-state>cargando…</li>
-        </ul>
-      </nav>
-
-      <!-- Footer: vault, modelo, voz, ayuda, home, dashboard.
-           Los pickers conservan los IDs originales — app.js no cambia
-           cómo los lee. -->
+      <!-- Controls block — vault, modo, voz, ayuda, home, dashboard, status.
+           Movido desde el bottom al top 2026-04-24: el user lo quiere
+           "arriba de todo" en la barra. Las clases conservan el prefijo
+           `sidebar-footer-*` por compat — nada de JS se engancha a ellas
+           (grep app.js: cero hits) y renombrar sería churn gratis. La
+           CSS ajusta border a bottom + saca safe-area-bottom. -->
       <footer class="sidebar-footer">
         <div class="sidebar-footer-controls">
           <div class="sidebar-footer-row">
@@ -260,6 +213,57 @@
           </a>
         </div>
       </footer>
+
+      <!-- New chat button — claude.ai pattern (prominent, full-width).
+           En collapsed mode se achica a sólo icon. -->
+      <button id="new-chat-btn" class="sidebar-new-btn" type="button"
+              title="Nueva conversación (olvida historial)">
+        <svg class="icon-new" width="16" height="16" viewBox="0 0 24 24"
+             aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5v14"/>
+          <path d="M5 12h14"/>
+        </svg>
+        <span class="sidebar-btn-label">nueva conversación</span>
+      </button>
+
+      <!-- Search input — filtra la lista de sesiones client-side por
+           substring case-insensitive sobre el título. No pegamos al
+           server (las sesiones ya vienen en memoria). -->
+      <div class="sidebar-search" role="search">
+        <svg class="icon-search" width="14" height="14" viewBox="0 0 24 24"
+             aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input id="sessions-search" type="search"
+               placeholder="buscar en recientes…"
+               aria-label="Buscar en conversaciones recientes"
+               autocomplete="off">
+      </div>
+
+      <!-- Sessions list. Populated por fetch a /api/sessions en boot y
+           tras cada /new o /save. Click en un item → hidrata los turns
+           en el área principal. -->
+      <nav class="sidebar-sessions" aria-label="Conversaciones recientes">
+        <div class="sidebar-section-label">
+          <span>recientes</span>
+          <button id="sessions-refresh-btn" class="icon-btn-sm" type="button"
+                  aria-label="Refrescar lista" title="Refrescar">
+            <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+        </div>
+        <ul id="sessions-list" class="sessions-list" role="list">
+          <li class="sessions-empty" data-empty-state>cargando…</li>
+        </ul>
+      </nav>
+
     </div>
   </aside>
 

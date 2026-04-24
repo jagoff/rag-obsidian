@@ -2898,9 +2898,7 @@ strong, b, th {
 /* En collapsed mode (desktop only) el historial desaparece completo —
    los títulos truncados a 2-3 chars ("Hol", "cua…") no son útiles ni
    legibles, distraen más que ayudan. El user que quiere ver la lista
-   expande la sidebar. `margin-top:auto` en el footer compensa por el
-   espacio que antes llenaba .sidebar-sessions con flex:1, así los
-   iconos quedan pegados abajo.
+   expande la sidebar.
    Scopeado a @media ≥768px porque en mobile el estado "collapsed" es
    un leftover persistido (el sidebar mobile abre como drawer full-
    width y no tiene variante icon-only). Sin scope, un user que tenía
@@ -2909,21 +2907,21 @@ strong, b, th {
   #sidebar[data-state="collapsed"] .sidebar-sessions {
     display: none;
   }
-  #sidebar[data-state="collapsed"] .sidebar-footer {
-    margin-top: auto;
-  }
 }
 
-/* ── Footer: pickers + actions ─────────────────────────────────────── */
+/* ── Controls block: pickers + actions ─────────────────────────────────
+   2026-04-24: movido del bottom al top de la sidebar por pedido del user
+   ("vault, modo, voz, home, dashboard arriba de todo"). El nombre
+   `.sidebar-footer-*` se preserva para no romper nada — no hay JS que
+   se enganche (grep: zero hits en app.js). Border pasó de top→bottom
+   y se sacó la safe-area-inset-bottom (ya no está pegado al edge). */
 
 .sidebar-footer {
-  border-top: 1px solid var(--sidebar-border);
-  padding-top: 10px;
+  border-bottom: 1px solid var(--sidebar-border);
+  padding-bottom: 10px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  /* Safe-area para home indicator en PWA standalone. */
-  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .sidebar-footer-controls {

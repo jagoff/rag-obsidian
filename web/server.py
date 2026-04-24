@@ -867,7 +867,68 @@ def _own_conversation_path(session_id: str) -> str | None:
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="obsidian-rag web", docs_url=None, redoc_url=None)
+
+# Lifespan handler para reemplazar `@app.on_event("startup"/"shutdown")`
+# (deprecated en FastAPI 0.93+, será eliminado en una mayor futura).
+# 2026-04-24 audit hardening: las 4 callbacks que estaban dispersas
+# por el archivo (warmup home cache, drain conversation writers,
+# memory sampler, cpu sampler) se registran ahora vía decorators
+# `@_on_startup` / `@_on_shutdown` que populan estas listas. La
+# lifespan async-iterates para preservar el contract original (orden
+# de registro = orden de ejecución, idéntico al behavior de los 4
+# `on_event` antes).
+#
+# Beneficio operacional: cero deprecation warnings en cada test run
+# (eran 4 + 16 propagated = 20 warnings/run que ensuciaban el output).
+# Beneficio estructural: lifespan maneja excepciones de startup
+# uniformemente — antes una callback que raisea bloqueaba el server
+# silently; ahora la traza queda visible.
+_startup_callbacks: "list[Callable[[], None]]" = []
+_shutdown_callbacks: "list[Callable[[], None]]" = []
+
+
+def _on_startup(fn: "Callable[[], None]") -> "Callable[[], None]":
+    """Decorator: registra `fn` para correr al startup. Reemplazo
+    drop-in de `@app.on_event("startup")`."""
+    _startup_callbacks.append(fn)
+    return fn
+
+
+def _on_shutdown(fn: "Callable[[], None]") -> "Callable[[], None]":
+    """Decorator: registra `fn` para correr al shutdown. Reemplazo
+    drop-in de `@app.on_event("shutdown")`."""
+    _shutdown_callbacks.append(fn)
+    return fn
+
+
+from contextlib import asynccontextmanager
+from typing import Callable, AsyncIterator
+
+
+@asynccontextmanager
+async def _lifespan(_app) -> "AsyncIterator[None]":
+    """FastAPI lifespan: corre todos los callbacks registrados via
+    `_on_startup` antes del primer request, y los de `_on_shutdown` al
+    apagar el server. Errores en startup callbacks NO bloquean el
+    server (catch + log); errores en shutdown se loguean y siguen.
+    """
+    for fn in _startup_callbacks:
+        try:
+            fn()
+        except Exception as exc:
+            print(f"[lifespan-startup] {fn.__name__} falló: {exc}", flush=True)
+    yield
+    for fn in _shutdown_callbacks:
+        try:
+            fn()
+        except Exception as exc:
+            print(f"[lifespan-shutdown] {fn.__name__} falló: {exc}", flush=True)
+
+
+app = FastAPI(
+    title="obsidian-rag web", docs_url=None, redoc_url=None,
+    lifespan=_lifespan,
+)
 
 
 # Cache-Control para /static/* — assets inmutables en prod (versionados por
@@ -1201,7 +1262,7 @@ _PROPOSE_CREATE_OVERRIDE = (
 )
 
 
-@app.on_event("startup")
+@_on_startup
 def _warmup() -> None:
     """Hydrate the home cache and kick the bg prewarmer; DO NOT pin the
     chat model or reranker on boot.
@@ -4660,7 +4721,7 @@ def _spawn_conversation_writer(
     return t
 
 
-@app.on_event("shutdown")
+@_on_shutdown
 def _drain_conversation_writers() -> None:
     """On server stop, give in-flight conversation writers up to 5s to
     finish. Any that don't make it land in the retry queue on disk via
@@ -8773,7 +8834,7 @@ def _memory_trim_file() -> None:
         pass
 
 
-@app.on_event("startup")
+@_on_startup
 def _start_memory_sampler() -> None:
     _memory_load_history()
 
@@ -9027,7 +9088,7 @@ def _cpu_trim_file() -> None:
         pass
 
 
-@app.on_event("startup")
+@_on_startup
 def _start_cpu_sampler() -> None:
     _cpu_load_history()
 

@@ -3172,3 +3172,111 @@ __messagesObserver.observe(messagesEl, { childList: true, subtree: true });
 // Run once on boot antes de que el observer registre algún evento — el
 // default HTML tiene #messages vacío, entonces arrancamos en chat-empty.
 updateChatEmptyState();
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Composer toolbar wiring (2026-04-24) — claude.ai-style controls
+// ═══════════════════════════════════════════════════════════════════════
+// Tres piezas nuevas en la bottom-row del composer:
+//   · #composer-plus-btn     → abre el help modal (MVP; más adelante
+//                               puede ser un menú de attach/voice/etc)
+//   · #composer-model-badge  → muestra el modelo activo, al click
+//                               scrollea a la sidebar + focusea el
+//                               #model-picker (si el sidebar está
+//                               collapsed lo expande primero)
+//   · #composer-mic-btn      → stub "próximamente" — whisper-cli STT
+//                               ya existe en el proyecto pero wiring
+//                               al browser es otro feature
+// + Quick-chips: al click rellenan #input con data-query y submitean.
+// ═══════════════════════════════════════════════════════════════════════
+
+const composerPlusBtn = document.getElementById("composer-plus-btn");
+const composerModelBadge = document.getElementById("composer-model-badge");
+const composerModelName = composerModelBadge?.querySelector(".composer-model-name");
+const composerMicBtn = document.getElementById("composer-mic-btn");
+
+// ── Plus button: abre el help modal (atajos + slash commands) ──
+if (composerPlusBtn && helpBtn) {
+  composerPlusBtn.addEventListener("click", () => helpBtn.click());
+}
+
+// ── Model badge: refleja el valor actual del #model-picker de la
+// sidebar, y al click expande la sidebar + focusea el picker para que
+// el user cambie el modelo con la dropdown nativa. Es un shortcut
+// visual que evita tener que navegar a la sidebar para saber qué
+// modelo se está usando. ──
+function updateComposerModelBadge() {
+  if (!composerModelName || !modelPicker) return;
+  const selected = modelPicker.options[modelPicker.selectedIndex];
+  const label = (selected?.textContent || "").trim();
+  // El texto del option suele ser "qwen2.5:7b (activo)" — limpiamos el
+  // sufijo para no duplicar la info visual (el badge ya implica "activo").
+  composerModelName.textContent = label.replace(/\s*\(activo\)\s*$/i, "")
+                                       .replace(/\s*\(disponible\)\s*$/i, "")
+                                       || "modelo";
+}
+if (modelPicker) {
+  modelPicker.addEventListener("change", updateComposerModelBadge);
+  // MutationObserver para cuando el modelPicker se popula async (fetch
+  // de /api/chat/model). Sin esto el badge arranca en "…" y no se
+  // actualiza nunca hasta que el user cambia manualmente.
+  new MutationObserver(updateComposerModelBadge)
+    .observe(modelPicker, { childList: true, characterData: true, subtree: true });
+  updateComposerModelBadge();
+}
+if (composerModelBadge && modelPicker) {
+  composerModelBadge.addEventListener("click", () => {
+    // En desktop collapsed, expandir primero — sin esto el <select>
+    // queda invisible detrás del sidebar colapsado.
+    const isCollapsed = sidebar?.getAttribute("data-state") === "collapsed";
+    const isDesktop = window.matchMedia("(min-width: 768px)").matches;
+    if (isCollapsed && isDesktop) {
+      sidebarCollapseBtn?.click();
+    }
+    // En mobile, abrir el drawer.
+    const isMobile = window.matchMedia("(max-width: 767px)").matches;
+    if (isMobile && typeof openSidebarMobile === "function") {
+      openSidebarMobile();
+    }
+    // Scroll + focus + abrir la dropdown nativa. showPicker() es Chrome
+    // 99+ / Safari 16.4+ — si no existe, focus() al menos lleva el
+    // keyboard nav ahí y el user toca Space/Enter para abrir.
+    setTimeout(() => {
+      modelPicker.focus();
+      if (typeof modelPicker.showPicker === "function") {
+        try { modelPicker.showPicker(); } catch (_) {}
+      }
+    }, 120);
+  });
+}
+
+// ── Mic button: stub — muestra un system message explicando que viene. ──
+if (composerMicBtn) {
+  composerMicBtn.addEventListener("click", () => {
+    pushSystemMessage(
+      "meta",
+      "dictado por voz en preparación — por ahora usá /tts para escuchar respuestas"
+    );
+  });
+}
+
+// ── Quick-chips: click rellena input + submit directo ──
+document.querySelectorAll(".quick-chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    const q = chip.getAttribute("data-query") || "";
+    if (!q) return;
+    input.value = q;
+    autoGrow();
+    updateSendBtnState();
+    // Si el chip trae espacio al final (ej "buscar en el vault "), el
+    // user probablemente quiere completarlo con más texto — no
+    // submiteamos, solo focuseamos con el cursor al final.
+    if (q.endsWith(" ")) {
+      input.focus();
+      input.setSelectionRange(q.length, q.length);
+      return;
+    }
+    // Submit directo — mismo path que Enter.
+    form.requestSubmit();
+  });
+});

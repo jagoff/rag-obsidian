@@ -1227,32 +1227,88 @@ body {
 .composer-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;   /* botones a la derecha siempre */
+  justify-content: space-between;  /* split: izq (plus) / der (modelo+mic+send) */
   gap: 6px;
   min-height: 34px;
 }
-
-.composer-hint {
-  flex: 1;
-  font-size: 11px;
-  color: var(--text-faint);
-  letter-spacing: 0.02em;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  user-select: none;
+.composer-actions-left,
+.composer-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
-.composer-hint kbd {
-  font-family: inherit;
-  font-size: 10px;
-  padding: 1px 5px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+
+/* Icon-only buttons del toolbar (plus, mic). Estilo ghost — sin border
+   sin background en idle, hover agrega bg-elev + color-text. Matchea
+   el look de claude.ai donde los controles son discreetos. */
+.composer-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
   color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.composer-icon-btn:hover {
   background: var(--bg-elev);
-  vertical-align: baseline;
-  /* Caps el tamaño para que no engorde el row en Safari. */
-  line-height: 1.4;
+  color: var(--text);
+  border-color: var(--border);
+}
+.composer-icon-btn:active { transform: scale(0.94); }
+.composer-icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Model badge — pill con nombre del modelo activo + chevron.
+   Click: focusea el #model-picker de la sidebar (si está collapsed
+   se expande primero). Hover da feedback visual. */
+.composer-model-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+  white-space: nowrap;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-model-badge:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+  border-color: var(--border);
+}
+.composer-model-badge:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.composer-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-model-chevron {
+  flex-shrink: 0;
+  opacity: 0.7;
 }
 
 #input {
@@ -3199,4 +3255,75 @@ body.chat-empty #input-wrap {
   body.chat-empty #input {
     min-height: 72px;
   }
+}
+
+/* ── Quick-chips (2026-04-24) — claude.ai "From Gmail / From Drive"
+   pattern. Sólo visibles en empty state, debajo del composer hero.
+   Al click: llena #input con data-query y submitea.
+   Design: pill rounded-full, border sutil, icon + label 12-13px.
+   Hover: bg-elev + border-strong + color-text. */
+#quick-chips {
+  display: none;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin: 20px auto 0;
+  max-width: 760px;
+}
+body.chat-empty #quick-chips {
+  display: flex;
+}
+
+.quick-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 100px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+.quick-chip:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.quick-chip:active { transform: scale(0.97); }
+.quick-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.quick-chip-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.quick-chip:hover .quick-chip-icon {
+  opacity: 1;
+}
+
+/* Mobile: chips scrollean horizontal (row) en vez de wrap para caber
+   en pantallas angostas sin parecer una lista vertical apretada. */
+@media (max-width: 767px) {
+  #quick-chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    justify-content: flex-start;
+    padding: 0 16px 12px;
+    margin-top: 12px;
+    -webkit-overflow-scrolling: touch;
+    /* Scrollbar super sutil — apenas visible. */
+    scrollbar-width: none;
+  }
+  #quick-chips::-webkit-scrollbar { display: none; }
+  .quick-chip { flex-shrink: 0; }
 }

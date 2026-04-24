@@ -436,6 +436,31 @@
       border-radius: 8px;
       margin-bottom: 14px;
       font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    /* Botón "✕" para cerrar manualmente un banner antes del auto-dismiss
+       (3.5-4s). El padding queda flush con el texto del banner pero con
+       área de tap suficiente (24×24) para mobile. */
+    .banner-close {
+      margin-left: auto;
+      background: transparent;
+      border: 1px solid transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 4px;
+      opacity: 0.7;
+      flex-shrink: 0;
+    }
+    .banner-close:hover { opacity: 1; }
+    .banner-close:focus-visible {
+      outline: 2px solid color-mix(in srgb, currentColor 60%, transparent);
+      outline-offset: 1px;
+      opacity: 1;
     }
 
     /* ── Insights grid ─────────────────────────────────────────────────
@@ -480,12 +505,13 @@
       gap: 10px;
       flex-wrap: wrap;
     }
-    .insight-head h3 {
+    .insight-head h2 {
       font-size: 11.5px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--text-dim);
+      margin: 0;
     }
     .insight-meta {
       font-size: 10.5px;
@@ -764,6 +790,68 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    /* Filtros de log: 2 grupos chiquitos lado a lado, look idéntico al
+       chat-mode-toggle de la sidebar (botones segmented, is-active
+       resaltado). */
+    .logs-filters {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 10.5px;
+      margin-bottom: 4px;
+    }
+    .logs-filter-group {
+      display: inline-flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .logs-filter-btn {
+      background: transparent;
+      color: var(--text-dim);
+      border: none;
+      padding: 4px 9px;
+      font-family: inherit;
+      font-size: 10.5px;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+      min-width: 30px;
+    }
+    .logs-filter-btn + .logs-filter-btn {
+      border-left: 1px solid var(--border);
+    }
+    .logs-filter-btn:hover { background: var(--hover); }
+    .logs-filter-btn.is-active {
+      background: color-mix(in srgb, var(--cyan) 18%, transparent);
+      color: var(--cyan);
+      font-weight: 600;
+    }
+    /* Click-to-expand: una fila .log-row.expanded muestra las extras
+       (exc_type + where path completos) en una segunda línea debajo del
+       msg, indented para que se vea agrupado. */
+    .log-list li {
+      cursor: pointer;
+    }
+    .log-list .log-extras {
+      grid-column: 2 / -1;
+      color: var(--text-faint);
+      font-size: 10px;
+      padding: 2px 0 4px 8px;
+      display: none;
+      white-space: normal;
+      word-break: break-word;
+    }
+    .log-list li.expanded .log-extras { display: block; }
+    .log-list li.expanded .log-msg { white-space: normal; }
+    .log-list .log-empty {
+      grid-template-columns: 1fr;
+      color: var(--text-faint);
+      text-align: center;
+      padding: 12px 0;
+      cursor: default;
+    }
+    .log-list .log-empty:hover { background: transparent; }
 
     /* Uptime heatmap 7d × 24h. Cada celda 10×10px para que en desktop
        entre cómodo y en mobile se escale con el container. */
@@ -835,6 +923,9 @@
       border-radius: 8px;
       margin-bottom: 14px;
       font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
 
     /* Mobile tweaks — densidad menor, 1 columna. */
@@ -850,14 +941,56 @@
       .service-action .action-label { display: none; }
       .service-action { padding: 4px 7px; }
     }
+
+    /* ── a11y: skip-link + tap targets (audit cross-cutting) ────────────
+       status.html no incluye style.css, así que el bloque global de a11y
+       que L1 agregó al CSS compartido NO aplica acá. Re-implementamos lo
+       mínimo inline: skip-link visible al recibir foco, y min-height 44px
+       para botones cuando el puntero es coarse (touch) o el viewport es
+       <= 640px (mobile). En desktop los chips compactos quedan como antes.
+    */
+    .skip-link {
+      position: absolute;
+      top: 0;
+      left: 0;
+      padding: 8px 12px;
+      background: var(--bg-card);
+      color: var(--text);
+      border: 1px solid var(--cyan);
+      border-radius: 4px;
+      text-decoration: none;
+      font-size: 13px;
+      transform: translateY(-200%);
+      z-index: 10000;
+      transition: transform 120ms ease-out;
+    }
+    .skip-link:focus,
+    .skip-link:focus-visible {
+      transform: translateY(0);
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+    /* Main landmark con tabindex=-1 no debe mostrar outline al recibir
+       foco programático desde el skip-link (no es interactivo). */
+    main:focus,
+    main:focus-visible { outline: none; }
+
+    @media (pointer: coarse), (max-width: 640px) {
+      .header-meta button,
+      .service-action {
+        min-height: 44px;
+      }
+      .service-action { padding: 6px 12px; }
+    }
   </style>
 </head>
 <body>
+  <a href="#main" class="skip-link">Saltar al contenido</a>
   <div class="container">
     <header>
       <h1>rag <span>· status</span></h1>
       <div class="header-meta">
-        <span id="meta-updated" aria-live="polite">cargando…</span>
+        <span id="meta-updated" aria-live="polite" aria-atomic="true">cargando…</span>
         <button id="live-toggle" type="button" aria-pressed="true"
                 aria-label="Pausar o reanudar auto-refresh">
           <span id="live-label">auto-refresh ON</span>
@@ -872,6 +1005,7 @@
       </div>
     </header>
 
+    <main id="main" tabindex="-1">
     <!-- ── Insights grid ──────────────────────────────────────────────
          5 cards con lo que el semáforo binario no captura. Sólo la
          primera (latencia) es real en este momento; las otras 4 tienen
@@ -882,7 +1016,7 @@
       <!-- #1 Latencia /api/chat — REAL -->
       <article class="insight-card" id="insight-latency" aria-label="Latencia api chat">
         <div class="insight-head">
-          <h3>latencia /api/chat · 24h</h3>
+          <h2>latencia /api/chat · 24h</h2>
           <span class="insight-meta" id="lat-count">—</span>
         </div>
         <div class="insight-big">
@@ -891,7 +1025,7 @@
           <span class="insight-delta neutral" id="lat-p95-delta">—</span>
         </div>
         <svg class="sparkline" id="lat-sparkline" viewBox="0 0 400 64"
-             preserveAspectRatio="none" aria-hidden="true"></svg>
+             preserveAspectRatio="xMidYMid meet" aria-hidden="true"></svg>
         <div class="insight-legend">
           <span><span class="dot p50"></span>p50</span>
           <span><span class="dot p95"></span>p95</span>
@@ -907,7 +1041,7 @@
            la lista muestra los top-N `where`/`event` por count. -->
       <article class="insight-card" id="insight-errors" aria-label="Error budget">
         <div class="insight-head">
-          <h3>errores sistema · 24h</h3>
+          <h2>errores sistema · 24h</h2>
           <span class="insight-meta" id="err-delta">—</span>
         </div>
         <div class="insight-donut-row">
@@ -933,7 +1067,7 @@
            chip coloreado ok/warn/stale/unknown. -->
       <article class="insight-card" id="insight-freshness" aria-label="Freshness de datos">
         <div class="insight-head">
-          <h3>freshness datos</h3>
+          <h2>freshness datos</h2>
           <span class="insight-meta" id="fresh-summary">—</span>
         </div>
         <div class="insight-big">
@@ -947,50 +1081,45 @@
         </table>
       </article>
 
-      <!-- #4 Log tail — PREVIEW (datos dummy) -->
-      <article class="insight-card insight-preview" aria-label="Actividad reciente">
+      <!-- #4 Log tail — REAL
+           Fuente: /api/status/logs. Eventos individuales WARN/ERROR
+           de silent_errors.jsonl + sql_state_errors.jsonl con filtros
+           de tiempo + level + click-to-expand por fila. -->
+      <article class="insight-card" id="insight-logs" aria-label="Actividad reciente">
         <div class="insight-head">
-          <h3>actividad reciente · WARN/ERROR</h3>
-          <span class="preview-badge">vista previa</span>
+          <h2>actividad reciente · WARN/ERROR</h2>
+          <span class="insight-meta" id="logs-summary">—</span>
         </div>
-        <ul class="log-list">
-          <li>
-            <span class="log-ts">hace 2m</span>
-            <span class="log-src">web</span>
-            <span class="log-msg log-level-WARN">ollama probe slow (8.2s &gt; 6s budget)</span>
-          </li>
-          <li>
-            <span class="log-ts">hace 14m</span>
-            <span class="log-src">wa</span>
-            <span class="log-msg log-level-ERROR">bridge timeout fetching chat history</span>
-          </li>
-          <li>
-            <span class="log-ts">hace 37m</span>
-            <span class="log-src">web</span>
-            <span class="log-msg log-level-WARN">SQL retry 1/3 on rag_queries insert</span>
-          </li>
-          <li>
-            <span class="log-ts">hace 1h</span>
-            <span class="log-src">ingest</span>
-            <span class="log-msg log-level-ERROR">gmail OAuth token expired (refresh triggered)</span>
-          </li>
-          <li>
-            <span class="log-ts">hace 2h</span>
-            <span class="log-src">chat</span>
-            <span class="log-msg log-level-WARN">semantic cache miss rate spiked (72%)</span>
-          </li>
-          <li>
-            <span class="log-ts">hace 4h</span>
-            <span class="log-src">web</span>
-            <span class="log-msg log-level-WARN">reranker MPS init took 14.3s (cold)</span>
-          </li>
+        <!-- Filtros: ventana de tiempo + level. Cambian el query y
+             refetchean. Defaults: 1h + all. Los `is-active` matchean
+             los defaults del JS (logsState arriba en status.js). -->
+        <div class="logs-filters" role="toolbar" aria-label="Filtros de log">
+          <div class="logs-filter-group" role="radiogroup" aria-label="Ventana">
+            <button type="button" class="logs-filter-btn" data-window="600"
+                    aria-pressed="false">10m</button>
+            <button type="button" class="logs-filter-btn is-active" data-window="3600"
+                    aria-pressed="true">1h</button>
+            <button type="button" class="logs-filter-btn" data-window="86400"
+                    aria-pressed="false">24h</button>
+          </div>
+          <div class="logs-filter-group" role="radiogroup" aria-label="Severity">
+            <button type="button" class="logs-filter-btn is-active" data-level="all"
+                    aria-pressed="true">all</button>
+            <button type="button" class="logs-filter-btn" data-level="warn"
+                    aria-pressed="false">warn</button>
+            <button type="button" class="logs-filter-btn" data-level="error"
+                    aria-pressed="false">error</button>
+          </div>
+        </div>
+        <ul class="log-list" id="logs-list">
+          <li><span class="log-ts">cargando…</span></li>
         </ul>
       </article>
 
       <!-- #5 Uptime heatmap — PREVIEW (datos dummy) -->
       <article class="insight-card insight-preview" aria-label="Uptime heatmap 7 días">
         <div class="insight-head">
-          <h3>uptime · 7d × 24h</h3>
+          <h2>uptime · 7d × 24h</h2>
           <span class="preview-badge">vista previa</span>
         </div>
         <div class="insight-big">
@@ -1004,8 +1133,9 @@
     <div id="content">
       <div class="loading">Consultando servicios</div>
     </div>
+    </main>
   </div>
 
-  <script src="/static/status.js?v=2026-04-24-freshness-card" defer></script>
+  <script src="/static/status.js?v=2026-04-24-logs-card" defer></script>
 </body>
 </html>

@@ -117,7 +117,13 @@
     const el = document.createElement("div");
     el.className = `service ${svc.status}`;
     el.setAttribute("data-id", svc.id || "");
+    // role=status implica aria-live=polite, pero algunos screen readers
+    // no lo aplican consistentemente cuando el contenido se muta — lo
+    // hacemos explícito + aria-atomic para que el SR anuncie el bloque
+    // entero (nombre + estado) cuando un servicio cambia ok→down.
     el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.setAttribute("aria-atomic", "true");
     el.setAttribute("aria-label", `${svc.name}: ${svc.status}`);
     el.title = `${svc.name} — ${svc.detail}`;
 
@@ -187,6 +193,17 @@
     if (!label || !action) return;
     if (btn.dataset.busy === "1") return;
 
+    // Stop es destructivo (puede tirar el web server, ollama, etc.) — pedimos
+    // confirmación nativa. Start no necesita confirm. El confirm() del browser
+    // es accessible por default (focus trap, Esc cancela, Enter confirma) y
+    // simple — no merece UI custom para una acción raramente disparada.
+    if (action === "stop") {
+      const ok = window.confirm(
+        `¿Parar ${label}?\n\nEsto puede afectar el funcionamiento del RAG.`
+      );
+      if (!ok) return;
+    }
+
     const iconEl = btn.querySelector(".action-icon");
     const labelEl = btn.querySelector(".action-label");
     const prevIcon = iconEl ? iconEl.textContent : "";
@@ -202,7 +219,10 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ label, action }),
       });
-      const data = await resp.json().catch(() => ({}));
+      const data = await resp.json().catch((err) => {
+        console.error("[status] action: JSON parse failed", err);
+        return {};
+      });
       if (!resp.ok || data.ok === false) {
         const msg = data.detail || data.stderr || data.stdout || `HTTP ${resp.status}`;
         showActionBanner(`${action} ${label}: ${msg}`, "err");
@@ -221,12 +241,39 @@
     }
   }
 
+  // Muestra un banner inline arriba del contenido. El auto-dismiss
+  // (3500ms) puede ser cancelado por el user con el botón "✕" — útil
+  // si querés copiar el mensaje de error o leerlo con calma cuando
+  // pasaron 3 banners en cadena. Devuelve el nodo por si el caller
+  // quiere componerlo (no usado hoy).
   function showActionBanner(msg, kind) {
-    const banner = document.createElement("div");
-    banner.className = kind === "err" ? "error-banner" : "info-banner";
-    banner.textContent = msg;
+    const banner = makeBanner(msg, kind === "err" ? "error-banner" : "info-banner");
     $content.prepend(banner);
-    setTimeout(() => banner.remove(), 3500);
+    const t = setTimeout(() => banner.remove(), 3500);
+    banner.dataset.dismissTimer = String(t);
+    return banner;
+  }
+
+  function makeBanner(msg, cls) {
+    const banner = document.createElement("div");
+    banner.className = cls;
+    const text = document.createElement("span");
+    text.className = "banner-text";
+    text.textContent = msg;
+    banner.appendChild(text);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "banner-close";
+    close.setAttribute("aria-label", "Descartar mensaje");
+    close.title = "Descartar";
+    close.textContent = "✕";
+    close.addEventListener("click", () => {
+      const t = banner.dataset.dismissTimer;
+      if (t) clearTimeout(Number(t));
+      banner.remove();
+    });
+    banner.appendChild(close);
+    return banner;
   }
 
   function escapeHTML(s) {
@@ -255,12 +302,14 @@
     } catch (e) {
       console.error("[status] fetch failed", e);
       // Si ya hay contenido renderizado, mostrar banner pero no limpiar.
-      const banner = document.createElement("div");
-      banner.className = "error-banner";
-      banner.textContent = `Error consultando /api/status: ${e.message || e}`;
+      const banner = makeBanner(
+        `Error consultando /api/status: ${e.message || e}`,
+        "error-banner",
+      );
       if (lastPayload) {
         $content.prepend(banner);
-        setTimeout(() => banner.remove(), 4000);
+        const t = setTimeout(() => banner.remove(), 4000);
+        banner.dataset.dismissTimer = String(t);
       } else {
         $content.replaceChildren(banner);
       }
@@ -552,7 +601,7 @@
   }
 
   function renderErrors(payload) {
-    const total = payload.total_errors | 0;
+    const total = payload.total_errors ?? 0;
     const bySrc = payload.by_source || { silent: 0, sql: 0 };
     const breakdown = Array.isArray(payload.breakdown) ? payload.breakdown : [];
 
@@ -686,7 +735,7 @@
 
   function renderFreshness(payload) {
     const sources = Array.isArray(payload.sources) ? payload.sources : [];
-    const healthy = payload.sources_healthy | 0;
+    const healthy = payload.sources_healthy ?? 0;
     const total = payload.sources_total || sources.length;
 
     // Headline: "5/6 fuentes al día".
@@ -745,6 +794,119 @@
     return "—";
   }
 
+  // ── Log-tail card (real) ────────────────────────────────────────────
+  // /api/status/logs trae eventos individuales WARN/ERROR de los 2 jsonl
+  // estructurados (silent + sql). State local: window_s + level_filter.
+  // Los filtros mutan logsState y refetchean; los defaults matchean el
+  // markup HTML (1h + all).
+
+  const $logsList = document.getElementById("logs-list");
+  const $logsSummary = document.getElementById("logs-summary");
+  const $logsCard = document.getElementById("insight-logs");
+
+  const logsState = {
+    window_s: 3600,   // 1h default
+    level: "all",
+  };
+
+  async function fetchLogs() {
+    try {
+      const url = `/api/status/logs?since_seconds=${logsState.window_s}`
+        + `&level=${encodeURIComponent(logsState.level)}&limit=50`;
+      const resp = await fetch(url, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderLogs(data);
+    } catch (e) {
+      console.error("[status] logs fetch failed", e);
+      if ($logsSummary) $logsSummary.textContent = "sin datos";
+      if ($logsList) $logsList.innerHTML = `<li class="log-empty">error consultando logs</li>`;
+    }
+  }
+
+  function renderLogs(payload) {
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    const total = payload.total_in_window | 0;
+    const truncated = !!payload.truncated;
+
+    // Summary: "12 eventos · últimos N · all" o "0 eventos" en verde.
+    if (total === 0) {
+      $logsSummary.textContent = "sin eventos";
+      $logsSummary.className = "insight-delta better";
+    } else {
+      const plural = total === 1 ? "evento" : "eventos";
+      const more = truncated ? " · +" + (total - events.length) + " antes" : "";
+      $logsSummary.textContent = `${total} ${plural}${more}`;
+      $logsSummary.className = "insight-delta neutral";
+    }
+
+    if (events.length === 0) {
+      $logsList.innerHTML = `<li class="log-empty">sin eventos en la ventana</li>`;
+      return;
+    }
+
+    $logsList.innerHTML = events.map((ev, i) => {
+      const ageText = fmtRelativeAge(ev.ts_age_s);
+      const levelCls = ev.level === "ERROR" ? "log-level-ERROR" : "log-level-WARN";
+      const where = escapeHTML(ev.where || "(unknown)");
+      const msg = escapeHTML(ev.message || "(sin mensaje)");
+      const excType = ev.exc_type ? escapeHTML(ev.exc_type) : "";
+      const sourceLabel = escapeHTML(ev.source || "");
+      // El primer renglón muestra: ts · source · where: message
+      // Click expande y muestra la línea completa + exc_type prefix.
+      const summaryHTML = excType
+        ? `<span class="${levelCls}">[${excType}]</span> ${where} · ${msg}`
+        : `<span class="${levelCls}">${where}</span> · ${msg}`;
+      const extrasHTML = `<span class="log-extras">${escapeHTML(ev.ts)} · ${excType ? excType + " · " : ""}${where}</span>`;
+      return `<li data-idx="${i}" title="click para expandir">
+        <span class="log-ts">${ageText}</span>
+        <span class="log-src">${sourceLabel}</span>
+        <span class="log-msg">${summaryHTML}</span>
+        ${extrasHTML}
+      </li>`;
+    }).join("");
+
+    // Click-to-expand handler.
+    $logsList.querySelectorAll("li[data-idx]").forEach((li) => {
+      li.addEventListener("click", () => {
+        li.classList.toggle("expanded");
+      });
+    });
+  }
+
+  function fmtRelativeAge(s) {
+    if (s == null) return "—";
+    if (s < 60) return `hace ${s}s`;
+    if (s < 3600) return `hace ${Math.floor(s / 60)}m`;
+    if (s < 86400) return `hace ${Math.floor(s / 3600)}h`;
+    return `hace ${Math.floor(s / 86400)}d`;
+  }
+
+  // Wire los filtros: cada grupo (window/level) tiene sus botones; al
+  // clickear, mutamos logsState + refetcheamos. is-active es manejado
+  // dentro del mismo grupo (radiogroup behavior).
+  function wireLogsFilters() {
+    if (!$logsCard) return;
+    const groups = $logsCard.querySelectorAll(".logs-filter-group");
+    groups.forEach((group) => {
+      group.addEventListener("click", (ev) => {
+        const btn = ev.target.closest(".logs-filter-btn");
+        if (!btn || btn.classList.contains("is-active")) return;
+        // Toggle is-active dentro del grupo.
+        group.querySelectorAll(".logs-filter-btn").forEach((b) => {
+          b.classList.remove("is-active");
+          b.setAttribute("aria-pressed", "false");
+        });
+        btn.classList.add("is-active");
+        btn.setAttribute("aria-pressed", "true");
+        // Update state según el data-attr.
+        if (btn.dataset.window) logsState.window_s = parseInt(btn.dataset.window, 10);
+        if (btn.dataset.level) logsState.level = btn.dataset.level;
+        fetchLogs();
+      });
+    });
+  }
+
   // ── Heatmap mock (PREVIEW) ──────────────────────────────────────────
   // Generate 7 rows × 24 cols de cuadraditos con un patrón semi-random
   // pero determinístico, para que el diseño se vea con datos verosímiles
@@ -795,6 +957,8 @@
   fetchLatency();
   fetchErrors();
   fetchFreshness();
+  fetchLogs();
+  wireLogsFilters();
   buildHeatmapMock();
   startLoop();
 
@@ -805,6 +969,7 @@
     fetchLatency();
     fetchErrors();
     fetchFreshness();
+    fetchLogs();
   });
 
   // Loops separados alineados con los TTL server-side:
@@ -813,13 +978,66 @@
   //   - freshness: cache 30s → poll 30s (los ingestores corren cada
   //                15-60min, pero los "hace Xm" deben actualizarse
   //                más seguido para que se sienta vivo)
-  setInterval(() => {
-    if (!document.hidden) fetchLatency();
-  }, 60000);
-  setInterval(() => {
-    if (!document.hidden) fetchErrors();
-  }, 30000);
-  setInterval(() => {
-    if (!document.hidden) fetchFreshness();
-  }, 30000);
+  //   - logs:      cache 15s → poll 15s (queremos que el tail se
+  //                sienta live, eventos nuevos visibles rápido)
+  //
+  // Guardamos los IDs para poder limpiarlos en `beforeunload` (evitar
+  // leaks si el SPA se re-mounteara) y pausar/resumir en
+  // `visibilitychange` (cuando la pestaña va a background no tiene
+  // sentido seguir polleando — el server timea cache de 30-60s).
+  const INSIGHT_PERIODS = { lat: 60000, err: 30000, fresh: 30000, logs: 15000 };
+  const INSIGHT_FNS = { lat: fetchLatency, err: fetchErrors, fresh: fetchFreshness, logs: fetchLogs };
+  const insightIvs = { lat: null, err: null, fresh: null, logs: null };
+
+  function startInsightLoops() {
+    for (const k of Object.keys(insightIvs)) {
+      if (insightIvs[k] != null) continue;  // ya corriendo
+      insightIvs[k] = setInterval(() => {
+        if (!document.hidden) INSIGHT_FNS[k]();
+      }, INSIGHT_PERIODS[k]);
+    }
+  }
+
+  function stopInsightLoops() {
+    for (const k of Object.keys(insightIvs)) {
+      if (insightIvs[k] != null) {
+        clearInterval(insightIvs[k]);
+        insightIvs[k] = null;
+      }
+    }
+  }
+
+  startInsightLoops();
+
+  // Pause polling cuando la pestaña no está visible (mismo patrón que
+  // el loop principal — pero acá clearInterval-amos en lugar de skip
+  // dentro del callback, para que el browser pueda throttle/sleep el
+  // event loop completo).
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopInsightLoops();
+      stopLoop();
+    } else {
+      startInsightLoops();
+      if (live) {
+        startLoop();
+        // Re-fetch inmediato al volver — la última data puede estar
+        // stale por minutos si la tab quedó hidden mucho rato.
+        tick(true);
+        fetchLatency();
+        fetchErrors();
+        fetchFreshness();
+        fetchLogs();
+      }
+    }
+  });
+
+  // Cleanup al cerrar la página (back/forward cache también dispara
+  // pagehide, pero beforeunload alcanza para uvicorn local). Sin esto,
+  // los handles de setInterval quedan vivos en el background hasta que
+  // el browser los recoge — no rompe nada pero es hygiene básica.
+  window.addEventListener("beforeunload", () => {
+    stopInsightLoops();
+    stopLoop();
+  });
 })();

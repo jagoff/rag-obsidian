@@ -9045,6 +9045,222 @@ def status_freshness(nocache: int = 0) -> dict:
     return cached
 
 
+# ── /api/status/logs — eventos recientes WARN/ERROR ──────────────────
+# Feed el card #4 del insights grid. Lee individual events (no rollup)
+# de los mismos jsonl que el endpoint /errors:
+#
+#   silent_errors.jsonl  → level=WARN  (swallowed exceptions, no user-
+#                          facing impact pero útiles para diagnóstico)
+#   sql_state_errors.jsonl → level=ERROR (post-retry-budget, persistent)
+#
+# Los `.log` plain de los daemons (ingest-*.log, watch.log, etc.) NO
+# se consumen acá — son texto semi-estructurado, dump de stdout, sin
+# timestamp por línea. Parsearlos requeriría regex frágiles + heurísticas
+# de severity. Mejor approach futuro: que los daemons escriban a un
+# `runtime_events.jsonl` estructurado. Hasta entonces, el card cubre
+# el ~95% de la señal real (los 2 jsonl actuales tienen 1000+ entries
+# por día en prod).
+#
+# Schema del payload:
+#   {
+#     "window_seconds": 3600,
+#     "limit": 50,
+#     "level_filter": "all",   # "all" | "warn" | "error"
+#     "events": [              # ordenados desc por ts
+#       {
+#         "ts": "2026-04-24T22:50:00",
+#         "ts_age_s": 234,
+#         "level": "ERROR",     # WARN | ERROR
+#         "source": "sql",      # silent | sql
+#         "where": "queries_sql_write_failed",
+#         "exc_type": "OperationalError",
+#         "message": "database is locked"
+#       }, ...
+#     ],
+#     "total_in_window": 458,   # antes del cap por limit
+#     "truncated": true,         # si total > limit
+#   }
+
+_LOGS_CACHE_TTL = 15.0  # más corto que errors (30s) porque queremos
+                          # ver eventos nuevos rápido — log-tail debería
+                          # sentirse "live"
+_LOGS_CACHE: dict = {}    # cached por (window, limit, level) tuple
+_LOGS_CACHE_LOCK = threading.Lock()
+
+# Allowed values para los query params; sirven también para el contract
+# tests + el frontend pickea de acá.
+_LOGS_VALID_LEVELS = {"all", "warn", "error"}
+_LOGS_DEFAULT_WINDOW_S = 3600
+_LOGS_DEFAULT_LIMIT = 50
+_LOGS_MAX_LIMIT = 200    # hard cap para no devolver MB de jsonl
+_LOGS_MAX_WINDOW_S = 86400  # 24h cap
+
+
+def _read_jsonl_events(path: Path, key_field: str, level: str,
+                       cutoff: datetime) -> list[dict]:
+    """Read a JSONL log file and return raw events with `ts >= cutoff`,
+    each as a normalized dict ready for merging.
+
+    Records that fail to parse / lack ts / are out-of-window are skipped.
+    Field name `key_field` differs per log (silent → 'where', sql →
+    'event'); both get normalized to `where` in the output for the
+    frontend.
+    """
+    events: list[dict] = []
+    if not path.is_file():
+        return events
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ts = rec.get("ts")
+                if not ts:
+                    continue
+                try:
+                    rec_dt = datetime.fromisoformat(ts.rstrip("Z"))
+                except Exception:
+                    continue
+                if rec_dt < cutoff:
+                    continue
+                where = rec.get(key_field) or "(unknown)"
+                # Mensaje + exc_type vienen distintos en cada log:
+                #   silent: {exc_type, exc}
+                #   sql:    {err: "RuntimeError('...')"} → solo string
+                if "exc_type" in rec:
+                    exc_type = rec.get("exc_type") or "(unknown)"
+                    message = rec.get("exc") or ""
+                else:
+                    # SQL: el err es un repr del exception. Intentamos
+                    # extraer el type prefix ("OperationalError(...)")
+                    # con una regex simple. Si falla, exc_type queda
+                    # vacío y el frontend muestra solo el mensaje.
+                    err_str = str(rec.get("err") or "")
+                    import re
+                    m = re.match(r"^([A-Z][A-Za-z0-9_]*)\((.*)\)$", err_str, re.DOTALL)
+                    if m:
+                        exc_type = m.group(1)
+                        message = m.group(2).strip("'\"")
+                    else:
+                        exc_type = ""
+                        message = err_str
+                events.append({
+                    "ts": ts,
+                    "ts_dt": rec_dt,
+                    "level": level,
+                    "source": "silent" if key_field == "where" else "sql",
+                    "where": where,
+                    "exc_type": exc_type,
+                    "message": message[:500],  # truncate to keep payload
+                })
+    except Exception as e:
+        print(f"[status_logs] warn: read of {path.name} failed: {type(e).__name__}: {e}", flush=True)
+    return events
+
+
+def _status_logs_build_payload(
+    window_s: int, limit: int, level_filter: str,
+) -> dict:
+    """Build the recent-events payload for /api/status/logs.
+
+    Reads silent + sql jsonl, filters by ts within `window_s`, optionally
+    by level (all|warn|error), sorts desc by ts, caps at `limit`.
+    """
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=window_s)
+    events: list[dict] = []
+
+    if level_filter in ("all", "warn"):
+        events.extend(_read_jsonl_events(
+            SILENT_ERRORS_LOG_PATH, "where", "WARN", cutoff,
+        ))
+    if level_filter in ("all", "error"):
+        events.extend(_read_jsonl_events(
+            _SQL_STATE_ERROR_LOG, "event", "ERROR", cutoff,
+        ))
+
+    # Sort desc por ts (más recientes primero).
+    events.sort(key=lambda e: e["ts_dt"], reverse=True)
+    total = len(events)
+    truncated = total > limit
+    if truncated:
+        events = events[:limit]
+
+    # Convertir ts_dt a ts_age_s (segundos relativos a ahora) para que
+    # el frontend pueda formatear "hace Xm" sin parsear fechas. Sacamos
+    # el ts_dt del payload (no es serializable y el ts string ya está).
+    out_events = []
+    now_ts = now.timestamp()
+    for e in events:
+        age_s = max(0, int(now_ts - e["ts_dt"].timestamp()))
+        out_events.append({
+            "ts": e["ts"],
+            "ts_age_s": age_s,
+            "level": e["level"],
+            "source": e["source"],
+            "where": e["where"],
+            "exc_type": e["exc_type"],
+            "message": e["message"],
+        })
+
+    return {
+        "window_seconds": window_s,
+        "limit": limit,
+        "level_filter": level_filter,
+        "events": out_events,
+        "total_in_window": total,
+        "truncated": truncated,
+    }
+
+
+@app.get("/api/status/logs")
+def status_logs(
+    since_seconds: int = _LOGS_DEFAULT_WINDOW_S,
+    limit: int = _LOGS_DEFAULT_LIMIT,
+    level: str = "all",
+    nocache: int = 0,
+) -> dict:
+    """Feed del card #4 (log-tail). Eventos individuales WARN/ERROR de
+    silent_errors.jsonl + sql_state_errors.jsonl, ordenados desc por
+    timestamp, cap por `limit`.
+
+    Query params:
+      since_seconds: ventana de tiempo (default 1h, max 24h)
+      limit: cuántos eventos devolver (default 50, max 200)
+      level: "all" | "warn" | "error" (filtra por sink)
+      nocache: 1 fuerza refresh (default usa el cache de 15s)
+
+    Cache key incluye los 3 query params — cada combinación tiene su
+    propio TTL bucket. Sin esto, alternar filtros en el UI siempre
+    devolvería el primer query cacheado.
+    """
+    # Validate + clamp.
+    if level not in _LOGS_VALID_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"level inválido: {level!r} (esperaba {sorted(_LOGS_VALID_LEVELS)})",
+        )
+    window_s = max(1, min(int(since_seconds), _LOGS_MAX_WINDOW_S))
+    lim = max(1, min(int(limit), _LOGS_MAX_LIMIT))
+
+    cache_key = (window_s, lim, level)
+    now_mono = time.monotonic()
+    with _LOGS_CACHE_LOCK:
+        entry = _LOGS_CACHE.get(cache_key)
+        fresh = entry is not None and (now_mono - entry["ts"]) < _LOGS_CACHE_TTL
+    if nocache or not fresh:
+        payload = _status_logs_build_payload(window_s, lim, level)
+        with _LOGS_CACHE_LOCK:
+            _LOGS_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+        return payload
+    return entry["payload"]
+
+
 @app.get("/status")
 def status_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "status.html")

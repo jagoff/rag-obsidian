@@ -228,10 +228,15 @@ def test_status_page_has_insights_section():
     assert 'id="err-total"' in body
     assert 'id="err-donut"' in body
     assert 'id="err-breakdown"' in body
-    # 2 preview badges restantes (log-tail + heatmap uptime).
+    # Card #4 (actividad reciente / log-tail) tampoco es preview ya — tiene
+    # su propio id + filtros + lista que se llena vía /api/status/logs.
+    assert 'id="insight-logs"' in body
+    assert 'id="logs-list"' in body
+    assert 'id="logs-summary"' in body
+    # 1 preview badge restante (heatmap uptime — sigue siendo dummy).
     # Buscamos la clase aplicada en el markup (<span class="preview-badge">)
     # para no contar la definición CSS inline.
-    assert body.count('class="preview-badge"') == 2
+    assert body.count('class="preview-badge"') == 1
     assert 'id="heatmap-mock"' in body
 
 
@@ -373,8 +378,9 @@ def test_status_page_freshness_has_real_ids():
     assert 'id="fresh-healthy"' in body
     assert 'id="fresh-total"' in body
     assert 'id="fresh-summary"' in body
-    # Preview badges ahora son 2 (log-tail + heatmap uptime).
-    assert body.count('class="preview-badge"') == 2
+    # Preview badge ahora es 1 (solo heatmap uptime sigue siendo dummy;
+    # log-tail dejó de ser preview cuando se conectó a /api/status/logs).
+    assert body.count('class="preview-badge"') == 1
 
 
 # ── /api/status/freshness — freshness matrix endpoint ───────────────
@@ -488,6 +494,152 @@ def test_read_start_interval_fallback():
     """Plist inexistente devuelve None. Plist sin StartInterval devuelve
     None (e.g. StartCalendarInterval-only jobs)."""
     assert _server._read_start_interval_s("com.nonexistent.label.12345") is None
+
+
+def test_status_page_logs_has_real_ids():
+    """El HTML del card #4 tiene ids + filtros."""
+    body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
+    assert 'id="insight-logs"' in body
+    assert 'id="logs-list"' in body
+    assert 'id="logs-summary"' in body
+    # Filtros: 3 botones de window + 3 de level (10m/1h/24h, all/warn/error).
+    assert 'data-window="600"' in body
+    assert 'data-window="3600"' in body
+    assert 'data-window="86400"' in body
+    assert 'data-level="all"' in body
+    assert 'data-level="warn"' in body
+    assert 'data-level="error"' in body
+    # Preview badges ahora sólo 1 (el heatmap uptime).
+    assert body.count('class="preview-badge"') == 1
+
+
+# ── /api/status/logs — log-tail endpoint ────────────────────────────
+
+def test_api_logs_payload_shape():
+    """GET /api/status/logs devuelve los campos del contract."""
+    resp = _client.get("/api/status/logs?nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    for k in ("window_seconds", "limit", "level_filter", "events",
+              "total_in_window", "truncated"):
+        assert k in d, f"falta {k!r}"
+    assert isinstance(d["events"], list)
+
+
+def test_api_logs_validates_level():
+    """level inválido → 400, no 500."""
+    resp = _client.get("/api/status/logs?level=critical&nocache=1")
+    assert resp.status_code == 400
+    assert "level inválido" in resp.json()["detail"]
+
+
+def test_api_logs_clamps_limits():
+    """since_seconds y limit clamped a sus máximos."""
+    resp = _client.get("/api/status/logs?since_seconds=999999&limit=999&nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["window_seconds"] <= 86400  # 24h max
+    assert d["limit"] <= 200             # max limit
+
+
+def test_logs_build_filters_by_level(tmp_path, monkeypatch):
+    """level=warn devuelve sólo events de silent_errors; level=error sólo
+    de sql_state. all merge ambos."""
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+
+    now = datetime.now()
+    recent = now - timedelta(minutes=5)
+    _write_jsonl_errors(silent_log, [
+        {"ts": recent.isoformat(timespec="seconds"), "where": "w_a",
+         "exc_type": "X", "exc": "msg_a"},
+    ])
+    _write_jsonl_errors(sql_log, [
+        {"ts": recent.isoformat(timespec="seconds"), "event": "e_b",
+         "err": "OperationalError('msg_b')"},
+    ])
+
+    # level=warn → sólo el silent.
+    p_warn = _server._status_logs_build_payload(3600, 50, "warn")
+    assert len(p_warn["events"]) == 1
+    assert p_warn["events"][0]["level"] == "WARN"
+    assert p_warn["events"][0]["where"] == "w_a"
+    assert p_warn["events"][0]["source"] == "silent"
+
+    # level=error → sólo el sql.
+    p_err = _server._status_logs_build_payload(3600, 50, "error")
+    assert len(p_err["events"]) == 1
+    assert p_err["events"][0]["level"] == "ERROR"
+    assert p_err["events"][0]["where"] == "e_b"
+    assert p_err["events"][0]["source"] == "sql"
+
+    # level=all → ambos.
+    p_all = _server._status_logs_build_payload(3600, 50, "all")
+    assert len(p_all["events"]) == 2
+
+
+def test_logs_build_extracts_exc_type_from_sql_repr(tmp_path, monkeypatch):
+    """Para sql_state_errors el `err` es repr() del exception. Verifica
+    que el regex extrae correctamente el exc_type prefix y limpia el
+    mensaje (sin las comillas del repr)."""
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+
+    silent_log.write_text("", encoding="utf-8")
+    now = datetime.now()
+    _write_jsonl_errors(sql_log, [
+        {"ts": now.isoformat(timespec="seconds"), "event": "x",
+         "err": "OperationalError('database is locked')"},
+        {"ts": now.isoformat(timespec="seconds"), "event": "y",
+         "err": "TimeoutError('budget exhausted')"},
+        # err sin formato Tipo(...) → exc_type vacío, msg = err completo.
+        {"ts": now.isoformat(timespec="seconds"), "event": "z",
+         "err": "weird unstructured error"},
+    ])
+
+    payload = _server._status_logs_build_payload(3600, 50, "error")
+    by_where = {e["where"]: e for e in payload["events"]}
+    assert by_where["x"]["exc_type"] == "OperationalError"
+    assert by_where["x"]["message"] == "database is locked"
+    assert by_where["y"]["exc_type"] == "TimeoutError"
+    assert by_where["y"]["message"] == "budget exhausted"
+    # Unstructured err: exc_type vacío, message = el string entero.
+    assert by_where["z"]["exc_type"] == ""
+    assert by_where["z"]["message"] == "weird unstructured error"
+
+
+def test_logs_build_sorts_desc_and_caps_limit(tmp_path, monkeypatch):
+    """Events ordenados desc por ts; el cap por `limit` deja truncated=
+    True y total_in_window con el count completo."""
+    from datetime import datetime, timedelta
+    silent_log = tmp_path / "silent_errors.jsonl"
+    sql_log = tmp_path / "sql_state_errors.jsonl"
+    monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)
+    monkeypatch.setattr(_server, "_SQL_STATE_ERROR_LOG", sql_log)
+    sql_log.write_text("", encoding="utf-8")
+
+    base = datetime.now() - timedelta(minutes=10)
+    # 20 events espaciados de a 10s, el más reciente al final.
+    entries = [
+        {"ts": (base + timedelta(seconds=i * 10)).isoformat(timespec="seconds"),
+         "where": f"w_{i:02d}", "exc_type": "X", "exc": "msg"}
+        for i in range(20)
+    ]
+    _write_jsonl_errors(silent_log, entries)
+
+    payload = _server._status_logs_build_payload(3600, 5, "all")
+    assert payload["total_in_window"] == 20
+    assert payload["truncated"] is True
+    assert len(payload["events"]) == 5
+    # El primero debe ser el más reciente (w_19), no el más viejo.
+    assert payload["events"][0]["where"] == "w_19"
+    assert payload["events"][-1]["where"] == "w_15"
 
 
 def test_fmt_age_spanish_boundaries():

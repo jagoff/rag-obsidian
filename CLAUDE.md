@@ -50,8 +50,8 @@ Devin for Terminal tiene 4 [permission modes](https://docs.devin.ai/reference/pe
 **Dos niveles de autonomía disponibles:**
 
 1. **`.devin/config.json` — permissions pre-aprobadas por default** (siempre activas)
-   - Allow-list (~80 reglas): todo el workflow normal del RAG auto-aprobado — `git *`, `rag *`, `uv *`, `pytest`, `sqlite3`, `launchctl` (menos remove/unload), `tail/head/cat/ls/find/grep/rg/awk/sed` (observabilidad), `.venv/bin/python`, `ollama ls/list/ps/show` (solo read), `curl localhost`, writes dentro del repo (`Write(**)` relativo al cwd).
-   - Deny-list (10 reglas): cosas irreversibles que NUNCA queremos — `rm -rf`, `sudo`, `git reset --hard`, `git push --force`, `git branch -D`, `launchctl remove/unload`.
+   - Allow-list (~80 reglas): todo el workflow normal del RAG auto-aprobado — `git *`, `rag *`, `uv *`, `pytest`, `sqlite3`, `launchctl *` (incluye `remove`/`unload`/`kickstart`/`bootout`/`bootstrap` para que los scripts de rotación de daemons no pidan permiso), `tail/head/cat/ls/find/grep/rg/awk/sed` (observabilidad), `.venv/bin/python`, `ollama ls/list/ps/show` (solo read), `curl localhost`, writes dentro del repo (`Write(**)` relativo al cwd).
+   - Deny-list (8 reglas): cosas irreversibles que NUNCA queremos — `rm -rf`, `sudo`, `git reset --hard`, `git push --force`, `git branch -D`. Nota histórica: `launchctl remove/unload` estaban acá hasta 2026-04-24; los sacamos porque el flujo normal de "refresh el web server después de cambiar el plist o el código" requiere un unload+load, y bloquearlos forzaba pedir permiso cada vez. El riesgo es bajo — si desactivo un daemon por error, lo vuelvo a cargar con `launchctl load` y listo; no hay pérdida de datos.
    - Ask-list (8 reglas): operaciones sensibles que SIEMPRE preguntan aunque estemos en Bypass mode — `rm` (sin `-rf`), `.env*`, `~/.ssh/`, `~/.aws/`, `~/.config/devin/`, writes al vault iCloud real, fetch a OpenAI/Anthropic APIs (el proyecto es local-first; si alguna vez tocamos esas URLs es un bug).
    - Resultado: en modo Normal, ~todo el flujo habitual corre sin pedir permiso. Las pausas que quedan son el handful de ops sensibles de la ask-list.
 

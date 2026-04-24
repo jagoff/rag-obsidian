@@ -102,8 +102,6 @@
       "Exec(rm -fr)",
       "Exec(sudo)",
       "Exec(sudo -s)",
-      "Exec(launchctl remove)",
-      "Exec(launchctl unload)",
       "Exec(git reset --hard)",
       "Exec(git push --force)",
       "Exec(git push -f)",

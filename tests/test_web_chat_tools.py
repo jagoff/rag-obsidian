@@ -465,6 +465,7 @@ def test_chat_endpoint_no_tools_path(chat_env, capsys):
     mock = _OllamaMock(responses)
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     # Input must NOT match `_detect_metachat_intent` (short-circuits the
     # retrieval path this test is asserting on). "que tal" was moved into
@@ -518,6 +519,7 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("qué tiempo va a hacer")
 
@@ -570,6 +572,7 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("resumen del dia")
 
@@ -633,6 +636,7 @@ def test_chat_endpoint_serial_then_parallel(chat_env, capsys):
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("buscá foo y contame el clima")
 
@@ -671,6 +675,7 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("clima")
 
@@ -726,6 +731,7 @@ def test_chat_timing_log_sanitizes_infinity_confidence(chat_env, capsys, monkeyp
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _body = _post_chat("consulta con corpus vacío")
     assert events[-1][0] == "done"
@@ -791,6 +797,7 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _body = _post_chat("cuándo es el cumple de mi mamá")
 
@@ -835,6 +842,7 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    chat_env.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("dame clima 3 veces")
 
@@ -911,6 +919,7 @@ def test_empty_retrieve_with_forced_tools_skips_bail(chat_env, monkeypatch):
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("que tengo para hacer esta semana?")
     names = [ev for ev, _ in events]
@@ -980,6 +989,7 @@ def test_low_conf_bypass_with_forced_tools_skips_bypass(chat_env, monkeypatch):
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("que tengo para hacer esta semana?")
 
@@ -1050,6 +1060,7 @@ def test_source_intent_hint_injected_when_pre_router_fires_gmail(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     assert events, "SSE stream vacío"
@@ -1105,6 +1116,7 @@ def test_source_intent_hint_omitted_when_no_source_specific_tools(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     # "dame info sobre grecia" — query semántica de vault sin pre-router match.
     events, _ = _post_chat("dame info sobre grecia")
@@ -1163,6 +1175,7 @@ def test_empty_tool_output_preserves_vault_context(chat_env, monkeypatch):
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     assert mock.calls, "se esperaba al menos una call a ollama.chat"
@@ -1229,6 +1242,7 @@ def test_nonempty_tool_output_replaces_vault_context(chat_env, monkeypatch):
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("revisar mails")
     assert mock.calls, "se esperaba al menos una call a ollama.chat"
@@ -1275,6 +1289,7 @@ def test_done_event_flags_source_specific_true_for_gmail_query(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("cuales son mis ultimos mails?")
     done_payload = next(data for ev, data in events if ev == "done")
@@ -1298,6 +1313,7 @@ def test_done_event_flags_source_specific_false_for_generic_query(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("dame info sobre grecia")
     done_payload = next(
@@ -1333,6 +1349,7 @@ def test_done_event_flags_source_specific_false_for_weather_only(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     # "va a llover?" matchea solo el regex de weather (`llov`), no toca
     # `_PLANNING_PAT` (hoy/mañana/semana) que dispararía calendar_ahead
@@ -1415,6 +1432,7 @@ def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     # Query intencionalmente sin keywords del pre-router — "correspondencia"
     # no está en los regex de `_TOOL_INTENT_RULES`.
@@ -1470,6 +1488,7 @@ def test_llm_tool_decide_skipped_when_pre_router_matches(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     events, _ = _post_chat("mis últimos mails")
 
@@ -1502,6 +1521,7 @@ def test_llm_tool_decide_skipped_when_vault_strong(
     ])
     monkeypatch.setattr(server_mod.ollama, "chat", mock)
     monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_TOOL_CLIENT, "chat", mock)
 
     # Query que no matchea pre-router pero el vault tiene info buena.
     events, _ = _post_chat("hablame sobre Grecia")

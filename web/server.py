@@ -1881,6 +1881,20 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
 _OLLAMA_STREAM_TIMEOUT = 45.0
 _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 
+# Tool-decision call (non-streaming, ~once per turn, with `tools=` schema
+# of all 12 chat tools). Observed 2026-04-24 (Fer F. "LLM falló: timed
+# out"): long queries (~50 palabras + 2KB de _WEB_TOOL_ADDENDUM + JSON
+# schemas de 12 tools) hacen que qwen2.5:7b en MPS tarde >45s en
+# samplear la decisión — se disparaba el timeout del cliente streaming
+# compartido y el turno fallaba antes de llegar a generar output.
+# Cliente separado con budget más amplio: tool-decision es una call
+# NO-streaming (no hay UX de tokens flowing) y low-frequency (1 vez por
+# turn, máx 3 rounds), así que podemos permitirnos más budget sin
+# degradar la percepción de "chat congelado". Si realmente hay un hang
+# del daemon, `_ollama_chat_probe` lo detecta antes con 6s.
+_OLLAMA_TOOL_TIMEOUT = 120.0
+_OLLAMA_TOOL_CLIENT = ollama.Client(timeout=_OLLAMA_TOOL_TIMEOUT)
+
 # Shared num_ctx for every call to the chat model from this server — the
 # real /api/chat, the preflight probe, and the background prewarmer must
 # all pass the same value. ollama re-initialises the KV cache when a
@@ -6421,6 +6435,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _fast_path = False
         else:  # "auto"
             _fast_path = bool(result.get("fast_path", False))
+
+        # Propose-intent hard-override: cualquier query que requiera un
+        # propose_* tool (reminder / calendar_event / whatsapp_send)
+        # necesita tool-calling confiable, y qwen2.5:3b (el modelo del
+        # fast_path) NO lo hace bien — entra en un loop de sampling que
+        # puede tardar >120s y timeoutea. Observed 2026-04-24 (Fer F.):
+        # "Enviale un mensaje a Grecia [...texto largo...]" con
+        # is_propose_intent=True y retrieve().fast_path=True corría con
+        # qwen2.5:3b, el tool loop loopeaba y el turno fallaba con
+        # "LLM falló: timed out" tras el budget de _OLLAMA_TOOL_TIMEOUT.
+        # El tradeoff: +3-5s de prefill del 7b vs. turno que completa vs
+        # turno que crashea → claramente vale el upgrade.
+        if is_propose_intent and _fast_path:
+            _fast_path = False
         # Tracks si hubo downgrade runtime por pre-router tools (ver bloque
         # de pre-router más abajo). False por default; el log del endpoint
         # lo expone como `fast_path_downgraded` en extra_json para que el
@@ -6844,7 +6872,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _round_tools = [
                         fn for fn in CHAT_TOOLS if fn.__name__ in PROPOSAL_TOOL_NAMES
                     ]
-                _tr = _OLLAMA_STREAM_CLIENT.chat(
+                # Use the tool-decision client with a wider timeout than
+                # the streaming one: non-streaming + `tools=` schema of
+                # all 12 chat tools can push qwen2.5:7b > 45s on long
+                # inputs. See `_OLLAMA_TOOL_CLIENT` comment above.
+                _tr = _OLLAMA_TOOL_CLIENT.chat(
                     model=_web_model,
                     messages=tool_messages,
                     tools=_round_tools,

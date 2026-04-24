@@ -326,6 +326,26 @@ def test_propose_whatsapp_send_is_NOT_parallel_safe():
     assert "propose_whatsapp_send" not in _tools.PARALLEL_SAFE
 
 
+def test_ollama_tool_client_has_separate_wider_timeout():
+    """Regresión 2026-04-24 iter3 (Fer F. "LLM falló: timed out"): el tool-
+    decision call (non-streaming, con `tools=` schema de 12 tools) tardaba
+    >45s en qwen2.5:7b con prompts largos. El cliente compartido
+    `_OLLAMA_STREAM_CLIENT` tenía 45s de timeout — cortaba antes de que el
+    LLM terminara de samplear la decisión. Fix: cliente separado
+    `_OLLAMA_TOOL_CLIENT` con 120s de budget, usado sólo para la call de
+    tool-decisión.
+    """
+    import web.server as srv
+    assert hasattr(srv, "_OLLAMA_TOOL_CLIENT"), (
+        "_OLLAMA_TOOL_CLIENT debe existir (separado del streaming client)"
+    )
+    # Streaming budget sigue siendo conservador (cortamos UX congelada rápido).
+    assert srv._OLLAMA_STREAM_TIMEOUT == 45.0
+    # Tool-decision budget es materialmente más amplio.
+    assert srv._OLLAMA_TOOL_TIMEOUT >= 90.0
+    assert srv._OLLAMA_TOOL_TIMEOUT > srv._OLLAMA_STREAM_TIMEOUT
+
+
 def test_tool_addendum_mentions_whatsapp_send():
     """Without the routing hint the LLM tends to respond in prose instead
     of calling the tool. The addendum must explicitly teach the pattern."""

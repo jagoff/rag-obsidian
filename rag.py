@@ -3265,8 +3265,21 @@ def _load_behavior_priors() -> dict:
     All four feature dicts default to 0.0 for unseen keys. Safe when the
     backing store is missing/empty/corrupt — returns empty snapshot. Never raises.
 
-    Reads rag_behavior (SQL-only since T10). Cache key = MAX(ts). On SQL error
-    or empty table, returns an empty snapshot.
+    Reads rag_behavior (SQL-only since T10). Cache key = MAX(ts).
+
+    **Audit 2026-04-24** (177 `behavior_priors_sql_read_failed` en 6 días):
+    el read SQL pre-fix tenía try/except bare sin retry — cada vez que el
+    WAL estaba locked (otro writer del semantic_cache + queries + samplers
+    concurrentes), la lectura caía al primer intento y devolvía empty
+    snapshot. Eso degradaba el ranker-vivo a baseline (sin priors) en 177
+    queries — el user retrieve-aba con scoring NO-aprendido sin saberlo.
+
+    Fix: el read va por `_sql_read_with_retry` (8 attempts, 0.15-0.5s
+    jitter, ~3.5s budget total). Si AÚN así el retry exhausta, devolvemos
+    el `_behavior_priors_cache` previo (stale) en vez de empty — priors
+    de hace 5 minutos son ~99.9% iguales a los actuales. La degradación
+    a empty solo ocurre en proceso fresh (sin cache) que pegue locks
+    persistentes — edge case real pero raro.
     """
     global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
 
@@ -3278,20 +3291,17 @@ def _load_behavior_priors() -> dict:
     # stale que nunca se refrescaba. Fix: envolver read-then-write en el
     # RLock pre-existente.
     with _behavior_priors_lock:
-        try:
+
+        def _read_priors():
             with _ragvec_state_conn() as conn:
                 max_ts = _sql_max_ts(conn, "rag_behavior")
                 if max_ts is None:
-                    # Empty table → return empty snapshot (no JSONL fallback).
                     snapshot = _compute_behavior_priors_from_rows([])
                     snapshot["hash"] = "sql:empty"
-                    _behavior_priors_cache = snapshot
-                    _behavior_priors_cache_key_sql = ""
-                    _behavior_priors_cache_key = None
-                    return snapshot
+                    return ("empty", snapshot, "")
                 if (_behavior_priors_cache is not None
                         and _behavior_priors_cache_key_sql == max_ts):
-                    return _behavior_priors_cache
+                    return ("hit", _behavior_priors_cache, max_ts)
                 import sqlite3 as _sqlite3
                 prev_factory = conn.row_factory
                 try:
@@ -3303,16 +3313,37 @@ def _load_behavior_priors() -> dict:
                     conn.row_factory = prev_factory
                 snapshot = _compute_behavior_priors_from_rows(rows)
                 snapshot["hash"] = f"sql:{max_ts}"
+                return ("rebuilt", snapshot, max_ts)
+
+        result = _sql_read_with_retry(
+            _read_priors, "behavior_priors_sql_read_failed",
+            default=None, attempts=8,
+        )
+        if result is not None:
+            kind, snapshot, max_ts = result
+            if kind == "empty":
+                _behavior_priors_cache = snapshot
+                _behavior_priors_cache_key_sql = ""
+                _behavior_priors_cache_key = None
+            elif kind == "rebuilt":
                 _behavior_priors_cache = snapshot
                 _behavior_priors_cache_key_sql = max_ts
                 _behavior_priors_cache_key = None
-                return snapshot
-        except Exception as exc:
-            _log_sql_state_error("behavior_priors_sql_read_failed", err=repr(exc))
-            # Degrade to empty snapshot — retrieval stays functional without priors.
-            snapshot = _compute_behavior_priors_from_rows([])
-            snapshot["hash"] = "sql:error"
+            # kind == "hit": cache ya está fresh, sólo retornamos.
             return snapshot
+
+        # Retry exhausted. Stale cache > empty snapshot — sin priors el
+        # ranker baja a baseline (todas las features de behavior se
+        # anulan). Stale by 1-5min es ~idéntico al fresh.
+        if _behavior_priors_cache is not None:
+            return _behavior_priors_cache
+
+        # Fresh process sin cache + DB locked persistente → fallback final
+        # empty (mantiene retrieval funcional, scoring sin priors). Este
+        # path solo se da en cold-start con la DB inaccesible — raro.
+        snapshot = _compute_behavior_priors_from_rows([])
+        snapshot["hash"] = "sql:error"
+        return snapshot
 
 
 class RankerWeights:
@@ -4022,9 +4053,14 @@ def load_feedback_golden() -> dict:
             # Nothing in either table → empty snapshot.
             return ("empty", {"positives": [], "negatives": []}, "")
 
+    # Audit 2026-04-24: bumped attempts 5→8 to match writers. 211
+    # `feedback_golden_sql_read_failed` en 6 días post semantic-cache wiring
+    # implicaba que los 5 intentos × ~250ms jitter (~1.25s budget) no
+    # alcanzaban contra la contención WAL real.
     result = _sql_read_with_retry(
         _read, "feedback_golden_sql_read_failed",
         default=("error", {"positives": [], "negatives": []}, None),
+        attempts=8,
     )
     kind, payload, new_ts = result
     # Observability: hit = in-memory memo reused; miss = SQL read / rebuild /
@@ -4032,6 +4068,21 @@ def load_feedback_golden() -> dict:
     if kind == "memo":
         record_cache_event("feedback_golden", hits=1)
         return payload
+    if kind == "error":
+        # Audit 2026-04-24 — el path original sobrescribía `_feedback_golden_memo`
+        # con el empty snapshot del default, **invalidando el memo previo**
+        # que tenía las señales reales del user. La próxima call veía
+        # `_feedback_golden_memo is not None` y `kind == "memo"` → devolvía
+        # empty de forma cacheada hasta que rag_feedback recibiera una
+        # nueva entry y el rebuild se disparara. Resultado: 211 reads
+        # fallidos posiblemente envenenaron el cache cuando aún tenían
+        # data buena cargada. Fix: en error, devolver el memo previo
+        # (si existe) sin tocar el cache. Es el mismo principio del
+        # behavior_priors stale-cache fallback.
+        record_cache_event("feedback_golden", misses=1)
+        if _feedback_golden_memo is not None:
+            return _feedback_golden_memo
+        return payload  # Fresh process sin memo — empty es lo único que tenemos.
     record_cache_event("feedback_golden", misses=1)
     _feedback_golden_memo = payload
     if new_ts is not None:
@@ -32758,6 +32809,165 @@ def _resolve_person_aliases(name: str) -> tuple[str, ...]:
             pass
     _PERSON_ALIAS_CACHE[name_clean] = result
     return result
+
+
+def _agent_tool_whatsapp_search(
+    query: str,
+    contact: str | None = None,
+    k: int = 8,
+) -> str:
+    """Buscar mensajes de WhatsApp en el corpus indexado por contenido.
+
+    Esto es complementario a `whatsapp_pending` (que sólo lista chats
+    sin respuesta): acá hacemos retrieval semántico + BM25 sobre los
+    chunks WA (`source="whatsapp"`) para preguntas tipo "qué me dijo
+    Juan sobre la deuda?" / "cuándo quedamos con Grecia para el
+    doctor?". Devuelve mensajes matcheantes ordenados por score.
+
+    Args:
+        query: Texto a buscar en lenguaje natural.
+        contact: Nombre del contacto a filtrar (resolved via Apple
+            Contacts → JID candidates por last-10-digits suffix). Si no
+            se resuelve, hacemos búsqueda sin filtro y agregamos un
+            campo `warning` en el output para que el LLM se lo cuente
+            al user.
+        k: Cantidad máxima de mensajes a devolver (1–8, default 8).
+
+    Returns:
+        JSON string `{query, contact_filter, messages: [{jid, contact,
+        ts, who, text, score}], warning?, error?}`. Silent-fail: si
+        retrieve raisea, devuelve `{messages: [], error: "..."}`. Nunca
+        propaga excepciones — el chat loop se rompe si lo hace.
+
+    Notes:
+        - `who` = "outbound" si el primer mensaje del chunk lo mandó
+          el user (sender == "yo"), "inbound" en cualquier otro caso.
+        - `text` es el body del chunk (rendering `Speaker: content` de
+          la ventana de mensajes), capado a 400 chars.
+        - `ts` es el timestamp del primer mensaje del chunk en formato
+          ISO UTC (ej. "2026-04-20T15:23:10Z").
+        - Cuando hay filtro de contacto, hacemos overfetch (k×3, cap
+          30) para compensar chunks de otros contactos que vendrían
+          ordenados por score antes del filtro JID.
+    """
+    k = max(1, min(8, int(k)))
+    q = (query or "").strip()
+    if not q:
+        return json.dumps({
+            "query": "",
+            "contact_filter": None,
+            "messages": [],
+            "error": "query vacía",
+        }, ensure_ascii=False)
+
+    contact_filter: str | None = None
+    jid_suffixes: set[str] = set()
+    warning: str | None = None
+
+    cn = (contact or "").strip()
+    if cn:
+        try:
+            lookup = _whatsapp_jid_from_contact(cn)
+        except Exception as exc:
+            lookup = {
+                "jid": None, "full_name": None, "phones": [],
+                "error": f"lookup_failed: {str(exc)[:80]}",
+            }
+        if lookup.get("jid"):
+            contact_filter = lookup.get("full_name") or cn
+            # Build digit-suffix candidates: last 10 digits of every
+            # phone we know about, plus the primary JID local-part.
+            # Last-10 handles AR's optional `9` mobile prefix +
+            # country-code variance — `+5491134567890` and
+            # `1134567890` both end in the same 10 digits.
+            for ph in (lookup.get("phones") or []):
+                d = re.sub(r"\D+", "", ph or "")
+                if len(d) >= 8:
+                    jid_suffixes.add(d[-10:] if len(d) >= 10 else d)
+            primary_local = lookup["jid"].split("@")[0]
+            d = re.sub(r"\D+", "", primary_local)
+            if len(d) >= 8:
+                jid_suffixes.add(d[-10:] if len(d) >= 10 else d)
+        else:
+            err = lookup.get("error") or "not_found"
+            warning = (
+                f"contact_not_resolved: '{cn}' no se encontró en Apple "
+                f"Contacts ({err}); búsqueda sin filtro de contacto."
+            )
+
+    try:
+        col = get_db()
+        # Overfetch when filtering — chunks de otros chats matchean por
+        # contenido y aparecen mezclados; necesitamos margen para que
+        # el filtro JID nos deje los k pedidos. Cap a 30 para no
+        # explotar el reranker en queries con WA-only source.
+        retrieve_k = min(k * 3, 30) if jid_suffixes else k
+        result = retrieve(
+            col, q, retrieve_k,
+            folder=None, tag=None, precise=False,
+            multi_query=False, auto_filter=True,
+            source="whatsapp",
+        )
+    except Exception as exc:
+        return json.dumps({
+            "query": q,
+            "contact_filter": contact_filter,
+            "messages": [],
+            "warning": warning,
+            "error": f"retrieve_failed: {str(exc)[:120]}",
+        }, ensure_ascii=False)
+
+    docs = result.get("docs") or []
+    metas = result.get("metas") or []
+    scores = result.get("scores") or []
+
+    messages: list[dict] = []
+    for doc, meta, score in zip(docs, metas, scores):
+        meta = meta or {}
+        chat_jid = str(meta.get("chat_jid") or "")
+        if jid_suffixes:
+            jid_local = chat_jid.split("@")[0]
+            jid_digits = re.sub(r"\D+", "", jid_local)
+            if not jid_digits or not any(
+                jid_digits.endswith(s) for s in jid_suffixes
+            ):
+                continue
+        ts_raw = meta.get("first_ts") or meta.get("created_ts") or 0
+        try:
+            # `Z` suffix denota UTC explícito en el output del tool;
+            # usamos `tz=timezone.utc` (en vez de `utcfromtimestamp`,
+            # deprecated en 3.12) y stripeamos el `+00:00` que el
+            # isoformat agrega para no duplicar el offset.
+            ts_iso = (
+                datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            ts_iso = ""
+        sender = str(meta.get("sender") or "").strip().lower()
+        who = "outbound" if sender == "yo" else "inbound"
+        text = str(doc or "").strip()[:400]
+        contact_name = str(meta.get("chat_name") or "").strip()
+        messages.append({
+            "jid": chat_jid,
+            "contact": contact_name,
+            "ts": ts_iso,
+            "who": who,
+            "text": text,
+            "score": round(float(score), 3),
+        })
+        if len(messages) >= k:
+            break
+
+    out: dict = {
+        "query": q,
+        "contact_filter": contact_filter,
+        "messages": messages,
+    }
+    if warning:
+        out["warning"] = warning
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 3500) -> str:

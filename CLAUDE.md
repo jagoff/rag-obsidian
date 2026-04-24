@@ -186,6 +186,62 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web
 
 Los defaults del código (`127.0.0.1` + regex localhost-only) se preservan si las env vars no están — sin estas dos variables setedas el server se comporta idéntico a antes.
 
+### HTTPS público vía Cloudflare Tunnel (quick, sin dominio, sin cert local)
+
+Para que iOS registre el Service Worker + PWA full (offline cache + instant-on) sin instalar root CA local ni comprar dominio, usamos un [Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/). Cero cuenta, cero config, HTTPS válido con cert público de Cloudflare.
+
+**Cómo funciona**: `cloudflared tunnel --url http://localhost:8765` abre un túnel QUIC salida hacia un edge de Cloudflare y te asigna una URL aleatoria tipo `https://word-word-random.trycloudflare.com`. Todo el tráfico iPhone → Cloudflare → cloudflared → `localhost:8765`. No expone tu IP, no necesita abrir puertos en el router.
+
+**Trade-off clave**: la URL es **random y cambia cada vez que cloudflared reinicia** (launchctl restart, reboot, crash + auto-restart). El PWA guardado en el iPhone se rompe al cambiar la URL — hay que re-abrir en Safari con la URL nueva y re-guardar. Si querés URL estable, hay que migrar a [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) con un dominio propio agregado a Cloudflare.
+
+**Dos servicios launchd emparejados** (el segundo es opcional pero altamente recomendado):
+
+1. `com.fer.obsidian-rag-cloudflare-tunnel` → corre `cloudflared tunnel --url http://localhost:8765`. RunAtLoad + KeepAlive. Logs en `~/.local/share/obsidian-rag/cloudflared.log` + `.error.log` (cloudflared escribe todo al stderr por diseño — los "INF" son logs normales).
+
+2. `com.fer.obsidian-rag-cloudflare-tunnel-watcher` → corre [`scripts/cloudflared_watcher.sh`](scripts/cloudflared_watcher.sh). Hace `tail -F` del log de cloudflared y cuando detecta una URL nueva: **(a)** la escribe a `~/.local/share/obsidian-rag/cloudflared-url.txt` (state file estable), **(b)** la copia al clipboard con `pbcopy`, **(c)** manda una macOS notification via `osascript` con sonido Tink. Idempotente — si cloudflared re-emite la misma URL no molesta. State file persiste entre restarts del watcher.
+
+**Helpers zsh** (agregados al final de `~/.zshrc`):
+
+```zsh
+alias rag-url='cat ~/.local/share/obsidian-rag/cloudflared-url.txt 2>/dev/null; echo'
+alias rag-url-c='cat ~/.local/share/obsidian-rag/cloudflared-url.txt 2>/dev/null | tee >(pbcopy); echo " (copied)"'
+```
+
+`rag-url` devuelve la URL activa al instante sin grepear el log. `rag-url-c` la copia al clipboard además de imprimirla.
+
+**Management**:
+
+```bash
+# Ver URL actual
+rag-url                             # via alias
+cat ~/.local/share/obsidian-rag/cloudflared-url.txt
+
+# Forzar URL nueva (útil post cambio de red)
+launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-cloudflare-tunnel
+# El watcher detecta el cambio en ~5-15s y notifica.
+
+# Estado de ambos servicios
+launchctl print gui/$(id -u)/com.fer.obsidian-rag-cloudflare-tunnel         | grep -E 'state|pid'
+launchctl print gui/$(id -u)/com.fer.obsidian-rag-cloudflare-tunnel-watcher | grep -E 'state|pid'
+
+# Log del watcher (historia de URLs vistas)
+tail -n 20 ~/.local/share/obsidian-rag/cloudflared-watcher.log
+
+# Detener todo (rollback a LAN-only HTTP)
+launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-cloudflare-tunnel-watcher
+launchctl bootout gui/$(id -u)/com.fer.obsidian-rag-cloudflare-tunnel
+mv ~/Library/LaunchAgents/com.fer.obsidian-rag-cloudflare-tunnel.plist{,.disabled}
+mv ~/Library/LaunchAgents/com.fer.obsidian-rag-cloudflare-tunnel-watcher.plist{,.disabled}
+```
+
+**Seguridad**: el túnel expone el web server a **internet público**. No tiene auth — cualquiera que sepa la URL random (ej. alguien que ve la URL en el log de Cloudflare si hubiera una filtración) puede leer todo el vault. Las URLs de `trycloudflare.com` son unguessable en la práctica (entropy alta, no indexadas), pero no hay SLA — cloudflare [explícitamente](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) recomienda NO usar quick tunnels para producción. Para paranoia extra: migrar a named tunnel + [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/) (requiere cuenta + dominio propio, gratis hasta 50 usuarios).
+
+**Caveats operacionales**:
+
+- La primera `display notification` pide permisos al user una vez (System Settings → Notifications → "Script Editor" permitir). Si la notificación no aparece, probablemente el user canceló el prompt. Fix: reabrir el prompt desde Script Editor.app o editar los permisos directo en Notifications Settings.
+- `cloudflared` instalado vía `brew install cloudflared` (plist apunta a `/opt/homebrew/bin/cloudflared`). Si el user instaló via `npm install -g cloudflared` (wrapper Node), el plist se rompe — actualizar `ProgramArguments` al path del binary nativo o reinstalar vía brew.
+- Si hay OTRO proceso cloudflared corriendo en el Mac (ej. para un port distinto), el watcher sólo monitorea el log de este servicio — no toca otros túneles.
+
 ## Commands
 
 ```bash

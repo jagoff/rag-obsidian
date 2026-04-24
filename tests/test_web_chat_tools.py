@@ -203,12 +203,12 @@ def _post_chat(question: str = "hola") -> tuple[list[tuple[str, dict]], str]:
 
 
 def test_tools_module_exports():
-    assert len(CHAT_TOOLS) == 15
-    assert len(TOOL_FNS) == 15
+    assert len(CHAT_TOOLS) == 16
+    assert len(TOOL_FNS) == 16
     assert PARALLEL_SAFE == {
         "weather", "finance_summary", "calendar_ahead",
         "reminders_due", "gmail_recent", "drive_search",
-        "whatsapp_pending", "whatsapp_search",
+        "whatsapp_pending", "whatsapp_search", "whatsapp_thread",
         "propose_reminder", "propose_calendar_event",
         # `propose_whatsapp_send` intentionally NOT here — see web/tools.py
         # comment: destructive action + osascript-heavy lookup.

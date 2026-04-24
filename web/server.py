@@ -5036,6 +5036,55 @@ def _drain_conversation_writers() -> None:
             pass
 
 
+@_on_shutdown
+def _shutdown_joblib_loky_pool() -> None:
+    """Drain joblib/loky reusable executor para evitar el leak de
+    semaphores POSIX en cada shutdown del web daemon.
+
+    Audit 2026-04-24: `web.error.log` mostraba 269 leaked semaphores
+    acumuladas (`/loky-PID-XXX`) — una por cada restart del daemon.
+    macOS POSIX semaphore namespace tiene un cap fijo y los leaks no
+    se recuperan hasta logout del user.
+
+    Origen: joblib usa loky (multiprocessing pool con workers
+    persistentes) como backend default. Algún transitive dep
+    (sentence-transformers / sklearn / scipy) hace `joblib.Parallel(...)`
+    o setea `n_jobs > 1` durante una request, lo que arranca el pool.
+    Pre-fix nadie lo paraba al SIGTERM → `resource_tracker` veía el
+    semaphore huérfano post-fork y warnea.
+
+    Fix: en el shutdown handler, importar joblib y llamar
+    `get_reusable_executor().shutdown(kill_workers=True)` para terminar
+    el pool antes de que el resource_tracker valide handles.
+
+    Idempotente: si el pool nunca arrancó (caso típico — la mayoría de
+    requests no usan joblib.Parallel), `get_reusable_executor()`
+    devuelve un executor vacío y `shutdown` es no-op. Si joblib no
+    está disponible (imports fail), silent-skip — el leak vuelve pero
+    no rompemos el shutdown path.
+
+    Trade-off: si una request EN VUELO está usando joblib.Parallel,
+    `kill_workers=True` la corta abruptamente. Es lo correcto durante
+    SIGTERM — los user-facing handlers ya tienen sus propios timeouts
+    y graceful aborts.
+    """
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        executor = get_reusable_executor()
+        executor.shutdown(wait=True, kill_workers=True)
+    except Exception as exc:
+        # Silent-skip — el leak no es bloqueante, no queremos romper el
+        # shutdown si joblib se desinstala o cambia su API.
+        try:
+            print(
+                f"[lifespan-shutdown] _shutdown_joblib_loky_pool skip: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+
 def _append_pending_conversation_turn(rec: dict) -> None:
     """Append a serialisable turn record to the pending-retry file.
 

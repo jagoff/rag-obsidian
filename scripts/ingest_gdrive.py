@@ -1,43 +1,55 @@
-"""Google Drive monthly backfill ingester.
+"""Google Drive cross-source ingester — Phase 1.g (2026-04-24).
 
-Pulls Google Docs / Sheets / Slides modified in the last N days (default
-30) from the user's Drive and writes ONE markdown per doc under::
+Indexa Google Docs / Sheets / Slides del user directo en la colección
+vectorial, con ``source="drive"``. NO escribe archivos al vault — el
+workflow del usuario (Obsidian + iCloud) movía periódicamente
+``03-Resources/GoogleDrive/`` a ``.trash/`` (5 copias observadas del
+19-24 de abril 2026), haciendo el approach file-based insostenible.
 
-    <VAULT>/03-Resources/GoogleDrive/archive/YYYY-MM-DD__<slug>__<id8>.md
+Design:
+  - Reader: ``drive.files().list()`` con
+    ``q="modifiedTime > '<iso>' and (mime = doc|sheet|slides) and trashed=false"``.
+    Pagina. Cap de 500 archivos por run.
+  - Chunking por-doc: ~800 chars con overlap 80, split por párrafos cuando
+    se puede, hard-split si un párrafo único excede el target. Doc largos
+    (hasta 128_000 chars del body-cap) generan múltiples chunks
+    independientes — el retrieval va a pescar el chunk relevante en vez
+    de intentar matchear un bloque de 50k.
+  - doc_id: ``gdrive://file/<file_id>#chunk=<NNNN>`` (4-digit padded
+    idx). Idempotent: la re-ingest del mismo file borra sus chunks
+    previos antes de re-upsertar.
+  - Embed prefix: ``[source=drive | kind=<doc|sheet|slides> | title=<name> |
+    owner=<name>] <body>`` (mismo shape que gmail / whatsapp).
+  - Recency: ``SOURCE_RECENCY_HALFLIFE_DAYS["drive"] = 90`` (entre email
+    180d y chat 30d).
+  - Retention: ``SOURCE_RETENTION_DAYS["drive"] = 365`` (un año, como
+    email). El ingester borra chunks con ``created_ts`` más viejos que
+    el cutoff cada run.
+  - Source weight: ``SOURCE_WEIGHTS["drive"] = 0.85`` (confianza editorial
+    alta, idem email).
 
-Each file carries YAML frontmatter (source, drive_id, mime, modified,
-owner, link) + the exported body. Existing files are skipped when the
-content is unchanged (`rag._atomic_write_if_changed`), so re-runs are
-cheap.
+Incremental sync:
+  - Cursor en ``rag_gdrive_state(account_id, last_modified_seen,
+    updated_at)`` — single-row.
+  - Bootstrap (cursor vacío): ventana de N días (default 30) en
+    ``modifiedTime``.
+  - Incremental: listar ``modifiedTime > last_modified_seen``, orden
+    asc para que el cursor avance monotonic.
 
-This complements the daily ``_sync_gdrive_notes`` (which writes a
-single summary with ~4 docs modified in the last 48h). The backfill
-gives ``rag_query`` / the reranker a real view of the user's full
-recent Drive activity instead of relying on the live
-``drive_search`` tool (which hits the Drive API on every query,
-~1-3s of latency).
+Opt-out: ninguno por ahora (mismo criterio de "index everything" que
+gmail + whatsapp). Los PDFs / xlsx / docx subidos no Google-native NO
+se tocan — requieren deps extra (pdftotext, openpyxl, python-docx).
 
-After writing the markdown files, we run ``rag index`` so the new
-files enter the semantic corpus immediately.
-
-Known caveat (Obsidian cleanup): the user's workflow occasionally moves
-``03-Resources/GoogleDrive/`` to ``.trash/`` (5 copies observed between
-Apr 19-24, 2026). If that happens the archive folder vanishes and the
-chunks become orphans on the next index. Re-run this script to rebuild.
-
-Invoked as::
-
-    .venv/bin/python scripts/ingest_gdrive.py                # 30d, reindex
-    .venv/bin/python scripts/ingest_gdrive.py --days 90      # 90d window
-    .venv/bin/python scripts/ingest_gdrive.py --dry-run      # listar sin bajar
-    .venv/bin/python scripts/ingest_gdrive.py --no-reindex   # solo escribir
+Invocación::
+    rag index --source drive [--reset] [--dry-run] [--days 30]
+    .venv/bin/python scripts/ingest_gdrive.py --days 90 --json
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
-import subprocess
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -50,15 +62,15 @@ import rag  # noqa: E402
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
+DOC_ID_PREFIX = "gdrive"
 DEFAULT_DAYS = 30
-DEFAULT_MAX_FILES = 500          # hard safety cap across the run
-DEFAULT_BODY_CAP = 128_000       # chars per doc (avoids pathological 10MB sheets)
-PAGE_SIZE = 100                  # Drive API max per page for our field set
-ARCHIVE_SUBPATH = "03-Resources/GoogleDrive/archive"
+DEFAULT_MAX_FILES = 500
+DEFAULT_BODY_CAP = 128_000
+CHUNK_TARGET = 800
+CHUNK_OVERLAP = 80
+PAGE_SIZE = 100
+STATE_DB_FILE = "ragvec.db"
 
-# mimeType → exportable text mime. Three Google-native types only; uploaded
-# PDFs / xlsx / docx need separate tooling (pdftotext, openpyxl, python-docx)
-# that we don't depend on yet — kept out of scope for this backfill.
 EXPORT_MIME = {
     "application/vnd.google-apps.document": "text/plain",
     "application/vnd.google-apps.spreadsheet": "text/csv",
@@ -72,25 +84,102 @@ MIME_LABEL = {
 }
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── State table (cursor) ────────────────────────────────────────────────────
 
-_SLUG_RE = re.compile(r"[^\w\s-]", re.UNICODE)
-_WS_RE = re.compile(r"[\s_-]+")
-
-
-def _slugify(name: str, max_len: int = 60) -> str:
-    """Filename-safe slug. Lowercase, dash-separated, capped in length.
-    Keeps unicode letters/digits so Spanish-named docs survive legibly."""
-    name = name.strip().lower()
-    name = _SLUG_RE.sub("", name)
-    name = _WS_RE.sub("-", name).strip("-")
-    if not name:
-        name = "untitled"
-    return name[:max_len].rstrip("-") or "untitled"
+_STATE_DDL = (
+    "CREATE TABLE IF NOT EXISTS rag_gdrive_state ("
+    " account_id TEXT PRIMARY KEY,"
+    " last_modified_seen TEXT,"
+    " updated_at TEXT NOT NULL"
+    ")"
+)
 
 
-def _build_drive_service():
-    """Returns (service, reason). service is None when creds / deps missing."""
+def _ensure_state_table(conn: sqlite3.Connection) -> None:
+    conn.execute(_STATE_DDL)
+
+
+def _load_cursor(conn: sqlite3.Connection, account_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT last_modified_seen FROM rag_gdrive_state WHERE account_id = ?",
+        (account_id,),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _save_cursor(conn: sqlite3.Connection, account_id: str, last_iso: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO rag_gdrive_state "
+        "(account_id, last_modified_seen, updated_at) VALUES (?, ?, ?)",
+        (account_id, last_iso, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def _reset_cursor(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM rag_gdrive_state")
+
+
+# ── Chunking ────────────────────────────────────────────────────────────────
+
+_PARA_RE = re.compile(r"\n\s*\n+")
+
+
+def _chunk_body(text: str, target: int = CHUNK_TARGET, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split ``text`` into chunks ~target chars long at paragraph boundaries.
+
+    - Short bodies (<= target) → single chunk.
+    - Paragraph-level split via blank-line regex; concatenates short paragraphs
+      until the target is reached, then emits.
+    - Overlap: last ``overlap`` chars of the previous chunk seed the next one
+      (context continuity across splits).
+    - Hard-split fallback for single paragraphs bigger than target.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= target:
+        return [text]
+
+    paragraphs = _PARA_RE.split(text)
+    chunks: list[str] = []
+    buf = ""
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        # If this paragraph alone exceeds target, flush buf then hard-split.
+        if len(p) > target:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            start = 0
+            step = max(1, target - overlap)
+            while start < len(p):
+                chunks.append(p[start:start + target])
+                start += step
+            continue
+        # Normal case: append to buf if it still fits.
+        tentative = (buf + "\n\n" + p) if buf else p
+        if len(tentative) <= target:
+            buf = tentative
+        else:
+            if buf:
+                chunks.append(buf)
+            # Seed next chunk with overlap tail for continuity.
+            seed = buf[-overlap:] if (buf and overlap > 0) else ""
+            buf = (seed + "\n\n" + p) if seed else p
+
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+# ── Drive API helpers ───────────────────────────────────────────────────────
+
+
+def _build_service():
+    """Returns (service, reason). service is None when creds/deps missing."""
     creds = rag._load_google_credentials()
     if creds is None:
         return None, "no_google_credentials"
@@ -105,38 +194,37 @@ def _build_drive_service():
     return svc, ""
 
 
-def _list_recent(svc, *, days: int, mime_types: list[str], max_files: int) -> list[dict]:
-    """Paginated files.list over modifiedTime window. Returns up to
-    max_files raw file metadata dicts."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _list_since(svc, *, since_iso: str, mime_types: list[str], max_files: int) -> list[dict]:
+    """Paginated files.list starting from ``since_iso`` exclusive, asc order
+    so the cursor advances monotonically."""
     mime_filter = " or ".join(f"mimeType = '{m}'" for m in mime_types)
-    q = f"(modifiedTime > '{cutoff}') and ({mime_filter}) and trashed = false"
+    q = f"(modifiedTime > '{since_iso}') and ({mime_filter}) and trashed = false"
     fields = (
         "nextPageToken, "
         "files(id, name, mimeType, modifiedTime, createdTime, "
-        "owners(displayName, emailAddress), webViewLink, size, parents)"
+        "owners(displayName, emailAddress), webViewLink, size)"
     )
     out: list[dict] = []
     page_token: str | None = None
     while True:
+        if len(out) >= max_files:
+            return out[:max_files]
         resp = svc.files().list(
             q=q,
-            orderBy="modifiedTime desc",
+            orderBy="modifiedTime asc",
             pageSize=min(PAGE_SIZE, max_files - len(out)),
             fields=fields,
             pageToken=page_token,
         ).execute()
-        batch = resp.get("files") or []
-        out.extend(batch)
-        if len(out) >= max_files:
-            return out[:max_files]
+        out.extend(resp.get("files") or [])
         page_token = resp.get("nextPageToken")
         if not page_token:
-            return out
+            return out[:max_files]
 
 
 def _export_body(svc, file_id: str, mime: str, body_cap: int) -> tuple[str, str]:
-    """Returns (body, err). body is the decoded, capped export text."""
+    """Export the document body as text (docs/slides) or CSV (sheets).
+    Returns (body, err); err is empty string on success."""
     export_mime = EXPORT_MIME.get(mime)
     if not export_mime:
         return "", f"unsupported_mime:{mime}"
@@ -152,171 +240,281 @@ def _export_body(svc, file_id: str, mime: str, body_cap: int) -> tuple[str, str]
     return raw, ""
 
 
-def _render_note(meta: dict, body: str, vault_relative_target: str) -> str:
-    """Markdown with YAML frontmatter. Matches the rest of the vault's
-    `source: google-drive` notes so the indexer treats it as drive-origin."""
+# ── Identifiers ─────────────────────────────────────────────────────────────
+
+
+def _file_key(file_id: str) -> str:
+    """Logical identity of the Drive file — used as ``file`` meta so we can
+    find all chunks of a single doc for delete+re-add on update."""
+    return f"{DOC_ID_PREFIX}://file/{file_id}"
+
+
+def _chunk_doc_id(file_id: str, idx: int) -> str:
+    return f"{DOC_ID_PREFIX}://file/{file_id}#chunk={idx:04d}"
+
+
+# ── Embed + upsert ──────────────────────────────────────────────────────────
+
+
+def _embed_prefix(meta: dict, chunk_body: str) -> str:
     mime_label = MIME_LABEL.get(meta["mimeType"], "file")
-    owner_list = meta.get("owners") or []
-    owner_name = (owner_list[0].get("displayName") if owner_list else None) or "?"
-    owner_email = (owner_list[0].get("emailAddress") if owner_list else None) or ""
-
-    fm: list[str] = [
-        "---",
-        "source: google-drive",
-        f"drive_id: {meta['id']}",
-        f"mime: {mime_label}",
-        f"modified: {meta.get('modifiedTime', '')}",
-        f"created: {meta.get('createdTime', '')}",
-        f"owner: {owner_name}",
-    ]
-    if owner_email:
-        fm.append(f"owner_email: {owner_email}")
-    if meta.get("webViewLink"):
-        fm.append(f"link: {meta['webViewLink']}")
-    fm.extend([
-        "tags:",
-        "- google-drive",
-        "- gdrive-archive",
-        f"- gdrive/{mime_label}",
-        "---",
-        "",
-        f"# {meta['name']}",
-        "",
-        f"**Tipo:** {mime_label} · **Modificado:** {meta.get('modifiedTime', '')} · **Owner:** {owner_name}",
-    ])
-    if meta.get("webViewLink"):
-        fm.append(f"**Link:** {meta['webViewLink']}")
-    fm.extend(["", body if body else "_(sin contenido exportado)_", ""])
-    return "\n".join(fm) + "\n"
+    owner = (meta.get("owners") or [{}])[0].get("displayName", "?")
+    return f"[source=drive | kind={mime_label} | title={meta['name']} | owner={owner}] {chunk_body}"
 
 
-def _target_path(vault_root: Path, meta: dict) -> Path:
-    mod = meta.get("modifiedTime", "") or datetime.now(timezone.utc).isoformat()
-    # modifiedTime is RFC3339 e.g. 2026-04-24T13:22:10.123Z — we just need YYYY-MM-DD
-    date_prefix = mod[:10] if len(mod) >= 10 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    slug = _slugify(meta.get("name", "untitled"))
-    id8 = meta["id"][:8]
-    filename = f"{date_prefix}__{slug}__{id8}.md"
-    return vault_root / ARCHIVE_SUBPATH / filename
+def _parse_mod_ts(mod_iso: str) -> float:
+    """Parse RFC3339 modifiedTime → epoch seconds. Returns 0.0 on parse
+    failure (retention cleanup treats 0 as 'very old', but we never set 0
+    for real chunks because Drive always returns modifiedTime)."""
+    if not mod_iso:
+        return 0.0
+    try:
+        return datetime.fromisoformat(mod_iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
-# ── Runner ──────────────────────────────────────────────────────────────────
+def upsert_drive_file(col, meta: dict, body: str) -> int:
+    """Chunk + embed + upsert one Drive file. Idempotent: pre-deletes any
+    chunks under the same file_key before re-adding. Returns chunks written
+    (0 if body is empty AND no prior chunks existed)."""
+    file_id = meta["id"]
+    file_key = _file_key(file_id)
+    chunks = _chunk_body(body)
+
+    # Delete existing chunks for this file (re-ingest = delete + re-add).
+    try:
+        existing = col.get(where={"file": file_key}, include=[])
+        if existing.get("ids"):
+            col.delete(ids=existing["ids"])
+    except Exception:
+        pass
+
+    if not chunks:
+        # Empty doc: nothing to upsert. We already deleted any previous chunks,
+        # so a doc that was previously indexed and is now empty ends up cleanly
+        # removed from the corpus.
+        return 0
+
+    mime_label = MIME_LABEL.get(meta["mimeType"], "file")
+    owners = meta.get("owners") or []
+    owner_name = (owners[0].get("displayName") if owners else None) or "?"
+    owner_email = (owners[0].get("emailAddress") if owners else None) or ""
+    mod_iso = meta.get("modifiedTime", "") or ""
+    mod_ts = _parse_mod_ts(mod_iso)
+    link = meta.get("webViewLink") or ""
+
+    parent_text = (
+        f"{meta.get('name', '?')} — {mime_label} por {owner_name}\n"
+        f"Drive link: {link}\n\n{body[:1200]}"
+    )
+
+    embed_texts = [_embed_prefix(meta, c) for c in chunks]
+    embeddings = rag.embed(embed_texts)
+    ids = [_chunk_doc_id(file_id, i) for i in range(len(chunks))]
+    metas: list[dict] = []
+    for i, chunk in enumerate(chunks):
+        metas.append({
+            "file": file_key,
+            "note": (meta.get("name") or "(sin nombre)")[:80],
+            "folder": f"drive/{mime_label}",
+            "tags": "google-drive,gdrive-archive",
+            "hash": "",
+            "outlinks": "",
+            "source": "drive",
+            "created_ts": mod_ts,
+            "drive_id": file_id,
+            "mime": mime_label,
+            "modified_iso": mod_iso,
+            "owner": owner_name,
+            "owner_email": owner_email,
+            "link": link,
+            "chunk_idx": i,
+            "total_chunks": len(chunks),
+            "parent": parent_text,
+        })
+
+    col.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metas)
+    # Entity extraction — same hook as gmail ingester (silent-fails if gliner absent).
+    try:
+        rag._extract_and_index_entities_for_chunks(chunks, ids, metas, "drive")
+    except Exception:
+        pass
+    return len(chunks)
+
+
+def _retention_prune(col, *, now_ts: float | None = None) -> int:
+    """Drop chunks with source='drive' whose created_ts is older than the
+    retention cutoff. Returns chunks deleted."""
+    retention_days = rag.SOURCE_RETENTION_DAYS.get("drive")
+    if retention_days is None:
+        return 0
+    cutoff = (now_ts or time.time()) - (retention_days * 86400.0)
+    try:
+        got = col.get(where={"source": "drive"}, include=["metadatas"])
+    except Exception:
+        return 0
+    stale_ids: list[str] = []
+    for mid, meta in zip(got.get("ids", []) or [], got.get("metadatas", []) or []):
+        ts = float((meta or {}).get("created_ts") or 0.0)
+        if ts and ts < cutoff:
+            stale_ids.append(mid)
+    if not stale_ids:
+        return 0
+    try:
+        col.delete(ids=stale_ids)
+    except Exception:
+        return 0
+    return len(stale_ids)
+
+
+# ── Orchestration ───────────────────────────────────────────────────────────
+
 
 def run(
     *,
+    reset: bool = False,
     days: int = DEFAULT_DAYS,
     max_files: int = DEFAULT_MAX_FILES,
     body_cap: int = DEFAULT_BODY_CAP,
-    mime_types: list[str] | None = None,
-    vault_root: Path | None = None,
     dry_run: bool = False,
     svc=None,
+    col=None,
+    state_conn=None,
 ) -> dict:
-    """Main entry. Returns a summary dict."""
-    t0 = time.monotonic()
-    mime_types = mime_types or list(EXPORT_MIME.keys())
-    vault_root = vault_root or rag.VAULT_PATH
-
-    if svc is None:
-        svc, reason = _build_drive_service()
-        if svc is None:
-            return {"ok": False, "error": reason, "duration_s": 0.0}
-
-    try:
-        files = _list_recent(svc, days=days, mime_types=mime_types, max_files=max_files)
-    except Exception as exc:
-        return {"ok": False, "error": f"list_failed: {str(exc)[:120]}", "duration_s": round(time.monotonic() - t0, 2)}
-
-    summary = {
-        "ok": True,
-        "files_seen": len(files),
-        "files_written": 0,
-        "files_skipped": 0,
+    """Main entry. Returns a summary dict consumed by `rag index --source drive`
+    and `python scripts/ingest_gdrive.py`."""
+    t0 = time.perf_counter()
+    summary: dict = {
+        "run_at": datetime.now().isoformat(timespec="seconds"),
+        "reset": bool(reset),
+        "dry_run": bool(dry_run),
+        "files_seen": 0,
+        "files_indexed": 0,
+        "chunks_written": 0,
         "files_failed": 0,
-        "bytes_written": 0,
+        "retention_deleted": 0,
         "errors": [],
-        "written_paths": [],
+        "bootstrapped": False,
         "days": days,
-        "max_files": max_files,
-        "dry_run": dry_run,
+        "duration_s": 0.0,
     }
 
-    for f in files:
-        target = _target_path(vault_root, f)
-        if dry_run:
-            summary["written_paths"].append(str(target))
-            summary["files_skipped"] += 1
-            continue
+    if svc is None:
+        built_svc, reason = _build_service()
+        if built_svc is None:
+            summary["error"] = reason
+            summary["duration_s"] = round(time.perf_counter() - t0, 2)
+            return summary
+        svc = built_svc
 
-        body, err = _export_body(svc, f["id"], f["mimeType"], body_cap)
-        if err:
-            summary["files_failed"] += 1
-            summary["errors"].append({"id": f["id"], "name": f.get("name"), "err": err})
-            # still try to write a stub so reruns can pick up body later
-            body = ""
+    account_id = "me"  # single-user for now; multi-account is a Phase 2 concern
+    if col is None:
+        col = rag.get_db()
 
-        note = _render_note(f, body, str(target.relative_to(vault_root)))
-        try:
-            changed = rag._atomic_write_if_changed(target, note)
-        except Exception as exc:
-            summary["files_failed"] += 1
-            summary["errors"].append({"id": f["id"], "name": f.get("name"), "err": f"write_failed:{str(exc)[:80]}"})
-            continue
-
-        if changed:
-            summary["files_written"] += 1
-            summary["bytes_written"] += len(note.encode("utf-8"))
-            summary["written_paths"].append(str(target.relative_to(vault_root)))
-        else:
-            summary["files_skipped"] += 1
-
-    summary["duration_s"] = round(time.monotonic() - t0, 2)
-    return summary
-
-
-def _run_reindex() -> tuple[bool, str]:
-    """Invoke `rag index` in-process. Returns (ok, output)."""
+    state_conn_local = state_conn
+    opened_state = False
+    if state_conn_local is None:
+        state_conn_local = sqlite3.connect(str(rag.DB_PATH / STATE_DB_FILE))
+        opened_state = True
     try:
-        # Prefer the installed entrypoint so we use whatever venv the user
-        # actually runs `rag` from. Fall back to `python -m rag` equivalent
-        # if the installed binary isn't on PATH.
-        proc = subprocess.run(
-            ["rag", "index"],
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        )
-        return proc.returncode == 0, (proc.stdout + proc.stderr).strip()[-4000:]
-    except FileNotFoundError:
-        # Fallback: call the click group via the module
-        proc = subprocess.run(
-            [sys.executable, "-c", "import rag; rag.cli(['index'])"],
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        )
-        return proc.returncode == 0, (proc.stdout + proc.stderr).strip()[-4000:]
-    except subprocess.TimeoutExpired:
-        return False, "rag index timed out (30min)"
+        _ensure_state_table(state_conn_local)
+        if reset:
+            _reset_cursor(state_conn_local)
+            state_conn_local.commit()
+
+        stored = _load_cursor(state_conn_local, account_id)
+        mode_bootstrap = stored is None
+        summary["bootstrapped"] = mode_bootstrap
+        if mode_bootstrap:
+            since_iso = (
+                datetime.now(timezone.utc) - timedelta(days=days)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            since_iso = stored
+
+        try:
+            files = _list_since(
+                svc, since_iso=since_iso,
+                mime_types=list(EXPORT_MIME.keys()),
+                max_files=max_files,
+            )
+        except Exception as exc:
+            summary["error"] = f"list_failed: {str(exc)[:120]}"
+            summary["duration_s"] = round(time.perf_counter() - t0, 2)
+            return summary
+
+        summary["files_seen"] = len(files)
+        latest_mod = since_iso
+
+        for f in files:
+            if dry_run:
+                summary["files_indexed"] += 1
+                if (f.get("modifiedTime") or "") > latest_mod:
+                    latest_mod = f["modifiedTime"]
+                continue
+            body, err = _export_body(svc, f["id"], f["mimeType"], body_cap)
+            if err:
+                summary["files_failed"] += 1
+                summary["errors"].append({
+                    "id": f.get("id", "?"),
+                    "name": f.get("name", "?"),
+                    "err": err,
+                })
+                continue
+            try:
+                written = upsert_drive_file(col, f, body)
+                summary["chunks_written"] += written
+                summary["files_indexed"] += 1
+            except Exception as exc:
+                summary["files_failed"] += 1
+                summary["errors"].append({
+                    "id": f.get("id", "?"),
+                    "name": f.get("name", "?"),
+                    "err": f"upsert_failed:{str(exc)[:80]}",
+                })
+                continue
+            if (f.get("modifiedTime") or "") > latest_mod:
+                latest_mod = f["modifiedTime"]
+
+        # Retention: drop old chunks. Skip on dry-run.
+        if not dry_run:
+            summary["retention_deleted"] = _retention_prune(col)
+
+            # Save cursor only on real runs and only if we processed at least one file.
+            # Empty runs keep the previous cursor so next run retries the same window.
+            if summary["files_seen"] > 0:
+                _save_cursor(state_conn_local, account_id, latest_mod)
+                state_conn_local.commit()
+
+        summary["duration_s"] = round(time.perf_counter() - t0, 2)
+        return summary
+    finally:
+        if opened_state:
+            state_conn_local.close()
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--reset", action="store_true",
+                    help="limpiar el cursor y re-indexar desde 0 (ventana --days)")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
-                    help=f"ventana de modificación en días (default {DEFAULT_DAYS})")
+                    help=f"ventana de bootstrap en días (default {DEFAULT_DAYS})")
     ap.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES,
-                    help=f"tope de archivos a bajar (default {DEFAULT_MAX_FILES})")
+                    help=f"tope de archivos por run (default {DEFAULT_MAX_FILES})")
     ap.add_argument("--body-cap", type=int, default=DEFAULT_BODY_CAP,
-                    help=f"chars máx por doc (default {DEFAULT_BODY_CAP})")
+                    help=f"chars máx por doc antes de truncar (default {DEFAULT_BODY_CAP})")
     ap.add_argument("--dry-run", action="store_true",
-                    help="lista archivos sin bajar ni escribir")
-    ap.add_argument("--no-reindex", action="store_true",
-                    help="no correr `rag index` al final")
+                    help="listar sin exportar ni upsertar (no avanza cursor)")
     ap.add_argument("--json", action="store_true",
                     help="imprimir summary como JSON")
     args = ap.parse_args()
 
     summary = run(
+        reset=bool(args.reset),
         days=args.days,
         max_files=args.max_files,
         body_cap=args.body_cap,
@@ -327,41 +525,25 @@ def main() -> None:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
         return
 
-    if not summary.get("ok"):
-        print(f"[error] {summary.get('error', 'unknown')}")
+    if "error" in summary:
+        print(f"[error] {summary['error']}")
         sys.exit(1)
 
+    mode = "bootstrap" if summary["bootstrapped"] else "incremental"
     prefix = "[dry-run] " if args.dry_run else ""
     print(
-        f"{prefix}Google Drive backfill ({args.days}d): "
+        f"{prefix}Drive ({mode}): "
         f"{summary['files_seen']} archivos · "
-        f"{summary['files_written']} escritos · "
-        f"{summary['files_skipped']} skipped · "
+        f"+{summary['files_indexed']} indexados · "
+        f"{summary['chunks_written']} chunks · "
+        f"-{summary['retention_deleted']} retención · "
         f"{summary['files_failed']} fallaron · "
-        f"{summary['bytes_written']/1024:.1f} KB · "
         f"{summary['duration_s']}s"
     )
     if summary["errors"]:
         print(f"  {len(summary['errors'])} errores (primeros 5):")
         for e in summary["errors"][:5]:
             print(f"    - {e['name']} ({e['id'][:8]}): {e['err']}")
-
-    if args.dry_run or args.no_reindex:
-        if not args.dry_run and summary["files_written"]:
-            print("  (skipped reindex — correr `rag index` manualmente)")
-        return
-
-    if summary["files_written"] == 0:
-        print("  (nada nuevo escrito, skip reindex)")
-        return
-
-    print("Reindexando corpus…")
-    ok, out = _run_reindex()
-    if ok:
-        print("  reindex OK")
-    else:
-        print(f"  [warn] reindex falló:\n{out}")
-        sys.exit(2)
 
 
 if __name__ == "__main__":

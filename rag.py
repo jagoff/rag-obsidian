@@ -1865,7 +1865,7 @@ _COLLECTION_BASE = "obsidian_notes_v11"  # v11: removed temporal tokens (A/B 202
 # in docs/design-cross-source-corpus.md §10.6.
 VALID_SOURCES: frozenset[str] = frozenset(
     {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-     "contacts", "calls", "safari"}
+     "contacts", "calls", "safari", "drive"}
 )
 
 # Per-source weight applied multiplicatively to the final rerank+feature
@@ -1877,6 +1877,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "calendar":  0.95,
     "reminders": 0.90,
     "gmail":     0.85,
+    "drive":     0.85,   # Docs/Sheets/Slides: user-authored, high trust like email
     "safari":    0.80,   # browsing signal: rich titles + URLs, same band as calls
     "calls":     0.80,   # log entries: factual but semantically thin
     "whatsapp":  0.75,
@@ -1897,6 +1898,7 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "calendar":  None,
     "reminders":   90.0,
     "gmail":      180.0,
+    "drive":       90.0,   # Google Docs age between email (180d) and chat (30d)
     "safari":      90.0,   # browsing context ages mid-term
     "whatsapp":    30.0,
     "messages":    30.0,
@@ -1913,6 +1915,7 @@ SOURCE_RETENTION_DAYS: dict[str, int | None] = {
     "calendar":  None,
     "reminders": None,
     "gmail":      365,
+    "drive":      365,   # user's Drive docs — keep a year like email
     "safari":     180,
     "whatsapp":   180,
     "messages":   180,
@@ -2452,6 +2455,28 @@ def is_excluded(rel_path: str) -> bool:
             "OBSIDIAN_RAG_INDEX_WA_MONTHLY", ""
         ).strip().lower()
         if _wa_override not in ("1", "true", "yes"):
+            return True
+    # 03-Resources/GoogleDrive/: the daily snapshot + the (deprecated)
+    # one-shot backfill used to write markdown files here, but the
+    # user's Obsidian workflow periodically moves the whole folder to
+    # `.trash/` (5 copies observed 2026-04-19..24 before we switched
+    # approaches). Drive docs are now indexed directly into the vector
+    # collection via `rag index --source drive` with
+    # doc_id=gdrive://<file_id>#<chunk_idx> and source="drive" — any
+    # leftover markdown in this folder would double-index as
+    # source="vault" and the retrieval layer would surface both
+    # representations. Exclude defensively so stragglers (manual exports,
+    # legacy snapshots) never leak into the vault-side index.
+    #
+    # Rollback: `export OBSIDIAN_RAG_INDEX_GDRIVE_VAULT=1` to re-enable
+    # vault indexing of any markdown left under 03-Resources/GoogleDrive/.
+    # Only needed if `rag index --source drive` is broken and you need
+    # to fall back to the old write-to-vault approach.
+    if rel_path.startswith("03-Resources/GoogleDrive/"):
+        _gd_override = os.environ.get(
+            "OBSIDIAN_RAG_INDEX_GDRIVE_VAULT", ""
+        ).strip().lower()
+        if _gd_override not in ("1", "true", "yes"):
             return True
     return False
 RETRIEVE_K = 20    # candidates from semantic + BM25 each
@@ -20830,6 +20855,28 @@ def _do_index(reset: bool, no_contradict: bool, source_opt: str | None,
                 duration_s=summary["duration_s"],
                 dry_run=bool(dry_run),
                 extra="bootstrap" if summary.get("bootstrapped") else "",
+            ))
+            return
+        if src == "drive":
+            from scripts.ingest_gdrive import run as _ingest_gd
+            summary = _ingest_gd(
+                reset=bool(reset),
+                dry_run=bool(dry_run),
+            )
+            if "error" in summary:
+                console.print(f"[red]✗[/red] {summary['error']}")
+                return
+            console.print(_fmt_ingest_summary(
+                "drive",
+                total=summary["files_seen"],
+                indexed=summary["files_indexed"],
+                deleted=summary.get("retention_deleted", 0),
+                duration_s=summary["duration_s"],
+                dry_run=bool(dry_run),
+                extra=(
+                    f"chunks={summary['chunks_written']}"
+                    + (" · bootstrap" if summary.get("bootstrapped") else "")
+                ),
             ))
             return
         if src == "reminders":
@@ -43802,7 +43849,7 @@ _SCORE_CALIBRATION_ENABLED = os.environ.get(
 # usamos la calibración del vault ya que es la distribución más ancha).
 _CALIBRATION_SOURCES = (
     "vault", "whatsapp", "calendar", "gmail",
-    "reminders", "safari", "contacts", "calls",
+    "drive", "reminders", "safari", "contacts", "calls",
 )
 
 # In-process cache del modelo por source: {source: (raw_knots, cal_knots)}

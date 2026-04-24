@@ -40,7 +40,8 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
     # ingester populates the corpus. Kept in sync with rag.VALID_SOURCES.
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
-                             "contacts://", "calls://", "safari://")
+                             "contacts://", "calls://", "safari://",
+                             "drive://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -68,7 +69,8 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     import rag
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
-                             "contacts://", "calls://", "safari://"}
+                             "contacts://", "calls://", "safari://",
+                             "drive://"}
     # vault is file-backed → not a prefix
     expected_whitelisted = rag.VALID_SOURCES - {"vault"}
     prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}

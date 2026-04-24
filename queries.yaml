@@ -124,14 +124,11 @@ queries:
     expected:
       - 02-Areas/Musica/Toma tres.md
 
-  # Claude / Tech
-  - question: "comandos CLI de claude code"
-    expected:
-      - 03-Resources/Claude/Claude Code - Comandos CLI.md
-
-  - question: "comandos interactivos claude code"
-    expected:
-      - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
+  # (2026-04-24) Removidos queries de Claude Code CLI/Interactivos/Peers:
+  # las notas `03-Resources/Claude/Claude*.md` fueron movidas a .trash/
+  # por el user — los paths dejaron de existir en el vault y el test
+  # `test_queries_yaml_all_paths_exist_or_placeholder` fallaba. Si se
+  # reponen las notas se pueden re-agregar estos queries.
 
   - question: "equipamiento amps guitarra"
     expected:
@@ -260,11 +257,8 @@ queries:
   # Expect BOTH contrasted notes in top-k (OR-any hit still counts, but the
   # prompt forces "X dice A / Y dice B / Diferencia clave" structure — if
   # retrieval only brings one side, synthesis loses grounding).
-  - question: "diferencia entre los comandos CLI y los interactivos de claude code"
-    expected:
-      - 03-Resources/Claude/Claude Code - Comandos CLI.md
-      - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
-    note: "comparison intent: ambos sides de la contrastación deben estar"
+  # (2026-04-24) Removido query "diferencia entre comandos CLI y interactivos
+  # de claude code" — las notas fuente fueron movidas a .trash/.
 
   - question: "comparame el curso de liderazgo estratégico con el otro curso de liderazgo"
     expected:
@@ -294,12 +288,9 @@ queries:
       - 03-Resources/Coaching/Comunicacion no violenta.md
     note: "synthesis intent: cross-ref aggregation sobre coaching"
 
-  - question: "todo lo que hay sobre claude peers"
-    expected:
-      - 03-Resources/Claude/Claude-peers.md
-      - 03-Resources/Claude/Claude Peers - Worker Prompt.md
-      - 03-Resources/Claude/Claude Peers - Team Lead Prompt.md
-    note: "synthesis intent: multi-doc sobre un mismo concepto"
+  # (2026-04-24) Removido query "todo lo que hay sobre claude peers" —
+  # las notas fuente (`03-Resources/Claude/Claude*.md`) fueron movidas
+  # a .trash/. Si se repone el dominio, re-agregar con paths frescos.
 
   # ─────────────────────────────────────────────────────────────────────────
   # Cross-source queries (Phase 1.f — baselined 2026-04-21)
@@ -431,14 +422,8 @@ chains:
           - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.0.md
           - 04-Archive/Musica/Muros Fractales/Letra - La herrumbre - AI - 2.1.md
 
-  - id: tech-claude-code
-    turns:
-      - question: "comandos CLI de claude code"
-        expected:
-          - 03-Resources/Claude/Claude Code - Comandos CLI.md
-      - question: "y los interactivos"
-        expected:
-          - 03-Resources/Claude/Claude Code - Comandos Interactivos.md
+  # (2026-04-24) Removida chain `tech-claude-code` — las notas Claude
+  # Code CLI / Interactivos fueron movidas a .trash/.
 
   - id: rag-system
     turns:

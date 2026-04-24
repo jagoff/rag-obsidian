@@ -46,7 +46,91 @@ const els = {
   panels: document.getElementById("panels"),
   error: document.getElementById("error-wrap"),
   progress: document.getElementById("progress"),
+  stages: document.getElementById("refresh-stages"),
 };
+
+// ── Stage progress UI (live SSE during manual refresh) ────────────────
+// Human labels for each fetcher in the home fan-out (server side names
+// in `_home_compute`). Keep aligned with the `hello` event the SSE
+// stream emits — server is the source of truth for ordering.
+const STAGE_LABELS = {
+  today: "evidencia del día",
+  signals: "pendientes",
+  tomorrow: "agenda mañana",
+  forecast: "pronóstico",
+  pagerank: "autoridad",
+  chrome: "web 7d",
+  eval: "salud retrieval",
+  followup: "loops aging",
+  drive: "Drive 48h",
+  wa_unreplied: "WhatsApp sin responder",
+  bookmarks: "bookmarks usados",
+  vaults: "actividad vault",
+  finance: "finanzas",
+  youtube: "YouTube visto",
+};
+const STAGE_SLOW_MS = 5000;  // > 5s ⇒ visualmente "lento" (cuello de botella)
+
+function _stageId(name) { return "stg-" + name.replace(/[^a-z0-9_-]/gi, "-"); }
+
+function renderStageList(stages, totalMs) {
+  if (!els.stages) return;
+  const head = `
+    <div class="rs-head">
+      <span>refresh — paso a paso</span>
+      <span class="rs-total">${(totalMs / 1000).toFixed(1)}s</span>
+    </div>`;
+  const chips = stages.map((name) => `
+    <span class="stage" id="${_stageId(name)}" data-status="pending" data-name="${name}">
+      <span class="gly">○</span>
+      <span class="lbl">${STAGE_LABELS[name] || name}</span>
+      <span class="ms"></span>
+    </span>
+  `).join("");
+  els.stages.innerHTML = head + chips;
+  els.stages.classList.add("active");
+}
+
+function updateStage(name, status, elapsedMs, errorMsg) {
+  if (!els.stages) return;
+  const node = document.getElementById(_stageId(name));
+  if (!node) return;
+  node.dataset.status = status;
+  const gly = node.querySelector(".gly");
+  const ms = node.querySelector(".ms");
+  // Glyph map: ○ pending · ◐ running · ✓ done · ⚠ error · ⏱ timeout
+  const map = { pending: "○", start: "◐", done: "✓", error: "⚠", timeout: "⏱" };
+  if (gly) gly.textContent = map[status] || "○";
+  if (ms) {
+    if (status === "done" || status === "error" || status === "timeout") {
+      ms.textContent = `${(elapsedMs / 1000).toFixed(1)}s`;
+    } else {
+      ms.textContent = "";
+    }
+  }
+  if (status === "done" && elapsedMs >= STAGE_SLOW_MS) {
+    node.dataset.slow = "1";
+  } else {
+    delete node.dataset.slow;
+  }
+  if (errorMsg) node.title = errorMsg;
+}
+
+function clearStageList(delayMs = 1200) {
+  // Brief lingering window so the user sees the final state before
+  // the chip strip collapses.
+  if (!els.stages) return;
+  setTimeout(() => {
+    els.stages.classList.remove("active");
+    els.stages.innerHTML = "";
+  }, delayMs);
+}
+
+function bumpStageTotal(totalMs) {
+  if (!els.stages) return;
+  const t = els.stages.querySelector(".rs-total");
+  if (t) t.textContent = `${(totalMs / 1000).toFixed(1)}s`;
+}
 
 // Refresh buttons live inside the narrative card (inline when the brief is
 // pending, icon-only corner when the brief exists). Both carry class
@@ -1008,6 +1092,68 @@ function render(data) {
     `${dot} ${srcText} · ${(data.today?.counts?.total || 0)} señales vault · actualizado ${fmtTime(data.generated_at)}`;
 }
 
+// Stream loader — uses /api/home/stream (SSE) so the user sees per-stage
+// progress while the 14-fetcher fan-out runs. Only used on manual refresh
+// (regenerate=true) — auto-refresh keeps the silent /api/home GET path so
+// the chip strip doesn't flash every 60s.
+function loadViaStream(regenerate) {
+  return new Promise((resolve, reject) => {
+    const url = `/api/home/stream?regenerate=${regenerate ? "true" : "false"}`;
+    const es = new EventSource(url);
+    const t0 = Date.now();
+    let stagesAnnounced = false;
+    let totalTimer = null;
+    let settled = false;
+
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (totalTimer) { clearInterval(totalTimer); totalTimer = null; }
+      try { es.close(); } catch (_) {}
+      fn(arg);
+    };
+
+    es.addEventListener("hello", (ev) => {
+      try {
+        const { stages } = JSON.parse(ev.data);
+        renderStageList(stages || [], 0);
+        stagesAnnounced = true;
+        // Tick the total counter once a second so a wedged fetcher is
+        // visually obvious (numero sigue subiendo aun cuando ningún
+        // chip cambia de estado).
+        totalTimer = setInterval(() => bumpStageTotal(Date.now() - t0), 250);
+      } catch (_) {}
+    });
+    es.addEventListener("stage", (ev) => {
+      try {
+        const evt = JSON.parse(ev.data);
+        if (!stagesAnnounced) {
+          renderStageList([evt.stage], 0);
+          stagesAnnounced = true;
+        }
+        updateStage(evt.stage, evt.status, evt.elapsed_ms || 0, evt.error || null);
+      } catch (_) {}
+    });
+    es.addEventListener("done", (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        bumpStageTotal(Date.now() - t0);
+        finish(resolve, data);
+      } catch (err) { finish(reject, err); }
+    });
+    es.addEventListener("error", (ev) => {
+      // SSE `error` event fires on either:
+      //  (a) network/connection drop (no `data`), or
+      //  (b) explicit server-emitted `event: error`.
+      let msg = "stream interrumpido";
+      if (ev && ev.data) {
+        try { msg = JSON.parse(ev.data).message || msg; } catch (_) {}
+      }
+      finish(reject, new Error(msg));
+    });
+  });
+}
+
 async function load(regenerate = false, { bypassDebounce = false } = {}) {
   // Debounce: collapse rapid back-to-back loads (visibilitychange firing
   // right after the 60s interval would double-fetch). Always honor an
@@ -1041,9 +1187,15 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
   }, 8000);
 
   try {
-    const resp = await fetch(`/api/home?regenerate=${regenerate ? "true" : "false"}`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    let data;
+    if (regenerate) {
+      // Manual refresh → stream so user sees per-stage progress.
+      data = await loadViaStream(true);
+    } else {
+      const resp = await fetch(`/api/home?regenerate=false`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      data = await resp.json();
+    }
     if (data.warming) {
       // Backend pre-warmer is still computing the first payload. Keep
       // skeletons up and short-poll so we catch the real payload as soon
@@ -1080,6 +1232,10 @@ async function load(regenerate = false, { bypassDebounce = false } = {}) {
       setRefreshSpinning(false);
       els.progress.classList.remove("active");
     }, remain);
+    // Linger the stage list briefly so the user reads the final timings
+    // (where the bottleneck was) before it collapses. Only meaningful
+    // when we actually streamed (regenerate=true).
+    if (regenerate) clearStageList(2200);
   }
 }
 

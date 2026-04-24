@@ -4705,6 +4705,114 @@ def home_api(regenerate: bool = False) -> Response:
     return Response(content=_WARMING_BODY, media_type="application/json")
 
 
+@app.get("/api/home/stream")
+def home_stream(regenerate: bool = False) -> StreamingResponse:
+    """SSE companion to `/api/home`. Streams stage events as the 14-fetcher
+    fan-out runs so the UI can show what's happening live (fetcher name +
+    elapsed_ms on done, "timeout" / "error" on bail). Final `done` event
+    carries the full payload (same shape as `/api/home`).
+
+    Events:
+    - `stage` ({stage, status, elapsed_ms, error?})
+        status ∈ {"start","done","error","timeout"}
+    - `done` ({payload})
+    - `error` ({message}) — only on hard failure (today_evidence aborts).
+    """
+    import queue as _queue
+    import concurrent.futures as _cf
+    from contextlib import suppress
+
+    _ensure_home_prewarmer()
+    q: _queue.Queue = _queue.Queue()
+    SENTINEL = object()
+
+    def _on_progress(stage: str, status: str, elapsed_ms: float, err: str | None) -> None:
+        evt = {"stage": stage, "status": status, "elapsed_ms": round(elapsed_ms, 1)}
+        if err:
+            evt["error"] = err
+        q.put(("stage", evt))
+
+    def _runner() -> None:
+        try:
+            payload = _home_compute(regenerate=regenerate, progress=_on_progress)
+            q.put(("done", payload))
+        except HTTPException as exc:
+            q.put(("error", {"message": str(exc.detail)}))
+        except Exception as exc:
+            q.put(("error", {"message": str(exc)}))
+        finally:
+            q.put((SENTINEL, None))
+
+    def _gen():
+        # Heartbeat so reverse-proxies / Safari don't kill the connection
+        # while the slowest fetcher (signals, ~25s cold) is still running.
+        # 14s is comfortably under the typical 30s idle-disconnect window.
+        HEARTBEAT_S = 14.0
+        # Hard cap matches the worst-case sum of per-fetcher budgets
+        # (today=30 + signals=45 + tail=15 cushion). Anything past this
+        # means a fetcher is wedged — emit an explicit error.
+        HARD_CAP_S = 90.0
+
+        worker = threading.Thread(target=_runner, name="home-stream", daemon=True)
+        worker.start()
+
+        # Initial event so the UI knows the stream is alive even before
+        # the first fetcher finishes (today_evidence cold path = 4-30s).
+        yield _sse("hello", {"stages": [
+            "today", "signals", "tomorrow", "forecast",
+            "pagerank", "chrome", "eval", "followup",
+            "drive", "wa_unreplied", "bookmarks", "vaults",
+            "finance", "youtube",
+        ]})
+
+        t0 = time.time()
+        finished = False
+        while not finished:
+            elapsed = time.time() - t0
+            if elapsed > HARD_CAP_S:
+                yield _sse("error", {
+                    "message": f"home-compute excedió {HARD_CAP_S:.0f}s",
+                })
+                break
+            try:
+                kind, payload = q.get(timeout=HEARTBEAT_S)
+            except _queue.Empty:
+                # No event in HEARTBEAT_S — flush a comment to keep the
+                # connection warm. SSE spec: lines starting with `:` are
+                # comments, ignored by the client.
+                yield ": keepalive\n\n"
+                continue
+
+            if kind is SENTINEL:
+                finished = True
+                break
+            yield _sse(kind, payload)
+            if kind == "done":
+                # Persist + cache so the next /api/home is instant.
+                with suppress(Exception):
+                    body = json.dumps(payload, default=str).encode()
+                    now = time.time()
+                    _HOME_STATE["payload"] = payload
+                    _HOME_STATE["body"] = body
+                    _HOME_STATE["ts"] = now
+                    _persist_home_cache(body, now)
+                finished = True
+                break
+            if kind == "error":
+                finished = True
+                break
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # disable nginx-style proxy buffering
+            "Connection": "keep-alive",
+        },
+    )
+
+
 _HOME_PREWARMER_STARTED = False
 
 # Opt-in prewarmer. Default OFF because the fan-out (12 channel fetchers
@@ -4915,7 +5023,10 @@ def _chat_cache_put(key: str, payload: dict) -> None:
             _CHAT_CACHE.popitem(last=False)
 
 
-def _home_compute(regenerate: bool = False) -> dict:
+def _home_compute(
+    regenerate: bool = False,
+    progress: "Callable[[str, str, float, str | None], None] | None" = None,
+) -> dict:
     """Centralizer — aggregates every information channel the user cares
     about into one JSON payload. Powers the home page.
 
@@ -4929,6 +5040,11 @@ def _home_compute(regenerate: bool = False) -> dict:
     icalBuddy not installed), that key is missing/empty but the rest renders.
     `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
     cached brief from `05-Reviews/<date>-evening.md` if present.
+
+    `progress` (optional): callback invoked as
+    `progress(stage, status, elapsed_ms, error_message)` where status is one
+    of "start" | "done" | "error" | "timeout". Used by the SSE stream
+    endpoint to surface live fetcher state to the UI.
     """
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import suppress
@@ -4953,10 +5069,24 @@ def _home_compute(regenerate: bool = False) -> dict:
 
     def _timed(name: str, fn, *args):
         t0 = time.time()
+        if progress is not None:
+            with suppress(Exception):
+                progress(name, "start", 0.0, None)
         try:
-            return fn(*args)
-        finally:
-            timings[name] = time.time() - t0
+            result = fn(*args)
+            elapsed_ms = (time.time() - t0) * 1000.0
+            timings[name] = (time.time() - t0)
+            if progress is not None:
+                with suppress(Exception):
+                    progress(name, "done", elapsed_ms, None)
+            return result
+        except Exception as exc:
+            elapsed_ms = (time.time() - t0) * 1000.0
+            timings[name] = (time.time() - t0)
+            if progress is not None:
+                with suppress(Exception):
+                    progress(name, "error", elapsed_ms, str(exc))
+            raise
 
     try:
         fut_today       = pool.submit(
@@ -4977,8 +5107,33 @@ def _home_compute(regenerate: bool = False) -> dict:
         fut_finance     = pool.submit(_timed, "finance", _fetch_finance, now)
         fut_youtube     = pool.submit(_timed, "youtube", _fetch_youtube_watched, 5, 168)
 
+        # Helper: wait on a future with budget, return default on timeout
+        # or worker exception. Emits "timeout" progress event so the UI
+        # can show "skipped (>Ns)" instead of "running" forever (the
+        # worker keeps going in bg to warm caches but its data is
+        # discarded by the main thread once the budget elapses).
+        import concurrent.futures as _cf
+
+        def _await(name: str, fut, timeout: float, default=None):
+            try:
+                return fut.result(timeout=timeout)
+            except _cf.TimeoutError:
+                if progress is not None:
+                    with suppress(Exception):
+                        progress(name, "timeout", timeout * 1000.0, None)
+                return default
+            except Exception:
+                # `_timed` already emitted "error" with the real elapsed.
+                return default
+
         try:
             today_ev = fut_today.result(timeout=30)
+        except _cf.TimeoutError as exc:
+            if progress is not None:
+                with suppress(Exception):
+                    progress("today", "timeout", 30000.0, None)
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise HTTPException(status_code=500, detail="today_evidence timeout") from exc
         except Exception as exc:
             pool.shutdown(wait=False, cancel_futures=True)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -4987,61 +5142,23 @@ def _home_compute(regenerate: bool = False) -> dict:
         # Bump cap to 45s — the user never waits on this since pre-warmer
         # eats the cold compute. If it still times out, the next cycle
         # repopulates and SWR keeps stale signals visible meanwhile.
-        signals = {}
-        with suppress(Exception):
-            signals = fut_signals.result(timeout=45)
-
-        tomorrow_calendar = []
-        with suppress(Exception):
-            tomorrow_calendar = fut_tomorrow.result(timeout=10) or []
-
-        weather_forecast = None
-        with suppress(Exception):
-            weather_forecast = fut_forecast.result(timeout=10)
-
-        pagerank_top: list[dict] = []
-        with suppress(Exception):
-            pagerank_top = fut_pagerank.result(timeout=10) or []
-
-        chrome_top_week: list[dict] = []
-        with suppress(Exception):
-            chrome_top_week = fut_chrome.result(timeout=5) or []
-
-        eval_trend: dict | None = None
-        with suppress(Exception):
-            eval_trend = fut_eval.result(timeout=5)
-
+        signals = _await("signals", fut_signals, 45, default={}) or {}
+        tomorrow_calendar = _await("tomorrow", fut_tomorrow, 10, default=[]) or []
+        weather_forecast = _await("forecast", fut_forecast, 10, default=None)
+        pagerank_top = _await("pagerank", fut_pagerank, 10, default=[]) or []
+        chrome_top_week = _await("chrome", fut_chrome, 5, default=[]) or []
+        eval_trend = _await("eval", fut_eval, 5, default=None)
         # followup_aging has its own 6h cache + LLM-judge per loop on cold.
         # If not ready within 2s, skip it this cycle — the bg thread keeps
         # computing and the next prewarmer pass (25s later) picks up the
         # warm cache. This shaves ~15s off the cold critical path.
-        followup_aging: dict | None = None
-        with suppress(Exception):
-            followup_aging = fut_followup.result(timeout=2)
-
-        drive_recent: list[dict] = []
-        with suppress(Exception):
-            drive_recent = fut_drive.result(timeout=10) or []
-
-        whatsapp_unreplied: list[dict] = []
-        with suppress(Exception):
-            whatsapp_unreplied = fut_wa_unreplied.result(timeout=10) or []
-
-        chrome_bookmarks: list[dict] = []
-        with suppress(Exception):
-            chrome_bookmarks = fut_bookmarks.result(timeout=5) or []
-
-        vault_activity: dict = {}
-        with suppress(Exception):
-            vault_activity = fut_vaults.result(timeout=10) or {}
-
-        finance: dict | None = None
-        with suppress(Exception):
-            finance = fut_finance.result(timeout=5)
-
-        youtube_watched: list[dict] = []
-        with suppress(Exception):
-            youtube_watched = fut_youtube.result(timeout=5) or []
+        followup_aging = _await("followup", fut_followup, 2, default=None)
+        drive_recent = _await("drive", fut_drive, 10, default=[]) or []
+        whatsapp_unreplied = _await("wa_unreplied", fut_wa_unreplied, 10, default=[]) or []
+        chrome_bookmarks = _await("bookmarks", fut_bookmarks, 5, default=[]) or []
+        vault_activity = _await("vaults", fut_vaults, 10, default={}) or {}
+        finance = _await("finance", fut_finance, 5, default=None)
+        youtube_watched = _await("youtube", fut_youtube, 5, default=[]) or []
 
         signals["pagerank_top"] = pagerank_top
         signals["chrome_top_week"] = chrome_top_week

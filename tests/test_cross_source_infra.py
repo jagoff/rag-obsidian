@@ -21,16 +21,17 @@ import rag
 
 def test_valid_sources_contains_expected():
     # Phase 1 registered 6 sources + Phase 1e/f added contacts + calls
-    # + Phase 2 added safari. Anchor test so future additions don't
+    # + Phase 2 added safari + drive (Google Docs/Sheets/Slides corpus,
+    # commit de03db1 2026-04-23). Anchor test so future additions don't
     # silently grow the surface.
     assert rag.VALID_SOURCES == frozenset(
         {"vault", "calendar", "gmail", "whatsapp", "reminders", "messages",
-         "contacts", "calls", "safari"}
+         "contacts", "calls", "safari", "drive"}
     )
 
 
 def test_source_weights_dict_covers_every_valid_source():
-    # Hierarchy: vault > contacts ≈ calendar > reminders > gmail
+    # Hierarchy: vault > contacts ≈ calendar > reminders > gmail ≈ drive
     #          > safari ≈ calls > whatsapp = messages.
     assert set(rag.SOURCE_WEIGHTS) == rag.VALID_SOURCES
     assert rag.SOURCE_WEIGHTS["vault"] == 1.00
@@ -38,6 +39,8 @@ def test_source_weights_dict_covers_every_valid_source():
     assert rag.SOURCE_WEIGHTS["calendar"] == 0.95
     assert rag.SOURCE_WEIGHTS["reminders"] == 0.90
     assert rag.SOURCE_WEIGHTS["gmail"] == 0.85
+    # drive: Docs/Sheets/Slides son user-authored + high trust, mismo band que email.
+    assert rag.SOURCE_WEIGHTS["drive"] == 0.85
     assert rag.SOURCE_WEIGHTS["safari"] == 0.80
     assert rag.SOURCE_WEIGHTS["calls"] == 0.80
     assert rag.SOURCE_WEIGHTS["whatsapp"] == 0.75

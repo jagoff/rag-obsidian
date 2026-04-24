@@ -188,6 +188,82 @@
     .status-line .dot.gen { color: var(--cyan); }
     .status-slow { color: var(--yellow); }
 
+    /* ── Stage list (live SSE progress while /api/home/stream runs) ──
+       Visible only during a manual refresh. Each stage renders as a
+       small chip with a state glyph + elapsed time, so the user can
+       see exactly which fetcher is the bottleneck (typically `signals`
+       or `today`). Auto-collapses when refresh ends. */
+    #refresh-stages {
+      display: none;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      margin: -16px 0 28px;
+      padding: 10px 12px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 11px;
+      color: var(--text-faint);
+      max-width: 100%;
+    }
+    #refresh-stages.active { display: flex; }
+    #refresh-stages .rs-head {
+      width: 100%;
+      font-size: 11px;
+      color: var(--text-faint);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+    }
+    #refresh-stages .rs-head .rs-total { color: var(--cyan); font-variant-numeric: tabular-nums; }
+    #refresh-stages .stage {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--bg) 50%, transparent);
+      border: 1px solid transparent;
+      transition: background 120ms, border-color 120ms;
+      font-variant-numeric: tabular-nums;
+    }
+    #refresh-stages .stage .gly {
+      display: inline-block;
+      width: 9px;
+      text-align: center;
+      font-weight: 700;
+    }
+    #refresh-stages .stage .ms { color: var(--text-faint); font-size: 10px; }
+    /* Pending: muted */
+    #refresh-stages .stage[data-status="pending"] { opacity: 0.45; }
+    #refresh-stages .stage[data-status="pending"] .gly { color: var(--text-faint); }
+    /* Running: pulsing cyan */
+    #refresh-stages .stage[data-status="start"] {
+      border-color: color-mix(in srgb, var(--cyan) 35%, transparent);
+      color: var(--cyan);
+    }
+    #refresh-stages .stage[data-status="start"] .gly {
+      color: var(--cyan);
+      animation: stage-spin 1s linear infinite;
+    }
+    @keyframes stage-spin { to { transform: rotate(360deg); } }
+    /* Done: green check */
+    #refresh-stages .stage[data-status="done"] .gly { color: var(--green); }
+    #refresh-stages .stage[data-status="done"] { color: var(--text); }
+    /* Slow done: yellow tint when elapsed > 5s (bottleneck signal) */
+    #refresh-stages .stage[data-slow="1"] .gly { color: var(--yellow); }
+    #refresh-stages .stage[data-slow="1"] .ms { color: var(--yellow); }
+    /* Error / timeout */
+    #refresh-stages .stage[data-status="error"] .gly,
+    #refresh-stages .stage[data-status="timeout"] .gly { color: var(--red); }
+    #refresh-stages .stage[data-status="error"],
+    #refresh-stages .stage[data-status="timeout"] { color: var(--red); }
+    @media (prefers-reduced-motion: reduce) {
+      #refresh-stages .stage[data-status="start"] .gly { animation: none; }
+    }
+
     /* ── Urgent banner ──────────────────────────────────────────── */
     .urgent {
       background: color-mix(in srgb, var(--red) 8%, transparent);
@@ -640,6 +716,7 @@
       <h2>hoy<span class="date" id="date-label">—</span></h2>
     </div>
     <div class="status-line" id="status-line">cargando…</div>
+    <div id="refresh-stages" aria-live="polite" aria-label="progreso del refresh"></div>
     <div id="urgent-wrap"></div>
     <div id="narrative-wrap"></div>
     <div class="grid" id="panels"></div>
@@ -650,6 +727,6 @@
   <script src="/static/vendor/marked.min.js"
           integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"
           defer></script>
-  <script src="/static/home.js?v=2026-04-24-gmail-unread" defer></script>
+  <script src="/static/home.js?v=2026-04-24-stream-progress" defer></script>
 </body>
 </html>

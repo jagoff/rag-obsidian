@@ -3020,6 +3020,26 @@ strong, b, th {
   grid-template-columns: 1fr;
 }
 
+/* ── Bottom-footer (meta-actions: ayuda + status) ──────────────────────
+   2026-04-24: el bloque principal de controles vive arriba (sidebar-
+   footer después del brand), pero ayuda y status quedaron acá abajo
+   como estaban antes. Border-top separa del sessions-list; safe-area-
+   inset-bottom respeta el home indicator del iPhone en PWA standalone.
+   Grid de 2 columnas (mismo layout que sidebar-footer-actions) que
+   colapsa a 1 columna cuando la sidebar está icon-only. */
+.sidebar-footer-bottom {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+  border-top: 1px solid var(--sidebar-border);
+  padding-top: 10px;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+#sidebar[data-state="collapsed"] .sidebar-footer-bottom {
+  grid-template-columns: 1fr;
+}
+
 /* ── Generic icon-btn used across sidebar + mobile-header ──────────── */
 
 .icon-btn {

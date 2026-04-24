@@ -53,7 +53,7 @@
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
 
-  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-wa-reply">
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-sidebar-split">
   <script src="/static/pwa/register-sw.js" defer></script>
 </head>
 <body>
@@ -175,12 +175,6 @@
             <span class="tts-icon" aria-hidden="true"></span>
             <span class="icon-btn-label tts-label">voz</span>
           </button>
-          <button id="help-btn" class="icon-btn" type="button"
-                  title="Atajos y comandos (⌘/)"
-                  aria-label="Abrir ayuda">
-            <span class="icon-btn-glyph" aria-hidden="true">?</span>
-            <span class="icon-btn-label">ayuda</span>
-          </button>
           <a class="icon-btn sidebar-link" href="/" title="Home">
             <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
                  fill="none" stroke="currentColor" stroke-width="2"
@@ -200,16 +194,6 @@
               <rect x="3" y="16" width="7" height="5"/>
             </svg>
             <span class="icon-btn-label">dashboard</span>
-          </a>
-          <a class="icon-btn sidebar-link" href="/status" title="Status de servicios">
-            <!-- Pulso/ECG: dice "health monitoring" de un vistazo sin
-                 necesidad de label en sidebar colapsado. -->
-            <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
-                 fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12h4l2-6 4 12 2-6h6"/>
-            </svg>
-            <span class="icon-btn-label">status</span>
           </a>
         </div>
       </footer>
@@ -264,6 +248,29 @@
         </ul>
       </nav>
 
+      <!-- Meta-actions (bottom) — ayuda + status.
+           2026-04-24: se separaron del bloque principal de controles y
+           quedaron abajo como estaban antes. El usuario rara vez abre
+           ayuda (cheatsheet de atajos) o revisa status (ECG de health
+           de los daemons); son controles "meta", no se usan mientras
+           chatea. Border-top + safe-area-inset-bottom para home
+           indicator del iPhone en PWA standalone. -->
+      <footer class="sidebar-footer-bottom">
+        <button id="help-btn" class="icon-btn" type="button"
+                title="Atajos y comandos (⌘/)"
+                aria-label="Abrir ayuda">
+          <span class="icon-btn-glyph" aria-hidden="true">?</span>
+          <span class="icon-btn-label">ayuda</span>
+        </button>
+        <a class="icon-btn sidebar-link" href="/status" title="Status de servicios">
+          <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12h4l2-6 4 12 2-6h6"/>
+          </svg>
+          <span class="icon-btn-label">status</span>
+        </a>
+      </footer>
     </div>
   </aside>
 

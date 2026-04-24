@@ -34760,6 +34760,177 @@ def find_dead_notes(
     return candidates
 
 
+# ── WAKE-UP PACK (rag wake-up) ─────────────────────────────────────────────
+# Orquestador "todo en uno" pensado para correr via launchd a las 04:00:
+# cuando el user se despierta, todo está fresco — ETLs corridos, vault
+# reindexado, caches limpios, radares actualizados, brief matutino
+# pre-renderizado en 05-Reviews/, y el chat model cargado en RAM con
+# keep_alive=-1 para que el primer `rag chat` responda sin cold-start.
+#
+# Cada paso es independiente: si `rag maintenance` falla, `rag morning`
+# igual corre. Al final imprime un resumen con qué pasó y exit code
+# non-zero si algún paso falló (para que launchd lo registre en
+# `last exit code` y aparezca rojo en la /status page).
+#
+# No reemplaza los plists individuales (morning 07:00, maintenance 03:30,
+# patterns domingo 20:00, emergent viernes 10:00) — solo los amortigua.
+# Si la Mac estaba en sleep a alguna de esas horas y launchd no pudo
+# disparar el job, el wake-up lo re-ejecuta a las 04:00. Lo contrario
+# también: si el user reinstala y no corrió morning desde los plists,
+# wake-up se encarga.
+
+
+@cli.command(name="wake-up")
+@click.option("--dry-run", is_flag=True,
+              help="Reportar los pasos sin ejecutar nada")
+@click.option("--skip-index", is_flag=True,
+              help="Saltear `rag index` (ETLs + reindex)")
+@click.option("--skip-maintenance", is_flag=True,
+              help="Saltear `rag maintenance`")
+@click.option("--skip-radars", is_flag=True,
+              help="Saltear `rag patterns` + `rag emergent`")
+@click.option("--skip-brief", is_flag=True,
+              help="Saltear pre-render de `rag morning`")
+@click.option("--skip-warmup", is_flag=True,
+              help="Saltear el Ollama warmup")
+@click.pass_context
+def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
+            skip_radars: bool, skip_brief: bool, skip_warmup: bool):
+    """Wake-up pack: traé todo fresco antes de despertarte.
+
+    Orquesta en este orden (cada paso es independiente — si uno falla,
+    los demás siguen):
+
+    \b
+      1. `rag index`        — ETLs de todas las fuentes + reindex del vault.
+      2. `rag maintenance`  — WAL checkpoint, rotación de logs, cleanup.
+      3. `rag patterns`     — radar de feedback dominante.
+      4. `rag emergent`     — radar de temas emergentes en queries.
+      5. `rag morning`      — brief matutino pre-renderizado a 05-Reviews/.
+      6. Ollama warmup      — carga el chat model con keep_alive=-1.
+
+    Pensado para launchd a las 04:00 — `rag setup` instala el plist.
+    Exit code != 0 si algún paso falla (launchd lo marca rojo).
+
+    Flags de skip útiles para debug o cuando un subsistema específico
+    está roto y querés correr el resto igual.
+    """
+    steps: list[tuple[str, object, dict]] = []
+    if not skip_index:
+        # Defaults matchean los que usa el plist `com.fer.obsidian-rag-ingest-*`
+        # y el flow normal de `rag index`: incremental, contradictions ON,
+        # sin --source (= vault + todos los pre-syncs cross-source).
+        steps.append(("rag index", index, dict(
+            reset=False, no_contradict=False, source_opt=None,
+            since_opt=None, dry_run=False, max_chats=None, vault_scope=None,
+        )))
+    if not skip_maintenance:
+        # skip_reindex=True porque `rag index` ya corrió arriba. El resto
+        # (WAL, logs, dead, orphan HNSW) sí queremos.
+        steps.append(("rag maintenance", maintenance, dict(
+            dry_run=False, skip_reindex=True, skip_logs=False, verbose=False,
+            as_json=False, rollback_state=False, validate_cutover=False,
+            force=False,
+        )))
+    if not skip_radars:
+        # patterns/emergent escriben notas al vault si detectan algo
+        # relevante; push=False para no mandar WhatsApp en mute hours.
+        steps.append(("rag patterns", patterns, dict(
+            last=500, min_share=0.30, dry_run=False, push=False,
+        )))
+        steps.append(("rag emergent", emergent, dict(
+            days=7, min_size=5, threshold=0.35, dry_run=False, push=False,
+        )))
+    if not skip_brief:
+        steps.append(("rag morning", morning, dict(
+            dry_run=False, date_opt=None, lookback_hours=36,
+        )))
+
+    total_steps = len(steps) + (0 if skip_warmup else 1)
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    total_start = time.perf_counter()
+    console.print()
+    console.print(Rule(title=f"[bold cyan]wake-up[/bold cyan] · "
+                       f"{total_steps} pasos",
+                       style="cyan"))
+
+    for i, (label, fn, kwargs) in enumerate(steps, 1):
+        console.print()
+        console.print(f"[bold cyan]▶ [{i}/{total_steps}][/bold cyan] {label}")
+        if dry_run:
+            console.print(f"  [dim]dry-run: skippeado[/dim]")
+            continue
+        step_start = time.perf_counter()
+        try:
+            ctx.invoke(fn, **kwargs)
+            ms = int((time.perf_counter() - step_start) * 1000)
+            succeeded.append(f"{label} ({ms}ms)")
+        except SystemExit as e:
+            # Click commands raise SystemExit en error paths. Mapeamos
+            # a "failed step" pero seguimos con el resto.
+            ms = int((time.perf_counter() - step_start) * 1000)
+            code = e.code if e.code is not None else 0
+            if code == 0:
+                succeeded.append(f"{label} ({ms}ms)")
+            else:
+                failed.append((label, f"exit {code} ({ms}ms)"))
+        except Exception as e:
+            ms = int((time.perf_counter() - step_start) * 1000)
+            failed.append((label, f"{type(e).__name__}: {e} ({ms}ms)"))
+            console.print(f"  [red]✗[/red] {type(e).__name__}: {e}")
+
+    if not skip_warmup:
+        idx = len(steps) + 1
+        console.print()
+        console.print(f"[bold cyan]▶ [{idx}/{total_steps}][/bold cyan] ollama warmup")
+        if dry_run:
+            console.print(f"  [dim]dry-run: skippeado[/dim]")
+        else:
+            step_start = time.perf_counter()
+            try:
+                model = resolve_chat_model()
+                # Tiny prompt — solo trigger del model load + keep_alive=-1.
+                # qwen2.5:7b carga en ~3-5s en M3 Max. Con keep_alive=-1
+                # queda en RAM hasta que ollama lo desaloje por presión
+                # de memoria o restart. El primer `rag chat` post-wake-up
+                # no paga el cold-start (~400ms de prefill vs. 5s cold).
+                ollama.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": "."}],
+                    options=CHAT_OPTIONS,
+                    keep_alive=-1,
+                )
+                ms = int((time.perf_counter() - step_start) * 1000)
+                succeeded.append(f"ollama warmup · {model} ({ms}ms)")
+                console.print(f"  [green]✓[/green] {model} caliente "
+                              f"(keep_alive=-1, {ms}ms)")
+            except Exception as e:
+                ms = int((time.perf_counter() - step_start) * 1000)
+                failed.append(("ollama warmup",
+                               f"{type(e).__name__}: {e} ({ms}ms)"))
+                console.print(f"  [red]✗[/red] {type(e).__name__}: {e}")
+
+    total_ms = int((time.perf_counter() - total_start) * 1000)
+    console.print()
+    style = "green" if not failed else "yellow"
+    verdict = "OK" if not failed else f"{len(failed)} falló(s)"
+    console.print(Rule(
+        title=f"[bold]wake-up done[/bold] · {verdict} · "
+              f"{len(succeeded)} ok · {total_ms}ms",
+        style=style,
+    ))
+    if failed:
+        console.print()
+        console.print("[yellow]Fallaron:[/yellow]")
+        for label, reason in failed:
+            console.print(f"  · [bold]{label}[/bold]: {reason}")
+        # Exit non-zero para que launchd registre el fallo en
+        # `last exit code` → aparece rojo en la /status page.
+        raise SystemExit(1)
+
+
 # ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
 # Promotes recurring conversation clusters from 00-Inbox/conversations/
 # into PARA and archives the originals. All heavy lifting lives in
@@ -36669,6 +36840,53 @@ def _ingest_reminders_plist(rag_bin: str) -> str:
 """
 
 
+def _wake_up_plist(rag_bin: str) -> str:
+    """Wake-up pack — 04:00 diario.
+
+    Orquesta `rag index` + `maintenance` + `patterns` + `emergent` +
+    `morning` + ollama warmup en ese orden. ~15-20min end-to-end.
+
+    Corre a las 04:00 (no 06:00) para darle tiempo a completar todo
+    antes de que el user se despierte. Asume que la Mac está prendida
+    overnight (plugged-in o no en sleep agresivo). Si la Mac estaba en
+    sleep, launchd dispara el job al wake y puede solaparse con el
+    `morning` plist de las 07:00 — rag maneja esto porque cada paso es
+    idempotente (hash-skip en ETLs, reindex incremental, etc.).
+
+    No reemplaza los plists individuales de morning/maintenance/
+    patterns/emergent — los amortigua (si alguno no corrió porque la
+    Mac estaba en sleep a su horario, wake-up lo re-ejecuta).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-wake-up</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>wake-up</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>-1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wake-up.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wake-up.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -36688,6 +36906,8 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _morning_plist(rag_bin)),
         ("com.fer.obsidian-rag-today", "com.fer.obsidian-rag-today.plist",
          _today_plist(rag_bin)),
+        ("com.fer.obsidian-rag-wake-up", "com.fer.obsidian-rag-wake-up.plist",
+         _wake_up_plist(rag_bin)),
         ("com.fer.obsidian-rag-emergent", "com.fer.obsidian-rag-emergent.plist",
          _emergent_plist(rag_bin)),
         ("com.fer.obsidian-rag-patterns", "com.fer.obsidian-rag-patterns.plist",

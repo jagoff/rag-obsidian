@@ -132,6 +132,10 @@ def chat_env(monkeypatch):
     conf=0.005 (triggers bypass). Tests que quieren normal path
     re-monkeypatch `multi_retrieve` con conf más alta.
     """
+    # Reset rate-limit bucket para que 30 req/60s no se excedan cuando
+    # la suite entera corre junta (acumulación entre tests). Ver
+    # comentario largo en tests/test_web_chat_tools.py::chat_env.
+    server_mod._CHAT_BUCKETS.clear()
     monkeypatch.setattr(
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(
@@ -348,6 +352,13 @@ def test_high_confidence_no_bypass(chat_env):
 def test_confidence_exactly_at_threshold_no_bypass(chat_env):
     """Edge: conf == CONFIDENCE_RERANK_MIN (0.015) NO dispara bypass
     (strict `<`, no `<=`). Invariant documentado en rag.py.
+
+    Post-iter-7 (2026-04-24): a 0.015 el vault retrieve cae en
+    `vault_retrieve_weak` (< CONFIDENCE_DEEP_THRESHOLD=0.10), y si la
+    query no matchea pre-router entonces el LLM tool-decide fallback
+    se activa como safety-net (ver `_llm_fallback_needed` en
+    web/server.py). Por eso ahora el mock scriptea 2 responses:
+    tool-decide (sin tools) + streaming final.
     """
     from rag import CONFIDENCE_RERANK_MIN
     chat_env.setattr(
@@ -358,7 +369,8 @@ def test_confidence_exactly_at_threshold_no_bypass(chat_env):
         ),
     )
     mock = _OllamaMock([
-        _mk_stream(["resp"]),
+        _mk_msg(tool_calls=[]),   # LLM tool-decide fallback (iter 7)
+        _mk_stream(["resp"]),     # streaming final
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
     chat_env.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)

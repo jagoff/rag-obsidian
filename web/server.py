@@ -7072,6 +7072,8 @@ _STATUS_CATALOG: list[dict] = [
 
     # Briefs + automation.
     {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-wake-up", "name": "Wake-up pack (04:00)"},
+    {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
      "target": "com.fer.obsidian-rag-morning", "name": "Morning brief"},
     {"category": "briefs", "category_label": "Briefs + automation", "kind": "scheduled",
      "target": "com.fer.obsidian-rag-today", "name": "Today brief"},

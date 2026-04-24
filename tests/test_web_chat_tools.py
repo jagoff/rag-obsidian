@@ -158,6 +158,13 @@ def chat_env(monkeypatch):
       to skip it for latency; these tests assert that round's semantics).
     """
     monkeypatch.setenv("RAG_WEB_TOOL_LLM_DECIDE", "1")
+    # Reset per-IP rate limit bucket — el `_CHAT_BUCKETS` default dict
+    # acumula timestamps entre tests y el límite de 30 req/60s se
+    # excedía cuando la suite entera corría junta, tirando 429s en
+    # tests que en isolation pasaban. Clear garantiza que cada test
+    # arranque con el budget lleno. TestClient usa "testclient" como
+    # client IP por defecto.
+    server_mod._CHAT_BUCKETS.clear()
     monkeypatch.setattr(
         server_mod, "multi_retrieve",
         lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
@@ -1345,6 +1352,164 @@ def test_done_event_flags_source_specific_false_for_weather_only(
         f"weather-only query NO debería flagear source_specific=true: "
         f"{done_payload!r}"
     )
+
+
+# ── 10.8. LLM tool-decide safety-net fallback (iter 7) ────────────────────
+
+
+@pytest.fixture
+def chat_env_prod(monkeypatch):
+    """Variante del fixture `chat_env` SIN `RAG_WEB_TOOL_LLM_DECIDE=1`,
+    replicando el comportamiento de producción donde el LLM tool-decide
+    está apagado por default. Así podemos testear el gate de fallback
+    (iter 7): cuando el pre-router no matcheó Y el retrieve vino con
+    conf<0.10, el LLM tool-decide debería prenderse solo como safety-net.
+    """
+    # No setear RAG_WEB_TOOL_LLM_DECIDE — dejamos el default (off).
+    monkeypatch.delenv("RAG_WEB_TOOL_LLM_DECIDE", raising=False)
+    # Reset rate-limit bucket (ver comentario en `chat_env` para detalle).
+    server_mod._CHAT_BUCKETS.clear()
+    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
+    monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
+    import rag as _rag
+    monkeypatch.setattr(_rag, "build_person_context", lambda q: None)
+    monkeypatch.setattr(server_mod, "_persist_conversation_turn", lambda *a, **kw: None)
+    monkeypatch.setattr(server_mod, "save_session", lambda sess: None)
+    monkeypatch.setattr(server_mod, "log_query_event", lambda ev: None)
+    monkeypatch.setattr(server_mod, "_chat_cache_get", lambda key: None)
+    monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
+    monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+    return monkeypatch
+
+
+@pytest.mark.requires_ollama
+def test_llm_tool_decide_fires_when_pre_router_misses_and_vault_weak(
+    chat_env_prod, monkeypatch, capsys,
+):
+    """Iter 7 regression (user question 2026-04-24): "¿no debería el LLM
+    intervenir acá? qué pasa si hay otra palabra que no matchea con el
+    pre-router?" — sí, ahora interviene como safety-net cuando regex +
+    vault ambos fallan.
+
+    Este test usa una query ("qué correspondencia tengo?") que NO matchea
+    ningún pattern del pre-router, stubbea multi_retrieve para devolver
+    confidence baja (< CONFIDENCE_DEEP_THRESHOLD=0.10), y verifica que
+    el LLM tool-decide round efectivamente corrió (mock recibió al menos
+    la call no-streaming del tool-deciding phase).
+    """
+    # Retrieve con confidence baja (vault really failed: < 0.10).
+    def _low_conf_retrieve(*a, **kw):
+        r = _canned_retrieve_result(a[1] if len(a) >= 2 else "x")
+        r["confidence"] = 0.05  # debajo del threshold
+        r["scores"] = [0.05, 0.04]
+        return r
+    monkeypatch.setattr(server_mod, "multi_retrieve", _low_conf_retrieve)
+
+    mock = _OllamaMock([
+        _mk_msg(tool_calls=[]),   # tool-deciding call (no tool picked)
+        _mk_stream(["fallback response"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    # Query intencionalmente sin keywords del pre-router — "correspondencia"
+    # no está en los regex de `_TOOL_INTENT_RULES`.
+    events, _ = _post_chat("qué correspondencia nueva tengo?")
+
+    # Evidencia: el mock recibió ≥2 calls (tool-deciding + streaming).
+    # Sin el fallback sería solo 1 (solo streaming).
+    assert len(mock.calls) >= 2, (
+        f"LLM tool-decide round NO corrió a pesar del fallback "
+        f"(pre-router miss + conf<0.10). Calls a ollama: {len(mock.calls)}"
+    )
+    # Confirmá que el tool-deciding call tiene `stream=False` y
+    # `tools=` (es el shape del decide round, no el final stream).
+    decide_call = mock.calls[0]
+    assert decide_call.get("stream") is False
+    assert decide_call.get("tools"), "tool-deciding call sin tools= kwarg"
+
+    # Log explícito del fallback gate — lo emitimos para debug + tunear.
+    stdout = capsys.readouterr().out
+    assert "[chat-llm-fallback]" in stdout, (
+        f"falta log [chat-llm-fallback] cuando el gate se activa: "
+        f"stdout tail={stdout[-500:]!r}"
+    )
+
+
+@pytest.mark.requires_ollama
+def test_llm_tool_decide_skipped_when_pre_router_matches(
+    chat_env_prod, monkeypatch,
+):
+    """No-regresión: si el pre-router SI matcheó (p.ej. gmail_recent
+    para "últimos mails"), el LLM tool-decide sigue skipped — no
+    necesitamos pagar la latencia porque el regex ya dio data. Path
+    rápido original preservado.
+    """
+    # Stub gmail_recent para evitar llamadas a la API real.
+    monkeypatch.setattr(
+        tools_mod, "_fetch_gmail_evidence",
+        lambda now: {"unread_count": 2, "awaiting_reply": [], "starred": [],
+                     "recent": [{"subject": "x", "from": "a@b.com",
+                                 "snippet": "", "thread_id": "t1",
+                                 "internal_date_ms": 1_700_000_000_000}]},
+    )
+    # Retrieve irrelevante — cualquier valor vale porque el pre-router
+    # matchea primero. Conf alta o baja no cambia el gate cuando hay
+    # forced tools.
+    monkeypatch.setattr(
+        server_mod, "multi_retrieve",
+        lambda *a, **kw: _canned_retrieve_result(a[1] if len(a) >= 2 else "x"),
+    )
+
+    mock = _OllamaMock([
+        _mk_stream(["respuesta basada en gmail_recent"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    events, _ = _post_chat("mis últimos mails")
+
+    # Con pre-router match + sin env var ni propose intent, el LLM
+    # tool-decide NO corre → solo hay 1 call a ollama (el streaming).
+    assert len(mock.calls) == 1, (
+        f"LLM tool-decide round corrió cuando no debía (pre-router "
+        f"matcheó → path rápido esperado). Calls: {len(mock.calls)}"
+    )
+    # Y esa call es el streaming, no el tool-decide.
+    assert mock.calls[0].get("stream") is True
+
+
+@pytest.mark.requires_ollama
+def test_llm_tool_decide_skipped_when_vault_strong(
+    chat_env_prod, monkeypatch,
+):
+    """No-regresión: si el vault devolvió confidence alta (≥ 0.10), el
+    LLM tool-decide sigue skipped aunque el pre-router no matcheó — el
+    vault respondió bien, no necesitamos un fallback.
+    """
+    def _strong_retrieve(*a, **kw):
+        r = _canned_retrieve_result(a[1] if len(a) >= 2 else "x")
+        r["confidence"] = 0.85
+        return r
+    monkeypatch.setattr(server_mod, "multi_retrieve", _strong_retrieve)
+
+    mock = _OllamaMock([
+        _mk_stream(["respuesta del vault"]),
+    ])
+    monkeypatch.setattr(server_mod.ollama, "chat", mock)
+    monkeypatch.setattr(server_mod._OLLAMA_STREAM_CLIENT, "chat", mock)
+
+    # Query que no matchea pre-router pero el vault tiene info buena.
+    events, _ = _post_chat("hablame sobre Grecia")
+
+    # Sin pre-router + vault strong + sin env + sin propose → skip LLM
+    # tool-decide. Solo 1 call: el streaming final.
+    assert len(mock.calls) == 1, (
+        f"LLM tool-decide corrió cuando vault strong (conf=0.85): "
+        f"{len(mock.calls)} calls"
+    )
+    assert mock.calls[0].get("stream") is True
 
 
 # ── 11. Metachat SSE: `metachat: true` flag in sources + done ─────────────

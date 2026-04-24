@@ -53,7 +53,7 @@
   <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
         media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
 
-  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-sidebar">
+  <link rel="stylesheet" href="/static/style.css?v=2026-04-24-composer">
   <script src="/static/pwa/register-sw.js" defer></script>
 </head>
 <body>
@@ -256,33 +256,49 @@
       <div id="composer-inner">
         <div id="slash-popover" class="slash-popover" hidden role="listbox" aria-label="Comandos"></div>
         <div id="history-popover" class="slash-popover history-popover" hidden role="listbox" aria-label="Historial"></div>
+        <!-- Composer card — layout claude.ai post-primer-mensaje:
+             fila 1 textarea, fila 2 botones alineados a la derecha.
+             Estructura nueva 2026-04-24; mantenemos los IDs
+             (#input-prompt, #input, #send-btn, #stop-btn) intactos
+             para que app.js los siga enganchando por getElementById. -->
         <div id="input-wrap">
-          <span id="input-prompt">tu ›</span>
-          <textarea
-            id="input"
-            rows="1"
-            placeholder="preguntale al vault — / para comandos, ⌘/ para ayuda"
-            aria-label="Pregunta"
-            autofocus
-          ></textarea>
-          <!-- Send + Stop como 2 botones en el mismo slot — toggle via JS.
-               En desktop ambos ocultos por default (el user tiene Enter);
-               en mobile el send aparece siempre (anti-#1 del audit — sin
-               él no hay cómo enviar) y cuando `pending=true` el send se
-               esconde y aparece el stop. Los 2 comparten tamaño 44×44
-               para cumplir el mínimo touch target HIG iOS. -->
-          <button id="send-btn" type="submit" class="send-btn" aria-label="Enviar"
-            disabled>
-            <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"
-                 fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 2L11 13"/>
-              <path d="M22 2l-7 20-4-9-9-4 20-7z"/>
-            </svg>
-          </button>
-          <button id="stop-btn" type="button" class="stop-btn" hidden aria-label="Detener (Esc)">
-            <span aria-hidden="true">■</span>
-          </button>
+          <div class="composer-row">
+            <span id="input-prompt" aria-hidden="true">tu ›</span>
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="preguntale al vault — / para comandos, ⌘/ para ayuda"
+              aria-label="Pregunta"
+              autofocus
+            ></textarea>
+          </div>
+          <div class="composer-actions">
+            <!-- Hint sutil: atajo de teclado. Se esconde en mobile
+                 (el user no tiene teclado físico por default). -->
+            <span class="composer-hint" aria-hidden="true">
+              <kbd>Enter</kbd> enviar · <kbd>⇧</kbd> <kbd>Enter</kbd> salto
+            </span>
+            <!-- Send + Stop comparten el slot derecho — mutuamente
+                 exclusivos via el hidden attribute toggled por JS.
+                 Ambos circulares (claude.ai style), 34×34 en desktop,
+                 44×44 en mobile para cumplir touch-target HIG. -->
+            <button id="stop-btn" type="button" class="stop-btn" hidden
+                    aria-label="Detener (Esc)" title="Detener (Esc)">
+              <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"
+                   fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="1"/>
+              </svg>
+            </button>
+            <button id="send-btn" type="submit" class="send-btn"
+                    aria-label="Enviar" title="Enviar (Enter)" disabled>
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"
+                   fill="none" stroke="currentColor" stroke-width="2.2"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V5"/>
+                <path d="M5 12l7-7 7 7"/>
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
     </form>
@@ -333,6 +349,6 @@
        | openssl dgst -sha384 -binary | openssl base64 -A` -->
   <script src="/static/vendor/marked.min.js"
           integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"></script>
-  <script src="/static/app.js?v=2026-04-24-sidebar"></script>
+  <script src="/static/app.js?v=2026-04-24-composer"></script>
 </body>
 </html>

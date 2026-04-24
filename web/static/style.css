@@ -1031,16 +1031,24 @@ body {
 }
 
 /* Composer ----------------------------------------------------- */
+/* Claude.ai post-primer-mensaje: card flotante al bottom, ancho
+   acotado a 760px, centrado en la columna del chat (respeta el ancho
+   de la sidebar en desktop). El background hace un gradient-to-bg
+   para que los mensajes que scrollean detrás se fundan en vez de
+   cortarse abruptamente. */
 #composer {
   position: fixed;
   bottom: 0;
   left: 0;
   right: 0;
-  padding: 16px 24px 20px 24px;
+  padding: 20px 24px 24px 24px;
   background: linear-gradient(180deg, transparent 0%, var(--bg) 35%);
   display: flex;
   justify-content: center;
   pointer-events: none;
+  /* Transición del padding-left: al colapsar/expandir la sidebar, el
+     composer sigue centrado en la columna del chat (no salta). */
+  transition: padding-left var(--dur-base) var(--ease-out);
 }
 
 #composer > * {
@@ -1050,9 +1058,23 @@ body {
 #composer-inner {
   position: relative;
   width: 100%;
-  max-width: 812px;
+  max-width: 760px;   /* claude.ai usa ~768px — 760 da aire parejo */
   display: flex;
   flex-direction: column;
+}
+
+/* Desktop: offset por el ancho de la sidebar (expanded o collapsed)
+   para que el composer quede centrado en la chat column, no en el
+   viewport. Sin esto, la sidebar "empuja" visualmente al composer
+   hacia la derecha. Los valores matchean exactamente los paddings
+   del #chat (var(--sidebar-w) + 24px). */
+@media (min-width: 768px) {
+  #composer {
+    padding-left: calc(var(--sidebar-w) + 24px);
+  }
+  #sidebar[data-state="collapsed"] ~ #chat #composer {
+    padding-left: calc(var(--sidebar-w-mini) + 24px);
+  }
 }
 
 /* Slash-command popover — floats above the input like Claude Code's
@@ -1170,28 +1192,75 @@ body {
   font-weight: 500;
 }
 
+/* ── Composer card (claude.ai post-first-message layout) ─────────────
+   Estructura en flex-column:
+     .composer-row     → textarea + prompt prefix "tu ›"
+     .composer-actions → hint + [stop|send] botones a la derecha
+   Radius grande (24px), bg más claro que el viewport para separación
+   visual, shadow sutil para elevación. Focus: ring cyan opaco en
+   lugar de border color flash (match del look claude.ai). */
 #input-wrap {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   width: 100%;
-  max-width: 812px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  padding: 10px 14px;
-  gap: 8px;
-  transition: border-color 0.15s;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 12px 16px 10px 16px;
+  gap: 6px;
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
 }
 
 #input-wrap:focus-within {
-  border-color: var(--accent-dim);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md), var(--focus-ring);
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;   /* botones a la derecha siempre */
+  gap: 6px;
+  min-height: 34px;
+}
+
+.composer-hint {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+.composer-hint kbd {
+  font-family: inherit;
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+  vertical-align: baseline;
+  /* Caps el tamaño para que no engorde el row en Safari. */
+  line-height: 1.4;
 }
 
 #input-prompt {
   color: var(--green);
   font-weight: 700;
   user-select: none;
-  padding-top: 1px;
+  padding-top: 3px;
+  font-size: 13px;
 }
 
 #input {
@@ -1199,13 +1268,14 @@ body {
   background: transparent;
   color: var(--text);
   border: none;
-  padding: 0;
+  padding: 2px 0;
   font-family: inherit;
   font-size: 14px;
   line-height: 1.55;
   resize: none;
   outline: none;
-  max-height: 200px;
+  max-height: 260px;   /* ~12 rows antes de scroll interno */
+  min-height: 24px;
 }
 
 #input::placeholder {
@@ -1256,72 +1326,76 @@ body {
   margin-left: 12px;
 }
 
-/* Stop button inside the composer. Only visible while pending.
-   En desktop 26×26 (estilo terminal minimalist). En mobile se agranda a
-   44×44 por HIG iOS — el .stop-btn-active override más abajo lo hace. */
-.stop-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 10px;
-  line-height: 1;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border-radius: 6px;
-  cursor: pointer;
-  align-self: center;
-  flex-shrink: 0;
+/* ── Composer buttons (send + stop, claude.ai style) ─────────────────
+   Botones circulares 34×34 en la bottom-row del #input-wrap. El send
+   es el hero button (solid accent cuando hay texto, grey disabled).
+   El stop lo reemplaza durante el stream (mismo slot, visibility
+   toggled por JS via hidden attribute). Ambos cumplen 44×44 en mobile
+   via el breakpoint correspondiente. */
+.stop-btn,
+.send-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.stop-btn:hover { color: var(--red); border-color: var(--red); }
-/* Un CSS rule con `display` explícita pisa la semántica del HTML
-   `hidden` attribute (que es equivalente a `display:none`). Declaramos
-   el override explícito — sin esto, toglear `.hidden = true` desde JS
-   no oculta el botón si el CSS lo puso como `inline-flex`. */
-.stop-btn[hidden], .send-btn[hidden] { display: none !important; }
-
-/* Send button — mobile-only en default (desktop sigue con Enter). Mismo
-   slot del flex que el stop-btn; cuando `pending=true` el JS toglea
-   el hidden attribute de ambos. Touch-target 44×44 spec HIG. */
-.send-btn {
-  display: none;  /* desktop: escondido, el user tiene Enter */
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  font-family: inherit;
+  width: 34px;
+  height: 34px;
   padding: 0;
-  border-radius: 10px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  font-family: inherit;
   cursor: pointer;
-  align-self: center;
   flex-shrink: 0;
-  width: 44px;
-  height: 44px;
-  align-items: center;
-  justify-content: center;
   transition:
     color var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out),
     background-color var(--dur-fast) var(--ease-out),
     transform var(--dur-fast) var(--ease-out);
 }
-.send-btn:not([disabled]) { color: var(--accent); border-color: var(--accent); }
+
+/* Send: disabled = grey transparent, enabled = filled accent.
+   El contraste fuerte entre estados matchea claude.ai donde el
+   botón "salta" visualmente cuando hay contenido listo para mandar. */
+.send-btn {
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+.send-btn:not([disabled]) {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
 .send-btn:not([disabled]):hover {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 85%, white 15%);
+  border-color: color-mix(in srgb, var(--accent) 85%, white 15%);
 }
 .send-btn:not([disabled]):active {
-  /* :active feedback — iOS no expone haptic API para web, pero un
-     scale(.96) en el active cubre la pérdida perceptual. */
-  transform: scale(0.96);
+  transform: scale(0.94);
 }
 .send-btn[disabled] {
-  opacity: 0.35;
   cursor: not-allowed;
+  opacity: 0.55;
 }
+
+/* Stop: red-accented para que sea obvio que es una acción de corte.
+   Solid red cuando está visible — no hay estado "desactivado" porque
+   sólo aparece mientras pending=true. */
+.stop-btn {
+  background: var(--bg-elev);
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+}
+.stop-btn:hover {
+  background: color-mix(in srgb, var(--red) 18%, var(--bg-elev));
+  border-color: var(--red);
+}
+.stop-btn:active { transform: scale(0.94); }
+
+/* `hidden` attribute debe ganarle al `display: inline-flex` del
+   default — sin !important, toglear `.hidden = true` desde JS no
+   oculta el botón porque el CSS es más específico. */
+.stop-btn[hidden],
+.send-btn[hidden] { display: none !important; }
 
 /* Confidence pill in the sources header ------------------------- */
 .sources-rule {
@@ -2153,45 +2227,22 @@ strong, b, th {
     padding-bottom: 120px;
   }
 
-  /* ── Mobile Tier 1 controls ──────────────────────────────────────
-     Send button: visible siempre en mobile (resuelve el "no hay cómo
-     enviar" del audit). Stop button: agrandado a 44×44 para cumplir
-     el touch-target mínimo HIG iOS (default 26×26 era untappable).
-     Help button: mismo bump. Ambos conservan el estilo visual del
-     desktop, sólo cambia el sizing. */
-  .send-btn {
-    display: inline-flex;
-  }
+  /* ── Mobile composer tweaks ──────────────────────────────────────
+     Botones a 40×40 (mínimo HIG iOS razonable para un circle dentro
+     de un card card). La kbd-hint se esconde — en iPhone no hay
+     teclado físico, mostrar "Enter · Shift+Enter" sólo ocupa espacio. */
+  .send-btn,
   .stop-btn {
-    width: 44px;
-    height: 44px;
-    border-radius: 10px;
-    font-size: 14px;
+    width: 40px;
+    height: 40px;
+  }
+  .composer-hint {
+    display: none;
   }
   #help-btn {
     min-width: 44px;
     min-height: 44px;
     padding: 0 10px;
-  }
-  /* Overflow menu button (⋯) — mobile-only. Mismo sizing que help
-     para que quede un row de 2 botones iguales a la derecha del
-     topbar. `.topbar-btn-mobile` class se esconde en desktop. */
-  #menu-btn {
-    display: inline-flex;
-    min-width: 44px;
-    min-height: 44px;
-    padding: 0 10px;
-    font-size: 18px;
-    line-height: 1;
-  }
-  #menu-btn:active {
-    transform: scale(0.96);
-  }
-  /* Input-wrap gap: sumar un poquito para que los 2-3 botones no se
-     encimen. El gap del desktop era 8px; con 3 controles en mobile
-     (input + send + stop) o 2 (input + send|stop) queda apretado. */
-  #input-wrap {
-    gap: 6px;
   }
   /* Input crece hasta max 30vh — evita que textos largos empujen el
      chat fuera de la pantalla cuando el keyboard está abierto. */

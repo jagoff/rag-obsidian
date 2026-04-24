@@ -398,6 +398,134 @@ def test_resolve_person_aliases_cached(monkeypatch):
     assert call_counter["n"] == first_count, "cache should have prevented the 2nd WA lookup"
 
 
+def test_drive_search_emits_sources_sse_with_drive_link(monkeypatch):
+    """End-to-end: cuando el pre-router dispara drive_search y el tool
+    encuentra archivos con link, el servidor emite un segundo evento SSE
+    `sources` con los links de Drive *prepended* al listado de fuentes.
+
+    El user pidió que "lo primero que se vea en fuentes sea el link al
+    doc de Drive". Este test lo assertea contra el stream SSE real,
+    parseando los eventos y verificando:
+
+      1. Hay ≥ 2 eventos `sources` (uno del retrieve inicial, otro
+         después del tool loop con el drive link).
+      2. El último evento `sources` tiene el URL del Drive como
+         primer item (`items[0].file` es el Drive link), con
+         `folder="Google Drive"`.
+      3. Los items posteriores siguen siendo las fuentes del vault
+         (no se pierden).
+    """
+    import re
+    from fastapi.testclient import TestClient
+    from web.server import app
+    from web import server as server_mod
+
+    # Reset rate-limit bucket + mock el retrieve y las dependencias que
+    # el endpoint carga eager.
+    server_mod._CHAT_BUCKETS.clear()
+    monkeypatch.setattr(server_mod, "_ollama_alive", lambda timeout=2.0: True)
+    monkeypatch.setattr(server_mod, "_ollama_chat_probe", lambda timeout_s=6.0: True)
+    monkeypatch.setattr(server_mod, "_fetch_whatsapp_unread", lambda *a, **kw: [])
+    monkeypatch.setattr(server_mod, "_persist_conversation_turn", lambda *a, **kw: None)
+    monkeypatch.setattr(server_mod, "save_session", lambda sess: None)
+    monkeypatch.setattr(server_mod, "log_query_event", lambda ev: None)
+    monkeypatch.setattr(server_mod, "_chat_cache_get", lambda key: None)
+    monkeypatch.setattr(server_mod, "_chat_cache_put", lambda key, val: None)
+    monkeypatch.setattr(server_mod, "_is_tasks_query", lambda q: False)
+
+    import rag as _rag_mod
+    monkeypatch.setattr(_rag_mod, "build_person_context", lambda q: None)
+    monkeypatch.setattr(
+        server_mod, "multi_retrieve",
+        lambda *a, **kw: {
+            "docs": ["vault content"],
+            "metas": [{"file": "03-Resources/test.md", "note": "test", "folder": "03-Resources"}],
+            "scores": [0.8],
+            "confidence": 0.5,
+            "search_query": a[1] if len(a) >= 2 else "x",
+            "filters_applied": {},
+            "query_variants": [],
+            "vault_scope": ["default"],
+        },
+    )
+
+    # Mock drive_search to return a known Drive file.
+    _drive_result = {
+        "tokens": ["alexis"],
+        "query_used": "alexis",
+        "files": [{
+            "name": "Alex - Cuotas Macbook",
+            "mime_label": "Sheet",
+            "modified": "2026-04-17T16:46:42.000Z",
+            "link": "https://docs.google.com/spreadsheets/d/ABC/edit",
+            "modifier": "Fer F.",
+            "body": "Cuota 01,200000\nFaltan,730000",
+        }],
+    }
+    monkeypatch.setitem(
+        server_mod.TOOL_FNS, "drive_search",
+        lambda query, max_files=5: json.dumps(_drive_result),
+    )
+
+    # Mock ollama.chat: first call is the tool-deciding round (we bypass
+    # it with an empty tool_calls response so the loop exits), then the
+    # streaming call emits a simple one-token answer.
+    from types import SimpleNamespace
+    class _Mock:
+        def __init__(self):
+            self.call_idx = 0
+        def __call__(self, *a, **kw):
+            if kw.get("stream"):
+                return iter([SimpleNamespace(
+                    message=SimpleNamespace(content="ok"),
+                )])
+            return SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=None),
+            )
+    import ollama
+    monkeypatch.setattr(ollama, "chat", _Mock())
+
+    # Fire the query — pre-router should fire drive_search.
+    client = TestClient(app)
+    resp = client.post(
+        "/api/chat",
+        json={
+            "question": "busca en mi drive lo de Alexis",
+            "vault_scope": None,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Parse SSE events.
+    _EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
+    events = []
+    for m in _EVENT_RE.finditer(resp.text):
+        try:
+            payload = json.loads(m.group("data"))
+        except Exception:
+            payload = {}
+        events.append((m.group("event"), payload))
+
+    sources_events = [p for ev, p in events if ev == "sources"]
+    assert len(sources_events) >= 2, (
+        f"Esperaba ≥2 eventos 'sources' (retrieve inicial + drive post-tool), "
+        f"vi {len(sources_events)}. Todos los eventos: {[ev for ev, _ in events]}"
+    )
+    # Último evento sources debe tener el Drive link como PRIMER item.
+    last_items = sources_events[-1].get("items", [])
+    assert last_items, "último evento 'sources' vino vacío"
+    first = last_items[0]
+    assert first["file"] == "https://docs.google.com/spreadsheets/d/ABC/edit"
+    assert first["note"] == "Alex - Cuotas Macbook"
+    assert first["folder"] == "Google Drive"
+    assert first["score"] == 5.0
+    # Tampoco se perdieron las fuentes del vault originales.
+    vault_items = [it for it in last_items if it.get("folder") != "Google Drive"]
+    assert any(it.get("file") == "03-Resources/test.md" for it in vault_items), (
+        f"vault source se perdió en el re-emit: items={last_items}"
+    )
+
+
 def test_clean_alias_strips_emojis_and_punct():
     # Literal emoji + punct suelto.
     assert rag._clean_alias("Maria 🍷") == "maria"

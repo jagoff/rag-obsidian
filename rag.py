@@ -20360,7 +20360,15 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         ("Calendar",   _sync_apple_calendar_notes,   "events"),
         ("Chrome",     _sync_chrome_history,         "urls"),
         ("Gmail",      _sync_gmail_notes,            "gmail"),
-        ("Drive",      _sync_gdrive_notes,           "drive"),
+        # Drive: quitado del pipeline 2026-04-24 (user report Fer F.).
+        # `_sync_gdrive_notes` snapshoteaba los 4 docs más recientes
+        # en 48h como archivos en el vault (`03-Resources/GoogleDrive/
+        # YYYY-MM-DD.md`). Resultaba duplicativo y user-hostile — el
+        # user no quiere que Obsidian se infle con copias de docs que
+        # ya viven en Drive. El tool `drive_search` (chat) hace la
+        # búsqueda on-demand con links directos al Drive, sin tocar
+        # el vault. La función queda definida en rag.py por si alguien
+        # la quiere reactivar manualmente; el hook se eliminó acá.
         ("GitHub",     _sync_github_activity,        "github"),
         ("Claude",     _sync_claude_code_transcripts,"claude"),
         ("YT trans.",  _sync_youtube_transcripts,    "yt-trans"),

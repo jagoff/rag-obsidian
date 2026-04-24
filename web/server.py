@@ -6436,6 +6436,53 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 tool_rounds += 1
                 tool_ms_total += _pre_serial_sum_ms + _pre_parallel_max_ms
 
+                # Drive sources (2026-04-24, user report Fer F. iter 3):
+                # Cuando drive_search disparó y encontró archivos, re-emitimos
+                # el `sources` SSE event con los links de Drive prepended al
+                # listado original. El user pidió explícitamente que "lo
+                # primero que se vea en fuentes sea el link al doc de
+                # Drive". El frontend hace `sources = parsed.items` en cada
+                # evento, así que esta segunda emisión REEMPLAZA la lista
+                # en UI sin requerir lógica extra del cliente (el render
+                # detecta URLs por regex y genera anchors externos).
+                _drive_source_items: list[dict] = []
+                for _n, _res, _ in _forced_results:
+                    if _n != "drive_search":
+                        continue
+                    try:
+                        _drive_payload = json.loads(_res)
+                    except Exception:
+                        continue
+                    if not isinstance(_drive_payload, dict):
+                        continue
+                    for _f in (_drive_payload.get("files") or [])[:5]:
+                        if not isinstance(_f, dict):
+                            continue
+                        _link = str(_f.get("link") or "").strip()
+                        _name = str(_f.get("name") or "").strip()
+                        if not _link or not _link.startswith(("http://", "https://")):
+                            continue
+                        _drive_source_items.append({
+                            "file": _link,
+                            "note": _name or "(sin nombre)",
+                            "folder": "Google Drive",
+                            "score": 5.0,
+                            "bar": "■■■■■",
+                        })
+                if _drive_source_items:
+                    yield _sse("sources", {
+                        "items": (
+                            _drive_source_items
+                            + _mention_sources
+                            + [
+                                {**_source_payload(_m, _s), "bar": _score_bar(float(_s))}
+                                for _m, _s in zip(result["metas"], result["scores"])
+                            ]
+                        ),
+                        "confidence": round(_sanitize_confidence(result["confidence"]), 3),
+                        "propose_intent": False,
+                    })
+
                 # Fast-path downgrade cuando el pre-router fired tools.
                 # Racional (2026-04-24, medido en prod el 2026-04-23):
                 # `_fast_path` fue calibrado por `retrieve()` para queries

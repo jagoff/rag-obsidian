@@ -1583,13 +1583,31 @@ function appendSources(parent, items, confidence) {
     const bar = el("span", `bar bar-${tone}`);
     bar.textContent = s.bar;
     row.appendChild(bar);
+    // External URL (Drive, web docs, etc.) vs vault-local path:
+    // Drive sources come in with `s.file = "https://docs.google.com/..."`
+    // and `s.folder = "Google Drive"` — render as a direct anchor with
+    // `target="_blank"` so clicking abre el doc en Drive, no en Obsidian.
+    // Vault-local files keep obsidian:// so doble-click abre la nota.
+    const isExternal = typeof s.file === "string" && /^https?:\/\//i.test(s.file);
     const note = el("a", "note", s.note || s.file);
-    note.href = obsidianUrl(s.file);
+    note.href = isExternal ? s.file : obsidianUrl(s.file);
     note.title = s.file;
+    if (isExternal) {
+      note.target = "_blank";
+      note.rel = "noopener noreferrer";
+    }
     row.appendChild(note);
-    const path = el("a", "path", s.file);
-    path.href = obsidianUrl(s.file);
+    // For externals, mostrar el folder label ("Google Drive") en lugar
+    // del URL completo — más legible que la URL crudota. Para vault
+    // files se mantiene el path original (comportamiento previo).
+    const pathLabel = isExternal ? (s.folder || "externo") : s.file;
+    const path = el("a", "path", pathLabel);
+    path.href = isExternal ? s.file : obsidianUrl(s.file);
     path.title = s.file;
+    if (isExternal) {
+      path.target = "_blank";
+      path.rel = "noopener noreferrer";
+    }
     row.appendChild(path);
     // Dwell tracking metadata — vault-relative paths only (the server
     // rejects ones with :// since commit db2a169). Cross-source ids
@@ -1631,7 +1649,16 @@ function buildMarkdownExport(question, answer, sources) {
       seen.add(s.file);
       const note = s.note || s.file.replace(/\.md$/, "").split("/").pop();
       const score = Number.isFinite(s.score) ? ` · ${(s.score >= 0 ? "+" : "") + s.score.toFixed(1)}` : "";
-      lines.push(`- [[${note}]] — \`${s.file}\`${score}`);
+      // Externals (Drive, web) get a markdown link instead of an
+      // Obsidian wikilink — un `[[Wikilink]]` a un URL externo se
+      // rompe cuando pasa por Obsidian o por un pipeline markdown.
+      const isExternalSrc = /^https?:\/\//i.test(s.file);
+      if (isExternalSrc) {
+        const label = note || s.folder || "link";
+        lines.push(`- [${label}](${s.file})${score}`);
+      } else {
+        lines.push(`- [[${note}]] — \`${s.file}\`${score}`);
+      }
     }
     parts.push(lines.join("\n"));
   }

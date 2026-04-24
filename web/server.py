@@ -169,6 +169,29 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     # (Slack, Messages) no están integradas al RAG todavía — en la
     # práctica "chat" == WhatsApp en este setup.
     ("whatsapp_pending", {}, r"whats.?app|\bwzp\b|\bwsp\b|\bchats?\b|mensajes?\s+sin|pendient|" + _PLANNING_PAT),
+    # `whatsapp_search` — buscar DENTRO del contenido de los mensajes
+    # (corpus indexado, ~4500 chunks), distinto de `whatsapp_pending`
+    # (que sólo lista chats sin respuesta). Triggers son frases de
+    # "comunicación pasada" que no tocan los keywords de pending:
+    #   - "qué me/te/le dijo Juan" / "qué me dijeron"
+    #   - "qué me mandó/escribió María" / "qué me comentó"
+    #   - "cuándo quedamos / hablamos / charlamos / acordamos"
+    #   - "el chat donde X mencionó Y" / "dónde mencionó / habló de"
+    # Importante: NO solapamos con `whatsapp_pending` porque ahí los
+    # keywords son `whatsapp/wzp/wsp/chats?/mensajes sin/pendient`. Las
+    # frases de acá hablan de pasado (dijo/mandó/quedamos), no de
+    # estado (pendiente/sin responder). La cobertura adicional la pone
+    # el LLM via el addendum cuando el pre-router no engancha. Pasamos
+    # la query cruda al tool — el helper resuelve `contact` desde el
+    # texto natural a futuro; por ahora deja `contact=None` y el
+    # retrieve unfiltered ya devuelve los matches relevantes.
+    ("whatsapp_search", {}, (
+        r"qu[eé]\s+(me|te|le|nos)?\s*"
+        r"(dij[oe]|dij[oe]ron|mand[oó]|mandaron|escribi[oó]|escribieron|coment[oó]|comentaron|cont[oó]|contaron)"
+        r"|cu[aá]ndo\s+(quedam|hablam|charlam|acordam)"
+        r"|d[oó]nde\s+(hablam|charlam|menci[oó]n|qued[oó])"
+        r"|el\s+chat\s+(donde|en\s+el\s+que)"
+    )),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
@@ -180,9 +203,9 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     to execute BEFORE the LLM tool-deciding call. Empty list = no forced
     tools (LLM decides freely).
 
-    `drive_search` receives the raw query as its `query` arg — the tool
-    helper filters stopwords internally. All other tools have static
-    args from their rule entry.
+    `drive_search` y `whatsapp_search` reciben la query cruda como
+    `query` arg — los tool helpers tokenizan / fan-out internamente.
+    All other tools have static args from their rule entry.
     """
     if not q:
         return []
@@ -191,6 +214,8 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
         if not rx.search(q):
             continue
         if name == "drive_search":
+            out.append((name, {"query": q}))
+        elif name == "whatsapp_search":
             out.append((name, {"query": q}))
         else:
             out.append((name, dict(args)))
@@ -278,6 +303,20 @@ _SOURCE_INTENT_META: dict[str, dict[str, str]] = {
         ),
         "item_shape": "- <contacto> (hace <Xh/d>): <último mensaje>",
         "empty_phrase": "No hay chats de WhatsApp esperando tu respuesta",
+    },
+    "whatsapp_search": {
+        "label": "tus mensajes de WhatsApp (búsqueda por contenido)",
+        "live_section": "### WhatsApp",
+        "digest_hint": (
+            "La sección live trae los mensajes WhatsApp matcheantes a la "
+            "query, ordenados por relevancia. Cada bullet tiene "
+            "`[<contacto> · <fecha>] <snippet>`; si arranca con `yo →` el "
+            "mensaje lo mandó el user, no el contacto. NUNCA inventes "
+            "conversaciones — citá TEXTUAL de los snippets que aparecen, "
+            "y si la sección live está vacía decilo explícitamente."
+        ),
+        "item_shape": "- <contacto> (<fecha>): <cita textual del snippet>",
+        "empty_phrase": "No encontré mensajes de WhatsApp que matcheen tu búsqueda",
     },
 }
 
@@ -434,6 +473,13 @@ def _is_empty_tool_output(name: str, raw: str) -> bool:
     if name == "whatsapp_pending":
         # Shape: list of chat dicts. Empty list = no chats waiting for reply.
         return isinstance(data, list) and not data
+    if name == "whatsapp_search":
+        # Shape: dict con `messages` list. Empty list = no matches encontrados
+        # en el corpus WA. Igual que drive_search: errores también cuentan
+        # como "empty" para que el fallback CONTEXTO-preserve kick-in.
+        if not isinstance(data, dict):
+            return False
+        return not (data.get("messages") or [])
     return False
 
 
@@ -488,6 +534,8 @@ def _format_forced_tool_output(name: str, raw: str) -> str:
         return _format_drive_block(raw)
     if name == "whatsapp_pending":
         return _format_whatsapp_block(raw)
+    if name == "whatsapp_search":
+        return _format_whatsapp_search_block(raw)
     # Unknown tool → keep raw JSON available but wrap in a labeled
     # section so it doesn't merge visually with the next block.
     return f"### Datos ({name})\n{raw}\n"
@@ -783,6 +831,85 @@ def _format_whatsapp_block(raw: str) -> str:
         if snippet:
             line += f": {snippet}"
         lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _format_whatsapp_search_block(raw: str) -> str:
+    """Render `whatsapp_search` output as a `### WhatsApp` section with
+    one bullet per matched message.
+
+    Shape esperado: ``{query, contact_filter, messages: [{jid, contact,
+    ts, who, text, score}], warning?, error?}`` (ver
+    `_agent_tool_whatsapp_search`).
+
+    Cada bullet sigue el shape ``- [<contacto> · <fecha>] <snippet>``;
+    si el chunk es outbound (sender == "yo") prefija ``yo →`` para que
+    el LLM diferencie quién dijo qué. Snippet se renderea capado
+    defensivamente a 300 chars (el tool ya lo capa a 400, pero el LLM
+    digestivo prefiere bullets más cortos cuando hay 5–8 hits).
+
+    Empty / errored results muestran un mensaje explícito en vez de
+    raw JSON — same pattern que `_format_drive_block` para que el LLM
+    no invente conversaciones cuando el corpus no devolvió match.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### WhatsApp\n{raw}\n"
+    if not isinstance(data, dict):
+        return f"### WhatsApp\n{raw}\n"
+
+    messages = data.get("messages") or []
+    contact_filter = data.get("contact_filter")
+    err = data.get("error") or ""
+    warning = data.get("warning") or ""
+
+    # Empty path — surface why so the LLM can tell the user.
+    if not messages:
+        reason_bits: list[str] = []
+        if err == "query vacía":
+            reason_bits.append("la pregunta vino vacía")
+        elif err.startswith("retrieve_failed"):
+            reason_bits.append("falló el retrieval")
+        elif err:
+            reason_bits.append(err)
+        else:
+            if contact_filter:
+                reason_bits.append(f"sin matches para {contact_filter!r}")
+            else:
+                reason_bits.append("sin matches en el corpus de WhatsApp")
+        if warning and warning not in reason_bits:
+            reason_bits.append(warning)
+        return f"### WhatsApp\n_Sin resultados ({'; '.join(reason_bits)})._\n"
+
+    valid = [m for m in messages if isinstance(m, dict) and str(m.get("text", "")).strip()]
+    header_bits: list[str] = [f"{len(valid)} mensaje{'s' if len(valid) != 1 else ''}"]
+    if contact_filter:
+        header_bits.append(f"contacto: {contact_filter}")
+    header = f"### WhatsApp ({', '.join(header_bits)})"
+
+    lines: list[str] = [header]
+    if warning:
+        lines.append(f"_Aviso: {warning}_")
+
+    SNIPPET_CAP = 300  # Defensive — tool capa a 400, pero bullets cortos = LLM más limpio.
+    for m in valid:
+        contact = str(m.get("contact", "")).strip() or "(sin contacto)"
+        ts = str(m.get("ts", "")).strip()
+        who = str(m.get("who", "")).strip().lower()
+        text = str(m.get("text", "")).strip()
+        # Date-only — el LLM se confunde con timestamps largos en
+        # bullets; la hora exacta vive en el JSON crudo si lo necesita.
+        date_part = ts.split("T")[0] if ts else ""
+        prefix = f"[{contact}"
+        if date_part:
+            prefix += f" · {date_part}"
+        prefix += "]"
+        # Outbound = lo dijo el user; importante distinguirlo para que
+        # el LLM no diga "Juan te dijo X" cuando el "X" lo dijiste vos.
+        speaker_marker = "yo → " if who == "outbound" else ""
+        snippet = text[:SNIPPET_CAP].replace("\n", " ⏎ ")
+        lines.append(f"- {prefix} {speaker_marker}{snippet}")
     return "\n".join(lines) + "\n"
 
 
@@ -1882,9 +2009,9 @@ _OLLAMA_STREAM_TIMEOUT = 45.0
 _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 
 # Tool-decision call (non-streaming, ~once per turn, with `tools=` schema
-# of all 12 chat tools). Observed 2026-04-24 (Fer F. "LLM falló: timed
+# of all 13 chat tools). Observed 2026-04-24 (Fer F. "LLM falló: timed
 # out"): long queries (~50 palabras + 2KB de _WEB_TOOL_ADDENDUM + JSON
-# schemas de 12 tools) hacen que qwen2.5:7b en MPS tarde >45s en
+# schemas de 13 tools) hacen que qwen2.5:7b en MPS tarde >45s en
 # samplear la decisión — se disparaba el timeout del cliente streaming
 # compartido y el turno fallaba antes de llegar a generar output.
 # Cliente separado con budget más amplio: tool-decision es una call
@@ -5606,6 +5733,27 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             and not is_propose_intent
             and len(vaults) == 1
         )
+        # Audit 2026-04-24: distinguir "skipped por gate" de "lookup nunca
+        # corrió" en el telemetry. Pre-fix `_semantic_cache_probe` quedaba
+        # en None cuando `_semantic_eligible=False`, indistinguible del
+        # caso de error pre-lookup. Ahora poblamos un probe explícito con
+        # el primer gate que cortó — datos accionables para el próximo
+        # tuning de cache: si `flags_skip` domina con reason=`history`,
+        # tunear el cache key para incluir history hash sería más
+        # impactful que aflojar el gate.
+        if not _semantic_eligible:
+            _skip_reason = (
+                "history" if history else
+                "propose_intent" if is_propose_intent else
+                "multi_vault" if len(vaults) != 1 else
+                "unknown"
+            )
+            _semantic_cache_probe = {
+                "result": "skipped",
+                "reason": f"flags_skip:{_skip_reason}",
+                "top_cosine": None,
+                "candidates": 0,
+            }
         if _semantic_eligible:
             try:
                 from rag import (
@@ -7210,6 +7358,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # Requisito para diagnosticar los outliers de web que
             # mostraban `retrieve_ms` 4-6s warm sin desglose accesible.
             "timing": _round_timing_ms(result.get("timing")),
+            # Audit 2026-04-24: pre-fix `cache_probe` se loggeaba SOLO en
+            # el HIT path (line 5717+, cuando el lookup matcheaba). Para
+            # los 998 web queries del último período (mayoría misses) este
+            # campo nunca se persistía → `rag cache stats --days 7`
+            # mostraba 5 eligible (sólo de CLI) cuando en realidad había
+            # ~600 web queries pasando por el lookup. El bug ocultaba el
+            # telemetry crítico para diagnosticar por qué el cache tiene
+            # 0 hits efectivos. Post-fix loggeamos el probe SIEMPRE — el
+            # caller (line 5520) inicializa la var a None y la setea
+            # cuando el lookup corre, así que es safe en todos los paths.
+            "cache_probe": _semantic_cache_probe,
+            "cache_hit": False,
+            "cache_layer": None,
         })
 
         yield _sse("done", {

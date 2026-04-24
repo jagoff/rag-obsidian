@@ -312,6 +312,35 @@ def test_semantic_miss_runs_pipeline_and_stores(chat_env):
     assert all(p.endswith(".md") for p in call["paths"])
 
 
+def test_semantic_miss_logs_cache_probe_in_event(chat_env):
+    """Audit 2026-04-24 — pre-fix el `log_query_event` del miss path NO
+    incluía `cache_probe`. Sólo el HIT path lo loggeaba (línea 5717+).
+    Resultado: 998 web queries en 7 días sin probe data → telemetry
+    inservible para tunear el cache. Post-fix, AMBOS paths loggean
+    cache_probe.
+
+    Este test asegura que un miss pasa el probe al log_query_event."""
+    _post_chat("nueva pregunta sin cache")
+    events = chat_env.log_events
+    assert events, "log_query_event not called"
+    ev = events[-1]
+    # Contract: el miss event tiene cmd="web" + cache_probe poblado +
+    # cache_hit=False + cache_layer=None.
+    assert ev["cmd"] == "web", f"expected cmd=web, got {ev['cmd']}"
+    assert ev["cache_hit"] is False, (
+        f"miss event must have cache_hit=False, got {ev.get('cache_hit')}"
+    )
+    assert ev["cache_layer"] is None, (
+        f"miss event must have cache_layer=None, got {ev.get('cache_layer')!r}"
+    )
+    assert "cache_probe" in ev, (
+        "cache_probe missing from miss-path log event — regression del audit 2026-04-24"
+    )
+    # El probe puede ser un dict de result/reason (cuando lookup corrió)
+    # o None (cuando lookup nunca alcanzó por error pre-conn). Ambos
+    # válidos — solo asserteamos que el field está presente.
+
+
 # ── 3. Gates: history / propose / multi-vault ────────────────────────────
 
 

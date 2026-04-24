@@ -33,6 +33,19 @@ let vaultScope = localStorage.getItem(VAULT_KEY) || "";
 let ttsEnabled = localStorage.getItem(TTS_KEY) === "1";
 let pending = false;
 let currentController = null;      // AbortController for in-flight /api/chat
+// Side-effect fetches (related, followups, contacts popover, etc) que
+// arrancan tras el done event y no están atadas al ciclo principal de
+// /api/chat. Si el user navega a otra sesión / `/new` antes de que la
+// respuesta llegue, hay que abortarlos — sino el render se aplica al
+// turn equivocado o al DOM ya limpio. abortSideFetches() corre en
+// /new, loadSession(), y triggerNewChat. 2026-04-25 a11y audit lote 2.
+const inflightSideFetches = new Set();
+function abortSideFetches() {
+  for (const ac of inflightSideFetches) {
+    try { ac.abort(); } catch (_) {}
+  }
+  inflightSideFetches.clear();
+}
 let currentAudio = null;           // In-flight <audio> playback
 let lastUserQuestion = "";         // For ⌘↑ edit-last
 
@@ -72,6 +85,8 @@ function renderHistoryPopover() {
     // No active descendant when the popover is empty — clear the attr so
     // screen readers don't announce a stale id.
     historyPopover.removeAttribute("aria-activedescendant");
+    historyPopover.removeAttribute("aria-owns");
+    input.removeAttribute("aria-owns");
     return;
   }
   historyPopoverItems.forEach((q, i) => {
@@ -105,6 +120,15 @@ function renderHistoryPopover() {
   // option inside the listbox has focus, without the listbox itself losing
   // keyboard focus. Required for ↑/↓ navigation to be announced.
   historyPopover.setAttribute("aria-activedescendant", `history-option-${historyPopoverIdx}`);
+  // a11y: aria-owns sobre el input (= elemento focuseado) declara la
+  // relación con los items del popover en el AX tree, ya que el DOM
+  // no los contiene como descendientes. Sin esto VoiceOver / NVDA no
+  // saben que el aria-activedescendant referenciado existe en el
+  // árbol de contenido. Espejamos también en el popover (harmless
+  // redundancy: el listbox enumera sus opciones por aria-owns).
+  const ownIds = historyPopoverItems.map((_, i) => `history-option-${i}`).join(" ");
+  historyPopover.setAttribute("aria-owns", ownIds);
+  input.setAttribute("aria-owns", ownIds);
   const active = historyPopover.children[historyPopoverIdx];
   if (active) active.scrollIntoView({ block: "nearest" });
 }
@@ -122,6 +146,13 @@ function openHistoryPopover() {
 function hideHistoryPopover() {
   historyPopover.hidden = true;
   historyPopoverItems = [];
+  historyPopover.removeAttribute("aria-activedescendant");
+  historyPopover.removeAttribute("aria-owns");
+  // Limpiamos aria-owns del input solo si era de history. El input
+  // puede tener slash/contacts ownership al mismo tiempo no: los 3
+  // popovers son mutuamente exclusivos, así que clear sin chequeo es
+  // seguro.
+  input.removeAttribute("aria-owns");
 }
 function pickHistoryEntry(q) {
   input.value = q;
@@ -291,8 +322,58 @@ ttsToggle.addEventListener("click", () => {
 renderTtsToggle();
 
 // Help modal ------------------------------------------------------
-function openHelp() { helpModal.hidden = false; }
-function closeHelp() { helpModal.hidden = true; }
+// Focus trap WCAG 2.4.3 / 2.4.7: cuando el modal se abre, Tab cicla
+// dentro; Shift+Tab al primer elemento revuelve al último (y vice-
+// versa). Al cerrar, restaura el focus al elemento que abrió el modal
+// (defaulteable a `document.activeElement` previo). Esc cierra el
+// modal y está manejado en el `keydown` global más abajo.
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex=\"-1\"])",
+].join(", ");
+let helpLastFocus = null;
+function _helpTrap(e) {
+  if (e.key !== "Tab") return;
+  const f = [...helpModal.querySelectorAll(FOCUSABLE_SELECTOR)]
+    .filter((el) => !el.hasAttribute("hidden") && el.offsetParent !== null);
+  if (!f.length) return;
+  const first = f[0];
+  const last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+function openHelp() {
+  helpLastFocus = document.activeElement;
+  helpModal.hidden = false;
+  // Focus al primer elemento focusable del modal — típicamente el
+  // botón "×" del header. preventScroll evita que el page jump al
+  // entrar.
+  const first = helpModal.querySelector(FOCUSABLE_SELECTOR);
+  if (first) first.focus({ preventScroll: true });
+  helpModal.addEventListener("keydown", _helpTrap);
+}
+function closeHelp() {
+  helpModal.hidden = true;
+  helpModal.removeEventListener("keydown", _helpTrap);
+  // Restaurar focus al trigger que abrió el modal (helpBtn,
+  // composer-plus-btn, o ⌘/ shortcut → activeElement previo). Si el
+  // elemento se removió del DOM mientras el modal estaba abierto,
+  // fallback al body.
+  if (helpLastFocus && typeof helpLastFocus.focus === "function" &&
+      document.contains(helpLastFocus)) {
+    try { helpLastFocus.focus({ preventScroll: true }); } catch (_) {}
+  }
+  helpLastFocus = null;
+}
 helpBtn.addEventListener("click", openHelp);
 helpModal.addEventListener("click", (e) => {
   if (e.target instanceof Element && e.target.dataset.close !== undefined) closeHelp();
@@ -345,6 +426,8 @@ function renderSlashPopover(items) {
     const empty = el("div", "slash-popover-empty", "sin comandos — Enter envía al vault");
     slashPopover.appendChild(empty);
     slashPopover.removeAttribute("aria-activedescendant");
+    slashPopover.removeAttribute("aria-owns");
+    input.removeAttribute("aria-owns");
     return;
   }
   items.forEach((c, i) => {
@@ -376,6 +459,11 @@ function renderSlashPopover(items) {
     slashPopover.appendChild(row);
   });
   slashPopover.setAttribute("aria-activedescendant", `slash-option-${slashIndex}`);
+  // a11y: aria-owns sobre input + popover (ver comentario detallado en
+  // renderHistoryPopover). El input "posee" los items en el AX tree.
+  const ownIds = items.map((_, i) => `slash-option-${i}`).join(" ");
+  slashPopover.setAttribute("aria-owns", ownIds);
+  input.setAttribute("aria-owns", ownIds);
 }
 
 function updateSlashPopover() {
@@ -394,6 +482,9 @@ function hideSlashPopover() {
   slashPopover.hidden = true;
   slashVisibleItems = [];
   slashIndex = 0;
+  slashPopover.removeAttribute("aria-activedescendant");
+  slashPopover.removeAttribute("aria-owns");
+  input.removeAttribute("aria-owns");
 }
 
 function completeSlash(c) {
@@ -465,6 +556,8 @@ function renderContactsPopover(items) {
       "sin contactos — Enter manda al chat igual",
     ));
     contactsPopover.removeAttribute("aria-activedescendant");
+    contactsPopover.removeAttribute("aria-owns");
+    input.removeAttribute("aria-owns");
     return;
   }
   items.forEach((c, i) => {
@@ -493,6 +586,12 @@ function renderContactsPopover(items) {
     contactsPopover.appendChild(row);
   });
   contactsPopover.setAttribute("aria-activedescendant", `contacts-option-${contactsIndex}`);
+  // a11y: aria-owns sobre input + popover (ver comentario en
+  // renderHistoryPopover). Sin esto el aria-activedescendant queda
+  // huérfano para los screen readers que validan ownership.
+  const ownIds = items.map((_, i) => `contacts-option-${i}`).join(" ");
+  contactsPopover.setAttribute("aria-owns", ownIds);
+  input.setAttribute("aria-owns", ownIds);
 }
 
 function hideContactsPopover() {
@@ -500,6 +599,9 @@ function hideContactsPopover() {
   contactsItems = [];
   contactsIndex = 0;
   contactsLastQuery = null;
+  contactsPopover.removeAttribute("aria-activedescendant");
+  contactsPopover.removeAttribute("aria-owns");
+  input.removeAttribute("aria-owns");
   if (contactsFetchAbort) {
     try { contactsFetchAbort.abort(); } catch (_) {}
     contactsFetchAbort = null;
@@ -516,9 +618,14 @@ async function _doContactsFetch(spec) {
   // después de que el user ya tipeó más letras.
   if (contactsFetchAbort) {
     try { contactsFetchAbort.abort(); } catch (_) {}
+    inflightSideFetches.delete(contactsFetchAbort);
   }
   const ac = new AbortController();
   contactsFetchAbort = ac;
+  // También registramos en el set global de side-fetches para que
+  // /new / loadSession / triggerNewChat aborten el contact lookup
+  // cuando cambia el contexto de chat. Borrado en finally abajo.
+  inflightSideFetches.add(ac);
   try {
     const url = `/api/contacts?q=${encodeURIComponent(spec.query.trim())}` +
                 `&kind=${spec.kind}&limit=20`;
@@ -541,6 +648,8 @@ async function _doContactsFetch(spec) {
     // Silent-fail: el popover no debe gritar al usuario. Cerramos y
     // dejamos que tipee el nombre a mano.
     hideContactsPopover();
+  } finally {
+    inflightSideFetches.delete(ac);
   }
 }
 
@@ -1222,16 +1331,28 @@ function escapeHtml(s) {
 async function appendRelated(parent, query) {
   if (!query) return;
   let items = [];
+  // AbortController registrado en el set global para que loadSession /
+  // /new lo cancelen si el user navega antes de que el fetch resuelva.
+  const ac = new AbortController();
+  inflightSideFetches.add(ac);
   try {
     const res = await fetch("/api/related", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
+      signal: ac.signal,
     });
     if (!res.ok) return;
     const data = await res.json();
     items = Array.isArray(data.items) ? data.items : [];
-  } catch { return; }
+  } catch (err) {
+    // AbortError es esperado cuando el user navega — silent. Cualquier
+    // otro error es de red / parsing y también lo silenciamos (el
+    // bloque "related" es decorativo, no crítico).
+    return;
+  } finally {
+    inflightSideFetches.delete(ac);
+  }
   if (!items.length) return;
   const wrap = el("div", "related");
   wrap.appendChild(el("div", "related-head", "📎 contexto relacionado"));
@@ -2406,15 +2527,30 @@ async function speak(text) {
 // Follow-up chips — generated post-done from the last turn's context.
 // Clicking a chip re-submits that question as a new turn.
 async function appendFollowups(parent, sid) {
+  // AbortController registrado en el set global para cancelar si el
+  // user navega de sesión antes de que el LLM termine de generar
+  // followups (puede tardar 1-3s). Sin esto el fetch resuelve y
+  // appendea chips a un turn que ya no es visible.
+  const ac = new AbortController();
+  inflightSideFetches.add(ac);
+  let arr = [];
   try {
     const res = await fetch("/api/followups", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sid }),
+      signal: ac.signal,
     });
     if (!res.ok) return;
     const data = await res.json();
-    const arr = (data.followups || []).filter((x) => typeof x === "string");
+    arr = (data.followups || []).filter((x) => typeof x === "string");
+  } catch (_) {
+    // AbortError o cualquier otro error → silent (chips son opcionales).
+    return;
+  } finally {
+    inflightSideFetches.delete(ac);
+  }
+  try {
     if (!arr.length) return;
     const wrap = el("div", "followups");
     wrap.appendChild(el("span", "followups-label", "seguir con ›"));
@@ -2435,8 +2571,18 @@ async function appendFollowups(parent, sid) {
   } catch {}
 }
 
+// a11y: Respeta `prefers-reduced-motion` para usuarios con sensibilidad
+// vestibular / motion sickness — el smooth-scroll programático puede
+// causar náuseas. El media query lo evalúa en cada call (en vez de
+// cachearlo) por si el user lo cambia en Settings sin reload.
+// WCAG 2.3.3 (Animation from Interactions, AAA).
+function smoothBehavior() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ? "auto" : "smooth";
+}
+
 function scrollBottom() {
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  window.scrollTo({ top: document.body.scrollHeight, behavior: smoothBehavior() });
 }
 
 function obsidianUrl(filePath) {
@@ -2672,6 +2818,15 @@ let lastTurnId = null;
 // redo_turn_id is set.
 async function send(question, opts = {}) {
   if (pending) return;
+  // a11y / race-condition: deshabilitar el botón en el DOM ANTES de
+  // tocar `pending` evita el doble-tap rápido (touch users en mobile,
+  // mouse double-click en desktop). El guard JS `if (pending) return`
+  // previene la segunda invocación lógica, pero un click adicional
+  // dispara igual el handler — `disabled` lo bloquea a nivel browser.
+  // En el finally se restablece visibilidad (sendBtn.hidden=false) +
+  // updateSendBtnState() recalcula `disabled` según contenido del
+  // textarea. 2026-04-25 a11y audit lote 2.
+  if (sendBtn) sendBtn.disabled = true;
   pending = true;
   lastUserQuestion = question;
   pushHistory(question);
@@ -2862,7 +3017,11 @@ async function send(question, opts = {}) {
       turn.appendChild(el("div", "meta", "  ⏹ detenido"));
     } else {
       thinking.remove();
-      turn.appendChild(el("div", "error", `  error: ${err.message}`));
+      // a11y: role="alert" sobre el error de red/transport — el user
+      // está esperando una respuesta y necesita enterarse que falló.
+      const errNode = el("div", "error", `  error: ${err.message}`);
+      errNode.setAttribute("role", "alert");
+      turn.appendChild(errNode);
     }
   } finally {
     stopGeneratingTicker();
@@ -2948,6 +3107,16 @@ async function send(question, opts = {}) {
         ragLine.className = "line";
         const prompt = el("span", "prompt rag", "rag ›");
         ragText = el("span", "text rag pending");
+        // a11y: aria-live="polite" sobre el contenedor que muta con
+        // cada chunk SSE → screen readers anuncian la respuesta a
+        // medida que llega. aria-atomic="false" porque cada token es
+        // un append (no queremos que VoiceOver re-lea todo el
+        // párrafo en cada chunk). role="region" + aria-label dan un
+        // landmark navegable. 2026-04-25 a11y audit lote 2.
+        ragText.setAttribute("role", "region");
+        ragText.setAttribute("aria-live", "polite");
+        ragText.setAttribute("aria-atomic", "false");
+        ragText.setAttribute("aria-label", "Respuesta del asistente");
         ragLine.appendChild(prompt);
         ragLine.appendChild(ragText);
         turn.appendChild(ragLine);
@@ -3096,7 +3265,14 @@ async function send(question, opts = {}) {
       stopGeneratingTicker();
       thinking.remove();
       clearToolChips();
-      turn.appendChild(el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`));
+      // a11y: role="alert" (= aria-live="assertive" + aria-atomic="true")
+      // — los estados terminales sin respuesta sí necesitan
+      // interrumpir al screen reader (a diferencia del stream "polite"
+      // arriba) porque el usuario está esperando la respuesta y este
+      // mensaje le dice "no hubo nada / falló".
+      const emptyNode = el("div", "empty", `  ${parsed.message || "Sin resultados relevantes."}`);
+      emptyNode.setAttribute("role", "alert");
+      turn.appendChild(emptyNode);
       if (question) {
         appendWebSearch(turn, question);
         appendRelated(turn, question);
@@ -3105,7 +3281,10 @@ async function send(question, opts = {}) {
       stopGeneratingTicker();
       thinking.remove();
       clearToolChips();
-      turn.appendChild(el("div", "error", `  ${parsed.message || "Error"}`));
+      // a11y: role="alert" — ver comentario del bloque "empty" arriba.
+      const errNode = el("div", "error", `  ${parsed.message || "Error"}`);
+      errNode.setAttribute("role", "alert");
+      turn.appendChild(errNode);
     } else if (event === "heartbeat") {
       // Server-side heartbeat is a liveness signal. Only act on it as a
       // fallback if no client-side ticker is running for this phase (e.g.
@@ -3211,6 +3390,10 @@ async function handleSlashCommand(raw) {
       try { currentController.abort(); } catch (_) {}
       currentController = null;
     }
+    // También cancelar related/followups/contacts pending del turn
+    // anterior — sino aparecen chips de followup de la sesión vieja
+    // pegoteados encima del "nueva sesión — historial en blanco".
+    abortSideFetches();
     sessionId = null;
     sessionStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SESSION_KEY); // legacy cleanup
@@ -3636,19 +3819,44 @@ function initSidebarCollapse() {
 }
 
 // ── Mobile drawer open/close ─────────────────────────────────────────
+// Focus trap WCAG 2.4.3: cuando el drawer está abierto en mobile, Tab
+// cicla dentro del sidebar (sino el focus salta al composer detrás
+// del backdrop). Mismo patrón que el help modal arriba — reusa
+// FOCUSABLE_SELECTOR. El trap solo aplica cuando data-state=="open"
+// (mobile drawer); en desktop el sidebar es siempre visible y el
+// focus puede salir libremente.
+let _sidebarLastFocus = null;
+function _sidebarTrap(e) {
+  if (e.key !== "Tab") return;
+  if (!sidebar || sidebar.getAttribute("data-state") !== "open") return;
+  const f = [...sidebar.querySelectorAll(FOCUSABLE_SELECTOR)]
+    .filter((el) => !el.hasAttribute("hidden") && el.offsetParent !== null);
+  if (!f.length) return;
+  const first = f[0];
+  const last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
 function openSidebarMobile() {
   if (!sidebar) return;
+  _sidebarLastFocus = document.activeElement;
   sidebar.setAttribute("data-state", "open");
   if (sidebarOpenBtn) sidebarOpenBtn.setAttribute("aria-expanded", "true");
   // Focus el primer control interactivo — a11y + keyboard users.
-  const firstFocusable = sidebar.querySelector(
-    "button:not([hidden]):not([disabled]), a[href], select, input"
-  );
+  const firstFocusable = sidebar.querySelector(FOCUSABLE_SELECTOR);
   if (firstFocusable) firstFocusable.focus({ preventScroll: true });
+  sidebar.addEventListener("keydown", _sidebarTrap);
 }
 
 function closeSidebarMobile() {
   if (!sidebar) return;
+  sidebar.removeEventListener("keydown", _sidebarTrap);
   // Restaurar el estado desktop persistido (expanded / collapsed)
   // cuando cerramos el drawer mobile. Así el desktop no se rompe si
   // el user redimensiona la ventana mientras tenía el drawer abierto.
@@ -3656,8 +3864,19 @@ function closeSidebarMobile() {
   sidebar.setAttribute("data-state", savedCollapsed ? "collapsed" : "expanded");
   if (sidebarOpenBtn) {
     sidebarOpenBtn.setAttribute("aria-expanded", "false");
+  }
+  // Restaurar focus al trigger que abrió el drawer si todavía existe
+  // en el DOM (típicamente el sidebar-open-btn). Si el user navegó al
+  // input mientras el drawer estaba abierto, no querríamos saltar
+  // sobre su intención — pero en este flow el trap previene eso, así
+  // que el lastFocus es siempre el botón de apertura.
+  if (_sidebarLastFocus && typeof _sidebarLastFocus.focus === "function" &&
+      document.contains(_sidebarLastFocus)) {
+    try { _sidebarLastFocus.focus({ preventScroll: true }); } catch (_) {}
+  } else if (sidebarOpenBtn) {
     sidebarOpenBtn.focus({ preventScroll: true });
   }
+  _sidebarLastFocus = null;
 }
 
 function initSidebarMobile() {
@@ -3705,6 +3924,9 @@ function triggerNewChat() {
     try { currentController.abort(); } catch (_) {}
     currentController = null;
   }
+  // También cancelar fetches secundarios (related/followups) del turn
+  // que estaba en curso. Mismo motivo que en /new arriba.
+  abortSideFetches();
   sessionId = null;
   sessionStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_KEY);
@@ -3819,6 +4041,10 @@ async function loadSession(sid) {
     try { currentController.abort(); } catch (_) {}
     currentController = null;
   }
+  // Cancelar related/followups/contacts pending del turn de la
+  // sesión vieja — sino aparecen chips o YouTube relacionados al
+  // turn previo metidos en la lista hidratada de la sesión nueva.
+  abortSideFetches();
   try {
     const res = await fetch(`/api/session/${encodeURIComponent(sid)}/turns`, {
       headers: { "Accept": "application/json" },
@@ -4008,12 +4234,26 @@ if (composerPlusBtn && helpBtn) {
 }
 
 // ── Mic button: stub — muestra un system message explicando que viene. ──
+// Dedup intencional: si el user clickea el mic varias veces seguidas, NO
+// apilamos el mismo meta-mensaje (Fer F. 2026-04-24 lo reportó con 3
+// líneas idénticas en pantalla). Si la última línea del chat ya es este
+// mismo texto, swallow el click. El mensaje sigue siendo visible para que
+// el user lo vea — solo evitamos la duplicación visual ruidosa.
+const _MIC_STUB_MSG = "dictado por voz en preparación — por ahora usá /tts para escuchar respuestas";
+
+function _isLastMessageSameMicStub() {
+  const last = messages.lastElementChild;
+  if (!last) return false;
+  const metas = last.querySelectorAll(".meta");
+  if (!metas.length) return false;
+  const tail = metas[metas.length - 1];
+  return tail.textContent.trim() === _MIC_STUB_MSG.trim();
+}
+
 if (composerMicBtn) {
   composerMicBtn.addEventListener("click", () => {
-    pushSystemMessage(
-      "meta",
-      "dictado por voz en preparación — por ahora usá /tts para escuchar respuestas"
-    );
+    if (_isLastMessageSameMicStub()) return;
+    pushSystemMessage("meta", _MIC_STUB_MSG);
   });
 }
 

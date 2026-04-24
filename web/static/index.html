@@ -18,7 +18,7 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="rag">
-  <title>rag</title>
+  <title>rag · chat</title>
 
   <!-- ── PWA wiring ────────────────────────────────────────────────
        Manifest + icons + splash screens. Regenerar con
@@ -57,6 +57,7 @@
   <script src="/static/pwa/register-sw.js" defer></script>
 </head>
 <body>
+  <a href="#chat" class="skip-link">Saltar al contenido</a>
   <!-- ══════════════════════════════════════════════════════════════════
        Sidebar claude.ai-style (2026-04-24)
        ══════════════════════════════════════════════════════════════════
@@ -91,8 +92,12 @@
     </button>
     <!-- El click-to-clearView se ata a `.topbar-title` en app.js (se
          dejó el class name para no duplicar código — renombrar cuando
-         toquemos más el JS). -->
-    <h1 class="topbar-title mobile-brand">rag <span>· chat</span></h1>
+         toquemos más el JS).
+         <p> en vez de <h1>: WCAG 2.4.6 quiere un solo h1 por documento;
+         el h1 canónico vive en la sidebar (línea 114) que está siempre
+         en el DOM. El brand mobile es decorativo + click-target, no un
+         heading semántico. -->
+    <p class="topbar-title mobile-brand">rag <span>· chat</span></p>
     <button id="mobile-new-btn" class="icon-btn" type="button"
             aria-label="Nueva conversación" title="Nueva conversación">
       <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"
@@ -281,14 +286,17 @@
   <div id="sidebar-backdrop" class="sidebar-backdrop" data-sidebar-close
        aria-hidden="true"></div>
 
-  <main id="chat">
+  <main id="chat" tabindex="-1">
     <!-- Empty-state hero: visible cuando body.chat-empty (el JS toggla la
          clase via MutationObserver sobre #messages). Replica el landing
          de claude.ai — greeting centrado + subtitle sutil. Una vez que
          aparece el primer turn real (.line.user o .line.rag) la clase
          se remueve y el hero desaparece; el composer vuelve al bottom. -->
     <section id="empty-hero" aria-hidden="true">
-      <h1 class="empty-hero-title">¿en qué te ayudo?</h1>
+      <!-- h2 (no h1) — el h1 del documento es el brand de la sidebar.
+           El hero es un sub-heading dentro de <main>, no el heading
+           top-level de la página (WCAG 2.4.6, 1 h1 por documento). -->
+      <h2 class="empty-hero-title">¿en qué te ayudo?</h2>
       <p class="empty-hero-sub">
         preguntale al vault —
         <kbd>/</kbd> comandos · <kbd>⌘</kbd><kbd>K</kbd> foco · <kbd>⌘</kbd><kbd>/</kbd> ayuda
@@ -315,12 +323,15 @@
              rompía la sensación de input limpio. -->
         <div id="input-wrap">
           <div class="composer-row">
+            <!-- Sin `autofocus`: en iOS Safari el HTML autofocus dispara
+                 el teclado al cargar la página y tapa el empty-hero. El
+                 focus inicial lo decide app.js — solo en desktop (ver
+                 `initMobileTier1` y el bloque DOMContentLoaded). -->
             <textarea
               id="input"
               rows="1"
               placeholder="¿cómo puedo ayudarte hoy?"
               aria-label="Pregunta"
-              autofocus
             ></textarea>
           </div>
           <div class="composer-actions">

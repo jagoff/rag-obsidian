@@ -662,6 +662,89 @@
     }).join("");
   }
 
+  // ── Freshness matrix card (real) ────────────────────────────────────
+  // /api/status/freshness trae una fila por fuente (vault, whatsapp,
+  // gmail, calendar, reminders, drive) con age + sla + drift_ratio +
+  // status. Dibujamos la tabla + contador de fuentes sanas arriba.
+
+  const $freshSummary = document.getElementById("fresh-summary");
+  const $freshHealthy = document.getElementById("fresh-healthy");
+  const $freshTotal = document.getElementById("fresh-total");
+  const $freshTbody = document.getElementById("fresh-tbody");
+
+  async function fetchFreshness() {
+    try {
+      const resp = await fetch("/api/status/freshness", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderFreshness(data);
+    } catch (e) {
+      console.error("[status] freshness fetch failed", e);
+      if ($freshSummary) $freshSummary.textContent = "sin datos";
+    }
+  }
+
+  function renderFreshness(payload) {
+    const sources = Array.isArray(payload.sources) ? payload.sources : [];
+    const healthy = payload.sources_healthy | 0;
+    const total = payload.sources_total || sources.length;
+
+    // Headline: "5/6 fuentes al día".
+    $freshHealthy.childNodes[0].nodeValue = String(healthy);
+    $freshTotal.textContent = `/${total}`;
+
+    // Summary meta: drift máximo para saber si hay algún amarillo/rojo.
+    const maxDrift = sources.reduce((m, s) => {
+      const r = s.drift_ratio;
+      return (r != null && r > m) ? r : m;
+    }, 0);
+    if (healthy === total) {
+      $freshSummary.textContent = "todo al día";
+      $freshSummary.className = "insight-delta better";
+    } else {
+      const stale = sources.filter((s) => s.status === "stale").length;
+      const warn = sources.filter((s) => s.status === "warn").length;
+      const bits = [];
+      if (stale) bits.push(`${stale} stale`);
+      if (warn) bits.push(`${warn} warn`);
+      $freshSummary.textContent = bits.join(" · ") || "—";
+      $freshSummary.className = stale
+        ? "insight-delta bad"
+        : "insight-delta worse";
+    }
+
+    // Tabla: 1 fila por fuente. El bar normaliza drift_ratio a [0,1]
+    // con un cap de 3× para que la barra se llene en el threshold stale.
+    const DRIFT_CAP = 3.0;
+    const rows = sources.map((s) => {
+      const ratio = typeof s.drift_ratio === "number" ? s.drift_ratio : null;
+      const driftNorm = ratio == null ? 0 : Math.min(ratio / DRIFT_CAP, 1);
+      const driftCls = `fresh-drift-${s.status || "unknown"}`;
+      const ageText = escapeHTML(s.detail || "—");
+      const chipText = statusChipText(s.status, ratio);
+      const title = escapeHTML(
+        `${s.label || s.id} · ${s.detail || ""}` +
+        (ratio != null ? ` · drift ${ratio.toFixed(2)}×` : ""),
+      );
+      return `<tr title="${title}">
+        <td class="fresh-source">${escapeHTML(s.label || s.id)}</td>
+        <td class="fresh-age">${ageText}</td>
+        <td>
+          <span class="fresh-bar ${driftCls}" style="--drift:${driftNorm.toFixed(3)}"></span>
+          <span class="fresh-chip ${driftCls}">${chipText}</span>
+        </td>
+      </tr>`;
+    }).join("");
+    $freshTbody.innerHTML = rows || `<tr><td colspan="3" style="text-align:center;color:var(--text-faint);padding:12px">sin fuentes</td></tr>`;
+  }
+
+  function statusChipText(status, ratio) {
+    if (status === "ok") return "ok";
+    if (status === "warn") return ratio != null ? `drift ${ratio.toFixed(1)}×` : "drift";
+    if (status === "stale") return "stale";
+    return "—";
+  }
+
   // ── Heatmap mock (PREVIEW) ──────────────────────────────────────────
   // Generate 7 rows × 24 cols de cuadraditos con un patrón semi-random
   // pero determinístico, para que el diseño se vea con datos verosímiles
@@ -711,6 +794,7 @@
   tick(true);
   fetchLatency();
   fetchErrors();
+  fetchFreshness();
   buildHeatmapMock();
   startLoop();
 
@@ -720,16 +804,22 @@
   $refreshNow.addEventListener("click", () => {
     fetchLatency();
     fetchErrors();
+    fetchFreshness();
   });
 
   // Loops separados alineados con los TTL server-side:
-  //   - latency: cache 60s → poll 60s
-  //   - errors:  cache 30s → poll 30s (los errores son "eventos", más
-  //     volátiles que la latencia agregada)
+  //   - latency:   cache 60s → poll 60s
+  //   - errors:    cache 30s → poll 30s (eventos, más volátiles)
+  //   - freshness: cache 30s → poll 30s (los ingestores corren cada
+  //                15-60min, pero los "hace Xm" deben actualizarse
+  //                más seguido para que se sienta vivo)
   setInterval(() => {
     if (!document.hidden) fetchLatency();
   }, 60000);
   setInterval(() => {
     if (!document.hidden) fetchErrors();
+  }, 30000);
+  setInterval(() => {
+    if (!document.hidden) fetchFreshness();
   }, 30000);
 })();

@@ -228,10 +228,10 @@ def test_status_page_has_insights_section():
     assert 'id="err-total"' in body
     assert 'id="err-donut"' in body
     assert 'id="err-breakdown"' in body
-    # 3 preview badges restantes (freshness + log-tail + heatmap uptime).
+    # 2 preview badges restantes (log-tail + heatmap uptime).
     # Buscamos la clase aplicada en el markup (<span class="preview-badge">)
     # para no contar la definición CSS inline.
-    assert body.count('class="preview-badge"') == 3
+    assert body.count('class="preview-badge"') == 2
     assert 'id="heatmap-mock"' in body
 
 
@@ -362,6 +362,146 @@ def test_api_errors_no_logs_returns_empty_gracefully(tmp_path, monkeypatch):
     assert payload["total_errors"] == 0
     assert payload["breakdown"] == []
     assert payload["delta_pct"] is None
+
+
+def test_status_page_freshness_has_real_ids():
+    """El HTML tiene los ids del card #3 real (tbody dinámico + total/
+    healthy/summary). Si alguien refactorea el markup, este test rompe."""
+    body = (_STATIC_DIR / "status.html").read_text(encoding="utf-8")
+    assert 'id="insight-freshness"' in body
+    assert 'id="fresh-tbody"' in body
+    assert 'id="fresh-healthy"' in body
+    assert 'id="fresh-total"' in body
+    assert 'id="fresh-summary"' in body
+    # Preview badges ahora son 2 (log-tail + heatmap uptime).
+    assert body.count('class="preview-badge"') == 2
+
+
+# ── /api/status/freshness — freshness matrix endpoint ───────────────
+# Mide last-run de cada ingestor via mtime del stdout log del launchd
+# job. Tests se apoyan en la API pública (TestClient) y en el build
+# helper directo para no depender de que el FS del CI tenga los logs.
+
+def test_api_freshness_payload_shape():
+    """GET /api/status/freshness devuelve los campos del contract."""
+    resp = _client.get("/api/status/freshness?nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    for k in ("window_hours", "sources", "sources_healthy", "sources_total"):
+        assert k in d, f"falta {k!r}"
+    assert isinstance(d["sources"], list)
+    # Las 6 fuentes estables (vault + 5 ingestores).
+    ids = [s["id"] for s in d["sources"]]
+    assert ids == ["vault", "whatsapp", "gmail", "calendar", "reminders", "drive"], (
+        f"orden / ids inesperados: {ids}"
+    )
+
+
+def test_api_freshness_row_shape():
+    """Cada fila tiene el shape esperado por el frontend."""
+    resp = _client.get("/api/status/freshness?nocache=1")
+    d = resp.json()
+    for s in d["sources"]:
+        for field in ("id", "label", "kind", "last_run_ts", "age_seconds",
+                      "sla_seconds", "drift_ratio", "status", "detail"):
+            assert field in s, f"{s['id']} falta {field}"
+        assert s["status"] in {"ok", "warn", "stale", "unknown"}
+        assert s["kind"] in {"continuous", "scheduled"}
+
+
+def test_freshness_build_classifies_by_drift(tmp_path, monkeypatch):
+    """Con logs sintéticos, verificar que el threshold del drift_ratio
+    clasifica ok/warn/stale correctamente (1.0 y 3.0 como corte)."""
+    import time as _time
+    log_dir = tmp_path / ".local" / "share" / "obsidian-rag"
+    log_dir.mkdir(parents=True)
+    la_dir = tmp_path / "LaunchAgents"
+    la_dir.mkdir()
+
+    # Apuntar el builder al tmp_path reemplazando Path.home() via
+    # monkeypatching del módulo.
+    from pathlib import Path as _P
+    orig_home = _P.home
+    monkeypatch.setattr(_P, "home", staticmethod(lambda: tmp_path))
+
+    # Escribir un plist mínimo para que _read_start_interval_s devuelva
+    # algo. El fallback del catalog también serviría pero testeamos el
+    # parse path explícitamente.
+    def _write_plist(label, interval):
+        (la_dir / f"{label}.plist").write_text(
+            f'<plist><dict><key>StartInterval</key><integer>{interval}</integer></dict></plist>\n',
+            encoding="utf-8",
+        )
+    _write_plist("com.fer.obsidian-rag-watch", 900)
+    _write_plist("com.fer.obsidian-rag-ingest-whatsapp", 900)
+    _write_plist("com.fer.obsidian-rag-ingest-gmail", 3600)
+    _write_plist("com.fer.obsidian-rag-ingest-calendar", 3600)
+    _write_plist("com.fer.obsidian-rag-ingest-reminders", 3600)
+    _write_plist("com.fer.obsidian-rag-ingest-drive", 3600)
+
+    now = _time.time()
+    # vault: fresh (drift < 1), WA: warn (drift 1.5), gmail: stale (drift 4),
+    # calendar: falta log (unknown), reminders: fresh, drive: warn.
+    (log_dir / "watch.log").write_text("x")
+    import os
+    os.utime(log_dir / "watch.log", (now - 60, now - 60))  # 1min ago
+
+    (log_dir / "ingest-whatsapp.log").write_text("x")
+    os.utime(log_dir / "ingest-whatsapp.log", (now - 1350, now - 1350))  # 22min ago, sla=15m → drift ~1.5
+
+    (log_dir / "ingest-gmail.log").write_text("x")
+    os.utime(log_dir / "ingest-gmail.log", (now - 4 * 3600, now - 4 * 3600))  # 4h ago, sla=1h → drift ~4
+
+    # calendar NO existe → unknown
+
+    (log_dir / "ingest-reminders.log").write_text("x")
+    os.utime(log_dir / "ingest-reminders.log", (now - 120, now - 120))  # 2min → ok
+
+    (log_dir / "ingest-drive.log").write_text("x")
+    os.utime(log_dir / "ingest-drive.log", (now - 2 * 3600, now - 2 * 3600))  # 2h → warn
+
+    # Invalidar cache module-level.
+    with _server._FRESHNESS_CACHE_LOCK:
+        _server._FRESHNESS_CACHE["ts"] = 0.0
+        _server._FRESHNESS_CACHE["payload"] = None
+
+    payload = _server._status_freshness_build_payload()
+    by_id = {s["id"]: s for s in payload["sources"]}
+
+    assert by_id["vault"]["status"] == "ok"
+    assert by_id["whatsapp"]["status"] == "warn"
+    assert by_id["gmail"]["status"] == "stale"
+    assert by_id["calendar"]["status"] == "unknown"
+    assert by_id["reminders"]["status"] == "ok"
+    assert by_id["drive"]["status"] == "warn"
+
+    # sources_healthy = cuenta de ok (vault + reminders = 2).
+    assert payload["sources_healthy"] == 2
+    assert payload["sources_total"] == 6
+
+    # Los detalles humanos no están vacíos.
+    assert by_id["vault"]["detail"].startswith("hace")
+    assert by_id["calendar"]["detail"]  # "nunca corrió" o equivalente
+
+
+def test_read_start_interval_fallback():
+    """Plist inexistente devuelve None. Plist sin StartInterval devuelve
+    None (e.g. StartCalendarInterval-only jobs)."""
+    assert _server._read_start_interval_s("com.nonexistent.label.12345") is None
+
+
+def test_fmt_age_spanish_boundaries():
+    """El formato 'hace Xs/m/h/d' se elige por boundary correcto."""
+    f = _server._fmt_age_spanish
+    assert f(-5) == "justo ahora"
+    assert f(30) == "hace 30s"
+    assert f(59) == "hace 59s"
+    assert f(60) == "hace 1m"
+    assert f(599) == "hace 9m"
+    assert f(3600) == "hace 1h"
+    assert f(7200) == "hace 2h"
+    assert f(86400) == "hace 1d"
+    assert f(172800) == "hace 2d"
 
 
 def test_api_errors_top_n_collapses_rest_to_other(tmp_path, monkeypatch):

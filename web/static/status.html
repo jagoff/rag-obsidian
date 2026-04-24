@@ -680,6 +680,10 @@
     .fresh-table .fresh-drift-ok { color: var(--green); }
     .fresh-table .fresh-drift-warn { color: var(--yellow); }
     .fresh-table .fresh-drift-down { color: var(--red); }
+    /* Fresh-bar: ancho del ::after viene de la var --drift (0..1 float)
+       que el JS setea inline según el drift_ratio / ratio_cap. El color
+       viene de la clase .fresh-drift-{ok,warn,stale}. Evita una
+       cascade rule per status + da una escala continua del drift. */
     .fresh-bar {
       display: inline-block;
       width: 50px;
@@ -689,17 +693,35 @@
       position: relative;
       vertical-align: middle;
       margin-right: 6px;
+      --drift: 0;
     }
     .fresh-bar::after {
       content: "";
       position: absolute;
-      inset: 0;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: calc(var(--drift) * 100%);
+      max-width: 100%;
       border-radius: inherit;
       background: currentColor;
     }
-    .fresh-bar.pct-low::after  { width: 25%; background: var(--green); }
-    .fresh-bar.pct-mid::after  { width: 60%; background: var(--yellow); }
-    .fresh-bar.pct-high::after { width: 95%; background: var(--red); }
+    .fresh-bar.fresh-drift-ok::after    { background: var(--green); }
+    .fresh-bar.fresh-drift-warn::after  { background: var(--yellow); }
+    .fresh-bar.fresh-drift-stale::after { background: var(--red); }
+    .fresh-bar.fresh-drift-unknown::after { background: var(--border-strong); }
+
+    /* Chip de estado a la derecha del bar, alineado inline. */
+    .fresh-chip {
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    .fresh-chip.fresh-drift-ok    { color: var(--green); }
+    .fresh-chip.fresh-drift-warn  { color: var(--yellow); }
+    .fresh-chip.fresh-drift-stale { color: var(--red); }
+    .fresh-chip.fresh-drift-unknown { color: var(--text-faint); }
 
     /* Log tail */
     .log-list {
@@ -904,47 +926,24 @@
         </div>
       </article>
 
-      <!-- #3 Freshness matrix — PREVIEW (datos dummy) -->
-      <article class="insight-card insight-preview" aria-label="Freshness de datos">
+      <!-- #3 Freshness matrix — REAL
+           Fuente: /api/status/freshness. Tabla con una fila por fuente
+           (vault, whatsapp, gmail, calendar, reminders, drive). Cada
+           fila muestra "hace Xm" + bar proporcional al drift vs SLA +
+           chip coloreado ok/warn/stale/unknown. -->
+      <article class="insight-card" id="insight-freshness" aria-label="Freshness de datos">
         <div class="insight-head">
           <h3>freshness datos</h3>
-          <span class="preview-badge">vista previa</span>
+          <span class="insight-meta" id="fresh-summary">—</span>
         </div>
         <div class="insight-big">
-          <span class="insight-big-value">5<span style="color:var(--text-faint);font-weight:500">/6</span></span>
+          <span class="insight-big-value" id="fresh-healthy">—<span style="color:var(--text-faint);font-weight:500" id="fresh-total"></span></span>
           <span class="insight-big-unit">fuentes al día</span>
         </div>
-        <table class="fresh-table">
-          <tr>
-            <td class="fresh-source">vault</td>
-            <td class="fresh-age">hace 4m</td>
-            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
-          </tr>
-          <tr>
-            <td class="fresh-source">whatsapp</td>
-            <td class="fresh-age">hace 11m</td>
-            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
-          </tr>
-          <tr>
-            <td class="fresh-source">gmail</td>
-            <td class="fresh-age">hace 2h</td>
-            <td><span class="fresh-bar pct-mid"></span><span class="fresh-drift-warn">drift 1.3×</span></td>
-          </tr>
-          <tr>
-            <td class="fresh-source">calendar</td>
-            <td class="fresh-age">hace 6h</td>
-            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
-          </tr>
-          <tr>
-            <td class="fresh-source">reminders</td>
-            <td class="fresh-age">hace 1h</td>
-            <td><span class="fresh-bar pct-low"></span><span class="fresh-drift-ok">ok</span></td>
-          </tr>
-          <tr>
-            <td class="fresh-source">web_corpus</td>
-            <td class="fresh-age">hace 18h</td>
-            <td><span class="fresh-bar pct-high"></span><span class="fresh-drift-down">stale</span></td>
-          </tr>
+        <table class="fresh-table" id="fresh-table">
+          <tbody id="fresh-tbody">
+            <tr><td colspan="3" style="text-align:center;color:var(--text-faint);padding:12px">cargando…</td></tr>
+          </tbody>
         </table>
       </article>
 
@@ -1007,6 +1006,6 @@
     </div>
   </div>
 
-  <script src="/static/status.js?v=2026-04-24-errors-card" defer></script>
+  <script src="/static/status.js?v=2026-04-24-freshness-card" defer></script>
 </body>
 </html>

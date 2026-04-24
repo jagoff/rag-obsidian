@@ -8804,6 +8804,247 @@ def status_errors(nocache: int = 0) -> dict:
     return cached
 
 
+# ── /api/status/freshness — cuándo corrió por última vez cada fuente ──
+# Feed el card #3 del insights grid. Los ingestores dispersos del sistema
+# tienen "last-run" en distintos lugares (plist con StartInterval, log
+# mtime, sqlite, ...). Consolidamos acá en un shape uniforme para que
+# la UI muestre la tabla con "hace Xm" + chip de drift vs SLA.
+#
+# Estrategia por fuente: el mtime del stdout log de su launchd job es
+# el indicador más simple + universal. Cada ingestor escribe al menos
+# un log line cuando corre (header de timestamps, payload count, etc.),
+# así que mtime del log === last-run. Evita tocar los ingestores para
+# agregar un "marker file" y funciona hoy sin migración.
+#
+# El SLA (cadence expected) se lee del `StartInterval` en el plist.
+# Para vault no hay StartInterval (es un watch daemon continuous), así
+# que hardcodeamos 900s como target de freshness — si en 15min no se
+# movió un archivo del vault, el watch está zombie o el vault quieto
+# (ambos ameritan el "warn" amarillo).
+#
+# Schema del payload:
+#   {
+#     "window_hours": 24,
+#     "sources": [
+#       {
+#         "id": "vault", "label": "vault",
+#         "last_run_ts": "2026-04-24T20:19:04",  # ISO local (no UTC)
+#         "age_seconds": 240,
+#         "sla_seconds": 900,
+#         "drift_ratio": 0.27,                   # age/sla
+#         "status": "ok",                         # ok | warn | stale | unknown
+#         "detail": "watch daemon · hace 4m"
+#       }, ...
+#     ],
+#     "sources_healthy": 5,
+#     "sources_total": 6,
+#   }
+#
+# Thresholds:
+#   drift < 1.0         → ok (dentro del SLA)
+#   drift 1.0 .. 3.0    → warn (atrasado pero tolerable)
+#   drift ≥ 3.0         → stale (el ingestor probablemente se wedgeó)
+#   file missing        → unknown (no corrió nunca o el log fue borrado)
+
+_FRESHNESS_CACHE_TTL = 30.0
+_FRESHNESS_CACHE: dict = {"ts": 0.0, "payload": None}
+_FRESHNESS_CACHE_LOCK = threading.Lock()
+
+# Catálogo de fuentes. El orden acá define el orden en la UI (stable,
+# lo que permite al user aprender la tabla "de memoria"). `sla_seconds`
+# para vault es el único hardcoded (no tiene StartInterval porque es
+# watcher continuous); el resto se lee del plist.
+_FRESHNESS_SOURCES: tuple[dict, ...] = (
+    {
+        "id": "vault",
+        "label": "vault",
+        "log_name": "watch.log",
+        "launchd_label": "com.fer.obsidian-rag-watch",
+        "sla_fallback_s": 900,  # 15min — si el watcher no indexa nada en
+                                # 15m, o está zombie o el vault está
+                                # idle (ambos vale marcar warn).
+        "kind": "continuous",
+    },
+    {
+        "id": "whatsapp",
+        "label": "whatsapp",
+        "log_name": "ingest-whatsapp.log",
+        "launchd_label": "com.fer.obsidian-rag-ingest-whatsapp",
+        "sla_fallback_s": 900,
+        "kind": "scheduled",
+    },
+    {
+        "id": "gmail",
+        "label": "gmail",
+        "log_name": "ingest-gmail.log",
+        "launchd_label": "com.fer.obsidian-rag-ingest-gmail",
+        "sla_fallback_s": 3600,
+        "kind": "scheduled",
+    },
+    {
+        "id": "calendar",
+        "label": "calendar",
+        "log_name": "ingest-calendar.log",
+        "launchd_label": "com.fer.obsidian-rag-ingest-calendar",
+        "sla_fallback_s": 3600,
+        "kind": "scheduled",
+    },
+    {
+        "id": "reminders",
+        "label": "reminders",
+        "log_name": "ingest-reminders.log",
+        "launchd_label": "com.fer.obsidian-rag-ingest-reminders",
+        "sla_fallback_s": 3600,
+        "kind": "scheduled",
+    },
+    {
+        "id": "drive",
+        "label": "drive",
+        "log_name": "ingest-drive.log",
+        "launchd_label": "com.fer.obsidian-rag-ingest-drive",
+        "sla_fallback_s": 3600,
+        "kind": "scheduled",
+    },
+)
+
+
+def _read_start_interval_s(plist_label: str) -> int | None:
+    """Extract `StartInterval` (seconds) from a user launchd plist. Returns
+    None if the plist doesn't exist or doesn't declare StartInterval (some
+    jobs use StartCalendarInterval or are continuous watchers — those get
+    handled via `sla_fallback_s` in the catalog)."""
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{plist_label}.plist"
+    if not plist_path.is_file():
+        return None
+    try:
+        content = plist_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    # Simple regex — no need for plistlib here; `<key>StartInterval</key>
+    # <integer>NNN</integer>` es stable-enough en plists generados por
+    # launchd / plutil. Si alguien edita a mano con formato raro, cae
+    # al fallback.
+    import re
+    m = re.search(
+        r"<key>\s*StartInterval\s*</key>\s*<integer>\s*(\d+)\s*</integer>",
+        content,
+    )
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _fmt_age_spanish(age_s: float) -> str:
+    """'hace 4m', 'hace 2h', 'hace 3d' — copy rioplatense consistente."""
+    if age_s < 0:
+        return "justo ahora"
+    if age_s < 60:
+        return f"hace {int(age_s)}s"
+    if age_s < 3600:
+        return f"hace {int(age_s / 60)}m"
+    if age_s < 86400:
+        return f"hace {int(age_s / 3600)}h"
+    return f"hace {int(age_s / 86400)}d"
+
+
+def _status_freshness_build_payload() -> dict:
+    """Build the freshness matrix payload. One row per _FRESHNESS_SOURCES
+    entry. Errors per-row are logged but don't fail the whole endpoint —
+    una fuente caída no debería impedir que las otras 5 se muestren."""
+    log_dir = Path.home() / ".local" / "share" / "obsidian-rag"
+    now = time.time()
+    rows: list[dict] = []
+    healthy = 0
+
+    for src in _FRESHNESS_SOURCES:
+        row: dict = {
+            "id": src["id"],
+            "label": src["label"],
+            "kind": src["kind"],
+            "last_run_ts": None,
+            "age_seconds": None,
+            "sla_seconds": None,
+            "drift_ratio": None,
+            "status": "unknown",
+            "detail": "sin log",
+        }
+        try:
+            # SLA: plist StartInterval > catalog fallback.
+            sla = _read_start_interval_s(src["launchd_label"]) or src["sla_fallback_s"]
+            row["sla_seconds"] = int(sla)
+
+            log_path = log_dir / src["log_name"]
+            if not log_path.is_file():
+                # Log no existe todavía (ingestor nunca corrió). Dejamos
+                # status=unknown; la UI lo muestra en gris.
+                row["detail"] = "nunca corrió"
+                rows.append(row)
+                continue
+
+            stat = log_path.stat()
+            age_s = now - stat.st_mtime
+            row["last_run_ts"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+            row["age_seconds"] = int(age_s)
+            row["drift_ratio"] = round(age_s / sla, 2) if sla > 0 else None
+
+            # Thresholds: <1× ok, 1-3× warn, ≥3× stale.
+            if sla > 0:
+                r = age_s / sla
+                if r < 1.0:
+                    row["status"] = "ok"
+                    healthy += 1
+                elif r < 3.0:
+                    row["status"] = "warn"
+                else:
+                    row["status"] = "stale"
+            else:
+                row["status"] = "unknown"
+
+            # Detalle legible: "hace Xm / SLA Ym"
+            sla_str = _fmt_age_spanish(sla).replace("hace ", "")
+            row["detail"] = f"{_fmt_age_spanish(age_s)} / SLA {sla_str}"
+        except Exception as e:
+            row["status"] = "unknown"
+            row["detail"] = f"error: {type(e).__name__}"
+            print(f"[status_freshness] warn: source {src['id']!r} failed: {e}", flush=True)
+        rows.append(row)
+
+    return {
+        "window_hours": 24,
+        "sources": rows,
+        "sources_healthy": healthy,
+        "sources_total": len(_FRESHNESS_SOURCES),
+    }
+
+
+@app.get("/api/status/freshness")
+def status_freshness(nocache: int = 0) -> dict:
+    """Freshness matrix: por fuente (vault, whatsapp, gmail, calendar,
+    reminders, drive), cuándo fue la última vez que corrió y si está
+    dentro del SLA. Drives el card #3 del /status. Cacheado 30s;
+    ?nocache=1 fuerza refresh.
+
+    Mide "last run" via mtime del stdout log del launchd job. Es un
+    proxy — asume que cada ingestor escribe al log cuando corre (todos
+    los actuales lo hacen, al menos un timestamp header). Si alguno
+    deja de hacerlo, hay que migrarlo a un marker file explícito.
+    """
+    now_mono = time.monotonic()
+    with _FRESHNESS_CACHE_LOCK:
+        cached = _FRESHNESS_CACHE["payload"]
+        fresh = (now_mono - _FRESHNESS_CACHE["ts"]) < _FRESHNESS_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _status_freshness_build_payload()
+        with _FRESHNESS_CACHE_LOCK:
+            _FRESHNESS_CACHE["payload"] = payload
+            _FRESHNESS_CACHE["ts"] = now_mono
+        return payload
+    return cached
+
+
 @app.get("/status")
 def status_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "status.html")

@@ -160,6 +160,33 @@ def _isolate_silent_errors_log(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_sql_state_error_log(tmp_path_factory):
+    """Gemelo de `_isolate_silent_errors_log`: evita que tests que disparan
+    `_log_sql_state_error` (SQL writer/reader fails con monkeypatched DB,
+    `test_tag` events, etc.) contaminen el
+    `~/.local/share/obsidian-rag/sql_state_errors.jsonl` real del usuario.
+
+    Bug medido en el audit 2026-04-24: **161 entries de `test_tag`** en el
+    sql_state_errors.jsonl de producción, mezcladas con 1595 errores reales
+    — imposible distinguir ruido de test vs señal de ops real sin filtrar a
+    mano. Pre-fix este path no se monkeypatcheaba en ningún lado.
+
+    Redirige `_SQL_STATE_ERROR_LOG` a tmp por la duración del test. El file
+    append es sync (no hay queue intermedio), así que al restore el path
+    viejo no tiene pendings colgados — simplemente reponemos el valor
+    original y las writes futuras vuelven al path real.
+    """
+    import rag as _rag
+    tmp = tmp_path_factory.mktemp("sql_state_errors") / "sql_state_errors.jsonl"
+    original = _rag._SQL_STATE_ERROR_LOG
+    _rag._SQL_STATE_ERROR_LOG = tmp
+    try:
+        yield
+    finally:
+        _rag._SQL_STATE_ERROR_LOG = original
+
+
+@pytest.fixture(autouse=True)
 def _clear_query_caches():
     """Evita que los LRU de embed/expand_queries contaminen tests.
 

@@ -264,6 +264,7 @@ def test_source_intent_label_covers_exactly_source_specific_tools():
         "calendar_ahead",
         "reminders_due",
         "drive_search",
+        "whatsapp_pending",
     }
     # Cada entrada tiene la forma (etiqueta_humana, section_header).
     for name, (label, section) in _SOURCE_INTENT_LABEL.items():

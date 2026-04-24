@@ -161,11 +161,14 @@ _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     # bucket" semántico del user (reportado 2026-04-24 Fer F.: "me
     # faltan las conversaciones de wzp relativa a la pregunta" cuando
     # preguntó por pendientes de la semana). Keywords explícitos
-    # (whatsapp/wzp/wsp/chats) también gatillan. `chats?` por sí solo
-    # es aceptable porque las otras apps de chat del user (Slack,
-    # Messages) no están integradas al RAG todavía — en la práctica
-    # "chat" == WhatsApp en este setup.
-    ("whatsapp_pending", {}, r"whats.?app|\bwzp\b|\bwsp\b|\bchats?\b|mensajes?\s+sin|pendient\w*\s+(de\s+)?(responder|contestar|respuesta)|" + _PLANNING_PAT),
+    # (whatsapp/wzp/wsp/chats) también gatillan. `pendient` plain
+    # (sin `\b`) matcha "pendiente(s)/pendient(e) de contestar/etc" —
+    # mismo patrón que usa `reminders_due`, así el scope de "pending
+    # bucket" está consistente entre tasks/events y chats. `chats?` por
+    # sí solo es aceptable porque las otras apps de chat del user
+    # (Slack, Messages) no están integradas al RAG todavía — en la
+    # práctica "chat" == WhatsApp en este setup.
+    ("whatsapp_pending", {}, r"whats.?app|\bwzp\b|\bwsp\b|\bchats?\b|mensajes?\s+sin|pendient|" + _PLANNING_PAT),
 )
 _TOOL_INTENT_COMPILED = tuple(
     (name, args, re.compile(pat, re.IGNORECASE)) for name, args, pat in _TOOL_INTENT_RULES
@@ -6574,15 +6577,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             # JID → deeplink al chat. Tres formas:
                             #   - `@s.whatsapp.net` = DM, phone en prefix
                             #     → `https://wa.me/<phone>` (web/app).
-                            #   - `@g.us` = grupo → no hay URL público,
-                            #     fallback a WhatsApp Web root.
+                            #   - `@g.us` = grupo → WhatsApp Web no
+                            #     tiene deeplink a grupos públicos,
+                            #     pero usamos un hash fragment con el
+                            #     jid para que cada grupo tenga un URL
+                            #     único (evita colapso en el dedup del
+                            #     frontend que usa `s.file` como key).
+                            #     El browser ignora el fragment al
+                            #     resolver, WA Web abre al inbox.
                             #   - `@lid` = participante sin resolver en
-                            #     grupo, también fallback.
+                            #     grupo, mismo tratamiento que grupo.
                             _phone = _jid.split("@")[0] if "@" in _jid else ""
                             if _jid.endswith("@s.whatsapp.net") and _phone.isdigit():
                                 _link = f"https://wa.me/{_phone}"
                             else:
-                                _link = "https://web.whatsapp.com/"
+                                _link = f"https://web.whatsapp.com/#{_jid}"
                             _wa_source_items.append({
                                 "file": _link,
                                 "note": _name,

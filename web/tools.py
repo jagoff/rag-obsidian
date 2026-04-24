@@ -33,7 +33,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 10 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 11 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -42,6 +42,7 @@ Routing por palabra clave (si aparece → llamá la tool):
 - evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
 - clima/tiempo/lluvia/temperatura/pronóstico → weather
 - google drive/drive/planilla/spreadsheet/sheet/doc/documento/presentación → drive_search(query='<keywords extraídos>'). Extraé los tokens útiles (nombres propios, sustantivos concretos) y descartá "busca", "decime", "en mi", "drive" — ej. "busca en mi drive qué me adeuda Alexis de la macbook pro" → drive_search(query='alexis macbook pro adeuda').
+- whatsapp/wzp/wsp/chat pendiente/respuesta pendiente → whatsapp_pending. Devuelve los chats donde el user debe responder. Usalo también en queries "qué tengo pendiente esta semana/hoy" — los chats pendientes cuentan como tarea pendiente semántica.
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
@@ -257,6 +258,35 @@ def drive_search(query: str, max_files: int = 5) -> str:
     return _agent_tool_drive_search(query, max_files=max_files)
 
 
+def whatsapp_pending(hours: int = 48, max_chats: int = 10) -> str:
+    """WhatsApp chats esperando respuesta del user — último inbound sin reply.
+
+    A diferencia de "mensajes sin leer" (que cuenta inbound recientes
+    aunque ya estén respondidos), esto devuelve sólo chats donde VOS
+    debés el próximo mensaje. Un chat con 20 inbound respondidos NO
+    aparece; uno con 1 inbound ignorado SÍ. Ventana configurable —
+    mensajes más viejos que `hours` se consideran abandonados.
+
+    Args:
+        hours: Cuán atrás mirar para decidir "stale". Default 48h
+            (2 días; fuera de eso dudoso que sea realmente pendiente).
+        max_chats: Máximo de chats a devolver (default 10).
+
+    Returns:
+        JSON lista `[{jid, name, last_snippet, hours_waiting}, ...]`
+        por orden descendente de timestamp del último mensaje. Error
+        o DB no disponible → `"[]"`.
+    """
+    try:
+        from web.server import _fetch_whatsapp_unreplied  # lazy: circular
+        h = max(1, min(168, int(hours)))
+        n = max(1, min(20, int(max_chats)))
+        result = _fetch_whatsapp_unreplied(hours=h, max_chats=n)
+        return json.dumps(result or [], ensure_ascii=False)
+    except Exception:
+        return "[]"
+
+
 # Chat-exposed tool wrappers for reminder/event creation. Real logic
 # lives in rag.py so the CLI rag chat loop can reuse it without the
 # web → rag → web circular import. These re-exports keep the ollama
@@ -276,6 +306,7 @@ CHAT_TOOLS: list[Callable] = [
     calendar_ahead,
     weather,
     drive_search,
+    whatsapp_pending,
     propose_reminder,
     propose_calendar_event,
 ]
@@ -289,6 +320,7 @@ PARALLEL_SAFE: set[str] = {
     "reminders_due",
     "gmail_recent",
     "drive_search",
+    "whatsapp_pending",
     "propose_reminder",
     "propose_calendar_event",
 }

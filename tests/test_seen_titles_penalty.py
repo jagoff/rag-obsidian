@@ -138,7 +138,17 @@ def test_retrieve_seen_title_match_is_case_insensitive(mocked_retrieve, monkeypa
 
 def test_retrieve_seen_title_penalty_noop_on_empty_list(mocked_retrieve, monkeypatch):
     """seen_titles=[] or None must be a pure no-op — callers can pass
-    their accumulated list unconditionally without worrying about edge cases."""
+    their accumulated list unconditionally without worrying about edge cases.
+
+    2026-04-24: el assert exacto con `==` era flaky porque el scoring
+    final incluye señales dependientes de time.time() (recency decay,
+    freshness weighting). Entre la call r1 y r3 pasan sub-ms de wall
+    time que afectan el 4to decimal del score. El intent del test es
+    "seen_titles no mueve la aguja", no "los 3 scores son bit-identical"
+    — usamos pytest.approx con tolerance 1e-3 que cubre sub-second
+    jitter sin permitir que un bug real de scoring escape.
+    """
+    import pytest as _pytest
     col = FakeCol([
         {"id": "a", "doc": "chunk A", "file": "notes/A.md", "note": "Alpha"},
     ])
@@ -153,5 +163,8 @@ def test_retrieve_seen_title_penalty_noop_on_empty_list(mocked_retrieve, monkeyp
     r2 = rag.retrieve(col, "q", k=1, folder=None, seen_titles=[])
     r3 = rag.retrieve(col, "q", k=1, folder=None, seen_titles=None)
 
-    # All three should produce identical scores — pass-through default.
-    assert r1["scores"][0] == r2["scores"][0] == r3["scores"][0]
+    # `seen_titles=[]` y `seen_titles=None` producen score equivalente al
+    # default. Tolerance 1e-3 cubre jitter sub-ms del recency decay;
+    # un penalty real de seen_titles sería >> 0.01.
+    assert r1["scores"][0] == _pytest.approx(r2["scores"][0], abs=1e-3)
+    assert r1["scores"][0] == _pytest.approx(r3["scores"][0], abs=1e-3)

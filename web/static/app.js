@@ -1296,10 +1296,149 @@ function appendCreatedChip(parent, payload) {
 }
 
 
+// Whatsapp-specific proposal card. Distinct from the reminder/event
+// variant because:
+//   1. Fields are different (contact_name + message_text + jid vs
+//      title + due/start).
+//   2. [Enviar] posts to /api/whatsapp/send (not /api/reminders|calendar/
+//      create), and the confirmation is stricter — a mis-send to a
+//      third party is NOT undoable (WhatsApp has no "delete sent").
+//   3. We show the message body as an editable textarea so the user
+//      can tweak before firing. Clicking [Editar] just focuses the
+//      textarea and switches [Enviar] from primary→confirm.
+//   4. If the contact couldn't be resolved (fields.error ==
+//      "not_found" | "no_phone" | "empty_query"), we surface the error
+//      inline and disable [Enviar] until the user clarifies.
+function appendWhatsAppProposal(parent, payload) {
+  const fields = payload.fields || {};
+  const proposalId = payload.proposal_id || "";
+  const err = fields.error || null;
+
+  const card = el("div", "proposal proposal-whatsapp");
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", "💬"));
+  head.appendChild(el("span", "proposal-kind", "Mensaje de WhatsApp"));
+  card.appendChild(head);
+
+  const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
+  const recipientLine = el("div", "proposal-title", `Para: ${recipientLabel}`);
+  card.appendChild(recipientLine);
+
+  // Editable textarea for the message body.
+  const textarea = document.createElement("textarea");
+  textarea.className = "proposal-wa-text";
+  textarea.rows = 3;
+  textarea.value = fields.message_text || "";
+  textarea.placeholder = "Texto del mensaje";
+  card.appendChild(textarea);
+
+  // Contact-lookup error surfaced inline.
+  if (err) {
+    const errMap = {
+      "not_found":   `No encontré a "${fields.contact_name}" en tus Contactos. Probá con el nombre completo.`,
+      "no_phone":    `El contacto "${fields.contact_name}" no tiene un número cargado en Contactos.`,
+      "empty_query": `El agente no detectó a quién mandarlo.`,
+    };
+    const msg = errMap[err] || `No se pudo resolver el destinatario: ${err}`;
+    card.appendChild(el("div", "proposal-warn", `⚠ ${msg}`));
+  }
+
+  const actions = el("div", "proposal-actions");
+  const sendBtn = document.createElement("button");
+  sendBtn.type = "button";
+  sendBtn.className = "proposal-btn proposal-btn-create";
+  sendBtn.textContent = "✈ Enviar";
+  sendBtn.disabled = !!err || !fields.jid;
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "proposal-btn proposal-btn-cancel";
+  cancelBtn.textContent = "✗ Descartar";
+
+  const status = el("span", "proposal-status", "");
+  actions.appendChild(sendBtn);
+  actions.appendChild(cancelBtn);
+  actions.appendChild(status);
+  card.appendChild(actions);
+
+  cancelBtn.addEventListener("click", () => {
+    if (card.dataset.resolved) return;
+    card.dataset.resolved = "cancelled";
+    sendBtn.disabled = true;
+    cancelBtn.disabled = true;
+    textarea.disabled = true;
+    status.textContent = "  descartada";
+    status.classList.add("cancelled");
+    card.classList.add("dimmed");
+  });
+
+  sendBtn.addEventListener("click", async () => {
+    if (card.dataset.resolved) return;
+    const body = textarea.value.trim();
+    if (!body) {
+      status.textContent = "  mensaje vacío";
+      status.classList.add("err");
+      return;
+    }
+    if (!fields.jid) {
+      status.textContent = "  destinatario no resuelto";
+      status.classList.add("err");
+      return;
+    }
+    card.dataset.resolved = "sending";
+    sendBtn.disabled = true;
+    cancelBtn.disabled = true;
+    textarea.disabled = true;
+    status.textContent = "  enviando…";
+    status.classList.remove("ok", "err");
+
+    try {
+      const res = await fetch("/api/whatsapp/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jid: fields.jid,
+          message_text: body,
+          proposal_id: proposalId,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      card.dataset.resolved = "sent";
+      status.textContent = `  ✓ enviado a ${recipientLabel}`;
+      status.classList.add("ok");
+      card.classList.add("created");
+      showToast(`✓ Mensaje enviado a ${recipientLabel}`, "ok");
+    } catch (err) {
+      delete card.dataset.resolved;
+      sendBtn.disabled = false;
+      cancelBtn.disabled = false;
+      textarea.disabled = false;
+      status.textContent = `  error: ${err.message}`;
+      status.classList.add("err");
+      showToast(`✗ No se pudo enviar: ${err.message}`, "err");
+    }
+  });
+
+  parent.appendChild(card);
+  return card;
+}
+
+
 function appendProposal(parent, payload) {
-  const kind = payload.kind;                    // "reminder" | "event"
+  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message"
   const fields = payload.fields || {};
   const needsClarif = payload.needs_clarification === true;
+
+  // whatsapp_message uses its own renderer — different fields (jid,
+  // contact_name, message_text), different actions (Enviar / Editar /
+  // Cancelar), different endpoint (/api/whatsapp/send).
+  if (kind === "whatsapp_message") {
+    return appendWhatsAppProposal(parent, payload);
+  }
 
   const card = el("div", `proposal proposal-${kind}`);
 

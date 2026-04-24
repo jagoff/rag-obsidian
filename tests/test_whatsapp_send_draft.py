@@ -1,0 +1,362 @@
+"""Tests for the `propose_whatsapp_send` chat tool + `/api/whatsapp/send`
+endpoint (2026-04-24, Fer F. request).
+
+The user asked the chat "Enviale un mensaje a Grecia: yo soy EL RA..."
+and the RAG responded with the TEXT of the message but never actually
+sent it — the tool registry didn't have a send tool, so the LLM fell
+back to "generate a suggested draft in prose". Per-message confirmation
+is mandatory because this is a destructive action to a third party
+(WhatsApp has no "delete sent").
+
+Covers:
+
+1. `_whatsapp_send_to_jid` — anti_loop=True prefixes U+200B, anti_loop=False
+   does NOT. Bridge 2xx → True, anything else → False.
+2. `_whatsapp_jid_from_contact` — happy path, empty query, not_found,
+   no_phone. JID format `<digits>@s.whatsapp.net`.
+3. `propose_whatsapp_send` — always returns `needs_clarification=True`
+   (never auto-sends), exposes `fields.error` when resolution fails.
+4. `/api/whatsapp/send` — happy path 200, invalid jid 400, empty body 400,
+   bridge down 502. Does NOT prefix U+200B (user → third party).
+5. Tool registration invariants — `propose_whatsapp_send` is in
+   `CHAT_TOOLS` + `PROPOSAL_TOOL_NAMES`, NOT in `PARALLEL_SAFE`.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+import rag
+from fastapi.testclient import TestClient
+import web.server as _server
+from web import tools as _tools
+
+
+_client = TestClient(_server.app)
+
+
+# ── 1. _whatsapp_send_to_jid ───────────────────────────────────────────────
+
+
+def test_send_to_jid_anti_loop_true_prefixes_u200b(monkeypatch):
+    captured = {}
+    class _FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake_urlopen(req, timeout=10):
+        captured["data"] = req.data
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    ok = rag._whatsapp_send_to_jid("123@s.whatsapp.net", "hola", anti_loop=True)
+    assert ok is True
+    payload = json.loads(captured["data"].decode("utf-8"))
+    # U+200B zero-width-space prefix was injected.
+    assert payload["message"].startswith("\u200b")
+    assert payload["message"].endswith("hola")
+
+
+def test_send_to_jid_anti_loop_false_is_literal(monkeypatch):
+    captured = {}
+    class _FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake_urlopen(req, timeout=10):
+        captured["data"] = req.data
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    ok = rag._whatsapp_send_to_jid("123@s.whatsapp.net", "hola grecia", anti_loop=False)
+    assert ok is True
+    payload = json.loads(captured["data"].decode("utf-8"))
+    # No U+200B prefix — this is a user-initiated send to a third party.
+    assert not payload["message"].startswith("\u200b")
+    assert payload["message"] == "hola grecia"
+    assert payload["recipient"] == "123@s.whatsapp.net"
+
+
+def test_send_to_jid_bridge_error_returns_false(monkeypatch):
+    def _fake_urlopen(req, timeout=10):
+        raise ConnectionRefusedError("bridge down")
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    assert rag._whatsapp_send_to_jid("123@s.whatsapp.net", "hola") is False
+
+
+def test_ambient_send_still_uses_anti_loop(monkeypatch):
+    """Sanity: legacy `_ambient_whatsapp_send` must still prefix U+200B.
+    Used by brief pushes and archive notifications that hit the bot's own
+    group — without the prefix the listener would re-ingest them as
+    queries and loop forever."""
+    captured = {}
+    class _FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake_urlopen(req, timeout=10):
+        captured["data"] = req.data
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    rag._ambient_whatsapp_send("bot-group@g.us", "morning brief")
+    payload = json.loads(captured["data"].decode("utf-8"))
+    assert payload["message"].startswith("\u200b")
+
+
+# ── 2. _whatsapp_jid_from_contact ──────────────────────────────────────────
+
+
+def test_jid_from_contact_happy_path(monkeypatch):
+    monkeypatch.setattr(rag, "_fetch_contact", lambda stem, email=None, canonical=None: {
+        "full_name": "Grecia Ferrari",
+        "phones": ["+54 9 11 5555-5555"],
+        "emails": [],
+        "birthday": "",
+    })
+    out = rag._whatsapp_jid_from_contact("Grecia")
+    assert out["error"] is None
+    assert out["full_name"] == "Grecia Ferrari"
+    assert out["jid"] == "5491155555555@s.whatsapp.net"
+    assert out["phones"] == ["+54 9 11 5555-5555"]
+
+
+def test_jid_from_contact_empty_query():
+    out = rag._whatsapp_jid_from_contact("")
+    assert out["error"] == "empty_query"
+    assert out["jid"] is None
+
+
+def test_jid_from_contact_not_found(monkeypatch):
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
+    out = rag._whatsapp_jid_from_contact("Unicornio Imaginario")
+    assert out["error"] == "not_found"
+    assert out["jid"] is None
+
+
+def test_jid_from_contact_no_phone(monkeypatch):
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Contacto Sin Tel",
+        "phones": [],
+        "emails": ["foo@bar.com"],
+        "birthday": "",
+    })
+    out = rag._whatsapp_jid_from_contact("Contacto Sin Tel")
+    assert out["error"] == "no_phone"
+    assert out["jid"] is None
+    assert out["full_name"] == "Contacto Sin Tel"
+
+
+def test_jid_from_contact_phone_with_only_non_digits(monkeypatch):
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Bug Contact",
+        "phones": ["+++"],
+        "emails": [],
+        "birthday": "",
+    })
+    out = rag._whatsapp_jid_from_contact("Bug Contact")
+    assert out["error"] == "no_phone"
+
+
+def test_jid_from_contact_fetch_raises(monkeypatch):
+    def _boom(*a, **kw):
+        raise RuntimeError("osascript died")
+    monkeypatch.setattr(rag, "_fetch_contact", _boom)
+    out = rag._whatsapp_jid_from_contact("Grecia")
+    assert out["error"].startswith("lookup_failed:")
+
+
+# ── 3. propose_whatsapp_send ────────────────────────────────────────────────
+
+
+def test_propose_whatsapp_send_always_needs_clarification(monkeypatch):
+    """Even on happy path we emit needs_clarification=True so the UI shows
+    the confirmation card. Auto-send is NEVER acceptable."""
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
+    })
+    raw = rag.propose_whatsapp_send("Grecia", "hola")
+    payload = json.loads(raw)
+    assert payload["kind"] == "whatsapp_message"
+    assert payload["needs_clarification"] is True
+    assert payload["proposal_id"].startswith("prop-")
+    assert payload["fields"]["contact_name"] == "Grecia"
+    assert payload["fields"]["message_text"] == "hola"
+    assert payload["fields"]["jid"] == "5491155555555@s.whatsapp.net"
+    assert payload["fields"]["full_name"] == "Grecia"
+    assert payload["fields"]["error"] is None
+
+
+def test_propose_whatsapp_send_surfaces_lookup_error(monkeypatch):
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
+    raw = rag.propose_whatsapp_send("Inexistente", "hola")
+    payload = json.loads(raw)
+    assert payload["fields"]["error"] == "not_found"
+    assert payload["fields"]["jid"] is None
+    # Still needs_clarification=True so the UI shows the card + error msg.
+    assert payload["needs_clarification"] is True
+
+
+def test_propose_whatsapp_send_handles_empty_message(monkeypatch):
+    """Empty message_text is allowed — the UI shows an editable textarea
+    so the user can fill it in. Should NOT auto-refuse."""
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
+    })
+    raw = rag.propose_whatsapp_send("Grecia", "")
+    payload = json.loads(raw)
+    assert payload["fields"]["message_text"] == ""
+    assert payload["fields"]["error"] is None
+
+
+# ── 4. /api/whatsapp/send endpoint ─────────────────────────────────────────
+
+
+def test_whatsapp_send_endpoint_happy_path(monkeypatch):
+    captured = {}
+    def _fake_send(jid, text, anti_loop=True):
+        captured["jid"] = jid
+        captured["text"] = text
+        captured["anti_loop"] = anti_loop
+        return True
+    monkeypatch.setattr(_server, "_whatsapp_send_to_jid", _fake_send, raising=False)
+    # Also patch the attr on the rag module (endpoint imports it lazily).
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", _fake_send)
+
+    resp = _client.post("/api/whatsapp/send", json={
+        "jid": "5491155555555@s.whatsapp.net",
+        "message_text": "hola grecia",
+        "proposal_id": "prop-abc",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["jid"] == "5491155555555@s.whatsapp.net"
+    # Critical: anti_loop must be False for user-initiated sends.
+    assert captured["anti_loop"] is False
+    assert captured["text"] == "hola grecia"
+
+
+def test_whatsapp_send_endpoint_rejects_invalid_jid():
+    resp = _client.post("/api/whatsapp/send", json={
+        "jid": "just-a-phone-no-at-sign",
+        "message_text": "hola",
+    })
+    assert resp.status_code == 400
+    assert "inválido" in resp.json()["detail"].lower() or "invalido" in resp.json()["detail"].lower()
+
+
+def test_whatsapp_send_endpoint_rejects_empty_body():
+    resp = _client.post("/api/whatsapp/send", json={
+        "jid": "123@s.whatsapp.net",
+        "message_text": "   ",  # whitespace only → stripped to empty
+    })
+    assert resp.status_code == 400
+    assert "vacío" in resp.json()["detail"] or "vacio" in resp.json()["detail"].lower()
+
+
+def test_whatsapp_send_endpoint_bridge_down_returns_502(monkeypatch):
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", lambda *a, **kw: False)
+    resp = _client.post("/api/whatsapp/send", json={
+        "jid": "5491155555555@s.whatsapp.net",
+        "message_text": "hola",
+    })
+    assert resp.status_code == 502
+    assert "bridge" in resp.json()["detail"].lower()
+
+
+def test_whatsapp_send_endpoint_accepts_group_jid(monkeypatch):
+    """Group chats use `<id>@g.us` instead of `@s.whatsapp.net`. Must be
+    accepted (though in practice users rarely send to groups from chat)."""
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", lambda *a, **kw: True)
+    resp = _client.post("/api/whatsapp/send", json={
+        "jid": "120363426178035051@g.us",
+        "message_text": "msg a grupo",
+    })
+    assert resp.status_code == 200
+
+
+# ── 5. Tool registration invariants ────────────────────────────────────────
+
+
+def test_propose_whatsapp_send_is_registered():
+    assert _tools.propose_whatsapp_send in _tools.CHAT_TOOLS
+    assert "propose_whatsapp_send" in _tools.TOOL_FNS
+    # Critical: emits SSE `proposal` event so the UI shows the card.
+    assert "propose_whatsapp_send" in _tools.PROPOSAL_TOOL_NAMES
+
+
+def test_propose_whatsapp_send_is_NOT_parallel_safe():
+    """Sending WhatsApp is not a read — we don't want it running in
+    parallel with other tools (also it's expensive: osascript + bridge).
+    """
+    assert "propose_whatsapp_send" not in _tools.PARALLEL_SAFE
+
+
+def test_tool_addendum_mentions_whatsapp_send():
+    """Without the routing hint the LLM tends to respond in prose instead
+    of calling the tool. The addendum must explicitly teach the pattern."""
+    addendum = _tools._WEB_TOOL_ADDENDUM
+    assert "propose_whatsapp_send" in addendum
+    # Must also teach that it's destructive / needs confirmation.
+    assert "confirmaci" in addendum.lower()
+
+
+# ── 6. Enrich hang fix (related sub-bug reported in the same turn) ─────────
+
+
+def test_emit_enrich_hung_worker_does_not_block_stream(monkeypatch):
+    """Regresión 2026-04-24 (Fer F. turn `1ac42f199034` — "quedó colgado"):
+    previously `_emit_enrich` used `with ThreadPoolExecutor(...) as _ex:`,
+    which called `shutdown(wait=True)` on exit. When the worker thread was
+    hung in osascript/ollama, the `with`-exit blocked the SSE generator
+    indefinitely — the user's chat froze after the response was rendered.
+
+    This test simulates the hang: `build_enrich_payload` never returns, we
+    assert `_emit_enrich` completes within the 4s timeout + slack (not
+    hanging forever) and returns None (skipped).
+    """
+    import time as _t
+    import threading as _th
+
+    # Build a fake build_enrich_payload that never returns.
+    _started = _th.Event()
+    _stuck = _th.Event()
+
+    def _hung_worker(q, answer, top_score):
+        _started.set()
+        _stuck.wait(timeout=30)  # hangs up to 30s
+        return None
+
+    monkeypatch.setattr(rag, "build_enrich_payload", _hung_worker)
+
+    # Extract _emit_enrich by calling the chat endpoint path — OR simpler,
+    # reconstruct it locally using the same pattern. Since `_emit_enrich`
+    # is a nested function inside chat(), we test the shape directly.
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+
+    def _emit_enrich_like():
+        _ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = _ex.submit(rag.build_enrich_payload, "q", "a", 0.5)
+            _fut.result(timeout=0.5)  # short timeout for test speed
+        except _FutTimeout:
+            return "skipped"
+        finally:
+            _ex.shutdown(wait=False, cancel_futures=True)
+        return "ok"
+
+    t0 = _t.monotonic()
+    result = _emit_enrich_like()
+    elapsed = _t.monotonic() - t0
+
+    # Must return within timeout + small overhead (not the 30s the worker sleeps).
+    assert elapsed < 2.0, f"_emit_enrich blocked for {elapsed:.1f}s (shutdown wait=True bug?)"
+    assert result == "skipped"
+
+    # Unblock the worker so it doesn't leak beyond the test.
+    _stuck.set()

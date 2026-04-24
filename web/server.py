@@ -2183,6 +2183,64 @@ def delete_calendar_event(req: CalendarDeleteRequest) -> dict:
     return {"ok": True, "message": msg}
 
 
+class WhatsAppSendRequest(BaseModel):
+    jid: str                      # e.g. "5491234567890@s.whatsapp.net"
+    message_text: str             # literal message body (no anti-loop prefix)
+    proposal_id: str | None = None  # for audit — id of the draft the UI confirmed
+
+
+@app.post("/api/whatsapp/send")
+def whatsapp_send(req: WhatsAppSendRequest) -> dict:
+    """Execute a WhatsApp send after the user clicked [Enviar] on a
+    ``propose_whatsapp_send`` proposal card in the chat UI.
+
+    Flow:
+      1. `propose_whatsapp_send` (chat tool) resolves contact → JID and
+         emits an SSE `proposal` event with ``kind="whatsapp_message"``.
+      2. The UI renders a card with the drafted text and [Enviar] /
+         [Editar] / [Cancelar] buttons.
+      3. On [Enviar] the UI POSTs to this endpoint with `{jid,
+         message_text, proposal_id}`. We call `_whatsapp_send_to_jid`
+         with ``anti_loop=False`` so the zero-width space prefix (used
+         for bot-to-self traffic) doesn't leak to a third-party's
+         WhatsApp.
+
+    Returns ``{ok: true, jid}`` on success, raises 400/502 on bridge
+    unreachable or 4xx/5xx. Rate-limited by the same IP bucket as
+    ``/api/chat`` because a tight loop from a compromised client could
+    spam arbitrary contacts.
+    """
+    jid = (req.jid or "").strip()
+    body = (req.message_text or "").strip()
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid inválido (debe ser '<digits>@s.whatsapp.net' o '<id>@g.us')")
+    if not body:
+        raise HTTPException(status_code=400, detail="message_text vacío")
+    from rag import _whatsapp_send_to_jid  # noqa: PLC0415
+    ok = _whatsapp_send_to_jid(jid, body, anti_loop=False)
+    if not ok:
+        # Can't distinguish "bridge down" from "bridge rejected" cheaply
+        # — the helper swallows the HTTP code. Return 502 (bad gateway)
+        # to signal an upstream issue vs 400 (client-side) for shape
+        # problems caught above.
+        raise HTTPException(status_code=502, detail="bridge WhatsApp no respondió (localhost:8080 no disponible o rechazó el mensaje)")
+    # Log minimal audit trail — we don't persist the message body for
+    # privacy, just the event + jid + proposal_id so we can correlate
+    # with the chat transcript later if needed.
+    try:
+        import rag as _rag  # noqa: PLC0415
+        _rag._ambient_log_event({
+            "cmd": "whatsapp_user_send",
+            "jid": jid,
+            "len": len(body),
+            "proposal_id": req.proposal_id or "",
+            "sent": True,
+        })
+    except Exception:
+        pass
+    return {"ok": True, "jid": jid}
+
+
 @app.get("/api/model")
 def get_chat_model() -> dict:
     """Return the chat model that /api/chat would use right now."""
@@ -5236,14 +5294,30 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         """Yield an `enrich` SSE event with cross-source signals (WA/Calendar/
         Reminders). 4s wall budget enforced via ThreadPoolExecutor.
         Soft-fail per source — never raises into the stream.
+
+        Bug 2026-04-24 (Fer F. "quedó colgado"): previously used
+        ``with ThreadPoolExecutor(max_workers=1) as _ex:``. When the inner
+        ``.result(timeout=4.0)`` raised ``TimeoutError``, the exception
+        propagated up and Python ran the ``__exit__`` of the context
+        manager before reaching our except block. ``__exit__`` calls
+        ``shutdown(wait=True)`` by default, which **waits for the still-
+        running thread to finish**. If the thread was hung in osascript
+        or ollama.chat (no timeout on those calls), the SSE generator
+        blocked indefinitely — no ``[enrich] skipped`` log, no stream
+        close, user sees a frozen chat.
+
+        Fix: explicit submit + `shutdown(wait=False, cancel_futures=True)`
+        in finally. The daemon worker thread may keep running briefly,
+        but the SSE stream is released immediately. We don't need the
+        result anyway once we've decided to skip.
         """
         print(f"[enrich] start turn={turn_id} top_score={top_score} answer_len={len(answer or '')}", flush=True)
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+        _ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"enrich-{turn_id[:8]}")
         try:
             from rag import build_enrich_payload
-            with ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(build_enrich_payload, q, answer, top_score)
-                _enrich = _fut.result(timeout=4.0)
+            _fut = _ex.submit(build_enrich_payload, q, answer, top_score)
+            _enrich = _fut.result(timeout=4.0)
             if _enrich:
                 print(f"[enrich] hit lines={len(_enrich.get('lines', []))}", flush=True)
                 return _sse("enrich", {"turn_id": turn_id, **_enrich})
@@ -5252,6 +5326,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             print("[enrich] skipped: 4s budget exceeded", flush=True)
         except Exception as exc:
             print(f"[enrich] skipped: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            # Non-blocking shutdown: don't wait for a hung worker. Any
+            # pending futures get cancelled; futures already running keep
+            # going until they naturally finish (in a daemon thread — they
+            # won't block process exit).
+            _ex.shutdown(wait=False, cancel_futures=True)
         return None
 
     def _emit_grounding(turn_id: str, full: str, docs: list, metas: list, question: str) -> str | None:

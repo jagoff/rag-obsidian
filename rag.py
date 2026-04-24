@@ -18920,10 +18920,28 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
     filtra mensajes que arrancan con U+200B (anti-loop) — se prefixa
     acá para evitar que nuestro propio output se procese como query.
     """
+    return _whatsapp_send_to_jid(jid, text, anti_loop=True)
+
+
+def _whatsapp_send_to_jid(jid: str, text: str, *, anti_loop: bool = True) -> bool:
+    """Low-level POST al bridge local. Dos modos:
+
+    - ``anti_loop=True`` (default, usado por ``_ambient_whatsapp_send``):
+      prefixa U+200B para que el listener del bot RAG ignore el mensaje
+      como query entrante. Necesario cuando el bot se manda cosas a su
+      propio grupo (briefs matutinos, archive pushes, etc.).
+    - ``anti_loop=False``: texto literal. Usalo cuando el destinatario
+      es un contacto tercero (mensajes iniciados desde el chat del user
+      vía ``propose_whatsapp_send``), porque el prefix se vería como un
+      char raro en el WhatsApp del contacto.
+
+    Retorna True en 2xx del bridge, False en cualquier otra cosa
+    (unreachable, 4xx, 5xx, timeout 10s).
+    """
     import urllib.request
-    payload_text = _AMBIENT_ANTILOOP_MARKER + text if not text.startswith(
-        _AMBIENT_ANTILOOP_MARKER
-    ) else text
+    payload_text = text
+    if anti_loop and not text.startswith(_AMBIENT_ANTILOOP_MARKER):
+        payload_text = _AMBIENT_ANTILOOP_MARKER + text
     data = json.dumps({
         "recipient": jid,
         "message": payload_text,
@@ -18937,6 +18955,96 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
             return 200 <= resp.status < 300
     except Exception:
         return False
+
+
+def _whatsapp_jid_from_contact(contact_name: str) -> dict:
+    """Resolve a contact name ("Grecia", "Oscar (Tela mosquitera)") to a
+    WhatsApp JID by looking up the user's Apple Contacts DB.
+
+    Returns::
+
+        {"jid": "5491234567890@s.whatsapp.net",
+         "full_name": "Grecia Ferrari",
+         "phones": ["+54 9 11 ..."],
+         "error": None}
+
+    or on failure::
+
+        {"jid": None, "full_name": None, "phones": [],
+         "error": "not_found" | "no_phone" | "empty_query"}
+
+    Single-match only. Apple Contacts doesn't give us a trivial way to
+    distinguish between a single homonym and multiple matches from a
+    first-name predicate, so we rely on the user providing enough
+    disambiguation in ``contact_name`` (full name or the custom-label
+    part in parens). On ambiguity the helper returns ``error="not_found"``
+    so the chat can ask the user to be more specific.
+    """
+    query = (contact_name or "").strip()
+    if not query:
+        return {"jid": None, "full_name": None, "phones": [], "error": "empty_query"}
+    # Reuse the existing osascript-backed contact lookup. Passes `query`
+    # as the stem — _fetch_contact will try canonical match, first name,
+    # and finally the raw stem against Contacts.app.
+    try:
+        contact = _fetch_contact(query, email=None, canonical=query)
+    except Exception as exc:
+        return {"jid": None, "full_name": None, "phones": [],
+                "error": f"lookup_failed: {str(exc)[:80]}"}
+    if not contact:
+        return {"jid": None, "full_name": None, "phones": [], "error": "not_found"}
+    phones = list(contact.get("phones") or [])
+    if not phones:
+        return {"jid": None, "full_name": contact.get("full_name"), "phones": [],
+                "error": "no_phone"}
+    digits = re.sub(r"\D+", "", phones[0])
+    if not digits:
+        return {"jid": None, "full_name": contact.get("full_name"),
+                "phones": phones, "error": "no_phone"}
+    return {
+        "jid": f"{digits}@s.whatsapp.net",
+        "full_name": contact.get("full_name") or query,
+        "phones": phones,
+        "error": None,
+    }
+
+
+def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
+    """Draft a WhatsApp message for confirmation. DOES NOT send.
+
+    Siempre devuelve una proposal card ``needs_clarification=True`` (aun
+    cuando resolvimos todo OK) para que la UI muestre [Enviar] / [Editar]
+    / [Cancelar] y el user confirme explícitamente. Mandarle algo a un
+    tercero es acción destructiva — nunca auto-disparar.
+
+    Args:
+        contact_name: Nombre del destinatario tal como aparece en
+            Contacts ("Grecia", "Oscar (Tela mosquitera)"). Se resuelve
+            a JID vía Apple Contacts.
+        message_text: Texto literal del mensaje a mandar.
+
+    Returns:
+        JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
+        fields: {contact_name, message_text, jid?, full_name?, error?}}``.
+        Si la resolución del contacto falla (no existe, sin phone, query
+        vacía), la card aparece igual pero con ``fields.error`` seteado
+        para que la UI muestre el problema y el user pueda editar el
+        destinatario.
+    """
+    lookup = _whatsapp_jid_from_contact(contact_name)
+    fields = {
+        "contact_name": contact_name,
+        "message_text": message_text or "",
+        "jid": lookup["jid"],
+        "full_name": lookup["full_name"],
+        "error": lookup["error"],
+    }
+    return json.dumps({
+        "kind": "whatsapp_message",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": fields,
+    }, ensure_ascii=False)
 
 
 def _brief_push_to_whatsapp(

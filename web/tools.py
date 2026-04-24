@@ -33,7 +33,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 11 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 12 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -54,6 +54,12 @@ Crear cosas nuevas (se agregan automáticamente, el usuario puede deshacer):
 - Si la fecha/hora parsea clara, el tool CREA de una (el usuario ve un toast con Deshacer por 10s). Si es ambigua, el tool devuelve una propuesta y el usuario aclara desde una tarjeta.
 - No vuelvas a llamar el tool si ya lo hiciste esta ronda.
 - En tu respuesta textual después de llamar el tool: SÉ CONCISO (1-2 oraciones). Decí algo tipo "Listo, quedó agendado" o "Ahí te lo sumo, avisame si hay que cambiar algo". No repitas todos los campos — el usuario ya los ve en el toast / tarjeta.
+
+Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
+- "enviale / mandale un mensaje a <Contacto> que diga: <texto>" / "decile a <Contacto>: <texto>" / "escribile a <Contacto>: <texto>" → propose_whatsapp_send(contact_name="<Contacto>", message_text="<texto literal>").
+- El tool NO envía: devuelve una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
+- Si el contacto no se resuelve (el tool devuelve `error: not_found` o `no_phone`), avisale al user que no encontraste a la persona en sus Contactos y sugerile que pase el nombre completo o el teléfono.
+- En tu respuesta textual: "Te dejo el mensaje armado para <Nombre>, revisalo y tocá Enviar si está ok." (1-2 oraciones, que quede claro que NO se envió todavía). NO repitas el texto del mensaje — la card ya lo muestra.
 
 Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/calendar/reminders/weather) van en PROSA, sin markdown links.
 
@@ -294,6 +300,7 @@ def whatsapp_pending(hours: int = 48, max_chats: int = 10) -> str:
 from rag import (  # noqa: E402
     propose_reminder,
     propose_calendar_event,
+    propose_whatsapp_send,
 )
 
 
@@ -309,6 +316,7 @@ CHAT_TOOLS: list[Callable] = [
     whatsapp_pending,
     propose_reminder,
     propose_calendar_event,
+    propose_whatsapp_send,
 ]
 
 TOOL_FNS: dict[str, Callable] = {fn.__name__: fn for fn in CHAT_TOOLS}
@@ -323,6 +331,12 @@ PARALLEL_SAFE: set[str] = {
     "whatsapp_pending",
     "propose_reminder",
     "propose_calendar_event",
+    # `propose_whatsapp_send` intencionalmente NO está acá: aunque el tool
+    # NO envía (solo drafts), el contact-lookup via osascript es side-
+    # effectful (2-3s de latencia) y ejecutarlo en paralelo con otros
+    # tools complica el debugging si hay un hang del bridge. Además la
+    # semántica de "enviar mensaje" debería correrse aislada — el user
+    # espera UN draft por turno, no varios en paralelo.
 }
 
 # Tool names whose return value (JSON string) should ALSO be emitted as a
@@ -332,4 +346,5 @@ PARALLEL_SAFE: set[str] = {
 PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_reminder",
     "propose_calendar_event",
+    "propose_whatsapp_send",
 }

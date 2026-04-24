@@ -1989,6 +1989,40 @@ kbd {
 .proposal-status.err { color: var(--red); }
 .proposal-status.cancelled { color: var(--text-faint); font-style: italic; }
 
+/* WhatsApp proposal card — editable textarea for the drafted message.
+ * Distinct from the reminder/event variants because the user is much
+ * more likely to want to tweak wording before firing a third-party
+ * message. Monospace-ish (same font as .input composer) so it feels
+ * like typing, not like reading a result. */
+.proposal-wa-text {
+  width: 100%;
+  min-height: 54px;
+  padding: 8px 10px;
+  margin: 2px 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  resize: vertical;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.proposal-wa-text:focus {
+  outline: none;
+  border-color: var(--green);
+}
+.proposal-wa-text:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.proposal-whatsapp .proposal-btn-create {
+  /* emphasize the send button a tad since it's not undoable — subtle
+     solid fill vs. the reminder/event border-only style */
+  background: rgba(126, 231, 135, 0.08);
+}
+
 /* ── Created chips (inline confirmation after auto-create) ────────────
  * Styled to match the existing ╌ fuentes rule-line aesthetic. Appears
  * below the rag response; scrolls with the chat. Reminders include an

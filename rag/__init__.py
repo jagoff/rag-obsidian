@@ -5531,6 +5531,80 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_home_compute_metrics(ts)",
         ),
     ),
+    (
+        # Voice classifier — bloque B del feature voice-classifier
+        # (spec en system/voice-classifier/spec.md). Una fila por cada
+        # decisión del classifier de audios reenviados a RagNet:
+        # transcript original, bucket que el LLM eligió, bucket que
+        # finalmente se ejecutó (si el user confirmó / rebuckeó), embedding
+        # bge-m3 para retrieval por similaridad (Layer 2). UNIQUE (message_id,
+        # chat_jid) para idempotencia: re-procesar el mismo audio (restart
+        # del listener, etc) no duplica filas.
+        #
+        # `embedding` es BLOB simple (no vec0) — _ragvec_state_conn() no
+        # carga sqlite-vec por diseño, y el volumen esperado (<1k filas /
+        # 90 días) hace que brute-force cosine en Python sea sub-ms.
+        # Mover a vec0 si crece el volumen.
+        "rag_routing_decisions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_routing_decisions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts INTEGER NOT NULL,"
+            " chat_jid TEXT NOT NULL,"
+            " message_id TEXT NOT NULL,"
+            " transcript TEXT NOT NULL,"
+            " transcript_hash TEXT NOT NULL,"
+            " bucket_llm TEXT NOT NULL,"
+            " reason_llm TEXT,"
+            " confidence_llm TEXT,"
+            " extracted_json TEXT NOT NULL,"
+            " raw_llm_json TEXT,"
+            " bucket_final TEXT,"
+            " user_response TEXT,"
+            " executed_at INTEGER,"
+            " execution_ok INTEGER,"
+            " execution_error TEXT,"
+            " embedding BLOB,"
+            " llm_latency_ms INTEGER,"
+            " UNIQUE(message_id, chat_jid)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_routing_ts ON rag_routing_decisions(ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_routing_bucket_final "
+            "ON rag_routing_decisions(bucket_final, ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_routing_chat "
+            "ON rag_routing_decisions(chat_jid, ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_routing_hash "
+            "ON rag_routing_decisions(transcript_hash)",
+        ),
+    ),
+    (
+        # Reglas heurísticas aprendidas del histórico de
+        # `rag_routing_decisions`. Promovidas por `rag_routing_learning.
+        # promote.upsert_rule()` cuando un n-gram tiene ratio ≥0.90 sobre
+        # ≥5 evidencias. El listener relee esta tabla cada 1h e inyecta el
+        # bloque "REGLAS APRENDIDAS" al sysprompt del classifier.
+        #
+        # `active` se flippea sin borrar — preserva trail de "esta regla
+        # estuvo activa pero la apagamos". UNIQUE (pattern, bucket) — la
+        # misma frase puede tener distintas reglas para distintos buckets
+        # (raro pero posible si el patrón es ambiguo).
+        "rag_routing_rules",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_routing_rules ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " pattern TEXT NOT NULL,"
+            " bucket TEXT NOT NULL,"
+            " evidence_count INTEGER NOT NULL,"
+            " evidence_ratio REAL NOT NULL,"
+            " promoted_at INTEGER NOT NULL,"
+            " active INTEGER NOT NULL DEFAULT 1,"
+            " notes TEXT,"
+            " UNIQUE(pattern, bucket)"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_routing_rules_active "
+            "ON rag_routing_rules(active, bucket)",
+        ),
+    ),
 )
 
 
@@ -25255,6 +25329,271 @@ def ignore_clear():
     """Limpia toda la ignore list."""
     save_ignored_paths(set())
     console.print("[green]✓[/green] ignore list vacía")
+
+
+# ── voice routing classifier — bloque B del feature voice-classifier ──────
+# spec: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
+#       04-Archive/99-obsidian-system/99-Claude/system/voice-classifier/spec.md
+# Tabla rag_routing_decisions (logged por el listener TS) +
+# rag_routing_rules (extraídas por este CLI). El extract_rules cron las
+# promueve diario a las 3:30 AM, este grupo permite review/audit manual.
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def routing(ctx: click.Context):
+    """Auditar / mantener las reglas aprendidas del voice-classifier.
+
+    Subcomandos:
+      rag routing stats          # Métricas: % auto-ruteado, distribución
+      rag routing recent [N]     # Últimas N decisiones del classifier
+      rag routing list-rules     # Reglas activas (las que el listener inyecta)
+      rag routing extract-rules  # Forzar extracción de patrones del histórico
+      rag routing review         # Aprobar/rechazar reglas candidatas
+      rag routing disable-rule <id>  # Desactivar una regla mala
+    """
+    if ctx.invoked_subcommand is None:
+        # Default: mostrar las reglas activas (lo más útil sin tipear más).
+        ctx.invoke(routing_list_rules)
+
+
+@routing.command("stats")
+def routing_stats():
+    """Métricas de uso del classifier sobre los últimos 30 días."""
+    import sqlite3 as _sqlite3
+    try:
+        with _ragvec_state_conn() as conn:
+            cutoff = int(time.time()) - 30 * 86400
+            total = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions WHERE ts >= ?",
+                (cutoff,),
+            ).fetchone()[0]
+            confirmed = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions "
+                "WHERE ts >= ? AND user_response = 'si'",
+                (cutoff,),
+            ).fetchone()[0]
+            rebucketed = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions "
+                "WHERE ts >= ? AND user_response LIKE '/%'",
+                (cutoff,),
+            ).fetchone()[0]
+            rejected = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions "
+                "WHERE ts >= ? AND user_response = 'no'",
+                (cutoff,),
+            ).fetchone()[0]
+            failed = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions "
+                "WHERE ts >= ? AND bucket_llm = '_failed'",
+                (cutoff,),
+            ).fetchone()[0]
+            by_bucket = conn.execute(
+                "SELECT bucket_llm, COUNT(*) FROM rag_routing_decisions "
+                "WHERE ts >= ? GROUP BY bucket_llm ORDER BY 2 DESC",
+                (cutoff,),
+            ).fetchall()
+            avg_lat = conn.execute(
+                "SELECT AVG(llm_latency_ms) FROM rag_routing_decisions "
+                "WHERE ts >= ? AND llm_latency_ms > 0",
+                (cutoff,),
+            ).fetchone()[0]
+    except _sqlite3.OperationalError:
+        console.print("[yellow]rag_routing_decisions no existe todavía — "
+                      "el listener no escribió ninguna decisión aún.[/yellow]")
+        return
+    except Exception as e:
+        console.print(f"[red]error:[/red] {e}")
+        return
+    if total == 0:
+        console.print("[dim]sin decisiones en los últimos 30 días[/dim]")
+        return
+    console.print(f"[bold]Voice classifier — últimos 30 días[/bold]")
+    console.print(f"  total decisiones: {total}")
+    pct = lambda n: f"{round(100 * n / total)}%" if total else "—"
+    console.print(f"  user dijo 'sí': {confirmed} ({pct(confirmed)})")
+    console.print(f"  user rebuckeó:  {rebucketed} ({pct(rebucketed)})")
+    console.print(f"  user dijo 'no': {rejected} ({pct(rejected)})")
+    console.print(f"  classifier falló: {failed} ({pct(failed)})")
+    if avg_lat is not None:
+        console.print(f"  latencia LLM promedio: {round(avg_lat)} ms")
+    console.print("\n[bold]por bucket:[/bold]")
+    for bucket, n in by_bucket:
+        console.print(f"  {bucket or '(null)'}: {n}")
+
+
+@routing.command("recent")
+@click.argument("n", type=int, default=20)
+def routing_recent(n: int):
+    """Últimas N decisiones del classifier — útil para auditar.
+
+    Para cada fila muestra: timestamp, transcript (truncado), bucket_llm,
+    bucket_final (si difiere), confidence, latencia. El bucket_final
+    distinto de bucket_llm es señal de que el user corrigió.
+    """
+    import sqlite3 as _sqlite3
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, transcript, bucket_llm, bucket_final, "
+                "       confidence_llm, llm_latency_ms, user_response "
+                "FROM rag_routing_decisions ORDER BY ts DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+    except _sqlite3.OperationalError:
+        console.print("[yellow]rag_routing_decisions no existe todavía.[/yellow]")
+        return
+    except Exception as e:
+        console.print(f"[red]error:[/red] {e}")
+        return
+    if not rows:
+        console.print("[dim]sin decisiones todavía[/dim]")
+        return
+    for ts, transcript, blm, bf, conf, lat, resp in rows:
+        when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        snippet = (transcript or "")[:60].replace("\n", " ")
+        if len(transcript or "") > 60:
+            snippet += "…"
+        marker = ""
+        if bf and bf != blm:
+            marker = f" → [yellow]{bf}[/yellow]"
+        confidence_str = f"[dim]{conf or '?'}[/dim]"
+        lat_str = f"[dim]{lat or 0}ms[/dim]"
+        resp_str = f"[dim]({resp or '—'})[/dim]"
+        console.print(
+            f"{when} [cyan]{blm:<16}[/cyan]{marker} {confidence_str} "
+            f"{lat_str} {resp_str}\n  [dim]{snippet}[/dim]"
+        )
+
+
+@routing.command("list-rules")
+@click.option("--all", "show_all", is_flag=True, default=False,
+              help="Incluir reglas desactivadas")
+def routing_list_rules(show_all: bool):
+    """Listar reglas aprendidas — las que el listener inyecta al sysprompt."""
+    from rag_routing_learning.promote import list_active_rules, list_all_rules
+    rules = list_all_rules() if show_all else list_active_rules()
+    if not rules:
+        console.print("[dim]sin reglas aprendidas todavía. Corré "
+                      "`rag routing extract-rules` para generar candidatas[/dim]")
+        return
+    console.print(f"[bold]{len(rules)} regla(s){'  (todas)' if show_all else '  activas'}:[/bold]")
+    for r in rules:
+        active_marker = "[green]✓[/green]" if r.active else "[red]✗[/red]"
+        pct = round(r.evidence_ratio * 100)
+        console.print(
+            f"{active_marker} #{r.id} [cyan]{r.pattern!r}[/cyan] → "
+            f"[bold]{r.bucket}[/bold]  ({pct}% de {r.evidence_count} casos)"
+        )
+
+
+@routing.command("extract-rules")
+@click.option("--min-count", type=int, default=5,
+              help="Mínimo de evidencias para considerar el patrón")
+@click.option("--min-ratio", type=float, default=0.90,
+              help="Fracción mínima de consistencia 0.0-1.0")
+@click.option("--days", type=int, default=60,
+              help="Ventana en días para el análisis")
+@click.option("--auto-promote", is_flag=True, default=False,
+              help="Promover automáticamente sin review (usado por el cron)")
+def routing_extract_rules(min_count: int, min_ratio: float, days: int,
+                          auto_promote: bool):
+    """Extraer patrones de rag_routing_decisions y opcionalmente promoverlos."""
+    from rag_routing_learning.promote import (
+        list_candidate_patterns,
+        upsert_rule,
+    )
+    candidates = list_candidate_patterns(
+        min_count=min_count, min_ratio=min_ratio, days=days,
+    )
+    new_count = sum(1 for c in candidates if not c["already_promoted"])
+    console.print(f"[bold]{len(candidates)} patrón(es) candidato(s)"
+                  f" ({new_count} nuevo(s)):[/bold]")
+    for c in candidates:
+        marker = "[dim](ya promovido)[/dim]" if c["already_promoted"] else "[green]nuevo[/green]"
+        pct = round(c["ratio"] * 100)
+        console.print(
+            f"  {marker} [cyan]{c['pattern']!r}[/cyan] → "
+            f"[bold]{c['bucket']}[/bold]  ({pct}% de {c['count']} casos)"
+        )
+    if auto_promote and new_count > 0:
+        promoted = 0
+        for c in candidates:
+            if c["already_promoted"]:
+                continue
+            rid = upsert_rule(
+                pattern=c["pattern"],
+                bucket=c["bucket"],
+                evidence_count=c["count"],
+                evidence_ratio=c["ratio"],
+            )
+            if rid is not None:
+                promoted += 1
+        console.print(f"[green]✓[/green] promovidas {promoted} reglas nuevas (auto-promote)")
+
+
+@routing.command("review")
+@click.option("--min-count", type=int, default=5)
+@click.option("--min-ratio", type=float, default=0.90)
+@click.option("--days", type=int, default=60)
+def routing_review(min_count: int, min_ratio: float, days: int):
+    """Review interactivo de patrones candidatos — aprobá uno a uno."""
+    from rag_routing_learning.promote import (
+        list_candidate_patterns,
+        upsert_rule,
+    )
+    candidates = [c for c in list_candidate_patterns(
+        min_count=min_count, min_ratio=min_ratio, days=days,
+    ) if not c["already_promoted"]]
+    if not candidates:
+        console.print("[dim]no hay candidatos nuevos para review[/dim]")
+        return
+    console.print(f"[bold]{len(candidates)} candidato(s) nuevo(s)[/bold]\n")
+    promoted = 0
+    skipped = 0
+    for i, c in enumerate(candidates, 1):
+        pct = round(c["ratio"] * 100)
+        console.print(f"\n[bold]({i}/{len(candidates)})[/bold] "
+                      f"[cyan]{c['pattern']!r}[/cyan] → [bold]{c['bucket']}[/bold]  "
+                      f"({pct}% de {c['count']} casos)")
+        if c["bucket_breakdown"]:
+            breakdown = "  ".join(f"{b}={n}" for b, n in c["bucket_breakdown"].items())
+            console.print(f"  [dim]breakdown: {breakdown}[/dim]")
+        for ex in c["examples"][:3]:
+            console.print(f"  [dim]ej: {ex[:80]}{'…' if len(ex) > 80 else ''}[/dim]")
+        choice = click.prompt(
+            "  promover? [y/n/q para salir]",
+            type=click.Choice(["y", "n", "q"]),
+            default="n",
+            show_choices=False,
+        )
+        if choice == "q":
+            break
+        if choice == "y":
+            rid = upsert_rule(
+                pattern=c["pattern"],
+                bucket=c["bucket"],
+                evidence_count=c["count"],
+                evidence_ratio=c["ratio"],
+            )
+            if rid is not None:
+                promoted += 1
+                console.print(f"  [green]✓[/green] promovida (#{rid})")
+            else:
+                console.print(f"  [red]✗[/red] falló el insert")
+        else:
+            skipped += 1
+    console.print(f"\n[bold]review terminado:[/bold] {promoted} promovidas, "
+                  f"{skipped} salteadas")
+
+
+@routing.command("disable-rule")
+@click.argument("rule_id", type=int)
+def routing_disable_rule(rule_id: int):
+    """Desactivar una regla por id (sin borrarla — preserva trail)."""
+    from rag_routing_learning.promote import deactivate_rule
+    if deactivate_rule(rule_id):
+        console.print(f"[green]✓[/green] regla #{rule_id} desactivada")
+    else:
+        console.print(f"[yellow]regla #{rule_id} no estaba activa o no existe[/yellow]")
 
 
 @cli.command()

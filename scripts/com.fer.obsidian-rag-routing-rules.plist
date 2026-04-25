@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-routing-rules</string>
+  <!--
+    Diario 3:30 AM. Lee rag_routing_decisions de los últimos 60 días, busca
+    n-grams con bucket consistente (ratio ≥0.90, count ≥5) y los promueve
+    a rag_routing_rules con --auto-promote. El listener relee la tabla cada
+    1h e inyecta las reglas activas al sysprompt del classifier.
+
+    Spec: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
+          04-Archive/99-obsidian-system/99-Claude/system/voice-classifier/spec.md
+
+    Para review manual antes de auto-promote: `rag routing review`.
+    Para desactivar una regla mala: `rag routing disable-rule <id>`.
+    Kill switch: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/
+                  com.fer.obsidian-rag-routing-rules.plist`.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/fer/.local/bin/rag</string>
+    <string>routing</string>
+    <string>extract-rules</string>
+    <string>--auto-promote</string>
+    <string>--min-count</string>
+    <string>5</string>
+    <string>--min-ratio</string>
+    <string>0.90</string>
+    <string>--days</string>
+    <string>60</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>/Users/fer</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/fer/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <!-- T10 cutover (2026-04-19): forzar SQL state path. No-op post-merge
+         pero lo dejamos por consistencia con los otros plists obsidian-rag-*. -->
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <!-- 30s después de online-tune (que también corre 3:30) — los 2 cron no
+       se pisan porque hacen queries distintas, pero por las dudas dejamos
+       el spread mínimo intencional via WorkingDirectory + KeepAlive=false. -->
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>/Users/fer/.local/share/obsidian-rag/routing-rules.log</string>
+  <key>StandardErrorPath</key><string>/Users/fer/.local/share/obsidian-rag/routing-rules.error.log</string>
+</dict>
+</plist>

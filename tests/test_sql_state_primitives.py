@@ -80,11 +80,14 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 audio corrections (rag_audio_corrections, Whisper learning loop
     # Phase 2 2026-04-25, c597932 — gold signal de correcciones manuales) +
     # 1 whisper vocab (rag_whisper_vocab, Whisper learning loop Phase 2
-    # 2026-04-25 — vocab refresh nightly inyectado al --prompt) =
-    # 36 tables total.
+    # 2026-04-25 — vocab refresh nightly inyectado al --prompt) +
+    # 1 routing decisions + 1 routing rules (voice-classifier Bloque B
+    # 2026-04-25, system/voice-classifier/spec.md — LLM routing aprendido
+    # de audios reenviados a RagNet) =
+    # 38 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 36
+    assert len(expected) == 38
     c.close()
 
 

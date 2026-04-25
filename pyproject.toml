@@ -90,6 +90,7 @@ packages = [
     "rag_anticipate",
     "rag_anticipate.signals",
     "rag_whisper_learning",
+    "rag_routing_learning",
 ]
 
 # Include rag/prompts/**/*.md en el bundle del tool. Sin esto, `uv tool

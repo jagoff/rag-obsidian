@@ -16,7 +16,33 @@ Los tests cubren:
 """
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    """Redirige `rag.DB_PATH` a tmp para que el TestClient no escriba a la
+    `telemetry.db` de producción.
+
+    Sin esto, los 3 endpoint integration tests POSTean `?¡@#` / `hola` /
+    queries normales contra `/api/chat`, el handler invoca
+    `log_query_event(...)` → `_ragvec_state_conn()` → prod DB. Audit
+    2026-04-25 detectó **57 rows con `q='?¡@#'`** filtradas a prod desde
+    estos tests.
+
+    Snap+restore manual (no `monkeypatch.setattr`) para evitar el warning
+    falso `rag.DB_PATH leaked from test` del autouse `_stabilize_rag_state`
+    en conftest — corre antes que el teardown de monkeypatch y ve el tmp
+    todavía aplicado. Mismo patrón que `tests/test_rag_log_sql_read.py`.
+    """
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
 
 
 def _import_helpers():

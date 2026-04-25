@@ -8424,10 +8424,6 @@ def _sync_apple_calendar_notes(vault_root: Path, days_ahead: int = 90) -> dict:
     }
 
 
-def _chrome_to_unix_ts(chrome_us: int) -> float:
-    return (chrome_us / 1_000_000.0) - _CHROME_EPOCH_OFFSET_S
-
-
 def _unix_to_chrome_ts(unix_s: float) -> int:
     return int((unix_s + _CHROME_EPOCH_OFFSET_S) * 1_000_000)
 
@@ -9531,10 +9527,6 @@ def _index_urls(
 # tree, flatten to (url, title, folder_breadcrumb), and write into the same
 # URL collection used by `rag links` with source="bookmark" — so a semantic
 # query surfaces notes AND bookmarks in a unified ranked list.
-
-
-def _chrome_bookmarks_root() -> Path:
-    return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
 
 
 def chrome_bookmark_files(root: Path | None = None) -> list[tuple[str, Path]]:
@@ -30301,28 +30293,9 @@ def weather(question: str):
         click.echo(forecast_block)
 
 
-def _weather_comment(question: str, forecast: str) -> str:
-    """Generate a brief conversational comment relating the forecast to the question."""
-    prompt = (
-        "Pronóstico:\n"
-        f"{forecast}\n\n"
-        f"Pregunta: \"{question}\"\n\n"
-        "Respondé EN ESPAÑOL RIOPLATENSE en 1-2 oraciones cortas. "
-        "Tono informal, directo al punto. "
-        "No repitas números ni datos del pronóstico. "
-        "Solo dá tu opinión o consejo basado en los datos. "
-        "Sin emojis. Sin saludos. Sin preámbulos."
-    )
-    try:
-        resp = _helper_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 80},
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-        return resp.message.content.strip()
-    except Exception:
-        return ""
+# `_weather_comment` moved to `rag.integrations.weather` (Phase 1b, 2026-04-25).
+# Re-exported at the bottom of this file so `rag._weather_comment` keeps
+# resolving for tests + `serve` callers in this same module.
 
 
 _CREATED_TS_BACKFILL_DONE = False
@@ -33125,42 +33098,8 @@ return _out
 '''
 
 
-# Use Mail's unified `inbox` alias — single query across all accounts, ~0.5s.
-# Previous per-account iteration was 10-20× slower and still missed Gmail
-# (no dedicated INBOX mailbox — Gmail uses labels).
-# Body is truncated to 600 chars in AS and stripped of `|`/newlines/tabs so the
-# pipe-separated parse stays unambiguous; Python normalises HTML+whitespace and
-# caps to 200 chars for the preview.
-_MAIL_SCRIPT = '''
-set _cutoff to (current date) - (36 * hours)
-set _out to ""
-tell application "Mail"
-  try
-    repeat with _msg in (messages of inbox whose read status is false and date received > _cutoff)
-      try
-        set _subject to subject of _msg
-        set _sender to sender of _msg
-        set _received to (date received of _msg) as string
-        set _body to ""
-        try
-          set _body to (content of _msg) as string
-        end try
-        if (count of _body) > 600 then
-          set _body to text 1 thru 600 of _body
-        end if
-        set _prev_tids to AppleScript's text item delimiters
-        set AppleScript's text item delimiters to {return, linefeed, character id 9, "|"}
-        set _bparts to text items of _body
-        set AppleScript's text item delimiters to " "
-        set _body to _bparts as text
-        set AppleScript's text item delimiters to _prev_tids
-        set _out to _out & _subject & "|" & _sender & "|" & _received & "|" & _body & linefeed
-      end try
-    end repeat
-  end try
-end tell
-return _out
-'''
+# `_MAIL_SCRIPT` moved to `rag.integrations.apple_mail` (Phase 1b, 2026-04-25).
+# Re-exported at the bottom of this file.
 
 
 def _apple_enabled() -> bool:
@@ -34817,174 +34756,16 @@ def _is_vip_sender(sender: str, vips: set[str]) -> bool:
     return any(v in s for v in vips)
 
 
-def _fetch_mail_unread(max_items: int = 10) -> list[dict]:
-    """Unread messages received in the last 36h from Apple Mail INBOX
-    across all accounts. Each item carries ``subject``, ``sender``,
-    ``received``, ``body_preview`` (≤200 chars, HTML stripped) and
-    ``is_vip`` (sender matches an entry in ``MAIL_VIP_CONFIG_PATH``).
-    VIPs are sorted to the top before the ``max_items`` cap so they
-    survive truncation.
-    """
-    if not _apple_enabled():
-        return []
-    out = _osascript(_MAIL_SCRIPT, timeout=20.0)
-    if not out:
-        return []
-    vips = _load_mail_vips()
-    items: list[dict] = []
-    for line in out.splitlines():
-        parts = line.split("|", 3)
-        if len(parts) < 2:
-            continue
-        subject = parts[0].strip()
-        sender = parts[1].strip()
-        received = parts[2].strip() if len(parts) > 2 else ""
-        body_raw = parts[3] if len(parts) > 3 else ""
-        if not subject:
-            continue
-        items.append({
-            "subject": subject,
-            "sender": sender,
-            "received": received,
-            "body_preview": _strip_html_to_preview(body_raw, cap=200),
-            "is_vip": _is_vip_sender(sender, vips),
-        })
-    items.sort(key=lambda m: 0 if m.get("is_vip") else 1)
-    return items[:max_items]
+# `_fetch_mail_unread` moved to `rag.integrations.apple_mail` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
-# ── Gmail API evidence (via OAuth creds shared with gmail-send MCP) ─────────
-# Apple Mail already feeds `mail_unread`, but only the 36h unread window. Gmail
-# adds two signals Apple Mail can't compute cheaply:
-#   - awaiting_reply: threads in inbox older than 3d, newer than 14d, last
-#     sender is NOT me. Surfaces stuck replies before they rot.
-#   - starred: recent explicit-priority threads the user flagged.
-# Plus a total unread count (all-time inbox) as one cheap number.
-# Silent-fail: missing deps, missing creds, API error → {}. Same contract as
-# `_fetch_calendar_today`.
-GMAIL_CREDS_DIR = Path.home() / ".gmail-mcp"
-GMAIL_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.settings.basic",
-]
-
-
-def _gmail_service():
-    """Authed Gmail API client, or None.
-
-    Intenta 2 paths de OAuth en orden:
-
-    1. **`~/.config/obsidian-rag/google_token.json`** (vía
-       `_load_google_credentials`). Este es el token que usan el
-       ingester de Gmail + Calendar + Drive + morning brief — se
-       refresca solo via google-auth-oauthlib y es el path que el user
-       re-autentica con `rag auth google` / primera corrida
-       interactiva. Scopes: `gmail.readonly + drive.readonly` — suficiente
-       para LECTURA (que es todo lo que hacen `_fetch_gmail_evidence` y
-       `_sync_gmail_notes`).
-
-    2. **`~/.gmail-mcp/credentials.json`** (legacy, shared con gmail-mcp
-       NPM). Scopes más amplios (`gmail.modify`) pero el refresh token
-       tiende a caducar porque Google lo revoca si la OAuth app está en
-       "Testing" mode y pasaron >7d. Lo mantenemos como fallback para no
-       romper setups viejos que tengan solo este token, pero ya no es el
-       path canónico.
-
-    Retorna None si ambos fallan (caller maneja silent-fail). Rollback
-    al comportamiento pre-iter5: borrar el bloque (1) y dejar solo (2).
-    Motivo del cambio (2026-04-24, user report iter 5): el token en (2)
-    se revocó y `_fetch_gmail_evidence` devolvía vacío silenciosamente
-    → el user preguntaba "cuales son mis ultimos mails?" y el sistema
-    decía "no encontré mails recientes" aunque el inbox estaba lleno.
-    """
-    try:
-        from googleapiclient.discovery import build
-    except ImportError:
-        return None
-
-    # Path primario: google_token.json (self-refreshing, alive).
-    try:
-        creds = _load_google_credentials(allow_interactive=False)
-        if creds is not None and creds.valid:
-            return build("gmail", "v1", credentials=creds, cache_discovery=False)
-    except Exception as exc:
-        _silent_log("gmail_service_primary", exc)
-
-    # Fallback: ~/.gmail-mcp/credentials.json (legacy, may be revoked).
-    try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-    except ImportError:
-        return None
-    creds_path = GMAIL_CREDS_DIR / "credentials.json"
-    oauth_path = GMAIL_CREDS_DIR / "gcp-oauth.keys.json"
-    if not creds_path.is_file() or not oauth_path.is_file():
-        return None
-    try:
-        stored = json.loads(creds_path.read_text(encoding="utf-8"))
-        oauth = json.loads(oauth_path.read_text(encoding="utf-8"))
-        installed = oauth.get("installed") or oauth.get("web") or {}
-        creds = Credentials(
-            token=stored.get("access_token"),
-            refresh_token=stored.get("refresh_token"),
-            token_uri=installed.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=installed.get("client_id"),
-            client_secret=installed.get("client_secret"),
-            scopes=GMAIL_SCOPES,
-        )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            stored["access_token"] = creds.token
-            creds_path.write_text(json.dumps(stored), encoding="utf-8")
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
-    except Exception as exc:
-        _silent_log("gmail_service_fallback", exc)
-        return None
-
-
-def _gmail_send_service():
-    """Authed Gmail client para ENVIAR (scope `gmail.modify`).
-
-    Similar a `_gmail_service()` pero prioriza invertido: prefiere el
-    fallback en `~/.gmail-mcp/credentials.json` (scope `gmail.modify` —
-    incluye send) porque el primary (`~/.config/obsidian-rag/
-    google_token.json`) típicamente tiene sólo `gmail.readonly` + `drive.
-    readonly` y fallaría con 403 al enviar.
-
-    Retorna None si no hay creds con el scope correcto. Caller silent-
-    fail. El fallback re-escribe el access token refrescado al archivo,
-    como hace `_gmail_service()`, así el próximo call evita el refresh.
-    """
-    try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-    except ImportError:
-        return None
-    creds_path = GMAIL_CREDS_DIR / "credentials.json"
-    oauth_path = GMAIL_CREDS_DIR / "gcp-oauth.keys.json"
-    if not creds_path.is_file() or not oauth_path.is_file():
-        return None
-    try:
-        stored = json.loads(creds_path.read_text(encoding="utf-8"))
-        oauth = json.loads(oauth_path.read_text(encoding="utf-8"))
-        installed = oauth.get("installed") or oauth.get("web") or {}
-        creds = Credentials(
-            token=stored.get("access_token"),
-            refresh_token=stored.get("refresh_token"),
-            token_uri=installed.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=installed.get("client_id"),
-            client_secret=installed.get("client_secret"),
-            scopes=GMAIL_SCOPES,
-        )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            stored["access_token"] = creds.token
-            creds_path.write_text(json.dumps(stored), encoding="utf-8")
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
-    except Exception as exc:
-        _silent_log("gmail_send_service", exc)
-        return None
+# Gmail integration block (`GMAIL_CREDS_DIR`, `GMAIL_SCOPES`, `_gmail_service`,
+# `_gmail_send_service`, `_gmail_thread_last_meta`, `_fetch_gmail_evidence`)
+# moved to `rag.integrations.gmail` (Phase 1b, 2026-04-25). Re-exported at the
+# bottom of this file. `_send_gmail` stays here because it's a higher-level
+# helper that composes the send service with mime + base64 — not a leaf
+# integration.
 
 
 def _send_gmail(to: str, subject: str, body: str,
@@ -35045,378 +34826,12 @@ def _send_gmail(to: str, subject: str, body: str,
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
 
-def _gmail_thread_last_meta(svc, thread_id: str) -> dict | None:
-    """Fetch metadata of the LAST message of a thread. Returns None on error.
-    Shape: {subject, from, snippet, internal_date_ms}.
-    """
-    try:
-        t = svc.users().threads().get(
-            userId="me", id=thread_id, format="metadata",
-            metadataHeaders=["Subject", "From", "Date"],
-        ).execute()
-    except Exception:
-        return None
-    msgs = t.get("messages") or []
-    if not msgs:
-        return None
-    last = msgs[-1]
-    headers = {
-        h["name"]: h["value"]
-        for h in (last.get("payload", {}).get("headers") or [])
-    }
-    try:
-        internal_ms = int(last.get("internalDate") or 0)
-    except Exception:
-        internal_ms = 0
-    return {
-        "subject": headers.get("Subject", "(sin asunto)"),
-        "from": headers.get("From", ""),
-        "snippet": (last.get("snippet") or "").strip()[:140],
-        "internal_date_ms": internal_ms,
-    }
-
-
-def _fetch_gmail_evidence(now: datetime) -> dict:
-    """Gmail signals for the morning brief + on-demand "últimos mails"
-    queries. Hits Gmail API ~5-15 times (<3s total with cached discovery).
-    Silent-fail on any error.
-
-    Returns:
-        {
-          "unread_count": int — total unread in inbox (all-time),
-          "starred": [{subject, from, snippet, thread_id, internal_date_ms}]
-             up to 3 recent starred threads,
-          "awaiting_reply": [{subject, from, snippet, days_old, thread_id,
-             internal_date_ms}] up to 5 threads where the last message is
-             NOT from me and is 3-14d old.
-          "recent": [{subject, from, snippet, thread_id, internal_date_ms}]
-             up to 8 most-recent inbox threads regardless of flags. 2026-04-24
-             (user report iter 5): el tool original solo devolvía starred +
-             awaiting — para un user con inbox-zero-ish ambos vienen vacíos
-             aunque tenga mails perfectamente navegables en el inbox. "últimos
-             mails" significa "los más recientes", no "los flagueados". Este
-             bucket tapa ese gap.
-        }
-
-        `thread_id` + `internal_date_ms` are emitted so downstream consumers
-        (web tools → `gmail_recent`) don't have to re-query Gmail to enrich
-        each item. `internal_date_ms` is int milliseconds since epoch;
-        callers convert to ISO timestamp at render time.
-    """
-    svc = _gmail_service()
-    if svc is None:
-        return {}
-    try:
-        profile = svc.users().getProfile(userId="me").execute()
-    except Exception:
-        return {}
-    me_lower = (profile.get("emailAddress") or "").lower()
-    out: dict = {
-        "unread_count": 0,
-        "starred": [],
-        "awaiting_reply": [],
-        "recent": [],
-    }
-
-    # Unread count — INBOX label metadata gives exact thread/message counts
-    # without scanning messages. Cheaper and accurate vs resultSizeEstimate.
-    try:
-        label = svc.users().labels().get(userId="me", id="INBOX").execute()
-        out["unread_count"] = int(label.get("threadsUnread") or 0)
-    except Exception as exc:
-        _silent_log('gmail_unread_count', exc)
-
-    # Starred recent — explicit user-flagged threads.
-    try:
-        r = svc.users().threads().list(
-            userId="me", q="is:starred in:inbox newer_than:7d", maxResults=3,
-        ).execute()
-        for th in r.get("threads", []) or []:
-            tid = th.get("id") or ""
-            meta = _gmail_thread_last_meta(svc, tid)
-            if meta:
-                out["starred"].append({
-                    "subject": meta["subject"],
-                    "from": meta["from"],
-                    "snippet": meta["snippet"],
-                    "thread_id": tid,
-                    "internal_date_ms": meta["internal_date_ms"],
-                })
-    except Exception as exc:
-        _silent_log('gmail_unread_list', exc)
-
-    # Awaiting reply — threads stuck, last sender != me. Exclude auto-generated
-    # categories to keep signal/noise high.
-    try:
-        q = (
-            "in:inbox newer_than:14d older_than:3d "
-            "-category:promotions -category:social "
-            "-category:updates -category:forums"
-        )
-        r = svc.users().threads().list(
-            userId="me", q=q, maxResults=15,
-        ).execute()
-        for th in r.get("threads", []) or []:
-            if len(out["awaiting_reply"]) >= 5:
-                break
-            tid = th.get("id") or ""
-            meta = _gmail_thread_last_meta(svc, tid)
-            if not meta:
-                continue
-            sender = meta["from"].lower()
-            if me_lower and me_lower in sender:
-                continue  # last reply was mine — not awaiting me
-            days_old = (
-                (now.timestamp() - meta["internal_date_ms"] / 1000) / 86400.0
-                if meta["internal_date_ms"] else 0.0
-            )
-            out["awaiting_reply"].append({
-                "subject": meta["subject"],
-                "from": meta["from"],
-                "snippet": meta["snippet"],
-                "days_old": round(days_old, 1),
-                "thread_id": tid,
-                "internal_date_ms": meta["internal_date_ms"],
-            })
-    except Exception as exc:
-        _silent_log('gmail_followup_list', exc)
-
-    # Recent inbox — los últimos 8 hilos del inbox sin filtrar por flag y
-    # SIN exclusiones de categoría. Es el bucket que responde literal
-    # "cuales son mis ultimos mails?" — el user quiere ver todo lo que el
-    # Gmail le muestra en la pantalla de inbox, no una vista filtrada.
-    #
-    # 2026-04-24 iter 6 (Fer F. user decision): antes excluíamos
-    # promotions/social/updates/forums (heredado del morning brief donde
-    # esconder newsletters + GitHub notifications hace sentido). Pero
-    # para "últimos mails" el user quiere literal los 8 más recientes
-    # del inbox tal cual Gmail los ordena. `category:updates` en particular
-    # atrapa GitHub notifications, Stripe receipts, Anthropic updates —
-    # todo "mail real" para un dev. Si eventualmente se siente ruidoso
-    # (promotions puras de Mercadolibre), rollback poniendo
-    # `-category:promotions` nuevamente. Rollback parcial no pasa tests
-    # nuevos porque los fake_ev no filtran por esas labels.
-    #
-    # Mantenemos `newer_than:30d` para acotar el scan: si el user no
-    # tocó Gmail en un mes, los 8 más viejos no son "últimos" en el
-    # sentido útil.
-    try:
-        q_recent = "in:inbox newer_than:30d"
-        r = svc.users().threads().list(
-            userId="me", q=q_recent, maxResults=8,
-        ).execute()
-        # Dedup contra starred/awaiting — si el user tiene un mail starred
-        # que también es el más reciente, no queremos listarlo dos veces.
-        # Set de thread_ids ya agregados en las secciones previas.
-        _seen_tids: set[str] = {
-            str(it.get("thread_id") or "")
-            for bucket in ("starred", "awaiting_reply")
-            for it in out[bucket]
-        }
-        for th in r.get("threads", []) or []:
-            tid = th.get("id") or ""
-            if tid in _seen_tids:
-                continue
-            meta = _gmail_thread_last_meta(svc, tid)
-            if not meta:
-                continue
-            out["recent"].append({
-                "subject": meta["subject"],
-                "from": meta["from"],
-                "snippet": meta["snippet"],
-                "thread_id": tid,
-                "internal_date_ms": meta["internal_date_ms"],
-            })
-            _seen_tids.add(tid)
-    except Exception as exc:
-        _silent_log('gmail_recent_list', exc)
-
-    return out
-
-
-# ── Google Drive evidence (via OAuth shared with google-drive MCP) ──────────
-# Surface files modified in the last N days — gives the morning brief context
-# about what docs/sheets/slides were touched. Skips the Drive.app daily churn
-# by showing only the top-N most-recent items. Silent-fail: missing deps, missing
-# creds, or API error → {}. OAuth reused from the `google-drive` MCP setup
-# (~/.config/google-drive-mcp/). Drive API exact-count is free; we don't need
-# to scan folders — modifiedTime query is O(log n).
-GDRIVE_CREDS_DIR = Path.home() / ".config/google-drive-mcp"
-GDRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-# Human-readable Drive mimeTypes for the rendered section. Everything else
-# falls back to a generic "📄 archivo" label.
-_GDRIVE_MIME_LABEL = {
-    "application/vnd.google-apps.document": "Doc",
-    "application/vnd.google-apps.spreadsheet": "Sheet",
-    "application/vnd.google-apps.presentation": "Slide",
-    "application/vnd.google-apps.folder": "Folder",
-    "application/vnd.google-apps.form": "Form",
-    "application/pdf": "PDF",
-}
-
-
-def _drive_service():
-    """Authed Drive API client, or None. Refreshes access_token in place and
-    persists back to tokens.json on expiry. Shares creds with the google-drive
-    MCP — so both paths stay authed through the same refresh token.
-    """
-    try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
-    except ImportError:
-        return None
-    tokens_path = GDRIVE_CREDS_DIR / "tokens.json"
-    oauth_path = GDRIVE_CREDS_DIR / "gcp-oauth.keys.json"
-    if not tokens_path.is_file() or not oauth_path.is_file():
-        return None
-    try:
-        stored = json.loads(tokens_path.read_text(encoding="utf-8"))
-        oauth = json.loads(oauth_path.read_text(encoding="utf-8"))
-        installed = oauth.get("installed") or oauth.get("web") or {}
-        # The google-drive MCP tokens file uses `access_token` / `refresh_token`
-        # at top level (same shape as the Gmail MCP). Some Google libs write
-        # `token` instead — accept both.
-        token = stored.get("access_token") or stored.get("token")
-        creds = Credentials(
-            token=token,
-            refresh_token=stored.get("refresh_token"),
-            token_uri=installed.get("token_uri", "https://oauth2.googleapis.com/token"),
-            client_id=installed.get("client_id"),
-            client_secret=installed.get("client_secret"),
-            scopes=GDRIVE_SCOPES,
-        )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            stored["access_token"] = creds.token
-            stored["token"] = creds.token
-            tokens_path.write_text(json.dumps(stored), encoding="utf-8")
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception:
-        return None
-
-
-def _fetch_drive_evidence(now: datetime, days: int = 5, max_items: int = 5) -> dict:
-    """Files modified in Drive in the last `days`. Filters trashed + picks the
-    `max_items` most-recent. Returns `{"files": [{name, modified, link,
-    mime_label, days_ago}]}`. `days_ago` is a float for the renderer to format.
-    Silent-fail → {}.
-    """
-    svc = _drive_service()
-    if svc is None:
-        return {}
-    cutoff_dt = now - timedelta(days=days)
-    # Drive query wants RFC3339; strip tz for simplicity (local vs UTC mismatch
-    # is at most a few hours — negligible at a 5-day window).
-    cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    q = f"modifiedTime > '{cutoff_iso}' and trashed = false"
-    try:
-        resp = svc.files().list(
-            q=q,
-            orderBy="modifiedTime desc",
-            pageSize=max_items,
-            fields=(
-                "files(id,name,modifiedTime,webViewLink,mimeType,"
-                "lastModifyingUser(displayName))"
-            ),
-            spaces="drive",
-        ).execute()
-    except Exception:
-        return {}
-    files_out: list[dict] = []
-    for f in resp.get("files") or []:
-        mtime_iso = f.get("modifiedTime") or ""
-        try:
-            # Drive returns `2026-04-14T18:23:00.000Z`
-            mtime_dt = datetime.fromisoformat(mtime_iso.replace("Z", "+00:00"))
-            days_ago = max(0.0, (now.astimezone(mtime_dt.tzinfo) - mtime_dt).total_seconds() / 86400.0)
-        except Exception:
-            days_ago = 0.0
-        mime = f.get("mimeType") or ""
-        label = _GDRIVE_MIME_LABEL.get(mime, "archivo")
-        files_out.append({
-            "name": f.get("name") or "(sin nombre)",
-            "modified": mtime_iso,
-            "link": f.get("webViewLink") or "",
-            "mime_label": label,
-            "days_ago": round(days_ago, 1),
-            "modifier": (f.get("lastModifyingUser") or {}).get("displayName") or "",
-        })
-    return {"files": files_out, "window_days": days}
-
-
-# ── Drive on-demand search (chat tool) ───────────────────────────────────────
-# Motivación (2026-04-24, user report Fer F.): el user pidió "busca en mi
-# google drive y decime cuánto adeuda alexis de la macbook pro" y el chat
-# respondió sobre la única planilla snapshoteada (`Lista de precios
-# Online`, modificada <48h) — sin buscar realmente en Drive. El snapshot
-# diario (`_sync_gdrive_notes`) sólo trae los 4 docs más recientes con
-# 8000 chars de body — insuficiente para responder queries sobre archivos
-# viejos o grandes. Este helper expone una búsqueda on-demand en la API
-# de Drive: dado un query en lenguaje natural, filtra stopwords, arma un
-# `fullText contains` y exporta el body de los top-N archivos.
-#
-# Comparte `_drive_service()` con el brief evidence path — mismas creds
-# (`~/.config/google-drive-mcp/`), misma refresh-token semantics, silent-
-# fail cuando falta auth (y el chat cae de vuelta al retrieve del vault).
-_GDRIVE_SEARCH_STOPWORDS: frozenset[str] = frozenset({
-    # Articles / conjunctions / prepositions (ES + EN, deduped into one set).
-    "a", "al", "an", "and", "ante", "at", "bajo", "but", "by", "con",
-    "contra", "de", "del", "desde", "durante", "e", "el", "en", "entre",
-    "for", "from", "hacia", "hasta", "in", "la", "las", "lo", "los",
-    "mediante", "o", "of", "on", "or", "para", "pero", "por", "segun",
-    "sin", "sobre", "the", "to", "tras", "un", "una", "unas", "unos",
-    "with", "y",
-    # Pronouns / interrogatives that show up in command phrasing (ES + EN).
-    "mi", "mis", "tu", "tus", "me", "te", "se", "le", "les", "nos", "yo",
-    "que", "qué", "como", "cómo", "cuando", "cuándo", "cuanto", "cuánto",
-    "donde", "dónde", "quien", "quién", "cual", "cuál",
-    "my", "your", "our", "his", "her", "its", "their", "is", "are", "was",
-    "were", "i", "you", "we", "they", "he", "she", "it",
-    # Command / filler verbs (Spanish rioplatense + neutral).
-    "busca", "buscá", "buscar", "buscame", "decime", "deci", "dime",
-    "contame", "quiero", "necesito", "quisiera", "saber", "ver", "mirar",
-    "revisar", "chequear", "chequeame", "favor", "fijate", "fijame",
-    # "tener/haber/ser/estar" conjugations frecuentes — son verbos
-    # genéricos que inflan name-OR sin aportar (ej. "tengo la planilla
-    # de alexis" → name contains 'tengo' matchea "Tengo que firmar...").
-    "tengo", "tenés", "tiene", "tienen", "tenemos", "hay", "había",
-    "hubo", "habría", "era", "eran", "fue", "fueron", "estaba",
-    "estaban", "está", "están", "estamos", "son", "soy", "eres",
-    # Drive-self-reference (redundant as a search token when the query is
-    # already scoped to Drive — "busca X en mi drive" → tokens=[X]).
-    "drive", "gdrive", "google", "doc", "docs", "documento", "documentos",
-    "sheet", "sheets", "planilla", "planillas", "spreadsheet",
-    "spreadsheets", "slide", "slides", "presentacion", "presentación",
-    "presentaciones", "archivo", "archivos", "file", "files",
-})
-
-
-def _drive_search_tokens(query: str, max_tokens: int = 6) -> list[str]:
-    """Extract up to `max_tokens` meaningful keywords from a natural-language
-    query. Lowercases, drops punctuation, filters `_GDRIVE_SEARCH_STOPWORDS`,
-    de-duplicates preserving order. Empty → []."""
-    # Normalize: lowercase, strip punctuation except inner apostrophes/dashes.
-    cleaned = re.sub(r"[^\w\s\-']", " ", query.lower(), flags=re.UNICODE)
-    seen: set[str] = set()
-    out: list[str] = []
-    for tok in cleaned.split():
-        tok = tok.strip("-'")
-        if len(tok) < 2:
-            continue
-        if tok in _GDRIVE_SEARCH_STOPWORDS:
-            continue
-        if tok in seen:
-            continue
-        seen.add(tok)
-        out.append(tok)
-        if len(out) >= max_tokens:
-            break
-    return out
-
-
+# Drive integration block (`GDRIVE_CREDS_DIR`, `GDRIVE_SCOPES`,
+# `_GDRIVE_MIME_LABEL`, `_GDRIVE_SEARCH_STOPWORDS`, `_drive_service`,
+# `_fetch_drive_evidence`, `_drive_search_tokens`) moved to
+# `rag.integrations.drive` (Phase 1b, 2026-04-25). Re-exported at the bottom
+# of this file. `_GDRIVE_EXPORT_MIME` stays here because it's only used by
+# `_agent_tool_drive_search` (chat tool, not a leaf integration).
 _GDRIVE_EXPORT_MIME: dict[str, str] = {
     "application/vnd.google-apps.document": "text/plain",
     "application/vnd.google-apps.spreadsheet": "text/csv",
@@ -36132,102 +35547,10 @@ def _agent_tool_drive_search(query: str, max_files: int = 5, body_cap: int = 350
     }, ensure_ascii=False)
 
 
-# ── Chrome bookmarks used (History join Bookmarks) ───────────────────────────
-# Bookmarks live in a JSON tree, visits live in SQLite; join by URL to surface
-# which *saved* pages the user reached for recently. Distinct signal from raw
-# top-visited (ambient browsing) because bookmarks encode intent.
-def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
-    """Top-n bookmarks whose URL was visited in the last `hours`.
-
-    Pipeline:
-    1. Flatten `Bookmarks` JSON (recursive across `roots.*`) into a URL→meta map.
-    2. Copy `History` SQLite (WAL-safe) and query visits within the window.
-    3. Inner-join by URL, sort by `last_visit` desc, truncate to n.
-
-    Chrome's `visit_time` is microseconds since 1601-01-01 UTC — same epoch as
-    `Bookmarks.date_added`, which is why the conversion constant is shared
-    with `_fetch_chrome_top_week`. Silent-fail if either file is missing.
-    """
-    import shutil
-    import sqlite3
-    import tempfile
-
-    bm_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Bookmarks"
-    hist_path = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
-    if not bm_path.is_file() or not hist_path.is_file():
-        return []
-
-    try:
-        tree = json.loads(bm_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-    bookmarks: dict[str, dict] = {}
-
-    def _walk(node: dict, folder: str) -> None:
-        if not isinstance(node, dict):
-            return
-        if node.get("type") == "url":
-            url = node.get("url") or ""
-            if url and url not in bookmarks:
-                bookmarks[url] = {
-                    "name": node.get("name") or "",
-                    "folder": folder.strip("/"),
-                }
-            return
-        name = node.get("name") or ""
-        sub_folder = f"{folder}/{name}" if name else folder
-        for child in node.get("children") or []:
-            _walk(child, sub_folder)
-
-    for root in (tree.get("roots") or {}).values():
-        _walk(root, "")
-
-    if not bookmarks:
-        return []
-
-    CHROME_EPOCH_OFFSET = 11_644_473_600
-    now_ts = time.time()
-    window_chrome = int((now_ts - hours * 3600 + CHROME_EPOCH_OFFSET) * 1_000_000)
-
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
-        shutil.copyfile(hist_path, tmp.name)
-        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT u.url AS url,
-                       COUNT(v.id) AS visit_count,
-                       MAX(v.visit_time) AS last_visit
-                FROM urls u
-                JOIN visits v ON v.url = u.id
-                WHERE v.visit_time >= ?
-                GROUP BY u.url
-                ORDER BY last_visit DESC
-                """,
-                (window_chrome,),
-            ).fetchall()
-        finally:
-            conn.close()
-
-    out: list[dict] = []
-    for r in rows:
-        url = r["url"]
-        meta = bookmarks.get(url)
-        if not meta:
-            continue
-        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
-        out.append({
-            "name": meta["name"],
-            "url": url,
-            "folder": meta["folder"],
-            "visit_count": int(r["visit_count"]),
-            "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
-        })
-        if len(out) >= n:
-            break
-    return out
+# ── Chrome bookmarks used (History join Bookmarks) — moved to
+# `rag.integrations.chrome_bookmarks` (Phase 1b, 2026-04-25). The re-export
+# at the bottom of this file keeps `rag._fetch_chrome_bookmarks_used`
+# resolvable for tests + `web/server.py` imports.
 
 
 # ── Per-vault activity (multi-vault aware, never mixes data) ─────────────────
@@ -37220,240 +36543,10 @@ def _fetch_recent_queries(
     return list(seen.values())
 
 
-# ── Weather (only if rain) ──────────────────────────────────────────────────
-WEATHER_LOCATION = "Santa+Fe,Argentina"
-WEATHER_RAIN_THRESHOLD = 70  # contract in repo CLAUDE.md: hint only if rain ≥70%
-
-
-def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
-    """Query wttr.in. Returns a summary dict ONLY if rain is in the forecast
-    for today (chance ≥ WEATHER_RAIN_THRESHOLD in any upcoming 3h block, or
-    current condition is raining). Returns ``None`` otherwise. Silent on any
-    network error.
-    """
-    import urllib.request as _req
-    url = f"https://wttr.in/{location}?format=j1"
-    try:
-        with _req.urlopen(url, timeout=8.0) as resp:
-            raw = resp.read()
-    except Exception:
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return None
-
-    # Current conditions: "Rain", "Light rain", "Thunderstorm", etc.
-    current = ""
-    try:
-        cc = data.get("current_condition") or []
-        if cc:
-            desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
-            current = desc.strip()
-    except Exception:
-        current = ""
-    currently_raining = bool(re.search(r"rain|shower|thunder|storm|drizzle", current, re.I))
-
-    # Today hourly: each entry has time="0|300|600|…|2100" (3h blocks) and
-    # chanceofrain / chanceofthunder as string ints.
-    weather_days = data.get("weather") or []
-    if not weather_days:
-        return None if not currently_raining else {
-            "summary": f"ahora: {current}",
-            "max_chance": 100, "blocks": [],
-        }
-    today = weather_days[0]
-    hourly = today.get("hourly") or []
-
-    now = datetime.now()
-    now_minutes = now.hour * 60 + now.minute
-    rain_blocks: list[dict] = []
-    max_chance = 0
-    for h in hourly:
-        try:
-            t = int(h.get("time", "0"))
-        except Exception:
-            continue
-        block_minutes = (t // 100) * 60
-        if block_minutes + 180 < now_minutes:
-            continue  # block already past
-        try:
-            chance_rain = int(h.get("chanceofrain", "0") or 0)
-            chance_thunder = int(h.get("chanceofthunder", "0") or 0)
-        except Exception:
-            continue
-        chance = max(chance_rain, chance_thunder)
-        if chance >= WEATHER_RAIN_THRESHOLD:
-            hh = block_minutes // 60
-            rain_blocks.append({"hour": hh, "chance": chance})
-            if chance > max_chance:
-                max_chance = chance
-
-    if not rain_blocks and not currently_raining:
-        return None
-
-    pieces = []
-    if currently_raining:
-        pieces.append(f"ahora: {current.lower()}")
-    if rain_blocks:
-        hour_str = ", ".join(f"{b['hour']:02d}h ({b['chance']}%)" for b in rain_blocks[:5])
-        pieces.append(f"bloques: {hour_str}")
-    return {
-        "summary": " · ".join(pieces) or current,
-        "max_chance": max_chance if max_chance else (100 if currently_raining else 0),
-        "blocks": rain_blocks,
-        "current": current,
-    }
-
-
-_WMO_WEATHER_CODES: dict[int, str] = {
-    0: "Despejado", 1: "Mayormente despejado", 2: "Parcialmente nublado",
-    3: "Cubierto", 45: "Neblina", 48: "Neblina helada",
-    51: "Llovizna leve", 53: "Llovizna moderada", 55: "Llovizna densa",
-    56: "Llovizna helada leve", 57: "Llovizna helada densa",
-    61: "Lluvia leve", 63: "Lluvia moderada", 65: "Lluvia fuerte",
-    66: "Lluvia helada leve", 67: "Lluvia helada fuerte",
-    71: "Nieve leve", 73: "Nieve moderada", 75: "Nieve fuerte",
-    77: "Granizo fino", 80: "Chubasco leve", 81: "Chubasco moderado",
-    82: "Chubasco fuerte", 85: "Nevada leve", 86: "Nevada fuerte",
-    95: "Tormenta", 96: "Tormenta con granizo leve", 99: "Tormenta con granizo fuerte",
-}
-
-
-def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
-    """Fallback weather via Open-Meteo (free, no API key)."""
-    import urllib.request as _req
-    import urllib.parse as _parse
-
-    city = location.replace("+", " ").split(",")[0]
-    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={_parse.quote(city)}&count=1&language=es"
-    try:
-        with _req.urlopen(geo_url, timeout=5.0) as resp:
-            geo = json.loads(resp.read())
-        r = geo["results"][0]
-        lat, lon, name = r["latitude"], r["longitude"], r.get("name", city)
-    except Exception:
-        return None
-
-    wx_url = (
-        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m,weather_code"
-        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
-        "&timezone=auto&forecast_days=3"
-    )
-    try:
-        with _req.urlopen(wx_url, timeout=5.0) as resp:
-            data = json.loads(resp.read())
-    except Exception:
-        return None
-
-    # `dict.get(key, default)` returns the default ONLY when key is missing —
-    # if the key exists with value `null` (Open-Meteo emits this during
-    # geo/sensor outages), `.get()` returns None and `round(None)` raises
-    # TypeError. The `or` short-circuit catches both missing-key and
-    # null-value cases. Same pattern below for daily series.
-    cur = data.get("current", {}) or {}
-    cur_code = cur.get("weather_code") or 0
-    cur_desc = _WMO_WEATHER_CODES.get(cur_code, f"Código {cur_code}")
-    cur_temp = str(round(cur.get("temperature_2m") or 0))
-
-    daily = data.get("daily", {}) or {}
-    dates = daily.get("time", []) or []
-    maxs = daily.get("temperature_2m_max", []) or []
-    mins = daily.get("temperature_2m_min", []) or []
-    rain_probs = daily.get("precipitation_probability_max", []) or []
-    codes = daily.get("weather_code", []) or []
-
-    days: list[dict] = []
-    for i, d in enumerate(dates):
-        code = codes[i] if i < len(codes) and codes[i] is not None else 0
-        # `mins[i]` / `maxs[i]` may be None even with len(...) > i.
-        min_v = mins[i] if i < len(mins) else None
-        max_v = maxs[i] if i < len(maxs) else None
-        rain_v = rain_probs[i] if i < len(rain_probs) else None
-        days.append({
-            "date": d,
-            "minC": str(round(min_v)) if min_v is not None else "",
-            "maxC": str(round(max_v)) if max_v is not None else "",
-            "avgC": "",
-            "description": _WMO_WEATHER_CODES.get(code, f"Código {code}"),
-            "chanceofrain": rain_v if rain_v is not None else 0,
-            "chanceofthunder": 0,
-        })
-
-    country = location.split(",")[-1].strip().replace("+", " ") if "," in location else ""
-    loc_str = f"{name},{country}" if country else name
-    return {
-        "location": loc_str,
-        "current": {"description": cur_desc, "temp_C": cur_temp},
-        "days": days,
-    }
-
-
-def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
-    """Query wttr.in, fallback to Open-Meteo. Returns multi-day forecast summary.
-
-    Returns dict with keys: location, current, days (list of up to 3 day
-    forecasts with date, minC, maxC, avgC, description, chanceofrain,
-    chanceofthunder). Returns None on network/parse errors from both sources.
-    """
-    import urllib.request as _req
-
-    # Primary: wttr.in
-    url = f"https://wttr.in/{location}?format=j1"
-    try:
-        with _req.urlopen(url, timeout=8.0) as resp:
-            raw = resp.read()
-        data = json.loads(raw)
-    except Exception:
-        return _fetch_weather_openmeteo(location)
-
-    # Current conditions
-    current = ""
-    temp_c = ""
-    try:
-        cc = data.get("current_condition") or []
-        if cc:
-            desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
-            current = desc.strip()
-            temp_c = cc[0].get("temp_C", "")
-    except Exception:
-        pass
-
-    # Daily forecasts (wttr.in gives today + 2 more days)
-    days: list[dict] = []
-    for wd in data.get("weather") or []:
-        # Max rain chance across hourly blocks
-        max_rain = 0
-        max_thunder = 0
-        descs: list[str] = []
-        for h in wd.get("hourly") or []:
-            try:
-                max_rain = max(max_rain, int(h.get("chanceofrain", "0") or 0))
-                max_thunder = max(max_thunder, int(h.get("chanceofthunder", "0") or 0))
-            except Exception:
-                pass
-            d = (h.get("weatherDesc") or [{}])[0].get("value", "")
-            if d and d not in descs:
-                descs.append(d)
-        days.append({
-            "date": wd.get("date", ""),
-            "minC": wd.get("mintempC", ""),
-            "maxC": wd.get("maxtempC", ""),
-            "avgC": wd.get("avgtempC", ""),
-            "description": ", ".join(descs[:3]),
-            "chanceofrain": max_rain,
-            "chanceofthunder": max_thunder,
-        })
-
-    if not days:
-        return _fetch_weather_openmeteo(location)
-
-    return {
-        "location": location.replace("+", " "),
-        "current": {"description": current, "temp_C": temp_c},
-        "days": days,
-    }
+# Weather block (`WEATHER_LOCATION`, `WEATHER_RAIN_THRESHOLD`,
+# `_WMO_WEATHER_CODES`, `_fetch_weather_rain`, `_fetch_weather_openmeteo`,
+# `_fetch_weather_forecast`) moved to `rag.integrations.weather`
+# (Phase 1b, 2026-04-25). Re-exported at the bottom of this file.
 
 
 def _parse_applescript_date(s: str) -> datetime | None:
@@ -52619,6 +51712,45 @@ def vocab_show(source: str | None, limit: int):
         console.print(f"  [dim]{t['weight']:6.2f}[/dim]  [cyan]{t['source']:12s}[/cyan]  {t['term']}")
 
 
+@whisper.command("patterns")
+@click.option("--min-count", default=2, type=int,
+              help="Mínimo de repeticiones para mostrar un pattern (default 2).")
+def whisper_patterns(min_count: int):
+    """Detectar patrones repetidos en correcciones — ej. samando → fernando 3 veces.
+
+    Útil para identificar errores sistemáticos que el modelo whisper hace
+    en palabras específicas. El pattern repetido es signal MUY fuerte de
+    que la palabra debería estar en el `--prompt` con prioridad alta — y
+    de hecho el job de vocab refresh ya las trata como gold signal.
+
+    Algoritmo: single-word swaps (1 palabra removida, 1 agregada) entre
+    `original` y `corrected`. Multi-word changes se descartan por noise.
+    """
+    from rag_whisper_learning import find_correction_patterns
+    patterns = find_correction_patterns(min_count=min_count)
+    if not patterns:
+        console.print(
+            f"[yellow]Sin patrones repetidos (≥{min_count} veces)[/yellow] · "
+            f"[dim]el sistema necesita más correcciones acumuladas para encontrar señales fuertes[/dim]"
+        )
+        return
+    console.print(f"[bold]{len(patterns)} pattern(s) repetido(s) en correcciones:[/bold]")
+    for p in patterns:
+        src_parts = []
+        if p.sources.get("explicit", 0) > 0:
+            src_parts.append(f"[green]{p.sources['explicit']} /fix[/green]")
+        if p.sources.get("llm", 0) > 0:
+            src_parts.append(f"[cyan]{p.sources['llm']} llm[/cyan]")
+        if p.sources.get("vault_diff", 0) > 0:
+            src_parts.append(f"[yellow]{p.sources['vault_diff']} vault[/yellow]")
+        src_label = " · ".join(src_parts) if src_parts else "?"
+        console.print(
+            f"  [dim]×{p.count}[/dim]  "
+            f"[red]{p.original}[/red] → [green]{p.corrected}[/green]  "
+            f"[dim]({src_label})[/dim]"
+        )
+
+
 @whisper.command("stats")
 def whisper_stats():
     """Resumen del estado del learning loop: transcripciones logueadas,
@@ -52649,7 +51781,7 @@ def whisper_stats():
     except Exception as exc:
         console.print(f"[red]error reading state: {exc}[/red]")
         return
-    console.print("[bold]Whisper learning loop — estado:[/bold]")
+    console.print(f"[bold]Whisper learning loop — estado:[/bold]")
     console.print(f"  transcripciones logueadas: [cyan]{n_transcripts}[/cyan]")
     if avg_logprob is not None:
         console.print(f"  avg_logprob promedio:      [dim]{avg_logprob:.3f}[/dim] (-0=conf alta, -1=baja)")
@@ -52670,3 +51802,45 @@ def whisper_stats():
 
 if __name__ == "__main__":
     cli()
+
+
+# ── Phase 1b: integrations re-export shim (2026-04-25) ───────────────────────
+# Leaf integrations were extracted into `rag.integrations.*` submodules to thin
+# the monolith. We re-import their public symbols here so every `rag.<X>`
+# reference (including the ones that tests `monkeypatch.setattr(rag, "_X", ...)`)
+# keeps resolving exactly as before. Order: alphabetical by module name.
+from rag.integrations.apple_mail import (  # noqa: E402, F401
+    _MAIL_SCRIPT,
+    _fetch_mail_unread,
+)
+from rag.integrations.chrome_bookmarks import (  # noqa: E402, F401
+    _chrome_bookmarks_root,
+    _chrome_to_unix_ts,
+    _fetch_chrome_bookmarks_used,
+)
+from rag.integrations.drive import (  # noqa: E402, F401
+    GDRIVE_CREDS_DIR,
+    GDRIVE_SCOPES,
+    _GDRIVE_MIME_LABEL,
+    _GDRIVE_SEARCH_STOPWORDS,
+    _drive_search_tokens,
+    _drive_service,
+    _fetch_drive_evidence,
+)
+from rag.integrations.gmail import (  # noqa: E402, F401
+    GMAIL_CREDS_DIR,
+    GMAIL_SCOPES,
+    _fetch_gmail_evidence,
+    _gmail_send_service,
+    _gmail_service,
+    _gmail_thread_last_meta,
+)
+from rag.integrations.weather import (  # noqa: E402, F401
+    WEATHER_LOCATION,
+    WEATHER_RAIN_THRESHOLD,
+    _WMO_WEATHER_CODES,
+    _fetch_weather_forecast,
+    _fetch_weather_openmeteo,
+    _fetch_weather_rain,
+    _weather_comment,
+)

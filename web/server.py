@@ -8236,10 +8236,14 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                 "SELECT term, weight, source FROM rag_whisper_vocab "
                 "ORDER BY weight DESC LIMIT 50"
             ).fetchall()
-            # Últimas 30 transcripciones
+            # Últimas 30 transcripciones — incluye `duration_s` para correlacionar
+            # con logprob (audios cortos típicamente tienen logprob más bajo
+            # por menos contexto; audios largos pueden tener errores en
+            # fragmentos específicos).
             recent_transcripts = conn.execute(
                 "SELECT audio_path, transcribed_at, avg_logprob, model, "
-                "       text, corrected_text, correction_source, chat_id "
+                "       text, corrected_text, correction_source, chat_id, "
+                "       duration_s "
                 "FROM rag_audio_transcripts "
                 "ORDER BY transcribed_at DESC LIMIT 30"
             ).fetchall()
@@ -8301,9 +8305,19 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
         cls = "lp-good" if lp > -0.4 else ("lp-mid" if lp > -0.8 else "lp-bad")
         return f'<span class="{cls}">{lp:.2f}</span>'
 
+    def fmt_duration(d: float | None) -> str:
+        """Formatea duración en `Xs` o `Xm Ys` según length."""
+        if d is None or d <= 0:
+            return "—"
+        if d < 60:
+            return f"{d:.0f}s"
+        m = int(d // 60)
+        s = int(d % 60)
+        return f"{m}m {s:02d}s"
+
     transcript_rows = ""
     for r in recent_transcripts:
-        path, ts, lp, model, text, corrected, corr_src, chat_id = r
+        path, ts, lp, model, text, corrected, corr_src, chat_id, duration = r
         chat_label = (chat_id or "")[-20:] if chat_id else "—"
         text_disp = (corrected or text or "")[:100]
         marker = ""
@@ -8316,6 +8330,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
         transcript_rows += (
             f'<tr>'
             f'<td><span class="text-mono">{_esc(fmt_ts(ts))}</span></td>'
+            f'<td><span class="text-mono">{_esc(fmt_duration(duration))}</span></td>'
             f'<td>{fmt_lp(lp)}</td>'
             f'<td><span class="text-mono">{_esc((model or "")[:25])}</span></td>'
             f'<td><span class="text-mono">{_esc(chat_label)}</span></td>'
@@ -8323,7 +8338,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             f'</tr>\n'
         )
     if not transcript_rows:
-        transcript_rows = '<tr><td colspan="5" class="meta" style="text-align:center;padding:20px">sin transcripciones logueadas — mandá un audio por WhatsApp para que aparezca acá</td></tr>'
+        transcript_rows = '<tr><td colspan="6" class="meta" style="text-align:center;padding:20px">sin transcripciones logueadas — mandá un audio por WhatsApp para que aparezca acá</td></tr>'
 
     # Tabla corrections
     correction_rows = ""
@@ -8490,7 +8505,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
 
   <h2>últimas 30 transcripciones</h2>
   <table>
-    <thead><tr><th>fecha</th><th>logprob</th><th>modelo</th><th>chat</th><th>texto</th></tr></thead>
+    <thead><tr><th>fecha</th><th>duración</th><th>logprob</th><th>modelo</th><th>chat</th><th>texto</th></tr></thead>
     <tbody>{transcript_rows}</tbody>
   </table>
 

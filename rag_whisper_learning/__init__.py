@@ -21,8 +21,14 @@ from rag_whisper_learning.vocab import (
     refresh_vocab,
     get_top_vocab_terms,
 )
+from rag_whisper_learning.patterns import (
+    CorrectionPattern,
+    find_correction_patterns,
+)
 
 __all__ = [
     "refresh_vocab",
     "get_top_vocab_terms",
+    "CorrectionPattern",
+    "find_correction_patterns",
 ]

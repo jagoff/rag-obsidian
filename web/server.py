@@ -8270,6 +8270,31 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                         hour_counts[h] = int(row[1] or 0)
             except Exception:
                 pass
+            # Heatmap semanal día×hora (últimos 60 días para tener suficiente
+            # signal por celda). Sqlite `strftime('%w', ...)` devuelve 0-6
+            # (0=domingo, 1=lunes, ..., 6=sábado). Reordenamos visualmente
+            # a lunes-domingo para coincidir con el calendario europeo /
+            # locale español.
+            cutoff_60d = time.time() - 60 * 86400
+            week_counts: dict[tuple[int, int], int] = {
+                (d, h): 0 for d in range(7) for h in range(24)
+            }
+            try:
+                for row in conn.execute(
+                    "SELECT CAST(strftime('%w', transcribed_at, 'unixepoch', 'localtime') AS INTEGER) AS dow, "
+                    "       CAST(strftime('%H', transcribed_at, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
+                    "       COUNT(*) "
+                    "FROM rag_audio_transcripts "
+                    "WHERE transcribed_at > ? "
+                    "GROUP BY dow, hour",
+                    (cutoff_60d,),
+                ):
+                    d = int(row[0]) if row[0] is not None else 0
+                    h = int(row[1]) if row[1] is not None else 0
+                    if 0 <= d < 7 and 0 <= h < 24:
+                        week_counts[(d, h)] = int(row[2] or 0)
+            except Exception:
+                pass
     except Exception as exc:
         return HTMLResponse(
             f"<!doctype html><html><body>"
@@ -8404,7 +8429,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
         heatmap_html = (
             f'<div class="heatmap-wrap">'
             f'<table class="heatmap"><tr>{"".join(heatmap_cells)}</tr></table>'
-            f'<p class="meta">cada celda = 1 hora del día · intensidad ∝ count · max={max_hour}</p>'
+            f'<p class="meta">cada celda = 1 hora del día (30d) · intensidad ∝ count · max={max_hour}</p>'
             f'</div>'
         )
     else:
@@ -8413,6 +8438,53 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             'sin audios en últimos 30d para construir heatmap. '
             'cuando llegue el primer audio, esta sección se va a poblar con '
             'la distribución horaria.'
+            '</p>'
+        )
+
+    # Heatmap semanal día×hora — matriz 7×24. Reordenamos las rows visualmente
+    # de lunes a domingo (sqlite devuelve 0=Sun..6=Sat, transformamos al
+    # mapping europeo lun=0, mar=1, ..., dom=6).
+    # `dow_sql_to_visual`: 0(Sun)→6, 1(Mon)→0, 2(Tue)→1, ..., 6(Sat)→5.
+    dow_to_visual = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+    visual_labels = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+    max_week = max(week_counts.values()) if week_counts else 0
+    if max_week > 0:
+        # Header con horas (00-23). Primera col es label del día.
+        header_cells = '<th></th>' + ''.join(
+            f'<th class="week-hour-hdr">{h:02d}</th>' for h in range(24)
+        )
+        rows_html = []
+        for visual_idx, day_label in enumerate(visual_labels):
+            sql_dow = next(d for d, v in dow_to_visual.items() if v == visual_idx)
+            cells: list[str] = []
+            cells.append(f'<th class="week-day-hdr">{day_label}</th>')
+            for h in range(24):
+                n = week_counts.get((sql_dow, h), 0)
+                alpha = (n / max_week) if max_week > 0 else 0.0
+                bg = (
+                    f"background:rgba(88,166,255,{alpha:.2f})"
+                    if alpha > 0
+                    else "background:var(--border-soft)"
+                )
+                cells.append(
+                    f'<td class="week-cell" title="{day_label} {h:02d}:00 — {n} audio(s)" style="{bg}">'
+                    f'{n if n > 0 else ""}'
+                    f'</td>'
+                )
+            rows_html.append(f'<tr>{"".join(cells)}</tr>')
+        week_html = (
+            f'<div class="heatmap-wrap">'
+            f'<table class="week-heatmap"><thead><tr>{header_cells}</tr></thead>'
+            f'<tbody>{"".join(rows_html)}</tbody></table>'
+            f'<p class="meta">7×24 = 168 celdas (60d) · intensidad ∝ count · max={max_week}</p>'
+            f'</div>'
+        )
+    else:
+        week_html = (
+            '<p class="meta" style="padding:14px 0">'
+            'sin audios en últimos 60d para construir heatmap semanal. '
+            'cuando hayan suficientes audios, vas a ver patrones tipo '
+            '"lunes mañana" o "viernes a la tarde".'
             '</p>'
         )
 
@@ -8533,6 +8605,20 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
   }}
   .heatmap-cell .hour-label {{ font-size: 10px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1; }}
   .heatmap-cell .hour-count {{ font-size: 11px; color: var(--text); font-weight: 600; line-height: 1.4; font-variant-numeric: tabular-nums; }}
+  /* Heatmap semanal 7×24 — más denso que el horario, cells más chicas. */
+  .week-heatmap {{ width: 100%; border-collapse: separate; border-spacing: 2px; table-layout: fixed; }}
+  .week-heatmap th, .week-heatmap td {{ padding: 0 !important; border-bottom: none !important; }}
+  .week-heatmap .week-day-hdr {{ width: 40px; text-align: right; padding-right: 8px !important; color: var(--text-muted); font-size: 11px; font-weight: 500; text-transform: lowercase; letter-spacing: 0; background: transparent; }}
+  .week-heatmap .week-hour-hdr {{ font-size: 10px; color: var(--text-dim); font-weight: 400; font-variant-numeric: tabular-nums; text-transform: none; letter-spacing: 0; background: transparent; }}
+  .week-cell {{
+    height: 22px;
+    border-radius: 2px;
+    text-align: center;
+    font-size: 10px;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    cursor: default;
+  }}
 </style>
 </head>
 <body>
@@ -8570,6 +8656,9 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
 
   <h2>distribución horaria (30d)</h2>
   {heatmap_html}
+
+  <h2>distribución semanal (60d)</h2>
+  {week_html}
 
   <h2>últimas 30 transcripciones</h2>
   <table>

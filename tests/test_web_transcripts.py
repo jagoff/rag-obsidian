@@ -209,6 +209,33 @@ def test_transcripts_heatmap_css_classes_defined():
         assert cls in html, f"missing CSS class: {cls}"
 
 
+# ── Heatmap semanal día×hora ──────────────────────────────────────────────────
+
+
+def test_transcripts_renders_weekly_heatmap_section():
+    """`/transcripts` tiene una sección `distribución semanal` con
+    matriz 7×24 (días × horas)."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    assert "distribución semanal" in html
+
+
+def test_transcripts_weekly_heatmap_empty_state():
+    """Sin audios en 60d, el heatmap semanal muestra mensaje informativo."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    if "sin audios en últimos 60d" in html:
+        assert "patrones tipo" in html  # sneak peek del placeholder text
+
+
+def test_transcripts_weekly_heatmap_css_classes():
+    """Classes del heatmap semanal están definidas."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    for cls in (".week-heatmap", ".week-cell", ".week-day-hdr", ".week-hour-hdr"):
+        assert cls in html, f"missing weekly heatmap CSS class: {cls}"
+
+
 # ── Auto-refresh ─────────────────────────────────────────────────────────────
 
 

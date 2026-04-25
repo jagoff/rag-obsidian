@@ -1642,6 +1642,137 @@ function toIsoArgentina(localDateTime) {
   return v + "-03:00";
 }
 
+// Relative-time formatting for "last contact" line in the WhatsApp card
+// header. Buckets:
+//   < 60min   → "hace 12 min"
+//   < 24h     → "hoy 14:30"
+//   1 día     → "ayer 18:30"
+//   2 días    → "antes de ayer 09:00"
+//   3-6 días  → "hace 3 días"
+//   1-3 sem   → "hace 2 semanas"
+//   < 1 año   → "hace 4 meses"
+//   ≥ 1 año   → "hace 2 años"
+// Localiza con TZ del browser usando Date.parse del ISO con offset.
+function formatRelativeContact(isoStr) {
+  if (!isoStr) return "";
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return "";
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMin = Math.round(diffMs / 60000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    if (diffMin < 0) {
+      return formatFriendlyDate(isoStr);
+    }
+    if (diffMin < 60) {
+      return diffMin <= 1 ? "hace un instante" : `hace ${diffMin} min`;
+    }
+    const dDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const nowDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const dayDiff = Math.round((nowDay - dDay) / (1000 * 60 * 60 * 24));
+    if (dayDiff === 0) return `hoy ${hh}:${mm}`;
+    if (dayDiff === 1) return `ayer ${hh}:${mm}`;
+    if (dayDiff === 2) return `antes de ayer ${hh}:${mm}`;
+    if (dayDiff < 7) return `hace ${dayDiff} días`;
+    if (dayDiff < 30) {
+      const weeks = Math.round(dayDiff / 7);
+      return weeks === 1 ? "hace 1 semana" : `hace ${weeks} semanas`;
+    }
+    if (dayDiff < 365) {
+      const months = Math.round(dayDiff / 30);
+      return months === 1 ? "hace 1 mes" : `hace ${months} meses`;
+    }
+    const years = Math.round(dayDiff / 365);
+    return years === 1 ? "hace 1 año" : `hace ${years} años`;
+  } catch (_) {
+    return "";
+  }
+}
+
+// Fetch + render del bloque de contexto de WhatsApp dentro del card.
+// Llamado desde `appendWhatsAppProposal` después del recipientLine.
+// Best-effort:
+//   - Si el bridge devuelve count=0 → muestra "Sin mensajes anteriores"
+//     en gris suave (no genera ruido cuando es un primer contacto).
+//   - Si el fetch falla → silent (mejor que ensuciar con un error de
+//     algo opcional).
+//   - El thread va dentro de un <details> default-cerrado, con el
+//     summary mostrando "<relative> · N mensajes". Click expande.
+async function appendWhatsAppContext(card, jid, recipientLabel) {
+  let data = null;
+  try {
+    const res = await fetch(
+      `/api/whatsapp/context?jid=${encodeURIComponent(jid)}&limit=5`,
+      { method: "GET" },
+    );
+    if (!res.ok) return;
+    data = await res.json();
+  } catch (_) {
+    return;
+  }
+  if (!data || typeof data !== "object") return;
+  const count = Number(data.messages_count || 0);
+  const wrap = el("div", "proposal-wa-context");
+
+  if (count === 0) {
+    wrap.classList.add("empty");
+    wrap.appendChild(el("span", "proposal-wa-context-meta",
+      "Sin mensajes anteriores con este contacto"));
+    const anchor = card.querySelector(
+      ".proposal-wa-text, .proposal-wa-schedule-chip, .proposal-wa-quote, .proposal-warn",
+    );
+    if (anchor) card.insertBefore(wrap, anchor);
+    else card.appendChild(wrap);
+    return;
+  }
+
+  const lastIso = data.last_contact_at || "";
+  const relativeStr = formatRelativeContact(lastIso) || "";
+  const summary = document.createElement("summary");
+  summary.className = "proposal-wa-context-summary";
+  const metaSpan = el("span", "proposal-wa-context-meta",
+    relativeStr ? `Último contacto: ${relativeStr}` : "Mensajes anteriores");
+  summary.appendChild(metaSpan);
+  summary.appendChild(el("span", "proposal-wa-context-count",
+    ` · ${count} mensaje${count === 1 ? "" : "s"}`));
+
+  const details = document.createElement("details");
+  details.className = "proposal-wa-context-details";
+  details.appendChild(summary);
+
+  const thread = el("div", "proposal-wa-context-thread");
+  for (const msg of (data.messages || [])) {
+    const bubble = el(
+      "div",
+      msg.is_from_me
+        ? "proposal-wa-context-msg me"
+        : "proposal-wa-context-msg them",
+    );
+    const head = el("div", "proposal-wa-context-msg-head");
+    head.appendChild(el("span", "proposal-wa-context-msg-who",
+      msg.is_from_me ? "yo" : (msg.who || recipientLabel || "")));
+    if (msg.ts) {
+      const friendly = formatFriendlyDate(msg.ts);
+      if (friendly) {
+        head.appendChild(el("span", "proposal-wa-context-msg-ts", ` · ${friendly}`));
+      }
+    }
+    bubble.appendChild(head);
+    bubble.appendChild(el("div", "proposal-wa-context-msg-text", msg.text || ""));
+    thread.appendChild(bubble);
+  }
+  details.appendChild(thread);
+  wrap.appendChild(details);
+
+  const anchor = card.querySelector(
+    ".proposal-wa-text, .proposal-wa-schedule-chip, .proposal-wa-quote, .proposal-warn",
+  );
+  if (anchor) card.insertBefore(wrap, anchor);
+  else card.appendChild(wrap);
+}
+
 function appendCreatedChip(parent, payload) {
   const kind = payload.kind;                    // "reminder" | "event"
   const fields = payload.fields || {};
@@ -1785,6 +1916,17 @@ function appendWhatsAppProposal(parent, payload) {
     recipientLine.appendChild(document.createTextNode(recipientLabel));
   }
   card.appendChild(recipientLine);
+
+  // Conversation context — last messages with this contact + last
+  // contact date. Replaces the old "seguir con ›" chips below the
+  // card (those preguntaban sobre el chat RAG, ruido cuando ya hay
+  // un proposal). Fetched async after render so el card aparece
+  // instantáneamente y el contexto se llena en ~50-200ms (lectura
+  // local de SQLite del bridge). Best-effort: si el bridge está
+  // caído o no hay JID, simplemente no se muestra (silent fail).
+  if (fields.jid) {
+    appendWhatsAppContext(card, fields.jid, recipientLabel);
+  }
 
   // Schedule chip — rendered between the recipient line and the textarea
   // when a scheduled_for is present. Variants:
@@ -2842,6 +2984,16 @@ async function speak(text) {
 // Follow-up chips — generated post-done from the last turn's context.
 // Clicking a chip re-submits that question as a new turn.
 async function appendFollowups(parent, sid) {
+  // Suprimir followups cuando el turn renderizó un proposal estructurado
+  // (whatsapp / mail / calendar / etc). En esos casos el user ya tiene
+  // una acción concreta para confirmar y los chips "seguir con ›" sobre
+  // temas del RAG son ruido — distraen del proposal mismo. La feature
+  // se decidió con el user 2026-04-25.
+  try {
+    if (parent && parent.querySelector && parent.querySelector(".proposal")) {
+      return;
+    }
+  } catch (_) {}
   // AbortController registrado en el set global para cancelar si el
   // user navega de sesión antes de que el LLM termine de generar
   // followups (puede tardar 1-3s). Sin esto el fetch resuelve y

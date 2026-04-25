@@ -597,6 +597,105 @@ def _fetch_whatsapp_window(
 # ── wa-tasks state + extractor ───────────────────────────────────────────────
 
 
+def _fetch_whatsapp_recent_with_jid(jid: str, limit: int = 5) -> dict:
+    """Últimos ``limit`` mensajes intercambiados con ``jid`` para mostrar
+    contexto en el card del chat antes de mandar/programar.
+
+    Distinto de ``_fetch_whatsapp_window``:
+      - No filtra por timestamp (devuelve los últimos N independientemente
+        de cuándo fueron — útil cuando hace meses no hablan).
+      - Filtra por ``chat_jid`` específico (no batch por chat).
+      - Devuelve los mensajes en orden cronológico ascendente (más viejo
+        arriba, más nuevo abajo) — lectura natural en el thread visual.
+
+    Returns ``{jid, messages_count, last_contact_at, messages: [...]}``
+    donde cada mensaje es ``{id, ts (ISO8601 con offset Argentina), who,
+    text, is_from_me}``. Si el bridge DB no existe o no hay mensajes
+    para el JID, devuelve estructura con ``messages_count=0`` y lista
+    vacía (no raisea — es un best-effort de UI).
+
+    Privacidad: no se persiste nada de lo retornado — el endpoint que
+    consume esto solo refleja al frontend la data del bridge local.
+    """
+    import rag as _rag
+    db_path = _rag.WHATSAPP_DB_PATH
+    bot_jid = _rag.WHATSAPP_BOT_JID
+    empty = {"jid": jid, "messages_count": 0, "last_contact_at": None, "messages": []}
+    if not jid or "@" not in jid:
+        return empty
+    if not db_path.is_file():
+        return empty
+    cap = max(1, min(int(limit or 5), 20))
+    import sqlite3
+    try:
+        con = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=5.0,
+        )
+    except sqlite3.Error:
+        return empty
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+              m.id AS id,
+              m.sender AS sender,
+              m.content AS content,
+              m.timestamp AS ts,
+              m.is_from_me AS is_from_me,
+              m.media_type AS media_type,
+              c.name AS chat_name
+            FROM messages m
+            LEFT JOIN chats c ON c.jid = m.chat_jid
+            WHERE m.chat_jid = ?
+              AND m.chat_jid != ?
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+            """,
+            (jid, bot_jid, cap),
+        ).fetchall()
+    except sqlite3.Error:
+        return empty
+    finally:
+        con.close()
+
+    if not rows:
+        return empty
+
+    chat_label = _wa_chat_label((rows[0]["chat_name"] or ""), jid)
+    # Bridge guarda timestamps con offset incluido y space separator
+    # ("2024-11-28 20:59:45-03:00"). Solo normalizamos el separador a
+    # "T" para que sea ISO8601 estricto y `Date.parse` del browser lo
+    # acepte sin caprichos.
+    messages = []
+    for r in reversed(rows):  # asc (más viejo → más nuevo) para lectura natural
+        ts_raw = (r["ts"] or "").strip()
+        ts_iso = ts_raw.replace(" ", "T") if ts_raw else ""
+        is_from_me = bool(r["is_from_me"])
+        content = (r["content"] or "").strip().replace("\n", " ")
+        media = (r["media_type"] or "").strip()
+        if not content and media:
+            content = f"[{media}]"
+        if not content:
+            continue
+        who = "yo" if is_from_me else chat_label
+        messages.append({
+            "id": r["id"] or "",
+            "ts": ts_iso,
+            "who": who,
+            "text": content[:400],  # cap defensivo: el card no necesita más
+            "is_from_me": is_from_me,
+        })
+
+    last_ts = messages[-1]["ts"] if messages else None
+    return {
+        "jid": jid,
+        "messages_count": len(messages),
+        "last_contact_at": last_ts,
+        "messages": messages,
+    }
+
+
 def _wa_tasks_load_state() -> dict:
     """Returns `{last_run_ts: iso|null, processed_ids: [id, ...]}`.
 

@@ -7683,3 +7683,111 @@ main:focus-visible {
     min-height: 44px;
   }
 }
+
+
+/* ── WhatsApp card · contexto de conversación ─────────────────────────
+   Bloque entre "Para: <contacto>" y la textarea del card. Reemplaza los
+   chips "seguir con ›" que aparecían debajo del proposal — esos pre-
+   guntaban sobre temas RAG y eran ruido cuando ya había una acción
+   concreta. Ahora el user ve la conversación reciente con esa persona
+   antes de mandar/programar (calibrar tono / saber si hace mucho que
+   no hablan).
+
+   Decidido con el user 2026-04-25.
+*/
+
+.proposal-wa-context {
+  margin: 6px 0 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.proposal-wa-context.empty .proposal-wa-context-meta {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* El <details> mismo no tiene background — es solo el contenedor
+   colapsible del thread. El summary muestra el "Último contacto: ayer
+   18:30 · 4 mensajes" con un caret nativo. Click expande el thread. */
+.proposal-wa-context-details {
+  margin: 0;
+}
+
+.proposal-wa-context-summary {
+  cursor: pointer;
+  list-style: revert; /* mantenemos el ▶ default del browser para affordance */
+  user-select: none;
+  padding: 2px 0;
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-summary:hover {
+  color: var(--text);
+}
+
+.proposal-wa-context-meta {
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-count {
+  color: var(--text-faint);
+}
+
+/* Thread visual: cada mensaje es una mini burbuja inline. "yo" alineado
+   a la derecha (verde tenue), "them" a la izquierda (gris). Sin bordes
+   pesados — la idea es que se vea liviano, contexto secundario, no que
+   compita visualmente con la textarea ni con los botones de acción. */
+.proposal-wa-context-thread {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 4px;
+  border-left: 2px solid var(--border);
+}
+
+.proposal-wa-context-msg {
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
+  max-width: 100%;
+}
+
+.proposal-wa-context-msg.me {
+  background: color-mix(in srgb, var(--green, #2f8f3d) 14%, var(--bg-elev) 86%);
+  align-self: flex-end;
+  text-align: left;
+}
+
+.proposal-wa-context-msg.them {
+  background: var(--bg-elev);
+  align-self: flex-start;
+}
+
+.proposal-wa-context-msg-head {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-bottom: 2px;
+}
+
+.proposal-wa-context-msg-who {
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.proposal-wa-context-msg-ts {
+  /* sin estilo extra — hereda el color faint del head */
+}
+
+.proposal-wa-context-msg-text {
+  font-size: 11px;
+  color: var(--text);
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+}

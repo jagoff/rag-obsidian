@@ -2580,6 +2580,31 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     return {"ok": True, "jid": jid}
 
 
+@app.get("/api/whatsapp/context")
+def whatsapp_context(jid: str, limit: int = 5) -> dict:
+    """Últimos ``limit`` mensajes intercambiados con ``jid`` para mostrar
+    contexto al lado del card del chat (cuando el LLM propone un mensaje,
+    el user ve la conversación reciente antes de mandar/programar).
+
+    Reemplaza el ruido de los chips ``"seguir con ›"`` que aparecían
+    debajo de los proposals — esos preguntan sobre el chat RAG, pero
+    cuando ya hay un proposal estructurado lo útil es la conversación
+    pasada con el destinatario, no más preguntas al RAG.
+
+    Devuelve estructura siempre válida (``messages_count: 0`` si no hay
+    bridge / contacto / mensajes) — el frontend renderiza la sección
+    aunque no haya datos.
+    """
+    j = (jid or "").strip()
+    if not j or "@" not in j:
+        raise HTTPException(status_code=400, detail="jid inválido")
+    try:
+        from rag.integrations.whatsapp import _fetch_whatsapp_recent_with_jid  # noqa: PLC0415
+        return _fetch_whatsapp_recent_with_jid(j, limit=int(limit))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error leyendo bridge: {e}") from e
+
+
 @app.get("/api/whatsapp/scheduled")
 def whatsapp_scheduled_list(
     status: str | None = None,

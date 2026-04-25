@@ -18732,6 +18732,16 @@ _DEEP_MAX_ITERS = 3
 # el juez siga pidiendo sub-queries. Override por env para hosts con más
 # memoria + recursos sobrados: `export RAG_DEEP_MAX_SECONDS=60`.
 _DEEP_MAX_SECONDS = float(os.environ.get("RAG_DEEP_MAX_SECONDS", "30"))
+# Early-exit si la primera pasada ya devuelve un top score por encima de
+# este umbral. Audit 2026-04-25: `_judge_sufficiency` cuesta ~1-3s
+# (HELPER_MODEL chat call) y cuando el primer top score es > 0.8 (cross
+# encoder normalizado), la sufficiency check casi siempre devuelve
+# SUFICIENTE — gastamos el round-trip al modelo helper para nada. Skip
+# directo si el primer rerank ya nos dio una respuesta confidente.
+# Override con `RAG_DEEP_HIGH_CONF_BYPASS=0.0` para deshabilitar el
+# bypass (todas las queries pasan por el sufficiency loop) o subirlo a
+# 0.9 si querés ser más conservador.
+_DEEP_HIGH_CONF_BYPASS = float(os.environ.get("RAG_DEEP_HIGH_CONF_BYPASS", "0.8"))
 
 
 def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tuple[bool, str]:
@@ -18806,6 +18816,20 @@ def deep_retrieve(
         intent=intent,
     )
     if not result["docs"]:
+        result["deep_retrieve_iterations"] = 1
+        result["deep_retrieve_exit_reason"] = "no_docs"
+        return result
+
+    # Early-exit: si el primer top score ya es alto (cross encoder está
+    # confiado), saltarse el sufficiency loop. Ahorra el round-trip al
+    # helper LLM (~1-3s) en queries faciles. Audit 2026-04-25.
+    first_top = result["scores"][0] if result["scores"] else float("-inf")
+    if (
+        _DEEP_HIGH_CONF_BYPASS > 0.0
+        and first_top >= _DEEP_HIGH_CONF_BYPASS
+    ):
+        result["deep_retrieve_iterations"] = 1
+        result["deep_retrieve_exit_reason"] = "high_confidence_bypass"
         return result
 
     all_docs = list(result["docs"])
@@ -18821,12 +18845,16 @@ def deep_retrieve(
     # 60-70s → 3 iters = 200s (bug medido 2026-04-22). El timeout absoluto
     # garantiza que ninguna query inflame el tail del pipeline.
     _deep_t0 = time.perf_counter()
+    iters_completed = 1  # we already ran the first pass above
+    exit_reason = "max_iters"
 
     for iteration in range(1, _DEEP_MAX_ITERS):
         if time.perf_counter() - _deep_t0 > _DEEP_MAX_SECONDS:
+            exit_reason = "timeout"
             break
         sufficient, sub_query = _judge_sufficiency(question, all_docs, all_metas)
         if sufficient or not sub_query:
+            exit_reason = "sufficient" if sufficient else "no_sub_query"
             break
 
         # Sub-query retrieval — no multi-query expansion (the sub-query is
@@ -18863,7 +18891,9 @@ def deep_retrieve(
                 seen_graph.add(gf)
                 all_graph_docs.append(gd)
                 all_graph_metas.append(gm)
+        iters_completed += 1
         if added == 0:
+            exit_reason = "no_new_chunks"
             break  # sub-query didn't surface anything new
 
     # Re-sort all collected results by score, take top-k
@@ -18878,6 +18908,13 @@ def deep_retrieve(
     result["confidence"] = result["scores"][0] if result["scores"] else float("-inf")
     result["graph_docs"] = all_graph_docs
     result["graph_metas"] = all_graph_metas
+    # Audit 2026-04-25: trackeamos cuántas iteraciones corrieron y por qué
+    # exit-eamos para que el caller (chat / web / CLI) pueda loggear estos
+    # campos a `rag_queries.extra_json` y permitir queries tipo
+    # "qué fracción de queries usa más de 1 iteración?" sin necesidad de
+    # instrumentación adicional.
+    result["deep_retrieve_iterations"] = iters_completed
+    result["deep_retrieve_exit_reason"] = exit_reason
     return result
 
 

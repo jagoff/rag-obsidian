@@ -271,3 +271,159 @@ def test_deep_max_seconds_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("RAG_DEEP_MAX_SECONDS", raising=False)
         importlib.reload(rag)
+
+
+# ── Early-exit por high confidence + iteration tracking (2026-04-25) ─────
+
+
+def test_deep_retrieve_high_confidence_bypass_skips_loop(monkeypatch):
+    """Si el primer top score >= _DEEP_HIGH_CONF_BYPASS, skip el loop —
+    no llamar _judge_sufficiency. Ahorra ~1-3s del round-trip al helper."""
+    from unittest.mock import MagicMock
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(*args, **kwargs):
+        judge_calls["n"] += 1
+        return (False, "should not be called")
+
+    high_score_result = {
+        "docs": ["doc 1"],
+        "metas": [{"file": "n.md", "note": "n"}],
+        "scores": [0.95],  # > 0.8 threshold
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: high_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    assert judge_calls["n"] == 0, "judge_sufficiency NO debe correr en bypass"
+    assert out["deep_retrieve_iterations"] == 1
+    assert out["deep_retrieve_exit_reason"] == "high_confidence_bypass"
+
+
+def test_deep_retrieve_no_bypass_when_top_score_below_threshold(monkeypatch):
+    """Si top score < _DEEP_HIGH_CONF_BYPASS, debe entrar al loop."""
+    from unittest.mock import MagicMock
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(question, docs, metas):
+        judge_calls["n"] += 1
+        return (True, "")  # immediately sufficient → exits after 1 judge call
+
+    low_score_result = {
+        "docs": ["doc 1"],
+        "metas": [{"file": "n.md", "note": "n"}],
+        "scores": [0.3],  # well below 0.8
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: low_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    assert judge_calls["n"] == 1, "judge_sufficiency debe correr cuando no hay bypass"
+    assert out["deep_retrieve_exit_reason"] == "sufficient"
+
+
+def test_deep_retrieve_bypass_disabled_by_zero_threshold(monkeypatch):
+    """RAG_DEEP_HIGH_CONF_BYPASS=0 deshabilita el bypass — todas las
+    queries pasan por el sufficiency loop."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(rag, "_DEEP_HIGH_CONF_BYPASS", 0.0)
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(question, docs, metas):
+        judge_calls["n"] += 1
+        return (True, "")
+
+    high_score_result = {
+        "docs": ["doc 1"],
+        "metas": [{"file": "n.md", "note": "n"}],
+        "scores": [0.99],  # very high, but bypass is disabled
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: high_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    # Even with top score 0.99, judge runs because bypass disabled.
+    assert judge_calls["n"] == 1
+
+
+def test_deep_retrieve_iterations_reported_when_loop_runs(monkeypatch):
+    """Cuando el loop corre, deep_retrieve_iterations debe contar pasadas
+    reales (1 = solo first pass; 2 = first + 1 sub-query; etc.)."""
+    from unittest.mock import MagicMock
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(question, docs, metas):
+        judge_calls["n"] += 1
+        # Devolver insufficient en el primer call, sufficient en el segundo
+        if judge_calls["n"] == 1:
+            return (False, "sub query")
+        return (True, "")
+
+    call_idx = {"n": 0}
+
+    def fake_retrieve(*args, **kwargs):
+        call_idx["n"] += 1
+        return {
+            "docs": [f"doc {call_idx['n']}"],
+            "metas": [{"file": f"n{call_idx['n']}.md", "note": "n"}],
+            "scores": [0.5],  # below bypass threshold
+            "graph_docs": [],
+            "graph_metas": [],
+        }
+
+    monkeypatch.setattr(rag, "retrieve", fake_retrieve)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    # Iteration 1 = first pass; loop-iter 1 found 1 added doc + judge
+    # call 2 said "sufficient" → iters_completed=2.
+    assert out["deep_retrieve_iterations"] == 2
+    assert out["deep_retrieve_exit_reason"] == "sufficient"
+
+
+def test_deep_retrieve_no_docs_marks_iterations_one(monkeypatch):
+    """Si la primera pasada devuelve cero docs, no entramos al loop pero
+    igual exponemos los campos de tracking."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: {
+        "docs": [], "metas": [], "scores": [],
+        "graph_docs": [], "graph_metas": [],
+    })
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    assert out["deep_retrieve_iterations"] == 1
+    assert out["deep_retrieve_exit_reason"] == "no_docs"
+
+
+def test_deep_high_conf_bypass_default_is_0_8():
+    """Default `_DEEP_HIGH_CONF_BYPASS` = 0.8.
+
+    Threshold elegido en el audit 2026-04-25: por debajo de 0.8 el
+    sufficiency check del helper sigue produciendo signal útil; por
+    encima, casi siempre dice SUFICIENTE → es waste del round-trip al
+    LLM helper (~1-3s).
+    """
+    assert rag._DEEP_HIGH_CONF_BYPASS == 0.8, (
+        f"_DEEP_HIGH_CONF_BYPASS default debe ser 0.8 "
+        f"(fue {rag._DEEP_HIGH_CONF_BYPASS}). Ver _DEEP_HIGH_CONF_BYPASS docstring."
+    )

@@ -1933,9 +1933,16 @@ function appendCreatedChip(parent, payload) {
   if (whenText) left.appendChild(el("span", "created-chip-when", whenText));
   chip.appendChild(left);
 
-  // Right block: `deshacer` text-button for reminders only (Calendar
-  // events don't get it — no working programmatic delete).
-  if (kind === "reminder" && payload.reminder_id) {
+  // Right block: `deshacer` text-button. Para reminders y events.
+  // Antes era solo reminders porque /api/calendar/delete tardaba 60s+
+  // por scan linear en AppleScript; el fix del 2026-04-25 cambió a
+  // EventKit nativo (<200ms via objc.lookUpClass), así que el undo
+  // de events ya es viable.
+  const hasUndoTarget = (
+    (kind === "reminder" && payload.reminder_id) ||
+    (kind === "event" && payload.event_uid)
+  );
+  if (hasUndoTarget) {
     const undo = document.createElement("button");
     undo.type = "button";
     undo.className = "created-chip-undo";
@@ -1947,10 +1954,16 @@ function appendCreatedChip(parent, payload) {
       undo.disabled = true;
       status.textContent = " · deshaciendo…";
       try {
-        const res = await fetch("/api/reminders/delete", {
+        const url = kind === "event"
+          ? "/api/calendar/delete"
+          : "/api/reminders/delete";
+        const body = kind === "event"
+          ? { event_uid: payload.event_uid }
+          : { reminder_id: payload.reminder_id };
+        const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reminder_id: payload.reminder_id }),
+          body: JSON.stringify(body),
         });
         if (!res.ok) {
           const detail = await res.json().catch(() => ({}));

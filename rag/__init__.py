@@ -32807,30 +32807,102 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
     Same contract as `_delete_reminder` — feeds the undo button on the
     chat's auto-create toast for events.
 
-    Implementation note: Calendar.app's `whose uid is X` query is
-    unreliable — on vaults with many events it either times out OR
-    errors with "No puede obtenerse event 1 whose uid = ..." (macOS
-    14+ behaviour, verified 2026-04-20 via user test). The fix is to
-    iterate over writable calendars and scan each one's events until
-    we find a matching uid. Slower but reliable; timeout 30s covers
-    calendars with thousands of events.
+    Implementation note (revised 2026-04-25): el approach previo via
+    AppleScript era inviable. Calendar.app expone una API que NO usa
+    los índices internos: `every event of _cal whose uid is X` hace
+    scan linear sobre los eventos del calendar. Medido empíricamente
+    en una cuenta con 1363 eventos: 55-58s. Cualquier filter (`whose
+    uid is`, `whose start date`, `whose summary is`) toma lo mismo,
+    y JXA tampoco mejora. El timeout default rompía el botón
+    [↩ deshacer] del chip auto-creado.
+
+    El fix real es **EventKit nativo** via objc.lookUpClass —
+    `EKEventStore.eventWithIdentifier_(uid)` es lookup INDEXADO (NSDictionary
+    interno keyed por identifier). Bench: 160ms vs 58s = 360× más rápido.
+
+    EventKit framework se carga dinámicamente con NSBundle (ya viene
+    en macOS, no requiere instalar pyobjc-framework-eventkit; basta
+    pyobjc-core que ya está como dep transitivo de ocrmac). Si el
+    framework no carga (macOS futuro lo deprecó? sandbox raro?), cae
+    al path AppleScript lento como fallback.
+
+    El `uid` que retorna AppleScript `_create_calendar_event` matchea
+    1:1 con `eventIdentifier` de EventKit — verificado empíricamente
+    2026-04-25: el UUID que devuelve `uid of _ev` se puede pasar
+    directo a `eventWithIdentifier_()` sin transformación.
     """
     uid = (event_uid or "").strip()
     if not uid:
         return False, "event uid vacío"
     if not _apple_enabled():
         return False, "Apple integration deshabilitada"
+
+    # ── Path rápido: EventKit (~160ms con calendar de 1363 eventos) ──
+    # Si el framework carga, su respuesta es autoritativa: ev is None
+    # significa "ese uid no existe en este EventStore", devolvemos
+    # error inmediatamente sin caer al fallback lento. Solo caemos al
+    # AppleScript path cuando el framework EN SÍ no se pudo cargar
+    # (escenario muy raro: macOS futuro lo deprecó, sandbox bloqueó
+    # `/System/Library/Frameworks`, etc.).
+    eventkit_loaded = False
+    try:
+        import objc  # noqa: PLC0415
+        from Foundation import NSBundle  # noqa: PLC0415
+
+        ek_bundle = NSBundle.bundleWithPath_(
+            "/System/Library/Frameworks/EventKit.framework"
+        )
+        if ek_bundle is not None and ek_bundle.load():
+            eventkit_loaded = True
+            EKEventStore = objc.lookUpClass("EKEventStore")
+            store = EKEventStore.alloc().init()
+            ev = store.eventWithIdentifier_(uid)
+            if ev is None:
+                return False, "evento no encontrado"
+            # EKSpan: 0=ThisEventOnly (no toca recurrencias futuras),
+            # 1=FutureEvents. Para undo del chat queremos solo este.
+            EK_SPAN_THIS_EVENT = 0
+            # PyObjc devuelve True/False directo, o tuple (bool, err)
+            # según versión. Normalizamos.
+            ok = store.removeEvent_span_commit_error_(
+                ev, EK_SPAN_THIS_EVENT, True, None
+            )
+            if isinstance(ok, tuple):
+                ok_flag = bool(ok[0])
+                err = ok[1] if len(ok) > 1 else None
+            else:
+                ok_flag = bool(ok)
+                err = None
+            if ok_flag:
+                return True, "borrado"
+            if err is not None and hasattr(err, "localizedDescription"):
+                return False, f"EventKit: {err.localizedDescription()}"
+            return False, "EventKit removeEvent retornó False"
+    except Exception:
+        # Si el framework no cargó / pyobjc roto / etc → fallback.
+        pass
+
+    if eventkit_loaded:
+        # EventKit cargó pero algo raro pasó arriba (no debería). No
+        # caer al AppleScript lento — el path EventKit es autoritativo.
+        return False, "EventKit path loaded but failed unexpectedly"
+
+    # ── Fallback: AppleScript scan linear (lento pero compat) ──────
     safe = uid.replace('"', '\\"')
     script = (
         'tell application "Calendar"\n'
         '  try\n'
         '    repeat with _cal in (every calendar whose writable is true)\n'
-        '      repeat with _ev in (every event of _cal)\n'
-        f'        if uid of _ev is "{safe}" then\n'
-        '          delete _ev\n'
-        '          return "ok"\n'
-        '        end if\n'
-        '      end repeat\n'
+        '      try\n'
+        '        repeat with _ev in (every event of _cal)\n'
+        f'          if uid of _ev is "{safe}" then\n'
+        '            delete _ev\n'
+        '            return "ok"\n'
+        '          end if\n'
+        '        end repeat\n'
+        '      on error\n'
+        '        -- calendar problemático, seguir.\n'
+        '      end try\n'
         '    end repeat\n'
         '    return "err: evento no encontrado"\n'
         '  on error errMsg\n'
@@ -32838,7 +32910,7 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
         '  end try\n'
         'end tell\n'
     )
-    out = _osascript(script, timeout=30.0)
+    out = _osascript(script, timeout=60.0)
     if out == "ok":
         return True, "borrado"
     if out.startswith("err:"):

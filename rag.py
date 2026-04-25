@@ -52552,5 +52552,121 @@ except Exception as _e:
         pass
 
 
+# ── Whisper learning loop CLI ────────────────────────────────────────────────
+# Phase 2 del plan whatsapp-whisper-learning. Comandos para administrar el
+# vocab aprendido + correcciones manuales. Doc completo:
+# `04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md`
+# en el vault (visible desde Obsidian).
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def whisper(ctx: click.Context):
+    """Whisper learning loop — vocab + correcciones del transcript de audios.
+
+    Subcomandos:
+      rag whisper vocab refresh   # refresh `rag_whisper_vocab` from corpus
+      rag whisper vocab show      # imprimir top vocab terms (debug)
+      rag whisper stats           # resumen rápido (transcripciones, correcciones)
+    """
+    if ctx.invoked_subcommand is None:
+        # Default: print stats
+        ctx.invoke(whisper_stats)
+
+
+@whisper.group(invoke_without_command=True)
+@click.pass_context
+def vocab(ctx: click.Context):
+    """Vocab aprendido del corpus que se inyecta al --prompt de whisper.
+
+    Sources: corrections (gold), contacts (Apple Contacts), notes (vault),
+    chats (WhatsApp últimos 30d). Refresh nightly via launchd o manualmente.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(vocab_show)
+
+
+@vocab.command("refresh")
+@click.option("--quiet", is_flag=True, help="Solo imprime stats finales, no rows individuales.")
+def vocab_refresh(quiet: bool):
+    """Re-compute `rag_whisper_vocab` desde el corpus + correcciones.
+
+    Cost típico: ~5-10s para un vault de 5K notas + 14K chats. Reemplaza la
+    tabla completa (DELETE + INSERT, no incremental).
+    """
+    from rag_whisper_learning import refresh_vocab as _refresh
+    with console.status("[dim]Computando vocab…[/dim]", spinner="dots"):
+        stats = _refresh()
+    console.print(
+        f"[green]✓[/green] vocab refreshed: "
+        f"{stats['total_inserted']} terms en {stats['ms_elapsed']}ms"
+    )
+    for source, count in stats["sources"].items():
+        console.print(f"  [dim]{source:14s}: {count} candidates[/dim]")
+
+
+@vocab.command("show")
+@click.option("--source", default=None, help="Filtrar por source (corrections/contacts/notes/chats).")
+@click.option("--limit", default=30, type=int, help="Top-N a mostrar.")
+def vocab_show(source: str | None, limit: int):
+    """Imprimir top vocab terms ordenados por weight."""
+    from rag_whisper_learning import get_top_vocab_terms
+    terms = get_top_vocab_terms(limit=limit, source=source)
+    if not terms:
+        console.print("[yellow]vocab vacío — corré `rag whisper vocab refresh`[/yellow]")
+        return
+    console.print(f"[bold]Top {len(terms)} vocab terms" + (f" (source={source})" if source else "") + ":[/bold]")
+    for t in terms:
+        console.print(f"  [dim]{t['weight']:6.2f}[/dim]  [cyan]{t['source']:12s}[/cyan]  {t['term']}")
+
+
+@whisper.command("stats")
+def whisper_stats():
+    """Resumen del estado del learning loop: transcripciones logueadas,
+    correcciones acumuladas, top sources, vocab en uso."""
+    try:
+        with _ragvec_state_conn() as conn:
+            n_transcripts = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_transcripts"
+            ).fetchone()[0]
+            n_corrections = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_corrections"
+            ).fetchone()[0]
+            corrections_by_source = dict(conn.execute(
+                "SELECT source, COUNT(*) FROM rag_audio_corrections GROUP BY source"
+            ).fetchall())
+            n_vocab = conn.execute(
+                "SELECT COUNT(*) FROM rag_whisper_vocab"
+            ).fetchone()[0]
+            vocab_by_source = dict(conn.execute(
+                "SELECT source, COUNT(*) FROM rag_whisper_vocab GROUP BY source"
+            ).fetchall())
+            last_refresh = conn.execute(
+                "SELECT MAX(refreshed_at) FROM rag_whisper_vocab"
+            ).fetchone()[0]
+            avg_logprob = conn.execute(
+                "SELECT AVG(avg_logprob) FROM rag_audio_transcripts WHERE avg_logprob IS NOT NULL"
+            ).fetchone()[0]
+    except Exception as exc:
+        console.print(f"[red]error reading state: {exc}[/red]")
+        return
+    console.print(f"[bold]Whisper learning loop — estado:[/bold]")
+    console.print(f"  transcripciones logueadas: [cyan]{n_transcripts}[/cyan]")
+    if avg_logprob is not None:
+        console.print(f"  avg_logprob promedio:      [dim]{avg_logprob:.3f}[/dim] (-0=conf alta, -1=baja)")
+    console.print(f"  correcciones acumuladas:   [cyan]{n_corrections}[/cyan]")
+    for src, n in sorted(corrections_by_source.items()):
+        console.print(f"    [dim]{src:12s}: {n}[/dim]")
+    console.print(f"  vocab terms:               [cyan]{n_vocab}[/cyan]")
+    for src, n in sorted(vocab_by_source.items()):
+        console.print(f"    [dim]{src:12s}: {n}[/dim]")
+    if last_refresh:
+        from datetime import datetime
+        ago = time.time() - last_refresh
+        ago_h = int(ago / 3600)
+        ago_m = int((ago % 3600) / 60)
+        last_str = datetime.fromtimestamp(last_refresh).strftime("%Y-%m-%d %H:%M")
+        console.print(f"  último vocab refresh:      [dim]{last_str} ({ago_h}h {ago_m}m ago)[/dim]")
+
+
 if __name__ == "__main__":
     cli()

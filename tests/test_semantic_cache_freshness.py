@@ -100,6 +100,7 @@ def test_freshness_vault_path_error_assumes_fresh(monkeypatch, clean_cache_env):
 # ── Integration: lookup applies freshness ────────────────────────────────────
 
 
+@pytest.mark.slow
 def test_lookup_skips_stale_entry(clean_cache_env):
     """Integration: almacenar una entry con path, editar el archivo,
     lookup debe reportar stale_source en el probe + devolver None."""
@@ -134,6 +135,7 @@ def test_lookup_skips_stale_entry(clean_cache_env):
     assert probe2["skipped_stale"] >= 1
 
 
+@pytest.mark.slow
 def test_lookup_stale_doesnt_blow_up_fresh_entries(clean_cache_env):
     """Tener UNA entry stale + UNA entry fresh → la fresh sigue hitting."""
     vault = clean_cache_env

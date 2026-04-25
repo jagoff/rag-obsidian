@@ -178,22 +178,6 @@ def test_cross_vault_fast_path_off_when_adaptive_routing_disabled(
     assert r.fast_path is False
 
 
-def test_cross_vault_fast_path_off_when_force_full_pipeline(
-    two_vaults, monkeypatch,
-):
-    """RAG_FORCE_FULL_PIPELINE=1 overrides adaptive routing → never fast."""
-    monkeypatch.setattr(rag, "get_db_for", lambda p: _fake_col())
-    monkeypatch.setattr(rag, "retrieve",
-                        lambda *a, **kw: _fake_retrieve_result(0.9))
-    monkeypatch.setenv("RAG_FORCE_FULL_PIPELINE", "1")
-
-    r = rag.multi_retrieve(
-        two_vaults, "q", k=3, folder=None,
-        multi_query=False, auto_filter=False,
-    )
-    assert r.fast_path is False
-
-
 # ── Empty vault list: fast_path=False by default ────────────────────────────
 
 

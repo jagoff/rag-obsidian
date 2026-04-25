@@ -41,13 +41,6 @@ def test_no_skip_for_non_metadata_intent(monkeypatch, intent):
     assert rag._should_skip_reformulate(intent) is False
 
 
-def test_force_full_pipeline_overrides(monkeypatch):
-    """RAG_FORCE_FULL_PIPELINE=1 → _adaptive_routing() False → no skip."""
-    monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "1")
-    monkeypatch.setenv("RAG_FORCE_FULL_PIPELINE", "1")
-    assert rag._should_skip_reformulate("count") is False
-
-
 def test_metadata_only_intents_frozen_set():
     """Set inmutable."""
     assert isinstance(rag._METADATA_ONLY_INTENTS, frozenset)

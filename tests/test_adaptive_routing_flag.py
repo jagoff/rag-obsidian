@@ -1,10 +1,9 @@
 """Tests for adaptive routing feature flags and constants (Improvement #3 Fase A).
 
 Scope: verificar que los env vars se leen correctamente y que _adaptive_routing()
-respeta la semántica ON-default (post 2026-04-22 flip) + FORCE_FULL override +
-rollback via RAG_ADAPTIVE_ROUTING=0.  NO testea side-effects en
-retrieve()/expand_queries() — esos tests viven en
-test_adaptive_fast_path.py / test_adaptive_metadata_skip.py.
+respeta la semántica ON-default (post 2026-04-22 flip) + rollback via
+RAG_ADAPTIVE_ROUTING=0.  NO testea side-effects en retrieve()/expand_queries()
+— esos tests viven en test_adaptive_fast_path.py / test_adaptive_metadata_skip.py.
 """
 from __future__ import annotations
 
@@ -16,29 +15,18 @@ def test_adaptive_routing_default_on(monkeypatch):
     Pre-flip este test era `default_off`.  Ver
     tests/test_adaptive_routing_default.py para la justificación."""
     monkeypatch.delenv("RAG_ADAPTIVE_ROUTING", raising=False)
-    monkeypatch.delenv("RAG_FORCE_FULL_PIPELINE", raising=False)
     import rag
     assert rag._adaptive_routing() is True
 
 
 def test_adaptive_routing_enabled_by_env(monkeypatch):
     monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "1")
-    monkeypatch.delenv("RAG_FORCE_FULL_PIPELINE", raising=False)
     import rag
     assert rag._adaptive_routing() is True
 
 
-def test_adaptive_routing_force_full_wins(monkeypatch):
-    """RAG_FORCE_FULL_PIPELINE=1 override incluso con adaptive=1."""
-    monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "1")
-    monkeypatch.setenv("RAG_FORCE_FULL_PIPELINE", "1")
-    import rag
-    assert rag._adaptive_routing() is False
-
-
 def test_adaptive_routing_disabled_values(monkeypatch):
     """Rollback explícito vía valores falsy estrictos."""
-    monkeypatch.delenv("RAG_FORCE_FULL_PIPELINE", raising=False)
     for val in ("0", "false", "no"):
         monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", val)
         import rag
@@ -49,7 +37,6 @@ def test_adaptive_routing_empty_string_is_on(monkeypatch):
     """String vacío (launchd plists sin el env) se interpreta como "no seteado".
     Post 2026-04-22 eso implica default ON — pre-flip era OFF."""
     monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "")
-    monkeypatch.delenv("RAG_FORCE_FULL_PIPELINE", raising=False)
     import rag
     assert rag._adaptive_routing() is True
 

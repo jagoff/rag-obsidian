@@ -44,58 +44,15 @@ from web.tools import (
 from web import server as server_mod
 from web.server import app
 
-
-# ── SSE parsing helpers ────────────────────────────────────────────────────
-
-
-_EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
-
-
-def _parse_sse(body: str) -> list[tuple[str, dict]]:
-    """Parse an SSE stream body into `[(event, data_dict), ...]`."""
-    out: list[tuple[str, dict]] = []
-    for m in _EVENT_RE.finditer(body):
-        try:
-            payload = json.loads(m.group("data"))
-        except Exception:
-            payload = {}
-        out.append((m.group("event"), payload))
-    return out
+# SSE parsing + Ollama mock consolidados en conftest.py (2026-04-25 saneamiento).
+# Antes cada archivo de test_web_chat_*.py tenía su copia byte-idéntica.
+from tests.conftest import _parse_sse, _OllamaMock  # noqa: F401 — usados en test bodies
 
 
 def _last_chat_timing(captured_text: str) -> str | None:
     """Return the most recent `[chat-timing] ...` line in captured output."""
     lines = [ln for ln in captured_text.splitlines() if ln.startswith("[chat-timing]")]
     return lines[-1] if lines else None
-
-
-# ── Ollama mock ────────────────────────────────────────────────────────────
-
-
-class _OllamaMock:
-    """Scripted stand-in for `ollama.chat`.
-
-    `responses` is a list of pre-built responses consumed in FIFO order. Each
-    element is either:
-      - a SimpleNamespace (non-streaming, returned directly), OR
-      - a list of SimpleNamespace chunks (streaming, wrapped in `iter(...)`).
-
-    The distinction is detected via the `stream` kwarg on each call.
-    """
-
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls: list[dict] = []
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append(kwargs)
-        if not self.responses:
-            raise AssertionError("OllamaMock: ran out of scripted responses")
-        resp = self.responses.pop(0)
-        if kwargs.get("stream"):
-            # Streaming: wrap the list in an iterator of chunks.
-            return iter(resp)
-        return resp
 
 
 def _mk_msg(content: str = "", tool_calls=None) -> SimpleNamespace:

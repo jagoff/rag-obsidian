@@ -121,6 +121,7 @@ def test_no_changes_after_first_index_is_fast_path(tmp_setup, tmp_path):
     assert stats["removed"] == 0
 
 
+@pytest.mark.slow
 def test_incremental_picks_up_modified_file(tmp_setup, tmp_path):
     v = _mk_vault(tmp_path / "vault", {"a.md": "original"})
     rag.auto_index_vault(v)
@@ -136,6 +137,7 @@ def test_incremental_picks_up_modified_file(tmp_setup, tmp_path):
     assert stats["indexed"] == 1
 
 
+@pytest.mark.slow
 def test_incremental_picks_up_new_file(tmp_setup, tmp_path):
     v = _mk_vault(tmp_path / "vault", {"a.md": "a"})
     rag.auto_index_vault(v)

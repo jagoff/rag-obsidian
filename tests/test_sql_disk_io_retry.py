@@ -41,26 +41,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import rag
 
 
-# ── isolation: redirigir `_SQL_STATE_ERROR_LOG` al tmp por test ──────────────
-#
-# Casi todos los tests de este archivo fuerzan `OperationalError("disk I/O
-# error")` adentro del writer/reader para ejercer el retry — cuando el budget
-# de 5 intentos se agota, `_sql_write_with_retry` / `_sql_read_with_retry`
-# caen en `_log_sql_state_error("test_tag", ...)` que por default appendea al
-# JSONL de producción (`~/.local/share/obsidian-rag/sql_state_errors.jsonl`).
-# Eso contamina la telemetry observada por `rag stats` (sección "silent_errors")
-# con eventos `"event": "test_tag"` fake.
-#
-# Fix simétrico al de `tests/test_sql_lock_retry.py`: autouse fixture que
-# monkeypatchea el Path module-level a un archivo dentro del `tmp_path` del
-# test. Scope acotado a este archivo.
-@pytest.fixture(autouse=True)
-def _isolate_sql_state_error_log(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        rag, "_SQL_STATE_ERROR_LOG", tmp_path / "sql_state_errors.jsonl"
-    )
-
-
 # ── write retry reintenta disk I/O error ─────────────────────────────────────
 
 

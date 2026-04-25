@@ -17,23 +17,6 @@ import rag
 from web import server as server_mod
 
 
-# ── isolation: redirect el sink de errors silentes al tmp por test ─────────
-# Cada test agota el retry budget intencionalmente (writers que tiran
-# OperationalError forever) → `_persist_with_sqlite_retry` termina en
-# `_log_sql_state_error("test_tag", ...)`, que appendea al JSONL de
-# producción (`~/.local/share/obsidian-rag/sql_state_errors.jsonl`).
-# Sin isolation, una corrida full de la suite suma ~6× attempts cada
-# (≈48 entradas `test_tag` por run) que contaminan los rollups del
-# `/api/status/errors` dashboard. Auditoría 2026-04-24 detectó 161
-# entradas `test_tag` acumuladas en 24h. Mismo patrón que
-# `tests/test_sql_lock_retry.py::_isolate_sql_state_error_log`.
-@pytest.fixture(autouse=True)
-def _isolate_sql_state_error_log(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        rag, "_SQL_STATE_ERROR_LOG", tmp_path / "sql_state_errors.jsonl"
-    )
-
-
 def test_persist_with_sqlite_retry_default_attempts_is_8():
     """Default bumped 3→8 para alinear con rag.py y cubrir WAL contention
     con 3+ writers concurrentes (queries + memory + cpu samplers)."""

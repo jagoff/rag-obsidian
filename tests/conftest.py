@@ -441,3 +441,104 @@ def _detect_test_tag_leak_to_prod_jsonl():
             f"  reference pattern) to whichever test file is bypassing it.",
             stacklevel=2,
         )
+
+
+# ─── Shared test helpers (consolidated 2026-04-25 saneamiento) ──────────────
+#
+# Antes de esta consolidación estas tres cosas estaban duplicadas en 16+
+# archivos de test. Moverlas acá hace que los tests no tengan que
+# reimplementar la plumbing básica.
+#
+# `fake_embed`: fixture de embedding determinístico simple. 14 archivos
+# (test_ambient, test_today, test_capture_morning_dead, etc.) tenían
+# exactamente este mismo cuerpo copiado. Algunas copias ni siquiera
+# hacían `return` del mock, así que llamar a `fake_embed` devolvía None.
+# Esta versión centralizada devuelve la función para quien la quiera usar
+# directo.
+#
+# `_parse_sse` + `_EVENT_RE`: parser de SSE body. Duplicado en 4 archivos
+# (test_home_progress_stream, test_web_chat_tools, test_web_chat_low_conf_bypass,
+# test_web_chat_semantic_cache). Cuerpo byte-idéntico.
+#
+# `_OllamaMock`: mock scripted de ollama.chat. Duplicado en
+# test_web_chat_tools y test_web_chat_mode con solo el docstring
+# difiriendo.
+#
+# Lo que NO movimos: versiones únicas de `fake_embed` (hash-based en
+# test_feedback.py, call-tracking en test_query_caches.py) y variantes
+# inline (test_filing, test_wiki_layer, test_auto_index, test_topic_shift)
+# — esas siguen locales porque su comportamiento difiere intencionalmente.
+
+
+import json as _json_for_helpers
+import re as _re_for_helpers
+
+
+@pytest.fixture
+def fake_embed(monkeypatch):
+    """Embedding mock simple — 1-hot vector 4-dim.
+
+    Tests que necesiten un `rag.embed` determinístico y barato usan esto.
+    Para tests que necesitan embeddings distintos por texto (semantic cache
+    similarity), ver el fixture hash-based en test_feedback.py.
+    """
+    import rag as _rag
+
+    def _embed(texts):
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(_rag, "embed", _embed)
+    return _embed
+
+
+_EVENT_RE = _re_for_helpers.compile(
+    r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n"
+)
+
+
+def _parse_sse(body: str) -> list[tuple[str, dict]]:
+    """Parsea un SSE body en `[(event, data_dict), ...]`.
+
+    Tests del web server que assertan sobre streams de eventos usan este
+    helper. El format es el estándar SSE: `event: NAME\\ndata: {json}\\n\\n`.
+    Data que no parsea como JSON se devuelve como dict vacío (casos
+    degenerados tipo heartbeats).
+    """
+    out: list[tuple[str, dict]] = []
+    for m in _EVENT_RE.finditer(body):
+        try:
+            payload = _json_for_helpers.loads(m.group("data"))
+        except Exception:
+            payload = {}
+        out.append((m.group("event"), payload))
+    return out
+
+
+class _OllamaMock:
+    """Scripted stand-in para `ollama.chat`.
+
+    `responses` es una lista de respuestas preconstruídas consumidas en
+    orden FIFO. Cada elemento puede ser:
+      - Un SimpleNamespace (no-streaming): se devuelve directo.
+      - Una lista de SimpleNamespace (streaming): se envuelve en `iter(...)`.
+
+    La distinción se detecta por el kwarg `stream` de la llamada.
+    Collectea cada call en `self.calls` con todos los kwargs (model,
+    options, stream, tools...) para que los tests puedan assertar sobre
+    ellos.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        if not self.responses:
+            raise AssertionError(
+                "OllamaMock: ran out of scripted responses"
+            )
+        resp = self.responses.pop(0)
+        if kwargs.get("stream"):
+            return iter(resp)
+        return resp

@@ -19,13 +19,6 @@ class _FakeResponse:
 
 
 @pytest.fixture
-def fake_embed(monkeypatch):
-    def _embed(texts):
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
-    monkeypatch.setattr(rag, "embed", _embed)
-
-
-@pytest.fixture
 def tmp_vault(tmp_path, monkeypatch, fake_embed):
     vault = tmp_path / "vault"
     (vault / "00-Inbox").mkdir(parents=True)

@@ -39,15 +39,6 @@ def test_fast_path_false_when_flag_off(monkeypatch):
     assert result["fast_path"] is False
 
 
-def test_fast_path_false_when_force_full_pipeline(monkeypatch):
-    """FORCE_FULL_PIPELINE=1 → _adaptive_routing() False → fast_path False."""
-    monkeypatch.setenv("RAG_ADAPTIVE_ROUTING", "1")
-    monkeypatch.setenv("RAG_FORCE_FULL_PIPELINE", "1")
-    col = _make_mock_col(0)
-    result = rag.retrieve(col, "test", k=5, folder=None)
-    assert result["fast_path"] is False
-
-
 def test_fast_path_key_present_in_result():
     """result siempre tiene fast_path key (nunca KeyError)."""
     col = _make_mock_col(0)
@@ -68,10 +59,8 @@ def test_lookup_num_ctx_default_is_4096():
 
     Pre-fix default 2048 truncó el context antes del chunk relevante en
     queries de alta confianza, devolviendo refuses falsos aunque el doc
-    estaba en el top-5 del rerank. Reproducible con
-    `RAG_FORCE_FULL_PIPELINE=1 rag query "curso de liderazgo estratégico"`
-    (responde bien) vs sin la flag (responde "No tengo esa información"
-    pre-2048, responde bien post-4096).
+    estaba en el top-5 del rerank (ej. "curso de liderazgo estratégico"
+    respondía "No tengo esa información" pre-bump, responde bien post-4096).
 
     El default es env-overridable vía RAG_LOOKUP_NUM_CTX pero el valor
     sin override debe ser 4096 para evitar la regresión.

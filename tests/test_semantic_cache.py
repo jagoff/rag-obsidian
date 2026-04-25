@@ -477,6 +477,7 @@ def test_background_store_respects_gating(clean_cache_env):
     assert stats["rows"] == 0, "gated stores must not enqueue any work"
 
 
+@pytest.mark.slow
 def test_background_store_does_not_block_under_contention(clean_cache_env, monkeypatch):
     """background=True must return in <100ms even if the underlying write
     is forced into its full retry budget (simulated via a slow connection).

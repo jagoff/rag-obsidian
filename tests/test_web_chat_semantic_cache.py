@@ -33,20 +33,10 @@ from web.server import app
 import rag
 
 
-# ── SSE helpers ──────────────────────────────────────────────────────────────
-
-_EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
-
-
-def _parse_sse(body: str) -> list[tuple[str, dict]]:
-    out: list[tuple[str, dict]] = []
-    for m in _EVENT_RE.finditer(body):
-        try:
-            payload = json.loads(m.group("data"))
-        except Exception:
-            payload = {}
-        out.append((m.group("event"), payload))
-    return out
+# SSE parser viene de conftest (consolidado 2026-04-25). El _OllamaMock LOCAL
+# queda porque el semantic-hit-replay path debe dar `calls == []`, y la
+# AssertionError custom acá documenta esa invariante.
+from tests.conftest import _parse_sse  # noqa: F401 — usado en test bodies
 
 
 class _OllamaMock:

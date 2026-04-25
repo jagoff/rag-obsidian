@@ -15,14 +15,6 @@ class _FakeResponse:
 
 
 @pytest.fixture
-def fake_embed(monkeypatch):
-    def _embed(texts):
-        # Match the dim used by the fixture below.
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
-    monkeypatch.setattr(rag, "embed", _embed)
-
-
-@pytest.fixture
 def vault_with_corpus(tmp_path, monkeypatch, fake_embed):
     """Tmp vault + collection populated with a typed corpus so folder
     suggestion has somewhere reasonable to point.

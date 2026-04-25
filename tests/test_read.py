@@ -26,13 +26,6 @@ _SUMMARY = (
 
 
 @pytest.fixture
-def fake_embed(monkeypatch):
-    def _embed(texts):
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
-    monkeypatch.setattr(rag, "embed", _embed)
-
-
-@pytest.fixture
 def fake_chat(monkeypatch):
     """Default chat stub: summary for command-r, empty YAML list for helper
     (tag picker). Tests that need richer tag picking override this.

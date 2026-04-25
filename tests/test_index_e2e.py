@@ -18,13 +18,16 @@ import pytest
 
 os.environ.setdefault("RAG_MEMORY_PRESSURE_DISABLE", "1")
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("RAG_RUN_E2E"),
-    reason=(
-        "End-to-end index test — requires ollama + bge-m3 pulled. "
-        "Opt in with RAG_RUN_E2E=1."
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("RAG_RUN_E2E"),
+        reason=(
+            "End-to-end index test — requires ollama + bge-m3 pulled. "
+            "Opt in with RAG_RUN_E2E=1."
+        ),
     ),
-)
+    pytest.mark.slow,
+]
 
 
 _NOTES = [

@@ -40,6 +40,7 @@ import fcntl
 import hashlib
 import json
 import queue
+import random
 import re
 import secrets
 import subprocess
@@ -190,9 +191,7 @@ def _nli_max_claims() -> int:
 # skipear stages (expand_queries en comparison/synthesis, citation-repair
 # en lookup fast-path) y ajustar rerank_pool / num_ctx / chat_model según
 # el intent clasificado. Default OFF = pipeline legacy bit-identical.
-# RAG_FORCE_FULL_PIPELINE=1 es un debug override que corre todos los
-# stages aun con adaptive ON — útil para A/B local del overhead del
-# dispatch sin los skips. Ver docs/improvement-3-adaptive-routing-design.md.
+# Ver docs/improvement-3-adaptive-routing-design.md.
 _LOOKUP_THRESHOLD = float(os.environ.get("RAG_LOOKUP_THRESHOLD", "0.6"))
 _LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
 # num_ctx para el fast-path lookup. Default 4096 tras medición 2026-04-22
@@ -202,9 +201,7 @@ _LOOKUP_MODEL = os.environ.get("RAG_LOOKUP_MODEL", "qwen2.5:3b")
 # + graph neighbors frecuentemente superan los 2048 tokens, y qwen2.5:3b
 # ve un contexto truncado al primer chunk (típicamente el más corto, no el
 # más relevante). 4096 cabe el context típico sin truncation + qwen2.5:3b
-# todavía es ~2x más rápido que el modelo 7b full. Reproducible:
-# `RAG_FORCE_FULL_PIPELINE=1 rag query "curso de liderazgo estratégico"`
-# (responde bien) vs sin la flag (refuse falso pre-fix). Override via env.
+# todavía es ~2x más rápido que el modelo 7b full. Override via env.
 _LOOKUP_NUM_CTX = int(os.environ.get("RAG_LOOKUP_NUM_CTX", "4096"))
 
 # Per-intent rerank pool override. Synthesis/comparison necesitan más pool
@@ -251,11 +248,7 @@ def _adaptive_routing() -> bool:
     only: count/list/recent/agenda/entity_lookup) sin adivinar.
 
     Rollback: `export RAG_ADAPTIVE_ROUTING=0` → pipeline legacy bit-idéntico.
-    Debug escape: `RAG_FORCE_FULL_PIPELINE=1` ignora todos los skips aun con
-    adaptive ON (útil para A/B local del overhead de dispatch sin los skips).
     """
-    if os.environ.get("RAG_FORCE_FULL_PIPELINE") == "1":
-        return False
     val = os.environ.get("RAG_ADAPTIVE_ROUTING", "").strip().lower()
     # Default ON: empty / unset / "1" / "true" / "yes" → True.
     # Explicit OFF: "0" / "false" / "no" → False.
@@ -10136,7 +10129,10 @@ def semantic_chunks(
 # persistentes repiten paraphrases idénticas (seed=42, deterministico) entre
 # queries — cachear ahorra ~50-150ms por hit dentro del proceso. Capacidad
 # calibrada: 512 strings × 1024 dims × 4B ≈ 2MB, ruido en memoria.
-_EMBED_CACHE_MAX = 512
+# Tunable vía env para deployments con alta QPS (subir el cap → más hit
+# rate) vs constrained memory (bajarlo). Default 512 × 1024 dims × 4 bytes
+# ≈ 2MB — presupuesto bajo.
+_EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
 _embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 _embed_cache_lock = threading.Lock()
 
@@ -10247,7 +10243,9 @@ def embed(texts: list[str]) -> list[list[float]]:
             _last_exc = exc
             if attempt == 3:
                 raise
-            time.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
+            # 1.5s, 3s, 6s + jitter (0-0.5s) para evitar thundering herd
+            # cuando varios workers retryan en lockstep post ollama-restart.
+            time.sleep(1.5 * (2 ** attempt) + random.random() * 0.5)
     else:
         raise _last_exc  # pragma: no cover
     fresh = resp.embeddings
@@ -34030,7 +34028,7 @@ _GDRIVE_EXPORT_MIME: dict[str, str] = {
 # faltar sin romper el resto. Cache bounded a 256 entradas (LRU manual
 # — la 257a entrada evicta la más vieja por orden de inserción).
 
-_PERSON_ALIAS_CACHE: dict[str, tuple[str, ...]] = {}
+_PERSON_ALIAS_CACHE: "OrderedDict[str, tuple[str, ...]]" = OrderedDict()
 _PERSON_ALIAS_CACHE_MAX = 256
 
 # Punctuation / emoji chars that WhatsApp contact names frequently use as
@@ -34083,6 +34081,8 @@ def _resolve_person_aliases(name: str) -> tuple[str, ...]:
 
     cached = _PERSON_ALIAS_CACHE.get(name_clean)
     if cached is not None:
+        # LRU: marcar como recién usado para no ser evictado enseguida.
+        _PERSON_ALIAS_CACHE.move_to_end(name_clean)
         return cached
 
     candidates: set[str] = set()
@@ -34205,14 +34205,13 @@ def _resolve_person_aliases(name: str) -> tuple[str, ...]:
         key=len,
     )[:8])
 
-    # Bounded cache with simple LRU-like eviction — evict the oldest
-    # insertion when full. Python dicts preserve insertion order since
-    # 3.7 so `next(iter(...))` is the oldest key.
+    # Bounded cache con LRU real via OrderedDict — evict el LRU
+    # (least recently used) cuando está lleno. move_to_end en el getter
+    # arriba mantiene el orden correcto.
     if len(_PERSON_ALIAS_CACHE) >= _PERSON_ALIAS_CACHE_MAX:
         try:
-            oldest = next(iter(_PERSON_ALIAS_CACHE))
-            del _PERSON_ALIAS_CACHE[oldest]
-        except StopIteration:
+            _PERSON_ALIAS_CACHE.popitem(last=False)
+        except KeyError:
             pass
     _PERSON_ALIAS_CACHE[name_clean] = result
     return result
@@ -41472,7 +41471,7 @@ def serve(host: str, port: int):
     # (~20-30s) cuando nada cambió. Key: (question, session_id). TTL 5min
     # — balance entre freshness (notas nuevas indexadas) y hit rate. Cap 64
     # entries (LRU) — budget de memoria ~200KB.
-    _serve_cache: dict[str, tuple[float, dict]] = {}
+    _serve_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
     _SERVE_CACHE_MAX = 64
     _SERVE_CACHE_TTL = 300.0  # seconds
 
@@ -41484,14 +41483,16 @@ def serve(host: str, port: int):
         if time.time() - ts > _SERVE_CACHE_TTL:
             _serve_cache.pop(key, None)
             return None
+        # LRU: marcar como recién usado para que no sea evictado en próximo put.
+        _serve_cache.move_to_end(key)
         return payload
 
     def _cache_put(key: str, payload: dict) -> None:
         if len(_serve_cache) >= _SERVE_CACHE_MAX:
-            # Drop oldest (insertion order). Dict preserves order in 3.7+.
+            # LRU: pop oldest (least recently used).
             try:
-                _serve_cache.pop(next(iter(_serve_cache)))
-            except StopIteration:
+                _serve_cache.popitem(last=False)
+            except KeyError:
                 pass
         _serve_cache[key] = (time.time(), payload)
 

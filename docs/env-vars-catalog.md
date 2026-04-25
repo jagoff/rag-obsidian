@@ -61,7 +61,6 @@ Para cambiar cualquier default: setear el env var en el shell antes de invocar e
 | `_CONTRADICTION_ASYNC` | `1` (on) | `rag.py:18215` | Async default para el contradiction detector. Setear `0` para sync (útil si debugueás un falso positivo). |
 | `OBSIDIAN_RAG_WEB_CHAT_MODEL` | `qwen2.5:7b` | `rag.py:36775` | Override del chat model del web server. Generado al plist en `rag setup`. |
 | `RAG_CACHE_ENABLED` | `1` (on) | `rag.py:4058` | Master switch del semantic cache. Tests autouse lo fuerzan a `0`. |
-| `RAG_FORCE_FULL_PIPELINE` | `""` (off) | `rag.py` | Debug — ignora el fast-path dispatch y corre siempre full rerank + LLM. |
 | `RAG_NO_WARMUP` | `""` (off) | `rag.py` | Debug — skippea el warmup del reranker + bge-m3 + corpus cache en startup. |
 | `RAG_OCR` | `""` (on) | `rag.py` | Opt-out del OCR de imágenes embebidas (Apple Vision). `0` desactiva. |
 | `RAG_POSTPROCESS_MODEL` | `""` | `rag.py:135` | Override del model LLM usado en stages de postprocess (critique, NLI repair). Default = chat model. |

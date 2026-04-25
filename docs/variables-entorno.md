@@ -154,13 +154,6 @@ export RAG_ADAPTIVE_ROUTING=0        # desactivar
 export RAG_ADAPTIVE_ROUTING=1        # activar explícito (default)
 ```
 
-### `RAG_FORCE_FULL_PIPELINE=1`
-Fuerza el pipeline completo aun con adaptive routing activado. Útil para debugging.
-
-```bash
-export RAG_FORCE_FULL_PIPELINE=1
-```
-
 ### `RAG_ENTITY_LOOKUP`
 Activa el dispatch a `handle_entity_lookup()` para queries tipo "todo sobre Astor". Default: ON desde 2026-04-21.
 

@@ -37,32 +37,6 @@ import pytest
 import rag
 
 
-# ── isolation: redirigir `_SQL_STATE_ERROR_LOG` al tmp por test ──────────────
-#
-# Los tests de este archivo llaman `_sql_write_with_retry(..., "test_tag")` y
-# `_sql_read_with_retry(..., "test_tag", ...)` varias veces con writers/readers
-# que fuerzan `OperationalError` para ejercer el camino de retry. Cuando el
-# budget se agota o el error NO es transient, el helper termina en
-# `_log_sql_state_error("test_tag", ...)` — que por default appendea al
-# JSONL de producción (`~/.local/share/obsidian-rag/sql_state_errors.jsonl`).
-#
-# Pre-fix: cada corrida de la suite inflaba ese archivo con ~9 entradas
-# `"event": "test_tag"` inútiles que después contaminaban `rag stats`
-# (sección "silent_errors") y los rollups de 24 h (`_rollup(_SQL_STATE_ERROR_LOG)`
-# en `rag.py`). Auditoría 2026-04-22 contó 617 entradas fake acumuladas.
-#
-# Fix: autouse fixture que monkeypatchea el Path module-level a un archivo
-# dentro del `tmp_path` del test. Scope acotado a este archivo (no global en
-# conftest) porque otros tests — p.ej. `tests/test_sql_state_primitives.py`
-# si los llegara a haber — pueden querer validar el path real como parte
-# del contrato.
-@pytest.fixture(autouse=True)
-def _isolate_sql_state_error_log(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        rag, "_SQL_STATE_ERROR_LOG", tmp_path / "sql_state_errors.jsonl"
-    )
-
-
 # ── _sql_write_with_retry: attempts + backoff invariants ──────────────────────
 
 

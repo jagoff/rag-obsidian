@@ -2,8 +2,8 @@
 """Standalone benchmark: ollama vs MLX backend for /api/chat.
 
 Usage:
-    python tests/bench_mlx_vs_ollama.py            # full bench (restarts service)
-    python tests/bench_mlx_vs_ollama.py --dry-run  # 2 queries, no restart
+    python benchmarks/bench_mlx_vs_ollama.py            # full bench (restarts service)
+    python benchmarks/bench_mlx_vs_ollama.py --dry-run  # 2 queries, no restart
 
 Requires: web service already installed as com.fer.obsidian-rag-web launchd.
 """

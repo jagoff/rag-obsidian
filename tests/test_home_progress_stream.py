@@ -41,22 +41,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-
-# ── SSE parsing helpers ────────────────────────────────────────────────────
-
-
-_EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
-
-
-def _parse_sse(body: str) -> list[tuple[str, dict]]:
-    out: list[tuple[str, dict]] = []
-    for m in _EVENT_RE.finditer(body):
-        try:
-            payload = json.loads(m.group("data"))
-        except Exception:
-            payload = {}
-        out.append((m.group("event"), payload))
-    return out
+# SSE parsing helpers vienen de conftest (consolidado 2026-04-25 — antes estos
+# mismos 10 LOC estaban duplicados en 4 archivos web_chat + este).
+from tests.conftest import _parse_sse  # noqa: F401 — usado en test bodies
 
 
 # Names of every fetcher the SSE `hello` event must announce so the UI
@@ -184,6 +171,7 @@ def test_progress_callback_fires_error_when_fetcher_raises(monkeypatch, stub_fet
     assert ("forecast", "forecast api 503") in errors
 
 
+@pytest.mark.slow
 def test_progress_callback_fires_timeout_when_fetcher_blows_budget(
     monkeypatch, stub_fetchers
 ):
@@ -377,6 +365,7 @@ def test_pendientes_progress_callback_emits_substages(monkeypatch):
     assert seen_dones == expected, f"missing dones: {expected - seen_dones}"
 
 
+@pytest.mark.slow
 def test_stream_done_persists_into_home_state_cache(stub_fetchers):
     """After a successful stream, `/api/home` (non-stream) should serve
     the same payload from cache without re-running the fan-out — the
@@ -551,6 +540,7 @@ def test_diagnose_home_slowdown_detects_unreachable_ollama(monkeypatch):
     assert diag["details"]["ollama_state"] == "unreachable"
 
 
+@pytest.mark.slow
 def test_stream_emits_degraded_event_when_slow(monkeypatch, stub_fetchers):
     """End-to-end: con un fetcher artificialmente lento + threshold
     bajado a 0.1s, el stream debe emitir UN sólo `event: degraded`

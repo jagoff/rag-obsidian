@@ -9,13 +9,6 @@ import rag
 
 
 @pytest.fixture
-def fake_embed(monkeypatch):
-    def _embed(texts):
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
-    monkeypatch.setattr(rag, "embed", _embed)
-
-
-@pytest.fixture
 def tmp_urls_col(tmp_path, monkeypatch, fake_embed):
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(

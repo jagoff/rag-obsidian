@@ -44,21 +44,11 @@ from web import server as server_mod
 from web.server import app
 
 
-# ── SSE parsing helpers ────────────────────────────────────────────────────
-
-
-_EVENT_RE = re.compile(r"event: (?P<event>[^\n]+)\ndata: (?P<data>[^\n]*)\n\n")
-
-
-def _parse_sse(body: str) -> list[tuple[str, dict]]:
-    out: list[tuple[str, dict]] = []
-    for m in _EVENT_RE.finditer(body):
-        try:
-            payload = json.loads(m.group("data"))
-        except Exception:
-            payload = {}
-        out.append((m.group("event"), payload))
-    return out
+# SSE parser viene de conftest (consolidado 2026-04-25). El _OllamaMock LOCAL
+# queda porque tiene el invariante del bypass: si el bypass funcionó, `calls`
+# debe quedar vacía, y el AssertionError custom acá documenta eso. El de
+# conftest es genérico.
+from tests.conftest import _parse_sse  # noqa: F401 — usado en test bodies
 
 
 # ── Ollama mock: tracks call count so tests can assert bypass skipped LLM ──

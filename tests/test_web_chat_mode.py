@@ -67,23 +67,9 @@ def _canned_retrieve(fast_path: bool, query: str = "explicame qué es ikigai") -
     }
 
 
-class _OllamaMock:
-    """Scripted stand-in para `ollama.chat`.
-    Collectea cada call con kwargs (model, options, stream, tools...).
-    """
-
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls: list[dict] = []
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append(kwargs)
-        if not self.responses:
-            raise AssertionError("OllamaMock: ran out of scripted responses")
-        resp = self.responses.pop(0)
-        if kwargs.get("stream"):
-            return iter(resp)
-        return resp
+# _OllamaMock viene de conftest (consolidado 2026-04-25 — antes byte-idéntico
+# al de test_web_chat_tools con solo el docstring en español).
+from tests.conftest import _OllamaMock  # noqa: F401 — usado en test bodies
 
 
 def _mk_stream(tokens: list[str]) -> list[SimpleNamespace]:

@@ -8619,6 +8619,19 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     font-variant-numeric: tabular-nums;
     cursor: default;
   }}
+  /* Refresh button al lado del título h1: link simple que recarga la página
+     sin esperar el auto-refresh de 60s. Visible pero no intrusivo. */
+  .refresh-btn {{
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 16px;
+    margin-left: 8px;
+    padding: 0 6px;
+    border-radius: 4px;
+    transition: color .12s ease, background .12s ease;
+    display: inline-block;
+  }}
+  .refresh-btn:hover {{ color: var(--accent); background: var(--bg-elev); }}
 </style>
 </head>
 <body>
@@ -8629,8 +8642,8 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     <a href="/status">status</a>
     <a href="/transcripts" class="active">transcripts</a>
   </nav>
-  <h1>whisper transcripts</h1>
-  <p class="meta">phase 2 learning loop · vocab refresh: {_esc(last_refresh_str)}</p>
+  <h1>whisper transcripts <a href="/transcripts" class="refresh-btn" title="recargar ahora">↻</a></h1>
+  <p class="meta">phase 2 learning loop · vocab refresh: {_esc(last_refresh_str)}{" · auto-refresh OFF" if nofresh else ""}</p>
 
   <div class="summary">
     <div class="stat"><div class="num">{n_30d}</div><div class="lbl">audios 30d ({n_total} total)</div></div>

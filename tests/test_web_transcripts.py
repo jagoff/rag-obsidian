@@ -32,15 +32,33 @@ def test_transcripts_renders_basic_structure():
     """HTML tiene los componentes principales del dashboard."""
     resp = _client.get("/transcripts")
     html = resp.text
-    # Header
+    # Header (puede tener un refresh button inline, no asumir exact match).
     assert "<title>whisper transcripts" in html
-    assert "<h1>whisper transcripts</h1>" in html
+    assert "<h1>whisper transcripts" in html
     # Secciones principales
     assert "logprob histogram" in html
     assert "vocab por source" in html
     assert "últimas 30 transcripciones" in html
     assert "últimas 20 correcciones" in html
     assert "top 50 vocab terms" in html
+
+
+def test_transcripts_has_manual_refresh_button():
+    """`/transcripts` tiene un botón refresh inline para recargar sin esperar
+    los 60s del auto-refresh."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    assert "refresh-btn" in html
+    # Botón con symbol "↻" o algo similar visible.
+    assert '↻' in html
+
+
+def test_transcripts_meta_says_auto_refresh_off_when_nofresh():
+    """Cuando `?nofresh=1`, la línea meta debe indicar que el auto-refresh
+    está OFF."""
+    resp = _client.get("/transcripts?nofresh=1")
+    html = resp.text
+    assert "auto-refresh OFF" in html
 
 
 def test_transcripts_includes_stat_cards():

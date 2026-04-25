@@ -424,6 +424,56 @@ def test_sync_youtube_transcripts_fetches_new(tmp_path, monkeypatch):
     assert "language: es" in body
 
 
+def test_run_cross_source_etls_invokes_chrome_bookmarks(tmp_path, monkeypatch):
+    """`rag index` (via `_run_cross_source_etls`) debe sincronizar Chrome
+    bookmarks junto con el resto de las ETLs (history, reminders, calendar,
+    gmail, etc.). Antes del 2026-04-25, `sync_chrome_bookmarks` sólo se
+    invocaba con el comando manual `rag bookmarks sync` y los marcadores
+    indexados quedaban stale."""
+    calls: list[dict] = []
+
+    def fake_sync_chrome_bookmarks(profile=None):
+        calls.append({"profile": profile})
+        return {"profiles": 1, "total": 5, "per_profile": {"Default": 5}}
+
+    # Bypass guard: en tests tmp_path no es vault canónico.
+    monkeypatch.setattr(rag, "_is_cross_source_target", lambda _vp: True)
+    # Mock todas las ETLs upstream a no-op para aislar el bloque nuevo.
+    monkeypatch.setattr(rag, "_sync_moze_notes", lambda vp: {"ok": False, "reason": "no_csv"})
+    monkeypatch.setattr(rag, "_sync_whatsapp_notes", lambda vp: {"ok": False, "reason": "script_missing"})
+    monkeypatch.setattr(rag, "_sync_reminders_notes", lambda vp: {"ok": False, "reason": "apple_disabled"})
+    monkeypatch.setattr(rag, "_sync_apple_calendar_notes", lambda vp: {"ok": False, "reason": "icalbuddy_missing"})
+    monkeypatch.setattr(rag, "_sync_chrome_history", lambda vp: {"ok": False, "reason": "no_visits_or_chrome_locked"})
+    monkeypatch.setattr(rag, "_sync_gmail_notes", lambda vp: {"ok": False, "reason": "no_google_credentials"})
+    monkeypatch.setattr(rag, "_sync_github_activity", lambda vp: {"ok": False, "reason": "gh_no_login"})
+    monkeypatch.setattr(rag, "_sync_claude_code_transcripts", lambda vp: {"ok": False, "reason": "no_claude_projects_dir"})
+    monkeypatch.setattr(rag, "_sync_youtube_transcripts", lambda vp: {"ok": False, "reason": "no_videos"})
+    monkeypatch.setattr(rag, "_sync_spotify_notes", lambda vp: {"ok": False, "reason": "no_spotify_credentials"})
+    monkeypatch.setattr(rag, "sync_chrome_bookmarks", fake_sync_chrome_bookmarks)
+
+    rag._run_cross_source_etls(tmp_path)
+
+    assert len(calls) == 1, "sync_chrome_bookmarks debe invocarse exactamente una vez"
+    assert calls[0]["profile"] is None, "se sincronizan TODOS los profiles, no uno específico"
+
+
+def test_run_cross_source_etls_chrome_bookmarks_silent_when_no_chrome(tmp_path, monkeypatch):
+    """Cuando Chrome no está instalado / no hay profiles, el branch debe
+    printear 'skip (no Chrome)' sin lanzar excepción."""
+    monkeypatch.setattr(rag, "_is_cross_source_target", lambda _vp: True)
+    for fn_name in (
+        "_sync_moze_notes", "_sync_whatsapp_notes", "_sync_reminders_notes",
+        "_sync_apple_calendar_notes", "_sync_chrome_history", "_sync_gmail_notes",
+        "_sync_github_activity", "_sync_claude_code_transcripts",
+        "_sync_youtube_transcripts", "_sync_spotify_notes",
+    ):
+        monkeypatch.setattr(rag, fn_name, lambda vp: {"ok": False, "reason": "no_data"})
+    monkeypatch.setattr(rag, "chrome_bookmark_files", lambda root=None: [])
+
+    # No raise — la función soporta gracefully el caso "no Chrome".
+    rag._run_cross_source_etls(tmp_path)
+
+
 def test_decode_gmail_body_strips_style_and_script_blocks():
     import base64
     raw = (

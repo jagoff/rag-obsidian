@@ -23723,6 +23723,30 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         except Exception as exc:
             console.print(f"[yellow]{label} sync falló: {exc}[/yellow]")
 
+    # Chrome bookmarks: actualizan la collection URLs (no escriben `.md` al
+    # vault, a diferencia de las ETLs de arriba). Idempotente — borra y
+    # reinserta in-place los rows del profile sin tocar el resto del corpus.
+    # Antes (≤2026-04-25) sólo se sincronizaban con `rag bookmarks sync`
+    # manual, así que los bookmarks indexados quedaban stale; ahora se
+    # refrescan en cada `rag index` automático (watcher / morning / today).
+    _t_bm = time.perf_counter()
+    try:
+        bm_stats = sync_chrome_bookmarks()
+        _ms = int((time.perf_counter() - _t_bm) * 1000)
+        profiles = bm_stats.get("profiles", 0)
+        total = bm_stats.get("total", 0)
+        if profiles > 0:
+            per_prof = bm_stats.get("per_profile", {})
+            breakdown = ", ".join(f"{p}={n}" for p, n in per_prof.items())
+            console.print(
+                f"[dim]Bookmarks sync: {total} marcadores · {profiles} profile(s) "
+                f"({breakdown}, {_ms}ms)[/dim]"
+            )
+        else:
+            console.print(f"[dim]Bookmarks sync: skip (no Chrome) ({_ms}ms)[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Bookmarks sync falló: {exc}[/yellow]")
+
 
 def _run_index(reset: bool, no_contradict: bool) -> dict:
     """Core indexing logic. Shared by the `rag index` CLI and the in-chat

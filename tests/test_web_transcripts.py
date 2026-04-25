@@ -227,6 +227,27 @@ def test_transcripts_heatmap_css_classes_defined():
         assert cls in html, f"missing CSS class: {cls}"
 
 
+# ── Patrones repetidos ────────────────────────────────────────────────────────
+
+
+def test_transcripts_renders_patterns_section():
+    """`/transcripts` tiene una sección `patrones repetidos` que muestra
+    los single-word swaps detectados."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    assert "patrones repetidos" in html
+
+
+def test_transcripts_patterns_empty_state():
+    """Sin patterns todavía, mostrar placeholder con instrucción."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    if "sin patrones repetidos" in html:
+        # Mensaje útil con `/fix` y comando CLI mencionados.
+        assert "/fix" in html
+        assert "rag whisper patterns" in html
+
+
 # ── Heatmap semanal día×hora ──────────────────────────────────────────────────
 
 

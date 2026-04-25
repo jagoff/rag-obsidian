@@ -8253,6 +8253,14 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                 "FROM rag_audio_corrections "
                 "ORDER BY ts DESC LIMIT 20"
             ).fetchall()
+            # Patrones repetidos en correcciones — mismo algoritmo que
+            # `rag whisper patterns` CLI. Imported lazy para no creates
+            # circular import si rag_whisper_learning todavía no está.
+            try:
+                from rag_whisper_learning.patterns import find_correction_patterns
+                patterns_data = find_correction_patterns(min_count=2)
+            except Exception:
+                patterns_data = []
             # Heatmap por hora del día (últimos 30 días, hora local).
             # Útil para visualizar cuándo el user manda audios típicamente.
             hour_counts: dict[int, int] = {h: 0 for h in range(24)}
@@ -8406,6 +8414,44 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             cls = {"explicit": "src-explicit", "llm": "src-llm", "vault_diff": "src-vault"}[src]
             corr_summary_parts.append(f'<span class="{cls}">{n} {src}</span>')
     corr_summary = " · ".join(corr_summary_parts) if corr_summary_parts else "0"
+
+    # Patterns repetidos — render compact list. Si no hay (count<2 en todos),
+    # placeholder con expectativa.
+    if patterns_data:
+        pattern_rows_html = ""
+        for p in patterns_data[:10]:  # cap top 10
+            src_parts = []
+            if p.sources.get("explicit", 0) > 0:
+                src_parts.append(f'<span class="src-explicit">{p.sources["explicit"]} /fix</span>')
+            if p.sources.get("llm", 0) > 0:
+                src_parts.append(f'<span class="src-llm">{p.sources["llm"]} llm</span>')
+            if p.sources.get("vault_diff", 0) > 0:
+                src_parts.append(f'<span class="src-vault">{p.sources["vault_diff"]} vault</span>')
+            src_label = " · ".join(src_parts) if src_parts else "—"
+            pattern_rows_html += (
+                f'<tr>'
+                f'<td><span class="text-mono">×{p.count}</span></td>'
+                f'<td class="text-orig">{_esc(p.original)}</td>'
+                f'<td><span class="text-mono">→</span></td>'
+                f'<td class="text-fixed">{_esc(p.corrected)}</td>'
+                f'<td><span class="text-mono">{src_label}</span></td>'
+                f'</tr>\n'
+            )
+        patterns_html = (
+            f'<table>'
+            f'<thead><tr><th>count</th><th>whisper dijo</th><th></th>'
+            f'<th>corrección</th><th>fuente</th></tr></thead>'
+            f'<tbody>{pattern_rows_html}</tbody>'
+            f'</table>'
+        )
+    else:
+        patterns_html = (
+            '<p class="meta" style="padding:8px 0">'
+            'sin patrones repetidos todavía (necesita ≥2 correcciones del mismo '
+            'swap). cuando uses <code>/fix</code> seguido para corregir el mismo '
+            'error, va a aparecer acá. también detectado vía <code>rag whisper patterns</code>.'
+            '</p>'
+        )
 
     # Heatmap por hora del día — render como una row de 24 cells coloreadas
     # según count (intensidad creciente). Si todos están en 0, muestra una
@@ -8685,6 +8731,10 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     <thead><tr><th>fecha</th><th>source</th><th>original</th><th>corregido</th></tr></thead>
     <tbody>{correction_rows}</tbody>
   </table>
+
+  <h2>patrones repetidos (≥2 swaps)</h2>
+  <p class="meta">errores sistemáticos del modelo whisper que se corrigieron varias veces. señal fuerte para el vocab. mismo algoritmo que <code>rag whisper patterns</code>.</p>
+  {patterns_html}
 
   <h2>top 50 vocab terms (peso DESC)</h2>
   <p class="meta">se inyecta al <code>--prompt</code> de whisper en cada transcripción. corregido vía <code>rag whisper vocab refresh</code>.</p>

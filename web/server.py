@@ -8176,8 +8176,14 @@ def _esc(s: str) -> str:
 
 
 @app.get("/transcripts", response_class=HTMLResponse)
-def transcripts_dashboard() -> HTMLResponse:
-    """Dashboard de telemetría del whisper learning loop."""
+def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
+    """Dashboard de telemetría del whisper learning loop.
+
+    Args:
+        nofresh: si !=0, suprime el meta-refresh auto cada 60s. Útil cuando
+            estás leyendo la página y no querés que se recargue scrollando.
+            Ejemplo: `/transcripts?nofresh=1`.
+    """
     try:
         with _ragvec_state_conn() as conn:
             # Stats globales (últimos 30 días)
@@ -8358,6 +8364,8 @@ def transcripts_dashboard() -> HTMLResponse:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
+{"<!-- Auto-refresh suppressed via ?nofresh=1 -->" if nofresh else "<!-- Auto-refresh cada 60s. Override con ?nofresh=1 -->"}
+{"" if nofresh else '<meta http-equiv="refresh" content="60">'}
 <title>whisper transcripts — rag</title>
 <style>
   /* Dark mode by default. Paleta cercana al GitHub dark + Obsidian default
@@ -8440,9 +8448,21 @@ def transcripts_dashboard() -> HTMLResponse:
   .text-fixed {{ color: var(--green); }}
   .text-mono {{ color: var(--text-muted); font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
   .weight-cell {{ text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }}
+  /* Topnav consistente con /dashboard y /home — links a las otras páginas */
+  .topnav {{ display: flex; gap: 14px; padding: 8px 0; margin: 0 0 8px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }}
+  .topnav a {{ color: var(--text-muted); text-decoration: none; padding: 4px 0; border-bottom: 2px solid transparent; transition: border-color .12s ease, color .12s ease; }}
+  .topnav a:hover {{ color: var(--text); }}
+  .topnav a.active {{ color: var(--text); border-bottom-color: var(--accent); }}
 </style>
 </head>
 <body>
+  <nav class="topnav">
+    <a href="/">home</a>
+    <a href="/chat">chat</a>
+    <a href="/dashboard">dashboard</a>
+    <a href="/status">status</a>
+    <a href="/transcripts" class="active">transcripts</a>
+  </nav>
   <h1>whisper transcripts</h1>
   <p class="meta">phase 2 learning loop · vocab refresh: {_esc(last_refresh_str)}</p>
 

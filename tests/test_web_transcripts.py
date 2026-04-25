@@ -180,6 +180,60 @@ def test_transcripts_defines_correction_source_classes():
 # ── Defensivo ────────────────────────────────────────────────────────────────
 
 
+# ── Auto-refresh ─────────────────────────────────────────────────────────────
+
+
+def test_transcripts_default_has_meta_refresh_60s():
+    """Default: la página se auto-recarga cada 60s para mostrar audios nuevos
+    en vivo cuando el listener loguea uno."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    assert '<meta http-equiv="refresh" content="60">' in html
+
+
+def test_transcripts_nofresh_suppresses_auto_refresh():
+    """`?nofresh=1` omite el meta-refresh — útil cuando estás leyendo la
+    página y no querés que scrollée perdiendo posición."""
+    resp = _client.get("/transcripts?nofresh=1")
+    assert resp.status_code == 200
+    html = resp.text
+    assert "http-equiv=\"refresh\"" not in html
+    assert "Auto-refresh suppressed" in html
+
+
+# ── Navegación cruzada (links entre páginas) ─────────────────────────────────
+
+
+def test_home_html_links_to_transcripts():
+    """`/home` debe tener un link a `/transcripts` en el topbar para que
+    el dashboard sea descubrible sin tener que recordar la URL."""
+    from pathlib import Path
+    static_dir = Path(_server.STATIC_DIR)
+    html = (static_dir / "home.html").read_text(encoding="utf-8")
+    assert 'href="/transcripts"' in html
+
+
+def test_dashboard_html_links_to_transcripts():
+    """`/dashboard` (semáforo) también debe enlazar a `/transcripts`."""
+    from pathlib import Path
+    static_dir = Path(_server.STATIC_DIR)
+    html = (static_dir / "dashboard.html").read_text(encoding="utf-8")
+    assert 'href="/transcripts"' in html
+
+
+def test_transcripts_has_topnav_to_other_pages():
+    """`/transcripts` tiene una topnav con links a las otras páginas
+    para no quedar como dead-end."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    # Espera ver links a las páginas hermanas.
+    for href in ('href="/"', 'href="/chat"', 'href="/dashboard"', 'href="/status"'):
+        assert href in html, f"missing nav link: {href}"
+    # Self-link debería tener `class="active"` o similar marker.
+    assert 'href="/transcripts"' in html
+    assert 'class="active"' in html
+
+
 def test_transcripts_escapes_user_text():
     """El template usa `_esc()` helper para evitar XSS si un transcript
     o correction tuviera caracteres HTML en el contenido. Smoke test que

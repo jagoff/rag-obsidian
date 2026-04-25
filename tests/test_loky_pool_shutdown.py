@@ -116,3 +116,55 @@ def test_shutdown_handles_executor_shutdown_exception(monkeypatch):
         sys.modules["joblib.externals.loky"].get_reusable_executor = fake_get
         # No raise.
         srv._shutdown_joblib_loky_pool()
+
+
+def test_shutdown_resets_loky_globals_to_release_semlock_refs():
+    """Audit follow-up 2026-04-25: el shutdown debe NULLIFICAR los globals
+    `_executor` + `_executor_kwargs` de loky para que las references a
+    SemLock se liberen y los Finalizers (`util.Finalize(_cleanup, ...)`)
+    corran ANTES del exit, no en el resource_tracker check del fini-fini.
+    Sin esto, vemos `leaked semaphore objects: /loky-PID-XXX` (308
+    warnings acumuladas en `web.error.log` pre-fix)."""
+    try:
+        from joblib import Parallel, delayed
+        from joblib.externals.loky import reusable_executor as re_mod
+    except ImportError:
+        pytest.skip("joblib not installed")
+
+    # Force a real executor to exist
+    Parallel(n_jobs=2, backend="loky")(delayed(lambda x: x)(i) for i in range(2))
+    # Pre-condition: globals point to the executor
+    assert re_mod._executor is not None
+    assert re_mod._executor_kwargs is not None
+
+    srv._shutdown_joblib_loky_pool()
+
+    # Post-condition: globals nullified — the SemLock refs the executor
+    # held are now garbage and gc.collect() inside the handler ran their
+    # Finalizers, calling sem_unlink + resource_tracker.unregister.
+    assert re_mod._executor is None, (
+        "loky._executor still set after shutdown — SemLock refs not released"
+    )
+    assert re_mod._executor_kwargs is None
+
+
+def test_shutdown_calls_gc_collect():
+    """Verifica que el handler dispara gc.collect() para correr los
+    Finalizers de SemLock que dependen del GC. Si el GC no corre, los
+    Finalizers (`exitpriority=0`) terminan corriendo en el atexit
+    fini-fini DESPUÉS del resource_tracker check, generando los warnings."""
+    import gc as _gc
+    calls = {"n": 0}
+    original_collect = _gc.collect
+
+    def counting_collect(*args, **kwargs):
+        calls["n"] += 1
+        return original_collect(*args, **kwargs)
+
+    with patch.object(_gc, "collect", counting_collect):
+        srv._shutdown_joblib_loky_pool()
+
+    assert calls["n"] >= 1, (
+        f"gc.collect() not called inside _shutdown_joblib_loky_pool "
+        f"(call count: {calls['n']})"
+    )

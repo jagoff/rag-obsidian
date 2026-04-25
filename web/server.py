@@ -5669,8 +5669,31 @@ def _shutdown_joblib_loky_pool() -> None:
     """
     try:
         from joblib.externals.loky import get_reusable_executor
+        from joblib.externals.loky import reusable_executor as _re_mod
+        import gc
+
         executor = get_reusable_executor()
         executor.shutdown(wait=True, kill_workers=True)
+
+        # Audit follow-up 2026-04-25: el shutdown solo SHUTTING los workers
+        # no es suficiente — el `_executor` global de loky sigue holdeando
+        # references a SemLock instances (locks internos del executor).
+        # Esos SemLocks NO se GC-ean hasta que el global se nullifique,
+        # entonces el `util.Finalize(SemLock._cleanup, ...)` con
+        # `exitpriority=0` no corre antes del resource_tracker check del
+        # exit, y vemos las warnings `leaked semaphore objects: /loky-PID-XXX`.
+        #
+        # Fix: reset los globals + force gc.collect() para que los Finalizers
+        # de los SemLocks corran AHORA, no en el exit fini-fini.
+        try:
+            _re_mod._executor = None
+            _re_mod._executor_kwargs = None
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
     except Exception as exc:
         # Silent-skip — el leak no es bloqueante, no queremos romper el
         # shutdown si joblib se desinstala o cambia su API.

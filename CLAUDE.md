@@ -59,6 +59,23 @@ Excepciones obvias: tareas exploratorias (investigar, responder preguntas, revis
 
 Esta regla NO cambia — es el comportamiento default para siempre. Si el user dice "hace el commit", "commit + push", "cerrá esto", o cualquier cosa que signifique "terminaste → guardá", ejecutás el ciclo completo pull → commit → push sin confirmar cada paso.
 
+### Gotcha: commits locales en `master` se pushean solos (auto-pusher en paralelo)
+
+**Cualquier commit que hagas en `master` localmente aparece en `origin/master` en segundos, aunque no llames `git push` explícitamente.** Observado en sesiones del 2026-04-25 donde agentes intentaron commits "experimentales" para evaluar y revertir, y los commits ya estaban en remote antes del rollback.
+
+Causa raíz no confirmada al 100% pero hipótesis principal: **otra sesión de Devin/Claude Code corriendo en paralelo** (el repo tiene MCP `claude-peers` activo, [`.claude/skills/claude-peers-mcp/`](.claude/skills/claude-peers-mcp/), que permite a varias instancias coordinarse via broker). Esa otra sesión detecta los commits locales y los pushea con su propio auto-pull+commit+push rule (la de arriba). NO se encontró cron, git hook, FS watcher, ni `git push` literal en plists del repo o `~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist` — descartado todo eso como culpable directo.
+
+**Implicaciones operativas**:
+
+1. **Asumí que `git commit` en `master` = `git push origin master` casi inmediato.** No hay ventana para "hago el commit, lo evalúo localmente, y si no me gusta lo deshago con `git reset HEAD~1`". Para cuando reseteaste, ya está en remote.
+2. **Si querés experimentar sin pushear → branch dedicada.** `git checkout -b experimental/<slug>` y commitea ahí. Las ramas no-master no las agarra el auto-pusher (no se confirmó pero es la asunción razonable hasta que se demuestre lo contrario).
+3. **Si pushiaste algo malo y no podés force-push** (la deny-list de [`.devin/config.json`](.devin/config.json) bloquea `git push --force`): único camino es `git revert <sha> && git push origin master`. Acepta que el commit malo + el revert quedan ambos en el log para siempre.
+4. **No se puede "desactivar temporalmente"** el auto-pusher desde esta sesión — es una sesión paralela con sus propias reglas. Si necesitás coordinarlo: usar [`mcp__claude-peers__send_message`](.claude/skills/claude-peers-mcp/SKILL.md) para pedirle a la otra instancia que pause sus pushes, o avisarle al user humano para que cierre la otra sesión.
+
+**Lección**: pensá dos veces antes de commitear en master. El commit es público en segundos.
+
+Aprendido el 2026-04-25 durante una sesión de fix de CI donde 2 commits ("ruff cleanup masivo" + "destrabar 40 tests") aparecieron en remote antes de que la sesión activa los pushiera. El reflog mostraba `pull: Fast-forward` post-commit en lugar de `push:`, confirmando que el push vino de otra fuente.
+
 ## Autonomous mode — empezar y terminar una feature sin interrupciones
 
 Devin for Terminal tiene 4 [permission modes](https://docs.devin.ai/reference/permissions): **Normal** (default, pide permiso para writes + exec), **Accept Edits** (auto-aprueba edits dentro del workspace), **Bypass** (auto-aprueba TODO sin prompts), y **Autonomous** (Bypass + sandbox OS). Este proyecto está configurado para minimizar interrupciones aun en modo Normal — y cuando querés zero prompts absolutos, hay un interruptor global.

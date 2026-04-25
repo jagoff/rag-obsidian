@@ -20852,7 +20852,14 @@ def propose_whatsapp_send(
         "jid": lookup["jid"],
         "full_name": lookup["full_name"],
         "error": lookup["error"],
+        # Forward `is_group` para que el frontend muestre el chip 👥
+        # y omita el wa.me link (que no funciona para grupos @g.us).
+        "is_group": bool(lookup.get("is_group")),
     }
+    # Si el resolver tiró ambigüedad de grupos, exponer los candidatos
+    # para que el LLM le pregunte al user cuál quiso decir.
+    if lookup.get("candidates"):
+        fields["candidates"] = lookup["candidates"]
     sched = _validate_scheduled_for(scheduled_for)
     if sched:
         fields["scheduled_for"] = sched
@@ -21702,7 +21709,10 @@ def propose_whatsapp_send_note(
         "section": section,
         "was_truncated": was_truncated,
         "error": contact_lookup["error"] or note_error,
+        "is_group": bool(contact_lookup.get("is_group")),
     }
+    if contact_lookup.get("candidates"):
+        fields["group_candidates"] = contact_lookup["candidates"]
     if section_warning:
         fields["warning"] = section_warning
     if candidates:
@@ -22007,7 +22017,10 @@ def propose_whatsapp_send_contact_card(
         "target_name": target["name"],
         "fields_filter": fields,
         "error": error,
+        "is_group": bool(recipient_lookup.get("is_group")),
     }
+    if recipient_lookup.get("candidates"):
+        payload_fields["group_candidates"] = recipient_lookup["candidates"]
     if target.get("candidates"):
         payload_fields["candidates"] = target["candidates"]
     sched = _validate_scheduled_for(scheduled_for)
@@ -22224,11 +22237,14 @@ def propose_whatsapp_reply(
         "reply_to_hint": when_hint or "",
         "reply_to": None,
         "reply_to_warning": None,
+        "is_group": bool(lookup.get("is_group")),
     }
+    if lookup.get("candidates"):
+        fields["group_candidates"] = lookup["candidates"]
     # Try to resolve the original message — only meaningful if the
-    # contact lookup itself succeeded (otherwise we'd just propagate the
-    # same error twice).
-    if lookup["jid"]:
+    # contact lookup itself succeeded AND no es grupo (reply_to en
+    # grupos NO está soportado, ver `_whatsapp_resolve_reply_target`).
+    if lookup["jid"] and not lookup.get("is_group"):
         try:
             target = _whatsapp_resolve_reply_target(contact_name, when_hint)
         except Exception as exc:

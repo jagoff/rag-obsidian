@@ -8126,3 +8126,42 @@ main:focus-visible {
 .proposal[data-resolved] .proposal-btn-cancel:not(.proposal-wa-action-back) {
   /* hereda lo de arriba */
 }
+
+
+/* WhatsApp groups — indicador visual y candidates en card de proposal.
+   Cuando el resolver detecta un grupo (vs contacto 1:1), mostramos
+   "👥 Grupo: <nombre>" en lugar del wa.me link, y si hay ambigüedad
+   listamos los candidatos para que el user re-pida con nombre exacto.
+
+   Decidido en el audit del 2026-04-25 (TOP 1 — soporte de grupos
+   @g.us via fuzzy-match en bridge DB). */
+.proposal-wa-group-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.proposal-wa-group-candidates {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border-left: 3px solid var(--orange, #ffa657);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.proposal-wa-group-candidates-label {
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.proposal-wa-group-candidates-list {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+
+.proposal-wa-group-candidates-list li {
+  padding: 2px 0;
+  color: var(--text);
+}

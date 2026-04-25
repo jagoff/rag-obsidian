@@ -2060,9 +2060,17 @@ function appendWhatsAppProposal(parent, payload) {
   card.appendChild(head);
 
   const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
-  const recipientHref = waHref(fields.jid || "");
+  const isGroup = !!fields.is_group;
+  // Para grupos NO armamos wa.me link — solo funciona con números 1:1
+  // (digits@s.whatsapp.net). Los grupos abren via deep link de la app
+  // si el user ya está en el grupo, pero no hay URL universal estable.
+  const recipientHref = isGroup ? "" : waHref(fields.jid || "");
   const recipientLine = el("div", "proposal-title");
-  recipientLine.appendChild(document.createTextNode("Para: "));
+  // Prefix distinto para grupos: "👥 Grupo:" vs "Para:" — visualmente
+  // claro que el envío va a múltiples personas, no 1:1.
+  recipientLine.appendChild(document.createTextNode(
+    isGroup ? "👥 Grupo: " : "Para: "
+  ));
   if (recipientHref) {
     // Click → abre el chat en WhatsApp app vía wa.me universal link.
     // No reemplaza la acción [Enviar]: solo permite "verificar antes
@@ -2074,9 +2082,30 @@ function appendWhatsAppProposal(parent, payload) {
     a.title = "Abrir chat con " + recipientLabel + " en WhatsApp";
     recipientLine.appendChild(a);
   } else {
-    recipientLine.appendChild(document.createTextNode(recipientLabel));
+    // Plain text para grupos (sin link) o cuando no hay JID resuelto.
+    const span = el("span", isGroup ? "proposal-wa-group-label" : "", recipientLabel);
+    recipientLine.appendChild(span);
   }
   card.appendChild(recipientLine);
+
+  // Si el resolver tiró ambigüedad de grupos (>1 match), mostrar los
+  // candidatos para que el user vea cuáles encontró y pueda re-pedir
+  // con el nombre exacto. Sin esto, el LLM dice "no encontré X" y el
+  // user no sabe que el grupo existe pero con otro nombre similar.
+  if (Array.isArray(fields.group_candidates) && fields.group_candidates.length > 0) {
+    const candWrap = el("div", "proposal-wa-group-candidates");
+    candWrap.appendChild(el(
+      "div", "proposal-wa-group-candidates-label",
+      `⚠ Encontré ${fields.group_candidates.length} grupos que matchean. Decime cuál:`
+    ));
+    const ul = el("ul", "proposal-wa-group-candidates-list");
+    for (const gc of fields.group_candidates) {
+      const li = el("li", "", gc.name || "(sin nombre)");
+      ul.appendChild(li);
+    }
+    candWrap.appendChild(ul);
+    card.appendChild(candWrap);
+  }
 
   // Conversation context — last messages with this contact + last
   // contact date. Replaces the old "seguir con ›" chips below the
@@ -2191,9 +2220,11 @@ function appendWhatsAppProposal(parent, payload) {
   // Contact-lookup error surfaced inline.
   if (err) {
     const errMap = {
-      "not_found":   `No encontré a "${fields.contact_name}" en tus Contactos. Probá con el nombre completo.`,
+      "not_found":   `No encontré a "${fields.contact_name}" en tus Contactos ni como grupo. Probá con el nombre completo o pedile al user que sea más específico.`,
       "no_phone":    `El contacto "${fields.contact_name}" no tiene un número cargado en Contactos.`,
       "empty_query": `El agente no detectó a quién mandarlo.`,
+      "ambiguous":   `Hay varios grupos que matchean "${fields.contact_name}" — decime cuál de los listados arriba.`,
+      "bridge_db_unavailable": `El bridge de WhatsApp no está corriendo. Sin él no puedo buscar grupos.`,
     };
     const msg = errMap[err] || `No se pudo resolver el destinatario: ${err}`;
     card.appendChild(el("div", "proposal-warn", `⚠ ${msg}`));

@@ -175,28 +175,128 @@ def _whatsapp_send_to_jid(
         return False
 
 
-def _whatsapp_jid_from_contact(contact_name: str) -> dict:
-    """Resolve a contact name ("Grecia", "Oscar (Tela mosquitera)") to a
-    WhatsApp JID by looking up the user's Apple Contacts DB.
+_GROUP_PREFIX_RE = re.compile(r"^\s*(?:grupo|group|gpo|gpe?o?)\s*:?\s+", re.IGNORECASE)
+"""Patrón de prefijo explícito para forzar lookup de grupo. Matchea
+'grupo X', 'group X', 'gpo X', 'grupo: X' (con o sin dos puntos)."""
 
-    Returns::
+
+def _whatsapp_resolve_group_jid(query: str, *, max_candidates: int = 3) -> dict:
+    """Resolve un nombre de grupo a `<grupo_id>@g.us` mirando la tabla
+    ``chats`` del bridge SQLite. Apple Contacts NO conoce los grupos
+    de WhatsApp — solo los conoce el bridge, que los mantiene
+    sincronizados con el cliente WhatsApp del user.
+
+    Estrategia de matching:
+      1. Match exacto case-insensitive (`name = ?`) — gana si existe.
+      2. Match por substring case-insensitive (`name LIKE '%query%'`).
+      3. Si hay >1 match, retorna error con los `max_candidates` más
+         recientes (por `last_message_time`) para que el caller le
+         pida al user que desambigüe.
+      4. Si 0 match → error="not_found".
+
+    Filtramos a JIDs `@g.us` exclusivamente — el resolver de 1:1 ya
+    cubre `@s.whatsapp.net`. Skipea status broadcast (`status@broadcast`).
+
+    Returns el mismo shape que `_whatsapp_jid_from_contact()` pero con
+    `is_group=True` y `phones=[]`. ``candidates`` viene populado solo
+    cuando hay ambigüedad para que el frontend la muestre.
+    """
+    import rag as _rag
+    db_path = _rag.WHATSAPP_DB_PATH
+    if not db_path.is_file():
+        return {"jid": None, "full_name": None, "phones": [], "is_group": True,
+                "error": "bridge_db_unavailable"}
+    q = (query or "").strip()
+    if not q:
+        return {"jid": None, "full_name": None, "phones": [], "is_group": True,
+                "error": "empty_query"}
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as e:
+        return {"jid": None, "full_name": None, "phones": [], "is_group": True,
+                "error": f"bridge_db_open_failed: {str(e)[:80]}"}
+    try:
+        con.row_factory = sqlite3.Row
+        # 1) Exact match — gana siempre.
+        rows = con.execute(
+            "SELECT jid, name, last_message_time FROM chats "
+            "WHERE jid LIKE '%@g.us' AND lower(name) = lower(?) "
+            "ORDER BY last_message_time DESC LIMIT 5",
+            (q,),
+        ).fetchall()
+        if not rows:
+            # 2) Substring fuzzy.
+            rows = con.execute(
+                "SELECT jid, name, last_message_time FROM chats "
+                "WHERE jid LIKE '%@g.us' AND lower(name) LIKE lower(?) "
+                "ORDER BY last_message_time DESC LIMIT 10",
+                (f"%{q}%",),
+            ).fetchall()
+    except sqlite3.Error as e:
+        return {"jid": None, "full_name": None, "phones": [], "is_group": True,
+                "error": f"bridge_db_query_failed: {str(e)[:80]}"}
+    finally:
+        con.close()
+
+    if not rows:
+        return {"jid": None, "full_name": None, "phones": [], "is_group": True,
+                "error": "not_found"}
+    if len(rows) == 1:
+        r = rows[0]
+        return {
+            "jid": r["jid"],
+            "full_name": r["name"],
+            "phones": [],
+            "is_group": True,
+            "error": None,
+        }
+    # >1 match → ambigüedad. Devolvemos `candidates` para que el LLM /
+    # frontend desambigüe. Cap a `max_candidates`.
+    candidates = [
+        {"jid": r["jid"], "name": r["name"]}
+        for r in rows[:max_candidates]
+    ]
+    return {
+        "jid": None,
+        "full_name": None,
+        "phones": [],
+        "is_group": True,
+        "candidates": candidates,
+        "error": "ambiguous",
+    }
+
+
+def _whatsapp_jid_from_contact(contact_name: str) -> dict:
+    """Resolve a contact name ("Grecia", "Oscar (Tela mosquitera)",
+    "grupo Random") to a WhatsApp JID. Tries Apple Contacts first (1:1
+    chats `@s.whatsapp.net`), and if that fails, falls back to the
+    bridge DB chats table for groups (`@g.us`).
+
+    Forced group lookup: si el query empieza con "grupo X", "group X"
+    o variantes (case-insensitive), saltamos directo al group resolver
+    sin pasar por Contacts. Útil cuando el user tiene un contacto Y un
+    grupo con el mismo nombre y quiere específicamente el grupo.
+
+    Returns para 1:1::
 
         {"jid": "5491234567890@s.whatsapp.net",
          "full_name": "Grecia Ferrari",
          "phones": ["+54 9 11 ..."],
+         "is_group": False,
          "error": None}
 
-    or on failure::
+    Returns para grupo::
 
-        {"jid": None, "full_name": None, "phones": [],
-         "error": "not_found" | "no_phone" | "empty_query"}
+        {"jid": "120363426178035051@g.us",
+         "full_name": "RagNet",
+         "phones": [],
+         "is_group": True,
+         "error": None}
 
-    Single-match only. Apple Contacts doesn't give us a trivial way to
-    distinguish between a single homonym and multiple matches from a
-    first-name predicate, so we rely on the user providing enough
-    disambiguation in ``contact_name`` (full name or the custom-label
-    part in parens). On ambiguity the helper returns ``error="not_found"``
-    so the chat can ask the user to be more specific.
+    Errores incluyen ``not_found`` (ni Contacts ni grupos), ``no_phone``
+    (1:1 sin phone), ``ambiguous`` (>1 grupo matchea, viene con
+    ``candidates``), ``empty_query``.
     """
     # Deferred attribute lookup so tests `monkeypatch.setattr(rag, "_fetch_contact", ...)`
     # take effect — patches live on `rag.__init__`, not on this module.
@@ -208,7 +308,19 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
     if query.startswith("@"):
         query = query.lstrip("@").strip()
     if not query:
-        return {"jid": None, "full_name": None, "phones": [], "error": "empty_query"}
+        return {"jid": None, "full_name": None, "phones": [],
+                "is_group": False, "error": "empty_query"}
+
+    # Forced group lookup: si el user / LLM puso "grupo X" explícito,
+    # saltamos Contacts y vamos directo al bridge. La búsqueda en
+    # Contacts no encuentra grupos (no existen ahí) así que el fallback
+    # eventualmente igual termina en groups; el prefix solo ahorra el
+    # round-trip a osascript.
+    forced_group = bool(_GROUP_PREFIX_RE.match(query))
+    if forced_group:
+        stripped = _GROUP_PREFIX_RE.sub("", query, count=1).strip()
+        return _whatsapp_resolve_group_jid(stripped or query)
+
     # Reuse the existing osascript-backed contact lookup. Passes `query`
     # as the stem — _fetch_contact will try canonical match, first name,
     # and finally the raw stem against Contacts.app.
@@ -216,23 +328,35 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
         contact = _rag._fetch_contact(query, email=None, canonical=query)
     except Exception as exc:
         return {"jid": None, "full_name": None, "phones": [],
+                "is_group": False,
                 "error": f"lookup_failed: {str(exc)[:80]}"}
-    if not contact:
-        return {"jid": None, "full_name": None, "phones": [], "error": "not_found"}
-    phones = list(contact.get("phones") or [])
-    if not phones:
-        return {"jid": None, "full_name": contact.get("full_name"), "phones": [],
-                "error": "no_phone"}
-    digits = re.sub(r"\D+", "", phones[0])
-    if not digits:
-        return {"jid": None, "full_name": contact.get("full_name"),
-                "phones": phones, "error": "no_phone"}
-    return {
-        "jid": f"{digits}@s.whatsapp.net",
-        "full_name": contact.get("full_name") or query,
-        "phones": phones,
-        "error": None,
-    }
+    if contact:
+        phones = list(contact.get("phones") or [])
+        if not phones:
+            return {"jid": None, "full_name": contact.get("full_name"),
+                    "phones": [], "is_group": False, "error": "no_phone"}
+        digits = re.sub(r"\D+", "", phones[0])
+        if not digits:
+            return {"jid": None, "full_name": contact.get("full_name"),
+                    "phones": phones, "is_group": False, "error": "no_phone"}
+        return {
+            "jid": f"{digits}@s.whatsapp.net",
+            "full_name": contact.get("full_name") or query,
+            "phones": phones,
+            "is_group": False,
+            "error": None,
+        }
+
+    # Contacts miss → fallback a grupos. Mejor "encontré un grupo con
+    # ese nombre" que "not_found" — el user puede tener ambos contactos
+    # en su cabeza (humanos + grupos) y el LLM no sabe a priori cuál es.
+    group = _whatsapp_resolve_group_jid(query)
+    if group.get("jid") or group.get("error") == "ambiguous":
+        return group
+
+    # Ni Contacts ni grupos → not_found definitivo.
+    return {"jid": None, "full_name": None, "phones": [],
+            "is_group": False, "error": "not_found"}
 
 
 def _whatsapp_resolve_reply_target(
@@ -280,6 +404,20 @@ def _whatsapp_resolve_reply_target(
     if not lookup.get("jid"):
         err = lookup.get("error") or "not_found"
         return {"error": f"contact_{err}", "contact_full_name": lookup.get("full_name")}
+
+    # Reply-to en grupos NO está soportado todavía: el resolver de
+    # mensajes en grupo requeriría más decisiones UX (quotear a qué
+    # miembro? respuesta colectiva?) y el bridge tiene shape distinto
+    # (sender_jid != chat_jid). Por ahora retornamos error claro para
+    # que el frontend muestre warning. El user puede usar
+    # `propose_whatsapp_send` con prefijo "grupo X" para mandar SIN
+    # quote, que sí funciona.
+    if lookup.get("is_group"):
+        return {
+            "error": "reply_to_groups_not_supported",
+            "contact_full_name": lookup.get("full_name"),
+            "is_group": True,
+        }
 
     primary_jid = lookup["jid"]
     full_name = lookup.get("full_name") or cn

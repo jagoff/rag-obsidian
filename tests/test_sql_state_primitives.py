@@ -70,11 +70,14 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 score calibration (rag_score_calibration, Feature #2 2026-04-23) +
     # 1 learned paraphrases (rag_learned_paraphrases, Feature #9 2026-04-23) +
     # 1 cita detections (rag_cita_detections, OCR→cita detector 2026-04-23) +
-    # 1 VLM caption cache (rag_vlm_captions, caption fallback 2026-04-23) =
-    # 30 tables total.
+    # 1 VLM caption cache (rag_vlm_captions, caption fallback 2026-04-23) +
+    # 1 reminder WA push (rag_reminder_wa_pushed, 2026-04-23) +
+    # 1 status samples (rag_status_samples, home dashboard 2026-04-24) +
+    # 1 home compute metrics (rag_home_compute_metrics, baseline persist 2026-04-24) =
+    # 33 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 30
+    assert len(expected) == 33
     c.close()
 
 

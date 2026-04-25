@@ -5017,6 +5017,31 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Mirror table del watchdog de presión de memoria del sistema. Mismo
+        # schema que rag_memory_metrics, pero la separación de tablas es
+        # intencional: rag_memory_metrics lo escribe el sampler periódico
+        # del web dashboard cada minuto (concern: trending del proceso RAG +
+        # subsistemas), system_memory_metrics lo escribe el watchdog cuando
+        # la presión cruza el threshold (concern: forensics post-incident
+        # del SO entero). Histórico: la entry estaba en _TELEMETRY_DDL del
+        # build/ legacy y se perdió en algún refactor; el test
+        # `test_metrics_writers_flag_on[system_memory]` cubrió el plumbing
+        # pero quedó rojo en master desde entonces (re-agregada 2026-04-25).
+        "system_memory_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS system_memory_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " total_mb REAL,"
+            " by_category_json TEXT,"
+            " top_json TEXT,"
+            " vm_json TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_system_memory_metrics_ts ON system_memory_metrics(ts)",
+        ),
+    ),
+    (
         # OCR cache — texto extraído por Apple Vision de imágenes embebidas
         # en las notas. Clave primaria = path absoluto de la imagen; mtime
         # es el invalidador (si la imagen se updatea, el hash_with_images
@@ -5416,6 +5441,25 @@ def _migrate_cita_detections_add_kind(conn) -> None:
         pass
 
 
+# Per-DB-path once-flag para los DDL idempotentes. Pre-2026-04-24 cada
+# `_ragvec_state_conn()` corría los ~28 CREATE TABLE IF NOT EXISTS + ALTER
+# en cada conn open, aún cuando el caller no era cold-start (samplers cpu/
+# memory abren ~120 conns/hr cada uno; behavior log abre 290/hr; 540+ conn
+# opens/hr × 28 statements = 15K+ DDL statements/hr ejecutándose contra
+# telemetry.db). Cada DDL es no-op cuando la tabla existe pero igual toma
+# el schema lock brevemente — contribuye a la contention WAL que aparece
+# como `database is locked` en los writers.
+#
+# Set keyed por path absoluto: tests que cambian DB_PATH a tmp dirs siguen
+# disparando el DDL contra cada DB nueva (el flag es por path). Crash
+# recovery: si el proceso muere antes del COMMIT, el flag no se setea
+# para ese path, el próximo open reintenta. Multi-proceso: cada proceso
+# ensure-once independientemente (las tablas son CREATE IF NOT EXISTS —
+# race-safe).
+_TELEMETRY_DDL_ENSURED_PATHS: set[str] = set()
+_TELEMETRY_DDL_LOCK = threading.Lock()
+
+
 def _ensure_telemetry_tables(conn) -> None:
     """Create all rag_* telemetry tables + indexes + schema_version rows.
 
@@ -5425,38 +5469,59 @@ def _ensure_telemetry_tables(conn) -> None:
     telemetry writes survive power loss (vec reads keep their settings).
 
     Called from SqliteVecClient.__init__ when RAG_STATE_SQL=1, so a process
-    that hasn't opted in never pays the DDL cost.
+    que no opt-ineó nunca paga el DDL cost.
+
+    Audit 2026-04-24: el DDL se ejecutaba en cada conn open (~540/hr). Con
+    `_TELEMETRY_DDL_ENSURED_PATHS` ahora corre exactamente una vez por
+    (proceso, db-path) — la primera invocación. Cada conn subsiguiente
+    contra la misma DB sólo aplica el PRAGMA de synchronous (per-conn,
+    requerido) y skip el DDL.
     """
     import sqlite3 as _sqlite3
     conn.execute("PRAGMA synchronous=NORMAL")
-    # Detect whether rag_schema_version exists. Created by SqliteVecClient on
-    # its own, but this helper might run against a bare DB in tests.
-    has_schema_version = bool(conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
-    ).fetchone())
+    # Identificar la DB por su file path. `database` columna del
+    # `database_list` PRAGMA da el path absoluto del main db (vacío para
+    # in-memory, en cuyo caso nunca cacheamos — siempre re-ensure).
     try:
-        conn.execute("BEGIN")
-        for _table_name, stmts in _TELEMETRY_DDL:
-            for stmt in stmts:
-                conn.execute(stmt)
-        if has_schema_version:
-            conn.executemany(
-                "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
-                [(name,) for name, _ in _TELEMETRY_DDL],
-            )
-        conn.execute("COMMIT")
-    except _sqlite3.Error:
-        conn.execute("ROLLBACK")
-        raise
-    # Lazy schema migrations — corren FUERA de la transaction principal
-    # porque ALTER TABLE no siempre es transactable y no queremos abortar
-    # el DDL batch entero si un ALTER de una sola columna falla.
-    try:
-        _migrate_cita_detections_add_kind(conn)
+        _row = conn.execute("PRAGMA database_list").fetchone()
+        db_path = _row[2] if _row else ""
     except Exception:
-        # Silent-fail: si la migration rompe, el INSERT usará el subset
-        # de columnas que sí existen (writer también es defensivo).
-        pass
+        db_path = ""
+    if db_path and db_path in _TELEMETRY_DDL_ENSURED_PATHS:
+        return
+    with _TELEMETRY_DDL_LOCK:
+        if db_path and db_path in _TELEMETRY_DDL_ENSURED_PATHS:
+            return
+        # Detect whether rag_schema_version exists. Created by SqliteVecClient on
+        # its own, but this helper might run against a bare DB in tests.
+        has_schema_version = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
+        ).fetchone())
+        try:
+            conn.execute("BEGIN")
+            for _table_name, stmts in _TELEMETRY_DDL:
+                for stmt in stmts:
+                    conn.execute(stmt)
+            if has_schema_version:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO rag_schema_version(table_name, version) VALUES(?, 1)",
+                    [(name,) for name, _ in _TELEMETRY_DDL],
+                )
+            conn.execute("COMMIT")
+        except _sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
+        # Lazy schema migrations — corren FUERA de la transaction principal
+        # porque ALTER TABLE no siempre es transactable y no queremos abortar
+        # el DDL batch entero si un ALTER de una sola columna falla.
+        try:
+            _migrate_cita_detections_add_kind(conn)
+        except Exception:
+            # Silent-fail: si la migration rompe, el INSERT usará el subset
+            # de columnas que sí existen (writer también es defensivo).
+            pass
+        if db_path:
+            _TELEMETRY_DDL_ENSURED_PATHS.add(db_path)
 
 
 # Columns that hold JSON payloads. Non-primitive values in a row dict are
@@ -43673,6 +43738,7 @@ _SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
     ("rag_proactive_log", 60),
     ("rag_cpu_metrics", 30),
     ("rag_memory_metrics", 30),
+    ("system_memory_metrics", 30),
 )
 
 # Tables that upsert on a PK instead of appending log rows. Listed here both

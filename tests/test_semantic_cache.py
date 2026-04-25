@@ -107,12 +107,26 @@ def test_compute_corpus_hash_returns_deterministic(monkeypatch, tmp_path):
     assert len(h1) > 0
 
 
-def test_compute_corpus_hash_changes_on_chunk_count(monkeypatch, tmp_path):
+def test_compute_corpus_hash_changes_on_bucket_boundary(monkeypatch, tmp_path):
+    """Hash buckets count by `_CORPUS_HASH_BUCKET` (default 100). Crossing a
+    bucket boundary changes the hash; staying within does not.
+
+    Pre-2026-04-24 hash changed on every count delta — ingesters running
+    every 30min (whatsapp/calendar/gmail) constantly invalidated the
+    semantic cache. Audit on web.log showed 30 SEMANTIC PUTs across 24
+    distinct corpus_hashes → 0 cache hits ever. Bucketing collapses the
+    rotation noise without losing the bulk-change invariant.
+    """
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     (tmp_path / "a.md").write_text("# a")
-    h1 = rag._compute_corpus_hash(_FakeCol(10))
-    h2 = rag._compute_corpus_hash(_FakeCol(11))
-    assert h1 != h2
+    bucket = rag._CORPUS_HASH_BUCKET
+    # Within bucket: hash stable.
+    h1 = rag._compute_corpus_hash(_FakeCol(bucket * 5 + 10))
+    h2 = rag._compute_corpus_hash(_FakeCol(bucket * 5 + 50))
+    assert h1 == h2, "small count delta inside bucket must not invalidate cache"
+    # Crossing bucket boundary: hash changes.
+    h3 = rag._compute_corpus_hash(_FakeCol(bucket * 6 + 10))
+    assert h1 != h3, "crossing bucket boundary must invalidate cache"
 
 
 def test_corpus_hash_cached_memoizes(monkeypatch, tmp_path):

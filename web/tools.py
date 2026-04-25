@@ -35,7 +35,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 16 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 18 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -62,7 +62,9 @@ Crear cosas nuevas (se agregan automáticamente, el usuario puede deshacer):
 Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
 - "enviale / mandale un mensaje a <Contacto> que diga: <texto>" / "decile a <Contacto>: <texto>" / "escribile a <Contacto>: <texto>" → propose_whatsapp_send(contact_name="<Contacto>", message_text="<texto literal>").
 - "respondele a <Contacto> al mensaje del <hint>: <texto>" / "contestale a <Contacto>: <texto>" / "responde el último de <Contacto>: <texto>" → propose_whatsapp_reply(contact_name="<Contacto>", message_text="<texto literal>", when_hint="<hint opcional>"). Es DISTINTO al send — acá el user quiere responder a UN mensaje específico que recibió, no iniciar un thread. Pasale el hint que el user dijo ("el del almuerzo", "el último", "el de las 14:30", "el de ayer") en `when_hint`. Si no especificó hint, dejá `when_hint=None` (agarra el más reciente). El tool resuelve el message_id automáticamente — el user no tiene que copiar ningún ID.
-- Ambos tools NO envían: devuelven una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
+- "mandale/pasale/compartile a <Contacto> la (nota|receta|info|pasos|lista|guía) de <Tema>" / "mandale a <Contacto> lo que tengo sobre <Tema>" → propose_whatsapp_send_note(contact_name="<Contacto>", note_query="<Tema>"). DISTINTO a propose_whatsapp_send (texto literal): este busca la nota en el vault, la convierte a formato WhatsApp y arma el draft con el contenido. Si el user dice "la sección X de la nota Y", pasá section="X". Si el user pasa un path explícito (".md"), usalo literal en `note_query`. Si la query es ambigua (low confidence), el tool devuelve `candidates` para que el user elija.
+- "mandale/pasale a <Contacto> el (tel|teléfono|email|contacto|dirección) de <Persona/Lugar>" → propose_whatsapp_send_contact_card(recipient_contact="<Contacto>", target_query="<Persona/Lugar>"). Resuelve los datos primero en Apple Contacts y después en notas del vault con frontmatter `phone`/`email`/`address`. Pasá `fields=["phone"]` (o "email"/"address") si el user pidió solo un campo.
+- Todos NO envían: devuelven una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
 - Si el contacto no se resuelve (el tool devuelve `error: not_found` o `no_phone`), avisale al user que no encontraste a la persona en sus Contactos y sugerile que pase el nombre completo o el teléfono.
 - En tu respuesta textual: "Te dejo el mensaje armado para <Nombre>, revisalo y tocá Enviar si está ok." (1-2 oraciones, que quede claro que NO se envió todavía). NO repitas el texto del mensaje — la card ya lo muestra.
 
@@ -363,6 +365,8 @@ from rag import (  # noqa: E402
     propose_calendar_event,
     propose_whatsapp_send,
     propose_whatsapp_reply,
+    propose_whatsapp_send_note,
+    propose_whatsapp_send_contact_card,
     propose_mail_send,
 )
 
@@ -383,6 +387,8 @@ CHAT_TOOLS: list[Callable] = [
     propose_calendar_event,
     propose_whatsapp_send,
     propose_whatsapp_reply,
+    propose_whatsapp_send_note,
+    propose_whatsapp_send_contact_card,
     propose_mail_send,
 ]
 
@@ -417,5 +423,7 @@ PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_calendar_event",
     "propose_whatsapp_send",
     "propose_whatsapp_reply",
+    "propose_whatsapp_send_note",
+    "propose_whatsapp_send_contact_card",
     "propose_mail_send",
 }

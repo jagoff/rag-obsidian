@@ -21169,6 +21169,620 @@ def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
     }, ensure_ascii=False)
 
 
+# ── WhatsApp SHARE NOTE — render vault note as WA message ──────────────────
+#
+# Pattern: "mandale a Sole la receta de panqueques", "compartile a Juan los
+# pasos para resetear el router". Hoy el user copia/pega manualmente desde
+# Obsidian; este tool resuelve la nota vía path explícito o búsqueda
+# semántica (`_agent_tool_search`), convierte el body a un formato que
+# WhatsApp pueda renderear bien (sin frontmatter, sin wikilinks crudos,
+# callouts simplificados, headings en bold), y arma la misma proposal
+# card `kind="whatsapp_message"` que ya maneja la UI.
+#
+# El renderer es stateless e idempotente: render(render(x)) ≈ render(x)
+# (idempotencia exacta no es alcanzable por la conversión de bullets
+# `-` → `•`, pero nunca degrada el output más allá del primer pase).
+
+WHATSAPP_NOTE_MAX_CHARS = 4096  # WA hard limit per message
+
+_WA_NOTE_IMAGE_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".heic", ".bmp",
+)
+
+# Folders / suffix patterns que se consideran "privados" — sin indexar
+# en el corpus público y sin compartir por WA. Heurística — en un vault
+# multi-tier real el user puede agregar un frontmatter `private: true`
+# para opt-out explícito.
+_WA_NOTE_PRIVATE_FOLDER_RE = re.compile(
+    r"(^|/)(99-private|secrets|99-personal-private)/", re.IGNORECASE
+)
+_WA_NOTE_PRIVATE_SUFFIX_RE = re.compile(r"\.private\.md$", re.IGNORECASE)
+
+
+def _is_private_note_path(rel_path: str) -> bool:
+    """True si el path matchea un folder/suffix privado conocido.
+
+    No leemos el contenido — solo el path. El check de frontmatter
+    `private: true` lo hace `_is_private_note_text` por separado para
+    permitir orden flexible (chequear path antes de leer el archivo).
+    """
+    if not rel_path:
+        return False
+    p = rel_path.replace("\\", "/")
+    if _WA_NOTE_PRIVATE_FOLDER_RE.search(f"/{p}"):
+        return True
+    if _WA_NOTE_PRIVATE_SUFFIX_RE.search(p):
+        return True
+    return False
+
+
+def _is_private_note_text(text: str) -> bool:
+    """True si el frontmatter declara `private: true` (o equivalente)."""
+    fm = parse_frontmatter(text)
+    val = fm.get("private")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "yes", "1", "sí", "si"}
+    return False
+
+
+def _extract_note_section(text: str, heading: str) -> str | None:
+    """Extract a section by heading title (case-insensitive substring match).
+
+    Devuelve el heading line + body hasta el siguiente heading de nivel
+    igual o menor, o ``None`` si no encuentra match. La búsqueda es
+    case-insensitive sobre el título (ej. ``section="ingredientes"``
+    matchea ``## Ingredientes``).
+    """
+    target = (heading or "").strip().lower()
+    if not target:
+        return None
+    lines = text.splitlines()
+    in_section = False
+    section_level = 0
+    out: list[str] = []
+    for line in lines:
+        m = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if m:
+            level = len(m.group(1))
+            title = m.group(2).strip().lower()
+            if not in_section and target in title:
+                in_section = True
+                section_level = level
+                out.append(line)
+                continue
+            if in_section and level <= section_level:
+                break
+        if in_section:
+            out.append(line)
+    return "\n".join(out).rstrip() if out else None
+
+
+def _render_note_for_whatsapp(text: str) -> str:
+    """Convert a vault note's markdown body to WhatsApp-friendly text.
+
+    Rules (orden importa — algunos regexes consumen el output del previo):
+      1. Strip YAML frontmatter.
+      2. Strip OCR injection comments (``<!-- OCR: img.png -->``) — el
+         indexer los inserta para alimentar el corpus pero no son útiles
+         para un humano leyendo en WhatsApp.
+      3. Embeds ``![[X]]`` y ``![[img.png]]`` → ``[embed: X]`` /
+         ``[imagen: name]``. **No** resolvemos recursivamente por ahora
+         (v1 simple). Image embeds (extensión conocida) se diferencian
+         de note embeds por el suffix.
+      4. Markdown image syntax ``![alt](path)`` → ``[imagen: alt]``.
+      5. Wikilinks ``[[Note]]`` / ``[[Note|alias]]`` / ``[[Note#Sec]]``
+         → bare title o alias (perdemos el link, ganamos legibilidad).
+      6. Markdown links ``[text](http(s)://url)`` → ``text: url``;
+         relative links → solo ``text``.
+      7. Callouts ``> [!type] Title`` → ``📝 *Title*``.
+      8. Bold ``***X***`` / ``**X**`` / ``__X__`` → ``*X*`` (WA bold).
+      9. Strikethrough ``~~X~~`` → ``~X~`` (WA strike).
+     10. Tasks ``- [ ]`` → ``☐`` y ``- [x]`` → ``☑``.
+     11. Headings ``# H`` → ``*H*``.
+     12. Bullets ``- x`` / ``* x`` → ``• x``.
+     13. Collapse 3+ blank lines a 2.
+
+    No tocamos ` `code` ` ni triple-backtick blocks — WA los renderea
+    como monospace nativamente.
+    """
+    if not text:
+        return ""
+
+    text = _strip_frontmatter(text)
+    text = re.sub(r"<!--\s*OCR:[^>]*-->\n?", "", text)
+
+    def _embed_replace(m: "re.Match[str]") -> str:
+        target = m.group(1).strip()
+        section = (m.group(2) or "").strip()
+        # Image embed?
+        low = target.lower()
+        if any(low.endswith(ext) for ext in _WA_NOTE_IMAGE_EXTS):
+            name = target.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            return f"[imagen: {name}]"
+        if section:
+            return f"[embed: {target}#{section}]"
+        return f"[embed: {target}]"
+
+    text = re.sub(
+        r"!\[\[([^\]\|#]+)(?:#([^\]\|]+))?(?:\|[^\]]+)?\]\]",
+        _embed_replace, text,
+    )
+
+    text = re.sub(
+        r"!\[([^\]]*)\]\([^)]+\)",
+        lambda m: f"[imagen: {(m.group(1) or 'sin-titulo').strip()}]",
+        text,
+    )
+
+    text = re.sub(
+        r"\[\[([^\]\|#]+)(?:#[^\]\|]*)?(?:\|([^\]]+))?\]\]",
+        lambda m: ((m.group(2) or m.group(1)) or "").strip(),
+        text,
+    )
+
+    def _link_replace(m: "re.Match[str]") -> str:
+        label = (m.group(1) or "").strip()
+        url = (m.group(2) or "").strip()
+        if url.startswith(("http://", "https://", "obsidian://")):
+            return f"{label}: {url}" if label else url
+        return label or url
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_replace, text)
+
+    def _callout_replace(m: "re.Match[str]") -> str:
+        title = (m.group(2) or "").strip()
+        return f"📝 *{title}*" if title else "📝"
+
+    text = re.sub(
+        r"^>\s*\[!(\w+)\][\+-]?\s*(.*)$",
+        _callout_replace, text, flags=re.MULTILINE,
+    )
+
+    text = re.sub(r"\*\*\*([^*\n]+)\*\*\*", r"*\1*", text)
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"*\1*", text)
+    text = re.sub(r"__([^_\n]+)__", r"*\1*", text)
+    text = re.sub(r"~~([^~\n]+)~~", r"~\1~", text)
+
+    text = re.sub(r"^(\s*)-\s\[ \]\s+", r"\1☐ ", text, flags=re.MULTILINE)
+    text = re.sub(r"^(\s*)-\s\[[xX]\]\s+", r"\1☑ ", text, flags=re.MULTILINE)
+
+    text = re.sub(
+        r"^#{1,6}\s+(.+?)\s*#*\s*$",
+        lambda m: f"*{m.group(1).strip()}*",
+        text, flags=re.MULTILINE,
+    )
+
+    text = re.sub(r"^(\s*)-\s+", r"\1• ", text, flags=re.MULTILINE)
+    text = re.sub(r"^(\s*)\*\s+", r"\1• ", text, flags=re.MULTILINE)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def propose_whatsapp_send_note(
+    contact_name: str,
+    note_query: str,
+    section: str | None = None,
+) -> str:
+    """Draft a WhatsApp message containing a vault note's content. DOES NOT send.
+
+    Diferente a ``propose_whatsapp_send`` (texto literal): este tool
+    busca la nota en el vault, la convierte a formato WhatsApp y arma
+    el draft con ese contenido. Siempre devuelve ``needs_clarification=True``
+    para que la UI muestre [Enviar] / [Editar] / [Cancelar].
+
+    Args:
+        contact_name: Nombre del destinatario (resuelto vía Apple Contacts).
+        note_query: Path vault-relativo terminado en ``.md`` (uso literal)
+            o query semántico (búsqueda con score ≥ 0.5 → top-1; <0.5 →
+            ``candidates`` en fields para que el user elija).
+        section: Heading opcional para extraer solo esa parte. Match
+            case-insensitive sobre el título.
+
+    Returns:
+        JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
+        fields: {contact_name, message_text, jid, full_name, source_path,
+        section, was_truncated, error?, warning?, candidates?}}``.
+    """
+    contact_lookup = _whatsapp_jid_from_contact(contact_name)
+
+    note_path: str | None = None
+    note_text: str | None = None
+    note_error: str | None = None
+    candidates: list[dict] = []
+
+    q = (note_query or "").strip()
+    if not q:
+        note_error = "empty_query"
+    elif q.lower().endswith(".md"):
+        full = (VAULT_PATH / q).resolve()
+        try:
+            full.relative_to(VAULT_PATH.resolve())
+            if full.is_file():
+                note_path = q
+                note_text = full.read_text(encoding="utf-8", errors="ignore")
+            else:
+                note_error = "note_not_found"
+        except (ValueError, OSError):
+            note_error = "note_not_found"
+    else:
+        try:
+            results_raw = _agent_tool_search(q, k=3)
+            results = json.loads(results_raw) if results_raw else []
+        except Exception as exc:
+            results = []
+            note_error = f"search_failed: {str(exc)[:80]}"
+
+        if results:
+            top = results[0]
+            top_score = float(top.get("score") or 0.0)
+            top_path = (top.get("path") or "").strip()
+            if top_score >= 0.5 and top_path:
+                full = (VAULT_PATH / top_path).resolve()
+                try:
+                    full.relative_to(VAULT_PATH.resolve())
+                    if full.is_file():
+                        note_path = top_path
+                        note_text = full.read_text(encoding="utf-8", errors="ignore")
+                    else:
+                        note_error = "note_not_found"
+                except (ValueError, OSError):
+                    note_error = "note_not_found"
+            else:
+                candidates = [
+                    {
+                        "path": (r.get("path") or "").strip(),
+                        "note": (r.get("note") or "").strip(),
+                        "score": round(float(r.get("score") or 0.0), 3),
+                    }
+                    for r in results[:3]
+                ]
+                note_error = "ambiguous"
+        elif note_error is None:
+            note_error = "note_not_found"
+
+    if note_text is not None and note_path is not None:
+        if _is_private_note_path(note_path) or _is_private_note_text(note_text):
+            note_error = "note_is_private"
+            note_text = None
+            note_path = None
+
+    section_warning: str | None = None
+    if note_text is not None and section:
+        sec_text = _extract_note_section(note_text, section)
+        if sec_text is None:
+            section_warning = "section_not_found"
+        else:
+            note_text = sec_text
+
+    rendered = ""
+    was_truncated = False
+    if note_text is not None:
+        rendered = _render_note_for_whatsapp(note_text)
+        if len(rendered) > WHATSAPP_NOTE_MAX_CHARS:
+            cutoff = WHATSAPP_NOTE_MAX_CHARS - 20
+            rendered = rendered[:cutoff].rstrip() + "\n... (truncado)"
+            was_truncated = True
+
+    fields: dict = {
+        "contact_name": contact_name,
+        "message_text": rendered,
+        "jid": contact_lookup["jid"],
+        "full_name": contact_lookup["full_name"],
+        "source_path": note_path,
+        "section": section,
+        "was_truncated": was_truncated,
+        "error": contact_lookup["error"] or note_error,
+    }
+    if section_warning:
+        fields["warning"] = section_warning
+    if candidates:
+        fields["candidates"] = candidates
+
+    return json.dumps({
+        "kind": "whatsapp_message",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": fields,
+    }, ensure_ascii=False)
+
+
+# ── WhatsApp SHARE CONTACT CARD — phone/email/address de un tercero ────────
+#
+# Pattern: "mandale a Sole el tel del plomero", "compartile a Mamá el
+# email del contador". Resuelve el `target_query` primero contra Apple
+# Contacts (vía `_fetch_contact`) y, si no hay match, contra notas del
+# vault con frontmatter `phone:` / `email:` / `address:`. Renderea el
+# resultado como texto plano (no vCard — el bridge actual no soporta
+# media attachments fácil) y arma la misma proposal card que los otros
+# `propose_whatsapp_*`.
+
+_WA_CONTACT_FRONTMATTER_KEYS = {
+    "phones": ("phone", "phones", "tel", "telefono", "teléfono", "celular", "movil", "móvil"),
+    "emails": ("email", "emails", "correo", "mail"),
+    "addresses": ("address", "addresses", "direccion", "dirección", "domicilio"),
+}
+
+
+def _resolve_contact_target_vault(query: str) -> dict:
+    """Scan vault para notas con frontmatter de contacto matcheando ``query``.
+
+    Walk vault top-down, leer frontmatter solo de notas cuyo stem
+    contenga ``query`` (substring case-insensitive). Si exactly 1
+    match → devolvemos los datos. Si >1 → ``candidates`` array.
+    Si 0 → ``error="target_not_found"``.
+
+    Para vaults grandes (>5k notas) esto puede tardar — no es
+    catastrófico (no es un tool de uso constante) pero si emerge como
+    bottleneck, futuro pasaje a una tabla `rag_vault_contact_data`
+    poblada al ingest queda como v1.1.
+    """
+    out: dict = {
+        "source": None, "name": None, "phones": [], "emails": [],
+        "addresses": [], "candidates": [], "error": None,
+    }
+    q_low = (query or "").strip().lower()
+    if not q_low:
+        out["error"] = "empty_query"
+        return out
+
+    try:
+        vp = VAULT_PATH.resolve()
+    except Exception:
+        out["error"] = "vault_unavailable"
+        return out
+
+    matches: list[dict] = []
+    try:
+        for md_path in vp.rglob("*.md"):
+            try:
+                stem_low = md_path.stem.lower()
+                if q_low not in stem_low:
+                    continue
+                rel = str(md_path.relative_to(vp))
+                # Skip private folders/suffix.
+                if _is_private_note_path(rel):
+                    continue
+                text = md_path.read_text(encoding="utf-8", errors="ignore")
+                if _is_private_note_text(text):
+                    continue
+                fm = parse_frontmatter(text)
+                if not fm:
+                    continue
+                phones: list[dict] = []
+                emails: list[str] = []
+                addresses: list[str] = []
+                for k in _WA_CONTACT_FRONTMATTER_KEYS["phones"]:
+                    v = fm.get(k)
+                    if not v:
+                        continue
+                    if isinstance(v, list):
+                        phones.extend(
+                            {"label": "", "value": str(x).strip()}
+                            for x in v if str(x).strip()
+                        )
+                    else:
+                        s = str(v).strip()
+                        if s:
+                            phones.append({"label": "", "value": s})
+                for k in _WA_CONTACT_FRONTMATTER_KEYS["emails"]:
+                    v = fm.get(k)
+                    if not v:
+                        continue
+                    if isinstance(v, list):
+                        emails.extend(str(x).strip() for x in v if str(x).strip())
+                    else:
+                        s = str(v).strip()
+                        if s:
+                            emails.append(s)
+                for k in _WA_CONTACT_FRONTMATTER_KEYS["addresses"]:
+                    v = fm.get(k)
+                    if not v:
+                        continue
+                    if isinstance(v, list):
+                        addresses.extend(str(x).strip() for x in v if str(x).strip())
+                    else:
+                        s = str(v).strip()
+                        if s:
+                            addresses.append(s)
+                if phones or emails or addresses:
+                    matches.append({
+                        "path": rel,
+                        "name": md_path.stem,
+                        "phones": phones,
+                        "emails": emails,
+                        "addresses": addresses,
+                    })
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not matches:
+        out["error"] = "target_not_found"
+        return out
+    if len(matches) == 1:
+        m = matches[0]
+        out.update({
+            "source": "vault", "name": m["name"], "phones": m["phones"],
+            "emails": m["emails"], "addresses": m["addresses"],
+        })
+        return out
+    out.update({
+        "source": "vault", "error": "ambiguous",
+        "candidates": [
+            {"name": m["name"], "path": m["path"]} for m in matches[:5]
+        ],
+    })
+    return out
+
+
+def _resolve_contact_target(query: str) -> dict:
+    """Resolve a 'target' contact for sharing — Apple Contacts → vault notes.
+
+    Returns dict shape::
+
+        {
+            "source": "apple"|"vault"|None,
+            "name": str|None,
+            "phones": [{"label": str, "value": str}, ...],
+            "emails": [str, ...],
+            "addresses": [str, ...],
+            "candidates": [{"name": str, "path": str?}, ...],
+            "error": str|None,  # "empty_query"|"target_not_found"|"ambiguous"|...
+        }
+
+    Apple Contacts tiene precedencia: si encuentra un match con
+    phones-or-emails, devolvemos eso y no tocamos el vault. Si Apple
+    no devuelve nada útil (sin match, sin phone/email, error), caemos
+    al vault scan. Strip `@` leading idem `_whatsapp_jid_from_contact`.
+    """
+    q = (query or "").strip().lstrip("@").strip()
+    if not q:
+        return {
+            "source": None, "name": None, "phones": [], "emails": [],
+            "addresses": [], "candidates": [], "error": "empty_query",
+        }
+
+    contact = None
+    try:
+        contact = _fetch_contact(q, email=None, canonical=q)
+    except Exception:
+        contact = None
+
+    if contact:
+        phones_raw = list(contact.get("phones") or [])
+        emails_raw = list(contact.get("emails") or [])
+        if phones_raw or emails_raw:
+            return {
+                "source": "apple",
+                "name": contact.get("full_name") or q,
+                "phones": [
+                    {"label": "", "value": str(p).strip()}
+                    for p in phones_raw if str(p).strip()
+                ],
+                "emails": [str(e).strip() for e in emails_raw if str(e).strip()],
+                "addresses": list(contact.get("addresses") or []),
+                "candidates": [], "error": None,
+            }
+
+    return _resolve_contact_target_vault(q)
+
+
+def _render_contact_card_for_whatsapp(
+    name: str | None,
+    phones: list[dict],
+    emails: list[str],
+    addresses: list[str],
+    fields_filter: list[str] | None,
+) -> str:
+    """Render a contact card as WhatsApp-friendly multiline text.
+
+    Filtra por ``fields_filter`` (lista de ``"phone"``/``"email"``/
+    ``"address"``); ``None`` o lista vacía → todos los campos.
+    Phone con label custom (ej. Apple Contacts label "Casa"/"Móvil")
+    se renderea como ``📞 Casa: +54...``.
+
+    Importante: si **ningún** campo de data (phone/email/address)
+    sobrevive al filtro, devolvemos ``""`` en vez del nombre solo —
+    mandar `📇 *Vet*` sin teléfono/email es inútil para el destinatario
+    y disparamos el error ``no_data_after_filter`` upstream para que
+    el user reciba feedback en la card.
+    """
+    allowed = {f.strip().lower() for f in (fields_filter or [])} or {"phone", "email", "address"}
+    data_parts: list[str] = []
+    if "phone" in allowed:
+        for p in phones:
+            label = (p.get("label") or "").strip()
+            value = (p.get("value") or "").strip()
+            if not value:
+                continue
+            data_parts.append(f"📞 {label}: {value}" if label else f"📞 {value}")
+    if "email" in allowed:
+        for e in emails:
+            s = (e or "").strip()
+            if s:
+                data_parts.append(f"✉️ {s}")
+    if "address" in allowed:
+        for a in addresses:
+            s = (a or "").strip()
+            if s:
+                data_parts.append(f"📍 {s}")
+    if not data_parts:
+        return ""
+    parts: list[str] = []
+    if name:
+        parts.append(f"📇 *{name}*")
+    parts.extend(data_parts)
+    return "\n".join(parts)
+
+
+def propose_whatsapp_send_contact_card(
+    recipient_contact: str,
+    target_query: str,
+    fields: list[str] | None = None,
+) -> str:
+    """Draft a WhatsApp message con tel/email/dirección de un tercero. NO envía.
+
+    Resuelve ``target_query`` primero contra Apple Contacts (vía
+    ``_fetch_contact``) y como fallback contra notas del vault con
+    frontmatter ``phone`` / ``email`` / ``address``. Renderea como
+    texto plano (no vCard — el bridge actual no soporta media files).
+
+    Args:
+        recipient_contact: Nombre del destinatario (resuelto vía
+            Apple Contacts a JID).
+        target_query: Nombre del contacto cuya tarjeta querés mandar
+            (ej. "plomero", "veterinaria", "Tía Marta").
+        fields: Subset opcional ``["phone", "email", "address"]``.
+            ``None`` o lista vacía → todos los campos disponibles.
+
+    Returns:
+        JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
+        fields: {contact_name, message_text, jid, full_name, target_query,
+        target_source, target_name, fields_filter, error?, candidates?}}``.
+    """
+    recipient_lookup = _whatsapp_jid_from_contact(recipient_contact)
+    target = _resolve_contact_target(target_query)
+
+    rendered = ""
+    if target["error"] is None and (
+        target["phones"] or target["emails"] or target["addresses"]
+    ):
+        rendered = _render_contact_card_for_whatsapp(
+            target["name"], target["phones"], target["emails"],
+            target["addresses"], fields,
+        )
+
+    error = recipient_lookup["error"] or target["error"]
+    if not rendered and error is None:
+        error = "no_data_after_filter"
+
+    payload_fields: dict = {
+        "contact_name": recipient_contact,
+        "message_text": rendered,
+        "jid": recipient_lookup["jid"],
+        "full_name": recipient_lookup["full_name"],
+        "target_query": target_query,
+        "target_source": target["source"],
+        "target_name": target["name"],
+        "fields_filter": fields,
+        "error": error,
+    }
+    if target.get("candidates"):
+        payload_fields["candidates"] = target["candidates"]
+
+    return json.dumps({
+        "kind": "whatsapp_message",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": payload_fields,
+    }, ensure_ascii=False)
+
+
 # ── WhatsApp REPLY (quote) — resolve target + propose tool ──────────────────
 #
 # Pattern: "respondele a Juan al mensaje del almuerzo: confirmo, voy yo".

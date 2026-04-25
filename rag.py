@@ -18696,8 +18696,12 @@ def collect_ranker_features(
     candidates = [(id_map[id_][0], id_map[id_][1], id_) for id_ in merged_ordered if id_ in id_map]
     expanded = [expand_to_parent(c[0], c[1]) for c in candidates]
     reranker = get_reranker()
+    # batch_size default (32) en lugar de batch_size=1 — a pool=30 este call
+    # forzaba 30 inferencias secuenciales MPS (~500ms-1s); batch default lo
+    # procesa en una pasada (~100-200ms). Mismo razonamiento que en la rerank
+    # principal (ver comentario en rag.py alrededor de 17869-17874).
     rerank_scores = reranker.predict(
-        [(question, e) for e in expanded], show_progress_bar=False, batch_size=1,
+        [(question, e) for e in expanded], show_progress_bar=False,
     )
 
     try:
@@ -19058,6 +19062,33 @@ class _HighlightGroup(click.Group):
                     formatter.write(render_row(name))
 
 
+# Subcomandos que invocan `retrieve()` en su flow normal → disparamos
+# warmup eager en background para evitar el cold-load 5-12s en el
+# foreground de la primera query (medido en rag_queries.extra_json.timing
+# pre-warmup: embed_ms 10277/11375/12014 en outliers 2026-04-22).
+#
+# Filosofía: allowlist, no denylist. El costo de un warmup innecesario
+# es ~100MB RAM + 5s de background load (silent-fail si falla). El costo
+# de NO warmup en un path que retrieva es 5-12s de cold-load blocking en
+# la primera query. Preferimos ser explícitos — un subcomando nuevo que
+# retriava no entra acá hasta que lo listemos, pero el usuario igual
+# puede forzar warmup con `RAG_NO_WARMUP=0` si lo necesita.
+#
+# `serve` ya dispara su propio warmup en el lifespan context (rag.py
+# around 41344), pero incluirlo acá es idempotente — `warmup_async`
+# tiene un lock + flag `_warmup_started` que evita doble-carga.
+_CLI_WARMUP_SUBCOMMANDS = frozenset({
+    "query", "chat", "do", "ask", "followup", "links", "pendientes",
+    "morning", "today", "digest", "brief", "ambient",
+    "read",        # retrieve dentro del flow de read-and-annotate
+    "eval",        # retrieva para medir métricas
+    "tune",        # retrieves para evaluar tuning offline
+    "trends",      # retrieve-heavy analytics
+    "emergent", "patterns",  # retrieve-heavy pattern mining
+    "serve",       # web server — retrieves por request
+})
+
+
 @click.group(cls=_HighlightGroup)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
@@ -19068,6 +19099,18 @@ def cli(ctx: click.Context) -> None:
     # instead of the ollama HTTP round-trip. See rag.py:6970
     # (`_maybe_auto_enable_local_embed`) + CLAUDE.md §Env vars.
     _maybe_auto_enable_local_embed(ctx.invoked_subcommand)
+
+    # Eager warmup para subcomandos que retrievan — no bloquea (fire-and-forget
+    # + daemon threads). RAG_NO_WARMUP=1 skippea adentro de warmup_async() si
+    # el usuario quiere zero-overhead absoluto (útil para scripts en serie).
+    # ctx.invoked_subcommand es None cuando `rag --help` / `rag` sin args →
+    # skip trivial (no hay retrieve en el horizonte).
+    if ctx.invoked_subcommand in _CLI_WARMUP_SUBCOMMANDS:
+        try:
+            warmup_async()
+        except Exception:
+            # Silent-fail: warmup es best-effort, no debe crashear el CLI.
+            pass
 
 
 def file_hash(raw: str) -> str:
@@ -21030,10 +21073,49 @@ def _ambient_hook(
 # Soft deps: `ocrmac` + pyobjc son macOS-only. Import fallido → silent
 # skip. Env `RAG_OCR=0` desactiva explícitamente.
 
-try:
-    from ocrmac import ocrmac as _ocrmac_module
-except Exception:  # noqa: BLE001 — pyobjc init puede fallar, no solo ImportError
-    _ocrmac_module = None  # type: ignore[assignment]
+# Lazy-load. `ocrmac` arrastra pyobjc → Vision + Quartz + CoreML + AppKit,
+# ~130ms de import time en macOS. El CLI arranca para muchos subcomandos
+# que no hacen OCR (query, chat, session list, vault list, etc.), así que
+# importar al cargar el módulo era pagar esos 130ms cada vez (37% del
+# cold-start de `rag --help`). Con este pattern la import se dispara
+# solo cuando `_ocr_image()` corre por primera vez.
+#
+# `_ocrmac_module` sigue existiendo como attribute del módulo — los tests
+# lo patchean via `monkeypatch.setattr(rag, "_ocrmac_module", fake)` y
+# ese contrato se preserva: si el attribute ya es no-None al llamar
+# `_load_ocrmac_module()` (o sea, alguien lo seteó), lo devolvemos tal
+# cual sin re-importar.
+#
+# `_ocrmac_import_attempted` guardia contra re-intentos de import fallidos
+# — si pyobjc rompe una vez, rompe siempre hasta reboot, no sentido en
+# pagar el ImportError cada llamada.
+_ocrmac_module = None  # type: ignore[assignment]
+_ocrmac_import_attempted = False
+
+
+def _load_ocrmac_module():
+    """Devuelve el módulo `ocrmac.ocrmac` o None si el import falla.
+
+    Lazy + cached: la primera llamada paga el import (~130ms macOS), las
+    subsiguientes retornan el singleton. Idempotente ante fallo — una
+    vez que `_ocrmac_import_attempted` queda en True, ni re-intenta ni
+    re-loggea. Preserva el contract de tests que hacen monkeypatch de
+    `rag._ocrmac_module`: si ya está seteado (por test o por carga
+    previa), no lo sobrescribe.
+    """
+    global _ocrmac_module, _ocrmac_import_attempted
+    if _ocrmac_module is not None:
+        return _ocrmac_module
+    if _ocrmac_import_attempted:
+        return None
+    _ocrmac_import_attempted = True
+    try:
+        from ocrmac import ocrmac as _mod
+        _ocrmac_module = _mod
+    except Exception:  # noqa: BLE001 — pyobjc init puede fallar, no solo ImportError
+        _ocrmac_module = None  # type: ignore[assignment]
+    return _ocrmac_module
+
 
 # Extensiones de imagen soportadas (Apple Vision handlea todas via Core Image).
 _IMAGE_EXTENSIONS = frozenset({
@@ -21137,7 +21219,8 @@ def _ocr_image(image_path: Path) -> str:
     """
     if os.environ.get("RAG_OCR", "").strip() == "0":
         return ""
-    if _ocrmac_module is None:
+    ocrmac_mod = _load_ocrmac_module()
+    if ocrmac_mod is None:
         return ""
     try:
         mtime = image_path.stat().st_mtime
@@ -21161,7 +21244,7 @@ def _ocr_image(image_path: Path) -> str:
 
     # OCR real.
     try:
-        annotations = _ocrmac_module.OCR(
+        annotations = ocrmac_mod.OCR(
             abs_key, language_preference=["es-ES", "en-US"],
         ).recognize()
     except Exception as exc:

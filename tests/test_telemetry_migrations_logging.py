@@ -144,3 +144,92 @@ def test_migration_failure_does_not_block_ensure_telemetry(monkeypatch, empty_db
 
     # No raise. Caller (SqliteVecClient init) keeps booting.
     rag._ensure_telemetry_tables(empty_db)
+
+
+# ── Per-column / per-index error logging (2026-04-25 bug fix) ─────────────
+
+
+def test_audio_transcripts_alter_logs_non_duplicate_errors(monkeypatch):
+    """Pre-fix las migrations idempotentes tenían un `pass` que tragaba
+    cualquier OperationalError NO-duplicate-column (table missing, disk
+    full, syntax error). Ahora se logueen via _silent_log."""
+    captured: list[tuple[str, Exception | None]] = []
+    monkeypatch.setattr(rag, "_silent_log", lambda w, e: captured.append((w, e)))
+
+    # Conn mock: cada ALTER raisea un error que NO es "duplicate column".
+    class _BoomConn:
+        def execute(self, sql, *args, **kwargs):
+            import sqlite3 as _s
+            raise _s.OperationalError("table rag_audio_transcripts has no column ts (simulated)")
+
+    rag._migrate_audio_transcripts_phase2(_BoomConn())
+
+    # 7 columnas + 2 índices → 9 errores logueados, todos con el prefix correcto.
+    alter_logs = [c for c in captured if c[0] == "migration_audio_transcripts_alter_failed"]
+    index_logs = [c for c in captured if c[0] == "migration_audio_transcripts_index_failed"]
+    assert len(alter_logs) == 7, (
+        f"esperaba 7 alter logs (uno por col), got {len(alter_logs)}: {captured!r}"
+    )
+    assert len(index_logs) == 2, (
+        f"esperaba 2 index logs, got {len(index_logs)}: {captured!r}"
+    )
+
+
+def test_audio_transcripts_alter_silent_on_duplicate_column(monkeypatch):
+    """Cuando el error ES "duplicate column" (caso happy idempotent),
+    NO se debe loggear nada — esa rama es no-op silencioso."""
+    captured: list[tuple[str, Exception | None]] = []
+    monkeypatch.setattr(rag, "_silent_log", lambda w, e: captured.append((w, e)))
+
+    class _DupConn:
+        def execute(self, sql, *args, **kwargs):
+            import sqlite3 as _s
+            if "ALTER" in sql:
+                raise _s.OperationalError("duplicate column name: audio_hash")
+            # CREATE INDEX IF NOT EXISTS — succeeds silently.
+            return None
+
+    rag._migrate_audio_transcripts_phase2(_DupConn())
+
+    # CERO alter logs (todas las ALTERs eran no-op por duplicate).
+    alter_logs = [c for c in captured if c[0] == "migration_audio_transcripts_alter_failed"]
+    assert alter_logs == [], (
+        f"happy path duplicate column NO debe loggear: {captured!r}"
+    )
+
+
+def test_cita_detections_alter_logs_non_duplicate_errors(monkeypatch):
+    """Mismo bug pre-fix en _migrate_cita_detections_add_kind."""
+    captured: list[tuple[str, Exception | None]] = []
+    monkeypatch.setattr(rag, "_silent_log", lambda w, e: captured.append((w, e)))
+
+    class _BoomConn:
+        def execute(self, sql, *args, **kwargs):
+            import sqlite3 as _s
+            raise _s.OperationalError("near 'ALTRE': syntax error (simulated)")
+
+    rag._migrate_cita_detections_add_kind(_BoomConn())
+
+    # 2 columnas + 1 índice → 3 errores logueados.
+    alter_logs = [c for c in captured if c[0] == "migration_cita_detections_alter_failed"]
+    index_logs = [c for c in captured if c[0] == "migration_cita_detections_index_failed"]
+    assert len(alter_logs) == 2, f"got {len(alter_logs)}: {captured!r}"
+    assert len(index_logs) == 1, f"got {len(index_logs)}: {captured!r}"
+
+
+def test_cita_detections_alter_silent_on_duplicate_column(monkeypatch):
+    """Duplicate column = no-op silencioso (idempotencia)."""
+    captured: list[tuple[str, Exception | None]] = []
+    monkeypatch.setattr(rag, "_silent_log", lambda w, e: captured.append((w, e)))
+
+    class _DupConn:
+        def execute(self, sql, *args, **kwargs):
+            import sqlite3 as _s
+            if "ALTER" in sql:
+                raise _s.OperationalError("duplicate column name: kind")
+            return None
+
+    rag._migrate_cita_detections_add_kind(_DupConn())
+
+    alter_logs = [c for c in captured if c[0] == "migration_cita_detections_alter_failed"]
+    assert alter_logs == []

@@ -5575,15 +5575,33 @@ def _migrate_audio_transcripts_phase2(conn) -> None:
             conn.execute(f"ALTER TABLE rag_audio_transcripts ADD COLUMN {col_ddl}")
         except _sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
-                pass
+                # Bug fix 2026-04-25: pre-fix esta rama tenía un `pass` que
+                # tragaba SILENCIOSAMENTE cualquier error que no fuera
+                # "duplicate column" (table not found, disk full, syntax
+                # error en el DDL, etc.) sin notificar a nadie. Ahora lo
+                # logueamos via _silent_log. El _ensure_telemetry_tables
+                # caller también tiene un except más arriba, pero ESE solo
+                # se dispara si la migration entera revienta — los errores
+                # per-column quedaban invisibles.
+                try:
+                    _silent_log(
+                        "migration_audio_transcripts_alter_failed", exc
+                    )
+                except Exception:  # pragma: no cover - log path itself failed
+                    pass
     for idx_ddl in (
         "CREATE INDEX IF NOT EXISTS ix_audio_transcripts_chat_id ON rag_audio_transcripts(chat_id, transcribed_at)",
         "CREATE INDEX IF NOT EXISTS ix_audio_transcripts_hash ON rag_audio_transcripts(audio_hash)",
     ):
         try:
             conn.execute(idx_ddl)
-        except Exception:
-            pass
+        except Exception as _idx_exc:
+            try:
+                _silent_log(
+                    "migration_audio_transcripts_index_failed", _idx_exc
+                )
+            except Exception:  # pragma: no cover
+                pass
 
 
 def _migrate_cita_detections_add_kind(conn) -> None:
@@ -5609,17 +5627,28 @@ def _migrate_cita_detections_add_kind(conn) -> None:
         except _sqlite3.OperationalError as exc:
             # "duplicate column name: kind" → ya migrado, no-op.
             if "duplicate column" not in str(exc).lower():
-                # Cualquier otro error lo ignoramos — si la tabla no existe
-                # es imposible (el DDL previo la crea) y cualquier otro
-                # issue se manifestará ruidosamente en el primer INSERT.
-                pass
+                # Bug fix 2026-04-25: pre-fix esta rama tenía un `pass`
+                # que tragaba CUALQUIER otro error en silencio. El
+                # comentario decía "se manifestará ruidosamente en el
+                # primer INSERT" — pero los INSERTs son defensivos
+                # (subset de columnas), así que en realidad nunca se
+                # manifestaba. Ahora lo logueamos para detección.
+                try:
+                    _silent_log(
+                        "migration_cita_detections_alter_failed", exc
+                    )
+                except Exception:  # pragma: no cover - log path itself failed
+                    pass
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_cita_detections_kind "
             "ON rag_cita_detections(kind)"
         )
-    except Exception:
-        pass
+    except Exception as _idx_exc:
+        try:
+            _silent_log("migration_cita_detections_index_failed", _idx_exc)
+        except Exception:  # pragma: no cover
+            pass
 
 
 # Per-DB-path once-flag para los DDL idempotentes. Pre-2026-04-24 cada

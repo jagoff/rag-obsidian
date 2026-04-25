@@ -39,6 +39,7 @@ _rag_cmd() {
             local -a subcommands
             subcommands=(
                 'ambient:Ambient Agent: reacciona a capturas en 00-Inbox con wikilinks+dupes+related.'
+                'anticipate:Anticipatory agent — el vault te habla sin que preguntes.'
                 'archive:Mover notas muertas a 04-Archive/ preservando la jerarquía PARA.'
                 'ask:Preguntar al vault — alias minimalista de `rag query`.'
                 'auto-tag:Sugerir + (opcional) aplicar tags a notas sin tags via LLM.'
@@ -84,7 +85,9 @@ _rag_cmd() {
                 'query:Consulta única contra las notas.'
                 'rate:Aplica rating +/-/0/1/👍/👎 al último turno de una sesión.'
                 'read:Ingerir una URL externa como nota estructurada en el vault.'
+                'remind-wa:Push de Apple Reminders próximos a vencer / recién vencidos al JID ambient.'
                 'scan-citas:Escanear un folder entero por citas en imágenes y agendarlas.'
+                'send-mail:Enviar un mail vía Gmail API. Útil para bots (WhatsApp listener'
                 'serve:Persistent HTTP query server — keeps models warm between requests.'
                 'session:Administrar sesiones conversacionales (list / show / clear / cleanup).'
                 'setup:Instalar (o desinstalar) los servicios launchd que mantienen el RAG vivo'
@@ -101,6 +104,7 @@ _rag_cmd() {
                 'tune:Auto-calibrar pesos del ranker sobre un golden set.'
                 'vault:Multi-vault: registrar / cambiar / listar vaults de Obsidian.'
                 'wa-tasks:Extrae tareas, preguntas y compromisos de WhatsApp al Inbox.'
+                'wake-up:Wake-up pack: traé todo fresco antes de despertarte.'
                 'watch:Observa el/los vault(s) y reindexa incrementalmente al guardar notas.'
                 'weather:Consultar el clima sin agent loop ni writes al vault.'
                 'wikilinks:Densificar el grafo: sugerir [[wikilinks]] faltantes.'
@@ -110,6 +114,7 @@ _rag_cmd() {
         args)
             case $line[1] in
                 ambient) _rag_cmd_ambient ;;
+                anticipate) _rag_cmd_anticipate ;;
                 archive) _rag_cmd_archive ;;
                 ask) _rag_cmd_ask ;;
                 auto-tag) _rag_cmd_auto_tag ;;
@@ -155,7 +160,9 @@ _rag_cmd() {
                 query) _rag_cmd_query ;;
                 rate) _rag_cmd_rate ;;
                 read) _rag_cmd_read ;;
+                remind-wa) _rag_cmd_remind_wa ;;
                 scan-citas) _rag_cmd_scan_citas ;;
+                send-mail) _rag_cmd_send_mail ;;
                 serve) _rag_cmd_serve ;;
                 session) _rag_cmd_session ;;
                 setup) _rag_cmd_setup ;;
@@ -172,6 +179,7 @@ _rag_cmd() {
                 tune) _rag_cmd_tune ;;
                 vault) _rag_cmd_vault ;;
                 wa-tasks) _rag_cmd_wa_tasks ;;
+                wake-up) _rag_cmd_wake_up ;;
                 watch) _rag_cmd_watch ;;
                 weather) _rag_cmd_weather ;;
                 wikilinks) _rag_cmd_wikilinks ;;
@@ -266,6 +274,49 @@ _rag_cmd_ambient_status() {
 _rag_cmd_ambient_test() {
     _arguments \
         '1:PATH:'
+}
+
+_rag_cmd_anticipate() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'explain:Evalúa señales y muestra todas con su score, sin pushear ni filtrar dedup.'
+                'log:Últimos N candidates de rag_anticipate_candidates.'
+                'run:Una pasada del scheduler — evalúa señales y empuja top-1.'
+            )
+            _describe -t subcommands "rag anticipate subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                explain) _rag_cmd_anticipate_explain ;;
+                log) _rag_cmd_anticipate_log ;;
+                run) _rag_cmd_anticipate_run ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_anticipate_explain() {
+    :
+}
+
+_rag_cmd_anticipate_log() {
+    _arguments \
+        '(--limit -n){--limit,-n}=[]:LIMIT:' \
+        '--only-sent[Solo los que efectivamente se enviaron a WA]'
+}
+
+_rag_cmd_anticipate_run() {
+    _arguments \
+        '--dry-run[Evalúa + loguea pero NO pushea a WA]' \
+        '--explain[Imprime tabla de TODOS los candidates con scores]' \
+        '--force[Bypassea dedup_key + daily_cap (debug)]'
 }
 
 _rag_cmd_archive() {
@@ -952,6 +1003,13 @@ _rag_cmd_read() {
         '1:URL:'
 }
 
+_rag_cmd_remind_wa() {
+    _arguments \
+        '--dry-run[Calcular las acciones sin mandar al bridge ni marcar dedup]' \
+        '--window-min=[Ventana ± minutos: reminders con due en [now - window, now + window] se notifican]:WINDOW_MIN:' \
+        '--max-overdue-min=[Cap absoluto de overdue: reminders con due anterior a now - max-overdue se skipean]:MAX_OVERDUE_MIN:'
+}
+
 _rag_cmd_scan_citas() {
     _arguments \
         '--apply[Crear los eventos de verdad. Sin esto es dry-run (default).]' \
@@ -960,6 +1018,16 @@ _rag_cmd_scan_citas() {
         '(--recursive --no-recursive)--no-recursive[Bajar a subdirs. Default: sí.]' \
         '--plain[Salida plana (ruta + decisión por línea).]' \
         '1:FOLDER:_path_files -/'
+}
+
+_rag_cmd_send_mail() {
+    _arguments \
+        '--to=[Email destinatario (ej. juan@ejemplo.com)]:TO:' \
+        '--subject=[Asunto. Default: '\''(sin asunto)'\''.]:SUBJECT:' \
+        '--body=[Cuerpo del mail. Si se omite se lee de stdin.]:BODY:' \
+        '--cc=[Copia. Separar con coma si son varios.]:CC:' \
+        '--bcc=[Copia oculta. Separar con coma si son varios.]:BCC:' \
+        '--json[Output JSON estructurado en stdout (para subprocess parse).]'
 }
 
 _rag_cmd_serve() {
@@ -1219,6 +1287,16 @@ _rag_cmd_wa_tasks() {
         '--dry-run[Imprimir acciones extraídas sin escribir el archivo]' \
         '--hours=[Ventana en horas (default: desde último run, o 24h si es la primera corrida)]:HOURS:' \
         '--force[Ignorar state file: procesar toda la ventana como si nunca se hubiera corrido]'
+}
+
+_rag_cmd_wake_up() {
+    _arguments \
+        '--dry-run[Reportar los pasos sin ejecutar nada]' \
+        '--skip-index[Saltear `rag index` (ETLs + reindex)]' \
+        '--skip-maintenance[Saltear `rag maintenance`]' \
+        '--skip-radars[Saltear `rag patterns` + `rag emergent`]' \
+        '--skip-brief[Saltear pre-render de `rag morning`]' \
+        '--skip-warmup[Saltear el Ollama warmup]'
 }
 
 _rag_cmd_watch() {

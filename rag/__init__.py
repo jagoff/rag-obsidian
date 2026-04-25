@@ -2889,7 +2889,21 @@ RETRIEVE_K = 20    # candidates from semantic + BM25 each
 # `find_ranker_weights`). Bajar el default invalida weights viejos — re-corré
 # `rag tune --apply` si venías usando tuning custom. Weights default (todos
 # en 0 salvo recency_cue) no se ven afectados.
-RERANK_POOL_MAX = 15
+#
+# Bench 2026-04-25 (post-audit telemetría): set golden creció de n=42
+# (2026-04-20) a n=60 (2026-04-21) con queries synthesis + cross-source
+# (Phase 1.f). Pool=15 quedó chico — varios goldens cross-source no
+# entraban al top-5 del reranker porque el candidato correcto caía fuera
+# del pool de 15. Bump 15→25 para darle más margen al reranker en queries
+# difíciles. Validación:
+# - `rag eval --latency`: singles_hit5 ≥ baseline (no regresión >2pp).
+# - p95 retrieve: +66% trabajo del cross-encoder (15→25 pares por query),
+#   esperado +50-80ms en MPS fp16, aceptable.
+# - feedback_match_floor (en ranker.json) está tuned con pool=15 y queda
+#   desalineado tras el bump — re-tune POST-merge automático con
+#   `rag tune --apply` reajusta. Pre-tune los weights default (todos 0
+#   salvo recency_cue) se mantienen bit-identical.
+RERANK_POOL_MAX = 25
 RERANK_TOP = 5     # final chunks after reranking
 PROGRESSIVE_CONTEXT_K = 6   # extra chunks for progressive context (summarized to 1-liners)
                             # bajado 15→6: cada entry cuesta prefill, y con top-5
@@ -20906,19 +20920,21 @@ def collect_ranker_features(
     Mirrors `retrieve()` but stops one step short of the weighted sort.
 
     ⚠️ Feature-pool mismatch caveat (documented 2026-04-20 audit, re-scoped
-    2026-04-21 when RERANK_POOL_MAX dropped 30→15):
-    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=15`. Production
+    2026-04-21 dropped 30→15, re-bumped 2026-04-25 to 25 para queries
+    cross-source — ver bench block adjacente a `RERANK_POOL_MAX`):
+    `rag tune` invokes this with `k_pool=RERANK_POOL_MAX=25`. Production
     callers use different pools: CLI (`rag query`, `rag chat`) inherits the
-    default (15); web `/api/chat` passes `rerank_pool=5`. Weights that
-    `rag tune --apply` writes are fit on 15-candidate feature vectors but
-    consumed by retrieve paths that score 5-15 at runtime. Closer than the
-    pre-2026-04-21 30-vs-{5,15} gap, but web surface remains mismatched.
+    default (25); web `/api/chat` passes `rerank_pool=5`. Weights that
+    `rag tune --apply` writes are fit on 25-candidate feature vectors but
+    consumed by retrieve paths that score 5-25 at runtime. Closer than the
+    pre-2026-04-21 30-vs-{5,15} gap, pero web surface sigue mismatched.
 
-    No empirical regression measured (hit@5 unchanged pool=30→15; see
-    bench block next to `RERANK_POOL_MAX`). When the tune-vs-runtime parity
-    study happens, either (a) bake `k_pool` into ranker.json and have
-    retrieve read it, or (b) align the tune pool to the dominant surface
-    (currently web chat at pool=5).
+    No empirical regression measured (hit@5 unchanged pool=30→15; el bump
+    15→25 del 2026-04-25 valida con singles_hit5 ≥ baseline en `rag eval
+    --latency`; bench block next to `RERANK_POOL_MAX`). When the
+    tune-vs-runtime parity study happens, either (a) bake `k_pool` into
+    ranker.json and have retrieve read it, or (b) align the tune pool to
+    the dominant surface (currently web chat at pool=5).
     """
     if col.count() == 0:
         return []

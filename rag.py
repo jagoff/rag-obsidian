@@ -4204,41 +4204,58 @@ _corpus_hash_memo: dict = {"hash": None, "chunk_count": None, "last_ts": 0.0}
 _corpus_hash_lock = threading.Lock()
 
 
+# Bucket size para el corpus_hash — fingerprint cambia cuando count cruza
+# un múltiplo de _CORPUS_HASH_BUCKET. Pre-2026-04-24 era count exact, lo
+# que hacía que ingesters continuos (whatsapp every 30min, calendar incremental)
+# fluctuaran el count constantemente y cada query veía un hash diferente:
+# 30 SEMANTIC PUT events en web.log con 24 hashes distintos → cache nunca
+# hiteaba porque cada lookup venía con un corpus_hash recién minteado y no
+# había rows con ese hash. Con bucket=100 y ~8K chunks, agregar/borrar 50
+# notas no invalida el cache; agregar 100 sí. Tradeoff aceptable: el
+# per-entry staleness check (ver `_cached_entry_is_stale`) ya cubre edits
+# a las paths citadas; los chunks nuevos NO citados no hacen mal a un hit.
+_CORPUS_HASH_BUCKET = 100
+
+
+def _hash_chunk_count(chunk_count: int) -> str:
+    import hashlib
+    bucket = chunk_count // _CORPUS_HASH_BUCKET
+    return hashlib.sha256(f"count_bucket:{bucket}".encode()).hexdigest()[:16]
+
+
 def _compute_corpus_hash(col) -> str:
-    """Cheap fingerprint of the current corpus. sha256 of the chunk count.
+    """Cheap fingerprint of the current corpus. sha256 of `chunk_count // 100`.
 
-    Returns "" if col is unavailable. Post 2026-04-23 this is *chunk-count
-    only* — no mtime scan. Rationale:
+    Returns "" if col is unavailable. Post 2026-04-24 buckets the count by
+    `_CORPUS_HASH_BUCKET` (default 100) en vez de usar el exact count.
+    Rationale:
 
-    - The previous implementation used `count + top-10 most-recently-modified
-      .md mtimes`, which meant ANY single note edit shifted the hash and
-      invalidated the entire cache. An audit after GC#1 shipped found 0 hits
-      against 2,335 queries over 7 days despite 14 queries repeating ≥10×
-      ("ikigai" 11×, "liderazgo" 5×, etc.) — exactly because each recent
-      edit blew away the cache globally.
+    - El cambio anterior (sólo `count`, sin mtimes) seguía invalidando el
+      cache cada vez que cualquier ingester escribía un chunk. Audit
+      2026-04-24 sobre el web.log mostró 30 PUT events con 24 corpus_hashes
+      DISTINTOS — el cache nunca hiteaba porque cada query reseteaba el
+      hash. Bucket=100 hace que el hash sólo cambie tras +/-100 chunks
+      netos, dejando que el cache sobreviva a la rotación normal de
+      ingesters.
 
-    - Per-entry freshness is now enforced at *lookup time* inside
-      ``semantic_cache_lookup`` by comparing each cached entry's source
-      ``paths[]`` against their current mtime. If any referenced note was
-      edited after the cache was stored, that row is skipped — the rest of
-      the cache survives. This trades one rglob at write time for one stat
-      per cached path at read time (cheap: <1ms for ≤5 paths per entry).
+    - Per-entry freshness se enforce en `semantic_cache_lookup` comparando
+      cada entry's `paths[]` contra su mtime actual; cualquier edit a una
+      nota citada salta la row, sin tirar el cache entero.
 
-    - New/removed notes *still* invalidate the whole cache via chunk_count
-      delta — that's the correct invariant (new chunks mean retrieval may
-      surface different sources for the same query).
+    - New/removed notes en bulk (>100 net) sí invalidan — correcta
+      invariante (corpus cambió suficiente como para esperar retrieval
+      diferente).
     """
     try:
-        import hashlib
         chunk_count = int(col.count())
     except Exception:
         return ""
-    return hashlib.sha256(f"count:{chunk_count}".encode()).hexdigest()[:16]
+    return _hash_chunk_count(chunk_count)
 
 
 def _corpus_hash_cached(col) -> str:
     """Cached version of _compute_corpus_hash — re-computes only when chunk
-    count changes (same trigger as _load_corpus invalidation)."""
+    count changes bucket (same trigger as _load_corpus invalidation)."""
     try:
         cnt = int(col.count())
     except Exception:
@@ -4997,21 +5014,6 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " extra_json TEXT"
             ")",
             "CREATE INDEX IF NOT EXISTS ix_rag_memory_metrics_ts ON rag_memory_metrics(ts)",
-        ),
-    ),
-    (
-        "system_memory_metrics",
-        (
-            "CREATE TABLE IF NOT EXISTS system_memory_metrics ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " ts TEXT NOT NULL,"
-            " total_mb REAL,"
-            " by_category_json TEXT,"
-            " top_json TEXT,"
-            " vm_json TEXT,"
-            " extra_json TEXT"
-            ")",
-            "CREATE INDEX IF NOT EXISTS ix_system_memory_metrics_ts ON system_memory_metrics(ts)",
         ),
     ),
     (
@@ -23048,6 +23050,15 @@ def watch(debounce: float, all_vaults: bool):
     console.print(f"[dim]debounce={debounce}s · Ctrl+C para salir[/dim]")
 
     multi = len(vault_state) > 1
+    # Heartbeat cadence: cada 5min el watcher imprime un "heartbeat
+    # alive=true" line para que el mtime de watch.log refleje "watcher
+    # corriendo" en vez de "vault editado". Pre-fix, `/api/status/freshness`
+    # mostraba `vault stale` cualquier hora donde el user no editara
+    # notas (típico fines de semana / noches), aunque el watcher
+    # estuviera 100% sano. SLA = 15min, heartbeat = 5min → drift_ratio
+    # siempre <1.0 cuando el watcher vive.
+    HEARTBEAT_S = 300.0
+    last_heartbeat = time.time()
     try:
         while True:
             time.sleep(debounce)
@@ -23061,6 +23072,17 @@ def watch(debounce: float, all_vaults: bool):
                     color = {"indexed": "green", "removed": "yellow", "empty": "dim"}.get(status, "white")
                     tag = f"[dim][{name}][/dim] " if multi else ""
                     console.print(f"  {tag}[{color}]{status:>8}[/{color}] {rel}")
+            now_t = time.time()
+            if now_t - last_heartbeat >= HEARTBEAT_S:
+                # Print directo (no console.print) para evitar markup
+                # parsing y mantener el line size mínimo. Va a stdout
+                # → watch.log via launchd.
+                print(
+                    f"[heartbeat] {datetime.now().isoformat(timespec='seconds')} "
+                    f"alive=true vaults={len(vault_state)}",
+                    flush=True,
+                )
+                last_heartbeat = now_t
     except KeyboardInterrupt:
         pass
     finally:
@@ -43631,8 +43653,8 @@ def _telemetry_wal_checkpoint(dry_run: bool = False) -> dict:
 #   90d: queries, behavior             — ranker-vivo signal window
 #   60d: ambient, brief_written, wa_tasks, archive, filing, eval, surface,
 #        proactive — useful historic context but not ranker input
-#   30d: cpu_metrics, memory_metrics, system_memory_metrics — sampled every
-#        minute by the web sampler; bloat magnet otherwise
+#   30d: cpu_metrics, memory_metrics — sampled every minute by the web
+#        sampler; bloat magnet otherwise
 #   ∞ : feedback, tune, contradictions — small, high-signal, intentionally
 #        kept (feedback golden depends on full rag_feedback history, tune
 #        history feeds `rag dashboard`, contradictions are audit).
@@ -43651,7 +43673,6 @@ _SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
     ("rag_proactive_log", 60),
     ("rag_cpu_metrics", 30),
     ("rag_memory_metrics", 30),
-    ("system_memory_metrics", 30),
 )
 
 # Tables that upsert on a PK instead of appending log rows. Listed here both
@@ -44645,7 +44666,6 @@ _CUTOVER_SOURCES: tuple[tuple[str, str], ...] = (
     ("proactive.jsonl", "rag_proactive_log"),
     ("rag_cpu.jsonl", "rag_cpu_metrics"),
     ("rag_memory.jsonl", "rag_memory_metrics"),
-    ("system_memory.jsonl", "system_memory_metrics"),
     # state_latest_jsonl sources (upsert-style: SQL rows ≤ JSONL lines
     # because repeated keys collapse on write). WARN if SQL < unique-key
     # count, don't fail on raw count mismatch.

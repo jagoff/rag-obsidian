@@ -155,6 +155,32 @@ def test_read_queries_n_zero_returns_empty(sql_env):
     assert rag._read_queries_for_log(-5) == []
 
 
+def test_admin_cmd_t_retrieve_populated(sql_env):
+    """Admin commands (`followup`, `read`) son operaciones holísticas sin
+    fase separada de retrieve/gen — pero el dashboard / `audit_telemetry_
+    health` agrupa AVG(t_retrieve) por cmd. Pre-fix los rows quedaban con
+    NULL en t_retrieve / t_gen → audit reportaba 1051 invocaciones sin
+    latency observability. Post-fix los call sites pasan `t_retrieve =
+    total_s` para que la columna refleje wall-time del comando."""
+    tmp, conn = sql_env
+    rag.log_query_event({
+        "cmd": "followup", "top_score": None,
+        "t_retrieve": 12.5, "n_loops": 3,
+    })
+    rag.log_query_event({
+        "cmd": "read", "top_score": None,
+        "t_retrieve": 4.2, "url": "https://example.com",
+    })
+    rows = conn.execute(
+        "SELECT cmd, t_retrieve FROM rag_queries WHERE cmd IN ('followup', 'read')"
+        " ORDER BY cmd"
+    ).fetchall()
+    assert len(rows) == 2
+    by_cmd = {r[0]: r[1] for r in rows}
+    assert by_cmd["followup"] == 12.5
+    assert by_cmd["read"] == 4.2
+
+
 def test_read_queries_excludes_rows_with_empty_q(sql_env):
     """Admin-style events (cmd='followup' / 'read' / etc) log to
     rag_queries with `q=""` via `_map_queries_row`'s setdefault fallback.

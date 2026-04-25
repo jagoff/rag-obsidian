@@ -31403,13 +31403,15 @@ def read_cmd(url: str, save: bool, plain: bool):
         click.echo(str(e)) if plain else console.print(f"[red]{e}[/red]")
         raise SystemExit(1)
 
+    _total_s = time.perf_counter() - t0
     log_query_event({
         "cmd": "read", "url": url, "saved": bool(save),
         "title": result.get("title", ""),
         "text_len": result.get("text_len", 0),
         "n_related": len(result.get("related") or []),
         "n_tags": len(result.get("tags") or []),
-        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
+        "t_retrieve": round(_total_s, 3),
+        "timing": _round_timing_ms({"total_ms": _total_s * 1000}),
     })
 
     if plain:
@@ -39034,10 +39036,12 @@ def followup(days: int, status: str | None, as_json: bool, plain: bool,
     for it in items:
         counts[it["status"]] = counts.get(it["status"], 0) + 1
 
+    _total_s = time.perf_counter() - t0
     log_query_event({
         "cmd": "followup", "days": days, "status": status,
         "n_loops": len(items), "counts": counts,
-        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
+        "t_retrieve": round(_total_s, 3),
+        "timing": _round_timing_ms({"total_ms": _total_s * 1000}),
     })
 
     if as_json:

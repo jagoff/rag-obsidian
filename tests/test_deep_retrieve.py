@@ -427,3 +427,110 @@ def test_deep_high_conf_bypass_default_is_0_8():
         f"_DEEP_HIGH_CONF_BYPASS default debe ser 0.8 "
         f"(fue {rag._DEEP_HIGH_CONF_BYPASS}). Ver _DEEP_HIGH_CONF_BYPASS docstring."
     )
+
+
+# ── Low-confidence bypass (opt-in, audit empírico 2026-04-25) ────────────
+
+
+def test_deep_retrieve_low_confidence_bypass_disabled_by_default(monkeypatch):
+    """Default `_DEEP_LOW_CONF_BYPASS = 0.0` → bypass deshabilitado, las
+    queries con top score bajo entran al loop normal."""
+    from unittest.mock import MagicMock
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(question, docs, metas):
+        judge_calls["n"] += 1
+        return (True, "")  # exit immediately
+
+    very_low_score_result = {
+        "docs": ["doc"],
+        "metas": [{"file": "n.md"}],
+        "scores": [0.05],  # extremely low
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: very_low_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+    # Default = 0.0 (disabled). Don't patch.
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    # Loop ran (judge called 1x) → exit_reason "sufficient".
+    assert judge_calls["n"] == 1
+    assert out["deep_retrieve_exit_reason"] == "sufficient"
+
+
+def test_deep_retrieve_low_confidence_bypass_when_enabled(monkeypatch):
+    """Cuando RAG_DEEP_LOW_CONF_BYPASS=0.3 está activo, queries con
+    top score < 0.3 NO entran al loop — exit_reason
+    `low_confidence_bypass`."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(rag, "_DEEP_LOW_CONF_BYPASS", 0.3)
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(*args, **kwargs):
+        judge_calls["n"] += 1
+        return (False, "should not be called")
+
+    low_score_result = {
+        "docs": ["doc"],
+        "metas": [{"file": "n.md"}],
+        "scores": [0.15],  # below 0.3 threshold
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: low_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    assert judge_calls["n"] == 0, "loop NO debe correr cuando hay low-conf bypass"
+    assert out["deep_retrieve_iterations"] == 1
+    assert out["deep_retrieve_exit_reason"] == "low_confidence_bypass"
+
+
+def test_deep_retrieve_mid_confidence_passes_both_bypasses(monkeypatch):
+    """Score entre los dos bypasses (e.g. 0.5) debe correr el loop
+    normal, ni high ni low bypass."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(rag, "_DEEP_HIGH_CONF_BYPASS", 0.8)
+    monkeypatch.setattr(rag, "_DEEP_LOW_CONF_BYPASS", 0.3)
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(*args, **kwargs):
+        judge_calls["n"] += 1
+        return (True, "")
+
+    mid_score_result = {
+        "docs": ["doc"],
+        "metas": [{"file": "n.md"}],
+        "scores": [0.5],  # entre 0.3 y 0.8
+        "graph_docs": [],
+        "graph_metas": [],
+    }
+
+    monkeypatch.setattr(rag, "retrieve", lambda *a, **kw: mid_score_result)
+    monkeypatch.setattr(rag, "_judge_sufficiency", fake_judge)
+
+    out = rag.deep_retrieve(col=MagicMock(), question="q", k=5, folder=None)
+
+    # Judge corrió → no hubo bypass.
+    assert judge_calls["n"] == 1
+    assert out["deep_retrieve_exit_reason"] == "sufficient"
+
+
+def test_deep_low_conf_bypass_default_is_zero():
+    """`_DEEP_LOW_CONF_BYPASS` default = 0.0 (deshabilitado).
+
+    Conscient elección: el low-confidence bypass es opt-in porque
+    en queries genuinamente difíciles (multi-entity, composite) el
+    loop SÍ ayuda — bypass-eando perdemos recall. Default safe.
+    """
+    assert rag._DEEP_LOW_CONF_BYPASS == 0.0

@@ -18771,6 +18771,21 @@ _DEEP_MAX_SECONDS = float(os.environ.get("RAG_DEEP_MAX_SECONDS", "30"))
 # bypass (todas las queries pasan por el sufficiency loop) o subirlo a
 # 0.9 si querés ser más conservador.
 _DEEP_HIGH_CONF_BYPASS = float(os.environ.get("RAG_DEEP_HIGH_CONF_BYPASS", "0.8"))
+# Symmetric early-exit por LOW confidence. Audit empírico 2026-04-25:
+# las 3 queries más lentas de los últimos 7 días (>60s c/u, una de
+# 202s) tenían `top_score < 0.5` y aun así corrieron el loop completo
+# de sub-queries. Cuando el corpus genuinamente no tiene contenido
+# relevante para la pregunta, las sub-queries del helper tienden a
+# generar más rondas de retrieval costoso sin ganancia real — el LLM
+# va a responder "no tengo info en el vault" igual.
+#
+# Default 0.0 (DESHABILITADO) — opt-in conservador, NO se activa por
+# defecto. La razón: en queries genuinamente difíciles (composite, múltiples
+# entidades), el sufficiency loop SÍ ayuda. El bypass es para
+# operadores que prefieren cap el tail latency a costa de perder algun
+# recall en queries de cobertura escasa. Setear ej. `RAG_DEEP_LOW_CONF_BYPASS=0.3`
+# para activar.
+_DEEP_LOW_CONF_BYPASS = float(os.environ.get("RAG_DEEP_LOW_CONF_BYPASS", "0.0"))
 
 
 def _judge_sufficiency(question: str, docs: list[str], metas: list[dict]) -> tuple[bool, str]:
@@ -18859,6 +18874,20 @@ def deep_retrieve(
     ):
         result["deep_retrieve_iterations"] = 1
         result["deep_retrieve_exit_reason"] = "high_confidence_bypass"
+        return result
+
+    # Early-exit por LOW confidence (opt-in, default deshabilitado).
+    # Audit empírico 2026-04-25: queries con top_score < 0.5 en la
+    # primera pasada ocupan el tail de latencia (60-200s) sin que el
+    # loop encuentre algo útil — el corpus genuinamente no tiene
+    # contenido. Activar setting `RAG_DEEP_LOW_CONF_BYPASS` (ej. 0.3)
+    # para cap el tail.
+    if (
+        _DEEP_LOW_CONF_BYPASS > 0.0
+        and first_top < _DEEP_LOW_CONF_BYPASS
+    ):
+        result["deep_retrieve_iterations"] = 1
+        result["deep_retrieve_exit_reason"] = "low_confidence_bypass"
         return result
 
     all_docs = list(result["docs"])

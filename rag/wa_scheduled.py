@@ -70,8 +70,14 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 _TABLE = "rag_whatsapp_scheduled"
 _VALID_STATUSES: tuple[str, ...] = (
-    "pending", "sent", "sent_late", "failed", "cancelled",
+    "pending", "processing", "sent", "sent_late", "failed", "cancelled",
 )
+# Si un row queda en 'processing' por más de este threshold, asumimos
+# que el worker que lo agarró crasheó antes de finalizar. Lo reseteamos
+# a 'pending' al inicio del siguiente run para que se reintente. Threshold
+# debe ser > timeout máximo del bridge (10s) + margen — 5min cubre con
+# holgura el caso plist tick + manual run solapados.
+_STALE_PROCESSING_MINUTES = 5
 _VALID_SOURCES: tuple[str, ...] = ("chat", "dashboard", "nl")
 # Margen para clock skew: rechazamos pasado solo si está más de 60s atrás.
 _PAST_TOLERANCE_SECONDS = 60
@@ -552,6 +558,34 @@ def run_due_worker(
         now_iso = _iso_utc(now_dt)
 
         with _resolve_conn(conn) as c:
+            # ── Step 0: recovery de filas "huérfanas" en 'processing' ──
+            # Si otro worker crasheó entre acquire y finalize, sus rows
+            # quedan trabadas en 'processing'. Las reseteamos a 'pending'
+            # si llevan más de _STALE_PROCESSING_MINUTES (default 5min).
+            # Sin esto, los mensajes quedan stuck para siempre. Solo
+            # corremos esto en modo no-dry-run (en dry-run no queremos
+            # mutaciones a la tabla).
+            if not dry_run:
+                stale_threshold = _iso_utc(
+                    now_dt - timedelta(minutes=_STALE_PROCESSING_MINUTES)
+                )
+                try:
+                    recovered = c.execute(
+                        f"UPDATE {_TABLE} SET status = 'pending' "
+                        f"WHERE status = 'processing' "
+                        f"AND last_attempt_at IS NOT NULL "
+                        f"AND last_attempt_at < ?",
+                        (stale_threshold,),
+                    ).rowcount
+                    c.commit()
+                    if recovered:
+                        _log_ambient("whatsapp_scheduled_processing_recovered", {
+                            "count": recovered,
+                            "stale_threshold_minutes": _STALE_PROCESSING_MINUTES,
+                        })
+                except Exception:
+                    pass
+
             rows = c.execute(
                 f"SELECT {_SELECT_COLS_SQL} FROM {_TABLE} "
                 f"WHERE status = 'pending' AND scheduled_for_utc <= ? "
@@ -567,7 +601,6 @@ def run_due_worker(
                 from rag.integrations.whatsapp import _whatsapp_send_to_jid as send_fn  # noqa: F401
 
             for r in rows:
-                summary["processed"] += 1
                 try:
                     sched = _row_to_dict(r)
                     sched_dt = _to_utc_dt(sched["scheduled_for_utc"])
@@ -587,6 +620,8 @@ def run_due_worker(
                         }
 
                     if dry_run:
+                        # Dry-run NO acquire ni manda — solo loguea lo que haría.
+                        summary["processed"] += 1
                         _log_ambient("whatsapp_scheduled_dry_run", {
                             "scheduled_id": sched["id"],
                             "jid": sched["jid"],
@@ -595,10 +630,30 @@ def run_due_worker(
                             "would_status": target_status,
                             "attempt_count": sched.get("attempt_count", 0),
                         })
-                        # En dry-run NO incrementamos contadores de sent/late
-                        # — solo `processed` arriba. El test puede verificar
-                        # que no haya effects.
                         continue
+
+                    # ── Atomic acquire: pending → processing ──────────
+                    # Esta UPDATE es la barrera de exclusión mutua. Si otro
+                    # worker ya agarró este row (status != 'pending'), el
+                    # rowcount es 0 y skipeamos sin mandar. Resuelve la
+                    # race condition donde 2 workers leen el mismo SELECT
+                    # y mandan duplicado al destinatario.
+                    acquired = c.execute(
+                        f"UPDATE {_TABLE} SET status = 'processing', "
+                        f"last_attempt_at = ? "
+                        f"WHERE id = ? AND status = 'pending'",
+                        (now_iso, sched["id"]),
+                    ).rowcount
+                    try:
+                        c.commit()
+                    except Exception:
+                        pass
+                    if not acquired:
+                        # Otro worker se lo llevó entre nuestro SELECT y
+                        # este UPDATE. Skip silencioso — él lo va a finalizar.
+                        continue
+
+                    summary["processed"] += 1
 
                     sent_ok = False
                     try:
@@ -621,11 +676,15 @@ def run_due_worker(
                     new_attempts = int(sched.get("attempt_count") or 0) + 1
 
                     if sent_ok:
+                        # Finalize: processing → sent / sent_late.
+                        # Matchear status='processing' en el WHERE garantiza
+                        # que solo finalize si seguimos siendo los dueños
+                        # (defensivo aunque el acquire ya nos dio exclusión).
                         c.execute(
                             f"UPDATE {_TABLE} SET status = ?, sent_at = ?, "
                             f"delta_minutes = ?, last_attempt_at = ?, "
                             f"attempt_count = ?, last_error = NULL "
-                            f"WHERE id = ?",
+                            f"WHERE id = ? AND status = 'processing'",
                             (target_status, now_iso, delta_min, now_iso,
                              new_attempts, sched["id"]),
                         )
@@ -653,10 +712,13 @@ def run_due_worker(
                             })
                     else:
                         if new_attempts >= int(max_retries):
+                            # Tras N fallos: processing → failed (terminal,
+                            # no se reintenta más sin intervención manual).
                             c.execute(
                                 f"UPDATE {_TABLE} SET status = 'failed', "
                                 f"last_error = ?, last_attempt_at = ?, "
-                                f"attempt_count = ? WHERE id = ?",
+                                f"attempt_count = ? "
+                                f"WHERE id = ? AND status = 'processing'",
                                 ("send_failed", now_iso, new_attempts,
                                  sched["id"]),
                             )
@@ -673,10 +735,16 @@ def run_due_worker(
                                 "last_error": "send_failed",
                             })
                         else:
+                            # Failure recoverable: processing → pending para
+                            # que el próximo tick lo agarre de nuevo. Sin
+                            # esto, el row se queda atrapado en 'processing'
+                            # esperando que el recovery loop lo libere
+                            # (5min de delay innecesario).
                             c.execute(
-                                f"UPDATE {_TABLE} SET last_error = ?, "
-                                f"last_attempt_at = ?, attempt_count = ? "
-                                f"WHERE id = ?",
+                                f"UPDATE {_TABLE} SET status = 'pending', "
+                                f"last_error = ?, last_attempt_at = ?, "
+                                f"attempt_count = ? "
+                                f"WHERE id = ? AND status = 'processing'",
                                 ("send_failed", now_iso, new_attempts,
                                  sched["id"]),
                             )

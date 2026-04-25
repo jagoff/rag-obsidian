@@ -2511,6 +2511,50 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
             "image_path": str(img_path),
         }
 
+    # ── Dedup check: si ya procesamos este texto OCR antes y ya
+    #    creamos un evento/reminder, NO crear duplicado. La tabla
+    #    `rag_cita_detections` (compartida con CLI `rag capture --image`)
+    #    indexa por sha256 del OCR normalizado. Usuario sube misma foto
+    #    2 veces → 2da vez devuelve `action="noop"` con el id original.
+    try:
+        from rag.ocr import _ocr_hash_key, _persist_cita_detection  # noqa: PLC0415
+        from rag import _ragvec_state_conn  # noqa: PLC0415
+        ocr_key = _ocr_hash_key(ocr_text)
+        with _ragvec_state_conn() as _conn:
+            prior = _conn.execute(
+                "SELECT decision, kind, title, start_text, location, "
+                "confidence, event_uid, reminder_id "
+                "FROM rag_cita_detections WHERE ocr_hash = ?",
+                (ocr_key,),
+            ).fetchone()
+    except Exception:
+        prior = None
+        ocr_key = ""
+
+    if prior is not None:
+        prior_decision = prior[0]
+        # Solo cortocircuitamos si ya hubo creación real (cita/reminder).
+        # Para `low_confidence`/`ambiguous`/`note`, re-procesamos: el
+        # detector puede haber mejorado o el user puede querer
+        # re-ofrecer la card de confirmación.
+        if prior_decision in ("cita", "reminder"):
+            return {
+                "action": "noop",
+                "reason": f"already_processed_{prior_decision}",
+                "kind": prior[1] or "",
+                "fields": {
+                    "title": prior[2],
+                    "start_text": prior[3],
+                    "location": prior[4],
+                },
+                "event_uid": prior[6],
+                "reminder_id": prior[7],
+                "confidence": prior[5],
+                "ocr_text": ocr_text[:500],
+                "ocr_source": ocr_source,
+                "image_path": str(img_path),
+            }
+
     try:
         detection = _detect_cita_from_ocr(ocr_text)
     except Exception as e:
@@ -2541,8 +2585,36 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
         f"{ocr_text[:1000]}"
     )
 
+    # Helper local para persistir en rag_cita_detections, idempotente.
+    # El dedup check al inicio del endpoint solo cortocircuita si ya
+    # creamos algo. Persistimos AHORA (después de procesar) para que
+    # uploads futuros del mismo OCR encuentren el row.
+    def _persist(decision: str, *, event_uid=None, reminder_id=None):
+        if not ocr_key:
+            return
+        try:
+            import time as _time  # noqa: PLC0415
+            _persist_cita_detection(
+                ocr_hash=ocr_key,
+                image_path=str(img_path),
+                source="web-chat",
+                decision=decision,
+                kind=kind,
+                title=title,
+                start_text=when,
+                location=location,
+                confidence=confidence,
+                event_uid=event_uid,
+                reminder_id=reminder_id,
+                created_at=_time.time(),
+            )
+        except Exception:
+            pass  # silent-fail: dedup miss en próximo upload no es crítico
+
     if kind not in {"event", "reminder"}:
-        # kind == "note" o algo raro → no proponemos nada agendable
+        # kind == "note" o algo raro → no proponemos nada agendable.
+        # Persistimos para evitar re-detectar el mismo texto.
+        _persist("note")
         return {
             "action": "noop",
             "reason": "kind_not_actionable",
@@ -2580,11 +2652,19 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
 
         if resp.get("created"):
             id_field = "event_uid" if kind == "event" else "reminder_id"
+            new_id = resp.get(id_field)
+            # Persistir como cita/reminder con el id real → próximas
+            # subidas de la misma foto detectan el dedup y devuelven
+            # noop sin re-crear.
+            if kind == "event":
+                _persist("cita", event_uid=new_id)
+            else:
+                _persist("reminder", reminder_id=new_id)
             return {
                 "action": "created",
                 "kind": kind,
                 "fields": resp.get("fields", {}),
-                id_field: resp.get(id_field),
+                id_field: new_id,
                 "ocr_text": ocr_text[:500],
                 "ocr_source": ocr_source,
                 "confidence": confidence,
@@ -2631,6 +2711,12 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
             "recurrence": None,
             "recurrence_text": None,
         }
+
+    # Persistir como 'ambiguous' (low_confidence o NL no parseable):
+    # NO se creó nada, así que si re-suben la foto queremos darle la
+    # chance al detector de re-procesar. El dedup check al inicio
+    # SOLO short-circuita decisions in {cita, reminder}, no estos.
+    _persist("ambiguous")
 
     return {
         "action": "needs_confirmation",

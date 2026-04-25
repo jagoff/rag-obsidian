@@ -835,3 +835,228 @@ def test_wa_scheduled_send_plist_uses_correct_rag_binary():
     xml = _rag._wa_scheduled_send_plist(custom_bin)
     parsed = plistlib.loads(xml.encode("utf-8"))
     assert parsed["ProgramArguments"][0] == custom_bin
+
+
+# ── Race condition + recovery: atomic acquire pending → processing ─────
+#
+# Tests para el fix del 2026-04-25 (audit profundo): el worker antes
+# tenía window race entre SELECT pending y UPDATE sent — dos workers
+# podían leer el mismo row y mandar el mensaje 2 veces al destinatario.
+# El fix es UPDATE atómico pending → processing como acquire, con check
+# de rowcount; si 0, skip silencioso. Y recovery loop al inicio para
+# liberar rows huérfanas en 'processing' que dejó un worker crasheado.
+
+
+def test_run_due_worker_skips_row_already_processing(
+    isolated_state_db, monkeypatch,
+):
+    """Si una row ya está en status='processing' (otro worker la
+    agarró), el worker actual debe SKIPEARLA — NO mandar al bridge ni
+    finalizar. Resuelve el caso plist tick + manual run solapados.
+    """
+    sent_calls = []
+
+    def _fake_send(jid, text, *, anti_loop=False, reply_to=None):
+        sent_calls.append({"jid": jid, "text": text})
+        return True
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid", _fake_send,
+    )
+
+    # Sembrar pending vencido (bypass schedule() que rechaza pasados).
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(60),  # 1h atrás, vencido
+        jid="540000@s.whatsapp.net",
+        message_text="msg",
+    )
+    # Simular otro worker que ya agarró el row → status='processing'
+    # con last_attempt_at reciente (<5min, NO stale).
+    not_stale = (
+        datetime.now(timezone.utc) - timedelta(seconds=30)
+    ).isoformat(timespec="seconds")
+    conn = sqlite3.connect(str(isolated_state_db), isolation_level=None)
+    try:
+        conn.execute(
+            f"UPDATE {wa_scheduled._TABLE} SET status='processing', "
+            f"last_attempt_at=? WHERE id=?",
+            (not_stale, sid),
+        )
+    finally:
+        conn.close()
+
+    summary = wa_scheduled.run_due_worker()
+    assert summary["processed"] == 0, (
+        "no debería haber procesado el row — el otro worker tiene 'processing'"
+    )
+    assert len(sent_calls) == 0, "no debería haber llamado al bridge"
+    # La row sigue en processing, no fue tocada.
+    row = _read_row(isolated_state_db, sid)
+    assert row["status"] == "processing"
+
+
+def test_run_due_worker_recovers_stale_processing(
+    isolated_state_db, monkeypatch,
+):
+    """Si una row quedó en status='processing' por > _STALE_PROCESSING_MINUTES,
+    asumimos que el worker que la agarró crasheó. El run actual la
+    resetea a 'pending' al inicio y luego la procesa normalmente.
+    Sin esto, los rows quedan stuck para siempre.
+    """
+    sent_calls = []
+
+    def _fake_send(jid, text, *, anti_loop=False, reply_to=None):
+        sent_calls.append(jid)
+        return True
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid", _fake_send,
+    )
+
+    # Sembrar pending vencido + simular worker viejo que crasheó hace
+    # 10 min (last_attempt_at IS stale → debería ser recuperado).
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(60),
+        jid="540000@s.whatsapp.net",
+        message_text="recovered",
+    )
+    stale_attempt = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat(timespec="seconds")
+    conn = sqlite3.connect(str(isolated_state_db), isolation_level=None)
+    try:
+        conn.execute(
+            f"UPDATE {wa_scheduled._TABLE} SET status='processing', "
+            f"last_attempt_at=? WHERE id=?",
+            (stale_attempt, sid),
+        )
+    finally:
+        conn.close()
+
+    summary = wa_scheduled.run_due_worker()
+    # Recovery + pickup + send en el mismo run.
+    # scheduled_for_utc fue hace 60min >> late_threshold de 5min →
+    # status final = 'sent_late', counter sent_late++.
+    assert summary["processed"] == 1
+    assert summary["sent_late"] == 1
+    assert sent_calls == ["540000@s.whatsapp.net"]
+    row = _read_row(isolated_state_db, sid)
+    assert row["status"] == "sent_late"
+
+
+def test_run_due_worker_send_failure_returns_to_pending(
+    isolated_state_db, monkeypatch,
+):
+    """Cuando el bridge falla pero attempt_count < max_retries, la row
+    debe volver a 'pending' (no quedar en 'processing'). Sin esto, el
+    próximo tick no la agarra hasta que el recovery loop la libere
+    (5min de delay innecesario).
+    """
+    def _fake_send_fail(jid, text, *, anti_loop=False, reply_to=None):
+        return False  # bridge down
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid", _fake_send_fail,
+    )
+
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(30),
+        jid="540000@s.whatsapp.net",
+        message_text="msg",
+    )
+    summary = wa_scheduled.run_due_worker(max_retries=5)
+    assert summary["retried"] == 1
+    row = _read_row(isolated_state_db, sid)
+    assert row["status"] == "pending", (
+        f"tras send fail recoverable debería volver a pending, got {row['status']!r}"
+    )
+    assert row["attempt_count"] == 1
+
+
+# ── Reply-to + scheduled_for: persiste E ENVÍA correctamente ──────────
+
+
+def test_run_due_worker_passes_reply_to_to_bridge(
+    isolated_state_db, monkeypatch,
+):
+    """Cuando se schedulea un reply (con `reply_to` populado), el
+    worker debe leer las columnas reply_to_* de la DB y pasarlas al
+    bridge en `_whatsapp_send_to_jid(..., reply_to=dict)`. Sin este
+    test, un cambio en run_due_worker que rompa el spread del dict
+    pasa silencioso (test_persists solo verifica las columnas
+    guardadas, no el outgoing call).
+    """
+    captured = []
+
+    def _fake_send(jid, text, *, anti_loop=False, reply_to=None):
+        captured.append({"jid": jid, "text": text, "reply_to": reply_to})
+        return True
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid", _fake_send,
+    )
+
+    # Sembrar reply pending con columnas reply_to_* populadas.
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(30),
+        jid="540000@s.whatsapp.net",
+        message_text="dale, voy",
+    )
+    conn = sqlite3.connect(str(isolated_state_db), isolation_level=None)
+    try:
+        conn.execute(
+            f"UPDATE {wa_scheduled._TABLE} SET reply_to_id=?, "
+            f"reply_to_text=?, reply_to_sender_jid=? WHERE id=?",
+            ("FAKE_BRIDGE_MSG_ID_42", "che, vení a las 9?",
+             "540000@s.whatsapp.net", sid),
+        )
+    finally:
+        conn.close()
+
+    summary = wa_scheduled.run_due_worker()
+    # scheduled_for_utc fue hace 30min >> 5min late_threshold →
+    # sent_late, no sent. Lo importante para este test es que el bridge
+    # recibió el reply_to correcto.
+    assert summary["sent_late"] == 1
+    assert len(captured) == 1
+    call = captured[0]
+    assert call["jid"] == "540000@s.whatsapp.net"
+    assert call["text"] == "dale, voy"
+    # El dict reply_to debe llegar tal cual al bridge — message_id es
+    # crítico para que cuando el bridge soporte quotes nativas funcione.
+    assert call["reply_to"] is not None
+    assert call["reply_to"]["message_id"] == "FAKE_BRIDGE_MSG_ID_42"
+    assert call["reply_to"]["original_text"] == "che, vení a las 9?"
+    assert call["reply_to"]["sender_jid"] == "540000@s.whatsapp.net"
+
+
+def test_run_due_worker_no_reply_to_passes_none(
+    isolated_state_db, monkeypatch,
+):
+    """El path "send normal" (sin reply_to) debe pasar reply_to=None
+    al bridge — no un dict vacío ni un dict con strings vacíos. Bridge
+    interpreta ambos distinto.
+    """
+    captured = []
+
+    def _fake_send(jid, text, *, anti_loop=False, reply_to=None):
+        captured.append({"reply_to": reply_to})
+        return True
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid", _fake_send,
+    )
+
+    _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(30),
+        jid="540000@s.whatsapp.net",
+        message_text="hola sin quote",
+    )
+    wa_scheduled.run_due_worker()
+    assert len(captured) == 1
+    assert captured[0]["reply_to"] is None

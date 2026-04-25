@@ -30,6 +30,51 @@ import web.server as _server
 _client = TestClient(_server.app)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cita_detections_table(monkeypatch, tmp_path):
+    """Aísla `_ragvec_state_conn` a una DB tmpfile por test.
+
+    Sin esta fixture, los tests que ejercen el endpoint
+    `/api/chat/upload-image` persistirían rows en
+    `~/.local/share/obsidian-rag/ragvec/telemetry.db` (DB real del user)
+    via `_persist_cita_detection`, contaminando entre runs y
+    triggereando el dedup en tests subsiguientes que mockean el mismo
+    OCR text. Aislándolo por test, cada uno arranca con la tabla vacía.
+    """
+    import sqlite3
+    from contextlib import contextmanager
+
+    db_path = tmp_path / "isolated_telemetry.db"
+
+    @contextmanager
+    def _fake_conn():
+        c = sqlite3.connect(
+            str(db_path),
+            isolation_level=None,
+            check_same_thread=False,
+            timeout=30.0,
+        )
+        try:
+            yield c
+        finally:
+            c.close()
+
+    # Crear schema mínimo de rag_cita_detections (DDL en rag/__init__.py:5437).
+    _CITA_DDL = (
+        "CREATE TABLE IF NOT EXISTS rag_cita_detections ("
+        " ocr_hash TEXT PRIMARY KEY, image_path TEXT, source TEXT NOT NULL,"
+        " decision TEXT NOT NULL, kind TEXT, title TEXT, start_text TEXT,"
+        " location TEXT, confidence REAL, event_uid TEXT, reminder_id TEXT,"
+        " created_at REAL NOT NULL"
+        ")"
+    )
+    with _fake_conn() as c:
+        c.execute(_CITA_DDL)
+
+    monkeypatch.setattr("rag._ragvec_state_conn", _fake_conn)
+    yield db_path
+
+
 def _png_bytes() -> bytes:
     """Devuelve un PNG mínimo válido (1x1 transparente) para uploads
     que no necesitan contenido real (los tests mockean el OCR)."""
@@ -445,3 +490,112 @@ def test_image_persists_to_uploads_dir(monkeypatch):
         p.unlink()
     except Exception:
         pass
+
+
+# ── Dedup de OCR (issue #6 del audit 2026-04-25) ─────────────────────────
+
+
+def test_dedup_returns_noop_when_same_image_already_processed(monkeypatch):
+    """Si el user sube la misma foto dos veces, la segunda debe
+    devolver action='noop' con reason='already_processed_cita' y el
+    event_uid original — sin re-llamar al detector ni crear duplicado.
+
+    `_isolate_cita_detections_table` (autouse fixture) garantiza DB tmp
+    vacía al inicio del test.
+    """
+    # Mock OCR + detector → texto idéntico, alta confidence, kind=event.
+    OCR_TEXT = "TURNO DENTISTA " + "X" * 100  # > 20 chars (umbral OCR)
+    monkeypatch.setattr(
+        "rag.ocr._image_text_or_caption", lambda p: (OCR_TEXT, "ocr"),
+    )
+
+    detect_calls = []
+    def _fake_detect(text):
+        detect_calls.append(text)
+        return {
+            "kind": "event",
+            "title": "Turno dentista",
+            "when": "martes 15hs",
+            "location": "Cabildo",
+            "confidence": 0.95,
+        }
+    monkeypatch.setattr("rag.ocr._detect_cita_from_ocr", _fake_detect)
+
+    # Mock propose_calendar_event → simulamos un create exitoso.
+    monkeypatch.setattr(
+        "rag.propose_calendar_event",
+        lambda **kw: json.dumps({
+            "kind": "event",
+            "created": True,
+            "event_uid": "FAKE-EV-DEDUP-1",
+            "fields": {"title": kw.get("title")},
+        }),
+    )
+
+    # 1ra subida: crea el evento.
+    resp1 = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("turno.png", _png_bytes(), "image/png")},
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["action"] == "created"
+    assert data1["event_uid"] == "FAKE-EV-DEDUP-1"
+    assert len(detect_calls) == 1, "1ra subida llama al detector"
+
+    # 2da subida idéntica: dedup hit → noop con event_uid original.
+    resp2 = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("turno.png", _png_bytes(), "image/png")},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["action"] == "noop"
+    assert data2["reason"] == "already_processed_cita"
+    assert data2["event_uid"] == "FAKE-EV-DEDUP-1"
+    assert len(detect_calls) == 1, (
+        "2da subida NO debe llamar al detector — dedup short-circuit"
+    )
+
+
+def test_dedup_does_not_short_circuit_ambiguous(monkeypatch):
+    """Si el primer procesamiento dejó decision='ambiguous' (low confidence
+    o NL no parseable), las subidas posteriores SÍ deben re-procesar.
+    Razonamiento: el detector LLM es probabilístico — re-ofrecer la card
+    de confirmación es lo correcto, no congelar el outcome ambiguo.
+    """
+    OCR_TEXT = "Reunion algun dia, sin fecha clara " + "Y" * 60
+    monkeypatch.setattr(
+        "rag.ocr._image_text_or_caption", lambda p: (OCR_TEXT, "ocr"),
+    )
+
+    # Detector con confidence baja → router decide needs_confirmation.
+    detect_calls = []
+    def _fake_detect(text):
+        detect_calls.append(text)
+        return {
+            "kind": "event",
+            "title": "Reunión",
+            "when": "algún día",
+            "location": "",
+            "confidence": 0.50,  # < 0.85 autocreate threshold
+        }
+    monkeypatch.setattr("rag.ocr._detect_cita_from_ocr", _fake_detect)
+
+    # 1ra subida → needs_confirmation, persiste 'ambiguous'.
+    resp1 = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("vago.png", _png_bytes(), "image/png")},
+    )
+    assert resp1.json()["action"] == "needs_confirmation"
+
+    # 2da subida → vuelve a procesar (no short-circuit), de nuevo
+    # devuelve needs_confirmation. Detector llamado de nuevo.
+    resp2 = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("vago.png", _png_bytes(), "image/png")},
+    )
+    assert resp2.json()["action"] == "needs_confirmation"
+    assert len(detect_calls) == 2, (
+        "ambiguous debe re-procesar — el LLM puede mejorar con más contexto"
+    )

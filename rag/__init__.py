@@ -21594,6 +21594,19 @@ def propose_whatsapp_send_note(
             mencionó explícitamente cuándo mandarlo. Omitir = enviar
             ahora. Formatos inválidos se ignoran silenciosamente.
 
+            **Snapshot vs live (importante):** cuando programás un
+            envío, el ``message_text`` que se persiste en
+            ``rag_whatsapp_scheduled`` es el SNAPSHOT del contenido de
+            la nota AL MOMENTO del proposal — NO se re-lee al momento
+            del envío. Si editás la nota entre el proposal y la hora
+            programada, la edición NO se refleja en el mensaje que
+            llega al destinatario. Si necesitás mandar la versión
+            actualizada: cancelá el envío programado (via tool
+            ``propose_whatsapp_cancel_scheduled``) y programá uno
+            nuevo. Lección: para envíos diferidos prefieras texto
+            literal (``propose_whatsapp_send``) sobre contenido de
+            nota cuando la nota puede cambiar antes de la hora.
+
     Returns:
         JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
         fields: {contact_name, message_text, jid, full_name, source_path,

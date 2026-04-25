@@ -8096,3 +8096,33 @@ main:focus-visible {
   letter-spacing: 0.4px;
   margin-bottom: 2px;
 }
+
+
+/* Cards de proposals resueltos (sent / scheduled / cancelled / created):
+   feedback visual claro de que ya no son interactivas, para evitar el
+   patrón "user clickea botón disabled y no entiende qué pasa".
+
+   Aplica cuando el card tiene `data-resolved` seteado por el handler
+   correspondiente (sendBtn.addEventListener resuelve en "sending" →
+   "scheduled" / "sent" / "created" cuando completa). El selector
+   atributo cubre cualquier valor non-empty.
+
+   Decidido en el audit del 2026-04-25 (issue #3 "card zombi" — el
+   `disabled=true` ya estaba; faltaba feedback explícito). */
+.proposal[data-resolved] .proposal-btn,
+.proposal[data-resolved] .proposal-btn:disabled,
+.proposal[data-resolved] .proposal-wa-clock-btn,
+.proposal[data-resolved] .proposal-wa-change-time-btn,
+.proposal[data-resolved] .proposal-wa-schedule-undo {
+  cursor: not-allowed;
+  opacity: 0.5;
+  pointer-events: none;  /* ningún hover ni click — silenciador total */
+}
+
+/* Excepción: el botón [Volver] de los cards de cancel/reschedule debe
+   seguir clickeable incluso post-resuelto, para que el user pueda
+   colapsar visualmente. El handler ya tiene su propio guard contra
+   doble-click. */
+.proposal[data-resolved] .proposal-btn-cancel:not(.proposal-wa-action-back) {
+  /* hereda lo de arriba */
+}

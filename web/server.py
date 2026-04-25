@@ -9706,6 +9706,13 @@ _STATUS_CATALOG: list[dict] = [
      "target": "com.fer.whatsapp-listener", "name": "Listener (ambient agent)"},
     {"category": "whatsapp", "category_label": "WhatsApp", "kind": "scheduled",
      "target": "com.fer.whatsapp-vault-sync", "name": "Vault sync"},
+    # Worker que entrega mensajes WhatsApp programados (cola de
+    # rag_whatsapp_scheduled). Si este daemon está caído, los mensajes
+    # programados via /chat o dashboard no se mandan — el user lo ve
+    # en /status y puede reactivarlo con `rag setup`.
+    {"category": "whatsapp", "category_label": "WhatsApp", "kind": "scheduled",
+     "target": "com.fer.obsidian-rag-wa-scheduled-send",
+     "name": "Scheduled send worker"},
     {"category": "whatsapp", "category_label": "WhatsApp", "kind": "wa_db", "id": "wa-db"},
 
     # Cross-source ingesters.

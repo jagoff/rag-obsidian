@@ -44,6 +44,39 @@ def _skip_if_no_ollama(request):
 
 
 @pytest.fixture(autouse=True)
+def _stub_chat_model_cache_if_no_ollama(monkeypatch, request):
+    """En CI / dev boxes sin Ollama corriendo, `rag.resolve_chat_model()`
+    levanta `RuntimeError("Ningún modelo de CHAT_MODEL_PREFERENCE instalado…")`
+    la primera vez que se la llama. Hay un cluster de ~40 tests que mockean
+    `ollama.chat` (la HTTP call real) pero NO mockean el guard, así que
+    el endpoint `/api/chat` falla en `_resolve_web_chat_model()` antes de
+    que los mocks tomen efecto. Esto rompía la suite en CI desde commit
+    5bbf30d (run #325).
+
+    Approach minimalista: cuando no hay Ollama, pre-poblamos el cache
+    module-level `rag._CHAT_MODEL_RESOLVED` con `qwen2.5:7b` (el primer
+    item de CHAT_MODEL_PREFERENCE). `resolve_chat_model()` short-circuitea
+    al inicio cuando el cache != None, así nunca se llega al
+    `ollama.list()` que fallaría.
+
+    Tests que validan el path real del guard (`test_chat_keep_alive_guard`
+    et al.) usan `monkeypatch.setattr` o resetean `_CHAT_MODEL_RESOLVED = None`
+    en su propio fixture autouse — esos overrides ganan por orden de
+    aplicación (los autouse de archivo corren después que los de conftest).
+    Tests con marker `requires_ollama` salen skipped via `_skip_if_no_ollama`
+    antes de llegar acá.
+
+    Cuando SÍ hay Ollama (entorno dev del usuario), no tocamos nada — la
+    suite ejerce el guard real.
+    """
+    if _HAS_CHAT_MODEL:
+        return
+    if request.node.get_closest_marker("requires_ollama"):
+        return
+    monkeypatch.setattr("rag._CHAT_MODEL_RESOLVED", "qwen2.5:7b")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_apple_integrations(request, monkeypatch):
     """Safety-critical: bloquear escrituras a Apple Reminders / Calendar /
     Contacts reales durante los tests.

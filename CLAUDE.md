@@ -242,6 +242,40 @@ mv ~/Library/LaunchAgents/com.fer.obsidian-rag-cloudflare-tunnel-watcher.plist{,
 - `cloudflared` instalado vía `brew install cloudflared` (plist apunta a `/opt/homebrew/bin/cloudflared`). Si el user instaló via `npm install -g cloudflared` (wrapper Node), el plist se rompe — actualizar `ProgramArguments` al path del binary nativo o reinstalar vía brew.
 - Si hay OTRO proceso cloudflared corriendo en el Mac (ej. para un port distinto), el watcher sólo monitorea el log de este servicio — no toca otros túneles.
 
+## Anticipatory Agent — el vault habla primero (2026-04-24)
+
+**Game-changer**: el RAG deja de ser puramente "pull" (vos preguntás, él responde) y pasa a "push" proactivo. Un daemon ([`com.fer.obsidian-rag-anticipate`](~/Library/LaunchAgents/com.fer.obsidian-rag-anticipate.plist)) corre cada 10 min y, cuando detecta algo timely, te escribe por WhatsApp sin que preguntes. Full doc: [`docs/anticipatory-agent.md`](docs/anticipatory-agent.md).
+
+**3 señales activas** (todas en [`rag.py`](rag.py) bajo `# ── ANTICIPATORY AGENT ──`):
+
+1. **Calendar proximity** (`anticipate-calendar`) — evento de hoy que arranca en [15, 90] min con contexto en el vault → push tipo "📅 En 30 min: call con Juan — [[Coaching - Juan]] score 87%". Reutiliza `_fetch_calendar_today()` (icalBuddy). Snooze 2h por evento.
+2. **Temporal echo** (`anticipate-echo`) — nota tocada hoy (≥500 chars) que resuena con una nota >60d (cosine ≥0.70) → push tipo "🔮 Lo que escribiste hoy resuena con algo de hace ~8 meses: [[2025-08-15 - coaching insights]]". Snooze 72h por par.
+3. **Stale commitment** (`anticipate-commitment`) — reutiliza `find_followup_loops()` del comando `rag followup`. Stale ≥7d → push tipo "⏰ Hace 11 días dijiste que ibas a hacer X y no veo señal". Snooze 168h (1 semana) por loop.
+
+**Orchestrator** (`anticipate_run_impl`): recoge candidates de las 3 signals, filtra por score ≥ `RAG_ANTICIPATE_MIN_SCORE` (default 0.35), dedupe via SQL lookup en `rag_anticipate_candidates` (ventana 24h, solo `sent=1` bloquea), pickea top-1, empuja vía `proactive_push()` — que a su vez aplica silence list + per-kind snooze + daily_cap=3 (compartido con `emergent` y `patterns` — el budget global no se infla).
+
+**Tabla nueva**: `rag_anticipate_candidates` (append-only, analytics; TODOS los candidates se loguean aunque no se envíen → permite tunear thresholds mirando `rag anticipate log -n 100`).
+
+**CLI**:
+```bash
+rag anticipate              # = rag anticipate run (default: evalúa + push top-1)
+rag anticipate explain      # ver scoring de todas las señales ahora (dry-run + force)
+rag anticipate log [-n 20 --only-sent]
+rag silence anticipate-calendar          # silenciar una señal (persistente)
+rag silence anticipate-calendar --off    # re-activar
+```
+
+**Kill switches**:
+- Per-kind: `rag silence anticipate-{calendar,echo,commitment}`.
+- Global: `RAG_ANTICIPATE_DISABLED=1` → `anticipate_run_impl` early-returns.
+- Nuclear: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-anticipate.plist && rm ~/Library/LaunchAgents/com.fer.obsidian-rag-anticipate.plist`.
+
+**Env tuning** (todas en `rag.py` como module-level, requieren reinstalar daemon para tomar efecto): `RAG_ANTICIPATE_MIN_SCORE` (threshold 0.35), `RAG_ANTICIPATE_DEDUP_WINDOW_HOURS` (24), `RAG_ANTICIPATE_CALENDAR_MIN_MIN/MAX_MIN` (15/90), `RAG_ANTICIPATE_ECHO_MIN_AGE_DAYS/MIN_COSINE` (60/0.70), `RAG_ANTICIPATE_COMMITMENT_MIN_AGE_DAYS` (7). Catálogo completo en [`docs/anticipatory-agent.md`](docs/anticipatory-agent.md).
+
+**Tests**: [`tests/test_anticipate_agent.py`](tests/test_anticipate_agent.py) (38 casos: dataclass + dedup + 3 signals con mocks + orchestrator dedup/threshold/force/error-isolation + CLI). Drift guards: `test_services_spec_total_count` bumpeado 21→22, `test_anticipate_plist_valid_xml`, table count drift (33→34) en `test_sql_state_primitives.py`.
+
+**Fase 2 (roadmap documentado, NO implementado)**: feedback loop (replies 👍/👎 → ajustes thresholds per-kind), quiet hours contextuales (22h→8h + "en reunión" via calendar), voice briefs matinales (morning via TTS en WA), user-configurable weights. Ver [`plans/anticipatory-agent.md`](plans/anticipatory-agent.md) y [`docs/anticipatory-agent.md`](docs/anticipatory-agent.md) para detalles.
+
 ## Commands
 
 ```bash
@@ -278,9 +312,16 @@ rag today [--dry-run]                      # EOD closure → 05-Reviews/YYYY-MM-
 rag digest [--week YYYY-WNN --days N]      # weekly narrative → 05-Reviews/YYYY-WNN.md
 rag consolidate [--window-days 14 --threshold 0.75 --min-cluster 3 --dry-run --json]  # episodic memory Phase 2 → PARA
 
-# Ambient agent
+# Ambient agent (reactive — dispara al cambiar una nota)
 rag ambient status|disable|test [path]|log [-n N]
 rag ambient folders list|add <F>|remove <F>
+
+# Anticipatory agent (proactive — el vault te habla sin que preguntes)
+rag anticipate [run]                       # default: evalúa señales + push top-1 a WA
+rag anticipate run [--dry-run --explain --force]  # dry-run no pushea, --explain muestra scoring
+rag anticipate explain                     # ver scoring de todas las señales del momento
+rag anticipate log [-n 20 --only-sent]     # últimas N entries de rag_anticipate_candidates
+rag silence anticipate-{calendar,echo,commitment} [--off]  # silenciar per-kind
 
 # Quality
 rag eval [--latency --max-p95-ms N]        # queries.yaml → hit@k, MRR, recall@k (+ bootstrap CI); gate on P95
@@ -301,7 +342,7 @@ python scripts/backfill_entities.py [--dry-run --limit N --vault NAME]  # one-sh
 python scripts/audit_telemetry_health.py [--days 7] [--json]  # data-first health audit: errores SQL/silent, latency outliers, cache probe distribution, DB sizes; primer comando antes de cualquier "auditá el sistema"
 
 # Automation
-rag setup [--remove]                       # install/remove 11 launchd services
+rag setup [--remove]                       # install/remove 22 launchd services (anticipate incluido 2026-04-24)
 
 # Tests
 .venv/bin/python -m pytest tests/ -q

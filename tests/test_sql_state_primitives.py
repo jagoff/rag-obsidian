@@ -73,11 +73,14 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 VLM caption cache (rag_vlm_captions, caption fallback 2026-04-23) +
     # 1 reminder WA push (rag_reminder_wa_pushed, 2026-04-23) +
     # 1 status samples (rag_status_samples, home dashboard 2026-04-24) +
-    # 1 home compute metrics (rag_home_compute_metrics, baseline persist 2026-04-24) =
-    # 33 tables total.
+    # 1 home compute metrics (rag_home_compute_metrics, baseline persist 2026-04-24) +
+    # 1 anticipate candidates (rag_anticipate_candidates, anticipatory agent
+    # game-changer 2026-04-24 — analytics append-only de todos los candidates
+    # evaluados por el scheduler de push proactivo cada 10 min) =
+    # 34 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 33
+    assert len(expected) == 34
     c.close()
 
 

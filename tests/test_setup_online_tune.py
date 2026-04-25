@@ -224,7 +224,7 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 17 base servicios + 4 ingesters cross-source
+    # 18 base servicios + 4 ingesters cross-source
     # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
     # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
     # pero el plist siempre está en el spec.
@@ -237,8 +237,9 @@ def test_services_spec_total_count():
     # LLM-as-judge nocturno que labelea queries low-conf sin feedback),
     # online-tune, calibrate (2026-04-23 — per-source isotonic regression
     # re-entrenada con feedback), maintenance (2026-04-21 hardening),
-    # consolidate.
-    assert len(specs) == 21
+    # consolidate, anticipate (2026-04-24 — game-changer push proactivo
+    # cada 10 min: calendar proximity + temporal echo + stale commitment).
+    assert len(specs) == 22
 
 
 def test_services_spec_includes_maintenance():
@@ -253,6 +254,29 @@ def test_services_spec_includes_maintenance():
     assert "<key>Hour</key><integer>4</integer>" in plist
     assert "<key>RunAtLoad</key><false/>" in plist
     assert "<string>maintenance</string>" in plist
+
+
+def test_services_spec_includes_anticipate():
+    """Added 2026-04-24 — game-changer: el RAG empuja info timely sin que
+    preguntes. Cada 10 min evalúa 3 señales (calendar proximity / temporal
+    echo / stale commitment) y empuja top-1 a WhatsApp vía proactive_push."""
+    specs = rag_module._services_spec(RAG_BIN)
+    labels = {s[0] for s in specs}
+    assert "com.fer.obsidian-rag-anticipate" in labels
+    plist = rag_module._anticipate_plist(RAG_BIN)
+    assert "<key>StartInterval</key><integer>600</integer>" in plist  # 10 min
+    assert "<key>RunAtLoad</key><false/>" in plist
+    assert "<string>anticipate</string>" in plist
+    assert "<string>run</string>" in plist
+
+
+@requires_plutil
+def test_anticipate_plist_valid_xml():
+    xml = rag_module._anticipate_plist(RAG_BIN)
+    result = subprocess.run(
+        ["plutil", "-lint", "-"], input=xml.encode(), capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
 
 
 # ── Cross-source ingesters (2026-04-21) ────────────────────────────────────

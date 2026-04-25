@@ -1691,6 +1691,132 @@ function formatRelativeContact(isoStr) {
   }
 }
 
+// Detector heurístico de fechas en lenguaje natural rioplatense.
+// Usado en `appendWhatsAppProposal` cuando el LLM NO populó
+// `fields.scheduled_for` pero el `message_text` tiene un patrón de
+// fecha (caso típico: el LLM mete "mañana 9hs" en el cuerpo en vez de
+// extraerla a `scheduled_for`). Sin esto, el user tendría que abrir
+// el popover ⏰ y re-tipear la fecha que ya escribió en el chat —
+// doble entrada que el user pidió evitar (2026-04-25).
+//
+// Soporta los patterns más comunes:
+//   "mañana 9hs" / "mañana a las 9" / "mañana 9:30" / "mañana a las 14:30"
+//   "hoy 14hs" / "hoy a las 14"
+//   "pasado mañana 9hs"
+//   "el lunes 14:30" / "el viernes a las 9"
+//   "en 2 horas" / "en 30 minutos" / "en una hora"
+//
+// NO soporta (queda para v2 si hace falta):
+//   "el 5 de mayo a las 18hs" (fechas absolutas)
+//   "al mediodía" / "a la noche" (dayparts sin hora)
+//
+// Devuelve `{iso, phrase}` o null. La fecha resuelta SIEMPRE es
+// futura (descarta matches que caen en el pasado por > 1min).
+function detectDateInMessage(text) {
+  if (!text || typeof text !== "string") return null;
+  const lower = text.toLowerCase();
+  const now = new Date();
+  const buildIso = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${y}-${m}-${day}T${hh}:${mm}:00-03:00`;
+  };
+  const isFuture = (d) => d.getTime() > now.getTime() + 60_000;
+
+  const wordToNum = { una: 1, "1": 1, dos: 2, tres: 3, cuatro: 4, cinco: 5,
+    seis: 6, siete: 7, ocho: 8, nueve: 9, diez: 10 };
+
+  // 1) "en N horas" / "en N minutos" / "en una hora"
+  const rxRel = /\ben\s+(una|un|\d+|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\s+(horas?|minutos?|min\b|hs?\b)/;
+  const mRel = lower.match(rxRel);
+  if (mRel) {
+    const raw = mRel[1];
+    const n = wordToNum[raw] || parseInt(raw, 10) || 1;
+    const unit = mRel[2];
+    const ms = (unit.startsWith("min") ? n * 60_000 : n * 3_600_000);
+    const d = new Date(now.getTime() + ms);
+    if (isFuture(d)) return { iso: buildIso(d), phrase: mRel[0] };
+  }
+
+  // 2) "pasado mañana ..."
+  const rxPasado = /\bpasado\s+ma[nñ]ana(?:\s+(?:a\s+las\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:hs?|horas?)?)?/;
+  const mPasado = lower.match(rxPasado);
+  if (mPasado) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 2);
+    const h = mPasado[1] != null ? parseInt(mPasado[1], 10) : 9;
+    const min = parseInt(mPasado[2] || "0", 10);
+    d.setHours(h, min, 0, 0);
+    if (isFuture(d)) return { iso: buildIso(d), phrase: mPasado[0] };
+  }
+
+  // 3) "mañana 9hs" / "mañana a las 9" / "mañana 9:30"
+  const rxManana = /\bma[nñ]ana(?:\s+(?:a\s+las\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:hs?|horas?)?)?/;
+  const mManana = lower.match(rxManana);
+  if (mManana) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    // Si dijo solo "mañana" sin hora, asumimos 9am como default razonable.
+    const h = mManana[1] != null ? parseInt(mManana[1], 10) : 9;
+    const min = parseInt(mManana[2] || "0", 10);
+    d.setHours(h, min, 0, 0);
+    if (isFuture(d)) return { iso: buildIso(d), phrase: mManana[0] };
+  }
+
+  // 4) "hoy 14hs" / "hoy a las 14:30"
+  const rxHoy = /\bhoy\s+(?:a\s+las\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:hs?|horas?)?/;
+  const mHoy = lower.match(rxHoy);
+  if (mHoy) {
+    const d = new Date(now);
+    const h = parseInt(mHoy[1], 10);
+    const min = parseInt(mHoy[2] || "0", 10);
+    d.setHours(h, min, 0, 0);
+    if (isFuture(d)) return { iso: buildIso(d), phrase: mHoy[0] };
+  }
+
+  // 5) "el lunes 14:30" / "el viernes a las 9"
+  const rxDow = /\bel\s+(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)(?:\s+(?:a\s+las\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:hs?|horas?)?)?/;
+  const mDow = lower.match(rxDow);
+  if (mDow) {
+    const dowMap = {
+      lunes: 1, martes: 2,
+      "miércoles": 3, miercoles: 3,
+      jueves: 4, viernes: 5,
+      "sábado": 6, sabado: 6,
+      domingo: 0,
+    };
+    const target = dowMap[mDow[1]];
+    if (target != null) {
+      const d = new Date(now);
+      let delta = target - d.getDay();
+      if (delta <= 0) delta += 7; // siempre el próximo
+      d.setDate(d.getDate() + delta);
+      const h = mDow[2] != null ? parseInt(mDow[2], 10) : 9;
+      const min = parseInt(mDow[3] || "0", 10);
+      d.setHours(h, min, 0, 0);
+      if (isFuture(d)) return { iso: buildIso(d), phrase: mDow[0] };
+    }
+  }
+
+  return null;
+}
+
+// Limpia la frase de fecha del message_text una vez detectada para
+// que no quede "mañana 9hs ya llegué" como cuerpo del mensaje (porque
+// si se programa para mañana 9hs, decirlo en el cuerpo es redundante
+// y suena raro). Devuelve el texto limpio + un flag.
+function stripDatePhraseFromMessage(text, phrase) {
+  if (!text || !phrase) return text;
+  // Buscar y quitar el match exacto (case-insensitive). Acepta espacios
+  // adyacentes y posible coma/punto al lado.
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rx = new RegExp(`\\s*[,.;]?\\s*${escaped}\\s*[,.;]?\\s*`, "i");
+  return text.replace(rx, " ").replace(/\s+/g, " ").trim();
+}
+
 // Fetch + render del bloque de contexto de WhatsApp dentro del card.
 // Llamado desde `appendWhatsAppProposal` después del recipientLine.
 // Best-effort:
@@ -1884,6 +2010,28 @@ function appendWhatsAppProposal(parent, payload) {
   // ISO8601 with offset, e.g. "2026-04-26T09:00:00-03:00".
   let scheduledFor = fields.scheduled_for || null;
 
+  // Heurística de fallback: si el LLM no detectó la fecha pero el
+  // user la escribió en el cuerpo del mensaje ("mañana 9hs ya llegué"),
+  // la extraemos client-side y la auto-aplicamos. Sin esto, el user
+  // tendría que abrir el ⏰ y re-tipear lo que ya escribió en el chat
+  // — doble entrada que pidió evitar (2026-04-25).
+  //
+  // `autoDetectedPhrase`: la sub-cadena de fecha que sacamos del
+  // body — usado para (a) limpiar el textarea cuando se cree, (b)
+  // permitir undo si fue falso positivo, (c) marcar el chip con
+  // "(del mensaje)" para que se vea de dónde salió la fecha.
+  // `originalMessageText`: snapshot del cuerpo ANTES de limpiar, por
+  // si el user clickea "↩ no, mandalo ya".
+  let autoDetectedPhrase = null;
+  let originalMessageText = fields.message_text || "";
+  if (!scheduledFor && fields.message_text) {
+    const detected = detectDateInMessage(fields.message_text);
+    if (detected) {
+      scheduledFor = detected.iso;
+      autoDetectedPhrase = detected.phrase;
+    }
+  }
+
   const card = el("div", `proposal proposal-whatsapp${isReply ? " proposal-whatsapp-reply" : ""}`);
   // a11y: ver comentario en appendProposal — region landmark con
   // aria-labelledby al heading del card.
@@ -1947,7 +2095,36 @@ function appendWhatsAppProposal(parent, payload) {
       scheduleChip = el("div", "proposal-wa-schedule-chip pending");
       recipientLine.insertAdjacentElement("afterend", scheduleChip);
     }
-    scheduleChip.textContent = `📅 Programado para ${formatFriendlyDate(scheduledFor)}`;
+    // Limpiar children — re-render desde cero (puede tener undo button
+    // de un render anterior que ya no aplica).
+    scheduleChip.innerHTML = "";
+    scheduleChip.appendChild(document.createTextNode(
+      `📅 Programado para ${formatFriendlyDate(scheduledFor)}`,
+    ));
+    if (autoDetectedPhrase) {
+      // Indicator visual: el user ve que la fecha se "leyó del mensaje"
+      // y no fue invento del agente. Transparencia = trust.
+      const hint = el("span", "proposal-wa-schedule-detected",
+        ' (detectado del mensaje)');
+      scheduleChip.appendChild(hint);
+      // Undo button — falso positivo del detector → vuelve al envío
+      // inmediato y restaura el body original. Único click reverso.
+      const undoBtn = document.createElement("button");
+      undoBtn.type = "button";
+      undoBtn.className = "proposal-wa-schedule-undo";
+      undoBtn.textContent = "↩ no, mandalo ya";
+      undoBtn.title = "Cancelar la programación detectada y mandar el mensaje ahora";
+      undoBtn.addEventListener("click", () => {
+        if (card.dataset.resolved) return;
+        scheduledFor = null;
+        autoDetectedPhrase = null;
+        textarea.value = originalMessageText;
+        autoGrow();
+        renderScheduleChip();
+        if (typeof refreshActionButtons === "function") refreshActionButtons();
+      });
+      scheduleChip.appendChild(undoBtn);
+    }
   }
   renderScheduleChip();
 
@@ -1983,7 +2160,18 @@ function appendWhatsAppProposal(parent, payload) {
   const textarea = document.createElement("textarea");
   textarea.className = "proposal-wa-text";
   textarea.rows = 3;
-  textarea.value = fields.message_text || "";
+  // Si auto-detectamos la fecha en el body del mensaje, limpiamos esa
+  // frase del textarea — es absurdo decirle a Grecia "mañana 9hs ya
+  // llegué" si el envío ya está programado para mañana 9hs. Si la
+  // limpieza dejaría el textarea vacío (ej. user solo dijo "mañana 9hs"
+  // sin más texto), mantenemos el original así el card no aparece sin
+  // body visible. El undo button restaura todo si fue falso positivo.
+  if (autoDetectedPhrase) {
+    const cleaned = stripDatePhraseFromMessage(originalMessageText, autoDetectedPhrase);
+    textarea.value = cleaned || originalMessageText;
+  } else {
+    textarea.value = originalMessageText;
+  }
   textarea.placeholder = "Texto del mensaje";
   card.appendChild(textarea);
 

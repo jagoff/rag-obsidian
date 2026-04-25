@@ -26,7 +26,7 @@ jobs:
           # tests/ that CI happily ignored. The rule set stays at
           # ruff's default (E/F/W); selection rules and extend-ignore
           # live in pyproject.toml so local `ruff check` matches CI.
-          src: "rag.py mcp_server.py web scripts tests"
+          src: "rag mcp_server.py web scripts tests"
 
   test:
     name: pytest (py${{ matrix.python-version }})

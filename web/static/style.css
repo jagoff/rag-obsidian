@@ -161,6 +161,22 @@ body {
   background: var(--bg-elev);
   transition: border-color 0.15s, color 0.15s;
 }
+
+/* Touch devices: bump topbar-link a >=44x44 (Apple HIG / WCAG 2.5.5).
+   En desktop con mouse el padding 4x10 + line-height ~17px = ~25px
+   alto queda compacto. En iPad / iPhone landscape (que NO matchea
+   el `max-width: 640px` que esconde los links) el touch target era
+   29x67 — falla regular del pulgar al cambiar entre home/chat/dashboard. */
+@media (pointer: coarse) {
+  .topbar-link {
+    min-height: 44px;
+    padding: 10px 14px;
+    display: inline-flex;
+    align-items: center;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
 .topbar-link:hover {
   color: var(--cyan);
   border-color: var(--border-strong);

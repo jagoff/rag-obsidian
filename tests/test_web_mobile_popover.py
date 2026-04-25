@@ -386,3 +386,24 @@ def test_empty_state_popover_collapses_height():
         "el selector :has() debe overridear max-height a `none` para que "
         "el popover empty-state colapse al content mínimo"
     )
+
+
+# ── Topbar-link tap target en touch devices (home + chat + dashboard) ─────
+
+
+def test_topbar_link_44px_tap_target_on_touch():
+    """`.topbar-link` (chat→ / dashboard→ / status→ del topbar del home)
+    debe ser >=44x44 px en touch screens. En desktop con mouse el
+    padding 4x10 = ~25px alto queda compacto y prolijo, pero en iPad
+    o iPhone landscape (donde el `max-width: 640px` no esconde los
+    links) el target era 29px alto — falla regular del pulgar."""
+    import re
+    pat = re.compile(
+        r'@media \(pointer:\s*coarse\)\s*\{[^}]*'
+        r'\.topbar-link\s*\{[^}]*min-height:\s*44px',
+        re.DOTALL,
+    )
+    assert pat.search(_STYLE_CSS) is not None, (
+        "@media (pointer: coarse) debe forzar .topbar-link a min-height 44px "
+        "para que los nav links del home sean tappables en touch screens"
+    )

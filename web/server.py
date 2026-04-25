@@ -8253,6 +8253,23 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
                 "FROM rag_audio_corrections "
                 "ORDER BY ts DESC LIMIT 20"
             ).fetchall()
+            # Heatmap por hora del día (últimos 30 días, hora local).
+            # Útil para visualizar cuándo el user manda audios típicamente.
+            hour_counts: dict[int, int] = {h: 0 for h in range(24)}
+            try:
+                for row in conn.execute(
+                    "SELECT CAST(strftime('%H', transcribed_at, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
+                    "       COUNT(*) "
+                    "FROM rag_audio_transcripts "
+                    "WHERE transcribed_at > ? "
+                    "GROUP BY hour",
+                    (cutoff_30d,),
+                ):
+                    h = int(row[0]) if row[0] is not None else 0
+                    if 0 <= h < 24:
+                        hour_counts[h] = int(row[1] or 0)
+            except Exception:
+                pass
     except Exception as exc:
         return HTMLResponse(
             f"<!doctype html><html><body>"
@@ -8365,6 +8382,40 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
             corr_summary_parts.append(f'<span class="{cls}">{n} {src}</span>')
     corr_summary = " · ".join(corr_summary_parts) if corr_summary_parts else "0"
 
+    # Heatmap por hora del día — render como una row de 24 cells coloreadas
+    # según count (intensidad creciente). Si todos están en 0, muestra una
+    # row plana con texto info.
+    max_hour = max(hour_counts.values()) if hour_counts else 0
+    if max_hour > 0:
+        heatmap_cells = []
+        for h in range(24):
+            n = hour_counts.get(h, 0)
+            # Intensidad de 0 a 1 — usa accent color con alpha variable.
+            alpha = 0.0 if max_hour == 0 else (n / max_hour)
+            # Background: blend del accent + bg-elev. Mostrar count en hover.
+            bg = f"background:rgba(88,166,255,{alpha:.2f})" if alpha > 0 else "background:var(--border-soft)"
+            label = f"{h:02d}"
+            heatmap_cells.append(
+                f'<td class="heatmap-cell" title="{h:02d}:00 — {n} audio(s)" style="{bg}">'
+                f'<div class="hour-label">{label}</div>'
+                f'<div class="hour-count">{n if n > 0 else ""}</div>'
+                f'</td>'
+            )
+        heatmap_html = (
+            f'<div class="heatmap-wrap">'
+            f'<table class="heatmap"><tr>{"".join(heatmap_cells)}</tr></table>'
+            f'<p class="meta">cada celda = 1 hora del día · intensidad ∝ count · max={max_hour}</p>'
+            f'</div>'
+        )
+    else:
+        heatmap_html = (
+            '<p class="meta" style="padding:14px 0">'
+            'sin audios en últimos 30d para construir heatmap. '
+            'cuando llegue el primer audio, esta sección se va a poblar con '
+            'la distribución horaria.'
+            '</p>'
+        )
+
     # Stats vocab por source
     vocab_summary_parts = []
     for src in ("corrections", "contacts", "notes", "chats"):
@@ -8468,6 +8519,20 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
   .topnav a {{ color: var(--text-muted); text-decoration: none; padding: 4px 0; border-bottom: 2px solid transparent; transition: border-color .12s ease, color .12s ease; }}
   .topnav a:hover {{ color: var(--text); }}
   .topnav a.active {{ color: var(--text); border-bottom-color: var(--accent); }}
+  /* Heatmap por hora — 24 cells de ancho equal, height fijo, color del accent
+     con alpha = count / max. Hover deja un title con el count exacto. */
+  .heatmap-wrap {{ margin: 8px 0 4px 0; }}
+  .heatmap {{ width: 100%; border-collapse: separate; border-spacing: 2px; table-layout: fixed; }}
+  .heatmap-cell {{
+    height: 38px;
+    border-radius: 3px;
+    text-align: center;
+    border-bottom: none !important;
+    padding: 4px 2px !important;
+    cursor: default;
+  }}
+  .heatmap-cell .hour-label {{ font-size: 10px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1; }}
+  .heatmap-cell .hour-count {{ font-size: 11px; color: var(--text); font-weight: 600; line-height: 1.4; font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
@@ -8502,6 +8567,9 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
       <p class="meta">{vocab_summary}</p>
     </div>
   </div>
+
+  <h2>distribución horaria (30d)</h2>
+  {heatmap_html}
 
   <h2>últimas 30 transcripciones</h2>
   <table>

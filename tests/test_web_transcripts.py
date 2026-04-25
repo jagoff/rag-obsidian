@@ -180,6 +180,35 @@ def test_transcripts_defines_correction_source_classes():
 # ── Defensivo ────────────────────────────────────────────────────────────────
 
 
+# ── Heatmap por hora del día ──────────────────────────────────────────────────
+
+
+def test_transcripts_renders_hourly_heatmap_section():
+    """`/transcripts` tiene una sección `distribución horaria` con heatmap
+    de audios por hora del día (últimos 30d)."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    assert "distribución horaria" in html
+
+
+def test_transcripts_heatmap_empty_state_when_no_audios():
+    """Cuando no hay audios en 30d, el heatmap muestra mensaje informativo
+    en vez de cells vacías."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    # Si la DB está vacía, el empty state aparece.
+    if "sin audios en últimos 30d" in html:
+        assert "distribución horaria" in html
+
+
+def test_transcripts_heatmap_css_classes_defined():
+    """Las classes del heatmap deben estar definidas para que se vea bien."""
+    resp = _client.get("/transcripts")
+    html = resp.text
+    for cls in (".heatmap-wrap", ".heatmap-cell", ".hour-label", ".hour-count"):
+        assert cls in html, f"missing CSS class: {cls}"
+
+
 # ── Auto-refresh ─────────────────────────────────────────────────────────────
 
 

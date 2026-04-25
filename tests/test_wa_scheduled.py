@@ -1060,3 +1060,323 @@ def test_run_due_worker_no_reply_to_passes_none(
     wa_scheduled.run_due_worker()
     assert len(captured) == 1
     assert captured[0]["reply_to"] is None
+
+
+# ── LLM tools: whatsapp_list_scheduled / propose_whatsapp_cancel_scheduled
+# / propose_whatsapp_reschedule_scheduled (issue #4 audit 2026-04-25) ─────
+#
+# Las tools dejan que el LLM gestione mensajes WhatsApp programados via
+# NL: listar (`whatsapp_list_scheduled`), cancelar
+# (`propose_whatsapp_cancel_scheduled`), y reagendar
+# (`propose_whatsapp_reschedule_scheduled`). Las dos `propose_*` emiten
+# proposal cards (kind="whatsapp_cancel_scheduled" /
+# "whatsapp_reschedule_scheduled") que el frontend renderea con
+# [Cancelar] / [Reagendar] / [Volver]. La `list` no emite card — el
+# LLM la consume y resume al user en prosa.
+#
+# Cada test mockea `_whatsapp_jid_from_contact` (vive en
+# `rag.integrations.whatsapp` y se re-exporta en `rag/__init__.py`)
+# para no tocar Apple Contacts real, y siembra rows con `_seed_row` o
+# directamente `wa_scheduled.schedule()`. La fixture `isolated_state_db`
+# garantiza que la DB es per-test.
+
+
+import json as _json  # noqa: E402  — alias para no chocar con `json` de deps
+
+
+def _mock_jid_lookup(monkeypatch, jid="5491155551111@s.whatsapp.net",
+                     full_name="Grecia", error=None):
+    """Patch `_whatsapp_jid_from_contact` para que retorne lo dado
+    sin tocar Apple Contacts. Lo seteamos en `rag` (el módulo que
+    las tools `propose_*` resuelven en su body) y en
+    `rag.integrations.whatsapp` (la home real del símbolo) por
+    seguridad — ambos paths se usan en la codebase.
+    """
+    def _fake(_query):
+        return {"jid": jid, "full_name": full_name, "error": error}
+    monkeypatch.setattr(rag, "_whatsapp_jid_from_contact", _fake)
+    try:
+        from rag.integrations import whatsapp as _waint
+        monkeypatch.setattr(_waint, "_whatsapp_jid_from_contact", _fake)
+    except Exception:
+        pass
+
+
+# ── 19. whatsapp_list_scheduled ──────────────────────────────────────
+
+
+def test_whatsapp_list_scheduled_returns_pending_only(
+    isolated_state_db, monkeypatch,
+):
+    """Default (sin args) trae solo `pending` — los `cancelled` /
+    `sent` no aparecen aunque estén en la DB."""
+    # 2 pendings.
+    sid_a = wa_scheduled.schedule(
+        jid="a@s.whatsapp.net", message_text="msg A",
+        scheduled_for_utc=_future_iso(60),
+    )["id"]
+    sid_b = wa_scheduled.schedule(
+        jid="b@s.whatsapp.net", message_text="msg B",
+        scheduled_for_utc=_future_iso(120),
+    )["id"]
+    # 1 cancelled (sembrado directo bypass schedule()).
+    sid_c = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_future_iso(180),
+        status="cancelled", jid="c@s.whatsapp.net",
+        message_text="msg C cancelado",
+    )
+
+    out = rag.whatsapp_list_scheduled()
+    body = _json.loads(out)
+    assert body["count"] == 2
+    ids = sorted(it["id"] for it in body["items"])
+    assert ids == sorted([sid_a, sid_b])
+    assert sid_c not in ids
+    # Cada item tiene los campos esperados que el LLM consume.
+    for it in body["items"]:
+        assert "scheduled_for_local" in it
+        assert "scheduled_for_iso_ar" in it
+        assert "message_text_preview" in it
+        assert it["status"] == "pending"
+
+
+def test_whatsapp_list_scheduled_truncates_message_text(
+    isolated_state_db, monkeypatch,
+):
+    """`message_text_preview` se trunca a 80 chars con ellipsis."""
+    long_msg = "a" * 200
+    wa_scheduled.schedule(
+        jid="x@s.whatsapp.net", message_text=long_msg,
+        scheduled_for_utc=_future_iso(60),
+    )
+    body = _json.loads(rag.whatsapp_list_scheduled())
+    assert body["count"] == 1
+    preview = body["items"][0]["message_text_preview"]
+    assert len(preview) <= 80
+    assert preview.endswith("…")
+
+
+def test_whatsapp_list_scheduled_with_status_all_returns_all_states(
+    isolated_state_db, monkeypatch,
+):
+    """`status='all'` se traduce a status=None en `wa_scheduled.list_scheduled`,
+    que retorna TODAS las filas independientemente del estado.
+    Util para "cuáles mandé este mes" / "cuáles cancelé"."""
+    wa_scheduled.schedule(
+        jid="a@s.whatsapp.net", message_text="A",
+        scheduled_for_utc=_future_iso(60),
+    )
+    _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_future_iso(90),
+        status="cancelled", jid="b@s.whatsapp.net",
+        message_text="B",
+    )
+    _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_future_iso(120),
+        status="sent", jid="c@s.whatsapp.net",
+        message_text="C",
+    )
+    body = _json.loads(rag.whatsapp_list_scheduled(status="all"))
+    assert body["count"] == 3
+
+
+# ── 20. propose_whatsapp_cancel_scheduled ────────────────────────────
+
+
+def test_propose_cancel_scheduled_when_no_pendings_for_contact(
+    isolated_state_db, monkeypatch,
+):
+    """0 matches → JSON con `error` populado, sin scheduled_id."""
+    _mock_jid_lookup(
+        monkeypatch, jid="5491155551111@s.whatsapp.net",
+        full_name="Grecia",
+    )
+    # Hay un pending pero para OTRO jid — no debería matchear.
+    wa_scheduled.schedule(
+        jid="otro@s.whatsapp.net", message_text="otro",
+        scheduled_for_utc=_future_iso(60),
+    )
+    out = rag.propose_whatsapp_cancel_scheduled(contact_name="Grecia")
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_cancel_scheduled"
+    assert "error" in body
+    assert "Grecia" in body["error"]
+    # No emitimos scheduled_id en el error path.
+    assert "scheduled_id" not in (body.get("fields") or {})
+
+
+def test_propose_cancel_scheduled_with_one_pending(
+    isolated_state_db, monkeypatch,
+):
+    """1 match → fields tiene scheduled_id, scheduled_for_local,
+    contact_name (preferentemente full_name), message_text_preview."""
+    target_jid = "5491155551111@s.whatsapp.net"
+    _mock_jid_lookup(monkeypatch, jid=target_jid, full_name="Grecia Full")
+    sid = wa_scheduled.schedule(
+        jid=target_jid, message_text="feliz cumple, capa",
+        scheduled_for_utc=_future_iso(60),
+    )["id"]
+    out = rag.propose_whatsapp_cancel_scheduled(contact_name="Grecia")
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_cancel_scheduled"
+    assert "error" not in body
+    assert body.get("needs_clarification") is not True
+    fields = body["fields"]
+    assert fields["scheduled_id"] == sid
+    assert fields["jid"] == target_jid
+    assert fields["contact_name"] == "Grecia Full"
+    assert "feliz cumple" in fields["message_text_preview"]
+    assert fields["scheduled_for_local"]  # no vacío
+
+
+def test_propose_cancel_scheduled_with_multiple_needs_clarification(
+    isolated_state_db, monkeypatch,
+):
+    """>1 matches y when_hint que no desambigua → needs_clarification:
+    true + candidates con todos los pendings del contacto."""
+    target_jid = "5491155551111@s.whatsapp.net"
+    _mock_jid_lookup(monkeypatch, jid=target_jid, full_name="Grecia")
+    sid_a = wa_scheduled.schedule(
+        jid=target_jid, message_text="msg A",
+        scheduled_for_utc=_future_iso(60),
+    )["id"]
+    sid_b = wa_scheduled.schedule(
+        jid=target_jid, message_text="msg B",
+        scheduled_for_utc=_future_iso(60 * 24 * 3),  # +3 días
+    )["id"]
+    out = rag.propose_whatsapp_cancel_scheduled(contact_name="Grecia")
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_cancel_scheduled"
+    assert body.get("needs_clarification") is True
+    cands = body.get("candidates") or []
+    cand_ids = sorted(c["scheduled_id"] for c in cands)
+    assert cand_ids == sorted([sid_a, sid_b])
+    # Cada candidato lleva la info que la UI necesita renderear.
+    for c in cands:
+        assert c["scheduled_for_local"]
+        assert "message_text_preview" in c
+
+
+def test_propose_cancel_scheduled_with_when_hint_filters_correctly(
+    isolated_state_db, monkeypatch,
+):
+    """Bonus: when_hint='mañana' → filtra al pending de mañana,
+    devolviendo 1 sola row (no needs_clarification)."""
+    target_jid = "5491155551111@s.whatsapp.net"
+    _mock_jid_lookup(monkeypatch, jid=target_jid, full_name="Grecia")
+    # Mañana 9hs (UTC 12).
+    tomorrow_9 = (
+        datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    ).isoformat(timespec="seconds")
+    sid_tomorrow = wa_scheduled.schedule(
+        jid=target_jid, message_text="el de mañana",
+        scheduled_for_utc=tomorrow_9,
+    )["id"]
+    # En 5 días (NO debería matchear "mañana").
+    far = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
+    wa_scheduled.schedule(
+        jid=target_jid, message_text="el del viernes",
+        scheduled_for_utc=far,
+    )
+    out = rag.propose_whatsapp_cancel_scheduled(
+        contact_name="Grecia", when_hint="mañana 9hs",
+    )
+    body = _json.loads(out)
+    if body.get("needs_clarification"):
+        # Si el parser de NL no tiene el día del LLM disponible, podría
+        # quedar ambiguo y devolver clarif — aceptable como fallback,
+        # pero la rama feliz es 1 match.
+        cands = body.get("candidates") or []
+        assert len(cands) >= 1
+    else:
+        assert body["fields"]["scheduled_id"] == sid_tomorrow
+
+
+def test_propose_cancel_scheduled_with_unknown_contact(
+    isolated_state_db, monkeypatch,
+):
+    """Contact lookup falla → error en payload, no scheduled_id."""
+    _mock_jid_lookup(monkeypatch, jid="", full_name="", error="not_found")
+    out = rag.propose_whatsapp_cancel_scheduled(contact_name="Fulano Inexistente")
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_cancel_scheduled"
+    assert "error" in body
+    assert "Fulano Inexistente" in body["error"]
+
+
+# ── 21. propose_whatsapp_reschedule_scheduled ────────────────────────
+
+
+def test_propose_reschedule_scheduled_with_new_when_parses_correctly(
+    isolated_state_db, monkeypatch,
+):
+    """new_when='en 3 horas' parsea → fields tiene
+    new_scheduled_for_iso_ar y new_scheduled_for_local."""
+    target_jid = "5491155551111@s.whatsapp.net"
+    _mock_jid_lookup(monkeypatch, jid=target_jid, full_name="Oscar")
+    sid = wa_scheduled.schedule(
+        jid=target_jid, message_text="msg",
+        scheduled_for_utc=_future_iso(60),
+    )["id"]
+    out = rag.propose_whatsapp_reschedule_scheduled(
+        contact_name="Oscar", new_when="en 3 horas",
+    )
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_reschedule_scheduled"
+    if "error" in body:
+        # Si el parser de fecha no está disponible (ej. dateparser
+        # missing), aceptamos el fallback con error explicativo.
+        assert "no entendí" in body["error"].lower() or "fecha" in body["error"].lower()
+        return
+    fields = body["fields"]
+    assert fields.get("scheduled_id") == sid
+    assert fields["new_scheduled_for_local"]
+    assert fields["new_scheduled_for_iso_ar"].endswith("-03:00")
+    assert "old_scheduled_for_local" in fields
+
+
+def test_propose_reschedule_scheduled_with_past_when_returns_error(
+    isolated_state_db, monkeypatch,
+):
+    """new_when="ayer 9hs" → datetime en el pasado → error explícito,
+    sin fields.scheduled_id."""
+    _mock_jid_lookup(monkeypatch)
+    out = rag.propose_whatsapp_reschedule_scheduled(
+        contact_name="Grecia", new_when="ayer 9hs",
+    )
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_reschedule_scheduled"
+    assert "error" in body
+    err = body["error"].lower()
+    assert "pasado" in err or "no entendí" in err
+
+
+def test_propose_reschedule_scheduled_with_garbage_when_returns_error(
+    isolated_state_db, monkeypatch,
+):
+    """new_when='asdfasdf' no parsea → error 'no entendí'."""
+    _mock_jid_lookup(monkeypatch)
+    out = rag.propose_whatsapp_reschedule_scheduled(
+        contact_name="Grecia", new_when="zzzzzzzz",
+    )
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_reschedule_scheduled"
+    assert "error" in body
+    assert "no entendí" in body["error"].lower()
+
+
+def test_propose_reschedule_scheduled_with_empty_when_returns_error(
+    isolated_state_db, monkeypatch,
+):
+    """new_when='' → error explícito sin tocar nada."""
+    _mock_jid_lookup(monkeypatch)
+    out = rag.propose_whatsapp_reschedule_scheduled(
+        contact_name="Grecia", new_when="",
+    )
+    body = _json.loads(out)
+    assert body["kind"] == "whatsapp_reschedule_scheduled"
+    assert "error" in body

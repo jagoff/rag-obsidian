@@ -8019,3 +8019,80 @@ main:focus-visible {
     gap: 10px;
   }
 }
+
+/* ── WhatsApp ACTION proposals (cancel/reschedule) ────────────────────
+ * Card más simple que el de send (kind="whatsapp_message"): no hay
+ * textarea editable porque el mensaje YA está programado y solo
+ * confirmamos cancelar o cambiar la hora. Visualmente reusa el verde
+ * WhatsApp del send-button para mantener el lenguaje, pero sin chip de
+ * programación (la card en sí es la acción de programación).
+ *
+ * Usamos `.proposal-whatsapp-action` como clase compartida entre los
+ * dos kinds — el frontend agrega además
+ * `.proposal-whatsapp_cancel_scheduled` /
+ * `.proposal-whatsapp_reschedule_scheduled` por si en algún momento
+ * queremos diferenciarlos visualmente. */
+.proposal-whatsapp-action .proposal-btn-create {
+  /* Mismo realce sutil que el send — confirmar también es destructivo
+     (cancelar borra estado, reschedule lo muta). */
+  background: rgba(126, 231, 135, 0.08);
+}
+.proposal-wa-action-meta {
+  /* Stack de pares label/value, muy compacto. Más denso que el de
+     send porque el contenido es read-only (no compite con un textarea). */
+  margin: 6px 0 4px 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.proposal-wa-action-meta .proposal-meta-row {
+  display: flex;
+  gap: 6px;
+  margin: 2px 0;
+}
+.proposal-wa-action-meta .proposal-meta-label {
+  /* Labels alineados a un ancho fijo para que las values queden
+     justificadas verticalmente — más legible cuando hay 3-4 rows. */
+  flex: 0 0 auto;
+  min-width: 88px;
+  color: var(--text-faint, #9aa);
+  font-weight: 500;
+}
+.proposal-wa-action-meta .proposal-meta-val {
+  flex: 1 1 auto;
+  color: var(--text);
+  word-break: break-word;
+}
+
+/* Clarification path: el LLM encontró >1 pending para el contacto y
+ * pide al user que elija. Cada candidato es un sub-card vertical con
+ * su propio botón [✓ Cancelar/Reagendar N]. Click sobre uno → se
+ * confirma esa fila + dimmean los demás (visual feedback). */
+.proposal-wa-action-clarif-intro {
+  margin: 6px 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.proposal-wa-action-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.proposal-wa-action-candidate {
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--bg-soft, rgba(255, 255, 255, 0.02));
+  transition: opacity 0.2s;
+}
+.proposal-wa-action-candidate.dimmed {
+  opacity: 0.45;
+}
+.proposal-wa-action-candidate-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint, #9aa);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 2px;
+}

@@ -160,15 +160,20 @@ def _post_chat(question: str = "hola") -> tuple[list[tuple[str, dict]], str]:
 
 
 def test_tools_module_exports():
-    assert len(CHAT_TOOLS) == 18
-    assert len(TOOL_FNS) == 18
+    # 21 = 18 originales + 3 nuevas de gestión de mensajes WA programados
+    # (whatsapp_list_scheduled, propose_whatsapp_cancel_scheduled,
+    # propose_whatsapp_reschedule_scheduled — issue #4 audit 2026-04-25).
+    assert len(CHAT_TOOLS) == 21
+    assert len(TOOL_FNS) == 21
     assert PARALLEL_SAFE == {
         "weather", "finance_summary", "calendar_ahead",
         "reminders_due", "gmail_recent", "drive_search",
         "whatsapp_pending", "whatsapp_search", "whatsapp_thread",
+        "whatsapp_list_scheduled",  # query-only contra SQLite local — safe.
         "propose_reminder", "propose_calendar_event",
-        # `propose_whatsapp_send` intentionally NOT here — see web/tools.py
-        # comment: destructive action + osascript-heavy lookup.
+        # `propose_whatsapp_send` / `_cancel_scheduled` / `_reschedule_scheduled`
+        # intentionally NOT here — see web/tools.py comment: destructive
+        # action + osascript-heavy lookup, mejor aislados.
     }
     assert CHAT_TOOL_OPTIONS == {
         "num_ctx": 4096,

@@ -35,7 +35,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 18 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 21 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -67,6 +67,12 @@ Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
 - Todos NO envían: devuelven una proposal card con [Enviar] / [Editar] / [Cancelar]. El user confirma explícitamente con un click. NUNCA prometas que "ya lo mandé" — hasta que el user toque Enviar no sale nada.
 - Si el contacto no se resuelve (el tool devuelve `error: not_found` o `no_phone`), avisale al user que no encontraste a la persona en sus Contactos y sugerile que pase el nombre completo o el teléfono.
 - **PROGRAMAR ENVÍO** (campo opcional `scheduled_for`): si el user mencionó EXPLÍCITAMENTE una fecha/hora futura para mandar el mensaje ("mandale a Grecia mañana 9hs que ya llegué", "avisale a Oscar el viernes 14:30", "decile a Sole en 2 horas", "el 5 de mayo a las 18hs"), pasá `scheduled_for="<ISO8601 con offset -03:00>"` (ej. `"2026-04-26T09:00:00-03:00"`). Resolvé fechas relativas usando la fecha de hoy del contexto. Si el user NO mencionó fecha, OMITÍ el arg — la card sale con [Enviar] inmediato (NO pongas null, NO inventes fecha). Ambiguo ("mandale mañana eventualmente") → omitir, que decida el humano. Aplica a `propose_whatsapp_send`, `propose_whatsapp_reply`, `propose_whatsapp_send_note`, `propose_whatsapp_send_contact_card`.
+
+Gestionar mensajes WhatsApp YA programados (cancelar, reagendar, listar):
+- "qué mensajes tengo programados / qué wsps quedan por mandar / lista los mensajes pendientes" → whatsapp_list_scheduled(). Es un QUERY tool (NO emite card) — devuelve JSON con `{items: [{id, contact_name, scheduled_for_local, message_text_preview, ...}]}`. Resumí el listado en prosa concisa: "Tenés 3 mensajes programados: 1) a Grecia mañana 9:00 'feliz cumple', 2) a Oscar el viernes 14:30 ..., 3) ...". Si está vacío decí "No tenés mensajes programados". Por default trae solo `pending`; si el user pide "todos los que mandé este mes" pasá `status="all"` o el filtro específico (`sent`, `cancelled`, `failed`, etc.).
+- "cancelá el mensaje a <Contacto> que programé" / "borrá el wsp programado a <Contacto>" / "no le mandes a <Contacto> el del <hint>" → propose_whatsapp_cancel_scheduled(contact_name="<Contacto>", when_hint="<hint opcional>"). Emite card con [Cancelar mensaje] / [Volver]. Si hay >1 pending para ese contacto y el user no dio hint claro, el tool devuelve `needs_clarification: true` + `candidates` — decile al user: "Tenés 2 programados para <Contacto>: a) el de mañana 9hs '...', b) el del viernes 14:30 '...'. ¿Cuál cancelo?". El `when_hint` es libre: "el de mañana", "el de la tarde", "el viernes".
+- "reagendá / cambiá / movéme el mensaje a <Contacto> para <nueva fecha>" → propose_whatsapp_reschedule_scheduled(contact_name="<Contacto>", new_when="<NL del nuevo horario>", when_hint="<hint opcional>"). El `new_when` lo parseamos con _parse_natural_datetime — pasá lo que el user dijo crudo ("el viernes 18hs", "mañana 14:30"). Si `new_when` está en el pasado o no parsea, la card sale con error y el user reformula.
+- En tu respuesta textual: card visible → 1-2 oraciones tipo "Te dejo el cancel armado, dale Cancelar para confirmar" / "Te dejo el reschedule armado para <hora simple>, dale Reagendar". Si vino error en la card, simplemente parafraseá el error ("No encontré ningún mensaje programado para <Contacto>").
 - En tu respuesta textual: "Te dejo el mensaje armado para <Nombre>, revisalo y tocá Enviar si está ok." (1-2 oraciones, que quede claro que NO se envió todavía). NO repitas el texto del mensaje — la card ya lo muestra. Si programaste, decí "Te lo dejo programado para <hora simple>, revisalo y dale Programar."
 
 Enviar emails via Gmail (misma lógica — acción destructiva, SIEMPRE pide confirmación):
@@ -368,7 +374,10 @@ from rag import (  # noqa: E402
     propose_whatsapp_reply,
     propose_whatsapp_send_note,
     propose_whatsapp_send_contact_card,
+    propose_whatsapp_cancel_scheduled,
+    propose_whatsapp_reschedule_scheduled,
     propose_mail_send,
+    whatsapp_list_scheduled,
 )
 
 
@@ -384,12 +393,15 @@ CHAT_TOOLS: list[Callable] = [
     whatsapp_pending,
     whatsapp_search,
     whatsapp_thread,
+    whatsapp_list_scheduled,
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,
     propose_whatsapp_reply,
     propose_whatsapp_send_note,
     propose_whatsapp_send_contact_card,
+    propose_whatsapp_cancel_scheduled,
+    propose_whatsapp_reschedule_scheduled,
     propose_mail_send,
 ]
 
@@ -405,6 +417,7 @@ PARALLEL_SAFE: set[str] = {
     "whatsapp_pending",
     "whatsapp_search",
     "whatsapp_thread",
+    "whatsapp_list_scheduled",  # query-only contra SQLite local — safe.
     "propose_reminder",
     "propose_calendar_event",
     # `propose_whatsapp_send` intencionalmente NO está acá: aunque el tool
@@ -413,6 +426,9 @@ PARALLEL_SAFE: set[str] = {
     # tools complica el debugging si hay un hang del bridge. Además la
     # semántica de "enviar mensaje" debería correrse aislada — el user
     # espera UN draft por turno, no varios en paralelo.
+    # Idem `propose_whatsapp_cancel_scheduled` / `_reschedule_scheduled`:
+    # también hacen contact-lookup via osascript y operan sobre estado
+    # mutable (rag_whatsapp_scheduled) — better aislado.
 }
 
 # Tool names whose return value (JSON string) should ALSO be emitted as a
@@ -426,5 +442,7 @@ PROPOSAL_TOOL_NAMES: set[str] = {
     "propose_whatsapp_reply",
     "propose_whatsapp_send_note",
     "propose_whatsapp_send_contact_card",
+    "propose_whatsapp_cancel_scheduled",
+    "propose_whatsapp_reschedule_scheduled",
     "propose_mail_send",
 }

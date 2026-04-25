@@ -2498,6 +2498,333 @@ function appendWhatsAppProposal(parent, payload) {
 }
 
 
+// Shared renderer for `whatsapp_cancel_scheduled` y
+// `whatsapp_reschedule_scheduled` — gestión de mensajes ya programados.
+// Card MÁS SIMPLE que el de send (no textarea editable, no popover de
+// hora — el "qué" ya lo decidió el LLM, solo falta confirmación).
+//
+// Variants by `payload.kind`:
+//   - "whatsapp_cancel_scheduled":   POST /api/whatsapp/scheduled/{id}/cancel
+//                                    (sin body); botón [✓ Cancelar mensaje]
+//   - "whatsapp_reschedule_scheduled": POST .../{id}/reschedule con
+//                                    body {scheduled_for: <iso_ar>};
+//                                    botón [✓ Reagendar]
+//
+// Cards de error (payload.error populado) → mini-card minimal sin botones.
+// Cards de needs_clarification (>1 candidatos) → lista de candidatos
+// como botones, cada uno reusa la misma lógica de POST con el
+// scheduled_id correspondiente.
+function appendWhatsAppActionProposal(parent, payload) {
+  const kind = payload.kind;
+  const isReschedule = kind === "whatsapp_reschedule_scheduled";
+  const fields = payload.fields || {};
+  const proposalId = payload.proposal_id || "";
+  const err = payload.error || null;
+  const needsClarif = payload.needs_clarification === true;
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+
+  const headIcon = isReschedule ? "🔄" : "⏰";
+  const headLabel = isReschedule
+    ? "Reagendar mensaje programado"
+    : "Cancelar mensaje programado";
+  const primaryLabel = isReschedule ? "✓ Reagendar" : "✓ Cancelar mensaje";
+  const secondaryLabel = "Volver";
+
+  const card = el(
+    "div",
+    `proposal proposal-whatsapp-action proposal-${kind}`,
+  );
+  card.setAttribute("role", "region");
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", headIcon));
+  const headId = `proposal-head-${Math.random().toString(36).slice(2, 9)}`;
+  const headLabelEl = el("span", "proposal-kind", headLabel);
+  headLabelEl.id = headId;
+  head.appendChild(headLabelEl);
+  card.setAttribute("aria-labelledby", headId);
+  card.appendChild(head);
+
+  // Error path: mini-card minimal sin botones. El user no puede hacer
+  // nada sobre estado inválido — solo lee el error y reformula al LLM.
+  if (err) {
+    const recipient = fields.contact_name || "";
+    const errBody = el("div", "proposal-warn", `⚠ ${err}`);
+    card.appendChild(errBody);
+    if (recipient) {
+      const meta = el("div", "proposal-wa-action-meta");
+      meta.appendChild(el("span", "proposal-meta-label", "para:"));
+      meta.appendChild(el("span", "proposal-meta-val", recipient));
+      card.appendChild(meta);
+    }
+    parent.appendChild(card);
+    return card;
+  }
+
+  // ── Helper builders shared by single-card y candidate-cards ──────────
+
+  // Render meta rows (Para / Programado / Mensaje, etc) into a container.
+  function renderMeta(container, opts) {
+    const meta = el("div", "proposal-wa-action-meta");
+    const addRow = (label, value) => {
+      if (!value) return;
+      const row = el("div", "proposal-meta-row");
+      row.appendChild(el("span", "proposal-meta-label", label));
+      row.appendChild(el("span", "proposal-meta-val", value));
+      meta.appendChild(row);
+    };
+    if (opts.contactName) addRow("Para:", opts.contactName);
+    if (opts.oldScheduled) {
+      addRow(
+        isReschedule ? "Programado actualmente:" : "Programado:",
+        formatFriendlyDate(opts.oldIsoAr || opts.oldScheduled) || opts.oldScheduled,
+      );
+    }
+    if (isReschedule && opts.newScheduled) {
+      addRow(
+        "Nueva fecha:",
+        formatFriendlyDate(opts.newIsoAr || opts.newScheduled) || opts.newScheduled,
+      );
+    }
+    if (opts.preview) addRow("Mensaje:", `“${opts.preview}”`);
+    container.appendChild(meta);
+  }
+
+  // Wire up the [✓ primary] / [Volver] action row + status span.
+  // Returns {primaryBtn, secondaryBtn, status} — caller can add an
+  // event listener to primaryBtn for the actual POST.
+  function buildActions(container) {
+    const actions = el("div", "proposal-actions");
+    const primaryBtn = document.createElement("button");
+    primaryBtn.type = "button";
+    primaryBtn.className = "proposal-btn proposal-btn-create";
+    primaryBtn.textContent = primaryLabel;
+    const secondaryBtn = document.createElement("button");
+    secondaryBtn.type = "button";
+    secondaryBtn.className = "proposal-btn proposal-btn-cancel";
+    secondaryBtn.textContent = secondaryLabel;
+    const status = el("span", "proposal-status", "");
+    actions.appendChild(primaryBtn);
+    actions.appendChild(secondaryBtn);
+    actions.appendChild(status);
+    container.appendChild(actions);
+    return { primaryBtn, secondaryBtn, status };
+  }
+
+  // Perform the POST: cancel → no body, reschedule → {scheduled_for}.
+  async function performAction(scheduledId, newIsoAr) {
+    const url = isReschedule
+      ? `/api/whatsapp/scheduled/${scheduledId}/reschedule`
+      : `/api/whatsapp/scheduled/${scheduledId}/cancel`;
+    const init = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    };
+    if (isReschedule) {
+      init.body = JSON.stringify({ scheduled_for: newIsoAr || "" });
+    }
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${res.status}`);
+    }
+    return res.json().catch(() => ({}));
+  }
+
+  function wireSingleAction(opts) {
+    const { primaryBtn, secondaryBtn, status } = buildActions(card);
+    secondaryBtn.addEventListener("click", () => {
+      if (card.dataset.resolved) return;
+      card.dataset.resolved = "cancelled";
+      primaryBtn.disabled = true;
+      secondaryBtn.disabled = true;
+      status.textContent = "  descartada";
+      status.classList.add("cancelled");
+      card.classList.add("dimmed");
+    });
+    primaryBtn.addEventListener("click", async () => {
+      if (card.dataset.resolved) return;
+      if (!opts.scheduledId) {
+        status.textContent = "  id inválido";
+        status.classList.add("err");
+        return;
+      }
+      card.dataset.resolved = "sending";
+      primaryBtn.disabled = true;
+      secondaryBtn.disabled = true;
+      status.textContent = isReschedule ? "  reagendando…" : "  cancelando…";
+      status.classList.remove("ok", "err");
+      try {
+        const data = await performAction(opts.scheduledId, opts.newIsoAr);
+        if (data && data.ok === false) {
+          throw new Error(data.reason || "no_op");
+        }
+        card.dataset.resolved = isReschedule ? "rescheduled" : "cancelled";
+        if (isReschedule) {
+          const friendly = formatFriendlyDate(opts.newIsoAr) || "";
+          status.textContent = friendly
+            ? `  ✓ reagendado para ${friendly}`
+            : "  ✓ reagendado";
+          showToast(
+            friendly
+              ? `✓ Reagendado para ${friendly}`
+              : "✓ Mensaje reagendado",
+            "ok",
+          );
+        } else {
+          status.textContent = "  ✓ cancelado";
+          showToast("✓ Mensaje programado cancelado", "ok");
+        }
+        status.classList.add("ok");
+        card.classList.add("created");
+      } catch (e) {
+        delete card.dataset.resolved;
+        primaryBtn.disabled = false;
+        secondaryBtn.disabled = false;
+        status.textContent = `  error: ${e.message}`;
+        status.classList.add("err");
+        showToast(
+          isReschedule
+            ? `✗ No se pudo reagendar: ${e.message}`
+            : `✗ No se pudo cancelar: ${e.message}`,
+          "err",
+        );
+      }
+    });
+  }
+
+  // ── Clarification path: lista de candidatos ─────────────────────────
+  // Cada candidato es un sub-card mini con su propia botonera. Cuando
+  // el user click [✓] en uno, se confirma esa fila (POST con su
+  // scheduled_id) y se dimmean los demás.
+  if (needsClarif && candidates.length) {
+    const intro = el(
+      "div",
+      "proposal-wa-action-clarif-intro",
+      `Encontré ${candidates.length} mensajes programados para ${fields.contact_name || "ese contacto"}. ¿Cuál ${isReschedule ? "reagendo" : "cancelo"}?`,
+    );
+    card.appendChild(intro);
+
+    const list = el("div", "proposal-wa-action-candidates");
+    card.appendChild(list);
+
+    candidates.forEach((cand, idx) => {
+      const sub = el("div", "proposal-wa-action-candidate");
+      const header = el(
+        "div",
+        "proposal-wa-action-candidate-head",
+        `Opción ${idx + 1}`,
+      );
+      sub.appendChild(header);
+      renderMeta(sub, {
+        oldScheduled: cand.old_scheduled_for_local || cand.scheduled_for_local || "",
+        oldIsoAr: cand.scheduled_for_iso_ar || "",
+        newScheduled: cand.new_scheduled_for_local || "",
+        newIsoAr: cand.new_scheduled_for_iso_ar || "",
+        preview: cand.message_text_preview || "",
+      });
+      const subActions = el("div", "proposal-actions");
+      const subBtn = document.createElement("button");
+      subBtn.type = "button";
+      subBtn.className = "proposal-btn proposal-btn-create";
+      subBtn.textContent = primaryLabel + " " + (idx + 1);
+      const subStatus = el("span", "proposal-status", "");
+      subActions.appendChild(subBtn);
+      subActions.appendChild(subStatus);
+      sub.appendChild(subActions);
+      list.appendChild(sub);
+
+      subBtn.addEventListener("click", async () => {
+        if (card.dataset.resolved) return;
+        if (!cand.scheduled_id) {
+          subStatus.textContent = "  id inválido";
+          subStatus.classList.add("err");
+          return;
+        }
+        card.dataset.resolved = "sending";
+        // Disable all candidate buttons; keep "Volver" alive.
+        list.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+        subStatus.textContent = isReschedule ? "  reagendando…" : "  cancelando…";
+        try {
+          const data = await performAction(
+            cand.scheduled_id,
+            cand.new_scheduled_for_iso_ar || fields.new_scheduled_for_iso_ar || "",
+          );
+          if (data && data.ok === false) {
+            throw new Error(data.reason || "no_op");
+          }
+          subStatus.textContent = isReschedule ? "  ✓ reagendado" : "  ✓ cancelado";
+          subStatus.classList.add("ok");
+          sub.classList.add("created");
+          card.dataset.resolved = isReschedule ? "rescheduled" : "cancelled";
+          // Dim the non-chosen candidates.
+          list.querySelectorAll(".proposal-wa-action-candidate").forEach((c) => {
+            if (c !== sub) c.classList.add("dimmed");
+          });
+          showToast(
+            isReschedule
+              ? "✓ Mensaje reagendado"
+              : "✓ Mensaje programado cancelado",
+            "ok",
+          );
+        } catch (e) {
+          delete card.dataset.resolved;
+          list.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+          subStatus.textContent = `  error: ${e.message}`;
+          subStatus.classList.add("err");
+          showToast(
+            isReschedule
+              ? `✗ No se pudo reagendar: ${e.message}`
+              : `✗ No se pudo cancelar: ${e.message}`,
+            "err",
+          );
+        }
+      });
+    });
+
+    // [Volver] al final que descarta toda la card.
+    const dismissRow = el("div", "proposal-actions");
+    const dismissBtn = document.createElement("button");
+    dismissBtn.type = "button";
+    dismissBtn.className = "proposal-btn proposal-btn-cancel";
+    dismissBtn.textContent = secondaryLabel;
+    dismissBtn.addEventListener("click", () => {
+      if (card.dataset.resolved) return;
+      card.dataset.resolved = "cancelled";
+      list.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      dismissBtn.disabled = true;
+      card.classList.add("dimmed");
+    });
+    dismissRow.appendChild(dismissBtn);
+    card.appendChild(dismissRow);
+
+    parent.appendChild(card);
+    return card;
+  }
+
+  // ── Single-action path (1 match exacto) ──────────────────────────────
+  renderMeta(card, {
+    contactName: fields.contact_name || "",
+    oldScheduled:
+      fields.old_scheduled_for_local
+      || fields.scheduled_for_local
+      || "",
+    oldIsoAr: fields.scheduled_for_iso_ar || "",
+    newScheduled: fields.new_scheduled_for_local || "",
+    newIsoAr: fields.new_scheduled_for_iso_ar || "",
+    preview: fields.message_text_preview || "",
+  });
+  void proposalId; // unused — proposal_id solo lo usa el server SSE log.
+  wireSingleAction({
+    scheduledId: fields.scheduled_id,
+    newIsoAr: fields.new_scheduled_for_iso_ar || "",
+  });
+
+  parent.appendChild(card);
+  return card;
+}
+
+
 // Mail-specific proposal card. Mismo modelo que WhatsApp — el send es
 // destructivo a un tercero, el user confirma con click. Distinto en:
 //   1. Tres campos editables: To / Subject / Body (vs un solo textarea).
@@ -2655,7 +2982,7 @@ function appendMailProposal(parent, payload) {
 
 
 function appendProposal(parent, payload) {
-  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message" | "whatsapp_reply" | "mail"
+  const kind = payload.kind;                    // "reminder" | "event" | "whatsapp_message" | "whatsapp_reply" | "whatsapp_cancel_scheduled" | "whatsapp_reschedule_scheduled" | "mail"
   const fields = payload.fields || {};
   const needsClarif = payload.needs_clarification === true;
 
@@ -2665,6 +2992,13 @@ function appendProposal(parent, payload) {
   // (/api/whatsapp/send for both — reply ships an extra reply_to field).
   if (kind === "whatsapp_message" || kind === "whatsapp_reply") {
     return appendWhatsAppProposal(parent, payload);
+  }
+  // whatsapp_cancel_scheduled / whatsapp_reschedule_scheduled — gestión de
+  // mensajes ya programados (cards más simples que el send: NO hay
+  // textarea editable, solo confirmar/volver). Comparten un único
+  // renderer que se ramifica internamente por kind.
+  if (kind === "whatsapp_cancel_scheduled" || kind === "whatsapp_reschedule_scheduled") {
+    return appendWhatsAppActionProposal(parent, payload);
   }
   // mail: tres campos editables (to / subject / body) + POST a /api/mail/send.
   if (kind === "mail") {

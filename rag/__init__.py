@@ -20864,6 +20864,516 @@ def propose_whatsapp_send(
     }, ensure_ascii=False)
 
 
+# ── WhatsApp scheduled-message MANAGEMENT (list/cancel/reschedule) ─────────
+#
+# Las tools de abajo permiten que el LLM gestione los mensajes programados
+# vía NL — sin tener que abrir el dashboard. Hoy `propose_whatsapp_send`
+# permite PROGRAMAR (campo `scheduled_for`); estas tools cierran el ciclo:
+#
+#   - `whatsapp_list_scheduled` → query, NO emite proposal. El LLM la
+#     consume y resume al user en prosa ("tenés 3 mensajes programados:
+#     1) Grecia mañana 9hs..., 2) ...").
+#   - `propose_whatsapp_cancel_scheduled` → emite card kind=
+#     "whatsapp_cancel_scheduled" para que el user confirme con click.
+#   - `propose_whatsapp_reschedule_scheduled` → emite card kind=
+#     "whatsapp_reschedule_scheduled" idem.
+#
+# El frontend tiene un renderer compartido `appendWhatsAppActionProposal`
+# para los dos kinds de proposal — card más simple que el de send (no
+# hay textarea editable, solo confirmar/cancelar la acción).
+#
+# Schema de retorno consistente con el resto de propose_*: kind +
+# proposal_id + fields (+ needs_clarification + error + candidates).
+# El server SSE-routes los kinds que están en `PROPOSAL_TOOL_NAMES`
+# (web/tools.py).
+
+
+_AR_OFFSET_HOURS = 3
+"""Offset fijo Argentina vs UTC. AR no tiene DST hace décadas — hardcoded."""
+
+
+def _wa_scheduled_utc_iso_to_local_pieces(scheduled_for_utc: str) -> dict:
+    """Convierte una ISO UTC (lo que vive en `rag_whatsapp_scheduled.scheduled_for_utc`)
+    a las piezas que la UI / LLM consumen:
+
+      - ``local_str``: ``"YYYY-MM-DD HH:MM"`` AR-local (sin TZ, naive) —
+        fácil de leer por el LLM y de pasarle a `formatFriendlyDate` en
+        el frontend (que tolera ISO + offset y also bare datetime-like).
+      - ``iso_ar``: ``"YYYY-MM-DDTHH:MM:SS-03:00"`` — listo para que el
+        frontend lo mande tal cual al endpoint de reschedule (que ya
+        sabe parsear ese formato vía `_parse_scheduled_for_to_utc`).
+
+    Si la ISO no parsea, devuelve strings vacíos en ambas keys (silent-
+    fail — el LLM se las arregla, el frontend muestra "(?)" y deja la
+    card visible).
+    """
+    try:
+        s = (scheduled_for_utc or "").strip()
+        if s.endswith("Z") or s.endswith("z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        utc = dt.astimezone(timezone.utc)
+        ar_naive = (utc - timedelta(hours=_AR_OFFSET_HOURS)).replace(tzinfo=None)
+        return {
+            "local_str": ar_naive.strftime("%Y-%m-%d %H:%M"),
+            "iso_ar": ar_naive.isoformat(timespec="seconds") + "-03:00",
+        }
+    except (ValueError, TypeError):
+        return {"local_str": "", "iso_ar": ""}
+
+
+def _wa_scheduled_truncate_preview(text: str, max_chars: int = 80) -> str:
+    """Trunca a `max_chars` y agrega ellipsis si recortamos. NO hace
+    word-boundary trimming — un truncado un poco feo (corta en medio
+    de palabra) es mejor que un cap inconsistente entre rows.
+    """
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 1].rstrip() + "…"
+
+
+def whatsapp_list_scheduled(status: str | None = None) -> str:
+    """Listar mensajes de WhatsApp programados a futuro. NO crea ni cancela nada.
+
+    Es un query tool — el LLM la llama, lee el JSON resultado, y enuncia
+    al user en prosa ("tenés 3 mensajes programados: 1) Grecia mañana
+    9hs 'feliz cumple', 2) ..."). NO emite proposal card; usá
+    ``propose_whatsapp_cancel_scheduled`` o
+    ``propose_whatsapp_reschedule_scheduled`` cuando el user pida acción
+    sobre un mensaje específico.
+
+    Args:
+        status: Filtro opcional de estado. Default ``None`` →
+            ``'pending'`` (los que todavía no se mandaron — el caso más
+            común: "qué tengo programado?"). Otros valores válidos:
+            ``'sent'`` (ya enviados), ``'sent_late'`` (enviados con
+            delay >5min), ``'failed'`` (fallaron tras max retries),
+            ``'cancelled'`` (cancelados por el user). Pasá explícito
+            ``'all'`` para traer TODOS los estados (history completo).
+            Cap interno: 50 rows.
+
+    Returns:
+        JSON ``{"items": [...], "count": N}``. Cada item:
+        ``{id, contact_name, jid, scheduled_for_local,
+        scheduled_for_iso_ar, message_text_preview, status,
+        attempt_count}``. Vacío si no hay matches:
+        ``{"items": [], "count": 0}``.
+    """
+    from rag import wa_scheduled  # noqa: PLC0415 — lazy: evita ciclo
+
+    effective_status: str | None
+    raw = (status or "").strip().lower() if isinstance(status, str) else None
+    if raw is None or raw == "":
+        effective_status = "pending"
+    elif raw == "all":
+        effective_status = None
+    else:
+        effective_status = raw
+
+    try:
+        rows = wa_scheduled.list_scheduled(status=effective_status, limit=50)
+    except ValueError as exc:
+        return json.dumps({
+            "items": [], "count": 0,
+            "error": f"status inválido: {exc}",
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({
+            "items": [], "count": 0,
+            "error": f"error listando: {str(exc)[:120]}",
+        }, ensure_ascii=False)
+
+    items: list[dict] = []
+    for r in rows:
+        local_pieces = _wa_scheduled_utc_iso_to_local_pieces(
+            r.get("scheduled_for_utc") or "",
+        )
+        items.append({
+            "id": r.get("id"),
+            "contact_name": r.get("contact_name") or "",
+            "jid": r.get("jid") or "",
+            "scheduled_for_local": local_pieces["local_str"],
+            "scheduled_for_iso_ar": local_pieces["iso_ar"],
+            "message_text_preview": _wa_scheduled_truncate_preview(
+                r.get("message_text") or "", 80,
+            ),
+            "status": r.get("status") or "",
+            "attempt_count": int(r.get("attempt_count") or 0),
+        })
+    return json.dumps(
+        {"items": items, "count": len(items)},
+        ensure_ascii=False,
+    )
+
+
+def _wa_scheduled_filter_by_when_hint(
+    rows: list[dict],
+    when_hint: str | None,
+) -> tuple[list[dict], dict | None]:
+    """Filtra `rows` por una ventana de ±1h alrededor del datetime
+    parseado de `when_hint`. Si `when_hint` es None/vacío, devuelve
+    todos los rows. Si parsea pero no matchea ningún row, devuelve [].
+
+    Retorna ``(filtered_rows, info)``. ``info`` contiene
+    ``{when_hint, parsed_local}`` cuando el hint pudo parsearse —
+    útil para mensajes de error/clarif al user. Si no parsea,
+    ``info=None`` y NO filtramos (mejor mostrar todo y dejar que el
+    user elija que rebotar con "no entendí").
+
+    Window de ±1h porque los humanos son aproximados ("mañana 9hs"
+    puede matchear 8:30 o 9:30 — no exigimos exact match).
+    """
+    if not when_hint or not when_hint.strip():
+        return rows, None
+    parsed = _parse_natural_datetime(when_hint, now=datetime.now())
+    if parsed is None:
+        return rows, None
+    info = {
+        "when_hint": when_hint,
+        "parsed_local": parsed.strftime("%Y-%m-%d %H:%M"),
+    }
+    window = timedelta(hours=1)
+    out: list[dict] = []
+    for r in rows:
+        local = _wa_scheduled_utc_iso_to_local_pieces(
+            r.get("scheduled_for_utc") or "",
+        )["local_str"]
+        if not local:
+            continue
+        try:
+            row_dt = datetime.strptime(local, "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if abs((row_dt - parsed).total_seconds()) <= window.total_seconds():
+            out.append(r)
+    return out, info
+
+
+def _wa_scheduled_row_to_card_fields(r: dict) -> dict:
+    """Convierte una row del DB (dict canónico de `wa_scheduled.list_scheduled`)
+    a los `fields` que la UI espera para una card de cancel/reschedule.
+
+    Comparte preview-truncation y conversión TZ con `whatsapp_list_scheduled`
+    para que la card y el listado muestren los mismos valores.
+    """
+    pieces = _wa_scheduled_utc_iso_to_local_pieces(
+        r.get("scheduled_for_utc") or "",
+    )
+    return {
+        "scheduled_id": r.get("id"),
+        "contact_name": r.get("contact_name") or "",
+        "jid": r.get("jid") or "",
+        "scheduled_for_local": pieces["local_str"],
+        "scheduled_for_iso_ar": pieces["iso_ar"],
+        "message_text_preview": _wa_scheduled_truncate_preview(
+            r.get("message_text") or "", 80,
+        ),
+    }
+
+
+def propose_whatsapp_cancel_scheduled(
+    contact_name: str,
+    when_hint: str | None = None,
+) -> str:
+    """Cancelar un mensaje de WhatsApp ya programado para `contact_name`.
+    Emite proposal card; el user confirma con [Cancelar mensaje] / [Volver].
+    NO cancela inmediatamente — siempre pasa por confirmación humana.
+
+    Usalo cuando el user diga: "cancelá el mensaje a Grecia que programé
+    para mañana", "borrá el WhatsApp programado a Sole", "no le mandes a
+    Oscar el del viernes". Si no hay ningún pending para ese contacto,
+    la card lo dice. Si hay varios, te pedimos `when_hint` para
+    desambiguar.
+
+    Args:
+        contact_name: Nombre tal como aparece en Apple Contacts. Se
+            resuelve a JID con la misma lookup que ``propose_whatsapp_send``.
+        when_hint: Filtro opcional NL para desambiguar si hay >1 pending
+            ("el de mañana", "el de la tarde", "el viernes"). Lo
+            parseamos con ``_parse_natural_datetime`` y filtramos por
+            ventana de ±1h sobre ``scheduled_for_utc``. Si no parsea
+            (ej. "el segundo"), lo ignoramos y mostramos todos los
+            candidatos para que el user elija.
+
+    Returns:
+        JSON ``{kind: "whatsapp_cancel_scheduled", proposal_id, fields,
+        needs_clarification?, candidates?, error?}``.
+
+        - 1 match → ``fields`` tiene ``{scheduled_id, contact_name,
+          scheduled_for_local, scheduled_for_iso_ar,
+          message_text_preview, jid}``. La UI renderea card con
+          [Cancelar mensaje] / [Volver].
+        - 0 matches → ``error: "no hay mensajes programados para X"``.
+        - >1 matches sin hint que desambigüe → ``needs_clarification:
+          true`` + ``candidates: [{scheduled_id, scheduled_for_local,
+          message_text_preview}]`` para que la UI / el LLM le pregunte
+          cuál.
+        - Contacto no se resuelve → ``error: "no encontré a X"``.
+    """
+    from rag import wa_scheduled  # noqa: PLC0415
+
+    lookup = _whatsapp_jid_from_contact(contact_name)
+    if lookup.get("error") or not lookup.get("jid"):
+        err_code = lookup.get("error") or "not_found"
+        nice = {
+            "not_found": f"no encontré a {contact_name} en tus Contactos",
+            "no_phone": f"el contacto {contact_name} no tiene teléfono cargado",
+            "empty_query": "no me dijiste a quién cancelarle el mensaje",
+        }.get(err_code, f"no se pudo resolver el contacto: {err_code}")
+        return json.dumps({
+            "kind": "whatsapp_cancel_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {"contact_name": contact_name},
+            "error": nice,
+        }, ensure_ascii=False)
+
+    target_jid = lookup["jid"]
+    try:
+        all_pending = wa_scheduled.list_scheduled(status="pending", limit=20)
+    except Exception as exc:
+        return json.dumps({
+            "kind": "whatsapp_cancel_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {"contact_name": contact_name, "jid": target_jid},
+            "error": f"error listando pendings: {str(exc)[:120]}",
+        }, ensure_ascii=False)
+    by_jid = [r for r in all_pending if (r.get("jid") or "") == target_jid]
+    if not by_jid:
+        nice_name = lookup.get("full_name") or contact_name
+        return json.dumps({
+            "kind": "whatsapp_cancel_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {"contact_name": contact_name, "jid": target_jid},
+            "error": f"no hay mensajes programados para {nice_name}",
+        }, ensure_ascii=False)
+
+    filtered, _hint_info = _wa_scheduled_filter_by_when_hint(by_jid, when_hint)
+
+    # Si el hint filtró todo → fallback al set sin filtrar (mejor que
+    # decirle al user "no hay" cuando sí hay, solo que el hint no matcheó).
+    candidates_pool = filtered if filtered else by_jid
+
+    if len(candidates_pool) == 1:
+        row = candidates_pool[0]
+        fields = _wa_scheduled_row_to_card_fields(row)
+        # contact_name del LLM es lo que el user dijo; preferimos full_name.
+        fields["contact_name"] = (
+            lookup.get("full_name") or row.get("contact_name") or contact_name
+        )
+        return json.dumps({
+            "kind": "whatsapp_cancel_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    # >1 candidatos — pedir clarification con la lista.
+    candidates = []
+    for row in candidates_pool[:10]:
+        cf = _wa_scheduled_row_to_card_fields(row)
+        candidates.append({
+            "scheduled_id": cf["scheduled_id"],
+            "scheduled_for_local": cf["scheduled_for_local"],
+            "scheduled_for_iso_ar": cf["scheduled_for_iso_ar"],
+            "message_text_preview": cf["message_text_preview"],
+        })
+    return json.dumps({
+        "kind": "whatsapp_cancel_scheduled",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": {
+            "contact_name": lookup.get("full_name") or contact_name,
+            "jid": target_jid,
+        },
+        "candidates": candidates,
+    }, ensure_ascii=False)
+
+
+def propose_whatsapp_reschedule_scheduled(
+    contact_name: str,
+    new_when: str,
+    when_hint: str | None = None,
+) -> str:
+    """Reagendar un mensaje de WhatsApp programado: cambia el horario de
+    envío a ``new_when``. Emite proposal card; el user confirma con
+    [Reagendar] / [Volver]. NO reagenda inmediatamente.
+
+    Usalo cuando el user diga: "cambiá el mensaje a Grecia para el
+    viernes 14hs", "reagendá el de Oscar para mañana 18hs", "moveme el
+    de Sole a las 20:30". El nuevo horario lo parseamos con el mismo
+    `_parse_natural_datetime` que usamos para los reminders/eventos.
+
+    Args:
+        contact_name: idem ``propose_whatsapp_cancel_scheduled``.
+        new_when: NL del nuevo horario ("el viernes a las 14hs",
+            "mañana 18hs", "el 5 de mayo 9:00"). Si no parsea, la
+            card sale con error y el user reformula.
+        when_hint: Para desambiguar CUÁL pending mover si hay >1.
+            Idem que en cancel: "el de mañana", "el de la tarde".
+
+    Returns:
+        JSON ``{kind: "whatsapp_reschedule_scheduled", proposal_id,
+        fields, needs_clarification?, candidates?, error?}``. Fields
+        incluye ``{scheduled_id, contact_name, old_scheduled_for_local,
+        new_scheduled_for_local, new_scheduled_for_iso_ar,
+        message_text_preview, jid}``.
+
+        - ``new_when`` no parsea → ``error: "no entendí 'X' como
+          fecha/hora"``.
+        - ``new_when`` está en el pasado (tolerancia 60s) → ``error: "no
+          puedo reagendar al pasado"``.
+        - 0 pendings para ese contacto → ``error: "no hay mensajes
+          programados para X"``.
+        - 1 match → card con todos los fields.
+        - >1 matches sin hint útil → ``needs_clarification: true`` +
+          ``candidates`` (mismo shape que cancel pero cada item lleva
+          ``new_scheduled_for_iso_ar`` igual para todos — sirve para
+          que cuando el user clickee uno, el frontend sepa qué fecha
+          asignar).
+    """
+    from rag import wa_scheduled  # noqa: PLC0415
+
+    # 1) Parse new_when primero — si esto truena, ni vale la pena
+    # hacer el lookup del contacto.
+    raw_when = (new_when or "").strip()
+    if not raw_when:
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {"contact_name": contact_name},
+            "error": "tenés que decirme la nueva fecha/hora",
+        }, ensure_ascii=False)
+    new_dt = _parse_natural_datetime(raw_when, now=datetime.now())
+    if new_dt is None:
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {
+                "contact_name": contact_name,
+                "new_when_text": raw_when,
+            },
+            "error": f"no entendí '{raw_when}' como fecha/hora",
+        }, ensure_ascii=False)
+    now_local = datetime.now()
+    if (now_local - new_dt).total_seconds() > 60:
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {
+                "contact_name": contact_name,
+                "new_when_text": raw_when,
+                "new_scheduled_for_local": new_dt.strftime("%Y-%m-%d %H:%M"),
+            },
+            "error": "no puedo reagendar al pasado",
+        }, ensure_ascii=False)
+
+    new_local_str = new_dt.strftime("%Y-%m-%d %H:%M")
+    new_iso_ar = new_dt.isoformat(timespec="seconds") + "-03:00"
+
+    # 2) Lookup contacto.
+    lookup = _whatsapp_jid_from_contact(contact_name)
+    if lookup.get("error") or not lookup.get("jid"):
+        err_code = lookup.get("error") or "not_found"
+        nice = {
+            "not_found": f"no encontré a {contact_name} en tus Contactos",
+            "no_phone": f"el contacto {contact_name} no tiene teléfono cargado",
+            "empty_query": "no me dijiste a quién reagendarle el mensaje",
+        }.get(err_code, f"no se pudo resolver el contacto: {err_code}")
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {
+                "contact_name": contact_name,
+                "new_scheduled_for_local": new_local_str,
+                "new_scheduled_for_iso_ar": new_iso_ar,
+            },
+            "error": nice,
+        }, ensure_ascii=False)
+
+    target_jid = lookup["jid"]
+
+    # 3) Buscar pendings.
+    try:
+        all_pending = wa_scheduled.list_scheduled(status="pending", limit=20)
+    except Exception as exc:
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {
+                "contact_name": contact_name,
+                "jid": target_jid,
+                "new_scheduled_for_local": new_local_str,
+                "new_scheduled_for_iso_ar": new_iso_ar,
+            },
+            "error": f"error listando pendings: {str(exc)[:120]}",
+        }, ensure_ascii=False)
+    by_jid = [r for r in all_pending if (r.get("jid") or "") == target_jid]
+    if not by_jid:
+        nice_name = lookup.get("full_name") or contact_name
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": {
+                "contact_name": contact_name,
+                "jid": target_jid,
+                "new_scheduled_for_local": new_local_str,
+                "new_scheduled_for_iso_ar": new_iso_ar,
+            },
+            "error": f"no hay mensajes programados para {nice_name}",
+        }, ensure_ascii=False)
+
+    filtered, _hint_info = _wa_scheduled_filter_by_when_hint(by_jid, when_hint)
+    candidates_pool = filtered if filtered else by_jid
+
+    if len(candidates_pool) == 1:
+        row = candidates_pool[0]
+        fields = _wa_scheduled_row_to_card_fields(row)
+        fields["contact_name"] = (
+            lookup.get("full_name") or row.get("contact_name") or contact_name
+        )
+        # Reschedule-specific fields: viejo local + nuevo local + nuevo ISO.
+        fields["old_scheduled_for_local"] = fields.pop(
+            "scheduled_for_local",
+        )
+        fields.pop("scheduled_for_iso_ar", None)
+        fields["new_scheduled_for_local"] = new_local_str
+        fields["new_scheduled_for_iso_ar"] = new_iso_ar
+        return json.dumps({
+            "kind": "whatsapp_reschedule_scheduled",
+            "proposal_id": f"prop-{uuid.uuid4()}",
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    # >1 candidatos — clarif. Cada candidato lleva el mismo new_*
+    # (es la fecha NUEVA, igual para todos los candidatos del set).
+    candidates = []
+    for row in candidates_pool[:10]:
+        cf = _wa_scheduled_row_to_card_fields(row)
+        candidates.append({
+            "scheduled_id": cf["scheduled_id"],
+            "old_scheduled_for_local": cf["scheduled_for_local"],
+            "message_text_preview": cf["message_text_preview"],
+            "new_scheduled_for_local": new_local_str,
+            "new_scheduled_for_iso_ar": new_iso_ar,
+        })
+    return json.dumps({
+        "kind": "whatsapp_reschedule_scheduled",
+        "proposal_id": f"prop-{uuid.uuid4()}",
+        "needs_clarification": True,
+        "fields": {
+            "contact_name": lookup.get("full_name") or contact_name,
+            "jid": target_jid,
+            "new_scheduled_for_local": new_local_str,
+            "new_scheduled_for_iso_ar": new_iso_ar,
+        },
+        "candidates": candidates,
+    }, ensure_ascii=False)
+
+
 # ── WhatsApp SHARE NOTE — render vault note as WA message ──────────────────
 #
 # Pattern: "mandale a Sole la receta de panqueques", "compartile a Juan los

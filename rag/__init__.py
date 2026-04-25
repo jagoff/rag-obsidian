@@ -1637,7 +1637,15 @@ def session_path(sid: str) -> Path:
 
 
 def load_session(sid: str) -> dict | None:
-    """Read a session file. Returns None if missing, invalid id, or unreadable."""
+    """Read a session file. Returns None if missing, invalid id, or unreadable.
+
+    If the file exists but is corrupt (truncated mid-write before the flock
+    hardening of 2026-04-24, or hit by a crash), quarantine it to
+    `<path>.corrupt-<ts>` and return None. Otherwise the same corrupted
+    "last session" file would log JSONDecodeError every time the chat
+    boots — which is exactly what `session_load_json` (60 errors / day in
+    the audit) was tracking.
+    """
     try:
         p = session_path(sid)
     except ValueError:
@@ -1648,6 +1656,14 @@ def load_session(sid: str) -> dict | None:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         _silent_log("session_load_json", exc)
+        # Quarantine corrupt file so the next read doesn't log the same
+        # error indefinitely. Best-effort: if rename fails (permission,
+        # cross-device), just leave it be — the silent log already fired.
+        try:
+            backup = p.with_suffix(f".json.corrupt-{int(time.time())}")
+            p.rename(backup)
+        except Exception:  # pragma: no cover - rescue path
+            pass
         return None
 
 
@@ -2911,7 +2927,12 @@ _synthetic_q_cache_lock = threading.Lock()
 
 
 def _load_synthetic_q_cache() -> dict[str, list[str]]:
-    """Load {file_hash: [questions]} from disk. Lazy, once per process."""
+    """Load {file_hash: [questions]} from disk. Lazy, once per process.
+
+    If the cache file is corrupted (truncated / not JSON), back it up to
+    `<path>.corrupt-<ts>` and start with an empty cache so the next save
+    rebuilds from scratch instead of looping the same JSONDecodeError.
+    """
     global _synthetic_q_cache
     with _synthetic_q_cache_lock:
         if _synthetic_q_cache is not None:
@@ -2928,6 +2949,14 @@ def _load_synthetic_q_cache() -> dict[str, list[str]]:
                     _synthetic_q_cache = OrderedDict()
             except Exception as exc:
                 _silent_log("synthetic_q_cache_load", exc)
+                # Quarantine the corrupt file so we don't loop the error
+                try:
+                    backup = SYNTHETIC_Q_CACHE_PATH.with_suffix(
+                        f".json.corrupt-{int(time.time())}"
+                    )
+                    SYNTHETIC_Q_CACHE_PATH.rename(backup)
+                except Exception:  # pragma: no cover - best-effort rescue
+                    pass
                 _synthetic_q_cache = OrderedDict()
         else:
             _synthetic_q_cache = OrderedDict()
@@ -2935,7 +2964,12 @@ def _load_synthetic_q_cache() -> dict[str, list[str]]:
 
 
 def _save_synthetic_q_cache() -> None:
-    """Persist synthetic questions cache to disk if dirty."""
+    """Persist synthetic questions cache to disk if dirty.
+
+    Uses atomic tmp+rename (same pattern as session save) so concurrent
+    writers can't truncate each other and produce JSONDecodeError on the
+    next load.
+    """
     global _synthetic_q_cache_dirty
     with _synthetic_q_cache_lock:
         if not _synthetic_q_cache_dirty or _synthetic_q_cache is None:
@@ -2943,7 +2977,19 @@ def _save_synthetic_q_cache() -> None:
         payload = json.dumps(_synthetic_q_cache, ensure_ascii=False)
         _synthetic_q_cache_dirty = False
     SYNTHETIC_Q_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SYNTHETIC_Q_CACHE_PATH.write_text(payload)
+    tmp = SYNTHETIC_Q_CACHE_PATH.with_suffix(
+        f".json.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        tmp.write_text(payload)
+        os.replace(tmp, SYNTHETIC_Q_CACHE_PATH)
+    except Exception:
+        # Don't leak tmp file if rename failed
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # pragma: no cover
+            pass
+        raise
 
 
 def _generate_synthetic_questions(text: str, title: str, folder: str) -> list[str] | None:
@@ -19588,6 +19634,11 @@ def _check_and_flag_contradictions(
 _CONTRA_PENDING_PATH = Path.home() / ".local/share/obsidian-rag" / "contradiction_pending.jsonl"
 _CONTRA_WRITERS_LOCK = threading.Lock()
 _CONTRA_WRITERS: "set[threading.Thread]" = set()
+# Set during shutdown so workers that haven't entered the chat call yet
+# bail early instead of pinning the drain. Was added in response to
+# `contradiction_shutdown_timeout` errors (~18/week pre-fix) where a chat
+# call mid-flight outlived the 10s drain budget.
+_CONTRA_SHUTDOWN_EVENT = threading.Event()
 # Env knob: set to "0" in tests that assert on post-index frontmatter state.
 # Default enabled — production code benefits from non-blocking index.
 _CONTRADICTION_ASYNC_ENV = os.environ.get("_CONTRADICTION_ASYNC", "1")
@@ -19623,6 +19674,22 @@ def _contradiction_worker_wrapper(
     boot can retry. We still remove ourselves from `_CONTRA_WRITERS` in
     the `finally` — the set must not leak threads.
     """
+    # Shutdown was already requested before we started — defer to pending
+    # so the next boot retries. Avoids spawning a 30-120s chat call during
+    # atexit drain that we know we can't wait for.
+    if _CONTRA_SHUTDOWN_EVENT.is_set():
+        try:
+            _append_pending_contradiction({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "path": str(path),
+                "text": text,
+                "doc_id_prefix": doc_id_prefix,
+                "error": "deferred-shutdown",
+            })
+        finally:
+            with _CONTRA_WRITERS_LOCK:
+                _CONTRA_WRITERS.discard(threading.current_thread())
+        return
     try:
         _check_and_flag_contradictions(col, path, text, doc_id_prefix)
     except Exception as exc:

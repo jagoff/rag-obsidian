@@ -32,6 +32,10 @@ import rag
 def _reset_tracker() -> None:
     with rag._CONTRA_WRITERS_LOCK:
         rag._CONTRA_WRITERS.clear()
+    # Clear the shutdown event in case a prior test (or a real atexit
+    # invocation in the suite) tripped it. Without this, every spawned
+    # worker would short-circuit to the "deferred-shutdown" branch.
+    rag._CONTRA_SHUTDOWN_EVENT.clear()
 
 
 def _register_fake_worker(work_time: float) -> threading.Thread:
@@ -153,6 +157,58 @@ def test_spawn_releases_on_check_exception(monkeypatch, tmp_path):
     rec = json.loads(lines[0])
     assert rec["doc_id_prefix"] == "y.md"
     assert "simulated failure" in rec["error"]
+
+
+def test_worker_defers_when_shutdown_event_set(monkeypatch, tmp_path):
+    """If `_CONTRA_SHUTDOWN_EVENT` was already set when the worker starts,
+    it must skip the chat call and write a `deferred-shutdown` entry to
+    the pending JSONL. Pre-fix, mid-flight 30-120s LLM calls during atexit
+    would produce `contradiction_shutdown_timeout` errors in telemetry.
+    """
+    _reset_tracker()
+
+    invocations: list[tuple] = []
+
+    def fake_check(col, path, text, doc_id):
+        invocations.append((col, path, text, doc_id))
+
+    monkeypatch.setattr(rag, "_check_and_flag_contradictions", fake_check)
+    pending = tmp_path / "contradiction_pending.jsonl"
+    monkeypatch.setattr(rag, "_CONTRA_PENDING_PATH", pending)
+
+    # Simulate the drain having fired before the worker started.
+    rag._CONTRA_SHUTDOWN_EVENT.set()
+    try:
+        t = rag._spawn_contradiction_worker(None, Path("/tmp/late.md"), "body", "late.md")
+        t.join(timeout=2.0)
+    finally:
+        rag._CONTRA_SHUTDOWN_EVENT.clear()
+
+    assert not t.is_alive()
+    # Chat call was skipped entirely.
+    assert invocations == []
+    # Pending file has a single deferred entry.
+    assert pending.is_file()
+    lines = [l for l in pending.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["error"] == "deferred-shutdown"
+    assert rec["doc_id_prefix"] == "late.md"
+
+
+def test_drain_sets_shutdown_event(monkeypatch):
+    """`_drain_contradiction_workers()` must flip the shutdown event so
+    in-flight workers can short-circuit. Verifies the event is set even
+    when there are no pending workers (the early-return branch)."""
+    _reset_tracker()
+    rag._CONTRA_SHUTDOWN_EVENT.clear()
+    assert not rag._CONTRA_SHUTDOWN_EVENT.is_set()
+
+    rag._drain_contradiction_workers(timeout=0.1)
+
+    assert rag._CONTRA_SHUTDOWN_EVENT.is_set()
+    # Reset for downstream tests.
+    rag._CONTRA_SHUTDOWN_EVENT.clear()
 
 
 # ── Dispatcher (sync vs async) ────────────────────────────────────────────

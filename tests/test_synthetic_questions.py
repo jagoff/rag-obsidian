@@ -19,6 +19,7 @@ Tests cubren:
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 
 import pytest
 
@@ -247,6 +248,45 @@ def test_cache_handles_corrupted_file(monkeypatch, tmp_path):
     monkeypatch.setattr(rag, "_synthetic_q_cache", None)
     cache = rag._load_synthetic_q_cache()
     assert cache == {}
+
+
+def test_cache_corrupted_file_is_quarantined(monkeypatch, tmp_path):
+    """A corrupted cache file must be renamed to `.corrupt-<ts>` so the
+    next read doesn't loop the same JSONDecodeError. Without this, every
+    process startup would log a fresh `synthetic_q_cache_load` error."""
+    tmp_cache = tmp_path / "synthetic_questions.json"
+    tmp_cache.write_text("{{not json")
+    monkeypatch.setattr(rag, "SYNTHETIC_Q_CACHE_PATH", tmp_cache)
+    monkeypatch.setattr(rag, "_synthetic_q_cache", None)
+
+    rag._load_synthetic_q_cache()
+
+    # Original file should be gone (renamed to backup).
+    assert not tmp_cache.is_file()
+    # Backup with `.corrupt-<digits>` suffix must exist.
+    backups = list(tmp_path.glob("synthetic_questions.json.corrupt-*"))
+    assert len(backups) == 1
+    # Content of backup must match original corrupt payload.
+    assert backups[0].read_text() == "{{not json"
+
+
+def test_cache_save_uses_atomic_tmp_rename(monkeypatch, tmp_path):
+    """Writes must go through tmp+rename so concurrent writers can never
+    truncate each other into a half-written JSON. Side effect we observe:
+    after save, no `.tmp` files leak in the cache dir."""
+    tmp_cache = tmp_path / "synthetic_questions.json"
+    monkeypatch.setattr(rag, "SYNTHETIC_Q_CACHE_PATH", tmp_cache)
+    monkeypatch.setattr(rag, "_synthetic_q_cache", OrderedDict({"h": ["¿q?"]}))
+    monkeypatch.setattr(rag, "_synthetic_q_cache_dirty", True)
+
+    rag._save_synthetic_q_cache()
+
+    # Final file must be valid JSON.
+    assert tmp_cache.is_file()
+    assert json.loads(tmp_cache.read_text()) == {"h": ["¿q?"]}
+    # No .tmp residue should have leaked.
+    leftovers = list(tmp_path.glob("*.tmp.*"))
+    assert leftovers == []
 
 
 # ── INTEGRACIÓN CON semantic_chunks ──────────────────────────────────────────

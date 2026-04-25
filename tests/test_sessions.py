@@ -195,6 +195,28 @@ def test_load_session_returns_none_on_corrupt_json(sessions_tmp):
     assert rag.load_session("broken") is None
 
 
+def test_load_session_quarantines_corrupt_file(sessions_tmp):
+    """A corrupt session file must be renamed to `.corrupt-<ts>` so the
+    next load doesn't loop the same JSONDecodeError. Pre-fix, every chat
+    boot would re-log `session_load_json` on the same broken file (~60
+    errors/day in the production telemetry as of the 2026-04-25 audit)."""
+    sdir, _ = sessions_tmp
+    sdir.mkdir(parents=True, exist_ok=True)
+    sess_file = sdir / "ghost.json"
+    sess_file.write_text("{ corrupt", encoding="utf-8")
+
+    assert rag.load_session("ghost") is None
+
+    # Original gone, corrupt-prefixed sibling must exist.
+    assert not sess_file.is_file()
+    backups = list(sdir.glob("ghost.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{ corrupt"
+
+    # Subsequent load on the same id is now a clean None (no file at all).
+    assert rag.load_session("ghost") is None
+
+
 def test_save_session_is_atomic_no_tmp_leftover(sessions_tmp):
     sdir, _ = sessions_tmp
     sess = rag.ensure_session("atomic", mode="chat")

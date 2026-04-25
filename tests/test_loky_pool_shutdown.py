@@ -168,3 +168,36 @@ def test_shutdown_calls_gc_collect():
         f"gc.collect() not called inside _shutdown_joblib_loky_pool "
         f"(call count: {calls['n']})"
     )
+
+
+def test_tqdm_lock_preset_at_import_time():
+    """Audit empírico 2026-04-25: el leak `/loky-PID-XXX` que vimos en
+    `web.error.log` (247 acumulados) NO venía de joblib pools — venía
+    de `tqdm.std.create_mp_lock()` que sentence-transformers triggea
+    al cargar el reranker. Joblib monkey-patcha el naming para que
+    todos los SemLocks (incluso de tqdm) usen el prefix `/loky-`.
+
+    El fix preventivo: setear `tqdm.tqdm._lock` a un threading.RLock
+    ANTES de cualquier import pesado, lo que skipea
+    `TqdmDefaultWriteLock()` (donde se crea el POSIX SemLock).
+
+    Este test verifica que el preset está aplicado: `tqdm.tqdm._lock`
+    debe ser un threading lock, NO el `TqdmDefaultWriteLock` con su
+    `mp_lock` POSIX.
+    """
+    import threading
+    import tqdm as _tqdm
+    import web.server  # noqa: F401  (force the module-level set_lock)
+
+    # Después del import, _lock debe estar pre-set a un threading lock,
+    # NO al TqdmDefaultWriteLock que crearía el mp_lock POSIX.
+    assert hasattr(_tqdm.tqdm, "_lock"), "tqdm._lock no existe — preset perdido"
+    lock = _tqdm.tqdm._lock
+    # Threading.RLock devuelve _thread.RLock o threading._RLock dependiendo
+    # de la versión de Python. Lo importante es que NO sea un
+    # TqdmDefaultWriteLock (la que crea el SemLock POSIX).
+    assert _tqdm.tqdm._lock.__class__.__name__ != "TqdmDefaultWriteLock", (
+        f"tqdm._lock es {type(lock).__name__} — expected threading.RLock. "
+        f"Eso significa que algo llamó tqdm.get_lock() ANTES del preset y "
+        f"creó el SemLock POSIX."
+    )

@@ -21,6 +21,41 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+# === LOKY SEMAPHORE LEAK FIX (2026-04-25) ===================================
+# `tqdm` (transitively pulled by sentence-transformers / transformers) crea
+# un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` para
+# coordinar progress bars en multi-process. Ese RLock es un POSIX named
+# semaphore que NO se libera al shutdown del web daemon — Python no tiene
+# atexit hook que lo unlinkee.
+#
+# Adicionalmente, `joblib.externals.loky.backend.__init__` monkey-patcha
+# `multiprocessing.synchronize.SemLock._make_name` para que TODOS los
+# SemLocks creados después usen el prefix `/loky-PID-XXX`. Resultado: la
+# warning `leaked semaphore objects: {/loky-PID-XXX}` aparece en cada
+# clean shutdown del web daemon — 247 leaks acumulados en `web.error.log`
+# pre-fix.
+#
+# Trace empírico (2026-04-25 con monkey-patch de SemLock.__init__) confirma:
+# el SemLock se crea en `tqdm/std.py:121 create_mp_lock` durante el primer
+# `cls.get_lock()` que dispara sentence-transformers al cargar el reranker.
+#
+# Fix: pre-set el lock de tqdm a un `threading.RLock` (in-process, no
+# semaphore POSIX) ANTES de que cualquier dep pesado (sentence-transformers,
+# transformers, etc.) toque tqdm. La condición `not hasattr(cls, '_lock')`
+# en `tqdm.tqdm.get_lock()` deja nuestro lock alone y nunca llama
+# `TqdmDefaultWriteLock()` que es donde se crea el SemLock.
+#
+# Side effect: las progress bars de tqdm en este proceso ya no son
+# inter-process safe — pero el web daemon es single-process (uvicorn con
+# workers=1), así que no hay loss real. Si alguna vez se introduce
+# multi-process workers, este lock necesita re-evaluación.
+try:
+    import tqdm as _tqdm
+    _tqdm.tqdm.set_lock(threading.RLock())
+except Exception:  # pragma: no cover - tqdm not installed
+    pass
+# === END LOKY SEMAPHORE LEAK FIX ============================================
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles

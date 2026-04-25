@@ -19,15 +19,14 @@ import rag
 
 
 @pytest.fixture
-def clean_cache_env(monkeypatch):
+def clean_cache_env(monkeypatch, tmp_path):
     monkeypatch.setenv("RAG_CACHE_ENABLED", "1")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_COSINE", 0.95)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_DEFAULT_TTL", 86400)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_RECENT_TTL", 600)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_MAX_ROWS", 100)
-    rag.semantic_cache_clear()
     yield
-    rag.semantic_cache_clear()
 
 
 def _emb(*floats: float, dim: int = 64):

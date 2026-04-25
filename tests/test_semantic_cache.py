@@ -34,17 +34,21 @@ import rag
 
 
 @pytest.fixture
-def clean_cache_env(monkeypatch):
-    """Ensure every test runs with the cache ENABLED and default thresholds."""
+def clean_cache_env(monkeypatch, tmp_path):
+    """Ensure every test runs with the cache ENABLED and default thresholds.
+
+    Redirects ``rag.DB_PATH`` to a tmp dir so ``semantic_cache_store`` /
+    ``_lookup`` / ``_clear`` operate on an isolated telemetry.db. Pre-fix
+    these tests wrote to the real prod telemetry.db (audit 2026-04-25:
+    5 rows con question="test" filtradas a producción).
+    """
     monkeypatch.setenv("RAG_CACHE_ENABLED", "1")
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_COSINE", 0.97)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_DEFAULT_TTL", 86400)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_RECENT_TTL", 600)
     monkeypatch.setattr(rag, "_SEMANTIC_CACHE_MAX_ROWS", 100)
-    # Clear any previous cache state from other tests.
-    rag.semantic_cache_clear()
     yield
-    rag.semantic_cache_clear()
 
 
 def _emb(*floats: float, dim: int = 1024):

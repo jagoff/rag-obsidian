@@ -17,28 +17,10 @@ import rag
 
 
 @pytest.fixture
-def clean_cache_env(monkeypatch):
+def clean_cache_env(monkeypatch, tmp_path):
     monkeypatch.setenv("RAG_CACHE_ENABLED", "1")
-    rag.semantic_cache_clear()
-    # Limpiar rag_queries recientes para que el test no herede ruido real.
-    try:
-        with rag._ragvec_state_conn() as conn:
-            conn.execute(
-                "DELETE FROM rag_queries WHERE q LIKE 'telemetry_test_%'"
-            )
-            conn.commit()
-    except Exception:
-        pass
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "ragvec")
     yield
-    rag.semantic_cache_clear()
-    try:
-        with rag._ragvec_state_conn() as conn:
-            conn.execute(
-                "DELETE FROM rag_queries WHERE q LIKE 'telemetry_test_%'"
-            )
-            conn.commit()
-    except Exception:
-        pass
 
 
 def _insert_query(q: str, cache_hit: bool, reason: str, t_gen_s: float = 5.0,

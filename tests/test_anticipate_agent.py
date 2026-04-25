@@ -10,7 +10,6 @@ Cubre:
 - Disabled flag + threshold env override
 """
 
-import os
 from dataclasses import FrozenInstanceError, asdict
 from datetime import datetime, timedelta
 from pathlib import Path

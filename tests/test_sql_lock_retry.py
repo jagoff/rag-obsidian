@@ -29,10 +29,8 @@ default sólo — el llamador sigue llamando ``_sql_write_with_retry(_do,
 from __future__ import annotations
 
 import sqlite3
-import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 import rag
 

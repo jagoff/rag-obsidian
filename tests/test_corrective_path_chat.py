@@ -17,9 +17,7 @@ record_feedback plumbing is validated separately in test_feedback.py.
 """
 from __future__ import annotations
 
-from unittest.mock import patch, MagicMock
 
-import pytest
 
 import rag
 

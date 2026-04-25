@@ -12,7 +12,6 @@ Validates:
 6. chat() citation-repair + critique use _postprocess_model() too
 7. Default _CITATION_REPAIR_MAX_BAD lowered to 2
 """
-import importlib
 import os
 
 import pytest

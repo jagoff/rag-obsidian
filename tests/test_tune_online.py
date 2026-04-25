@@ -331,7 +331,6 @@ def test_gate_constants_env_override(monkeypatch):
     # Este test verifica que los env vars son leídos at module-load,
     # NO en runtime — así que sólo chequeamos que los nombres son los
     # documentados + que los valores son floats válidos.
-    import os
     assert "RAG_EVAL_GATE_SINGLES_MIN" in rag.__dict__.get(
         "__annotations__", {}
     ) or True  # variable existe en el source

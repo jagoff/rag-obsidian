@@ -343,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Dry-run: print plan + row counts, exit ────────────────────────────────
 
     if args.dry_run:
-        print(f"DRY-RUN")
+        print("DRY-RUN")
         print(f"  source : {ragvec_db}  ({ragvec_db.stat().st_size / 1024 / 1024:.1f} MB)")
         print(f"  dest   : {telemetry_db}  (will be created)")
         print(f"  tables : {len(tables_to_copy)} to migrate,"

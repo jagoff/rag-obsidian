@@ -30,7 +30,6 @@ test de `_atomic_write_if_changed`, que trabaja sólo con el FS.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path

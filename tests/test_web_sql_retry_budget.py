@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import pytest
 
-import rag
 from web import server as server_mod
 
 

@@ -9,7 +9,6 @@ single vault, sin source/folder/tag/filter, sin critique/counter).
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pytest

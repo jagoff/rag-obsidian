@@ -8,7 +8,6 @@ fila se skippea (reason='stale_source') sin tumbar el resto del cache.
 """
 from __future__ import annotations
 
-import os
 import time
 
 import numpy as np

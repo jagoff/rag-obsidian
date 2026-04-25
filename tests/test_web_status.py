@@ -836,7 +836,7 @@ def test_logs_build_extracts_exc_type_from_sql_repr(tmp_path, monkeypatch):
     """Para sql_state_errors el `err` es repr() del exception. Verifica
     que el regex extrae correctamente el exc_type prefix y limpia el
     mensaje (sin las comillas del repr)."""
-    from datetime import datetime, timedelta
+    from datetime import datetime
     silent_log = tmp_path / "silent_errors.jsonl"
     sql_log = tmp_path / "sql_state_errors.jsonl"
     monkeypatch.setattr(_server, "SILENT_ERRORS_LOG_PATH", silent_log)

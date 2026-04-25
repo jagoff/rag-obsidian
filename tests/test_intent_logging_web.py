@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -87,7 +87,6 @@ def test_web_has_intent_classifier_wired_in_pipeline():
     """Regression guard: el web server debe tener `_rag.classify_intent`
     accesible. Si alguien remueve el import fallará acá antes de afectar
     producción."""
-    import importlib
     # web/server.py siempre importa rag; chequeamos que classify_intent
     # es una función callable (no un string u otro sentinel).
     assert callable(rag.classify_intent)

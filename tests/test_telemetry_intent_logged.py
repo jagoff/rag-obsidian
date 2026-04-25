@@ -8,7 +8,6 @@ Post-fix: cada path de query() loguea `intent` en extra_json.
 """
 from __future__ import annotations
 
-import pytest
 from click.testing import CliRunner
 
 import rag

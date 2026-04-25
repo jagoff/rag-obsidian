@@ -25,7 +25,6 @@ Cubre regresiones reales que tuvimos:
 from __future__ import annotations
 from pathlib import Path
 
-import pytest
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
 _STYLE_CSS = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")

@@ -36,7 +36,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 from click.testing import CliRunner
 
 import rag
@@ -247,8 +246,8 @@ def test_cli_skips_warmup_for_non_retrieve_subcommand():
         result = runner.invoke(rag.cli, ["vault", "--help"])
         assert result.exit_code == 0, result.output
         assert fired["count"] == 0, (
-            f"warmup_async se disparó para `rag vault --help` — vault es "
-            f"un group de administración, no debe pagar warmup"
+            "warmup_async se disparó para `rag vault --help` — vault es "
+            "un group de administración, no debe pagar warmup"
         )
 
 

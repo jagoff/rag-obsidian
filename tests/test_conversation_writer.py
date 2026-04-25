@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 import rag
-from web import conversation_writer
 from web.conversation_writer import (
     TurnData,
     get_conversation_path,

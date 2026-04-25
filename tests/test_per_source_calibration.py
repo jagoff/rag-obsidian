@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 from click.testing import CliRunner

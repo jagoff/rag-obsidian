@@ -30,8 +30,6 @@ de conversación/log — 0 llamadas de red, 0 llamadas al daemon real.
 """
 from __future__ import annotations
 
-import json
-import re
 from types import SimpleNamespace
 
 import pytest

@@ -21,7 +21,6 @@ Sin red ni ollama real: todos los VLM calls están mockeados vía
 """
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

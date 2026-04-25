@@ -7,7 +7,6 @@ Override para dev: `OBSIDIAN_RAG_STATIC_NO_CACHE=1` → max-age=0.
 from __future__ import annotations
 
 import importlib
-import os
 
 from fastapi.testclient import TestClient
 

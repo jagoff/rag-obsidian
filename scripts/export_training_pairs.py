@@ -452,7 +452,7 @@ def _print_stats(stats: dict, file=None) -> None:
     print(f"== Training-pair export — {stats['days_window']}d window ==", file=file)
     print(f"  Pairs total: {stats['total_pairs']}", file=file)
     print(f"  Unique queries: {stats['unique_queries']}", file=file)
-    print(f"  Source breakdown:", file=file)
+    print("  Source breakdown:", file=file)
     for src, n in sorted(stats["by_source"].items(), key=lambda kv: -kv[1]):
         print(f"    {src:30s} {n}", file=file)
     print(f"  Underlying rows: "

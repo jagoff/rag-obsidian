@@ -30,7 +30,6 @@ Invariants esperados:
 from __future__ import annotations
 
 import json
-import pytest
 
 
 def _import_helper():

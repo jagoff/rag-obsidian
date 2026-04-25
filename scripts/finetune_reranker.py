@@ -43,7 +43,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -561,7 +560,7 @@ def main():
         print(f"    Chains  delta: {(ft['chains_hit5']-base['chains_hit5'])*100:+.1f}pp",
               file=sys.stderr)
     else:
-        print(f"  [gate] ✗ regression detected. NOT promoting.", file=sys.stderr)
+        print("  [gate] ✗ regression detected. NOT promoting.", file=sys.stderr)
         print(f"    singles_ok={singles_ok} chains_ok={chains_ok}", file=sys.stderr)
         print(f"    Model kept at {out_dir} for inspection — remove manually.",
               file=sys.stderr)

@@ -76,7 +76,7 @@ obsidian-rag-mcp = "mcp_server:main"
 
 [tool.setuptools]
 py-modules = ["rag", "mcp_server"]
-packages = ["scripts", "web"]
+packages = ["scripts", "web", "rag_anticipate", "rag_anticipate.signals"]
 
 # Include prompts/**/*.md in the installed tool bundle. Without this,
 # `uv tool install --editable .` copies rag.py but skips the prompts/

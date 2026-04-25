@@ -9,9 +9,7 @@ Validates:
 from __future__ import annotations
 
 import json
-import os
 
-import pytest
 from click.testing import CliRunner
 
 import rag

@@ -19,10 +19,8 @@ Validates the helpers in isolation (using a temp telemetry DB):
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
-from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pytest

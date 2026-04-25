@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
 
-import pytest
 from click.testing import CliRunner
 
 import rag

@@ -20433,10 +20433,31 @@ def _anticipate_signal_commitment(now: datetime) -> list["AnticipatoryCandidate"
 
 # Tuple de (kind_label_corto, signal_fn). El orden NO importa para el outcome
 # porque después se filtra por score; pero el log respeta este orden.
-_ANTICIPATE_SIGNALS: tuple[tuple[str, "Callable[[datetime], list[AnticipatoryCandidate]]"], ...] = (
+#
+# Las 3 señales originales (calendar / echo / commitment) viven acá por
+# histórico. Señales NUEVAS van en `rag_anticipate/signals/<kind>.py` y se
+# auto-registran vía el decorator `@register_signal` — leemos la lista
+# `rag_anticipate.SIGNALS` al final y la concatenamos. Silent-fail si el
+# package no carga (ej. tests sin el folder): core sigue funcionando.
+_ANTICIPATE_CORE_SIGNALS: tuple[tuple[str, "Callable[[datetime], list[AnticipatoryCandidate]]"], ...] = (
     ("calendar", _anticipate_signal_calendar),
     ("echo", _anticipate_signal_echo),
     ("commitment", _anticipate_signal_commitment),
+)
+
+try:
+    import rag_anticipate as _rag_anticipate_pkg
+    _ANTICIPATE_EXTRA_SIGNALS: tuple = tuple(_rag_anticipate_pkg.SIGNALS)
+except Exception as _exc:
+    _ANTICIPATE_EXTRA_SIGNALS = ()
+    try:
+        _silent_log("anticipate_extra_signals_load", _exc)
+    except Exception:
+        pass
+
+_ANTICIPATE_SIGNALS: tuple[tuple[str, "Callable[[datetime], list[AnticipatoryCandidate]]"], ...] = (
+    *_ANTICIPATE_CORE_SIGNALS,
+    *_ANTICIPATE_EXTRA_SIGNALS,
 )
 
 

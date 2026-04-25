@@ -30,7 +30,6 @@ import json
 import pytest
 
 import rag
-from web import server as server_mod
 from web import tools as tools_mod
 from web.server import (
     _SOURCE_INTENT_META,

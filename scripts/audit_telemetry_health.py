@@ -187,6 +187,177 @@ def _audit_cache_health(conn: sqlite3.Connection, days: int) -> dict:
     }
 
 
+def check_anticipate_health(conn: sqlite3.Connection, days: int = 7) -> dict:
+    """Health check del Anticipatory Agent (rag_anticipate_candidates).
+
+    Detecta automáticamente las cuatro patologías que importan en prod:
+
+    1. **Send rate global bajo (<5%)** con suficiente muestra (≥30 rows
+       evaluated) → status="degraded". Significa que el agente está
+       evaluando candidates pero el orchestrator descarta casi todos
+       (threshold mal calibrado, dedup demasiado agresivo, quiet hours
+       mal seteado).
+    2. **Última emit muy vieja (>24h)** → status="stale". El daemon
+       parece down — ningún signal disparó en >1 día. El nombre
+       "last_emit_age_hours" sigue la convención del Anticipatory
+       Agent: una "emit" es una row con sent=1.
+    3. **Signals "silent"** (≥1 evaluated en la ventana, 0 emits) — la
+       signal corre pero nunca dispara. Threshold mal puesto, signal
+       rota, o feature deshabilitada. Se loguea como issue per-signal.
+    4. **Signals "noisy"** (>10 emits con avg_score <0.3) — la signal
+       dispara mucho con poca confianza. Likely false positive farm —
+       hay que subir el threshold o agregar un dedup más estricto.
+
+    Ver `# ── ANTICIPATORY AGENT ──` en rag.py para el diseño del
+    sistema de signals + scoring + threshold.
+
+    Returns un dict JSON-serializable. Status mapping:
+    - "unknown": tabla missing o 0 rows totales (agente nunca corrió)
+    - "stale":   last_emit_age_hours > 24 (daemon parece down)
+    - "degraded": send_rate <0.05 con ≥30 evaluated en la ventana
+    - "healthy": caso normal
+    """
+    out: dict = {
+        "status": "unknown",
+        "window_days": days,
+        "total_evaluated": 0,
+        "total_sent": 0,
+        "send_rate": 0.0,
+        "last_emit_age_hours": None,
+        "issues": [],
+        "by_signal": {},
+    }
+
+    # 1) Tabla existe?
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_anticipate_candidates'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["issues"].append(f"sql_error: {exc!r}")
+        return out
+    if exists is None:
+        out["issues"].append("table missing: rag_anticipate_candidates")
+        return out
+
+    # 2) ¿Alguna vez corrió? (separado del window check para distinguir
+    # "nunca corrió" de "no corrió en los últimos N días").
+    total_ever = conn.execute(
+        "SELECT COUNT(*) FROM rag_anticipate_candidates"
+    ).fetchone()[0]
+    if not total_ever:
+        out["issues"].append(
+            "0 rows in rag_anticipate_candidates — agent never ran"
+        )
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 3) Totales en la ventana
+    row = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(sent), 0) "
+        "FROM rag_anticipate_candidates WHERE ts >= ?",
+        (cutoff_iso,),
+    ).fetchone()
+    total_evaluated = int(row[0] or 0)
+    total_sent = int(row[1] or 0)
+    out["total_evaluated"] = total_evaluated
+    out["total_sent"] = total_sent
+    out["send_rate"] = (
+        round(total_sent / total_evaluated, 4) if total_evaluated else 0.0
+    )
+
+    # 4) Última emit (sent=1) — across all time, así detectamos un daemon
+    # down aunque la ventana sea chica.
+    last_emit_ts = conn.execute(
+        "SELECT MAX(ts) FROM rag_anticipate_candidates WHERE sent = 1"
+    ).fetchone()[0]
+    if last_emit_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_emit_ts)
+            age_h = (datetime.now() - last_dt).total_seconds() / 3600.0
+            out["last_emit_age_hours"] = round(age_h, 2)
+        except (ValueError, TypeError):
+            # ts mal formado — silent fail, dejamos None y seguimos.
+            pass
+
+    # 5) Per-signal breakdown — emits, avg_score, send_rate y status
+    sig_rows = conn.execute(
+        "SELECT kind, COUNT(*), COALESCE(SUM(sent), 0), AVG(score), "
+        "       MAX(CASE WHEN sent = 1 THEN ts END) "
+        "FROM rag_anticipate_candidates "
+        "WHERE ts >= ? "
+        "GROUP BY kind "
+        "ORDER BY COUNT(*) DESC",
+        (cutoff_iso,),
+    ).fetchall()
+
+    by_signal: dict = {}
+    for r in sig_rows:
+        kind = r[0]
+        n = int(r[1] or 0)
+        emits = int(r[2] or 0)
+        avg_score = float(r[3] or 0.0)
+        last_ts_signal = r[4]
+
+        if emits == 0:
+            sig_status = "silent"
+        elif emits > 10 and avg_score < 0.3:
+            sig_status = "noisy"
+        else:
+            sig_status = "healthy"
+            if last_ts_signal:
+                try:
+                    age_signal = (
+                        datetime.now()
+                        - datetime.fromisoformat(last_ts_signal)
+                    ).total_seconds() / 3600.0
+                    if age_signal > 24:
+                        sig_status = "stale"
+                except (ValueError, TypeError):
+                    pass
+
+        by_signal[kind] = {
+            "evaluated": n,
+            "emits": emits,
+            "avg_score": round(avg_score, 4),
+            "send_rate": round(emits / n, 4) if n else 0.0,
+            "status": sig_status,
+        }
+
+        if sig_status == "silent":
+            out["issues"].append(
+                f"silent signal: {kind} (0 emits / {n} evaluated in last {days}d)"
+            )
+        elif sig_status == "noisy":
+            out["issues"].append(
+                f"noisy signal: {kind} ({emits} emits, avg_score={avg_score:.2f} <0.3)"
+            )
+
+    out["by_signal"] = by_signal
+
+    # 6) Status global — orden de precedencia: stale > degraded > healthy
+    if (
+        out["last_emit_age_hours"] is not None
+        and out["last_emit_age_hours"] > 24
+    ):
+        out["status"] = "stale"
+        out["issues"].append(
+            f"last emit {out['last_emit_age_hours']:.1f}h ago — daemon may be down"
+        )
+    elif total_evaluated >= 30 and out["send_rate"] < 0.05:
+        out["status"] = "degraded"
+        out["issues"].append(
+            f"low send rate: {out['send_rate'] * 100:.1f}% with "
+            f"{total_evaluated} evaluated (threshold: <5% with ≥30 rows)"
+        )
+    else:
+        out["status"] = "healthy"
+
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -290,6 +461,45 @@ def _render_text(report: dict) -> str:
                 )
         out.append("")
 
+    # Anticipatory agent
+    ant = report.get("anticipate")
+    if ant is not None:
+        status = (ant.get("status") or "unknown").upper()
+        sent = ant.get("total_sent", 0)
+        ev = ant.get("total_evaluated", 0)
+        rate_pct = (ant.get("send_rate") or 0.0) * 100
+        last_age = ant.get("last_emit_age_hours")
+        if status == "STALE":
+            last_str = (
+                f"last emit {last_age:.0f}h ago — daemon may be down"
+                if last_age is not None
+                else "no emits ever — daemon may be down"
+            )
+            out.append(f"🤖 Anticipate: {status} | {last_str}")
+        elif status == "UNKNOWN":
+            issues = "; ".join(ant.get("issues") or []) or "no data"
+            out.append(f"🤖 Anticipate: {status} | {issues}")
+        else:
+            last_str = (
+                f"last emit {last_age:.0f}h ago"
+                if last_age is not None
+                else "no emits yet"
+            )
+            out.append(
+                f"🤖 Anticipate: {status} | {ev} evaluated, "
+                f"{sent} sent ({rate_pct:.0f}%), {last_str}"
+            )
+        # Per-signal one-liner para signals con problemas
+        for kind, info in (ant.get("by_signal") or {}).items():
+            sig_st = info.get("status")
+            if sig_st in ("silent", "noisy", "stale"):
+                out.append(
+                    f"     ⚠️  {kind}: {sig_st} "
+                    f"(emits={info.get('emits')}, evaluated={info.get('evaluated')}, "
+                    f"avg_score={info.get('avg_score')})"
+                )
+        out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -322,7 +532,36 @@ def _render_text(report: dict) -> str:
             "  • Cache table casi vacía — chequear gates en run_chat_turn / "
             "_semantic_eligible. ¿Demasiado restrictivo?"
         )
-    if not err.get("total_errors") and not (lat and lat.get("outliers")):
+    if ant is not None:
+        ant_status = (ant.get("status") or "").lower()
+        if ant_status == "stale":
+            out.append(
+                "  • Anticipate STALE — el daemon parece down. Revisar "
+                "`launchctl list | grep anticipate` y los logs en "
+                "~/Library/Logs/com.fer.obsidian-rag-anticipate.log."
+            )
+        elif ant_status == "degraded":
+            out.append(
+                "  • Anticipate DEGRADED — send_rate <5%. Revisar threshold "
+                "(_ANTICIPATE_THRESHOLD), dedup window y quiet hours."
+            )
+        elif ant_status == "unknown":
+            out.append(
+                "  • Anticipate UNKNOWN — tabla missing o agente nunca corrió. "
+                "Validar que el daemon esté instalado."
+            )
+        elif (ant.get("issues") or []):
+            # healthy global pero con per-signal issues
+            n_issues = len(ant.get("issues") or [])
+            out.append(
+                f"  • Anticipate healthy global, pero {n_issues} signal "
+                f"issue(s) — revisar la sección 🤖 arriba (silent / noisy)."
+            )
+    if (
+        not err.get("total_errors")
+        and not (lat and lat.get("outliers"))
+        and (ant is None or ant.get("status") == "healthy")
+    ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
     return "\n".join(out)
@@ -354,14 +593,19 @@ def main() -> int:
     if conn is None:
         report["query_latency"] = None
         report["cache_health"] = None
+        report["anticipate"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
             report["query_latency"] = _audit_query_latency(conn, args.days)
             report["cache_health"] = _audit_cache_health(conn, args.days)
+            # rag_anticipate_candidates vive en la misma telemetry.db,
+            # así que reusamos la conexión.
+            report["anticipate"] = check_anticipate_health(conn, args.days)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
+            report["anticipate"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

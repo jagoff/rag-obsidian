@@ -33,10 +33,7 @@ touches ollama / sqlite / iCalBuddy / Gmail / weather APIs.
 """
 from __future__ import annotations
 
-import json
-import re
 import time
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -716,7 +713,6 @@ def test_hydrate_home_compute_history_from_sql(isolate_home_metrics_sql):
             " elapsed_s REAL NOT NULL, regenerate INTEGER NOT NULL DEFAULT 0,"
             " degraded INTEGER NOT NULL DEFAULT 0, degraded_cause TEXT)"
         )
-        from datetime import datetime
         for i, v in enumerate([3.0, 4.0, 5.0, 6.0, 7.0]):
             conn.execute(
                 "INSERT INTO rag_home_compute_metrics(ts, elapsed_s) VALUES(?, ?)",

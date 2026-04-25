@@ -39446,7 +39446,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
         console.print()
         console.print(f"[bold cyan]▶ [{i}/{total_steps}][/bold cyan] {label}")
         if dry_run:
-            console.print(f"  [dim]dry-run: skippeado[/dim]")
+            console.print("  [dim]dry-run: skippeado[/dim]")
             continue
         step_start = time.perf_counter()
         try:
@@ -39472,7 +39472,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
         console.print()
         console.print(f"[bold cyan]▶ [{idx}/{total_steps}][/bold cyan] ollama warmup")
         if dry_run:
-            console.print(f"  [dim]dry-run: skippeado[/dim]")
+            console.print("  [dim]dry-run: skippeado[/dim]")
         else:
             step_start = time.perf_counter()
             try:
@@ -44433,7 +44433,7 @@ def _render_session_to_markdown(sess: dict, *, include_sources: bool = True) -> 
     lines.append(f"n_turns: {len(turns)}")
     lines.append(f"mode: {sess.get('mode', 'chat')}")
     lines.append("tags: [conversation, rag-export]")
-    lines.append(f"source: rag session export")
+    lines.append("source: rag session export")
     lines.append("---")
     lines.append("")
     lines.append(f"# {title}")
@@ -44550,7 +44550,7 @@ def session_export(
     try:
         col = get_db()
         _index_single_file(col, target_path)
-        console.print(f"  [dim]reindexed OK[/dim]")
+        console.print("  [dim]reindexed OK[/dim]")
     except Exception:
         pass
 
@@ -48867,7 +48867,7 @@ def context_estimate(
         return
     console.print()
     color = {"ok": "green", "warn": "yellow", "over": "red"}[budget["level"]]
-    console.print(f"[bold]Token estimate[/bold]")
+    console.print("[bold]Token estimate[/bold]")
     console.print(f"  chars:    {len(text):,}")
     console.print(f"  tokens:   [cyan]~{tokens:,}[/cyan]")
     console.print(f"  num_ctx:  {num_ctx:,}")
@@ -49077,7 +49077,7 @@ def paraphrases_stats(limit: int):
         console.print(f"[red]Error: {exc!r}[/red]")
         return
     console.print()
-    console.print(f"[bold]Learned paraphrases[/bold]")
+    console.print("[bold]Learned paraphrases[/bold]")
     console.print(f"  Total: [cyan]{total}[/cyan]  "
                   f"| Trusted (≥{_LEARNED_PARA_MIN_HITS} hits): "
                   f"[green]{trusted}[/green]")
@@ -49429,7 +49429,6 @@ def health_cli(since_hours: int, as_json: bool):
         click.echo(json.dumps(payload, default=str))
         return
 
-    from rich.table import Table
     console.print()
     console.print("[bold cyan]RAG Health Dashboard[/bold cyan]  "
                   f"[dim]({payload['ts']})[/dim]")
@@ -49467,7 +49466,7 @@ def health_cli(since_hours: int, as_json: bool):
     gate_target = _FEEDBACK_GATE_TARGET
     gate_remaining = max(0, gate_target - fb["with_cp"])
     gate_str = (
-        f"[green](gate open!)[/green]" if gate_remaining == 0
+        "[green](gate open!)[/green]" if gate_remaining == 0
         else f"[yellow]faltan {gate_remaining}[/yellow]"
     )
     console.print(
@@ -49525,8 +49524,8 @@ def health_cli(since_hours: int, as_json: bool):
         )
     else:
         console.print(
-            f"[bold]Calibration[/bold]: [dim]ninguna source entrenada "
-            f"(correr `rag calibrate`)[/dim]"
+            "[bold]Calibration[/bold]: [dim]ninguna source entrenada "
+            "(correr `rag calibrate`)[/dim]"
         )
 
     # ── Features opt-in
@@ -50021,7 +50020,6 @@ _SPANISH_STOPWORDS = frozenset([
 def _extract_trends(days: int = 7, top_n: int = 10) -> dict:
     """Aggregate recent queries into trends by folder, tags, and keywords."""
     from collections import Counter
-    from datetime import datetime as _dt
     out = {
         "days": days,
         "n_queries": 0,
@@ -50183,8 +50181,7 @@ def _hygiene_scan(
     Stale: file mtime > stale_days ago.
     Huérfanas: path not in any note's outlinks (= sin backlinks).
     """
-    from datetime import datetime as _dt, timezone as _tz
-    import math
+    from datetime import datetime as _dt
     result = {
         "total_notes": 0,
         "sin_tags": [],
@@ -50531,10 +50528,10 @@ def auto_tag_cli(
                 if ok:
                     applied_count += 1
                     if not as_json:
-                        console.print(f"  [green]✓ written[/green]")
+                        console.print("  [green]✓ written[/green]")
                 else:
                     if not as_json:
-                        console.print(f"  [red]✗ write failed[/red]")
+                        console.print("  [red]✗ write failed[/red]")
         results.append(entry)
 
     if as_json:

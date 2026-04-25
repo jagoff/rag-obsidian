@@ -367,7 +367,13 @@ def test_propose_send_note_empty_query(monkeypatch, tmp_path):
 
 
 def test_tool_registered_in_chat_tools():
-    assert rag.propose_whatsapp_send_note in _tools.CHAT_TOOLS
+    # Usamos `_tools.propose_whatsapp_send_note` (no `rag.propose_...`) en el
+    # lado izquierdo para que ambos operandos del `in` vengan del mismo
+    # módulo. Tests previos que hacen `importlib.reload(rag)` (ej. en
+    # test_adaptive_fast_path.py, test_deep_retrieve.py) dejan `rag.X` y
+    # `_tools.CHAT_TOOLS[...]` apuntando a function objects distintos —
+    # `_tools` no se reloadea, así que su referencia interna sigue válida.
+    assert _tools.propose_whatsapp_send_note in _tools.CHAT_TOOLS
     assert "propose_whatsapp_send_note" in _tools.TOOL_FNS
 
 

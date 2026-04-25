@@ -8266,19 +8266,19 @@ def transcripts_dashboard() -> HTMLResponse:
     avg_lp_str = f"{avg_lp_30d:.3f}" if avg_lp_30d is not None else "—"
     avg_dur_str = f"{avg_dur_30d:.1f}s" if avg_dur_30d is not None else "—"
 
-    # Tabla histogram
+    # Tabla histogram — barras usan width inline (data-driven) + class .bar (color del theme).
     max_hist = max((n for _, n in hist), default=1)
     hist_rows = "\n".join(
         f'<tr><td>{_esc(label)}</td>'
         f'<td style="text-align:right">{n}</td>'
-        f'<td><div style="background:#4a90e2;height:14px;width:{int(200 * n / max(1, max_hist))}px;"></div></td></tr>'
+        f'<td><div class="bar" style="width:{int(200 * n / max(1, max_hist))}px"></div></td></tr>'
         for label, n in hist
     )
 
     # Tabla top vocab
     vocab_rows = "\n".join(
-        f'<tr><td style="text-align:right;color:#666">{w:.2f}</td>'
-        f'<td><span style="color:#888;font-size:11px">{_esc(s)}</span></td>'
+        f'<tr><td class="weight-cell">{w:.2f}</td>'
+        f'<td><span class="text-mono">{_esc(s)}</span></td>'
         f'<td><strong>{_esc(t)}</strong></td></tr>'
         for t, w, s in top_vocab
     )
@@ -8291,9 +8291,9 @@ def transcripts_dashboard() -> HTMLResponse:
 
     def fmt_lp(lp: float | None) -> str:
         if lp is None:
-            return "<span style='color:#888'>—</span>"
-        color = "#2a7" if lp > -0.4 else ("#b80" if lp > -0.8 else "#c33")
-        return f'<span style="color:{color}">{lp:.2f}</span>'
+            return '<span class="text-mono">—</span>'
+        cls = "lp-good" if lp > -0.4 else ("lp-mid" if lp > -0.8 else "lp-bad")
+        return f'<span class="{cls}">{lp:.2f}</span>'
 
     transcript_rows = ""
     for r in recent_transcripts:
@@ -8302,46 +8302,46 @@ def transcripts_dashboard() -> HTMLResponse:
         text_disp = (corrected or text or "")[:100]
         marker = ""
         if corr_src == "llm":
-            marker = ' <span style="background:#e3f0ff;padding:1px 4px;border-radius:3px;font-size:10px">llm</span>'
+            marker = ' <span class="pill pill-llm">llm</span>'
         elif corr_src == "explicit":
-            marker = ' <span style="background:#dfd;padding:1px 4px;border-radius:3px;font-size:10px">/fix</span>'
+            marker = ' <span class="pill pill-fix">/fix</span>'
         elif corr_src == "vault_diff":
-            marker = ' <span style="background:#ffe;padding:1px 4px;border-radius:3px;font-size:10px">vault</span>'
+            marker = ' <span class="pill pill-vault">vault</span>'
         transcript_rows += (
             f'<tr>'
-            f'<td>{_esc(fmt_ts(ts))}</td>'
+            f'<td><span class="text-mono">{_esc(fmt_ts(ts))}</span></td>'
             f'<td>{fmt_lp(lp)}</td>'
-            f'<td><span style="color:#888;font-size:11px">{_esc((model or "")[:25])}</span></td>'
-            f'<td><span style="color:#888;font-size:11px">{_esc(chat_label)}</span></td>'
+            f'<td><span class="text-mono">{_esc((model or "")[:25])}</span></td>'
+            f'<td><span class="text-mono">{_esc(chat_label)}</span></td>'
             f'<td>{_esc(text_disp)}{marker}</td>'
             f'</tr>\n'
         )
     if not transcript_rows:
-        transcript_rows = '<tr><td colspan="5" style="color:#888;text-align:center;padding:20px">sin transcripciones logueadas — mandá un audio por WhatsApp para que aparezca acá</td></tr>'
+        transcript_rows = '<tr><td colspan="5" class="meta" style="text-align:center;padding:20px">sin transcripciones logueadas — mandá un audio por WhatsApp para que aparezca acá</td></tr>'
 
     # Tabla corrections
     correction_rows = ""
     for r in recent_corrections:
         ts, src, orig, corr = r
-        src_color = {"explicit": "#2a7", "llm": "#4a90e2", "vault_diff": "#b80"}.get(src, "#888")
+        src_cls = {"explicit": "src-explicit", "llm": "src-llm", "vault_diff": "src-vault"}.get(src, "")
         correction_rows += (
             f'<tr>'
-            f'<td>{_esc(fmt_ts(ts))}</td>'
-            f'<td><span style="color:{src_color}">{_esc(src)}</span></td>'
-            f'<td style="color:#c33">{_esc((orig or "")[:80])}</td>'
-            f'<td style="color:#2a7">{_esc((corr or "")[:80])}</td>'
+            f'<td><span class="text-mono">{_esc(fmt_ts(ts))}</span></td>'
+            f'<td><span class="{src_cls}">{_esc(src)}</span></td>'
+            f'<td class="text-orig">{_esc((orig or "")[:80])}</td>'
+            f'<td class="text-fixed">{_esc((corr or "")[:80])}</td>'
             f'</tr>\n'
         )
     if not correction_rows:
-        correction_rows = '<tr><td colspan="4" style="color:#888;text-align:center;padding:20px">sin correcciones todavía — usá <code>/fix &lt;texto&gt;</code> en WhatsApp para corregir un audio</td></tr>'
+        correction_rows = '<tr><td colspan="4" class="meta" style="text-align:center;padding:20px">sin correcciones todavía — usá <code>/fix &lt;texto&gt;</code> en WhatsApp para corregir un audio</td></tr>'
 
     # Stats correcciones por source
     corr_summary_parts = []
     for src in ("explicit", "llm", "vault_diff"):
         n = corr_by_source.get(src, 0)
         if n > 0:
-            color = {"explicit": "#2a7", "llm": "#4a90e2", "vault_diff": "#b80"}[src]
-            corr_summary_parts.append(f'<span style="color:{color}">{n} {src}</span>')
+            cls = {"explicit": "src-explicit", "llm": "src-llm", "vault_diff": "src-vault"}[src]
+            corr_summary_parts.append(f'<span class="{cls}">{n} {src}</span>')
     corr_summary = " · ".join(corr_summary_parts) if corr_summary_parts else "0"
 
     # Stats vocab por source
@@ -8357,22 +8357,89 @@ def transcripts_dashboard() -> HTMLResponse:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>whisper transcripts — rag</title>
 <style>
-  body {{ font: 14px/1.4 -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; color: #222; }}
-  h1 {{ font-size: 22px; margin: 0 0 6px 0; }}
-  h2 {{ font-size: 16px; margin: 28px 0 8px 0; color: #444; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
-  .summary {{ display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0 20px 0; }}
-  .stat {{ background: #f7f7f7; padding: 10px 14px; border-radius: 6px; min-width: 140px; }}
-  .stat .num {{ font-size: 20px; font-weight: 600; color: #222; }}
-  .stat .lbl {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ padding: 5px 8px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }}
-  th {{ background: #fafafa; font-weight: 600; font-size: 12px; color: #555; }}
+  /* Dark mode by default. Paleta cercana al GitHub dark + Obsidian default
+     theme para coherencia con el resto del stack del usuario.
+     Override automático al modo light si el OS lo pide explícitamente. */
+  :root {{
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-elev-2: #1f242c;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-dim: #6e7681;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root {{
+      --bg: #ffffff;
+      --bg-elev: #f6f8fa;
+      --bg-elev-2: #eaeef2;
+      --border: #d0d7de;
+      --border-soft: #eaeef2;
+      --text: #1f2328;
+      --text-muted: #59636e;
+      --text-dim: #818b97;
+      --accent: #0969da;
+      --green: #1a7f37;
+      --orange: #9a6700;
+      --red: #cf222e;
+    }}
+  }}
+  html, body {{ background: var(--bg); }}
+  body {{
+    font: 14px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    max-width: 1100px;
+    margin: 20px auto;
+    padding: 0 16px;
+    color: var(--text);
+  }}
+  h1 {{ font-size: 22px; margin: 0 0 6px 0; color: var(--text); font-weight: 600; }}
+  h2 {{ font-size: 16px; margin: 28px 0 8px 0; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 6px; font-weight: 600; }}
+  .summary {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 24px 0; }}
+  .stat {{
+    background: var(--bg-elev);
+    padding: 12px 16px;
+    border-radius: 8px;
+    min-width: 150px;
+    border: 1px solid var(--border-soft);
+  }}
+  .stat .num {{ font-size: 22px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }}
+  .stat .lbl {{ font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }}
+  table {{ border-collapse: collapse; width: 100%; background: var(--bg); }}
+  th, td {{ padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border-soft); vertical-align: top; }}
+  th {{ background: var(--bg-elev); font-weight: 600; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid var(--border); }}
+  tr:hover td {{ background: var(--bg-elev); }}
   .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
   @media (max-width: 800px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
-  .meta {{ color: #888; font-size: 12px; margin-top: 4px; }}
-  code {{ background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }}
+  .meta {{ color: var(--text-muted); font-size: 12px; margin-top: 4px; }}
+  code {{ background: var(--bg-elev-2); padding: 2px 6px; border-radius: 4px; font-size: 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--text); }}
+  /* Pills de marker: rebajan el fondo en dark mode para no quemar la vista */
+  .pill {{ padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 500; }}
+  .pill-llm {{ background: rgba(88, 166, 255, 0.18); color: var(--accent); }}
+  .pill-fix {{ background: rgba(63, 185, 80, 0.18); color: var(--green); }}
+  .pill-vault {{ background: rgba(210, 153, 34, 0.18); color: var(--orange); }}
+  /* Histogram bars: usa accent del theme */
+  .bar {{ background: var(--accent); height: 14px; border-radius: 2px; }}
+  /* Logprob colors */
+  .lp-good {{ color: var(--green); font-variant-numeric: tabular-nums; }}
+  .lp-mid {{ color: var(--orange); font-variant-numeric: tabular-nums; }}
+  .lp-bad {{ color: var(--red); font-variant-numeric: tabular-nums; }}
+  /* Source colors en correcciones */
+  .src-explicit {{ color: var(--green); }}
+  .src-llm {{ color: var(--accent); }}
+  .src-vault {{ color: var(--orange); }}
+  .text-orig {{ color: var(--red); }}
+  .text-fixed {{ color: var(--green); }}
+  .text-mono {{ color: var(--text-muted); font-size: 11px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
+  .weight-cell {{ text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
@@ -8408,7 +8475,7 @@ def transcripts_dashboard() -> HTMLResponse:
   </table>
 
   <h2>últimas 20 correcciones</h2>
-  <p class="meta">source <span style="color:#2a7">explicit</span> = comando /fix · <span style="color:#4a90e2">llm</span> = qwen2.5:7b auto-correct · <span style="color:#b80">vault_diff</span> = nota editada</p>
+  <p class="meta">source <span class="src-explicit">explicit</span> = comando /fix · <span class="src-llm">llm</span> = qwen2.5:7b auto-correct · <span class="src-vault">vault_diff</span> = nota editada</p>
   <table>
     <thead><tr><th>fecha</th><th>source</th><th>original</th><th>corregido</th></tr></thead>
     <tbody>{correction_rows}</tbody>

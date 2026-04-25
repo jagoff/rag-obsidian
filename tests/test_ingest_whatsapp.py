@@ -332,18 +332,27 @@ def test_run_desync_guard_blocks_cursor_advance(
     menos 1 chunk en la DB antes de persistir el cursor.
     """
     # Monkeypatch upsert_chunks para retornar N > 0 pero NO escribir.
-    def _fake_upsert(col, chunks):
-        return len(chunks)  # lies — says it wrote but didn't
-    monkeypatch.setattr(iw, "upsert_chunks", _fake_upsert)
+    # Usamos `monkeypatch.context()` (en vez de `monkeypatch.undo()`
+    # global) porque la fixture `tmp_vault_col` también monkeypatchea
+    # `rag.embed` con un fake determinístico (necesario en CI sin
+    # Ollama). Un `monkeypatch.undo()` plano revertiría AMBOS — el
+    # upsert_chunks local Y el rag.embed de la fixture — y la segunda
+    # corrida abajo intentaría llamar Ollama real, fallando con
+    # `ConnectionError: Failed to connect to Ollama`.
+    # `monkeypatch.context()` aísla solo lo que se setteó adentro.
+    with monkeypatch.context() as mp:
+        def _fake_upsert(col, chunks):
+            return len(chunks)  # lies — says it wrote but didn't
+        mp.setattr(iw, "upsert_chunks", _fake_upsert)
 
-    summary = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col)
-    # Summary tiene el error explicativo.
-    assert "error" in summary
-    assert "desync" in summary["error"].lower()
-    assert "cursor" in summary["error"].lower()
-    # La próxima corrida (sin el monkeypatch) DEBE reprocesar desde 0
-    # porque el cursor nunca avanzó.
-    monkeypatch.undo()
+        summary = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col)
+        # Summary tiene el error explicativo.
+        assert "error" in summary
+        assert "desync" in summary["error"].lower()
+        assert "cursor" in summary["error"].lower()
+    # Fuera del context: `upsert_chunks` restaurado, `rag.embed` (de la
+    # fixture) sigue siendo el fake. La 2da corrida DEBE reprocesar
+    # desde 0 porque el cursor nunca avanzó.
     summary2 = iw.run(bridge_db=fake_bridge, vault_col=tmp_vault_col)
     assert summary2["messages_after_retention"] > 0
     assert summary2["chunks_written"] > 0

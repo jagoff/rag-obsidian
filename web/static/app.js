@@ -1589,6 +1589,59 @@ function formatDateOnly(iso) {
   }
 }
 
+// Friendly relative formatter for the WhatsApp scheduling chip.
+//   - Same-calendar-day → "hoy 14:30"
+//   - Next/previous calendar day → "mañana 9:00" / "ayer 18:00"
+//   - Otherwise → es-AR short with weekday + day + month + time
+//     (e.g. "vie 26 abr 14:30")
+//
+// We use *calendar-day* delta (not 24h-window) so 23:59 today and 00:01
+// today both show as "hoy ..." and don't flip arbitrarily based on the
+// elapsed milliseconds. The browser's local timezone is used for the
+// comparison — this matches what the user expects ("mañana" = mañana
+// donde está, no donde está el server).
+function formatFriendlyDate(isoStr) {
+  if (!isoStr) return "";
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr;
+    const now = new Date();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const dayDiff = Math.round((startOfDay(d) - startOfDay(now)) / dayMs);
+    const time = d.toLocaleTimeString("es-AR", {
+      hour: "2-digit", minute: "2-digit",
+    });
+    if (dayDiff === 0) return `hoy ${time}`;
+    if (dayDiff === 1) return `mañana ${time}`;
+    if (dayDiff === -1) return `ayer ${time}`;
+    return d.toLocaleString("es-AR", {
+      weekday: "short", day: "numeric", month: "short",
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return isoStr;
+  }
+}
+
+// Convert a `<input type="datetime-local">` value (e.g. "2026-04-26T09:00")
+// into an ISO8601 string with explicit Argentina offset (-03:00). The
+// backend accepts naive ISO too, but explicit-better-than-implicit — if
+// the user's browser is somehow in a non-AR timezone, this still ships a
+// timestamp the backend interprets as Argentina wall-clock time.
+function toIsoArgentina(localDateTime) {
+  if (!localDateTime) return "";
+  let v = String(localDateTime).trim();
+  if (!v) return "";
+  // datetime-local usually emits "YYYY-MM-DDTHH:MM"; some browsers add
+  // ":SS" when the field is configured with seconds precision. Normalize
+  // so the output is always "YYYY-MM-DDTHH:MM:SS-03:00".
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(v)) {
+    v = v + ":00";
+  }
+  return v + "-03:00";
+}
+
 function appendCreatedChip(parent, payload) {
   const kind = payload.kind;                    // "reminder" | "event"
   const fields = payload.fields || {};
@@ -1694,6 +1747,12 @@ function appendWhatsAppProposal(parent, payload) {
   const replyHint = fields.reply_to_hint || "";
   const replyWarn = fields.reply_to_warning || "";
 
+  // Scheduling state — mutable so the user can flip from "send now" to
+  // "scheduled" via the ⏰ popover (or change a pre-existing schedule).
+  // Starts with whatever the LLM proposed (may be null/undefined). Format:
+  // ISO8601 with offset, e.g. "2026-04-26T09:00:00-03:00".
+  let scheduledFor = fields.scheduled_for || null;
+
   const card = el("div", `proposal proposal-whatsapp${isReply ? " proposal-whatsapp-reply" : ""}`);
   // a11y: ver comentario en appendProposal — region landmark con
   // aria-labelledby al heading del card.
@@ -1726,6 +1785,29 @@ function appendWhatsAppProposal(parent, payload) {
     recipientLine.appendChild(document.createTextNode(recipientLabel));
   }
   card.appendChild(recipientLine);
+
+  // Schedule chip — rendered between the recipient line and the textarea
+  // when a scheduled_for is present. Variants:
+  //   .pending → grey (default while card is unsent)
+  //   .sent    → green (after a successful schedule POST)
+  //   .late / .failed reserved for future "scheduled-but-not-fired-yet"
+  //   surfacing — see scheduled_messages table in the backend.
+  let scheduleChip = null;
+  function renderScheduleChip() {
+    if (!scheduledFor) {
+      if (scheduleChip) {
+        scheduleChip.remove();
+        scheduleChip = null;
+      }
+      return;
+    }
+    if (!scheduleChip) {
+      scheduleChip = el("div", "proposal-wa-schedule-chip pending");
+      recipientLine.insertAdjacentElement("afterend", scheduleChip);
+    }
+    scheduleChip.textContent = `📅 Programado para ${formatFriendlyDate(scheduledFor)}`;
+  }
+  renderScheduleChip();
 
   // Reply variant: render the original message as a styled blockquote
   // above the textarea, mimicking WhatsApp's reply UI (left border in
@@ -1778,8 +1860,24 @@ function appendWhatsAppProposal(parent, payload) {
   const sendBtn = document.createElement("button");
   sendBtn.type = "button";
   sendBtn.className = "proposal-btn proposal-btn-create";
-  sendBtn.textContent = "✈ Enviar";
   sendBtn.disabled = !!err || !fields.jid;
+
+  // Two secondary scheduling buttons that swap based on schedule state:
+  //   - clockBtn (⏰ icon-only) → visible when no schedule, opens popover
+  //   - changeTimeBtn (⏰ Cambiar hora) → visible when schedule exists,
+  //     opens popover pre-filled with current schedule
+  // Only one is in the DOM at a time; refreshActionButtons() handles the swap.
+  const clockBtn = document.createElement("button");
+  clockBtn.type = "button";
+  clockBtn.className = "proposal-btn proposal-wa-clock-btn";
+  clockBtn.setAttribute("aria-label", "Programar para más tarde");
+  clockBtn.title = "Programar para más tarde";
+  clockBtn.textContent = "⏰";
+
+  const changeTimeBtn = document.createElement("button");
+  changeTimeBtn.type = "button";
+  changeTimeBtn.className = "proposal-btn proposal-wa-change-time-btn";
+  changeTimeBtn.textContent = "⏰ Cambiar hora";
 
   const cancelBtn = document.createElement("button");
   cancelBtn.type = "button";
@@ -1788,16 +1886,168 @@ function appendWhatsAppProposal(parent, payload) {
 
   const status = el("span", "proposal-status", "");
   actions.appendChild(sendBtn);
+  // clockBtn / changeTimeBtn slot is filled by refreshActionButtons()
   actions.appendChild(cancelBtn);
   actions.appendChild(status);
   card.appendChild(actions);
+
+  // Sync the primary button label + which secondary scheduling button is
+  // shown, based on whether we have a schedule. Idempotent — safe to call
+  // any number of times after scheduledFor changes.
+  function refreshActionButtons() {
+    if (scheduledFor) {
+      sendBtn.textContent = "📅 Programar";
+      if (clockBtn.parentNode) clockBtn.remove();
+      if (!changeTimeBtn.parentNode) {
+        sendBtn.insertAdjacentElement("afterend", changeTimeBtn);
+      }
+    } else {
+      sendBtn.textContent = "✈ Enviar";
+      if (changeTimeBtn.parentNode) changeTimeBtn.remove();
+      if (!clockBtn.parentNode) {
+        sendBtn.insertAdjacentElement("afterend", clockBtn);
+      }
+    }
+  }
+  refreshActionButtons();
+
+  // Inline popover for the date/time picker. Toggled by clockBtn / changeTimeBtn.
+  // Sits at the bottom of the card (NOT a modal) so the rest of the chat
+  // stays scrollable. Single popover instance — reopening reuses or
+  // toggles closed depending on current state.
+  let popover = null;
+  function openPopover() {
+    if (card.dataset.resolved) return;
+    if (popover) {
+      // Toggle: clicking the trigger again closes the popover.
+      popover.remove();
+      popover = null;
+      return;
+    }
+    popover = el("div", "proposal-wa-schedule-popover");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("aria-label", "Programar mensaje");
+
+    const pad = (n) => String(n).padStart(2, "0");
+    const toLocalInputValue = (d) =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+    // Quick-time chips first (above the input) so the most common case —
+    // pick a preset, hit Programar — is one tap. The datetime-local input
+    // is the fallback for arbitrary times.
+    const quick = el("div", "proposal-wa-quick-times");
+    const quickBtns = [
+      { label: "+15min", offsetMin: 15 },
+      { label: "+1h", offsetMin: 60 },
+      { label: "+3h", offsetMin: 180 },
+      { label: "Mañana 9hs", custom: () => {
+        const t = new Date();
+        t.setDate(t.getDate() + 1);
+        t.setHours(9, 0, 0, 0);
+        return t;
+      } },
+      { label: "Mañana 18hs", custom: () => {
+        const t = new Date();
+        t.setDate(t.getDate() + 1);
+        t.setHours(18, 0, 0, 0);
+        return t;
+      } },
+    ];
+    popover.appendChild(quick);
+
+    const inputWrap = el("div", "proposal-wa-schedule-row");
+    const inputLabel = el("label", "proposal-wa-schedule-label", "Fecha y hora:");
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.className = "proposal-wa-schedule-input";
+    // Pre-fill: existing schedule if any, otherwise now+1h as a sensible default.
+    const seedDate = scheduledFor ? new Date(scheduledFor) : new Date(Date.now() + 60 * 60 * 1000);
+    if (!isNaN(seedDate.getTime())) {
+      input.value = toLocalInputValue(seedDate);
+    }
+    inputLabel.appendChild(input);
+    inputWrap.appendChild(inputLabel);
+    popover.appendChild(inputWrap);
+
+    const popoverErr = el("div", "proposal-wa-schedule-err", "");
+    popover.appendChild(popoverErr);
+
+    for (const q of quickBtns) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "proposal-wa-quick-time";
+      b.textContent = q.label;
+      b.addEventListener("click", () => {
+        const target = q.custom ? q.custom() : new Date(Date.now() + q.offsetMin * 60 * 1000);
+        input.value = toLocalInputValue(target);
+        popoverErr.textContent = "";
+      });
+      quick.appendChild(b);
+    }
+
+    const popoverActions = el("div", "proposal-wa-schedule-actions");
+    const acceptBtn = document.createElement("button");
+    acceptBtn.type = "button";
+    acceptBtn.className = "proposal-btn proposal-btn-create";
+    acceptBtn.textContent = "Programar";
+    const cancelPopBtn = document.createElement("button");
+    cancelPopBtn.type = "button";
+    cancelPopBtn.className = "proposal-btn proposal-btn-cancel";
+    cancelPopBtn.textContent = "Cancelar";
+    popoverActions.appendChild(acceptBtn);
+    popoverActions.appendChild(cancelPopBtn);
+    popover.appendChild(popoverActions);
+
+    cancelPopBtn.addEventListener("click", () => {
+      popover.remove();
+      popover = null;
+    });
+
+    acceptBtn.addEventListener("click", () => {
+      popoverErr.textContent = "";
+      const v = input.value;
+      if (!v) {
+        popoverErr.textContent = "Elegí fecha y hora";
+        return;
+      }
+      const target = new Date(v);
+      if (isNaN(target.getTime())) {
+        popoverErr.textContent = "Fecha inválida";
+        return;
+      }
+      if (target.getTime() <= Date.now()) {
+        popoverErr.textContent = "La fecha tiene que ser futura";
+        return;
+      }
+      // Lock in the new schedule and re-render chip + button state.
+      // The user still has to hit the primary "📅 Programar" button to POST.
+      scheduledFor = toIsoArgentina(v);
+      renderScheduleChip();
+      refreshActionButtons();
+      popover.remove();
+      popover = null;
+    });
+
+    card.appendChild(popover);
+    // Focus the datetime-local input for keyboard-first usage.
+    setTimeout(() => { try { input.focus(); } catch {} }, 0);
+  }
+
+  clockBtn.addEventListener("click", openPopover);
+  changeTimeBtn.addEventListener("click", openPopover);
 
   cancelBtn.addEventListener("click", () => {
     if (card.dataset.resolved) return;
     card.dataset.resolved = "cancelled";
     sendBtn.disabled = true;
     cancelBtn.disabled = true;
+    clockBtn.disabled = true;
+    changeTimeBtn.disabled = true;
     textarea.disabled = true;
+    if (popover) {
+      popover.remove();
+      popover = null;
+    }
     status.textContent = "  descartada";
     status.classList.add("cancelled");
     card.classList.add("dimmed");
@@ -1816,11 +2066,17 @@ function appendWhatsAppProposal(parent, payload) {
       status.classList.add("err");
       return;
     }
+    // Snapshot the current schedule — `scheduledFor` is mutable but this
+    // closure should commit to the value at click time so a concurrent
+    // popover edit during the in-flight POST doesn't desync the UI.
+    const scheduleAtClick = scheduledFor;
     card.dataset.resolved = "sending";
     sendBtn.disabled = true;
     cancelBtn.disabled = true;
+    clockBtn.disabled = true;
+    changeTimeBtn.disabled = true;
     textarea.disabled = true;
-    status.textContent = "  enviando…";
+    status.textContent = scheduleAtClick ? "  programando…" : "  enviando…";
     status.classList.remove("ok", "err");
 
     try {
@@ -1829,6 +2085,12 @@ function appendWhatsAppProposal(parent, payload) {
         message_text: body,
         proposal_id: proposalId,
       };
+      // Schedule path: ship `scheduled_for` so the backend persists a
+      // pending row instead of firing the bridge. Backend response shape:
+      //   { ok: true, scheduled: true, id, scheduled_for_utc, status: "pending" }
+      if (scheduleAtClick) {
+        sendBody.scheduled_for = scheduleAtClick;
+      }
       // Forward the reply_to context when this card is a reply with a
       // resolved target. The bridge currently ignores it (no native
       // quote support — see rag._whatsapp_send_to_jid docstring) but
@@ -1849,19 +2111,42 @@ function appendWhatsAppProposal(parent, payload) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || `HTTP ${res.status}`);
       }
-      card.dataset.resolved = "sent";
-      status.textContent = `  ✓ enviado a ${recipientLabel}`;
-      status.classList.add("ok");
-      card.classList.add("created");
-      showToast(`✓ Mensaje enviado a ${recipientLabel}`, "ok");
+      const data = await res.json().catch(() => ({}));
+      if (data && data.scheduled) {
+        // Scheduled path — chip flips to .sent (green) and status shows
+        // the friendly date echoed back from the server (`scheduled_for_utc`
+        // is the canonical persisted value; falling back to the local
+        // schedule if the server didn't include it).
+        const when = data.scheduled_for_utc || scheduleAtClick;
+        const friendly = formatFriendlyDate(when);
+        card.dataset.resolved = "scheduled";
+        status.textContent = `  ✓ programado para ${friendly}`;
+        status.classList.add("ok");
+        card.classList.add("created");
+        if (scheduleChip) {
+          scheduleChip.classList.remove("pending");
+          scheduleChip.classList.add("sent");
+          scheduleChip.textContent = `📅 Programado para ${friendly}`;
+        }
+        showToast(`✓ Programado para ${friendly}`, "ok");
+      } else {
+        card.dataset.resolved = "sent";
+        status.textContent = `  ✓ enviado a ${recipientLabel}`;
+        status.classList.add("ok");
+        card.classList.add("created");
+        showToast(`✓ Mensaje enviado a ${recipientLabel}`, "ok");
+      }
     } catch (err) {
       delete card.dataset.resolved;
       sendBtn.disabled = false;
       cancelBtn.disabled = false;
+      clockBtn.disabled = false;
+      changeTimeBtn.disabled = false;
       textarea.disabled = false;
       status.textContent = `  error: ${err.message}`;
       status.classList.add("err");
-      showToast(`✗ No se pudo enviar: ${err.message}`, "err");
+      const verb = scheduleAtClick ? "No se pudo programar" : "No se pudo enviar";
+      showToast(`✗ ${verb}: ${err.message}`, "err");
     }
   });
 

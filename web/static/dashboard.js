@@ -122,11 +122,13 @@ el.liveToggle.addEventListener("click", () => {
     setLiveState("paused", "pausado");
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
     if (state.poll) { clearInterval(state.poll); state.poll = null; }
+    if (state.waPoll) { clearInterval(state.waPoll); state.waPoll = null; }
   } else {
     setLiveState("off", "reconectando…");
     load(false);
     startPolling();
     startStream();
+    if (state.waInitDone) startWaPolling();
   }
 });
 
@@ -135,10 +137,18 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     if (state.poll) { clearInterval(state.poll); state.poll = null; }
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
+    if (state.waPoll) { clearInterval(state.waPoll); state.waPoll = null; }
   } else if (!state.paused) {
     load(false);
     startPolling();
     startStream();
+    if (state.waInitDone) {
+      // Pull a fresh snapshot first (we likely missed N seconds of
+      // changes while hidden), then resume the 30s loop. Init handles
+      // the first-run case earlier in load().
+      refreshWaScheduled();
+      startWaPolling();
+    }
   }
 });
 
@@ -149,6 +159,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("beforeunload", () => {
   try { if (state.evtSrc) state.evtSrc.close(); } catch (_) {}
   try { if (state.poll) clearInterval(state.poll); } catch (_) {}
+  try { if (state.waPoll) clearInterval(state.waPoll); } catch (_) {}
   try { if (MEM && MEM.es) MEM.es.close(); } catch (_) {}
   try { if (CPU && CPU.es) CPU.es.close(); } catch (_) {}
 });
@@ -190,6 +201,7 @@ async function load(showSkeleton) {
       state.built = true;
       memInit();
       cpuInit();
+      waInit();
     }
     refresh(d);
     announceStatus(`Datos del dashboard actualizados (${d.kpis.total_queries} queries en ${state.days} días)`);
@@ -383,6 +395,19 @@ function buildLayout(d) {
       <section class="chart-card wide" aria-labelledby="sec-feedback">
         <h2 id="sec-feedback">Feedback accionable — señales para mejorar el RAG</h2>
         <div id="feedback-panel"></div>
+      </section>
+
+      <section class="chart-card wide" id="sec-wa-scheduled-card" aria-labelledby="sec-wa-scheduled">
+        <h2 id="sec-wa-scheduled">Mensajes programados de WhatsApp <span id="wa-pending-badge" class="wa-pending-badge">(0 pending)</span></h2>
+        <div class="wa-tabs" role="tablist" aria-label="Filtrar mensajes programados por estado">
+          <button type="button" role="tab" id="wa-tab-pending" aria-selected="true" aria-controls="wa-scheduled-body" data-wa-tab="pending" class="wa-tab active">Pendientes <span class="wa-tab-count">0</span></button>
+          <button type="button" role="tab" id="wa-tab-sent" aria-selected="false" aria-controls="wa-scheduled-body" data-wa-tab="sent" class="wa-tab">Enviados <span class="wa-tab-count">0</span></button>
+          <button type="button" role="tab" id="wa-tab-failed" aria-selected="false" aria-controls="wa-scheduled-body" data-wa-tab="failed" class="wa-tab">Fallados <span class="wa-tab-count">0</span></button>
+          <button type="button" role="tab" id="wa-tab-all" aria-selected="false" aria-controls="wa-scheduled-body" data-wa-tab="all" class="wa-tab">Todos <span class="wa-tab-count">0</span></button>
+        </div>
+        <div id="wa-scheduled-body" class="wa-scheduled-body" role="tabpanel" aria-labelledby="wa-tab-pending">
+          <div class="fb-empty">cargando…</div>
+        </div>
       </section>
 
       <section class="chart-card" aria-labelledby="sec-latency">
@@ -1687,4 +1712,514 @@ async function cpuInit() {
   cpuSyncChart();
   cpuSyncHeader();
   cpuOpenStream();
+}
+
+// ── WhatsApp scheduled messages ──────────────────────────────────────────
+//
+// Sección que lista los rows de `rag_whatsapp_scheduled` (backend en
+// `/api/whatsapp/scheduled`) con tabs para filtrar por estado y acciones
+// inline (cancelar, reprogramar, reenviar). El polling es independiente
+// del de `/api/dashboard` (KPIs/charts) — un mini-loop de 30s que se
+// pausa con state.paused / document.hidden, igual que el resto.
+//
+// Idempotencia visual: re-renders comparan una signature `id:status` para
+// evitar parpadeos en cada poll cuando nada cambió.
+//
+// Mobile (<=640px): la tabla se colapsa a cards via CSS (data-label).
+
+const WA_POLL_MS = 30_000;
+const WA_TABS = [
+  { id: "pending", label: "Pendientes" },
+  { id: "sent",    label: "Enviados" },
+  { id: "failed",  label: "Fallados" },
+  { id: "all",     label: "Todos" },
+];
+
+function waInit() {
+  if (state.waInitDone) return;
+  state.waInitDone = true;
+  state.waTab = "pending";
+  state.waItems = [];
+  state.waLastSig = "";
+  waAttachListeners();
+  refreshWaScheduled();
+  startWaPolling();
+}
+
+function startWaPolling() {
+  if (state.waPoll) clearInterval(state.waPoll);
+  state.waPoll = setInterval(() => {
+    if (state.paused || document.hidden) return;
+    refreshWaScheduled();
+  }, WA_POLL_MS);
+}
+
+async function refreshWaScheduled() {
+  try {
+    // No filter on the GET — we use one fetch and split client-side.
+    // It also keeps the per-tab counts always-fresh in one round-trip.
+    const res = await fetch("/api/whatsapp/scheduled?limit=200");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    state.waItems = Array.isArray(data.items) ? data.items : [];
+    renderWaScheduled();
+  } catch (err) {
+    const body = document.getElementById("wa-scheduled-body");
+    if (body && !state.waItems.length) {
+      body.innerHTML = `<div class="fb-empty" style="color:var(--red)">error cargando: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+}
+
+function waItemsForTab(tab) {
+  const all = state.waItems || [];
+  if (tab === "pending") return all.filter(it => it.status === "pending");
+  if (tab === "sent")    return all.filter(it => it.status === "sent" || it.status === "sent_late");
+  if (tab === "failed")  return all.filter(it => it.status === "failed");
+  return all;
+}
+
+function waCountByTab() {
+  const c = { pending: 0, sent: 0, failed: 0, all: 0 };
+  for (const it of state.waItems || []) {
+    c.all += 1;
+    if (it.status === "pending") c.pending += 1;
+    else if (it.status === "sent" || it.status === "sent_late") c.sent += 1;
+    else if (it.status === "failed") c.failed += 1;
+  }
+  return c;
+}
+
+function renderWaScheduled() {
+  const root = document.getElementById("sec-wa-scheduled-card");
+  if (!root) return;
+
+  const counts = waCountByTab();
+
+  // Pending badge in the section header.
+  const badge = document.getElementById("wa-pending-badge");
+  if (badge) badge.textContent = `(${counts.pending} pending)`;
+
+  // Tabs: count + selected state. Don't blow away the buttons (they
+  // own click listeners + focus state) — just mutate.
+  const body = document.getElementById("wa-scheduled-body");
+  for (const tab of WA_TABS) {
+    const btn = root.querySelector(`button[data-wa-tab="${tab.id}"]`);
+    if (!btn) continue;
+    const isActive = (tab.id === state.waTab);
+    btn.setAttribute("aria-selected", String(isActive));
+    btn.classList.toggle("active", isActive);
+    const c = btn.querySelector(".wa-tab-count");
+    if (c) c.textContent = counts[tab.id];
+    if (isActive && body) body.setAttribute("aria-labelledby", `wa-tab-${tab.id}`);
+  }
+
+  if (!body) return;
+
+  // Truly empty corpus → minimal centered message.
+  if (!state.waItems.length) {
+    if (state.waLastSig !== "EMPTY_ALL") {
+      body.innerHTML = `<div class="fb-empty">no hay mensajes programados</div>`;
+      state.waLastSig = "EMPTY_ALL";
+    }
+    return;
+  }
+
+  const items = waItemsForTab(state.waTab);
+  if (!items.length) {
+    const sig = `EMPTY:${state.waTab}`;
+    if (state.waLastSig !== sig) {
+      const lbl = (WA_TABS.find(t => t.id === state.waTab) || { label: "" }).label.toLowerCase();
+      body.innerHTML = `<div class="fb-empty">sin mensajes en "${escapeHtml(lbl)}"</div>`;
+      state.waLastSig = sig;
+    }
+    return;
+  }
+
+  // Idempotency: if the signature matches the previous render, skip the
+  // innerHTML reset. Signature includes tab + (id, status, scheduled_for_utc)
+  // per row so reschedule moves and status flips force re-render.
+  const sig = state.waTab + "|" + items
+    .map(it => `${it.id}:${it.status}:${it.scheduled_for_utc || ""}`)
+    .join(",");
+  if (sig === state.waLastSig) return;
+  state.waLastSig = sig;
+
+  body.innerHTML = `
+    <table class="wa-table">
+      <caption class="sr-only">Mensajes de WhatsApp programados — para, mensaje, fecha programada, estado y acciones disponibles</caption>
+      <thead>
+        <tr>
+          <th scope="col">Para</th>
+          <th scope="col">Mensaje</th>
+          <th scope="col">Programado</th>
+          <th scope="col">Estado</th>
+          <th scope="col">Acción</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${items.map(waRowHtml).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function waRowHtml(it) {
+  const display = waContactDisplay(it);
+  const whoCell = waContactCell(it, display);
+  const msgFull = it.message_text || "";
+  const msgShort = msgFull.length > 60 ? msgFull.slice(0, 60) + "…" : msgFull;
+  const sched = waFormatScheduled(it.scheduled_for_utc);
+  return `
+    <tr data-wa-id="${it.id}" data-wa-status="${escapeHtml(it.status)}">
+      <td data-label="Para">${whoCell}</td>
+      <td data-label="Mensaje" title="${escapeHtml(msgFull)}"><span class="wa-msg">${escapeHtml(msgShort)}</span></td>
+      <td data-label="Programado" class="wa-when">${escapeHtml(sched)}</td>
+      <td data-label="Estado">${waStatusChip(it)}</td>
+      <td data-label="Acción" class="wa-actions">${waActionsHtml(it)}</td>
+    </tr>
+  `;
+}
+
+function waContactDisplay(it) {
+  if (it && it.contact_name && String(it.contact_name).trim()) {
+    return String(it.contact_name).trim();
+  }
+  return waJidToHumanPhone((it && it.jid) || "");
+}
+
+function waContactCell(it, displayText) {
+  const phone = waJidToPhone((it && it.jid) || "");
+  const safe = escapeHtml(displayText);
+  if (!phone) return `<span class="wa-who">${safe}</span>`;
+  const href = `https://wa.me/${phone}`;
+  return `<a class="wa-who" href="${escapeHtml(href)}" target="_blank" rel="noopener" title="Abrir chat en WhatsApp">${safe}</a>`;
+}
+
+// "5491100000000@s.whatsapp.net" → "5491100000000". Groups (@g.us) and
+// status broadcasts return "" because wa.me doesn't deep-link them.
+function waJidToPhone(jid) {
+  if (!jid) return "";
+  if (jid.includes("@g.us")) return "";
+  const part = jid.split("@")[0] || "";
+  if (/^\d{6,}$/.test(part)) return part;
+  return "";
+}
+
+// Format AR cell: "+54 9 11 1234 5678". For non-AR or short numbers
+// fall back to "+<digits>" so it's still clickable / readable.
+function waJidToHumanPhone(jid) {
+  const phone = waJidToPhone(jid);
+  if (!phone) return jid || "?";
+  if (phone.startsWith("549") && phone.length >= 12) {
+    const rest = phone.slice(3);
+    const local = rest.slice(-8);
+    const area = rest.slice(0, rest.length - 8);
+    return `+54 9 ${area} ${local.slice(0, 4)} ${local.slice(4)}`;
+  }
+  if (phone.startsWith("54") && phone.length >= 11) {
+    const rest = phone.slice(2);
+    const local = rest.slice(-8);
+    const area = rest.slice(0, rest.length - 8);
+    return `+54 ${area} ${local.slice(0, 4)} ${local.slice(4)}`;
+  }
+  return `+${phone}`;
+}
+
+// "hoy 14:30" / "mañana 9:00" / "ayer 21:00" / "vie 26 abr 14:30"
+// (con año si es otro año). Usa Intl es-AR igual que otras partes
+// del dashboard. Strip dots ("vie." → "vie") para consistencia.
+function waFormatScheduled(iso) {
+  if (!iso) return "?";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const now = new Date();
+  const same = (a, b) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  const hm = new Intl.DateTimeFormat("es-AR", {
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(d);
+  if (same(d, now)) return `hoy ${hm}`;
+  if (same(d, tomorrow)) return `mañana ${hm}`;
+  if (same(d, yesterday)) return `ayer ${hm}`;
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const dateLabel = new Intl.DateTimeFormat("es-AR", {
+    weekday: "short", day: "numeric", month: "short",
+    year: sameYear ? undefined : "numeric",
+  }).format(d).replace(/\./g, "").replace(/,/g, "").replace(/\s+/g, " ").trim();
+  return `${dateLabel} ${hm}`;
+}
+
+function waStatusChip(it) {
+  const s = (it && it.status) || "pending";
+  let cls = s, label = s, title = "";
+  if (s === "pending") {
+    cls = "pending"; label = "pending";
+  } else if (s === "sent") {
+    cls = "sent"; label = "sent";
+    if (it.delta_minutes != null) title = `entregado ${it.delta_minutes}min después de lo programado`;
+  } else if (s === "sent_late") {
+    cls = "sent-late"; label = "sent late";
+    if (it.delta_minutes != null) title = `llegó ${it.delta_minutes}min tarde`;
+  } else if (s === "failed") {
+    cls = "failed"; label = "failed";
+    const bits = [];
+    if (it.last_error) bits.push(it.last_error);
+    if (it.attempt_count) bits.push(`intentos: ${it.attempt_count}`);
+    if (bits.length) title = bits.join(" · ");
+  } else if (s === "cancelled") {
+    cls = "cancelled"; label = "cancelled";
+  }
+  const t = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<span class="wa-chip wa-chip-${cls}"${t}>${escapeHtml(label)}</span>`;
+}
+
+function waActionsHtml(it) {
+  const s = it && it.status;
+  if (s === "pending") {
+    const who = escapeHtml(waContactDisplay(it));
+    return `
+      <button type="button" class="wa-btn wa-btn-cancel" data-wa-action="cancel" aria-label="Cancelar mensaje a ${who}">Cancelar</button>
+      <button type="button" class="wa-btn-link" data-wa-action="reschedule" aria-label="Reprogramar mensaje a ${who}">Reprogramar</button>
+    `;
+  }
+  if (s === "failed") {
+    const who = escapeHtml(waContactDisplay(it));
+    return `<button type="button" class="wa-btn-link" data-wa-action="resend" aria-label="Reenviar mensaje a ${who}">Reenviar</button>`;
+  }
+  return `<span class="wa-action-empty">—</span>`;
+}
+
+function waAttachListeners() {
+  const root = document.getElementById("sec-wa-scheduled-card");
+  if (!root) return;
+  root.addEventListener("click", (ev) => {
+    // Tab switch (delegated, idempotent — same tab is no-op).
+    const tab = ev.target.closest("button[data-wa-tab]");
+    if (tab) {
+      ev.preventDefault();
+      if (tab.dataset.waTab === state.waTab) return;
+      state.waTab = tab.dataset.waTab;
+      state.waLastSig = "";  // force re-render on tab change
+      renderWaScheduled();
+      return;
+    }
+    const btn = ev.target.closest("[data-wa-action]");
+    if (!btn) return;
+    const action = btn.dataset.waAction;
+    // The reschedule popover lives in its own <tr> appended after the
+    // target row — find the target via data-target-id when we're inside it.
+    const popupRow = btn.closest("tr.wa-resched-row");
+    let id;
+    if (popupRow) {
+      id = Number(popupRow.dataset.targetId);
+    } else {
+      const tr = btn.closest("tr[data-wa-id]");
+      if (!tr) return;
+      id = Number(tr.dataset.waId);
+    }
+    if (action === "cancel") return waCancel(id);
+    if (action === "resend") return waResend(id);
+    if (action === "reschedule") return waToggleReschedule(id);
+    if (action === "reschedule-confirm") return waConfirmReschedule(id);
+    if (action === "reschedule-cancel") return waCloseReschedule(id);
+    if (action === "reschedule-chip") return waApplyChip(btn, id);
+  });
+}
+
+function waCancel(id) {
+  const item = (state.waItems || []).find(x => x.id === id);
+  if (!item || item.status !== "pending") return;
+  if (!confirm(`¿Cancelar el mensaje programado a ${waContactDisplay(item)}?`)) return;
+
+  // Optimistic update: flip status to cancelled in the local list and
+  // re-render. Revert on server NACK.
+  const prevStatus = item.status;
+  item.status = "cancelled";
+  state.waLastSig = "";
+  renderWaScheduled();
+
+  fetch(`/api/whatsapp/scheduled/${id}/cancel`, { method: "POST" })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+    .then(data => {
+      if (data && data.ok) {
+        // Pull authoritative state (sent_at, etc.).
+        refreshWaScheduled();
+      } else {
+        item.status = prevStatus;
+        state.waLastSig = "";
+        renderWaScheduled();
+        alert(`No se pudo cancelar: ${(data && data.reason) || "desconocido"}`);
+      }
+    })
+    .catch(err => {
+      item.status = prevStatus;
+      state.waLastSig = "";
+      renderWaScheduled();
+      alert(`Error cancelando: ${err.message}`);
+    });
+}
+
+function waResend(id) {
+  const item = (state.waItems || []).find(x => x.id === id);
+  if (!item) return;
+  if (!confirm(`¿Mandar este mensaje fallido ahora a ${waContactDisplay(item)}?`)) return;
+
+  // Locate the resend button to disable while in flight.
+  const tr = document.querySelector(`tr[data-wa-id="${id}"]`);
+  const btn = tr && tr.querySelector('[data-wa-action="resend"]');
+  if (btn) { btn.disabled = true; btn.textContent = "enviando…"; }
+
+  const payload = {
+    jid: item.jid,
+    message_text: item.message_text || "",
+  };
+  if (item.contact_name) payload.contact_name = item.contact_name;
+
+  fetch("/api/whatsapp/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, data: d })))
+    .then(({ ok, status, data }) => {
+      if (!ok) {
+        const reason = (data && (data.detail || data.reason)) || `HTTP ${status}`;
+        if (btn) { btn.disabled = false; btn.textContent = "Reenviar"; }
+        alert(`Error reenviando: ${reason}`);
+        return;
+      }
+      // /send doesn't mutate the failed scheduled row — refresh anyway
+      // so any new event/state is reflected.
+      refreshWaScheduled();
+    })
+    .catch(err => {
+      if (btn) { btn.disabled = false; btn.textContent = "Reenviar"; }
+      alert(`Error reenviando: ${err.message}`);
+    });
+}
+
+function waToggleReschedule(id) {
+  // Close any other open popover (single-popover invariant).
+  document.querySelectorAll("tr.wa-resched-row").forEach(r => {
+    if (r.dataset.targetId !== String(id)) r.remove();
+  });
+  // Toggle this one.
+  const existing = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
+  if (existing) { existing.remove(); return; }
+
+  const item = (state.waItems || []).find(x => x.id === id);
+  const tr = document.querySelector(`tr[data-wa-id="${id}"]`);
+  if (!item || !tr) return;
+  const initialLocal = waIsoToLocalInput(item.scheduled_for_utc);
+
+  const popup = document.createElement("tr");
+  popup.className = "wa-resched-row";
+  popup.dataset.targetId = String(id);
+  popup.innerHTML = `
+    <td colspan="5">
+      <div class="wa-resched">
+        <label class="wa-resched-label">
+          <span>Nueva fecha/hora:</span>
+          <input type="datetime-local" class="wa-resched-input" value="${escapeHtml(initialLocal)}">
+        </label>
+        <div class="wa-resched-chips" role="group" aria-label="Atajos rápidos">
+          <button type="button" class="wa-chip-quick" data-wa-action="reschedule-chip" data-delta="15">+15min</button>
+          <button type="button" class="wa-chip-quick" data-wa-action="reschedule-chip" data-delta="60">+1h</button>
+          <button type="button" class="wa-chip-quick" data-wa-action="reschedule-chip" data-delta="180">+3h</button>
+          <button type="button" class="wa-chip-quick" data-wa-action="reschedule-chip" data-delta="tomorrow-9">Mañana 9hs</button>
+        </div>
+        <div class="wa-resched-actions">
+          <button type="button" class="wa-btn wa-btn-confirm" data-wa-action="reschedule-confirm">Confirmar</button>
+          <button type="button" class="wa-btn-link" data-wa-action="reschedule-cancel">Cancelar</button>
+        </div>
+        <div class="wa-resched-error" role="alert" aria-live="polite" hidden></div>
+      </div>
+    </td>
+  `;
+  tr.parentNode.insertBefore(popup, tr.nextSibling);
+  // Focus the input for keyboard users.
+  const input = popup.querySelector(".wa-resched-input");
+  if (input) input.focus();
+}
+
+function waCloseReschedule(id) {
+  const popup = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
+  if (popup) popup.remove();
+}
+
+function waApplyChip(btn, id) {
+  const popup = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
+  if (!popup) return;
+  const input = popup.querySelector(".wa-resched-input");
+  if (!input) return;
+  const delta = btn.dataset.delta;
+  const now = new Date();
+  let target;
+  if (delta === "tomorrow-9") {
+    target = new Date(now);
+    target.setDate(now.getDate() + 1);
+    target.setHours(9, 0, 0, 0);
+  } else {
+    const min = Number(delta);
+    target = new Date(now.getTime() + min * 60_000);
+  }
+  input.value = waDateToLocalInput(target);
+}
+
+function waConfirmReschedule(id) {
+  const popup = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
+  if (!popup) return;
+  const input = popup.querySelector(".wa-resched-input");
+  const errEl = popup.querySelector(".wa-resched-error");
+  const setErr = (msg) => {
+    if (!errEl) return;
+    errEl.textContent = msg;
+    errEl.hidden = !msg;
+  };
+  setErr("");
+  const v = input && input.value;
+  if (!v) { setErr("elegí una fecha/hora"); return; }
+
+  // datetime-local emits "YYYY-MM-DDTHH:MM" without offset; the server
+  // assumes -03:00 (AR) when none is present.
+  const confirmBtn = popup.querySelector('[data-wa-action="reschedule-confirm"]');
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = "guardando…"; }
+
+  fetch(`/api/whatsapp/scheduled/${id}/reschedule`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scheduled_for: v }),
+  })
+    .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, data: d })))
+    .then(({ ok, status, data }) => {
+      if (!ok || !(data && data.ok)) {
+        const reason = (data && (data.detail || data.reason)) || `HTTP ${status}`;
+        setErr("no se pudo: " + reason);
+        if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = "Confirmar"; }
+        return;
+      }
+      popup.remove();
+      refreshWaScheduled();
+    })
+    .catch(err => {
+      setErr("error: " + err.message);
+      if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = "Confirmar"; }
+    });
+}
+
+function waIsoToLocalInput(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return waDateToLocalInput(d);
+}
+
+function waDateToLocalInput(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }

@@ -2043,6 +2043,36 @@ _OLLAMA_TOOL_CLIENT = ollama.Client(timeout=_OLLAMA_TOOL_TIMEOUT)
 # scope so there's one source of truth.
 _WEB_CHAT_NUM_CTX = 4096
 
+# Critique loop env-gate (rollout 2026-04-25, default OFF).
+#
+# El critique pass vive en `rag.run_parallel_post_process` (ver
+# rag/__init__.py:17671) y corre post-stream sobre la respuesta del LLM
+# para detectar/regenerar respuestas mal-citadas o débiles. El CLI lo
+# expone via `--critique` flag; el endpoint web NUNCA lo invocó (audit
+# telemetría 7d / 919 web queries: `critique_fired=0` en TODOS los rows).
+#
+# Esta constante habilita el wiring del critique en `/api/chat` cuando
+# el operador exporta `RAG_CRITIQUE_ENABLED=1`. Default OFF para que el
+# rollout sea reversible sin redeploy. Hacelo via env var (no per-request
+# field en ChatRequest) para evitar surface-area en la API pública
+# durante la fase de validación; si el critique demuestra mejora medible
+# en grounding, lo promocionamos a un knob user-facing en una segunda
+# pasada.
+#
+# NOTA (developer-1, 2026-04-25): la constante está definida pero el
+# wiring del critique pass al stream NO está aplicado todavía. El CLI
+# usa `run_parallel_post_process` post-stream con re-emisión condicional
+# del answer corregido — replicar eso en el endpoint web requiere
+# decidir UX (¿re-emitimos un `update` SSE event? ¿pre-buffereamos la
+# respuesta?) + propagar args (docs/metas/scores) al post-process. Es
+# >5 líneas de cambio + decisión de producto sobre el shape del SSE
+# stream, así que queda gateado por esta env var pero sin consumer
+# hasta que rag-llm valide el approach.
+_CRITIQUE_ENABLED = (
+    os.environ.get("RAG_CRITIQUE_ENABLED", "0").strip().lower()
+    in ("1", "true", "yes")
+)
+
 
 def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
     """Deep probe: does `/api/chat` actually stream a token within `timeout_s`?
@@ -2351,13 +2381,66 @@ class WhatsAppSendRequest(BaseModel):
     message_text: str             # literal message body (no anti-loop prefix)
     proposal_id: str | None = None  # for audit — id of the draft the UI confirmed
     reply_to: WhatsAppReplyTarget | None = None  # populated when this is a reply
+    # Si viene populado, en vez de mandar al bridge, programamos el
+    # envío via `rag.wa_scheduled.schedule()`. Acepta ISO8601 con
+    # offset (LLM emite "2026-04-26T09:00:00-03:00") o sin offset
+    # (datetime-local del HTML, asumimos TZ Argentina). Vacío / null →
+    # legacy path (envío inmediato).
+    scheduled_for: str | None = None
+    contact_name: str | None = None  # opcional, informativo (lo guarda la tabla)
+
+
+_AR_OFFSET = "-03:00"
+"""Default TZ Argentina (no DST). Aplicado a inputs sin offset."""
+
+
+def _parse_scheduled_for_to_utc(raw: str) -> str:
+    """Acepta el ``scheduled_for`` que viene del frontend y devuelve un
+    ISO8601 UTC ``"YYYY-MM-DDTHH:MM:SS+00:00"`` listo para guardar en
+    ``rag_whatsapp_scheduled``.
+
+    Formatos aceptados:
+      - ISO8601 con offset: ``"2026-04-26T09:00:00-03:00"`` (lo que
+        emite el LLM en la proposal).
+      - ISO8601 sin offset: ``"2026-04-26T09:00"`` o
+        ``"2026-04-26T09:00:00"`` (lo que emite ``<input
+        type="datetime-local">``). Asumimos TZ Argentina (-03:00).
+
+    Raisea ``ValueError`` con mensaje legible si no parsea — el caller
+    convierte a HTTPException 400. NO valida que esté en el futuro
+    (eso lo hace ``wa_scheduled.schedule()`` con margen para clock
+    skew y cap de horizonte).
+    """
+    if not isinstance(raw, str):
+        raise ValueError("scheduled_for debe ser string ISO8601")
+    s = raw.strip()
+    if not s:
+        raise ValueError("scheduled_for vacío")
+    candidate = s
+    # ``datetime.fromisoformat`` 3.11+ acepta "Z" como sufijo, pero
+    # forzamos consistencia: si no hay offset, asumimos AR.
+    has_offset = (
+        candidate.endswith("Z")
+        or "+" in candidate[10:]
+        or candidate[10:].count("-") > 0
+    )
+    if not has_offset:
+        candidate = candidate + _AR_OFFSET
+    try:
+        from datetime import datetime, timezone  # noqa: PLC0415
+        dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            raise ValueError("falta timezone tras normalización")
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except ValueError as e:
+        raise ValueError(f"scheduled_for inválido: {e}") from e
 
 
 @app.post("/api/whatsapp/send")
 def whatsapp_send(req: WhatsAppSendRequest) -> dict:
-    """Execute a WhatsApp send after the user clicked [Enviar] on a
-    ``propose_whatsapp_send`` (or ``propose_whatsapp_reply``) proposal
-    card in the chat UI.
+    """Execute a WhatsApp send after the user clicked [Enviar] (envío
+    inmediato) o [Programar] (envío diferido) on a ``propose_whatsapp_send``
+    / ``propose_whatsapp_reply`` proposal card.
 
     Flow:
       1. `propose_whatsapp_send` (chat tool) resolves contact → JID and
@@ -2369,10 +2452,14 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
          [Editar] / [Cancelar] buttons. When it's a reply the original
          message is shown above the textarea as a styled blockquote.
       3. On [Enviar] the UI POSTs to this endpoint with `{jid,
-         message_text, proposal_id, reply_to?}`. We call
-         `_whatsapp_send_to_jid` with ``anti_loop=False`` so the
-         zero-width space prefix (used for bot-to-self traffic) doesn't
-         leak to a third-party's WhatsApp.
+         message_text, proposal_id, reply_to?, scheduled_for?}`.
+         - Sin ``scheduled_for``: llamamos `_whatsapp_send_to_jid` con
+           ``anti_loop=False`` y se entrega ya.
+         - Con ``scheduled_for``: NO mandamos al bridge — guardamos el
+           row en ``rag_whatsapp_scheduled`` (status='pending') y el
+           plist ``com.fer.obsidian-rag-wa-scheduled-send`` lo entrega
+           cuando vence. Devolvemos ``{ok, scheduled: true, id,
+           scheduled_for_utc}``.
 
     Replies (``reply_to`` present):
       - The bridge today (`whatsapp-mcp/whatsapp-bridge/main.go:707`)
@@ -2383,10 +2470,10 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
       - The audit log records ``reply_to_id`` so we can correlate the
         outbound message with the original incoming message later.
 
-    Returns ``{ok: true, jid}`` on success, raises 400/502 on bridge
-    unreachable or 4xx/5xx. Rate-limited by the same IP bucket as
-    ``/api/chat`` because a tight loop from a compromised client could
-    spam arbitrary contacts.
+    Returns ``{ok: true, jid}`` (immediate) or ``{ok: true, scheduled:
+    true, id, scheduled_for_utc}`` (deferred). Raises 400 on shape
+    problems, 502 on bridge unreachable. Rate-limited by the same IP
+    bucket as ``/api/chat``.
     """
     jid = (req.jid or "").strip()
     body = (req.message_text or "").strip()
@@ -2405,6 +2492,29 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
             "original_text": req.reply_to.original_text or "",
             "sender_jid": req.reply_to.sender_jid or "",
         }
+
+    # ── Deferred path: si viene scheduled_for lo guardamos y salimos. ─
+    if req.scheduled_for:
+        try:
+            scheduled_for_utc = _parse_scheduled_for_to_utc(req.scheduled_for)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        try:
+            from rag import wa_scheduled  # noqa: PLC0415
+            row = wa_scheduled.schedule(
+                jid=jid,
+                message_text=body,
+                scheduled_for_utc=scheduled_for_utc,
+                contact_name=(req.contact_name or "").strip() or None,
+                reply_to=reply_to_payload,
+                proposal_id=req.proposal_id or None,
+                source="chat",
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return {"ok": True, "scheduled": True, **row}
+
+    # ── Immediate path: legacy (sin cambios de comportamiento). ───────
     from rag import _whatsapp_send_to_jid  # noqa: PLC0415
     ok = _whatsapp_send_to_jid(
         jid, body,
@@ -2433,6 +2543,82 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     except Exception:
         pass
     return {"ok": True, "jid": jid}
+
+
+@app.get("/api/whatsapp/scheduled")
+def whatsapp_scheduled_list(
+    status: str | None = None,
+    limit: int = 200,
+) -> dict:
+    """Lista los mensajes de WhatsApp programados para mostrar en el
+    dashboard.
+
+    Query params:
+      - ``status``: filtra por estado (``pending`` | ``sent`` |
+        ``sent_late`` | ``failed`` | ``cancelled``). Sin filtro = todos.
+      - ``limit``: cap de filas devueltas (default 200, sirve hasta
+        que la cola supere ese tamaño y queramos paginación).
+
+    Devuelve ``{items: [...]}`` ordenado por ``scheduled_for_utc ASC``
+    cuando ``status=pending`` (lo más urgente arriba) o por
+    ``created_at DESC`` en otros casos (timeline). El cuerpo de cada
+    mensaje viene truncado a 500 chars en este endpoint para no inflar
+    payloads del dashboard.
+    """
+    try:
+        from rag import wa_scheduled  # noqa: PLC0415
+        items = wa_scheduled.list_scheduled(
+            status=status if (status or "").strip() else None,
+            limit=max(1, min(int(limit), 1000)),
+        )
+        return {"items": items, "count": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error listando scheduled: {e}") from e
+
+
+@app.post("/api/whatsapp/scheduled/{scheduled_id}/cancel")
+def whatsapp_scheduled_cancel(scheduled_id: int) -> dict:
+    """Cancela un mensaje pending. Idempotente: si ya está en otro
+    estado, devuelve ``{ok: false, reason}`` sin error 4xx/5xx (el
+    dashboard puede simplemente refrescar la fila).
+    """
+    try:
+        from rag import wa_scheduled  # noqa: PLC0415
+        ok = wa_scheduled.cancel(int(scheduled_id), reason="user_cancel_dashboard")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error cancelando: {e}") from e
+    if not ok:
+        return {"ok": False, "reason": "not_pending_or_not_found"}
+    return {"ok": True, "id": int(scheduled_id), "status": "cancelled"}
+
+
+class WhatsAppRescheduleRequest(BaseModel):
+    scheduled_for: str  # mismo formato que WhatsAppSendRequest
+
+
+@app.post("/api/whatsapp/scheduled/{scheduled_id}/reschedule")
+def whatsapp_scheduled_reschedule(
+    scheduled_id: int,
+    req: WhatsAppRescheduleRequest,
+) -> dict:
+    """Reprograma un mensaje pending para una nueva fecha/hora. Solo
+    funciona si el row está en ``status='pending'`` (mismo guard que
+    cancel — no rescheduleamos `sent`/`failed`/`cancelled`).
+    """
+    try:
+        scheduled_for_utc = _parse_scheduled_for_to_utc(req.scheduled_for)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    try:
+        from rag import wa_scheduled  # noqa: PLC0415
+        ok = wa_scheduled.reschedule(int(scheduled_id), scheduled_for_utc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error rescheduleando: {e}") from e
+    if not ok:
+        return {"ok": False, "reason": "not_pending_or_not_found"}
+    return {"ok": True, "id": int(scheduled_id), "scheduled_for_utc": scheduled_for_utc}
 
 
 class MailSendRequest(BaseModel):
@@ -5254,9 +5440,19 @@ def _ensure_corpus_prewarmer() -> None:
 #
 # Cache key: sha256(question|vault_scope|chat_model|vault_chunks_count)[:16].
 # Incluir el chunks count efectivamente invalida el cache cuando el vault
-# gana/pierde notas (count cambia → key cambia). TTL secundario 5min para
+# gana/pierde notas (count cambia → key cambia). TTL secundario para
 # invalidar respuestas sin cambio de vault pero con información que puede
 # haber envejecido (ej. `rag tune` refinó pesos → retrieval diferente).
+#
+# Pre-2026-04-25 era 300s (5min), bumped a 24h tras audit telemétrico que
+# mostró 3% hit rate (28 entries / 919 queries 7d) vs el 15-25% esperado:
+# el TTL corto tiraba la mayoría de respuestas antes de la siguiente
+# query equivalente. El vault_chunks count en la key ya invalida cuando
+# el contenido cambia, así que el TTL solo defiende contra "data
+# externa" (calendar, gmail, WA) — pero esos paths ya tienen short-
+# circuits separados (`_wa_in_query`, propose-intent, source-specific).
+# Override via env si causa problemas: `RAG_WEB_CHAT_CACHE_TTL=300` para
+# rollback al valor previo.
 #
 # No cacheamos cuando:
 #   - hay history (follow-ups dependen del turno previo, el key no refleja eso)
@@ -5264,7 +5460,7 @@ def _ensure_corpus_prewarmer() -> None:
 #   - _wa_in_query matcheó (WA data change rápidamente, datos frescos importan)
 _CHAT_CACHE: "OrderedDict[str, dict]" = __import__("collections").OrderedDict()
 _CHAT_CACHE_MAX = 100
-_CHAT_CACHE_TTL = 300.0  # 5 min
+_CHAT_CACHE_TTL = float(os.environ.get("RAG_WEB_CHAT_CACHE_TTL", "86400"))  # default 24h, override via env
 _CHAT_CACHE_LOCK = threading.Lock()
 
 
@@ -7825,6 +8021,36 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             m.get("role") == "system" and m.get("content") == _WEB_TOOL_ADDENDUM
         )]
 
+        # Adaptive num_ctx (2026-04-25, developer-1).
+        #
+        # Pre-fix the streaming call always passed `num_ctx=4096` (or
+        # `_LOOKUP_NUM_CTX=4096` on fast-path), so prefill paid for the
+        # full 4K KV cache even when the actual content fit in 1.5K
+        # tokens. Telemetría 7d (919 web queries) mostraba `num_ctx=4096`
+        # parejo para "hola" (5 chars) y para queries con 6K chars de
+        # tool output — el costo de prefill no era sensible al input.
+        #
+        # Heurística: 1 char ≈ 0.25 tokens (conservador para español;
+        # qwen2.5 tokenizer suele dar ~0.22-0.28 tok/char). +512 buffer
+        # cubre el system prompt overhead + el num_predict=256 reply.
+        # Floor 1024 protege queries vacías o tool-only responses (sin
+        # esto, queries degenerate + tools podían terminar en num_ctx <
+        # 600 que ollama rechaza). Cap 4096 mantiene el ceiling histórico
+        # — nunca pedimos MÁS contexto del que la KV cache estaba
+        # configurada para sostener, así no rompemos prefix caching.
+        #
+        # Logueado abajo en `extra_json.adaptive_num_ctx` para medir
+        # impacto real en p50/p95 de prefill (esperado: queries cortas
+        # de saludo / propose intent caen de ~1.5s a ~0.5s prefill, vault
+        # queries largas no cambian porque ya saturaban los 4096).
+        # Variable separada (`_final_ctx_chars`) del `_ctx_chars` pre-tool
+        # de línea 7190 — el segundo loggea pre-tool size para el printk
+        # `[chat-timing]`, este mide post-tool para la decisión de KV.
+        _final_ctx_chars = sum(len(m.get("content", "")) for m in final_messages)
+        _adaptive_num_ctx = min(4096, max(1024, (_final_ctx_chars // 4) + 512))
+        _stream_options = dict(_WEB_CHAT_OPTIONS)
+        _stream_options["num_ctx"] = _adaptive_num_ctx
+
         parts: list[str] = []
         stripper = _InlineCitationStripper()
         # 2026-04-23: chain de filtro de leaks portugueses/gallegos
@@ -7839,7 +8065,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             for chunk in _OLLAMA_STREAM_CLIENT.chat(
                 model=_web_model,
                 messages=final_messages,
-                options=_WEB_CHAT_OPTIONS,
+                options=_stream_options,
                 stream=True,
                 think=False,   # the user-facing stream never includes a
                                # <think> preamble. Thinking-capable models
@@ -7968,6 +8194,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "llm_prefill_ms": int(_t_llm_prefill_ms),
             "llm_decode_ms": int(_t_llm_decode_ms),
             "total_ms": int(_t_total_ms),
+            # Adaptive num_ctx (2026-04-25, developer-1) — el ceiling KV
+            # efectivo que pasamos al streaming call. Pre-fix era fijo en
+            # 4096; ahora es min(4096, max(1024, char_count//4 + 512)),
+            # con cap igual al pre-fix value para que no rompa prefix
+            # caching. Cruzar contra `llm_prefill_ms` para medir si bajar
+            # el ctx para queries chicas reduce prefill (esperado: queries
+            # de saludo / propose intent caen ~1.0s, vault queries
+            # largas no cambian). El campo `final_ctx_chars` es el input
+            # crudo a la heurística (todos los message.content del
+            # streaming call concatenados), útil para reverse-engineering
+            # del cálculo si la heurística necesita re-tuning.
+            "adaptive_num_ctx": int(_adaptive_num_ctx),
+            "final_ctx_chars": int(_final_ctx_chars),
             # fast_path marker (Improvement #3): True when adaptive routing
             # judged the query eligible for the small-model fast path
             # (semantic intent + top-1 rerank > 0.6, OR WA majority per

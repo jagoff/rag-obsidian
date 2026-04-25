@@ -923,6 +923,317 @@
       .container { padding: 16px 14px 40px; }
     }
 
+    /* ── WhatsApp scheduled messages section ────────────────────────────
+       Tabs simples + tabla semántica + popover inline para reprogramar.
+       En mobile (<=640px) la tabla colapsa a cards via `data-label` en
+       cada `<td>` (el patrón "responsive table sin JS"). Sin libs.
+    */
+    .wa-pending-badge {
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--text-faint);
+      margin-left: 6px;
+    }
+    .wa-tabs {
+      display: flex;
+      gap: 4px;
+      margin: 12px 0 10px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .wa-tab {
+      background: transparent;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 12px;
+      padding: 8px 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 120ms, border-color 120ms;
+    }
+    .wa-tab:hover { color: var(--text); }
+    .wa-tab.active {
+      color: var(--text);
+      border-bottom-color: var(--cyan);
+    }
+    .wa-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--cyan); }
+    .wa-tab-count {
+      font-size: 10px;
+      color: var(--text-faint);
+      background: var(--sep);
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+    .wa-tab.active .wa-tab-count,
+    .wa-tab[aria-selected="true"] .wa-tab-count {
+      color: var(--cyan);
+      background: rgba(121, 192, 255, 0.12);
+    }
+    .wa-tab:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: -2px;
+      border-radius: 4px 4px 0 0;
+    }
+
+    .wa-scheduled-body {
+      min-height: 60px;
+    }
+    .wa-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .wa-table th,
+    .wa-table td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--sep);
+      vertical-align: top;
+    }
+    .wa-table th {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-faint);
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    .wa-table tbody tr:hover { background: var(--hover); }
+    .wa-table tbody tr:last-child td { border-bottom: 0; }
+    .wa-who {
+      color: var(--cyan);
+      text-decoration: none;
+      border-bottom: 1px dotted currentColor;
+      font-variant-numeric: tabular-nums;
+    }
+    a.wa-who:hover { color: var(--text); }
+    .wa-msg {
+      color: var(--text-dim);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .wa-when {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .wa-chip {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+      background: var(--sep);
+      color: var(--text-faint);
+      border: 1px solid transparent;
+    }
+    .wa-chip-pending {
+      color: var(--text-faint);
+      background: var(--sep);
+    }
+    .wa-chip-sent {
+      color: var(--green);
+      background: rgba(126, 231, 135, 0.1);
+      border-color: rgba(126, 231, 135, 0.25);
+    }
+    .wa-chip-sent-late {
+      color: var(--orange);
+      background: rgba(255, 166, 87, 0.1);
+      border-color: rgba(255, 166, 87, 0.3);
+      cursor: help;
+    }
+    .wa-chip-failed {
+      color: var(--red);
+      background: rgba(255, 123, 114, 0.1);
+      border-color: rgba(255, 123, 114, 0.3);
+      cursor: help;
+    }
+    .wa-chip-cancelled {
+      color: var(--text-faint);
+      background: var(--sep);
+      opacity: 0.55;
+    }
+
+    .wa-actions {
+      white-space: nowrap;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .wa-action-empty { color: var(--text-faint); font-size: 11px; }
+    .wa-btn,
+    .wa-btn-link,
+    .wa-chip-quick {
+      font-family: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      border-radius: 4px;
+      padding: 4px 10px;
+      transition: background 120ms, color 120ms, border-color 120ms;
+    }
+    .wa-btn {
+      background: transparent;
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+    }
+    .wa-btn:hover { background: var(--hover); }
+    .wa-btn-cancel {
+      color: var(--red);
+      border-color: rgba(255, 123, 114, 0.4);
+    }
+    .wa-btn-cancel:hover {
+      background: rgba(255, 123, 114, 0.1);
+      border-color: var(--red);
+    }
+    .wa-btn-confirm {
+      color: var(--green);
+      border-color: rgba(126, 231, 135, 0.4);
+    }
+    .wa-btn-confirm:hover {
+      background: rgba(126, 231, 135, 0.1);
+      border-color: var(--green);
+    }
+    .wa-btn-link {
+      background: transparent;
+      border: 0;
+      color: var(--cyan);
+      padding: 4px 6px;
+      text-decoration: none;
+      border-bottom: 1px dotted transparent;
+    }
+    .wa-btn-link:hover {
+      border-bottom-color: var(--cyan);
+    }
+    .wa-btn:focus-visible,
+    .wa-btn-link:focus-visible,
+    .wa-chip-quick:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
+    }
+    .wa-btn[disabled],
+    .wa-btn-link[disabled] {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    /* Reschedule popover — vive en un <tr> que se appendea después del
+       row target. `colspan="5"` ocupa todo el ancho de la tabla. */
+    .wa-resched-row td {
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border) !important;
+    }
+    .wa-resched {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      padding: 4px 0;
+    }
+    .wa-resched-label {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .wa-resched-input {
+      background: var(--bg-card);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .wa-resched-input:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
+    }
+    .wa-resched-chips {
+      display: inline-flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .wa-chip-quick {
+      background: var(--sep);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+    }
+    .wa-chip-quick:hover {
+      color: var(--cyan);
+      border-color: var(--cyan);
+    }
+    .wa-resched-actions {
+      display: inline-flex;
+      gap: 6px;
+      margin-left: auto;
+    }
+    .wa-resched-error {
+      flex-basis: 100%;
+      color: var(--red);
+      font-size: 11px;
+    }
+
+    /* Mobile: la tabla colapsa a cards. Ocultamos thead, cada <tr> se
+       comporta como un card, y cada <td> usa data-label como prefix
+       (label : valor en una fila flex). */
+    @media (max-width: 640px) {
+      .wa-table thead { display: none; }
+      .wa-table,
+      .wa-table tbody,
+      .wa-table tr,
+      .wa-table td { display: block; width: 100%; }
+      .wa-table tr {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 8px;
+        padding: 6px 10px;
+        background: var(--bg-card);
+      }
+      .wa-table tbody tr:last-child td { border-bottom: 1px solid var(--sep); }
+      .wa-table td {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 6px 0;
+        border-bottom: 1px solid var(--sep);
+      }
+      .wa-table td:last-child { border-bottom: 0; }
+      .wa-table td::before {
+        content: attr(data-label);
+        color: var(--text-faint);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        flex-shrink: 0;
+        font-weight: 600;
+        padding-top: 1px;
+      }
+      .wa-actions { justify-content: flex-end; }
+      .wa-msg { text-align: right; max-width: 65%; }
+      .wa-resched-row td { display: block; }
+      .wa-resched-row td::before { display: none; }
+      .wa-resched { flex-direction: column; align-items: stretch; }
+      .wa-resched-actions { margin-left: 0; }
+      /* Tap targets — empareja la regla genérica al final del <style>. */
+      .wa-btn, .wa-btn-link, .wa-chip-quick, .wa-tab { min-height: 36px; }
+    }
+
   </style>
 </head>
 <body>

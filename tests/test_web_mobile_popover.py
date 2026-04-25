@@ -278,3 +278,86 @@ def test_quick_chips_max_width_responsive():
         "#quick-chips max-width debe ser responsive (min(760px, 100%)) "
         "en lugar de hard-coded 760px"
     )
+
+
+# ── Proposal cards iOS auto-zoom prevention ────────────────────────────────
+
+
+def test_proposal_inputs_16px_on_mobile_to_prevent_ios_zoom():
+    """`.proposal-wa-text` (inputs/textarea de las tarjetas de
+    propuesta) deben ser >=16px en mobile para que iOS Safari no
+    haga auto-zoom al focusear. Aplicado tanto al WhatsApp send/reply
+    como al mail (los 3 inputs comparten la clase)."""
+    import re
+    pat = re.compile(
+        r'@media \([^)]*max-width:\s*480px[^)]*\)[^{]*\{[^}]*'
+        r'\.proposal-wa-text\s*\{[^}]*font-size:\s*16px',
+        re.DOTALL,
+    )
+    assert pat.search(_STYLE_CSS) is not None, (
+        "@media para mobile debe forzar .proposal-wa-text a font-size:16px "
+        "— sino iOS auto-zoomea al focusear el textarea de WhatsApp/mail"
+    )
+
+
+def test_proposal_buttons_have_touch_action_manipulation():
+    """Botones de propuesta (Enviar/Cancelar/Crear) deben tener
+    `touch-action: manipulation` para sacar el delay de 300ms del tap
+    en iOS."""
+    assert ".proposal-btn" in _STYLE_CSS
+    # Buscar el bloque que define touch-action para .proposal-btn.
+    import re
+    pat = re.compile(
+        r'\.proposal-btn[^{]*\{[^}]*touch-action:\s*manipulation',
+        re.DOTALL,
+    )
+    assert pat.search(_STYLE_CSS) is not None, (
+        ".proposal-btn debe declarar touch-action:manipulation para "
+        "feedback visual inmediato al tocar [Enviar]"
+    )
+
+
+# ── Dashboard + status mobile (overflow + header wrap) ────────────────────
+
+
+def test_dashboard_html_has_overflow_x_hidden():
+    """Bug histórico: <caption class='sr-only'> en una tabla del
+    dashboard tenía scrollWidth=771 que forzaba el body a 700px en
+    viewport de 375px. Fix: overflow-x: hidden en html/body clipea
+    el sr-only sin afectar visualmente."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent /
+            "web" / "static" / "dashboard.html").read_text(encoding="utf-8")
+    assert "overflow-x: hidden" in html, (
+        "dashboard.html necesita overflow-x:hidden en html/body para que "
+        "los screen-reader-only captions no rompan el layout responsive"
+    )
+
+
+def test_status_html_has_overflow_x_hidden():
+    """Mismo patrón que dashboard.html — defensa en profundidad contra
+    cualquier child que se overflow horizontal."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent /
+            "web" / "static" / "status.html").read_text(encoding="utf-8")
+    assert "overflow-x: hidden" in html
+
+
+def test_dashboard_header_wraps_on_mobile():
+    """El <header> del dashboard tiene `flex-wrap: wrap` para que h1
+    + header-meta no se overlap en mobile. Sin esto, en viewport de
+    375px el "rag · dashboard" choca contra el "actualizado HH:MM" y
+    el days-picker queda off-screen."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent /
+            "web" / "static" / "dashboard.html").read_text(encoding="utf-8")
+    # El bloque `header { display: flex; ... flex-wrap: wrap; }`.
+    import re
+    pat = re.compile(
+        r'header\s*\{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap',
+        re.DOTALL,
+    )
+    assert pat.search(html) is not None, (
+        "dashboard.html <header> necesita flex-wrap:wrap para que en "
+        "mobile h1 + meta no se overlap"
+    )

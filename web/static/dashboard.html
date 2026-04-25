@@ -126,6 +126,12 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     html, body {
+      /* Defensa en profundidad: cualquier child que se overflow horizontal
+         se clipea acá en lugar de hacer al body más ancho que el viewport.
+         Bug histórico (2026-04-24): un <caption class="sr-only"> con
+         scrollWidth=771 forzaba al body a 700px en viewport de 375px,
+         rompiendo el layout responsive entero. */
+      overflow-x: hidden;
       background: var(--bg);
       color: var(--text);
       font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
@@ -152,6 +158,12 @@
       display: flex;
       align-items: baseline;
       justify-content: space-between;
+      /* Permite que h1 + header-meta wrappeen a 2 líneas en mobile en
+         lugar de superponerse. Sin esto, en viewports angostos los
+         elementos del meta (picker de días, live toggle, etc.) se
+         empujan por afuera del viewport. */
+      flex-wrap: wrap;
+      gap: 8px 12px;
       margin-bottom: 28px;
       padding: 14px 0 16px;
       border-bottom: 1px solid var(--border);
@@ -892,6 +904,25 @@
       .ticker-item { grid-template-columns: 50px 60px 1fr 50px; }
       .ticker-item .t-latency { display: none; }
     }
+    /* Mobile: header-meta wrappea + chip-style. h1 más chico (16px vs
+       18px) para dejar lugar al meta sin que se rompa. Date picker
+       toma ancho fijo más chico; live-toggle compacta el dot+label. */
+    @media (max-width: 640px) {
+      header {
+        gap: 6px 10px;
+      }
+      header h1 { font-size: 16px; }
+      .header-meta {
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .header-meta select {
+        font-size: 13px;
+        padding: 4px 22px 4px 6px;
+      }
+      .container { padding: 16px 14px 40px; }
+    }
+
   </style>
 </head>
 <body>

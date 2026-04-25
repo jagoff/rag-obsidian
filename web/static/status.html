@@ -103,6 +103,12 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     html, body {
+      /* Defensa en profundidad: cualquier child que se overflow horizontal
+         se clipea acá en lugar de hacer al body más ancho que el viewport.
+         Bug histórico (2026-04-24): un <caption class="sr-only"> con
+         scrollWidth=771 forzaba al body a 700px en viewport de 375px,
+         rompiendo el layout responsive entero. */
+      overflow-x: hidden;
       background: var(--bg);
       color: var(--text);
       font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;

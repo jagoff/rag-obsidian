@@ -5695,17 +5695,27 @@ def _ensure_telemetry_tables(conn) -> None:
         # Lazy schema migrations — corren FUERA de la transaction principal
         # porque ALTER TABLE no siempre es transactable y no queremos abortar
         # el DDL batch entero si un ALTER de una sola columna falla.
+        #
+        # Audit follow-up 2026-04-25: pre-fix los except eran `pass` puros, lo
+        # que escondía migrations rotas indefinidamente — el siguiente boot
+        # las reintentaba y volvía a fallar sin que nadie se enterara. Ahora
+        # los logueamos via _silent_log para que aparezcan en el dashboard
+        # `/api/status/errors`. Seguimos NO re-raising — el INSERT del writer
+        # es defensivo y usa el subset de columnas que sí existen.
         try:
             _migrate_cita_detections_add_kind(conn)
-        except Exception:
-            # Silent-fail: si la migration rompe, el INSERT usará el subset
-            # de columnas que sí existen (writer también es defensivo).
-            pass
+        except Exception as _migrate_exc:
+            try:
+                _silent_log("migration_cita_detections_failed", _migrate_exc)
+            except Exception:  # pragma: no cover - log path itself failed
+                pass
         try:
             _migrate_audio_transcripts_phase2(conn)
-        except Exception:
-            # Silent-fail: idem rationale del cita migration.
-            pass
+        except Exception as _migrate_exc:
+            try:
+                _silent_log("migration_audio_transcripts_failed", _migrate_exc)
+            except Exception:  # pragma: no cover - log path itself failed
+                pass
         if db_path:
             _TELEMETRY_DDL_ENSURED_PATHS.add(db_path)
 

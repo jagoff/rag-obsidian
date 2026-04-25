@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -8153,6 +8153,276 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 @app.get("/dashboard")
 def dashboard_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "dashboard.html")
+
+
+# ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
+# Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
+# de las transcripciones de audio, correcciones acumuladas, y top vocab terms
+# que el sistema está aprendiendo. Sirve como observability + para calibrar
+# el threshold del LLM auto-correct (si muchos audios caen en el bucket
+# `avg_logprob < -0.8`, conviene bajar el threshold; si pocos, está bien
+# como está).
+#
+# Doc del plan en el vault:
+# `04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md`
+
+def _esc(s: str) -> str:
+    """HTML escape para evitar XSS desde texto del usuario (chats, transcripts)."""
+    return (str(s) if s is not None else "")\
+        .replace("&", "&amp;")\
+        .replace("<", "&lt;")\
+        .replace(">", "&gt;")\
+        .replace('"', "&quot;")
+
+
+@app.get("/transcripts", response_class=HTMLResponse)
+def transcripts_dashboard() -> HTMLResponse:
+    """Dashboard de telemetría del whisper learning loop."""
+    try:
+        with _ragvec_state_conn() as conn:
+            # Stats globales (últimos 30 días)
+            cutoff_30d = time.time() - 30 * 86400
+            row_global = conn.execute(
+                "SELECT COUNT(*), AVG(avg_logprob), AVG(duration_s) "
+                "FROM rag_audio_transcripts "
+                "WHERE transcribed_at > ?",
+                (cutoff_30d,),
+            ).fetchone()
+            n_30d = row_global[0] or 0
+            avg_lp_30d = row_global[1]
+            avg_dur_30d = row_global[2]
+            n_total = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_transcripts"
+            ).fetchone()[0]
+            # Correcciones — totales y por source
+            n_corrections = conn.execute(
+                "SELECT COUNT(*) FROM rag_audio_corrections"
+            ).fetchone()[0]
+            corr_by_source = dict(conn.execute(
+                "SELECT source, COUNT(*) FROM rag_audio_corrections GROUP BY source"
+            ).fetchall())
+            # Logprob histogram — buckets de 0.2
+            buckets = [
+                ("> -0.2 (excelente)", "avg_logprob > -0.2"),
+                ("-0.4 a -0.2 (alta)", "avg_logprob > -0.4 AND avg_logprob <= -0.2"),
+                ("-0.6 a -0.4 (media)", "avg_logprob > -0.6 AND avg_logprob <= -0.4"),
+                ("-0.8 a -0.6 (baja)", "avg_logprob > -0.8 AND avg_logprob <= -0.6"),
+                ("< -0.8 (LLM correct)", "avg_logprob <= -0.8"),
+            ]
+            hist = []
+            for label, where in buckets:
+                n = conn.execute(
+                    f"SELECT COUNT(*) FROM rag_audio_transcripts WHERE {where}"
+                ).fetchone()[0]
+                hist.append((label, n))
+            # Vocab — totales y por source
+            n_vocab = conn.execute(
+                "SELECT COUNT(*) FROM rag_whisper_vocab"
+            ).fetchone()[0]
+            vocab_by_source = dict(conn.execute(
+                "SELECT source, COUNT(*) FROM rag_whisper_vocab GROUP BY source"
+            ).fetchall())
+            last_vocab_refresh = conn.execute(
+                "SELECT MAX(refreshed_at) FROM rag_whisper_vocab"
+            ).fetchone()[0]
+            # Top vocab por weight (50)
+            top_vocab = conn.execute(
+                "SELECT term, weight, source FROM rag_whisper_vocab "
+                "ORDER BY weight DESC LIMIT 50"
+            ).fetchall()
+            # Últimas 30 transcripciones
+            recent_transcripts = conn.execute(
+                "SELECT audio_path, transcribed_at, avg_logprob, model, "
+                "       text, corrected_text, correction_source, chat_id "
+                "FROM rag_audio_transcripts "
+                "ORDER BY transcribed_at DESC LIMIT 30"
+            ).fetchall()
+            # Top 20 correcciones recientes
+            recent_corrections = conn.execute(
+                "SELECT ts, source, original, corrected "
+                "FROM rag_audio_corrections "
+                "ORDER BY ts DESC LIMIT 20"
+            ).fetchall()
+    except Exception as exc:
+        return HTMLResponse(
+            f"<!doctype html><html><body>"
+            f"<h1>Whisper transcripts</h1>"
+            f"<p>Error reading state: {_esc(str(exc))}</p>"
+            f"<p>¿`telemetry.db` accesible? ¿`RAG_STATE_SQL=1` en el listener?</p>"
+            f"</body></html>",
+            status_code=500,
+        )
+
+    # Renderizar HTML
+    last_refresh_str = "—"
+    if last_vocab_refresh:
+        ago = time.time() - last_vocab_refresh
+        ago_h = int(ago / 3600)
+        ago_m = int((ago % 3600) / 60)
+        last_refresh_str = (
+            f"{datetime.fromtimestamp(last_vocab_refresh).strftime('%Y-%m-%d %H:%M')} "
+            f"({ago_h}h {ago_m}m ago)"
+        )
+    avg_lp_str = f"{avg_lp_30d:.3f}" if avg_lp_30d is not None else "—"
+    avg_dur_str = f"{avg_dur_30d:.1f}s" if avg_dur_30d is not None else "—"
+
+    # Tabla histogram
+    max_hist = max((n for _, n in hist), default=1)
+    hist_rows = "\n".join(
+        f'<tr><td>{_esc(label)}</td>'
+        f'<td style="text-align:right">{n}</td>'
+        f'<td><div style="background:#4a90e2;height:14px;width:{int(200 * n / max(1, max_hist))}px;"></div></td></tr>'
+        for label, n in hist
+    )
+
+    # Tabla top vocab
+    vocab_rows = "\n".join(
+        f'<tr><td style="text-align:right;color:#666">{w:.2f}</td>'
+        f'<td><span style="color:#888;font-size:11px">{_esc(s)}</span></td>'
+        f'<td><strong>{_esc(t)}</strong></td></tr>'
+        for t, w, s in top_vocab
+    )
+
+    # Tabla transcripts
+    def fmt_ts(ts: float | None) -> str:
+        if ts is None:
+            return "—"
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+    def fmt_lp(lp: float | None) -> str:
+        if lp is None:
+            return "<span style='color:#888'>—</span>"
+        color = "#2a7" if lp > -0.4 else ("#b80" if lp > -0.8 else "#c33")
+        return f'<span style="color:{color}">{lp:.2f}</span>'
+
+    transcript_rows = ""
+    for r in recent_transcripts:
+        path, ts, lp, model, text, corrected, corr_src, chat_id = r
+        chat_label = (chat_id or "")[-20:] if chat_id else "—"
+        text_disp = (corrected or text or "")[:100]
+        marker = ""
+        if corr_src == "llm":
+            marker = ' <span style="background:#e3f0ff;padding:1px 4px;border-radius:3px;font-size:10px">llm</span>'
+        elif corr_src == "explicit":
+            marker = ' <span style="background:#dfd;padding:1px 4px;border-radius:3px;font-size:10px">/fix</span>'
+        elif corr_src == "vault_diff":
+            marker = ' <span style="background:#ffe;padding:1px 4px;border-radius:3px;font-size:10px">vault</span>'
+        transcript_rows += (
+            f'<tr>'
+            f'<td>{_esc(fmt_ts(ts))}</td>'
+            f'<td>{fmt_lp(lp)}</td>'
+            f'<td><span style="color:#888;font-size:11px">{_esc((model or "")[:25])}</span></td>'
+            f'<td><span style="color:#888;font-size:11px">{_esc(chat_label)}</span></td>'
+            f'<td>{_esc(text_disp)}{marker}</td>'
+            f'</tr>\n'
+        )
+    if not transcript_rows:
+        transcript_rows = '<tr><td colspan="5" style="color:#888;text-align:center;padding:20px">sin transcripciones logueadas — mandá un audio por WhatsApp para que aparezca acá</td></tr>'
+
+    # Tabla corrections
+    correction_rows = ""
+    for r in recent_corrections:
+        ts, src, orig, corr = r
+        src_color = {"explicit": "#2a7", "llm": "#4a90e2", "vault_diff": "#b80"}.get(src, "#888")
+        correction_rows += (
+            f'<tr>'
+            f'<td>{_esc(fmt_ts(ts))}</td>'
+            f'<td><span style="color:{src_color}">{_esc(src)}</span></td>'
+            f'<td style="color:#c33">{_esc((orig or "")[:80])}</td>'
+            f'<td style="color:#2a7">{_esc((corr or "")[:80])}</td>'
+            f'</tr>\n'
+        )
+    if not correction_rows:
+        correction_rows = '<tr><td colspan="4" style="color:#888;text-align:center;padding:20px">sin correcciones todavía — usá <code>/fix &lt;texto&gt;</code> en WhatsApp para corregir un audio</td></tr>'
+
+    # Stats correcciones por source
+    corr_summary_parts = []
+    for src in ("explicit", "llm", "vault_diff"):
+        n = corr_by_source.get(src, 0)
+        if n > 0:
+            color = {"explicit": "#2a7", "llm": "#4a90e2", "vault_diff": "#b80"}[src]
+            corr_summary_parts.append(f'<span style="color:{color}">{n} {src}</span>')
+    corr_summary = " · ".join(corr_summary_parts) if corr_summary_parts else "0"
+
+    # Stats vocab por source
+    vocab_summary_parts = []
+    for src in ("corrections", "contacts", "notes", "chats"):
+        n = vocab_by_source.get(src, 0)
+        if n > 0:
+            vocab_summary_parts.append(f'{n} {src}')
+    vocab_summary = " · ".join(vocab_summary_parts) if vocab_summary_parts else "0"
+
+    html = f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>whisper transcripts — rag</title>
+<style>
+  body {{ font: 14px/1.4 -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; color: #222; }}
+  h1 {{ font-size: 22px; margin: 0 0 6px 0; }}
+  h2 {{ font-size: 16px; margin: 28px 0 8px 0; color: #444; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
+  .summary {{ display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0 20px 0; }}
+  .stat {{ background: #f7f7f7; padding: 10px 14px; border-radius: 6px; min-width: 140px; }}
+  .stat .num {{ font-size: 20px; font-weight: 600; color: #222; }}
+  .stat .lbl {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ padding: 5px 8px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }}
+  th {{ background: #fafafa; font-weight: 600; font-size: 12px; color: #555; }}
+  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+  @media (max-width: 800px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
+  .meta {{ color: #888; font-size: 12px; margin-top: 4px; }}
+  code {{ background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }}
+</style>
+</head>
+<body>
+  <h1>whisper transcripts</h1>
+  <p class="meta">phase 2 learning loop · vocab refresh: {_esc(last_refresh_str)}</p>
+
+  <div class="summary">
+    <div class="stat"><div class="num">{n_30d}</div><div class="lbl">audios 30d ({n_total} total)</div></div>
+    <div class="stat"><div class="num">{avg_lp_str}</div><div class="lbl">avg logprob (30d)</div></div>
+    <div class="stat"><div class="num">{avg_dur_str}</div><div class="lbl">avg duración (30d)</div></div>
+    <div class="stat"><div class="num">{n_corrections}</div><div class="lbl">correcciones totales</div></div>
+    <div class="stat"><div class="num">{n_vocab}</div><div class="lbl">vocab terms</div></div>
+  </div>
+
+  <div class="grid-2">
+    <div>
+      <h2>logprob histogram</h2>
+      <p class="meta">distribución de confianza de las transcripciones. logprob &lt; -0.8 dispara LLM auto-correct.</p>
+      <table>{hist_rows}</table>
+    </div>
+    <div>
+      <h2>correcciones por source</h2>
+      <p class="meta">{corr_summary}</p>
+      <h2 style="margin-top: 24px">vocab por source</h2>
+      <p class="meta">{vocab_summary}</p>
+    </div>
+  </div>
+
+  <h2>últimas 30 transcripciones</h2>
+  <table>
+    <thead><tr><th>fecha</th><th>logprob</th><th>modelo</th><th>chat</th><th>texto</th></tr></thead>
+    <tbody>{transcript_rows}</tbody>
+  </table>
+
+  <h2>últimas 20 correcciones</h2>
+  <p class="meta">source <span style="color:#2a7">explicit</span> = comando /fix · <span style="color:#4a90e2">llm</span> = qwen2.5:7b auto-correct · <span style="color:#b80">vault_diff</span> = nota editada</p>
+  <table>
+    <thead><tr><th>fecha</th><th>source</th><th>original</th><th>corregido</th></tr></thead>
+    <tbody>{correction_rows}</tbody>
+  </table>
+
+  <h2>top 50 vocab terms (peso DESC)</h2>
+  <p class="meta">se inyecta al <code>--prompt</code> de whisper en cada transcripción. corregido vía <code>rag whisper vocab refresh</code>.</p>
+  <table>
+    <thead><tr><th style="text-align:right">peso</th><th>source</th><th>term</th></tr></thead>
+    <tbody>{vocab_rows}</tbody>
+  </table>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # ── /status — service health page ────────────────────────────────────

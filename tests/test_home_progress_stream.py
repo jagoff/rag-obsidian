@@ -401,3 +401,246 @@ def test_stream_done_persists_into_home_state_cache(stub_fetchers):
         assert "today" in data
         # Not the placeholder "warming" payload.
         assert data.get("warming") is not True
+
+
+# ── HARD_CAP_S regression guard ────────────────────────────────────────────
+#
+# El cap del SSE stream limita cuánto tiempo el server espera por un
+# `done` antes de bailar con `event: error`. Bajado de 90s → 30s en
+# 2026-04-24 — el cap original sumaba budgets per-fetcher (today=30 +
+# signals=45 + cushion=15) pero esos corren en paralelo. P95 real del
+# `_home_compute` es ~15s, peor outlier en 7d fue 21.5s. 30s da ~40%
+# margen sobre ese outlier.
+#
+# Este assertion fija el valor: un futuro bump tendría que actualizar
+# el test deliberadamente (con justificación documentada). Sin este
+# guard, alguien podría re-bumpear el cap a 60s/90s sin notar que
+# recursos del server quedan tied up por minutos en wedges.
+
+
+def test_hard_cap_s_is_30_seconds_or_less():
+    """SSE stream cap stays ≤ 30s. Si necesitás más, abrir issue + medir
+    P95 real de `_home_compute` antes de subir.
+
+    Implementación: el cap es local al `_gen()` async generator, no una
+    constante module-level. Lo extraemos via source-grep de la asignación
+    `HARD_CAP_S = N.0` en `web/server.py` — match laxo (admite spaces o
+    tipo float/int) pero específico al token name.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "web" / "server.py"
+    body = src.read_text(encoding="utf-8")
+    matches = re.findall(r"HARD_CAP_S\s*=\s*([\d.]+)", body)
+    assert matches, "HARD_CAP_S assignment not found in web/server.py"
+    # Take the FIRST match (the in-function definition; any other refs
+    # are reads). All assignments must be ≤ 30.
+    for raw in matches:
+        val = float(raw)
+        assert val <= 30.0, (
+            f"HARD_CAP_S = {val}s exceeds the 30s ceiling. If you really "
+            f"need more, document the regression in the test + commit."
+        )
+
+
+# ── Degraded event ─────────────────────────────────────────────────────────
+#
+# Probes a la unidad — lógica del threshold + diagnóstico — y al
+# end-to-end (`event: degraded` aparece en el stream cuando elapsed
+# pasa el umbral). El end-to-end usa un fixture que fuerza un fetcher
+# lento + monkeypatchea el threshold floor.
+
+
+def test_record_home_compute_total_drops_outliers():
+    """Outliers obvios (≤0 o >600s) no pueden contaminar la rolling
+    window — esos vendrían de bugs de medición, no de runs reales."""
+    from web import server as server_mod
+
+    # Reset window for isolation (other tests may have populated it).
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    server_mod._record_home_compute_total(0)
+    server_mod._record_home_compute_total(-5)
+    server_mod._record_home_compute_total(700)
+    server_mod._record_home_compute_total(8.5)
+    assert list(server_mod._HOME_COMPUTE_HISTORY) == [8.5]
+
+
+def test_record_home_compute_total_caps_at_window_max():
+    """La rolling window no crece sin límite — se queda en
+    `_HOME_COMPUTE_HISTORY_MAX`, oldest-first eviction."""
+    from web import server as server_mod
+
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    cap = server_mod._HOME_COMPUTE_HISTORY_MAX
+    for i in range(cap + 5):
+        server_mod._record_home_compute_total(float(i + 1))
+    snap = list(server_mod._HOME_COMPUTE_HISTORY)
+    assert len(snap) == cap
+    # Should retain the LAST `cap` entries (newest values).
+    assert snap[0] == float(6)  # first 5 evicted
+    assert snap[-1] == float(cap + 5)
+
+
+def test_degraded_threshold_floors_when_history_thin():
+    """Con <3 samples, devolvemos el floor (8s) — no arriesgamos
+    fire-on-startup cuando sólo tenemos 1-2 mediciones que pueden
+    venir de un disk cache hit (~1.5s) que daría threshold absurdo."""
+    from web import server as server_mod
+
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    assert server_mod._home_compute_degraded_threshold() == server_mod._HOME_COMPUTE_DEGRADED_FLOOR
+
+    server_mod._record_home_compute_total(2.0)
+    server_mod._record_home_compute_total(2.5)
+    # Still <3 → floor.
+    assert server_mod._home_compute_degraded_threshold() == server_mod._HOME_COMPUTE_DEGRADED_FLOOR
+
+
+def test_degraded_threshold_uses_2x_median_when_window_warm():
+    """Con suficiente data, threshold = max(floor, median × 2). Median
+    > mean cuando hay un outlier alto — más robusto a un wedge único
+    que no debería disparar el floor del threshold para todas las
+    futuras corridas."""
+    from web import server as server_mod
+
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    # 9 samples around 6s + 1 anomalous 60s outlier
+    for v in [5, 5.5, 6, 6, 6.2, 6.5, 7, 7.5, 8, 60]:
+        server_mod._record_home_compute_total(v)
+    threshold = server_mod._home_compute_degraded_threshold()
+    # Median = 6.5 (5th value when sorted). Threshold = max(8, 13) = 13.
+    assert threshold == 13.0
+
+
+def test_diagnose_home_slowdown_shape(monkeypatch):
+    """`_diagnose_home_slowdown` returns a stable dict shape. Stub the
+    HTTP probe so we don't actually hit ollama (CI-safe + fast)."""
+    from web import server as server_mod
+    import urllib.request
+
+    class _StubResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def read(self): return b'{"models":[]}'
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _StubResp())
+    diag = server_mod._diagnose_home_slowdown()
+    assert "cause" in diag
+    assert "details" in diag
+    assert isinstance(diag["details"], dict)
+    assert "ollama_state" in diag["details"]
+    assert "ollama_ms" in diag["details"]
+    # All-OK probe → cause is "unknown" or "memory_pressure" depending
+    # on the actual machine state, NEVER an ollama_* tag.
+    assert not diag["cause"].startswith("ollama_")
+
+
+def test_diagnose_home_slowdown_detects_unreachable_ollama(monkeypatch):
+    """Cuando urllib tira URLError, `cause` debe ser `ollama_unreachable`."""
+    from web import server as server_mod
+    import urllib.error
+    import urllib.request
+
+    def _boom(*a, **kw):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    diag = server_mod._diagnose_home_slowdown()
+    assert diag["cause"] == "ollama_unreachable"
+    assert diag["details"]["ollama_state"] == "unreachable"
+
+
+def test_stream_emits_degraded_event_when_slow(monkeypatch, stub_fetchers):
+    """End-to-end: con un fetcher artificialmente lento + threshold
+    bajado a 0.1s, el stream debe emitir UN sólo `event: degraded`
+    antes del `done`.
+
+    El probe de diagnóstico se monkeypatchea para evitar el hit a
+    ollama localhost (no determinista en CI).
+    """
+    import time as _time
+    from web import server as server_mod
+    from web.server import app
+
+    # Force threshold to ~0 by clearing history and lowering the floor.
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    monkeypatch.setattr(server_mod, "_HOME_COMPUTE_DEGRADED_FLOOR", 0.05)
+
+    # Make `today` a slow stub so total elapsed crosses 0.05s easily
+    # (each chip starts immediately; the slowdown only fires after the
+    # first iteration of the queue loop, ~1s due to DISCONNECT_PROBE_S).
+    def _slow_today(*a, **kw):
+        _time.sleep(0.2)
+        return {"recent_notes": [], "inbox_today": [], "todos": [],
+                "new_contradictions": [], "low_conf_queries": []}
+
+    monkeypatch.setattr(server_mod, "_collect_today_evidence", _slow_today)
+    monkeypatch.setattr(server_mod, "_diagnose_home_slowdown",
+                        lambda: {"cause": "unknown", "details": {"stub": True}})
+
+    with TestClient(app) as client:
+        with client.stream("GET", "/api/home/stream?regenerate=false") as resp:
+            body = b"".join(resp.iter_bytes()).decode()
+
+    events = _parse_sse(body)
+    kinds = [e[0] for e in events]
+    assert kinds.count("degraded") == 1, kinds
+    degraded_payload = next(p for ev, p in events if ev == "degraded")
+    assert degraded_payload["cause"] == "unknown"
+    assert "elapsed_ms" in degraded_payload
+    assert "threshold_ms" in degraded_payload
+    assert degraded_payload["details"]["stub"] is True
+
+
+def test_stream_does_not_emit_degraded_when_fast(stub_fetchers):
+    """Path feliz: si el stream termina antes del threshold, NO hay
+    `event: degraded`. Los stubs por default son sub-50ms cada uno,
+    bien debajo del floor de 8s."""
+    from web.server import app
+
+    with TestClient(app) as client:
+        with client.stream("GET", "/api/home/stream?regenerate=false") as resp:
+            body = b"".join(resp.iter_bytes()).decode()
+
+    events = _parse_sse(body)
+    kinds = [e[0] for e in events]
+    assert "degraded" not in kinds
+
+
+# ── Reminder push plist ─────────────────────────────────────────────────────
+#
+# Validá que el plist generador produce un XML cargable por launchd y
+# que está registrado en `_services_spec` para que `rag setup` lo
+# instale en una máquina nueva.
+
+
+def test_reminder_wa_push_plist_shape():
+    """El plist debe llevar el binario, el comando `remind-wa`, un
+    StartInterval razonable, y los logs apuntando al directorio
+    estándar de obsidian-rag."""
+    import rag
+
+    xml = rag._reminder_wa_push_plist("/usr/local/bin/rag")
+    assert "<key>Label</key><string>com.fer.obsidian-rag-reminder-wa-push</string>" in xml
+    assert "<string>remind-wa</string>" in xml
+    assert "<string>/usr/local/bin/rag</string>" in xml
+    # 5min cadence — tighter than the 30min wa-tasks cron.
+    assert "<key>StartInterval</key><integer>300</integer>" in xml
+    assert "reminder-wa-push.log" in xml
+    assert "reminder-wa-push.error.log" in xml
+
+
+def test_reminder_wa_push_plist_in_services_spec():
+    """`_services_spec` debe listarlo así `rag setup` lo instala."""
+    import rag
+
+    spec = rag._services_spec("/usr/local/bin/rag")
+    labels = [s[0] for s in spec]
+    assert "com.fer.obsidian-rag-reminder-wa-push" in labels
+    # Asociado al filename canónico — `rag setup` usa este path para
+    # escribir en ~/Library/LaunchAgents/.
+    entry = next(s for s in spec if s[0] == "com.fer.obsidian-rag-reminder-wa-push")
+    assert entry[1] == "com.fer.obsidian-rag-reminder-wa-push.plist"
+    # XML consistent con el generator.
+    assert "remind-wa" in entry[2]

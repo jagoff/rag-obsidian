@@ -4578,7 +4578,7 @@ _HOME_STATE: dict = {
 }
 _HOME_SOFT_TTL = 120.0      # serve cached without bg-refresh under this age
 # Pre-warmer cadence — bumped 25s → 300s on 2026-04-17 after chat latency
-# blew up to 30-160s. Each cycle fans out 12 channel fetchers and can eat
+# blew up to 30-160s. Each cycle fans out 14 top-level + 9 sub-fetchers and can eat
 # 6-27s of ollama + MPS + disk, which starves concurrent /api/chat requests
 # waiting for the same ollama daemon. 5-minute refresh is plenty for a
 # dashboard — the home page SWRs on visit anyway.
@@ -5041,9 +5041,10 @@ def _ensure_home_prewarmer() -> None:
         while True:
             try:
                 # Skip the cycle while a chat request is in flight — each
-                # home-compute fans out 12 channel fetchers (some hitting
-                # ollama for helper-model judgments) and would queue behind
-                # or evict the chat model, turning a 3s chat into 60s+.
+                # home-compute fans out 14 top-level fetchers + 9 sub-
+                # fetchers inside `signals` (some hitting ollama for
+                # helper-model judgments) and would queue behind or evict
+                # the chat model, turning a 3s chat into 60s+.
                 if _CHAT_INFLIGHT > 0:
                     time.sleep(10)
                     continue

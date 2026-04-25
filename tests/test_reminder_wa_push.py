@@ -31,13 +31,32 @@ import rag
 
 
 @pytest.fixture
-def cfg_path(tmp_path, monkeypatch):
-    """Redirigir AMBIENT_CONFIG_PATH y DB_PATH a tmp por test."""
+def cfg_path(tmp_path):
+    """Redirigir AMBIENT_CONFIG_PATH y DB_PATH a tmp por test.
+
+    Usamos try/finally explícito en vez de `monkeypatch.setattr` porque
+    el conftest autouse `_stabilize_rag_state` chequea `rag.DB_PATH`
+    contra su snapshot DURANTE su propia teardown — y pytest finaliza
+    fixtures independientes en orden FIFO de creación, así que el
+    teardown del conftest corría ANTES del teardown del monkeypatch.
+    Resultado: warning falso "rag.DB_PATH leaked from test" cada test.
+
+    El fix: restauramos los valores en el propio finally del fixture,
+    así para cuando el conftest hace su check, ya están de vuelta.
+    """
     p = tmp_path / "ambient.json"
-    monkeypatch.setattr(rag, "AMBIENT_CONFIG_PATH", p)
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
-    monkeypatch.setattr(rag, "AMBIENT_LOG_PATH", tmp_path / "ambient.jsonl")
-    return p
+    snap_cfg = rag.AMBIENT_CONFIG_PATH
+    snap_db = rag.DB_PATH
+    snap_log = rag.AMBIENT_LOG_PATH
+    rag.AMBIENT_CONFIG_PATH = p
+    rag.DB_PATH = tmp_path
+    rag.AMBIENT_LOG_PATH = tmp_path / "ambient.jsonl"
+    try:
+        yield p
+    finally:
+        rag.AMBIENT_CONFIG_PATH = snap_cfg
+        rag.DB_PATH = snap_db
+        rag.AMBIENT_LOG_PATH = snap_log
 
 
 def _write_cfg(path: Path, *, jid: str = "ragnet@g.us",

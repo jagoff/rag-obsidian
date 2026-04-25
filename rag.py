@@ -5222,8 +5222,74 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " language TEXT,"
             " duration_s REAL,"
             " model TEXT NOT NULL,"
-            " transcribed_at REAL NOT NULL"
+            " transcribed_at REAL NOT NULL,"
+            " audio_hash TEXT,"
+            " chat_id TEXT,"
+            " avg_logprob REAL,"
+            " corrected_text TEXT,"
+            " correction_source TEXT,"
+            " note_path TEXT,"
+            " note_initial_hash TEXT"
             ")",
+            # Los índices de las nuevas columnas Phase 2 se crean en
+            # `_migrate_audio_transcripts_phase2` AFTER los ALTERs — no acá,
+            # porque en una DB pre-Phase 2 las columnas chat_id/audio_hash
+            # no existen y el CREATE INDEX referenciándolas falla mientras
+            # corre este DDL block (CREATE TABLE IF NOT EXISTS no agrega
+            # columnas a tablas existentes).
+        ),
+    ),
+    (
+        # Phase 2 learning loop — pares (raw, corrected) para que el sistema
+        # aprenda con el uso. 3 sources:
+        #   - 'explicit'  → /fix command via WhatsApp.
+        #   - 'llm'       → confidence-gated auto-correct con qwen2.5:7b.
+        #   - 'vault_diff' → user editó la nota generada en Obsidian, watcher
+        #                    detectó el diff y lo guardó como correction.
+        #
+        # `audio_hash` es FK soft a rag_audio_transcripts.audio_hash (no
+        # enforced — borrar transcripts no debería borrar correcciones, las
+        # correcciones tienen valor independiente como training data).
+        # `context` guarda el chat tail al momento de la corrección para
+        # few-shot del LLM con contexto reproducible.
+        "rag_audio_corrections",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_audio_corrections ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " audio_hash TEXT NOT NULL,"
+            " original TEXT NOT NULL,"
+            " corrected TEXT NOT NULL,"
+            " source TEXT NOT NULL,"
+            " ts REAL NOT NULL,"
+            " chat_id TEXT,"
+            " context TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_corrections_ts ON rag_audio_corrections(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_corrections_hash ON rag_audio_corrections(audio_hash)",
+            "CREATE INDEX IF NOT EXISTS ix_corrections_source_ts ON rag_audio_corrections(source, ts)",
+        ),
+    ),
+    (
+        # Phase 2 learning loop — vocabulario aprendido del corpus + correcciones.
+        # Se inyecta al `--prompt` de whisper para sesgar el decoding.
+        # Refresh full nightly por un job launchd (no incremental porque las
+        # tablas source — vault notes, chats — pueden cambiar arbitrariamente
+        # y un re-cómputo de tf-idf es barato a esta escala).
+        #
+        # source ∈ {'notes', 'chats', 'contacts', 'corrections'} — cada source
+        # tiene priority distinta cuando se compite por budget de tokens del
+        # prompt (224 max).
+        "rag_whisper_vocab",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_whisper_vocab ("
+            " term TEXT PRIMARY KEY,"
+            " weight REAL NOT NULL,"
+            " source TEXT NOT NULL,"
+            " last_seen_ts REAL NOT NULL,"
+            " refreshed_at REAL NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_whisper_vocab_weight ON rag_whisper_vocab(weight DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_whisper_vocab_source ON rag_whisper_vocab(source, weight DESC)",
         ),
     ),
     (
@@ -5422,6 +5488,58 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def _migrate_audio_transcripts_phase2(conn) -> None:
+    """Idempotent ALTER para DBs pre-2026-04-25 que ya tienen `rag_audio_transcripts`
+    con el schema v1 (audio_path, mtime, text, language, duration_s, model,
+    transcribed_at). Phase 2 learning loop (whatsapp-whisper-learning) suma
+    7 columnas para soportar logging del listener + correcciones + LLM gating:
+
+    - audio_hash: sha256(bytes), idempotencia + FK soft a rag_audio_corrections.
+    - chat_id: para retrieval de chat tail + lookup de "última transcripción"
+      por chat (que es lo que `/fix` necesita corregir).
+    - avg_logprob: confidence promedio del segmento (whisper-server con
+      response_format=verbose_json), usado por el threshold de LLM correction.
+    - corrected_text + correction_source: trail de auditoría — original
+      siempre queda en `text`, la versión final usada para el reply queda en
+      `corrected_text` (cuando hubo correction; NULL en el path happy).
+    - note_path + note_initial_hash: para vault_diff watcher detectar si
+      el user editó manualmente la nota generada → genera una correction
+      implícita.
+
+    Sqlite no soporta `ADD COLUMN IF NOT EXISTS` — cada ALTER tira
+    OperationalError ("duplicate column name") si la columna ya existe;
+    lo tragamos. Idempotente: correr esto N veces es no-op.
+
+    Llamado desde `_ensure_telemetry_tables` después del CREATE TABLE IF NOT
+    EXISTS (que tiene las columnas nuevas en el DDL para installs frescos —
+    este migration es para installs preexistentes).
+    """
+    import sqlite3 as _sqlite3
+    new_cols = (
+        "audio_hash TEXT",
+        "chat_id TEXT",
+        "avg_logprob REAL",
+        "corrected_text TEXT",
+        "correction_source TEXT",
+        "note_path TEXT",
+        "note_initial_hash TEXT",
+    )
+    for col_ddl in new_cols:
+        try:
+            conn.execute(f"ALTER TABLE rag_audio_transcripts ADD COLUMN {col_ddl}")
+        except _sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                pass
+    for idx_ddl in (
+        "CREATE INDEX IF NOT EXISTS ix_audio_transcripts_chat_id ON rag_audio_transcripts(chat_id, transcribed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_audio_transcripts_hash ON rag_audio_transcripts(audio_hash)",
+    ):
+        try:
+            conn.execute(idx_ddl)
+        except Exception:
+            pass
+
+
 def _migrate_cita_detections_add_kind(conn) -> None:
     """Idempotent ALTER para DBs pre-2026-04-23 tarde que ya tienen la tabla
     `rag_cita_detections` con el schema inicial (solo `event_uid`, sin
@@ -5536,6 +5654,11 @@ def _ensure_telemetry_tables(conn) -> None:
         except Exception:
             # Silent-fail: si la migration rompe, el INSERT usará el subset
             # de columnas que sí existen (writer también es defensivo).
+            pass
+        try:
+            _migrate_audio_transcripts_phase2(conn)
+        except Exception:
+            # Silent-fail: idem rationale del cita migration.
             pass
         if db_path:
             _TELEMETRY_DDL_ENSURED_PATHS.add(db_path)

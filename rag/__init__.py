@@ -21808,10 +21808,8 @@ def propose_whatsapp_send_contact_card(
 # está respondiendo. Cuando el bridge agregue soporte de quote, el
 # campo `reply_to` ya viaja en el POST y empieza a renderear nativo.
 
-WHATSAPP_BRIDGE_DB_PATH = (
-    Path.home()
-    / "repositories" / "whatsapp-mcp" / "whatsapp-bridge" / "store" / "messages.db"
-)
+# `WHATSAPP_BRIDGE_DB_PATH` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 def _parse_when_hint(hint: str | None) -> tuple[float | None, float | None, str | None]:
@@ -21900,147 +21898,8 @@ def _parse_when_hint(hint: str | None) -> tuple[float | None, float | None, str 
     return (now.timestamp() - 24 * 3600, None, f"keyword:{h[:32]}")
 
 
-def _whatsapp_resolve_reply_target(
-    contact_name: str,
-    when_hint: str | None = None,
-    *,
-    db_path: Path | str | None = None,
-    keyword: str | None = None,
-) -> dict:
-    """Resolve a "responder a X" request to a concrete WhatsApp message.
-
-    Pipeline:
-      1. ``_whatsapp_jid_from_contact(contact_name)`` → JID candidates.
-      2. ``_parse_when_hint(when_hint)`` → (low, high, kind) window.
-      3. Scan ``messages.db`` for last inbound (``is_from_me=0``) message
-         in the contact's 1:1 chat that fits the window. Optional
-         ``keyword`` substring match (case-insensitive) on the content,
-         útil cuando el hint trae una palabra clave ("del almuerzo",
-         "del médico", "del cumple").
-      4. Return ``{"message_id", "text", "ts", "ts_iso", "from_jid",
-         "chat_jid", "warning"?}`` o ``{"error": ...}``.
-
-    Returns shape:
-      - hit:    ``{"message_id", "text", "ts", "ts_iso", "from_jid",
-                 "chat_jid", "when_kind", "candidates_seen"}``
-      - miss:   ``{"error": "no_match", "candidates_seen": int,
-                 "contact_full_name": str, "when_kind": str}``
-      - error:  ``{"error": "<reason>"}``
-
-    Personal 1:1 chats only (chat_jid `<digits>@s.whatsapp.net`). Group
-    replies (`@g.us`) intencionalmente NO soportadas — la UX de "respondele
-    a Juan" en grupos es ambigua (Juan podría tener varios mensajes en
-    chats distintos). Defer hasta que el user lo pida.
-    """
-    cn = (contact_name or "").strip()
-    if not cn:
-        return {"error": "empty_contact"}
-    try:
-        lookup = _whatsapp_jid_from_contact(cn)
-    except Exception as exc:
-        return {"error": f"contact_lookup_failed: {str(exc)[:80]}"}
-    if not lookup.get("jid"):
-        err = lookup.get("error") or "not_found"
-        return {"error": f"contact_{err}", "contact_full_name": lookup.get("full_name")}
-
-    primary_jid = lookup["jid"]
-    full_name = lookup.get("full_name") or cn
-
-    # Build last-10-digit suffix candidates to match `chat_jid` flexibly:
-    # Apple Contacts may have "+5491155555555" while bridge stores
-    # "5491155555555@s.whatsapp.net" — both end in the same 10 digits.
-    suffixes: set[str] = set()
-    primary_local = primary_jid.split("@")[0]
-    d = re.sub(r"\D+", "", primary_local)
-    if len(d) >= 8:
-        suffixes.add(d[-10:] if len(d) >= 10 else d)
-    for ph in (lookup.get("phones") or []):
-        d2 = re.sub(r"\D+", "", ph or "")
-        if len(d2) >= 8:
-            suffixes.add(d2[-10:] if len(d2) >= 10 else d2)
-
-    low, high, when_kind = _parse_when_hint(when_hint)
-
-    import sqlite3 as _sqlite3
-    db = Path(db_path) if db_path else WHATSAPP_BRIDGE_DB_PATH
-    if not db.exists():
-        return {"error": f"bridge_db_missing: {db}"}
-
-    try:
-        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
-    except _sqlite3.Error as exc:
-        return {"error": f"bridge_db_open_failed: {str(exc)[:80]}"}
-
-    try:
-        # Pull recent inbound messages from any chat whose JID local-part
-        # ends in one of our suffixes. We do this client-side to keep the
-        # SQL portable and bounded — practical inbound volume per contact
-        # is in the low thousands so a 200-row scan is plenty.
-        cur = conn.execute(
-            "SELECT id, chat_jid, sender, content, timestamp "
-            "FROM messages "
-            "WHERE is_from_me = 0 "
-            "  AND chat_jid LIKE '%@s.whatsapp.net' "
-            "  AND content IS NOT NULL AND content != '' "
-            "ORDER BY timestamp DESC "
-            "LIMIT 500"
-        )
-        rows = cur.fetchall()
-    except _sqlite3.Error as exc:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return {"error": f"bridge_db_query_failed: {str(exc)[:80]}"}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    kw = (keyword or "").strip().lower() or None
-    candidates_seen = 0
-    best: dict | None = None
-    for mid, chat_jid, sender, content, ts_raw in rows:
-        local = (chat_jid or "").split("@")[0]
-        ldigits = re.sub(r"\D+", "", local)
-        if not ldigits:
-            continue
-        if suffixes and not any(ldigits.endswith(s) for s in suffixes):
-            continue
-        ts = _parse_bridge_timestamp(ts_raw)
-        if ts is None:
-            continue
-        if low is not None and ts < low:
-            continue
-        if high is not None and ts >= high:
-            continue
-        candidates_seen += 1
-        if kw and kw not in (content or "").lower():
-            continue
-        # Rows are ordered by timestamp DESC, so first match in window = newest.
-        best = {
-            "message_id": mid,
-            "text": content or "",
-            "ts": ts,
-            "ts_iso": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
-            "from_jid": chat_jid,
-            "chat_jid": chat_jid,
-            "sender": sender or "",
-        }
-        break
-
-    if best is None:
-        return {
-            "error": "no_match",
-            "candidates_seen": candidates_seen,
-            "contact_full_name": full_name,
-            "when_kind": when_kind,
-        }
-    best["when_kind"] = when_kind
-    best["candidates_seen"] = candidates_seen
-    best["contact_full_name"] = full_name
-    return best
+# `_whatsapp_resolve_reply_target` moved to `rag.integrations.whatsapp`
+# (Phase 1b, 2026-04-25). Re-exported at the bottom of this file.
 
 
 def _parse_bridge_timestamp(raw: object) -> float | None:
@@ -35285,255 +35144,12 @@ def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
     return out
 
 
-# ── WhatsApp unread (bridge SQLite) ─────────────────────────────────────────
-WHATSAPP_DB_PATH = Path.home() / "repositories/whatsapp-mcp/whatsapp-bridge/store/messages.db"
-WHATSAPP_BOT_JID = "120363426178035051@g.us"  # RagNet — bot's own group, skip
-
-
-def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
-    """Inbound WhatsApp messages in the last `hours`, grouped by chat.
-
-    Skips the bot's own group and status broadcasts. Returns a list of
-    ``{"name": str, "jid": str, "count": int, "last_snippet": str}``
-    sorted by message count desc.
-
-    Entries whose `chats.name` is missing or purely digits (typical of
-    `@lid` participants whose profile isn't resolved) are dropped — the
-    raw phone-number-like JID pollutes briefs. SQL fetches 3× the needed
-    cap so filtered entries don't under-populate the final list.
-    """
-    if not WHATSAPP_DB_PATH.is_file():
-        return []
-    import sqlite3
-    try:
-        con = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
-    except sqlite3.Error:
-        return []
-    try:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT
-              m.chat_jid AS jid,
-              (SELECT name FROM chats WHERE jid = m.chat_jid) AS name,
-              count(*) AS cnt,
-              (SELECT content FROM messages
-                 WHERE chat_jid = m.chat_jid AND is_from_me = 0
-                 ORDER BY datetime(timestamp) DESC LIMIT 1) AS last_content
-            FROM messages m
-            WHERE m.is_from_me = 0
-              AND datetime(m.timestamp) > datetime('now', ?)
-              AND m.chat_jid != ?
-              AND m.chat_jid NOT LIKE '%status@broadcast'
-            GROUP BY m.chat_jid
-            ORDER BY cnt DESC
-            LIMIT ?
-            """,
-            (f"-{int(hours)} hours", WHATSAPP_BOT_JID, int(max_chats) * 3),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-    out: list[dict] = []
-    for r in rows:
-        raw_name = (r["name"] or "").strip()
-        jid_prefix = (r["jid"] or "").split("@")[0]
-        display_name = raw_name or jid_prefix
-        # Drop unnamed contacts (raw phone-number-like JIDs). A "real" name
-        # has at least one non-digit character; "Grecia's group" passes,
-        # "255804326297735" doesn't.
-        if not any(ch.isalpha() for ch in display_name):
-            continue
-        snippet = (r["last_content"] or "").strip().replace("\n", " ")
-        if len(snippet) > 120:
-            snippet = snippet[:117] + "…"
-        out.append({
-            "jid": r["jid"],
-            "name": display_name,
-            "count": int(r["cnt"] or 0),
-            "last_snippet": snippet,
-        })
-        if len(out) >= max_chats:
-            break
-    return out
-
-
-# ── WhatsApp action-item extractor (rag wa-tasks) ───────────────────────────
-#
-# Los chats de WhatsApp son fuente diaria de tareas, preguntas y compromisos
-# que hoy se pierden: el vault-sync escribe el histórico pero está excluido
-# del watch (high-churn mata ollama), y el morning sólo lista unread counts.
-# Este extractor corre periódicamente, lee delta vs último run, y destila
-# action items a `00-Inbox/WA-YYYY-MM-DD.md` donde quedan RAG-searchable y
-# visibles desde morning. `ambient: skip` evita el loop (no re-empuja a WA).
-
-WA_TASKS_STATE_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks_state.json"
-WA_TASKS_LOG_PATH = Path.home() / ".local/share/obsidian-rag/wa_tasks.jsonl"
-# How many chats × messages per run. Conservative: one LLM call per chat
-# so the cap bounds cost. Chats with <2 inbound msgs in the window skip
-# (not enough signal for extraction).
-WA_TASKS_MAX_CHATS = 12
-WA_TASKS_MAX_MSGS_PER_CHAT = 40
-WA_TASKS_MIN_INBOUND = 2
-
-
-def _wa_tasks_load_state() -> dict:
-    """Returns `{last_run_ts: iso|null, processed_ids: [id, ...]}`.
-
-    `processed_ids` is a ring of recent message ids (cap 2000) — cheap dedup
-    across overlapping windows. `last_run_ts` is the high-water mark; next
-    run fetches strictly after it.
-    """
-    if not WA_TASKS_STATE_PATH.is_file():
-        return {"last_run_ts": None, "processed_ids": []}
-    try:
-        data = json.loads(WA_TASKS_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"last_run_ts": None, "processed_ids": []}
-    if not isinstance(data, dict):
-        return {"last_run_ts": None, "processed_ids": []}
-    data.setdefault("last_run_ts", None)
-    data.setdefault("processed_ids", [])
-    if not isinstance(data["processed_ids"], list):
-        data["processed_ids"] = []
-    return data
-
-
-def _wa_tasks_save_state(state: dict) -> None:
-    ids = state.get("processed_ids") or []
-    if len(ids) > 2000:
-        state["processed_ids"] = ids[-2000:]
-    WA_TASKS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    WA_TASKS_STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
-
-
-def _wa_chat_label(raw_name: str, jid: str) -> str:
-    """Human-readable chat label. Returns the stored name if it has at least
-    one alpha character, else `Contacto …<last4>` from the JID prefix.
-    Mirrors the filter in `_fetch_whatsapp_unread` so morning and the
-    extractor surface the same set of chats.
-    """
-    name = (raw_name or "").strip()
-    if any(ch.isalpha() for ch in name):
-        return name
-    prefix = (jid or "").split("@")[0]
-    tail = prefix[-4:] if len(prefix) >= 4 else prefix
-    return f"Contacto …{tail}" if tail else "Contacto"
-
-
-def _fetch_whatsapp_window(
-    since_ts: datetime | None,
-    now_ts: datetime,
-    processed_ids: set[str],
-) -> list[dict]:
-    """Per-chat conversation windows since `since_ts` (or last 24h if None).
-
-    Each entry: ``{"jid", "label", "is_group", "inbound": int,
-    "messages": [{"id", "ts", "who", "text", "is_from_me"}]}``. Outbound
-    messages are included for LLM context but don't count toward inbound
-    threshold. Chats below `WA_TASKS_MIN_INBOUND` are dropped. Skips the
-    bot's own group, status broadcasts, and unnamed contacts (same filter
-    as `_fetch_whatsapp_unread`).
-
-    `processed_ids` deduplicates across runs: messages already extracted
-    are filtered out, but we still fetch them because the LLM may need
-    the surrounding context.
-    """
-    if not WHATSAPP_DB_PATH.is_file():
-        return []
-    since = since_ts or (now_ts - timedelta(hours=24))
-    since_iso = since.strftime("%Y-%m-%d %H:%M:%S")
-    import sqlite3
-    try:
-        con = sqlite3.connect(
-            f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=5.0,
-        )
-    except sqlite3.Error:
-        return []
-    try:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT
-              m.id AS id,
-              m.chat_jid AS jid,
-              m.sender AS sender,
-              m.content AS content,
-              m.timestamp AS ts,
-              m.is_from_me AS is_from_me,
-              m.media_type AS media_type,
-              c.name AS chat_name
-            FROM messages m
-            LEFT JOIN chats c ON c.jid = m.chat_jid
-            WHERE datetime(m.timestamp) >= datetime(?)
-              AND m.chat_jid != ?
-              AND m.chat_jid NOT LIKE '%status@broadcast'
-            ORDER BY m.timestamp ASC
-            """,
-            (since_iso, WHATSAPP_BOT_JID),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-
-    by_chat: dict[str, dict] = {}
-    for r in rows:
-        jid = r["jid"] or ""
-        label = _wa_chat_label(r["chat_name"] or "", jid)
-        # Drop unnamed contacts — same policy as morning brief.
-        if label.startswith("Contacto …") and not any(ch.isalpha() for ch in (r["chat_name"] or "")):
-            continue
-        content = (r["content"] or "").strip().replace("\n", " ")
-        if not content and r["media_type"]:
-            content = f"[{r['media_type']}]"
-        if not content:
-            continue
-        is_from_me = bool(r["is_from_me"])
-        who = "yo" if is_from_me else (r["sender"] or "").split("@")[0] or label
-        entry = by_chat.setdefault(jid, {
-            "jid": jid,
-            "label": label,
-            "is_group": jid.endswith("@g.us"),
-            "inbound": 0,
-            "messages": [],
-            "new_ids": [],
-        })
-        msg_id = r["id"] or ""
-        new = msg_id and msg_id not in processed_ids
-        if not is_from_me:
-            entry["inbound"] += 1
-        entry["messages"].append({
-            "id": msg_id,
-            "ts": r["ts"] or "",
-            "who": who,
-            "text": content[:400],
-            "is_from_me": is_from_me,
-            "new": new,
-        })
-        if new:
-            entry["new_ids"].append(msg_id)
-
-    out: list[dict] = []
-    for entry in by_chat.values():
-        if entry["inbound"] < WA_TASKS_MIN_INBOUND:
-            continue
-        # Skip chats with no *new* inbound messages — purely-read context,
-        # nothing to extract. (new_ids includes outbound; re-filter.)
-        new_inbound = sum(
-            1 for m in entry["messages"] if m["new"] and not m["is_from_me"]
-        )
-        if new_inbound == 0:
-            continue
-        # Keep the tail window — extraction cares about recent state.
-        entry["messages"] = entry["messages"][-WA_TASKS_MAX_MSGS_PER_CHAT:]
-        out.append(entry)
-
-    out.sort(key=lambda e: e["inbound"], reverse=True)
-    return out[:WA_TASKS_MAX_CHATS]
+# WhatsApp leaf integrations (`WHATSAPP_DB_PATH`, `WHATSAPP_BOT_JID`,
+# `_fetch_whatsapp_unread`, `WA_TASKS_*`, `_wa_tasks_load_state`,
+# `_wa_tasks_save_state`, `_wa_chat_label`, `_fetch_whatsapp_window`) moved
+# to `rag.integrations.whatsapp` (Phase 1b, 2026-04-25). Re-exported at the
+# bottom of this file. The cross-ref helper below stays here because it
+# orchestrates `_fetch_contact` (vault) + WA + datetime parsing — not a leaf.
 
 
 # ── WhatsApp cross-reference for entity queries ─────────────────────────────
@@ -36015,163 +35631,9 @@ def _build_wa_cross_ref(
     }
 
 
-def _wa_extract_actions(chat_label: str, is_group: bool, messages: list[dict]) -> dict:
-    """LLM-extract action items from a chat window.
-
-    Conservative prompt: only flag items a human would genuinely action.
-    Returns ``{"tasks": [str], "questions": [str], "commitments": [str]}``
-    (empty lists on LLM failure — callers treat as "nothing to extract",
-    not as an error). Deterministic via HELPER_OPTIONS.
-
-    `commitments` are things the user (yo) promised to do; `tasks` are
-    asks directed at the user; `questions` are open questions addressed
-    to the user that still need an answer.
-    """
-    empty = {"tasks": [], "questions": [], "commitments": []}
-    if not messages:
-        return empty
-    convo_lines: list[str] = []
-    for m in messages:
-        ts = (m["ts"] or "")[:16].replace("T", " ")
-        convo_lines.append(f"[{ts}] {m['who']}: {m['text']}")
-    convo = "\n".join(convo_lines)
-    if len(convo) > 6000:
-        convo = convo[-6000:]
-    kind = "grupo" if is_group else "chat directo"
-    prompt = (
-        f"Conversación de WhatsApp ({kind}): {chat_label}\n\n"
-        f"{convo}\n\n"
-        "Extraé solo items accionables reales para \"yo\" (el usuario). "
-        "Sé conservador: si no está claro que sea una acción, omitilo. "
-        "Ignorá saludos, small talk, memes, reacciones.\n\n"
-        "- tasks: cosas que alguien le pidió a yo (hacer X, mandar Y, revisar Z).\n"
-        "- questions: preguntas dirigidas a yo que aún no respondió.\n"
-        "- commitments: cosas que yo prometió hacer (\"te mando…\", \"mañana te paso…\").\n\n"
-        "Cada item: frase corta en español, 1 línea, sin nombre del chat ni timestamps. "
-        "Si no hay nada en una categoría, lista vacía. "
-        "Formato estricto JSON: "
-        "{\"tasks\": [\"...\"], \"questions\": [\"...\"], \"commitments\": [\"...\"]}"
-    )
-    try:
-        resp = _summary_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 320, "num_ctx": 4096},
-            keep_alive=OLLAMA_KEEP_ALIVE,
-            format="json",
-        )
-        raw = (resp.message.content or "").strip()
-        data = json.loads(raw)
-    except Exception:
-        return empty
-    if not isinstance(data, dict):
-        return empty
-    out = {"tasks": [], "questions": [], "commitments": []}
-    for key in out:
-        items = data.get(key) or []
-        if not isinstance(items, list):
-            continue
-        seen: set[str] = set()
-        for item in items[:10]:
-            if not isinstance(item, str):
-                continue
-            clean = item.strip().strip("-•*").strip()
-            if len(clean) < 4 or len(clean) > 240:
-                continue
-            key_norm = clean.lower()
-            if key_norm in seen:
-                continue
-            seen.add(key_norm)
-            out[key].append(clean)
-    return out
-
-
-def _wa_chat_month_link(jid: str, label: str, ts_iso: str) -> str:
-    """Wikilink to the vault-sync'd chat note for the message's month.
-
-    Falls back to just the label if the month can't be parsed. The link
-    target mirrors `whatsapp-to-vault`'s layout:
-    `03-Resources/WhatsApp/<slug>/YYYY-MM.md`.
-    """
-    slug_src = label if any(ch.isalpha() for ch in label) else (jid.split("@")[0] or "sin-nombre")
-    # Same slug rule as vault-sync: strip non-word/dash/dot/space.
-    slug = re.sub(r"[^\w\-\. ]+", "", slug_src).strip()
-    slug = re.sub(r"\s+", " ", slug)[:80] or "sin-nombre"
-    try:
-        dt = datetime.fromisoformat(ts_iso[:19].replace(" ", "T"))
-        ym = dt.strftime("%Y-%m")
-    except Exception:
-        return f"[[{label}]]"
-    return f"[[03-Resources/WhatsApp/{slug}/{ym}|{label}]]"
-
-
-def _wa_tasks_write_note(
-    vault: Path,
-    run_ts: datetime,
-    by_chat: list[dict],
-    extractions: list[dict],
-) -> tuple[Path, bool, int]:
-    """Append a timestamped section to `00-Inbox/WA-YYYY-MM-DD.md`.
-
-    Creates the file with frontmatter on first write of the day. Later
-    runs append under a new `## HH:MM` heading so the same-day history is
-    preserved. Returns ``(path, created, new_items)``. If every extraction
-    came back empty, writes nothing and returns `(path, False, 0)`.
-    """
-    total_items = sum(
-        len(e["tasks"]) + len(e["questions"]) + len(e["commitments"])
-        for e in extractions
-    )
-    date_str = run_ts.strftime("%Y-%m-%d")
-    note_path = vault / INBOX_FOLDER / f"WA-{date_str}.md"
-    if total_items == 0:
-        return note_path, False, 0
-
-    lines: list[str] = []
-    section = f"## {run_ts.strftime('%H:%M')} — {sum(1 for e in extractions if any(e[k] for k in ('tasks','questions','commitments')))} chats\n"
-    lines.append(section)
-    for chat, ext in zip(by_chat, extractions):
-        if not any(ext[k] for k in ("tasks", "questions", "commitments")):
-            continue
-        first_new_ts = next(
-            (m["ts"] for m in chat["messages"] if m["new"] and not m["is_from_me"]),
-            chat["messages"][-1]["ts"] if chat["messages"] else "",
-        )
-        link = _wa_chat_month_link(chat["jid"], chat["label"], first_new_ts)
-        lines.append(f"### {link}\n")
-        for t in ext["tasks"]:
-            lines.append(f"- [ ] {t}")
-        for q in ext["questions"]:
-            lines.append(f"- ❓ {q}")
-        for c in ext["commitments"]:
-            lines.append(f"- 📌 {c}")
-        lines.append("")
-
-    note_path.parent.mkdir(parents=True, exist_ok=True)
-    created = not note_path.exists()
-    if created:
-        header = [
-            "---",
-            "source: whatsapp",
-            "type: wa-tasks",
-            f"date: {date_str}",
-            "ambient: skip",
-            "tags:",
-            "- whatsapp",
-            "- tasks/wa",
-            "---",
-            "",
-            f"# WhatsApp — tareas {date_str}",
-            "",
-        ]
-        body = "\n".join(header + lines) + "\n"
-        note_path.write_text(body, encoding="utf-8")
-    else:
-        existing = note_path.read_text(encoding="utf-8")
-        if not existing.endswith("\n"):
-            existing += "\n"
-        note_path.write_text(existing + "\n".join(lines) + "\n", encoding="utf-8")
-    return note_path, created, total_items
+# `_wa_extract_actions`, `_wa_chat_month_link`, `_wa_tasks_write_note` moved
+# to `rag.integrations.whatsapp` (Phase 1b, 2026-04-25). Re-exported at the
+# bottom of this file.
 
 
 # ── Recent user queries ─────────────────────────────────────────────────────
@@ -39656,39 +39118,8 @@ def _reminder_wa_push_plist(rag_bin: str) -> str:
 """
 
 
-def _wa_tasks_plist(rag_bin: str) -> str:
-    """WhatsApp action-item extractor — every 30min.
-
-    Reads delta from the bridge SQLite since last run and distills tasks/
-    questions/commitments to `00-Inbox/WA-YYYY-MM-DD.md`. Cheap: one
-    qwen2.5:3b call per chat with new inbound messages (capped at 12
-    chats). `ambient: skip` in the output frontmatter prevents the
-    WhatsApp push loop.
-    """
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.fer.obsidian-rag-wa-tasks</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{rag_bin}</string>
-    <string>wa-tasks</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key><string>{Path.home()}</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
-    <key>NO_COLOR</key><string>1</string>
-    <key>TERM</key><string>dumb</string>
-  </dict>
-  <key>StartInterval</key><integer>1800</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-tasks.log</string>
-  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-tasks.error.log</string>
-</dict>
-</plist>
-"""
+# `_wa_tasks_plist` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 def _emergent_plist(rag_bin: str) -> str:
@@ -51204,6 +50635,173 @@ def whisper_patterns(min_count: int):
         )
 
 
+@whisper.command("doctor")
+def whisper_doctor():
+    """Health check del whisper learning loop end-to-end.
+
+    Verifica todos los componentes que el sistema necesita para funcionar:
+    modelos bajados, server activo, schema SQL completo, vocab fresh,
+    LLM disponible, daemons launchd corriendo. Output con semaphore visual
+    (✓ / ⚠ / ✗).
+
+    Útil después de un deploy nuevo o cuando algo "dejó de andar"
+    inexplicablemente. Sale con exit code 0 si todo OK, 1 si hay errors,
+    2 si solo warnings.
+
+    Reusa el patrón de `rag stats` pero específico al learning loop.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    home = Path.home()
+    checks: list[tuple[str, str, str, str]] = []  # (status, label, value, hint)
+
+    # 1. Modelos whisper
+    turbo = home / "whisper-models/ggml-large-v3-turbo.bin"
+    small = home / "whisper-models/ggml-small.bin"
+    vad = home / "whisper-models/ggml-silero-v5.1.2.bin"
+    if turbo.is_file():
+        size_mb = turbo.stat().st_size / 1024 / 1024
+        checks.append(("ok", "modelo turbo", f"{size_mb:.0f}MB", ""))
+    elif small.is_file():
+        checks.append(("warn", "modelo turbo", "no bajado",
+                       "fallback a small.bin (calidad menor); bajar con `curl -L -O ...`"))
+    else:
+        checks.append(("err", "modelo whisper", "ninguno encontrado",
+                       "bajar al menos ggml-small.bin a ~/whisper-models/"))
+    if vad.is_file():
+        checks.append(("ok", "VAD silero v5", f"{vad.stat().st_size // 1024}KB", ""))
+    else:
+        checks.append(("warn", "VAD silero v5", "no bajado",
+                       "VAD reduce alucinaciones — bajar de ggml-org/whisper-vad"))
+
+    # 2. Whisper server vivo
+    try:
+        import urllib.request as _urlreq
+        with _urlreq.urlopen("http://127.0.0.1:9199/", timeout=2) as resp:
+            checks.append(("ok", "whisper-server", f"http 9199 ({resp.status})", ""))
+    except Exception:
+        checks.append(("warn", "whisper-server", "no responde en :9199",
+                       "el listener lo arranca al startup; reload con launchctl"))
+
+    # 3. Telemetry DB + schema
+    db_path = home / ".local/share/obsidian-rag/ragvec/telemetry.db"
+    if not db_path.is_file():
+        checks.append(("err", "telemetry.db", "no existe",
+                       f"esperaba en {db_path}"))
+    else:
+        try:
+            import sqlite3 as _sql
+            con = _sql.connect(str(db_path))
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            con.close()
+            required = {"rag_audio_transcripts", "rag_audio_corrections", "rag_whisper_vocab"}
+            missing = required - tables
+            if missing:
+                checks.append(("err", "telemetry schema",
+                               f"falta: {', '.join(sorted(missing))}",
+                               "correr cualquier `rag` command para disparar migrations"))
+            else:
+                checks.append(("ok", "telemetry schema", "3 tablas Phase 2", ""))
+        except Exception as exc:
+            checks.append(("warn", "telemetry schema", f"error: {exc}", ""))
+
+    # 4. Vocab fresh
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), MAX(refreshed_at) FROM rag_whisper_vocab"
+            ).fetchone()
+        n_vocab, last_refresh = row
+        if n_vocab == 0:
+            checks.append(("warn", "vocab", "0 terms",
+                           "correr `rag whisper vocab refresh`"))
+        elif last_refresh is None:
+            checks.append(("warn", "vocab", f"{n_vocab} terms (sin timestamp)", ""))
+        else:
+            ago_h = (time.time() - last_refresh) / 3600
+            if ago_h > 48:
+                checks.append(("warn", "vocab",
+                               f"{n_vocab} terms (refresh hace {ago_h:.0f}h)",
+                               "el plist nightly debería correr 03:15; chequear launchctl"))
+            else:
+                checks.append(("ok", "vocab",
+                               f"{n_vocab} terms (refresh hace {ago_h:.0f}h)", ""))
+    except Exception as exc:
+        checks.append(("warn", "vocab", f"error: {exc}", ""))
+
+    # 5. Ollama + qwen2.5:7b
+    try:
+        ollama_bin = _shutil.which("ollama") or "/opt/homebrew/bin/ollama"
+        proc = _subprocess.run(
+            [ollama_bin, "list"], capture_output=True, text=True, timeout=5
+        )
+        if proc.returncode == 0 and "qwen2.5:7b" in proc.stdout:
+            checks.append(("ok", "qwen2.5:7b", "instalado en Ollama", ""))
+        elif proc.returncode == 0:
+            checks.append(("warn", "qwen2.5:7b", "no instalado",
+                           "LLM auto-correct va a fallar; `ollama pull qwen2.5:7b`"))
+        else:
+            checks.append(("warn", "ollama", "no responde",
+                           "service Homebrew launchd; chequear localhost:11434"))
+    except Exception as exc:
+        checks.append(("warn", "ollama", f"error: {exc}", ""))
+
+    # 6. launchd daemons
+    try:
+        proc = _subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=5
+        )
+        listener_running = "com.fer.whatsapp-listener" in proc.stdout
+        web_running = "com.fer.obsidian-rag-web" in proc.stdout
+        vocab_loaded = "com.fer.obsidian-rag-whisper-vocab" in proc.stdout
+        if listener_running:
+            checks.append(("ok", "whatsapp-listener", "loaded", ""))
+        else:
+            checks.append(("err", "whatsapp-listener", "no loaded",
+                           "`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.whatsapp-listener.plist`"))
+        if web_running:
+            checks.append(("ok", "obsidian-rag-web", "loaded (`/transcripts` ok)", ""))
+        else:
+            checks.append(("err", "obsidian-rag-web", "no loaded",
+                           "el dashboard no va a estar disponible"))
+        if vocab_loaded:
+            checks.append(("ok", "vocab nightly job", "plist loaded", ""))
+        else:
+            checks.append(("warn", "vocab nightly job", "no loaded",
+                           "vocab no se va a refreshear automático"))
+    except Exception as exc:
+        checks.append(("warn", "launchd daemons", f"error: {exc}", ""))
+
+    # Render
+    n_ok = sum(1 for c in checks if c[0] == "ok")
+    n_warn = sum(1 for c in checks if c[0] == "warn")
+    n_err = sum(1 for c in checks if c[0] == "err")
+    console.print(f"[bold]Whisper learning loop — health check[/bold]")
+    for status, label, value, hint in checks:
+        if status == "ok":
+            mark = "[green]✓[/green]"
+        elif status == "warn":
+            mark = "[yellow]⚠[/yellow]"
+        else:
+            mark = "[red]✗[/red]"
+        line = f"  {mark} [bold]{label:22s}[/bold]  {value}"
+        console.print(line)
+        if hint:
+            console.print(f"    [dim]→ {hint}[/dim]")
+    console.print(
+        f"\n[bold]Resumen:[/bold] "
+        f"[green]{n_ok} ok[/green] · "
+        f"[yellow]{n_warn} warn[/yellow] · "
+        f"[red]{n_err} err[/red]"
+    )
+    if n_err > 0:
+        sys.exit(1)
+    if n_warn > 0:
+        sys.exit(2)
+
+
 @whisper.command("export")
 @click.option("--output", "-o", type=click.Path(dir_okay=False, writable=True),
               default=None,
@@ -51464,10 +51062,38 @@ from rag.integrations.reminders import (  # noqa: E402, F401
 )
 from rag.integrations.screentime import (  # noqa: E402, F401
     SCREENTIME_DB,
+    _SCREENTIME_APP_LABELS,
+    _SCREENTIME_CATEGORIES,
+    _SCREENTIME_COCOA_OFFSET,
     _collect_screentime,
     _render_screentime_section,
     _screentime_app_label,
     _screentime_category,
+)
+from rag.integrations.whatsapp import (  # noqa: E402, F401
+    WA_CROSS_REF_LIMIT,
+    WA_TASKS_LOG_PATH,
+    WA_TASKS_MAX_CHATS,
+    WA_TASKS_MAX_MSGS_PER_CHAT,
+    WA_TASKS_MIN_INBOUND,
+    WA_TASKS_STATE_PATH,
+    WHATSAPP_BOT_JID,
+    WHATSAPP_BRIDGE_DB_PATH,
+    WHATSAPP_DB_PATH,
+    WHATSAPP_NOTE_MAX_CHARS,
+    _ambient_whatsapp_send,
+    _fetch_whatsapp_unread,
+    _fetch_whatsapp_window,
+    _wa_chat_label,
+    _wa_chat_month_link,
+    _wa_extract_actions,
+    _wa_tasks_load_state,
+    _wa_tasks_plist,
+    _wa_tasks_save_state,
+    _wa_tasks_write_note,
+    _whatsapp_jid_from_contact,
+    _whatsapp_resolve_reply_target,
+    _whatsapp_send_to_jid,
 )
 from rag.integrations.weather import (  # noqa: E402, F401
     WEATHER_LOCATION,

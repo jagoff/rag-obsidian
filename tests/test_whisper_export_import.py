@@ -248,6 +248,36 @@ def test_import_handles_missing_corrections_key(tmp_corrections_db, tmp_path):
 # ── Roundtrip ─────────────────────────────────────────────────────────────────
 
 
+# ── Doctor ───────────────────────────────────────────────────────────────────
+
+
+def test_whisper_doctor_command_registered():
+    """`rag whisper doctor` debe estar registrado como subcomando."""
+    assert "doctor" in rag.whisper.commands
+    cmd = rag.whisper.commands["doctor"]
+    assert cmd.callback.__name__ == "whisper_doctor"
+    # Help text presente y descriptivo.
+    assert cmd.help is not None
+    assert "health check" in cmd.help.lower()
+
+
+def test_whisper_doctor_runs_without_crashing(tmp_corrections_db):
+    """Smoke test: el comando corre end-to-end sin tirar excepción.
+
+    No verificamos cada check individual porque dependen del filesystem
+    real (modelos, daemons launchd, ollama). Pero confirmamos que el flow
+    completo no rompe con exception cuando alguno falta.
+    """
+    runner = CliRunner()
+    result = runner.invoke(rag.cli, ["whisper", "doctor"])
+    # Exit code 0=todo ok, 1=err, 2=warn. Cualquiera de los tres es OK
+    # mientras no sea uncaught exception (3+).
+    assert result.exit_code in (0, 1, 2), \
+        f"unexpected exit code {result.exit_code}: {result.output}"
+    # Output debe tener el header.
+    assert "Whisper learning loop" in result.output or "health check" in result.output
+
+
 def test_export_import_roundtrip(tmp_corrections_db, tmp_path):
     """Export desde DB con datos → import a DB vacía → lo mismo en ambas."""
     seed, db_path = tmp_corrections_db

@@ -193,7 +193,16 @@ def test_empty_vaults_returns_fast_path_false():
 def test_web_log_includes_fast_path():
     """Grep-level contract: web/server.py's main log_query_event payload
     must include `fast_path` so the dashboard can count realised vs
-    potential fast-path hits."""
+    potential fast-path hits.
+
+    Window bumped 1500 → 4000 (2026-04-25): la peer agregó campos nuevos
+    al payload (`adaptive_num_ctx`, `final_ctx_chars`) con comentarios
+    extensos justificándolos, lo que empujó `fast_path` fuera del window
+    original. Subiendo el cap a 4000 chars el test sigue siendo restrictivo
+    (no busca `"fast_path"` en TODO el archivo, solo en el block del
+    log_query_event principal) pero permite que crezca el bloque a
+    medida que se documentan más campos.
+    """
     src = (Path(__file__).resolve().parent.parent
            / "web" / "server.py").read_text(encoding="utf-8")
     # Find the main `cmd: "web"` log call and confirm the key is there.
@@ -204,7 +213,7 @@ def test_web_log_includes_fast_path():
     idx = src.find('"llm_decode_ms": int(_t_llm_decode_ms)')
     assert idx >= 0, "llm_decode_ms anchor missing — log_query_event changed?"
     # Window around the anchor — both directions.
-    window = src[max(0, idx - 200) : idx + 1500]
+    window = src[max(0, idx - 200) : idx + 4000]
     assert '"fast_path"' in window, (
         "fast_path key missing from /api/chat main log_query_event payload"
     )

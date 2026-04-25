@@ -12735,9 +12735,101 @@ def _extract_proper_nouns(text: str) -> set[str]:
 
 # Cache LRU de paráfrasis por query. Temperature=0 + seed=42 → determinístico,
 # cachear es gratis. Las queries se repiten bastante entre chat turns y bots.
+#
+# Persistencia a disco (2026-04-25): el LRU in-memory funciona bien para el
+# web server (proceso long-lived → cache hit-rate alto, p50 retrieve = 0.58s
+# medido en `rag_queries`). Pero el CLI `rag query` arranca proceso fresh
+# cada vez → cache vacía → paga ~1-3s de paraphrase en cada call (p50 7.3s
+# en producción). Persistimos el cache a `EXPAND_CACHE_PATH` y lo cargamos
+# lazy al primer `expand_queries()` para que el CLI cold-start también
+# aproveche el cache acumulado.
+EXPAND_CACHE_PATH = Path.home() / ".local/share/obsidian-rag/expand_cache.json"
 _EXPAND_CACHE_MAX = 256
+# Always an OrderedDict (never None) so existing tests + conftest that call
+# `_expand_cache.clear()` keep working without ceremony. The disk-backed
+# entries are merged in lazily on the first `_load_expand_cache()`.
 _expand_cache: "OrderedDict[str, list[str]]" = OrderedDict()
+_expand_cache_dirty = False
+_expand_cache_disk_loaded = False
 _expand_cache_lock = threading.Lock()
+
+
+def _load_expand_cache() -> "OrderedDict[str, list[str]]":
+    """Merge the disk-persisted cache into `_expand_cache` once per process.
+
+    Lazy: only does the disk read on the first call. Subsequent calls are
+    a no-op fast path. If the cache file is corrupt (truncated mid-write
+    or pre-atomic-write bug), back it up to `<path>.corrupt-<ts>` and
+    return whatever is in-memory. Same hardening pattern as
+    `_load_synthetic_q_cache` and `load_session` (2026-04-25).
+    """
+    global _expand_cache_disk_loaded
+    with _expand_cache_lock:
+        if _expand_cache_disk_loaded:
+            return _expand_cache
+        _expand_cache_disk_loaded = True  # set even on failure → don't retry
+        if not EXPAND_CACHE_PATH.is_file():
+            return _expand_cache
+        try:
+            data = json.loads(EXPAND_CACHE_PATH.read_text())
+        except Exception as exc:
+            _silent_log("expand_cache_load", exc)
+            try:
+                backup = EXPAND_CACHE_PATH.with_suffix(
+                    f".json.corrupt-{int(time.time())}"
+                )
+                EXPAND_CACHE_PATH.rename(backup)
+            except Exception:  # pragma: no cover - rescue path
+                pass
+            return _expand_cache
+        if not isinstance(data, dict):
+            return _expand_cache
+        # Merge disk entries that aren't already in memory. In-memory wins
+        # on collision (the running process may have a newer paraphrase).
+        for k, v in data.items():
+            if k in _expand_cache:
+                continue
+            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                _expand_cache[k] = list(v)
+        # Trim if disk pushed us past the cap (oldest first).
+        while len(_expand_cache) > _EXPAND_CACHE_MAX:
+            _expand_cache.popitem(last=False)
+        return _expand_cache
+
+
+def _save_expand_cache() -> None:
+    """Persist the paraphrase cache atomically if dirty.
+
+    Uses tmp+os.replace pattern so concurrent writers (e.g. web server +
+    a parallel `rag query` CLI) cannot truncate each other into a
+    half-written JSON. Called from `atexit` so we save once per process
+    on clean shutdown — losing the in-memory delta on crash is fine
+    (paraphrases are deterministic, the next query just repays the LLM
+    cost once).
+    """
+    global _expand_cache_dirty
+    with _expand_cache_lock:
+        if not _expand_cache_dirty:
+            return
+        payload = json.dumps(dict(_expand_cache), ensure_ascii=False)
+        _expand_cache_dirty = False
+    EXPAND_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = EXPAND_CACHE_PATH.with_suffix(
+        f".json.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        tmp.write_text(payload)
+        os.replace(tmp, EXPAND_CACHE_PATH)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # pragma: no cover
+            pass
+        raise
+
+
+# Persist on clean exit. Idempotent (atexit dedups by callable identity).
+atexit.register(_save_expand_cache)
 
 # Perf gate — queries con MENOS de este nº de tokens se saltan la expansión
 # (el helper qwen2.5:3b cuesta 1-3s y aporta recall marginal sobre queries
@@ -12881,13 +12973,15 @@ def expand_queries(question: str) -> list[str]:
     Populated por `rag paraphrases train` desde rag_feedback. Flag
     RAG_LEARNED_PARAPHRASES (default ON).
     """
+    global _expand_cache_dirty
     tokens = question.strip().split()
     if len(tokens) < _EXPAND_MIN_TOKENS:
         return [question]
+    cache = _load_expand_cache()  # lazy disk-load on first call per process
     with _expand_cache_lock:
-        hit = _expand_cache.get(question)
+        hit = cache.get(question)
         if hit is not None:
-            _expand_cache.move_to_end(question)  # LRU: mark as recently used
+            cache.move_to_end(question)  # LRU: mark as recently used
     if hit is not None:
         return list(hit)
     # Learned-paraphrases short-circuit: if we have ≥2-hit paraphrases
@@ -12896,10 +12990,11 @@ def expand_queries(question: str) -> list[str]:
     if learned:
         result = [question] + learned
         with _expand_cache_lock:
-            _expand_cache[question] = result
-            _expand_cache.move_to_end(question)
-            while len(_expand_cache) > _EXPAND_CACHE_MAX:
-                _expand_cache.popitem(last=False)
+            cache[question] = result
+            cache.move_to_end(question)
+            while len(cache) > _EXPAND_CACHE_MAX:
+                cache.popitem(last=False)
+            _expand_cache_dirty = True
         return list(result)
     prompt = (
         "Reformulá esta pregunta de DOS maneras distintas — distintas "
@@ -12944,10 +13039,11 @@ def expand_queries(question: str) -> list[str]:
             break
     result = [question] + kept
     with _expand_cache_lock:
-        _expand_cache[question] = result
-        _expand_cache.move_to_end(question)
-        while len(_expand_cache) > _EXPAND_CACHE_MAX:
-            _expand_cache.popitem(last=False)  # evict least-recently-used
+        cache[question] = result
+        cache.move_to_end(question)
+        while len(cache) > _EXPAND_CACHE_MAX:
+            cache.popitem(last=False)  # evict least-recently-used
+        _expand_cache_dirty = True
     return list(result)
 
 
@@ -19725,16 +19821,21 @@ def _spawn_contradiction_worker(
     return t
 
 
-def _drain_contradiction_workers(timeout: float = 10.0) -> None:
-    """On CLI exit, give in-flight contradiction workers up to 10s to
+def _drain_contradiction_workers(timeout: float = 30.0) -> None:
+    """On CLI exit, give in-flight contradiction workers up to 30s to
     finish. Stragglers self-persist to the pending JSONL via the
     exception path in `_contradiction_worker_wrapper` and get re-applied
     at next startup. We never block indefinitely — a wedged chat model
     must not prevent process exit.
 
+    Sets `_CONTRA_SHUTDOWN_EVENT` first so any worker that hasn't entered
+    its chat call yet can short-circuit (defer to pending JSONL) instead
+    of starting a fresh 30-120s LLM call we know we can't wait for.
+
     Idempotent: safe to register multiple times (atexit dedups by
     callable identity) and safe to call manually from tests.
     """
+    _CONTRA_SHUTDOWN_EVENT.set()
     with _CONTRA_WRITERS_LOCK:
         pending = list(_CONTRA_WRITERS)
     if not pending:

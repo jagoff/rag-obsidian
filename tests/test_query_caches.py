@@ -7,6 +7,7 @@ de las mismas variantes — cachear ahorra llamadas a ollama.
 El conftest.py autouse limpia ambos caches entre tests, así que cada caso
 arranca con dict vacío.
 """
+import json
 import threading
 
 import pytest
@@ -251,3 +252,161 @@ def test_concurrent_expand_same_query_is_thread_safe(fake_chat):
     assert not errors
     assert len(set(results)) == 1
     assert q in rag._expand_cache
+
+
+# ── Persistencia disco-backed del expand cache ──────────────────────────────
+
+
+def test_expand_cache_load_from_disk_populates_in_memory(monkeypatch, tmp_path):
+    """Disk-persisted entries must be merged into `_expand_cache` on the
+    first `_load_expand_cache()` call. Validates the cold-start fix:
+    `rag query` arranca proceso fresh y aprovecha paraphrases acumuladas
+    de calls anteriores."""
+    cache_path = tmp_path / "expand_cache.json"
+    cache_path.write_text(json.dumps({
+        "qué tema musical de tool tiene mejor solo": [
+            "qué tema musical de tool tiene mejor solo",
+            "cuál es el mejor solo de tool",
+            "tool: tema con el mejor solo de guitarra",
+        ],
+    }))
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache_disk_loaded", False)
+    rag._expand_cache.clear()
+
+    cache = rag._load_expand_cache()
+
+    assert "qué tema musical de tool tiene mejor solo" in cache
+    assert len(cache["qué tema musical de tool tiene mejor solo"]) == 3
+
+
+def test_expand_cache_load_is_lazy_and_idempotent(monkeypatch, tmp_path):
+    """Subsequent `_load_expand_cache()` calls must be a no-op: don't
+    re-read the file. We test by deleting the file after the first load —
+    if the second call re-read from disk, it would now see "no file" and
+    skip merging, which would still leave the cache populated; so the
+    real signal here is the `_expand_cache_disk_loaded` flag toggling on
+    the first call."""
+    cache_path = tmp_path / "expand_cache.json"
+    cache_path.write_text(json.dumps({"q one alfa beta gamma delta": ["q one alfa beta gamma delta", "p1", "p2"]}))
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache_disk_loaded", False)
+    rag._expand_cache.clear()
+
+    assert rag._expand_cache_disk_loaded is False
+    rag._load_expand_cache()
+    assert rag._expand_cache_disk_loaded is True
+
+    # Even if the disk file is deleted, the second call doesn't re-read.
+    cache_path.unlink()
+
+    second_call = rag._load_expand_cache()
+    # Cache content should still be there (didn't reset)
+    assert "q one alfa beta gamma delta" in second_call
+
+
+def test_expand_cache_save_writes_atomically(monkeypatch, tmp_path):
+    """Save must use tmp+rename so concurrent writers can't corrupt the
+    cache. Verifies that the final file is valid JSON and no `.tmp.*`
+    residue leaks."""
+    from collections import OrderedDict as _OD
+
+    cache_path = tmp_path / "expand_cache.json"
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache", _OD({"q one alfa": ["q one alfa", "p1", "p2"]}))
+    monkeypatch.setattr(rag, "_expand_cache_dirty", True)
+
+    rag._save_expand_cache()
+
+    assert cache_path.is_file()
+    assert json.loads(cache_path.read_text()) == {"q one alfa": ["q one alfa", "p1", "p2"]}
+    leftovers = list(tmp_path.glob("*.tmp.*"))
+    assert leftovers == []
+
+
+def test_expand_cache_save_skips_when_not_dirty(monkeypatch, tmp_path):
+    """If nothing changed since last save, don't touch the disk."""
+    from collections import OrderedDict as _OD
+
+    cache_path = tmp_path / "expand_cache.json"
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache", _OD({"x": ["x", "p1"]}))
+    monkeypatch.setattr(rag, "_expand_cache_dirty", False)
+
+    rag._save_expand_cache()
+
+    assert not cache_path.is_file()
+
+
+def test_expand_cache_corrupt_file_is_quarantined(monkeypatch, tmp_path):
+    """Corrupt cache → quarantine to `.corrupt-<ts>` and return empty.
+    Same hardening pattern as `_load_synthetic_q_cache` and `load_session`.
+    """
+    cache_path = tmp_path / "expand_cache.json"
+    cache_path.write_text("{not json}")
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache_disk_loaded", False)
+    rag._expand_cache.clear()
+
+    rag._load_expand_cache()
+
+    assert not cache_path.is_file()
+    backups = list(tmp_path.glob("expand_cache.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "{not json}"
+
+
+def test_expand_queries_marks_dirty_on_llm_path(monkeypatch, tmp_path):
+    """When `expand_queries()` writes a fresh paraphrase, it must flip
+    `_expand_cache_dirty` so the next `atexit` save persists it."""
+    cache_path = tmp_path / "expand_cache.json"
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+    monkeypatch.setattr(rag, "_expand_cache_disk_loaded", True)  # skip disk load
+    monkeypatch.setattr(rag, "_expand_cache_dirty", False)
+    rag._expand_cache.clear()
+
+    # Make _lookup_learned_paraphrases return nothing so we go LLM path.
+    monkeypatch.setattr(rag, "_lookup_learned_paraphrases", lambda *a, **k: [])
+
+    captured = []
+
+    class _Resp:
+        class message:
+            content = "p1 alfa beta gamma\np2 zeta eta theta"
+
+    class _Client:
+        def chat(self, **kwargs):
+            captured.append(kwargs)
+            return _Resp()
+
+    monkeypatch.setattr(rag, "_helper_client", lambda: _Client())
+
+    out = rag.expand_queries("pregunta original alfa beta gamma delta epsilon")
+
+    assert len(out) >= 1
+    assert rag._expand_cache_dirty is True
+
+
+def test_expand_cache_save_then_load_roundtrip(monkeypatch, tmp_path):
+    """Full cycle: write to disk, reset state, load back. No data loss."""
+    from collections import OrderedDict as _OD
+
+    cache_path = tmp_path / "expand_cache.json"
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+
+    # Save phase
+    monkeypatch.setattr(rag, "_expand_cache", _OD({
+        "query alfa beta gamma delta epsilon": ["query alfa beta gamma delta epsilon", "p1", "p2"],
+        "otra query con varias palabras hoy": ["otra query con varias palabras hoy", "x1", "x2"],
+    }))
+    monkeypatch.setattr(rag, "_expand_cache_dirty", True)
+    rag._save_expand_cache()
+
+    # Load phase: simulate a new process
+    rag._expand_cache.clear()
+    monkeypatch.setattr(rag, "_expand_cache_disk_loaded", False)
+
+    cache = rag._load_expand_cache()
+    assert "query alfa beta gamma delta epsilon" in cache
+    assert "otra query con varias palabras hoy" in cache
+    assert cache["query alfa beta gamma delta epsilon"] == ["query alfa beta gamma delta epsilon", "p1", "p2"]

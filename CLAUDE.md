@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (~32.7k lines) + `mcp_server.py` (thin wrapper, 283 lines) + `web/` (FastAPI server, 6.1k lines + ~7.7k JS/HTML/CSS) + `tests/` (2,247 tests, 125 files). Resist package-split until real friction shows up.
+Local RAG over an Obsidian vault. Single-file: `rag.py` (~50.9k lines as of 2026-04-25 — drift +56% vs prior 32.7k snapshot, package-split is now an open discussion not a settled "no") + `mcp_server.py` (thin wrapper, 604 lines) + `web/` (FastAPI `web/server.py` 11.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (2,247 tests, 269 files).
 
 Entry points (both installed via `uv tool install --editable .`):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -429,7 +429,7 @@ Chunks 150–800 chars, split on headers + blank lines, merged if < MIN_CHUNK. E
 | Chat | `resolve_chat_model()`: qwen2.5:7b > qwen3:30b-a3b > command-r > qwen2.5:14b > phi4 | qwen2.5:7b default tras bench 2026-04-18 (total P50 5.9s vs 37s de command-r); fallbacks high-quality disponibles. |
 | Helper | `qwen2.5:3b` | paraphrase/HyDE/reformulation |
 | Embed | `bge-m3` | 1024-dim multilingual |
-| Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float32` forced — do NOT switch to fp16 on MPS (score collapse to ~0.001, verified 2026-04-13); CPU fallback = 3× slower. |
+| Reranker | `BAAI/bge-reranker-v2-m3` | `device="mps"` + `float32` forced — do NOT switch to fp16 on MPS. Two A/Bs verifican el desastre por motivos distintos (collapse 2026-04-13, overhead 2× con calidad equivalente 2026-04-22). Detalle en §"Rerank fp16 A/B 2026-04-22 — NO PROMOTED" abajo. CPU fallback = 3× slower. |
 | NLI (opt-in) | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` | ~400 MB MPS fp32, idle-unload via `RAG_NLI_IDLE_TTL` (default 900s). Gate: `RAG_NLI_GROUNDING`. |
 
 All ollama calls use `keep_alive=OLLAMA_KEEP_ALIVE` — default `-1` (forever) in code (`rag.py:1608`) since 2026-04-21; launchd plists use the same value for symmetry. `CHAT_OPTIONS`: `num_ctx=4096, num_predict=384` — don't bump unless prompts grow.
@@ -745,15 +745,29 @@ Primitives in `rag.py` (`# ── SQL state store (T1: foundation) ──` secti
 
 Writer contract (post-T10): single-row BEGIN/COMMIT into SQL. On exception, log the error to `sql_state_errors.jsonl` and **silently drop the event** — no JSONL fallback. Callers never see a raised exception. Reader contract: SQL-only. Readers return empty snapshots (behavior priors, feedback golden, behavior-augmented cases, contradictions) or False/None (brief_state, ambient_state lookups) on SQL error; retrieval pipeline stays functional without priors until the DB is readable again.
 
-#### Invariantes del telemetry stack (audit 2026-04-24)
+#### Invariantes del telemetry stack (audit 2026-04-24 + extensión 2026-04-25)
 
-Tres reglas que el código tiene que respetar — violar cualquiera deja bugs latentes que el audit del 2026-04-24 encontró tras 6 días de degradación silenciosa.
+Cuatro reglas que el código tiene que respetar — violar cualquiera deja bugs latentes. Las tres primeras salieron del audit del 2026-04-24 tras 6 días de degradación silenciosa; la cuarta del audit 2026-04-25 tras encontrar tests escribiendo a la prod telemetry.db en 3 clases distintas.
 
 1. **Todo silent-error sink llama `_bump_silent_log_counter()`**. Cualquier función nueva tipo `_log_X_error(...)` que escribe a un `.jsonl` y devuelve sin raisear DEBE invocar el helper en `rag.py` post-write. Sin esto, el alerting a stderr (threshold `RAG_SILENT_LOG_ALERT_THRESHOLD=20/h`) queda parcial — es exactamente cómo 1756 errores SQL en 6 días no dispararon un solo alert. Pre-fix `_silent_log` lo bumpeba pero `_log_sql_state_error` no. Tests: `tests/test_silent_log_alerting.py`.
 
 2. **Async writer = paquete completo de 4 cambios**. Cuando un writer pasa a usar `_enqueue_background_sql`: (a) helper de gate per-writer (`_log_X_event_background_default()`), (b) caller con branch sync/async, (c) autouse fixture en conftest que setea `RAG_LOG_X_ASYNC=0`, (d) doc del env var en este CLAUDE.md. Tocar solo (a)+(b) deja tests rotos en producción y la próxima persona descubre el override por accidente. Tests: `tests/test_sql_async_writers.py`.
 
 3. **Readers SQL: retry + stale-cache fallback, nunca empty default que sobrescriba memo**. `_load_behavior_priors` y `load_feedback_golden` son los modelos. En error path, devolver el cache previo SIN tocar `_X_memo`. El bug clásico que esto previene: el `default=("error", {empty}, None)` del retry era asignado al memo, envenenando el cache hasta que `source_ts` cambiara. Tests: `tests/test_sql_reader_retry.py`.
+
+4. **Tests con TestClient o writers SQL aíslan `DB_PATH` per-file**. Conftest autouse `_isolate_vault_path` cubre `VAULT_PATH` global pero NO hay equivalente para `DB_PATH` — intentos conftest-wide reverteados (sesión 2026-04-25, dos veces) porque disparan warning falso de `_stabilize_rag_state` cuando un test sub-fixture redirige a un sub-tmp. Cualquier test que use `fastapi.testclient.TestClient(app)`, llame `log_query_event` / `log_behavior_event` / `semantic_cache_*` / `record_feedback` directamente, o ejercite endpoints `/api/chat` / `/api/behavior`, DEBE redirigir `rag.DB_PATH` con autouse fixture **snap+restore manual** (no `monkeypatch.setattr`):
+
+   ```python
+   @pytest.fixture(autouse=True)
+   def _isolate_db_path(tmp_path):
+       import rag as _rag
+       snap = _rag.DB_PATH
+       _rag.DB_PATH = tmp_path / "ragvec"
+       try: yield
+       finally: _rag.DB_PATH = snap
+   ```
+
+   Razón del manual snap+restore: `monkeypatch.setattr` revierte en su propio teardown que corre DESPUÉS del teardown de `_stabilize_rag_state` → la stabilizer ve el tmp todavía aplicado y warning. Mismo patrón que `tests/test_rag_log_sql_read.py::sql_env`. Tests con isolation aplicada (al 2026-04-25): `test_degenerate_query`, `test_semantic_cache*` (5 archivos), `test_rag_log_sql_read`, `test_post_t10_sql_readers`, `test_followup`, `test_read`. **Pendiente** (gap conocido): `test_web_{cors,pwa,chat_low_conf_bypass,sessions_sidebar,static_cache,chat_tools,propose_endpoints,chat_mode}`, `test_propose_mail_send`, `test_drive_search_tool`. Pollution medida 2026-04-25: 161 entries `event=test_tag` en `sql_state_errors.jsonl`, 5 rows `question='test'` en `rag_response_cache`, 57 rows `cmd='web.chat.degenerate'` con `q='?¡@#'` en `rag_queries`. Memoria: [feedback_test_db_path_isolation.md](.claude/projects/-Users-fer-repositories-obsidian-rag/memory/feedback_test_db_path_isolation.md) si existe el symlink en tu workspace.
 
 Diagnóstico data-first: correr `python scripts/audit_telemetry_health.py --days 7` antes de cualquier "auditá el sistema" — agrega los 5 queries que reprodujeron el audit 2026-04-24 en 1 segundo (errores SQL/silent, latency outliers, cache probe distribution, DB sizes). Primer comando del workflow.
 

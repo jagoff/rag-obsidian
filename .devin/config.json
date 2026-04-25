@@ -117,5 +117,20 @@
       "Fetch(https://api.openai.com/**)",
       "Fetch(https://api.anthropic.com/**)"
     ]
+  },
+  "hooks": {
+    "_comment": "PostToolUse: tras cada edit/write a rag.py o web/server.py, corre un import-check rapido (~1-2s) que detecta syntax errors e import errors al instante. Output silencioso en happy path; en error imprime stderr al agent para que pueda corregir antes de seguir editando. Ver .devin/hooks/post-edit-syntax-check.sh para detalles.",
+    "PostToolUse": [
+      {
+        "matcher": "edit|write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".devin/hooks/post-edit-syntax-check.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
   }
 }

@@ -22,6 +22,22 @@ Tasks that touch ≤2 files go directly to the owning agent (`rag-retrieval`, `r
 
 When peers are active (`mcp__claude-peers__list_peers(scope: "repo")` returns >1), even ≤2-file tasks may need PM coordination — flag overlapping zones before editing.
 
+### Custom agent profiles requieren reload de la sesión
+
+Los profiles definidos en [`.claude/agents/*.md`](.claude/agents/) se cargan **una sola vez al iniciar la sesión** de Devin / Claude Code. Si creás un agent nuevo durante una sesión activa (ej. agregás `.claude/agents/foo.md`), **esa sesión NO lo ve** — la lista de profiles disponibles se compiló al boot y no se refresca.
+
+Síntoma: invocar `run_subagent(profile="foo", ...)` (Devin) o `Agent(subagent_type: "foo", ...)` (Claude Code) rebota con "Subagent failed to start" o "subagent type unknown".
+
+Workarounds en orden de preferencia:
+
+1. **Reabrir la sesión**: `Ctrl-D` (o `exit`) y volver a lanzar `devin` / `claude`. La nueva sesión escanea `.claude/agents/` y carga el profile. Es lo correcto a largo plazo — siempre que no estés en medio de algo importante.
+2. **Inyectar el system prompt inline en `subagent_explore` o `subagent_general`**: pegás el body del nuevo `AGENT.md` como brief en `run_subagent(profile="subagent_explore", task="<system prompt completo>")`. Output equivalente, pero perdés el archivo como source of truth — cada invocación re-pegás el prompt.
+3. **Adelantarse**: si vas a crear un agent nuevo durante una task, creá el archivo **antes** de empezar la sesión y arrancá Devin después. Sirve cuando el flujo es predecible.
+
+Este gotcha aplica también a **skills** custom en `.devin/skills/` y `.claude/skills/`. Hooks en `.devin/config.json` SÍ se refrescan en runtime (al menos en versiones recientes), no hay que reabrir.
+
+Aprendido el 2026-04-25 cuando creé `rag-perf-auditor.md` durante una sesión y `run_subagent(profile="rag-perf-auditor", ...)` rebotó.
+
 ## Auto-pull + commit + push rule
 
 **Regla universal: cuando termino ALGO — feature, fix, refactor, limpieza, ajuste — el ciclo es siempre `git pull → git commit → git push origin master`. Sin preguntar.**

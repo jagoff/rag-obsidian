@@ -410,3 +410,59 @@ def test_expand_cache_save_then_load_roundtrip(monkeypatch, tmp_path):
     assert "query alfa beta gamma delta epsilon" in cache
     assert "otra query con varias palabras hoy" in cache
     assert cache["query alfa beta gamma delta epsilon"] == ["query alfa beta gamma delta epsilon", "p1", "p2"]
+
+
+def test_expand_cache_concurrent_saves_dont_corrupt(monkeypatch, tmp_path):
+    """Stress: 8 threads concurrente llaman _save_expand_cache. El
+    atomic write (tmp + os.replace) debe garantizar que el archivo
+    final SIEMPRE sea JSON válido — nunca truncado, nunca media-escrito.
+
+    Pre-fix la implementación usaba `write_text()` directo lo que
+    permitía interleaving entre threads (1 thread podía leer un
+    estado parcial de otro). El fix con tmp+rename hace cada save
+    atómico a nivel filesystem (APFS/ext4 garantizan rename atomic).
+    """
+    from collections import OrderedDict as _OD
+    import threading
+
+    cache_path = tmp_path / "expand_cache.json"
+    monkeypatch.setattr(rag, "EXPAND_CACHE_PATH", cache_path)
+
+    errors: list[Exception] = []
+
+    def writer(thread_id: int):
+        try:
+            for i in range(20):
+                # Cada thread tiene su propio dict que muta y guarda.
+                local = _OD({
+                    f"q-thread-{thread_id}-{i}": [
+                        f"q-thread-{thread_id}-{i}",
+                        "p1",
+                        "p2",
+                    ],
+                })
+                # Hack: monkeypatch en thread no aplica — escribimos
+                # directo al global con un lock.
+                with rag._expand_cache_lock:
+                    rag._expand_cache.update(local)
+                    rag._expand_cache_dirty = True
+                rag._save_expand_cache()
+        except Exception as e:
+            errors.append(e)
+
+    rag._expand_cache.clear()
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"writer threads raisearon: {errors!r}"
+
+    # Final read MUST succeed — el archivo siempre fue JSON válido.
+    assert cache_path.is_file()
+    final = json.loads(cache_path.read_text())
+    assert isinstance(final, dict)
+    # Y no debe haber `.tmp.*` files leakeados (cada thread limpia su tmp).
+    leftovers = list(tmp_path.glob("*.tmp.*"))
+    assert leftovers == [], f"tmp files leakearon: {leftovers!r}"

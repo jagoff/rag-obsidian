@@ -4606,13 +4606,81 @@ _HOME_COMPUTE_HISTORY_MAX = 20
 _HOME_COMPUTE_DEGRADED_FLOOR = 8.0
 
 
-def _record_home_compute_total(elapsed_s: float) -> None:
+def _record_home_compute_total(
+    elapsed_s: float,
+    *,
+    regenerate: bool = False,
+    degraded: bool = False,
+    degraded_cause: str | None = None,
+) -> None:
+    """Append a sample to the rolling window AND persist to SQL.
+
+    Persisting to `rag_home_compute_metrics` lets the degraded
+    threshold survive a web service restart — pre-persistence, the
+    in-memory `_HOME_COMPUTE_HISTORY` reset on every kickstart, so
+    the first 3 streams after restart fell back to the
+    `_HOME_COMPUTE_DEGRADED_FLOOR` (8s) which is conservative and
+    typically too high for warm-cache machines. SQL persistence makes
+    the threshold reflect genuine recent baselines.
+
+    Outliers (≤0 or >600s) are dropped — those would be measurement
+    bugs, not real runs.
+    """
     if elapsed_s <= 0 or elapsed_s > 600:
-        return  # ignore obvious outliers
+        return
     with _HOME_COMPUTE_HISTORY_LOCK:
         _HOME_COMPUTE_HISTORY.append(elapsed_s)
         if len(_HOME_COMPUTE_HISTORY) > _HOME_COMPUTE_HISTORY_MAX:
             _HOME_COMPUTE_HISTORY.pop(0)
+
+    # Persist sync — single-row INSERT to telemetry.db is sub-ms warm
+    # and benefits from `busy_timeout=30000` to absorb transient locks.
+    # Going async via daemon thread caused races with conftest fixture
+    # teardown in tests (`rag.DB_PATH` got restored before the daemon
+    # could open its conn). Silent-fail per existing convention.
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "INSERT INTO rag_home_compute_metrics "
+                "(ts, elapsed_s, regenerate, degraded, degraded_cause) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    datetime.now().isoformat(timespec="seconds"),
+                    float(elapsed_s),
+                    1 if regenerate else 0,
+                    1 if degraded else 0,
+                    degraded_cause,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass  # silent-fail per convention
+
+
+def _hydrate_home_compute_history_from_sql() -> None:
+    """Backfill `_HOME_COMPUTE_HISTORY` with the most recent samples
+    from SQL on web service startup. Called from the lifespan hook.
+
+    Without this, the threshold `max(floor, median × 2)` falls back
+    to the floor every restart. Hydrating means the user sees
+    consistent threshold behaviour across kickstarts.
+    """
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(
+                "SELECT elapsed_s FROM rag_home_compute_metrics "
+                "ORDER BY ts DESC LIMIT ?",
+                (_HOME_COMPUTE_HISTORY_MAX,),
+            ).fetchall()
+    except Exception:
+        return
+    if not rows:
+        return
+    samples = [float(r[0]) for r in reversed(rows)]
+    with _HOME_COMPUTE_HISTORY_LOCK:
+        _HOME_COMPUTE_HISTORY[:] = samples
 
 
 def _home_compute_degraded_threshold() -> float:
@@ -9897,6 +9965,82 @@ def dashboard_api(days: int = 30) -> dict:
         return hit[1]
     payload = _dashboard_compute(days)
     _DASHBOARD_CACHE[days] = (now_ts, payload)
+    return payload
+
+
+@app.get("/api/status/home")
+def status_home() -> dict:
+    """Health del home page compute — surface el threshold actual,
+    los últimos N totales (para sparkline en el status page) y un
+    conteo de degraded events en las últimas 24h.
+
+    Diseño: SOLO lee `rag_home_compute_metrics` (sin cómputos pesados,
+    sub-50ms warm). El threshold es el mismo que usa el SSE generator,
+    derivado de la rolling window in-memory. Si la window está fría
+    (post-restart sin hidratar todavía), devuelve `floor` con un flag
+    `cold=true` para que la UI pinte un disclaimer apropiado.
+    """
+    from rag import _ragvec_state_conn, _sql_read_with_retry
+
+    def _do() -> dict:
+        with _ragvec_state_conn() as conn:
+            recent = conn.execute(
+                "SELECT ts, elapsed_s, regenerate, degraded, degraded_cause "
+                "FROM rag_home_compute_metrics "
+                "ORDER BY ts DESC LIMIT 50"
+            ).fetchall()
+            cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+            counts = conn.execute(
+                "SELECT "
+                " COUNT(*) AS total, "
+                " COALESCE(SUM(degraded), 0) AS degraded_n, "
+                " COALESCE(SUM(regenerate), 0) AS regen_n "
+                "FROM rag_home_compute_metrics WHERE ts >= ?",
+                (cutoff,),
+            ).fetchone()
+            cause_breakdown = conn.execute(
+                "SELECT degraded_cause, COUNT(*) AS n "
+                "FROM rag_home_compute_metrics "
+                "WHERE ts >= ? AND degraded = 1 AND degraded_cause IS NOT NULL "
+                "GROUP BY degraded_cause ORDER BY n DESC",
+                (cutoff,),
+            ).fetchall()
+        return {
+            "samples": [
+                {
+                    "ts": r[0],
+                    "elapsed_s": float(r[1]),
+                    "regenerate": bool(r[2]),
+                    "degraded": bool(r[3]),
+                    "degraded_cause": r[4],
+                }
+                for r in recent
+            ],
+            "window_24h": {
+                "total": int(counts[0] or 0),
+                "degraded": int(counts[1] or 0),
+                "regenerate": int(counts[2] or 0),
+                "by_cause": [
+                    {"cause": r[0], "count": int(r[1])}
+                    for r in cause_breakdown
+                ],
+            },
+        }
+
+    payload = _sql_read_with_retry(_do, "status_home_sql_read_failed", default=None)
+    if payload is None:
+        payload = {
+            "samples": [],
+            "window_24h": {"total": 0, "degraded": 0, "regenerate": 0,
+                           "by_cause": []},
+        }
+
+    with _HOME_COMPUTE_HISTORY_LOCK:
+        history_size = len(_HOME_COMPUTE_HISTORY)
+    payload["threshold_s"] = round(_home_compute_degraded_threshold(), 2)
+    payload["floor_s"] = _HOME_COMPUTE_DEGRADED_FLOOR
+    payload["cold"] = history_size < 3
+    payload["history_size"] = history_size
     return payload
 
 

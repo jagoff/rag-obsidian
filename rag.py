@@ -5354,6 +5354,27 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_status_samples(service_id, ts)",
         ),
     ),
+    (
+        # rag_home_compute_metrics — un row por cada `_home_compute()`
+        # exitoso, escrito por el web server. Powers el degraded
+        # threshold (median × 2) y el panel del status page que muestra
+        # trend P50/P95 de la carga del home page. Persistir en SQL →
+        # threshold consistente cross-restart en vez de fall back al
+        # floor de 8s después de cada kickstart.
+        "rag_home_compute_metrics",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_home_compute_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " elapsed_s REAL NOT NULL,"
+            " regenerate INTEGER NOT NULL DEFAULT 0,"
+            " degraded INTEGER NOT NULL DEFAULT 0,"
+            " degraded_cause TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_home_compute_metrics_ts "
+            "ON rag_home_compute_metrics(ts)",
+        ),
+    ),
 )
 
 

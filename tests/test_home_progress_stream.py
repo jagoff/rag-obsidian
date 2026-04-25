@@ -644,3 +644,191 @@ def test_reminder_wa_push_plist_in_services_spec():
     assert entry[1] == "com.fer.obsidian-rag-reminder-wa-push.plist"
     # XML consistent con el generator.
     assert "remind-wa" in entry[2]
+
+
+# ── SQL persistence + /api/status/home ─────────────────────────────────────
+
+
+@pytest.fixture
+def isolate_home_metrics_sql(tmp_path, monkeypatch):
+    """Redirigir DB_PATH a tmp_path y limpiar la rolling window
+    in-memory para que cada test arranque en estado conocido. Restaura
+    paths en su propio finally para evitar el warning falso del
+    conftest autouse (mismo patrón que tests/test_reminder_wa_push.py)."""
+    import rag
+    from web import server as server_mod
+
+    snap_db = rag.DB_PATH
+    rag.DB_PATH = tmp_path
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    try:
+        yield tmp_path
+    finally:
+        rag.DB_PATH = snap_db
+        server_mod._HOME_COMPUTE_HISTORY.clear()
+
+
+def test_record_home_compute_persists_to_sql(isolate_home_metrics_sql):
+    """`_record_home_compute_total` debe escribir un row en
+    `rag_home_compute_metrics` para que la baseline sobreviva un
+    restart del web service."""
+    import sqlite3
+    import time as _time
+
+    from web import server as server_mod
+
+    server_mod._record_home_compute_total(
+        7.5, regenerate=False, degraded=False,
+    )
+    server_mod._record_home_compute_total(
+        12.3, regenerate=True, degraded=True, degraded_cause="ollama_slow",
+    )
+
+    # Writer is a daemon thread — give it a moment to land.
+    deadline = _time.time() + 2.0
+    db = isolate_home_metrics_sql / "telemetry.db"
+    rows: list[tuple] = []
+    while _time.time() < deadline:
+        if db.is_file():
+            try:
+                with sqlite3.connect(str(db)) as conn:
+                    rows = list(conn.execute(
+                        "SELECT elapsed_s, regenerate, degraded, degraded_cause "
+                        "FROM rag_home_compute_metrics ORDER BY id"
+                    ).fetchall())
+            except sqlite3.OperationalError:
+                rows = []
+            if len(rows) >= 2:
+                break
+        _time.sleep(0.05)
+
+    assert len(rows) == 2, rows
+    assert rows[0] == (7.5, 0, 0, None)
+    assert rows[1] == (12.3, 1, 1, "ollama_slow")
+
+
+def test_hydrate_home_compute_history_from_sql(isolate_home_metrics_sql):
+    """Al startup, la rolling window se hidrata con los últimos
+    `_HOME_COMPUTE_HISTORY_MAX` samples desde SQL — así el threshold
+    no falla a `floor` después de cada kickstart."""
+    import sqlite3
+
+    from web import server as server_mod
+
+    # Sembrar SQL directamente (saltea el writer async) para eliminar
+    # races de timing en CI.
+    db = isolate_home_metrics_sql / "telemetry.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE rag_home_compute_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,"
+            " elapsed_s REAL NOT NULL, regenerate INTEGER NOT NULL DEFAULT 0,"
+            " degraded INTEGER NOT NULL DEFAULT 0, degraded_cause TEXT)"
+        )
+        from datetime import datetime
+        for i, v in enumerate([3.0, 4.0, 5.0, 6.0, 7.0]):
+            conn.execute(
+                "INSERT INTO rag_home_compute_metrics(ts, elapsed_s) VALUES(?, ?)",
+                (f"2026-04-25T10:0{i}:00", v),
+            )
+        conn.commit()
+
+    # Window vacía → hidratar.
+    server_mod._HOME_COMPUTE_HISTORY.clear()
+    server_mod._hydrate_home_compute_history_from_sql()
+    assert list(server_mod._HOME_COMPUTE_HISTORY) == [3.0, 4.0, 5.0, 6.0, 7.0]
+
+
+def test_status_home_endpoint_returns_threshold_and_samples(
+    isolate_home_metrics_sql,
+):
+    """`/api/status/home` devuelve threshold actual + últimos N
+    samples + breakdown 24h."""
+    import sqlite3
+
+    from datetime import datetime
+    from fastapi.testclient import TestClient
+    from web.server import app
+
+    db = isolate_home_metrics_sql / "telemetry.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE rag_home_compute_metrics ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,"
+            " elapsed_s REAL NOT NULL, regenerate INTEGER NOT NULL DEFAULT 0,"
+            " degraded INTEGER NOT NULL DEFAULT 0, degraded_cause TEXT)"
+        )
+        recent_iso = datetime.now().isoformat(timespec="seconds")
+        for v in [5.0, 6.0, 7.0, 20.0]:
+            conn.execute(
+                "INSERT INTO rag_home_compute_metrics"
+                "(ts, elapsed_s, regenerate, degraded, degraded_cause)"
+                " VALUES(?, ?, 0, ?, ?)",
+                (recent_iso, v, 1 if v > 15 else 0,
+                 "ollama_slow" if v > 15 else None),
+            )
+        conn.commit()
+
+    with TestClient(app) as client:
+        r = client.get("/api/status/home")
+        assert r.status_code == 200
+        data = r.json()
+
+    assert "samples" in data
+    assert "window_24h" in data
+    assert "threshold_s" in data
+    assert "floor_s" in data
+    assert "cold" in data
+    # Cold = True porque la rolling window in-memory está vacía
+    # (el endpoint no la hidrata por sí solo).
+    assert data["cold"] is True
+    assert data["floor_s"] == 8.0
+    assert data["window_24h"]["total"] == 4
+    assert data["window_24h"]["degraded"] == 1
+    assert data["window_24h"]["by_cause"] == [{"cause": "ollama_slow", "count": 1}]
+
+
+def test_status_home_endpoint_shape_when_table_empty(isolate_home_metrics_sql):
+    """Al instalar (tabla vacía o nonexistente), el endpoint devuelve
+    estructura mínima sin 500. Importa para que el frontend no
+    branchee entre "instalado" vs "vacío"."""
+    from fastapi.testclient import TestClient
+    from web.server import app
+
+    with TestClient(app) as client:
+        r = client.get("/api/status/home")
+        assert r.status_code == 200
+        data = r.json()
+    assert data["samples"] == []
+    assert data["window_24h"] == {
+        "total": 0, "degraded": 0, "regenerate": 0, "by_cause": [],
+    }
+    assert data["cold"] is True
+    assert data["threshold_s"] == 8.0
+
+
+def test_record_home_compute_drops_outliers_before_sql_write(
+    isolate_home_metrics_sql,
+):
+    """Outliers (≤0 o >600s) ni siquiera disparan el writer thread —
+    no contaminan SQL ni la rolling window."""
+    import sqlite3
+    import time as _time
+
+    from web import server as server_mod
+
+    server_mod._record_home_compute_total(0)
+    server_mod._record_home_compute_total(-1)
+    server_mod._record_home_compute_total(700)
+    _time.sleep(0.3)  # let any rogue daemon thread land if it's going to
+
+    db = isolate_home_metrics_sql / "telemetry.db"
+    if db.is_file():
+        with sqlite3.connect(str(db)) as conn:
+            rows = list(conn.execute(
+                "SELECT COUNT(*) FROM rag_home_compute_metrics"
+            ).fetchall())
+        assert rows[0][0] == 0, "outliers leaked to SQL"
+    # Si la tabla no existe → ningún writer corrió, mejor todavía.

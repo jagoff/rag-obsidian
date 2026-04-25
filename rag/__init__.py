@@ -23620,6 +23620,64 @@ def _index_single_file(
     return "indexed"
 
 
+def _format_etl_detail(kind: str, stats: dict) -> str:
+    """Render the per-source `(N items, M things)` summary that
+    `_run_cross_source_etls` prints alongside each ETL's "files written"
+    line. Centralised so adding a new ETL kind is a one-line dict entry
+    instead of editing an 8-elif chain in the loop body.
+
+    Each handler reads from the `stats` dict the source's
+    `_sync_*` function returns. Missing fields default to 0/empty so a
+    partial response (e.g. `{"ok": True, "files_written": 1}` without
+    extra stats) still renders without raising.
+
+    Returns "" when the kind is unknown — caller will print the
+    files_written + target line without an extra detail tail.
+    """
+    if kind == "reminders":
+        return f"{stats.get('pending', 0)} pending · {stats.get('completed', 0)} done"
+    if kind == "events":
+        return f"{stats.get('events', 0)} eventos"
+    if kind == "urls":
+        return (
+            f"{stats.get('urls', 0)} URLs · "
+            f"{stats.get('youtube_videos', 0)} YouTube"
+        )
+    if kind == "gmail":
+        return f"{stats.get('messages', 0)} mensajes"
+    if kind == "drive":
+        return f"{stats.get('docs', 0)} docs"
+    if kind == "github":
+        return f"{stats.get('events', 0)} eventos · {stats.get('open_prs', 0)} open PRs"
+    if kind == "claude":
+        return f"{stats.get('sessions_seen', 0)} sesiones (30d)"
+    if kind == "yt-trans":
+        return (
+            f"{stats.get('fetched_this_run', 0)} fetched · "
+            f"{stats.get('failed_this_run', 0)} failed · "
+            f"{stats.get('videos_known', 0)} known"
+        )
+    if kind == "spotify":
+        top_part = " · top refreshed" if stats.get("refreshed_top") else ""
+        return f"{stats.get('recently_played', 0)} played{top_part}"
+    return ""
+
+
+# ETL kinds whose `{"ok": False, "reason": ...}` should be silently
+# swallowed (no warning to the user) — these are well-known
+# unavailable-source signals (no creds, no Apple, Chrome locked, etc.)
+# rather than bugs. Anything not in this set surfaces the reason as a
+# yellow warning so real failures don't disappear into the silent set.
+_ETL_QUIET_REASONS = frozenset({
+    "apple_disabled", "icalbuddy_missing",
+    "no_visits_or_chrome_locked", "no_data", "no_events",
+    "no_messages", "no_docs", "no_google_credentials",
+    "no_videos", "no_recent_sessions", "no_claude_projects_dir",
+    "gh_unavailable_or_unauth", "gh_no_login", "no_activity",
+    "no_spotify_credentials", "no_spotify_token",
+})
+
+
 def _run_cross_source_etls(vault_path: Path) -> None:
     """Pre-index hook: corre los 11 ETLs cross-source que escriben `.md`
     al vault para que el rglob posterior los absorba (MOZE, WhatsApp,
@@ -23705,34 +23763,7 @@ def _run_cross_source_etls(vault_path: Path) -> None:
             stats = fn(vault_path)
             _ms = int((time.perf_counter() - _t_etl) * 1000)
             if stats.get("ok") and stats.get("files_written"):
-                if kind == "reminders":
-                    detail = f"{stats.get('pending', 0)} pending · {stats.get('completed', 0)} done"
-                elif kind == "events":
-                    detail = f"{stats.get('events', 0)} eventos"
-                elif kind == "urls":
-                    detail = (
-                        f"{stats.get('urls', 0)} URLs · "
-                        f"{stats.get('youtube_videos', 0)} YouTube"
-                    )
-                elif kind == "gmail":
-                    detail = f"{stats.get('messages', 0)} mensajes"
-                elif kind == "drive":
-                    detail = f"{stats.get('docs', 0)} docs"
-                elif kind == "github":
-                    detail = f"{stats.get('events', 0)} eventos · {stats.get('open_prs', 0)} open PRs"
-                elif kind == "claude":
-                    detail = f"{stats.get('sessions_seen', 0)} sesiones (30d)"
-                elif kind == "yt-trans":
-                    detail = (
-                        f"{stats.get('fetched_this_run', 0)} fetched · "
-                        f"{stats.get('failed_this_run', 0)} failed · "
-                        f"{stats.get('videos_known', 0)} known"
-                    )
-                elif kind == "spotify":
-                    top_part = " · top refreshed" if stats.get('refreshed_top') else ""
-                    detail = f"{stats.get('recently_played', 0)} played{top_part}"
-                else:
-                    detail = ""
+                detail = _format_etl_detail(kind, stats)
                 console.print(
                     f"[dim]{label} sync: {stats['files_written']} archivo(s) → "
                     f"{stats['target']}/ ({detail}, {_ms}ms)[/dim]"
@@ -23743,13 +23774,10 @@ def _run_cross_source_etls(vault_path: Path) -> None:
                 console.print(
                     f"[dim]{label} sync: skip ({_ms}ms)[/dim]"
                 )
-            elif not stats.get("ok") and stats.get("reason") not in (
-                None, "apple_disabled", "icalbuddy_missing",
-                "no_visits_or_chrome_locked", "no_data", "no_events",
-                "no_messages", "no_docs", "no_google_credentials",
-                "no_videos", "no_recent_sessions", "no_claude_projects_dir",
-                "gh_unavailable_or_unauth", "gh_no_login", "no_activity",
-                "no_spotify_credentials", "no_spotify_token",
+            elif (
+                not stats.get("ok")
+                and stats.get("reason") is not None
+                and stats.get("reason") not in _ETL_QUIET_REASONS
             ):
                 console.print(f"[yellow]{label} sync: {stats['reason']} ({_ms}ms)[/yellow]")
             else:

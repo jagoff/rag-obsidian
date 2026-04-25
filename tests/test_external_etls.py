@@ -487,3 +487,94 @@ def test_decode_gmail_body_strips_style_and_script_blocks():
     assert "Hola Mundo" in out
     assert "color:red" not in out
     assert "alert" not in out
+
+
+# ── _format_etl_detail (helper centralised in 2026-04-25) ───────────────────
+
+
+def test_format_etl_detail_reminders():
+    out = rag._format_etl_detail("reminders", {"pending": 5, "completed": 2})
+    assert out == "5 pending · 2 done"
+
+
+def test_format_etl_detail_events():
+    out = rag._format_etl_detail("events", {"events": 12})
+    assert out == "12 eventos"
+
+
+def test_format_etl_detail_urls():
+    out = rag._format_etl_detail("urls", {"urls": 30, "youtube_videos": 3})
+    assert out == "30 URLs · 3 YouTube"
+
+
+def test_format_etl_detail_gmail():
+    out = rag._format_etl_detail("gmail", {"messages": 8})
+    assert out == "8 mensajes"
+
+
+def test_format_etl_detail_drive():
+    out = rag._format_etl_detail("drive", {"docs": 4})
+    assert out == "4 docs"
+
+
+def test_format_etl_detail_github():
+    out = rag._format_etl_detail("github", {"events": 7, "open_prs": 2})
+    assert out == "7 eventos · 2 open PRs"
+
+
+def test_format_etl_detail_claude():
+    out = rag._format_etl_detail("claude", {"sessions_seen": 14})
+    assert out == "14 sesiones (30d)"
+
+
+def test_format_etl_detail_yt_trans():
+    out = rag._format_etl_detail("yt-trans", {
+        "fetched_this_run": 3,
+        "failed_this_run": 1,
+        "videos_known": 47,
+    })
+    assert out == "3 fetched · 1 failed · 47 known"
+
+
+def test_format_etl_detail_spotify_with_top():
+    out = rag._format_etl_detail("spotify", {
+        "recently_played": 25,
+        "refreshed_top": True,
+    })
+    assert out == "25 played · top refreshed"
+
+
+def test_format_etl_detail_spotify_without_top():
+    out = rag._format_etl_detail("spotify", {"recently_played": 25})
+    assert out == "25 played"
+
+
+def test_format_etl_detail_unknown_kind_returns_empty():
+    """Unknown kind → "" so the caller's f-string still renders without
+    blowing up. Defensive fallback for new ETLs that don't have a
+    handler yet."""
+    out = rag._format_etl_detail("future-source", {"x": 1})
+    assert out == ""
+
+
+def test_format_etl_detail_missing_fields_default_zero():
+    """Partial stats dict → fields default to 0 instead of KeyError."""
+    out = rag._format_etl_detail("reminders", {})  # no pending/completed
+    assert out == "0 pending · 0 done"
+
+
+def test_etl_quiet_reasons_includes_no_data():
+    """`_ETL_QUIET_REASONS` set must include the well-known unavailable
+    signals so they don't surface as yellow warnings to the user."""
+    assert "no_data" in rag._ETL_QUIET_REASONS
+    assert "apple_disabled" in rag._ETL_QUIET_REASONS
+    assert "icalbuddy_missing" in rag._ETL_QUIET_REASONS
+    assert "no_visits_or_chrome_locked" in rag._ETL_QUIET_REASONS
+    assert "gh_no_login" in rag._ETL_QUIET_REASONS
+
+
+def test_etl_quiet_reasons_does_not_swallow_unknown_errors():
+    """An unknown reason like "permission_denied" or "out_of_disk" must
+    NOT be in the quiet set — caller should still surface it as yellow."""
+    assert "permission_denied" not in rag._ETL_QUIET_REASONS
+    assert "out_of_disk" not in rag._ETL_QUIET_REASONS

@@ -52649,7 +52649,7 @@ def whisper_stats():
     except Exception as exc:
         console.print(f"[red]error reading state: {exc}[/red]")
         return
-    console.print(f"[bold]Whisper learning loop — estado:[/bold]")
+    console.print("[bold]Whisper learning loop — estado:[/bold]")
     console.print(f"  transcripciones logueadas: [cyan]{n_transcripts}[/cyan]")
     if avg_logprob is not None:
         console.print(f"  avg_logprob promedio:      [dim]{avg_logprob:.3f}[/dim] (-0=conf alta, -1=baja)")

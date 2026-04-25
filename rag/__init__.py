@@ -20659,7 +20659,32 @@ def push_due_reminders_to_whatsapp(
 # 2026-04-25). Re-exported at the bottom of this file.
 
 
-def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
+def _validate_scheduled_for(raw: object) -> str | None:
+    """Permissive ISO8601 validator para el campo opcional ``scheduled_for``.
+
+    Devuelve el string si parsea como ISO8601 (con o sin offset),
+    ``None`` en cualquier otro caso (input vacío, tipo distinto a str,
+    formato inválido). Permisivo a propósito: si el LLM emite algo
+    inesperado NO rompemos la proposal — la card sale igual sin
+    schedule (envío inmediato, comportamiento legacy).
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    return s
+
+
+def propose_whatsapp_send(
+    contact_name: str,
+    message_text: str,
+    scheduled_for: str | None = None,
+) -> str:
     """Draft a WhatsApp message for confirmation. DOES NOT send.
 
     Siempre devuelve una proposal card ``needs_clarification=True`` (aun
@@ -20672,14 +20697,21 @@ def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
             Contacts ("Grecia", "Oscar (Tela mosquitera)"). Se resuelve
             a JID vía Apple Contacts.
         message_text: Texto literal del mensaje a mandar.
+        scheduled_for: OPCIONAL — fecha/hora futura para programar el
+            envío, en ISO8601 con offset Argentina ``-03:00`` (ej.
+            ``"2026-04-26T09:00:00-03:00"``). Sólo populalo si el user
+            mencionó explícitamente una fecha/hora ("mañana 9hs", "el
+            viernes 14:30", "en 2 horas"). Si NO mencionó nada, omití
+            este arg — la card sale con [Enviar] inmediato. Formatos
+            inválidos se ignoran silenciosamente (no rompen la card).
 
     Returns:
         JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
-        fields: {contact_name, message_text, jid?, full_name?, error?}}``.
-        Si la resolución del contacto falla (no existe, sin phone, query
-        vacía), la card aparece igual pero con ``fields.error`` seteado
-        para que la UI muestre el problema y el user pueda editar el
-        destinatario.
+        fields: {contact_name, message_text, jid?, full_name?, error?,
+        scheduled_for?}}``. Si la resolución del contacto falla (no
+        existe, sin phone, query vacía), la card aparece igual pero con
+        ``fields.error`` seteado para que la UI muestre el problema y
+        el user pueda editar el destinatario.
     """
     lookup = _whatsapp_jid_from_contact(contact_name)
     fields = {
@@ -20689,6 +20721,9 @@ def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
         "full_name": lookup["full_name"],
         "error": lookup["error"],
     }
+    sched = _validate_scheduled_for(scheduled_for)
+    if sched:
+        fields["scheduled_for"] = sched
     return json.dumps({
         "kind": "whatsapp_message",
         "proposal_id": f"prop-{uuid.uuid4()}",
@@ -20895,6 +20930,7 @@ def propose_whatsapp_send_note(
     contact_name: str,
     note_query: str,
     section: str | None = None,
+    scheduled_for: str | None = None,
 ) -> str:
     """Draft a WhatsApp message containing a vault note's content. DOES NOT send.
 
@@ -20910,11 +20946,17 @@ def propose_whatsapp_send_note(
             ``candidates`` en fields para que el user elija).
         section: Heading opcional para extraer solo esa parte. Match
             case-insensitive sobre el título.
+        scheduled_for: OPCIONAL — fecha/hora futura para programar el
+            envío, en ISO8601 con offset Argentina ``-03:00`` (ej.
+            ``"2026-04-26T09:00:00-03:00"``). Sólo populalo si el user
+            mencionó explícitamente cuándo mandarlo. Omitir = enviar
+            ahora. Formatos inválidos se ignoran silenciosamente.
 
     Returns:
         JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
         fields: {contact_name, message_text, jid, full_name, source_path,
-        section, was_truncated, error?, warning?, candidates?}}``.
+        section, was_truncated, error?, warning?, candidates?,
+        scheduled_for?}}``.
     """
     contact_lookup = _whatsapp_jid_from_contact(contact_name)
 
@@ -21010,6 +21052,9 @@ def propose_whatsapp_send_note(
         fields["warning"] = section_warning
     if candidates:
         fields["candidates"] = candidates
+    sched = _validate_scheduled_for(scheduled_for)
+    if sched:
+        fields["scheduled_for"] = sched
 
     return json.dumps({
         "kind": "whatsapp_message",
@@ -21253,6 +21298,7 @@ def propose_whatsapp_send_contact_card(
     recipient_contact: str,
     target_query: str,
     fields: list[str] | None = None,
+    scheduled_for: str | None = None,
 ) -> str:
     """Draft a WhatsApp message con tel/email/dirección de un tercero. NO envía.
 
@@ -21268,11 +21314,17 @@ def propose_whatsapp_send_contact_card(
             (ej. "plomero", "veterinaria", "Tía Marta").
         fields: Subset opcional ``["phone", "email", "address"]``.
             ``None`` o lista vacía → todos los campos disponibles.
+        scheduled_for: OPCIONAL — fecha/hora futura para programar el
+            envío, en ISO8601 con offset Argentina ``-03:00`` (ej.
+            ``"2026-04-26T09:00:00-03:00"``). Sólo populalo si el user
+            mencionó explícitamente cuándo mandarlo. Omitir = enviar
+            ahora. Formatos inválidos se ignoran silenciosamente.
 
     Returns:
         JSON ``{kind: "whatsapp_message", proposal_id, needs_clarification,
         fields: {contact_name, message_text, jid, full_name, target_query,
-        target_source, target_name, fields_filter, error?, candidates?}}``.
+        target_source, target_name, fields_filter, error?, candidates?,
+        scheduled_for?}}``.
     """
     recipient_lookup = _whatsapp_jid_from_contact(recipient_contact)
     target = _resolve_contact_target(target_query)
@@ -21303,6 +21355,9 @@ def propose_whatsapp_send_contact_card(
     }
     if target.get("candidates"):
         payload_fields["candidates"] = target["candidates"]
+    sched = _validate_scheduled_for(scheduled_for)
+    if sched:
+        payload_fields["scheduled_for"] = sched
 
     return json.dumps({
         "kind": "whatsapp_message",
@@ -21457,6 +21512,7 @@ def propose_whatsapp_reply(
     contact_name: str,
     message_text: str,
     when_hint: str | None = None,
+    scheduled_for: str | None = None,
 ) -> str:
     """Draft a WhatsApp REPLY (quote) for confirmation. DOES NOT send.
 
@@ -21474,13 +21530,20 @@ def propose_whatsapp_reply(
             Default ``None`` → más reciente inbound del contacto.
             Soporta "el último", "ayer", "hoy", "esta mañana",
             "[hh:mm]", "del almuerzo/cena/desayuno", "hace 2 horas",
-            etc. Ver ``_parse_when_hint`` para cobertura.
+            etc. Ver ``_parse_when_hint`` para cobertura. NO confundir
+            con ``scheduled_for`` — éste apunta al pasado (qué mensaje
+            citar), aquél al futuro (cuándo enviar la respuesta).
+        scheduled_for: OPCIONAL — fecha/hora futura para programar el
+            envío del reply, en ISO8601 con offset Argentina ``-03:00``
+            (ej. ``"2026-04-26T09:00:00-03:00"``). Sólo populalo si el
+            user mencionó explícitamente cuándo mandarlo. Omitir =
+            enviar ahora. Formatos inválidos se ignoran silenciosamente.
 
     Returns:
         JSON ``{kind: "whatsapp_reply", proposal_id, needs_clarification,
         fields: {contact_name, message_text, jid?, full_name?, error?,
         reply_to?: {message_id, original_text, original_ts, sender_jid},
-        reply_to_hint?, reply_to_warning?}}``.
+        reply_to_hint?, reply_to_warning?, scheduled_for?}}``.
 
         Si el contacto no se resuelve, ``fields.error`` llega seteado
         (``not_found``/``no_phone``/``empty_query``) — la UI desactiva
@@ -21542,6 +21605,9 @@ def propose_whatsapp_reply(
                 "sender_jid": target.get("from_jid") or "",
                 "when_kind": target.get("when_kind") or "",
             }
+    sched = _validate_scheduled_for(scheduled_for)
+    if sched:
+        fields["scheduled_for"] = sched
     return json.dumps({
         "kind": "whatsapp_reply",
         "proposal_id": f"prop-{uuid.uuid4()}",
@@ -21696,1069 +21762,15 @@ def _ambient_hook(
     })
 
 
-# ── OCR on embedded images (Apple Vision via ocrmac) ─────────────────────────
-# Indexer hook: el body de una nota se enriquece con el texto OCR de sus
-# imágenes embebidas ANTES del chunking. Sin esto, notas tipo link-hub
-# (filename descriptivo + body = un link + un `![[screenshot.png]]`) eran
-# invisibles al retrieval — el reranker solo ve el body textual y no tiene
-# forma de leer la captura. Con OCR, el texto de la imagen (ej. tabla de
-# dev cycles en una screenshot) se concatena al body y aterriza en un
-# chunk indexable.
-#
-# Cache: SQL `rag_ocr_cache`, key = image abs path, invalidado por mtime.
-# Sin TTL — el texto no envejece, solo cambia cuando la imagen cambia.
-# El hash del chunk `_index_single_file` se computa sobre raw + mtimes de
-# imágenes (`_file_hash_with_images`) así que una imagen actualizada
-# fuerza reindex aunque el markdown no cambie.
-#
-# Soft deps: `ocrmac` + pyobjc son macOS-only. Import fallido → silent
-# skip. Env `RAG_OCR=0` desactiva explícitamente.
-
-# Lazy-load. `ocrmac` arrastra pyobjc → Vision + Quartz + CoreML + AppKit,
-# ~130ms de import time en macOS. El CLI arranca para muchos subcomandos
-# que no hacen OCR (query, chat, session list, vault list, etc.), así que
-# importar al cargar el módulo era pagar esos 130ms cada vez (37% del
-# cold-start de `rag --help`). Con este pattern la import se dispara
-# solo cuando `_ocr_image()` corre por primera vez.
-#
-# `_ocrmac_module` sigue existiendo como attribute del módulo — los tests
-# lo patchean via `monkeypatch.setattr(rag, "_ocrmac_module", fake)` y
-# ese contrato se preserva: si el attribute ya es no-None al llamar
-# `_load_ocrmac_module()` (o sea, alguien lo seteó), lo devolvemos tal
-# cual sin re-importar.
-#
-# `_ocrmac_import_attempted` guardia contra re-intentos de import fallidos
-# — si pyobjc rompe una vez, rompe siempre hasta reboot, no sentido en
-# pagar el ImportError cada llamada.
-_ocrmac_module = None  # type: ignore[assignment]
-_ocrmac_import_attempted = False
-
-
-def _load_ocrmac_module():
-    """Devuelve el módulo `ocrmac.ocrmac` o None si el import falla.
-
-    Lazy + cached: la primera llamada paga el import (~130ms macOS), las
-    subsiguientes retornan el singleton. Idempotente ante fallo — una
-    vez que `_ocrmac_import_attempted` queda en True, ni re-intenta ni
-    re-loggea. Preserva el contract de tests que hacen monkeypatch de
-    `rag._ocrmac_module`: si ya está seteado (por test o por carga
-    previa), no lo sobrescribe.
-    """
-    global _ocrmac_module, _ocrmac_import_attempted
-    if _ocrmac_module is not None:
-        return _ocrmac_module
-    if _ocrmac_import_attempted:
-        return None
-    _ocrmac_import_attempted = True
-    try:
-        from ocrmac import ocrmac as _mod
-        _ocrmac_module = _mod
-    except Exception:  # noqa: BLE001 — pyobjc init puede fallar, no solo ImportError
-        _ocrmac_module = None  # type: ignore[assignment]
-    return _ocrmac_module
-
-
-# Extensiones de imagen soportadas (Apple Vision handlea todas via Core Image).
-_IMAGE_EXTENSIONS = frozenset({
-    ".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif", ".bmp", ".tiff", ".tif",
-})
-
-# Min confidence para considerar un texto OCR. ocrmac devuelve [0,1] por
-# annotation. Umbral bajo (0.3) porque para tablas / screenshots la
-# confianza real suele ser 0.5+ pero algunas palabras de una o dos letras
-# bajan; preferimos falsos-positivos leves (ruido) a pérdida de señal
-# (tabla de números ej. "10.54" es crítica y puede scorear 0.5-0.7).
-_OCR_MIN_CONFIDENCE = 0.3
-
-# Regex para extraer embeds de imagen. Dos formatos:
-#   - Wikilink Obsidian:  ![[folder/image.png]]  o  ![[image.png|alias]]
-#   - Markdown estándar:  ![alt text](path/to/image.png)
-_EMBED_WIKILINK_RE = re.compile(r"!\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]")
-_EMBED_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)")
-
-
-def _extract_embedded_images(body: str, note_path: Path, vault_root: Path) -> list[Path]:
-    """Parse `body` para encontrar imágenes embebidas y devolver paths
-    absolutos (solo las que existen en disco). Formatos soportados:
-    wikilink Obsidian (`![[img.png]]`) y markdown estándar (`![alt](p.png)`).
-
-    Resolución de paths (en orden):
-      1. URL externa (http/https/data:) → skip.
-      2. Path absoluto → se usa tal cual si existe.
-      3. Path relativo a `note_path.parent` → se prueba ahí primero.
-      4. Solo nombre de archivo (ej. `![[captura.png]]`) → scan del vault
-         entero por filename match (Obsidian default behavior cuando no
-         hay path).
-
-    Ignora:
-      - Extensiones no-imagen (`.md`, `.pdf`, `.canvas`, ...) — la función
-        es específica para OCR, no para todos los embeds.
-      - Imágenes referenciadas pero no encontradas en disco (broken
-        links) — silent skip.
-      - URLs externas (no fetcheamos; la política es 100% local).
-    """
-    if not body:
-        return []
-    out: list[Path] = []
-    seen: set[Path] = set()
-
-    def _resolve_and_add(candidate: str) -> None:
-        # Skip externals.
-        low = candidate.strip().lower()
-        if not low or low.startswith(("http://", "https://", "data:", "ftp://")):
-            return
-        # Skip non-image extensions (embeds de notas/pdfs/canvas no aplican).
-        ext = Path(candidate).suffix.lower()
-        if ext not in _IMAGE_EXTENSIONS:
-            return
-        # Absolute path.
-        p = Path(candidate)
-        if p.is_absolute():
-            if p.is_file() and p.resolve() not in seen:
-                seen.add(p.resolve())
-                out.append(p)
-            return
-        # Relative to note parent.
-        rel = (note_path.parent / candidate).resolve()
-        if rel.is_file() and rel not in seen:
-            seen.add(rel)
-            out.append(rel)
-            return
-        # Filename-only wikilink: scan vault.
-        if "/" not in candidate and "\\" not in candidate:
-            try:
-                matches = list(vault_root.rglob(candidate))
-            except OSError:
-                matches = []
-            for m in matches:
-                if m.is_file() and m.resolve() not in seen:
-                    seen.add(m.resolve())
-                    out.append(m)
-                    return
-
-    for m in _EMBED_WIKILINK_RE.finditer(body):
-        _resolve_and_add(m.group(1))
-    for m in _EMBED_MARKDOWN_RE.finditer(body):
-        _resolve_and_add(m.group(1))
-    return out
-
-
-def _ocr_image(image_path: Path) -> str:
-    """OCR `image_path` usando Apple Vision (ocrmac). Resultado cacheado
-    en `rag_ocr_cache` SQL table, key = abs path, invalidación por mtime.
-
-    Returns `""` (no crash) en cualquiera de estos casos:
-      - env `RAG_OCR=0` — usuario desactivó OCR explícitamente.
-      - `_ocrmac_module is None` — import falló (non-macOS / pyobjc roto).
-      - imagen no existe o stat falla.
-      - ocrmac lanza — imagen corrupta, formato raro, memory issue.
-
-    Filtra annotations por confianza ≥ `_OCR_MIN_CONFIDENCE` (0.3). El
-    texto resultante es la concatenación space-separated de todas las
-    annotations que pasaron el umbral — suficiente para que el chunker
-    downstream (que tokeniza por whitespace) encuentre matches.
-    """
-    if os.environ.get("RAG_OCR", "").strip() == "0":
-        return ""
-    ocrmac_mod = _load_ocrmac_module()
-    if ocrmac_mod is None:
-        return ""
-    try:
-        mtime = image_path.stat().st_mtime
-    except OSError:
-        return ""
-    abs_key = str(image_path.resolve())
-
-    # Cache read.
-    try:
-        with _ragvec_state_conn() as conn:
-            row = conn.execute(
-                "SELECT mtime, text FROM rag_ocr_cache WHERE image_path = ?",
-                (abs_key,),
-            ).fetchone()
-            if row is not None and abs(row[0] - mtime) < 1e-6:
-                return row[1] or ""
-    except Exception as exc:
-        _silent_log("ocr_cache_read", exc)
-        # Continuamos al OCR real si la cache falla — no bloqueamos el
-        # indexer por problemas de estado.
-
-    # OCR real.
-    try:
-        annotations = ocrmac_mod.OCR(
-            abs_key, language_preference=["es-ES", "en-US"],
-        ).recognize()
-    except Exception as exc:
-        _silent_log(f"ocr_recognize:{abs_key}", exc)
-        return ""
-
-    # annotations = [(text, confidence, bbox), ...]. Filtramos por umbral
-    # y concatenamos. Separador ` ` (no `\n`) porque el chunker split
-    # por whitespace lo mismo, y keep el tamaño compacto.
-    texts = [
-        t for (t, c, _bbox) in annotations
-        if isinstance(t, str) and t and c >= _OCR_MIN_CONFIDENCE
-    ]
-    out = " ".join(texts).strip()
-
-    # Cache write (best-effort; no rompe el indexer si falla).
-    try:
-        with _ragvec_state_conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO rag_ocr_cache "
-                "(image_path, mtime, text, ocr_at) VALUES (?, ?, ?, ?)",
-                (abs_key, float(mtime), out, time.time()),
-            )
-    except Exception as exc:
-        _silent_log(f"ocr_cache_write:{abs_key}", exc)
-
-    return out
-
-
-# ── VLM caption fallback ────────────────────────────────────────────────────
-#
-# Hay imágenes en el vault que NO tienen texto (o tienen muy poquito) pero sí
-# información visual relevante — fotos familiares, diagramas de arquitectura,
-# whiteboards dibujados, gráficos de torta, screenshots puramente gráficos,
-# paisajes, flyers de eventos en imagen. Con OCR solo, esas imágenes son
-# invisibles al retrieval aunque la nota contenedora las describa parcialmente
-# en texto.
-#
-# La solución: cuando OCR devuelve vacío (o menos de `_VLM_FALLBACK_MIN_OCR`
-# chars), corremos un modelo vision-language local (qwen2.5vl:3b vía ollama)
-# con un prompt que pide descripción grep-friendly + transcripción de texto
-# visible. El caption resultante se concatena al body igual que el OCR, pero
-# con un marker distinto (`<!-- VLM-caption: -->`) para que sea grepable.
-#
-# Cache: tabla `rag_vlm_captions` keyed por `(abs_path, mtime)` — misma
-# invariante que `rag_ocr_cache`. El hash del chunk (`_file_hash_with_images`)
-# suma mtimes de imágenes, así que una imagen nueva fuerza re-chunking aunque
-# el .md no haya cambiado — y por mtime invalidation, también fuerza
-# re-caption.
-#
-# Silent-fail total:
-#   - `RAG_VLM_CAPTION=0` → feature off, wrapper devuelve lo que dé OCR.
-#   - ollama no responde / timeout → return "" (el OCR text gana si había).
-#   - Modelo no existe (usuario no corrió `ollama pull qwen2.5vl:3b`) →
-#     hint en stderr UNA vez por proceso + return "".
-#   - Budget per-run excedido → return "" sin llamar a ollama (safety net
-#     contra loops infinitos o primer indexing de vaults gigantes).
-#
-# Costo real a considerar: qwen2.5vl:3b ocupa ~4 GB en RAM, ~2-4s por imagen
-# en MPS. Primera corrida de `rag index --reset` sobre un vault con 500
-# imágenes sin OCR = ~25 min. Por eso `RAG_VLM_CAPTION_MAX_PER_RUN=500`
-# default — el cap previene que un bug o un corpus inesperadamente grande
-# se coma el día. Override con la var env.
-
-VLM_MODEL = os.environ.get("RAG_VLM_MODEL", "").strip() or "qwen2.5vl:3b"
-
-# Chars mínimos de OCR para NO hacer fallback al VLM. 20 = threshold sano
-# empíricamente: menos que esto suele ser ruido de OCR ("OK", "x", "•"), más
-# es probable que sea texto real valioso que no necesita caption encima.
-_VLM_FALLBACK_MIN_OCR = 20
-
-# Longitud máxima del caption post-procesado. 500 chars = 1-2 oraciones
-# descriptivas sin inflar el chunk. El prompt pide <80 palabras pero algunos
-# modelos ignoran el cap — truncamos por las dudas.
-_VLM_CAPTION_MAX_CHARS = 500
-
-# Budget per-process. Protege contra runaway loops y contra primer indexing
-# de vault gigante. El counter es module-global (single-process assumption
-# del indexer). Override con `RAG_VLM_CAPTION_MAX_PER_RUN`.
-_VLM_CAPTION_MAX_PER_RUN = int(os.environ.get("RAG_VLM_CAPTION_MAX_PER_RUN", "500"))
-_vlm_caption_calls_used: int = 0
-
-# Warned-once set por nombre de modelo. Evita spam en stderr cuando el
-# usuario no tiene el VLM pulled y cada imagen falla con "model not found".
-_vlm_model_missing_warned: set[str] = set()
-
-# Cliente ollama dedicado para VLM. Timeout más alto (60s) que helper text
-# porque qwen2.5vl en MPS tarda 2-4s warm / hasta 10s en cold-load.
-_VLM_CLIENT: "ollama.Client | None" = None
-
-
-def _vlm_caption_enabled() -> bool:
-    """True salvo `RAG_VLM_CAPTION=0/false/no` explícito. Default ON."""
-    val = os.environ.get("RAG_VLM_CAPTION", "").strip().lower()
-    return val not in ("0", "false", "no")
-
-
-def _vlm_client() -> "ollama.Client":
-    """Lazy-init singleton. 60s timeout cubre cold-load del modelo (~10s en
-    MPS primera vez) + inference típica (~2-4s)."""
-    global _VLM_CLIENT
-    if _VLM_CLIENT is None:
-        _VLM_CLIENT = ollama.Client(timeout=60.0)
-    return _VLM_CLIENT
-
-
-def _vlm_caption_budget_reset() -> None:
-    """Reinicia el contador de llamadas. Llamado por el CLI al arrancar
-    comandos de indexing (`rag index`, `rag watch`, `rag scan-citas`) para
-    que cada run tenga su propio budget limpio. Tests también resetean
-    entre casos para aislar."""
-    global _vlm_caption_calls_used
-    _vlm_caption_calls_used = 0
-
-
-def _vlm_caption_budget_available() -> bool:
-    return _vlm_caption_calls_used < _VLM_CAPTION_MAX_PER_RUN
-
-
-def _vlm_caption_budget_consume() -> None:
-    global _vlm_caption_calls_used
-    _vlm_caption_calls_used += 1
-
-
-# Prompt del VLM. Español rioplatense-neutral, optimizado para retrieval:
-# pide (a) transcripción de texto visible si lo hay, (b) descripción de
-# escena grep-friendly, (c) nombres propios y fechas si aparecen. El
-# formato es prosa libre sin markdown porque el chunker normaliza eso.
-_VLM_CAPTION_PROMPT = (
-    "Describí qué hay en esta imagen en 1-2 oraciones (≤80 palabras). "
-    "Si hay texto visible en la imagen (letreros, títulos, nombres, "
-    "fechas, números), transcribilo literal al principio. Si es una "
-    "foto, mencioná objetos/personas/escena; si es un diagrama, qué "
-    "representa; si es una captura de UI, qué app/pantalla. "
-    "Sé específico — evitá 'una imagen' o 'una foto'. "
-    "Sin markdown, sin comillas, sin preámbulos. "
-    "Respondé en español."
-)
-
-
-def _caption_image(image_path: Path) -> str:
-    """VLM caption de `image_path` — fallback cuando el OCR devolvió poco.
-
-    Returns caption string (máx `_VLM_CAPTION_MAX_CHARS` chars) o "" en
-    cualquiera de estos casos (silent-fail):
-      - `RAG_VLM_CAPTION=0` — feature off.
-      - stat falla (imagen no existe o sin permisos).
-      - budget per-run excedido.
-      - ollama timeout / unreachable.
-      - modelo no pulled — imprime hint en stderr UNA vez por proceso.
-      - response vacío o mal-formed.
-
-    Cache: `rag_vlm_captions` con key `(abs_path, mtime)`. Re-correr sobre
-    la misma imagen es O(1) SQL lookup — NO vuelve a llamar al modelo.
-    """
-    if not _vlm_caption_enabled():
-        return ""
-    try:
-        mtime = image_path.stat().st_mtime
-    except OSError:
-        return ""
-    abs_key = str(image_path.resolve())
-
-    # Cache read.
-    try:
-        with _ragvec_state_conn() as conn:
-            row = conn.execute(
-                "SELECT mtime, caption FROM rag_vlm_captions WHERE image_path = ?",
-                (abs_key,),
-            ).fetchone()
-            if row is not None and abs(row[0] - mtime) < 1e-6:
-                return row[1] or ""
-    except Exception as exc:
-        _silent_log("vlm_caption_cache_read", exc)
-        # Seguimos — cache roto no bloquea VLM call.
-
-    # Budget gate — DESPUÉS del cache read (cache hits no cuentan contra
-    # el budget, solo las invocaciones reales al modelo).
-    if not _vlm_caption_budget_available():
-        return ""
-
-    # VLM call.
-    try:
-        resp = _vlm_client().chat(
-            model=VLM_MODEL,
-            messages=[{
-                "role": "user",
-                "content": _VLM_CAPTION_PROMPT,
-                "images": [abs_key],
-            }],
-            options={
-                "temperature": 0,
-                "seed": 42,
-                "num_predict": 120,
-                # num_ctx dejamos que el servidor elija — imagen + prompt
-                # +  caption caben cómodo en el default de qwen2.5vl.
-            },
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-    except Exception as exc:
-        # Detectamos "model not found" → hint one-shot. Otros errores
-        # (timeout, network) silent-fail normal.
-        msg = str(exc).lower()
-        if ("not found" in msg or "pull" in msg) and VLM_MODEL not in _vlm_model_missing_warned:
-            _vlm_model_missing_warned.add(VLM_MODEL)
-            try:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"\n[obsidian-rag] VLM caption skipped: modelo '{VLM_MODEL}' "
-                    f"no está disponible en ollama. Corré:\n"
-                    f"    ollama pull {VLM_MODEL}\n"
-                    f"Para desactivar el caption fallback: "
-                    f"export RAG_VLM_CAPTION=0\n\n"
-                )
-            except Exception:
-                pass
-        _silent_log(f"vlm_caption:{abs_key}", exc)
-        return ""
-
-    # Budget se consume SOLO cuando efectivamente llamamos al modelo (éxito
-    # o respuesta vacía — no cuando falló el pull). Evita que un modelo
-    # no-pulled queme budget en el primer intento y deje el resto sin
-    # siquiera intentar.
-    _vlm_caption_budget_consume()
-
-    # Normalización del output.
-    try:
-        raw = resp.message.content or ""
-    except Exception:
-        raw = ""
-    caption = raw.strip()
-    # Strip markdown residual + comillas extra si el modelo ignoró el prompt.
-    caption = caption.strip("`\"' \n\r\t").replace("\n\n", " ").replace("\n", " ")
-    caption = caption[:_VLM_CAPTION_MAX_CHARS]
-
-    # Cache write (también cacheamos captions vacíos — así no re-intentamos
-    # en cada index run una imagen que el VLM no supo captionar).
-    try:
-        with _ragvec_state_conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO rag_vlm_captions "
-                "(image_path, mtime, caption, model, captioned_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (abs_key, float(mtime), caption, VLM_MODEL, time.time()),
-            )
-    except Exception as exc:
-        _silent_log(f"vlm_caption_cache_write:{abs_key}", exc)
-
-    return caption
-
-
-def _image_text_or_caption(image_path: Path) -> tuple[str, str]:
-    """Wrapper unificado: devuelve `(text, source)` donde source es uno de:
-      - `"ocr"`: el texto viene de Apple Vision (había texto reconocible).
-      - `"vlm"`: OCR fue vacío/poco → fallback al VLM para captionear.
-      - `""`: ni OCR ni VLM aportaron nada (imagen sin señal).
-
-    Orden: OCR primero (barato, determinístico, local). Si el OCR devuelve
-    menos de `_VLM_FALLBACK_MIN_OCR` chars, se intenta VLM. Si VLM
-    también vacío, devolvemos lo que dé OCR (que puede ser "" o un
-    fragmento corto) preferentemente como `"ocr"` — el OCR corto todavía
-    tiene más chance de ser verdadero texto de la imagen que un caption
-    inventado.
-
-    Es el punto de entrada que deben usar los callers (`_enrich_body_with_ocr`,
-    `rag scan-citas`, `rag capture --image`, WA ingester). NUNCA raise.
-    """
-    try:
-        ocr_text = _ocr_image(image_path)
-    except Exception as exc:
-        _silent_log(f"image_text_ocr:{image_path}", exc)
-        ocr_text = ""
-
-    if ocr_text and len(ocr_text.strip()) >= _VLM_FALLBACK_MIN_OCR:
-        return ocr_text, "ocr"
-
-    # Fallback VLM — solo si está habilitado.
-    try:
-        caption = _caption_image(image_path)
-    except Exception as exc:
-        _silent_log(f"image_text_vlm:{image_path}", exc)
-        caption = ""
-
-    if caption:
-        return caption, "vlm"
-    if ocr_text:
-        # OCR corto pero no vacío — preferible a nada.
-        return ocr_text, "ocr"
-    return "", ""
-
-
-def _enrich_body_with_ocr(
-    body: str, note_path: Path, vault_root: Path,
-    images_source: str | None = None,
-) -> str:
-    """Retorna `body` extendido con el texto OCR de sus imágenes embebidas.
-
-    Para cada imagen encontrada por `_extract_embedded_images`, corre
-    `_ocr_image` y concatena el texto extraído al final del body con un
-    marker HTML-comment que identifica la imagen (user-grep-friendly,
-    no visible en render de Markdown).
-
-    `images_source`: opcional, el texto desde el cual extraer embeds. Default
-    = `body`. Usado por el indexer para extraer del `raw` (pre-`clean_md`)
-    pero apendear al `text` (post-`clean_md`) — `clean_md` convierte los
-    `![[img.png]]` a `!img.png` (matchea la misma regex de wikilinks) y
-    eso pierde el embed. Pasando el `raw` como `images_source`, el parser
-    sigue viendo los `![[...]]` intactos.
-
-    Imágenes cuyo OCR devuelve "" (cache miss + OCR empty, ocrmac
-    desactivado, imagen vacía) se skippean sin agregar marker — evita
-    contaminar el body con placeholders vacíos.
-
-    Retorna `body` intacto si no hay imágenes embebidas.
-    """
-    src = images_source if images_source is not None else body
-    images = _extract_embedded_images(src, note_path, vault_root)
-    if not images:
-        return body
-    parts: list[str] = [body]
-    for img in images:
-        # Wrapper unificado: OCR primero, fallback a VLM si OCR vacío/corto.
-        # El `source` ∈ {"ocr", "vlm", ""} gobierna el marker que elegimos
-        # abajo — importante para grep/debug y para distinguir texto
-        # literal (OCR) de descripción inferida (VLM).
-        text, source = _image_text_or_caption(img)
-        if not text:
-            continue
-        # Marker: path relativo al vault si posible (más legible), fallback
-        # al filename. HTML-comment style porque markdown lo oculta en
-        # renders de Obsidian — el user no lo ve a menos que mire el source.
-        try:
-            rel_marker = str(img.resolve().relative_to(vault_root.resolve()))
-        except ValueError:
-            rel_marker = img.name
-        marker = "VLM-caption" if source == "vlm" else "OCR"
-        parts.append(f"\n\n<!-- {marker}: {rel_marker} -->\n{text}")
-        # Cita-from-image detector hook. Corre DESPUÉS del append para
-        # que el body enrichment siempre gane — si el detector crashea o
-        # el helper está caído, el OCR/caption sigue llegando al chunker
-        # tal cual. Silent-fail triple: la función ya es silent, pero
-        # envolvemos en try/except por las dudas. El detector es
-        # source-agnóstico: un caption VLM que dice "flyer cumple Flor 26
-        # de mayo" clasifica igual de bien que el OCR literal del mismo
-        # flyer.
-        try:
-            _maybe_create_cita_from_ocr(text, img, source="index")
-        except Exception as exc:
-            _silent_log(f"cita_detect_enrich:{img}", exc)
-    return "".join(parts)
-
-
-def _file_hash_with_images(raw: str, note_path: Path, vault_root: Path) -> str:
-    """Hash del archivo + firmas mtime de sus imágenes embebidas.
-
-    Sin esto, el indexer skippea reindex cuando el .md no cambió pero
-    una imagen embebida sí (caso típico: tomé una screenshot nueva, la
-    guardé con el mismo nombre, pero la nota contenedora no cambió). El
-    OCR cache está invalidado por mtime pero el indexer nunca llegaría
-    a re-chunkear. Combinando los mtimes de las imágenes al hash base,
-    un cambio en cualquier imagen fuerza reindex de la nota.
-    """
-    base = file_hash(raw)
-    images = _extract_embedded_images(raw, note_path, vault_root)
-    if not images:
-        return base
-    sig_parts: list[str] = [base]
-    for p in sorted(images, key=lambda x: str(x)):
-        try:
-            sig_parts.append(f"{p}:{p.stat().st_mtime}")
-        except OSError:
-            sig_parts.append(f"{p}:missing")
-    return file_hash("\n".join(sig_parts))
-
-
-# ── OCR → intent detector (event / reminder / note) ────────────────────────
-#
-# El OCR extrae texto de imágenes embebidas (Apple Vision, ver `_ocr_image`).
-# Esa misma rama se extiende acá: el helper qwen2.5:3b clasifica el texto
-# en tres kinds y extrae datos estructurados:
-#
-#   - `event`: cita, turno, reunión, cumple, vuelo — cosa con fecha y/o
-#     hora específica que va al calendario. Dispara `propose_calendar_event`.
-#   - `reminder`: tarea, to-do, factura a pagar, lista de compras, llamar
-#     a X — acción a hacer, con o sin deadline. Dispara `propose_reminder`
-#     con el path de la imagen en el campo `notes` (Apple Reminders no
-#     soporta attachments vía AppleScript; el path en `notes` es lo más
-#     cercano — queda como texto grep-friendly en la app).
-#   - `note`: info sin acción — receta médica sin fecha, foto de código,
-#     meme, captura de UI, texto de referencia. No-op: la nota OCR ya se
-#     guardó en el vault (si el trigger fue `rag capture --image` o el
-#     indexer), nada más para hacer.
-#
-# Triple salvaguarda contra dupes (preservada del diseño original):
-#   1. Sidecar `rag_cita_detections` keyed por `sha256(normalized_ocr)[:16]` —
-#      impide dos llamadas al helper para el mismo texto, aunque llegue por
-#      rutas distintas (indexer, `rag capture --image`, `rag scan-citas`,
-#      WhatsApp hook).
-#   2. `_find_duplicate_calendar_event` adentro de `propose_calendar_event`
-#      (segunda capa a nivel calendar real).
-#   3. Confidence floor `_CITA_MIN_CONFIDENCE` descarta casos borderline.
-#
-# Silent-fail en todos los niveles: fallo de OCR, helper timeout, JSON
-# malformado, sqlite lock, osascript error — ninguno propaga. El indexer y
-# los ingesters siguen funcionando sin citas nuevas.
-#
-# Rollback: `export RAG_CITA_DETECT=0`. Con eso `_detect_cita_from_ocr`
-# devuelve None de una (sin helper call) y `_maybe_create_cita_from_ocr`
-# se vuelve no-op. OCR body enrichment sigue igual — es feature ortogonal.
-
-# Umbral de confianza auto-create. qwen2.5:3b con temp=0 + seed=42 devuelve
-# scores consistentes; 0.70 filtra ambigüedades pero pasa casos reales
-# ("turno dentista miércoles 15hs consultorio Palermo" → 0.9+). Override
-# por `rag scan-citas --min-confidence 0.5` para barridos agresivos.
-_CITA_MIN_CONFIDENCE = 0.70
-
-# OCR más corto que esto no tiene suficiente señal (ej. screenshot de un
-# botón con "OK"). Skipeamos sin gastar helper call.
-_CITA_MIN_CHARS = 20
-
-# Kinds válidos del detector. `note` = no-op (solo se loggea). El resto
-# dispara acción.
-_CITA_VALID_KINDS = frozenset({"event", "reminder", "note"})
-
-
-def _cita_detect_enabled() -> bool:
-    """True salvo `RAG_CITA_DETECT=0/false/no` explícito. Default ON."""
-    val = os.environ.get("RAG_CITA_DETECT", "").strip().lower()
-    return val not in ("0", "false", "no")
-
-
-def _normalize_ocr_for_hash(ocr_text: str) -> str:
-    """Lowercase + whitespace-collapsed para que dos OCR passes sobre la
-    misma imagen colisionen en el hash aunque ocrmac produzca orden de
-    palabras distinto entre runs (raro, pero posible con tablas).
-    """
-    return " ".join((ocr_text or "").lower().split())
-
-
-def _ocr_hash_key(ocr_text: str) -> str:
-    """SHA256 (primeros 16 hex chars) del texto normalizado. PRIMARY KEY de
-    `rag_cita_detections`. 16 chars = 64 bits, colisión accidental ~irreal
-    para la cardinalidad esperada (≤ miles de imágenes por user).
-    """
-    norm = _normalize_ocr_for_hash(ocr_text)
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
-
-
-_CITA_PROMPT_SYSTEM = (
-    "Sos un clasificador de tareas agendables a partir de texto OCR "
-    "crudo. El texto viene de una imagen — puede tener errores de "
-    "reconocimiento (acentos perdidos, palabras cortadas, líneas "
-    "mezcladas, chrome de app). Tu trabajo es decidir si el texto "
-    "describe un EVENTO de calendario, un RECORDATORIO/tarea, o "
-    "simplemente INFORMACIÓN sin acción agendable. Y extraer los datos."
-)
-
-_CITA_PROMPT_USER_TEMPLATE = (
-    "Texto OCR de la imagen (puede estar ruidoso):\n"
-    "<OCR>\n{ocr}\n</OCR>\n\n"
-    "Devolvé JSON estricto, sin preámbulos, con estas llaves:\n"
-    "  kind (str): 'event' | 'reminder' | 'note'\n"
-    "    - 'event': cita, turno, reunión, cumple, vuelo, clase, "
-    "entrevista — cosas con fecha Y/O hora específica que van al "
-    "calendario (ej. 'Turno dentista martes 15hs', 'Cumple Flor 26 "
-    "de mayo', 'Vuelo AR1234 15/06 08:20').\n"
-    "    - 'reminder': tarea, to-do, factura a pagar, lista de compras, "
-    "llamar/contactar a alguien, devolver algo, renovar documento — "
-    "algo a HACER, con o sin deadline (ej. 'Pagar luz antes del 15', "
-    "'Comprar huevos tomates pan', 'Llamar al plomero').\n"
-    "    - 'note': información pura sin acción — receta médica sin "
-    "fecha, foto de código, meme, captura de UI, texto de referencia, "
-    "imagen decorativa (ej. 'Ibuprofeno 400mg cada 8hs', 'Error 500 "
-    "stack trace', una foto familiar cualquiera).\n"
-    "  title (str): título corto y descriptivo (<80 chars). Para event "
-    "nombrá persona/servicio si aparece. Para reminder usá verbo + "
-    "objeto ('Pagar luz', 'Comprar huevos'). Para note describí qué es.\n"
-    "  when (str): fecha/hora/día en NL tal como aparece en el texto. "
-    "'' si no hay. Usá lo que el dateparser entiende: 'martes 15hs', "
-    "'15/05 10:00', 'mañana 14hs', 'el viernes', '26 de mayo', 'antes "
-    "del 15'. NO inventes horario si no está en el texto.\n"
-    "  location (str): dirección, consultorio, link de Zoom, negocio — "
-    "relevante para event y a veces para reminder. '' si no aplica.\n"
-    "  confidence (float 0.0–1.0): qué tan seguro estás. Alto (≥0.8) si "
-    "los marcadores del kind son claros. Medio (0.5–0.8) si hay "
-    "ambigüedad. Bajo (<0.5) si casi no hay pistas.\n\n"
-    "Si NO está claro qué es, usá kind='note' con confidence baja.\n"
-    "Si el texto tiene varios items, agarrá el más importante / "
-    "próximo en el tiempo."
-)
-
-
-def _detect_cita_from_ocr(ocr_text: str) -> dict | None:
-    """Helper call qwen2.5:3b con format=json: clasifica el texto OCR como
-    event, reminder o note, y extrae {title, when, location}.
-
-    Returns:
-      - dict con shape `{kind, title, when, location, confidence}` —
-        normalizado y validado. NUNCA raise.
-      - None si: `RAG_CITA_DETECT=0`, ocr_text vacío o muy corto, helper
-        timeout / unreachable, JSON malformado, shape inválida.
-
-    Callers deben chequear `None` + `kind in {event, reminder}` +
-    `confidence >= threshold` antes de crear algo — el helper a veces
-    devuelve `kind='event'` con `confidence=0.3`, lo cual es una
-    clasificación dudosa que no queremos auto-agendar.
-
-    Backward-compat con el schema viejo `{is_cita, start}`: si el modelo
-    (o un test monkeypatched) devuelve las keys viejas, las mapeamos:
-    `is_cita=True` → `kind='event'`, `is_cita=False` → `kind='note'`,
-    `start` → `when`. Eso hace que el upgrade sea transparente para
-    callers externos.
-    """
-    if not _cita_detect_enabled():
-        return None
-    text = (ocr_text or "").strip()
-    if len(text) < _CITA_MIN_CHARS:
-        return None
-    # Cap para controlar el prompt size — 1500 chars cubre el 99% de
-    # screenshots reales. Cortar el final es OK: el título / fecha suele
-    # estar al principio del OCR (Apple Vision scanea top→bottom).
-    capped = text[:1500]
-    prompt = _CITA_PROMPT_USER_TEMPLATE.format(ocr=capped)
-    try:
-        resp = _helper_client().chat(
-            model=HELPER_MODEL,
-            messages=[
-                {"role": "system", "content": _CITA_PROMPT_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
-            options={**HELPER_OPTIONS, "num_predict": 180, "num_ctx": 2048},
-            keep_alive=OLLAMA_KEEP_ALIVE,
-            format="json",
-        )
-        raw = resp.message.content.strip()
-        data = json.loads(raw)
-    except Exception as exc:
-        _silent_log("cita_detect_helper", exc)
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Normalización defensiva — el helper a veces devuelve tipos raros.
-    try:
-        # Backward-compat: schema viejo usaba `is_cita` + `start`.
-        kind_raw = data.get("kind")
-        if kind_raw is None and "is_cita" in data:
-            kind_raw = "event" if data.get("is_cita") else "note"
-        kind = str(kind_raw or "note").strip().lower()
-        if kind not in _CITA_VALID_KINDS:
-            kind = "note"
-
-        title = str(data.get("title") or "").strip()[:120]
-        when_raw = data.get("when")
-        if when_raw is None and "start" in data:
-            when_raw = data.get("start")
-        when = str(when_raw or "").strip()[:200]
-        location = str(data.get("location") or "").strip()[:200]
-
-        conf_raw = data.get("confidence")
-        if isinstance(conf_raw, str):
-            try:
-                conf_raw = float(conf_raw)
-            except ValueError:
-                conf_raw = 0.0
-        confidence = float(conf_raw or 0.0)
-        confidence = max(0.0, min(1.0, confidence))
-    except Exception as exc:
-        _silent_log("cita_detect_normalize", exc)
-        return None
-    return {
-        "kind": kind,
-        "title": title,
-        "when": when,
-        "location": location,
-        "confidence": confidence,
-    }
-
-
-def _maybe_create_cita_from_ocr(
-    ocr_text: str,
-    image_path: Path,
-    source: str,
-    *,
-    min_confidence: float | None = None,
-) -> dict | None:
-    """Pipeline OCR → classifier → action (event / reminder / note) con
-    sidecar dedup. Silent-fail en cada paso.
-
-    Flujo por kind:
-      - `kind="event"` + when parseable → `propose_calendar_event`. Persist
-        decision="cita" con `event_uid` (o "duplicate" si ya estaba, o
-        "error", o "ambiguous" si el parser de fecha no lo resolvió).
-      - `kind="event"` + when="" → persist "ambiguous" sin crear.
-      - `kind="reminder"` → `propose_reminder` (con o sin fecha). El path
-        de la imagen se incluye en `notes` para que quede referenciado
-        en Apple Reminders (no hay attachment API). Persist "reminder" +
-        `reminder_id`.
-      - `kind="note"` → no-op. Persist "note" para que re-runs skippeen.
-
-    `source` arg se propaga al sidecar para auditoría ("index" / "capture"
-    / "scan-citas" / "whatsapp"). `min_confidence` override local cuando
-    el caller es `rag scan-citas --min-confidence 0.5`.
-
-    Returns dict con shape unificada:
-      `{cached: bool, decision: str, kind: str, title, when, location,
-        confidence, event_uid, reminder_id}`.
-
-    NUNCA raise — cada paso tiene try/except silent-log.
-    """
-    if not _cita_detect_enabled():
-        return None
-    text = (ocr_text or "").strip()
-    if len(text) < _CITA_MIN_CHARS:
-        return None
-    threshold = (
-        float(min_confidence) if min_confidence is not None else _CITA_MIN_CONFIDENCE
-    )
-    key = _ocr_hash_key(text)
-    img_str = str(image_path) if image_path else ""
-
-    # Step 1: dedup lookup. Si ya lo procesamos antes, short-circuit.
-    try:
-        with _ragvec_state_conn() as conn:
-            row = conn.execute(
-                "SELECT decision, kind, title, start_text, location, "
-                "confidence, event_uid, reminder_id, created_at "
-                "FROM rag_cita_detections WHERE ocr_hash = ?",
-                (key,),
-            ).fetchone()
-    except Exception as exc:
-        _silent_log("cita_sidecar_read", exc)
-        row = None
-    if row is not None:
-        return {
-            "cached": True,
-            "decision": row[0],
-            "kind": row[1] or "",
-            "title": row[2],
-            "when": row[3],
-            # Backward-compat alias para callers que esperan `start`.
-            "start": row[3],
-            "location": row[4],
-            "confidence": row[5],
-            "event_uid": row[6],
-            "reminder_id": row[7],
-            "created_at": row[8],
-        }
-
-    # Step 2: run detector.
-    detected = _detect_cita_from_ocr(text)
-    if detected is None:
-        # Helper unavailable / malformed — NO persist. Reintentamos next run.
-        return None
-
-    now_ts = time.time()
-    kind = detected.get("kind") or "note"
-    title = detected.get("title") or ""
-    when = detected.get("when") or ""
-    location = detected.get("location") or ""
-    confidence = float(detected.get("confidence") or 0.0)
-
-    # Step 3: below-threshold — persist so dedup wins next time.
-    if confidence < threshold:
-        _persist_cita_detection(
-            ocr_hash=key, image_path=img_str, source=source,
-            decision="low_confidence", kind=kind,
-            title=title, start_text=when, location=location,
-            confidence=confidence, event_uid=None, reminder_id=None,
-            created_at=now_ts,
-        )
-        return _cita_result(
-            cached=False, decision="low_confidence", kind=kind,
-            title=title, when=when, location=location,
-            confidence=confidence,
-        )
-
-    # Step 4: route by kind.
-    if kind == "note":
-        # Nothing to schedule. Persist so we don't re-invoke the helper.
-        _persist_cita_detection(
-            ocr_hash=key, image_path=img_str, source=source,
-            decision="note", kind="note",
-            title=title, start_text=when, location=location,
-            confidence=confidence, event_uid=None, reminder_id=None,
-            created_at=now_ts,
-        )
-        return _cita_result(
-            cached=False, decision="note", kind="note",
-            title=title, when=when, location=location,
-            confidence=confidence,
-        )
-
-    if kind == "event":
-        if not when:
-            # Event classification without a parseable date — persist as
-            # ambiguous (user can re-evaluate manually, and dedup won't
-            # re-call helper for the same OCR text).
-            _persist_cita_detection(
-                ocr_hash=key, image_path=img_str, source=source,
-                decision="ambiguous", kind="event",
-                title=title, start_text=when, location=location,
-                confidence=confidence, event_uid=None, reminder_id=None,
-                created_at=now_ts,
-            )
-            return _cita_result(
-                cached=False, decision="ambiguous", kind="event",
-                title=title, when=when, location=location,
-                confidence=confidence,
-            )
-        event_title = title or "Cita"
-        notes_blob = f"Auto-detectado de OCR ({source}): {image_path}\n\n{text[:500]}"
-        try:
-            result_json = propose_calendar_event(
-                title=event_title, start=when,
-                location=(location or None), notes=notes_blob,
-            )
-            result = json.loads(result_json)
-        except Exception as exc:
-            _silent_log("cita_propose_event", exc)
-            result = {"created": False, "error": str(exc)}
-
-        event_uid = None
-        decision = "error"
-        if isinstance(result, dict):
-            if result.get("duplicate"):
-                decision = "duplicate"
-                existing = result.get("existing") or {}
-                event_uid = existing.get("uid") or existing.get("event_uid")
-            elif result.get("created"):
-                decision = "cita"
-                event_uid = result.get("event_uid")
-            elif result.get("needs_clarification"):
-                decision = "ambiguous"
-            else:
-                decision = "error"
-
-        _persist_cita_detection(
-            ocr_hash=key, image_path=img_str, source=source,
-            decision=decision, kind="event",
-            title=event_title, start_text=when, location=location,
-            confidence=confidence, event_uid=event_uid, reminder_id=None,
-            created_at=now_ts,
-        )
-        return _cita_result(
-            cached=False, decision=decision, kind="event",
-            title=event_title, when=when, location=location,
-            confidence=confidence, event_uid=event_uid,
-        )
-
-    # kind == "reminder"
-    reminder_title = title or "Tarea"
-    # Apple Reminders NO soporta attachments vía AppleScript; el path de
-    # la imagen queda en el body del reminder para referencia — Reminders.
-    # app lo muestra como texto, grep-friendly desde CLI también.
-    notes_blob = (
-        f"Imagen: {image_path}\n"
-        f"Origen: {source}\n\n"
-        f"{text[:500]}"
-    )
-    try:
-        result_json = propose_reminder(
-            title=reminder_title,
-            when=when,  # puede ser "" — `propose_reminder` lo tolera
-            notes=notes_blob,
-        )
-        result = json.loads(result_json)
-    except Exception as exc:
-        _silent_log("cita_propose_reminder", exc)
-        result = {"created": False, "error": str(exc)}
-
-    reminder_id = None
-    decision = "error"
-    if isinstance(result, dict):
-        if result.get("created"):
-            decision = "reminder"
-            reminder_id = result.get("reminder_id")
-        elif result.get("needs_clarification"):
-            decision = "ambiguous"
-        else:
-            decision = "error"
-
-    _persist_cita_detection(
-        ocr_hash=key, image_path=img_str, source=source,
-        decision=decision, kind="reminder",
-        title=reminder_title, start_text=when, location=location,
-        confidence=confidence, event_uid=None, reminder_id=reminder_id,
-        created_at=now_ts,
-    )
-    return _cita_result(
-        cached=False, decision=decision, kind="reminder",
-        title=reminder_title, when=when, location=location,
-        confidence=confidence, reminder_id=reminder_id,
-    )
-
-
-def _cita_result(
-    *, cached: bool, decision: str, kind: str, title: str, when: str,
-    location: str, confidence: float,
-    event_uid: str | None = None, reminder_id: str | None = None,
-) -> dict:
-    """Shape uniforme de retorno para `_maybe_create_cita_from_ocr`.
-    Incluye `start` como alias de `when` para backward-compat con callers
-    que esperan el schema viejo (tests pre-2026-04-23 tarde, renders del
-    CLI anteriores al routing por kind).
-    """
-    return {
-        "cached": bool(cached),
-        "decision": decision,
-        "kind": kind,
-        "title": title,
-        "when": when,
-        "start": when,  # alias
-        "location": location,
-        "confidence": float(confidence),
-        "event_uid": event_uid,
-        "reminder_id": reminder_id,
-    }
-
-
-def _persist_cita_detection(
-    *, ocr_hash: str, image_path: str, source: str, decision: str,
-    kind: str | None, title: str, start_text: str, location: str,
-    confidence: float,
-    event_uid: str | None, reminder_id: str | None, created_at: float,
-) -> None:
-    """INSERT OR IGNORE en `rag_cita_detections`.
-
-    Si otro caller ganó la carrera (mismo `ocr_hash` persistido primero),
-    respetamos su fila — por eso OR IGNORE y no OR REPLACE. Silent-fail:
-    excepciones log-only, no bloquean el caller.
-
-    Incluye columnas `kind` + `reminder_id` post-2026-04-23. Instalaciones
-    viejas sin la migration lazy (`_migrate_cita_detections_add_kind`) van
-    a fallar el INSERT por columnas inexistentes; el except genérico lo
-    captura y persistimos con el subset mínimo (best-effort degradation).
-    """
-    try:
-        with _ragvec_state_conn() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO rag_cita_detections "
-                "(ocr_hash, image_path, source, decision, kind, title, "
-                "start_text, location, confidence, event_uid, reminder_id, "
-                "created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    ocr_hash, image_path, source, decision, kind, title,
-                    start_text, location, float(confidence), event_uid,
-                    reminder_id, float(created_at),
-                ),
-            )
-    except Exception as exc:
-        _silent_log(f"cita_sidecar_write:{ocr_hash}", exc)
-        # Fallback: retry con subset pre-kind/reminder_id (pre-migration
-        # schema). Protege operadores que corrieron el feature original
-        # (commit 1d55b27) y NO bajaron `_migrate_cita_detections_add_kind`
-        # todavía (ej. tests que instancian un DB bare sin
-        # `_ensure_telemetry_tables`).
-        try:
-            with _ragvec_state_conn() as conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO rag_cita_detections "
-                    "(ocr_hash, image_path, source, decision, title, "
-                    "start_text, location, confidence, event_uid, "
-                    "created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        ocr_hash, image_path, source, decision, title,
-                        start_text, location, float(confidence),
-                        event_uid, float(created_at),
-                    ),
-                )
-        except Exception as exc2:
-            _silent_log(f"cita_sidecar_write_fallback:{ocr_hash}", exc2)
+# ── Phase 6: OCR + VLM caption + intent detector moved to `rag.ocr` ──────
+# Three concerns extracted to `rag/ocr.py` (Phase 6, 2026-04-25):
+#   - OCR primitives (Apple Vision via ocrmac).
+#   - VLM caption fallback (qwen2.5vl:3b via ollama).
+#   - OCR → intent detector (event/reminder/note classifier).
+# Re-exported at the bottom of this file. `_index_single_file` (the next
+# function) calls into them via `_enrich_body_with_ocr` /
+# `_maybe_create_cita_from_ocr` / `_file_hash_with_images` — all
+# resolved on `rag` namespace by the shim.
 
 
 def _index_single_file(
@@ -31449,8 +30461,8 @@ def capture(text: str | None, from_stdin: bool, tags: tuple[str, ...],
 @click.option("--apply", "do_apply", is_flag=True,
               help="Crear los eventos de verdad. Sin esto es dry-run (default).")
 @click.option("--min-confidence", "min_conf", type=float, default=None,
-              help=f"Override del umbral ({_CITA_MIN_CONFIDENCE} default). "
-                   f"Bajá a 0.5 para barridos agresivos.")
+              help="Override del umbral (0.70 default). "
+                   "Bajá a 0.5 para barridos agresivos.")
 @click.option("--recursive/--no-recursive", default=True,
               help="Bajar a subdirs. Default: sí.")
 @click.option("--plain", is_flag=True, help="Salida plana (ruta + decisión por línea).")
@@ -36733,6 +35745,63 @@ def remind_wa(dry_run: bool, window_min: int, max_overdue_min: int):
     )
 
 
+@cli.command("wa-scheduled-send")
+@click.option("--dry-run", is_flag=True,
+              help="Calcular las acciones sin enviar al bridge ni mover status")
+@click.option("--late-threshold-min", type=int, default=5, show_default=True,
+              help="Si el delta now-scheduled_for supera estos minutos el status final es 'sent_late' (no 'sent')")
+@click.option("--max-retries", type=int, default=5, show_default=True,
+              help="Tras N reintentos fallidos, el row queda en 'failed' y deja de pickearse")
+@click.option("--max-per-run", type=int, default=20, show_default=True,
+              help="Cap de cuántos pendings procesa por corrida (limita ráfagas si la cola se llenó)")
+def wa_scheduled_send(dry_run: bool, late_threshold_min: int,
+                      max_retries: int, max_per_run: int):
+    """Worker — envía mensajes de WhatsApp programados cuyo `scheduled_for_utc`
+    ya venció. Lo dispara el plist `com.fer.obsidian-rag-wa-scheduled-send`
+    cada 5 minutos.
+
+    Idempotente: cada row se mueve de `pending` a `sent` / `sent_late` /
+    `failed` en una sola transacción; si el bridge está caído, el row
+    queda `pending` con `attempt_count` incrementado y se reintenta en
+    el próximo ciclo del cron. Tras `max-retries` fallos consecutivos
+    pasa a `failed` y deja de pickearse (el dashboard lo muestra para
+    reenvío manual).
+
+    Si la Mac estuvo dormida, el delta `now - scheduled_for` puede ser
+    grande — política decidida con el usuario: mandamos igual y marcamos
+    `sent_late` con `delta_minutes` para que el dashboard lo destaque
+    en naranja. NO se cancela el envío por estar tarde.
+
+    Silent-fail completo: cualquier excepción inesperada se loguea a
+    `rag_ambient` con `cmd=whatsapp_scheduled_worker_error` y el comando
+    sale exit 0 para no romper launchd. El cuerpo del mensaje NUNCA se
+    persiste en el log (privacidad) — solo metadata operativa.
+    """
+    from rag import wa_scheduled  # noqa: PLC0415 (lazy: el módulo abre SQLite)
+    summary = wa_scheduled.run_due_worker(
+        late_threshold_minutes=int(late_threshold_min),
+        max_retries=int(max_retries),
+        max_per_run=int(max_per_run),
+        dry_run=bool(dry_run),
+    )
+    tag = "[dim]dry-run[/dim]" if dry_run else "[green]live[/green]"
+    if not summary.get("ok"):
+        reason = summary.get("reason") or "unknown_error"
+        console.print(f"{tag} wa-scheduled-send · [red]{reason}[/red]")
+        return
+    processed = summary.get("processed", 0)
+    sent = summary.get("sent", 0)
+    sent_late = summary.get("sent_late", 0)
+    failed = summary.get("failed", 0)
+    retried = summary.get("retried", 0)
+    color = "yellow" if sent_late or failed else "green"
+    console.print(
+        f"{tag} wa-scheduled-send · processed={processed} "
+        f"sent=[{color}]{sent}[/{color}] sent_late=[yellow]{sent_late}[/yellow] "
+        f"failed=[red]{failed}[/red] retried={retried}"
+    )
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")
@@ -38557,6 +37626,54 @@ def _reminder_wa_push_plist(rag_bin: str) -> str:
 """
 
 
+def _wa_scheduled_send_plist(rag_bin: str) -> str:
+    """Scheduled WhatsApp messages → bridge dispatcher — every 5 minutes.
+
+    Pickea rows de `rag_whatsapp_scheduled` con `status='pending'` y
+    `scheduled_for_utc <= now`, las manda al bridge local
+    (whatsapp-mcp), y las mueve a `sent` / `sent_late` / `failed`.
+    Cadencia idéntica a `reminder-wa-push` (5min) — ambos son
+    time-sensitive y comparten el mismo trade-off precisión vs CPU.
+    Si la Mac quedó dormida y un mensaje de las 9am se procesa a las
+    11:30, el row queda en `sent_late` con `delta_minutes` populado
+    para que el dashboard lo muestre en naranja (decisión del user:
+    mejor llegar tarde que no llegar).
+
+    Idempotente vía la propia tabla — cada row tiene un `status` que
+    avanza monotónicamente. El bridge caído NO marca `sent`: deja
+    `pending` con `attempt_count++` y reintenta en el próximo ciclo.
+    Tras 5 fallos consecutivos pasa a `failed` (configurable via
+    --max-retries) y se muestra en el dashboard para reenvío manual.
+
+    Silent-fail completo: el comando wrappea todo en try/except y
+    siempre exit 0 — no romper launchd ni dejar el plist en backoff.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-wa-scheduled-send</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>wa-scheduled-send</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/wa-scheduled-send.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/wa-scheduled-send.error.log</string>
+</dict>
+</plist>
+"""
+
+
 # `_wa_tasks_plist` moved to `rag.integrations.whatsapp` (Phase 1b,
 # 2026-04-25). Re-exported at the bottom of this file.
 
@@ -39220,6 +38337,14 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-reminder-wa-push",
          "com.fer.obsidian-rag-reminder-wa-push.plist",
          _reminder_wa_push_plist(rag_bin)),
+        # Scheduled WhatsApp messages — el user programa un mensaje
+        # ("mandale a Grecia mañana 9hs ...") y este worker pickea el
+        # row cuando vence y lo dispara al bridge. Misma cadencia que
+        # reminder-wa-push (5min) por la misma razón: precisión sin
+        # ráfagas de CPU. Idempotente vía status enum en la tabla.
+        ("com.fer.obsidian-rag-wa-scheduled-send",
+         "com.fer.obsidian-rag-wa-scheduled-send.plist",
+         _wa_scheduled_send_plist(rag_bin)),
         ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
          _auto_harvest_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
@@ -49295,6 +48420,7 @@ _sys_for_reload.modules.pop("rag.anticipatory", None)
 _sys_for_reload.modules.pop("rag.proactive", None)
 _sys_for_reload.modules.pop("rag.wa_tasks", None)
 _sys_for_reload.modules.pop("rag.pendientes", None)
+_sys_for_reload.modules.pop("rag.ocr", None)
 del _sys_for_reload
 
 # Phase 4a re-export: proactive nudges. NOTE: must come BEFORE rag.anticipatory
@@ -49401,6 +48527,60 @@ from rag.pendientes import (  # noqa: E402, F401
     _pendientes_render_rich,
     _pendientes_urgent,
     pendientes,
+)
+
+
+# ── Phase 6: rag.ocr re-export shim (2026-04-25) ────────────────────────────
+# OCR + VLM caption + intent detector extracted to `rag/ocr.py`. The module
+# imports a handful of helpers from `rag` at module-load time
+# (HELPER_MODEL, _silent_log, propose_calendar_event, etc. — all defined
+# earlier in this file). Internal callers of monkey-patched names
+# (_ocrmac_module, _ocr_image, _vlm_client, _VLM_CAPTION_MAX_PER_RUN,
+# _detect_cita_from_ocr) resolve via `rag.<X>` so test patches propagate.
+#
+# The `_ocrmac_module` and `_ocrmac_import_attempted` globals live on the
+# `rag` namespace (not `rag.ocr`) — `_load_ocrmac_module` reads/writes via
+# `_rag.<X>` so monkey-patches and the loader's cached singleton land on
+# the same attribute.
+from rag.ocr import (  # noqa: E402, F401
+    _CITA_MIN_CHARS,
+    _CITA_MIN_CONFIDENCE,
+    _CITA_PROMPT_SYSTEM,
+    _CITA_PROMPT_USER_TEMPLATE,
+    _CITA_VALID_KINDS,
+    _EMBED_MARKDOWN_RE,
+    _EMBED_WIKILINK_RE,
+    _IMAGE_EXTENSIONS,
+    _OCR_MIN_CONFIDENCE,
+    _VLM_CAPTION_MAX_CHARS,
+    _VLM_CAPTION_MAX_PER_RUN,
+    _VLM_CAPTION_PROMPT,
+    _VLM_FALLBACK_MIN_OCR,
+    VLM_MODEL,
+    _caption_image,
+    _cita_detect_enabled,
+    _cita_result,
+    _detect_cita_from_ocr,
+    _enrich_body_with_ocr,
+    _extract_embedded_images,
+    _file_hash_with_images,
+    _image_text_or_caption,
+    _load_ocrmac_module,
+    _maybe_create_cita_from_ocr,
+    _normalize_ocr_for_hash,
+    _ocr_hash_key,
+    _ocr_image,
+    _ocrmac_import_attempted,
+    _ocrmac_module,
+    _persist_cita_detection,
+    _vlm_caption_budget_available,
+    _vlm_caption_budget_consume,
+    _vlm_caption_budget_reset,
+    _vlm_caption_calls_used,
+    _vlm_caption_enabled,
+    _VLM_CLIENT,
+    _vlm_client,
+    _vlm_model_missing_warned,
 )
 
 

@@ -42,6 +42,11 @@ import rag
 
 ROOT = Path(__file__).resolve().parent.parent
 RAG_PY = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
+# OCR primitives moved to `rag/ocr.py` in Phase 6 (2026-04-25). Some
+# source-level contract tests below grep for `def _ocr_image(...)` etc. so
+# we concat both files for the lookup.
+RAG_OCR_PY = (ROOT / "rag" / "ocr.py").read_text(encoding="utf-8")
+RAG_PY = RAG_PY + "\n" + RAG_OCR_PY
 
 
 # ─── Fix 1: ocrmac lazy-import ────────────────────────────────────────────

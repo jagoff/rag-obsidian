@@ -63,6 +63,7 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import rag  # noqa: E402
+from scripts import ingest_base  # noqa: E402
 from scripts import ingest_contacts as _contacts  # noqa: E402
 
 
@@ -207,40 +208,28 @@ def read_calls(
 
 # ── State ──────────────────────────────────────────────────────────────────
 
-_STATE_TABLE_DDL = (
-    "CREATE TABLE IF NOT EXISTS rag_calls_state ("
-    " call_uid TEXT PRIMARY KEY,"
-    " content_hash TEXT NOT NULL,"
-    " last_seen_ts TEXT NOT NULL,"
-    " updated_at TEXT NOT NULL"
-    ")"
-)
+_STATE_TABLE = "rag_calls_state"
+_STATE_KEY_COL = "call_uid"
 
 
 def _ensure_state_table(conn: sqlite3.Connection) -> None:
-    conn.execute(_STATE_TABLE_DDL)
+    ingest_base.ensure_state_table(conn, _STATE_TABLE, _STATE_KEY_COL)
 
 
 def _load_hashes(conn: sqlite3.Connection) -> dict[str, str]:
-    cur = conn.execute("SELECT call_uid, content_hash FROM rag_calls_state")
-    return {row[0]: row[1] for row in cur.fetchall()}
+    return ingest_base.load_hashes(conn, _STATE_TABLE, _STATE_KEY_COL)
 
 
 def _upsert_hash(conn: sqlite3.Connection, uid: str, h: str, now_iso: str) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO rag_calls_state "
-        "(call_uid, content_hash, last_seen_ts, updated_at) "
-        "VALUES (?, ?, ?, ?)",
-        (uid, h, now_iso, now_iso),
-    )
+    ingest_base.upsert_hash(conn, _STATE_TABLE, _STATE_KEY_COL, uid, h, now_iso)
 
 
 def _delete_hash(conn: sqlite3.Connection, uid: str) -> None:
-    conn.execute("DELETE FROM rag_calls_state WHERE call_uid = ?", (uid,))
+    ingest_base.delete_hash(conn, _STATE_TABLE, _STATE_KEY_COL, uid)
 
 
 def _reset_state(conn: sqlite3.Connection) -> None:
-    conn.execute("DELETE FROM rag_calls_state")
+    conn.execute(f"DELETE FROM {_STATE_TABLE}")
 
 
 def _content_hash(c: Call) -> str:
@@ -389,17 +378,9 @@ def upsert_calls(col, calls: list[Call]) -> int:
 def delete_calls(col, uids: list[str]) -> int:
     if not uids:
         return 0
-    n = 0
-    for uid in uids:
-        key = f"{DOC_ID_PREFIX}://{uid}"
-        try:
-            got = col.get(where={"file": key}, include=[])
-            if got.get("ids"):
-                col.delete(ids=got["ids"])
-                n += 1
-        except Exception:
-            continue
-    return n
+    return ingest_base.delete_chunks_by_file_keys(
+        col, [f"{DOC_ID_PREFIX}://{uid}" for uid in uids]
+    )
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────

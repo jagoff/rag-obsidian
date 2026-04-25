@@ -53,6 +53,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import rag  # noqa: E402
+from scripts import ingest_base  # noqa: E402
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -270,49 +271,34 @@ def read_bookmarks(plist_path: Path = DEFAULT_BOOKMARKS_PLIST) -> list[Bookmark]
 
 # ── State ──────────────────────────────────────────────────────────────────
 
-_HISTORY_STATE_DDL = (
-    "CREATE TABLE IF NOT EXISTS rag_safari_history_state ("
-    " history_item_id INTEGER PRIMARY KEY,"
-    " content_hash TEXT NOT NULL,"
-    " last_seen_ts TEXT NOT NULL,"
-    " updated_at TEXT NOT NULL"
-    ")"
-)
-
-_BOOKMARK_STATE_DDL = (
-    "CREATE TABLE IF NOT EXISTS rag_safari_bookmark_state ("
-    " bookmark_uuid TEXT PRIMARY KEY,"
-    " content_hash TEXT NOT NULL,"
-    " last_seen_ts TEXT NOT NULL,"
-    " updated_at TEXT NOT NULL"
-    ")"
-)
+_HISTORY_TABLE = "rag_safari_history_state"
+_HISTORY_KEY_COL = "history_item_id"
+_BOOKMARK_TABLE = "rag_safari_bookmark_state"
+_BOOKMARK_KEY_COL = "bookmark_uuid"
 
 
 def _ensure_state_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(_HISTORY_STATE_DDL)
-    conn.execute(_BOOKMARK_STATE_DDL)
+    ingest_base.ensure_state_table(
+        conn, _HISTORY_TABLE, _HISTORY_KEY_COL, key_type="INTEGER",
+    )
+    ingest_base.ensure_state_table(
+        conn, _BOOKMARK_TABLE, _BOOKMARK_KEY_COL,
+    )
 
 
 def _load_hashes(conn: sqlite3.Connection, table: str, key_col: str) -> dict[str, str]:
-    cur = conn.execute(f"SELECT {key_col}, content_hash FROM {table}")
-    return {str(row[0]): row[1] for row in cur.fetchall()}
+    return ingest_base.load_hashes(conn, table, key_col)
 
 
 def _upsert_hash(
     conn: sqlite3.Connection, table: str, key_col: str,
     key: str | int, h: str, now_iso: str,
 ) -> None:
-    conn.execute(
-        f"INSERT OR REPLACE INTO {table} "
-        f"({key_col}, content_hash, last_seen_ts, updated_at) "
-        f"VALUES (?, ?, ?, ?)",
-        (key, h, now_iso, now_iso),
-    )
+    ingest_base.upsert_hash(conn, table, key_col, key, h, now_iso=now_iso)
 
 
 def _delete_hash(conn: sqlite3.Connection, table: str, key_col: str, key: str | int) -> None:
-    conn.execute(f"DELETE FROM {table} WHERE {key_col} = ?", (key,))
+    ingest_base.delete_hash(conn, table, key_col, key)
 
 
 def _reset_state(conn: sqlite3.Connection) -> None:
@@ -534,13 +520,8 @@ def delete_history(col, hist_item_ids: list[int]) -> int:
     n = 0
     for hid in hist_item_ids:
         key = f"{DOC_ID_PREFIX}://history/{hid}"
-        try:
-            got = col.get(where={"file": key}, include=[])
-            if got.get("ids"):
-                col.delete(ids=got["ids"])
-                n += 1
-        except Exception:
-            continue
+        if ingest_base.delete_chunks_by_file_key(col, key) > 0:
+            n += 1
     return n
 
 
@@ -551,13 +532,8 @@ def delete_bookmarks(col, keys: list[str]) -> int:
         return 0
     n = 0
     for key in keys:
-        try:
-            got = col.get(where={"file": key}, include=[])
-            if got.get("ids"):
-                col.delete(ids=got["ids"])
-                n += 1
-        except Exception:
-            continue
+        if ingest_base.delete_chunks_by_file_key(col, key) > 0:
+            n += 1
     return n
 
 

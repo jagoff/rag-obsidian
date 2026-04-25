@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover - tqdm not installed
     pass
 # === END LOKY SEMAPHORE LEAK FIX ============================================
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -2397,6 +2397,251 @@ def delete_calendar_event(req: CalendarDeleteRequest) -> dict:
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
     return {"ok": True, "message": msg}
+
+
+# Cap defensivo de upload — fotos típicas de iPhone son 4-8MB, dejamos
+# margen de manija. Above this returns 413.
+_CHAT_UPLOAD_MAX_BYTES = 12 * 1024 * 1024  # 12 MB
+_CHAT_UPLOAD_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-uploads"
+# Confidence threshold para auto-crear vs mostrar card de confirmación.
+# Decidido con el user 2026-04-25: ≥0.85 auto-crea con undo, <0.85
+# va a card. Mantiene el balance entre velocidad y seguridad — el
+# detector de citas es bastante conservador con su confidence ya, así
+# que confidence ≥ 0.85 quiere decir "esto es claramente un evento/
+# reminder, ahorrale el click al user".
+_CHAT_UPLOAD_AUTOCREATE_CONFIDENCE = 0.85
+
+
+@app.post("/api/chat/upload-image")
+async def upload_chat_image(file: UploadFile = File(...)) -> dict:
+    """Subir una imagen al chat para que la procesemos con OCR + VLM
+    fallback + detector de cita, y o bien (a) creemos directamente el
+    evento/recordatorio si el detector está muy seguro (confidence
+    ≥0.85, mismo flujo que el chip auto-creado), o bien (b) emitamos
+    un proposal card para que el user confirme manualmente cuando el
+    detector está dudoso.
+
+    Acción según el contenido detectado:
+
+    - ``kind == "note"`` o no se detectó nada agendable → ``action="noop"``,
+      el frontend muestra un mini-card minimal "imagen procesada, sin
+      fecha detectada" (o simplemente nada).
+    - ``kind == "event"`` o ``kind == "reminder"`` con confidence
+      ≥0.85 y fecha parseable → llamamos ``propose_calendar_event`` /
+      ``propose_reminder`` que CREAN el evento real → ``action="created"``,
+      response incluye ``event_uid`` o ``reminder_id`` para que el
+      frontend muestre el chip auto-creado con [↩ deshacer].
+    - Cualquier otro caso (confidence baja, NL no parseable) →
+      ``action="needs_confirmation"`` con los fields normalizados
+      (mismo shape que la respuesta de ``propose_*`` cuando emite
+      ``needs_clarification: true``). El frontend renderiza la card
+      estándar de proposal y el user clickea [✓ Crear] para confirmar.
+
+    Persistimos la imagen en
+    ``~/.local/share/obsidian-rag/chat-uploads/<sha256>.<ext>``
+    (key por hash → dedup natural). NO se copia al vault iCloud
+    automáticamente — eso lo hace ``rag capture --image`` cuando el
+    user pide capturar explícitamente; acá la imagen es solo input
+    para el detector.
+
+    Validaciones: tipo MIME ``image/*``, tamaño ≤12MB. Errores de OCR
+    o detector se manejan silenciosamente (devuelve ``action="noop"``
+    con un ``reason``) — la idea es nunca bloquear al user que
+    simplemente quiso compartir una imagen.
+    """
+    content_type = (file.content_type or "").lower().strip()
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"solo imágenes (recibí content_type={content_type!r})",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="imagen vacía")
+    if len(raw) > _CHAT_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"imagen muy grande ({len(raw)} bytes, max {_CHAT_UPLOAD_MAX_BYTES})",
+        )
+
+    import hashlib  # noqa: PLC0415
+    img_hash = hashlib.sha256(raw).hexdigest()[:32]
+    suffix = Path(file.filename or "img.jpg").suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif"}:
+        suffix = ".jpg"  # forzar extensión conocida para que ocrmac no se confunda
+    _CHAT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    img_path = _CHAT_UPLOAD_DIR / f"{img_hash}{suffix}"
+    if not img_path.exists():
+        img_path.write_bytes(raw)
+
+    # OCR + VLM fallback. Reset del budget VLM por sesión para que el
+    # cap "max captions per run" no nos bloquee si el daemon llevaba
+    # rato corriendo y ya consumió su budget.
+    try:
+        from rag.ocr import (  # noqa: PLC0415
+            _image_text_or_caption,
+            _detect_cita_from_ocr,
+            _vlm_caption_budget_reset,
+        )
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"OCR backend no disponible: {e}") from e
+
+    try:
+        _vlm_caption_budget_reset()
+    except Exception:
+        pass
+
+    ocr_text = ""
+    ocr_source = ""
+    try:
+        ocr_text, ocr_source = _image_text_or_caption(img_path)
+    except Exception as e:
+        return {
+            "action": "noop",
+            "reason": f"ocr_error: {e}",
+            "image_path": str(img_path),
+        }
+
+    if not ocr_text or len(ocr_text.strip()) < 20:
+        return {
+            "action": "noop",
+            "reason": "ocr_empty_or_short",
+            "ocr_text": ocr_text,
+            "ocr_source": ocr_source,
+            "image_path": str(img_path),
+        }
+
+    try:
+        detection = _detect_cita_from_ocr(ocr_text)
+    except Exception as e:
+        return {
+            "action": "noop",
+            "reason": f"detector_error: {e}",
+            "ocr_text": ocr_text[:500],
+            "ocr_source": ocr_source,
+            "image_path": str(img_path),
+        }
+
+    if not detection:
+        return {
+            "action": "noop",
+            "reason": "no_cita_detected",
+            "ocr_text": ocr_text[:500],
+            "ocr_source": ocr_source,
+            "image_path": str(img_path),
+        }
+
+    kind = detection.get("kind") or ""
+    title = (detection.get("title") or "").strip() or "(sin título)"
+    when = (detection.get("when") or "").strip()
+    location = (detection.get("location") or "").strip()
+    confidence = float(detection.get("confidence") or 0.0)
+    notes = (
+        f"Detectado de imagen subida al chat ({ocr_source.upper() or 'OCR'})\n\n"
+        f"{ocr_text[:1000]}"
+    )
+
+    if kind not in {"event", "reminder"}:
+        # kind == "note" o algo raro → no proponemos nada agendable
+        return {
+            "action": "noop",
+            "reason": "kind_not_actionable",
+            "kind": kind,
+            "ocr_text": ocr_text[:500],
+            "ocr_source": ocr_source,
+            "detection": detection,
+            "image_path": str(img_path),
+        }
+
+    # Routing por confidence.
+    if confidence >= _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE:
+        # Auto-crear via propose_*: estos parsean el NL y crean al toque.
+        # Si el NL no parsea, propose_* devuelve needs_clarification:true
+        # — caemos al fallback de needs_confirmation abajo.
+        try:
+            if kind == "event":
+                from rag import propose_calendar_event  # noqa: PLC0415
+                resp_json = propose_calendar_event(
+                    title=title,
+                    start=when or "",
+                    location=location or None,
+                    notes=notes,
+                )
+            else:
+                from rag import propose_reminder  # noqa: PLC0415
+                resp_json = propose_reminder(
+                    title=title,
+                    when=when or "",
+                    notes=notes,
+                )
+            resp = json.loads(resp_json)
+        except Exception as e:
+            resp = {"created": False, "error": f"propose_*_failed: {e}"}
+
+        if resp.get("created"):
+            id_field = "event_uid" if kind == "event" else "reminder_id"
+            return {
+                "action": "created",
+                "kind": kind,
+                "fields": resp.get("fields", {}),
+                id_field: resp.get(id_field),
+                "ocr_text": ocr_text[:500],
+                "ocr_source": ocr_source,
+                "confidence": confidence,
+                "image_path": str(img_path),
+            }
+        # Si auto-crear falló (NL no parseable), caemos a confirmación.
+
+    # Confidence baja o auto-crear no pudo: emitir proposal sin crear.
+    # Hacemos un best-effort de parsear el `when` para popular
+    # ``start_iso`` / ``due_iso`` y que el frontend pueda mandar el
+    # POST a /api/calendar/create directamente cuando el user confirme.
+    parsed_iso: str | None = None
+    if when:
+        try:
+            from rag import _parse_natural_datetime  # noqa: PLC0415
+            from datetime import datetime as _dt  # noqa: PLC0415
+            parsed = _parse_natural_datetime(when, now=_dt.now())
+            if parsed:
+                parsed_iso = parsed.isoformat()
+        except Exception:
+            parsed_iso = None
+
+    if kind == "event":
+        fields = {
+            "title": title,
+            "start_iso": parsed_iso,
+            "start_text": when,
+            "end_iso": None,
+            "calendar": None,
+            "location": location or None,
+            "notes": notes,
+            "all_day": False,
+            "recurrence": None,
+            "recurrence_text": None,
+        }
+    else:  # reminder
+        fields = {
+            "title": title,
+            "due_iso": parsed_iso,
+            "due_text": when,
+            "list": None,
+            "priority": None,
+            "notes": notes,
+            "recurrence": None,
+            "recurrence_text": None,
+        }
+
+    return {
+        "action": "needs_confirmation",
+        "kind": kind,
+        "fields": fields,
+        "needs_clarification": parsed_iso is None and not when,
+        "ocr_text": ocr_text[:500],
+        "ocr_source": ocr_source,
+        "confidence": confidence,
+        "image_path": str(img_path),
+    }
 
 
 class WhatsAppReplyTarget(BaseModel):

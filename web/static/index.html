@@ -454,6 +454,14 @@
             Buscar en vault
           </button>
         </div>
+        <!-- File picker oculto: lo dispara el item "📎 Adjuntar imagen"
+             del mini-popover del botón `+` (construido dinámicamente
+             en app.js). Vive dentro del <form> para que el reset de
+             value="" en `change` funcione bien y permita re-elegir el
+             mismo archivo otra vez. accept="image/*" cubre jpeg/png/
+             heic/heif/webp/gif — el backend valida tipos y tamaño
+             (max 12MB) en /api/chat/upload-image. -->
+        <input type="file" id="composer-file-input" accept="image/*" hidden>
       </div>
     </form>
   </main>

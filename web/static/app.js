@@ -4882,10 +4882,344 @@ updateChatEmptyState();
 
 const composerPlusBtn = document.getElementById("composer-plus-btn");
 const composerMicBtn = document.getElementById("composer-mic-btn");
+const composerFileInput = document.getElementById("composer-file-input");
 
-// ── Plus button: abre el help modal (atajos + slash commands) ──
-if (composerPlusBtn && helpBtn) {
-  composerPlusBtn.addEventListener("click", () => helpBtn.click());
+// ── Plus button: mini-popover con dos opciones ─────────────────────────
+// "📎 Adjuntar imagen" → trigger del <input type="file"> oculto.
+// "❓ Atajos y comandos" → mismo helpBtn.click() de antes.
+//
+// El popover se construye on-demand (no vive en el HTML) para no
+// inflar el markup. Aparece anchored al botón `+` (preferimos arriba
+// para no taparse con teclado en mobile, fallback abajo si hay poco
+// viewport). Click fuera y ESC lo cierran. Focus trap + return focus
+// al `+` al cerrar (a11y, ver helpModal para el patrón).
+let _composerPlusMenu = null;
+let _composerPlusMenuLastFocus = null;
+
+function _closeComposerPlusMenu() {
+  if (!_composerPlusMenu) return;
+  document.removeEventListener("click", _composerPlusMenuOutsideClick, true);
+  document.removeEventListener("keydown", _composerPlusMenuKeydown, true);
+  window.removeEventListener("resize", _closeComposerPlusMenu);
+  window.removeEventListener("scroll", _closeComposerPlusMenu, true);
+  _composerPlusMenu.remove();
+  _composerPlusMenu = null;
+  // Return focus al `+` (o al elemento que lo abrió) — a menos que el
+  // foco ya haya migrado a otro elemento (ej. file picker open).
+  if (_composerPlusMenuLastFocus &&
+      typeof _composerPlusMenuLastFocus.focus === "function" &&
+      document.contains(_composerPlusMenuLastFocus)) {
+    try { _composerPlusMenuLastFocus.focus({ preventScroll: true }); } catch (_) {}
+  }
+  _composerPlusMenuLastFocus = null;
+}
+
+function _composerPlusMenuOutsideClick(ev) {
+  if (!_composerPlusMenu) return;
+  // Click dentro del menú o sobre el `+` mismo (toggle): no cerrar acá
+  // — el item handler decide si cerrar (sí en ambos items).
+  if (_composerPlusMenu.contains(ev.target)) return;
+  if (composerPlusBtn && composerPlusBtn.contains(ev.target)) return;
+  _closeComposerPlusMenu();
+}
+
+function _composerPlusMenuKeydown(ev) {
+  if (!_composerPlusMenu) return;
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    ev.stopPropagation();
+    _closeComposerPlusMenu();
+    return;
+  }
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    const items = [..._composerPlusMenu.querySelectorAll('[role="menuitem"]')];
+    if (!items.length) return;
+    const cur = items.indexOf(document.activeElement);
+    const next = ev.key === "ArrowDown"
+      ? (cur < 0 ? 0 : (cur + 1) % items.length)
+      : (cur < 0 ? items.length - 1 : (cur - 1 + items.length) % items.length);
+    items[next].focus();
+    return;
+  }
+  if (ev.key === "Tab") {
+    // Focus trap simple: si Tab/Shift+Tab sale del menú, lo cerramos
+    // (los menús de tipo "popover transient" no necesitan trap real —
+    // mejor cerrar y devolver el flow al composer).
+    setTimeout(() => {
+      if (_composerPlusMenu && !_composerPlusMenu.contains(document.activeElement)) {
+        _closeComposerPlusMenu();
+      }
+    }, 0);
+  }
+}
+
+function _openComposerPlusMenu() {
+  if (_composerPlusMenu) {
+    _closeComposerPlusMenu();
+    return;
+  }
+  if (!composerPlusBtn) return;
+  _composerPlusMenuLastFocus = document.activeElement;
+
+  const menu = document.createElement("div");
+  menu.className = "composer-plus-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Opciones del composer");
+
+  // Item 1: 📎 Adjuntar imagen
+  const itemAttach = document.createElement("button");
+  itemAttach.type = "button";
+  itemAttach.className = "composer-plus-menu-item";
+  itemAttach.setAttribute("role", "menuitem");
+  itemAttach.innerHTML = '<span class="composer-plus-menu-icon" aria-hidden="true">📎</span><span class="composer-plus-menu-label">Adjuntar imagen</span>';
+  itemAttach.addEventListener("click", () => {
+    _closeComposerPlusMenu();
+    if (composerFileInput) composerFileInput.click();
+  });
+  menu.appendChild(itemAttach);
+
+  // Item 2: ❓ Atajos y comandos
+  const itemHelp = document.createElement("button");
+  itemHelp.type = "button";
+  itemHelp.className = "composer-plus-menu-item";
+  itemHelp.setAttribute("role", "menuitem");
+  itemHelp.innerHTML = '<span class="composer-plus-menu-icon" aria-hidden="true">❓</span><span class="composer-plus-menu-label">Atajos y comandos</span>';
+  itemHelp.addEventListener("click", () => {
+    _closeComposerPlusMenu();
+    if (helpBtn) helpBtn.click();
+  });
+  menu.appendChild(itemHelp);
+
+  // Posicionamiento: anchored al `+` via getBoundingClientRect. Por
+  // default arriba del botón (el composer vive abajo de la pantalla,
+  // arriba es más intuitivo + no se tapa con el teclado en mobile).
+  // Si arriba no entra (poco espacio entre top del viewport y el `+`),
+  // fallback a abajo. Position fixed para que no se reposicione si
+  // el composer scrollea internamente.
+  document.body.appendChild(menu);
+  const btnRect = composerPlusBtn.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const margin = 6;
+  let top = btnRect.top - menuRect.height - margin;
+  let placement = "above";
+  if (top < 8) {
+    top = btnRect.bottom + margin;
+    placement = "below";
+  }
+  let left = btnRect.left;
+  // Clamp horizontal: si el menú se sale por la derecha, alineamos
+  // al right edge del botón menos el ancho del menú.
+  const vw = window.innerWidth;
+  if (left + menuRect.width > vw - 8) {
+    left = Math.max(8, vw - menuRect.width - 8);
+  }
+  menu.style.position = "fixed";
+  menu.style.top = `${top}px`;
+  menu.style.left = `${left}px`;
+  menu.dataset.placement = placement;
+
+  _composerPlusMenu = menu;
+  // Focus al primer item — keyboard users pueden Enter directo.
+  itemAttach.focus({ preventScroll: true });
+
+  // Listeners globales para cerrar — en capture phase para ganarle a
+  // otros handlers que pudieran stopPropagation.
+  document.addEventListener("click", _composerPlusMenuOutsideClick, true);
+  document.addEventListener("keydown", _composerPlusMenuKeydown, true);
+  window.addEventListener("resize", _closeComposerPlusMenu);
+  window.addEventListener("scroll", _closeComposerPlusMenu, true);
+}
+
+if (composerPlusBtn) {
+  composerPlusBtn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    _openComposerPlusMenu();
+  });
+}
+
+// ── File input change → upload + render ────────────────────────────────
+// Triggered when user selecciona archivo desde el menú "📎 Adjuntar
+// imagen". Crea un mini-card de loading inmediato, postea el archivo
+// a /api/chat/upload-image, y según la respuesta del backend:
+//   action="created"           → reusar appendCreatedChip()
+//   action="needs_confirmation" → reusar appendProposal()
+//   action="noop"              → el card de loading muta a mensaje
+//                                 explicativo (no hay nada agendable)
+if (composerFileInput) {
+  composerFileInput.addEventListener("change", async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    // Reset value para permitir re-seleccionar el mismo archivo después
+    // (sin esto, change no dispara la segunda vez con el mismo file).
+    ev.target.value = "";
+
+    // Pre-validación client-side de tamaño (12MB = backend limit). Cortamos
+    // antes del upload para no gastar el round-trip si el user agarró un
+    // RAW de 50MB. El backend igual valida — esto es UX, no security.
+    const MAX_SIZE = 12 * 1024 * 1024;
+    if (file.size > MAX_SIZE) {
+      showToast(`✗ Imagen muy grande (${_formatFileSize(file.size)} — max 12MB)`, "err");
+      return;
+    }
+    // Mismo check para tipo: el backend acepta image/*, pero si el OS
+    // dejó pasar otra cosa cortamos acá.
+    if (file.type && !file.type.startsWith("image/")) {
+      showToast(`✗ Solo imágenes (recibí ${file.type})`, "err");
+      return;
+    }
+
+    const uploadCard = createUploadStatusCard(file);
+    appendUploadCard(uploadCard);
+    scrollBottom();
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/chat/upload-image", {
+        method: "POST",
+        body: fd,
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      handleUploadResponse(uploadCard, data);
+      scrollBottom();
+    } catch (err) {
+      _renderUploadCardError(uploadCard, err.message || String(err));
+      showToast(`✗ ${err.message || err}`, "err");
+    }
+  });
+}
+
+// Helper: KB/MB humanos para el card de loading. <1KB → bytes, <1MB → KB,
+// >=1MB → MB con 1 decimal.
+function _formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Crea el mini-card que se inserta inmediatamente al subir (loading
+// state). Layout: thumbnail 64×64 · meta column (filename, size,
+// status). El status arranca en "procesando con OCR…" y muta a
+// chip/proposal/noop según la response. El thumb usa
+// URL.createObjectURL para preview local sin re-fetch (revocamos el
+// blob URL cuando el card se reemplace o muera, ver _revokeThumbBlob).
+function createUploadStatusCard(file) {
+  const card = el("div", "upload-card loading");
+  card.setAttribute("role", "status");
+  card.setAttribute("aria-live", "polite");
+
+  const thumb = document.createElement("img");
+  thumb.className = "upload-card-thumb";
+  thumb.alt = "Imagen subida";
+  // createObjectURL puede devolver null en navegadores antiguos / sandbox;
+  // si falla, dejamos el thumb vacío con bg gris (CSS).
+  try {
+    thumb.src = URL.createObjectURL(file);
+    card.dataset.thumbBlobUrl = thumb.src;
+  } catch (_) {
+    thumb.style.display = "none";
+  }
+  card.appendChild(thumb);
+
+  const meta = el("div", "upload-card-meta");
+  const name = el("div", "upload-card-name", file.name || "imagen");
+  meta.appendChild(name);
+  const size = el("div", "upload-card-size", _formatFileSize(file.size));
+  meta.appendChild(size);
+  const status = el("div", "upload-card-status", "procesando con OCR…");
+  meta.appendChild(status);
+  card.appendChild(meta);
+
+  return card;
+}
+
+// Inserta el card en el chat. Patrón: si hay un último .turn lo
+// usamos como parent (mantiene el scroll-with-conversation natural);
+// si no, creamos un turn nuevo. Mismo patrón que appendProposal cuando
+// se llama desde el SSE handler (línea 3745+).
+function appendUploadCard(card) {
+  let turn = messagesEl.lastElementChild;
+  if (!turn || !turn.classList || !turn.classList.contains("turn")) {
+    turn = appendTurn();
+  }
+  turn.appendChild(card);
+  return card;
+}
+
+function _revokeThumbBlob(card) {
+  const url = card && card.dataset && card.dataset.thumbBlobUrl;
+  if (url) {
+    try { URL.revokeObjectURL(url); } catch (_) {}
+    delete card.dataset.thumbBlobUrl;
+  }
+}
+
+function _renderUploadCardError(card, msg) {
+  card.classList.remove("loading");
+  card.classList.add("err");
+  const status = card.querySelector(".upload-card-status");
+  if (status) status.textContent = `✗ ${msg}`;
+}
+
+// Routing por response.action. Reusa appendCreatedChip y appendProposal
+// (ya existentes) — el card de loading se reemplaza por el output final
+// en el mismo lugar del DOM (parent del card original).
+function handleUploadResponse(uploadCard, data) {
+  const parent = uploadCard.parentNode;
+  if (!parent) return;
+
+  if (data.action === "created") {
+    const payload = {
+      kind: data.kind,
+      fields: data.fields || {},
+      event_uid: data.event_uid,
+      reminder_id: data.reminder_id,
+    };
+    _revokeThumbBlob(uploadCard);
+    uploadCard.remove();
+    appendCreatedChip(parent, payload);
+    showToast(
+      data.kind === "event"
+        ? "✓ Evento creado en Calendario"
+        : "✓ Recordatorio creado",
+      "ok",
+    );
+  } else if (data.action === "needs_confirmation") {
+    const payload = {
+      kind: data.kind,
+      proposal_id: `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      needs_clarification: !!data.needs_clarification,
+      fields: data.fields || {},
+    };
+    _revokeThumbBlob(uploadCard);
+    uploadCard.remove();
+    appendProposal(parent, payload);
+  } else {
+    // action === "noop" (o response inesperada → tratamos como noop con
+    // el reason crudo). El card muta in-place a mensaje explicativo.
+    const reason = data.reason || "";
+    const reasonMap = {
+      "ocr_empty_or_short": "No detecté texto suficiente en la imagen.",
+      "no_cita_detected": "No detecté fecha/hora ni motivo agendable en la imagen.",
+      "kind_not_actionable": "La imagen tiene texto pero no parece algo agendable.",
+    };
+    let userMsg = reasonMap[reason] || (reason ? `No procesé la imagen: ${reason}` : "No procesé la imagen.");
+    if (reason.startsWith("ocr_error") || reason.startsWith("detector_error")) {
+      userMsg = `Error procesando: ${reason}`;
+      uploadCard.classList.add("err");
+    } else {
+      uploadCard.classList.add("noop");
+    }
+    uploadCard.classList.remove("loading");
+    const status = uploadCard.querySelector(".upload-card-status");
+    if (status) status.textContent = userMsg;
+  }
 }
 
 // ── Mic button: stub — muestra un system message explicando que viene. ──

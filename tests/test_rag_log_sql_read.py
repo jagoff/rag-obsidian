@@ -36,12 +36,24 @@ def _open_db(tmp_path: Path) -> sqlite3.Connection:
 
 
 @pytest.fixture
-def sql_env(tmp_path, monkeypatch):
-    """Redirect `DB_PATH` so `_ragvec_state_conn()` points at a clean tmp db."""
-    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+def sql_env(tmp_path):
+    """Redirect `DB_PATH` so `_ragvec_state_conn()` points at a clean tmp db.
+
+    Restauración explícita en finally (en vez de `monkeypatch.setattr`)
+    para evitar el warning falso `rag.DB_PATH leaked from test` —
+    causa: el conftest autouse `_stabilize_rag_state` chequea DB_PATH
+    en su teardown que corre ANTES del teardown de monkeypatch (FIFO
+    de fixtures independientes), así que ve DB_PATH todavía apuntando
+    a tmp_path. Mismo patrón que `tests/test_reminder_wa_push.py`.
+    """
+    snap_db = rag.DB_PATH
+    rag.DB_PATH = tmp_path
     conn = _open_db(tmp_path)
-    yield tmp_path, conn
-    conn.close()
+    try:
+        yield tmp_path, conn
+    finally:
+        conn.close()
+        rag.DB_PATH = snap_db
 
 
 # ── _read_queries_for_log ─────────────────────────────────────────────

@@ -742,3 +742,96 @@ def test_parse_scheduled_for_garbage_raises_value_error():
     import web.server as _server
     with pytest.raises(ValueError):
         _server._parse_scheduled_for_to_utc("garbage")
+
+
+# ── Plist registration / XML validity ───────────────────────────────────
+#
+# Tests para evitar el bug del 2026-04-25: el plist de wa-scheduled-send
+# se shippeo en commit 9740fa1 pero al user le quedó NO instalado porque
+# yo lo dejé como TODO ("corré rag setup"). Estos tests garantizan que
+# (1) el plist está registrado en la lista que `rag setup` consume — si
+# alguien refactorea la lista y se olvida del nuestro, el test grita;
+# (2) el XML generado por `_wa_scheduled_send_plist` es válido (parseable
+# como plist real) y tiene los campos esperados — si alguien rompe el
+# template (mismatched braces, key fuera de orden, etc.), el test grita
+# antes de que un launchctl bootstrap real falle silenciosamente.
+
+
+def test_wa_scheduled_send_plist_is_registered_in_services_spec():
+    """`com.fer.obsidian-rag-wa-scheduled-send` debe estar en la lista
+    que `rag setup` consume para instalar los daemons. Sin este registro
+    el plist nunca se copia a ~/Library/LaunchAgents/ y el worker no
+    arranca.
+    """
+    import rag as _rag
+    spec = _rag._services_spec("/Users/fer/.local/bin/rag")
+    labels = [t[0] for t in spec]
+    assert "com.fer.obsidian-rag-wa-scheduled-send" in labels, (
+        "El plist del worker de mensajes WhatsApp programados no está "
+        "registrado en _services_spec — `rag setup` no lo va a instalar. "
+        f"Plists registrados: {labels}"
+    )
+    # Triple sanity-check: la tupla tiene la forma (label, filename, xml).
+    entry = next(t for t in spec if t[0] == "com.fer.obsidian-rag-wa-scheduled-send")
+    assert len(entry) == 3
+    assert entry[1] == "com.fer.obsidian-rag-wa-scheduled-send.plist"
+    assert "<?xml" in entry[2]
+
+
+def test_wa_scheduled_send_plist_xml_is_valid_and_has_expected_fields():
+    """El XML generado por `_wa_scheduled_send_plist(rag_bin)` debe ser
+    parseable por plistlib (== launchd lo va a aceptar al bootstrap)
+    y tener los campos críticos: Label correcto, ProgramArguments con
+    el subcomando, StartInterval=300, paths de log apuntando a
+    `_RAG_LOG_DIR`.
+    """
+    import plistlib
+    import rag as _rag
+
+    rag_bin = "/Users/fer/.local/bin/rag"
+    xml = _rag._wa_scheduled_send_plist(rag_bin)
+
+    # 1) plistlib parsea sin excepción (== XML válido + plist syntax).
+    parsed = plistlib.loads(xml.encode("utf-8"))
+
+    # 2) Campos requeridos por launchd:
+    assert parsed["Label"] == "com.fer.obsidian-rag-wa-scheduled-send"
+    assert parsed["ProgramArguments"] == [rag_bin, "wa-scheduled-send"]
+
+    # 3) Cadencia: 300s = 5min (decisión del user 2026-04-25, igual al
+    # cron de reminder-wa-push). Si alguien cambia esto sin pensar, los
+    # mensajes programados pueden llegar tarde por minutos.
+    assert parsed["StartInterval"] == 300
+
+    # 4) RunAtLoad=False — no queremos que un push de código nuevo
+    # spamee mensajes pendientes inesperadamente al daemon recargar.
+    assert parsed.get("RunAtLoad") is False
+
+    # 5) Logs apuntan al log dir del proyecto (no a /tmp ni similar).
+    # Tolerante: el dir exacto depende de _RAG_LOG_DIR pero el filename
+    # debe ser consistente.
+    assert parsed["StandardOutPath"].endswith("/wa-scheduled-send.log")
+    assert parsed["StandardErrorPath"].endswith("/wa-scheduled-send.error.log")
+
+    # 6) Env vars mínimos para que el subcomando corra fuera de un
+    # shell interactivo: HOME, PATH, NO_COLOR, TERM=dumb (sin esto,
+    # rich rompería en stderr porque cree que tiene TTY).
+    env = parsed["EnvironmentVariables"]
+    assert "HOME" in env
+    assert "PATH" in env
+    assert env.get("NO_COLOR") == "1"
+    assert env.get("TERM") == "dumb"
+
+
+def test_wa_scheduled_send_plist_uses_correct_rag_binary():
+    """El plist debe ejecutar EXACTAMENTE el rag_bin que se le pasa.
+    Si rag se mueve (ej. de ~/.local/bin a /opt/homebrew/bin tras
+    `uv tool install`), el path en el plist debe reflejarlo. Bug típico:
+    hardcodear el path en lugar de usar el arg.
+    """
+    import plistlib
+    import rag as _rag
+    custom_bin = "/opt/custom/path/to/rag"
+    xml = _rag._wa_scheduled_send_plist(custom_bin)
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    assert parsed["ProgramArguments"][0] == custom_bin

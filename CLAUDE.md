@@ -887,3 +887,71 @@ The `.bak.<ts>` files under `~/.local/share/obsidian-rag/` are still there (kept
 Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Override: `OBSIDIAN_RAG_VAULT` env var. Collections namespaced per vault (sha256[:8]).
 
 Claude Code memory (`~/.claude/projects/-Users-fer/memory/`) is symlinked into vault at `04-Archive/99-obsidian-system/99-Claude/memory/`.
+
+## Features que dependen de launchd: dejá el daemon ACTIVO al cerrar el commit
+
+**Regla universal del repo**: cuando una feature nueva se completa con un plist `com.fer.obsidian-rag-*`, el daemon tiene que estar **cargado y verificado** al cierre del turno. NO dejar como TODO "corré `rag setup` cuando puedas". Una feature con cron-dependent behavior **no está completa** hasta que se demuestra que ejecuta sola.
+
+Aprendido el 2026-04-25 con `com.fer.obsidian-rag-wa-scheduled-send` (worker de mensajes WhatsApp programados): el código + plist factory se shippearon en el commit `9740fa1`, pero el archivo nunca se copió a `~/Library/LaunchAgents/`. El user programó un mensaje, esperó la hora, y nada — el worker no existía como proceso. La feature parecía rota cuando en realidad solo faltaba el último paso operativo.
+
+### Checklist al agregar un plist nuevo
+
+1. **Código**: factory `_<nombre>_plist(rag_bin: str)` + tuple en la lista de [`rag/__init__.py:39190+`](rag/__init__.py) que `rag setup` consume.
+2. **Click subcommand**: el comando que el plist ejecuta (`@cli.command("...")`).
+3. **Smoke del comando manual**: `rag <subcomando> --dry-run` corre sin error y reporta.
+4. **Generar el plist y copiarlo**:
+   ```bash
+   .venv/bin/python -c "import rag; print(rag._<nombre>_plist('/Users/fer/.local/bin/rag'))" \
+     > ~/Library/LaunchAgents/com.fer.obsidian-rag-<nombre>.plist
+   ```
+5. **Cargar con launchctl**:
+   ```bash
+   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.fer.obsidian-rag-<nombre>.plist
+   ```
+6. **Verificar que está vivo**:
+   ```bash
+   launchctl list | grep obsidian-rag-<nombre>          # debe aparecer con state 0 o running
+   launchctl print gui/$UID/com.fer.obsidian-rag-<nombre>  # ver run interval, last exit, runs
+   ```
+7. **Esperar al menos un tick** (o `launchctl kickstart -k gui/$UID/com.fer.obsidian-rag-<nombre>` para forzar el primer run) y verificar que el log se generó:
+   ```bash
+   tail -20 ~/.local/share/obsidian-rag/<nombre>.log
+   ```
+8. **Solo después** del paso 7, marcar la feature como completa.
+
+### Daemons activos del proyecto (referencia)
+
+Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` muestre):
+
+| Plist | Cadencia | Comando | Propósito |
+|---|---|---|---|
+| `com.fer.obsidian-rag-watch` | filesystem watcher | `rag watch` | Auto-reindex del vault |
+| `com.fer.obsidian-rag-serve` | KeepAlive | `rag serve` | MCP server |
+| `com.fer.obsidian-rag-web` | KeepAlive | `web/server.py` | Web UI + chat |
+| `com.fer.obsidian-rag-digest` | semanal | `rag digest` | Brief semanal |
+| `com.fer.obsidian-rag-morning` | calendar 7am L-V | `rag morning` | Brief matinal |
+| `com.fer.obsidian-rag-today` | calendar 22hs L-V | `rag today` | Brief vespertino |
+| `com.fer.obsidian-rag-wake-up` | calendar | `rag wake-up` | Setup post-sleep |
+| `com.fer.obsidian-rag-emergent` | viernes 10am | `rag emergent` | Detector de temas emergentes |
+| `com.fer.obsidian-rag-patterns` | domingo 20:00 | `rag patterns` | Alertas de feedback |
+| `com.fer.obsidian-rag-archive` | weekly | `rag archive` | Auto-archivo de notas muertas |
+| `com.fer.obsidian-rag-wa-tasks` | 30min | `rag wa-tasks` | Extracción de tareas WhatsApp |
+| `com.fer.obsidian-rag-reminder-wa-push` | 5min | `rag remind-wa` | Push de Reminders al WA |
+| `com.fer.obsidian-rag-wa-scheduled-send` | 5min | `rag wa-scheduled-send` | **(nuevo 2026-04-25)** Worker de mensajes WA programados |
+| `com.fer.obsidian-rag-anticipate` | 10min | `rag anticipate` | Anticipatory agent |
+| `com.fer.obsidian-rag-auto-harvest` | weekly | `rag auto-harvest` | Auto-tune feedback |
+| `com.fer.obsidian-rag-online-tune` | nightly 03:30 | `rag tune --apply` | Ranker-vivo nightly |
+| `com.fer.obsidian-rag-calibrate` | nightly | `rag calibrate` | Score calibration |
+| `com.fer.obsidian-rag-maintenance` | weekly | `rag maintenance` | Vacuum + WAL checkpoint + log rotation |
+| `com.fer.obsidian-rag-consolidate` | nightly | `rag consolidate` | Memory consolidation |
+| `com.fer.obsidian-rag-ingest-{whatsapp,gmail,reminders,calendar}` | varios | `rag ingest <source>` | Cross-source ingesters |
+
+Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py:39190+`](rag/__init__.py) (función `_plists_to_install` o similar — `grep "_plists" rag/__init__.py`).
+
+### Bypass: `rag setup` también funciona
+
+Si la feature shippea junto con cambios al `rag setup` (o si el user prefiere reinstalar todo en bloque), `rag setup` instala/recarga TODOS los plists de la tabla anterior. Es más invasivo (puede recargar daemons que ya estaban corriendo bien) pero menos manual. Como compromiso: para plists nuevos individuales → recipe del checklist. Para refactors masivos → `rag setup`.
+
+### Cuándo NO instalar el plist en el commit
+
+Excepción legítima: si la feature requiere config previo del user (ej. OAuth de Gmail, ambient.json, etc.) y el plist crashea sin eso. En ese caso, el commit msg debe decir explícitamente "el plist NO se instala automáticamente porque requiere `<X>` primero" — no "corré `rag setup` cuando puedas" sin más contexto. El [`com.fer.obsidian-rag-ingest-calendar.plist`](rag/__init__.py) es ejemplo: `rag setup` lo skipea si `~/.calendar-mcp/credentials.json` no existe.

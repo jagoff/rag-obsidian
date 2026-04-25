@@ -4589,6 +4589,96 @@ _HOME_BG_INTERVAL = 300.0
 # ollama anyway, and we only care about "nobody chatting" vs "someone is".
 _CHAT_INFLIGHT = 0
 _CHAT_INFLIGHT_LOCK = threading.Lock()
+# Rolling window of recent home-compute totals (seconds). Powers the
+# `degraded` SSE event: when an in-flight stream exceeds 2× the median
+# of this window, we emit a one-shot `degraded` event with a probable
+# cause (ollama state / memory pressure) so the UI can surface "esto
+# está más lento de lo normal" instead of just spinning silently.
+# Bounded to last 20 entries (≈10min at the 30s prewarmer cadence + 60s
+# auto-refresh) — old enough to capture day-to-day variance, recent
+# enough not to anchor on stale baselines after a restart.
+_HOME_COMPUTE_HISTORY: list[float] = []
+_HOME_COMPUTE_HISTORY_LOCK = threading.Lock()
+_HOME_COMPUTE_HISTORY_MAX = 20
+# Floor below which we don't bother computing degraded thresholds —
+# avoids spamming "degraded" early on when we only have 1-2 samples
+# from a fast warm cache (≈1.5s) and 2× would fire on any cold-ish run.
+_HOME_COMPUTE_DEGRADED_FLOOR = 8.0
+
+
+def _record_home_compute_total(elapsed_s: float) -> None:
+    if elapsed_s <= 0 or elapsed_s > 600:
+        return  # ignore obvious outliers
+    with _HOME_COMPUTE_HISTORY_LOCK:
+        _HOME_COMPUTE_HISTORY.append(elapsed_s)
+        if len(_HOME_COMPUTE_HISTORY) > _HOME_COMPUTE_HISTORY_MAX:
+            _HOME_COMPUTE_HISTORY.pop(0)
+
+
+def _home_compute_degraded_threshold() -> float:
+    """Median × 2 over the rolling window, clamped to the floor.
+
+    Median over mean → resistant to a single anomalous run. Less than
+    3 samples → return floor so we don't fire prematurely after restart.
+    """
+    with _HOME_COMPUTE_HISTORY_LOCK:
+        snap = list(_HOME_COMPUTE_HISTORY)
+    if len(snap) < 3:
+        return _HOME_COMPUTE_DEGRADED_FLOOR
+    snap.sort()
+    median = snap[len(snap) // 2]
+    return max(_HOME_COMPUTE_DEGRADED_FLOOR, median * 2.0)
+
+
+def _diagnose_home_slowdown() -> dict:
+    """Best-effort sniff of *why* a home-compute is slow. Returns a
+    dict with `cause: str` and `details: dict`.
+
+    Probes are cheap — a 500ms ollama HTTP timeout, a vm_stat read, a
+    reranker-load-time check. We never block the SSE stream more than
+    ~1s on these.
+    """
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    details: dict = {}
+
+    # 1. Ollama health — slow `/api/tags` typically means model swap or
+    #    daemon unloading something big. 500ms budget covers warm and
+    #    flags genuine wedges.
+    ollama_state = "ok"
+    ollama_t0 = time.time()
+    try:
+        req = _ur.Request("http://localhost:11434/api/tags", method="GET")
+        with _ur.urlopen(req, timeout=0.5) as resp:
+            resp.read()
+    except _ue.URLError:
+        ollama_state = "unreachable"
+    except TimeoutError:
+        ollama_state = "slow"
+    except Exception:
+        ollama_state = "error"
+    details["ollama_ms"] = round((time.time() - ollama_t0) * 1000.0, 1)
+    details["ollama_state"] = ollama_state
+
+    # 2. Memory pressure — wired+active+compressed pct on macOS. >85%
+    #    aligns with the watchdog threshold that evicts the chat model.
+    try:
+        import rag as _rag
+        used_pct = _rag._system_memory_used_pct()
+        if used_pct is not None:
+            details["mem_used_pct"] = round(used_pct, 1)
+    except Exception:
+        pass
+
+    # Pick the dominant cause for the UI label.
+    if ollama_state in ("unreachable", "slow", "error"):
+        cause = f"ollama_{ollama_state}"
+    elif details.get("mem_used_pct", 0) >= 85:
+        cause = "memory_pressure"
+    else:
+        cause = "unknown"
+    return {"cause": cause, "details": details}
 # Persist cache to disk so service restarts don't force a 30-45s cold
 # compute on the next user visit. Disk payload is served immediately
 # (stale OK — SWR refreshes in bg within seconds).
@@ -4630,7 +4720,9 @@ def _home_refresh(regenerate: bool = False) -> None:
     _HOME_STATE["payload"] = payload
     _HOME_STATE["body"] = body
     _HOME_STATE["ts"] = now
-    print(f"[home-refresh] compute={(now - t0):.2f}s regen={regenerate}", file=sys.stderr)
+    elapsed = now - t0
+    _record_home_compute_total(elapsed)
+    print(f"[home-refresh] compute={elapsed:.2f}s regen={regenerate}", file=sys.stderr)
     _persist_home_cache(body, now)
 
 
@@ -4766,10 +4858,23 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         # still there. 1s is a balance between snappy cancel and
         # overhead (each probe is ~50µs).
         DISCONNECT_PROBE_S = 1.0
-        # Hard cap matches the worst-case sum of per-fetcher budgets
-        # (today=30 + signals=45 + tail=15 cushion). Anything past this
-        # means a fetcher is wedged — emit an explicit error.
-        HARD_CAP_S = 90.0
+        # Hard cap on the SSE stream itself (not on the underlying
+        # `_home_compute` worker — that one continues to use its own
+        # per-fetcher budgets and writes to disk via the SWR path).
+        #
+        # 30s is empirically generous — `_home_compute` typical cold
+        # is 6-10s, P95 is ~15s, the worst-recorded outlier in 7d was
+        # 21.5s during an ollama eviction event. 30s gives ~40% margin
+        # over that outlier.
+        #
+        # Pre-2026-04-24 cap was 90s, which was the SUM of nominal
+        # per-fetcher budgets — but those run in parallel, not serial.
+        # The 90s cap meant a wedged stream tied up an asyncio task +
+        # one executor thread + a worker thread for 1.5min, hurting
+        # the next visitor when several stale clients piled up
+        # (browser background tab keeps the EventSource alive).
+        # 30s frees those resources 3× faster on a wedge.
+        HARD_CAP_S = 30.0
 
         worker = threading.Thread(target=_runner, name="home-stream", daemon=True)
         worker.start()
@@ -4802,6 +4907,13 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
         last_event = t0
         finished = False
         loop = asyncio.get_running_loop()
+        # Degraded watchdog: emit a one-shot `degraded` event when the
+        # in-flight stream exceeds 2× the rolling median (clamped to
+        # _HOME_COMPUTE_DEGRADED_FLOOR). The probe runs `_diagnose_home_slowdown`
+        # (cheap: 500ms ollama HEAD + vm_stat read) so the UI gets a
+        # probable cause label instead of just "lento".
+        degraded_threshold = _home_compute_degraded_threshold()
+        degraded_emitted = False
 
         try:
             while not finished:
@@ -4812,6 +4924,19 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                     })
                     cancel_event.set()
                     break
+
+                # One-shot degraded probe — fires once when we cross
+                # threshold and haven't seen `done` yet. The probe runs
+                # in the executor too (urllib + vm_stat are blocking).
+                if not degraded_emitted and elapsed >= degraded_threshold:
+                    diag = await loop.run_in_executor(None, _diagnose_home_slowdown)
+                    yield _sse("degraded", {
+                        "elapsed_ms": round(elapsed * 1000.0, 1),
+                        "threshold_ms": round(degraded_threshold * 1000.0, 1),
+                        **diag,
+                    })
+                    degraded_emitted = True
+                    last_event = time.time()
 
                 # Disconnect probe before blocking on the queue.
                 with suppress(Exception):
@@ -4846,6 +4971,8 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                 yield _sse(kind, payload)
                 if kind == "done":
                     # Persist + cache so the next /api/home is instant.
+                    # Also feed the rolling history so the next stream's
+                    # degraded threshold reflects this run.
                     with suppress(Exception):
                         body = json.dumps(payload, default=str).encode()
                         now = time.time()
@@ -4853,6 +4980,7 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                         _HOME_STATE["body"] = body
                         _HOME_STATE["ts"] = now
                         _persist_home_cache(body, now)
+                    _record_home_compute_total(time.time() - t0)
                     finished = True
                     break
                 if kind == "error":
@@ -4878,15 +5006,26 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
 
 _HOME_PREWARMER_STARTED = False
 
-# Opt-in prewarmer. Default OFF because the fan-out (12 channel fetchers
-# including ollama-based signals) holds the ollama daemon mid-cycle and
-# starves concurrent /api/chat requests — even a 300s interval isn't
-# enough because a chat arriving mid-cycle still waits for the 7-27s
-# compute to finish before its embed call gets served. The home page
-# already uses SWR: first visit pays a cold compute (~10s), subsequent
-# visits are instant with a bg refresh. That's the right trade.
-# Set OBSIDIAN_RAG_HOME_PREWARM=1 to re-enable for display-only deploys.
-_HOME_PREWARM_ENABLED = os.environ.get("OBSIDIAN_RAG_HOME_PREWARM") == "1"
+# Prewarmer flipped a ON por default tras 2026-04-24 (cancel-on-disconnect +
+# `_CHAT_INFLIGHT` skip-cycle ya en su lugar). Pre-flip era opt-in porque
+# el fan-out (14 channel fetchers, varios pegando ollama) podía starvear
+# `/api/chat` mid-cycle. La protección actual:
+#
+#   1. Skip-cycle: si `_CHAT_INFLIGHT > 0`, el loop duerme 10s y reintenta.
+#      Un chat-en-curso garantiza que el prewarmer NO arranca un compute
+#      nuevo encima.
+#   2. Cancel-on-disconnect: si un cliente del SSE cierra la conexión,
+#      `cancel_event` propaga `pool.shutdown(cancel_futures=True)` —
+#      las pendientes se descartan, no se acumulan.
+#   3. Si la prewarmer-cycle SÍ está corriendo cuando llega un chat,
+#      ollama serializa los requests vía su propio scheduler (no hay
+#      doble carga del chat-model — el prewarmer no lo toca, solo el
+#      chat-prewarmer tiene contacto con el chat-model).
+#
+# Beneficio: visitas post-restart instantáneas en vez de pagar 6-10s
+# cold compute la primera vez. Para deshabilitar (ej. perf debug):
+# `OBSIDIAN_RAG_HOME_PREWARM=0` en el plist o en el shell del proceso.
+_HOME_PREWARM_ENABLED = os.environ.get("OBSIDIAN_RAG_HOME_PREWARM", "1") not in ("0", "false", "no")
 
 def _ensure_home_prewarmer() -> None:
     """Start the pre-warmer loop iff opt-in. Called from startup and from

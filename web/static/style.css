@@ -2195,6 +2195,25 @@ kbd {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* Mobile: input/textarea de proposal cards a 16px para evitar el
+   auto-zoom de iOS Safari al focusear. El font visualmente sigue
+   chico-ish (16px sigue siendo "body" en iOS); en desktop dejamos
+   13px (más compact, más cards visibles a la vez). */
+@media (max-width: 480px), (pointer: coarse) {
+  .proposal-wa-text {
+    font-size: 16px;
+  }
+}
+
+/* Tap polish para los botones de propuestas en mobile: matar el delay
+   de 300ms del tap + el highlight azul de Safari (ya tenemos hover/
+   focus rings). También aplica a buttons del slash popover. */
+.proposal-btn,
+.proposal-wa-link {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
 .proposal-whatsapp .proposal-btn-create {
   /* emphasize the send button a tad since it's not undoable — subtle
      solid fill vs. the reminder/event border-only style */
@@ -5903,6 +5922,25 @@ kbd {
 .proposal-wa-text:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* Mobile: input/textarea de proposal cards a 16px para evitar el
+   auto-zoom de iOS Safari al focusear. El font visualmente sigue
+   chico-ish (16px sigue siendo "body" en iOS); en desktop dejamos
+   13px (más compact, más cards visibles a la vez). */
+@media (max-width: 480px), (pointer: coarse) {
+  .proposal-wa-text {
+    font-size: 16px;
+  }
+}
+
+/* Tap polish para los botones de propuestas en mobile: matar el delay
+   de 300ms del tap + el highlight azul de Safari (ya tenemos hover/
+   focus rings). También aplica a buttons del slash popover. */
+.proposal-btn,
+.proposal-wa-link {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .proposal-whatsapp .proposal-btn-create {
   /* emphasize the send button a tad since it's not undoable — subtle

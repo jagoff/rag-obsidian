@@ -383,3 +383,61 @@ def _stabilize_rag_state():
                 stacklevel=2,
             )
             _rag._TELEMETRY_DB_FILENAME = snap_telemetry_db
+
+
+# ── Session-end leak guard for sql_state_errors.jsonl ────────────────────
+#
+# Tests que ejercen el retry budget (test_sql_lock_retry, test_web_sql_retry_budget)
+# usan `_log_sql_state_error("test_tag", ...)` adrede para verificar el
+# camino de fall-through. Sin un fixture que redirija
+# `_SQL_STATE_ERROR_LOG` al `tmp_path`, esos hits se appendan al JSONL
+# de PRODUCCIÓN (`~/.local/share/obsidian-rag/sql_state_errors.jsonl`),
+# después salen como `event=test_tag` en el dashboard `/api/status/errors`
+# y contaminan los rollups de 24h.
+#
+# Auditoría 2026-04-24 detectó 161 entradas `test_tag` así. Fix concreto
+# fue agregar el autouse fixture en cada archivo de tests; este guard
+# session-scoped es el safety net: si un futuro test bypassea el fixture,
+# el leak se detecta al final del run en vez de quedar latente meses.
+#
+# Mecanismo: snapshot del file size + último timestamp ANTES de la suite,
+# diff DESPUÉS. Cualquier entrada `event=test_tag` aparecida durante el
+# run dispara un `pytest.fail(...)` en el teardown de session.
+@pytest.fixture(scope="session", autouse=True)
+def _detect_test_tag_leak_to_prod_jsonl():
+    import json as _json
+    import rag as _rag
+
+    real_path = Path(_rag._SQL_STATE_ERROR_LOG)
+    snap_size = real_path.stat().st_size if real_path.is_file() else 0
+    yield
+    if not real_path.is_file():
+        return
+    new_size = real_path.stat().st_size
+    if new_size <= snap_size:
+        return
+    # Read just the appended slice (avoid loading megabytes if the file is huge).
+    leaked: list[str] = []
+    try:
+        with real_path.open("rb") as f:
+            f.seek(snap_size)
+            for raw in f.read().splitlines():
+                try:
+                    rec = _json.loads(raw)
+                except Exception:
+                    continue
+                if rec.get("event") == "test_tag":
+                    leaked.append(rec.get("ts", "?"))
+    except Exception:
+        return
+    if leaked:
+        warnings.warn(
+            f"\n  test_tag LEAK DETECTED: {len(leaked)} entries appended to "
+            f"production {real_path} during this session.\n"
+            f"  Some test ran `_log_sql_state_error('test_tag', ...)` without\n"
+            f"  the autouse `_isolate_sql_state_error_log` fixture. First ts: "
+            f"{leaked[0]}.\n"
+            f"  Fix: add the fixture (see tests/test_sql_lock_retry.py for the\n"
+            f"  reference pattern) to whichever test file is bypassing it.",
+            stacklevel=2,
+        )

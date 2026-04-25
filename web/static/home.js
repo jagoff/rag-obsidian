@@ -164,6 +164,46 @@ function bumpStageTotal(totalMs) {
   if (t) t.textContent = `${(totalMs / 1000).toFixed(1)}s`;
 }
 
+// Map server-side `cause` → human-readable label. Anything else falls
+// through to "tarda más de lo normal".
+const DEGRADED_LABELS = {
+  ollama_unreachable: "Ollama no responde",
+  ollama_slow: "Ollama lento (probablemente cargando un modelo)",
+  ollama_error: "Ollama devolvió error",
+  memory_pressure: "memoria saturada — el watchdog probablemente desalojó algo",
+  unknown: "tarda más de lo normal — sin causa identificada",
+};
+
+function renderDegradedBanner({ cause, details, elapsed_ms, threshold_ms }) {
+  if (!els.stages) return;
+  const label = DEGRADED_LABELS[cause] || DEGRADED_LABELS.unknown;
+  const elapsedS = ((elapsed_ms || 0) / 1000).toFixed(1);
+  const thresholdS = ((threshold_ms || 0) / 1000).toFixed(1);
+  const detailBits = [];
+  if (details && typeof details === "object") {
+    if (typeof details.ollama_ms === "number") {
+      detailBits.push(`ollama ${details.ollama_ms.toFixed(0)}ms`);
+    }
+    if (typeof details.mem_used_pct === "number") {
+      detailBits.push(`mem ${details.mem_used_pct.toFixed(0)}%`);
+    }
+  }
+  const detailStr = detailBits.length ? ` · ${detailBits.join(" · ")}` : "";
+  const banner = document.createElement("div");
+  banner.className = "rs-degraded";
+  banner.innerHTML = `
+    <span class="gly">⚠</span>
+    <span class="lbl">${label}</span>
+    <span class="ms">${elapsedS}s vs umbral ${thresholdS}s${detailStr}</span>`;
+  // Insert right after the head so it sits above the chips.
+  const head = els.stages.querySelector(".rs-head");
+  if (head && head.nextSibling) {
+    els.stages.insertBefore(banner, head.nextSibling);
+  } else {
+    els.stages.appendChild(banner);
+  }
+}
+
 // Refresh buttons live inside the narrative card (inline when the brief is
 // pending, icon-only corner when the brief exists). Both carry class
 // `.js-refresh` so loading-state and click delegation don't care which one
@@ -1170,6 +1210,15 @@ function loadViaStream(regenerate) {
         // visually obvious (numero sigue subiendo aun cuando ningún
         // chip cambia de estado).
         totalTimer = setInterval(() => bumpStageTotal(Date.now() - t0), 250);
+      } catch (_) {}
+    });
+    es.addEventListener("degraded", (ev) => {
+      // Server detectó que esta corrida está pasando 2× el baseline.
+      // Mostrar un banner discreto con la causa probable para que el
+      // user no se quede mirando un chip ◐ sin contexto.
+      try {
+        const { cause, details, elapsed_ms, threshold_ms } = JSON.parse(ev.data);
+        renderDegradedBanner({ cause, details, elapsed_ms, threshold_ms });
       } catch (_) {}
     });
     es.addEventListener("stage", (ev) => {

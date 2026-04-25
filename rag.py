@@ -39397,6 +39397,57 @@ def _today_plist(rag_bin: str) -> str:
 """
 
 
+def _reminder_wa_push_plist(rag_bin: str) -> str:
+    """Apple Reminders → WhatsApp push — every 5 minutes.
+
+    Reads pending Reminders via `_fetch_reminders_due`, filters to the
+    `[now - 5min, now + 5min]` window (matching the cadence), and pushes
+    each unmarked one to the ambient JID through the local bridge.
+    Idempotent via `rag_reminder_wa_pushed` (PK reminder_id) — a single
+    reminder is notified once even if the cron fires several times before
+    the user dismisses it.
+
+    Tighter cadence than `wa-tasks` (5min vs 30min) because reminder
+    push is time-sensitive: a reminder set for "10 minutes from now"
+    on a 30min cron would notify ~25min after due, which defeats the
+    feature. 5min is the sweet spot — overlapping window means even a
+    cron that misses one cycle (machine sleep / launchd backoff)
+    catches the reminder on the next run.
+
+    Cost per cycle: one osascript call (Reminders.app), one or two SQL
+    upserts when there's something to push, zero LLM calls. Sub-200ms
+    typical.
+
+    Silent-fail on missing ambient.json or `reminder_push_enabled=false`
+    in the config — exit 0 with `reason` field in the summary so the
+    log is informative without flooding stderr.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-reminder-wa-push</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>remind-wa</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/reminder-wa-push.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/reminder-wa-push.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _wa_tasks_plist(rag_bin: str) -> str:
     """WhatsApp action-item extractor — every 30min.
 
@@ -40031,6 +40082,14 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _archive_plist(rag_bin)),
         ("com.fer.obsidian-rag-wa-tasks", "com.fer.obsidian-rag-wa-tasks.plist",
          _wa_tasks_plist(rag_bin)),
+        # Reminder push — Apple Reminders due en una ventana corta se
+        # notifican al JID ambient via WhatsApp bridge. Cron a 5min
+        # porque la feature es time-sensitive (un reminder en 10min
+        # tiene que llegar antes de los 10min, no a los 25min como con
+        # el cron de wa-tasks).
+        ("com.fer.obsidian-rag-reminder-wa-push",
+         "com.fer.obsidian-rag-reminder-wa-push.plist",
+         _reminder_wa_push_plist(rag_bin)),
         ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
          _auto_harvest_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",

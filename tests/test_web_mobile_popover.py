@@ -361,3 +361,28 @@ def test_dashboard_header_wraps_on_mobile():
         "dashboard.html <header> necesita flex-wrap:wrap para que en "
         "mobile h1 + meta no se overlap"
     )
+
+
+# ── Empty state compacto del contacts popover ─────────────────────────────
+
+
+def test_empty_state_popover_collapses_height():
+    """Cuando el user tipea `/wzp zzzz` y no matchea ningún contacto,
+    el popover sólo contiene un mensaje "sin contactos". Sin este fix
+    el popover reservaría 280px en mobile (max-height del container)
+    sólo para mostrar una línea de texto — un waste visual grande.
+
+    Fix: `.slash-popover:has(.slash-popover-empty:only-child)` overridea
+    el max-height a `none` (collapses al content natural, ~30-77px según
+    padding). `:has()` tiene >90% support (iOS 15.4+, Chrome 105+)."""
+    assert ".slash-popover:has(> .slash-popover-empty:only-child)" in _STYLE_CSS
+    # Y el override a max-height: none debe estar dentro de ese selector.
+    import re
+    pat = re.compile(
+        r'\.slash-popover:has\(>\s*\.slash-popover-empty:only-child\)\s*\{[^}]*max-height:\s*none',
+        re.DOTALL,
+    )
+    assert pat.search(_STYLE_CSS) is not None, (
+        "el selector :has() debe overridear max-height a `none` para que "
+        "el popover empty-state colapse al content mínimo"
+    )

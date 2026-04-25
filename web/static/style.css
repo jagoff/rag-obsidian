@@ -1177,6 +1177,15 @@ body {
   font-style: italic;
 }
 
+/* Compact empty state — un popover que sólo contiene el mensaje
+   "sin contactos" no debería reservar 280px de alto en mobile.
+   `:has()` es widely supported (iOS Safari 15.4+, Chrome 105+). El
+   fallback en browsers viejos: el popover queda con max-height
+   normal (no peor que el comportamiento previo). */
+.slash-popover:has(> .slash-popover-empty:only-child) {
+  max-height: none;
+}
+
 /* ── Mobile / touch — best practices ────────────────────────────────────
    Apple HIG + WCAG 2.5.5 AAA piden tap targets >=44x44px y body text
    >=15px en mobile. La altura del popover es el problema más sutil:
@@ -4940,6 +4949,15 @@ body {
   padding: 8px 10px;
   color: var(--text-faint);
   font-style: italic;
+}
+
+/* Compact empty state — un popover que sólo contiene el mensaje
+   "sin contactos" no debería reservar 280px de alto en mobile.
+   `:has()` es widely supported (iOS Safari 15.4+, Chrome 105+). El
+   fallback en browsers viejos: el popover queda con max-height
+   normal (no peor que el comportamiento previo). */
+.slash-popover:has(> .slash-popover-empty:only-child) {
+  max-height: none;
 }
 
 /* ── Mobile / touch — best practices ────────────────────────────────────

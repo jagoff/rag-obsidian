@@ -20888,15 +20888,8 @@ def _ambient_log_event(event: dict) -> None:
     _sql_write_with_retry(_do, "ambient_sql_write_failed")
 
 
-def _ambient_whatsapp_send(jid: str, text: str) -> bool:
-    """Fire-and-forget al bridge local de WhatsApp. Retorna True en 2xx.
-
-    POSTea a `http://localhost:8080/api/send` con body
-    `{recipient: <jid>, message: <text>}`. El listener del bot RAG
-    filtra mensajes que arrancan con U+200B (anti-loop) — se prefixa
-    acá para evitar que nuestro propio output se procese como query.
-    """
-    return _whatsapp_send_to_jid(jid, text, anti_loop=True)
+# `_ambient_whatsapp_send` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 # ── Reminder → WhatsApp push (rag wa-tasks runtime) ──────────────────────
@@ -21140,131 +21133,12 @@ def push_due_reminders_to_whatsapp(
     return summary
 
 
-def _whatsapp_send_to_jid(
-    jid: str,
-    text: str,
-    *,
-    anti_loop: bool = True,
-    reply_to: dict | None = None,
-) -> bool:
-    """Low-level POST al bridge local. Dos modos:
-
-    - ``anti_loop=True`` (default, usado por ``_ambient_whatsapp_send``):
-      prefixa U+200B para que el listener del bot RAG ignore el mensaje
-      como query entrante. Necesario cuando el bot se manda cosas a su
-      propio grupo (briefs matutinos, archive pushes, etc.).
-    - ``anti_loop=False``: texto literal. Usalo cuando el destinatario
-      es un contacto tercero (mensajes iniciados desde el chat del user
-      vía ``propose_whatsapp_send``), porque el prefix se vería como un
-      char raro en el WhatsApp del contacto.
-
-    ``reply_to`` (optional): cuando el caller quiere responder a un
-    mensaje específico con quote nativo de WhatsApp. Shape esperado:
-    ``{"message_id": str, "original_text": str, "sender_jid": str?}``.
-
-    Estado actual: el bridge local (whatsapp-mcp/whatsapp-bridge,
-    `main.go:707-771`) **NO soporta ``ContextInfo``/``QuotedMessage``**
-    out of the box — `SendMessageRequest` solo acepta
-    ``{recipient, message, media_path}`` y construye `msg.Conversation`
-    plano. Por eso pasamos el ``reply_to`` al payload pero el bridge lo
-    ignora silenciosamente; el mensaje sale como reply normal sin la
-    cita boxed que ves en la UI nativa de WhatsApp. La info igualmente
-    se loguea via el caller (auditoría + traceability) y la UI del
-    chat web muestra el contexto del mensaje original al user.
-
-    Cuando el bridge agregue soporte de quote, este helper ya pasa el
-    campo — bumpean el bridge y empiezan a salir las citas nativas sin
-    cambiar el cliente.
-
-    Retorna True en 2xx del bridge, False en cualquier otra cosa
-    (unreachable, 4xx, 5xx, timeout 10s).
-    """
-    import urllib.request
-    payload_text = text
-    if anti_loop and not text.startswith(_AMBIENT_ANTILOOP_MARKER):
-        payload_text = _AMBIENT_ANTILOOP_MARKER + text
-    body: dict = {
-        "recipient": jid,
-        "message": payload_text,
-    }
-    if reply_to and isinstance(reply_to, dict):
-        # Forward-compatible: el bridge actual ignora estos campos pero
-        # cuando agreguen ContextInfo los va a leer sin necesidad de
-        # tocar el cliente. Ver docstring arriba.
-        rt_id = reply_to.get("message_id") or reply_to.get("id")
-        if rt_id:
-            body["reply_to"] = {
-                "message_id": str(rt_id),
-                "original_text": str(reply_to.get("original_text") or reply_to.get("text") or "")[:1024],
-                "sender_jid": str(reply_to.get("sender_jid") or reply_to.get("from_jid") or ""),
-            }
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        AMBIENT_WHATSAPP_BRIDGE_URL, data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
-    except Exception:
-        return False
+# `_whatsapp_send_to_jid` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
-def _whatsapp_jid_from_contact(contact_name: str) -> dict:
-    """Resolve a contact name ("Grecia", "Oscar (Tela mosquitera)") to a
-    WhatsApp JID by looking up the user's Apple Contacts DB.
-
-    Returns::
-
-        {"jid": "5491234567890@s.whatsapp.net",
-         "full_name": "Grecia Ferrari",
-         "phones": ["+54 9 11 ..."],
-         "error": None}
-
-    or on failure::
-
-        {"jid": None, "full_name": None, "phones": [],
-         "error": "not_found" | "no_phone" | "empty_query"}
-
-    Single-match only. Apple Contacts doesn't give us a trivial way to
-    distinguish between a single homonym and multiple matches from a
-    first-name predicate, so we rely on the user providing enough
-    disambiguation in ``contact_name`` (full name or the custom-label
-    part in parens). On ambiguity the helper returns ``error="not_found"``
-    so the chat can ask the user to be more specific.
-    """
-    query = (contact_name or "").strip()
-    # Strip leading `@` that the LLM sometimes emits for contact names —
-    # habit from Obsidian wikilinks `@Person` and Twitter-style mentions.
-    # Apple Contacts doesn't care about the sigil; we do.
-    if query.startswith("@"):
-        query = query.lstrip("@").strip()
-    if not query:
-        return {"jid": None, "full_name": None, "phones": [], "error": "empty_query"}
-    # Reuse the existing osascript-backed contact lookup. Passes `query`
-    # as the stem — _fetch_contact will try canonical match, first name,
-    # and finally the raw stem against Contacts.app.
-    try:
-        contact = _fetch_contact(query, email=None, canonical=query)
-    except Exception as exc:
-        return {"jid": None, "full_name": None, "phones": [],
-                "error": f"lookup_failed: {str(exc)[:80]}"}
-    if not contact:
-        return {"jid": None, "full_name": None, "phones": [], "error": "not_found"}
-    phones = list(contact.get("phones") or [])
-    if not phones:
-        return {"jid": None, "full_name": contact.get("full_name"), "phones": [],
-                "error": "no_phone"}
-    digits = re.sub(r"\D+", "", phones[0])
-    if not digits:
-        return {"jid": None, "full_name": contact.get("full_name"),
-                "phones": phones, "error": "no_phone"}
-    return {
-        "jid": f"{digits}@s.whatsapp.net",
-        "full_name": contact.get("full_name") or query,
-        "phones": phones,
-        "error": None,
-    }
+# `_whatsapp_jid_from_contact` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
@@ -21319,7 +21193,8 @@ def propose_whatsapp_send(contact_name: str, message_text: str) -> str:
 # (idempotencia exacta no es alcanzable por la conversión de bullets
 # `-` → `•`, pero nunca degrada el output más allá del primer pase).
 
-WHATSAPP_NOTE_MAX_CHARS = 4096  # WA hard limit per message
+# `WHATSAPP_NOTE_MAX_CHARS` moved to `rag.integrations.whatsapp` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 _WA_NOTE_IMAGE_EXTS = (
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".heic", ".bmp",
@@ -33050,52 +32925,9 @@ def _osascript(script: str, timeout: float = 15.0) -> str:
 # is silently skipped.
 
 
-_REMINDERS_SCRIPT = '''
-set _out to ""
-tell application "Reminders"
-  repeat with _list in lists
-    try
-      set _pending to (reminders of _list whose completed is false)
-      repeat with _r in _pending
-        try
-          set _rid to id of _r
-          set _due to due date of _r
-          if _due is not missing value then
-            set _out to _out & _rid & "|" & (name of _r) & "|" & (_due as string) & "|" & (name of _list) & linefeed
-          else
-            set _out to _out & _rid & "|" & (name of _r) & "||" & (name of _list) & linefeed
-          end if
-        end try
-      end repeat
-    end try
-  end repeat
-end tell
-return _out
-'''
-
-
-# Completed reminders — para cruzar con open loops del vault (rag followup).
-# Mismo shape que `_REMINDERS_SCRIPT` (name|date|list) pero filtra por
-# `completed is true` y emite `completion date` en vez de `due date`.
-_COMPLETED_REMINDERS_SCRIPT = '''
-set _out to ""
-tell application "Reminders"
-  repeat with _list in lists
-    try
-      set _done to (reminders of _list whose completed is true)
-      repeat with _r in _done
-        try
-          set _comp to completion date of _r
-          if _comp is not missing value then
-            set _out to _out & (name of _r) & "|" & (_comp as string) & "|" & (name of _list) & linefeed
-          end if
-        end try
-      end repeat
-    end try
-  end repeat
-end tell
-return _out
-'''
+# `_REMINDERS_SCRIPT` and `_COMPLETED_REMINDERS_SCRIPT` moved to
+# `rag.integrations.reminders` (Phase 1b, 2026-04-25). Re-exported at the
+# bottom of this file.
 
 
 # `_MAIL_SCRIPT` moved to `rag.integrations.apple_mail` (Phase 1b, 2026-04-25).
@@ -33115,131 +32947,12 @@ def _icalbuddy_path() -> str | None:
     return shutil.which("icalBuddy")
 
 
-def _fetch_calendar_today(max_events: int = 15) -> list[dict]:
-    """Events scheduled for today via icalBuddy. Returns [] if icalBuddy is
-    not installed — the user can `brew install ical-buddy` to enable.
-
-    Output parsing handles the default icalBuddy format:
-        Event title
-            list: CalendarName
-            date: 14/04/2026 at 09:30 - 10:00
-    """
-    if not _apple_enabled():
-        return []
-    icb = _icalbuddy_path()
-    if not icb:
-        return []
-    import subprocess
-    try:
-        res = subprocess.run(
-            [
-                icb,
-                "-npn",                        # no property names
-                "-nc",                          # no calendar names inline
-                "-nrd",                         # no relative dates
-                "-ea",                          # exclude all-day events? no, include.
-                "-iep", "title,datetime",       # include only: title + datetime
-                "-b", "",                       # no bullet prefix
-                "eventsToday",
-            ],
-            capture_output=True, text=True, timeout=10.0,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
-    if res.returncode != 0:
-        return []
-    out = (res.stdout or "").strip()
-    if not out:
-        return []
-    events: list[dict] = []
-    current: dict | None = None
-    for raw in out.splitlines():
-        line = raw.rstrip()
-        if not line:
-            continue
-        # title lines start at col 0; property lines are indented
-        if not line.startswith(" ") and not line.startswith("\t"):
-            if current and current.get("title"):
-                events.append(current)
-            current = {"title": line.strip(), "start": "", "end": ""}
-            continue
-        # property line — look for date/time range
-        stripped = line.strip()
-        if current is None:
-            continue
-        # Formats seen: "today at 09:30 - 10:00", "14/04/2026 at 09:30 - 10:00",
-        # or bare "09:30 - 10:00"
-        m = re.search(r"(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)\s*-\s*(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)", stripped)
-        if m:
-            current["start"] = m.group(1)
-            current["end"] = m.group(2)
-    if current and current.get("title"):
-        events.append(current)
-    events.sort(key=lambda e: e["start"] or "99:99")
-    return events[:max_events]
+# `_fetch_calendar_today` moved to `rag.integrations.calendar` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
-def _fetch_reminders_due(now: datetime, horizon_days: int = 1, max_items: int = 20) -> list[dict]:
-    """Incomplete reminders with due date ≤ today + horizon_days, plus
-    reminders without any due date. Splits into buckets: ``overdue`` / ``today``
-    / ``upcoming`` (dated) and ``undated`` (no due). Undated reminders land at
-    the bottom of the sort order — still actionable but not time-sensitive.
-    """
-    if not _apple_enabled():
-        return []
-    out = _osascript(_REMINDERS_SCRIPT, timeout=45.0)
-    if not out:
-        return []
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    horizon = today + timedelta(days=horizon_days + 1)
-    items: list[dict] = []
-    for line in out.splitlines():
-        parts = line.split("|", 3)
-        # New shape: id|name|due|list. Legacy fallback (name|due|list) kept
-        # so a script that reverts doesn't silently drop all reminders.
-        if len(parts) == 4:
-            rid, name, due_raw, list_name = (p.strip() for p in parts)
-        elif len(parts) == 3:
-            rid = ""
-            name, due_raw, list_name = (p.strip() for p in parts)
-        elif len(parts) == 2:
-            rid = ""
-            name, due_raw = (p.strip() for p in parts)
-            list_name = ""
-        else:
-            continue
-        if not name:
-            continue
-        if not due_raw:
-            items.append({
-                "id": rid,
-                "name": name,
-                "due": "",
-                "list": list_name,
-                "bucket": "undated",
-            })
-            continue
-        due_dt = _parse_applescript_date(due_raw)
-        if due_dt is None:
-            continue
-        if due_dt >= horizon:
-            continue
-        if due_dt < today:
-            bucket = "overdue"
-        elif due_dt < today + timedelta(days=1):
-            bucket = "today"
-        else:
-            bucket = "upcoming"
-        items.append({
-            "id": rid,
-            "name": name,
-            "due": due_dt.isoformat(timespec="minutes"),
-            "list": list_name,
-            "bucket": bucket,
-        })
-    order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
-    items.sort(key=lambda r: (order.get(r["bucket"], 9), r["due"]))
-    return items[:max_items]
+# `_fetch_reminders_due` moved to `rag.integrations.reminders` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 # ── NL datetime + recurrence parsing (feeds propose_reminder / propose_event) ─
@@ -34674,46 +34387,8 @@ def propose_mail_send(
 
 
 
-def _fetch_completed_reminders(
-    now: datetime, days: int = 30, max_items: int = 200,
-) -> list[dict]:
-    """Completed Apple Reminders in the last `days`. Used by `rag followup`
-    to cross-resolve open loops in the vault against tasks already checked
-    off in Reminders.app — if you closed "comprar pan" there, the vault's
-    checkbox "comprar pan" is implicitly resolved.
-
-    Silent-fail: `_apple_enabled()=False` or osascript empty → []. Same
-    contract as `_fetch_reminders_due`. Shape: `[{name, completed_date,
-    list}]` sorted newest-first.
-    """
-    if not _apple_enabled():
-        return []
-    out = _osascript(_COMPLETED_REMINDERS_SCRIPT, timeout=60.0)
-    if not out:
-        return []
-    cutoff = now - timedelta(days=days)
-    items: list[dict] = []
-    for line in out.splitlines():
-        parts = line.split("|", 2)
-        if len(parts) < 2:
-            continue
-        name = parts[0].strip()
-        comp_raw = parts[1].strip()
-        list_name = parts[2].strip() if len(parts) > 2 else ""
-        if not name:
-            continue
-        comp_dt = _parse_applescript_date(comp_raw)
-        if comp_dt is None:
-            continue
-        if comp_dt < cutoff:
-            continue
-        items.append({
-            "name": name,
-            "completed_date": comp_dt.isoformat(timespec="minutes"),
-            "list": list_name,
-        })
-    items.sort(key=lambda r: r["completed_date"], reverse=True)
-    return items[:max_items]
+# `_fetch_completed_reminders` moved to `rag.integrations.reminders` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 MAIL_VIP_CONFIG_PATH = Path.home() / ".config/obsidian-rag/mail-vip.json"
@@ -36715,164 +36390,11 @@ def _fetch_system_activity(
     return out
 
 
-# ── Screen Time (knowledgeC.db) ─────────────────────────────────────────
-# macOS logs foreground app usage at `/app/usage` in CoreDuet's knowledge
-# store. Read-only access works without Full Disk Access as long as the
-# file is readable. Values are per foreground session; summing gives
-# active-use seconds (not wall time). Categories are heuristic — bundle
-# ID prefix match. Unknown apps render as bundle ID stem so new apps
-# surface instead of hiding in "otros".
-
-SCREENTIME_DB = Path.home() / "Library/Application Support/Knowledge/knowledgeC.db"
-# 978307200 = seconds between 1970-01-01 and 2001-01-01 (Cocoa epoch).
-_SCREENTIME_COCOA_OFFSET = 978307200
-
-_SCREENTIME_APP_LABELS = {
-    "com.exafunction.windsurf": "Windsurf",
-    "com.googlecode.iterm2": "iTerm",
-    "com.apple.Terminal": "Terminal",
-    "com.microsoft.VSCode": "VS Code",
-    "com.sublimetext.4": "Sublime",
-    "com.jetbrains.pycharm": "PyCharm",
-    "md.obsidian": "Obsidian",
-    "com.google.Chrome": "Chrome",
-    "com.apple.Safari": "Safari",
-    "company.thebrowser.Browser": "Arc",
-    "com.brave.Browser": "Brave",
-    "net.whatsapp.WhatsApp": "WhatsApp",
-    "com.apple.MobileSMS": "Messages",
-    "com.tinyspeck.slackmacgap": "Slack",
-    "com.hnc.Discord": "Discord",
-    "ru.keepcoder.Telegram": "Telegram",
-    "com.apple.mail": "Mail",
-    "com.apple.iCal": "Calendar",
-    "com.flexibits.fantastical2.mac": "Fantastical",
-    "com.apple.reminders": "Reminders",
-    "com.apple.Notes": "Notes",
-    "com.apple.finder": "Finder",
-    "com.apple.Photos": "Photos",
-    "com.apple.Music": "Music",
-    "com.spotify.client": "Spotify",
-    "com.apple.QuickTimePlayerX": "QuickTime",
-    "com.apple.systempreferences": "System Settings",
-    "com.apple.ActivityMonitor": "Activity Monitor",
-    "com.figma.Desktop": "Figma",
-    "com.linear": "Linear",
-    "notion.id": "Notion",
-    "com.apple.podcasts": "Podcasts",
-}
-
-_SCREENTIME_CATEGORIES = {
-    "code": {
-        "com.exafunction.windsurf", "com.googlecode.iterm2", "com.apple.Terminal",
-        "com.microsoft.VSCode", "com.sublimetext.4", "com.jetbrains.pycharm",
-        "com.apple.dt.Xcode", "com.todesktop.230313mzl4w4u92",  # Cursor
-    },
-    "notas": {"md.obsidian", "com.apple.Notes", "notion.id"},
-    "comms": {
-        "net.whatsapp.WhatsApp", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap",
-        "com.hnc.Discord", "ru.keepcoder.Telegram", "com.apple.mail", "com.apple.FaceTime",
-    },
-    "browser": {
-        "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser",
-        "com.brave.Browser", "org.mozilla.firefox",
-    },
-    "media": {
-        "com.apple.Music", "com.spotify.client", "com.apple.QuickTimePlayerX",
-        "com.apple.podcasts", "com.apple.TV",
-    },
-}
-
-
-def _screentime_app_label(bundle: str) -> str:
-    if bundle in _SCREENTIME_APP_LABELS:
-        return _SCREENTIME_APP_LABELS[bundle]
-    # Fallback: last dotted segment, title-cased ("com.foo.BarApp" → "BarApp")
-    return bundle.rsplit(".", 1)[-1] if "." in bundle else bundle
-
-
-def _screentime_category(bundle: str) -> str:
-    for cat, bundles in _SCREENTIME_CATEGORIES.items():
-        if bundle in bundles:
-            return cat
-    return "otros"
-
-
-def _collect_screentime(
-    start: datetime, end: datetime,
-    db_path: Path | None = None,
-) -> dict:
-    """Per-app foreground usage for [start, end). Returns:
-
-    ```
-    {
-        "available": bool,
-        "total_secs": int,
-        "top_apps": [{"bundle": str, "label": str, "secs": int}],
-        "categories": {"code": int, "comms": int, ...},
-    }
-    ```
-
-    Silent-degrades to `available=False` if the db is missing or locked.
-    Only sessions >= 5s counted (filters spurious re-focuses). Unknown
-    bundles surface via their stem so new apps aren't swept into "otros".
-    """
-    import sqlite3
-
-    path = db_path or SCREENTIME_DB
-    empty = {"available": False, "total_secs": 0, "top_apps": [], "categories": {}}
-    if not path.is_file():
-        return empty
-
-    start_ts = start.timestamp() - _SCREENTIME_COCOA_OFFSET
-    end_ts = end.timestamp() - _SCREENTIME_COCOA_OFFSET
-    try:
-        # immutable=1 lets us read even if macOS holds a write lock.
-        uri = f"file:{path}?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-        try:
-            rows = conn.execute(
-                """
-                SELECT ZVALUESTRING, SUM(ZENDDATE - ZSTARTDATE) AS secs
-                FROM ZOBJECT
-                WHERE ZSTREAMNAME = '/app/usage'
-                  AND ZSTARTDATE >= ?
-                  AND ZSTARTDATE < ?
-                  AND (ZENDDATE - ZSTARTDATE) >= 5
-                GROUP BY ZVALUESTRING
-                ORDER BY secs DESC
-                """,
-                (start_ts, end_ts),
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception:
-        return empty
-
-    top: list[dict] = []
-    cats: dict[str, int] = {}
-    total = 0
-    for bundle, secs in rows:
-        if not bundle or secs is None:
-            continue
-        s = int(round(float(secs)))
-        if s <= 0:
-            continue
-        total += s
-        top.append({
-            "bundle": bundle,
-            "label": _screentime_app_label(bundle),
-            "secs": s,
-        })
-        cat = _screentime_category(bundle)
-        cats[cat] = cats.get(cat, 0) + s
-
-    return {
-        "available": True,
-        "total_secs": total,
-        "top_apps": top[:10],
-        "categories": cats,
-    }
+# Screen Time block (`SCREENTIME_DB`, `_SCREENTIME_*`, `_screentime_app_label`,
+# `_screentime_category`, `_collect_screentime`, `_render_screentime_section`)
+# moved to `rag.integrations.screentime` (Phase 1b, 2026-04-25). Re-exported
+# at the bottom of this file. `_fmt_hm` stays here because it's a generic
+# duration formatter used by other consumers (`web/server.py`, tests).
 
 
 def _fmt_hm(secs: int) -> str:
@@ -36886,32 +36408,8 @@ def _fmt_hm(secs: int) -> str:
     return f"{secs}s"
 
 
-def _render_screentime_section(st: dict) -> str:
-    """Deterministic "where time went" section. Empty if db unavailable
-    or total < 5 min (likely sleeping Mac or brand-new setup).
-    """
-    if not st or not st.get("available"):
-        return ""
-    total = int(st.get("total_secs") or 0)
-    if total < 300:
-        return ""
-
-    lines = [f"## 🖥 Pantalla · {_fmt_hm(total)} activo"]
-    top = (st.get("top_apps") or [])[:5]
-    if top:
-        parts = [f"{a['label']} {_fmt_hm(a['secs'])}" for a in top]
-        lines.append("- " + " · ".join(parts))
-    cats = st.get("categories") or {}
-    if cats:
-        order = ["code", "notas", "comms", "browser", "media", "otros"]
-        pieces = []
-        for k in order:
-            v = cats.get(k, 0)
-            if v >= 60:
-                pieces.append(f"{k} {_fmt_hm(v)}")
-        if pieces:
-            lines.append("- " + " · ".join(pieces))
-    return "\n".join(lines)
+# `_render_screentime_section` moved to `rag.integrations.screentime`
+# (Phase 1b, 2026-04-25). Re-exported at the bottom of this file.
 
 
 def _render_system_activity_section(act: dict) -> str:
@@ -41335,53 +40833,8 @@ def _detect_time_scope(q: str) -> dict:
     }
 
 
-def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
-    """icalBuddy `eventsToday+N` with relative-date labels. Returns
-    [{title, date_label, time_range}]. Silent-fail per contract."""
-    if not _apple_enabled() or days_ahead < 0:
-        return []
-    icb = _icalbuddy_path()
-    if not icb:
-        return []
-    import subprocess as _sp
-    query = "eventsToday" if days_ahead == 0 else f"eventsToday+{days_ahead}"
-    try:
-        res = _sp.run(
-            [icb, "-nc", "-iep", "title,datetime", "-b", "", query],
-            capture_output=True, text=True, timeout=10.0,
-        )
-    except (FileNotFoundError, _sp.TimeoutExpired, OSError):
-        return []
-    if res.returncode != 0 or not (res.stdout or "").strip():
-        return []
-    events: list[dict] = []
-    current: dict | None = None
-    for raw in (res.stdout or "").splitlines():
-        line = raw.rstrip()
-        if not line:
-            continue
-        if not line.startswith(" ") and not line.startswith("\t"):
-            if current and current.get("title"):
-                events.append(current)
-            current = {"title": line.strip(), "date_label": "", "time_range": ""}
-            continue
-        stripped = line.strip()
-        if current is None:
-            continue
-        m = re.search(
-            r"(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)\s*-\s*(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)",
-            stripped,
-        )
-        if m:
-            current["time_range"] = f"{m.group(1)}–{m.group(2)}"
-            label = stripped.split(" at ", 1)[0].strip()
-            if label and label != stripped:
-                current["date_label"] = label
-        else:
-            current["date_label"] = stripped
-    if current and current.get("title"):
-        events.append(current)
-    return events[:max_events]
+# `_fetch_calendar_ahead` moved to `rag.integrations.calendar` (Phase 1b,
+# 2026-04-25). Re-exported at the bottom of this file.
 
 
 # ── Cross-source enrichment for web chat ─────────────────────────────────
@@ -51751,6 +51204,170 @@ def whisper_patterns(min_count: int):
         )
 
 
+@whisper.command("export")
+@click.option("--output", "-o", type=click.Path(dir_okay=False, writable=True),
+              default=None,
+              help="Path al archivo JSON de salida. Default: stdout.")
+@click.option("--source", default=None,
+              help="Filtrar por source ('explicit'/'llm'/'vault_diff'). Default: todas.")
+def whisper_export(output: str | None, source: str | None):
+    """Exportar correcciones a JSON para backup o migración entre máquinas.
+
+    Cada row de `rag_audio_corrections` se serializa con todas sus columnas.
+    El JSON resultante se puede importar en otra máquina con `rag whisper import`
+    o procesar offline.
+
+    Ejemplo:
+
+        rag whisper export -o ~/Backups/corrections-2026-04-25.json
+        rag whisper export --source explicit  # solo correcciones manuales /fix
+    """
+    import json as _json
+    sql = (
+        "SELECT id, audio_hash, original, corrected, source, ts, chat_id, context "
+        "FROM rag_audio_corrections"
+    )
+    params: tuple = ()
+    if source:
+        if source not in ("explicit", "llm", "vault_diff"):
+            console.print(f"[red]source inválido: {source}[/red] · esperaba: explicit/llm/vault_diff")
+            return
+        sql += " WHERE source = ?"
+        params = (source,)
+    sql += " ORDER BY ts ASC"
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as exc:
+        console.print(f"[red]error reading corrections: {exc}[/red]")
+        return
+    payload = {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "count": len(rows),
+        "filter_source": source,
+        "schema_version": 1,
+        "corrections": [
+            {
+                "id": r[0],
+                "audio_hash": r[1],
+                "original": r[2],
+                "corrected": r[3],
+                "source": r[4],
+                "ts": r[5],
+                "chat_id": r[6],
+                "context": r[7],
+            }
+            for r in rows
+        ],
+    }
+    blob = _json.dumps(payload, ensure_ascii=False, indent=2)
+    if output:
+        Path(output).write_text(blob, encoding="utf-8")
+        console.print(
+            f"[green]✓[/green] {len(rows)} corrections exported to "
+            f"[cyan]{output}[/cyan]"
+        )
+    else:
+        # stdout — útil para piping (`rag whisper export | jq ...`)
+        click.echo(blob)
+
+
+@whisper.command("import")
+@click.argument("input_file", type=click.Path(exists=True, dir_okay=False, readable=True))
+@click.option("--dry-run", is_flag=True,
+              help="Mostrar qué se importaría sin escribir a la DB.")
+def whisper_import(input_file: str, dry_run: bool):
+    """Importar correcciones desde un JSON exportado por `rag whisper export`.
+
+    Idempotente: si una correction con el mismo (audio_hash, original,
+    corrected, ts) ya existe, skip — esto permite re-importar el mismo
+    backup múltiples veces sin duplicados.
+
+    Use cases:
+    - Migrar a una máquina nueva: export + scp + import.
+    - Restaurar después de un VACUUM accidental que borró rows.
+    - Compartir correcciones gold entre 2 setups (raro pero posible).
+
+    Ejemplo:
+
+        rag whisper import ~/Backups/corrections-2026-04-25.json
+        rag whisper import backup.json --dry-run
+    """
+    import json as _json
+    try:
+        payload = _json.loads(Path(input_file).read_text(encoding="utf-8"))
+    except Exception as exc:
+        console.print(f"[red]error reading {input_file}: {exc}[/red]")
+        return
+    rows = payload.get("corrections", [])
+    if not isinstance(rows, list):
+        console.print("[red]formato inválido: 'corrections' debe ser una lista[/red]")
+        return
+    schema_v = payload.get("schema_version", 1)
+    if schema_v != 1:
+        console.print(f"[yellow]warning: schema_version={schema_v} (esperaba 1)[/yellow]")
+    if dry_run:
+        console.print(
+            f"[bold]DRY-RUN[/bold]: importaría {len(rows)} correction(s) de "
+            f"[cyan]{input_file}[/cyan]"
+        )
+        sources = {}
+        for r in rows:
+            src = r.get("source", "?")
+            sources[src] = sources.get(src, 0) + 1
+        for src, n in sorted(sources.items()):
+            console.print(f"  [dim]{src:12s}: {n}[/dim]")
+        return
+    inserted = 0
+    skipped = 0
+    failed = 0
+    try:
+        with _ragvec_state_conn() as conn:
+            for r in rows:
+                try:
+                    # Idempotencia: skip si (audio_hash, original, corrected, ts)
+                    # ya existe. Esto NO es UNIQUE constraint en el schema,
+                    # solo guard manual aquí.
+                    existing = conn.execute(
+                        "SELECT 1 FROM rag_audio_corrections "
+                        "WHERE audio_hash = ? AND original = ? "
+                        "AND corrected = ? AND ts = ? LIMIT 1",
+                        (r.get("audio_hash", ""), r["original"],
+                         r["corrected"], r["ts"]),
+                    ).fetchone()
+                    if existing:
+                        skipped += 1
+                        continue
+                    conn.execute(
+                        "INSERT INTO rag_audio_corrections "
+                        "(audio_hash, original, corrected, source, ts, "
+                        " chat_id, context) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            r.get("audio_hash", ""),
+                            r["original"],
+                            r["corrected"],
+                            r.get("source", "explicit"),
+                            r["ts"],
+                            r.get("chat_id"),
+                            r.get("context"),
+                        ),
+                    )
+                    inserted += 1
+                except (KeyError, TypeError) as exc:
+                    failed += 1
+                    console.print(f"[yellow]skip row malformada: {exc}[/yellow]")
+    except Exception as exc:
+        console.print(f"[red]error importing: {exc}[/red]")
+        return
+    console.print(
+        f"[green]✓[/green] imported "
+        f"[cyan]{inserted}[/cyan] new · "
+        f"[dim]{skipped} skipped (already exist) · "
+        f"{failed} failed[/dim]"
+    )
+
+
 @whisper.command("stats")
 def whisper_stats():
     """Resumen del estado del learning loop: transcripciones logueadas,
@@ -51813,6 +51430,10 @@ from rag.integrations.apple_mail import (  # noqa: E402, F401
     _MAIL_SCRIPT,
     _fetch_mail_unread,
 )
+from rag.integrations.calendar import (  # noqa: E402, F401
+    _fetch_calendar_ahead,
+    _fetch_calendar_today,
+)
 from rag.integrations.chrome_bookmarks import (  # noqa: E402, F401
     _chrome_bookmarks_root,
     _chrome_to_unix_ts,
@@ -51834,6 +51455,19 @@ from rag.integrations.gmail import (  # noqa: E402, F401
     _gmail_send_service,
     _gmail_service,
     _gmail_thread_last_meta,
+)
+from rag.integrations.reminders import (  # noqa: E402, F401
+    _COMPLETED_REMINDERS_SCRIPT,
+    _REMINDERS_SCRIPT,
+    _fetch_completed_reminders,
+    _fetch_reminders_due,
+)
+from rag.integrations.screentime import (  # noqa: E402, F401
+    SCREENTIME_DB,
+    _collect_screentime,
+    _render_screentime_section,
+    _screentime_app_label,
+    _screentime_category,
 )
 from rag.integrations.weather import (  # noqa: E402, F401
     WEATHER_LOCATION,

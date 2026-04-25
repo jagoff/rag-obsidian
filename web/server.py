@@ -9477,6 +9477,103 @@ def _persist_status_samples(payload: dict) -> None:
         print(f"[status_samples] warn: persist failed: {type(e).__name__}: {e}", flush=True)
 
 
+# ── Periodic background probe ────────────────────────────────────────
+# Cron-driven sampling para que el heatmap se llene aunque nadie esté
+# mirando /status. Single daemon thread inside FastAPI lifecycle: arranca
+# en `_on_startup`, se apaga vía Event en `_on_shutdown`. Sleep de 60s
+# coincide con `_STATUS_SAMPLE_RATE_LIMIT_S` así cada tick efectivamente
+# inserta — sin doble-pisarse con el rate-limit cuando además un user
+# está activo (el rate-limit gana, el thread queda no-op para esa tick).
+#
+# Por qué thread interno y no launchd cron separado:
+#   - Cero archivos nuevos que mantener (plist, log paths, kickstart
+#     handlers en /api/status/action).
+#   - Sampling matchea "is the web server alive?" — si el server está
+#     down, no hay heatmap que llenar tampoco. Es la semántica correcta
+#     para un dashboard local-first single-user.
+#   - El thread comparte el cache de `_status_build_payload` así si un
+#     user hizo un request hace <3s, el thread reusa esa data en vez de
+#     re-probar 25 servicios en paralelo.
+#
+# Trade-off aceptado: cuando el server está dormido (mac suspended), no
+# samplea — el heatmap muestra gris para esas horas. Si en algún momento
+# el user quiere "completitud aunque la mac esté apagada", la solución
+# es un launchd job externo (cron) que persista igual desde otra máquina,
+# o usar una probe externa (ej. UptimeRobot). Out of scope acá.
+
+_STATUS_PROBE_PERIOD_S = 60.0
+_STATUS_PROBE_THREAD: "threading.Thread | None" = None
+_STATUS_PROBE_STOP = threading.Event()
+
+
+def _status_periodic_probe_loop() -> None:
+    """Daemon thread loop: cada `_STATUS_PROBE_PERIOD_S` segundos invoca
+    `_status_build_payload + _persist_status_samples` para alimentar el
+    heatmap del card #5.
+
+    Usa el mismo `_status_build_payload` que `/api/status` así el cache
+    queda warm para el próximo request del user. La persistencia es
+    rate-limited globalmente (`_STATUS_SAMPLE_LOCK`), así que aunque
+    coincida con un request del user en la misma ventana, sólo se
+    inserta una vez.
+
+    Best-effort: cualquier excepción se traga + sigue. El loop sale solo
+    cuando `_STATUS_PROBE_STOP.is_set()` (vía `_on_shutdown`). Logging
+    a stderr para que las fallas queden visibles en `web.error.log`
+    sin spammar el log feliz path (sólo se imprime en error).
+    """
+    while not _STATUS_PROBE_STOP.is_set():
+        try:
+            payload = _status_build_payload()
+            # Update el cache módulo-level así un user que llega justo
+            # ahora consume la data fresca sin re-build (3s TTL del
+            # `/api/status` cache).
+            with _STATUS_CACHE_LOCK:
+                _STATUS_CACHE["payload"] = payload
+                _STATUS_CACHE["ts"] = time.monotonic()
+            _persist_status_samples(payload)
+        except Exception as exc:
+            print(f"[status-probe] tick failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+        # Wait con cancelación temprana — `Event.wait(timeout)` retorna
+        # True ni bien `set()` se llama, así que el shutdown no espera
+        # los 60s completos.
+        _STATUS_PROBE_STOP.wait(timeout=_STATUS_PROBE_PERIOD_S)
+
+
+@_on_startup
+def _start_status_probe_thread() -> None:
+    """Arrancar el daemon thread del probe periódico al startup.
+
+    `daemon=True` para que no bloquee la salida del proceso si por algún
+    motivo el shutdown callback no llega (ej. SIGKILL). El thread normal
+    sale via `_STATUS_PROBE_STOP.set()` desde `_stop_status_probe_thread`.
+    """
+    global _STATUS_PROBE_THREAD
+    _STATUS_PROBE_STOP.clear()
+    _STATUS_PROBE_THREAD = threading.Thread(
+        target=_status_periodic_probe_loop,
+        name="status-probe",
+        daemon=True,
+    )
+    _STATUS_PROBE_THREAD.start()
+
+
+@_on_shutdown
+def _stop_status_probe_thread() -> None:
+    """Señalar al probe thread que pare + esperarlo brevemente.
+
+    Tope de 2s al join para no bloquear la shutdown sequence — si el
+    thread está mid-build_payload (que puede tardar varios segundos por
+    los probes paralelos), aceptamos cortarlo. Como es daemon, el
+    proceso lo cierra de cualquier forma; el join es sólo cleanup
+    cosmético para que no salga un warning de Python al exit.
+    """
+    _STATUS_PROBE_STOP.set()
+    if _STATUS_PROBE_THREAD is not None:
+        _STATUS_PROBE_THREAD.join(timeout=2.0)
+
+
 # Cache para el endpoint /uptime — el query es relativamente caro
 # (window function sobre 50k rows agrupadas por hora), TTL más largo
 # que los otros cards porque los buckets de uptime cambian de a poco.

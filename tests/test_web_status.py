@@ -611,6 +611,98 @@ def test_uptime_build_with_synthetic_samples(tmp_path, monkeypatch):
     assert len(buckets_with_data) >= 3
 
 
+def test_periodic_probe_runs_one_tick(tmp_path, monkeypatch):
+    """El periodic probe loop, ejecutado una sola iteración, llama a
+    `_status_build_payload` + persiste samples + actualiza el cache.
+
+    No spawn del thread real: simulamos una sola iteración del while
+    seteando el stop event antes de la 2da. Así no dependemos de timing
+    real de 60s en el test.
+    """
+    import rag
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+
+    # Reset state global para evitar interferencia con tests previos.
+    with _server._STATUS_SAMPLE_LOCK:
+        _server._STATUS_SAMPLE_LAST_TS["ts"] = 0.0
+    with _server._STATUS_CACHE_LOCK:
+        _server._STATUS_CACHE["ts"] = 0.0
+        _server._STATUS_CACHE["payload"] = None
+
+    # Mockear _status_build_payload para evitar correr 25 probes reales
+    # (ollama, launchctl, etc.) — sólo nos importa que el loop llame a
+    # las 3 funciones en orden.
+    fake_payload = {
+        "categories": [{"id": "core", "services": [
+            {"id": "web-self", "status": "ok"},
+            {"id": "ollama", "status": "ok"},
+            {"id": "vault", "status": "warn"},
+        ]}],
+    }
+    monkeypatch.setattr(_server, "_status_build_payload", lambda: fake_payload)
+
+    # Strategy: dejar que el loop entre a su primera iteración (STOP
+    # clear), pero envolver `_persist_status_samples` para que después
+    # de correr una vez, setee STOP — así la 2da iteración del while
+    # no se ejecuta y el test no se cuelga 60s en el wait().
+    real_persist = _server._persist_status_samples
+    def _persist_then_stop(payload):
+        real_persist(payload)
+        _server._STATUS_PROBE_STOP.set()
+    monkeypatch.setattr(_server, "_persist_status_samples", _persist_then_stop)
+
+    _server._STATUS_PROBE_STOP.clear()
+    _server._status_periodic_probe_loop()
+
+    # Verificar que la persistencia ocurrió (3 rows = 3 servicios
+    # rastreados en _UPTIME_TRACKED_IDS, los demás del fake_payload se
+    # filtran).
+    with rag._ragvec_state_conn() as conn:
+        rows = conn.execute(
+            "SELECT service_id FROM rag_status_samples"
+        ).fetchall()
+    sids = {r[0] for r in rows}
+    # web-self + ollama + vault del fake_payload, todos en _UPTIME_TRACKED_IDS.
+    assert "web-self" in sids
+    assert "ollama" in sids
+    assert "vault" in sids
+
+    # Cache del /api/status también debe estar warm post-tick.
+    with _server._STATUS_CACHE_LOCK:
+        cached = _server._STATUS_CACHE["payload"]
+    assert cached is fake_payload
+
+
+def test_periodic_probe_thread_can_be_stopped():
+    """`_stop_status_probe_thread` señala el Event y hace join. Test
+    simula el ciclo de vida completo: start → un tick → stop, sin
+    timing real.
+    """
+    # Reset state.
+    _server._STATUS_PROBE_STOP.clear()
+    # Si hubo un thread previo en este test session, esperarlo.
+    if _server._STATUS_PROBE_THREAD is not None and _server._STATUS_PROBE_THREAD.is_alive():
+        _server._STATUS_PROBE_STOP.set()
+        _server._STATUS_PROBE_THREAD.join(timeout=2.0)
+        _server._STATUS_PROBE_STOP.clear()
+
+    # Start.
+    _server._start_status_probe_thread()
+    assert _server._STATUS_PROBE_THREAD is not None
+    assert _server._STATUS_PROBE_THREAD.is_alive()
+
+    # Stop. El thread debería salir rápido porque el wait() del Event
+    # se cancela inmediatamente.
+    _server._stop_status_probe_thread()
+
+    # Después del stop, el thread no debería seguir alive (join 2s).
+    assert not _server._STATUS_PROBE_THREAD.is_alive(), (
+        "el thread no se cerró tras _stop_status_probe_thread"
+    )
+
+
 def test_persist_status_samples_rate_limits(tmp_path, monkeypatch):
     """`_persist_status_samples` debería respetar el rate-limit de 60s
     — múltiples calls back-to-back resultan en un solo INSERT batch."""

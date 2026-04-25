@@ -295,7 +295,15 @@ def test_rag_audio_transcripts_columns(telemetry_db):
         cols = [r[1] for r in conn.execute(
             "PRAGMA table_info(rag_audio_transcripts)"
         ).fetchall()]
+    # Phase 1 (2026-04-22, STT MVP): 7 cols base.
+    # Phase 2 (2026-04-25, c597932 Whisper learning loop): 7 cols extra
+    # (audio_hash, chat_id, avg_logprob, corrected_text, correction_source,
+    # note_path, note_initial_hash) para soportar dedup por hash + linkeo
+    # a chats + auto-correct + diff watcher de notas.
     assert cols == [
         "audio_path", "mtime", "text", "language",
         "duration_s", "model", "transcribed_at",
+        "audio_hash", "chat_id", "avg_logprob",
+        "corrected_text", "correction_source",
+        "note_path", "note_initial_hash",
     ]

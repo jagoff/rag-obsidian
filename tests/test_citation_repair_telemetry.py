@@ -104,7 +104,7 @@ def test_query_log_event_shape_contains_new_fields():
     """Smoke: inspeccionar el source del query() log_query_event debe
     referenciar bad_citations_count + citation_repair_attempted. Si alguien
     remueve las líneas, este test falla antes de llegar a producción."""
-    src = Path(__file__).resolve().parent.parent.joinpath("rag.py").read_text()
+    src = Path(__file__).resolve().parent.parent.joinpath("rag", "__init__.py").read_text()
     # Ambos campos deben aparecer en rag.py como keys del event.
     assert '"bad_citations_count"' in src, \
         "rag.py debe loggear bad_citations_count en query() / chat() path"
@@ -115,7 +115,7 @@ def test_query_log_event_shape_contains_new_fields():
 def test_query_log_event_has_new_fields_in_both_paths():
     """Tanto query() como chat() deben loggear los dos campos (no sólo uno).
     Cuenta de occurrencias mínima 2 (una por path)."""
-    src = Path(__file__).resolve().parent.parent.joinpath("rag.py").read_text()
+    src = Path(__file__).resolve().parent.parent.joinpath("rag", "__init__.py").read_text()
     assert src.count('"bad_citations_count"') >= 2, \
         "bad_citations_count debe loggearse en query() + chat() (≥2 ocurrencias)"
     assert src.count('"citation_repair_attempted"') >= 2, \

@@ -23,7 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RAG_PY = (ROOT / "rag.py").read_text(encoding="utf-8")
+RAG_PY = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
 
 
 def test_warmup_has_parallel_target_helpers():

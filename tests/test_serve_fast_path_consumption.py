@@ -38,7 +38,7 @@ import rag  # noqa: E402
 def test_serve_consumes_fast_path_from_retrieve_result():
     """The main LLM call inside serve's _handle_query must read
     `result["fast_path"]` and route to _LOOKUP_MODEL accordingly."""
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     # Anchor: the `_serve_fast_path` assignment I added should exist.
     # Without it, the whole refactor never happened.
     assert "_serve_fast_path = bool(result.get(" in src, (
@@ -69,7 +69,7 @@ def test_serve_consumes_fast_path_from_retrieve_result():
 def test_serve_logs_fast_path_and_gen_model():
     """log_query_event in the serve main path must surface `fast_path`
     and `gen_model` so the dashboard can measure realised speedup."""
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     # Find the serve cmd log event
     idx = src.find('"cmd": "serve", "q": question')
     assert idx >= 0, "serve log_query_event anchor missing"
@@ -121,7 +121,7 @@ def test_keep_alive_respects_fast_path_model():
     """`chat_keep_alive(_serve_gen_model)` must be called with the actual
     model so a small model (_LOOKUP_MODEL) doesn't get pinned with a
     large-model keep-alive policy."""
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     idx = src.find("_serve_gen_model = (")
     assert idx >= 0, "_serve_gen_model definition missing"
     # Find the ollama.chat call inside the same handler block

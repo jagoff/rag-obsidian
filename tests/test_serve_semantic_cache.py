@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 import rag  # noqa: E402
 
 
-_SRC = (ROOT / "rag.py").read_text(encoding="utf-8")
+_SRC = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
 
 
 def _serve_handler_body() -> str:

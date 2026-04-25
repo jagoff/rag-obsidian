@@ -144,7 +144,7 @@ def test_weather_fetch_failure_falls_through(monkeypatch):
 
 
 def test_serve_has_weather_shortcut_in_source():
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     # Find the serve endpoint handler.
     idx = src.find("def _handle_query(body: dict)")
     assert idx >= 0, "serve _handle_query not found"
@@ -158,7 +158,7 @@ def test_serve_has_weather_shortcut_in_source():
 
 
 def test_serve_has_metachat_shortcut_in_source():
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     idx = src.find("def _handle_query(body: dict)")
     assert idx >= 0
     nearby = src[idx : idx + 15000]
@@ -173,7 +173,7 @@ def test_serve_weather_short_circuit_precedes_tasks():
     "llueve hoy?" contains "hoy" which could in theory trip a
     time-scoped tasks detector (though today it doesn't). Keeping
     the order explicit as a regression guard."""
-    src = (ROOT / "rag.py").read_text(encoding="utf-8")
+    src = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
     idx = src.find("def _handle_query(body: dict)")
     assert idx >= 0
     nearby = src[idx : idx + 20000]

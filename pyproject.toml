@@ -75,30 +75,42 @@ rag = "rag:cli"
 obsidian-rag-mcp = "mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["rag", "mcp_server"]
-packages = ["scripts", "web", "rag_anticipate", "rag_anticipate.signals", "rag_whisper_learning"]
+# Phase 1 del split del monolito (2026-04-25): rag.py se renombra a
+# rag/__init__.py para volverse package, y rag/integrations/ aloja los
+# 8 leaf modules de fuentes externas. mcp_server queda como top-level
+# module porque es un wrapper independiente. prompts/ se movió a
+# rag/prompts/ para que `Path(__file__).resolve().parent / "prompts"`
+# siga resolviendo correctamente desde rag/__init__.py.
+py-modules = ["mcp_server"]
+packages = [
+    "rag",
+    "rag.integrations",
+    "scripts",
+    "web",
+    "rag_anticipate",
+    "rag_anticipate.signals",
+    "rag_whisper_learning",
+]
 
-# Include prompts/**/*.md in the installed tool bundle. Without this,
-# `uv tool install --editable .` copies rag.py but skips the prompts/
-# directory, and `load_prompt()` raises FileNotFoundError at import time
-# when the tool runs from ~/.local/share/uv/tools/obsidian-rag/ instead
-# of the repo.
+# Include rag/prompts/**/*.md en el bundle del tool. Sin esto, `uv tool
+# install --editable .` skip el prompts/ y `load_prompt()` raisea
+# FileNotFoundError al import time desde ~/.local/share/uv/tools/.
 [tool.setuptools.package-data]
-"*" = ["prompts/**/*.md"]
+"rag" = ["prompts/**/*.md"]
 
 [tool.setuptools.data-files]
-"share/obsidian-rag/prompts/rules" = ["prompts/rules/chunk_as_data.v1.md", "prompts/rules/name_preservation.v1.md"]
+"share/obsidian-rag/prompts/rules" = ["rag/prompts/rules/chunk_as_data.v1.md", "rag/prompts/rules/name_preservation.v1.md"]
 "share/obsidian-rag/prompts/intents" = [
-  "prompts/intents/system_rules.v1.md",
-  "prompts/intents/strict.v1.md",
-  "prompts/intents/chat.v1.md",
-  "prompts/intents/web.v1.md",
-  "prompts/intents/lookup.v1.md",
-  "prompts/intents/synthesis.v1.md",
-  "prompts/intents/synthesis.v2.md",
-  "prompts/intents/comparison.v1.md",
-  "prompts/intents/comparison.v2.md",
-  "prompts/intents/serve_meta.v1.md",
+  "rag/prompts/intents/system_rules.v1.md",
+  "rag/prompts/intents/strict.v1.md",
+  "rag/prompts/intents/chat.v1.md",
+  "rag/prompts/intents/web.v1.md",
+  "rag/prompts/intents/lookup.v1.md",
+  "rag/prompts/intents/synthesis.v1.md",
+  "rag/prompts/intents/synthesis.v2.md",
+  "rag/prompts/intents/comparison.v1.md",
+  "rag/prompts/intents/comparison.v2.md",
+  "rag/prompts/intents/serve_meta.v1.md",
 ]
 
 [tool.pytest.ini_options]
@@ -116,7 +128,7 @@ line-length = 100
 target-version = "py313"
 # Run across the whole project by default. CI passes explicit src=...
 # but local `ruff check` with no args should mirror CI.
-src = ["rag.py", "mcp_server.py", "web", "scripts"]
+src = ["rag", "mcp_server.py", "web", "scripts"]
 
 [tool.ruff.lint]
 # E402: module-level imports after logging/warnings configuration are intentional

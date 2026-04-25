@@ -288,6 +288,13 @@ def test_today_todo_frontmatter_in_window(tmp_vault):
 def test_today_cli_silent_no_op_when_empty(tmp_vault, monkeypatch):
     monkeypatch.setattr(rag, "LOG_PATH", tmp_vault[2] / "q.jsonl")
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", tmp_vault[2] / "c.jsonl")
+    # `today` está en `_CLI_WARMUP_SUBCOMMANDS` (rag/__init__.py:19242) →
+    # el group callback dispara `warmup_async()` → spawnea threads,
+    # incluyendo `_wu_chat_models()` que llama `ollama.chat` 2 veces para
+    # pre-cargar el chat model + helper. Acá nos importa solo el path del
+    # CLI `today`, no el warmup global, así que lo desactivamos vía la
+    # env var oficial. Ver `warmup_async()` en rag/__init__.py:12574.
+    monkeypatch.setenv("RAG_NO_WARMUP", "1")
     called = []
 
     def _boom(*a, **kw):

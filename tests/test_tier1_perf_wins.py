@@ -41,7 +41,7 @@ from click.testing import CliRunner
 import rag
 
 ROOT = Path(__file__).resolve().parent.parent
-RAG_PY = (ROOT / "rag.py").read_text(encoding="utf-8")
+RAG_PY = (ROOT / "rag" / "__init__.py").read_text(encoding="utf-8")
 
 
 # ─── Fix 1: ocrmac lazy-import ────────────────────────────────────────────

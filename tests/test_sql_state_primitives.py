@@ -76,11 +76,15 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 home compute metrics (rag_home_compute_metrics, baseline persist 2026-04-24) +
     # 1 anticipate candidates (rag_anticipate_candidates, anticipatory agent
     # game-changer 2026-04-24 — analytics append-only de todos los candidates
-    # evaluados por el scheduler de push proactivo cada 10 min) =
-    # 34 tables total.
+    # evaluados por el scheduler de push proactivo cada 10 min) +
+    # 1 audio corrections (rag_audio_corrections, Whisper learning loop
+    # Phase 2 2026-04-25, c597932 — gold signal de correcciones manuales) +
+    # 1 whisper vocab (rag_whisper_vocab, Whisper learning loop Phase 2
+    # 2026-04-25 — vocab refresh nightly inyectado al --prompt) =
+    # 36 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 34
+    assert len(expected) == 36
     c.close()
 
 

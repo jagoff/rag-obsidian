@@ -19994,100 +19994,12 @@ AMBIENT_WHATSAPP_BRIDGE_URL = "http://localhost:8080/api/send"
 _AMBIENT_ANTILOOP_MARKER = "\u200b"
 
 
-# ── Proactive nudges (emergent theme, feedback patterns, followups, etc) ─────
-# Pattern: features proactivas comparten un pipeline común que maneja rate-
-# limit global (max N/día), silencio por-kind, snooze, y log append-only.
-# El objetivo es que cada feature (emergent, patterns, followup, calendar)
-# solo declare 'kind' + construya el mensaje; la infra se encarga del resto.
-
-PROACTIVE_STATE_PATH = Path.home() / ".local/share/obsidian-rag/proactive.json"
-PROACTIVE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/proactive.jsonl"
-PROACTIVE_DAILY_CAP = 3
-
-
-def _proactive_load_state() -> dict:
-    """Carga {date, daily_count, silenced:[], snooze:{kind: iso_ts}}.
-
-    Si el date guardado no es hoy, resetea daily_count.
-    """
-    default = {"date": datetime.now().strftime("%Y-%m-%d"),
-               "daily_count": 0, "silenced": [], "snooze": {}}
-    if not PROACTIVE_STATE_PATH.is_file():
-        return default
-    try:
-        data = json.loads(PROACTIVE_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-    today = datetime.now().strftime("%Y-%m-%d")
-    if data.get("date") != today:
-        data["date"] = today
-        data["daily_count"] = 0
-    return {**default, **data}
-
-
-def _proactive_save_state(state: dict) -> None:
-    PROACTIVE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PROACTIVE_STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(PROACTIVE_STATE_PATH)
-
-
-def _proactive_log(event: dict) -> None:
-    full = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
-
-    def _do() -> None:
-        with _ragvec_state_conn() as conn:
-            _sql_append_event(conn, "rag_proactive_log",
-                               _map_proactive_row(full))
-    _sql_write_with_retry(_do, "proactive_sql_write_failed")
-
-
-def _proactive_can_push(kind: str) -> tuple[bool, str]:
-    """Devuelve (ok, reason). 'reason' explica por qué no se envía."""
-    cfg = _ambient_config()
-    if not cfg:
-        return (False, "ambient WA no habilitado (/enable_ambient desde el bot)")
-    state = _proactive_load_state()
-    if kind in state.get("silenced", []):
-        return (False, f"{kind} silenciado (rag silence off {kind})")
-    snooze_ts = state.get("snooze", {}).get(kind)
-    if snooze_ts:
-        try:
-            until = datetime.fromisoformat(snooze_ts)
-            if datetime.now() < until:
-                return (False, f"{kind} en snooze hasta {until.isoformat(timespec='minutes')}")
-        except Exception:
-            pass
-    if state.get("daily_count", 0) >= PROACTIVE_DAILY_CAP:
-        return (False, f"daily cap alcanzado ({PROACTIVE_DAILY_CAP})")
-    return (True, "")
-
-
-def proactive_push(kind: str, message: str, *, snooze_hours: int | None = None) -> bool:
-    """Push proactivo a WA con rate-limit + silencio + snooze compartidos.
-
-    Si `snooze_hours` se pasa, tras enviar el kind entra en snooze por ese
-    tiempo — evita repetir el mismo trigger (ej: emergent theme sobre 'X'
-    ya se pingeó, no repetir hasta snooze_hours después).
-    """
-    ok, reason = _proactive_can_push(kind)
-    if not ok:
-        _proactive_log({"kind": kind, "sent": False, "reason": reason})
-        return False
-    cfg = _ambient_config()
-    if not cfg:
-        return False
-    sent = _ambient_whatsapp_send(cfg["jid"], message)
-    state = _proactive_load_state()
-    if sent:
-        state["daily_count"] = state.get("daily_count", 0) + 1
-        if snooze_hours:
-            state.setdefault("snooze", {})[kind] = (
-                datetime.now() + timedelta(hours=snooze_hours)
-            ).isoformat(timespec="seconds")
-        _proactive_save_state(state)
-    _proactive_log({"kind": kind, "sent": sent, "message_preview": message[:120]})
-    return sent
+# ── Phase 4a: proactive nudges moved to `rag.proactive` (2026-04-25) ──────
+# Shared push pipeline (rate-limit + silence + snooze + daily_cap) extracted
+# to `rag/proactive.py`. Surfaces re-exported at the bottom of this file:
+# `PROACTIVE_*` constants + `_proactive_load_state` / `_proactive_save_state` /
+# `_proactive_log` / `_proactive_can_push` / `proactive_push`. Used by
+# emergent themes, feedback patterns, anticipate agent, reminder push.
 
 
 def _scan_queries_log(days: int = 14) -> list[dict]:
@@ -36772,118 +36684,11 @@ def _generate_today_narrative(prompt: str) -> str:
         return ""
 
 
-@cli.command("wa-tasks")
-@click.option("--dry-run", is_flag=True,
-              help="Imprimir acciones extraídas sin escribir el archivo")
-@click.option("--hours", type=int, default=None,
-              help="Ventana en horas (default: desde último run, o 24h si es la primera corrida)")
-@click.option("--force", is_flag=True,
-              help="Ignorar state file: procesar toda la ventana como si nunca se hubiera corrido")
-def wa_tasks(dry_run: bool, hours: int | None, force: bool):
-    """Extrae tareas, preguntas y compromisos de WhatsApp al Inbox.
-
-    Lee delta del bridge SQLite (is_from_me=0, ventana incremental vs último
-    run). Agrupa por chat; si un chat tiene ≥2 mensajes entrantes nuevos,
-    qwen2.5:3b destila action items. Escribe `00-Inbox/WA-YYYY-MM-DD.md`
-    con frontmatter `ambient: skip` (evita loop) + wikilinks al archivo
-    del chat/mes. Idempotente: sin items nuevos → no-op silencioso.
-
-    Ideal como launchd cada 30min — el file dispara el watch (00-Inbox
-    no está excluido), el morning lo ve como evidencia, y `rag query`
-    lo recupera como cualquier otra nota.
-    """
-    now = datetime.now()
-    state = _wa_tasks_load_state() if not force else {"last_run_ts": None, "processed_ids": []}
-    if hours is not None:
-        since = now - timedelta(hours=max(1, int(hours)))
-    elif state.get("last_run_ts"):
-        try:
-            since = datetime.fromisoformat(state["last_run_ts"])
-        except Exception:
-            since = now - timedelta(hours=24)
-    else:
-        since = now - timedelta(hours=24)
-
-    processed = set(state.get("processed_ids") or [])
-    by_chat = _fetch_whatsapp_window(since, now, processed)
-    if not by_chat:
-        console.print(f"[dim]sin chats con actividad nueva desde {since:%Y-%m-%d %H:%M}[/dim]")
-        if not dry_run:
-            state["last_run_ts"] = now.isoformat(timespec="seconds")
-            _wa_tasks_save_state(state)
-        return
-
-    console.print(
-        f"[dim]Ventana:[/dim] {since:%Y-%m-%d %H:%M} → {now:%H:%M} · "
-        f"{len(by_chat)} chats con nuevos mensajes entrantes"
-    )
-    extractions: list[dict] = []
-    for chat in by_chat:
-        ext = _wa_extract_actions(chat["label"], chat["is_group"], chat["messages"])
-        extractions.append(ext)
-        n = len(ext["tasks"]) + len(ext["questions"]) + len(ext["commitments"])
-        tag = "[green]✓[/green]" if n else "[dim]·[/dim]"
-        console.print(f"  {tag} [cyan]{chat['label']}[/cyan] · {chat['inbound']} inbound → {n} items")
-
-    total = sum(
-        len(e["tasks"]) + len(e["questions"]) + len(e["commitments"])
-        for e in extractions
-    )
-    if total == 0:
-        console.print("[yellow]sin items accionables extraídos[/yellow]")
-        if not dry_run:
-            state["last_run_ts"] = now.isoformat(timespec="seconds")
-            # Still record the fetched msg ids so we don't re-scan them next run.
-            for chat in by_chat:
-                for mid in chat["new_ids"]:
-                    state.setdefault("processed_ids", []).append(mid)
-            _wa_tasks_save_state(state)
-        return
-
-    if dry_run:
-        console.print(f"\n[bold]{total} items extraídos (dry-run — no se escribe)[/bold]")
-        for chat, ext in zip(by_chat, extractions):
-            if not any(ext[k] for k in ("tasks", "questions", "commitments")):
-                continue
-            console.print(f"\n[cyan]{chat['label']}[/cyan]")
-            for t in ext["tasks"]:
-                console.print(f"  [ ] {t}")
-            for q in ext["questions"]:
-                console.print(f"  ❓ {q}")
-            for c in ext["commitments"]:
-                console.print(f"  📌 {c}")
-        return
-
-    note_path, created, n_new = _wa_tasks_write_note(
-        VAULT_PATH, now, by_chat, extractions,
-    )
-    # Update state with ALL fetched new ids (including ones from chats that
-    # produced no extractions — we don't want to reprocess them).
-    for chat in by_chat:
-        for mid in chat["new_ids"]:
-            state.setdefault("processed_ids", []).append(mid)
-    state["last_run_ts"] = now.isoformat(timespec="seconds")
-    _wa_tasks_save_state(state)
-
-    # Append to log for analytics / debugging.
-    _wa_log_event = {
-        "ts": now.isoformat(timespec="seconds"),
-        "since": since.isoformat(timespec="seconds"),
-        "chats": len(by_chat),
-        "items": n_new,
-        "path": str(note_path.relative_to(VAULT_PATH)),
-    }
-    def _do_wa_log() -> None:
-        with _ragvec_state_conn() as conn:
-            _sql_append_event(conn, "rag_wa_tasks",
-                               _map_wa_tasks_row(_wa_log_event))
-    _sql_write_with_retry(_do_wa_log, "wa_tasks_sql_write_failed")
-
-    rel = note_path.relative_to(VAULT_PATH)
-    verb = "creado" if created else "actualizado"
-    console.print(
-        f"\n[green]✓[/green] {verb}: [cyan]{rel}[/cyan] · {n_new} items"
-    )
+# ── Phase 4b: `rag wa-tasks` Click command moved to `rag.wa_tasks` ──────
+# Thin CLI wrapper that orchestrates `_fetch_whatsapp_window` →
+# `_wa_extract_actions` → `_wa_tasks_write_note` (all already in
+# `rag.integrations.whatsapp` since Phase 1b). Re-imported at the bottom
+# of this file so `rag.wa_tasks` resolves the same Click command.
 
 
 @cli.command("remind-wa")
@@ -49963,7 +49768,26 @@ if __name__ == "__main__":
 import sys as _sys_for_reload  # noqa: E402
 _sys_for_reload.modules.pop("rag.whisper", None)
 _sys_for_reload.modules.pop("rag.anticipatory", None)
+_sys_for_reload.modules.pop("rag.proactive", None)
+_sys_for_reload.modules.pop("rag.wa_tasks", None)
 del _sys_for_reload
+
+# Phase 4a re-export: proactive nudges. NOTE: must come BEFORE rag.anticipatory
+# because the anticipatory orchestrator references rag.proactive_push at call
+# time. Phase 4a is also imported BEFORE the integrations shim because
+# `_proactive_can_push` calls `_ambient_config` which is in __init__ proper
+# (not in any submodule), so order between proactive and integrations doesn't
+# matter for correctness — alphabetical-ish order kept for readability.
+from rag.proactive import (  # noqa: E402, F401
+    PROACTIVE_DAILY_CAP,
+    PROACTIVE_LOG_PATH,
+    PROACTIVE_STATE_PATH,
+    _proactive_can_push,
+    _proactive_load_state,
+    _proactive_log,
+    _proactive_save_state,
+    proactive_push,
+)
 from rag.whisper import (  # noqa: E402, F401
     _WHISPER_MODEL_DEFAULT,
     _audio_transcript_cache_get,
@@ -50024,6 +49848,16 @@ from rag.anticipatory import (  # noqa: E402, F401
     anticipate_run,
     anticipate_run_impl,
 )
+
+
+# ── Phase 4b: rag.wa_tasks re-export shim (2026-04-25) ───────────────────────
+# `rag wa-tasks` Click command moved to `rag/wa_tasks.py`. The bulk of the
+# pipeline (`_fetch_whatsapp_window`, `_wa_extract_actions`,
+# `_wa_tasks_write_note`, `_wa_tasks_load_state`, `_wa_tasks_save_state`)
+# was already extracted to `rag.integrations.whatsapp` in Phase 1b; this
+# imports the thin CLI wrapper, which triggers the `@cli.command("wa-tasks")`
+# decorator → registers `wa-tasks` on the global `cli`.
+from rag.wa_tasks import wa_tasks  # noqa: E402, F401
 
 
 # ── Phase 1b: integrations re-export shim (2026-04-25) ───────────────────────

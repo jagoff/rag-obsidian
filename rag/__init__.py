@@ -49968,8 +49968,7 @@ def feedback_classify_sessions(
 
 @cli.command("tune-lambdarank")
 @click.option("--apply", is_flag=True,
-              help="Persiste el modelo a ranker.lgbm. Sin --apply: dry-run "
-                   "(reporta sin guardar).")
+              help="Persiste el modelo a ranker.lgbm. Sin --apply: dry-run.")
 @click.option("--num-boost-round", "num_boost_round", default=200,
               show_default=True,
               help="Máximo árboles. Lightgbm puede early-stop antes.")
@@ -49981,12 +49980,17 @@ def feedback_classify_sessions(
               help="Complejidad por árbol. Default 31 captura interacciones.")
 @click.option("--val-fraction", "val_fraction", default=0.2,
               show_default=True, type=float,
-              help="Fracción de queries para validación. 0 = sin val "
-                   "(solo train, sin early stopping).")
+              help="Fracción de queries para validación. 0 = sin val.")
 @click.option("--skip-no-corrective", is_flag=True,
-              help="Solo entrenar sobre queries con corrective_path "
-                   "(signal explícita o inferida). Recomendado cuando hay "
-                   "feedback denso.")
+              help="Solo entrenar sobre queries con corrective_path.")
+@click.option("--use-synthetic/--no-use-synthetic", default=True,
+              show_default=True,
+              help="Incluir synthetic queries + hard negatives en el "
+                   "training set. Sprint 2.A: data augmentation desde el "
+                   "corpus para destrabar el modelo.")
+@click.option("--use-feedback/--no-use-feedback", default=True,
+              show_default=True,
+              help="Incluir feedback real (rag_feedback) en el training set.")
 @click.option("--json", "as_json", is_flag=True,
               help="Output como JSON (para launchd).")
 def tune_lambdarank(
@@ -49996,6 +50000,8 @@ def tune_lambdarank(
     num_leaves: int,
     val_fraction: float,
     skip_no_corrective: bool,
+    use_synthetic: bool,
+    use_feedback: bool,
     as_json: bool,
 ) -> None:
     """Entrenar un LightGBM lambdarank sobre `rag_feedback` (Sprint 2).
@@ -50018,24 +50024,32 @@ def tune_lambdarank(
     from rag_ranker_lgbm import (
         DEFAULT_MODEL_PATH,
         FEATURE_NAMES,
-        feedback_to_training_data,
         train_lambdarank,
     )
+    from rag_ranker_lgbm.features import combined_training_data
     from rag_ranker_lgbm.train import persist_train_run_to_telemetry
 
     console.print()
     console.print("[bold]rag tune-lambdarank[/bold]")
-    console.print("  Recolectando training data desde rag_feedback...")
+    console.print(
+        f"  Sources: feedback={use_feedback}, synthetic={use_synthetic}"
+    )
+    console.print("  Recolectando training data...")
 
     with _ragvec_state_conn() as conn:
-        data = feedback_to_training_data(
-            conn, skip_queries_without_corrective=skip_no_corrective
+        data = combined_training_data(
+            conn,
+            use_feedback=use_feedback,
+            use_synthetic=use_synthetic,
+            feedback_kwargs={
+                "skip_queries_without_corrective": skip_no_corrective,
+            },
         )
 
-        console.print(f"  Queries: {data['n_queries']}  ·  "
+        console.print(f"  Queries totales: {data['n_queries']}  ·  "
                       f"Candidates: {data['n_candidates']}")
-        console.print(f"  Skip — sin signal:      {data['n_skipped_no_signal']}")
-        console.print(f"  Skip — replay falló:    {data['n_skipped_no_features']}")
+        console.print(f"    feedback:  {data['sources']['feedback']}")
+        console.print(f"    synthetic: {data['sources']['synthetic']}")
         console.print()
 
         if data["n_queries"] == 0:

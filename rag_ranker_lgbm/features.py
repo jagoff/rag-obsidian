@@ -283,3 +283,164 @@ def _default_replay_features(query: str) -> list[dict[str, Any]]:
     return rag.collect_ranker_features(
         col, query, k_pool=15, multi_query=False, auto_filter=True
     )
+
+
+def synthetic_to_training_data(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    replay_features_fn=None,
+) -> dict[str, Any]:
+    """Construir training data desde rag_synthetic_queries +
+    rag_synthetic_negatives + collect_ranker_features.
+
+    A diferencia de feedback_to_training_data() (que reads rag_feedback),
+    este lee de las 2 tablas synthetic:
+      - rag_synthetic_queries: positives con label 2.
+      - rag_synthetic_negatives: hard negatives con label 0.
+
+    Replay collect_ranker_features() para cada synth query, y label cada
+    candidato según:
+      - candidate == positive_path → label 2
+      - candidate ∈ hard_negatives_for_this_query → label 0
+      - otherwise → label 0 (in-batch negative implícito)
+
+    Args:
+        conn: connection a telemetry.db.
+        limit: máximo synthetic queries a procesar.
+        replay_features_fn: callable query → candidates. Default = bge-m3.
+
+    Returns:
+        dict con X, y, group + métricas.
+    """
+    if replay_features_fn is None:
+        replay_features_fn = _default_replay_features
+
+    sql = """
+        SELECT sq.id, sq.query, sq.note_path
+        FROM rag_synthetic_queries sq
+        ORDER BY sq.id ASC
+    """
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    queries = conn.execute(sql).fetchall()
+
+    X: list[list[float]] = []
+    y: list[int] = []
+    group: list[int] = []
+    n_skipped_no_features = 0
+
+    for synth_id, query, positive_path in queries:
+        # Get hard negatives for this query (set lookup en RAM).
+        neg_rows = conn.execute(
+            "SELECT neg_path FROM rag_synthetic_negatives "
+            "WHERE synthetic_query_id = ?",
+            (synth_id,),
+        ).fetchall()
+        hard_negatives = {row[0] for row in neg_rows}
+
+        # Replay features for this query.
+        try:
+            candidates = replay_features_fn(query)
+        except Exception:
+            n_skipped_no_features += 1
+            continue
+        if not candidates:
+            n_skipped_no_features += 1
+            continue
+
+        has_recency_cue = bool(candidates[0].get("has_recency_cue", False))
+
+        group_size = 0
+        for cand in candidates:
+            cand_path = cand["path"]
+            if cand_path == positive_path:
+                label = 2
+            elif cand_path in hard_negatives:
+                label = 0
+            else:
+                # In-batch implicit negative: el candidate apareció en el
+                # top-k del retrieval pero NO es ni el positive ni un
+                # hard negative explícito → likely irrelevant.
+                label = 0
+            X.append(_candidate_to_feature_vector(cand, has_recency_cue))
+            y.append(label)
+            group_size += 1
+
+        if group_size == 0:
+            n_skipped_no_features += 1
+            continue
+        group.append(group_size)
+
+    return {
+        "X": X,
+        "y": y,
+        "group": group,
+        "feature_names": FEATURE_NAMES,
+        "n_queries": len(group),
+        "n_candidates": len(X),
+        "n_skipped_no_features": n_skipped_no_features,
+    }
+
+
+def combined_training_data(
+    conn: sqlite3.Connection,
+    *,
+    use_feedback: bool = True,
+    use_synthetic: bool = True,
+    synthetic_limit: int | None = None,
+    feedback_kwargs: dict | None = None,
+    replay_features_fn=None,
+) -> dict[str, Any]:
+    """Combina feedback real + synthetic data en un solo training set.
+
+    Concatena los X/y/group de ambas fuentes. La feature dimension es la
+    misma (FEATURE_NAMES) entonces concat es directo.
+
+    Args:
+        conn: connection.
+        use_feedback: si True, incluye datos de rag_feedback.
+        use_synthetic: si True, incluye datos de rag_synthetic_queries +
+            rag_synthetic_negatives.
+        synthetic_limit: máximo synthetic queries.
+        feedback_kwargs: kwargs extra para feedback_to_training_data.
+        replay_features_fn: callable query → candidates. Default real.
+
+    Returns:
+        dict combinado con X, y, group + breakdown de fuentes.
+    """
+    feedback_kwargs = feedback_kwargs or {}
+
+    X_combined: list[list[float]] = []
+    y_combined: list[int] = []
+    group_combined: list[int] = []
+    sources: dict[str, int] = {"feedback": 0, "synthetic": 0}
+
+    if use_feedback:
+        fb_data = feedback_to_training_data(
+            conn, replay_features_fn=replay_features_fn, **feedback_kwargs
+        )
+        X_combined.extend(fb_data["X"])
+        y_combined.extend(fb_data["y"])
+        group_combined.extend(fb_data["group"])
+        sources["feedback"] = fb_data["n_queries"]
+
+    if use_synthetic:
+        synth_data = synthetic_to_training_data(
+            conn, limit=synthetic_limit,
+            replay_features_fn=replay_features_fn,
+        )
+        X_combined.extend(synth_data["X"])
+        y_combined.extend(synth_data["y"])
+        group_combined.extend(synth_data["group"])
+        sources["synthetic"] = synth_data["n_queries"]
+
+    return {
+        "X": X_combined,
+        "y": y_combined,
+        "group": group_combined,
+        "feature_names": FEATURE_NAMES,
+        "n_queries": len(group_combined),
+        "n_candidates": len(X_combined),
+        "sources": sources,
+    }

@@ -39238,9 +39238,16 @@ def _web_plist(rag_bin: str) -> str:
     `from rag import ...` misses the setdefault. Setting the offline flags
     in the plist dict eliminates that race.
     """
-    venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
-    web_server = Path(__file__).resolve().parent / "web" / "server.py"
-    working_dir = Path(__file__).resolve().parent
+    # Repo root is two levels up from this file (rag/__init__.py); the venv
+    # and web/ subtree both live at the repo root, NOT inside the `rag/`
+    # package dir. Using `.parent` only (a single level) yielded
+    # `…/obsidian-rag/rag/.venv/bin/python` and `…/obsidian-rag/rag/web/server.py`
+    # — paths that don't exist — and left the daemon crashing with exit 78
+    # until the plist was patched by hand. Bug found 2026-04-26.
+    repo_root = Path(__file__).resolve().parent.parent
+    venv_python = repo_root / ".venv" / "bin" / "python"
+    web_server = repo_root / "web" / "server.py"
+    working_dir = repo_root
     # Youtube key is optional — include only if present in the env to avoid
     # hard-coding a secret at setup time. Most installs leave it blank.
     youtube_key = os.environ.get("YOUTUBE_API_KEY", "")

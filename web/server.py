@@ -12730,6 +12730,7 @@ def learning_api(days: int = 30) -> dict:
         routing_learning,
         score_calibration,
         vault_intelligence,
+        verdict,
         whisper_learning,
     )
     payload = {
@@ -12737,6 +12738,11 @@ def learning_api(days: int = 30) -> dict:
             "window_days": days,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
+        # Veredicto: ¿aprende cada uno de los 12 sistemas? Origen: el
+        # diagnóstico manual del 2026-04-26 que detectó loop roto en
+        # anticipatory + 3 sistemas dormidos. Auto-generado para que la
+        # próxima vez algo se rompa, esté visible en /dashboard/learning.
+        "verdict": verdict(),
         "kpis": kpis(days),
         "sections": {
             "retrieval_quality": retrieval_quality(days),
@@ -12753,6 +12759,51 @@ def learning_api(days: int = 30) -> dict:
         },
     }
     _LEARNING_CACHE[days] = (now_ts, payload)
+    return payload
+
+
+# ── /api/dashboard/learning/health ─────────────────────────────────────────
+# Semáforo del sistema: bloque "verde / amarillo / rojo" arriba del dashboard
+# que un usuario sin conocimiento técnico interpreta en 2s. Computa 6 señales
+# (acierto en preguntas simples + complejas, servicios, vault al día, errores
+# 24h, velocidad de respuesta) y aplica worst-case wins. Ver `system_health`
+# en `web/learning_queries.py` para la lógica + thresholds.
+#
+# TTL=15s — más corto que `/api/dashboard/learning` (60s) porque queremos
+# que el banner refresque rápido. La señal `services` invoca `launchctl list`
+# (subprocess, ~50ms) — el resto son SQL reads cacheados por _ragvec_state_conn.
+
+_LEARNING_HEALTH_CACHE: tuple[float, dict] | None = None
+_LEARNING_HEALTH_TTL = 15.0
+
+
+@app.get("/api/dashboard/learning/health")
+def learning_health_api() -> dict:
+    """Devuelve el semáforo del sistema. Shape estable:
+
+        {
+          "level": "green" | "yellow" | "red",
+          "headline": "Todo funcionando bien" | ...,
+          "summary": "El sistema responde bien y está al día.",
+          "signals": [
+            {"key": ..., "label": ..., "level": ...,
+             "value_text": ..., "value_raw": ..., "tooltip": ...,
+             "explanation": ...},
+            ...
+          ],
+          "checked_at": "2026-04-26T..."
+        }
+
+    Cache TTL=15s. Cada señal corre en try/except independiente — la falla
+    de una NO afecta a las otras."""
+    global _LEARNING_HEALTH_CACHE
+    now_ts = time.time()
+    hit = _LEARNING_HEALTH_CACHE
+    if hit and now_ts - hit[0] < _LEARNING_HEALTH_TTL:
+        return hit[1]
+    from web.learning_queries import system_health
+    payload = system_health()
+    _LEARNING_HEALTH_CACHE = (now_ts, payload)
     return payload
 
 

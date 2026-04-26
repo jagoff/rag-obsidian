@@ -253,6 +253,106 @@
       color: var(--text-faint);
     }
 
+    /* ── Veredicto (estado de los 12 sistemas de aprendizaje) ──────── */
+    .verdict {
+      padding: 18px 24px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .verdict-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .verdict-summary {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .verdict-headline {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .verdict-counts {
+      display: inline-flex;
+      gap: 14px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .vc { display: inline-flex; align-items: center; gap: 6px; }
+    .vc-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .vc-alive .vc-dot { background: var(--green); box-shadow: 0 0 6px rgba(126,231,135,0.55); }
+    .vc-stale .vc-dot { background: var(--yellow); }
+    .vc-dormant .vc-dot { background: var(--red); }
+    .verdict-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+    @media (max-width: 1100px) {
+      .verdict-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 640px) {
+      .verdict-grid { grid-template-columns: 1fr; }
+    }
+    .vsys {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-height: 64px;
+    }
+    .vsys-alive   { border-left-color: var(--green); }
+    .vsys-stale   { border-left-color: var(--yellow); }
+    .vsys-dormant { border-left-color: var(--red); }
+    .vsys-row1 {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .vsys-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.01em;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .vsys-when {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+    .vsys-metric {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.01em;
+    }
+    .vsys-note {
+      font-size: 10px;
+      color: var(--yellow);
+      margin-top: 2px;
+      font-style: italic;
+    }
+    .vsys-dormant .vsys-note { color: var(--red); }
+
     /* ── KPI hero (8 tarjetas grandes, 4 cols desktop / 2 mobile) ──── */
     .kpi-hero {
       display: grid;
@@ -619,6 +719,25 @@
   </header>
 
   <main id="content" tabindex="-1">
+    <!-- ── VEREDICTO ─────────────────────────────────────────────
+         Estado actual de los 12 sistemas de aprendizaje. Auto-generado
+         desde `verdict()` en `web/learning_queries.py`. La idea: lo que
+         antes había que diagnosticar a mano (¿aprende?, ¿cuánto?, ¿cuándo?)
+         ahora vive permanente acá. Si un sistema se rompe, se ve en rojo. -->
+    <section class="verdict" id="verdict-hero" aria-label="Veredicto del aprendizaje del sistema">
+      <header class="verdict-hdr">
+        <div class="verdict-summary">
+          <span class="verdict-headline" id="verdict-headline">cargando&hellip;</span>
+          <span class="verdict-counts">
+            <span class="vc vc-alive"><span class="vc-dot"></span><span id="verdict-count-alive">0</span> vivos</span>
+            <span class="vc vc-stale"><span class="vc-dot"></span><span id="verdict-count-stale">0</span> stale</span>
+            <span class="vc vc-dormant"><span class="vc-dot"></span><span id="verdict-count-dormant">0</span> dormidos</span>
+          </span>
+        </div>
+      </header>
+      <div class="verdict-grid" id="verdict-grid"></div>
+    </section>
+
     <!-- ── KPI HERO ─────────────────────────────────────────────── -->
     <section class="kpi-hero" aria-label="Indicadores clave de aprendizaje">
       <div class="kpi" id="kpi-eval-singles">

@@ -1830,3 +1830,1070 @@ def _vault_surface_archive_over_time(days: int) -> dict:
     return _sql_read_with_retry(
         _do, "learning_vault_surface_archive_failed", default=_empty_series(),
     )
+
+
+# ── /api/dashboard/learning/health ─────────────────────────────────────────
+# Semáforo del sistema. Devuelve un nivel global (green/yellow/red) +
+# señales individuales con texto en lenguaje plain. Pensado para que un
+# usuario sin conocimiento técnico abra el dashboard y entienda en 2s si
+# algo está mal o no.
+#
+# Filosofía:
+#   - "Worst-case wins": si una sola señal está roja, el banner va rojo.
+#   - Cada señal trae 4 datos: nivel propio, valor crudo (para el dev),
+#     texto plain (para el usuario), y tooltip técnico (para el dev en hover).
+#   - Thresholds basados en p50 histórico (30d) — ver constantes ``_HEALTH_*``
+#     más abajo. Son ajustables sin romper el shape del payload.
+#
+# Aprendido el 2026-04-26: el dashboard previo tenía 8 KPIs + 11 secciones
+# + 43 charts pero ningún indicador de "todo OK / algo mal". Un usuario
+# sin contexto necesitaba interpretar números técnicos para saber si el
+# sistema estaba andando. Este endpoint resuelve esa pregunta primero.
+
+# Thresholds — verde es ≥, rojo es ≤, amarillo en el medio.
+_HEALTH_RETRIEVAL_SINGLES_GREEN = 0.75   # ≥75% del eval set en top-5
+_HEALTH_RETRIEVAL_SINGLES_RED = 0.60     # <60% es señal de regresión
+_HEALTH_RETRIEVAL_CHAINS_GREEN = 0.80    # ≥80% multi-hop OK
+_HEALTH_RETRIEVAL_CHAINS_RED = 0.65      # <65% multi-hop está roto
+_HEALTH_VAULT_GREEN_HOURS = 2.0          # último cambio indexado <2h
+_HEALTH_VAULT_RED_HOURS = 12.0           # >12h sin actividad de indexación
+_HEALTH_ERRORS_GREEN_PCT = 0.0           # 0% degraded runs últimas 24h
+_HEALTH_ERRORS_RED_PCT = 0.05            # >5% es señal real
+_HEALTH_SPEED_GREEN_S = 20.0             # p95 latencia <20s (datos reales: p50=9s, p95=32s)
+_HEALTH_SPEED_RED_S = 45.0               # >45s p95 ya es problema operativo
+_HEALTH_SPEED_MIN_SAMPLES = 20           # n<20 → "sin suficientes datos" (yellow)
+
+# Servicios "críticos" — si UNO de estos está caído, level=red. Servicios
+# secundarios (digest, archive, etc.) son tolerables → max amarillo.
+_HEALTH_CRITICAL_SERVICES = {
+    "com.fer.obsidian-rag-web",     # web UI + chat SSE
+    "com.fer.obsidian-rag-watch",   # vault file watcher
+    "com.fer.obsidian-rag-serve",   # query server hot path
+}
+
+
+def _level_worst(levels: list[str]) -> str:
+    """Worst-case wins: red > yellow > green. Default green si lista vacía."""
+    if "red" in levels:
+        return "red"
+    if "yellow" in levels:
+        return "yellow"
+    return "green"
+
+
+def _signal(*, key: str, label: str, level: str, value_text: str,
+            value_raw: float | int | str | None, tooltip: str,
+            explanation: str = "") -> dict:
+    """Shape canonical de una señal individual. Todas las funciones
+    ``_health_*`` devuelven exactamente este dict."""
+    return {
+        "key": key,
+        "label": label,
+        "level": level,
+        "value_text": value_text,
+        "value_raw": value_raw,
+        "tooltip": tooltip,
+        "explanation": explanation,
+    }
+
+
+def _health_retrieval(column: str, *, key: str, label_simple_or_complex: str,
+                      tooltip_kind: str,
+                      green_th: float, red_th: float) -> dict:
+    """Una señal de calidad de retrieval (singles o chains). Reusa el
+    pattern de ``_kpi_eval_hit5`` pero devuelve el shape de health."""
+    from rag import _ragvec_state_conn, _sql_read_with_retry
+
+    cutoff = _cutoff_iso(30)
+
+    def _do() -> dict:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                f"SELECT AVG({column}) AS v, COUNT({column}) AS n "
+                "FROM rag_eval_runs WHERE ts >= ?",
+                (cutoff,),
+            ).fetchone()
+        v = float(row[0]) if row and row[0] is not None else 0.0
+        n = int(row[1]) if row and row[1] is not None else 0
+        if n < _INSUFFICIENT_THRESHOLD:
+            return _signal(
+                key=key,
+                label=f"Acierto en {label_simple_or_complex}",
+                level="yellow",
+                value_text="Sin suficientes datos todavía",
+                value_raw=None,
+                tooltip=f"hit@5 sobre {tooltip_kind} del eval set",
+                explanation=f"Solo hay {n} corridas de eval en los últimos 30 días.",
+            )
+        # Texto en "X de cada 10 veces" para que sea intuitivo.
+        out_of_10 = round(v * 10, 1)
+        # Si es .0 lo mostramos sin decimal: "9 de cada 10". Si no: "8.5 de cada 10".
+        out_of_10_text = (
+            f"{int(out_of_10)}" if out_of_10 == int(out_of_10) else f"{out_of_10:.1f}"
+        )
+        if v >= green_th:
+            level = "green"
+        elif v <= red_th:
+            level = "red"
+        else:
+            level = "yellow"
+        return _signal(
+            key=key,
+            label=f"Acierto en {label_simple_or_complex}",
+            level=level,
+            value_text=f"{out_of_10_text} de cada 10 veces",
+            value_raw=round(v, 4),
+            tooltip=f"hit@5 sobre {tooltip_kind} del eval set",
+            explanation=f"Promedio últimos 30 días sobre {n} corridas de eval.",
+        )
+
+    return _sql_read_with_retry(
+        _do, f"learning_health_{key}_failed",
+        default=_signal(
+            key=key,
+            label=f"Acierto en {label_simple_or_complex}",
+            level="yellow",
+            value_text="No pude leer la base",
+            value_raw=None,
+            tooltip=f"hit@5 sobre {tooltip_kind} del eval set",
+            explanation="Falla al leer rag_eval_runs.",
+        ),
+    )
+
+
+def _health_services() -> dict:
+    """Lee `launchctl list` y verifica que los daemons críticos del RAG
+    tengan PID asignado (≠ "-"). Servicios programados (no-keepalive) que
+    están en exit 0 sin PID se consideran OK — son cron-style.
+
+    Tolerancia:
+      - Todos críticos arriba → green.
+      - 1 secundario caído (no en la lista crítica) → yellow.
+      - ≥1 crítico caído O ≥1 con last_exit != 0 → red.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"launchctl exit {result.returncode}")
+    except Exception:
+        return _signal(
+            key="services",
+            label="Servicios del sistema",
+            level="yellow",
+            value_text="No pude verificar el estado",
+            value_raw=None,
+            tooltip="`launchctl list` falló o no está disponible",
+            explanation="No pudimos consultar a macOS por el estado de los servicios.",
+        )
+
+    rag_lines = [
+        line for line in result.stdout.splitlines()
+        if "com.fer.obsidian-rag-" in line
+    ]
+    critical_down: list[str] = []
+    nonzero_exit: list[str] = []
+    n_running_critical = 0
+    seen_labels: set[str] = set()
+    for line in rag_lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        pid, status, label = parts[0], parts[1], parts[2]
+        seen_labels.add(label)
+        is_critical = label in _HEALTH_CRITICAL_SERVICES
+        try:
+            status_int = int(status)
+        except ValueError:
+            status_int = 0
+        has_pid = pid != "-"
+        # Si tiene PID, está corriendo AHORA. El status que reporta launchctl
+        # es del último exit ANTERIOR (post-bootout/restart típicamente -15
+        # SIGTERM), no del estado actual. Daemon con PID = vivo, regardless.
+        if has_pid:
+            if is_critical:
+                n_running_critical += 1
+            continue
+        # Sin PID — puede ser un crítico que se cayó O un job programado
+        # (cron-style con KeepAlive=false) que está esperando su próximo tick.
+        if is_critical:
+            # Crítico se espera que esté corriendo siempre (KeepAlive=true).
+            # Sin PID = caído.
+            critical_down.append(label.replace("com.fer.obsidian-rag-", ""))
+        elif status_int != 0:
+            # Secundario sin PID con last_exit != 0 (y != -15 SIGTERM): crash real.
+            # -15 SIGTERM es restart limpio, no crash.
+            if status_int != -15:
+                nonzero_exit.append(label.replace("com.fer.obsidian-rag-", ""))
+
+    # Si falta algún crítico de la lista esperada (no aparece en launchctl list).
+    for crit in _HEALTH_CRITICAL_SERVICES:
+        if crit not in seen_labels:
+            critical_down.append(crit.replace("com.fer.obsidian-rag-", "") + " (no instalado)")
+
+    if critical_down or nonzero_exit:
+        items_red = critical_down + [f"{s} (crasheó)" for s in nonzero_exit]
+        return _signal(
+            key="services",
+            label="Servicios del sistema",
+            level="red",
+            value_text="Hay servicios caídos: " + ", ".join(items_red[:3]),
+            value_raw=len(items_red),
+            tooltip="critical down: " + ",".join(critical_down) +
+                    " | nonzero exit: " + ",".join(nonzero_exit),
+            explanation="Si la búsqueda no responde, lo más probable es esto.",
+        )
+    return _signal(
+        key="services",
+        label="Servicios del sistema",
+        level="green",
+        value_text="Todos respondiendo bien",
+        value_raw=n_running_critical,
+        tooltip=f"{n_running_critical} críticos arriba: " +
+                ",".join(s.replace("com.fer.obsidian-rag-", "")
+                         for s in _HEALTH_CRITICAL_SERVICES),
+        explanation="Web, búsqueda e indexador están todos arriba.",
+    )
+
+
+def _health_vault_freshness() -> dict:
+    """¿Cuándo fue el último cambio que el sistema procesó? Mira el último
+    ts de ``rag_filing_log`` (acción de archiving) o ``rag_queries`` (uso
+    activo). Tomamos el MÁS reciente — si hay queries pero no filings, el
+    vault sigue activo aunque el indexer no haya tenido nada que archivar."""
+    from rag import _ragvec_state_conn, _sql_read_with_retry
+    import time as _time
+
+    def _do() -> dict:
+        with _ragvec_state_conn() as conn:
+            # rag_queries ts es ISO8601 — comparamos directamente con strftime.
+            row_q = conn.execute(
+                "SELECT MAX(ts) FROM rag_queries"
+            ).fetchone()
+            row_f = conn.execute(
+                "SELECT MAX(ts) FROM rag_filing_log"
+            ).fetchone()
+        last_q = row_q[0] if row_q and row_q[0] else None
+        last_f = row_f[0] if row_f and row_f[0] else None
+        candidates = [t for t in (last_q, last_f) if t]
+        if not candidates:
+            return _signal(
+                key="vault_freshness",
+                label="Vault al día",
+                level="yellow",
+                value_text="Sin actividad reciente",
+                value_raw=None,
+                tooltip="MAX(ts) de rag_queries y rag_filing_log: ambas vacías",
+                explanation="No hay queries ni archivos procesados todavía.",
+            )
+        last_iso = max(candidates)
+        # Parse ISO8601 sin timezone — asumimos local.
+        try:
+            last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+        except Exception:
+            return _signal(
+                key="vault_freshness",
+                label="Vault al día",
+                level="yellow",
+                value_text="No pude leer la fecha",
+                value_raw=last_iso,
+                tooltip=f"datetime.fromisoformat falló sobre: {last_iso}",
+                explanation="Fecha del último evento en formato inesperado.",
+            )
+        # Convertimos a aware si no lo es (ts naive = local time del sistema).
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.astimezone()
+        now = datetime.now(last_dt.tzinfo)
+        age_s = (now - last_dt).total_seconds()
+        age_h = age_s / 3600.0
+        if age_h < _HEALTH_VAULT_GREEN_HOURS:
+            level = "green"
+            text = _humanize_age(age_s) + " desde el último cambio"
+            expl = "Tu vault está siendo procesado al día."
+        elif age_h > _HEALTH_VAULT_RED_HOURS:
+            level = "red"
+            text = "Sin actividad hace " + _humanize_age(age_s)
+            expl = "El indexer puede estar caído o el vault sin uso."
+        else:
+            level = "yellow"
+            text = "Última actividad hace " + _humanize_age(age_s)
+            expl = "Todo OK pero hace un rato que no procesa nada."
+        return _signal(
+            key="vault_freshness",
+            label="Vault al día",
+            level=level,
+            value_text=text,
+            value_raw=round(age_h, 2),
+            tooltip="MAX(ts) de rag_queries ∪ rag_filing_log",
+            explanation=expl,
+        )
+
+    return _sql_read_with_retry(
+        _do, "learning_health_vault_freshness_failed",
+        default=_signal(
+            key="vault_freshness",
+            label="Vault al día",
+            level="yellow",
+            value_text="No pude leer la base",
+            value_raw=None,
+            tooltip="DB read failed",
+            explanation="Falla al consultar telemetry.db.",
+        ),
+    )
+
+
+def _humanize_age(seconds: float) -> str:
+    """7200 → '2 horas'. 90 → '1 minuto'. 86400 → '1 día'. Castellano."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} segundos" if seconds != 1 else "1 segundo"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minutos" if minutes != 1 else "1 minuto"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} horas" if hours != 1 else "1 hora"
+    days = hours // 24
+    return f"{days} días" if days != 1 else "1 día"
+
+
+def _health_errors_24h() -> dict:
+    """% de runs del home-compute que terminaron degraded en las últimas 24h.
+    Es el indicador más confiable de "algo se está rompiendo en silencio"
+    porque el home-compute corre cada vez que alguien abre /home (~50/hr) y
+    el flag `degraded` se setea cuando alguna sub-task tiró excepción."""
+    from rag import _ragvec_state_conn, _sql_read_with_retry
+
+    def _do() -> dict:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT SUM(degraded) AS d, COUNT(*) AS n "
+                "FROM rag_home_compute_metrics "
+                "WHERE ts >= datetime('now', '-1 day')"
+            ).fetchone()
+        n_degraded = int(row[0] or 0) if row else 0
+        n_total = int(row[1] or 0) if row else 0
+        if n_total == 0:
+            return _signal(
+                key="errors_24h",
+                label="Errores recientes",
+                level="yellow",
+                value_text="Sin actividad para evaluar",
+                value_raw=None,
+                tooltip="rag_home_compute_metrics vacío en últimas 24h",
+                explanation="Nadie abrió la home en 24h, no hay datos para chequear.",
+            )
+        pct = n_degraded / n_total
+        if pct <= _HEALTH_ERRORS_GREEN_PCT:
+            level = "green"
+            text = "Sin errores"
+            expl = "Ninguna corrida del sistema falló en las últimas 24 horas."
+        elif pct >= _HEALTH_ERRORS_RED_PCT:
+            level = "red"
+            text = f"{n_degraded} corridas fallaron de {n_total}"
+            expl = "Más del 5% del sistema falló — revisar los logs."
+        else:
+            level = "yellow"
+            text = f"{n_degraded} corridas degradadas de {n_total}"
+            expl = "Algunos errores aislados — vale la pena revisar."
+        return _signal(
+            key="errors_24h",
+            label="Errores recientes",
+            level=level,
+            value_text=text,
+            value_raw=round(pct, 4),
+            tooltip=f"SUM(degraded)/COUNT(*) de rag_home_compute_metrics 24h: "
+                    f"{n_degraded}/{n_total}",
+            explanation=expl,
+        )
+
+    return _sql_read_with_retry(
+        _do, "learning_health_errors_24h_failed",
+        default=_signal(
+            key="errors_24h",
+            label="Errores recientes",
+            level="yellow",
+            value_text="No pude leer la base",
+            value_raw=None,
+            tooltip="DB read failed",
+            explanation="Falla al consultar telemetry.db.",
+        ),
+    )
+
+
+def _health_response_speed() -> dict:
+    """p95 de latencia (t_retrieve + t_gen) en los últimos 7 días.
+    NTILE(100) sobre los queries con t > 0 nos da percentiles sin
+    necesidad de window functions complejas."""
+    from rag import _ragvec_state_conn, _sql_read_with_retry
+
+    def _do() -> dict:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute("""
+                WITH ranked AS (
+                  SELECT (COALESCE(t_retrieve,0)+COALESCE(t_gen,0)) AS t,
+                         NTILE(100) OVER (ORDER BY (COALESCE(t_retrieve,0)+COALESCE(t_gen,0))) AS pct
+                  FROM rag_queries
+                  WHERE ts >= datetime('now','-7 days')
+                    AND (COALESCE(t_retrieve,0)+COALESCE(t_gen,0)) > 0
+                )
+                SELECT MAX(t), COUNT(*) FROM ranked WHERE pct = 95
+            """).fetchone()
+        p95 = float(row[0]) if row and row[0] is not None else 0.0
+        n = int(row[1]) if row and row[1] is not None else 0
+        if n < _HEALTH_SPEED_MIN_SAMPLES:
+            return _signal(
+                key="response_speed",
+                label="Velocidad de respuesta",
+                level="yellow",
+                value_text=f"Sin suficientes consultas para medir (n={n})",
+                value_raw=None,
+                tooltip=f"NTILE(100) p95 de t_retrieve+t_gen en 7d, "
+                        f"n={n} < min={_HEALTH_SPEED_MIN_SAMPLES}",
+                explanation="Hacen falta más consultas en los últimos 7 días "
+                            "para que el p95 sea representativo.",
+            )
+        if p95 < _HEALTH_SPEED_GREEN_S:
+            level = "green"
+            text = f"95% de respuestas en menos de {p95:.0f}s"
+            expl = "El sistema responde rápido casi siempre."
+        elif p95 > _HEALTH_SPEED_RED_S:
+            level = "red"
+            text = f"Hay respuestas que tardan más de {p95:.0f}s"
+            expl = "El sistema está lento — revisar carga del LLM o de Ollama."
+        else:
+            level = "yellow"
+            text = f"95% de respuestas en menos de {p95:.0f}s"
+            expl = "Velocidad aceptable pero podría ser mejor."
+        return _signal(
+            key="response_speed",
+            label="Velocidad de respuesta",
+            level=level,
+            value_text=text,
+            value_raw=round(p95, 2),
+            tooltip=f"p95 latencia (t_retrieve+t_gen) últimos 7d sobre n={n}",
+            explanation=expl,
+        )
+
+    return _sql_read_with_retry(
+        _do, "learning_health_response_speed_failed",
+        default=_signal(
+            key="response_speed",
+            label="Velocidad de respuesta",
+            level="yellow",
+            value_text="No pude leer la base",
+            value_raw=None,
+            tooltip="DB read failed",
+            explanation="Falla al consultar telemetry.db.",
+        ),
+    )
+
+
+def system_health() -> dict:
+    """Computa el semáforo del sistema. Devuelve nivel global + lista de
+    señales individuales con texto en lenguaje plain.
+
+    Cada señal corre en un try/except independiente (vía
+    ``_sql_read_with_retry``); la falla de una NO contamina las otras —
+    devuelve nivel `yellow` y texto explicando que no pudo leer la base.
+
+    Side effect: ``_health_services`` invoca subprocess `launchctl list`
+    (timeout 5s). Si launchctl no está disponible (no-macOS) la señal
+    devuelve yellow.
+
+    El resultado se cachea en `web/server.py` con TTL=15s — es lo que
+    determina con qué frecuencia se actualiza el banner. Más corto que
+    el `/api/dashboard/learning` (60s) porque queremos que el usuario
+    vea cambios de salud rápido."""
+    signals = [
+        _health_retrieval(
+            "singles_hit5",
+            key="retrieval_singles",
+            label_simple_or_complex="preguntas simples",
+            tooltip_kind="singles",
+            green_th=_HEALTH_RETRIEVAL_SINGLES_GREEN,
+            red_th=_HEALTH_RETRIEVAL_SINGLES_RED,
+        ),
+        _health_retrieval(
+            "chains_hit5",
+            key="retrieval_chains",
+            label_simple_or_complex="preguntas con varios pasos",
+            tooltip_kind="chains",
+            green_th=_HEALTH_RETRIEVAL_CHAINS_GREEN,
+            red_th=_HEALTH_RETRIEVAL_CHAINS_RED,
+        ),
+        _health_services(),
+        _health_vault_freshness(),
+        _health_errors_24h(),
+        _health_response_speed(),
+    ]
+    overall = _level_worst([s["level"] for s in signals])
+    headlines = {
+        "green": "Todo funcionando bien",
+        "yellow": "Hay algo para vigilar",
+        "red": "Algo no está bien",
+    }
+    summaries = {
+        "green": "El sistema responde bien y está al día.",
+        "yellow": "Hay alguna señal que conviene revisar — todo lo crítico anda.",
+        "red": "Algo importante no está funcionando — mirá los detalles.",
+    }
+    return {
+        "level": overall,
+        "headline": headlines[overall],
+        "summary": summaries[overall],
+        "signals": signals,
+        "checked_at": datetime.now().astimezone().isoformat(),
+    }
+
+
+# ── Veredicto: ¿aprende cada sistema? ──────────────────────────────────────
+#
+# Una mirada honesta del estado del aprendizaje. Cada sistema está en uno de
+# tres estados: 🟢 alive (actividad reciente + cambios), 🟡 stale (hubo data
+# pero ya no), 🔴 dormant (nunca aprendió o loop roto).
+#
+# Origen: el diagnóstico manual que hicimos el 2026-04-26 detectó que de los
+# 11 sistemas de aprendizaje del RAG, 5 estaban vivos, 3 stale, 3 dormidos
+# (paraphrases vacío, routing rules sin data, audio corrections sin uso). El
+# loop de anticipatory estaba ROTO (72 candidates sent=0) porque ambient.json
+# no existía. Esta función automatiza ese diagnóstico para que no haya que
+# correrlo a mano nunca más.
+#
+# Importante: la regla de "alive" es flexible por sistema. Un sistema que
+# corre nightly se considera alive si tuvo update en las últimas 48h; uno
+# continuo (behavior, queries) en las últimas 6h. Si en el futuro cambian
+# las cadencias, ajustar `_VERDICT_THRESHOLDS_HOURS`.
+
+# Thresholds por sistema (en horas) para el corte alive/stale.
+# stale → alive si último update < alive_h. dormant si nunca o > stale_h.
+_VERDICT_THRESHOLDS_HOURS: dict[str, tuple[int, int]] = {
+    # Continuo (events constantes mientras el user usa el sistema)
+    "feedback":            (48, 24 * 14),    # 2d alive, 14d stale-cap
+    "behavior":            (6,  24 * 7),     # 6h alive, 7d stale-cap
+    "contradictions":      (24, 24 * 14),
+    "entities":            (24 * 7, 24 * 30),  # crece con indexing
+    # Nightly / cron
+    "ranker":              (24,      24 * 7),
+    "eval":                (24,      24 * 7),
+    "score_calibration":   (24 * 14, 24 * 60),
+    "whisper_vocab":       (24 * 14, 24 * 60),
+    # On-demand / depende de actividad del user
+    "anticipatory":        (48,      24 * 7),
+    "paraphrases":         (24 * 30, 24 * 90),
+    "routing_rules":       (24 * 30, 24 * 90),
+    "whisper_corrections": (24 * 30, 24 * 90),
+}
+
+
+def _hours_ago(ts_iso: str | None) -> float | None:
+    """Horas transcurridas desde un ISO8601 (o None). Si el ts no parsea,
+    devuelve None — el caller trata None como "nunca"."""
+    if not ts_iso:
+        return None
+    try:
+        # Soporta naive (lo más común en este DB) y aware. Comparamos contra
+        # naive UTC porque las tablas guardan localtime ISO sin tz.
+        ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        delta = datetime.now() - ts
+        return delta.total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _verdict_status(system_id: str, hours_since: float | None) -> str:
+    """Devuelve 'alive' | 'stale' | 'dormant' según `_VERDICT_THRESHOLDS_HOURS`.
+
+    Si `hours_since is None` (nunca tuvo update), devuelve 'dormant'.
+    """
+    if hours_since is None:
+        return "dormant"
+    alive_h, stale_h = _VERDICT_THRESHOLDS_HOURS.get(system_id, (24, 24 * 7))
+    if hours_since <= alive_h:
+        return "alive"
+    if hours_since <= stale_h:
+        return "stale"
+    return "dormant"
+
+
+def _format_hours_ago(hours: float | None) -> str:
+    """'hace 47min' | 'hace 3h' | 'hace 5d' | 'nunca'."""
+    if hours is None:
+        return "nunca"
+    if hours < 1:
+        mins = max(1, int(hours * 60))
+        return f"hace {mins}min"
+    if hours < 48:
+        return f"hace {int(round(hours))}h"
+    days = int(round(hours / 24))
+    return f"hace {days}d"
+
+
+def _verdict_ranker() -> dict:
+    """Ranker: comparar weights actual vs baseline embebido en metadata."""
+    out: dict = {
+        "id": "ranker",
+        "name": "Ranker (pesos del retrieval)",
+        "status": "dormant",
+        "last_active_ts": None,
+        "last_active_human": "nunca",
+        "metric": None,
+        "note": None,
+    }
+    # Last tune timestamp + estadística reciente
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts) FROM rag_tune"
+            ).fetchone()
+            last_ts = row[0] if row else None
+            stats = conn.execute(
+                "SELECT COUNT(*) AS total,"
+                " SUM(CASE WHEN delta > 0 THEN 1 ELSE 0 END) AS positive"
+                " FROM rag_tune WHERE ts >= datetime('now', '-7 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("ranker", hours_since)
+    # Cuánto cambió: # weights modificados + total absolute delta
+    try:
+        if _RANKER_PATH.is_file():
+            r = json.loads(_RANKER_PATH.read_text())
+            weights = r.get("weights") or {}
+            baseline = (r.get("metadata") or {}).get("baseline") or {}
+            n_changed = 0
+            total_delta = 0.0
+            for k in set(list(weights.keys()) + list(baseline.keys())):
+                cur = float(weights.get(k, 0) or 0)
+                base = float(baseline.get(k, 0) or 0)
+                if abs(cur - base) > 1e-6:
+                    n_changed += 1
+                    total_delta += abs(cur - base)
+            if weights:
+                out["metric"] = (
+                    f"{n_changed}/{len(weights)} pesos cambiados · "
+                    f"Δ total = {total_delta:.3f}"
+                )
+    except Exception:
+        pass
+    if stats and stats[0]:
+        total, positive = int(stats[0] or 0), int(stats[1] or 0)
+        if total > 5 and positive < total * 0.1:
+            out["note"] = (
+                f"{total} runs últimos 7d, solo {positive} mejoraron — "
+                "espacio de búsqueda saturado"
+            )
+    return out
+
+
+def _verdict_eval() -> dict:
+    """Eval: comparar hit5 últimos 7d vs ventana 7-30d para mostrar mejora."""
+    out: dict = {
+        "id": "eval", "name": "Eval scoring (calidad del retrieval)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            last = conn.execute("SELECT MAX(ts) FROM rag_eval_runs").fetchone()
+            recent = conn.execute(
+                "SELECT AVG(singles_hit5), AVG(chains_hit5), COUNT(*) "
+                "FROM rag_eval_runs WHERE ts >= datetime('now', '-7 days')"
+            ).fetchone()
+            prior = conn.execute(
+                "SELECT AVG(singles_hit5), COUNT(*) "
+                "FROM rag_eval_runs "
+                "WHERE ts < datetime('now', '-7 days') "
+                "  AND ts >= datetime('now', '-30 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = last[0] if last else None
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("eval", hours_since)
+    if recent and recent[0] is not None:
+        cur_hit5 = float(recent[0])
+        n_recent = int(recent[2] or 0)
+        prior_hit5 = float(prior[0]) if prior and prior[0] is not None else None
+        if prior_hit5 is not None and prior[1] and int(prior[1]) >= 5:
+            delta_pts = (cur_hit5 - prior_hit5) * 100
+            sign = "+" if delta_pts >= 0 else ""
+            out["metric"] = (
+                f"hit@5 = {cur_hit5*100:.1f}% (n={n_recent}) · "
+                f"{sign}{delta_pts:.1f}pts vs hace 30d"
+            )
+        else:
+            out["metric"] = f"hit@5 = {cur_hit5*100:.1f}% (n={n_recent})"
+    return out
+
+
+def _verdict_feedback() -> dict:
+    out: dict = {
+        "id": "feedback", "name": "Feedback explícito (👍/👎)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            last = conn.execute("SELECT MAX(ts) FROM rag_feedback").fetchone()
+            stats = conn.execute(
+                "SELECT "
+                " SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END), "
+                " SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END) "
+                "FROM rag_feedback WHERE ts >= datetime('now', '-7 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = last[0] if last else None
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("feedback", hours_since)
+    if stats:
+        pos = int(stats[0] or 0)
+        neg = int(stats[1] or 0)
+        if pos + neg > 0:
+            out["metric"] = f"{pos+neg} eventos últimos 7d ({pos}👍 / {neg}👎)"
+            if neg > pos * 1.5 and (pos + neg) >= 5:
+                out["note"] = "más 👎 que 👍 — revisar calidad del retrieval"
+    return out
+
+
+def _verdict_behavior() -> dict:
+    out: dict = {
+        "id": "behavior", "name": "Behavior (clicks, dwell, opens)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            last = conn.execute("SELECT MAX(ts) FROM rag_behavior").fetchone()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM rag_behavior "
+                "WHERE ts >= datetime('now', '-7 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = last[0] if last else None
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("behavior", hours_since)
+    if count and count[0]:
+        out["metric"] = f"{int(count[0]):,} eventos últimos 7d"
+    return out
+
+
+def _verdict_anticipatory() -> dict:
+    out: dict = {
+        "id": "anticipatory", "name": "Anticipatory agent (push proactivo)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            last = conn.execute(
+                "SELECT MAX(ts) FROM rag_anticipate_candidates"
+            ).fetchone()
+            stats = conn.execute(
+                "SELECT COUNT(*), SUM(sent) FROM rag_anticipate_candidates "
+                "WHERE ts >= datetime('now', '-2 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = last[0] if last else None
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("anticipatory", hours_since)
+    if stats and stats[0]:
+        total = int(stats[0] or 0)
+        sent = int(stats[1] or 0)
+        out["metric"] = f"{sent}/{total} enviados últimas 48h"
+        # Loop roto: hay candidates pero sent=0 → bajar a dormant aunque
+        # haya update reciente, porque el feedback loop está cortado.
+        if total >= 10 and sent == 0:
+            out["status"] = "dormant"
+            out["note"] = (
+                "loop cortado: genera candidates pero no envía "
+                "(probable: ambient.json missing o cap)"
+            )
+    return out
+
+
+def _verdict_paraphrases() -> dict:
+    out: dict = {
+        "id": "paraphrases", "name": "Paráfrasis aprendidas (query expansion)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(last_used_ts), COUNT(*), COALESCE(SUM(hit_count), 0) "
+                "FROM rag_learned_paraphrases"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = row[0] if row else None
+    count = int(row[1] or 0) if row else 0
+    hits = int(row[2] or 0) if row else 0
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("paraphrases", hours_since)
+    if count > 0:
+        out["metric"] = f"{count} aprendidas, {hits} usos"
+    else:
+        out["note"] = "ejecutar `rag paraphrases train` desde feedback positivo"
+    return out
+
+
+def _verdict_routing_rules() -> dict:
+    out: dict = {
+        "id": "routing_rules",
+        "name": "Routing rules (n-gram patterns para WA voice)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            rules = conn.execute(
+                "SELECT MAX(promoted_at), "
+                " COALESCE(SUM(active), 0), COUNT(*) "
+                "FROM rag_routing_rules"
+            ).fetchone()
+            decisions = conn.execute(
+                "SELECT COUNT(*) FROM rag_routing_decisions"
+            ).fetchone()
+    except Exception:
+        return out
+    last_unix = rules[0] if rules else None
+    last_ts = (
+        datetime.fromtimestamp(int(last_unix)).isoformat(timespec="seconds")
+        if last_unix else None
+    )
+    active = int(rules[1] or 0) if rules else 0
+    n_decisions = int(decisions[0] or 0) if decisions else 0
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("routing_rules", hours_since)
+    if active > 0:
+        out["metric"] = f"{active} reglas activas · {n_decisions} decisions"
+    elif n_decisions < 10:
+        out["note"] = f"sin data ({n_decisions} decisions, mínimo ~50 para extraer patterns)"
+    return out
+
+
+def _verdict_whisper_vocab() -> dict:
+    out: dict = {
+        "id": "whisper_vocab", "name": "Whisper vocab (boost en STT prompt)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(refreshed_at), COUNT(*) FROM rag_whisper_vocab"
+            ).fetchone()
+    except Exception:
+        return out
+    last_unix = row[0] if row else None
+    count = int(row[1] or 0) if row else 0
+    last_ts = (
+        datetime.fromtimestamp(float(last_unix)).isoformat(timespec="seconds")
+        if last_unix else None
+    )
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("whisper_vocab", hours_since)
+    if count > 0:
+        out["metric"] = f"{count} términos"
+    return out
+
+
+def _verdict_whisper_corrections() -> dict:
+    out: dict = {
+        "id": "whisper_corrections",
+        "name": "Whisper corrections (manual STT fixes)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts), COUNT(*) FROM rag_audio_corrections"
+            ).fetchone()
+    except Exception:
+        return out
+    last_unix = row[0] if row else None
+    count = int(row[1] or 0) if row else 0
+    last_ts = (
+        datetime.fromtimestamp(float(last_unix)).isoformat(timespec="seconds")
+        if last_unix else None
+    )
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("whisper_corrections", hours_since)
+    if count > 0:
+        out["metric"] = f"{count} correcciones"
+    else:
+        out["note"] = "sin uso de voice o transcripciones aceptables"
+    return out
+
+
+def _verdict_score_calibration() -> dict:
+    out: dict = {
+        "id": "score_calibration",
+        "name": "Score calibration (isotonic per-source)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(trained_at), COUNT(*), "
+                " COALESCE(SUM(n_pos), 0) "
+                "FROM rag_score_calibration"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = row[0] if row else None
+    n_curves = int(row[1] or 0) if row else 0
+    n_pos = int(row[2] or 0) if row else 0
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("score_calibration", hours_since)
+    if n_curves > 0:
+        out["metric"] = f"{n_curves} curvas · n_pos total = {n_pos}"
+    return out
+
+
+def _verdict_contradictions() -> dict:
+    out: dict = {
+        "id": "contradictions",
+        "name": "Contradicciones (radar Phase 2)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(ts), COUNT(*) FROM rag_contradictions"
+            ).fetchone()
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM rag_contradictions "
+                "WHERE ts >= datetime('now', '-7 days')"
+            ).fetchone()
+    except Exception:
+        return out
+    last_ts = row[0] if row else None
+    total = int(row[1] or 0) if row else 0
+    n_recent = int(recent[0] or 0) if recent else 0
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("contradictions", hours_since)
+    if total > 0:
+        out["metric"] = f"{total} totales · {n_recent} últimos 7d"
+    return out
+
+
+def _verdict_entities() -> dict:
+    out: dict = {
+        "id": "entities", "name": "Entidades (GLiNER NER)",
+        "status": "dormant", "last_active_ts": None,
+        "last_active_human": "nunca", "metric": None, "note": None,
+    }
+    try:
+        from rag import _ragvec_state_conn
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(last_seen_ts), COUNT(*), "
+                " COALESCE(SUM(mention_count), 0) "
+                "FROM rag_entities"
+            ).fetchone()
+    except Exception:
+        return out
+    last_unix = row[0] if row else None
+    n_entities = int(row[1] or 0) if row else 0
+    n_mentions = int(row[2] or 0) if row else 0
+    last_ts = (
+        datetime.fromtimestamp(float(last_unix)).isoformat(timespec="seconds")
+        if last_unix else None
+    )
+    out["last_active_ts"] = last_ts
+    hours_since = _hours_ago(last_ts)
+    out["last_active_human"] = _format_hours_ago(hours_since)
+    out["status"] = _verdict_status("entities", hours_since)
+    if n_entities > 0:
+        out["metric"] = f"{n_entities:,} entidades · {n_mentions:,} mentions"
+    return out
+
+
+def verdict() -> dict:
+    """Estado actual de los 11 sistemas de aprendizaje del RAG.
+
+    Devuelve summary (counts por status) + lista de sistemas con
+    status/last_active/metric/note. Cada función `_verdict_*` es silent-fail
+    (try/except + retorna shape vacío) → un sistema roto no rompe el dashboard.
+
+    Las funciones individuales hacen sus propios SQL reads (no comparten conn
+    porque cada `_ragvec_state_conn()` ya hace pool internamente y prefiero
+    aislamiento sobre micro-optimización: si una corrupta o lockea, las otras
+    siguen).
+
+    Performance: ~50-100ms warm (12 queries SQL muy chicas, todas con índice
+    sobre `ts`/`trained_at`/etc).
+    """
+    systems = [
+        _verdict_ranker(),
+        _verdict_eval(),
+        _verdict_feedback(),
+        _verdict_behavior(),
+        _verdict_anticipatory(),
+        _verdict_paraphrases(),
+        _verdict_routing_rules(),
+        _verdict_whisper_vocab(),
+        _verdict_whisper_corrections(),
+        _verdict_score_calibration(),
+        _verdict_contradictions(),
+        _verdict_entities(),
+    ]
+    counts = {"alive": 0, "stale": 0, "dormant": 0}
+    for s in systems:
+        counts[s["status"]] = counts.get(s["status"], 0) + 1
+    return {
+        "summary": {
+            "alive": counts["alive"],
+            "stale": counts["stale"],
+            "dormant": counts["dormant"],
+            "total": len(systems),
+        },
+        "systems": systems,
+    }

@@ -388,6 +388,90 @@ const KPI_MAP = [
   { id: "kpi-contradictions",     key: "contradictions_resolved_pct", fmt: "pct", higherIsBetter: true  },
 ];
 
+// ── Veredicto (estado de los 12 sistemas de aprendizaje) ────────────────
+//
+// Backend: `verdict()` en web/learning_queries.py devuelve:
+//   { summary: {alive, stale, dormant, total},
+//     systems: [{id, name, status, last_active_human, metric, note}, …] }
+// Origen: el diagnóstico manual del 2026-04-26 que detectó loop roto en
+// anticipatory + 3 sistemas dormidos. La idea es que ese diagnóstico ya
+// no haya que correrlo a mano — vive permanente en el dashboard. Si algo
+// se rompe se ve en rojo arriba de todo.
+
+function renderVerdict(v) {
+  if (!v) return;
+  const summary = v.summary || {};
+  const systems = Array.isArray(v.systems) ? v.systems : [];
+
+  // Counts visibles (verde/amarillo/rojo).
+  const alive = summary.alive || 0;
+  const stale = summary.stale || 0;
+  const dormant = summary.dormant || 0;
+  const total = summary.total || systems.length || 0;
+
+  const setText = (id, txt) => {
+    const node = document.getElementById(id);
+    if (node) node.textContent = txt;
+  };
+  setText("verdict-count-alive", String(alive));
+  setText("verdict-count-stale", String(stale));
+  setText("verdict-count-dormant", String(dormant));
+
+  // Headline narrativa: el sistema "está aprendiendo" si la mayoría de los
+  // tracks están vivos. Si hay ≥1 dormant que NO sea por "data esperada
+  // ausente" (paraphrases, routing rules, audio corrections suelen ser 0 sin
+  // ser un bug), se mantiene la afirmación pero se enfatiza el rojo.
+  let headline;
+  if (alive >= total * 0.6) {
+    headline = `El sistema está aprendiendo · ${alive}/${total} tracks activos`;
+  } else if (alive >= total * 0.3) {
+    headline = `Aprendizaje parcial · ${alive}/${total} tracks activos`;
+  } else {
+    headline = `Aprendizaje detenido · solo ${alive}/${total} tracks activos`;
+  }
+  setText("verdict-headline", headline);
+
+  // Grid de tarjetas, una por sistema.
+  const grid = document.getElementById("verdict-grid");
+  if (!grid) return;
+  // Limpiar y rebuildear (cantidad fija de 12, así que no es costoso).
+  grid.innerHTML = "";
+  systems.forEach((s) => {
+    if (!s || !s.id) return;
+    const card = document.createElement("div");
+    card.className = `vsys vsys-${s.status || "dormant"}`;
+    card.setAttribute("data-system", s.id);
+
+    const row1 = document.createElement("div");
+    row1.className = "vsys-row1";
+    const name = document.createElement("span");
+    name.className = "vsys-name";
+    name.textContent = s.name || s.id;
+    name.title = s.name || s.id;  // tooltip si se trunca
+    const when = document.createElement("span");
+    when.className = "vsys-when";
+    when.textContent = s.last_active_human || "—";
+    if (s.last_active_ts) when.title = s.last_active_ts;
+    row1.appendChild(name);
+    row1.appendChild(when);
+    card.appendChild(row1);
+
+    if (s.metric) {
+      const metric = document.createElement("span");
+      metric.className = "vsys-metric";
+      metric.textContent = s.metric;
+      card.appendChild(metric);
+    }
+    if (s.note) {
+      const note = document.createElement("span");
+      note.className = "vsys-note";
+      note.textContent = s.note;
+      card.appendChild(note);
+    }
+    grid.appendChild(card);
+  });
+}
+
 function renderKPIs(kpis) {
   if (!kpis) return;
   KPI_MAP.forEach((cfg) => {
@@ -1569,6 +1653,10 @@ function renderAll(payload) {
     el.metaPeriod.textContent = `· ${days}d`;
   }
   if (el.metaUpdated) el.metaUpdated.textContent = `actualizado ${nowHM()}`;
+
+  // Veredicto: estado de los 12 sistemas (alive/stale/dormant).
+  // Se renderiza ANTES de las KPIs porque conceptualmente es el "headline".
+  renderVerdict(payload.verdict);
 
   // KPIs + secciones.
   renderKPIs(payload.kpis);

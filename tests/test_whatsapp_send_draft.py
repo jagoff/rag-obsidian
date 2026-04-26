@@ -166,6 +166,106 @@ def test_jid_from_contact_not_found(monkeypatch):
     assert out["jid"] is None
 
 
+def test_jid_from_contact_resolves_via_my_card_relationship(monkeypatch):
+    """Cuando el query es un alias de parentesco ("Mama") y no existe
+    como contacto literal, intenta resolver vía Related Names del My Card."""
+    from rag.integrations import whatsapp as wa_mod
+
+    # Stub: My Card tiene "Mother → Mamá" y "Father → Carlos".
+    monkeypatch.setattr(wa_mod, "_load_my_card_relations", lambda: [
+        {"label": "mother", "personName": "Mamá"},
+        {"label": "father", "personName": "Carlos"},
+    ])
+
+    # `_fetch_contact` falla para "Mama" (kinship guard) pero resuelve "Mamá".
+    calls: list[str] = []
+
+    def _fake_fetch(stem, email=None, canonical=None):
+        calls.append(stem)
+        if stem == "Mamá":
+            return {
+                "full_name": "Mamá",
+                "phones": ["+54 9 342 547 6623"],
+                "emails": [], "birthday": "",
+            }
+        return None
+
+    monkeypatch.setattr(rag, "_fetch_contact", _fake_fetch)
+    out = rag._whatsapp_jid_from_contact("Mama")
+    assert out["error"] is None
+    assert out["full_name"] == "Mamá"
+    assert out["jid"] == "5493425476623@s.whatsapp.net"
+    # Llamó dos veces: primero "Mama" (falló), después "Mamá" (resolved).
+    assert "Mama" in calls and "Mamá" in calls
+
+
+def test_jid_from_contact_relationship_no_my_card(monkeypatch):
+    """Si el alias es de parentesco pero no hay My Card seteada,
+    seguimos cayendo a `not_found` igual que antes."""
+    from rag.integrations import whatsapp as wa_mod
+
+    monkeypatch.setattr(wa_mod, "_load_my_card_relations", lambda: [])
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
+    out = rag._whatsapp_jid_from_contact("Mama")
+    assert out["error"] == "not_found"
+    assert out["jid"] is None
+
+
+def test_jid_from_contact_unknown_alias_skips_relationship_path(monkeypatch):
+    """Queries que no son alias de parentesco no triggean la rama de
+    Related Names — caen al `not_found` directo."""
+    from rag.integrations import whatsapp as wa_mod
+
+    # Spy: si esto se llama, el test falla.
+    relations_calls = []
+
+    def _spy_relations():
+        relations_calls.append(1)
+        return []
+
+    monkeypatch.setattr(wa_mod, "_load_my_card_relations", _spy_relations)
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
+    out = rag._whatsapp_jid_from_contact("Unicornio Imaginario")
+    assert out["error"] == "not_found"
+    # _load_my_card_relations no fue llamado (el alias no es parentesco).
+    assert relations_calls == []
+
+
+def test_resolve_via_my_card_relationship_normalizes_accents():
+    """Tildes en español no deben romper el match (mamá ≡ mama)."""
+    from rag.integrations import whatsapp as wa_mod
+
+    # Inject relations directamente al cache para no llamar osascript.
+    import time
+    wa_mod._MY_CARD_RELATIONS_CACHE = {
+        "at": time.time(),
+        "rows": [{"label": "mother", "personName": "Mamá"}],
+    }
+    try:
+        assert wa_mod._resolve_via_my_card_relationship("Mama") == "Mamá"
+        assert wa_mod._resolve_via_my_card_relationship("mama") == "Mamá"
+        assert wa_mod._resolve_via_my_card_relationship("Mamá") == "Mamá"
+        assert wa_mod._resolve_via_my_card_relationship("mami") == "Mamá"
+        assert wa_mod._resolve_via_my_card_relationship("MADRE") == "Mamá"
+        # Non-relationship word → None
+        assert wa_mod._resolve_via_my_card_relationship("Random") is None
+    finally:
+        wa_mod._MY_CARD_RELATIONS_CACHE = None  # reset
+
+
+def test_parse_apple_label_handles_both_formats():
+    """Apple Contacts labels vienen en 2 formatos: `_$!<English>!$_` y
+    plain Spanish ("Madre" en es-AR locale)."""
+    from rag.integrations.whatsapp import _parse_apple_label
+    assert _parse_apple_label("_$!<Mother>!$_") == "mother"
+    assert _parse_apple_label("_$!<Father>!$_") == "father"
+    assert _parse_apple_label("Madre") == "mother"
+    assert _parse_apple_label("padre") == "father"
+    assert _parse_apple_label("hermana") == "sister"
+    # Unknown labels passthrough lowercased + folded.
+    assert _parse_apple_label("Custom Label") == "custom label"
+
+
 def test_jid_from_contact_no_phone(monkeypatch):
     monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
         "full_name": "Contacto Sin Tel",

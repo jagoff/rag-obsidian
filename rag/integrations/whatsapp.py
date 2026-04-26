@@ -176,6 +176,155 @@ def _whatsapp_send_to_jid(
 
 
 _GROUP_PREFIX_RE = re.compile(r"^\s*(?:grupo|group|gpo|gpe?o?)\s*:?\s+", re.IGNORECASE)
+
+
+# ── My Card relationships → personName resolver ─────────────────────────────
+# Cuando el user dice "mandale a Mama" / "decile a papá", el contacto real
+# probablemente está bajo otro nombre (ej. "Mamá" con tilde, "Carmen", etc.).
+# Apple Contacts permite definir Related Names en tu My Card — ahí seteás
+# "Madre → Mamá", "Padre → Carlos", etc. Esta función lee ese mapping vía
+# osascript y resuelve "mama" → "Mamá" antes de fallar con `not_found`.
+#
+# El listener WhatsApp (`whatsapp-listener/listener.ts:4385+`) ya tiene esto
+# implementado para el flow de voz. Acá lo replicamos para que el chat web
+# (vía `propose_whatsapp_send`) tenga la misma capacidad.
+
+# Spanish/English alias → canonical Apple Contacts label.
+# Keys YA están normalizados (lowercase + sin acentos).
+_RELATIONSHIP_HINT_MAP: dict[str, str] = {
+    # mother
+    "mama": "mother", "mami": "mother", "mamita": "mother",
+    "madre": "mother", "mom": "mother", "mother": "mother",
+    # father
+    "papa": "father", "papi": "father", "papito": "father",
+    "padre": "father", "dad": "father", "father": "father",
+    # siblings
+    "hermana": "sister", "herma": "sister", "sis": "sister", "sister": "sister",
+    "hermano": "brother", "hermo": "brother", "bro": "brother", "brother": "brother",
+    # partner
+    "esposa": "wife", "mujer": "wife", "wife": "wife",
+    "esposo": "husband", "marido": "husband", "husband": "husband",
+    # children
+    "hijo": "son", "son": "son",
+    "hija": "daughter", "daughter": "daughter",
+    # grandparents
+    "abuela": "grandmother", "abue": "grandmother",
+    "grandmother": "grandmother", "granny": "grandmother",
+    "abuelo": "grandfather", "abu": "grandfather", "grandfather": "grandfather",
+    # in-laws / extended
+    "suegra": "motherInLaw", "suegro": "fatherInLaw",
+    "tia": "aunt", "tio": "uncle",
+    "prima": "cousin", "primo": "cousin",
+}
+
+# Apple's localized Spanish labels also resolve to canonical English.
+# `_$!<Mother>!$_` is the "raw" label for the English-locale Contacts; for
+# es-AR/es-ES users the same field can be stored as "Madre" plain.
+_APPLE_LABEL_ES_TO_EN: dict[str, str] = {
+    "madre": "mother", "padre": "father",
+    "hermana": "sister", "hermano": "brother",
+    "esposa": "wife", "esposo": "husband",
+    "marido": "husband", "mujer": "wife",
+    "hija": "daughter", "hijo": "son",
+    "abuela": "grandmother", "abuelo": "grandfather",
+    "suegra": "motherInLaw", "suegro": "fatherInLaw",
+    "tia": "aunt", "tio": "uncle",
+    "prima": "cousin", "primo": "cousin",
+}
+
+
+def _normalize_hint(s: str) -> str:
+    """Lowercase + strip accents → match keys in `_RELATIONSHIP_HINT_MAP`."""
+    import unicodedata
+    fold = unicodedata.normalize("NFD", s.strip().lower())
+    return "".join(c for c in fold if unicodedata.category(c) != "Mn")
+
+
+def _parse_apple_label(raw: str) -> str:
+    """Convert Apple's `_$!<Mother>!$_` or raw "Madre" to canonical English."""
+    if not raw:
+        return ""
+    m = re.match(r"^_\$!<(.+)>!\$_$", raw)
+    core = (m.group(1) if m else raw).lower()
+    fold = _normalize_hint(core)
+    return _APPLE_LABEL_ES_TO_EN.get(fold, fold)
+
+
+# Cache the My Card → relations dump. Contacts changes are rare; refresh
+# every hour is more than enough.
+_MY_CARD_RELATIONS_CACHE: dict | None = None
+_MY_CARD_RELATIONS_TTL_S = 3600
+
+
+def _load_my_card_relations() -> list[dict]:
+    """Read related names from Apple Contacts My Card.
+
+    Returns list of `{label: 'mother', personName: 'Mamá'}`. Empty list
+    if no My Card, no permissions, or osascript fails. Never raises.
+
+    Cached for 1h — Apple Contacts permission dialog only fires once.
+    """
+    import time as _time
+    global _MY_CARD_RELATIONS_CACHE
+    now = _time.time()
+    if (_MY_CARD_RELATIONS_CACHE
+            and (now - _MY_CARD_RELATIONS_CACHE.get("at", 0)) < _MY_CARD_RELATIONS_TTL_S):
+        return _MY_CARD_RELATIONS_CACHE["rows"]
+
+    script = '''tell application "Contacts"
+  set _out to ""
+  try
+    set _myCard to my card
+    repeat with _rn in (related names of _myCard)
+      set _lbl to (label of _rn as string)
+      set _val to (value of _rn as string)
+      set _out to _out & _lbl & "|||" & _val & linefeed
+    end repeat
+  end try
+  return _out
+end tell'''
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            _MY_CARD_RELATIONS_CACHE = {"at": now, "rows": []}
+            return []
+    except Exception:
+        _MY_CARD_RELATIONS_CACHE = {"at": now, "rows": []}
+        return []
+
+    rows: list[dict] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("|||")
+        if len(parts) < 2:
+            continue
+        raw_label, person_name = parts[0].strip(), parts[1].strip()
+        label = _parse_apple_label(raw_label)
+        if label and person_name:
+            rows.append({"label": label, "personName": person_name})
+
+    _MY_CARD_RELATIONS_CACHE = {"at": now, "rows": rows}
+    return rows
+
+
+def _resolve_via_my_card_relationship(hint: str) -> str | None:
+    """Try resolving "mama"/"papa"/etc. → real personName via My Card.
+
+    Returns None if the hint isn't a relationship word, no My Card is set,
+    or no related-name match exists for the canonical label.
+    """
+    fold = _normalize_hint(hint)
+    canonical = _RELATIONSHIP_HINT_MAP.get(fold)
+    if not canonical:
+        return None
+    relations = _load_my_card_relations()
+    for r in relations:
+        if r.get("label") == canonical:
+            return r.get("personName")
+    return None
 """Patrón de prefijo explícito para forzar lookup de grupo. Matchea
 'grupo X', 'group X', 'gpo X', 'grupo: X' (con o sin dos puntos)."""
 
@@ -324,12 +473,33 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
     # Reuse the existing osascript-backed contact lookup. Passes `query`
     # as the stem — _fetch_contact will try canonical match, first name,
     # and finally the raw stem against Contacts.app.
+    #
+    # Importante: `_fetch_contact` tiene un guard que SKIPEA stems de
+    # parentesco ("Mama"/"Papa"/"Hermana"/...) porque buscarlos por
+    # name-contains genera falsos positivos ("Carmen Mama Bianca" ↩).
+    # Eso significa que para "Mama" el lookup retorna None aunque el
+    # contacto exista (típicamente bajo "Mamá" con tilde). Resolución
+    # correcta: leer Related Names de tu My Card → "Madre → Mamá" → re-
+    # llamar al lookup con el personName real.
     try:
         contact = _rag._fetch_contact(query, email=None, canonical=query)
     except Exception as exc:
         return {"jid": None, "full_name": None, "phones": [],
                 "is_group": False,
                 "error": f"lookup_failed: {str(exc)[:80]}"}
+
+    # Si el primer intento no encontró nada Y el query es un alias de
+    # parentesco, probar la resolución vía My Card antes de dar up.
+    if not contact:
+        resolved_name = _resolve_via_my_card_relationship(query)
+        if resolved_name:
+            try:
+                contact = _rag._fetch_contact(
+                    resolved_name, email=None, canonical=resolved_name,
+                )
+            except Exception:
+                contact = None
+
     if contact:
         phones = list(contact.get("phones") or [])
         if not phones:

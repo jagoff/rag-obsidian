@@ -24,7 +24,11 @@ Un buscador inteligente para tu vault de Obsidian. En vez de buscar por palabras
 
 ```bash
 cd ~/repositories/obsidian-rag
-uv tool install --reinstall --editable .
+# Los extras `entities` (NER con gliner) y `stt` (faster-whisper) son
+# features default-on que sin la flag quedan silenciadas — los ingesters
+# loggean warnings cada corrida y la transcripción de audio rebota con
+# ImportError. `spotify` queda como opt-in real (requiere OAuth manual).
+uv tool install --reinstall --editable '.[entities,stt]'
 ```
 
 Esto te deja dos comandos disponibles globalmente:

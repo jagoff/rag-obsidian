@@ -92,8 +92,13 @@ ollama pull qwen2.5:3b
 ollama pull command-r
 
 # 2. Instalar el CLI (binarios: rag, obsidian-rag-mcp)
+# Los extras `entities` (gliner NER, RAG_ENTITY_LOOKUP=ON default) y `stt`
+# (faster-whisper, whisper learning loop) son default-on en producción —
+# sin ellos los ingesters loggean warnings y las features quedan
+# silenciosamente desactivadas. `spotify` queda como opt-in real (requiere
+# config OAuth).
 cd ~/repositories/obsidian-rag
-uv tool install --reinstall --editable .
+uv tool install --reinstall --editable '.[entities,stt]'
 
 # 3. Primer indexado del vault (10-30 min según vault size + Mac)
 rag index
@@ -748,7 +753,7 @@ rag eval                                     # baseline contra queries.yaml
 
 ### Bumpar schema de la collection
 1. Editar `_COLLECTION_BASE` (ej. `obsidian_notes_v8`) en `rag.py`.
-2. `uv tool install --reinstall --editable .`
+2. `uv tool install --reinstall --editable '.[entities,stt]'` (extras explícitos para no perder gliner+whisper en el reinstall).
 3. `rag index --reset` → drop ambas collections + reindex.
 4. (Opcional) borrar collections viejas: `rag.get_db()` se construye on demand, las viejas quedan huérfanas en `~/.local/share/obsidian-rag/ragvec/ragvec.db` (tablas `vec_*_<hash>` / `meta_*_<hash>` con sufijo previo) — se pueden inspeccionar con `sqlite3 ragvec.db ".tables"` y dropear manualmente, o ignorar.
 

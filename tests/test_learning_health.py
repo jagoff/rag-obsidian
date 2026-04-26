@@ -1,6 +1,6 @@
 """Tests for the system-health traffic-light banner.
 
-Endpoint: ``/api/dashboard/learning/health``
+Endpoint: ``/api/learning/health``
 Backend: ``web.learning_queries.system_health()`` + private ``_health_*`` helpers.
 
 The banner shows a green/yellow/red light at the top of the learning dashboard

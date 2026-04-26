@@ -861,7 +861,7 @@
     <!-- ── HEALTH BANNER (semáforo del sistema) ───────────────────
          Lo PRIMERO que ve el usuario: bloque verde / amarillo / rojo con
          texto en lenguaje plain explicando si todo está OK. JS hidrata los
-         signals desde /api/dashboard/learning/health (TTL 15s) y refresca
+         signals desde /api/learning/health (TTL 15s) y refresca
          cada 30s. Si la red falla, queda en .is-loading. Worst-case wins:
          si una sola señal está roja, el banner va rojo. -->
     <section id="health-banner" class="health-banner is-loading"

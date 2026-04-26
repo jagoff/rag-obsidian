@@ -6,7 +6,7 @@
  *     CSS variables (cyan/green/yellow/red/purple/orange/pink/grid).
  *   - Polling con setTimeout recursivo + backoff exponencial cuando la
  *     pestaña está hidden (mismo POLL_HIDDEN_GRACE_MS = 5min).
- *   - SSE (`/api/dashboard/learning/stream`) con auto-reconnect en error.
+ *   - SSE (`/api/learning/stream`) con auto-reconnect en error.
  *   - Theme toggle re-aplica defaults + redraws.
  *   - Selector de ventana (7d/30d/90d/365d) destruye charts y re-fetcha.
  *
@@ -1685,7 +1685,7 @@ function renderAll(payload) {
 // ── Fetch + polling ──────────────────────────────────────────────────────
 async function fetchSnapshot() {
   try {
-    const res = await fetch(`/api/dashboard/learning?days=${state.days}`, {
+    const res = await fetch(`/api/learning?days=${state.days}`, {
       headers: { "Accept": "application/json" },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1716,7 +1716,7 @@ function startStream() {
 
   let src;
   try {
-    src = new EventSource("/api/dashboard/learning/stream");
+    src = new EventSource("/api/learning/stream");
   } catch (e) {
     console.warn("[learning] EventSource unavailable:", e);
     setLiveState("off", "sin stream");
@@ -1749,7 +1749,7 @@ function startStream() {
 // Bloque arriba del dashboard que dice "todo OK / atención / problema" en
 // lenguaje plain. Independiente del SSE de los charts — su propio fetch +
 // interval de 30s. La razón es que (a) el endpoint /health es ~3-4× más
-// liviano que /api/dashboard/learning, y (b) queremos que el banner
+// liviano que /api/learning, y (b) queremos que el banner
 // refresque rápido aún si los charts están pausados o desconectados.
 const HEALTH_REFRESH_MS = 30_000;
 const HEALTH_LEVELS = ["green", "yellow", "red"];
@@ -1832,7 +1832,7 @@ function renderHealth(payload) {
 
 async function fetchHealth() {
   try {
-    const res = await fetch("/api/dashboard/learning/health", {
+    const res = await fetch("/api/learning/health", {
       headers: { "Accept": "application/json" },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

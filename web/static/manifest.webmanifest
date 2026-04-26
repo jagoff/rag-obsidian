@@ -65,7 +65,7 @@
       "name": "Learning",
       "short_name": "Learning",
       "description": "Cómo evoluciona el aprendizaje del sistema",
-      "url": "/dashboard/learning",
+      "url": "/learning",
       "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
     }
   ]

@@ -166,7 +166,7 @@ def test_manifest_shortcuts_point_to_valid_routes():
     data = resp.json()
     shortcuts = data.get("shortcuts", [])
     assert len(shortcuts) >= 1
-    valid_routes = {"/", "/chat", "/dashboard", "/dashboard/learning"}
+    valid_routes = {"/", "/chat", "/dashboard", "/learning"}
     for sc in shortcuts:
         assert sc["url"] in valid_routes, f"shortcut url {sc['url']} not routable"
 

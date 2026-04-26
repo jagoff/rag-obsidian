@@ -1,4 +1,4 @@
-"""Backend del dashboard de aprendizaje (`/dashboard/learning`).
+"""Backend del dashboard de aprendizaje (`/learning`).
 
 Una función pública por sección — todas reciben `days: int` y devuelven un
 ``dict`` con shape estable que el frontend consume sin checks defensivos.
@@ -1858,7 +1858,7 @@ def _vault_surface_archive_over_time(days: int) -> dict:
     )
 
 
-# ── /api/dashboard/learning/health ─────────────────────────────────────────
+# ── /api/learning/health ─────────────────────────────────────────
 # Semáforo del sistema. Devuelve un nivel global (green/yellow/red) +
 # señales individuales con texto en lenguaje plain. Pensado para que un
 # usuario sin conocimiento técnico abra el dashboard y entienda en 2s si
@@ -2332,7 +2332,7 @@ def system_health() -> dict:
 
     El resultado se cachea en `web/server.py` con TTL=15s — es lo que
     determina con qué frecuencia se actualiza el banner. Más corto que
-    el `/api/dashboard/learning` (60s) porque queremos que el usuario
+    el `/api/learning` (60s) porque queremos que el usuario
     vea cambios de salud rápido."""
     signals = [
         _health_retrieval(

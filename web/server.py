@@ -12680,7 +12680,7 @@ def _stream_payload(kind: str, ev: dict) -> dict:
     return ev
 
 
-# ── /dashboard/learning ─────────────────────────────────────────────────
+# ── /learning ─────────────────────────────────────────────────
 # Dashboard secundario, focalizado en el LOOP de aprendizaje del RAG: cómo
 # evoluciona el ranker, cuánto feedback (explícito + implícito) entra,
 # qué tan bien funciona la cache, qué entities/contradictions emergen, etc.
@@ -12696,15 +12696,15 @@ _LEARNING_CACHE: dict[int, tuple[float, dict]] = {}
 _LEARNING_TTL = 60.0
 
 
-@app.get("/dashboard/learning")
+@app.get("/learning")
 def learning_page() -> FileResponse:
     """HTML estático del learning dashboard. El contenido se hidrata vía
-    `/api/dashboard/learning` (initial load) + `/api/dashboard/learning/stream`
+    `/api/learning` (initial load) + `/api/learning/stream`
     (SSE, snapshot completo cada 30s)."""
     return FileResponse(STATIC_DIR / "learning.html")
 
 
-@app.get("/api/dashboard/learning")
+@app.get("/api/learning")
 def learning_api(days: int = 30) -> dict:
     """Snapshot completo de las 11 secciones + KPIs hero. Cada sección es
     independiente — un SQL error en una NO contamina las otras (las
@@ -12715,7 +12715,7 @@ def learning_api(days: int = 30) -> dict:
     if hit and now_ts - hit[0] < _LEARNING_TTL:
         return hit[1]
     # Lazy import: módulo nuevo, no queremos cargarlo al import-time del
-    # servidor si nadie pide /dashboard/learning. Después del primer hit
+    # servidor si nadie pide /learning. Después del primer hit
     # queda cacheado por el import system; las llamadas subsiguientes son
     # gratis.
     from web.learning_queries import (
@@ -12741,7 +12741,7 @@ def learning_api(days: int = 30) -> dict:
         # Veredicto: ¿aprende cada uno de los 12 sistemas? Origen: el
         # diagnóstico manual del 2026-04-26 que detectó loop roto en
         # anticipatory + 3 sistemas dormidos. Auto-generado para que la
-        # próxima vez algo se rompa, esté visible en /dashboard/learning.
+        # próxima vez algo se rompa, esté visible en /learning.
         "verdict": verdict(),
         "kpis": kpis(days),
         "sections": {
@@ -12762,14 +12762,14 @@ def learning_api(days: int = 30) -> dict:
     return payload
 
 
-# ── /api/dashboard/learning/health ─────────────────────────────────────────
+# ── /api/learning/health ─────────────────────────────────────────
 # Semáforo del sistema: bloque "verde / amarillo / rojo" arriba del dashboard
 # que un usuario sin conocimiento técnico interpreta en 2s. Computa 6 señales
 # (acierto en preguntas simples + complejas, servicios, vault al día, errores
 # 24h, velocidad de respuesta) y aplica worst-case wins. Ver `system_health`
 # en `web/learning_queries.py` para la lógica + thresholds.
 #
-# TTL=15s — más corto que `/api/dashboard/learning` (60s) porque queremos
+# TTL=15s — más corto que `/api/learning` (60s) porque queremos
 # que el banner refresque rápido. La señal `services` invoca `launchctl list`
 # (subprocess, ~50ms) — el resto son SQL reads cacheados por _ragvec_state_conn.
 
@@ -12777,7 +12777,7 @@ _LEARNING_HEALTH_CACHE: tuple[float, dict] | None = None
 _LEARNING_HEALTH_TTL = 15.0
 
 
-@app.get("/api/dashboard/learning/health")
+@app.get("/api/learning/health")
 def learning_health_api() -> dict:
     """Devuelve el semáforo del sistema. Shape estable:
 
@@ -12807,10 +12807,10 @@ def learning_health_api() -> dict:
     return payload
 
 
-@app.get("/api/dashboard/learning/stream")
+@app.get("/api/learning/stream")
 async def learning_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
     """SSE: cada 30s emite un snapshot completo del payload de
-    /api/dashboard/learning. Heartbeat con comentario `: keep-alive` cada
+    /api/learning. Heartbeat con comentario `: keep-alive` cada
     15s entre snapshots para que proxies/CDNs no maten la conexión por
     inactividad. El cliente reconecta automáticamente con EventSource si
     se cae."""

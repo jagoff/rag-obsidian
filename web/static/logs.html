@@ -712,6 +712,36 @@
        sepa que es aproximado. */
     .log-line .ts.synthetic { opacity: 0.6; color: var(--purple); }
 
+    /* Botón "🩺 fix con IA" — sólo visible para líneas con level=error.
+       Compacto, alineado al final de la línea. La clase es .diag-trigger
+       (NO .diag-btn) para no chocar con la clase del modal compartido en
+       diagnose-modal.css que usa .diag-btn para sus propios botones. */
+    .log-line .diag-trigger {
+      display: none;
+      font-size: 11px;
+      font-family: inherit;
+      padding: 1px 6px;
+      margin-left: 8px;
+      border-radius: 3px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      color: var(--cyan-dim);
+      cursor: pointer;
+      vertical-align: middle;
+      transition: background 0.12s, border-color 0.12s, color 0.12s;
+      white-space: nowrap;
+    }
+    .log-line.lvl-error .diag-trigger { display: inline-block; }
+    .log-line .diag-trigger:hover {
+      background: color-mix(in srgb, var(--cyan) 20%, transparent);
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+    .log-line .diag-trigger:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
+    }
+
     /* Chip clickeable con el nombre del service (sólo en feed global).
        Mostrado antes del texto de la línea. Click → abre el log. */
     .log-line.is-global .svc-chip {
@@ -955,6 +985,8 @@
     </main>
   </div>
 
-  <script src="/static/logs.js?v=2026-04-26-logs-global" defer></script>
+  <link rel="stylesheet" href="/static/diagnose-modal.css?v=2026-04-26">
+  <script src="/static/diagnose-modal.js?v=2026-04-26" defer></script>
+  <script src="/static/logs.js?v=2026-04-26-diagnose" defer></script>
 </body>
 </html>

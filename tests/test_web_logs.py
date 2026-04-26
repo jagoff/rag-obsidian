@@ -505,6 +505,69 @@ def test_api_logs_errors_validates_level_param():
     assert resp.status_code == 400
 
 
+# ── Diagnose endpoint (LLM-powered, /api/diagnose-error) ─────────────
+
+def test_api_diagnose_error_validates_empty_text():
+    """error_text vacío → 422 (pydantic validation)."""
+    resp = _client.post("/api/diagnose-error", json={"error_text": "  "})
+    assert resp.status_code == 422
+
+
+def test_api_diagnose_error_truncates_huge_text():
+    """error_text muy largo (>4000 chars) se truncate antes de mandar al LLM."""
+    long_text = "x" * 6000
+    req = _server._DiagnoseErrorRequest(error_text=long_text)
+    assert len(req.error_text) < len(long_text)
+    assert req.error_text.endswith("…(truncado)")
+
+
+def test_diagnose_error_prompt_includes_context():
+    """El prompt construido incluye los snippets de contexto."""
+    req = _server._DiagnoseErrorRequest(
+        error_text="OperationalError: bad",
+        service="watch",
+        file="obsidian-rag/watch.log (stdout)",
+        line_n=42,
+        timestamp="2026-04-26T19:00:00",
+        context_lines=["heartbeat alive=true", "[before line]"],
+    )
+    prompt = _server._build_diagnose_error_prompt(req)
+    assert "watch" in prompt
+    assert "2026-04-26T19:00:00" in prompt
+    assert "OperationalError: bad" in prompt
+    assert "Contexto previo" in prompt
+    assert "[before line]" in prompt
+    assert "watch.log" in prompt
+
+
+def test_diagnose_error_prompt_skips_empty_context():
+    """Sin contexto previo, el prompt no incluye headers innecesarios."""
+    req = _server._DiagnoseErrorRequest(error_text="some error")
+    prompt = _server._build_diagnose_error_prompt(req)
+    assert "Contexto previo" not in prompt
+    assert "some error" in prompt
+
+
+def test_diagnose_error_prompt_caps_context_at_20():
+    """Más de 20 líneas de contexto → trunca a 20 (las últimas)."""
+    req = _server._DiagnoseErrorRequest(
+        error_text="error here",
+        context_lines=[f"line {i}" for i in range(50)],
+    )
+    prompt = _server._build_diagnose_error_prompt(req)
+    # Las últimas 20 (30..49) deben aparecer; las anteriores no.
+    assert "line 30" in prompt
+    assert "line 49" in prompt
+    assert "line 29" not in prompt
+
+
+def test_api_diagnose_error_execute_disabled():
+    """Por seguridad, /api/diagnose-error/execute devuelve 503."""
+    resp = _client.post("/api/diagnose-error/execute", json={"command": "echo hi"})
+    assert resp.status_code == 503
+    assert "deshabilitada" in resp.json()["detail"].lower()
+
+
 def test_static_assets_exist():
     """logs.html + logs.js existen en /static/."""
     assert (_STATIC_DIR / "logs.html").is_file()

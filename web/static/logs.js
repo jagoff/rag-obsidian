@@ -523,12 +523,18 @@
                   `data-svc-name="${escapeHtml(ln.service)}" ` +
                   `title="abrir el log de ${escapeHtml(ln.service)}">${escapeHtml(ln.service)}</button>`;
       }
+      // Botón "🩺 fix con IA" — sólo visible para errores (CSS gating).
+      // El idx en data-line-idx lo necesita el handler para recuperar
+      // el contexto pre/post de data.lines sin pasarlo por dataset.
+      const diagBtn = `<button class="diag-trigger" type="button" ` +
+                      `data-line-idx="${data.lines.indexOf(ln)}" ` +
+                      `title="enviar al LLM y obtener diagnóstico">🩺</button>`;
       parts.push(
         `<div class="${cls}">` +
           `<span class="lnum">${ln.n}</span>` +
           `<span class="${tsClass}" title="${escapeHtml(tsTitle)}">${tsLabel}</span>` +
           `<span class="lvl">${lvlLabel}</span>` +
-          `<span class="text">${svcChip}${txt}</span>` +
+          `<span class="text">${svcChip}${txt}${diagBtn}</span>` +
         `</div>`
       );
     }
@@ -545,6 +551,48 @@
         });
       });
     }
+
+    // Wire-up para el botón "🩺 fix con IA" en cada línea con level=error.
+    // Llama al modal compartido (window.DiagnoseModal) con el contexto
+    // necesario: la línea + 20 anteriores + service + file label.
+    body.querySelectorAll(".diag-trigger").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!window.DiagnoseModal) {
+          alert("Modal de diagnóstico no cargado. Recargá la página.");
+          return;
+        }
+        const idx = parseInt(btn.dataset.lineIdx, 10);
+        if (!Number.isFinite(idx) || !data.lines[idx]) return;
+        const ln = data.lines[idx];
+        // Contexto: las 20 líneas previas (texto solo, no metadata).
+        const ctx = data.lines
+          .slice(Math.max(0, idx - 20), idx)
+          .map((l) => l.text);
+        // Service + file: en modo global cada línea trae `service`; en
+        // single el state apunta al service activo.
+        let serviceName, fileLabel;
+        if (isGlobal) {
+          serviceName = ln.service || "global";
+          fileLabel = ln.ref || `${ln.service} (global feed)`;
+        } else {
+          const svc = findSelectedService();
+          serviceName = svc ? svc.service : "(unknown)";
+          fileLabel = svc
+            ? `${svc.dir}/${svc.service} (${state.selectedKind})`
+            : state.selectedKey || "(unknown)";
+        }
+        window.DiagnoseModal.open({
+          service: serviceName,
+          file: fileLabel,
+          line_n: ln.n || 0,
+          error_text: ln.text || "",
+          context_lines: ctx,
+          timestamp: ln.ts || null,
+        });
+      });
+    });
 
     if (scrollToBottom) {
       // Scrollear al final para sentir tipo `tail -f`. Un raf para que

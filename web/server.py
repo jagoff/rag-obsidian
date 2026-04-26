@@ -13021,46 +13021,49 @@ def logs_global_errors(
     return entry["payload"]
 
 
-# ── /api/logs/diagnose — LLM-powered error diagnosis ──────────────────
-# El user clickea el botón "🤖 diagnosticar" al lado de una línea con
+# ── /api/diagnose-error — LLM-powered error diagnosis ─────────────────
+# El user clickea el botón "🩺 fix con IA" al lado de una línea con
 # level=error en el viewer, y recibe streaming del LLM con un análisis
 # del error: causa probable, severidad, propuesta de fix.
 #
-# Scope:
-#   - SOLO diagnóstico textual (nivel 1). NO ejecuta comandos, NO edita
-#     archivos, NO reinicia daemons. Si el user quiere aplicar el fix
-#     que el LLM propuso, lo hace a mano.
-#   - El LLM recibe el error + ~10 líneas de contexto del log + nombre
-#     del service. NO recibe el código del repo (eso requeriría RAG over
-#     el codebase, fuera de scope acá).
+# El frontend (web/static/diagnose-modal.js) consume el SSE con eventos:
+#   - {type: "model", name: "..."}
+#   - {type: "token", content: "..."}
+#   - {type: "done"}
+#   - {type: "error", message: "..."}
 #
-# Por qué no usamos /api/chat (que sí tiene RAG):
-#   1. El RAG sobre el vault es ortogonal — los errores son del CÓDIGO
-#      del repo, no del contenido del vault.
-#   2. El chat tiene tool-calling, history, intent classification —
-#      overhead innecesario para una pregunta directa.
-#   3. Queremos un prompt template específico para diagnóstico.
+# Scope (Nivel 1):
+#   - SOLO diagnóstico textual. NO ejecuta comandos, NO edita archivos.
+#   - El LLM recibe el error + ~20 líneas de contexto + service.
+#   - El LLM puede SUGERIR comandos en bloques ```bash``` que el user
+#     decide ejecutar a mano (copy-paste a terminal).
+#
+# El frontend tiene un endpoint `/api/diagnose-error/execute` para
+# auto-ejecutar comandos del LLM, pero por seguridad ese endpoint está
+# deshabilitado en este server (returns 503). Habilitarlo requiere una
+# whitelist conservadora de comandos seguros + audit log + diseño
+# pensado en otra entrega.
 
-class _LogDiagnoseRequest(BaseModel):
-    line: str = Field(..., description="La línea de log con el error")
+class _DiagnoseErrorRequest(BaseModel):
+    error_text: str = Field(..., description="La línea de log con el error")
     service: str = Field("", description="Service de origen (ej. 'watch')")
-    level: str = Field("error", description="Level clasificado: error|warn")
-    ts: str | None = Field(None, description="Timestamp ISO si lo conocemos")
-    context_before: list[str] = Field(default_factory=list, description="Líneas antes (cronológicamente)")
-    context_after: list[str] = Field(default_factory=list, description="Líneas después")
+    file: str = Field("", description="Label del archivo de origen")
+    line_n: int = Field(0, description="Número de línea reverso (1=más reciente)")
+    timestamp: str | None = Field(None, description="Timestamp ISO de la línea")
+    context_lines: list[str] = Field(default_factory=list, description="Líneas previas (cronológicamente)")
 
-    @field_validator("line")
+    @field_validator("error_text")
     @classmethod
-    def _line_not_empty(cls, v: str) -> str:
+    def _error_not_empty(cls, v: str) -> str:
         v = (v or "").strip()
         if not v:
-            raise ValueError("line vacía")
+            raise ValueError("error_text vacío")
         if len(v) > 4000:
             v = v[:4000] + "…(truncado)"
         return v
 
 
-_LOG_DIAGNOSE_SYSTEM_PROMPT = """\
+_DIAGNOSE_ERROR_SYSTEM_PROMPT = """\
 Sos un asistente experto en el stack `obsidian-rag` de Fer (Fernando Ferrari).
 El user te muestra una línea de log con un error y pide diagnóstico.
 
@@ -13068,100 +13071,102 @@ Stack relevante:
 - Local-first RAG sobre vault Obsidian, single-file `rag.py` (~50k líneas)
   + `web/server.py` (FastAPI) + daemons launchd (watch, ingest-*, anticipate,
   reminder-wa-push, wa-scheduled-send, etc.).
-- SQLite-vec (`ragvec.db`) con escrituras concurrentes desde varios
-  procesos — `database is locked` es el patrón típico de contención.
+- SQLite-vec (`ragvec.db`) con escrituras concurrentes — `database is
+  locked` es el patrón típico de contención, recoverable.
 - Ollama local + sentence-transformers + reranker (BGE).
 
-Errores frecuentes y cómo se interpretan:
-- `OperationalError: no such column: trace_id` → falta una migration de
-  schema, suele requerir corrida de `_ensure_telemetry_tables` en una
-  conexión nueva.
-- `database is locked` → contención SQLite. Recoverable: el daemon
-  reintenta en el próximo tick. NO es serio salvo que se acumulen
-  decenas seguidos.
-- `UserWarning: leaked semaphore` → tqdm/loky en multi-process. Patch
-  histórico documentado en `web/server.py` líneas iniciales.
-- `another row available` → un `cursor.fetchone()` esperaba 1 row pero
-  el query devolvió 2+. Bug real: `LIMIT 1` faltante en el SQL.
+Errores frecuentes:
+- `OperationalError: no such column: ...` → falta migration de schema.
+- `database is locked` → contención SQLite, recoverable. Serio sólo si
+  se acumulan decenas seguidos en pocos minutos.
+- `UserWarning: leaked semaphore` → tqdm/loky multi-process. Patch ya
+  documentado en `web/server.py` líneas iniciales.
+- `another row available` → bug real: `LIMIT 1` faltante en SQL o join
+  que duplica.
 
-Formato de respuesta (markdown, español rioplatense, conciso):
-1. **Causa probable**: 1-2 oraciones.
-2. **Severidad**: ok / warning / serio (con justificación corta).
-3. **Fix sugerido**: pasos concretos. Si está documentado en CLAUDE.md
-   o docs/, apuntá ahí. Si no estás seguro, decilo y pedí más contexto
-   en vez de inventar.
-4. **Cuándo preocuparse**: criterios para escalar.
+Formato de respuesta (markdown, español rioplatense):
+
+## Qué está pasando
+1-2 oraciones: causa probable + severidad (ok/warning/serio).
+
+## Cómo arreglarlo
+Pasos concretos. Si está documentado en CLAUDE.md o docs/, apuntá ahí.
+Si no estás seguro, decilo y pedí más contexto en vez de inventar.
+
+## Comandos sugeridos
+Si hay comandos shell que ayudan, ponelos en bloques ```bash```. Cada
+comando en su propia línea. Ejemplos seguros:
+- `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch` (reiniciar daemon)
+- `tail -50 ~/.local/share/obsidian-rag/watch.log` (inspeccionar log)
+- `rag stats` (verificar índice)
+NO sugieras `rm -rf`, `sudo`, `git push --force` ni nada destructivo
+sin marcarlo EXPLÍCITAMENTE como destructivo y advertir las consecuencias.
 
 NO inventes paths, archivos, o líneas que no estén en el contexto.
-NO propongas comandos peligrosos (rm -rf, sudo, force-push) sin marcarlos
-explícitamente como destructivos.
-Si el "error" es un falso positivo del clasificador, decilo.
+Si el "error" parece un falso positivo del clasificador, decilo.
 """
 
 
-def _build_diagnose_user_prompt(req: _LogDiagnoseRequest) -> str:
+def _build_diagnose_error_prompt(req: _DiagnoseErrorRequest) -> str:
     parts = []
-    if req.ts:
-        parts.append(f"**Timestamp**: {req.ts}")
+    if req.timestamp:
+        parts.append(f"**Timestamp**: {req.timestamp}")
     if req.service:
         parts.append(f"**Service**: `{req.service}`")
-    if req.level:
-        parts.append(f"**Level clasificado**: {req.level}")
+    if req.file:
+        parts.append(f"**Archivo**: `{req.file}`")
+    if req.line_n:
+        parts.append(f"**Línea N°** (reverse desde el final): {req.line_n}")
     parts.append("")
-    if req.context_before:
-        parts.append("**Contexto previo** (líneas anteriores):")
+    if req.context_lines:
+        parts.append("**Contexto previo** (las líneas anteriores en el log):")
         parts.append("```")
-        for ln in req.context_before[-8:]:
+        for ln in req.context_lines[-20:]:
             parts.append(ln)
         parts.append("```")
         parts.append("")
     parts.append("**Línea con el error**:")
     parts.append("```")
-    parts.append(req.line)
+    parts.append(req.error_text)
     parts.append("```")
-    if req.context_after:
-        parts.append("")
-        parts.append("**Líneas posteriores**:")
-        parts.append("```")
-        for ln in req.context_after[:8]:
-            parts.append(ln)
-        parts.append("```")
     parts.append("")
     parts.append("Diagnosticá según el formato del system prompt.")
     return "\n".join(parts)
 
 
-@app.post("/api/logs/diagnose")
-def logs_diagnose(req: _LogDiagnoseRequest, request: Request) -> StreamingResponse:
+@app.post("/api/diagnose-error")
+def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingResponse:
     """SSE streaming del LLM con el diagnóstico del error.
 
-    Rate-limited (mismo bucket que /api/chat).
+    Rate-limited (mismo bucket que /api/chat). El SSE emite eventos:
+    `model` (al inicio con el nombre del modelo), `token` (cada chunk
+    del response), `done` (al final), `error` (si algo falla).
     """
     client_ip = (request.client.host if request.client else "unknown")
     _check_rate_limit(_CHAT_BUCKETS, client_ip,
                       _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
 
-    user_prompt = _build_diagnose_user_prompt(req)
+    user_prompt = _build_diagnose_error_prompt(req)
     model = resolve_chat_model()
 
     def _stream():
         try:
+            yield f"data: {json.dumps({'type': 'model', 'name': model})}\n\n"
             stream = ollama.chat(
                 model=model,
                 messages=[
-                    {"role": "system", "content": _LOG_DIAGNOSE_SYSTEM_PROMPT},
+                    {"role": "system", "content": _DIAGNOSE_ERROR_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=True,
                 options={
                     "temperature": 0.3,
                     "seed": 42,
-                    "num_predict": 600,
+                    "num_predict": 800,
                     "num_ctx": 4096,
                 },
                 keep_alive=chat_keep_alive(),
             )
-            yield f"data: {json.dumps({'type': 'start', 'model': model})}\n\n"
             for chunk in stream:
                 msg = chunk.get("message") if isinstance(chunk, dict) else getattr(chunk, "message", None)
                 content = ""
@@ -13169,7 +13174,7 @@ def logs_diagnose(req: _LogDiagnoseRequest, request: Request) -> StreamingRespon
                     content = (msg.get("content") if isinstance(msg, dict)
                                else getattr(msg, "content", "")) or ""
                 if content:
-                    yield f"data: {json.dumps({'type': 'token', 'text': content})}\n\n"
+                    yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
                 done = chunk.get("done") if isinstance(chunk, dict) else getattr(chunk, "done", False)
                 if done:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -13185,6 +13190,33 @@ def logs_diagnose(req: _LogDiagnoseRequest, request: Request) -> StreamingRespon
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+class _DiagnoseExecuteRequest(BaseModel):
+    command: str = Field(..., description="Comando shell que el LLM sugirió")
+
+
+@app.post("/api/diagnose-error/execute")
+def diagnose_error_execute(req: _DiagnoseExecuteRequest) -> dict:
+    """Auto-ejecutar un comando que el LLM sugirió.
+
+    DESHABILITADO en este server por seguridad. El frontend tiene la UI
+    pero ejecutar un comando arbitrario que un LLM produjo (aunque venga
+    en un bloque ```bash```) es un risk vector grande sin una whitelist
+    conservadora + audit log + revisión humana. Por ahora returns 503
+    con un mensaje que sugiere copy-paste manual.
+
+    Para habilitarlo en el futuro, ver el plan en
+    `04-Archive/99-obsidian-system/99-Claude/system/diagnose-execute/`
+    (todavía sin escribir — diseño pendiente).
+    """
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Auto-ejecución de comandos del LLM está deshabilitada por "
+            "seguridad. Copiá el comando y pegalo a tu terminal."
+        ),
     )
 
 

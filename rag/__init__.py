@@ -13032,25 +13032,31 @@ def detect_topic_shift(
     history: list[dict],
     *,
     person_fired: bool,
-) -> tuple[bool, str]:
-    """¿El turno actual cambia de tema vs el anterior? Devuelve (shift, razón).
+) -> tuple[bool, str, float | None]:
+    """¿El turno actual cambia de tema vs el anterior? Devuelve (shift, razón, cosine).
 
     - `shift=True` → el caller debería descartar history para este turno.
     - `razón` es un string corto para logging/observabilidad.
+    - `cosine` es la similitud bge-m3 entre current_q y last_user_q cuando
+      el cosine gate corrió, o None cuando un gate previo cortó (short,
+      anaphoric, person, embed-failure). Lo expone el web chat handler
+      para decidir search-query strategy: cosine ≥ 0.7 → query autónoma
+      (raw), [0.4-0.7) → borderline (reformulate LLM), < 0.4 → ya hubo
+      shift (history dropeado, raw).
 
     No muta nada. Pure function, testeable sin vault/session.
     """
     if not history:
-        return False, "no-history"
+        return False, "no-history", None
     # (1) Anafóricos: pronombres, demostrativos, "y X?", "como lo Y". Short
     # follow-ups (≤2 tokens) también entran acá por construcción — una
     # query de 1-2 palabras es casi siempre elipsis del turno anterior
     # ("y?", "más?", "ella?"). 3+ tokens ya puede ser standalone (ej.
     # "notas de coaching") y cae al cosine gate.
     if len(current_q.split()) <= 2:
-        return False, "short"
+        return False, "short", None
     if _TOPIC_SHIFT_FOLLOWUP_RE.search(current_q):
-        return False, "anaphoric"
+        return False, "anaphoric", None
     # (2) Person-mention gate: build_person_context ya inyectó el dossier de
     # la persona; history de otros temas es ruido puro. Pero si el turno
     # anterior menciona a LA MISMA persona, es follow-up mismo-tema
@@ -13067,24 +13073,24 @@ def detect_topic_shift(
             except Exception:
                 current_people = last_people = set()
             if current_people and current_people == last_people:
-                return False, "same-person"
-        return True, "person"
+                return False, "same-person", None
+        return True, "person", None
     # (3) Cosine gate contra el último user turn.
     if not last_user_q:
-        return False, "no-last-user"
+        return False, "no-last-user", None
     try:
         vecs = embed([current_q, last_user_q])
         if len(vecs) < 2:
-            return False, "embed-empty"
+            return False, "embed-empty", None
         sim = cosine_sim(vecs[0], vecs[1])
     except Exception as exc:
         # Silent fallback — embed puede fallar si ollama está caído; en ese
         # caso preferimos mantener history (fail-safe para follow-ups) antes
         # que dropearla agresivamente.
-        return False, f"embed-failed:{type(exc).__name__}"
+        return False, f"embed-failed:{type(exc).__name__}", None
     if sim < TOPIC_SHIFT_COSINE:
-        return True, f"cosine={sim:.3f}"
-    return False, f"cosine={sim:.3f}"
+        return True, f"cosine={sim:.3f}", float(sim)
+    return False, f"cosine={sim:.3f}", float(sim)
 
 
 _reranker = None

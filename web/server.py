@@ -8407,16 +8407,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # `_helper_idle_unload_qwen3b` is a separate idle-sweeper; this
         # call respects whatever VRAM budget the caller already
         # configured.
-        from rag import build_person_context as _build_person_ctx_early
-        from rag import detect_topic_shift as _detect_topic_shift_early
-        _person_ctx = _build_person_ctx_early(question)
+        from rag import build_person_context as _build_person_ctx
+        from rag import detect_topic_shift as _detect_topic_shift
+        _person_ctx = _build_person_ctx(question)
         _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
         _topic_shifted = False
         _topic_shift_reason = "no-history"
         _topic_shift_cosine: float | None = None
         if history:
             _topic_shifted, _topic_shift_reason, _topic_shift_cosine = (
-                _detect_topic_shift_early(
+                _detect_topic_shift(
                     question, history, person_fired=bool(_person_ctx),
                 )
             )
@@ -8849,28 +8849,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # NOTE: this supersedes the earlier web-local `_mentions_block` —
         # `build_person_context` does the same job with richer output
         # (Apple Contacts metadata + structured format).
-        from rag import build_person_context as _build_person_ctx
-        from rag import detect_topic_shift as _detect_topic_shift
-        _person_ctx = _build_person_ctx(question)
-        _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
-
-        # Topic-shift gate: si la current question cambia de tema vs el turno
-        # anterior, descartamos history para evitar contaminación cross-tópico
-        # del LLM. Caso reportado 2026-04-20: "cual es mi password de avature?"
-        # → "busca informacion sobre mi mama" terminaba mezclando ambos temas
-        # ("no hay info sobre la contraseña de Avature de tu mamá") porque los
-        # 6 últimos mensajes seguían vivos en el prompt. El gate combina
-        # (a) regex anafórico protector, (b) person_context fired, (c) cosine
-        # bge-m3 < 0.40 vs last user Q. Ver `detect_topic_shift` en rag.py.
-        _topic_shifted = False
-        _topic_shift_reason = "no-history"
-        if history:
-            _topic_shifted, _topic_shift_reason = _detect_topic_shift(
-                question, history, person_fired=bool(_person_ctx),
-            )
-            if _topic_shifted:
-                history = []
-
+        # Person-mention enrichment + topic-shift gate moved up to the
+        # search-question selection block (~line 8410) so the cosine value
+        # from `detect_topic_shift` can drive the hybrid reform-vs-concat
+        # routing. `_person_ctx`, `_person_block`, `_topic_shifted`, and
+        # `_topic_shift_reason` are already populated at this point. See
+        # the "Hybrid follow-up resolution (2026-04-26 rework)" comment for
+        # rationale.
 
         # Build messages so the system prompt is BYTE-IDENTICAL across all
         # requests — that's the whole game for ollama prefix caching. The
@@ -13034,6 +13019,173 @@ def logs_global_errors(
             _LOG_GLOBAL_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
         return payload
     return entry["payload"]
+
+
+# ── /api/logs/diagnose — LLM-powered error diagnosis ──────────────────
+# El user clickea el botón "🤖 diagnosticar" al lado de una línea con
+# level=error en el viewer, y recibe streaming del LLM con un análisis
+# del error: causa probable, severidad, propuesta de fix.
+#
+# Scope:
+#   - SOLO diagnóstico textual (nivel 1). NO ejecuta comandos, NO edita
+#     archivos, NO reinicia daemons. Si el user quiere aplicar el fix
+#     que el LLM propuso, lo hace a mano.
+#   - El LLM recibe el error + ~10 líneas de contexto del log + nombre
+#     del service. NO recibe el código del repo (eso requeriría RAG over
+#     el codebase, fuera de scope acá).
+#
+# Por qué no usamos /api/chat (que sí tiene RAG):
+#   1. El RAG sobre el vault es ortogonal — los errores son del CÓDIGO
+#      del repo, no del contenido del vault.
+#   2. El chat tiene tool-calling, history, intent classification —
+#      overhead innecesario para una pregunta directa.
+#   3. Queremos un prompt template específico para diagnóstico.
+
+class _LogDiagnoseRequest(BaseModel):
+    line: str = Field(..., description="La línea de log con el error")
+    service: str = Field("", description="Service de origen (ej. 'watch')")
+    level: str = Field("error", description="Level clasificado: error|warn")
+    ts: str | None = Field(None, description="Timestamp ISO si lo conocemos")
+    context_before: list[str] = Field(default_factory=list, description="Líneas antes (cronológicamente)")
+    context_after: list[str] = Field(default_factory=list, description="Líneas después")
+
+    @field_validator("line")
+    @classmethod
+    def _line_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("line vacía")
+        if len(v) > 4000:
+            v = v[:4000] + "…(truncado)"
+        return v
+
+
+_LOG_DIAGNOSE_SYSTEM_PROMPT = """\
+Sos un asistente experto en el stack `obsidian-rag` de Fer (Fernando Ferrari).
+El user te muestra una línea de log con un error y pide diagnóstico.
+
+Stack relevante:
+- Local-first RAG sobre vault Obsidian, single-file `rag.py` (~50k líneas)
+  + `web/server.py` (FastAPI) + daemons launchd (watch, ingest-*, anticipate,
+  reminder-wa-push, wa-scheduled-send, etc.).
+- SQLite-vec (`ragvec.db`) con escrituras concurrentes desde varios
+  procesos — `database is locked` es el patrón típico de contención.
+- Ollama local + sentence-transformers + reranker (BGE).
+
+Errores frecuentes y cómo se interpretan:
+- `OperationalError: no such column: trace_id` → falta una migration de
+  schema, suele requerir corrida de `_ensure_telemetry_tables` en una
+  conexión nueva.
+- `database is locked` → contención SQLite. Recoverable: el daemon
+  reintenta en el próximo tick. NO es serio salvo que se acumulen
+  decenas seguidos.
+- `UserWarning: leaked semaphore` → tqdm/loky en multi-process. Patch
+  histórico documentado en `web/server.py` líneas iniciales.
+- `another row available` → un `cursor.fetchone()` esperaba 1 row pero
+  el query devolvió 2+. Bug real: `LIMIT 1` faltante en el SQL.
+
+Formato de respuesta (markdown, español rioplatense, conciso):
+1. **Causa probable**: 1-2 oraciones.
+2. **Severidad**: ok / warning / serio (con justificación corta).
+3. **Fix sugerido**: pasos concretos. Si está documentado en CLAUDE.md
+   o docs/, apuntá ahí. Si no estás seguro, decilo y pedí más contexto
+   en vez de inventar.
+4. **Cuándo preocuparse**: criterios para escalar.
+
+NO inventes paths, archivos, o líneas que no estén en el contexto.
+NO propongas comandos peligrosos (rm -rf, sudo, force-push) sin marcarlos
+explícitamente como destructivos.
+Si el "error" es un falso positivo del clasificador, decilo.
+"""
+
+
+def _build_diagnose_user_prompt(req: _LogDiagnoseRequest) -> str:
+    parts = []
+    if req.ts:
+        parts.append(f"**Timestamp**: {req.ts}")
+    if req.service:
+        parts.append(f"**Service**: `{req.service}`")
+    if req.level:
+        parts.append(f"**Level clasificado**: {req.level}")
+    parts.append("")
+    if req.context_before:
+        parts.append("**Contexto previo** (líneas anteriores):")
+        parts.append("```")
+        for ln in req.context_before[-8:]:
+            parts.append(ln)
+        parts.append("```")
+        parts.append("")
+    parts.append("**Línea con el error**:")
+    parts.append("```")
+    parts.append(req.line)
+    parts.append("```")
+    if req.context_after:
+        parts.append("")
+        parts.append("**Líneas posteriores**:")
+        parts.append("```")
+        for ln in req.context_after[:8]:
+            parts.append(ln)
+        parts.append("```")
+    parts.append("")
+    parts.append("Diagnosticá según el formato del system prompt.")
+    return "\n".join(parts)
+
+
+@app.post("/api/logs/diagnose")
+def logs_diagnose(req: _LogDiagnoseRequest, request: Request) -> StreamingResponse:
+    """SSE streaming del LLM con el diagnóstico del error.
+
+    Rate-limited (mismo bucket que /api/chat).
+    """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
+
+    user_prompt = _build_diagnose_user_prompt(req)
+    model = resolve_chat_model()
+
+    def _stream():
+        try:
+            stream = ollama.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _LOG_DIAGNOSE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=True,
+                options={
+                    "temperature": 0.3,
+                    "seed": 42,
+                    "num_predict": 600,
+                    "num_ctx": 4096,
+                },
+                keep_alive=chat_keep_alive(),
+            )
+            yield f"data: {json.dumps({'type': 'start', 'model': model})}\n\n"
+            for chunk in stream:
+                msg = chunk.get("message") if isinstance(chunk, dict) else getattr(chunk, "message", None)
+                content = ""
+                if msg is not None:
+                    content = (msg.get("content") if isinstance(msg, dict)
+                               else getattr(msg, "content", "")) or ""
+                if content:
+                    yield f"data: {json.dumps({'type': 'token', 'text': content})}\n\n"
+                done = chunk.get("done") if isinstance(chunk, dict) else getattr(chunk, "done", False)
+                if done:
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    break
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            yield f"data: {json.dumps({'type': 'error', 'message': err_msg})}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/logs")

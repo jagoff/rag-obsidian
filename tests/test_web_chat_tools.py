@@ -744,7 +744,7 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
     # Fuerza topic-shift so el gate reasigna `history = []` post-check.
     monkeypatch.setattr(
         rag, "detect_topic_shift",
-        lambda q, h, *, person_fired: (True, "person!"),
+        lambda q, h, *, person_fired: (True, "person!", None),
     )
 
     # Overrides el stub del fixture para capturar si se llama al PUT.

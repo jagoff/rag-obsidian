@@ -22,7 +22,7 @@ def _hist(last_user_q: str) -> list[dict]:
 
 
 def test_empty_history_is_not_a_shift():
-    shifted, reason = rag.detect_topic_shift("cualquier cosa", [], person_fired=False)
+    shifted, reason, _cos = rag.detect_topic_shift("cualquier cosa", [], person_fired=False)
     assert shifted is False
     assert reason == "no-history"
 
@@ -31,7 +31,7 @@ def test_short_query_keeps_history_even_if_topic_differs(monkeypatch):
     # 1-2 token queries son ellipsis del turno anterior ("y?", "ella?").
     # Aún si la cosine daría shift, el gate (1) corta antes.
     monkeypatch.setattr(rag, "embed", lambda _ts: [[1.0, 0.0], [0.0, 1.0]])
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "más?", _hist("hablame de Grecia"), person_fired=False,
     )
     assert shifted is False
@@ -48,7 +48,7 @@ def test_anaphoric_cue_keeps_history(monkeypatch):
         return [[1.0, 0.0], [0.0, 1.0]]
 
     monkeypatch.setattr(rag, "embed", fake_embed)
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "profundiza sobre eso",
         _hist("cual es mi password?"),
         person_fired=False,
@@ -63,7 +63,7 @@ def test_como_lo_X_is_anaphoric():
     # Cosine empírica 0.298 (bge-m3 separa activo/desactivo) — el gate de
     # cosine SÍ lo marcaría como shift, pero es claramente un follow-up.
     # El regex "c[oó]mo (lo|la|los|las) \w+" lo protege.
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "y como lo desactivo?",
         _hist("como activo claude peers?"),
         person_fired=False,
@@ -78,7 +78,7 @@ def test_person_fired_with_different_prior_topic_drops_history(monkeypatch):
     monkeypatch.setattr(rag, "_match_mentions_in_query", lambda q, *a, **k: (
         ["04-Archive/99-obsidian-system/99-Mentions/Mama.md"] if "mama" in q.lower() else []
     ))
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "busca informacion sobre mi mama",
         _hist("cual es mi password de avature?"),
         person_fired=True,
@@ -93,7 +93,7 @@ def test_person_fired_same_person_keeps_history(monkeypatch):
     monkeypatch.setattr(rag, "_match_mentions_in_query", lambda q, *a, **k: (
         ["04-Archive/99-obsidian-system/99-Mentions/Mama.md"] if "mama" in q.lower() else []
     ))
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "busca informacion sobre mi mama",
         _hist("contame sobre mi mama"),
         person_fired=True,
@@ -105,7 +105,7 @@ def test_person_fired_same_person_keeps_history(monkeypatch):
 def test_cosine_low_drops_history(monkeypatch):
     # No anafórico, no person, current y last ortogonales → shift.
     monkeypatch.setattr(rag, "embed", lambda _ts: [[1.0, 0.0], [0.0, 1.0]])
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "dame info sobre mis proyectos",
         _hist("como activo claude peers?"),
         person_fired=False,
@@ -119,7 +119,7 @@ def test_cosine_low_drops_history(monkeypatch):
 def test_cosine_high_keeps_history(monkeypatch):
     # Vectores casi paralelos → cosine > threshold → no shift.
     monkeypatch.setattr(rag, "embed", lambda _ts: [[1.0, 0.0], [0.95, 0.05]])
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "que reflexiones tengo sobre coaching?",
         _hist("notas de coaching"),
         person_fired=False,
@@ -135,7 +135,7 @@ def test_embed_failure_is_fail_safe(monkeypatch):
         raise ConnectionError("ollama unreachable")
 
     monkeypatch.setattr(rag, "embed", boom)
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "algo completamente distinto",
         _hist("otro tema totalmente"),
         person_fired=False,
@@ -154,7 +154,7 @@ def test_threshold_boundary(monkeypatch):
     monkeypatch.setattr(rag, "embed", lambda _ts: [
         [1.0, 0.0], [target, v],
     ])
-    shifted, reason = rag.detect_topic_shift(
+    shifted, reason, _cos = rag.detect_topic_shift(
         "a query for boundary",
         _hist("another query"),
         person_fired=False,

@@ -899,50 +899,50 @@
 
     <!-- ── KPI HERO ─────────────────────────────────────────────── -->
     <section class="kpi-hero" aria-label="Indicadores clave de aprendizaje">
-      <div class="kpi" id="kpi-eval-singles">
-        <span class="kpi-label">eval hit@5 (singles)</span>
+      <div class="kpi" id="kpi-eval-singles" title="hit@5 sobre singles del eval set">
+        <span class="kpi-label">Acierto en preguntas simples</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-eval-chains">
-        <span class="kpi-label">eval hit@5 (chains)</span>
+      <div class="kpi" id="kpi-eval-chains" title="hit@5 sobre chains del eval set">
+        <span class="kpi-label">Acierto en preguntas con varios pasos</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-feedback-total">
-        <span class="kpi-label">feedback total</span>
+      <div class="kpi" id="kpi-feedback-total" title="Total de thumbs ↑/↓ en la ventana">
+        <span class="kpi-label">Feedback que diste</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-behavior-per-query">
-        <span class="kpi-label">eventos / query</span>
+      <div class="kpi" id="kpi-behavior-per-query" title="Ratio: eventos rag_behavior / queries">
+        <span class="kpi-label">Señales implícitas por pregunta</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-cache-hit">
-        <span class="kpi-label">cache hit rate</span>
+      <div class="kpi" id="kpi-cache-hit" title="Tasa de hit del response cache">
+        <span class="kpi-label">Respuestas desde memoria reciente</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-paraphrases">
-        <span class="kpi-label">paráfrasis aprendidas</span>
+      <div class="kpi" id="kpi-paraphrases" title="Conteo total de paraphrases creadas">
+        <span class="kpi-label">Variantes de preguntas aprendidas</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-entities">
-        <span class="kpi-label">entidades</span>
+      <div class="kpi" id="kpi-entities" title="Snapshot total de entities en la vault">
+        <span class="kpi-label">Personas y lugares reconocidos</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-contradictions">
-        <span class="kpi-label">contradicciones resueltas</span>
+      <div class="kpi" id="kpi-contradictions" title="% de contradictions con decisión (resuelta/dismissed)">
+        <span class="kpi-label">Inconsistencias que aclaraste</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
@@ -952,22 +952,22 @@
     <!-- ── 1. RETRIEVAL QUALITY ─────────────────────────────────── -->
     <section class="learn-section" id="sec-retrieval-quality" aria-labelledby="h-retrieval-quality">
       <header class="learn-section-hdr">
-        <h2 id="h-retrieval-quality">Retrieval Quality</h2>
+        <h2 id="h-retrieval-quality" title="Retrieval quality: hit@5, MRR, latencia vs score">Qué tan bien encuentra notas</h2>
         <p class="muted">hit@5, MRR, eval drift y latencia vs score</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-retrieval-quality" data-collapse="body-retrieval-quality">−</button>
       </header>
       <div class="learn-section-body" id="body-retrieval-quality">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="eval-over-time">
-            <h3>Eval over time (hit@5 + MRR)</h3>
+            <h3 title="Eval over time: hit@5 + MRR, singles + chains">Precisión en el tiempo</h3>
             <div class="chart-wrap"><canvas id="chart-eval-over-time" aria-label="Líneas: hit@5 y MRR para singles y chains a lo largo del tiempo"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="tune-deltas">
-            <h3>Tune deltas (% mejora vs baseline)</h3>
+            <h3 title="Tune deltas — % delta vs baseline weights">Mejora por ajuste (% vs línea base)</h3>
             <div class="chart-wrap"><canvas id="chart-tune-deltas" aria-label="Barras: % de mejora por iteración de tune"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="latency-vs-score">
-            <h3>Latencia vs top score (cada query)</h3>
+            <h3 title="Latency (s) vs top score per query">Velocidad vs relevancia</h3>
             <div class="chart-wrap"><canvas id="chart-latency-vs-score" aria-label="Scatter: latencia de retrieval (s) vs top score por query"></canvas></div>
           </div>
         </div>
@@ -977,13 +977,13 @@
     <!-- ── 2. RANKER WEIGHTS ────────────────────────────────────── -->
     <section class="learn-section" id="sec-ranker-weights" aria-labelledby="h-ranker-weights">
       <header class="learn-section-hdr">
-        <h2 id="h-ranker-weights">Ranker Weights</h2>
+        <h2 id="h-ranker-weights" title="Ranker weights over time (12 features)">Importancia de cada factor de búsqueda</h2>
         <p class="muted">small-multiples — una mini-línea por weight, baseline punteada</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-ranker-weights" data-collapse="body-ranker-weights">−</button>
       </header>
       <div class="learn-section-body" id="body-ranker-weights">
         <div class="chart-card wide" data-chart-card="ranker-weights">
-          <h3>Pesos del ranker en el tiempo (vs baseline)</h3>
+          <h3 title="Ranker weights over time vs baseline">Importancia de cada factor (12 mini-gráficos)</h3>
           <div id="ranker-weights-grid" class="small-multiples"></div>
         </div>
       </div>
@@ -992,7 +992,7 @@
     <!-- ── 3. SCORE CALIBRATION ─────────────────────────────────── -->
     <section class="learn-section" id="sec-score-calibration" aria-labelledby="h-score-calibration">
       <header class="learn-section-hdr">
-        <h2 id="h-score-calibration">Score Calibration</h2>
+        <h2 id="h-score-calibration" title="Score calibration: raw vs calibrated por source">Calibración de confianza por fuente</h2>
         <p class="muted">curvas raw → calibrated por source (isotonic / spline)</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-score-calibration" data-collapse="body-score-calibration">−</button>
       </header>
@@ -1004,22 +1004,22 @@
     <!-- ── 4. FEEDBACK EXPLÍCITO ────────────────────────────────── -->
     <section class="learn-section" id="sec-feedback-explicit" aria-labelledby="h-feedback-explicit">
       <header class="learn-section-hdr">
-        <h2 id="h-feedback-explicit">Feedback Explícito</h2>
+        <h2 id="h-feedback-explicit" title="Explicit feedback: rag_feedback table">Lo que dijiste (thumbs ↑/↓)</h2>
         <p class="muted">thumbs ↑/↓, paths correctivos, scope (answer vs retrieval)</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-explicit" data-collapse="body-feedback-explicit">−</button>
       </header>
       <div class="learn-section-body" id="body-feedback-explicit">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="thumbs-over-time">
-            <h3>Thumbs por día (positivo / negativo / correctivo)</h3>
+            <h3 title="Thumbs/day: positive, negative, corrective">Reacciones diarias</h3>
             <div class="chart-wrap"><canvas id="chart-thumbs-over-time"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="corrective-cumulative">
-            <h3>Paths correctivos (acumulado)</h3>
+            <h3 title="Corrective paths cumulative">Correcciones acumuladas</h3>
             <div class="chart-wrap"><canvas id="chart-corrective-cumulative"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="feedback-by-scope">
-            <h3>Feedback por scope</h3>
+            <h3 title="Feedback by scope: answer/retrieval/both">Dónde fue el feedback</h3>
             <div class="chart-wrap"><canvas id="chart-feedback-by-scope"></canvas></div>
           </div>
         </div>
@@ -1029,18 +1029,18 @@
     <!-- ── 5. FEEDBACK IMPLÍCITO ────────────────────────────────── -->
     <section class="learn-section" id="sec-feedback-implicit" aria-labelledby="h-feedback-implicit">
       <header class="learn-section-hdr">
-        <h2 id="h-feedback-implicit">Feedback Implícito</h2>
+        <h2 id="h-feedback-implicit" title="Implicit feedback: re-queries, dwell, outcomes">Lo que hiciste (sin decir nada)</h2>
         <p class="muted">señales pasivas: requery, session outcome, paths correctivos</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-implicit" data-collapse="body-feedback-implicit">−</button>
       </header>
       <div class="learn-section-body" id="body-feedback-implicit">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="implicit-by-source">
-            <h3>Por fuente</h3>
+            <h3 title="Implicit feedback by source">Señales implícitas por fuente</h3>
             <div class="chart-wrap"><canvas id="chart-implicit-by-source"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="implicit-rate-over-time">
-            <h3>Tasa de señal implícita por día</h3>
+            <h3 title="Implicit signal rate per day">% de señales implícitas (por día)</h3>
             <div class="chart-wrap"><canvas id="chart-implicit-rate"></canvas></div>
           </div>
         </div>
@@ -1050,26 +1050,26 @@
     <!-- ── 6. BEHAVIOR ──────────────────────────────────────────── -->
     <section class="learn-section" id="sec-behavior" aria-labelledby="h-behavior">
       <header class="learn-section-hdr">
-        <h2 id="h-behavior">Behavior</h2>
+        <h2 id="h-behavior" title="Behavior: rag_behavior events">Cómo interactuaste</h2>
         <p class="muted">CTR por source, dwell, top paths, heatmap día×hora</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-behavior" data-collapse="body-behavior">−</button>
       </header>
       <div class="learn-section-body" id="body-behavior">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="ctr-by-source">
-            <h3>CTR por source en el tiempo</h3>
+            <h3 title="CTR by source over time">Click rate por fuente</h3>
             <div class="chart-wrap"><canvas id="chart-ctr-by-source"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="dwell-distribution">
-            <h3>Distribución de dwell time</h3>
+            <h3 title="Dwell time distribution">Cuánto tiempo pasaste leyendo</h3>
             <div class="chart-wrap"><canvas id="chart-dwell-distribution"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="top-paths">
-            <h3>Top paths (clicks · dwell promedio)</h3>
+            <h3 title="Top paths: clicks + avg dwell">Notas más visitadas</h3>
             <div class="chart-wrap"><canvas id="chart-top-paths"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="heatmap-dow-hour">
-            <h3>Heatmap día de la semana × hora</h3>
+            <h3 title="Heatmap day-of-week × hour">Mapa de actividad</h3>
             <div id="heatmap-dow-hour" class="heatmap-dow-hour" role="img" aria-label="Heatmap de actividad por día de la semana y hora del día"></div>
             <div id="heatmap-hours-axis" class="heatmap-hours" aria-hidden="true"></div>
           </div>
@@ -1080,22 +1080,22 @@
     <!-- ── 7. QUERY LEARNING ────────────────────────────────────── -->
     <section class="learn-section" id="sec-query-learning" aria-labelledby="h-query-learning">
       <header class="learn-section-hdr">
-        <h2 id="h-query-learning">Query Learning</h2>
+        <h2 id="h-query-learning" title="Query learning: paraphrases + cache">Cómo aprendió a entender tus preguntas</h2>
         <p class="muted">paráfrasis aprendidas, top variantes, cache hit rate</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-query-learning" data-collapse="body-query-learning">−</button>
       </header>
       <div class="learn-section-body" id="body-query-learning">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="paraphrases-count">
-            <h3>Paráfrasis acumuladas por día</h3>
+            <h3 title="Paraphrases cumulative per day">Variantes de preguntas (acumuladas)</h3>
             <div class="chart-wrap"><canvas id="chart-paraphrases-count"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="cache-hit-rate-time">
-            <h3>Cache hit rate por día</h3>
+            <h3 title="Cache hit rate per day">Respuestas desde cache (por día)</h3>
             <div class="chart-wrap"><canvas id="chart-cache-hit-rate-time"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="top-paraphrases">
-            <h3>Top paráfrasis (hit count)</h3>
+            <h3 title="Top paraphrases by hit count">Variantes más usadas</h3>
             <div class="chart-wrap"><canvas id="chart-top-paraphrases"></canvas></div>
           </div>
         </div>
@@ -1105,26 +1105,26 @@
     <!-- ── 8. ANTICIPATORY ──────────────────────────────────────── -->
     <section class="learn-section" id="sec-anticipatory" aria-labelledby="h-anticipatory">
       <header class="learn-section-hdr">
-        <h2 id="h-anticipatory">Anticipatory</h2>
+        <h2 id="h-anticipatory" title="Anticipatory: rag_anticipate_candidates">Predicciones que hizo</h2>
         <p class="muted">candidatos por kind, selección/send, reacciones, weights</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-anticipatory" data-collapse="body-anticipatory">−</button>
       </header>
       <div class="learn-section-body" id="body-anticipatory">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="anti-candidates">
-            <h3>Candidatos por kind (apilado)</h3>
+            <h3 title="Anticipated candidates by kind (stacked)">Predicciones por tipo</h3>
             <div class="chart-wrap"><canvas id="chart-anti-candidates"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="anti-selection-send">
-            <h3>Tasa de selección y send</h3>
+            <h3 title="Anticipatory selection + send rate">Acierto de predicciones</h3>
             <div class="chart-wrap"><canvas id="chart-anti-selection-send"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="anti-reactions">
-            <h3>Reacciones del usuario</h3>
+            <h3 title="Anticipatory user reactions">Cómo reaccionaste</h3>
             <div class="chart-wrap"><canvas id="chart-anti-reactions"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="anti-weights">
-            <h3>Weights actuales por kind</h3>
+            <h3 title="Anticipatory weights by kind">Importancia de cada tipo de predicción</h3>
             <div class="chart-wrap"><canvas id="chart-anti-weights"></canvas></div>
           </div>
         </div>
@@ -1134,22 +1134,22 @@
     <!-- ── 9. ROUTING LEARNING ──────────────────────────────────── -->
     <section class="learn-section" id="sec-routing" aria-labelledby="h-routing">
       <header class="learn-section-hdr">
-        <h2 id="h-routing">Routing Learning</h2>
+        <h2 id="h-routing" title="Routing learning: rag_routing_decisions">A dónde envió cada pregunta</h2>
         <p class="muted">decisiones por bucket, reglas activas, ratio de evidencia</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-routing" data-collapse="body-routing">−</button>
       </header>
       <div class="learn-section-body" id="body-routing">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="routing-decisions">
-            <h3>Decisiones por bucket (apilado)</h3>
+            <h3 title="Routing decisions by bucket (stacked)">A dónde fueron las preguntas</h3>
             <div class="chart-wrap"><canvas id="chart-routing-decisions"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="routing-rules">
-            <h3>Reglas activas en el tiempo</h3>
+            <h3 title="Active routing rules over time">Reglas activas</h3>
             <div class="chart-wrap"><canvas id="chart-routing-rules"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="routing-evidence">
-            <h3>Distribución del evidence ratio</h3>
+            <h3 title="Routing evidence ratio distribution">Confianza de las decisiones</h3>
             <div class="chart-wrap"><canvas id="chart-routing-evidence"></canvas></div>
           </div>
         </div>
@@ -1159,26 +1159,26 @@
     <!-- ── 10. WHISPER LEARNING ─────────────────────────────────── -->
     <section class="learn-section" id="sec-whisper" aria-labelledby="h-whisper">
       <header class="learn-section-hdr">
-        <h2 id="h-whisper">Whisper Learning</h2>
+        <h2 id="h-whisper" title="Whisper learning: vocab + corrections">Cómo mejoró la transcripción</h2>
         <p class="muted">vocab por source, correcciones, avg logprob, top vocab</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-whisper" data-collapse="body-whisper">−</button>
       </header>
       <div class="learn-section-body" id="body-whisper">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="whisper-vocab-source">
-            <h3>Vocab size por source (snapshot)</h3>
+            <h3 title="Whisper vocab size by source">Vocabulario por fuente</h3>
             <div class="chart-wrap"><canvas id="chart-whisper-vocab-source"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="whisper-corrections">
-            <h3>Correcciones por source en el tiempo</h3>
+            <h3 title="Whisper corrections by source over time">Correcciones de transcripción</h3>
             <div class="chart-wrap"><canvas id="chart-whisper-corrections"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="whisper-logprob">
-            <h3>Avg logprob por día</h3>
+            <h3 title="Whisper avg logprob per day">Confianza de transcripciones</h3>
             <div class="chart-wrap"><canvas id="chart-whisper-logprob"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="whisper-top-vocab">
-            <h3>Top vocab (peso)</h3>
+            <h3 title="Top whisper vocab by weight">Términos más importantes</h3>
             <div class="chart-wrap"><canvas id="chart-whisper-top-vocab"></canvas></div>
           </div>
         </div>
@@ -1188,30 +1188,30 @@
     <!-- ── 11. VAULT INTELLIGENCE ───────────────────────────────── -->
     <section class="learn-section" id="sec-vault" aria-labelledby="h-vault">
       <header class="learn-section-hdr">
-        <h2 id="h-vault">Vault Intelligence</h2>
+        <h2 id="h-vault" title="Vault intelligence: entities + contradictions">Qué aprendió de tus notas</h2>
         <p class="muted">entidades, mentions, contradicciones, filing, surface vs archive</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-vault" data-collapse="body-vault">−</button>
       </header>
       <div class="learn-section-body" id="body-vault">
         <div class="chart-grid">
           <div class="chart-card" data-chart-card="vault-entities-type">
-            <h3>Entidades por tipo en el tiempo</h3>
+            <h3 title="Entities by type over time">Personas y lugares en el tiempo</h3>
             <div class="chart-wrap"><canvas id="chart-vault-entities-type"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="vault-mentions">
-            <h3>Mentions por día</h3>
+            <h3 title="Mentions per day">Menciones de entidades</h3>
             <div class="chart-wrap"><canvas id="chart-vault-mentions"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="vault-contradictions">
-            <h3>Contradicciones por semana (detectadas / resueltas)</h3>
+            <h3 title="Contradictions per week: detected vs resolved">Inconsistencias detectadas vs resueltas</h3>
             <div class="chart-wrap"><canvas id="chart-vault-contradictions"></canvas></div>
           </div>
           <div class="chart-card" data-chart-card="vault-filing">
-            <h3>Filing por carpeta (apilado)</h3>
+            <h3 title="Filing by folder (stacked)">Distribución en carpetas</h3>
             <div class="chart-wrap"><canvas id="chart-vault-filing"></canvas></div>
           </div>
           <div class="chart-card wide" data-chart-card="vault-surface-archive">
-            <h3>Surface vs Archive en el tiempo</h3>
+            <h3 title="Surface vs archive over time">Notas activas vs archivadas</h3>
             <div class="chart-wrap"><canvas id="chart-vault-surface-archive"></canvas></div>
           </div>
         </div>

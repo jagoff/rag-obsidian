@@ -537,10 +537,10 @@ function renderRetrievalQuality(payload) {
       data: {
         labels,
         datasets: [
-          { label: "hit@5 singles", data: series.map((p) => p.hit5_singles), borderColor: C.cyan,   backgroundColor: alpha(C.cyan, 0.15),   tension: 0.3, pointRadius: 2, _paletteIdx: 0 },
-          { label: "hit@5 chains",  data: series.map((p) => p.hit5_chains),  borderColor: C.green,  backgroundColor: alpha(C.green, 0.15),  tension: 0.3, pointRadius: 2, _paletteIdx: 1 },
-          { label: "MRR singles",   data: series.map((p) => p.mrr_singles),  borderColor: C.yellow, backgroundColor: alpha(C.yellow, 0.10), tension: 0.3, pointRadius: 2, borderDash: [4, 3], _paletteIdx: 2 },
-          { label: "MRR chains",    data: series.map((p) => p.mrr_chains),   borderColor: C.purple, backgroundColor: alpha(C.purple, 0.10), tension: 0.3, pointRadius: 2, borderDash: [4, 3], _paletteIdx: 4 },
+          { label: "Acierto en simples", data: series.map((p) => p.hit5_singles), borderColor: C.cyan,   backgroundColor: alpha(C.cyan, 0.15),   tension: 0.3, pointRadius: 2, _paletteIdx: 0 },
+          { label: "Acierto en complejas",  data: series.map((p) => p.hit5_chains),  borderColor: C.green,  backgroundColor: alpha(C.green, 0.15),  tension: 0.3, pointRadius: 2, _paletteIdx: 1 },
+          { label: "Ranking promedio (simples)",   data: series.map((p) => p.mrr_singles),  borderColor: C.yellow, backgroundColor: alpha(C.yellow, 0.10), tension: 0.3, pointRadius: 2, borderDash: [4, 3], _paletteIdx: 2 },
+          { label: "Ranking promedio (complejas)",    data: series.map((p) => p.mrr_chains),   borderColor: C.purple, backgroundColor: alpha(C.purple, 0.10), tension: 0.3, pointRadius: 2, borderDash: [4, 3], _paletteIdx: 4 },
         ],
       },
       options: {
@@ -564,7 +564,7 @@ function renderRetrievalQuality(payload) {
       data: {
         labels,
         datasets: [{
-          label: "Δ% vs baseline",
+          label: "Mejora vs línea base (%)",
           data,
           backgroundColor: colors,
           borderColor: colors,
@@ -596,7 +596,7 @@ function renderRetrievalQuality(payload) {
       type: "scatter",
       data: {
         datasets: [{
-          label: "queries",
+          label: "Consultas",
           data: points,
           backgroundColor: alpha(C.cyan, 0.4),
           borderColor: C.cyan,
@@ -671,8 +671,8 @@ function renderRankerWeights(payload) {
       data: {
         labels,
         datasets: [
-          { label: "weight", data, borderColor: col, backgroundColor: alpha(col, 0.15), tension: 0.3, pointRadius: 0, borderWidth: 1.5, _paletteIdx: i },
-          { label: "baseline", data: baseLine, borderColor: C.dim, borderDash: [3, 3], pointRadius: 0, borderWidth: 1, fill: false },
+          { label: "Peso actual", data, borderColor: col, backgroundColor: alpha(col, 0.15), tension: 0.3, pointRadius: 0, borderWidth: 1.5, _paletteIdx: i },
+          { label: "Peso inicial", data: baseLine, borderColor: C.dim, borderDash: [3, 3], pointRadius: 0, borderWidth: 1, fill: false },
         ],
       },
       options: {
@@ -745,8 +745,8 @@ function renderScoreCalibration(payload) {
       data: {
         labels: raw.map((v) => v.toFixed(2)),
         datasets: [
-          { label: "raw → cal", data: cal, borderColor: col, backgroundColor: alpha(col, 0.15), tension: 0.2, pointRadius: 3, _paletteIdx: idx },
-          { label: "y = x (identidad)", data: raw, borderColor: C.dim, borderDash: [4, 3], pointRadius: 0, borderWidth: 1, fill: false },
+          { label: "Score ajustado", data: cal, borderColor: col, backgroundColor: alpha(col, 0.15), tension: 0.2, pointRadius: 3, _paletteIdx: idx },
+          { label: "Sin ajuste (referencia)", data: raw, borderColor: C.dim, borderDash: [4, 3], pointRadius: 0, borderWidth: 1, fill: false },
         ],
       },
       options: {
@@ -776,9 +776,9 @@ function renderFeedbackExplicit(payload) {
       data: {
         labels,
         datasets: [
-          { label: "positivos",   data: series.map((p) => p.positive),   borderColor: C.green,  backgroundColor: alpha(C.green, 0.30),  fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 1, _areaFill: true },
-          { label: "negativos",   data: series.map((p) => p.negative),   borderColor: C.red,    backgroundColor: alpha(C.red, 0.30),    fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 3, _areaFill: true },
-          { label: "correctivos", data: series.map((p) => p.corrective), borderColor: C.yellow, backgroundColor: alpha(C.yellow, 0.30), fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 2, _areaFill: true },
+          { label: "Positivos",   data: series.map((p) => p.positive),   borderColor: C.green,  backgroundColor: alpha(C.green, 0.30),  fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 1, _areaFill: true },
+          { label: "Negativos",   data: series.map((p) => p.negative),   borderColor: C.red,    backgroundColor: alpha(C.red, 0.30),    fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 3, _areaFill: true },
+          { label: "Correctivos", data: series.map((p) => p.corrective), borderColor: C.yellow, backgroundColor: alpha(C.yellow, 0.30), fill: true, tension: 0.3, pointRadius: 1, _paletteIdx: 2, _areaFill: true },
         ],
       },
       options: {
@@ -799,7 +799,7 @@ function renderFeedbackExplicit(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "acumulado",
+          label: "Total acumulado",
           data: series.map((p) => p.cumulative),
           borderColor: C.cyan,
           backgroundColor: alpha(C.cyan, 0.20),
@@ -894,7 +894,7 @@ function renderFeedbackImplicit(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "% implícito",
+          label: "% de señales implícitas",
           data: series.map((p) => p.implicit_pct),
           borderColor: C.purple,
           backgroundColor: alpha(C.purple, 0.18),
@@ -955,7 +955,7 @@ function renderBehavior(payload) {
       data: {
         labels: buckets.map((b) => b.label),
         datasets: [{
-          label: "frecuencia",
+          label: "Cantidad",
           data: buckets.map((b) => b.count),
           backgroundColor: alpha(C.cyan, 0.6),
           borderColor: C.cyan,
@@ -988,7 +988,7 @@ function renderBehavior(payload) {
       data: {
         labels: top.map((r) => r.path && r.path.length > 50 ? "…" + r.path.slice(-49) : (r.path || "?")),
         datasets: [{
-          label: "clicks",
+          label: "Clicks",
           data: top.map((r) => r.clicks),
           backgroundColor: alpha(C.green, 0.6),
           borderColor: C.green,
@@ -1087,7 +1087,7 @@ function renderQueryLearning(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "acumulado",
+          label: "Total acumulado",
           data: series.map((p) => p.cumulative),
           borderColor: C.purple,
           backgroundColor: alpha(C.purple, 0.20),
@@ -1116,7 +1116,7 @@ function renderQueryLearning(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "hit rate",
+          label: "Tasa de cache",
           data: series.map((p) => p.hit_rate),
           borderColor: C.green,
           backgroundColor: alpha(C.green, 0.20),
@@ -1161,7 +1161,7 @@ function renderQueryLearning(payload) {
           return text.length > 60 ? text.slice(0, 59) + "…" : text;
         }),
         datasets: [{
-          label: "hits",
+          label: "Usos",
           data: top.map((r) => r.hit_count),
           backgroundColor: alpha(C.cyan, 0.6),
           borderColor: C.cyan,
@@ -1225,8 +1225,8 @@ function renderAnticipatory(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [
-          { label: "selection",  data: series.map((p) => p.selection_rate), borderColor: C.cyan,  backgroundColor: alpha(C.cyan, 0.15),  tension: 0.3, pointRadius: 1, _paletteIdx: 0 },
-          { label: "send",       data: series.map((p) => p.send_rate),      borderColor: C.green, backgroundColor: alpha(C.green, 0.15), tension: 0.3, pointRadius: 1, _paletteIdx: 1 },
+          { label: "Seleccionados",  data: series.map((p) => p.selection_rate), borderColor: C.cyan,  backgroundColor: alpha(C.cyan, 0.15),  tension: 0.3, pointRadius: 1, _paletteIdx: 0 },
+          { label: "Enviados",       data: series.map((p) => p.send_rate),      borderColor: C.green, backgroundColor: alpha(C.green, 0.15), tension: 0.3, pointRadius: 1, _paletteIdx: 1 },
         ],
       },
       options: {
@@ -1280,7 +1280,7 @@ function renderAnticipatory(payload) {
       data: {
         labels: wkeys,
         datasets: [{
-          label: "weight",
+          label: "Peso",
           data: wkeys.map((k) => wc[k]),
           backgroundColor: alpha(C.purple, 0.6),
           borderColor: C.purple,
@@ -1337,7 +1337,7 @@ function renderRoutingLearning(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "reglas activas",
+          label: "Reglas activas",
           data: series.map((p) => p.count),
           borderColor: C.orange,
           backgroundColor: alpha(C.orange, 0.20),
@@ -1361,7 +1361,7 @@ function renderRoutingLearning(payload) {
       data: {
         labels: buckets.map((b) => b.range),
         datasets: [{
-          label: "frecuencia",
+          label: "Cantidad",
           data: buckets.map((b) => b.count),
           backgroundColor: alpha(C.yellow, 0.6),
           borderColor: C.yellow,
@@ -1446,7 +1446,7 @@ function renderWhisperLearning(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "avg logprob",
+          label: "Confianza promedio",
           data: series.map((p) => p.avg_logprob),
           borderColor: C.cyan,
           backgroundColor: alpha(C.cyan, 0.15),
@@ -1485,7 +1485,7 @@ function renderWhisperLearning(payload) {
       data: {
         labels: top.map((r) => r.term || "?"),
         datasets: [{
-          label: "weight",
+          label: "Peso",
           data: top.map((r) => r.weight),
           backgroundColor: alpha(C.green, 0.6),
           borderColor: C.green,
@@ -1551,7 +1551,7 @@ function renderVaultIntelligence(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [{
-          label: "mentions",
+          label: "Menciones",
           data: series.map((p) => p.count),
           borderColor: C.cyan,
           backgroundColor: alpha(C.cyan, 0.20),
@@ -1575,8 +1575,8 @@ function renderVaultIntelligence(payload) {
       data: {
         labels: series.map((p) => shortDate(p.week_start)),
         datasets: [
-          { label: "detectadas", data: series.map((p) => p.detected), backgroundColor: alpha(C.red, 0.6),   borderColor: C.red,   borderWidth: 1, _paletteIdx: 3 },
-          { label: "resueltas",  data: series.map((p) => p.resolved), backgroundColor: alpha(C.green, 0.6), borderColor: C.green, borderWidth: 1, _paletteIdx: 1 },
+          { label: "Detectadas", data: series.map((p) => p.detected), backgroundColor: alpha(C.red, 0.6),   borderColor: C.red,   borderWidth: 1, _paletteIdx: 3 },
+          { label: "Resueltas",  data: series.map((p) => p.resolved), backgroundColor: alpha(C.green, 0.6), borderColor: C.green, borderWidth: 1, _paletteIdx: 1 },
         ],
       },
       options: {
@@ -1626,8 +1626,8 @@ function renderVaultIntelligence(payload) {
       data: {
         labels: series.map((p) => shortDate(p.date)),
         datasets: [
-          { label: "surface", data: series.map((p) => p.surface), borderColor: C.cyan,  backgroundColor: alpha(C.cyan, 0.15),  tension: 0.3, pointRadius: 1, _paletteIdx: 0 },
-          { label: "archive", data: series.map((p) => p.archive), borderColor: C.dim,   backgroundColor: alpha(C.dim, 0.10),   tension: 0.3, pointRadius: 1 },
+          { label: "Activas", data: series.map((p) => p.surface), borderColor: C.cyan,  backgroundColor: alpha(C.cyan, 0.15),  tension: 0.3, pointRadius: 1, _paletteIdx: 0 },
+          { label: "Archivadas", data: series.map((p) => p.archive), borderColor: C.dim,   backgroundColor: alpha(C.dim, 0.10),   tension: 0.3, pointRadius: 1 },
         ],
       },
       options: {

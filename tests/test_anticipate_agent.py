@@ -427,7 +427,7 @@ def test_orchestrator_dry_run_does_not_push(monkeypatch, state_db):
                         (("a", lambda now: [cand]),))
     pushed = []
     monkeypatch.setattr(rag, "proactive_push",
-                        lambda kind, msg, **kw: pushed.append(kind) or True)
+                        lambda kind, msg, **kw: (pushed.append(kind) or True, None))
     rag.anticipate_run_impl(dry_run=True)
     assert pushed == []
 
@@ -468,10 +468,11 @@ def test_orchestrator_pushes_when_not_dry_run(monkeypatch, state_db):
                         (("a", lambda now: [cand]),))
     pushed = []
     monkeypatch.setattr(rag, "proactive_push",
-                        lambda kind, msg, **kw: pushed.append((kind, msg)) or True)
+                        lambda kind, msg, **kw: (pushed.append((kind, msg)) or True, None))
     res = rag.anticipate_run_impl(dry_run=False)
     assert res["selected"] is not None
     assert res["sent"] is True
+    assert res.get("skip_reason") is None
     assert pushed[0][0] == "anticipate-calendar"
 
 

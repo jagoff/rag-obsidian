@@ -20787,11 +20787,11 @@ def emergent(days: int, min_size: int, threshold: float, dry_run: bool, push: bo
     if dry_run and not push:
         return
     # Snooze por 72h en el mismo theme — no queremos spam del mismo cluster.
-    sent = proactive_push("emergent", msg, snooze_hours=72)
+    sent, reason = proactive_push("emergent", msg, snooze_hours=72)
     if sent:
         console.print("[green]✓ pusheado a WA[/green]")
     else:
-        console.print("[yellow]no pusheado (cap diario, silencio o snooze)[/yellow]")
+        console.print(f"[yellow]no pusheado: {reason or 'razón desconocida'}[/yellow]")
 
 
 @cli.command()
@@ -20855,11 +20855,11 @@ def patterns(last: int, min_share: float, dry_run: bool, push: bool):
     console.print(msg)
     if dry_run and not push:
         return
-    sent = proactive_push("patterns", msg, snooze_hours=168)  # weekly
+    sent, reason = proactive_push("patterns", msg, snooze_hours=168)  # weekly
     if sent:
         console.print("[green]✓ pusheado a WA[/green]")
     else:
-        console.print("[yellow]no pusheado (cap/silencio/snooze)[/yellow]")
+        console.print(f"[yellow]no pusheado: {reason or 'razón desconocida'}[/yellow]")
 
 
 @cli.command()

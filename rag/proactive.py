@@ -140,21 +140,43 @@ def _proactive_can_push(kind: str) -> tuple[bool, str]:
     return (True, "")
 
 
-def proactive_push(kind: str, message: str, *, snooze_hours: int | None = None) -> bool:
+def proactive_push(
+    kind: str, message: str, *, snooze_hours: int | None = None,
+) -> tuple[bool, str | None]:
     """Push proactivo a WA con rate-limit + silencio + snooze compartidos.
 
     Si `snooze_hours` se pasa, tras enviar el kind entra en snooze por ese
     tiempo — evita repetir el mismo trigger (ej: emergent theme sobre 'X'
     ya se pingeó, no repetir hasta snooze_hours después).
+
+    Returns `(sent, reason)`:
+      - sent=True, reason=None   → mensaje enviado al WA jid.
+      - sent=False, reason=str   → razón EXACTA del skip. Una de:
+          * "ambient WA no habilitado (/enable_ambient desde el bot)"
+              (gate 1 — no existe ambient.json o enabled=false)
+          * "{kind} silenciado (rag silence off {kind})"  (gate 2)
+          * "{kind} en snooze hasta {iso_ts}"             (gate 3)
+          * "daily cap alcanzado ({N})"                   (gate 4)
+          * "WA bridge send failed"   (los 4 gates pasaron pero el HTTP
+              POST al bridge falló — cluster down, bridge crasheado, etc.)
+
+    Pre-2026-04-26: devolvía solo `bool`. Los callers imprimían un mensaje
+    genérico "no pusheado (cap diario, silencio o snooze)" que ocultaba el
+    motivo real (ej. ambient deshabilitado, gate 1, NO uno de los 3 que
+    nombraba el mensaje). Cambio motivado por debugging del loop de
+    anticipatory roto: 72 candidates con sent=0 que parecían rate-limit
+    pero eran ambient.json missing. La razón exacta ahorra horas.
     """
     from rag import _ambient_config, _ambient_whatsapp_send
     ok, reason = _proactive_can_push(kind)
     if not ok:
         _proactive_log({"kind": kind, "sent": False, "reason": reason})
-        return False
+        return (False, reason)
     cfg = _ambient_config()
     if not cfg:
-        return False
+        # Defensive: _proactive_can_push ya chequea esto, pero por si la
+        # config se borra entre el chequeo y el send.
+        return (False, "ambient WA no habilitado (/enable_ambient desde el bot)")
     sent = _ambient_whatsapp_send(cfg["jid"], message)
     state = _proactive_load_state()
     if sent:
@@ -165,4 +187,4 @@ def proactive_push(kind: str, message: str, *, snooze_hours: int | None = None) 
             ).isoformat(timespec="seconds")
         _proactive_save_state(state)
     _proactive_log({"kind": kind, "sent": sent, "message_preview": message[:120]})
-    return sent
+    return (sent, None if sent else "WA bridge send failed")

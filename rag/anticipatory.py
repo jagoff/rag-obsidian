@@ -557,12 +557,16 @@ def anticipate_run_impl(
 
     top = viable[0]
     sent = False
+    skip_reason: str | None = None
     if not dry_run:
         try:
-            sent = _rag.proactive_push(top.kind, top.message, snooze_hours=top.snooze_hours)
+            sent, skip_reason = _rag.proactive_push(
+                top.kind, top.message, snooze_hours=top.snooze_hours,
+            )
         except Exception as exc:
             _silent_log("anticipate_proactive_push", exc)
             sent = False
+            skip_reason = f"exception: {exc}"
 
     try:
         _anticipate_log_candidate(top, selected=True, sent=sent)
@@ -572,6 +576,7 @@ def anticipate_run_impl(
     return {
         "selected": _anticipate_candidate_to_dict(top),
         "sent": sent,
+        "skip_reason": skip_reason,
         "all": [_anticipate_candidate_to_dict(c) for c in all_candidates],
     }
 
@@ -660,9 +665,8 @@ def anticipate_run(dry_run: bool, explain: bool, force: bool):
         elif result.get("sent"):
             console.print("[green]✓ pusheado a WA[/green]")
         else:
-            console.print(
-                "[yellow]no pusheado (cap diario, silencio o snooze)[/yellow]"
-            )
+            reason = result.get("skip_reason") or "razón desconocida"
+            console.print(f"[yellow]no pusheado: {reason}[/yellow]")
     elif not all_c:
         console.print("[dim]ninguna señal activa[/dim]")
     else:

@@ -2411,6 +2411,66 @@ _CHAT_UPLOAD_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-upl
 # reminder, ahorrale el click al user".
 _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE = 0.85
 
+# Mapeo suffix → format param de PIL.save (los formatos que PIL maneja
+# nativamente sin plugins extra). HEIC NO está acá porque PIL sin
+# pillow_heif no puede leerlo — para HEIC dejamos los bytes originales.
+_SANITIZABLE_FORMATS: dict[str, str] = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
+    ".gif": "GIF",
+}
+
+
+def _sanitize_image_exif(raw_bytes: bytes, suffix: str) -> bytes:
+    """Re-encode la imagen sin EXIF/GPS/metadata para evitar fugas de
+    privacidad cuando se copia al vault iCloud.
+
+    PIL al cargar con ``Image.open()`` lee el EXIF en ``img.info``;
+    cuando re-encodeamos creando una nueva imagen con ``putdata()`` y
+    saving sin pasar ``exif=...`` explícito, los metadatos no
+    sobreviven al roundtrip.
+
+    Args:
+      raw_bytes: bytes de la imagen original (del upload).
+      suffix: extensión con punto (ej. ``.jpg``). Determina el formato
+        de re-encoding.
+
+    Returns:
+      Bytes sanitizados si el formato es soportado, o ``raw_bytes`` sin
+      cambios si:
+
+      - El suffix no está en ``_SANITIZABLE_FORMATS`` (HEIC, HEIF, etc.)
+      - PIL falla al cargar la imagen (corrupta, formato exótico)
+      - Hay cualquier otra excepción durante el re-encoding
+
+      Falla suave porque la sanitización es nice-to-have — preferimos
+      copiar la foto con EXIF a NO copiarla. Si el user pierde
+      privacidad, al menos no pierde la nota.
+    """
+    fmt = _SANITIZABLE_FORMATS.get(suffix.lower())
+    if fmt is None:
+        return raw_bytes
+    try:
+        from PIL import Image  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            img.load()  # force decode (PIL is lazy)
+            # Crear imagen NUEVA con los mismos píxeles raw pero sin
+            # heredar el `info` dict del source (que contiene EXIF,
+            # ICC, XMP, etc.). `tobytes()` + `frombytes()` es la API
+            # estable que no usa el `getdata()` deprecated en Pillow 14.
+            stripped = Image.frombytes(img.mode, img.size, img.tobytes())
+            buf = io.BytesIO()
+            stripped.save(buf, format=fmt)
+            return buf.getvalue()
+    except Exception:
+        # Cualquier error → fallback al raw original. Privacidad
+        # degradada pero la nota se guarda.
+        return raw_bytes
+
 
 @app.post("/api/chat/upload-image")
 async def upload_chat_image(file: UploadFile = File(...)) -> dict:
@@ -2484,6 +2544,15 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
     # Naming: `<timestamp>-<hash8>.<ext>` para que sea ordenable
     # cronológicamente en el inbox. Idempotente — si ya existe (hash
     # igual = mismo contenido), no lo re-escribimos.
+    #
+    # **EXIF sanitization (audit 2026-04-25 #5)**: las fotos del iPhone
+    # incluyen EXIF con GPS coords + fecha + cámara. El vault sincroniza
+    # con iCloud, así que sin sanitización los metadatos viajan a la
+    # nube. PIL re-codifica la imagen sin EXIF (formato JPEG/PNG/WebP/
+    # GIF). Para HEIC del iPhone (formato default), PIL sin pillow_heif
+    # no puede leer → caemos al original con EXIF (mejor que rechazar
+    # el upload entero); el user puede convertir a JPEG en Settings →
+    # Camera → Formats → "Most Compatible" si la privacidad importa.
     try:
         import rag as _rag  # noqa: PLC0415
         from datetime import datetime as _dt  # noqa: PLC0415
@@ -2498,7 +2567,8 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                 # repetida del mismo binary) — si está, dedup natural.
                 existing = list(vault_inbox.glob(f"*-{img_hash[:8]}{suffix}"))
                 if not existing:
-                    vault_img_path.write_bytes(raw)
+                    sanitized = _sanitize_image_exif(raw, suffix)
+                    vault_img_path.write_bytes(sanitized)
     except Exception:
         # Silent-fail: copia al vault es nice-to-have, no debe romper
         # el flujo principal de OCR + detección.
@@ -2523,8 +2593,25 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
 
     ocr_text = ""
     ocr_source = ""
+    # OCR + VLM caption es síncrono (ocrmac llama a Apple Vision via
+    # PyObjC; VLM hace HTTP a Ollama). Si lo llamamos directo desde el
+    # handler async, BLOQUEA el event loop entero hasta 60s (timeout
+    # de _vlm_client). Lo movemos a un thread y le ponemos timeout
+    # duro de 20s — VLM normal tarda 2-4s, cold-load del modelo ~10s,
+    # 20s es margen para casos lentos sin colgar el server. Si excede,
+    # devolvemos noop con razón explícita y la imagen igual quedó
+    # cacheada en disco para retry manual.
     try:
-        ocr_text, ocr_source = _image_text_or_caption(img_path)
+        ocr_text, ocr_source = await asyncio.wait_for(
+            asyncio.to_thread(_image_text_or_caption, img_path),
+            timeout=20.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "action": "noop",
+            "reason": "ocr_timeout",
+            "image_path": str(img_path),
+        }
     except Exception as e:
         return {
             "action": "noop",
@@ -2585,8 +2672,23 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
                 "image_path": str(img_path),
             }
 
+    # Detector LLM (qwen2.5:3b por default) también es blocking.
+    # Mismo tratamiento: thread + timeout 15s. El detector tarda 1-3s
+    # en warm + ~10s en cold-load del modelo. 15s cubre casos lentos
+    # sin freezar el server.
     try:
-        detection = _detect_cita_from_ocr(ocr_text)
+        detection = await asyncio.wait_for(
+            asyncio.to_thread(_detect_cita_from_ocr, ocr_text),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "action": "noop",
+            "reason": "detector_timeout",
+            "ocr_text": ocr_text[:500],
+            "ocr_source": ocr_source,
+            "image_path": str(img_path),
+        }
     except Exception as e:
         return {
             "action": "noop",

@@ -20552,12 +20552,119 @@ def _ambient_log_event(event: dict) -> None:
 
 def _reminder_wa_was_pushed(conn, reminder_id: str) -> bool:
     """True si el reminder ya fue pusheado a WhatsApp y la row sigue en
-    la tabla de dedup (no fue pruneada). PK lookup, O(1)."""
+    la tabla de dedup (no fue pruneada). PK lookup, O(1).
+
+    Nota: rows con ``pushed_at`` empezando con ``"pending:"`` son
+    markers de adquisición atómica (un worker está procesando ahora
+    mismo el envío, ver ``_reminder_wa_acquire``); esas NO cuentan
+    como "ya pusheado" — el envío real puede fallar y la row pending
+    se libera. Solo rows con un timestamp ISO regular cuentan."""
     row = conn.execute(
-        "SELECT 1 FROM rag_reminder_wa_pushed WHERE reminder_id = ?",
+        "SELECT pushed_at FROM rag_reminder_wa_pushed WHERE reminder_id = ?",
         (reminder_id,),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    return not (row[0] or "").startswith("pending:")
+
+
+def _reminder_wa_acquire(
+    conn, reminder_id: str, due_iso: str | None, title: str | None,
+    *,
+    stale_after_seconds: int = 600,
+) -> str:
+    """Atómicamente intenta agarrar el lock de envío para ``reminder_id``.
+
+    Antes (SELECT-then-INSERT) había una race: 2 workers concurrentes
+    leían "no está pushed" y ambos enviaban → reminder duplicado. Ahora
+    el INSERT OR IGNORE hace de mutex: solo el primer worker pasa con
+    rowcount=1; el segundo ve la row ya creada y se va.
+
+    Devuelve uno de:
+
+    - ``"acquired"``: gané la carrera, debo proceder a enviar y
+      eventualmente llamar ``_reminder_wa_mark_pushed`` (success)
+      o ``_reminder_wa_release`` (fail).
+    - ``"already_sent"``: la row ya tiene un ``pushed_at`` real (no
+      ``"pending:"``) — alguien ya envió, skip.
+    - ``"in_flight"``: la row es ``"pending:<ts>"`` y ``ts`` es reciente
+      (< ``stale_after_seconds``) — otro worker está procesando, skip.
+    - ``"stale_pending"``: la row es ``"pending:<ts>"`` pero ``ts`` es
+      muy viejo — un worker probablemente crasheó dejando la row
+      colgada. La robamos (refresh el timestamp) y procedemos como
+      si fuera ``"acquired"``.
+    """
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    pending_marker = f"pending:{now_iso}"
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO rag_reminder_wa_pushed "
+        "(reminder_id, pushed_at, due_iso, title) VALUES (?, ?, ?, ?)",
+        (reminder_id, pending_marker, due_iso or None, title or None),
+    )
+    conn.commit()
+    if (cur.rowcount or 0) > 0:
+        return "acquired"
+
+    # La row ya existía. Inspeccionamos si está pending o ya enviada.
+    row = conn.execute(
+        "SELECT pushed_at FROM rag_reminder_wa_pushed WHERE reminder_id = ?",
+        (reminder_id,),
+    ).fetchone()
+    if row is None:
+        # Race weirdness: la row se borró entre el INSERT y el SELECT
+        # (otro proceso probablemente la liberó). Reportamos in_flight
+        # para que el próximo run lo agarre.
+        return "in_flight"
+
+    state = row[0] or ""
+    if not state.startswith("pending:"):
+        return "already_sent"
+
+    # Pending de otro worker — chequeamos si está stale.
+    try:
+        ts_str = state[len("pending:"):]
+        ts = datetime.fromisoformat(ts_str)
+        age_s = (datetime.now() - ts).total_seconds()
+    except Exception:
+        # Marker corrupto — lo robamos.
+        age_s = float("inf")
+
+    if age_s > stale_after_seconds:
+        # Stale recovery: el worker que tenía la row crasheó. Robamos
+        # con un UPDATE condicional (si otro worker hizo lo mismo
+        # simultáneamente, solo uno gana — atomic por el WHERE clause
+        # que matchea el ts viejo exacto).
+        cur = conn.execute(
+            "UPDATE rag_reminder_wa_pushed SET pushed_at = ? "
+            "WHERE reminder_id = ? AND pushed_at = ?",
+            (pending_marker, reminder_id, state),
+        )
+        conn.commit()
+        if (cur.rowcount or 0) > 0:
+            return "stale_pending"
+        # Si el rowcount es 0, otro worker se nos adelantó — caemos a
+        # in_flight como caso degenerado.
+
+    return "in_flight"
+
+
+def _reminder_wa_release(conn, reminder_id: str) -> None:
+    """Borra la row pending para ``reminder_id`` si existe — solo
+    afecta rows con marker ``"pending:..."``, no rows ya enviadas.
+
+    Se llama cuando el send falla después de un acquire exitoso, para
+    que el próximo run del worker pueda reintentar. Sin esto, un fallo
+    transitorio del bridge dejaría la row pending para siempre y el
+    reminder nunca se mandaría (hasta el prune cada 30 días)."""
+    try:
+        conn.execute(
+            "DELETE FROM rag_reminder_wa_pushed WHERE reminder_id = ? "
+            "AND pushed_at LIKE 'pending:%'",
+            (reminder_id,),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def _reminder_wa_mark_pushed(
@@ -20566,7 +20673,10 @@ def _reminder_wa_mark_pushed(
     """INSERT OR REPLACE: marca el reminder como ya pusheado.
     `due_iso` y `title` se persisten para auditoría/debug — no se leen
     durante el flow normal pero ayudan cuando alguien revisa la tabla
-    a ojo (`SELECT * FROM rag_reminder_wa_pushed`)."""
+    a ojo (`SELECT * FROM rag_reminder_wa_pushed`).
+
+    Cuando se llama después de ``_reminder_wa_acquire`` exitoso, esto
+    promueve la row pending → real timestamp (idempotente)."""
     conn.execute(
         "INSERT OR REPLACE INTO rag_reminder_wa_pushed "
         "(reminder_id, pushed_at, due_iso, title) VALUES (?, ?, ?, ?)",
@@ -20734,17 +20844,44 @@ def push_due_reminders_to_whatsapp(
                     summary["items"].append(entry)
                     continue
 
-            # Dedup gate — already pushed.
-            if rid and _reminder_wa_was_pushed(conn, rid):
-                entry["action"] = "skipped:already"
-                summary["skipped"] += 1
-                summary["items"].append(entry)
-                continue
-
+            # Dry-run path: solo chequea, no muta. NO usa acquire (no
+            # queremos ensuciar la tabla con markers pending durante un
+            # dry-run).
             if dry_run:
+                if rid and _reminder_wa_was_pushed(conn, rid):
+                    entry["action"] = "skipped:already"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
                 entry["action"] = "dry_run"
                 summary["items"].append(entry)
                 continue
+
+            # Acquire atómico — reemplaza el SELECT-then-INSERT no-atómico
+            # de antes. Si 2 workers corren a la vez (ej. cron + manual),
+            # solo uno pasa a enviar. Audit 2026-04-25.
+            if rid:
+                acq = _reminder_wa_acquire(conn, rid, due_iso, title)
+                if acq == "already_sent":
+                    entry["action"] = "skipped:already"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
+                if acq == "in_flight":
+                    # Otro worker está procesando este mismo reminder —
+                    # lo dejamos al próximo run para que decida si
+                    # reintenta (lo verá como "ya pushed" si el otro
+                    # worker terminó OK, o como "stale_pending" si
+                    # crasheó).
+                    entry["action"] = "skipped:in_flight"
+                    summary["skipped"] += 1
+                    summary["items"].append(entry)
+                    continue
+                # acq es "acquired" o "stale_pending" — soy el dueño.
+            # Si rid es vacío (caso degenerado), no hay dedup posible —
+            # mando igual sin acquire para preservar el comportamiento
+            # anterior (mejor un duplicado raro que perder un reminder
+            # legítimo sin ID).
 
             text = _reminder_wa_format_text(item, now)
             try:
@@ -20763,9 +20900,14 @@ def push_due_reminders_to_whatsapp(
                 entry["action"] = "pushed"
                 summary["pushed"] += 1
             else:
-                # Bridge falló — NO marcamos para reintentar en el próximo
-                # run (es la garantía de retry implícita: solo dedup en
-                # sends exitosos).
+                # Bridge falló — liberamos la row pending para que el
+                # próximo run pueda reintentar. Sin release, la row
+                # quedaría como "pending:<ts>" y el otro worker la vería
+                # como in_flight indefinidamente (hasta los 600s del
+                # stale recovery, durante los cuales el reminder NO se
+                # manda).
+                if rid:
+                    _reminder_wa_release(conn, rid)
                 entry["action"] = "failed"
                 summary["failed"] += 1
             summary["items"].append(entry)

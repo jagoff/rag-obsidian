@@ -462,6 +462,80 @@ def test_detector_exception_returns_noop(monkeypatch):
     assert "detector_error" in data["reason"]
 
 
+def test_ocr_timeout_returns_noop(monkeypatch):
+    """Si OCR cuelga >20s, asyncio.wait_for cancela y devolvemos
+    noop con reason='ocr_timeout'. Audit 2026-04-25: antes de este
+    fix, OCR síncrono dentro de async handler bloqueaba el event
+    loop entero. Ahora corre en thread con timeout duro."""
+    import time as _time
+
+    def _slow_ocr(p):
+        # 0.5s es suficiente para exceder el timeout testeado de 0.1s.
+        # No usamos sleep(30) porque asyncio.to_thread no cancela el
+        # thread — el wait_for timeout libera al caller, pero el thread
+        # sigue corriendo hasta que termine, y el test esperaba 30s.
+        _time.sleep(0.5)
+        return ("nunca llega acá", "ocr")
+
+    monkeypatch.setattr("rag.ocr._image_text_or_caption", _slow_ocr)
+    # Bajamos el timeout a 0.1s para que el test sea rápido — el
+    # mecanismo es el mismo, solo cambiamos la duración.
+    import web.server as _ws  # noqa: PLC0415
+    import asyncio as _aio  # noqa: PLC0415
+    orig_wait_for = _aio.wait_for
+
+    async def _short_wait_for(coro, timeout):
+        return await orig_wait_for(coro, 0.1)
+
+    monkeypatch.setattr(_ws.asyncio, "wait_for", _short_wait_for)
+
+    resp = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("img.png", _png_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["action"] == "noop"
+    # Puede dar ocr_timeout o detector_timeout dependiendo de cuál
+    # call vino primero; lo que NO debe pasar es freezar el server.
+    assert data["reason"] in ("ocr_timeout", "detector_timeout")
+
+
+def test_detector_timeout_returns_noop(monkeypatch):
+    """Si detector LLM cuelga >15s, asyncio.wait_for cancela y
+    devolvemos noop con reason='detector_timeout'. OCR responde
+    rápido para llegar al detector."""
+    import time as _time
+
+    monkeypatch.setattr(
+        "rag.ocr._image_text_or_caption",
+        lambda p: ("a" * 100 + " texto largo agendable", "ocr"),
+    )
+
+    def _slow_detect(t):
+        _time.sleep(0.5)
+        return None
+
+    monkeypatch.setattr("rag.ocr._detect_cita_from_ocr", _slow_detect)
+    import web.server as _ws  # noqa: PLC0415
+    import asyncio as _aio  # noqa: PLC0415
+    orig_wait_for = _aio.wait_for
+
+    async def _short_wait_for(coro, timeout):
+        return await orig_wait_for(coro, 0.1)
+
+    monkeypatch.setattr(_ws.asyncio, "wait_for", _short_wait_for)
+
+    resp = _client.post(
+        "/api/chat/upload-image",
+        files={"file": ("img.png", _png_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["action"] == "noop"
+    assert data["reason"] in ("ocr_timeout", "detector_timeout")
+
+
 # ── 6. Persistencia: imagen guardada en uploads dir ─────────────────────
 
 
@@ -599,3 +673,96 @@ def test_dedup_does_not_short_circuit_ambiguous(monkeypatch):
     assert len(detect_calls) == 2, (
         "ambiguous debe re-procesar — el LLM puede mejorar con más contexto"
     )
+
+
+# ── 8. EXIF sanitization (audit 2026-04-25) ─────────────────────────────────
+
+
+def _jpeg_with_exif(gps_lat: float = -34.6037, gps_lon: float = -58.3816) -> bytes:
+    """Genera un JPEG con EXIF GPS embebido (Buenos Aires por default).
+    Útil para verificar que el sanitizer extrae los metadatos."""
+    from PIL import Image
+    import io
+
+    img = Image.new("RGB", (10, 10), color=(255, 128, 64))
+    # PIL no expone una API simple para crear EXIF de cero; usamos
+    # piexif si está, o simulamos al menos `info["exif"]` con bytes
+    # arbitrarios reconocibles.
+    buf = io.BytesIO()
+    # Inyectar exif bytes: header EXIF mínimo + marker GPS.
+    # En la práctica PIL acepta cualquier bytes en el param `exif=` y
+    # los embebe — solo necesitamos verificar que se eliminan post-strip.
+    fake_exif = b"Exif\x00\x00MM\x00*\x00\x00\x00\x08" + b"\xff" * 100
+    img.save(buf, format="JPEG", exif=fake_exif)
+    return buf.getvalue()
+
+
+def _png_with_metadata() -> bytes:
+    """PNG con tEXt chunk de metadata, para test de strip en PNG."""
+    from PIL import Image, PngImagePlugin
+    import io
+
+    img = Image.new("RGB", (10, 10), color=(0, 200, 100))
+    buf = io.BytesIO()
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("Author", "Fer")
+    pnginfo.add_text("GPS", "-34.6037,-58.3816")
+    img.save(buf, format="PNG", pnginfo=pnginfo)
+    return buf.getvalue()
+
+
+def test_sanitize_strips_exif_from_jpeg():
+    """JPEG con EXIF → output NO debe tener marcador EXIF."""
+    raw = _jpeg_with_exif()
+    # Verificar que el original SÍ tiene EXIF (sanity check del fixture).
+    assert b"Exif" in raw
+
+    sanitized = _server._sanitize_image_exif(raw, ".jpg")
+    assert sanitized != raw
+    # El re-encoding sin pasar exif=... no embebe EXIF.
+    assert b"Exif" not in sanitized
+
+
+def test_sanitize_strips_metadata_from_png():
+    """PNG con tEXt chunks (Author, GPS) → output limpio."""
+    raw = _png_with_metadata()
+    assert b"Author" in raw or b"GPS" in raw
+
+    sanitized = _server._sanitize_image_exif(raw, ".png")
+    # tEXt chunks no se preservan en el roundtrip Image.new+putdata+save.
+    assert b"Author" not in sanitized
+    assert b"GPS" not in sanitized
+
+
+def test_sanitize_passthrough_for_heic():
+    """HEIC no es sanitizable sin pillow_heif → devuelve raw original.
+    Compromiso de privacidad documentado: el iPhone manda HEIC por
+    default, y rechazar el upload entero sería peor UX que copiar con
+    EXIF."""
+    fake_heic = b"\x00\x00\x00\x18ftypheic" + b"\xff" * 200
+    result = _server._sanitize_image_exif(fake_heic, ".heic")
+    assert result == fake_heic
+
+
+def test_sanitize_passthrough_for_corrupt_image():
+    """Bytes corruptos / formato exótico → silent fail, devuelve raw."""
+    corrupt = b"this is definitely not an image"
+    result = _server._sanitize_image_exif(corrupt, ".jpg")
+    # PIL.Image.open rebota con UnidentifiedImageError → caemos al
+    # except y devolvemos raw.
+    assert result == corrupt
+
+
+def test_sanitize_preserves_pixel_data():
+    """Sanitizer no corrompe los píxeles — la imagen sigue siendo
+    visualmente la misma, solo sin metadatos."""
+    from PIL import Image
+    import io
+
+    raw = _jpeg_with_exif()
+    sanitized = _server._sanitize_image_exif(raw, ".jpg")
+
+    orig = Image.open(io.BytesIO(raw))
+    clean = Image.open(io.BytesIO(sanitized))
+    assert orig.size == clean.size
+    assert orig.mode == clean.mode

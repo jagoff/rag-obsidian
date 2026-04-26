@@ -541,3 +541,120 @@ def test_run_fallback_bootstrap_does_not_loop_with_stale_hid(tmp_vault_col):
         f"fallback bootstrap debería avanzar a hid fresco '3000', "
         f"got '{row[0]}' — pre-fix loopeaba con '1000' (stale)"
     )
+
+
+# ── CAS (compare-and-swap) del cursor — audit 2026-04-25 ────────────────────
+
+
+def test_save_history_id_cas_bootstrap_succeeds_when_no_row(tmp_vault_col):
+    """Bootstrap (expected=None) e INSERT exitoso → True. La tabla
+    queda con la row insertada."""
+    import sqlite3
+    from scripts import ingest_gmail as ig_mod
+
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        ig_mod._ensure_state_table(conn)
+        won = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "100", expected_history_id=None,
+        )
+        conn.commit()
+        assert won is True
+        assert ig_mod._load_history_id(conn, "me@x.com") == "100"
+    finally:
+        conn.close()
+
+
+def test_save_history_id_cas_bootstrap_loses_race(tmp_vault_col):
+    """Bootstrap concurrente: dos workers leen None y ambos intentan
+    INSERT. El primero gana (rowcount=1), el segundo pierde
+    (rowcount=0 por OR IGNORE). Sin el CAS pre-fix ambos hacían
+    INSERT OR REPLACE y el segundo pisaba al primero con un hid
+    distinto."""
+    import sqlite3
+    from scripts import ingest_gmail as ig_mod
+
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        ig_mod._ensure_state_table(conn)
+        # Worker 1 hace bootstrap con hid="100".
+        a = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "100", expected_history_id=None,
+        )
+        # Worker 2 (concurrente, también leyó None) intenta hid="200".
+        # OR IGNORE: no toca la row existente.
+        b = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "200", expected_history_id=None,
+        )
+        conn.commit()
+        assert a is True
+        assert b is False
+        # El cursor quedó con el hid del primer worker.
+        assert ig_mod._load_history_id(conn, "me@x.com") == "100"
+    finally:
+        conn.close()
+
+
+def test_save_history_id_cas_incremental_succeeds_when_unchanged(tmp_vault_col):
+    """Incremental con expected_hid que matchea: UPDATE gana. Cursor
+    avanza al new_hid."""
+    import sqlite3
+    from scripts import ingest_gmail as ig_mod
+
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        ig_mod._ensure_state_table(conn)
+        ig_mod._save_history_id(conn, "me@x.com", "500")
+        conn.commit()
+        # Worker leyó "500" al inicio, ahora intenta avanzar a "600".
+        won = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "600", expected_history_id="500",
+        )
+        conn.commit()
+        assert won is True
+        assert ig_mod._load_history_id(conn, "me@x.com") == "600"
+    finally:
+        conn.close()
+
+
+def test_save_history_id_cas_incremental_loses_race(tmp_vault_col):
+    """Race incremental: ambos workers leyeron stored_hid='500'; el
+    primero avanzó a '600' antes del CAS del segundo. El segundo CAS
+    falla (rowcount=0) porque su WHERE history_id='500' ya no matchea.
+    El cursor queda en el valor del primer worker — NO se sobrescribe.
+
+    Este es exactamente el bug del audit: pre-fix, INSERT OR REPLACE
+    siempre escribía y ambos workers procesaban el mismo rango → corpus
+    con duplicados de threads. Post-fix, el segundo worker detecta el
+    conflicto y NO retry."""
+    import sqlite3
+    from scripts import ingest_gmail as ig_mod
+
+    state_path = rag.DB_PATH / "ragvec.db"
+    conn = sqlite3.connect(str(state_path))
+    try:
+        ig_mod._ensure_state_table(conn)
+        ig_mod._save_history_id(conn, "me@x.com", "500")
+        conn.commit()
+
+        # Worker 1: leyó "500", procesó, avanza a "600". Gana.
+        a = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "600", expected_history_id="500",
+        )
+        # Worker 2 (concurrente): leyó "500" antes que worker 1
+        # commiteara, procesó el mismo rango, intenta avanzar a "650".
+        # Pierde porque su WHERE no matchea.
+        b = ig_mod._save_history_id_cas(
+            conn, "me@x.com", "650", expected_history_id="500",
+        )
+        conn.commit()
+        assert a is True
+        assert b is False
+        # El cursor quedó en "600" (worker 1 ganó), no en "650"
+        # (worker 2 perdió la carrera).
+        assert ig_mod._load_history_id(conn, "me@x.com") == "600"
+    finally:
+        conn.close()

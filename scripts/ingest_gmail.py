@@ -134,6 +134,61 @@ def _save_history_id(
     )
 
 
+def _save_history_id_cas(
+    conn: sqlite3.Connection,
+    account_id: str,
+    new_history_id: str,
+    expected_history_id: str | None,
+    last_msg_id: str | None = None,
+) -> bool:
+    """Compare-and-swap del cursor de history.
+
+    Audit 2026-04-25: el ``BEGIN IMMEDIATE`` solo cubría la escritura,
+    pero el ``_load_history_id`` inicial NO estaba en la transacción.
+    Si 2 ingesters concurrentes leían el mismo cursor, ambos procesaban
+    el mismo rango de history y el segundo escribía sobre el primero
+    (idempotente para el cursor pero el corpus tenía duplicados).
+
+    Solución: en vez de una transacción larga (que tendría locked al
+    state.db por todo el ingest, ~minutos), usamos optimistic
+    concurrency: la escritura solo gana si el cursor no se movió
+    desde que lo leímos al inicio.
+
+    Args:
+      account_id: identifica al usuario (multi-cuenta hipotético).
+      new_history_id: el cursor que queremos escribir.
+      expected_history_id: lo que leímos al inicio del run; None si
+        era bootstrap (no había row).
+      last_msg_id: pasado al INSERT OR UPDATE (informativo).
+
+    Returns:
+      True si la escritura tuvo efecto (no había conflicto).
+      False si otro worker ya avanzó el cursor — el caller debe
+      loggear y NO retry (el otro worker ya hizo el trabajo).
+    """
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    if expected_history_id is None:
+        # Caso bootstrap: no había row. INSERT OR IGNORE de modo que
+        # si otro worker bootsrapeó simultáneamente, su INSERT gana
+        # y el nuestro es no-op (rowcount=0).
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO rag_gmail_state "
+            "(account_id, history_id, last_msg_id, updated_at) VALUES (?, ?, ?, ?)",
+            (account_id, new_history_id, last_msg_id, now_iso),
+        )
+        return (cur.rowcount or 0) > 0
+    # Caso incremental: había una row con `expected_history_id`. Solo
+    # escribimos si nadie más la cambió mientras procesábamos. El WHERE
+    # con history_id=expected es atomic en SQLite (un UPDATE es una
+    # sola operación, sin race entre WHERE y SET).
+    cur = conn.execute(
+        "UPDATE rag_gmail_state SET history_id = ?, last_msg_id = ?, updated_at = ? "
+        "WHERE account_id = ? AND history_id = ?",
+        (new_history_id, last_msg_id, now_iso, account_id, expected_history_id),
+    )
+    return (cur.rowcount or 0) > 0
+
+
 def _reset_cursor(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM rag_gmail_state")
 
@@ -658,16 +713,25 @@ def run(
             fresh_hid = None
         new_hid = fresh_hid or latest_hid or profile_hid
         if new_hid:
-            # 2026-04-24 audit: BEGIN IMMEDIATE serializa escrituras del
-            # cursor `history_id` si 2 ingesters corren en paralelo
-            # (cron + manual). Sin esto, el 2do escritor podía pisar
-            # el `history_id` del 1ro con un valor stale que leyó
-            # antes del commit del 1ro → próxima corrida re-procesa
-            # el mismo rango history.
+            # 2026-04-25 audit: además del BEGIN IMMEDIATE en la
+            # escritura, ahora usamos compare-and-swap contra el
+            # `stored_hid` que leímos al inicio. Si 2 ingesters
+            # corren en paralelo y ambos leen `stored_hid=X`, ambos
+            # procesan el rango X→Y; el primero en commitear escribe
+            # Y, el segundo intenta escribir Y también pero su CAS
+            # falla (el cursor ya no está en X). Loggeamos el conflicto
+            # y NO retry — el corpus quedará con duplicados de ese
+            # run, pero el cursor es consistente y la próxima corrida
+            # NO re-procesa el rango.
             try:
                 state_conn.execute("BEGIN IMMEDIATE")
-                _save_history_id(state_conn, account_id, str(new_hid))
+                won = _save_history_id_cas(
+                    state_conn, account_id, str(new_hid),
+                    expected_history_id=stored_hid,
+                )
                 state_conn.commit()
+                if not won:
+                    summary["cursor_cas_conflict"] = True
             except sqlite3.Error:
                 try:
                     state_conn.rollback()

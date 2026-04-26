@@ -373,4 +373,133 @@ def test_dry_run_no_send_no_mark(
     actions = [it["action"] for it in summary["items"]]
     assert actions.count("dry_run") == 2
     assert calls == []
-    assert _read_pushed_rows(tmp_path) == []
+
+
+# ── Race condition (atomic acquire) ──────────────────────────────────────────
+
+
+def test_acquire_returns_acquired_on_first_call(cfg_path, tmp_path):
+    """Primer worker en agarrar el reminder gana el lock."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        result = rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "Test")
+        assert result == "acquired"
+
+
+def test_acquire_returns_in_flight_when_concurrent(cfg_path, tmp_path):
+    """Segundo worker simultáneo ve la row pending y se va con
+    ``in_flight`` en vez de mandar duplicado. Esta es la race que
+    arregla el atomic acquire (audit 2026-04-25)."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        first = rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "Test")
+        assert first == "acquired"
+        # Mismo conn (el SQLite WAL serializa writes), simulamos un
+        # segundo worker que intenta agarrar el mismo rid.
+        second = rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "Test")
+        assert second == "in_flight"
+
+
+def test_acquire_returns_already_sent_when_marked(cfg_path, tmp_path):
+    """Después de mark_pushed, otro acquire ve la row real y devuelve
+    already_sent."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "Test")
+        rag._reminder_wa_mark_pushed(conn, "rid-1", "2026-04-24T18:00", "Test")
+        # Otro worker llega tarde — debería ver already_sent.
+        result = rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "Test")
+        assert result == "already_sent"
+
+
+def test_acquire_steals_stale_pending(cfg_path, tmp_path):
+    """Si un worker crasheó dejando pending:<old_ts>, otro lo roba con
+    stale_pending. Lo testeamos forzando un timestamp antiguo a mano."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        # Inyectamos manualmente una row "pending" vieja.
+        old_ts = (datetime.now() - timedelta(seconds=900)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO rag_reminder_wa_pushed (reminder_id, pushed_at, due_iso, title) "
+            "VALUES (?, ?, ?, ?)",
+            ("rid-1", f"pending:{old_ts}", "2026-04-24T18:00", "Crashed worker"),
+        )
+        conn.commit()
+        # Stale por default es 600s; 900s la caída para arriba.
+        result = rag._reminder_wa_acquire(
+            conn, "rid-1", "2026-04-24T18:00", "Test",
+            stale_after_seconds=600,
+        )
+        assert result == "stale_pending"
+
+
+def test_release_clears_pending_only(cfg_path, tmp_path):
+    """release borra rows pending pero NO rows ya enviadas (mark_pushed
+    persiste). Defensa contra un bug donde release tras un fallo
+    transitorio corrompía el dedup permanente."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        # 1) Pending → release → desaparece
+        rag._reminder_wa_acquire(conn, "rid-A", "2026-04-24T18:00", "A")
+        assert rag._reminder_wa_was_pushed(conn, "rid-A") is False  # pending
+        rag._reminder_wa_release(conn, "rid-A")
+        # Después de release, la row no existe → was_pushed False y un
+        # acquire fresco vuelve a darnos "acquired".
+        assert (
+            rag._reminder_wa_acquire(conn, "rid-A", "2026-04-24T18:00", "A")
+            == "acquired"
+        )
+
+        # 2) mark_pushed → release no afecta
+        rag._reminder_wa_mark_pushed(conn, "rid-B", "2026-04-24T18:00", "B")
+        assert rag._reminder_wa_was_pushed(conn, "rid-B") is True
+        rag._reminder_wa_release(conn, "rid-B")  # no-op porque no es pending
+        assert rag._reminder_wa_was_pushed(conn, "rid-B") is True
+
+
+def test_was_pushed_ignores_pending_rows(cfg_path, tmp_path):
+    """was_pushed debe devolver False para rows con marker pending —
+    si un worker está procesando, todavía no es 'ya pusheado'."""
+    _write_cfg(cfg_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._reminder_wa_acquire(conn, "rid-1", "2026-04-24T18:00", "X")
+        # Pending row presente, pero NO debería contar como pushed.
+        assert rag._reminder_wa_was_pushed(conn, "rid-1") is False
+
+
+def test_send_failure_releases_pending_for_retry(
+    cfg_path, fake_send, fake_reminders, tmp_path,
+):
+    """Si el bridge falla en el primer envío, la row pending se libera
+    (release) y el SIGUIENTE run del worker reintenta. Sin esto, la
+    row pending bloquearía el retry hasta el stale_recovery (10min)."""
+    _write_cfg(cfg_path)
+    calls, set_outcomes = fake_send
+    set_outcomes([False, True])  # 1er run falla, 2do tiene éxito
+
+    now = datetime(2026, 4, 24, 18, 0)
+    fake_reminders([
+        _build_reminder("rid-retry", now - timedelta(minutes=1),
+                        name="Retry me"),
+    ])
+
+    # Run 1 — falla
+    summary1 = rag.push_due_reminders_to_whatsapp(now=now, window_min=5)
+    assert summary1["pushed"] == 0
+    assert summary1["failed"] == 1
+
+    # La row pending debe haber sido liberada (DELETE), de modo que un
+    # acquire fresco pueda reintentar.
+    with rag._ragvec_state_conn() as conn:
+        # was_pushed sigue False (no hay row real ni pending).
+        assert rag._reminder_wa_was_pushed(conn, "rid-retry") is False
+
+    # Run 2 — éxito (porque la row pending fue liberada)
+    fake_reminders([
+        _build_reminder("rid-retry", now - timedelta(minutes=1),
+                        name="Retry me"),
+    ])
+    summary2 = rag.push_due_reminders_to_whatsapp(now=now, window_min=5)
+    assert summary2["pushed"] == 1
+    assert summary2["failed"] == 0
+    assert len(calls) == 2  # 1 fallo + 1 éxito

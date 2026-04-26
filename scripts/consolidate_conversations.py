@@ -1,18 +1,28 @@
 """Weekly consolidation of episodic-memory conversation notes (Phase 2).
 
-Scans `00-Inbox/conversations/`, groups related conversations by embedding
-similarity (connected components on cosine ≥ threshold), synthesises each
-cluster into a single consolidated note in the appropriate PARA folder,
-and archives the originals under `04-Archive/conversations/YYYY-MM/`.
+Scans `04-Archive/99-obsidian-system/99-Claude/conversations/`, groups
+related conversations by embedding similarity (connected components on
+cosine ≥ threshold), synthesises each cluster into a single consolidated
+note in the appropriate PARA folder, and archives the originals under
+`04-Archive/conversations/YYYY-MM/`.
 
 Invoked via `rag consolidate` or the weekly launchd plist
 `com.fer.obsidian-rag-consolidate` (Mondays 06:00 local).
 
 Design notes:
-- `00-Inbox/conversations/` is already excluded from the search index
-  (`is_excluded`), so originals are invisible to `retrieve()` until a
-  consolidated note promotes them into PARA. `04-Archive/conversations/`
-  is likewise excluded so archived originals don't leak back in either.
+- `04-Archive/99-obsidian-system/99-Claude/conversations/` is already
+  excluded from the search index (`is_excluded` cubre TODO el prefix
+  `04-Archive/99-obsidian-system/`), así que originals son invisibles a
+  `retrieve()` hasta que un consolidated note las promueva a PARA.
+  `04-Archive/conversations/` también se excluye explícitamente para
+  que los originales archivados no leakeen de vuelta.
+- Pre-2026-04-25 las conversations vivían en `00-Inbox/conversations/`.
+  El consolidator antes scaneaba esa carpeta. Tras 2026-04-25 las
+  conversations son "system files" (no son del PARA del user, son
+  artefactos generados por el chat web), por eso pasaron a vivir bajo
+  `99-Claude/`. Si el user tiene archivos legacy en
+  `00-Inbox/conversations/`, este script los ignora — moverlos a la
+  nueva ubicación o borrarlos a mano.
 - Representation per conversation = `first_question + answer_preview`
   embedded via `bge-m3`. One batch embed call per run.
 - Chat model (resolve_chat_model → qwen2.5:7b by default) does the
@@ -50,7 +60,7 @@ import rag  # noqa: E402
 from web import conversation_writer  # noqa: E402
 
 
-CONVERSATIONS_SUBFOLDER = "00-Inbox/conversations"
+CONVERSATIONS_SUBFOLDER = "04-Archive/99-obsidian-system/99-Claude/conversations"
 ARCHIVE_SUBFOLDER = "04-Archive/conversations"
 CONSOLIDATION_LOG = Path.home() / ".local/share/obsidian-rag/consolidation.log"
 
@@ -133,7 +143,8 @@ def scan_conversations(
 ) -> list[ConversationNote]:
     """Load conversation notes modified within the window.
 
-    `root` is the absolute path to `00-Inbox/conversations/`. Malformed
+    `root` is the absolute path to the conversations folder
+    (`04-Archive/99-obsidian-system/99-Claude/conversations/`). Malformed
     files (bad frontmatter, missing Turn 1) are skipped silently — the
     writer path always produces well-formed notes so any breakage is a
     manual edit we want to leave untouched.
@@ -178,15 +189,19 @@ def scan_conversations(
 
 
 def _vault_root_of(conversation_path: Path) -> Path:
-    """Walk up to find the vault root (parent of `00-Inbox`). Falls back to
-    `conversation_path.parents[2]` if the layout doesn't match — same
-    convention as `save_note`."""
+    """Walk up to find the vault root (parent of `00-Inbox`).
+
+    El loop sube por TODOS los parents buscando un dir hermano del PARA
+    (`00-Inbox/` o `01-Projects/`), así que funciona igual con la path
+    legacy (`<vault>/00-Inbox/conversations/file.md` → 2 niveles arriba)
+    como con la nueva (`<vault>/04-Archive/99-obsidian-system/99-Claude/
+    conversations/file.md` → 4 niveles arriba). Si no encuentra el PARA
+    (escenario raro: vault malformado, test con layout custom), fallback
+    al parent inmediato — conservador, no rompe walks futuros."""
     for parent in conversation_path.parents:
         if (parent / "00-Inbox").is_dir() or (parent / "01-Projects").is_dir():
             return parent
-    # Defensive default — two levels up from .../00-Inbox/conversations/file.md
-    return conversation_path.parents[2] if len(conversation_path.parents) >= 3 \
-        else conversation_path.parent
+    return conversation_path.parent
 
 
 # ── Clustering ─────────────────────────────────────────────────────────────

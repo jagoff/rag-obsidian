@@ -2688,14 +2688,17 @@ def is_excluded(rel_path: str) -> bool:
       notes at the TOP LEVEL of 03-Resources/Claude/ (Claude Peers prompts,
       command cheatsheets) stay indexed — only the generated subfolders are
       filtered.
-    - 00-Inbox/conversations/: episodic chat transcripts written by the web
-      server after each `/api/chat` turn. Originally indexed so past turns
-      were retrievable — but we observed a toxic feedback loop (2026-04-20):
-      when the LLM gives a wrong answer, the turn is saved and reindexed
-      within ~3s, then the next identical query retrieves that bad answer as
-      the top match and parrots it. The LLM's own hallucinations become
-      ground truth. Excluding them breaks the loop; to keep a past turn
-      searchable, curate it by moving the relevant content into PARA.
+    - 04-Archive/99-obsidian-system/99-Claude/conversations/: episodic chat
+      transcripts written by the web server after each `/api/chat` turn.
+      Originally indexed so past turns were retrievable — but we observed a
+      toxic feedback loop (2026-04-20): when the LLM gives a wrong answer,
+      the turn is saved and reindexed within ~3s, then the next identical
+      query retrieves that bad answer as the top match and parrots it. The
+      LLM's own hallucinations become ground truth. Excluding them breaks
+      the loop; to keep a past turn searchable, curate it by moving the
+      relevant content into PARA. (Pre-2026-04-25 ubicación: `00-Inbox/
+      conversations/` — el legacy prefix sigue excluido más abajo por
+      defense-in-depth para archivos viejos que el user no haya migrado.)
     """
     if any(seg.startswith(".") for seg in rel_path.split("/") if seg):
         return True
@@ -2709,11 +2712,16 @@ def is_excluded(rel_path: str) -> bool:
     claude_prefix = "03-Resources/Claude/"
     if rel_path.startswith(claude_prefix) and "/" in rel_path[len(claude_prefix):]:
         return True
+    # Legacy episodic-memory inbox (pre-2026-04-25). Las conversaciones
+    # nuevas viven bajo `04-Archive/99-obsidian-system/99-Claude/conversations/`,
+    # que ya queda excluida por el prefix general `04-Archive/99-obsidian-system/`
+    # de arriba. Mantenemos este check específico para archivos legacy que
+    # el user todavía no haya migrado/borrado de su `00-Inbox/conversations/`.
     if rel_path.startswith("00-Inbox/conversations/"):
         return True
     # Consolidated episodic-memory originals (Phase 2). The consolidator
-    # moves files from 00-Inbox/conversations/ to 04-Archive/conversations/
-    # YYYY-MM/ after promoting a cluster to PARA. Without this exclusion
+    # moves files from the conversations folder to `04-Archive/conversations/
+    # YYYY-MM/` after promoting a cluster to PARA. Without this exclusion
     # the archived raw conversations leak back into retrieval and compete
     # with the curated consolidated note — same feedback loop we avoided
     # at the inbox stage.
@@ -38000,8 +38008,9 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
 
 
 # ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
-# Promotes recurring conversation clusters from 00-Inbox/conversations/
-# into PARA and archives the originals. All heavy lifting lives in
+# Promotes recurring conversation clusters from
+# 04-Archive/99-obsidian-system/99-Claude/conversations/ into PARA and
+# archives the originals. All heavy lifting lives in
 # scripts/consolidate_conversations.py — this is just the CLI shim so the
 # command shows up in `rag --help` + the weekly launchd service can invoke
 # it as `rag consolidate`. See plans/episodic-memory.md for rationale.
@@ -38024,7 +38033,7 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
 
     Por default es dry-run — pasá --apply para escribir al vault.
 
-    Barre `00-Inbox/conversations/` buscando clusters semánticamente similares
+    Barre `04-Archive/99-obsidian-system/99-Claude/conversations/` buscando clusters semánticamente similares
     (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
     de --window-days. Cada cluster se sintetiza en una sola nota consolidada
     (qwen2.5:7b default) y se promueve a `01-Projects/` o `03-Resources/`
@@ -39559,8 +39568,9 @@ def _archive_plist(rag_bin: str) -> str:
 
 def _consolidate_plist(rag_bin: str) -> str:
     """Weekly episodic-memory consolidation — Mondays 06:00 local. Promotes
-    recurring conversation clusters from 00-Inbox/conversations/ to PARA
-    and archives the originals (see plans/episodic-memory.md Phase 2)."""
+    recurring conversation clusters from
+    04-Archive/99-obsidian-system/99-Claude/conversations/ to PARA and
+    archives the originals (see plans/episodic-memory.md Phase 2)."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

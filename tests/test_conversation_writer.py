@@ -18,7 +18,7 @@ from web.conversation_writer import (
 @pytest.fixture
 def tmp_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
-    (vault / "00-Inbox" / "conversations").mkdir(parents=True)
+    (vault / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations").mkdir(parents=True)
     # Post-T10 split: index lives in rag_conversations_index in telemetry.db.
     # _resolve_telemetry_db_path() reads rag.DB_PATH dynamically, so patching
     # DB_PATH is sufficient — no _DB_PATH module attr needed.
@@ -42,7 +42,7 @@ def test_first_turn_creates_note_with_frontmatter(tmp_vault):
     )
     path = write_turn(tmp_vault, "web:abc123", turn)
     assert path.name == "2026-04-19-0412-que-es-el-ikigai.md"
-    assert path.parent == tmp_vault / "00-Inbox" / "conversations"
+    assert path.parent == tmp_vault / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations"
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\n")
     fm_end = text.index("\n---\n", 4)
@@ -161,7 +161,7 @@ def test_turn_with_inf_confidence_sanitized_on_second_turn(tmp_vault):
     sid = "web:inf-conf"
     ts1 = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
     # Seed a note with a corrupt `confidence_avg` value on disk.
-    folder = tmp_vault / "00-Inbox" / "conversations"
+    folder = tmp_vault / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations"
     corrupt = folder / "2026-04-21-0900-q.md"
     corrupt.write_text(
         "---\n"
@@ -221,7 +221,7 @@ def test_second_turn_with_first_turn_zero_sources(tmp_vault):
 
 def test_malformed_frontmatter_raises(tmp_vault):
     sid = "web:broken"
-    target = tmp_vault / "00-Inbox" / "conversations" / "broken.md"
+    target = tmp_vault / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations" / "broken.md"
     target.write_text("---\nthis is : not : parseable : yaml\nno closing block\n",
                       encoding="utf-8")
     # Post-T10: seed the SQL index to point at the broken file.
@@ -266,7 +266,7 @@ def _select_row(db_path: Path, sid: str):
 
 def test_upsert_new_session_flag_on(sql_env):
     sid = "web:t5-new"
-    rel = "00-Inbox/conversations/2026-04-19-1000-hello.md"
+    rel = "04-Archive/99-obsidian-system/99-Claude/conversations/2026-04-19-1000-hello.md"
     persist_conversation_index_entry(sid, rel)
     row = _select_row(sql_env, sid)
     assert row is not None
@@ -304,7 +304,7 @@ def test_read_returns_none_when_both_missing(sql_env):
 def test_flag_off_is_inert_post_t10(flag_off):
     """Post-T10 RAG_STATE_SQL is inert — writer still lands in SQL regardless."""
     sid = "web:t5-flag-inert"
-    rel = "00-Inbox/conversations/sql-only.md"
+    rel = "04-Archive/99-obsidian-system/99-Claude/conversations/sql-only.md"
     persist_conversation_index_entry(sid, rel)
     conn = sqlite3.connect(str(flag_off))
     try:
@@ -328,7 +328,7 @@ def test_writer_failure_does_not_raise_into_caller(sql_env, monkeypatch):
     monkeypatch.setattr(rag, "_sql_upsert", boom)
 
     vault = sql_env.parent / "vault"
-    (vault / "00-Inbox" / "conversations").mkdir(parents=True)
+    (vault / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations").mkdir(parents=True)
     ts = datetime(2026, 4, 19, 8, 0, 0, tzinfo=timezone.utc)
     turn = _turn("q5", "a5", [{"file": "X.md", "score": 0.1}], 0.1, ts)
 
@@ -359,7 +359,7 @@ def _worker_upsert(args):
     _rag.DB_PATH = Path(db_path).parent
     for i in range(10):
         sid = f"wa:proc{proc_id}-turn{i}"
-        rel = f"00-Inbox/conversations/{proc_id}-{i}.md"
+        rel = f"04-Archive/99-obsidian-system/99-Claude/conversations/{proc_id}-{i}.md"
         from web import conversation_writer as cw
         cw.persist_conversation_index_entry(sid, rel)
 

@@ -7645,7 +7645,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 vaults, search_question, 4, None, history, None, False,
                 multi_query=False, auto_filter=True, date_range=None,
                 rerank_pool=5, exclude_paths=_exclude,
-                exclude_path_prefixes=("00-Inbox/conversations/",),
+                exclude_path_prefixes=(
+                    # Episodic memory: el writer dejó de escribir acá tras
+                    # 2026-04-25 pero archivos viejos pueden seguir en el vault
+                    # hasta el próximo `rag consolidate`. Mantenemos el
+                    # prefix para que no entren al index retroactivamente.
+                    "00-Inbox/conversations/",
+                    # Nueva ubicación canónica desde 2026-04-25 — sistema vive
+                    # bajo 99-Claude/, fuera del PARA del user.
+                    "04-Archive/99-obsidian-system/99-Claude/conversations/",
+                ),
                 intent=_intent_for_log,
             )
             # Normalizar shape del result ANTES de cualquier acceso

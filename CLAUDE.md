@@ -309,6 +309,73 @@ rag silence anticipate-calendar --off    # re-activar
 
 **Fase 2 (roadmap documentado, NO implementado)**: feedback loop (replies 👍/👎 → ajustes thresholds per-kind), quiet hours contextuales (22h→8h + "en reunión" via calendar), voice briefs matinales (morning via TTS en WA), user-configurable weights. Ver [`plans/anticipatory-agent.md`](plans/anticipatory-agent.md) y [`docs/anticipatory-agent.md`](docs/anticipatory-agent.md) para detalles.
 
+## Whisper learning loop — la transcripción mejora con el uso (2026-04-25)
+
+El sistema de transcripción de audios de WhatsApp aprende del corpus + correcciones manuales del usuario. Cada audio se loguea, las correcciones se acumulan, y un job nightly extrae vocabulario del corpus para sesgar el `--prompt` de whisper. Plan completo en el vault: [`04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-Claude%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
+
+**3 surfaces de aprendizaje**:
+
+1. **Pasivo (corpus + nightly)**: job [`com.fer.obsidian-rag-whisper-vocab`](~/Library/LaunchAgents/com.fer.obsidian-rag-whisper-vocab.plist) corre 03:15 → `refresh_vocab()` extrae top-N términos del vault (notas) + WhatsApp (chats 30d) + Apple Contacts + correcciones explícitas → escribe `rag_whisper_vocab`. Listener lee SQL cada 6h → arma `--prompt` dinámico.
+2. **Explícito (`/fix` por WhatsApp)**: el usuario manda `/fix <texto correcto>` y la última transcripción se marca como gold signal con `source='explicit'` en `rag_audio_corrections`.
+3. **Confidence-gated LLM correct**: si `avg_logprob < -0.8` (whisper transcribió con baja confianza), el listener pasa el output por `qwen2.5:7b` con sysprompt estructurado + few-shot de correcciones explícitas + vocab hints (top-30 nombres propios). El LLM corrige y la corrección queda con `source='llm'`.
+
+**3 tablas SQL nuevas en `telemetry.db`** (Step 1 del plan):
+
+- `rag_audio_transcripts` (extendida): `audio_path PK`, `text`, `corrected_text`, `correction_source ∈ {explicit, llm, vault_diff}`, `avg_logprob`, `audio_hash`, `chat_id`, `note_path/initial_hash` (placeholder Step 2.d).
+- `rag_audio_corrections`: `(audio_hash, original, corrected, source, ts, chat_id, context)`. Append-only. Sin UNIQUE constraint, idempotencia manual en `rag whisper import`.
+- `rag_whisper_vocab`: `term PK`, `weight`, `source ∈ {corrections, contacts, notes, chats}`, `last_seen_ts`, `refreshed_at`. Refresh full nightly (DELETE + INSERT). Caps por source: 100 corrections, 100 contacts, 200 notes, 100 chats = 500 total.
+
+**CLI** (todos en `rag whisper *`):
+
+```bash
+rag whisper                         # = rag whisper stats (default)
+rag whisper stats                   # resumen general
+rag whisper vocab refresh           # forzar refresh manual (no esperar al nightly)
+rag whisper vocab show [--source X --limit N]
+rag whisper patterns [--min-count 2]    # detecta single-word swaps repetidos
+rag whisper export [-o FILE] [--source S]   # backup correcciones a JSON
+rag whisper import FILE [--dry-run]         # restore/migrate
+```
+
+**WhatsApp commands**:
+
+- `/fix <texto correcto>` — corrige la última transcripción global.
+- `/whisper` o `/whisper stats` — resumen agregado inline (audios 24h, vocab, correcciones).
+- `/whisper recent [N]` — últimas N transcripciones (default 5, max 10) con markers de correction.
+
+**Dashboard**: [`/transcripts`](https://ra.ai/transcripts) — server-rendered en `web/server.py:transcripts_dashboard()`. Stats cards + logprob histogram + heatmap horario (24 cells, 30d) + heatmap semanal día×hora (7×24 = 168 cells, 60d) + tabla últimas 30 transcripts (con duración + markers) + tabla últimas 20 correcciones (diff visual rojo→verde) + top 50 vocab terms. Auto-refresh 60s (override `?nofresh=1`). Dark mode default + light auto via `prefers-color-scheme`. Cross-linkeado desde `/home` y `/dashboard`.
+
+**Listener integration** (en `~/whatsapp-listener/listener.ts`):
+
+- `transcribe(audioPath, chatJid?)` → `TranscribeOutput {text, llmCorrected, originalText?, avgLogprob}`. Server path usa `verbose_json` para capturar `avg_logprob` weighted por duración.
+- Logging: `logTranscription()` UPSERT a `rag_audio_transcripts` via `bun:sqlite` (WAL + busy_timeout=5000).
+- LLM correct: `attemptLlmCorrect()` con threshold + sanity checks (no-op detect, ratio guard 0.3-2.5x, timeout 15s).
+- Reply transparency: cuando hubo LLM correct, el reply al user incluye sufijo `_✨ corregido por llm (original: "...")_`.
+
+**Env tuning** (todas en `~/Library/LaunchAgents/com.fer.whatsapp-listener.plist` o env del shell):
+
+- `WHISPER_MODEL` — default auto-detect `ggml-large-v3-turbo.bin` con fallback a `ggml-small.bin`.
+- `WHISPER_VAD_DISABLE=1` — desactiva el VAD pre-pass del silero v5.
+- `WHISPER_AF_DISABLE=1` — desactiva el ffmpeg loudnorm + bandpass pre-process.
+- `WHISPER_LLM_CORRECT_THRESHOLD=-0.8` — bajar a -0.6 si pocos audios disparan LLM.
+- `WHISPER_LLM_CORRECT_MODEL=qwen2.5:7b` — probar `qwen3:30b-a3b` para más quality (slower).
+- `WHISPER_LLM_CORRECT_DISABLE=1` — kill switch del LLM correct.
+- `WHISPER_TELEMETRY_DISABLE=1` — kill switch del logging a SQL.
+- `WHISPER_VOCAB_CACHE_TTL_MS=21600000` — TTL del cache in-mem del vocab (6h default).
+
+**Kill switches**:
+- LLM correct: `WHISPER_LLM_CORRECT_DISABLE=1` en plist + `launchctl kickstart -k`.
+- Vocab refresh nightly: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-whisper-vocab.plist`.
+- Logging: `WHISPER_TELEMETRY_DISABLE=1` en plist del listener.
+- Nuclear: borrar las 3 tablas + `WHISPER_TELEMETRY_DISABLE=1` + revertir commits Phase 2 con `git revert c597932 fd3ff44 d747432 ...`.
+
+**Tests**: 47+ tests del learning loop:
+- [`tests/test_web_transcripts.py`](tests/test_web_transcripts.py) — 25 tests del dashboard (render, dark mode, auto-refresh, heatmaps, navegación).
+- [`tests/test_whisper_patterns.py`](tests/test_whisper_patterns.py) — 11 tests del pattern detection.
+- [`tests/test_whisper_export_import.py`](tests/test_whisper_export_import.py) — 11 tests del export/import roundtrip.
+
+**Calibración futura**: después de unos días de uso real, mirar histogram en `/transcripts` y ajustar threshold; correr `rag whisper patterns` para ver errores sistemáticos del modelo; backup periódico con `rag whisper export -o ~/Backups/corrections-$(date +%F).json`.
+
 ## Commands
 
 ```bash
@@ -619,11 +686,11 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 **Sessions**: JSON per session in `sessions/<id>.json`. TTL 30d, cap 50 turns, history window 6. IDs validated `^[A-Za-z0-9_.:-]{1,64}$`; invalid → mint fresh. WhatsApp passes `wa:<jid>`.
 
-**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread via `_spawn_conversation_writer` that appends the turn to `00-Inbox/conversations/YYYY-MM-DD-HHMM-<slug>.md`. One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). The session_id → relative_path index lives in `rag_conversations_index` (SQL, upsert). Atomic .md write via `os.replace`; concurrent writes for the same session are not a production scenario (one /api/chat per session at a time) so the pre-T10 whole-body fcntl lock is gone — SQL upsert inside `BEGIN IMMEDIATE` handles index serialisation. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Raw conversations are **excluded from the search index** (`is_excluded`: `00-Inbox/conversations/` + `04-Archive/conversations/`) — they leak LLM hallucinations back as ground truth if indexed (T6 regression). Curation happens via `rag consolidate` (Phase 2, below), not by manual editing.
+**Episodic memory** (`web/conversation_writer.py`, silent write): after every `/api/chat` `done` event, `web/server.py` spawns a daemon thread via `_spawn_conversation_writer` that appends the turn to `04-Archive/99-obsidian-system/99-Claude/conversations/YYYY-MM-DD-HHMM-<slug>.md` (pre-2026-04-25: `00-Inbox/conversations/` — el user pidió que las "carpetas de sistema" vivan bajo `99-obsidian-system/99-Claude/` para que su PARA quede limpio). One note per `session_id`, multi-turn. Hand-rolled YAML frontmatter (`session_id`, `created`, `updated`, `turns`, `confidence_avg`, `sources`, `tags`). The session_id → relative_path index lives in `rag_conversations_index` (SQL, upsert). Atomic .md write via `os.replace`; concurrent writes for the same session are not a production scenario (one /api/chat per session at a time) so the pre-T10 whole-body fcntl lock is gone — SQL upsert inside `BEGIN IMMEDIATE` handles index serialisation. Errors land on `LOG_PATH` as `conversation_turn_error` — never raised, never SSE-emitted. Raw conversations are **excluded from the search index** (`is_excluded`: prefix general `04-Archive/99-obsidian-system/` + el legacy `00-Inbox/conversations/` por compat + `04-Archive/conversations/` para los archivados post-consolidación) — leak LLM hallucinations back as ground truth if indexed (T6 regression). Curation happens via `rag consolidate` (Phase 2, below), not by manual editing.
 
 **Conversation writer shutdown drain** (`_CONV_WRITERS` + `@app.on_event("shutdown")`): every in-flight writer registers in `_CONV_WRITERS` and removes itself when `_persist_conversation_turn` returns (success or exception). On server stop the `_drain_conversation_writers` hook joins each pending thread with a combined 5s budget. Anything still running falls through the normal exception path, lands in `_CONV_PENDING_PATH` (`conversation_turn_pending.jsonl`), and gets re-applied at next startup by `_retry_pending_conversation_turns`. Threads stay `daemon=True` on purpose — a wedged SQL/disk write must not block process exit. Stragglers past the cap are logged once as `conversation_writer_shutdown_timeout` to `LOG_PATH`. Tests: `tests/test_web_conv_shutdown.py` (6 cases covering self-remove, empty drain no-op, quick-writer wait, 5s cap with wedged writer, spawn tracking, exception-path release).
 
-**Episodic memory — Phase 2 consolidation** (`scripts/consolidate_conversations.py`, `rag consolidate`, weekly launchd): scans `00-Inbox/conversations/` in a rolling window (default 14d), embeds each as `first_question + first_answer` via bge-m3, groups by connected components on cosine ≥ 0.75, promotes clusters ≥ 3 to PARA. Target folder picked by regex over cluster bodies: ≥2 matches against `_PROJECT_PATTERNS` (ES+EN action verbs / future-tense / dates) → `01-Projects/`, else `03-Resources/` (conservative default). Synthesis via `resolve_chat_model()` + `CHAT_OPTIONS` — one non-streaming call per cluster (~6s). Consolidated note gets frontmatter `type: consolidated-conversation`, wikilink section to originals (now under `04-Archive/conversations/YYYY-MM/`), and wikilinks to every source note union'd across turns. Originals move via `shutil.move`; archive folder is also excluded from the index so archived raws don't compete with the curated synthesis. Errors per cluster are swallowed (cluster entry gets `error` key; other clusters proceed). Log schema at `~/.local/share/obsidian-rag/consolidation.log` (JSONL: `{run_at, window_days, n_conversations, n_clusters, n_promoted, n_archived, duration_s, dry_run, clusters: [...]}`). CLI flags: `--window-days`, `--threshold`, `--min-cluster`, `--dry-run`, `--json`. Launchd: `com.fer.obsidian-rag-consolidate` (Mondays 06:00 local), registered in `_services_spec()`, installable via `rag setup`.
+**Episodic memory — Phase 2 consolidation** (`scripts/consolidate_conversations.py`, `rag consolidate`, weekly launchd): scans `04-Archive/99-obsidian-system/99-Claude/conversations/` in a rolling window (default 14d), embeds each as `first_question + first_answer` via bge-m3, groups by connected components on cosine ≥ 0.75, promotes clusters ≥ 3 to PARA. Target folder picked by regex over cluster bodies: ≥2 matches against `_PROJECT_PATTERNS` (ES+EN action verbs / future-tense / dates) → `01-Projects/`, else `03-Resources/` (conservative default). Synthesis via `resolve_chat_model()` + `CHAT_OPTIONS` — one non-streaming call per cluster (~6s). Consolidated note gets frontmatter `type: consolidated-conversation`, wikilink section to originals (now under `04-Archive/conversations/YYYY-MM/`), and wikilinks to every source note union'd across turns. Originals move via `shutil.move`; archive folder is also excluded from the index so archived raws don't compete with the curated synthesis. Errors per cluster are swallowed (cluster entry gets `error` key; other clusters proceed). Log schema at `~/.local/share/obsidian-rag/consolidation.log` (JSONL: `{run_at, window_days, n_conversations, n_clusters, n_promoted, n_archived, duration_s, dry_run, clusters: [...]}`). CLI flags: `--window-days`, `--threshold`, `--min-cluster`, `--dry-run`, `--json`. Launchd: `com.fer.obsidian-rag-consolidate` (Mondays 06:00 local), registered in `_services_spec()`, installable via `rag setup`.
 
 **Web chat tool-calling** (`web/tools.py`, 9 tools): `search_vault`, `read_note`, `reminders_due`, `gmail_recent`, `finance_summary`, `calendar_ahead`, `weather` (read-only) + `propose_reminder`, `propose_calendar_event` (create-intent, implementations live in `rag.py` — `web/tools.py` re-exports). `/api/chat` runs a 2-phase tool loop: pre-router (`_detect_tool_intent`, keyword → forced read tool) + optional LLM tool-decide round (gated by `RAG_WEB_TOOL_LLM_DECIDE`, default OFF). Create intent ("recordame", "creá un evento", ...) is detected by `_detect_propose_intent` (defined in `rag.py`, shared between web + CLI) which FORCES the LLM decide round ON for that query — propose tools need LLM arg extraction, can't run from pre-router. Create tools auto-create the reminder/event if the datetime is unambiguous (SSE `created` event → inline `╌ ✓ agregado...` chip, reminders get an inline `deshacer` link backed by `DELETE /api/reminders/{id}`, events don't since Calendar.app AppleScript delete is unreliable) or fall back to a `proposal` card with ✓ Crear / ✗ Descartar when the parser flagged `needs_clarification`. Low-level helpers `_parse_natural_datetime` (dateparser + qwen2.5:3b fallback, `_preprocess_rioplatense_datetime` for `18hs`/`al mediodía`/`X que viene`), `_parse_natural_recurrence` (regex over ES/EN patterns), `_create_reminder` (supports `due_dt`, `priority`, `notes`, `recurrence`), `_create_calendar_event` (via Calendar.app AppleScript — iCloud writable, unlike the JXA read path), `_has_explicit_time` (auto all-day detection), `_delete_reminder`, `_delete_calendar_event` all in `rag.py`. Recurrence on Reminders is best-effort (inner try/on error) since the property is macOS-version-dependent; on Calendar it's stable.
 

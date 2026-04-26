@@ -7,9 +7,13 @@ el pile-up que ya pasó un ciclo y sigue ahí.
 
 Diseño:
 - File-system only: cuenta `.md` con `iterdir()` sobre `00-Inbox/` top-level.
-  NO recursivo — los sub-dirs del inbox (en especial `00-Inbox/conversations/`,
-  episodic memory de chat auto-generada por el web server) NO representan
-  trabajo pendiente del user y se excluyen explícitamente.
+  NO recursivo — los sub-dirs del inbox NO representan trabajo pendiente
+  del user y se excluyen automáticamente por el `iterdir()` top-level.
+  Pre-2026-04-25, episodic memory del chat se escribía a
+  `00-Inbox/conversations/` y este check explícitamente la ignoraba; ahora
+  vive bajo `04-Archive/99-obsidian-system/99-Claude/conversations/` y ya
+  ni siquiera está bajo el inbox, pero dejamos la lógica de "no recursivo"
+  por si en el futuro cae otra subcarpeta acá (ej. `00-Inbox/voice/`).
 - Ventana de edad: `min_age_hours=24` default. Si bajamos el umbral, cada
   vez que el user captura rápido una idea el signal grita; demasiado alto y
   el pile-up tarda en dispararse.
@@ -49,11 +53,13 @@ def _count_stale_inbox(vault: Path, min_age_hours: int = _INBOX_MIN_AGE_HOURS) -
     """Cuenta archivos `.md` en `<vault>/00-Inbox/` top-level con mtime
     más viejo que `min_age_hours` horas.
 
-    Deliberadamente NO recursivo: `00-Inbox/conversations/` (episodic
-    memory auto-generada) y cualquier otra subcarpeta bajo el inbox NO
-    cuentan — son artefactos que no requieren triage manual. `iterdir()`
+    Deliberadamente NO recursivo: cualquier subcarpeta bajo el inbox NO
+    cuenta — son artefactos que no requieren triage manual. `iterdir()`
     solo ve los entries directos, así que una subfolder con 500 archivos
-    queda invisible para este conteo.
+    queda invisible para este conteo. (Histórico: hasta 2026-04-25, episodic
+    memory del chat se escribía a `00-Inbox/conversations/`; tras esa
+    fecha vive bajo `04-Archive/99-obsidian-system/99-Claude/conversations/`,
+    fuera del inbox enteramente.)
 
     Silent-fail: si el dir no existe o no se puede leer, devuelve 0 (no
     excepción). El caller ya está envuelto en outer try/except por el

@@ -17,9 +17,11 @@ Diseño:
   y "proyecto-x-v1.md" vs "proyecto-x-v2.md" queden con ratio ~0.91,
   arriba del threshold.
 - Respeta `is_excluded(rel)` del vault layer: dotdirs (`.obsidian/`,
-  `.trash/`, ...), `00-Inbox/conversations/` (episodic), `04-Archive/99-*`,
-  `03-Resources/Claude/<slug>/`, etc. quedan fuera del scan — son
-  artefactos auto-generados que no son "dupes" del user.
+  `.trash/`, ...), `04-Archive/99-obsidian-system/99-Claude/conversations/`
+  (episodic), `04-Archive/99-obsidian-system/...` en general,
+  `03-Resources/Claude/<slug>/`, y el legacy `00-Inbox/conversations/`
+  por compat — todos quedan fuera del scan, son artefactos auto-generados
+  que no son "dupes" del user.
 - Cap defensivo de 2000 archivos escaneados — O(N²) sobre stems cortos es
   barato pero queremos evitar pathological cases donde un vault con 20k
   notas duplique la CPU del signal loop.

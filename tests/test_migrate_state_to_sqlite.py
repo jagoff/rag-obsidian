@@ -344,8 +344,8 @@ def test_summary_json_format(source_dir):
 def test_conversations_index_migrates(source_dir):
     (source_dir / "conversations_index.json").write_text(
         json.dumps({
-            "sess1": "00-Inbox/conversations/a.md",
-            "sess2": "00-Inbox/conversations/b.md",
+            "sess1": "04-Archive/99-obsidian-system/99-Claude/conversations/a.md",
+            "sess2": "04-Archive/99-obsidian-system/99-Claude/conversations/b.md",
         }), encoding="utf-8",
     )
     rc = mig.main([
@@ -362,8 +362,8 @@ def test_conversations_index_migrates(source_dir):
             "ORDER BY session_id"
         ))
         assert [(r["session_id"], r["relative_path"]) for r in rows] == [
-            ("sess1", "00-Inbox/conversations/a.md"),
-            ("sess2", "00-Inbox/conversations/b.md"),
+            ("sess1", "04-Archive/99-obsidian-system/99-Claude/conversations/a.md"),
+            ("sess2", "04-Archive/99-obsidian-system/99-Claude/conversations/b.md"),
         ]
     finally:
         conn.close()

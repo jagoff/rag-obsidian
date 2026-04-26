@@ -153,7 +153,7 @@ launchctl list | grep obsidian-rag    # los 16 servicios deben aparecer
 | `~/Library/LaunchAgents/com.fer.obsidian-rag-{watch,digest,morning}.plist` | Plists generados por `rag setup` |
 | `~/.local/share/uv/tools/obsidian-rag/` | Tool venv instalado por `uv tool install` |
 | `<repo>/.venv/` | Venv local para tests (pytest acá) |
-| `<vault>/05-Reviews/YYYY-WNN.md` | Output del weekly digest |
+| `<vault>/04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md` | Output del weekly digest |
 | `<vault>/00-Inbox/YYYY-MM-DD-prep-<slug>.md` | Output de `rag prep --save` |
 | `<vault>/00-Inbox/<title>.md` | Output de `/save` desde chat |
 
@@ -267,7 +267,7 @@ flowchart LR
         JSONL --> Collect
         QLogD[queries.jsonl] --> Collect
         Collect --> Draft[command-r drafting<br/>1ra persona]
-        Draft --> Note[05-Reviews/YYYY-WNN.md<br/>auto-indexed]
+        Draft --> Note[04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md<br/>auto-indexed]
     end
 ```
 
@@ -711,7 +711,7 @@ echo "transcript largo" | rag capture --stdin  # pipe
 ### Morning brief a mano
 ```bash
 rag morning --dry-run                   # ver primero
-rag morning                             # escribe 05-Reviews/YYYY-MM-DD.md
+rag morning                             # escribe 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md
 # Auto-fires lun-vie 7am vía launchd (rag setup)
 ```
 

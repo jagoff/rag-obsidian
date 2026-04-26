@@ -184,8 +184,8 @@ def test_collect_morning_wires_dedup(monkeypatch, tmp_path):
 
 def test_continuity_link_present_when_file_exists(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
-    (vault / "05-Reviews").mkdir(parents=True)
-    (vault / "05-Reviews" / "2026-04-14-evening.md").write_text("x")
+    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-04-14-evening.md").write_text("x")
     target = datetime(2026, 4, 15)
     out = rag._yesterday_evening_link(target, vault)
     assert "2026-04-14-evening" in out
@@ -194,7 +194,7 @@ def test_continuity_link_present_when_file_exists(tmp_path, monkeypatch):
 
 def test_continuity_link_empty_when_missing(tmp_path):
     vault = tmp_path / "vault"
-    (vault / "05-Reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
     target = datetime(2026, 4, 15)
     assert rag._yesterday_evening_link(target, vault) == ""
 

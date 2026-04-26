@@ -19,7 +19,7 @@ import rag
 def tmp_vault(tmp_path, monkeypatch, fake_embed):
     vault = tmp_path / "vault"
     for d in ("00-Inbox", "01-Projects", "02-Areas",
-              "03-Resources", "04-Archive", "05-Reviews"):
+              "03-Resources", "04-Archive", "04-Archive/99-obsidian-system/99-Claude/reviews"):
         (vault / d).mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
@@ -306,7 +306,7 @@ def test_report_written_to_reviews(tmp_vault):
     result = rag.archive_dead_notes(col, vault, [c], apply=True, force=False)
     report = rag._write_archive_report(result, apply=True)
     assert report is not None
-    assert report.parent == vault / "05-Reviews"
+    assert report.parent == vault / "04-Archive/99-obsidian-system/99-Claude/reviews"
     body = report.read_text()
     assert "02-Areas/dead.md" in body
     assert "04-Archive/02-Areas/dead.md" in body

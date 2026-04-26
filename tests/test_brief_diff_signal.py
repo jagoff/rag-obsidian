@@ -47,7 +47,7 @@ def _read_behavior_events(tmp_path: Path) -> list[dict]:
 @pytest.fixture
 def tmp_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
-    (vault / "05-Reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
     (vault / "02-Areas").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     return vault
@@ -78,7 +78,7 @@ def _write_sidecar_entry(path: Path, brief_type: str, brief_rel: str,
 
 def test_record_brief_written_appends_valid_json(tmp_sidecars):
     paths = ["02-Areas/Foo.md", "03-Resources/Bar.md"]
-    rag.record_brief_written("morning", Path("05-Reviews/2026-04-17.md"), paths, {"agenda": paths[:1]})
+    rag.record_brief_written("morning", Path("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-17.md"), paths, {"agenda": paths[:1]})
     # Post-T10 split: read from rag_brief_written in telemetry.db.
     import sqlite3
     conn = sqlite3.connect(str(tmp_sidecars["tmp"] / rag._TELEMETRY_DB_FILENAME))
@@ -107,7 +107,7 @@ def test_record_brief_written_noop_on_io_error(tmp_sidecars, monkeypatch):
     monkeypatch.setattr(rag, "BRIEF_WRITTEN_PATH", bad)
     try:
         # Must not raise
-        rag.record_brief_written("morning", Path("05-Reviews/x.md"), ["a.md"], {})
+        rag.record_brief_written("morning", Path("04-Archive/99-obsidian-system/99-Claude/reviews/x.md"), ["a.md"], {})
         assert not bad.is_file()
     finally:
         os.chmod(ro_dir, stat.S_IRWXU)  # restore so tmp_path cleanup works
@@ -124,7 +124,7 @@ def test_diff_brief_signal_no_sidecar_no_crash(tmp_sidecars, tmp_vault):
 def test_diff_brief_signal_entry_too_young_ignored(tmp_sidecars, tmp_vault):
     _write_sidecar_entry(
         tmp_sidecars["written"],
-        "morning", "05-Reviews/2026-04-17.md",
+        "morning", "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-17.md",
         ["02-Areas/Foo.md"], age_hours=5.0,  # < 18h
     )
     rag._diff_brief_signal()
@@ -134,7 +134,7 @@ def test_diff_brief_signal_entry_too_young_ignored(tmp_sidecars, tmp_vault):
 def test_diff_brief_signal_entry_too_old_ignored(tmp_sidecars, tmp_vault):
     _write_sidecar_entry(
         tmp_sidecars["written"],
-        "morning", "05-Reviews/2026-04-17.md",
+        "morning", "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-17.md",
         ["02-Areas/Foo.md"], age_hours=48.0,  # > 36h
     )
     rag._diff_brief_signal()
@@ -158,11 +158,11 @@ def test_diff_kept_and_deleted(tmp_sidecars, tmp_vault):
         "02-Areas/Goals.md",
         "03-Resources/DeepWork.md",
     ]
-    brief_rel = "05-Reviews/2026-04-17.md"
+    brief_rel = "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-17.md"
     _write_sidecar_entry(tmp_sidecars["written"], "morning", brief_rel, cited, age_hours=24)
 
     # On-disk brief still has [[Ikigai]] and [[Goals]] but not Deep Work
-    brief_file = tmp_vault / "05-Reviews" / "2026-04-17.md"
+    brief_file = tmp_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-04-17.md"
     brief_file.write_text(
         "# Morning brief — 2026-04-17\n\n"
         "Hoy hay que revisar [[Ikigai]] y los [[Goals]] del mes. Sin DeepWork.\n"
@@ -182,7 +182,7 @@ def test_diff_kept_and_deleted(tmp_sidecars, tmp_vault):
 def test_diff_brief_file_gone_all_deleted(tmp_sidecars, tmp_vault):
     """Brief file no longer on disk → all paths emitted as deleted."""
     cited = ["02-Areas/Foo.md", "02-Areas/Bar.md"]
-    brief_rel = "05-Reviews/2026-04-16.md"
+    brief_rel = "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-16.md"
     _write_sidecar_entry(tmp_sidecars["written"], "morning", brief_rel, cited, age_hours=24)
     # Do NOT create the brief file on disk
 
@@ -199,11 +199,11 @@ def test_diff_brief_file_gone_all_deleted(tmp_sidecars, tmp_vault):
 def test_diff_dedup_second_call_noop(tmp_sidecars, tmp_vault):
     """Second call emits nothing — brief_state prevents re-emission."""
     cited = ["02-Areas/Note.md"]
-    brief_rel = "05-Reviews/2026-04-17.md"
+    brief_rel = "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-17.md"
     _write_sidecar_entry(tmp_sidecars["written"], "morning", brief_rel, cited, age_hours=24)
 
     # Brief file exists but doesn't contain the wikilink → deleted
-    brief_file = tmp_vault / "05-Reviews" / "2026-04-17.md"
+    brief_file = tmp_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-04-17.md"
     brief_file.write_text("# Morning brief\n\nNada aqui.\n")
 
     rag._diff_brief_signal()

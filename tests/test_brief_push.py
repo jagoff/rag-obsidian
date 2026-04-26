@@ -76,14 +76,14 @@ def captured(monkeypatch):
 
 def test_no_config_is_silent_noop(cfg_set, captured):
     cfg_set(None)
-    sent = rag._brief_push_to_whatsapp("Morning", "05-Reviews/x.md", "hola")
+    sent = rag._brief_push_to_whatsapp("Morning", "04-Archive/99-obsidian-system/99-Claude/reviews/x.md", "hola")
     assert sent is False
     assert captured == []
 
 
 def test_disabled_config_skips_send(cfg_set, captured):
     cfg_set("123@g.us", enabled=False)
-    sent = rag._brief_push_to_whatsapp("Morning", "05-Reviews/x.md", "hola")
+    sent = rag._brief_push_to_whatsapp("Morning", "04-Archive/99-obsidian-system/99-Claude/reviews/x.md", "hola")
     assert sent is False
     assert captured == []
 
@@ -91,14 +91,14 @@ def test_disabled_config_skips_send(cfg_set, captured):
 def test_sends_to_jid_with_title_and_path_and_body(cfg_set, captured):
     cfg_set("123@g.us")
     sent = rag._brief_push_to_whatsapp(
-        "Morning 2026-04-15", "05-Reviews/2026-04-15.md", "Hola, hoy enfocate."
+        "Morning 2026-04-15", "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-15.md", "Hola, hoy enfocate."
     )
     assert sent is True
     assert len(captured) == 1
     assert captured[0]["jid"] == "123@g.us"
     text = captured[0]["text"]
     assert "Morning 2026-04-15" in text
-    assert "05-Reviews/2026-04-15.md" in text
+    assert "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-15.md" in text
     assert "Hola, hoy enfocate." in text
 
 
@@ -106,7 +106,7 @@ def test_citations_rewritten_to_obsidian_urls(cfg_set, captured):
     cfg_set("123@g.us")
     rag._brief_push_to_whatsapp(
         "Morning",
-        "05-Reviews/x.md",
+        "04-Archive/99-obsidian-system/99-Claude/reviews/x.md",
         "Mirá [Foo](02-Areas/Foo.md) y [bar/baz.md] hoy.",
     )
     text = captured[0]["text"]
@@ -121,13 +121,13 @@ def test_citations_rewritten_to_obsidian_urls(cfg_set, captured):
 def test_logs_brief_push_event(cfg_set, captured, tmp_path):
     cfg_set("123@g.us")
     rag._brief_push_to_whatsapp(
-        "Morning 2026-04-15", "05-Reviews/x.md", "hola"
+        "Morning 2026-04-15", "04-Archive/99-obsidian-system/99-Claude/reviews/x.md", "hola"
     )
     events = _read_ambient_events(tmp_path)
     push_events = [e for e in events if e.get("cmd") == "brief_push"]
     assert len(push_events) == 1
     assert push_events[0]["title"] == "Morning 2026-04-15"
-    assert push_events[0]["path"] == "05-Reviews/x.md"
+    assert push_events[0]["path"] == "04-Archive/99-obsidian-system/99-Claude/reviews/x.md"
     assert push_events[0]["whatsapp_sent"] is True
 
 

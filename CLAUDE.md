@@ -407,9 +407,9 @@ rag dead [--min-age-days 365]              # candidates to archive (read-only)
 rag archive [--apply --force --gate 20]    # move dead → 04-Archive/ (dry-run default)
 
 # Daily automation
-rag morning [--dry-run]                    # daily brief → 05-Reviews/YYYY-MM-DD.md
-rag today [--dry-run]                      # EOD closure → 05-Reviews/YYYY-MM-DD-evening.md
-rag digest [--week YYYY-WNN --days N]      # weekly narrative → 05-Reviews/YYYY-WNN.md
+rag morning [--dry-run]                    # daily brief → 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md
+rag today [--dry-run]                      # EOD closure → 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md
+rag digest [--week YYYY-WNN --days N]      # weekly narrative → 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md
 rag consolidate [--window-days 14 --threshold 0.75 --min-cluster 3 --dry-run --json]  # episodic memory Phase 2 → PARA
 
 # Ambient agent (reactive — dispara al cambiar una nota)

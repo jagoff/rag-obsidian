@@ -134,7 +134,7 @@ def _map_brief_state(rec: dict, src: Source) -> dict:
     ts = rec.get("ts") or _now_iso()
     brief_path, cited_path = (key.split("\x00", 1) + [""])[:2] if "\x00" in key else (key, "")
     bt = "today" if brief_path.endswith("-evening.md") else (
-        "morning" if "/05-Reviews/" in brief_path or brief_path.startswith("05-Reviews/") else "unknown"
+        "morning" if "/04-Archive/99-obsidian-system/99-Claude/reviews/" in brief_path or brief_path.startswith("04-Archive/99-obsidian-system/99-Claude/reviews/") else "unknown"
     )
     return {"pair_key": key, "brief_type": bt, "kind": "cited",
             "path": cited_path, "first_ts": ts, "last_ts": ts}

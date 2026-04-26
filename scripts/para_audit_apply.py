@@ -25,7 +25,7 @@ MOVES_LOG = AUDIT_DIR / "moves_applied.jsonl"
 PARA_BUCKETS = {"01-Projects", "02-Areas", "03-Resources", "04-Archive"}
 
 HARD_SKIP_SEGMENTS = {"99-obsidian-system", "99-Claude"}
-HARD_SKIP_PREFIXES = ("05-Reviews/",)
+HARD_SKIP_PREFIXES = ("04-Archive/99-obsidian-system/99-Claude/reviews/",)
 HARD_SKIP_EXTENSIONS = {".icloud"}
 
 OPT_OUT_ARCHIVE_NEVER = re.compile(r"^archive:\s*never\s*$", re.MULTILINE)

@@ -7,7 +7,7 @@ se rompió y vale la pena un nudge sutil para retomar el hábito.
 
 Fuente: filesystem como primary (más robusto que la tabla SQL
 `rag_brief_written` — sobrevive a resets del state DB, drops de tablas y
-migrations). Se lista `<vault>/05-Reviews/` buscando archivos cuyo
+migrations). Se lista `<vault>/04-Archive/99-obsidian-system/99-Claude/reviews/` buscando archivos cuyo
 filename matchea `YYYY-MM-DD.md` EXACTO. El filename es la verdad
 autoritativa (no el mtime), porque:
 
@@ -46,7 +46,7 @@ from rag_anticipate.signals.base import register_signal
 
 
 # Carpeta canónica donde `rag morning` escribe los briefs.
-_REVIEWS_FOLDER = "05-Reviews"
+_REVIEWS_FOLDER = "04-Archive/99-obsidian-system/99-Claude/reviews"
 
 # Matchea "YYYY-MM-DD.md" EXACTO.
 # - NO matchea "YYYY-MM-DD-evening.md" (evening brief de `rag today`).

@@ -149,7 +149,7 @@ def test_min_hops_1_accepts_direct_neighbors(tmp_vault):
 # ── Filtros de carpeta / MOC / tags / edad ────────────────────────────────────
 
 
-@pytest.mark.parametrize("skip_folder", ["00-Inbox", "04-Archive", "05-Reviews"])
+@pytest.mark.parametrize("skip_folder", ["00-Inbox", "04-Archive", "04-Archive/99-obsidian-system/99-Claude/reviews"])
 def test_skips_notes_in_excluded_folders(tmp_vault, skip_folder):
     vault, col = tmp_vault
     _add_note(col, vault, f"{skip_folder}/a.md", "A", [1, 0, 0, 0], created=_old())

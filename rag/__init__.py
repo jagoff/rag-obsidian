@@ -6917,7 +6917,7 @@ def _map_brief_state_row(brief_path: str, cited_path: str) -> dict:
     ts = datetime.now().isoformat(timespec="seconds")
     pair_key = f"{brief_path}\x00{cited_path}"
     bt = "today" if brief_path.endswith("-evening.md") else (
-        "morning" if "/05-Reviews/" in brief_path or brief_path.startswith("05-Reviews/") else "unknown"
+        "morning" if "/04-Archive/99-obsidian-system/99-Claude/reviews/" in brief_path or brief_path.startswith("04-Archive/99-obsidian-system/99-Claude/reviews/") else "unknown"
     )
     return {"pair_key": pair_key, "brief_type": bt, "kind": "cited",
             "path": cited_path, "first_ts": ts, "last_ts": ts}
@@ -16148,7 +16148,7 @@ def find_duplicate_notes(
 # una oración de "por qué están conectadas".
 
 SURFACE_LOG_PATH = Path.home() / ".local/share/obsidian-rag/surface.jsonl"
-SURFACE_SKIP_FOLDERS = ("00-Inbox/", "04-Archive/", "05-Reviews/")
+SURFACE_SKIP_FOLDERS = ("00-Inbox/", "04-Archive/")
 
 
 def _build_graph_adj(corpus: dict) -> dict[str, set[str]]:
@@ -16354,7 +16354,7 @@ def find_surface_bridges(
     Filtros (AND):
       - cosine(centroid_a, centroid_b) ≥ sim_threshold
       - distancia en el grafo ≥ min_hops  (b ∉ (min_hops−1)-hop de a)
-      - ninguna nota en 00-Inbox / 04-Archive / 05-Reviews
+      - ninguna nota en 00-Inbox / 04-Archive (incluye reviews/)
       - ninguna nota es MOC (título, tag o folder-index)
       - el par NO comparte ≥2 tags (la conexión ya es explícita vía tags)
       - ambas notas tienen edad ≥ skip_young_days (notas frescas siguen evolucionando)
@@ -28909,7 +28909,7 @@ def _generate_digest_narrative(prompt: str) -> str:
     return (resp.message.content or "").strip()
 
 
-DIGEST_FOLDER = "05-Reviews"
+DIGEST_FOLDER = "04-Archive/99-obsidian-system/99-Claude/reviews"
 
 
 @cli.command()
@@ -28925,7 +28925,7 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
     Consume notas modificadas, frontmatter `contradicts:`, el sidecar log
     de contradicciones index-time, las contradicciones query-time y las
     queries low-confidence. Genera prosa narrativa con command-r y la
-    guarda en `05-Reviews/YYYY-WNN.md` (auto-indexado).
+    guarda en `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md` (auto-indexado).
     """
     from datetime import timedelta as _td
     if week_opt:
@@ -29229,7 +29229,7 @@ INSIGHTS_GAP_THRESHOLD = CONFIDENCE_RERANK_MIN
 INSIGHTS_GAP_MIN_OCCURRENCES = 2
 INSIGHTS_HOT_MIN_OCCURRENCES = 3
 INSIGHTS_DEFAULT_WINDOW_DAYS = 30
-INSIGHTS_ORPHAN_EXCLUDED_PREFIXES = ("00-Inbox/", "05-Reviews/", "04-Archive/")
+INSIGHTS_ORPHAN_EXCLUDED_PREFIXES = ("00-Inbox/", "04-Archive/")
 
 
 def _normalize_query_for_grouping(q: str) -> str:
@@ -33159,10 +33159,10 @@ def read_cmd(url: str, save: bool, plain: bool):
 # ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
 # Proactive daily brief: what happened yesterday + what's pending + what to
 # focus today. Composes recent-notes / inbox / todo-frontmatter / new
-# contradictions / low-conf queries. Writes to 05-Reviews/YYYY-MM-DD.md.
+# contradictions / low-conf queries. Writes to 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md.
 # Auto-fires via launchd weekday mornings.
 
-MORNING_FOLDER = "05-Reviews"
+MORNING_FOLDER = "04-Archive/99-obsidian-system/99-Claude/reviews"
 
 
 # ── Apple integrations (Calendar / Reminders / Mail) ─────────────────────────
@@ -37286,7 +37286,7 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
     previous `rag today` left off.
     """
     yesterday = target - timedelta(days=1)
-    rel = f"05-Reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
+    rel = f"04-Archive/99-obsidian-system/99-Claude/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
     if not (vault / rel).is_file():
         return ""
     title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
@@ -37357,7 +37357,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
     contradicciones index-time del sidecar y queries low-confidence.
     command-r arma un brief de 120-280 palabras. Escribe a
-    `05-Reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+    `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
     if date_opt:
@@ -37500,7 +37500,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
 # End-of-day closure: mirrors morning's structure but looks BACK at the day
 # that just closed. Evidence window is [today 00:00 local, now]. Writes to
-# 05-Reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
+# 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
 
 
 def _today_window(now: datetime) -> tuple[datetime, datetime]:
@@ -37922,7 +37922,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
     Ventana: hoy 00:00 → ahora. Evidencia: notas modificadas hoy, capturas del
     día en 00-Inbox/, todos/due tocados, contradicciones nuevas, queries
     low-confidence. command-r arma un brief de 150-250 palabras. Escribe a
-    `05-Reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
+    `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
     hay actividad, imprime "sin actividad hoy" y termina.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
@@ -38061,7 +38061,7 @@ def find_dead_notes(
     min_age_days: int = 365,
     query_window_days: int = 180,
     exclude_folders: tuple[str, ...] = (
-        "00-Inbox", "04-Archive", "05-Reviews",
+        "00-Inbox", "04-Archive",
     ),
     use_frontmatter_date: bool = True,
 ) -> list[dict]:
@@ -38163,7 +38163,7 @@ def find_dead_notes(
 # Orquestador "todo en uno" pensado para correr via launchd a las 04:00:
 # cuando el user se despierta, todo está fresco — ETLs corridos, vault
 # reindexado, caches limpios, radares actualizados, brief matutino
-# pre-renderizado en 05-Reviews/, y el chat model cargado en RAM con
+# pre-renderizado en 04-Archive/99-obsidian-system/99-Claude/reviews/, y el chat model cargado en RAM con
 # keep_alive=-1 para que el primer `rag chat` responda sin cold-start.
 #
 # Cada paso es independiente: si `rag maintenance` falla, `rag morning`
@@ -38216,7 +38216,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
       4. `rag maintenance`     — WAL checkpoint, rotación de logs, cleanup.
       5. `rag patterns`        — radar de feedback dominante.
       6. `rag emergent`        — radar de temas emergentes en queries.
-      7. `rag morning`         — brief matutino pre-renderizado a 05-Reviews/.
+      7. `rag morning`         — brief matutino pre-renderizado a 04-Archive/99-obsidian-system/99-Claude/reviews/.
       8. Ollama warmup         — carga el chat model con keep_alive=-1.
 
     Nota sobre bookmarks: `rag index` ya los sincroniza automáticamente
@@ -38806,7 +38806,7 @@ def _render_archive_result(result: dict, apply: bool, plain: bool) -> None:
 
 
 def _write_archive_report(result: dict, apply: bool) -> Path | None:
-    """Write a human-readable Markdown report to 05-Reviews/YYYY-MM-archive.md.
+    """Write a human-readable Markdown report to 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md.
     Appends a dated section if the file already exists (monthly cadence can
     hit the same file twice if triggered manually between cycles).
     """
@@ -38814,7 +38814,7 @@ def _write_archive_report(result: dict, apply: bool) -> Path | None:
     skipped = result["skipped"]
     if not plan and not skipped:
         return None
-    reviews_dir = VAULT_PATH / "05-Reviews"
+    reviews_dir = VAULT_PATH / "04-Archive/99-obsidian-system/99-Claude/reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     ym = datetime.now().strftime("%Y-%m")
     path = reviews_dir / f"{ym}-archive.md"
@@ -38911,7 +38911,7 @@ def _push_archive_notification(result: dict, apply: bool) -> bool:
 @click.option("--notify/--no-notify", default=True,
               help="Push a WhatsApp si ambient está configurado")
 @click.option("--report/--no-report", default=True,
-              help="Escribe reporte a 05-Reviews/YYYY-MM-archive.md")
+              help="Escribe reporte a 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md")
 @click.option("--plain", is_flag=True, help="Salida plana (src\\tdst por línea)")
 def archive(min_age_days: int, query_window_days: int, folder: str | None,
             limit: int, gate: int, apply: bool, force: bool,

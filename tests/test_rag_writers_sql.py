@@ -233,7 +233,7 @@ def test_ambient_state_upsert_replaces(sql_env):
 
 def test_brief_written_writer_flag_on(sql_env):
     rag.record_brief_written(
-        "morning", Path("05-Reviews/2026-04-19.md"),
+        "morning", Path("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-19.md"),
         ["01-Projects/a.md", "02-Areas/b.md"],
         {"Prioridades": ["01-Projects/a.md"]},
     )
@@ -243,7 +243,7 @@ def test_brief_written_writer_flag_on(sql_env):
             "SELECT brief_type, brief_path, paths_cited_json, citations_by_section_json FROM rag_brief_written"
         ).fetchone()
         assert row[0] == "morning"
-        assert row[1] == "05-Reviews/2026-04-19.md"
+        assert row[1] == "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-19.md"
         assert json.loads(row[2]) == ["01-Projects/a.md", "02-Areas/b.md"]
         assert json.loads(row[3]) == {"Prioridades": ["01-Projects/a.md"]}
     finally:

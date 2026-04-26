@@ -4866,7 +4866,7 @@ _TODAY_FM_SPLIT = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
 
 def _persist_today_brief(date_label: str, narrative: str) -> None:
-    """Write the regenerated brief to `05-Reviews/YYYY-MM-DD-evening.md` so
+    """Write the regenerated brief to `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` so
     subsequent `/api/home` calls hit the cached path. Mirrors the CLI
     `rag today` write — same frontmatter shape so contradiction detection
     and ambient skip rules treat both files the same. Silent-fail.
@@ -4893,7 +4893,7 @@ def _persist_today_brief(date_label: str, narrative: str) -> None:
 
 
 def _today_cached_narrative(date_label: str) -> str | None:
-    """Return narrative from `05-Reviews/YYYY-MM-DD-evening.md` if present.
+    """Return narrative from `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` if present.
     CLI `rag today` writes this file, so we avoid re-running the LLM when the
     brief was already generated today.
     """
@@ -6215,7 +6215,7 @@ def _home_compute(
     Per-channel silent-fail: if one source errors (e.g. Gmail OAuth expired,
     icalBuddy not installed), that key is missing/empty but the rest renders.
     `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
-    cached brief from `05-Reviews/<date>-evening.md` if present.
+    cached brief from `04-Archive/99-obsidian-system/99-Claude/reviews/<date>-evening.md` if present.
 
     `progress` (optional): callback invoked as
     `progress(stage, status, elapsed_ms, error_message)` where status is one

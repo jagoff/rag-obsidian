@@ -22,7 +22,7 @@ class _FakeResponse:
 def tmp_vault(tmp_path, monkeypatch, fake_embed):
     vault = tmp_path / "vault"
     (vault / "00-Inbox").mkdir(parents=True)
-    (vault / "05-Reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(

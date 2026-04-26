@@ -228,7 +228,7 @@ Detecta cuando una nota se contradice con otra del vault. Tres fases:
       │
       ▼
    command-r arma un brief narrativo sobre lo que cambió
-   de opinión en la semana → escribe a 05-Reviews/YYYY-WNN.md
+   de opinión en la semana → escribe a 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md
 ```
 
 ---
@@ -393,7 +393,7 @@ tu-vault/                       ◀── tu vault de Obsidian
  ├── 02-Areas/
  ├── 03-Resources/
  ├── 04-Archive/
- └── 05-Reviews/                ◀── donde caen morning/today/digest
+ └── 04-Archive/99-obsidian-system/99-Claude/reviews/                ◀── donde caen morning/today/digest
 ```
 
 ---

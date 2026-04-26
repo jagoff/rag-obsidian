@@ -2438,7 +2438,7 @@ def _verdict_ranker() -> dict:
     """Ranker: comparar weights actual vs baseline embebido en metadata."""
     out: dict = {
         "id": "ranker",
-        "name": "Ranker (pesos del retrieval)",
+        "name": "Cómo prioriza resultados",
         "status": "dormant",
         "last_active_ts": None,
         "last_active_human": "nunca",
@@ -2498,7 +2498,7 @@ def _verdict_ranker() -> dict:
 def _verdict_eval() -> dict:
     """Eval: comparar hit5 últimos 7d vs ventana 7-30d para mostrar mejora."""
     out: dict = {
-        "id": "eval", "name": "Eval scoring (calidad del retrieval)",
+        "id": "eval", "name": "Calidad de los resultados",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2541,7 +2541,7 @@ def _verdict_eval() -> dict:
 
 def _verdict_feedback() -> dict:
     out: dict = {
-        "id": "feedback", "name": "Feedback explícito (👍/👎)",
+        "id": "feedback", "name": "Lo que evaluaste con 👍/👎",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2574,7 +2574,7 @@ def _verdict_feedback() -> dict:
 
 def _verdict_behavior() -> dict:
     out: dict = {
-        "id": "behavior", "name": "Behavior (clicks, dwell, opens)",
+        "id": "behavior", "name": "Cómo interactuás con los resultados",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2600,7 +2600,7 @@ def _verdict_behavior() -> dict:
 
 def _verdict_anticipatory() -> dict:
     out: dict = {
-        "id": "anticipatory", "name": "Anticipatory agent (push proactivo)",
+        "id": "anticipatory", "name": "Predicciones proactivas",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2638,7 +2638,7 @@ def _verdict_anticipatory() -> dict:
 
 def _verdict_paraphrases() -> dict:
     out: dict = {
-        "id": "paraphrases", "name": "Paráfrasis aprendidas (query expansion)",
+        "id": "paraphrases", "name": "Variantes de preguntas aprendidas",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2668,7 +2668,7 @@ def _verdict_paraphrases() -> dict:
 def _verdict_routing_rules() -> dict:
     out: dict = {
         "id": "routing_rules",
-        "name": "Routing rules (n-gram patterns para WA voice)",
+        "name": "Reglas de derivación de mensajes",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2705,7 +2705,7 @@ def _verdict_routing_rules() -> dict:
 
 def _verdict_whisper_vocab() -> dict:
     out: dict = {
-        "id": "whisper_vocab", "name": "Whisper vocab (boost en STT prompt)",
+        "id": "whisper_vocab", "name": "Vocabulario para transcripciones",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2735,7 +2735,7 @@ def _verdict_whisper_vocab() -> dict:
 def _verdict_whisper_corrections() -> dict:
     out: dict = {
         "id": "whisper_corrections",
-        "name": "Whisper corrections (manual STT fixes)",
+        "name": "Correcciones de transcripciones",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2767,7 +2767,7 @@ def _verdict_whisper_corrections() -> dict:
 def _verdict_score_calibration() -> dict:
     out: dict = {
         "id": "score_calibration",
-        "name": "Score calibration (isotonic per-source)",
+        "name": "Confianza calibrada por fuente",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2796,7 +2796,7 @@ def _verdict_score_calibration() -> dict:
 def _verdict_contradictions() -> dict:
     out: dict = {
         "id": "contradictions",
-        "name": "Contradicciones (radar Phase 2)",
+        "name": "Detector de contradicciones",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }
@@ -2826,7 +2826,7 @@ def _verdict_contradictions() -> dict:
 
 def _verdict_entities() -> dict:
     out: dict = {
-        "id": "entities", "name": "Entidades (GLiNER NER)",
+        "id": "entities", "name": "Personas y lugares detectados",
         "status": "dormant", "last_active_ts": None,
         "last_active_human": "nunca", "metric": None, "note": None,
     }

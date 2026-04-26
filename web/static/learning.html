@@ -953,7 +953,7 @@
     <section class="learn-section" id="sec-retrieval-quality" aria-labelledby="h-retrieval-quality">
       <header class="learn-section-hdr">
         <h2 id="h-retrieval-quality" title="Retrieval quality: hit@5, MRR, latencia vs score">Qué tan bien encuentra notas</h2>
-        <p class="muted">hit@5, MRR, eval drift y latencia vs score</p>
+        <p class="muted">Acierto, ranking, regresiones y velocidad por consulta</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-retrieval-quality" data-collapse="body-retrieval-quality">−</button>
       </header>
       <div class="learn-section-body" id="body-retrieval-quality">
@@ -978,7 +978,7 @@
     <section class="learn-section" id="sec-ranker-weights" aria-labelledby="h-ranker-weights">
       <header class="learn-section-hdr">
         <h2 id="h-ranker-weights" title="Ranker weights over time (12 features)">Importancia de cada factor de búsqueda</h2>
-        <p class="muted">small-multiples — una mini-línea por weight, baseline punteada</p>
+        <p class="muted">Una mini-línea por factor — peso actual vs inicial</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-ranker-weights" data-collapse="body-ranker-weights">−</button>
       </header>
       <div class="learn-section-body" id="body-ranker-weights">
@@ -993,7 +993,7 @@
     <section class="learn-section" id="sec-score-calibration" aria-labelledby="h-score-calibration">
       <header class="learn-section-hdr">
         <h2 id="h-score-calibration" title="Score calibration: raw vs calibrated por source">Calibración de confianza por fuente</h2>
-        <p class="muted">curvas raw → calibrated por source (isotonic / spline)</p>
+        <p class="muted">Cómo se ajusta la confianza para cada fuente de resultados</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-score-calibration" data-collapse="body-score-calibration">−</button>
       </header>
       <div class="learn-section-body" id="body-score-calibration">
@@ -1005,7 +1005,7 @@
     <section class="learn-section" id="sec-feedback-explicit" aria-labelledby="h-feedback-explicit">
       <header class="learn-section-hdr">
         <h2 id="h-feedback-explicit" title="Explicit feedback: rag_feedback table">Lo que dijiste (thumbs ↑/↓)</h2>
-        <p class="muted">thumbs ↑/↓, paths correctivos, scope (answer vs retrieval)</p>
+        <p class="muted">Reacciones, correcciones manuales, y a qué parte de la respuesta apuntaron</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-explicit" data-collapse="body-feedback-explicit">−</button>
       </header>
       <div class="learn-section-body" id="body-feedback-explicit">
@@ -1030,7 +1030,7 @@
     <section class="learn-section" id="sec-feedback-implicit" aria-labelledby="h-feedback-implicit">
       <header class="learn-section-hdr">
         <h2 id="h-feedback-implicit" title="Implicit feedback: re-queries, dwell, outcomes">Lo que hiciste (sin decir nada)</h2>
-        <p class="muted">señales pasivas: requery, session outcome, paths correctivos</p>
+        <p class="muted">Cuando re-preguntás, abandonás o corregís sin decir nada explícito</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-implicit" data-collapse="body-feedback-implicit">−</button>
       </header>
       <div class="learn-section-body" id="body-feedback-implicit">
@@ -1051,7 +1051,7 @@
     <section class="learn-section" id="sec-behavior" aria-labelledby="h-behavior">
       <header class="learn-section-hdr">
         <h2 id="h-behavior" title="Behavior: rag_behavior events">Cómo interactuaste</h2>
-        <p class="muted">CTR por source, dwell, top paths, heatmap día×hora</p>
+        <p class="muted">Clicks por fuente, tiempo de lectura, notas más visitadas, mapa día×hora</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-behavior" data-collapse="body-behavior">−</button>
       </header>
       <div class="learn-section-body" id="body-behavior">
@@ -1081,7 +1081,7 @@
     <section class="learn-section" id="sec-query-learning" aria-labelledby="h-query-learning">
       <header class="learn-section-hdr">
         <h2 id="h-query-learning" title="Query learning: paraphrases + cache">Cómo aprendió a entender tus preguntas</h2>
-        <p class="muted">paráfrasis aprendidas, top variantes, cache hit rate</p>
+        <p class="muted">Variantes aprendidas, formas más usadas, respuestas servidas desde cache</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-query-learning" data-collapse="body-query-learning">−</button>
       </header>
       <div class="learn-section-body" id="body-query-learning">
@@ -1106,7 +1106,7 @@
     <section class="learn-section" id="sec-anticipatory" aria-labelledby="h-anticipatory">
       <header class="learn-section-hdr">
         <h2 id="h-anticipatory" title="Anticipatory: rag_anticipate_candidates">Predicciones que hizo</h2>
-        <p class="muted">candidatos por kind, selección/send, reacciones, weights</p>
+        <p class="muted">Predicciones por tipo, aciertos, reacciones tuyas, importancia de cada tipo</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-anticipatory" data-collapse="body-anticipatory">−</button>
       </header>
       <div class="learn-section-body" id="body-anticipatory">
@@ -1135,7 +1135,7 @@
     <section class="learn-section" id="sec-routing" aria-labelledby="h-routing">
       <header class="learn-section-hdr">
         <h2 id="h-routing" title="Routing learning: rag_routing_decisions">A dónde envió cada pregunta</h2>
-        <p class="muted">decisiones por bucket, reglas activas, ratio de evidencia</p>
+        <p class="muted">A qué destino fue cada pregunta, reglas activas, confianza de las decisiones</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-routing" data-collapse="body-routing">−</button>
       </header>
       <div class="learn-section-body" id="body-routing">
@@ -1160,7 +1160,7 @@
     <section class="learn-section" id="sec-whisper" aria-labelledby="h-whisper">
       <header class="learn-section-hdr">
         <h2 id="h-whisper" title="Whisper learning: vocab + corrections">Cómo mejoró la transcripción</h2>
-        <p class="muted">vocab por source, correcciones, avg logprob, top vocab</p>
+        <p class="muted">Vocabulario aprendido, correcciones manuales, confianza promedio, términos más importantes</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-whisper" data-collapse="body-whisper">−</button>
       </header>
       <div class="learn-section-body" id="body-whisper">
@@ -1189,7 +1189,7 @@
     <section class="learn-section" id="sec-vault" aria-labelledby="h-vault">
       <header class="learn-section-hdr">
         <h2 id="h-vault" title="Vault intelligence: entities + contradictions">Qué aprendió de tus notas</h2>
-        <p class="muted">entidades, mentions, contradicciones, filing, surface vs archive</p>
+        <p class="muted">Personas y lugares, menciones, inconsistencias detectadas, organización de notas</p>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-vault" data-collapse="body-vault">−</button>
       </header>
       <div class="learn-section-body" id="body-vault">

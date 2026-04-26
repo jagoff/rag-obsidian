@@ -28025,6 +28025,143 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
                 f"chains {c_hit5:.2%} ≥ {GATE_CHAINS_HIT5_MIN:.2%})"
             )
 
+    # ── Stratified eval (Sprint 3 hook, 2026-04-26) ────────────────────────
+    # Defense-in-depth sobre el CI gate aggregate: cluster las queries de
+    # singles por tipo (definition / procedural / temporal / etc.), y mide
+    # hit@k per cluster baseline vs candidate. Si CUALQUIER cluster
+    # regresiona >5pp, se considera regresión silenciosa que el aggregate
+    # ocultó (mejora pareja de clusters fáciles, empeoró cluster crítico).
+    #
+    # Modo informativo siempre: imprime el delta per cluster post-tune.
+    # Modo bloqueante con `RAG_TUNE_STRATIFIED_GATE=1`: si detecta
+    # regresión, dispara rollback igual que el CI gate aggregate.
+    #
+    # Sin re-correr `rag eval` — reusa los `cases` ya computados (con
+    # `feats` precomputados via collect_ranker_features) y solo re-scorea
+    # con apply_weighted_scores. Costo: ~milisegundos, no segundos.
+    try:
+        from rag_implicit_learning import (
+            cluster_query,
+            should_rollback,
+        )
+
+        singles = [c for c in cases if c.get("kind") == "single"]
+
+        def _hit5_for_cluster(cluster_cases, weights):
+            hits = 0
+            n_evaluable = 0
+            for case in cluster_cases:
+                feats = case.get("feats")
+                expected = set(case.get("expected") or [])
+                if not feats or not expected:
+                    continue
+                n_evaluable += 1
+                ranked = apply_weighted_scores(feats, weights, k=k)
+                paths_topk = [r["path"] for r in ranked[:k]]
+                if any(p in expected for p in paths_topk):
+                    hits += 1
+            return {
+                "hit5": hits / n_evaluable if n_evaluable > 0 else 0.0,
+                "n_cases": n_evaluable,
+                "included_in_gate": n_evaluable >= 3,
+            }
+
+        by_cluster: dict[str, list[dict]] = {}
+        for case in singles:
+            cluster = cluster_query(case.get("q") or "")
+            by_cluster.setdefault(cluster, []).append(case)
+
+        baseline_per_cluster: dict[str, dict] = {}
+        candidate_per_cluster: dict[str, dict] = {}
+        for cluster_name, cluster_cases in by_cluster.items():
+            baseline_per_cluster[cluster_name] = _hit5_for_cluster(
+                cluster_cases, baseline_w
+            )
+            candidate_per_cluster[cluster_name] = _hit5_for_cluster(
+                cluster_cases, best_w
+            )
+
+        decision = should_rollback(baseline_per_cluster, candidate_per_cluster)
+
+        console.print()
+        console.print("[bold]Stratified eval per cluster:[/bold]")
+        for cluster_name, delta_pp in sorted(decision["per_cluster_delta"].items()):
+            n_cases_cluster = candidate_per_cluster[cluster_name]["n_cases"]
+            style = (
+                "green" if delta_pp > 0 else "red" if delta_pp < 0 else "dim"
+            )
+            console.print(
+                f"  [{style}]{cluster_name:18}: {delta_pp:+.2f}pp"
+                f" (n={n_cases_cluster})[/{style}]"
+            )
+
+        # Excluded clusters (n < 3) — listamos para visibility.
+        excluded = [
+            (name, info["n_cases"])
+            for name, info in candidate_per_cluster.items()
+            if not info["included_in_gate"]
+        ]
+        if excluded:
+            console.print(
+                f"  [dim]Clusters excluidos del gate (n<3): "
+                + ", ".join(f"{n}={c}" for n, c in excluded)
+                + "[/dim]"
+            )
+
+        stratified_gate_env = os.environ.get(
+            "RAG_TUNE_STRATIFIED_GATE", "0"
+        ).strip()
+        stratified_gate_enabled = stratified_gate_env not in ("", "0", "false", "no")
+
+        if decision["rollback"]:
+            if stratified_gate_enabled:
+                console.print(
+                    f"[red]✗ Stratified gate falló: {decision['reason']}. "
+                    "Auto-rollback…[/red]"
+                )
+                if backup_path and backup_path.is_file():
+                    if _restore_ranker_backup(backup_path):
+                        _invalidate_ranker_weights()
+                        console.print(
+                            f"[yellow]Ranker restaurado desde "
+                            f"{backup_path.name}[/yellow]"
+                        )
+                _log_tune_event({
+                    "cmd": "tune_stratified_regression",
+                    "reason": decision["reason"],
+                    "regressed_clusters": decision["regressed_clusters"],
+                    "per_cluster_delta": decision["per_cluster_delta"],
+                    "auto_rolled_back": backup_path is not None,
+                })
+                import sys as _sys
+                _sys.exit(1)
+            else:
+                console.print(
+                    f"[yellow]⚠ Stratified detectó regresión: "
+                    f"{decision['reason']}[/yellow]"
+                )
+                console.print(
+                    "[dim]   Set RAG_TUNE_STRATIFIED_GATE=1 en el plist "
+                    "para que esto bloquee futuros deploys.[/dim]"
+                )
+                _log_tune_event({
+                    "cmd": "tune_stratified_warn",
+                    "reason": decision["reason"],
+                    "regressed_clusters": decision["regressed_clusters"],
+                    "per_cluster_delta": decision["per_cluster_delta"],
+                })
+        else:
+            console.print(
+                f"[green]✓[/green] Stratified eval OK: {decision['reason']}"
+            )
+    except Exception as exc:
+        # Stratified eval es bonus — si rompe, NO afectamos el flow del tune.
+        # Si esto pasa, el aggregate gate ya fue OK (sino habríamos exited
+        # antes), así que el modelo igual queda persistido.
+        console.print(
+            f"[dim]Stratified eval skipped ({type(exc).__name__}: {exc})[/dim]"
+        )
+
 
 @cli.command()
 @click.argument("path")
@@ -49057,6 +49194,16 @@ _AUTO_HARVEST_MIN_CONF = float(
 _AUTO_HARVEST_SNIPPET_CHARS = int(
     os.environ.get("RAG_AUTO_HARVEST_SNIPPET_CHARS", "400")
 )
+# Sprint 3 hook (2026-04-26): ensemble LLM-judge en auto_harvest.
+# Cuando RAG_AUTO_HARVEST_ENSEMBLE=1, el verdict por candidato se calcula
+# llamando a múltiples jueces independientes (default: qwen2.5:7b +
+# qwen2.5:3b + command-r) y haciendo majority vote. Cancela biases
+# idiosincráticos de un single judge — por ejemplo, qwen tiene tendencia
+# a verdicts confiados aunque el match sea loose.
+# Default off (=0) para mantener el comportamiento histórico tested.
+# Cuando sea estable + medido, podemos default-on en una próxima version.
+_AUTO_HARVEST_ENSEMBLE = os.environ.get("RAG_AUTO_HARVEST_ENSEMBLE", "0").strip()
+_AUTO_HARVEST_ENSEMBLE_ENABLED = _AUTO_HARVEST_ENSEMBLE not in ("", "0", "false", "no")
 
 
 def _auto_harvest_snippets(
@@ -49229,7 +49376,46 @@ def auto_harvest(
             stats["skipped_empty_paths"] += 1
             continue
         snippets = _auto_harvest_snippets(paths[:5], vault=vault)
-        verdict = _auto_harvest_judge(c["q"], snippets, model=model)
+        # Hook Sprint 3: si `RAG_AUTO_HARVEST_ENSEMBLE=1`, usar ensemble de
+        # 2-3 jueces con majority vote en lugar de single-judge. Más robusto
+        # contra biases idiosincráticos pero ~3x más caro (3 LLM calls vs 1).
+        # Si el ensemble falla por completo (e.g. modelos no disponibles),
+        # fallback al single-judge para no romper auto-harvest histórico.
+        if _AUTO_HARVEST_ENSEMBLE_ENABLED:
+            try:
+                from rag_implicit_learning import (
+                    DEFAULT_ENSEMBLE_MODELS,
+                    judge_with_ensemble,
+                )
+                ens_result = judge_with_ensemble(
+                    c["q"], snippets,
+                    models=DEFAULT_ENSEMBLE_MODELS,
+                    judge_fn=_auto_harvest_judge,
+                )
+                if ens_result is not None:
+                    # Normalizar al shape que espera el resto del flujo
+                    # (verdict + confidence + reason).
+                    verdict = {
+                        "verdict": ens_result["verdict"],
+                        "confidence": ens_result["confidence"],
+                        "reason": (
+                            f"ensemble agreement={ens_result['agreement']:.2f} "
+                            f"({ens_result['n_judges_voted']}/{ens_result['n_judges_total']} judges)"
+                        ),
+                    }
+                else:
+                    # Ensemble retornó None (todos los jueces fallaron o
+                    # abstuvieron) → no insertamos nada para esta query.
+                    verdict = None
+            except Exception as exc:
+                # Hard failure del ensemble: caer al single-judge histórico.
+                if verbose:
+                    console.print(
+                        f"  [dim]ensemble error, fallback to single: {exc}[/dim]"
+                    )
+                verdict = _auto_harvest_judge(c["q"], snippets, model=model)
+        else:
+            verdict = _auto_harvest_judge(c["q"], snippets, model=model)
         if verdict is None:
             stats["skipped_judge_failed"] += 1
             if verbose:

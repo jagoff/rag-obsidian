@@ -37,6 +37,14 @@ dependencies = [
     # Runtime code guards with `try: import ocrmac` so the absence is
     # silent on non-macOS.
     "ocrmac>=1.0; sys_platform == 'darwin'",
+    # pillow-heif registra el HEIC/HEIF reader en PIL para que
+    # `_sanitize_image_exif` (web/server.py) pueda strippear EXIF/GPS de
+    # las fotos que el user sube via PWA desde el iPhone (formato HEIC
+    # default). Sin esta dep, las HEIC eran passthrough y conservaban GPS
+    # coords al copiarse al vault iCloud. Audit 2026-04-25 R2-OCR #4
+    # followup. Pillow se pulla transitivamente; explicitamos solo el
+    # plugin HEIF.
+    "pillow-heif>=1.0",
 ]
 
 [project.optional-dependencies]

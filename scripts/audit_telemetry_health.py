@@ -358,6 +358,377 @@ def check_anticipate_health(conn: sqlite3.Connection, days: int = 7) -> dict:
     return out
 
 
+def check_retrieval_health(conn: sqlite3.Connection, days: int = 7) -> dict:
+    """Health check del pipeline de retrieval (cache + ranker + latency).
+
+    Audit 2026-04-25 R2-Telemetry #5: agregamos este check porque el
+    audit detectó que la degradation silenciosa del retrieval (cache
+    invalidation suelta, ranker devolviendo basura, latency creep) pasa
+    desapercibida hasta que el user la experimenta. Mismo patrón que
+    `check_anticipate_health` — recibe conn, calcula thresholds,
+    devuelve dict JSON-serializable.
+
+    Detecta cuatro patologías:
+
+    1. **stale**: 0 queries en la ventana → system idle o corrupto.
+    2. **cache hit rate < 50%** (con muestra ≥20 web queries que
+       loguearon `cache_probe`): cache invalidation suelta o config
+       rota — el LRU cosine no está devolviendo hits en queries que
+       repiten.
+    3. **median top_score < 0.4**: ranker degradado. Si la mediana de
+       los scores top-1 es bajísima, el embed/rerank está devolviendo
+       contexto irrelevante para casi todas las queries.
+    4. **p95 t_retrieve > baseline × 1.3** (baseline 1500ms → trip a
+       >1950ms): latency creep — alguno de bm25/sem/rerank se estancó.
+
+    Reglas adicionales (no `degraded` por sí solas, solo informativas):
+
+    - **NLI grounding bajo** (`claims_supported / claims_total < 0.5`)
+      cuando claims_total > 0. Marca degraded si está pero no hace
+      degraded el caso `claims_total == 0` — el NLI puede no haber
+      corrido y eso no es per se un bug del retrieval.
+
+    Returns dict con shape:
+
+        {
+            "status": "healthy" | "degraded" | "stale" | "unknown",
+            "issues": ["..."],
+            "details": {
+                "queries_count": N,
+                "cache_hit_rate_pct": X.X | None,
+                "p95_retrieve_ms": Y | None,
+                "median_top_score": Z.Z | None,
+                "nli_supported_rate": W | None,  # opcional
+            }
+        }
+
+    TODO (audit 2026-04-25 R2-Telemetry #5): el threshold de cache hit
+    rate (50%) y p95 baseline (1500ms) son numbers tomados de la
+    distribución observada en abril 2026. Cuando subamos el ranker o
+    cambiemos modelo de embeddings, estos baselines necesitan revisarse
+    — convendría persistirlos en una tabla `rag_telemetry_baselines`
+    en lugar de hardcodear acá.
+    """
+    out: dict = {
+        "status": "unknown",
+        "issues": [],
+        "details": {
+            "queries_count": 0,
+            "cache_hit_rate_pct": None,
+            "p95_retrieve_ms": None,
+            "median_top_score": None,
+        },
+    }
+
+    # 1) Tabla rag_queries existe?
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_queries'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["issues"].append(f"sql_error: {exc!r}")
+        return out
+    if exists is None:
+        out["issues"].append("table missing: rag_queries")
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 2) Total queries en la ventana — los 3 cmds que disparan retrieve
+    # real ('chat' CLI, 'query' CLI, 'web' endpoint principal). Los
+    # sub-cmds 'web.chat.*' los excluímos porque son re-logs de stages
+    # post-retrieval (metachat/degenerate/low_conf_bypass) y no
+    # representan un retrieve nuevo.
+    queries_count = conn.execute(
+        "SELECT COUNT(*) FROM rag_queries "
+        "WHERE ts >= ? AND cmd IN ('chat', 'query', 'web')",
+        (cutoff_iso,),
+    ).fetchone()[0]
+    out["details"]["queries_count"] = queries_count
+
+    if queries_count == 0:
+        out["status"] = "stale"
+        out["issues"].append(
+            f"0 retrieval queries en ventana de {days}d (system idle o corrupto)"
+        )
+        return out
+
+    # 3) Cache hit rate — leemos `extra_json.cache_hit` que el web
+    # endpoint loguea desde el fix 2026-04-24 (commit 3dcbe81). Antes
+    # del fix solo se logueaba en el hit path; ahora también el miss.
+    # Solo evaluamos la regla si tenemos una muestra mínima — sino los
+    # primeros días post-deploy mostrarían "cache hit rate 0% degraded"
+    # cuando en realidad recién empezó a poblarse.
+    cache_rows = conn.execute(
+        "SELECT json_extract(extra_json, '$.cache_hit') "
+        "FROM rag_queries "
+        "WHERE ts >= ? AND cmd = 'web' "
+        "  AND json_extract(extra_json, '$.cache_hit') IS NOT NULL",
+        (cutoff_iso,),
+    ).fetchall()
+    cache_total = len(cache_rows)
+    cache_hits = sum(1 for r in cache_rows if r[0])
+    cache_hit_rate_pct: float | None = None
+    if cache_total > 0:
+        cache_hit_rate_pct = round(100.0 * cache_hits / cache_total, 1)
+        out["details"]["cache_hit_rate_pct"] = cache_hit_rate_pct
+
+    # 4) p95 t_retrieve (en ms). Nearest-rank percentile — para muestras
+    # chicas no usamos interpolación (sería sobreingeniería). Convertimos
+    # de segundos a ms acá.
+    retrieve_rows = conn.execute(
+        "SELECT t_retrieve FROM rag_queries "
+        "WHERE ts >= ? AND cmd IN ('chat', 'query', 'web') "
+        "  AND t_retrieve IS NOT NULL "
+        "ORDER BY t_retrieve ASC",
+        (cutoff_iso,),
+    ).fetchall()
+    p95_retrieve_ms: float | None = None
+    if retrieve_rows:
+        n = len(retrieve_rows)
+        # nearest-rank: ceil(0.95 * n) - 1 con guard de bounds
+        idx = max(0, min(n - 1, int(0.95 * n) - 1 if 0.95 * n == int(0.95 * n) else int(0.95 * n)))
+        p95_retrieve_ms = round(retrieve_rows[idx][0] * 1000.0, 1)
+        out["details"]["p95_retrieve_ms"] = p95_retrieve_ms
+
+    # 5) Median top_score — mediana clásica (índice n//2 sobre lista
+    # ordenada). Si hay 0 rows con top_score, queda None.
+    score_rows = conn.execute(
+        "SELECT top_score FROM rag_queries "
+        "WHERE ts >= ? AND cmd IN ('chat', 'query', 'web') "
+        "  AND top_score IS NOT NULL "
+        "ORDER BY top_score ASC",
+        (cutoff_iso,),
+    ).fetchall()
+    median_top_score: float | None = None
+    if score_rows:
+        n = len(score_rows)
+        median_top_score = round(score_rows[n // 2][0], 3)
+        out["details"]["median_top_score"] = median_top_score
+
+    # 6) NLI grounding — claims_supported/claims_total. En prod actualmente
+    # `extra_json.grounding_summary` está mayormente null (NLI corre
+    # solo en ciertos paths). Si no hay claims, este check queda no-op.
+    nli_rows = conn.execute(
+        "SELECT json_extract(extra_json, '$.grounding_summary.claims_total'), "
+        "       json_extract(extra_json, '$.grounding_summary.supported') "
+        "FROM rag_queries "
+        "WHERE ts >= ? AND cmd IN ('chat', 'query', 'web') "
+        "  AND json_extract(extra_json, '$.grounding_summary.claims_total') > 0",
+        (cutoff_iso,),
+    ).fetchall()
+    nli_claims_total = sum(int(r[0] or 0) for r in nli_rows)
+    nli_claims_supported = sum(int(r[1] or 0) for r in nli_rows)
+    nli_supported_rate: float | None = None
+    if nli_claims_total > 0:
+        nli_supported_rate = round(nli_claims_supported / nli_claims_total, 3)
+        out["details"]["nli_supported_rate"] = nli_supported_rate
+
+    # 7) Aplicar reglas de degradation
+    issues: list[str] = []
+    P95_BASELINE_MS = 1500.0
+    P95_THRESHOLD_MS = P95_BASELINE_MS * 1.3  # 1950ms
+
+    if (
+        cache_hit_rate_pct is not None
+        and cache_total >= 20
+        and cache_hit_rate_pct < 50.0
+    ):
+        issues.append(
+            f"cache hit rate {cache_hit_rate_pct:.1f}% < 50% threshold "
+            f"(n={cache_total})"
+        )
+    if median_top_score is not None and median_top_score < 0.4:
+        issues.append(
+            f"median top_score {median_top_score:.2f} < 0.4 (ranker degradado)"
+        )
+    if p95_retrieve_ms is not None and p95_retrieve_ms > P95_THRESHOLD_MS:
+        issues.append(
+            f"p95 t_retrieve {p95_retrieve_ms:.0f}ms (baseline "
+            f"{P95_BASELINE_MS:.0f}ms × 1.3 = {P95_THRESHOLD_MS:.0f}ms)"
+        )
+    if nli_supported_rate is not None and nli_supported_rate < 0.5:
+        issues.append(
+            f"NLI grounding bajo: {nli_claims_supported}/{nli_claims_total} "
+            f"claims supported ({nli_supported_rate * 100:.0f}% < 50%)"
+        )
+
+    out["issues"] = issues
+    out["status"] = "degraded" if issues else "healthy"
+    return out
+
+
+def check_chat_health(conn: sqlite3.Connection, days: int = 7) -> dict:
+    """Health check del pipeline de chat / LLM (post-retrieval).
+
+    Audit 2026-04-25 R2-Telemetry #5: complementa
+    `check_retrieval_health` cubriendo el lado generation. Detecta
+    degradation que `check_retrieval_health` no ve — por ejemplo, el
+    ranker puede estar perfecto pero el LLM tardar 6s en generar (cap
+    de t_gen creció), o el critique nunca dispara porque alguien rompió
+    el hook al refactorear.
+
+    Detecta:
+
+    1. **stale**: 0 chats en ventana → endpoint /chat caído o nadie
+       lo está usando.
+    2. **p95 t_gen > baseline × 1.3** (baseline 3000ms → trip a
+       >3900ms): latency creep en generation.
+    3. **critique_fired_rate == 0** con muestra ≥20 → critique nunca
+       dispara, hook roto. (Nota: critique_fired = 1 cuando el critique
+       loop detectó algo y modificó la respuesta; rate sano ronda
+       5-15%.)
+    4. **refusal_rate > 50%**: el bot devuelve `web.chat.degenerate`
+       canned reply en >50% de las queries → o routing roto, o el LLM
+       perdió capacidad, o el dataset cambió drásticamente. Solo se
+       evalúa con muestra ≥20 chats para evitar ruido en days bajos.
+
+    TODO (audit 2026-04-25 R2-Telemetry #5): no hay un flag explícito
+    `error: true` en `extra_json` para LLM crashes — los timeouts se
+    propagan a `silent_errors.jsonl` con `where=...` que no incluye
+    `cmd`, así que atribuir errores a chat vs otros sub-sistemas
+    requiere parsear el JSONL aparte. Por ahora `error_rate_pct` queda
+    out de las reglas de `degraded` (no se calcula). Si en R3 agregamos
+    un flag dedicado `extra_json.error` o `extra_json.exc_type`,
+    levantamos esta TODO y agregamos la regla `error_rate > 5%`.
+
+    Returns dict con shape:
+
+        {
+            "status": "healthy" | "degraded" | "stale" | "unknown",
+            "issues": ["..."],
+            "details": {
+                "chats_count": N,
+                "p95_gen_ms": Y | None,
+                "critique_fired_rate": F | None,
+                "refusal_rate_pct": R | None,
+            }
+        }
+    """
+    out: dict = {
+        "status": "unknown",
+        "issues": [],
+        "details": {
+            "chats_count": 0,
+            "p95_gen_ms": None,
+            "critique_fired_rate": None,
+            "refusal_rate_pct": None,
+        },
+    }
+
+    # 1) Tabla rag_queries existe?
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='rag_queries'"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        out["issues"].append(f"sql_error: {exc!r}")
+        return out
+    if exists is None:
+        out["issues"].append("table missing: rag_queries")
+        return out
+
+    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+    # 2) Total chats — agarramos `chat` (CLI), `web` (endpoint
+    # principal del web server) y todos los sub-cmds `web.chat.%`
+    # (metachat / degenerate / low_conf_bypass / cached_semantic).
+    # Ver `web/server.py:7119` para la convención de naming.
+    chats_count = conn.execute(
+        "SELECT COUNT(*) FROM rag_queries "
+        "WHERE ts >= ? "
+        "  AND (cmd = 'chat' OR cmd = 'web' OR cmd LIKE 'web.chat.%')",
+        (cutoff_iso,),
+    ).fetchone()[0]
+    out["details"]["chats_count"] = chats_count
+
+    if chats_count == 0:
+        out["status"] = "stale"
+        out["issues"].append(
+            f"0 chats en ventana de {days}d (endpoint idle o caído)"
+        )
+        return out
+
+    # 3) p95 t_gen (ms) — solo sobre chats que efectivamente generaron
+    # (t_gen > 0). Cache hits y degenerate replies tienen t_gen NULL y
+    # no entran al cálculo de latency.
+    gen_rows = conn.execute(
+        "SELECT t_gen FROM rag_queries "
+        "WHERE ts >= ? "
+        "  AND (cmd = 'chat' OR cmd = 'web' OR cmd LIKE 'web.chat.%') "
+        "  AND t_gen IS NOT NULL AND t_gen > 0 "
+        "ORDER BY t_gen ASC",
+        (cutoff_iso,),
+    ).fetchall()
+    p95_gen_ms: float | None = None
+    if gen_rows:
+        n = len(gen_rows)
+        idx = max(0, min(n - 1, int(0.95 * n) - 1 if 0.95 * n == int(0.95 * n) else int(0.95 * n)))
+        p95_gen_ms = round(gen_rows[idx][0] * 1000.0, 1)
+        out["details"]["p95_gen_ms"] = p95_gen_ms
+
+    # 4) Critique fired rate — sobre chats con `critique_fired` no-null
+    # (la columna admite NULL para queries pre-feature). Si el rate
+    # cae a 0 con muestra significativa, el hook se rompió.
+    crit_rows = conn.execute(
+        "SELECT critique_fired FROM rag_queries "
+        "WHERE ts >= ? "
+        "  AND (cmd = 'chat' OR cmd = 'web' OR cmd LIKE 'web.chat.%') "
+        "  AND critique_fired IS NOT NULL",
+        (cutoff_iso,),
+    ).fetchall()
+    crit_total = len(crit_rows)
+    crit_fired = sum(1 for r in crit_rows if r[0])
+    critique_fired_rate: float | None = None
+    if crit_total > 0:
+        critique_fired_rate = round(crit_fired / crit_total, 3)
+        out["details"]["critique_fired_rate"] = critique_fired_rate
+
+    # 5) Refusal rate — `web.chat.degenerate` es la canned reply
+    # "no puedo responder eso, reformulá". Si supera 50% de los chats
+    # totales, el bot se está rindiendo demasiado.
+    refusals = conn.execute(
+        "SELECT COUNT(*) FROM rag_queries "
+        "WHERE ts >= ? AND cmd = 'web.chat.degenerate'",
+        (cutoff_iso,),
+    ).fetchone()[0]
+    refusal_rate_pct = (
+        round(100.0 * refusals / chats_count, 1) if chats_count else 0.0
+    )
+    out["details"]["refusal_rate_pct"] = refusal_rate_pct
+
+    # 6) Reglas de degradation
+    issues: list[str] = []
+    P95_BASELINE_MS = 3000.0
+    P95_THRESHOLD_MS = P95_BASELINE_MS * 1.3  # 3900ms
+
+    if p95_gen_ms is not None and p95_gen_ms > P95_THRESHOLD_MS:
+        issues.append(
+            f"p95 t_gen {p95_gen_ms:.0f}ms (baseline "
+            f"{P95_BASELINE_MS:.0f}ms × 1.3 = {P95_THRESHOLD_MS:.0f}ms)"
+        )
+    if (
+        critique_fired_rate is not None
+        and crit_total >= 20
+        and critique_fired_rate == 0.0
+    ):
+        issues.append(
+            f"critique nunca dispara: 0/{crit_total} chats con "
+            f"critique_fired=1 (hook roto?)"
+        )
+    if refusal_rate_pct > 50.0 and chats_count >= 20:
+        issues.append(
+            f"refusal rate {refusal_rate_pct:.1f}% > 50% — bot se rinde "
+            f"demasiado ({refusals}/{chats_count} `web.chat.degenerate`)"
+        )
+
+    out["issues"] = issues
+    out["status"] = "degraded" if issues else "healthy"
+    return out
+
+
 def _audit_db_size() -> dict:
     """Tamaño físico de las DBs + WAL files. Detección temprana de bloat."""
     out = {}
@@ -500,6 +871,52 @@ def _render_text(report: dict) -> str:
                 )
         out.append("")
 
+    # Retrieval + Chat health — audit 2026-04-25 R2-Telemetry #5.
+    # Render compacto: ícono + status + 1 línea per issue.
+    def _icon_for(status: str) -> str:
+        s = status.lower()
+        if s == "healthy":
+            return "✓"
+        if s == "degraded":
+            return "⚠"
+        if s == "stale":
+            return "✗"
+        return "?"
+
+    out.append("=== Health checks ===")
+    if ant is not None:
+        ant_status = (ant.get("status") or "unknown").lower()
+        ant_age = ant.get("last_emit_age_hours")
+        suffix = (
+            f"last_emit {ant_age:.0f}h ago"
+            if isinstance(ant_age, (int, float))
+            else "no emits yet"
+        )
+        out.append(f"{_icon_for(ant_status)} Anticipate: {ant_status} ({suffix})")
+    ret = report.get("retrieval_health")
+    if ret is not None:
+        ret_status = (ret.get("status") or "unknown").lower()
+        details = ret.get("details") or {}
+        n = details.get("queries_count") or 0
+        out.append(
+            f"{_icon_for(ret_status)} Retrieval: {ret_status} "
+            f"({n} queries en {report['days']}d)"
+        )
+        for issue in (ret.get("issues") or []):
+            out.append(f"  - {issue}")
+    chat = report.get("chat_health")
+    if chat is not None:
+        chat_status = (chat.get("status") or "unknown").lower()
+        details = chat.get("details") or {}
+        n = details.get("chats_count") or 0
+        out.append(
+            f"{_icon_for(chat_status)} Chat: {chat_status} "
+            f"({n} chats en {report['days']}d)"
+        )
+        for issue in (chat.get("issues") or []):
+            out.append(f"  - {issue}")
+    out.append("")
+
     # DB size
     db = report.get("db_size", {})
     out.append("💽 DB sizes:")
@@ -557,10 +974,39 @@ def _render_text(report: dict) -> str:
                 f"  • Anticipate healthy global, pero {n_issues} signal "
                 f"issue(s) — revisar la sección 🤖 arriba (silent / noisy)."
             )
+    # Audit 2026-04-25 R2-Telemetry #5: hints para retrieval + chat.
+    if ret is not None:
+        ret_status = (ret.get("status") or "").lower()
+        if ret_status == "stale":
+            out.append(
+                "  • Retrieval STALE — 0 queries en la ventana. ¿El web "
+                "server está down o nadie está usando el sistema?"
+            )
+        elif ret_status == "degraded":
+            n_issues = len(ret.get("issues") or [])
+            out.append(
+                f"  • Retrieval DEGRADED — {n_issues} issue(s). Revisar "
+                "cache hit rate, ranker scores, y p95 t_retrieve arriba."
+            )
+    if chat is not None:
+        chat_status = (chat.get("status") or "").lower()
+        if chat_status == "stale":
+            out.append(
+                "  • Chat STALE — 0 chats en la ventana. ¿El endpoint "
+                "/chat está respondiendo? ¿Ollama está corriendo?"
+            )
+        elif chat_status == "degraded":
+            n_issues = len(chat.get("issues") or [])
+            out.append(
+                f"  • Chat DEGRADED — {n_issues} issue(s). Revisar p95 "
+                "t_gen, critique_fired_rate, y refusal_rate arriba."
+            )
     if (
         not err.get("total_errors")
         and not (lat and lat.get("outliers"))
         and (ant is None or ant.get("status") == "healthy")
+        and (ret is None or ret.get("status") == "healthy")
+        and (chat is None or chat.get("status") == "healthy")
     ):
         out.append("  • ✅ Sistema sano. No se requiere acción inmediata.")
     out.append("=" * 72)
@@ -594,6 +1040,8 @@ def main() -> int:
         report["query_latency"] = None
         report["cache_health"] = None
         report["anticipate"] = None
+        report["retrieval_health"] = None
+        report["chat_health"] = None
         report["db_unavailable"] = str(TELEMETRY_DB)
     else:
         try:
@@ -602,10 +1050,17 @@ def main() -> int:
             # rag_anticipate_candidates vive en la misma telemetry.db,
             # así que reusamos la conexión.
             report["anticipate"] = check_anticipate_health(conn, args.days)
+            # Audit 2026-04-25 R2-Telemetry #5: agregamos retrieval +
+            # chat health para detectar degradation silenciosa que el
+            # `check_anticipate_health` no cubría.
+            report["retrieval_health"] = check_retrieval_health(conn, args.days)
+            report["chat_health"] = check_chat_health(conn, args.days)
         except sqlite3.OperationalError as exc:
             report["query_latency"] = None
             report["cache_health"] = None
             report["anticipate"] = None
+            report["retrieval_health"] = None
+            report["chat_health"] = None
             report["db_error"] = repr(exc)
         finally:
             conn.close()

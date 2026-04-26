@@ -181,11 +181,16 @@ document.addEventListener("visibilitychange", () => {
   // Cuando la pestaña se oculta NO cortamos el polling — lo dejamos seguir
   // pero los próximos delays se calculan via pollNextDelay(), que aplica
   // backoff exponencial pasada la ventana de gracia (POLL_HIDDEN_GRACE_MS).
-  // Lo único que cerramos en hidden es el SSE: una conexión persistente
-  // sin uso real cuando la app no está en pantalla.
+  // Lo que SÍ cerramos en hidden son las 3 SSE persistentes (dashboard,
+  // memoria y CPU): conexiones que tickean cada 1-2s sin nadie mirando
+  // la UI son drenaje puro. memOpenStream()/cpuOpenStream() son
+  // idempotentes (cierran la previa antes de abrir una nueva), así que
+  // reabrirlas al volver al frente es seguro.
   if (document.hidden) {
     _hiddenSince = Date.now();
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
+    try { if (MEM && MEM.es) { MEM.es.close(); MEM.es = null; } } catch (_) {}
+    try { if (CPU && CPU.es) { CPU.es.close(); CPU.es = null; } } catch (_) {}
   } else if (!state.paused) {
     // Volvemos al frente: reseteamos el clock del backoff y forzamos un
     // refresh inmediato (likely missed N seconds de cambios mientras
@@ -197,6 +202,12 @@ document.addEventListener("visibilitychange", () => {
     // idempotente — clearTimeout primero y reagenda.
     if (!state.poll) startPolling();
     startStream();
+    // Reabrir mem/cpu streams sólo si ya estaban inicializados — al
+    // boot de la página memInit()/cpuInit() todavía no corrieron y
+    // MEM.chart / CPU.chart son null; abrir el SSE antes del init
+    // dejaría samples sin chart donde renderear.
+    if (MEM && MEM.chart && !MEM.es) memOpenStream();
+    if (CPU && CPU.chart && !CPU.es) cpuOpenStream();
     if (state.waInitDone) {
       // Snapshot fresca + asegurar que el waPoll esté agendado.
       refreshWaScheduled();

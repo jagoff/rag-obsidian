@@ -766,3 +766,46 @@ def test_sanitize_preserves_pixel_data():
     clean = Image.open(io.BytesIO(sanitized))
     assert orig.size == clean.size
     assert orig.mode == clean.mode
+
+
+# ── 9. HEIC sanitization (audit 2026-04-25 R2-OCR #4 followup) ──────────────
+# Cierre del gap: las fotos del iPhone (HEIC default) eran passthrough
+# en `_sanitize_image_exif` y conservaban GPS coords al copiarse al
+# vault iCloud. Con `pillow-heif` instalado, HEIC se re-encodea a JPEG
+# sin EXIF. El test de passthrough cubre el escenario donde la dep no
+# está disponible (CI sin pillow-heif, etc.).
+
+
+def test_sanitize_heic_passthrough_when_pillow_heif_unavailable(monkeypatch):
+    """Sin pillow-heif (`_HEIC_AVAILABLE=False`), HEIC sigue siendo
+    passthrough — mantiene EXIF pero al menos no rompe el upload.
+
+    Audit 2026-04-25 R2-OCR #4 followup: simulamos el escenario con
+    monkeypatch porque en este host la dep ya está instalada y el
+    sanitizer nuevo intentaría re-encodear."""
+    monkeypatch.setattr(_server, "_HEIC_AVAILABLE", False)
+    # Con la dep no disponible, el dict NO debe tener `.heic` mapeado
+    # (igual que antes del followup). Simulamos el dict pre-followup.
+    monkeypatch.setattr(
+        _server,
+        "_SANITIZABLE_FORMATS",
+        {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP", ".gif": "GIF"},
+    )
+    fake_heic = b"\x00\x00\x00\x18ftypheic" + b"\xff" * 200
+    result = _server._sanitize_image_exif(fake_heic, ".heic")
+    assert result == fake_heic  # passthrough: bytes idénticos
+
+
+def test_sanitize_heic_strips_exif_when_pillow_heif_available():
+    """Si pillow-heif está disponible, HEIC se re-encodea a JPEG sin EXIF.
+
+    Audit 2026-04-25 R2-OCR #4 followup. Generar un HEIC válido con
+    EXIF inyectado desde Python requiere libheif con encoder habilitado
+    + APIs no triviales — lo dejamos como TODO si querés cubrir el
+    happy path con un fixture pre-generado en `tests/fixtures/`."""
+    if not _server._HEIC_AVAILABLE:
+        pytest.skip("pillow-heif not installed")
+    pytest.skip(
+        "requires HEIC fixture generation — TODO: agregar"
+        " tests/fixtures/sample_with_gps.heic + assertion de strip"
+    )

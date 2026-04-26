@@ -4,13 +4,43 @@ Alimentan el flujo auto-create + undo: tras crear un reminder/event la UI
 muestra un toast con "Deshacer" que hace DELETE al endpoint
 correspondiente, el cual llama a estos helpers.
 
-Mockeamos `_osascript` + `_apple_enabled`.
+Mockeamos `_osascript` + `_apple_enabled`. Como EventKit framework
+SÍ está disponible en macOS dev (audit 2026-04-25 R2-Calendar #3
+extendió el fast-path EventKit a Reminders también), forzamos el
+fallback AppleScript en estos tests con `_force_applescript_path` —
+esos paths siguen siendo el contract de fallback que queremos cubrir
+y son lo que el caller ve cuando EventKit no carga (deps de pyobjc
+desinstaladas, sandbox raro, macOS futuro).
 """
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 import rag
+
+
+@pytest.fixture(autouse=True)
+def _force_applescript_path(monkeypatch):
+    """Hace que el bloque EventKit en los helpers falle silencioso →
+    cae al fallback AppleScript que estos tests cubren. Evita tener
+    que mockear EKEventStore + EKEvent por separado.
+
+    Implementación: monkeypatcheamos ``objc.lookUpClass`` para que
+    tire LookupError, lo que dispara el ``except Exception: pass`` del
+    bloque EventKit en ``_delete_reminder`` / ``_delete_calendar_event``.
+    Si pyobjc no está importable (no-mac), no hacemos nada — el path
+    EventKit ya falla por ImportError."""
+    try:
+        import objc  # noqa: PLC0415
+
+        def _force_failure(name):
+            raise LookupError(f"forced fail in tests: {name}")
+
+        monkeypatch.setattr(objc, "lookUpClass", _force_failure)
+    except ImportError:
+        pass
 
 
 def _capture_osascript(monkeypatch, return_val="ok"):

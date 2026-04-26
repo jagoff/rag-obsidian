@@ -81,23 +81,47 @@ graph TD
 
 ## Instalación / setup
 
+Quickstart end-to-end (asumiendo macOS + Homebrew + `uv` ya instalado):
+
 ```bash
+# 1. Verificar que Ollama está corriendo y tiene los modelos
+ollama list   # debe incluir bge-m3, qwen2.5:3b, command-r (o qwen2.5:14b / phi4 como fallbacks)
+# Si falta alguno:
+ollama pull bge-m3
+ollama pull qwen2.5:3b
+ollama pull command-r
+
+# 2. Instalar el CLI (binarios: rag, obsidian-rag-mcp)
 cd ~/repositories/obsidian-rag
-uv tool install --reinstall --editable .   # binarios: rag, obsidian-rag-mcp
-rag index                                  # primer indexado del vault
-rag setup                                  # instala launchd: watch + digest
+uv tool install --reinstall --editable .
+
+# 3. Primer indexado del vault (10-30 min según vault size + Mac)
+rag index
+
+# 4. Instalar los 16 daemons (watch, web, digest, morning, today, anticipate,
+#    wa-scheduled-send, ingest-{whatsapp,gmail,calendar,reminders}, etc.)
+#    Idempotente — re-correr recarga.
+rag setup
+
+# 5. Verificar que el sistema está sano
+rag health                       # snapshot unificado: corpus, latencia, feedback, calibration
+launchctl list | grep obsidian-rag    # los 16 servicios deben aparecer
 ```
 
 **Dependencias del sistema** (Homebrew):
-- `ollama` corriendo en `localhost:11434` con `bge-m3`, `qwen2.5:3b`, `command-r:latest` instalados.
-- Python 3.13 vía `uv`.
+- [`ollama`](https://ollama.com) corriendo en `localhost:11434` con `bge-m3`, `qwen2.5:3b`, `command-r:latest` instalados.
+- Python 3.13 vía [`uv`](https://docs.astral.sh/uv/).
+- Para integraciones cross-source opcionales (Gmail/Calendar): credenciales OAuth en `~/.gmail-mcp/` (ver [`docs/design-cross-source-corpus.md`](./docs/design-cross-source-corpus.md)).
+- Para WhatsApp ingest: el bridge `~/whatsapp-listener/` corriendo en `localhost:8080`.
 
 **Para correr tests**:
 ```bash
-.venv/bin/python -m pytest tests/ -q             # full suite (~3s)
+.venv/bin/python -m pytest tests/ -q             # full suite (~100s)
 .venv/bin/python -m pytest tests/test_X.py -q    # un módulo
 .venv/bin/python -m pytest tests/test_X.py::test_Y    # un caso
 ```
+
+**Si algo se rompió durante el setup** (corpus corrupto, daemon que no arranca, dir lleno): ver [`docs/recovery.md`](./docs/recovery.md) — runbook de los 7 modos de falla más probables.
 
 ---
 
@@ -403,28 +427,38 @@ Skips: frontmatter, fenced/inline code, existing wikilinks, markdown links, HTML
 
 | Comando | Función |
 |---|---|
+| `rag health [--since 24] [--as-json]` | **Dashboard unificado de salud** — snapshot de 5s con corpus size + latencia P50/P95 de queries recientes + cache hit rate + feedback stats + progreso hacia gate de fine-tune + estado de calibración + features opt-in activos + training signal flywheel (CTR + orphan opens). Pensado para correr **antes de cualquier debug**. Para deep-dives usar los comandos específicos abajo. |
+| `rag dashboard [--days 30]` | **Analytics de queries** — métricas del pipeline sobre `queries.jsonl`: distribución de intents, hit@k por intent, latencia breakdown, paths más consultados, queries low-confidence agrupadas. Ventana default 30 días. |
+| `rag stats` | Estado del índice: chunks, URLs, vault path, collections, modelos resueltos (chat / helper / embed / reranker), pipeline flags activos. |
 | `rag eval` | Corre `queries.yaml` (singles + chains). Imprime hit@k, MRR, recall@k, chain_success. |
 | `rag eval --hyde --no-multi -k 10 --file otro.yaml` | Variantes. |
 | `rag log [-n 20]` | Tail últimas N queries del jsonl. |
 | `rag log --low-confidence` | Filtra queries con `top_score ≤ CONFIDENCE_RERANK_MIN`. Útil para gap detection. |
-| `rag stats` | Estado: chunks, URLs, vault path, collections, modelos, pipeline. |
+| `rag log --silent-errors [--summary]` | Tail de las excepciones capturadas por `_silent_log` (subsistemas secundarios). |
 | `rag gaps [--threshold 0.015] [--min-count 2] [--days 60]` | Cluster low-confidence queries del log → temas que el vault no responde. |
 | `rag timeline [--query Q] [--tag T] [--folder F] [--limit N]` | Notas ordenadas por mtime. |
 | `rag graph <note-title> [--depth 2] [--output file.html]` | Grafo local en torno a una nota. |
 | `rag autotag <path> [--apply] [--max-tags 6]` | Sugiere tags del vocabulario. |
 | `rag digest [--week YYYY-WNN] [--days 7] [--dry-run]` | Weekly narrative digest. Auto-corre los domingos 22:00 vía launchd. |
+| `rag maintenance [--dry-run] [--as-json]` | DB compact + chat-uploads TTL cleanup (default 30 días, override via `RAG_CHAT_UPLOADS_TTL_DAYS`) + filing batches prune + tmp file cleanup + URL orphans GC. Auto-corre weekly vía launchd. |
 
 ### Automation
 
 | Comando | Función |
 |---|---|
-| `rag setup` | Instala launchd: `com.fer.obsidian-rag-watch` + `com.fer.obsidian-rag-digest`. Idempotente (re-correr recarga). |
-| `rag setup --remove` | Desinstala ambos. |
+| `rag setup` | Instala los 16 launchd plists `com.fer.obsidian-rag-*` (watch, web, digest, morning, today, anticipate, ingest-{whatsapp,gmail,calendar,reminders}, wa-tasks, reminder-wa-push, **wa-scheduled-send**, maintenance, calibrate, auto-harvest, online-tune, …). Idempotente — re-correr recarga. Ver tabla completa en [§Automation (launchd)](#automation-launchd). |
+| `rag setup --remove` | Desinstala todos los servicios. |
+| `rag wa-scheduled-send [--dry-run] [--late-threshold-min 5] [--max-retries 5] [--max-per-run 20]` | Worker manual del envío de mensajes de WhatsApp programados. Lo dispara automáticamente el plist `com.fer.obsidian-rag-wa-scheduled-send` cada 5 min, pero podés correrlo a mano para debug — `--dry-run` calcula sin enviar ni mover status. Idempotente: cada row se mueve `pending`→`sent`/`sent_late`/`failed` en una sola transacción. |
+| `rag remind-wa [--dry-run] [--window-min 5] [--max-overdue-min 1440]` | Worker manual del push de Apple Reminders próximos a vencer al JID ambient. Cron equivalente: `com.fer.obsidian-rag-reminder-wa-push` cada 5 min. Idempotente vía `rag_reminder_wa_pushed`. |
+| `rag ambient {status,disable,test,log}` | Manage del ambient hook (ver [§Ambient Agent](#ambient-agent-co-autor-del-inbox)). |
 
 ```bash
 # Inspección de los servicios
 launchctl list | grep obsidian-rag
-tail -f ~/.local/share/obsidian-rag/{watch,digest}.log
+tail -f ~/.local/share/obsidian-rag/{watch,web,digest,morning,wa-scheduled-send}.log
+
+# Forzar un tick manual de un servicio
+launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-wa-scheduled-send
 ```
 
 ### MCP server
@@ -523,6 +557,10 @@ Complementa a `rag inbox`: `inbox` optimiza para "tag + wikilink + dedup + auto-
 
 ## Configuración (env vars + modelos)
 
+> **Referencia completa de env vars**: [`docs/env-vars.md`](./docs/env-vars.md) — ~95 variables agrupadas por categoría (Core, Modelos, Embedding, Retrieval, Cache, Ambient, OCR, NLI, Telemetry, WhatsApp, Privacy), con default + path:line + descripción. Los recientes del audit 2026-04-25 (`RAG_RERANK_FASTPATH_DIST`, `RAG_AMBIENT_DISABLED`, `RAG_CHAT_UPLOADS_TTL_DAYS`, `RAG_OCR_HISTORICAL_MAX_DAYS`, `RAG_SSE_MAX_PER_IP`, `RAG_CROSS_SOURCE_DEDUP_THRESHOLD`) están destacados al tope. Para guía orientada a usuarios (cuándo tocar qué) ver [`docs/variables-entorno.md`](./docs/variables-entorno.md).
+
+Las **3 más críticas** que casi siempre vas a querer setear:
+
 | Env var | Default | Función |
 |---|---|---|
 | `OBSIDIAN_RAG_VAULT` | iCloud Notes | Override del vault path. Las collections se namespace con sha8 del path. |
@@ -578,21 +616,51 @@ Expuestos por `obsidian-rag-mcp` vía stdio. Registro en `~/.claude.json` (Claud
 
 ## Automation (launchd)
 
-Servicios instalados por `rag setup`:
+`rag setup` instala 16 servicios launchd que cubren indexing continuo, briefs diarios, ingesta cross-source, ambient hooks, fine-tuning offline y workers de WhatsApp. Idempotente — re-correr recarga.
 
 | Label | Comando | Trigger | Logs |
 |---|---|---|---|
 | `com.fer.obsidian-rag-watch` | `rag watch` | RunAtLoad + KeepAlive | `~/.local/share/obsidian-rag/watch.{log,error.log}` |
+| `com.fer.obsidian-rag-serve` | `rag serve` | RunAtLoad + KeepAlive | `~/.local/share/obsidian-rag/serve.{log,error.log}` |
+| `com.fer.obsidian-rag-web` | `rag web` (FastAPI 8765) | RunAtLoad + KeepAlive | `~/.local/share/obsidian-rag/web.{log,error.log}` |
 | `com.fer.obsidian-rag-digest` | `rag digest` | StartCalendarInterval `domingo 22:00 local` | `~/.local/share/obsidian-rag/digest.{log,error.log}` |
 | `com.fer.obsidian-rag-morning` | `rag morning` | StartCalendarInterval `lun-vie 07:00 local` | `~/.local/share/obsidian-rag/morning.{log,error.log}` |
+| `com.fer.obsidian-rag-today` | `rag today` | `lun-dom 21:00 local` | `~/.local/share/obsidian-rag/today.{log,error.log}` |
+| `com.fer.obsidian-rag-wake-up` | wake-up brief | calendar interval | `~/.local/share/obsidian-rag/wake-up.{log,error.log}` |
+| `com.fer.obsidian-rag-anticipate` | `rag anticipate` (anticipatory agent) | calendar interval | `~/.local/share/obsidian-rag/anticipate.{log,error.log}` |
+| `com.fer.obsidian-rag-emergent` | detector de emergent topics | nightly | `~/.local/share/obsidian-rag/emergent.{log,error.log}` |
+| `com.fer.obsidian-rag-patterns` | mining de patrones de routing | nightly | `~/.local/share/obsidian-rag/patterns.{log,error.log}` |
+| `com.fer.obsidian-rag-archive` | archive sweep | weekly | `~/.local/share/obsidian-rag/archive.{log,error.log}` |
+| `com.fer.obsidian-rag-consolidate` | consolidate conversations | weekly | `~/.local/share/obsidian-rag/consolidate.{log,error.log}` |
+| `com.fer.obsidian-rag-maintenance` | `rag maintenance` (DB compact + chat-uploads TTL + filing batches prune) | weekly | `~/.local/share/obsidian-rag/maintenance.{log,error.log}` |
+| `com.fer.obsidian-rag-calibrate` | `scripts/calibrate_thresholds.py` | nightly | `~/.local/share/obsidian-rag/calibrate.{log,error.log}` |
+| `com.fer.obsidian-rag-auto-harvest` | LLM-as-judge harvest de queries low-conf | `03:30 local` | `~/.local/share/obsidian-rag/auto-harvest.{log,error.log}` |
+| `com.fer.obsidian-rag-online-tune` | online tune del reranker | nightly | `~/.local/share/obsidian-rag/online-tune.{log,error.log}` |
+| `com.fer.obsidian-rag-ingest-whatsapp` | ingesta WhatsApp via bridge | StartInterval | `~/.local/share/obsidian-rag/ingest-whatsapp.{log,error.log}` |
+| `com.fer.obsidian-rag-ingest-gmail` | ingesta Gmail via OAuth | StartInterval | `~/.local/share/obsidian-rag/ingest-gmail.{log,error.log}` |
+| `com.fer.obsidian-rag-ingest-calendar` | ingesta Calendar via OAuth | StartInterval | `~/.local/share/obsidian-rag/ingest-calendar.{log,error.log}` |
+| `com.fer.obsidian-rag-ingest-reminders` | ingesta Reminders local (EventKit) | StartInterval | `~/.local/share/obsidian-rag/ingest-reminders.{log,error.log}` |
+| `com.fer.obsidian-rag-wa-tasks` | extracción de action items desde WhatsApp | `*/30min` | `~/.local/share/obsidian-rag/wa-tasks.{log,error.log}` |
+| `com.fer.obsidian-rag-reminder-wa-push` | push de reminders próximos al vencer al JID ambient | `*/5min` | `~/.local/share/obsidian-rag/reminder-wa-push.{log,error.log}` |
+| `com.fer.obsidian-rag-wa-scheduled-send` | **worker de WhatsApp programados** — pickea rows `pending` con `scheduled_for_utc <= now` y los envía al bridge; idempotente (`pending`→`sent`/`sent_late`/`failed` en una sola transacción); tras 5 reintentos consecutivos fallidos pasa a `failed` | `*/5min` | `~/.local/share/obsidian-rag/wa-scheduled-send.{log,error.log}` |
+
+**Flujo completo de WhatsApp programado** (end-to-end):
+
+1. El user agenda un mensaje (UI web `/scheduled` o endpoint `/api/whatsapp/schedule`) → row insertada en `rag_wa_scheduled_messages` con `status='pending'`, `scheduled_for_utc`, `contact_jid`, `message_text`.
+2. El daemon `com.fer.obsidian-rag-wa-scheduled-send` corre cada 5 min y ejecuta `rag wa-scheduled-send`. Internamente: SELECT rows con `status='pending' AND scheduled_for_utc <= now()`, capadas a `--max-per-run=20`.
+3. Por cada row pickeada → POST al WhatsApp bridge (`localhost:8080/api/send`) con el body. Si OK: marca `sent` (o `sent_late` si el delta `now - scheduled_for` supera `--late-threshold-min=5`). Si falla: incrementa `attempt_count`, queda `pending`. Tras `--max-retries=5` consecutivos pasa a `failed` y deja de pickearse.
+4. El cuerpo del mensaje **NUNCA se persiste en logs** (privacidad) — solo metadata operativa (`id`, `delta_minutes`, `attempt_count`).
+5. El `rag today` brief incluye un widget "WhatsApp pendientes hoy" que destaca rows que quedaron `pending` cuando ya deberían haber salido — señal de que el worker no está corriendo. Ver [recovery.md §2](./docs/recovery.md#2-el-daemon-wa-scheduled-send-no-está-enviando-mensajes-programados) para el fix.
 
 ```bash
-rag setup                      # install/recarga
+rag setup                      # install/recarga (los 16 servicios)
 rag setup --remove             # uninstall
 launchctl list | grep obsidian-rag
 launchctl unload ~/Library/LaunchAgents/com.fer.obsidian-rag-watch.plist
 launchctl load   ~/Library/LaunchAgents/com.fer.obsidian-rag-watch.plist
 ```
+
+**Tunnel público (opcional)**: si querés exponer el web server vía `cloudflared`, los plists `com.fer.obsidian-rag-cloudflare-tunnel` + `com.fer.obsidian-rag-cloudflare-tunnel-watcher` se manejan aparte ([CLAUDE.md §Cloudflare tunnel](./CLAUDE.md)). Para cortar la exposición sin desinstalar, ver [recovery.md §4](./docs/recovery.md#4-el-cloudflare-tunnel-está-corriendo-y-no-querés-exposición-pública).
 
 ---
 
@@ -752,6 +820,8 @@ Single-bot consolidado en `~/whatsapp-listener/listener.ts` (Bun + TypeScript). 
 - **Tests**: `~/whatsapp-listener/listener.test.ts` cubre URL regexes, `ragRead/Followup/Today`, `enableAmbient`. `bun test listener.test.ts`.
 
 ## Troubleshooting
+
+> Para **runbook de los 7 modos de falla destructivos** (DBs borradas, daemon `wa-scheduled-send` que no envía, web colgado, cloudflare tunnel a desactivar, `chat-uploads/` lleno, tests rotos post-pull, restaurar de backup): ver [`docs/recovery.md`](./docs/recovery.md). Para problemas comunes de uso diario (queries lentas, alucinaciones, reranker en CPU, sesiones que no resumen): ver [`docs/problemas-comunes.md`](./docs/problemas-comunes.md). La tabla de abajo es el quick-lookup de una línea.
 
 | Síntoma | Causa probable | Fix |
 |---|---|---|

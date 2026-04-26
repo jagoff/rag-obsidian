@@ -7626,6 +7626,24 @@ main:focus-visible {
   outline: none;
   border-color: var(--green);
 }
+/* iOS <16 fallback: cuando el datetime-local rompe el popover, Agent B
+   armó un wrapper con <input type="date"> + <input type="time"> inline.
+   Sin esto los inputs hijos heredan el estilo crudo del UA (border gris
+   medio random, padding mínimo) y rompen visualmente la armonía con el
+   resto del popover. Matcheamos border/padding/radius/font con
+   .proposal-wa-schedule-input de arriba; el .wa-resched-input-split es
+   el equivalente para el modal de reschedule (mismo split, otra clase). */
+.proposal-wa-schedule-input-split > input,
+.wa-resched-input-split > input {
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  min-width: 100px;
+}
 .proposal-wa-schedule-err {
   color: var(--red);
   font-size: 12px;
@@ -7674,7 +7692,9 @@ main:focus-visible {
    send/cancel buttons en el mismo media query alrededor de la línea
    ~2228). */
 @media (max-width: 480px), (pointer: coarse) {
-  .proposal-wa-schedule-input {
+  .proposal-wa-schedule-input,
+  .proposal-wa-schedule-input-split > input,
+  .wa-resched-input-split > input {
     font-size: 16px;
   }
   .proposal-wa-clock-btn,

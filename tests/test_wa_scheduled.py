@@ -1085,6 +1085,140 @@ def test_run_due_worker_send_failure_returns_to_pending(
     assert row["attempt_count"] == 1
 
 
+# ── E2E: run_due_worker invoca _notify_ambient_scheduled_outcome en los
+# paths sent + sent_late (audit 2026-04-25 R2-Tests #3) ────────────────
+#
+# Los 6 tests unit-level de `_notify_ambient_scheduled_outcome`
+# (test_notify_ambient_*) cubren la lógica interna del notificador
+# aislada (config off, self-loop, formato del mensaje, etc.) y el commit
+# anterior agregó `test_notify_ambient_called_on_failed_after_max_retries`
+# para el path 'failed'. Faltaban los 2 paths restantes: 'sent' (delta
+# corto, dentro del threshold) y 'sent_late' (delta > 5min). Sin estos
+# E2E, un refactor en `run_due_worker` que mueva las llamadas
+# `_notify_ambient_scheduled_outcome(sched, "sent"|"sent_late", ...)`
+# afuera del scope correcto pasa silencioso hasta producción — los
+# tests existentes verifican la transición de status pero no el side
+# effect de la notificación al ambient JID.
+
+
+def test_run_due_worker_notifies_ambient_on_successful_send(
+    isolated_state_db, monkeypatch,
+):
+    """E2E (audit 2026-04-25 R2-Tests #3, path 'sent'): row pending
+    recién due (scheduled_for ~ now) → bridge OK → `run_due_worker`
+    debe invocar `_notify_ambient_scheduled_outcome` exactamente una
+    vez con `status="sent"`, `delta_minutes` cercano a 0 (dentro del
+    late_threshold de 5min), `attempt_count=1`, y el sched original
+    (con jid + scheduled_for_utc) como primer arg.
+    """
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(0),  # justo ahora — recién due
+        jid="540000@s.whatsapp.net",
+        message_text="hola justo a tiempo",
+    )
+
+    # Bridge OK.
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid",
+        lambda *a, **kw: True,
+    )
+
+    # Spy sobre la notif para capturar status + kwargs.
+    notif_calls: list[dict] = []
+
+    def _spy(sched, status, **kwargs):
+        notif_calls.append({"sched": sched, "status": status, **kwargs})
+
+    monkeypatch.setattr(
+        wa_scheduled, "_notify_ambient_scheduled_outcome", _spy,
+    )
+
+    summary = wa_scheduled.run_due_worker()
+    assert summary["sent"] == 1, (
+        f"esperaba 1 row enviado dentro del threshold, got {summary!r}"
+    )
+    assert summary["sent_late"] == 0
+    assert summary["failed"] == 0
+
+    assert len(notif_calls) == 1, (
+        f"esperaba 1 notif para status='sent', got {len(notif_calls)}"
+    )
+    call = notif_calls[0]
+    assert call["status"] == "sent"
+    assert call["sched"]["id"] == sid
+    assert call["sched"]["jid"] == "540000@s.whatsapp.net"
+    # Delta cerca de 0 (recién due): puede ser 0 o muy poco. El
+    # threshold para 'sent' es < 5min — confirmamos que estamos
+    # dentro de ese rango sin acoplarnos al valor exacto (que depende
+    # de cuánto tarda el test en correr entre _seed_row y run_due_worker).
+    assert "delta_minutes" in call
+    assert abs(call["delta_minutes"]) < 5, (
+        f"delta_minutes={call['delta_minutes']} fuera del threshold 'sent' "
+        f"(<5min) — el test corrió demasiado lento o el seed/run quedó "
+        f"desincronizado"
+    )
+    assert call.get("attempt_count") == 1
+
+
+def test_run_due_worker_notifies_ambient_on_late_send(
+    isolated_state_db, monkeypatch,
+):
+    """E2E (audit 2026-04-25 R2-Tests #3, path 'sent_late'): row
+    pending con scheduled_for hace 60min (delta >> threshold de 5min)
+    → bridge OK → `run_due_worker` debe invocar
+    `_notify_ambient_scheduled_outcome` con `status="sent_late"`
+    (NO 'sent') y `delta_minutes >= 60`.
+
+    Este path se dispara cuando la Mac estuvo dormida durante la
+    ventana del scheduled_for y el worker se entera tarde — el
+    feedback al user via ambient JID le explica el delay.
+    """
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(60),  # 1h atrás → late
+        jid="540000@s.whatsapp.net",
+        message_text="hola tarde",
+    )
+
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._whatsapp_send_to_jid",
+        lambda *a, **kw: True,
+    )
+
+    notif_calls: list[dict] = []
+
+    def _spy(sched, status, **kwargs):
+        notif_calls.append({"sched": sched, "status": status, **kwargs})
+
+    monkeypatch.setattr(
+        wa_scheduled, "_notify_ambient_scheduled_outcome", _spy,
+    )
+
+    summary = wa_scheduled.run_due_worker()
+    assert summary["sent"] == 0
+    assert summary["sent_late"] == 1, (
+        f"esperaba sent_late=1 con delta de 60min, got {summary!r}"
+    )
+
+    assert len(notif_calls) == 1, (
+        f"esperaba 1 notif para status='sent_late', got {len(notif_calls)}"
+    )
+    call = notif_calls[0]
+    assert call["status"] == "sent_late", (
+        f"con delta=60min el status notificado debe ser 'sent_late', "
+        f"got {call['status']!r}"
+    )
+    assert call["sched"]["id"] == sid
+    # Delta debería ser ~60min (puede tener algunos segundos de drift por
+    # el tiempo entre _seed_row y run_due_worker).
+    assert call["delta_minutes"] >= 60, (
+        f"delta_minutes={call['delta_minutes']} debería ser >= 60min "
+        f"(scheduled_for fue hace 1h)"
+    )
+    assert call.get("attempt_count") == 1
+
+
 # ── Reply-to + scheduled_for: persiste E ENVÍA correctamente ──────────
 
 

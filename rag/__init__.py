@@ -33838,6 +33838,89 @@ def _create_calendar_event(
     if end < start:
         return False, "end date antes de start date"
 
+    # ── Fast path: EventKit (audit 2026-04-25 R2-Calendar #2) ──────────
+    # AppleScript create no es tan lento como el delete (que escaneaba
+    # por uid 55-58s en calendarios grandes). Pero el timeout defensivo
+    # de 20s sigue siendo demasiado para casos donde Calendar.app está
+    # lento o la cuenta tiene CalDAV remotos (iCloud sync pendiente).
+    # EventKit nativo crea el evento en ~50-100ms con commit local.
+    #
+    # Skip EventKit para recurrencias — EKRecurrenceRule es complejo de
+    # mappear desde nuestro dict {freq, interval, byday}. AppleScript
+    # toma un RRULE string así nomás. Las recurrencias caen al fallback.
+    if recurrence is None:
+        try:
+            import objc  # noqa: PLC0415
+            from Foundation import NSBundle, NSDate, NSURL  # noqa: PLC0415
+
+            ek_bundle = NSBundle.bundleWithPath_(
+                "/System/Library/Frameworks/EventKit.framework"
+            )
+            if ek_bundle is not None and ek_bundle.load():
+                EKEventStore = objc.lookUpClass("EKEventStore")
+                EKEvent = objc.lookUpClass("EKEvent")
+                store = EKEventStore.alloc().init()
+                ev = EKEvent.eventWithEventStore_(store)
+                ev.setTitle_(nm)
+                # NSDate desde epoch — cubrimos tz porque datetime ya
+                # viene tz-aware del caller (parseado con _AR_OFFSET).
+                ev.setStartDate_(
+                    NSDate.dateWithTimeIntervalSince1970_(start.timestamp())
+                )
+                ev.setEndDate_(
+                    NSDate.dateWithTimeIntervalSince1970_(end.timestamp())
+                )
+                if all_day:
+                    ev.setAllDay_(True)
+                if location:
+                    ev.setLocation_(location)
+                if notes:
+                    ev.setNotes_(notes)
+                # Calendar destino: el primero con allowsContentModifications
+                # cuando el caller no pidió uno específico. Si pidió uno,
+                # buscalo por título — match exacto, case-sensitive.
+                target_cal = None
+                if calendar:
+                    cals = store.calendarsForEntityType_(0)  # 0=event
+                    for c in cals:
+                        if str(c.title()) == calendar:
+                            target_cal = c
+                            break
+                else:
+                    target_cal = store.defaultCalendarForNewEvents()
+                if target_cal is None:
+                    # No matchea — caemos al AppleScript path para tener
+                    # el mismo selector "first writable" que tenía antes.
+                    raise RuntimeError("calendar no encontrado en EventKit")
+                ev.setCalendar_(target_cal)
+
+                # Save: span=0 (ThisEventOnly, no aplica a recurrencias
+                # porque skipeamos esa rama). commit=True para flush
+                # inmediato al store. err=None devuelve tuple en pyobjc.
+                ok = store.saveEvent_span_commit_error_(ev, 0, True, None)
+                if isinstance(ok, tuple):
+                    ok_flag = bool(ok[0])
+                    err = ok[1] if len(ok) > 1 else None
+                else:
+                    ok_flag = bool(ok)
+                    err = None
+                if ok_flag:
+                    # eventIdentifier es el UUID que devuelve AppleScript
+                    # `uid of _ev` — verificado en `_delete_calendar_event`
+                    # que ese identifier funciona contra `eventWithIdentifier_`.
+                    return True, str(ev.eventIdentifier())
+                if err is not None and hasattr(err, "localizedDescription"):
+                    # No tan crítico — caemos al fallback AppleScript.
+                    pass
+        except Exception:
+            # Cualquier error en EventKit → fallback silencioso.
+            pass
+
+    # ── Fallback: AppleScript (timeout reducido 20s→8s) ──────────────
+    # Audit 2026-04-25: 20s era margen excesivo. Si AppleScript no
+    # respondió en 8s, hay un problema real (Calendar.app frozen,
+    # autocompletion lock, etc.) y prefiero fallar rápido para que el
+    # caller decida (retry / show error / queue).
     safe_title = nm.replace("\\", "\\\\").replace('"', '\\"')
 
     # Calendar selector: named or first-writable fallback.
@@ -33885,7 +33968,7 @@ def _create_calendar_event(
         '  end try\n'
         'end tell\n'
     )
-    out = _osascript(script, timeout=20.0)
+    out = _osascript(script, timeout=8.0)
     if out.startswith("err:"):
         return False, out[4:].strip() or "error creando evento"
     if out:
@@ -33901,14 +33984,64 @@ def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
     `_create_reminder`, the UI shows a 10s toast with a Deshacer button;
     click dispatches `DELETE /api/reminders/{id}` which calls this.
 
-    Silent-fail on osascript errors (reminder already deleted, bad id)
-    so the endpoint surfaces a clean message without stack traces.
+    Implementation note (2026-04-25 R2-Calendar #3): aplicamos el mismo
+    patrón EventKit del `_delete_calendar_event` — Reminders.app via
+    AppleScript también escanea linealmente sobre `id`, lento en
+    cuentas grandes. EventKit/EKReminder con `calendarItemWithIdentifier_`
+    es lookup indexado, ~50ms en lugar de varios segundos.
+
+    EventKit framework cubre tanto Calendar como Reminders (mismo bundle,
+    mismo EKEventStore). Si carga, su respuesta es autoritativa.
+    Fallback a AppleScript con timeout reducido (15s→5s) para casos
+    donde el framework no carga.
     """
     rid = (reminder_id or "").strip()
     if not rid:
         return False, "reminder id vacío"
     if not _apple_enabled():
         return False, "Apple integration deshabilitada"
+
+    # ── Fast path: EventKit ──────────────────────────────────────────
+    # Solo retornamos desde acá en caso de éxito O de "reminder no
+    # encontrado" (autoritativo). Cualquier otro error cae al fallback
+    # AppleScript silenciosamente.
+    try:
+        import objc  # noqa: PLC0415
+        from Foundation import NSBundle  # noqa: PLC0415
+
+        ek_bundle = NSBundle.bundleWithPath_(
+            "/System/Library/Frameworks/EventKit.framework"
+        )
+        if ek_bundle is not None and ek_bundle.load():
+            EKEventStore = objc.lookUpClass("EKEventStore")
+            store = EKEventStore.alloc().init()
+            # Reminders heredan de EKCalendarItem — el lookup correcto
+            # es calendarItemWithIdentifier_, NO eventWithIdentifier_
+            # (ese es solo para EKEvent del Calendar app).
+            item = store.calendarItemWithIdentifier_(rid)
+            if item is None:
+                return False, "reminder no encontrado"
+            # removeReminder_commit_error_ es el método específico para
+            # EKReminder (no removeEvent). Soporta el mismo pyobjc tuple
+            # return pattern.
+            ok = store.removeReminder_commit_error_(item, True, None)
+            if isinstance(ok, tuple):
+                ok_flag = bool(ok[0])
+                err = ok[1] if len(ok) > 1 else None
+            else:
+                ok_flag = bool(ok)
+                err = None
+            if ok_flag:
+                return True, "borrada"
+            if err is not None and hasattr(err, "localizedDescription"):
+                return False, f"EventKit: {err.localizedDescription()}"
+            # Falló el remove sin error útil — caer al fallback.
+    except Exception:
+        # Cualquier error en el path EventKit (framework no carga,
+        # pyobjc roto, lookup falla, etc) → fallback silencioso.
+        pass
+
+    # ── Fallback: AppleScript (timeout reducido 15s→5s) ──────────────
     safe = rid.replace('"', '\\"')
     script = (
         'tell application "Reminders"\n'
@@ -33921,7 +34054,7 @@ def _delete_reminder(reminder_id: str) -> tuple[bool, str]:
         '  end try\n'
         'end tell\n'
     )
-    out = _osascript(script, timeout=15.0)
+    out = _osascript(script, timeout=5.0)
     if out == "ok":
         return True, "borrada"
     if out.startswith("err:"):
@@ -33967,13 +34100,9 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
         return False, "Apple integration deshabilitada"
 
     # ── Path rápido: EventKit (~160ms con calendar de 1363 eventos) ──
-    # Si el framework carga, su respuesta es autoritativa: ev is None
-    # significa "ese uid no existe en este EventStore", devolvemos
-    # error inmediatamente sin caer al fallback lento. Solo caemos al
-    # AppleScript path cuando el framework EN SÍ no se pudo cargar
-    # (escenario muy raro: macOS futuro lo deprecó, sandbox bloqueó
-    # `/System/Library/Frameworks`, etc.).
-    eventkit_loaded = False
+    # Si el framework carga + el lookup retorna None, devolvemos
+    # "evento no encontrado" autoritativo (no scan AppleScript inútil).
+    # Cualquier otro error en el path → fallback silencioso al AppleScript.
     try:
         import objc  # noqa: PLC0415
         from Foundation import NSBundle  # noqa: PLC0415
@@ -33982,7 +34111,6 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
             "/System/Library/Frameworks/EventKit.framework"
         )
         if ek_bundle is not None and ek_bundle.load():
-            eventkit_loaded = True
             EKEventStore = objc.lookUpClass("EKEventStore")
             store = EKEventStore.alloc().init()
             ev = store.eventWithIdentifier_(uid)
@@ -34006,15 +34134,10 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
                 return True, "borrado"
             if err is not None and hasattr(err, "localizedDescription"):
                 return False, f"EventKit: {err.localizedDescription()}"
-            return False, "EventKit removeEvent retornó False"
+            # Remove falló sin error útil — caer al fallback.
     except Exception:
         # Si el framework no cargó / pyobjc roto / etc → fallback.
         pass
-
-    if eventkit_loaded:
-        # EventKit cargó pero algo raro pasó arriba (no debería). No
-        # caer al AppleScript lento — el path EventKit es autoritativo.
-        return False, "EventKit path loaded but failed unexpectedly"
 
     # ── Fallback: AppleScript scan linear (lento pero compat) ──────
     safe = uid.replace('"', '\\"')

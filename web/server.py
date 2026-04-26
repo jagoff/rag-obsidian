@@ -56,6 +56,20 @@ except Exception:  # pragma: no cover - tqdm not installed
     pass
 # === END LOKY SEMAPHORE LEAK FIX ============================================
 
+# pillow-heif registra el HEIC/HEIF reader/writer en PIL. Audit 2026-04-25
+# R2-OCR #4 followup: sin esto, las fotos del iPhone (HEIC default) eran
+# passthrough en `_sanitize_image_exif` y conservaban GPS coords al
+# copiarse al vault iCloud. Lo registramos UNA sola vez al import del
+# módulo — `register_heif_opener()` es idempotente pero igual lo
+# guardeamos detrás del flag `_HEIC_AVAILABLE` para que el sanitizer
+# (y sus tests) puedan detectar cuándo el plugin está disponible.
+try:
+    import pillow_heif as _pillow_heif  # noqa: PLC0415
+    _pillow_heif.register_heif_opener()
+    _HEIC_AVAILABLE = True
+except ImportError:
+    _HEIC_AVAILABLE = False
+
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -2518,9 +2532,21 @@ try:
 except (TypeError, ValueError):
     _CHAT_UPLOAD_HISTORICAL_DAYS = _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT
 
-# Mapeo suffix → format param de PIL.save (los formatos que PIL maneja
-# nativamente sin plugins extra). HEIC NO está acá porque PIL sin
-# pillow_heif no puede leerlo — para HEIC dejamos los bytes originales.
+# Mapeo suffix → format param de PIL.save. HEIC/HEIF se agregan
+# condicionalmente si `pillow-heif` está instalado (audit 2026-04-25
+# R2-OCR #4 followup) y se mappean a "JPEG" porque PIL puede *leer* HEIC
+# con pillow-heif pero el writer HEIF requiere libheif con el encoder
+# habilitado, que no siempre está. Re-encodear a JPEG es lossy pero
+# ganamos privacidad (EXIF/GPS strippeado) + compatibilidad universal
+# (todo browser y Obsidian renderean JPEG sin plugins).
+#
+# Trade-off deliberado: el archivo en el vault termina con extensión
+# `.heic` PERO el contenido es JPEG. Es confuso pero el alternativo
+# (cambiar la extensión) requiere romper el contrato `(bytes, suffix)
+# → bytes` del sanitizer. Obsidian/Safari renderean igual porque
+# detectan por magic bytes, no por extensión. Si en el futuro queremos
+# extensión consistente, el caller (`upload_chat_image`) debería
+# decidir el suffix final basado en `_HEIC_AVAILABLE`.
 _SANITIZABLE_FORMATS: dict[str, str] = {
     ".jpg": "JPEG",
     ".jpeg": "JPEG",
@@ -2528,6 +2554,9 @@ _SANITIZABLE_FORMATS: dict[str, str] = {
     ".webp": "WEBP",
     ".gif": "GIF",
 }
+if _HEIC_AVAILABLE:
+    _SANITIZABLE_FORMATS[".heic"] = "JPEG"
+    _SANITIZABLE_FORMATS[".heif"] = "JPEG"
 
 
 def _sanitize_image_exif(raw_bytes: bytes, suffix: str) -> bytes:
@@ -2548,7 +2577,8 @@ def _sanitize_image_exif(raw_bytes: bytes, suffix: str) -> bytes:
       Bytes sanitizados si el formato es soportado, o ``raw_bytes`` sin
       cambios si:
 
-      - El suffix no está en ``_SANITIZABLE_FORMATS`` (HEIC, HEIF, etc.)
+      - El suffix no está en ``_SANITIZABLE_FORMATS`` (HEIC/HEIF solo si
+        pillow-heif está instalado; ver ``_HEIC_AVAILABLE``)
       - PIL falla al cargar la imagen (corrupta, formato exótico)
       - Hay cualquier otra excepción durante el re-encoding
 
@@ -2652,14 +2682,15 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
     # cronológicamente en el inbox. Idempotente — si ya existe (hash
     # igual = mismo contenido), no lo re-escribimos.
     #
-    # **EXIF sanitization (audit 2026-04-25 #5)**: las fotos del iPhone
-    # incluyen EXIF con GPS coords + fecha + cámara. El vault sincroniza
-    # con iCloud, así que sin sanitización los metadatos viajan a la
-    # nube. PIL re-codifica la imagen sin EXIF (formato JPEG/PNG/WebP/
-    # GIF). Para HEIC del iPhone (formato default), PIL sin pillow_heif
-    # no puede leer → caemos al original con EXIF (mejor que rechazar
-    # el upload entero); el user puede convertir a JPEG en Settings →
-    # Camera → Formats → "Most Compatible" si la privacidad importa.
+    # **EXIF sanitization (audit 2026-04-25 #5 + #4 followup)**: las fotos
+    # del iPhone incluyen EXIF con GPS coords + fecha + cámara. El vault
+    # sincroniza con iCloud, así que sin sanitización los metadatos
+    # viajan a la nube. PIL re-codifica la imagen sin EXIF (JPEG/PNG/
+    # WebP/GIF nativos; HEIC/HEIF si `pillow-heif` está instalado, en
+    # cuyo caso re-encodeamos a JPEG — ver comentario en
+    # `_SANITIZABLE_FORMATS`). Si pillow-heif no está disponible, HEIC
+    # cae al passthrough original con EXIF (mejor que rechazar el upload
+    # entero).
     try:
         import rag as _rag  # noqa: PLC0415
         from datetime import datetime as _dt  # noqa: PLC0415

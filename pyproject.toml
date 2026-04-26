@@ -51,6 +51,14 @@ dependencies = [
     # followup. Pillow se pulla transitivamente; explicitamos solo el
     # plugin HEIF.
     "pillow-heif>=1.0",
+    # openpyxl parsea los `Último resumen - <Marca> <Últimos4>.xlsx` que
+    # el banco emite y el user deja en iCloud `/Finances` junto a los
+    # CSV de MOZE — los consume `_fetch_credit_cards` (web/server.py)
+    # para el panel home `tarjetas` + el tool `credit_cards_summary`.
+    # Wheel ~600KB + et_xmlfile transitiva (~30KB), BSD, sin deps
+    # pesadas. Lo dejamos core (no opt-in) porque es el único parser
+    # nativo de xlsx y el overhead es ínfimo.
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

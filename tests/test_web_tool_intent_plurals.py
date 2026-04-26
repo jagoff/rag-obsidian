@@ -89,6 +89,19 @@ _PLURAL_CASES: list[tuple[str, str]] = [
     ("cómo está el clima", "weather"),
     ("va a llover mañana?", "weather"),
     ("temperatura para hoy", "weather"),
+
+    # credit_cards_summary — tarjetas de crédito. Disparado por `tarjet*`,
+    # marcas (Visa/Master/Amex), "saldo a pagar", "fecha de cierre/vencim",
+    # "resumen de tarjeta", "cuánto debo".
+    ("cuánto tengo que pagar de la tarjeta?", "credit_cards_summary"),
+    ("cuáles son mis tarjetas?", "credit_cards_summary"),
+    ("saldo a pagar de la Visa", "credit_cards_summary"),
+    ("cuánto debo este mes?", "credit_cards_summary"),
+    ("fecha de cierre de la Visa", "credit_cards_summary"),
+    ("fecha de vencimiento de la tarjeta", "credit_cards_summary"),
+    ("resumen de tarjeta de Visa", "credit_cards_summary"),
+    ("cuándo vence mi Visa?", "credit_cards_summary"),
+    ("mi resumen de Master", "credit_cards_summary"),
 ]
 
 
@@ -141,11 +154,14 @@ def test_hint_none_when_no_tools():
 
 
 def test_hint_none_for_non_source_specific_tools():
-    """weather y finance_summary no son source-specific: el user no pregunta
-    'busqué en el clima y no encontré nada', así que el hint no aplica.
+    """weather, finance_summary y credit_cards_summary no son source-specific:
+    el user no pregunta 'busqué en el clima y no encontré nada', así que el
+    hint no aplica. Idem tarjetas — son resúmenes derivados, no una "fuente"
+    que el user busca y donde puede haber ausencia significativa.
     """
     assert _build_source_intent_hint(["weather"]) is None
     assert _build_source_intent_hint(["finance_summary"]) is None
+    assert _build_source_intent_hint(["credit_cards_summary"]) is None
     assert _build_source_intent_hint(["weather", "finance_summary"]) is None
 
 

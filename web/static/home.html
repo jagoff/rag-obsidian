@@ -708,13 +708,14 @@
     #panel-drive .head h3 { color: var(--purple); }
 
     /* health — muted (deterministic metrics, low cognitive weight) */
-    #panel-pagerank, #panel-evaltrend, #panel-weather, #panel-finance {
+    #panel-pagerank, #panel-evaltrend, #panel-weather, #panel-finance, #panel-cards {
       border-left-color: color-mix(in srgb, var(--text-dim) 50%, transparent);
     }
     #panel-pagerank .head h3,
     #panel-evaltrend .head h3,
     #panel-weather .head h3,
-    #panel-finance .head h3 { color: var(--text-dim); }
+    #panel-finance .head h3,
+    #panel-cards .head h3 { color: var(--text-dim); }
 
     /* Empty panels fade back so active channels pop. Min-height
        shrinks so a row of empties doesn't waste vertical space. */
@@ -757,6 +758,7 @@
         <a class="topbar-link" href="/learning">learning →</a>
         <a class="topbar-link" href="/transcripts">transcripts →</a>
         <a class="topbar-link" href="/status">status →</a>
+        <a class="topbar-link" href="/logs">logs →</a>
         <a class="topbar-link" href="https://ra.ai/agents/">agents →</a>
       </div>
     </div>

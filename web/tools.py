@@ -35,10 +35,11 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 21 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 22 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
+- tarjeta/Visa/Mastercard/Amex/saldo a pagar/cierre/vencimiento del resumen → credit_cards_summary
 - pendiente/tarea/recordatorio/to-do/checklist → reminders_due
 - mail/correo/email/gmail/inbox → gmail_recent
 - evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
@@ -82,7 +83,7 @@ Enviar emails via Gmail (misma lógica — acción destructiva, SIEMPRE pide con
 - El tool NO envía: devuelve una proposal card con [Enviar] / [Editar] / [Descartar]. Mismo flow que WhatsApp — el user confirma con click. Hasta que toque Enviar no sale nada.
 - Respuesta textual 1-2 oraciones: "Te armé el mail para <to>, revisá y dale Enviar." Sin repetir el cuerpo — la card lo muestra.
 
-Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/calendar/reminders/weather) van en PROSA, sin markdown links.
+Regla de citas (CRÍTICA): cita SOLO paths reales del vault devueltos por search_vault/read_note (ej. `[Algo](02-Areas/X/Algo.md)`). NUNCA cites identificadores internos ni nombres de tools: **PROHIBIDO** `[calendar_ahead](...)`, `[reminders_due](...)`, `[gmail_recent](...)`, `[finance_summary](...)`, `[credit_cards_summary](...)`, `[weather](...)`, `[propose_reminder](...)`, `[propose_calendar_event](...)`, thread_id, event_id, proposal_id, ni nada con `.md` que no haya vuelto literalmente de search_vault. Los datos de tools externas (gmail/finance/cards/calendar/reminders/weather) van en PROSA, sin markdown links.
 
 Paralelismo: podés llamar varias tools en el mismo turno si son independientes. Máximo 3 rondas.
 """
@@ -232,6 +233,24 @@ def finance_summary(month: str | None = None) -> str:
         return json.dumps(result or {}, ensure_ascii=False)
     except Exception:
         return "{}"
+
+
+def credit_cards_summary() -> str:
+    """Resúmenes de tarjeta de crédito (saldo a pagar, fechas de cierre y
+    vencimiento, top consumos) parseados de los `.xlsx` que el banco
+    emite por ciclo y el user deja en iCloud `/Finances`.
+
+    Returns:
+        JSON con lista de tarjetas (`[]` si no hay xlsx / openpyxl falla).
+        Cada item: `{brand, last4, holder, closing_date, due_date,
+        next_closing_date, next_due_date, total_ars, total_usd,
+        minimum_ars, minimum_usd, top_purchases_ars, top_purchases_usd}`.
+    """
+    try:
+        from web.server import _fetch_credit_cards  # lazy: web.server importa este módulo.
+        return json.dumps(_fetch_credit_cards() or [], ensure_ascii=False)
+    except Exception:
+        return "[]"
 
 
 def calendar_ahead(days: int = 3) -> str:
@@ -388,6 +407,7 @@ CHAT_TOOLS: list[Callable] = [
     reminders_due,
     gmail_recent,
     finance_summary,
+    credit_cards_summary,
     calendar_ahead,
     weather,
     drive_search,
@@ -411,6 +431,7 @@ TOOL_FNS: dict[str, Callable] = {fn.__name__: fn for fn in CHAT_TOOLS}
 PARALLEL_SAFE: set[str] = {
     "weather",
     "finance_summary",
+    "credit_cards_summary",
     "calendar_ahead",
     "reminders_due",
     "gmail_recent",

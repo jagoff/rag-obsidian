@@ -50,7 +50,7 @@ _EXPECTED_STAGES = [
     "today", "signals", "tomorrow", "forecast",
     "pagerank", "chrome", "eval", "followup",
     "drive", "wa_unreplied", "bookmarks", "vaults",
-    "finance", "youtube",
+    "finance", "cards", "youtube",
 ]
 
 
@@ -98,6 +98,7 @@ def stub_fetchers(monkeypatch):
     monkeypatch.setattr(server_mod, "_fetch_chrome_bookmarks_used", _bump("bookmarks"))
     monkeypatch.setattr(server_mod, "_fetch_vault_activity", _bump("vaults"))
     monkeypatch.setattr(server_mod, "_fetch_finance", _bump("finance"))
+    monkeypatch.setattr(server_mod, "_fetch_credit_cards", _bump("cards"))
     monkeypatch.setattr(server_mod, "_fetch_youtube_watched", _bump("youtube"))
 
     # Skip pendientes-urgent / narrative — not fetchers, but they read
@@ -177,8 +178,8 @@ def test_progress_callback_fires_timeout_when_fetcher_blows_budget(
     `concurrent.futures.Future.result` to force the first 5s-budget
     `result(timeout=)` call to raise — `_home_compute` should translate
     that into a timeout progress event for whichever stage drew the
-    short straw (chrome/eval/finance/youtube/bookmarks all share a 5s
-    budget; ordering varies by GIL / dispatcher).
+    short straw (chrome/eval/finance/cards/youtube/bookmarks all share
+    a 5s budget; ordering varies by GIL / dispatcher).
     """
     from web.server import _home_compute
 
@@ -206,7 +207,7 @@ def test_progress_callback_fires_timeout_when_fetcher_blows_budget(
     # Exactly one timeout, on whichever 5s-budget fetcher landed first.
     assert len(timeouts) == 1, timeouts
     name, elapsed = timeouts[0]
-    assert name in {"chrome", "eval", "finance", "youtube", "bookmarks"}, name
+    assert name in {"chrome", "eval", "finance", "cards", "youtube", "bookmarks"}, name
     # Elapsed reported = budget * 1000ms = 5000ms (timeout doesn't
     # measure real elapsed; it reports the budget that was blown).
     assert elapsed == 5000.0

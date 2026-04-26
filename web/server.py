@@ -186,6 +186,12 @@ _PLANNING_PAT = (
 
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
+    # Tarjetas: keywords inequívocos del dominio "resumen de tarjeta de
+    # crédito" → fuerza credit_cards_summary. Diseñado conservadoramente
+    # para no chocar con "tiempo" (clima) o "gasto" (MOZE) — esos viven
+    # en sus tools propias. "saldo" solo, sin "pagar"/"tarjeta", se
+    # excluye porque puede referir a saldo de cuenta/billetera.
+    ("credit_cards_summary", {}, r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta|cu[aá]nto.*deb[oe]"),
     # NOTE: "recordame" / "agendáme" used to be here as query triggers, but
     # they're CREATE intents now (propose_reminder / propose_calendar_event).
     # Moved to `_PROPOSE_INTENT_RE` below. `recordator` still matches
@@ -484,6 +490,7 @@ def _is_empty_tool_output(name: str, raw: str) -> bool:
     - ``gmail_recent`` → ``threads == []`` AND ``unread_count == 0``.
     - ``calendar_ahead`` → lista vacía.
     - ``reminders_due`` → ``dated == []`` AND ``undated == []``.
+    - ``credit_cards_summary`` → lista vacía (sin xlsx en /Finances).
     - ``finance_summary`` / ``weather`` → siempre ``False`` (tienen output
       útil aun cuando los números son todos cero — un mes sin gastos es
       data válida, no ausencia de data).
@@ -506,6 +513,8 @@ def _is_empty_tool_output(name: str, raw: str) -> bool:
             unread = 0
         return not threads and unread == 0
     if name == "calendar_ahead":
+        return isinstance(data, list) and not data
+    if name == "credit_cards_summary":
         return isinstance(data, list) and not data
     if name == "reminders_due":
         if not isinstance(data, dict):
@@ -579,6 +588,8 @@ def _format_forced_tool_output(name: str, raw: str) -> str:
         return _format_gmail_block(raw)
     if name == "finance_summary":
         return _format_finance_block(raw)
+    if name == "credit_cards_summary":
+        return _format_cards_block(raw)
     if name == "weather":
         return _format_weather_block(raw)
     if name == "drive_search":
@@ -766,6 +777,76 @@ def _format_weather_block(raw: str) -> str:
     if not body:
         return "### Clima\n_Sin datos del clima._\n"
     return f"### Clima\n{body}\n"
+
+
+def _format_cards_block(raw: str) -> str:
+    """Credit cards summary es una lista de dicts (uno por tarjeta). Renderea
+    una sub-sección por tarjeta con saldo a pagar (ARS/USD), vencimiento,
+    cierre y top 3 consumos. Es passthrough en formato humano para que el
+    LLM cite los números directamente sin hacer su propia matemática.
+    """
+    try:
+        cards = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return f"### Tarjetas\n{raw}\n"
+    if not isinstance(cards, list) or not cards:
+        return "### Tarjetas\n_Sin resúmenes de tarjeta disponibles._\n"
+
+    def _fmt_ars(n: float | None) -> str:
+        if n is None:
+            return "—"
+        v = int(round(abs(n)))
+        s = f"{v:,}".replace(",", ".")
+        return f"${s}"
+
+    def _fmt_usd(n: float | None) -> str:
+        if n is None:
+            return "—"
+        return f"U$S{abs(n):,.2f}"
+
+    lines = ["### Tarjetas"]
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        brand = c.get("brand") or "Tarjeta"
+        last4 = c.get("last4") or "----"
+        title = f"{brand} ····{last4}"
+        lines.append(f"- **{title}**")
+        # Saldo a pagar
+        total_bits = []
+        if c.get("total_ars"):
+            total_bits.append(_fmt_ars(c["total_ars"]))
+        if c.get("total_usd"):
+            total_bits.append(_fmt_usd(c["total_usd"]))
+        if total_bits:
+            lines.append(f"  - Total a pagar: {' + '.join(total_bits)}")
+        # Mínimo (solo si difiere del total — banks suelen igualarlos)
+        min_bits = []
+        if c.get("minimum_ars") and c.get("minimum_ars") != c.get("total_ars"):
+            min_bits.append(_fmt_ars(c["minimum_ars"]))
+        if c.get("minimum_usd") and c.get("minimum_usd") != c.get("total_usd"):
+            min_bits.append(_fmt_usd(c["minimum_usd"]))
+        if min_bits:
+            lines.append(f"  - Mínimo: {' + '.join(min_bits)}")
+        # Fechas: vencimiento es la accionable
+        if c.get("due_date"):
+            lines.append(f"  - Vence: {c['due_date']}")
+        if c.get("closing_date"):
+            lines.append(f"  - Cierre: {c['closing_date']}")
+        if c.get("next_due_date"):
+            lines.append(f"  - Próximo venc.: {c['next_due_date']}")
+        # Top consumos: ARS + USD (3 + 2 max para no inundar)
+        ars_top = c.get("top_purchases_ars") or []
+        usd_top = c.get("top_purchases_usd") or []
+        if ars_top or usd_top:
+            lines.append("  - Top consumos:")
+            for p in ars_top[:3]:
+                desc = p.get("description") or "—"
+                lines.append(f"    - {desc} · {_fmt_ars(p.get('amount'))}")
+            for p in usd_top[:2]:
+                desc = p.get("description") or "—"
+                lines.append(f"    - {desc} · {_fmt_usd(p.get('amount'))}")
+    return "\n".join(lines) + "\n"
 
 
 def _format_drive_block(raw: str) -> str:
@@ -5387,11 +5468,19 @@ def _fetch_whatsapp_unreplied(hours: int = 48, max_chats: int = 5) -> list[dict]
     return out
 
 
-# MOZE (Money app) export — user drops `MOZE_YYYYMMDD_HHMMSS.csv` into iCloud
-# Backup. We pick the newest file and parse locally; no network, no API.
-# Dates are MM/DD/YYYY (US format); Price uses ES decimals ("2026,74").
-# Expenses are stored as negative numbers — abs() for display.
-_FINANCE_BACKUP_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Backup"
+# MOZE (Money app) export — user drops `MOZE_YYYYMMDD_HHMMSS.csv` into the
+# iCloud `/Finances` folder (que también aloja los `.xlsx` de resúmenes de
+# tarjeta — ver `_fetch_credit_cards`). Tomamos el CSV más nuevo y lo
+# parseamos local; sin red, sin API. Dates: MM/DD/YYYY (US); Price: ES
+# decimals ("2026,74"). Gastos vienen como negativos → abs() para mostrar.
+#
+# Migración 2026-04-26: el dir antes era `/Backup`. Si en el futuro el user
+# vuelve a moverlo, el override por env vive en `_FINANCE_DIR_ENV`.
+_FINANCE_DIR_ENV = "OBSIDIAN_RAG_FINANCE_DIR"
+_FINANCE_BACKUP_DIR = Path(
+    os.environ.get(_FINANCE_DIR_ENV, "")
+    or (Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances")
+)
 _FINANCE_CACHE: dict = {"key": None, "payload": None}
 
 
@@ -5536,6 +5625,374 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
     _FINANCE_CACHE["key"] = key
     _FINANCE_CACHE["payload"] = payload
     return payload
+
+
+# Resúmenes de tarjeta de crédito — el banco emite un `.xlsx` por ciclo
+# (Santander Río exporta `Último resumen - <Marca> <Últimos4>.xlsx`) y el
+# user lo deja caer en el mismo dir iCloud `/Finances` que los CSV de MOZE.
+# Naming esperado: empieza con "Último resumen" (con o sin acento) — usamos
+# globs case-insensitive para tolerar variaciones del banco.
+#
+# Shape parseado (un dict por xlsx), todas las claves opcionales:
+#   { "brand": "Visa", "last4": "1059", "holder": "Fernando ...",
+#     "closing_date": "2026-03-26", "due_date": "2026-04-08",
+#     "next_closing_date": "2026-04-30", "next_due_date": "2026-05-08",
+#     "total_ars": 549438.75, "total_usd": 98.93,
+#     "minimum_ars": ..., "minimum_usd": ...,
+#     "top_purchases": [{date, description, amount, currency}, ...],
+#     "source_file": "Último resumen - Visa 1059.xlsx",
+#     "source_mtime": "2026-04-26T19:11:42" }
+#
+# Cache compartido: clave = tuple ordenado de (path, mtime) de TODOS los
+# xlsx → re-export de cualquier tarjeta invalida; agregar/quitar tarjetas
+# también. Silent-fail (devuelve `[]`) si no hay xlsx, falta openpyxl, o
+# todos los archivos fallan al parsear.
+_CARDS_CACHE: dict = {"key": None, "payload": None}
+
+# Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
+# Tolera "Visa Crédito terminada en 1059", "Visa 1059", "Mastercard 5234",
+# "Amex 3456". Case-insensitive.
+_CARD_BRAND_RE = re.compile(
+    r"\b(Visa|Master(?:card)?|Amex|American\s*Express|Cabal|Maestro|Naranja)\b",
+    re.IGNORECASE,
+)
+_CARD_LAST4_RE = re.compile(r"(\d{4})(?!\d)")
+
+
+def _parse_ars_or_usd(raw: object) -> tuple[float | None, str | None]:
+    """Parsea celdas tipo `$549.438,75`, `U$S98,93`, `-$926,15`, o numérico
+    crudo (openpyxl puede devolver float si la celda tiene formato número).
+    Retorna `(amount, currency)` donde currency ∈ {"ARS", "USD", None}.
+
+    Heurística decimal: si el string tiene `,` lo asumimos formato ES
+    (decimal coma, miles punto) y normalizamos. Si solo tiene `.` puede ser
+    formato US (`24.99`) — solo strippeamos puntos como miles si hay 3
+    dígitos exactos después, sino el punto es decimal.
+    """
+    if raw is None:
+        return (None, None)
+    if isinstance(raw, (int, float)):
+        return (float(raw), None)
+    s = str(raw).strip()
+    if not s:
+        return (None, None)
+    cur: str | None = None
+    if s.upper().startswith("U$S") or "U$S" in s.upper() or s.upper().startswith("USD"):
+        cur = "USD"
+    elif s.startswith("$") or "ARS" in s.upper():
+        cur = "ARS"
+    # Strippeamos símbolos no-numéricos.
+    cleaned = re.sub(r"[^\d,.\-]", "", s)
+    if "," in cleaned:
+        # Formato ES: punto = miles, coma = decimal.
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif cleaned.count(".") > 1:
+        # Múltiples puntos → todos son miles ES sin decimal explícito.
+        cleaned = cleaned.replace(".", "")
+    # Else: un solo punto → decimal US (`24.99`), dejarlo como está.
+    try:
+        return (float(cleaned), cur)
+    except ValueError:
+        return (None, cur)
+
+
+def _parse_card_date(raw: object) -> str | None:
+    """DD/MM/YYYY → ISO `YYYY-MM-DD`. None si no parsea. Acepta
+    `datetime.date|datetime` (openpyxl normaliza fechas si la celda tiene
+    formato fecha) y strings con prefijo (`"Cierre: 26/03/2026"`).
+    """
+    if raw is None:
+        return None
+    if hasattr(raw, "strftime"):
+        try:
+            return raw.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    s = str(raw).strip()
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    if not m:
+        return None
+    try:
+        d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        return d.strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _parse_credit_card_xlsx(path: Path) -> dict | None:
+    """Parsea un `Último resumen - <Marca> <Últimos4>.xlsx` del banco a un
+    dict normalizado. None si openpyxl no está disponible o el xlsx no
+    tiene la estructura esperada (sin Total a pagar reconocible).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return None
+    try:
+        wb = load_workbook(path, data_only=True, read_only=True)
+    except Exception:
+        return None
+
+    rows: list[tuple] = []
+    sheet_name = ""
+    try:
+        ws = wb.active
+        sheet_name = ws.title or ""
+        # Lectura completa: el archivo es <100 filas — read_only modo
+        # streaming, sin riesgo de memoria.
+        for row in ws.iter_rows(values_only=True):
+            rows.append(row)
+    except Exception:
+        return None
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    if not rows:
+        return None
+
+    # Identificar marca + últimos 4 — primero del sheet name, sino del
+    # nombre de archivo, sino del primer row con "terminada en".
+    brand = None
+    last4 = None
+    for source in (sheet_name, path.stem):
+        m_brand = _CARD_BRAND_RE.search(source)
+        m_last4 = _CARD_LAST4_RE.search(source)
+        if m_brand and not brand:
+            brand = m_brand.group(1).title()
+            if brand.lower() in ("master", "mastercard"):
+                brand = "Mastercard"
+            elif brand.lower() in ("amex", "american express"):
+                brand = "Amex"
+        if m_last4 and not last4:
+            last4 = m_last4.group(1)
+        if brand and last4:
+            break
+
+    # Pasada por filas: extraer secciones por anchor text.
+    holder = None
+    closing_date = None
+    due_date = None
+    next_closing_date = None
+    next_due_date = None
+    total_ars = None
+    total_usd = None
+    minimum_ars = None
+    minimum_usd = None
+    top_purchases: list[dict] = []
+
+    def _row_text(r: tuple) -> str:
+        return " ".join(str(c) for c in r if c is not None).strip()
+
+    n = len(rows)
+    i = 0
+    in_purchases_block = False
+    in_payments_block = False
+    while i < n:
+        row = rows[i]
+        text = _row_text(row).lower()
+
+        # Header: "Tarjeta <Marca> ... terminada en NNNN"
+        if not last4 and "terminada en" in text:
+            m = _CARD_LAST4_RE.search(text)
+            if m:
+                last4 = m.group(1)
+            m_brand = _CARD_BRAND_RE.search(text)
+            if m_brand and not brand:
+                brand = m_brand.group(1).title()
+
+        # "Fecha de cierre" / "Fecha de vencimiento" — fila siguiente las trae
+        if "fecha de cierre" in text and "fecha de vencimiento" in text and i + 1 < n:
+            nxt = rows[i + 1]
+            closing_date = _parse_card_date(nxt[0] if len(nxt) > 0 else None)
+            due_date = _parse_card_date(nxt[1] if len(nxt) > 1 else None)
+            i += 2
+            continue
+
+        # "Total a pagar" — fila siguiente: ARS | USD
+        if "total a pagar" in text and i + 1 < n:
+            nxt = rows[i + 1]
+            v0, c0 = _parse_ars_or_usd(nxt[0] if len(nxt) > 0 else None)
+            v1, c1 = _parse_ars_or_usd(nxt[1] if len(nxt) > 1 else None)
+            for v, c in ((v0, c0), (v1, c1)):
+                if v is None:
+                    continue
+                if c == "USD":
+                    total_usd = v
+                else:
+                    total_ars = v if total_ars is None else total_ars
+            i += 2
+            continue
+
+        # "Mínimo a pagar"
+        if "mínimo a pagar" in text or "minimo a pagar" in text:
+            if i + 1 < n:
+                nxt = rows[i + 1]
+                v0, c0 = _parse_ars_or_usd(nxt[0] if len(nxt) > 0 else None)
+                v1, c1 = _parse_ars_or_usd(nxt[1] if len(nxt) > 1 else None)
+                for v, c in ((v0, c0), (v1, c1)):
+                    if v is None:
+                        continue
+                    if c == "USD":
+                        minimum_usd = v
+                    else:
+                        minimum_ars = v if minimum_ars is None else minimum_ars
+                i += 2
+                continue
+
+        # "Próximo resumen" — la fila tiene "Cierre: DD/MM/YYYY" en col 2
+        if "próximo resumen" in text or "proximo resumen" in text:
+            # Las dos siguientes filas tienen "Cierre: ..." y "Vencimiento: ..."
+            for j in range(i + 1, min(i + 4, n)):
+                trow = _row_text(rows[j]).lower()
+                if "cierre" in trow:
+                    # col 1 = actual, col 2 = próximo
+                    cell = rows[j][1] if len(rows[j]) > 1 else None
+                    next_closing_date = _parse_card_date(cell)
+                if "vencimiento" in trow:
+                    cell = rows[j][1] if len(rows[j]) > 1 else None
+                    next_due_date = _parse_card_date(cell)
+            i += 1
+            continue
+
+        # Holder: "<Marca> Crédito terminada en NNNN" + col 2 con "(Titular)"
+        if holder is None and len(row) > 1 and row[1] and "titular" in str(row[1]).lower():
+            holder = re.sub(r"\s*\(Titular\)\s*$", "", str(row[1])).strip() or None
+
+        # Bloques de movimientos: "Pago de tarjeta y devoluciones" (skipear) /
+        # "Tarjeta de <holder>" (capturar movimientos hasta "Total de ...")
+        if "pago de tarjeta y devoluciones" in text:
+            in_payments_block = True
+            in_purchases_block = False
+        elif text.startswith("tarjeta de ") and "terminada en" in text:
+            in_purchases_block = True
+            in_payments_block = False
+            # Extraer holder si aún no lo tenemos
+            if holder is None:
+                m = re.search(r"tarjeta de (.+?)\s*-", text, re.IGNORECASE)
+                if m:
+                    holder = m.group(1).strip().title()
+        elif text.startswith("total de ") and ("terminada en" in text or "tarjeta" in text):
+            in_purchases_block = False
+            in_payments_block = False
+        elif text.startswith("otros conceptos"):
+            in_purchases_block = False
+            in_payments_block = False
+        elif in_purchases_block and len(row) >= 5:
+            # Fila de movimiento: (fecha, descripción, cuotas, comprobante, ARS, USD)
+            # Algunas filas tienen fecha vacía (continuación del día anterior)
+            desc = (str(row[1]).strip() if row[1] else "").strip()
+            if desc and desc.lower() not in ("descripción", "descripcion"):
+                amt_ars, _ = _parse_ars_or_usd(row[4] if len(row) > 4 else None)
+                amt_usd, _ = _parse_ars_or_usd(row[5] if len(row) > 5 else None)
+                amount = None
+                currency = None
+                if amt_ars is not None:
+                    amount = abs(amt_ars)
+                    currency = "ARS"
+                elif amt_usd is not None:
+                    amount = abs(amt_usd)
+                    currency = "USD"
+                if amount is not None and amount > 0:
+                    top_purchases.append({
+                        "date": _parse_card_date(row[0] if len(row) > 0 else None),
+                        "description": desc,
+                        "amount": amount,
+                        "currency": currency,
+                    })
+
+        i += 1
+
+    # Sin total ni fechas reconocibles → xlsx no es un resumen válido.
+    if total_ars is None and total_usd is None and not closing_date and not due_date:
+        return None
+
+    # Top 5 movimientos por monto absoluto, separando ARS/USD para que
+    # las dos monedas tengan visibilidad.
+    ars_purchases = sorted(
+        (p for p in top_purchases if p["currency"] == "ARS"),
+        key=lambda p: p["amount"],
+        reverse=True,
+    )[:5]
+    usd_purchases = sorted(
+        (p for p in top_purchases if p["currency"] == "USD"),
+        key=lambda p: p["amount"],
+        reverse=True,
+    )[:3]
+
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    return {
+        "brand": brand,
+        "last4": last4,
+        "holder": holder,
+        "closing_date": closing_date,
+        "due_date": due_date,
+        "next_closing_date": next_closing_date,
+        "next_due_date": next_due_date,
+        "total_ars": total_ars,
+        "total_usd": total_usd,
+        "minimum_ars": minimum_ars,
+        "minimum_usd": minimum_usd,
+        "top_purchases_ars": ars_purchases,
+        "top_purchases_usd": usd_purchases,
+        "source_file": path.name,
+        "source_mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
+    }
+
+
+def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG001
+    """Lista de resúmenes de tarjeta parseados de los xlsx en `/Finances`.
+
+    Devuelve `[]` si no hay xlsx, openpyxl no está, o todos fallan al
+    parsear. Cache por (paths, mtimes) compartidos — re-export de
+    cualquier xlsx invalida el cache; agregar/quitar archivos también.
+
+    Ordenado por `due_date` ascendente (vencimientos próximos primero) con
+    ítems sin fecha al final.
+    """
+    try:
+        # Glob case-insensitive: el banco a veces usa "Último" (con acento)
+        # y a veces "Ultimo". Usamos 2 globs explícitos para no depender de
+        # case-fold del FS (HFS+/APFS son case-insensitive por default pero
+        # vault sync remoto puede no serlo).
+        seen: set[Path] = set()
+        for pattern in ("Último resumen*.xlsx", "Ultimo resumen*.xlsx"):
+            for p in _FINANCE_BACKUP_DIR.glob(pattern):
+                seen.add(p)
+        files = sorted(seen, key=lambda p: p.name)
+    except Exception:
+        return []
+    if not files:
+        return []
+
+    # Cache key: tupla con (str(path), mtime) de cada archivo, ordenada.
+    try:
+        cache_key = tuple(sorted((str(p), p.stat().st_mtime) for p in files))
+    except Exception:
+        cache_key = None
+
+    if cache_key is not None and _CARDS_CACHE.get("key") == cache_key:
+        return _CARDS_CACHE.get("payload") or []
+
+    cards: list[dict] = []
+    for p in files:
+        parsed = _parse_credit_card_xlsx(p)
+        if parsed:
+            cards.append(parsed)
+
+    # Orden: due_date ASC; sin fecha al final.
+    cards.sort(key=lambda c: (c.get("due_date") is None, c.get("due_date") or ""))
+
+    if cache_key is not None:
+        _CARDS_CACHE["key"] = cache_key
+        _CARDS_CACHE["payload"] = cards
+    return cards
 
 
 # Cold `_home_compute` is 30–40s (12-fetcher fan-out, slowest = pendientes
@@ -5942,7 +6399,7 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
                 "today", "signals", "tomorrow", "forecast",
                 "pagerank", "chrome", "eval", "followup",
                 "drive", "wa_unreplied", "bookmarks", "vaults",
-                "finance", "youtube",
+                "finance", "cards", "youtube",
             ],
             "substages": {
                 "signals": [
@@ -6390,6 +6847,7 @@ def _home_compute(
         fut_bookmarks   = pool.submit(_timed, "bookmarks", _fetch_chrome_bookmarks_used, 48, 5)
         fut_vaults      = pool.submit(_timed, "vaults", _fetch_vault_activity, 48, 5)
         fut_finance     = pool.submit(_timed, "finance", _fetch_finance, now)
+        fut_cards       = pool.submit(_timed, "cards", _fetch_credit_cards, now)
         fut_youtube     = pool.submit(_timed, "youtube", _fetch_youtube_watched, 5, 168)
 
         # Helper: wait on a future with budget, return default on timeout
@@ -6448,6 +6906,7 @@ def _home_compute(
         chrome_bookmarks = _await("bookmarks", fut_bookmarks, 5, default=[]) or []
         vault_activity = _await("vaults", fut_vaults, 10, default={}) or {}
         finance = _await("finance", fut_finance, 5, default=None)
+        cards = _await("cards", fut_cards, 5, default=[]) or []
         youtube_watched = _await("youtube", fut_youtube, 5, default=[]) or []
 
         signals["pagerank_top"] = pagerank_top
@@ -6459,6 +6918,7 @@ def _home_compute(
         signals["chrome_bookmarks"] = chrome_bookmarks
         signals["vault_activity"] = vault_activity
         signals["finance"] = finance
+        signals["cards"] = cards
         signals["youtube_watched"] = youtube_watched
     finally:
         # Detach stragglers; they continue warming caches for the next call.
@@ -11570,6 +12030,465 @@ def status_uptime(nocache: int = 0) -> dict:
 @app.get("/status")
 def status_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "status.html")
+
+
+# ── /logs — dashboard de logs del sistema ─────────────────────────────
+# Página + endpoints para inspeccionar todos los archivos de log que
+# generan los daemons del stack (ingest-*, watch, web, wa-scheduled-send,
+# anticipate, reminder-wa-push, etc.). A diferencia del card #4 del
+# /status que sólo lee 2 jsonl estructurados, acá listamos los ~80
+# archivos `.log` + `.error.log` que escriben los daemons launchd.
+#
+# Decisiones:
+#   - Sources: ~/.local/share/obsidian-rag/ + ~/.local/share/whatsapp-listener/
+#     (los 2 stacks compartidos del sistema). Todo lo que termine en .log
+#     o .error.log entra; los .jsonl quedan fuera (formato distinto, ya
+#     cubiertos por el card #4 de /status).
+#   - Agrupamos por "service": el nombre sin .log / .error.log. Cada
+#     service tiene un par (stdout, stderr) + status agregado: OK si no
+#     hay errores recientes, WARN si hay warnings, ERROR si .error.log
+#     tiene contenido reciente o líneas con patterns de error.
+#   - Tail eficiente: para archivos grandes (web.log ~1.6MB) seekeamos
+#     desde el final en chunks de 64KB hasta juntar N líneas. No leemos
+#     el archivo entero a memoria.
+#   - Heurística de level por línea: regex case-insensitive sobre
+#     "error|exception|traceback|fatal|panic|critical" → error;
+#     "warn|warning|deprec" → warn. Evitamos falsos positivos de
+#     "failed=0" / "errors=0" (líneas de stats que NO son errores).
+#
+# Seguridad: el `name` del file viene de la lista enumerada del backend.
+# El handler valida que el path resuelto está dentro de los allowed
+# LOG_DIRS (defensa en profundidad contra path traversal).
+
+# Directorios donde viven los logs de los daemons del stack. Si en algún
+# futuro se agrega otro stack, sumarlo acá.
+_LOG_DIRS: tuple[Path, ...] = (
+    Path.home() / ".local/share/obsidian-rag",
+    Path.home() / ".local/share/whatsapp-listener",
+)
+
+# Heurística para clasificar líneas. Sin word boundary INICIAL así
+# matchea CamelCase tipo `OperationalError` o `UserWarning` (que NO
+# tienen boundary entre `l-E` o `r-W`), pero con boundary final + un
+# lookahead negativo `(?!s?[\s:=]+0\b)` que evita clasificar como error
+# las stats "failed=0" / "errors: 0".
+_LOG_RE_ERROR = re.compile(
+    r"(error|exception|traceback|failed|fatal|panic|critical)"
+    r"(?!s?[\s:=]+0\b)\b",
+    re.IGNORECASE,
+)
+_LOG_RE_WARN = re.compile(r"(warning|warn|deprec|retry)\b", re.IGNORECASE)
+# Heartbeat / status normales — overrideamos cualquier match accidental.
+_LOG_RE_OK = re.compile(r"^\[heartbeat\]|alive=true|✓\s|status=ok\b", re.IGNORECASE)
+# Líneas claramente informacionales (uvicorn / stdlib logging). Si una
+# línea empieza con `INFO:` / `DEBUG:` etc., NO la clasificamos como
+# error aunque mencione "error" en una URL/path. Bug histórico:
+# `INFO:    "GET /api/logs/file?name=...error.log... 200 OK"` aparecía
+# como ERROR sólo porque la URL contenía "error.log".
+_LOG_RE_INFO_PREFIX = re.compile(r"^\s*(INFO|DEBUG|TRACE|NOTICE)[\s:]", re.IGNORECASE)
+
+# Cap conservador. La página puede pedir tail=N hasta este max para no
+# devolver MB de log al cliente.
+_LOG_FILE_TAIL_DEFAULT = 500
+_LOG_FILE_TAIL_MAX = 5000
+
+# Ventana para "errores recientes" en la lista de archivos. Si .error.log
+# tiene mtime más viejo que esto, igual lo marcamos como con errores
+# pero con menor severidad visual ("histórico"). Default: 24h.
+_LOG_RECENT_ERROR_WINDOW_S = 86400
+
+# Cache para /api/logs (la lista de archivos). El stat() de 80 files es
+# rápido (~5ms), pero la heurística de "error_count_recent" lee la cola
+# de varios files para detectar errores → más caro. Cache 10s mantiene
+# la página snappy sin perder responsiveness real.
+_LOGS_INDEX_CACHE: dict = {"ts": 0.0, "payload": None}
+_LOGS_INDEX_CACHE_TTL = 10.0
+_LOGS_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def _classify_log_line(line: str) -> str:
+    """Devolver 'error' | 'warn' | 'ok' | 'info' para una línea de log."""
+    if not line.strip():
+        return "info"
+    if _LOG_RE_OK.search(line):
+        return "ok"
+    # `INFO:`/`DEBUG:` prefix gana sobre los matches de "error" en URLs.
+    if _LOG_RE_INFO_PREFIX.match(line):
+        return "info"
+    if _LOG_RE_ERROR.search(line):
+        return "error"
+    if _LOG_RE_WARN.search(line):
+        return "warn"
+    return "info"
+
+
+def _read_tail_lines(path: Path, max_lines: int, max_bytes: int = 4 * 1024 * 1024) -> list[str]:
+    """Leer las últimas `max_lines` líneas de `path` sin cargar el archivo
+    entero a memoria. Seek desde el final en chunks; cap absoluto por
+    `max_bytes` así no nos vamos al ratón con archivos gigantes.
+
+    Retorna lista en orden cronológico (vieja → nueva).
+    """
+    if not path.is_file():
+        return []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            total = f.tell()
+            if total == 0:
+                return []
+            chunk_size = 64 * 1024
+            # Acumulamos chunks desde el final hasta tener max_lines + 1
+            # newlines (uno extra para tolerar el caso de archivos que
+            # terminan en `\n`, que crean una "línea vacía" final que
+            # luego descartamos). El slice por max_lines lo hacemos al
+            # final, una sola vez, para que la lógica sea simple +
+            # correcta sin cortar de más.
+            buf = b""
+            pos = total
+            read_total = 0
+            target_newlines = max_lines + 1
+            while pos > 0 and buf.count(b"\n") < target_newlines and read_total < max_bytes:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                read_total += read_size
+                buf = chunk + buf
+            # Splitear y decodear con replace (no morir con bytes
+            # inválidos en tracebacks Python).
+            lines = [b.decode("utf-8", errors="replace") for b in buf.split(b"\n")]
+            # Archivos terminados en `\n` generan una línea vacía final
+            # que es ruido — descartar.
+            while lines and lines[-1] == "":
+                lines.pop()
+            # Slice a max_lines del final. Si el primer fragmento fue
+            # leído parcialmente (pos > 0) descartamos esa primer línea
+            # porque puede estar cortada por la mitad.
+            if pos > 0 and len(lines) > 0:
+                lines = lines[1:]
+            if len(lines) > max_lines:
+                lines = lines[-max_lines:]
+            return lines
+    except Exception:
+        return []
+
+
+def _classify_file_status(error_log_path: Path, recent_lines: list[str]) -> tuple[str, int]:
+    """Decidir el status agregado de un service: 'ok' | 'warn' | 'error'.
+
+    - error si .error.log existe + size > 0 + mtime reciente, o si las
+      últimas N líneas del .log tienen pattern de error.
+    - warn si las últimas N líneas tienen pattern de warn.
+    - ok en otro caso.
+
+    Devuelve (status, error_count_recent).
+    """
+    error_count = 0
+    has_warn = False
+    # Inspeccionar .error.log: si existe, tiene size > 0 y mtime
+    # reciente, contar líneas con pattern.
+    if error_log_path.is_file():
+        try:
+            stat = error_log_path.stat()
+            if stat.st_size > 0:
+                age_s = time.time() - stat.st_mtime
+                if age_s < _LOG_RECENT_ERROR_WINDOW_S:
+                    # Leer las últimas 200 líneas del error log y
+                    # contar las que matchean error.
+                    err_lines = _read_tail_lines(error_log_path, 200)
+                    for ln in err_lines:
+                        lvl = _classify_log_line(ln)
+                        if lvl == "error":
+                            error_count += 1
+                        elif lvl == "warn":
+                            has_warn = True
+        except Exception:
+            pass
+    # También revisar las recent lines del stdout — algunos daemons
+    # imprimen tracebacks ahí en vez de stderr.
+    for ln in recent_lines:
+        lvl = _classify_log_line(ln)
+        if lvl == "error":
+            error_count += 1
+        elif lvl == "warn":
+            has_warn = True
+    if error_count > 0:
+        return ("error", error_count)
+    if has_warn:
+        return ("warn", 0)
+    return ("ok", 0)
+
+
+def _human_size(n: int) -> str:
+    """Format bytes to human-readable (B / KB / MB)."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _resolve_log_path(name: str) -> Path | None:
+    """Resolve un log name (ej. 'watch.log' o 'whatsapp-listener/listener.log')
+    al Path absoluto, validando que esté dentro de uno de los _LOG_DIRS.
+    Retorna None si no existe o el path está fuera del allowlist.
+    """
+    if not name or ".." in name or name.startswith("/"):
+        return None
+    # El name viene como "<dir-slug>/<filename>" o sólo "<filename>"
+    # (en cuyo caso asumimos el primer dir, obsidian-rag).
+    if "/" in name:
+        dir_slug, _, filename = name.partition("/")
+        if "/" in filename or ".." in filename:
+            return None
+        # dir_slug → mapear a uno de _LOG_DIRS por el último componente
+        # del path.
+        for d in _LOG_DIRS:
+            if d.name == dir_slug:
+                candidate = (d / filename).resolve()
+                try:
+                    candidate.relative_to(d.resolve())
+                except ValueError:
+                    return None
+                if candidate.is_file():
+                    return candidate
+                return None
+        return None
+    # Sin slash → buscar en _LOG_DIRS[0] (obsidian-rag).
+    candidate = (_LOG_DIRS[0] / name).resolve()
+    try:
+        candidate.relative_to(_LOG_DIRS[0].resolve())
+    except ValueError:
+        return None
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _build_logs_index_payload() -> dict:
+    """Enumerar todos los .log + .error.log de los _LOG_DIRS, agrupar por
+    service, y devolver con metadata + status.
+    """
+    services_by_key: dict[str, dict] = {}
+
+    for log_dir in _LOG_DIRS:
+        if not log_dir.is_dir():
+            continue
+        dir_slug = log_dir.name
+        # Listar .log + .error.log. Ignoramos otros ext.
+        for path in sorted(log_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if not (name.endswith(".log") or name.endswith(".stdout.log") or name.endswith(".stderr.log")):
+                continue
+            # Derivar service key. "wa-scheduled-send.error.log" → "wa-scheduled-send"
+            # "watch.log" → "watch". "cloudflared-watcher.stdout.log" → "cloudflared-watcher".
+            base = name
+            kind = "stdout"
+            if base.endswith(".error.log"):
+                base = base[: -len(".error.log")]
+                kind = "stderr"
+            elif base.endswith(".stderr.log"):
+                base = base[: -len(".stderr.log")]
+                kind = "stderr"
+            elif base.endswith(".stdout.log"):
+                base = base[: -len(".stdout.log")]
+                kind = "stdout"
+            elif base.endswith(".log"):
+                base = base[: -len(".log")]
+                kind = "stdout"
+            key = f"{dir_slug}::{base}"
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            file_meta = {
+                "name": name,
+                "ref": f"{dir_slug}/{name}",
+                "kind": kind,
+                "size_bytes": stat.st_size,
+                "size_human": _human_size(stat.st_size),
+                "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "mtime_age_s": max(0, int(time.time() - stat.st_mtime)),
+                "abs_path": str(path),
+            }
+            svc = services_by_key.setdefault(
+                key,
+                {
+                    "service": base,
+                    "dir": dir_slug,
+                    "files": [],
+                },
+            )
+            svc["files"].append(file_meta)
+
+    # Para cada service: status agregado + preview.
+    services_out: list[dict] = []
+    for key in sorted(services_by_key.keys()):
+        svc = services_by_key[key]
+        # Buscar el stdout y el stderr.
+        stdout_file = next((f for f in svc["files"] if f["kind"] == "stdout"), None)
+        stderr_file = next((f for f in svc["files"] if f["kind"] == "stderr"), None)
+
+        # Preview: tail de N líneas del stdout (o del stderr si no hay
+        # stdout). Sólo última línea, para mostrar en el sidebar.
+        primary = stdout_file or stderr_file
+        preview = ""
+        recent_lines: list[str] = []
+        if primary:
+            recent_lines = _read_tail_lines(Path(primary["abs_path"]), 100)
+            for ln in reversed(recent_lines):
+                if ln.strip():
+                    preview = ln.strip()[:200]
+                    break
+
+        # Status agregado: error si el stderr tiene contenido reciente,
+        # warn si las recent_lines del stdout matchean warn, ok si nada.
+        stderr_path = Path(stderr_file["abs_path"]) if stderr_file else (
+            (Path(primary["abs_path"]).parent / (svc["service"] + ".error.log"))
+            if primary else None
+        )
+        if stderr_path is None:
+            status, err_count = ("ok", 0)
+        else:
+            status, err_count = _classify_file_status(stderr_path, recent_lines)
+
+        # mtime más reciente entre los files.
+        mtime_max = max((f["mtime_age_s"] for f in svc["files"]), default=10**9)
+        # El archivo más reciente determina el "primary mtime" para
+        # ordenar la lista por actividad.
+        mtime_min_age = min((f["mtime_age_s"] for f in svc["files"]), default=10**9)
+        # ¿Está totalmente vacío? (todos los files tienen size 0)
+        all_empty = all(f["size_bytes"] == 0 for f in svc["files"])
+
+        services_out.append({
+            "service": svc["service"],
+            "dir": svc["dir"],
+            "status": status,
+            "error_count_recent": err_count,
+            "files": svc["files"],
+            "preview": preview,
+            "mtime_age_s": mtime_min_age,
+            "all_empty": all_empty,
+        })
+
+    # Sort: services con error primero, después warn, después ok; dentro
+    # de cada bucket, los más activos (mtime_min_age menor) primero.
+    status_order = {"error": 0, "warn": 1, "ok": 2}
+    services_out.sort(
+        key=lambda s: (status_order.get(s["status"], 3), s["mtime_age_s"], s["service"])
+    )
+
+    n_error = sum(1 for s in services_out if s["status"] == "error")
+    n_warn = sum(1 for s in services_out if s["status"] == "warn")
+    n_ok = sum(1 for s in services_out if s["status"] == "ok")
+
+    return {
+        "scanned_at": datetime.now().isoformat(timespec="seconds"),
+        "services": services_out,
+        "totals": {
+            "services": len(services_out),
+            "error": n_error,
+            "warn": n_warn,
+            "ok": n_ok,
+        },
+    }
+
+
+@app.get("/api/logs")
+def logs_index(nocache: int = 0) -> dict:
+    """Lista de todos los archivos de log del stack, agrupados por service,
+    con status agregado (ok/warn/error) y preview de la última línea.
+
+    Cacheado `_LOGS_INDEX_CACHE_TTL` segundos. ?nocache=1 fuerza refresh.
+    """
+    now_mono = time.monotonic()
+    with _LOGS_INDEX_CACHE_LOCK:
+        cached = _LOGS_INDEX_CACHE["payload"]
+        fresh = (now_mono - _LOGS_INDEX_CACHE["ts"]) < _LOGS_INDEX_CACHE_TTL
+    if nocache or not fresh or cached is None:
+        payload = _build_logs_index_payload()
+        with _LOGS_INDEX_CACHE_LOCK:
+            _LOGS_INDEX_CACHE["payload"] = payload
+            _LOGS_INDEX_CACHE["ts"] = now_mono
+        return payload
+    return cached
+
+
+@app.get("/api/logs/file")
+def logs_file(
+    name: str,
+    tail: int = _LOG_FILE_TAIL_DEFAULT,
+    q: str = "",
+    only_errors: int = 0,
+) -> dict:
+    """Devolver el tail de un archivo de log específico, con cada línea
+    clasificada (ok/warn/error/info) y opcionalmente filtrada por query.
+
+    Args:
+        name: ref del archivo, formato "<dir-slug>/<filename>" (ej.
+            "obsidian-rag/watch.log"). El backend valida contra el
+            allowlist de _LOG_DIRS.
+        tail: cantidad de líneas a devolver (default 500, max 5000).
+        q: substring filter case-insensitive. Si vacío, devuelve todo.
+        only_errors: 1 → sólo líneas clasificadas como warn o error.
+    """
+    path = _resolve_log_path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"log no encontrado: {name!r}")
+
+    tail_n = max(1, min(int(tail), _LOG_FILE_TAIL_MAX))
+    raw_lines = _read_tail_lines(path, tail_n)
+
+    q_lower = (q or "").strip().lower()
+    out_lines: list[dict] = []
+    counts = {"ok": 0, "info": 0, "warn": 0, "error": 0}
+    # Numeración relativa al final: la última línea es la más alta. No
+    # tenemos line numbers absolutos sin scanear el archivo entero, así
+    # que devolvemos el offset reverse desde el final.
+    total = len(raw_lines)
+    for idx, ln in enumerate(raw_lines):
+        level = _classify_log_line(ln)
+        counts[level] = counts.get(level, 0) + 1
+        if q_lower and q_lower not in ln.lower():
+            continue
+        if only_errors and level not in ("warn", "error"):
+            continue
+        out_lines.append({
+            "n": total - idx,  # 1 = última línea (más reciente)
+            "text": ln,
+            "level": level,
+        })
+
+    try:
+        stat = path.stat()
+        size_bytes = stat.st_size
+        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    except Exception:
+        size_bytes = 0
+        mtime = None
+
+    return {
+        "name": name,
+        "abs_path": str(path),
+        "size_bytes": size_bytes,
+        "size_human": _human_size(size_bytes),
+        "mtime": mtime,
+        "tail_requested": tail_n,
+        "lines_total": total,
+        "lines_returned": len(out_lines),
+        "counts": counts,
+        "lines": out_lines,
+        "filtered_by_query": bool(q_lower),
+        "filtered_by_level": bool(only_errors),
+    }
+
+
+@app.get("/logs")
+def logs_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "logs.html")
 
 
 def _collect_screentime_daily(

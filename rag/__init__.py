@@ -8102,10 +8102,18 @@ def extract_urls(text: str) -> list[dict]:
 
 
 # MOZE (Money app) → monthly vault notes. User re-exports `MOZE_*.csv` to
-# iCloud Backup; we transform it into one markdown note per month so the
-# regular indexing pipeline picks it up automatically. No special retrieval
-# path — chunks, graph, reranker all treat these like any other note.
-MOZE_BACKUP_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Backup"
+# iCloud `/Finances` (mismo dir donde caen los `.xlsx` de resúmenes de
+# tarjeta); transformamos cada mes en una nota markdown para que el
+# pipeline normal de indexado la absorba. No hay retrieval path especial —
+# chunks, graph y reranker la tratan como cualquier otra nota.
+#
+# Migración 2026-04-26: el dir antes era `/Backup`. Override por env via
+# `OBSIDIAN_RAG_FINANCE_DIR` (compartido con `web/server.py:_fetch_finance`
+# para que un solo override mueva ambos consumidores en sync).
+MOZE_BACKUP_DIR = Path(
+    os.environ.get("OBSIDIAN_RAG_FINANCE_DIR", "")
+    or (Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/Finances")
+)
 MOZE_VAULT_SUBPATH = os.environ.get(
     "OBSIDIAN_RAG_MOZE_FOLDER", "02-Areas/Personal/Finanzas/MOZE"
 )

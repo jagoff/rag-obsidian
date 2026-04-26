@@ -67,6 +67,7 @@ const STAGE_LABELS = {
   bookmarks: "bookmarks usados",
   vaults: "actividad vault",
   finance: "finanzas",
+  cards: "tarjetas",
   youtube: "YouTube visto",
   // Sub-stages of `signals` — match server-side keys (`_pendientes_collect`).
   "signals.mail_unread": "mail.app",
@@ -322,6 +323,7 @@ const PANEL_PRIORITY = {
   "panel-pagerank": 150,
   "panel-weather": 160,
   "panel-finance": 170,
+  "panel-cards": 175,
 };
 function panelPriority(id) {
   if (id in PANEL_PRIORITY) return PANEL_PRIORITY[id];
@@ -956,6 +958,113 @@ function renderFinance(f) {
   return panel("finance", "finanzas", null, body);
 }
 
+// signals.cards — resúmenes de tarjeta de crédito parseados de los `.xlsx`
+// del banco en /Finances. Shape (lista de):
+//   { brand, last4, holder, closing_date, due_date,
+//     next_closing_date, next_due_date,
+//     total_ars, total_usd, minimum_ars, minimum_usd,
+//     top_purchases_ars: [{date,description,amount,currency}, ...],
+//     top_purchases_usd: [{...}], source_file, source_mtime }
+// Días-hasta-vencimiento se computa client-side para no servir HTML
+// stale: el server cachea el resumen por (path,mtime) pero el countdown
+// avanza con el reloj del browser.
+function renderCards(cards) {
+  if (!cards || !cards.length) return panel("cards", "tarjetas", 0, "", "sin resumen");
+  const fmtArs = (n) => {
+    if (n == null) return "—";
+    const v = Math.round(Number(n));
+    return "$" + v.toLocaleString("es-AR");
+  };
+  const fmtUsd = (n) => {
+    if (n == null) return "—";
+    return "U$S" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const daysUntil = (iso) => {
+    if (!iso) return null;
+    const d = new Date(iso + "T00:00:00");
+    if (isNaN(d.getTime())) return null;
+    return Math.round((d.getTime() - today.getTime()) / 86400000);
+  };
+
+  const items = cards.map((c) => {
+    const title = `${esc(c.brand || "Tarjeta")} ····${esc(c.last4 || "----")}`;
+    // Total a pagar: ambos lados separados con " + " si hay USD también
+    const totalBits = [];
+    if (c.total_ars) totalBits.push(fmtArs(c.total_ars));
+    if (c.total_usd) totalBits.push(fmtUsd(c.total_usd));
+    const totalStr = totalBits.length ? totalBits.join(" + ") : "—";
+
+    // Vencimiento + countdown
+    const dueDays = daysUntil(c.due_date);
+    let dueLabel = "";
+    let dueCls = "flat";
+    if (c.due_date) {
+      if (dueDays == null) {
+        dueLabel = `vence ${esc(c.due_date)}`;
+      } else if (dueDays < 0) {
+        dueLabel = `vencida hace ${Math.abs(dueDays)}d`;
+        dueCls = "down";
+      } else if (dueDays === 0) {
+        dueLabel = "vence HOY";
+        dueCls = "down";
+      } else if (dueDays <= 3) {
+        dueLabel = `vence en ${dueDays}d`;
+        dueCls = "down";
+      } else if (dueDays <= 7) {
+        dueLabel = `vence en ${dueDays}d`;
+        dueCls = "flat";
+      } else {
+        dueLabel = `vence en ${dueDays}d (${esc(c.due_date)})`;
+      }
+    }
+
+    const meta = [];
+    if (c.closing_date) meta.push(`cerró ${esc(c.closing_date)}`);
+    if (c.holder) meta.push(esc(c.holder));
+    const metaStr = meta.length ? `<span class="meta">${meta.join(" · ")}</span>` : "";
+
+    return `<li>
+      <b>${title}</b>
+      <span class="meta">${totalStr}</span>
+      ${dueLabel ? `<span class="delta ${dueCls}">${esc(dueLabel)}</span>` : ""}
+      ${metaStr}
+    </li>`;
+  }).join("");
+
+  // Top consumos consolidados (por tarjeta — tomamos los primeros 3 ARS y 1 USD
+  // de cada tarjeta, mergeados, ordenados desc por monto en su moneda).
+  const topItems = [];
+  cards.forEach((c) => {
+    (c.top_purchases_ars || []).slice(0, 3).forEach((p) => {
+      topItems.push({ ...p, brand: c.brand, last4: c.last4, currency: "ARS" });
+    });
+    (c.top_purchases_usd || []).slice(0, 1).forEach((p) => {
+      topItems.push({ ...p, brand: c.brand, last4: c.last4, currency: "USD" });
+    });
+  });
+  topItems.sort((a, b) => {
+    // ARS y USD no son comparables 1:1 — bucketear por moneda.
+    if (a.currency !== b.currency) return a.currency === "USD" ? 1 : -1;
+    return Number(b.amount || 0) - Number(a.amount || 0);
+  });
+  const topHtml = topItems.slice(0, 6).map((p) => {
+    const fmt = p.currency === "USD" ? fmtUsd : fmtArs;
+    const cardTag = p.brand ? `${esc(p.brand)} ····${esc(p.last4 || "")}` : "";
+    return `<li>
+      <b>${esc(p.description || "—")}</b>
+      <span class="meta">${esc(p.date || "")}${cardTag ? " · " + cardTag : ""}</span>
+      <span class="delta down">-${fmt(p.amount)}</span>
+    </li>`;
+  }).join("");
+
+  const body = `<ul>${items}</ul>`
+    + (topHtml ? `<div class="meta" style="margin:10px 0 4px;">top consumos</div><ul>${topHtml}</ul>` : "");
+
+  return panel("cards", "tarjetas", null, body);
+}
+
 // signals.whatsapp_unreplied — chats whose last message is inbound and
 // still awaits a reply. Distinct from `renderWhatsApp` (unread inbound
 // in last 24h): this one flags where *you* owe the next move. Item
@@ -1163,6 +1272,7 @@ function render(data) {
     renderVaultActivity(signals.vault_activity),
     renderDriveRecent(signals.drive_recent),
     renderFinance(signals.finance),
+    renderCards(signals.cards),
   ].join("");
 
   els.panels.innerHTML = html;

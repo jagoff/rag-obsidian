@@ -5888,6 +5888,150 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ON rag_routing_rules(active, bucket)",
         ),
     ),
+    (
+        # WA Negotiation Auto-Pilot — Fase 0 (Foundation). Spec en
+        # 04-Archive/99-obsidian-system/99-Claude/system/wa-negotiation-
+        # autopilot/design.md. Una fila por negociación que el user
+        # lance vía PWA / self-DM / voz. El `status` está validado al
+        # transition por `rag_negotiations.state_machine.transition()`
+        # — esta tabla NO impone CHECK constraints sobre los strings
+        # legales para que sea fácil agregar estados nuevos sin
+        # migration. Estados actuales: draft, launched, in_flight,
+        # escalated, closed_ok, closed_fail, cancelled, out_of_perimeter.
+        # `perimeter_json` lleva el scope acordado al lanzar (topic +
+        # items + caps de transacción) — el classifier lo lee en F2
+        # para detectar `perimeter_violation`.
+        "rag_negotiations",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiations ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " trace_id TEXT,"
+            " user_intent TEXT NOT NULL,"
+            " target_jid TEXT NOT NULL,"
+            " target_name TEXT,"
+            " status TEXT NOT NULL,"
+            " created_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL,"
+            " closed_at TEXT,"
+            " perimeter_json TEXT NOT NULL,"
+            " confidence_threshold REAL,"
+            " max_messages INTEGER,"
+            " messages_sent INTEGER DEFAULT 0,"
+            " messages_received INTEGER DEFAULT 0,"
+            " last_message_id TEXT,"
+            " closure_type TEXT,"
+            " closure_summary TEXT,"
+            " side_effect_json TEXT,"
+            " style_seed_jid TEXT,"
+            " style_examples_count INTEGER,"
+            " cost_estimate_cents INTEGER,"
+            " user_overrode_count INTEGER DEFAULT 0"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_status_updated "
+            "ON rag_negotiations(status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_target_jid "
+            "ON rag_negotiations(target_jid, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_negotiations_trace_id "
+            "ON rag_negotiations(trace_id) WHERE trace_id IS NOT NULL",
+        ),
+    ),
+    (
+        # Una fila por mensaje (in/out) de una negociación.
+        # `direction='in'` = mensaje recibido del target_jid;
+        # `direction='out'` = mensaje mandado por el bot (o por el
+        # user si fue user_resumes / user_takes_over). El classifier
+        # confidence + reasoning quedan para audit ("¿por qué el bot
+        # contestó así?"). FK con `ON DELETE CASCADE` para que borrar
+        # una negociación obsoleta limpie todo el historial sin
+        # orphan rows.
+        "rag_negotiation_turns",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiation_turns ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " negotiation_id INTEGER NOT NULL"
+            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
+            " ts TEXT NOT NULL,"
+            " direction TEXT NOT NULL,"
+            " content TEXT NOT NULL,"
+            " classifier_confidence REAL,"
+            " classifier_reasoning TEXT,"
+            " pause_simulated_ms INTEGER,"
+            " bridge_message_id TEXT,"
+            " escalated_at TEXT,"
+            " user_response_text TEXT,"
+            " user_response_at TEXT,"
+            " user_overrode INTEGER"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_negotiation_turns_neg_ts "
+            "ON rag_negotiation_turns(negotiation_id, ts)",
+        ),
+    ),
+    (
+        # Cola de envíos pendientes — el orchestrator (F3) lee con
+        # `dequeue_due(now)` cada N segundos. `send_after_ts` es
+        # epoch-seconds; el pause simulator setea el delay
+        # apropiado. `attempts` permite reintentos exponenciales
+        # cuando el bridge devuelve fail. `status` ∈
+        # {pending, sent, failed, cancelled}.
+        "rag_negotiation_pending_sends",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_negotiation_pending_sends ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " negotiation_id INTEGER NOT NULL"
+            "   REFERENCES rag_negotiations(id) ON DELETE CASCADE,"
+            " content TEXT NOT NULL,"
+            " typing_simulation_ms INTEGER,"
+            " send_after_ts REAL NOT NULL,"
+            " queued_at TEXT NOT NULL,"
+            " attempts INTEGER DEFAULT 0,"
+            " last_attempt_ts TEXT,"
+            " status TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_pending_sends_due "
+            "ON rag_negotiation_pending_sends(status, send_after_ts)",
+            "CREATE INDEX IF NOT EXISTS ix_pending_sends_neg "
+            "ON rag_negotiation_pending_sends(negotiation_id, queued_at DESC)",
+        ),
+    ),
+    (
+        # Style fingerprint per contacto — refrescado por el watcher
+        # de F1 cuando detecta cambios en el bridge. El JSON tiene
+        # tone / vocabulary / structural / temporal features. F0 lo
+        # trata como blob opaco; el classifier de F2 lo lee.
+        # `target_jid` como PK natural — un JID, un fingerprint.
+        "rag_style_fingerprints",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_style_fingerprints ("
+            " target_jid TEXT PRIMARY KEY,"
+            " fingerprint_json TEXT NOT NULL,"
+            " messages_analyzed INTEGER NOT NULL,"
+            " computed_at TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_style_fingerprints_computed "
+            "ON rag_style_fingerprints(computed_at DESC)",
+        ),
+    ),
+    (
+        # Behavior priors per contacto — alimentan el pause simulator
+        # de F3 (lognormal del response lag). NULL en cualquier
+        # campo → fallback a defaults globales en el simulator.
+        # `samples_n` permite UI tipo "basado en N mensajes".
+        "rag_behavior_priors_wa",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_behavior_priors_wa ("
+            " target_jid TEXT PRIMARY KEY,"
+            " response_lag_mu REAL,"
+            " response_lag_sigma REAL,"
+            " avg_msg_length_words REAL,"
+            " msg_per_response REAL,"
+            " emoji_freq REAL,"
+            " samples_n INTEGER,"
+            " computed_at TEXT NOT NULL"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_behavior_priors_wa_computed "
+            "ON rag_behavior_priors_wa(computed_at DESC)",
+        ),
+    ),
 )
 
 

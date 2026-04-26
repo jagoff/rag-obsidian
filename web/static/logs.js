@@ -244,6 +244,7 @@
       $("viewer-sub").textContent = "";
       $("viewer-tabs").replaceChildren();
       $("viewer-controls").hidden = true;
+      $("viewer-charts").hidden = true;
       $("viewer-body").replaceChildren(
         el("div", { class: "empty-state" },
           "elegí un service del listado",
@@ -301,6 +302,7 @@
         )
       );
       $("viewer-counts").textContent = "";
+      $("viewer-charts").hidden = true;
       return;
     }
     try {
@@ -316,6 +318,7 @@
       state.viewerData = data;
       renderViewerBody(data, scrollToBottom);
       renderViewerCounts(data);
+      renderCharts(data);
     } catch (e) {
       $("viewer-body").replaceChildren(
         el("div", { class: "empty-state" },
@@ -397,6 +400,163 @@
     if (c.warn) html += ` · <span class="c-warn">${c.warn} warn</span>`;
     if (c.ok) html += ` · <span class="c-ok">${c.ok} ok</span>`;
     $("viewer-counts").innerHTML = html;
+  }
+
+  // ── Charts: donut + timeline ──────────────────────────────────────────
+  // Ambos derivan del mismo `data.lines` que ya tenemos en estado, así
+  // que no hay request adicional. Si las líneas no traen `ts` (logs sin
+  // timestamps detectables), el timeline muestra el placeholder "sin
+  // timestamps" y el donut sigue funcionando con los counts.
+
+  /** Donut: stroke-dasharray sobre un círculo r=26 con perímetro 2πr.
+   *  Cada segmento ocupa una proporción del perímetro = count/total. */
+  function renderDonutChart(counts) {
+    const order = ["error", "warn", "ok", "info"];
+    const total = order.reduce((a, k) => a + (counts[k] || 0), 0);
+    const svg = $("charts-donut");
+
+    // Limpiar segmentos previos (mantenemos el donut-bg).
+    svg.querySelectorAll(".donut-seg, .donut-center-num").forEach((n) => n.remove());
+
+    if (total === 0) {
+      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      t.setAttribute("class", "donut-center-num");
+      t.setAttribute("x", "32"); t.setAttribute("y", "32");
+      t.style.fill = "var(--text-faint)";
+      t.style.fontSize = "10px";
+      t.textContent = "—";
+      svg.appendChild(t);
+      return;
+    }
+
+    const r = 26;
+    const C = 2 * Math.PI * r; // ≈163.36
+    let offset = 0;
+    for (const k of order) {
+      const v = counts[k] || 0;
+      if (v === 0) continue;
+      const len = (v / total) * C;
+      const seg = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      seg.setAttribute("class", "donut-seg s-" + k);
+      seg.setAttribute("cx", "32"); seg.setAttribute("cy", "32"); seg.setAttribute("r", String(r));
+      // Empezar en las 12 (rotación -90°).
+      seg.setAttribute("transform", "rotate(-90 32 32)");
+      seg.setAttribute("stroke-dasharray", `${len} ${C - len}`);
+      seg.setAttribute("stroke-dashoffset", String(-offset));
+      svg.appendChild(seg);
+      offset += len;
+    }
+
+    // Número central: total de líneas.
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    t.setAttribute("class", "donut-center-num");
+    t.setAttribute("x", "32"); t.setAttribute("y", "32");
+    t.textContent = total >= 1000 ? `${(total / 1000).toFixed(1)}k` : String(total);
+    svg.appendChild(t);
+  }
+
+  /** Timeline: barras apiladas. Bins automáticos según rango temporal.
+   *  Sólo cuenta líneas con ts NO inferred (las inferred son ruido para
+   *  el chart porque heredarían a un único bin). */
+  function renderTimelineChart(lines) {
+    const svg = $("charts-timeline");
+    svg.replaceChildren();
+    const tsLines = lines.filter((l) => l.ts && !l.ts_inferred);
+    if (tsLines.length === 0) {
+      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      t.setAttribute("class", "tl-empty");
+      t.setAttribute("x", "300"); t.setAttribute("y", "30");
+      t.textContent = "sin timestamps detectables en este log";
+      svg.appendChild(t);
+      $("tl-range").textContent = "—";
+      return;
+    }
+    // Rango temporal en ms.
+    const tsMs = tsLines.map((l) => Date.parse(l.ts));
+    const tMin = Math.min(...tsMs);
+    const tMax = Math.max(...tsMs);
+    const span = Math.max(1, tMax - tMin);
+    // Bins: target 60, mínimo 1. Si todo cabe en 1min, 60 bins de 1s.
+    // Si cabe en 1h, 60 bins de 1min. Si cabe en 24h, 60 bins de 24min.
+    // Si span es 0 (todas las líneas en el mismo segundo), 1 bin.
+    const N_BINS = Math.min(60, Math.max(8, Math.floor(tsLines.length / 4)));
+    const binSize = Math.max(1, span / N_BINS);
+    const bins = Array.from({ length: N_BINS }, () => ({ error: 0, warn: 0, ok: 0, info: 0, total: 0 }));
+    for (const l of tsLines) {
+      const t = Date.parse(l.ts);
+      let idx = Math.floor((t - tMin) / binSize);
+      if (idx >= N_BINS) idx = N_BINS - 1;
+      bins[idx][l.level] = (bins[idx][l.level] || 0) + 1;
+      bins[idx].total++;
+    }
+    const maxTotal = Math.max(1, ...bins.map((b) => b.total));
+
+    // Geometría: viewBox 600×56, padding superior 4px, gap 1px entre bars.
+    const W = 600, H = 56;
+    const PAD = 4;
+    const usableH = H - PAD - 2;  // 2px abajo para visual breathing
+    const barW = W / N_BINS;
+    const gap = barW > 4 ? 1 : 0;
+    const order = ["error", "warn", "ok", "info"];
+
+    // Axis baseline (línea horizontal de referencia abajo).
+    const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    axis.setAttribute("class", "tl-axis");
+    axis.setAttribute("x1", "0"); axis.setAttribute("x2", String(W));
+    axis.setAttribute("y1", String(H - 1)); axis.setAttribute("y2", String(H - 1));
+    svg.appendChild(axis);
+
+    for (let i = 0; i < N_BINS; i++) {
+      const b = bins[i];
+      if (b.total === 0) continue;
+      const x = i * barW;
+      // Apilar de abajo arriba: info → ok → warn → error.
+      let yCursor = H - 1;
+      for (const lvl of ["info", "ok", "warn", "error"]) {
+        const v = b[lvl] || 0;
+        if (v === 0) continue;
+        const h = (v / maxTotal) * usableH;
+        const y = yCursor - h;
+        const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        r.setAttribute("class", "tl-bar-" + lvl);
+        r.setAttribute("x", String(x + gap / 2));
+        r.setAttribute("y", String(y));
+        r.setAttribute("width", String(Math.max(0.5, barW - gap)));
+        r.setAttribute("height", String(h));
+        // Tooltip con bin range + counts.
+        const binStart = new Date(tMin + i * binSize);
+        const binEnd = new Date(tMin + (i + 1) * binSize);
+        const fmt = (d) => d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+        const parts = [];
+        for (const k of order) if (b[k]) parts.push(`${k}:${b[k]}`);
+        const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        t.textContent = `${fmt(binStart)}–${fmt(binEnd)} · ${parts.join(" ")}`;
+        r.appendChild(t);
+        svg.appendChild(r);
+        yCursor = y;
+      }
+    }
+
+    // Etiqueta de rango: "HH:MM:SS → HH:MM:SS" o "MM-DD HH:MM → MM-DD HH:MM"
+    // según span.
+    const dMin = new Date(tMin);
+    const dMax = new Date(tMax);
+    const sameDay = dMin.toDateString() === dMax.toDateString();
+    const fmtTs = (d) => sameDay
+      ? d.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+      : d.toLocaleString("es-AR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+    $("tl-range").textContent = `${fmtTs(dMin)} → ${fmtTs(dMax)}`;
+  }
+
+  function renderCharts(data) {
+    const counts = data.counts || {};
+    $("leg-error").textContent = counts.error || 0;
+    $("leg-warn").textContent = counts.warn || 0;
+    $("leg-ok").textContent = counts.ok || 0;
+    $("leg-info").textContent = counts.info || 0;
+    renderDonutChart(counts);
+    renderTimelineChart(data.lines || []);
+    $("viewer-charts").hidden = false;
   }
 
   // ── Error banner ─────────────────────────────────────────────────────

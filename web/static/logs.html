@@ -519,6 +519,136 @@
     .viewer-counts .c-warn  { color: var(--yellow); }
     .viewer-counts .c-ok    { color: var(--green); }
 
+    /* ── Charts ──────────────────────────────────────────────────────
+       Dos gráficos en el viewer header: donut con distribución de
+       niveles + timeline con barras apiladas por nivel.
+       Se ocultan si no hay un service seleccionado o si no hay datos.
+    */
+    .viewer-charts {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--sep);
+      background: color-mix(in srgb, var(--bg-card) 60%, transparent);
+    }
+    .viewer-charts[hidden] { display: none; }
+
+    .charts-donut-block {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .charts-donut {
+      width: 64px;
+      height: 64px;
+      flex-shrink: 0;
+    }
+    .charts-donut .donut-bg {
+      fill: none;
+      stroke: var(--border);
+      stroke-width: 10;
+    }
+    .charts-donut .donut-seg {
+      fill: none;
+      stroke-width: 10;
+      stroke-linecap: butt;
+      transition: stroke-dasharray 0.18s ease-out;
+    }
+    .charts-donut .donut-seg.s-error { stroke: var(--red); }
+    .charts-donut .donut-seg.s-warn  { stroke: var(--yellow); }
+    .charts-donut .donut-seg.s-ok    { stroke: var(--green); }
+    .charts-donut .donut-seg.s-info  { stroke: var(--text-faint); }
+    .charts-donut .donut-center-num {
+      text-anchor: middle;
+      dominant-baseline: central;
+      font-family: "SF Mono", "Menlo", monospace;
+      font-size: 13px;
+      font-weight: 700;
+      fill: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .charts-legend {
+      display: grid;
+      grid-template-columns: auto auto;
+      gap: 2px 10px;
+      font-size: 10.5px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-dim);
+    }
+    .charts-legend .leg-key {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .charts-legend .leg-dot {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .charts-legend .leg-dot.s-error { background: var(--red); }
+    .charts-legend .leg-dot.s-warn  { background: var(--yellow); }
+    .charts-legend .leg-dot.s-ok    { background: var(--green); }
+    .charts-legend .leg-dot.s-info  { background: var(--text-faint); }
+    .charts-legend .leg-val {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    /* Timeline — bars apiladas. SVG width 100%, height fijo. Las bars se
+       dibujan via JS en logs.js renderTimelineChart. */
+    .charts-timeline-block {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .charts-timeline-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 10px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .charts-timeline-head .tl-range {
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .charts-timeline {
+      width: 100%;
+      height: 56px;
+      display: block;
+      overflow: visible;
+    }
+    .charts-timeline .tl-bar-error { fill: var(--red); }
+    .charts-timeline .tl-bar-warn  { fill: var(--yellow); }
+    .charts-timeline .tl-bar-ok    { fill: var(--green); }
+    .charts-timeline .tl-bar-info  { fill: var(--text-faint); }
+    .charts-timeline .tl-axis {
+      stroke: var(--grid);
+      stroke-width: 1;
+    }
+    .charts-timeline .tl-empty {
+      font-size: 10px;
+      fill: var(--text-faint);
+      text-anchor: middle;
+      font-style: italic;
+    }
+    .charts-timeline rect {
+      transition: opacity 0.12s ease-out;
+    }
+    .charts-timeline rect:hover {
+      opacity: 0.75;
+    }
+
     .viewer-body {
       flex: 1;
       overflow-y: auto;
@@ -734,6 +864,33 @@
             <div class="viewer-tabs" id="viewer-tabs" role="tablist" aria-label="Stdout vs stderr"></div>
           </div>
 
+          <div class="viewer-charts" id="viewer-charts" hidden aria-label="Gráficos del log">
+            <div class="charts-donut-block">
+              <svg class="charts-donut" id="charts-donut" viewBox="0 0 64 64" aria-hidden="true">
+                <circle class="donut-bg" cx="32" cy="32" r="26"></circle>
+                <!-- segmentos los inserta logs.js renderDonutChart -->
+              </svg>
+              <div class="charts-legend" id="charts-legend">
+                <div class="leg-key"><span class="leg-dot s-error"></span>error</div>
+                <div class="leg-val" id="leg-error">0</div>
+                <div class="leg-key"><span class="leg-dot s-warn"></span>warn</div>
+                <div class="leg-val" id="leg-warn">0</div>
+                <div class="leg-key"><span class="leg-dot s-ok"></span>ok</div>
+                <div class="leg-val" id="leg-ok">0</div>
+                <div class="leg-key"><span class="leg-dot s-info"></span>info</div>
+                <div class="leg-val" id="leg-info">0</div>
+              </div>
+            </div>
+            <div class="charts-timeline-block">
+              <div class="charts-timeline-head">
+                <span>actividad temporal</span>
+                <span class="tl-range" id="tl-range">—</span>
+              </div>
+              <svg class="charts-timeline" id="charts-timeline" viewBox="0 0 600 56"
+                   preserveAspectRatio="none" aria-hidden="true"></svg>
+            </div>
+          </div>
+
           <div class="viewer-controls" id="viewer-controls" hidden>
             <input id="viewer-search" type="search" placeholder="filtrar líneas (substring)…"
                    aria-label="Filtrar líneas">
@@ -753,6 +910,6 @@
     </main>
   </div>
 
-  <script src="/static/logs.js?v=2026-04-26-logs-ts" defer></script>
+  <script src="/static/logs.js?v=2026-04-26-logs-charts" defer></script>
 </body>
 </html>

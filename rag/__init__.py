@@ -41594,6 +41594,168 @@ def _is_weather_query(q: str) -> bool:
     return bool(_WEATHER_KEYWORDS.search(stripped))
 
 
+# Finance + tarjetas short-circuit — espeja el patrón del weather. El
+# WhatsApp listener pega al `rag serve /query` que NO tiene el pre-router
+# de tools del web `/api/chat`, así que queries como "cuánto gasté de
+# tarjeta este mes" terminaban en retrieve genérico → 90 notas random
+# del vault → LLM alucinaba (user report 2026-04-26).
+#
+# Regex en sync con `_TOOL_INTENT_RULES` de `web/server.py:187-209`. Si
+# se cambia uno, cambiar el otro — comparten semántica.
+_FINANCE_CARDS_KEYWORDS = re.compile(
+    r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|\bcr[eé]dito\b"
+    r"|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta"
+    r"|cu[aá]nto.*deb[oe]"
+    r"|\b(?:[uú]ltim[oa]s?|recientes?)\s+(?:gastos?|consumos?|movimientos?|compras?|cargos?|transac)\b"
+    r"|\b(?:consumos?|movimientos?|cargos?)\s+(?:de|del|en|con|mi)"
+    r"|gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze",
+    re.IGNORECASE,
+)
+_FINANCE_CARDS_MAX_TOKENS = 16
+
+
+def _is_finance_or_cards_query(q: str) -> bool:
+    """True si `q` pide datos del módulo financiero (MOZE export + xlsx
+    de tarjetas en iCloud `/Finances`). El short-circuit consulta
+    `_fetch_finance` y/o `_fetch_credit_cards` en lugar de hacer
+    retrieve sobre el vault — esos archivos no son notas indexadas y el
+    retrieve siempre los miss.
+    """
+    if not q:
+        return False
+    stripped = q.strip()
+    if not stripped:
+        return False
+    if len(stripped.split()) > _FINANCE_CARDS_MAX_TOKENS:
+        return False
+    return bool(_FINANCE_CARDS_KEYWORDS.search(stripped))
+
+
+def _format_finance_cards_block(finance: dict | None, cards: list[dict] | None) -> str:
+    """Datos de finance + cards pegados como bloques markdown plain.
+    Diseñado para entrar literal en el prompt del LLM helper sin
+    transformación, así el LLM no tiene chance de inventar números.
+    """
+    parts: list[str] = []
+
+    if cards:
+        lines = ["### Tarjetas (resumen del banco)"]
+        for c in cards:
+            brand = c.get("brand") or "Tarjeta"
+            last4 = c.get("last4") or "----"
+            lines.append(f"- {brand} ····{last4}:")
+            total_bits: list[str] = []
+            if c.get("total_ars"):
+                total_bits.append(f"${int(round(c['total_ars'])):,}".replace(",", "."))
+            if c.get("total_usd"):
+                total_bits.append(f"U$S{c['total_usd']:.2f}")
+            if total_bits:
+                lines.append(f"    Total a pagar: {' + '.join(total_bits)}")
+            if c.get("due_date"):
+                lines.append(f"    Vence: {c['due_date']}")
+            if c.get("closing_date"):
+                lines.append(f"    Cerró: {c['closing_date']}")
+            top = (c.get("top_purchases_ars") or [])[:3]
+            if top:
+                lines.append("    Top consumos ARS:")
+                for p in top:
+                    desc = p.get("description") or "—"
+                    amt = f"${int(round(p.get('amount') or 0)):,}".replace(",", ".")
+                    lines.append(f"      - {desc} · {amt}")
+            usd_top = (c.get("top_purchases_usd") or [])[:2]
+            if usd_top:
+                lines.append("    Top consumos USD:")
+                for p in usd_top:
+                    desc = p.get("description") or "—"
+                    amt = f"U$S{p.get('amount') or 0:.2f}"
+                    lines.append(f"      - {desc} · {amt}")
+        parts.append("\n".join(lines))
+
+    if finance and isinstance(finance, dict) and finance.get("ars"):
+        ars = finance["ars"]
+        lines = ["### Gastos del mes (MOZE — gastos cargados manualmente)"]
+        lines.append(f"- Mes: {finance.get('month_label') or '—'}")
+        lines.append(
+            f"- Día: {finance.get('days_elapsed')}/{finance.get('days_in_month')}"
+        )
+        if ars.get("this_month"):
+            this_m = f"${int(round(ars['this_month'])):,}".replace(",", ".")
+            lines.append(f"- Gasto ARS este mes: {this_m}")
+        if ars.get("prev_month"):
+            prev_m = f"${int(round(ars['prev_month'])):,}".replace(",", ".")
+            delta = ars.get("delta_pct")
+            delta_str = f" ({delta:+.1f}%)" if delta is not None else ""
+            lines.append(f"- Mes anterior: {prev_m}{delta_str}")
+        if ars.get("projected"):
+            proj = f"${int(round(ars['projected'])):,}".replace(",", ".")
+            lines.append(f"- Proyectado fin de mes: {proj}")
+        cats = (ars.get("top_categories") or [])[:5]
+        if cats:
+            lines.append("- Top categorías ARS:")
+            for cat in cats:
+                amt = f"${int(round(cat.get('amount') or 0)):,}".replace(",", ".")
+                share = round((cat.get("share") or 0) * 100)
+                lines.append(f"    - {cat.get('name') or '—'}: {amt} ({share}%)")
+        usd = finance.get("usd") or {}
+        if usd.get("this_month"):
+            lines.append(f"- Gasto USD este mes: U$S{usd['this_month']:,.2f}")
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts).strip()
+
+
+def _finance_cards_comment(question: str, finance: dict | None, cards: list[dict] | None) -> str:
+    """Genera respuesta conversacional para WA con los datos pegados literal
+    en el prompt. El LLM helper (qwen2.5:3b temp=0) NO inventa porque la
+    instrucción explícita es "cita los números literalmente". Si los datos
+    no responden la pregunta, debe decir "no tengo data fresca de [X]"
+    sin fabricar.
+
+    Devuelve `""` si el helper falla — el caller debe tener fallback.
+    """
+    block = _format_finance_cards_block(finance, cards)
+    if not block:
+        return (
+            "No tengo data fresca de tus tarjetas ni de MOZE — "
+            "el último export del banco/Money app puede no estar al día."
+        )
+
+    prompt = (
+        f"DATOS FRESCOS (parseados del banco/MOZE — son la verdad):\n\n"
+        f"{block}\n\n"
+        f"PREGUNTA: \"{question}\"\n\n"
+        "Respondé EN ESPAÑOL RIOPLATENSE en 1-3 oraciones cortas, tono "
+        "informal/directo (estilo WhatsApp).\n\n"
+        "REGLAS ESTRICTAS:\n"
+        "1. Citá NÚMEROS / FECHAS / NOMBRES literalmente como aparecen "
+        "en DATOS FRESCOS. PROHIBIDO inventar montos, fechas, comercios "
+        "o categorías que no estén ahí.\n"
+        "2. Si la pregunta menciona 'tarjeta/visa/master/amex/crédito' "
+        "→ priorizá la sección 'Tarjetas'. Si menciona 'gasto/gasté' "
+        "sin marca → sección 'Gastos del mes (MOZE)'.\n"
+        "3. Si la sección con los datos pedidos no está / está vacía, "
+        "decí literalmente: 'No tengo data fresca de [X] — el último "
+        "export del banco/Money app puede no estar al día.' y CORTÁ.\n"
+        "4. Sin emojis. Sin preámbulo ('claro', 'perfecto', 'según tus '). "
+        "Sin saludo. Directo al dato."
+    )
+
+    # `HELPER_MODEL`, `HELPER_OPTIONS`, `OLLAMA_KEEP_ALIVE`, `_helper_client`
+    # están definidos en este módulo (rag/__init__.py) — usados igual
+    # que `_weather_comment` (que vive en rag/integrations/weather.py y
+    # los re-importa).
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={**HELPER_OPTIONS, "num_predict": 180},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return (resp.message.content or "").strip()
+    except Exception:
+        return ""
+
+
 _SCOPE_N_DAYS = re.compile(
     r"\bpr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as?\b|\bnext\s+(\d+)\s+days?\b",
     re.IGNORECASE,
@@ -42457,6 +42619,89 @@ def serve(host: str, port: int):
                 if not force:
                     _cache_put(cache_key, weather_payload)
                 return weather_payload
+
+        # Finance / tarjetas short-circuit (2026-04-26) — el listener de
+        # WhatsApp pega acá vía `/query`. Pre-fix, queries como "cuánto
+        # gasté de tarjeta este mes" caían al retrieve genérico y traían
+        # 90 notas random del vault (las xlsx de tarjetas + CSV de MOZE
+        # NO son notas indexadas). El LLM final alucinaba montos del
+        # Gmail digest o FinOps reports tangenciales.
+        #
+        # Espeja el patrón del weather: detect → fetch → LLM helper
+        # ligero con datos pegados literal → return. Sin retrieve, sin
+        # rerank. ~2-3s vs 15-30s del path largo.
+        if _is_finance_or_cards_query(question):
+            t_fc0 = time.perf_counter()
+            finance_data = None
+            cards_data: list[dict] | None = None
+            try:
+                # Lazy import desde web.server — el módulo es importable
+                # standalone (no requiere FastAPI corriendo). Si falla
+                # por alguna razón inesperada, fall through al RAG path
+                # (mejor que crashear la query).
+                from web.server import _fetch_credit_cards, _fetch_finance
+                finance_data = _fetch_finance()
+                cards_data = _fetch_credit_cards()
+            except Exception as exc:
+                _silent_log("serve_finance_fetch", exc)
+                # Sin datos, mejor caer al RAG normal — el user puede
+                # querer información histórica de notas que mencionan
+                # tarjetas / gastos.
+            else:
+                # Si AMBOS retornaron vacío y el user pidió algo
+                # específico, mejor decir "no tengo data" antes que
+                # llamar al LLM con un block vacío. La función helper
+                # ya tiene este case manejado, pero acortamos la latencia.
+                if not finance_data and not cards_data:
+                    answer = (
+                        "No tengo data fresca de tus tarjetas ni de MOZE — "
+                        "el último export del banco/Money app puede no "
+                        "estar al día."
+                    )
+                else:
+                    try:
+                        answer = _finance_cards_comment(
+                            question, finance_data, cards_data,
+                        )
+                    except Exception as exc:
+                        _silent_log("serve_finance_comment", exc)
+                        answer = ""
+                if answer:
+                    t_fc = time.perf_counter() - t_fc0
+                    query_turn_id = new_turn_id()
+                    if sess:
+                        append_turn(sess, {
+                            "q": question, "a": answer,
+                            "paths": [], "top_score": 0.0,
+                            "turn_id": query_turn_id, "mode": "finance",
+                        })
+                        save_session(sess)
+                    try:
+                        log_query_event({
+                            "cmd": "serve.finance",
+                            "turn_id": query_turn_id,
+                            "session": sid, "q": question[:200],
+                            "t_retrieve": 0.0,
+                            "t_gen": round(t_fc, 3),
+                            "intent": "finance",
+                            "n_cards": len(cards_data or []),
+                            "has_moze": bool(finance_data),
+                        })
+                    except Exception:
+                        pass
+                    finance_payload = {
+                        "answer": answer,
+                        "sources": [],
+                        "mode": "finance",
+                        "t_retrieve": 0.0,
+                        "t_gen": round(t_fc, 3),
+                        "turn_id": query_turn_id,
+                    }
+                    if not force:
+                        _cache_put(cache_key, finance_payload)
+                    return finance_payload
+                # answer == "" → helper falló sin generar texto; cae al
+                # RAG path para no dejar al user sin respuesta.
 
         # Metachat short-circuit — greetings / thanks / "qué podés hacer".
         # Matches the regex-based detector from rag.py:26314 (also used by

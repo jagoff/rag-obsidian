@@ -99,6 +99,11 @@ packages = [
     "rag_anticipate.signals",
     "rag_whisper_learning",
     "rag_routing_learning",
+    # Implicit feedback learning (2026-04-26 — Sprint 1 del cierre del
+    # loop de aprendizaje). Infiere `corrective_path` desde behavior
+    # post-👎 sin pedir input al user. Lee rag_feedback + rag_behavior,
+    # actualiza extra_json del feedback con el path inferido.
+    "rag_implicit_learning",
 ]
 
 # Include rag/prompts/**/*.md en el bundle del tool. Sin esto, `uv tool

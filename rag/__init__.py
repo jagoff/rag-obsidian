@@ -4998,7 +4998,26 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # query → behavior → impressions del mismo request. Crítico
             # para debug ("el chat tardó 30s ayer a las 4pm" → grep
             # trace_id en rag_queries + rag_behavior + silent_errors).
-            "CREATE INDEX IF NOT EXISTS ix_rag_queries_trace_id ON rag_queries(trace_id) WHERE trace_id IS NOT NULL",
+            #
+            # Bug 2026-04-26: el índice partial vivía acá pero falló en
+            # DBs pre-2026-04-25 que tenían `rag_queries` SIN la columna
+            # `trace_id`. `CREATE TABLE IF NOT EXISTS` es no-op cuando la
+            # tabla ya existe → el ALTER de la columna nunca se aplicaba
+            # antes del CREATE INDEX, y el `WHERE trace_id IS NOT NULL`
+            # del partial-index tiraba `OperationalError: no such column:
+            # trace_id`, que explotaba el BEGIN/COMMIT entero de
+            # `_ensure_telemetry_tables` ANTES de que pudiera correr la
+            # migración. El endpoint /transcripts y el persist de
+            # rag_status_samples tiraban 500/warns en cada request.
+            #
+            # Fix: el índice se crea ahora SOLO desde
+            # `_migrate_trace_id_columns()`, que corre DESPUÉS del ALTER
+            # idempotente. En fresh DBs el ALTER da "duplicate column"
+            # (silent), después el CREATE INDEX corre sin issues. En
+            # DBs viejas el ALTER agrega la columna, después el CREATE
+            # INDEX la encuentra. Mantener el índice fuera de
+            # `_TELEMETRY_DDL` evita que un partial-index sobre una
+            # columna recién migrada rompa el bootstrap.
         ),
     ),
     (
@@ -5024,7 +5043,10 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # last N days by path). Without it the path-only index requires
             # a filter pass on ts for every bucket.
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path_ts ON rag_behavior(path, ts)",
-            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_trace_id ON rag_behavior(trace_id) WHERE trace_id IS NOT NULL",
+            # Mismo escenario que `ix_rag_queries_trace_id` arriba: el
+            # partial-index sobre `trace_id` vive AHORA en
+            # `_migrate_trace_id_columns()` para que corra DESPUÉS del
+            # ALTER. Ver bug 2026-04-26 en el comentario de rag_queries.
         ),
     ),
     (
@@ -39854,6 +39876,59 @@ def _online_tune_plist(rag_bin: str) -> str:
 """
 
 
+def _implicit_feedback_plist(rag_bin: str) -> str:
+    """Nightly implicit feedback inference — corre 03:25, 5 min antes del
+    online-tune.
+
+    Inferir corrective_path desde behavior post-👎 (ver
+    `rag_implicit_learning.corrective_paths`). Pre-popula
+    `rag_feedback.extra_json` con corrective_paths sin que el user toque
+    nada — destraba el gate del online-tune (≥20 corrective_paths) sin
+    depender de que el user marque manualmente cada nota correcta en el
+    chat. Sprint 1 del cierre del loop de aprendizaje (2026-04-26).
+
+    Schedule a las 03:25 deliberado: el `online-tune` corre 03:30, y este
+    daemon lo precede para que la signal nueva entre a la primera corrida
+    del tune. 5 minutos es suficiente — el inferrer es ~20ms sobre 70
+    feedbacks, dominado por SQL setup, no por lógica.
+
+    Salida JSON al log para que `tail -f` muestre métricas estructuradas
+    sin parseo. RunAtLoad=false porque solo tiene sentido nightly tras
+    acumular signal del día.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-implicit-feedback</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>feedback</string>
+    <string>infer-implicit</string>
+    <string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>25</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/implicit-feedback.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/implicit-feedback.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _ingest_whatsapp_plist(rag_bin: str) -> str:
     """Cross-source: WhatsApp ingester, cada 15min.
 
@@ -40134,6 +40209,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _wa_scheduled_send_plist(rag_bin)),
         ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
          _auto_harvest_plist(rag_bin)),
+        # Implicit corrective_path inference — corre 03:25, 5 min antes
+        # del online-tune. Pre-popula corrective_paths desde behavior
+        # post-👎 sin pedir input al user. Sprint 1 del cierre del loop
+        # de auto-aprendizaje (2026-04-26).
+        ("com.fer.obsidian-rag-implicit-feedback",
+         "com.fer.obsidian-rag-implicit-feedback.plist",
+         _implicit_feedback_plist(rag_bin)),
         ("com.fer.obsidian-rag-online-tune", "com.fer.obsidian-rag-online-tune.plist",
          _online_tune_plist(rag_bin)),
         ("com.fer.obsidian-rag-calibrate", "com.fer.obsidian-rag-calibrate.plist",
@@ -40181,7 +40263,16 @@ def setup(remove: bool):
     rag_bin = _rag_binary()
     if not Path(rag_bin).is_file():
         console.print(f"[red]No encuentro el binario `rag`:[/red] {rag_bin}")
-        console.print("[dim]Instalá primero: uv tool install --reinstall --editable .[/dim]")
+        # Incluir el extra `[entities]` por default — sin él, gliner no se
+        # instala en el uv tool venv y los ingesters loggean
+        # `[feature: entities] dep \`gliner\` not available` cada corrida +
+        # la feature de entity-aware retrieval queda desactivada
+        # silenciosamente. Aprendido el 2026-04-25 en una sesión donde los
+        # 5 *.error.log se llenaron de ese warning durante días sin que
+        # nadie lo notara. Si querés MUY mínimo (e.g. CI sin GPU/MPS),
+        # corré `uv tool install --reinstall --editable .` (sin extra) y
+        # exportá `RAG_EXTRACT_ENTITIES=0` para silenciar.
+        console.print("[dim]Instalá primero: uv tool install --reinstall --editable '.[entities]'[/dim]")
         return
     _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     _RAG_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -49253,6 +49344,105 @@ def feedback_auto_harvest(
                          if remaining > 0
                          else "[bold green](gate open!)[/bold green]"))
     console.print()
+
+
+@feedback.command("infer-implicit")
+@click.option("--window-seconds", "window_seconds", default=60,
+              show_default=True,
+              help="Cuántos segundos después de un 👎 considerar como reacción "
+                   "del user (60s = ventana típica para search UX).")
+@click.option("--dry-run", is_flag=True,
+              help="No persistir cambios — solo reportar qué se inferiría.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emitir summary como JSON (para launchd / scripts).")
+def feedback_infer_implicit(
+    window_seconds: int, dry_run: bool, as_json: bool
+) -> None:
+    """Inferir corrective_path implícito desde behavior post-👎.
+
+    Para cada feedback con `rating=-1` que NO tiene `corrective_path`
+    todavía, busca eventos `open` en `rag_behavior` dentro de la ventana
+    temporal post-feedback en la misma session. Si el path opened NO es
+    el #1 que se rankeó, ESE es el corrective_path implícito — el user
+    contradijo el ranking abriendo otra source.
+
+    Útil para destrabar el gate del fine-tune (`online-tune` necesita
+    ≥20 feedbacks con corrective_path para mover los pesos del ranker).
+    Hoy todos los corrective_paths se generan a mano via `rag chat`; este
+    comando rescata signal histórica que se perdió porque el user no
+    marcó manualmente la nota correcta.
+
+    Idempotente: skipea feedbacks que ya tienen corrective_path. Re-correrlo
+    no duplica trabajo.
+
+    Persiste a `rag_feedback.extra_json`:
+      - `corrective_path`: el path inferido
+      - `corrective_source`: "implicit_behavior_inference"
+      - `corrective_inferred_at`: timestamp ISO
+      - `corrective_in_top_k`: si el path estaba en los top-k mostrados
+    """
+    import json as _json
+    from rag_implicit_learning import infer_corrective_paths_from_behavior
+
+    with _ragvec_state_conn() as conn:
+        result = infer_corrective_paths_from_behavior(
+            conn, window_seconds=window_seconds, dry_run=dry_run
+        )
+
+    if as_json:
+        # No imprimir los `updates` raw en JSON modo launchd — pueden ser
+        # 100+ rows y solo necesitamos las métricas para el log nightly.
+        summary = {k: v for k, v in result.items() if k != "updates"}
+        summary["n_updates_payload_redacted"] = len(result.get("updates", []))
+        click.echo(_json.dumps(summary))
+        return
+
+    console.print()
+    console.print("[bold]rag feedback infer-implicit[/bold]")
+    console.print(f"  Window: {result['window_seconds']}s · "
+                  f"dry-run={'yes' if result['dry_run'] else 'no'}")
+    console.print()
+    console.print(f"  Candidatos (rating=-1):  {result['n_candidates']}")
+    console.print(f"  [bold green]Inferidos:               "
+                  f"{result['n_inferred']}[/bold green]")
+    console.print(f"  Skip — ya tienen corrective: "
+                  f"{result['n_skip_already_corrective']}")
+    console.print(f"  Skip — sin session_id:       "
+                  f"{result['n_skip_no_session']}")
+    console.print(f"  Skip — sin paths_json:       {result['n_skip_no_paths']}")
+    console.print(f"  Skip — sin opens en ventana: {result['n_skip_no_open']}")
+    console.print(f"  Skip — abrió el top path:    "
+                  f"{result['n_skip_opened_top']}")
+    console.print()
+
+    if result["updates"]:
+        from rich.table import Table
+        tbl = Table(show_header=True, header_style="bold cyan")
+        tbl.add_column("fb_id", justify="right")
+        tbl.add_column("ts", style="dim")
+        tbl.add_column("query", overflow="fold", max_width=40)
+        tbl.add_column("top_path → corrective", overflow="fold", max_width=60)
+        tbl.add_column("in top-k?")
+        for u in result["updates"][:20]:
+            tbl.add_row(
+                str(u["feedback_id"]),
+                u["ts"],
+                u["query"] or "—",
+                f"[red]{u['top_path']}[/red] → [green]{u['corrective_path']}[/green]",
+                "✓" if u["in_top_k"] else "[yellow]ext[/yellow]",
+            )
+        console.print(tbl)
+        if len(result["updates"]) > 20:
+            console.print(
+                f"\n  [dim]... y {len(result['updates']) - 20} más "
+                f"(usá --json para todos)[/dim]\n"
+            )
+
+    if dry_run and result["n_inferred"] > 0:
+        console.print(
+            "\n[yellow]💡 Re-corré sin --dry-run para persistir los "
+            "corrective_paths.[/yellow]"
+        )
 
 
 # ── /end `rag feedback` subgroup ────────────────────────────────────────

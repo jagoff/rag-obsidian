@@ -4,9 +4,9 @@ Regresiones que atrapan:
   - El comando se registra en Click y aparece en `rag --help`.
   - `--dry-run` no dispara ningún step real (smoke test).
   - Cada `--skip-*` flag realmente saltea su step.
-  - Los pasos dependen del orden declarado: index → maintenance → radars →
-    morning → warmup. Si alguien reordena y rompe la secuencia, el test
-    detecta el cambio.
+  - Los pasos dependen del orden declarado: index → bookmarks → wa-tasks →
+    maintenance → radars → morning → warmup. Si alguien reordena y rompe la
+    secuencia, el test detecta el cambio.
   - Si un step tira exception, los siguientes igual corren (independencia).
   - Exit code != 0 cuando al menos un step falla (para que launchd lo
     marque rojo en /status).
@@ -46,13 +46,13 @@ def test_wake_up_command_registered():
 
 
 def test_wake_up_help_has_all_skip_flags():
-    """El `--help` lista los 5 skips + dry-run (contract para launchd/cron)."""
+    """El `--help` lista los 7 skips + dry-run (contract para launchd/cron)."""
     runner = CliRunner()
     result = runner.invoke(rag_module.cli, ["wake-up", "--help"])
     assert result.exit_code == 0
     for flag in (
-        "--dry-run", "--skip-index", "--skip-maintenance",
-        "--skip-radars", "--skip-brief", "--skip-warmup",
+        "--dry-run", "--skip-index", "--skip-bookmarks", "--skip-wa-tasks",
+        "--skip-maintenance", "--skip-radars", "--skip-brief", "--skip-warmup",
     ):
         assert flag in result.output, f"falta {flag} en --help"
 
@@ -74,8 +74,9 @@ def test_wake_up_dry_run_skips_everything():
 
     assert result.exit_code == 0
     assert called == []  # nada se llamó
-    # Output muestra los 6 steps.
-    assert "6 pasos" in result.output
+    # Output muestra los 8 steps (index, bookmarks, wa-tasks, maintenance,
+    # patterns, emergent, morning, warmup).
+    assert "8 pasos" in result.output
     assert "dry-run: skippeado" in result.output
 
 
@@ -84,43 +85,76 @@ def test_wake_up_skip_all_still_valid():
     runner = CliRunner()
     result = runner.invoke(rag_module.cli, [
         "wake-up", "--dry-run",
-        "--skip-index", "--skip-maintenance", "--skip-radars",
-        "--skip-brief", "--skip-warmup",
+        "--skip-index", "--skip-bookmarks", "--skip-wa-tasks",
+        "--skip-maintenance", "--skip-radars", "--skip-brief", "--skip-warmup",
     ])
     assert result.exit_code == 0
     assert "0 pasos" in result.output
 
 
 def test_wake_up_skip_warmup_reduces_step_count():
-    """--skip-warmup → 5 pasos en vez de 6."""
+    """--skip-warmup → 7 pasos en vez de 8."""
     runner = CliRunner()
     result = runner.invoke(rag_module.cli, [
         "wake-up", "--dry-run", "--skip-warmup",
     ])
     assert result.exit_code == 0
-    assert "5 pasos" in result.output
+    assert "7 pasos" in result.output
 
 
 def test_wake_up_skip_index_removes_only_index():
-    """--skip-index → 5 pasos (warmup se queda), index no aparece."""
+    """--skip-index → 7 pasos (bookmarks + wa-tasks + maintenance + radars +
+    morning + warmup quedan), index no aparece."""
     runner = CliRunner()
     result = runner.invoke(rag_module.cli, [
         "wake-up", "--dry-run", "--skip-index",
     ])
     assert result.exit_code == 0
-    assert "5 pasos" in result.output
+    assert "7 pasos" in result.output
     assert "rag index" not in result.output
+    assert "rag bookmarks sync" in result.output
+    assert "rag wa-tasks" in result.output
     assert "rag maintenance" in result.output
 
 
+def test_wake_up_skip_bookmarks_removes_only_bookmarks():
+    """--skip-bookmarks → 7 pasos, bookmarks sync no aparece pero los
+    otros sí (incluyendo wa-tasks). `rag index` igual sincroniza
+    bookmarks como pre-sync, pero el log de wake-up no muestra paso
+    explícito."""
+    runner = CliRunner()
+    result = runner.invoke(rag_module.cli, [
+        "wake-up", "--dry-run", "--skip-bookmarks",
+    ])
+    assert result.exit_code == 0
+    assert "7 pasos" in result.output
+    assert "rag bookmarks sync" not in result.output
+    assert "rag wa-tasks" in result.output
+    assert "rag index" in result.output
+
+
+def test_wake_up_skip_wa_tasks_removes_only_wa_tasks():
+    """--skip-wa-tasks → 7 pasos, wa-tasks no aparece. Útil cuando el
+    cron de 30min `com.fer.obsidian-rag-wa-tasks` ya cubre el extractor
+    y querés evitar la duplicación en el wake-up."""
+    runner = CliRunner()
+    result = runner.invoke(rag_module.cli, [
+        "wake-up", "--dry-run", "--skip-wa-tasks",
+    ])
+    assert result.exit_code == 0
+    assert "7 pasos" in result.output
+    assert "rag wa-tasks" not in result.output
+    assert "rag bookmarks sync" in result.output
+
+
 def test_wake_up_skip_radars_removes_both_radars():
-    """--skip-radars → 4 pasos (patterns + emergent juntos)."""
+    """--skip-radars → 6 pasos (patterns + emergent juntos)."""
     runner = CliRunner()
     result = runner.invoke(rag_module.cli, [
         "wake-up", "--dry-run", "--skip-radars",
     ])
     assert result.exit_code == 0
-    assert "4 pasos" in result.output
+    assert "6 pasos" in result.output
     assert "rag patterns" not in result.output
     assert "rag emergent" not in result.output
     assert "rag morning" in result.output
@@ -129,8 +163,9 @@ def test_wake_up_skip_radars_removes_both_radars():
 # ── Execution order & independence ──────────────────────────────────
 
 def test_wake_up_runs_steps_in_declared_order():
-    """Sequence de llamados: index → maintenance → patterns → emergent
-    → morning → (warmup). Si alguien reordena, el test falla."""
+    """Sequence de llamados: index → bookmarks → wa-tasks → maintenance →
+    patterns → emergent → morning → (warmup). Si alguien reordena, el
+    test falla."""
     runner = CliRunner()
     call_order: list[str] = []
 
@@ -139,7 +174,17 @@ def test_wake_up_runs_steps_in_declared_order():
             call_order.append(name)
         return _fn
 
+    # `wake_up` hace `from rag.wa_tasks import wa_tasks` en su cuerpo, por
+    # lo que parchamos el atributo `wa_tasks` del submódulo. Cuidado:
+    # `rag.wa_tasks` está shadowed por la función Click `wa_tasks`
+    # re-exportada al final de `rag/__init__.py` — `import rag.wa_tasks`
+    # devuelve la función, no el módulo. Usamos `sys.modules` para
+    # acceder al submódulo real.
+    rag_wa_tasks_mod = sys.modules["rag.wa_tasks"]
+
     with patch.object(rag_module, "index", new=_stub("index")), \
+         patch.object(rag_module, "bookmarks_sync", new=_stub("bookmarks")), \
+         patch.object(rag_wa_tasks_mod, "wa_tasks", new=_stub("wa_tasks")), \
          patch.object(rag_module, "maintenance", new=_stub("maintenance")), \
          patch.object(rag_module, "patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
@@ -151,8 +196,8 @@ def test_wake_up_runs_steps_in_declared_order():
         result = runner.invoke(rag_module.cli, ["wake-up"])
 
     assert result.exit_code == 0, result.output
-    assert call_order == ["index", "maintenance", "patterns", "emergent",
-                          "morning", "ollama"]
+    assert call_order == ["index", "bookmarks", "wa_tasks", "maintenance",
+                          "patterns", "emergent", "morning", "ollama"]
 
 
 def test_wake_up_continues_after_step_failure():
@@ -169,7 +214,11 @@ def test_wake_up_continues_after_step_failure():
         call_order.append("maintenance-FAIL")
         raise RuntimeError("simulated failure")
 
+    rag_wa_tasks_mod = sys.modules["rag.wa_tasks"]
+
     with patch.object(rag_module, "index", new=_stub("index")), \
+         patch.object(rag_module, "bookmarks_sync", new=_stub("bookmarks")), \
+         patch.object(rag_wa_tasks_mod, "wa_tasks", new=_stub("wa_tasks")), \
          patch.object(rag_module, "maintenance", new=_explode), \
          patch.object(rag_module, "patterns", new=_stub("patterns")), \
          patch.object(rag_module, "emergent", new=_stub("emergent")), \
@@ -183,8 +232,8 @@ def test_wake_up_continues_after_step_failure():
     # Exit != 0 porque un step falló (launchd lo marca rojo).
     assert result.exit_code == 1
     # Todos los pasos siguientes a maintenance igual corrieron.
-    assert call_order == ["index", "maintenance-FAIL", "patterns",
-                          "emergent", "morning", "ollama"]
+    assert call_order == ["index", "bookmarks", "wa_tasks", "maintenance-FAIL",
+                          "patterns", "emergent", "morning", "ollama"]
     assert "Fallaron" in result.output
     assert "simulated failure" in result.output
 
@@ -197,7 +246,11 @@ def test_wake_up_ollama_warmup_uses_keep_alive_minus_one():
     def _capture(*args, **kwargs):
         seen_kwargs.update(kwargs)
 
+    rag_wa_tasks_mod = sys.modules["rag.wa_tasks"]
+
     with patch.object(rag_module, "index", new=lambda *a, **kw: None), \
+         patch.object(rag_module, "bookmarks_sync", new=lambda *a, **kw: None), \
+         patch.object(rag_wa_tasks_mod, "wa_tasks", new=lambda *a, **kw: None), \
          patch.object(rag_module, "maintenance", new=lambda *a, **kw: None), \
          patch.object(rag_module, "patterns", new=lambda *a, **kw: None), \
          patch.object(rag_module, "emergent", new=lambda *a, **kw: None), \

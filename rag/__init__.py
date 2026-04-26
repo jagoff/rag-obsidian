@@ -38184,6 +38184,14 @@ def find_dead_notes(
               help="Reportar los pasos sin ejecutar nada")
 @click.option("--skip-index", is_flag=True,
               help="Saltear `rag index` (ETLs + reindex)")
+@click.option("--skip-bookmarks", is_flag=True,
+              help="Saltear `rag bookmarks sync` (Chrome bookmarks). "
+                   "Nota: `rag index` ya los sincroniza automáticamente "
+                   "desde 2026-04-25 — este paso es redundante por default "
+                   "pero queda explícito para que se vea en el log y para "
+                   "cubrir el caso `--skip-index`.")
+@click.option("--skip-wa-tasks", is_flag=True,
+              help="Saltear `rag wa-tasks` (action items de WhatsApp al Inbox)")
 @click.option("--skip-maintenance", is_flag=True,
               help="Saltear `rag maintenance`")
 @click.option("--skip-radars", is_flag=True,
@@ -38193,20 +38201,32 @@ def find_dead_notes(
 @click.option("--skip-warmup", is_flag=True,
               help="Saltear el Ollama warmup")
 @click.pass_context
-def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
-            skip_radars: bool, skip_brief: bool, skip_warmup: bool):
+def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
+            skip_wa_tasks: bool, skip_maintenance: bool, skip_radars: bool,
+            skip_brief: bool, skip_warmup: bool):
     """Wake-up pack: traé todo fresco antes de despertarte.
 
     Orquesta en este orden (cada paso es independiente — si uno falla,
     los demás siguen):
 
     \b
-      1. `rag index`        — ETLs de todas las fuentes + reindex del vault.
-      2. `rag maintenance`  — WAL checkpoint, rotación de logs, cleanup.
-      3. `rag patterns`     — radar de feedback dominante.
-      4. `rag emergent`     — radar de temas emergentes en queries.
-      5. `rag morning`      — brief matutino pre-renderizado a 05-Reviews/.
-      6. Ollama warmup      — carga el chat model con keep_alive=-1.
+      1. `rag index`           — ETLs de todas las fuentes + reindex del vault.
+      2. `rag bookmarks sync`  — Chrome bookmarks → sub-índice URLs (rag links).
+      3. `rag wa-tasks`        — extractor de action items de WhatsApp al Inbox.
+      4. `rag maintenance`     — WAL checkpoint, rotación de logs, cleanup.
+      5. `rag patterns`        — radar de feedback dominante.
+      6. `rag emergent`        — radar de temas emergentes en queries.
+      7. `rag morning`         — brief matutino pre-renderizado a 05-Reviews/.
+      8. Ollama warmup         — carga el chat model con keep_alive=-1.
+
+    Nota sobre bookmarks: `rag index` ya los sincroniza automáticamente
+    como parte del pre-sync cross-source desde 2026-04-25. El paso 2
+    (`rag bookmarks sync`) está acá por dos razones: (a) queda visible
+    en el log del wake-up — sino se "esconde" dentro de los logs de
+    `rag index`; (b) cubre el caso `--skip-index`, donde igual querés
+    refrescar bookmarks sin reindexar todo el vault. El costo es ~100ms
+    de duplicación cuando ambos corren (idempotente, segunda corrida
+    es no-op por hash-skip).
 
     Pensado para launchd a las 04:00 — `rag setup` instala el plist.
     Exit code != 0 si algún paso falla (launchd lo marca rojo).
@@ -38214,6 +38234,10 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
     Flags de skip útiles para debug o cuando un subsistema específico
     está roto y querés correr el resto igual.
     """
+    # `wa_tasks` se carga al final de rag/__init__.py (línea ~51565), después
+    # de la definición de wake_up. Lazy import para evitar el orden de import.
+    from rag.wa_tasks import wa_tasks as wa_tasks_cmd
+
     steps: list[tuple[str, object, dict]] = []
     if not skip_index:
         # Defaults matchean los que usa el plist `com.fer.obsidian-rag-ingest-*`
@@ -38222,6 +38246,20 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_maintenance: bool,
         steps.append(("rag index", index, dict(
             reset=False, no_contradict=False, source_opt=None,
             since_opt=None, dry_run=False, max_chats=None, vault_scope=None,
+        )))
+    if not skip_bookmarks:
+        # `profile=None` = sincroniza todos los Chrome profiles registrados.
+        # Idempotente: si ya corrió en `rag index` el hash-skip lo deja en no-op.
+        steps.append(("rag bookmarks sync", bookmarks_sync, dict(profile=None)))
+    if not skip_wa_tasks:
+        # `hours=None` = ventana incremental desde último run (state file).
+        # `force=False` = no reprocesa mensajes ya procesados.
+        # `dry_run=False` = escribe `00-Inbox/WA-YYYY-MM-DD.md` si hay items.
+        # Es idempotente con el cron de 30min (`com.fer.obsidian-rag-wa-tasks`):
+        # la segunda corrida del día desde el cron es no-op si esta ya procesó
+        # los mensajes nuevos.
+        steps.append(("rag wa-tasks", wa_tasks_cmd, dict(
+            dry_run=False, hours=None, force=False,
         )))
     if not skip_maintenance:
         # skip_reindex=True porque `rag index` ya corrió arriba. El resto

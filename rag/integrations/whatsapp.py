@@ -388,6 +388,241 @@ def _strip_possessive_prefix(s: str) -> str:
     return out
 
 
+# ── Vault contacts (`99-Contacts/`) — fuente PRIMARIA ──────────────────────
+# Las notas en `04-Archive/99-obsidian-system/99-Contacts/` son la fuente
+# autoritativa de contactos del user — escritas a mano con teléfono real,
+# alias, relación, apellido completo. Tienen prioridad sobre Apple Contacts
+# y My Card resolver porque acá NO hay ambigüedad: "Mama.md" es la mamá del
+# user, "Maria.md" es la esposa, etc. (decisión del user 2026-04-26).
+#
+# Formato esperado (ver `_template.md` en esa carpeta):
+#   ---
+#   aliases: [Sebastián, Sebastian Serra]   # opcional, en frontmatter YAML
+#   ---
+#   [[NombreArchivo|@Alias]]
+#   - **Relación**: Mamá
+#   - **Apellido / nombre completo**: Monica Ferrari
+#   - **Teléfono**: +54 9 3425476623
+
+VAULT_CONTACTS_SUBPATH = "04-Archive/99-obsidian-system/99-Contacts"
+
+# Cache del scan completo del directorio. TTL bajo porque el user puede
+# editar las notas en cualquier momento — invalidación cada 60s evita
+# stale data en sesiones largas. Cold call ~5-20ms (8 archivos chicos).
+_VAULT_CONTACTS_CACHE: dict | None = None
+_VAULT_CONTACTS_TTL_S = 60
+
+
+def _vault_contacts_dir() -> Path | None:
+    """Path al folder de contactos del vault, o None si no se puede
+    resolver el VAULT_PATH (no hay vault registrado)."""
+    try:
+        from rag import VAULT_PATH
+    except ImportError:
+        return None
+    if not VAULT_PATH:
+        return None
+    target = VAULT_PATH / VAULT_CONTACTS_SUBPATH
+    return target if target.is_dir() else None
+
+
+def _parse_vault_contact(path: Path, text: str | None = None) -> dict:
+    """Parsear una nota de contact del vault.
+
+    Devuelve `{full_name, phones, emails, birthday, source: "vault",
+    aliases, relation_label}`. Campos vacíos default a "" o [].
+    """
+    if text is None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+
+    def _extract_field(label: str) -> str:
+        # "- **Label**: value" — el label es regex (puede traer sets como
+        # `[eé]` para tolerancia a acentos). NO escapamos corchetes a
+        # propósito; el caller pasa labels seguras / hardcodeadas.
+        pattern = (
+            r"^-\s*\*\*\s*"
+            + label
+            + r"\s*\*\*\s*:\s*(.+)$"
+        )
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    raw_phones = _extract_field(r"Tel[eé]fono") or _extract_field(r"Phone")
+    phones = [p.strip() for p in raw_phones.split(",") if p.strip()]
+    # Filtrar placeholders del template ("+54 9 ...").
+    phones = [p for p in phones if not p.endswith("...")]
+
+    raw_emails = _extract_field(r"Email") or _extract_field(r"Correo")
+    emails = [e.strip() for e in raw_emails.split(",") if e.strip()]
+
+    full_name = (
+        _extract_field(r"Apellido(?:\s*/\s*nombre\s+completo)?")
+        or _extract_field(r"Full[\s-]?name")
+        or path.stem
+    )
+    relation = _extract_field(r"Relaci[oó]n") or _extract_field(r"Relation")
+    birthday = _extract_field(r"Cumplea[ñn]os") or _extract_field(r"Birthday")
+
+    # Aliases del frontmatter YAML — solo line-by-line, sin dependencia YAML.
+    aliases: list[str] = []
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+    if fm_match:
+        in_aliases = False
+        for line in fm_match.group(1).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("aliases:"):
+                in_aliases = True
+                # Inline list: "aliases: [a, b, c]"
+                inline = stripped[len("aliases:"):].strip()
+                if inline.startswith("[") and inline.endswith("]"):
+                    in_aliases = False
+                    parts = inline[1:-1].split(",")
+                    aliases.extend(p.strip().strip('"\'') for p in parts if p.strip())
+                continue
+            if in_aliases:
+                if stripped.startswith("-"):
+                    val = stripped[1:].strip().strip('"\'')
+                    if val:
+                        aliases.append(val)
+                elif stripped and not stripped.startswith(" "):
+                    in_aliases = False  # otro key del frontmatter
+
+    # También el wikilink del header: `[[X|@Y]]` → captura X y Y como aliases.
+    header_match = re.search(
+        r"\[\[(?:[^|\]]+/)?([^|\]]+)(?:\|@?([^\]]+))?\]\]", text,
+    )
+    if header_match:
+        wl_target = header_match.group(1).strip()
+        wl_alias = (header_match.group(2) or "").strip()
+        if wl_target and wl_target not in aliases:
+            aliases.append(wl_target)
+        if wl_alias and wl_alias not in aliases:
+            aliases.append(wl_alias)
+
+    # Filtrar aliases-template ("Otra forma de llamarlo", "Apodo", etc.)
+    _TEMPLATE_ALIASES = {
+        "otra forma de llamarlo", "apodo", "nombre completo",
+    }
+    aliases = [
+        a for a in aliases
+        if _normalize_hint(a) not in _TEMPLATE_ALIASES
+    ]
+
+    return {
+        "full_name": full_name or path.stem,
+        "phones": phones,
+        "emails": emails,
+        "birthday": birthday,
+        "source": "vault",
+        "aliases": aliases,
+        "relation_label": relation,
+    }
+
+
+def _load_vault_contacts() -> list[dict]:
+    """Scan del directorio `99-Contacts/`, parsea cada nota.
+
+    Devuelve `[{stem, path, parsed}]`. Skipea `_template.md` y archivos
+    con prefijo `_` (scaffolding/internal). Cached por 60s.
+    """
+    import time as _time
+    global _VAULT_CONTACTS_CACHE
+    now = _time.time()
+    if (_VAULT_CONTACTS_CACHE
+            and (now - _VAULT_CONTACTS_CACHE.get("at", 0)) < _VAULT_CONTACTS_TTL_S):
+        return _VAULT_CONTACTS_CACHE["contacts"]
+
+    base = _vault_contacts_dir()
+    if not base:
+        _VAULT_CONTACTS_CACHE = {"at": now, "contacts": []}
+        return []
+
+    out: list[dict] = []
+    for p in base.glob("*.md"):
+        if p.name.startswith("_") or p.name.startswith("."):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        parsed = _parse_vault_contact(p, text)
+        out.append({"stem": p.stem, "path": p, "parsed": parsed})
+
+    _VAULT_CONTACTS_CACHE = {"at": now, "contacts": out}
+    return out
+
+
+def _lookup_vault_contact(query: str) -> dict | None:
+    """Resolver un query a un contact del vault (`99-Contacts/`).
+
+    Estrategia (en orden de confianza):
+      1. Filename exacto (case + accent insensitive): "Mama" → `Mama.md`.
+      2. Match de aliases del frontmatter YAML.
+      3. Match contra el campo `**Apellido / nombre completo**`.
+      4. Match contra `**Relación**` cuando query es alias de parentesco
+         (vía RELATIONSHIP_HINT_MAP). "mama" → busca nota con
+         Relación=Mamá/Madre.
+
+    Devuelve dict shape `_fetch_contact` (full_name, phones, emails,
+    birthday) + extra fields `source="vault"` y `match_kind` para debug.
+    None si no encuentra.
+    """
+    if not query or not query.strip():
+        return None
+    q_clean = _strip_possessive_prefix(query).strip()
+    q_fold = _normalize_hint(q_clean)
+    if not q_fold:
+        return None
+
+    contacts = _load_vault_contacts()
+    if not contacts:
+        return None
+
+    # 1. Filename exact match.
+    for c in contacts:
+        if _normalize_hint(c["stem"]) == q_fold:
+            r = dict(c["parsed"])
+            r["match_kind"] = "filename"
+            return r
+
+    # 2. Alias match (frontmatter aliases + wikilink header).
+    for c in contacts:
+        for alias in c["parsed"].get("aliases", []):
+            if _normalize_hint(alias) == q_fold:
+                r = dict(c["parsed"])
+                r["match_kind"] = "alias"
+                return r
+
+    # 3. Full name (apellido / nombre completo) — match si el query es
+    #    parte del full_name (ej. "Monica" matchea "Monica Ferrari").
+    for c in contacts:
+        full = _normalize_hint(c["parsed"].get("full_name", ""))
+        if full and (full == q_fold or q_fold in full.split()):
+            r = dict(c["parsed"])
+            r["match_kind"] = "full_name"
+            return r
+
+    # 4. Relationship hint ("mama"/"papa"/"hermana") → match contra
+    #    el campo **Relación**. Resuelve a English canonical y compara
+    #    con la relation del contact (también normalizada).
+    canonical = _RELATIONSHIP_HINT_MAP.get(q_fold)
+    if canonical:
+        for c in contacts:
+            rel_raw = c["parsed"].get("relation_label", "")
+            if not rel_raw:
+                continue
+            rel_canonical = _APPLE_LABEL_ES_TO_EN.get(_normalize_hint(rel_raw))
+            if rel_canonical == canonical:
+                r = dict(c["parsed"])
+                r["match_kind"] = "relation"
+                return r
+
+    return None
+
+
 def _exact_contact_lookup(person_name: str) -> dict | None:
     """Buscar un contacto en Apple Contacts por nombre EXACTO (case-
     insensitive).
@@ -614,6 +849,33 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
         stripped = _GROUP_PREFIX_RE.sub("", query, count=1).strip()
         return _whatsapp_resolve_group_jid(stripped or query)
 
+    # PRIMERA FUENTE: vault `99-Contacts/`. Las notas que el user escribió
+    # a mano son la verdad autoritativa — `Mama.md` es la mamá del user,
+    # `Maria.md` es la esposa, sin ambigüedad de fuzzy match. Si encuentra
+    # acá, ni siquiera consultamos Apple Contacts. Pedido del user
+    # 2026-04-26: "en el primer lugar que tiene que buscar el contactos
+    # es aca [...] /99-Contacts".
+    #
+    # Crítico: si vault encuentra match SIN phone (placeholder "+54 9 ..."
+    # filtrado, o campo Teléfono vacío), igual usamos vault — el downstream
+    # va a devolver `error="no_phone"` con el `full_name` del vault, así el
+    # user sabe "Astor está en mi vault pero falta el teléfono" en lugar de
+    # mandarle accidentalmente a un contacto distinto de Apple Contacts
+    # que casualmente matchea por substring (ej. "Astor" → "Psicopedagoga
+    # Astor"). El vault es autoritativo aunque esté incompleto.
+    contact = None
+    try:
+        vault_match = _lookup_vault_contact(query)
+        if vault_match:
+            contact = {
+                "full_name": vault_match.get("full_name") or query,
+                "phones": vault_match.get("phones", []),
+                "emails": vault_match.get("emails", []),
+                "birthday": vault_match.get("birthday", ""),
+            }
+    except Exception:
+        contact = None
+
     # Reuse the existing osascript-backed contact lookup. Passes `query`
     # as the stem — _fetch_contact will try canonical match, first name,
     # and finally the raw stem against Contacts.app.
@@ -625,12 +887,13 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
     # contacto exista (típicamente bajo "Mamá" con tilde). Resolución
     # correcta: leer Related Names de tu My Card → "Madre → Mamá" → re-
     # llamar al lookup con el personName real.
-    try:
-        contact = _rag._fetch_contact(query, email=None, canonical=query)
-    except Exception as exc:
-        return {"jid": None, "full_name": None, "phones": [],
-                "is_group": False,
-                "error": f"lookup_failed: {str(exc)[:80]}"}
+    if not contact:
+        try:
+            contact = _rag._fetch_contact(query, email=None, canonical=query)
+        except Exception as exc:
+            return {"jid": None, "full_name": None, "phones": [],
+                    "is_group": False,
+                    "error": f"lookup_failed: {str(exc)[:80]}"}
 
     # Si el primer intento no encontró nada Y el query es un alias de
     # parentesco, probar la resolución vía My Card antes de dar up.

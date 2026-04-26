@@ -270,6 +270,201 @@ def test_jid_from_contact_strips_possessive_prefix(monkeypatch):
         assert out["full_name"] == "Mamá", f"hint {hint!r} → {out!r}"
 
 
+def test_lookup_vault_contact_filename_match(monkeypatch, tmp_path):
+    """`Mama.md` en `99-Contacts/` → match por filename exact."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Mama.md").write_text(
+        "[[Mama|@Mama]]\n"
+        "- **Relación**: Mamá\n"
+        "- **Apellido / nombre completo**: Monica Ferrari\n"
+        "- **Teléfono**: +54 9 3425476623\n"
+        "- **Email**: monicaferrari@gmail.com\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    out = wa_mod._lookup_vault_contact("Mama")
+    assert out is not None
+    assert out["full_name"] == "Monica Ferrari"
+    assert out["phones"] == ["+54 9 3425476623"]
+    assert out["emails"] == ["monicaferrari@gmail.com"]
+    assert out["relation_label"] == "Mamá"
+    assert out["match_kind"] == "filename"
+
+
+def test_lookup_vault_contact_strips_possessive(monkeypatch, tmp_path):
+    """`mi Mama` y `a mi Mama` strippean prefix → matchean `Mama.md`."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Mama.md").write_text(
+        "- **Apellido / nombre completo**: Monica\n"
+        "- **Teléfono**: +5491155555555\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    for q in ["mi Mama", "a mi Mama", "la Mama", "MAMA", "Mamá"]:
+        assert wa_mod._lookup_vault_contact(q) is not None, f"failed on {q!r}"
+
+
+def test_lookup_vault_contact_relation_match(monkeypatch, tmp_path):
+    """`mama` (sin filename `Mama.md`) → match por `Relación: Madre`."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    # Filename arbitrario "Carmen Pérez" (NO matchea filename "mama").
+    (contacts_dir / "Carmen Pérez.md").write_text(
+        "- **Relación**: Madre\n"
+        "- **Apellido / nombre completo**: Carmen Pérez\n"
+        "- **Teléfono**: +5493426113332\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    out = wa_mod._lookup_vault_contact("mama")
+    assert out is not None
+    assert out["full_name"] == "Carmen Pérez"
+    assert out["match_kind"] == "relation"
+
+
+def test_lookup_vault_contact_alias_yaml_match(monkeypatch, tmp_path):
+    """Alias en frontmatter YAML matchea (e.g. `aliases: [Sebastián]`)."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Seba.md").write_text(
+        "---\n"
+        "aliases:\n"
+        "  - Sebastián\n"
+        "  - Sebastian Serra\n"
+        "---\n"
+        "- **Teléfono**: +5491166666666\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    # Filename match (Seba)
+    out1 = wa_mod._lookup_vault_contact("Seba")
+    assert out1 is not None and out1["match_kind"] == "filename"
+
+    # Alias match
+    out2 = wa_mod._lookup_vault_contact("Sebastián")
+    assert out2 is not None and out2["match_kind"] == "alias"
+
+    out3 = wa_mod._lookup_vault_contact("Sebastian Serra")
+    assert out3 is not None and out3["match_kind"] == "alias"
+
+
+def test_lookup_vault_contact_skips_template_files(monkeypatch, tmp_path):
+    """`_template.md` y archivos con prefijo `_` se ignoran."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "_template.md").write_text(
+        "- **Teléfono**: +54 9 ...\n"
+    )
+    (contacts_dir / "Mama.md").write_text(
+        "- **Teléfono**: +5491155555555\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    contacts = wa_mod._load_vault_contacts()
+    stems = [c["stem"] for c in contacts]
+    assert "Mama" in stems
+    assert "_template" not in stems
+
+
+def test_lookup_vault_contact_filters_phone_placeholder(monkeypatch, tmp_path):
+    """Placeholder `+54 9 ...` del template NO se considera teléfono real."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Astor.md").write_text(
+        "- **Apellido / nombre completo**: Ferrari Astor\n"
+        "- **Teléfono**: +54 9 ...\n"  # placeholder
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    out = wa_mod._lookup_vault_contact("Astor")
+    assert out is not None
+    assert out["full_name"] == "Ferrari Astor"
+    # phones se filtra porque "+54 9 ..." termina en "..."
+    assert out["phones"] == []
+
+
+def test_jid_from_contact_prefers_vault_over_apple(monkeypatch, tmp_path):
+    """Cuando vault y Apple Contacts ambos tienen un match, vault gana
+    (la nota del user es la fuente autoritativa)."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Mama.md").write_text(
+        "- **Apellido / nombre completo**: Monica Ferrari\n"
+        "- **Teléfono**: +5493425476623\n"
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+
+    # `_fetch_contact` (Apple) NO se debería llamar porque vault gana.
+    fetch_calls = []
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: (
+        fetch_calls.append(a) or {
+            "full_name": "Otra Mama Distinta",
+            "phones": ["+1234567890"],
+            "emails": [], "birthday": "",
+        }
+    ))
+
+    out = rag._whatsapp_jid_from_contact("Mama")
+    assert out["error"] is None
+    assert out["full_name"] == "Monica Ferrari"  # del vault, no de Apple
+    assert out["jid"] == "5493425476623@s.whatsapp.net"
+    # _fetch_contact no se llamó para "Mama" porque vault resolvió primero.
+    assert fetch_calls == []
+
+
+def test_jid_from_contact_returns_no_phone_when_vault_incomplete(
+    monkeypatch, tmp_path,
+):
+    """Si vault tiene la nota pero sin teléfono completo, NO cae a Apple
+    Contacts (que podría matchear un contacto distinto por substring) —
+    devuelve `error=no_phone` para que el user complete la nota."""
+    from rag.integrations import whatsapp as wa_mod
+
+    contacts_dir = tmp_path / "04-Archive/99-obsidian-system/99-Contacts"
+    contacts_dir.mkdir(parents=True)
+    (contacts_dir / "Astor.md").write_text(
+        "- **Apellido / nombre completo**: Ferrari Astor\n"
+        "- **Teléfono**: +54 9 ...\n"  # placeholder filtrado
+    )
+    monkeypatch.setattr(wa_mod, "_vault_contacts_dir", lambda: contacts_dir)
+    wa_mod._VAULT_CONTACTS_CACHE = None
+    # Apple Contacts tiene un "Astor" distinto — NO debería usarse.
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Lic. Cande (Psicopedagoga Astor)",
+        "phones": ["+9999999999"],
+        "emails": [], "birthday": "",
+    })
+
+    out = rag._whatsapp_jid_from_contact("Astor")
+    assert out["error"] == "no_phone"
+    assert out["full_name"] == "Ferrari Astor"  # del vault
+    # JID None — el frontend va a render rojo + card editable.
+    assert out["jid"] is None
+
+
 def test_strip_emoji_and_symbols():
     """Strip de emojis + variation selectors + ZWJ joiners."""
     from rag.integrations.whatsapp import _strip_emoji_and_symbols

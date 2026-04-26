@@ -253,7 +253,9 @@ def _default_nearest_neighbors_fn(
     seen_paths: set[str] = set()
     out: list[dict[str, Any]] = []
     for meta, dist in zip(metas, distances):
-        path = (meta or {}).get("path")
+        # Schema del metadata en producción: campo `file` (no `path`),
+        # con vault-relative path. `path` es legacy, se chequean ambos.
+        path = (meta or {}).get("file") or (meta or {}).get("path")
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)

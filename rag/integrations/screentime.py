@@ -60,6 +60,7 @@ _SCREENTIME_APP_LABELS = {
     "com.exafunction.windsurf": "Windsurf",
     "com.googlecode.iterm2": "iTerm",
     "com.apple.Terminal": "Terminal",
+    "com.mitchellh.ghostty": "Ghostty",
     "com.microsoft.VSCode": "VS Code",
     "com.sublimetext.4": "Sublime",
     "com.jetbrains.pycharm": "PyCharm",
@@ -94,6 +95,7 @@ _SCREENTIME_APP_LABELS = {
 _SCREENTIME_CATEGORIES = {
     "code": {
         "com.exafunction.windsurf", "com.googlecode.iterm2", "com.apple.Terminal",
+        "com.mitchellh.ghostty",
         "com.microsoft.VSCode", "com.sublimetext.4", "com.jetbrains.pycharm",
         "com.apple.dt.Xcode", "com.todesktop.230313mzl4w4u92",  # Cursor
     },

@@ -10178,6 +10178,289 @@ def _index_urls(
     return len(urls)
 
 
+# ── Screen Time persistence (daily + monthly) ───────────────────────────────
+# `_collect_screentime` (en `rag.integrations.screentime`) es read-only sobre
+# `~/Library/Application Support/Knowledge/knowledgeC.db`. Acá lo persistimos
+# como notas .md al vault para que el RAG pueda responder queries tipo
+# "cuánto usé Ghostty esta semana?" o "qué app fue mi top en abril?".
+# Crítico: macOS rota el knowledgeC.db cada ~30d, así que sin estas notas
+# todo lo más viejo que un mes está perdido. La nota mensual es write-once-
+# per-day (el mes en curso se reescribe entero cada `rag index`, los meses
+# pasados ya no cambian gracias al hash-skip).
+
+SCREENTIME_VAULT_SUBPATH = "03-Resources/Screentime"
+_SCREENTIME_BACKFILL_DAYS = 30
+
+
+def _sync_screentime_notes(
+    vault_root: Path,
+    days: int = _SCREENTIME_BACKFILL_DAYS,
+    db_path: Path | None = None,
+) -> dict:
+    """Persist Screen Time per-app foreground usage as vault notes.
+
+    Writes:
+      - `03-Resources/Screentime/YYYY-MM-DD.md` per día (con datos)
+      - `03-Resources/Screentime/YYYY-MM.md` per mes (rolling aggregate del mes)
+      - `03-Resources/Screentime/_index.md` con tabla mensual
+
+    Backfill: corre por los últimos `days` días (default 30, alineado con la
+    ventana que macOS retiene en `knowledgeC.db`).
+
+    Hash-skip: si el contenido binario del archivo no cambió, skip — para que
+    el indexer downstream también skipee. Días pasados solo se reescriben si
+    hubo nuevas sesiones registradas (raro pero posible si Mac estaba dormido).
+
+    Silent-fail: si no hay db o está locked → `{ok: False, reason: "no_data"}`.
+    """
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+
+    target_dir = vault_root / SCREENTIME_VAULT_SUBPATH
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "reason": f"mkdir: {exc}"}
+
+    # Loop por día. `_collect_screentime` ya devuelve `available=False` si la
+    # db no existe — usamos eso como early-return en la primera iteración.
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    day_data: dict[str, dict] = {}  # "YYYY-MM-DD" → screentime dict
+    months: dict[str, list[str]] = defaultdict(list)  # "YYYY-MM" → ["YYYY-MM-DD", ...]
+
+    db_was_available = False
+    for d in range(days, -1, -1):
+        day_start = today - timedelta(days=d)
+        day_end = day_start + timedelta(days=1)
+        st = _collect_screentime(day_start, day_end, db_path=db_path)
+        if not st.get("available"):
+            # Si el db no existe en absoluto, abortar; si solo el día está
+            # vacío (Mac dormido), seguir con los demás.
+            if d == days and not (target_dir / "_index.md").is_file():
+                return {"ok": False, "reason": "no_data"}
+            continue
+        db_was_available = True
+        if int(st.get("total_secs") or 0) < 60:
+            continue  # día sin uso real
+        day_str = day_start.strftime("%Y-%m-%d")
+        month_str = day_start.strftime("%Y-%m")
+        day_data[day_str] = st
+        months[month_str].append(day_str)
+
+    if not db_was_available:
+        return {"ok": False, "reason": "no_data"}
+    if not day_data:
+        return {"ok": True, "files_written": 0, "days_total": 0,
+                "target": str(target_dir.relative_to(vault_root))}
+
+    written = 0
+    skipped = 0
+    current_set: set[str] = set()
+
+    # Daily notes
+    for day_str, st in day_data.items():
+        body = _render_screentime_daily_md(day_str, st)
+        path = target_dir / f"{day_str}.md"
+        current_set.add(path.name)
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if existing == body:
+            skipped += 1
+            continue
+        path.write_text(body, encoding="utf-8")
+        written += 1
+
+    # Monthly aggregates
+    for month_str, day_list in sorted(months.items()):
+        body = _render_screentime_monthly_md(
+            month_str,
+            [(d, day_data[d]) for d in sorted(day_list)],
+        )
+        path = target_dir / f"{month_str}.md"
+        current_set.add(path.name)
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if existing == body:
+            skipped += 1
+            continue
+        path.write_text(body, encoding="utf-8")
+        written += 1
+
+    # Index — tabla mensual rolling
+    idx_body = _render_screentime_index_md(months, day_data)
+    idx_path = target_dir / "_index.md"
+    current_set.add(idx_path.name)
+    existing = idx_path.read_text(encoding="utf-8") if idx_path.is_file() else ""
+    if existing != idx_body:
+        idx_path.write_text(idx_body, encoding="utf-8")
+        written += 1
+    else:
+        skipped += 1
+
+    # Prune días que ya cayeron fuera de la ventana de backfill (>30d).
+    # Conservadoramente, solo borramos archivos *.md cuyo nombre matchea
+    # YYYY-MM-DD o YYYY-MM y NO está en current_set.
+    import re as _re
+    daily_re = _re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+    monthly_re = _re.compile(r"^\d{4}-\d{2}\.md$")
+    for p in target_dir.glob("*.md"):
+        if p.name in current_set:
+            continue
+        if daily_re.match(p.name):
+            # Daily fuera de ventana — preservar (histórico).
+            continue
+        if monthly_re.match(p.name):
+            # Monthly fuera de ventana — preservar también.
+            continue
+        # Otros archivos no tocamos (puede haber notas user-creadas).
+
+    total_secs = sum(int(st.get("total_secs") or 0) for st in day_data.values())
+    return {
+        "ok": True,
+        "files_written": written,
+        "files_skipped": skipped,
+        "days_total": len(day_data),
+        "months_total": len(months),
+        "total_secs": total_secs,
+        "target": str(target_dir.relative_to(vault_root)),
+    }
+
+
+def _render_screentime_daily_md(day_str: str, st: dict) -> str:
+    """Daily note: top apps + categorías. Determinístico para que el
+    hash-skip funcione."""
+    total = int(st.get("total_secs") or 0)
+    top_apps = (st.get("top_apps") or [])[:10]
+    cats = st.get("categories") or {}
+
+    lines = [
+        "---",
+        "type: screentime",
+        f"date: {day_str}",
+        f"total_active_secs: {total}",
+        "ambient: skip",
+        "tags: [screentime, productividad]",
+        "---",
+        "",
+        f"# Pantalla · {day_str} · {_fmt_hm(total)} activo",
+        "",
+        "## Top apps",
+    ]
+    if top_apps:
+        for a in top_apps:
+            lines.append(f"- {a['label']} · {_fmt_hm(int(a['secs']))}")
+    else:
+        lines.append("- _sin actividad registrada_")
+
+    if cats:
+        lines.append("")
+        lines.append("## Por categoría")
+        order = ["code", "notas", "comms", "browser", "media", "otros"]
+        for k in order:
+            v = int(cats.get(k, 0) or 0)
+            if v >= 60:
+                lines.append(f"- {k} · {_fmt_hm(v)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_screentime_monthly_md(month_str: str, days: list[tuple[str, dict]]) -> str:
+    """Monthly aggregate: top apps del mes + por categoría + tabla diaria."""
+    from collections import defaultdict
+
+    total_secs = sum(int(st.get("total_secs") or 0) for _, st in days)
+    apps_total: dict[str, dict] = defaultdict(lambda: {"label": "", "secs": 0})
+    cats_total: dict[str, int] = defaultdict(int)
+    for _day, st in days:
+        for a in (st.get("top_apps") or []):
+            bundle = a.get("bundle", "")
+            apps_total[bundle]["label"] = a.get("label", bundle)
+            apps_total[bundle]["secs"] += int(a.get("secs") or 0)
+        for k, v in (st.get("categories") or {}).items():
+            cats_total[k] += int(v or 0)
+
+    top_apps_sorted = sorted(apps_total.items(), key=lambda kv: -kv[1]["secs"])[:15]
+
+    lines = [
+        "---",
+        "type: screentime-monthly",
+        f"month: {month_str}",
+        f"total_active_secs: {total_secs}",
+        f"days_active: {len(days)}",
+        "ambient: skip",
+        "tags: [screentime, productividad]",
+        "---",
+        "",
+        f"# Pantalla · {month_str} · {_fmt_hm(total_secs)} activo ({len(days)} días)",
+        "",
+        "## Top apps del mes",
+    ]
+    for _bundle, info in top_apps_sorted:
+        lines.append(f"- {info['label']} · {_fmt_hm(info['secs'])}")
+
+    lines.append("")
+    lines.append("## Por categoría")
+    order = ["code", "notas", "comms", "browser", "media", "otros"]
+    for k in order:
+        v = int(cats_total.get(k, 0))
+        if v >= 60:
+            lines.append(f"- {k} · {_fmt_hm(v)}")
+
+    lines.append("")
+    lines.append("## Por día")
+    lines.append("| Día | Total | Top app | Top categoría |")
+    lines.append("|---|---|---|---|")
+    for day_str, st in days:
+        total = int(st.get("total_secs") or 0)
+        top = (st.get("top_apps") or [{}])[0]
+        top_label = top.get("label", "—")
+        top_secs = int(top.get("secs") or 0)
+        # Top categoría
+        cats = st.get("categories") or {}
+        top_cat = max(cats.items(), key=lambda kv: kv[1])[0] if cats else "—"
+        lines.append(
+            f"| [[{day_str}]] | {_fmt_hm(total)} | "
+            f"{top_label} ({_fmt_hm(top_secs)}) | {top_cat} |"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_screentime_index_md(
+    months: dict[str, list[str]], day_data: dict[str, dict]
+) -> str:
+    """Index note — tabla mensual con totales + top categoría."""
+    from collections import defaultdict
+
+    lines = [
+        "---",
+        "type: screentime-index",
+        "ambient: skip",
+        "tags: [screentime, indice, productividad]",
+        "---",
+        "",
+        "# Pantalla — índice mensual",
+        "",
+        "Fuente: `~/Library/Application Support/Knowledge/knowledgeC.db` (CoreDuet).",
+        "Ventana: macOS retiene ~30 días — estas notas persisten lo histórico.",
+        "",
+        "| Mes | Total activo | Días | Top categoría |",
+        "|---|---|---:|---|",
+    ]
+    for month_str in sorted(months.keys()):
+        day_list = months[month_str]
+        total = sum(int(day_data[d].get("total_secs") or 0) for d in day_list)
+        cats_total: dict[str, int] = defaultdict(int)
+        for d in day_list:
+            for k, v in (day_data[d].get("categories") or {}).items():
+                cats_total[k] += int(v or 0)
+        top_cat = (
+            max(cats_total.items(), key=lambda kv: kv[1])[0] if cats_total else "—"
+        )
+        lines.append(
+            f"| [[{month_str}]] | {_fmt_hm(total)} | {len(day_list)} | {top_cat} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 # ── Chrome bookmarks ─────────────────────────────────────────────────────────
 # Chrome keeps bookmarks as a JSON tree at
 # ~/Library/Application Support/Google/Chrome/<Profile>/Bookmarks
@@ -23457,6 +23740,13 @@ def _format_etl_detail(kind: str, stats: dict) -> str:
     if kind == "spotify":
         top_part = " · top refreshed" if stats.get("refreshed_top") else ""
         return f"{stats.get('recently_played', 0)} played{top_part}"
+    if kind == "screentime":
+        days = stats.get("days_total", 0)
+        months = stats.get("months_total", 0)
+        total = int(stats.get("total_secs") or 0)
+        # `_fmt_hm` viene de la misma module — está definido más arriba.
+        hm = _fmt_hm(total) if total else "0min"
+        return f"{days} días · {months} meses · {hm}"
     return ""
 
 
@@ -23476,10 +23766,14 @@ _ETL_QUIET_REASONS = frozenset({
 
 
 def _run_cross_source_etls(vault_path: Path) -> None:
-    """Pre-index hook: corre los 11 ETLs cross-source que escriben `.md`
+    """Pre-index hook: corre los 12 ETLs cross-source que escriben `.md`
     al vault para que el rglob posterior los absorba (MOZE, WhatsApp,
-    Reminders, Calendar, Chrome, Gmail, Drive, GitHub, Claude, YouTube,
-    Spotify).
+    Reminders, Calendar, Chrome, Gmail, GitHub, Claude, YouTube,
+    Spotify, Bookmarks, Screentime). Drive estaba en el pipeline
+    hasta 2026-04-24 — quitado por user-feedback (duplicativo, ver
+    el bloque comentado más abajo). Screentime agregado 2026-04-26
+    para persistir el knowledgeC.db rolling de macOS (~30d) como
+    histórico permanente en el vault.
 
     Guard crítico: `_is_cross_source_target(vault_path)` decide si este
     vault es el target canónico. Cuando no lo es (user corrió
@@ -23554,6 +23848,10 @@ def _run_cross_source_etls(vault_path: Path) -> None:
         ("Claude",     _sync_claude_code_transcripts,"claude"),
         ("YT trans.",  _sync_youtube_transcripts,    "yt-trans"),
         ("Spotify",    _sync_spotify_notes,          "spotify"),
+        # Screen Time — persist macOS knowledgeC.db (foreground app usage)
+        # como notas .md al vault. macOS rota el db cada ~30d, las notas
+        # son la única forma de tener histórico más allá de eso.
+        ("Screentime", _sync_screentime_notes,       "screentime"),
     ):
         _t_etl = time.perf_counter()
         try:
@@ -30906,6 +31204,136 @@ def links(query: str | None, k: int, folder: str | None, tag: str | None,
         "top_url": items[0]["url"] if items else None,
         "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
     })
+
+
+# ── `rag related <path>` ──────────────────────────────────────────────────────
+# Wrap CLI de `find_related` para que el plugin de Obsidian tenga un fallback
+# si el web server (puerto local) está caído. El plugin hace HTTP primero,
+# spawnea este comando si falla. También sirve para shell scripting puntual
+# ("dame las relacionadas a esta nota en JSON pa pipearlo a jq").
+#
+# El comportamiento es paralelo al endpoint GET /api/notes/related: misma
+# función Python, mismo shape de output, mismas razones de empty-result
+# ("empty_index", "not_indexed"). Si tocás uno y no el otro, el fallback
+# del plugin va a divergir silenciosamente.
+@cli.command()
+@click.argument("path")
+@click.option("--limit", default=10, show_default=True,
+              help="Cantidad de notas relacionadas a devolver (1-50).")
+@click.option("--json", "as_json", is_flag=True,
+              help="Salida JSON (consumido por el plugin Obsidian / scripts).")
+@click.option("--plain", is_flag=True,
+              help="Salida tabular sin colores ni paneles (script-friendly).")
+def related(path: str, limit: int, as_json: bool, plain: bool):
+    """Notas relacionadas a PATH por shared tags + graph hops.
+
+    PATH es vault-relative (ej. 02-Areas/Coaching/Autoridad.md). El ranking
+    combina tags compartidos + edges del grafo (outlinks + backlinks), con
+    tie-break por top-level folder en común. Cada item devuelve un `score`
+    (entero) y un `reason` ('tags', 'link', 'tags+link') para que el UI
+    decida cómo presentarlo.
+    """
+    t0 = time.perf_counter()
+    if not path.endswith(".md"):
+        msg = "path debe terminar en .md"
+        if as_json:
+            click.echo(json.dumps({"error": msg, "items": [], "source_path": path}))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(2)
+
+    limit = max(1, min(int(limit), 50))
+    col = get_db()
+    if col.count() == 0:
+        payload = {"items": [], "source_path": path, "reason": "empty_index"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print("[yellow]Índice vacío. Corré `rag index` primero.[/yellow]")
+        return
+
+    # Pasamos TODOS los chunks de la nota source — find_related agrega tags +
+    # títulos por toda la lista. Ver comentario equivalente en
+    # web/server.py:notes_related para la justificación detallada.
+    c = _load_corpus(col)
+    source_metas = [m for m in c["metas"] if m.get("file") == path]
+    if not source_metas:
+        payload = {"items": [], "source_path": path, "reason": "not_indexed"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print(f"[yellow]La nota '{path}' no está en el índice.[/yellow]")
+        return
+
+    src_tags: set[str] = set()
+    for m in source_metas:
+        for t in (m.get("tags") or "").split(","):
+            t = t.strip()
+            if t:
+                src_tags.add(t)
+
+    results = find_related(col, source_metas, limit=limit)
+    items: list[dict] = []
+    for meta, score, reason in results:
+        nei_tags = [
+            t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()
+        ]
+        items.append({
+            "path": meta.get("file", ""),
+            "note": meta.get("note", ""),
+            "folder": meta.get("folder", ""),
+            "tags": nei_tags,
+            "shared_tags": sorted(src_tags.intersection(nei_tags)),
+            "score": int(score),
+            "reason": reason,
+        })
+
+    log_query_event({
+        "cmd": "related", "path": path, "n_results": len(items),
+        "limit": limit,
+        "timing": _round_timing_ms({"total_ms": (time.perf_counter() - t0) * 1000}),
+    })
+
+    if as_json:
+        click.echo(json.dumps(
+            {"items": items, "source_path": path}, ensure_ascii=False,
+        ))
+        return
+
+    if not items:
+        msg = f"Sin notas relacionadas a {path}"
+        click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+        return
+
+    if plain:
+        # Formato tabular: SCORE  REASON       PATH
+        # Pensado para `rag related X --plain | awk` y similar.
+        for it in items:
+            click.echo(f"{it['score']}\t{it['reason']:<10}\t{it['path']}")
+        return
+
+    console.print()
+    console.print(Rule(
+        title=(
+            f"[bold cyan]🔗 {len(items)} nota(s) relacionada(s) a "
+            f"[magenta]{path}[/magenta][/bold cyan]"
+        ),
+        style="cyan",
+    ))
+    for it in items:
+        reason_color = {
+            "link": "green", "tags": "yellow", "tags+link": "cyan",
+        }.get(it["reason"], "dim")
+        console.print()
+        console.print(
+            f"[bold]{it['score']}[/bold] "
+            f"[{reason_color}]· {it['reason']}[/{reason_color}]  "
+            f"[magenta]{it['note']}[/magenta] "
+            f"[dim]({it['path']})[/dim]"
+        )
+        if it["shared_tags"]:
+            tags_str = " ".join(f"#{t}" for t in it["shared_tags"])
+            console.print(f"   [dim]tags: {tags_str}[/dim]")
 
 
 @cli.command()

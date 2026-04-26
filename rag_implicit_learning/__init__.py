@@ -26,8 +26,19 @@ Llamadores:
   fine-tune del ranker en `com.fer.obsidian-rag-online-tune`.
 """
 
+from rag_implicit_learning.auto_rollback import (
+    cluster_query,
+    cluster_queries_by_type,
+    should_rollback,
+    stratified_eval,
+)
 from rag_implicit_learning.corrective_paths import (
     infer_corrective_paths_from_behavior,
+)
+from rag_implicit_learning.llm_judge_ensemble import (
+    DEFAULT_ENSEMBLE_MODELS,
+    judge_with_ensemble,
+    self_consistency_check,
 )
 from rag_implicit_learning.requery_detection import (
     detect_requery_loss_signal,
@@ -44,12 +55,19 @@ from rag_implicit_learning.session_outcome import (
 )
 
 __all__ = [
+    "DEFAULT_ENSEMBLE_MODELS",
     "SessionAnalysis",
     "apply_reward_from_session_outcomes",
     "classify_recent_sessions",
     "classify_session",
+    "cluster_queries_by_type",
+    "cluster_query",
     "detect_requery_loss_signal",
     "infer_corrective_paths_from_behavior",
     "is_paraphrase",
+    "judge_with_ensemble",
+    "self_consistency_check",
     "session_outcome_summary",
+    "should_rollback",
+    "stratified_eval",
 ]

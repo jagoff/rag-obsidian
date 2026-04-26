@@ -342,14 +342,36 @@
     }
     // Render eficiente: HTML strings concatenadas. ~500 líneas ⇒ DOM
     // creation directo es ~80ms, con HTML directo es <10ms.
+    // Para el ts: si todas las líneas son del mismo día, mostramos sólo
+    // `HH:MM:SS` (más legible). Si hay ≥2 días distintos, `MM-DD HH:MM`
+    // (compromiso entre contexto + ancho — el día completo no entra en 74px).
+    const days = new Set();
+    for (const ln of data.lines) {
+      if (ln.ts) days.add(ln.ts.slice(0, 10));
+    }
+    const sameDay = days.size <= 1;
+
     const parts = [];
     for (const ln of data.lines) {
       const cls = "log-line lvl-" + ln.level;
       const lvlLabel = ln.level === "info" ? "·" : ln.level;
       const txt = highlightQuery(ln.text, state.viewerQuery);
+      let tsLabel, tsClass = "ts", tsTitle = "";
+      if (ln.ts) {
+        const day = ln.ts.slice(0, 10);    // 2026-04-26
+        const time = ln.ts.slice(11, 19);  // 19:47:50
+        tsLabel = sameDay ? time : (day.slice(5) + " " + time.slice(0, 5));
+        if (ln.ts_inferred) tsClass += " inferred";
+        tsTitle = ln.ts;
+      } else {
+        tsLabel = "—";
+        tsClass += " empty";
+        tsTitle = "(sin timestamp en la línea)";
+      }
       parts.push(
         `<div class="${cls}">` +
           `<span class="lnum">${ln.n}</span>` +
+          `<span class="${tsClass}" title="${escapeHtml(tsTitle)}">${tsLabel}</span>` +
           `<span class="lvl">${lvlLabel}</span>` +
           `<span class="text">${txt}</span>` +
         `</div>`

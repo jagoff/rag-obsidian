@@ -530,7 +530,9 @@
 
     .log-line {
       display: grid;
-      grid-template-columns: 50px 60px 1fr;
+      /* lnum (40px) · ts (74px) · level (60px) · text (1fr).
+         La columna `ts` muestra HH:MM:SS (o MM-DD HH:MM si hay >1 día). */
+      grid-template-columns: 40px 74px 60px 1fr;
       gap: 10px;
       padding: 1px 14px;
       align-items: baseline;
@@ -545,6 +547,18 @@
       font-size: 10px;
       text-align: right;
     }
+    .log-line .ts {
+      color: var(--text-dim);
+      font-size: 10.5px;
+      font-family: "SF Mono", "Menlo", monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* Si el ts viene heredado de una línea anterior (multi-line trace),
+       lo dimmeamos para que se note. */
+    .log-line .ts.inferred { opacity: 0.4; font-style: italic; }
+    .log-line .ts.empty { color: var(--text-faint); opacity: 0.6; }
     .log-line .lvl {
       font-size: 9.5px;
       font-weight: 700;
@@ -627,7 +641,9 @@
       header h1 { font-size: 16px; }
       .sidebar { max-height: 40vh; }
       .viewer { max-height: none; }
-      .log-line { grid-template-columns: 38px 50px 1fr; gap: 6px; padding: 1px 8px; }
+      /* Mobile: ocultamos lnum + ts para no perder ancho útil en el text. */
+      .log-line { grid-template-columns: 50px 1fr; gap: 6px; padding: 1px 8px; }
+      .log-line .lnum, .log-line .ts { display: none; }
       .log-line .text { font-size: 11px; }
     }
 
@@ -737,6 +753,6 @@
     </main>
   </div>
 
-  <script src="/static/logs.js?v=2026-04-26-logs-dashboard" defer></script>
+  <script src="/static/logs.js?v=2026-04-26-logs-ts" defer></script>
 </body>
 </html>

@@ -12239,6 +12239,43 @@ _LOG_RE_OK = re.compile(r"^\[heartbeat\]|alive=true|✓\s|status=ok\b", re.IGNOR
 # como ERROR sólo porque la URL contenía "error.log".
 _LOG_RE_INFO_PREFIX = re.compile(r"^\s*(INFO|DEBUG|TRACE|NOTICE)[\s:]", re.IGNORECASE)
 
+# Patrones de timestamp que aparecen en los logs del stack. En orden de
+# prioridad — el primer match gana. Soportamos:
+#   - JSONL `{"ts": "2026-04-26T19:51:39", ...}` (silent_errors,
+#     sql_state_errors, collection_ops, behavior, etc.)
+#   - ISO con T: `2026-04-26T19:47:50` (heartbeat, eval, varios daemons)
+#   - ISO con espacio: `2026-04-26 17:05:22` (cloudflared-watcher,
+#     algunos scripts shell)
+# Capturamos el timestamp en formato ISO normalizado (sin Z ni offset).
+_LOG_RE_TS_JSONL = re.compile(r'"ts"\s*:\s*"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})')
+_LOG_RE_TS_ISO_T = re.compile(r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+_LOG_RE_TS_ISO_SPACE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _extract_log_ts(line: str) -> str | None:
+    """Extraer timestamp ISO de una línea de log si está presente.
+
+    Retorna el timestamp en formato `YYYY-MM-DDTHH:MM:SS` (T como
+    separador, sin zona horaria), o None si la línea no tiene timestamp
+    detectable.
+
+    Cubre los formatos vistos en el stack al 2026-04-26: JSONL con
+    `"ts": "..."`, ISO con T (heartbeat / silent_errors), e ISO con
+    espacio (cloudflared-watcher).
+    """
+    if not line:
+        return None
+    m = _LOG_RE_TS_JSONL.search(line)
+    if m:
+        return m.group(1).replace(" ", "T")
+    m = _LOG_RE_TS_ISO_T.search(line)
+    if m:
+        return m.group(1)
+    m = _LOG_RE_TS_ISO_SPACE.match(line)
+    if m:
+        return m.group(1).replace(" ", "T")
+    return None
+
 # Cap conservador. La página puede pedir tail=N hasta este max para no
 # devolver MB de log al cliente.
 _LOG_FILE_TAIL_DEFAULT = 500
@@ -12601,9 +12638,21 @@ def logs_file(
     # tenemos line numbers absolutos sin scanear el archivo entero, así
     # que devolvemos el offset reverse desde el final.
     total = len(raw_lines)
+    # Forward-fill de timestamp: si una línea no tiene ts pero la anterior
+    # sí, la marcamos como `ts_inferred=true` heredando ese timestamp. Útil
+    # para tracebacks multi-línea (la línea con `Traceback` tiene ts, las
+    # frames siguientes no, y queremos agruparlas visualmente).
+    last_ts: str | None = None
     for idx, ln in enumerate(raw_lines):
         level = _classify_log_line(ln)
         counts[level] = counts.get(level, 0) + 1
+        ts = _extract_log_ts(ln)
+        ts_inferred = False
+        if ts:
+            last_ts = ts
+        elif last_ts is not None:
+            ts = last_ts
+            ts_inferred = True
         if q_lower and q_lower not in ln.lower():
             continue
         if only_errors and level not in ("warn", "error"):
@@ -12612,6 +12661,8 @@ def logs_file(
             "n": total - idx,  # 1 = última línea (más reciente)
             "text": ln,
             "level": level,
+            "ts": ts,
+            "ts_inferred": ts_inferred,
         })
 
     try:

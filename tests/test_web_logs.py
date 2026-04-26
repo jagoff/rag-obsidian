@@ -248,6 +248,74 @@ def test_api_logs_file_rejects_traversal(bad_name):
     assert resp.status_code == 404
 
 
+# ── Timestamp extraction ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("line, expected", [
+    # ISO con T (heartbeat / silent_errors / la mayoría).
+    ("[heartbeat] 2026-04-26T19:47:50 alive=true vaults=2", "2026-04-26T19:47:50"),
+    ("2026-04-26T19:51:39 something happened", "2026-04-26T19:51:39"),
+    # ISO con espacio (cloudflared-watcher / scripts shell).
+    ("2026-04-26 17:05:22 Watcher started", "2026-04-26T17:05:22"),
+    ("2026-04-26 17:05:26 URL changed", "2026-04-26T17:05:26"),
+    # JSONL — el `"ts": "..."` gana sobre cualquier otro pattern.
+    ('{"ts": "2026-04-26T19:51:39", "where": "foo"}', "2026-04-26T19:51:39"),
+    ('{"pid": 86385, "ts": "2026-04-26T19:50:16Z", "op": "delete"}', "2026-04-26T19:50:16"),
+    # Sin timestamp.
+    ("gmail · 1.41s", None),
+    ("INFO:     127.0.0.1:0 - GET /api/logs HTTP/1.1 200 OK", None),
+    ("sqlite3.OperationalError: no such column: trace_id", None),
+    ("", None),
+])
+def test_extract_log_ts(line, expected):
+    assert _server._extract_log_ts(line) == expected
+
+
+def test_api_logs_file_includes_timestamps(monkeypatch, tmp_path: Path):
+    """Cada línea devuelta tiene `ts` (string ISO o None) y `ts_inferred`
+    (bool). Forward-fill: una línea sin ts hereda el ts de la anterior."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "demo.log"
+    log.write_text(
+        "2026-04-26T19:47:50 first event\n"
+        "  continuation line without ts\n"
+        "no timestamp at all here\n"
+        "2026-04-26T19:48:00 second event\n"
+    )
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    resp = _client.get("/api/logs/file?name=obsidian-rag/demo.log&tail=10")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["lines_total"] == 4
+    lines = d["lines"]
+    assert lines[0]["ts"] == "2026-04-26T19:47:50"
+    assert lines[0]["ts_inferred"] is False
+    assert lines[1]["ts"] == "2026-04-26T19:47:50"
+    assert lines[1]["ts_inferred"] is True
+    assert lines[2]["ts"] == "2026-04-26T19:47:50"
+    assert lines[2]["ts_inferred"] is True
+    assert lines[3]["ts"] == "2026-04-26T19:48:00"
+    assert lines[3]["ts_inferred"] is False
+
+
+def test_api_logs_file_no_timestamps_returns_null(monkeypatch, tmp_path: Path):
+    """Si ninguna línea tiene timestamp, todas vuelven con `ts: null`."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "no-ts.log"
+    log.write_text("gmail · 1.41s\nwhatsapp: 14732 · 0.07s\n")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+
+    resp = _client.get("/api/logs/file?name=obsidian-rag/no-ts.log&tail=10")
+    assert resp.status_code == 200
+    lines = resp.json()["lines"]
+    assert len(lines) == 2
+    for ln in lines:
+        assert ln["ts"] is None
+        assert ln["ts_inferred"] is False
+
+
 def test_api_logs_file_returns_classified_lines(monkeypatch, tmp_path: Path):
     fake_dir = tmp_path / "obsidian-rag"
     fake_dir.mkdir()

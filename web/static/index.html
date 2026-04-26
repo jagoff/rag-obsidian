@@ -370,6 +370,15 @@
                  el teclado al cargar la página y tapa el empty-hero. El
                  focus inicial lo decide app.js — solo en desktop (ver
                  `initMobileTier1` y el bloque DOMContentLoaded). -->
+            <!-- Overlay para highlight de contactos detectados (verbo de
+                 envío + nombre que matchea Apple Contacts / My Card).
+                 Posicionado encima del textarea, color: transparent
+                 excepto el <mark>, pointer-events: none. JS sincroniza
+                 contenido + posición al type. Ver setupContactMatchHighlight
+                 en app.js. -->
+            <div id="input-overlay"
+                 class="contact-match-overlay"
+                 aria-hidden="true"></div>
             <textarea
               id="input"
               rows="1"
@@ -377,6 +386,13 @@
               aria-label="Pregunta"
             ></textarea>
           </div>
+          <!-- Badge debajo del textarea cuando se detecta un destinatario.
+               Hidden por default; el JS lo muestra con el nombre real del
+               contacto (puede diferir del input — "Mama" → "Mamá"). -->
+          <div id="contact-match-badge"
+               class="contact-match-badge"
+               hidden
+               aria-live="polite"></div>
           <div class="composer-actions">
             <!-- Toolbar-left: botón `+` (más opciones). Por ahora abre el
                  help modal con atajos y slash-commands — cuando haya un

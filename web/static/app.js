@@ -5793,6 +5793,172 @@ if (composerMicBtn) {
   });
 }
 
+// ── Contact match highlight (incremental, mientras se escribe) ─────────────
+// Debounce 300ms en el textarea. Cuando el user escribe un verbo de envío
+// + un nombre que el sistema puede resolver (vía Apple Contacts / Related
+// Names del My Card), highlightea el nombre con verde + negrita en un
+// overlay encima del textarea, y muestra un badge con el nombre canónico
+// debajo. Cero llamadas si el texto no contiene verbo de envío.
+//
+// Endpoint backend: POST /api/whatsapp/contacts/match — recibe `{text}`,
+// devuelve `{match: {name, jid, source, matched_token, match_offset, ...}}`
+// o `{match: null}`. Silent fail en cualquier error.
+
+const contactMatchOverlay = document.getElementById("input-overlay");
+const contactMatchBadge = document.getElementById("contact-match-badge");
+let _contactMatchDebounce = null;
+let _contactMatchLastSig = "";
+
+function _renderOverlayPlain(text) {
+  if (!contactMatchOverlay) return;
+  contactMatchOverlay.textContent = text;
+}
+
+function _renderOverlayWithMatch(text, match) {
+  if (!contactMatchOverlay) return;
+  // Spans: pre / mark / post. Si el offset es inválido (-1) o fuera de
+  // rango, fallback a texto plano para no romper.
+  const off = Number(match.match_offset);
+  const len = Number(match.match_length);
+  if (!Number.isFinite(off) || !Number.isFinite(len)
+      || off < 0 || off + len > text.length) {
+    _renderOverlayPlain(text);
+    return;
+  }
+  const pre = text.slice(0, off);
+  const matched = text.slice(off, off + len);
+  const post = text.slice(off + len);
+  // Limpiar y reconstruir con createTextNode + <mark> — sin innerHTML para
+  // evitar XSS si el user escribe `<script>` (improbable pero correcto).
+  contactMatchOverlay.textContent = "";
+  contactMatchOverlay.appendChild(document.createTextNode(pre));
+  const mark = document.createElement("mark");
+  mark.className = "contact-match-hit";
+  mark.textContent = matched;
+  contactMatchOverlay.appendChild(mark);
+  contactMatchOverlay.appendChild(document.createTextNode(post));
+}
+
+function _renderContactMatchBadge(match) {
+  if (!contactMatchBadge) return;
+  if (!match) {
+    contactMatchBadge.hidden = true;
+    contactMatchBadge.textContent = "";
+    return;
+  }
+  contactMatchBadge.textContent = "";
+  contactMatchBadge.appendChild(document.createTextNode("📤 Para: "));
+  const nameEl = document.createElement("span");
+  nameEl.className = "contact-match-name";
+  nameEl.textContent = match.name;
+  contactMatchBadge.appendChild(nameEl);
+  if (match.phone) {
+    const phoneEl = document.createElement("span");
+    phoneEl.className = "contact-match-phone";
+    phoneEl.textContent = match.phone;
+    contactMatchBadge.appendChild(phoneEl);
+  }
+  contactMatchBadge.hidden = false;
+}
+
+function _syncOverlayStyles() {
+  // Replicar font/padding del textarea en el overlay (por si el CSS
+  // cambia con media queries — en mobile #input pasa a font-size:16px
+  // por anti-zoom de iOS, hay que matchear). Idempotente.
+  if (!contactMatchOverlay || !input) return;
+  const cs = window.getComputedStyle(input);
+  contactMatchOverlay.style.font = cs.font;
+  contactMatchOverlay.style.padding = cs.padding;
+  contactMatchOverlay.style.lineHeight = cs.lineHeight;
+  contactMatchOverlay.style.letterSpacing = cs.letterSpacing;
+  contactMatchOverlay.style.wordSpacing = cs.wordSpacing;
+}
+
+function _scheduleContactMatchSearch(text) {
+  if (!contactMatchOverlay) return;
+  // Sync overlay con texto plano inmediatamente — mantiene el layout
+  // alineado mientras esperamos el debounce.
+  _renderOverlayPlain(text);
+  // Limpiar el badge en cada keystroke. Si hay match, el response del
+  // fetch lo va a re-popular. Sin esta limpieza early, el badge queda
+  // mostrando el match anterior por 300ms+ del debounce + roundtrip
+  // mientras el user ya cambió el texto — bug observado 2026-04-26.
+  _renderContactMatchBadge(null);
+  if (_contactMatchDebounce) {
+    clearTimeout(_contactMatchDebounce);
+  }
+  // Si el texto no parece tener verbo de envío, evitar el round-trip
+  // — heurística client-side rápida (regex similar a la del backend
+  // pero más laxa para matchear early).
+  const QUICK_PROBE = /\b(mand[aá]le|manda|escribi?le|dec[iíĩ]le|avis[aá]le|record[aá]le)\b/i;
+  if (!QUICK_PROBE.test(text)) {
+    _contactMatchLastSig = "";
+    return;
+  }
+  // Dedup: si el texto no cambió desde el último call, skip.
+  if (text === _contactMatchLastSig) return;
+  _contactMatchDebounce = setTimeout(async () => {
+    _contactMatchLastSig = text;
+    try {
+      const resp = await fetch("/api/whatsapp/contacts/match", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({text}),
+      });
+      if (!resp.ok) {
+        _renderContactMatchBadge(null);
+        _renderOverlayPlain(text);
+        return;
+      }
+      const data = await resp.json();
+      // Solo aplicar si el textarea sigue mostrando el mismo texto —
+      // el user puede haber tipeado más mientras esperabamos.
+      if (input.value !== text) return;
+      const match = data && data.match ? data.match : null;
+      if (match) {
+        _renderOverlayWithMatch(text, match);
+        _renderContactMatchBadge(match);
+      } else {
+        _renderOverlayPlain(text);
+        _renderContactMatchBadge(null);
+      }
+    } catch {
+      // Silent fail — no rompemos el chat por un fallback.
+      _renderOverlayPlain(text);
+      _renderContactMatchBadge(null);
+    }
+  }, 300);
+}
+
+if (contactMatchOverlay && input) {
+  // Init: sincronizar estilos + textarea actual (en caso de que el
+  // browser restore tenga texto pre-existente).
+  _syncOverlayStyles();
+  _renderOverlayPlain(input.value || "");
+  // Listener `input` — corre EN PARALELO al existing handler arriba.
+  input.addEventListener("input", () => {
+    _scheduleContactMatchSearch(input.value || "");
+  });
+  // Sync scroll para que el overlay siga al textarea cuando hay
+  // muchas líneas (el textarea internamente scrollea verticalmente
+  // si se pasa de max-height).
+  input.addEventListener("scroll", () => {
+    contactMatchOverlay.scrollTop = input.scrollTop;
+    contactMatchOverlay.scrollLeft = input.scrollLeft;
+  });
+  // Re-sync estilos al resize (mobile portrait/landscape switch).
+  window.addEventListener("resize", _syncOverlayStyles);
+  // Si el form se submitea, limpiar overlay y badge.
+  if (form) {
+    form.addEventListener("submit", () => {
+      _renderOverlayPlain("");
+      _renderContactMatchBadge(null);
+      _contactMatchLastSig = "";
+    });
+  }
+}
+
+
 // ── Quick-chips: click rellena input + submit directo ──
 document.querySelectorAll(".quick-chip").forEach((chip) => {
   chip.addEventListener("click", () => {

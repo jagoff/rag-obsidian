@@ -8252,3 +8252,104 @@ main:focus-visible {
   font-size: 14px;
   line-height: 1.4;
 }
+
+/* ── Contact match highlight overlay (added 2026-04-26) ────────────────────
+ * Mientras el user escribe en el textarea del chat, si detectamos un
+ * verbo de envío de WhatsApp + un nombre que resolvemos contra Apple
+ * Contacts / Related Names, el JS:
+ *
+ *   1. Pone un <mark class="contact-match-hit"> alrededor del nombre en
+ *      el overlay → se ve en VERDE NEGRITA encima del textarea.
+ *   2. Muestra un badge debajo con el nombre canónico del contacto
+ *      ("Mama" → "Para: Mamá").
+ *
+ * Técnica: overlay con posición absoluta, mismo font/padding que el
+ * textarea, color: transparent excepto el <mark>. El textarea tiene
+ * background: transparent así el overlay se ve "detrás" pero del
+ * mismo lado del z-index (usamos pointer-events:none para no robar
+ * los clicks).
+ */
+
+.composer-row {
+  position: relative;
+}
+
+.contact-match-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 1;
+  /* Replicar EXACTAMENTE los estilos del textarea para que el layout
+     (saltos de línea, kerning) coincida píxel a píxel. JS además fuerza
+     padding/border vía getComputedStyle al init para cubrir cualquier
+     override que hagan media queries (mobile #input). */
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+  padding: 2px 0;
+  border: none;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-word;
+  color: transparent;
+  background: transparent;
+  overflow: hidden;
+  margin: 0;
+  /* Mismo box-sizing que el textarea (browser default = content-box,
+     pero los textareas usan border-box en muchos UAs — lo forzamos
+     explícito). */
+  box-sizing: border-box;
+}
+
+.contact-match-overlay .contact-match-hit {
+  background: transparent;
+  color: var(--green, #16a34a);
+  font-weight: 700;
+  /* Pequeño underline sutil para reforzar que el sistema lo detectó. */
+  text-decoration: underline;
+  text-decoration-color: var(--green, #16a34a);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+#input {
+  /* Aseguramos que el textarea está sobre el overlay para que el caret
+     y el highlight de selección se vean — pero como ambos tienen
+     position:relative + z-index, el textarea se renderea encima. El
+     truco es que su background es transparent, así el <mark> del
+     overlay se ve a través. */
+  position: relative;
+  z-index: 0;
+}
+
+.contact-match-badge {
+  margin: 6px 12px 0 12px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: rgba(126, 231, 135, 0.08);
+  border-left: 2px solid var(--green, #16a34a);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+}
+
+.contact-match-badge[hidden] {
+  display: none;
+}
+
+.contact-match-badge .contact-match-name {
+  color: var(--green, #16a34a);
+  font-weight: 600;
+}
+
+.contact-match-badge .contact-match-phone {
+  color: var(--text-faint, #9ca3af);
+  margin-left: 4px;
+  font-variant-numeric: tabular-nums;
+}

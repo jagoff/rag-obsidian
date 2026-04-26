@@ -3311,6 +3311,158 @@ def whatsapp_send(req: WhatsAppSendRequest) -> dict:
     return {"ok": True, "jid": jid}
 
 
+class WhatsAppMatchRequest(BaseModel):
+    text: str = Field(..., description="Texto del input del usuario tal cual lo escribe.")
+
+
+# Verbos de envío de WhatsApp + capturas del candidato (rioplatense + neutral).
+# Diseñado para matchear en MEDIO del texto (no anchored al inicio) — el user
+# puede escribir "Recordame que ... y mandale a Mama que diga ..." y queremos
+# detectar "Mama" igual.
+_WA_SEND_VERB_RE = re.compile(
+    r"\b(mand[aá]le|manda|escribi?le|dec[iíĩ]le|avis[aá]le|record[aá]le)\s+"
+    r"(?:un\s+)?(?:(?:mensaje|msj|msg|wzp|wa|whatsapp)(?:\s+(?:de|por|via|v[ií]a)\s+(?:wa|whatsapp))?\s+)?"
+    r"a\s+",
+    re.IGNORECASE,
+)
+
+
+@app.post("/api/whatsapp/contacts/match")
+def whatsapp_contacts_match(req: WhatsAppMatchRequest) -> dict:
+    """Detección incremental de destinatario mientras el user escribe.
+
+    Llamado con debounce desde el frontend cada vez que cambia el textarea
+    del chat. Si el texto contiene un verbo de envío + un nombre que el
+    sistema puede resolver (vía Related Names del My Card o Apple Contacts),
+    devuelve el match para que el frontend highlightee el nombre y muestre
+    una confirmación visual ANTES del envío.
+
+    Diseñado para ser fast (osascript cached) — el frontend lo invoca cada
+    ~300ms. Silent-fail para todo error (devuelve `match: None`).
+
+    Returns::
+
+        {
+          "match": {
+            "name": "Mamá",                      # nombre canónico del contacto
+            "phone": "+54 9 342 547 6623",
+            "jid": "5493425476623@s.whatsapp.net",
+            "source": "relations" | "contacts",  # de dónde salió
+            "matched_token": "Mama",             # lo que el user escribió
+            "match_offset": 22,                  # posición en `text` (chars)
+            "match_length": 4
+          },
+          "trigger": {                           # opcional
+            "verb": "mandale",
+            "offset": 0
+          }
+        } | { "match": None, "trigger": None }
+    """
+    text = (req.text or "").strip()
+    if not text:
+        return {"match": None, "trigger": None}
+
+    m_verb = _WA_SEND_VERB_RE.search(text)
+    if not m_verb:
+        return {"match": None, "trigger": None}
+
+    # Después del "a " del verbo, viene el candidate string.
+    candidate_start = m_verb.end()
+    candidate_text = text[candidate_start:].strip()
+    if not candidate_text:
+        return {"match": None, "trigger": {
+            "verb": m_verb.group(1), "offset": m_verb.start(),
+        }}
+
+    # Strip posesivos al inicio del candidate ("mi Mama", "a mi Mama", "la
+    # Mama") — lookup downstream también lo hace, pero acá adelantamos para
+    # que el offset/length que devolvemos al frontend matchee la palabra
+    # real que el highlight debe pintar (si dejamos "mi Mama", el highlight
+    # incluiría "mi" que NO es parte del nombre).
+    from rag.integrations.whatsapp import (
+        _whatsapp_jid_from_contact,
+        _strip_possessive_prefix,
+    )
+    candidate_stripped = _strip_possessive_prefix(candidate_text).strip()
+    if not candidate_stripped:
+        return {"match": None, "trigger": {
+            "verb": m_verb.group(1), "offset": m_verb.start(),
+        }}
+
+    tokens = candidate_stripped.split()
+    if not tokens:
+        return {"match": None, "trigger": {
+            "verb": m_verb.group(1), "offset": m_verb.start(),
+        }}
+
+    # Probar 1 palabra primero — la mayoría de los casos ("Mama", "Maria",
+    # "Sebas"). Si no resuelve, probar 2 ("Maria José", "Tía Carmen") y
+    # finalmente 3 ("Maria José Pérez"). Sin esto el endpoint matcheaba 3
+    # palabras espurias ("Maria que ya") y resolvía via fuzzy a otro
+    # contacto distinto — error observado 2026-04-26.
+    _RELATION_LOWER = {
+        "mama", "mami", "papa", "papi", "madre", "padre",
+        "hermana", "hermano", "esposa", "esposo", "marido", "mujer",
+        "hijo", "hija", "abuela", "abuelo", "tia", "tio",
+        "prima", "primo", "suegra", "suegro",
+    }
+    best_match = None
+    matched_token = ""
+    for n in range(1, min(4, len(tokens) + 1)):
+        candidate = " ".join(tokens[:n])
+        # Filter: si el primer token no arranca con mayúscula Y no es alias
+        # de parentesco → skip (es prosa, no nombre).
+        first_lower = tokens[0].lower()
+        if not tokens[0][:1].isupper() and first_lower not in _RELATION_LOWER:
+            break  # sin sentido seguir agregando palabras
+        try:
+            lookup = _whatsapp_jid_from_contact(candidate)
+        except Exception:
+            continue
+        if lookup.get("jid") and not lookup.get("error") and not lookup.get("is_group"):
+            best_match = lookup
+            matched_token = candidate
+            break
+
+    if not best_match:
+        return {"match": None, "trigger": {
+            "verb": m_verb.group(1), "offset": m_verb.start(),
+        }}
+
+    # Calcular offset/length del matched_token en el texto original.
+    # `candidate_text` empieza en `candidate_start`. El primer token ocupa
+    # `len(matched_token)` chars (después de strip).
+    # Necesitamos la posición real en `text` — buscamos `matched_token`
+    # case-insensitive desde `candidate_start`.
+    needle_lower = matched_token.lower()
+    haystack_lower = text.lower()
+    match_offset = haystack_lower.find(needle_lower, candidate_start)
+    match_length = len(matched_token)
+
+    # Decidir source: si el resolver vino vía Related Names (full_name distinto
+    # del input limpio), es "relations"; si match exact/fuzzy de Contacts directo,
+    # es "contacts".
+    source = "relations" if (
+        best_match.get("full_name") and matched_token.lower() not in best_match["full_name"].lower()
+    ) else "contacts"
+
+    return {
+        "match": {
+            "name": best_match.get("full_name") or matched_token,
+            "phone": (best_match.get("phones") or [""])[0],
+            "jid": best_match["jid"],
+            "source": source,
+            "matched_token": matched_token,
+            "match_offset": match_offset,
+            "match_length": match_length,
+        },
+        "trigger": {
+            "verb": m_verb.group(1),
+            "offset": m_verb.start(),
+        },
+    }
+
+
 @app.get("/api/whatsapp/context")
 def whatsapp_context(jid: str, limit: int = 5) -> dict:
     """Últimos ``limit`` mensajes intercambiados con ``jid`` para mostrar

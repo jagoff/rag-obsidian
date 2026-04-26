@@ -40,7 +40,15 @@ from rag_ranker_lgbm.features import (
     FEATURE_NAMES,
     feedback_to_training_data,
 )
+from rag_ranker_lgbm.hard_negatives import (
+    get_negatives_stats,
+    mine_hard_negatives_for_synthetic,
+)
 from rag_ranker_lgbm.inference import LambdaRankerScorer
+from rag_ranker_lgbm.synthetic_queries import (
+    generate_synthetic_queries,
+    get_synthetic_stats,
+)
 from rag_ranker_lgbm.train import (
     DEFAULT_MODEL_PATH,
     train_lambdarank,
@@ -51,5 +59,9 @@ __all__ = [
     "FEATURE_NAMES",
     "LambdaRankerScorer",
     "feedback_to_training_data",
+    "generate_synthetic_queries",
+    "get_negatives_stats",
+    "get_synthetic_stats",
+    "mine_hard_negatives_for_synthetic",
     "train_lambdarank",
 ]

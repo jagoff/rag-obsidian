@@ -132,6 +132,7 @@ from rag import (  # noqa: E402
     append_turn,
     ensure_session,
     find_followup_loops,
+    find_related,
     get_db,
     get_pagerank,
     log_behavior_event,
@@ -3781,6 +3782,95 @@ def related(req: RelatedRequest) -> dict:
     if "youtube" in wanted:
         items.extend(_youtube_search(q, limit=2))
     return {"items": items}
+
+
+# ── /api/notes/related ────────────────────────────────────────────────────────
+# Distinto del `/api/related` de arriba (que es enrichment externo Deezer/
+# YouTube). Este endpoint devuelve **notas del vault** relacionadas a una
+# nota dada, vía shared-tags + graph hops (find_related). Pensado para el
+# panel "Notas relacionadas" del plugin Obsidian — el sidebar lo querya
+# cada vez que cambia la nota activa.
+#
+# No agregamos cache adicional encima de _load_corpus porque ese ya está
+# cached con la invalidation correcta (watchdog → reindex bumpa col.id,
+# que dispara rebuild). Cold call ~1-2s en vaults grandes; cached <100ms.
+@app.get("/api/notes/related")
+def notes_related(path: str, limit: int = 10) -> dict:
+    """Notas relacionadas a `path` por shared tags + graph hops.
+
+    Wrap delgado de `find_related()`. El ranking real vive en rag/__init__.py
+    — este endpoint sólo valida la path, agarra la lista de chunks de la
+    nota source, llama a find_related, y formatea el resultado para JSON.
+
+    Args:
+        path: Vault-relative (ej. "02-Areas/Coaching/Autoridad.md").
+              Debe terminar en .md y no escapar el vault root.
+        limit: Cantidad máxima de items (1-50, default 10).
+
+    Returns:
+        {"items": [{path, note, folder, tags, shared_tags, score, reason},...],
+         "source_path": str}
+        Si la nota no está indexada o el vault no existe, items=[] con un
+        campo "reason" describiendo el motivo (sin status 4xx — el plugin
+        debe poder distinguir "no hay relacionadas" de "no indexada" sin
+        try/catch).
+    """
+    if not path or not path.endswith(".md"):
+        raise HTTPException(status_code=400, detail="path debe terminar en .md")
+    if not VAULT_PATH.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"vault no encontrado en {VAULT_PATH}",
+        )
+    # Path-traversal guard: resolver y verificar que cae dentro del vault.
+    # Sigue el mismo shape que `rag_read_note` en mcp_server.py.
+    try:
+        full = (VAULT_PATH / path).resolve()
+        full.relative_to(VAULT_PATH.resolve())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"path inválido: {exc}")
+
+    limit = max(1, min(int(limit), 50))
+
+    col = get_db()
+    if col.count() == 0:
+        return {"items": [], "source_path": path, "reason": "empty_index"}
+
+    # Pasamos TODOS los chunks de la nota source — find_related agrega
+    # tags + títulos por toda la lista para construir el set source. Si
+    # pasáramos sólo el primer chunk, una nota con N chunks de tags
+    # heterogéneos perdería signal.
+    c = _load_corpus(col)
+    source_metas = [m for m in c["metas"] if m.get("file") == path]
+    if not source_metas:
+        return {"items": [], "source_path": path, "reason": "not_indexed"}
+
+    # Union de tags de la source — para computar `shared_tags` por
+    # vecino y devolverlo al UI (chips clickeables).
+    src_tags: set[str] = set()
+    for m in source_metas:
+        for t in (m.get("tags") or "").split(","):
+            t = t.strip()
+            if t:
+                src_tags.add(t)
+
+    results = find_related(col, source_metas, limit=limit)
+    items: list[dict] = []
+    for meta, score, reason in results:
+        nei_tags = [
+            t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()
+        ]
+        shared = sorted(src_tags.intersection(nei_tags))
+        items.append({
+            "path": meta.get("file", ""),
+            "note": meta.get("note", ""),
+            "folder": meta.get("folder", ""),
+            "tags": nei_tags,
+            "shared_tags": shared,
+            "score": int(score),
+            "reason": reason,
+        })
+    return {"items": items, "source_path": path}
 
 
 class TTSRequest(BaseModel):

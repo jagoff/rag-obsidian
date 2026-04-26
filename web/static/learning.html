@@ -353,6 +353,145 @@
     }
     .vsys-dormant .vsys-note { color: var(--red); }
 
+    /* ── Health banner (semáforo del sistema) ─────────────────────── */
+    /* Bloque grande arriba del dashboard. Estados: is-loading (gris),
+       level-green, level-yellow, level-red. Cambia bg + border + ícono.
+       Diseño "tarjeta dentro de tarjeta": .health-banner es el contenedor
+       coloreado, .health-main es el headline grande, .health-signals es la
+       lista de bullets debajo (uno por señal: ✓ verde, ⚠ amarillo, ✗ rojo). */
+    .health-banner {
+      margin: 16px 24px 0;
+      padding: 20px 24px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      transition: background 240ms ease, border-color 240ms ease;
+    }
+    .health-banner.is-loading {
+      background: var(--bg-card);
+      border-color: var(--border);
+      color: var(--text-faint);
+    }
+    .health-banner.level-green {
+      background: color-mix(in srgb, var(--green) 12%, var(--bg-card));
+      border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+    }
+    .health-banner.level-yellow {
+      background: color-mix(in srgb, var(--yellow) 14%, var(--bg-card));
+      border-color: color-mix(in srgb, var(--yellow) 55%, var(--border));
+    }
+    .health-banner.level-red {
+      background: color-mix(in srgb, var(--red) 14%, var(--bg-card));
+      border-color: color-mix(in srgb, var(--red) 55%, var(--border));
+    }
+
+    .health-main {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 16px;
+    }
+    .health-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      display: inline-block;
+      background: var(--text-faint);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--text-faint) 18%, transparent);
+      transition: background 240ms ease, box-shadow 240ms ease;
+      flex-shrink: 0;
+    }
+    .level-green .health-icon {
+      background: var(--green);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 22%, transparent);
+    }
+    .level-yellow .health-icon {
+      background: var(--yellow);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--yellow) 22%, transparent);
+    }
+    .level-red .health-icon {
+      background: var(--red);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--red) 22%, transparent);
+      /* Pulse sutil cuando es rojo — atención, no alarma. */
+      animation: health-pulse 2s ease-in-out infinite;
+    }
+    @keyframes health-pulse {
+      0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--red) 22%, transparent); }
+      50%      { box-shadow: 0 0 0 8px color-mix(in srgb, var(--red) 28%, transparent); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .level-red .health-icon { animation: none; }
+    }
+
+    .health-text { min-width: 0; }
+    .health-headline {
+      font-size: 22px;
+      font-weight: 700;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+    .health-summary {
+      font-size: 14px;
+      color: var(--text-dim);
+      margin: 4px 0 0;
+    }
+    .health-updated {
+      font-size: 11px;
+      color: var(--text-faint);
+      white-space: nowrap;
+      align-self: start;
+      padding-top: 6px;
+    }
+
+    .health-signals {
+      list-style: none;
+      margin: 16px 0 0;
+      padding: 0;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px 24px;
+    }
+    .health-signal {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 10px;
+      align-items: baseline;
+      font-size: 14px;
+      cursor: help;
+    }
+    .health-signal-marker {
+      font-size: 14px;
+      line-height: 1;
+      font-weight: 700;
+      text-align: center;
+    }
+    .health-signal.level-green .health-signal-marker { color: var(--green); }
+    .health-signal.level-yellow .health-signal-marker { color: var(--yellow); }
+    .health-signal.level-red .health-signal-marker { color: var(--red); }
+    .health-signal-body { min-width: 0; }
+    .health-signal-label {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .health-signal-value {
+      color: var(--text-dim);
+      margin-left: 6px;
+    }
+    .health-signal.level-red .health-signal-value {
+      color: var(--red);
+      font-weight: 600;
+    }
+
+    @media (max-width: 720px) {
+      .health-banner { margin: 12px 16px 0; padding: 16px; }
+      .health-main { grid-template-columns: auto 1fr; }
+      .health-updated { grid-column: 1 / -1; padding-top: 0; }
+      .health-icon { width: 36px; height: 36px; }
+      .health-headline { font-size: 18px; }
+      .health-summary { font-size: 13px; }
+      .health-signals { grid-template-columns: 1fr; gap: 8px; }
+    }
+
     /* ── KPI hero (8 tarjetas grandes, 4 cols desktop / 2 mobile) ──── */
     .kpi-hero {
       display: grid;
@@ -719,6 +858,26 @@
   </header>
 
   <main id="content" tabindex="-1">
+    <!-- ── HEALTH BANNER (semáforo del sistema) ───────────────────
+         Lo PRIMERO que ve el usuario: bloque verde / amarillo / rojo con
+         texto en lenguaje plain explicando si todo está OK. JS hidrata los
+         signals desde /api/dashboard/learning/health (TTL 15s) y refresca
+         cada 30s. Si la red falla, queda en .is-loading. Worst-case wins:
+         si una sola señal está roja, el banner va rojo. -->
+    <section id="health-banner" class="health-banner is-loading"
+             aria-live="polite" role="status"
+             aria-label="Estado general del sistema">
+      <div class="health-main">
+        <span class="health-icon" aria-hidden="true"></span>
+        <div class="health-text">
+          <h2 id="health-headline" class="health-headline">Verificando estado…</h2>
+          <p id="health-summary" class="health-summary">Cargando indicadores de salud del sistema.</p>
+        </div>
+        <span id="health-updated" class="health-updated"></span>
+      </div>
+      <ul id="health-signals" class="health-signals" role="list"></ul>
+    </section>
+
     <!-- ── VEREDICTO ─────────────────────────────────────────────
          Estado actual de los 12 sistemas de aprendizaje. Auto-generado
          desde `verdict()` en `web/learning_queries.py`. La idea: lo que

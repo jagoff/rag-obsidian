@@ -1738,8 +1738,119 @@ function startStream() {
   };
 }
 
+// ── Health banner (semáforo del sistema) ─────────────────────────────────
+// Bloque arriba del dashboard que dice "todo OK / atención / problema" en
+// lenguaje plain. Independiente del SSE de los charts — su propio fetch +
+// interval de 30s. La razón es que (a) el endpoint /health es ~3-4× más
+// liviano que /api/dashboard/learning, y (b) queremos que el banner
+// refresque rápido aún si los charts están pausados o desconectados.
+const HEALTH_REFRESH_MS = 30_000;
+const HEALTH_LEVELS = ["green", "yellow", "red"];
+const HEALTH_MARKERS = { green: "✓", yellow: "⚠", red: "✗" };
+
+let healthTimer = null;
+let lastHealthLevel = null;
+
+function el_(id) { return document.getElementById(id); }
+
+function renderHealth(payload) {
+  if (!payload) return;
+  const banner = el_("health-banner");
+  const headline = el_("health-headline");
+  const summary = el_("health-summary");
+  const updated = el_("health-updated");
+  const signalsList = el_("health-signals");
+  if (!banner || !headline || !summary || !signalsList) return;
+
+  const level = HEALTH_LEVELS.includes(payload.level) ? payload.level : "yellow";
+
+  // Toggle classes (sin perder otras como is-loading que sale al primer render).
+  banner.classList.remove("is-loading", "level-green", "level-yellow", "level-red");
+  banner.classList.add(`level-${level}`);
+  // Si pasó de un nivel a otro, anunciamos a screen readers (aria-live="polite").
+  if (lastHealthLevel && lastHealthLevel !== level) {
+    announceStatus(`Estado del sistema: ${payload.headline}`);
+  }
+  lastHealthLevel = level;
+
+  headline.textContent = payload.headline || "Estado desconocido";
+  summary.textContent = payload.summary || "";
+  if (updated) {
+    try {
+      const dt = new Date(payload.checked_at);
+      const hh = String(dt.getHours()).padStart(2, "0");
+      const mm = String(dt.getMinutes()).padStart(2, "0");
+      updated.textContent = `chequeado ${hh}:${mm}`;
+      updated.title = `Último chequeo: ${dt.toLocaleString()}`;
+    } catch (_) {
+      updated.textContent = "";
+    }
+  }
+
+  // Render de la lista de señales individuales.
+  signalsList.innerHTML = "";
+  for (const s of (payload.signals || [])) {
+    const lvl = HEALTH_LEVELS.includes(s.level) ? s.level : "yellow";
+    const li = document.createElement("li");
+    li.className = `health-signal level-${lvl}`;
+    // Tooltip combina el explanation (lenguaje plain) + tooltip (jerga
+    // técnica) para que tanto el user como el dev entiendan al hover.
+    const tipParts = [];
+    if (s.explanation) tipParts.push(s.explanation);
+    if (s.tooltip) tipParts.push(`[${s.tooltip}]`);
+    li.title = tipParts.join("\n");
+
+    const marker = document.createElement("span");
+    marker.className = "health-signal-marker";
+    marker.setAttribute("aria-hidden", "true");
+    marker.textContent = HEALTH_MARKERS[lvl] || "•";
+    li.appendChild(marker);
+
+    const body = document.createElement("span");
+    body.className = "health-signal-body";
+    const labelEl = document.createElement("span");
+    labelEl.className = "health-signal-label";
+    labelEl.textContent = s.label || s.key;
+    body.appendChild(labelEl);
+    if (s.value_text) {
+      const valueEl = document.createElement("span");
+      valueEl.className = "health-signal-value";
+      valueEl.textContent = "— " + s.value_text;
+      body.appendChild(valueEl);
+    }
+    li.appendChild(body);
+    signalsList.appendChild(li);
+  }
+}
+
+async function fetchHealth() {
+  try {
+    const res = await fetch("/api/dashboard/learning/health", {
+      headers: { "Accept": "application/json" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    renderHealth(payload);
+  } catch (err) {
+    console.warn("[learning] health fetch error:", err);
+    // No tocamos el banner — queda con el último estado renderizado o en
+    // is-loading si era el primer fetch. El usuario igual ve algo.
+  }
+}
+
+function startHealthPolling() {
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+  fetchHealth();  // primer hit inmediato
+  healthTimer = setInterval(() => {
+    if (state.paused) return;
+    if (document.visibilityState === "hidden") return;
+    fetchHealth();
+  }, HEALTH_REFRESH_MS);
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────
 applyChartDefaults();
 fetchSnapshot();
 startPolling();
 startStream();
+startHealthPolling();

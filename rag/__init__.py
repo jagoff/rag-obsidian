@@ -38388,6 +38388,91 @@ def wa_scheduled_send(dry_run: bool, late_threshold_min: int,
     )
 
 
+@cli.command("contact-note")
+@click.argument("contact_name")
+@click.argument("observation")
+@click.option("--category", default=None,
+              help="Categoría tipo bullet existente (Preferencias, Trabajo, "
+                   "Notas, etc.). Si matchea, smart-append al value de ese "
+                   "bullet. Si no, crea bullet nuevo. Si NO se da, solo va "
+                   "a `## Observaciones`.")
+@click.option("--source-kind", default="manual",
+              type=click.Choice(["manual", "chat", "wa", "audio"]),
+              help="Origen de la observación. `manual` (default) para CLI, "
+                   "los otros se reservan para hooks automáticos.")
+@click.option("--source-excerpt", default=None,
+              help="Texto crudo del mensaje original (e.g. \"Seba te llevo "
+                   "un vino\") — se loguea en italic junto a la observación.")
+def contact_note(contact_name: str, observation: str,
+                 category: str | None, source_kind: str,
+                 source_excerpt: str | None):
+    """Anotar info viva sobre un contacto en su nota del vault.
+
+    Las notas de `04-Archive/99-obsidian-system/99-Contacts/` son contactos
+    "vivos" — cada vez que el user (o el LLM) detecta info relevante sobre
+    alguien, esta función la guarda ahí. Doble write:
+
+      1. Sección `## Observaciones` al final, con bullet timestamped
+         + el texto crudo en italic (auditoría completa).
+      2. Si `--category` matchea un bullet `**<X>**:` existente del
+         template (`Notas`, `Trabajo / contexto`, etc.), append al
+         value de ese bullet. Si no existe, crea uno nuevo.
+
+    Idempotente: si la observación ya está literal, skip silencioso.
+
+    Ejemplos:
+
+      \b
+      # Solo a la sección de auditoría:
+      rag contact-note Seba "Le gusta el vino" \\
+        --source-excerpt "Seba te llevo un vino"
+
+      # También consolida en bullet **Preferencias**:
+      rag contact-note Seba "Vino" --category Preferencias
+
+      # Update de trabajo:
+      rag contact-note Mama "Jubilada en Santa Fe" \\
+        --category "Trabajo / contexto"
+    """
+    from rag.integrations.whatsapp import _append_contact_observation
+    result = _append_contact_observation(
+        contact_name,
+        observation,
+        category=category,
+        source_kind=source_kind,
+        source_excerpt=source_excerpt,
+    )
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        if reason == "contact_not_in_vault":
+            console.print(
+                f"[red]✗ no encontré '{contact_name}' en el vault "
+                f"`99-Contacts/`[/red]\n"
+                f"[dim]creá la nota primero (copiá `_template.md`) o "
+                f"chequeá el alias[/dim]"
+            )
+        else:
+            console.print(f"[red]✗ falló: {reason}[/red]")
+        raise click.exceptions.Exit(1)
+
+    if result.get("reason") == "duplicate_skipped":
+        console.print(
+            f"[yellow]· ya estaba registrado en {result['file']}[/yellow]"
+        )
+        return
+
+    parts = []
+    if result.get("observation_added"):
+        parts.append("Observaciones")
+    if result.get("category_updated"):
+        parts.append(f"**{category}**")
+    where = " + ".join(parts) if parts else "(nada cambió)"
+    console.print(
+        f"[green]✓ anotado en {result['file']}[/green] "
+        f"[dim]→ {where}[/dim]"
+    )
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")

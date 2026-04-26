@@ -623,6 +623,228 @@ def _lookup_vault_contact(query: str) -> dict | None:
     return None
 
 
+# ── Contact observation logger ─────────────────────────────────────────────
+# El user pidió 2026-04-26: "[las notas de 99-Contacts/] son contactos
+# 'vivos', cada información relevante sobre ese contacto debería almacenarse
+# ahí". Ej: "Seba te llevo un vino" → la nota de Seba debería anotar
+# "Preferencia de bebidas: Vino".
+#
+# Esta función appendea observaciones a la nota correspondiente.
+# Doble write (decisión user 2026-04-26 "las dos cosas"):
+#   1. Sección "## Observaciones" al final de la nota — bullet con
+#      timestamp + texto crudo. Auditoría completa, no se borra nada.
+#   2. Si la observación tiene `category` (ej. "Preferencias"), también
+#      append al bullet `**<category>**:` existente o crear uno nuevo.
+#      Vista consolidada para queries del RAG ("a Seba qué le gusta?").
+#
+# Idempotencia: hash del observation text — si el mismo texto ya existe en
+# las últimas N obs, skip. Permite que el LLM dispare el tool múltiples
+# veces sin spammear la nota.
+
+# Marker que abre la sección auto-managed. Único + estable para que el
+# parser sepa dónde insertar. Si el user reorganiza la nota a mano,
+# preservamos su edición — solo modificamos lo que está bajo este marker.
+_OBSERVATIONS_HEADING = "## Observaciones"
+
+
+def _append_contact_observation(
+    contact_name: str,
+    observation: str,
+    *,
+    category: str | None = None,
+    source_kind: str = "manual",   # "manual" | "chat" | "wa" | "audio"
+    source_excerpt: str | None = None,
+) -> dict:
+    """Anotar una observación sobre un contacto en su nota del vault.
+
+    Args:
+        contact_name: Nombre tal como el user/LLM lo dice ("Seba", "mi
+            Mama", "Sebastian"). Resuelto vía `_lookup_vault_contact`.
+        observation: Texto procesado de la observación, listo para
+            mostrarse. Ej: "Le gusta el vino", "Preferencia de bebidas:
+            Vino", "Trabajo nuevo: cafetería en Costanera".
+        category: OPCIONAL — categoría que matchea un bullet existente
+            del template (`Trabajo / contexto`, `Notas`, `Preferencias`,
+            etc.). Si está dado, appendea al bullet existente o crea uno
+            nuevo. Si None, solo va a `## Observaciones`.
+        source_kind: De dónde vino la observación. "chat" | "wa" |
+            "audio" | "manual". Default "manual" para CLI.
+        source_excerpt: OPCIONAL — texto crudo del mensaje original
+            ("Seba me llevo un vino"). Se loguea junto a la obs.
+
+    Returns:
+        `{ok: bool, file: str, observation_added: bool, category_updated:
+        bool, reason?: str}`. `ok=False` con `reason` cuando el contacto
+        no existe en el vault o no se puede escribir el archivo.
+
+    Idempotencia: si el `observation` ya está literal en la sección
+    `## Observaciones`, no lo agregamos de vuelta. El smart-append a la
+    categoría es similar.
+    """
+    if not contact_name or not contact_name.strip():
+        return {"ok": False, "reason": "empty_contact"}
+    if not observation or not observation.strip():
+        return {"ok": False, "reason": "empty_observation"}
+
+    vault_match = _lookup_vault_contact(contact_name)
+    if not vault_match:
+        return {"ok": False, "reason": "contact_not_in_vault",
+                "contact_name": contact_name}
+
+    base = _vault_contacts_dir()
+    if not base:
+        return {"ok": False, "reason": "no_vault"}
+
+    # Re-load para obtener el path real (lookup devuelve solo `parsed`).
+    contacts = _load_vault_contacts()
+    target_path: Path | None = None
+    target_stem = ""
+    for c in contacts:
+        # Match por full_name o aliases o filename.
+        norm_full = _normalize_hint(c["parsed"].get("full_name", ""))
+        norm_match_full = _normalize_hint(vault_match.get("full_name", ""))
+        if norm_full and norm_full == norm_match_full:
+            target_path = c["path"]
+            target_stem = c["stem"]
+            break
+    if not target_path:
+        return {"ok": False, "reason": "contact_path_not_found"}
+
+    try:
+        text = target_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "reason": f"read_failed: {str(exc)[:80]}"}
+
+    obs_clean = observation.strip()
+    excerpt_clean = (source_excerpt or "").strip()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Render del bullet para la sección "## Observaciones".
+    if excerpt_clean and excerpt_clean.lower() != obs_clean.lower():
+        new_bullet = f"- {today} · {obs_clean} _(orig: \"{excerpt_clean}\")_"
+    else:
+        new_bullet = f"- {today} · {obs_clean}"
+
+    # 1. Sección "## Observaciones" — append idempotente.
+    new_text = text
+    obs_idx = new_text.find(_OBSERVATIONS_HEADING)
+    if obs_idx == -1:
+        # No existe la sección — agregarla al final (con linebreak previo
+        # si la nota no termina en \n).
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        if not new_text.endswith("\n\n"):
+            new_text += "\n"
+        new_text += f"{_OBSERVATIONS_HEADING}\n\n{new_bullet}\n"
+        observation_added = True
+    else:
+        # Idempotencia: skip si la observación literal ya está en la
+        # sección. Comparamos el "core" (sin la fecha) para que dos obs
+        # del mismo día con texto idéntico no dupliquen.
+        existing_section = new_text[obs_idx:]
+        # Substring check del observation en el cuerpo de la sección.
+        if obs_clean and obs_clean in existing_section:
+            observation_added = False
+        else:
+            # Insertar después del último bullet de la sección. Buscamos
+            # el siguiente heading "##" o EOF.
+            section_end = new_text.find("\n## ", obs_idx + len(_OBSERVATIONS_HEADING))
+            if section_end == -1:
+                # Sección hasta EOF.
+                if not new_text.endswith("\n"):
+                    new_text += "\n"
+                new_text += f"{new_bullet}\n"
+            else:
+                new_text = (
+                    new_text[:section_end]
+                    + f"\n{new_bullet}"
+                    + new_text[section_end:]
+                )
+            observation_added = True
+
+    # 2. Smart-append al bullet de categoría si está dada.
+    category_updated = False
+    if category:
+        cat_clean = category.strip()
+        # Buscar bullet existente `- **<category>**: <value>`.
+        pattern = re.compile(
+            r"^(-\s*\*\*\s*"
+            + re.escape(cat_clean)
+            + r"\s*\*\*\s*:\s*)(.*)$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        m = pattern.search(new_text)
+        if m:
+            old_value = m.group(2).strip()
+            # Idempotencia: si el observation ya está en el value, skip.
+            if obs_clean.lower() not in old_value.lower():
+                if old_value:
+                    new_value = f"{old_value}, {obs_clean}"
+                else:
+                    new_value = obs_clean
+                new_text = (
+                    new_text[:m.start()]
+                    + m.group(1)
+                    + new_value
+                    + new_text[m.end():]
+                )
+                category_updated = True
+        else:
+            # No existe el bullet — crear uno nuevo. Lo insertamos
+            # después del último bullet de propiedades existente
+            # (`- **<X>**: ...`), antes de la sección "## Observaciones"
+            # o de cualquier otra sección.
+            last_bullet_re = re.compile(
+                r"^-\s*\*\*[^*]+\*\*\s*:.*$",
+                re.MULTILINE,
+            )
+            last_bullet_m = None
+            for last_bullet_m in last_bullet_re.finditer(new_text):
+                pass
+            new_bullet_str = f"- **{cat_clean}**: {obs_clean}"
+            if last_bullet_m:
+                insert_at = last_bullet_m.end()
+                new_text = (
+                    new_text[:insert_at]
+                    + f"\n{new_bullet_str}"
+                    + new_text[insert_at:]
+                )
+            else:
+                # Sin bullets previos — append al inicio del cuerpo.
+                new_text = f"{new_bullet_str}\n{new_text}"
+            category_updated = True
+
+    # Si nada cambió (idempotencia full hit), avisamos sin escribir.
+    if not observation_added and not category_updated:
+        return {
+            "ok": True,
+            "file": str(target_path.relative_to(base.parent.parent.parent)),
+            "observation_added": False,
+            "category_updated": False,
+            "reason": "duplicate_skipped",
+        }
+
+    try:
+        target_path.write_text(new_text, encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "reason": f"write_failed: {str(exc)[:80]}"}
+
+    # Invalidar cache del vault para que el próximo lookup vea la nota
+    # actualizada (especialmente relevante si el caller es el chat que
+    # corre en el mismo proceso).
+    global _VAULT_CONTACTS_CACHE
+    _VAULT_CONTACTS_CACHE = None
+
+    return {
+        "ok": True,
+        "file": str(target_path.relative_to(base.parent.parent.parent)),
+        "stem": target_stem,
+        "observation_added": observation_added,
+        "category_updated": category_updated,
+        "source_kind": source_kind,
+    }
+
+
 def _exact_contact_lookup(person_name: str) -> dict | None:
     """Buscar un contacto en Apple Contacts por nombre EXACTO (case-
     insensitive).

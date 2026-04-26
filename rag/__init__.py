@@ -49604,6 +49604,256 @@ def feedback_classify_sessions(
 # ── /end `rag feedback` subgroup ────────────────────────────────────────
 
 
+@cli.command("tune-lambdarank")
+@click.option("--apply", is_flag=True,
+              help="Persiste el modelo a ranker.lgbm. Sin --apply: dry-run "
+                   "(reporta sin guardar).")
+@click.option("--num-boost-round", "num_boost_round", default=200,
+              show_default=True,
+              help="Máximo árboles. Lightgbm puede early-stop antes.")
+@click.option("--learning-rate", "learning_rate", default=0.05,
+              show_default=True, type=float,
+              help="Shrinkage. Más bajo = más árboles + menos overfit.")
+@click.option("--num-leaves", "num_leaves", default=31,
+              show_default=True,
+              help="Complejidad por árbol. Default 31 captura interacciones.")
+@click.option("--val-fraction", "val_fraction", default=0.2,
+              show_default=True, type=float,
+              help="Fracción de queries para validación. 0 = sin val "
+                   "(solo train, sin early stopping).")
+@click.option("--skip-no-corrective", is_flag=True,
+              help="Solo entrenar sobre queries con corrective_path "
+                   "(signal explícita o inferida). Recomendado cuando hay "
+                   "feedback denso.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output como JSON (para launchd).")
+def tune_lambdarank(
+    apply: bool,
+    num_boost_round: int,
+    learning_rate: float,
+    num_leaves: int,
+    val_fraction: float,
+    skip_no_corrective: bool,
+    as_json: bool,
+) -> None:
+    """Entrenar un LightGBM lambdarank sobre `rag_feedback` (Sprint 2).
+
+    Modelo no-lineal alternativo al ranker linear de `ranker.json`. Captura
+    interacciones entre features que el lineal aplasta. Persiste a
+    `~/.local/share/obsidian-rag/ranker.lgbm` (con sidecar `.meta.json`).
+
+    Por default es DRY-RUN: corre el training pero no escribe el modelo a
+    disk. `--apply` persiste el modelo y registra una entry en `rag_tune`.
+
+    El modelo NO se usa todavía en producción — falta la integración con
+    `apply_weighted_scores`. Para evaluar A/B: `rag eval-lambdarank`.
+
+    Costo: el feature replay (que reusa `collect_ranker_features`) tarda
+    ~1-2s por query del feedback set. Con 100-200 queries históricos,
+    esperá 2-7 minutos.
+    """
+    import json as _json
+    from rag_ranker_lgbm import (
+        DEFAULT_MODEL_PATH,
+        FEATURE_NAMES,
+        feedback_to_training_data,
+        train_lambdarank,
+    )
+    from rag_ranker_lgbm.train import persist_train_run_to_telemetry
+
+    console.print()
+    console.print("[bold]rag tune-lambdarank[/bold]")
+    console.print("  Recolectando training data desde rag_feedback...")
+
+    with _ragvec_state_conn() as conn:
+        data = feedback_to_training_data(
+            conn, skip_queries_without_corrective=skip_no_corrective
+        )
+
+        console.print(f"  Queries: {data['n_queries']}  ·  "
+                      f"Candidates: {data['n_candidates']}")
+        console.print(f"  Skip — sin signal:      {data['n_skipped_no_signal']}")
+        console.print(f"  Skip — replay falló:    {data['n_skipped_no_features']}")
+        console.print()
+
+        if data["n_queries"] == 0:
+            console.print(
+                "[red]✗ No hay training data. Necesitás feedback con "
+                "paths_json. Corré `rag feedback infer-implicit` "
+                "+ `rag feedback detect-requery` + `rag feedback "
+                "classify-sessions` para acumular signal implícita.[/red]"
+            )
+            if as_json:
+                click.echo(_json.dumps({"error": "no_training_data"}))
+            return
+
+        target_path = DEFAULT_MODEL_PATH if apply else (
+            DEFAULT_MODEL_PATH.with_suffix(".dryrun.lgbm")
+        )
+        console.print(f"[bold]Training[/bold] → {target_path}")
+
+        result = train_lambdarank(
+            data["X"], data["y"], data["group"],
+            feature_names=FEATURE_NAMES,
+            output_path=target_path,
+            num_boost_round=num_boost_round,
+            learning_rate=learning_rate,
+            num_leaves=num_leaves,
+            val_fraction=val_fraction,
+        )
+
+        meta = result["metadata"]
+        console.print()
+        console.print(f"  best_iteration:  {meta['best_iteration'] or 'all'}")
+        console.print(f"  train queries:   {meta['n_train_queries']}")
+        console.print(f"  val queries:     {meta['n_val_queries']}")
+        console.print()
+
+        # Top features by gain
+        from rich.table import Table
+        tbl = Table(show_header=True, header_style="bold cyan")
+        tbl.add_column("feature")
+        tbl.add_column("importance (gain)", justify="right")
+        importance = sorted(
+            meta["feature_importance_gain"].items(),
+            key=lambda x: -x[1],
+        )
+        for feat, gain in importance[:10]:
+            tbl.add_row(feat, f"{gain:.2f}")
+        console.print("[bold]Feature importance (top 10 by gain)[/bold]")
+        console.print(tbl)
+        console.print()
+
+        if apply:
+            persist_train_run_to_telemetry(conn, metadata=meta)
+            console.print(
+                f"[bold green]✓ Modelo persistido a {target_path}[/bold green]"
+            )
+            console.print(
+                "  Para evaluar A/B vs ranker linear: "
+                "[cyan]rag eval-lambdarank[/cyan]"
+            )
+            # Invalidate scorer cache si existía.
+            from rag_ranker_lgbm import LambdaRankerScorer
+            LambdaRankerScorer.clear_cache()
+        else:
+            console.print(
+                "[yellow]💡 Re-corré con --apply para persistir el modelo "
+                "a la default location y registrar en rag_tune.[/yellow]"
+            )
+
+    if as_json:
+        click.echo(_json.dumps({
+            "model_path": result["model_path"],
+            "n_train_queries": meta["n_train_queries"],
+            "n_val_queries": meta["n_val_queries"],
+            "best_iteration": meta["best_iteration"],
+            "applied": apply,
+        }))
+
+
+@cli.command("eval-lambdarank")
+@click.option("--file", default="queries.yaml", show_default=True,
+              help="YAML con queries golden (mismo schema que rag eval).")
+@click.option("-k", default=5, show_default=True, help="top-k.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output como JSON.")
+def eval_lambdarank(file: str, k: int, as_json: bool) -> None:
+    """A/B test: linear vs LightGBM lambdarank sobre queries.yaml.
+
+    Reporta hit@k / MRR / recall@k para los dos modelos + delta.
+    No toca producción — el reranking es offline.
+    """
+    import json as _json
+
+    import yaml as _yaml
+
+    from rag_ranker_lgbm import LambdaRankerScorer
+    from rag_ranker_lgbm.eval import eval_lambdarank_vs_linear
+
+    yaml_path = Path(file)
+    if not yaml_path.exists():
+        console.print(f"[red]No existe {file}[/red]")
+        return
+
+    scorer = LambdaRankerScorer.load_default()
+    if scorer is None:
+        console.print(
+            "[red]✗ No hay modelo lambdarank entrenado. "
+            "Corré `rag tune-lambdarank --apply` primero.[/red]"
+        )
+        return
+
+    data = _yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    cases = data.get("queries") or []
+    flat_cases: list[dict] = []
+    for entry in cases:
+        if "question" in entry:
+            flat_cases.append(entry)
+        elif "turns" in entry:  # multi-turn case
+            for turn in entry["turns"]:
+                if "question" in turn and "expected" in turn:
+                    flat_cases.append(turn)
+
+    if not flat_cases:
+        console.print(f"[red]No hay queries en {file}[/red]")
+        return
+
+    console.print()
+    console.print(f"[bold]rag eval-lambdarank[/bold]  ({len(flat_cases)} cases, k={k})")
+    console.print("  Corriendo A/B linear vs lambdarank...")
+    console.print()
+
+    result = eval_lambdarank_vs_linear(
+        flat_cases, k=k, lambdarank_scorer=scorer
+    )
+
+    if as_json:
+        # Skip per_case en JSON para mantenerlo conciso.
+        out = {kk: vv for kk, vv in result.items() if kk != "per_case"}
+        click.echo(_json.dumps(out))
+        return
+
+    from rich.table import Table
+
+    tbl = Table(show_header=True, header_style="bold cyan")
+    tbl.add_column("metric")
+    tbl.add_column("linear", justify="right")
+    tbl.add_column("lambdarank", justify="right")
+    tbl.add_column("delta", justify="right")
+
+    lin = result["linear"]
+    lgb_m = result["lgbm"]
+    delta = result["delta"]
+
+    def _fmt_delta_pp(d):
+        return f"{'+' if d > 0 else ''}{d:.2f} pp"
+
+    def _fmt_delta_pct(d):
+        return f"{'+' if d > 0 else ''}{d:.2f} %"
+
+    tbl.add_row(
+        f"hit@{k}",
+        f"{lin['hit5'] * 100:.2f} %",
+        f"{lgb_m['hit5'] * 100:.2f} %",
+        _fmt_delta_pp(delta["hit5_pp"]),
+    )
+    tbl.add_row(
+        "MRR",
+        f"{lin['mrr']:.3f}",
+        f"{lgb_m['mrr']:.3f}",
+        _fmt_delta_pct(delta["mrr_pct"]),
+    )
+    tbl.add_row(
+        f"recall@{k}",
+        f"{lin['recall5'] * 100:.2f} %",
+        f"{lgb_m['recall5'] * 100:.2f} %",
+        _fmt_delta_pp(delta["recall5_pp"]),
+    )
+    console.print(tbl)
+    console.print()
+
+
 # NLI model state + lazy loader (Fase B.1)
 _NLI_MODEL_NAME = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
 _NLI_IDLE_TTL = float(os.environ.get("RAG_NLI_IDLE_TTL", "900"))

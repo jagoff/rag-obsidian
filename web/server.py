@@ -9337,9 +9337,14 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
 {"" if nofresh else '<meta http-equiv="refresh" content="60">'}
 <title>whisper transcripts — rag</title>
 <style>
-  /* Dark mode by default. Paleta cercana al GitHub dark + Obsidian default
+  /* Dark mode FIJO. Paleta cercana al GitHub dark + Obsidian default
      theme para coherencia con el resto del stack del usuario.
-     Override automático al modo light si el OS lo pide explícitamente. */
+     Decisión 2026-04-25: removido el override `prefers-color-scheme:
+     light` — el resto del stack (chat/dashboard/status/home) tiene tema
+     oscuro como default y el user lo prefiere así, no querer que la
+     página se flipee a light cuando el OS está en modo claro. Si en el
+     futuro queremos agregar toggle manual (como dashboard.html), se
+     hace sobre `data-theme="light"` en el <html>, NO con media query. */
   :root {{
     --bg: #0d1117;
     --bg-elev: #161b22;
@@ -9353,22 +9358,6 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     --green: #3fb950;
     --orange: #d29922;
     --red: #f85149;
-  }}
-  @media (prefers-color-scheme: light) {{
-    :root {{
-      --bg: #ffffff;
-      --bg-elev: #f6f8fa;
-      --bg-elev-2: #eaeef2;
-      --border: #d0d7de;
-      --border-soft: #eaeef2;
-      --text: #1f2328;
-      --text-muted: #59636e;
-      --text-dim: #818b97;
-      --accent: #0969da;
-      --green: #1a7f37;
-      --orange: #9a6700;
-      --red: #cf222e;
-    }}
   }}
   html, body {{ background: var(--bg); }}
   body {{

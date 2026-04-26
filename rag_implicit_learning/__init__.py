@@ -29,5 +29,27 @@ Llamadores:
 from rag_implicit_learning.corrective_paths import (
     infer_corrective_paths_from_behavior,
 )
+from rag_implicit_learning.requery_detection import (
+    detect_requery_loss_signal,
+    is_paraphrase,
+)
+from rag_implicit_learning.reward_shaping import (
+    apply_reward_from_session_outcomes,
+)
+from rag_implicit_learning.session_outcome import (
+    SessionAnalysis,
+    classify_recent_sessions,
+    classify_session,
+    session_outcome_summary,
+)
 
-__all__ = ["infer_corrective_paths_from_behavior"]
+__all__ = [
+    "SessionAnalysis",
+    "apply_reward_from_session_outcomes",
+    "classify_recent_sessions",
+    "classify_session",
+    "detect_requery_loss_signal",
+    "infer_corrective_paths_from_behavior",
+    "is_paraphrase",
+    "session_outcome_summary",
+]

@@ -39877,25 +39877,37 @@ def _online_tune_plist(rag_bin: str) -> str:
 
 
 def _implicit_feedback_plist(rag_bin: str) -> str:
-    """Nightly implicit feedback inference — corre 03:25, 5 min antes del
+    """Nightly implicit feedback pipeline — corre 03:25, 5 min antes del
     online-tune.
 
-    Inferir corrective_path desde behavior post-👎 (ver
-    `rag_implicit_learning.corrective_paths`). Pre-popula
-    `rag_feedback.extra_json` con corrective_paths sin que el user toque
-    nada — destraba el gate del online-tune (≥20 corrective_paths) sin
-    depender de que el user marque manualmente cada nota correcta en el
-    chat. Sprint 1 del cierre del loop de aprendizaje (2026-04-26).
+    Ejecuta 3 pasos en cadena via shell (cada uno persiste señal a
+    `rag_feedback`, idempotentes):
+
+      1. `rag feedback infer-implicit --json` — corrective_path desde behavior
+         post-👎 (ver `rag_implicit_learning.corrective_paths`).
+      2. `rag feedback detect-requery --json` — paráfrasis <30s = loss
+         implícito (ver `rag_implicit_learning.requery_detection`).
+      3. `rag feedback classify-sessions --json` — outcome win/loss/abandon
+         con reward shaping a los turns (ver `rag_implicit_learning.session_outcome`
+         + `reward_shaping`).
 
     Schedule a las 03:25 deliberado: el `online-tune` corre 03:30, y este
-    daemon lo precede para que la signal nueva entre a la primera corrida
-    del tune. 5 minutos es suficiente — el inferrer es ~20ms sobre 70
-    feedbacks, dominado por SQL setup, no por lógica.
+    pipeline lo precede para que la signal nueva entre a la primera corrida
+    del tune. 5 minutos es suficiente — los 3 inferrers son ~50ms cada
+    uno, dominados por SQL setup.
 
-    Salida JSON al log para que `tail -f` muestre métricas estructuradas
-    sin parseo. RunAtLoad=false porque solo tiene sentido nightly tras
-    acumular signal del día.
+    Salida JSON al log (3 líneas por corrida, una por step) para que
+    `tail -f implicit-feedback.log` muestre métricas estructuradas sin
+    parseo. RunAtLoad=false — solo tiene sentido nightly tras acumular
+    signal del día.
+
+    Sprint 1 del cierre del loop de auto-aprendizaje (2026-04-26).
     """
+    cmd = (
+        f'{rag_bin} feedback infer-implicit --json && '
+        f'{rag_bin} feedback detect-requery --json && '
+        f'{rag_bin} feedback classify-sessions --json'
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -39903,10 +39915,9 @@ def _implicit_feedback_plist(rag_bin: str) -> str:
   <key>Label</key><string>com.fer.obsidian-rag-implicit-feedback</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{rag_bin}</string>
-    <string>feedback</string>
-    <string>infer-implicit</string>
-    <string>--json</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>{cmd}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -49443,6 +49454,151 @@ def feedback_infer_implicit(
             "\n[yellow]💡 Re-corré sin --dry-run para persistir los "
             "corrective_paths.[/yellow]"
         )
+
+
+@feedback.command("detect-requery")
+@click.option("--window-seconds", "window_seconds", default=30,
+              show_default=True,
+              help="Gap máximo entre dos queries para considerar re-query.")
+@click.option("--similarity-threshold", "similarity_threshold", default=0.5,
+              show_default=True,
+              help="Threshold de SequenceMatcher para detectar paráfrasis.")
+@click.option("--dry-run", is_flag=True,
+              help="No persistir cambios — solo reportar detecciones.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emitir summary como JSON (para launchd).")
+def feedback_detect_requery(
+    window_seconds: int,
+    similarity_threshold: float,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """Detectar re-queries (paráfrasis <30s) como signal negativa implícita.
+
+    Si el user pregunta, recibe respuesta, y dentro de los siguientes 30s
+    hace OTRA pregunta con tokens muy parecidos a la anterior, eso es
+    señal de que la primera respuesta no le sirvió. Persiste rating=-1
+    a `rag_feedback` con `extra_json.implicit_loss_source='requery_detection'`.
+
+    Idempotente: re-runs no duplican el mismo turn.
+    """
+    import json as _json
+    from rag_implicit_learning import detect_requery_loss_signal
+
+    with _ragvec_state_conn() as conn:
+        result = detect_requery_loss_signal(
+            conn,
+            window_seconds=window_seconds,
+            similarity_threshold=similarity_threshold,
+            dry_run=dry_run,
+        )
+
+    if as_json:
+        summary = {k: v for k, v in result.items() if k != "detections"}
+        summary["n_detections_payload_redacted"] = len(result.get("detections", []))
+        click.echo(_json.dumps(summary))
+        return
+
+    console.print()
+    console.print("[bold]rag feedback detect-requery[/bold]")
+    console.print(f"  Window: {result['window_seconds']}s · "
+                  f"similarity ≥ {result['similarity_threshold']} · "
+                  f"dry-run={'yes' if result['dry_run'] else 'no'}")
+    console.print()
+    console.print(f"  Turns examinados:      {result['n_turns_examined']}")
+    console.print(f"  Pares examinados:      {result['n_pairs_examined']}")
+    console.print(f"  [bold green]Re-queries detectadas: "
+                  f"{result['n_paraphrases_detected']}[/bold green]")
+    console.print(f"  Insertados:            {result['n_inserted']}")
+    console.print(f"  Skip — fuera de ventana:  {result['n_skip_outside_window']}")
+    console.print(f"  Skip — ya marcado:        {result['n_skip_already_marked']}")
+    console.print()
+
+
+@feedback.command("classify-sessions")
+@click.option("--days", default=7, show_default=True,
+              help="Ventana de sessions a clasificar.")
+@click.option("--min-confidence", "min_confidence", default=0.7, type=float,
+              show_default=True,
+              help="Confidence mínima para shapeear reward (no propaga inferencias débiles).")
+@click.option("--dry-run", is_flag=True,
+              help="No persistir cambios.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emitir summary como JSON.")
+def feedback_classify_sessions(
+    days: int, min_confidence: float, dry_run: bool, as_json: bool
+) -> None:
+    """Clasificar sessions recientes y aplicar reward shaping a los turns.
+
+    Para cada session de los últimos N días, infiere outcome (win/loss/
+    abandon/partial) por keywords + re-queries internas + silencio post-cierre.
+    Sessions con confidence ≥ threshold y outcome win/loss propagan signal
+    a TODOS sus turns como rating=+1 / -1 implícito.
+
+    Skipea turns que ya tienen feedback explícito (no overlappear señales).
+    Idempotente.
+    """
+    import json as _json
+    from rag_implicit_learning import (
+        apply_reward_from_session_outcomes,
+        classify_recent_sessions,
+        session_outcome_summary,
+    )
+
+    with _ragvec_state_conn() as conn:
+        # Primero: classification puro (informativo).
+        analyses = classify_recent_sessions(conn, days=days)
+        summary = session_outcome_summary(analyses)
+
+        # Después: aplicar reward shaping (puede persistir).
+        reward_result = apply_reward_from_session_outcomes(
+            conn, days=days, min_confidence=min_confidence, dry_run=dry_run
+        )
+
+    if as_json:
+        out = {
+            "classification": summary,
+            "reward_shaping": {
+                k: v for k, v in reward_result.items() if k != "updates"
+            },
+            "n_updates_payload_redacted": len(reward_result.get("updates", [])),
+        }
+        click.echo(_json.dumps(out))
+        return
+
+    console.print()
+    console.print(f"[bold]rag feedback classify-sessions[/bold]  "
+                  f"(días={days}, min_conf={min_confidence}, "
+                  f"dry-run={'yes' if dry_run else 'no'})")
+    console.print()
+    console.print(f"  Sessions analizadas:    {summary['n_sessions']}")
+    console.print(f"    [green]win:[/green]                  "
+                  f"{summary['by_outcome']['win']}")
+    console.print(f"    [red]loss:[/red]                 "
+                  f"{summary['by_outcome']['loss']}")
+    console.print(f"    [dim]partial (ambiguo):[/dim]  "
+                  f"{summary['by_outcome']['partial']}")
+    console.print(f"    [dim]abandon (1 turn):[/dim]   "
+                  f"{summary['by_outcome']['abandon']}")
+    console.print(f"  Avg confidence:         {summary['avg_confidence']}")
+    console.print()
+    console.print("[bold]Reward shaping[/bold]")
+    console.print(f"  Sessions usadas:        "
+                  f"{reward_result['n_sessions_used_for_reward']}")
+    console.print(f"  Sessions skip ambiguos: "
+                  f"{reward_result['n_skip_ambiguous_outcome']}")
+    console.print(f"  Sessions skip lowconf:  "
+                  f"{reward_result['n_skip_low_confidence']}")
+    console.print(f"  Turns evaluados:        {reward_result['n_turns_total']}")
+    console.print(f"  Turns skip explícito:   "
+                  f"{reward_result['n_turns_skip_explicit']}")
+    console.print(f"  Turns skip ya shaped:   "
+                  f"{reward_result['n_turns_skip_already_shaped']}")
+    console.print(f"  [bold green]Insertados +1 (win):    "
+                  f"{reward_result['n_turns_inserted_pos']}[/bold green]")
+    console.print(f"  [bold red]Insertados -1 (loss):   "
+                  f"{reward_result['n_turns_inserted_neg']}[/bold red]")
+    console.print()
 
 
 # ── /end `rag feedback` subgroup ────────────────────────────────────────

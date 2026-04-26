@@ -5046,6 +5046,12 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             " ON rag_anticipate_candidates(ts)",
             "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_dedup"
             " ON rag_anticipate_candidates(dedup_key)",
+            # Composite (kind, ts) para queries del dashboard:
+            # `WHERE kind=? AND ts > ?` (rag_anticipate/dashboard.py:109).
+            # Pre-2026-04-25 esto hacía full scan. Ahora index seek.
+            # Audit R2-7 #2.
+            "CREATE INDEX IF NOT EXISTS ix_rag_anticipate_candidates_kind_ts"
+            " ON rag_anticipate_candidates(kind, ts)",
         ),
     ),
     (
@@ -5763,6 +5769,12 @@ def _ensure_telemetry_tables(conn) -> None:
     """
     import sqlite3 as _sqlite3
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Audit R2-7 #5: foreign_keys=ON requerido para que los `REFERENCES
+    # ... ON DELETE CASCADE` declarados en el schema (ej.
+    # rag_entity_mentions → rag_entities) se enforcen. SQLite por
+    # default los IGNORA — borrar una entity dejaba rows huérfanas en
+    # mentions hasta el prune. Pragma es per-connection.
+    conn.execute("PRAGMA foreign_keys=ON")
     # Identificar la DB por su file path. `database` columna del
     # `database_list` PRAGMA da el path absoluto del main db (vacío para
     # in-memory, en cuyo caso nunca cacheamos — siempre re-ensure).
@@ -12138,6 +12150,52 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (norm + 1e-8)
 
 
+def _should_skip_rerank(
+    *,
+    rrf_top_id: str | None,
+    sem_top_id: str | None,
+    bm25_top_id: str | None,
+    sem_top_distance: float | None,
+) -> bool:
+    """Decide si saltearse el cross-encoder rerank (audit 2026-04-25 R2-1 #2).
+
+    Si AMBOS retrievers (sem, BM25) coinciden con el RRF en el top-1 y
+    el cosine distance del top sem es muy bajo, tenemos 3 señales
+    convergentes — sem, BM25 y RRF eligieron lo mismo con alta confianza.
+    El reranker no va a mover ese top-1 (caso típico de bench: 90%+
+    overlap en tope cuando hay agreement). Skipeamos para ahorrar
+    500-2000ms por query (cross-encoder en MPS fp32 es ~30-50ms/par,
+    pool=15 = 450-750ms; pool=40 = 1.2-2s).
+
+    Args:
+      rrf_top_id: ID del top-1 después de RRF (post-merge).
+      sem_top_id: ID del top-1 sem search (1ra variante de la query).
+      bm25_top_id: ID del top-1 BM25 (1ra variante).
+      sem_top_distance: cosine distance del top sem en chromadb space
+        (range [0, 2], donde 0 = idéntico). ``None`` si no se capturó.
+
+    Returns:
+      ``True`` si todas las condiciones se cumplen y vale skipear el
+      rerank. ``False`` en cualquier otro caso (incluido si la env var
+      ``RAG_RERANK_FASTPATH_DIST`` está en 0, que deshabilita la feature).
+
+    Threshold default: ``RAG_RERANK_FASTPATH_DIST=0.10``, equivalente a
+    cosine_sim ≥ 0.90. Conservador para no comerse queries borderline.
+    Set a 0 para deshabilitar (escape hatch para A/B testing o
+    regression debugging).
+    """
+    threshold = float(os.environ.get("RAG_RERANK_FASTPATH_DIST", "0.10"))
+    if threshold <= 0:
+        return False
+    if rrf_top_id is None or sem_top_id is None or bm25_top_id is None:
+        return False
+    if sem_top_distance is None:
+        return False
+    if rrf_top_id != sem_top_id or rrf_top_id != bm25_top_id:
+        return False
+    return sem_top_distance <= threshold
+
+
 # ── Topic-shift detection ─────────────────────────────────────────────────
 # Protege a la conversación de contaminación cross-tópico cuando el usuario
 # cambia de tema abruptamente sin cerrar el hilo anterior. Reportado 2026-04-20:
@@ -18159,20 +18217,42 @@ def retrieve(
     _sem_ms = 0.0
     _bm25_ms = 0.0
     _rrf_ms = 0.0
+    # Capturamos el top-1 de la 1ra variante para el fast-path del
+    # reranker más abajo: si AMBOS retrievers (sem, BM25) coinciden en
+    # el top-1 con cosine bajo, el cross-encoder no va a mover ese
+    # resultado y podemos saltearlo (audit 2026-04-25 finding R2-1 #2).
+    _fastpath_first_iter = True
+    _top_sem_id_first: str | None = None
+    _top_sem_dist_first: float | None = None
+    _top_bm25_id_first: str | None = None
     for v, q_embed in zip(variants, variant_embeds):
         sem_kwargs: dict = {
             "query_embeddings": [q_embed],
             "n_results": n_results,
-            "include": ["documents", "metadatas"],
+            "include": ["documents", "metadatas", "distances"],
         }
         if where:
             sem_kwargs["where"] = where
         _t0 = time.perf_counter()
-        sem_ids = col.query(**sem_kwargs)["ids"][0]
+        _sem_result = col.query(**sem_kwargs)
+        sem_ids = _sem_result["ids"][0]
+        _sem_dists_row = (_sem_result.get("distances") or [[]])[0] if isinstance(
+            _sem_result.get("distances"), list,
+        ) else []
+        if _fastpath_first_iter and sem_ids:
+            _top_sem_id_first = sem_ids[0]
+            if _sem_dists_row:
+                try:
+                    _top_sem_dist_first = float(_sem_dists_row[0])
+                except (TypeError, ValueError):
+                    _top_sem_dist_first = None
         _sem_ms += (time.perf_counter() - _t0) * 1000
         _t0 = time.perf_counter()
         bm25_ids = bm25_search(col, v, RETRIEVE_K, folder, tag, date_range)
+        if _fastpath_first_iter and bm25_ids:
+            _top_bm25_id_first = bm25_ids[0]
         _bm25_ms += (time.perf_counter() - _t0) * 1000
+        _fastpath_first_iter = False
         _t0 = time.perf_counter()
         for id_ in rrf_merge(sem_ids, bm25_ids):
             if id_ not in seen_ids:
@@ -18271,15 +18351,34 @@ def retrieve(
             f"{title}\n\n" if title else ""
         )
         return header + parent
-    pairs = [(question, _rerank_doc(e, c[1])) for e, c in zip(expanded, candidates)]
-    _t0 = time.perf_counter()
-    # Default batch_size (32). Probado 2026-04-18 en CLI chat: batch_size=1
-    # forzaba 30 inferencias secuenciales a pool=30 (~3s de rerank). Batch
-    # default procesa todo en una pasada MPS, ~500ms. El fix de
-    # batch_size=1 del commit 79f6b8e aplicaba a pool=2-4 donde el
-    # padding overhead a pow-2 domina; a pool más grande no hace falta.
-    scores = reranker.predict(pairs, show_progress_bar=False)
-    _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
+
+    # Fast-path del reranker (audit 2026-04-25 finding R2-1 #2). Ver
+    # docstring de `_should_skip_rerank` para detalles.
+    fast_path_taken = _should_skip_rerank(
+        rrf_top_id=merged_ordered[0] if merged_ordered else None,
+        sem_top_id=_top_sem_id_first,
+        bm25_top_id=_top_bm25_id_first,
+        sem_top_distance=_top_sem_dist_first,
+    )
+    if fast_path_taken:
+        # Scores sintéticos decrecientes desde 0.95: mantienen el orden
+        # RRF y dan confidence alta al top-1 (downstream gates como
+        # CONFIDENCE_RERANK_MIN=0.015 pasan trivialmente). 0.95 - 0.01*i
+        # mantiene gap entre posiciones consistente con outputs típicos
+        # del cross-encoder (BAAI/bge-reranker en sigmoid space).
+        scores = [max(0.0, 0.95 - 0.01 * i) for i in range(len(candidates))]
+        _timing["rerank_ms"] = 0.0
+        _timing["rerank_fastpath"] = _top_sem_dist_first
+    else:
+        pairs = [(question, _rerank_doc(e, c[1])) for e, c in zip(expanded, candidates)]
+        _t0 = time.perf_counter()
+        # Default batch_size (32). Probado 2026-04-18 en CLI chat: batch_size=1
+        # forzaba 30 inferencias secuenciales a pool=30 (~3s de rerank). Batch
+        # default procesa todo en una pasada MPS, ~500ms. El fix de
+        # batch_size=1 del commit 79f6b8e aplicaba a pool=2-4 donde el
+        # padding overhead a pow-2 domina; a pool más grande no hace falta.
+        scores = reranker.predict(pairs, show_progress_bar=False)
+        _timing["rerank_ms"] = (time.perf_counter() - _t0) * 1000
 
     # Capturar el comienzo del score-loop block (scoring + recency + tag +
     # title_match + PPR + behavior priors). Este rango es el gap más
@@ -44736,9 +44835,28 @@ class GroundingResult:
 
 # Refusal patterns — skip NLI on these, they're not factual claims.
 # Match is case-insensitive over the whole claim text.
+#
+# Cubre las 4 variantes intencionales de refusal usadas en los prompts
+# bajo `rag/prompts/intents/` (ver audit 2026-04-25 R2-6 #1 para la
+# decisión de mantenerlas distintas en lugar de unificar):
+#
+# 1. ``"No tengo esa información en tus notas."`` — strict, web,
+#    chat, system_rules. Default para queries semánticas que no
+#    encontraron fuentes relevantes.
+# 2. ``"No encontré esto en el vault."`` — lookup (count/list/recent/
+#    agenda). Frase distinta para distinguir en telemetría
+#    `count+refused` vs `semantic+refused`.
+# 3. ``"No hay suficientes fuentes en el vault para sintetizar esto."``
+#    — synthesis. Semánticamente distinto: tenemos UNA fuente pero
+#    no llega para sintetizar (≥2 requerido).
+# 4. ``"No hay suficientes fuentes en el vault para comparar esto."``
+#    — comparison. Idem synthesis pero para comparison (≥2 lados).
+#
+# Si un prompt nuevo agrega una 5ta variante, agregá el pattern acá
+# para que el cache poisoning detector y el NLI grounding lo skipeen.
 _REFUSAL_PATTERNS = (
     r"^no encontr[eé]\b",
-    r"^no hay\s+(?:ning[úu]n|informaci[óo]n)\b",
+    r"^no hay\s+(?:ning[úu]n|informaci[óo]n|suficientes)\b",
     r"^no tengo (?:esa\s+)?informaci[óo]n\b",
     r"^i (?:don'?t|did not|didn'?t) find\b",
     r"^i could not find\b",

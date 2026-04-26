@@ -175,3 +175,29 @@ def test_is_refusal_variants():
     assert rag._is_refusal("I could not find")
     assert not rag._is_refusal("El documento dice que no")
     assert not rag._is_refusal("No es importante")
+
+
+def test_is_refusal_recognizes_all_4_canonical_phrases():
+    """Audit 2026-04-25 R2-6 #1: las 4 frases de refusal usadas en los
+    prompts de `rag/prompts/intents/` deben todas ser detectadas como
+    refusal — sino el cache poisoning detector y NLI grounding las
+    tratan como contenido factual y se cachean / score-an mal.
+
+    Pre-fix: las frases de comparison/synthesis ('No hay suficientes
+    fuentes...') NO matcheaban porque el regex era
+    `^no hay\\s+(?:ningún|información)\\b` y faltaba `suficientes`."""
+    canonical_refusals = [
+        # 1. strict, web, chat, system_rules
+        "No tengo esa información en tus notas.",
+        # 2. lookup
+        "No encontré esto en el vault.",
+        # 3. synthesis
+        "No hay suficientes fuentes en el vault para sintetizar esto.",
+        # 4. comparison
+        "No hay suficientes fuentes en el vault para comparar esto.",
+    ]
+    for phrase in canonical_refusals:
+        assert rag._is_refusal(phrase), (
+            f"refusal canónico no detectado: {phrase!r} — chequear "
+            f"_REFUSAL_PATTERNS en rag/__init__.py"
+        )

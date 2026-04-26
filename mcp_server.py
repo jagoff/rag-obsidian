@@ -176,19 +176,37 @@ def rag_read_note(path: str) -> str:
     Args:
         path: Vault-relative path, e.g. "02-Areas/Coaching/Autoridad.md".
               Must end in .md and not escape the vault root.
+
+    Returns the note content as a string. On any error, returns a string
+    that starts with "Error: " followed by a human-readable reason — the
+    MCP client (Claude Code / Devin / Cursor) sees this as the tool
+    output and can detect the prefix to know it failed.
+
+    Defensive catches added 2026-04-25 (audit R2-2 #2):
+    - VAULT_PATH does not exist (iCloud not synced, dev box without vault)
+    - ``.resolve()`` raises ``OSError`` (broken symlinks, permission denied)
+    - ``read_text()`` raises ``OSError`` (file replaced mid-read, FS error)
+
+    Pre-fix any of these caused an uncaught exception that bubbled up to
+    the MCP transport as "Internal error" — the LLM saw no useful hint.
     """
     _touch()
     if not path.endswith(".md"):
         return "Error: path must end in .md"
     rag = _load_rag()
-    full = (rag.VAULT_PATH / path).resolve()
+    if not rag.VAULT_PATH.exists():
+        return f"Error: vault not found at {rag.VAULT_PATH}"
     try:
+        full = (rag.VAULT_PATH / path).resolve()
         full.relative_to(rag.VAULT_PATH.resolve())
-    except ValueError:
-        return "Error: path escapes the vault root"
+    except (ValueError, OSError) as e:
+        return f"Error: path invalid or escapes the vault root ({e})"
     if not full.is_file():
         return f"Error: note not found at {path}"
-    return full.read_text(encoding="utf-8", errors="ignore")
+    try:
+        return full.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        return f"Error: failed to read {path} ({e})"
 
 
 @mcp.tool()

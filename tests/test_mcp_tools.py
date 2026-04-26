@@ -104,6 +104,39 @@ def test_read_note_reports_missing_file(fake_rag):
     assert "not found" in out.lower()
 
 
+def test_read_note_reports_missing_vault(fake_rag, tmp_path):
+    """Audit R2-2 #2: si VAULT_PATH no existe (iCloud no sincronizó,
+    dev box sin vault, etc.), pre-fix esto crasheaba con OSError sin
+    contexto. Ahora retorna error legible que el LLM puede entender."""
+    fake_rag.VAULT_PATH = tmp_path / "no_existe_este_vault"
+    out = mcp_server.rag_read_note("test.md")
+    assert out.startswith("Error: vault not found")
+    assert "no_existe_este_vault" in out
+
+
+def test_read_note_handles_oserror_during_read(fake_rag, tmp_path,
+                                                 monkeypatch):
+    """Si read_text() levanta OSError (file replaced mid-read, FS error),
+    devolvemos error legible en vez de crashear."""
+    note = fake_rag.VAULT_PATH / "broken.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("contenido inicial", encoding="utf-8")
+
+    from pathlib import Path as _Path
+    orig_read_text = _Path.read_text
+
+    def _raising_read_text(self, *args, **kwargs):
+        if self.name == "broken.md":
+            raise OSError("simulated FS failure")
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "read_text", _raising_read_text)
+
+    out = mcp_server.rag_read_note("broken.md")
+    assert out.startswith("Error: failed to read")
+    assert "simulated FS failure" in out
+
+
 # ── rag_query ────────────────────────────────────────────────────────────────
 
 

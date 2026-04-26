@@ -24694,6 +24694,11 @@ def query(
             "top_score": None, "t_retrieve": round(t_retrieve, 2), "answered": False,
             "timing": _round_timing_ms(result.get("timing")),
             "intent": intent,
+            # Deep-retrieve telemetry — `None` salvo si el caller corrió
+            # deep. Ver web/server.py log_query_event "cmd=web" para el
+            # rationale extendido. Audit 2026-04-25.
+            "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+            "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         })
         if plain:
             click.echo("Sin resultados.")
@@ -24770,6 +24775,11 @@ def query(
             "timing": _round_timing_ms(result.get("timing")),
             "answered": False, "gated_low_confidence": True,
             "intent": intent,
+            # Deep-retrieve telemetry — `None` salvo si el caller corrió
+            # deep. Ver web/server.py log_query_event "cmd=web" para el
+            # rationale extendido. Audit 2026-04-25.
+            "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+            "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         })
         if sess is not None:
             append_turn(sess, {
@@ -25068,6 +25078,11 @@ def query(
         # al momento de loggear esta query. Permite SQL analytics downstream:
         # json_extract(extra_json, '$.cache_stats.embed.ratio') por ej.
         "cache_stats": cache_stats_snapshot(),
+        # Deep-retrieve telemetry — `None` salvo si el caller corrió
+        # deep. Ver web/server.py log_query_event "cmd=web" para el
+        # rationale extendido. Audit 2026-04-25.
+        "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+        "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
     })
 
     if sess is not None:
@@ -26347,6 +26362,11 @@ def chat(
             # query paths in `rag_queries.extra_json`. Pre 2026-04-22 this
             # field was silently dropped by `chat()`'s own log_query_event.
             "intent": result.get("intent"),
+            # Deep-retrieve telemetry — `None` salvo si el caller corrió
+            # deep. Ver web/server.py log_query_event "cmd=web" para el
+            # rationale extendido. Audit 2026-04-25.
+            "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+            "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         })
 
         last_turn_id = turn_id
@@ -42186,6 +42206,11 @@ def serve(host: str, port: int):
             "t_retrieve": round(t_retrieve, 2), "t_gen": round(t_gen, 2),
             "timing": _round_timing_ms(result.get("timing")),
             "answered": True,
+            # Deep-retrieve telemetry — `None` salvo si el caller corrió
+            # deep. Ver web/server.py log_query_event "cmd=web" para el
+            # rationale extendido. Audit 2026-04-25.
+            "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+            "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         })
 
         payload = {

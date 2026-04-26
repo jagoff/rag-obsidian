@@ -8999,6 +8999,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "cache_probe": _semantic_cache_probe,
             "cache_hit": False,
             "cache_layer": None,
+            # Audit 2026-04-25: trackeamos cuántas iteraciones del
+            # sufficiency loop corrieron y por qué exit-eamos. `None`
+            # cuando `deep_retrieve()` no se invocó (top_score >=
+            # CONFIDENCE_DEEP_THRESHOLD ya en la primera pasada, o
+            # el caller pidió `no_deep`). `1 + "high_confidence_bypass"`
+            # cuando el early-exit por alta confianza activó (audit
+            # 2026-04-25 — commit e81251f). Permite SQL tipo
+            # "qué fracción de queries usa más de 1 iter?" + medir
+            # hit rate del bypass sin instrumentación adicional.
+            # Ver `rag/__init__.py:19515-19521` (donde el dict se
+            # populates) y los campos `_DEEP_HIGH_CONF_BYPASS` /
+            # `_DEEP_LOW_CONF_BYPASS` para los thresholds.
+            "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
+            "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
         })
 
         yield _sse("done", {

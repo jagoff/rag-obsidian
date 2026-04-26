@@ -199,17 +199,25 @@ def _kpi_eval_hit5(days: int, *, column: str) -> dict:
                 (cutoff_now,),
             ).fetchone()
             row_prev = conn.execute(
-                f"SELECT AVG({column}) AS v "
+                f"SELECT AVG({column}) AS v, COUNT({column}) AS n "
                 "FROM rag_eval_runs WHERE ts >= ? AND ts < ?",
                 (cutoff_prev, cutoff_now),
             ).fetchone()
         v_now = float(row_now[0]) if row_now and row_now[0] is not None else 0.0
         n_now = int(row_now[1]) if row_now and row_now[1] is not None else 0
         v_prev = float(row_prev[0]) if row_prev and row_prev[0] is not None else 0.0
-        delta = v_now - v_prev if n_now else 0.0
+        n_prev = int(row_prev[1]) if row_prev and row_prev[1] is not None else 0
+        # Sin baseline confiable (ventana previa < threshold) NO mostramos
+        # delta — el frontend interpreta None como "primera medición" y
+        # evita el falso "+97% subió" cuando antes simplemente no medíamos.
+        delta = (
+            round(v_now - v_prev, 4)
+            if n_now and n_prev >= _INSUFFICIENT_THRESHOLD
+            else None
+        )
         return {
             "value": round(v_now, 4),
-            "delta_30d": round(delta, 4),
+            "delta_30d": delta,
             "n_samples": n_now,
             "insufficient": _insufficient(n_now),
         }
@@ -268,9 +276,16 @@ def _kpi_behavior_per_query(days: int) -> dict:
             ).fetchone()[0] or 0
         ratio_now = (n_b_now / n_q_now) if n_q_now else 0.0
         ratio_prev = (n_b_prev / n_q_prev) if n_q_prev else 0.0
+        # Delta = None cuando la ventana previa no tiene queries suficientes
+        # — evita "+21 vs 30d" cuando hace 60 días no se medía nada.
+        delta = (
+            round(ratio_now - ratio_prev, 3)
+            if int(n_q_now) and int(n_q_prev) >= _INSUFFICIENT_THRESHOLD
+            else None
+        )
         return {
             "value": round(ratio_now, 3),
-            "delta_30d": round(ratio_now - ratio_prev, 3),
+            "delta_30d": delta,
             "n_samples": int(n_q_now),
             "insufficient": _insufficient(int(n_q_now)),
         }
@@ -315,9 +330,15 @@ def _kpi_cache_hit_rate(days: int) -> dict:
             ).fetchone()[0] or 0
         rate_now = (n_hit_now / n_total_now) if n_total_now else 0.0
         rate_prev = (n_hit_prev / n_total_prev) if n_total_prev else 0.0
+        # Sin baseline confiable → None (frontend muestra "primera medición").
+        delta = (
+            round(rate_now - rate_prev, 4)
+            if int(n_total_now) and int(n_total_prev) >= _INSUFFICIENT_THRESHOLD
+            else None
+        )
         return {
             "value": round(rate_now, 4),
-            "delta_30d": round(rate_now - rate_prev, 4),
+            "delta_30d": delta,
             "n_samples": int(n_total_now),
             "insufficient": _insufficient(int(n_total_now)),
         }
@@ -416,9 +437,14 @@ def _kpi_contradictions_resolved_pct(days: int) -> dict:
         resolved_prev = int(row_prev[1] or 0) if row_prev else 0
         pct_now = (resolved_now / total_now) if total_now else 0.0
         pct_prev = (resolved_prev / total_prev) if total_prev else 0.0
+        delta = (
+            round(pct_now - pct_prev, 4)
+            if total_now and total_prev >= _INSUFFICIENT_THRESHOLD
+            else None
+        )
         return {
             "value": round(pct_now, 4),
-            "delta_30d": round(pct_now - pct_prev, 4),
+            "delta_30d": delta,
             "n_samples": total_now,
             "insufficient": _insufficient(total_now),
         }
@@ -2480,8 +2506,8 @@ def _verdict_ranker() -> dict:
                     total_delta += abs(cur - base)
             if weights:
                 out["metric"] = (
-                    f"{n_changed}/{len(weights)} pesos cambiados · "
-                    f"Δ total = {total_delta:.3f}"
+                    f"{n_changed} de {len(weights)} factores ajustados · "
+                    f"cambio total = {total_delta:.3f}"
                 )
     except Exception:
         pass
@@ -2529,13 +2555,25 @@ def _verdict_eval() -> dict:
         prior_hit5 = float(prior[0]) if prior and prior[0] is not None else None
         if prior_hit5 is not None and prior[1] and int(prior[1]) >= 5:
             delta_pts = (cur_hit5 - prior_hit5) * 100
-            sign = "+" if delta_pts >= 0 else ""
+            out_of_10 = round(cur_hit5 * 10, 1)
+            out_of_10_text = (
+                f"{int(out_of_10)}" if out_of_10 == int(out_of_10) else f"{out_of_10:.1f}"
+            )
+            if abs(delta_pts) < 0.1:
+                trend = "igual que hace 30 días"
+            elif delta_pts >= 0:
+                trend = f"subió {delta_pts:.1f} puntos en 30 días"
+            else:
+                trend = f"bajó {abs(delta_pts):.1f} puntos en 30 días"
             out["metric"] = (
-                f"hit@5 = {cur_hit5*100:.1f}% (n={n_recent}) · "
-                f"{sign}{delta_pts:.1f}pts vs hace 30d"
+                f"Acierto: {out_of_10_text} de cada 10 ({n_recent} pruebas) · {trend}"
             )
         else:
-            out["metric"] = f"hit@5 = {cur_hit5*100:.1f}% (n={n_recent})"
+            out_of_10 = round(cur_hit5 * 10, 1)
+            out_of_10_text = (
+                f"{int(out_of_10)}" if out_of_10 == int(out_of_10) else f"{out_of_10:.1f}"
+            )
+            out["metric"] = f"Acierto: {out_of_10_text} de cada 10 ({n_recent} pruebas)"
     return out
 
 
@@ -2566,9 +2604,9 @@ def _verdict_feedback() -> dict:
         pos = int(stats[0] or 0)
         neg = int(stats[1] or 0)
         if pos + neg > 0:
-            out["metric"] = f"{pos+neg} eventos últimos 7d ({pos}👍 / {neg}👎)"
+            out["metric"] = f"{pos+neg} reacciones esta semana ({pos} 👍 / {neg} 👎)"
             if neg > pos * 1.5 and (pos + neg) >= 5:
-                out["note"] = "más 👎 que 👍 — revisar calidad del retrieval"
+                out["note"] = "Más 👎 que 👍 — convendría revisar la calidad de las respuestas"
     return out
 
 
@@ -2594,7 +2632,7 @@ def _verdict_behavior() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("behavior", hours_since)
     if count and count[0]:
-        out["metric"] = f"{int(count[0]):,} eventos últimos 7d"
+        out["metric"] = f"{int(count[0]):,} interacciones esta semana".replace(",", ".")
     return out
 
 
@@ -2624,7 +2662,7 @@ def _verdict_anticipatory() -> dict:
     if stats and stats[0]:
         total = int(stats[0] or 0)
         sent = int(stats[1] or 0)
-        out["metric"] = f"{sent}/{total} enviados últimas 48h"
+        out["metric"] = f"{sent} de {total} predicciones enviadas en 48h"
         # Loop roto: hay candidates pero sent=0 → bajar a dormant aunque
         # haya update reciente, porque el feedback loop está cortado.
         if total >= 10 and sent == 0:
@@ -2659,9 +2697,9 @@ def _verdict_paraphrases() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("paraphrases", hours_since)
     if count > 0:
-        out["metric"] = f"{count} aprendidas, {hits} usos"
+        out["metric"] = f"{count} variantes aprendidas · {hits} usos"
     else:
-        out["note"] = "ejecutar `rag paraphrases train` desde feedback positivo"
+        out["note"] = "Hace falta entrenar las variantes desde el feedback positivo (`rag paraphrases train`)"
     return out
 
 
@@ -2696,10 +2734,15 @@ def _verdict_routing_rules() -> dict:
     hours_since = _hours_ago(last_ts)
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("routing_rules", hours_since)
+    decisiones_word = "decisión" if n_decisions == 1 else "decisiones"
+    reglas_word = "regla activa" if active == 1 else "reglas activas"
     if active > 0:
-        out["metric"] = f"{active} reglas activas · {n_decisions} decisions"
+        out["metric"] = f"{active} {reglas_word} · {n_decisions} {decisiones_word} registradas"
     elif n_decisions < 10:
-        out["note"] = f"sin data ({n_decisions} decisions, mínimo ~50 para extraer patterns)"
+        out["note"] = (
+            f"Sin datos suficientes ({n_decisions} {decisiones_word}, hace falta ~50 "
+            "para detectar patrones)"
+        )
     return out
 
 
@@ -2728,7 +2771,7 @@ def _verdict_whisper_vocab() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("whisper_vocab", hours_since)
     if count > 0:
-        out["metric"] = f"{count} términos"
+        out["metric"] = f"{count} términos en el vocabulario"
     return out
 
 
@@ -2758,9 +2801,9 @@ def _verdict_whisper_corrections() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("whisper_corrections", hours_since)
     if count > 0:
-        out["metric"] = f"{count} correcciones"
+        out["metric"] = f"{count} correcciones manuales"
     else:
-        out["note"] = "sin uso de voice o transcripciones aceptables"
+        out["note"] = "Sin transcripciones para corregir todavía"
     return out
 
 
@@ -2789,7 +2832,8 @@ def _verdict_score_calibration() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("score_calibration", hours_since)
     if n_curves > 0:
-        out["metric"] = f"{n_curves} curvas · n_pos total = {n_pos}"
+        fuentes_word = "fuente calibrada" if n_curves == 1 else "fuentes calibradas"
+        out["metric"] = f"{n_curves} {fuentes_word} · {n_pos} ejemplos positivos"
     return out
 
 
@@ -2820,7 +2864,8 @@ def _verdict_contradictions() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("contradictions", hours_since)
     if total > 0:
-        out["metric"] = f"{total} totales · {n_recent} últimos 7d"
+        total_fmt = f"{total:,}".replace(",", ".")
+        out["metric"] = f"{total_fmt} detectadas en total · {n_recent} esta semana"
     return out
 
 
@@ -2852,7 +2897,9 @@ def _verdict_entities() -> dict:
     out["last_active_human"] = _format_hours_ago(hours_since)
     out["status"] = _verdict_status("entities", hours_since)
     if n_entities > 0:
-        out["metric"] = f"{n_entities:,} entidades · {n_mentions:,} mentions"
+        ent_fmt = f"{n_entities:,}".replace(",", ".")
+        men_fmt = f"{n_mentions:,}".replace(",", ".")
+        out["metric"] = f"{ent_fmt} personas/lugares · {men_fmt} menciones"
     return out
 
 

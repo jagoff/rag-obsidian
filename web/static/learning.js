@@ -505,7 +505,14 @@ function renderKPIs(kpis) {
     const delta = data.delta_30d;
     if (dEl) {
       if (delta == null || isNaN(delta)) {
-        dEl.textContent = "—";
+        // Backend devuelve null cuando la ventana previa NO tiene baseline
+        // confiable (n_prev < 5). Si igual hay un valor actual visible,
+        // mostramos "primera medición" en lugar de "—" para que el user
+        // entienda que hay número pero todavía no hay con qué comparar.
+        // Bug previo: el delta = value cuando v_prev=0 → "+97.1% subió"
+        // engañoso post-deploy de un KPI nuevo.
+        const hasValue = data.value != null && !isNaN(data.value);
+        dEl.textContent = hasValue ? "primera medición" : "—";
         dEl.className = "kpi-delta neutral";
       } else {
         let arrow = "—";

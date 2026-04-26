@@ -301,22 +301,85 @@ def test_jid_from_contact_fetch_raises(monkeypatch):
 # ── 3. propose_whatsapp_send ────────────────────────────────────────────────
 
 
-def test_propose_whatsapp_send_always_needs_clarification(monkeypatch):
-    """Even on happy path we emit needs_clarification=True so the UI shows
-    the confirmation card. Auto-send is NEVER acceptable."""
+def test_propose_whatsapp_send_auto_sends_when_resolution_clean(monkeypatch):
+    """Cuando el contacto resuelve limpio (jid + sin error + no group + no
+    scheduled), el backend dispara `_whatsapp_send_to_jid` directo y
+    devuelve `whatsapp_message_sent` sin form editable.
+
+    Cambio de política 2026-04-26 (pedido explícito del user): "saca el
+    cuadro de revisión, quiero que el chat envíe directamente". Antes
+    siempre salía `whatsapp_message + needs_clarification=True` aunque
+    hubiera resolución perfecta — ahora sale solo cuando hay error,
+    grupo, o programación."""
     monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
         "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
     })
+    sends: list[tuple] = []
+
+    def _fake_send(jid, text, *, anti_loop=True, reply_to=None):
+        sends.append((jid, text, anti_loop, reply_to))
+        return True
+
+    # Patch en el namespace `rag` (donde se resuelve el nombre dentro de
+    # `propose_whatsapp_send`), no en `rag.integrations.whatsapp` —
+    # aunque vienen de la misma función vía re-export, la llamada
+    # `_whatsapp_send_to_jid(...)` en propose_whatsapp_send resuelve via
+    # globals() del módulo `rag`, no via attribute lookup en el módulo de
+    # integrations.
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid", _fake_send)
     raw = rag.propose_whatsapp_send("Grecia", "hola")
+    payload = json.loads(raw)
+    assert payload["kind"] == "whatsapp_message_sent"
+    assert payload["needs_clarification"] is False
+    assert payload["fields"]["auto_sent"] is True
+    assert payload["fields"]["error"] is None
+    # Bridge fue llamado con anti_loop=False (mensajes a terceros NO usan
+    # el U+200B marker — se vería raro en el WA del destinatario).
+    assert len(sends) == 1
+    assert sends[0][0] == "5491155555555@s.whatsapp.net"
+    assert sends[0][1] == "hola"
+    assert sends[0][2] is False  # anti_loop=False
+
+
+def test_propose_whatsapp_send_falls_back_to_card_when_send_fails(monkeypatch):
+    """Si el bridge devuelve 5xx / unreachable, NO marcamos el mensaje
+    como enviado — sale la card editable original con `error=send_failed`
+    para que el user pueda re-intentar manualmente."""
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
+    })
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
+                        lambda *a, **kw: False)
+    raw = rag.propose_whatsapp_send("Grecia", "hola")
+    payload = json.loads(raw)
+    # Card editable original — user puede corregir y dar [Enviar] manual.
+    assert payload["kind"] == "whatsapp_message"
+    assert payload["needs_clarification"] is True
+    assert payload["fields"]["error"] == "send_failed"
+    # auto_sent NO está set (solo aparece en el path success).
+    assert "auto_sent" not in payload["fields"]
+
+
+def test_propose_whatsapp_send_scheduled_skips_auto_send(monkeypatch):
+    """Mensajes programados (`scheduled_for` set) NUNCA auto-envían — el
+    user querrá revisar el horario antes de cometer la programación."""
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
+    })
+    sends = []
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
+                        lambda *a, **kw: sends.append(a) or True)
+    raw = rag.propose_whatsapp_send(
+        "Grecia", "hola",
+        scheduled_for="2099-12-31T09:00:00-03:00",
+    )
     payload = json.loads(raw)
     assert payload["kind"] == "whatsapp_message"
     assert payload["needs_clarification"] is True
-    assert payload["proposal_id"].startswith("prop-")
-    assert payload["fields"]["contact_name"] == "Grecia"
-    assert payload["fields"]["message_text"] == "hola"
-    assert payload["fields"]["jid"] == "5491155555555@s.whatsapp.net"
-    assert payload["fields"]["full_name"] == "Grecia"
-    assert payload["fields"]["error"] is None
+    # No se llamó al bridge — la programación se dispara después por el
+    # plist `wa-scheduled-send`, no por este path.
+    assert sends == []
+    assert payload["fields"]["scheduled_for"] == "2099-12-31T09:00:00-03:00"
 
 
 def test_propose_whatsapp_send_surfaces_lookup_error(monkeypatch):

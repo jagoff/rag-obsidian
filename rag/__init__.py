@@ -21910,6 +21910,48 @@ def propose_whatsapp_send(
     sched = _validate_scheduled_for(scheduled_for)
     if sched:
         fields["scheduled_for"] = sched
+
+    # Auto-send: si el contacto se resolvió limpio (sin error, JID válido,
+    # no es grupo, no es scheduled) y hay texto → mandar el mensaje
+    # inmediatamente sin esperar confirmación. El user pidió este flow
+    # explícitamente (2026-04-26): "saca el cuadro de revisión, quiero
+    # que el chat envíe directamente el mensaje".
+    #
+    # Guards de seguridad preservados — la card SIGUE saliendo si:
+    #   - error != None        (resolver falló o ambiguous)
+    #   - is_group == True     (mensajes grupales requieren confirmar)
+    #   - scheduled_for set    (mensajes programados merecen revisar horario)
+    #   - sin message_text     (LLM no propuso cuerpo aún)
+    can_auto_send = (
+        lookup.get("error") is None
+        and lookup.get("jid")
+        and not lookup.get("is_group")
+        and not sched
+        and bool((message_text or "").strip())
+    )
+    if can_auto_send:
+        try:
+            ok = _whatsapp_send_to_jid(
+                lookup["jid"], message_text, anti_loop=False,
+            )
+        except Exception as exc:  # pragma: no cover — bridge unreachable
+            ok = False
+            fields["error"] = f"send_failed: {str(exc)[:80]}"
+        if ok:
+            # Marker explícito para que el frontend renderee "✓ enviado"
+            # en lugar de la card editable con [Enviar]/[Editar]/[Cancel].
+            fields["auto_sent"] = True
+            return json.dumps({
+                "kind": "whatsapp_message_sent",
+                "proposal_id": f"prop-{uuid.uuid4()}",
+                "needs_clarification": False,
+                "fields": fields,
+            }, ensure_ascii=False)
+        # Send failed: caer al flow original (card de proposal) con error
+        # seteado para que el user pueda re-intentar manualmente.
+        if not fields.get("error"):
+            fields["error"] = "send_failed"
+
     return json.dumps({
         "kind": "whatsapp_message",
         "proposal_id": f"prop-{uuid.uuid4()}",

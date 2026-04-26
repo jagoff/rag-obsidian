@@ -8211,3 +8211,44 @@ main:focus-visible {
 .upload-card.done + .created-chip {
   margin-top: 4px;
 }
+
+/* ── WhatsApp recipient resolution & auto-sent notice ─────────────────────
+ * Added 2026-04-26 per user request: visual color cues for resolved/failed
+ * contacts + compact "✓ Sent" card variant when the backend auto-sends.
+ *
+ * Verde: contacto resuelto limpio (jid + sin error + no group). Aplicado
+ *        tanto en el `proposal-whatsapp-sent` (auto-sent) como en cards
+ *        editables que igual quedan visibles (scheduled_for / group).
+ * Rojo:  error de resolución (`fields.error`: not_found / no_phone /
+ *        ambiguous / send_failed). El JS deshabilita [Enviar] hasta que
+ *        se clarifique.
+ *
+ * Variables: --green/--red del tema, fallback hex sensato si no están.
+ */
+.proposal-resolved-ok {
+  color: var(--green, #16a34a);
+}
+.proposal-resolved-ok-link {
+  color: var(--green, #16a34a) !important;
+}
+.proposal-resolved-error {
+  color: var(--red, #dc2626);
+}
+.proposal-whatsapp-sent {
+  border-left: 3px solid var(--green, #16a34a);
+  padding-left: 12px;
+}
+.proposal-whatsapp-sent .proposal-icon {
+  color: var(--green, #16a34a);
+}
+.proposal-sent-body {
+  color: var(--text);
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(126, 231, 135, 0.08);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.4;
+}

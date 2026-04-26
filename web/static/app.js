@@ -2027,6 +2027,52 @@ function appendCreatedChip(parent, payload) {
 //   4. If the contact couldn't be resolved (fields.error ==
 //      "not_found" | "no_phone" | "empty_query"), we surface the error
 //      inline and disable [Enviar] until the user clarifies.
+// Render compacto de "✓ Enviado por WhatsApp a Mamá: <texto>" cuando el
+// backend ya disparó el send (kind = "whatsapp_message_sent"). NO hay form
+// editable — el mensaje ya salió, solo confirmamos visualmente. El recipient
+// queda en verde (`.proposal-resolved-ok`) para diferenciarlo de los casos
+// donde la resolución falló (rojo).
+function appendWhatsAppSentNotice(parent, payload) {
+  const fields = payload.fields || {};
+  const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
+  const text = fields.message_text || "";
+  const jid = fields.jid || "";
+
+  const card = el("div", "proposal proposal-whatsapp-sent");
+  card.setAttribute("role", "region");
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", "✓"));
+  const headId = `proposal-sent-head-${Math.random().toString(36).slice(2, 9)}`;
+  const headLabel = el("span", "proposal-kind", "Enviado por WhatsApp");
+  headLabel.id = headId;
+  head.appendChild(headLabel);
+  card.setAttribute("aria-labelledby", headId);
+  card.appendChild(head);
+
+  const recipientLine = el("div", "proposal-title proposal-resolved-ok");
+  recipientLine.appendChild(document.createTextNode("Para: "));
+  if (jid) {
+    const a = el("a", "proposal-wa-link proposal-resolved-ok-link", recipientLabel);
+    a.href = waHref(jid);
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = "Abrir chat con " + recipientLabel + " en WhatsApp";
+    recipientLine.appendChild(a);
+  } else {
+    recipientLine.appendChild(el("span", "", recipientLabel));
+  }
+  card.appendChild(recipientLine);
+
+  // Mensaje enviado (read-only, sin textarea).
+  const bodyLine = el("div", "proposal-sent-body");
+  bodyLine.textContent = text;
+  card.appendChild(bodyLine);
+
+  parent.appendChild(card);
+}
+
+
 function appendWhatsAppProposal(parent, payload) {
   const fields = payload.fields || {};
   const proposalId = payload.proposal_id || "";
@@ -2089,7 +2135,17 @@ function appendWhatsAppProposal(parent, payload) {
   // (digits@s.whatsapp.net). Los grupos abren via deep link de la app
   // si el user ya está en el grupo, pero no hay URL universal estable.
   const recipientHref = isGroup ? "" : waHref(fields.jid || "");
-  const recipientLine = el("div", "proposal-title");
+  // Color del recipient: verde si resolvió OK (jid válido + sin error),
+  // rojo si hay error de resolución, sin color en otros casos (grupo,
+  // no-resuelto-todavía). Reduce la fricción visual de "verifico que
+  // detectó al contacto bien antes de mandar".
+  let resolveClass = "";
+  if (err) {
+    resolveClass = " proposal-resolved-error";
+  } else if (fields.jid && !isGroup) {
+    resolveClass = " proposal-resolved-ok";
+  }
+  const recipientLine = el("div", "proposal-title" + resolveClass);
   // Prefix distinto para grupos: "👥 Grupo:" vs "Para:" — visualmente
   // claro que el envío va a múltiples personas, no 1:1.
   recipientLine.appendChild(document.createTextNode(
@@ -3112,6 +3168,15 @@ function appendProposal(parent, payload) {
   // (/api/whatsapp/send for both — reply ships an extra reply_to field).
   if (kind === "whatsapp_message" || kind === "whatsapp_reply") {
     return appendWhatsAppProposal(parent, payload);
+  }
+  // whatsapp_message_sent — el backend ya envió el mensaje (auto-send vía
+  // `propose_whatsapp_send` cuando el contacto se resolvió limpio). El
+  // frontend solo confirma "✓ enviado" sin form editable. Pedido del user
+  // 2026-04-26: "saca el cuadro de revisión, quiero que el chat envíe
+  // directamente el mensaje". Si auto-send falla en el backend, la card
+  // editable original sigue saliendo (kind = "whatsapp_message").
+  if (kind === "whatsapp_message_sent") {
+    return appendWhatsAppSentNotice(parent, payload);
   }
   // whatsapp_cancel_scheduled / whatsapp_reschedule_scheduled — gestión de
   // mensajes ya programados (cards más simples que el send: NO hay

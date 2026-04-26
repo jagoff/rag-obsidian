@@ -288,10 +288,16 @@ def test_functional_downgrade_fires_when_preroute_matches(chat_env_fastpath):
         f"full model {full_model!r} (downgrade should have fired "
         f"because pre-router matched reminders_due)"
     )
-    # num_ctx también debe ser _WEB_CHAT_NUM_CTX (4096), no _LOOKUP_NUM_CTX.
-    assert final_call["options"]["num_ctx"] == server_mod._WEB_CHAT_NUM_CTX, (
-        f"num_ctx={final_call['options']['num_ctx']} — expected "
-        f"{server_mod._WEB_CHAT_NUM_CTX} post-downgrade"
+    # num_ctx también debe estar capeado por _WEB_CHAT_NUM_CTX (4096), no
+    # _LOOKUP_NUM_CTX. Adaptive num_ctx (2026-04-25, developer-1) calcula
+    # un valor runtime entre [1024, cap] basado en final_messages chars,
+    # así que verificamos el contrato del cap (lo que importa para el
+    # downgrade es que el ceiling sea el del modelo full, no que el valor
+    # exacto sea 4096).
+    _num_ctx = final_call["options"]["num_ctx"]
+    assert 1024 <= _num_ctx <= server_mod._WEB_CHAT_NUM_CTX, (
+        f"num_ctx={_num_ctx} fuera del rango adaptativo "
+        f"[1024, {server_mod._WEB_CHAT_NUM_CTX}] post-downgrade"
     )
 
 
@@ -323,7 +329,14 @@ def test_functional_no_downgrade_when_no_preroute_match(chat_env_fastpath):
         f"sin pre-router match, el fast-path debía sobrevivir — "
         f"got {final_call['model']!r}, expected {server_mod._LOOKUP_MODEL!r}"
     )
-    assert final_call["options"]["num_ctx"] == server_mod._LOOKUP_NUM_CTX
+    # Adaptive num_ctx (2026-04-25): cap es _LOOKUP_NUM_CTX (4096), runtime
+    # effective value depende de final_messages chars. Ver
+    # test_functional_downgrade_fires_when_preroute_matches para detalle.
+    _num_ctx = final_call["options"]["num_ctx"]
+    assert 1024 <= _num_ctx <= server_mod._LOOKUP_NUM_CTX, (
+        f"num_ctx={_num_ctx} fuera del rango adaptativo "
+        f"[1024, {server_mod._LOOKUP_NUM_CTX}]"
+    )
 
 
 def test_functional_rollback_env_keeps_fast_path_with_tools(chat_env_fastpath, monkeypatch):

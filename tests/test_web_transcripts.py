@@ -116,15 +116,21 @@ def test_transcripts_dark_palette_is_default():
     assert "#e6edf3" in snippet, "dark text color esperado en :root default"
 
 
-def test_transcripts_light_override_via_media_query():
-    """Light mode existe como media query override (`prefers-color-scheme: light`)."""
+def test_transcripts_no_light_override_dark_is_forced():
+    """Dark FIJO desde commit cce1716 (2026-04-25 — el override
+    `@media (prefers-color-scheme: light)` se removió a propósito porque
+    el resto del stack del rag tiene tema oscuro como default y la página
+    se flipeaba a light cuando el OS estaba en modo claro). Si alguien
+    re-introduce el override sin actualizar este test, salta acá."""
     resp = _client.get("/transcripts")
     html = resp.text
-    assert "@media (prefers-color-scheme: light)" in html
-    # Después del media query, hay otro :root con bg blanco.
-    media_idx = html.index("prefers-color-scheme: light")
-    snippet = html[media_idx:media_idx + 500]
-    assert "#ffffff" in snippet, "light bg color #ffffff esperado en media query"
+    # NO debe haber media query light flippeando la paleta.
+    assert "@media (prefers-color-scheme: light)" not in html
+    # Y NO debe haber colores hardcoded del light theme (el #ffffff
+    # del bg viejo, el #1f2328 del text viejo). Si alguien copy-pastea
+    # variables claras desde otra página, este test las flagea.
+    assert "#ffffff" not in html
+    assert "#1f2328" not in html
 
 
 def test_transcripts_uses_css_classes_not_inline_colors():

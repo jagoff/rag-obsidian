@@ -151,3 +151,108 @@ def test_log_query_event_works_without_trace_id(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0][0] is None  # trace_id NULL
     assert rows[0][1] == "sin trace"
+
+
+def test_migration_runs_on_pre_trace_id_db(tmp_path, monkeypatch):
+    """Regression 2026-04-26: si el bootstrap encuentra una telemetry.db
+    pre-2026-04-25 con `rag_queries` y `rag_behavior` SIN la columna
+    ``trace_id``, debe migrarla idempotentemente al primer
+    ``_ragvec_state_conn()``.
+
+    Bug origen: el partial-index ``ix_rag_queries_trace_id ON
+    rag_queries(trace_id) WHERE trace_id IS NOT NULL`` vivía dentro de
+    ``_TELEMETRY_DDL`` y se ejecutaba ANTES del ALTER de
+    ``_migrate_trace_id_columns``. Como ``CREATE TABLE IF NOT EXISTS``
+    es no-op en tablas pre-existentes, la columna ``trace_id`` faltaba,
+    el CREATE INDEX rompía el BEGIN/COMMIT entero, y el endpoint
+    /transcripts y el persist de rag_status_samples explotaban con
+    ``OperationalError: no such column: trace_id``.
+
+    Fix: el partial-index vive ahora SOLO en
+    ``_migrate_trace_id_columns``, que corre DESPUÉS del ALTER. Este test
+    simula el escenario migración construyendo un schema "viejo" sin
+    trace_id y verificando que ``_ragvec_state_conn()`` lo levante sin
+    raisear, agregue la columna, y persista filas con trace_id.
+    """
+    # Crear DB con schema "viejo" (pre-trace_id): tablas con SOLO las
+    # columnas que existían antes del commit 2b7c0c1 (audit ronda 2 batch).
+    db_path = tmp_path / "telemetry.db"
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        legacy.executescript("""
+            CREATE TABLE rag_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                cmd TEXT,
+                q TEXT NOT NULL,
+                session TEXT,
+                mode TEXT,
+                top_score REAL,
+                t_retrieve REAL,
+                t_gen REAL,
+                answer_len INTEGER,
+                citation_repaired INTEGER,
+                critique_fired INTEGER,
+                critique_changed INTEGER,
+                variants_json TEXT,
+                paths_json TEXT,
+                scores_json TEXT,
+                filters_json TEXT,
+                bad_citations_json TEXT,
+                extra_json TEXT
+            );
+            CREATE TABLE rag_behavior (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                source TEXT NOT NULL,
+                event TEXT NOT NULL,
+                path TEXT,
+                query TEXT,
+                rank INTEGER,
+                dwell_s REAL,
+                extra_json TEXT
+            );
+        """)
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    # Apuntar el módulo al tmp_path. Telemetry.db file ya está en su lugar
+    # — el _ensure_telemetry_tables debería detectar las tablas viejas y
+    # correr la migración idempotente.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_TELEMETRY_DB_FILENAME", "telemetry.db")
+    # Limpiar el cache global que skipea el DDL on second open.
+    rag._TELEMETRY_DDL_ENSURED_PATHS.clear()
+
+    # Esto no debe raisear — pre-fix tiraba "no such column: trace_id"
+    # al intentar el CREATE INDEX partial sobre la tabla legacy.
+    with rag._ragvec_state_conn() as conn:
+        cols_q = [r[1] for r in conn.execute("PRAGMA table_info(rag_queries)").fetchall()]
+        cols_b = [r[1] for r in conn.execute("PRAGMA table_info(rag_behavior)").fetchall()]
+        assert "trace_id" in cols_q, f"migración no agregó trace_id a rag_queries: {cols_q}"
+        assert "trace_id" in cols_b, f"migración no agregó trace_id a rag_behavior: {cols_b}"
+
+        # El partial-index también debe existir post-migración.
+        idx_names = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name LIKE '%trace_id%'"
+            ).fetchall()
+        ]
+        assert "ix_rag_queries_trace_id" in idx_names
+        assert "ix_rag_behavior_trace_id" in idx_names
+
+    # Y un INSERT con trace_id debe funcionar end-to-end.
+    monkeypatch.setenv("RAG_LOG_QUERY_ASYNC", "0")
+    tid = rag.generate_trace_id()
+    rag.log_query_event({"cmd": "query", "q": "post-migración", "trace_id": tid})
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT trace_id, q FROM rag_queries WHERE trace_id = ?", (tid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0] == (tid, "post-migración")

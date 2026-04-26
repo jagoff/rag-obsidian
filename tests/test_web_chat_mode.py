@@ -178,7 +178,14 @@ def test_mode_fast_forces_small_model(chat_env):
         f"mode='fast' should force {server_mod._LOOKUP_MODEL}, "
         f"got {final_call['model']!r}"
     )
-    assert final_call["options"]["num_ctx"] == server_mod._LOOKUP_NUM_CTX
+    # Adaptive num_ctx (2026-04-25): el ceiling es _LOOKUP_NUM_CTX (4096)
+    # pero el valor efectivo se computa runtime desde final_messages chars.
+    # Verificamos el contrato: 1024 <= num_ctx <= cap.
+    _num_ctx = final_call["options"]["num_ctx"]
+    assert 1024 <= _num_ctx <= server_mod._LOOKUP_NUM_CTX, (
+        f"num_ctx={_num_ctx} fuera del rango adaptativo "
+        f"[1024, {server_mod._LOOKUP_NUM_CTX}]"
+    )
 
     assert log.events, "log_query_event never called"
     ev = log.events[-1]
@@ -222,7 +229,13 @@ def test_mode_deep_forces_full_model(chat_env):
     assert final_call["model"] == full_model, (
         f"mode='deep' should force {full_model!r}, got {final_call['model']!r}"
     )
-    assert final_call["options"]["num_ctx"] == server_mod._WEB_CHAT_NUM_CTX
+    # Adaptive num_ctx (2026-04-25): cap es _WEB_CHAT_NUM_CTX (4096),
+    # valor efectivo se calcula runtime. Ver test_mode_fast para detalle.
+    _num_ctx = final_call["options"]["num_ctx"]
+    assert 1024 <= _num_ctx <= server_mod._WEB_CHAT_NUM_CTX, (
+        f"num_ctx={_num_ctx} fuera del rango adaptativo "
+        f"[1024, {server_mod._WEB_CHAT_NUM_CTX}]"
+    )
 
     ev = log.events[-1]
     assert ev["fast_path"] is False, f"expected fast_path=False, got {ev['fast_path']}"
@@ -263,7 +276,13 @@ def test_mode_auto_delegates_to_retrieve(chat_env):
     final_call = streaming_calls[-1]
     # retrieve() said fast_path=True → small model.
     assert final_call["model"] == server_mod._LOOKUP_MODEL
-    assert final_call["options"]["num_ctx"] == server_mod._LOOKUP_NUM_CTX
+    # Adaptive num_ctx (2026-04-25): cap _LOOKUP_NUM_CTX (4096), runtime
+    # effective value. Ver test_mode_fast para detalle.
+    _num_ctx = final_call["options"]["num_ctx"]
+    assert 1024 <= _num_ctx <= server_mod._LOOKUP_NUM_CTX, (
+        f"num_ctx={_num_ctx} fuera del rango adaptativo "
+        f"[1024, {server_mod._LOOKUP_NUM_CTX}]"
+    )
 
     ev = log.events[-1]
     assert ev["fast_path"] is True

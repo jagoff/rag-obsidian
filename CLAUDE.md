@@ -2,7 +2,7 @@
 
 Local RAG over an Obsidian vault. Single-file: `rag.py` (~50.9k lines as of 2026-04-25 — drift +56% vs prior 32.7k snapshot, package-split is now an open discussion not a settled "no") + `mcp_server.py` (thin wrapper, 604 lines) + `web/` (FastAPI `web/server.py` 11.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (2,247 tests, 269 files).
 
-Entry points (both installed via `uv tool install --editable .`):
+Entry points (both installed via `uv tool install --editable '.[entities]'` — incluye el extra `entities` para que gliner se instale en el uv tool venv y la feature de entity-aware retrieval quede activa de fábrica; sin el extra los 5 ingesters loggean `dep \`gliner\` not available` cada corrida y la feature corre desactivada silenciosamente):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
 - `obsidian-rag-mcp` — MCP server (`rag_query`, `rag_read_note`, `rag_list_notes`, `rag_links`, `rag_stats`)
 

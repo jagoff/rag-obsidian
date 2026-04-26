@@ -318,6 +318,24 @@
       min-width: 0;
     }
     .service-item:hover { background: var(--hover); }
+    /* Pseudo-service "feed global" — visualmente distinto. Borde left
+       más grueso, fondo más prominente, ícono ⚡ en vez de dot. */
+    .service-item.global-item {
+      background: color-mix(in srgb, var(--cyan) 8%, transparent);
+      border-left-width: 4px;
+      margin-bottom: 6px;
+    }
+    .service-item.global-item .service-name {
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .service-item.global-item .service-dot {
+      width: 9px;
+      height: 9px;
+    }
+    .service-item.global-item.status-error .service-dot {
+      animation: pulse 1.6s ease-in-out infinite;
+    }
     .service-item.is-selected {
       background: color-mix(in srgb, var(--cyan) 14%, transparent);
       border-color: var(--cyan);
@@ -689,6 +707,33 @@
        lo dimmeamos para que se note. */
     .log-line .ts.inferred { opacity: 0.4; font-style: italic; }
     .log-line .ts.empty { color: var(--text-faint); opacity: 0.6; }
+    /* `synthetic` indica que el ts viene del mtime del archivo (modo
+       global), no de la línea misma. Color distinto para que el user
+       sepa que es aproximado. */
+    .log-line .ts.synthetic { opacity: 0.6; color: var(--purple); }
+
+    /* Chip clickeable con el nombre del service (sólo en feed global).
+       Mostrado antes del texto de la línea. Click → abre el log. */
+    .log-line.is-global .svc-chip {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      font-family: inherit;
+      padding: 1px 6px;
+      margin-right: 8px;
+      border-radius: 3px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      color: var(--cyan-dim);
+      cursor: pointer;
+      vertical-align: middle;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    .log-line.is-global .svc-chip:hover {
+      background: color-mix(in srgb, var(--cyan) 18%, transparent);
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
     .log-line .lvl {
       font-size: 9.5px;
       font-weight: 700;
@@ -910,6 +955,6 @@
     </main>
   </div>
 
-  <script src="/static/logs.js?v=2026-04-26-logs-charts" defer></script>
+  <script src="/static/logs.js?v=2026-04-26-logs-global" defer></script>
 </body>
 </html>

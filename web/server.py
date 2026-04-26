@@ -12689,6 +12689,192 @@ def logs_file(
     }
 
 
+# ── /api/logs/errors — feed global de errores ─────────────────────────
+# Agrega TODAS las líneas con level=error de TODOS los services en una
+# sola lista ordenada por timestamp desc. Útil para responder "¿qué
+# falló en el sistema en la última hora?" sin tener que clickear service
+# por service.
+#
+# Cap implícito: por archivo leemos hasta `_LOG_GLOBAL_TAIL_PER_FILE`
+# líneas (default 300). En archivos chiquitos no importa; en `web.log`
+# que tiene 1.6M, esto es ~10% del tail ⇒ dominado por la cantidad de
+# .log + .error.log que iteramos (~80) × 300 = 24k líneas escaneadas
+# total, ~30ms en SSD.
+#
+# Para los logs sin timestamps nativos, NO podemos ordenar globalmente
+# (no sabemos cuándo ocurrió cada línea). En esos casos usamos el mtime
+# del archivo como fallback — todas las líneas sin ts del file heredan
+# `mtime - i*1s` donde i es la posición desde el final. Inferred timestamp
+# se devuelve con el flag `ts_synthetic=true` así el frontend lo muestra
+# en cursiva opacity baja.
+
+_LOG_GLOBAL_TAIL_PER_FILE = 300
+_LOG_GLOBAL_DEFAULT_WINDOW_S = 3600  # 1h
+_LOG_GLOBAL_MAX_WINDOW_S = 7 * 86400  # 7 días
+_LOG_GLOBAL_MAX_LINES = 1000
+
+_LOG_GLOBAL_CACHE: dict = {}
+_LOG_GLOBAL_CACHE_TTL = 8.0
+_LOG_GLOBAL_CACHE_LOCK = threading.Lock()
+
+
+def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
+    """Iterar todos los .log + .error.log, extraer las líneas matching
+    el level_filter ('error', 'warn_error', 'all'), mergear por ts desc.
+
+    Para líneas sin ts: fallback a (mtime - offset_from_tail) — no es
+    exacto, pero ordena bien dentro del mismo archivo y mantiene los
+    archivos modificados recientemente arriba del feed. Marcamos esas
+    líneas con `ts_synthetic=true` para que el frontend las distinga.
+    """
+    cutoff_ts = time.time() - window_s
+    out_lines: list[dict] = []
+    files_scanned = 0
+    files_skipped_old = 0
+
+    for log_dir in _LOG_DIRS:
+        if not log_dir.is_dir():
+            continue
+        dir_slug = log_dir.name
+        for path in sorted(log_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if not (name.endswith(".log") or name.endswith(".stdout.log") or
+                    name.endswith(".stderr.log")):
+                continue
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            if stat.st_size == 0:
+                continue
+            if stat.st_mtime < cutoff_ts:
+                # Archivo no modificado dentro de la ventana → skip.
+                files_skipped_old += 1
+                continue
+            files_scanned += 1
+            # Derivar service + kind del nombre (mismo mapping que el index).
+            base = name
+            kind = "stdout"
+            if base.endswith(".error.log"):
+                base = base[: -len(".error.log")]; kind = "stderr"
+            elif base.endswith(".stderr.log"):
+                base = base[: -len(".stderr.log")]; kind = "stderr"
+            elif base.endswith(".stdout.log"):
+                base = base[: -len(".stdout.log")]; kind = "stdout"
+            elif base.endswith(".log"):
+                base = base[: -len(".log")]; kind = "stdout"
+
+            raw = _read_tail_lines(path, _LOG_GLOBAL_TAIL_PER_FILE)
+            mtime_dt = datetime.fromtimestamp(stat.st_mtime)
+            n_total = len(raw)
+            last_ts: str | None = None
+            for idx, ln in enumerate(raw):
+                level = _classify_log_line(ln)
+                # Filter por level.
+                if level_filter == "error" and level != "error":
+                    continue
+                if level_filter == "warn_error" and level not in ("warn", "error"):
+                    continue
+                ts = _extract_log_ts(ln)
+                ts_inferred = False
+                ts_synthetic = False
+                if ts:
+                    last_ts = ts
+                elif last_ts is not None:
+                    ts = last_ts
+                    ts_inferred = True
+                else:
+                    # Fallback: mtime - (offset from tail) seg. Para que las
+                    # líneas más cerca del final del archivo queden con ts
+                    # más reciente.
+                    secs_back = (n_total - 1 - idx)
+                    synthetic_dt = mtime_dt - timedelta(seconds=secs_back)
+                    ts = synthetic_dt.isoformat(timespec="seconds")
+                    ts_synthetic = True
+                # Filter por window — si el ts (real o sintético) cae
+                # antes de cutoff, skip.
+                try:
+                    ts_dt = datetime.fromisoformat(ts)
+                    if ts_dt.timestamp() < cutoff_ts:
+                        continue
+                except Exception:
+                    pass
+                out_lines.append({
+                    "ts": ts,
+                    "ts_inferred": ts_inferred,
+                    "ts_synthetic": ts_synthetic,
+                    "level": level,
+                    "service": base,
+                    "dir": dir_slug,
+                    "kind": kind,
+                    "ref": f"{dir_slug}/{name}",
+                    "text": ln,
+                })
+
+    # Sort por ts desc (más reciente primero). Cap a _LOG_GLOBAL_MAX_LINES.
+    out_lines.sort(key=lambda x: x["ts"], reverse=True)
+    truncated = len(out_lines) > _LOG_GLOBAL_MAX_LINES
+    if truncated:
+        out_lines = out_lines[:_LOG_GLOBAL_MAX_LINES]
+
+    # Counts por nivel + por service.
+    counts_by_level = {"error": 0, "warn": 0, "ok": 0, "info": 0}
+    counts_by_service: dict[str, int] = {}
+    for ln in out_lines:
+        counts_by_level[ln["level"]] = counts_by_level.get(ln["level"], 0) + 1
+        counts_by_service[ln["service"]] = counts_by_service.get(ln["service"], 0) + 1
+    top_services = sorted(counts_by_service.items(), key=lambda x: -x[1])[:10]
+
+    return {
+        "window_seconds": window_s,
+        "level_filter": level_filter,
+        "lines": out_lines,
+        "lines_total": len(out_lines),
+        "truncated": truncated,
+        "files_scanned": files_scanned,
+        "files_skipped_old": files_skipped_old,
+        "counts_by_level": counts_by_level,
+        "top_services": [{"service": s, "count": c} for s, c in top_services],
+        "scanned_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+@app.get("/api/logs/errors")
+def logs_global_errors(
+    since_seconds: int = _LOG_GLOBAL_DEFAULT_WINDOW_S,
+    level: str = "error",
+    nocache: int = 0,
+) -> dict:
+    """Feed global de errores agregado de TODOS los logs.
+
+    Args:
+        since_seconds: ventana de tiempo (default 1h, max 7d).
+        level: "error" | "warn_error" (incluye warn) | "all".
+        nocache: 1 fuerza refresh del cache.
+
+    Response shape: ver `_build_global_errors_payload`.
+    """
+    if level not in ("error", "warn_error", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"level inválido: {level!r} (esperaba error|warn_error|all)",
+        )
+    window_s = max(60, min(int(since_seconds), _LOG_GLOBAL_MAX_WINDOW_S))
+    cache_key = (window_s, level)
+    now_mono = time.monotonic()
+    with _LOG_GLOBAL_CACHE_LOCK:
+        entry = _LOG_GLOBAL_CACHE.get(cache_key)
+        fresh = entry is not None and (now_mono - entry["ts"]) < _LOG_GLOBAL_CACHE_TTL
+    if nocache or not fresh:
+        payload = _build_global_errors_payload(window_s, level)
+        with _LOG_GLOBAL_CACHE_LOCK:
+            _LOG_GLOBAL_CACHE[cache_key] = {"payload": payload, "ts": now_mono}
+        return payload
+    return entry["payload"]
+
+
 @app.get("/logs")
 def logs_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "logs.html")

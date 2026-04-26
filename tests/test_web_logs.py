@@ -401,6 +401,110 @@ def test_logs_page_served():
     assert "register-sw.js" in body
 
 
+# ── Global feed (/api/logs/errors) ────────────────────────────────────
+
+def test_api_logs_errors_aggregates_across_files(monkeypatch, tmp_path: Path):
+    """El feed global mergea líneas de varios archivos ordenadas por ts desc."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    (fake_dir / "alpha.log").write_text(
+        "2026-04-26T10:00:00 something fine\n"
+        "2026-04-26T11:00:00 OperationalError: alpha bad\n"
+    )
+    (fake_dir / "beta.log").write_text(
+        "2026-04-26T10:30:00 RuntimeError: beta bad\n"
+    )
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+    monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
+
+    resp = _client.get("/api/logs/errors?since_seconds=86400&level=error&nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert d["lines_total"] == 2
+    # Más reciente primero.
+    assert d["lines"][0]["text"].startswith("2026-04-26T11:00:00 OperationalError")
+    assert d["lines"][0]["service"] == "alpha"
+    assert d["lines"][1]["text"].startswith("2026-04-26T10:30:00 RuntimeError")
+    assert d["lines"][1]["service"] == "beta"
+    # Counts agregados.
+    assert d["counts_by_level"]["error"] == 2
+    # Top services.
+    services = {s["service"]: s["count"] for s in d["top_services"]}
+    assert services == {"alpha": 1, "beta": 1}
+
+
+def test_api_logs_errors_synthetic_ts_for_lines_without_ts(monkeypatch, tmp_path: Path):
+    """Cuando una línea no tiene ts, el feed global usa mtime - offset
+    como timestamp aproximado y la marca con `ts_synthetic=true`."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    log = fake_dir / "no-ts.log"
+    log.write_text(
+        "OperationalError: bad thing happened\n"
+        "Another error line\n"
+    )
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+    monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
+
+    resp = _client.get("/api/logs/errors?since_seconds=86400&level=error&nocache=1")
+    assert resp.status_code == 200
+    lines = resp.json()["lines"]
+    assert len(lines) == 2
+    for ln in lines:
+        assert ln["ts_synthetic"] is True
+        assert ln["ts"] is not None
+        assert ln["service"] == "no-ts"
+
+
+def test_api_logs_errors_filters_old_files(monkeypatch, tmp_path: Path):
+    """Archivos con mtime fuera de la ventana se saltean (no se leen)."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    old_log = fake_dir / "old.log"
+    old_log.write_text("2026-01-01T00:00:00 OperationalError: ancient\n")
+    # Hacer que sea muy viejo (timestamp del 2020).
+    os.utime(old_log, (1577836800.0, 1577836800.0))
+    new_log = fake_dir / "new.log"
+    new_log.write_text("OperationalError: recent\n")
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+    monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
+
+    resp = _client.get("/api/logs/errors?since_seconds=3600&level=error&nocache=1")
+    assert resp.status_code == 200
+    d = resp.json()
+    # `old.log` se descartó por mtime fuera de ventana.
+    assert d["files_skipped_old"] >= 1
+    services = {l["service"] for l in d["lines"]}
+    assert "old" not in services
+
+
+def test_api_logs_errors_warn_error_level(monkeypatch, tmp_path: Path):
+    """level=warn_error incluye warns + errors. level=error sólo errors."""
+    fake_dir = tmp_path / "obsidian-rag"
+    fake_dir.mkdir()
+    (fake_dir / "demo.log").write_text(
+        "2026-04-26T10:00:00 normal info line\n"
+        "2026-04-26T10:01:00 warnings.warn('foo')\n"
+        "2026-04-26T10:02:00 OperationalError: bad\n"
+    )
+    monkeypatch.setattr(_server, "_LOG_DIRS", (fake_dir,))
+    monkeypatch.setattr(_server, "_LOG_GLOBAL_CACHE", {})
+
+    resp_err = _client.get("/api/logs/errors?since_seconds=86400&level=error&nocache=1")
+    assert resp_err.status_code == 200
+    assert resp_err.json()["lines_total"] == 1
+
+    resp_we = _client.get("/api/logs/errors?since_seconds=86400&level=warn_error&nocache=1")
+    assert resp_we.status_code == 200
+    assert resp_we.json()["lines_total"] == 2
+
+
+def test_api_logs_errors_validates_level_param():
+    """level inválido → HTTP 400."""
+    resp = _client.get("/api/logs/errors?level=invalid")
+    assert resp.status_code == 400
+
+
 def test_static_assets_exist():
     """logs.html + logs.js existen en /static/."""
     assert (_STATIC_DIR / "logs.html").is_file()

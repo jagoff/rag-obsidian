@@ -16,18 +16,30 @@
   "use strict";
 
   // ── State ────────────────────────────────────────────────────────────
+  // El "feed global" es una vista virtual: cuando selectedKey === GLOBAL_KEY,
+  // el viewer pide /api/logs/errors en vez de /api/logs/file y muestra
+  // líneas de varios services mergeadas. selectedKind toma valores
+  // 1h/24h/7d en ese modo (ventana temporal).
+  const GLOBAL_KEY = "__global__::errors";
   const state = {
     services: [],
-    selectedKey: null, // "<dir>::<service>"
-    selectedKind: "stdout", // "stdout" | "stderr"
+    selectedKey: null, // "<dir>::<service>" | GLOBAL_KEY
+    selectedKind: "stdout", // "stdout" | "stderr" | "1h"|"24h"|"7d" si GLOBAL_KEY
     viewerData: null,
     viewerQuery: "",
     viewerOnlyErrors: false,
     sidebarFilter: "all", // "all" | "error" | "warn"
     sidebarQuery: "",
+    globalSummary: null,  // { total, lines_total, top_services, counts_by_level }
     live: true,
     sidebarTimer: null,
     viewerTimer: null,
+  };
+
+  const GLOBAL_WINDOWS = {
+    "1h":  { secs: 3600,    label: "1h" },
+    "24h": { secs: 86400,   label: "24h" },
+    "7d":  { secs: 604800,  label: "7d" },
   };
 
   const SIDEBAR_REFRESH_MS = 8000;
@@ -150,6 +162,33 @@
     const host = $("service-list");
     host.replaceChildren();
 
+    // Pseudo-service "feed global" al tope. Siempre visible (no cae bajo
+    // los filtros de status/search del sidebar) porque es la entrada
+    // principal cuando el user quiere "ver qué falló en todo el sistema"
+    // sin saber qué service mirar primero.
+    const totalErrors = state.services.reduce((a, s) => a + (s.error_count_recent || 0), 0);
+    const globalItem = el("button", {
+      type: "button",
+      class: "service-item global-item status-" + (totalErrors > 0 ? "error" : "ok") +
+             (state.selectedKey === GLOBAL_KEY ? " is-selected" : ""),
+      onclick: () => selectGlobalFeed(),
+      title: "Feed global de errores de todos los services",
+    },
+      el("span", { class: "service-dot" }),
+      el("span", { class: "service-text" },
+        el("span", { class: "service-name" }, "feed global"),
+        el("span", { class: "service-meta" },
+          totalErrors > 0
+            ? `${totalErrors} errores · todos los services`
+            : "todo OK"
+        )
+      ),
+      totalErrors > 0
+        ? el("span", { class: "service-badge" }, String(totalErrors))
+        : null
+    );
+    host.appendChild(globalItem);
+
     // Agrupar por dir primero (todos los obsidian-rag juntos, después
     // todos los whatsapp-listener), y dentro de cada grupo mantener el
     // orden global del backend (status primero, recencia después). Si
@@ -233,8 +272,20 @@
     fetchAndRenderViewer(true);
   }
 
+  function selectGlobalFeed() {
+    state.selectedKey = GLOBAL_KEY;
+    if (!GLOBAL_WINDOWS[state.selectedKind]) state.selectedKind = "1h";
+    state.viewerQuery = "";
+    state.viewerOnlyErrors = false;
+    $("viewer-search").value = "";
+    $("viewer-only-errors").setAttribute("aria-pressed", "false");
+    renderSidebar();
+    renderViewerHeaderGlobal();
+    fetchAndRenderViewer(false);
+  }
+
   function findSelectedService() {
-    if (!state.selectedKey) return null;
+    if (!state.selectedKey || state.selectedKey === GLOBAL_KEY) return null;
     return state.services.find((s) => `${s.dir}::${s.service}` === state.selectedKey) || null;
   }
 
@@ -285,7 +336,36 @@
     $("viewer-controls").hidden = false;
   }
 
+  function renderViewerHeaderGlobal() {
+    $("viewer-name").textContent = "feed global";
+    $("viewer-sub").textContent = "errores agregados de todos los services";
+
+    // Tabs: 1h / 24h / 7d (ventanas temporales) en lugar de stdout/stderr.
+    const tabs = $("viewer-tabs");
+    tabs.replaceChildren();
+    for (const [k, w] of Object.entries(GLOBAL_WINDOWS)) {
+      const isActive = state.selectedKind === k;
+      const tab = el("button", {
+        type: "button",
+        class: "viewer-tab" + (isActive ? " is-active" : ""),
+        role: "tab",
+        "aria-selected": isActive ? "true" : "false",
+        onclick: () => {
+          state.selectedKind = k;
+          renderViewerHeaderGlobal();
+          fetchAndRenderViewer(false);
+        },
+      }, w.label);
+      tabs.appendChild(tab);
+    }
+    $("viewer-controls").hidden = false;
+  }
+
   async function fetchAndRenderViewer(scrollToBottom) {
+    if (state.selectedKey === GLOBAL_KEY) {
+      await fetchAndRenderGlobalFeed();
+      return;
+    }
     const svc = findSelectedService();
     if (!svc) return;
     const file = svc.files.find((f) => f.kind === state.selectedKind);
@@ -329,6 +409,60 @@
     }
   }
 
+  async function fetchAndRenderGlobalFeed() {
+    const win = GLOBAL_WINDOWS[state.selectedKind] || GLOBAL_WINDOWS["1h"];
+    try {
+      const params = new URLSearchParams({
+        since_seconds: String(win.secs),
+        level: state.viewerOnlyErrors ? "error" : "warn_error",
+      });
+      const resp = await fetch(`/api/logs/errors?${params.toString()}`, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      state.viewerData = data;
+      // Filter cliente-side por substring (el endpoint no lo hace para
+      // mantenerse cacheable a nivel ventana × level).
+      let lines = data.lines || [];
+      if (state.viewerQuery) {
+        const q = state.viewerQuery.toLowerCase();
+        lines = lines.filter((l) => l.text.toLowerCase().includes(q) ||
+                                     l.service.toLowerCase().includes(q));
+      }
+      // Adaptar el shape al renderViewerBody (que espera `n` reverse-index).
+      const adapted = {
+        lines: lines.map((l, i) => ({
+          n: lines.length - i,
+          text: l.text,
+          level: l.level,
+          ts: l.ts,
+          ts_inferred: l.ts_inferred,
+          ts_synthetic: l.ts_synthetic,
+          // Extra para el renderer: marcar el service de origen.
+          service: l.service,
+          ref: l.ref,
+          kind: l.kind,
+        })),
+        lines_total: data.lines_total,
+        lines_returned: lines.length,
+        counts: data.counts_by_level,
+        filtered_by_query: !!state.viewerQuery,
+        filtered_by_level: state.viewerOnlyErrors,
+        global: true,
+        top_services: data.top_services || [],
+      };
+      renderViewerBody(adapted, false);
+      renderViewerCounts(adapted);
+      renderCharts(adapted);
+    } catch (e) {
+      $("viewer-body").replaceChildren(
+        el("div", { class: "empty-state" },
+          "error cargando el feed global",
+          el("div", { class: "small" }, e.message)
+        )
+      );
+    }
+  }
+
   function renderViewerBody(data, scrollToBottom) {
     const body = $("viewer-body");
     body.replaceChildren();
@@ -354,9 +488,10 @@
     }
     const sameDay = days.size <= 1;
 
+    const isGlobal = !!data.global;
     const parts = [];
     for (const ln of data.lines) {
-      const cls = "log-line lvl-" + ln.level;
+      const cls = "log-line lvl-" + ln.level + (isGlobal ? " is-global" : "");
       const lvlLabel = ln.level === "info" ? "·" : ln.level;
       const txt = highlightQuery(ln.text, state.viewerQuery);
       let tsLabel, tsClass = "ts", tsTitle = "";
@@ -364,23 +499,52 @@
         const day = ln.ts.slice(0, 10);    // 2026-04-26
         const time = ln.ts.slice(11, 19);  // 19:47:50
         tsLabel = sameDay ? time : (day.slice(5) + " " + time.slice(0, 5));
-        if (ln.ts_inferred) tsClass += " inferred";
-        tsTitle = ln.ts;
+        if (ln.ts_synthetic) {
+          tsClass += " synthetic";
+          tsTitle = `${ln.ts} (timestamp aproximado, derivado del mtime del archivo)`;
+        } else if (ln.ts_inferred) {
+          tsClass += " inferred";
+          tsTitle = `${ln.ts} (heredado de la línea anterior)`;
+        } else {
+          tsTitle = ln.ts;
+        }
       } else {
         tsLabel = "—";
         tsClass += " empty";
         tsTitle = "(sin timestamp en la línea)";
+      }
+      // En modo global, además de las cols normales, agregamos una "service
+      // chip" antes del texto. Es un span clickeable que cambia el viewer
+      // al log de ese service.
+      let svcChip = "";
+      if (isGlobal && ln.service) {
+        svcChip = `<button class="svc-chip" type="button" ` +
+                  `data-svc-ref="${escapeHtml(ln.ref || "")}" ` +
+                  `data-svc-name="${escapeHtml(ln.service)}" ` +
+                  `title="abrir el log de ${escapeHtml(ln.service)}">${escapeHtml(ln.service)}</button>`;
       }
       parts.push(
         `<div class="${cls}">` +
           `<span class="lnum">${ln.n}</span>` +
           `<span class="${tsClass}" title="${escapeHtml(tsTitle)}">${tsLabel}</span>` +
           `<span class="lvl">${lvlLabel}</span>` +
-          `<span class="text">${txt}</span>` +
+          `<span class="text">${svcChip}${txt}</span>` +
         `</div>`
       );
     }
     body.innerHTML = parts.join("");
+
+    // Wire-up para los chips clickeables del modo global.
+    if (isGlobal) {
+      body.querySelectorAll(".svc-chip").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          const svcName = btn.dataset.svcName;
+          const svc = state.services.find((s) => s.service === svcName);
+          if (svc) selectService(svc);
+        });
+      });
+    }
 
     if (scrollToBottom) {
       // Scrollear al final para sentir tipo `tail -f`. Un raf para que

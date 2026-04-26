@@ -240,6 +240,49 @@ def _normalize_hint(s: str) -> str:
     return "".join(c for c in fold if unicodedata.category(c) != "Mn")
 
 
+def _strip_emoji_and_symbols(s: str) -> str:
+    """Remove emojis, pictographic symbols, and variation selectors from
+    a person name.
+
+    Users often add hearts/decorations to Related Names ("Maria ❤️",
+    "Juli 🥰") but the actual Contacts entry is just the plain name —
+    so a literal Apple Contacts lookup with the emoji included fails
+    and we either get nothing or fuzzy-match a wrong person.
+
+    Caveats:
+    - Variation Selectors (U+FE00–U+FE0F) son `Mn` (mark non-spacing) en
+      unicodedata — los strippeamos explícitamente. Sin esto, "Maria ❤️"
+      → "Maria " con un VS-16 invisible al final que igual rompía el
+      lookup downstream.
+    - Apple Skin Tone Modifiers (U+1F3FB–U+1F3FF) son `Sk` — strippeados
+      por el filter de cat[0] != "L|M|N|Zs".
+
+    We keep letters (L*), accent marks on letters (Mn pero NO los
+    Variation Selectors), digits (N*), spaces (Zs), y unas puntuaciones
+    comunes en nombres: hyphen, apostrophe, dot, parens.
+    """
+    import unicodedata
+    out_chars = []
+    for ch in s:
+        # Strip Variation Selectors explícitamente — son `Mn` pero no
+        # son acentos sobre letras, son modifiers de emoji.
+        if 0xFE00 <= ord(ch) <= 0xFE0F:
+            continue
+        # Strip Zero-Width Joiner / Non-Joiner (used in emoji sequences).
+        if ch in ("\u200d", "\u200c"):
+            continue
+        cat = unicodedata.category(ch)
+        # Keep letters (L*), accent marks (M*), numbers (N*), space (Zs),
+        # plus common name punctuation.
+        if cat[0] in ("L", "M", "N") or cat == "Zs" or ch in "-'.()":
+            out_chars.append(ch)
+    cleaned = "".join(out_chars).strip()
+    # Collapse repeated whitespace (e.g. "Maria  " → "Maria").
+    while "  " in cleaned:
+        cleaned = cleaned.replace("  ", " ")
+    return cleaned
+
+
 def _parse_apple_label(raw: str) -> str:
     """Convert Apple's `_$!<Mother>!$_` or raw "Madre" to canonical English."""
     if not raw:
@@ -303,20 +346,121 @@ end tell'''
             continue
         raw_label, person_name = parts[0].strip(), parts[1].strip()
         label = _parse_apple_label(raw_label)
-        if label and person_name:
-            rows.append({"label": label, "personName": person_name})
+        # Strip emojis y otros símbolos del personName para que el lookup
+        # secundario en Apple Contacts no falle. El user típicamente pone
+        # "Maria ❤️" como Related Name, pero el contacto real se llama
+        # "Maria Apellido" sin emoji — Apple Contacts no encuentra el
+        # match con el emoji presente y termina haciendo fuzzy a otro
+        # contacto distinto ("Mariano" matchea "Mari").
+        cleaned_name = _strip_emoji_and_symbols(person_name)
+        if label and cleaned_name:
+            rows.append({"label": label, "personName": cleaned_name})
 
     _MY_CARD_RELATIONS_CACHE = {"at": now, "rows": rows}
     return rows
 
 
+# Strip de prefijos posesivos comunes que el LLM deja en `contact_name`
+# cuando el user dice "mandale a mi mama" / "decile a mi hermana ..." —
+# el LLM a veces preserva "mi" en el arg en vez de pasar solo "mama".
+# Sin este strip, "mi Mama" no matchea ningún alias y cae a not_found,
+# aunque resolverlo sea trivial.
+#
+# Cubre: "mi", "a mi", "la", "el" al inicio (sin acento o con). NO toca
+# nombres reales que casualmente arrancan con "mi" (ej. "Miguel") porque
+# requiere el espacio después. "Miguel" → no strip; "mi Hermana" → strip.
+_POSSESSIVE_PREFIX_RE = re.compile(
+    r"^\s*(?:a\s+)?(?:mi|m[ií]a|mio|m[ií]o|tu|su|el|la)\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_possessive_prefix(s: str) -> str:
+    """Remove 'mi '/'a mi '/'tu '/'la ' etc. del inicio para que el alias
+    de parentesco quede limpio. Iterativo por si hay cadena ('a mi tu'
+    es absurdo pero el LLM puede emitir cualquier cosa)."""
+    out = (s or "").strip()
+    for _ in range(3):  # max 3 iteraciones — suficiente para cualquier caso real
+        new = _POSSESSIVE_PREFIX_RE.sub("", out, count=1)
+        if new == out:
+            break
+        out = new
+    return out
+
+
+def _exact_contact_lookup(person_name: str) -> dict | None:
+    """Buscar un contacto en Apple Contacts por nombre EXACTO (case-
+    insensitive).
+
+    Devuelve `{full_name, phones, emails, birthday}` igual que
+    `_fetch_contact`, o `None` si no hay match exacto.
+
+    Se usa como primer intento cuando el lookup viene del Related Names
+    resolver — en ese caso el `person_name` es lo que el user puso en
+    Contacts, así que un fuzzy/contains lookup puede agarrar el
+    contacto equivocado (ej. "Maria" matchea "Mariano" antes que
+    "Maria Pérez"). Exact match elimina la ambigüedad.
+    """
+    if not person_name or not person_name.strip():
+        return None
+    safe = person_name.replace('"', '\\"')
+    script = f'''tell application "Contacts"
+  set _out to ""
+  try
+    set _people to (every person whose name is "{safe}")
+    if (count of _people) > 0 then
+      set _p to first item of _people
+      set _name to name of _p
+      set _phones to ""
+      try
+        repeat with _ph in (phones of _p)
+          set _phones to _phones & (value of _ph as string) & ","
+        end repeat
+      end try
+      set _out to _name & "|||" & _phones
+    end if
+  end try
+  return _out
+end tell'''
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        line = proc.stdout.strip()
+        if not line or "|||" not in line:
+            return None
+        parts = line.split("|||", 1)
+        full_name = parts[0].strip()
+        phones_csv = parts[1].strip() if len(parts) > 1 else ""
+        phones = [p.strip() for p in phones_csv.split(",") if p.strip()]
+        return {
+            "full_name": full_name,
+            "phones": phones,
+            "emails": [],
+            "birthday": "",
+        }
+    except Exception:
+        return None
+
+
 def _resolve_via_my_card_relationship(hint: str) -> str | None:
     """Try resolving "mama"/"papa"/etc. → real personName via My Card.
+
+    Acepta también prefijos posesivos rioplatenses ("mi mama", "a mi
+    hermana") strippeándolos antes de buscar el alias canónico. Sin este
+    paso, el LLM frecuentemente dispara `propose_whatsapp_send` con
+    `contact_name="mi Mama"` (en vez de "Mama") y el resolver fallaba
+    silenciosamente con `not_found`.
 
     Returns None if the hint isn't a relationship word, no My Card is set,
     or no related-name match exists for the canonical label.
     """
-    fold = _normalize_hint(hint)
+    cleaned = _strip_possessive_prefix(hint)
+    fold = _normalize_hint(cleaned)
     canonical = _RELATIONSHIP_HINT_MAP.get(fold)
     if not canonical:
         return None
@@ -493,12 +637,20 @@ def _whatsapp_jid_from_contact(contact_name: str) -> dict:
     if not contact:
         resolved_name = _resolve_via_my_card_relationship(query)
         if resolved_name:
-            try:
-                contact = _rag._fetch_contact(
-                    resolved_name, email=None, canonical=resolved_name,
-                )
-            except Exception:
-                contact = None
+            # Intentar EXACT match primero (cuando viene de Related Names,
+            # el user tipeó el nombre completo del contacto). Sin esto,
+            # `_fetch_contact("Maria")` cae a "name contains" y puede
+            # matchear "Mariano Di Maggio" antes que el "Maria <Apellido>"
+            # real — bug observado 2026-04-26 con `_fetch_contact("mi Esposa")`.
+            contact = _exact_contact_lookup(resolved_name)
+            # Si exact falla, fallback a fuzzy estándar.
+            if not contact:
+                try:
+                    contact = _rag._fetch_contact(
+                        resolved_name, email=None, canonical=resolved_name,
+                    )
+                except Exception:
+                    contact = None
 
     if contact:
         phones = list(contact.get("phones") or [])

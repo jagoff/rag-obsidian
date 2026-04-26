@@ -168,7 +168,8 @@ def test_jid_from_contact_not_found(monkeypatch):
 
 def test_jid_from_contact_resolves_via_my_card_relationship(monkeypatch):
     """Cuando el query es un alias de parentesco ("Mama") y no existe
-    como contacto literal, intenta resolver vía Related Names del My Card."""
+    como contacto literal, intenta resolver vía Related Names del My
+    Card → exact lookup en Contacts.app por el nombre real."""
     from rag.integrations import whatsapp as wa_mod
 
     # Stub: My Card tiene "Mother → Mamá" y "Father → Carlos".
@@ -177,12 +178,21 @@ def test_jid_from_contact_resolves_via_my_card_relationship(monkeypatch):
         {"label": "father", "personName": "Carlos"},
     ])
 
-    # `_fetch_contact` falla para "Mama" (kinship guard) pero resuelve "Mamá".
-    calls: list[str] = []
+    # `_fetch_contact` falla para "Mama" (kinship guard).
+    fetch_calls: list[str] = []
 
     def _fake_fetch(stem, email=None, canonical=None):
-        calls.append(stem)
-        if stem == "Mamá":
+        fetch_calls.append(stem)
+        return None  # Siempre None — nuestro path de éxito es vía exact_lookup
+
+    # `_exact_contact_lookup` ahora es el path primario cuando viene del
+    # relationship resolver — evita el fuzzy match que matcheaba
+    # "Mariano Di Maggio" cuando relations dice "Maria ❤️".
+    exact_calls: list[str] = []
+
+    def _fake_exact(name):
+        exact_calls.append(name)
+        if name == "Mamá":
             return {
                 "full_name": "Mamá",
                 "phones": ["+54 9 342 547 6623"],
@@ -191,12 +201,85 @@ def test_jid_from_contact_resolves_via_my_card_relationship(monkeypatch):
         return None
 
     monkeypatch.setattr(rag, "_fetch_contact", _fake_fetch)
+    monkeypatch.setattr(wa_mod, "_exact_contact_lookup", _fake_exact)
     out = rag._whatsapp_jid_from_contact("Mama")
     assert out["error"] is None
     assert out["full_name"] == "Mamá"
     assert out["jid"] == "5493425476623@s.whatsapp.net"
-    # Llamó dos veces: primero "Mama" (falló), después "Mamá" (resolved).
-    assert "Mama" in calls and "Mamá" in calls
+    # Primero llamó _fetch_contact("Mama") → falla (kinship guard).
+    # Después _exact_contact_lookup("Mamá") → encontró → no necesitó
+    # llamar a _fetch_contact("Mamá") (path primario tomó la decisión).
+    assert "Mama" in fetch_calls
+    assert "Mamá" in exact_calls
+    # _fetch_contact NO se llamó con "Mamá" (exact resolvió primero).
+    assert "Mamá" not in fetch_calls
+
+
+def test_jid_from_contact_relationship_falls_back_to_fuzzy(monkeypatch):
+    """Si exact lookup no encuentra el contacto (ej. el nombre en
+    Related Names difiere ligeramente del Contacts entry), caemos a
+    `_fetch_contact` (fuzzy) como red de seguridad."""
+    from rag.integrations import whatsapp as wa_mod
+
+    monkeypatch.setattr(wa_mod, "_load_my_card_relations", lambda: [
+        {"label": "mother", "personName": "Carmen"},
+    ])
+    # Exact match falla — Related Name es "Carmen" pero el contacto real
+    # se llama "Carmen Pérez" (el user no completó el apellido en Related).
+    monkeypatch.setattr(wa_mod, "_exact_contact_lookup", lambda n: None)
+
+    fetch_calls: list[str] = []
+
+    def _fake_fetch(stem, email=None, canonical=None):
+        fetch_calls.append(stem)
+        if stem == "Carmen":
+            return {
+                "full_name": "Carmen Pérez",
+                "phones": ["+5491155555555"],
+                "emails": [], "birthday": "",
+            }
+        return None
+
+    monkeypatch.setattr(rag, "_fetch_contact", _fake_fetch)
+    out = rag._whatsapp_jid_from_contact("Mama")
+    assert out["error"] is None
+    assert out["full_name"] == "Carmen Pérez"
+    # Llamó _fetch_contact 2 veces: "Mama" (kinship), "Carmen" (fallback).
+    assert fetch_calls == ["Mama", "Carmen"]
+
+
+def test_jid_from_contact_strips_possessive_prefix(monkeypatch):
+    """LLM frecuentemente pasa `contact_name="mi Mama"` (con preposición).
+    El resolver debe strippear "mi"/"a mi"/"la"/"el" antes del alias."""
+    from rag.integrations import whatsapp as wa_mod
+
+    monkeypatch.setattr(wa_mod, "_load_my_card_relations", lambda: [
+        {"label": "mother", "personName": "Mamá"},
+    ])
+    monkeypatch.setattr(wa_mod, "_exact_contact_lookup", lambda n: {
+        "full_name": "Mamá",
+        "phones": ["+54 9 342 547 6623"],
+        "emails": [], "birthday": "",
+    } if n == "Mamá" else None)
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: None)
+
+    # Variantes que el LLM puede emitir.
+    for hint in ["mi Mama", "mi mama", "a mi Mama", "la Mama", "tu Mama"]:
+        out = rag._whatsapp_jid_from_contact(hint)
+        assert out["error"] is None, f"hint {hint!r} should resolve"
+        assert out["full_name"] == "Mamá", f"hint {hint!r} → {out!r}"
+
+
+def test_strip_emoji_and_symbols():
+    """Strip de emojis + variation selectors + ZWJ joiners."""
+    from rag.integrations.whatsapp import _strip_emoji_and_symbols
+    assert _strip_emoji_and_symbols("Maria \u2764\ufe0f") == "Maria"
+    assert _strip_emoji_and_symbols("Juli \U0001f970") == "Juli"
+    assert _strip_emoji_and_symbols("Pedro \U0001f468\u200d\U0001f373") == "Pedro"
+    assert _strip_emoji_and_symbols("María José") == "María José"  # acentos OK
+    assert _strip_emoji_and_symbols("John (Tio)") == "John (Tio)"  # parens OK
+    assert _strip_emoji_and_symbols("Pepe-Luis") == "Pepe-Luis"  # hyphen OK
+    assert _strip_emoji_and_symbols("O'Connor") == "O'Connor"  # apostrophe OK
 
 
 def test_jid_from_contact_relationship_no_my_card(monkeypatch):

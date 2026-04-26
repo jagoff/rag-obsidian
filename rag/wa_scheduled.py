@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
@@ -254,6 +255,116 @@ def _log_ambient(cmd: str, payload: dict | None = None) -> None:
         _ambient_log_event(event)
     except Exception as exc:
         logger.debug("wa_scheduled_log_ambient_failed cmd=%s err=%r", cmd, exc)
+
+
+def _format_delta_human(delta_minutes: int) -> str:
+    """Convierte minutos a string humano corto: '5min', '1h 30min', '2h',
+    '1d 4h'. Usado en notificaciones al ambient JID para que el user
+    vea de un vistazo cuánto tarde llegó un mensaje.
+    """
+    m = abs(int(delta_minutes))
+    if m < 60:
+        return f"{m}min"
+    if m < 24 * 60:
+        h = m // 60
+        rest = m % 60
+        return f"{h}h" if rest == 0 else f"{h}h {rest}min"
+    d = m // (24 * 60)
+    rest_h = (m % (24 * 60)) // 60
+    return f"{d}d" if rest_h == 0 else f"{d}d {rest_h}h"
+
+
+def _notify_ambient_scheduled_outcome(
+    sched: dict,
+    status: str,
+    *,
+    delta_minutes: int = 0,
+    attempt_count: int = 0,
+    last_error: str | None = None,
+) -> None:
+    """Manda una notificación al ambient JID confirmando el outcome
+    de un mensaje programado. Cierre de feedback loop: el user se
+    entera de qué pasó sin abrir el dashboard.
+
+    Status soportados:
+      - ``"sent"`` → "✓ Mandé tu mensaje a Grecia (programado para hoy 09:00)"
+      - ``"sent_late"`` → "⚠ Mandé tu mensaje a Grecia (programado para
+        hoy 09:00, llegó 145min tarde)"
+      - ``"failed"`` → "✗ No pude mandar tu mensaje a Grecia tras 5
+        intentos: send_failed"
+
+    Silent-fail completo: si el ambient no está configurado, si el
+    bridge está caído, si el target_jid es el mismo ambient JID
+    (auto-loop) — return sin error. La notificación es nice-to-have,
+    no debe interferir con el funcionamiento del worker.
+
+    Anti-loop natural: `_ambient_whatsapp_send` usa `anti_loop=True`
+    que prefixa zero-width-space al mensaje, así el listener del bot
+    NO procesa nuestra propia notificación como query del user.
+    """
+    try:
+        from rag import _ambient_config  # noqa: PLC0415
+        cfg = _ambient_config()
+    except Exception:
+        return
+    if not cfg or not cfg.get("enabled"):
+        return
+    ambient_jid = (cfg.get("jid") or "").strip()
+    if not ambient_jid:
+        return
+
+    # Self-loop guard: si el target del scheduled ES el ambient, no
+    # mandes notificación — el user ya recibió el mensaje original
+    # (que también es el mensaje confirmación), repetir sería ruido.
+    target_jid = (sched.get("jid") or "").strip()
+    if target_jid == ambient_jid:
+        return
+
+    # Format del recipient: contact_name si está, sino últimos 10
+    # dígitos del jid para reconocimiento ("...12345678").
+    recipient = (sched.get("contact_name") or "").strip()
+    if not recipient:
+        local = target_jid.split("@")[0]
+        digits = re.sub(r"\D+", "", local)
+        recipient = f"+...{digits[-8:]}" if len(digits) >= 8 else target_jid
+
+    # Format de la hora original programada (en TZ local AR para
+    # legibilidad). Si no parsea, fallback al string crudo.
+    sched_iso = (sched.get("scheduled_for_utc") or "").strip()
+    sched_str = sched_iso
+    try:
+        dt_utc = _to_utc_dt(sched_iso) if sched_iso else None
+        if dt_utc is not None:
+            # Convertir a -03:00 para mostrar en hora local AR.
+            local_dt = dt_utc.astimezone(timezone(timedelta(hours=-3)))
+            today_local = datetime.now(timezone(timedelta(hours=-3))).date()
+            if local_dt.date() == today_local:
+                sched_str = f"hoy {local_dt:%H:%M}"
+            elif local_dt.date() == today_local + timedelta(days=-1):
+                sched_str = f"ayer {local_dt:%H:%M}"
+            else:
+                sched_str = local_dt.strftime("%a %d %b %H:%M").lower()
+    except Exception:
+        pass
+
+    if status == "sent":
+        msg = f"✓ Mandé tu mensaje a {recipient} (programado para {sched_str})"
+    elif status == "sent_late":
+        delta = _format_delta_human(delta_minutes)
+        msg = (f"⚠ Mandé tu mensaje a {recipient} (programado para {sched_str}, "
+               f"llegó {delta} tarde)")
+    elif status == "failed":
+        err = (last_error or "send_failed").strip()[:60]
+        msg = (f"✗ No pude mandar tu mensaje a {recipient} (programado para "
+               f"{sched_str}) tras {attempt_count} intentos: {err}")
+    else:
+        return  # status desconocido, no notificamos
+
+    try:
+        from rag.integrations.whatsapp import _ambient_whatsapp_send  # noqa: PLC0415
+        _ambient_whatsapp_send(ambient_jid, msg)
+    except Exception as exc:
+        logger.debug("wa_scheduled_notif_failed: %r", exc)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -453,6 +564,63 @@ def list_scheduled(
         if isinstance(msg, str) and len(msg) > _LIST_TEXT_MAX_CHARS:
             d["message_text"] = msg[:_LIST_TEXT_MAX_CHARS]
         out.append(d)
+    return out
+
+
+def list_today_pending(
+    now: Any = None,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[dict]:
+    """Mensajes WhatsApp con `status='pending'` cuya `scheduled_for_utc`
+    cae HOY en TZ Argentina (-03:00). Útil para que el daily brief
+    (`rag morning` / `rag today`) le mencione al user qué mensajes
+    están por salir antes de que arranque el día.
+
+    Args:
+        now: Override de "ahora" para testing. Default: ``datetime.now(UTC)``.
+        conn: SQLite connection opcional (reusa la del caller).
+
+    Returns:
+        Lista de dicts con shape simplificada para que el LLM la consuma:
+        ``[{id, contact_name, scheduled_for_local, message_text_preview}]``,
+        ordenada por hora ascendente. ``scheduled_for_local`` es solo
+        ``"HH:MM"`` (asumimos contexto = hoy). Lista vacía si no hay
+        nada o si el módulo no está disponible.
+    """
+    AR = timezone(timedelta(hours=-3))
+    now_dt = _to_utc_dt(now) if now is not None else _now_utc()
+    today_start_local = now_dt.astimezone(AR).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_end_local = today_start_local + timedelta(days=1)
+    out: list[dict] = []
+    try:
+        rows = list_scheduled(status="pending", limit=200, conn=conn)
+    except Exception:
+        return []
+    for r in rows:
+        sched_iso = r.get("scheduled_for_utc") or ""
+        try:
+            dt_utc = _to_utc_dt(sched_iso)
+            dt_local = dt_utc.astimezone(AR)
+        except Exception:
+            continue
+        if not (today_start_local <= dt_local < today_end_local):
+            continue
+        # Truncar preview a 80 chars (igual a `whatsapp_list_scheduled`).
+        msg = (r.get("message_text") or "").strip()
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        out.append({
+            "id": r["id"],
+            "contact_name": (r.get("contact_name") or "").strip(),
+            "jid": r["jid"],
+            "scheduled_for_local": dt_local.strftime("%H:%M"),
+            "scheduled_for_local_iso": dt_local.isoformat(timespec="minutes"),
+            "message_text_preview": msg,
+        })
+    out.sort(key=lambda x: x["scheduled_for_local"])
     return out
 
 
@@ -701,6 +869,11 @@ def run_due_worker(
                                 "delta_minutes": delta_min,
                                 "attempt_count": new_attempts,
                             })
+                            _notify_ambient_scheduled_outcome(
+                                sched, "sent",
+                                delta_minutes=delta_min,
+                                attempt_count=new_attempts,
+                            )
                         else:
                             summary["sent_late"] += 1
                             _log_ambient("whatsapp_scheduled_sent_late", {
@@ -710,6 +883,11 @@ def run_due_worker(
                                 "delta_minutes": delta_min,
                                 "attempt_count": new_attempts,
                             })
+                            _notify_ambient_scheduled_outcome(
+                                sched, "sent_late",
+                                delta_minutes=delta_min,
+                                attempt_count=new_attempts,
+                            )
                     else:
                         if new_attempts >= int(max_retries):
                             # Tras N fallos: processing → failed (terminal,
@@ -734,6 +912,11 @@ def run_due_worker(
                                 "attempt_count": new_attempts,
                                 "last_error": "send_failed",
                             })
+                            _notify_ambient_scheduled_outcome(
+                                sched, "failed",
+                                attempt_count=new_attempts,
+                                last_error="send_failed",
+                            )
                         else:
                             # Failure recoverable: processing → pending para
                             # que el próximo tick lo agarre de nuevo. Sin

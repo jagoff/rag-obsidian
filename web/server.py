@@ -2474,6 +2474,36 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
     if not img_path.exists():
         img_path.write_bytes(raw)
 
+    # Copia al vault 00-Inbox para consistencia con CLI `rag capture
+    # --image`. El CLI siempre copia al vault porque "una foto que el
+    # user subió" es info que vive en el vault de Obsidian, no en un
+    # cache de runtime. Antes el endpoint web NO lo hacía → las fotos
+    # subidas via /chat eran invisibles desde Obsidian. Ahora ambos
+    # paths terminan en el mismo lugar (decidido 2026-04-25, C.2).
+    #
+    # Naming: `<timestamp>-<hash8>.<ext>` para que sea ordenable
+    # cronológicamente en el inbox. Idempotente — si ya existe (hash
+    # igual = mismo contenido), no lo re-escribimos.
+    try:
+        import rag as _rag  # noqa: PLC0415
+        from datetime import datetime as _dt  # noqa: PLC0415
+        vault_inbox = _rag.VAULT_PATH / "00-Inbox"
+        if vault_inbox.is_dir() or _rag.VAULT_PATH.is_dir():
+            vault_inbox.mkdir(parents=True, exist_ok=True)
+            ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+            vault_img_name = f"{ts}-{img_hash[:8]}{suffix}"
+            vault_img_path = vault_inbox / vault_img_name
+            if not vault_img_path.exists():
+                # Buscar si ya hay un archivo con el mismo hash8 (subida
+                # repetida del mismo binary) — si está, dedup natural.
+                existing = list(vault_inbox.glob(f"*-{img_hash[:8]}{suffix}"))
+                if not existing:
+                    vault_img_path.write_bytes(raw)
+    except Exception:
+        # Silent-fail: copia al vault es nice-to-have, no debe romper
+        # el flujo principal de OCR + detección.
+        pass
+
     # OCR + VLM fallback. Reset del budget VLM por sesión para que el
     # cap "max captions per run" no nos bloquee si el daemon llevaba
     # rato corriendo y ya consumió su budget.

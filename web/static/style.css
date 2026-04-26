@@ -8165,3 +8165,29 @@ main:focus-visible {
   padding: 2px 0;
   color: var(--text);
 }
+
+
+/* upload-card.done: estado post-procesamiento. El card persiste arriba
+   del resultado (chip / proposal) para mantener contexto visual de qué
+   imagen generó qué acción. Decidido en el sprint UX 2026-04-25 (C.1):
+   antes el uploadCard se eliminaba y el user perdía la referencia. */
+.upload-card.done {
+  opacity: 0.85;
+  border-color: var(--green);
+}
+
+.upload-card.done .upload-card-status::after {
+  content: ""; /* sin cursor blink — ya terminó */
+  animation: none;
+}
+
+.upload-card.done .upload-card-status {
+  color: var(--green);
+  font-weight: 500;
+}
+
+/* Margen entre el thumb persistente y el card resultado debajo. */
+.upload-card.done + .proposal,
+.upload-card.done + .created-chip {
+  margin-top: 4px;
+}

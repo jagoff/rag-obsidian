@@ -5552,6 +5552,21 @@ function handleUploadResponse(uploadCard, data) {
   const parent = uploadCard.parentNode;
   if (!parent) return;
 
+  // Antes el uploadCard se eliminaba al transformarse en chip/proposal.
+  // Ahora persiste como mini-thumb arriba del card resultado para
+  // mantener contexto visual ("qué imagen generó este evento?").
+  // `_finalizeUploadCardAsThumb()` lo muta a status="done", reduce
+  // visualmente al thumb + meta corta, y libera el blob URL solo si
+  // ya no necesitamos el thumb (post-render).
+  const finalizeAsThumb = (statusLabel) => {
+    uploadCard.classList.remove("loading");
+    uploadCard.classList.add("done");
+    const status = uploadCard.querySelector(".upload-card-status");
+    if (status) status.textContent = statusLabel;
+    // NO revocamos el blob URL — el thumb sigue siendo visible.
+    // El cleanup se hace al destruir el chat (beforeunload).
+  };
+
   if (data.action === "created") {
     const payload = {
       kind: data.kind,
@@ -5559,8 +5574,9 @@ function handleUploadResponse(uploadCard, data) {
       event_uid: data.event_uid,
       reminder_id: data.reminder_id,
     };
-    _revokeThumbBlob(uploadCard);
-    uploadCard.remove();
+    finalizeAsThumb(
+      data.kind === "event" ? "→ evento creado" : "→ recordatorio creado"
+    );
     appendCreatedChip(parent, payload);
     showToast(
       data.kind === "event"
@@ -5575,8 +5591,7 @@ function handleUploadResponse(uploadCard, data) {
       needs_clarification: !!data.needs_clarification,
       fields: data.fields || {},
     };
-    _revokeThumbBlob(uploadCard);
-    uploadCard.remove();
+    finalizeAsThumb("→ esperando confirmación");
     appendProposal(parent, payload);
   } else {
     // action === "noop" (o response inesperada → tratamos como noop con

@@ -1380,3 +1380,167 @@ def test_propose_reschedule_scheduled_with_empty_when_returns_error(
     body = _json.loads(out)
     assert body["kind"] == "whatsapp_reschedule_scheduled"
     assert "error" in body
+
+
+# ── Notificación post-envío al ambient JID (audit 2026-04-25, A.1) ─────
+
+
+def test_format_delta_human_minutes():
+    """`_format_delta_human` produce strings cortos para mostrar al user
+    en el mensaje de notificación."""
+    f = wa_scheduled._format_delta_human
+    assert f(0) == "0min"
+    assert f(5) == "5min"
+    assert f(59) == "59min"
+    assert f(60) == "1h"
+    assert f(90) == "1h 30min"
+    assert f(120) == "2h"
+    assert f(125) == "2h 5min"
+    assert f(24 * 60) == "1d"
+    assert f(24 * 60 + 60 * 4) == "1d 4h"
+    assert f(7 * 24 * 60) == "7d"
+
+
+def test_notify_ambient_skips_when_no_config(monkeypatch):
+    """Sin ambient config (None o disabled) → silent skip, no llama al
+    bridge. La notificación es nice-to-have, no bloquea nada.
+    """
+    sent_calls = []
+
+    def _fake_send(jid, text):
+        sent_calls.append((jid, text))
+        return True
+
+    monkeypatch.setattr("rag._ambient_config", lambda: None)
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send", _fake_send,
+    )
+
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "540000@s.whatsapp.net", "contact_name": "Test",
+         "scheduled_for_utc": "2026-04-25T12:00:00+00:00"},
+        "sent", delta_minutes=2,
+    )
+    assert sent_calls == [], "no debería notificar sin config"
+
+
+def test_notify_ambient_skips_when_disabled(monkeypatch):
+    """Config existe pero `enabled=False` → skip."""
+    sent_calls = []
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": False, "jid": "X@s.whatsapp.net"})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "540000@s.whatsapp.net"}, "sent", delta_minutes=0,
+    )
+    assert sent_calls == []
+
+
+def test_notify_ambient_skips_self_loop(monkeypatch):
+    """Si el target_jid del scheduled ES el ambient JID, NO notificar.
+    Evita auto-spam: el user ya vio el mensaje original cuando lo recibió.
+    """
+    sent_calls = []
+    AMBIENT = "5491155556666@s.whatsapp.net"
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": True, "jid": AMBIENT})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    # Mismo jid → self-loop → skip
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": AMBIENT, "contact_name": "yo",
+         "scheduled_for_utc": "2026-04-25T12:00:00+00:00"},
+        "sent", delta_minutes=2,
+    )
+    assert sent_calls == []
+
+
+def test_notify_ambient_sends_for_normal_recipient(monkeypatch):
+    """Path happy: target distinto al ambient → manda notificación
+    formato correcto."""
+    sent_calls = []
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": True, "jid": "MEAMBIENT@s.whatsapp.net"})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "540000@s.whatsapp.net", "contact_name": "Grecia",
+         "scheduled_for_utc": "2099-04-25T12:00:00+00:00"},
+        "sent", delta_minutes=2, attempt_count=1,
+    )
+    assert len(sent_calls) == 1
+    target_jid, msg = sent_calls[0]
+    assert target_jid == "MEAMBIENT@s.whatsapp.net"
+    assert "Mandé tu mensaje a Grecia" in msg
+    assert "✓" in msg
+
+
+def test_notify_ambient_sent_late_includes_delta(monkeypatch):
+    """sent_late incluye el delta humano en el mensaje."""
+    sent_calls = []
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": True, "jid": "ME@s.whatsapp.net"})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "540000@s.whatsapp.net", "contact_name": "Oscar",
+         "scheduled_for_utc": "2026-04-25T12:00:00+00:00"},
+        "sent_late", delta_minutes=145, attempt_count=1,
+    )
+    assert len(sent_calls) == 1
+    msg = sent_calls[0][1]
+    assert "Oscar" in msg
+    assert "2h 25min" in msg  # 145min = 2h 25min
+    assert "tarde" in msg
+    assert "⚠" in msg
+
+
+def test_notify_ambient_failed_includes_attempts_and_error(monkeypatch):
+    """failed incluye N intentos + último error."""
+    sent_calls = []
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": True, "jid": "ME@s.whatsapp.net"})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "540000@s.whatsapp.net", "contact_name": "Sole",
+         "scheduled_for_utc": "2026-04-25T12:00:00+00:00"},
+        "failed", attempt_count=5, last_error="bridge_unreachable",
+    )
+    assert len(sent_calls) == 1
+    msg = sent_calls[0][1]
+    assert "Sole" in msg
+    assert "5 intentos" in msg
+    assert "bridge_unreachable" in msg
+    assert "✗" in msg
+
+
+def test_notify_ambient_uses_phone_fallback_when_no_contact_name(monkeypatch):
+    """Si contact_name está vacío, fallback a últimos dígitos del JID
+    para reconocimiento básico."""
+    sent_calls = []
+    monkeypatch.setattr("rag._ambient_config",
+                        lambda: {"enabled": True, "jid": "ME@s.whatsapp.net"})
+    monkeypatch.setattr(
+        "rag.integrations.whatsapp._ambient_whatsapp_send",
+        lambda jid, text: sent_calls.append((jid, text)) or True,
+    )
+    wa_scheduled._notify_ambient_scheduled_outcome(
+        {"jid": "5491198765432@s.whatsapp.net", "contact_name": "",
+         "scheduled_for_utc": "2099-04-25T12:00:00+00:00"},
+        "sent", delta_minutes=0,
+    )
+    msg = sent_calls[0][1]
+    # Últimos 8 dígitos como fallback de identidad
+    assert "98765432" in msg

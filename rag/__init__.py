@@ -35615,6 +35615,15 @@ def _collect_morning_evidence(
     inbox.sort(key=lambda r: r["modified"], reverse=True)
 
     weather = _fetch_weather_rain()
+    # Mensajes WhatsApp programados para HOY (TZ AR). Si la cola está
+    # vacía o el módulo no está disponible, queda lista vacía. El render
+    # del prompt solo agrega la sección si hay items, así que no
+    # contamina los días sin pendings.
+    try:
+        from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
+        wa_today = _wa_sched.list_today_pending(now=now)
+    except Exception:
+        wa_today = []
     ev = {
         "recent_notes": recent,
         "inbox_pending": inbox,
@@ -35629,6 +35638,7 @@ def _collect_morning_evidence(
         "bookmarks_used": _fetch_chrome_bookmarks_used(hours=48, n=5),
         "vault_activity": _fetch_vault_activity(hours=48, n_per_vault=5),
         "whatsapp_unread": _fetch_whatsapp_unread(),
+        "wa_scheduled_today": wa_today,
         "recent_queries": _fetch_recent_queries(query_log, now),
         "weather_rain": weather,  # dict or None
         "system_activity": _fetch_system_activity(now, lookback_hours=lookback_hours),
@@ -35693,6 +35703,18 @@ def _render_morning_prompt(date_label: str, ev: dict) -> str:
             tag = r["bucket"]
             lst = f" [{r['list']}]" if r.get("list") else ""
             parts.append(f"- ({tag}) {r['name']} due={r['due']}{lst}")
+        parts.append("")
+    if ev.get("wa_scheduled_today"):
+        parts.append(
+            f"## WhatsApp — mensajes programados para hoy "
+            f"({len(ev['wa_scheduled_today'])}):"
+        )
+        for w in ev["wa_scheduled_today"][:12]:
+            contact = w["contact_name"] or "(sin nombre)"
+            preview = w.get("message_text_preview") or ""
+            parts.append(
+                f"- {w['scheduled_for_local']} → {contact}: \"{preview}\""
+            )
         parts.append("")
     if ev.get("mail_unread"):
         parts.append(f"## Mail — no leídos últimas 36h ({len(ev['mail_unread'])}):")
@@ -36568,12 +36590,25 @@ def _collect_today_evidence(
     recent.sort(key=lambda r: r["modified"], reverse=True)
     inbox_today.sort(key=lambda r: r["modified"], reverse=True)
 
+    # WhatsApp pending de hoy. El today brief corre típicamente a las
+    # 22hs — a esta hora los pendings programados para hoy deberían
+    # estar todos en `sent`/`sent_late`. Si queda alguno en `pending`,
+    # es señal de problema (worker caído, bridge inalcanzable). El
+    # render del prompt lo destaca como warning para que el user lo
+    # note antes de cerrar el día.
+    try:
+        from rag import wa_scheduled as _wa_sched  # noqa: PLC0415
+        wa_today_pending = _wa_sched.list_today_pending()
+    except Exception:
+        wa_today_pending = []
+
     return {
         "recent_notes": recent,
         "inbox_today": inbox_today,
         "todos": todos,
         "new_contradictions": new_contrad,
         "low_conf_queries": low_conf,
+        "wa_scheduled_today_pending": wa_today_pending,
     }
 
 
@@ -36624,6 +36659,27 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
         )
         for q in ev["low_conf_queries"][:6]:
             parts.append(f"- \"{q['q']}\" (score {q['top_score']:+.2f})")
+        parts.append("")
+    # Pendings de WhatsApp que aún no se mandaron — a esta hora del día
+    # (22hs) deberían estar todos en sent/sent_late, así que cualquier
+    # pending acá indica un problema operativo (worker caído, bridge
+    # inalcanzable). Mencionarlo permite al user tomar acción antes de
+    # cerrar el día.
+    if ev.get("wa_scheduled_today_pending"):
+        parts.append(
+            f"## ⚠ WhatsApp — mensajes que NO salieron todavía hoy "
+            f"({len(ev['wa_scheduled_today_pending'])}):"
+        )
+        for w in ev["wa_scheduled_today_pending"][:6]:
+            contact = w["contact_name"] or "(sin nombre)"
+            preview = w.get("message_text_preview") or ""
+            parts.append(
+                f"- {w['scheduled_for_local']} → {contact}: \"{preview}\""
+            )
+        parts.append(
+            "(si quedaron pending a esta hora, el worker tuvo problemas — "
+            "revisá `launchctl list | grep wa-scheduled-send` y los logs)"
+        )
         parts.append("")
     fin = ev.get("finance") or {}
     ars = fin.get("ars") or {}

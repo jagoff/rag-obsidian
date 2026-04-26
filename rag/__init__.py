@@ -1953,9 +1953,16 @@ SOURCE_RECENCY_HALFLIFE_DAYS: dict[str, float | None] = {
     "gmail":      180.0,
     "drive":       90.0,   # Google Docs age between email (180d) and chat (30d)
     "safari":      90.0,   # browsing context ages mid-term
-    "whatsapp":    30.0,
-    "messages":    30.0,
-    "calls":       30.0,
+    # WhatsApp/Messages/Calls bumpeados de 30→60 días (audit 2026-04-25
+    # R2-Cross-source #5). 30d era muy agresivo: una conversación de
+    # hace 31 días caía a 0.5× del peso, perdiendo contra notas viejas
+    # del vault aunque fuera más relevante. Caso real del audit:
+    # "qué dijo X sobre Y" devolvía nota vault de hace 90d en lugar de
+    # un WA de hace 35d (mismo tema, más reciente). 60d half-life
+    # mantiene la decadencia conversacional pero da más margen.
+    "whatsapp":    60.0,
+    "messages":    60.0,
+    "calls":       60.0,
 }
 
 # Retention windows per source, in days. None → keep forever. Used at
@@ -2083,6 +2090,238 @@ def _conv_dedup_window(
         accepted.append(first_ts)
         kept_by_chat[jid] = accepted
         out.append(pair)
+    return out
+
+
+def _cross_source_dedup(
+    scored_pairs: list[tuple], *, jaccard_threshold: float = 0.7,
+) -> list[tuple]:
+    """Colapsa chunks de FUENTES DISTINTAS que cubren el mismo evento/decisión.
+
+    Caso real (audit 2026-04-25 R2-Cross-source #2): el user decide algo
+    en una nota del vault, lo confirma por mail, lo agenda en Calendar y
+    lo coordina por WhatsApp. Pre-fix el RAG devolvía los 4 chunks como
+    si fueran 4 evidencias separadas, llenando el contexto del LLM con
+    near-duplicates.
+
+    Algoritmo conservador: para cada par de pairs (i, j) con
+    ``source[i] != source[j]``, computa Jaccard de tokens (primeros
+    ~600 chars del expanded text, normalizados a lowercase + sin
+    puntuación). Si Jaccard >= ``jaccard_threshold``, mantiene SOLO
+    el pair de mayor score y descarta el otro.
+
+    Threshold default 0.7 (audit recomienda conservador): 2 chunks que
+    comparten 70% de tokens en sus primeros 600 chars son casi
+    seguramente la misma cosa. Bajo eso → false positives donde temas
+    relacionados pero distintos se colapsan.
+
+    Override via ``RAG_CROSS_SOURCE_DEDUP_THRESHOLD`` env var. Set a
+    1.0 para deshabilitar (escape hatch).
+
+    O(n²) en el pool — irrelevante porque el pool está capped a ~40.
+    """
+    threshold = float(os.environ.get(
+        "RAG_CROSS_SOURCE_DEDUP_THRESHOLD", str(jaccard_threshold),
+    ))
+    if threshold >= 1.0 or len(scored_pairs) < 2:
+        return scored_pairs
+
+    # Pre-compute token sets para cada pair. Usamos solo primeros 600
+    # chars: si 2 chunks comparten ese prefijo, son casi seguro la misma
+    # cosa, y reduce el costo del Jaccard.
+    def _tokenize(text: str) -> frozenset[str]:
+        # Lowercase + strip puntuación + split. Tokens de longitud >= 3
+        # para filtrar stopwords cortas (de, en, la, etc.) que generan
+        # match espurio.
+        s = (text or "")[:600].lower()
+        # Reemplazo simple de puntuación por espacios.
+        for p in ".,;:!?¿¡()[]{}\"'`-_/\\|*~":
+            s = s.replace(p, " ")
+        return frozenset(t for t in s.split() if len(t) >= 3)
+
+    sources: list[str] = []
+    tokens_list: list[frozenset[str]] = []
+    for cand, expanded, _score in scored_pairs:
+        meta = cand[1] if isinstance(cand[1], dict) else {}
+        sources.append(meta.get("source") or "vault")
+        tokens_list.append(_tokenize(str(expanded)))
+
+    # Greedy: iteramos en orden de score (input ya viene sorted desc).
+    # Para cada pair, descartamos pairs posteriores que sean cross-source
+    # near-dup. Mantiene el de mayor score por construcción.
+    drop_indices: set[int] = set()
+    for i in range(len(scored_pairs)):
+        if i in drop_indices:
+            continue
+        ti = tokens_list[i]
+        if not ti:
+            continue
+        for j in range(i + 1, len(scored_pairs)):
+            if j in drop_indices:
+                continue
+            if sources[i] == sources[j]:
+                continue  # Solo cross-source — dedup intra-source es _conv_dedup_window
+            tj = tokens_list[j]
+            if not tj:
+                continue
+            inter = len(ti & tj)
+            union = len(ti | tj)
+            if union == 0:
+                continue
+            if (inter / union) >= threshold:
+                drop_indices.add(j)
+
+    return [p for k, p in enumerate(scored_pairs) if k not in drop_indices]
+
+
+# ── Cross-source privacy opt-out (audit 2026-04-25 R2-Cross-source #1) ─────
+# Filtro opt-in que excluye del retrieval chunks de fuentes sensibles
+# (mails de banking/2FA, chats privados específicos, calendarios marcados,
+# etc.). El user crea ``~/.local/share/obsidian-rag/cross-source.yaml``
+# con las reglas; sin ese archivo, no hay filtro (default: indexar todo,
+# como decidió el user en §10.5 del design doc).
+#
+# Schema esperado:
+#
+#   gmail:
+#     exclude_labels: [banking, 2fa, otp]
+#     exclude_senders: ["*@bank.com", "noreply@2fa.com"]
+#   whatsapp:
+#     exclude_chats: ["+5491112345678@s.whatsapp.net"]
+#   calendar:
+#     exclude_calendars: ["Privado"]
+#
+# El glob simple ``*@bank.com`` matchea fnmatch — no full regex.
+
+_CROSS_SOURCE_FILTERS_CACHE: dict | None = None
+_CROSS_SOURCE_FILTERS_MTIME: float = 0.0
+
+
+def _cross_source_filters_path():
+    return DB_PATH / "cross-source.yaml"
+
+
+def _load_cross_source_filters() -> dict:
+    """Carga las reglas de exclusión cross-source desde YAML. Cachea
+    en memoria con invalidation por mtime — recargas el yaml en hot
+    reload sin reiniciar el server.
+
+    Devuelve ``{}`` (no filtra nada) si el archivo no existe, no parsea,
+    o contiene un schema inesperado. Silent-fail intencional: la
+    privacidad es opt-in, no queremos que un YAML malformado rompa
+    todo el retrieval.
+    """
+    global _CROSS_SOURCE_FILTERS_CACHE, _CROSS_SOURCE_FILTERS_MTIME
+    path = _cross_source_filters_path()
+    if not path.is_file():
+        return {}
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return _CROSS_SOURCE_FILTERS_CACHE or {}
+    if (
+        _CROSS_SOURCE_FILTERS_CACHE is not None
+        and abs(mtime - _CROSS_SOURCE_FILTERS_MTIME) < 0.001
+    ):
+        return _CROSS_SOURCE_FILTERS_CACHE
+    try:
+        import yaml  # noqa: PLC0415
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:
+        raw = {}
+    _CROSS_SOURCE_FILTERS_CACHE = raw
+    _CROSS_SOURCE_FILTERS_MTIME = mtime
+    return raw
+
+
+def _should_exclude_chunk(meta: dict, filters: dict | None = None) -> bool:
+    """Determina si un chunk debe ser excluido del retrieval por reglas
+    de privacidad cross-source. Devuelve True para excluir.
+
+    Reglas suportadas por source:
+
+    - gmail: ``exclude_labels`` (lista de Gmail labels), ``exclude_senders``
+      (lista de glob patterns sobre el campo ``from`` del mail)
+    - whatsapp: ``exclude_chats`` (lista de jids exactos)
+    - calendar: ``exclude_calendars`` (lista de nombres de calendarios)
+
+    Si no hay filtros para el source del chunk, devuelve False (no excluye).
+    """
+    if filters is None:
+        filters = _load_cross_source_filters()
+    if not filters:
+        return False
+    source = (meta.get("source") or "vault").lower()
+    src_filters = filters.get(source)
+    if not isinstance(src_filters, dict):
+        return False
+
+    if source == "gmail":
+        # exclude_labels: matchea contra meta["labels"] (lista) o
+        # meta["label"] (singular). Case-insensitive.
+        excl_labels = src_filters.get("exclude_labels") or []
+        if excl_labels:
+            chunk_labels = meta.get("labels") or meta.get("label") or []
+            if isinstance(chunk_labels, str):
+                chunk_labels = [chunk_labels]
+            chunk_labels_lower = {str(l).lower() for l in chunk_labels}
+            for excl in excl_labels:
+                if str(excl).lower() in chunk_labels_lower:
+                    return True
+        # exclude_senders: glob patterns contra meta["from"]
+        excl_senders = src_filters.get("exclude_senders") or []
+        if excl_senders:
+            sender = (meta.get("from") or meta.get("sender") or "").lower()
+            if sender:
+                import fnmatch  # noqa: PLC0415
+                for pat in excl_senders:
+                    if fnmatch.fnmatch(sender, str(pat).lower()):
+                        return True
+    elif source in ("whatsapp", "messages"):
+        excl_chats = src_filters.get("exclude_chats") or []
+        if excl_chats:
+            jid = meta.get("chat_jid") or meta.get("jid") or ""
+            if jid in excl_chats:
+                return True
+    elif source == "calendar":
+        excl_calendars = src_filters.get("exclude_calendars") or []
+        if excl_calendars:
+            cal = meta.get("calendar") or meta.get("calendar_name") or ""
+            if cal in excl_calendars:
+                return True
+    return False
+
+
+def _filter_excluded_chunks(scored_pairs: list[tuple]) -> list[tuple]:
+    """Aplica los filtros cross-source de privacidad. Returns una lista
+    sin los chunks que matchean alguna regla de exclusión.
+
+    Logguea cuántos chunks se filtraron en silent_errors para
+    observabilidad — si el user reporta "no encuentro mi mail bancario",
+    el log dice "filtered N gmail chunks por exclude_labels".
+    """
+    filters = _load_cross_source_filters()
+    if not filters:
+        return scored_pairs
+    out: list[tuple] = []
+    excluded_count = 0
+    for pair in scored_pairs:
+        cand = pair[0]
+        meta = cand[1] if isinstance(cand[1], dict) else {}
+        if _should_exclude_chunk(meta, filters):
+            excluded_count += 1
+            continue
+        out.append(pair)
+    if excluded_count > 0:
+        try:
+            _silent_log(
+                "cross_source_filter_applied",
+                Exception(f"excluded {excluded_count} chunks by privacy filters"),
+            )
+        except Exception:
+            pass
     return out
 
 
@@ -4720,6 +4959,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE TABLE IF NOT EXISTS rag_queries ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " ts TEXT NOT NULL,"
+            " trace_id TEXT,"
             " cmd TEXT,"
             " q TEXT NOT NULL,"
             " session TEXT,"
@@ -4746,6 +4986,11 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # via (session, ts DESC); without this covering index SQLite
             # falls back to the session-only index + per-row ts sort.
             "CREATE INDEX IF NOT EXISTS ix_rag_queries_session_ts ON rag_queries(session, ts)",
+            # Audit 2026-04-25 R2-Telemetry #1: trace_id correlation
+            # query → behavior → impressions del mismo request. Crítico
+            # para debug ("el chat tardó 30s ayer a las 4pm" → grep
+            # trace_id en rag_queries + rag_behavior + silent_errors).
+            "CREATE INDEX IF NOT EXISTS ix_rag_queries_trace_id ON rag_queries(trace_id) WHERE trace_id IS NOT NULL",
         ),
     ),
     (
@@ -4754,6 +4999,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE TABLE IF NOT EXISTS rag_behavior ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " ts TEXT NOT NULL,"
+            " trace_id TEXT,"
             " source TEXT NOT NULL,"
             " event TEXT NOT NULL,"
             " path TEXT,"
@@ -4770,6 +5016,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             # last N days by path). Without it the path-only index requires
             # a filter pass on ts for every bucket.
             "CREATE INDEX IF NOT EXISTS ix_rag_behavior_path_ts ON rag_behavior(path, ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_behavior_trace_id ON rag_behavior(trace_id) WHERE trace_id IS NOT NULL",
         ),
     ),
     (
@@ -5731,6 +5978,60 @@ def _migrate_cita_detections_add_kind(conn) -> None:
             pass
 
 
+def _migrate_trace_id_columns(conn) -> None:
+    """Idempotent ALTER para agregar ``trace_id`` a rag_queries y rag_behavior
+    (audit 2026-04-25 R2-Telemetry #1).
+
+    En DBs pre-2026-04-25 las tablas existen sin la columna. Intentamos
+    el ALTER y tragamos OperationalError si la columna ya existe (cuando
+    la DB es fresh, el CREATE TABLE arriba ya la creó). Después agregamos
+    el índice partial idempotente.
+
+    Sin trace_id, "el chat tardó 30s ayer 4pm" no se puede correlacionar
+    contra rag_behavior (qué clicks hizo el user) ni silent_errors (qué
+    falló). Con trace_id, un grep cruza las 3 fuentes en O(1).
+    """
+    import sqlite3 as _sqlite3
+    for col_ddl in (
+        "ALTER TABLE rag_queries ADD COLUMN trace_id TEXT",
+        "ALTER TABLE rag_behavior ADD COLUMN trace_id TEXT",
+    ):
+        try:
+            conn.execute(col_ddl)
+        except _sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                try:
+                    _silent_log("migration_trace_id_alter_failed", exc)
+                except Exception:
+                    pass
+    for idx_ddl in (
+        "CREATE INDEX IF NOT EXISTS ix_rag_queries_trace_id "
+        "ON rag_queries(trace_id) WHERE trace_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_rag_behavior_trace_id "
+        "ON rag_behavior(trace_id) WHERE trace_id IS NOT NULL",
+    ):
+        try:
+            conn.execute(idx_ddl)
+        except Exception as _idx_exc:
+            try:
+                _silent_log("migration_trace_id_index_failed", _idx_exc)
+            except Exception:
+                pass
+
+
+def generate_trace_id() -> str:
+    """Devuelve un trace_id corto (8 chars hex) para correlacionar
+    queries / behavior / errores del mismo request.
+
+    8 chars (32 bits) son suficientes para evitar colisiones dentro de
+    la ventana de retention 90 días: con 50 queries/día = 4500 IDs por
+    ventana, probabilidad de colisión ~1 en 10^6 (birthday). Si llegamos
+    a colisionar, no es problema porque las tablas tienen ts también.
+    """
+    import secrets  # noqa: PLC0415
+    return secrets.token_hex(4)  # 8 chars hex
+
+
 # Per-DB-path once-flag para los DDL idempotentes. Pre-2026-04-24 cada
 # `_ragvec_state_conn()` corría los ~28 CREATE TABLE IF NOT EXISTS + ALTER
 # en cada conn open, aún cuando el caller no era cold-start (samplers cpu/
@@ -5830,6 +6131,13 @@ def _ensure_telemetry_tables(conn) -> None:
             try:
                 _silent_log("migration_audio_transcripts_failed", _migrate_exc)
             except Exception:  # pragma: no cover - log path itself failed
+                pass
+        try:
+            _migrate_trace_id_columns(conn)
+        except Exception as _migrate_exc:
+            try:
+                _silent_log("migration_trace_id_failed", _migrate_exc)
+            except Exception:  # pragma: no cover
                 pass
         if db_path:
             _TELEMETRY_DDL_ENSURED_PATHS.add(db_path)
@@ -6141,12 +6449,17 @@ def _ragvec_state_conn():
     DB_PATH.mkdir(parents=True, exist_ok=True)
     conn = _sqlite3.connect(str(DB_PATH / _TELEMETRY_DB_FILENAME),
                             isolation_level=None, check_same_thread=False,
-                            timeout=30.0)
+                            timeout=60.0)
     try:
         # busy_timeout FIRST — subsequent PRAGMAs then wait on writer lock
         # instead of returning SQLITE_BUSY immediately. Matches the pattern
         # in web/conversation_writer._open_sql_conn and the `timeout=` kwarg.
-        conn.execute("PRAGMA busy_timeout=30000")
+        # Bumpeado 30s→60s (audit 2026-04-25 R2-Schemas #4): el audit del
+        # sql_state_errors.jsonl seguía mostrando 258 `queries_sql_write_failed`
+        # en 14 días bajo contención (rag index + chat concurrente). 60s
+        # da margen para que el indexer libere el lock antes de que el
+        # hot-path se rinda.
+        conn.execute("PRAGMA busy_timeout=60000")
         # journal_mode flip takes a brief exclusive lock — skip when
         # already WAL (idempotent check). Critical under multi-process
         # stampede at cold cache.
@@ -6175,9 +6488,9 @@ def _ragvec_state_conn():
 # and duplicate-free from T2's migration script — T2 is a one-shot and
 # doesn't expose a reusable API.
 
-_QUERIES_COLS = ("ts", "cmd", "q", "session", "mode", "top_score", "t_retrieve",
-                 "t_gen", "answer_len", "citation_repaired", "critique_fired",
-                 "critique_changed")
+_QUERIES_COLS = ("ts", "trace_id", "cmd", "q", "session", "mode", "top_score",
+                 "t_retrieve", "t_gen", "answer_len", "citation_repaired",
+                 "critique_fired", "critique_changed")
 _QUERIES_JSON = (("variants", "variants_json"), ("paths", "paths_json"),
                  ("scores", "scores_json"), ("filters", "filters_json"),
                  ("bad_citations", "bad_citations_json"))
@@ -6208,14 +6521,14 @@ def _map_queries_row(ev: dict) -> dict:
 
 def _map_behavior_row(ev: dict) -> dict:
     out: dict = {}
-    for k in ("ts", "source", "event", "path", "query", "rank", "dwell_s"):
+    for k in ("ts", "trace_id", "source", "event", "path", "query", "rank", "dwell_s"):
         if k in ev and ev[k] is not None:
             out[k] = ev[k]
     if "ts" not in out:
         out["ts"] = datetime.now().isoformat(timespec="seconds")
     out.setdefault("source", "unknown")
     out.setdefault("event", "unknown")
-    known = {"ts", "source", "event", "path", "query", "rank", "dwell_s"}
+    known = {"ts", "trace_id", "source", "event", "path", "query", "rank", "dwell_s"}
     extra = {k: v for k, v in ev.items() if k not in known}
     if extra:
         out["extra_json"] = extra
@@ -10460,6 +10773,13 @@ def semantic_chunks(
 _EMBED_CACHE_MAX = int(os.environ.get("RAG_EMBED_CACHE_MAX", "512"))
 _embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 _embed_cache_lock = threading.Lock()
+# Sentinel del modelo con el que se pobló el cache (audit 2026-04-25
+# R2-Embedding #1). Si EMBED_MODEL cambia mid-runtime (el user editó
+# config + reload), los embeddings cacheados del modelo viejo serían
+# incompatibles dimensionalmente y semánticamente. _embed_cache_model
+# guarda qué modelo usamos cada vez que populamos; si difiere del
+# EMBED_MODEL actual al próximo embed() call, limpiamos el cache.
+_embed_cache_model: str | None = None
 
 
 # ── Cache hit/miss observability (2026-04-22) ────────────────────────────────
@@ -10533,6 +10853,16 @@ def cache_stats_reset() -> None:
 def embed(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
+    # Cache invalidation por cambio de modelo (audit 2026-04-25 R2-Embedding #1).
+    # Si EMBED_MODEL cambió desde la última vez que populamos el cache,
+    # los embeddings cacheados son del modelo viejo (incompatibles
+    # dimensionalmente y semánticamente con el nuevo). Limpiamos el
+    # cache entero antes de hacer cualquier lookup.
+    global _embed_cache_model
+    with _embed_cache_lock:
+        if _embed_cache_model is not None and _embed_cache_model != EMBED_MODEL:
+            _embed_cache.clear()
+        _embed_cache_model = EMBED_MODEL
     # Fast path: todos los textos ya cacheados.
     # Batch read under one lock to prevent inter-item eviction races between
     # concurrent request threads. move_to_end on each hit keeps LRU order
@@ -15411,6 +15741,7 @@ _WIKILINK_SKIP_PATTERNS = [
     re.compile(r"`[^`\n]+`"),                              # inline code
     re.compile(r"!?\[\[[^\]]+\]\]"),                       # existing wikilinks (incl. ![[embed]])
     re.compile(r"\[[^\]\n]+\]\([^\)\n]+\)"),               # markdown links
+    re.compile(r"<!--.*?-->", re.DOTALL),                  # HTML comments (audit R2-Wikilinks #2)
     re.compile(r"<[^>\n]+>"),                              # HTML tags
 ]
 
@@ -18592,7 +18923,19 @@ def retrieve(
     # thought; same-minute follow-ups almost always are. No calibration
     # against production yet (Phase 1.f).
     if scored_all:
+        # Privacy filter PRIMERO (audit 2026-04-25 R2-Cross-source #1).
+        # Si el user configuró ~/.local/share/obsidian-rag/cross-source.yaml
+        # con exclude_labels (ej. "banking", "2fa"), exclude_senders, etc.,
+        # filtramos esos chunks ANTES del dedup para que un mail de OTP no
+        # gane la dedup contra un mail legítimo del mismo trace.
+        scored_all = _filter_excluded_chunks(scored_all)
         scored_all = _conv_dedup_window(scored_all, window_s=1800.0)
+        # Cross-source dedup (audit 2026-04-25 R2-Cross-source #2): si
+        # vault + gmail + calendar + WA cubren el mismo evento, dejamos
+        # solo el de mayor score. Conservador (Jaccard 0.7 sobre primeros
+        # 600 chars + cross-source-only) para no eliminar variantes
+        # legítimas.
+        scored_all = _cross_source_dedup(scored_all, jaccard_threshold=0.7)
     # MMR diversity pass (Feature #5, 2026-04-23). Post-rerank, re-order
     # the candidate pool balancing relevance (cross-encoder score) vs
     # diversity (Jaccard token overlap with already-selected docs). When
@@ -20553,6 +20896,12 @@ def _ambient_config() -> dict | None:
     loggea warning una vez y retorna None — el usuario debe re-habilitar
     desde el bot de WhatsApp para regenerar la config.
     """
+    # Kill switch global via env var (audit 2026-04-25 R2-Wikilinks #5).
+    # Útil para silenciar el ambient hook sin tocar el config.json — ej.
+    # cuando el user está debugueando algo que dispara muchos saves o
+    # quiere correr `rag index --reset` sin spam de notificaciones.
+    if os.environ.get("RAG_AMBIENT_DISABLED", "").lower() in ("1", "true", "yes"):
+        return None
     if not AMBIENT_CONFIG_PATH.is_file():
         return None
     try:
@@ -42920,6 +43269,52 @@ def _cleanup_tmp_files() -> int:
     return removed
 
 
+def _cleanup_chat_uploads(*, ttl_days: int | None = None) -> dict:
+    """Borra imágenes en chat-uploads/ con mtime > ttl_days.
+
+    Las imágenes se guardan en ``~/.local/share/obsidian-rag/chat-uploads/``
+    cuando el user las sube via ``/api/chat/upload-image``. Sin TTL, el dir
+    crece sin bound (audit 2026-04-25 R2-Security #6). Idempotente — si
+    una imagen ya fue copiada al vault con un naming cronológico
+    (``00-Inbox/<timestamp>-<hash8>.ext``), borrar el cache no pierde data.
+
+    Args:
+      ttl_days: días de antigüedad mínima para borrar. Default lee la env
+        var ``RAG_CHAT_UPLOADS_TTL_DAYS``, fallback 30.
+
+    Returns:
+      ``{"deleted": N, "bytes_freed": M, "errors": [...]}``. Nunca tira —
+      si el dir no existe devuelve ceros; errores per-archivo se acumulan
+      en ``errors`` para que el caller pueda loguearlos sin abortar la
+      maintenance entera.
+    """
+    if ttl_days is None:
+        ttl_days = int(os.environ.get("RAG_CHAT_UPLOADS_TTL_DAYS", "30"))
+    upload_dir = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-uploads"
+    if not upload_dir.is_dir():
+        return {"deleted": 0, "bytes_freed": 0, "errors": []}
+
+    now = time.time()
+    cutoff = now - (ttl_days * 86400)
+    deleted = 0
+    bytes_freed = 0
+    errors: list[str] = []
+    for fpath in upload_dir.iterdir():
+        if not fpath.is_file():
+            continue
+        try:
+            mtime = fpath.stat().st_mtime
+            if mtime < cutoff:
+                size = fpath.stat().st_size
+                fpath.unlink()
+                deleted += 1
+                bytes_freed += size
+        except Exception as e:  # noqa: BLE001 - best-effort, capturamos per-file
+            errors.append(f"{fpath.name}: {e}")
+
+    return {"deleted": deleted, "bytes_freed": bytes_freed, "errors": errors}
+
+
 def _check_ollama_health() -> dict:
     """Verify required Ollama models are available. Returns {model: ok/missing}."""
     required = [EMBED_MODEL, HELPER_MODEL] + list(CHAT_MODEL_PREFERENCE)
@@ -44058,6 +44453,36 @@ def run_maintenance(
     else:
         results["tmp_cleaned"] = _cleanup_tmp_files()
 
+    # 10b. Chat-uploads TTL cleanup (audit 2026-04-25 R2-Security #6).
+    # Las imágenes que el user sube via /api/chat/upload-image quedan en
+    # ~/.local/share/obsidian-rag/chat-uploads/ con naming hash-based;
+    # sin TTL ese dir crece sin bound. Defensive try/except: si algo
+    # explota acá, el resto de la maintenance sigue.
+    if dry_run:
+        upload_dir = Path.home() / ".local/share/obsidian-rag/chat-uploads"
+        ttl_days = int(os.environ.get("RAG_CHAT_UPLOADS_TTL_DAYS", "30"))
+        cutoff = _t.time() - ttl_days * 86400
+        n_up = 0
+        bytes_up = 0
+        if upload_dir.is_dir():
+            for f in upload_dir.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        n_up += 1
+                        bytes_up += f.stat().st_size
+                except OSError:
+                    continue
+        results["chat_uploads_cleaned"] = {
+            "deleted": n_up, "bytes_freed": bytes_up, "errors": [],
+        }
+    else:
+        try:
+            results["chat_uploads_cleaned"] = _cleanup_chat_uploads()
+        except Exception as e:
+            results["chat_uploads_cleaned_error"] = str(e)
+
     # 11. URL orphans (files deleted but URL rows remain)
     if dry_run:
         try:
@@ -44541,6 +44966,27 @@ def maintenance(dry_run: bool, skip_reindex: bool, skip_logs: bool, verbose: boo
         console.print(f"  [bold]Tmp files:[/bold] [yellow]{tmps} orphans {verb}[/yellow]")
     else:
         console.print("  [bold]Tmp files:[/bold] [dim]none[/dim]")
+
+    # ── Chat uploads TTL (audit 2026-04-25 R2-Security #6) ──
+    cu = results.get("chat_uploads_cleaned") or {}
+    if cu:
+        n = cu.get("deleted", 0)
+        mb = cu.get("bytes_freed", 0) / (1024 * 1024)
+        errs = cu.get("errors", []) or []
+        if n:
+            verb = "would purge" if dry_run else "purged"
+            console.print(
+                f"  [bold]Chat uploads:[/bold] [yellow]{verb} {n} files ({mb:.1f} MB)[/yellow]"
+            )
+        else:
+            console.print("  [bold]Chat uploads:[/bold] [dim]none past TTL[/dim]")
+        if errs and verbose:
+            for err in errs:
+                console.print(f"    [dim red]{err}[/dim red]")
+    elif "chat_uploads_cleaned_error" in results:
+        console.print(
+            f"  [bold]Chat uploads:[/bold] [red]error: {results['chat_uploads_cleaned_error']}[/red]"
+        )
 
     # ── URL orphans ──
     url_orph = results.get("url_orphans", 0)

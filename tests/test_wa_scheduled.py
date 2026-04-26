@@ -510,6 +510,115 @@ def test_run_due_worker_retries_on_failure_until_max(isolated_state_db, monkeypa
     assert row["last_error"] == "send_failed"
 
 
+# ── 8.b run_due_worker() notif al ambient cuando el row pasa a 'failed' ─────
+# Cobertura del audit 2026-04-25 R2-Ambient #4: cuando el bridge está caído
+# y un mensaje programado agota los retries, hay que cerrar el feedback loop
+# avisándole al user por el ambient JID — sin esto, el user solo se entera
+# abriendo el dashboard.
+
+
+def test_notify_ambient_called_on_failed_after_max_retries(
+    isolated_state_db, monkeypatch,
+):
+    """Bridge down: el send falla 5 veces consecutivas. En las primeras 4
+    iteraciones la row vuelve a 'pending' (retry recoverable) y NO se
+    notifica al ambient. Recién en el 5to intento, cuando attempt_count
+    llega a max_retries y la row pasa a 'failed' permanente, se invoca
+    `_notify_ambient_scheduled_outcome` con outcome='failed', el
+    attempt_count y el last_error.
+
+    Audit 2026-04-25 R2-Ambient #4.
+    """
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(2),
+        jid="grecia@s.whatsapp.net",
+        message_text="feliz cumple",
+    )
+
+    # Bridge siempre falla.
+    import rag.integrations.whatsapp as _waint
+    monkeypatch.setattr(_waint, "_whatsapp_send_to_jid",
+                        lambda *a, **kw: False)
+
+    # Spy sobre la notif ambient para capturar status + kwargs.
+    notif_calls: list[tuple] = []
+
+    def _spy_notif(sched, status, **kwargs):
+        notif_calls.append((sched, status, kwargs))
+
+    monkeypatch.setattr(wa_scheduled, "_notify_ambient_scheduled_outcome",
+                        _spy_notif)
+
+    # Runs 1-4: retry recoverable, NO debe notificar.
+    for _ in range(4):
+        wa_scheduled.run_due_worker()
+    assert notif_calls == [], (
+        "no debería notificar mientras la row siga en 'pending' "
+        f"(transient failure) — got: {notif_calls!r}"
+    )
+
+    # Run 5: attempt_count llega a max_retries → status='failed' → notif.
+    s5 = wa_scheduled.run_due_worker()
+    assert s5["failed"] == 1
+    row = _read_row(isolated_state_db, sid)
+    assert row["status"] == "failed"
+
+    assert len(notif_calls) == 1, (
+        f"esperaba 1 notif para outcome='failed', got {len(notif_calls)}"
+    )
+    sched_arg, status_arg, kwargs_arg = notif_calls[0]
+    assert status_arg == "failed"
+    assert kwargs_arg.get("attempt_count") == 5
+    assert kwargs_arg.get("last_error") == "send_failed"
+    # El sched que se le pasa al notifier es la row original (con su jid +
+    # message_text + scheduled_for_utc), no la versión post-UPDATE.
+    assert sched_arg["id"] == sid
+    assert sched_arg["jid"] == "grecia@s.whatsapp.net"
+
+
+def test_notify_ambient_NOT_called_on_transient_failure(
+    isolated_state_db, monkeypatch,
+):
+    """Falla 1 sola vez con max_retries=5 → la row vuelve a 'pending' y
+    `_notify_ambient_scheduled_outcome` NO se invoca. La notif debe
+    dispararse una sola vez en el cierre permanente, nunca en
+    transient failures que todavía tienen retries pendientes.
+
+    Audit 2026-04-25 R2-Ambient #4.
+    """
+    sid = _seed_row(
+        isolated_state_db,
+        scheduled_for_utc=_past_iso(2),
+        jid="grecia@s.whatsapp.net",
+        message_text="feliz cumple",
+    )
+
+    import rag.integrations.whatsapp as _waint
+    monkeypatch.setattr(_waint, "_whatsapp_send_to_jid",
+                        lambda *a, **kw: False)
+
+    notif_calls: list[tuple] = []
+
+    def _spy_notif(sched, status, **kwargs):
+        notif_calls.append((sched, status, kwargs))
+
+    monkeypatch.setattr(wa_scheduled, "_notify_ambient_scheduled_outcome",
+                        _spy_notif)
+
+    summary = wa_scheduled.run_due_worker(max_retries=5)
+    assert summary["retried"] == 1
+    assert summary["failed"] == 0
+    row = _read_row(isolated_state_db, sid)
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 1
+
+    assert notif_calls == [], (
+        "transient failure (1/5) no debería notificar al ambient — "
+        f"got: {notif_calls!r}"
+    )
+
+
 # ── 9. run_due_worker() no procesa cancelled ────────────────────────────────
 
 

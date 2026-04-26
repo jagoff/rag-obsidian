@@ -496,3 +496,134 @@ def test_rag_followup_delegates_and_filters(fake_rag):
 def test_rag_followup_empty_list_is_ok(fake_rag):
     fake_rag.find_followup_loops.return_value = []
     assert mcp_server.rag_followup(days=30) == []
+
+
+# ── session_id validation + reformulate logging (audit 2026-04-25 R2-2) ──────
+# Cubren los dos findings nuevos:
+#   #4 — `session_id` sin validación de formato (ataque path-traversal / DoS)
+#   #3 — errores en reformulate silenciados sin log (debug imposible)
+
+
+def test_rag_query_rejects_invalid_session_id(fake_rag):
+    """Audit R2-2 #4: session_ids con `../` o caracteres no permitidos
+    deben rebotar con `[]` ANTES de tocar el filesystem (sin invocar
+    `ensure_session`). Esto evita path traversal en `~/.local/share/
+    obsidian-rag/sessions/` y XSS-en-tránsito si la web UI rendea el id."""
+    payloads = [
+        "../../etc/passwd",                # path traversal clásico
+        "..\\..\\windows\\system32",       # variante Windows
+        "<script>alert(1)</script>",       # XSS si se rendea sin escape
+        "session id with spaces",          # whitespace explícito no permitido
+        "session/with/slashes",            # slashes nunca van
+        "id;DROP TABLE sessions;--",       # SQL-ish (paranoia)
+        "",                                # string vacío (longitud mín = 1)
+        "id\nwith\nnewlines",              # control chars
+    ]
+    for bad in payloads:
+        out = mcp_server.rag_query("hola", session_id=bad)
+        assert out == [], f"esperaba [] para session_id={bad!r}, vino {out!r}"
+    # `ensure_session` nunca debe haberse llamado — la validación cortó
+    # antes incluso de cargar `rag` (`_load_rag` está mockeado pero igual,
+    # el guard es lo primero).
+    fake_rag.ensure_session.assert_not_called()
+
+
+def test_rag_query_accepts_valid_session_id_format(fake_rag):
+    """Audit R2-2 #4: ids legítimos del docstring deben pasar la
+    validación. Los samples cubren los prefijos típicos de cada
+    integración (telegram, mcp, web)."""
+    fake_rag.retrieve.return_value = {
+        "docs": [], "metas": [], "scores": [], "confidence": None,
+    }
+    fake_rag.session_history.return_value = None  # sin historial → no reformula
+    fake_rag.ensure_session.return_value = object()  # opaque session token
+
+    valids = [
+        "tg:123",            # telegram bot
+        "mcp-x",             # MCP wrapper
+        "web:abc-def_123",   # web UI con guiones + underscores
+        "a",                 # mínimo absoluto (1 char)
+        "X" * 64,            # máximo permitido (64 chars)
+        "session.with.dots", # los dots también están en la regex
+        "0123456789",        # solo dígitos
+        "Mixed_Case-123",    # combinación realista
+    ]
+    for ok in valids:
+        # No debe levantar ni devolver `[]` por validación — devolver `[]`
+        # es esperable si col.count==0 o si retrieve no encontró nada,
+        # pero verificamos que `ensure_session` se haya llamado, lo que
+        # significa que pasamos el guard.
+        fake_rag.ensure_session.reset_mock()
+        mcp_server.rag_query("hola", session_id=ok)
+        fake_rag.ensure_session.assert_called_once_with(ok, mode="mcp")
+
+
+def test_rag_query_rejects_too_long_session_id(fake_rag):
+    """Audit R2-2 #4: 65 caracteres o más deben rechazarse — la regex
+    declara `{1,64}` exactamente. Pre-fix podías mandar un string de
+    10 KB y se persistía como nombre de archivo de sesión."""
+    too_long_65 = "x" * 65
+    too_long_10k = "x" * 10_000
+    assert mcp_server.rag_query("hola", session_id=too_long_65) == []
+    assert mcp_server.rag_query("hola", session_id=too_long_10k) == []
+    fake_rag.ensure_session.assert_not_called()
+
+
+def test_rag_query_logs_reformulate_failure(fake_rag, monkeypatch):
+    """Audit R2-2 #3: cuando `reformulate_and_expand` falla, el bloque
+    catch debe llamar a `_silent_log("mcp_reformulate_and_expand", exc)`
+    para que el error quede en `silent_errors.jsonl` y sea diagnostable.
+    Pre-fix se silenciaba sin log y debug era imposible."""
+    # Fake history → entramos al branch que reformula.
+    fake_rag.ensure_session.return_value = object()
+    fake_rag.session_history.return_value = [
+        {"q": "previa", "a": "respuesta previa", "paths": []},
+    ]
+    boom = RuntimeError("ollama timeout simulado")
+    fake_rag.reformulate_and_expand.side_effect = boom
+    fake_rag.retrieve.return_value = {
+        "docs": [], "metas": [], "scores": [], "confidence": None,
+    }
+
+    # Capturamos las llamadas a _silent_log.
+    log_calls: list[tuple[str, BaseException]] = []
+    def _capture(where, exc):
+        log_calls.append((where, exc))
+    fake_rag._silent_log = _capture
+
+    out = mcp_server.rag_query(
+        "profundizá", session_id="tg:99", multi_query=True,
+    )
+
+    # No debe haber crasheado — fallback a la pregunta original.
+    assert out == []
+    # _silent_log fue invocado con el evento correcto y la excepción real.
+    assert len(log_calls) == 1
+    where, exc = log_calls[0]
+    assert where == "mcp_reformulate_and_expand"
+    assert exc is boom
+    # Y la query original se le pasó a retrieve (fallback).
+    fake_rag.retrieve.assert_called_once()
+    assert fake_rag.retrieve.call_args[0][1] == "profundizá"
+
+
+def test_rag_query_logs_reformulate_query_failure(fake_rag):
+    """Audit R2-2 #3: mismo tratamiento para el branch single-query
+    (cuando `multi_query=False`) — `reformulate_query` también loggea."""
+    fake_rag.ensure_session.return_value = object()
+    fake_rag.session_history.return_value = [
+        {"q": "previa", "a": "ok", "paths": []},
+    ]
+    boom = RuntimeError("oom")
+    fake_rag.reformulate_query.side_effect = boom
+    fake_rag.retrieve.return_value = {
+        "docs": [], "metas": [], "scores": [], "confidence": None,
+    }
+
+    log_calls: list[tuple[str, BaseException]] = []
+    fake_rag._silent_log = lambda where, exc: log_calls.append((where, exc))
+
+    mcp_server.rag_query(
+        "y entonces", session_id="mcp-x", multi_query=False,
+    )
+    assert log_calls == [("mcp_reformulate_query", boom)]

@@ -998,6 +998,30 @@ function el(tag, className, text) {
   return node;
 }
 
+// Detección iOS <16. iOS <16 muestra el picker de <input type="datetime-local">
+// en fullscreen (toma toda la pantalla), tapando el popover de schedule y
+// sus quick-chips (+15min, +1h, …). El user pierde contexto y termina tipeando
+// la fecha a mano. Los pickers de <input type="date"> y <input type="time">
+// por separado, en cambio, se muestran como wheel inline (no fullscreen) y
+// preservan el contexto del popover.
+//
+// Cómo testear sin un iPhone real con iOS <16:
+//   Chrome DevTools → ⋮ → More tools → Network conditions → User agent →
+//   uncheck "Use browser default" → pegar un UA con "iPhone OS 15_" o menor,
+//   ej:
+//     Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15
+//     (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1
+//   Recargar y abrir el popover de schedule. Tiene que aparecer 2 inputs
+//   (fecha + hora) en lugar del datetime-local nativo.
+//
+// Audit ref: R2-PWA #1.
+function isIOSVersionBelow16() {
+  const ua = navigator.userAgent || "";
+  const match = ua.match(/iPhone OS (\d+)_/);
+  if (!match) return false;
+  return parseInt(match[1], 10) < 16;
+}
+
 function appendTurn() {
   const turn = el("div", "turn");
   messagesEl.appendChild(turn);
@@ -2305,6 +2329,71 @@ function appendWhatsAppProposal(parent, payload) {
     const pad = (n) => String(n).padStart(2, "0");
     const toLocalInputValue = (d) =>
       `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const toDateInputValue = (d) =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const toTimeInputValue = (d) =>
+      `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+    // Construye el picker de fecha/hora abstrayendo el modo:
+    //   - Modo normal: un solo <input type="datetime-local">.
+    //   - Modo iOS<16: dos inputs separados (date + time) que en iOS muestran
+    //     wheel inline en lugar de fullscreen; ver isIOSVersionBelow16().
+    // Devolvemos un objeto con la misma API mínima ({element, getValueIso,
+    // setFromDate, focus}) para que el resto del flujo (chips, submit) no
+    // tenga que ramificar en cada uso.
+    function buildPicker(seedDate) {
+      if (!isIOSVersionBelow16()) {
+        const input = document.createElement("input");
+        input.type = "datetime-local";
+        input.className = "proposal-wa-schedule-input";
+        if (seedDate && !isNaN(seedDate.getTime())) {
+          input.value = toLocalInputValue(seedDate);
+        }
+        return {
+          element: input,
+          getValueIso: () => input.value || "",
+          setFromDate: (d) => { input.value = toLocalInputValue(d); },
+          focus: () => { try { input.focus(); } catch {} },
+        };
+      }
+      // Fallback iOS<16: wrapper inline-flex con date + time. Mantiene la
+      // misma class del input nativo (.proposal-wa-schedule-input) para que
+      // el contenedor herede estilos básicos; los hijos llevan inline styles
+      // mínimos porque no podemos tocar CSS en este fix.
+      const wrap = el("span", "proposal-wa-schedule-input proposal-wa-schedule-input-split");
+      wrap.style.display = "inline-flex";
+      wrap.style.gap = "6px";
+      wrap.style.flexWrap = "wrap";
+      const dateInput = document.createElement("input");
+      dateInput.type = "date";
+      dateInput.className = "proposal-wa-schedule-input-date";
+      dateInput.setAttribute("aria-label", "Fecha");
+      const timeInput = document.createElement("input");
+      timeInput.type = "time";
+      timeInput.className = "proposal-wa-schedule-input-time";
+      timeInput.setAttribute("aria-label", "Hora");
+      if (seedDate && !isNaN(seedDate.getTime())) {
+        dateInput.value = toDateInputValue(seedDate);
+        timeInput.value = toTimeInputValue(seedDate);
+      }
+      wrap.appendChild(dateInput);
+      wrap.appendChild(timeInput);
+      return {
+        element: wrap,
+        // Devolvemos el mismo formato que datetime-local nativo: "YYYY-MM-DDTHH:MM".
+        // Si falta cualquiera de los dos, devolvemos "" para que el submit muestre
+        // el error "Elegí fecha y hora" igual que en el path moderno.
+        getValueIso: () => {
+          if (!dateInput.value || !timeInput.value) return "";
+          return `${dateInput.value}T${timeInput.value}`;
+        },
+        setFromDate: (d) => {
+          dateInput.value = toDateInputValue(d);
+          timeInput.value = toTimeInputValue(d);
+        },
+        focus: () => { try { dateInput.focus(); } catch {} },
+      };
+    }
 
     // Quick-time chips first (above the input) so the most common case —
     // pick a preset, hit Programar — is one tap. The datetime-local input
@@ -2331,15 +2420,10 @@ function appendWhatsAppProposal(parent, payload) {
 
     const inputWrap = el("div", "proposal-wa-schedule-row");
     const inputLabel = el("label", "proposal-wa-schedule-label", "Fecha y hora:");
-    const input = document.createElement("input");
-    input.type = "datetime-local";
-    input.className = "proposal-wa-schedule-input";
     // Pre-fill: existing schedule if any, otherwise now+1h as a sensible default.
     const seedDate = scheduledFor ? new Date(scheduledFor) : new Date(Date.now() + 60 * 60 * 1000);
-    if (!isNaN(seedDate.getTime())) {
-      input.value = toLocalInputValue(seedDate);
-    }
-    inputLabel.appendChild(input);
+    const picker = buildPicker(seedDate);
+    inputLabel.appendChild(picker.element);
     inputWrap.appendChild(inputLabel);
     popover.appendChild(inputWrap);
 
@@ -2353,7 +2437,9 @@ function appendWhatsAppProposal(parent, payload) {
       b.textContent = q.label;
       b.addEventListener("click", () => {
         const target = q.custom ? q.custom() : new Date(Date.now() + q.offsetMin * 60 * 1000);
-        input.value = toLocalInputValue(target);
+        // picker.setFromDate maneja ambos modos (datetime-local único, o
+        // date+time separados). No tenemos que ramificar acá.
+        picker.setFromDate(target);
         popoverErr.textContent = "";
       });
       quick.appendChild(b);
@@ -2379,7 +2465,10 @@ function appendWhatsAppProposal(parent, payload) {
 
     acceptBtn.addEventListener("click", () => {
       popoverErr.textContent = "";
-      const v = input.value;
+      // picker.getValueIso() devuelve "YYYY-MM-DDTHH:MM" (mismo formato que el
+      // datetime-local nativo) o "" si falta cualquiera de las dos partes en
+      // el modo iOS<16 (date+time).
+      const v = picker.getValueIso();
       if (!v) {
         popoverErr.textContent = "Elegí fecha y hora";
         return;
@@ -2403,8 +2492,8 @@ function appendWhatsAppProposal(parent, payload) {
     });
 
     card.appendChild(popover);
-    // Focus the datetime-local input for keyboard-first usage.
-    setTimeout(() => { try { input.focus(); } catch {} }, 0);
+    // Focus the picker (date input en modo iOS<16, datetime-local en el moderno).
+    setTimeout(() => { picker.focus(); }, 0);
   }
 
   clockBtn.addEventListener("click", openPopover);

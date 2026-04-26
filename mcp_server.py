@@ -21,8 +21,16 @@ Write tools (create files / Apple DB rows — use when the user asks to
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
+
+# Regex que matchea exactamente lo que el docstring de `rag_query` declara
+# aceptar como `session_id`. Compilado a nivel de módulo así no pagamos el
+# parse en cada tool call. Audit 2026-04-25 R2-2 #4: pre-fix no había
+# validación, un cliente podía pasar "../../etc/passwd" o un string de 10k
+# caracteres y disparábamos path-traversal o DoS al persistir la sesión.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 # Silence sentence-transformers / HF output that would corrupt MCP stdio.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -113,6 +121,19 @@ def rag_query(
             identifier matching [A-Za-z0-9_.:-]{1,64} (e.g. "tg:123", "mcp-x").
     """
     _touch()
+    # Audit 2026-04-25 R2-2 #4: validar el formato del session_id antes de
+    # tocar el filesystem. El docstring declara `[A-Za-z0-9_.:-]{1,64}` pero
+    # pre-fix no había chequeo, así que un cliente podía mandar:
+    #   - "../../etc/passwd" → potencial path traversal en `ensure_session`
+    #   - "x" * 10000        → DoS escribiendo archivos enormes de sesión
+    #   - "<script>...</script>" → XSS si después se renderea en la web UI
+    # Devolvemos lista vacía (mismo shape que "sin resultados") en vez de
+    # raisear: el transport MCP renderiza excepciones como "Internal error"
+    # sin contexto, así que el cliente no ganaría nada con un raise. Un
+    # empty result le da la pista de que algo falló y puede reintentar con
+    # un id válido.
+    if session_id is not None and not _SESSION_ID_RE.match(session_id):
+        return []
     rag = _load_rag()
     col = rag.get_db()
     if col.count() == 0:
@@ -128,12 +149,31 @@ def rag_query(
             effective_question, pre_variants = rag.reformulate_and_expand(
                 question, history
             )
-        except Exception:
+        except Exception as e:
+            # Audit 2026-04-25 R2-2 #3: pre-fix silenciaba todos los errores
+            # acá sin log → si reformulate cuelga (ollama timeout, OOM,
+            # cambio de schema en el JSON parser, etc.) el cliente MCP veía
+            # resultados sin reformulación pero nadie tenía forma de
+            # diagnosticar. Ahora loggeamos via _silent_log que escribe a
+            # ~/.local/share/obsidian-rag/silent_errors.jsonl.
+            try:
+                rag._silent_log("mcp_reformulate_and_expand", e)
+            except Exception:
+                # Last-ditch — el log puede fallar si telemetry.db está
+                # locked o el queue está lleno. No queremos que un fallo de
+                # observabilidad rompa el query.
+                pass
             effective_question = question
     elif history:
         try:
             effective_question = rag.reformulate_query(question, history)
-        except Exception:
+        except Exception as e:
+            # Audit 2026-04-25 R2-2 #3: idem caso anterior pero para el
+            # path single-query (sin expansión a paráfrasis).
+            try:
+                rag._silent_log("mcp_reformulate_query", e)
+            except Exception:
+                pass
             effective_question = question
 
     result = rag.retrieve(

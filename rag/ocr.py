@@ -737,6 +737,20 @@ _CITA_MIN_CHARS = 20
 # dispara acción.
 _CITA_VALID_KINDS = frozenset({"event", "reminder", "note"})
 
+# Audit 2026-04-25 R2-OCR #1: timeout explícito del detector LLM (qwen2.5:3b).
+# Sin esto, una llamada colgada bloquea el endpoint /api/chat/upload-image
+# por minutos. El detector va a través de `rag._helper_client()`, que ya
+# fija este mismo valor en `_TimedOllamaProxy(timeout=30.0)` —
+# `_DETECTOR_TIMEOUT` documenta el contrato del lado consumidor (ocr.py)
+# y permite testearlo sin importar implementación.
+#
+# 30s cubre cold-load de qwen2.5:3b (~10s en MPS) + inference típica
+# (1-3s) con margen para retry interno del cliente. Si esto cambia,
+# actualizar también `rag.__init__._helper_client()` para mantenerlos
+# en sync (el test `test_detector_client_honors_timeout_contract` lo
+# verifica).
+_DETECTOR_TIMEOUT: float = 30.0
+
 
 def _cita_detect_enabled() -> bool:
     """True salvo `RAG_CITA_DETECT=0/false/no` explícito. Default ON."""

@@ -86,6 +86,7 @@ _rag_cmd() {
                 'rate:Aplica rating +/-/0/1/👍/👎 al último turno de una sesión.'
                 'read:Ingerir una URL externa como nota estructurada en el vault.'
                 'remind-wa:Push de Apple Reminders próximos a vencer / recién vencidos al JID ambient.'
+                'routing:Auditar / mantener las reglas aprendidas del voice-classifier.'
                 'scan-citas:Escanear un folder entero por citas en imágenes y agendarlas.'
                 'send-mail:Enviar un mail vía Gmail API. Útil para bots (WhatsApp listener'
                 'serve:Persistent HTTP query server — keeps models warm between requests.'
@@ -103,10 +104,12 @@ _rag_cmd() {
                 'trends:Análisis temático de queries recientes.'
                 'tune:Auto-calibrar pesos del ranker sobre un golden set.'
                 'vault:Multi-vault: registrar / cambiar / listar vaults de Obsidian.'
+                'wa-scheduled-send:Worker — envía mensajes de WhatsApp programados cuyo `scheduled_for_utc`'
                 'wa-tasks:Extrae tareas, preguntas y compromisos de WhatsApp al Inbox.'
                 'wake-up:Wake-up pack: traé todo fresco antes de despertarte.'
                 'watch:Observa el/los vault(s) y reindexa incrementalmente al guardar notas.'
                 'weather:Consultar el clima sin agent loop ni writes al vault.'
+                'whisper:Whisper learning loop — vocab + correcciones del transcript de audios.'
                 'wikilinks:Densificar el grafo: sugerir [[wikilinks]] faltantes.'
             )
             _describe -t subcommands "rag  subcommand" subcommands
@@ -161,6 +164,7 @@ _rag_cmd() {
                 rate) _rag_cmd_rate ;;
                 read) _rag_cmd_read ;;
                 remind-wa) _rag_cmd_remind_wa ;;
+                routing) _rag_cmd_routing ;;
                 scan-citas) _rag_cmd_scan_citas ;;
                 send-mail) _rag_cmd_send_mail ;;
                 serve) _rag_cmd_serve ;;
@@ -178,10 +182,12 @@ _rag_cmd() {
                 trends) _rag_cmd_trends ;;
                 tune) _rag_cmd_tune ;;
                 vault) _rag_cmd_vault ;;
+                wa-scheduled-send) _rag_cmd_wa_scheduled_send ;;
                 wa-tasks) _rag_cmd_wa_tasks ;;
                 wake-up) _rag_cmd_wake_up ;;
                 watch) _rag_cmd_watch ;;
                 weather) _rag_cmd_weather ;;
+                whisper) _rag_cmd_whisper ;;
                 wikilinks) _rag_cmd_wikilinks ;;
             esac
             ;;
@@ -1010,10 +1016,76 @@ _rag_cmd_remind_wa() {
         '--max-overdue-min=[Cap absoluto de overdue: reminders con due anterior a now - max-overdue se skipean]:MAX_OVERDUE_MIN:'
 }
 
+_rag_cmd_routing() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'disable-rule:Desactivar una regla por id (sin borrarla — preserva trail).'
+                'extract-rules:Extraer patrones de rag_routing_decisions y opcionalmente promoverlos.'
+                'list-rules:Listar reglas aprendidas — las que el listener inyecta al sysprompt.'
+                'recent:Últimas N decisiones del classifier — útil para auditar.'
+                'review:Review interactivo de patrones candidatos — aprobá uno a uno.'
+                'stats:Métricas de uso del classifier sobre los últimos 30 días.'
+            )
+            _describe -t subcommands "rag routing subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                disable-rule) _rag_cmd_routing_disable_rule ;;
+                extract-rules) _rag_cmd_routing_extract_rules ;;
+                list-rules) _rag_cmd_routing_list_rules ;;
+                recent) _rag_cmd_routing_recent ;;
+                review) _rag_cmd_routing_review ;;
+                stats) _rag_cmd_routing_stats ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_routing_disable_rule() {
+    _arguments \
+        '1:RULE_ID:'
+}
+
+_rag_cmd_routing_extract_rules() {
+    _arguments \
+        '--min-count=[Mínimo de evidencias para considerar el patrón]:MIN_COUNT:' \
+        '--min-ratio=[Fracción mínima de consistencia 0.0-1.0]:MIN_RATIO:' \
+        '--days=[Ventana en días para el análisis]:DAYS:' \
+        '--auto-promote[Promover automáticamente sin review (usado por el cron)]'
+}
+
+_rag_cmd_routing_list_rules() {
+    _arguments \
+        '--all[Incluir reglas desactivadas]'
+}
+
+_rag_cmd_routing_recent() {
+    _arguments \
+        '1:N:'
+}
+
+_rag_cmd_routing_review() {
+    _arguments \
+        '--min-count=[]:MIN_COUNT:' \
+        '--min-ratio=[]:MIN_RATIO:' \
+        '--days=[]:DAYS:'
+}
+
+_rag_cmd_routing_stats() {
+    :
+}
+
 _rag_cmd_scan_citas() {
     _arguments \
         '--apply[Crear los eventos de verdad. Sin esto es dry-run (default).]' \
-        '--min-confidence=[Override del umbral (0.7 default). Bajá a 0.5 para barridos agresivos.]:MIN_CONF:' \
+        '--min-confidence=[Override del umbral (0.70 default). Bajá a 0.5 para barridos agresivos.]:MIN_CONF:' \
         '(--recursive --no-recursive)--recursive[Bajar a subdirs. Default: sí.]' \
         '(--recursive --no-recursive)--no-recursive[Bajar a subdirs. Default: sí.]' \
         '--plain[Salida plana (ruta + decisión por línea).]' \
@@ -1282,6 +1354,14 @@ _rag_cmd_vault_use() {
         '1:NAME:'
 }
 
+_rag_cmd_wa_scheduled_send() {
+    _arguments \
+        '--dry-run[Calcular las acciones sin enviar al bridge ni mover status]' \
+        '--late-threshold-min=[Si el delta now-scheduled_for supera estos minutos el status final es '\''sent_late'\'' (no '\''sent'\'')]:LATE_THRESHOLD_MIN:' \
+        '--max-retries=[Tras N reintentos fallidos, el row queda en '\''failed'\'' y deja de pickearse]:MAX_RETRIES:' \
+        '--max-per-run=[Cap de cuántos pendings procesa por corrida (limita ráfagas si la cola se llenó)]:MAX_PER_RUN:'
+}
+
 _rag_cmd_wa_tasks() {
     _arguments \
         '--dry-run[Imprimir acciones extraídas sin escribir el archivo]' \
@@ -1308,6 +1388,98 @@ _rag_cmd_watch() {
 _rag_cmd_weather() {
     _arguments \
         '1:QUESTION:'
+}
+
+_rag_cmd_whisper() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'doctor:Health check del whisper learning loop end-to-end.'
+                'export:Exportar correcciones a JSON para backup o migración entre máquinas.'
+                'import:Importar correcciones desde un JSON exportado por `rag whisper export`.'
+                'patterns:Detectar patrones repetidos en correcciones — ej. samando → fernando 3 veces.'
+                'stats:Resumen del estado del learning loop: transcripciones logueadas,'
+                'vocab:Vocab aprendido del corpus que se inyecta al --prompt de whisper.'
+            )
+            _describe -t subcommands "rag whisper subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                doctor) _rag_cmd_whisper_doctor ;;
+                export) _rag_cmd_whisper_export ;;
+                import) _rag_cmd_whisper_import ;;
+                patterns) _rag_cmd_whisper_patterns ;;
+                stats) _rag_cmd_whisper_stats ;;
+                vocab) _rag_cmd_whisper_vocab ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_whisper_doctor() {
+    :
+}
+
+_rag_cmd_whisper_export() {
+    _arguments \
+        '(--output -o){--output,-o}=[Path al archivo JSON de salida. Default: stdout.]:OUTPUT:_files' \
+        '--source=[Filtrar por source ('\''explicit'\''/'\''llm'\''/'\''vault_diff'\''). Default: todas.]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)'
+}
+
+_rag_cmd_whisper_import() {
+    _arguments \
+        '--dry-run[Mostrar qué se importaría sin escribir a la DB.]' \
+        '1:INPUT_FILE:_files'
+}
+
+_rag_cmd_whisper_patterns() {
+    _arguments \
+        '--min-count=[Mínimo de repeticiones para mostrar un pattern (default 2).]:MIN_COUNT:'
+}
+
+_rag_cmd_whisper_stats() {
+    :
+}
+
+_rag_cmd_whisper_vocab() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :->subcmd' \
+        '*::arg:->args'
+    case $state in
+        subcmd)
+            local -a subcommands
+            subcommands=(
+                'refresh:Re-compute `rag_whisper_vocab` desde el corpus + correcciones.'
+                'show:Imprimir top vocab terms ordenados por weight.'
+            )
+            _describe -t subcommands "rag whisper vocab subcommand" subcommands
+            ;;
+        args)
+            case $line[1] in
+                refresh) _rag_cmd_whisper_vocab_refresh ;;
+                show) _rag_cmd_whisper_vocab_show ;;
+            esac
+            ;;
+    esac
+}
+
+_rag_cmd_whisper_vocab_refresh() {
+    _arguments \
+        '--quiet[Solo imprime stats finales, no rows individuales.]'
+}
+
+_rag_cmd_whisper_vocab_show() {
+    _arguments \
+        '--source=[Filtrar por source (corrections/contacts/notes/chats).]:SOURCE:(vault whatsapp gmail calendar reminders contacts bookmarks chrome claude drive github mail moze music reviews spotify youtube)' \
+        '--limit=[Top-N a mostrar.]:LIMIT:'
 }
 
 _rag_cmd_wikilinks() {

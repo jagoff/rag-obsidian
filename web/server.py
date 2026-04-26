@@ -1887,7 +1887,89 @@ def submit_feedback(req: FeedbackRequest) -> dict:
 import collections as _collections
 import threading as _threading
 
-_BEHAVIOR_BUCKETS: dict[str, _collections.deque] = _collections.defaultdict(_collections.deque)
+# Audit 2026-04-25 finding R2-Performance #1: bound de IPs en buckets
+# de rate-limit. Antes usábamos `defaultdict(deque)` directo y crecía
+# sin límite — cada IP nueva creaba una entrada y nunca se removía.
+# Bajo ataque (rotación de proxies, scanners) o uso prolongado, el dict
+# acumulaba decenas de miles de keys (cada deque vacío ≈ 64 bytes +
+# overhead de la key). El wrapper `_LRURateBucket` mantiene un
+# `OrderedDict` ordenado por LRU; cuando supera `max_size`, popea el
+# menos recientemente accedido. API compatible con el código viejo que
+# hace `bucket[ip].append(...)` / `bucket[ip].popleft()`. El default de
+# 5000 IPs es generoso para tráfico humano normal (~10s de IPs por día)
+# y suficientemente estricto para que un atacante no agote memoria.
+_LRU_RATE_BUCKET_MAX = 5000
+
+
+class _LRURateBucket:
+    """Bucket per-IP con bound LRU. Audit 2026-04-25 finding R2-Performance #1.
+
+    Wrapper sobre `OrderedDict` que mantiene como mucho `max_size`
+    entradas. Cada acceso a `bucket[ip]` cuenta como "recently used":
+    la key se mueve al final del orden con `move_to_end`. Cuando se
+    inserta una key nueva y el dict ya está full, se popea la primera
+    (la menos recientemente accedida).
+
+    La API es compatible con `defaultdict(deque)` para los call sites
+    existentes (`_check_rate_limit`, tests con `.clear()`, etc.):
+    ``bucket[ip]`` siempre devuelve un ``collections.deque`` (creándolo
+    si no existía). Los tests que monkeypatchen el atributo entero con
+    un ``defaultdict(list)`` siguen funcionando porque reemplazan la
+    referencia, no el wrapper.
+    """
+
+    def __init__(self, max_size: int = _LRU_RATE_BUCKET_MAX) -> None:
+        self._data: _collections.OrderedDict[str, _collections.deque] = (
+            _collections.OrderedDict()
+        )
+        self._max_size = max_size
+
+    def __getitem__(self, key: str) -> _collections.deque:
+        # Hit: marcamos como recently-used y devolvemos el deque existente.
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        # Miss: creamos un deque vacío y, si llenamos, eviccionamos LRU.
+        bucket: _collections.deque = _collections.deque()
+        self._data[key] = bucket
+        if len(self._data) > self._max_size:
+            self._data.popitem(last=False)
+        return bucket
+
+    def __setitem__(self, key: str, value) -> None:
+        # Compat con tests/legacy: aceptamos cualquier iterable y lo
+        # envolvemos en deque para preservar la API esperada por
+        # `_check_rate_limit`.
+        if not isinstance(value, _collections.deque):
+            value = _collections.deque(value)
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self._max_size:
+            self._data.popitem(last=False)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def items(self):
+        return self._data.items()
+
+
+_BEHAVIOR_BUCKETS: _LRURateBucket = _LRURateBucket()
 _BEHAVIOR_RATE_LIMIT = 120
 _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
 
@@ -1896,7 +1978,7 @@ _BEHAVIOR_RATE_WINDOW = 60.0  # seconds
 # and stops an adversarial loop (e.g. browser extension gone rogue) from
 # starving the daemon. Separate from behavior bucket so clicks don't
 # consume chat budget.
-_CHAT_BUCKETS: dict[str, _collections.deque] = _collections.defaultdict(_collections.deque)
+_CHAT_BUCKETS: _LRURateBucket = _LRURateBucket()
 _CHAT_RATE_LIMIT = 30
 _CHAT_RATE_WINDOW = 60.0
 
@@ -2064,7 +2146,14 @@ _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 # turn, máx 3 rounds), así que podemos permitirnos más budget sin
 # degradar la percepción de "chat congelado". Si realmente hay un hang
 # del daemon, `_ollama_chat_probe` lo detecta antes con 6s.
-_OLLAMA_TOOL_TIMEOUT = 120.0
+#
+# Audit 2026-04-25 finding R1 #9: bajamos el budget de 120s → 45s. El
+# valor previo era demasiado amplio: si qwen2.5:7b se cuelga (OOM,
+# memory pressure, daemon wedge), el chat queda freeze 2 minutos enteros
+# desde la perspectiva del user antes de fallar. qwen2.5 con
+# num_ctx=4096 tarda 1-3s warm + 8-10s cold-load; 45s cubre cold-load +
+# 1-2 retries internos del cliente sin colgar el chat 2 min entero.
+_OLLAMA_TOOL_TIMEOUT = 45.0
 _OLLAMA_TOOL_CLIENT = ollama.Client(timeout=_OLLAMA_TOOL_TIMEOUT)
 
 # Shared num_ctx for every call to the chat model from this server — the
@@ -2411,6 +2500,24 @@ _CHAT_UPLOAD_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "chat-upl
 # reminder, ahorrale el click al user".
 _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE = 0.85
 
+# Audit 2026-04-25 finding R2-OCR #2: si la fecha detectada está más
+# vieja que este umbral (días en el pasado), bajamos el confidence
+# para forzar `needs_confirmation` aunque el detector estuviera muy
+# seguro. Caso real del audit: foto de un ticket de cine de hace 2
+# años → "Cine 15/06 20:00" → auto-creaba un evento histórico en el
+# calendario sin que el user pueda intervenir. 30 días es un trade-off
+# razonable: cubre tickets/recibos viejos pero no penaliza fotos de
+# eventos de "el mes pasado" que el user quiere agendar como referencia.
+_CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT = 30
+try:
+    _CHAT_UPLOAD_HISTORICAL_DAYS = int(
+        os.environ.get("RAG_OCR_HISTORICAL_MAX_DAYS", _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT)
+    )
+    if _CHAT_UPLOAD_HISTORICAL_DAYS < 0:
+        _CHAT_UPLOAD_HISTORICAL_DAYS = _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT
+except (TypeError, ValueError):
+    _CHAT_UPLOAD_HISTORICAL_DAYS = _CHAT_UPLOAD_HISTORICAL_DAYS_DEFAULT
+
 # Mapeo suffix → format param de PIL.save (los formatos que PIL maneja
 # nativamente sin plugins extra). HEIC NO está acá porque PIL sin
 # pillow_heif no puede leerlo — para HEIC dejamos los bytes originales.
@@ -2756,6 +2863,54 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
             "detection": detection,
             "image_path": str(img_path),
         }
+
+    # Audit 2026-04-25 finding R2-OCR #2: si el detector está muy
+    # seguro PERO la fecha detectada es histórica (>30 días en el
+    # pasado), forzamos needs_confirmation. Foto de un ticket viejo no
+    # debería crear un evento sin confirmación explícita. Parsing del
+    # `when` reusa `_parse_natural_datetime` (la misma función que el
+    # fallback de needs_confirmation usa más abajo). Si no parsea, lo
+    # dejamos pasar — el routing normal por confidence decide.
+    if (
+        confidence >= _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE
+        and when
+        and _CHAT_UPLOAD_HISTORICAL_DAYS > 0
+    ):
+        try:
+            from rag import _parse_natural_datetime  # noqa: PLC0415
+            from datetime import datetime as _dt  # noqa: PLC0415
+            _now = _dt.now()
+            _when_dt = _parse_natural_datetime(when, now=_now)
+            if _when_dt is not None:
+                # Normalizar a naive si vino con tz, para comparar
+                # contra `_dt.now()` que también es naive (ambos
+                # comparten la misma referencia de "ahora local AR").
+                if _when_dt.tzinfo is not None:
+                    _when_dt = _when_dt.replace(tzinfo=None)
+                age_days = (_now - _when_dt).total_seconds() / 86400.0
+                if age_days > _CHAT_UPLOAD_HISTORICAL_DAYS:
+                    # Downgrade — forzamos needs_confirmation. 0.5 es
+                    # un valor neutro: por debajo del umbral de
+                    # auto-create pero no tan bajo que el frontend lo
+                    # marque como "ruido".
+                    confidence = 0.5
+                    try:
+                        import rag as _rag  # noqa: PLC0415
+                        _rag._ambient_log_event({
+                            "cmd": "ocr_historical_downgrade",
+                            "kind": kind,
+                            "title": title[:200],
+                            "when": when[:100],
+                            "age_days": round(age_days, 1),
+                            "threshold_days": _CHAT_UPLOAD_HISTORICAL_DAYS,
+                            "ocr_source": ocr_source,
+                        })
+                    except Exception:
+                        pass
+        except Exception:
+            # Cualquier error de parsing → no bloqueamos, dejamos
+            # que el routing normal decida (best-effort guardrail).
+            pass
 
     # Routing por confidence.
     if confidence >= _CHAT_UPLOAD_AUTOCREATE_CONFIDENCE:
@@ -12243,6 +12398,50 @@ _STREAM_SOURCES: dict[str, tuple[str, Callable[[dict], dict]]] = {
 }
 
 
+# Audit 2026-04-25 finding R2-Performance #3: límite de SSE streams
+# concurrentes por IP. Cada conexión al `/api/dashboard/stream` mantiene
+# un poll cada 1.5s contra SQLite indefinidamente; un solo browser con
+# N tabs del dashboard abiertas multiplica el costo. 10 tabs × 24h ≈
+# 57k ciclos de polling acumulados — fácil de gatillar accidentalmente.
+#
+# Tracking: contador in-memory por IP protegido por lock. Se incrementa
+# al entrar al handler y se decrementa en el `finally` del generator
+# (cuando el cliente cierra el stream o cancela la request).
+#
+# Default 3 streams por IP cubre el caso real (PWA + 1 desktop tab + 1
+# mobile) sin permitir runaway. Configurable por env var.
+_SSE_MAX_PER_IP_DEFAULT = 3
+try:
+    _SSE_MAX_PER_IP = int(os.environ.get("RAG_SSE_MAX_PER_IP", _SSE_MAX_PER_IP_DEFAULT))
+    if _SSE_MAX_PER_IP < 1:
+        _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
+except (TypeError, ValueError):
+    _SSE_MAX_PER_IP = _SSE_MAX_PER_IP_DEFAULT
+_SSE_CONNECTIONS_PER_IP: dict[str, int] = {}
+_SSE_CONNECTIONS_LOCK = _threading.Lock()
+
+
+def _sse_acquire_slot(ip: str) -> bool:
+    """Reserva un slot SSE para `ip`. Devuelve False si ya hay
+    `_SSE_MAX_PER_IP` conexiones activas. Audit 2026-04-25 R2-Performance #3."""
+    with _SSE_CONNECTIONS_LOCK:
+        current = _SSE_CONNECTIONS_PER_IP.get(ip, 0)
+        if current >= _SSE_MAX_PER_IP:
+            return False
+        _SSE_CONNECTIONS_PER_IP[ip] = current + 1
+        return True
+
+
+def _sse_release_slot(ip: str) -> None:
+    """Libera un slot SSE para `ip` (idempotente con el contador a 0)."""
+    with _SSE_CONNECTIONS_LOCK:
+        current = _SSE_CONNECTIONS_PER_IP.get(ip, 0)
+        if current <= 1:
+            _SSE_CONNECTIONS_PER_IP.pop(ip, None)
+        else:
+            _SSE_CONNECTIONS_PER_IP[ip] = current - 1
+
+
 def _stream_max_id(conn, table: str) -> int:
     """Starting cursor for a stream — connection-time high-water mark so the
     client only sees rows written AFTER it connects. Missing table or no rows
@@ -12270,7 +12469,7 @@ def _stream_fetch_since(conn, table: str, last_id: int) -> list[dict]:
 
 
 @app.get("/api/dashboard/stream")
-async def dashboard_stream() -> StreamingResponse:
+async def dashboard_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
     """SSE: poll rag_* SQL tables for new rows and push them as events.
 
     Each kind tracks its own `last_id` cursor, initialised at connection
@@ -12279,7 +12478,30 @@ async def dashboard_stream() -> StreamingResponse:
     are scanned, then the connection is closed — keeps total connection
     time short (WAL readers don't block writers but we prefer no-op
     polls to not hold the conn).
+
+    Audit 2026-04-25 finding R2-Performance #3: cap por IP de streams
+    concurrentes. Si la IP ya tiene `_SSE_MAX_PER_IP` conexiones
+    abiertas, devolvemos 429 antes de armar el generator. El slot se
+    libera en el `finally` del generator (sea por cierre limpio o
+    cancelación del cliente).
+
+    `request` es opcional para tests que invocan el handler directo
+    (sin pasar por el routing de FastAPI) — en producción FastAPI lo
+    inyecta siempre. Si viene None, salteamos el rate-limit por IP.
     """
+    # Cap por IP — el primer chequeo es gate-keeping, el slot real se
+    # reserva en `_sse_acquire_slot` con un lock para que dos requests
+    # simultáneas no se pasen el límite por race. Si `request is None`
+    # (caso test), el slot no se gestiona y `client_ip` queda en None.
+    client_ip: str | None = None
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        if not _sse_acquire_slot(client_ip):
+            raise HTTPException(
+                status_code=429,
+                detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)",
+            )
+
     # Cursors per kind — populated lazily on first poll so connection-setup
     # errors don't kill the SSE stream (the dashboard uses this endpoint as
     # a heartbeat in addition to a data feed).
@@ -12315,6 +12537,14 @@ async def dashboard_stream() -> StreamingResponse:
                 await asyncio.sleep(1.5)
         except asyncio.CancelledError:
             return
+        finally:
+            # Audit 2026-04-25 R2-Performance #3: liberamos el slot tanto si
+            # el stream terminó limpio como si el cliente canceló (el cleanup
+            # de FastAPI dispara CancelledError al cerrar la conexión).
+            # `client_ip is None` cuando el handler lo invocó un test directo
+            # sin Request — no hay slot que liberar.
+            if client_ip is not None:
+                _sse_release_slot(client_ip)
 
     return StreamingResponse(
         gen(),

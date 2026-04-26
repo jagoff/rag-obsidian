@@ -48,12 +48,53 @@ applyChartDefaults();
 const POLL_MS = 60_000;        // refresh aggregations every 60s; SSE pushes live deltas in between
 const TICKER_MAX = 5;          // live events kept on screen
 
+// ── Mobile/PWA polling backoff ────────────────────────────────────────────
+//
+// Problema (audit R2-PWA #5): en iPhone con la app instalada como PWA
+// standalone, JS NO se throttlea agresivamente cuando la app pasa a
+// background (a diferencia de Chrome Android). Antes de este fix, el
+// visibilitychange handler simplemente cortaba el polling — lo cual
+// asume que el OS pone la app a dormir. En la práctica iOS standalone
+// deja el JS corriendo un buen rato, y los timers seguían disparando
+// fetches a /api/dashboard y /api/whatsapp/scheduled cada 30-60s →
+// drenaje de batería innecesario.
+//
+// Fix: en lugar de cortar, vamos espaciando el polling con backoff
+// exponencial cuando la pestaña lleva mucho tiempo oculta.
+//
+// Reglas:
+//   - Visible: interval normal (POLL_MS o WA_POLL_MS según el poller).
+//   - Hidden < HIDDEN_GRACE_MS (5 min): interval normal (gracia, asumiendo
+//     que el user vuelve pronto y queremos data fresca al reabrir).
+//   - Hidden ≥ 5 min: doblamos cada 5 min adicionales (30s → 60s → 120s → …).
+//   - Cap: POLL_MAX_MS (5 min) entre polls.
+//   - Al volver a visible: reset y trigger inmediato.
+//
+// Implementación: en lugar de setInterval (que tiene un período fijo),
+// usamos setTimeout recursivo donde cada tick computa el próximo delay
+// vía pollNextDelay(baseMs). Así el intervalo crece dinámicamente.
+const POLL_MAX_MS = 300_000;       // cap a 5 minutos
+const POLL_HIDDEN_GRACE_MS = 300_000;  // 5 min de hidden antes del primer backoff
+let _hiddenSince = null;           // timestamp ms desde que la pestaña pasó a hidden
+
+function pollNextDelay(baseMs) {
+  // Visible o no hace tanto que estamos hidden → usar el base interval del poller.
+  if (!document.hidden || _hiddenSince == null) return baseMs;
+  const hiddenFor = Date.now() - _hiddenSince;
+  if (hiddenFor < POLL_HIDDEN_GRACE_MS) return baseMs;
+  // Cuántas veces ya tendríamos que haber doblado: 1 después de la primera
+  // ventana de gracia, 2 después de otra ventana, etc. Stepwise (no
+  // continuo) para que el comportamiento sea predecible.
+  const doublings = Math.floor((hiddenFor - POLL_HIDDEN_GRACE_MS) / POLL_HIDDEN_GRACE_MS) + 1;
+  return Math.min(baseMs * Math.pow(2, doublings), POLL_MAX_MS);
+}
+
 const state = {
   days: 30,
   charts: {},                  // name → Chart instance
   built: false,                // first render done?
   data: null,                  // last full payload
-  poll: null,                  // setInterval handle
+  poll: null,                  // setTimeout handle (recursive — ver startPolling)
   evtSrc: null,                // EventSource
   paused: false,
   ticker: [],                  // recent stream events
@@ -121,8 +162,12 @@ el.liveToggle.addEventListener("click", () => {
   if (state.paused) {
     setLiveState("paused", "pausado");
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
-    if (state.poll) { clearInterval(state.poll); state.poll = null; }
-    if (state.waPoll) { clearInterval(state.waPoll); state.waPoll = null; }
+    // state.poll / state.waPoll ahora son setTimeout handles (no setInterval)
+    // — usamos clearTimeout. Tanto clearInterval como clearTimeout aceptan
+    // el otro tipo de handle en navegadores reales, pero por claridad
+    // usamos el correcto.
+    if (state.poll) { clearTimeout(state.poll); state.poll = null; }
+    if (state.waPoll) { clearTimeout(state.waPoll); state.waPoll = null; }
   } else {
     setLiveState("off", "reconectando…");
     load(false);
@@ -133,21 +178,29 @@ el.liveToggle.addEventListener("click", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  // Pause polling/stream when tab hidden to avoid burning CPU.
+  // Cuando la pestaña se oculta NO cortamos el polling — lo dejamos seguir
+  // pero los próximos delays se calculan via pollNextDelay(), que aplica
+  // backoff exponencial pasada la ventana de gracia (POLL_HIDDEN_GRACE_MS).
+  // Lo único que cerramos en hidden es el SSE: una conexión persistente
+  // sin uso real cuando la app no está en pantalla.
   if (document.hidden) {
-    if (state.poll) { clearInterval(state.poll); state.poll = null; }
+    _hiddenSince = Date.now();
     if (state.evtSrc) { state.evtSrc.close(); state.evtSrc = null; }
-    if (state.waPoll) { clearInterval(state.waPoll); state.waPoll = null; }
   } else if (!state.paused) {
+    // Volvemos al frente: reseteamos el clock del backoff y forzamos un
+    // refresh inmediato (likely missed N seconds de cambios mientras
+    // estuvo oculta), después reconectamos SSE.
+    _hiddenSince = null;
     load(false);
-    startPolling();
+    // Si por alguna razón el poller quedó cancelado (ej. live-toggle pause/
+    // resume durante hidden), lo arrancamos de nuevo. startPolling() es
+    // idempotente — clearTimeout primero y reagenda.
+    if (!state.poll) startPolling();
     startStream();
     if (state.waInitDone) {
-      // Pull a fresh snapshot first (we likely missed N seconds of
-      // changes while hidden), then resume the 30s loop. Init handles
-      // the first-run case earlier in load().
+      // Snapshot fresca + asegurar que el waPoll esté agendado.
       refreshWaScheduled();
-      startWaPolling();
+      if (!state.waPoll) startWaPolling();
     }
   }
 });
@@ -158,8 +211,9 @@ document.addEventListener("visibilitychange", () => {
 // they leak as zombie connections from the browser's PoV until GC.
 window.addEventListener("beforeunload", () => {
   try { if (state.evtSrc) state.evtSrc.close(); } catch (_) {}
-  try { if (state.poll) clearInterval(state.poll); } catch (_) {}
-  try { if (state.waPoll) clearInterval(state.waPoll); } catch (_) {}
+  // state.poll / state.waPoll son setTimeout handles ahora — clearTimeout.
+  try { if (state.poll) clearTimeout(state.poll); } catch (_) {}
+  try { if (state.waPoll) clearTimeout(state.waPoll); } catch (_) {}
   try { if (MEM && MEM.es) MEM.es.close(); } catch (_) {}
   try { if (CPU && CPU.es) CPU.es.close(); } catch (_) {}
 });
@@ -218,8 +272,21 @@ async function load(showSkeleton) {
 }
 
 function startPolling() {
-  if (state.poll) clearInterval(state.poll);
-  state.poll = setInterval(() => { if (!state.paused) load(false); }, POLL_MS);
+  // Cancelar cualquier tick pendiente (idempotente).
+  if (state.poll) { clearTimeout(state.poll); state.poll = null; }
+  // Patrón setTimeout recursivo en lugar de setInterval — necesario para
+  // que el delay del próximo tick varíe dinámicamente vía pollNextDelay()
+  // según document.hidden + cuánto tiempo lleva oculta. setInterval tiene
+  // período fijo y no nos permite eso.
+  const tick = () => {
+    if (state.paused) { state.poll = null; return; }
+    // Hacemos el fetch incluso cuando está hidden (la idea del backoff es
+    // espaciar, no cortar — así si el user vuelve después de 20min hay
+    // data más-o-menos fresca sin esperar el primer poll post-resume).
+    load(false);
+    state.poll = setTimeout(tick, pollNextDelay(POLL_MS));
+  };
+  state.poll = setTimeout(tick, pollNextDelay(POLL_MS));
 }
 
 // ── SSE stream ────────────────────────────────────────────────────────────
@@ -1747,11 +1814,20 @@ function waInit() {
 }
 
 function startWaPolling() {
-  if (state.waPoll) clearInterval(state.waPoll);
-  state.waPoll = setInterval(() => {
-    if (state.paused || document.hidden) return;
+  // Cancelar cualquier tick pendiente (idempotente).
+  if (state.waPoll) { clearTimeout(state.waPoll); state.waPoll = null; }
+  // Mismo patrón recursivo que startPolling(): el delay del próximo tick
+  // se computa via pollNextDelay(WA_POLL_MS) — hidden mucho tiempo →
+  // backoff exponencial (cap 5 min). Antes de este fix se usaba setInterval
+  // con un guard `if (state.paused || document.hidden) return;` adentro,
+  // lo que igual disparaba el timer cada 30s aunque no hiciera fetch —
+  // batería igual castigada. Ahora el timer mismo se va espaciando.
+  const tick = () => {
+    if (state.paused) { state.waPoll = null; return; }
     refreshWaScheduled();
-  }, WA_POLL_MS);
+    state.waPoll = setTimeout(tick, pollNextDelay(WA_POLL_MS));
+  };
+  state.waPoll = setTimeout(tick, pollNextDelay(WA_POLL_MS));
 }
 
 async function refreshWaScheduled() {
@@ -2103,6 +2179,88 @@ function waResend(id) {
     });
 }
 
+// Detección iOS <16. iOS <16 abre el picker de <input type="datetime-local">
+// en fullscreen (toma toda la pantalla), tapando el popover de reschedule
+// y sus quick-chips (+15min, +1h, …). En esos devices usamos 2 inputs
+// separados (date + time) que iOS muestra como wheel inline, preservando
+// el contexto.
+//
+// Cómo testear: Chrome DevTools → ⋮ → More tools → Network conditions →
+// User agent → uncheck "Use browser default" → pegar un UA con
+// "iPhone OS 15_" o menor (ej:
+//   Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15
+//   (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1
+// ) y abrir el reschedule de un mensaje pendiente.
+//
+// Audit ref: R2-PWA #1.
+function isIOSVersionBelow16() {
+  const ua = navigator.userAgent || "";
+  const match = ua.match(/iPhone OS (\d+)_/);
+  if (!match) return false;
+  return parseInt(match[1], 10) < 16;
+}
+
+// Construye el picker de fecha/hora del reschedule popover. Devuelve un
+// objeto con API mínima ({element, getValueIso, setFromDate, focus}) para
+// que el resto del flujo (chips, confirm) sea agnóstico al modo.
+//
+// - Modo normal: <input type="datetime-local">.
+// - Modo iOS<16: <input type="date"> + <input type="time"> (wheel inline).
+function waBuildSchedulePicker(seedDate) {
+  const pad = (n) => String(n).padStart(2, "0");
+  if (!isIOSVersionBelow16()) {
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.className = "wa-resched-input";
+    if (seedDate && !Number.isNaN(seedDate.getTime())) {
+      input.value = waDateToLocalInput(seedDate);
+    }
+    return {
+      element: input,
+      getValueIso: () => input.value || "",
+      setFromDate: (d) => { input.value = waDateToLocalInput(d); },
+      focus: () => { try { input.focus(); } catch {} },
+    };
+  }
+  // Fallback iOS<16. Wrap mantiene la class "wa-resched-input" para que los
+  // querySelector existentes (defensivos) y cualquier estilo base sigan
+  // funcionando. Inline styles mínimos porque no podemos tocar CSS.
+  const wrap = document.createElement("span");
+  wrap.className = "wa-resched-input wa-resched-input-split";
+  wrap.style.display = "inline-flex";
+  wrap.style.gap = "6px";
+  wrap.style.flexWrap = "wrap";
+  const dateInput = document.createElement("input");
+  dateInput.type = "date";
+  dateInput.className = "wa-resched-input-date";
+  dateInput.setAttribute("aria-label", "Fecha");
+  const timeInput = document.createElement("input");
+  timeInput.type = "time";
+  timeInput.className = "wa-resched-input-time";
+  timeInput.setAttribute("aria-label", "Hora");
+  if (seedDate && !Number.isNaN(seedDate.getTime())) {
+    dateInput.value = `${seedDate.getFullYear()}-${pad(seedDate.getMonth() + 1)}-${pad(seedDate.getDate())}`;
+    timeInput.value = `${pad(seedDate.getHours())}:${pad(seedDate.getMinutes())}`;
+  }
+  wrap.appendChild(dateInput);
+  wrap.appendChild(timeInput);
+  return {
+    element: wrap,
+    // Mismo formato que datetime-local: "YYYY-MM-DDTHH:MM". "" si falta
+    // cualquiera, así el confirm muestra "elegí una fecha/hora" igual que
+    // en el path moderno.
+    getValueIso: () => {
+      if (!dateInput.value || !timeInput.value) return "";
+      return `${dateInput.value}T${timeInput.value}`;
+    },
+    setFromDate: (d) => {
+      dateInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      timeInput.value = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    },
+    focus: () => { try { dateInput.focus(); } catch {} },
+  };
+}
+
 function waToggleReschedule(id) {
   // Close any other open popover (single-popover invariant).
   document.querySelectorAll("tr.wa-resched-row").forEach(r => {
@@ -2115,17 +2273,20 @@ function waToggleReschedule(id) {
   const item = (state.waItems || []).find(x => x.id === id);
   const tr = document.querySelector(`tr[data-wa-id="${id}"]`);
   if (!item || !tr) return;
-  const initialLocal = waIsoToLocalInput(item.scheduled_for_utc);
 
   const popup = document.createElement("tr");
   popup.className = "wa-resched-row";
   popup.dataset.targetId = String(id);
+  // Construimos el shell del popover via innerHTML (más legible para el
+  // template estático) y dejamos un <span class="wa-resched-input-slot">
+  // como anclaje donde el picker (datetime-local o date+time) se inserta
+  // después por JS. Esto evita ramificar el template en dos versiones.
   popup.innerHTML = `
     <td colspan="5">
       <div class="wa-resched">
         <label class="wa-resched-label">
           <span>Nueva fecha/hora:</span>
-          <input type="datetime-local" class="wa-resched-input" value="${escapeHtml(initialLocal)}">
+          <span class="wa-resched-input-slot"></span>
         </label>
         <div class="wa-resched-chips" role="group" aria-label="Atajos rápidos">
           <button type="button" class="wa-chip-quick" data-wa-action="reschedule-chip" data-delta="15">+15min</button>
@@ -2141,10 +2302,16 @@ function waToggleReschedule(id) {
       </div>
     </td>
   `;
+  // Pre-fill: el schedule actual del item (si existe).
+  const seedDate = item.scheduled_for_utc ? new Date(item.scheduled_for_utc) : null;
+  const picker = waBuildSchedulePicker(seedDate);
+  popup.querySelector(".wa-resched-input-slot").appendChild(picker.element);
+  // Stasheamos el accessor en el nodo para que waApplyChip / waConfirmReschedule
+  // (que reciben el `id` y miran el DOM) puedan leer/escribir sin saber el modo.
+  popup._picker = picker;
   tr.parentNode.insertBefore(popup, tr.nextSibling);
   // Focus the input for keyboard users.
-  const input = popup.querySelector(".wa-resched-input");
-  if (input) input.focus();
+  picker.focus();
 }
 
 function waCloseReschedule(id) {
@@ -2154,9 +2321,7 @@ function waCloseReschedule(id) {
 
 function waApplyChip(btn, id) {
   const popup = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
-  if (!popup) return;
-  const input = popup.querySelector(".wa-resched-input");
-  if (!input) return;
+  if (!popup || !popup._picker) return;
   const delta = btn.dataset.delta;
   const now = new Date();
   let target;
@@ -2168,13 +2333,15 @@ function waApplyChip(btn, id) {
     const min = Number(delta);
     target = new Date(now.getTime() + min * 60_000);
   }
-  input.value = waDateToLocalInput(target);
+  // picker.setFromDate maneja ambos modos (datetime-local único, o date+time
+  // separados en iOS<16). No nos importa cuál es acá.
+  popup._picker.setFromDate(target);
 }
 
 function waConfirmReschedule(id) {
   const popup = document.querySelector(`tr.wa-resched-row[data-target-id="${id}"]`);
   if (!popup) return;
-  const input = popup.querySelector(".wa-resched-input");
+  const picker = popup._picker;
   const errEl = popup.querySelector(".wa-resched-error");
   const setErr = (msg) => {
     if (!errEl) return;
@@ -2182,7 +2349,9 @@ function waConfirmReschedule(id) {
     errEl.hidden = !msg;
   };
   setErr("");
-  const v = input && input.value;
+  // picker.getValueIso() devuelve "YYYY-MM-DDTHH:MM" o "" (el path iOS<16
+  // requiere date+time ambos llenos para emitir un string válido).
+  const v = picker && picker.getValueIso();
   if (!v) { setErr("elegí una fecha/hora"); return; }
 
   // datetime-local emits "YYYY-MM-DDTHH:MM" without offset; the server

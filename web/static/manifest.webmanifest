@@ -60,6 +60,13 @@
       "description": "Analytics del corpus",
       "url": "/dashboard",
       "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Learning",
+      "short_name": "Learning",
+      "description": "Cómo evoluciona el aprendizaje del sistema",
+      "url": "/dashboard/learning",
+      "icons": [{ "src": "/static/pwa/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }

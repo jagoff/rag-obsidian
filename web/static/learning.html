@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <!-- viewport-fit=cover: empareja con dashboard.html / home.html / index.html
+       para que la PWA standalone no tenga gaps blancos arriba/abajo. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag">
+  <title>rag · learning</title>
+
+  <!-- ── PWA wiring (idéntico a dashboard.html — ver index.html para nota
+       de regeneración) ─────────────────────────────────────────────── -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-x.png"
+        media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xr.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-xs-max.png"
+        media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-mini.png"
+        media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12.png"
+        media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-12-pro-max.png"
+        media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro.png"
+        media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-14-pro-max.png"
+        media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro.png"
+        media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+  <link rel="apple-touch-startup-image" href="/static/pwa/splash-iphone-16-pro-max.png"
+        media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+
+  <script>
+    // Inline theme init — runs before body paint to avoid flash.
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/static/pwa/register-sw.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <style>
+    :root {
+      --bg: #1a1a1f;
+      --bg-elev: #222228;
+      --bg-card: #26262c;
+      --border: #33333a;
+      --border-strong: #3e3e46;
+      --text: #ececed;
+      --text-dim: #a0a0a6;
+      --text-faint: #7a7a82;
+      --green: #7ee787;
+      --cyan: #79c0ff;
+      --cyan-dim: #5a9bd5;
+      --yellow: #e3c27a;
+      --red: #ff7b72;
+      --purple: #d2a8ff;
+      --orange: #ffa657;
+      --pink: #f778ba;
+      --grid: rgba(255,255,255,0.04);
+      --hover: rgba(255,255,255,0.06);
+      --sep: rgba(255,255,255,0.03);
+      color-scheme: dark;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #fafafa;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --border: #e2e2e5;
+      --border-strong: #cfcfd4;
+      --text: #1a1a20;
+      --text-dim: #52525b;
+      --text-faint: #70707a;
+      --green: #2f8f3d;
+      --cyan: #0969da;
+      --cyan-dim: #0969da;
+      --yellow: #a0761a;
+      --red: #c8311f;
+      --purple: #7c3aed;
+      --orange: #c25a11;
+      --pink: #d02a8a;
+      --grid: rgba(0,0,0,0.05);
+      --hover: rgba(0,0,0,0.04);
+      --sep: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) {
+        --bg: #fafafa;
+        --bg-elev: #ffffff;
+        --bg-card: #ffffff;
+        --border: #e2e2e5;
+        --border-strong: #cfcfd4;
+        --text: #1a1a20;
+        --text-dim: #52525b;
+        --text-faint: #70707a;
+        --green: #2f8f3d;
+        --cyan: #0969da;
+        --cyan-dim: #0969da;
+        --yellow: #a0761a;
+        --red: #c8311f;
+        --purple: #7c3aed;
+        --orange: #c25a11;
+        --pink: #d02a8a;
+        --grid: rgba(0,0,0,0.05);
+        --hover: rgba(0,0,0,0.04);
+        --sep: rgba(0,0,0,0.04);
+        color-scheme: light;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    :focus { outline: none; }
+    :focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    /* ── Header sticky ──────────────────────────────────────────────
+       Mismo look-and-feel que dashboard.html: backdrop blur, border
+       inferior, sticky, h1 con accent cyan + meta a la derecha. */
+    header.hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 14px 24px 16px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .hdr-l {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .hdr-l .brand { color: var(--cyan); text-decoration: none; }
+    .hdr-l .brand:hover { color: var(--cyan); filter: brightness(1.15); }
+    .hdr-l .sep { color: var(--text-faint); font-weight: 400; }
+    .hdr-l .title { color: var(--text-faint); font-weight: 400; }
+
+    .hdr-r {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-dim);
+      flex-wrap: wrap;
+    }
+
+    /* Selector segmentado de días (7d/30d/90d/1a) */
+    .seg {
+      display: inline-flex;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+    }
+    .seg-btn {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      padding: 4px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .seg-btn:hover { color: var(--text); }
+    .seg-btn.active { background: var(--bg-card); color: var(--cyan); }
+
+    /* Live + theme toggle (mismo patrón visual que .live de dashboard.html) */
+    .btn-icon {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-faint);
+      cursor: pointer;
+      user-select: none;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      font-family: inherit;
+    }
+    .btn-icon:hover { border-color: var(--border-strong); color: var(--text); }
+    .btn-icon .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-faint);
+      box-shadow: 0 0 0 0 rgba(126,231,135,0);
+    }
+    .btn-icon[data-state="live"] .dot { background: var(--green); }
+    .btn-icon[data-state="paused"] .dot { background: var(--yellow); }
+    .btn-icon[data-state="off"] .dot { background: var(--red); }
+    @media (prefers-reduced-motion: no-preference) {
+      .btn-icon[data-state="live"] .dot { animation: pulse 1.6s ease-out infinite; }
+      @keyframes pulse {
+        0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 55%, transparent); }
+        70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--green) 0%, transparent); }
+        100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 0%, transparent); }
+      }
+    }
+
+    .hdr-nav { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+    .hdr-nav a {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-decoration: none;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    .hdr-nav a:hover { color: var(--cyan); background: var(--hover); }
+
+    .meta-period {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-faint);
+    }
+
+    /* ── KPI hero (8 tarjetas grandes, 4 cols desktop / 2 mobile) ──── */
+    .kpi-hero {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      padding: 16px 24px;
+    }
+    @media (max-width: 1100px) {
+      .kpi-hero { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 520px) {
+      .kpi-hero { grid-template-columns: 1fr; }
+    }
+
+    .kpi {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      position: relative;
+    }
+    .kpi-label {
+      font-size: 11px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .kpi-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--cyan);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi-delta {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi-delta.up { color: var(--green); }
+    .kpi-delta.down { color: var(--red); }
+    .kpi-delta.neutral { color: var(--text-faint); }
+    .kpi.insufficient .kpi-value { color: var(--text-dim); }
+    .kpi-badge {
+      position: absolute;
+      top: 8px;
+      right: 10px;
+      font-size: 9px;
+      color: var(--yellow);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: color-mix(in srgb, var(--yellow) 15%, transparent);
+      border: 1px solid color-mix(in srgb, var(--yellow) 35%, transparent);
+      border-radius: 4px;
+      padding: 1px 5px;
+      display: none;
+    }
+    .kpi.insufficient .kpi-badge { display: inline-block; }
+
+    /* ── Secciones colapsables ─────────────────────────────────────── */
+    .learn-section {
+      padding: 16px 24px;
+      border-top: 1px solid var(--border);
+    }
+    .learn-section-hdr {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .learn-section-hdr h2 {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0;
+      color: var(--text);
+    }
+    .learn-section-hdr p.muted {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin: 0;
+      flex: 1;
+    }
+    .collapse-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .collapse-btn:hover { color: var(--text); border-color: var(--border-strong); }
+    .learn-section-body.collapsed { display: none; }
+
+    /* ── Chart grid + cards (mismo look que dashboard.html) ───────── */
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+    @media (max-width: 1100px) {
+      .chart-grid { grid-template-columns: 1fr; }
+    }
+    .chart-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      min-height: 300px;
+      display: flex;
+      flex-direction: column;
+    }
+    .chart-card.wide { grid-column: 1 / -1; }
+    .chart-card h3 {
+      font-size: 12px;
+      font-weight: 600;
+      margin: 0 0 12px 0;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .chart-card .chart-wrap {
+      position: relative;
+      width: 100%;
+      flex: 1;
+      min-height: 240px;
+    }
+    .chart-card canvas { max-height: 280px; }
+
+    /* Insufficient placeholder — sustituye al canvas cuando series.insufficient=true */
+    .insufficient {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 4px;
+      height: 240px;
+      color: var(--text-faint);
+      font-size: 12px;
+      font-style: italic;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+    }
+    .insufficient .ins-n {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-style: normal;
+      opacity: 0.8;
+    }
+
+    /* ── Ranker weights small-multiples ────────────────────────────── */
+    .small-multiples {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 1100px) { .small-multiples { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 700px)  { .small-multiples { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 420px)  { .small-multiples { grid-template-columns: 1fr; } }
+    .sm-cell {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      min-height: 110px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .sm-cell h4 {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-dim);
+      margin: 0;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sm-cell .sm-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 70px;
+    }
+    .sm-cell canvas { max-height: 90px; }
+    .sm-meta {
+      font-size: 9px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* ── Heatmap DOW × hour ─────────────────────────────────────────
+       Patrón calcado del status uptime heatmap pero en lugar de 7d×24h
+       de uptime, acá es 7 (días de semana) × 24 (horas del día) con
+       intensidad verde según número de queries en cada celda. */
+    .heatmap-dow-hour {
+      display: grid;
+      grid-template-columns: 60px repeat(24, 1fr);
+      gap: 2px;
+      font-variant-numeric: tabular-nums;
+    }
+    .heatmap-label {
+      font-size: 10px;
+      color: var(--text-faint);
+      text-align: right;
+      padding-right: 6px;
+      align-self: center;
+    }
+    .heatmap-cell {
+      aspect-ratio: 1;
+      min-height: 14px;
+      background: var(--sep);
+      border-radius: 2px;
+    }
+    .heatmap-cell[data-intensity="0"] { background: rgba(126, 231, 135, 0.06); }
+    .heatmap-cell[data-intensity="1"] { background: rgba(126, 231, 135, 0.20); }
+    .heatmap-cell[data-intensity="2"] { background: rgba(126, 231, 135, 0.40); }
+    .heatmap-cell[data-intensity="3"] { background: rgba(126, 231, 135, 0.65); }
+    .heatmap-cell[data-intensity="4"] { background: rgba(126, 231, 135, 0.85); }
+    :root[data-theme="light"] .heatmap-cell[data-intensity="0"] { background: rgba(47, 143, 61, 0.05); }
+    :root[data-theme="light"] .heatmap-cell[data-intensity="1"] { background: rgba(47, 143, 61, 0.25); }
+    :root[data-theme="light"] .heatmap-cell[data-intensity="2"] { background: rgba(47, 143, 61, 0.45); }
+    :root[data-theme="light"] .heatmap-cell[data-intensity="3"] { background: rgba(47, 143, 61, 0.70); }
+    :root[data-theme="light"] .heatmap-cell[data-intensity="4"] { background: rgba(47, 143, 61, 0.92); }
+    .heatmap-hours {
+      display: grid;
+      grid-template-columns: 60px repeat(24, 1fr);
+      gap: 2px;
+      margin-top: 4px;
+      font-size: 9px;
+      color: var(--text-faint);
+      text-align: center;
+    }
+    .heatmap-hours span { padding: 2px 0; }
+    .heatmap-hours .heatmap-spacer { background: transparent; }
+
+    /* ── Loading + skip-link ───────────────────────────────────────── */
+    .skip-link {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: var(--cyan);
+      color: var(--bg);
+      padding: 8px 14px;
+      border-radius: 0 0 8px 0;
+      font-weight: 700;
+      font-size: 13px;
+      text-decoration: none;
+      z-index: 9999;
+      transform: translateY(-110%);
+      transition: transform 120ms ease-out;
+    }
+    .skip-link:focus, .skip-link:focus-visible {
+      transform: translateY(0);
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    main:focus, main:focus-visible { outline: none; }
+
+    .loading {
+      text-align: center;
+      padding: 80px 0;
+      color: var(--text-dim);
+    }
+    .loading::after { content: "▍"; }
+    @media (prefers-reduced-motion: no-preference) {
+      .loading::after { animation: blink 1s steps(2) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+    }
+
+    .skeleton {
+      background: linear-gradient(90deg, var(--bg-card) 0%, var(--bg-elev) 50%, var(--bg-card) 100%);
+      background-size: 200% 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .skeleton { animation: shimmer 1.8s linear infinite; }
+      @keyframes shimmer {
+        0% { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+      }
+    }
+
+    /* ── Mobile tweaks ─────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      header.hdr { padding: 12px 16px; gap: 6px 10px; }
+      .hdr-l { font-size: 16px; }
+      .hdr-r { gap: 8px; font-size: 11px; }
+      .seg-btn { padding: 4px 8px; }
+      .kpi-hero { padding: 12px 16px; gap: 12px; }
+      .kpi-value { font-size: 24px; }
+      .learn-section { padding: 14px 16px; }
+      .chart-card { padding: 14px; }
+    }
+    @media (pointer: coarse), (max-width: 640px) {
+      .btn-icon, .seg-btn, .collapse-btn, .hdr-nav a {
+        min-height: 36px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a href="#content" class="skip-link">Saltar al contenido</a>
+
+  <header class="hdr">
+    <div class="hdr-l">
+      <a href="/" class="brand">rag</a>
+      <span class="sep">·</span>
+      <span class="title">learning</span>
+    </div>
+    <div class="hdr-r">
+      <span class="meta-period" id="meta-period"></span>
+      <span class="meta-period" id="meta-updated"></span>
+      <!-- Selector de ventana -->
+      <div class="seg" role="tablist" aria-label="Ventana de tiempo">
+        <button class="seg-btn" type="button" data-days="7" role="tab">7d</button>
+        <button class="seg-btn active" type="button" data-days="30" role="tab" aria-selected="true">30d</button>
+        <button class="seg-btn" type="button" data-days="90" role="tab">90d</button>
+        <button class="seg-btn" type="button" data-days="365" role="tab">1a</button>
+      </div>
+      <!-- Live toggle -->
+      <button id="live-toggle" class="btn-icon" type="button" data-state="off"
+              aria-pressed="false" aria-label="Pausar o reanudar actualizaciones en vivo">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="live-label">conectando…</span>
+      </button>
+      <!-- Theme toggle -->
+      <button id="theme-toggle" class="btn-icon" type="button"
+              aria-label="Alternar tema claro/oscuro">
+        <span id="theme-icon" aria-hidden="true"></span>
+      </button>
+      <!-- Nav links -->
+      <nav class="hdr-nav" aria-label="Navegación principal">
+        <a href="/dashboard">dashboard</a>
+        <a href="/status">status</a>
+        <a href="/transcripts">transcripts</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="content" tabindex="-1">
+    <!-- ── KPI HERO ─────────────────────────────────────────────── -->
+    <section class="kpi-hero" aria-label="Indicadores clave de aprendizaje">
+      <div class="kpi" id="kpi-eval-singles">
+        <span class="kpi-label">eval hit@5 (singles)</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-eval-chains">
+        <span class="kpi-label">eval hit@5 (chains)</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-feedback-total">
+        <span class="kpi-label">feedback total</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-behavior-per-query">
+        <span class="kpi-label">eventos / query</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-cache-hit">
+        <span class="kpi-label">cache hit rate</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-paraphrases">
+        <span class="kpi-label">paráfrasis aprendidas</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-entities">
+        <span class="kpi-label">entidades</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+      <div class="kpi" id="kpi-contradictions">
+        <span class="kpi-label">contradicciones resueltas</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-delta neutral">—</span>
+        <span class="kpi-badge">datos insuf.</span>
+      </div>
+    </section>
+
+    <!-- ── 1. RETRIEVAL QUALITY ─────────────────────────────────── -->
+    <section class="learn-section" id="sec-retrieval-quality" aria-labelledby="h-retrieval-quality">
+      <header class="learn-section-hdr">
+        <h2 id="h-retrieval-quality">Retrieval Quality</h2>
+        <p class="muted">hit@5, MRR, eval drift y latencia vs score</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-retrieval-quality" data-collapse="body-retrieval-quality">−</button>
+      </header>
+      <div class="learn-section-body" id="body-retrieval-quality">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="eval-over-time">
+            <h3>Eval over time (hit@5 + MRR)</h3>
+            <div class="chart-wrap"><canvas id="chart-eval-over-time" aria-label="Líneas: hit@5 y MRR para singles y chains a lo largo del tiempo"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="tune-deltas">
+            <h3>Tune deltas (% mejora vs baseline)</h3>
+            <div class="chart-wrap"><canvas id="chart-tune-deltas" aria-label="Barras: % de mejora por iteración de tune"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="latency-vs-score">
+            <h3>Latencia vs top score (cada query)</h3>
+            <div class="chart-wrap"><canvas id="chart-latency-vs-score" aria-label="Scatter: latencia de retrieval (s) vs top score por query"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 2. RANKER WEIGHTS ────────────────────────────────────── -->
+    <section class="learn-section" id="sec-ranker-weights" aria-labelledby="h-ranker-weights">
+      <header class="learn-section-hdr">
+        <h2 id="h-ranker-weights">Ranker Weights</h2>
+        <p class="muted">small-multiples — una mini-línea por weight, baseline punteada</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-ranker-weights" data-collapse="body-ranker-weights">−</button>
+      </header>
+      <div class="learn-section-body" id="body-ranker-weights">
+        <div class="chart-card wide" data-chart-card="ranker-weights">
+          <h3>Pesos del ranker en el tiempo (vs baseline)</h3>
+          <div id="ranker-weights-grid" class="small-multiples"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 3. SCORE CALIBRATION ─────────────────────────────────── -->
+    <section class="learn-section" id="sec-score-calibration" aria-labelledby="h-score-calibration">
+      <header class="learn-section-hdr">
+        <h2 id="h-score-calibration">Score Calibration</h2>
+        <p class="muted">curvas raw → calibrated por source (isotonic / spline)</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-score-calibration" data-collapse="body-score-calibration">−</button>
+      </header>
+      <div class="learn-section-body" id="body-score-calibration">
+        <div id="score-calibration-grid" class="chart-grid"></div>
+      </div>
+    </section>
+
+    <!-- ── 4. FEEDBACK EXPLÍCITO ────────────────────────────────── -->
+    <section class="learn-section" id="sec-feedback-explicit" aria-labelledby="h-feedback-explicit">
+      <header class="learn-section-hdr">
+        <h2 id="h-feedback-explicit">Feedback Explícito</h2>
+        <p class="muted">thumbs ↑/↓, paths correctivos, scope (answer vs retrieval)</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-explicit" data-collapse="body-feedback-explicit">−</button>
+      </header>
+      <div class="learn-section-body" id="body-feedback-explicit">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="thumbs-over-time">
+            <h3>Thumbs por día (positivo / negativo / correctivo)</h3>
+            <div class="chart-wrap"><canvas id="chart-thumbs-over-time"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="corrective-cumulative">
+            <h3>Paths correctivos (acumulado)</h3>
+            <div class="chart-wrap"><canvas id="chart-corrective-cumulative"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="feedback-by-scope">
+            <h3>Feedback por scope</h3>
+            <div class="chart-wrap"><canvas id="chart-feedback-by-scope"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 5. FEEDBACK IMPLÍCITO ────────────────────────────────── -->
+    <section class="learn-section" id="sec-feedback-implicit" aria-labelledby="h-feedback-implicit">
+      <header class="learn-section-hdr">
+        <h2 id="h-feedback-implicit">Feedback Implícito</h2>
+        <p class="muted">señales pasivas: requery, session outcome, paths correctivos</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-implicit" data-collapse="body-feedback-implicit">−</button>
+      </header>
+      <div class="learn-section-body" id="body-feedback-implicit">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="implicit-by-source">
+            <h3>Por fuente</h3>
+            <div class="chart-wrap"><canvas id="chart-implicit-by-source"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="implicit-rate-over-time">
+            <h3>Tasa de señal implícita por día</h3>
+            <div class="chart-wrap"><canvas id="chart-implicit-rate"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 6. BEHAVIOR ──────────────────────────────────────────── -->
+    <section class="learn-section" id="sec-behavior" aria-labelledby="h-behavior">
+      <header class="learn-section-hdr">
+        <h2 id="h-behavior">Behavior</h2>
+        <p class="muted">CTR por source, dwell, top paths, heatmap día×hora</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-behavior" data-collapse="body-behavior">−</button>
+      </header>
+      <div class="learn-section-body" id="body-behavior">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="ctr-by-source">
+            <h3>CTR por source en el tiempo</h3>
+            <div class="chart-wrap"><canvas id="chart-ctr-by-source"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="dwell-distribution">
+            <h3>Distribución de dwell time</h3>
+            <div class="chart-wrap"><canvas id="chart-dwell-distribution"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="top-paths">
+            <h3>Top paths (clicks · dwell promedio)</h3>
+            <div class="chart-wrap"><canvas id="chart-top-paths"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="heatmap-dow-hour">
+            <h3>Heatmap día de la semana × hora</h3>
+            <div id="heatmap-dow-hour" class="heatmap-dow-hour" role="img" aria-label="Heatmap de actividad por día de la semana y hora del día"></div>
+            <div id="heatmap-hours-axis" class="heatmap-hours" aria-hidden="true"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 7. QUERY LEARNING ────────────────────────────────────── -->
+    <section class="learn-section" id="sec-query-learning" aria-labelledby="h-query-learning">
+      <header class="learn-section-hdr">
+        <h2 id="h-query-learning">Query Learning</h2>
+        <p class="muted">paráfrasis aprendidas, top variantes, cache hit rate</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-query-learning" data-collapse="body-query-learning">−</button>
+      </header>
+      <div class="learn-section-body" id="body-query-learning">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="paraphrases-count">
+            <h3>Paráfrasis acumuladas por día</h3>
+            <div class="chart-wrap"><canvas id="chart-paraphrases-count"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="cache-hit-rate-time">
+            <h3>Cache hit rate por día</h3>
+            <div class="chart-wrap"><canvas id="chart-cache-hit-rate-time"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="top-paraphrases">
+            <h3>Top paráfrasis (hit count)</h3>
+            <div class="chart-wrap"><canvas id="chart-top-paraphrases"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 8. ANTICIPATORY ──────────────────────────────────────── -->
+    <section class="learn-section" id="sec-anticipatory" aria-labelledby="h-anticipatory">
+      <header class="learn-section-hdr">
+        <h2 id="h-anticipatory">Anticipatory</h2>
+        <p class="muted">candidatos por kind, selección/send, reacciones, weights</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-anticipatory" data-collapse="body-anticipatory">−</button>
+      </header>
+      <div class="learn-section-body" id="body-anticipatory">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="anti-candidates">
+            <h3>Candidatos por kind (apilado)</h3>
+            <div class="chart-wrap"><canvas id="chart-anti-candidates"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="anti-selection-send">
+            <h3>Tasa de selección y send</h3>
+            <div class="chart-wrap"><canvas id="chart-anti-selection-send"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="anti-reactions">
+            <h3>Reacciones del usuario</h3>
+            <div class="chart-wrap"><canvas id="chart-anti-reactions"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="anti-weights">
+            <h3>Weights actuales por kind</h3>
+            <div class="chart-wrap"><canvas id="chart-anti-weights"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 9. ROUTING LEARNING ──────────────────────────────────── -->
+    <section class="learn-section" id="sec-routing" aria-labelledby="h-routing">
+      <header class="learn-section-hdr">
+        <h2 id="h-routing">Routing Learning</h2>
+        <p class="muted">decisiones por bucket, reglas activas, ratio de evidencia</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-routing" data-collapse="body-routing">−</button>
+      </header>
+      <div class="learn-section-body" id="body-routing">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="routing-decisions">
+            <h3>Decisiones por bucket (apilado)</h3>
+            <div class="chart-wrap"><canvas id="chart-routing-decisions"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="routing-rules">
+            <h3>Reglas activas en el tiempo</h3>
+            <div class="chart-wrap"><canvas id="chart-routing-rules"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="routing-evidence">
+            <h3>Distribución del evidence ratio</h3>
+            <div class="chart-wrap"><canvas id="chart-routing-evidence"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 10. WHISPER LEARNING ─────────────────────────────────── -->
+    <section class="learn-section" id="sec-whisper" aria-labelledby="h-whisper">
+      <header class="learn-section-hdr">
+        <h2 id="h-whisper">Whisper Learning</h2>
+        <p class="muted">vocab por source, correcciones, avg logprob, top vocab</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-whisper" data-collapse="body-whisper">−</button>
+      </header>
+      <div class="learn-section-body" id="body-whisper">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="whisper-vocab-source">
+            <h3>Vocab size por source (snapshot)</h3>
+            <div class="chart-wrap"><canvas id="chart-whisper-vocab-source"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="whisper-corrections">
+            <h3>Correcciones por source en el tiempo</h3>
+            <div class="chart-wrap"><canvas id="chart-whisper-corrections"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="whisper-logprob">
+            <h3>Avg logprob por día</h3>
+            <div class="chart-wrap"><canvas id="chart-whisper-logprob"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="whisper-top-vocab">
+            <h3>Top vocab (peso)</h3>
+            <div class="chart-wrap"><canvas id="chart-whisper-top-vocab"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 11. VAULT INTELLIGENCE ───────────────────────────────── -->
+    <section class="learn-section" id="sec-vault" aria-labelledby="h-vault">
+      <header class="learn-section-hdr">
+        <h2 id="h-vault">Vault Intelligence</h2>
+        <p class="muted">entidades, mentions, contradicciones, filing, surface vs archive</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-vault" data-collapse="body-vault">−</button>
+      </header>
+      <div class="learn-section-body" id="body-vault">
+        <div class="chart-grid">
+          <div class="chart-card" data-chart-card="vault-entities-type">
+            <h3>Entidades por tipo en el tiempo</h3>
+            <div class="chart-wrap"><canvas id="chart-vault-entities-type"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="vault-mentions">
+            <h3>Mentions por día</h3>
+            <div class="chart-wrap"><canvas id="chart-vault-mentions"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="vault-contradictions">
+            <h3>Contradicciones por semana (detectadas / resueltas)</h3>
+            <div class="chart-wrap"><canvas id="chart-vault-contradictions"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="vault-filing">
+            <h3>Filing por carpeta (apilado)</h3>
+            <div class="chart-wrap"><canvas id="chart-vault-filing"></canvas></div>
+          </div>
+          <div class="chart-card wide" data-chart-card="vault-surface-archive">
+            <h3>Surface vs Archive en el tiempo</h3>
+            <div class="chart-wrap"><canvas id="chart-vault-surface-archive"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Persistent SR-only live region — sobrevive al re-render de las
+       secciones (mismo patrón que dashboard.html). -->
+  <span id="learning-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de aprendizaje</span>
+
+  <script src="/static/learning.js" defer></script>
+</body>
+</html>

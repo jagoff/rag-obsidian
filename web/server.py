@@ -12666,6 +12666,122 @@ def _stream_payload(kind: str, ev: dict) -> dict:
     return ev
 
 
+# ── /dashboard/learning ─────────────────────────────────────────────────
+# Dashboard secundario, focalizado en el LOOP de aprendizaje del RAG: cómo
+# evoluciona el ranker, cuánto feedback (explícito + implícito) entra,
+# qué tan bien funciona la cache, qué entities/contradictions emergen, etc.
+# El endpoint principal `/api/dashboard` cubre métricas operativas (latencia,
+# top topics, cmd breakdown). Este otro responde la pregunta "el sistema
+# está aprendiendo o estancado?".
+#
+# Cache TTL: 60s (vs 30s del operativo) — los datos del learning loop
+# cambian más lento (eval runs son nightly, tune runs son nightly, weights
+# se reescriben 1/día). Sirve directo desde RAM si hay hit warm.
+
+_LEARNING_CACHE: dict[int, tuple[float, dict]] = {}
+_LEARNING_TTL = 60.0
+
+
+@app.get("/dashboard/learning")
+def learning_page() -> FileResponse:
+    """HTML estático del learning dashboard. El contenido se hidrata vía
+    `/api/dashboard/learning` (initial load) + `/api/dashboard/learning/stream`
+    (SSE, snapshot completo cada 30s)."""
+    return FileResponse(STATIC_DIR / "learning.html")
+
+
+@app.get("/api/dashboard/learning")
+def learning_api(days: int = 30) -> dict:
+    """Snapshot completo de las 11 secciones + KPIs hero. Cada sección es
+    independiente — un SQL error en una NO contamina las otras (las
+    funciones de `web.learning_queries` envuelven sus reads con
+    `_sql_read_with_retry` y devuelven shape vacío en error)."""
+    now_ts = time.time()
+    hit = _LEARNING_CACHE.get(days)
+    if hit and now_ts - hit[0] < _LEARNING_TTL:
+        return hit[1]
+    # Lazy import: módulo nuevo, no queremos cargarlo al import-time del
+    # servidor si nadie pide /dashboard/learning. Después del primer hit
+    # queda cacheado por el import system; las llamadas subsiguientes son
+    # gratis.
+    from web.learning_queries import (
+        anticipatory,
+        behavior,
+        feedback_explicit,
+        feedback_implicit,
+        kpis,
+        query_learning,
+        ranker_weights,
+        retrieval_quality,
+        routing_learning,
+        score_calibration,
+        vault_intelligence,
+        whisper_learning,
+    )
+    payload = {
+        "meta": {
+            "window_days": days,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "kpis": kpis(days),
+        "sections": {
+            "retrieval_quality": retrieval_quality(days),
+            "ranker_weights": ranker_weights(days),
+            "score_calibration": score_calibration(),
+            "feedback_explicit": feedback_explicit(days),
+            "feedback_implicit": feedback_implicit(days),
+            "behavior": behavior(days),
+            "query_learning": query_learning(days),
+            "anticipatory": anticipatory(days),
+            "routing_learning": routing_learning(days),
+            "whisper_learning": whisper_learning(days),
+            "vault_intelligence": vault_intelligence(days),
+        },
+    }
+    _LEARNING_CACHE[days] = (now_ts, payload)
+    return payload
+
+
+@app.get("/api/dashboard/learning/stream")
+async def learning_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
+    """SSE: cada 30s emite un snapshot completo del payload de
+    /api/dashboard/learning. Heartbeat con comentario `: keep-alive` cada
+    15s entre snapshots para que proxies/CDNs no maten la conexión por
+    inactividad. El cliente reconecta automáticamente con EventSource si
+    se cae."""
+    async def gen():
+        last_snapshot_ts = 0.0
+        try:
+            # Snapshot inicial inmediato — el cliente no espera 30s para
+            # ver datos. Los siguientes ya respetan el intervalo.
+            payload = learning_api(days=30)
+            yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            last_snapshot_ts = time.time()
+            while True:
+                if request is not None and await request.is_disconnected():
+                    break
+                now = time.time()
+                if now - last_snapshot_ts >= 30:
+                    payload = learning_api(days=30)
+                    yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    last_snapshot_ts = now
+                else:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ── RAG-system memory sampler ──────────────────────────────────────────
 # Tracks RSS of processes that are part of the rag stack we built:
 #   rag        — obsidian-rag python (watch, morning, today, digest, web,

@@ -9647,6 +9647,7 @@ def transcripts_dashboard(nofresh: int = 0) -> HTMLResponse:
     <a href="/dashboard">dashboard</a>
     <a href="/status">status</a>
     <a href="/transcripts" class="active">transcripts</a>
+    <a href="/agents/">agents</a>
   </nav>
   <h1>whisper transcripts <a href="/transcripts" class="refresh-btn" title="recargar ahora">↻</a></h1>
   <p class="meta">phase 2 learning loop · vocab refresh: {_esc(last_refresh_str)}{" · auto-refresh OFF" if nofresh else ""}</p>

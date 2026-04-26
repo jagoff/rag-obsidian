@@ -140,11 +140,24 @@ from rag import (  # noqa: E402
     multi_retrieve,
     new_turn_id,
     record_feedback,
+    reformulate_query,
     resolve_chat_model,
     resolve_vault_paths,
     save_session,
     session_history,
+    TOPIC_SHIFT_COSINE,
 )
+
+# Cosine band for the borderline reform-LLM gate. The lower bound matches
+# `TOPIC_SHIFT_COSINE` (0.40) — anything below already gets `history = []`
+# from `detect_topic_shift`, so the borderline case is "history kept but
+# cosine ≤ this upper bound". 0.7 chosen as the empirical threshold above
+# which user follow-ups are paraphrases / self-contained restatements
+# rather than elliptical references — measured 2026-04-26 on the chains
+# golden set: 0.585 ("listame los gastos en pesos" after "Cuanto devo a
+# la visa?") needed reform; 0.887 ("listame los gastos en pesos de la
+# visa") was already self-contained. 0.7 splits the two.
+REFORM_COSINE_HIGH = 0.70
 
 from web.conversation_writer import write_turn, TurnData  # noqa: E402
 from web.tools import (  # noqa: E402
@@ -187,11 +200,26 @@ _PLANNING_PAT = (
 _TOOL_INTENT_RULES: tuple[tuple[str, dict, str], ...] = (
     ("finance_summary", {}, r"gast[oéó]s?|gast[aá][mn]os|gastar|presupuesto|plata|finanz|moze"),
     # Tarjetas: keywords inequívocos del dominio "resumen de tarjeta de
-    # crédito" → fuerza credit_cards_summary. Diseñado conservadoramente
-    # para no chocar con "tiempo" (clima) o "gasto" (MOZE) — esos viven
-    # en sus tools propias. "saldo" solo, sin "pagar"/"tarjeta", se
-    # excluye porque puede referir a saldo de cuenta/billetera.
-    ("credit_cards_summary", {}, r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta|cu[aá]nto.*deb[oe]"),
+    # crédito" → fuerza credit_cards_summary.
+    #
+    # Triggers (en orden de especificidad):
+    #   1. tarjeta(s) | visa | master(card) | amex | crédito           — marca
+    #   2. saldo a pagar | fecha de cierre | fecha de vencimiento      — ciclo
+    #   3. resumen de tarjeta | cuánto debo                            — directo
+    #   4. último/reciente + gasto/consumo/movimiento/compra/cargo     — recientes
+    #   5. consumo/movimiento/cargo + de/del/en/con/mi                 — fraseo
+    #
+    # 2026-04-26: ampliado tras user report — el LLM alucinaba "Helado en
+    # Manalu $15K" cuando la query era "cuál fue mi último gasto" (sin
+    # "tarjeta" explícito) porque solo finance_summary disparaba (MOZE).
+    # Triggers 4+5 disparan AMBOS tools (finance_summary + credit_cards_
+    # summary): el LLM ve los dos contextos y prioriza el más específico
+    # via REGLA 1.b del system prompt (datos transaccionales: cita literal,
+    # no inventes).
+    #
+    # No matchean por diseño: "saldo" solo (puede ser cuenta/billetera),
+    # "tiempo" (clima), "gasto" solo sin marca (MOZE genérico).
+    ("credit_cards_summary", {}, r"\btarjet|\bvisa\b|\bmaster(?:card)?\b|\bamex\b|\bcr[eé]dito\b|saldo.*paga|fecha.*cierre|fecha.*vencim|resumen.*tarjeta|cu[aá]nto.*deb[oe]|\b(?:[uú]ltim[oa]s?|recientes?)\s+(?:gastos?|consumos?|movimientos?|compras?|cargos?|transac)\b|\b(?:consumos?|movimientos?|cargos?)\s+(?:de|del|en|con|mi)"),
     # NOTE: "recordame" / "agendáme" used to be here as query triggers, but
     # they're CREATE intents now (propose_reminder / propose_calendar_event).
     # Moved to `_PROPOSE_INTENT_RE` below. `recordator` still matches
@@ -1553,7 +1581,7 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
 # incluir portugués e italiano explícitamente (contagion bajo fast-path
 # WA con contactos brasileros).
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.b — DATOS TRANSACCIONALES (excepción a REGLA 1): cuando la pregunta pide datos numéricos/identificativos específicos — montos, fechas exactas, comercios, categorías, items de transacción (gastos, tarjetas, mails, eventos, recordatorios, movimientos, consumos) — NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo una sección de tool fresca: ### Gastos, ### Tarjetas, ### Mails, ### Calendario, ### Reminders, ### Clima, ### WhatsApp, ### Google Drive. Si esa sección NO está, o está pero vacía/sin el dato pedido, respondé textualmente: "No tengo data fresca de [X] — el último export del banco/cuenta puede no estar al día." y CORTÁ ahí. PROHIBIDO en este caso: extraer "últimos consumos" de un Gmail digest viejo, citar montos de un FinOps report, mezclar gastos cargados manualmente en MOZE con consumos de tarjeta del banco. Si hay AMBAS secciones (### Gastos de MOZE + ### Tarjetas del banco) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas; si no menciona, usá la que tenga el dato pedido.\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -4749,6 +4777,46 @@ _FOLLOWUP_CUES = re.compile(
     re.IGNORECASE,
 )
 
+# Extended follow-up patterns added 2026-04-26 to close the recall gap on
+# elliptical follow-ups that don't have explicit pronoun cues. Three buckets:
+#
+# (a) Leading "y + article/wh-word": "y el icbc", "y la retrospectiva del
+#     barco", "y qué pendientes tengo del sistema RAG", "y cómo las indexás",
+#     "y las versiones de la herrumbre". The base regex already catches
+#     "y + de/sobre/con/para/en" but missed these continuations because
+#     "el/la/los/las/qué/cómo" are way too common as leading articles in
+#     standalone questions ("la nota que dice X"). We anchor with `^` so
+#     ONLY question-initial "y + token" fires — confirmed safe on the
+#     queries.yaml golden set (no false positives in standalone questions).
+#
+# (b) Leading verb + definite article + noun: imperative shorthand like
+#     "listame los gastos", "mostrame las cuentas", "detallame los pagos".
+#     The user pattern is "I just asked about X, now elaborate without
+#     re-naming X". Reproduced 2026-04-26 from session web:cee69e81829c:
+#     after "Cuanto devo a la visa?" the user asked "listame los gastos
+#     en pesos" expecting Visa context — got MOZE chunks because
+#     `_looks_like_followup` returned False and the retriever searched
+#     the raw question.
+#
+# (c) "tengo algún" / "qué <noun> tengo|usé|tenía": cross-source follow-ups
+#     from queries.yaml `rag-pendientes-cross` / `rag-workshops-cross` chains
+#     ("tengo algún workshop agendado sobre RAG" after "obsidian-rag
+#     pipelines"). The continuation references the prior turn's entity
+#     implicitly via "tengo".
+_FOLLOWUP_CUES_EXT_LEADING_Y = re.compile(
+    r"^y\s+(el|la|los|las|qué|que|cómo|como|cu[áa]l|otra|otro|otras|otros)\b",
+    re.IGNORECASE,
+)
+_FOLLOWUP_CUES_EXT_LEADING_VERB_DEFART = re.compile(
+    r"^(listame|dame|mostrame|contame|explicame|detallame|decime|enumerame|"
+    r"resume|resumi|resumí)\s+(el|la|los|las)\s+\w+",
+    re.IGNORECASE,
+)
+_FOLLOWUP_CUES_EXT_TENGO_ALGUN = re.compile(
+    r"^tengo\s+alg[uú]n\b|^qu[ée]\s+\w+\s+(tengo|us[oé]|tenía|tuve)\b",
+    re.IGNORECASE,
+)
+
 # Leading-pronoun pattern: question starts with a pronoun/demonstrative that
 # requires prior context to resolve. Only checked at position 0 (after strip).
 _LEADING_PRONOUN_RE = re.compile(
@@ -4767,18 +4835,33 @@ _SHORT_INTERROGATIVE_RE = re.compile(
 
 
 def _looks_like_followup(q: str) -> bool:
-    """Heuristic: should we pay the reformulate_query LLM call (~1s)?
+    """Heuristic: is this question elliptical / context-dependent?
 
-    Fires when the question is contextually incomplete and needs prior-turn
-    resolution. Three cases:
+    When True, the chat handler concatenates the prior user turn into the
+    retrieve query (`{last_user_q} {q}`) — cheap (0ms), empirically
+    anchors retrieval to the right entity (~+0.20 rerank).
+    Concretely fires when the question matches any of:
+
       (a) ≤2 words — genuine ellipsis: "y eso?", "más?", "cuál?"
       (b) Starts with a pronoun/demonstrative: "eso que dijiste", "ella cómo?"
       (c) ≤5-word question starting with an interrogative word (incomplete
           subject implied by context): "qué hay de eso?"
+      (d) Anaphora cue anywhere: pronoun, "y de/sobre/...", "profundizá",
+          "más sobre", "amplía", etc. (see `_FOLLOWUP_CUES`).
+      (e) Question-initial "y + article/wh-word": "y el icbc", "y la
+          retrospectiva", "y qué pendientes tengo", "y cómo las indexás".
+          Anchored to ^ so only follow-up continuations match — standalone
+          questions starting with mid-sentence "y" don't fire.
+      (f) Imperative + definite article + noun: "listame los gastos",
+          "mostrame las cuentas", "detallame los pagos". The user pattern
+          is "I asked about X, now elaborate without re-naming X".
+      (g) "tengo algún X" / "qué <noun> tengo|usé|tenía": implicit cross-
+          turn entity reference via possessive "tengo".
 
-    Long standalone questions (≥4 words without leading cues) skip the call —
-    the original query is already a good search target. Avoids paying 0.6-2s
-    reformulate on "resumime los sprints", "qué dice la nota sobre Grecia", etc.
+    Long standalone questions (≥4 words without leading cues) skip the
+    concat — the original query is already a good search target. Borderline
+    turns (history exists, no regex match, cosine 0.4-0.7) get a separate
+    `reformulate_query` LLM rewrite — the hybrid path is in `chat()`.
     """
     if not q:
         return False
@@ -4794,7 +4877,18 @@ def _looks_like_followup(q: str) -> bool:
     if len(words) <= 5 and _SHORT_INTERROGATIVE_RE.match(stripped):
         return True
     # (d) explicit anaphora cue anywhere in the question
-    return bool(_FOLLOWUP_CUES.search(q))
+    if _FOLLOWUP_CUES.search(q):
+        return True
+    # (e) leading "y + article/wh"
+    if _FOLLOWUP_CUES_EXT_LEADING_Y.match(stripped):
+        return True
+    # (f) leading verb + definite article + noun
+    if _FOLLOWUP_CUES_EXT_LEADING_VERB_DEFART.match(stripped):
+        return True
+    # (g) "tengo algún X" / "qué X tengo"
+    if _FOLLOWUP_CUES_EXT_TENGO_ALGUN.match(stripped):
+        return True
+    return False
 
 
 # Pronouns / demonstratives that, if still present after reformulation,
@@ -8279,25 +8373,92 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         yield _sse("status", _retrieving_status)
 
         _t_reform_start = time.perf_counter()
-        # Follow-up resolution: antes llamábamos a reformulate_query (qwen2.5:3b,
-        # ~1-2s de LLM call + re-eviction pressure sobre qwen2.5:7b). El comment
-        # original admite que el fallback (concat "{last_user_q} {current_q}")
-        # empíricamente lograba mismo rerank score con recall igual o mejor
-        # (~+0.20 score al anclar con la entidad del turno previo). Saltamos
-        # reform directo al concat: 2s → 0ms, y qwen2.5:3b ya no se carga en
-        # el path de /chat, aliviando VRAM pressure sobre el 7b pinned.
+        # Hybrid follow-up resolution (2026-04-26 rework). Earlier versions
+        # of this code path skipped reformulate_query entirely in favour of
+        # a free concat of the prior user turn — the comment claimed
+        # "concat empíricamente lograba mismo rerank score con recall igual
+        # o mejor". Re-running the queries.yaml chains golden eval against
+        # 4 variants (base / always-concat / extended-regex / reform LLM)
+        # showed the assumption was false: chain_success was 41.7% on the
+        # web path vs 58.3% on the CLI eval path that uses reform-LLM. The
+        # gap was concentrated on elliptical follow-ups whose regex didn't
+        # fire (e.g. "listame los gastos en pesos" after "Cuanto devo a la
+        # visa?" — reproduced from session web:cee69e81829c on 2026-04-26).
+        #
+        # Hybrid strategy:
+        #   (a) `_looks_like_followup` matches → concat last user turn with
+        #       current question. Cheap (0ms), captures the obvious cases
+        #       (pronouns, ellipsis, "y + article"). Empirically gains
+        #       ~+8pp chain_success vs raw.
+        #   (b) Topic-shift gate dropped history (cosine < 0.4) → use raw.
+        #       History was already cleared because the user moved on.
+        #   (c) History exists, regex didn't fire, cosine in [0.4, 0.7) →
+        #       borderline. Run `reformulate_query` (qwen2.5:3b helper,
+        #       ~1-2s) for explicit pronoun resolution + entity anchoring.
+        #       This is the band where concat is too noisy and raw misses
+        #       the prior topic — e.g. "y cómo las indexás" needs "las" →
+        #       "embeddings" rewrite that the regex can't do.
+        #   (d) High cosine (≥ 0.7) without regex match → paraphrase or
+        #       self-contained rephrase, raw query is fine.
+        #
+        # The `_topic_shifted` block below this one (build_person_context +
+        # detect_topic_shift) used to live AFTER this section. It moved up
+        # so we can read the cosine value here for the (c) gate.
+        # `_helper_idle_unload_qwen3b` is a separate idle-sweeper; this
+        # call respects whatever VRAM budget the caller already
+        # configured.
+        from rag import build_person_context as _build_person_ctx_early
+        from rag import detect_topic_shift as _detect_topic_shift_early
+        _person_ctx = _build_person_ctx_early(question)
+        _person_block = f"{_person_ctx}\n\n---\n\n" if _person_ctx else ""
+        _topic_shifted = False
+        _topic_shift_reason = "no-history"
+        _topic_shift_cosine: float | None = None
+        if history:
+            _topic_shifted, _topic_shift_reason, _topic_shift_cosine = (
+                _detect_topic_shift_early(
+                    question, history, person_fired=bool(_person_ctx),
+                )
+            )
+            if _topic_shifted:
+                history = []
+
         search_question = question
         _reform_fired = False
         _reform_used_concat = False
-        if history and _looks_like_followup(question):
-            _reform_fired = True
-            last_user_q = next(
-                (m["content"] for m in reversed(history) if m.get("role") == "user"),
-                None,
-            )
-            if last_user_q:
+        _reform_used_llm = False
+        last_user_q = next(
+            (m["content"] for m in reversed(history) if m.get("role") == "user"),
+            None,
+        ) if history else None
+        if history and last_user_q:
+            if _looks_like_followup(question):
+                # (a) Regex match → concat (cheap, 0ms).
                 search_question = f"{last_user_q} {question}"
+                _reform_fired = True
                 _reform_used_concat = True
+            elif (
+                _topic_shift_cosine is not None
+                and TOPIC_SHIFT_COSINE <= _topic_shift_cosine < REFORM_COSINE_HIGH
+            ):
+                # (c) Borderline cosine band → reform LLM.
+                try:
+                    search_question = reformulate_query(question, history)
+                    _reform_fired = True
+                    _reform_used_llm = True
+                except Exception as _exc:
+                    # Fail-safe: fall back to concat (better than raw, +8pp
+                    # chain_success vs raw per the eval). Log for ops.
+                    print(
+                        f"[reform] LLM call failed, falling back to concat: "
+                        f"{type(_exc).__name__}: {_exc}",
+                        flush=True,
+                    )
+                    search_question = f"{last_user_q} {question}"
+                    _reform_fired = True
+                    _reform_used_concat = True
+            # else (d): high cosine ≥ 0.7 or cosine=None (anaphoric/short/
+            # person already handled above) → raw query is fine.
         _t_reform_end = time.perf_counter()
 
         try:

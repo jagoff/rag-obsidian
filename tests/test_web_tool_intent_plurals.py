@@ -91,8 +91,12 @@ _PLURAL_CASES: list[tuple[str, str]] = [
     ("temperatura para hoy", "weather"),
 
     # credit_cards_summary — tarjetas de crédito. Disparado por `tarjet*`,
-    # marcas (Visa/Master/Amex), "saldo a pagar", "fecha de cierre/vencim",
-    # "resumen de tarjeta", "cuánto debo".
+    # marcas (Visa/Master/Amex/crédito), "saldo a pagar", "fecha de cierre/
+    # vencim", "resumen de tarjeta", "cuánto debo", + (post-2026-04-26)
+    # "último/reciente + gasto/consumo/movimiento/compra/cargo" y
+    # "consumos/movimientos/cargos + de/del/en/con/mi" — agregados tras
+    # user report donde "cuál fue mi último gasto" disparaba SOLO
+    # finance_summary (MOZE) y el LLM alucinaba "Helado en Manalu $15K".
     ("cuánto tengo que pagar de la tarjeta?", "credit_cards_summary"),
     ("cuáles son mis tarjetas?", "credit_cards_summary"),
     ("saldo a pagar de la Visa", "credit_cards_summary"),
@@ -102,6 +106,19 @@ _PLURAL_CASES: list[tuple[str, str]] = [
     ("resumen de tarjeta de Visa", "credit_cards_summary"),
     ("cuándo vence mi Visa?", "credit_cards_summary"),
     ("mi resumen de Master", "credit_cards_summary"),
+    # post-2026-04-26 — fix del user report
+    ("cuál fue mi último gasto", "credit_cards_summary"),
+    ("cuál fue mi último consumo", "credit_cards_summary"),
+    ("últimos movimientos", "credit_cards_summary"),
+    ("últimas compras", "credit_cards_summary"),
+    ("últimos cargos del mes", "credit_cards_summary"),
+    ("recientes consumos", "credit_cards_summary"),
+    ("movimientos de la tarjeta", "credit_cards_summary"),
+    ("consumos del mes", "credit_cards_summary"),
+    ("cargos en la visa", "credit_cards_summary"),
+    # Crédito como sinónimo de tarjeta de crédito
+    ("mi crédito", "credit_cards_summary"),
+    ("estado de mi crédito", "credit_cards_summary"),
 ]
 
 

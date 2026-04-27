@@ -1828,15 +1828,25 @@ def _warmup() -> None:
 
 @app.get("/")
 def home_page() -> FileResponse:
+    """Home dashboard (mission-control terminal aesthetic). Servido por
+    `home.v2.html` desde 2026-04-27 después del refactor + 4 commits de
+    iteración (cross-source correlator, prompt enriquecido, voice
+    normalizer, tier visual hierarchy). Usa `/api/home` como backend.
+    """
+    return FileResponse(STATIC_DIR / "home.v2.html")
+
+
+# Legacy ruta del home v1 — accesible en `/v1` durante la transición.
+# Si rompe algo en producción podemos volver al viejo apuntando `/` a
+# `home.html` con un revert del swap. Borrar esta ruta en el commit
+# siguiente confirmando que `/` v2 funciona en producción ~1 semana.
+@app.get("/v1")
+def home_v1_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "home.html")
 
 
-# Preview ruta del refactor de home (mission-control terminal). Servida
-# en `/v2` mientras iteramos visualmente. Cuando esté listo y validado,
-# `home.v2.html` reemplaza a `home.html` (con backup) y esta ruta se
-# elimina. Usa los mismos endpoints `/api/home` así que no hay backend
-# nuevo. Ver `00-Inbox/RAG - Flujo WhatsApp - auditoría` del vault para
-# el contexto que originó este refactor.
+# `/v2` mantenido como alias de `/` para no romper bookmarks o links
+# externos que apuntan a la URL preview durante la fase de iteración.
 @app.get("/v2")
 def home_v2_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "home.v2.html")
@@ -7720,6 +7730,11 @@ def _home_compute(
 
     narrative = "" if today_total == 0 else (_today_cached_narrative(date_label) or "")
     narrative_source = "cached" if narrative else "none"
+    # Default correlations: el path de cache (no-regenerate) NO corre el
+    # correlator por costo. Si la UI quiere pintar el panel "🔗 Patrones
+    # del día", solo aparece después de un regenerate. Es OK — los
+    # patrones ya quedan visibles en el narrative del brief cacheado.
+    today_correlations: dict | None = None
     # Only call the LLM when the caller explicitly asks. Default path stays
     # fast — if no cached brief exists yet, the UI shows "pendiente" and
     # offers a button that re-hits with regenerate=true.
@@ -7799,10 +7814,11 @@ def _home_compute(
         # que generaba antes. Costo: <100ms (regex + dict ops, no IO).
         from rag.today_correlator import correlate_today_signals as _corr
         try:
-            extras["correlations"] = _corr(today_ev, extras)
+            today_correlations = _corr(today_ev, extras)
         except Exception as exc:  # noqa: BLE001
             print(f"[today-correlator] failed: {exc}", file=sys.stderr)
-            extras["correlations"] = {"people": [], "topics": []}
+            today_correlations = {"people": [], "topics": [], "time_overlaps": []}
+        extras["correlations"] = today_correlations
         prompt = _render_today_prompt(date_label, today_ev, extras=extras)
         narrative = _generate_today_narrative(prompt)
         narrative_source = "generated" if narrative else "error"
@@ -7835,6 +7851,10 @@ def _home_compute(
                 "total": today_total,
             },
             "evidence": today_ev,
+            # Cross-source matches pre-armados (people + topics + time
+            # overlaps). Solo populated cuando regenerate=true; en el
+            # cache path queda None y el frontend oculta el panel.
+            "correlations": today_correlations,
         },
         "urgent": urgent,
         "signals": signals,

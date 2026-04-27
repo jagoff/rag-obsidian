@@ -570,20 +570,110 @@
     }
   });
 
-  // Refresh manual del brief (regenerate=true → LLM corre síncrono ~10-15s)
+  // Refresh manual del brief (regenerate=true → LLM corre síncrono ~30-45s
+  // con qwen2.5:7b warm). Durante el wait mostramos un progress bar ASCII
+  // que avanza en steps fijos cada 3s. NO es real — el endpoint no expone
+  // SSE de progreso; es una indicación visual de "todavía vivo".
   document.addEventListener("DOMContentLoaded", () => {
     const refreshBtn = document.getElementById("brief-refresh");
     if (!refreshBtn) return;
+    const progressEl = document.getElementById("hero-progress");
+    const progressBar = document.getElementById("progress-bar");
+    const progressLabel = document.getElementById("progress-label");
+    let progressTimer = null;
+
+    function startProgress() {
+      if (!progressEl || !progressBar) return;
+      progressEl.hidden = false;
+      const totalBlocks = 20;
+      let pct = 0;
+      const labels = [
+        "leyendo señales del vault…",
+        "consultando gmail / wa / calendar…",
+        "armando entidades cross-source…",
+        "esperando al LLM…",
+        "qwen2.5:7b escribiendo…",
+        "post-procesando voz…",
+      ];
+      let labelIdx = 0;
+      progressBar.textContent =
+        `[${"░".repeat(totalBlocks)}] 0%`;
+      progressLabel.textContent = labels[0];
+      progressTimer = setInterval(() => {
+        pct = Math.min(95, pct + 3);
+        const filled = Math.round((pct / 100) * totalBlocks);
+        const bar = "█".repeat(filled) + "░".repeat(totalBlocks - filled);
+        progressBar.textContent = `[${bar}] ${pct}%`;
+        if (pct % 15 === 0) {
+          labelIdx = Math.min(labels.length - 1, labelIdx + 1);
+          progressLabel.textContent = labels[labelIdx];
+        }
+      }, 1500);
+    }
+
+    function stopProgress() {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = null;
+      }
+      if (progressEl) progressEl.hidden = true;
+    }
+
     refreshBtn.addEventListener("click", async () => {
       refreshBtn.disabled = true;
       refreshBtn.textContent = "↻";
+      startProgress();
       try {
         await load({ regenerate: true });
       } finally {
         refreshBtn.disabled = false;
+        stopProgress();
       }
     });
   });
+
+  // Hero collapse toggle (Item A): click on the ▼/▶ button toggles
+  // `data-collapsed` on the .today-hero and updates aria-expanded.
+  document.addEventListener("DOMContentLoaded", () => {
+    const heroToggle = document.getElementById("hero-toggle");
+    if (!heroToggle) return;
+    const hero = heroToggle.closest(".today-hero");
+    if (!hero) return;
+    heroToggle.addEventListener("click", () => {
+      const collapsed = hero.getAttribute("data-collapsed") === "true";
+      hero.setAttribute("data-collapsed", collapsed ? "false" : "true");
+      heroToggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+    });
+  });
+
+  // Section collapse toggles (Item F): each .section-toggle button
+  // toggles its parent .section's `data-collapsed`. On mobile we
+  // start with Monitoring + Ambiente collapsed by default to reduce
+  // initial scroll; user expands them with tap. Hero + Accionable
+  // stay expanded.
+  function initCollapsibleSections() {
+    const isMobile = window.matchMedia("(max-width: 720px)").matches;
+    document.querySelectorAll(".section-toggle").forEach((btn) => {
+      const section = btn.closest(".section");
+      if (!section) return;
+      // Default-collapse Monitoring + Ambiente on mobile boot
+      if (isMobile && (
+        section.classList.contains("section-monitoring") ||
+        section.classList.contains("section-ambient")
+      )) {
+        section.setAttribute("data-collapsed", "true");
+        btn.setAttribute("aria-expanded", "false");
+      }
+      btn.addEventListener("click", (e) => {
+        // Permitir click en el toggle button sin scroll
+        e.preventDefault();
+        const collapsed = section.getAttribute("data-collapsed") === "true";
+        section.setAttribute("data-collapsed", collapsed ? "false" : "true");
+        btn.setAttribute("aria-expanded", collapsed ? "true" : "false");
+      });
+    });
+  }
+  document.addEventListener("DOMContentLoaded", initCollapsibleSections);
 
   function renderFinance(payload) {
     const fin = payload.signals?.finance;
@@ -937,10 +1027,75 @@
     }
   }
 
+  // Item B: Patrones del día — render del panel cross-source dedicado.
+  // Lee `payload.today.correlations` (poblado por el correlator del web
+  // cuando regenerate=true). Si NO hay people ni topics, oculta el panel
+  // entero. Si hay, renderea cada item con su nombre + sources separados.
+  function renderPatterns(payload) {
+    const panel = document.getElementById("p-patterns");
+    if (!panel) return;
+    const correlations = payload.today?.correlations
+      || payload.signals?.correlations
+      || null;
+    if (!correlations) {
+      panel.hidden = true;
+      return;
+    }
+    const people = correlations.people || [];
+    const topics = correlations.topics || [];
+    const overlaps = correlations.time_overlaps || [];
+    const total = people.length + topics.length + overlaps.length;
+    if (total === 0) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    const body = panel.querySelector("[data-body]");
+    const count = panel.querySelector("[data-count]");
+    count.textContent = String(total);
+    const rows = [];
+    for (const p of people.slice(0, 5)) {
+      const sources = (p.appearances || [])
+        .map((a) => a.source)
+        .filter((v, i, arr) => arr.indexOf(v) === i)
+        .join(" + ");
+      rows.push(`
+        <div class="pattern-row">
+          <div>
+            <span class="pattern-name">👤 ${escapeHTML(p.name)}</span>
+            <span class="pattern-sources"> · ${escapeHTML(sources)} (${p.sources_count})</span>
+          </div>
+        </div>`);
+    }
+    for (const t of topics.slice(0, 5)) {
+      rows.push(`
+        <div class="pattern-row">
+          <div>
+            <span class="pattern-name">💡 ${escapeHTML(t.topic)}</span>
+            <span class="pattern-sources"> · ${escapeHTML(t.sources.join(" + "))}</span>
+          </div>
+        </div>`);
+    }
+    for (const o of overlaps.slice(0, 3)) {
+      const labels = (o.items || [])
+        .map((it) => `${it.source}: "${(it.label || "").slice(0, 40)}"`)
+        .join(" ↔ ");
+      rows.push(`
+        <div class="pattern-row">
+          <div>
+            <span class="pattern-name">⏱ ${escapeHTML(o.time)}</span>
+            <span class="pattern-sources"> · ${escapeHTML(labels)}</span>
+          </div>
+        </div>`);
+    }
+    body.innerHTML = rows.join("");
+  }
+
   function render(payload) {
     updateTopbar(payload);
     renderTodayHero(payload);
     renderCmdBar(payload);
+    renderPatterns(payload);
     renderInbox(payload);
     renderQuestions(payload);
     renderTomorrow(payload);

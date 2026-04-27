@@ -794,6 +794,190 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   .today-hero-body > .hero-section:last-child { border-bottom: none; }
 }
 
+/* ── Hero collapse toggle (▼ / ▶) + progress bar ─────── */
+/* El hero crece a 4-6 sub-secciones (Conexiones + Finanzas opcionales).
+   En mobile esto es un wall of text; el toggle deja al usuario colapsarlo
+   manteniendo solo el header con la fecha. */
+
+.today-hero-toggle {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 2px 6px;
+  margin-right: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-base);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.today-hero-toggle:hover { color: var(--cyan); }
+.today-hero-toggle .toggle-icon {
+  display: inline-block;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.today-hero[data-collapsed="true"] .today-hero-toggle .toggle-icon {
+  transform: rotate(-90deg);
+}
+.today-hero[data-collapsed="true"] .today-hero-body,
+.today-hero[data-collapsed="true"] .today-hero-progress {
+  display: none;
+}
+
+/* Progress bar ASCII durante regenerate. Visible solo cuando JS quita el
+   `hidden`. Estilo terminal log: monospace, dim. */
+.today-hero-progress {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px dashed var(--border);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mini);
+  color: var(--cyan);
+}
+.progress-label {
+  color: var(--text-dim);
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+}
+.progress-bar {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* ── KPI link wrapper (Item D: cmdbar shortcut a panels) ─ */
+/* El cmdbar tiene 3 KPIs (era 4 — sacamos WhatsApp porque duplicaba el
+   panel de la sección Accionable). Ahora cada KPI es un anchor link
+   clickeable que scrollea al panel correspondiente. Subrayado solo en
+   focus visible (mantiene el feel de "número" más que "link"). */
+
+.kpi-link {
+  color: inherit;
+  text-decoration: none;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.kpi-link:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ── Section toggles (Item F: collapse en mobile) ──────── */
+/* Cada section header se transforma en un button que togglea su body.
+   Default expanded en desktop; en mobile, solo Accionable empieza
+   expanded — Monitoring + Ambiente colapsan para reducir scroll. */
+
+.section-toggle {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+.section-toggle:hover { color: var(--cyan); }
+.section-toggle:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+.section-toggle .toggle-icon {
+  display: inline-block;
+  font-size: 0.7em;
+  color: var(--text-faint);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.section[data-collapsed="true"] .section-toggle .toggle-icon {
+  transform: rotate(-90deg);
+}
+.section[data-collapsed="true"] .section-body {
+  display: none;
+}
+
+/* ── Tier visual hierarchy (Item C: anti-sameness) ─────── */
+/* Tier-1 (Accionable): paneles más altos + ASCII bar prominente +
+   border-left phosphor para "pulso urgente". */
+
+.tier-1 .panel {
+  min-height: 180px;
+  border-left: 2px solid var(--phosphor-dim);
+}
+.tier-1 .panel:hover {
+  border-left-color: var(--phosphor);
+}
+.tier-1 .panel-head .count {
+  color: var(--phosphor);
+  font-size: var(--fs-md);
+  font-weight: 700;
+}
+
+/* Tier-2 (Monitoring): paneles medianos + sparkline vibe (cyan) +
+   border-left amber-dim. */
+.tier-2 .panel {
+  min-height: 140px;
+  border-left: 2px solid var(--amber-dim);
+}
+.tier-2 .panel:hover {
+  border-left-color: var(--amber);
+}
+.tier-2 .panel-head .count {
+  color: var(--amber);
+  font-size: var(--fs-base);
+}
+
+/* Tier-3 (Ambiente): paneles compactos + max 3 items + sin
+   border-left para que se sienta "passive". Density más alta. */
+.tier-3 .section-body {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-2);
+}
+.tier-3 .panel {
+  min-height: 92px;
+  font-size: var(--fs-mini);
+}
+.tier-3 .panel-head { padding: var(--space-2) var(--space-3); }
+.tier-3 .panel-body { padding: var(--space-2) var(--space-3); }
+.tier-3 .panel-head .title { font-size: var(--fs-mini); }
+.tier-3 .panel-head .count { color: var(--text-dim); font-size: var(--fs-mini); }
+
+/* ── Patterns panel (Item B: cross-source dedicado) ────── */
+/* Aparece SOLO si el correlator detectó people o topics (JS unhide).
+   Border magenta para diferenciarlo de los otros tier-1 panels —
+   patrones son el "odd one out" intencional, lo más interesante del día. */
+
+.panel-patterns {
+  border-left-color: var(--magenta-dim) !important;
+  grid-column: span 2;  /* ocupa 2 cols cuando hay patrones */
+}
+.panel-patterns:hover { border-left-color: var(--magenta) !important; }
+.panel-patterns .panel-head .count {
+  color: var(--magenta);
+}
+.panel-patterns .pattern-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-1);
+  padding: var(--space-2) 0;
+  border-bottom: 1px dashed var(--border);
+}
+.panel-patterns .pattern-row:last-child { border-bottom: none; }
+.panel-patterns .pattern-name {
+  color: var(--magenta);
+  font-weight: 600;
+}
+.panel-patterns .pattern-sources {
+  color: var(--text-dim);
+  font-size: var(--fs-mini);
+  letter-spacing: 0.04em;
+}
+
 /* ── Empty state ─────────────────────────────────────── */
 
 .empty {
@@ -833,6 +1017,16 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
   .topbar { padding: var(--space-2) var(--space-3); }
   .topbar .meta { gap: var(--space-2); flex-wrap: wrap; justify-content: flex-end; }
+
+  /* Mobile collapsibility: en mobile el cmdbar ocupa una columna y
+     algunos panels pierden contexto. Colapsar Monitoring + Ambiente
+     por default reduce scroll inicial; el user los expande con tap. */
+  /* JS auto-collapsea estas dos secciones al boot en mobile (≤720px) —
+     ver `home.v2.js:initCollapsibleSections()`. */
+
+  .panel-patterns {
+    grid-column: auto; /* en mobile no spans 2 cols */
+  }
 }
 
 /* PWA standalone — más reducción de chrome */

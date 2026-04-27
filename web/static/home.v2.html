@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/home.v2.css?v=6">
+  <link rel="stylesheet" href="/static/home.v2.css?v=7">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -37,56 +37,92 @@
   </header>
 
   <main class="shell" id="main">
-    <!-- ╔═══════════ TODAY BRIEF — narrativo con 4 sub-secciones ═══════════╗ -->
-    <!-- El narrative del LLM viene como markdown con 4 H2: Lo que pasó hoy /
-         Sin procesar / Preguntas abiertas / Para mañana. Lo renderemos full
-         width arriba para darle peso visual. Cada H2 se transforma en una
-         "sub-card" interna con su contenido. Bajo "Para mañana" se inyectan
-         botones "✓ crear Apple Reminder" en cada <li>. -->
-    <section class="today-hero" aria-labelledby="hero-h">
+    <!-- ╔═══════════ TODAY BRIEF — narrativo con 4-6 sub-secciones ═══════════╗ -->
+    <!-- El narrative del LLM viene como markdown con 4-6 H2: Lo que pasó hoy /
+         Sin procesar / Preguntas abiertas / Para mañana / 🔗 Conexiones /
+         💸 Finanzas. Lo renderemos full width arriba para darle peso visual.
+         Cada H2 se transforma en una "sub-card" interna con su contenido.
+         Bajo "Para mañana" se inyectan botones "✓ crear Apple Reminder".
+         Toggle collapse — default expanded en desktop, collapsed en mobile. -->
+    <section class="today-hero" aria-labelledby="hero-h" data-collapsed="false">
       <header class="today-hero-head">
+        <button type="button" class="today-hero-toggle" id="hero-toggle"
+                aria-expanded="true" aria-controls="today-hero-body"
+                title="Colapsar/expandir">
+          <span class="toggle-icon" aria-hidden="true">▼</span>
+        </button>
         <h2 id="hero-h" class="today-hero-title">
           <span class="hero-date" id="hero-date">—</span>
           <span class="hero-counts" id="hero-counts"></span>
         </h2>
         <button type="button" class="today-hero-refresh" id="brief-refresh"
-                title="Re-generar brief (toma ~10-15s)" aria-label="Re-generar brief">
+                title="Re-generar brief (toma ~30-45s con qwen2.5:7b warm)"
+                aria-label="Re-generar brief">
           ↻
         </button>
       </header>
+      <!-- Progress bar ASCII (visible solo durante regenerate). Usa Unicode
+           block chars + porcentaje monospace. Estilo terminal log. -->
+      <div class="today-hero-progress" id="hero-progress" hidden>
+        <span class="progress-label" id="progress-label">leyendo señales…</span>
+        <span class="progress-bar" id="progress-bar">[░░░░░░░░░░] 0%</span>
+      </div>
       <div class="today-hero-body" id="today-hero-body">
         <div class="empty">cargando brief…</div>
       </div>
     </section>
 
-    <!-- ╔═══════════ COMMAND BAR — 4 KPIs críticos ═══════════╗ -->
+    <!-- ╔═══════════ COMMAND BAR — 3 KPIs críticos ═══════════╗ -->
+    <!-- KPI WhatsApp removido (era duplicado del panel "WhatsApp · sin
+         responder" en Accionable). 3 KPIs deja más espacio horizontal por
+         tarjeta + reduce sameness con la sección de abajo. -->
     <section class="cmdbar" aria-label="indicadores críticos">
       <article class="kpi" id="kpi-inbox" data-kpi="inbox">
-        <div class="kpi-label">Inbox sin procesar</div>
-        <div class="kpi-value" data-value>—</div>
-        <div class="kpi-meta" data-meta>cargando…</div>
+        <a class="kpi-link" href="#p-inbox" aria-label="ir al panel inbox">
+          <div class="kpi-label">Inbox sin procesar</div>
+          <div class="kpi-value" data-value>—</div>
+          <div class="kpi-meta" data-meta>cargando…</div>
+        </a>
       </article>
       <article class="kpi" id="kpi-reminders" data-kpi="reminders">
-        <div class="kpi-label">Reminders hoy</div>
-        <div class="kpi-value" data-value>—</div>
-        <div class="kpi-meta" data-meta>cargando…</div>
-      </article>
-      <article class="kpi" id="kpi-wa" data-kpi="wa">
-        <div class="kpi-label">WhatsApp sin responder</div>
-        <div class="kpi-value" data-value>—</div>
-        <div class="kpi-meta" data-meta>cargando…</div>
+        <a class="kpi-link" href="#p-tomorrow" aria-label="ir a reminders">
+          <div class="kpi-label">Reminders hoy</div>
+          <div class="kpi-value" data-value>—</div>
+          <div class="kpi-meta" data-meta>cargando…</div>
+        </a>
       </article>
       <article class="kpi" id="kpi-loops" data-kpi="loops">
-        <div class="kpi-label">Loops STALE</div>
-        <div class="kpi-value" data-value>—</div>
-        <div class="kpi-meta" data-meta>cargando…</div>
+        <a class="kpi-link" href="#p-loops-urgent"
+           aria-label="ir a loops stale">
+          <div class="kpi-label">Loops STALE</div>
+          <div class="kpi-value" data-value>—</div>
+          <div class="kpi-meta" data-meta>cargando…</div>
+        </a>
       </article>
     </section>
 
-    <!-- ╔═══════════ ACCIONABLE HOY ═══════════╗ -->
-    <section class="section section-accionable" aria-labelledby="sec-acc">
-      <h2 class="section-header accent" id="sec-acc">Accionable hoy</h2>
-      <div class="section-body">
+    <!-- ╔═══════════ ACCIONABLE HOY (Tier-1 panels: altos, ASCII bar) ═════╗ -->
+    <section class="section section-accionable tier-1"
+             aria-labelledby="sec-acc" data-collapsed="false">
+      <h2 class="section-header accent" id="sec-acc">
+        <button type="button" class="section-toggle"
+                aria-expanded="true" aria-controls="sec-acc-body"
+                data-section="accionable">
+          <span class="toggle-icon" aria-hidden="true">▼</span>
+          Accionable hoy
+        </button>
+      </h2>
+      <div class="section-body" id="sec-acc-body">
+        <!-- 🔗 Patrones del día: aparece SOLO si el correlator detectó
+             personas o temas cross-source. Si está vacío, hidden via JS. -->
+        <article class="panel panel-patterns" id="p-patterns" hidden>
+          <header class="panel-head">
+            <span class="title">🔗 Patrones del día</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">sin patrones</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
         <article class="panel" id="p-inbox">
           <header class="panel-head">
             <span class="title">Inbox · sin procesar</span>
@@ -138,10 +174,18 @@
       </div>
     </section>
 
-    <!-- ╔═══════════ MONITORING PASIVO ═══════════╗ -->
-    <section class="section section-monitoring" aria-labelledby="sec-mon">
-      <h2 class="section-header" id="sec-mon">Monitoring</h2>
-      <div class="section-body">
+    <!-- ╔═══════════ MONITORING PASIVO (Tier-2: medianos, sparkline) ═════╗ -->
+    <section class="section section-monitoring tier-2"
+             aria-labelledby="sec-mon" data-collapsed="false">
+      <h2 class="section-header" id="sec-mon">
+        <button type="button" class="section-toggle"
+                aria-expanded="true" aria-controls="sec-mon-body"
+                data-section="monitoring">
+          <span class="toggle-icon" aria-hidden="true">▼</span>
+          Monitoring
+        </button>
+      </h2>
+      <div class="section-body" id="sec-mon-body">
         <article class="panel" id="p-finance">
           <header class="panel-head">
             <span class="title">Finanzas · mes</span>
@@ -188,10 +232,18 @@
       </div>
     </section>
 
-    <!-- ╔═══════════ AMBIENTE ═══════════╗ -->
-    <section class="section section-ambient" aria-labelledby="sec-amb">
-      <h2 class="section-header" id="sec-amb">Ambiente</h2>
-      <div class="section-body">
+    <!-- ╔═══════════ AMBIENTE (Tier-3: chicos, log-line) ═══════════╗ -->
+    <section class="section section-ambient tier-3"
+             aria-labelledby="sec-amb" data-collapsed="false">
+      <h2 class="section-header" id="sec-amb">
+        <button type="button" class="section-toggle"
+                aria-expanded="true" aria-controls="sec-amb-body"
+                data-section="ambient">
+          <span class="toggle-icon" aria-hidden="true">▼</span>
+          Ambiente
+        </button>
+      </h2>
+      <div class="section-body" id="sec-amb-body">
         <article class="panel" id="p-weather">
           <header class="panel-head">
             <span class="title">Weather</span>
@@ -245,6 +297,6 @@
     </section>
   </main>
 
-  <script src="/static/home.v2.js?v=6"></script>
+  <script src="/static/home.v2.js?v=7"></script>
 </body>
 </html>

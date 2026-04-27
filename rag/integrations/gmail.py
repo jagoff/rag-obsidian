@@ -203,6 +203,60 @@ def _gmail_thread_last_meta(svc, thread_id: str) -> dict | None:
     }
 
 
+def _fetch_gmail_today(now: datetime, max_items: int = 8) -> list[dict]:
+    """Mails recibidos HOY (today 00:00 local → now). Distinto de
+    `_fetch_gmail_evidence`: ese devuelve "unread total + starred 7d +
+    awaiting 3-14d + recent 30d". Este corta exactamente al inicio del
+    día local — para el evening brief que quiere "qué llegó hoy".
+
+    Returns: list of {subject, from, snippet, thread_id, internal_date_ms}
+    sorted DESC by internal_date_ms (most recent first), max `max_items`.
+
+    Silent-fail: si la API falla devuelve []. Sin auth → []. El brief
+    se renderea sin la sección de gmail-today.
+    """
+    from rag import _silent_log
+    svc = _gmail_service()
+    if svc is None:
+        return []
+    today_start_ms = int(now.replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    ).timestamp() * 1000)
+    out: list[dict] = []
+    try:
+        # `newer_than:1d` agarra desde "now - 24h" (window relative).
+        # Filtramos después por internal_date_ms >= today_start_ms para
+        # cortar exacto al 00:00 local. Si el cron corre a las 22hs,
+        # `newer_than:1d` puede mezclar 22hs de ayer; filter cliente
+        # arregla.
+        r = svc.users().threads().list(
+            userId="me", q="in:inbox newer_than:1d",
+            maxResults=max(int(max_items) * 2, 10),
+        ).execute()
+        for th in r.get("threads", []) or []:
+            tid = th.get("id") or ""
+            meta = _gmail_thread_last_meta(svc, tid)
+            if not meta:
+                continue
+            ms = int(meta.get("internal_date_ms") or 0)
+            if ms < today_start_ms:
+                continue
+            out.append({
+                "subject": meta["subject"],
+                "from": meta["from"],
+                "snippet": meta["snippet"],
+                "thread_id": tid,
+                "internal_date_ms": ms,
+            })
+            if len(out) >= max_items:
+                break
+    except Exception as exc:
+        _silent_log('gmail_today_list', exc)
+        return []
+    out.sort(key=lambda x: x.get("internal_date_ms") or 0, reverse=True)
+    return out
+
+
 def _fetch_gmail_evidence(now: datetime) -> dict:
     """Gmail signals for the morning brief + on-demand "últimos mails"
     queries. Hits Gmail API ~5-15 times (<3s total with cached discovery).

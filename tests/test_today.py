@@ -304,10 +304,13 @@ def test_render_today_prompt_no_extras_backward_compatible():
     prompt = rag._render_today_prompt("2026-04-21", _ev_minimal())
     for h in ("Lo que pasó hoy", "Sin procesar", "Preguntas abiertas", "Para mañana"):
         assert f"## " in prompt and h in prompt
-    # Sin extras, no aparecen los nuevos buckets
-    assert "Gmail" not in prompt
-    assert "WhatsApp pendientes de respuesta" not in prompt
-    assert "YouTube" not in prompt
+    # Sin extras, no aparecen los buckets DATA — chequeamos los headers
+    # de bucket específicos (no la palabra suelta "Gmail" que aparece en
+    # el preámbulo explicativo).
+    assert "## 📧 Gmail" not in prompt
+    assert "## 💬 WhatsApp — recibido HOY" not in prompt
+    assert "## 💬 WhatsApp — esperando" not in prompt
+    assert "## 📺 YouTube" not in prompt
 
 
 def test_render_today_prompt_includes_gmail_when_provided():
@@ -378,6 +381,101 @@ def test_render_today_prompt_includes_youtube_drive_bookmarks():
     assert "Video de RAG" in prompt
     assert "Spec X.pdf" in prompt
     assert "Hacker News" in prompt
+
+
+def test_render_today_prompt_includes_gmail_today_bucket():
+    """gmail_today (mails recibidos HOY) debe aparecer ANTES que
+    gmail_unread (rolling window) en el prompt — es la señal más
+    accionable para el evening brief.
+    """
+    extras = {
+        "gmail_today": [
+            {"subject": "Reunión 14hs", "from": "fer@x.com",
+             "snippet": "confirmás?", "thread_id": "t1",
+             "internal_date_ms": 1_700_000_000_000},
+            {"subject": "Factura", "from": "billing@svc.com",
+             "snippet": "tu factura abril", "thread_id": "t2",
+             "internal_date_ms": 1_700_000_001_000},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Gmail — recibido HOY" in prompt
+    assert "Reunión 14hs" in prompt
+    assert "fer@x.com" in prompt
+    assert "confirmás?" in prompt
+    # Gmail today aparece antes de los buckets rolling
+    idx_today = prompt.find("Gmail — recibido HOY")
+    idx_rolling = prompt.find("Gmail — bandeja al cierre")
+    if idx_rolling != -1:
+        assert idx_today < idx_rolling
+
+
+def test_render_today_prompt_includes_whatsapp_today_bucket():
+    """whatsapp_today (mensajes recibidos HOY) ≠ whatsapp_unreplied (chats
+    donde tardás en responder). El primero es lo que llegó hoy, el
+    segundo lo que tenés pendiente acumulado.
+    """
+    extras = {
+        "whatsapp_today": [
+            {"name": "Marina", "jid": "549@s.whatsapp.net",
+             "count": 5, "last_snippet": "che nos vemos mañana?"},
+            {"name": "Equipo X", "jid": "120@g.us",
+             "count": 12, "last_snippet": "alguien viene?"},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "WhatsApp — recibido HOY" in prompt
+    assert "Marina" in prompt
+    assert "5 msgs" in prompt
+    assert "che nos vemos mañana?" in prompt
+
+
+def test_render_today_prompt_includes_calendar_today_bucket():
+    """calendar_today (eventos del día — pasados + futuros del día) ≠
+    tomorrow_calendar (eventos de mañana).
+    """
+    extras = {
+        "calendar_today": [
+            {"title": "Standup", "start": "10:00", "end": "10:30"},
+            {"title": "Demo cliente", "start": "14:00", "end": "15:00"},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Calendar — eventos de HOY" in prompt
+    assert "Standup" in prompt
+    assert "10:00–10:30" in prompt
+    assert "Demo cliente" in prompt
+
+
+def test_render_today_prompt_includes_youtube_today_bucket():
+    """youtube_today (visto HOY) ≠ youtube_recent (últimos 7d sin hoy)."""
+    extras = {
+        "youtube_today": [
+            {"title": "Video viejo de Ghostty", "url": "https://yt/abc",
+             "video_id": "abc"},
+        ],
+        "youtube_recent": [
+            {"title": "Video de la semana", "url": "https://yt/def",
+             "video_id": "def"},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "YouTube — visto HOY" in prompt
+    assert "Video viejo de Ghostty" in prompt
+    assert "YouTube — visto últimos 7 días" in prompt
+    assert "Video de la semana" in prompt
+    # El de hoy aparece ANTES que el de la semana
+    assert prompt.find("YouTube — visto HOY") < prompt.find("YouTube — visto últimos 7")
+
+
+def test_render_today_prompt_youtube_recent_back_compat_with_watched_key():
+    """Tests viejos pasaban `youtube_watched` — la key nueva es
+    `youtube_recent` pero el render acepta ambas para no romper.
+    """
+    extras = {"youtube_watched": [{"title": "Old key still works",
+                                    "video_id": "xyz"}]}
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Old key still works" in prompt
 
 
 def test_render_today_prompt_asks_for_cross_source_matching():

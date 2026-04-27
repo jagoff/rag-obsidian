@@ -1506,6 +1506,85 @@ def _whatsapp_resolve_reply_target(
 # ── Read path: unread + windowed scan ────────────────────────────────────────
 
 
+def _fetch_whatsapp_today(now=None, max_chats: int = 8) -> list[dict]:
+    """Inbound WhatsApp messages received TODAY (today 00:00 local → now),
+    grouped by chat. Distinto de `_fetch_whatsapp_unread`: ese mira ventana
+    rolling de N horas; este corta exactamente al inicio del día local.
+
+    Mirroring `_fetch_whatsapp_unread` shape: list of
+    ``{"name": str, "jid": str, "count": int, "last_snippet": str}``
+    sorted by message count desc.
+
+    Use case: el evening brief de las 22hs quiere "qué llegó por WA HOY"
+    (no "últimas 24hs" que mezclaría parte de ayer). Pasa el corte exacto
+    en local time.
+    """
+    from datetime import datetime as _dt
+    if now is None:
+        now = _dt.now()
+    # Inicio del día local en ISO sin timezone — coincide con cómo
+    # `messages.timestamp` se almacena en el bridge SQLite (naive RFC3339
+    # local-ish). El `datetime(?)` de SQLite parsea ambos formatos.
+    today_start_iso = now.replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    ).isoformat()
+    import rag as _rag
+    db_path = _rag.WHATSAPP_DB_PATH
+    bot_jid = _rag.WHATSAPP_BOT_JID
+    if not db_path.is_file():
+        return []
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT
+              m.chat_jid AS jid,
+              (SELECT name FROM chats WHERE jid = m.chat_jid) AS name,
+              count(*) AS cnt,
+              (SELECT content FROM messages
+                 WHERE chat_jid = m.chat_jid AND is_from_me = 0
+                 ORDER BY datetime(timestamp) DESC LIMIT 1) AS last_content
+            FROM messages m
+            WHERE m.is_from_me = 0
+              AND datetime(m.timestamp) >= datetime(?)
+              AND m.chat_jid != ?
+              AND m.chat_jid NOT LIKE '%status@broadcast'
+            GROUP BY m.chat_jid
+            ORDER BY cnt DESC
+            LIMIT ?
+            """,
+            (today_start_iso, bot_jid, int(max_chats) * 3),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    out: list[dict] = []
+    for r in rows:
+        raw_name = (r["name"] or "").strip()
+        jid_prefix = (r["jid"] or "").split("@")[0]
+        display_name = raw_name or jid_prefix
+        if not any(ch.isalpha() for ch in display_name):
+            continue
+        snippet = (r["last_content"] or "").strip().replace("\n", " ")
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "…"
+        out.append({
+            "jid": r["jid"],
+            "name": display_name,
+            "count": int(r["cnt"] or 0),
+            "last_snippet": snippet,
+        })
+        if len(out) >= max_chats:
+            break
+    return out
+
+
 def _fetch_whatsapp_unread(hours: int = 24, max_chats: int = 8) -> list[dict]:
     """Inbound WhatsApp messages in the last `hours`, grouped by chat.
 

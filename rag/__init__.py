@@ -39548,8 +39548,12 @@ def _render_today_prompt(
     # múltiples fuentes y nombrar el patrón.
     has_cross_source = any(
         extras.get(k) for k in (
+            # TODAY-only buckets (corte 00:00 local)
+            "gmail_today", "whatsapp_today", "calendar_today", "youtube_today",
+            # Rolling windows / stale buckets
             "gmail_unread", "whatsapp_unreplied", "tomorrow_calendar",
-            "drive_recent", "youtube_watched", "chrome_bookmarks",
+            "drive_recent", "youtube_watched", "youtube_recent",
+            "chrome_bookmarks",
             "vault_activity", "pagerank_top", "followup_aging",
             "loops_stale", "loops_activo", "reminders_overdue",
             "mail_unread",
@@ -39563,9 +39567,65 @@ def _render_today_prompt(
         "Tono calmo y honesto. Mirás hacia atrás — NO proyectes foco de "
         "mañana como agenda; solo semillas.",
         "",
-        "Contexto real del vault (NO inventes lo que no esté acá):",
+        "Contexto real del vault y fuentes externas (NO inventes lo que no "
+        "esté acá). Cuando un mismo dato aparezca en una nota ingester "
+        "(`03-Resources/Gmail/<fecha>.md`, `03-Resources/YouTube/<fecha>.md`, "
+        "etc.) Y en un bucket TODAY explícito (## Gmail — recibido HOY, "
+        "## YouTube — visto HOY), priorizá el bucket TODAY: ese es la "
+        "fuente structured y tiene los detalles para citar (subject, "
+        "remitente, snippet). Las notas ingester son backups del mismo "
+        "dato, NO las cites como 'tocaste una nota'.",
         "",
     ]
+    # ── BUCKETS TODAY (corte 00:00 local) — PRIMERO en el prompt
+    # porque son la señal más fresca + accionable. El LLM lee primero
+    # estos y luego puede mezclarlos con las notas tocadas / capturas.
+    gmail_today = extras.get("gmail_today") or []
+    if gmail_today:
+        parts.append(f"## 📧 Gmail — recibido HOY ({len(gmail_today)} hilos):")
+        for m in gmail_today[:8]:
+            subj = (m.get("subject") or "(sin asunto)")[:80]
+            sender = m.get("from") or m.get("sender") or "?"
+            snippet = (m.get("snippet") or "")[:120]
+            parts.append(f"- \"{subj}\" — {sender}: {snippet}")
+        parts.append("")
+    wa_today = extras.get("whatsapp_today") or []
+    if wa_today:
+        parts.append(
+            f"## 💬 WhatsApp — recibido HOY ({len(wa_today)} chats):"
+        )
+        for w in wa_today[:8]:
+            name = w.get("name") or "(sin nombre)"
+            count = w.get("count") or 0
+            snippet = (w.get("last_snippet") or "")[:90]
+            parts.append(f"- {name} ({count} msgs): \"{snippet}\"")
+        parts.append("")
+    cal_today = extras.get("calendar_today") or []
+    if cal_today:
+        parts.append(f"## 📅 Calendar — eventos de HOY ({len(cal_today)}):")
+        for c in cal_today[:10]:
+            title = c.get("title") or "(sin título)"
+            start = c.get("start") or ""
+            end = c.get("end") or ""
+            time_label = (
+                f"{start}–{end}" if start and end and start != end
+                else (start or end or "")
+            )
+            parts.append(
+                f"- {time_label} — {title}" if time_label else f"- {title}"
+            )
+        parts.append(
+            "(eventos del día — los pasados ya ocurrieron, los futuros del "
+            "día están por venir; usá esto para el recap del día)"
+        )
+        parts.append("")
+    yt_today = extras.get("youtube_today") or []
+    if yt_today:
+        parts.append(f"## 📺 YouTube — visto HOY ({len(yt_today)}):")
+        for v in yt_today[:6]:
+            title = (v.get("title") or "?")[:90]
+            parts.append(f"- {title}")
+        parts.append("")
     if ev["recent_notes"]:
         parts.append(f"## Notas tocadas hoy ({len(ev['recent_notes'])}):")
         for r in ev["recent_notes"][:12]:
@@ -39623,10 +39683,11 @@ def _render_today_prompt(
             "revisá `launchctl list | grep wa-scheduled-send` y los logs)"
         )
         parts.append("")
-    # ── Cross-source signals (gmail, calendar, wa, drive, youtube,
-    # bookmarks, loops, vault-activity). Estas señales NO vienen del
-    # vault — vienen del fan-out de `_home_compute` en web/server.py.
-    # Solo se renderean si el caller las pasa en `extras`.
+    # ── BUCKETS rolling-window (últimos N días/horas, NO solo hoy).
+    # Estos vienen del fan-out de `_home_compute` en web/server.py.
+    # Los buckets TODAY ya se renderearon arriba (al inicio del prompt)
+    # con prioridad — los rolling complementan con info "stale" o
+    # acumulada que NO se generó hoy específicamente.
     gmail = extras.get("gmail_unread") or {}
     if gmail and (gmail.get("unread_count") or gmail.get("awaiting_reply")):
         unread = int(gmail.get("unread_count") or 0)
@@ -39678,9 +39739,15 @@ def _render_today_prompt(
             name = d.get("name") or d.get("title") or "?"
             parts.append(f"- {name}")
         parts.append("")
-    yt = extras.get("youtube_watched") or []
+    # Aceptamos tanto `youtube_recent` (key nueva, ya excluye los de hoy)
+    # como `youtube_watched` (key legacy del primer commit) para que tests
+    # viejos sigan andando.
+    yt = extras.get("youtube_recent") or extras.get("youtube_watched") or []
     if yt:
-        parts.append(f"## 📺 YouTube — visto últimos 7 días ({len(yt)} videos):")
+        parts.append(
+            f"## 📺 YouTube — visto últimos 7 días (excluye hoy) "
+            f"({len(yt)} videos):"
+        )
         for v in yt[:5]:
             title = (v.get("title") or "?")[:90]
             parts.append(f"- {title}")
@@ -39823,12 +39890,33 @@ def _today_brief_model() -> str:
     return os.environ.get("OBSIDIAN_RAG_TODAY_MODEL") or "qwen2.5:14b"
 
 
+# Options dedicadas al today brief — distinto del CHAT_OPTIONS general que
+# usa todo el sistema (chat web, helpers, etc.).
+#   - `temperature` 0.4 vs 0 del chat → da variedad mínima entre runs (no
+#     queremos texto idéntico cada noche aunque los inputs cambien poco;
+#     temperature=0+seed=42 hacía que el brief fuera 100% determinístico).
+#   - `seed` ausente → cada call usa una semilla nueva, así dos runs con
+#     el mismo prompt entregan paráfrasis distintas en lugar del clon.
+#   - `num_ctx` 8192 vs 4096 → el prompt con 14 buckets cross-source ya
+#     pesa ~2000-2500 tokens; sumarle margen al output deja al LLM citar
+#     specifics sin truncarse. Costo memoria ollama: ~2× el cache, pero
+#     se libera al `keep_alive` expire.
+#   - `num_predict` 700 vs 384 → cap de 250-450 palabras pedidas + sección
+#     de cross-source opcional necesita ~600-700 tokens de output cap.
+TODAY_BRIEF_OPTIONS = {
+    "temperature": 0.4,
+    "top_p": 0.9,
+    "num_ctx": 8192,
+    "num_predict": 700,
+}
+
+
 def _generate_today_narrative(prompt: str) -> str:
     try:
         resp = _chat_capped_client().chat(
             model=_today_brief_model(),
             messages=[{"role": "user", "content": prompt}],
-            options=CHAT_OPTIONS,
+            options=TODAY_BRIEF_OPTIONS,
             keep_alive=chat_keep_alive(),
         )
         return (resp.message.content or "").strip()
@@ -54618,6 +54706,7 @@ from rag.integrations.gmail import (  # noqa: E402, F401
     GMAIL_CREDS_DIR,
     GMAIL_SCOPES,
     _fetch_gmail_evidence,
+    _fetch_gmail_today,
     _gmail_send_service,
     _gmail_service,
     _gmail_thread_last_meta,
@@ -54650,6 +54739,7 @@ from rag.integrations.whatsapp import (  # noqa: E402, F401
     WHATSAPP_DB_PATH,
     WHATSAPP_NOTE_MAX_CHARS,
     _ambient_whatsapp_send,
+    _fetch_whatsapp_today,
     _fetch_whatsapp_unread,
     _fetch_whatsapp_window,
     _wa_chat_label,

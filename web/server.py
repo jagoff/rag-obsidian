@@ -112,11 +112,14 @@ from rag import (  # noqa: E402
     _collect_scoped_tasks_evidence_multi as _rag_collect_scoped_tasks_evidence_multi,
     _collect_today_evidence,
     _fetch_calendar_ahead,
+    _fetch_calendar_today,
     _fetch_chrome_bookmarks_used,
     _fetch_drive_evidence,
+    _fetch_gmail_today,
     _fetch_reminders_due,
     _fetch_vault_activity,
     _fetch_weather_forecast,
+    _fetch_whatsapp_today,
     _fetch_whatsapp_unread,
     _format_scoped_tasks_context as _rag_format_scoped_tasks_context,
     _generate_today_narrative,
@@ -5938,6 +5941,94 @@ def _fetch_youtube_watched(n: int = 5, hours: int = 168) -> list[dict]:
     return out
 
 
+def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
+    """YouTube videos abiertos en Chrome HOY (today 00:00 local → now).
+    Distinto de `_fetch_youtube_watched`: ese mira ventana rolling 7d.
+    Este corta exactamente al inicio del día local — para el evening
+    brief que quiere "qué viste hoy".
+
+    Mismo shape que `_fetch_youtube_watched`: list of
+    {title, url, video_id, visit_count, last_visit_iso}.
+
+    Reusa toda la lógica del 7d (Chrome epoch math, dedup por video_id,
+    " - YouTube" suffix strip). Solo cambia la window inferior.
+    """
+    import shutil
+    import sqlite3
+    import tempfile
+    from urllib.parse import urlparse, parse_qs
+
+    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    if not src.is_file():
+        return []
+
+    CHROME_EPOCH_OFFSET = 11_644_473_600
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start_chrome = int(
+        (today_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        shutil.copyfile(src, tmp.name)
+        conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT u.url AS url, u.title AS title,
+                       COUNT(v.id) AS visit_count,
+                       MAX(v.visit_time) AS last_visit
+                FROM urls u
+                JOIN visits v ON v.url = u.id
+                WHERE v.visit_time >= ?
+                  AND (
+                       u.url LIKE '%://www.youtube.com/watch%'
+                    OR u.url LIKE '%://youtube.com/watch%'
+                    OR u.url LIKE '%://m.youtube.com/watch%'
+                    OR u.url LIKE '%://youtu.be/%'
+                  )
+                GROUP BY u.url
+                ORDER BY last_visit DESC
+                LIMIT 50
+                """,
+                (window_start_chrome,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    seen_ids: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        url = r["url"]
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc.endswith("youtu.be"):
+                vid = parsed.path.strip("/").split("/")[0] or url
+            else:
+                vid = (parse_qs(parsed.query).get("v") or [url])[0]
+        except Exception:
+            vid = url
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        raw_title = (r["title"] or "").strip()
+        title = (
+            raw_title[:-len(" - YouTube")].rstrip()
+            if raw_title.endswith(" - YouTube") else raw_title
+        )
+        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+        out.append({
+            "title": title or url,
+            "url": url,
+            "video_id": vid,
+            "visit_count": int(r["visit_count"]),
+            "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
 # Baselines from CLAUDE.md (2026-04-16 post-quick-wins floor). Hardcoded
 # because they're the reference against which the UI renders drift — changing
 # the baseline needs a human decision, not an automatic update from the latest
@@ -7726,22 +7817,62 @@ def _home_compute(
         finance_snapshot = signals.get("finance") if isinstance(signals, dict) else None
         if finance_snapshot:
             today_ev = {**today_ev, "finance": finance_snapshot}
+        # Fetchers TODAY-only (gmail/wa/calendar/youtube received-or-seen
+        # HOY 00:00 → now, NO ventana rolling). Solo se ejecutan al
+        # regenerar el brief para no inflar la latencia del path
+        # default `/api/home`. Paralelizados — el peor caso es ~max(5s
+        # gmail API, 0.05s wa SQLite, 2s icalBuddy, 0.1s yt sqlite) ≈
+        # 5s. Silent-fail por fetcher: si gmail falla el resto sigue.
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=4, thread_name_prefix="today-extras") as _t_pool:
+            fut_gmail_today = _t_pool.submit(_fetch_gmail_today, now, 8)
+            fut_wa_today    = _t_pool.submit(_fetch_whatsapp_today, now, 8)
+            fut_cal_today   = _t_pool.submit(_fetch_calendar_today, 15)
+            fut_yt_today    = _t_pool.submit(_fetch_youtube_today, now, 5)
+            try:
+                gmail_today = fut_gmail_today.result(timeout=10) or []
+            except Exception:
+                gmail_today = []
+            try:
+                wa_today = fut_wa_today.result(timeout=5) or []
+            except Exception:
+                wa_today = []
+            try:
+                cal_today = fut_cal_today.result(timeout=10) or []
+            except Exception:
+                cal_today = []
+            try:
+                yt_today = fut_yt_today.result(timeout=5) or []
+            except Exception:
+                yt_today = []
         # Cross-source extras — NO los inventamos, ya los recolectamos
-        # en paralelo arriba (`signals` + buckets sueltos). Pasarlos al
-        # LLM permite que el brief escriba "esperás respuesta de 3 chats
-        # WhatsApp + 2 mails VIP + tenés meet con Pablo mañana 10hs"
-        # en vez de un recap solo del vault. El render del prompt
-        # ignora keys vacías así que es safe pasar todo aunque algunos
-        # buckets hayan caído en timeout (`_await(...)` devuelve []/{}).
+        # en paralelo arriba (`signals` + buckets sueltos + los 4 today
+        # de recién). Pasarlos al LLM permite que el brief escriba
+        # "esperás respuesta de 3 chats WhatsApp + 2 mails VIP + tenés
+        # meet con Pablo mañana 10hs" en vez de un recap solo del vault.
+        # El render del prompt ignora keys vacías así que es safe pasar
+        # todo aunque algunos buckets hayan caído en timeout.
         signals_dict = signals if isinstance(signals, dict) else {}
+        # Dedup: si un YouTube apareció HOY, sacarlo del bucket "últimos
+        # 7d" para que el LLM no lo cite dos veces. El `youtube_recent`
+        # queda como "lo de los últimos 7 días que NO viste hoy".
+        yt_today_ids = {v.get("video_id") for v in yt_today if v.get("video_id")}
+        yt_recent_raw = signals_dict.get("youtube_watched") or []
+        yt_recent = [v for v in yt_recent_raw if v.get("video_id") not in yt_today_ids]
         extras = {
+            # TODAY (corte exacto al 00:00 local, no ventana rolling)
+            "gmail_today": gmail_today,
+            "whatsapp_today": wa_today,
+            "calendar_today": cal_today,
+            "youtube_today": yt_today,
+            # Buckets ya existentes (rolling windows / "stale" buckets)
             "gmail_unread": signals_dict.get("gmail") or {},
             "mail_unread": signals_dict.get("mail_unread") or [],
             "whatsapp_unreplied": signals_dict.get("whatsapp_unreplied")
                 or signals_dict.get("whatsapp") or [],
             "tomorrow_calendar": tomorrow_calendar,
             "drive_recent": signals_dict.get("drive_recent") or [],
-            "youtube_watched": signals_dict.get("youtube_watched") or [],
+            "youtube_recent": yt_recent,
             "chrome_bookmarks": signals_dict.get("chrome_bookmarks") or [],
             "loops_stale": signals_dict.get("loops_stale") or [],
             "loops_activo": signals_dict.get("loops_activo") or [],

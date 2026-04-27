@@ -159,3 +159,83 @@ def test_empty_collection_returns_empty(tmp_path):
         name="empty_test", metadata={"hnsw:space": "cosine"}
     )
     assert rag.find_duplicate_notes(col) == []
+
+
+def test_calendar_chunks_skipped_as_false_positives(tmp_path, monkeypatch):
+    """Recurring calendar events produce cosine-1.000 pairs that are NOT vault
+    notes — they must be silently skipped regardless of threshold."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setattr(rag, "VAULT_PATH", vault)
+    client = _TestVecClient(path=str(tmp_path / "c"))
+    col = client.get_or_create_collection(
+        name="cal_test", metadata={"hnsw:space": "cosine"}
+    )
+    # Two calendar chunks with identical embeddings (cosine 1.0) — same
+    # recurring event indexed as separate instances.
+    col.add(
+        ids=["calendar://calA/evt1::0"],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["Reunión semanal"],
+        metadatas=[{"file": "calendar://calA/evt1", "note": "Reunión semanal", "source": "calendar"}],
+    )
+    col.add(
+        ids=["calendar://calA/evt2::0"],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["Reunión semanal"],
+        metadatas=[{"file": "calendar://calA/evt2", "note": "Reunión semanal", "source": "calendar"}],
+    )
+    # Also add a reminders chunk for good measure.
+    col.add(
+        ids=["reminders://rem1::0"],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["Turno dentista"],
+        metadatas=[{"file": "reminders://rem1", "note": "Turno dentista", "source": "reminders"}],
+    )
+    pairs = rag.find_duplicate_notes(col, threshold=0.5)
+    assert pairs == [], (
+        "calendar/reminders chunks must be excluded — no false-positive pairs"
+    )
+
+
+def test_vault_dupes_still_reported_with_cross_source_in_collection(tmp_path, monkeypatch):
+    """Vault near-duplicates are still surfaced even when cross-source chunks
+    coexist in the same collection."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("nota A")
+    (vault / "b.md").write_text("nota B")
+    monkeypatch.setattr(rag, "VAULT_PATH", vault)
+    client = _TestVecClient(path=str(tmp_path / "c"))
+    col = client.get_or_create_collection(
+        name="mixed_test", metadata={"hnsw:space": "cosine"}
+    )
+    # Vault dupes — should be found.
+    col.add(
+        ids=["a.md::0"],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["nota A"],
+        metadatas=[{"file": "a.md", "note": "A", "source": "vault"}],
+    )
+    col.add(
+        ids=["b.md::0"],
+        embeddings=[[1.0, 0.001, 0.0, 0.0]],
+        documents=["nota B"],
+        metadatas=[{"file": "b.md", "note": "B", "source": "vault"}],
+    )
+    # Calendar chunk with identical direction — must NOT be paired with vault notes.
+    col.add(
+        ids=["calendar://calA/evt1::0"],
+        embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        documents=["Evento"],
+        metadatas=[{"file": "calendar://calA/evt1", "note": "Evento", "source": "calendar"}],
+    )
+    pairs = rag.find_duplicate_notes(col, threshold=0.9)
+    paths_seen = {(p["a_path"], p["b_path"]) for p in pairs}
+    # The vault pair must be reported.
+    assert ("a.md", "b.md") in paths_seen or ("b.md", "a.md") in paths_seen, \
+        "vault near-dupe pair must still be reported"
+    # No calendar path must appear in any pair.
+    for p in pairs:
+        assert not p["a_path"].startswith("calendar://"), "calendar chunk leaked into pairs"
+        assert not p["b_path"].startswith("calendar://"), "calendar chunk leaked into pairs"

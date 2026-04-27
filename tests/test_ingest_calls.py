@@ -471,7 +471,7 @@ def test_valid_sources_includes_calls_and_contacts():
 def test_source_weight_and_halflife_registered():
     assert rag.SOURCE_WEIGHTS["calls"] == 0.80
     assert rag.SOURCE_WEIGHTS["contacts"] == 0.95
-    assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["calls"] == 30.0
+    assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["calls"] == 60.0
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["contacts"] is None
     assert rag.SOURCE_RETENTION_DAYS["calls"] == 180
     assert rag.SOURCE_RETENTION_DAYS["contacts"] is None

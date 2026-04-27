@@ -42665,17 +42665,30 @@ def _wants_finance_detail(question: str) -> bool:
     """Detecta si el user quiere TODOS los movimientos (detalle completo)
     en lugar del summary corto con top 3-5. Triggers:
 
-      - "detalle" / "detallado" / "todo el detalle" / "dame el detalle"
-      - "todos los movimientos" / "todos los gastos" / "lista completa"
-      - "lista" en contexto de finanzas
+      - "detalle" / "detalles" / "detallado" / "todo el detalle"
+      - "resumen" / "resúmen" / "resúmenes" — en dominio de tarjetas,
+        "dame el resumen de mi tarjeta" = el documento del banco con
+        TODOS los movimientos del ciclo, no un top-3 (user report
+        2026-04-26 voice "Eh, dame el resumen de tarjeta mío de este
+        mes" esperaba la lista completa).
+      - "todos los movimientos/gastos/consumos/cargos"
+      - "movimientos" / "consumos" / "cargos" (plural solos — pedido
+        implícito de listá los que hay)
+      - "lista completa" / "lista de consumos"
       - "items" / "ítems"
+      - "mostrame/dame/ver todo"
 
     Sin matches: respuesta corta default (top consumos).
     """
     q = (question or "").lower()
     return bool(re.search(
-        r"\bdetalle\b|\bdetallad[oa]\b|\btodos\s+los\s+(movimientos|gastos|consumos)\b|"
-        r"\blista\s+(completa|de\s+(consumos|movimientos|gastos))\b|\b\u00edtems?\b|\bitems\b",
+        r"\bdetalles?\b|\bdetallad[oa]\b|"
+        r"\bres[uú]men(?:es)?\b|"
+        r"\btodos\s+los\s+(movimientos|gastos|consumos|cargos)\b|"
+        r"\b(movimientos|consumos|cargos)\b|"
+        r"\blista\s+(completa|de\s+(consumos|movimientos|gastos|cargos))\b|"
+        r"\b\u00edtems?\b|\bitems\b|"
+        r"\b(mostrame|dame|ver)\s+todo\b",
         q,
     ))
 

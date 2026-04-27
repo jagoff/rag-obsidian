@@ -2782,13 +2782,46 @@ async def upload_chat_image(file: UploadFile = File(...)) -> dict:
             status_code=400,
             detail=f"solo imágenes (recibí content_type={content_type!r})",
         )
-    raw = await file.read()
+    # Audit security 2026-04-26 (HIGH-DoS): pre-fix `await file.read()` sin
+    # cap → un cliente con multipart de 500MB ahoga la RAM del proceso ANTES
+    # de que el gate de tamaño dispare. Uvicorn no tiene default body-size
+    # limit. Lectura cap'd-to-MAX+1: si el body es > MAX, leemos sólo lo
+    # suficiente para detectar el overflow y rechazamos.
+    raw = await file.read(_CHAT_UPLOAD_MAX_BYTES + 1)
     if not raw:
         raise HTTPException(status_code=400, detail="imagen vacía")
     if len(raw) > _CHAT_UPLOAD_MAX_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"imagen muy grande ({len(raw)} bytes, max {_CHAT_UPLOAD_MAX_BYTES})",
+            detail=f"imagen muy grande (>{_CHAT_UPLOAD_MAX_BYTES} bytes)",
+        )
+    # Magic-byte verification — pre-fix confiabamos en `Content-Type` header
+    # del cliente (trivial spoofear). Atacante mandaba `image/jpeg` con
+    # body de ZIP/pickle/PDF → llegaba a disco + ocrmac (Apple Vision).
+    # Whitelist de signatures comunes:
+    _IMAGE_MAGIC_PREFIXES = (
+        b"\xff\xd8\xff",          # JPEG
+        b"\x89PNG\r\n\x1a\n",     # PNG
+        b"GIF87a", b"GIF89a",     # GIF
+        b"RIFF",                   # WebP (RIFF...WEBP) — verifica WEBP en bytes 8-12
+        b"\x00\x00\x00",           # HEIC/HEIF (ftypheic, ftypheix, ftypmif1, etc — bytes 4-12)
+    )
+    _has_magic = any(raw.startswith(p) for p in _IMAGE_MAGIC_PREFIXES)
+    if _has_magic and raw.startswith(b"RIFF"):
+        # WebP requiere WEBP en bytes 8-12
+        _has_magic = len(raw) >= 12 and raw[8:12] == b"WEBP"
+    if _has_magic and raw.startswith(b"\x00\x00\x00"):
+        # HEIC/HEIF requiere "ftyp" en bytes 4-8 + heic/heix/mif1/msf1/heim/etc
+        _has_magic = (
+            len(raw) >= 12 and raw[4:8] == b"ftyp"
+            and raw[8:12] in (b"heic", b"heix", b"hevc", b"hevx",
+                              b"mif1", b"msf1", b"heim", b"heis",
+                              b"hevm", b"hevs", b"avif")
+        )
+    if not _has_magic:
+        raise HTTPException(
+            status_code=400,
+            detail="contenido no es una imagen válida (magic bytes no matchean)",
         )
 
     import hashlib  # noqa: PLC0415
@@ -6060,6 +6093,11 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     i = 0
     in_purchases_block = False
     in_payments_block = False
+    # Trackeamos la última fecha vista en filas de movimiento para
+    # heredarla en filas que vienen con col[0] vacía (multi-consumo
+    # mismo día). Reset al cerrar el bloque para no contaminar entre
+    # tarjetas / secciones.
+    last_seen_purchase_date: str | None = None
     while i < n:
         row = rows[i]
         text = _row_text(row).lower()
@@ -6152,7 +6190,12 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
             in_payments_block = False
         elif in_purchases_block and len(row) >= 5:
             # Fila de movimiento: (fecha, descripción, cuotas, comprobante, ARS, USD)
-            # Algunas filas tienen fecha vacía (continuación del día anterior)
+            # Algunas filas tienen fecha vacía (continuación del día anterior).
+            # El banco ahorra espacio mostrando la fecha solo en el primer
+            # consumo del día — los siguientes vienen con col[0]=None y
+            # heredan implícitamente la fecha de la fila anterior. Sin
+            # esta inheritance, el render quedaba con `?` para esas filas
+            # (≈9 de 14 movimientos en el test 2026-04-26).
             desc = (str(row[1]).strip() if row[1] else "").strip()
             if desc and desc.lower() not in ("descripción", "descripcion"):
                 amt_ars, _ = _parse_ars_or_usd(row[4] if len(row) > 4 else None)
@@ -6166,8 +6209,19 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
                     amount = abs(amt_usd)
                     currency = "USD"
                 if amount is not None and amount > 0:
+                    parsed_date = _parse_card_date(row[0] if len(row) > 0 else None)
+                    if parsed_date:
+                        # Cell tiene fecha → la usamos y la guardamos
+                        # como "última vista" para que la próxima fila
+                        # sin fecha la herede.
+                        last_seen_purchase_date = parsed_date
+                    elif last_seen_purchase_date:
+                        # Fecha vacía + ya vimos una fecha previa →
+                        # heredamos. Asume orden cronológico (que es lo
+                        # que el banco emite).
+                        parsed_date = last_seen_purchase_date
                     top_purchases.append({
-                        "date": _parse_card_date(row[0] if len(row) > 0 else None),
+                        "date": parsed_date,
                         "description": desc,
                         "amount": amount,
                         "currency": currency,
@@ -8907,13 +8961,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
 
         is_multi = len(vaults) > 1
         # Cap each chunk at 500 chars on the fast path. With 4 chunks that's
-        # ~2000 chars ≈ 500 tokens of variable context — small enough that
-        # uncached prefill stays under ~6s on command-r:35b (12.7ms/tok),
-        # large enough that REGLA 4's "obligatory usage block" still lands.
+        # ~2000 chars ≈ 500 tokens de contexto — chico para que prefill
+        # uncached < 6s, grande para que REGLA 4 obligatoria aterrice.
         _WEB_CHUNK_CAP = 500
+        # Audit security 2026-04-26 (HIGH): pre-fix el fast-path emitía
+        # chunks al LLM con f-string crudo, BYPASSEANDO `_format_chunk_for_llm`
+        # → no `_redact_sensitive` (OTPs/CBU/tokens leakean al LLM) ni
+        # fences `<<<CHUNK>>>...<<<END_CHUNK>>>` (la REGLA 0 de "chunks son
+        # DATA no instrucciones" no aplica). Cross-source corpus (Gmail/
+        # WhatsApp) puede meter prompt-injection en este path. Fix:
+        # delegar al helper como los otros 4 callers (CLI query, chat,
+        # serve, build_progressive_context).
+        from rag import _format_chunk_for_llm as _rag_format_chunk
         context = "\n\n---\n\n".join(
-            (f"[vault: {m.get('_vault', '?')}] " if is_multi else "")
-            + f"[nota: {m['note']}] [ruta: {m['file']}]\n{d[:_WEB_CHUNK_CAP]}"
+            (f"[vault: {m.get('_vault', '?')}]\n" if is_multi else "")
+            + _rag_format_chunk(d[:_WEB_CHUNK_CAP], m, role="nota")
             for d, m in zip(result["docs"], result["metas"])
         )
 
@@ -15304,6 +15366,7 @@ def _stream_payload(kind: str, ev: dict) -> dict:
 # se reescriben 1/día). Sirve directo desde RAM si hay hit warm.
 
 _LEARNING_CACHE: dict[int, tuple[float, dict]] = {}
+_LEARNING_CACHE_LOCK = threading.Lock()  # audit 2026-04-26 — race en SSE concurrente
 _LEARNING_TTL = 60.0
 
 
@@ -15322,9 +15385,10 @@ def learning_api(days: int = 30) -> dict:
     funciones de `web.learning_queries` envuelven sus reads con
     `_sql_read_with_retry` y devuelven shape vacío en error)."""
     now_ts = time.time()
-    hit = _LEARNING_CACHE.get(days)
-    if hit and now_ts - hit[0] < _LEARNING_TTL:
-        return hit[1]
+    with _LEARNING_CACHE_LOCK:
+        hit = _LEARNING_CACHE.get(days)
+        if hit and now_ts - hit[0] < _LEARNING_TTL:
+            return hit[1]
     # Lazy import: módulo nuevo, no queremos cargarlo al import-time del
     # servidor si nadie pide /learning. Después del primer hit
     # queda cacheado por el import system; las llamadas subsiguientes son
@@ -15369,7 +15433,8 @@ def learning_api(days: int = 30) -> dict:
             "vault_intelligence": vault_intelligence(days),
         },
     }
-    _LEARNING_CACHE[days] = (now_ts, payload)
+    with _LEARNING_CACHE_LOCK:
+        _LEARNING_CACHE[days] = (now_ts, payload)
     return payload
 
 
@@ -15820,18 +15885,30 @@ _MEMORY_LIVE_INTERVAL = 2.0
 
 
 @app.get("/api/system-memory/stream")
-async def system_memory_stream() -> StreamingResponse:
+async def system_memory_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
+    # Audit 2026-04-26: agregar slot cap como dashboard/stream para evitar
+    # N tabs × infinite-loop por IP saturando el server.
+    client_ip: str | None = None
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        if not _sse_acquire_slot(client_ip):
+            raise HTTPException(status_code=429,
+                detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)")
+
     async def gen():
-        # Prime with one sample immediately so the client doesn't wait.
-        first = await asyncio.to_thread(_sample_memory)
-        if first:
-            yield _sse("sample", first)
-        while True:
-            await asyncio.sleep(_MEMORY_LIVE_INTERVAL)
-            sample = await asyncio.to_thread(_sample_memory)
-            if not sample:
-                continue
-            yield _sse("sample", sample)
+        try:
+            first = await asyncio.to_thread(_sample_memory)
+            if first:
+                yield _sse("sample", first)
+            while True:
+                await asyncio.sleep(_MEMORY_LIVE_INTERVAL)
+                sample = await asyncio.to_thread(_sample_memory)
+                if not sample:
+                    continue
+                yield _sse("sample", sample)
+        finally:
+            if client_ip is not None:
+                _sse_release_slot(client_ip)
 
     return StreamingResponse(
         gen(),
@@ -16083,17 +16160,28 @@ def system_cpu_api(minutes: int = 360) -> dict:
 
 
 @app.get("/api/system-cpu/stream")
-async def system_cpu_stream() -> StreamingResponse:
+async def system_cpu_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
+    # Audit 2026-04-26: agregar slot cap (gemelo de system-memory/stream).
+    client_ip: str | None = None
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        if not _sse_acquire_slot(client_ip):
+            raise HTTPException(status_code=429,
+                detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)")
+
     async def gen():
-        state: dict = {}
-        # Prime baseline, wait one interval, then stream.
-        await asyncio.to_thread(_sample_cpu, state)
-        while True:
-            await asyncio.sleep(_CPU_LIVE_INTERVAL)
-            sample = await asyncio.to_thread(_sample_cpu, state)
-            if not sample:
-                continue
-            yield _sse("sample", sample)
+        try:
+            state: dict = {}
+            await asyncio.to_thread(_sample_cpu, state)
+            while True:
+                await asyncio.sleep(_CPU_LIVE_INTERVAL)
+                sample = await asyncio.to_thread(_sample_cpu, state)
+                if not sample:
+                    continue
+                yield _sse("sample", sample)
+        finally:
+            if client_ip is not None:
+                _sse_release_slot(client_ip)
 
     return StreamingResponse(
         gen(),

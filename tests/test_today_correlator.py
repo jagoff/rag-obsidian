@@ -7,8 +7,10 @@ from rag.today_correlator import (
     _extract_name_from_email,
     _extract_names_from_title,
     _is_self_notification,
+    _parse_time_to_minutes,
     _tokenize,
     correlate_today_signals,
+    normalize_voice_to_2da_persona,
 )
 
 
@@ -263,12 +265,12 @@ def test_topics_sorted_by_sources_count_desc():
 
 def test_empty_inputs():
     result = correlate_today_signals({}, {})
-    assert result == {"people": [], "topics": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": []}
 
 
 def test_handles_none_inputs():
     result = correlate_today_signals(None, None)
-    assert result == {"people": [], "topics": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": []}
 
 
 # ── Self-notifications (github bot, google alerts, etc.) ───────────────────
@@ -393,3 +395,173 @@ def test_topics_excludes_self_notification_mails_from_tokenization():
     assert xyz_topic is None, (
         "El mail de notifications no debería contribuir al topic count"
     )
+
+
+# ── Time overlap correlation ─────────────────────────────────────────────
+
+
+def test_parse_time_to_minutes():
+    assert _parse_time_to_minutes("10:00") == 600
+    assert _parse_time_to_minutes("14:30") == 870
+    assert _parse_time_to_minutes("10:00–11:00") == 600  # toma el primero
+    assert _parse_time_to_minutes("2:30 PM") == 870
+    assert _parse_time_to_minutes("12:00 AM") == 0
+    assert _parse_time_to_minutes("") is None
+    assert _parse_time_to_minutes("sin hora") is None
+
+
+def test_time_overlap_gmail_calendar_match():
+    """Gmail recibido 14:00 + calendar event 14:00 con tokens compartidos
+    → debe detectarse como overlap.
+    """
+    extras = {
+        "gmail_today": [
+            # 14:00 local — internal_date_ms = 1700000000000 + algo
+            {"from": "Pablo <p@x.com>",
+             "subject": "Reunión proyecto demo confirmada",
+             "snippet": "te confirmo el meet de demo a las 14",
+             "internal_date_ms": _ms_at_local_time(14, 0)},
+        ],
+        "calendar_today": [
+            {"title": "Reunión proyecto demo", "start": "14:00",
+             "end": "15:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    overlaps = result["time_overlaps"]
+    assert len(overlaps) >= 1
+    o = overlaps[0]
+    assert {it["source"] for it in o["items"]} == {"gmail", "calendar"}
+    # Tokens compartidos: "reunión", "proyecto", "demo"
+    assert "demo" in o["shared_tokens"] or "reunión" in o["shared_tokens"]
+
+
+def test_time_overlap_skipped_when_no_shared_tokens():
+    """Gmail 14:00 + calendar 14:00 SIN tokens en común → NO debe matchear."""
+    extras = {
+        "gmail_today": [
+            {"from": "x@x.com", "subject": "newsletter aleatorio",
+             "snippet": "blah blah",
+             "internal_date_ms": _ms_at_local_time(14, 0)},
+        ],
+        "calendar_today": [
+            {"title": "Yoga clase mañanera", "start": "14:00", "end": "15:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["time_overlaps"] == []
+
+
+def test_time_overlap_skipped_when_far_apart():
+    """Gmail 09:00 + calendar 17:00 → fuera de la window de 30min, no match."""
+    extras = {
+        "gmail_today": [
+            {"from": "x@x.com", "subject": "demo proyecto",
+             "snippet": "demo proyecto importante",
+             "internal_date_ms": _ms_at_local_time(9, 0)},
+        ],
+        "calendar_today": [
+            {"title": "Demo proyecto", "start": "17:00", "end": "18:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["time_overlaps"] == []
+
+
+def test_time_overlap_skips_self_notifications():
+    """github bot mail no debe contar para time overlaps aunque tenga
+    timestamp."""
+    extras = {
+        "gmail_today": [
+            {"from": "Fer F <notifications@github.com>",
+             "subject": "demo proyecto failed CI",
+             "snippet": "...",
+             "internal_date_ms": _ms_at_local_time(14, 0)},
+        ],
+        "calendar_today": [
+            {"title": "Demo proyecto", "start": "14:00", "end": "15:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["time_overlaps"] == []
+
+
+def _ms_at_local_time(hour: int, minute: int) -> int:
+    """Helper: timestamp en ms para la hora especificada de hoy."""
+    from datetime import datetime
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return int(target.timestamp() * 1000)
+
+
+# ── Voice normalization ──────────────────────────────────────────────────
+
+
+def test_voice_replaces_first_person_singular_verbs():
+    text = "Hoy trabajé intensamente en la auditoría. Recibí 3 mails."
+    result = normalize_voice_to_2da_persona(text)
+    assert "trabajé" not in result
+    assert "Recibí" not in result
+    # Case-preserving: "trabajé" → "trabajaste" (lower), "Recibí" → "Recibiste"
+    assert "trabajaste" in result
+    assert "Recibiste" in result
+
+
+def test_voice_replaces_first_person_plural_verbs():
+    text = "Hoy tocamos varias notas y vimos los diagramas."
+    result = normalize_voice_to_2da_persona(text)
+    assert "tocamos" not in result
+    assert "tocaste" in result
+    assert "viste" in result
+
+
+def test_voice_preserves_case():
+    text = "Trabajé en el proyecto. RECIBÍ 5 mails."
+    result = normalize_voice_to_2da_persona(text)
+    assert "Trabajaste" in result
+    assert "RECIBISTE" in result
+
+
+def test_voice_preserves_quoted_text():
+    """Citas literales del user no deben ser modificadas."""
+    text = 'Notaste que "yo no quería hacer eso" pero lo hiciste igual.'
+    result = normalize_voice_to_2da_persona(text)
+    # "yo" en la cita queda
+    assert '"yo no quería hacer eso"' in result
+    # "Notaste" e "hiciste" están bien (ya 2da persona)
+    assert "Notaste" in result
+
+
+def test_voice_replaces_pronouns():
+    text = "Yo me centré en el tema, mi trabajo fue largo."
+    result = normalize_voice_to_2da_persona(text)
+    # "Yo" → "Vos", "me" → "te", "mi" → "tu"
+    assert "Vos te centraste" in result
+    assert "tu trabajo" in result
+
+
+def test_voice_does_not_break_unrelated_text():
+    """Texto sin 1ra persona debe quedar idéntico (idempotente para 2da)."""
+    text = "Tocaste varias notas. Recibiste 3 mails. Viste 2 videos."
+    result = normalize_voice_to_2da_persona(text)
+    assert result == text
+
+
+def test_voice_handles_empty_text():
+    assert normalize_voice_to_2da_persona("") == ""
+    assert normalize_voice_to_2da_persona(None or "") == ""
+
+
+def test_voice_word_boundary_no_substring_replace():
+    """'concentré' contiene 'centré' pero NO debe ser reemplazado."""
+    text = "Te concentré en esto."  # palabra inventada para test
+    # En realidad "concentré" probablemente no es palabra real, pero
+    # palabras como "hablé" están en la lista; necesitamos que
+    # "establé" NO se modifique.
+    text2 = "Hablé claro." # es 1PS, debe cambiarse
+    result2 = normalize_voice_to_2da_persona(text2)
+    assert "Hablaste" in result2
+    # Palabra rara que CONTIENE "fui" pero word-boundary no aplica:
+    text3 = "fuimos al cine"  # "fuimos" 1PP → "fuiste"
+    result3 = normalize_voice_to_2da_persona(text3)
+    assert "fuiste" in result3

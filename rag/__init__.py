@@ -40001,9 +40001,20 @@ def _generate_today_narrative(prompt: str) -> str:
             options=TODAY_BRIEF_OPTIONS,
             keep_alive=chat_keep_alive(),
         )
-        return (resp.message.content or "").strip()
+        raw = (resp.message.content or "").strip()
     except Exception:
         return ""
+    # Post-processing — el prompt prohíbe 1ª persona pero qwen2.5:7b
+    # se desliza ~10% del tiempo ("trabajé", "me centré"). Este pass
+    # final reemplaza verbos / pronombres en 1ª persona singular y
+    # plural por 2ª persona singular ("trabajaste", "te centraste").
+    # Preserva citas literales entre comillas para no destrozar texto
+    # del usuario citado.
+    try:
+        from rag.today_correlator import normalize_voice_to_2da_persona
+        return normalize_voice_to_2da_persona(raw)
+    except Exception:
+        return raw
 
 
 # ── Phase 4b: `rag wa-tasks` Click command moved to `rag.wa_tasks` ──────

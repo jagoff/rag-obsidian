@@ -9,7 +9,7 @@ This module pre-computes the patterns BEFORE the LLM call so the prompt
 can include a structured ENTIDADES CROSS-SOURCE block. The LLM then narrates
 matches that already exist instead of inventing them.
 
-Three correlations:
+Three correlations + one post-processor:
 
 1. **People** — names that appear in ≥2 sources (gmail-from, wa-name,
    calendar-title). Canonicalized + deduplicated. Output: list of
@@ -21,9 +21,17 @@ Three correlations:
 
 3. **Time overlaps** — events at same hour bucket cross-source (e.g.
    gmail received 14:23 + calendar event 14:00 with overlapping tokens).
+   Output: list of {time, items: [{source, label, snippet}], shared_tokens}.
+
+4. **Voice normalization** (post-processing) — `normalize_voice_to_2da_persona`
+   replaces 1st-person verbs ("recibí", "trabajé", "me centré") with 2nd
+   person singular ("recibiste", "trabajaste", "te centraste") in the LLM
+   output. The prompt forbids 1ª persona but the 7B model slips ~10% of
+   the time; this is the safety net.
 
 Used by `web/server.py:_home_compute` → passed to the prompt via
-`extras["correlations"]` → rendered in `_render_today_prompt`.
+`extras["correlations"]` → rendered in `_render_today_prompt`. The voice
+normalizer wraps `_generate_today_narrative`'s return value.
 """
 
 from __future__ import annotations
@@ -491,11 +499,285 @@ def _correlate_topics(today_ev: dict, extras: dict) -> list[dict]:
     return out[:12]
 
 
+# ── Time overlap correlation ──────────────────────────────────────────────
+
+
+_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+
+
+def _parse_time_to_minutes(time_str: str) -> int | None:
+    """Parse "10:00" / "14:30 PM" / "10:00–11:00" → minutes since midnight
+    of the FIRST time mentioned. None si no hay hora parseable.
+    """
+    if not time_str:
+        return None
+    m = _TIME_RE.search(time_str)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mm = int(m.group(2))
+    # AM/PM no afecta — calendars en macOS Calendar.app suelen venir
+    # ya en formato 24hs. Si está PM y el hour es <12, sumar 12.
+    if "PM" in time_str.upper() and h < 12:
+        h += 12
+    elif "AM" in time_str.upper() and h == 12:
+        h = 0
+    return h * 60 + mm
+
+
+def _correlate_time_overlaps(
+    today_ev: dict, extras: dict, window_min: int = 30,
+) -> list[dict]:
+    """Detect events from distinct sources that fall in the same time
+    bucket AND share tokens. Useful para detectar:
+      - gmail "Reunión 14hs confirmada" recibido 13:45 + calendar event
+        "Reunión 14:00–15:00" → match probable
+      - calendar "Demo cliente 14:00" + gmail "Re: Demo" recibido 13:30
+        → cross-reference
+    Cuando 2 items coinciden en time + tienen ≥2 tokens en común
+    (post-stopwords, ≥4 chars), es overlap.
+
+    Returns: list of {time, items: [{source, label, snippet, ts_minutes}],
+    shared_tokens} sorted by time asc.
+
+    `window_min` (default 30): items dentro de ±N min se consideran
+    "mismo bucket". 30 captura "received 13:45 vs event 14:00" pero no
+    junta items de horas distintas.
+    """
+    items: list[dict] = []
+
+    # Gmail today: timestamp del internal_date_ms
+    for m in (extras.get("gmail_today") or [])[:20]:
+        if _is_self_notification(m.get("from") or m.get("sender") or ""):
+            continue
+        ts_ms = m.get("internal_date_ms")
+        if not ts_ms:
+            continue
+        from datetime import datetime as _dt
+        try:
+            t = _dt.fromtimestamp(int(ts_ms) / 1000)
+            ts_minutes = t.hour * 60 + t.minute
+        except (ValueError, OSError):
+            continue
+        text = (m.get("subject") or "") + " " + (m.get("snippet") or "")
+        items.append({
+            "source": "gmail",
+            "label": (m.get("subject") or "")[:80],
+            "snippet": (m.get("snippet") or "")[:80],
+            "ts_minutes": ts_minutes,
+            "time_str": f"{t.hour:02d}:{t.minute:02d}",
+            "tokens": _tokenize(text),
+        })
+
+    # Calendar today: time_range OR start time
+    for c in (extras.get("calendar_today") or [])[:20]:
+        time_str = c.get("start") or c.get("time_range") or ""
+        ts_minutes = _parse_time_to_minutes(time_str)
+        if ts_minutes is None:
+            continue
+        title = c.get("title") or ""
+        items.append({
+            "source": "calendar",
+            "label": title[:80],
+            "snippet": (c.get("time_range") or time_str)[:40],
+            "ts_minutes": ts_minutes,
+            "time_str": time_str.split("–")[0].strip()[:7],
+            "tokens": _tokenize(title),
+        })
+
+    # Sort by ts_minutes para que el sliding window sea trivial
+    items.sort(key=lambda x: x["ts_minutes"])
+
+    # Para cada item, mirar si otro item de DISTINTA fuente está en
+    # ±window_min Y comparte ≥2 tokens.
+    overlaps: list[dict] = []
+    seen_pairs: set[frozenset] = set()
+    for i, a in enumerate(items):
+        for b in items[i + 1:]:
+            if b["ts_minutes"] - a["ts_minutes"] > window_min:
+                break  # sorted, futuros son más lejanos
+            if a["source"] == b["source"]:
+                continue
+            shared = a["tokens"] & b["tokens"]
+            if len(shared) < 2:
+                continue
+            pair_key = frozenset({
+                (a["source"], a["label"]),
+                (b["source"], b["label"]),
+            })
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            overlaps.append({
+                "time": a["time_str"],
+                "items": [
+                    {"source": a["source"], "label": a["label"],
+                     "snippet": a["snippet"]},
+                    {"source": b["source"], "label": b["label"],
+                     "snippet": b["snippet"]},
+                ],
+                "shared_tokens": sorted(shared),
+            })
+
+    return overlaps[:6]  # top-N para no inflar el prompt
+
+
+# ── Voice normalization (post-processing del LLM output) ──────────────────
+
+
+# Mapeo 1ra persona singular ("yo trabajé") → 2da persona singular ("vos
+# trabajaste"). Solo se chequean palabras completas (word-boundary).
+# Ordenado por longitud DESC para que "encontré" matchee antes que "encé".
+_VOICE_VERB_REPLACEMENTS_1PS = [
+    # 1PS pretérito perfecto simple regulares -ar → -aste
+    ("trabajé", "trabajaste"), ("revisé", "revisaste"),
+    ("centré", "centraste"), ("pasé", "pasaste"), ("noté", "notaste"),
+    ("preparé", "preparaste"), ("armé", "armaste"), ("dejé", "dejaste"),
+    ("envié", "enviaste"), ("mandé", "mandaste"), ("toqué", "tocaste"),
+    ("escribí", "escribiste"), ("entré", "entraste"),
+    ("encontré", "encontraste"), ("intenté", "intentaste"),
+    ("cerré", "cerraste"), ("llamé", "llamaste"), ("hablé", "hablaste"),
+    ("pregunté", "preguntaste"), ("contesté", "contestaste"),
+    ("avancé", "avanzaste"), ("logré", "lograste"), ("terminé", "terminaste"),
+    ("empecé", "empezaste"), ("agregué", "agregaste"),
+    ("investigué", "investigaste"), ("comparé", "comparaste"),
+    ("reuní", "reuniste"),
+    # 1PS irregulares
+    ("recibí", "recibiste"), ("vi", "viste"), ("fui", "fuiste"),
+    ("estuve", "estuviste"), ("tuve", "tuviste"), ("hice", "hiciste"),
+    ("dije", "dijiste"), ("vine", "viniste"), ("puse", "pusiste"),
+    ("supe", "supiste"), ("anduve", "anduviste"), ("traje", "trajiste"),
+    ("pude", "pudiste"), ("quise", "quisiste"), ("leí", "leíste"),
+    ("oí", "oíste"), ("salí", "saliste"), ("dormí", "dormiste"),
+    ("comí", "comiste"), ("subí", "subiste"), ("abrí", "abriste"),
+    ("escogí", "escogiste"), ("seguí", "seguiste"), ("conseguí", "conseguiste"),
+    # Presente 1PS irregulares
+    ("tengo", "tenés"), ("hago", "hacés"), ("digo", "decís"),
+    ("pongo", "ponés"), ("salgo", "salís"), ("vengo", "venís"),
+    ("conozco", "conocés"), ("sé", "sabés"),
+    # 1ra plural ("nosotros") en pretérito perfecto suelen sonar igual
+    # (-amos / -imos) — el LLM a veces dice "trabajamos" / "vimos" para
+    # incluir al user. Convertir a 2da singular del usuario.
+    ("trabajamos", "trabajaste"), ("revisamos", "revisaste"),
+    ("vimos", "viste"), ("hicimos", "hiciste"), ("estuvimos", "estuviste"),
+    ("tuvimos", "tuviste"), ("fuimos", "fuiste"), ("dijimos", "dijiste"),
+    ("tocamos", "tocaste"), ("notamos", "notaste"),
+    ("encontramos", "encontraste"), ("dejamos", "dejaste"),
+    ("recibimos", "recibiste"), ("preparamos", "preparaste"),
+]
+
+
+# Pronombres / determinantes en 1ra persona → 2da. Cuidado con falsos
+# positivos: "mi" puede ser nota musical. La regla pragmática: solo
+# reemplazar al inicio de palabra Y dentro de un contexto de prosa
+# narrativa. El regex word-boundary es suficiente.
+_VOICE_PRONOUN_REPLACEMENTS = [
+    # Pronombres sujeto / objeto
+    ("yo", "vos"),
+    # "me" reflexivo: se queda como "te"
+    ("me ", "te "),
+    # "mi/mí/mío/míos/mía/mías" → "tu/vos/tuyo..."
+    ("mi ", "tu "),
+    ("mí ", "vos "),
+    ("mío", "tuyo"),
+    ("míos", "tuyos"),
+    ("mía", "tuya"),
+    ("mías", "tuyas"),
+    # "nos" reflexivo plural ("nos vimos") → "te"
+    ("nos ", "te "),
+]
+
+
+def _make_word_boundary_pattern(words: list[str]) -> "re.Pattern":
+    """Compila un único regex que matchea CUALQUIERA de las palabras
+    como word completa (word boundary). Más rápido que iterar N regex.
+    """
+    # Sort longest-first para que "encontré" capture antes que "encé"
+    sorted_words = sorted(words, key=len, reverse=True)
+    pattern = r"\b(?:" + "|".join(re.escape(w) for w in sorted_words) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def normalize_voice_to_2da_persona(text: str) -> str:
+    """Reemplaza verbos / pronombres en 1ra persona por 2da singular.
+
+    Pragmático: el prompt prohíbe 1ª persona pero el modelo 7B se desliza
+    ~10% del tiempo. Este pass es el último guard. NO toca:
+      - Texto entre comillas (preserva citas literales del user)
+      - Substrings dentro de palabras (ej. "concentré" no matchea
+        "centré" porque el word-boundary se aplica)
+      - Code fences (no debería haber en briefs, pero por las dudas)
+
+    Estrategia de preservación de citas: split por delimiters de cita
+    `"..."` y `'...'`, normalizar SOLO los segmentos fuera de comillas,
+    re-juntar.
+
+    Aplica una sola vez (no idempotente para evitar over-replace en
+    ediciones repetidas).
+    """
+    if not text:
+        return text
+
+    # Build maps: lowercase verb / pronoun → replacement (preservando
+    # case del original donde se pueda — ej. "Recibí" → "Recibiste").
+    verb_map = {orig: repl for orig, repl in _VOICE_VERB_REPLACEMENTS_1PS}
+    verb_re = _make_word_boundary_pattern(list(verb_map.keys()))
+
+    # Pronouns con espacio trailing — usamos un regex distinto porque
+    # ya incluye el espacio en el match.
+    # Para "me " etc., el regex es \bme\s — matchea la palabra + 1 ws.
+    pronoun_pattern = r"\b(yo|me|mi|mí|mío|míos|mía|mías|nos)\b"
+    pronoun_re = re.compile(pronoun_pattern, re.IGNORECASE)
+    pronoun_map = {
+        "yo": "vos",
+        "me": "te",
+        "mi": "tu",
+        "mí": "vos",
+        "mío": "tuyo",
+        "míos": "tuyos",
+        "mía": "tuya",
+        "mías": "tuyas",
+        "nos": "te",
+    }
+
+    def _preserve_case(orig: str, repl: str) -> str:
+        if orig.isupper():
+            return repl.upper()
+        if orig[:1].isupper():
+            return repl[:1].upper() + repl[1:]
+        return repl
+
+    def _replace_verb(m: re.Match) -> str:
+        orig = m.group(0)
+        repl = verb_map.get(orig.lower(), orig)
+        return _preserve_case(orig, repl)
+
+    def _replace_pronoun(m: re.Match) -> str:
+        orig = m.group(0)
+        repl = pronoun_map.get(orig.lower(), orig)
+        return _preserve_case(orig, repl)
+
+    # Preservar citas: split text por comillas dobles y procesar solo
+    # segmentos pares (índices 0, 2, 4...).
+    parts = re.split(r'(".*?"|\'.*?\')', text)
+    out_parts: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:  # adentro de comillas
+            out_parts.append(part)
+            continue
+        # Aplicar verb replacements primero, después pronouns.
+        normalized = verb_re.sub(_replace_verb, part)
+        normalized = pronoun_re.sub(_replace_pronoun, normalized)
+        out_parts.append(normalized)
+    return "".join(out_parts)
+
+
 def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     """Pre-correlate cross-source signals. Returns:
         {
             "people": [{name, appearances: [...], sources_count}, ...],
             "topics": [{topic, sources, sources_count}, ...],
+            "time_overlaps": [{time, items: [...], shared_tokens}, ...],
         }
 
     Empty buckets are silently skipped — `today_ev` and `extras` can
@@ -504,4 +786,5 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
     return {
         "people": _correlate_people(today_ev or {}, extras or {}),
         "topics": _correlate_topics(today_ev or {}, extras or {}),
+        "time_overlaps": _correlate_time_overlaps(today_ev or {}, extras or {}),
     }

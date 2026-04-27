@@ -292,3 +292,34 @@
   .diag-body { padding: 12px 14px; }
   .diag-footer { padding: 10px 14px; }
 }
+
+/* ── Trigger button (cada línea de error en /logs y /status) ─────────
+ *
+ * Pequeño, compacto, hereda el tema de la página. Tooltip via title=.
+ * Hover y focus visible para accessibility.
+ */
+.diag-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  border: 1px solid color-mix(in srgb, var(--diag-cyan, #4a9eff) 30%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--diag-cyan, #4a9eff) 8%, transparent);
+  color: var(--diag-fg, currentColor);
+  cursor: pointer;
+  vertical-align: middle;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+}
+.diag-trigger:hover {
+  background: color-mix(in srgb, var(--diag-cyan, #4a9eff) 18%, transparent);
+  border-color: color-mix(in srgb, var(--diag-cyan, #4a9eff) 50%, transparent);
+}
+.diag-trigger:focus-visible {
+  outline: 2px solid var(--diag-cyan, #4a9eff);
+  outline-offset: 1px;
+}

@@ -20,9 +20,16 @@
  *      respuesta del LLM en Markdown light-rendered.
  *   4. Cada bloque ```bash``` se renderea con un botón "▶ Ejecutar".
  *   5. Click en "▶ Ejecutar" → POST /api/diagnose-error/execute con el
- *      comando exacto. ESTÁ DESHABILITADO server-side por seguridad
- *      (returns 503); el modal muestra el mensaje del server pidiendo
- *      copy-paste manual.
+ *      comando exacto. El server valida contra una whitelist de comandos
+ *      seguros (rag/ollama/launchctl/tail/head/cat/ls/wc + validators
+ *      por argumento). Si el comando NO está en whitelist o tiene
+ *      metachars peligrosos (`;`, `|`, `>`, `$()`, etc.), responde 403
+ *      con el motivo. El modal sigue mostrando "📋 copiar" como
+ *      alternativa para que el user pueda llevarlo a su terminal real.
+ *
+ *      Por compat con versiones que devolvían 503 (auto-execute
+ *      deshabilitado), el handler abajo trata 503 igual que 403 →
+ *      ofrecer copiar como alternativa.
  *
  * Markdown rendering: light, manual. NO agregamos `marked` por algo tan
  * acotado. Sólo necesitamos:
@@ -201,9 +208,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ command: cmd }),
         });
-        if (resp.status === 503) {
+        // 403 = comando rechazado por whitelist (caso esperado, no error).
+        // 503 = backwards compat con versiones donde /execute estaba deshabilitado
+        // entero. Ambos: degradamos a "copiá manualmente" con el motivo.
+        if (resp.status === 503 || resp.status === 403) {
           const data = await resp.json();
-          resultEl.textContent = data.detail || "auto-ejecución deshabilitada";
+          resultEl.textContent = data.detail || "comando no ejecutable";
           runBtn.textContent = "deshabilitado";
           // Botón "copiar" como alternativa.
           const copyBtn = document.createElement("button");

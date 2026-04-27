@@ -701,14 +701,68 @@
       ul.innerHTML = `<li><span class="cause" style="color:var(--green)">sin errores</span><span class="count">0</span></li>`;
       return;
     }
-    ul.innerHTML = items.slice(0, 7).map((it) => {
+    // Render con un botón "🩺 fix" por entry. data-idx permite recuperar
+    // el item original en el handler — pasamos al modal el rollup
+    // (key/source/count) como error_text agregado, sin contexto granular.
+    const slice = items.slice(0, 7);
+    ul.innerHTML = slice.map((it, idx) => {
       const srcCls = it.source === "sql" ? "src-sql"
         : it.source === "silent" ? "src-silent"
         : "src-mixed";
       const keyEsc = escapeHTML(it.key);
       const cnt = Number(it.count || 0).toLocaleString("es-AR");
-      return `<li><span class="cause" title="${keyEsc}"><span class="src-dot ${srcCls}"></span>${keyEsc}</span><span class="count">${cnt}</span></li>`;
+      return (
+        `<li>` +
+          `<span class="cause" title="${keyEsc}">` +
+            `<span class="src-dot ${srcCls}"></span>${keyEsc}` +
+          `</span>` +
+          `<span class="count">${cnt}</span>` +
+          `<button class="diag-trigger" type="button" data-idx="${idx}" ` +
+            `title="Diagnosticar este error con IA">🩺 fix</button>` +
+        `</li>`
+      );
     }).join("");
+
+    // Wire-up de los botones "🩺 fix" del breakdown.
+    // En /status no tenemos las líneas exactas del log (sólo el rollup
+    // por categoría), así que el modal abre con un error_text sintético:
+    // key + count + source. El LLM diagnostica el patrón general; si el
+    // user quiere precisión por línea, va a /logs y clickea ahí.
+    ul.querySelectorAll(".diag-trigger").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!window.DiagnoseModal) {
+          alert("Modal de diagnóstico no cargado. Recargá la página.");
+          return;
+        }
+        const i = parseInt(btn.dataset.idx, 10);
+        const it = slice[i];
+        if (!it) return;
+        // Mapeo source → log file path conocido (informativo).
+        const fileLabel =
+          it.source === "sql"
+            ? "~/.local/share/obsidian-rag/sql_state_errors.jsonl"
+            : it.source === "silent"
+              ? "~/.local/share/obsidian-rag/silent_errors.jsonl"
+              : "(múltiples logs)";
+        const errorText =
+          `[Aggregated rollup last 24h]\n` +
+          `Key: ${it.key}\n` +
+          `Source: ${it.source}\n` +
+          `Count: ${it.count} ocurrencias en las últimas 24h.\n` +
+          `(Sin sample concreto — esto es el rollup del /api/status/errors. ` +
+          `Para ver una instancia específica, andá a /logs y clickeá ahí.)`;
+        window.DiagnoseModal.open({
+          service: it.source ? `errors:${it.source}` : "errors:mixed",
+          file: fileLabel,
+          line_n: 0,
+          error_text: errorText,
+          context_lines: [],
+          timestamp: null,
+        });
+      });
+    });
   }
 
   // ── Freshness matrix card (real) ────────────────────────────────────

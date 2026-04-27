@@ -6179,18 +6179,21 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     if total_ars is None and total_usd is None and not closing_date and not due_date:
         return None
 
-    # Top 5 movimientos por monto absoluto, separando ARS/USD para que
-    # las dos monedas tengan visibilidad.
-    ars_purchases = sorted(
+    # Movimientos completos por moneda, ordenados por monto descendente.
+    # `all_purchases_ars/usd` = TODOS los movimientos del ciclo (para
+    # respuestas de "detalle"). `top_purchases_ars/usd` = top 5/3
+    # (para summary cortos). Mantener ambos para retrocompat con
+    # `_render_cards_answer` y otros consumers.
+    all_ars_purchases = sorted(
         (p for p in top_purchases if p["currency"] == "ARS"),
         key=lambda p: p["amount"],
         reverse=True,
-    )[:5]
-    usd_purchases = sorted(
+    )
+    all_usd_purchases = sorted(
         (p for p in top_purchases if p["currency"] == "USD"),
         key=lambda p: p["amount"],
         reverse=True,
-    )[:3]
+    )
 
     try:
         mtime = path.stat().st_mtime
@@ -6209,8 +6212,10 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         "total_usd": total_usd,
         "minimum_ars": minimum_ars,
         "minimum_usd": minimum_usd,
-        "top_purchases_ars": ars_purchases,
-        "top_purchases_usd": usd_purchases,
+        "top_purchases_ars": all_ars_purchases[:5],
+        "top_purchases_usd": all_usd_purchases[:3],
+        "all_purchases_ars": all_ars_purchases,
+        "all_purchases_usd": all_usd_purchases,
         "source_file": path.name,
         "source_mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
     }

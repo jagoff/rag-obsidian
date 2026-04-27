@@ -42410,6 +42410,61 @@ def _detect_finance_intent(question: str) -> str:
     return "generic"
 
 
+def _wants_finance_detail(question: str) -> bool:
+    """Detecta si el user quiere TODOS los movimientos (detalle completo)
+    en lugar del summary corto con top 3-5. Triggers:
+
+      - "detalle" / "detallado" / "todo el detalle" / "dame el detalle"
+      - "todos los movimientos" / "todos los gastos" / "lista completa"
+      - "lista" en contexto de finanzas
+      - "items" / "ítems"
+
+    Sin matches: respuesta corta default (top consumos).
+    """
+    q = (question or "").lower()
+    return bool(re.search(
+        r"\bdetalle\b|\bdetallad[oa]\b|\btodos\s+los\s+(movimientos|gastos|consumos)\b|"
+        r"\blista\s+(completa|de\s+(consumos|movimientos|gastos))\b|\b\u00edtems?\b|\bitems\b",
+        q,
+    ))
+
+
+_DESC_NOISE_RE = re.compile(
+    # Códigos del banco que son ruido — no aportan al user:
+    # "Merpago*idilicadeco" → "idilicadeco" (sacamos prefijo del processor)
+    # "Claro deb aut 000021416263265" → "Claro" (sacamos "deb aut <numbers>")
+    # "Pago tic ppt adventistas" → ok como está
+    # "Rapipago x123456" → "Rapipago"
+    r"^(merpago|mercadopago|mercpago)\*\s*|"
+    r"\s*(deb(\.|ito)?\s*aut(\.|om(a|á)tico)?|debito\s+autom|"
+    r"d\.?\s*automatico)\s+\d{5,}.*$|"
+    r"\s+x?\d{6,}\s*$|"
+    r"\s+ref\.?\s*\d+\s*$|"
+    r"\s+ord\.?\s*\d+\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_purchase_description(desc: str) -> str:
+    """Limpia descripciones crudas del banco para que sean legibles.
+
+    Ejemplos:
+      "Merpago*idilicadeco"            → "idilicadeco"
+      "Claro deb aut 000021416263265"  → "Claro"
+      "Pago tic ppt adventistas"       → "Pago tic ppt adventistas" (no toca)
+      "Rapipago x123456"               → "Rapipago"
+
+    No agresivo — preserva descripciones que ya son legibles. Solo
+    strippea patterns de ruido bancario explícitos.
+    """
+    if not desc:
+        return ""
+    cleaned = _DESC_NOISE_RE.sub("", desc).strip()
+    # Si después del clean queda vacío (la regex match consumió todo),
+    # fallback al original — mejor algo legible que vacío.
+    return cleaned or desc.strip()
+
+
 def _finance_short_circuit_answer(
     question: str,
 ) -> tuple[str, int, bool, float] | None:
@@ -42502,17 +42557,23 @@ def _finance_cards_comment(question: str, finance: dict | None, cards: list[dict
     mensaje específico al intent.
     """
     intent = _detect_finance_intent(question)
+    detail = _wants_finance_detail(question)
 
     if intent == "cards":
-        return _render_cards_answer(cards)
+        return _render_cards_answer(cards, detail=detail)
     if intent == "moze":
-        return _render_moze_answer(finance)
-    return _render_generic_finance_answer(finance, cards)
+        return _render_moze_answer(finance, detail=detail)
+    return _render_generic_finance_answer(finance, cards, detail=detail)
 
 
-def _render_cards_answer(cards: list[dict] | None) -> str:
+def _render_cards_answer(cards: list[dict] | None, *, detail: bool = False) -> str:
     """Respuesta para queries tipo "cuánto gasté de tarjeta este mes".
-    SOLO datos del CSV de tarjeta — MOZE explícitamente excluido."""
+    SOLO datos del CSV de tarjeta — MOZE explícitamente excluido.
+
+    Si `detail=True` (user pidió "detalle"/"todos los movimientos"),
+    devuelve formato multi-línea con TODOS los consumos del ciclo en
+    lugar del summary corto con top 3-5.
+    """
     if not cards:
         return (
             "No tengo data fresca de tus tarjetas — "
@@ -42531,14 +42592,54 @@ def _render_cards_answer(cards: list[dict] | None) -> str:
             "Tus tarjetas figuran en el sistema pero sin montos del último "
             "ciclo — revisá el export del banco."
         )
+
+    # ── Modo DETALLE: lista completa de movimientos ─────────────────
+    if detail:
+        out_lines = []
+        for c in cards:
+            brand = c.get("brand") or "Tarjeta"
+            last4 = c.get("last4") or "----"
+            sub_parts = []
+            if c.get("total_ars"):
+                sub_parts.append(_fmt_ars(c["total_ars"]))
+            if c.get("total_usd"):
+                sub_parts.append(_fmt_usd(c["total_usd"]))
+            header = f"📇 {brand} ····{last4} — {' + '.join(sub_parts)}"
+            if c.get("closing_date"):
+                header += f" (cerró {c['closing_date']})"
+            out_lines.append(header)
+            # ARS — preferimos `all_purchases_ars` si está disponible
+            # (no truncado), sino caemos a `top_purchases_ars`.
+            ars_list = c.get("all_purchases_ars") or c.get("top_purchases_ars") or []
+            if ars_list:
+                out_lines.append("\nMovimientos ARS:")
+                for p in ars_list:
+                    desc = _clean_purchase_description(p.get("description") or "—")
+                    amt = _fmt_ars(p.get("amount") or 0)
+                    date = p.get("date") or "?"
+                    out_lines.append(f"  · {date} · {desc} · {amt}")
+            usd_list = c.get("all_purchases_usd") or c.get("top_purchases_usd") or []
+            if usd_list:
+                out_lines.append("\nMovimientos USD:")
+                for p in usd_list:
+                    desc = _clean_purchase_description(p.get("description") or "—")
+                    amt = _fmt_usd(p.get("amount") or 0)
+                    date = p.get("date") or "?"
+                    out_lines.append(f"  · {date} · {desc} · {amt}")
+            out_lines.append("")  # separador entre tarjetas
+        return "\n".join(out_lines).rstrip()
+
+    # ── Modo SUMMARY default: top 3 consumos ────────────────────────
     if len(cards) == 1:
         c = cards[0]
         brand = c.get("brand") or "Tarjeta"
         last4 = c.get("last4") or "----"
-        # Top 3 consumos ARS si los hay.
         top = (c.get("top_purchases_ars") or [])[:3]
         if top:
-            descs = [(p.get("description") or "—").strip() for p in top]
+            descs = [
+                _clean_purchase_description(p.get("description") or "—")
+                for p in top
+            ]
             return (
                 f"Tarjeta ({brand} ····{last4}): {' + '.join(parts)} — "
                 f"top consumos: {', '.join(descs)}."
@@ -42561,9 +42662,13 @@ def _render_cards_answer(cards: list[dict] | None) -> str:
     return f"Tarjetas: {' + '.join(parts)}."
 
 
-def _render_moze_answer(finance: dict | None) -> str:
+def _render_moze_answer(finance: dict | None, *, detail: bool = False) -> str:
     """Respuesta para queries tipo "cuánto gasté en MOZE/efectivo este mes".
-    SOLO datos de MOZE — tarjetas explícitamente excluidas."""
+    SOLO datos de MOZE — tarjetas explícitamente excluidas.
+
+    `detail=True`: lista TODAS las categorías + USD (no solo top 1).
+    """
+    _ = detail  # acepta el flag para uniformidad — render extendido abajo
     if not finance or not isinstance(finance, dict):
         return (
             "No tengo data fresca de MOZE — "
@@ -42576,20 +42681,43 @@ def _render_moze_answer(finance: dict | None) -> str:
             "No tengo data fresca de MOZE — "
             "el último export de la app puede no estar al día."
         )
+    if detail:
+        # Modo detalle: header + tabla de categorías + USD.
+        out = [f"💰 MOZE — {_fmt_ars(this_month)}"]
+        prev = ars.get("prev_month")
+        delta_pct = ars.get("delta_pct")
+        if prev and delta_pct is not None:
+            sign = "+" if delta_pct >= 0 else ""
+            out.append(f"  Mes anterior: {_fmt_ars(prev)} ({sign}{delta_pct:.1f}%)")
+        proj = ars.get("projected")
+        if proj:
+            out.append(f"  Proyectado fin de mes: {_fmt_ars(proj)}")
+        # Todas las categorías.
+        cats = ars.get("top_categories") or []
+        if cats:
+            out.append("\nCategorías:")
+            for c in cats:
+                share = round((c.get("share") or 0) * 100)
+                out.append(
+                    f"  · {c.get('name') or '—'}: {_fmt_ars(c.get('amount') or 0)} ({share}%)"
+                )
+        usd = (finance.get("usd") or {}).get("this_month")
+        if usd:
+            out.append(f"\nUSD este mes: {_fmt_usd(usd)}")
+        return "\n".join(out)
+
+    # Modo summary default.
     parts = [f"MOZE: {_fmt_ars(this_month)}"]
-    # Comparación con mes anterior si existe.
     prev = ars.get("prev_month")
     delta_pct = ars.get("delta_pct")
     if prev and delta_pct is not None:
         sign = "+" if delta_pct >= 0 else ""
         parts.append(f"vs mes ant {_fmt_ars(prev)} ({sign}{delta_pct:.1f}%)")
-    # Top categoría si la hay.
     cats = (ars.get("top_categories") or [])[:1]
     if cats:
         c = cats[0]
         share = round((c.get("share") or 0) * 100)
         parts.append(f"top: {c.get('name') or '—'} {share}%")
-    # USD si existe.
     usd = (finance.get("usd") or {}).get("this_month")
     if usd:
         parts.append(f"+ {_fmt_usd(usd)}")
@@ -42597,11 +42725,21 @@ def _render_moze_answer(finance: dict | None) -> str:
 
 
 def _render_generic_finance_answer(
-    finance: dict | None, cards: list[dict] | None,
+    finance: dict | None, cards: list[dict] | None, *, detail: bool = False,
 ) -> str:
     """Respuesta para queries genéricas tipo "cuánto gasté este mes" (sin
     discriminar fuente). Cita las dos fuentes ETIQUETADAS por separado —
-    NO suma ni da total combinado salvo que el user lo pida explícito."""
+    NO suma ni da total combinado salvo que el user lo pida explícito.
+
+    `detail=True`: emite versión larga de cards + MOZE concatenadas.
+    """
+    if detail:
+        # Combinamos los dos detalles separados con header.
+        return (
+            _render_cards_answer(cards, detail=True)
+            + "\n\n"
+            + _render_moze_answer(finance, detail=True)
+        )
     have_cards = cards and any(c.get("total_ars") or c.get("total_usd") for c in cards)
     have_moze = (
         finance and isinstance(finance, dict)

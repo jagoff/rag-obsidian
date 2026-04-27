@@ -4102,6 +4102,51 @@ def related(req: RelatedRequest) -> dict:
     return {"items": items}
 
 
+# ── Helper compartido: excluded folders ──────────────────────────────────────
+#
+# Los endpoints `/api/notes/{related,contradictions,wikilink-suggestions}`
+# aceptan un query param `exclude_folders` (CSV) que filtra ítems cuyo
+# `path` arranca con cualquiera de los prefijos. Pensado para el plugin
+# Obsidian: el user configura "no me sugieras nada de 04-Archive ni
+# 00-Inbox" en settings y cada call pasa esos folders como filtro.
+#
+# Decisión: filter SERVER-SIDE (no client) porque:
+#   - Para contradictions cada call cuesta 5-10s del LLM. Si los items
+#     después se descartan client-side, el budget del LLM se desperdicia.
+#   - El backend ya conoce VAULT_PATH y los paths normalizados; aplicar
+#     aquí es más confiable que reimplementar match en el plugin.
+#
+# El match es por **prefijo + separador** — "04-Archive" matchea
+# "04-Archive/X.md" y "04-Archive/Sub/Y.md" pero NO "04-Archive2/Z.md"
+# (que sería un folder vecino sin relación). Por eso normalizamos
+# agregando "/" cuando no termina en uno.
+
+def _parse_exclude_folders(s: str | None) -> list[str]:
+    """Parsea el query param `exclude_folders` (CSV) en una lista de
+    prefijos normalizados con "/" al final."""
+    if not s:
+        return []
+    out: list[str] = []
+    for raw in s.split(","):
+        folder = raw.strip().strip("/")
+        if not folder:
+            continue
+        out.append(folder + "/")
+    return out
+
+
+def _is_in_excluded_folder(path: str, excluded: list[str]) -> bool:
+    """True si `path` arranca con cualquiera de los prefijos `excluded`.
+
+    `excluded` debe venir ya normalizado con `/` al final
+    (vía `_parse_exclude_folders`).
+    """
+    if not excluded:
+        return False
+    p = path.lstrip("/")
+    return any(p.startswith(prefix) for prefix in excluded)
+
+
 # ── /api/notes/related ────────────────────────────────────────────────────────
 # Distinto del `/api/related` de arriba (que es enrichment externo Deezer/
 # YouTube). Este endpoint devuelve **notas del vault** relacionadas a una
@@ -4113,7 +4158,12 @@ def related(req: RelatedRequest) -> dict:
 # cached con la invalidation correcta (watchdog → reindex bumpa col.id,
 # que dispara rebuild). Cold call ~1-2s en vaults grandes; cached <100ms.
 @app.get("/api/notes/related")
-def notes_related(path: str, limit: int = 10, request: Request = None) -> dict:  # type: ignore[assignment]
+def notes_related(
+    path: str,
+    limit: int = 10,
+    exclude_folders: str | None = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict:
     """Notas relacionadas a `path` por shared tags + graph hops.
 
     Wrap delgado de `find_related()`. El ranking real vive en rag/__init__.py
@@ -4179,15 +4229,24 @@ def notes_related(path: str, limit: int = 10, request: Request = None) -> dict: 
             if t:
                 src_tags.add(t)
 
-    results = find_related(col, source_metas, limit=limit)
+    excluded = _parse_exclude_folders(exclude_folders)
+    # Pedimos `limit + len(excluded)*N` para cubrir el caso pessimista
+    # donde el filtro descarte la mayoría. En la práctica el filter
+    # es ligero (prefix match) y limit alcanza casi siempre, así que
+    # un cap de 2× del limit es más que suficiente sin desperdiciar.
+    fetch_limit = limit if not excluded else min(limit * 2, 100)
+    results = find_related(col, source_metas, limit=fetch_limit)
     items: list[dict] = []
     for meta, score, reason in results:
+        item_path = meta.get("file", "")
+        if _is_in_excluded_folder(item_path, excluded):
+            continue
         nei_tags = [
             t.strip() for t in (meta.get("tags") or "").split(",") if t.strip()
         ]
         shared = sorted(src_tags.intersection(nei_tags))
         items.append({
-            "path": meta.get("file", ""),
+            "path": item_path,
             "note": meta.get("note", ""),
             "folder": meta.get("folder", ""),
             "tags": nei_tags,
@@ -4195,6 +4254,8 @@ def notes_related(path: str, limit: int = 10, request: Request = None) -> dict: 
             "score": int(score),
             "reason": reason,
         })
+        if len(items) >= limit:
+            break
     return {"items": items, "source_path": path}
 
 
@@ -4215,7 +4276,9 @@ def notes_related(path: str, limit: int = 10, request: Request = None) -> dict: 
 #   batería + rompe la UX. El panel es MANUAL (refresh button) con
 #   cache agresivo por path.
 @app.get("/api/notes/contradictions")
-def notes_contradictions(path: str, limit: int = 5) -> dict:
+def notes_contradictions(
+    path: str, limit: int = 5, exclude_folders: str | None = None,
+) -> dict:
     """Posibles contradicciones entre `path` y otras notas del vault.
 
     Usa `find_contradictions_for_note` del rag.py — wrap delgado para que
@@ -4273,12 +4336,19 @@ def notes_contradictions(path: str, limit: int = 5) -> dict:
     # Excluir la misma nota del set de candidatos. find_contradictions_for_note
     # hace match por chunk embed, así que si no excluimos, los chunks de
     # la nota source van a aparecer como "contradicciones de sí misma".
+    excluded = _parse_exclude_folders(exclude_folders)
+    # Para contradictions cada call al LLM cuesta ~5-10s. Si los excluded
+    # folders descartan muchas, NO pedimos más al LLM (sería re-ejecutar
+    # el clasificador entero); aceptamos que el panel devuelva menos
+    # items que el `limit` cuando hay filter agresivo.
     results = find_contradictions_for_note(
         col, body, exclude_paths={path}, k=limit,
     )
     items: list[dict] = []
     for r in results:
         p = r.get("path", "")
+        if _is_in_excluded_folder(p, excluded):
+            continue
         folder = "/".join(p.split("/")[:-1]) if "/" in p else ""
         items.append({
             "path": p,
@@ -4389,7 +4459,9 @@ def notes_loops(path: str, limit: int = 50) -> dict:
 # pre-compilado por título; típicamente <50ms para body de 5KB +
 # corpus de 2K títulos. Reactive-friendly.
 @app.get("/api/notes/wikilink-suggestions")
-def notes_wikilink_suggestions(path: str, limit: int = 30) -> dict:
+def notes_wikilink_suggestions(
+    path: str, limit: int = 30, exclude_folders: str | None = None,
+) -> dict:
     """Wikilinks sugeridos para `path` — strings en el body que matchean
     títulos de otras notas pero no están linkeadas.
 
@@ -4437,7 +4509,20 @@ def notes_wikilink_suggestions(path: str, limit: int = 30) -> dict:
     if col.count() == 0:
         return {"items": [], "source_path": path, "reason": "empty_index"}
 
-    suggestions = find_wikilink_suggestions(col, path, max_per_note=limit)
+    excluded = _parse_exclude_folders(exclude_folders)
+    # Cuando hay folders excluidos, pedimos un poco más para no quedarnos
+    # cortos al filtrar. find_wikilink_suggestions ya tiene un cap interno
+    # contra abuso, así que pedir 1.5× es seguro.
+    fetch_limit = limit if not excluded else min(int(limit * 1.5), 50)
+    suggestions = find_wikilink_suggestions(col, path, max_per_note=fetch_limit)
+    if excluded:
+        # El item del wikilink suggestion tiene `target` (el path de la
+        # nota destino), no `path`. Filtramos sobre ese.
+        suggestions = [
+            s for s in suggestions
+            if not _is_in_excluded_folder(s.get("target", ""), excluded)
+        ]
+        suggestions = suggestions[:limit]
     return {"items": suggestions, "source_path": path}
 
 
@@ -5590,7 +5675,7 @@ _TODAY_FM_SPLIT = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
 
 def _persist_today_brief(date_label: str, narrative: str) -> None:
-    """Write the regenerated brief to `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` so
+    """Write the regenerated brief to `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` so
     subsequent `/api/home` calls hit the cached path. Mirrors the CLI
     `rag today` write — same frontmatter shape so contradiction detection
     and ambient skip rules treat both files the same. Silent-fail.
@@ -5617,7 +5702,7 @@ def _persist_today_brief(date_label: str, narrative: str) -> None:
 
 
 def _today_cached_narrative(date_label: str) -> str | None:
-    """Return narrative from `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` if present.
+    """Return narrative from `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` if present.
     CLI `rag today` writes this file, so we avoid re-running the LLM when the
     brief was already generated today.
     """
@@ -7395,7 +7480,7 @@ def _home_compute(
     Per-channel silent-fail: if one source errors (e.g. Gmail OAuth expired,
     icalBuddy not installed), that key is missing/empty but the rest renders.
     `regenerate=true` forces a fresh LLM narrative (~10s); default reuses the
-    cached brief from `04-Archive/99-obsidian-system/99-Claude/reviews/<date>-evening.md` if present.
+    cached brief from `04-Archive/99-obsidian-system/99-AI/reviews/<date>-evening.md` if present.
 
     `progress` (optional): callback invoked as
     `progress(stage, status, elapsed_ms, error_message)` where status is one
@@ -8944,8 +9029,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     # prefix para que no entren al index retroactivamente.
                     "00-Inbox/conversations/",
                     # Nueva ubicación canónica desde 2026-04-25 — sistema vive
-                    # bajo 99-Claude/, fuera del PARA del user.
-                    "04-Archive/99-obsidian-system/99-Claude/conversations/",
+                    # bajo 99-AI/, fuera del PARA del user.
+                    "04-Archive/99-obsidian-system/99-AI/conversations/",
                 ),
                 intent=_intent_for_log,
             )
@@ -10457,7 +10542,7 @@ def dashboard_page() -> FileResponse:
 # como está).
 #
 # Doc del plan en el vault:
-# `04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md`
+# `04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`
 
 def _esc(s: str) -> str:
     """HTML escape para evitar XSS desde texto del usuario (chats, transcripts)."""

@@ -3411,7 +3411,8 @@ RANKER_CONFIG_PATH = Path.home() / ".local/share/obsidian-rag/ranker.json"
 # now measured over real impressions, with Laplace smoothing
 # (clicks+1)/(impressions+10) keeping sparse-interaction paths stable.
 
-_BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept",
+_BEHAVIOR_POSITIVE = frozenset({"open", "open_external", "positive_implicit",
+                                "save", "kept",
                                 # "copy" (2026-04-22): user copied text from
                                 # a RAG response. Emitted by web (Cmd+C listener
                                 # on `.turn[data-turn-id]` selection >=20 chars)
@@ -3419,6 +3420,12 @@ _BEHAVIOR_POSITIVE = frozenset({"open", "positive_implicit", "save", "kept",
                                 # a 👍 — the user took action with the content,
                                 # not just reacted to it. Folded into CTR the
                                 # same way as open/save: +1 click, +1 impression.
+                                # "open_external" (audit 2026-04-26 H2): el
+                                # WHERE de _load_behavior_priors lo incluía
+                                # pero el set NO → SQL traía rows que el
+                                # agregador descartaba silentemente. Es
+                                # semánticamente un open (user navegó al
+                                # path en una app externa).
                                 "copy"})
 _BEHAVIOR_NEGATIVE = frozenset({"negative_implicit", "deleted"})
 # Denominator-only events: `retrieve()` logs one `impression` row per final
@@ -3613,9 +3620,14 @@ def _load_behavior_priors() -> dict:
                     # smoothing). Sin él todos los paths tendrían
                     # click_prior ~1 falso. NO usar LIMIT — la CTR requiere
                     # conteo completo dentro del window.
+                    # Audit 2026-04-26 H3: SQLite `'now'` retorna **UTC**,
+                    # pero `ts` se inserta con `datetime.now().isoformat()`
+                    # (local). Para AR (UTC-3) eso cortaba 3h antes en el
+                    # límite del window de 90d → events del borde se
+                    # perdían. `'now', 'localtime'` resuelve.
                     rows = list(conn.execute(
                         "SELECT ts, event, path, dwell_s FROM rag_behavior "
-                        "WHERE ts >= datetime('now','-90 days') "
+                        "WHERE ts >= datetime('now','localtime','-90 days') "
                         "AND event IN ('open','open_external','positive_implicit',"
                         "'negative_implicit','kept','deleted','save','copy','impression')"
                     ).fetchall())
@@ -14113,13 +14125,29 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
     pct_after = _system_memory_used_pct()
     actions["pct_after_chat"] = round(pct_after, 2) if pct_after is not None else None
     if pct_after is not None and pct_after >= threshold:
-        try:
-            if maybe_unload_reranker(force=True):
-                actions["reranker_unloaded"] = True
-            pct_after2 = _system_memory_used_pct()
-            actions["pct_after_reranker"] = round(pct_after2, 2) if pct_after2 is not None else None
-        except Exception as exc:
-            _silent_log("memory_watchdog_unload_reranker", exc)
+        # Audit 2026-04-26: respetar RAG_RERANKER_NEVER_UNLOAD=1 también
+        # bajo memory pressure (pre-fix, el watchdog hacía bypass total
+        # del flag → contradecía la promesa documentada del operator).
+        # Si está set, loguea warning + skip. El operator que confió en
+        # NEVER_UNLOAD asumió que iba a tener reranker pinned siempre;
+        # si el sistema realmente colapsa, el OS hará swap-or-OOM —
+        # pero eso es responsabilidad del operator, no nuestra. Para
+        # forzar el unload aunque NEVER_UNLOAD esté set, el operator
+        # debe sacar el flag del plist.
+        _never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip().lower() in ("1", "true", "yes")
+        if _never_unload:
+            actions["reranker_unload_skipped_never_unload"] = True
+            _silent_log("memory_watchdog_reranker_pinned",
+                        f"pct_after_chat={pct_after} >= threshold={threshold} "
+                        f"but RAG_RERANKER_NEVER_UNLOAD=1 — skipping")
+        else:
+            try:
+                if maybe_unload_reranker(force=True):
+                    actions["reranker_unloaded"] = True
+                pct_after2 = _system_memory_used_pct()
+                actions["pct_after_reranker"] = round(pct_after2, 2) if pct_after2 is not None else None
+            except Exception as exc:
+                _silent_log("memory_watchdog_unload_reranker", exc)
     return actions
 
 
@@ -17179,8 +17207,13 @@ def _personalized_pagerank(
     else:
         seed_set = {p for p in seed_paths if p in adj}
     if not seed_set:
-        # No valid seeds — degrade to uniform teleport (classic PageRank).
-        return _graph_pagerank(adj, damping=damping, iterations=iterations)
+        # Audit 2026-04-26 M3: pre-fix devolvía global PageRank acá. Pero
+        # el caller (`retrieve()` línea ~19979) distinguía PPR vs global
+        # via `if ppr_score else pagerank` — si esto retorna global, la
+        # distinción se pierde silenciosamente y el ranker usa "global"
+        # creyendo que es PPR. Devolvemos `{}` para que el caller caiga
+        # explícitamente al global por su path normal.
+        return {}
     # Personalization vector: 1/|seed| on seeds, 0 elsewhere.
     seed_weight = 1.0 / len(seed_set)
     teleport = {node: (seed_weight if node in seed_set else 0.0) for node in nodes}
@@ -20552,6 +20585,13 @@ def deep_retrieve(
             exit_reason = "timeout"
             break
         sufficient, sub_query = _judge_sufficiency(question, all_docs, all_metas)
+        # Audit 2026-04-26 H4: chequear timeout TAMBIÉN después del judge —
+        # si el judge cuelga 25s, el cap "absoluto" pre-fix era violado por
+        # 2× (judge 25s + sub-retrieve 25s = 50s antes del próximo check).
+        # Ahora bailamos antes del retrieve si ya superamos el budget.
+        if time.perf_counter() - _deep_t0 > _DEEP_MAX_SECONDS:
+            exit_reason = "timeout_post_judge"
+            break
         if sufficient or not sub_query:
             exit_reason = "sufficient" if sufficient else "no_sub_query"
             break
@@ -45962,6 +46002,16 @@ _SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
     ("rag_cpu_metrics", 30),
     ("rag_memory_metrics", 30),
     ("system_memory_metrics", 30),
+    # Audit 2026-04-26 BUG #2 telemetry: estas tablas son creadas por
+    # writers fuera de _TELEMETRY_DDL (rag_ranker_lgbm/synthetic_queries.py
+    # + hard_negatives.py + wa_scheduled.py + obsidian-rag-promises fork).
+    # Pre-fix crecían sin rotation — `rag_synthetic_negatives` ya tiene
+    # ~3K rows. Estas son señales temporales del fine-tune y la auto-
+    # tuning pipeline; rotation 90d es generosa.
+    ("rag_synthetic_queries", 90),
+    ("rag_synthetic_negatives", 90),
+    ("rag_promises", 90),
+    ("rag_whatsapp_scheduled", 30),
 )
 
 # Tables that upsert on a PK instead of appending log rows. Listed here both

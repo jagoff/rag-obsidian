@@ -4,6 +4,52 @@
 // Data source: GET /api/home (silent-fail per channel).
 // Auto-refresh: every 60s unless tab is hidden.
 
+// ── HTML sanitizer (audit 2026-04-26 BUG #4 web) ─────────────────────────────
+// El brief que home.js renderiza viene del LLM, basado en contenido del vault.
+// El vault puede tener HTML user-pasted (`<script>` o `<img onerror=...>`).
+// Pre-fix: `marked.parse()` directo → XSS. Sanitizer espejo del de app.js.
+const _HOME_SAFE_TAGS = new Set([
+  "a", "abbr", "b", "blockquote", "br", "code", "del", "div", "em",
+  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol",
+  "p", "pre", "s", "span", "strong", "sub", "sup", "table", "tbody",
+  "td", "th", "thead", "tr", "ul",
+]);
+const _HOME_SAFE_ATTRS = new Set([
+  "href", "title", "alt", "src", "target", "rel", "class", "id",
+  "colspan", "rowspan", "start", "type",
+]);
+function _homeSanitizeNode(node) {
+  const children = Array.from(node.childNodes);
+  for (const child of children) {
+    if (child.nodeType === Node.ELEMENT_NODE) {
+      const tag = child.tagName.toLowerCase();
+      if (!_HOME_SAFE_TAGS.has(tag)) { child.remove(); continue; }
+      for (const attr of Array.from(child.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith("on") || !_HOME_SAFE_ATTRS.has(name)) {
+          child.removeAttribute(attr.name); continue;
+        }
+        if (name === "href" || name === "src") {
+          const val = attr.value.trim().toLowerCase();
+          const isJs = val.startsWith("javascript:");
+          const isDataNonImg = val.startsWith("data:") && !val.startsWith("data:image/");
+          if (isJs || isDataNonImg) child.removeAttribute(attr.name);
+        }
+      }
+      _homeSanitizeNode(child);
+    }
+  }
+}
+function _homeSanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(
+    `<div id="__root">${html}</div>`, "text/html"
+  );
+  const root = doc.getElementById("__root");
+  if (!root) return "";
+  _homeSanitizeNode(root);
+  return root.innerHTML;
+}
+
 // ── Behavior tracking ────────────────────────────────────────────────────────
 // Session ID persisted in sessionStorage so all clicks in a tab share one id.
 // Format: "web:<12 hex chars>" — satisfies SESSION_ID_RE in rag.py.
@@ -1138,7 +1184,7 @@ function renderNarrative(text, source, briefPath, totalSignals) {
     return;
   }
   const html = window.marked
-    ? marked.parse(stripWikilinks(text))
+    ? _homeSanitizeHtml(marked.parse(stripWikilinks(text)))
     : `<pre>${esc(stripWikilinks(text))}</pre>`;
   els.narrative.innerHTML = `
     <div class="narrative narrative-filled">

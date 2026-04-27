@@ -13654,7 +13654,10 @@ _DIAGNOSE_COMMAND_REGISTRY: dict[str, tuple[str | None, "Callable[[list[str]], b
 }
 
 # Defense-in-depth: detección de metachars en raw string antes de shlex.
-_DANGEROUS_METACHARS_RE = re.compile(r"[;&|<>`$()\n\r]")
+# Audit 2026-04-26 BUG #9: agregar `\x00` (null byte) y otros whitespace
+# control. shlex/execvp manejan null como string-end pero el audit log
+# guarda `command_original` truncado → forensics se rompen post-mortem.
+_DANGEROUS_METACHARS_RE = re.compile(r"[;&|<>`$()\n\r\t\v\f\x00]")
 
 
 def _validate_safe_command(cmd_str: str) -> tuple[list[str] | None, str]:
@@ -15490,12 +15493,21 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
     15s entre snapshots para que proxies/CDNs no maten la conexión por
     inactividad. El cliente reconecta automáticamente con EventSource si
     se cae."""
+    # Audit 2026-04-26 BUG #5: agregar slot cap.
+    client_ip: str | None = None
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        if not _sse_acquire_slot(client_ip):
+            raise HTTPException(status_code=429,
+                detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)")
+
     async def gen():
         last_snapshot_ts = 0.0
         try:
-            # Snapshot inicial inmediato — el cliente no espera 30s para
-            # ver datos. Los siguientes ya respetan el intervalo.
-            payload = learning_api(days=30)
+            # learning_api() es sync con I/O — sacarlo del event loop.
+            # Audit 2026-04-26 BUG #1 web: pre-fix bloqueaba el loop por
+            # toda la duración (10s+ con 11 secciones SQL).
+            payload = await asyncio.to_thread(learning_api, days=30)
             yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             last_snapshot_ts = time.time()
             while True:
@@ -15503,7 +15515,7 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
                     break
                 now = time.time()
                 if now - last_snapshot_ts >= 30:
-                    payload = learning_api(days=30)
+                    payload = await asyncio.to_thread(learning_api, days=30)
                     yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     last_snapshot_ts = now
                 else:
@@ -15511,6 +15523,9 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
                 await asyncio.sleep(15)
         except asyncio.CancelledError:
             return
+        finally:
+            if client_ip is not None:
+                _sse_release_slot(client_ip)
 
     return StreamingResponse(
         gen(),

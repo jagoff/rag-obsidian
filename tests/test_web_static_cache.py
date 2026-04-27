@@ -6,6 +6,7 @@ Override para dev: `OBSIDIAN_RAG_STATIC_NO_CACHE=1` → max-age=0.
 """
 from __future__ import annotations
 
+import pytest
 import importlib
 
 from fastapi.testclient import TestClient
@@ -22,6 +23,22 @@ def _fresh_client(monkeypatch, no_cache: bool = False):
     importlib.reload(_server)
     return TestClient(_server.app)
 
+
+# ── Audit 2026-04-26 BUG #1 telemetry — DB_PATH isolation ────────────────
+# Previene pollution de la prod telemetry.db cuando el TestClient ejercita
+# endpoints que disparan log_query_event/semantic_cache_store/etc.
+# Snap+restore manual (NO monkeypatch.setattr) — el conftest autouse
+# `_stabilize_rag_state` corre teardown ANTES de monkeypatch y emite
+# warning falso si está set. Mismo patrón que tests/test_rag_log_sql_read.py.
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    import rag as _rag_isolate
+    _snap = _rag_isolate.DB_PATH
+    _rag_isolate.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag_isolate.DB_PATH = _snap
 
 def test_static_has_cache_control_default(monkeypatch):
     """Default (sin override): Cache-Control: public, max-age=3600."""

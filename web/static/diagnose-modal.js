@@ -237,10 +237,26 @@
         if (!streamState.outputEl) return;
         streamState.outputAccum += event.chunk || "";
         streamState.outputEl.textContent = streamState.outputAccum;
+        // Al recibir output real, el status vuelve a "investigando"
+        // (sin contador) por si venía de un heartbeat con número.
+        status.textContent = "Devin investigando…";
         // Auto-scroll al fondo mientras stream-ea.
         requestAnimationFrame(() => {
           streamState.outputEl.scrollTop = streamState.outputEl.scrollHeight;
         });
+        break;
+      }
+
+      case "heartbeat": {
+        // Devin sigue vivo pero no emitió output nuevo — contador de tiempo
+        // para que el user sepa que no está colgado (el server emite este
+        // evento cada ~3s cuando no hay output del subprocess).
+        const s = event.elapsed_s || 0;
+        const mm = Math.floor(s / 60);
+        const ss = s % 60;
+        status.textContent = mm > 0
+          ? `Devin investigando… (${mm}m ${ss}s)`
+          : `Devin investigando… (${ss}s)`;
         break;
       }
 

@@ -14359,9 +14359,19 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
         _DEVIN_BIN,
         "-p", prompt,
         "--respect-workspace-trust", "false",
+        # --permission-mode dangerous: auto-aprobar todas las tool calls.
+        # El user pidió explícitamente auto-fix 100% autónomo. Sin esto,
+        # Devin al toparse con un edit/exec que requiera aprobación queda
+        # esperando stdin (que tiene DEVNULL) → cuelgue indefinido.
+        # Valores válidos en la CLI: "auto" (default, auto-aprueba read-only)
+        # o "dangerous" (auto-aprueba todo). No existe "bypass" — verificado
+        # con `devin --help` 2026-04-26.
+        "--permission-mode", "dangerous",
     ]
 
     def _stream():
+        import select  # local import — select solo se usa acá
+
         yield f"data: {json.dumps({'type': 'start', 'cmd': cmd})}\n\n"
         # Log de la invocación al audit.
         _audit_diagnose_execution({
@@ -14378,16 +14388,17 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
         exit_code = -1
         try:
             # cwd = repo root para que Devin tenga contexto del código.
-            # env mínimo con PATH extendido (Devin necesita PATH para
-            # encontrar sus deps: claude, node, etc.) + HOME + TERM dumb
-            # para evitar ANSI codes que no queremos en el modal.
+            # stdin=DEVNULL explícito — si devin pide confirmación interactiva
+            # por algo no cubierto por --permission-mode dangerous, preferimos
+            # que falle rápido antes que bloquearse esperando input.
+            # TERM=dumb + NO_COLOR=1 para minimizar ANSI en el stream.
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(ROOT),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # merge stderr al stdout para un solo stream
-                text=True,
-                bufsize=1,  # line-buffered
+                bufsize=0,  # unbuffered — leemos raw bytes
                 env={
                     **os.environ,  # Devin CLI necesita su env completo
                     "TERM": "dumb",
@@ -14396,17 +14407,37 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
                 },
             )
 
-            # Read stdout line-by-line con timeout absoluto.
+            # Lectura NON-BLOCKING con select+os.read.
+            #
+            # Antes usábamos readline() con bufsize=1, pero eso bloquea
+            # esperando '\n'. Devin durante la fase "pensando" emite
+            # spinners/dots/ANSI sin newline, entonces readline() se colgaba
+            # y el cliente veía "Devin investigando…" eternamente hasta el
+            # final. Ahora leemos bytes crudos a medida que llegan y los
+            # pusheamos inmediatamente al SSE.
+            #
+            # Además emitimos 'heartbeat' cada 3s cuando no hay output, para
+            # que el modal sepa que Devin sigue vivo y pueda mostrar un
+            # contador (ej. "Devin investigando… (27s)").
+            fd = proc.stdout.fileno()
             t0 = time.monotonic()
+            last_heartbeat = 0
             while True:
                 if proc.poll() is not None:
-                    # Proceso terminó — leer lo que queda y break.
-                    remaining = proc.stdout.read()
+                    # Proceso terminó — drenar lo que quede del pipe.
+                    try:
+                        remaining = proc.stdout.read()
+                        if isinstance(remaining, bytes):
+                            remaining = remaining.decode("utf-8", errors="replace")
+                    except Exception:
+                        remaining = ""
                     if remaining:
                         full_output_chunks.append(remaining)
                         yield f"data: {json.dumps({'type': 'output', 'chunk': remaining})}\n\n"
                     break
-                if (time.monotonic() - t0) > _AUTO_FIX_DEVIN_TIMEOUT_S:
+
+                elapsed = time.monotonic() - t0
+                if elapsed > _AUTO_FIX_DEVIN_TIMEOUT_S:
                     proc.terminate()
                     yield f"data: {json.dumps({'type': 'error', 'message': f'timeout después de {_AUTO_FIX_DEVIN_TIMEOUT_S}s'})}\n\n"
                     try:
@@ -14415,15 +14446,24 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
                         proc.kill()
                     return
 
-                # Leer con un pequeño timeout para no bloquear.
-                line = proc.stdout.readline()
-                if line:
-                    full_output_chunks.append(line)
-                    # Emitir chunk al SSE.
-                    yield f"data: {json.dumps({'type': 'output', 'chunk': line})}\n\n"
+                # Poll stdout por hasta 1s. Si hay datos, leer un chunk
+                # (hasta 4KB) y emitirlo. Si no, chequear si toca heartbeat.
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if ready:
+                    try:
+                        raw = os.read(fd, 4096)
+                    except (OSError, ValueError):
+                        raw = b""
+                    if raw:
+                        chunk = raw.decode("utf-8", errors="replace")
+                        full_output_chunks.append(chunk)
+                        yield f"data: {json.dumps({'type': 'output', 'chunk': chunk})}\n\n"
                 else:
-                    # No hay línea nueva — sleep brief para no busy-loop.
-                    time.sleep(0.05)
+                    # Sin datos nuevos: emitir heartbeat cada ~3s.
+                    elapsed_int = int(elapsed)
+                    if elapsed_int - last_heartbeat >= 3:
+                        last_heartbeat = elapsed_int
+                        yield f"data: {json.dumps({'type': 'heartbeat', 'elapsed_s': elapsed_int})}\n\n"
 
             exit_code = proc.returncode if proc.returncode is not None else -1
         except Exception as e:
@@ -14730,13 +14770,22 @@ def _process_error_with_devin(error_id: int) -> dict:
         _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
         return {"error_id": error_id, "exit_code": -1, "resolution_status": "failed"}
 
-    cmd = [_DEVIN_BIN, "-p", prompt, "--respect-workspace-trust", "false"]
+    # Worker autónomo: mismas flags que el endpoint `/api/auto-fix-devin`.
+    # --permission-mode dangerous es obligatorio acá — sin ello el subprocess
+    # se cuelga indefinidamente cuando Devin intenta un edit/exec y pide
+    # aprobación (no hay humano leyendo stdin).
+    cmd = [
+        _DEVIN_BIN, "-p", prompt,
+        "--respect-workspace-trust", "false",
+        "--permission-mode", "dangerous",
+    ]
     _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
             cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,  # evitar bloqueo esperando input
             capture_output=True,
             text=True,
             timeout=_AUTO_FIX_DEVIN_TIMEOUT_S,

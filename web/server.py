@@ -4110,7 +4110,7 @@ def related(req: RelatedRequest) -> dict:
 # cached con la invalidation correcta (watchdog → reindex bumpa col.id,
 # que dispara rebuild). Cold call ~1-2s en vaults grandes; cached <100ms.
 @app.get("/api/notes/related")
-def notes_related(path: str, limit: int = 10) -> dict:
+def notes_related(path: str, limit: int = 10, request: Request = None) -> dict:  # type: ignore[assignment]
     """Notas relacionadas a `path` por shared tags + graph hops.
 
     Wrap delgado de `find_related()`. El ranking real vive en rag/__init__.py
@@ -4130,6 +4130,13 @@ def notes_related(path: str, limit: int = 10) -> dict:
         debe poder distinguir "no hay relacionadas" de "no indexada" sin
         try/catch).
     """
+    # Audit 2026-04-26 (BUG #33): rate limit per-IP. Pre-fix: plugin
+    # buggy o atacante podía floodear (find_related con _load_corpus
+    # tarda 1-2s en vault grande).
+    if request is not None:
+        client_ip = (request.client.host if request.client else "unknown")
+        _check_rate_limit(_BEHAVIOR_BUCKETS, client_ip,
+                          _BEHAVIOR_RATE_LIMIT, _BEHAVIOR_RATE_WINDOW)
     if not path or not path.endswith(".md"):
         raise HTTPException(status_code=400, detail="path debe terminar en .md")
     if not VAULT_PATH.exists():

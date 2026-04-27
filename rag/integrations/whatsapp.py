@@ -168,8 +168,12 @@ def _whatsapp_send_to_jid(
         AMBIENT_WHATSAPP_BRIDGE_URL, data=data,
         headers={"Content-Type": "application/json"},
     )
+    # Audit 2026-04-26 (BUG #46): bajar timeout 10→3s. Bridge HTTP en
+    # localhost responde en <100ms warm; 10s es excesivo y bloquea
+    # el ambient hook (sync-call desde indexing) si el bridge crashea
+    # / restartea. 3s sigue tolerando spike normal.
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False

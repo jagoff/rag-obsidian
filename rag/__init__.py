@@ -32567,6 +32567,111 @@ def contradictions(path: str, limit: int, as_json: bool, plain: bool):
             console.print(f"   [dim]{snip}[/dim]")
 
 
+# ── `rag loops <path>` ───────────────────────────────────────────────────────
+# Wrap CLI de `_extract_followup_loops`. Paralelo al endpoint HTTP
+# `/api/notes/loops` — mismo shape, mismas razones de empty-result.
+# Cheap: sin LLM, sin embed, solo regex + frontmatter parse. Apto
+# para uso reactive desde el plugin Obsidian (panel "Loops abiertos")
+# o como debugging manual.
+@cli.command()
+@click.argument("path")
+@click.option("--limit", default=50, show_default=True,
+              help="Cantidad máxima de loops a devolver (1-100).")
+@click.option("--json", "as_json", is_flag=True,
+              help="Salida JSON (consumido por el plugin Obsidian / scripts).")
+@click.option("--plain", is_flag=True,
+              help="Salida tabular sin colores (script-friendly).")
+def loops(path: str, limit: int, as_json: bool, plain: bool):
+    """Loops abiertos (TODOs sin cerrar) en PATH.
+
+    PATH es vault-relative. Detecta:
+      - todos en frontmatter (kind=todo).
+      - checkboxes `- [ ]` sin marcar (kind=checkbox).
+      - clausulas imperativas en el body (kind=inline).
+
+    Cheap (sin LLM). Si querés clasificar resolved/stale/activo del
+    vault completo, mirá `rag pendientes`.
+    """
+    if not path.endswith(".md"):
+        msg = "path debe terminar en .md"
+        if as_json:
+            click.echo(json.dumps(
+                {"error": msg, "items": [], "source_path": path},
+            ))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(2)
+
+    limit = max(1, min(int(limit), 100))
+    note_path = VAULT_PATH / path
+    if not note_path.is_file():
+        payload = {"items": [], "source_path": path, "reason": "not_found"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print(f"[yellow]Nota no encontrada: {path}[/yellow]")
+        return
+
+    raw = note_path.read_text(encoding="utf-8", errors="ignore")
+    extracted_ts = _note_created_ts(raw, note_path.stat().st_mtime)
+    loops = _extract_followup_loops(raw, path, extracted_ts)
+    now = datetime.now()
+    items: list[dict] = []
+    for loop in loops[:limit]:
+        try:
+            ex_dt = datetime.fromisoformat(loop.get("extracted_at", ""))
+            if ex_dt.tzinfo is not None:
+                ex_dt = ex_dt.astimezone().replace(tzinfo=None)
+            age_days = max(0, (now - ex_dt).days)
+        except Exception:
+            age_days = 0
+        items.append({
+            "loop_text": loop.get("loop_text", ""),
+            "kind": loop.get("kind", "inline"),
+            "age_days": age_days,
+            "extracted_at": loop.get("extracted_at", ""),
+        })
+
+    if as_json:
+        click.echo(json.dumps(
+            {"items": items, "source_path": path}, ensure_ascii=False,
+        ))
+        return
+
+    if not items:
+        msg = f"Sin loops abiertos en {path}"
+        click.echo(msg) if plain else console.print(f"[green]✓ {msg}[/green]")
+        return
+
+    if plain:
+        # Formato tabular: AGE_DAYS \t KIND \t TEXT
+        for it in items:
+            click.echo(f"{it['age_days']}\t{it['kind']}\t{it['loop_text']}")
+        return
+
+    console.print()
+    console.print(Rule(
+        title=(
+            f"[bold cyan]✎ {len(items)} loop(s) en "
+            f"[magenta]{path}[/magenta][/bold cyan]"
+        ),
+        style="cyan",
+    ))
+    for it in items:
+        kind_color = {
+            "todo": "magenta", "checkbox": "cyan", "inline": "yellow",
+        }.get(it["kind"], "dim")
+        age_color = "red" if it["age_days"] > 14 else (
+            "yellow" if it["age_days"] > 7 else "green"
+        )
+        console.print()
+        console.print(
+            f"[{age_color}]{it['age_days']}d[/{age_color}] "
+            f"[{kind_color}]· {it['kind']}[/{kind_color}]  "
+            f"{it['loop_text']}"
+        )
+
+
 @cli.command()
 @click.option("--threshold", default=0.85, show_default=True,
               help="Cosine mínimo para considerar duplicado (sobre centroides)")

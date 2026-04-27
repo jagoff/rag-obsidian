@@ -131,6 +131,8 @@ from rag import (  # noqa: E402
     _tasks_services_consulted as _rag_tasks_services_consulted,
     append_turn,
     ensure_session,
+    _extract_followup_loops,
+    _note_created_ts,
     find_contradictions_for_note,
     find_followup_loops,
     find_related,
@@ -4283,6 +4285,93 @@ def notes_contradictions(path: str, limit: int = 5) -> dict:
             "folder": folder,
             "snippet": r.get("snippet", ""),
             "why": r.get("why", ""),
+        })
+    return {"items": items, "source_path": path}
+
+
+# ── /api/notes/loops ─────────────────────────────────────────────────────────
+#
+# Endpoint para el panel "Loops abiertos" del plugin Obsidian (Track A
+# del roadmap). Devuelve los loops sin cerrar de UNA nota: TODOs en
+# frontmatter, checkboxes `- [ ]` sin marcar, y clausulas imperativas
+# en el body ("tengo que X", "preguntar Y", etc.).
+#
+# Diferencia con `find_followup_loops` (rag/__init__.py):
+#   - Esa función walks TODO el vault + classifica cada loop con LLM
+#     judge (resolved/stale/activo). Pesado (~30s+ en vault grande).
+#   - Acá usamos `_extract_followup_loops` sobre 1 archivo solo. No LLM.
+#     Cheap (<5ms por nota típica). Apto para reactive trigger del panel.
+#   - Trade-off: no clasificamos resolved/stale, solo extraemos. El user
+#     ve la lista cruda con age_days y juzga visualmente. Para clasificar
+#     existe el endpoint /api/pendientes que hace el walk completo.
+@app.get("/api/notes/loops")
+def notes_loops(path: str, limit: int = 50) -> dict:
+    """Loops abiertos en `path` — frontmatter todos + checkboxes + imperativas.
+
+    Reactive-friendly: O(N) sobre el body de la nota, sin LLM ni embed.
+
+    Args:
+        path: Vault-relative (ej. "02-Areas/Coaching/Plan-2026.md").
+        limit: Máximo de loops a devolver (1-100, default 50). El plugin
+            puede mandar 50 sin riesgo — la mayoría de notas tienen <10.
+
+    Returns:
+        items: [{loop_text, kind, age_days, extracted_at}, ...]
+          - `kind`: "todo" (frontmatter) | "checkbox" | "inline" (imperative).
+          - `age_days`: días desde extracted_at (0 = hoy).
+          - El plugin ordena visualmente: stale (age >14d) primero, etc.
+        source_path: echo del input.
+        reason?: "not_found" si la nota no existe en el vault.
+
+    Performance: <5ms para notas típicas. Sin embed, sin LLM, sin
+    sqlite-vec — solo fs + regex + frontmatter parse.
+    """
+    if not path or not path.endswith(".md"):
+        raise HTTPException(status_code=400, detail="path debe terminar en .md")
+    if not VAULT_PATH.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"vault no encontrado en {VAULT_PATH}",
+        )
+    try:
+        full = (VAULT_PATH / path).resolve()
+        full.relative_to(VAULT_PATH.resolve())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"path inválido: {exc}")
+    if not full.is_file():
+        return {"items": [], "source_path": path, "reason": "not_found"}
+
+    limit = max(1, min(int(limit), 100))
+    try:
+        raw = full.read_text(encoding="utf-8", errors="ignore")
+        st = full.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"read failed: {exc}")
+
+    extracted_ts = _note_created_ts(raw, st.st_mtime)
+    loops = _extract_followup_loops(raw, path, extracted_ts)
+    if not loops:
+        return {"items": [], "source_path": path}
+
+    # Anotar age_days y devolver. El now lo capturamos UNA vez para que
+    # todos los loops del response sean coherentes entre sí.
+    now = datetime.now()
+    items: list[dict] = []
+    for loop in loops[:limit]:
+        # extracted_at es ISO; parseamos defensivo (algunos formatos
+        # podrían venir con/sin tz).
+        try:
+            ex_dt = datetime.fromisoformat(loop.get("extracted_at", ""))
+            if ex_dt.tzinfo is not None:
+                ex_dt = ex_dt.astimezone().replace(tzinfo=None)
+            age_days = max(0, (now - ex_dt).days)
+        except Exception:
+            age_days = 0
+        items.append({
+            "loop_text": loop.get("loop_text", ""),
+            "kind": loop.get("kind", "inline"),
+            "age_days": age_days,
+            "extracted_at": loop.get("extracted_at", ""),
         })
     return {"items": items, "source_path": path}
 

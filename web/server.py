@@ -7973,6 +7973,71 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 pass
             return
 
+        # Finance/cards short-circuit (added 2026-04-26). El chat web
+        # tarda 30-48s con el flow LLM completo (retrieve + tools +
+        # qwen2.5:7b prompt+decode), pasando el timeout de 45s del
+        # cliente Ollama → frontend muestra "LLM falló: timed out".
+        # Para queries financieras con datos parsed (xlsx tarjeta,
+        # CSV MOZE) NO necesitamos el LLM — el render determinístico
+        # de `rag._finance_cards_comment` da la respuesta exacta en
+        # <1s. Mismo patrón que `rag serve /query` y `/chat`.
+        try:
+            import rag as _rag_mod_for_fin
+            _is_finance_q = _rag_mod_for_fin._is_finance_or_cards_query(question)
+        except Exception:
+            _is_finance_q = False
+        if _is_finance_q:
+            try:
+                _t_fin = time.perf_counter()
+                _finance_data = _fetch_finance()
+                _cards_data = _fetch_credit_cards()
+                _fin_answer = _rag_mod_for_fin._finance_cards_comment(
+                    question, _finance_data, _cards_data,
+                )
+            except Exception as exc:
+                _fin_answer = (
+                    f"No pude leer los datos de tarjetas/MOZE: {str(exc)[:80]}"
+                )
+
+            turn_id = new_turn_id()
+            yield _sse("sources", {
+                "items": [],
+                "confidence": None,
+                "intent": "finance",
+            })
+            yield _sse("status", {
+                "stage": "generating",
+                "intent": "finance",
+                "hint": "Datos del banco / MOZE",
+            })
+            # Tokenizado en chunks chicos para mimic del UX normal —
+            # el frontend tiene animación de typing.
+            for i in range(0, len(_fin_answer), 40):
+                yield _sse("token", {"delta": _fin_answer[i:i+40]})
+            total_ms = int((time.perf_counter() - _t0) * 1000)
+            yield _sse("done", {
+                "turn_id": turn_id,
+                "elapsed_ms": total_ms,
+                "mode": "finance",
+            })
+            try:
+                append_turn(sess, {
+                    "turn_id": turn_id, "q": question,
+                    "a": _fin_answer[:500], "mode": "finance",
+                })
+                save_session(sess)
+            except Exception:
+                pass
+            try:
+                log_query_event({
+                    "cmd": "web.chat.finance", "q": question[:200],
+                    "session": sess["id"], "answered": True,
+                    "t_total": round(total_ms / 1000.0, 3),
+                })
+            except Exception:
+                pass
+            return
+
         # Meta-chat short-circuit. Canned responses (varied across
         # WA-style variants so repeated "hola" doesn't always say the
         # same thing). Random seeded by minute so the same message in

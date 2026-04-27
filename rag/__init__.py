@@ -40382,6 +40382,44 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
             console.print(f"  [green]✓[/green] [{size}] {target}: {title}")
 
 
+# ── VAULT TRANSIENT CLEANUP (rag vault-cleanup) ─────────────────────────────
+# El vault Obsidian acumula carpetas de "sistema" (outputs de scripts, chat
+# transcripts, drafts de commit msg, exports auto-regenerados) bajo
+# `04-Archive/99-obsidian-system/99-AI/`. `is_excluded()` ya filtra ese
+# subtree del indexado del RAG, pero los archivos siguen ocupando espacio +
+# ensucian el graph view + las búsquedas full-text del Obsidian nativo.
+# Este command los purga moviéndolos al `.trash/` del vault (reversible).
+# Heavy lifting en `scripts/cleanup_vault_transient.py` — ver docstring ahí
+# para la tabla de políticas por carpeta. Daemon diario via launchd a 02:00.
+
+
+@cli.command(name="vault-cleanup")
+@click.option("--dry-run", is_flag=True,
+              help="Simular sin mover archivos")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emitir summary como JSON (para servicios/scripts)")
+def vault_cleanup_cmd(dry_run: bool, as_json: bool):
+    """Mover archivos transitorios del vault al `.trash/`.
+
+    Carpetas bajo `04-Archive/99-obsidian-system/99-AI/` con TTLs por
+    política: `tmp/` 7d · `conversations/` 30d · `sessions/` 30d ·
+    `Wiki/` wipe total · `plans/` 180d · `system/<slug>/` 180d ·
+    `reviews/` 365d. `memory/` y `skills/` están en whitelist (intactos).
+    Files se mueven a `<vault>/.trash/` (Obsidian convention) — recuperables
+    hasta vaciar la papelera de Obsidian.
+
+    Corre diario via launchd a 02:00 — instalable con `rag setup`.
+    """
+    from scripts.cleanup_vault_transient import run as _run, _print_human
+    summary = _run(dry_run=dry_run)
+    if as_json:
+        click.echo(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        _print_human(summary)
+    if not summary.get("ok", False):
+        raise SystemExit(1)
+
+
 @cli.command()
 @click.option("--min-age-days", default=365, show_default=True,
               help="Edad mínima por mtime")
@@ -41917,6 +41955,60 @@ def _consolidate_plist(rag_bin: str) -> str:
 """
 
 
+def _vault_cleanup_plist(rag_bin: str) -> str:
+    """Daily vault transient-folder cleanup — every day at 02:00.
+
+    Mueve archivos viejos en `04-Archive/99-obsidian-system/99-AI/{{tmp,
+    conversations, sessions, plans, system, reviews}}/` y wipe completo
+    de `Wiki/` al `.trash/` del vault. `memory/` y `skills/` están
+    explícitamente protegidos. Reversible: los archivos quedan en
+    `<vault>/.trash/` hasta que el user vacíe la papelera de Obsidian.
+
+    Schedule a las 02:00 — antes del ciclo de housekeeping del SQL
+    (auto-harvest 03:00 → implicit 03:25 → online-tune 03:30 →
+    maintenance 04:00 → calibrate 04:30) para no competir por I/O en
+    iCloud durante esa ventana. Solo toca FS del vault, no abre
+    ragvec.db, así que no hay race con el ciclo SQL.
+
+    `RunAtLoad=false` para que `rag setup` no dispare un cleanup
+    inmediato — la primera corrida es a la próxima 02:00 AM, dándole
+    al user tiempo de auditar el plist + revertir si quiere.
+
+    Lógica completa en `scripts/cleanup_vault_transient.py` — TTLs y
+    políticas por carpeta documentados ahí. Para auditar qué se va a
+    borrar sin tocar nada: `rag vault-cleanup --dry-run --json`.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-vault-cleanup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>vault-cleanup</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>2</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/cleanup-vault.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/cleanup-vault.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _anticipate_plist(rag_bin: str) -> str:
     """Anticipatory agent — every 10 min. Evalúa señales y empuja top-1 a WA.
 
@@ -42524,6 +42616,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _maintenance_plist(rag_bin)),
         ("com.fer.obsidian-rag-consolidate", "com.fer.obsidian-rag-consolidate.plist",
          _consolidate_plist(rag_bin)),
+        # Daily vault transient cleanup (2026-04-27) — barre carpetas de
+        # "sistema" bajo 04-Archive/99-obsidian-system/99-AI/ con TTLs por
+        # carpeta y mueve archivos viejos a `.trash/` del vault. Whitelist:
+        # `memory/` + `skills/`. Lógica en scripts/cleanup_vault_transient.py.
+        ("com.fer.obsidian-rag-vault-cleanup",
+         "com.fer.obsidian-rag-vault-cleanup.plist",
+         _vault_cleanup_plist(rag_bin)),
         # Anticipatory agent (2026-04-24) — game-changer push proactivo cada
         # 10 min. Comparte daily_cap=3 con emergent/patterns. Silenciable
         # per-kind: `rag silence anticipate-calendar`. Kill global:

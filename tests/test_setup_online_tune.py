@@ -224,7 +224,7 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 18 base servicios + 4 ingesters cross-source
+    # 21 base servicios + 4 ingesters cross-source
     # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
     # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
     # pero el plist siempre está en el spec.
@@ -233,13 +233,17 @@ def test_services_spec_total_count():
     # wake-up (agregado 2026-04-24 — orquestador nocturno 04:00),
     # emergent, patterns, archive, wa-tasks, reminder-wa-push (cron 5min
     # para disparar Apple Reminders via WhatsApp bridge antes de la due
-    # — ver docstring en _services_spec), auto-harvest (2026-04-23 —
-    # LLM-as-judge nocturno que labelea queries low-conf sin feedback),
-    # online-tune, calibrate (2026-04-23 — per-source isotonic regression
-    # re-entrenada con feedback), maintenance (2026-04-21 hardening),
-    # consolidate, anticipate (2026-04-24 — game-changer push proactivo
-    # cada 10 min: calendar proximity + temporal echo + stale commitment).
-    assert len(specs) == 22
+    # — ver docstring en _services_spec), wa-scheduled-send (2026-04-25 —
+    # worker de mensajes WA programados, idempotente vía status enum),
+    # auto-harvest (2026-04-23 — LLM-as-judge nocturno que labelea
+    # queries low-conf sin feedback), implicit-feedback (2026-04-26 —
+    # Sprint 1 del cierre del loop de auto-aprendizaje), online-tune,
+    # calibrate (2026-04-23 — per-source isotonic regression re-entrenada
+    # con feedback), maintenance (2026-04-21 hardening), consolidate,
+    # vault-cleanup (2026-04-27 — purge diario de carpetas transitorias
+    # bajo 99-AI/, mueve a .trash/ del vault), anticipate (2026-04-24 —
+    # game-changer push proactivo cada 10 min).
+    assert len(specs) == 25
 
 
 def test_services_spec_includes_maintenance():
@@ -254,6 +258,23 @@ def test_services_spec_includes_maintenance():
     assert "<key>Hour</key><integer>4</integer>" in plist
     assert "<key>RunAtLoad</key><false/>" in plist
     assert "<string>maintenance</string>" in plist
+
+
+def test_services_spec_includes_vault_cleanup():
+    """Added 2026-04-27: daily `rag vault-cleanup` a las 02:00 mueve
+    archivos transitorios en `04-Archive/99-obsidian-system/99-AI/{tmp,
+    conversations, sessions, plans, system, reviews}/` (TTLs por carpeta)
+    + wipe completo de `Wiki/` al `.trash/` del vault. `memory/` y
+    `skills/` están en whitelist."""
+    specs = rag_module._services_spec(RAG_BIN)
+    labels = {s[0] for s in specs}
+    assert "com.fer.obsidian-rag-vault-cleanup" in labels
+    plist = rag_module._vault_cleanup_plist(RAG_BIN)
+    assert "<key>Hour</key><integer>2</integer>" in plist
+    assert "<key>RunAtLoad</key><false/>" in plist
+    assert "<string>vault-cleanup</string>" in plist
+    # No KeepAlive — es un cron diario, no un daemon long-running.
+    assert "<key>KeepAlive</key><false/>" in plist
 
 
 def test_services_spec_includes_anticipate():
@@ -273,6 +294,18 @@ def test_services_spec_includes_anticipate():
 @requires_plutil
 def test_anticipate_plist_valid_xml():
     xml = rag_module._anticipate_plist(RAG_BIN)
+    result = subprocess.run(
+        ["plutil", "-lint", "-"], input=xml.encode(), capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@requires_plutil
+def test_vault_cleanup_plist_valid_xml():
+    """El plist tiene `{{tmp,...}}` literal escapado en el docstring del
+    generator (f-string) — este test guardia contra typos que metan llaves
+    sueltas y rompan el XML."""
+    xml = rag_module._vault_cleanup_plist(RAG_BIN)
     result = subprocess.run(
         ["plutil", "-lint", "-"], input=xml.encode(), capture_output=True,
     )

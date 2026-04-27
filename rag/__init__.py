@@ -14233,6 +14233,20 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
                 actions["pct_after_reranker"] = round(pct_after2, 2) if pct_after2 is not None else None
             except Exception as exc:
                 _silent_log("memory_watchdog_unload_reranker", exc)
+
+    # Audit 2026-04-26 (BUG #9): Paso 3 — si después de chat + reranker
+    # la presión sigue arriba, descargar NLI model (mDeBERTa ~400 MB).
+    # Pre-fix nunca se descargaba bajo presión → NLI quedaba pinned
+    # consumiendo memoria sin servir tráfico activo.
+    pct_check = _system_memory_used_pct()
+    if pct_check is not None and pct_check >= threshold:
+        try:
+            if maybe_unload_nli_model(force=True):
+                actions["nli_unloaded"] = True
+                pct_after3 = _system_memory_used_pct()
+                actions["pct_after_nli"] = round(pct_after3, 2) if pct_after3 is not None else None
+        except Exception as exc:
+            _silent_log("memory_watchdog_unload_nli", exc)
     return actions
 
 
@@ -28725,8 +28739,13 @@ def _behavior_augmented_cases(days: int = 14) -> list[dict]:
     """
     cutoff_ts = time.time() - days * 86400
     since_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
-    _POSITIVE = {"open", "positive_implicit", "save", "kept"}
-    _NEGATIVE = {"negative_implicit", "deleted"}
+    # Audit 2026-04-26 (BUG #4): pre-fix usaba un literal local desincronizado
+    # del frozenset global. `_BEHAVIOR_POSITIVE` evolucionó agregando
+    # `open_external` y `copy` pero esta función no se enteraba → tune nightly
+    # descartaba esos eventos silenciosamente. Reusar el global garantiza
+    # propagación automática a futuros adds.
+    _POSITIVE = _BEHAVIOR_POSITIVE
+    _NEGATIVE = _BEHAVIOR_NEGATIVE
     pos: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
     neg: dict[tuple[str, str], str] = {}   # (norm_q, path) → source
 
@@ -30013,46 +30032,77 @@ def _collect_week_evidence(
                 out.append(e)
         return out
 
+    # Audit 2026-04-26 (BUG #12): pre-fix leía dos JSONLs stale post-T10:
+    # `contradiction_log` ya no se escribe (Phase 2 → SQL `rag_contradictions`)
+    # y `query_log` recibe `conversation_turn_written` events, no `cmd=query`.
+    # Las 3 secciones del digest (index_contrad, query_contrad, low_conf)
+    # quedaban siempre vacías. Fix: leer SQL directamente.
+    start_iso = start.isoformat(timespec="seconds")
+    end_iso = end.isoformat(timespec="seconds")
     index_contrad: list[dict] = []
-    for e in _read_jsonl_in_window(contradiction_log):
-        if e.get("cmd") != "contradict_index":
-            continue
-        entries = e.get("contradicts") or []
-        if not entries:
-            continue
-        index_contrad.append({
-            "ts": e.get("ts"),
-            "subject_path": e.get("subject_path", ""),
-            "targets": [
-                {"path": c.get("path", ""), "why": c.get("why", "")}
-                for c in entries if isinstance(c, dict)
-            ],
-        })
+    try:
+        with _ragvec_state_conn() as _conn:
+            for ts_str, subj, targets_json in _conn.execute(
+                "SELECT ts, subject_path, targets_json FROM rag_contradictions "
+                "WHERE ts >= ? AND ts < ?",
+                (start_iso, end_iso),
+            ):
+                try:
+                    targets = json.loads(targets_json) if targets_json else []
+                except Exception:
+                    continue
+                if not isinstance(targets, list) or not targets:
+                    continue
+                index_contrad.append({
+                    "ts": ts_str,
+                    "subject_path": subj or "",
+                    "targets": [
+                        {"path": c.get("path", ""), "why": c.get("why", "")}
+                        for c in targets if isinstance(c, dict)
+                    ],
+                })
+    except Exception as _exc:
+        try:
+            _silent_log("week_evidence_contradictions_sql_failed", _exc)
+        except Exception:
+            pass
 
     query_contrad: list[dict] = []
     low_conf: list[dict] = []
-    for e in _read_jsonl_in_window(query_log):
-        if e.get("cmd") != "query":
-            continue
-        contrad = e.get("contradictions")
-        if isinstance(contrad, list) and contrad:
-            for c in contrad:
-                if isinstance(c, dict) and c.get("path"):
-                    query_contrad.append({
-                        "ts": e.get("ts"),
-                        "q": e.get("q", ""),
-                        "path": c.get("path", ""),
-                        "why": c.get("why", ""),
-                    })
-        score = e.get("top_score")
-        if isinstance(score, (int, float)) and score <= CONFIDENCE_RERANK_MIN:
-            q = (e.get("q") or "").strip()
-            if q:
-                low_conf.append({
-                    "ts": e.get("ts"),
-                    "q": q,
-                    "top_score": float(score),
-                })
+    try:
+        with _ragvec_state_conn() as _conn:
+            for ts_str, q_text, top_score, extra_json in _conn.execute(
+                "SELECT ts, q, top_score, extra_json FROM rag_queries "
+                "WHERE ts >= ? AND ts < ? AND cmd = 'query'",
+                (start_iso, end_iso),
+            ):
+                try:
+                    extra = json.loads(extra_json) if extra_json else {}
+                except Exception:
+                    extra = {}
+                contrad = extra.get("contradictions") if isinstance(extra, dict) else None
+                if isinstance(contrad, list) and contrad:
+                    for c in contrad:
+                        if isinstance(c, dict) and c.get("path"):
+                            query_contrad.append({
+                                "ts": ts_str,
+                                "q": q_text or "",
+                                "path": c.get("path", ""),
+                                "why": c.get("why", ""),
+                            })
+                if isinstance(top_score, (int, float)) and top_score <= CONFIDENCE_RERANK_MIN:
+                    q_clean = (q_text or "").strip()
+                    if q_clean:
+                        low_conf.append({
+                            "ts": ts_str,
+                            "q": q_clean,
+                            "top_score": float(top_score),
+                        })
+    except Exception as _exc:
+        try:
+            _silent_log("week_evidence_queries_sql_failed", _exc)
+        except Exception:
+            pass
 
     return {
         "recent_notes": recent,
@@ -38957,10 +39007,11 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
 
     path = VAULT_PATH / MORNING_FOLDER / f"{date_label}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path = path.with_name(
-            f"{date_label} ({datetime.now().strftime('%H%M%S')}).md"
-        )
+    # Audit 2026-04-26 (BUG #14): pre-fix creaba `YYYY-MM-DD (HHMMSS).md`
+    # si el archivo ya existía → 2 runs el mismo día (re-arme manual,
+    # retry post error, etc.) generaban briefs duplicados, y el brief
+    # diff signal comparaba contra el archivo viejo. Idempotencia
+    # correcta: sobrescribir.
     path.write_text(body, encoding="utf-8")
     try:
         _index_single_file(get_db(), path, skip_contradict=True)
@@ -39568,10 +39619,8 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
 
     path = VAULT_PATH / MORNING_FOLDER / f"{date_label}-evening.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path = path.with_name(
-            f"{date_label}-evening ({datetime.now().strftime('%H%M%S')}).md"
-        )
+    # Audit 2026-04-26 (BUG #14): idempotencia — sobrescribir si re-corre el
+    # mismo día (igual que morning brief). Pre-fix duplicaba con timestamp.
     path.write_text(body, encoding="utf-8")
     try:
         _index_single_file(get_db(), path, skip_contradict=True)

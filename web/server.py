@@ -2216,11 +2216,31 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
     # ranker-vivo priors. Convert here so the dwell signal lands in
     # the column the aggregator actually reads.
     dwell_s = (req.dwell_ms / 1000.0) if req.dwell_ms is not None else None
+    # Hidrate `query` from the latest rag_queries row in this session when the
+    # client didn't pass one (race con `appendSources` antes del set de
+    # turn.dataset.q, panels de home.js sin context, etc.). Sin query el
+    # ranker-vivo ignora el evento entero (`_behavior_augmented_cases`
+    # require query NOT NULL); 122 events del web en 7d quedaron inertes
+    # por este bug. Best-effort lookup: si falla, deja query=None y se
+    # comporta como antes.
+    query_val = req.query
+    if (query_val is None or query_val == "") and req.session:
+        try:
+            with _ragvec_state_conn() as _conn:
+                _row = _conn.execute(
+                    "SELECT q FROM rag_queries WHERE session = ? AND q IS NOT NULL "
+                    "AND q <> '' ORDER BY ts DESC LIMIT 1",
+                    (req.session,),
+                ).fetchone()
+                if _row and _row[0]:
+                    query_val = _row[0]
+        except Exception:
+            pass  # silent — peor caso queda como antes (query=None)
     try:
         log_behavior_event({
             "source": req.source,
             "event": req.event,
-            "query": req.query,
+            "query": query_val,
             "path": req.path,
             "rank": req.rank,
             "dwell_s": dwell_s,
@@ -13307,13 +13327,20 @@ def _is_safe_launchctl_target(arg: str) -> bool:
     return bool(_LAUNCHCTL_LABEL_RE.match(arg) or _LAUNCHCTL_GUI_RE.match(arg))
 
 
+def _is_self_daemon_target(arg: str) -> bool:
+    """¿El target apunta al propio web daemon? Si sí, rechazamos kickstart
+    porque mataríamos al proceso mid-request. List/print SÍ se permiten
+    (son read-only, no afectan al daemon)."""
+    return "obsidian-rag-web" in arg
+
+
 def _is_int_string(arg: str) -> bool:
     return arg.lstrip("-").isdigit() and len(arg) <= 6
 
 
 def _validate_launchctl_args(args: list[str]) -> bool:
     """`launchctl kickstart [-k|-p|-s] <target>` | `list [<label>]` |
-    `print <target>`."""
+    `print <target>`. Hard-rejects kickstart del propio daemon web."""
     if not args:
         return False
     sub = args[0]
@@ -13327,7 +13354,14 @@ def _validate_launchctl_args(args: list[str]) -> bool:
             i += 1
         if len(rest) - i != 1:
             return False
-        return _is_safe_launchctl_target(rest[i])
+        target = rest[i]
+        if not _is_safe_launchctl_target(target):
+            return False
+        # Hard-defense: kickstart al propio daemon mata el endpoint
+        # mid-request. Lo rechazamos sin importar lo que diga el prompt.
+        if _is_self_daemon_target(target):
+            return False
+        return True
     if sub == "list":
         if len(args) == 1:
             return True
@@ -13597,6 +13631,358 @@ def diagnose_error_execute(req: _DiagnoseExecuteRequest, request: Request) -> di
         "duration_s": duration_s,
         "timed_out": timed_out,
     }
+
+
+# ── /api/auto-fix — agent loop que resuelve solo el problema ──────────
+# El user pidió "no tiene que decirte qué hacer, tiene que hacerlo solo".
+# Esto es un agent loop: el LLM diagnostica + ejecuta comandos + verifica
+# en un ciclo, hasta resolver el error o agotar el cap de turnos.
+#
+# Flow por turno:
+#   1. LLM recibe el contexto acumulado (error original + resultados de
+#      acciones previas) y devuelve un JSON con shape:
+#        { "thought": "..", "action": "<cmd>" | null, "done": bool, "summary": "" }
+#   2. Si action no-null: el server lo valida con _validate_safe_command
+#      (misma whitelist que /execute), lo ejecuta con timeout, y el
+#      stdout/stderr se inyecta al contexto del próximo turno.
+#   3. Si done=true: el loop termina y emite el summary al frontend.
+#   4. Cap a _AUTO_FIX_MAX_TURNS para evitar bucles infinitos.
+#
+# El SSE emite eventos:
+#   - {type: "turn", n: 1}
+#   - {type: "thought", text: "..."}
+#   - {type: "action", command: "..."}
+#   - {type: "action_result", exit_code: 0, stdout: "...", stderr: "..."}
+#   - {type: "action_rejected", command: "...", reason: "..."}
+#   - {type: "done", summary: "..."}
+#   - {type: "max_turns_reached"}
+#   - {type: "error", message: "..."}
+
+_AUTO_FIX_MAX_TURNS = 8
+_AUTO_FIX_OUTPUT_TRUNCATE = 2000  # truncado del stdout/stderr inyectado al LLM
+
+_AUTO_FIX_SYSTEM_PROMPT = """\
+Sos un agente que resuelve errores del stack obsidian-rag de Fer.
+
+Recibís un error en un log y tenés que diagnosticar Y resolver el
+problema en un ciclo de hasta 6 turnos. NO le das al user instrucciones
+para que él haga algo — vos hacés el trabajo ejecutando comandos.
+
+Stack relevante:
+- Daemons launchd: com.fer.obsidian-rag-{watch,web,wa-scheduled-send,
+  ingest-{calendar,gmail,drive,whatsapp,reminders},anticipate,
+  reminder-wa-push,maintenance,morning,today, ...}.
+- Logs: /Users/fer/.local/share/obsidian-rag/<servicename>.log y
+  <servicename>.error.log.
+- SQLite-vec con escrituras concurrentes (database is locked es típico,
+  recoverable).
+
+Tools disponibles (whitelist estricta — cualquier otra cosa es rechazada):
+- `launchctl kickstart -k gui/501/<label>` — reiniciar daemon. IMPORTANTE:
+  el label DEBE venir prefixed con `gui/501/`, sino macOS lo rechaza.
+  Ejemplo correcto: `launchctl kickstart -k gui/501/com.fer.obsidian-rag-watch`
+  Ejemplo INCORRECTO: `launchctl kickstart -k com.fer.obsidian-rag-watch`
+  (tira `Unrecognized target specifier`).
+- `launchctl list com.fer.obsidian-rag-<service>` — ver estado del daemon
+  (este SÍ usa label desnudo, sin gui/501/).
+- `launchctl print gui/501/com.fer.obsidian-rag-<service>` — info detallada.
+- `tail [-n N] <log_path>` — leer últimas líneas (NO uses -f, se cuelga).
+- `head [-n N] <log_path>` — primeras líneas.
+- `wc -l <log_path>` — contar líneas.
+- `cat <log_path>` — todo el archivo.
+- `ls -la <dir>` — listar files (sólo bajo el log dir).
+- `rag stats` / `rag status` / `rag vault list` — CLI read-only.
+
+Workflow esperado (sé EFICIENTE — máximo 1-2 turnos de investigación):
+1. Investigá UNA vez: ej. `launchctl list <label>` o `tail -50 <log>`.
+   NO hagas tail múltiples veces — la primera lectura ya te debería
+   dar suficiente contexto. Si necesitás MÁS líneas, usá `tail -n 200`
+   en el siguiente turno, NO repitas `tail -50`.
+2. Decidí el fix: kickstart del daemon (caso típico) o no-acción
+   (si es un error transient/aislado).
+3. Aplicá el fix con la sintaxis correcta (`gui/501/<label>` para kickstart).
+4. Verificá: `tail -10` post-restart o `launchctl list` para confirmar PID nuevo.
+5. Devolvé done=true con summary.
+
+Errores comunes y fix asociado:
+- "database is locked" + REPETIDO (≥3 ocurrencias en últimos 5 min):
+  kickstart del daemon → `launchctl kickstart -k gui/501/<label>`.
+  Si es 1-2 ocurrencias aisladas: NO requiere acción (el daemon retrió
+  bien). Devolvé done=true marcándolo como aislado.
+- "OperationalError: no such column" → schema desincronizado. NO se
+  resuelve sin tocar código. Devolvé done=true con summary explicando
+  que requiere intervención humana (schema migration).
+- "UserWarning: leaked semaphore" → ruido de tqdm/loky. Falso positivo,
+  no es serio. Devolvé done=true marcándolo como ignorable.
+- "another row available" → bug SQL real (LIMIT 1 faltante). No se
+  resuelve con kickstart. Devolvé done=true explicando que requiere
+  fix de código.
+
+FORMATO DE RESPUESTA (responder SIEMPRE con JSON válido):
+{
+  "thought": "explicación corta de qué vas a hacer ahora (≤2 frases)",
+  "action": "<comando exacto sin pipes ni metachars>" o null,
+  "done": false,
+  "summary": ""
+}
+
+Cuando termines (resuelto o no-resoluble):
+{
+  "thought": "última observación",
+  "action": null,
+  "done": true,
+  "summary": "qué hiciste / qué pasó / qué requiere atención manual"
+}
+
+Reglas:
+- NUNCA emitas comandos con `;`, `&&`, `|`, `>`, `$()`, backticks. La
+  whitelist los rechaza y perdés un turno.
+- NUNCA inventes paths que no estén en el contexto.
+- NUNCA reinicies el daemon `obsidian-rag-web` (com.fer.obsidian-rag-web).
+  Vos vivís adentro de ese daemon — kickstartearlo te mata mid-request
+  y el user pierde la conexión sin ver el resultado. Si el error es
+  del daemon web, devolvé done=true explicando qué viste pero pediendo
+  que el user reinicie a mano.
+- Si después de 2-3 acciones no encontrás progreso, devolvé done=true
+  con summary explicando qué intentaste y qué requiere review humano.
+- Sé conservador: si dudás entre kickstart y no-acción, prefiero no-acción.
+"""
+
+
+def _build_initial_auto_fix_user_prompt(req: "_AutoFixRequest") -> str:
+    parts = ["Tenés que resolver este error:"]
+    parts.append("")
+    if req.timestamp:
+        parts.append(f"**Timestamp**: {req.timestamp}")
+    if req.service:
+        parts.append(f"**Service**: `{req.service}`")
+    if req.file:
+        parts.append(f"**Archivo**: `{req.file}`")
+    parts.append("")
+    if req.context_lines:
+        parts.append("**Contexto previo del log** (las líneas anteriores):")
+        parts.append("```")
+        for ln in req.context_lines[-15:]:
+            parts.append(ln)
+        parts.append("```")
+        parts.append("")
+    parts.append("**Línea con el error**:")
+    parts.append("```")
+    parts.append(req.error_text)
+    parts.append("```")
+    parts.append("")
+    parts.append(
+        f"Tenés hasta {_AUTO_FIX_MAX_TURNS} turnos. Empezá investigando "
+        "(ver estado del daemon o leer más del log) antes de actuar. "
+        "Respondé con JSON según el schema del system prompt."
+    )
+    return "\n".join(parts)
+
+
+class _AutoFixRequest(BaseModel):
+    error_text: str = Field(..., description="La línea de log con el error")
+    service: str = Field("", description="Service de origen (ej. 'watch')")
+    file: str = Field("", description="Label del archivo")
+    line_n: int = Field(0, description="Número de línea reverso")
+    timestamp: str | None = Field(None, description="Timestamp ISO")
+    context_lines: list[str] = Field(default_factory=list)
+
+    @field_validator("error_text")
+    @classmethod
+    def _error_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("error_text vacío")
+        if len(v) > 4000:
+            v = v[:4000] + "…(truncado)"
+        return v
+
+
+def _execute_whitelisted_command(cmd_str: str) -> dict:
+    """Ejecutar un comando del whitelist y devolver dict con resultado.
+
+    Reusa _validate_safe_command + _audit_diagnose_execution. Si el
+    comando es rechazado, devuelve `{rejected: True, reason}`. Si pasa,
+    `{exit_code, stdout, stderr, command_executed, duration_s, timed_out}`.
+    """
+    argv, reason = _validate_safe_command(cmd_str)
+    if argv is None:
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "command_original": cmd_str,
+            "rejected": True,
+            "reason": reason,
+            "via": "auto-fix",
+        }
+        _audit_diagnose_execution(record)
+        return {"rejected": True, "reason": reason}
+
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_DIAGNOSE_TIMEOUT_S,
+            shell=False,
+            check=False,
+            cwd=str(Path.home()),
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": str(Path.home()),
+                "LANG": "en_US.UTF-8",
+            },
+        )
+        stdout = (result.stdout or "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        stderr = (result.stderr or "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        exit_code = result.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout.decode("utf-8", "replace") if e.stdout else "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        stderr = (
+            (e.stderr.decode("utf-8", "replace") if e.stderr else "")
+            + f"\n[timeout: {_DIAGNOSE_TIMEOUT_S}s]"
+        )[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        exit_code = 124
+        timed_out = True
+    except Exception as e:
+        stdout = ""
+        stderr = f"{type(e).__name__}: {e}"
+        exit_code = -1
+        timed_out = False
+    duration_s = round(time.monotonic() - t0, 3)
+
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "command_original": cmd_str,
+        "command_executed": argv,
+        "exit_code": exit_code,
+        "duration_s": duration_s,
+        "stdout_len": len(stdout),
+        "stderr_len": len(stderr),
+        "timed_out": timed_out,
+        "via": "auto-fix",
+        "stdout_preview": stdout[:300],
+        "stderr_preview": stderr[:300],
+    }
+    _audit_diagnose_execution(record)
+
+    return {
+        "rejected": False,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "command_executed": argv,
+        "duration_s": duration_s,
+        "timed_out": timed_out,
+    }
+
+
+@app.post("/api/auto-fix")
+def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
+    """Agent loop que diagnostica + resuelve el error solo.
+
+    En cada turno: el LLM emite un JSON con `{thought, action, done,
+    summary}`. Si action no-null, el server lo ejecuta y manda el
+    resultado al LLM como contexto del próximo turno. Loop hasta
+    `done=true` o `_AUTO_FIX_MAX_TURNS` (6).
+
+    Streams SSE con eventos: turn, thought, action, action_result,
+    action_rejected, done, max_turns_reached, error.
+    """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
+
+    initial_user_prompt = _build_initial_auto_fix_user_prompt(req)
+    model = resolve_chat_model()
+
+    def _stream():
+        messages = [
+            {"role": "system", "content": _AUTO_FIX_SYSTEM_PROMPT},
+            {"role": "user", "content": initial_user_prompt},
+        ]
+        yield f"data: {json.dumps({'type': 'model', 'name': model})}\n\n"
+
+        for turn_n in range(1, _AUTO_FIX_MAX_TURNS + 1):
+            yield f"data: {json.dumps({'type': 'turn', 'n': turn_n})}\n\n"
+            try:
+                resp = ollama.chat(
+                    model=model,
+                    messages=messages,
+                    format="json",
+                    options={
+                        "temperature": 0.2,
+                        "seed": 42,
+                        "num_predict": 400,
+                        "num_ctx": 6144,
+                    },
+                    keep_alive=chat_keep_alive(),
+                )
+                raw_content = (resp.message.content if hasattr(resp, "message") else
+                               resp["message"]["content"])
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'LLM call failed: {e}'})}\n\n"
+                return
+
+            try:
+                data = json.loads(raw_content or "{}")
+            except json.JSONDecodeError as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'LLM did not return valid JSON: {e}'})}\n\n"
+                return
+
+            thought = (data.get("thought") or "").strip()
+            action = data.get("action")
+            done = bool(data.get("done"))
+            summary = (data.get("summary") or "").strip()
+
+            if thought:
+                yield f"data: {json.dumps({'type': 'thought', 'text': thought})}\n\n"
+
+            if done:
+                yield f"data: {json.dumps({'type': 'done', 'summary': summary})}\n\n"
+                return
+
+            if not action:
+                # No action y no done — el LLM se confundió. Cortamos.
+                yield f"data: {json.dumps({'type': 'done', 'summary': summary or 'el agente no decidió siguiente acción'})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'type': 'action', 'command': action})}\n\n"
+            result = _execute_whitelisted_command(action)
+            if result.get("rejected"):
+                yield f"data: {json.dumps({'type': 'action_rejected', 'command': action, 'reason': result['reason']})}\n\n"
+                # Inyectar al LLM la rejection para que intente otra cosa.
+                messages.append({"role": "assistant", "content": raw_content})
+                messages.append({
+                    "role": "user",
+                    "content": f"La acción `{action}` fue rechazada por la whitelist: {result['reason']}. Intentá con otra acción permitida o devolvé done=true si no podés resolver.",
+                })
+                continue
+
+            yield f"data: {json.dumps({'type': 'action_result', 'exit_code': result['exit_code'], 'stdout': result['stdout'][:_AUTO_FIX_OUTPUT_TRUNCATE], 'stderr': result['stderr'][:_AUTO_FIX_OUTPUT_TRUNCATE], 'duration_s': result['duration_s']})}\n\n"
+
+            # Inyectar el resultado al contexto para el próximo turno.
+            messages.append({"role": "assistant", "content": raw_content})
+            obs = (
+                f"Resultado de `{action}`:\n"
+                f"exit_code: {result['exit_code']}\n"
+                f"stdout: {result['stdout'][:_AUTO_FIX_OUTPUT_TRUNCATE]}\n"
+                f"stderr: {result['stderr'][:500]}"
+            )
+            messages.append({"role": "user", "content": obs})
+
+        # Si salió del loop sin done, max_turns_reached.
+        yield f"data: {json.dumps({'type': 'max_turns_reached', 'limit': _AUTO_FIX_MAX_TURNS})}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/logs")

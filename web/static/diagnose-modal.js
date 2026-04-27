@@ -1,43 +1,33 @@
-/* diagnose-modal.js — modal compartido para "🩺 fix con IA".
+/* diagnose-modal.js — modal "🩺 fix con IA" con agent loop server-side.
  *
- * Public API (global, sin module system para que /logs y /status puedan
- * cargarlo con un <script> tag simple):
+ * Flow nuevo (vs. la versión anterior que diagnosticaba textualmente y
+ * mostraba botones para ejecutar comandos uno por uno):
+ *
+ *   1. Click 🩺 → modal abre, llama POST /api/auto-fix con el contexto.
+ *   2. El server arranca un agent loop (LLM → tool_call → result → LLM).
+ *   3. Cada paso del agent llega vía SSE como un evento separado:
+ *        {type: "model", name: "qwen2.5:7b"}
+ *        {type: "turn", n: 1}
+ *        {type: "thought", text: "Voy a verificar si el daemon está vivo"}
+ *        {type: "action", command: "launchctl list com.fer..."}
+ *        {type: "action_result", exit_code: 0, stdout: "...", stderr: "..."}
+ *        {type: "action_rejected", command: "...", reason: "..."}
+ *        {type: "done", summary: "Reinicié el daemon, errores cesaron"}
+ *        {type: "max_turns_reached", limit: 8}
+ *        {type: "error", message: "..."}
+ *   4. El frontend renderea cada evento como una entrada en una timeline.
+ *      Sin botones, sin confirmaciones — el agent corre solo hasta done.
+ *
+ * Public API global:
  *
  *   window.DiagnoseModal.open({
  *     service: "watch",
  *     file: "obsidian-rag/watch.log (stdout)",
  *     line_n: 1234,
  *     error_text: "OperationalError: ...",
- *     context_lines: ["...", "..."],   // optional, las 20 anteriores
- *     timestamp: "2026-04-26T19:47:50", // optional
+ *     context_lines: ["...", "..."],   // optional, ~20 líneas anteriores
+ *     timestamp: "2026-04-26T19:47:50",
  *   });
- *
- * Lifecycle:
- *   1. open() construye el modal en document.body (singleton — si ya
- *      hay uno abierto, lo cierra antes).
- *   2. Empieza el fetch SSE a /api/diagnose-error con el payload.
- *   3. Renderea progresivamente: header con modelo, body con la
- *      respuesta del LLM en Markdown light-rendered.
- *   4. Cada bloque ```bash``` se renderea con un botón "▶ Ejecutar".
- *   5. Click en "▶ Ejecutar" → POST /api/diagnose-error/execute con el
- *      comando exacto. El server valida contra una whitelist de comandos
- *      seguros (rag/ollama/launchctl/tail/head/cat/ls/wc + validators
- *      por argumento). Si el comando NO está en whitelist o tiene
- *      metachars peligrosos (`;`, `|`, `>`, `$()`, etc.), responde 403
- *      con el motivo. El modal sigue mostrando "📋 copiar" como
- *      alternativa para que el user pueda llevarlo a su terminal real.
- *
- *      Por compat con versiones que devolvían 503 (auto-execute
- *      deshabilitado), el handler abajo trata 503 igual que 403 →
- *      ofrecer copiar como alternativa.
- *
- * Markdown rendering: light, manual. NO agregamos `marked` por algo tan
- * acotado. Sólo necesitamos:
- *   - Headers `## Title` → <h3>
- *   - Bullets `- item` → <ul><li>
- *   - Código inline `code` → <code>
- *   - Bloques ```bash\n...\n``` → <pre><code>
- *   - **bold** → <strong>
  */
 
 (function () {
@@ -66,9 +56,7 @@
     }
   }
 
-  // ── Markdown light renderer ────────────────────────────────────────
-  // Returns { node, commands } — el DOM y la lista de bloques bash que
-  // detectamos para wirear el botón "▶ Ejecutar".
+  // ── Helpers ────────────────────────────────────────────────────────
   function escapeHtml(s) {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -78,252 +66,82 @@
       .replace(/'/g, "&#39;");
   }
 
-  function renderMarkdown(text) {
-    const node = document.createElement("div");
-    const commands = [];
-    if (!text) return { node, commands };
-
-    // Splitear por bloques ``` para procesar bash separado del resto.
-    const parts = text.split(/```(\w*)\n([\s\S]*?)(?:```|$)/);
-    // Resultados: [text0, lang1, code1, text2, lang2, code2, ...]
-    for (let i = 0; i < parts.length; i++) {
-      if (i % 3 === 0) {
-        // Texto markdown normal.
-        const block = parts[i];
-        if (!block.trim()) continue;
-        const html = renderInlineMarkdown(block);
-        // Insertar como wrapper para que herede el flow del .diag-stream.
-        const wrapper = document.createElement("div");
-        wrapper.innerHTML = html;
-        while (wrapper.firstChild) node.appendChild(wrapper.firstChild);
-      } else if (i % 3 === 1) {
-        // Idioma del bloque (ej. "bash"). Skip; lo usamos en i+1.
-        continue;
-      } else {
-        // Código del bloque.
-        const lang = parts[i - 1];
-        const code = parts[i].replace(/\n+$/, "");
-        if (lang === "bash" || lang === "sh" || lang === "shell") {
-          // Cada línea de comando es un bloque clickeable.
-          for (const cmd of code.split("\n").map((s) => s.trim()).filter(Boolean)) {
-            // Skip lines que son comments del LLM (ej. "# ejemplo de uso").
-            if (cmd.startsWith("#")) continue;
-            const cmdNode = renderCommandBlock(cmd);
-            commands.push(cmd);
-            node.appendChild(cmdNode);
-          }
-        } else {
-          const pre = document.createElement("pre");
-          const codeEl = document.createElement("code");
-          codeEl.textContent = code;
-          pre.appendChild(codeEl);
-          node.appendChild(pre);
-        }
+  function el(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    if (attrs) {
+      for (const k in attrs) {
+        if (k === "class") e.className = attrs[k];
+        else if (k === "html") e.innerHTML = attrs[k];
+        else e.setAttribute(k, attrs[k]);
       }
     }
-    return { node, commands };
-  }
-
-  function renderInlineMarkdown(text) {
-    // Headers: ## o ### → h3.
-    let html = text;
-    html = html.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
-    html = html.replace(/^##\s+(.+)$/gm, "<h3>$1</h3>");
-    html = html.replace(/^#\s+(.+)$/gm, "<h3>$1</h3>");
-    // Bullets — convertir secuencias de líneas que empiezan con `- `.
-    html = html.replace(/((?:^- .+(?:\n|$))+)/gm, (match) => {
-      const items = match
-        .trimEnd()
-        .split("\n")
-        .map((l) => l.replace(/^- /, "").trim())
-        .filter(Boolean)
-        .map((l) => `<li>${renderInlineFormatting(escapeHtml(l))}</li>`)
-        .join("");
-      return `<ul>${items}</ul>`;
-    });
-    // Numbered lists.
-    html = html.replace(/((?:^\d+\.\s.+(?:\n|$))+)/gm, (match) => {
-      const items = match
-        .trimEnd()
-        .split("\n")
-        .map((l) => l.replace(/^\d+\.\s/, "").trim())
-        .filter(Boolean)
-        .map((l) => `<li>${renderInlineFormatting(escapeHtml(l))}</li>`)
-        .join("");
-      return `<ol>${items}</ol>`;
-    });
-    // Párrafos: dividir por dobles \n y envolver en <p> los que no son
-    // ya un block element (ul/ol/h3/pre).
-    const paragraphs = html.split(/\n\n+/);
-    return paragraphs
-      .map((p) => {
-        p = p.trim();
-        if (!p) return "";
-        if (/^<(?:h3|ul|ol|pre)/.test(p)) return p;
-        // Inline formatting + escape para texto plano.
-        return `<p>${renderInlineFormatting(escapeHtml(p))}</p>`;
-      })
-      .join("");
-  }
-
-  function renderInlineFormatting(escapedText) {
-    // **bold**, `code`. Ambos sobre HTML ya escapado.
-    let s = escapedText;
-    s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    s = s.replace(/`([^`]+?)`/g, "<code>$1</code>");
-    return s;
-  }
-
-  function renderCommandBlock(cmd) {
-    const block = document.createElement("div");
-    block.className = "diag-cmd-block";
-    const codeEl = document.createElement("code");
-    codeEl.textContent = cmd;
-    block.appendChild(codeEl);
-
-    const runBtn = document.createElement("button");
-    runBtn.type = "button";
-    runBtn.className = "diag-btn diag-btn-execute";
-    runBtn.textContent = "▶ ejecutar";
-    block.appendChild(runBtn);
-
-    const resultEl = document.createElement("div");
-    resultEl.className = "diag-cmd-result";
-    block.appendChild(resultEl);
-
-    runBtn.addEventListener("click", async () => {
-      // Confirmación obligatoria — el comando vino de un LLM, no
-      // querés ejecutar a ciegas.
-      if (!runBtn.classList.contains("diag-btn-confirm")) {
-        runBtn.classList.add("diag-btn-confirm");
-        runBtn.textContent = "▶▶ confirmar";
-        return;
-      }
-      runBtn.disabled = true;
-      runBtn.textContent = "⏳ ejecutando…";
-      resultEl.textContent = "";
-      try {
-        const resp = await fetch("/api/diagnose-error/execute", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: cmd }),
-        });
-        // 403 = comando rechazado por whitelist (caso esperado, no error).
-        // 503 = backwards compat con versiones donde /execute estaba deshabilitado
-        // entero. Ambos: degradamos a "copiá manualmente" con el motivo.
-        if (resp.status === 503 || resp.status === 403) {
-          const data = await resp.json();
-          resultEl.textContent = data.detail || "comando no ejecutable";
-          runBtn.textContent = "deshabilitado";
-          // Botón "copiar" como alternativa.
-          const copyBtn = document.createElement("button");
-          copyBtn.type = "button";
-          copyBtn.className = "diag-btn diag-btn-execute";
-          copyBtn.textContent = "📋 copiar";
-          copyBtn.addEventListener("click", async () => {
-            try {
-              await navigator.clipboard.writeText(cmd);
-              copyBtn.textContent = "✓ copiado";
-              setTimeout(() => { copyBtn.textContent = "📋 copiar"; }, 1200);
-            } catch {}
-          });
-          block.appendChild(copyBtn);
-          return;
-        }
-        const data = await resp.json();
-        if (data.exit_code === 0) {
-          resultEl.textContent = `✓ ok\n${data.stdout || ""}`;
-          runBtn.textContent = "✓ hecho";
-        } else {
-          resultEl.textContent = `✗ exit ${data.exit_code}\n${data.stderr || data.stdout || ""}`;
-          runBtn.textContent = "✗ falló";
-        }
-      } catch (e) {
-        resultEl.textContent = `error: ${e.message || e}`;
-        runBtn.textContent = "✗ error";
-      }
-    });
-
-    return block;
+    for (const k of kids) {
+      if (k == null) continue;
+      e.appendChild(typeof k === "string" ? document.createTextNode(k) : k);
+    }
+    return e;
   }
 
   // ── Modal construction ─────────────────────────────────────────────
   async function open(payload) {
     close();  // singleton
 
-    const overlay = document.createElement("div");
-    overlay.className = "diag-overlay";
+    const overlay = el("div", { class: "diag-overlay" });
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) close();
     });
 
-    const modal = document.createElement("div");
-    modal.className = "diag-modal";
+    const modal = el("div", { class: "diag-modal" });
     overlay.appendChild(modal);
 
     // Header.
-    const header = document.createElement("header");
-    header.className = "diag-header";
-    const title = document.createElement("h2");
-    title.className = "diag-title";
-    title.textContent = "🩺 fix con IA";
+    const header = el("header", { class: "diag-header" });
+    const title = el("h2", { class: "diag-title" }, "🩺 fix con IA");
     header.appendChild(title);
-    const meta = document.createElement("div");
-    meta.className = "diag-meta";
+    const meta = el("div", { class: "diag-meta" });
     const metaParts = [];
     if (payload.service) metaParts.push(payload.service);
     if (payload.timestamp) metaParts.push(payload.timestamp);
     if (payload.line_n) metaParts.push(`L${payload.line_n}`);
     meta.textContent = metaParts.join(" · ");
     header.appendChild(meta);
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "diag-close";
-    closeBtn.setAttribute("aria-label", "Cerrar");
-    closeBtn.textContent = "✕";
+    const closeBtn = el("button", {
+      type: "button", class: "diag-close", "aria-label": "Cerrar",
+    }, "✕");
     closeBtn.addEventListener("click", close);
     header.appendChild(closeBtn);
     modal.appendChild(header);
 
     // Body.
-    const body = document.createElement("section");
-    body.className = "diag-body";
+    const body = el("section", { class: "diag-body" });
 
-    // Error block.
-    const errBlock = document.createElement("div");
-    errBlock.className = "diag-error-block";
-    const errLine = document.createElement("pre");
-    errLine.className = "diag-error-line";
+    // Error block (siempre arriba).
+    const errBlock = el("div", { class: "diag-error-block" });
+    const errLine = el("pre", { class: "diag-error-line" });
     errLine.textContent = payload.error_text || "(sin texto)";
     errBlock.appendChild(errLine);
     body.appendChild(errBlock);
 
-    const status = document.createElement("div");
-    status.className = "diag-status";
-    status.textContent = "consultando al LLM…";
+    // Status arriba (cambia con cada turn).
+    const status = el("div", { class: "diag-status" }, "iniciando agente…");
     body.appendChild(status);
 
-    const stream = document.createElement("article");
-    stream.className = "diag-stream";
-    stream.setAttribute("aria-live", "polite");
-    body.appendChild(stream);
+    // Timeline — cada turn agrega un .diag-turn aquí.
+    const timeline = el("div", { class: "diag-timeline" });
+    body.appendChild(timeline);
+
+    // Summary — visible al final cuando hay done event.
+    const summaryBox = el("div", { class: "diag-summary", hidden: "true" });
+    body.appendChild(summaryBox);
 
     modal.appendChild(body);
 
     // Footer.
-    const footer = document.createElement("footer");
-    footer.className = "diag-footer";
-    const retryBtn = document.createElement("button");
-    retryBtn.type = "button";
-    retryBtn.className = "diag-btn";
-    retryBtn.textContent = "↻ reintentar";
-    retryBtn.disabled = true;
+    const footer = el("footer", { class: "diag-footer" });
+    const retryBtn = el("button", { type: "button", class: "diag-btn", disabled: "true" }, "↻ reintentar");
     retryBtn.addEventListener("click", () => open(payload));
     footer.appendChild(retryBtn);
-    const closeFooterBtn = document.createElement("button");
-    closeFooterBtn.type = "button";
-    closeFooterBtn.className = "diag-btn diag-btn-close-footer";
-    closeFooterBtn.textContent = "cerrar";
+    const closeFooterBtn = el("button", { type: "button", class: "diag-btn diag-btn-close-footer" }, "cerrar");
     closeFooterBtn.addEventListener("click", close);
     footer.appendChild(closeFooterBtn);
     modal.appendChild(footer);
@@ -332,12 +150,11 @@
     _activeModal = overlay;
     document.addEventListener("keydown", _onKeydown);
 
-    // SSE fetch — usamos POST con body JSON, así que no podemos usar
-    // EventSource (que sólo soporta GET). Usamos fetch + ReadableStream.
+    // ── SSE fetch ───────────────────────────────────────────────────
     _abortController = new AbortController();
-    let accum = "";
+    let currentTurn = null;  // referencia al div del turn activo
     try {
-      const resp = await fetch("/api/diagnose-error", {
+      const resp = await fetch("/api/auto-fix", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -361,25 +178,7 @@
           if (!dataLine) continue;
           let event;
           try { event = JSON.parse(dataLine.slice(6)); } catch (_) { continue; }
-          if (event.type === "model") {
-            status.textContent = `Diagnosticando con ${event.name}…`;
-          } else if (event.type === "token") {
-            accum += event.content;
-            stream.innerHTML = "";
-            const { node } = renderMarkdown(accum);
-            stream.appendChild(node);
-          } else if (event.type === "done") {
-            status.textContent = "✓ listo";
-            status.classList.add("diag-status-done");
-            retryBtn.disabled = false;
-            stream.innerHTML = "";
-            const { node } = renderMarkdown(accum);
-            stream.appendChild(node);
-          } else if (event.type === "error") {
-            status.textContent = `error del LLM: ${event.message}`;
-            status.classList.add("diag-status-error");
-            retryBtn.disabled = false;
-          }
+          currentTurn = handleEvent(event, status, timeline, summaryBox, retryBtn, currentTurn);
         }
       }
     } catch (err) {
@@ -390,6 +189,121 @@
       }
     } finally {
       _abortController = null;
+    }
+  }
+
+  /** Procesa un evento del agent loop y actualiza el DOM. */
+  function handleEvent(event, status, timeline, summaryBox, retryBtn, currentTurn) {
+    switch (event.type) {
+      case "model":
+        status.textContent = `agente activo · modelo: ${event.name}`;
+        return currentTurn;
+
+      case "turn": {
+        // Crear un nuevo turn en la timeline.
+        const turn = el("article", { class: "diag-turn" });
+        const turnHead = el("header", { class: "diag-turn-head" });
+        turnHead.appendChild(el("span", { class: "diag-turn-n" }, `turno ${event.n}`));
+        turn.appendChild(turnHead);
+        timeline.appendChild(turn);
+        // Auto-scroll al turn nuevo.
+        requestAnimationFrame(() => {
+          turn.scrollIntoView({ behavior: "smooth", block: "end" });
+        });
+        return turn;
+      }
+
+      case "thought": {
+        if (!currentTurn) return currentTurn;
+        const t = el("div", { class: "diag-thought" });
+        t.appendChild(el("span", { class: "diag-thought-icon" }, "💭"));
+        t.appendChild(el("span", { class: "diag-thought-text" }, event.text || ""));
+        currentTurn.appendChild(t);
+        return currentTurn;
+      }
+
+      case "action": {
+        if (!currentTurn) return currentTurn;
+        const a = el("div", { class: "diag-action" });
+        a.appendChild(el("span", { class: "diag-action-icon" }, "▶"));
+        a.appendChild(el("code", { class: "diag-action-cmd" }, event.command || ""));
+        a.appendChild(el("span", { class: "diag-action-status" }, "ejecutando…"));
+        currentTurn.appendChild(a);
+        return currentTurn;
+      }
+
+      case "action_result": {
+        if (!currentTurn) return currentTurn;
+        // Encontrar el último .diag-action y actualizarlo.
+        const lastAction = currentTurn.querySelector(".diag-action:last-of-type");
+        if (lastAction) {
+          const statusEl = lastAction.querySelector(".diag-action-status");
+          const ok = event.exit_code === 0;
+          if (statusEl) {
+            statusEl.textContent = ok
+              ? `✓ ok (${event.duration_s}s)`
+              : `✗ exit ${event.exit_code} (${event.duration_s}s)`;
+            statusEl.classList.add(ok ? "diag-action-ok" : "diag-action-fail");
+          }
+        }
+        // Mostrar el output debajo de la acción.
+        const out = (event.stdout || event.stderr || "").trim();
+        if (out) {
+          const pre = el("pre", { class: "diag-action-output" });
+          pre.textContent = out.length > 800 ? out.slice(0, 800) + "\n…(truncado)" : out;
+          currentTurn.appendChild(pre);
+        }
+        return currentTurn;
+      }
+
+      case "action_rejected": {
+        if (!currentTurn) return currentTurn;
+        const lastAction = currentTurn.querySelector(".diag-action:last-of-type");
+        if (lastAction) {
+          const statusEl = lastAction.querySelector(".diag-action-status");
+          if (statusEl) {
+            statusEl.textContent = `✗ rechazado: ${event.reason}`;
+            statusEl.classList.add("diag-action-rejected");
+          }
+        }
+        return currentTurn;
+      }
+
+      case "done": {
+        status.textContent = "✓ resuelto";
+        status.classList.add("diag-status-done");
+        retryBtn.disabled = false;
+        if (event.summary) {
+          summaryBox.hidden = false;
+          summaryBox.innerHTML = `<div class="diag-summary-icon">✓</div>` +
+                                 `<div class="diag-summary-text">${escapeHtml(event.summary)}</div>`;
+          requestAnimationFrame(() => {
+            summaryBox.scrollIntoView({ behavior: "smooth", block: "end" });
+          });
+        }
+        return currentTurn;
+      }
+
+      case "max_turns_reached": {
+        status.textContent = `✗ agotó ${event.limit} turnos sin resolver`;
+        status.classList.add("diag-status-error");
+        retryBtn.disabled = false;
+        summaryBox.hidden = false;
+        summaryBox.innerHTML = `<div class="diag-summary-icon diag-summary-icon-fail">✗</div>` +
+                               `<div class="diag-summary-text">El agente no pudo resolver el error en ${event.limit} turnos. ` +
+                               `Revisá la timeline arriba para ver qué intentó.</div>`;
+        return currentTurn;
+      }
+
+      case "error": {
+        status.textContent = `error: ${event.message}`;
+        status.classList.add("diag-status-error");
+        retryBtn.disabled = false;
+        return currentTurn;
+      }
+
+      default:
+        return currentTurn;
     }
   }
 

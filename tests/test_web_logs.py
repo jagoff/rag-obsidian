@@ -592,6 +592,9 @@ def test_validate_safe_command_accepts_whitelist(cmd):
     ("tail -f /Users/fer/.local/share/obsidian-rag/watch.log", "argumentos inválidos"),
     ("launchctl kickstart -k com.fer.OTHER.daemon", "argumentos inválidos"),
     ("launchctl bootout gui/501/com.fer.obsidian-rag-watch", "argumentos inválidos"),
+    # Hard-defense: kickstart del propio web daemon es rechazado.
+    ("launchctl kickstart -k gui/501/com.fer.obsidian-rag-web", "argumentos inválidos"),
+    ("launchctl kickstart -k com.fer.obsidian-rag-web", "argumentos inválidos"),
     ("rag index", "argumentos inválidos"),
     ("rag query foo", "argumentos inválidos"),
     ("cat /etc/passwd", "argumentos inválidos"),
@@ -658,7 +661,67 @@ def test_api_diagnose_error_execute_runs_safe_command(tmp_path: Path, monkeypatc
     assert audit_path.is_file()
 
 
+# ── /api/auto-fix — agent loop ───────────────────────────────────────
+
+def test_api_auto_fix_validates_empty_text():
+    resp = _client.post("/api/auto-fix", json={"error_text": "  "})
+    assert resp.status_code == 422
+
+
+def test_auto_fix_initial_prompt_includes_context():
+    """El prompt inicial al LLM incluye el error + contexto + service."""
+    req = _server._AutoFixRequest(
+        error_text="OperationalError: bad",
+        service="watch",
+        file="obsidian-rag/watch.log",
+        line_n=42,
+        timestamp="2026-04-26T19:00:00",
+        context_lines=["heartbeat alive=true", "[before]"],
+    )
+    prompt = _server._build_initial_auto_fix_user_prompt(req)
+    assert "watch" in prompt
+    assert "2026-04-26T19:00:00" in prompt
+    assert "OperationalError: bad" in prompt
+    assert "Contexto previo" in prompt
+    assert "[before]" in prompt
+    assert "8 turnos" in prompt or "turnos" in prompt
+
+
+def test_execute_whitelisted_command_rejected_returns_dict(tmp_path: Path, monkeypatch):
+    """Función de ejecución helper devuelve {rejected: True} sin lanzar."""
+    audit_path = tmp_path / "diagnose_executions.jsonl"
+    monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
+
+    result = _server._execute_whitelisted_command("rm -rf /")
+    assert result["rejected"] is True
+    assert "no está en la whitelist" in result["reason"]
+    # Audit log se escribió.
+    assert audit_path.is_file()
+
+
+def test_execute_whitelisted_command_runs_safe(tmp_path: Path, monkeypatch):
+    """Función helper ejecuta el comando + devuelve resultado."""
+    audit_path = tmp_path / "diagnose_executions.jsonl"
+    monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
+
+    log_dir = Path.home() / ".local/share/obsidian-rag"
+    if not log_dir.is_dir():
+        pytest.skip("no obsidian-rag log dir on this machine")
+    candidates = [p for p in log_dir.iterdir() if p.is_file() and p.suffix == ".log"]
+    if not candidates:
+        pytest.skip("no .log files")
+    sample = candidates[0]
+
+    result = _server._execute_whitelisted_command(f"wc -l {sample}")
+    assert result["rejected"] is False
+    assert result["exit_code"] == 0
+    assert result["duration_s"] >= 0
+    assert "command_executed" in result
+
+
 def test_static_assets_exist():
     """logs.html + logs.js existen en /static/."""
     assert (_STATIC_DIR / "logs.html").is_file()
     assert (_STATIC_DIR / "logs.js").is_file()
+    assert (_STATIC_DIR / "diagnose-modal.js").is_file()
+    assert (_STATIC_DIR / "diagnose-modal.css").is_file()

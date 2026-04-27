@@ -201,3 +201,125 @@ def test_tqdm_lock_preset_at_import_time():
         f"Eso significa que algo llamó tqdm.get_lock() ANTES del preset y "
         f"creó el SemLock POSIX."
     )
+
+
+# ── Factorización 2026-04-26: helper compartido rag/_shutdown.py ─────────
+#
+# Post commits `22a3b0b` (web) + `4d66199` (rag) había dos copias casi
+# idénticas del shutdown handler — una en `web/server.py`, otra en
+# `rag/__init__.py`. El siguiente bloque extrajo la lógica común a
+# `rag/_shutdown.py` y dejó ambos call-sites delegando en ese helper.
+# Los tests abajo blindan:
+#
+# 1. El helper canónico (`rag._shutdown.shutdown_joblib_loky_pool`) es
+#    importable standalone + idempotente.
+# 2. El CLI entry-point lo registra via `atexit.register()` — para que
+#    cualquier invocación (watch, serve, query, chat) drenee el pool al
+#    exit, no solo el web daemon.
+# 3. `web.server._shutdown_joblib_loky_pool` delega en el canónico
+#    (no reimplementa la lógica inline).
+# 4. El call-site característico `executor.shutdown(wait=True, kill_workers=True)`
+#    aparece en UN solo lugar del proyecto (sin duplicación).
+
+
+def test_canonical_helper_importable_standalone():
+    """`rag._shutdown.shutdown_joblib_loky_pool` tiene que ser callable
+    sin side effects y sin raisear, incluso si el pool nunca arrancó.
+
+    Blinda el invariante "factorización no rompió la API" — si alguien
+    renombra el módulo, el import falla y este test lo cachea antes de
+    llegar a prod.
+    """
+    from rag._shutdown import shutdown_joblib_loky_pool
+
+    # No side-effect observable, no raise.
+    shutdown_joblib_loky_pool()
+    shutdown_joblib_loky_pool()  # idempotente
+
+
+def test_cli_registers_shutdown_via_atexit():
+    """`rag/__init__.py` importa el helper de `rag._shutdown` y lo
+    registra via `atexit.register()` al import time.
+
+    No podemos inspect directo los callbacks de `atexit` (CPython no
+    expone esa list), así que verificamos el proxy observable: el
+    símbolo `_shutdown_joblib_loky_pool` en el namespace de `rag` tiene
+    que referenciar a la misma función del módulo canónico.
+
+    Si la factorización se deshace (alguien redefine el handler inline
+    en `rag/__init__.py`), este test lo detecta porque el `id()` deja
+    de matchear al del helper canónico.
+    """
+    import rag
+    from rag._shutdown import shutdown_joblib_loky_pool
+
+    assert hasattr(rag, "_shutdown_joblib_loky_pool"), (
+        "rag._shutdown_joblib_loky_pool no existe — alguien removió el alias "
+        "del re-export. Revisá rag/__init__.py y asegurate que haga "
+        "`from rag._shutdown import shutdown_joblib_loky_pool as _shutdown_joblib_loky_pool`."
+    )
+    assert rag._shutdown_joblib_loky_pool is shutdown_joblib_loky_pool, (
+        f"rag._shutdown_joblib_loky_pool apunta a una función distinta "
+        f"({rag._shutdown_joblib_loky_pool!r}) del canónico "
+        f"({shutdown_joblib_loky_pool!r}). La factorización se rompió — "
+        f"hay drift silencioso entre `rag/__init__.py` y `rag/_shutdown.py`."
+    )
+
+
+def test_web_server_delegates_to_shared_helper():
+    """`web.server._shutdown_joblib_loky_pool` tiene que llamar al helper
+    canónico de `rag._shutdown`, no reimplementar la lógica inline.
+
+    Pre-factorización (2026-04-26) había duplicación: web tenía 70
+    líneas inline, rag tenía 40 líneas inline. Este test blinda que se
+    mantenga un único origen de verdad.
+    """
+    from unittest.mock import patch
+
+    call_count = {"n": 0}
+
+    def counting_shutdown():
+        call_count["n"] += 1
+
+    # Monkeypatchear la función canónica + verificar que el handler
+    # del web la invoca. El handler re-importa `rag._shutdown` dentro
+    # del body, así que el patch se respeta.
+    with patch("rag._shutdown.shutdown_joblib_loky_pool", counting_shutdown):
+        srv._shutdown_joblib_loky_pool()
+
+    assert call_count["n"] == 1, (
+        f"web.server._shutdown_joblib_loky_pool no delegó en "
+        f"rag._shutdown.shutdown_joblib_loky_pool (se llamó {call_count['n']} "
+        f"veces). Probablemente alguien reintrodujo la lógica inline."
+    )
+
+
+def test_canonical_helper_has_no_duplicate_inline_implementations():
+    """Grep de defensa: el bloque `executor.shutdown(wait=True, kill_workers=True)`
+    debe aparecer en UN solo lugar del proyecto — `rag/_shutdown.py`.
+
+    Si alguien re-inlinea la lógica en `web/server.py` o `rag/__init__.py`
+    (regresión de la factorización), este test cachea la duplicación
+    grepeando por el call-site característico.
+    """
+    import pathlib
+
+    root = pathlib.Path(srv.__file__).resolve().parent.parent
+    needle = "executor.shutdown(wait=True, kill_workers=True)"
+
+    hits: list[str] = []
+    for path in [
+        root / "rag" / "__init__.py",
+        root / "web" / "server.py",
+        root / "rag" / "_shutdown.py",
+    ]:
+        if not path.exists():
+            continue
+        if needle in path.read_text(encoding="utf-8"):
+            hits.append(str(path.relative_to(root)))
+
+    assert hits == ["rag/_shutdown.py"], (
+        f"El call-site `{needle}` debería estar SOLO en rag/_shutdown.py, "
+        f"pero aparece en: {hits}. Alguien reintrodujo la lógica inline "
+        f"en vez de delegar en el helper compartido."
+    )

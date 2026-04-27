@@ -7529,74 +7529,21 @@ def _drain_conversation_writers() -> None:
 
 @_on_shutdown
 def _shutdown_joblib_loky_pool() -> None:
-    """Drain joblib/loky reusable executor para evitar el leak de
-    semaphores POSIX en cada shutdown del web daemon.
+    """Drain el joblib/loky reusable executor al stop del lifespan de FastAPI.
 
-    Audit 2026-04-24: `web.error.log` mostraba 269 leaked semaphores
-    acumuladas (`/loky-PID-XXX`) — una por cada restart del daemon.
-    macOS POSIX semaphore namespace tiene un cap fijo y los leaks no
-    se recuperan hasta logout del user.
+    El trabajo real vive en `rag/_shutdown.py` para compartir código con
+    el CLI (`rag watch`, `rag serve`, etc.) — ver ese módulo para la
+    doc completa del bug, el fix en tres pasos, y el trade-off de
+    `kill_workers=True` durante SIGTERM.
 
-    Origen: joblib usa loky (multiprocessing pool con workers
-    persistentes) como backend default. Algún transitive dep
-    (sentence-transformers / sklearn / scipy) hace `joblib.Parallel(...)`
-    o setea `n_jobs > 1` durante una request, lo que arranca el pool.
-    Pre-fix nadie lo paraba al SIGTERM → `resource_tracker` veía el
-    semaphore huérfano post-fork y warnea.
-
-    Fix: en el shutdown handler, importar joblib y llamar
-    `get_reusable_executor().shutdown(kill_workers=True)` para terminar
-    el pool antes de que el resource_tracker valide handles.
-
-    Idempotente: si el pool nunca arrancó (caso típico — la mayoría de
-    requests no usan joblib.Parallel), `get_reusable_executor()`
-    devuelve un executor vacío y `shutdown` es no-op. Si joblib no
-    está disponible (imports fail), silent-skip — el leak vuelve pero
-    no rompemos el shutdown path.
-
-    Trade-off: si una request EN VUELO está usando joblib.Parallel,
-    `kill_workers=True` la corta abruptamente. Es lo correcto durante
-    SIGTERM — los user-facing handlers ya tienen sus propios timeouts
-    y graceful aborts.
+    Acá solo envolvemos el helper en el decorator `@_on_shutdown` del
+    lifespan, y mantenemos el nombre original para que los tests que
+    verifican la registración (`test_shutdown_callback_registered`)
+    sigan sin cambio.
     """
-    try:
-        from joblib.externals.loky import get_reusable_executor
-        from joblib.externals.loky import reusable_executor as _re_mod
-        import gc
+    from rag._shutdown import shutdown_joblib_loky_pool
 
-        executor = get_reusable_executor()
-        executor.shutdown(wait=True, kill_workers=True)
-
-        # Audit follow-up 2026-04-25: el shutdown solo SHUTTING los workers
-        # no es suficiente — el `_executor` global de loky sigue holdeando
-        # references a SemLock instances (locks internos del executor).
-        # Esos SemLocks NO se GC-ean hasta que el global se nullifique,
-        # entonces el `util.Finalize(SemLock._cleanup, ...)` con
-        # `exitpriority=0` no corre antes del resource_tracker check del
-        # exit, y vemos las warnings `leaked semaphore objects: /loky-PID-XXX`.
-        #
-        # Fix: reset los globals + force gc.collect() para que los Finalizers
-        # de los SemLocks corran AHORA, no en el exit fini-fini.
-        try:
-            _re_mod._executor = None
-            _re_mod._executor_kwargs = None
-        except Exception:
-            pass
-        try:
-            gc.collect()
-        except Exception:
-            pass
-    except Exception as exc:
-        # Silent-skip — el leak no es bloqueante, no queremos romper el
-        # shutdown si joblib se desinstala o cambia su API.
-        try:
-            print(
-                f"[lifespan-shutdown] _shutdown_joblib_loky_pool skip: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-        except Exception:
-            pass
+    shutdown_joblib_loky_pool()
 
 
 def _append_pending_conversation_turn(rec: dict) -> None:
@@ -8946,11 +8893,22 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # retrieve haya bajado debajo de CONFIDENCE_RERANK_MIN — los tools
         # van a inyectar la data real. Sin este check, el user reporta
         # "Sin resultados" cuando el sistema sí tiene forma de responder.
+        # Audit 2026-04-26 (BUG #6): per-source threshold en lugar
+        # del global CONFIDENCE_RERANK_MIN=0.015. Si Phase 1.h baja el
+        # gate de WA a 0.008, el web seguía cortando a 0.015 → falsos
+        # refuses cross-source.
+        _top_meta = (result.get("metas") or [{}])[0] if result.get("metas") else {}
+        _top_src = _top_meta.get("source") if isinstance(_top_meta, dict) else None
+        try:
+            from rag import confidence_threshold_for_source as _conf_thresh_fn
+            _conf_threshold = _conf_thresh_fn(_top_src) if _top_src else CONFIDENCE_RERANK_MIN
+        except Exception:
+            _conf_threshold = CONFIDENCE_RERANK_MIN
         _low_conf_bypass = (
             not is_propose_intent
             and not _mention_paths
             and not _has_forced_tools
-            and float(result["confidence"]) < CONFIDENCE_RERANK_MIN
+            and float(result["confidence"]) < _conf_threshold
         )
         if _low_conf_bypass:
             _t_retrieve_ms = int((_t_retrieve_end - _t_retrieve_start) * 1000)

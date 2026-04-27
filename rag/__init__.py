@@ -14260,9 +14260,11 @@ def _handle_memory_pressure(pct_before: float, threshold: float) -> dict:
         _never_unload = os.environ.get("RAG_RERANKER_NEVER_UNLOAD", "").strip().lower() in ("1", "true", "yes")
         if _never_unload:
             actions["reranker_unload_skipped_never_unload"] = True
+            # Audit 2026-04-26 (BUG #36): wrap en Exception, no str.
             _silent_log("memory_watchdog_reranker_pinned",
-                        f"pct_after_chat={pct_after} >= threshold={threshold} "
-                        f"but RAG_RERANKER_NEVER_UNLOAD=1 — skipping")
+                        Exception(
+                            f"pct_after_chat={pct_after} >= threshold={threshold} "
+                            f"but RAG_RERANKER_NEVER_UNLOAD=1 — skipping"))
         else:
             try:
                 if maybe_unload_reranker(force=True):
@@ -19948,7 +19950,11 @@ def retrieve(
     #     del top-40 RRF) y ahorra 1-2s por query.
     #     `rerank_pool` override permite reducir el pool para superficies
     #     latency-sensitive (web) sin afectar el comportamiento del CLI.
+    # Audit 2026-04-26 (BUG #30): clamp lower bound. `rerank_pool=0`
+    # producía empty pool → top_score=-inf → low_conf_bypass siempre.
     _effective_pool = rerank_pool if rerank_pool is not None else RERANK_POOL_MAX
+    if _effective_pool <= 0:
+        _effective_pool = 1
 
     # 5. Fetch candidates. Fetch BEFORE pool truncation so the exclude filter
     #    (when active) drops candidates by metadata first, leaving _effective_pool

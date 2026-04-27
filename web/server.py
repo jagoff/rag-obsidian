@@ -136,6 +136,7 @@ from rag import (  # noqa: E402
     find_contradictions_for_note,
     find_followup_loops,
     find_related,
+    find_wikilink_suggestions,
     get_db,
     get_pagerank,
     log_behavior_event,
@@ -4374,6 +4375,70 @@ def notes_loops(path: str, limit: int = 50) -> dict:
             "extracted_at": loop.get("extracted_at", ""),
         })
     return {"items": items, "source_path": path}
+
+
+# ── /api/notes/wikilink-suggestions ──────────────────────────────────────────
+#
+# Endpoint para el panel "Wikilinks sugeridos" del plugin Obsidian
+# (Track A #4). Detecta strings en el body de la nota que matchean
+# títulos de OTRAS notas del corpus pero NO están linkeadas con
+# `[[...]]`. Útil para combatir el patrón "escribí 'autoridad' pero
+# olvidé linkear `[[Autoridad]]`" que pasa cuando uno escribe rápido.
+#
+# Cheap (sin LLM, sin embed). El backend usa un regex multi-pattern
+# pre-compilado por título; típicamente <50ms para body de 5KB +
+# corpus de 2K títulos. Reactive-friendly.
+@app.get("/api/notes/wikilink-suggestions")
+def notes_wikilink_suggestions(path: str, limit: int = 30) -> dict:
+    """Wikilinks sugeridos para `path` — strings en el body que matchean
+    títulos de otras notas pero no están linkeadas.
+
+    Wrap delgado de `find_wikilink_suggestions` del rag.py. El ranking
+    + filtering (longest-first, ambiguous skip, code-fence skip,
+    self-link skip) viven allá; este endpoint solo expone el shape.
+
+    Args:
+        path: Vault-relative.
+        limit: Max sugerencias a devolver (1-50, default 30). El
+            algoritmo internamente respeta el cap, así que pedir más
+            no agrega trabajo del lado del server.
+
+    Returns:
+        items: [{title, target, line, char_offset, context}, ...]
+          - `title`: el texto detectado en la nota (== basename de la
+            target sin .md).
+          - `target`: path destino (vault-relative).
+          - `line`: número de línea 1-indexed.
+          - `char_offset`: offset absoluto en bytes desde el inicio
+            del archivo. El plugin lo convierte a editor position
+            con `editor.offsetToPos()`.
+          - `context`: ±60 chars alrededor del match (sin newlines,
+            para preview en el card).
+        source_path: echo del input.
+        reason?: "empty_index" | "not_found" si items=[].
+    """
+    if not path or not path.endswith(".md"):
+        raise HTTPException(status_code=400, detail="path debe terminar en .md")
+    if not VAULT_PATH.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"vault no encontrado en {VAULT_PATH}",
+        )
+    try:
+        full = (VAULT_PATH / path).resolve()
+        full.relative_to(VAULT_PATH.resolve())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"path inválido: {exc}")
+    if not full.is_file():
+        return {"items": [], "source_path": path, "reason": "not_found"}
+
+    limit = max(1, min(int(limit), 50))
+    col = get_db()
+    if col.count() == 0:
+        return {"items": [], "source_path": path, "reason": "empty_index"}
+
+    suggestions = find_wikilink_suggestions(col, path, max_per_note=limit)
+    return {"items": suggestions, "source_path": path}
 
 
 class TTSRequest(BaseModel):

@@ -33748,9 +33748,11 @@ def wikilinks():
               help="Largo mínimo del título a considerar (filtro de colisiones)")
 @click.option("--show", default=5, show_default=True,
               help="Sugerencias por nota a imprimir en dry-run")
+@click.option("--json", "as_json", is_flag=True,
+              help="Salida JSON (consumido por el plugin Obsidian / scripts).")
 def wikilinks_suggest(
     note_path: str | None, folder: str | None, apply: bool,
-    max_per_note: int, min_len: int, show: int,
+    max_per_note: int, min_len: int, show: int, as_json: bool,
 ):
     """Encontrar menciones a títulos de notas que NO están wikilinkeadas y
     proponerlas. Skipea código, frontmatter, links existentes, y títulos
@@ -33766,14 +33768,21 @@ def wikilinks_suggest(
             paths = [p for p in paths if p.startswith(folder.rstrip("/") + "/") or p == folder]
 
     if not paths:
-        console.print("[yellow]No hay notas que procesar.[/yellow]")
+        if as_json:
+            click.echo(json.dumps({"items": [], "source_path": note_path or ""}))
+        else:
+            console.print("[yellow]No hay notas que procesar.[/yellow]")
         return
 
     total_suggestions = 0
     notes_with_suggestions = 0
     notes_applied = 0
     by_note: list[tuple[str, list[dict]]] = []
-    for path in track(paths, description="Analizando..."):
+    # Skip rich `track()` progress bar bajo --json — emite escapes ANSI a
+    # stderr que el plugin no espera. Usamos un loop plano cuando hay
+    # output máquina.
+    iterable = paths if as_json else track(paths, description="Analizando...")
+    for path in iterable:
         try:
             sugs = find_wikilink_suggestions(
                 col, path, min_title_len=min_len, max_per_note=max_per_note,
@@ -33802,6 +33811,28 @@ def wikilinks_suggest(
                         pass
             except Exception as e:
                 console.print(f"[red]Error aplicando en {path}: {e}[/red]")
+
+    if as_json:
+        # Output paralelo al endpoint HTTP /api/notes/wikilink-suggestions:
+        # cuando hay 1 nota (--note), devolvemos {items, source_path} (mismo
+        # shape). Cuando hay N notas (default sin --note), devolvemos
+        # {by_note: [{path, items}, ...], total_suggestions, notes_with_suggestions}
+        # para que scripts agrupen.
+        if note_path:
+            items = by_note[0][1] if by_note else []
+            click.echo(json.dumps(
+                {"items": items, "source_path": note_path},
+                ensure_ascii=False,
+            ))
+        else:
+            click.echo(json.dumps({
+                "by_note": [{"path": p, "items": s} for p, s in by_note],
+                "total_suggestions": total_suggestions,
+                "notes_with_suggestions": notes_with_suggestions,
+                "notes_processed": len(paths),
+                "applied": notes_applied if apply else 0,
+            }, ensure_ascii=False))
+        return
 
     if not apply:
         for path, sugs in by_note:

@@ -314,7 +314,7 @@ def transcribe(audio_path: str, model: str, language: str | None,
 # ── `rag whisper` group + subcommands (learning loop admin) ─────────────────
 # Phase 2 del plan whatsapp-whisper-learning. Comandos para administrar el
 # vocab aprendido + correcciones manuales. Doc completo:
-# `04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md`
+# `04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`
 # en el vault (visible desde Obsidian).
 
 @cli.group(invoke_without_command=True)

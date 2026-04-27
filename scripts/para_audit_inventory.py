@@ -22,7 +22,7 @@ OUTPUT_FILE = OUTPUT_DIR / "inventory.jsonl"
 PARA_BUCKETS = ["01-Projects", "02-Areas", "03-Resources", "04-Archive"]
 
 # Hard-skip patterns (vault-relative path segments)
-CLAUDE_SKIP_PREFIX = "04-Archive/99-obsidian-system/99-Claude"
+CLAUDE_SKIP_PREFIX = "04-Archive/99-obsidian-system/99-AI"
 
 # Root-level 00-Inbox Claude memory filenames (but we skip 00-Inbox entirely anyway)
 INBOX_SKIP_PATTERNS = re.compile(

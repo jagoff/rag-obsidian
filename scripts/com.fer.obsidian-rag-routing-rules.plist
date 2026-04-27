@@ -10,7 +10,7 @@
     1h e inyecta las reglas activas al sysprompt del classifier.
 
     Spec: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
-          04-Archive/99-obsidian-system/99-Claude/system/voice-classifier/spec.md
+          04-Archive/99-obsidian-system/99-AI/system/voice-classifier/spec.md
 
     Para review manual antes de auto-promote: `rag routing review`.
     Para desactivar una regla mala: `rag routing disable-rule <id>`.

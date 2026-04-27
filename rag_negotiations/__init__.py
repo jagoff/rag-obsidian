@@ -2,7 +2,7 @@
 (Foundation).
 
 El feature completo (8 fases, ~10 semanas) lo describe la spec en
-`04-Archive/99-obsidian-system/99-Claude/system/wa-negotiation-autopilot/
+`04-Archive/99-obsidian-system/99-AI/system/wa-negotiation-autopilot/
 design.md`. Este subpackage entrega **solo la capa de datos** que las
 otras fases enchufan encima:
 

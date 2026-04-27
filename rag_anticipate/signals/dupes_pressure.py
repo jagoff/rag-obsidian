@@ -17,7 +17,7 @@ Diseño:
   y "proyecto-x-v1.md" vs "proyecto-x-v2.md" queden con ratio ~0.91,
   arriba del threshold.
 - Respeta `is_excluded(rel)` del vault layer: dotdirs (`.obsidian/`,
-  `.trash/`, ...), `04-Archive/99-obsidian-system/99-Claude/conversations/`
+  `.trash/`, ...), `04-Archive/99-obsidian-system/99-AI/conversations/`
   (episodic), `04-Archive/99-obsidian-system/...` en general,
   `03-Resources/Claude/<slug>/`, y el legacy `00-Inbox/conversations/`
   por compat — todos quedan fuera del scan, son artefactos auto-generados

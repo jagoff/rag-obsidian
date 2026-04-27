@@ -30,7 +30,7 @@ def test_folder_matches_widens_to_inbox():
 
 def test_folder_matches_inbox_is_always_in():
     # Cualquier folder como filtro + file en Inbox → match.
-    for folder in ["02-Areas", "03-Resources/Tech", "04-Archive/99-obsidian-system/99-Claude/reviews", "04-Archive/foo"]:
+    for folder in ["02-Areas", "03-Resources/Tech", "04-Archive/99-obsidian-system/99-AI/reviews", "04-Archive/foo"]:
         assert rag._folder_matches("00-Inbox/capture.md", folder) is True
 
 
@@ -92,7 +92,7 @@ def test_filter_files_folder_widens_to_inbox():
 # ── infer_filters: compound-noun guard ────────────────────────────────────
 # Bug (2026-04-16): "dame el cmd para enviar mensajes entre claude peers"
 # auto-aplicó folder=03-Resources/Claude y escondió la nota SKILL.md en
-# 04-Archive/99-obsidian-system/99-Claude/skills/claude-peers-mcp/. El leaf
+# 04-Archive/99-obsidian-system/99-AI/skills/claude-peers-mcp/. El leaf
 # corto "claude" se match'ea pero está pegado a "peers" → es brand, no intent
 # de carpeta.
 

@@ -1,7 +1,7 @@
 """Tests for the 'streak_break' Anticipatory Agent signal.
 
 Cubre:
-- Sin 04-Archive/99-obsidian-system/99-Claude/reviews dir → []
+- Sin 04-Archive/99-obsidian-system/99-AI/reviews dir → []
 - Brief de hoy existe (gap=0) → []
 - Brief de ayer + hoy no (gap=1) → []
 - Último brief hace 2 días → emit score 0.4
@@ -41,16 +41,16 @@ _REF_NOW = datetime(2025, 6, 15, 12, 0, 0)
 
 @pytest.fixture
 def mock_vault(tmp_path, monkeypatch):
-    """Vault vacío + 04-Archive/99-obsidian-system/99-Claude/reviews creado + `_resolve_vault_path` apuntando acá."""
+    """Vault vacío + 04-Archive/99-obsidian-system/99-AI/reviews creado + `_resolve_vault_path` apuntando acá."""
     vault = tmp_path / "vault"
-    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-AI/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     return vault
 
 
 @pytest.fixture
 def empty_vault(tmp_path, monkeypatch):
-    """Vault SIN 04-Archive/99-obsidian-system/99-Claude/reviews (para simular setup inicial)."""
+    """Vault SIN 04-Archive/99-obsidian-system/99-AI/reviews (para simular setup inicial)."""
     vault = tmp_path / "vault"
     vault.mkdir(parents=True)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
@@ -58,15 +58,15 @@ def empty_vault(tmp_path, monkeypatch):
 
 
 def _write_brief(vault: Path, brief_date, body: str = "# morning brief\n\nstub.\n") -> Path:
-    """Crea `04-Archive/99-obsidian-system/99-Claude/reviews/{brief_date.isoformat()}.md` con body mínimo."""
-    path = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / f"{brief_date.isoformat()}.md"
+    """Crea `04-Archive/99-obsidian-system/99-AI/reviews/{brief_date.isoformat()}.md` con body mínimo."""
+    path = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / f"{brief_date.isoformat()}.md"
     path.write_text(body, encoding="utf-8")
     return path
 
 
 def _write_evening(vault: Path, brief_date, body: str = "# evening brief\n") -> Path:
-    """Crea `04-Archive/99-obsidian-system/99-Claude/reviews/{brief_date.isoformat()}-evening.md` (NO debe contar)."""
-    path = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / f"{brief_date.isoformat()}-evening.md"
+    """Crea `04-Archive/99-obsidian-system/99-AI/reviews/{brief_date.isoformat()}-evening.md` (NO debe contar)."""
+    path = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / f"{brief_date.isoformat()}-evening.md"
     path.write_text(body, encoding="utf-8")
     return path
 
@@ -74,13 +74,13 @@ def _write_evening(vault: Path, brief_date, body: str = "# evening brief\n") -> 
 # ── Tests: estructura del vault ──────────────────────────────────────────────
 
 def test_no_reviews_dir_returns_empty(empty_vault):
-    """Sin folder 04-Archive/99-obsidian-system/99-Claude/reviews → [] silenciosamente."""
+    """Sin folder 04-Archive/99-obsidian-system/99-AI/reviews → [] silenciosamente."""
     result = streak_break_signal(_REF_NOW)
     assert result == []
 
 
 def test_empty_reviews_dir_returns_empty(mock_vault):
-    """Con 04-Archive/99-obsidian-system/99-Claude/reviews pero sin briefs → [] (pausa voluntaria)."""
+    """Con 04-Archive/99-obsidian-system/99-AI/reviews pero sin briefs → [] (pausa voluntaria)."""
     result = streak_break_signal(_REF_NOW)
     assert result == []
 
@@ -196,9 +196,9 @@ def test_evening_ignored_gap_measured_from_morning_only(mock_vault):
 
 def test_non_iso_md_files_ignored(mock_vault):
     """Archivos con nombres no-ISO (`notes.md`, `2025-W12.md`) no cuentan."""
-    (mock_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "notes.md").write_text("random", encoding="utf-8")
-    (mock_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2025-W12.md").write_text("weekly", encoding="utf-8")
-    (mock_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "README.md").write_text("readme", encoding="utf-8")
+    (mock_vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "notes.md").write_text("random", encoding="utf-8")
+    (mock_vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "2025-W12.md").write_text("weekly", encoding="utf-8")
+    (mock_vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "README.md").write_text("readme", encoding="utf-8")
     result = streak_break_signal(_REF_NOW)
     # Sin morning briefs válidos → []
     assert result == []
@@ -206,7 +206,7 @@ def test_non_iso_md_files_ignored(mock_vault):
 
 def test_invalid_date_in_filename_ignored(mock_vault):
     """Filenames con fecha imposible (`2025-13-45.md`) se ignoran silenciosamente."""
-    (mock_vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2025-13-45.md").write_text("bad", encoding="utf-8")
+    (mock_vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "2025-13-45.md").write_text("bad", encoding="utf-8")
     result = streak_break_signal(_REF_NOW)
     assert result == []
 
@@ -308,7 +308,7 @@ def test_silent_fail_on_nonexistent_vault(tmp_path, monkeypatch):
 # ── Tests: helpers internos (unit) ───────────────────────────────────────────
 
 def test_find_last_morning_brief_empty_vault(mock_vault):
-    """Helper retorna None con 04-Archive/99-obsidian-system/99-Claude/reviews vacío."""
+    """Helper retorna None con 04-Archive/99-obsidian-system/99-AI/reviews vacío."""
     assert _find_last_morning_brief(mock_vault, _REF_NOW) is None
 
 

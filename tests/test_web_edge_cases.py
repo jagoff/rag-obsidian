@@ -162,7 +162,7 @@ def test_retry_pending_conversation_turns_sanitizes_legacy_infinity(
     import rag
 
     vault_root = tmp_path / "vault"
-    (vault_root / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations").mkdir(parents=True)
+    (vault_root / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations").mkdir(parents=True)
     # Post 2026-04-21 split: conversation_writer reads rag.DB_PATH dynamically
     # and appends _TELEMETRY_DB_FILENAME. Redirect both so this test stays
     # hermetic without poking a private symbol that no longer exists.
@@ -221,8 +221,8 @@ def test_retry_pending_conversation_turns_sanitizes_legacy_infinity(
     n_retried = server_mod._retry_pending_conversation_turns()
     assert n_retried == 3, f"expected 3 retries, got {n_retried}"
 
-    # Las tres notas quedan escritas en 04-Archive/99-obsidian-system/99-Claude/conversations/.
-    conv_folder = vault_root / "04-Archive" / "99-obsidian-system" / "99-Claude" / "conversations"
+    # Las tres notas quedan escritas en 04-Archive/99-obsidian-system/99-AI/conversations/.
+    conv_folder = vault_root / "04-Archive" / "99-obsidian-system" / "99-AI" / "conversations"
     written = sorted(conv_folder.glob("*.md"))
     assert len(written) == 3, f"expected 3 notes, got {[p.name for p in written]}"
 

@@ -182,12 +182,12 @@ def test_sql_append_event_roundtrip(conn):
 def test_sql_upsert_replace(conn):
     row1 = {
         "session_id": "wa:5493425153999",
-        "relative_path": "04-Archive/99-obsidian-system/99-Claude/conversations/2026-04-19-1100-aaa.md",
+        "relative_path": "04-Archive/99-obsidian-system/99-AI/conversations/2026-04-19-1100-aaa.md",
         "updated_at": "2026-04-19T11:00:00",
     }
     row2 = {
         "session_id": "wa:5493425153999",  # same PK
-        "relative_path": "04-Archive/99-obsidian-system/99-Claude/conversations/2026-04-19-1200-bbb.md",
+        "relative_path": "04-Archive/99-obsidian-system/99-AI/conversations/2026-04-19-1200-bbb.md",
         "updated_at": "2026-04-19T12:00:00",
     }
     rag._sql_upsert(conn, "rag_conversations_index", row1, ("session_id",))

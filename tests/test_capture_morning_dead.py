@@ -22,7 +22,7 @@ class _FakeResponse:
 def tmp_vault(tmp_path, monkeypatch, fake_embed):
     vault = tmp_path / "vault"
     (vault / "00-Inbox").mkdir(parents=True)
-    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-AI/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     # Aislamos la telemetry DB al tmp_path — BUG #11 fix (2026-04-26) hace
     # que find_dead_notes lea de `rag_queries` SQL en lugar de `queries.jsonl`,

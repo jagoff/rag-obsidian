@@ -2743,13 +2743,13 @@ def is_excluded(rel_path: str) -> bool:
     """Skip hidden paths, system-backed folders and auto-generated content.
 
     - Dotfolders (.trash/, .obsidian/, .git/): system/hidden by convention.
-    - 99-Claude/skills/: live under the vault via symlink chain
+    - 99-AI/skills/: live under the vault via symlink chain
       (~/.claude/skills → ~/.agents/skills → vault) for Claude Code to consume.
       Skill definitions/rules, not user notes — redundant with the broader
       99-obsidian-system rule below but kept as belt-and-suspenders for paths
       that may live outside 04-Archive via other symlink targets.
     - 04-Archive/99-obsidian-system/*: Obsidian system folders (99-Attachments,
-      99-Canvas, 99-Claude, 99-Daily routine, 99-Forms, 99-Templates) — binary
+      99-Canvas, 99-AI, 99-Daily routine, 99-Forms, 99-Templates) — binary
       assets, template scaffolding, plugin data. 99-Mentions is the ONE
       exception: those are per-person dossiers that enrich retrieval via
       `build_person_context()` and should stay indexed so they also surface
@@ -2761,7 +2761,7 @@ def is_excluded(rel_path: str) -> bool:
       notes at the TOP LEVEL of 03-Resources/Claude/ (Claude Peers prompts,
       command cheatsheets) stay indexed — only the generated subfolders are
       filtered.
-    - 04-Archive/99-obsidian-system/99-Claude/conversations/: episodic chat
+    - 04-Archive/99-obsidian-system/99-AI/conversations/: episodic chat
       transcripts written by the web server after each `/api/chat` turn.
       Originally indexed so past turns were retrievable — but we observed a
       toxic feedback loop (2026-04-20): when the LLM gives a wrong answer,
@@ -2775,7 +2775,7 @@ def is_excluded(rel_path: str) -> bool:
     """
     if any(seg.startswith(".") for seg in rel_path.split("/") if seg):
         return True
-    if "/99-Claude/skills/" in f"/{rel_path}":
+    if "/99-AI/skills/" in f"/{rel_path}":
         return True
     system_prefix = "04-Archive/99-obsidian-system/"
     if rel_path.startswith(system_prefix) and not rel_path.startswith(
@@ -2786,7 +2786,7 @@ def is_excluded(rel_path: str) -> bool:
     if rel_path.startswith(claude_prefix) and "/" in rel_path[len(claude_prefix):]:
         return True
     # Legacy episodic-memory inbox (pre-2026-04-25). Las conversaciones
-    # nuevas viven bajo `04-Archive/99-obsidian-system/99-Claude/conversations/`,
+    # nuevas viven bajo `04-Archive/99-obsidian-system/99-AI/conversations/`,
     # que ya queda excluida por el prefix general `04-Archive/99-obsidian-system/`
     # de arriba. Mantenemos este check específico para archivos legacy que
     # el user todavía no haya migrado/borrado de su `00-Inbox/conversations/`.
@@ -6022,7 +6022,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         # WA Negotiation Auto-Pilot — Fase 0 (Foundation). Spec en
-        # 04-Archive/99-obsidian-system/99-Claude/system/wa-negotiation-
+        # 04-Archive/99-obsidian-system/99-AI/system/wa-negotiation-
         # autopilot/design.md. Una fila por negociación que el user
         # lance vía PWA / self-DM / voz. El `status` está validado al
         # transition por `rag_negotiations.state_machine.transition()`
@@ -7058,7 +7058,7 @@ def _map_brief_state_row(brief_path: str, cited_path: str) -> dict:
     ts = datetime.now().isoformat(timespec="seconds")
     pair_key = f"{brief_path}\x00{cited_path}"
     bt = "today" if brief_path.endswith("-evening.md") else (
-        "morning" if "/04-Archive/99-obsidian-system/99-Claude/reviews/" in brief_path or brief_path.startswith("04-Archive/99-obsidian-system/99-Claude/reviews/") else "unknown"
+        "morning" if "/04-Archive/99-obsidian-system/99-AI/reviews/" in brief_path or brief_path.startswith("04-Archive/99-obsidian-system/99-AI/reviews/") else "unknown"
     )
     return {"pair_key": pair_key, "brief_type": bt, "kind": "cited",
             "path": cited_path, "first_ts": ts, "last_ts": ts}
@@ -27804,7 +27804,7 @@ USER_STATE_TTL_HOURS = 24
 # Perfil explícito del usuario — nota vault-relativa. Si existe, su contenido
 # se inyecta en el system prompt de query/chat como bloque "SOBRE EL USUARIO".
 # Contexto estable (familia, trabajo, áreas de expertise, preferencias de tono).
-USER_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-Claude/perfil.md"
+USER_PROFILE_RELPATH = "04-Archive/99-obsidian-system/99-AI/perfil.md"
 
 
 def read_user_state() -> dict | None:
@@ -27935,7 +27935,7 @@ def ignore_clear():
 
 # ── voice routing classifier — bloque B del feature voice-classifier ──────
 # spec: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
-#       04-Archive/99-obsidian-system/99-Claude/system/voice-classifier/spec.md
+#       04-Archive/99-obsidian-system/99-AI/system/voice-classifier/spec.md
 # Tabla rag_routing_decisions (logged por el listener TS) +
 # rag_routing_rules (extraídas por este CLI). El extract_rules cron las
 # promueve diario a las 3:30 AM, este grupo permite review/audit manual.
@@ -30224,7 +30224,7 @@ def _generate_digest_narrative(prompt: str) -> str:
     return (resp.message.content or "").strip()
 
 
-DIGEST_FOLDER = "04-Archive/99-obsidian-system/99-Claude/reviews"
+DIGEST_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
 
 
 @cli.command()
@@ -30240,7 +30240,7 @@ def digest(week_opt: str | None, days: int, dry_run: bool):
     Consume notas modificadas, frontmatter `contradicts:`, el sidecar log
     de contradicciones index-time, las contradicciones query-time y las
     queries low-confidence. Genera prosa narrativa con command-r y la
-    guarda en `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md` (auto-indexado).
+    guarda en `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-WNN.md` (auto-indexado).
     """
     from datetime import timedelta as _td
     if week_opt:
@@ -35004,10 +35004,10 @@ def read_cmd(url: str, save: bool, plain: bool):
 # ── MORNING BRIEF (rag morning) ──────────────────────────────────────────────
 # Proactive daily brief: what happened yesterday + what's pending + what to
 # focus today. Composes recent-notes / inbox / todo-frontmatter / new
-# contradictions / low-conf queries. Writes to 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md.
+# contradictions / low-conf queries. Writes to 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md.
 # Auto-fires via launchd weekday mornings.
 
-MORNING_FOLDER = "04-Archive/99-obsidian-system/99-Claude/reviews"
+MORNING_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
 
 
 # ── Apple integrations (Calendar / Reminders / Mail) ─────────────────────────
@@ -39137,7 +39137,7 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
     previous `rag today` left off.
     """
     yesterday = target - timedelta(days=1)
-    rel = f"04-Archive/99-obsidian-system/99-Claude/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
+    rel = f"04-Archive/99-obsidian-system/99-AI/reviews/{yesterday.strftime('%Y-%m-%d')}-evening.md"
     if not (vault / rel).is_file():
         return ""
     title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
@@ -39208,7 +39208,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
     contradicciones index-time del sidecar y queries low-confidence.
     command-r arma un brief de 120-280 palabras. Escribe a
-    `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+    `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
     if date_opt:
@@ -39352,7 +39352,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
 # End-of-day closure: mirrors morning's structure but looks BACK at the day
 # that just closed. Evidence window is [today 00:00 local, now]. Writes to
-# 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
+# 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md so it doesn't collide with morning's file.
 
 
 def _today_window(now: datetime) -> tuple[datetime, datetime]:
@@ -39863,7 +39863,7 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
     Ventana: hoy 00:00 → ahora. Evidencia: notas modificadas hoy, capturas del
     día en 00-Inbox/, todos/due tocados, contradicciones nuevas, queries
     low-confidence. command-r arma un brief de 150-250 palabras. Escribe a
-    `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
+    `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md` (auto-indexado) salvo --dry-run. Si no
     hay actividad, imprime "sin actividad hoy" y termina.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
@@ -40106,7 +40106,7 @@ def find_dead_notes(
 # Orquestador "todo en uno" pensado para correr via launchd a las 04:00:
 # cuando el user se despierta, todo está fresco — ETLs corridos, vault
 # reindexado, caches limpios, radares actualizados, brief matutino
-# pre-renderizado en 04-Archive/99-obsidian-system/99-Claude/reviews/, y el chat model cargado en RAM con
+# pre-renderizado en 04-Archive/99-obsidian-system/99-AI/reviews/, y el chat model cargado en RAM con
 # keep_alive=-1 para que el primer `rag chat` responda sin cold-start.
 #
 # Cada paso es independiente: si `rag maintenance` falla, `rag morning`
@@ -40159,7 +40159,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
       4. `rag maintenance`     — WAL checkpoint, rotación de logs, cleanup.
       5. `rag patterns`        — radar de feedback dominante.
       6. `rag emergent`        — radar de temas emergentes en queries.
-      7. `rag morning`         — brief matutino pre-renderizado a 04-Archive/99-obsidian-system/99-Claude/reviews/.
+      7. `rag morning`         — brief matutino pre-renderizado a 04-Archive/99-obsidian-system/99-AI/reviews/.
       8. Ollama warmup         — carga el chat model con keep_alive=-1.
 
     Nota sobre bookmarks: `rag index` ya los sincroniza automáticamente
@@ -40313,7 +40313,7 @@ def wake_up(ctx, dry_run: bool, skip_index: bool, skip_bookmarks: bool,
 
 # ── EPISODIC MEMORY — PHASE 2 CONSOLIDATION (rag consolidate) ───────────────
 # Promotes recurring conversation clusters from
-# 04-Archive/99-obsidian-system/99-Claude/conversations/ into PARA and
+# 04-Archive/99-obsidian-system/99-AI/conversations/ into PARA and
 # archives the originals. All heavy lifting lives in
 # scripts/consolidate_conversations.py — this is just the CLI shim so the
 # command shows up in `rag --help` + the weekly launchd service can invoke
@@ -40337,7 +40337,7 @@ def consolidate(window_days: int, threshold: float, min_cluster: int,
 
     Por default es dry-run — pasá --apply para escribir al vault.
 
-    Barre `04-Archive/99-obsidian-system/99-Claude/conversations/` buscando clusters semánticamente similares
+    Barre `04-Archive/99-obsidian-system/99-AI/conversations/` buscando clusters semánticamente similares
     (embedding cosine ≥ --threshold, tamaño ≥ --min-cluster) en la ventana
     de --window-days. Cada cluster se sintetiza en una sola nota consolidada
     (qwen2.5:7b default) y se promueve a `01-Projects/` o `03-Resources/`
@@ -40787,7 +40787,7 @@ def _render_archive_result(result: dict, apply: bool, plain: bool) -> None:
 
 
 def _write_archive_report(result: dict, apply: bool) -> Path | None:
-    """Write a human-readable Markdown report to 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md.
+    """Write a human-readable Markdown report to 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md.
     Appends a dated section if the file already exists (monthly cadence can
     hit the same file twice if triggered manually between cycles).
     """
@@ -40795,7 +40795,7 @@ def _write_archive_report(result: dict, apply: bool) -> Path | None:
     skipped = result["skipped"]
     if not plan and not skipped:
         return None
-    reviews_dir = VAULT_PATH / "04-Archive/99-obsidian-system/99-Claude/reviews"
+    reviews_dir = VAULT_PATH / "04-Archive/99-obsidian-system/99-AI/reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     ym = datetime.now().strftime("%Y-%m")
     path = reviews_dir / f"{ym}-archive.md"
@@ -40892,7 +40892,7 @@ def _push_archive_notification(result: dict, apply: bool) -> bool:
 @click.option("--notify/--no-notify", default=True,
               help="Push a WhatsApp si ambient está configurado")
 @click.option("--report/--no-report", default=True,
-              help="Escribe reporte a 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md")
+              help="Escribe reporte a 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md")
 @click.option("--plain", is_flag=True, help="Salida plana (src\\tdst por línea)")
 def archive(min_age_days: int, query_window_days: int, folder: str | None,
             limit: int, gate: int, apply: bool, force: bool,
@@ -41918,7 +41918,7 @@ def _archive_plist(rag_bin: str) -> str:
 def _consolidate_plist(rag_bin: str) -> str:
     """Weekly episodic-memory consolidation — Mondays 06:00 local. Promotes
     recurring conversation clusters from
-    04-Archive/99-obsidian-system/99-Claude/conversations/ to PARA and
+    04-Archive/99-obsidian-system/99-AI/conversations/ to PARA and
     archives the originals (see plans/episodic-memory.md Phase 2)."""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

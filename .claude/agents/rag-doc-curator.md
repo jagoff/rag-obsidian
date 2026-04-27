@@ -208,7 +208,7 @@ plist inventory" o similar. NO decidir solo.
 ## Limitaciones conocidas
 
 - Solo auditás CLAUDE.md del repo. Hay otros: `~/.claude/projects/.../CLAUDE.md`,
-  vault `99-Claude/CLAUDE.md`, `.claude/agents/README.md`. Si el caller
+  vault `99-AI/CLAUDE.md`, `.claude/agents/README.md`. Si el caller
   pide auditar uno específico, hacelo. Si no, default = repo CLAUDE.md.
 - No auditás los .claude/agents/*.md individuales (overlap con futuro
   agent rag-meta-auditor).

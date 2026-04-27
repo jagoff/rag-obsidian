@@ -63,7 +63,7 @@ def frozen_now(monkeypatch):
 def tmp_vault(tmp_path, monkeypatch, fake_embed, frozen_now):
     vault = tmp_path / "vault"
     (vault / "00-Inbox").mkdir(parents=True)
-    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-AI/reviews").mkdir(parents=True)
     (vault / "02-Areas").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
@@ -147,7 +147,7 @@ def test_today_excludes_yesterday(tmp_vault):
 
 def test_today_excludes_reviews_folder(tmp_vault):
     vault, _, tmp_path = tmp_vault
-    p = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-04-15.md"
+    p = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "2026-04-15.md"
     p.write_text("morning brief")
     now = _FROZEN_NOW
     _set_mtime(p, now - timedelta(minutes=10))
@@ -157,7 +157,7 @@ def test_today_excludes_reviews_folder(tmp_vault):
         contradiction_log=tmp_path / "c.jsonl",
     )
     paths = {r["path"] for r in ev["recent_notes"]}
-    assert "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-15.md" not in paths
+    assert "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-15.md" not in paths
 
 
 def test_today_inbox_capture_routed_to_inbox_bucket(tmp_vault):
@@ -327,8 +327,8 @@ def test_today_cli_dry_run_does_not_write(tmp_vault, monkeypatch):
     # 4 expected headers
     for h in ("Lo que pasó hoy", "Sin procesar", "Preguntas abiertas", "Para mañana"):
         assert h in result.output
-    # No file written to 04-Archive/99-obsidian-system/99-Claude/reviews
-    files = list((vault / "04-Archive/99-obsidian-system/99-Claude/reviews").glob("*.md"))
+    # No file written to 04-Archive/99-obsidian-system/99-AI/reviews
+    files = list((vault / "04-Archive/99-obsidian-system/99-AI/reviews").glob("*.md"))
     assert files == []
 
 
@@ -347,7 +347,7 @@ def test_today_cli_writes_evening_suffix_and_frontmatter(tmp_vault, monkeypatch)
     result = runner.invoke(rag.cli, ["today", "--plain"])
     assert result.exit_code == 0
     date_label = _FROZEN_NOW.strftime("%Y-%m-%d")
-    expected = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / f"{date_label}-evening.md"
+    expected = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / f"{date_label}-evening.md"
     assert expected.is_file(), result.output
     body = expected.read_text()
     assert "type: evening-brief" in body
@@ -362,7 +362,7 @@ def test_today_cli_does_not_collide_with_morning_file(tmp_vault, monkeypatch):
     monkeypatch.setattr(rag, "LOG_PATH", tmp_path / "q.jsonl")
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", tmp_path / "c.jsonl")
     date_label = _FROZEN_NOW.strftime("%Y-%m-%d")
-    morning_file = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / f"{date_label}.md"
+    morning_file = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / f"{date_label}.md"
     morning_file.write_text("morning brief existente")
 
     p = vault / "02-Areas" / "a.md"
@@ -378,7 +378,7 @@ def test_today_cli_does_not_collide_with_morning_file(tmp_vault, monkeypatch):
     # Morning file untouched
     assert morning_file.read_text() == "morning brief existente"
     # Evening file present separately
-    assert (vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / f"{date_label}-evening.md").is_file()
+    assert (vault / "04-Archive/99-obsidian-system/99-AI/reviews" / f"{date_label}-evening.md").is_file()
 
 
 def test_today_plist_registered_in_services(tmp_path):

@@ -348,7 +348,7 @@ def write_turn(
     session_id: str,
     turn: TurnData,
     *,
-    subfolder: str = "04-Archive/99-obsidian-system/99-Claude/conversations",
+    subfolder: str = "04-Archive/99-obsidian-system/99-AI/conversations",
 ) -> Path:
     """Append one turn to the session's .md + upsert the SQL index.
 

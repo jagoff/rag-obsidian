@@ -1,6 +1,6 @@
 """Weekly consolidation of episodic-memory conversation notes (Phase 2).
 
-Scans `04-Archive/99-obsidian-system/99-Claude/conversations/`, groups
+Scans `04-Archive/99-obsidian-system/99-AI/conversations/`, groups
 related conversations by embedding similarity (connected components on
 cosine ≥ threshold), synthesises each cluster into a single consolidated
 note in the appropriate PARA folder, and archives the originals under
@@ -10,7 +10,7 @@ Invoked via `rag consolidate` or the weekly launchd plist
 `com.fer.obsidian-rag-consolidate` (Mondays 06:00 local).
 
 Design notes:
-- `04-Archive/99-obsidian-system/99-Claude/conversations/` is already
+- `04-Archive/99-obsidian-system/99-AI/conversations/` is already
   excluded from the search index (`is_excluded` cubre TODO el prefix
   `04-Archive/99-obsidian-system/`), así que originals son invisibles a
   `retrieve()` hasta que un consolidated note las promueva a PARA.
@@ -20,7 +20,7 @@ Design notes:
   El consolidator antes scaneaba esa carpeta. Tras 2026-04-25 las
   conversations son "system files" (no son del PARA del user, son
   artefactos generados por el chat web), por eso pasaron a vivir bajo
-  `99-Claude/`. Si el user tiene archivos legacy en
+  `99-AI/`. Si el user tiene archivos legacy en
   `00-Inbox/conversations/`, este script los ignora — moverlos a la
   nueva ubicación o borrarlos a mano.
 - Representation per conversation = `first_question + answer_preview`
@@ -60,7 +60,7 @@ import rag  # noqa: E402
 from web import conversation_writer  # noqa: E402
 
 
-CONVERSATIONS_SUBFOLDER = "04-Archive/99-obsidian-system/99-Claude/conversations"
+CONVERSATIONS_SUBFOLDER = "04-Archive/99-obsidian-system/99-AI/conversations"
 ARCHIVE_SUBFOLDER = "04-Archive/conversations"
 CONSOLIDATION_LOG = Path.home() / ".local/share/obsidian-rag/consolidation.log"
 
@@ -144,7 +144,7 @@ def scan_conversations(
     """Load conversation notes modified within the window.
 
     `root` is the absolute path to the conversations folder
-    (`04-Archive/99-obsidian-system/99-Claude/conversations/`). Malformed
+    (`04-Archive/99-obsidian-system/99-AI/conversations/`). Malformed
     files (bad frontmatter, missing Turn 1) are skipped silently — the
     writer path always produces well-formed notes so any breakage is a
     manual edit we want to leave untouched.
@@ -194,7 +194,7 @@ def _vault_root_of(conversation_path: Path) -> Path:
     El loop sube por TODOS los parents buscando un dir hermano del PARA
     (`00-Inbox/` o `01-Projects/`), así que funciona igual con la path
     legacy (`<vault>/00-Inbox/conversations/file.md` → 2 niveles arriba)
-    como con la nueva (`<vault>/04-Archive/99-obsidian-system/99-Claude/
+    como con la nueva (`<vault>/04-Archive/99-obsidian-system/99-AI/
     conversations/file.md` → 4 niveles arriba). Si no encuentra el PARA
     (escenario raro: vault malformado, test con layout custom), fallback
     al parent inmediato — conservador, no rompe walks futuros."""

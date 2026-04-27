@@ -58,7 +58,7 @@ DAILY_NOTE_REL = "00-Inbox/Daily note.md"
 #    never appear in proposals.jsonl because the Phase 1 classifier was given
 #    the inventory output; but we double-check here as a belt-and-suspenders
 #    guard so we never write a skip-zone path into proposals_approved.jsonl.
-CLAUDE_SKIP_PREFIX = "04-Archive/99-obsidian-system/99-Claude"
+CLAUDE_SKIP_PREFIX = "04-Archive/99-obsidian-system/99-AI"
 
 PARA_BUCKETS = {"01-Projects", "02-Areas", "03-Resources", "04-Archive"}
 

@@ -179,16 +179,16 @@ Se queda silencioso el 99% del tiempo. Cuando guardás una nota, en 3 segundos (
 Mantienen los modelos calientes (bge-m3, qwen2.5:3b, reranker) para que las queries del bot/web respondan rápido. Consumen ~8-10 GB de RAM todo el tiempo.
 
 ### morning (7am lun-vie)
-Genera un archivo nuevo en `tu-vault/04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md`. Si tu Mac estuvo apagado a esa hora, no corre (no hay "catch-up"). Lo podés correr a mano: `rag morning`.
+Genera un archivo nuevo en `tu-vault/04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md`. Si tu Mac estuvo apagado a esa hora, no corre (no hay "catch-up"). Lo podés correr a mano: `rag morning`.
 
 ### today (22pm lun-vie)
-Genera `tu-vault/04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md`. Si no hubo actividad en el día, imprime "sin actividad hoy" y no escribe nada.
+Genera `tu-vault/04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md`. Si no hubo actividad en el día, imprime "sin actividad hoy" y no escribe nada.
 
 ### digest (domingo 22pm)
-Genera `tu-vault/04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md` (semana ISO). Es un brief narrativo largo.
+Genera `tu-vault/04-Archive/99-obsidian-system/99-AI/reviews/YYYY-WNN.md` (semana ISO). Es un brief narrativo largo.
 
 ### archive (día 1 de cada mes, 23pm)
-Corre `rag archive --apply --gate 20` — si detecta más de 20 notas a archivar, no lo aplica sin `--force`. Escribe un reporte a `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md`.
+Corre `rag archive --apply --gate 20` — si detecta más de 20 notas a archivar, no lo aplica sin `--force`. Escribe un reporte a `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md`.
 
 ### consolidate (lunes 6am)
 Agrupa conversaciones del Inbox semánticamente similares y las promueve a PARA. Escribe notas nuevas en `01-Projects/` o `03-Resources/`.

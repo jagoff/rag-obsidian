@@ -60,7 +60,7 @@ SKIP_REASONS = {
     "archive_optout": "has_archive_optout",
     "type_optout": "has_type_optout",
     "short_body": "body_chars < 100",
-    "reviews": "bucket == 04-Archive/99-obsidian-system/99-Claude/reviews",
+    "reviews": "bucket == 04-Archive/99-obsidian-system/99-AI/reviews",
 }
 
 
@@ -200,7 +200,7 @@ def should_skip(item: dict) -> str | None:
         return "type_optout"
     if (item.get("body_chars") or 0) < 100:
         return "short_body"
-    if item.get("bucket") == "04-Archive/99-obsidian-system/99-Claude/reviews":
+    if item.get("bucket") == "04-Archive/99-obsidian-system/99-AI/reviews":
         return "reviews"
     return None
 
@@ -357,7 +357,7 @@ def main() -> None:
         "archive_optout": "  has archive:never",
         "type_optout": "  excluded type (moc/dashboard/etc.)",
         "short_body": "  body < 100 chars",
-        "reviews": "  bucket 04-Archive/99-obsidian-system/99-Claude/reviews (auto-generated)",
+        "reviews": "  bucket 04-Archive/99-obsidian-system/99-AI/reviews (auto-generated)",
         "parse_error": "  LLM parse error",
         "already_done": "  already processed (resume)",
     }

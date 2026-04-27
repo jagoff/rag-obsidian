@@ -25,7 +25,7 @@ def integrated_env(tmp_path, monkeypatch):
     (vault / "00-Inbox").mkdir(parents=True)
     (vault / "01-Projects").mkdir(parents=True)
     (vault / "02-Areas").mkdir(parents=True)
-    (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
+    (vault / "04-Archive/99-obsidian-system/99-AI/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: vault)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
 

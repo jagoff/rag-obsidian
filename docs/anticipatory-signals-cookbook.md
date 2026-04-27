@@ -171,7 +171,7 @@ silent-fail end-to-end, dedup_key estable cross-runs.
 ## 9. `anticipate-streak_break`
 
 - **Trigger**: ≥2 días sin morning brief (filename `YYYY-MM-DD.md` en
-  `04-Archive/99-obsidian-system/99-Claude/reviews/`) dentro de la ventana de 7d. **Si NO hay ningún brief en
+  `04-Archive/99-obsidian-system/99-AI/reviews/`) dentro de la ventana de 7d. **Si NO hay ningún brief en
   los últimos 7d** asume "pausa voluntaria" y NO emite (no spam-ear vacaciones).
 - **Score**: `min(1.0, gap_days / 5.0)`. 2d → 0.4, 3d → 0.6, 5+d → 1.0.
 - **dedup_key**: `f"streak_break:{today_iso_date}"`.

@@ -11,7 +11,7 @@ Diseño:
   del user y se excluyen automáticamente por el `iterdir()` top-level.
   Pre-2026-04-25, episodic memory del chat se escribía a
   `00-Inbox/conversations/` y este check explícitamente la ignoraba; ahora
-  vive bajo `04-Archive/99-obsidian-system/99-Claude/conversations/` y ya
+  vive bajo `04-Archive/99-obsidian-system/99-AI/conversations/` y ya
   ni siquiera está bajo el inbox, pero dejamos la lógica de "no recursivo"
   por si en el futuro cae otra subcarpeta acá (ej. `00-Inbox/voice/`).
 - Ventana de edad: `min_age_hours=24` default. Si bajamos el umbral, cada
@@ -58,7 +58,7 @@ def _count_stale_inbox(vault: Path, min_age_hours: int = _INBOX_MIN_AGE_HOURS) -
     solo ve los entries directos, así que una subfolder con 500 archivos
     queda invisible para este conteo. (Histórico: hasta 2026-04-25, episodic
     memory del chat se escribía a `00-Inbox/conversations/`; tras esa
-    fecha vive bajo `04-Archive/99-obsidian-system/99-Claude/conversations/`,
+    fecha vive bajo `04-Archive/99-obsidian-system/99-AI/conversations/`,
     fuera del inbox enteramente.)
 
     Silent-fail: si el dir no existe o no se puede leer, devuelve 0 (no

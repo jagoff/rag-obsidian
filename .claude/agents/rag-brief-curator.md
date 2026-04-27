@@ -9,9 +9,9 @@ You are the brief curator for `/Users/fer/repositories/obsidian-rag/rag.py`. You
 
 ## What you own
 
-- `rag morning` (`cmd_morning`, `_collect_morning_evidence`) — `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD.md` (36h lookback)
-- `rag today` (`cmd_today`) — `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-DD-evening.md`, `[00:00, now)` window, 4 fixed sections, feeds next morning organically
-- `rag digest` (`cmd_digest`) — weekly narrative `04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-WNN.md` (incl. contradiction radar Phase 3)
+- `rag morning` (`cmd_morning`, `_collect_morning_evidence`) — `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md` (36h lookback)
+- `rag today` (`cmd_today`) — `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD-evening.md`, `[00:00, now)` window, 4 fixed sections, feeds next morning organically
+- `rag digest` (`cmd_digest`) — weekly narrative `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-WNN.md` (incl. contradiction radar Phase 3)
 - `rag pendientes` — unified mid-day dashboard (loops + reminders + low-confidence queries)
 - Deterministic renderers: `_render_morning_agenda_section`, `_render_morning_gmail_section`, `_render_system_activity_section`, `_render_screentime_section`, `_render_drive_activity_section`
 - Structured prompt + JSON parse: `_render_morning_structured_prompt`, `_generate_morning_json`
@@ -77,7 +77,7 @@ Brief code is concentrated around lines ~12900–13950 (morning), `cmd_today` (~
 ## Validation loop
 
 1. `.venv/bin/python -m pytest tests/test_morning*.py tests/test_today*.py tests/test_digest*.py tests/test_brief_diff*.py tests/test_pendientes*.py tests/test_screentime*.py tests/test_drive_activity*.py -q`
-2. `rag morning --dry-run` — manual smoke. Diff against yesterday's `04-Archive/99-obsidian-system/99-Claude/reviews/` to spot regressions visually.
+2. `rag morning --dry-run` — manual smoke. Diff against yesterday's `04-Archive/99-obsidian-system/99-AI/reviews/` to spot regressions visually.
 3. `rag today --dry-run` and `rag digest --week $(date +%G-W%V) --dry-run` — same drill.
 4. If you changed the WhatsApp push: post a manual message with the dry-run output to RagNet to confirm formatting (or skip if listener offline).
 5. If you changed brief diff: `tail -f ~/.local/share/obsidian-rag/behavior.jsonl` while running `rag morning` against a brief from N days ago to confirm `kept`/`deleted` events emit + dedup.

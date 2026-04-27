@@ -310,7 +310,7 @@ def test_orphan_excludes_default_prefixes(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     _make_md(vault, "00-Inbox/new.md")
-    _make_md(vault, "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-15.md")
+    _make_md(vault, "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-15.md")
     _make_md(vault, "04-Archive/old.md")
     _make_md(vault, "02-Areas/real.md")
     out = rag.detect_orphan_notes([], vault)

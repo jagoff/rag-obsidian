@@ -76,7 +76,7 @@ queries:
   - question: "qué reranker tiene el sistema"
     expected:
       - 01-Projects/RAG-Local/Obsidian RAG Local.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
 
   - question: "cómo se indexan las notas en el vault"
     expected:
@@ -225,15 +225,15 @@ queries:
   # 04-Archive — memorias PARA
   - question: "feedback sobre stack local free"
     expected:
-      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_local_free_stack.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_local_free_stack.md
 
   - question: "por qué hyde falla con modelos chicos"
     expected:
-      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_hyde_small_models.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_hyde_small_models.md
 
   - question: "estructura PARA del vault"
     expected:
-      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_obsidian_para.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_obsidian_para.md
 
   # 03-Resources/Personal-ref/Info — queries diagnósticas
   - question: "info del banco santander"
@@ -307,10 +307,10 @@ queries:
   - question: "cuál es mi stack de IA local"
     expected:
       - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_local_free_stack.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/reference_ollama.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/reference_obsidian_rag_services.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_local_free_stack.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/reference_ollama.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag_services.md
     note: "synthesis intent: stack local IA — cross-ref ollama + rag local + servicios + feedback"
 
   - question: "qué temas de coaching trabajé este año"
@@ -346,7 +346,7 @@ queries:
       - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
       - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
       - 01-Projects/RAG-Local/obsidian-rag - Roadmap 2026-04-22.md
-      - 04-Archive/99-obsidian-system/99-Claude/memory/feedback_hyde_small_models.md
+      - 04-Archive/99-obsidian-system/99-AI/memory/feedback_hyde_small_models.md
     note: "synthesis intent: decisiones técnicas sobre reranking — multi-doc del proyecto"
 
   # (2026-04-24) Removido query "todo lo que hay sobre claude peers" —

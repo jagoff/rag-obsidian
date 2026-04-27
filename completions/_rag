@@ -336,8 +336,8 @@ _rag_cmd_archive() {
         '--force[Bypass del gate de confirmación]' \
         '(--notify --no-notify)--notify[Push a WhatsApp si ambient está configurado]' \
         '(--notify --no-notify)--no-notify[Push a WhatsApp si ambient está configurado]' \
-        '(--report --no-report)--report[Escribe reporte a 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md]' \
-        '(--report --no-report)--no-report[Escribe reporte a 04-Archive/99-obsidian-system/99-Claude/reviews/YYYY-MM-archive.md]' \
+        '(--report --no-report)--report[Escribe reporte a 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md]' \
+        '(--report --no-report)--no-report[Escribe reporte a 04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-archive.md]' \
         '--plain[Salida plana (src\tdst por línea)]'
 }
 

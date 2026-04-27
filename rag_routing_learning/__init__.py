@@ -15,7 +15,7 @@ Este subpackage analiza ese histórico para que el classifier "aprenda":
   desactivación, listado.
 
 Doc: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/
-04-Archive/99-obsidian-system/99-Claude/system/voice-classifier/spec.md
+04-Archive/99-obsidian-system/99-AI/system/voice-classifier/spec.md
 
 Esquema (en ``rag/__init__.py`` ``_TELEMETRY_DDL``):
 

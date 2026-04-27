@@ -142,7 +142,7 @@ def anniversary_signal(now: datetime) -> list:
                 if not any(rel.startswith(p) for p in _ANNIV_ALLOWED_PREFIXES):
                     continue
                 # Respeta la exclusion list global (defensive — los prefixes
-                # allowed ya descartan 00-Inbox/99-Claude/etc., pero por si
+                # allowed ya descartan 00-Inbox/99-AI/etc., pero por si
                 # hay subrutas aún excluidas como WhatsApp/Claude bajo 03-Resources/).
                 if is_excluded(rel):
                     continue

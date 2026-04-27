@@ -14,7 +14,7 @@ Esquema en rag.py:
   chat_id, context).
 - `rag_whisper_vocab` (term PK, weight, source, last_seen_ts, refreshed_at).
 
-Doc: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/04-Archive/99-obsidian-system/99-Claude/system/whatsapp-whisper-learning/plan.md
+Doc: ~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md
 """
 
 from rag_whisper_learning.vocab import (

@@ -226,10 +226,10 @@ def test_behavior_augmented_cases_14d_window(sql_env):
 
 def test_brief_state_dedup_sql_hit(sql_env):
     """Seed a pair in rag_brief_state → seen returns True."""
-    rag._brief_state_record("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-19.md", "01-Projects/a.md")
-    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-19.md",
+    rag._brief_state_record("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-19.md", "01-Projects/a.md")
+    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-19.md",
                                    "01-Projects/a.md") is True
-    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-19.md",
+    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-19.md",
                                    "01-Projects/NEW.md") is False
 
 
@@ -237,12 +237,12 @@ def test_brief_state_dedup_sql_only(sql_env):
     """Post-T10: only SQL is consulted. A legacy brief_state.jsonl with the
     pair but no SQL row → seen returns False (no JSONL fallback)."""
     rag.BRIEF_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    key = "04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-18.md\x0001-Projects/legacy.md"
+    key = "04-Archive/99-obsidian-system/99-AI/reviews/2026-04-18.md\x0001-Projects/legacy.md"
     rag.BRIEF_STATE_PATH.write_text(
         json.dumps({"ts": "2026-04-18T07:00:00", "key": key}) + "\n",
         encoding="utf-8",
     )
-    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-Claude/reviews/2026-04-18.md",
+    assert rag._brief_state_seen("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-18.md",
                                    "01-Projects/legacy.md") is False
 
 

@@ -196,7 +196,7 @@ def test_digest_dry_run_with_evidence(digest_env, monkeypatch):
     assert "Review 2026-W15" in result.output
     assert "[[tema]]" in result.output
     # dry-run must NOT write
-    assert not (vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-W15.md").exists()
+    assert not (vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "2026-W15.md").exists()
 
 
 def test_digest_writes_and_indexes(digest_env, monkeypatch):
@@ -218,7 +218,7 @@ def test_digest_writes_and_indexes(digest_env, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(rag.cli, ["digest", "--week", "2026-W15"])
     assert result.exit_code == 0, result.output
-    out_path = vault / "04-Archive/99-obsidian-system/99-Claude/reviews" / "2026-W15.md"
+    out_path = vault / "04-Archive/99-obsidian-system/99-AI/reviews" / "2026-W15.md"
     assert out_path.is_file()
     written = out_path.read_text(encoding="utf-8")
     assert "week: '2026-W15'" in written

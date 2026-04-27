@@ -5914,6 +5914,10 @@ def _fetch_finance(now: datetime | None = None) -> dict | None:
 # también. Silent-fail (devuelve `[]`) si no hay xlsx, falta openpyxl, o
 # todos los archivos fallan al parsear.
 _CARDS_CACHE: dict = {"key": None, "payload": None}
+# Lock para read-then-write atómico (audit 2026-04-26): pre-fix dos threads
+# concurrentes podían ver pareja inconsistente (key nuevo + payload viejo)
+# si uno leía mientras otro escribía. Lock simple — el path no recursa.
+_CARDS_CACHE_LOCK = threading.Lock()
 
 # Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
 # Tolera "Visa Crédito terminada en 1059", "Visa 1059", "Mastercard 5234",
@@ -6243,8 +6247,11 @@ def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG
     except Exception:
         cache_key = None
 
-    if cache_key is not None and _CARDS_CACHE.get("key") == cache_key:
-        return _CARDS_CACHE.get("payload") or []
+    # Snapshot bajo lock — evita pareja inconsistente.
+    if cache_key is not None:
+        with _CARDS_CACHE_LOCK:
+            if _CARDS_CACHE.get("key") == cache_key:
+                return _CARDS_CACHE.get("payload") or []
 
     cards: list[dict] = []
     for p in files:
@@ -6256,8 +6263,9 @@ def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG
     cards.sort(key=lambda c: (c.get("due_date") is None, c.get("due_date") or ""))
 
     if cache_key is not None:
-        _CARDS_CACHE["key"] = cache_key
-        _CARDS_CACHE["payload"] = cards
+        with _CARDS_CACHE_LOCK:
+            _CARDS_CACHE["key"] = cache_key
+            _CARDS_CACHE["payload"] = cards
     return cards
 
 
@@ -8153,11 +8161,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _corpus_hash_cached,
                     semantic_cache_lookup,
                     _semantic_cache_enabled,
+                    query_embed_local as _rag_query_embed_local,
+                    _local_embed_enabled as _rag_local_embed_enabled,
                 )
                 if _semantic_cache_enabled():
                     from rag import get_db_for as _rag_get_db_for
                     _sem_col = _rag_get_db_for(vaults[0][1])
-                    _semantic_cache_emb = _rag_embed([question])[0]
+                    # Doble-embed fix (audit perf 2026-04-26): pre-fix
+                    # SIEMPRE iba por ollama HTTP (~140ms warm, 10s cold)
+                    # y después `retrieve()` re-embeddeaba la misma query
+                    # con `query_embed_local` (~30ms MPS) — 2× embed por
+                    # query. Si el local está warm (Event set en steady-
+                    # state web), usá ese; si no cae a ollama (mismo path
+                    # que retrieve usaría tras `RAG_LOCAL_EMBED_WAIT_MS=0`).
+                    _semantic_cache_emb = None
+                    if _rag_local_embed_enabled():
+                        _local_emb = _rag_query_embed_local([question])
+                        if _local_emb:
+                            _semantic_cache_emb = _local_emb[0]
+                    if _semantic_cache_emb is None:
+                        _semantic_cache_emb = _rag_embed([question])[0]
                     _semantic_cache_hash = _corpus_hash_cached(_sem_col)
                     _sem_hit, _semantic_cache_probe = semantic_cache_lookup(
                         _semantic_cache_emb, _semantic_cache_hash,

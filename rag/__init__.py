@@ -8984,6 +8984,17 @@ def _sync_credit_cards_notes(vault_root: Path) -> dict:
         return {"ok": False, "reason": "no_xlsx"}
 
     target_dir = vault_root / TARJETAS_VAULT_SUBPATH
+    # Audit 2026-04-26: enforce que el target queda DENTRO del vault.
+    # Sin esto, `OBSIDIAN_RAG_TARJETAS_FOLDER=../../../tmp` permitiría
+    # escribir notas fuera del vault. Vault es user-controlled así que
+    # el riesgo es bajo, pero el guard es trivial. resolve() colapsa
+    # `..` y symlinks; relative_to() raises si el target escapa.
+    try:
+        _vr = vault_root.resolve()
+        _td = target_dir.resolve()
+        _td.relative_to(_vr)
+    except Exception:
+        return {"ok": False, "reason": f"target escapa vault: {target_dir}"}
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:

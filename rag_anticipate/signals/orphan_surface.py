@@ -43,6 +43,28 @@ _ORPHAN_ALLOWED_PREFIXES: tuple[str, ...] = (
     "03-Resources/",
 )
 
+# ETL output prefixes — autogenerados desde fuentes externas (Chrome
+# history, Gmail dumps, WhatsApp rollups, Calendar, etc.) NO son notas
+# humanas y typically tienen 0 wikilinks por diseño (son texto raw del
+# bridge / ETL). El signal orphan_surface marca falsos positivos
+# repetidos sobre estos archivos — telemetría 7d (audit 2026-04-26):
+# `03-Resources/Chrome/2026-04-26.md` (154K chars) seleccionado 10×
+# y siempre rebotado por daily_cap → ranura desperdiciada que podría
+# usar otro signal real. Excluir explícitamente.
+_ORPHAN_EXCLUDE_SUBPREFIXES: tuple[str, ...] = (
+    "03-Resources/Chrome/",
+    "03-Resources/Gmail/",
+    "03-Resources/WhatsApp/",
+    "03-Resources/Calendar/",
+    "03-Resources/Reminders/",
+    "03-Resources/Drive/",
+    "03-Resources/Bookmarks/",
+    "03-Resources/Spotify/",
+    "03-Resources/Screen-Time/",
+    "03-Resources/Safari/",
+    "03-Resources/Contacts/",
+)
+
 # Grace period inferior: no pushear dentro de las primeras 2h tras el save.
 # El user todavía tiene la nota abierta/fresca, preguntarle "¿querés
 # agregarle links?" mientras está escribiendo es interruptivo.
@@ -136,6 +158,10 @@ def orphan_surface_signal(now: datetime) -> list:
 
                 # Bucket allowlist — 00-Inbox/04-Archive/etc. quedan fuera.
                 if not any(rel.startswith(p) for p in _ORPHAN_ALLOWED_PREFIXES):
+                    continue
+
+                # Sub-prefix denylist — ETL outputs auto-generados.
+                if any(rel.startswith(p) for p in _ORPHAN_EXCLUDE_SUBPREFIXES):
                     continue
 
                 # Defensive: exclusiones globales (Claude transcripts,

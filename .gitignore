@@ -61,3 +61,7 @@ ticker-buscando.png
 # Local OCR end-to-end scratch captures — used for ad-hoc validation of
 # the ocrmac pipeline, never meant to be versioned.
 ocr-e2e-*.png
+
+# Local screenshots from playwright iterations during dev
+v2-iter*.png
+ra-home-current.png

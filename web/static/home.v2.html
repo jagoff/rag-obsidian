@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0e14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag">
+  <title>rag · home v2</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+  <link rel="stylesheet" href="/static/home.v2.css?v=5">
+</head>
+<body>
+  <a class="skip-link" href="#main">saltar al contenido</a>
+
+  <header class="topbar" role="banner">
+    <div class="brand">rag<span class="accent">·</span>home</div>
+    <div class="meta" id="topbar-meta">
+      <span class="meta-item">
+        <span class="dot ok" id="serve-dot"></span>
+        <span id="serve-text">serve</span>
+      </span>
+      <span class="meta-item" id="last-update">—</span>
+      <span class="meta-item" id="today-date">—</span>
+    </div>
+  </header>
+
+  <main class="shell" id="main">
+    <!-- ╔═══════════ COMMAND BAR — 4 KPIs críticos ═══════════╗ -->
+    <section class="cmdbar" aria-label="indicadores críticos">
+      <article class="kpi" id="kpi-inbox" data-kpi="inbox">
+        <div class="kpi-label">Inbox sin procesar</div>
+        <div class="kpi-value" data-value>—</div>
+        <div class="kpi-meta" data-meta>cargando…</div>
+      </article>
+      <article class="kpi" id="kpi-reminders" data-kpi="reminders">
+        <div class="kpi-label">Reminders hoy</div>
+        <div class="kpi-value" data-value>—</div>
+        <div class="kpi-meta" data-meta>cargando…</div>
+      </article>
+      <article class="kpi" id="kpi-wa" data-kpi="wa">
+        <div class="kpi-label">WhatsApp sin responder</div>
+        <div class="kpi-value" data-value>—</div>
+        <div class="kpi-meta" data-meta>cargando…</div>
+      </article>
+      <article class="kpi" id="kpi-loops" data-kpi="loops">
+        <div class="kpi-label">Loops STALE</div>
+        <div class="kpi-value" data-value>—</div>
+        <div class="kpi-meta" data-meta>cargando…</div>
+      </article>
+    </section>
+
+    <!-- ╔═══════════ ACCIONABLE HOY ═══════════╗ -->
+    <section class="section section-accionable" aria-labelledby="sec-acc">
+      <h2 class="section-header accent" id="sec-acc">Accionable hoy</h2>
+      <div class="section-body">
+        <article class="panel" id="p-inbox">
+          <header class="panel-head">
+            <span class="title">Inbox · sin procesar</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-questions">
+          <header class="panel-head">
+            <span class="title">Preguntas abiertas</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-tomorrow">
+          <header class="panel-head">
+            <span class="title">Para mañana</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-wa-unreplied">
+          <header class="panel-head">
+            <span class="title">WhatsApp · sin responder</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-loops-urgent">
+          <header class="panel-head">
+            <span class="title">Loops · urgentes</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-contradictions">
+          <header class="panel-head">
+            <span class="title">Contradicciones</span>
+            <span class="count" data-count>—</span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+      </div>
+    </section>
+
+    <!-- ╔═══════════ BRIEFS NARRATIVOS ═══════════╗ -->
+    <section class="section section-briefs" aria-labelledby="sec-brf">
+      <h2 class="section-header" id="sec-brf">Briefs</h2>
+      <div class="section-body">
+        <article class="brief" id="brief-today">
+          <div class="brief-title">🪞 Lo que pasó hoy</div>
+          <div class="brief-prose" data-prose>cargando…</div>
+        </article>
+        <article class="brief tomorrow" id="brief-tomorrow">
+          <div class="brief-title">🌅 Para mañana</div>
+          <div class="brief-prose" data-prose>cargando…</div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ╔═══════════ MONITORING PASIVO ═══════════╗ -->
+    <section class="section section-monitoring" aria-labelledby="sec-mon">
+      <h2 class="section-header" id="sec-mon">Monitoring</h2>
+      <div class="section-body">
+        <article class="panel" id="p-finance">
+          <header class="panel-head">
+            <span class="title">Finanzas · mes</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+          <footer class="panel-foot" data-foot></footer>
+        </article>
+        <article class="panel" id="p-cards">
+          <header class="panel-head">
+            <span class="title">Tarjetas · ciclo</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-retrieval">
+          <header class="panel-head">
+            <span class="title">Retrieval health</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-loops-aging">
+          <header class="panel-head">
+            <span class="title">Loops aging</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-authority">
+          <header class="panel-head">
+            <span class="title">Autoridad · top 5</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-eval-trend">
+          <header class="panel-head">
+            <span class="title">Eval · 30d</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ╔═══════════ AMBIENTE ═══════════╗ -->
+    <section class="section section-ambient" aria-labelledby="sec-amb">
+      <h2 class="section-header" id="sec-amb">Ambiente</h2>
+      <div class="section-body">
+        <article class="panel" id="p-weather">
+          <header class="panel-head">
+            <span class="title">Weather</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-vault-activity">
+          <header class="panel-head">
+            <span class="title">Notas tocadas · 48h</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-captured">
+          <header class="panel-head">
+            <span class="title">Capturado hoy</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-web">
+          <header class="panel-head">
+            <span class="title">Web · 7d</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-bookmarks">
+          <header class="panel-head">
+            <span class="title">Bookmarks · 48h</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-youtube">
+          <header class="panel-head">
+            <span class="title">YouTube · 7d</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+        <article class="panel" id="p-drive">
+          <header class="panel-head">
+            <span class="title">Drive · 48h</span>
+            <span class="count" data-count></span>
+          </header>
+          <div class="panel-body" data-body><div class="empty">cargando…</div></div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/home.v2.js?v=5"></script>
+</body>
+</html>

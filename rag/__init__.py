@@ -43048,6 +43048,22 @@ def _render_cards_answer(cards: list[dict] | None, *, detail: bool = False) -> s
                     amt = _fmt_usd(p.get("amount") or 0)
                     date = p.get("date") or "?"
                     out_lines.append(f"  · {date} · {desc} · {amt}")
+            # Otros conceptos = impuestos/IVA/retenciones. Sin esto,
+            # `sum(movimientos) != total_ars` y el user cree que se
+            # pierde plata. Antes de 2026-04-26 el parser los ignoraba
+            # y el render no los mostraba — detectamos el gap cuando
+            # el user preguntó por qué el resumen decía $549k pero los
+            # movimientos visibles sumaban $494k (diff = impuestos).
+            other_charges = c.get("other_charges") or []
+            if other_charges:
+                out_lines.append("\nOtros conceptos (IVA, sellos, retenciones):")
+                for oc in other_charges:
+                    desc = oc.get("description") or "—"
+                    amt = _fmt_ars(oc.get("amount") or 0)
+                    out_lines.append(f"  · {desc} · {amt}")
+                oc_total = c.get("other_charges_total_ars") or 0
+                if oc_total:
+                    out_lines.append(f"  Subtotal otros conceptos: {_fmt_ars(oc_total)}")
             out_lines.append("")  # separador entre tarjetas
         return "\n".join(out_lines).rstrip()
 

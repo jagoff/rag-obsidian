@@ -6178,6 +6178,12 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     minimum_ars = None
     minimum_usd = None
     top_purchases: list[dict] = []
+    # "Otros conceptos": impuestos / IVA / retenciones que el banco cobra
+    # encima de los consumos. Típicamente: Impuesto de sellos, Iibb
+    # percep-sant 3%, Iva rg 4240 21%, Db.rg 5617 30%. Suma ~10% del
+    # total a pagar. Sin esto la suma de consumos no cuadra con el
+    # "Total a pagar" — gap ~$55.683 reportado por el user 2026-04-26.
+    other_charges: list[dict] = []
 
     def _row_text(r: tuple) -> str:
         return " ".join(str(c) for c in r if c is not None).strip()
@@ -6186,6 +6192,7 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
     i = 0
     in_purchases_block = False
     in_payments_block = False
+    in_other_charges_block = False
     # Trackeamos la última fecha vista en filas de movimiento para
     # heredarla en filas que vienen con col[0] vacía (multi-consumo
     # mismo día). Reset al cerrar el bloque para no contaminar entre
@@ -6278,9 +6285,31 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         elif text.startswith("total de ") and ("terminada en" in text or "tarjeta" in text):
             in_purchases_block = False
             in_payments_block = False
+            in_other_charges_block = False
         elif text.startswith("otros conceptos"):
             in_purchases_block = False
             in_payments_block = False
+            in_other_charges_block = True
+        elif text.startswith("aviso importante") or text.startswith("total a pagar"):
+            # Cierra el bloque de otros conceptos — el footer legal ya
+            # no aporta data parseable.
+            in_other_charges_block = False
+        elif in_other_charges_block and len(row) >= 2:
+            # Fila de "Otros conceptos": (descripción, monto ARS, ...).
+            # Ejemplos del banco (Visa 1059 — 2026-04-26):
+            #   "Impuesto de sellos" — $548,75
+            #   "Iibb percep-sant 3%( 7)" — $902,95
+            #   "Iva rg 4240 21%( 30098,37)" — $6.320,65
+            #   "Db.rg 5617 30% ( 136276,07 )" — $40.882,82
+            desc = (str(row[0]).strip() if row[0] else "").strip()
+            if desc and desc.lower() not in ("descripción", "descripcion"):
+                amt_ars, _ = _parse_ars_or_usd(row[1] if len(row) > 1 else None)
+                if amt_ars is not None and abs(amt_ars) > 0:
+                    other_charges.append({
+                        "description": desc,
+                        "amount": abs(amt_ars),
+                        "currency": "ARS",
+                    })
         elif in_purchases_block and len(row) >= 5:
             # Fila de movimiento: (fecha, descripción, cuotas, comprobante, ARS, USD)
             # Algunas filas tienen fecha vacía (continuación del día anterior).
@@ -6363,6 +6392,12 @@ def _parse_credit_card_xlsx(path: Path) -> dict | None:
         "top_purchases_usd": all_usd_purchases[:3],
         "all_purchases_ars": all_ars_purchases,
         "all_purchases_usd": all_usd_purchases,
+        # Otros conceptos = impuestos/IVA/retenciones. ~10% típico del
+        # total a pagar. Sin esto, `sum(purchases) != total_ars`.
+        "other_charges": other_charges,
+        "other_charges_total_ars": (
+            sum(c["amount"] for c in other_charges) if other_charges else 0
+        ),
         "source_file": path.name,
         "source_mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
     }

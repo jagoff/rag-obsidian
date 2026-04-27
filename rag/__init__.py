@@ -39570,23 +39570,74 @@ def _render_today_prompt(
         )
     )
     parts = [
-        f"Generás un evening brief para el {date_label} (cierre del día), en "
-        "2da persona singular (tuteo rioplatense: 'recibiste', 'estuviste', "
-        "'tocaste', 'tenés'). NUNCA uses 1ra persona ('recibí', 'estuve', "
-        "'tengo'): le hablás al usuario sobre su propio día, no sos el usuario. "
-        "Tono calmo y honesto. Mirás hacia atrás — NO proyectes foco de "
-        "mañana como agenda; solo semillas.",
+        f"# Evening brief — {date_label}",
         "",
-        "Contexto real del vault y fuentes externas (NO inventes lo que no "
-        "esté acá). Cuando un mismo dato aparezca en una nota ingester "
-        "(`03-Resources/Gmail/<fecha>.md`, `03-Resources/YouTube/<fecha>.md`, "
-        "etc.) Y en un bucket TODAY explícito (## Gmail — recibido HOY, "
-        "## YouTube — visto HOY), priorizá el bucket TODAY: ese es la "
-        "fuente structured y tiene los detalles para citar (subject, "
-        "remitente, snippet). Las notas ingester son backups del mismo "
-        "dato, NO las cites como 'tocaste una nota'.",
+        "## REGLAS (leer antes de generar)",
+        "",
+        "1. **VOZ — 2da persona, tuteo rioplatense**. Hablás AL usuario "
+        "sobre SU propio día. Usá: 'recibiste', 'estuviste', 'tocaste', "
+        "'tenés', 'mandaste'. NUNCA uses 1ra persona ('recibí', 'estuve', "
+        "'me centré', 'trabajé', 'mi'): vos sos el observador, no el "
+        "actor. Si te encontrás escribiendo 'yo / me / mi / nos', "
+        "cambialo a 'vos / te / tu'.",
+        "   Ejemplo MAL: 'Hoy trabajé intensamente en la auditoría'.",
+        "   Ejemplo BIEN: 'Hoy trabajaste intenso en la auditoría'.",
+        "",
+        "2. **SOLO escribí las secciones marcadas como output abajo**. "
+        "NO repitas estas reglas, NO escribas 'Entre X y Y palabras', "
+        "NO incluyas comentarios meta. Tu respuesta empieza con "
+        "`## 🪞 Lo que pasó hoy` y termina con la última línea de la "
+        "última sección.",
+        "",
+        "3. **NO inventes datos**. Citá solo lo que aparece en los "
+        "bloques de contexto. Si un dato no está, no lo menciones.",
+        "",
+        "4. **Dedupe ingester vs TODAY**. Cuando un dato aparezca tanto "
+        "en una nota `03-Resources/Gmail/<fecha>.md` como en un bucket "
+        "TODAY (`## Gmail — recibido HOY`), priorizá el bucket TODAY "
+        "(tiene subject + remitente + snippet). NO cites las notas "
+        "ingester como 'tocaste una nota'.",
+        "",
+        "5. **Tono**: calmo, honesto, factual. Mirás hacia atrás. NO "
+        "proyectes la agenda de mañana como tareas; solo semillas "
+        "derivadas de lo de hoy.",
+        "",
+        "## CONTEXTO DEL DÍA",
         "",
     ]
+    # ── ENTIDADES CROSS-SOURCE (pre-correlated en Python por
+    # `rag.today_correlator`). Personas + temas que YA aparecen en ≥2
+    # fuentes — no las tiene que descubrir el LLM. Esta sección va PRIMERA
+    # de todo para que el modelo tenga el "esqueleto" del cross-source
+    # antes de leer los buckets crudos.
+    correlations = extras.get("correlations") or {}
+    people = correlations.get("people") or []
+    topics = correlations.get("topics") or []
+    if people or topics:
+        parts.append("## 🔗 ENTIDADES CROSS-SOURCE (ya correlacionadas):")
+        parts.append("(personas y temas que aparecen en MÚLTIPLES fuentes — "
+                     "úsalas literal en el brief. NO inventes correlaciones "
+                     "fuera de esta lista. Si esta lista está vacía y vos "
+                     "querés afirmar 'X conecta con Y', NO lo hagas.)")
+        parts.append("")
+        if people:
+            parts.append(f"### Personas en ≥2 fuentes ({len(people)}):")
+            for p in people[:6]:
+                src_tags = ", ".join(
+                    f"{a['source']}({a.get('context','')[:50]})"
+                    for a in p["appearances"][:4]
+                )
+                parts.append(f"- **{p['name']}** ({p['sources_count']} "
+                             f"fuentes): {src_tags}")
+            parts.append("")
+        if topics:
+            parts.append(f"### Temas en ≥2 fuentes ({len(topics)}):")
+            for t in topics[:8]:
+                src_list = " + ".join(t["sources"])
+                parts.append(
+                    f"- **{t['topic']}** aparece en: {src_list}"
+                )
+            parts.append("")
     # ── BUCKETS TODAY (corte 00:00 local) — PRIMERO en el prompt
     # porque son la señal más fresca + accionable. El LLM lee primero
     # estos y luego puede mezclarlos con las notas tocadas / capturas.
@@ -39819,16 +39870,23 @@ def _render_today_prompt(
         parts.append("")
     extra_sections = []
     if has_cross_source:
-        extra_sections.append("`## 🔗 Conexiones del día` (cross-source)")
+        extra_sections.append("`## 🔗 Conexiones del día`")
     if has_finance:
         extra_sections.append("`## 💸 Finanzas`")
     extras_clause = (
-        f"; agregá {' y '.join(extra_sections)} como sección extra SOLO "
-        "si recibiste el bloque correspondiente arriba"
-    ) if extra_sections else ""
+        f". Agregá {' y '.join(extra_sections)} SOLO si recibiste "
+        "el bloque correspondiente en el contexto de arriba."
+    ) if extra_sections else "."
+    word_budget = (
+        "250 a 450 palabras" if has_cross_source
+        else "150 a 250 palabras"
+    )
     sections_hint = (
-        "Formato de salida (Markdown, EXACTO, incluí las 4 secciones aunque "
-        "alguna quede corta" + extras_clause + "):"
+        f"## OUTPUT — formato (longitud total: {word_budget})\n\n"
+        "Empezá tu respuesta con `## 🪞 Lo que pasó hoy` y entregá "
+        "EXACTAMENTE estas 4 secciones (no más, no menos)" + extras_clause
+        + " Citá notas con [[Título]]. Citá personas por nombre cuando "
+        "aparezcan en gmail/wa/calendar."
     )
     parts.extend([
         sections_hint,
@@ -39857,14 +39915,18 @@ def _render_today_prompt(
         parts.extend([
             "",
             "## 🔗 Conexiones del día",
-            "(1-3 patrones cross-source REALES — solo si los encontrás. "
-            "Ejemplos del tipo de patrón a buscar: una persona que aparece "
-            "en gmail Y en WhatsApp Y en una nota tocada hoy → agrupala "
-            "en una línea; un proyecto mencionado en una nota que también "
-            "tiene archivos en Drive → contextualizalo; un tema de "
-            "YouTube que se cruza con una pregunta low-confidence → "
-            "señalalo. NO inventes conexiones que no estén en los datos. "
-            "Si no encontrás patrones reales, omití la sección entera.)",
+            "(escribí UNA línea por cada item del bloque '🔗 ENTIDADES "
+            "CROSS-SOURCE' de arriba. Para cada PERSONA en ≥2 fuentes, "
+            "narrá QUÉ HACE conectar las superficies: ej. 'Pablo te "
+            "escribió 5 veces por WA + lo tenés mañana 10hs en calendar "
+            "— probable que el WA sea para confirmar el sync'. Para cada "
+            "TEMA en ≥2 fuentes, narrá QUÉ INDICA el patrón: ej. "
+            "'Ghostty aparece en youtube + notas + screentime — el deep "
+            "work del día fue tu setup de terminal'. NO inventes "
+            "conexiones fuera de ese bloque. Si el bloque está vacío, "
+            "OMITÍ esta sección entera. Cada línea debe agregar valor — "
+            "si solo podés decir 'X aparece en gmail y wa' sin un "
+            "insight derivado, mejor omitir esa línea.)",
         ])
     if has_finance:
         parts.extend([
@@ -39873,15 +39935,6 @@ def _render_today_prompt(
             "(1-2 líneas: total del mes + si el run-rate proyecta arriba/abajo "
             "del mes pasado, y 1 categoría que destaca. Sé factual, sin juicio.)",
         ])
-    word_budget = (
-        "Entre 250 y 450 palabras total" if has_cross_source
-        else "Entre 150 y 250 palabras total"
-    )
-    parts.extend([
-        "",
-        f"{word_budget}. Citá notas con [[Título]]. Citá personas por "
-        "nombre cuando aparezcan en gmail/wa/calendar.",
-    ])
     return "\n".join(parts)
 
 

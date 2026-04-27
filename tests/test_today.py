@@ -478,6 +478,62 @@ def test_render_today_prompt_youtube_recent_back_compat_with_watched_key():
     assert "Old key still works" in prompt
 
 
+def test_render_today_prompt_renders_correlations_block():
+    """Cuando `extras["correlations"]` viene populated por el correlator
+    Python, el prompt debe renderear un bloque '🔗 ENTIDADES CROSS-SOURCE'
+    al inicio con las personas y temas ya matched.
+    """
+    extras = {
+        "correlations": {
+            "people": [
+                {"name": "Pablo Fer", "sources_count": 3,
+                 "appearances": [
+                     {"source": "gmail_today",
+                      "context": "Reunión 14hs", "snippet": ""},
+                     {"source": "whatsapp",
+                      "context": "5 msgs hoy", "snippet": "che"},
+                     {"source": "calendar",
+                      "context": "mañana 10:00–11:00", "snippet": "Sync"},
+                 ]},
+            ],
+            "topics": [
+                {"topic": "ghostty", "sources": ["youtube", "notas"],
+                 "sources_count": 2},
+            ],
+        }
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    # Header del bloque DATA (como H2)
+    assert "## 🔗 ENTIDADES CROSS-SOURCE" in prompt
+    # Contenido populated
+    assert "Pablo Fer" in prompt
+    assert "3 fuentes" in prompt
+    assert "ghostty" in prompt
+    assert "youtube" in prompt and "notas" in prompt
+    # Aparece ANTES del bloque "Notas tocadas hoy"
+    idx_corr = prompt.find("## 🔗 ENTIDADES CROSS-SOURCE")
+    idx_notas = prompt.find("## Notas tocadas hoy")
+    assert idx_corr < idx_notas
+
+
+def test_render_today_prompt_skips_correlations_block_when_empty():
+    """Si correlations viene vacío, NO se renderea el bloque (evita ruido
+    en el prompt para días sin cross-source detectables).
+    """
+    extras = {
+        "correlations": {"people": [], "topics": []},
+        "gmail_today": [
+            {"from": "x", "subject": "test", "snippet": "..."},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    # El HEADER (H2) NO debe aparecer cuando los buckets están vacíos.
+    # La frase 'ENTIDADES CROSS-SOURCE' aparece en las instructions de
+    # la sección 🔗 Conexiones del día (referencia descripta), pero NO
+    # como header del data block.
+    assert "## 🔗 ENTIDADES CROSS-SOURCE" not in prompt
+
+
 def test_render_today_prompt_asks_for_cross_source_matching():
     """El prompt debe instruir explícitamente al LLM a buscar conexiones
     entre fuentes (gmail/wa/calendar/notas) cuando hay extras de varias

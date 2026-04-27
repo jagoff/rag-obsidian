@@ -7880,6 +7880,16 @@ def _home_compute(
             "vault_activity": signals_dict.get("vault_activity") or {},
             "followup_aging": signals_dict.get("followup_aging") or {},
         }
+        # Pre-correlate ANTES del LLM call. Un 7B aplanado descubre poco
+        # cross-source por su cuenta — pasarle entidades + temas ya
+        # matched evita los "X conecta con Y porque ambos son X" tautológicos
+        # que generaba antes. Costo: <100ms (regex + dict ops, no IO).
+        from rag.today_correlator import correlate_today_signals as _corr
+        try:
+            extras["correlations"] = _corr(today_ev, extras)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[today-correlator] failed: {exc}", file=sys.stderr)
+            extras["correlations"] = {"people": [], "topics": []}
         prompt = _render_today_prompt(date_label, today_ev, extras=extras)
         narrative = _generate_today_narrative(prompt)
         narrative_source = "generated" if narrative else "error"

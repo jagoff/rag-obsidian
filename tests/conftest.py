@@ -125,7 +125,7 @@ def _isolate_apple_integrations(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_vault_path(tmp_path_factory, request):
+def _isolate_vault_path(tmp_path_factory, request, monkeypatch):
     """Safety-critical: `rag.VAULT_PATH` resuelve en import-time a
     `_DEFAULT_VAULT` (el iCloud Obsidian real del usuario) si no hay
     override en env o vaults.json. Sin este fixture, cualquier test que
@@ -181,33 +181,25 @@ def _isolate_vault_path(tmp_path_factory, request):
     # movieran VAULT_PATH).
     if request.node.get_closest_marker("real_vault"):
         import rag as _rag
-        snap_real = _rag.VAULT_PATH
-        # Re-resolve al default real (el que había en import-time).
-        _rag.VAULT_PATH = _rag._DEFAULT_VAULT
-        try:
-            yield None
-        finally:
-            _rag.VAULT_PATH = snap_real
+        # Forzar VAULT_PATH al default real (el que había en import-time).
+        # Usamos `monkeypatch.setattr` en lugar de mutación directa para
+        # que `monkeypatch.undo()` (en teardown) lo restaure correctamente
+        # al original-original, sin depender del orden LIFO contra otras
+        # fixtures autouse.
+        monkeypatch.setattr(_rag, "VAULT_PATH", _rag._DEFAULT_VAULT)
+        yield None
         return
 
     import rag as _rag
-    snap_original = _rag.VAULT_PATH
     tmp = tmp_path_factory.mktemp("vault_isolated")
-    _rag.VAULT_PATH = tmp
-    try:
-        yield tmp
-    finally:
-        # monkeypatch.undo() ya corrió (LIFO: esta fixture no depende de
-        # monkeypatch → tears down después de él). Cualquier drift vs
-        # `tmp` es mutación directa que bypasseó monkeypatch.
-        current = _rag.VAULT_PATH
-        if current != tmp:
-            warnings.warn(
-                f"rag.VAULT_PATH leaked from test (expected {tmp}, "
-                f"now {current}); restoring to module default",
-                stacklevel=2,
-            )
-        _rag.VAULT_PATH = snap_original
+    # `monkeypatch.setattr` registra el undo automáticamente. Si el test
+    # hace su propio `monkeypatch.setattr(rag, "VAULT_PATH", X)` encima,
+    # el stack de undos se desenrolla LIFO en el teardown del monkeypatch
+    # del test (función estándar de pytest), restaurando VAULT_PATH al
+    # `_DEFAULT_VAULT` original. Ya no hace falta capturar snapshot ni
+    # detectar drift acá — eso lo hace `pytest_runtest_protocol` al final.
+    monkeypatch.setattr(_rag, "VAULT_PATH", tmp)
+    yield tmp
 
 
 @pytest.fixture(autouse=True)
@@ -356,66 +348,91 @@ def _snapshot_rag_local_embed_env():
 
 
 @pytest.fixture(autouse=True)
-def _stabilize_rag_state():
-    """Flake root cause — the T4 branch introduced writer/reader tests that
-    mutate module-level globals (`RAG_STATE_SQL`, `DB_PATH`). Pytest's
-    monkeypatch reverts those correctly, BUT:
+def _drain_log_queue():
+    """Drain `_LOG_QUEUE` between tests para que assertions del próximo
+    test no se contaminen con writes del anterior.
 
-    1. `log_behavior_event()` and `log_query_event()` enqueue onto the module
-       `_LOG_QUEUE`, which is drained by a daemon thread (`_LOG_THREAD`) — so
-       tests that call these writers + assert on the JSONL output have an
-       implicit race. Under heavier pytest load (output capture + many prior
-       tests), the assertion fires before the background write lands. This
-       manifested as intermittent failures in `test_brief_diff_signal.py` and
-       similar readers that indirectly enqueue via `_diff_brief_signal`.
+    Histórico: hubo flake intermitente en `test_brief_diff_signal.py` y
+    similares — tests que llaman `log_behavior_event()` /
+    `log_query_event()` (que encolan en el `_LOG_QUEUE` drenado por el
+    daemon `_LOG_THREAD`) y después assertean sobre el JSONL antes de
+    que el background write aterrizara.
 
-    2. If a test crashes mid-way after setting `RAG_STATE_SQL=True` but before
-       `monkeypatch` unwinds, the flag leaks to later tests. Those tests would
-       then hit the SQL branch of writers and accidentally touch the LIVE DB
-       (`~/.local/share/obsidian-rag/ragvec/ragvec.db`) when `DB_PATH` wasn't
-       redirected in parallel. This fixture asserts both are restored.
-
-    Fix: after every test,
-      (a) drain `_LOG_QUEUE` so filesystem state is quiescent before teardown;
-      (b) snapshot & restore `RAG_STATE_SQL` + `DB_PATH` if they drifted,
-          emitting a warning so the offending test is obvious.
+    Esta fixture solo drena la queue; la detección de drift en
+    `RAG_STATE_SQL` / `DB_PATH` / `VAULT_PATH` / `_TELEMETRY_DB_FILENAME`
+    vive en el hook `pytest_runtest_protocol` más abajo, que corre FUERA
+    del orden LIFO de fixtures (la única forma de validar después de que
+    `monkeypatch.undo()` se haya ejecutado).
     """
-    import rag as _rag
-    snap_sql_flag = _rag.RAG_STATE_SQL
-    snap_db_path = _rag.DB_PATH
-    snap_telemetry_db = _rag._TELEMETRY_DB_FILENAME
+    yield
     try:
-        yield
-    finally:
-        # (a) Drain the writer queue so assertions in the next test aren't
-        # contaminated by writes enqueued by the previous one.
-        try:
-            _rag._LOG_QUEUE.join()
-        except Exception:
-            pass
+        import rag as _rag
+        _rag._LOG_QUEUE.join()
+    except Exception:
+        pass
 
-        # (b) Detect flag/DB_PATH/_TELEMETRY_DB_FILENAME drift — restore + warn.
-        if _rag.RAG_STATE_SQL is not snap_sql_flag:
-            warnings.warn(
-                f"RAG_STATE_SQL leaked from test (was {snap_sql_flag}, "
-                f"now {_rag.RAG_STATE_SQL}); restoring",
-                stacklevel=2,
-            )
-            _rag.RAG_STATE_SQL = snap_sql_flag
-        if _rag.DB_PATH != snap_db_path:
-            warnings.warn(
-                f"rag.DB_PATH leaked from test (was {snap_db_path}, "
-                f"now {_rag.DB_PATH}); restoring",
-                stacklevel=2,
-            )
-            _rag.DB_PATH = snap_db_path
-        if _rag._TELEMETRY_DB_FILENAME != snap_telemetry_db:
-            warnings.warn(
-                f"rag._TELEMETRY_DB_FILENAME leaked from test (was {snap_telemetry_db!r}, "
-                f"now {_rag._TELEMETRY_DB_FILENAME!r}); restoring",
-                stacklevel=2,
-            )
-            _rag._TELEMETRY_DB_FILENAME = snap_telemetry_db
+
+# ── Drift detection hook (out-of-fixture-LIFO) ──────────────────────────
+#
+# Problema histórico (resuelto 2026-04-27): la suite emitía decenas de
+# warnings falsos `rag.DB_PATH leaked from test` y `rag.VAULT_PATH leaked
+# from test`, aún cuando los tests usaban `monkeypatch.setattr`
+# correctamente. Root cause: el guard vivía en el `finally` de fixtures
+# autouse (`_stabilize_rag_state`, `_isolate_vault_path`), y por LIFO de
+# teardown corría ANTES de `monkeypatch.undo()` en escenarios donde otras
+# autouse fixtures (`_stub_chat_model_cache_if_no_ollama`,
+# `_isolate_apple_integrations`, etc.) declaran `monkeypatch` como
+# dependency. En esos casos pytest resuelve `monkeypatch` primero, así
+# que su teardown corre último, y el guard veía el state todavía mutado.
+#
+# Fix: mover la drift detection a un hook a nivel
+# `pytest_runtest_protocol` con `hookwrapper=True`. El `yield` cede para
+# que pytest corra setup + call + teardown completos; el código post-yield
+# ve el state final, después de TODOS los teardowns (incluyendo
+# `monkeypatch.undo()`). Si todavía hay drift acá, es genuino —
+# probablemente un test que mutó state global directamente sin pasar por
+# `monkeypatch.setattr`.
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Snapshot pre-test → run protocol → validate drift post-everything.
+
+    Captura `DB_PATH` / `VAULT_PATH` / `RAG_STATE_SQL` /
+    `_TELEMETRY_DB_FILENAME` ANTES de que las fixtures setup corran (al
+    inicio del protocolo), y los compara DESPUÉS de que todas las
+    fixtures + monkeypatch hayan teardowneado. Drift acá = el test (o
+    una fixture en su scope) mutó un global y no se deshizo, lo cual
+    contamina los tests siguientes — restauramos al snapshot para
+    aislar y emitimos warning con el test offender en `item.nodeid`.
+    """
+    try:
+        import rag as _rag
+        snap = {
+            "DB_PATH": _rag.DB_PATH,
+            "VAULT_PATH": _rag.VAULT_PATH,
+            "RAG_STATE_SQL": _rag.RAG_STATE_SQL,
+            "_TELEMETRY_DB_FILENAME": _rag._TELEMETRY_DB_FILENAME,
+        }
+    except Exception:
+        snap = None
+
+    yield  # pytest runs setup → call → teardown (incl. monkeypatch.undo)
+
+    if snap is None:
+        return
+    try:
+        import rag as _rag
+        for attr, snap_val in snap.items():
+            cur_val = getattr(_rag, attr, None)
+            if cur_val != snap_val:
+                warnings.warn(
+                    f"rag.{attr} leaked from test {item.nodeid} "
+                    f"(was {snap_val!r}, now {cur_val!r}); restoring",
+                    stacklevel=2,
+                )
+                setattr(_rag, attr, snap_val)
+    except Exception:
+        pass
 
 
 # ── Session-end leak guard for sql_state_errors.jsonl ────────────────────

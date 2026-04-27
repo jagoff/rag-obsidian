@@ -13,9 +13,19 @@ Contrato:
     Calendar.app, a diferencia de Reminders).
 
 Todos los tests mockean `_osascript` y capturan el script generado.
+
+NOTA fast-path EventKit (commit 2b7c0c1 audit 2026-04-25 R2-Calendar #2):
+desde el audit ronda 2, `_create_calendar_event` intenta primero crear el
+evento via EventKit nativo (50-100ms vs 8s AppleScript) antes de caer al
+fallback. Estos tests se centran en el fallback AppleScript — bloqueamos
+el import de `Foundation` con `_capture_osascript` para forzar que el
+fast-path falle y el flow llegue al AppleScript path donde los asserts
+de "el script generado contiene X" siguen siendo válidos. El happy path
+EventKit tiene su propia cobertura empírica via smoke tests live.
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -26,6 +36,12 @@ def _capture_osascript(monkeypatch, return_val="ABC-DEF-UUID-123"):
     m = MagicMock(return_value=return_val)
     monkeypatch.setattr(rag, "_osascript", m)
     monkeypatch.setattr(rag, "_apple_enabled", lambda: True)
+    # Forzar fallback AppleScript: bloqueamos el import dinámico de
+    # `Foundation` que el fast-path EventKit hace dentro de la función.
+    # `setitem(sys.modules, 'X', None)` hace que `from X import Y` raisee
+    # `ImportError`, atrapado por el `try/except Exception` del fast-path.
+    monkeypatch.setitem(sys.modules, "Foundation", None)
+    monkeypatch.setitem(sys.modules, "objc", None)
     return m
 
 
@@ -182,6 +198,10 @@ def test_create_event_osascript_error_surfaces(monkeypatch):
 
 
 def test_create_event_empty_osascript_output(monkeypatch):
+    # Bloquear fast-path EventKit para que el test del fallback AppleScript
+    # corra (mismo patrón que `_capture_osascript`).
+    monkeypatch.setitem(sys.modules, "Foundation", None)
+    monkeypatch.setitem(sys.modules, "objc", None)
     monkeypatch.setattr(rag, "_osascript", lambda *a, **kw: "")
     monkeypatch.setattr(rag, "_apple_enabled", lambda: True)
     ok, msg = rag._create_calendar_event("x", datetime(2026, 4, 25, 14, 0))

@@ -50,10 +50,13 @@ def test_source_weights_dict_covers_every_valid_source():
 def test_recency_halflife_and_retention_keyed_on_every_source():
     assert set(rag.SOURCE_RECENCY_HALFLIFE_DAYS) == rag.VALID_SOURCES
     assert set(rag.SOURCE_RETENTION_DAYS) == rag.VALID_SOURCES
-    # Vault/Calendar opt out of decay; WhatsApp has a short halflife.
+    # Vault/Calendar opt out of decay; WhatsApp/Messages/Calls have a
+    # mid-term halflife. Bumpeado de 30→60 días en audit 2026-04-25
+    # R2-Cross-source #5 — 30d era muy agresivo (rev. comentario
+    # SOURCE_RECENCY_HALFLIFE_DAYS en rag/__init__.py para la historia).
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["vault"] is None
     assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["calendar"] is None
-    assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["whatsapp"] == 30.0
+    assert rag.SOURCE_RECENCY_HALFLIFE_DAYS["whatsapp"] == 60.0
 
 
 # ── normalize_source ─────────────────────────────────────────────────────────
@@ -102,12 +105,13 @@ def test_recency_multiplier_returns_one_for_halflife_none():
 
 
 def test_recency_multiplier_respects_halflife():
-    # WhatsApp halflife is 30d → age=30 should be 0.5, age=60 → 0.25.
+    # WhatsApp halflife is 60d (audit 2026-04-25 bumpeo) → age=60 → 0.5,
+    # age=120 → 0.25.
     now = time.time()
-    age_30d = now - 30 * 86400
     age_60d = now - 60 * 86400
-    assert rag.source_recency_multiplier("whatsapp", age_30d, now=now) == pytest.approx(0.5, abs=1e-3)
-    assert rag.source_recency_multiplier("whatsapp", age_60d, now=now) == pytest.approx(0.25, abs=1e-3)
+    age_120d = now - 120 * 86400
+    assert rag.source_recency_multiplier("whatsapp", age_60d, now=now) == pytest.approx(0.5, abs=1e-3)
+    assert rag.source_recency_multiplier("whatsapp", age_120d, now=now) == pytest.approx(0.25, abs=1e-3)
 
 
 def test_recency_multiplier_age_zero_returns_one():
@@ -116,19 +120,21 @@ def test_recency_multiplier_age_zero_returns_one():
 
 
 def test_recency_multiplier_accepts_iso_string():
+    # Halflife=60d: una fecha de hace 60d debería dar 0.5.
     now = datetime.now()
-    created = (now - timedelta(days=30)).isoformat(timespec="seconds")
+    created = (now - timedelta(days=60)).isoformat(timespec="seconds")
     mult = rag.source_recency_multiplier("whatsapp", created, now=now.timestamp())
     assert mult == pytest.approx(0.5, abs=1e-2)
 
 
 def test_recency_multiplier_accepts_iso_z_timezone():
     # Zulu-style Z suffix (used by web/conversation_writer frontmatter).
+    # Halflife=60d → fecha de hace 60d debería caer en bucket [0.4, 0.6].
     now = datetime.now()
-    iso_z = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_z = (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
     mult = rag.source_recency_multiplier("whatsapp", iso_z, now=now.timestamp())
-    # ISO Z is UTC; test clock is local — the offset may be a few hours but
-    # still within the same ~30d bucket, so multiplier ∈ [0.4, 0.6]
+    # ISO Z is UTC; test clock is local — el offset puede ser unas horas pero
+    # sigue en el bucket de ~60d, multiplier ∈ [0.4, 0.6]
     assert 0.4 <= mult <= 0.6
 
 
@@ -179,9 +185,15 @@ def test_apply_weighted_scores_source_multiplier_downweights_nonvault():
 
 
 def test_apply_weighted_scores_recency_decays_whatsapp():
-    """WA chunk 30 days old should halve (0.75 * 0.5 = 0.375× baseline)."""
+    """WA chunk 60 days old should halve (0.75 * 0.5 = 0.375× baseline).
+
+    Audit 2026-04-25 R2-Cross-source #5 bumpeó el halflife de WA de 30→60
+    días, así que un mensaje de hace 60d ahora cae a 0.5× (antes esa edad
+    daba 0.25×). Para llegar a la vieja división 0.5× del rerank tenemos
+    que envejecer 60 días, no 30.
+    """
     w = rag.RankerWeights.defaults()
-    old_ts = time.time() - 30 * 86400
+    old_ts = time.time() - 60 * 86400  # 60d con halflife=60d → 0.5×
     fresh_ts = time.time()
     feats = [
         _make_feat("wa-fresh.md", 0.80, "whatsapp", fresh_ts),

@@ -176,13 +176,17 @@ def _post_chat(question: str = "hola") -> tuple[list[tuple[str, dict]], str]:
 
 
 def test_tools_module_exports():
-    # 22 = 18 originales + 3 nuevas de gestión de mensajes WA programados
+    # 23 = 18 originales + 3 nuevas de gestión de mensajes WA programados
     # (whatsapp_list_scheduled, propose_whatsapp_cancel_scheduled,
     # propose_whatsapp_reschedule_scheduled — issue #4 audit 2026-04-25)
     # + 1 para resúmenes de tarjetas (credit_cards_summary — 2026-04-26
-    # cuando el user mudó la fuente financiera a /Finances y agregó xlsx).
-    assert len(CHAT_TOOLS) == 22
-    assert len(TOOL_FNS) == 22
+    # cuando el user mudó la fuente financiera a /Finances y agregó xlsx)
+    # + 1 para anotar observaciones de contactos en el vault
+    # (record_contact_observation — 2026-04-26, hace que las notas de
+    # 99-Contacts/ sean "vivas" y el chat web pueda capturar info sobre
+    # personas de forma persistente).
+    assert len(CHAT_TOOLS) == 23
+    assert len(TOOL_FNS) == 23
     assert PARALLEL_SAFE == {
         "weather", "finance_summary", "credit_cards_summary", "calendar_ahead",
         "reminders_due", "gmail_recent", "drive_search",

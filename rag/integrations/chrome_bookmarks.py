@@ -143,3 +143,103 @@ def _fetch_chrome_bookmarks_used(hours: int = 48, n: int = 5) -> list[dict]:
         if len(out) >= n:
             break
     return out
+
+
+# ── YouTube watched today (Chrome history) ─────────────────────────────────
+# Sibling of `_fetch_chrome_bookmarks_used` — same Chrome history DB, same
+# tmp-copy pattern, but filters to YouTube watch URLs and a TODAY window
+# (today 00:00 local → now). Used by both web (`_home_compute`) and CLI
+# (`cmd_today`).
+
+
+def _fetch_youtube_today(now: datetime, n: int = 5) -> list[dict]:
+    """YouTube videos abiertos en Chrome HOY (today 00:00 local → now).
+
+    Same shape as `_fetch_youtube_watched` (see `web/server.py`):
+    list of {title, url, video_id, visit_count, last_visit_iso}, dedup
+    por video_id, sorted by last_visit DESC.
+
+    Reuses the Chrome history pattern (tmp copy + read-only SQLite + epoch
+    conversion). Differs from the 7-day watched fetcher only in the lower
+    bound of the visit_time window: hard cut at today_start instead of
+    rolling N hours.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    src = Path.home() / "Library/Application Support/Google/Chrome/Default/History"
+    if not src.is_file():
+        return []
+
+    CHROME_EPOCH_OFFSET = 11_644_473_600
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start_chrome = int(
+        (today_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=True) as tmp:
+        try:
+            shutil.copyfile(src, tmp.name)
+        except OSError:
+            return []
+        try:
+            conn = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return []
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT u.url AS url, u.title AS title,
+                       COUNT(v.id) AS visit_count,
+                       MAX(v.visit_time) AS last_visit
+                FROM urls u
+                JOIN visits v ON v.url = u.id
+                WHERE v.visit_time >= ?
+                  AND (
+                       u.url LIKE '%://www.youtube.com/watch%'
+                    OR u.url LIKE '%://youtube.com/watch%'
+                    OR u.url LIKE '%://m.youtube.com/watch%'
+                    OR u.url LIKE '%://youtu.be/%'
+                  )
+                GROUP BY u.url
+                ORDER BY last_visit DESC
+                LIMIT 50
+                """,
+                (window_start_chrome,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    seen_ids: set[str] = set()
+    out: list[dict] = []
+    for r in rows:
+        url = r["url"]
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc.endswith("youtu.be"):
+                vid = parsed.path.strip("/").split("/")[0] or url
+            else:
+                vid = (parse_qs(parsed.query).get("v") or [url])[0]
+        except Exception:
+            vid = url
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        raw_title = (r["title"] or "").strip()
+        title = (
+            raw_title[:-len(" - YouTube")].rstrip()
+            if raw_title.endswith(" - YouTube") else raw_title
+        )
+        last_unix = (r["last_visit"] / 1_000_000) - CHROME_EPOCH_OFFSET
+        out.append({
+            "title": title or url,
+            "url": url,
+            "video_id": vid,
+            "visit_count": int(r["visit_count"]),
+            "last_visit_iso": datetime.fromtimestamp(last_unix).isoformat(timespec="seconds"),
+        })
+        if len(out) >= n:
+            break
+    return out

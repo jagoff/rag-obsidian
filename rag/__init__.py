@@ -40201,6 +40201,59 @@ def contact_note(contact_name: str, observation: str,
     )
 
 
+def _build_today_extras_for_cli(target: datetime) -> dict:
+    """Construye el dict `extras` cross-source para el CLI `rag today`.
+
+    Paridad con `web/server.py:_home_compute` regenerate=True path. Corre
+    los 4 fetchers TODAY (gmail/wa/calendar/youtube) en paralelo + el
+    correlator + tomorrow_calendar (para detectar personas en agenda
+    futura). NO incluye buckets web-specific (signals, pagerank, eval,
+    drive, bookmarks rolling) — esos requieren un web compute pool y la
+    DB del corpus, que el CLI no tiene a mano. Suficiente para el brief
+    de cierre de día tras la terminal.
+
+    Silent-fail por fetcher: si gmail OAuth expiró o calendar no tiene
+    icalBuddy instalado, ese bucket queda `[]` y el resto sigue.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="cli-today") as pool:
+        fut_gmail = pool.submit(_fetch_gmail_today, target, 8)
+        fut_wa = pool.submit(_fetch_whatsapp_today, target, 8)
+        fut_cal_today = pool.submit(_fetch_calendar_today, 15)
+        fut_yt_today = pool.submit(_fetch_youtube_today, target, 5)
+        fut_cal_tomorrow = pool.submit(_fetch_calendar_ahead, 1, 10)
+
+        def _safe(fut, default, timeout: float):
+            try:
+                return fut.result(timeout=timeout) or default
+            except Exception:
+                return default
+
+        gmail_today = _safe(fut_gmail, [], 10.0)
+        wa_today = _safe(fut_wa, [], 5.0)
+        cal_today = _safe(fut_cal_today, [], 10.0)
+        yt_today = _safe(fut_yt_today, [], 5.0)
+        cal_tomorrow = _safe(fut_cal_tomorrow, [], 10.0)
+
+    extras: dict = {
+        "gmail_today": gmail_today,
+        "whatsapp_today": wa_today,
+        "calendar_today": cal_today,
+        "youtube_today": yt_today,
+        "tomorrow_calendar": cal_tomorrow,
+    }
+    # Pre-correlate cross-source antes de pasar al LLM. Misma lógica que
+    # el web — el LLM 7B no descubre patrones cross-source flat, los
+    # narra mejor cuando recibe el bloque pre-armado.
+    try:
+        from rag.today_correlator import correlate_today_signals as _corr
+        extras["correlations"] = _corr({}, extras)
+    except Exception:
+        extras["correlations"] = {"people": [], "topics": []}
+    return extras
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True,
               help="Imprimir el brief sin escribir el archivo")
@@ -40248,8 +40301,16 @@ def today(dry_run: bool, plain: bool, date_opt: str | None):
             f"{len(ev['low_conf_queries'])} low-conf"
         )
 
+    # Cross-source extras: paridad con el web `/api/home?regenerate=1`.
+    # Antes el CLI solo veía el vault (notas + inbox + todos), ahora ve
+    # también gmail/wa/calendar/youtube de hoy + tomorrow_calendar + el
+    # correlator pre-arma personas + temas cross-source. Sin esto el
+    # `rag today` desde la terminal generaba un brief mucho más pobre que
+    # el regenerate del web. Silent-fail por fetcher: si gmail OAuth está
+    # roto el resto sigue.
+    extras = _build_today_extras_for_cli(target)
     date_label = target.strftime("%Y-%m-%d")
-    prompt = _render_today_prompt(date_label, ev)
+    prompt = _render_today_prompt(date_label, ev, extras=extras)
     if plain:
         narrative = _generate_today_narrative(prompt)
     else:
@@ -54791,6 +54852,7 @@ from rag.integrations.chrome_bookmarks import (  # noqa: E402, F401
     _chrome_bookmarks_root,
     _chrome_to_unix_ts,
     _fetch_chrome_bookmarks_used,
+    _fetch_youtube_today,
 )
 from rag.integrations.drive import (  # noqa: E402, F401
     GDRIVE_CREDS_DIR,

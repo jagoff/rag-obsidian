@@ -8402,6 +8402,602 @@ def _sync_moze_notes(vault_root: Path) -> dict:
     }
 
 
+# ── Resúmenes de tarjeta de crédito → notas mensuales ────────────────────
+# El banco emite un `.xlsx` por ciclo (Santander Río exporta `Último resumen
+# - <Marca> <Últimos4>.xlsx`) y el user lo deja caer en el mismo dir iCloud
+# `/Finances` que los CSV de MOZE. Naming esperado: empieza con "Último
+# resumen" (con o sin acento) — globs case-insensitive para tolerar
+# variaciones del banco.
+#
+# Pre 2026-04-26 el data flow era unidireccional: web/server.py:_fetch_credit_
+# cards leía el xlsx live (cache en RAM por (path, mtime)) y lo servía al
+# tool `credit_cards_summary`. NO había notas markdown ni indexación en
+# sqlite-vec — el chat solo veía las tarjetas vía pre-router que detectaba
+# "tarjeta/visa/master/amex" y forzaba el tool. Cualquier query que NO
+# matcheara el regex (ej. "listame los gastos en pesos" después de
+# "Cuanto debo a la visa?") terminaba en MOZE chunks o en respuestas
+# huecas porque el retriever no tenía nada de tarjetas que recuperar.
+#
+# Post-fix: `_sync_credit_cards_notes` genera 1 nota .md por (tarjeta,
+# ciclo) bajo `02-Areas/Personal/Finanzas/Tarjetas/`. La nota incluye
+# frontmatter estructurado (brand, last4, totales, fechas) + body con los
+# top movimientos. `rag index` la absorbe vía rglob como cualquier nota
+# del vault → embedding + reranker la levantan en `retrieve("gastos visa
+# marzo")` aunque el pre-router no fire. El tool `credit_cards_summary`
+# se mantiene en paralelo para datos transaccionales 100% frescos
+# (REGLA 1.b del web system prompt: cita literal de tool fresca, no
+# parafraseo de chunks).
+#
+# DUPLICACIÓN CONOCIDA: `_parse_credit_card_xlsx` (+ helpers `_parse_ars_or_
+# usd`, `_parse_card_date`, `_CARD_BRAND_RE`, `_CARD_LAST4_RE`) existe
+# byte-idéntico en `web/server.py` líneas ~5901-6192. La intención era
+# hacer un único source-of-truth acá y que web importe desde rag, pero
+# el refactor cross-file fue revertido por una sesión paralela mientras
+# se shipia este commit. La duplicación es funcional (ambos parsers
+# producen el mismo dict) pero hay riesgo de drift si alguien edita uno
+# y olvida el otro. TODO: deduplicar movimiento posterior — flag
+# `from rag import _parse_credit_card_xlsx` en web/server.py + delete
+# de la copia. Tests de parser (`tests/test_credit_cards_parser.py`)
+# importan desde `web.server` y siguen verdes; tests del sync
+# (`tests/test_credit_cards_sync.py`) importan desde `rag`. Si los dos
+# tests salen de sincro entre sí en el futuro, ese es el síntoma.
+TARJETAS_VAULT_SUBPATH = os.environ.get(
+    "OBSIDIAN_RAG_TARJETAS_FOLDER", "02-Areas/Personal/Finanzas/Tarjetas"
+)
+
+# Regex para extraer marca + últimos 4 del nombre de archivo o sheet name.
+# Tolera "Visa Crédito terminada en 1059", "Visa 1059", "Mastercard 5234",
+# "Amex 3456". Case-insensitive.
+_CARD_BRAND_RE = re.compile(
+    r"\b(Visa|Master(?:card)?|Amex|American\s*Express|Cabal|Maestro|Naranja)\b",
+    re.IGNORECASE,
+)
+_CARD_LAST4_RE = re.compile(r"(\d{4})(?!\d)")
+
+
+def _parse_ars_or_usd(raw: object) -> tuple[float | None, str | None]:
+    """Parsea celdas tipo `$549.438,75`, `U$S98,93`, `-$926,15`, o numérico
+    crudo (openpyxl puede devolver float si la celda tiene formato número).
+    Retorna `(amount, currency)` donde currency ∈ {"ARS", "USD", None}.
+
+    Heurística decimal: si el string tiene `,` lo asumimos formato ES
+    (decimal coma, miles punto) y normalizamos. Si solo tiene `.` puede ser
+    formato US (`24.99`) — solo strippeamos puntos como miles si hay 3
+    dígitos exactos después, sino el punto es decimal.
+    """
+    if raw is None:
+        return (None, None)
+    if isinstance(raw, (int, float)):
+        return (float(raw), None)
+    s = str(raw).strip()
+    if not s:
+        return (None, None)
+    cur: str | None = None
+    if s.upper().startswith("U$S") or "U$S" in s.upper() or s.upper().startswith("USD"):
+        cur = "USD"
+    elif s.startswith("$") or "ARS" in s.upper():
+        cur = "ARS"
+    # Strippeamos símbolos no-numéricos.
+    cleaned = re.sub(r"[^\d,.\-]", "", s)
+    if "," in cleaned:
+        # Formato ES: punto = miles, coma = decimal.
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif cleaned.count(".") > 1:
+        # Múltiples puntos → todos son miles ES sin decimal explícito.
+        cleaned = cleaned.replace(".", "")
+    # Else: un solo punto → decimal US (`24.99`), dejarlo como está.
+    try:
+        return (float(cleaned), cur)
+    except ValueError:
+        return (None, cur)
+
+
+def _parse_card_date(raw: object) -> str | None:
+    """DD/MM/YYYY → ISO `YYYY-MM-DD`. None si no parsea. Acepta
+    `datetime.date|datetime` (openpyxl normaliza fechas si la celda tiene
+    formato fecha) y strings con prefijo (`"Cierre: 26/03/2026"`).
+    """
+    if raw is None:
+        return None
+    if hasattr(raw, "strftime"):
+        try:
+            return raw.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    s = str(raw).strip()
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    if not m:
+        return None
+    try:
+        d = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        return d.strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _parse_credit_card_xlsx(path: Path) -> dict | None:
+    """Parsea un `Último resumen - <Marca> <Últimos4>.xlsx` del banco a un
+    dict normalizado. None si openpyxl no está disponible o el xlsx no
+    tiene la estructura esperada (sin Total a pagar reconocible).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return None
+    try:
+        wb = load_workbook(path, data_only=True, read_only=True)
+    except Exception:
+        return None
+
+    rows: list[tuple] = []
+    sheet_name = ""
+    try:
+        ws = wb.active
+        sheet_name = ws.title or ""
+        # Lectura completa: el archivo es <100 filas — read_only modo
+        # streaming, sin riesgo de memoria.
+        for row in ws.iter_rows(values_only=True):
+            rows.append(row)
+    except Exception:
+        return None
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    if not rows:
+        return None
+
+    # Identificar marca + últimos 4 — primero del sheet name, sino del
+    # nombre de archivo, sino del primer row con "terminada en".
+    brand = None
+    last4 = None
+    for source in (sheet_name, path.stem):
+        m_brand = _CARD_BRAND_RE.search(source)
+        m_last4 = _CARD_LAST4_RE.search(source)
+        if m_brand and not brand:
+            brand = m_brand.group(1).title()
+            if brand.lower() in ("master", "mastercard"):
+                brand = "Mastercard"
+            elif brand.lower() in ("amex", "american express"):
+                brand = "Amex"
+        if m_last4 and not last4:
+            last4 = m_last4.group(1)
+        if brand and last4:
+            break
+
+    # Pasada por filas: extraer secciones por anchor text.
+    holder = None
+    closing_date = None
+    due_date = None
+    next_closing_date = None
+    next_due_date = None
+    total_ars = None
+    total_usd = None
+    minimum_ars = None
+    minimum_usd = None
+    top_purchases: list[dict] = []
+
+    def _row_text(r: tuple) -> str:
+        return " ".join(str(c) for c in r if c is not None).strip()
+
+    n = len(rows)
+    i = 0
+    in_purchases_block = False
+    in_payments_block = False
+    while i < n:
+        row = rows[i]
+        text = _row_text(row).lower()
+
+        # Header: "Tarjeta <Marca> ... terminada en NNNN"
+        if not last4 and "terminada en" in text:
+            m = _CARD_LAST4_RE.search(text)
+            if m:
+                last4 = m.group(1)
+            m_brand = _CARD_BRAND_RE.search(text)
+            if m_brand and not brand:
+                brand = m_brand.group(1).title()
+
+        # "Fecha de cierre" / "Fecha de vencimiento" — fila siguiente las trae
+        if "fecha de cierre" in text and "fecha de vencimiento" in text and i + 1 < n:
+            nxt = rows[i + 1]
+            closing_date = _parse_card_date(nxt[0] if len(nxt) > 0 else None)
+            due_date = _parse_card_date(nxt[1] if len(nxt) > 1 else None)
+            i += 2
+            continue
+
+        # "Total a pagar" — fila siguiente: ARS | USD
+        if "total a pagar" in text and i + 1 < n:
+            nxt = rows[i + 1]
+            v0, c0 = _parse_ars_or_usd(nxt[0] if len(nxt) > 0 else None)
+            v1, c1 = _parse_ars_or_usd(nxt[1] if len(nxt) > 1 else None)
+            for v, c in ((v0, c0), (v1, c1)):
+                if v is None:
+                    continue
+                if c == "USD":
+                    total_usd = v
+                else:
+                    total_ars = v if total_ars is None else total_ars
+            i += 2
+            continue
+
+        # "Mínimo a pagar"
+        if "mínimo a pagar" in text or "minimo a pagar" in text:
+            if i + 1 < n:
+                nxt = rows[i + 1]
+                v0, c0 = _parse_ars_or_usd(nxt[0] if len(nxt) > 0 else None)
+                v1, c1 = _parse_ars_or_usd(nxt[1] if len(nxt) > 1 else None)
+                for v, c in ((v0, c0), (v1, c1)):
+                    if v is None:
+                        continue
+                    if c == "USD":
+                        minimum_usd = v
+                    else:
+                        minimum_ars = v if minimum_ars is None else minimum_ars
+                i += 2
+                continue
+
+        # "Próximo resumen" — la fila tiene "Cierre: DD/MM/YYYY" en col 2
+        if "próximo resumen" in text or "proximo resumen" in text:
+            # Las dos siguientes filas tienen "Cierre: ..." y "Vencimiento: ..."
+            for j in range(i + 1, min(i + 4, n)):
+                trow = _row_text(rows[j]).lower()
+                if "cierre" in trow:
+                    cell = rows[j][1] if len(rows[j]) > 1 else None
+                    next_closing_date = _parse_card_date(cell)
+                if "vencimiento" in trow:
+                    cell = rows[j][1] if len(rows[j]) > 1 else None
+                    next_due_date = _parse_card_date(cell)
+            i += 1
+            continue
+
+        # Holder: "<Marca> Crédito terminada en NNNN" + col 2 con "(Titular)"
+        if holder is None and len(row) > 1 and row[1] and "titular" in str(row[1]).lower():
+            holder = re.sub(r"\s*\(Titular\)\s*$", "", str(row[1])).strip() or None
+
+        # Bloques de movimientos: "Pago de tarjeta y devoluciones" (skipear) /
+        # "Tarjeta de <holder>" (capturar movimientos hasta "Total de ...")
+        if "pago de tarjeta y devoluciones" in text:
+            in_payments_block = True
+            in_purchases_block = False
+        elif text.startswith("tarjeta de ") and "terminada en" in text:
+            in_purchases_block = True
+            in_payments_block = False
+            if holder is None:
+                m = re.search(r"tarjeta de (.+?)\s*-", text, re.IGNORECASE)
+                if m:
+                    holder = m.group(1).strip().title()
+        elif text.startswith("total de ") and ("terminada en" in text or "tarjeta" in text):
+            in_purchases_block = False
+            in_payments_block = False
+        elif text.startswith("otros conceptos"):
+            in_purchases_block = False
+            in_payments_block = False
+        elif in_purchases_block and len(row) >= 5:
+            # Fila de movimiento: (fecha, descripción, cuotas, comprobante, ARS, USD)
+            desc = (str(row[1]).strip() if row[1] else "").strip()
+            if desc and desc.lower() not in ("descripción", "descripcion"):
+                amt_ars, _ = _parse_ars_or_usd(row[4] if len(row) > 4 else None)
+                amt_usd, _ = _parse_ars_or_usd(row[5] if len(row) > 5 else None)
+                amount = None
+                currency = None
+                if amt_ars is not None:
+                    amount = abs(amt_ars)
+                    currency = "ARS"
+                elif amt_usd is not None:
+                    amount = abs(amt_usd)
+                    currency = "USD"
+                if amount is not None and amount > 0:
+                    top_purchases.append({
+                        "date": _parse_card_date(row[0] if len(row) > 0 else None),
+                        "description": desc,
+                        "amount": amount,
+                        "currency": currency,
+                    })
+
+        i += 1
+
+    # Sin total ni fechas reconocibles → xlsx no es un resumen válido.
+    if total_ars is None and total_usd is None and not closing_date and not due_date:
+        return None
+
+    # Top 5 movimientos por monto absoluto, separando ARS/USD.
+    ars_purchases = sorted(
+        (p for p in top_purchases if p["currency"] == "ARS"),
+        key=lambda p: p["amount"],
+        reverse=True,
+    )[:5]
+    usd_purchases = sorted(
+        (p for p in top_purchases if p["currency"] == "USD"),
+        key=lambda p: p["amount"],
+        reverse=True,
+    )[:3]
+
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    return {
+        "brand": brand,
+        "last4": last4,
+        "holder": holder,
+        "closing_date": closing_date,
+        "due_date": due_date,
+        "next_closing_date": next_closing_date,
+        "next_due_date": next_due_date,
+        "total_ars": total_ars,
+        "total_usd": total_usd,
+        "minimum_ars": minimum_ars,
+        "minimum_usd": minimum_usd,
+        "top_purchases_ars": ars_purchases,
+        "top_purchases_usd": usd_purchases,
+        "source_file": path.name,
+        "source_mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
+        "all_purchases": top_purchases,  # extra para el render de nota
+    }
+
+
+def _card_note_filename(card: dict) -> str | None:
+    """Construye el filename de la nota .md para una tarjeta parseada.
+
+    Convención: `Tarjeta-<Marca>-<Últimos4>-YYYY-MM.md`, donde YYYY-MM es
+    el `closing_date.year-month`. Si no hay `closing_date` ni
+    `due_date` reconocible, devuelve None — sin ancla temporal no
+    podemos diferenciar ciclos. Garantiza que re-exportar el mismo
+    ciclo SOBREESCRIBE la nota (mismo filename), pero un ciclo nuevo
+    crea una nota nueva.
+
+    Marca + last4 son obligatorios. Si falta alguno, devuelve None
+    (xlsx mal formado / parser falló parcialmente).
+    """
+    brand = (card.get("brand") or "").strip()
+    last4 = (card.get("last4") or "").strip()
+    if not brand or not last4:
+        return None
+    cycle = card.get("closing_date") or card.get("due_date")
+    if not cycle:
+        return None
+    yyyy_mm = cycle[:7]  # "2026-03-26" → "2026-03"
+    return f"Tarjeta-{brand}-{last4}-{yyyy_mm}.md"
+
+
+def _card_render_note(card: dict) -> str:
+    """Renderiza una nota markdown para un resumen de tarjeta parseado.
+
+    Frontmatter estructurado para que el chat tool format y el retriever
+    tengan los mismos campos visibles. Body con un párrafo TL;DR (cuánto
+    debo, cuándo cierra/vence) y los top movimientos en tablas separadas
+    ARS/USD para que las dos monedas tengan visibilidad cuando el user
+    pregunta "qué gasté en marzo en la Visa".
+
+    Determinístico: dado el mismo `card` dict siempre devuelve el mismo
+    string. Eso habilita el hash-skip del indexador (no escribir si el
+    contenido es idéntico al .md previo).
+    """
+    brand = card.get("brand") or "?"
+    last4 = card.get("last4") or "????"
+    holder = card.get("holder") or ""
+    closing = card.get("closing_date") or ""
+    due = card.get("due_date") or ""
+    next_closing = card.get("next_closing_date") or ""
+    next_due = card.get("next_due_date") or ""
+    total_ars = card.get("total_ars")
+    total_usd = card.get("total_usd")
+    minimum_ars = card.get("minimum_ars")
+    minimum_usd = card.get("minimum_usd")
+    src_file = card.get("source_file") or ""
+    cycle_yyyy_mm = (closing or due or "")[:7]
+
+    def _fmt_ars(v: float | None) -> str:
+        if v is None:
+            return "—"
+        # ES locale: punto miles, coma decimal.
+        s = f"{v:,.2f}"  # `1,234,567.89` → en-US
+        # Swap: `,` ↔ `.`
+        return s.replace(",", "_TMP_").replace(".", ",").replace("_TMP_", ".")
+
+    def _fmt_usd(v: float | None) -> str:
+        if v is None:
+            return "—"
+        return f"{v:,.2f}".replace(",", "_TMP_").replace(".", ",").replace("_TMP_", ".")
+
+    # Frontmatter — claves estables, valores YAML-safe (sin chars
+    # especiales que requieran quoting). `tags` ayuda a filtros del retriever.
+    fm: list[str] = ["---"]
+    fm.append("type: finanzas")
+    fm.append("source: tarjeta")
+    fm.append(f"brand: {brand}")
+    fm.append(f"last4: \"{last4}\"")  # quote: empieza con dígito, evitar coerción a int
+    if holder:
+        fm.append(f"holder: {holder}")
+    if cycle_yyyy_mm:
+        fm.append(f"cycle: {cycle_yyyy_mm}")
+    if closing:
+        fm.append(f"closing_date: {closing}")
+    if due:
+        fm.append(f"due_date: {due}")
+    if next_closing:
+        fm.append(f"next_closing_date: {next_closing}")
+    if next_due:
+        fm.append(f"next_due_date: {next_due}")
+    if total_ars is not None:
+        fm.append(f"total_ars: {total_ars:.2f}")
+    if total_usd is not None:
+        fm.append(f"total_usd: {total_usd:.2f}")
+    if minimum_ars is not None:
+        fm.append(f"minimum_ars: {minimum_ars:.2f}")
+    if minimum_usd is not None:
+        fm.append(f"minimum_usd: {minimum_usd:.2f}")
+    tags = ["finanzas", "tarjeta", brand.lower()]
+    fm.append(f"tags: [{', '.join(tags)}]")
+    fm.append("ambient: skip")
+    if src_file:
+        fm.append(f"source_file: {src_file}")
+    fm.append("---")
+    fm.append("")
+
+    # Body — TL;DR primero, después tablas.
+    title = f"# Tarjeta {brand} ·{last4} — ciclo {cycle_yyyy_mm or 'sin fecha'}"
+    body: list[str] = [title, ""]
+    if holder:
+        body.append(f"Titular: **{holder}**.")
+        body.append("")
+
+    # Resumen del ciclo — el LLM lo cita literal por REGLA 1.b.
+    parts: list[str] = []
+    if total_ars is not None:
+        parts.append(f"total ARS **${_fmt_ars(total_ars)}**")
+    if total_usd is not None:
+        parts.append(f"total USD **U$S{_fmt_usd(total_usd)}**")
+    if parts:
+        body.append("Total a pagar este ciclo: " + " · ".join(parts) + ".")
+    if closing or due:
+        body.append(f"Fecha de cierre: **{closing or '—'}** · Fecha de vencimiento: **{due or '—'}**.")
+    if minimum_ars is not None or minimum_usd is not None:
+        mins: list[str] = []
+        if minimum_ars is not None:
+            mins.append(f"ARS **${_fmt_ars(minimum_ars)}**")
+        if minimum_usd is not None:
+            mins.append(f"USD **U$S{_fmt_usd(minimum_usd)}**")
+        body.append("Mínimo a pagar: " + " · ".join(mins) + ".")
+    if next_closing or next_due:
+        body.append(f"Próximo ciclo — cierre: {next_closing or '—'} · vencimiento: {next_due or '—'}.")
+    body.append("")
+
+    # Tabla de top movimientos ARS.
+    ars = card.get("top_purchases_ars") or []
+    if ars:
+        body.append("## Top movimientos ARS")
+        body.append("")
+        body.append("| Fecha | Descripción | Monto |")
+        body.append("|---|---|---:|")
+        for p in ars:
+            d = p.get("date") or ""
+            desc = (p.get("description") or "").replace("|", "\\|")
+            amt = p.get("amount")
+            body.append(f"| {d} | {desc} | ${_fmt_ars(amt)} |")
+        body.append("")
+
+    usd = card.get("top_purchases_usd") or []
+    if usd:
+        body.append("## Top movimientos USD")
+        body.append("")
+        body.append("| Fecha | Descripción | Monto |")
+        body.append("|---|---|---:|")
+        for p in usd:
+            d = p.get("date") or ""
+            desc = (p.get("description") or "").replace("|", "\\|")
+            amt = p.get("amount")
+            body.append(f"| {d} | {desc} | U$S{_fmt_usd(amt)} |")
+        body.append("")
+
+    # Lista plana de TODOS los movimientos para que retrieval por descripción
+    # funcione (ej. "claro deb aut" o "merpago idilica" disparan match
+    # exacto). No queremos solo top-5 acá — el reranker puede traer la nota
+    # entera si la query menciona una merchant específica.
+    all_p = card.get("all_purchases") or []
+    if all_p:
+        body.append("## Todos los movimientos")
+        body.append("")
+        for p in all_p:
+            d = p.get("date") or ""
+            desc = (p.get("description") or "").replace("|", "\\|")
+            cur = p.get("currency") or ""
+            amt = p.get("amount")
+            if cur == "USD":
+                body.append(f"- {d} — {desc} — U$S{_fmt_usd(amt)}")
+            else:
+                body.append(f"- {d} — {desc} — ${_fmt_ars(amt)}")
+        body.append("")
+
+    body.append(f"_Fuente: `{src_file}` (export del banco)._")
+    body.append("")
+
+    return "\n".join(fm + body)
+
+
+def _sync_credit_cards_notes(vault_root: Path) -> dict:
+    """Regenerate per-cycle credit-card notes from the xlsx exports in
+    `MOZE_BACKUP_DIR` (same `/Finances` folder). Mirrors the MOZE pattern:
+    one note per (card, cycle), hash-skip if content is unchanged, prune
+    notes whose source xlsx no longer exists.
+
+    Returns stats for logging:
+      {ok, files_total, files_written, files_skipped, target}
+    or {ok=False, reason} on no-source / unparseable.
+
+    Silent-fail patterns:
+      - No xlsx in `/Finances` → `{ok: False, reason: "no_xlsx"}`
+      - Some xlsx fail to parse → continue with the rest, count failures
+      - openpyxl missing → first xlsx returns None, all do, "no_parsed"
+    """
+    try:
+        seen: set[Path] = set()
+        for pattern in ("Último resumen*.xlsx", "Ultimo resumen*.xlsx"):
+            for p in MOZE_BACKUP_DIR.glob(pattern):
+                seen.add(p)
+        files = sorted(seen, key=lambda p: p.name)
+    except Exception as exc:
+        return {"ok": False, "reason": f"glob: {exc}"}
+    if not files:
+        return {"ok": False, "reason": "no_xlsx"}
+
+    target_dir = vault_root / TARJETAS_VAULT_SUBPATH
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "reason": f"mkdir: {exc}"}
+
+    written = 0
+    skipped = 0
+    parse_failed = 0
+    current_set: set[str] = set()
+
+    for xlsx in files:
+        card = _parse_credit_card_xlsx(xlsx)
+        if not card:
+            parse_failed += 1
+            continue
+        fname = _card_note_filename(card)
+        if not fname:
+            # brand/last4/cycle missing — can't name deterministically.
+            parse_failed += 1
+            continue
+        current_set.add(fname)
+        body = _card_render_note(card)
+        path = target_dir / fname
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if existing == body:
+            skipped += 1
+            continue
+        path.write_text(body, encoding="utf-8")
+        written += 1
+
+    # Prune .md whose source no longer exists. Conservative: only delete
+    # files matching our `Tarjeta-*.md` naming scheme so we don't nuke
+    # user-authored notes the same folder might contain.
+    for p in target_dir.glob("Tarjeta-*.md"):
+        if p.name not in current_set:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    if not current_set and parse_failed:
+        return {"ok": False, "reason": "no_parsed"}
+
+    return {
+        "ok": True,
+        "files_total": len(files),
+        "files_written": written,
+        "files_skipped": skipped,
+        "files_parse_failed": parse_failed,
+        "target": str(target_dir.relative_to(vault_root)),
+    }
+
+
 _WHATSAPP_ETL_SCRIPT = Path.home() / ".local/bin/whatsapp-to-vault"
 _WHATSAPP_ETL_RE = re.compile(
     r"wrote\s+(\d+)\s+files,\s+(\d+)\s+unchanged,\s+(\d+)\s+\(chat, month\)\s+buckets,\s+(\d+)\s+chats"
@@ -18044,6 +18640,14 @@ class RetrieveResult:
     extras: dict = field(default_factory=dict)
     intent: str | None = None
     vault_scope: list[str] = field(default_factory=list)
+    # Audit 2026-04-25 (commit e81251f2): trackeamos las iteraciones del
+    # deep_retrieve loop y el exit reason para que `rag_queries.extra_json`
+    # los persista. El código setea estos via `result["..."] = ...` —
+    # `__setitem__` requiere que sean fields legítimos. Sin esto, el
+    # `rag query` CLI explotaba con KeyError porque ese commit agregó
+    # los writes pero NO los fields.
+    deep_retrieve_iterations: int = 0
+    deep_retrieve_exit_reason: str = ""
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 
@@ -23864,6 +24468,28 @@ def _run_cross_source_etls(vault_path: Path) -> None:
             )
     except Exception as exc:
         console.print(f"[yellow]MOZE sync falló: {exc}[/yellow]")
+
+    # Tarjetas de crédito (xlsx del banco) → 1 nota .md por (tarjeta, ciclo).
+    # Mismo dir `/Finances` que los CSV de MOZE. Pre 2026-04-26 las tarjetas
+    # NO tenían notas en el vault — el chat solo las consultaba via tool
+    # live (`credit_cards_summary`) gateado por keyword en el pre-router.
+    # Ahora indexamos las notas para habilitar retrieval semántico:
+    # `retrieve("gastos visa marzo")` levanta la nota correcta aunque el
+    # pre-router no fire. El tool live se mantiene en paralelo (REGLA 1.b).
+    try:
+        cards_stats = _sync_credit_cards_notes(vault_path)
+        if cards_stats.get("ok") and cards_stats.get("files_written"):
+            console.print(
+                f"[dim]Tarjetas sync: {cards_stats['files_written']} notas nuevas/modificadas "
+                f"de {cards_stats['files_total']} xlsx → {cards_stats['target']}/[/dim]"
+            )
+        elif cards_stats.get("ok") and cards_stats.get("files_skipped"):
+            console.print(
+                f"[dim]Tarjetas sync: skip ({cards_stats['files_skipped']}/"
+                f"{cards_stats['files_total']} sin cambios)[/dim]"
+            )
+    except Exception as exc:
+        console.print(f"[yellow]Tarjetas sync falló: {exc}[/yellow]")
 
     # WhatsApp ETL → reads whatsapp-bridge SQLite, writes monthly per-chat
     # `.md` so the rglob below absorbs them. Same script that

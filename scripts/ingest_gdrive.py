@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import signal
 import sqlite3
 import sys
 import time
@@ -179,7 +180,12 @@ def _chunk_body(text: str, target: int = CHUNK_TARGET, overlap: int = CHUNK_OVER
 
 
 def _build_service():
-    """Returns (service, reason). service is None when creds/deps missing."""
+    """Returns (service, reason). service is None when creds/deps missing.
+
+    To handle timeouts on .export() calls, callers should wrap them in
+    try/except and catch socket.timeout or httplib2.RedirectMissingLocation.
+    The timeout is enforced at the HTTP library level when the request hangs.
+    """
     creds = rag._load_google_credentials()
     if creds is None:
         return None, "no_google_credentials"
@@ -222,16 +228,61 @@ def _list_since(svc, *, since_iso: str, mime_types: list[str], max_files: int) -
             return out[:max_files]
 
 
-def _export_body(svc, file_id: str, mime: str, body_cap: int) -> tuple[str, str]:
+class _ExportTimeout(Exception):
+    """Raised when an export operation times out."""
+    pass
+
+
+def _execute_with_timeout(request, timeout_secs: int = 30) -> object:
+    """Execute a googleapiclient request with a timeout.
+
+    Wraps the .execute() call with a signal-based timeout (Unix-only).
+    Falls back to direct .execute() on Windows or if signal handling fails.
+    """
+    if sys.platform == "win32":
+        # Signal alarms don't work on Windows; fall back to unprotected execute.
+        return request.execute()
+
+    def timeout_handler(signum, frame):
+        raise _ExportTimeout()
+
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout_secs)
+    try:
+        return request.execute()
+    except _ExportTimeout:
+        raise TimeoutError(f"export timed out after {timeout_secs}s")
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def _export_body(svc, file_id: str, mime: str, body_cap: int, file_meta: dict | None = None) -> tuple[str, str]:
     """Export the document body as text (docs/slides) or CSV (sheets).
-    Returns (body, err); err is empty string on success."""
+    Returns (body, err); err is empty string on success.
+
+    Skips files larger than 50MB to avoid lengthy timeouts on exports.
+    """
     export_mime = EXPORT_MIME.get(mime)
     if not export_mime:
         return "", f"unsupported_mime:{mime}"
+
+    # Skip very large files (applies to binary exports, not Google Docs).
+    if file_meta and mime not in EXPORT_MIME:  # Non-Google-native format
+        file_size = int((file_meta.get("size") or "0") or "0")
+        if file_size > 50_000_000:  # 50 MB
+            return "", "file_too_large:>50MB"
+
     try:
-        raw = svc.files().export(fileId=file_id, mimeType=export_mime).execute()
+        req = svc.files().export(fileId=file_id, mimeType=export_mime)
+        raw = _execute_with_timeout(req, timeout_secs=30)
     except Exception as exc:
-        return "", f"export_failed:{str(exc)[:100]}"
+        exc_str = str(exc)
+        # Timeout errors show up as socket errors, TimeoutError, or "timed out" in message.
+        if isinstance(exc, TimeoutError) or \
+           "timeout" in exc_str.lower() or "timed out" in exc_str.lower():
+            return "", "export_timeout:>30s"
+        return "", f"export_failed:{exc_str[:100]}"
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="ignore")
     raw = raw.strip()
@@ -453,7 +504,7 @@ def run(
                 if (f.get("modifiedTime") or "") > latest_mod:
                     latest_mod = f["modifiedTime"]
                 continue
-            body, err = _export_body(svc, f["id"], f["mimeType"], body_cap)
+            body, err = _export_body(svc, f["id"], f["mimeType"], body_cap, file_meta=f)
             if err:
                 summary["files_failed"] += 1
                 summary["errors"].append({

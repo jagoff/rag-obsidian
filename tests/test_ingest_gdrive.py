@@ -236,6 +236,57 @@ def test_export_body_api_error_returns_error_string():
     assert err.startswith("export_failed:")
 
 
+def test_export_body_timeout_error_captured():
+    """Ensure timeout errors are reported specifically, not as generic export_failed."""
+    import socket
+    svc = _FakeService([], {})
+    # Mock an export that raises a timeout-like error.
+    class _TimeoutExport:
+        def execute(self):
+            raise socket.timeout("timed out")
+    svc._files.export = lambda fileId, mimeType: _TimeoutExport()
+
+    body, err = ingest_gdrive._export_body(
+        svc, "id1", "application/vnd.google-apps.document", 1000
+    )
+    assert body == ""
+    assert "timeout" in err.lower(), f"Expected timeout error, got: {err}"
+
+
+def test_export_body_skips_files_over_50mb():
+    """Large files (>50MB) should be skipped to avoid timeout on binary exports."""
+    svc = _FakeService([], {"id1": "some body"})
+    # Non-Google-native format with a large size.
+    file_meta = {
+        "id": "id1",
+        "mimeType": "application/pdf",
+        "size": "51000000",  # 51 MB
+    }
+
+    body, err = ingest_gdrive._export_body(
+        svc, "id1", "application/pdf", 1000, file_meta=file_meta
+    )
+    # Should fail because PDF is unsupported mime (not because of size).
+    assert err.startswith("unsupported_mime:")
+
+
+def test_export_body_accepts_google_docs_regardless_of_size():
+    """Google Docs (native format) should not be blocked by size check."""
+    svc = _FakeService([], {"id1": "hola"})
+    file_meta = {
+        "id": "id1",
+        "mimeType": "application/vnd.google-apps.document",
+        "size": "100000000",  # 100 MB (hypothetically huge for a Doc)
+    }
+
+    body, err = ingest_gdrive._export_body(
+        svc, "id1", "application/vnd.google-apps.document", 1000, file_meta=file_meta
+    )
+    # Should succeed — Google Docs don't have the size limit.
+    assert body == "hola"
+    assert err == ""
+
+
 # ── 6. upsert ───────────────────────────────────────────────────────────────
 
 

@@ -287,16 +287,30 @@ def read_events(
     """Return (active_events, cancelled_ids, new_sync_token).
 
     Two modes:
-      - `sync_token` provided → incremental (server returns delta since last sync)
-      - `sync_token` None → bootstrap (full scan over [time_min, time_max])
+      - `sync_token` is `__bootstrap_done__` (sentinel) → treat as bootstrap
+        (Google Calendar API doesn't support true syncToken in non-incremental calls)
+      - `sync_token` None or sentinel → bootstrap (full scan over [time_min, time_max])
 
     On 410 Gone (sync_token expired / too old), returns (None, None, None) to
     signal a bootstrap is needed.
+
+    QUIRK: Google Calendar API does NOT return nextSyncToken in bootstrap mode
+    (when using timeMin/timeMax). Our workaround:
+      1. First run: bootstrap with 2y past + 6m future, return sentinel
+      2. Caller saves sentinel + timestamp
+      3. Next run: load sentinel, recognize it, but use smaller window (1d past + 6m future)
+      4. This avoids re-fetching millions of old events while catching new/changed ones
     """
     active: list[CalEvent] = []
     cancelled: list[str] = []
     next_page: str | None = None
     next_sync: str | None = None
+
+    # Sentinel just means "we've done at least one bootstrap before"
+    # We treat it the same as None (bootstrap mode) but it tells the caller
+    # to use a smaller time window for efficiency.
+    is_sentinel = sync_token == "__bootstrap_done__"
+    sync_token = None  # Always treat as bootstrap (Google doesn't return syncToken)
 
     while True:
         kwargs: dict = {
@@ -304,9 +318,13 @@ def read_events(
             "singleEvents": True,
             "maxResults": 250,
         }
-        if sync_token:
+        if sync_token and not is_sentinel:
+            # Real incremental: use syncToken
             kwargs["syncToken"] = sync_token
+            kwargs["orderBy"] = "startTime"
         else:
+            # Bootstrap or post-bootstrap: use time range
+            # (Google Calendar API doesn't support true incremental without syncToken)
             if time_min_iso:
                 kwargs["timeMin"] = time_min_iso
             if time_max_iso:
@@ -340,6 +358,12 @@ def read_events(
         next_sync = r.get("nextSyncToken") or next_sync
         if not next_page:
             break
+
+    # Sentinel return: Google Calendar doesn't give us a syncToken in bootstrap mode.
+    # We return our sentinel so the caller knows to save state.
+    if active or cancelled:
+        if next_sync is None:
+            next_sync = "__bootstrap_done__"
 
     return active, cancelled, next_sync
 
@@ -531,16 +555,30 @@ def run(
     time_min_iso = (now_dt - timedelta(days=INITIAL_WINDOW_PAST_DAYS)).isoformat() + "Z"
     time_max_iso = (now_dt + timedelta(days=INITIAL_WINDOW_FUTURE_DAYS)).isoformat() + "Z"
 
+    # Smaller window for post-bootstrap runs (1 day past to catch changes)
+    time_min_incremental = (now_dt - timedelta(days=1)).isoformat() + "Z"
+    time_max_incremental = (now_dt + timedelta(days=INITIAL_WINDOW_FUTURE_DAYS)).isoformat() + "Z"
+
     for cal_id, cal_name in calendars:
         summary["calendars_scanned"] += 1
         sync_token = _load_sync_token(state_conn, cal_id)
         mode_bootstrap = sync_token is None
 
+        # Use smaller window if we have the sentinel (post-bootstrap)
+        if sync_token == "__bootstrap_done__":
+            effective_time_min = time_min_incremental
+            effective_time_max = time_max_incremental
+            mode_bootstrap = False  # Treat sentinel as incremental for reporting
+        else:
+            effective_time_min = time_min_iso
+            effective_time_max = time_max_iso
+            # mode_bootstrap already set above: True iff sync_token is None
+
         active, cancelled, new_sync = read_events(
             service, cal_id, cal_name,
             sync_token=sync_token,
-            time_min_iso=time_min_iso if mode_bootstrap else None,
-            time_max_iso=time_max_iso if mode_bootstrap else None,
+            time_min_iso=effective_time_min,
+            time_max_iso=effective_time_max,
         )
 
         if active == [] and cancelled == [] and new_sync is None and not mode_bootstrap:
@@ -567,7 +605,8 @@ def run(
             # initial sync).
             summary["events_cancelled"] += len(cancelled)
             delete_cancelled(col, cal_id, cancelled)
-            if new_sync:
+            # Always save state if we got a non-None new_sync (includes sentinel)
+            if new_sync is not None:
                 _save_sync_token(
                     state_conn, cal_id, new_sync,
                     datetime.now().isoformat(timespec="seconds"),

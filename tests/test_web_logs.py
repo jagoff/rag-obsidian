@@ -23,6 +23,7 @@ No testeamos:
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -561,11 +562,100 @@ def test_diagnose_error_prompt_caps_context_at_20():
     assert "line 29" not in prompt
 
 
-def test_api_diagnose_error_execute_disabled():
-    """Por seguridad, /api/diagnose-error/execute devuelve 503."""
-    resp = _client.post("/api/diagnose-error/execute", json={"command": "echo hi"})
-    assert resp.status_code == 503
-    assert "deshabilitada" in resp.json()["detail"].lower()
+# ── Whitelist del execute endpoint ────────────────────────────────────
+
+@pytest.mark.parametrize("cmd", [
+    "launchctl kickstart -k gui/501/com.fer.obsidian-rag-watch",
+    "launchctl kickstart -k com.fer.obsidian-rag-watch",
+    "launchctl list com.fer.obsidian-rag-watch",
+    "tail -50 /Users/fer/.local/share/obsidian-rag/watch.log",
+    "tail -n 100 /Users/fer/.local/share/obsidian-rag/watch.log",
+    "wc -l /Users/fer/.local/share/obsidian-rag/watch.log",
+    "rag stats",
+    "rag vault list",
+])
+def test_validate_safe_command_accepts_whitelist(cmd):
+    argv, reason = _server._validate_safe_command(cmd)
+    assert argv is not None, f"esperaba aceptar {cmd!r}, rechazó: {reason}"
+    assert reason == ""
+
+
+@pytest.mark.parametrize("cmd, expected_reason_substr", [
+    ("rm -rf /", "no está en la whitelist"),
+    ("sudo launchctl kickstart com.fer.obsidian-rag-watch", "no está en la whitelist"),
+    ("tail watch.log; rm -rf /", "metacharacter shell prohibido"),
+    ("tail watch.log && echo done", "metacharacter shell prohibido"),
+    ("tail $(echo /etc/passwd)", "metacharacter shell prohibido"),
+    ("tail watch.log | grep error", "metacharacter shell prohibido"),
+    ("tail watch.log > /tmp/x", "metacharacter shell prohibido"),
+    ("tail /etc/passwd", "argumentos inválidos"),
+    ("tail -f /Users/fer/.local/share/obsidian-rag/watch.log", "argumentos inválidos"),
+    ("launchctl kickstart -k com.fer.OTHER.daemon", "argumentos inválidos"),
+    ("launchctl bootout gui/501/com.fer.obsidian-rag-watch", "argumentos inválidos"),
+    ("rag index", "argumentos inválidos"),
+    ("rag query foo", "argumentos inválidos"),
+    ("cat /etc/passwd", "argumentos inválidos"),
+    ("/bin/tail watch.log", "no es un nombre simple"),
+    ("", "vacío"),
+    ("a" * 600, "demasiado largo"),
+])
+def test_validate_safe_command_rejects(cmd, expected_reason_substr):
+    argv, reason = _server._validate_safe_command(cmd)
+    assert argv is None, f"esperaba rechazar {cmd!r}, aceptó como {argv}"
+    assert expected_reason_substr in reason or expected_reason_substr.replace("no es un nombre simple", "nombre simple") in reason
+
+
+def test_api_diagnose_error_execute_rejects_dangerous():
+    """Endpoint debe rechazar con 403 cualquier comando fuera del whitelist."""
+    resp = _client.post(
+        "/api/diagnose-error/execute",
+        json={"command": "rm -rf /"},
+    )
+    assert resp.status_code == 403
+    assert "rechazado" in resp.json()["detail"].lower()
+
+
+def test_api_diagnose_error_execute_audit_log(tmp_path: Path, monkeypatch):
+    """Cada ejecución (aceptada o rechazada) debe escribir audit log."""
+    audit_path = tmp_path / "diagnose_executions.jsonl"
+    monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
+
+    # Trigger un reject.
+    resp = _client.post(
+        "/api/diagnose-error/execute",
+        json={"command": "rm -rf /"},
+    )
+    assert resp.status_code == 403
+    assert audit_path.is_file()
+    lines = audit_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["rejected"] is True
+    assert rec["command_original"] == "rm -rf /"
+    assert "no está en la whitelist" in rec["reason"]
+
+
+def test_api_diagnose_error_execute_runs_safe_command(tmp_path: Path, monkeypatch):
+    """Endpoint ejecuta `wc -l <log_path>` y devuelve exit_code=0."""
+    audit_path = tmp_path / "diagnose_executions.jsonl"
+    monkeypatch.setattr(_server, "_DIAGNOSE_AUDIT_LOG", audit_path)
+
+    log_dir = Path.home() / ".local/share/obsidian-rag"
+    if not log_dir.is_dir():
+        pytest.skip("no obsidian-rag log dir on this machine")
+    candidates = [p for p in log_dir.iterdir() if p.is_file() and p.suffix == ".log"]
+    if not candidates:
+        pytest.skip("no .log files to test against")
+    sample = candidates[0]
+    cmd = f"wc -l {sample}"
+
+    resp = _client.post("/api/diagnose-error/execute", json={"command": cmd})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["exit_code"] == 0
+    assert "command_executed" in data and isinstance(data["command_executed"], list)
+    # Audit log se escribió.
+    assert audit_path.is_file()
 
 
 def test_static_assets_exist():

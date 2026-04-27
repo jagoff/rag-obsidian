@@ -13095,12 +13095,31 @@ Si no estás seguro, decilo y pedí más contexto en vez de inventar.
 
 ## Comandos sugeridos
 Si hay comandos shell que ayudan, ponelos en bloques ```bash```. Cada
-comando en su propia línea. Ejemplos seguros:
-- `launchctl kickstart -k gui/$(id -u)/com.fer.obsidian-rag-watch` (reiniciar daemon)
-- `tail -50 ~/.local/share/obsidian-rag/watch.log` (inspeccionar log)
-- `rag stats` (verificar índice)
-NO sugieras `rm -rf`, `sudo`, `git push --force` ni nada destructivo
-sin marcarlo EXPLÍCITAMENTE como destructivo y advertir las consecuencias.
+comando en su propia línea, sin pipes (`|`), redirects (`>`), command
+substitution (`$()`), ni encadenamiento (`;`, `&&`). El user va a poder
+clickear "▶ ejecutar" y el server los corre directo — pero hay una
+WHITELIST estricta del lado del server, así que sólo estas formas pasan:
+
+- `launchctl kickstart -k <label>` — reiniciar un daemon. Label debe
+  matchear `com.fer.obsidian-rag-*` o `com.fer.whatsapp-*`. Aceptamos
+  el prefix `gui/501/` opcional. Ejemplos OK:
+  - `launchctl kickstart -k com.fer.obsidian-rag-watch`
+  - `launchctl kickstart -k gui/501/com.fer.obsidian-rag-wa-scheduled-send`
+- `launchctl list com.fer.obsidian-rag-<service>` — ver estado.
+- `launchctl print gui/501/com.fer.obsidian-rag-<service>` — info detallada.
+- `tail [-n N] /Users/fer/.local/share/obsidian-rag/<archivo>.log` — leer log.
+  Soportamos también `tail -50 <path>`. NO uses `-f` (se cuelga).
+- `head [-n N] <log_path>` — primeras N líneas.
+- `wc -l <log_path>` — contar líneas.
+- `cat <log_path>` — todo el archivo.
+- `ls -la /Users/fer/.local/share/obsidian-rag/` — listar logs.
+- `rag stats` / `rag status` / `rag vault list` — CLI read-only.
+
+Cualquier otro comando va a ser RECHAZADO por la whitelist con un 403.
+NUNCA sugieras `rm`, `mv`, `cp`, `sudo`, `bash -c`, `python -c`, `git push`,
+`kill`, ni nada con shell metachars. Si la solución requiere algo así,
+NO lo pongas en un bloque ```bash``` — describilo en prosa para que el
+user lo haga a mano.
 
 NO inventes paths, archivos, o líneas que no estén en el contexto.
 Si el "error" parece un falso positivo del clasificador, decilo.
@@ -13193,31 +13212,357 @@ def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingRes
     )
 
 
+# ── /api/diagnose-error/execute — auto-ejecución segura del LLM ───────
+# El user pidió "que resuelva solo el problema". Esto requiere ejecutar
+# los comandos shell que el LLM sugiere. Como ejecutar shell arbitrario
+# producido por un LLM es peligroso, aplicamos varias capas de defensa:
+#
+#   1. WHITELIST estricta de binarios + validators de argumentos. El
+#      comando se rechaza si su primer token no está en la whitelist.
+#   2. NO usamos `shell=True` — pasamos argv directo a subprocess. Eso
+#      elimina shell metachars (`;`, `|`, `&`, `$()`, backticks, etc.)
+#      como vector de ataque incluso si el shlex parser fallara.
+#   3. Detección defensiva de metachars en el string CRUDO antes de
+#      shlex.split — si el LLM emite `tail watch.log; rm -rf /` lo
+#      cortamos antes de tocarlo.
+#   4. Argumentos validados por whitelist entry — `tail` sólo acepta
+#      paths bajo `~/.local/share/obsidian-rag/`, `launchctl kickstart`
+#      sólo acepta labels que matchean `com.fer.obsidian-rag-*`, etc.
+#   5. Timeout de 15s en subprocess.run para que un comando colgado
+#      no quede vivo.
+#   6. Audit log JSONL en `~/.local/share/obsidian-rag/diagnose_executions.jsonl`
+#      con timestamp + comando original + comando ejecutado + exit_code
+#      + stdout/stderr (truncados). Auditable post-mortem.
+#   7. Rate limit (mismo bucket que /api/chat).
+#
+# Lo que NO está permitido:
+#   - rm, mv, cp, dd (filesystem mutator)
+#   - sudo, su (privilege escalation)
+#   - bash, sh, zsh, python -c (arbitrary code)
+#   - git push, git reset --hard, git checkout (repo mutator)
+#   - kill -9 (signal a procesos arbitrarios — `launchctl kickstart -k`
+#     mata el daemon target específico de forma controlada)
+#   - cualquier cosa con stdin redirigido o pipes
+
+_LOG_DIR_ABS = (Path.home() / ".local/share/obsidian-rag").resolve()
+_DIAGNOSE_AUDIT_LOG = _LOG_DIR_ABS / "diagnose_executions.jsonl"
+_DIAGNOSE_TIMEOUT_S = 15.0
+_DIAGNOSE_OUTPUT_TRUNCATE = 8000  # bytes por stdout/stderr
+
+
+def _is_safe_log_path(arg: str) -> bool:
+    """Path debe estar dentro de _LOG_DIR_ABS."""
+    if not arg:
+        return False
+    try:
+        p = Path(arg).expanduser().resolve()
+    except Exception:
+        return False
+    try:
+        p.relative_to(_LOG_DIR_ABS)
+    except ValueError:
+        return False
+    return True
+
+
+_LAUNCHCTL_LABEL_RE = re.compile(r"^com\.fer\.(obsidian-rag-|whatsapp-)[a-z0-9_-]+$")
+_LAUNCHCTL_GUI_RE = re.compile(r"^gui/\d+/com\.fer\.(obsidian-rag-|whatsapp-)[a-z0-9_-]+$")
+
+
+def _is_safe_launchctl_target(arg: str) -> bool:
+    return bool(_LAUNCHCTL_LABEL_RE.match(arg) or _LAUNCHCTL_GUI_RE.match(arg))
+
+
+def _is_int_string(arg: str) -> bool:
+    return arg.lstrip("-").isdigit() and len(arg) <= 6
+
+
+def _validate_launchctl_args(args: list[str]) -> bool:
+    """`launchctl kickstart [-k|-p|-s] <target>` | `list [<label>]` |
+    `print <target>`."""
+    if not args:
+        return False
+    sub = args[0]
+    if sub == "kickstart":
+        flags_ok = {"-k", "-p", "-s"}
+        rest = args[1:]
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            if rest[i] not in flags_ok:
+                return False
+            i += 1
+        if len(rest) - i != 1:
+            return False
+        return _is_safe_launchctl_target(rest[i])
+    if sub == "list":
+        if len(args) == 1:
+            return True
+        if len(args) == 2:
+            return _is_safe_launchctl_target(args[1])
+        return False
+    if sub == "print":
+        if len(args) != 2:
+            return False
+        return _is_safe_launchctl_target(args[1])
+    return False
+
+
+def _validate_tail_head_args(args: list[str]) -> bool:
+    """`tail [-n N] <log_path>` o `tail -<N> <log_path>` (BSD)."""
+    if not args:
+        return False
+    path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-n" or a == "-c":
+            if i + 1 >= len(args) or not _is_int_string(args[i + 1]):
+                return False
+            i += 2
+            continue
+        if a == "-f":
+            return False  # follow se cuelga
+        if a.startswith("-") and a != "-" and _is_int_string(a):
+            i += 1
+            continue
+        if a.startswith("-"):
+            return False
+        if path is not None:
+            return False
+        path = a
+        i += 1
+    return path is not None and _is_safe_log_path(path)
+
+
+def _validate_wc_args(args: list[str]) -> bool:
+    if not args:
+        return False
+    flags_ok = {"-l", "-c", "-w", "-m"}
+    path = None
+    for a in args:
+        if a in flags_ok:
+            continue
+        if a.startswith("-"):
+            return False
+        if path is not None:
+            return False
+        path = a
+    return path is not None and _is_safe_log_path(path)
+
+
+def _validate_cat_args(args: list[str]) -> bool:
+    if len(args) != 1:
+        return False
+    if args[0].startswith("-"):
+        return False
+    return _is_safe_log_path(args[0])
+
+
+def _validate_rag_args(args: list[str]) -> bool:
+    """Sólo subcomandos read-only de la CLI."""
+    if not args:
+        return False
+    READ_ONLY_SUBCMDS = {"stats", "status", "vault", "version", "config"}
+    if args[0] not in READ_ONLY_SUBCMDS:
+        return False
+    if args[0] == "vault":
+        if len(args) == 1:
+            return True
+        if args[1] in {"list", "info", "ls"}:
+            return len(args) <= 3 and all(not a.startswith("/") for a in args[2:])
+        return False
+    if len(args) > 2:
+        return False
+    if len(args) == 2 and ("/" in args[1] or args[1].startswith("-")):
+        return False
+    return True
+
+
+def _validate_ls_args(args: list[str]) -> bool:
+    flags_ok = {"-l", "-a", "-la", "-al", "-h", "-lh", "-lah", "-laH"}
+    path = None
+    for a in args:
+        if a in flags_ok:
+            continue
+        if a.startswith("-"):
+            return False
+        if path is not None:
+            return False
+        path = a
+    return path is not None and _is_safe_log_path(path)
+
+
+def _which_safe(name: str, candidates: tuple[str, ...]) -> str | None:
+    for c in candidates:
+        if Path(c).is_file():
+            return c
+    return None
+
+
+_SAFE_LAUNCHCTL = _which_safe("launchctl", ("/bin/launchctl",))
+_SAFE_TAIL = _which_safe("tail", ("/usr/bin/tail",))
+_SAFE_HEAD = _which_safe("head", ("/usr/bin/head",))
+_SAFE_WC = _which_safe("wc", ("/usr/bin/wc",))
+_SAFE_CAT = _which_safe("cat", ("/bin/cat",))
+_SAFE_LS = _which_safe("ls", ("/bin/ls",))
+_SAFE_RAG = _which_safe("rag", (
+    str(Path.home() / ".local/bin/rag"),
+    "/usr/local/bin/rag",
+))
+
+_DIAGNOSE_COMMAND_REGISTRY: dict[str, tuple[str | None, "Callable[[list[str]], bool]"]] = {
+    "launchctl": (_SAFE_LAUNCHCTL, _validate_launchctl_args),
+    "tail": (_SAFE_TAIL, _validate_tail_head_args),
+    "head": (_SAFE_HEAD, _validate_tail_head_args),
+    "wc": (_SAFE_WC, _validate_wc_args),
+    "cat": (_SAFE_CAT, _validate_cat_args),
+    "ls": (_SAFE_LS, _validate_ls_args),
+    "rag": (_SAFE_RAG, _validate_rag_args),
+}
+
+# Defense-in-depth: detección de metachars en raw string antes de shlex.
+_DANGEROUS_METACHARS_RE = re.compile(r"[;&|<>`$()\n\r]")
+
+
+def _validate_safe_command(cmd_str: str) -> tuple[list[str] | None, str]:
+    """Validar un comando shell crudo contra la whitelist.
+
+    Retorna `(argv, "")` si es seguro y se puede ejecutar, o `(None,
+    reason)` con un mensaje de error legible.
+    """
+    cmd = (cmd_str or "").strip()
+    if not cmd:
+        return None, "comando vacío"
+    if len(cmd) > 500:
+        return None, "comando demasiado largo (>500 chars)"
+    m = _DANGEROUS_METACHARS_RE.search(cmd)
+    if m:
+        return None, f"metacharacter shell prohibido: {m.group(0)!r}"
+    import shlex
+    try:
+        argv = shlex.split(cmd, posix=True)
+    except ValueError as e:
+        return None, f"comando mal formado: {e}"
+    if not argv:
+        return None, "comando vacío post-parse"
+    binary_name = argv[0]
+    if "/" in binary_name:
+        return None, "el comando debe ser un nombre simple, no un path"
+    entry = _DIAGNOSE_COMMAND_REGISTRY.get(binary_name)
+    if entry is None:
+        return None, f"comando '{binary_name}' no está en la whitelist"
+    abs_path, validator = entry
+    if abs_path is None:
+        return None, f"binario '{binary_name}' no encontrado en el sistema"
+    if not validator(argv[1:]):
+        return None, f"argumentos inválidos para '{binary_name}'"
+    return [abs_path] + argv[1:], ""
+
+
+def _audit_diagnose_execution(record: dict) -> None:
+    """Append-only audit log de ejecuciones. Best-effort."""
+    try:
+        _DIAGNOSE_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _DIAGNOSE_AUDIT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[diagnose-execute] audit log write failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
 class _DiagnoseExecuteRequest(BaseModel):
     command: str = Field(..., description="Comando shell que el LLM sugirió")
 
 
 @app.post("/api/diagnose-error/execute")
-def diagnose_error_execute(req: _DiagnoseExecuteRequest) -> dict:
-    """Auto-ejecutar un comando que el LLM sugirió.
+def diagnose_error_execute(req: _DiagnoseExecuteRequest, request: Request) -> dict:
+    """Auto-ejecutar un comando del LLM, validado contra una whitelist.
 
-    DESHABILITADO en este server por seguridad. El frontend tiene la UI
-    pero ejecutar un comando arbitrario que un LLM produjo (aunque venga
-    en un bloque ```bash```) es un risk vector grande sin una whitelist
-    conservadora + audit log + revisión humana. Por ahora returns 503
-    con un mensaje que sugiere copy-paste manual.
+    Retorna `{exit_code, stdout, stderr, command_executed, command_original,
+    duration_s, timed_out}`. Si el comando no pasa la validación,
+    retorna 403 con `{detail}` describiendo por qué.
 
-    Para habilitarlo en el futuro, ver el plan en
-    `04-Archive/99-obsidian-system/99-Claude/system/diagnose-execute/`
-    (todavía sin escribir — diseño pendiente).
+    Hard timeout 15s. Audit log a `~/.local/share/obsidian-rag/diagnose_executions.jsonl`.
     """
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Auto-ejecución de comandos del LLM está deshabilitada por "
-            "seguridad. Copiá el comando y pegalo a tu terminal."
-        ),
-    )
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
+
+    cmd_original = req.command
+    argv, reason = _validate_safe_command(cmd_original)
+    if argv is None:
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "command_original": cmd_original,
+            "rejected": True,
+            "reason": reason,
+            "client_ip": client_ip,
+        }
+        _audit_diagnose_execution(record)
+        raise HTTPException(
+            status_code=403,
+            detail=f"comando rechazado por la whitelist: {reason}",
+        )
+
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_DIAGNOSE_TIMEOUT_S,
+            shell=False,
+            check=False,
+            cwd=str(Path.home()),
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": str(Path.home()),
+                "LANG": "en_US.UTF-8",
+            },
+        )
+        stdout = (result.stdout or "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        stderr = (result.stderr or "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        exit_code = result.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout.decode("utf-8", "replace") if e.stdout else "")[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        stderr = (
+            (e.stderr.decode("utf-8", "replace") if e.stderr else "")
+            + f"\n[timeout: {_DIAGNOSE_TIMEOUT_S}s]"
+        )[:_DIAGNOSE_OUTPUT_TRUNCATE]
+        exit_code = 124
+        timed_out = True
+    except Exception as e:
+        stdout = ""
+        stderr = f"{type(e).__name__}: {e}"
+        exit_code = -1
+        timed_out = False
+    duration_s = round(time.monotonic() - t0, 3)
+
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "command_original": cmd_original,
+        "command_executed": argv,
+        "exit_code": exit_code,
+        "duration_s": duration_s,
+        "stdout_len": len(stdout),
+        "stderr_len": len(stderr),
+        "timed_out": timed_out,
+        "client_ip": client_ip,
+        "stdout_preview": stdout[:300],
+        "stderr_preview": stderr[:300],
+    }
+    _audit_diagnose_execution(record)
+
+    return {
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "command_executed": argv,
+        "command_original": cmd_original,
+        "duration_s": duration_s,
+        "timed_out": timed_out,
+    }
 
 
 @app.get("/logs")

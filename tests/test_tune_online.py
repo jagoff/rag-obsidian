@@ -308,19 +308,20 @@ def test_rag_explore_scrubbed_from_eval_env():
 
 
 def test_gate_constants_derivation():
-    """Gate constants match el baseline actual (2026-04-23 recalibration).
+    """Gate constants match el baseline actual (2026-04-27 recalibration).
 
-    Pre-2026-04-23 los floors eran 0.7619 / 0.6364 — CI lower bounds del
-    run del 2026-04-17 con n=42 singles. Post queries.yaml expansion
-    (42→60 singles, +18 queries cross-source + synthesis + comparison
-    intencionalmente más duras), el baseline estable cayó a 71.67% /
-    86.67% y los floors se re-derivaron de los nuevos CI lower bounds:
-    singles [60.00, 83.33] y chains [73.33, 96.67]. Ver el bloque de
-    comentarios sobre `GATE_SINGLES_HIT5_MIN` en rag.py para la timeline
-    completa.
+    Timeline:
+    - 2026-04-17: 0.7619 / 0.6364 (CI lower bounds n=42 singles).
+    - 2026-04-23: 0.60 / 0.73 (post queries.yaml expansion 42→60 singles).
+    - 2026-04-27: 0.4074 / 0.52 (post vault reorg golden remap, n=60→54
+      singles, n=12→9 chains; baseline cayó a 53.70% / 72.00% por remoción
+      de paths muertos en .trash/, no por regresión del pipeline). CI lower
+      bounds del menor de las 2 corridas reproducibles post-remap.
+    Ver el bloque de comentarios sobre `GATE_SINGLES_HIT5_MIN` en rag.py
+    para la timeline completa.
     """
-    assert rag.GATE_SINGLES_HIT5_MIN == pytest.approx(0.60, abs=1e-4)
-    assert rag.GATE_CHAINS_HIT5_MIN == pytest.approx(0.73, abs=1e-4)
+    assert rag.GATE_SINGLES_HIT5_MIN == pytest.approx(0.4074, abs=1e-4)
+    assert rag.GATE_CHAINS_HIT5_MIN == pytest.approx(0.52, abs=1e-4)
 
 
 def test_gate_constants_env_override(monkeypatch):
@@ -360,13 +361,18 @@ def test_eval_gate_timeout_returns_none_none():
     assert "timeout" in out.lower()
 
 
-def test_eval_gate_timeout_is_bounded_tightly():
-    """Guard against the timeout creeping back up to 10+ minutes. A
-    dead ollama should fail the gate fast, not block the nightly tune
-    for 10 min.
+def test_eval_gate_timeout_is_bounded():
+    """Guard against the timeout creeping unbounded.
 
-    Introspects _run_eval_gate's subprocess.run call and asserts the
-    timeout kwarg is ≤ 5 min (our target post-audit)."""
+    Post-2026-04-27 the timeout was bumped 300s → 1200s because real
+    eval wall on n=54 singles + n=9 chains over the cross-source corpus
+    is 10-12 min warm. The previous 300s was triggering false-positive
+    auto-rollback every nightly run (singles parsed fine but chains
+    never finished in time). Cap kept ≤ 1800s (30 min) to still fail
+    relatively fast if ollama is down — beyond that means infrastructure
+    issue, not eval slowness.
+    Override via RAG_EVAL_GATE_TIMEOUT_S env var.
+    """
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -380,7 +386,8 @@ def test_eval_gate_timeout_is_bounded_tightly():
         rag._run_eval_gate()
 
     assert captured["timeout"] is not None, "timeout kwarg missing from subprocess.run"
-    assert captured["timeout"] <= 300, (
-        f"eval gate timeout is {captured['timeout']}s — audit target was ≤300s "
-        f"to fail fast when ollama is down. Did it creep up?"
+    assert 600 <= captured["timeout"] <= 1800, (
+        f"eval gate timeout is {captured['timeout']}s — expected in [600, 1800]s "
+        f"range (current default 1200s post-2026-04-27 vault reorg). "
+        f"Override via RAG_EVAL_GATE_TIMEOUT_S if hardware differs."
     )

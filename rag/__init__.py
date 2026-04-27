@@ -29080,15 +29080,22 @@ def _run_eval_gate() -> tuple[float | None, float | None, str]:
     one or both values may be None (treat as regression). Scrubs RAG_EXPLORE
     from subprocess env so the eval run is production-equivalent.
 
-    Timeout sized at 300s (5 min): the real cost on this corpus is 60-100s
-    warm + ~30s cold-start margin for ollama. 10 min was the previous cap
-    — too generous, made `rag tune --online` hang for 10 min if ollama
-    was down instead of failing fast and triggering auto-rollback. The
-    caller treats timeout-as-None the same as a regression, so a too-tight
-    timeout costs us at most one nightly tune cycle.
+    Timeout sized at 1200s (20 min): post 2026-04-27 vault reorg + golden
+    remap (n=54 singles + n=9 chains), real cost is 10-12 min warm under
+    typical conditions. The previous 300s cap was sized when n was smaller
+    AND when chains used a lighter pipeline; with the cross-source corpus
+    (8k+ chunks) and the n=9 chain turns each running a full retrieve(),
+    chains alone now take 5-8 min. 5 min was triggering false-positive
+    auto-rollback every nightly run (observed in online-tune.log:
+    "✗ CI gate falló: No se pudo parsear singles hit@5 (timeout o error)"
+    while singles parsed fine but chains never ran). 20 min is the cold-
+    start margin (ollama unload + reload of qwen2.5:3b helper for
+    reformulate_query in chains).
+    Override via RAG_EVAL_GATE_TIMEOUT_S env if your hardware is faster
+    or slower.
     """
     import subprocess
-    _GATE_TIMEOUT_S = 300
+    _GATE_TIMEOUT_S = int(os.environ.get("RAG_EVAL_GATE_TIMEOUT_S", "1200"))
     env = {k: v for k, v in os.environ.items() if k != "RAG_EXPLORE"}
     assert "RAG_EXPLORE" not in env, "RAG_EXPLORE must not be set during gate eval"
     try:

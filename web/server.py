@@ -8007,7 +8007,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             turn_id = new_turn_id()
             yield _sse("sources", {
                 "items": [],
-                "confidence": None,
+                # confidence ALTA explícita evita que el frontend marque
+                # `weakAnswer=true` y dispare el link "↗ buscar en internet"
+                # — la respuesta es exacta, viene del banco, NO necesita
+                # fallback a Google. Bug observado 2026-04-26.
+                "confidence": 1.0,
                 "intent": "finance",
             })
             yield _sse("status", {
@@ -8024,6 +8028,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 "turn_id": turn_id,
                 "elapsed_ms": total_ms,
                 "mode": "finance",
+                # `source_specific: true` = bypass del fallback de
+                # "buscar en internet" / cluster Google/YouTube/Wiki.
+                # Mismo flag que usan los tools gmail_recent /
+                # calendar_ahead / reminders_due — la data es local,
+                # autoritativa, no necesita escape a la web.
+                "source_specific": True,
             })
             try:
                 append_turn(sess, {

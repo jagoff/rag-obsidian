@@ -42453,16 +42453,29 @@ def _clean_purchase_description(desc: str) -> str:
       "Claro deb aut 000021416263265"  → "Claro"
       "Pago tic ppt adventistas"       → "Pago tic ppt adventistas" (no toca)
       "Rapipago x123456"               → "Rapipago"
+      "Payu*ar*uber"                   → "Payu/ar/uber" (asteriscos como
+                                         separador, no markdown italic)
 
     No agresivo — preserva descripciones que ya son legibles. Solo
     strippea patterns de ruido bancario explícitos.
+
+    También: reemplaza `*` por `/` en el texto restante. El frontend
+    del chat web renderea la respuesta como markdown — los `*` quedan
+    interpretados como italic abriendo/cerrando spans de `<em>`. Para
+    descripciones tipo "Payu*ar*uber" el output era "Payu<em>ar</em>uber".
+    Reemplazar `*` por `/` mantiene el sentido (separador entre componentes
+    del comercio: payu / ar / uber) sin disparar markdown formatting.
     """
     if not desc:
         return ""
     cleaned = _DESC_NOISE_RE.sub("", desc).strip()
     # Si después del clean queda vacío (la regex match consumió todo),
     # fallback al original — mejor algo legible que vacío.
-    return cleaned or desc.strip()
+    cleaned = cleaned or desc.strip()
+    # Escape: asteriscos en descripciones del banco (separadores tipo
+    # "Payu*ar*uber") se renderean como italic en markdown. Cambiarlos
+    # por "/" preserva el sentido sin formatting accidental.
+    return cleaned.replace("*", "/")
 
 
 def _finance_short_circuit_answer(

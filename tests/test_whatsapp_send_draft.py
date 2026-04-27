@@ -908,21 +908,43 @@ def test_propose_whatsapp_send_is_NOT_parallel_safe():
 def test_ollama_tool_client_has_separate_wider_timeout():
     """Regresión 2026-04-24 iter3 (Fer F. "LLM falló: timed out"): el tool-
     decision call (non-streaming, con `tools=` schema de 12 tools) tardaba
-    >45s en qwen2.5:7b con prompts largos. El cliente compartido
-    `_OLLAMA_STREAM_CLIENT` tenía 45s de timeout — cortaba antes de que el
-    LLM terminara de samplear la decisión. Fix: cliente separado
-    `_OLLAMA_TOOL_CLIENT` con 120s de budget, usado sólo para la call de
-    tool-decisión.
+    >45s en qwen2.5:7b con prompts largos. Fix iter1: cliente separado
+    `_OLLAMA_TOOL_CLIENT` con 120s de budget, distinto del
+    `_OLLAMA_STREAM_CLIENT` (45s) usado para streaming.
+
+    Update audit 2026-04-25 ronda 2 (commit 2b7c0c1): el budget bajó de
+    120s → 45s. El razonamiento del audit: 120s era demasiado amplio —
+    si qwen2.5:7b se cuelga (OOM, memory pressure, daemon wedge), el
+    chat queda freeze 2 minutos enteros antes de fallar. qwen2.5 con
+    num_ctx=4096 tarda 1-3s warm + 8-10s cold-load; 45s cubre cold-load
+    + 1-2 retries internos sin colgar la UX.
+
+    Lo que el test SIGUE garantizando post-audit:
+    1. `_OLLAMA_TOOL_CLIENT` es UN CLIENTE SEPARADO (no aliased al
+       `_STREAM_CLIENT`) — la separación importa para httpx connection
+       pooling: las calls de tool-decision (con `tools=` schema) no
+       comparten el pool de las calls de streaming, evitando que un
+       hang en una bloquee la otra.
+    2. Ambos timeouts existen como constantes (no hardcoded inline),
+       mantienen el invariante de "una sola fuente de verdad".
+
+    Si el audit cambia de opinión y vuelve a separar timeouts, este
+    test debería actualizar la aserción de `>=` con un comentario.
     """
     import web.server as srv
     assert hasattr(srv, "_OLLAMA_TOOL_CLIENT"), (
         "_OLLAMA_TOOL_CLIENT debe existir (separado del streaming client)"
     )
-    # Streaming budget sigue siendo conservador (cortamos UX congelada rápido).
+    assert hasattr(srv, "_OLLAMA_STREAM_CLIENT"), (
+        "_OLLAMA_STREAM_CLIENT debe existir"
+    )
+    # Clientes distintos (no es el mismo objeto) — separación de pool.
+    assert srv._OLLAMA_TOOL_CLIENT is not srv._OLLAMA_STREAM_CLIENT
+    # Streaming budget conservador — cortamos UX congelada rápido.
     assert srv._OLLAMA_STREAM_TIMEOUT == 45.0
-    # Tool-decision budget es materialmente más amplio.
-    assert srv._OLLAMA_TOOL_TIMEOUT >= 90.0
-    assert srv._OLLAMA_TOOL_TIMEOUT > srv._OLLAMA_STREAM_TIMEOUT
+    # Tool-decision budget convergió a 45s post-audit ronda 2 (commit
+    # 2b7c0c1, 2026-04-25). Si vuelve a divergir, actualizar este assert.
+    assert srv._OLLAMA_TOOL_TIMEOUT == 45.0
 
 
 def test_tool_addendum_mentions_whatsapp_send():

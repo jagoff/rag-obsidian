@@ -5264,6 +5264,7 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE TABLE IF NOT EXISTS rag_ambient ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " ts TEXT NOT NULL,"
+            " trace_id TEXT,"
             " cmd TEXT,"
             " path TEXT,"
             " hash TEXT,"
@@ -6305,11 +6306,19 @@ def _migrate_trace_id_columns(conn) -> None:
     # DDL inicial → cada sample dispara `OperationalError: no such column:
     # trace_id` cada 60s. 333 errores en 7d, watchdog de memory-pressure
     # ciego. ALTER idempotente en migration ahora cubre las 4 tablas.
+    #
+    # Audit 2026-04-27: rag_ambient también faltaba. 29 errores confirmados
+    # en sql_state_errors.jsonl del 2026-04-25 (ambient_sql_write_failed:
+    # no such column: trace_id). Mismo patrón que cpu/memory metrics: la
+    # tabla existía en DBs pre-trace_id sin la columna. ALTER idempotente
+    # cubre la brecha para despliegues existentes; el CREATE TABLE en
+    # _TELEMETRY_DDL ya tiene trace_id para fresh installs.
     for col_ddl in (
         "ALTER TABLE rag_queries ADD COLUMN trace_id TEXT",
         "ALTER TABLE rag_behavior ADD COLUMN trace_id TEXT",
         "ALTER TABLE rag_cpu_metrics ADD COLUMN trace_id TEXT",
         "ALTER TABLE rag_memory_metrics ADD COLUMN trace_id TEXT",
+        "ALTER TABLE rag_ambient ADD COLUMN trace_id TEXT",
     ):
         try:
             conn.execute(col_ddl)
@@ -7019,12 +7028,12 @@ def _map_contradiction_row(ev: dict) -> dict:
 
 def _map_ambient_row(ev: dict) -> dict:
     out: dict = {}
-    for k in ("ts", "cmd", "path", "hash"):
+    for k in ("ts", "trace_id", "cmd", "path", "hash"):
         if k in ev and ev[k] is not None:
             out[k] = ev[k]
     if "ts" not in out:
         out["ts"] = datetime.now().isoformat(timespec="seconds")
-    known = {"ts", "cmd", "path", "hash"}
+    known = {"ts", "trace_id", "cmd", "path", "hash"}
     extra = {k: v for k, v in ev.items() if k not in known}
     if extra:
         out["payload_json"] = extra
@@ -30094,7 +30103,7 @@ def _collect_week_evidence(
     try:
         with _ragvec_state_conn() as _conn:
             for ts_str, subj, targets_json in _conn.execute(
-                "SELECT ts, subject_path, targets_json FROM rag_contradictions "
+                "SELECT ts, subject_path, contradicts_json FROM rag_contradictions "
                 "WHERE ts >= ? AND ts < ?",
                 (start_iso, end_iso),
             ):

@@ -256,3 +256,58 @@ def test_migration_runs_on_pre_trace_id_db(tmp_path, monkeypatch):
         conn.close()
     assert len(rows) == 1
     assert rows[0] == (tid, "post-migración")
+
+
+def test_migration_adds_trace_id_to_rag_ambient(tmp_path, monkeypatch):
+    """Regression 2026-04-27: rag_ambient faltaba en _migrate_trace_id_columns.
+    29 errores ambient_sql_write_failed: no such column: trace_id registrados
+    en sql_state_errors.jsonl del 2026-04-25 desde una DB pre-trace_id.
+
+    Este test simula el escenario: DB con rag_ambient sin trace_id →
+    _ragvec_state_conn() debe migrarla sin raisear, y _ambient_log_event
+    con trace_id en el payload debe persistirlo como columna (no en payload_json).
+    """
+    db_path = tmp_path / "telemetry.db"
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        legacy.executescript("""
+            CREATE TABLE rag_ambient (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                cmd TEXT,
+                path TEXT,
+                hash TEXT,
+                payload_json TEXT
+            );
+        """)
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_TELEMETRY_DB_FILENAME", "telemetry.db")
+    rag._TELEMETRY_DDL_ENSURED_PATHS.clear()
+
+    with rag._ragvec_state_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(rag_ambient)").fetchall()]
+        assert "trace_id" in cols, f"migración no agregó trace_id a rag_ambient: {cols}"
+
+    monkeypatch.setenv("RAG_LOG_BEHAVIOR_ASYNC", "0")
+    rag._ambient_log_event({
+        "cmd": "test_ambient_event",
+        "trace_id": "ab123456",
+        "path": "test/note.md",
+    })
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT trace_id, cmd, path FROM rag_ambient WHERE cmd = ?",
+            ("test_ambient_event",),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0][0] == "ab123456"
+    assert rows[0][1] == "test_ambient_event"
+    assert rows[0][2] == "test/note.md"

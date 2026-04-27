@@ -89,17 +89,28 @@ def _insert(ts_dt: datetime, *, kind: str, chat: str,
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-def test_signal_registered_in_registry():
-    """Sanity: el decorator registra la signal en SIGNALS."""
+def test_signal_not_in_registry():
+    """DEFERRED: el signal NO debe estar en SIGNALS (causa ~114 silent-errors/día).
+
+    El signal asume columnas `kind`, `source_chat`, `message_preview`, `user`
+    en `rag_wa_tasks` que no existen en producción. Hasta que el ingester
+    per-item exista, la señal no se registra. Ver docstring del módulo.
+    """
     import rag_anticipate
     names = [n for (n, _fn) in rag_anticipate.SIGNALS]
-    assert "question_awaiting" in names
+    assert "question_awaiting" not in names, (
+        "question_awaiting no debe estar registrada — "
+        "tabla rag_wa_tasks no tiene columnas kind/source_chat/message_preview/user"
+    )
 
 
-def test_signal_in_anticipate_tuple():
-    """La signal aparece en el tuple global `rag._ANTICIPATE_SIGNALS`."""
+def test_signal_not_in_anticipate_tuple():
+    """DEFERRED: el signal NO debe aparecer en el tuple global `rag._ANTICIPATE_SIGNALS`."""
     names = [n for (n, _fn) in rag._ANTICIPATE_SIGNALS]
-    assert "question_awaiting" in names
+    assert "question_awaiting" not in names, (
+        "question_awaiting no debe estar en _ANTICIPATE_SIGNALS — "
+        "el signal está deferred hasta que el ingester per-item exista"
+    )
 
 
 def test_empty_table_returns_empty(state_db):

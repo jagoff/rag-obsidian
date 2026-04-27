@@ -1,5 +1,27 @@
 """Signal — Preguntas abiertas en WhatsApp sin respuesta del user.
 
+## ESTADO: DEFERRED — no registrada en SIGNALS (2026-04-27)
+
+Este signal está desactivado porque la tabla `rag_wa_tasks` en producción
+registra INVOCACIONES del CLI `rag wa-tasks` (columnas: id, ts, since,
+chats, items, path, extra_json), NO filas por-pregunta. El signal asume
+un schema extendido con columnas `kind`, `source_chat`, `message_preview`,
+`user` que nunca se implementó.
+
+Mientras el signal estuvo registrado (hasta 2026-04-27) acumulaba
+~114 OperationalError/día en `silent_errors.jsonl` con
+`"no such column: source_chat"`.
+
+Para activarlo se necesita un ingester que inserte una fila por cada
+mensaje clasificado como `kind='question'` — con `source_chat=<jid>`,
+`message_preview=<text>`, `user='me'|'them'` — cuando `rag wa-tasks` corre.
+Hasta que ese ingester exista, la función vive acá como spec pero NO se
+registra: el decorator `@register_signal` fue reemplazado por una definición
+directa. Los tests del módulo siguen siendo válidos como especificación de
+la lógica; solo los tests de registry comprueban que NO está registrada.
+
+---
+
 Detecta el patrón clásico de "me preguntaste algo, no te contesté, y pasaron
 días". Fuente primaria: la SQL table `rag_wa_tasks` poblada por el comando
 `rag wa-tasks` (que clasifica mensajes de los chats con kind=question /
@@ -43,24 +65,14 @@ locked, SQL malformado) → `[]`. El contrato del framework es "nunca tirar
 desde una signal"; el orchestrator tiene un outer try/except pero este
 doble cinturón es lo que se espera. Los `_silent_log` aseguran que si algo
 falla silenciosamente quede un rastro en `silent_errors.jsonl`.
-
-## Nota sobre el schema de producción
-
-La tabla `rag_wa_tasks` en producción hoy (schema ~2026-04-21) registra
-INVOCACIONES del CLI `rag wa-tasks` (columnas: id, ts, since, chats, items,
-path, extra_json) — NO filas por-pregunta. Este signal asume que el schema
-evolucionó / se extendió para incluir columnas `kind`, `source_chat`,
-`message_preview`, `user`. Si esas columnas no existen, el `SELECT`
-fallará con OperationalError → silent-fail → `[]`. Si/cuando el schema se
-extienda el signal empieza a emitir solo. Los tests crean la tabla con las
-columnas extendidas para ejercitar la lógica happy-path.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from rag_anticipate.signals.base import register_signal
+# `register_signal` no se importa — este signal está DEFERRED.
+# Ver el docstring del módulo para el motivo.
 
 
 # Ventana máxima de edad de la pregunta (días). Más allá el contexto está
@@ -110,7 +122,8 @@ def _parse_ts(raw) -> datetime | None:
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
-@register_signal(name="question_awaiting", snooze_hours=168)
+# NOT registered — deferred until rag_wa_tasks has per-item rows.
+# See module docstring for the full explanation.
 def question_awaiting_signal(now: datetime) -> list:
     """Emite hasta 2 candidates por preguntas WA ≥3d sin respuesta del user.
 

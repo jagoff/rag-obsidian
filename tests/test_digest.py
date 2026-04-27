@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from datetime import datetime
 
 import click
@@ -19,6 +20,43 @@ def digest_env(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "LOG_PATH", qlog)
     monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", clog)
     return vault, qlog, clog
+
+
+def _open_telemetry_db(tmp_path):
+    """Open a fresh telemetry.db in tmp_path and ensure all tables exist."""
+    db = tmp_path / rag._TELEMETRY_DB_FILENAME
+    conn = sqlite3.connect(str(db), isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_schema_version "
+        "(table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)"
+    )
+    rag._ensure_telemetry_tables(conn)
+    return conn
+
+
+@pytest.fixture
+def digest_sql_env(tmp_path, monkeypatch):
+    """digest_env + DB_PATH isolation so _ragvec_state_conn() uses tmp DB.
+
+    Uses snap+restore (not monkeypatch.setattr) to avoid the teardown-order
+    bug where _stabilize_rag_state sees DB_PATH still pointing to tmp_path.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    qlog = tmp_path / "queries.jsonl"
+    clog = tmp_path / "contradictions.jsonl"
+    monkeypatch.setattr(rag, "VAULT_PATH", vault)
+    monkeypatch.setattr(rag, "LOG_PATH", qlog)
+    monkeypatch.setattr(rag, "CONTRADICTION_LOG_PATH", clog)
+    snap_db = rag.DB_PATH
+    rag.DB_PATH = tmp_path
+    conn = _open_telemetry_db(tmp_path)
+    try:
+        yield vault, qlog, clog, conn
+    finally:
+        conn.close()
+        rag.DB_PATH = snap_db
 
 
 def _write_note(vault, rel_path, body, mtime=None):
@@ -103,30 +141,22 @@ def test_collect_evidence_reads_frontmatter_contradicts(digest_env):
     assert fc["targets"] == ["beta.md", "gamma.md"]
 
 
-def test_collect_evidence_windows_contradiction_log(digest_env):
-    vault, qlog, clog = digest_env
-    _append_jsonl(clog, [
-        {
-            "ts": "2026-04-09T10:00:00",
-            "cmd": "contradict_index",
-            "subject_path": "new.md",
-            "contradicts": [{"path": "old.md", "note": "old", "why": "tensión"}],
-            "skipped": None,
-        },
-        {
-            "ts": "2026-03-01T10:00:00",
-            "cmd": "contradict_index",
-            "subject_path": "old-note.md",
-            "contradicts": [{"path": "other.md", "why": "viejo"}],
-        },
-        {
-            "ts": "2026-04-10T10:00:00",
-            "cmd": "contradict_index",
-            "subject_path": "empty.md",
-            "contradicts": [],
-            "skipped": "too_short",
-        },
-    ])
+def test_collect_evidence_windows_contradiction_log(digest_sql_env):
+    """_collect_week_evidence reads rag_contradictions SQL, not JSONL."""
+    vault, qlog, clog, conn = digest_sql_env
+    # Insert three rows: one in-window with targets, one out-of-window, one in-window with empty targets.
+    conn.execute(
+        "INSERT INTO rag_contradictions (ts, subject_path, contradicts_json) VALUES (?, ?, ?)",
+        ("2026-04-09T10:00:00", "new.md", json.dumps([{"path": "old.md", "why": "tensión"}])),
+    )
+    conn.execute(
+        "INSERT INTO rag_contradictions (ts, subject_path, contradicts_json) VALUES (?, ?, ?)",
+        ("2026-03-01T10:00:00", "old-note.md", json.dumps([{"path": "other.md", "why": "viejo"}])),
+    )
+    conn.execute(
+        "INSERT INTO rag_contradictions (ts, subject_path, contradicts_json) VALUES (?, ?, ?)",
+        ("2026-04-10T10:00:00", "empty.md", json.dumps([])),
+    )
     ev = rag._collect_week_evidence(
         datetime(2026, 4, 6), datetime(2026, 4, 13), vault, qlog, clog,
     )
@@ -136,30 +166,27 @@ def test_collect_evidence_windows_contradiction_log(digest_env):
     assert ic["targets"] == [{"path": "old.md", "why": "tensión"}]
 
 
-def test_collect_evidence_reads_query_log(digest_env):
-    vault, qlog, clog = digest_env
-    _append_jsonl(qlog, [
-        {
-            "ts": "2026-04-09T10:00:00",
-            "cmd": "query",
-            "q": "¿qué es X?",
-            "top_score": 0.35,
-            "contradictions": [{"path": "a.md", "why": "X vs Y"}],
-        },
-        {
-            "ts": "2026-04-10T10:00:00",
-            "cmd": "query",
-            "q": "algo oscuro",
-            "top_score": 0.005,
-            "contradictions": None,
-        },
-        {
-            "ts": "2026-03-01T10:00:00",
-            "cmd": "query",
-            "q": "fuera de rango",
-            "top_score": 0.001,
-        },
-    ])
+def test_collect_evidence_reads_query_log(digest_sql_env):
+    """_collect_week_evidence reads rag_queries SQL for query_contradictions and low_conf."""
+    vault, qlog, clog, conn = digest_sql_env
+    # In-window: has contradictions in extra_json
+    conn.execute(
+        "INSERT INTO rag_queries (ts, cmd, q, top_score, extra_json) VALUES (?, ?, ?, ?, ?)",
+        (
+            "2026-04-09T10:00:00", "query", "¿qué es X?", 0.35,
+            json.dumps({"contradictions": [{"path": "a.md", "why": "X vs Y"}]}),
+        ),
+    )
+    # In-window: low confidence, no contradictions
+    conn.execute(
+        "INSERT INTO rag_queries (ts, cmd, q, top_score, extra_json) VALUES (?, ?, ?, ?, ?)",
+        ("2026-04-10T10:00:00", "query", "algo oscuro", 0.005, None),
+    )
+    # Out-of-window: should not appear
+    conn.execute(
+        "INSERT INTO rag_queries (ts, cmd, q, top_score, extra_json) VALUES (?, ?, ?, ?, ?)",
+        ("2026-03-01T10:00:00", "query", "fuera de rango", 0.001, None),
+    )
     ev = rag._collect_week_evidence(
         datetime(2026, 4, 6), datetime(2026, 4, 13), vault, qlog, clog,
     )

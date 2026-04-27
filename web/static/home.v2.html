@@ -13,7 +13,13 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/home.v2.css?v=5">
+  <link rel="stylesheet" href="/static/home.v2.css?v=6">
+  <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
+       today/tomorrow narrative which has 4 H2 sub-sections that need
+       real markdown rendering (lists, headers) — not the regex hack. -->
+  <script src="/static/vendor/marked.min.js"
+          integrity="sha384-VFZ9RElp7G/IxAGHV8iq2n2RuDktt4iBszz0AX1jzsKdHQRQoRi3LlUhxx31gpx0"
+          defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">saltar al contenido</a>
@@ -31,6 +37,28 @@
   </header>
 
   <main class="shell" id="main">
+    <!-- ╔═══════════ TODAY BRIEF — narrativo con 4 sub-secciones ═══════════╗ -->
+    <!-- El narrative del LLM viene como markdown con 4 H2: Lo que pasó hoy /
+         Sin procesar / Preguntas abiertas / Para mañana. Lo renderemos full
+         width arriba para darle peso visual. Cada H2 se transforma en una
+         "sub-card" interna con su contenido. Bajo "Para mañana" se inyectan
+         botones "✓ crear Apple Reminder" en cada <li>. -->
+    <section class="today-hero" aria-labelledby="hero-h">
+      <header class="today-hero-head">
+        <h2 id="hero-h" class="today-hero-title">
+          <span class="hero-date" id="hero-date">—</span>
+          <span class="hero-counts" id="hero-counts"></span>
+        </h2>
+        <button type="button" class="today-hero-refresh" id="brief-refresh"
+                title="Re-generar brief (toma ~10-15s)" aria-label="Re-generar brief">
+          ↻
+        </button>
+      </header>
+      <div class="today-hero-body" id="today-hero-body">
+        <div class="empty">cargando brief…</div>
+      </div>
+    </section>
+
     <!-- ╔═══════════ COMMAND BAR — 4 KPIs críticos ═══════════╗ -->
     <section class="cmdbar" aria-label="indicadores críticos">
       <article class="kpi" id="kpi-inbox" data-kpi="inbox">
@@ -106,21 +134,6 @@
           </header>
           <div class="panel-body" data-body><div class="empty">cargando…</div></div>
           <footer class="panel-foot" data-foot></footer>
-        </article>
-      </div>
-    </section>
-
-    <!-- ╔═══════════ BRIEFS NARRATIVOS ═══════════╗ -->
-    <section class="section section-briefs" aria-labelledby="sec-brf">
-      <h2 class="section-header" id="sec-brf">Briefs</h2>
-      <div class="section-body">
-        <article class="brief" id="brief-today">
-          <div class="brief-title">🪞 Lo que pasó hoy</div>
-          <div class="brief-prose" data-prose>cargando…</div>
-        </article>
-        <article class="brief tomorrow" id="brief-tomorrow">
-          <div class="brief-title">🌅 Para mañana</div>
-          <div class="brief-prose" data-prose>cargando…</div>
         </article>
       </div>
     </section>
@@ -232,6 +245,6 @@
     </section>
   </main>
 
-  <script src="/static/home.v2.js?v=5"></script>
+  <script src="/static/home.v2.js?v=6"></script>
 </body>
 </html>

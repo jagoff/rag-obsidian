@@ -340,59 +340,250 @@
     });
   }
 
-  function renderTodayBrief(payload) {
-    const el = document.querySelector("#brief-today [data-prose]");
-    if (!el) return;
-    const md = payload.today?.narrative;
-    if (!md) {
-      el.innerHTML = `<span class="empty">Aún sin brief de hoy</span>`;
-      return;
-    }
-    // Strip primer `## ...` para evitar el duplicado del title del card.
-    const cleaned = md.replace(/^##\s*[^\n]+\n+/, "");
-    el.innerHTML = renderInlineMarkdown(cleaned);
+  // ──────────────────────────────────────────────────────────────
+  // Today hero — el bloque grande arriba con 4 sub-secciones
+  // (Lo que pasó hoy / Sin procesar / Preguntas abiertas / Para mañana).
+  // El narrative del LLM es markdown con 4 H2; lo splitemos en 4 trozos
+  // y renderemos cada uno en su columna.
+  // ──────────────────────────────────────────────────────────────
+
+  // Strip [[wikilinks]] del texto para que marked no los rompa (no son
+  // markdown válido). Replico el helper que tiene v1.
+  function stripWikilinks(s) {
+    if (!s) return "";
+    return s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
+            .replace(/\[\[([^\]]+)\]\]/g, "$1");
   }
 
-  function renderTomorrowBrief(payload) {
-    const el = document.querySelector("#brief-tomorrow [data-prose]");
-    if (!el) return;
-    const md = payload.signals?.brief_tomorrow || payload.tomorrow_brief || "";
-    if (!md) {
-      // Si no hay brief, mostramos los items del calendar como fallback
-      const cal = payload.tomorrow_calendar?.events || [];
-      if (cal.length) {
-        el.innerHTML = "<ul>" + cal.slice(0, 6).map((e) =>
-          `<li><b>${escapeHTML(e.start || e.time || "—")}</b> · ${escapeHTML(e.title || e.summary || "")}</li>`,
-        ).join("") + "</ul>";
-      } else {
-        el.innerHTML = `<span class="empty">sin agenda · día abierto</span>`;
+  // Sanitizer mínimo para el output de marked. Quita <script>, on*=,
+  // javascript: hrefs. Defensa pragmática — el contenido viene de un
+  // LLM local que confiamos pero que podría escupir basura por error.
+  function sanitizeHTML(html) {
+    return String(html)
+      .replace(/<\s*script[\s\S]*?<\/\s*script\s*>/gi, "")
+      .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+      .replace(/\son\w+\s*=\s*'[^']*'/gi, "")
+      .replace(/javascript:/gi, "");
+  }
+
+  function mdToHTML(md) {
+    if (!md) return "";
+    const stripped = stripWikilinks(md);
+    if (window.marked) {
+      try {
+        return sanitizeHTML(window.marked.parse(stripped));
+      } catch (e) {
+        console.warn("[home.v2] marked.parse failed:", e);
       }
-      return;
     }
-    el.innerHTML = renderInlineMarkdown(md);
+    // Fallback regex-based — peor pero suficiente.
+    return `<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">${escapeHTML(stripped)}</pre>`;
   }
 
-  function renderInlineMarkdown(md) {
-    // Conversión muy básica: párrafos, bold, italic, headings,
-    // wikilinks, lists. Suficiente para los briefs del rag.
-    let out = escapeHTML(md);
-    out = out.replace(/^### (.+)$/gm, "<h4>$1</h4>");
-    out = out.replace(/^## (.+)$/gm, "<h3>$1</h3>");
-    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    out = out.replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, "$1<em>$2</em>");
-    out = out.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '<a href="#">$2</a>');
-    out = out.replace(/\[\[([^\]]+)\]\]/g, '<a href="#">$1</a>');
-    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
-    // Lists
-    out = out.replace(/(^|\n)- (.+)(?=\n|$)/g, "$1<li>$2</li>");
-    out = out.replace(/(<li>.+?<\/li>)(?=\n[^<]|\n*$)/gs, "<ul>$1</ul>");
-    // Paragraphs
-    out = out.split(/\n\n+/).map((p) => {
-      if (p.startsWith("<")) return p;
-      return `<p>${p.replace(/\n/g, "<br>")}</p>`;
-    }).join("");
+  // Splittear el narrative en sus 4 sub-secciones por H2.
+  // El formato esperado del LLM (system prompt en rag.py):
+  //   ## 🪞 Lo que pasó hoy
+  //   ...prose
+  //   ## 📥 Sin procesar
+  //   - item
+  //   ## 🔍 Preguntas abiertas
+  //   ...
+  //   ## 🌅 Para mañana
+  //   - item
+  //
+  // Devolvemos `{narrative, inbox, questions, tomorrow}` con el contenido
+  // (sin el header) de cada sub-sección. Si el LLM se zarpó con el orden
+  // o agregó/sacó secciones, matcheamos por keyword en el header.
+  function splitNarrative(md) {
+    const out = { narrative: "", inbox: "", questions: "", tomorrow: "" };
+    if (!md) return out;
+    // Split por líneas que empiezan con `## ` (H2). El primer chunk
+    // es lo que va antes del primer H2 (puede ser vacío).
+    const chunks = md.split(/^##\s+/m).map((c, i) => i === 0 ? c : "## " + c);
+    for (const chunk of chunks) {
+      const headerMatch = chunk.match(/^##\s+(.+?)\n([\s\S]*)$/);
+      if (!headerMatch) continue;
+      const header = headerMatch[1].toLowerCase();
+      const body = headerMatch[2].trim();
+      if (/lo que pas[oó]|hoy/.test(header) && /pas/.test(header)) {
+        out.narrative = body;
+      } else if (/sin procesar|inbox|por procesar/.test(header)) {
+        out.inbox = body;
+      } else if (/pregunta|abierta|open|low.?conf/.test(header)) {
+        out.questions = body;
+      } else if (/ma[ñn]ana|tomorrow|para hoy m/.test(header)) {
+        out.tomorrow = body;
+      }
+    }
     return out;
   }
+
+  function renderTodayHero(payload) {
+    const dateEl = document.getElementById("hero-date");
+    const countsEl = document.getElementById("hero-counts");
+    const bodyEl = document.getElementById("today-hero-body");
+    if (!dateEl || !bodyEl) return;
+
+    dateEl.textContent = payload.date || "—";
+
+    const counts = payload.today?.counts || {};
+    const evidence = payload.today?.evidence || {};
+    const inboxItems = evidence.inbox_today || [];
+    const lowConfItems = payload.signals?.low_conf || [];
+    const tomorrowEvents = payload.tomorrow_calendar?.events || [];
+
+    // Counts chip al lado de la fecha
+    const totalThings = (counts.total) ||
+      ((evidence.recent_notes?.length || 0) +
+       (inboxItems.length) +
+       (lowConfItems.length));
+    countsEl.textContent = `${totalThings} señales · ${inboxItems.length} inbox · ${lowConfItems.length} preguntas`;
+
+    const md = payload.today?.narrative || "";
+    const split = splitNarrative(md);
+
+    // Si no hay narrative (LLM aún no corrió), generamos contenido a
+    // partir de evidence directamente — el user no ve "cargando" eterno.
+    const hasNarrative = !!md.trim();
+
+    const sectionHTML = (cls, emoji, label, count, contentHTML, emptyText) => `
+      <div class="hero-section ${cls}">
+        <h3><span>${emoji} ${escapeHTML(label)}</span>${count != null ? `<span class="count">${count}</span>` : ""}</h3>
+        <div class="prose">${contentHTML || `<div class="empty">${escapeHTML(emptyText)}</div>`}</div>
+      </div>
+    `;
+
+    // Sub-section: narrative del LLM ("Lo que pasó hoy")
+    const narrativeHTML = split.narrative
+      ? mdToHTML(split.narrative)
+      : (hasNarrative ? "" : (() => {
+          // Fallback derivado de evidence: notas tocadas hoy
+          const recent = (evidence.recent_notes || []).slice(0, 5);
+          if (!recent.length) return "";
+          return "<p>Notas tocadas hoy:</p><ul>" + recent.map((n) =>
+            `<li><strong>${escapeHTML(n.title || n.path)}</strong></li>`,
+          ).join("") + "</ul>";
+        })());
+
+    // Sub-section: Sin procesar (inbox del día)
+    let inboxHTML = "";
+    if (split.inbox) {
+      inboxHTML = mdToHTML(split.inbox);
+    } else if (inboxItems.length) {
+      inboxHTML = "<ul>" + inboxItems.slice(0, 8).map((it) => {
+        const tags = (it.tags || []).slice(0, 3).map((t) => `<code>#${escapeHTML(t)}</code>`).join(" ");
+        return `<li><strong>${escapeHTML(it.title || it.path)}</strong>${tags ? ` ${tags}` : ""}</li>`;
+      }).join("") + "</ul>";
+    }
+
+    // Sub-section: Preguntas abiertas (low-conf queries)
+    let questionsHTML = "";
+    if (split.questions) {
+      questionsHTML = mdToHTML(split.questions);
+    } else if (lowConfItems.length) {
+      questionsHTML = "<ul>" + lowConfItems.slice(0, 5).map((q) => {
+        const text = q.q || q.question || q.text || "";
+        const score = q.score != null ? ` <em>(score ${q.score.toFixed?.(2) || q.score})</em>` : "";
+        return `<li>${escapeHTML(text)}${score}</li>`;
+      }).join("") + "</ul>";
+    }
+
+    // Sub-section: Para mañana
+    let tomorrowHTML = "";
+    if (split.tomorrow) {
+      tomorrowHTML = mdToHTML(split.tomorrow);
+    } else if (tomorrowEvents.length) {
+      tomorrowHTML = "<ul>" + tomorrowEvents.slice(0, 6).map((e) => {
+        const when = e.start || e.time || "";
+        return `<li><strong>${escapeHTML(when)}</strong> ${escapeHTML(e.title || e.summary || "")}</li>`;
+      }).join("") + "</ul>";
+    }
+
+    bodyEl.innerHTML = [
+      sectionHTML("s-narrative", "🪞", "Lo que pasó hoy", null, narrativeHTML, "Aún sin brief — pulsá ↻ arriba para generar"),
+      sectionHTML("s-inbox", "📥", "Sin procesar", inboxItems.length || null, inboxHTML, "todo procesado ✓"),
+      sectionHTML("s-questions", "🔍", "Preguntas abiertas", lowConfItems.length || null, questionsHTML, "sin preguntas pendientes"),
+      sectionHTML("s-tomorrow", "🌅", "Para mañana", null, tomorrowHTML, "agenda libre · día abierto"),
+    ].join("");
+
+    // Botones inline "crear reminder" en cada <li> de "Para mañana"
+    injectTomorrowReminderButtons();
+  }
+
+  // Tracks created reminders per session — re-renders no debe poder hacer
+  // doble-create del mismo texto.
+  const _createdReminderTexts = new Set();
+
+  function injectTomorrowReminderButtons() {
+    const root = document.querySelector(".hero-section.s-tomorrow .prose");
+    if (!root) return;
+    const items = root.querySelectorAll("li");
+    items.forEach((li) => {
+      if (li.querySelector(".add-reminder-btn")) return;
+      const original = (li.textContent || "").trim();
+      if (!original) return;
+      li.dataset.reminderText = original;
+      const btn = document.createElement("button");
+      btn.className = "add-reminder-btn";
+      btn.type = "button";
+      btn.title = "Crear Apple Reminder (mañana 9:00)";
+      btn.textContent = "+ rec";
+      li.appendChild(btn);
+      if (_createdReminderTexts.has(original)) {
+        li.classList.add("reminder-created");
+        btn.disabled = true;
+        btn.title = "Ya agregado a Reminders";
+      }
+    });
+  }
+
+  // Click handler para los botones inline
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".add-reminder-btn");
+    if (!btn) return;
+    ev.preventDefault();
+    const li = btn.closest("li");
+    if (!li || li.classList.contains("reminder-created")) return;
+    const text = li.dataset.reminderText || (li.textContent || "").trim();
+    if (!text) return;
+    btn.disabled = true;
+    btn.classList.add("loading");
+    try {
+      const res = await fetch("/api/reminders/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, due: "tomorrow" }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      _createdReminderTexts.add(text);
+      li.classList.add("reminder-created");
+      btn.title = "Agregado a Reminders";
+    } catch (e) {
+      btn.classList.add("err");
+      btn.title = "Error: " + (e.message || String(e));
+      btn.disabled = false;
+    } finally {
+      btn.classList.remove("loading");
+    }
+  });
+
+  // Refresh manual del brief (regenerate=true → LLM corre síncrono ~10-15s)
+  document.addEventListener("DOMContentLoaded", () => {
+    const refreshBtn = document.getElementById("brief-refresh");
+    if (!refreshBtn) return;
+    refreshBtn.addEventListener("click", async () => {
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = "↻";
+      try {
+        await load({ regenerate: true });
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    });
+  });
 
   function renderFinance(payload) {
     const fin = payload.signals?.finance;
@@ -748,6 +939,7 @@
 
   function render(payload) {
     updateTopbar(payload);
+    renderTodayHero(payload);
     renderCmdBar(payload);
     renderInbox(payload);
     renderQuestions(payload);
@@ -755,8 +947,6 @@
     renderWAUnreplied(payload);
     renderLoopsUrgent(payload);
     renderContradictions(payload);
-    renderTodayBrief(payload);
-    renderTomorrowBrief(payload);
     renderFinance(payload);
     renderCards(payload);
     renderRetrievalHealth(payload);

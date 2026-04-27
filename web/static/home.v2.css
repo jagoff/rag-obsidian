@@ -572,27 +572,227 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   100% { background-position: -200% 0; }
 }
 
-/* ── Narrative briefs (today / tomorrow) ────────────────── */
+/* ── Today hero (full width brief con 4 sub-secciones) ─────
+   Es el bloque más prominente de la página — donde vivimos el "qué
+   pasó hoy / qué hay sin procesar / qué quedó abierto / qué para mañana".
+   El narrative viene del LLM como markdown con 4 H2; el JS lo splitea
+   y renderea cada sub-sección como una columna. */
 
-.brief {
-  background: var(--bg-elev-1);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--cyan-dim);
-  border-radius: 4px;
-  padding: var(--space-3) var(--space-4);
+.today-hero {
+  background: linear-gradient(
+    180deg,
+    var(--bg-elev-2) 0%,
+    var(--bg-elev-1) 100%
+  );
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  margin-bottom: var(--space-4);
+  overflow: hidden;
+  position: relative;
 }
-.brief.tomorrow { border-left-color: var(--amber-dim); }
-.brief .brief-title {
-  font-size: var(--fs-md);
+.today-hero::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--phosphor) 0%,
+    var(--cyan) 35%,
+    var(--amber) 70%,
+    var(--magenta) 100%
+  );
+  opacity: 0.55;
+}
+.today-hero-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4) var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+.today-hero-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  font-size: var(--fs-mini);
+  text-transform: uppercase;
+  letter-spacing: 0.20em;
   font-weight: 600;
-  color: var(--text);
-  margin-bottom: var(--space-2);
+  color: var(--text-faint);
 }
-.brief .brief-prose {
-  color: var(--text);
-  line-height: 1.65;
+.hero-date {
+  color: var(--cyan);
+  font-size: var(--fs-md);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
-.brief .brief-prose a { color: var(--cyan); }
+.hero-counts {
+  color: var(--text-dim);
+  font-size: var(--fs-mini);
+  text-transform: lowercase;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.today-hero-refresh {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  padding: 2px 10px;
+  font-size: var(--fs-base);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.today-hero-refresh:hover {
+  color: var(--cyan);
+  border-color: var(--cyan-dim);
+}
+.today-hero-refresh:disabled {
+  opacity: 0.4;
+  cursor: wait;
+  animation: pulse 1.4s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 0.75; }
+}
+
+/* Body: 4 columnas en desktop (Lo que pasó / Sin procesar / Preguntas /
+   Para mañana), 2 en tablet, 1 en mobile. Cada sub-card tiene un border-
+   left color-coded por sub-sección para reforzar la jerarquía. */
+.today-hero-body {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+}
+.today-hero-body > .hero-section {
+  padding: var(--space-3) var(--space-4);
+  border-right: 1px solid var(--border);
+  min-width: 0;
+}
+.today-hero-body > .hero-section:last-child { border-right: none; }
+.hero-section h3 {
+  font-size: var(--fs-mini);
+  margin: 0 0 var(--space-2);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px dashed var(--border);
+}
+.hero-section.s-narrative h3 { color: var(--cyan); }
+.hero-section.s-inbox h3      { color: var(--amber); }
+.hero-section.s-questions h3  { color: var(--magenta); }
+.hero-section.s-tomorrow h3   { color: var(--phosphor); }
+.hero-section h3 .count {
+  margin-left: auto;
+  font-size: var(--fs-mini);
+  background: var(--bg-elev-3);
+  padding: 1px 6px;
+  border-radius: 2px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.hero-section .prose {
+  font-size: var(--fs-base);
+  color: var(--text);
+  line-height: 1.55;
+}
+.hero-section .prose p { margin: 0 0 var(--space-2); }
+.hero-section .prose p:last-child { margin-bottom: 0; }
+.hero-section .prose ul,
+.hero-section .prose ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.hero-section .prose li {
+  position: relative;
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  font-size: var(--fs-base);
+  border-bottom: 1px dashed var(--border);
+}
+.hero-section .prose li:last-child { border-bottom: none; }
+.hero-section .prose li::before {
+  content: "·";
+  position: absolute;
+  left: 0;
+  color: var(--text-faint);
+  font-weight: 700;
+}
+.hero-section .prose strong { color: var(--text); font-weight: 700; }
+.hero-section .prose em { color: var(--cyan); font-style: normal; }
+.hero-section .prose a { color: var(--cyan); border-bottom: 1px dotted var(--cyan-dim); }
+.hero-section .prose code {
+  font-size: 11px;
+  background: var(--bg-elev-3);
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--amber);
+}
+.hero-section .empty {
+  text-align: left;
+  padding: var(--space-2) 0;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Botón inline "✓ crear reminder" después de cada <li> de "Para mañana". */
+.add-reminder-btn {
+  margin-left: var(--space-2);
+  padding: 1px 6px;
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid var(--phosphor-dim);
+  color: var(--phosphor);
+  border-radius: 2px;
+  cursor: pointer;
+  vertical-align: middle;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.add-reminder-btn:hover {
+  background: rgba(102, 255, 153, 0.10);
+}
+.add-reminder-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.add-reminder-btn.loading { opacity: 0.5; animation: pulse 1.4s infinite; }
+.add-reminder-btn.err {
+  border-color: var(--red);
+  color: var(--red);
+}
+.hero-section .prose li.reminder-created {
+  color: var(--text-dim);
+}
+.hero-section .prose li.reminder-created::before { content: "✓"; color: var(--phosphor); }
+
+/* Tablet: 2x2 */
+@media (max-width: 1100px) {
+  .today-hero-body { grid-template-columns: repeat(2, 1fr); }
+  .today-hero-body > .hero-section:nth-child(2) { border-right: none; }
+  .today-hero-body > .hero-section:nth-child(3) { border-right: 1px solid var(--border); }
+  .today-hero-body > .hero-section:nth-child(1),
+  .today-hero-body > .hero-section:nth-child(2) {
+    border-bottom: 1px solid var(--border);
+  }
+}
+/* Mobile: stack */
+@media (max-width: 720px) {
+  .today-hero-body { grid-template-columns: 1fr; }
+  .today-hero-body > .hero-section {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .today-hero-body > .hero-section:last-child { border-bottom: none; }
+}
 
 /* ── Empty state ─────────────────────────────────────── */
 

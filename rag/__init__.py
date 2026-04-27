@@ -66,6 +66,79 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+# === LOKY SEMAPHORE LEAK FIX (2026-04-26) ===================================
+# Espejo del fix de web/server.py para todas las invocaciones `rag <cmd>`,
+# especialmente los daemons de larga duración (`rag watch`, `rag serve`).
+# `tqdm` (transitively pulled por sentence-transformers / transformers) crea
+# un `multiprocessing.RLock()` lazy en su primer `tqdm.get_lock()` — ese
+# RLock es un POSIX named semaphore que NO se libera al exit del proceso.
+# Joblib además monkey-patchea `SemLock._make_name` para que todos los
+# SemLocks usen el prefix `/loky-PID-XXX`. Resultado: `resource_tracker`
+# warnea `leaked semaphore objects: {/loky-PID-XXX}` en cada shutdown
+# clean del watch daemon (9 warnings acumuladas en `watch.error.log`
+# pre-fix).
+#
+# `TQDM_DISABLE=1` (ya seteado arriba) desactiva las progress bars, pero
+# NO previene la creación del SemLock via `tqdm.get_lock()` que ST llama
+# durante la carga del reranker / embedder para coordinar multi-worker
+# dataloaders. Pre-setear `_lock` a un `threading.RLock` (in-process, no
+# semaphore POSIX) antes de que nada triggee `get_lock()` evita el leak.
+#
+# Idempotente: si algo ya seteo `_lock` (ej. web/server.py cuando `rag` y
+# `web` comparten un proceso), `set_lock` sobreescribe con el mismo tipo.
+try:
+    import tqdm as _tqdm_preset
+    _tqdm_preset.tqdm.set_lock(threading.RLock())
+except Exception:  # pragma: no cover - tqdm not installed
+    pass
+
+
+def _shutdown_joblib_loky_pool() -> None:
+    """Drain el joblib/loky reusable executor al exit del proceso.
+
+    Registrado via `atexit`. Mismo mecanismo que el handler del web server
+    (ver `web/server.py:_shutdown_joblib_loky_pool` + comentarios ahí para
+    el trace completo del bug).
+
+    Origen: sentence-transformers / transformers / sklearn usan joblib
+    internamente; algunos paths arrancan un `loky` pool (multiprocessing
+    workers) durante el re-indexing. Si nadie drena ese pool al exit,
+    `resource_tracker` ve el SemLock del pool huérfano y warnea.
+
+    Idempotente: si el pool nunca arrancó, `get_reusable_executor()`
+    devuelve un executor vacío y `shutdown` es no-op. Silent-skip si
+    joblib no está disponible o si la API cambia — el leak vuelve pero
+    no rompemos el shutdown path.
+    """
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        from joblib.externals.loky import reusable_executor as _re_mod
+        import gc as _gc
+
+        executor = get_reusable_executor()
+        executor.shutdown(wait=True, kill_workers=True)
+
+        # Reset los globals del executor para liberar las refs a SemLock
+        # y correr sus Finalizers (`util.Finalize(SemLock._cleanup, ...)`)
+        # ANTES del resource_tracker check del exit fini-fini.
+        try:
+            _re_mod._executor = None
+            _re_mod._executor_kwargs = None
+        except Exception:
+            pass
+        try:
+            _gc.collect()
+        except Exception:
+            pass
+    except Exception:
+        # Silent-skip — el leak no es bloqueante, no queremos romper el
+        # exit si joblib se desinstala o cambia su API.
+        pass
+
+
+atexit.register(_shutdown_joblib_loky_pool)
+# === END LOKY SEMAPHORE LEAK FIX ============================================
+
 import click
 import difflib
 import sqlite_vec

@@ -39703,7 +39703,11 @@ def contact_note(contact_name: str, observation: str,
     if result.get("observation_added"):
         parts.append("Observaciones")
     if result.get("category_updated"):
-        parts.append(f"**{category}**")
+        effective_category = result.get("category") or category
+        if result.get("category_inferred"):
+            parts.append(f"**{effective_category}** [i]inferida por LLM[/i]")
+        else:
+            parts.append(f"**{effective_category}**")
     where = " + ".join(parts) if parts else "(nada cambió)"
     console.print(
         f"[green]✓ anotado en {result['file']}[/green] "

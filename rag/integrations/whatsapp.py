@@ -651,6 +651,157 @@ def _lookup_vault_contact(query: str) -> dict | None:
 _OBSERVATIONS_HEADING = "## Observaciones"
 
 
+# Categorías estándar del template de `99-Contacts/_template.md` (2026-04-26)
+# más las extensiones semánticas que el user agregó en notas reales
+# ("Preferencias", "Eventos importantes"). El LLM elige UNA si la
+# observation matchea, o "Notas" como default (que SIEMPRE existe en el
+# template). Si el LLM rebota → None → va solo a `## Observaciones`.
+_CONTACT_OBS_STANDARD_CATEGORIES = [
+    "Trabajo / contexto",
+    "Notas",
+    "Preferencias",
+    "Eventos importantes",
+    "Familia",
+    "Cumpleaños",
+]
+
+
+def _infer_observation_category(
+    observation: str,
+    note_body: str = "",
+    *,
+    max_categories: int = 8,
+) -> str | None:
+    """Usa el LLM barato (HELPER_MODEL, qwen2.5:3b) para inferir qué bullet
+    de la nota del contacto corresponde a una observación libre.
+
+    Args:
+        observation: texto ya procesado ("Le gusta el vino", "Trabaja en
+            cooperativa", "Anda sensible con el tema herencia").
+        note_body: cuerpo markdown de la nota del contacto (sin frontmatter
+            necesariamente). Se usa para ver qué bullets `- **<cat>**:
+            ...` ya existen y preferirlos sobre crear uno nuevo.
+        max_categories: límite de categorías candidatas a presentar al LLM.
+
+    Returns:
+        Nombre de la categoría (matchea un bullet existente o crea uno
+        nuevo con ese nombre) o `None` si el LLM falla o responde que
+        no hay categoría apropiada. `None` = caller va solo a la
+        sección `## Observaciones` (auditoría pura).
+
+    Invariantes:
+    - Silent-fail: cualquier error del LLM → `None`.
+    - Timeout corto (heredado del helper client = 30s).
+    - Idempotente: prompt es determinístico (temperature=0, seed=42).
+    - No imprime nada — los callers silencian errores.
+    """
+    if not observation or not observation.strip():
+        return None
+
+    # Categorías candidatas = existentes en la nota + estándar del template.
+    # Priorizamos las existentes (orden preservado) para que el LLM prefiera
+    # matchear una ya presente antes de inventar una nueva.
+    existing: list[str] = []
+    if note_body:
+        # Parseamos bullets `- **<X>**: ...` del cuerpo de la nota. No
+        # distingue frontmatter — el regex matchea solo líneas con el
+        # patrón exacto del bullet.
+        bullet_re = re.compile(
+            r"^-\s*\*\*\s*([^*]+?)\s*\*\*\s*:",
+            re.MULTILINE,
+        )
+        for m in bullet_re.finditer(note_body):
+            cat = m.group(1).strip()
+            # Descartamos estructurales que no aplican a observaciones
+            # libres (Teléfono, Email, Dirección, Apellido, Relación).
+            if cat.lower() in {
+                "teléfono", "telefono", "email", "dirección", "direccion",
+                "apellido / nombre completo", "apellido", "relación", "relacion",
+            }:
+                continue
+            if cat not in existing:
+                existing.append(cat)
+
+    candidates = existing + [
+        c for c in _CONTACT_OBS_STANDARD_CATEGORIES if c not in existing
+    ]
+    candidates = candidates[:max_categories]
+
+    # Prompt del LLM — corto, determinístico, con ejemplos few-shot.
+    # Evitamos dar demasiados ejemplos (cost) pero los suficientes para
+    # que el modelo entienda el shape esperado.
+    prompt = (
+        "Sos un asistente que clasifica observaciones sobre personas "
+        "en una de estas categorías de su ficha de contacto:\n\n"
+        + "\n".join(f"- {c}" for c in candidates)
+        + '\n- (ninguna)\n\n'
+        "Regla: respondé con EXACTAMENTE una línea, solo el nombre de "
+        "la categoría (sin comillas, sin explicación). Si ninguna "
+        "aplica, respondé `(ninguna)`.\n\n"
+        "Ejemplos:\n"
+        "Observación: Le gusta el vino → Preferencias\n"
+        "Observación: Trabaja en la cooperativa → Trabajo / contexto\n"
+        "Observación: Anda con problemas de salud → Notas\n"
+        "Observación: Cumpleaños: 26 de mayo → Cumpleaños\n"
+        "Observación: Se mudó a San Pedro → Trabajo / contexto\n"
+        "Observación: Le gustan las plantas → Preferencias\n"
+        "Observación: Habló del viaje a Europa → Eventos importantes\n"
+        f"Observación: {observation.strip()} → "
+    )
+    try:
+        import rag  # deferred: evita ciclo en init
+        resp = rag._helper_client().chat(
+            model=rag.HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0, "seed": 42, "num_predict": 32},
+            keep_alive=rag.OLLAMA_KEEP_ALIVE,
+        )
+        raw = (resp.message.content or "").strip()
+    except Exception as exc:
+        try:
+            rag._silent_log("infer_observation_category_failed", exc)
+        except Exception:
+            pass
+        return None
+
+    # Parseo tolerante: el modelo a veces devuelve "Categoría: Notas" o
+    # "→ Notas" o la palabra con un sufijo ("Notas (default)"). Tomamos
+    # la primera línea no vacía y matcheamos contra candidates.
+    first_line = next(
+        (ln.strip() for ln in raw.splitlines() if ln.strip()),
+        "",
+    )
+    if not first_line:
+        return None
+
+    # Limpieza común (prefijos tipo "→", "-", "*", "Categoría:").
+    cleaned = re.sub(
+        r"^[\-*→>]+\s*|^\s*categor[íi]a\s*:\s*",
+        "",
+        first_line,
+        flags=re.IGNORECASE,
+    ).strip().strip("`'\"")
+
+    lower = cleaned.lower()
+    if lower in {"(ninguna)", "ninguna", "none", "null"}:
+        return None
+
+    # Match exacto (case-insensitive) con cualquier candidate.
+    for cand in candidates:
+        if cand.lower() == lower:
+            return cand
+    # Match por prefijo — cubrir "Notas (default)" → "Notas".
+    for cand in candidates:
+        if lower.startswith(cand.lower()):
+            return cand
+    # Si el LLM devolvió algo libre fuera de la lista, lo aceptamos igual
+    # SIEMPRE que sea corto (< 40 chars) y no tenga chars raros. Permite
+    # que el LLM invente categorías útiles ("Salud", "Hobbies", etc).
+    if 2 <= len(cleaned) <= 40 and re.match(r"^[\w\s/áéíóúñÁÉÍÓÚÑ]+$", cleaned):
+        return cleaned
+    return None
+
+
 def _append_contact_observation(
     contact_name: str,
     observation: str,
@@ -722,6 +873,21 @@ def _append_contact_observation(
     obs_clean = observation.strip()
     excerpt_clean = (source_excerpt or "").strip()
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # Task #4 (2026-04-26): si el caller no dio `category`, intentamos
+    # inferirla con el LLM barato mirando los bullets existentes de la
+    # nota + categorías estándar del template. Silent-fail: si el LLM
+    # rebota, `category` queda None y la observation va solo a la
+    # sección `## Observaciones` (comportamiento pre-fix).
+    inferred_category = False
+    if category is None:
+        try:
+            inferred = _infer_observation_category(obs_clean, note_body=text)
+        except Exception:
+            inferred = None
+        if inferred:
+            category = inferred
+            inferred_category = True
 
     # Render del bullet para la sección "## Observaciones".
     if excerpt_clean and excerpt_clean.lower() != obs_clean.lower():
@@ -846,6 +1012,11 @@ def _append_contact_observation(
         "observation_added": observation_added,
         "category_updated": category_updated,
         "source_kind": source_kind,
+        # Señal para el caller que la categoría fue inferida por el LLM
+        # (vs pasada explícitamente). Útil para logging/auditoría — el CLI
+        # imprime "categoría inferida por LLM: X" en lugar de solo "X".
+        "category": category,
+        "category_inferred": inferred_category,
     }
 
 

@@ -1080,9 +1080,16 @@ _USER_QUERY_CMDS: frozenset[str] = frozenset({
     "web",             # /api/chat principal
     "web.chat.metachat",            # metachat short-circuit
     "web.chat.low_conf_bypass",     # low-conf fallback (aún es query)
-    "serve",           # rag serve (mic-drop handler)
-    "serve.chat",      # rag serve → chat endpoint
-    "serve.received",  # whatsapp inbound → rag serve
+    "serve",                # rag serve (mic-drop handler)
+    "serve.chat",           # rag serve → chat endpoint
+    "serve.chat.finance",   # /chat short-circuit → finance/cards (2026-04-26)
+    "serve.received",       # whatsapp inbound → rag serve
+    "serve.weather",        # /query short-circuit → weather
+    "serve.weather_fallback",  # weather fallback al RAG path
+    "serve.metachat",       # /query short-circuit → metachat (greetings)
+    "serve.tasks",          # /query short-circuit → tasks/agenda
+    "serve.finance",        # /query short-circuit → finance/cards (2026-04-26)
+    "serve.error",          # /query|/chat raised exception
 })
 
 
@@ -3593,8 +3600,24 @@ def _load_behavior_priors() -> dict:
                 prev_factory = conn.row_factory
                 try:
                     conn.row_factory = _sqlite3.Row
+                    # Audit perf 2026-04-26: pre-fix scaneaba TODA rag_behavior
+                    # sin filtros (84K+ rows en 7d → todos los Row objects en
+                    # RAM ~50-200MB en cada cache rebuild). El filtro lado-DB
+                    # elimina round-trip de Python para events que
+                    # `_compute_behavior_priors_from_rows` skipea por
+                    # event_type ∉ POSITIVE|NEGATIVE|IMPRESSION_ONLY.
+                    # Retención rag_behavior = 90d; bound `ts >= now-90d`
+                    # es belt-and-suspenders contra rotación atrasada +
+                    # permite usar `ix_rag_behavior_ts`. CRÍTICO: incluir
+                    # 'impression' — denominador de la CTR (Laplace
+                    # smoothing). Sin él todos los paths tendrían
+                    # click_prior ~1 falso. NO usar LIMIT — la CTR requiere
+                    # conteo completo dentro del window.
                     rows = list(conn.execute(
-                        "SELECT ts, event, path, dwell_s FROM rag_behavior"
+                        "SELECT ts, event, path, dwell_s FROM rag_behavior "
+                        "WHERE ts >= datetime('now','-90 days') "
+                        "AND event IN ('open','open_external','positive_implicit',"
+                        "'negative_implicit','kept','deleted','save','copy','impression')"
                     ).fetchall())
                 finally:
                     conn.row_factory = prev_factory
@@ -4735,7 +4758,14 @@ def semantic_cache_lookup(
             continue
         # Track best cosine regardless of threshold — used by probe to
         # explain misses ("closest match was 0.88, below 0.93 threshold").
-        if cos > best_cos and best is None:
+        # Bug fix 2026-04-26 audit: la condición pre-fix era `> best_cos
+        # AND best is None` — solo actualizaba la PRIMERA iteración por la
+        # cláusula `best is None`. Cualquier sub-threshold posterior con
+        # cosine más alto quedaba ignorado y el probe reportaba el
+        # cosine de la primera fila escaneada, no el max real. Solo
+        # afecta el display del probe (no afecta hit/miss decision —
+        # ese path se actualiza en el block del threshold abajo).
+        if cos > best_cos:
             best_cos = cos
         if cos >= threshold:
             # Per-entry freshness check (post 2026-04-23): skip rows whose
@@ -42339,56 +42369,257 @@ def _format_finance_cards_block(finance: dict | None, cards: list[dict] | None) 
     return "\n\n".join(parts).strip()
 
 
-def _finance_cards_comment(question: str, finance: dict | None, cards: list[dict] | None) -> str:
-    """Genera respuesta conversacional para WA con los datos pegados literal
-    en el prompt. El LLM helper (qwen2.5:3b temp=0) NO inventa porque la
-    instrucción explícita es "cita los números literalmente". Si los datos
-    no responden la pregunta, debe decir "no tengo data fresca de [X]"
-    sin fabricar.
+def _detect_finance_intent(question: str) -> str:
+    """Clasifica la pregunta financiera del user para decidir qué fuente
+    pasar al LLM. Tres buckets:
 
-    Devuelve `""` si el helper falla — el caller debe tener fallback.
+      - `cards`:  query menciona tarjeta/visa/master/amex/crédito/banco
+                  → solo CSV del banco, MOZE oculto del prompt.
+      - `moze`:   query menciona MOZE/efectivo/gastos diarios/día a día
+                  → solo MOZE, tarjetas ocultas.
+      - `generic`: query genérica (cuánto gasté este mes, total de gastos)
+                  → ambas fuentes etiquetadas, el LLM cita las dos por
+                  separado.
+
+    Regla del user (2026-04-26): MOZE y tarjetas son fuentes SEPARADAS
+    de gastos personales — sumar los montos es alucinación.
     """
-    block = _format_finance_cards_block(finance, cards)
-    if not block:
+    q = (question or "").lower()
+    cards_re = re.compile(
+        r"\btarjeta(s)?\b|\bvisa\b|\bmaster(card)?\b|\bamex\b|\b"
+        r"american\s+express\b|\bcr[eé]dito\b|\bbanco\b|\bdebitos?\s+autom"
+    )
+    moze_re = re.compile(
+        r"\bmoze\b|\befectivo\b|\bgastos?\s+diarios?\b|\bd[ií]a\s+a\s+d[ií]a\b"
+    )
+    if cards_re.search(q):
+        return "cards"
+    if moze_re.search(q):
+        return "moze"
+    return "generic"
+
+
+def _finance_short_circuit_answer(
+    question: str,
+) -> tuple[str, int, bool, float] | None:
+    """Resuelve queries de finance/tarjetas sin pasar por retrieve.
+
+    Tupla retornada: ``(answer, n_cards, has_moze, t_gen_seconds)``.
+    Devuelve ``None`` si:
+      - la query NO es finance/cards (caller sigue al path normal),
+      - falla el lazy-import de `web.server` (caller sigue al path normal),
+      - el LLM helper falla sin texto (caller sigue al path normal).
+
+    Datos vienen de `_fetch_finance` (MOZE CSV) y `_fetch_credit_cards`
+    (xlsx del banco), ambos en `web/server.py`. La respuesta la genera
+    `_finance_cards_comment` con un prompt anti-alucinación inline.
+
+    Compartido entre `_handle_query` (`/query`) y `_handle_chat`
+    (`/chat`) — el WhatsApp listener rutea `/search ...` al primero y
+    bare text al segundo, ambos paths necesitaban el short-circuit
+    para que "decime cuanto gasté de tarjeta este mes" funcione tanto
+    via comando como via voice transcript.
+    """
+    if not _is_finance_or_cards_query(question):
+        return None
+    t0 = time.perf_counter()
+    try:
+        # Lazy import — `web.server` es importable standalone (no
+        # requiere FastAPI corriendo) pero no quiero forzar el import
+        # en cada arranque del serve si no hay queries de finance.
+        from web.server import _fetch_credit_cards, _fetch_finance
+        finance_data = _fetch_finance()
+        cards_data = _fetch_credit_cards()
+    except Exception as exc:
+        _silent_log("serve_finance_fetch", exc)
+        return None
+
+    if not finance_data and not cards_data:
+        answer = (
+            "No tengo data fresca de tus tarjetas ni de MOZE — "
+            "el último export del banco/Money app puede no estar al día."
+        )
+    else:
+        try:
+            answer = _finance_cards_comment(question, finance_data, cards_data)
+        except Exception as exc:
+            _silent_log("serve_finance_comment", exc)
+            return None
+
+    if not answer:
+        return None
+    return (
+        answer,
+        len(cards_data or []),
+        bool(finance_data),
+        time.perf_counter() - t0,
+    )
+
+
+def _fmt_ars(amount) -> str:
+    """Formato ARS estándar: `$1.234.567` (puntos como separador miles)."""
+    try:
+        n = int(round(float(amount or 0)))
+    except Exception:
+        return "$0"
+    return f"${n:,}".replace(",", ".")
+
+
+def _fmt_usd(amount) -> str:
+    """Formato USD estándar: `U$S98.93`."""
+    try:
+        return f"U$S{float(amount or 0):.2f}"
+    except Exception:
+        return "U$S0.00"
+
+
+def _finance_cards_comment(question: str, finance: dict | None, cards: list[dict] | None) -> str:
+    """Genera respuesta determinística (sin LLM) para queries financieras
+    de WhatsApp. Diseño:
+
+    - Detecta el intent (cards/moze/generic) vía `_detect_finance_intent`.
+    - Renderea la respuesta DIRECTAMENTE desde los dicts. El LLM nunca
+      ve los números — no puede alucinar ni mezclar fuentes.
+
+    Decisión 2026-04-26 (user report): el LLM helper (qwen2.5:3b temp=0)
+    seguía mezclando MOZE con tarjeta aunque le pasáramos solo una
+    fuente filtrada en el bloque. Reemplazamos el LLM con render
+    programático — más rápido (~5ms vs 2-10s), 0% alucinación, totales
+    siempre exactos.
+
+    Si los datos son nulos o no hay nada que reportar, devuelve un
+    mensaje específico al intent.
+    """
+    intent = _detect_finance_intent(question)
+
+    if intent == "cards":
+        return _render_cards_answer(cards)
+    if intent == "moze":
+        return _render_moze_answer(finance)
+    return _render_generic_finance_answer(finance, cards)
+
+
+def _render_cards_answer(cards: list[dict] | None) -> str:
+    """Respuesta para queries tipo "cuánto gasté de tarjeta este mes".
+    SOLO datos del CSV de tarjeta — MOZE explícitamente excluido."""
+    if not cards:
+        return (
+            "No tengo data fresca de tus tarjetas — "
+            "el último export del banco puede no estar al día."
+        )
+    # Sumamos ARS + listamos USD por tarjeta (no se suman entre divisas).
+    total_ars = sum(float(c.get("total_ars") or 0) for c in cards)
+    total_usd = sum(float(c.get("total_usd") or 0) for c in cards)
+    parts: list[str] = []
+    if total_ars:
+        parts.append(_fmt_ars(total_ars))
+    if total_usd:
+        parts.append(_fmt_usd(total_usd))
+    if not parts:
+        return (
+            "Tus tarjetas figuran en el sistema pero sin montos del último "
+            "ciclo — revisá el export del banco."
+        )
+    if len(cards) == 1:
+        c = cards[0]
+        brand = c.get("brand") or "Tarjeta"
+        last4 = c.get("last4") or "----"
+        # Top 3 consumos ARS si los hay.
+        top = (c.get("top_purchases_ars") or [])[:3]
+        if top:
+            descs = [(p.get("description") or "—").strip() for p in top]
+            return (
+                f"Tarjeta ({brand} ····{last4}): {' + '.join(parts)} — "
+                f"top consumos: {', '.join(descs)}."
+            )
+        return f"Tarjeta ({brand} ····{last4}): {' + '.join(parts)}."
+    # Múltiples tarjetas — desagregamos.
+    breakdown = []
+    for c in cards:
+        brand = c.get("brand") or "Tarjeta"
+        last4 = c.get("last4") or "----"
+        bits = []
+        if c.get("total_ars"):
+            bits.append(_fmt_ars(c["total_ars"]))
+        if c.get("total_usd"):
+            bits.append(_fmt_usd(c["total_usd"]))
+        if bits:
+            breakdown.append(f"{brand} ····{last4} {' + '.join(bits)}")
+    if breakdown:
+        return f"Tarjetas: {' / '.join(breakdown)}. Total: {' + '.join(parts)}."
+    return f"Tarjetas: {' + '.join(parts)}."
+
+
+def _render_moze_answer(finance: dict | None) -> str:
+    """Respuesta para queries tipo "cuánto gasté en MOZE/efectivo este mes".
+    SOLO datos de MOZE — tarjetas explícitamente excluidas."""
+    if not finance or not isinstance(finance, dict):
+        return (
+            "No tengo data fresca de MOZE — "
+            "el último export de la app puede no estar al día."
+        )
+    ars = finance.get("ars") or {}
+    this_month = ars.get("this_month")
+    if not this_month:
+        return (
+            "No tengo data fresca de MOZE — "
+            "el último export de la app puede no estar al día."
+        )
+    parts = [f"MOZE: {_fmt_ars(this_month)}"]
+    # Comparación con mes anterior si existe.
+    prev = ars.get("prev_month")
+    delta_pct = ars.get("delta_pct")
+    if prev and delta_pct is not None:
+        sign = "+" if delta_pct >= 0 else ""
+        parts.append(f"vs mes ant {_fmt_ars(prev)} ({sign}{delta_pct:.1f}%)")
+    # Top categoría si la hay.
+    cats = (ars.get("top_categories") or [])[:1]
+    if cats:
+        c = cats[0]
+        share = round((c.get("share") or 0) * 100)
+        parts.append(f"top: {c.get('name') or '—'} {share}%")
+    # USD si existe.
+    usd = (finance.get("usd") or {}).get("this_month")
+    if usd:
+        parts.append(f"+ {_fmt_usd(usd)}")
+    return " — ".join(parts) + "."
+
+
+def _render_generic_finance_answer(
+    finance: dict | None, cards: list[dict] | None,
+) -> str:
+    """Respuesta para queries genéricas tipo "cuánto gasté este mes" (sin
+    discriminar fuente). Cita las dos fuentes ETIQUETADAS por separado —
+    NO suma ni da total combinado salvo que el user lo pida explícito."""
+    have_cards = cards and any(c.get("total_ars") or c.get("total_usd") for c in cards)
+    have_moze = (
+        finance and isinstance(finance, dict)
+        and (finance.get("ars") or {}).get("this_month")
+    )
+    if not have_cards and not have_moze:
         return (
             "No tengo data fresca de tus tarjetas ni de MOZE — "
             "el último export del banco/Money app puede no estar al día."
         )
+    bits = []
+    if have_cards:
+        total_ars = sum(float(c.get("total_ars") or 0) for c in cards)
+        total_usd = sum(float(c.get("total_usd") or 0) for c in cards)
+        card_parts = []
+        if total_ars:
+            card_parts.append(_fmt_ars(total_ars))
+        if total_usd:
+            card_parts.append(_fmt_usd(total_usd))
+        if card_parts:
+            bits.append(f"Tarjeta {' + '.join(card_parts)}")
+    if have_moze:
+        moze_amt = (finance.get("ars") or {}).get("this_month")
+        bits.append(f"MOZE {_fmt_ars(moze_amt)}")
+    return " + ".join(bits) + " (fuentes separadas — no se suman)."
 
-    prompt = (
-        f"DATOS FRESCOS (parseados del banco/MOZE — son la verdad):\n\n"
-        f"{block}\n\n"
-        f"PREGUNTA: \"{question}\"\n\n"
-        "Respondé EN ESPAÑOL RIOPLATENSE en 1-3 oraciones cortas, tono "
-        "informal/directo (estilo WhatsApp).\n\n"
-        "REGLAS ESTRICTAS:\n"
-        "1. Citá NÚMEROS / FECHAS / NOMBRES literalmente como aparecen "
-        "en DATOS FRESCOS. PROHIBIDO inventar montos, fechas, comercios "
-        "o categorías que no estén ahí.\n"
-        "2. Si la pregunta menciona 'tarjeta/visa/master/amex/crédito' "
-        "→ priorizá la sección 'Tarjetas'. Si menciona 'gasto/gasté' "
-        "sin marca → sección 'Gastos del mes (MOZE)'.\n"
-        "3. Si la sección con los datos pedidos no está / está vacía, "
-        "decí literalmente: 'No tengo data fresca de [X] — el último "
-        "export del banco/Money app puede no estar al día.' y CORTÁ.\n"
-        "4. Sin emojis. Sin preámbulo ('claro', 'perfecto', 'según tus '). "
-        "Sin saludo. Directo al dato."
-    )
-
-    # `HELPER_MODEL`, `HELPER_OPTIONS`, `OLLAMA_KEEP_ALIVE`, `_helper_client`
-    # están definidos en este módulo (rag/__init__.py) — usados igual
-    # que `_weather_comment` (que vive en rag/integrations/weather.py y
-    # los re-importa).
-    try:
-        resp = _helper_client().chat(
-            model=HELPER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={**HELPER_OPTIONS, "num_predict": 180},
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-        return (resp.message.content or "").strip()
-    except Exception:
-        return ""
+# Path histórico (LLM helper) eliminado 2026-04-26 — sumaba MOZE+tarjeta
+# como "alucinación" pesar del prompt anti-mix. Para recuperarlo: `git
+# log -S "_finance_cards_comment_legacy" -- rag/__init__.py`.
 
 
 _SCOPE_N_DAYS = re.compile(
@@ -43255,88 +43486,45 @@ def serve(host: str, port: int):
                     _cache_put(cache_key, weather_payload)
                 return weather_payload
 
-        # Finance / tarjetas short-circuit (2026-04-26) — el listener de
-        # WhatsApp pega acá vía `/query`. Pre-fix, queries como "cuánto
-        # gasté de tarjeta este mes" caían al retrieve genérico y traían
-        # 90 notas random del vault (las xlsx de tarjetas + CSV de MOZE
-        # NO son notas indexadas). El LLM final alucinaba montos del
-        # Gmail digest o FinOps reports tangenciales.
-        #
-        # Espeja el patrón del weather: detect → fetch → LLM helper
-        # ligero con datos pegados literal → return. Sin retrieve, sin
-        # rerank. ~2-3s vs 15-30s del path largo.
-        if _is_finance_or_cards_query(question):
-            t_fc0 = time.perf_counter()
-            finance_data = None
-            cards_data: list[dict] | None = None
+        # Finance / tarjetas short-circuit (2026-04-26) — queries financieras
+        # bypassean retrieve. Helper compartido con `/chat`. Devuelve None
+        # cuando la query NO es finance/cards o el helper falla, en cuyo
+        # caso seguimos al pipeline normal.
+        _fc_result = _finance_short_circuit_answer(question)
+        if _fc_result is not None:
+            answer, n_cards, has_moze, t_fc = _fc_result
+            query_turn_id = new_turn_id()
+            if sess:
+                append_turn(sess, {
+                    "q": question, "a": answer,
+                    "paths": [], "top_score": 0.0,
+                    "turn_id": query_turn_id, "mode": "finance",
+                })
+                save_session(sess)
             try:
-                # Lazy import desde web.server — el módulo es importable
-                # standalone (no requiere FastAPI corriendo). Si falla
-                # por alguna razón inesperada, fall through al RAG path
-                # (mejor que crashear la query).
-                from web.server import _fetch_credit_cards, _fetch_finance
-                finance_data = _fetch_finance()
-                cards_data = _fetch_credit_cards()
-            except Exception as exc:
-                _silent_log("serve_finance_fetch", exc)
-                # Sin datos, mejor caer al RAG normal — el user puede
-                # querer información histórica de notas que mencionan
-                # tarjetas / gastos.
-            else:
-                # Si AMBOS retornaron vacío y el user pidió algo
-                # específico, mejor decir "no tengo data" antes que
-                # llamar al LLM con un block vacío. La función helper
-                # ya tiene este case manejado, pero acortamos la latencia.
-                if not finance_data and not cards_data:
-                    answer = (
-                        "No tengo data fresca de tus tarjetas ni de MOZE — "
-                        "el último export del banco/Money app puede no "
-                        "estar al día."
-                    )
-                else:
-                    try:
-                        answer = _finance_cards_comment(
-                            question, finance_data, cards_data,
-                        )
-                    except Exception as exc:
-                        _silent_log("serve_finance_comment", exc)
-                        answer = ""
-                if answer:
-                    t_fc = time.perf_counter() - t_fc0
-                    query_turn_id = new_turn_id()
-                    if sess:
-                        append_turn(sess, {
-                            "q": question, "a": answer,
-                            "paths": [], "top_score": 0.0,
-                            "turn_id": query_turn_id, "mode": "finance",
-                        })
-                        save_session(sess)
-                    try:
-                        log_query_event({
-                            "cmd": "serve.finance",
-                            "turn_id": query_turn_id,
-                            "session": sid, "q": question[:200],
-                            "t_retrieve": 0.0,
-                            "t_gen": round(t_fc, 3),
-                            "intent": "finance",
-                            "n_cards": len(cards_data or []),
-                            "has_moze": bool(finance_data),
-                        })
-                    except Exception:
-                        pass
-                    finance_payload = {
-                        "answer": answer,
-                        "sources": [],
-                        "mode": "finance",
-                        "t_retrieve": 0.0,
-                        "t_gen": round(t_fc, 3),
-                        "turn_id": query_turn_id,
-                    }
-                    if not force:
-                        _cache_put(cache_key, finance_payload)
-                    return finance_payload
-                # answer == "" → helper falló sin generar texto; cae al
-                # RAG path para no dejar al user sin respuesta.
+                log_query_event({
+                    "cmd": "serve.finance",
+                    "turn_id": query_turn_id,
+                    "session": sid, "q": question[:200],
+                    "t_retrieve": 0.0,
+                    "t_gen": round(t_fc, 3),
+                    "intent": "finance",
+                    "n_cards": n_cards,
+                    "has_moze": has_moze,
+                })
+            except Exception:
+                pass
+            finance_payload = {
+                "answer": answer,
+                "sources": [],
+                "mode": "finance",
+                "t_retrieve": 0.0,
+                "t_gen": round(t_fc, 3),
+                "turn_id": query_turn_id,
+            }
+            if not force:
+                _cache_put(cache_key, finance_payload)
+            return finance_payload
 
         # Metachat short-circuit — greetings / thanks / "qué podés hacer".
         # Matches the regex-based detector from rag.py:26314 (also used by
@@ -43908,6 +44096,38 @@ def serve(host: str, port: int):
 
         sess = ensure_session(sid, mode="chat") if sid else None
         history = session_history(sess) if sess else None
+
+        # Finance / tarjetas short-circuit — bare text routes here from the
+        # WhatsApp listener (slash commands `/search`/`/rag` go to /query).
+        # Pre-fix 2026-04-26: voice transcript "decime cuánto gasté de
+        # tarjeta este mes" → bare text → /chat → `_SERVE_CHAT_SYSTEM`
+        # told the LLM to suggest `/search ...` instead of answering.
+        # Now we fast-path queries that have data backends (banco xlsx,
+        # MOZE CSV) so the user gets the actual numbers regardless of
+        # whether they typed `/search` or just spoke.
+        _fc_result = _finance_short_circuit_answer(message)
+        if _fc_result is not None:
+            answer, n_cards, has_moze, t_fc = _fc_result
+            chat_turn_id = new_turn_id()
+            if sess:
+                append_turn(sess, {
+                    "q": message, "a": answer[:500],
+                    "turn_id": chat_turn_id, "mode": "finance",
+                })
+                save_session(sess)
+            try:
+                log_query_event({
+                    "cmd": "serve.chat.finance",
+                    "turn_id": chat_turn_id,
+                    "session": sid, "q": message[:200],
+                    "t_gen": round(t_fc, 3),
+                    "intent": "finance",
+                    "n_cards": n_cards,
+                    "has_moze": has_moze,
+                })
+            except Exception:
+                pass
+            return {"answer": answer, "t_gen": round(t_fc, 3)}
 
         messages = [{"role": "system", "content": _SERVE_CHAT_SYSTEM}]
         if history:

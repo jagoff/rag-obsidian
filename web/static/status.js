@@ -718,7 +718,7 @@
           `</span>` +
           `<span class="count">${cnt}</span>` +
           `<button class="diag-trigger" type="button" data-idx="${idx}" ` +
-            `title="Diagnosticar este error con IA">🩺 fix</button>` +
+            `title="Diagnosticar este grupo de errores con IA">▶ fix</button>` +
         `</li>`
       );
     }).join("");

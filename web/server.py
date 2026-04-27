@@ -13063,6 +13063,40 @@ class _DiagnoseErrorRequest(BaseModel):
         return v
 
 
+# Model preference para el feature diagnose-error. command-r:35b es ~2-3×
+# mejor que qwen2.5:7b en razonamiento técnico sobre stack traces + bash
+# (bench informal 2026-04-26). Si command-r no está instalado, caemos a
+# resolve_chat_model() del rag.py que devuelve el chat default del user.
+#
+# Cacheado durante la vida del proceso — la lista de modelos no cambia
+# salvo que el user haga `ollama pull` mientras el web está corriendo,
+# en cuyo caso un restart del daemon lo recoge.
+_DIAGNOSE_MODEL_PREFERENCE: tuple[str, ...] = (
+    "command-r:latest",
+    "command-r:35b",
+    "qwen3:30b-a3b",
+)
+_DIAGNOSE_MODEL_RESOLVED: str | None = None
+
+
+def _resolve_diagnose_model() -> str:
+    """Devuelve el primer modelo de _DIAGNOSE_MODEL_PREFERENCE instalado;
+    fallback a resolve_chat_model() del rag.py (suele ser qwen2.5:7b)."""
+    global _DIAGNOSE_MODEL_RESOLVED
+    if _DIAGNOSE_MODEL_RESOLVED is not None:
+        return _DIAGNOSE_MODEL_RESOLVED
+    try:
+        available = {m.model for m in ollama.list().models}
+    except Exception:
+        available = set()
+    for candidate in _DIAGNOSE_MODEL_PREFERENCE:
+        if candidate in available:
+            _DIAGNOSE_MODEL_RESOLVED = candidate
+            return candidate
+    _DIAGNOSE_MODEL_RESOLVED = resolve_chat_model()
+    return _DIAGNOSE_MODEL_RESOLVED
+
+
 _DIAGNOSE_ERROR_SYSTEM_PROMPT = """\
 Sos un asistente experto en el stack `obsidian-rag` de Fer (Fernando Ferrari).
 El user te muestra una línea de log con un error y pide diagnóstico.
@@ -13166,7 +13200,7 @@ def diagnose_error(req: _DiagnoseErrorRequest, request: Request) -> StreamingRes
                       _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
 
     user_prompt = _build_diagnose_error_prompt(req)
-    model = resolve_chat_model()
+    model = _resolve_diagnose_model()
 
     def _stream():
         try:

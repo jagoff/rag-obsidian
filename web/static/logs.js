@@ -229,11 +229,23 @@
       }
       const svc = it.svc;
       const key = `${svc.dir}::${svc.service}`;
+      // Wrapper row: el button del service ocupa el ancho, el botón
+      // diagnose va a la derecha con stopPropagation. Antes era UN solo
+      // <button>, pero queremos dos acciones independientes (seleccionar
+      // vs. diagnosticar) y un button anidado dentro de otro es HTML
+      // inválido. El row es flex; las status classes (status-X +
+      // is-selected) siguen yendo al `.service-item` para que los
+      // selectores CSS existentes (border-left por status, hover,
+      // selección) sigan funcionando byte-idénticos.
+      const row = el("div", {
+        class: "service-row",
+        dataset: { key: key },
+      });
       const item = el("button", {
         type: "button",
-        class: "service-item status-" + svc.status + (svc.all_empty ? " status-empty" : "") +
+        class: "service-item status-" + svc.status +
+               (svc.all_empty ? " status-empty" : "") +
                (state.selectedKey === key ? " is-selected" : ""),
-        dataset: { key: key },
         onclick: () => selectService(svc),
       },
         el("span", { class: "service-dot" }),
@@ -248,8 +260,118 @@
               String(svc.error_count_recent))
           : null
       );
-      host.appendChild(item);
+      row.appendChild(item);
+      // Botón "▶" diagnose con IA — sólo si el service tiene errores
+      // recientes. No mostramos para services en status=ok porque no hay
+      // nada que diagnosticar y agrega ruido visual a la lista.
+      if (svc.error_count_recent > 0 && (svc.status === "error" || svc.status === "warn")) {
+        const diagBtn = el("button", {
+          type: "button",
+          class: "diag-trigger service-diag-trigger",
+          title: `Diagnosticar errores de ${svc.service} con IA`,
+          "aria-label": `Diagnosticar errores de ${svc.service} con IA`,
+          onclick: (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            void diagnoseServiceErrors(svc);
+          },
+        }, "▶");
+        row.appendChild(diagBtn);
+      }
+      host.appendChild(row);
     }
+  }
+
+  /**
+   * Click handler del botón "▶" en cada service-item del sidebar.
+   *
+   * Estrategia: el LLM diagnostica MEJOR el patrón general que casos
+   * individuales — si tengo 50 instancias del mismo `database is locked`,
+   * agrupar es lo correcto. Por eso traemos las últimas N líneas
+   * error/warn del service y se las pasamos al modal como contexto, en
+   * vez de un único error aislado.
+   *
+   * Pasos:
+   *   1. Encontrar el archivo del service con más probabilidad de
+   *      tener errores (stderr primero, fallback stdout).
+   *   2. Fetch /api/logs/file?only_errors=1 con tail=200 — el endpoint
+   *      ya filtra a level=warn/error.
+   *   3. Quedarnos con las últimas N (10 default) líneas.
+   *   4. Abrir el modal con error_text = resumen del grupo +
+   *      context_lines = los samples completos.
+   */
+  async function diagnoseServiceErrors(svc) {
+    if (!window.DiagnoseModal) {
+      alert("Modal de diagnóstico no cargado. Recargá la página.");
+      return;
+    }
+    // Elegir el archivo: stderr primero, fallback stdout. Si ninguno
+    // tiene `ref` (raro), usamos el primero del array.
+    const stderrFile = svc.files.find((f) => f.kind === "stderr" && f.ref);
+    const stdoutFile = svc.files.find((f) => f.kind === "stdout" && f.ref);
+    const file = stderrFile || stdoutFile || svc.files[0];
+    if (!file || !file.ref) {
+      alert(`No hay archivo de log para ${svc.service}.`);
+      return;
+    }
+    let lines = [];
+    let mtime = null;
+    try {
+      const params = new URLSearchParams({
+        name: file.ref,
+        tail: "200",
+        only_errors: "1",
+      });
+      const resp = await fetch(`/api/logs/file?${params.toString()}`, { cache: "no-store" });
+      if (!resp.ok) {
+        alert(`Error fetching logs: HTTP ${resp.status}`);
+        return;
+      }
+      const data = await resp.json();
+      lines = Array.isArray(data.lines) ? data.lines : [];
+      mtime = data.mtime || null;
+    } catch (e) {
+      alert(`Error de red: ${e.message || e}`);
+      return;
+    }
+    if (lines.length === 0) {
+      alert(`No hay errores recientes en ${svc.service}.`);
+      return;
+    }
+    // Ordenamos: las líneas vienen del más reciente al más viejo (n=1 es
+    // la última). Para el LLM tiene más sentido el orden cronológico
+    // (viejo → nuevo) así sigue el flujo del log. El último error
+    // (más reciente) lo ponemos como `error_text` del modal porque es
+    // el que disparó el click.
+    const sortedAsc = [...lines].sort((a, b) => (a.n || 0) - (b.n || 0));
+    const latest = sortedAsc[sortedAsc.length - 1];
+    // Tomar las últimas 10 (incluida la latest); el resto van como
+    // contexto. Si hay menos de 10, mandamos todas.
+    const N = 10;
+    const groupSlice = sortedAsc.slice(-N);
+    const samples = groupSlice.map((l) => {
+      const tsPart = l.ts ? `[${l.ts.slice(11, 19)}] ` : "";
+      const lvlPart = `(${l.level}) `;
+      return `${tsPart}${lvlPart}${l.text}`;
+    });
+    // El prompt del backend espera UN error_text + N context_lines.
+    // Construimos un error_text "agregado" que le dice al LLM que esto
+    // es un PATRÓN, no un caso aislado, y le damos el más reciente como
+    // representativo. Los samples van en context_lines.
+    const errorText =
+      `[Grupo de ${lines.length} errores recientes en service '${svc.service}']\n\n` +
+      `Última ocurrencia (${latest.ts || "sin ts"}):\n` +
+      `${latest.text}\n\n` +
+      `(Diagnosticá el patrón general del grupo, no solo este caso. ` +
+      `Las ${groupSlice.length} muestras más recientes están en el contexto.)`;
+    window.DiagnoseModal.open({
+      service: svc.service,
+      file: `${svc.dir}/${svc.service} (${file.kind}, group of ${lines.length} errors)`,
+      line_n: latest.n || 0,
+      error_text: errorText,
+      context_lines: samples,
+      timestamp: latest.ts || mtime || null,
+    });
   }
 
   // ── Viewer ───────────────────────────────────────────────────────────
@@ -523,18 +645,20 @@
                   `data-svc-name="${escapeHtml(ln.service)}" ` +
                   `title="abrir el log de ${escapeHtml(ln.service)}">${escapeHtml(ln.service)}</button>`;
       }
-      // Botón "🩺 fix con IA" — sólo visible para errores (CSS gating).
-      // El idx en data-line-idx lo necesita el handler para recuperar
-      // el contexto pre/post de data.lines sin pasarlo por dataset.
-      const diagBtn = `<button class="diag-trigger" type="button" ` +
-                      `data-line-idx="${data.lines.indexOf(ln)}" ` +
-                      `title="enviar al LLM y obtener diagnóstico">🩺</button>`;
+      // 2026-04-26: removido el botón "🩺 fix" por línea individual.
+      // El feedback del user fue claro: "resolver logs así no sirve, se
+      // resuelve por grupo". Una línea aislada NO le da al LLM el patrón
+      // — si tengo 50 instancias del mismo `database is locked`, hace
+      // falta agruparlas para que el diagnóstico tenga sentido.
+      // El botón "▶" ahora vive en cada service-row del sidebar (handler
+      // `diagnoseServiceErrors` arriba), que envía las últimas 10 líneas
+      // error/warn del service como contexto al LLM.
       parts.push(
         `<div class="${cls}">` +
           `<span class="lnum">${ln.n}</span>` +
           `<span class="${tsClass}" title="${escapeHtml(tsTitle)}">${tsLabel}</span>` +
           `<span class="lvl">${lvlLabel}</span>` +
-          `<span class="text">${svcChip}${txt}${diagBtn}</span>` +
+          `<span class="text">${svcChip}${txt}</span>` +
         `</div>`
       );
     }
@@ -551,48 +675,6 @@
         });
       });
     }
-
-    // Wire-up para el botón "🩺 fix con IA" en cada línea con level=error.
-    // Llama al modal compartido (window.DiagnoseModal) con el contexto
-    // necesario: la línea + 20 anteriores + service + file label.
-    body.querySelectorAll(".diag-trigger").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (!window.DiagnoseModal) {
-          alert("Modal de diagnóstico no cargado. Recargá la página.");
-          return;
-        }
-        const idx = parseInt(btn.dataset.lineIdx, 10);
-        if (!Number.isFinite(idx) || !data.lines[idx]) return;
-        const ln = data.lines[idx];
-        // Contexto: las 20 líneas previas (texto solo, no metadata).
-        const ctx = data.lines
-          .slice(Math.max(0, idx - 20), idx)
-          .map((l) => l.text);
-        // Service + file: en modo global cada línea trae `service`; en
-        // single el state apunta al service activo.
-        let serviceName, fileLabel;
-        if (isGlobal) {
-          serviceName = ln.service || "global";
-          fileLabel = ln.ref || `${ln.service} (global feed)`;
-        } else {
-          const svc = findSelectedService();
-          serviceName = svc ? svc.service : "(unknown)";
-          fileLabel = svc
-            ? `${svc.dir}/${svc.service} (${state.selectedKind})`
-            : state.selectedKey || "(unknown)";
-        }
-        window.DiagnoseModal.open({
-          service: serviceName,
-          file: fileLabel,
-          line_n: ln.n || 0,
-          error_text: ln.text || "",
-          context_lines: ctx,
-          timestamp: ln.ts || null,
-        });
-      });
-    });
 
     if (scrollToBottom) {
       // Scrollear al final para sentir tipo `tail -f`. Un raf para que

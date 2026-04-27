@@ -686,14 +686,42 @@
     }
     .insight-breakdown li {
       display: flex;
-      justify-content: space-between;
+      align-items: center;
       gap: 8px;
     }
     .insight-breakdown .cause {
       color: var(--text-dim);
       font-family: inherit;
+      /* margin-right: auto empuja count + botón al final del flex.
+         Antes usábamos justify-content: space-between en el <li> pero
+         eso distribuye 3 hijos (cause/count/botón) en lugar de
+         agruparlos a izquierda/derecha. */
+      margin-right: auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .insight-breakdown .count { color: var(--text); font-weight: 600; }
+    /* Botón "▶ fix" al margen derecho. Pequeño y discreto en idle,
+       más prominente al hover. Hereda el theme via color-mix. */
+    .insight-breakdown .diag-trigger {
+      flex: 0 0 auto;
+      font-size: 11px;
+      padding: 2px 8px;
+      margin-left: 0;
+      border-radius: 4px;
+      color: var(--text-dim);
+      background: var(--sep);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+    .insight-breakdown .diag-trigger:hover {
+      background: color-mix(in srgb, var(--cyan) 20%, var(--sep));
+      color: var(--cyan);
+      border-color: color-mix(in srgb, var(--cyan) 50%, transparent);
+    }
 
     /* Freshness matrix (table compacta). */
     .fresh-table {

@@ -303,6 +303,25 @@
       gap: 3px;
     }
 
+    /* Row wrapper: contiene el .service-item (selección/abrir el log)
+       + opcionalmente .service-diag-trigger (▶ diagnose con IA). El
+       button principal ocupa el ancho disponible; el botón diagnose
+       queda anclado a la derecha. Usamos flex en vez de grid porque
+       el botón diagnose puede no existir (services sin errores no lo
+       muestran), y flex maneja "sin segundo hijo" sin reservar columna
+       vacía. */
+    .service-row {
+      display: flex;
+      align-items: stretch;
+      gap: 4px;
+      margin-bottom: 0;
+      min-width: 0;
+    }
+    .service-row > .service-item {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
     .service-item {
       display: grid;
       grid-template-columns: auto 1fr auto;
@@ -318,6 +337,49 @@
       min-width: 0;
     }
     .service-item:hover { background: var(--hover); }
+
+    /* Botón "▶ diagnose con IA" — vive a la derecha del .service-item
+       en cada .service-row. Por feedback del user 2026-04-26: los
+       errores se resuelven por GRUPO de logs del service, no por línea
+       individual. Click → fetch de las últimas 10 líneas error/warn de
+       ese service → modal con diagnóstico holistic.
+
+       Estilo: pequeño cuadrado a la derecha, fondo opaco que se
+       intensifica al hover. Hereda el border-left color del status
+       de la fila para que servicios en error/warn lo destaquen. */
+    .service-diag-trigger {
+      flex: 0 0 auto;
+      width: 32px;
+      align-self: stretch;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      margin-left: auto;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--sep);
+      border: 1px solid transparent;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+    .service-diag-trigger:hover {
+      background: color-mix(in srgb, var(--cyan) 18%, var(--sep));
+      color: var(--cyan);
+      border-color: color-mix(in srgb, var(--cyan) 40%, transparent);
+    }
+    .service-diag-trigger:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
+    }
+    .service-row:has(.service-item.status-error) .service-diag-trigger {
+      color: var(--red);
+    }
+    .service-row:has(.service-item.status-warn) .service-diag-trigger {
+      color: var(--yellow);
+    }
     /* Pseudo-service "feed global" — visualmente distinto. Borde left
        más grueso, fondo más prominente, ícono ⚡ en vez de dot. */
     .service-item.global-item {

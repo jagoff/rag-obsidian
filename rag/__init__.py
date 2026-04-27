@@ -54150,17 +54150,27 @@ _gliner_load_failed_ts: float = 0.0
 _WARNED_FEATURE_DEPS: set[tuple[str, str]] = set()
 
 
-def _warn_feature_dep_once(feature: str, dep: str) -> None:
+def _warn_feature_dep_once(feature: str, dep: str, *, reason: str = "not_available") -> None:
     """Emit one stderr line the first time a default-ON feature's
     soft-dep fails to import / load in this process.
+
+    `reason` distinguishes between install-missing ("not_available") and
+    model-load failures ("load_failed") so operators can tell from the
+    error.log whether they need to reinstall the extra or debug the HF
+    cache / model download.
 
     Before this (2026-04-22 audit), `RAG_EXTRACT_ENTITIES=1` (default ON)
     + `gliner` missing produced 28+ `gliner_import_failed` per day in
     `silent_errors.jsonl` with zero operator-visible signal. Now the
     first miss prints a single line like::
 
-        [feature: entities] dep `gliner` not available — install with
-          `uv pip install obsidian-rag[entities]` or set RAG_EXTRACT_ENTITIES=0
+        [feature: entities] dep `gliner` not available — install the
+          `obsidian-rag[entities]` extra or disable the feature via env.
+
+    or, when the package is installed but the model fails to load::
+
+        [feature: entities] dep `gliner` model load failed — check
+          ~/.cache/huggingface/hub/ or re-run `GLiNER.from_pretrained(...)`.
 
     Subsequent calls for the same (feature, dep) are no-ops. Process
     restart resets the set — this is by design, so operators see the
@@ -54171,10 +54181,17 @@ def _warn_feature_dep_once(feature: str, dep: str) -> None:
         return
     _WARNED_FEATURE_DEPS.add(key)
     try:
-        sys.stderr.write(
-            f"[feature: {feature}] dep `{dep}` not available — install the "
-            f"`obsidian-rag[{feature}]` extra or disable the feature via env.\n"
-        )
+        if reason == "load_failed":
+            sys.stderr.write(
+                f"[feature: {feature}] dep `{dep}` model load failed — check "
+                f"~/.cache/huggingface/hub/ or reinstall: "
+                f"`uv tool install --reinstall --editable '.[{feature}]'`\n"
+            )
+        else:
+            sys.stderr.write(
+                f"[feature: {feature}] dep `{dep}` not available — install the "
+                f"`obsidian-rag[{feature}]` extra or disable the feature via env.\n"
+            )
         sys.stderr.flush()
     except Exception:
         pass
@@ -54248,7 +54265,7 @@ def _get_gliner_model():
                 _silent_log("gliner_load_failed", exc)
             except Exception:
                 pass
-            _warn_feature_dep_once("entities", "gliner")
+            _warn_feature_dep_once("entities", "gliner", reason="load_failed")
             return None
 
 

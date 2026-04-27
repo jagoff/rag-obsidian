@@ -4375,6 +4375,17 @@ async function send(question, opts = {}) {
           appendWebSearch(target, question, true);
         }
       }
+      // Pin question + session on the turn BEFORE appendSources so the
+      // dwell tracker rows copy them into row.dataset.{q,session}. Pre-fix
+      // (audit 2026-04-26): appendSources corría antes del set en 4419, los
+      // rows quedaban con q=undefined → 122 'open' events del web con
+      // query=NULL en rag_behavior → ranker-vivo lee "n_behavior=0" y NO
+      // aprende del click signal real. Ver `_behavior_augmented_cases`.
+      if (question) {
+        turn.dataset.q = question.length > 300
+          ? question.slice(0, 300) : question;
+      }
+      if (sessionId) turn.dataset.session = sessionId;
       if (!hadProposal && !isMetachat && sources && sources.length) {
         appendSources(turn, sources, conf);
       }

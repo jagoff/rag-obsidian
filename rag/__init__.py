@@ -6166,9 +6166,18 @@ def _migrate_trace_id_columns(conn) -> None:
     falló). Con trace_id, un grep cruza las 3 fuentes en O(1).
     """
     import sqlite3 as _sqlite3
+    # Audit 2026-04-26: agregamos cpu/memory metrics al ALTER. Antes del fix,
+    # algún caller de los samplers `_cpu_persist`/`_memory_persist` inyectaba
+    # `trace_id` al payload (correlación request-tracing). Las tablas
+    # rag_cpu_metrics + rag_memory_metrics se crearon SIN la columna en el
+    # DDL inicial → cada sample dispara `OperationalError: no such column:
+    # trace_id` cada 60s. 333 errores en 7d, watchdog de memory-pressure
+    # ciego. ALTER idempotente en migration ahora cubre las 4 tablas.
     for col_ddl in (
         "ALTER TABLE rag_queries ADD COLUMN trace_id TEXT",
         "ALTER TABLE rag_behavior ADD COLUMN trace_id TEXT",
+        "ALTER TABLE rag_cpu_metrics ADD COLUMN trace_id TEXT",
+        "ALTER TABLE rag_memory_metrics ADD COLUMN trace_id TEXT",
     ):
         try:
             conn.execute(col_ddl)

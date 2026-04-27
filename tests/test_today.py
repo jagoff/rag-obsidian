@@ -282,6 +282,161 @@ def test_today_todo_frontmatter_in_window(tmp_vault):
     assert "02-Areas/with-todo.md" in paths
 
 
+# ── _render_today_prompt — extras (cross-source signals) ────────────────────
+
+
+def _ev_minimal():
+    """Evidence shell (notas tocadas + 1 inbox) que asegura `total > 0`."""
+    return {
+        "recent_notes": [
+            {"title": "Nota A", "path": "02-Areas/A.md", "snippet": "cuerpo A"}
+        ],
+        "inbox_today": [],
+        "todos": [],
+        "new_contradictions": [],
+        "low_conf_queries": [],
+        "wa_scheduled_today_pending": [],
+    }
+
+
+def test_render_today_prompt_no_extras_backward_compatible():
+    """Sin extras, sigue funcionando como antes — 4 secciones obligatorias."""
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal())
+    for h in ("Lo que pasó hoy", "Sin procesar", "Preguntas abiertas", "Para mañana"):
+        assert f"## " in prompt and h in prompt
+    # Sin extras, no aparecen los nuevos buckets
+    assert "Gmail" not in prompt
+    assert "WhatsApp pendientes de respuesta" not in prompt
+    assert "YouTube" not in prompt
+
+
+def test_render_today_prompt_includes_gmail_when_provided():
+    extras = {
+        "gmail_unread": {
+            "unread_count": 12,
+            "awaiting_reply": [
+                {"subject": "Reunión proyecto X", "sender": "fer@ejemplo.com",
+                 "days_old": 3},
+                {"subject": "Factura abril", "sender": "billing@x.io",
+                 "days_old": 1},
+            ],
+        }
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Gmail" in prompt
+    assert "12" in prompt  # unread count
+    assert "Reunión proyecto X" in prompt
+    assert "fer@ejemplo.com" in prompt
+
+
+def test_render_today_prompt_includes_wa_unreplied():
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Marina", "jid": "549@s.whatsapp.net",
+             "last_snippet": "che, te respondo después", "hours_waiting": 26.5},
+            {"name": "Equipo X", "jid": "120@g.us",
+             "last_snippet": "alguien viene mañana?", "hours_waiting": 8.0},
+        ]
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "WhatsApp" in prompt and "respond" in prompt.lower()
+    assert "Marina" in prompt
+    assert "26" in prompt or "27" in prompt  # hours_waiting redondeado
+
+
+def test_render_today_prompt_includes_calendar_tomorrow():
+    extras = {
+        "tomorrow_calendar": [
+            {"title": "Sync con Pablo", "date_label": "mañana",
+             "time_range": "10:00–11:00"},
+            {"title": "Dentista", "date_label": "mañana",
+             "time_range": "16:30–17:30"},
+        ]
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Sync con Pablo" in prompt
+    assert "10:00" in prompt
+
+
+def test_render_today_prompt_includes_youtube_drive_bookmarks():
+    extras = {
+        "youtube_watched": [
+            {"title": "Video de RAG", "url": "https://yt/abc",
+             "video_id": "abc", "visit_count": 1,
+             "last_visit_iso": "2026-04-21T10:00"},
+        ],
+        "drive_recent": [
+            {"name": "Spec X.pdf", "last_modified": "2026-04-21T12:00"},
+        ],
+        "chrome_bookmarks": [
+            {"name": "Hacker News", "url": "https://news.ycombinator.com",
+             "folder": "tech", "visit_count": 4,
+             "last_visit_iso": "2026-04-21T08:00"},
+        ],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    assert "Video de RAG" in prompt
+    assert "Spec X.pdf" in prompt
+    assert "Hacker News" in prompt
+
+
+def test_render_today_prompt_asks_for_cross_source_matching():
+    """El prompt debe instruir explícitamente al LLM a buscar conexiones
+    entre fuentes (gmail/wa/calendar/notas) cuando hay extras de varias
+    fuentes — esto es lo que diferencia un dump plano de un brief útil.
+    """
+    extras = {
+        "gmail_unread": {"unread_count": 5, "awaiting_reply": []},
+        "whatsapp_unreplied": [{"name": "X", "jid": "j", "last_snippet": "hola",
+                                "hours_waiting": 5}],
+        "tomorrow_calendar": [{"title": "T", "date_label": "mañana",
+                               "time_range": "10:00"}],
+    }
+    prompt = rag._render_today_prompt("2026-04-21", _ev_minimal(), extras=extras)
+    # Buscamos cualquier referencia a cross-source / conexiones / agrupar.
+    lower = prompt.lower()
+    assert any(
+        marker in lower
+        for marker in ("cross-source", "cross source", "conexion",
+                       "conexión", "agrupá", "agrupa ",
+                       "entre fuentes", "patrón")
+    ), f"prompt no pide cross-source matching:\n{prompt}"
+
+
+# ── _generate_today_narrative — model selection ─────────────────────────────
+
+
+def test_generate_today_narrative_uses_qwen14b_by_default(monkeypatch):
+    captured = {}
+
+    def _fake_chat(model, messages, options=None, keep_alive=None):
+        captured["model"] = model
+        return _FakeResponse("ok")
+
+    fake_client = type("_C", (), {"chat": staticmethod(_fake_chat)})()
+    monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
+    monkeypatch.delenv("OBSIDIAN_RAG_TODAY_MODEL", raising=False)
+
+    out = rag._generate_today_narrative("hola")
+    assert out == "ok"
+    assert captured["model"] == "qwen2.5:14b"
+
+
+def test_generate_today_narrative_respects_env_override(monkeypatch):
+    captured = {}
+
+    def _fake_chat(model, messages, options=None, keep_alive=None):
+        captured["model"] = model
+        return _FakeResponse("ok")
+
+    fake_client = type("_C", (), {"chat": staticmethod(_fake_chat)})()
+    monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
+    monkeypatch.setenv("OBSIDIAN_RAG_TODAY_MODEL", "command-r:latest")
+
+    rag._generate_today_narrative("hola")
+    assert captured["model"] == "command-r:latest"
+
+
 # ── CLI `rag today` ──────────────────────────────────────────────────────────
 
 

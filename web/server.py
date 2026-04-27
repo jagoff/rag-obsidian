@@ -7726,7 +7726,30 @@ def _home_compute(
         finance_snapshot = signals.get("finance") if isinstance(signals, dict) else None
         if finance_snapshot:
             today_ev = {**today_ev, "finance": finance_snapshot}
-        prompt = _render_today_prompt(date_label, today_ev)
+        # Cross-source extras — NO los inventamos, ya los recolectamos
+        # en paralelo arriba (`signals` + buckets sueltos). Pasarlos al
+        # LLM permite que el brief escriba "esperás respuesta de 3 chats
+        # WhatsApp + 2 mails VIP + tenés meet con Pablo mañana 10hs"
+        # en vez de un recap solo del vault. El render del prompt
+        # ignora keys vacías así que es safe pasar todo aunque algunos
+        # buckets hayan caído en timeout (`_await(...)` devuelve []/{}).
+        signals_dict = signals if isinstance(signals, dict) else {}
+        extras = {
+            "gmail_unread": signals_dict.get("gmail") or {},
+            "mail_unread": signals_dict.get("mail_unread") or [],
+            "whatsapp_unreplied": signals_dict.get("whatsapp_unreplied")
+                or signals_dict.get("whatsapp") or [],
+            "tomorrow_calendar": tomorrow_calendar,
+            "drive_recent": signals_dict.get("drive_recent") or [],
+            "youtube_watched": signals_dict.get("youtube_watched") or [],
+            "chrome_bookmarks": signals_dict.get("chrome_bookmarks") or [],
+            "loops_stale": signals_dict.get("loops_stale") or [],
+            "loops_activo": signals_dict.get("loops_activo") or [],
+            "pagerank_top": signals_dict.get("pagerank_top") or [],
+            "vault_activity": signals_dict.get("vault_activity") or {},
+            "followup_aging": signals_dict.get("followup_aging") or {},
+        }
+        prompt = _render_today_prompt(date_label, today_ev, extras=extras)
         narrative = _generate_today_narrative(prompt)
         narrative_source = "generated" if narrative else "error"
         if narrative:

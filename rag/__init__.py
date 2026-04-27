@@ -17190,6 +17190,8 @@ def _note_centroids(
     col: SqliteVecCollection,
     folder: str | None = None,
     skip_folders: tuple[str, ...] = (),
+    *,
+    vault_only: bool = True,
 ) -> tuple[list[str], list[dict], "np.ndarray"]:
     """Group all chunks by file, average the embeddings, L2-normalise.
 
@@ -17197,6 +17199,13 @@ def _note_centroids(
     zero chunks (shouldn't happen) are skipped silently. `skip_folders` is
     a tuple of path prefixes to exclude (e.g. `("04-Archive/",)` so dupes
     don't pair a live note with its archived copy).
+
+    `vault_only` (default True) skips cross-source chunks whose ``source``
+    metadata is anything other than ``"vault"`` (calendar, reminders,
+    whatsapp, gmail, contacts, calls, safari, messages …).  Those chunks
+    share the same collection but are not user vault notes, so they produce
+    spurious cosine-1.000 pairs for recurring calendar events and similar
+    structural duplicates that the user never sees in Obsidian.
     """
     import numpy as np
     data = col.get(include=["embeddings", "metadatas"])
@@ -17204,6 +17213,8 @@ def _note_centroids(
     for emb, meta in zip(data["embeddings"], data["metadatas"]):
         f = meta.get("file", "")
         if not f:
+            continue
+        if vault_only and normalize_source(meta.get("source")) != "vault":
             continue
         if folder and not (f == folder or f.startswith(folder.rstrip("/") + "/")):
             continue
@@ -39525,7 +39536,25 @@ def _collect_today_evidence(
     }
 
 
-def _render_today_prompt(date_label: str, ev: dict) -> str:
+def _render_today_prompt(
+    date_label: str, ev: dict, extras: dict | None = None,
+) -> str:
+    extras = extras or {}
+    # ¿Tenemos señales cross-source más allá del vault? Si sí, el prompt
+    # cambia el énfasis: en lugar de un recap solo del vault, le pedimos
+    # al LLM que busque conexiones entre fuentes (gmail × calendar × wa
+    # × notas × drive). Esto es lo que diferencia un dump plano de un
+    # brief útil — el modelo tiene que agrupar items que aparecen en
+    # múltiples fuentes y nombrar el patrón.
+    has_cross_source = any(
+        extras.get(k) for k in (
+            "gmail_unread", "whatsapp_unreplied", "tomorrow_calendar",
+            "drive_recent", "youtube_watched", "chrome_bookmarks",
+            "vault_activity", "pagerank_top", "followup_aging",
+            "loops_stale", "loops_activo", "reminders_overdue",
+            "mail_unread",
+        )
+    )
     parts = [
         f"Generás un evening brief para el {date_label} (cierre del día), en "
         "2da persona singular (tuteo rioplatense: 'recibiste', 'estuviste', "
@@ -39594,6 +39623,97 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
             "revisá `launchctl list | grep wa-scheduled-send` y los logs)"
         )
         parts.append("")
+    # ── Cross-source signals (gmail, calendar, wa, drive, youtube,
+    # bookmarks, loops, vault-activity). Estas señales NO vienen del
+    # vault — vienen del fan-out de `_home_compute` en web/server.py.
+    # Solo se renderean si el caller las pasa en `extras`.
+    gmail = extras.get("gmail_unread") or {}
+    if gmail and (gmail.get("unread_count") or gmail.get("awaiting_reply")):
+        unread = int(gmail.get("unread_count") or 0)
+        awaiting = gmail.get("awaiting_reply") or []
+        parts.append(f"## 📧 Gmail — bandeja al cierre del día ({unread} sin leer):")
+        for m in awaiting[:5]:
+            subj = (m.get("subject") or "(sin asunto)")[:80]
+            sender = m.get("sender") or m.get("from") or "?"
+            days = m.get("days_old")
+            tail = f" ({days}d esperando respuesta)" if days else ""
+            parts.append(f"- \"{subj}\" — {sender}{tail}")
+        parts.append("")
+    mail_unread = extras.get("mail_unread") or []
+    if mail_unread:
+        parts.append(f"## 📨 Apple Mail — VIP / sin leer ({len(mail_unread)}):")
+        for m in mail_unread[:5]:
+            subj = (m.get("subject") or "(sin asunto)")[:80]
+            sender = m.get("sender") or "?"
+            vip = " ⭐VIP" if m.get("is_vip") else ""
+            parts.append(f"- \"{subj}\" — {sender}{vip}")
+        parts.append("")
+    wa_un = extras.get("whatsapp_unreplied") or []
+    if wa_un:
+        parts.append(
+            f"## 💬 WhatsApp — esperando que respondas ({len(wa_un)} chats):"
+        )
+        for w in wa_un[:6]:
+            name = w.get("name") or "(sin nombre)"
+            snippet = (w.get("last_snippet") or "")[:90]
+            hours = w.get("hours_waiting") or 0
+            parts.append(f"- {name} ({hours:.0f}h esperando): \"{snippet}\"")
+        parts.append("")
+    cal_tomorrow = extras.get("tomorrow_calendar") or []
+    if cal_tomorrow:
+        parts.append(f"## 📅 Calendario — mañana ({len(cal_tomorrow)} eventos):")
+        for c in cal_tomorrow[:8]:
+            title = c.get("title") or "(sin título)"
+            tr = c.get("time_range") or ""
+            parts.append(f"- {tr} — {title}")
+        parts.append(
+            "(NO armes una agenda con esto — solo úsalo para mencionar el clima "
+            "del día siguiente o conectarlo con cabos sueltos de hoy)"
+        )
+        parts.append("")
+    drive_recent = extras.get("drive_recent") or []
+    if drive_recent:
+        parts.append(f"## 🗂 Drive — archivos recientes ({len(drive_recent)}):")
+        for d in drive_recent[:5]:
+            name = d.get("name") or d.get("title") or "?"
+            parts.append(f"- {name}")
+        parts.append("")
+    yt = extras.get("youtube_watched") or []
+    if yt:
+        parts.append(f"## 📺 YouTube — visto últimos 7 días ({len(yt)} videos):")
+        for v in yt[:5]:
+            title = (v.get("title") or "?")[:90]
+            parts.append(f"- {title}")
+        parts.append("")
+    bm = extras.get("chrome_bookmarks") or []
+    if bm:
+        parts.append(f"## 🔖 Chrome bookmarks usados ({len(bm)}):")
+        for b in bm[:5]:
+            name = (b.get("name") or "?")[:80]
+            folder = b.get("folder") or ""
+            tail = f" [{folder}]" if folder else ""
+            parts.append(f"- {name}{tail}")
+        parts.append("")
+    loops_stale = extras.get("loops_stale") or []
+    if loops_stale:
+        parts.append(f"## 🔄 Loops viejos sin tocar (>30d) ({len(loops_stale)}):")
+        for lp in loops_stale[:5]:
+            note = lp.get("source_note") or "?"
+            text = (lp.get("loop_text") or "")[:120]
+            age = lp.get("age_days") or 0
+            parts.append(f"- [[{note}]] ({age}d): {text}")
+        parts.append("")
+    pagerank_top = extras.get("pagerank_top") or []
+    if pagerank_top:
+        parts.append(
+            f"## 🌟 Notas centrales del vault (PageRank top {len(pagerank_top)}):"
+        )
+        for n in pagerank_top[:5]:
+            parts.append(f"- [[{n.get('title') or '?'}]]")
+        parts.append(
+            "(si tocaste hoy alguna de estas, dale más peso en el recap)"
+        )
+        parts.append("")
     fin = ev.get("finance") or {}
     ars = fin.get("ars") or {}
     has_finance = bool(ars.get("this_month"))
@@ -39620,32 +39740,55 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
             )
             parts.append(f"- top categorías: {bits}")
         parts.append("")
+    extra_sections = []
+    if has_cross_source:
+        extra_sections.append("`## 🔗 Conexiones del día` (cross-source)")
+    if has_finance:
+        extra_sections.append("`## 💸 Finanzas`")
+    extras_clause = (
+        f"; agregá {' y '.join(extra_sections)} como sección extra SOLO "
+        "si recibiste el bloque correspondiente arriba"
+    ) if extra_sections else ""
     sections_hint = (
         "Formato de salida (Markdown, EXACTO, incluí las 4 secciones aunque "
-        "alguna quede corta" + (
-            "; agregá `## 💸 Finanzas` como 5ta sección SOLO si recibiste "
-            "el bloque 'Finanzas' arriba" if has_finance else ""
-        ) + "):"
+        "alguna quede corta" + extras_clause + "):"
     )
     parts.extend([
         sections_hint,
         "",
         "## 🪞 Lo que pasó hoy",
-        "(2-3 líneas concretas: qué notas tocaste, qué temas aparecieron; "
-        "si no hubo casi nada, decilo breve)",
+        "(3-4 líneas concretas: qué notas tocaste, qué temas aparecieron, "
+        "qué mails/mensajes movieron la aguja. Si no hubo casi nada, decilo "
+        "breve. Mezclá señales — no listés solo notas)",
         "",
         "## 📥 Sin procesar",
-        "(listar capturas de hoy que todavía no tienen carpeta/tags; si no "
-        "hay, decir 'nada quedó suelto')",
+        "(listar capturas de hoy que todavía no tienen carpeta/tags + mails "
+        "VIP sin responder + chats WhatsApp esperando respuesta. Si no hay "
+        "nada de esto, decir 'nada quedó suelto')",
         "",
         "## 🔍 Preguntas abiertas",
         "(queries low-confidence de hoy → notas que podrías escribir; "
         "citá las preguntas literales; omitir la sección si no hubo ninguna)",
         "",
         "## 🌅 Para mañana",
-        "(2-3 action items concretos derivados de cabos sueltos de hoy; "
-        "NO agenda genérica — tienen que venir del contexto real)",
+        "(2-3 action items concretos derivados de cabos sueltos de hoy. "
+        "Si hay eventos en el calendario de mañana, mencionalos SOLO si "
+        "se conectan con algo de hoy — no copies la agenda. NO agenda "
+        "genérica — todo tiene que venir del contexto real)",
     ])
+    if has_cross_source:
+        parts.extend([
+            "",
+            "## 🔗 Conexiones del día",
+            "(1-3 patrones cross-source REALES — solo si los encontrás. "
+            "Ejemplos del tipo de patrón a buscar: una persona que aparece "
+            "en gmail Y en WhatsApp Y en una nota tocada hoy → agrupala "
+            "en una línea; un proyecto mencionado en una nota que también "
+            "tiene archivos en Drive → contextualizalo; un tema de "
+            "YouTube que se cruza con una pregunta low-confidence → "
+            "señalalo. NO inventes conexiones que no estén en los datos. "
+            "Si no encontrás patrones reales, omití la sección entera.)",
+        ])
     if has_finance:
         parts.extend([
             "",
@@ -39653,17 +39796,37 @@ def _render_today_prompt(date_label: str, ev: dict) -> str:
             "(1-2 líneas: total del mes + si el run-rate proyecta arriba/abajo "
             "del mes pasado, y 1 categoría que destaca. Sé factual, sin juicio.)",
         ])
+    word_budget = (
+        "Entre 250 y 450 palabras total" if has_cross_source
+        else "Entre 150 y 250 palabras total"
+    )
     parts.extend([
         "",
-        "Entre 150 y 250 palabras total. Citá notas con [[Título]].",
+        f"{word_budget}. Citá notas con [[Título]]. Citá personas por "
+        "nombre cuando aparezcan en gmail/wa/calendar.",
     ])
     return "\n".join(parts)
+
+
+def _today_brief_model() -> str:
+    """Modelo para el evening brief de `rag today`. Default `qwen2.5:14b`
+    porque el chat-default (`qwen2.5:7b`) escribe briefs cortos y se le
+    pierden las conexiones cross-source cuando recibe 10+ buckets.
+    Override por env si el user quiere probar `command-r:latest` (35B,
+    optimizado para RAG grounded) o volver a `qwen2.5:7b` por latencia.
+    Pipeline:
+      1. `OBSIDIAN_RAG_TODAY_MODEL` (env)
+      2. `qwen2.5:14b` (default — instalado en local + 9GB)
+    No cae a `resolve_chat_model()` para mantener el brief desacoplado
+    del modelo del chat (la calidad/latencia óptima es distinta).
+    """
+    return os.environ.get("OBSIDIAN_RAG_TODAY_MODEL") or "qwen2.5:14b"
 
 
 def _generate_today_narrative(prompt: str) -> str:
     try:
         resp = _chat_capped_client().chat(
-            model=resolve_chat_model(),
+            model=_today_brief_model(),
             messages=[{"role": "user", "content": prompt}],
             options=CHAT_OPTIONS,
             keep_alive=chat_keep_alive(),

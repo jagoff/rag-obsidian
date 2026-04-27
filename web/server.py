@@ -1355,14 +1355,27 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402 — must go aft
 
 # LAN IP privada (192.168.x.x / 10.x.x.x / 172.16-31.x.x) se permite sólo
 # cuando OBSIDIAN_RAG_ALLOW_LAN=1 — empareja con OBSIDIAN_RAG_BIND_HOST=
-# 0.0.0.0 para exponer la PWA al iPhone vía `http://192.168.x.x:8765`.
-# Sin el flag el regex se mantiene igual que antes (localhost only).
+# 0.0.0.0 para exponer la PWA al iPhone vía `http://192.168.x.x:8765` o
+# `https://192.168.x.x:8765` (Caddy tls internal). Sin el flag el regex
+# se mantiene igual que antes (localhost only).
+#
+# Bug fix 2026-04-27: http → https? en ambas ramas para no bloquear Caddy
+# tls internal (LAN) ni HTTPS local (localhost:8765 vía Caddy).
+#
+# OBSIDIAN_RAG_ALLOW_TUNNEL=1 añade las URLs de Cloudflare Quick Tunnel
+# (`https://<slug>.trycloudflare.com`) al regex para que el iPhone pueda
+# usar el SW + full PWA sobre HTTPS público. Se empareja con la env var
+# que propaga el watcher (`cloudflared_watcher.sh`). Default OFF — la URL
+# random de trycloudflare.com es unguessable pero expone el server al
+# internet público (sin auth). Solo activar junto con el túnel.
 _allow_lan = os.environ.get("OBSIDIAN_RAG_ALLOW_LAN", "").strip().lower() in ("1", "true", "yes")
+_allow_tunnel = os.environ.get("OBSIDIAN_RAG_ALLOW_TUNNEL", "").strip().lower() in ("1", "true", "yes")
 if _allow_lan:
     # RFC1918 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. Nada más.
+    # https? cubre http (LAN plain) y https (Caddy tls internal).
     # Refuses file:// y cualquier IP pública.
     _cors_regex = (
-        r"^http://("
+        r"^https?://("
         r"127\.0\.0\.1|localhost|"
         r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
         r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
@@ -1370,7 +1383,15 @@ if _allow_lan:
         r")(:[0-9]+)?$"
     )
 else:
-    _cors_regex = r"^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$"
+    _cors_regex = r"^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?$"
+# Cloudflare Quick Tunnel: cualquier subdominio *.trycloudflare.com sobre
+# HTTPS solamente. La URL cambia en cada restart de cloudflared pero el
+# patrón es estable — solo HTTPS, nunca HTTP (Cloudflare fuerza TLS).
+if _allow_tunnel:
+    _cors_regex = (
+        r"(?:" + _cors_regex + r")"
+        r"|^https://[a-z0-9-]+\.trycloudflare\.com$"
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -1804,6 +1825,17 @@ def _warmup() -> None:
 @app.get("/")
 def home_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "home.html")
+
+
+# Preview ruta del refactor de home (mission-control terminal). Servida
+# en `/v2` mientras iteramos visualmente. Cuando esté listo y validado,
+# `home.v2.html` reemplaza a `home.html` (con backup) y esta ruta se
+# elimina. Usa los mismos endpoints `/api/home` así que no hay backend
+# nuevo. Ver `00-Inbox/RAG - Flujo WhatsApp - auditoría` del vault para
+# el contexto que originó este refactor.
+@app.get("/v2")
+def home_v2_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "home.v2.html")
 
 
 @app.get("/chat")
@@ -7045,7 +7077,22 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
     interrupted (Python threads aren't preemptable), but the cancellation
     short-circuits any sub-stages that haven't started — which matters
     most for `signals` (9 internal fetchers).
+
+    Bug fix 2026-04-27: apply the same per-IP slot cap used by
+    dashboard_stream / system_memory_stream / system_cpu_stream. Without
+    the cap a browser tab that keeps reconnecting (background EventSource
+    auto-reconnect) can accumulate connections, each launching a full
+    14-fetcher `_home_compute` fan-out with concurrent threads.
     """
+    # Cap por IP — mismo patrón que dashboard_stream (audit 2026-04-25 R2).
+    client_ip: str | None = None
+    client_ip = request.client.host if request.client else "unknown"
+    if not _sse_acquire_slot(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)",
+        )
+
     import asyncio
     import queue as _queue
     from contextlib import suppress
@@ -7219,6 +7266,11 @@ async def home_stream(request: Request, regenerate: bool = False) -> StreamingRe
             # running fetchers will finish naturally (warming caches)
             # but won't queue more work.
             cancel_event.set()
+            # Bug fix 2026-04-27: liberar el slot SSE al cerrar el stream
+            # (limpio, cancel, o timeout). client_ip nunca es None aquí
+            # porque el gate de arriba lo asigna siempre antes de entrar.
+            if client_ip is not None:
+                _sse_release_slot(client_ip)
 
     return StreamingResponse(
         _gen(),
@@ -10591,7 +10643,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             with _CHAT_INFLIGHT_LOCK:
                 _CHAT_INFLIGHT = max(0, _CHAT_INFLIGHT - 1)
 
-    return StreamingResponse(guarded(), media_type="text/event-stream")
+    # Bug fix 2026-04-27: add anti-buffering headers so reverse proxies
+    # (Caddy, nginx) don't buffer the SSE stream, causing the user to
+    # see nothing until the response completes. Same set as home_stream /
+    # dashboard_stream.
+    return StreamingResponse(
+        guarded(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/dashboard")
@@ -16480,6 +16544,35 @@ def _stream_fetch_since(conn, table: str, last_id: int) -> list[dict]:
         return []
 
 
+def _do_poll_sql(cursors: dict) -> list[tuple[str, dict]]:
+    """Sync helper: open one SQL connection, scan all stream sources, return
+    list of (kind, payload) pairs for rows found since the last cursor.
+
+    Extracted so `dashboard_stream` can offload the blocking I/O to a thread
+    pool via `asyncio.to_thread`, keeping the async event loop unblocked.
+    Cursor state is mutated in-place so callers see the updated positions.
+    """
+    import rag as _rag
+
+    events: list[tuple[str, dict]] = []
+    try:
+        with _rag._ragvec_state_conn() as conn:
+            for kind, (table, mapper) in _STREAM_SOURCES.items():
+                if cursors[kind] is None:
+                    cursors[kind] = _stream_max_id(conn, table)
+                    continue
+                rows = _stream_fetch_since(conn, table, cursors[kind])
+                if not rows:
+                    continue
+                cursors[kind] = max(int(r.get("id") or 0) for r in rows)
+                for r in rows:
+                    ev = mapper(r)
+                    events.append((kind, _stream_payload(kind, ev)))
+    except Exception:
+        pass
+    return events
+
+
 @app.get("/api/dashboard/stream")
 async def dashboard_stream(request: Request = None) -> StreamingResponse:  # type: ignore[assignment]
     """SSE: poll rag_* SQL tables for new rows and push them as events.
@@ -16525,23 +16618,12 @@ async def dashboard_stream(request: Request = None) -> StreamingResponse:  # typ
         yield _sse("hello", {"t": time.time(), "tracking": list(_STREAM_SOURCES)})
         try:
             while True:
-                try:
-                    with _ragvec_state_conn() as conn:
-                        for kind, (table, mapper) in _STREAM_SOURCES.items():
-                            if cursors[kind] is None:
-                                cursors[kind] = _stream_max_id(conn, table)
-                                continue
-                            rows = _stream_fetch_since(conn, table, cursors[kind])
-                            if not rows:
-                                continue
-                            cursors[kind] = max(int(r.get("id") or 0) for r in rows)
-                            for r in rows:
-                                ev = mapper(r)
-                                yield _sse(kind, _stream_payload(kind, ev))
-                except Exception:
-                    # Transient SQL error — skip this cycle, keep the SSE
-                    # connection up so the dashboard doesn't reconnect.
-                    pass
+                # Offload blocking SQL I/O to a thread so the async event
+                # loop stays free for concurrent /api/chat and other SSE
+                # streams. `_do_poll_sql` mutates `cursors` in-place.
+                events = await asyncio.to_thread(_do_poll_sql, cursors)
+                for kind, payload in events:
+                    yield _sse(kind, payload)
                 now = time.time()
                 if now - last_heartbeat >= 15:
                     yield _sse("heartbeat", {"t": now})

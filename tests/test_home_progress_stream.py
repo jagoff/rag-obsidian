@@ -819,3 +819,71 @@ def test_record_home_compute_drops_outliers_before_sql_write(
             ).fetchall())
         assert rows[0][0] == 0, "outliers leaked to SQL"
     # Si la tabla no existe → ningún writer corrió, mejor todavía.
+
+
+# ── Bug fix 2026-04-27: SSE slot cap on /api/home/stream ──────────────────
+
+
+def test_home_stream_slot_cap_returns_429_when_full(monkeypatch):
+    """Bug fix: /api/home/stream must honour the per-IP SSE slot cap
+    (same as dashboard_stream / system_memory_stream / system_cpu_stream).
+    When a given IP already has `_SSE_MAX_PER_IP` slots taken, a new
+    request must get HTTP 429 before launching any _home_compute worker."""
+    from web import server as srv
+
+    test_ip = "10.0.0.1"
+
+    # Pre-fill the slot counter to the cap.
+    with srv._SSE_CONNECTIONS_LOCK:
+        srv._SSE_CONNECTIONS_PER_IP[test_ip] = srv._SSE_MAX_PER_IP
+
+    try:
+        from fastapi import Request
+        from unittest.mock import MagicMock
+        import asyncio
+        from fastapi import HTTPException
+
+        # Build a minimal fake Request with the test IP.
+        mock_request = MagicMock(spec=Request)
+        mock_request.client = MagicMock()
+        mock_request.client.host = test_ip
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(srv.home_stream(mock_request))
+
+        assert exc_info.value.status_code == 429
+        detail = exc_info.value.detail
+        assert "too many concurrent streams" in detail
+        assert str(srv._SSE_MAX_PER_IP) in detail
+    finally:
+        # Clean up so other tests see a clean counter.
+        with srv._SSE_CONNECTIONS_LOCK:
+            srv._SSE_CONNECTIONS_PER_IP.pop(test_ip, None)
+
+
+def test_home_stream_slot_released_after_stream(monkeypatch, stub_fetchers):
+    """Bug fix: slot must be released when the SSE stream ends so a
+    second connection from the same IP can succeed (no permanent leak)."""
+    from web import server as srv
+    from fastapi.testclient import TestClient
+
+    test_ip = "127.0.0.1"
+
+    # Snapshot the counter before the request.
+    with srv._SSE_CONNECTIONS_LOCK:
+        count_before = srv._SSE_CONNECTIONS_PER_IP.get(test_ip, 0)
+
+    client = TestClient(srv.app)
+    resp = client.get(
+        "/api/home/stream",
+        headers={"Accept": "text/event-stream"},
+    )
+    # The TestClient drains the full response.
+    assert resp.status_code == 200
+
+    with srv._SSE_CONNECTIONS_LOCK:
+        count_after = srv._SSE_CONNECTIONS_PER_IP.get(test_ip, 0)
+
+    assert count_after == count_before, (
+        f"slot was not released: before={count_before} after={count_after}"
+    )

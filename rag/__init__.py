@@ -12460,19 +12460,16 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     global _corpus_cache
     n = col.count()
     cid = str(getattr(col, "id", "") or "")
-    # Check + return bajo el mismo lock para evitar TOCTOU con
-    # `_invalidate_corpus_cache`. Audit 2026-04-26 (BUG #8): pre-fix
-    # rebuild ocurría FUERA del lock — dos threads en miss simultáneo
-    # ejecutaban BM25Okapi en paralelo (lento) y al final el segundo
-    # overwriteaba al primero bajo el lock. Peor: si entre release-y-
-    # rebuild un tercer thread llamaba invalidate, el write-back
-    # reintroducía el cache que invalidate borró.
-    # Fix: single-flight pattern usando RLock — el lock cubre TODO el
-    # rebuild. Costo: queries paralelas serializan en cache miss
-    # (~50-200ms una vez), pero el cache hit subsequent es libre.
-    # Penalty bounded: el RLock permite recursión si algún path
-    # del rebuild llama a otro `_load_corpus` (no debería pero es
-    # defensivo).
+    # Single-flight pattern: el lock cubre TODO el rebuild para que dos
+    # threads en miss simultáneo no ejecuten BM25Okapi en paralelo.
+    # Pre-fix: el lock se soltaba tras el check de hit y el rebuild
+    # ocurría fuera — el segundo thread overwriteaba al primero, y si
+    # un tercer thread llamaba `_invalidate_corpus_cache()` entre el
+    # release y el write-back, la invalidación se perdía.
+    # RLock permite recursión segura si algún path del rebuild vuelve
+    # a llamar `_load_corpus` (no debería, pero es defensivo).
+    # Costo: queries paralelas serializan en cache miss (~50-300ms una
+    # vez); el cache hit subsequent es libre (check al inicio del lock).
     with _corpus_cache_lock:
         cached = _corpus_cache
         if (
@@ -12484,55 +12481,54 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
             return cached
 
         record_cache_event("corpus", misses=1)
-    data = col.get(include=["documents", "metadatas"])
-    docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
+        data = col.get(include=["documents", "metadatas"])
+        docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
 
-    bm25 = None
-    if docs:
-        bm25_texts = [
-            f"{m.get('note', '')} {m.get('file', '')} {d}".lower()
-            for d, m in zip(docs, metas)
-        ]
-        tokenized = [_tokenize(t) for t in bm25_texts]
-        bm25 = BM25Okapi(tokenized)
-
-    tags: set[str] = set()
-    folders: set[str] = set()
-    title_to_paths: dict[str, set[str]] = {}
-    outlinks: dict[str, list[str]] = {}   # path → list of linked note titles
-    backlinks: dict[str, set[str]] = {}   # note title → set of paths that link to it
-
-    for m in metas:
-        for t in (m.get("tags") or "").split(","):
-            t = t.strip()
-            if t:
-                tags.add(t)
-        f = m.get("folder")
-        if f:
-            folders.add(f)
-        path = m.get("file", "")
-        title = m.get("note", "")
-        if title and path:
-            title_to_paths.setdefault(title, set()).add(path)
-        if path not in outlinks:
-            raw_links = [
-                ln.strip() for ln in (m.get("outlinks") or "").split(",") if ln.strip()
+        bm25 = None
+        if docs:
+            bm25_texts = [
+                f"{m.get('note', '')} {m.get('file', '')} {d}".lower()
+                for d, m in zip(docs, metas)
             ]
-            outlinks[path] = raw_links
-            for t in raw_links:
-                backlinks.setdefault(t, set()).add(path)
+            tokenized = [_tokenize(t) for t in bm25_texts]
+            bm25 = BM25Okapi(tokenized)
 
-    new_cache = {
-        "count": n, "collection_id": cid,
-        "ids": ids, "docs": docs, "metas": metas,
-        "bm25": bm25, "tags": tags, "folders": folders,
-        "title_to_paths": title_to_paths,
-        "outlinks": outlinks,    # path → [linked titles]
-        "backlinks": backlinks,  # title → {paths that link to it}
-    }
-    with _corpus_cache_lock:
+        tags: set[str] = set()
+        folders: set[str] = set()
+        title_to_paths: dict[str, set[str]] = {}
+        outlinks: dict[str, list[str]] = {}   # path → list of linked note titles
+        backlinks: dict[str, set[str]] = {}   # note title → set of paths that link to it
+
+        for m in metas:
+            for t in (m.get("tags") or "").split(","):
+                t = t.strip()
+                if t:
+                    tags.add(t)
+            f = m.get("folder")
+            if f:
+                folders.add(f)
+            path = m.get("file", "")
+            title = m.get("note", "")
+            if title and path:
+                title_to_paths.setdefault(title, set()).add(path)
+            if path not in outlinks:
+                raw_links = [
+                    ln.strip() for ln in (m.get("outlinks") or "").split(",") if ln.strip()
+                ]
+                outlinks[path] = raw_links
+                for t in raw_links:
+                    backlinks.setdefault(t, set()).add(path)
+
+        new_cache = {
+            "count": n, "collection_id": cid,
+            "ids": ids, "docs": docs, "metas": metas,
+            "bm25": bm25, "tags": tags, "folders": folders,
+            "title_to_paths": title_to_paths,
+            "outlinks": outlinks,    # path → [linked titles]
+            "backlinks": backlinks,  # title → {paths that link to it}
+        }
         _corpus_cache = new_cache
-    return new_cache
+        return new_cache
 
 
 def _invalidate_corpus_cache() -> None:
@@ -14309,9 +14305,6 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
                 continue
             if pct >= threshold:
                 actions = _handle_memory_pressure(pct, threshold)
-                # Emitir evento visible en stderr para debug. No SQL porque
-                # la tabla rag_memory_metrics está reservada para muestreos
-                # periódicos del web dashboard (distinct concern).
                 print(
                     f"[memory-watchdog] pressure={actions['pct_before']}% "
                     f"threshold={threshold}% "
@@ -14320,6 +14313,21 @@ def _memory_pressure_watchdog_loop(threshold: float, interval: int) -> None:
                     f"pct_after={actions.get('pct_after_chat')}%",
                     flush=True,
                 )
+                # Persistir el evento de presión en system_memory_metrics para
+                # forensics post-incident. Bug #3 audit 2026-04-27: la tabla
+                # existía en el DDL pero el watchdog nunca escribía a ella —
+                # 0 filas incluso con el watchdog activo.
+                try:
+                    with _ragvec_state_conn() as _conn:
+                        _sql_append_event(_conn, "system_memory_metrics", {
+                            "ts": datetime.now().isoformat(timespec="seconds"),
+                            "extra_json": actions,
+                        })
+                except Exception as _sql_exc:
+                    try:
+                        _silent_log("memory_sql_write_failed", _sql_exc)
+                    except Exception:
+                        pass
         except Exception as exc:
             _silent_log("memory_watchdog_loop", exc)
 
@@ -40009,7 +40017,7 @@ def find_dead_notes(
     min_age_days: int = 365,
     query_window_days: int = 180,
     exclude_folders: tuple[str, ...] = (
-        "00-Inbox", "04-Archive", "05-Reviews",
+        "00-Inbox", "04-Archive",
     ),
     use_frontmatter_date: bool = True,
 ) -> list[dict]:

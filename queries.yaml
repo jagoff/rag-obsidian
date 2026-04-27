@@ -69,18 +69,14 @@
 
 queries:
   # RAG system itself
-  - question: "qué modelo de embeddings uso en mi RAG"
-    expected:
-      - 01-Projects/RAG-Local/Obsidian RAG Local.md
+  # (2026-04-27: vault reorg moved 01-Projects/RAG-Local/* to .trash/
+  # "qué modelo de embeddings uso en mi RAG" dropped — Obsidian RAG Local.md trashed,
+  #   no live note covers current stack (bge-m3 / sqlite-vec) with enough depth.
+  # "cómo se indexan las notas en el vault" dropped — same reason.
 
   - question: "qué reranker tiene el sistema"
     expected:
-      - 01-Projects/RAG-Local/Obsidian RAG Local.md
       - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
-
-  - question: "cómo se indexan las notas en el vault"
-    expected:
-      - 01-Projects/RAG-Local/Obsidian RAG Local.md
 
   # Coaching
   - question: "charla sobre ansiedad y estrés laboral"
@@ -210,13 +206,8 @@ queries:
       - 04-Archive/Personal/Letras - Escritos/Apagado.md
 
   # 01-Projects (non-RAG-Local)
-  - question: "arquitectura de obsidian-rag"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-
-  - question: "pipelines de obsidian-rag"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
+  # (2026-04-27) "arquitectura de obsidian-rag" dropped — obsidian-rag - Arquitectura.md trashed.
+  # (2026-04-27) "pipelines de obsidian-rag" dropped — obsidian-rag - Pipelines.md trashed.
 
   - question: "bots y automatización del rag"
     expected:
@@ -266,33 +257,15 @@ queries:
       - 03-Resources/Coaching/Coaching - Curso de liderazgo.md
     note: "comparison intent: dos cursos distintos sobre el mismo tópico"
 
-  - question: "arquitectura vs pipelines del rag"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
-    note: "comparison intent: 'vs' bare — caso canónico de _INTENT_COMPARISON_RE"
-
-  # === Expansión 2026-04-25: cobertura comparison ===
-  - question: "qué diferencia hay entre el chat model y el helper model"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-    note: "comparison intent: chat (qwen2.5:7b) vs helper (qwen2.5:3b) — sección 'Por qué NO usar el helper para judgment'"
-
-  - question: "comparame los modelos chat y helper que uso"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-    note: "comparison intent: 'comparame' bare con dos roles del mismo stack"
+  # (2026-04-27) "arquitectura vs pipelines del rag" dropped — both source notes trashed.
+  # (2026-04-27) "qué diferencia hay entre el chat model y el helper model" dropped — Modelos y
+  #   performance.md + Arquitectura.md trashed; no live note covers the distinction.
+  # (2026-04-27) "comparame los modelos chat y helper que uso" dropped — same reason.
 
   # Synthesis intent — fires _INTENT_SYNTHESIS_RE → SYSTEM_RULES_SYNTHESIS.
   # Cross-reference aggregation: expect ≥2 notes del mismo dominio en top-k.
-  - question: "sintetizame todo lo que hay sobre obsidian-rag en mi vault"
-    expected:
-      - 01-Projects/RAG-Local/Obsidian RAG Local.md
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
-    note: "synthesis intent: aggregate sobre RAG — top-k debe traer varias"
+  # (2026-04-27) "sintetizame todo lo que hay sobre obsidian-rag en mi vault" dropped —
+  #   all 3 expected paths (Obsidian RAG Local.md, Arquitectura.md, Pipelines.md) trashed.
 
   - question: "resumime todo lo que tengo sobre coaching"
     expected:
@@ -306,12 +279,11 @@ queries:
   # según rag.eval, pero el síntoma de health real es N>=2 expected en top-k.
   - question: "cuál es mi stack de IA local"
     expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
       - 04-Archive/99-obsidian-system/99-AI/memory/feedback_local_free_stack.md
       - 04-Archive/99-obsidian-system/99-AI/memory/reference_ollama.md
       - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag.md
       - 04-Archive/99-obsidian-system/99-AI/memory/reference_obsidian_rag_services.md
-    note: "synthesis intent: stack local IA — cross-ref ollama + rag local + servicios + feedback"
+    note: "synthesis intent: stack local IA — cross-ref ollama + rag local + servicios + feedback. (2026-04-27: removed obsidian-rag - Modelos y performance.md, trashed)"
 
   - question: "qué temas de coaching trabajé este año"
     expected:
@@ -322,14 +294,9 @@ queries:
       - 04-Archive/Coaching/Ikigai.md
     note: "synthesis intent: temas de coaching — multi-nota cross-folder (02-Areas + 03-Resources + 04-Archive)"
 
-  - question: "cómo está armado el pipeline de retrieval del rag"
-    expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-      - 01-Projects/RAG-Local/Obsidian RAG Local.md
-      - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
-      - 01-Projects/RAG-Local/obsidian-rag - Roadmap 2026-04-22.md
-    note: "synthesis intent: ingeniería interna del rag — pipelines + arquitectura + modelos + roadmap"
+  # (2026-04-27) "cómo está armado el pipeline de retrieval del rag" dropped —
+  #   all 5 expected paths trashed (Pipelines, Arquitectura, Obsidian RAG Local,
+  #   Modelos y performance, Roadmap 2026-04-22).
 
   - question: "de qué hablan las canciones de muros fractales"
     expected:
@@ -342,12 +309,8 @@ queries:
 
   - question: "qué decisiones de diseño tomé sobre el reranker"
     expected:
-      - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-      - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
-      - 01-Projects/RAG-Local/obsidian-rag - Modelos y performance.md
-      - 01-Projects/RAG-Local/obsidian-rag - Roadmap 2026-04-22.md
       - 04-Archive/99-obsidian-system/99-AI/memory/feedback_hyde_small_models.md
-    note: "synthesis intent: decisiones técnicas sobre reranking — multi-doc del proyecto"
+    note: "synthesis intent: decisiones técnicas sobre reranking. (2026-04-27: removed 4 dead paths trashed in vault reorg)"
 
   # (2026-04-24) Removido query "todo lo que hay sobre claude peers" —
   # las notas fuente (`03-Resources/Claude/Claude*.md`) fueron movidas
@@ -486,17 +449,8 @@ chains:
   # (2026-04-24) Removida chain `tech-claude-code` — las notas Claude
   # Code CLI / Interactivos fueron movidas a .trash/.
 
-  - id: rag-system
-    turns:
-      - question: "qué modelo de embeddings uso"
-        expected:
-          - 01-Projects/RAG-Local/Obsidian RAG Local.md
-      - question: "y el reranker"
-        expected:
-          - 01-Projects/RAG-Local/Obsidian RAG Local.md
-      - question: "y cómo las indexás"
-        expected:
-          - 01-Projects/RAG-Local/Obsidian RAG Local.md
+  # (2026-04-27) Removida chain `rag-system` — todas las turns apuntaban a
+  # Obsidian RAG Local.md, movida a .trash/ en el vault reorg.
 
   # Failure mode: folder semantics ("esa carpeta") + ambiguous pronoun "los"
   # (los acordes vs los temas). Also cascada: t2 depende de t1 anclar en Sal.
@@ -591,29 +545,14 @@ chains:
   # gmail vuelvan a indexarse. El chain hit@5 cae proporcional pero la t1
   # mantiene la chain como evaluable (no es 0/2 puro).
 
-  # Vault → Reminders: arranca por proyecto, follow-up por pendientes.
-  - id: rag-pendientes-cross
-    turns:
-      - question: "qué es obsidian-rag"
-        expected:
-          - 01-Projects/RAG-Local/Obsidian RAG Local.md
-          - 01-Projects/RAG-Local/obsidian-rag - Sistema.md
-          - 01-Projects/RAG-Local/obsidian-rag - Arquitectura.md
-      - question: "y qué pendientes tengo del sistema RAG"
-        expected:
-          - reminders://x-apple-reminder://BB6A5430-5269-435F-8256-C5AF86A173DD
-        note: "cross-source vault→reminders: requires reminders ingester"
+  # (2026-04-27) Removida chain `rag-pendientes-cross` — la turn 0 apuntaba a
+  # Obsidian RAG Local.md, Sistema.md y Arquitectura.md, todos movidos a .trash/.
+  # Re-agregar cuando haya una nota vault activa sobre obsidian-rag que resuelva
+  # el anchor del t1, para que la cross-source turn 2 tenga grounding válido.
 
-  # Vault → Calendar: pipelines del proyecto, follow-up por workshops agendados.
-  - id: rag-workshops-cross
-    turns:
-      - question: "obsidian-rag pipelines"
-        expected:
-          - 01-Projects/RAG-Local/obsidian-rag - Pipelines.md
-      - question: "tengo algún workshop agendado sobre RAG"
-        expected:
-          - calendar://fernandoferrari@gmail.com/0vqo081rthdblder0qnpvi5o9j
-        note: "cross-source vault→calendar: requires calendar ingester (workshop AI Engineer)"
+  # (2026-04-27) Removida chain `rag-workshops-cross` — la turn 0 apuntaba a
+  # obsidian-rag - Pipelines.md, movida a .trash/. Sin anchor vault en t1
+  # la chain no mide nada útil.
 
   # NOTA 2026-04-25: dos chains adicionales se postergaron tras eval seco
   # (sólo `vault` cargado) porque el chain hit@5 caía fuera del budget de 3pp.

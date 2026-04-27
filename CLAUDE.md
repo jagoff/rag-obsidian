@@ -196,7 +196,7 @@ Tests: [`tests/test_web_pwa.py`](tests/test_web_pwa.py) (9 casos: manifest mime+
 **Dos env vars emparejadas** (ambas deben estar seteadas, o ninguna):
 
 - `OBSIDIAN_RAG_BIND_HOST=0.0.0.0` — uvicorn bindea a todas las interfaces (default `127.0.0.1`). Ver [`web/server.py`](web/server.py) en el `__main__`.
-- `OBSIDIAN_RAG_ALLOW_LAN=1` — extiende el regex de CORS a los 3 rangos privados [RFC1918](https://datatracker.ietf.org/doc/html/rfc1918): `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. Sin este flag, aunque el puerto esté accesible el browser bloquea el CORS porque el Origin no matchea localhost. Ver [`web/server.py`](web/server.py) sobre el bloque `CORSMiddleware`.
+- `OBSIDIAN_RAG_ALLOW_LAN=1` — extiende el regex de CORS a los 3 rangos privados [RFC1918](https://datatracker.ietf.org/doc/html/rfc1918): `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. Acepta tanto `http://` como `https://` (Caddy `tls internal`). Sin este flag, aunque el puerto esté accesible el browser bloquea el CORS porque el Origin no matchea localhost. Ver [`web/server.py`](web/server.py) sobre el bloque `CORSMiddleware`.
 
 Ambas están seteadas en [`~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist`](~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist). Para aplicar tras editar el plist: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist`. (`kickstart -k` re-lanza el process pero NO relee las env vars — hay que hacer bootout+bootstrap para que agarre cambios del plist).
 
@@ -224,6 +224,21 @@ Los defaults del código (`127.0.0.1` + regex localhost-only) se preservan si la
 Para que iOS registre el Service Worker + PWA full (offline cache + instant-on) sin instalar root CA local ni comprar dominio, usamos un [Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/). Cero cuenta, cero config, HTTPS válido con cert público de Cloudflare.
 
 **Cómo funciona**: `cloudflared tunnel --url http://localhost:8765` abre un túnel QUIC salida hacia un edge de Cloudflare y te asigna una URL aleatoria tipo `https://word-word-random.trycloudflare.com`. Todo el tráfico iPhone → Cloudflare → cloudflared → `localhost:8765`. No expone tu IP, no necesita abrir puertos en el router.
+
+**CORS para el túnel — env var adicional requerida** (bug fix 2026-04-27):
+
+El browser del iPhone envía el Origin `https://word-word-random.trycloudflare.com` y el server necesita aceptarlo. Sin la env var el CORS regex es localhost-only y el browser bloquea la primera petición API.
+
+- `OBSIDIAN_RAG_ALLOW_TUNNEL=1` — extiende el regex de CORS con `^https://[a-z0-9-]+\.trycloudflare\.com$`. Default OFF. Agregar al plist del web server junto con las otras env vars. **Solo activar cuando el túnel está corriendo** — expone el server al internet público.
+
+Para activar, agregar al plist `com.fer.obsidian-rag-web.plist`:
+
+```xml
+<key>OBSIDIAN_RAG_ALLOW_TUNNEL</key>
+<string>1</string>
+```
+
+Y recargar: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-web.plist`.
 
 **Trade-off clave**: la URL es **random y cambia cada vez que cloudflared reinicia** (launchctl restart, reboot, crash + auto-restart). El PWA guardado en el iPhone se rompe al cambiar la URL — hay que re-abrir en Safari con la URL nueva y re-guardar. Si querés URL estable, hay que migrar a [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) con un dominio propio agregado a Cloudflare.
 

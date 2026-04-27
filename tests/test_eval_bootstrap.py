@@ -81,8 +81,16 @@ def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
 
 
 def test_queries_yaml_has_underrepresented_folders():
-    """After expansion, 03-Resources + 04-Archive + 01-Projects coverage must
-    each be nontrivial (>=3 queries). Singles-only — chains are bonus."""
+    """After expansion, 03-Resources + 04-Archive coverage must
+    each be nontrivial (>=3 queries). Singles-only — chains are bonus.
+
+    2026-04-27: 01-Projects floor removed. Vault reorg moved all
+    01-Projects/RAG-Local/* notes to .trash/ (Obsidian RAG Local.md,
+    Arquitectura.md, Pipelines.md, Modelos y performance.md, Roadmap, Sistema).
+    Only 01-Projects/RAG/fuentes de informacion.md survives — not enough
+    content for meaningful golden queries. Re-add the floor once the user
+    populates 01-Projects with active project notes.
+    """
     data = yaml.safe_load((REPO_ROOT / "queries.yaml").read_text(encoding="utf-8"))
     folders: dict[str, int] = {}
     for q in (data.get("queries") or []):
@@ -91,7 +99,6 @@ def test_queries_yaml_has_underrepresented_folders():
             folders[top] = folders.get(top, 0) + 1
     assert folders.get("03-Resources", 0) >= 3, folders
     assert folders.get("04-Archive", 0) >= 3, folders
-    assert folders.get("01-Projects", 0) >= 3, folders
 
 
 def test_queries_yaml_singles_count():

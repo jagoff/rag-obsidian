@@ -5020,7 +5020,7 @@ def _fetch_calendar_ahead(days_ahead: int, max_events: int = 40) -> list[dict]:
     try:
         res = subprocess.run(
             [icb, "-nc", "-iep", "title,datetime", "-b", "", query],
-            capture_output=True, text=True, timeout=10.0,
+            capture_output=True, text=True, errors="replace", timeout=10.0,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -6322,9 +6322,20 @@ def _fetch_credit_cards(now: datetime | None = None) -> list[dict]:  # noqa: ARG
     cards.sort(key=lambda c: (c.get("due_date") is None, c.get("due_date") or ""))
 
     if cache_key is not None:
+        # Audit 2026-04-26 BUG #6 web — TOCTOU fix: si otro thread escribió
+        # una key MÁS RECIENTE mientras computábamos, NO sobrescribimos
+        # (sería un retroceso). Gen counter implícito vía max(mtime).
         with _CARDS_CACHE_LOCK:
-            _CARDS_CACHE["key"] = cache_key
-            _CARDS_CACHE["payload"] = cards
+            _existing = _CARDS_CACHE.get("key")
+            _our_max_mtime = max((m for _, m in cache_key), default=0.0)
+            _existing_max_mtime = (
+                max((m for _, m in _existing), default=0.0)
+                if _existing else 0.0
+            )
+            if _existing is None or _our_max_mtime >= _existing_max_mtime:
+                _CARDS_CACHE["key"] = cache_key
+                _CARDS_CACHE["payload"] = cards
+            # else: skip write — el cache tiene data más fresca.
     return cards
 
 
@@ -10813,7 +10824,7 @@ def _launchctl_print_fields(label: str, timeout: float = 3.0) -> dict[str, str] 
         out = subprocess.run(
             ["/bin/launchctl", "print", f"gui/{_launchd_uid_cached()}/{label}"],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -11326,7 +11337,7 @@ def status_action(req: StatusActionRequest) -> dict:
 
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10.0, check=False,
+            cmd, capture_output=True, text=True, errors="replace", timeout=10.0, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         raise HTTPException(status_code=500,
@@ -13745,7 +13756,7 @@ def diagnose_error_execute(req: _DiagnoseExecuteRequest, request: Request) -> di
         result = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=_DIAGNOSE_TIMEOUT_S,
             shell=False,
             check=False,
@@ -13990,7 +14001,7 @@ def _execute_whitelisted_command(cmd_str: str) -> dict:
         result = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=_DIAGNOSE_TIMEOUT_S,
             shell=False,
             check=False,
@@ -14142,6 +14153,192 @@ def auto_fix(req: _AutoFixRequest, request: Request) -> StreamingResponse:
 
         # Si salió del loop sin done, max_turns_reached.
         yield f"data: {json.dumps({'type': 'max_turns_reached', 'limit': _AUTO_FIX_MAX_TURNS})}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── /api/auto-fix-devin — delegar al agente Devin ─────────────────────
+# El user pidió "para arreglar los errores tenes que usar devin no otro
+# modelo". El endpoint /api/auto-fix con qwen2.5:7b + whitelist propia
+# era una solución restringida; esto lo reemplaza delegando a la CLI de
+# Devin (https://cli.devin.ai) que corre en el mismo repo y tiene acceso
+# real al código, permissions del user, tools completos (read/edit/exec),
+# y sus propias rules + skills configurados en `.devin/`.
+#
+# Cómo funciona:
+#   1. Construimos un prompt con el error + contexto (igual que /auto-fix).
+#   2. Spawneamos `devin -p "<prompt>"` como subprocess (modo non-
+#      interactive — procesa el prompt y sale).
+#   3. Capturamos stdout+stderr en vivo, stream al cliente via SSE.
+#   4. Al terminar: evento `done` con el output completo + exit_code.
+#
+# Seguridad: NO necesitamos whitelist porque Devin respeta las
+# permission rules del user configuradas en `.devin/config.json`
+# (deny-list: rm -rf, sudo, force-push, reset --hard, branch -D; ask-list
+# para ops sensibles; allow-list para el workflow normal del RAG).
+# Devin sabe las convenciones del proyecto via CLAUDE.md cargado como rule.
+#
+# Costo: cada invocación de Devin consume ACUs (unidades pagas de
+# Cognition). El user está consciente (pidió explícitamente usar Devin).
+# Rate-limited con el mismo bucket que /api/chat para evitar spam.
+#
+# Latencia: Devin tarda 30-120s (depende del error). El modal muestra
+# un spinner + stream del progreso en vivo.
+#
+# Limitaciones:
+#   - `devin -p` devuelve el output completo al final, no necesariamente
+#     streaming progresivo durante su trabajo (depende de cómo la CLI
+#     flushee stdout). Igual lo tratamos como stream — si todo sale al
+#     final, el modal muestra el resultado al final.
+#   - Si la CLI requiere confirmación interactiva (workspace trust, etc.),
+#     se cuelga. Pasamos --respect-workspace-trust false para evitarlo.
+
+_DEVIN_BIN = _which_safe("devin", (
+    str(Path.home() / ".local/bin/devin"),
+    "/usr/local/bin/devin",
+))
+_AUTO_FIX_DEVIN_TIMEOUT_S = 300.0  # 5min cap
+
+
+def _build_devin_prompt(req: "_AutoFixRequest") -> str:
+    """Arma el prompt para pasar a `devin -p`. En una sola línea porque
+    el CLI acepta el prompt como string positional arg."""
+    parts = [
+        "Error detectado en el stack obsidian-rag. Diagnosticá Y resolvé:",
+    ]
+    if req.service:
+        parts.append(f"service={req.service}")
+    if req.file:
+        parts.append(f"archivo={req.file}")
+    if req.timestamp:
+        parts.append(f"ts={req.timestamp}")
+    parts.append(f"error='{req.error_text[:500]}'")
+    if req.context_lines:
+        ctx = " | ".join(ln[:120] for ln in req.context_lines[-6:])
+        parts.append(f"contexto_previo='{ctx[:600]}'")
+    parts.append(
+        "Investigá el problema (launchctl list, tail del log), identificá "
+        "la causa, aplicá el fix (kickstart del daemon si aplica, o fix "
+        "de código si requiere), verificá que quedó resuelto, y devolvé "
+        "un resumen corto de qué hiciste. NO reinicies obsidian-rag-web "
+        "(matarías el proceso que te invocó). Si no podés resolver solo "
+        "y requiere decisión humana, explicalo en el resumen."
+    )
+    return " ".join(parts)
+
+
+@app.post("/api/auto-fix-devin")
+def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
+    """Delegar la resolución del error al agente Devin (CLI `devin -p`).
+
+    Stream SSE con eventos:
+      - {type: "start", cmd: ["devin", "-p", ...]}
+      - {type: "output", chunk: "..."}      (stdout/stderr en vivo)
+      - {type: "done", exit_code: N, output: "<full output>"}
+      - {type: "error", message: "..."}
+    """
+    client_ip = (request.client.host if request.client else "unknown")
+    _check_rate_limit(_CHAT_BUCKETS, client_ip,
+                      _CHAT_RATE_LIMIT, _CHAT_RATE_WINDOW)
+
+    if _DEVIN_BIN is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CLI `devin` no encontrado en el sistema. Instalá desde "
+                "https://cli.devin.ai o configurá el path."
+            ),
+        )
+
+    prompt = _build_devin_prompt(req)
+    # Limitamos el prompt para no pasarle miles de chars a un arg de CLI.
+    if len(prompt) > 3000:
+        prompt = prompt[:3000] + "…(truncado)"
+
+    cmd = [
+        _DEVIN_BIN,
+        "-p", prompt,
+        "--respect-workspace-trust", "false",
+    ]
+
+    def _stream():
+        yield f"data: {json.dumps({'type': 'start', 'cmd': cmd})}\n\n"
+        # Log de la invocación al audit.
+        _audit_diagnose_execution({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "command_original": f"devin -p '{prompt[:200]}…'",
+            "command_executed": cmd[:2],  # no loguear todo el prompt (PII)
+            "via": "auto-fix-devin",
+            "prompt_len": len(prompt),
+            "service": req.service,
+            "error_preview": req.error_text[:200],
+        })
+
+        full_output_chunks: list[str] = []
+        exit_code = -1
+        try:
+            # cwd = repo root para que Devin tenga contexto del código.
+            # env mínimo con PATH extendido (Devin necesita PATH para
+            # encontrar sus deps: claude, node, etc.) + HOME + TERM dumb
+            # para evitar ANSI codes que no queremos en el modal.
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # merge stderr al stdout para un solo stream
+                text=True,
+                bufsize=1,  # line-buffered
+                env={
+                    **os.environ,  # Devin CLI necesita su env completo
+                    "TERM": "dumb",
+                    "NO_COLOR": "1",
+                    "FORCE_COLOR": "0",
+                },
+            )
+
+            # Read stdout line-by-line con timeout absoluto.
+            t0 = time.monotonic()
+            while True:
+                if proc.poll() is not None:
+                    # Proceso terminó — leer lo que queda y break.
+                    remaining = proc.stdout.read()
+                    if remaining:
+                        full_output_chunks.append(remaining)
+                        yield f"data: {json.dumps({'type': 'output', 'chunk': remaining})}\n\n"
+                    break
+                if (time.monotonic() - t0) > _AUTO_FIX_DEVIN_TIMEOUT_S:
+                    proc.terminate()
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'timeout después de {_AUTO_FIX_DEVIN_TIMEOUT_S}s'})}\n\n"
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return
+
+                # Leer con un pequeño timeout para no bloquear.
+                line = proc.stdout.readline()
+                if line:
+                    full_output_chunks.append(line)
+                    # Emitir chunk al SSE.
+                    yield f"data: {json.dumps({'type': 'output', 'chunk': line})}\n\n"
+                else:
+                    # No hay línea nueva — sleep brief para no busy-loop.
+                    time.sleep(0.05)
+
+            exit_code = proc.returncode if proc.returncode is not None else -1
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'{type(e).__name__}: {e}'})}\n\n"
+            return
+
+        full_output = "".join(full_output_chunks)
+        yield f"data: {json.dumps({'type': 'done', 'exit_code': exit_code, 'output': full_output[:16000]})}\n\n"
 
     return StreamingResponse(
         _stream(),
@@ -15618,7 +15815,7 @@ def _read_vm_stat() -> dict:
     """Parse `vm_stat` to surface pressure + free pages."""
     try:
         out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=2, check=False,
+            ["vm_stat"], capture_output=True, text=True, errors="replace", timeout=2, check=False,
         ).stdout
     except Exception:
         return {}
@@ -15653,7 +15850,7 @@ def _sample_memory() -> dict | None:
     try:
         out = subprocess.run(
             ["ps", "-axo", "rss=,command="],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
     except Exception:
         return None
@@ -15980,7 +16177,7 @@ def _sample_cpu(prev_state: dict) -> dict | None:
     try:
         out = subprocess.run(
             ["ps", "-axo", "pid=,cputime=,command="],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, errors="replace", timeout=5, check=False,
         ).stdout
     except Exception:
         return None

@@ -661,6 +661,34 @@ def test_api_diagnose_error_execute_runs_safe_command(tmp_path: Path, monkeypatc
     assert audit_path.is_file()
 
 
+# ── /api/auto-fix-devin — delegar a Devin CLI ───────────────────────
+
+def test_api_auto_fix_devin_validates_empty_text():
+    resp = _client.post("/api/auto-fix-devin", json={"error_text": "  "})
+    assert resp.status_code == 422
+
+
+def test_build_devin_prompt_includes_context():
+    """El prompt de Devin incluye error + service + contexto previo."""
+    req = _server._AutoFixRequest(
+        error_text="OperationalError: bad",
+        service="watch",
+        file="obsidian-rag/watch.log",
+        context_lines=["line1", "line2"],
+    )
+    prompt = _server._build_devin_prompt(req)
+    assert "watch" in prompt
+    assert "OperationalError: bad" in prompt
+    assert "contexto_previo" in prompt
+    assert "NO reinicies obsidian-rag-web" in prompt
+
+
+def test_build_devin_prompt_no_context_skips_header():
+    req = _server._AutoFixRequest(error_text="error")
+    prompt = _server._build_devin_prompt(req)
+    assert "contexto_previo" not in prompt
+
+
 # ── /api/auto-fix — agent loop ───────────────────────────────────────
 
 def test_api_auto_fix_validates_empty_text():

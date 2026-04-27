@@ -496,3 +496,32 @@
   animation: diag-spin 0.7s linear infinite;
 }
 @keyframes diag-spin { to { transform: rotate(360deg); } }
+
+/* ── Devin stream output ─────────────────────────────────────────────
+   El `pre` con el output crudo de `devin -p` — puede ser largo (1-2KB
+   típico), así que le damos max-height generoso + scroll. */
+.diag-devin-stream {
+  max-height: 50vh;
+  min-height: 80px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.diag-devin-stream:empty::before {
+  content: "esperando output de Devin…";
+  color: var(--diag-fg-faint);
+  font-style: italic;
+}
+
+.diag-devin-stream code {
+  background: color-mix(in srgb, var(--diag-cyan) 18%, transparent);
+  color: var(--diag-cyan);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.diag-devin-turn {
+  border-left: 3px solid var(--diag-cyan);
+}

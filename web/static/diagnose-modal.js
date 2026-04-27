@@ -1,22 +1,16 @@
-/* diagnose-modal.js — modal "🩺 fix con IA" con agent loop server-side.
+/* diagnose-modal.js — modal "🩺 fix con IA" que delega a Devin.
  *
- * Flow nuevo (vs. la versión anterior que diagnosticaba textualmente y
- * mostraba botones para ejecutar comandos uno por uno):
+ * Flow:
  *
- *   1. Click 🩺 → modal abre, llama POST /api/auto-fix con el contexto.
- *   2. El server arranca un agent loop (LLM → tool_call → result → LLM).
- *   3. Cada paso del agent llega vía SSE como un evento separado:
- *        {type: "model", name: "qwen2.5:7b"}
- *        {type: "turn", n: 1}
- *        {type: "thought", text: "Voy a verificar si el daemon está vivo"}
- *        {type: "action", command: "launchctl list com.fer..."}
- *        {type: "action_result", exit_code: 0, stdout: "...", stderr: "..."}
- *        {type: "action_rejected", command: "...", reason: "..."}
- *        {type: "done", summary: "Reinicié el daemon, errores cesaron"}
- *        {type: "max_turns_reached", limit: 8}
+ *   1. Click 🩺 → modal abre, llama POST /api/auto-fix-devin con el contexto.
+ *   2. El server spawnea `devin -p "<prompt>"` como subprocess y stream-ea
+ *      su stdout al cliente via SSE:
+ *        {type: "start", cmd: ["devin", "-p", ...]}
+ *        {type: "output", chunk: "..."}      (stream de stdout)
+ *        {type: "done", exit_code: 0, output: "<full output>"}
  *        {type: "error", message: "..."}
- *   4. El frontend renderea cada evento como una entrada en una timeline.
- *      Sin botones, sin confirmaciones — el agent corre solo hasta done.
+ *   3. El frontend acumula los chunks y los muestra en vivo. Al final,
+ *      renderea el output completo con markdown-light.
  *
  * Public API global:
  *
@@ -152,9 +146,15 @@
 
     // ── SSE fetch ───────────────────────────────────────────────────
     _abortController = new AbortController();
-    let currentTurn = null;  // referencia al div del turn activo
+    // Acumulador del output de Devin — en el endpoint Devin no hay
+    // turnos discretos, solo un stream de stdout. Renderamos el output
+    // crudo en un <pre> que va creciendo.
+    const streamState = {
+      outputAccum: "",
+      outputEl: null,
+    };
     try {
-      const resp = await fetch("/api/auto-fix", {
+      const resp = await fetch("/api/auto-fix-devin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -178,7 +178,7 @@
           if (!dataLine) continue;
           let event;
           try { event = JSON.parse(dataLine.slice(6)); } catch (_) { continue; }
-          currentTurn = handleEvent(event, status, timeline, summaryBox, retryBtn, currentTurn);
+          handleDevinEvent(event, status, timeline, summaryBox, retryBtn, streamState);
         }
       }
     } catch (err) {
@@ -192,118 +192,92 @@
     }
   }
 
-  /** Procesa un evento del agent loop y actualiza el DOM. */
-  function handleEvent(event, status, timeline, summaryBox, retryBtn, currentTurn) {
+  /** Convertir `<ref_file file="..." />` / `<ref_snippet ... />` que
+   *  Devin emite en su output a HTML clickeable. */
+  function formatDevinOutput(raw) {
+    const safe = escapeHtml(raw);
+    // `<ref_file file="/path/to/file" />` → `<code>/path/to/file</code>`
+    return safe
+      .replace(/&lt;ref_file file=&quot;([^&]+?)&quot;\s*\/&gt;/g,
+               (_, p) => `<code>${p}</code>`)
+      .replace(/&lt;ref_snippet file=&quot;([^&]+?)&quot;\s*lines=&quot;([^&]+?)&quot;\s*\/&gt;/g,
+               (_, p, l) => `<code>${p}:${l}</code>`);
+  }
+
+  /** Procesa un evento del stream de Devin y actualiza el DOM.
+   *
+   * Eventos posibles:
+   *   {type: "start", cmd: [...]}
+   *   {type: "output", chunk: "..."}
+   *   {type: "done", exit_code: 0, output: "..."}
+   *   {type: "error", message: "..."}
+   */
+  function handleDevinEvent(event, status, timeline, summaryBox, retryBtn, streamState) {
     switch (event.type) {
-      case "model":
-        status.textContent = `agente activo · modelo: ${event.name}`;
-        return currentTurn;
+      case "start": {
+        status.textContent = "Devin investigando…";
+        // Crear el bloque de output inicial donde vamos a volcar el stream.
+        if (!streamState.outputEl) {
+          const turn = el("article", { class: "diag-turn diag-devin-turn" });
+          turn.appendChild(el("div", { class: "diag-thought" },
+            el("span", { class: "diag-thought-icon" }, "🤖"),
+            el("span", { class: "diag-thought-text" },
+              "Devin tiene acceso completo al repo — está leyendo el código, ejecutando tools, y resolviendo el problema. Esto puede tardar 30-120s.")
+          ));
+          const outputPre = el("pre", { class: "diag-action-output diag-devin-stream" });
+          outputPre.textContent = "";
+          turn.appendChild(outputPre);
+          timeline.appendChild(turn);
+          streamState.outputEl = outputPre;
+        }
+        break;
+      }
 
-      case "turn": {
-        // Crear un nuevo turn en la timeline.
-        const turn = el("article", { class: "diag-turn" });
-        const turnHead = el("header", { class: "diag-turn-head" });
-        turnHead.appendChild(el("span", { class: "diag-turn-n" }, `turno ${event.n}`));
-        turn.appendChild(turnHead);
-        timeline.appendChild(turn);
-        // Auto-scroll al turn nuevo.
+      case "output": {
+        if (!streamState.outputEl) return;
+        streamState.outputAccum += event.chunk || "";
+        streamState.outputEl.textContent = streamState.outputAccum;
+        // Auto-scroll al fondo mientras stream-ea.
         requestAnimationFrame(() => {
-          turn.scrollIntoView({ behavior: "smooth", block: "end" });
+          streamState.outputEl.scrollTop = streamState.outputEl.scrollHeight;
         });
-        return turn;
-      }
-
-      case "thought": {
-        if (!currentTurn) return currentTurn;
-        const t = el("div", { class: "diag-thought" });
-        t.appendChild(el("span", { class: "diag-thought-icon" }, "💭"));
-        t.appendChild(el("span", { class: "diag-thought-text" }, event.text || ""));
-        currentTurn.appendChild(t);
-        return currentTurn;
-      }
-
-      case "action": {
-        if (!currentTurn) return currentTurn;
-        const a = el("div", { class: "diag-action" });
-        a.appendChild(el("span", { class: "diag-action-icon" }, "▶"));
-        a.appendChild(el("code", { class: "diag-action-cmd" }, event.command || ""));
-        a.appendChild(el("span", { class: "diag-action-status" }, "ejecutando…"));
-        currentTurn.appendChild(a);
-        return currentTurn;
-      }
-
-      case "action_result": {
-        if (!currentTurn) return currentTurn;
-        // Encontrar el último .diag-action y actualizarlo.
-        const lastAction = currentTurn.querySelector(".diag-action:last-of-type");
-        if (lastAction) {
-          const statusEl = lastAction.querySelector(".diag-action-status");
-          const ok = event.exit_code === 0;
-          if (statusEl) {
-            statusEl.textContent = ok
-              ? `✓ ok (${event.duration_s}s)`
-              : `✗ exit ${event.exit_code} (${event.duration_s}s)`;
-            statusEl.classList.add(ok ? "diag-action-ok" : "diag-action-fail");
-          }
-        }
-        // Mostrar el output debajo de la acción.
-        const out = (event.stdout || event.stderr || "").trim();
-        if (out) {
-          const pre = el("pre", { class: "diag-action-output" });
-          pre.textContent = out.length > 800 ? out.slice(0, 800) + "\n…(truncado)" : out;
-          currentTurn.appendChild(pre);
-        }
-        return currentTurn;
-      }
-
-      case "action_rejected": {
-        if (!currentTurn) return currentTurn;
-        const lastAction = currentTurn.querySelector(".diag-action:last-of-type");
-        if (lastAction) {
-          const statusEl = lastAction.querySelector(".diag-action-status");
-          if (statusEl) {
-            statusEl.textContent = `✗ rechazado: ${event.reason}`;
-            statusEl.classList.add("diag-action-rejected");
-          }
-        }
-        return currentTurn;
+        break;
       }
 
       case "done": {
-        status.textContent = "✓ resuelto";
-        status.classList.add("diag-status-done");
+        const ok = event.exit_code === 0;
+        status.textContent = ok ? "✓ Devin terminó" : `✗ Devin salió con exit ${event.exit_code}`;
+        status.classList.add(ok ? "diag-status-done" : "diag-status-error");
         retryBtn.disabled = false;
-        if (event.summary) {
-          summaryBox.hidden = false;
-          summaryBox.innerHTML = `<div class="diag-summary-icon">✓</div>` +
-                                 `<div class="diag-summary-text">${escapeHtml(event.summary)}</div>`;
-          requestAnimationFrame(() => {
-            summaryBox.scrollIntoView({ behavior: "smooth", block: "end" });
-          });
-        }
-        return currentTurn;
-      }
 
-      case "max_turns_reached": {
-        status.textContent = `✗ agotó ${event.limit} turnos sin resolver`;
-        status.classList.add("diag-status-error");
-        retryBtn.disabled = false;
+        // Final output — si el stream no capturó nada, usar el output
+        // completo del evento done. Si capturamos bien, el <pre> ya tiene
+        // lo que necesitamos — pero lo reemplazamos por el formateado
+        // con links clickeables a archivos.
+        const finalOutput = event.output || streamState.outputAccum;
+        if (streamState.outputEl && finalOutput) {
+          streamState.outputEl.innerHTML = formatDevinOutput(finalOutput);
+        }
+
+        // Summary box.
         summaryBox.hidden = false;
-        summaryBox.innerHTML = `<div class="diag-summary-icon diag-summary-icon-fail">✗</div>` +
-                               `<div class="diag-summary-text">El agente no pudo resolver el error en ${event.limit} turnos. ` +
-                               `Revisá la timeline arriba para ver qué intentó.</div>`;
-        return currentTurn;
+        summaryBox.innerHTML = ok
+          ? `<div class="diag-summary-icon">✓</div>` +
+            `<div class="diag-summary-text">Devin completó el análisis. El output de arriba tiene el detalle de lo que investigó + qué hizo o qué recomienda.</div>`
+          : `<div class="diag-summary-icon diag-summary-icon-fail">✗</div>` +
+            `<div class="diag-summary-text">Devin salió con exit ${event.exit_code}. Revisá el output arriba.</div>`;
+        requestAnimationFrame(() => {
+          summaryBox.scrollIntoView({ behavior: "smooth", block: "end" });
+        });
+        break;
       }
 
       case "error": {
         status.textContent = `error: ${event.message}`;
         status.classList.add("diag-status-error");
         retryBtn.disabled = false;
-        return currentTurn;
+        break;
       }
-
-      default:
-        return currentTurn;
     }
   }
 

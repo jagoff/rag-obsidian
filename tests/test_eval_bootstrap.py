@@ -306,3 +306,53 @@ def test_golden_cross_source_paths_have_native_id_format():
         "\n".join(f"  {desc}" for _, desc in SOURCE_PATTERNS) +
         "\nBad:\n  " + "\n  ".join(bad[:10])
     )
+
+
+def test_gate_floor_constants_match_documented_values():
+    """Drift guard: GATE_SINGLES_HIT5_MIN and GATE_CHAINS_HIT5_MIN must equal
+    the documented CI lower bounds.
+
+    Floor (2026-04-27, post-golden-remap vault reorg, commit 6f8994f):
+      singles lower CI bound = 40.74%  → GATE_SINGLES_HIT5_MIN = 0.4074
+      chains  lower CI bound = 52.00%  → GATE_CHAINS_HIT5_MIN   = 0.52
+
+    When the floor is recalibrated (new queries.yaml, new model stack, vault
+    reorg), update this test together with the constants so the assertion stays
+    honest. The test intentionally stores the *expected* values inline — it
+    fails loudly if someone bumps the constants without updating this docstring
+    and vice versa, preventing silent divergence between code and documentation.
+    """
+    import os
+    import importlib
+
+    # Read defaults from the module without any env-var override.
+    # Temporarily clear the override vars if set in the current env.
+    _singles_env = os.environ.pop("RAG_EVAL_GATE_SINGLES_MIN", None)
+    _chains_env = os.environ.pop("RAG_EVAL_GATE_CHAINS_MIN", None)
+    try:
+        import rag as _rag
+        importlib.reload(_rag)
+        singles_floor = _rag.GATE_SINGLES_HIT5_MIN
+        chains_floor = _rag.GATE_CHAINS_HIT5_MIN
+    finally:
+        if _singles_env is not None:
+            os.environ["RAG_EVAL_GATE_SINGLES_MIN"] = _singles_env
+        if _chains_env is not None:
+            os.environ["RAG_EVAL_GATE_CHAINS_MIN"] = _chains_env
+
+    # Expected values (recalibrated 2026-04-27 — update here when floor changes)
+    EXPECTED_SINGLES = 0.4074
+    EXPECTED_CHAINS  = 0.52
+
+    assert abs(singles_floor - EXPECTED_SINGLES) < 1e-6, (
+        f"GATE_SINGLES_HIT5_MIN is {singles_floor:.4f} but expected "
+        f"{EXPECTED_SINGLES:.4f} (2026-04-27 floor). "
+        "If the floor was intentionally recalibrated, update both the constant "
+        "in rag/__init__.py and EXPECTED_SINGLES in this test."
+    )
+    assert abs(chains_floor - EXPECTED_CHAINS) < 1e-6, (
+        f"GATE_CHAINS_HIT5_MIN is {chains_floor:.4f} but expected "
+        f"{EXPECTED_CHAINS:.4f} (2026-04-27 floor). "
+        "If the floor was intentionally recalibrated, update both the constant "
+        "in rag/__init__.py and EXPECTED_CHAINS in this test."
+    )

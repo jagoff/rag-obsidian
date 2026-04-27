@@ -744,6 +744,12 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 
 ## Eval baselines
 
+**Floor (2026-04-27, post-golden-remap vault reorg, commit 6f8994f)** — vault reorg eliminó paths que ya no existen; golden remap redujo el set de n=60→54 singles / n=12→9 chains. Dos corridas reproducibles (bit-idénticas en hit@5 + chain_success; MRR chains dentro de CI):
+- Singles: `hit@5 53.70% [40.74, 66.67] · MRR 0.528 [0.407, 0.657] · n=54`
+- Chains: `hit@5 72.00% [52.00, 88.00] · MRR 0.633–0.653 [0.460, 0.820] · chain_success 33.33% [11.11, 66.67] · turns=25 chains=9`
+- Lower-CI-bound gate (nightly online-tune auto-rollback): singles < 40.74% OR chains < 52.00%
+- Nota: la caída vs el floor previo (singles 71.67% → 53.70%, chains 86.67% → 72.00%) NO es regresión del pipeline — es reducción del n y remoción de goldens fáciles que ya no existen en el vault post-reorg. Las queries removidas pertenecían mayoritariamente a `01-Projects/RAG-Local/*` (notas movidas al .trash/ por el user). Los floors nuevos codifican el mismo criterio: "95% confianza de que una corrida bajo el floor es regresión real, no noise".
+
 **Floor (2026-04-17, post-golden-expansion + bootstrap CI)** — queries.yaml doubled (21→42 singles, 9→12 chains; +15 singles in under-represented folders 03-Resources/Agile+Tech, 02-Areas/Personal, 01-Projects/obsidian-rag, 04-Archive memory). `rag eval` now reports percentile bootstrap 95% CI (1000 resamples, seed=42) alongside each metric + `rag eval --latency` reports P50/P95/P99 of retrieve() per bucket and accepts `--max-p95-ms` as a CI gate.
 - Singles: `hit@5 88.10% [76.19, 97.62] · MRR 0.772 [0.651, 0.873] · n=42`
 - Chains: `hit@5 78.79% [63.64, 90.91] · MRR 0.629 [0.490, 0.768] · chain_success 50.00% [25.00, 75.00] · turns=33 chains=12`

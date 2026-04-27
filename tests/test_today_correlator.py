@@ -6,6 +6,7 @@ from rag.today_correlator import (
     _canonicalize_name,
     _extract_name_from_email,
     _extract_names_from_title,
+    _is_self_notification,
     _tokenize,
     correlate_today_signals,
 )
@@ -268,3 +269,127 @@ def test_empty_inputs():
 def test_handles_none_inputs():
     result = correlate_today_signals(None, None)
     assert result == {"people": [], "topics": []}
+
+
+# ── Self-notifications (github bot, google alerts, etc.) ───────────────────
+
+
+def test_is_self_notification_github_bot():
+    assert _is_self_notification("Fer F <notifications@github.com>")
+    assert _is_self_notification("notifications@github.com")
+    assert _is_self_notification("noreply@github.com")
+    assert _is_self_notification("Foo <noreply@github.com>")
+
+
+def test_is_self_notification_google_services():
+    assert _is_self_notification("security@google.com")
+    assert _is_self_notification("noreply@accounts.google.com")
+    assert _is_self_notification("noreply@youtube.com")
+
+
+def test_is_self_notification_payment_services():
+    assert _is_self_notification("receipts@stripe.com")
+    assert _is_self_notification("service@paypal.com")
+
+
+def test_is_self_notification_real_person_not_filtered():
+    assert not _is_self_notification("Marina Pérez <marina@empresa.com>")
+    assert not _is_self_notification("pablo.fer@gmail.com")
+    assert not _is_self_notification("john@startup.io")
+
+
+def test_is_self_notification_empty_treated_as_not_real():
+    """Sender vacío no debería contar como persona real para correlación."""
+    assert _is_self_notification("")
+    assert _is_self_notification(None or "")
+
+
+def test_people_excludes_github_self_notification():
+    """Mails de notifications@github.com con 'Fer F' como display NO deben
+    crear "Fer F" como persona cross-source. Es ruido del feed automático.
+    """
+    today_ev = {}
+    extras = {
+        "gmail_today": [
+            {"from": "Fer F <notifications@github.com>",
+             "subject": "[jagoff/rag-obsidian] Run failed: CI",
+             "snippet": "..."},
+            {"from": "Fer F <notifications@github.com>",
+             "subject": "[jagoff/rag-obsidian] Run failed: CI master",
+             "snippet": "..."},
+        ],
+        "whatsapp_today": [
+            # WA self-chat — el mismo "Fer F" como nombre
+            {"name": "Fer F", "count": 2, "last_snippet": "nota"},
+        ],
+    }
+    result = correlate_today_signals(today_ev, extras)
+    # "Fer F" NO debe aparecer porque gmail era self-notification
+    assert all("Fer F" not in p["name"] for p in result["people"])
+
+
+def test_people_real_person_still_detected_after_filter():
+    """Filtro de self-notifications NO debe afectar personas reales."""
+    today_ev = {}
+    extras = {
+        "gmail_today": [
+            {"from": "notifications@github.com", "subject": "x", "snippet": ""},
+            {"from": "Pablo Fer <pablo@empresa.com>", "subject": "y", "snippet": ""},
+        ],
+        "tomorrow_calendar": [
+            {"title": "Sync con Pablo Fer", "time_range": "10:00–11:00"},
+        ],
+    }
+    result = correlate_today_signals(today_ev, extras)
+    assert any("Pablo" in p["name"] for p in result["people"])
+
+
+def test_topics_excludes_github_ci_noise():
+    """Tokens 'failed', 'master', 'jagoff', 'ferrari' que dominan los
+    mails CI no deben aparecer como topics (ahora son stopwords).
+    """
+    today_ev = {
+        "recent_notes": [
+            {"title": "ci failed master jagoff ferrari", "path": "p",
+             "snippet": "rag-obsidian build deploy"},
+        ],
+    }
+    extras = {
+        "gmail_today": [
+            {"from": "notifications@github.com",
+             "subject": "[jagoff/rag-obsidian] Run failed: CI master",
+             "snippet": "ferrari rag-obsidian build deploy"},
+        ],
+    }
+    result = correlate_today_signals(today_ev, extras)
+    bad_tokens = {"failed", "master", "jagoff", "ferrari", "rag-obsidian",
+                  "build", "deploy", "ci"}
+    for t in result["topics"]:
+        assert t["topic"] not in bad_tokens, (
+            f"CI noise token '{t['topic']}' got through stopwords"
+        )
+
+
+def test_topics_excludes_self_notification_mails_from_tokenization():
+    """Los mails de github notifications no contribuyen al topic
+    extraction — incluso si los tokens NO son stopwords, no debería
+    cuentar la fuente "gmail" como una de las fuentes del topic.
+    """
+    today_ev = {
+        "recent_notes": [
+            {"title": "tema importante xyz123", "path": "p", "snippet": ""},
+        ],
+    }
+    extras = {
+        # Solo notification mail con el mismo token "xyz123"
+        "gmail_today": [
+            {"from": "notifications@github.com",
+             "subject": "xyz123 in CI", "snippet": ""},
+        ],
+    }
+    result = correlate_today_signals(today_ev, extras)
+    # xyz123 está en notas + (gmail filtrado) = solo 1 source → no es topic
+    xyz_topic = next((t for t in result["topics"] if "xyz123" in t["topic"]), None)
+    assert xyz_topic is None, (
+        "El mail de notifications no debería contribuir al topic count"
+    )

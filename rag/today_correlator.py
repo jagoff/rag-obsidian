@@ -58,7 +58,63 @@ _STOPWORDS = frozenset({
     "youtube", "video", "watch", "url", "link", "post", "stream",
     "today", "yesterday", "tomorrow",
     "github", "com", "https", "http", "www",
+    # CI / GitHub notifications mail noise — los CI failure emails generan
+    # tokens repetidos como "failed", "master", "jagoff", "ferrari" que
+    # dominan los topics cuando hay 5-10 mails de github en un día. NO son
+    # temas de trabajo, son ruido del feed automático.
+    "failed", "master", "jagoff", "ferrari", "rag-obsidian", "obsidian-rag",
+    "passed", "branch", "commit", "build", "ci", "pull", "push", "actions",
+    "workflow", "request", "issue", "pull_request", "released", "deploy",
+    "merge", "merged", "closed", "opened", "review", "ready",
+    # Apple Mail / Apple Reminders noise
+    "apple", "icloud", "mailbox",
+    # Genéricos que no aportan tema
+    "hola", "saludos", "atentamente", "atte", "cordial", "cordiales",
+    "regards", "thanks", "gracias", "buen", "buenos", "buenas",
 })
+
+
+# Self-notification senders — emails de sistema que tienen el `display name`
+# del propio user (github notifications usa el nombre del repo owner como
+# display). NO son personas reales del cross-source. Filtramos antes de
+# extraer name → evita "Fer F" como persona "en gmail+wa".
+_SELF_NOTIFICATION_DOMAINS = (
+    "@notifications.github.com",
+    "@noreply.github.com",
+    "@notifications.",
+    "@noreply.",
+    "@no-reply.",
+    "@bot.",
+    "@github.com",
+    "@google.com",  # Google security alerts
+    "@accounts.google.com",
+    "@youtube.com",
+    "@drive.google.com",
+    "@docs.google.com",
+    "@calendar.google.com",
+    "@stripe.com",
+    "@paypal.com",
+    "@anthropic.com",  # API + plan emails (auto)
+    "@openai.com",
+    "@vercel.com",
+    "@cloudflare.com",
+)
+
+
+def _is_self_notification(sender_field: str) -> bool:
+    """True si el `From:` es de un dominio de notification automatizada
+    (github bot, google security alerts, stripe receipts, etc). Esos
+    NO son personas reales — el correlator los excluye del bucket de
+    personas cross-source.
+
+    Match es CASE-INSENSITIVE y por substring (`@notifications.github.com`
+    matchea tanto `notifications@github.com` como `Foo Bar
+    <notifications@github.com>`).
+    """
+    if not sender_field:
+        return True  # vacío → tampoco es persona real
+    s = sender_field.lower()
+    return any(dom in s for dom in _SELF_NOTIFICATION_DOMAINS)
 
 
 # Regex de email: "Nombre Apellido <email@dom.com>" o "email@dom.com"
@@ -279,6 +335,11 @@ def _correlate_people(today_ev: dict, extras: dict) -> list[dict]:
 
     for m in (extras.get("gmail_today") or [])[:20]:
         sender = m.get("from") or m.get("sender") or ""
+        # Skip self-notifications (github bot, google alerts, stripe
+        # receipts) — el `display name` de esos suele matchear con el
+        # nombre del user generando falsos cruces "persona en gmail+wa".
+        if _is_self_notification(sender):
+            continue
         display = _extract_name_from_email(sender)
         canonical = _canonicalize_name(display)
         if not canonical:
@@ -354,11 +415,16 @@ def _topic_source_texts(today_ev: dict, extras: dict) -> dict[str, list[str]]:
     """Devuelve {source_label: [text_chunks...]} para tokenización. Los
     labels son cortos para que el render del prompt diga "aparece en
     gmail+youtube+notas" en vez de "gmail_today+youtube_today+recent_notes".
+
+    Los mails de self-notification (github bot, etc.) NO contribuyen a
+    topics — saturan los tokens con "failed/master/jagoff/ferrari" cuando
+    hay 5-10 mails de CI por día.
     """
     return {
         "gmail": [
             (m.get("subject") or "") + " " + (m.get("snippet") or "")
             for m in (extras.get("gmail_today") or [])
+            if not _is_self_notification(m.get("from") or m.get("sender") or "")
         ],
         "whatsapp": [
             (w.get("last_snippet") or "")

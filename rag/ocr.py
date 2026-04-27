@@ -277,6 +277,19 @@ def _ocr_image(image_path: Path) -> str:
     try:
         mtime = image_path.stat().st_mtime
     except OSError:
+        # Audit 2026-04-26 (MEDIUM): si el archivo desapareció, dropear
+        # el cache row stale para que el chunk no embeba OCR text
+        # fantasma. Pre-fix el cache quedaba forever.
+        try:
+            abs_gone = str(image_path.resolve()) if image_path else ""
+            if abs_gone:
+                with _ragvec_state_conn() as conn:
+                    conn.execute(
+                        "DELETE FROM rag_ocr_cache WHERE image_path = ?",
+                        (abs_gone,),
+                    )
+        except Exception:
+            pass
         return ""
     abs_key = str(image_path.resolve())
 
@@ -294,11 +307,23 @@ def _ocr_image(image_path: Path) -> str:
         # Continuamos al OCR real si la cache falla — no bloqueamos el
         # indexer por problemas de estado.
 
-    # OCR real.
+    # OCR real con timeout 30s (audit 2026-04-26 MEDIUM: pre-fix sin
+    # timeout, una imagen corrupta o un Apple Vision hang bloqueaba al
+    # indexer thread indefinidamente — observado hasta 30s en
+    # screenshots complejos, teóricamente unbounded).
     try:
-        annotations = ocrmac_mod.OCR(
-            abs_key, language_preference=["es-ES", "en-US"],
-        ).recognize()
+        import concurrent.futures as _cf  # noqa: PLC0415
+        def _do_ocr() -> list:
+            return ocrmac_mod.OCR(
+                abs_key, language_preference=["es-ES", "en-US"],
+            ).recognize()
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(_do_ocr)
+            try:
+                annotations = _fut.result(timeout=30.0)
+            except _cf.TimeoutError:
+                _silent_log(f"ocr_timeout:{abs_key}", "Vision hang >30s")
+                return ""
     except Exception as exc:
         _silent_log(f"ocr_recognize:{abs_key}", exc)
         return ""

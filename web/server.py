@@ -131,6 +131,7 @@ from rag import (  # noqa: E402
     _tasks_services_consulted as _rag_tasks_services_consulted,
     append_turn,
     ensure_session,
+    find_contradictions_for_note,
     find_followup_loops,
     find_related,
     get_db,
@@ -4183,6 +4184,98 @@ def notes_related(path: str, limit: int = 10) -> dict:
             "shared_tags": shared,
             "score": int(score),
             "reason": reason,
+        })
+    return {"items": items, "source_path": path}
+
+
+# ── /api/notes/contradictions ────────────────────────────────────────────────
+#
+# Endpoint pensado para el panel "Posibles contradicciones" del plugin
+# Obsidian (Track A del roadmap). Detecta fragmentos de OTRAS notas
+# del vault que contradicen afirmaciones de la nota dada.
+#
+# Shape de la respuesta:
+#   {items: [{path, note, folder, snippet, why}], source_path, reason?}
+#
+# Por qué NO es reactive (active-leaf-change) como `/api/notes/related`:
+#   `find_contradictions_for_note` usa el chat LLM (command-r/qwen2.5)
+#   para el paso de clasificación "qué es una contradicción genuina
+#   vs complementaria". Cold-load del modelo + inferencia = 5-10s
+#   por call en M3 Max. Dispararlo en cada cambio de nota quema
+#   batería + rompe la UX. El panel es MANUAL (refresh button) con
+#   cache agresivo por path.
+@app.get("/api/notes/contradictions")
+def notes_contradictions(path: str, limit: int = 5) -> dict:
+    """Posibles contradicciones entre `path` y otras notas del vault.
+
+    Usa `find_contradictions_for_note` del rag.py — wrap delgado para que
+    el plugin consuma el mismo shape via HTTP o CLI.
+
+    Args:
+        path: Vault-relative (ej. "02-Areas/Coaching/Autoridad.md").
+        limit: Máximo de items a devolver (1-10, default 5). El LLM
+            devuelve conservador, raramente supera 3.
+
+    Returns:
+        items: [{path, note, folder, snippet, why}, ...]
+          - `why`: razón del LLM (<20 palabras) de por qué contradice.
+          - `snippet`: fragmento del texto que contradice (primeros ~280 chars).
+        source_path: echo del input.
+        reason?: "empty_index" | "not_indexed" | "too_short" si items=[].
+
+    Performance: 5-10s por call (LLM-bound). El plugin cachea 30min por
+    path para que re-entrar a la misma nota sea instant.
+    """
+    if not path or not path.endswith(".md"):
+        raise HTTPException(status_code=400, detail="path debe terminar en .md")
+    if not VAULT_PATH.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"vault no encontrado en {VAULT_PATH}",
+        )
+    # Path-traversal guard (mismo shape que /api/notes/related).
+    try:
+        full = (VAULT_PATH / path).resolve()
+        full.relative_to(VAULT_PATH.resolve())
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=f"path inválido: {exc}")
+    if not full.is_file():
+        return {"items": [], "source_path": path, "reason": "not_indexed"}
+
+    limit = max(1, min(int(limit), 10))
+    col = get_db()
+    if col.count() == 0:
+        return {"items": [], "source_path": path, "reason": "empty_index"}
+
+    # Leer el body. find_contradictions_for_note ya valida longitud
+    # mínima internamente pero adelantamos el chequeo para devolver un
+    # `reason: "too_short"` explícito en vez de una lista vacía sin
+    # contexto — el plugin renderea empty states distintos según el
+    # reason, y "muy corta" es accionable para el user ("escribí más
+    # o amplíá") vs "no hay contradicciones" (ya evaluado).
+    try:
+        body = full.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"read failed: {exc}")
+    if len(body.strip()) < 200:
+        return {"items": [], "source_path": path, "reason": "too_short"}
+
+    # Excluir la misma nota del set de candidatos. find_contradictions_for_note
+    # hace match por chunk embed, así que si no excluimos, los chunks de
+    # la nota source van a aparecer como "contradicciones de sí misma".
+    results = find_contradictions_for_note(
+        col, body, exclude_paths={path}, k=limit,
+    )
+    items: list[dict] = []
+    for r in results:
+        p = r.get("path", "")
+        folder = "/".join(p.split("/")[:-1]) if "/" in p else ""
+        items.append({
+            "path": p,
+            "note": r.get("note", ""),
+            "folder": folder,
+            "snippet": r.get("snippet", ""),
+            "why": r.get("why", ""),
         })
     return {"items": items, "source_path": path}
 

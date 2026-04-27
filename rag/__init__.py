@@ -2156,6 +2156,16 @@ def _cross_source_dedup(
     # Greedy: iteramos en orden de score (input ya viene sorted desc).
     # Para cada pair, descartamos pairs posteriores que sean cross-source
     # near-dup. Mantiene el de mayor score por construcción.
+    # Audit 2026-04-26 (MEDIUM): docs muy cortos (<50 chars, <8 tokens)
+    # generaban falsos positivos. "Reunión Max martes 18hs" (~50 chars)
+    # vs un WA message similar producen Jaccard >0.83 con 5 tokens
+    # compartidos — uno se borra. Skipear pairs donde AMBOS son cortos.
+    # 50 chars es ~8-10 tokens significativos — suficiente para Jaccard
+    # robusto sin perder la utilidad de dedup en notas de tamaño normal.
+    _DEDUP_MIN_LEN = 50
+    pair_lens = []
+    for cand, expanded, _ in scored_pairs:
+        pair_lens.append(len(str(expanded)))
     drop_indices: set[int] = set()
     for i in range(len(scored_pairs)):
         if i in drop_indices:
@@ -2170,6 +2180,10 @@ def _cross_source_dedup(
                 continue  # Solo cross-source — dedup intra-source es _conv_dedup_window
             tj = tokens_list[j]
             if not tj:
+                continue
+            # Skip pairs where both docs are short — Jaccard inflates
+            # over small token sets.
+            if min(pair_lens[i], pair_lens[j]) < _DEDUP_MIN_LEN:
                 continue
             inter = len(ti & tj)
             union = len(ti | tj)
@@ -3126,7 +3140,12 @@ def _generate_context_summary(text: str, title: str, folder: str) -> str:
         first_line = raw.split("\n")[0].split(". ")[0]
         return first_line[:120]
     except Exception:
-        return ""
+        # Audit 2026-04-26: pre-fix devolvía "" en error transitorio →
+        # `get_context_summary` cacheaba ese "" → embedding del chunk
+        # quedaba SIN prefix contextual permanente (hasta que la nota
+        # cambiara). Devolvemos None para que el caller distinga
+        # "summary vacío legítimo" de "fallo, no cachear".
+        return None
 
 
 def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> str:
@@ -3144,6 +3163,11 @@ def get_context_summary(text: str, file_hash: str, title: str, folder: str) -> s
     # LLM call happens OUTSIDE the lock — holding it for ~1-3s would
     # serialise every concurrent summary request across the process.
     summary = _generate_context_summary(text, title, folder)
+    # Audit 2026-04-26: si el LLM falla (`summary is None`) NO cachear.
+    # Cachear "" envenena el embedding de ESTA nota permanentemente
+    # (chunk sin prefix contextual hasta que el hash cambie).
+    if summary is None:
+        return ""
     with _context_cache_lock:
         cache[file_hash] = summary
         cache.move_to_end(file_hash)
@@ -7943,11 +7967,22 @@ def auto_index_vault(vault_path: Path) -> dict:
         first_time = col.count() == 0
 
         # Listar md files (rglob es rápido en APFS, ~50ms para 500 archivos).
+        # Audit 2026-04-26: skip symlinks para evitar ciclos (a→b→a).
+        # Python 3.13+ rglob soporta `recurse_symlinks=False`. En 3.13 o
+        # menor caemos al manual `is_symlink()` check.
         md_files: list[Path] = []
-        for p in vault_path.rglob("*.md"):
+        try:
+            _md_iter = vault_path.rglob("*.md", recurse_symlinks=False)
+        except TypeError:
+            _md_iter = vault_path.rglob("*.md")
+        for p in _md_iter:
             try:
+                if p.is_symlink():
+                    continue
                 rel = p.relative_to(vault_path)
             except ValueError:
+                continue
+            except OSError:
                 continue
             if is_excluded(str(rel)):
                 continue
@@ -19966,6 +20001,12 @@ def retrieve(
     seen_title_set: set[str] = set()
     if seen_titles and SEEN_TITLE_PENALTY > 0.0:
         seen_title_set = {t.strip().lower() for t in seen_titles if t and t.strip()}
+    # Audit perf 2026-04-26 M1: pre-fix `max_pr` se recalculaba dentro del
+    # loop por candidato. _pr_map es invariante durante el loop → hoist
+    # fuera. ~30k iters ahorradas (15 candidates × 2k paths) en queries
+    # típicas. Cero cambio funcional.
+    _pr_map_hoist = ppr_score if ppr_score else pagerank
+    _max_pr_hoist = max(_pr_map_hoist.values()) if _pr_map_hoist else 1.0
     final_pairs: list[tuple] = []
     for c, e, s in zip(candidates, expanded, scores):
         meta = c[1] if isinstance(c[1], dict) else {}
@@ -20009,11 +20050,9 @@ def retrieve(
         # Feature #6: if personalized PPR was computed for this query,
         # use the topic-aware score instead of the global pagerank —
         # more informative because it's seeded from the top-K rerank.
-        _pr_map = ppr_score if ppr_score else pagerank
-        if weights.graph_pagerank and _pr_map:
-            pr = _pr_map.get(path, 0.0)
-            max_pr = max(_pr_map.values()) if _pr_map else 1.0
-            final += weights.graph_pagerank * (pr / max_pr if max_pr > 0 else 0.0)
+        if weights.graph_pagerank and _pr_map_hoist:
+            pr = _pr_map_hoist.get(path, 0.0)
+            final += weights.graph_pagerank * (pr / _max_pr_hoist if _max_pr_hoist > 0 else 0.0)
         # Behavior priors: user interaction signals from behavior.jsonl.
         # All weights default 0.0 so this block is a no-op without tuning.
         if _any_behavior_weight and priors:
@@ -32108,6 +32147,135 @@ def related(path: str, limit: int, as_json: bool, plain: bool):
             console.print(f"   [dim]tags: {tags_str}[/dim]")
 
 
+# ── `rag contradictions <path>` ──────────────────────────────────────────────
+# Wrap CLI de `find_contradictions_for_note`. Paralelo al endpoint HTTP
+# `/api/notes/contradictions` — mismo shape, mismas razones de empty-
+# result. Usado como fallback por el plugin Obsidian cuando el web
+# server está caído, y como utility de debugging manual.
+@cli.command()
+@click.argument("path")
+@click.option("--limit", default=5, show_default=True,
+              help="Cantidad máxima de contradicciones a devolver (1-10).")
+@click.option("--json", "as_json", is_flag=True,
+              help="Salida JSON (consumido por el plugin Obsidian / scripts).")
+@click.option("--plain", is_flag=True,
+              help="Salida tabular sin colores ni paneles (script-friendly).")
+def contradictions(path: str, limit: int, as_json: bool, plain: bool):
+    """Posibles contradicciones entre PATH y otras notas del vault.
+
+    PATH es vault-relative (ej. 02-Areas/Coaching/Autoridad.md). Detecta
+    fragmentos de OTRAS notas que contradicen afirmaciones de PATH. El
+    LLM es conservador — raramente devuelve más de 2-3 resultados.
+
+    Performance: 5-10s por call (chat model bound). El plugin cachea
+    por 30 min.
+    """
+    t0 = time.perf_counter()
+    if not path.endswith(".md"):
+        msg = "path debe terminar en .md"
+        if as_json:
+            click.echo(json.dumps(
+                {"error": msg, "items": [], "source_path": path},
+            ))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(2)
+
+    limit = max(1, min(int(limit), 10))
+    col = get_db()
+    if col.count() == 0:
+        payload = {"items": [], "source_path": path, "reason": "empty_index"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print(
+                "[yellow]Índice vacío. Corré `rag index` primero.[/yellow]"
+            )
+        return
+
+    # Leer el body. Mismo preguard que el endpoint HTTP — body corto
+    # retorna reason=too_short, no lista vacía sin contexto.
+    note_path = VAULT_PATH / path
+    if not note_path.is_file():
+        payload = {"items": [], "source_path": path, "reason": "not_found"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print(f"[yellow]Nota no encontrada: {path}[/yellow]")
+        return
+    body = note_path.read_text(encoding="utf-8", errors="ignore")
+    if len(body.strip()) < 200:
+        payload = {"items": [], "source_path": path, "reason": "too_short"}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False))
+        else:
+            console.print(
+                "[yellow]Nota muy corta (<200 chars) para analizar "
+                "contradicciones.[/yellow]"
+            )
+        return
+
+    results = find_contradictions_for_note(
+        col, body, exclude_paths={path}, k=limit,
+    )
+    items: list[dict] = []
+    for r in results:
+        p = r.get("path", "")
+        folder = "/".join(p.split("/")[:-1]) if "/" in p else ""
+        items.append({
+            "path": p,
+            "note": r.get("note", ""),
+            "folder": folder,
+            "snippet": r.get("snippet", ""),
+            "why": r.get("why", ""),
+        })
+
+    log_query_event({
+        "cmd": "contradictions", "path": path, "n_results": len(items),
+        "limit": limit,
+        "timing": _round_timing_ms(
+            {"total_ms": (time.perf_counter() - t0) * 1000},
+        ),
+    })
+
+    if as_json:
+        click.echo(json.dumps(
+            {"items": items, "source_path": path}, ensure_ascii=False,
+        ))
+        return
+
+    if not items:
+        msg = f"Sin contradicciones detectadas en {path}"
+        click.echo(msg) if plain else console.print(f"[green]✓ {msg}[/green]")
+        return
+
+    if plain:
+        # Formato tabular: PATH \t WHY
+        for it in items:
+            click.echo(f"{it['path']}\t{it['why']}")
+        return
+
+    console.print()
+    console.print(Rule(
+        title=(
+            f"[bold yellow]⚠ {len(items)} posible(s) contradicción(es) "
+            f"en [magenta]{path}[/magenta][/bold yellow]"
+        ),
+        style="yellow",
+    ))
+    for it in items:
+        console.print()
+        console.print(
+            f"[magenta]{it['note']}[/magenta] "
+            f"[dim]({it['path']})[/dim]"
+        )
+        if it["why"]:
+            console.print(f"   [yellow]→[/yellow] [italic]{it['why']}[/italic]")
+        if it["snippet"]:
+            snip = it["snippet"][:200]
+            console.print(f"   [dim]{snip}[/dim]")
+
+
 @cli.command()
 @click.option("--threshold", default=0.85, show_default=True,
               help="Cosine mínimo para considerar duplicado (sobre centroides)")
@@ -35193,10 +35361,16 @@ def _create_reminder(
         return False, "nombre vacío"
     if not _apple_enabled():
         return False, "Apple integration deshabilitada"
-    safe_name = nm.replace('"', '\\"')
+    # Audit 2026-04-26 (HIGH): backslash-then-quote en orden correcto.
+    # Pre-fix solo escapaba `"` → un title con `\` (ej. `"cosa \n importante"`)
+    # quedaba `"cosa \\n importante"` que AppleScript interpretaba como
+    # newline literal y rompía el script, o peor inyectaba un newline
+    # estructural que cambiaba la AS evaluación. Mismo orden ya usado en
+    # `notes` (línea 35220).
+    safe_name = nm.replace("\\", "\\\\").replace('"', '\\"')
     list_selector = ""
     if list_name:
-        safe_list = list_name.replace('"', '\\"')
+        safe_list = list_name.replace("\\", "\\\\").replace('"', '\\"')
         list_selector = f' of list "{safe_list}"'
 
     # Build properties block. `name` always goes in the with-properties.
@@ -44368,6 +44542,14 @@ def serve(host: str, port: int):
             pass
         return {"answer": answer, "t_gen": round(t_gen, 3)}
 
+    # Connection-drop exceptions we treat as "client went away, do NOT log
+    # the traceback" — the WA listener (the main client of this endpoint)
+    # sometimes disconnects mid-request when the phone network flaps or
+    # whisper transcription runs long and the listener times out. Before
+    # 2026-04-26 these surfaced as noisy double-tracebacks in serve.error.log
+    # (one for the failed 200 write, a second for the failed 500 fallback).
+    _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/health":
@@ -44386,6 +44568,13 @@ def serve(host: str, port: int):
                 handler = _handle_chat if self.path == "/chat" else _handle_query
                 result = handler(body)
                 self._json(200, result)
+            except _CLIENT_GONE:
+                # Client already closed the socket (WA listener timeout /
+                # phone network flap). Nothing to send back; the handler
+                # did its work, we just can't deliver. Do NOT fall through
+                # to the 500 path — that would try to write on the same
+                # dead socket and produce a second traceback.
+                return
             except Exception as exc:
                 # Log so the dashboard surfaces failures instead of silently
                 # returning 500 — log_query_event was inside the success path
@@ -44399,7 +44588,12 @@ def serve(host: str, port: int):
                     })
                 except Exception:
                     pass
-                self._json(500, {"error": str(exc)})
+                try:
+                    self._json(500, {"error": str(exc)})
+                except _CLIENT_GONE:
+                    # Client dropped while we were assembling the 500. Give
+                    # up quietly — the error is already logged above.
+                    pass
 
         def _json(self, code: int, data: dict):
             payload = _json.dumps(data, ensure_ascii=False).encode()
@@ -44412,7 +44606,23 @@ def serve(host: str, port: int):
         def log_message(self, format, *args):  # noqa: A002
             pass  # Silence per-request logging
 
-    server = HTTPServer((host, port), _Handler)
+    class _QuietHTTPServer(HTTPServer):
+        """`HTTPServer` subclass that suppresses tracebacks for the
+        client-disconnected exception family. stdlib's `BaseServer.handle_error`
+        prints a full traceback to stderr for any uncaught exception raised
+        inside the handler — including `BrokenPipeError` from `wfile.write()`
+        when the client already closed. We silence that specific family so
+        `serve.error.log` stays readable; other exceptions bubble up as usual.
+        """
+
+        def handle_error(self, request, client_address):
+            import sys as _sys
+            exc_type = _sys.exc_info()[0]
+            if exc_type is not None and issubclass(exc_type, _CLIENT_GONE):
+                return
+            super().handle_error(request, client_address)
+
+    server = _QuietHTTPServer((host, port), _Handler)
     console.print(f"[bold green]rag serve[/bold green] → http://{host}:{port}")
     try:
         server.serve_forever()

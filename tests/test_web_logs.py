@@ -661,6 +661,73 @@ def test_api_diagnose_error_execute_runs_safe_command(tmp_path: Path, monkeypatc
     assert audit_path.is_file()
 
 
+# ── /api/logs/queue — error queue + worker ──────────────────────────
+
+def test_compute_error_signature_normalizes():
+    """Errores "similares" (distintos paths o números) hashean igual."""
+    s1 = _server._compute_error_signature("watch", "error  2026-04.md: database is locked")
+    s2 = _server._compute_error_signature("watch", "error  2026-05-03.md: database is locked")
+    s3 = _server._compute_error_signature("watch", "error  _index.md: database is locked")
+    assert s1 == s2 == s3, "errores con solo path distinto deben tener la misma signature"
+    # Diferentes services → diferentes signatures
+    s_other = _server._compute_error_signature("wa-tasks", "error  2026-04.md: database is locked")
+    assert s1 != s_other
+    # Diferentes tipos de error → diferentes signatures
+    s_diff = _server._compute_error_signature("watch", "OperationalError: no such column")
+    assert s1 != s_diff
+
+
+def test_parse_devin_resolution_status():
+    """Parser extrae STATUS: + REASON: del output."""
+    output = "lala\nSTATUS: resolved\nREASON: reinicié el daemon watch\nmas texto"
+    status, reason = _server._parse_devin_resolution_status(output)
+    assert status == "resolved"
+    assert "reinicié" in reason
+
+    output_no_marker = "Devin did stuff"
+    status, reason = _server._parse_devin_resolution_status(output_no_marker)
+    assert status == "failed"
+    assert "sin marker" in reason
+
+
+def test_api_logs_queue_list_empty():
+    """Queue endpoint devuelve lista y counts."""
+    resp = _client.get("/api/logs/queue")
+    assert resp.status_code == 200
+    d = resp.json()
+    assert "entries" in d
+    assert "counts_by_status" in d
+    assert "worker_enabled" in d
+    assert "worker_rate_limit" in d
+
+
+def test_api_logs_queue_list_filter_invalid():
+    resp = _client.get("/api/logs/queue?status=bogus")
+    assert resp.status_code == 400
+
+
+def test_api_logs_queue_config_toggles_worker():
+    """POST /config cambia el flag del worker."""
+    # Estado inicial (asumimos off en fresh setup).
+    resp = _client.post("/api/logs/queue/config", json={"enabled": True})
+    assert resp.status_code == 200
+    assert resp.json()["worker_enabled"] is True
+    # Reset.
+    resp = _client.post("/api/logs/queue/config", json={"enabled": False})
+    assert resp.status_code == 200
+    assert resp.json()["worker_enabled"] is False
+
+
+def test_api_logs_queue_get_404():
+    resp = _client.get("/api/logs/queue/99999999")
+    assert resp.status_code == 404
+
+
+def test_api_logs_queue_delete_404():
+    resp = _client.delete("/api/logs/queue/99999999")
+    assert resp.status_code == 404
+
+
 # ── /api/auto-fix-devin — delegar a Devin CLI ───────────────────────
 
 def test_api_auto_fix_devin_validates_empty_text():

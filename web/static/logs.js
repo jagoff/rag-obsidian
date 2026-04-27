@@ -932,9 +932,217 @@
       if (document.hidden) stopTimers();
       else if (state.live) startTimers();
     });
+
+    // ── View toggle (logs vs queue) ─────────────────────────────────
+    document.querySelectorAll(".view-toggle-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const view = btn.dataset.view;
+        document.querySelectorAll(".view-toggle-btn").forEach((b) => {
+          b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+        });
+        const isQueue = view === "queue";
+        document.querySelector(".layout").hidden = isQueue;
+        $("queue-panel").hidden = !isQueue;
+        document.getElementById("totals").hidden = isQueue;
+        if (isQueue) {
+          fetchQueueNow();
+          startQueueTimer();
+        } else {
+          stopQueueTimer();
+        }
+      });
+    });
+
+    // Queue controls.
+    $("qc-worker-toggle").addEventListener("click", async () => {
+      const btn = $("qc-worker-toggle");
+      const wasEnabled = btn.getAttribute("aria-pressed") === "true";
+      try {
+        const resp = await fetch("/api/logs/queue/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: !wasEnabled }),
+        });
+        const d = await resp.json();
+        btn.setAttribute("aria-pressed", d.worker_enabled ? "true" : "false");
+        $("qc-worker-label").textContent = d.worker_enabled ? "worker ON" : "worker OFF";
+        fetchQueueNow();
+      } catch (e) {
+        alert(`error toggling worker: ${e.message}`);
+      }
+    });
+
+    $("qc-scan-now").addEventListener("click", async () => {
+      const btn = $("qc-scan-now");
+      btn.disabled = true;
+      btn.textContent = "↻ escaneando…";
+      try {
+        const resp = await fetch("/api/logs/queue/scan-now", { method: "POST" });
+        const d = await resp.json();
+        btn.textContent = `+${d.new_entries} nuevos`;
+        setTimeout(() => { btn.textContent = "↻ escanear"; btn.disabled = false; }, 2000);
+        fetchQueueNow();
+      } catch (e) {
+        btn.textContent = `✗ ${e.message}`;
+        btn.disabled = false;
+      }
+    });
+
+    $("qc-process-next").addEventListener("click", async () => {
+      const btn = $("qc-process-next");
+      btn.disabled = true;
+      btn.textContent = "▶ procesando (puede tardar minutos)…";
+      try {
+        const resp = await fetch("/api/logs/queue/process-next", { method: "POST" });
+        const d = await resp.json();
+        if (d.status === "no-pending") {
+          btn.textContent = "no hay pending";
+        } else {
+          btn.textContent = `✓ ${d.resolution_status || "done"}`;
+        }
+        setTimeout(() => {
+          btn.textContent = "▶ procesar siguiente";
+          btn.disabled = false;
+        }, 3500);
+        fetchQueueNow();
+      } catch (e) {
+        btn.textContent = `✗ ${e.message}`;
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // ── Queue panel ──────────────────────────────────────────────────────
+  let queueTimer = null;
+  const QUEUE_REFRESH_MS = 5000;
+
+  function startQueueTimer() {
+    stopQueueTimer();
+    queueTimer = setInterval(fetchQueueNow, QUEUE_REFRESH_MS);
+  }
+  function stopQueueTimer() {
+    if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+  }
+
+  async function fetchQueueNow() {
+    try {
+      const resp = await fetch("/api/logs/queue?limit=100", { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderQueue(data);
+      updateQueueBadge(data.counts_by_status || {});
+    } catch (e) {
+      console.warn("queue fetch failed:", e);
+    }
+  }
+
+  function renderQueue(data) {
+    const counts = data.counts_by_status || {};
+    $("qc-pending").textContent = counts.pending || 0;
+    $("qc-processing").textContent = counts.processing || 0;
+    $("qc-resolved").textContent = counts.resolved || 0;
+    $("qc-needs-human").textContent = counts["needs-human"] || 0;
+    $("qc-failed").textContent = counts.failed || 0;
+
+    // Worker toggle state.
+    const wt = $("qc-worker-toggle");
+    wt.setAttribute("aria-pressed", data.worker_enabled ? "true" : "false");
+    $("qc-worker-label").textContent = data.worker_enabled ? "worker ON" : "worker OFF";
+
+    // Rate limit indicator.
+    const rl = data.worker_rate_limit || {};
+    const rlEl = $("queue-rate-limit");
+    if (!rl.can_invoke_now) {
+      rlEl.textContent = `⚠ ${rl.reason}`;
+      rlEl.classList.add("qrl-warn");
+    } else {
+      rlEl.textContent = `rate: ${rl.current_hour_count || 0}/${rl.hourly_cap || 5} invocaciones de Devin en la última hora`;
+      rlEl.classList.remove("qrl-warn");
+    }
+
+    // Tabla.
+    const tbody = $("queue-tbody");
+    const entries = data.entries || [];
+    if (entries.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="7" class="queue-empty">la queue está vacía — clickeá "↻ escanear" para ver si hay errores nuevos</td></tr>`;
+      return;
+    }
+    const rows = entries.map((e) => {
+      const lastSeen = e.last_seen_at ? e.last_seen_at.slice(5, 16).replace("T", " ") : "—";
+      const resolution = e.resolution_status
+        ? `<span class="queue-status ${e.resolution_status}">${e.resolution_status}</span>`
+        : "—";
+      return `<tr data-id="${e.id}">
+        <td style="color:var(--text-faint);font-variant-numeric:tabular-nums">${e.id}</td>
+        <td><span class="queue-status ${e.status}">${e.status}</span></td>
+        <td>${escapeHtml(e.service)}</td>
+        <td class="queue-error-text" title="${escapeHtml(e.error_text)}">${escapeHtml(e.error_text)}</td>
+        <td class="queue-occ">${e.occurrence_count}</td>
+        <td class="queue-age">${lastSeen}</td>
+        <td>${resolution}</td>
+      </tr>`;
+    }).join("");
+    tbody.innerHTML = rows;
+    // Click row → abrir detalle.
+    tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+      tr.addEventListener("click", () => openQueueDetail(parseInt(tr.dataset.id, 10)));
+    });
+  }
+
+  async function openQueueDetail(id) {
+    try {
+      const resp = await fetch(`/api/logs/queue/${id}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const d = await resp.json();
+      const lines = [
+        `service: ${d.service}`,
+        `file: ${d.file_ref}`,
+        `signature: ${d.error_signature}`,
+        `status: ${d.status}`,
+        `occurrences: ${d.occurrence_count}`,
+        `first seen: ${d.first_seen_at}`,
+        `last seen: ${d.last_seen_at}`,
+        `attempts: ${d.attempts}`,
+      ];
+      if (d.completed_at) lines.push(`completed: ${d.completed_at} (${d.duration_s}s)`);
+      if (d.resolution_status) lines.push(`resolution: ${d.resolution_status} — ${d.resolution_reason || ""}`);
+      lines.push("");
+      lines.push("--- error text ---");
+      lines.push(d.error_text);
+      if (d.devin_output) {
+        lines.push("");
+        lines.push("--- devin output ---");
+        lines.push(d.devin_output);
+      }
+      // Simple dialog — reusamos el window.alert porque el modal serio
+      // está comprometido con el diagnose flow.
+      alert(lines.join("\n"));
+    } catch (e) {
+      alert(`error loading detail: ${e.message}`);
+    }
+  }
+
+  function updateQueueBadge(counts) {
+    const badge = $("queue-badge");
+    const pending = (counts.pending || 0) + (counts.processing || 0);
+    if (pending > 0) {
+      badge.hidden = false;
+      badge.textContent = String(pending);
+    } else {
+      badge.hidden = true;
+    }
   }
 
   // ── Init ─────────────────────────────────────────────────────────────
   wireUp();
   fetchServices().then(() => startTimers());
+  // Poll queue in background para el badge incluso si estás en vista logs.
+  setInterval(() => {
+    if (!document.hidden) {
+      fetch("/api/logs/queue?limit=1", { cache: "no-store" })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) updateQueueBadge(d.counts_by_status || {}); })
+        .catch(() => {});
+    }
+  }, 15000);
 })();

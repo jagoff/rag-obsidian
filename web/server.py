@@ -14443,6 +14443,635 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
     )
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ── Auto-fix queue: DB + scanner + worker ──────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# El user pidió: "meté los errores en una DB y dedespues que vaya
+# agarrando uno por uno y los resuelva 100% automático".
+#
+# Diseño:
+#   1. Schema: tabla rag_error_queue (sqlite-vec, state DB). Cada error
+#      único (por signature hash) es una fila. Si se repite, incrementa
+#      occurrence_count y last_seen_at.
+#   2. Scanner: thread interno del web daemon que cada N minutos lee
+#      todos los logs (reusa `_build_global_errors_payload`) y hace UPSERT.
+#   3. Worker: OTRO thread interno que cada M minutos toma el siguiente
+#      error con status=pending (ordenado por occurrence_count desc,
+#      luego last_seen_at desc), marca processing, spawn `devin -p`,
+#      parsea el STATUS de la respuesta, marca resolved/failed/etc.
+#   4. Hard cap: max N invocaciones de Devin por hora para controlar
+#      ACUs. Default conservador: 5/hora.
+#
+# Estados:
+#   pending      — nuevo, esperando worker
+#   processing   — Devin está trabajando
+#   resolved     — Devin reportó STATUS: resolved
+#   needs-human  — Devin reportó STATUS: needs-human (fix requiere decisión)
+#   no-action    — Devin reportó STATUS: no-action (falso positivo / transient)
+#   failed       — Devin crashó, exit != 0, o output sin STATUS
+#   skipped      — el worker decidió no procesar (ya tuvo attempts >= 3)
+#
+# Idempotencia: si un error resuelto vuelve a aparecer, NO volvemos a
+# procesar — el dedupe por signature lo mantiene en status=resolved
+# (solo incrementa occurrence_count). Para "reopen" manualmente, el
+# user hace UPDATE status='pending' o borra la row via CLI/DB tool.
+
+_ERROR_QUEUE_DDL = (
+    "CREATE TABLE IF NOT EXISTS rag_error_queue ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    " service TEXT NOT NULL,"
+    " file_ref TEXT NOT NULL,"
+    " error_signature TEXT NOT NULL UNIQUE,"
+    " error_text TEXT NOT NULL,"
+    " context_lines TEXT,"
+    " error_ts TEXT,"
+    " first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    " last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    " occurrence_count INTEGER NOT NULL DEFAULT 1,"
+    " status TEXT NOT NULL DEFAULT 'pending',"
+    " attempts INTEGER NOT NULL DEFAULT 0,"
+    " started_at TEXT,"
+    " completed_at TEXT,"
+    " duration_s REAL,"
+    " devin_exit_code INTEGER,"
+    " devin_output TEXT,"
+    " resolution_status TEXT,"
+    " resolution_reason TEXT"
+    ")"
+)
+_ERROR_QUEUE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_error_queue_status ON rag_error_queue(status)",
+    "CREATE INDEX IF NOT EXISTS ix_error_queue_signature ON rag_error_queue(error_signature)",
+    "CREATE INDEX IF NOT EXISTS ix_error_queue_service_ts "
+    "ON rag_error_queue(service, last_seen_at DESC)",
+)
+
+_ERROR_QUEUE_DDL_DONE = False
+_ERROR_QUEUE_DDL_LOCK = threading.Lock()
+
+
+def _ensure_error_queue_table() -> None:
+    """DDL idempotente del rag_error_queue. Corre al primer uso."""
+    global _ERROR_QUEUE_DDL_DONE
+    if _ERROR_QUEUE_DDL_DONE:
+        return
+    with _ERROR_QUEUE_DDL_LOCK:
+        if _ERROR_QUEUE_DDL_DONE:
+            return
+        try:
+            with _ragvec_state_conn() as conn:
+                conn.execute(_ERROR_QUEUE_DDL)
+                for idx in _ERROR_QUEUE_INDEXES:
+                    conn.execute(idx)
+                conn.commit()
+            _ERROR_QUEUE_DDL_DONE = True
+        except Exception as e:
+            print(f"[error-queue] DDL failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+
+
+def _compute_error_signature(service: str, error_text: str) -> str:
+    """Hash normalizado para dedupe. Errores "similares" (mismo exception
+    type + mismo mensaje estructural) → mismo signature → se dedupean.
+
+    Normalización:
+      - Lowercase
+      - Absolute paths (`/Users/...`, `/tmp/...`) → `PATH`
+      - Filenames con extensión (`_index.md`, `2026-04.md`) → `FILE`
+      - Números puros → `N` (para `line 123` = `line 456`)
+      - Whitespace colapsado
+
+    El orden importa: primero paths completos, después filenames,
+    después números. Si hacés números primero, `2026-04.md` queda
+    `N-N.md` que ya no matchea el regex de filename.
+    """
+    import hashlib
+    t = error_text.lower()
+    # 1. Paths absolutos primero.
+    t = re.sub(r"/[\w/.-]+", "PATH", t)
+    # 2. Filenames con extensión (incluso dentro de texto).
+    t = re.sub(r"\b[\w.-]+\.(md|py|txt|log|json|jsonl|db|html|js|css|yml|yaml)\b",
+               "FILE", t)
+    # 3. Números sueltos.
+    t = re.sub(r"\b\d+\b", "N", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t[:500]
+    return hashlib.sha256(f"{service}:{t}".encode("utf-8")).hexdigest()[:16]
+
+
+def _enqueue_error(
+    service: str, file_ref: str, error_text: str,
+    context_lines: list[str] | None = None, error_ts: str | None = None,
+) -> tuple[int, bool]:
+    """UPSERT del error. Retorna `(row_id, was_new)`.
+
+    Si el signature ya existía:
+      - Incrementa occurrence_count
+      - Actualiza last_seen_at
+      - NO toca status (errores ya resueltos que vuelven quedan resolved)
+    Si es nuevo: inserta con status='pending'.
+    """
+    _ensure_error_queue_table()
+    sig = _compute_error_signature(service, error_text)
+    ctx_json = json.dumps(context_lines or [], ensure_ascii=False)[:2000]
+    try:
+        with _ragvec_state_conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM rag_error_queue WHERE error_signature = ?",
+                (sig,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE rag_error_queue SET "
+                    "occurrence_count = occurrence_count + 1, "
+                    "last_seen_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (existing[0],),
+                )
+                conn.commit()
+                return existing[0], False
+            cursor = conn.execute(
+                "INSERT INTO rag_error_queue "
+                "(service, file_ref, error_signature, error_text, "
+                " context_lines, error_ts) VALUES (?, ?, ?, ?, ?, ?)",
+                (service, file_ref, sig, error_text[:4000], ctx_json, error_ts),
+            )
+            conn.commit()
+            return cursor.lastrowid, True
+    except Exception as e:
+        print(f"[error-queue] enqueue failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return -1, False
+
+
+# Rate limit del worker — max N invocaciones de Devin por hora.
+# Cada invocación tarda ~60-120s y consume ACUs pagas, así que el cap
+# es conservador. Ajustable con env var.
+_AUTO_FIX_WORKER_HOURLY_CAP = int(os.environ.get("RAG_AUTO_FIX_HOURLY_CAP", "5"))
+_AUTO_FIX_WORKER_INVOCATIONS: list[float] = []  # monotonic ts de invocaciones
+
+
+def _worker_can_invoke_devin() -> tuple[bool, str]:
+    """¿El worker puede disparar otra invocación de Devin ahora?"""
+    now = time.monotonic()
+    # Filtrar invocaciones de la última hora.
+    one_hour_ago = now - 3600
+    _AUTO_FIX_WORKER_INVOCATIONS[:] = [t for t in _AUTO_FIX_WORKER_INVOCATIONS if t > one_hour_ago]
+    if len(_AUTO_FIX_WORKER_INVOCATIONS) >= _AUTO_FIX_WORKER_HOURLY_CAP:
+        return False, (
+            f"rate limit: {_AUTO_FIX_WORKER_HOURLY_CAP} invocaciones/hora alcanzado "
+            f"(próxima slot en {int((_AUTO_FIX_WORKER_INVOCATIONS[0] + 3600 - now) / 60)}min)"
+        )
+    return True, ""
+
+
+def _parse_devin_resolution_status(output: str) -> tuple[str, str]:
+    """Extraer STATUS: y REASON: del output de Devin. Retorna
+    `(status, reason)` donde status ∈ {resolved, no-action, needs-human, failed}.
+
+    Si no encuentra un STATUS: marker, devuelve ('failed', 'no status marker').
+    """
+    m = re.search(r"STATUS:\s*(resolved|no-action|needs-human|failed)\b",
+                  output, re.IGNORECASE)
+    if not m:
+        return "failed", "output sin marker STATUS:"
+    status = m.group(1).lower()
+    reason_match = re.search(r"REASON:\s*(.+?)(?:\n|$)", output)
+    reason = reason_match.group(1).strip() if reason_match else ""
+    return status, reason[:500]
+
+
+def _get_next_pending_error() -> dict | None:
+    """Siguiente error para procesar. Prioridad:
+    1. occurrence_count DESC (errores más frecuentes primero)
+    2. last_seen_at DESC (más recientes primero)
+    3. attempts < 3 (si ya falló 3 veces, skip)
+    """
+    _ensure_error_queue_table()
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT id, service, file_ref, error_text, context_lines, "
+                "error_ts, occurrence_count, attempts "
+                "FROM rag_error_queue "
+                "WHERE status = 'pending' AND attempts < 3 "
+                "ORDER BY occurrence_count DESC, last_seen_at DESC "
+                "LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0], "service": row[1], "file_ref": row[2],
+                "error_text": row[3],
+                "context_lines": json.loads(row[4]) if row[4] else [],
+                "error_ts": row[5],
+                "occurrence_count": row[6], "attempts": row[7],
+            }
+    except Exception as e:
+        print(f"[error-queue] get_next failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _process_error_with_devin(error_id: int) -> dict:
+    """Spawn `devin -p` con el contexto del error en la DB y update la row.
+
+    Retorna el resultado `{exit_code, output, resolution_status, ...}`.
+    """
+    _ensure_error_queue_table()
+    # Fetch error row.
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT service, file_ref, error_text, context_lines, error_ts, attempts "
+                "FROM rag_error_queue WHERE id = ?",
+                (error_id,),
+            ).fetchone()
+    except Exception as e:
+        return {"error": f"fetch row failed: {e}"}
+    if not row:
+        return {"error": "row no existe"}
+
+    service, file_ref, error_text, context_json, error_ts, attempts = row
+    context_lines = json.loads(context_json) if context_json else []
+
+    # Marcar como processing + increment attempts.
+    with _ragvec_state_conn() as conn:
+        conn.execute(
+            "UPDATE rag_error_queue SET status = 'processing', "
+            "started_at = CURRENT_TIMESTAMP, attempts = attempts + 1 "
+            "WHERE id = ?",
+            (error_id,),
+        )
+        conn.commit()
+
+    # Build prompt + ejecutar devin.
+    req = _AutoFixRequest(
+        error_text=error_text,
+        service=service,
+        file=file_ref,
+        line_n=0,
+        timestamp=error_ts,
+        context_lines=context_lines,
+    )
+    prompt = _build_devin_prompt(req) + (
+        "\n\nCuando termines, terminá la respuesta con una línea:\n"
+        "STATUS: resolved | no-action | needs-human | failed\n"
+        "REASON: <explicación breve>\n"
+        "Esto es CRÍTICO para que el worker autónomo pueda clasificar "
+        "tu respuesta."
+    )
+    if len(prompt) > 3000:
+        prompt = prompt[:3000] + "…(truncado)"
+
+    if _DEVIN_BIN is None:
+        _finalize_error(error_id, -1, "", "failed", "devin CLI no encontrado", 0.0)
+        _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
+        return {"error_id": error_id, "exit_code": -1, "resolution_status": "failed"}
+
+    cmd = [_DEVIN_BIN, "-p", prompt, "--respect-workspace-trust", "false"]
+    _AUTO_FIX_WORKER_INVOCATIONS.append(time.monotonic())
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=_AUTO_FIX_DEVIN_TIMEOUT_S,
+            shell=False,
+            env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
+        )
+        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        exit_code = proc.returncode
+        duration_s = round(time.monotonic() - t0, 3)
+        if exit_code == 0:
+            resolution_status, reason = _parse_devin_resolution_status(output)
+        else:
+            resolution_status, reason = "failed", f"exit {exit_code}"
+        _finalize_error(error_id, exit_code, output, resolution_status, reason, duration_s)
+        return {
+            "error_id": error_id, "exit_code": exit_code,
+            "resolution_status": resolution_status, "reason": reason,
+            "duration_s": duration_s,
+        }
+    except subprocess.TimeoutExpired:
+        duration_s = round(time.monotonic() - t0, 3)
+        _finalize_error(error_id, 124, "", "failed",
+                        f"timeout {_AUTO_FIX_DEVIN_TIMEOUT_S}s", duration_s)
+        return {"error_id": error_id, "exit_code": 124, "resolution_status": "failed"}
+    except Exception as e:
+        duration_s = round(time.monotonic() - t0, 3)
+        _finalize_error(error_id, -1, "", "failed",
+                        f"{type(e).__name__}: {e}", duration_s)
+        return {"error_id": error_id, "exit_code": -1, "resolution_status": "failed"}
+
+
+def _finalize_error(
+    error_id: int, exit_code: int, output: str,
+    resolution_status: str, reason: str, duration_s: float,
+) -> None:
+    """Marcar la row como completada con resolution_status."""
+    # resolution_status → row.status mapping.
+    status_map = {
+        "resolved": "resolved",
+        "no-action": "no-action",
+        "needs-human": "needs-human",
+        "failed": "failed",
+    }
+    new_status = status_map.get(resolution_status, "failed")
+    try:
+        with _ragvec_state_conn() as conn:
+            conn.execute(
+                "UPDATE rag_error_queue SET "
+                "status = ?, completed_at = CURRENT_TIMESTAMP, "
+                "duration_s = ?, devin_exit_code = ?, "
+                "devin_output = ?, resolution_status = ?, resolution_reason = ? "
+                "WHERE id = ?",
+                (new_status, duration_s, exit_code, output[:16000],
+                 resolution_status, reason, error_id),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[error-queue] finalize failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
+# ── Scanner + Worker threads ──────────────────────────────────────────
+# Dos daemon threads — uno popla la queue, el otro la procesa. Ambos
+# despiertan periódicamente y corren una iteración.
+
+_SCANNER_PERIOD_S = 300.0  # 5min
+_WORKER_PERIOD_S = 120.0   # 2min
+_SCANNER_THREAD: "threading.Thread | None" = None
+_WORKER_THREAD: "threading.Thread | None" = None
+_ERROR_QUEUE_STOP = threading.Event()
+# Flag para habilitar el worker automático. Default: off para que el user
+# explícitamente lo active (evita sorpresas con ACUs). Se controla via
+# env var o via /api/logs/queue/config.
+_WORKER_AUTO_ENABLED = os.environ.get("RAG_AUTO_FIX_WORKER", "0") == "1"
+
+
+def _scanner_loop() -> None:
+    """Loop: cada _SCANNER_PERIOD_S, escanea logs + enqueue errores nuevos."""
+    while not _ERROR_QUEUE_STOP.is_set():
+        try:
+            payload = _build_global_errors_payload(3600, "error")
+            enqueued = 0
+            seen = 0
+            for ln in payload.get("lines", []):
+                seen += 1
+                _, was_new = _enqueue_error(
+                    service=ln.get("service") or "unknown",
+                    file_ref=ln.get("ref") or "",
+                    error_text=ln.get("text") or "",
+                    context_lines=[],  # Scanner no tiene contexto líneas; el feed global no lo provee
+                    error_ts=ln.get("ts"),
+                )
+                if was_new:
+                    enqueued += 1
+            if enqueued > 0:
+                print(f"[error-queue scanner] enqueued {enqueued} new errors "
+                      f"(seen {seen})", flush=True)
+        except Exception as e:
+            print(f"[error-queue scanner] tick failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+        _ERROR_QUEUE_STOP.wait(timeout=_SCANNER_PERIOD_S)
+
+
+def _worker_loop() -> None:
+    """Loop: cada _WORKER_PERIOD_S, si hay pending + bajo el rate limit,
+    procesa 1 error con Devin."""
+    while not _ERROR_QUEUE_STOP.is_set():
+        try:
+            if not _WORKER_AUTO_ENABLED:
+                _ERROR_QUEUE_STOP.wait(timeout=_WORKER_PERIOD_S)
+                continue
+            can, reason = _worker_can_invoke_devin()
+            if not can:
+                _ERROR_QUEUE_STOP.wait(timeout=_WORKER_PERIOD_S)
+                continue
+            next_error = _get_next_pending_error()
+            if not next_error:
+                _ERROR_QUEUE_STOP.wait(timeout=_WORKER_PERIOD_S)
+                continue
+            print(f"[error-queue worker] processing error id={next_error['id']} "
+                  f"service={next_error['service']} "
+                  f"count={next_error['occurrence_count']}", flush=True)
+            result = _process_error_with_devin(next_error["id"])
+            print(f"[error-queue worker] done id={next_error['id']} "
+                  f"status={result.get('resolution_status')} "
+                  f"duration={result.get('duration_s')}s", flush=True)
+        except Exception as e:
+            print(f"[error-queue worker] tick failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+        _ERROR_QUEUE_STOP.wait(timeout=_WORKER_PERIOD_S)
+
+
+@_on_startup
+def _start_error_queue_threads() -> None:
+    """Arrancar scanner + worker threads al boot del web daemon."""
+    global _SCANNER_THREAD, _WORKER_THREAD
+    _ERROR_QUEUE_STOP.clear()
+    _SCANNER_THREAD = threading.Thread(
+        target=_scanner_loop, name="error-queue-scanner", daemon=True)
+    _SCANNER_THREAD.start()
+    _WORKER_THREAD = threading.Thread(
+        target=_worker_loop, name="error-queue-worker", daemon=True)
+    _WORKER_THREAD.start()
+
+
+@_on_shutdown
+def _stop_error_queue_threads() -> None:
+    """Señalar a los threads que paren."""
+    _ERROR_QUEUE_STOP.set()
+    if _SCANNER_THREAD is not None:
+        _SCANNER_THREAD.join(timeout=2.0)
+    if _WORKER_THREAD is not None:
+        _WORKER_THREAD.join(timeout=2.0)
+
+
+# ── API endpoints ─────────────────────────────────────────────────────
+
+@app.get("/api/logs/queue")
+def logs_queue_list(status: str = "all", limit: int = 100) -> dict:
+    """Listar entries del queue. Filtro por status opcional."""
+    _ensure_error_queue_table()
+    valid_statuses = {"all", "pending", "processing", "resolved",
+                      "needs-human", "no-action", "failed", "skipped"}
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400,
+                            detail=f"status inválido: {status!r}")
+    lim = max(1, min(int(limit), 500))
+    try:
+        with _ragvec_state_conn() as conn:
+            if status == "all":
+                rows = conn.execute(
+                    "SELECT id, service, file_ref, error_text, status, "
+                    "occurrence_count, attempts, first_seen_at, last_seen_at, "
+                    "completed_at, duration_s, resolution_status, resolution_reason "
+                    "FROM rag_error_queue "
+                    "ORDER BY CASE status "
+                    "  WHEN 'processing' THEN 0 "
+                    "  WHEN 'pending' THEN 1 "
+                    "  WHEN 'needs-human' THEN 2 "
+                    "  WHEN 'failed' THEN 3 "
+                    "  WHEN 'resolved' THEN 4 "
+                    "  ELSE 5 END, "
+                    "last_seen_at DESC "
+                    "LIMIT ?",
+                    (lim,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, service, file_ref, error_text, status, "
+                    "occurrence_count, attempts, first_seen_at, last_seen_at, "
+                    "completed_at, duration_s, resolution_status, resolution_reason "
+                    "FROM rag_error_queue WHERE status = ? "
+                    "ORDER BY last_seen_at DESC LIMIT ?",
+                    (status, lim),
+                ).fetchall()
+            # Counts por status.
+            counts = dict(conn.execute(
+                "SELECT status, COUNT(*) FROM rag_error_queue GROUP BY status"
+            ).fetchall())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+    entries = [{
+        "id": r[0], "service": r[1], "file_ref": r[2],
+        "error_text": r[3], "status": r[4],
+        "occurrence_count": r[5], "attempts": r[6],
+        "first_seen_at": r[7], "last_seen_at": r[8],
+        "completed_at": r[9], "duration_s": r[10],
+        "resolution_status": r[11], "resolution_reason": r[12],
+    } for r in rows]
+
+    can_invoke, rate_reason = _worker_can_invoke_devin()
+    return {
+        "entries": entries,
+        "counts_by_status": counts,
+        "total": sum(counts.values()),
+        "worker_enabled": _WORKER_AUTO_ENABLED,
+        "worker_rate_limit": {
+            "hourly_cap": _AUTO_FIX_WORKER_HOURLY_CAP,
+            "current_hour_count": len(_AUTO_FIX_WORKER_INVOCATIONS),
+            "can_invoke_now": can_invoke,
+            "reason": rate_reason if not can_invoke else "",
+        },
+    }
+
+
+@app.get("/api/logs/queue/{error_id}")
+def logs_queue_get(error_id: int) -> dict:
+    """Detalle de un error (incluye context_lines + devin_output completo)."""
+    _ensure_error_queue_table()
+    try:
+        with _ragvec_state_conn() as conn:
+            row = conn.execute(
+                "SELECT id, service, file_ref, error_signature, error_text, "
+                "context_lines, error_ts, first_seen_at, last_seen_at, "
+                "occurrence_count, status, attempts, started_at, completed_at, "
+                "duration_s, devin_exit_code, devin_output, "
+                "resolution_status, resolution_reason "
+                "FROM rag_error_queue WHERE id = ?",
+                (error_id,),
+            ).fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+    if not row:
+        raise HTTPException(status_code=404, detail="error no encontrado")
+    return {
+        "id": row[0], "service": row[1], "file_ref": row[2],
+        "error_signature": row[3], "error_text": row[4],
+        "context_lines": json.loads(row[5]) if row[5] else [],
+        "error_ts": row[6], "first_seen_at": row[7], "last_seen_at": row[8],
+        "occurrence_count": row[9], "status": row[10], "attempts": row[11],
+        "started_at": row[12], "completed_at": row[13],
+        "duration_s": row[14], "devin_exit_code": row[15],
+        "devin_output": row[16], "resolution_status": row[17],
+        "resolution_reason": row[18],
+    }
+
+
+@app.post("/api/logs/queue/process-next")
+def logs_queue_process_next() -> dict:
+    """Procesar manualmente el siguiente pending. Útil para testing y
+    para cuando el worker está desactivado."""
+    can, reason = _worker_can_invoke_devin()
+    if not can:
+        raise HTTPException(status_code=429, detail=reason)
+    next_error = _get_next_pending_error()
+    if not next_error:
+        return {"status": "no-pending", "message": "no hay errores pending"}
+    result = _process_error_with_devin(next_error["id"])
+    return {"status": "processed", **result}
+
+
+@app.post("/api/logs/queue/scan-now")
+def logs_queue_scan_now() -> dict:
+    """Forzar un scan manual de los logs + enqueue. Útil después de que
+    un daemon empezó a fallar y querés ver los errores en la queue ya."""
+    try:
+        payload = _build_global_errors_payload(3600, "error")
+        enqueued = 0
+        for ln in payload.get("lines", []):
+            _, was_new = _enqueue_error(
+                service=ln.get("service") or "unknown",
+                file_ref=ln.get("ref") or "",
+                error_text=ln.get("text") or "",
+                context_lines=[], error_ts=ln.get("ts"),
+            )
+            if was_new:
+                enqueued += 1
+        return {
+            "status": "ok", "scanned": len(payload.get("lines", [])),
+            "new_entries": enqueued,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"{type(e).__name__}: {e}") from e
+
+
+class _WorkerConfigRequest(BaseModel):
+    enabled: bool = Field(..., description="Habilitar o no el worker auto")
+    hourly_cap: int | None = Field(None, description="Cap de invocaciones/hora")
+
+
+@app.post("/api/logs/queue/config")
+def logs_queue_config(req: _WorkerConfigRequest) -> dict:
+    """Toggle del worker automático + ajuste del rate limit."""
+    global _WORKER_AUTO_ENABLED, _AUTO_FIX_WORKER_HOURLY_CAP
+    _WORKER_AUTO_ENABLED = bool(req.enabled)
+    if req.hourly_cap is not None:
+        _AUTO_FIX_WORKER_HOURLY_CAP = max(0, min(int(req.hourly_cap), 50))
+    return {
+        "worker_enabled": _WORKER_AUTO_ENABLED,
+        "hourly_cap": _AUTO_FIX_WORKER_HOURLY_CAP,
+    }
+
+
+@app.delete("/api/logs/queue/{error_id}")
+def logs_queue_delete(error_id: int) -> dict:
+    """Borrar un entry del queue. Útil para limpiar falsos positivos."""
+    _ensure_error_queue_table()
+    try:
+        with _ragvec_state_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM rag_error_queue WHERE id = ?", (error_id,)
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="error no encontrado")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"{type(e).__name__}: {e}") from e
+    return {"status": "deleted", "id": error_id}
+
+
 @app.get("/logs")
 def logs_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "logs.html")

@@ -937,6 +937,204 @@
       outline-offset: 2px;
     }
     main:focus, main:focus-visible { outline: none; }
+
+    /* ── Auto-fix queue tab ─ panel alternativo a .layout.
+       Se muestra cuando el user clickea el toggle "queue" del header. */
+    .queue-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    .queue-panel[hidden] { display: none; }
+
+    .queue-summary {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--sep);
+      align-items: center;
+    }
+    .queue-summary .qs-chip {
+      display: inline-flex;
+      gap: 6px;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+    }
+    .queue-summary .qs-chip strong { font-weight: 700; font-size: 14px; }
+    .qs-chip.pending     strong { color: var(--cyan); }
+    .qs-chip.processing  strong { color: var(--purple); }
+    .qs-chip.resolved    strong { color: var(--green); }
+    .qs-chip.needs-human strong { color: var(--yellow); }
+    .qs-chip.failed      strong { color: var(--red); }
+
+    .queue-controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-left: auto;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+    .queue-controls .qc-toggle {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .queue-controls .qc-toggle:hover {
+      background: var(--hover);
+      border-color: var(--border-strong);
+    }
+    .qc-toggle[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--green) 15%, transparent);
+      border-color: var(--green);
+      color: var(--green);
+    }
+    .qc-toggle[aria-pressed="false"] {
+      background: var(--bg-elev);
+    }
+    .queue-controls .qc-action {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .queue-controls .qc-action:hover {
+      background: var(--hover);
+      border-color: var(--border-strong);
+    }
+
+    .queue-rate-limit {
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-bottom: 10px;
+    }
+    .queue-rate-limit.qrl-warn { color: var(--yellow); }
+
+    .queue-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .queue-table th {
+      text-align: left;
+      padding: 8px 8px;
+      border-bottom: 2px solid var(--sep);
+      color: var(--text-faint);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .queue-table td {
+      padding: 8px 8px;
+      border-bottom: 1px solid var(--sep);
+      vertical-align: top;
+    }
+    .queue-table tr:hover td { background: var(--hover); cursor: pointer; }
+
+    .queue-status {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 2px 7px;
+      border-radius: 3px;
+    }
+    .queue-status.pending    { background: color-mix(in srgb, var(--cyan) 18%, transparent); color: var(--cyan); }
+    .queue-status.processing { background: color-mix(in srgb, var(--purple) 22%, transparent); color: var(--purple); animation: pulse 1.6s ease-in-out infinite; }
+    .queue-status.resolved   { background: color-mix(in srgb, var(--green) 18%, transparent); color: var(--green); }
+    .queue-status.no-action  { background: color-mix(in srgb, var(--text-faint) 18%, transparent); color: var(--text-dim); }
+    .queue-status.needs-human { background: color-mix(in srgb, var(--yellow) 22%, transparent); color: var(--yellow); }
+    .queue-status.failed      { background: color-mix(in srgb, var(--red) 18%, transparent); color: var(--red); }
+    .queue-status.skipped     { background: var(--border); color: var(--text-faint); }
+
+    .queue-error-text {
+      font-family: "SF Mono", "Menlo", monospace;
+      font-size: 11px;
+      color: var(--text-dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 400px;
+    }
+
+    .queue-age {
+      font-size: 10.5px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .queue-occ {
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+    }
+
+    .queue-empty {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-faint);
+      font-size: 13px;
+    }
+
+    /* Tab toggle en header */
+    .view-toggle {
+      display: inline-flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      margin-right: 6px;
+    }
+    .view-toggle-btn {
+      background: transparent;
+      color: var(--text-dim);
+      border: none;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .view-toggle-btn + .view-toggle-btn {
+      border-left: 1px solid var(--border);
+    }
+    .view-toggle-btn:hover { background: var(--hover); }
+    .view-toggle-btn[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--cyan) 18%, transparent);
+      color: var(--cyan);
+      font-weight: 600;
+    }
+    .view-toggle-btn .queue-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-left: 5px;
+      background: color-mix(in srgb, var(--cyan) 25%, transparent);
+      color: var(--cyan);
+      font-variant-numeric: tabular-nums;
+    }
   </style>
 </head>
 <body>
@@ -946,6 +1144,15 @@
       <h1>rag <span>· logs</span></h1>
       <div class="header-meta">
         <span id="meta-updated" aria-live="polite" aria-atomic="true">cargando…</span>
+        <div class="view-toggle" role="tablist" aria-label="Vista">
+          <button class="view-toggle-btn" data-view="logs"
+                  type="button" aria-pressed="true">logs</button>
+          <button class="view-toggle-btn" data-view="queue"
+                  type="button" aria-pressed="false">
+            queue
+            <span class="queue-badge" id="queue-badge" hidden>0</span>
+          </button>
+        </div>
         <button id="live-toggle" type="button" aria-pressed="true"
                 aria-label="Pausar o reanudar auto-refresh">
           <span id="live-label">auto ON</span>
@@ -1044,11 +1251,55 @@
           </div>
         </section>
       </div>
+
+      <!-- Queue panel (auto-fix) — alternativa a .layout, se toggle con
+           el botón "queue" del header. -->
+      <section class="queue-panel" id="queue-panel" hidden aria-label="Auto-fix queue">
+        <div class="queue-summary" id="queue-summary">
+          <span class="label" style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:0.06em">queue</span>
+          <span class="qs-chip pending"><strong id="qc-pending">0</strong> pending</span>
+          <span class="qs-chip processing"><strong id="qc-processing">0</strong> processing</span>
+          <span class="qs-chip resolved"><strong id="qc-resolved">0</strong> resolved</span>
+          <span class="qs-chip needs-human"><strong id="qc-needs-human">0</strong> needs human</span>
+          <span class="qs-chip failed"><strong id="qc-failed">0</strong> failed</span>
+          <div class="queue-controls">
+            <button class="qc-toggle" id="qc-worker-toggle" type="button" aria-pressed="false"
+                    title="habilitar/deshabilitar el worker automático que procesa errores con Devin">
+              <span id="qc-worker-label">worker OFF</span>
+            </button>
+            <button class="qc-action" id="qc-scan-now" type="button"
+                    title="escanear logs ahora + insertar errores nuevos en la queue">
+              ↻ escanear
+            </button>
+            <button class="qc-action" id="qc-process-next" type="button"
+                    title="procesar manualmente el siguiente error pending con Devin (ignora el worker toggle)">
+              ▶ procesar siguiente
+            </button>
+          </div>
+        </div>
+        <div class="queue-rate-limit" id="queue-rate-limit"></div>
+        <table class="queue-table" id="queue-table">
+          <thead>
+            <tr>
+              <th style="width:50px">id</th>
+              <th style="width:100px">status</th>
+              <th style="width:130px">service</th>
+              <th>error</th>
+              <th style="width:60px">occ.</th>
+              <th style="width:80px">last seen</th>
+              <th style="width:90px">resolution</th>
+            </tr>
+          </thead>
+          <tbody id="queue-tbody">
+            <tr><td colspan="7" class="queue-empty">cargando queue…</td></tr>
+          </tbody>
+        </table>
+      </section>
     </main>
   </div>
 
   <link rel="stylesheet" href="/static/diagnose-modal.css?v=2026-04-26-devin">
   <script src="/static/diagnose-modal.js?v=2026-04-26-devin" defer></script>
-  <script src="/static/logs.js?v=2026-04-26-diagnose" defer></script>
+  <script src="/static/logs.js?v=2026-04-26-queue" defer></script>
 </body>
 </html>

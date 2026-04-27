@@ -42665,15 +42665,18 @@ def _wants_finance_detail(question: str) -> bool:
     """Detecta si el user quiere TODOS los movimientos (detalle completo)
     en lugar del summary corto con top 3-5. Triggers:
 
-      - "detalle" / "detalles" / "detallado" / "todo el detalle"
-      - "resumen" / "resúmen" / "resúmenes" — en dominio de tarjetas,
-        "dame el resumen de mi tarjeta" = el documento del banco con
-        TODOS los movimientos del ciclo, no un top-3 (user report
-        2026-04-26 voice "Eh, dame el resumen de tarjeta mío de este
-        mes" esperaba la lista completa).
+      - Sustantivo "detalle" / "detalles" / "detallado"
+      - Verbo "detallar" conjugado (imperativo voseo/tuteo + infinitivo):
+        "detallame", "detalláme", "detallá", "detalla", "detállame",
+        "detallanos", "detallarme", "detallarlos" — user report
+        2026-04-26 voice "detallame el consumo de la tarjeta de credito"
+        no disparaba detail porque solo matcheaba el sustantivo.
+      - "resumen" / "resúmen" / "resúmenes" — en dominio de tarjetas
+        "el resumen" = el documento del banco con todos los movimientos.
       - "todos los movimientos/gastos/consumos/cargos"
-      - "movimientos" / "consumos" / "cargos" (plural solos — pedido
-        implícito de listá los que hay)
+      - "movimientos" / "consumos" / "cargos" (plurales solos)
+      - "consumo" singular (el short-circuit ya filtró por tarjeta/visa/etc.
+        antes, así que no hay falso-positivo "mi consumo de agua")
       - "lista completa" / "lista de consumos"
       - "items" / "ítems"
       - "mostrame/dame/ver todo"
@@ -42682,10 +42685,19 @@ def _wants_finance_detail(question: str) -> bool:
     """
     q = (question or "").lower()
     return bool(re.search(
+        # Sustantivo detalle / adjetivo detallado
         r"\bdetalles?\b|\bdetallad[oa]\b|"
+        # Verbo detallar conjugado — imperativo voseo/tuteo + infinitivo con
+        # clíticos. Cubre: detalla, detallá, detallame, detalláme, detállame,
+        # detallanos, detallarme, detallarlo, detallarla, detallarlos, etc.
+        r"\bdet[aá]ll[aá](?:me|nos|lo|la|los|las|rme|rlo|rla|rlos|rlas)?\b|"
+        # Sustantivo resumen / plural
         r"\bres[uú]men(?:es)?\b|"
         r"\btodos\s+los\s+(movimientos|gastos|consumos|cargos)\b|"
         r"\b(movimientos|consumos|cargos)\b|"
+        # Singular "consumo" — OK porque _is_finance_or_cards_query filtró
+        # por contexto financiero antes de llegar acá.
+        r"\bconsumo\b|"
         r"\blista\s+(completa|de\s+(consumos|movimientos|gastos|cargos))\b|"
         r"\b\u00edtems?\b|\bitems\b|"
         r"\b(mostrame|dame|ver)\s+todo\b",

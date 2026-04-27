@@ -93,48 +93,12 @@ except Exception:  # pragma: no cover - tqdm not installed
     pass
 
 
-def _shutdown_joblib_loky_pool() -> None:
-    """Drain el joblib/loky reusable executor al exit del proceso.
-
-    Registrado via `atexit`. Mismo mecanismo que el handler del web server
-    (ver `web/server.py:_shutdown_joblib_loky_pool` + comentarios ahí para
-    el trace completo del bug).
-
-    Origen: sentence-transformers / transformers / sklearn usan joblib
-    internamente; algunos paths arrancan un `loky` pool (multiprocessing
-    workers) durante el re-indexing. Si nadie drena ese pool al exit,
-    `resource_tracker` ve el SemLock del pool huérfano y warnea.
-
-    Idempotente: si el pool nunca arrancó, `get_reusable_executor()`
-    devuelve un executor vacío y `shutdown` es no-op. Silent-skip si
-    joblib no está disponible o si la API cambia — el leak vuelve pero
-    no rompemos el shutdown path.
-    """
-    try:
-        from joblib.externals.loky import get_reusable_executor
-        from joblib.externals.loky import reusable_executor as _re_mod
-        import gc as _gc
-
-        executor = get_reusable_executor()
-        executor.shutdown(wait=True, kill_workers=True)
-
-        # Reset los globals del executor para liberar las refs a SemLock
-        # y correr sus Finalizers (`util.Finalize(SemLock._cleanup, ...)`)
-        # ANTES del resource_tracker check del exit fini-fini.
-        try:
-            _re_mod._executor = None
-            _re_mod._executor_kwargs = None
-        except Exception:
-            pass
-        try:
-            _gc.collect()
-        except Exception:
-            pass
-    except Exception:
-        # Silent-skip — el leak no es bloqueante, no queremos romper el
-        # exit si joblib se desinstala o cambia su API.
-        pass
-
+# El teardown (drain del joblib/loky pool) vive en `rag/_shutdown.py` para
+# compartir el código con `web/server.py` — ver ese módulo para la doc
+# completa del bug + el fix en tres pasos. Acá solo registramos el handler
+# via atexit para que cualquier invocación del CLI (watch, serve, query,
+# chat, etc.) lo dispare al exit del intérprete.
+from rag._shutdown import shutdown_joblib_loky_pool as _shutdown_joblib_loky_pool
 
 atexit.register(_shutdown_joblib_loky_pool)
 # === END LOKY SEMAPHORE LEAK FIX ============================================
@@ -12450,16 +12414,18 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
     n = col.count()
     cid = str(getattr(col, "id", "") or "")
     # Check + return bajo el mismo lock para evitar TOCTOU con
-    # `_invalidate_corpus_cache`. Pre-fix (2026-04-24 audit):
-    #   with lock: cached = _corpus_cache       # <-- lock released
-    #   if cached is not None and cached["count"]==n: return cached
-    # Entre el release del lock y el check, otro thread podía llamar
-    # `_invalidate_corpus_cache` (que setea `_corpus_cache=None` bajo
-    # el lock); la ref local `cached` seguía apuntando al dict viejo,
-    # y lo retornábamos como si fuera válido — serving stale data
-    # después de que otro thread explícitamente dijo "invalidá el
-    # cache". Típico caso: `rag index --reset` corriendo en paralelo
-    # con `rag chat` serve.
+    # `_invalidate_corpus_cache`. Audit 2026-04-26 (BUG #8): pre-fix
+    # rebuild ocurría FUERA del lock — dos threads en miss simultáneo
+    # ejecutaban BM25Okapi en paralelo (lento) y al final el segundo
+    # overwriteaba al primero bajo el lock. Peor: si entre release-y-
+    # rebuild un tercer thread llamaba invalidate, el write-back
+    # reintroducía el cache que invalidate borró.
+    # Fix: single-flight pattern usando RLock — el lock cubre TODO el
+    # rebuild. Costo: queries paralelas serializan en cache miss
+    # (~50-200ms una vez), pero el cache hit subsequent es libre.
+    # Penalty bounded: el RLock permite recursión si algún path
+    # del rebuild llama a otro `_load_corpus` (no debería pero es
+    # defensivo).
     with _corpus_cache_lock:
         cached = _corpus_cache
         if (
@@ -12470,7 +12436,7 @@ def _load_corpus(col: SqliteVecCollection) -> dict:
             record_cache_event("corpus", hits=1)
             return cached
 
-    record_cache_event("corpus", misses=1)
+        record_cache_event("corpus", misses=1)
     data = col.get(include=["documents", "metadatas"])
     docs, ids, metas = data["documents"], data["ids"], data["metadatas"]
 
@@ -19989,12 +19955,20 @@ def retrieve(
         sem_top_distance=_top_sem_dist_first,
     )
     if fast_path_taken:
-        # Scores sintéticos decrecientes desde 0.95: mantienen el orden
-        # RRF y dan confidence alta al top-1 (downstream gates como
-        # CONFIDENCE_RERANK_MIN=0.015 pasan trivialmente). 0.95 - 0.01*i
-        # mantiene gap entre posiciones consistente con outputs típicos
-        # del cross-encoder (BAAI/bge-reranker en sigmoid space).
-        scores = [max(0.0, 0.95 - 0.01 * i) for i in range(len(candidates))]
+        # Audit 2026-04-26 (BUG #5): pre-fix usaba `0.95 - 0.01*i` para
+        # todos los candidates. Eso garantizaba que el confidence gate
+        # (CONFIDENCE_RERANK_MIN=0.015) pasara trivialmente, AUN si el
+        # rerank real hubiera sido negativo. Para queries semánticamente
+        # off-topic donde sem+BM25 coinciden por accidente lexical, el
+        # gate hubiera filtrado correctamente, pero el fast-path lo
+        # bypaseaba.
+        # Fix: usar el cosine similarity REAL del top sem (que sabemos
+        # ≥0.90 por el threshold del fast-path) como base, y degradar
+        # 0.005/posición. Mantiene orden RRF + monotonicidad pero no
+        # inflar artificialmente el score; el gate ya pasaría con
+        # cosine 0.90 (>>0.015) sin necesidad de inventar 0.95.
+        _base_score = max(0.0, 1.0 - (_top_sem_dist_first or 0.0))
+        scores = [max(0.0, _base_score - 0.005 * i) for i in range(len(candidates))]
         _timing["rerank_ms"] = 0.0
         _timing["rerank_fastpath"] = _top_sem_dist_first
     else:
@@ -20202,14 +20176,21 @@ def retrieve(
         # Cross-source multiplicative adjustment. For `vault` (default)
         # both factors are 1.0 — no-op. Non-vault sources get a static
         # trust weight × exponential recency decay. Applied last so it
-        # composes with every upstream signal, preserving their relative
-        # ordering within a source but globally down-weighting less-
-        # trusted sources relative to the vault baseline.
+        # composes con cada signal upstream, preservando ordering
+        # interno pero down-weighting fuentes menos confiables.
+        # Audit 2026-04-26 (BUG #7): cuando `final < 0` (rerank logit
+        # negativo + feedback_neg agresivo), `final * 0.75` MEJORA el
+        # score (lo acerca a cero) → chunks penalizados en WA terminan
+        # ranking MÁS alto que en vault. Para preservar ordering: si
+        # final < 0, dividir por src_mult en vez de multiplicar.
         src_mult = source_weight(src) * source_recency_multiplier(
             src, meta.get("created_ts"),
         )
-        if src_mult != 1.0:
-            final *= src_mult
+        if src_mult != 1.0 and src_mult > 0:
+            if final >= 0:
+                final *= src_mult
+            else:
+                final /= src_mult
         final_pairs.append((c, e, final))
     scored_all = sorted(final_pairs, key=lambda x: x[2], reverse=True)
     # Conversational dedup (§3.3 option A) — WhatsApp chunks from the same
@@ -21034,8 +21015,12 @@ def apply_weighted_scores(
         src = normalize_source(f["meta"].get("source"))
         created = f["meta"].get("created_ts")
         src_mult = source_weight(src) * source_recency_multiplier(src, created)
-        if src_mult != 1.0:
-            score *= src_mult
+        # Audit 2026-04-26 (BUG #7): preservar ordering en scores negativos.
+        if src_mult != 1.0 and src_mult > 0:
+            if score >= 0:
+                score *= src_mult
+            else:
+                score /= src_mult
         scored.append((score, f))
     scored.sort(key=lambda x: x[0], reverse=True)
     out: list[dict] = []
@@ -26780,13 +26765,23 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
     tc = tcalls[0]
     name = tc.function.name
     args = tc.function.arguments or {}
-    if isinstance(args, dict) and "parameters" in args and isinstance(args["parameters"], (dict, str)):
+    # Audit 2026-04-26 (BUG #10): defensive parse de raw string args.
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    if "parameters" in args and isinstance(args["parameters"], (dict, str)):
         params = args["parameters"]
         if isinstance(params, str):
             try:
                 params = json.loads(params)
             except Exception:
                 params = {}
+        if not isinstance(params, dict):
+            params = {}
         args = params
     args = {k: v for k, v in args.items() if v not in ("", None)}
 
@@ -31494,15 +31489,27 @@ def do(instruction: str, yes: bool, max_iterations: int):
         for tc in msg.tool_calls:
             name = tc.function.name
             args = tc.function.arguments or {}
+            # Audit 2026-04-26 (BUG #10): algunos modelos ollama devuelven
+            # args como JSON string raw — el dict comp de abajo crasheaba
+            # con AttributeError sin capturar. Parse defensivo PRIMERO.
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
             # command-r wraps args as {"tool_name": "...", "parameters": {...}}.
             # Unwrap so we can call the Python function directly.
-            if isinstance(args, dict) and "parameters" in args and isinstance(args["parameters"], (dict, str)):
+            if "parameters" in args and isinstance(args["parameters"], (dict, str)):
                 params = args["parameters"]
                 if isinstance(params, str):
                     try:
                         params = json.loads(params)
                     except Exception:
                         params = {}
+                if not isinstance(params, dict):
+                    params = {}
                 args = params
             # Drop empty-string optional args so defaults kick in.
             args = {k: v for k, v in args.items() if v not in ("", None)}
@@ -39630,7 +39637,7 @@ def find_dead_notes(
     min_age_days: int = 365,
     query_window_days: int = 180,
     exclude_folders: tuple[str, ...] = (
-        "00-Inbox", "04-Archive",
+        "00-Inbox", "04-Archive", "05-Reviews",
     ),
     use_frontmatter_date: bool = True,
 ) -> list[dict]:
@@ -39640,6 +39647,14 @@ def find_dead_notes(
     Age source: frontmatter `created:` if present (more reliable in iCloud
     vaults where sync constantly bumps mtime), else mtime. Disable with
     `use_frontmatter_date=False`.
+
+    Audit 2026-04-26 (BUG #11): pre-fix leía `queries.jsonl` (param
+    `query_log`) que post-T10 (2026-04-19) está casi vacío de eventos
+    `cmd=query` reales — solo recibe `conversation_turn_written` desde
+    el split de telemetría. `retrieved_paths` quedaba vacío → cualquier
+    nota retrieved en últimos 180d pasaba el filtro AND como dead
+    candidate → `rag archive --apply` archivaba notas que el user usó
+    en la última semana. CRÍTICO. Fix: leer SQL `rag_queries` directamente.
     """
     from datetime import timedelta as _td
     corpus = _load_corpus(col)
@@ -39653,31 +39668,27 @@ def find_dead_notes(
             backlinked_paths.update(title_to_paths.get(title, set()))
 
     retrieved_paths: set[str] = set()
-    if query_log.is_file():
-        cutoff = datetime.now() - _td(days=query_window_days)
+    cutoff_iso = (datetime.now() - _td(days=query_window_days)).isoformat(timespec="seconds")
+    try:
+        with _ragvec_state_conn() as _conn:
+            for (paths_json,) in _conn.execute(
+                "SELECT paths_json FROM rag_queries "
+                "WHERE ts >= ? AND paths_json IS NOT NULL AND paths_json <> ''",
+                (cutoff_iso,),
+            ):
+                try:
+                    paths = json.loads(paths_json) if paths_json else []
+                except Exception:
+                    continue
+                if isinstance(paths, list):
+                    for p in paths:
+                        if isinstance(p, str) and p:
+                            retrieved_paths.add(p)
+    except Exception as _exc:
         try:
-            lines = query_log.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            try:
-                ts = datetime.fromisoformat(e.get("ts", ""))
-            except Exception:
-                continue
-            if ts < cutoff:
-                continue
-            paths = e.get("paths") or []
-            if isinstance(paths, list):
-                for p in paths:
-                    if isinstance(p, str) and p:
-                        retrieved_paths.add(p)
+            _silent_log("find_dead_notes_sql_read_failed", _exc)
+        except Exception:
+            pass
 
     files_info: dict[str, tuple[float, float]] = {}  # rel → (age_ts, mtime)
     if vault.is_dir():

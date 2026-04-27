@@ -24,6 +24,10 @@ def tmp_vault(tmp_path, monkeypatch, fake_embed):
     (vault / "00-Inbox").mkdir(parents=True)
     (vault / "04-Archive/99-obsidian-system/99-Claude/reviews").mkdir(parents=True)
     monkeypatch.setattr(rag, "VAULT_PATH", vault)
+    # Aislamos la telemetry DB al tmp_path — BUG #11 fix (2026-04-26) hace
+    # que find_dead_notes lea de `rag_queries` SQL en lugar de `queries.jsonl`,
+    # entonces sin este monkeypatch los tests tocarían la telemetry real.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path / "telemetry_db")
     client = _TestVecClient(path=str(tmp_path / "ragvec"))
     col = client.get_or_create_collection(
         name="cmd_test", metadata={"hnsw:space": "cosine"}
@@ -486,16 +490,21 @@ def test_dead_excludes_recently_retrieved(tmp_vault, tmp_path):
     target.write_text("used in queries")
     _touch_with_mtime(target, 400)
     _add_chunk(col, "02-Areas/used.md", "used")
-    ql = tmp_path / "q.jsonl"
-    # Query that retrieved it recently (7 days ago)
-    entry = {
-        "ts": (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds"),
-        "cmd": "query", "q": "whatever",
-        "paths": ["02-Areas/used.md"],
-    }
-    ql.write_text(json.dumps(entry) + "\n")
+    # BUG #11 fix (2026-04-26): el signal de "retrieved recently" ahora viene
+    # de `rag_queries` SQL, no del JSONL legacy. Insertamos la row al SQL via
+    # el mismo helper que usa find_dead_notes para mantener simetría.
+    ts_7d_ago = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+    with rag._ragvec_state_conn() as conn:
+        conn.execute(
+            "INSERT INTO rag_queries (ts, cmd, q, paths_json) VALUES (?, ?, ?, ?)",
+            (ts_7d_ago, "query", "whatever",
+             json.dumps(["02-Areas/used.md"])),
+        )
     rag._invalidate_corpus_cache()
-    items = rag.find_dead_notes(col, vault, query_log=ql, query_window_days=30)
+    items = rag.find_dead_notes(
+        col, vault, query_log=tmp_path / "q.jsonl",
+        query_window_days=30,
+    )
     assert "02-Areas/used.md" not in [it["path"] for it in items]
 
 

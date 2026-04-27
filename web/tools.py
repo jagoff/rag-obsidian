@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from rag import (  # noqa: E402
     _agent_tool_drive_search,
     _agent_tool_read_note,
+    _agent_tool_record_contact_observation,
     _agent_tool_search,
     _agent_tool_weather,
     _agent_tool_whatsapp_search,
@@ -35,7 +36,7 @@ from rag import (  # noqa: E402
 )
 
 
-_WEB_TOOL_ADDENDUM: str = """Tenés 22 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
+_WEB_TOOL_ADDENDUM: str = """Tenés 23 tools para traer datos frescos o registrar acciones. IMPORTANTE: usalas cuando la pregunta las necesita, aunque el CONTEXTO del vault ya tenga algo — el vault puede estar desactualizado o incompleto.
 
 Routing por palabra clave (si aparece → llamá la tool):
 - gasto/gasté/gastos/presupuesto/plata/finanza/MOZE → finance_summary
@@ -50,6 +51,15 @@ Routing por palabra clave (si aparece → llamá la tool):
 - "qué hablamos con X / qué quedamos con X / leéme el chat con X / qué dijimos con X / fijate qué charlamos con X" → whatsapp_thread(contact_name='X', max_messages=15, days=7). Trae los últimos N mensajes LITERALES del chat 1:1 con X, en orden cronológico, leídos directo del bridge SQLite (no del corpus indexado). Distinto a `whatsapp_search` (que matchea por contenido) y `whatsapp_pending` (que lista chats sin responder): acá queremos el hilo tal cual para que el LLM parsee contexto (horas propuestas, decisiones, promesas, confirmaciones). Si después de leer el thread ves una fecha/hora clara propuesta para juntarse ("el jueves a las 4pm", "mañana 10hs"), encadená con `propose_calendar_event(title='Reunión con X', start='<fecha parseada>')` en la MISMA ronda — NO pidas confirmación intermedia al user; el propose_calendar_event ya muestra la card con [Crear].
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
+
+Capturar info sobre contactos (PERSISTENTE, escribe al vault sin pedir permiso):
+- Cuando el user dice algo relevante sobre una PERSONA (preferencia, update de trabajo/familia, evento importante, tema sensible, cumpleaños, etc.), llamá `record_contact_observation(contact_name='<nombre>', observation='<info corta procesada>', category='<bullet>', source_excerpt='<frase cruda>')`. NO pidas permiso — es una nota interna, el user la puede editar/borrar en Obsidian.
+- Triggers típicos: "Seba me trajo un vino" → `record_contact_observation(contact_name='Seba', observation='Le gusta el vino', category='Preferencias', source_excerpt='Seba me trajo un vino')`. "Mi vieja empezó a trabajar en San Pedro" → `(contact_name='Mama', observation='Trabaja en San Pedro', category='Trabajo / contexto', source_excerpt='...')`. "Oscar está sensible con la herencia" → `(contact_name='Oscar', observation='Sensible con tema herencia', category='Notas', ...)`.
+- Categorías sugeridas (bullets del template de `99-Contacts/`): "Preferencias", "Trabajo / contexto", "Familia", "Notas", "Eventos importantes". Si no estás seguro, dejá `category=None` (va solo a la sección `## Observaciones` como auditoría).
+- Si el contacto no existe en el vault, el tool devuelve `reason: "contact_not_in_vault"`. Avisale al user: "No tengo nota de <X> en el vault — copiá `99-Contacts/_template.md` y completala con su nombre, teléfono, etc., y lo anoto la próxima".
+- Confirmá con 1 línea después de la llamada: "Anotado en la nota de <nombre>". NO repitas el texto (el user ya sabe lo que dijo) — solo confirmá que quedó registrado. Si pusiste category, podés agregar "→ **<category>**".
+- Podés llamar este tool en PARALELO con otros (search_vault, propose_calendar_event) si el turno tiene múltiples intents — ej. "hoy Astor cumple 3 → observation 'cumple 26 abril' + propose_calendar_event yearly".
+- NO usar para queries/lookups ("qué le gusta a X" → usá search_vault / read_note para leer la nota del contacto), ni cuando el user dice explícitamente "no anotes esto" / "no te acuerdes".
 
 Crear cosas nuevas (se agregan automáticamente, el usuario puede deshacer):
 - "recordame X" / "acordate X" / "ponete un recordatorio" → propose_reminder(title, when, ...)
@@ -354,6 +364,66 @@ def whatsapp_thread(contact_name: str, max_messages: int = 15, days: int = 7) ->
     return _agent_tool_whatsapp_thread(contact_name, max_messages, days)
 
 
+def record_contact_observation(
+    contact_name: str,
+    observation: str,
+    category: str | None = None,
+    source_excerpt: str | None = None,
+) -> str:
+    """Anotar info relevante sobre un contacto en su nota viva del vault.
+
+    Las notas de `99-Contacts/` son contactos vivos: cada vez que el user
+    menciona algo relevante sobre alguien (una preferencia, un update de
+    trabajo, un cumpleaños que olvidó, un tema sensible), ESTE tool lo
+    graba para que la próxima vez que el LLM lea la nota tenga el contexto.
+    Escribe persistente al vault — idempotente si ya existe el texto.
+
+    Usalo **sin pedir permiso** cuando detectes info nueva sobre un
+    contacto. Ejemplos de triggers:
+    - "Seba me llevó un vino" → observation="Le gusta el vino",
+      category="Preferencias", source_excerpt="Seba me llevó un vino"
+    - "Mi vieja ahora trabaja en San Pedro" → observation="Trabaja en
+      San Pedro", category="Trabajo / contexto"
+    - "Oscar anda de mal humor con el tema de la herencia" → observation=
+      "Sensible con el tema de la herencia", category="Notas"
+    - "El cumple de Astor es el 26 de mayo" → observation="Cumpleaños:
+      26 de mayo", category="Preferencias" (además del
+      propose_calendar_event yearly si el user pide agendarlo)
+
+    NO usar para queries/lookups ("qué le gusta a X" → usá search_vault /
+    read_note), ni para info que el user dice "no te acordes de esto".
+
+    Tras la llamada, mencioná 1 línea que lo anotaste: "Anotado en la nota
+    de X" (sin repetir el texto). No esperes confirmación: el user puede
+    ver/editar la nota siempre.
+
+    Args:
+        contact_name: Nombre tal como el user lo dijo ("Seba", "mi Mama",
+            "Sebastián"). Se resuelve por full_name / aliases / filename
+            del vault `99-Contacts/`.
+        observation: Texto procesado, corto y accionable ("Le gusta el
+            vino"). NO copies la frase cruda — eso va en source_excerpt.
+        category: OPCIONAL pero recomendado. Bullet del template:
+            "Preferencias", "Trabajo / contexto", "Notas", "Familia",
+            "Eventos importantes". Si no matchea uno existente, se crea.
+            Si lo omitís, va solo a `## Observaciones` (auditoría pura).
+        source_excerpt: OPCIONAL pero recomendado. Frase cruda del user
+            que motivó la obs ("Seba me llevó un vino"). Auditoría.
+
+    Returns:
+        JSON `{ok, file, observation_added, category_updated, reason?}`.
+        Si el contacto no existe en el vault, `ok=false` con
+        `reason="contact_not_in_vault"` — decile al user que cree la nota
+        primero (copiando `99-Contacts/_template.md`).
+    """
+    return _agent_tool_record_contact_observation(
+        contact_name, observation,
+        category=category,
+        source_excerpt=source_excerpt,
+        source_kind="chat",
+    )
+
+
 def whatsapp_pending(hours: int = 48, max_chats: int = 10) -> str:
     """WhatsApp chats esperando respuesta del user — último inbound sin reply.
 
@@ -415,6 +485,7 @@ CHAT_TOOLS: list[Callable] = [
     whatsapp_search,
     whatsapp_thread,
     whatsapp_list_scheduled,
+    record_contact_observation,
     propose_reminder,
     propose_calendar_event,
     propose_whatsapp_send,

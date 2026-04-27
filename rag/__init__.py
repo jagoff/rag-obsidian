@@ -39886,18 +39886,22 @@ def _render_today_prompt(
 
 
 def _today_brief_model() -> str:
-    """Modelo para el evening brief de `rag today`. Default `qwen2.5:14b`
-    porque el chat-default (`qwen2.5:7b`) escribe briefs cortos y se le
-    pierden las conexiones cross-source cuando recibe 10+ buckets.
-    Override por env si el user quiere probar `command-r:latest` (35B,
-    optimizado para RAG grounded) o volver a `qwen2.5:7b` por latencia.
-    Pipeline:
+    """Modelo para el evening brief de `rag today`. Default `qwen2.5:7b`
+    (el mismo del chat). Probamos qwen2.5:14b primero pero en mac M-chip
+    con num_ctx=6144 + num_predict=500 tardaba 187s (timeout en
+    `_today_brief_client`). El gap real de calidad para este task viene
+    del prompt enriquecido (14 buckets cross-source), no del tamaño del
+    modelo — qwen2.5:7b warm + prompt completo escribe briefs ricos en
+    ~10-15s.
+    Override por env si el user quiere probar `qwen2.5:14b` con paciencia
+    o `command-r:latest`. Pipeline:
       1. `OBSIDIAN_RAG_TODAY_MODEL` (env)
-      2. `qwen2.5:14b` (default — instalado en local + 9GB)
+      2. `qwen2.5:7b` (default — ya warm en VRAM por `OLLAMA_KEEP_ALIVE=-1`)
     No cae a `resolve_chat_model()` para mantener el brief desacoplado
-    del modelo del chat (la calidad/latencia óptima es distinta).
+    del modelo del chat — si después cambiamos `OBSIDIAN_RAG_WEB_CHAT_MODEL`,
+    el brief sigue usando qwen2.5:7b a menos que se override explícito.
     """
-    return os.environ.get("OBSIDIAN_RAG_TODAY_MODEL") or "qwen2.5:14b"
+    return os.environ.get("OBSIDIAN_RAG_TODAY_MODEL") or "qwen2.5:7b"
 
 
 # Options dedicadas al today brief — distinto del CHAT_OPTIONS general que
@@ -39907,23 +39911,38 @@ def _today_brief_model() -> str:
 #     temperature=0+seed=42 hacía que el brief fuera 100% determinístico).
 #   - `seed` ausente → cada call usa una semilla nueva, así dos runs con
 #     el mismo prompt entregan paráfrasis distintas en lugar del clon.
-#   - `num_ctx` 8192 vs 4096 → el prompt con 14 buckets cross-source ya
-#     pesa ~2000-2500 tokens; sumarle margen al output deja al LLM citar
-#     specifics sin truncarse. Costo memoria ollama: ~2× el cache, pero
-#     se libera al `keep_alive` expire.
-#   - `num_predict` 700 vs 384 → cap de 250-450 palabras pedidas + sección
-#     de cross-source opcional necesita ~600-700 tokens de output cap.
+#   - `num_ctx` 4096 (igual que CHAT_OPTIONS) → el prompt con todos los
+#     buckets pesa ~2200-2500 tokens; entra justo dejando ~1500 para
+#     output. Importante mantener el MISMO num_ctx que el chat porque
+#     subirlo fuerza a ollama a reinicializar el KV cache (200ms→4400ms
+#     prefill, según comentario en CHAT_OPTIONS) y disparara cold-load
+#     del modelo cada vez.
+#   - `num_predict` 500 vs 384 del chat → cap de 250-450 palabras pedidas.
 TODAY_BRIEF_OPTIONS = {
     "temperature": 0.4,
     "top_p": 0.9,
-    "num_ctx": 8192,
-    "num_predict": 700,
+    "num_ctx": 4096,
+    "num_predict": 500,
 }
+
+
+# Cliente dedicado con timeout MÁS ALTO (120s vs 90s del general). Con
+# qwen2.5:7b warm el inference tarda ~10-15s; cold path puede pegar 30-60s
+# si ollama lo descargó por memory pressure. 120s deja margen sin tener
+# que esperar 3 minutos.
+_TODAY_BRIEF_CLIENT = None
+
+
+def _today_brief_client():
+    global _TODAY_BRIEF_CLIENT
+    if _TODAY_BRIEF_CLIENT is None:
+        _TODAY_BRIEF_CLIENT = _TimedOllamaProxy(timeout=120.0)
+    return _TODAY_BRIEF_CLIENT
 
 
 def _generate_today_narrative(prompt: str) -> str:
     try:
-        resp = _chat_capped_client().chat(
+        resp = _today_brief_client().chat(
             model=_today_brief_model(),
             messages=[{"role": "user", "content": prompt}],
             options=TODAY_BRIEF_OPTIONS,

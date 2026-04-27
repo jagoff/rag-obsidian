@@ -504,20 +504,31 @@ def test_render_today_prompt_asks_for_cross_source_matching():
 # ── _generate_today_narrative — model selection ─────────────────────────────
 
 
-def test_generate_today_narrative_uses_qwen14b_by_default(monkeypatch):
+def test_generate_today_narrative_uses_qwen7b_by_default(monkeypatch):
+    """Default del brief: qwen2.5:7b (mismo del chat) por velocidad.
+    qwen2.5:14b se descartó después de medir 187s end-to-end en mac
+    (timeout). Override por env si el user tiene paciencia / GPU mejor.
+    """
     captured = {}
 
     def _fake_chat(model, messages, options=None, keep_alive=None):
         captured["model"] = model
+        captured["options"] = options
         return _FakeResponse("ok")
 
     fake_client = type("_C", (), {"chat": staticmethod(_fake_chat)})()
-    monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
+    monkeypatch.setattr(rag, "_today_brief_client", lambda: fake_client)
     monkeypatch.delenv("OBSIDIAN_RAG_TODAY_MODEL", raising=False)
 
     out = rag._generate_today_narrative("hola")
     assert out == "ok"
-    assert captured["model"] == "qwen2.5:14b"
+    assert captured["model"] == "qwen2.5:7b"
+    # Options del brief, NO el CHAT_OPTIONS general (sin temperature=0
+    # + sin seed para variedad; same num_ctx 4096 para reusar KV cache
+    # del chat).
+    assert captured["options"]["temperature"] == 0.4
+    assert captured["options"]["num_ctx"] == 4096
+    assert "seed" not in captured["options"]  # variedad entre runs
 
 
 def test_generate_today_narrative_respects_env_override(monkeypatch):
@@ -528,7 +539,7 @@ def test_generate_today_narrative_respects_env_override(monkeypatch):
         return _FakeResponse("ok")
 
     fake_client = type("_C", (), {"chat": staticmethod(_fake_chat)})()
-    monkeypatch.setattr(rag, "_chat_capped_client", lambda: fake_client)
+    monkeypatch.setattr(rag, "_today_brief_client", lambda: fake_client)
     monkeypatch.setenv("OBSIDIAN_RAG_TODAY_MODEL", "command-r:latest")
 
     rag._generate_today_narrative("hola")

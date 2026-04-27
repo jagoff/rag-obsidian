@@ -12362,17 +12362,34 @@ def _warmup_local_embedder() -> bool:
 
 
 def hyde_embed(question: str) -> list[float]:
-    """Generate a short hypothetical note sentence and embed it (1 sentence = fast)."""
+    """Generate a short hypothetical note sentence and embed it (1 sentence = fast).
+
+    Audit 2026-04-26 (BUG #1): wrappear `question` con `_wrap_untrusted` para
+    prevenir prompt-injection. Pre-fix la query iba interpolada cruda entre
+    comillas → `\\n"\\n\\nIgnore...` podía escapar el framing.
+    """
     prompt = (
-        f'Write ONE sentence as if from personal notes that directly answers: "{question}"\n\nSentence:'
+        "Escribí UNA oración como si fuera de notas personales que responde "
+        "directamente a la siguiente pregunta del usuario.\n\n"
+        f"{_wrap_untrusted(question, 'PREGUNTA')}\n\nOración:"
     )
-    resp = _helper_client().chat(
-        model=HELPER_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options=HELPER_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
-    )
-    return embed([resp.message.content.strip()])[0]
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=HELPER_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        content = resp.message.content.strip()
+        if not content:
+            return embed([question])[0]
+        return embed([content])[0]
+    except Exception as exc:
+        try:
+            _silent_log("hyde_embed_failed", exc)
+        except Exception:
+            pass
+        return embed([question])[0]
 
 
 # ── SEARCH ────────────────────────────────────────────────────────────────────
@@ -34086,12 +34103,65 @@ _READ_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _READ_NEWLINES_RE = re.compile(r"\n{3,}")
 
 
+def _is_safe_public_url(url: str) -> tuple[bool, str]:
+    """Audit 2026-04-26 (BUG #2): SSRF guard.
+
+    Resuelve el host del URL y rechaza si apunta a un rango privado:
+    - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918)
+    - 127.0.0.0/8 (loopback)
+    - 169.254.0.0/16 (link-local — incluye AWS metadata 169.254.169.254)
+    - ::1, fe80::/10 (IPv6 loopback / link-local)
+
+    Returns (ok, reason). Si DNS falla, deny — fail-closed.
+    """
+    import urllib.parse  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+    import ipaddress  # noqa: PLC0415
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return (False, "URL malformada")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return (False, "URL sin host")
+    if parsed.scheme not in ("http", "https"):
+        return (False, f"scheme no permitido: {parsed.scheme}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        return (False, f"DNS resolución falló: {exc}")
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved):
+            return (False, f"host resuelve a IP privada/local: {ip}")
+    return (True, "")
+
+
 def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, dict]:
     """Fetch URL, return (decoded_html, headers_dict). Raises RuntimeError on
     network failure. Stdlib urllib only — no third-party.
+
+    Audit 2026-04-26 (BUG #2): SSRF guard pre-fetch + post-redirect via
+    custom HTTPRedirectHandler. Rechaza IPs privadas/loopback/link-local.
     """
     import urllib.request
     import urllib.error
+    ok, reason = _is_safe_public_url(url)
+    if not ok:
+        raise RuntimeError(f"URL no permitida: {reason}")
+
+    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            ok2, reason2 = _is_safe_public_url(newurl)
+            if not ok2:
+                raise RuntimeError(f"redirect a URL no permitida: {reason2}")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
     req = urllib.request.Request(
         url,
         headers={
@@ -34101,7 +34171,7 @@ def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, d
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             charset = resp.headers.get_content_charset() or "utf-8"
             headers = dict(resp.headers.items())

@@ -282,18 +282,22 @@ def test_ingest_related_uses_vault_titles(tmp_vault):
 
 
 def test_fetch_wraps_http_error(monkeypatch):
+    # BUG #2 fix (2026-04-26): `_read_fetch_url` ahora usa
+    # `urllib.request.build_opener(_SafeRedirectHandler())` + `opener.open`
+    # en vez de `urlopen` directo, para bloquear redirects a IPs internas.
+    # Stub el opener + bypass del SSRF guard (el DNS lookup real en tests es
+    # lento y flaky).
     import urllib.error
 
-    class _Ctx:
-        def __enter__(self_inner): raise urllib.error.HTTPError(
-            "https://x.io", 404, "Not Found", {}, None,
-        )
-        def __exit__(self_inner, *a): return False
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(
+                "https://x.io", 404, "Not Found", {}, None,
+            )
 
-    def _urlopen(req, timeout=None):
-        raise urllib.error.HTTPError("https://x.io", 404, "Not Found", {}, None)
-
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr("rag._is_safe_public_url", lambda url: (True, ""))
+    monkeypatch.setattr("urllib.request.build_opener",
+                        lambda *a, **kw: _FakeOpener())
     with pytest.raises(RuntimeError, match="404"):
         rag._read_fetch_url("https://x.io/")
 
@@ -301,10 +305,13 @@ def test_fetch_wraps_http_error(monkeypatch):
 def test_fetch_wraps_url_error(monkeypatch):
     import urllib.error
 
-    def _urlopen(req, timeout=None):
-        raise urllib.error.URLError("no route to host")
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("no route to host")
 
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr("rag._is_safe_public_url", lambda url: (True, ""))
+    monkeypatch.setattr("urllib.request.build_opener",
+                        lambda *a, **kw: _FakeOpener())
     with pytest.raises(RuntimeError, match="Error de red"):
         rag._read_fetch_url("https://x.io/")
 

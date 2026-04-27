@@ -8542,6 +8542,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "message": "Ollama no responde (stuck-load). Auto-restart falló. "
                     "Probá: brew services restart ollama",
                 })
+                # Audit 2026-04-26 (BUG #31): emitir `done` siempre tras
+                # `error` para que el cliente cierre el spinner y libere
+                # el input. Pre-fix: error puro dejaba EventSource
+                # esperando indefinidamente.
+                yield _sse("done", {"error": True})
                 return
             print("[ollama-preflight] recovered via restart", flush=True)
 
@@ -8792,6 +8797,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
             yield _sse("error", {"message": f"retrieve falló: {exc}"})
+            yield _sse("done", {"error": True})  # BUG #31 — emitir done
             return
 
         # Pre-compute forced tools ONCE here so both the empty-bail and
@@ -9858,6 +9864,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 })
         except Exception as exc:
             yield _sse("error", {"message": f"LLM falló: {exc}"})
+            yield _sse("done", {"error": True})  # BUG #31
             return
 
         # Final streaming answer call: strip _WEB_TOOL_ADDENDUM and `tools=`
@@ -9949,6 +9956,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 yield _sse("token", {"delta": final_tail})
         except Exception as exc:
             yield _sse("error", {"message": f"LLM falló: {exc}"})
+            yield _sse("done", {"error": True})  # BUG #31
             return
 
         full = "".join(parts)

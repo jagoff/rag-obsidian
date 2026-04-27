@@ -853,7 +853,10 @@ atexit.register(_flush_log_queue)
 # Design mirrors `_LOG_QUEUE`: unbounded queue + single daemon worker +
 # bounded atexit drain. Drops on shutdown are acceptable because the cache
 # is a speed optimization, not a correctness path.
-_BACKGROUND_SQL_QUEUE: queue.Queue = queue.Queue()
+# Audit 2026-04-26 (BUG #16): cap a 10K items + drops counter para alerting.
+_BACKGROUND_SQL_QUEUE_MAX = int(os.environ.get("RAG_BG_QUEUE_MAX", "10000"))
+_BACKGROUND_SQL_QUEUE: queue.Queue = queue.Queue(maxsize=_BACKGROUND_SQL_QUEUE_MAX)
+_BACKGROUND_SQL_QUEUE_DROPS = 0
 
 
 def _background_sql_writer_loop() -> None:
@@ -891,8 +894,20 @@ def _enqueue_background_sql(write_fn, error_tag: str) -> None:
     write is dropped silently to preserve the no-raise contract of the
     hot path.
     """
+    global _BACKGROUND_SQL_QUEUE_DROPS
     try:
         _BACKGROUND_SQL_QUEUE.put_nowait((write_fn, error_tag))
+    except queue.Full:
+        # Audit 2026-04-26 (BUG #16): overflow → bumpea drops counter
+        # para que el alerting de silent_log lo detecte.
+        _BACKGROUND_SQL_QUEUE_DROPS += 1
+        try:
+            _silent_log(
+                f"bg_sql_queue_full:{error_tag}",
+                Exception(f"queue at maxsize={_BACKGROUND_SQL_QUEUE_MAX}, drops={_BACKGROUND_SQL_QUEUE_DROPS}"),
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -3727,9 +3742,12 @@ def _load_behavior_priors() -> dict:
             return snapshot
 
         # Retry exhausted. Stale cache > empty snapshot — sin priors el
-        # ranker baja a baseline (todas las features de behavior se
-        # anulan). Stale by 1-5min es ~idéntico al fresh.
+        # ranker baja a baseline. Stale by 1-5min es ~idéntico al fresh.
+        # Audit 2026-04-26 (BUG #18): invalidar cache_key_sql para forzar
+        # rebuild en la próxima call con DB sana. Pre-fix: la siguiente
+        # call veía cache_key == max_ts (hit stale).
         if _behavior_priors_cache is not None:
+            _behavior_priors_cache_key_sql = ""
             return _behavior_priors_cache
 
         # Fresh process sin cache + DB locked persistente → fallback final
@@ -12362,17 +12380,34 @@ def _warmup_local_embedder() -> bool:
 
 
 def hyde_embed(question: str) -> list[float]:
-    """Generate a short hypothetical note sentence and embed it (1 sentence = fast)."""
+    """Generate a short hypothetical note sentence and embed it.
+
+    Audit 2026-04-26 (BUG #1): wrap question con `_wrap_untrusted` para
+    prevenir prompt-injection. Try/except + fallback al embed directo
+    si el helper falla.
+    """
     prompt = (
-        f'Write ONE sentence as if from personal notes that directly answers: "{question}"\n\nSentence:'
+        "Escribí UNA oración como si fuera de notas personales que responde "
+        "directamente a la siguiente pregunta del usuario.\n\n"
+        f"{_wrap_untrusted(question, 'PREGUNTA')}\n\nOración:"
     )
-    resp = _helper_client().chat(
-        model=HELPER_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options=HELPER_OPTIONS,
-        keep_alive=OLLAMA_KEEP_ALIVE,
-    )
-    return embed([resp.message.content.strip()])[0]
+    try:
+        resp = _helper_client().chat(
+            model=HELPER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options=HELPER_OPTIONS,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        content = resp.message.content.strip()
+        if not content:
+            return embed([question])[0]
+        return embed([content])[0]
+    except Exception as exc:
+        try:
+            _silent_log("hyde_embed_failed", exc)
+        except Exception:
+            pass
+        return embed([question])[0]
 
 
 # ── SEARCH ────────────────────────────────────────────────────────────────────
@@ -31094,6 +31129,78 @@ def _agent_tool_weather(location: str | None = None) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _agent_tool_record_contact_observation(
+    contact_name: str,
+    observation: str,
+    category: str | None = None,
+    source_excerpt: str | None = None,
+    source_kind: str = "chat",
+) -> str:
+    """Anotar info relevante sobre un contacto en su nota del vault.
+
+    Las notas de `04-Archive/99-obsidian-system/99-Contacts/` son contactos
+    VIVOS: cada vez que el user menciona algo relevante sobre alguien (una
+    preferencia, un update de trabajo, un cumpleaños que olvidó, un tema
+    sensible), usá este tool para que la próxima vez que el LLM lea esa
+    nota tenga el contexto. Es escritura persistente al vault.
+
+    Doble escritura: (1) bullet timestamped en la sección `## Observaciones`
+    al final de la nota (auditoría completa, incluye el excerpt crudo); y
+    (2) si pasás `category` y matchea un bullet existente del frontmatter
+    del contacto (ej. `- **Preferencias**: ...`), también appendea al
+    value de ese bullet (vista consolidada para queries tipo "a Seba qué
+    le gusta?"). Idempotente: texto ya presente → skip silencioso.
+
+    Usalo cuando el user dice cosas como:
+    - "Seba me llevó un vino" → observation="Le gusta el vino",
+      category="Preferencias", source_excerpt="Seba me llevó un vino"
+    - "Mi vieja ahora trabaja en San Pedro" → observation="Trabaja en San
+      Pedro", category="Trabajo / contexto"
+    - "Oscar anda de mal humor con el tema de la herencia" → observation=
+      "Sensible con el tema de la herencia", category="Notas"
+
+    NO usar para: queries/lookups ("qué le gusta a X"), eventos puntuales
+    sin significado de contacto ("Seba vino a cenar" sin info nueva), o
+    info que ya está en la nota.
+
+    Args:
+        contact_name: Nombre tal como el user lo dice ("Seba", "mi Mama",
+            "Sebastian"). Se resuelve via el vault `99-Contacts/` (full_name,
+            aliases, filename).
+        observation: Texto procesado de la observación, corto y accionable
+            ("Le gusta el vino"). Evitá la frase cruda — eso va en
+            source_excerpt.
+        category: Categoría del bullet del template del contacto
+            (`Preferencias`, `Trabajo / contexto`, `Notas`, etc.). Opcional
+            — si no se pasa, solo va a `## Observaciones` (auditoría).
+        source_excerpt: Frase cruda que motivó la observación (se loguea
+            en italic junto al bullet). Útil para auditoría.
+        source_kind: Origen del insight. Default "chat" porque este tool
+            lo llama el LLM del chat.
+
+    Returns:
+        JSON `{ok, file, observation_added, category_updated, reason?}`.
+        Si el contacto no existe en el vault, devuelve `ok=false` con
+        `reason="contact_not_in_vault"` — avisale al user que creé la nota
+        primero (copiando `_template.md` de `99-Contacts/`).
+    """
+    from rag.integrations.whatsapp import _append_contact_observation
+    try:
+        result = _append_contact_observation(
+            contact_name,
+            observation,
+            category=category,
+            source_kind=source_kind,
+            source_excerpt=source_excerpt,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"ok": False, "reason": f"exception: {str(exc)[:120]}"},
+            ensure_ascii=False,
+        )
+    return json.dumps(result, ensure_ascii=False)
+
+
 _AGENT_PENDING_WRITES: list[dict] = []
 _AGENT_PENDING_WRITES_lock = threading.Lock()
 # Guards `_AGENT_PENDING_WRITES` against concurrent append/clear/iterate.
@@ -34086,12 +34193,62 @@ _READ_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _READ_NEWLINES_RE = re.compile(r"\n{3,}")
 
 
+def _is_safe_public_url(url: str) -> tuple[bool, str]:
+    """Audit 2026-04-26 (BUG #2): SSRF guard.
+
+    Resuelve el host del URL y rechaza si apunta a IP privada/loopback/
+    link-local (incluye AWS metadata 169.254.169.254). Si DNS falla,
+    deny — fail-closed.
+    """
+    import urllib.parse  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+    import ipaddress  # noqa: PLC0415
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return (False, "URL malformada")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return (False, "URL sin host")
+    if parsed.scheme not in ("http", "https"):
+        return (False, f"scheme no permitido: {parsed.scheme}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        return (False, f"DNS resolución falló: {exc}")
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved):
+            return (False, f"host resuelve a IP privada/local: {ip}")
+    return (True, "")
+
+
 def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, dict]:
     """Fetch URL, return (decoded_html, headers_dict). Raises RuntimeError on
     network failure. Stdlib urllib only — no third-party.
+
+    Audit 2026-04-26 (BUG #2): SSRF guard pre-fetch + post-redirect.
+    Custom HTTPRedirectHandler valida cada hop — `urlopen` por default
+    sigue redirects sin validar destino.
     """
     import urllib.request
     import urllib.error
+    ok, reason = _is_safe_public_url(url)
+    if not ok:
+        raise RuntimeError(f"URL no permitida: {reason}")
+
+    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            ok2, reason2 = _is_safe_public_url(newurl)
+            if not ok2:
+                raise RuntimeError(f"redirect a URL no permitida: {reason2}")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
     req = urllib.request.Request(
         url,
         headers={
@@ -34101,7 +34258,7 @@ def _read_fetch_url(url: str, timeout: int = _READ_TIMEOUT_SECS) -> tuple[str, d
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             charset = resp.headers.get_content_charset() or "utf-8"
             headers = dict(resp.headers.items())

@@ -8270,7 +8270,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         """Compute NLI grounding for the LLM response and return an SSE event
         string, or None if skipped or unavailable.
         Silent-fail — never raises into the stream.
+
+        Bug 2026-04-27 (audit "RAG - Flujo api-chat - auditoría" #1): pre-fix
+        `ground_claims_nli` ran synchronously inside the SSE generator. If
+        the NLI helper hung (qwen2.5:3b stuck-load, MPS contention, ollama
+        daemon not responsive), the generator blocked indefinitely — the
+        client never received `done` and the PWA showed a frozen spinner.
+        Fix: wrap the call in `ThreadPoolExecutor + result(timeout=4.0) +
+        shutdown(wait=False, cancel_futures=True)`, the same pattern that
+        `_emit_enrich` (just above) uses for the same kind of hang. The
+        background worker thread may keep running briefly but the SSE
+        stream is released within the timeout budget.
         """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
         try:
             import rag as _rag
             if not _rag._nli_grounding_enabled():
@@ -8281,11 +8293,46 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if _intent in _rag._nli_skip_intents():
                 return None
             claims = _rag.split_claims(full)
-            grounding = _rag.ground_claims_nli(
+        except Exception as exc:
+            print(f"[nli-grounding] skipped (pre-flight): {type(exc).__name__}: {exc}", flush=True)
+            return None
+
+        # Wall-time budget for the NLI helper. 4s matches `_emit_enrich`.
+        # Override via env for hosts where bge-m3 + reranker + qwen3 fight
+        # for MPS — bumping to 6-8s buys headroom without unbounded waits.
+        try:
+            _nli_budget_s = float(os.environ.get("RAG_NLI_GROUNDING_BUDGET_S", "4.0"))
+        except ValueError:
+            _nli_budget_s = 4.0
+
+        _ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"grounding-{turn_id[:8]}")
+        try:
+            # `ground_claims_nli` has keyword-only args (after `*`), so
+            # threshold_contradicts/max_claims MUST go as kwargs in submit().
+            _fut = _ex.submit(
+                _rag.ground_claims_nli,
                 claims, docs, metas,
                 threshold_contradicts=_rag._nli_contradicts_threshold(),
                 max_claims=_rag._nli_max_claims(),
             )
+            grounding = _fut.result(timeout=_nli_budget_s)
+        except _FutTimeout:
+            print(
+                f"[nli-grounding] skipped: budget exceeded "
+                f"({_nli_budget_s}s) turn={turn_id}",
+                flush=True,
+            )
+            return None
+        except Exception as exc:
+            print(f"[nli-grounding] skipped: {type(exc).__name__}: {exc}", flush=True)
+            return None
+        finally:
+            # Non-blocking shutdown: don't wait for a hung worker. Same
+            # rationale as `_emit_enrich` — keeps the SSE stream moving
+            # even if `ground_claims_nli` is stuck on a daemon thread.
+            _ex.shutdown(wait=False, cancel_futures=True)
+
+        try:
             if grounding is None or grounding.claims_total == 0:
                 return None
             _metas_by_cid: dict = {}
@@ -9061,9 +9108,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # DRY reutilizando esta variable, pero por ahora el regex scan
         # es sub-microsegundo y preservamos esa call local para no
         # acoplar los dos sitios.
-        _forced_tool_pairs: list[tuple[str, dict]] = (
-            [] if is_propose_intent else _detect_tool_intent(question)
-        )
+        #
+        # Bug 2026-04-27 (audit "RAG - Flujo api-chat - auditoría" #2):
+        # esta call estaba SIN try/except — si `_detect_tool_intent`
+        # reventaba (regex compile inesperada, tipo de retorno raro,
+        # bug nuevo en un matcher agregado), la excepción propagaba
+        # hacia `gen()`, Starlette cerraba la conexión, el frontend
+        # veía "stream ended" sin mensaje de error y la PWA quedaba
+        # con spinner congelado. La SEGUNDA call al final del flujo
+        # (línea ~9701, dentro del pre-router) ya estaba protegida por
+        # un try/except envolvente. Esta primera call no lo estaba.
+        # Fix: try/except local que emite `error + done(error=True)`
+        # para mantener el contrato del SSE stream (cliente recibe
+        # cierre limpio con un mensaje de error que puede mostrar).
+        try:
+            _forced_tool_pairs: list[tuple[str, dict]] = (
+                [] if is_propose_intent else _detect_tool_intent(question)
+            )
+        except Exception as exc:
+            print(f"[chat] _detect_tool_intent failed: {type(exc).__name__}: {exc}", flush=True)
+            yield _sse("error", {"message": f"detector de intents falló: {exc}"})
+            yield _sse("done", {"error": True})
+            return
         _has_forced_tools = bool(_forced_tool_pairs)
 
         if not result["docs"]:

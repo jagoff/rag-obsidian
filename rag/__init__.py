@@ -11430,7 +11430,10 @@ def parse_frontmatter(text: str) -> dict:
     Intencionalmente NO raise para mantener el contrato existente (callers
     esperan dict vacío en error), pero el log da observabilidad.
     """
-    match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    # Audit 2026-04-26 (BUG #26): aceptar CRLF + LF. Pre-fix sólo `\n`
+    # → notas con line endings Windows quedaban indexadas SIN tags/
+    # aliases/area silentemente.
+    match = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n", text, re.DOTALL)
     if not match:
         return {}
     try:
@@ -24871,6 +24874,13 @@ def _run_index(reset: bool, no_contradict: bool) -> dict:
     """
     col = get_db()
     _invalidate_corpus_cache()
+    # Audit 2026-04-26 (BUG #23): reset VLM caption budget per-run.
+    # Pre-fix: counter `_vlm_caption_calls_used` se acumulaba entre
+    # runs en daemons long-lived → tras 500 captions el budget agotaba.
+    try:
+        _vlm_caption_budget_reset()
+    except Exception:
+        pass
     # Contradiction check only runs in incremental mode and when not opted out.
     check_contradictions = not reset and not no_contradict
 
@@ -31572,6 +31582,7 @@ def do(instruction: str, yes: bool, max_iterations: int):
         _agent_tool_propose_write,
         _agent_tool_append_to_note,
         _agent_tool_weather,
+        _agent_tool_record_contact_observation,
     ]
     tool_fns = {fn.__name__: fn for fn in tools}
 
@@ -47428,6 +47439,15 @@ def run_maintenance(
     # the legacy JSONL rotation path unchanged.
     if not skip_logs:
         if RAG_STATE_SQL:
+            # Audit 2026-04-26 (BUG #22): force re-ensure DDL antes de
+            # rotation. Daemons long-lived no veían nuevos `_migrate_*`
+            # del código → ALTERs nunca corrían.
+            try:
+                with _TELEMETRY_DDL_LOCK:
+                    _TELEMETRY_DDL_ENSURED_PATHS.clear()
+                results["ddl_re_ensured"] = True
+            except Exception as e:
+                results["ddl_re_ensure_error"] = str(e)
             try:
                 results["sql_rotation"] = _sql_rotate_log_tables(dry_run=dry_run)
             except Exception as e:
@@ -53574,6 +53594,9 @@ _ENTITY_PHONE_ID_RE = re.compile(r"^\d{7,}$")
 _gliner_model = None
 _gliner_lock = threading.Lock()
 _gliner_load_failed = False
+# Audit 2026-04-26 (BUG #19): TTL para sticky-fail.
+_GLINER_STICKY_FAIL_TTL_S = float(os.environ.get("RAG_GLINER_RETRY_TTL_S", "1800"))
+_gliner_load_failed_ts: float = 0.0
 
 # Feature-dep warnings already emitted in this process. Gate for
 # `_warn_feature_dep_once()`: we want the operator to see ONE stderr line
@@ -53651,23 +53674,26 @@ def _get_gliner_model():
     without re-attempting the import (avoids repeated heavy import overhead).
     Returns None if gliner package is missing or model load fails.
     """
-    global _gliner_model, _gliner_load_failed
+    global _gliner_model, _gliner_load_failed, _gliner_load_failed_ts
     with _gliner_lock:
+        # Audit 2026-04-26 (BUG #19): TTL al sticky flag — recuperación
+        # automática post-instalar gliner / restablecer HF cache.
         if _gliner_load_failed:
-            return None
+            if (time.time() - _gliner_load_failed_ts) > _GLINER_STICKY_FAIL_TTL_S:
+                _gliner_load_failed = False
+            else:
+                return None
         if _gliner_model is not None:
             return _gliner_model
         try:
             from gliner import GLiNER
         except ImportError:
             _gliner_load_failed = True
+            _gliner_load_failed_ts = time.time()
             try:
                 _silent_log("gliner_import_failed", Exception("gliner package not installed"))
             except Exception:
                 pass
-            # Surface ONCE per process on stderr so the operator knows the
-            # entity-extraction path is degraded — otherwise the failure is
-            # invisible unless they grep silent_errors.jsonl.
             _warn_feature_dep_once("entities", "gliner")
             return None
         try:
@@ -53675,6 +53701,7 @@ def _get_gliner_model():
             return _gliner_model
         except Exception as exc:
             _gliner_load_failed = True
+            _gliner_load_failed_ts = time.time()
             try:
                 _silent_log("gliner_load_failed", exc)
             except Exception:

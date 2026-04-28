@@ -35559,6 +35559,11 @@ _METACHAT_RE = re.compile(
     # Greetings
     r"hola|holi|holis|buenas(?:\s+tardes|\s+noches|\s+d[ií]as)?|buen\s+d[ií]a|"
     r"hi|hey|hello|saludos|qu[eé]\s+tal|qu[eé]\s+onda|c[oó]mo\s+(?:est[aá]s|and[aá]s|va)|"
+    # Casual check-ins (2026-04-28 wave-5 — "todo bien" antes ruteaba
+    # a reminders_due porque "tengo recordatorios pendientes" matchea
+    # confidence > weak. Bare check-ins son metachat, no queries.)
+    r"todo\s+bien|todo\s+ok|todo\s+okey|"
+    r"como\s+est[aá]\s+todo|c[oó]mo\s+va\s+todo|qu[eé]\s+m[aá]s|"
     # Thanks / closings (bare, not followed by content)
     r"gracias|muchas\s+gracias|mil\s+gracias|dale\s+gracias|thanks|thx|"
     r"chau|bye|adi[oó]s|nos\s+vemos|"

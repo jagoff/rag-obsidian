@@ -5367,6 +5367,50 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\besqueça\b", "olvide"),
     (r"\bdessas\b", "de esas"),         # "no te esqueças dessas"
     (r"\bdesses\b", "de esos"),
+    # 2026-04-28 wave-5: leaks observados en Playwright batch sobre nota
+    # Ikigai. El LLM mezcló pt en respuestas que sí debían ser español.
+    # "tem" (3ra persona singular del verbo ter en pt) → "tiene". CUIDADO:
+    # "tem" puede aparecer en frases como "sistema TEM-1" — usamos word
+    # boundary + lookahead que pida espacio + minúscula después para no
+    # tocar siglas técnicas.
+    (r"\btem\s+(?=[a-záéíóúñ])", "tiene "),
+    (r"\bté\b", "té"),                  # idempotent (té ya está en español)
+    # Demostrativos/adjetivos (pt) — diferenciable porque las grafías
+    # con doble s NO existen en español.
+    (r"\besse\b", "ese"),
+    (r"\bessa\b", "esa"),
+    (r"\besses\b", "esos"),
+    (r"\bessas\b", "esas"),
+    (r"\bisso\b", "eso"),
+    (r"\bisto\b", "esto"),
+    (r"\baquilo\b", "aquello"),
+    # Adverbios/locuciones pt comunes en respuestas.
+    (r"\bAqui\s+estão\b", "Acá están"),
+    (r"\baqui\s+está\b", "acá está"),
+    (r"\baqui\b", "acá"),               # SOLO al inicio de frase + minúscula
+    (r"\bestão\b", "están"),
+    (r"\bmelhor\b", "mejor"),
+    (r"\bpior\b", "peor"),
+    # Verbos de movimiento/uso (pt → es).
+    (r"\bajudar\b", "ayudar"),
+    (r"\bajuda\b", "ayuda"),
+    (r"\bvocê\b", "vos"),
+    (r"\bvocês\b", "ustedes"),
+    # Conectores/preposiciones (pt — claramente no español).
+    (r"\bcom\s+(?=[a-záéíóúñ])", "con "),
+    (r"\bde\s+(?=[a-záéíóúñ]\w+ção\b)", "de "),  # idempotente — solo prep
+    # Sufijos -ção / -ções son siempre pt; convertir a -ción/-ciones en
+    # contexto. Caso específico observado.
+    (r"\bação\b", "acción"),
+    (r"\bações\b", "acciones"),
+    (r"\bsolução\b", "solución"),
+    (r"\bsoluções\b", "soluciones"),
+    (r"\bquestão\b", "cuestión"),
+    (r"\bquestões\b", "cuestiones"),
+    # Francés/italiano stray words (hallucination genuina, no contagio).
+    # "Voulu" observado al inicio de respuesta — claramente falso.
+    (r"\bVoulu,?\s+", ""),
+    (r"\bvoilà\b", "acá"),
 )
 _IBERIAN_LEAK_COMPILED: tuple[tuple[re.Pattern, str], ...] = tuple(
     (re.compile(pat, re.IGNORECASE), repl)

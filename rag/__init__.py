@@ -39620,12 +39620,14 @@ def _render_today_prompt(
     correlations = extras.get("correlations") or {}
     people = correlations.get("people") or []
     topics = correlations.get("topics") or []
-    if people or topics:
+    gaps = correlations.get("gaps") or []
+    if people or topics or gaps:
         parts.append("## 🔗 ENTIDADES CROSS-SOURCE (ya correlacionadas):")
-        parts.append("(personas y temas que aparecen en MÚLTIPLES fuentes — "
-                     "úsalas literal en el brief. NO inventes correlaciones "
-                     "fuera de esta lista. Si esta lista está vacía y vos "
-                     "querés afirmar 'X conecta con Y', NO lo hagas.)")
+        parts.append("(personas, temas y cabos sueltos que aparecen en "
+                     "MÚLTIPLES fuentes — úsalos literal en el brief. "
+                     "NO inventes correlaciones fuera de esta lista. Si "
+                     "esta lista está vacía y vos querés afirmar 'X conecta "
+                     "con Y', NO lo hagas.)")
         parts.append("")
         if people:
             parts.append(f"### Personas en ≥2 fuentes ({len(people)}):")
@@ -39643,6 +39645,19 @@ def _render_today_prompt(
                 src_list = " + ".join(t["sources"])
                 parts.append(
                     f"- **{t['topic']}** aparece en: {src_list}"
+                )
+            parts.append("")
+        if gaps:
+            parts.append(f"### ⚠ Cabos sueltos sin slot ({len(gaps)}):")
+            for g in gaps[:5]:
+                hours = g.get("hours_waiting") or 0
+                person = g.get("person") or "?"
+                snippet = (g.get("snippet") or "")[:80]
+                parts.append(
+                    f"- **{person}** te escribió hace {hours:.0f}h por "
+                    f"WhatsApp: \"{snippet}\" — y NO aparece en el "
+                    f"calendar de mañana. Posible action: agendar tiempo "
+                    f"para responderle."
                 )
             parts.append("")
     # ── BUCKETS TODAY (corte 00:00 local) — PRIMERO en el prompt

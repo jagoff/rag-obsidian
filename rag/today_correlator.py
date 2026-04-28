@@ -622,6 +622,70 @@ def _correlate_time_overlaps(
     return overlaps[:6]  # top-N para no inflar el prompt
 
 
+# ── Gaps detection (loose ends sin slot) ─────────────────────────────────
+
+
+def _correlate_gaps(today_ev: dict, extras: dict) -> list[dict]:
+    """Detect 'loose ends' — items que requieren acción del user pero no
+    tienen un slot agendado en tomorrow_calendar.
+
+    MVP — focus en WhatsApp unreplied: chats donde el user tarda ≥24h en
+    responder Y la persona NO aparece en tomorrow_calendar. Indica que
+    'no le agendaste tiempo para responder o resolver'. Es accionable:
+    el brief puede sugerir 'bloqueá 30min mañana para responderle a X'.
+
+    Future expansion (NO incluido en MVP, para evitar false positives):
+      - Action verbs en gmail_today / wa_today snippets ('preparar
+        planilla', 'mandar X') sin slot reservado
+      - Reminders overdue + no slot
+      - Calendar events de hoy que NO se cerraron (último log de la
+        nota matcheante < event end_time)
+
+    Returns: list of {kind, person, hours_waiting, snippet, context}
+    sorted by hours_waiting DESC (loose ends más viejos primero).
+    """
+    wa_unreplied = extras.get("whatsapp_unreplied") or []
+    if not wa_unreplied:
+        return []
+
+    cal_tomorrow = extras.get("tomorrow_calendar") or []
+    cal_tokens: set[str] = set()
+    for c in cal_tomorrow:
+        title = c.get("title") or ""
+        cal_tokens.update(_tokenize(title))
+        # Para nombres cortos que el _tokenize filtra (≥4 chars), agregar
+        # tokens lowercase del title raw también.
+        for tok in re.split(r"[\s,()/:;]+", title.lower().strip()):
+            if tok and tok.isalpha() and len(tok) >= 3:
+                cal_tokens.add(tok)
+
+    gaps: list[dict] = []
+    for w in wa_unreplied[:10]:
+        name = w.get("name") or ""
+        hours = w.get("hours_waiting") or 0
+        if hours < 24:
+            continue  # solo cuenta como gap si lleva ≥1 día sin respuesta
+        canonical = _canonicalize_name(name)
+        if not canonical:
+            continue
+        # ¿El nombre aparece en algún título de calendar mañana?
+        # Match: cualquier token del canonical name (lowercase, alpha-only)
+        # presente en los tokens del calendar.
+        name_tokens = set(canonical.split())
+        if name_tokens & cal_tokens:
+            continue  # tienen slot agendado → no es gap
+        gaps.append({
+            "kind": "wa_unreplied_no_slot",
+            "person": name,
+            "hours_waiting": float(hours),
+            "snippet": (w.get("last_snippet") or "")[:100],
+            "context": "no aparece en calendar de mañana",
+        })
+
+    gaps.sort(key=lambda g: -g["hours_waiting"])
+    return gaps[:5]
+
+
 # ── Voice normalization (post-processing del LLM output) ──────────────────
 
 
@@ -778,6 +842,7 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
             "people": [{name, appearances: [...], sources_count}, ...],
             "topics": [{topic, sources, sources_count}, ...],
             "time_overlaps": [{time, items: [...], shared_tokens}, ...],
+            "gaps": [{kind, person, hours_waiting, snippet, context}, ...],
         }
 
     Empty buckets are silently skipped — `today_ev` and `extras` can
@@ -787,4 +852,5 @@ def correlate_today_signals(today_ev: dict, extras: dict) -> dict:
         "people": _correlate_people(today_ev or {}, extras or {}),
         "topics": _correlate_topics(today_ev or {}, extras or {}),
         "time_overlaps": _correlate_time_overlaps(today_ev or {}, extras or {}),
+        "gaps": _correlate_gaps(today_ev or {}, extras or {}),
     }

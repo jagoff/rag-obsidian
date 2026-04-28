@@ -265,12 +265,12 @@ def test_topics_sorted_by_sources_count_desc():
 
 def test_empty_inputs():
     result = correlate_today_signals({}, {})
-    assert result == {"people": [], "topics": [], "time_overlaps": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": [], "gaps": []}
 
 
 def test_handles_none_inputs():
     result = correlate_today_signals(None, None)
-    assert result == {"people": [], "topics": [], "time_overlaps": []}
+    assert result == {"people": [], "topics": [], "time_overlaps": [], "gaps": []}
 
 
 # ── Self-notifications (github bot, google alerts, etc.) ───────────────────
@@ -565,3 +565,98 @@ def test_voice_word_boundary_no_substring_replace():
     text3 = "fuimos al cine"  # "fuimos" 1PP → "fuiste"
     result3 = normalize_voice_to_2da_persona(text3)
     assert "fuiste" in result3
+
+
+# ── Gaps detection ───────────────────────────────────────────────────────
+
+
+def test_gaps_detected_when_wa_unreplied_no_calendar_slot():
+    """Marina te escribió 26h atrás + Marina NO está en tomorrow_calendar
+    → gap detectado.
+    """
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Marina Pérez", "jid": "549@s",
+             "last_snippet": "che vení mañana", "hours_waiting": 26.5},
+        ],
+        "tomorrow_calendar": [
+            {"title": "Standup diario", "time_range": "10:00–10:30"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    gaps = result["gaps"]
+    assert len(gaps) == 1
+    assert gaps[0]["person"] == "Marina Pérez"
+    assert gaps[0]["hours_waiting"] == 26.5
+    assert gaps[0]["kind"] == "wa_unreplied_no_slot"
+
+
+def test_gaps_skipped_when_wa_unreplied_has_calendar_slot():
+    """Marina escribió + Marina aparece en tomorrow_calendar → NO es gap
+    (ya tenés agendado tiempo para hablarle).
+    """
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Marina", "jid": "x", "last_snippet": "hola",
+             "hours_waiting": 30},
+        ],
+        "tomorrow_calendar": [
+            {"title": "Sync con Marina", "time_range": "14:00–15:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["gaps"] == []
+
+
+def test_gaps_skipped_when_hours_waiting_under_24h():
+    """Si llevás <24h sin responder, todavía no es loose end."""
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Pablo", "jid": "x", "last_snippet": "hola",
+             "hours_waiting": 5},
+        ],
+        "tomorrow_calendar": [],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["gaps"] == []
+
+
+def test_gaps_sorted_by_hours_waiting_desc():
+    """Loose ends más viejos primero — son los más urgentes."""
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Reciente", "jid": "x", "last_snippet": "x",
+             "hours_waiting": 30},
+            {"name": "Vieja", "jid": "y", "last_snippet": "y",
+             "hours_waiting": 80},
+            {"name": "Media", "jid": "z", "last_snippet": "z",
+             "hours_waiting": 50},
+        ],
+        "tomorrow_calendar": [],
+    }
+    result = correlate_today_signals({}, extras)
+    persons = [g["person"] for g in result["gaps"]]
+    assert persons == ["Vieja", "Media", "Reciente"]
+
+
+def test_gaps_empty_when_no_unreplied():
+    extras = {"whatsapp_unreplied": [], "tomorrow_calendar": []}
+    result = correlate_today_signals({}, extras)
+    assert result["gaps"] == []
+
+
+def test_gaps_partial_name_match_in_calendar():
+    """'Marina Pérez' en wa + 'Marina' (single token) en calendar → MATCH
+    (no es gap). El nombre del calendar es subset.
+    """
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Marina Pérez", "jid": "x",
+             "last_snippet": "x", "hours_waiting": 30},
+        ],
+        "tomorrow_calendar": [
+            {"title": "Café con Marina", "time_range": "10:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["gaps"] == []

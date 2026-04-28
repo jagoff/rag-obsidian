@@ -1044,7 +1044,8 @@
     const people = correlations.people || [];
     const topics = correlations.topics || [];
     const overlaps = correlations.time_overlaps || [];
-    const total = people.length + topics.length + overlaps.length;
+    const gaps = correlations.gaps || [];
+    const total = people.length + topics.length + overlaps.length + gaps.length;
     if (total === 0) {
       panel.hidden = true;
       return;
@@ -1085,6 +1086,20 @@
           <div>
             <span class="pattern-name">⏱ ${escapeHTML(o.time)}</span>
             <span class="pattern-sources"> · ${escapeHTML(labels)}</span>
+          </div>
+        </div>`);
+    }
+    for (const g of gaps.slice(0, 5)) {
+      const hours = Math.round(g.hours_waiting || 0);
+      const person = g.person || "?";
+      const snippet = (g.snippet || "").slice(0, 60);
+      rows.push(`
+        <div class="pattern-row pattern-gap">
+          <div>
+            <span class="pattern-name">⚠ ${escapeHTML(person)}</span>
+            <span class="pattern-sources">
+              · ${hours}h sin responder · "${escapeHTML(snippet)}" · sin slot mañana
+            </span>
           </div>
         </div>`);
     }

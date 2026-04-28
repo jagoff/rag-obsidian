@@ -977,6 +977,14 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   font-size: var(--fs-mini);
   letter-spacing: 0.04em;
 }
+/* Gaps (cabos sueltos) — ámbar para diferenciarlos de patterns puros */
+.panel-patterns .pattern-row.pattern-gap .pattern-name {
+  color: var(--amber);
+}
+.panel-patterns .pattern-row.pattern-gap {
+  border-left: 2px solid var(--amber-dim);
+  padding-left: var(--space-2);
+}
 
 /* ── Empty state ─────────────────────────────────────── */
 

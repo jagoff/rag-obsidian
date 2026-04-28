@@ -6,6 +6,12 @@ drive_search disparaban timeouts (60-80s) en la 2da ronda del LLM.
 Fix: truncar a top-N items + agregar summary count para que el LLM
 sepa que hay más sin que tenga que procesarlos todos.
 
+Bug 2026-04-28 wave-3 (UI test): `read_note("CLAUDE.md")` devolvió 165k
+chars de markdown plano, el LLM con num_ctx=4096 truncó silenciosamente,
+y respondió con headings INVENTADOS (alucinación pura). Fix: agregar
+shape C "plain text large" — si el output no es JSON y excede 12k chars,
+truncar al inicio + final con marker explícito.
+
 API pública:
 - `truncate_tool_output_for_synthesis(name, raw_json, max_items=N)` →
   retorna JSON string truncado (o el original si está bajo el cap).
@@ -18,6 +24,7 @@ El truncado es POR-TOOL: cada tool tiene una shape distinta.
 - drive_search retorna `{files: [...]}` o lista plana → truncar.
 - whatsapp_thread retorna lista de mensajes → truncar.
 - whatsapp_search idem.
+- read_note retorna markdown plano → truncar a ~12k chars con marker.
 
 El helper es CONSERVADOR: si no reconoce la shape, devuelve el JSON
 original sin tocar (no rompe nada).
@@ -40,6 +47,15 @@ _DEFAULT_CAPS: dict[str, int] = {
     # "calendar_ahead", "reminders_due", "weather", "finance_summary",
     # "credit_cards_summary".
 }
+
+
+# Cap en chars para outputs de plain-text grande (read_note). 12000 chars
+# ≈ 9000 tokens, cabe holgado en num_ctx=4096 dejando margen para system
+# prompt + retrieved context + respuesta. Si la nota excede, devolvemos
+# inicio (8000) + corte explícito + final (2000) — el LLM ve los
+# headings principales del top + la conclusión, evita alucinar.
+_PLAIN_TEXT_TOOL_CHAR_CAP = 12000
+_PLAIN_TEXT_TOOLS: set[str] = {"read_note"}
 
 
 def _truncate_list(lst: list[Any], cap: int) -> tuple[list[Any], int]:
@@ -73,11 +89,32 @@ def truncate_tool_output_for_synthesis(
     para decir "tenés más mails — acá los 5 más recientes" en lugar de
     asumir que esos son todos.
     """
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        return raw_output
+
+    # Shape C: plain-text tool (read_note). Truncar por chars con marker
+    # explícito. Mantenemos head + tail para preservar headings (que están
+    # arriba) y conclusiones (abajo). Marker informativo para que el LLM
+    # sepa que hay contenido faltante.
+    if tool_name in _PLAIN_TEXT_TOOLS:
+        if len(raw_output) <= _PLAIN_TEXT_TOOL_CHAR_CAP:
+            return raw_output
+        head_len = int(_PLAIN_TEXT_TOOL_CHAR_CAP * 0.8)  # 9600 chars
+        tail_len = _PLAIN_TEXT_TOOL_CHAR_CAP - head_len  # 2400 chars
+        head = raw_output[:head_len]
+        tail = raw_output[-tail_len:]
+        omitted = len(raw_output) - head_len - tail_len
+        return (
+            f"{head}\n\n"
+            f"[…CONTENIDO TRUNCADO: {omitted} caracteres omitidos del medio "
+            f"de la nota. Total original: {len(raw_output)} chars. Si necesitás "
+            f"el medio, pedí al user un fragmento específico…]\n\n"
+            f"{tail}"
+        )
+
     cap = max_items if max_items is not None else _DEFAULT_CAPS.get(tool_name)
     if cap is None:
         return raw_output  # tool no listada, no truncar
-    if not isinstance(raw_output, str) or not raw_output.strip():
-        return raw_output
 
     try:
         parsed = json.loads(raw_output)

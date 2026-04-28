@@ -2632,9 +2632,28 @@ def _ollama_alive(timeout: float = 2.0) -> bool:
 # the budget, ReadTimeout fires and our `except Exception` surfaces an
 # error SSE to the frontend. Without this, a stuck-load ollama daemon
 # silently wedges the /api/chat stream forever (spinner never clears).
-# Budget rationale: qwen2.5:7b prefill on 9k-char ctx measures 5-10s P50,
-# so 45s read is >4x the worst observed and well below user patience.
-_OLLAMA_STREAM_TIMEOUT = 45.0
+#
+# Budget rationale (2026-04-28 update — was 45.0):
+# La streaming call es la fase MÁS pesada del turno: prefill sobre el
+# contexto post-tools (típico 25-30k chars cuando hay whatsapp_pending /
+# reminders_due / calendar_ahead) + decode de la respuesta. Empíricamente
+# `[chat-timing]` registra ttft hasta 38.5s en queries con tool_rounds=1,
+# lo cual está peligrosamente cerca de 45s — un cold-load del modelo
+# (~5-10s extra de KV reinit cuando num_ctx adaptive cambia respecto del
+# value loaded) y/o memory pressure en MPS lo empuja >45s y dispara
+# "LLM falló: timed out" en el frontend. Repro autónomo Playwright
+# 2026-04-28: 3 de 5 queries (whatsapp/RAG/pendientes) cayeron en
+# 59-62s wall time → el stream client cortaba a los 45s del primer
+# read, antes de que llegara el primer token de la synthesis call.
+#
+# Subimos a 90s para alinear con `_OLLAMA_TOOL_TIMEOUT` (que ya estaba
+# en 90s tras commit b0d140e). Argumento: el tool decision call mide el
+# 1er-y-único chunk no-streaming, mientras que el stream final mide
+# per-chunk; ambos pueden saturar el mismo budget cuando el modelo cold-
+# loads o el contexto explota. Si realmente hay un wedge del daemon,
+# `_ollama_chat_probe` lo detecta antes con 6s — el budget de 90s no
+# expone al user a colgues largos por daemon stuck.
+_OLLAMA_STREAM_TIMEOUT = 90.0
 _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 
 # Tool-decision call (non-streaming, ~once per turn, with `tools=` schema
@@ -5999,6 +6018,15 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
                 parts.append(delta)
                 yield _sse("token", {"delta": delta})
     except Exception as exc:
+        # Ver `[chat-stream-error] phase=synthesis` en /api/chat para
+        # rationale — mismo bug de observabilidad acá. Este es el brief
+        # de /api/tasks (streaming directo, sin tool loop).
+        print(
+            f"[chat-stream-error] phase=tasks_brief "
+            f"exc_type={type(exc).__name__} exc={exc} "
+            f"parts_so_far={len(parts)}",
+            flush=True,
+        )
         yield _sse("error", {"message": f"LLM falló: {exc}"})
         return
 
@@ -10705,6 +10733,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     "content": "Alcanzado cap de herramientas; respondé con lo que tenés.",
                 })
         except Exception as exc:
+            # Ver `[chat-stream-error] phase=synthesis` (más abajo) para
+            # rationale del logging — mismo bug de observabilidad acá.
+            # Este es el except del tool-decision loop (cliente non-stream
+            # con tools= schema, budget de _OLLAMA_TOOL_TIMEOUT=90s).
+            print(
+                f"[chat-stream-error] phase=tool_decision "
+                f"exc_type={type(exc).__name__} exc={exc} "
+                f"tool_rounds={tool_rounds} "
+                f"tools_so_far={','.join(tool_names_called) or 'none'} "
+                f"messages_so_far={len(tool_messages)}",
+                flush=True,
+            )
             yield _sse("error", {"message": f"LLM falló: {exc}"})
             yield _sse("done", {"error": True})  # BUG #31
             return
@@ -10718,35 +10758,57 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             m.get("role") == "system" and m.get("content") == _WEB_TOOL_ADDENDUM
         )]
 
-        # Adaptive num_ctx (2026-04-25, developer-1).
+        # num_ctx PINNED to `_WEB_CHAT_NUM_CTX` (= _WEB_CHAT_OPTIONS["num_ctx"])
+        # — sin variación entre turnos. Ver más abajo el rationale extendido.
         #
-        # Pre-fix the streaming call always passed `num_ctx=4096` (or
-        # `_LOOKUP_NUM_CTX=4096` on fast-path), so prefill paid for the
-        # full 4K KV cache even when the actual content fit in 1.5K
-        # tokens. Telemetría 7d (919 web queries) mostraba `num_ctx=4096`
-        # parejo para "hola" (5 chars) y para queries con 6K chars de
-        # tool output — el costo de prefill no era sensible al input.
+        # Historia:
         #
-        # Heurística: 1 char ≈ 0.25 tokens (conservador para español;
-        # qwen2.5 tokenizer suele dar ~0.22-0.28 tok/char). +512 buffer
-        # cubre el system prompt overhead + el num_predict=256 reply.
-        # Floor 1024 protege queries vacías o tool-only responses (sin
-        # esto, queries degenerate + tools podían terminar en num_ctx <
-        # 600 que ollama rechaza). Cap 4096 mantiene el ceiling histórico
-        # — nunca pedimos MÁS contexto del que la KV cache estaba
-        # configurada para sostener, así no rompemos prefix caching.
+        # 2026-04-25 (developer-1) introdujo aquí un `_adaptive_num_ctx =
+        # min(4096, max(1024, (_final_ctx_chars // 4) + 512))` con la idea
+        # de ahorrar prefill en queries cortas (saludos, propose intent
+        # simple). Telemetría esperada: -1s prefill en queries de <1.5K
+        # tokens.
         #
-        # Logueado abajo en `extra_json.adaptive_num_ctx` para medir
-        # impacto real en p50/p95 de prefill (esperado: queries cortas
-        # de saludo / propose intent caen de ~1.5s a ~0.5s prefill, vault
-        # queries largas no cambian porque ya saturaban los 4096).
-        # Variable separada (`_final_ctx_chars`) del `_ctx_chars` pre-tool
-        # de línea 7190 — el segundo loggea pre-tool size para el printk
-        # `[chat-timing]`, este mide post-tool para la decisión de KV.
+        # 2026-04-28 repro Playwright detectó el costo oculto: cada call
+        # con `num_ctx ≠ <currently-loaded num_ctx>` fuerza a ollama a
+        # reinicializar la KV cache del modelo. En MPS bajo memory
+        # pressure ese reinit puede tomar 60-120s. Concretamente vimos
+        #
+        #   [chat-stream-error] phase=synthesis exc=timed out ttft_ms=90004
+        #     ctx_chars=8277 num_ctx=2581 tools=whatsapp_pending,calendar_
+        #     ahead,reminders_due got_first_token=False
+        #
+        # con el modelo loaded a `CONTEXT 4096` (visible en `ollama ps`).
+        # El "ahorro" de 1s en queries cortas no compensa los 90s de
+        # timeout en queries que mezclan adaptive=2581 con loaded=4096.
+        #
+        # El propio comentario de `_WEB_CHAT_NUM_CTX` (línea ~2700) dice:
+        #
+        #   "Shared num_ctx for every call to the chat model from this
+        #    server — the real /api/chat, the preflight probe, and the
+        #    background prewarmer must all pass the same value. ollama
+        #    re-initialises the KV cache when a model call arrives with a
+        #    different num_ctx than the currently-loaded one [...]"
+        #
+        # El adaptive contradecía ese invariante. Lo borramos; si en el
+        # futuro queremos volver a optimizar prefill para queries cortas,
+        # la ruta correcta es:
+        #   (a) usar el fast_path (qwen2.5:3b con num_ctx=4096) que ya
+        #       acelera por modelo más chico sin tocar KV cache, o
+        #   (b) cambiar el num_ctx loaded del modelo (vía prewarm) para
+        #       que coincida con el adaptive — pero entonces hay que
+        #       garantizar que TODOS los callers (prewarm, probe, /api/
+        #       tasks) usen el mismo valor.
+        #
+        # Por ahora, num_ctx=4096 fijo en todos lados. Mantenemos el
+        # _final_ctx_chars solo para el log diagnóstico de [chat-stream-
+        # error] y por si en el futuro queremos truncar tool output
+        # cuando excede el budget (línea ~2685: "mejor truncar el tool
+        # output ANTES de mandarlo al LLM").
         _final_ctx_chars = sum(len(m.get("content", "")) for m in final_messages)
-        _adaptive_num_ctx = min(4096, max(1024, (_final_ctx_chars // 4) + 512))
+        _adaptive_num_ctx = _WEB_CHAT_OPTIONS["num_ctx"]
         _stream_options = dict(_WEB_CHAT_OPTIONS)
-        _stream_options["num_ctx"] = _adaptive_num_ctx
+        # No override de num_ctx — pin al valor pre-loaded.
 
         parts: list[str] = []
         stripper = _InlineCitationStripper()
@@ -10797,6 +10859,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 parts.append(final_tail)
                 yield _sse("token", {"delta": final_tail})
         except Exception as exc:
+            # Diagnóstico: sin este print el server NO loggea NADA cuando el
+            # frontend muestra "LLM falló: timed out". Debugear regresiones
+            # post-eval era imposible (los chat-timing de éxito sí están en
+            # web.log, los failures eran black-box). Capturamos el tipo de
+            # exception, ttft hasta donde llegamos, ctx_chars, num_ctx
+            # efectivo y qué tools corrieron en este turno — todo lo
+            # necesario para distinguir "modelo cold-load" vs "context
+            # explotó" vs "ollama daemon wedged" sin re-instrumentar.
+            _err_ttft_ms = (
+                int((time.perf_counter() - _t_llm_start) * 1000)
+                if not _first_token_logged
+                else int((_t_first_token - _t_llm_start) * 1000)
+            )
+            print(
+                f"[chat-stream-error] phase=synthesis exc_type={type(exc).__name__} "
+                f"exc={exc} ttft_ms={_err_ttft_ms} ctx_chars={_final_ctx_chars} "
+                f"num_ctx={_adaptive_num_ctx} tools={','.join(tool_names_called) or 'none'} "
+                f"got_first_token={_first_token_logged} parts_so_far={len(parts)}",
+                flush=True,
+            )
             yield _sse("error", {"message": f"LLM falló: {exc}"})
             yield _sse("done", {"error": True})  # BUG #31
             return

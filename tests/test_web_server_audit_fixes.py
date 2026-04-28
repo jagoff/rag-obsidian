@@ -2,8 +2,11 @@
 
 Cubre cuatro findings cerrados en el mismo commit:
 
-- **R1 #9** — `_OLLAMA_TOOL_TIMEOUT` bajado de 120s → 45s para que un
-  cuelgue del tool-decision call no freeze el chat 2 minutos enteros.
+- **R1 #9 + iter** — `_OLLAMA_TOOL_TIMEOUT` y `_OLLAMA_STREAM_TIMEOUT`
+  alineados a 90s. R1 #9 original bajó tool 120 → 45s; eval autónomo
+  del 2026-04-28 lo subió 45 → 90s al ver que la 2da ronda timeouteaba
+  con outputs grandes; repro Playwright el mismo día subió stream 45 →
+  90s al ver el mismo problema en la synthesis call post-tools.
 - **R2-Performance #1** — `_CHAT_BUCKETS` / `_BEHAVIOR_BUCKETS` ahora
   son `_LRURateBucket` con cap 5000 IPs (antes `defaultdict(deque)`
   crecía sin bound y permitía memory exhaustion bajo rotación de
@@ -88,18 +91,56 @@ def _png_bytes() -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Fix 1 — Audit R1 #9: _OLLAMA_TOOL_TIMEOUT 120s → 45s
+# Fix 1 — Ollama client budgets alineados (Tool + Stream = 90s)
+#
+# Historia:
+#   - Audit 2026-04-25 R1 #9: _OLLAMA_TOOL_TIMEOUT bajó 120 → 45s.
+#   - Eval autónomo 2026-04-28 (commit b0d140e): subió 45 → 90s tras ver
+#     que la 2da ronda (synthesis post-tool-output) consistentemente
+#     timeouteaba en 60-80s.
+#   - Repro autónomo Playwright 2026-04-28: 3 de 5 queries fallaron con
+#     "LLM falló: timed out" en 59-62s — esta vez por el `_OLLAMA_STREAM_
+#     TIMEOUT=45s` (que el commit anterior NO había subido). El stream
+#     final post-tools comparte el mismo budget conceptual que el tool
+#     decision call (cold-load del modelo + prefill + decode), así que
+#     debe tener el mismo timeout para no colgarse antes que el otro.
+#
+# Invariante actual: ambos timeouts == 90s. Si alguien quiere cambiar
+# uno, cambiar el otro y ajustar este test, o pensar bien por qué
+# divergir.
 # ══════════════════════════════════════════════════════════════════════
 
 
-def test_ollama_tool_timeout_is_45_seconds():
-    """El tool-decision client tiene que tener un budget acotado para
-    que un cuelgue de qwen2.5:7b (OOM, daemon wedge) no freeze el chat
-    2 minutos. 45s cubre cold-load + 1-2 retries internos sin colgar
-    al user excesivamente."""
-    assert _server._OLLAMA_TOOL_TIMEOUT == 45.0, (
-        f"Esperado _OLLAMA_TOOL_TIMEOUT=45.0 (audit 2026-04-25 R1 #9), "
-        f"got {_server._OLLAMA_TOOL_TIMEOUT}"
+def test_ollama_tool_timeout_is_90_seconds():
+    """El tool-decision client necesita budget de ~90s: la 2da ronda con
+    `tools=` schema + tool outputs grandes (whatsapp_search, gmail_recent,
+    drive_search) puede tardar 60-80s en MPS warm. Si bajamos a 45s
+    volvemos a ver `LLM falló: timed out` en queries multi-tool."""
+    assert _server._OLLAMA_TOOL_TIMEOUT == 90.0, (
+        f"Esperado _OLLAMA_TOOL_TIMEOUT=90.0 (eval autónomo 2026-04-28, "
+        f"commit b0d140e), got {_server._OLLAMA_TOOL_TIMEOUT}"
+    )
+
+
+def test_ollama_stream_timeout_aligned_with_tool_timeout():
+    """El stream-final client (synthesis post-tools) puede tardar tanto
+    como el tool-decision call: prefill sobre 25-30k chars de contexto +
+    decode de la respuesta + cold-load eventual cuando num_ctx adaptive
+    cambia respecto del loaded value. Pre-fix (2026-04-28) el stream
+    estaba en 45s y disparaba timeouts en ~60s wall time mientras el
+    tool client tenía 90s y holgaba — divergencia que invalidaba el
+    sentido del fix anterior."""
+    assert _server._OLLAMA_STREAM_TIMEOUT == 90.0, (
+        f"Esperado _OLLAMA_STREAM_TIMEOUT=90.0 alineado con _OLLAMA_TOOL_"
+        f"TIMEOUT (repro Playwright 2026-04-28), "
+        f"got {_server._OLLAMA_STREAM_TIMEOUT}"
+    )
+    # Belt-and-suspenders: si alguien sube uno de los dos sin actualizar
+    # el otro, fallamos antes de que llegue al server.
+    assert _server._OLLAMA_STREAM_TIMEOUT == _server._OLLAMA_TOOL_TIMEOUT, (
+        f"Invariant: stream y tool timeouts deben coincidir. "
+        f"stream={_server._OLLAMA_STREAM_TIMEOUT} "
+        f"tool={_server._OLLAMA_TOOL_TIMEOUT}"
     )
 
 

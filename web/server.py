@@ -345,12 +345,24 @@ def _detect_read_note_intent(q: str) -> tuple[str, dict] | None:
 # en paralelo (weather + reminders + calendar + wa_pending) porque
 # "hoy" matchea _PLANNING_PAT. Cuando el user es explícito sobre la
 # ciudad, queremos SOLO weather con esa location, sin morning-brief
-# noise. Patron conservador: requiere "clima/tiempo/pronóstico" + "en/de/para" + nombre.
+# noise.
+#
+# 2026-04-28 wave-3: relajado el regex porque la versión inicial era
+# demasiado estricta:
+#   1. "qué clima hace en BA hoy" no matcheaba — "hace" intercalado
+#      entre keyword y prep cortaba el match. Ahora aceptamos hasta 3
+#      palabras intermedias.
+#   2. Location lowercase ("buenos aires") fallaba porque pedía mayúscula
+#      al principio. Ahora aceptamos cualquier letra inicial.
+#   3. Lookahead final era demasiado restrictivo. Ahora dejamos que la
+#      location sea cualquier cosa hasta `?` / `,` / fin de string /
+#      keyword temporal.
 _WEATHER_LOCATION_RE = re.compile(
-    r"\b(?:clima|tiempos?|pron[oó]stico|temperatur[ao])\s+"
-    r"(?:hoy\s+)?(?:en|de|para|para\s+el?)\s+"
-    r"(?P<loc>[A-ZÁÉÍÓÚÑ][\wáéíóúñÁÉÍÓÚÑ ]{2,40}?)"
-    r"(?=\s*(?:\?|$|hoy|mañana|hoy\s+a))",
+    r"\b(?:clima|tiempos?|pron[oó]stico|temperatur[ao])\b"
+    r"(?:\s+\w+){0,3}?"  # palabras intermedias opcionales (hace, hay, está, etc.)
+    r"\s+(?:en|de|para|para\s+el?)\s+"
+    r"(?P<loc>[A-Za-zÁÉÍÓÚÑáéíóúñ][\wáéíóúñÁÉÍÓÚÑ\s]{1,40}?)"
+    r"(?=\s*(?:[?.,!]|$|\bhoy\b|\bmañana\b|\bahora\b|\bpasado\s+mañana\b))",
     re.IGNORECASE,
 )
 
@@ -360,17 +372,21 @@ def _detect_weather_explicit_location_intent(q: str) -> tuple[str, dict] | None:
     si matchea, None si no. Cuando matchea, debe forzar SOLO weather sin
     disparar morning-brief tools.
 
-    Conservative: requiere keyword ('clima'/'tiempo'/'pronóstico') + preposición
-    ('en'/'de'/'para') + nombre que arranque con mayúscula. Falsos positivos
-    son peor que falsos negativos.
+    Conservative pero no demasiado: keyword ('clima'/'tiempo'/'pronóstico')
+    + (opcional palabras intermedias) + preposición ('en'/'de'/'para')
+    + ciudad. Acepta lowercase ("buenos aires") y mayúscula ("BA").
     """
     if not q or not q.strip():
         return None
     m = _WEATHER_LOCATION_RE.search(q)
     if not m:
         return None
-    loc = (m.group("loc") or "").strip()
-    if not loc:
+    loc = (m.group("loc") or "").strip().rstrip(",.;:")
+    # Strip trailing common time words si quedaron pegados al match
+    for tail in (" hoy", " mañana", " ahora", " ahorita"):
+        if loc.lower().endswith(tail):
+            loc = loc[: -len(tail)].strip()
+    if not loc or len(loc) < 2:
         return None
     return ("weather", {"location": loc})
 
@@ -9090,11 +9106,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Cubre: paraphrases + reinicios del server + TTL largo (24h) vs el
         # LRU (exact-match lowercased + 5min + in-memory).
         # Gates: no history, single-vault (corpus_hash es per-col),
-        # no propose_intent (create actions NO son queries), cache enabled.
+        # no propose_intent (create actions NO son queries), cache enabled,
+        # NO forced-tool-intent (weather, whatsapp_list_scheduled, reminders_due,
+        # etc — el resultado es dinámico, cachearlo devuelve datos stale).
+        try:
+            _forced_intent_check_pairs = _detect_tool_intent(question)
+        except Exception:
+            _forced_intent_check_pairs = []
         _semantic_eligible = (
             not history
             and not is_propose_intent
             and len(vaults) == 1
+            and not _forced_intent_check_pairs
         )
         # Audit 2026-04-24: distinguir "skipped por gate" de "lookup nunca
         # corrió" en el telemetry. Pre-fix `_semantic_cache_probe` quedaba
@@ -9104,11 +9127,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # tuning de cache: si `flags_skip` domina con reason=`history`,
         # tunear el cache key para incluir history hash sería más
         # impactful que aflojar el gate.
+        # 2026-04-28 (eval cleanup wave 2): agregado forced_intent reason —
+        # antes "clima en BA" se cacheaba y devolvía "última predicción
+        # está para Santa Fe" porque match'eaba un embed viejo. Ahora si
+        # la query rutea a una tool, salteamos el cache.
         if not _semantic_eligible:
             _skip_reason = (
                 "history" if history else
                 "propose_intent" if is_propose_intent else
                 "multi_vault" if len(vaults) != 1 else
+                "forced_intent" if _forced_intent_check_pairs else
                 "unknown"
             )
             _semantic_cache_probe = {
@@ -10657,6 +10685,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     tool_names_called.extend(_round_tool_names)
                     # Critical-path ms this round = serial sum + parallel max.
                     tool_ms_total += _round_serial_sum_ms + _round_parallel_max_ms
+                    # 2026-04-28 wave-3: si esta ronda ejecutó tools, salimos
+                    # del loop directo — la siguiente ronda llamaría al LLM
+                    # con `tools=` schema (~23 tools) + tool results en
+                    # contexto. Empíricamente: en 678 queries históricos NUNCA
+                    # se necesitó round 2 productivo (todos `tool_rounds=1`),
+                    # pero a veces tardaba >90s causando "LLM falló: timed
+                    # out". Skipear esa ronda nos lleva directo a la synthesis
+                    # call (sin `tools=`), más rápida y sin colgarse. Si en el
+                    # futuro queremos chained tool execution real, aflojar
+                    # esta guard y agregar telemetry para detectar cuántas
+                    # queries lo necesitan.
+                    break
             else:
                 # Round cap reached without the model emitting an empty
                 # tool_calls turn — nudge it to close out with what it has.

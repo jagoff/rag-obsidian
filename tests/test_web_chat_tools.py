@@ -496,9 +496,10 @@ def test_chat_endpoint_tool_path(chat_env, capsys):
     mock = _OllamaMock([
         # Round 1 — ask for weather.
         _mk_msg(tool_calls=[_mk_tool_call("weather", {"location": "Santa Fe"})]),
-        # Round 2 — no more tools.
-        _mk_msg(tool_calls=[]),
-        # Final streaming — 2 chunks.
+        # Final streaming — 2 chunks. (2026-04-28 wave-3: el loop ahora
+        # rompe tras la primera ronda con tools ejecutadas, así que NO
+        # se hace una segunda llamada con tools= al LLM. Va directo al
+        # final stream.)
         _mk_stream(["tiempo: ", "soleado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
@@ -551,7 +552,8 @@ def test_chat_endpoint_parallel_tools(chat_env, capsys):
             _mk_tool_call("finance_summary", {}),
             _mk_tool_call("calendar_ahead", {"days": 3}),
         ]),
-        _mk_msg(tool_calls=[]),
+        # 2026-04-28 wave-3: el loop rompe tras la primera ronda con tools.
+        # Sin segunda llamada al LLM con tools=, va directo al final stream.
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
@@ -654,7 +656,9 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
 
     mock = _OllamaMock([
         _mk_msg(tool_calls=[_mk_tool_call("weather", {})]),
-        _mk_msg(tool_calls=[]),
+        # 2026-04-28 wave-3: el loop rompe tras tool execution, va directo
+        # al final stream. La 2da call al LLM es el final stream, no un
+        # tool-deciding round.
         _mk_stream(["ok"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
@@ -681,12 +685,13 @@ def test_chat_endpoint_tool_exception_recovers(chat_env, capsys):
     assert "tool_rounds=2" in line
     assert "tool_names=weather" in line
 
-    # Spy on the SECOND ollama.chat call — its messages kwarg should include
-    # a role:"tool" message whose content starts with "Error:".
+    # 2026-04-28 wave-3: ahora la 2da llamada es el final stream (sin tools=).
+    # Verificamos que el `role:"tool"` con error está en sus messages
+    # (consumido tras la ejecución del tool en round 1).
     second_call = mock.calls[1]
     msgs = second_call["messages"]
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
-    assert tool_msgs, "expected a role=tool message in the 2nd round"
+    assert tool_msgs, "expected a role=tool message in the final stream call"
     assert tool_msgs[0]["content"].startswith("Error:")
 
 
@@ -814,14 +819,16 @@ def test_chat_endpoint_topic_shift_no_cache_key_unbound_error(chat_env, capsys, 
 
 @pytest.mark.requires_ollama
 def test_chat_endpoint_round_cap_respected(chat_env, capsys):
+    """2026-04-28 wave-3: el loop ahora rompe tras la 1ra ronda con tools
+    ejecutadas, así que el round_cap nudge YA NO se emite — el LLM nunca
+    alcanza el cap. Conservamos el test pero asertamos el nuevo comportamiento:
+    una sola ronda de tools, después final stream, total 2 calls."""
     chat_env.setattr(tools_mod, "_agent_tool_weather", lambda loc=None: '{"w": 1}')
 
     mock = _OllamaMock([
-        # Rounds 1, 2, 3 — model keeps asking for weather.
+        # Round 1 — model asks for weather.
         _mk_msg(tool_calls=[_mk_tool_call("weather", {})]),
-        _mk_msg(tool_calls=[_mk_tool_call("weather", {})]),
-        _mk_msg(tool_calls=[_mk_tool_call("weather", {})]),
-        # 4th call: final streaming answer.
+        # 2nd call: final streaming answer (loop rompió tras round 1).
         _mk_stream(["forzado"]),
     ])
     chat_env.setattr(server_mod.ollama, "chat", mock)
@@ -833,27 +840,27 @@ def test_chat_endpoint_round_cap_respected(chat_env, capsys):
     names = [ev for ev, _ in events]
     assert names[-1] == "done"
 
-    # Exactly 4 ollama.chat calls (3 tool-deciding rounds + 1 final stream).
-    assert len(mock.calls) == 4, mock.calls
+    # Exactamente 2 calls: 1 tool-deciding round + 1 final stream. El cap
+    # de 3 rounds ya no se alcanza porque el loop rompe tras 1 ejecución.
+    assert len(mock.calls) == 2, mock.calls
 
-    # 4th call is the streaming one (stream=True) and its messages must
-    # include the system nudge appended by the round-cap branch.
-    final_call = mock.calls[3]
+    # 2da call es el final streaming (stream=True) y NO debe incluir el
+    # nudge porque el loop rompió clean (sin alcanzar cap).
+    final_call = mock.calls[1]
     assert final_call.get("stream") is True
     final_msgs = final_call["messages"]
     nudge = "Alcanzado cap de herramientas; respondé con lo que tenés."
-    assert any(
+    assert not any(
         m.get("role") == "system" and m.get("content") == nudge
         for m in final_msgs
-    ), f"nudge missing from final call messages: {final_msgs!r}"
+    ), "nudge no debería aparecer (loop rompió antes del cap)"
 
     # Timing log.
     line = _last_chat_timing(capsys.readouterr().out)
     assert line is not None
-    # tool_rounds == 4: pre-router round + 3 capped LLM rounds.
-    # _TOOL_ROUND_CAP=3 is the LLM-loop cap; pre-router adds one extra.
-    assert "tool_rounds=4" in line
-    assert "tool_names=weather,weather,weather,weather" in line
+    # tool_rounds == 2: pre-router round + 1 LLM round (rompió clean).
+    assert "tool_rounds=2" in line
+    assert "tool_names=weather,weather" in line
 
 
 # ── 9. Empty-retrieve bail must NOT swallow pre-router-covered queries ────

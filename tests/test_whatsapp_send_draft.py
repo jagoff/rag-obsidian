@@ -773,26 +773,88 @@ def test_propose_whatsapp_send_falls_back_to_card_when_send_fails(monkeypatch):
     assert "auto_sent" not in payload["fields"]
 
 
-def test_propose_whatsapp_send_scheduled_skips_auto_send(monkeypatch):
-    """Mensajes programados (`scheduled_for` set) NUNCA auto-envían — el
-    user querrá revisar el horario antes de cometer la programación."""
+def test_propose_whatsapp_send_scheduled_skips_immediate_send(monkeypatch):
+    """Mensajes programados (`scheduled_for` set) NUNCA disparan envío
+    inmediato al bridge — el envío real ocurre en el cron `wa-scheduled-
+    send` a la hora programada. Esta es la guarda de seguridad clave:
+    aunque cambiemos a auto-schedule, el bridge NO se llama ahora.
+    """
     monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
         "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
     })
     sends = []
     monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
                         lambda *a, **kw: sends.append(a) or True)
+    # Mockear `wa_scheduled.schedule` para que no toque la DB real (rompe
+    # tests aislados). La función igual fire-and-forgets en el módulo
+    # original; acá la reemplazamos para inspectar args sin side effects.
+    captured: list[dict] = []
+
+    def _fake_schedule(jid, message_text, scheduled_for_utc, *,
+                       contact_name=None, source="chat", **kw):
+        captured.append({
+            "jid": jid, "text": message_text,
+            "sched": scheduled_for_utc, "source": source,
+            "contact_name": contact_name,
+        })
+        return {"id": 42, "scheduled_for_utc": "2099-12-31T12:00:00+00:00",
+                "status": "pending"}
+
+    from rag import wa_scheduled as _ws
+    monkeypatch.setattr(_ws, "schedule", _fake_schedule)
+
     raw = rag.propose_whatsapp_send(
         "Grecia", "hola",
         scheduled_for="2099-12-31T09:00:00-03:00",
     )
     payload = json.loads(raw)
+    # Comportamiento NUEVO 2026-04-28: cuando todo está OK + sched está
+    # set, auto-schedule en lugar de mostrar card pendiente. Antes salía
+    # `whatsapp_message + needs_clarification=True` esperando el click;
+    # ahora persiste y muestra `whatsapp_message_scheduled` con confirmación.
+    assert payload["kind"] == "whatsapp_message_scheduled"
+    assert payload["needs_clarification"] is False
+    assert payload["fields"]["auto_scheduled"] is True
+    assert payload["fields"]["scheduled_id"] == 42
+    # CRITICAL: el bridge NO se llamó — el envío es responsabilidad del
+    # cron worker. Esto es el invariante de seguridad principal.
+    assert sends == []
+    # Schedule fue llamado con los args correctos.
+    assert len(captured) == 1
+    assert captured[0]["jid"] == "5491155555555@s.whatsapp.net"
+    assert captured[0]["text"] == "hola"
+    assert captured[0]["sched"] == "2099-12-31T09:00:00-03:00"
+    assert captured[0]["source"] == "chat"
+
+
+def test_propose_whatsapp_send_scheduled_falls_back_to_card_on_schedule_error(monkeypatch):
+    """Si `wa_scheduled.schedule()` falla (ej. ValueError "más de 60s en
+    el pasado"), el flow cae a la card editable original con el error
+    visible — el user reformula. NO se persiste y NO se envía.
+    """
+    monkeypatch.setattr(rag, "_fetch_contact", lambda *a, **kw: {
+        "full_name": "Grecia", "phones": ["+5491155555555"], "emails": [], "birthday": "",
+    })
+    sends = []
+    monkeypatch.setattr(rag, "_whatsapp_send_to_jid",
+                        lambda *a, **kw: sends.append(a) or True)
+
+    def _fake_schedule_fails(*a, **kw):
+        raise ValueError("scheduled_for_utc en el pasado por más de 60s")
+
+    from rag import wa_scheduled as _ws
+    monkeypatch.setattr(_ws, "schedule", _fake_schedule_fails)
+
+    raw = rag.propose_whatsapp_send(
+        "Grecia", "hola",
+        scheduled_for="2020-01-01T09:00:00-03:00",  # past
+    )
+    payload = json.loads(raw)
     assert payload["kind"] == "whatsapp_message"
     assert payload["needs_clarification"] is True
-    # No se llamó al bridge — la programación se dispara después por el
-    # plist `wa-scheduled-send`, no por este path.
-    assert sends == []
-    assert payload["fields"]["scheduled_for"] == "2099-12-31T09:00:00-03:00"
+    assert payload["fields"]["error"].startswith("schedule_failed:")
+    assert "pasado" in payload["fields"]["error"]
+    assert sends == []  # bridge nunca se llamó
 
 
 def test_propose_whatsapp_send_surfaces_lookup_error(monkeypatch):

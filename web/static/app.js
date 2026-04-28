@@ -2073,6 +2073,81 @@ function appendWhatsAppSentNotice(parent, payload) {
 }
 
 
+// Render compacto de "📅 Programado para X" cuando el backend ya persistió
+// el mensaje a `rag_whatsapp_scheduled` (kind = "whatsapp_message_scheduled").
+// Análogo a appendWhatsAppSentNotice — el user ya dio CUÁNDO + A QUIÉN +
+// QUÉ explícito, no hay nada que confirmar. El user puede cancelar después
+// desde /dashboard si se equivocó (operación reversible).
+//
+// Cambio del 2026-04-28: antes la card siempre salía con [📅 Programar]
+// requiriendo click del user. Eso causó que mensajes "se programaran" en
+// la narrativa del LLM pero NO en la DB — y nunca se enviaban porque
+// nadie clickeaba. Ahora si todo está OK auto-persiste y se renderiza
+// este banner compacto.
+function appendWhatsAppScheduledNotice(parent, payload) {
+  const fields = payload.fields || {};
+  const recipientLabel = fields.full_name || fields.contact_name || "(sin destinatario)";
+  const text = fields.message_text || "";
+  const jid = fields.jid || "";
+  const scheduledFor = fields.scheduled_for || null;
+  const scheduledId = fields.scheduled_id || null;
+
+  const card = el("div", "proposal proposal-whatsapp-sent");
+  card.setAttribute("role", "region");
+
+  const head = el("div", "proposal-head");
+  head.appendChild(el("span", "proposal-icon", "📅"));
+  const headId = `proposal-sched-head-${Math.random().toString(36).slice(2, 9)}`;
+  const headLabel = el("span", "proposal-kind", "Programado en WhatsApp");
+  headLabel.id = headId;
+  head.appendChild(headLabel);
+  card.setAttribute("aria-labelledby", headId);
+  card.appendChild(head);
+
+  const recipientLine = el("div", "proposal-title proposal-resolved-ok");
+  recipientLine.appendChild(document.createTextNode("Para: "));
+  if (jid) {
+    const a = el("a", "proposal-wa-link proposal-resolved-ok-link", recipientLabel);
+    a.href = waHref(jid);
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = "Abrir chat con " + recipientLabel + " en WhatsApp";
+    recipientLine.appendChild(a);
+  } else {
+    recipientLine.appendChild(el("span", "", recipientLabel));
+  }
+  card.appendChild(recipientLine);
+
+  // Chip con la hora programada — el formato amigable lo da
+  // formatFriendlyDate (ya usado por la card editable original).
+  if (scheduledFor) {
+    const friendly = formatFriendlyDate(scheduledFor);
+    const sched = el(
+      "div", "proposal-schedule-chip proposal-schedule-chip-confirmed",
+      `📅 Se va a enviar ${friendly}`,
+    );
+    card.appendChild(sched);
+  }
+
+  // Mensaje programado (read-only).
+  const bodyLine = el("div", "proposal-sent-body");
+  bodyLine.textContent = text;
+  card.appendChild(bodyLine);
+
+  // Hint de cancelación si tenemos el ID — el user puede cambiar de
+  // opinión antes de que se envíe.
+  if (scheduledId) {
+    const hint = el(
+      "div", "proposal-meta",
+      `id #${scheduledId} · podés cancelarlo desde el dashboard si te arrepentís`,
+    );
+    card.appendChild(hint);
+  }
+
+  parent.appendChild(card);
+}
+
+
 function appendWhatsAppProposal(parent, payload) {
   const fields = payload.fields || {};
   const proposalId = payload.proposal_id || "";
@@ -3207,6 +3282,14 @@ function appendProposal(parent, payload) {
   // editable original sigue saliendo (kind = "whatsapp_message").
   if (kind === "whatsapp_message_sent") {
     return appendWhatsAppSentNotice(parent, payload);
+  }
+  // whatsapp_message_scheduled — análogo al sent pero para mensajes
+  // programados (auto-schedule vía `propose_whatsapp_send` cuando el
+  // user dio horario explícito). El backend ya persistió el row en
+  // rag_whatsapp_scheduled; el cron `wa-scheduled-send` lo dispara a
+  // la hora. El user puede cancelar desde /dashboard si se arrepiente.
+  if (kind === "whatsapp_message_scheduled") {
+    return appendWhatsAppScheduledNotice(parent, payload);
   }
   // whatsapp_cancel_scheduled / whatsapp_reschedule_scheduled — gestión de
   // mensajes ya programados (cards más simples que el send: NO hay

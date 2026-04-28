@@ -22942,7 +22942,6 @@ def propose_whatsapp_send(
     # Guards de seguridad preservados — la card SIGUE saliendo si:
     #   - error != None        (resolver falló o ambiguous)
     #   - is_group == True     (mensajes grupales requieren confirmar)
-    #   - scheduled_for set    (mensajes programados merecen revisar horario)
     #   - sin message_text     (LLM no propuso cuerpo aún)
     can_auto_send = (
         lookup.get("error") is None
@@ -22973,6 +22972,62 @@ def propose_whatsapp_send(
         # seteado para que el user pueda re-intentar manualmente.
         if not fields.get("error"):
             fields["error"] = "send_failed"
+
+    # Auto-schedule: análogo al auto-send pero para mensajes programados.
+    # Bug detectado 2026-04-28 (3-4 turns en el chat web): el user pedía
+    # "mandale a mama a las HH:MM diciendo: ..." esperando que se
+    # programara solo, pero el código viejo siempre devolvía una card
+    # con [📅 Programar] que requería click manual. La narrativa del LLM
+    # decía "Se ha programado..." cuando técnicamente NO se había
+    # programado todavía — engañoso. El user nunca clickeaba (pensaba
+    # que ya estaba) y los mensajes nunca salían.
+    #
+    # Simetría con auto_send: si el user dijo CUÁNDO + A QUIÉN + QUÉ,
+    # no hay nada que confirmar — se persiste a `rag_whatsapp_scheduled`
+    # y el cron `wa-scheduled-send` lo dispara a la hora. La card
+    # resultante muestra "✓ Programado" sin botón de Programar (el
+    # user igual puede cancelar después desde /dashboard si se
+    # equivocó — operación reversible).
+    #
+    # Guards: mismas excepciones que auto_send (error/grupo/sin body),
+    # MÁS protección contra cualquier excepción de `schedule()` —
+    # típicamente "más de 60s en el pasado" si el LLM emite un horario
+    # ya pasado. En ese caso caemos al flow legacy (card pendiente)
+    # con el error visible para que el user reformule.
+    can_auto_schedule = (
+        lookup.get("error") is None
+        and lookup.get("jid")
+        and not lookup.get("is_group")
+        and bool(sched)
+        and bool((message_text or "").strip())
+    )
+    if can_auto_schedule:
+        try:
+            from rag import wa_scheduled
+            sched_result = wa_scheduled.schedule(
+                jid=lookup["jid"],
+                message_text=message_text,
+                scheduled_for_utc=sched,
+                contact_name=lookup.get("full_name") or contact_name,
+                source="chat",
+            )
+            fields["auto_scheduled"] = True
+            fields["scheduled_id"] = sched_result.get("id")
+            fields["scheduled_for_utc"] = sched_result.get("scheduled_for_utc")
+            return json.dumps({
+                "kind": "whatsapp_message_scheduled",
+                "proposal_id": f"prop-{uuid.uuid4()}",
+                "needs_clarification": False,
+                "fields": fields,
+            }, ensure_ascii=False)
+        except ValueError as exc:
+            # `_validate_schedule_time` rechaza past>60s o future>365d, y
+            # `_to_utc_dt` rechaza strings malformados — los tres salen
+            # como ValueError. Guardamos el detail para que el user vea
+            # qué pasó y reformule.
+            fields["error"] = f"schedule_failed: {str(exc)[:120]}"
+        except Exception as exc:  # pragma: no cover — DB lockeada / etc.
+            fields["error"] = f"schedule_failed: {str(exc)[:120]}"
 
     return json.dumps({
         "kind": "whatsapp_message",

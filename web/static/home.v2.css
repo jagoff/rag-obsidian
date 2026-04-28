@@ -154,6 +154,9 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  column-gap: var(--space-4);
+  row-gap: var(--space-2);
   padding: var(--space-2) var(--space-4);
   background: var(--bg-elev-2);
   border-bottom: 1px solid var(--border);
@@ -164,9 +167,10 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
   color: var(--text);
   font-weight: 600;
   letter-spacing: 0.05em;
+  order: 1;
 }
 .topbar .brand .accent { color: var(--cyan); }
-.topbar .meta { display: flex; gap: var(--space-4); }
+.topbar .meta { display: flex; gap: var(--space-4); order: 3; }
 .topbar .meta-item {
   display: inline-flex;
   align-items: center;
@@ -180,6 +184,54 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 }
 .topbar .dot.warn   { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
 .topbar .dot.crit   { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+/* Page nav — links a /chat /dashboard /learning /transcripts /status
+   /logs /agents. Centrado entre brand y meta en desktop; en mobile
+   se baja a su propia fila gracias al flex-wrap del topbar. Estilo
+   minimal: solo texto + cyan, sin bordes ni fondo, para mantener
+   la estética terminal "ls de páginas" sin competir con los KPIs. */
+.topbar .topnav {
+  order: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1 1 auto;
+  justify-content: center;
+  min-width: 0;
+}
+.topbar .topnav-link {
+  color: var(--cyan-dim);
+  text-decoration: none;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 3px;
+  transition: color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
+}
+.topbar .topnav-link:hover,
+.topbar .topnav-link:focus-visible {
+  color: var(--cyan);
+  background: var(--bg-elev-3);
+  text-decoration: none;
+  outline: none;
+}
+.topbar .topnav-link:focus-visible {
+  box-shadow: var(--shadow-focus);
+}
+
+/* Touch devices: bump tap target a >=44x44 (Apple HIG / WCAG 2.5.5).
+   Mismo trato que tenían los .topbar-link de v1 — el bolsillo de un
+   pulgar grande no distingue entre dos links pegados. */
+@media (pointer: coarse) {
+  .topbar .topnav-link {
+    min-height: 44px;
+    padding: var(--space-2) var(--space-3);
+    display: inline-flex;
+    align-items: center;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
 
 /* ── Layout container ───────────────────────────────────── */
 
@@ -1025,6 +1077,15 @@ ul, ol { padding: 0; margin: 0; list-style: none; }
 
   .topbar { padding: var(--space-2) var(--space-3); }
   .topbar .meta { gap: var(--space-2); flex-wrap: wrap; justify-content: flex-end; }
+  /* Mobile: nav cae a su propia fila debajo de brand+meta. flex-basis:
+     100% fuerza el wrap; justify-content: flex-start lo alinea con el
+     resto del shell (no centrado, que se ve raro a 360px). */
+  .topbar .topnav {
+    flex-basis: 100%;
+    order: 4;
+    justify-content: flex-start;
+    gap: var(--space-2);
+  }
 
   /* Mobile collapsibility: en mobile el cmdbar ocupa una columna y
      algunos panels pierden contexto. Colapsar Monitoring + Ambiente

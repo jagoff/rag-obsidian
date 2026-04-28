@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
-  <link rel="stylesheet" href="/static/home.v2.css?v=8">
+  <link rel="stylesheet" href="/static/home.v2.css?v=9">
   <!-- marked@18 vendored — same SRI as the v1 home. Used to parse the
        today/tomorrow narrative which has 4 H2 sub-sections that need
        real markdown rendering (lists, headers) — not the regex hack. -->
@@ -26,6 +26,15 @@
 
   <header class="topbar" role="banner">
     <div class="brand">rag<span class="accent">·</span>home</div>
+    <nav class="topnav" aria-label="páginas">
+      <a class="topnav-link" href="/chat">chat</a>
+      <a class="topnav-link" href="/dashboard">dashboard</a>
+      <a class="topnav-link" href="/learning">learning</a>
+      <a class="topnav-link" href="/transcripts">transcripts</a>
+      <a class="topnav-link" href="/status">status</a>
+      <a class="topnav-link" href="/logs">logs</a>
+      <a class="topnav-link" href="https://ra.ai/agents/">agents</a>
+    </nav>
     <div class="meta" id="topbar-meta">
       <span class="meta-item">
         <span class="dot ok" id="serve-dot"></span>

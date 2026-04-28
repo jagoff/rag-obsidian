@@ -4648,10 +4648,21 @@ _corpus_hash_lock = threading.Lock()
 _CORPUS_HASH_BUCKET = 100
 
 
+# 2026-04-28 wave-7: filter version baked into the corpus hash. Bump cuando
+# cambia algún regex/filter/system-prompt que afecta cómo el LLM responde
+# (PII redaction, raw tool call stripper, iberian leaks, REGLA 1.b/1.c, etc.).
+# Forzando que las entries del semantic cache pre-fix sean "diferente
+# corpus" → no se sirvan más.
+_FILTER_VERSION = "wave7-2026-04-28"
+
+
 def _hash_chunk_count(chunk_count: int) -> str:
     import hashlib
     bucket = chunk_count // _CORPUS_HASH_BUCKET
-    return hashlib.sha256(f"count_bucket:{bucket}".encode()).hexdigest()[:16]
+    # Prefijo con _FILTER_VERSION para invalidar cache cuando bumpeamos.
+    return hashlib.sha256(
+        f"count_bucket:{bucket}|filter:{_FILTER_VERSION}".encode()
+    ).hexdigest()[:16]
 
 
 def _compute_corpus_hash(col) -> str:
@@ -45833,6 +45844,16 @@ def serve(host: str, port: int):
         # Respuestas median 38 chars, p95 236 tok; 256 deja buffer ajustado
         # y cap gen time a ~25s a 10 tok/s peor caso. CLI usa CHAT_OPTIONS=384.
         predict_cap = int(body.get("num_predict", 256))
+        # retrieve_only (2026-04-28): skip LLM call y devolver solo sources +
+        # excerpts. Diseñado para drafts del WhatsApp listener — necesita
+        # contexto del corpus (notas/calendar/reminders/gmail/whatsapp) sin
+        # pagar los 10-30s de un LLM call que va a descartar igual. El
+        # listener arma su propio prompt para el draft con esos excerpts.
+        # Bypassea metachat / weather / tasks / finance short-circuits — esos
+        # NO usan retrieve y devolverían sources=[] inútil. Evitamos también
+        # el cache (sources puede cambiar entre runs por reindexing) y la
+        # session persistence (no es un turn de conversación).
+        retrieve_only = bool(body.get("retrieve_only", False))
 
         # Emit "received" event before processing — lets the dashboard surface
         # in-flight queries even when retrieval/generation hangs (the prior
@@ -45895,7 +45916,15 @@ def serve(host: str, port: int):
         # point running retrieve + command-r when we have a dedicated
         # weather pipeline (~2-3s total). Conservative keyword matcher
         # with exclude list for "clima laboral" / "tengo tiempo" FPs.
-        if _is_weather_query(question):
+        #
+        # `retrieve_only` bypassea TODOS los short-circuits — el caller
+        # (listener para drafts) quiere sources del corpus, no answers
+        # canned. Si la query es weather/metachat/tasks/finance Y
+        # retrieve_only=true, igual corre el retrieve normal: las
+        # sources que devuelva pueden ser irrelevantes (vault no tiene
+        # info de "hola" o "llueve hoy?") pero el listener decide
+        # qué hacer con eso (filtra por score abajo).
+        if not retrieve_only and _is_weather_query(question):
             t_w0 = time.perf_counter()
             try:
                 forecast_block = _fetch_weather_forecast()
@@ -45957,7 +45986,8 @@ def serve(host: str, port: int):
         # bypassean retrieve. Helper compartido con `/chat`. Devuelve None
         # cuando la query NO es finance/cards o el helper falla, en cuyo
         # caso seguimos al pipeline normal.
-        _fc_result = _finance_short_circuit_answer(question)
+        # `retrieve_only` skipea este short-circuit — ver explicación arriba.
+        _fc_result = None if retrieve_only else _finance_short_circuit_answer(question)
         if _fc_result is not None:
             answer, n_cards, has_moze, t_fc = _fc_result
             query_turn_id = new_turn_id()
@@ -46004,7 +46034,7 @@ def serve(host: str, port: int):
         # own _pick_metachat_reply with richer time-aware variants; WA
         # stays with a compact single-line canned reply — matches the
         # conversational register).
-        if _detect_metachat_intent(question):
+        if not retrieve_only and _detect_metachat_intent(question):
             t_m0 = time.perf_counter()
             _q_lower = question.strip().lower()
             if any(w in _q_lower for w in ("gracias", "thanks", "thank")):
@@ -46048,7 +46078,7 @@ def serve(host: str, port: int):
         # "what do I have this week" queries (picks up recent WhatsApp
         # markdown and answers with a chat fragment). Bypass retrieve and
         # pull from the live services layer scoped to the query's window.
-        if _is_tasks_query(question):
+        if not retrieve_only and _is_tasks_query(question):
             t_tasks0 = time.perf_counter()
             scope = _detect_time_scope(question)
             # Tasks-mode always consults ALL registered vaults — user keeps
@@ -46358,6 +46388,41 @@ def serve(host: str, port: int):
 
         if not result["docs"]:
             return {"answer": "", "sources": [], "t_retrieve": round(t_retrieve, 3)}
+
+        # retrieve_only early return (2026-04-28): devolver sources +
+        # excerpts sin tocar confidence gate ni LLM. El caller (listener
+        # de drafts) ya filtra por `score` su lado — el gate de server
+        # acá sería ruido. Los excerpts van truncados a 500 chars (c/u) —
+        # el draft prompt no necesita el chunk completo, solo la evidencia.
+        if retrieve_only:
+            sources_with_excerpts = [
+                {
+                    "note": m.get("note", ""),
+                    "path": m.get("file", ""),
+                    "score": round(float(s), 2),
+                    "excerpt": (d or "")[:500],
+                    "source": m.get("source", ""),
+                }
+                for m, s, d in zip(
+                    result["metas"], result["scores"], result["docs"],
+                )
+            ]
+            try:
+                log_query_event({
+                    "cmd": "serve.retrieve_only",
+                    "q": question[:200], "session": sid,
+                    "n_sources": len(sources_with_excerpts),
+                    "t_retrieve": round(t_retrieve, 3),
+                    "top_score": round(float(result.get("confidence", 0.0)), 3),
+                })
+            except Exception:
+                pass
+            return {
+                "sources": sources_with_excerpts,
+                "confidence": round(float(result.get("confidence", 0.0)), 2),
+                "t_retrieve": round(t_retrieve, 3),
+                "retrieve_only": True,
+            }
 
         # Confidence gate — per-source threshold (scaffolding today: all
         # sources equal the baseline until production data calibrates them).

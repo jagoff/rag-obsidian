@@ -1864,7 +1864,7 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
 # incluir portugués e italiano explícitamente (contagion bajo fast-path
 # WA con contactos brasileros).
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.b — DATOS TRANSACCIONALES FINANCIEROS (excepción ESPECÍFICA y ACOTADA a REGLA 1): SOLO aplica cuando la pregunta nombra EXPLÍCITAMENTE banco/tarjeta/visa/mastercard/amex/MOZE/dolares/pesos/USD/ARS/montos/consumos/movimientos. En esos casos: NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo ### Gastos o ### Tarjetas. Si esas secciones NO están, o están pero vacías, respondé "No tengo data fresca de [X] — el último export del banco puede no estar al día." y CORTÁ ahí. Si hay AMBAS secciones (MOZE + Tarjetas) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas. Para CALENDARIO/REMINDERS/MAILS/WHATSAPP/CLIMA/DRIVE — citá literal de la sección correspondiente cuando esté presente, pero NUNCA uses el template de "data fresca/export" (esos no tienen "exports" — los devolvés ya frescos via tool calls).\n\nREGLA 1.b.1 — ALCANCE de REGLA 1.b (PROHIBICIÓN EXPLÍCITA): REGLA 1.b NO aplica a preguntas sobre notas, conceptos, temas, ideas, técnicas, proyectos, conocimiento, conceptos abstractos, métodos, frameworks, libros, autores, citas. Para esas: REGLA 1 (engancháte con el CONTEXTO). El template "No tengo data fresca de [X] — el último export del [...] puede no estar al día" está PROHIBIDO para queries que NO sean financieras explícitas. Si el vault no tiene matches sobre un concepto/técnica/tema, respondé en LENGUAJE NATURAL: "No encontré nada en tus notas sobre [X]. Probá buscar como [variante1] o [variante2], o agregá una nota si querés trackearlo." NO uses la palabra "export", NO digas "no tengo data fresca", NO menciones "el último [algo]".\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.b — DATOS TRANSACCIONALES FINANCIEROS (excepción ESPECÍFICA y ACOTADA a REGLA 1): SOLO aplica cuando la pregunta nombra EXPLÍCITAMENTE banco/tarjeta/visa/mastercard/amex/MOZE/dolares/pesos/USD/ARS/montos/consumos/movimientos. En esos casos: NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo ### Gastos o ### Tarjetas. Si esas secciones NO están, o están pero vacías, respondé "No tengo data fresca de [X] — el último export del banco puede no estar al día." y CORTÁ ahí. Si hay AMBAS secciones (MOZE + Tarjetas) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas. Para CALENDARIO/REMINDERS/MAILS/WHATSAPP/CLIMA/DRIVE — citá literal de la sección correspondiente cuando esté presente, pero NUNCA uses el template de "data fresca/export" (esos no tienen "exports" — los devolvés ya frescos via tool calls).\n\nREGLA 1.b.1 — ALCANCE de REGLA 1.b (PROHIBICIÓN EXPLÍCITA): REGLA 1.b NO aplica a preguntas sobre notas, conceptos, temas, ideas, técnicas, proyectos, conocimiento, conceptos abstractos, métodos, frameworks, libros, autores, citas. Para esas: REGLA 1 (engancháte con el CONTEXTO). El template "No tengo data fresca de [X] — el último export del [...] puede no estar al día" está PROHIBIDO para queries que NO sean financieras explícitas. Si el vault no tiene matches sobre un concepto/técnica/tema, respondé en LENGUAJE NATURAL: "No encontré nada en tus notas sobre [X]. Probá buscar como [variante1] o [variante2], o agregá una nota si querés trackearlo." NO uses la palabra "export", NO digas "no tengo data fresca", NO menciones "el último [algo]".\n\nREGLA 1.c — NO FALSE CONFIRMATIONS (CRÍTICA, security-related): NUNCA digas "se ha programado/agregado/creado/cancelado/eliminado/modificado/actualizado [X]" si NO ejecutaste literalmente la tool correspondiente en este turno. Si el user pide editar/sumar/cambiar/cancelar algo PREVIAMENTE creado y NO tenés tool para hacer ese edit (no existe `propose_reminder_edit`, `propose_calendar_cancel`, etc.), DECILE textualmente: "No puedo editar/cancelar lo anterior desde acá — abrí Apple Reminders/Calendar y modificá manualmente. Si querés, puedo crear uno nuevo con [X] (el viejo queda como está)." PROHIBIDO confirmar acciones que no se ejecutaron.\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -2025,6 +2025,12 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
         "Después del tool call, el siguiente turn del assistant (sin "
         "tool calls) es UNA oración breve de confirmación. No repitas "
         "los campos (el usuario los ve en el chip inline del chat).\n\n"
+        # 2026-04-28 wave-7 (eval Conv 3 — wrong cancel tool): rule corta
+        # para evitar inflar el override (5300+ chars regresiona routing).
+        "Cancelar/editar: SOLO `propose_whatsapp_cancel_scheduled` para "
+        "WhatsApp scheduled. Reminders/calendar NO tienen edit/cancel tools "
+        "— para esos NO llames tool, el siguiente turn dice: \"No puedo "
+        "editar/cancelar desde acá, abrí Apple Reminders/Calendar.\"\n\n"
         "No cites notas del vault, no inventes paths, no menciones "
         "REGLA 1. El único output válido acá es un tool_call en el "
         "protocolo; imprimir el call como texto es un bug."
@@ -5475,6 +5481,258 @@ def _normalize_canonical_filenames(text: str) -> str:
     return out
 
 
+# 2026-04-28 wave-7 (eval Conv 5 — CRITICAL privacy leak): el vault del
+# user puede tener notas de contacto con credenciales en plain text
+# (passwords, DNI, números de teléfono). Si el user pregunta "quién es
+# mi mamá", el LLM lee la nota y emite TODO incluido el password. Esto
+# es un security/privacy issue grave.
+#
+# Fix: post-process filter en el streaming pipeline que detecta patrones
+# claros de credenciales y los redacta. Conservador — sólo matchea
+# labels explícitos seguidos del valor (ej. "Contraseña: foo123"). NO
+# redacta números/strings sueltos sin contexto. False positives son
+# baratos (un número que no era PII queda redactado, el user pregunta
+# de nuevo). False negatives serían el bug.
+#
+# Greppable: cuando se redacta algo, el filter incrementa
+# `_PII_REDACT_COUNT` (atómico-ish, log periódico).
+_PII_REDACT_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    # 2026-04-28 wave-7 iter2: el LLM no siempre emite "Label: valor" — a
+    # veces dice "Su contraseña es valor", "contraseña guardada como valor",
+    # "el password de X es valor". Patterns label-PROXIMITY (label + hasta
+    # ~30 chars de prosa + valor) cubren los modos de falla observados en
+    # eval Conv 5.
+
+    # Passwords / contraseñas — label + connector ("es"/"como"/"="/":") +
+    # valor mixto alphanum 4+ chars. Greedy hasta whitespace/punctuation.
+    # NOTA: catch "Contraseña: X", "su contraseña es X", "contraseña
+    # guardada como X", "password = X", "su contraseña en tus notas como X".
+    # Allow 0-6 palabras intermedias entre label y connector (cubre frases
+    # tipo "guardada en tus notas como").
+    (
+        re.compile(
+            r"(?i)\b(?:contrase[ñn]a|password|pwd|passphrase)"
+            r"(?:\s+\w+){0,6}?"  # 0-6 palabras intermedias
+            r"\s*(?:[:=]|\bes\b|\bcomo\b)\s*"  # connector
+            r"\S{4,}",  # valor (4+ chars no-whitespace)
+        ),
+        "[contraseña REDACTADA]",
+    ),
+    # DNI (Argentina) — formato 7-8 dígitos con/sin puntos.
+    # Pattern 1: label + connector + valor.
+    (
+        re.compile(
+            r"(?i)\bDNI(?:\s+\w+){0,3}?\s*(?:[:=]|\bes\b)\s*[\d.]{7,12}",
+        ),
+        "DNI: [REDACTADO]",
+    ),
+    # Pattern 2: 7-8 dígitos seguidos con puntos típicos de DNI (xx.xxx.xxx).
+    # Conservador: requiere el formato exacto AR.
+    (
+        re.compile(
+            r"\b\d{2}\.\d{3}\.\d{3}\b",
+        ),
+        "[DNI REDACTADO]",
+    ),
+    # Teléfono — label + valor. Acepta connector "es"/"como"/":".
+    (
+        re.compile(
+            r"(?i)\b(?:tel(?:[eé]fono)?|cel(?:ular)?|m[oó]vil|whatsapp|n[uú]mero(?:\s+de)?\s+(?:tel(?:[eé]fono)?|cel(?:ular)?))"
+            r"(?:\s+\w+){0,3}?"
+            r"\s*(?:[:=]|\bes\b|\bcomo\b)\s*"
+            r"\+?\d[\d\s\-()]{7,20}",
+        ),
+        "[teléfono REDACTADO]",
+    ),
+    # Pattern 3: número AR completo (+54 9 ... ) sin label. Conservador:
+    # requiere prefijo +54 + 9 dígitos+.
+    (
+        re.compile(
+            r"\+54\s*9\s*\d{2,4}[\s-]?\d{3,4}[\s-]?\d{3,4}\b",
+        ),
+        "[teléfono REDACTADO]",
+    ),
+    # CUIT/CUIL — 11 dígitos, formato XX-XXXXXXXX-X o sin guiones.
+    (
+        re.compile(
+            r"(?i)\b(?:cuit|cuil)(?:\s+\w+){0,3}?\s*(?:[:=]|\bes\b)?\s*\d{2}[\s-]?\d{8}[\s-]?\d{1}",
+        ),
+        "[CUIT REDACTADO]",
+    ),
+    (
+        re.compile(
+            r"\b\d{2}-\d{8}-\d\b",  # standalone CUIT format
+        ),
+        "[CUIT REDACTADO]",
+    ),
+    # Tokens / API keys — label + connector + valor.
+    (
+        re.compile(
+            r"(?i)\b(?:token|api[_\s-]?key|secret|access[_\s-]?key)"
+            r"(?:\s+\w+){0,3}?\s*(?:[:=]|\bes\b)\s*\S{4,}",
+        ),
+        "[token REDACTADO]",
+    ),
+    # CBU / CVU / IBAN.
+    (
+        re.compile(
+            r"(?i)\b(?:cbu|cvu|iban)(?:\s+\w+){0,3}?\s*(?:[:=]|\bes\b)?\s*[\d-]{16,32}",
+        ),
+        "[CBU REDACTADO]",
+    ),
+    # Tarjeta de crédito 16 dígitos.
+    (
+        re.compile(
+            r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
+        ),
+        "[tarjeta REDACTADA]",
+    ),
+    # CVV/CVC.
+    (
+        re.compile(
+            r"(?i)\b(?:cvv|cvc|c[oó]digo\s+seguridad)(?:\s+\w+){0,3}?\s*(?:[:=]|\bes\b)?\s*\d{3,4}",
+        ),
+        "[CVV REDACTADO]",
+    ),
+)
+
+
+# 2026-04-28 wave-7 (eval Conv 6 — CRITICAL internal error leak): assertion
+# messages internas (con references a CLAUDE.md, ThreadPoolExecutor, M3 Max,
+# stack frames) llegaban directo al user via SSE error event. Repro:
+# "cómo funciona el sistema RAG" → "retrieve falló: bm25_search llamado en
+# paralelo — es GIL-serialised por diseño (CLAUDE.md línea 126...)".
+#
+# Fix: detectar señales claras de "esto es un dev error, no un user error" y
+# reemplazar con mensaje user-friendly. El error ORIGINAL queda loggeado en
+# web.log con tag `[chat-error-sanitized]` para debug.
+_DEV_ERROR_SIGNALS = (
+    "claude.md", "agents.md", "thread", "executor", "gil-serialised",
+    "gil-serialized", "asserterror", "assertionerror", "traceback",
+    "  file ", "stack", "m3 max", "callable", "noneType",
+    "in __init__", "lambda", "wrapped function",
+)
+
+
+def _sanitize_error_for_user(exc: Exception, *, phase: str = "unknown") -> str:
+    """Convertir un Exception en un mensaje user-friendly. Si el error parece
+    interno/dev-facing (matchea _DEV_ERROR_SIGNALS), reemplazar por un
+    mensaje genérico. Sino, devolver el mensaje del exception (asumido
+    user-safe — ej. "ollama no responde", "vault no encontrado").
+    """
+    raw = str(exc) if exc else ""
+    raw_lower = raw.lower()
+    for signal in _DEV_ERROR_SIGNALS:
+        if signal in raw_lower:
+            # Mensaje user-friendly por phase. Si phase desconocido, fallback.
+            user_msgs = {
+                "retrieve": "No pude buscar en el vault — probá reformular o intentar de nuevo en un momento.",
+                "synthesis": "Tuve un problema generando la respuesta — probá de nuevo.",
+                "tool_decision": "Hubo un error decidiendo qué hacer — reformulá la pregunta o probá de nuevo.",
+                "tasks_brief": "Falló el resumen de pendientes — probá de nuevo.",
+            }
+            return user_msgs.get(phase, "Hubo un error procesando tu consulta — probá de nuevo o reformulá.")
+    # No matchea — el mensaje del exception es probablemente safe (ej.
+    # "vault X no encontrado", "ollama timeout"). Devolverlo prefixado
+    # con el phase para context.
+    if not raw:
+        return f"Error desconocido en {phase}."
+    # Sanitize: nunca exponemos tracebacks o paths absolutos. Cortar al
+    # primer newline + cap a 200 chars.
+    safe = raw.split("\n")[0][:200]
+    return f"{phase} falló: {safe}"
+
+
+def _redact_pii(text: str) -> tuple[str, int]:
+    """Redact PII labels en texto. Retorna (texto_redactado, count_redacciones).
+
+    Patrones soportados (ver `_PII_REDACT_PATTERNS`):
+      - Contraseña/password/clave: cualquier valor tras label
+      - DNI: dígitos 7-12 con/sin puntos
+      - Teléfono/celular/móvil/whatsapp con label
+      - Token/API key/secret/access key con label
+      - CBU/CVU/IBAN con label
+      - Números de tarjeta (16 dígitos)
+      - CVV/CVC con label
+
+    Idempotente: re-aplicar sobre texto ya redactado no rompe nada.
+    """
+    if not text:
+        return text, 0
+    out = text
+    n = 0
+    for pat, repl in _PII_REDACT_PATTERNS:
+        if callable(repl):
+            new_out, k = pat.subn(repl, out)
+        else:
+            new_out, k = pat.subn(repl, out)
+        if k:
+            n += k
+            out = new_out
+    return out, n
+
+
+# Streaming pipeline: PII labels may arrive split across chunks
+# (ej. chunk1="Contraseña: " + chunk2="secret123"). Si emitimos chunk1
+# antes de ver chunk2, el regex no matchea (label sin valor adyacente).
+# Este regex detecta cuando el candidate de emit TERMINA con un PII
+# label parcial que necesita el próximo chunk para redactar bien.
+_PII_TAIL_HOLDBACK_RE = re.compile(
+    r"(?i)\b(?:contrase[ñn]a|clave|password|pwd|pass|"
+    r"dni|tel(?:[eé]fono)?|cel(?:ular)?|m[oó]vil|whatsapp|"
+    r"token|api[_\s-]?key|secret|access[_\s-]?key|"
+    r"cbu|cvu|iban|cvv|cvc|c[oó]digo\s+seguridad)"
+    r"\s*[:=]?\s*\S{0,40}\s*$",  # label opcionalmente seguida de inicio del valor
+    re.IGNORECASE,
+)
+
+
+class _PiiRedactFilter:
+    """Streaming filter al final del pipeline que redacta credenciales/PII
+    cruzando chunk boundaries. Mantiene un buffer si el candidate termina
+    con un label de PII conocido — el valor llegará en el próximo chunk.
+
+    Usado DESPUÉS del IberianLeakFilter (que ya hace redact inline para
+    mismo-chunk). Este filter cubre los casos de chunks pequeños donde
+    label y valor llegan separados.
+    """
+
+    _MAX_HOLD = 200  # cap de emergencia
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._redact_count = 0
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        self._buf += chunk
+        # Si el buffer entero termina con un PII label (con o sin valor
+        # parcial), retenemos hasta el próximo chunk.
+        m = _PII_TAIL_HOLDBACK_RE.search(self._buf)
+        if m and m.end() == len(self._buf):
+            # Tail es PII label en construcción — emergency flush si demasiado largo
+            if len(self._buf) > self._MAX_HOLD:
+                out, n = _redact_pii(self._buf)
+                self._redact_count += n
+                self._buf = ""
+                return out
+            return ""
+        # No hay label pendiente — aplicar redact y emitir todo.
+        out, n = _redact_pii(self._buf)
+        self._redact_count += n
+        self._buf = ""
+        return out
+
+    def flush(self) -> str:
+        if not self._buf:
+            return ""
+        out, n = _redact_pii(self._buf)
+        self._redact_count += n
+        self._buf = ""
+        return out
+
+
 class _IberianLeakFilter:
     """Streaming filter chained después de `_InlineCitationStripper` que
     reemplaza leaks portugueses/gallegos con su equivalente español.
@@ -5545,15 +5803,15 @@ class _IberianLeakFilter:
             # Retener desde el starter; emitir todo lo anterior.
             to_emit = self._buf[:starter_start]
             self._buf = self._buf[starter_start:]
-            return _normalize_canonical_filenames(_replace_iberian_leaks(to_emit))
+            return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(to_emit)))[0]
         to_emit = candidate
         self._buf = self._buf[last_boundary + 1:]
-        return _normalize_canonical_filenames(_replace_iberian_leaks(to_emit))
+        return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(to_emit)))[0]
 
     def flush(self) -> str:
         tail = self._buf
         self._buf = ""
-        return _normalize_canonical_filenames(_replace_iberian_leaks(tail))
+        return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(tail)))[0]
 
 
 # 2026-04-28 wave-5: el LLM (qwen2.5:7b) ocasionalmente emite la SINTAXIS
@@ -6363,7 +6621,7 @@ def _gen_tasks_response(sess: dict, question: str, history: list[dict]):
             f"parts_so_far={len(parts)}",
             flush=True,
         )
-        yield _sse("error", {"message": f"LLM falló: {exc}"})
+        yield _sse("error", {"message": _sanitize_error_for_user(exc, phase="tasks_brief")})
         return
 
     full = "".join(parts)
@@ -9553,6 +9811,20 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         if _sem_top is None:
                             _sem_top = 0.0
                         _sem_text = _sem_hit["response"]
+                        # 2026-04-28 wave-7: aplicar PII redaction también
+                        # al cache hit. Las entries pre-fix pueden tener
+                        # PII en plain text. La invalidación por filter_version
+                        # del corpus_hash debería evitarlo, pero defense-in-
+                        # depth: redactar antes de yield.
+                        _sem_text, _sem_redact_n = _redact_pii(_sem_text)
+                        if _sem_redact_n > 0:
+                            print(
+                                f"[chat-pii-redact] phase=cache_hit "
+                                f"redacted {_sem_redact_n} pattern(s) from "
+                                f"cached response — old entry should be "
+                                f"invalidated by corpus_hash bump",
+                                flush=True,
+                            )
                         _sem_sources = [
                             {
                                 "file": _p,
@@ -9963,7 +10235,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             result = _validate_retrieve_result(result)
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
-            yield _sse("error", {"message": f"retrieve falló: {exc}"})
+            # 2026-04-28 wave-7: sanitizar el error message antes de emitirlo
+            # al user. Repro Conv 6: "cómo funciona el sistema RAG" → assertion
+            # interna `bm25_search llamado en paralelo — es GIL-serialised por
+            # diseño (CLAUDE.md línea 126, medido 3× slower paralelo en M3 Max)`
+            # se filtraba directo al chat. Reemplazamos por mensaje user-friendly
+            # y loggeamos el original en web.log para debug.
+            _sanitized_msg = _sanitize_error_for_user(exc, phase="retrieve")
+            print(
+                f"[chat-error-sanitized] phase=retrieve "
+                f"exc_type={type(exc).__name__} "
+                f"original={str(exc)[:200]!r} "
+                f"sent_to_user={_sanitized_msg!r}",
+                flush=True,
+            )
+            yield _sse("error", {"message": _sanitized_msg})
             # BUG #31 wave-2 (2026-04-28): top_score=0.0 dispara fallback
             # cluster en frontend (Google/YouTube/Wikipedia) — sin esto el
             # user ve solo el banner de error rojo sin escape hatch.
@@ -11117,7 +11403,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 f"messages_so_far={len(tool_messages)}",
                 flush=True,
             )
-            yield _sse("error", {"message": f"LLM falló: {exc}"})
+            yield _sse("error", {"message": _sanitize_error_for_user(exc, phase="tool_decision")})
             # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31
             return
@@ -11196,6 +11482,17 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # el costo es un regex scan por emit. Buffer adds ~1 palabra
         # de lag al streaming, irrelevante para UX.
         iberian = _IberianLeakFilter()
+        # 2026-04-28 wave-7: PII redaction filter al final del pipeline.
+        # Cubre el caso de chunks split (label + valor llegan en chunks
+        # distintos) que el iberian filter ya redacta inline pero solo
+        # mismo-chunk. Greppable: incrementa pii.
+        pii_filter = _PiiRedactFilter()
+
+        def _emit(token_text: str) -> str:
+            """Helper: pasa token_text por el pii_filter y devuelve lo
+            que se debe yieldear (puede ser '' si está holdeado)."""
+            return pii_filter.feed(token_text)
+
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
         try:
@@ -11225,8 +11522,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 if filtered:
                     cleaned = iberian.feed(filtered)
                     if cleaned:
-                        parts.append(cleaned)
-                        yield _sse("token", {"delta": cleaned})
+                        emit_text = _emit(cleaned)
+                        if emit_text:
+                            parts.append(emit_text)
+                            yield _sse("token", {"delta": emit_text})
             # Flush raw_tool_filter primero (puede emitir clarificación).
             raw_tail = raw_tool_filter.flush()
             if raw_tail:
@@ -11234,26 +11533,46 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 if filtered_raw_tail:
                     cleaned_raw_tail = iberian.feed(filtered_raw_tail)
                     if cleaned_raw_tail:
-                        parts.append(cleaned_raw_tail)
-                        yield _sse("token", {"delta": cleaned_raw_tail})
+                        emit_text = _emit(cleaned_raw_tail)
+                        if emit_text:
+                            parts.append(emit_text)
+                            yield _sse("token", {"delta": emit_text})
             # Flush any tail that was held back waiting for a close-paren.
             tail = stripper.flush()
             if tail:
                 cleaned_tail = iberian.feed(tail)
                 if cleaned_tail:
-                    parts.append(cleaned_tail)
-                    yield _sse("token", {"delta": cleaned_tail})
+                    emit_text = _emit(cleaned_tail)
+                    if emit_text:
+                        parts.append(emit_text)
+                        yield _sse("token", {"delta": emit_text})
             # Final drain del buffer iberian (residual que no vio boundary).
             final_tail = iberian.flush()
             if final_tail:
-                parts.append(final_tail)
-                yield _sse("token", {"delta": final_tail})
+                emit_text = _emit(final_tail)
+                if emit_text:
+                    parts.append(emit_text)
+                    yield _sse("token", {"delta": emit_text})
+            # Final drain del PII filter (cualquier label sin valor que
+            # quedó en buffer al cierre del stream).
+            pii_tail = pii_filter.flush()
+            if pii_tail:
+                parts.append(pii_tail)
+                yield _sse("token", {"delta": pii_tail})
             # 2026-04-28 wave-5: log si emitimos clarificación de raw tool call.
             if raw_tool_filter._was_raw_tool_call:
                 print(
                     f"[chat-raw-tool-call] LLM leaked tool-call syntax — "
                     f"replaced with clarification. tools_fired={tool_names_called or 'none'} "
                     f"is_propose={is_propose_intent}",
+                    flush=True,
+                )
+            # 2026-04-28 wave-7: log si redactamos PII.
+            if pii_filter._redact_count > 0:
+                print(
+                    f"[chat-pii-redact] redacted {pii_filter._redact_count} "
+                    f"PII pattern(s) from response. tools_fired="
+                    f"{tool_names_called or 'none'}",
                     flush=True,
                 )
         except Exception as exc:
@@ -11299,7 +11618,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     except Exception as _bg_exc:
                         print(f"[ollama-auto-recovery] error: {_bg_exc!r}", flush=True)
                 threading.Thread(target=_bg_restart, daemon=True, name="ollama-auto-recovery").start()
-            yield _sse("error", {"message": f"LLM falló: {exc}"})
+            yield _sse("error", {"message": _sanitize_error_for_user(exc, phase="synthesis")})
             # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31
             return

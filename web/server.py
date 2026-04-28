@@ -386,6 +386,12 @@ def _detect_weather_explicit_location_intent(q: str) -> tuple[str, dict] | None:
     for tail in (" hoy", " mañana", " ahora", " ahorita"):
         if loc.lower().endswith(tail):
             loc = loc[: -len(tail)].strip()
+    # 2026-04-28 wave-4: strip trailing preposiciones que quedaron pegadas
+    # cuando el regex non-greedy capturó "Mendoza para" en "clima en Mendoza
+    # para mañana". Una prep al final NUNCA es parte del nombre de ciudad.
+    for prep in (" para el", " para", " de", " en", " hasta"):
+        if loc.lower().endswith(prep):
+            loc = loc[: -len(prep)].strip()
     if not loc or len(loc) < 2:
         return None
     return ("weather", {"location": loc})
@@ -860,11 +866,54 @@ def _format_reminders_block(raw: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _format_calendar_block(raw: str) -> str:
+# Mapeo de date_labels en inglés (formato icalBuddy) → español. icalBuddy
+# emite "today" / "tomorrow" / "day after tomorrow" para fechas relativas
+# corto plazo, y YYYY-MM-DD o "lunes, abril 28, 2026" para fechas lejanas.
+# El LLM (qwen2.5:7b) traducía "tomorrow" a "mañana" pero NO se daba
+# cuenta de la inconsistencia con la pregunta del user ("hoy"). Pre-fix
+# 2026-04-28 (Playwright autónomo): pregunta "qué tengo agendado para
+# hoy específicamente" → respuesta "- Psiquiatra (mañana)" sin
+# disclaimer de que NO había nada hoy. Forzar el label en español + tag
+# relativo explícito le da al LLM el anclaje temporal que le faltaba.
+_CALENDAR_LABEL_ES = {
+    "today": "HOY",
+    "tomorrow": "MAÑANA",
+    "day after tomorrow": "PASADO MAÑANA",
+}
+
+
+def _translate_calendar_label(date_label: str, time_range: str = "") -> str:
+    """Normaliza un date_label de icalBuddy a español y, cuando es un
+    label relativo, ANCLA el tag absoluto entre corchetes para que el LLM
+    no confunda "tomorrow" con "hoy". Retorna string vacío si no hay
+    label útil.
+    """
+    if not date_label:
+        return ""
+    low = date_label.strip().lower()
+    if low in _CALENDAR_LABEL_ES:
+        # Tag explícito en MAYÚSCULAS — llama atención del LLM y se
+        # mantiene incluso si el modelo lo cita literal.
+        return _CALENDAR_LABEL_ES[low]
+    # icalBuddy también puede devolver "Wednesday, April 30, 2026" o un
+    # YYYY-MM-DD plano para fechas más lejanas. No reformateamos —
+    # devolvemos como está; el LLM puede leerlo igual.
+    return date_label.strip()
+
+
+def _format_calendar_block(raw: str, now: datetime | None = None) -> str:
     """Render calendar events as a bulleted list. Does NOT dedup — the
     same recurring event across multiple days must show up N times so the
     user sees 'cumpleaños de Astor' twice if it falls on two rendered
     dates.
+
+    Header incluye la fecha de "hoy" (DD/MM/YYYY + día de la semana en
+    español) para que el LLM tenga anclaje temporal explícito al
+    interpretar items con date_label relativo. Pre-2026-04-28 sólo se
+    emitía "### Calendario (N eventos)" sin fecha → el LLM no podía
+    distinguir "hoy" en la pregunta del user vs "today/tomorrow" en los
+    items, y caía en respuestas crudas tipo "- Psiquiatra (mañana)" para
+    "qué tengo hoy".
     """
     try:
         data = json.loads(raw)
@@ -872,17 +921,39 @@ def _format_calendar_block(raw: str) -> str:
         return f"### Calendario\n{raw}\n"
     if not isinstance(data, list):
         return f"### Calendario\n{raw}\n"
+
+    # Día actual para el header — usamos el now inyectado (testeable) o
+    # datetime.now() del huso local. _DAYS_ES traduce el nombre del
+    # weekday inglés (datetime.strftime("%A")) a español rioplatense.
+    if now is None:
+        now = datetime.now()
+    _DAYS_ES = {
+        "Monday": "lunes", "Tuesday": "martes", "Wednesday": "miércoles",
+        "Thursday": "jueves", "Friday": "viernes", "Saturday": "sábado",
+        "Sunday": "domingo",
+    }
+    today_str = f"{_DAYS_ES.get(now.strftime('%A'), now.strftime('%A').lower())} {now.strftime('%d/%m/%Y')}"
+
     if not data:
-        return "### Calendario\n_Sin eventos en el horizonte._\n"
+        return f"### Calendario (hoy: {today_str})\n_Sin eventos en el horizonte._\n"
 
     # Count explícito en header (ver comentario en _format_reminders_block).
     valid_events = [ev for ev in data if isinstance(ev, dict) and str(ev.get("title", "")).strip()]
-    header = f"### Calendario ({len(valid_events)} evento{'s' if len(valid_events) != 1 else ''})"
+    header = (
+        f"### Calendario (hoy: {today_str} · "
+        f"{len(valid_events)} evento{'s' if len(valid_events) != 1 else ''})"
+    )
     lines: list[str] = [header]
+    has_today = False
     for ev in valid_events:
         title = str(ev.get("title", "")).strip()
-        date_label = str(ev.get("date_label", "")).strip()
+        date_label = _translate_calendar_label(
+            str(ev.get("date_label", "")).strip(),
+            str(ev.get("time_range", "")).strip(),
+        )
         time_range = str(ev.get("time_range", "")).strip()
+        if date_label == "HOY":
+            has_today = True
         parts: list[str] = []
         if date_label:
             parts.append(date_label)
@@ -893,6 +964,11 @@ def _format_calendar_block(raw: str) -> str:
             lines.append(f"- {prefix} · {title}")
         else:
             lines.append(f"- {title}")
+    # Hint explícito al LLM cuando la lista NO tiene eventos para HOY.
+    # Sin esto, el LLM ve "- MAÑANA · Psiquiatra" y lo cita literal sin
+    # aclarar que la respuesta a "qué tengo hoy" es "nada hoy".
+    if valid_events and not has_today:
+        lines.append("_(no hay eventos hoy; los items de arriba son posteriores)_")
     return "\n".join(lines) + "\n"
 
 
@@ -1788,7 +1864,7 @@ _WEB_SYSTEM_PROMPT_V1 = (
 # del CONTEXTO ("María es tu hermano"). Endurecemos REGLA 0 para
 # incluir portugués e italiano explícitamente (contagion bajo fast-path
 # WA con contactos brasileros).
-_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.b — DATOS TRANSACCIONALES (excepción a REGLA 1): cuando la pregunta pide datos numéricos/identificativos específicos — montos, fechas exactas, comercios, categorías, items de transacción (gastos, tarjetas, mails, eventos, recordatorios, movimientos, consumos) — NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo una sección de tool fresca: ### Gastos, ### Tarjetas, ### Mails, ### Calendario, ### Reminders, ### Clima, ### WhatsApp, ### Google Drive. Si esa sección NO está, o está pero vacía/sin el dato pedido, respondé textualmente: "No tengo data fresca de [X] — el último export del banco/cuenta puede no estar al día." y CORTÁ ahí. PROHIBIDO en este caso: extraer "últimos consumos" de un Gmail digest viejo, citar montos de un FinOps report, mezclar gastos cargados manualmente en MOZE con consumos de tarjeta del banco. Si hay AMBAS secciones (### Gastos de MOZE + ### Tarjetas del banco) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas; si no menciona, usá la que tenga el dato pedido.\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
+_WEB_SYSTEM_PROMPT_V2 = 'Eres un asistente de consulta sobre las notas personales de Obsidian del usuario. NO sos un modelo de conocimiento general.\n\nREGLA 0 — IDIOMA: respondé SIEMPRE en español rioplatense. PROHIBIDO emitir tokens en portugués, inglés, italiano, ni otros idiomas/alfabetos (汉字, русский, etc.); caracteres fuera del alfabeto latino sólo se permiten dentro de una cita literal entre comillas. Si el CONTEXTO contiene mensajes en otros idiomas (ej. WhatsApp con contactos brasileros), traducilos al responder. Si la pregunta viene en otro idioma, traducila y respondé en español.\n\nREGLA 1 — ENGANCHÁTE CON EL CONTEXTO: el CONTEXTO de abajo es lo que el retriever consideró más cercano. Resumí SIEMPRE lo que aporta, aun si es breve o tangencial. Preguntas tipo "¿tengo algo sobre X?" se responden afirmativo apenas X aparezca en título o cuerpo — listá brevemente. Si el CONTEXTO es pobre, describí lo que sí aparece ("las notas mencionan X pero no detallan Y"). PROHIBIDO refusal tipo "no tengo información" — siempre devolvé el mejor resumen posible del CONTEXTO. Fuera del CONTEXTO no inventes (ver REGLA 3).\n\nREGLA 1.b — DATOS TRANSACCIONALES FINANCIEROS (excepción ESPECÍFICA y ACOTADA a REGLA 1): SOLO aplica cuando la pregunta nombra EXPLÍCITAMENTE banco/tarjeta/visa/mastercard/amex/MOZE/dolares/pesos/USD/ARS/montos/consumos/movimientos. En esos casos: NUNCA inventes ni copies de notas tangenciales. SOLO cita números/fechas/comercios que aparecen literalmente bajo ### Gastos o ### Tarjetas. Si esas secciones NO están, o están pero vacías, respondé "No tengo data fresca de [X] — el último export del banco puede no estar al día." y CORTÁ ahí. Si hay AMBAS secciones (MOZE + Tarjetas) y la pregunta menciona "tarjeta/visa/master/amex/crédito", priorizá ### Tarjetas. Para CALENDARIO/REMINDERS/MAILS/WHATSAPP/CLIMA/DRIVE — citá literal de la sección correspondiente cuando esté presente, pero NUNCA uses el template de "data fresca/export" (esos no tienen "exports" — los devolvés ya frescos via tool calls).\n\nREGLA 1.b.1 — ALCANCE de REGLA 1.b (PROHIBICIÓN EXPLÍCITA): REGLA 1.b NO aplica a preguntas sobre notas, conceptos, temas, ideas, técnicas, proyectos, conocimiento, conceptos abstractos, métodos, frameworks, libros, autores, citas. Para esas: REGLA 1 (engancháte con el CONTEXTO). El template "No tengo data fresca de [X] — el último export del [...] puede no estar al día" está PROHIBIDO para queries que NO sean financieras explícitas. Si el vault no tiene matches sobre un concepto/técnica/tema, respondé en LENGUAJE NATURAL: "No encontré nada en tus notas sobre [X]. Probá buscar como [variante1] o [variante2], o agregá una nota si querés trackearlo." NO uses la palabra "export", NO digas "no tengo data fresca", NO menciones "el último [algo]".\n\nREGLA 2 — NO CITAR NOTAS INLINE: la UI ya muestra la lista de fuentes (nota, score, ruta) debajo. PROHIBIDO markdown links `[Título](ruta.md)`, nombres con extensión (`algo.md`), rutas PARA (`03-Resources/…`, `02-Areas/…`) ni el título completo como header. Referencias implícitas OK: "según tus notas", "en tu nota sobre X".\n\nREGLA 3 — MARCAR EXTERNO (excepcional, no rutinario): usá `<<ext>>...<</ext>>` SOLO para (a) conocimiento general externo al CONTEXTO (ej: \'React es una librería de UI de Meta\' si el CONTEXTO no tiene React), (b) opinión/inferencia tuya que NO se deriva del CONTEXTO, (c) link a docs oficiales permitido por REGLA 4.6. Parafraseo rutinario, reordenamientos, conectores (\'también\', \'además\', \'en resumen\'), síntesis — TODO eso NO lleva marcador. Marcar cada oración con `<<ext>>` es un BUG. Ante duda, NO marques.\n\nREGLA 4 — FORMATO: 2-4 oraciones o lista corta. Dato clave primero, contexto mínimo (qué hace, cómo se invoca) después. Si piden un comando, herramienta o parámetro Y el CONTEXTO tiene su uso (firma, ejemplo, en qué MCP vive), ese uso es OBLIGATORIO en la respuesta.\n\nREGLA 4.5 — PRESERVAR LINKS DEL CONTENIDO: URLs (http://, https://) y wikilinks ([[Nota]]) que vivan DENTRO del cuerpo de una nota son data, no citas-fuente — copialos LITERAL. REGLA 2 sólo prohíbe citar la ruta del chunk; los links internos son clickeables.\n\nREGLA 4.6 — LINK A DOCS OFICIALES (raro, MUY acotado): TOTALMENTE PROHIBIDO en queries sobre personas ("qué sabés de X", "hablame de Y"), eventos, recordatorios, mails, gastos, WhatsApp, calendar, o cualquier dato del vault. SOLO aplica cuando (a) la pregunta nombra EXPLÍCITAMENTE un software/herramienta/producto externo (ej. "cómo configuro OmniFocus", "qué features tiene Obsidian"), (b) el CONTEXTO del vault se queda corto, y (c) tenés certeza del dominio raíz oficial. Formato: `<<ext>>Más info: <dominio-raíz></ext>>`. En TODOS los demás casos NO agregues link externo, aunque la respuesta sea breve. Ante duda, NO lo incluyas.\n\nREGLA 5 — SEGUÍ EL HILO: es una conversación. Pronombres ("ella", "eso"), referencias elípticas ("y de X?", "profundizá") o temas asumidos se resuelven con los turns previos. No trates la pregunta como si empezara de cero.\n\nREGLA 6 — TRATAMIENTO: hablale DIRECTAMENTE al usuario en 2da persona, tuteo rioplatense ("vos", "tenés", "te"). El usuario ES quien pregunta. PROHIBIDO 3ra persona ("el usuario", "la hija del usuario", "le"). Traducí: "la hija del usuario" → "tu hija"; "las notas del usuario" → "tus notas".\n\nREGLA 7 — NO FUSIONAR PERSONAS: si el CONTEXTO menciona varias personas (ej. una "María" contacto + otra "María" de otro chat + un "Mario"), NUNCA mezcles sus atributos. Si no podés distinguir a quién pertenece cada dato, decí "hay varias personas con ese nombre en tus notas" y listá lo más seguro. PROHIBIDO inventar parentesco ("María es tu hermana/o") si el CONTEXTO no lo afirma LITERALMENTE con esa palabra — si una nota dice "mi prima María" y otra "María Fernández, colega", NO unifiques. Respetá el género/pronombre tal como aparece en cada cita — no los "corrijas" al género preguntado.'
 
 # Selector con fallback seguro a v1 si el env var toma un valor raro.
 _WEB_SYSTEM_PROMPT = (
@@ -2774,21 +2850,79 @@ def _ollama_chat_probe(timeout_s: float = 6.0) -> bool:
 
 
 def _ollama_restart_if_stuck() -> bool:
-    """Heal the ollama daemon via `brew services restart`. Returns True on
-    successful restart. Blocks 3-5s for the bounce.
+    """Heal the ollama daemon. Returns True on successful restart. Blocks
+    3-10s for the bounce.
+
+    Detect which deployment is running:
+      1. If `homebrew.mxcl.ollama` is loaded in launchd → use `brew services restart`
+      2. Else if Ollama.app is running → quit + reopen the app
+      3. Else → try kickstart of homebrew first (in case it just bootstrapped),
+         fallback to `open -a Ollama`.
+
+    Pre-2026-04-28 hardcoded `brew services restart`, falló silenciosamente
+    cuando el user usaba la .app version (sin homebrew daemon). Repro
+    Playwright detectó hangs recurrentes que no se auto-curaban porque el
+    restart no aplicaba al daemon real.
     """
+    # Step 1: kill all runners forcefully (the .app's serve will respawn them
+    # on next request). This handles the case where the runner is wedged but
+    # the serve itself is healthy.
     try:
         subprocess.run(
-            ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
-            check=True, capture_output=True, timeout=30,
+            ["pkill", "-9", "-f", "ollama runner"],
+            capture_output=True, timeout=5, check=False,
         )
-        # Wait up to 10s for the daemon to accept traffic again.
-        for _ in range(20):
-            if _ollama_alive(timeout=1.0):
-                return True
-            time.sleep(0.5)
     except Exception:
         pass
+
+    # Step 2: detect deployment and restart serve.
+    restarted = False
+    # 2a) Homebrew daemon path.
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0 and "homebrew.mxcl.ollama" in result.stdout:
+            try:
+                subprocess.run(
+                    ["/opt/homebrew/bin/brew", "services", "restart", "ollama"],
+                    check=True, capture_output=True, timeout=30,
+                )
+                restarted = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2b) Ollama.app path — quit + reopen.
+    if not restarted:
+        try:
+            # Kill all ollama processes (.app + serve + runner).
+            subprocess.run(
+                ["pkill", "-9", "-f", "ollama"],
+                capture_output=True, timeout=5, check=False,
+            )
+            # Brief pause for clean exit.
+            time.sleep(2)
+            # Reopen the .app (background launches the serve daemon).
+            subprocess.run(
+                ["open", "-a", "Ollama"],
+                capture_output=True, timeout=10, check=False,
+            )
+            restarted = True
+        except Exception:
+            pass
+
+    if not restarted:
+        return False
+
+    # Wait up to 12s for the daemon to accept traffic again (Ollama.app
+    # cold start takes 5-8s on Apple Silicon).
+    for _ in range(24):
+        if _ollama_alive(timeout=1.0):
+            return True
+        time.sleep(0.5)
     return False
 
 
@@ -5267,6 +5401,36 @@ def _replace_iberian_leaks(text: str) -> str:
     return out
 
 
+# 2026-04-28 wave-4: el LLM (qwen2.5:7b) tipea mal los nombres de archivos
+# canónicos del proyecto. Repro Playwright: pregunta "leé CLAUDE.md y
+# resumime", response empieza con "Basado en el contenido de `CLAIDE.md`..."
+# (transposición I↔U en el tokenizer). Normalizamos el filename a la forma
+# canónica via regex case-insensitive — corrige el typo sin afectar prosa.
+# Todos los archivos canónicos viven en project root o docs/ (ver
+# `_agent_tool_read_note` whitelist).
+_CANONICAL_FILENAME_TYPOS: tuple[tuple[re.Pattern, str], ...] = (
+    # CLAUDE typos: variantes de 5 letras con C+L+ (A|O) + (U|I) + (D|E)
+    # incluyendo CLAIDE, CLODE, CLAUE, CLAUD, CLODA, CLOUDE, etc.
+    (re.compile(r"\bCL[AO][UI]?D?E?\.md\b", re.IGNORECASE), "CLAUDE.md"),
+    # AGENTS typos: AGUNTS, AGNTS, AGENT, AGNETS, AGENS, etc.
+    (re.compile(r"\bAG[EU]?N?[ET]?[ST]?S?\.md\b", re.IGNORECASE), "AGENTS.md"),
+    # README typos: READEM, REAME, READMI, REDME, etc.
+    (re.compile(r"\bREA?D?[EM]?[EM]?[EI]?\.md\b", re.IGNORECASE), "README.md"),
+)
+
+
+def _normalize_canonical_filenames(text: str) -> str:
+    """Corrige typos del LLM sobre nombres canónicos de archivos del proyecto.
+    Idempotente sobre texto que ya tiene el filename correcto.
+    """
+    if not text or ".md" not in text.lower():
+        return text
+    out = text
+    for pat, canonical in _CANONICAL_FILENAME_TYPOS:
+        out = pat.sub(canonical, out)
+    return out
+
+
 class _IberianLeakFilter:
     """Streaming filter chained después de `_InlineCitationStripper` que
     reemplaza leaks portugueses/gallegos con su equivalente español.
@@ -5330,22 +5494,22 @@ class _IberianLeakFilter:
                 # El candidate es sólo el starter + espacios — no hay
                 # nada que emitir por ahora. Esperamos más chunks.
                 if len(self._buf) > self._MAX_HOLD:
-                    out = _replace_iberian_leaks(self._buf)
+                    out = _normalize_canonical_filenames(_replace_iberian_leaks(self._buf))
                     self._buf = ""
                     return out
                 return ""
             # Retener desde el starter; emitir todo lo anterior.
             to_emit = self._buf[:starter_start]
             self._buf = self._buf[starter_start:]
-            return _replace_iberian_leaks(to_emit)
+            return _normalize_canonical_filenames(_replace_iberian_leaks(to_emit))
         to_emit = candidate
         self._buf = self._buf[last_boundary + 1:]
-        return _replace_iberian_leaks(to_emit)
+        return _normalize_canonical_filenames(_replace_iberian_leaks(to_emit))
 
     def flush(self) -> str:
         tail = self._buf
         self._buf = ""
-        return _replace_iberian_leaks(tail)
+        return _normalize_canonical_filenames(_replace_iberian_leaks(tail))
 
 
 class _InlineCitationStripper:
@@ -5604,6 +5768,27 @@ _LEADING_PRONOUN_RE = re.compile(
 _SHORT_INTERROGATIVE_RE = re.compile(
     r"^(qué|que|cuál|cual|cómo|como|por\s+qué|por\s+que|"
     r"what|how|which|why)\b",
+    re.IGNORECASE,
+)
+
+
+# List-intent: query pide explícitamente una LISTA / ENUMERACIÓN amplia.
+# Cuando matchea, el endpoint sube k y rerank_pool en `multi_retrieve`
+# para devolver más fuentes — "mostrame todas las notas sobre X" con
+# k=4 starveaba al LLM, que terminaba alucinando o devolviendo respuestas
+# triviales. Pre-fix Playwright autónomo 2026-04-28: "mostrame todas las
+# notas relacionadas con RAG y embeddings" trajo solo 4 fuentes con
+# confidence 0.334 y el LLM alucinó "RAG (Rapid Application Generation)"
+# por falta de anclaje. Con k=12 + multi_query=True el retrieval cubre
+# decenas de notas reales del corpus y el LLM tiene contexto suficiente
+# para no inventar. NO matchea queries de "lista" cortas tipo "qué
+# tengo" (esos van por el pre-router de tools); este regex solo dispara
+# cuando hay un cuantificador explícito (todas/todos/varias/cuántas).
+_LIST_INTENT_RE = re.compile(
+    r"\b(todas|todos|cu[áa]ntas|cu[áa]ntos|enumera|listame|mostrame|"
+    r"dame|deja(?:me)?\s+ver)\s+(las|los|mis|tus|cu[áa]nt[oa]s)?\s*"
+    r"(notas|archivos|menciones|documentos|referencias|hilos|entradas|"
+    r"tareas|projectos|proyectos|recordatorios|reuniones)",
     re.IGNORECASE,
 )
 
@@ -9345,7 +9530,16 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # `error` para que el cliente cierre el spinner y libere
                 # el input. Pre-fix: error puro dejaba EventSource
                 # esperando indefinidamente.
-                yield _sse("done", {"error": True})
+                #
+                # Update 2026-04-28 (BUG #31 wave-2): incluir `top_score:
+                # 0.0` además de `error: true`. El frontend usa
+                # `top_score < 0.10` como gate para `appendFallbackCluster`
+                # (los 3 botones Google/YouTube/Wikipedia). Pre-fix sin
+                # ese campo el cliente NO mostraba el cluster cuando había
+                # error → el user veía el banner rojo y nada más, sin
+                # escape hatch. Con top_score=0.0 el frontend SÍ activa
+                # el fallback.
+                yield _sse("done", {"error": True, "top_score": 0.0})
                 return
             print("[ollama-preflight] recovered via restart", flush=True)
 
@@ -9571,10 +9765,26 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         search_question, set(), set())
                 except Exception:
                     _intent_for_log = None
+            # List-intent override (2026-04-28): si la query pide
+            # explícitamente una lista amplia ("mostrame todas las
+            # notas X", "cuántas notas tengo sobre Y"), subimos k y
+            # rerank_pool. k=4 era OK para queries de pregunta corta
+            # pero con queries de "lista" hacía que el LLM viera 4
+            # chunks y o (a) los repitiera sin contexto adicional, o
+            # (b) alucinara para llenar la respuesta. multi_query=True
+            # también: para "lista todas X" valen las paraphrases
+            # ("notas sobre X", "archivos con X", "menciones de X")
+            # — el costo de la 2da call al qwen2.5:3b reformer (1-3s)
+            # es aceptable para queries de exploración. Cap k=12 para
+            # que el contexto post-retrieve no explote num_ctx=4096.
+            _is_list_intent = bool(_LIST_INTENT_RE.search(search_question))
+            _retrieve_k = 12 if _is_list_intent else 4
+            _retrieve_pool = 20 if _is_list_intent else 5
+            _retrieve_multi_query = _is_list_intent
             result = multi_retrieve(
-                vaults, search_question, 4, None, history, None, False,
-                multi_query=False, auto_filter=True, date_range=None,
-                rerank_pool=5, exclude_paths=_exclude,
+                vaults, search_question, _retrieve_k, None, history, None, False,
+                multi_query=_retrieve_multi_query, auto_filter=True, date_range=None,
+                rerank_pool=_retrieve_pool, exclude_paths=_exclude,
                 exclude_path_prefixes=(
                     # Episodic memory: el writer dejó de escribir acá tras
                     # 2026-04-25 pero archivos viejos pueden seguir en el vault
@@ -9596,7 +9806,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             _t_retrieve_end = time.perf_counter()
         except Exception as exc:
             yield _sse("error", {"message": f"retrieve falló: {exc}"})
-            yield _sse("done", {"error": True})  # BUG #31 — emitir done
+            # BUG #31 wave-2 (2026-04-28): top_score=0.0 dispara fallback
+            # cluster en frontend (Google/YouTube/Wikipedia) — sin esto el
+            # user ve solo el banner de error rojo sin escape hatch.
+            yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31 — emitir done
             return
 
         # Pre-compute forced tools ONCE here so both the empty-bail and
@@ -9634,7 +9847,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         except Exception as exc:
             print(f"[chat] _detect_tool_intent failed: {type(exc).__name__}: {exc}", flush=True)
             yield _sse("error", {"message": f"detector de intents falló: {exc}"})
-            yield _sse("done", {"error": True})
+            # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
+            yield _sse("done", {"error": True, "top_score": 0.0})
             return
         _has_forced_tools = bool(_forced_tool_pairs)
 
@@ -10746,7 +10960,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 flush=True,
             )
             yield _sse("error", {"message": f"LLM falló: {exc}"})
-            yield _sse("done", {"error": True})  # BUG #31
+            # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
+            yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31
             return
 
         # Final streaming answer call: strip _WEB_TOOL_ADDENDUM and `tools=`
@@ -10880,7 +11095,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 flush=True,
             )
             yield _sse("error", {"message": f"LLM falló: {exc}"})
-            yield _sse("done", {"error": True})  # BUG #31
+            # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
+            yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31
             return
 
         full = "".join(parts)

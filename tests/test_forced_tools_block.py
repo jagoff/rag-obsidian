@@ -156,8 +156,17 @@ def test_calendar_ahead_renders_list_with_dates():
     assert out.count("cumpleaños de Astor") >= 2, (
         f"esperaba 2 apariciones (fechas distintas), got:\n{out}"
     )
-    # Fechas visibles
-    assert "day after tomorrow" in out or "2026-04-24" in out or "24/04" in out
+    # Fechas visibles. Post 2026-04-28 (Playwright autónomo): los labels
+    # relativos en inglés que vienen de icalBuddy (today / tomorrow / day
+    # after tomorrow) se traducen a español MAYÚSCULAS (HOY / MAÑANA /
+    # PASADO MAÑANA) para que el LLM tenga anclaje temporal explícito.
+    # Fechas absolutas ("25 abr 2026", YYYY-MM-DD) se preservan literal.
+    assert (
+        "PASADO MAÑANA" in out  # nuevo (traducido)
+        or "day after tomorrow" in out  # legacy literal
+        or "2026-04-24" in out
+        or "24/04" in out
+    )
     assert "25 abr 2026" in out or "2026-04-25" in out or "25/04" in out
 
 

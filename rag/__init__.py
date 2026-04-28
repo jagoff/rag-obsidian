@@ -35756,6 +35756,18 @@ _TEMPORAL_VIENE_IDIOM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 2026-04-28 wave-4: detector de queries de weather/forecast como
+# disqualifier de propose intent. "clima en X para mañana" cae bajo
+# branch 4 (has_explicit_time porque "mañana" matchea como time-of-day
+# adverb) → mal flag de propose intent → bypass del weather pre-router →
+# LLM emite "工具调用：propose_weather_forecast(...)" en chino. Guard
+# explícito al inicio de _detect_propose_intent corrige el routing.
+_WEATHER_QUERY_PREFIX_RE = re.compile(
+    r"\b(?:clima|tiempos?|pron[oó]stico|temperatur[ao]s?|"
+    r"qu[eé]\s+tiempo\s+(?:hace|va\s+a\s+hacer))\b",
+    re.IGNORECASE,
+)
+
 
 def _detect_propose_intent(q: str) -> bool:
     """Return True if `q` looks like a CREATE request (reminder or event).
@@ -35766,6 +35778,14 @@ def _detect_propose_intent(q: str) -> bool:
     route the turn to the tool-calling helper instead of query-RAG).
     """
     if not q:
+        return False
+    # 2026-04-28 wave-4: queries de clima/tiempo NUNCA son propose-intent.
+    # "mañana" en "clima en Mendoza para mañana" se interpretaba como
+    # explicit_time → propose_intent → bypass del weather pre-router.
+    # Repro Playwright: la query devolvía "工具调用：propose_weather_forecast(...)"
+    # en chino porque el LLM no podía rutear correctamente. Guard explícito
+    # acá previene el cross-fire.
+    if _WEATHER_QUERY_PREFIX_RE.search(q):
         return False
     if _PROPOSE_INTENT_RE.search(q):
         return True

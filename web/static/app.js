@@ -4480,7 +4480,20 @@ async function send(question, opts = {}) {
       // el gate, la lógica de `weakAnswer` dispara `↗ buscar en internet`
       // (link a Google) + `appendRelated` (YouTube). Absurdo para un
       // saludo; el backend ya dio una respuesta conversacional canned.
-      if (!hadProposal && !isMetachat && !isSourceSpecific && question && weakAnswer && !mentionMatched) {
+      // BUG #31 wave-2 (2026-04-28): cuando el backend emitió `error`
+      // antes del done (timeout LLM, ollama stuck, retrieve falló, etc.),
+      // `parsed.error === true` y `ragText` es null porque nunca llegó
+      // un token. Pre-fix: el banner rojo era lo único visible, sin
+      // escape hatch. Fix: tratar el caso "error real" igual que el
+      // low-conf-bypass — `appendFallbackCluster` muestra los 3
+      // botones (Google/YouTube/Wikipedia) sin necesitar `ragText`.
+      // Hace short-circuit antes de las otras gates para que el cluster
+      // sea lo principal que ve el user (no se mezcla con sources/
+      // YouTube random aunque vaultReallyFailed=true).
+      const isErrorTerminal = parsed.error === true;
+      if (isErrorTerminal && question) {
+        appendFallbackCluster(turn, question);
+      } else if (!hadProposal && !isMetachat && !isSourceSpecific && question && weakAnswer && !mentionMatched) {
         if (lowConfBypass) {
           appendFallbackCluster(turn, question);
         } else if (ragText) {
@@ -4509,7 +4522,11 @@ async function send(question, opts = {}) {
       // genéricos son ruido. Ver comentario arriba de los thresholds.
       // `isSourceSpecific` también bloquea YouTube — preguntar por
       // mails/calendar/reminders nunca debería terminar en una playlist.
-      if (!hadProposal && !isMetachat && !isSourceSpecific && question && vaultReallyFailed && !mentionMatched) {
+      // `isErrorTerminal` (BUG #31 wave-2): cuando ya mostramos el
+      // cluster fallback (Google/YouTube/Wikipedia 3-botones) arriba,
+      // appendRelated agregaría una segunda lista de videos genéricos
+      // redundante con el botón YouTube del cluster. Skip.
+      if (!hadProposal && !isMetachat && !isSourceSpecific && !isErrorTerminal && question && vaultReallyFailed && !mentionMatched) {
         appendRelated(turn, question);
       }
       const feedbackBar = parsed.turn_id

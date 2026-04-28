@@ -87,24 +87,59 @@ def _read_recent_query_latencies(window_minutes: int) -> tuple[list[float], list
 
 
 def _restart_ollama_daemon() -> tuple[bool, str]:
-    """Reinicia el daemon ollama via launchctl. Retorna (ok, detail).
+    """Reinicia el daemon ollama. Retorna (ok, detail).
 
-    Usa `launchctl kickstart -k gui/<uid>/homebrew.mxcl.ollama` que es
-    más liviano que `brew services restart` (no toca el plist) y respeta
-    KeepAlive=true del plist.
+    Detecta el deployment activo:
+      1. homebrew.mxcl.ollama loaded → kickstart launchctl
+      2. Ollama.app running (sin homebrew) → kill + open -a Ollama
+      3. Neither → fallback: kill todos + open -a Ollama (best effort)
+
+    Pre-2026-04-28 wave-4 hardcoded la ruta homebrew. Cuando el user
+    deshabilitó el plist (porque el daemon duplicado causaba hangs), el
+    watchdog quedó inútil. Auto-detección lo arregla.
     """
     try:
         uid = os.getuid()
     except Exception:
         return False, "no_uid"
+
+    # 1) Detect homebrew deployment.
     try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{uid}/homebrew.mxcl.ollama"],
-            capture_output=True, text=True, timeout=15, check=False,
+        check = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5, check=False,
         )
-        if result.returncode == 0:
-            return True, "kickstarted"
-        return False, f"rc={result.returncode}: {result.stderr.strip()[:80]}"
+        homebrew_loaded = (
+            check.returncode == 0
+            and "homebrew.mxcl.ollama" in check.stdout
+        )
+    except Exception:
+        homebrew_loaded = False
+
+    if homebrew_loaded:
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k",
+                 f"gui/{uid}/homebrew.mxcl.ollama"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if result.returncode == 0:
+                return True, "kickstarted_homebrew"
+        except Exception as exc:
+            pass  # fallthrough to .app path
+
+    # 2) Ollama.app path: kill all ollama procs then reopen.
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", "ollama"],
+            capture_output=True, timeout=5, check=False,
+        )
+        time.sleep(2)  # let processes exit cleanly
+        subprocess.run(
+            ["open", "-a", "Ollama"],
+            capture_output=True, timeout=10, check=False,
+        )
+        return True, "restarted_app"
     except Exception as exc:
         return False, f"exception: {exc!r}"
 

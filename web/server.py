@@ -5849,7 +5849,20 @@ _FOLLOWUP_CUES = re.compile(
     r"it\b|this\b|that\b|he\b|she\b|"
     r"y\s+(de|sobre|con|para|en)|"
     r"profundizá|profundiza|ampliá|amplia|seguí|segui|continuá|continua|"
-    r"más\s+(sobre|de|al\s+respecto)|mas\s+(sobre|de|al\s+respecto))\b",
+    r"más\s+(sobre|de|al\s+respecto)|mas\s+(sobre|de|al\s+respecto)|"
+    # 2026-04-28 wave-6: sync con _TOPIC_SHIFT_FOLLOWUP_RE en rag/__init__.py.
+    # Antes: detect_topic_shift veía "qué otros materiales..." como anaphoric
+    # (mantenía history) PERO _looks_like_followup retornaba False, así que el
+    # search_question quedaba raw → retrieve buscaba "materiales" sueltos sin
+    # anchor del turno anterior. Sincronizar acá hace que CONCAT(prev, current)
+    # sea el search-question, recuperando el contexto.
+    r"qu[eé]\s+otros?|qu[eé]\s+otras?|"
+    r"cu[aá]l\s+(?:era|fue|es|ser[ií]a|ser[ií]an)\s+(?:el|la|los|las)?|"
+    r"dame\s+(?:un|el|los|otro)|un\s+ejemplo|otro\s+ejemplo|"
+    r"explic[aá]me\s+(?:mejor|bien|m[aá]s|otra\s+vez)|"
+    r"resum[ií]me|tradu[cz]i?[ií]?(?:me|lo|la)?|"
+    r"y\s+despu[eé]s|y\s+entonces|y\s+ahora|"
+    r"recomend[aá]ri[aá]s|sugerir[ií]as)\b",
     re.IGNORECASE,
 )
 

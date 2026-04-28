@@ -13856,7 +13856,22 @@ _TOPIC_SHIFT_FOLLOWUP_RE = re.compile(
     r"y\s+(de|sobre|con|para|en|c[oó]mo|qu[eé])|"
     r"c[oó]mo\s+(lo|la|los|las)\s+\w+|"  # "como lo desactivo", "como la uso"
     r"profundiz[aá]|ampl[ií]a|segu[ií]|contin[uú]a|"
-    r"m[aá]s\s+(sobre|de|al\s+respecto))\b",
+    r"m[aá]s\s+(sobre|de|al\s+respecto)|"
+    # 2026-04-28 wave-6: follow-up phrases comunes en multi-turn detectadas
+    # via Playwright. "qué otros X me recomendarías" / "cuál era X" /
+    # "dame un ejemplo" / "explicame mejor" son CLARAMENTE referencias al
+    # turno anterior, pero el cosine cae en 0.36-0.39 (debajo del umbral
+    # 0.40 actual) porque las palabras vacías ("otros", "cuál", "dame") no
+    # cargan signal. Whitelist explícita.
+    r"qu[eé]\s+otros?|qu[eé]\s+otras?|"        # "qué otros materiales"
+    r"cu[aá]l\s+(?:era|fue|es|ser[ií]a|ser[ií]an)\s+(?:el|la|los|las)?|"  # "cuál era el primer punto"
+    r"dame\s+(?:un|el|los|otro)|"               # "dame un ejemplo"
+    r"un\s+ejemplo|otro\s+ejemplo|"             # "un ejemplo más"
+    r"explic[aá]me\s+(?:mejor|bien|m[aá]s|otra\s+vez)|"
+    r"resum[ií]me|"                             # "resumime eso"
+    r"tradu[cz]i?[ií]?(?:me|lo|la)?|"           # "traducíme/traducilo"
+    r"y\s+despu[eé]s|y\s+entonces|y\s+ahora|"  # "y después?"
+    r"recomend[aá]ri[aá]s|sugerir[ií]as)\b",   # "qué recomendarías"
     re.IGNORECASE,
 )
 

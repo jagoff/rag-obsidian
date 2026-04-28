@@ -206,10 +206,19 @@ def _fetch_weather_openmeteo(location: str = WEATHER_LOCATION) -> dict | None:
 
     country = location.split(",")[-1].strip().replace("+", " ") if "," in location else ""
     loc_str = f"{name},{country}" if country else name
+    # Eval 2026-04-28 BUG-2a: text_summary prominente para que el LLM lo
+    # eche en la síntesis. Sin este campo, el LLM solo extraía
+    # current.description + temp_C y omitía la ciudad.
+    text_summary = (
+        f"{loc_str}: {cur_desc} ({cur_temp}°C)"
+        if loc_str and cur_desc
+        else "Sin datos del clima"
+    )
     return {
         "location": loc_str,
         "current": {"description": cur_desc, "temp_C": cur_temp},
         "days": days,
+        "text_summary": text_summary,
     }
 
 
@@ -272,10 +281,20 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
     if not days:
         return _fetch_weather_openmeteo(location)
 
+    # Eval 2026-04-28 BUG-2a: text_summary prominente para que el LLM
+    # lo eche en la síntesis. Sin este campo, el LLM solo extraía
+    # current.description + temp_C y omitía la ciudad.
+    loc_display = location.replace("+", " ").strip()
+    text_summary = (
+        f"{loc_display}: {current} ({temp_c}°C)"
+        if loc_display and current
+        else "Sin datos del clima"
+    )
     return {
-        "location": location.replace("+", " "),
+        "location": loc_display,
         "current": {"description": current, "temp_C": temp_c},
         "days": days,
+        "text_summary": text_summary,
     }
 
 

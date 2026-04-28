@@ -341,6 +341,74 @@ def _detect_read_note_intent(q: str) -> tuple[str, dict] | None:
     return ("read_note", {"path": path})
 
 
+# Eval 2026-04-28 BUG-2b: queries "clima en CIUDAD" disparaban 4 tools
+# en paralelo (weather + reminders + calendar + wa_pending) porque
+# "hoy" matchea _PLANNING_PAT. Cuando el user es explícito sobre la
+# ciudad, queremos SOLO weather con esa location, sin morning-brief
+# noise. Patron conservador: requiere "clima/tiempo/pronóstico" + "en/de/para" + nombre.
+_WEATHER_LOCATION_RE = re.compile(
+    r"\b(?:clima|tiempos?|pron[oó]stico|temperatur[ao])\s+"
+    r"(?:hoy\s+)?(?:en|de|para|para\s+el?)\s+"
+    r"(?P<loc>[A-ZÁÉÍÓÚÑ][\wáéíóúñÁÉÍÓÚÑ ]{2,40}?)"
+    r"(?=\s*(?:\?|$|hoy|mañana|hoy\s+a))",
+    re.IGNORECASE,
+)
+
+
+def _detect_weather_explicit_location_intent(q: str) -> tuple[str, dict] | None:
+    """Detect 'clima/tiempo en CIUDAD' patterns. Returns ('weather', {'location': X})
+    si matchea, None si no. Cuando matchea, debe forzar SOLO weather sin
+    disparar morning-brief tools.
+
+    Conservative: requiere keyword ('clima'/'tiempo'/'pronóstico') + preposición
+    ('en'/'de'/'para') + nombre que arranque con mayúscula. Falsos positivos
+    son peor que falsos negativos.
+    """
+    if not q or not q.strip():
+        return None
+    m = _WEATHER_LOCATION_RE.search(q)
+    if not m:
+        return None
+    loc = (m.group("loc") or "").strip()
+    if not loc:
+        return None
+    return ("weather", {"location": loc})
+
+
+# Eval 2026-04-28 BUG-3: queries "qué WA programados" se ruteaban a
+# whatsapp_pending (incoming) en vez de whatsapp_list_scheduled
+# (outgoing). Causa: la palabra "mañana" matcheaba _PLANNING_PAT del
+# whatsapp_pending. Fix: helper específico que detecta keywords claros
+# de "mensajes que YO programé" y fuerza whatsapp_list_scheduled.
+_WA_LIST_SCHEDULED_TRIGGER_RE = re.compile(
+    r"\b(?:programad\w*|scheduled|"
+    r"(?:quedan|que\s+quedan)\s+por\s+mandar|"
+    r"pendientes?\s+de\s+mandar|"
+    r"qu[eé]\s+(?:program[eé]|tengo\s+programado\w*))\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_whatsapp_list_scheduled_intent(q: str) -> tuple[str, dict] | None:
+    """Detect 'qué mensajes WA programados / quedan por mandar' patterns.
+
+    OUTGOING que YO programé (símil a whatsapp_list_scheduled), NO confundir
+    con whatsapp_pending (INCOMING sin contestar). Conservative: solo dispara
+    con keywords explícitos.
+
+    Returns ('whatsapp_list_scheduled', {}) si matchea, None si no.
+    """
+    if not q or not q.strip():
+        return None
+    if not _WA_LIST_SCHEDULED_TRIGGER_RE.search(q):
+        return None
+    # Sanity: la query debe tocar el dominio WhatsApp. Aceptamos plurales
+    # ("wsps", "wzps") y variantes como "whatsapp"/"whatsapps".
+    if not re.search(r"\b(?:whats\w*|wzps?|wsps?|mensajes?)\b", q, re.IGNORECASE):
+        return None
+    return ("whatsapp_list_scheduled", {})
+
+
 def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     """Deterministic keyword → tool routing. Returns (name, args) tuples
     to execute BEFORE the LLM tool-deciding call. Empty list = no forced
@@ -359,6 +427,16 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     _read = _detect_read_note_intent(q)
     if _read is not None:
         return [_read]
+    # weather con location explícita tiene prioridad: skipea morning-brief
+    # spurioso disparado por "hoy"/"mañana" en _PLANNING_PAT.
+    _wx = _detect_weather_explicit_location_intent(q)
+    if _wx is not None:
+        return [_wx]
+    # whatsapp_list_scheduled tiene prioridad: keywords claros de "outgoing
+    # que YO programé" no deben disparar whatsapp_pending por "mañana".
+    _wa_sched = _detect_whatsapp_list_scheduled_intent(q)
+    if _wa_sched is not None:
+        return [_wa_sched]
     out: list[tuple[str, dict]] = []
     for name, args, rx in _TOOL_INTENT_COMPILED:
         if not rx.search(q):
@@ -863,13 +941,40 @@ def _format_finance_block(raw: str) -> str:
 
 
 def _format_weather_block(raw: str) -> str:
-    """Weather tool already returns a human-friendly string — just wrap it
-    in a section header so it doesn't visually bleed into adjacent blocks.
+    """Render weather JSON output as human-readable markdown for the LLM.
+
+    Eval 2026-04-28 BUG-2a: el LLM no mencionaba la ciudad porque la
+    location quedaba enterrada en el JSON. Fix: parsear y exponer un
+    text_summary "Ciudad: descripción (temp°C)" prominente.
     """
     body = (raw or "").strip()
     if not body:
         return "### Clima\n_Sin datos del clima._\n"
-    return f"### Clima\n{body}\n"
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        # No es JSON parseable, dejar el raw como antes.
+        return f"### Clima\n{body}\n"
+
+    if not isinstance(data, dict):
+        return f"### Clima\n{body}\n"
+
+    # Si el output ya tiene text_summary (post-fix), usarlo como header.
+    summary = data.get("text_summary")
+    if not summary and data.get("current"):
+        loc = data.get("location", "Ubicación no especificada")
+        cur = data["current"]
+        desc = cur.get("description", "Sin datos")
+        temp = cur.get("temp_C") or cur.get("temp")
+        summary = f"{loc}: {desc} ({temp}°C)" if temp else f"{loc}: {desc}"
+
+    # Render: summary (prominente) + JSON full por si el LLM quiere los días.
+    out = "### Clima\n"
+    if summary:
+        out += f"{summary}\n"
+    out += body  # mantiene el JSON crudo para el LLM si necesita días
+    out += "\n"
+    return out
 
 
 def _format_cards_block(raw: str) -> str:
@@ -10077,6 +10182,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # Serial bucket (vault-touching tools under GIL/MPS).
                 for _n, _a in _f_serial:
                     _t0 = time.perf_counter()
+                    # Eval 2026-04-28: inyectar el query original al post-LLM
+                    # para que los validators (_validate_calendar_recurrence,
+                    # _validate_reminder_*) puedan recuperar info que el LLM
+                    # dropeó.
+                    if _n in ("propose_calendar_event", "propose_reminder") and "_original_query" not in _a:
+                        _a["_original_query"] = question
                     try:
                         _res = TOOL_FNS[_n](**_a)
                     except Exception as _exc:
@@ -10092,6 +10203,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 if _f_parallel:
                     def _run_tool(name: str, args: dict):
                         _t0 = time.perf_counter()
+                        # Eval 2026-04-28: inyectar el query original (ver
+                        # comentario en el bucket serial arriba).
+                        if name in ("propose_calendar_event", "propose_reminder") and "_original_query" not in args:
+                            args["_original_query"] = question
                         try:
                             _r = TOOL_FNS[name](**args)
                         except Exception as _exc:
@@ -10467,6 +10582,12 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     yield _sse("status", {"stage": "tool", "name": _name, "args": _args})
                     _t_tool_start = time.perf_counter()
                     _fn = TOOL_FNS.get(_name)
+                    # Eval 2026-04-28: inyectar el query original al post-LLM
+                    # para que los validators (_validate_calendar_recurrence,
+                    # _validate_reminder_*) puedan recuperar info que el LLM
+                    # dropeó.
+                    if _name in ("propose_calendar_event", "propose_reminder") and "_original_query" not in _args:
+                        _args["_original_query"] = question
                     try:
                         if _fn is None:
                             _out = f"Error: tool '{_name}' no existe"
@@ -10498,6 +10619,10 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                         _name, _args = name_args
                         _t0 = time.perf_counter()
                         _fn = TOOL_FNS.get(_name)
+                        # Eval 2026-04-28: inyectar el query original (ver
+                        # comentario en el bucket serial arriba).
+                        if _name in ("propose_calendar_event", "propose_reminder") and "_original_query" not in _args:
+                            _args["_original_query"] = question
                         try:
                             if _fn is None:
                                 _out = f"Error: tool '{_name}' no existe"

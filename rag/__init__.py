@@ -31298,24 +31298,70 @@ def _agent_tool_search(query: str, k: int = 5) -> str:
 
 
 def _agent_tool_read_note(path: str) -> str:
-    """Leer el contenido completo de una nota del vault.
+    """Leer contenido de una nota del vault, con fallback a project root
+    para archivos especiales del proyecto (CLAUDE.md, AGENTS.md, README.md,
+    docs/*.md). Bug 2026-04-28: el LLM hallucina cuando el path no existe
+    en el vault. El fallback busca el archivo en el repo root antes de
+    devolver error.
 
     Args:
-        path: Ruta relativa al vault, por ej. "02-Areas/Coaching/Ikigai.md".
+        path: Ruta relativa al vault (ej. "02-Areas/Coaching/Ikigai.md") o
+            archivo especial del project root (ej. "CLAUDE.md").
 
     Returns:
-        Texto markdown completo, o mensaje de error si no existe.
+        Markdown completo de la nota, o mensaje de error si no existe en
+        ningún lugar.
     """
+    if not path or not isinstance(path, str):
+        return "Error: path inválido"
     if not path.endswith(".md"):
         return "Error: el path debe terminar en .md"
+
+    # Intento 1: vault path
     full = (VAULT_PATH / path).resolve()
     try:
         full.relative_to(VAULT_PATH.resolve())
     except ValueError:
         return "Error: path fuera del vault"
-    if not full.is_file():
-        return f"Error: nota no encontrada: {path}"
-    return full.read_text(encoding="utf-8", errors="ignore")
+
+    basename = Path(path).name
+    allowed_special = {"CLAUDE.md", "AGENTS.md", "README.md"}
+    is_docs = path.startswith("docs/") and path.endswith(".md")
+
+    if full.is_file():
+        content = full.read_text(encoding="utf-8", errors="ignore")
+        # Detección de placeholder: vault file pequeño (<200 bytes) que es
+        # solo un redirect tipo `@04-Archive/.../CLAUDE.md` apunta al archivo
+        # real. Si es uno de los archivos especiales whitelisted, fallback
+        # a project root en vez de devolver el placeholder de 1 línea.
+        is_placeholder = (
+            len(content) < 200
+            and content.lstrip().startswith("@")
+            and (basename in allowed_special or is_docs)
+        )
+        if not is_placeholder:
+            return content
+
+    # Intento 2: project root fallback para archivos especiales.
+    # Whitelist: CLAUDE.md, AGENTS.md, README.md (project root) +
+    # cualquier archivo bajo docs/ (referencias técnicas).
+    if basename in allowed_special or is_docs:
+        repo_root = Path(__file__).resolve().parent.parent
+        fallback = (repo_root / path).resolve()
+        try:
+            fallback.relative_to(repo_root)
+        except ValueError:
+            return f"Error: nota no encontrada: {path}"
+        if fallback.is_file():
+            return fallback.read_text(encoding="utf-8", errors="ignore")
+
+    # Ni vault ni project root: devolver mensaje claro para que el LLM
+    # NO hallucine. El mensaje incluye el path para que el LLM lo
+    # reporte al user en vez de inventar contenido.
+    return (
+        f"Error: nota '{path}' no encontrada en el vault ni en el project "
+        f"root. Sugerí al user que verifique el nombre o pase el path completo."
+    )
 
 
 def _agent_tool_list_notes(folder: str | None = None, tag: str | None = None, limit: int = 30) -> str:
@@ -35309,6 +35355,14 @@ _RECUR_WEEKDAY_MAP = {
 # Each entry is (pattern, replacement) passed to `re.sub` with IGNORECASE.
 # Tested empirically against `dateparser 1.4.0` on macOS / es-AR.
 _RIOPLATENSE_REWRITES: tuple[tuple[str, str], ...] = (
+    # Bug 2026-04-28: el "el" prefix antes de "DD de MES_ES" rompe
+    # dateparser.parse() en versiones actuales. Lo strippeamos como
+    # preproc para que la frase llegue limpia ("20 de septiembre").
+    (
+        r"\bel\s+(\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|"
+        r"agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b)",
+        r"\1",
+    ),
     # "18hs" / "18 hs" / "18h" / "18:30hs" → "18:00" / "18:30"
     # Handles bare "Xhs" by appending ":00"; leaves "X:Yhs" intact (just strips
     # the hs suffix). Only 1-2 digit hour blocks to avoid eating IDs/dates.
@@ -36660,6 +36714,58 @@ def _validate_reminder_when(
     return when_fixed, issues
 
 
+def _validate_reminder_title(
+    title_from_llm: str | None,
+    original_query: str | None,
+) -> tuple[str, list[str]]:
+    """Post-check: si el title del LLM es prefijo demasiado corto del
+    query original, intentar recuperar el objeto directo.
+
+    Bug 2026-04-28: qwen2.5:7b a veces extrae solo el verbo del title
+    ('regar' en vez de 'regar las plantas'). Heurística: si el title
+    es 1 palabra Y el query tiene 'recordame TITLE OBJ DIRECTO'
+    seguido de fecha/hora, recuperar 'TITLE OBJ DIRECTO'.
+
+    CONSERVADOR: solo activa si el title es muy corto (<3 palabras) Y
+    el query tiene una estructura clara post-verbo. Si dudoso, NO toca.
+
+    Returns:
+        (title_fixed, issues) — title_fixed puede ser igual al original.
+    """
+    title_fixed = (title_from_llm or "").strip()
+    issues: list[str] = []
+    query = (original_query or "").strip()
+    if not query or not title_fixed:
+        return title_fixed, issues
+
+    # Solo activar si el title es 1 palabra
+    if len(title_fixed.split()) > 1:
+        return title_fixed, issues
+
+    # Buscar en el query: "recordame VERBO ... DÍA/HORA"
+    # Patron: "recordame TITLE [palabras hasta] (el/los) (lunes|...|domingo|hoy|mañana|a las|en N)"
+    # Quantifier non-greedy ({1,5}?): si pongo greedy el regex come hasta
+    # el último anchor posible y deja "regar las plantas el sábado"; con
+    # non-greedy backtrack al primer anchor → "regar las plantas".
+    verb = title_fixed.lower()
+    pat = (
+        r"\brecord[aá](?:me|te|rme)?\s+"
+        rf"({re.escape(verb)}(?:\s+\w+){{1,5}}?)"
+        r"\s+(?:el|este|próximo|próxima|los|los?\s+\w+|en\s+|a\s+las\s+|hoy|mañana|"
+        r"lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|"
+        r"\d|por\s+la\s+(?:mañana|tarde|noche))"
+    )
+    m = re.search(pat, query, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        # Sanity: el candidate debe contener el title como primera palabra
+        if candidate.lower().split()[0] == verb:
+            issues.append(f"title expanded from '{title_fixed}' to '{candidate}'")
+            title_fixed = candidate
+
+    return title_fixed, issues
+
+
 def propose_reminder(
     title: str,
     when: str = "",
@@ -36688,6 +36794,23 @@ def propose_reminder(
         Error: `{kind, created:false, error, fields}`.
     """
     now = datetime.now()
+    # POST-CHECK 2026-04-28: title truncation (BUG-5 del eval).
+    # qwen2.5:7b a veces drop el objeto directo del title.
+    if _original_query:
+        _title_fixed, _title_issues = _validate_reminder_title(
+            title, _original_query
+        )
+        if _title_issues:
+            try:
+                _ambient_log_event({
+                    "cmd": "propose_reminder_title_fixed",
+                    "original_title": title,
+                    "fixed_title": _title_fixed,
+                    "issues": _title_issues,
+                })
+            except Exception:
+                pass
+        title = _title_fixed
     # Post-check 2026-04-28: si el LLM droppeó info temporal del `when`
     # (típicamente día concreto como "el sábado"), la recuperamos del
     # query original. Documentación + ejemplos en _validate_reminder_when.
@@ -36836,6 +36959,41 @@ def _find_duplicate_calendar_event(
     return None
 
 
+def _validate_calendar_recurrence(
+    recurrence_text_from_llm: str | None,
+    original_query: str | None,
+) -> tuple[str | None, list[str]]:
+    """Post-check: si el query original menciona cumple/cumpleaños/aniversario
+    pero el LLM no pasó recurrence_text='yearly', lo forzamos.
+
+    Bug 2026-04-28 (T6/T9 del eval autónomo): qwen2.5:7b ignora la guía
+    soft del system prompt para cumpleaños y deja recurrence_text=null.
+    Resultado: evento de un solo año (inútil para cumples). El helper
+    detecta el patrón en el query original y fuerza yearly.
+
+    Defensivo: solo activa si query menciona el patrón Y recurrence_text
+    está vacío. NO sobreescribe valores explícitos del LLM.
+
+    Returns:
+        (recurrence_fixed, issues) — recurrence_fixed es 'yearly' si se
+        detectó cumple sin recurrence, issues describen el cambio.
+    """
+    recurrence_fixed = (recurrence_text_from_llm or "").strip()
+    issues: list[str] = []
+    query = (original_query or "").strip()
+    if not query:
+        return recurrence_fixed or None, issues
+
+    has_birthday = bool(
+        re.search(r"\b(cumple|cumpleañ?os?|anivers[aá]rios?)\b",
+                  query, re.IGNORECASE)
+    )
+    if has_birthday and not recurrence_fixed:
+        issues.append("birthday/anniversary detected, forced recurrence=yearly")
+        recurrence_fixed = "yearly"
+    return (recurrence_fixed or None), issues
+
+
 def propose_calendar_event(
     title: str,
     start: str,
@@ -36845,6 +37003,7 @@ def propose_calendar_event(
     notes: str | None = None,
     all_day: bool = False,
     recurrence_text: str | None = None,
+    _original_query: str | None = None,
 ) -> str:
     """Agregar un evento a Calendar.app. Si la fecha parsea clara, se CREA
     automáticamente. Si es ambigua, vuelve como propuesta.
@@ -36871,6 +37030,24 @@ def propose_calendar_event(
         Error: `{kind, created:false, error, fields}`.
     """
     now = datetime.now()
+    # POST-CHECK 2026-04-28: si el query original tenía cumple/aniversario
+    # y el LLM no pasó recurrence_text="yearly", forzarlo. Símil al
+    # validator de propose_reminder.
+    if _original_query:
+        _rec_fixed, _rec_issues = _validate_calendar_recurrence(
+            recurrence_text, _original_query
+        )
+        if _rec_issues:
+            try:
+                _ambient_log_event({
+                    "cmd": "propose_calendar_recurrence_fixed",
+                    "original": recurrence_text,
+                    "fixed": _rec_fixed,
+                    "issues": _rec_issues,
+                })
+            except Exception:
+                pass
+        recurrence_text = _rec_fixed
     start_dt = _parse_natural_datetime(start, now=now) if start and start.strip() else None
     end_dt: datetime | None = None
     if end and end.strip():

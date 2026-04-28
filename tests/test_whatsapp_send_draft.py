@@ -1004,9 +1004,10 @@ def test_ollama_tool_client_has_separate_wider_timeout():
     assert srv._OLLAMA_TOOL_CLIENT is not srv._OLLAMA_STREAM_CLIENT
     # Streaming budget conservador — cortamos UX congelada rápido.
     assert srv._OLLAMA_STREAM_TIMEOUT == 45.0
-    # Tool-decision budget convergió a 45s post-audit ronda 2 (commit
-    # 2b7c0c1, 2026-04-25). Si vuelve a divergir, actualizar este assert.
-    assert srv._OLLAMA_TOOL_TIMEOUT == 45.0
+    # Tool-decision budget bumped a 90s post-eval autónomo del 2026-04-28:
+    # gmail/whatsapp_search/drive_search consistentemente timeouteaban en
+    # la 2da ronda con 45s. Si vuelve a bajar, actualizar este assert.
+    assert srv._OLLAMA_TOOL_TIMEOUT == 90.0
 
 
 def test_tool_addendum_mentions_whatsapp_send():

@@ -2462,7 +2462,16 @@ _OLLAMA_STREAM_CLIENT = ollama.Client(timeout=_OLLAMA_STREAM_TIMEOUT)
 # desde la perspectiva del user antes de fallar. qwen2.5 con
 # num_ctx=4096 tarda 1-3s warm + 8-10s cold-load; 45s cubre cold-load +
 # 1-2 retries internos del cliente sin colgar el chat 2 min entero.
-_OLLAMA_TOOL_TIMEOUT = 45.0
+#
+# Eval autónomo 2026-04-28 (12 queries vía Playwright): 45s no
+# alcanzaba para queries post-tool con outputs grandes. Concretamente
+# gmail_recent + whatsapp_search + drive_search consistentemente
+# timeouteaban en la 2da ronda (donde el LLM sintetiza el output del
+# tool en prosa) — observado 60-80s de wall time. Sube a 90s para
+# cubrir el caso. Si en el futuro queremos cap más agresivo, mejor
+# truncar el tool output ANTES de mandarlo al LLM (no tiene sentido
+# pasarle 30+ items con full body — pasarle un summary y los top-N).
+_OLLAMA_TOOL_TIMEOUT = 90.0
 _OLLAMA_TOOL_CLIENT = ollama.Client(timeout=_OLLAMA_TOOL_TIMEOUT)
 
 # Shared num_ctx for every call to the chat model from this server — the

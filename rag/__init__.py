@@ -43091,6 +43091,51 @@ def _wake_up_plist(rag_bin: str) -> str:
 """
 
 
+def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usado)
+    """Watchdog del web server — corre cada 60s, healthcheck HTTP +
+    catchup de plists nightly que se saltearon su window por Mac dormida.
+
+    Originalmente vivía en `scripts/com.fer.obsidian-rag-serve-watchdog.plist`
+    con paths hardcoded al repo (`~/repositories/obsidian-rag/scripts/...`).
+    Migrado a generación dinámica el 2026-04-27 (después del audit
+    subagent 2297bb6e que detectó el riesgo: si Fer mueve el repo, el
+    plist viejo apunta a un path que ya no existe).
+
+    El script bash `rag-serve-watchdog.sh` queda en el repo (es lógica
+    no-Python que se mantiene mejor como bash standalone). El plist
+    apunta a su path absoluto vía `Path(__file__).resolve().parent.parent
+    / "scripts" / "rag-serve-watchdog.sh"` — si el repo se mueve, el
+    siguiente `rag setup` regenera el plist con el path nuevo.
+
+    Schedule: `StartInterval=60` + `RunAtLoad=true` (corre al boot).
+    Lo de catchup de nightly plists se documenta dentro del script.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    watchdog_script = repo_root / "scripts" / "rag-serve-watchdog.sh"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-serve-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{watchdog_script}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/serve-watchdog.stdout.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/serve-watchdog.stderr.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
     """Return [(label, plist_filename, plist_xml), ...]."""
     return [
@@ -43184,6 +43229,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-ingest-calendar",
          "com.fer.obsidian-rag-ingest-calendar.plist",
          _ingest_calendar_plist(rag_bin)),
+        # Serve watchdog — antes en scripts/com.fer.obsidian-rag-
+        # serve-watchdog.plist con paths hardcoded; migrado a generación
+        # dinámica 2026-04-27. HTTP healthcheck del web server cada 60s
+        # + catchup de plists nightly que se saltearon (Mac dormida).
+        ("com.fer.obsidian-rag-serve-watchdog",
+         "com.fer.obsidian-rag-serve-watchdog.plist",
+         _serve_watchdog_plist(rag_bin)),
     ]
 
 

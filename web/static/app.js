@@ -2297,16 +2297,46 @@ function appendWhatsAppProposal(parent, payload) {
   textarea.placeholder = "Texto del mensaje";
   card.appendChild(textarea);
 
-  // Contact-lookup error surfaced inline.
+  // Error surfaced inline. Hay DOS familias de errores acá: (a) los de
+  // resolución del destinatario (fail ANTES de llegar al bridge — el
+  // contacto no existe, no tiene tel, etc.), y (b) los de envío
+  // efectivo (fail DESPUÉS de resolver — el bridge HTTP no está
+  // conectado a WhatsApp, timeout, etc.). Es importante distinguirlos
+  // en el copy: si decimos "no se pudo resolver el destinatario" cuando
+  // en realidad el contacto fue resuelto OK pero falló el envío, el
+  // user busca el bug en el lugar equivocado (ej. revisa Contactos
+  // cuando lo que tiene que hacer es re-escanear el QR del bridge).
+  // Bug detectado 2026-04-28 cuando bridge se desautenticó silenciosamente
+  // y todos los sends devolvían "send_failed" rendered como "no se pudo
+  // resolver el destinatario" — ver `bridge.log`/`Device logged out`.
   if (err) {
+    const errStr = String(err);
     const errMap = {
       "not_found":   `No encontré a "${fields.contact_name}" en tus Contactos ni como grupo. Probá con el nombre completo o pedile al user que sea más específico.`,
       "no_phone":    `El contacto "${fields.contact_name}" no tiene un número cargado en Contactos.`,
       "empty_query": `El agente no detectó a quién mandarlo.`,
       "ambiguous":   `Hay varios grupos que matchean "${fields.contact_name}" — decime cuál de los listados arriba.`,
       "bridge_db_unavailable": `El bridge de WhatsApp no está corriendo. Sin él no puedo buscar grupos.`,
+      "send_failed": `No pude enviar el mensaje a ${fields.full_name || fields.contact_name}. El bridge de WhatsApp no está conectado a WA — probablemente la sesión expiró y necesita re-escaneo del QR. Revisá el bridge (\`tail -f ~/.local/share/whatsapp-bridge/bridge.log\`) o re-autenticá. El destinatario está OK; el envío es lo que falló.`,
     };
-    const msg = errMap[err] || `No se pudo resolver el destinatario: ${err}`;
+    let msg;
+    if (errMap[errStr]) {
+      msg = errMap[errStr];
+    } else if (errStr.startsWith("send_failed:")) {
+      // `send_failed: <excerpt>` cuando el bridge tira excepción
+      // distinta a HTTP 5xx (ej. ConnectionRefused, timeout, DNS).
+      const detail = errStr.slice("send_failed:".length).trim();
+      msg = `No pude enviar el mensaje a ${fields.full_name || fields.contact_name}. El bridge respondió con un error: "${detail}". Probá re-autenticar el bridge (escaneá el QR de nuevo) y reintentá.`;
+    } else if (errStr.startsWith("lookup_failed:")) {
+      // `lookup_failed: <excerpt>` cuando osascript / Apple Contacts
+      // tira excepción al buscar el contacto.
+      const detail = errStr.slice("lookup_failed:".length).trim();
+      msg = `No pude buscar a "${fields.contact_name}" en tus Contactos: ${detail}. Es probable que macOS necesite permisos para Contacts.`;
+    } else {
+      // Genérico — NO prefijar con "no se pudo resolver" porque puede
+      // ser un error de cualquier etapa, no solo de resolución.
+      msg = `Error: ${errStr}`;
+    }
     card.appendChild(el("div", "proposal-warn", `⚠ ${msg}`));
   }
 

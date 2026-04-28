@@ -87,10 +87,11 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 5 negotiation tables (rag_negotiations, rag_negotiation_turns,
     # rag_negotiation_pending_sends, rag_style_fingerprints,
     # rag_behavior_priors_wa — WA Negotiation Auto-Pilot Fase 0) =
-    # 43 tables total.
+    # 44 tables total (43 + rag_promises agregada 2026-04-25 con la
+    # infra base del feat de promesas WhatsApp).
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 43
+    assert len(expected) == 44
     c.close()
 
 

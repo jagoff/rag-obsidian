@@ -5352,6 +5352,42 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS ix_rag_wa_tasks_ts ON rag_wa_tasks(ts)",
         ),
     ),
+    # Promesas WhatsApp pendientes (feat 2026-04-25). Detectamos frases
+    # como "después te aviso", "te llamo mañana", "en un rato lo reviso"
+    # tanto outbound (yo prometo a un contacto) como inbound (un contacto
+    # me promete) y agendamos un recordatorio en RagNet self-chat.
+    # Un signal pluggable (`rag_anticipate/signals/promises.py`) lee la
+    # tabla y dispara `proactive_push` cuando `due_ts <= now + 30min` y
+    # `status='pending'`. Auto-cierre: cuando hay nuevo msg outbound
+    # sustantivo (>20 chars, no-promesa) al `contact_jid`, marcamos
+    # `closed (reason='activity')`. Manual override via `rag promises`
+    # CLI subcomandos.
+    (
+        "rag_promises",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_promises ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " contact_jid TEXT NOT NULL,"
+            " contact_name TEXT,"
+            " promise_text TEXT NOT NULL,"
+            " direction TEXT NOT NULL,"
+            " due_ts TEXT,"
+            " due_confidence REAL,"
+            " source_msg_id TEXT,"
+            " source_chat_jid TEXT,"
+            " status TEXT NOT NULL DEFAULT 'pending',"
+            " reminder_sent_ts TEXT,"
+            " closed_ts TEXT,"
+            " closed_reason TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_ts ON rag_promises(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_due_ts ON rag_promises(due_ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_status ON rag_promises(status)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_promises_contact ON rag_promises(contact_jid)",
+        ),
+    ),
     (
         "rag_archive_log",
         (
@@ -54993,9 +55029,13 @@ from rag.integrations.whatsapp import (  # noqa: E402, F401
     _fetch_whatsapp_today,
     _fetch_whatsapp_unread,
     _fetch_whatsapp_window,
+    _has_promise_hint,
+    _parse_promise_when,
+    _PROMISE_REGEX_HINTS,
     _wa_chat_label,
     _wa_chat_month_link,
     _wa_extract_actions,
+    _wa_extract_promises,
     _wa_tasks_load_state,
     _wa_tasks_plist,
     _wa_tasks_save_state,

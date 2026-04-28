@@ -35573,7 +35573,13 @@ _METACHAT_RE = re.compile(
     r"^\s*¿?\s*(?:"
     # Greetings
     r"hola|holi|holis|buenas(?:\s+tardes|\s+noches|\s+d[ií]as)?|buen\s+d[ií]a|"
-    r"hi|hey|hello|saludos|qu[eé]\s+tal|qu[eé]\s+onda|c[oó]mo\s+(?:est[aá]s|and[aá]s|va)|"
+    r"hi|hey|hello|saludos|qu[eé]\s+tal|qu[eé]\s+onda|"
+    # 2026-04-28 wave-6: "cómo va" tightened — antes matchaba "cómo va a
+    # estar la semana?" como metachat (false positive). Ahora requiere que
+    # "cómo está/andás/va" sea la última cosa significativa antes del
+    # cierre — bloqueamos la continuación con "a estar/el clima/...".
+    r"c[oó]mo\s+(?:est[aá]s|and[aá]s)(?:\s+(?:hoy|tod[ao]|amig[oa]|che|loco))?(?!\s+\w)|"
+    r"c[oó]mo\s+va(?!\s+a\s+|\s+el\s|\s+la\s|\s+los\s|\s+las\s)|"
     # Casual check-ins (2026-04-28 wave-5 — "todo bien" antes ruteaba
     # a reminders_due porque "tengo recordatorios pendientes" matchea
     # confidence > weak. Bare check-ins son metachat, no queries.)

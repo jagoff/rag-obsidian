@@ -1666,3 +1666,58 @@ def test_app_js_wires_escape_to_close_contacts_popover():
         "con el popover abierto si cambia de idea"
     )
     assert 'hideContactsPopover()' in block
+
+
+# ── Eval regression tests (2026-04-28) ──────────────────────────────
+
+
+def test_weather_docstring_mentions_location_param():
+    """Eval 2026-04-28: el LLM no pasaba location="Buenos Aires" a weather.
+    Fix: docstring + addendum ahora son explícitos. Este test asegura que
+    no se vuelva a vaguear el docstring."""
+    from web.tools import weather
+    doc = weather.__doc__ or ""
+    # Debe mencionar location explícitamente con un ejemplo
+    assert "location" in doc.lower()
+    assert "Buenos Aires" in doc or "Mendoza" in doc, \
+        "docstring debe tener ejemplo de ciudad para que el LLM aprenda el patrón"
+
+
+def test_read_note_docstring_mentions_priority():
+    """Eval 2026-04-28: el LLM ignoraba read_note cuando user decía
+    "leé la nota X" y prefería search_vault. Fix: docstring ahora dice
+    PRIORIDAD explícita. Test guarda esa propiedad."""
+    from web.tools import read_note
+    doc = read_note.__doc__ or ""
+    assert "PRIORIDAD" in doc.upper() or "prioridad" in doc.lower()
+    # Debe mencionar los verbos triggers
+    text = doc.lower()
+    assert any(v in text for v in ["leé", "abrí", "mostrame", "lee"])
+
+
+def test_addendum_contrasts_wa_pending_vs_scheduled():
+    """Eval 2026-04-28: el LLM se confundía entre whatsapp_pending
+    (incoming) y whatsapp_list_scheduled (outgoing programados).
+    Fix: línea de contraste en _WEB_TOOL_ADDENDUM."""
+    from web.tools import _WEB_TOOL_ADDENDUM
+    text = _WEB_TOOL_ADDENDUM.lower()
+    assert "incoming" in text or "outgoing" in text, \
+        "el addendum debe contrastar pending (incoming) vs list_scheduled (outgoing)"
+
+
+def test_addendum_weather_has_location_example():
+    """Asegura que el addendum tiene ejemplo de cómo pasar location."""
+    from web.tools import _WEB_TOOL_ADDENDUM
+    text = _WEB_TOOL_ADDENDUM
+    assert "location=" in text, \
+        "el addendum debe tener un ejemplo concreto de location='X'"
+
+
+def test_addendum_mentions_read_note_routing():
+    """Asegura que el addendum tiene routing rule explícito para read_note."""
+    from web.tools import _WEB_TOOL_ADDENDUM
+    text = _WEB_TOOL_ADDENDUM.lower()
+    assert "read_note" in text
+    # Verbos triggers presentes
+    has_verbs = any(v in text for v in ["leé", "abrí", "mostrame", "lee la nota"])
+    assert has_verbs, "el addendum debe listar los verbos que disparan read_note"

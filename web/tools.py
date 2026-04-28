@@ -44,11 +44,12 @@ Routing por palabra clave (si aparece → llamá la tool):
 - pendiente/tarea/recordatorio/to-do/checklist → reminders_due
 - mail/correo/email/gmail/inbox → gmail_recent
 - evento/agenda/calendario/cita/reunión/mañana/próxima semana → calendar_ahead
-- clima/tiempo/lluvia/temperatura/pronóstico → weather
+- clima/tiempo/lluvia/temperatura/pronóstico → weather. **Si el user menciona una ciudad** ("clima en X", "pronóstico en X"), pasá `location='X'`. Sin location devuelve el default (Santa Fe). Ej: "cómo está el clima hoy en Buenos Aires" → weather(location='Buenos Aires').
 - google drive/drive/planilla/spreadsheet/sheet/doc/documento/presentación → drive_search(query='<keywords extraídos>'). Extraé los tokens útiles (nombres propios, sustantivos concretos) y descartá "busca", "decime", "en mi", "drive" — ej. "busca en mi drive qué me adeuda Alexis de la macbook pro" → drive_search(query='alexis macbook pro adeuda').
 - whatsapp/wzp/wsp + "chat pendiente"/"respuesta pendiente"/"qué tengo pendiente" → whatsapp_pending. Devuelve la LISTA de chats donde el user debe responder (último inbound sin reply). Sólo lista chats; NO busca en contenido. Usalo también en queries "qué tengo pendiente esta semana/hoy" — los chats pendientes cuentan como tarea pendiente semántica.
 - "qué me dijo X / qué me mandó X / cuándo hablamos de Y / el chat donde X mencionó Z / dónde charlamos sobre W" → whatsapp_search(query='<tema o palabras clave>', contact='<nombre opcional>'). Busca DENTRO del contenido de los mensajes WhatsApp (4500+ chunks indexados). Si el user nombra un contacto explícito ("qué me dijo Juan sobre la deuda") pasá `contact='Juan'` para filtrar; si la pregunta es genérica ("dónde charlamos sobre la mudanza") dejá `contact=None`. Es DISTINTO a `whatsapp_pending` — éste busca por CONTENIDO, no lista chats abiertos.
 - "qué hablamos con X / qué quedamos con X / leéme el chat con X / qué dijimos con X / fijate qué charlamos con X" → whatsapp_thread(contact_name='X', max_messages=15, days=7). Trae los últimos N mensajes LITERALES del chat 1:1 con X, en orden cronológico, leídos directo del bridge SQLite (no del corpus indexado). Distinto a `whatsapp_search` (que matchea por contenido) y `whatsapp_pending` (que lista chats sin responder): acá queremos el hilo tal cual para que el LLM parsee contexto (horas propuestas, decisiones, promesas, confirmaciones). Si después de leer el thread ves una fecha/hora clara propuesta para juntarse ("el jueves a las 4pm", "mañana 10hs"), encadená con `propose_calendar_event(title='Reunión con X', start='<fecha parseada>')` en la MISMA ronda — NO pidas confirmación intermedia al user; el propose_calendar_event ya muestra la card con [Crear].
+- "leé/abrí/mostrame/lee la nota <X>" (donde X es nombre o path) → read_note(path='<path>'). Resolvé el path: si el user dice solo el nombre sin ".md", agregalo (ej. "leé CLAUDE" → path='CLAUDE.md'). Esta tool SIEMPRE tiene prioridad cuando el user pide explícitamente leer una nota — NO uses search_vault como fallback.
 - para profundizar en una nota específica → read_note(path)
 - si ninguna aplica y necesitás más contexto del vault → search_vault
 
@@ -91,6 +92,7 @@ Enviar WhatsApp a terceros (acción destructiva — SIEMPRE pide confirmación):
 
 Gestionar mensajes WhatsApp YA programados (cancelar, reagendar, listar):
 - "qué mensajes tengo programados / qué wsps quedan por mandar / lista los mensajes pendientes" → whatsapp_list_scheduled(). Es un QUERY tool (NO emite card) — devuelve JSON con `{items: [{id, contact_name, scheduled_for_local, message_text_preview, ...}]}`. Resumí el listado en prosa concisa: "Tenés 3 mensajes programados: 1) a Grecia mañana 9:00 'feliz cumple', 2) a Oscar el viernes 14:30 ..., 3) ...". Si está vacío decí "No tenés mensajes programados". Por default trae solo `pending`; si el user pide "todos los que mandé este mes" pasá `status="all"` o el filtro específico (`sent`, `cancelled`, `failed`, etc.).
+- **CONTRASTE crítico**: `whatsapp_pending` = INCOMING sin respuesta (chats donde tengo que contestar). `whatsapp_list_scheduled` = OUTGOING que YO programé para enviar después. Keywords: "qué chats / a quién contestar" → pending. "qué programé / qué quedan por mandar" → list_scheduled.
 - "cancelá el mensaje a <Contacto> que programé" / "borrá el wsp programado a <Contacto>" / "no le mandes a <Contacto> el del <hint>" → propose_whatsapp_cancel_scheduled(contact_name="<Contacto>", when_hint="<hint opcional>"). Emite card con [Cancelar mensaje] / [Volver]. Si hay >1 pending para ese contacto y el user no dio hint claro, el tool devuelve `needs_clarification: true` + `candidates` — decile al user: "Tenés 2 programados para <Contacto>: a) el de mañana 9hs '...', b) el del viernes 14:30 '...'. ¿Cuál cancelo?". El `when_hint` es libre: "el de mañana", "el de la tarde", "el viernes".
 - "reagendá / cambiá / movéme el mensaje a <Contacto> para <nueva fecha>" → propose_whatsapp_reschedule_scheduled(contact_name="<Contacto>", new_when="<NL del nuevo horario>", when_hint="<hint opcional>"). El `new_when` lo parseamos con _parse_natural_datetime — pasá lo que el user dijo crudo ("el viernes 18hs", "mañana 14:30"). Si `new_when` está en el pasado o no parsea, la card sale con error y el user reformula.
 - En tu respuesta textual: card visible → 1-2 oraciones tipo "Te dejo el cancel armado, dale Cancelar para confirmar" / "Te dejo el reschedule armado para <hora simple>, dale Reagendar". Si vino error en la card, simplemente parafraseá el error ("No encontré ningún mensaje programado para <Contacto>").
@@ -131,13 +133,22 @@ def search_vault(query: str, k: int = 5) -> str:
 
 
 def read_note(path: str) -> str:
-    """Leer contenido completo de una nota del vault. path debe terminar en .md.
+    """Leer contenido completo de una nota del vault.
+
+    Usalo cuando el user pide explícitamente leer una nota por nombre
+    ("leé CLAUDE.md", "abrí la nota de Coaching", "mostrame Ikigai",
+    "lee la nota X"). Tiene PRIORIDAD sobre search_vault cuando el user
+    nombra un archivo concreto. NO uses search_vault como fallback —
+    si el user pidió leer una nota específica, usá esta tool.
 
     Args:
         path: Ruta relativa al vault (ej. "02-Areas/Coaching/Ikigai.md").
+            Si el user dice solo el nombre sin ".md", agregalo. Si es
+            ambiguo, pasá el nombre tal cual y la tool intentará
+            resolver.
 
     Returns:
-        Markdown completo de la nota, o mensaje de error.
+        Markdown completo de la nota, o mensaje de error si no existe.
     """
     return _agent_tool_read_note(path)
 
@@ -291,13 +302,20 @@ def calendar_ahead(days: int = 3) -> str:
 
 
 def weather(location: str | None = None) -> str:
-    """Pronóstico: hoy + 2 días.
+    """Pronóstico del tiempo: hoy + próximos 2 días.
+
+    Usalo cuando el user pregunta por el clima, temperatura, lluvia o
+    pronóstico. Si el user menciona una CIUDAD específica ("clima en
+    Buenos Aires", "cómo está el tiempo en Mendoza"), SIEMPRE pasá
+    `location='<ciudad>'` — sin parámetro devuelve la ubicación
+    configurada (default Santa Fe).
 
     Args:
-        location: Ciudad a consultar. Default: ubicación configurada.
+        location: Ciudad a consultar (ej. "Buenos Aires", "Mendoza",
+            "Córdoba"). Default None → usa WEATHER_LOCATION configurado.
 
     Returns:
-        JSON con condición actual + 3 días, o mensaje de error.
+        JSON con condición actual + pronóstico 3 días, o mensaje de error.
     """
     return _agent_tool_weather(location)
 

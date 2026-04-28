@@ -291,6 +291,56 @@ _TOOL_INTENT_COMPILED = tuple(
 )
 
 
+# Pre-router heuristic for read_note (eval 2026-04-28 fix). El LLM
+# tiende a ignorar read_note y prefiere search_vault aunque el user
+# pidió leer un archivo específico. Disparamos el tool a mano cuando
+# el patrón es clarísimo.
+#
+# Conservative match: SOLO dispara si hay (a) qualifier explícito
+# "la nota / el archivo / el md / el markdown" + nombre, O (b) un
+# nombre que termina en `.md`. Sin esto el regex levantaba "abrí
+# gmail" → read_note('gmail.md') (rompía test_web_tool_intent_plurals
+# y test_whatsapp_search_tool, eval 2026-04-28).
+_READ_NOTE_TRIGGER_RE = re.compile(
+    r"\b(?:le[eé]|abr[ií]|mostrame|muestra|mu[eé]strame|"
+    r"showme|show\s+me)\s+"
+    r"(?:"
+    # (a) qualifier-prefixed: "la nota CLAUDE", "el archivo notas",
+    # "el md plan", "la nota 02-Areas/Foo".
+    r"(?:la\s+nota|el\s+archivo|el\s+md|el\s+markdown)\s+"
+    r"([A-Za-z0-9_\-./áéíóúñÁÉÍÓÚÑ][A-Za-z0-9_\-./áéíóúñÁÉÍÓÚÑ]{1,79})"
+    r"|"
+    # (b) bare path con extensión `.md` explícita.
+    r"([A-Za-z0-9_\-./áéíóúñÁÉÍÓÚÑ][A-Za-z0-9_\-./áéíóúñÁÉÍÓÚÑ]{1,79}\.md)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _detect_read_note_intent(q: str) -> tuple[str, dict] | None:
+    """Detect 'leé la nota X / abrí X.md / mostrame el archivo X' patterns.
+
+    Returns ('read_note', {'path': resolved_path}) si matchea, None si no.
+
+    Conservative: solo dispara si el pattern es clarísimo (qualifier
+    explícito tipo "la nota / el archivo" o sufijo `.md`). False
+    positives son peor que false negatives — si dudoso, el LLM puede
+    igual elegir read_note vía el tool addendum.
+    """
+    if not q or not q.strip():
+        return None
+    m = _READ_NOTE_TRIGGER_RE.search(q)
+    if not m:
+        return None
+    raw = (m.group(1) or m.group(2) or "").strip()
+    if not raw:
+        return None
+    # Si no termina en .md, agregarlo. Y si el user pasó solo el nombre,
+    # asumimos que es relativo al root del vault.
+    path = raw if raw.lower().endswith(".md") else f"{raw}.md"
+    return ("read_note", {"path": path})
+
+
 def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     """Deterministic keyword → tool routing. Returns (name, args) tuples
     to execute BEFORE the LLM tool-deciding call. Empty list = no forced
@@ -302,6 +352,13 @@ def _detect_tool_intent(q: str) -> list[tuple[str, dict]]:
     """
     if not q:
         return []
+    # read_note tiene prioridad: si el user pidió explícitamente leer
+    # una nota específica, devolvemos eso solo y skippeamos las regex
+    # genéricas (que podrían disparar reminders_due / calendar_ahead /
+    # etc. spuriamente sobre la misma frase).
+    _read = _detect_read_note_intent(q)
+    if _read is not None:
+        return [_read]
     out: list[tuple[str, dict]] = []
     for name, args, rx in _TOOL_INTENT_COMPILED:
         if not rx.search(q):
@@ -1706,8 +1763,12 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
         # schema). Si en el futuro hace falta endurecer, mejor un
         # override DEDICADO por tipo de propose-intent que uno gigante
         # único — ver `_detect_propose_intent` para discriminar.
-        "Para reminders: si el user mencionó cualquier hint temporal "
-        "(día, hora, 'mañana'), pasalo en `when`. Si no hubo hint, "
+        "Para reminders: si el user mencionó CUALQUIER hint temporal "
+        "(día concreto como lunes/.../domingo, 'mañana'/'hoy'/'pasado mañana', "
+        "hora), pasalo EXACTAMENTE en `when` tal como lo dijo. NO truques al "
+        "`title` partes del hint temporal. Si el user dice 'recordame regar "
+        "el sábado a las 11am' → title='regar', when='el sábado a las 11am' "
+        "(NO when='a las 11am' sin el día). Si no mencionó ningún hint, "
         "dejá `when` vacío.\n\n"
         "Para cumples y aniversarios: usá `propose_calendar_event` "
         "(no reminder) con `all_day` true y `recurrence_text` 'yearly' "
@@ -1829,6 +1890,17 @@ def _warmup() -> None:
         start_memory_pressure_watchdog()
     except Exception as _exc:
         print(f"[warmup] memory-pressure watchdog skipped: {_exc}", flush=True)
+
+    # Latency degradation watchdog — detecta wedge del daemon ollama
+    # tras queries tool-heavy consecutivas y reinicia automáticamente.
+    # Eval 2026-04-28: tras 5-7 queries con tools, p95 sube de ~30s a
+    # ~70s. El watchdog detecta y bouncea el daemon. Lazy import para
+    # no romper si el módulo no existe (deploy parcial OK).
+    try:
+        from rag._ollama_health import start_latency_degradation_watchdog
+        start_latency_degradation_watchdog()
+    except Exception as _exc:
+        print(f"[warmup] ollama-health-watchdog skipped: {_exc}", flush=True)
 
     # WAL checkpointer — libera páginas del WAL cada 30s para que los
     # writers concurrentes (queries, behavior, cache) no peguen contra el
@@ -10064,9 +10136,19 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 # contestar "te dejo otras fuentes" en abstracto. Con el
                 # tool output reemplazando, el vault material se descartaba
                 # y el LLM no tenía de qué resumir.
+                # Tool output truncation (eval 2026-04-28 fix): outputs grandes de
+                # gmail/whatsapp_search/drive disparaban timeout de 45-90s en la 2da
+                # ronda del LLM. Recortamos a top-N items + summary para acelerar la
+                # síntesis. Lazy import para deploy parcial.
+                try:
+                    from rag._tool_output_helpers import truncate_tool_output_for_synthesis
+                except Exception:
+                    truncate_tool_output_for_synthesis = lambda name, raw, **kw: raw  # type: ignore
+
                 _datos_block = ""
                 for _n, _res, _ in _forced_results:
-                    _datos_block += "\n" + _format_forced_tool_output(_n, _res) + "\n"
+                    _res_truncated = truncate_tool_output_for_synthesis(_n, _res)
+                    _datos_block += "\n" + _format_forced_tool_output(_n, _res_truncated) + "\n"
                 _all_tools_empty = all(
                     _is_empty_tool_output(_n, _res)
                     for _n, _res, _ in _forced_results
@@ -10371,6 +10453,15 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 _round_parallel_max_ms = 0
                 _round_serial_sum_ms = 0
 
+                # Tool output truncation (eval 2026-04-28 fix): mismo motivo
+                # que en el pre-router (ver bloque `_datos_block` arriba) —
+                # los outputs grandes hacían que la 2da ronda del LLM
+                # timeoutiara. Lazy import para deploy parcial.
+                try:
+                    from rag._tool_output_helpers import truncate_tool_output_for_synthesis as _trunc_tool_out
+                except Exception:
+                    _trunc_tool_out = lambda name, raw, **kw: raw  # type: ignore
+
                 # Serial bucket first — vault search is the gating signal.
                 for _name, _args in _serial:
                     yield _sse("status", {"stage": "tool", "name": _name, "args": _args})
@@ -10393,7 +10484,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     tool_messages.append({
                         "role": "tool",
                         "name": _name,
-                        "content": _out,
+                        "content": _trunc_tool_out(_name, _out),
                     })
 
                 # Parallel bucket: emit all `tool` fan-out events first, then
@@ -10431,7 +10522,7 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                             tool_messages.append({
                                 "role": "tool",
                                 "name": _name,
-                                "content": _out,
+                                "content": _trunc_tool_out(_name, _out),
                             })
                     finally:
                         _ex.shutdown(wait=False)

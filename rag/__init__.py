@@ -23111,7 +23111,7 @@ def _wa_scheduled_truncate_preview(text: str, max_chars: int = 80) -> str:
 
 
 def whatsapp_list_scheduled(status: str | None = None) -> str:
-    """Listar mensajes de WhatsApp programados a futuro. NO crea ni cancela nada.
+    """Listar mensajes de WhatsApp **OUTGOING** que YO programé para enviar después. NO crea ni cancela nada.
 
     Es un query tool — el LLM la llama, lee el JSON resultado, y enuncia
     al user en prosa ("tenés 3 mensajes programados: 1) Grecia mañana
@@ -36584,6 +36584,82 @@ def _delete_calendar_event(event_uid: str) -> tuple[bool, str]:
 #   4. Calendar events auto-flip to all_day when no time marker detected
 #      in the start text (`_has_explicit_time`).
 
+# Patrones temporales para detectar info que el LLM puede dropear de
+# `when` cuando el user lo dijo en el query original. Bug del 2026-04-28:
+# query "recordame regar las plantas el sábado a las 11am" → LLM
+# pasaba when="a las 11am" (sin "el sábado") → reminder iba a mañana
+# en vez del sábado próximo. El post-check abajo lo recupera.
+_REMINDER_WEEKDAY_RE = re.compile(
+    r"\b(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b",
+    re.IGNORECASE,
+)
+_REMINDER_RELATIVE_DAY_RE = re.compile(
+    r"\b(?:hoy|ma[ñn]ana|pasado\s+ma[ñn]ana)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_reminder_when(
+    when_from_llm: str | None,
+    original_query: str | None,
+) -> tuple[str, list[str]]:
+    """Post-check: si el LLM droppeó info temporal del `when` que el
+    query original tenía, la recuperamos.
+
+    Casos detectados:
+      1. Query tiene día concreto (lunes/.../domingo) pero `when` no →
+         agrega el día al `when`.
+      2. Query tiene día relativo (hoy/mañana/pasado mañana) pero
+         `when` no → agrega.
+      (NO chequeamos hora porque el LLM rara vez dropea hora — el bug
+      observado siempre fue dropear día.)
+
+    Es defensivo: solo agrega tokens encontrados textualmente en el
+    query original. NO inventa nada. Si el query no menciona ningún
+    día/hora, retorna `when_from_llm` sin tocar.
+
+    Args:
+        when_from_llm: el valor de `when` que pasó el LLM (puede ser
+            vacío, None, o frase parcial).
+        original_query: el mensaje crudo del user (para extraer info
+            que el LLM perdió).
+
+    Returns:
+        `(when_fixed, issues)` — when_fixed es el `when` corregido,
+        issues es lista de strings descriptivos de qué se recuperó
+        (vacía si no hubo problemas).
+    """
+    when_fixed = (when_from_llm or "").strip()
+    issues: list[str] = []
+    query = (original_query or "").strip()
+    if not query:
+        return when_fixed, issues
+
+    # 1) Weekday concreto
+    has_weekday_in_query = bool(_REMINDER_WEEKDAY_RE.search(query))
+    has_weekday_in_when = bool(_REMINDER_WEEKDAY_RE.search(when_fixed))
+    if has_weekday_in_query and not has_weekday_in_when:
+        m = _REMINDER_WEEKDAY_RE.search(query)
+        if m:
+            day = m.group(0).lower()
+            issues.append(f"recovered weekday '{day}' from query")
+            when_fixed = f"{day} {when_fixed}".strip() if when_fixed else day
+
+    # 2) Día relativo (solo si no recuperamos un weekday — evita
+    #    duplicados como "lunes mañana").
+    if not has_weekday_in_query:
+        has_rel_in_query = bool(_REMINDER_RELATIVE_DAY_RE.search(query))
+        has_rel_in_when = bool(_REMINDER_RELATIVE_DAY_RE.search(when_fixed))
+        if has_rel_in_query and not has_rel_in_when:
+            m = _REMINDER_RELATIVE_DAY_RE.search(query)
+            if m:
+                rel = m.group(0).lower()
+                issues.append(f"recovered relative day '{rel}' from query")
+                when_fixed = f"{rel} {when_fixed}".strip() if when_fixed else rel
+
+    return when_fixed, issues
+
+
 def propose_reminder(
     title: str,
     when: str = "",
@@ -36591,6 +36667,7 @@ def propose_reminder(
     priority: int | None = None,
     notes: str | None = None,
     recurrence_text: str | None = None,
+    _original_query: str | None = None,
 ) -> str:
     """Agregar un recordatorio a Apple Reminders. Si la fecha/hora parsea
     clara, se CREA automáticamente. Si es ambigua, vuelve como propuesta
@@ -36611,6 +36688,22 @@ def propose_reminder(
         Error: `{kind, created:false, error, fields}`.
     """
     now = datetime.now()
+    # Post-check 2026-04-28: si el LLM droppeó info temporal del `when`
+    # (típicamente día concreto como "el sábado"), la recuperamos del
+    # query original. Documentación + ejemplos en _validate_reminder_when.
+    if _original_query:
+        _when_fixed, _issues = _validate_reminder_when(when, _original_query)
+        if _issues:
+            try:
+                _ambient_log_event({
+                    "cmd": "propose_reminder_when_fixed",
+                    "original_when": when,
+                    "fixed_when": _when_fixed,
+                    "issues": _issues,
+                })
+            except Exception:
+                pass
+        when = _when_fixed
     due = _parse_natural_datetime(when, now=now) if when and when.strip() else None
     recurrence = _parse_natural_recurrence(recurrence_text) if recurrence_text else None
     needs_clarif = bool(when and when.strip()) and due is None

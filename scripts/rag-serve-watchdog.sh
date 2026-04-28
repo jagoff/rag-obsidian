@@ -129,9 +129,50 @@ fi
 # Si querés pausar el catchup: setear RAG_WATCHDOG_CATCHUP_DISABLED=1.
 
 if [ -z "${RAG_WATCHDOG_CATCHUP_DISABLED:-}" ]; then
+  # Schedule sensitivity por plist. Lista expandida 2026-04-27 después
+  # del audit que detectó 8 plists schedule-sensitive faltantes (audit
+  # subagent 2297bb6e). El bug original eran wake-up + consolidate
+  # missing por Mac dormida, pero el problema es general: TODOS los
+  # plists con StartCalendarInterval pueden saltearse si la Mac no
+  # está despierta a esa hora.
+  #
+  # Schedules cubiertos (LABEL_SUFFIX:LOG_BASENAME:MAX_AGE_SECONDS):
+  #   Diarios (max 26h = 24h ciclo + 2h buffer):
+  #     wake-up         daily 4am
+  #     archive         daily 23h (NOTA: schedule real es día 1 del mes
+  #                     según audit, pero el log es diario por activity
+  #                     interna; usamos 26h = funciona aunque sobre-trigger)
+  #     vault-cleanup   daily 2am
+  #     auto-harvest    daily 3am
+  #     implicit-feedback daily 3:25am
+  #     online-tune     daily 3:30am (fix del timeout 1200→2400 también
+  #                     necesita esto para correr esta noche)
+  #     maintenance     daily 4am
+  #     calibrate       daily 4:30am
+  #
+  #   Lunes-viernes (max 50h = 48h fin de semana + buffer):
+  #     morning         L-V 7am
+  #     today           L-V 22h
+  #
+  #   Semanales (max 8d = 7d ciclo + 1d buffer):
+  #     consolidate     weekly mon 6am
+  #     digest          weekly sun 22h
+  #     patterns        weekly sun 20h
+  #     emergent        weekly fri 10am
   NIGHTLY_PLISTS=(
+    # Diarios
     "wake-up:wake-up.log:93600"
     "archive:archive.log:93600"
+    "vault-cleanup:vault-cleanup.log:93600"
+    "auto-harvest:auto-harvest.log:93600"
+    "implicit-feedback:implicit-feedback.log:93600"
+    "online-tune:online-tune.log:93600"
+    "maintenance:maintenance.log:93600"
+    "calibrate:calibrate.log:93600"
+    # Lunes-viernes
+    "morning:morning.log:180000"
+    "today:today.log:180000"
+    # Semanales
     "consolidate:consolidate.log:691200"
     "digest:digest.log:691200"
     "patterns:patterns.log:691200"
@@ -165,9 +206,12 @@ if [ -z "${RAG_WATCHDOG_CATCHUP_DISABLED:-}" ]; then
     fi
 
     # Determinar la "edad" del último run. Si el log no existe O su mtime
-    # es viejo, considerar missed.
+    # es viejo, considerar missed. NOTA: si no hay log, seteamos age a
+    # max_age + 1 para que el `-gt` triggee (con `-ge` también andaría
+    # pero `-gt` deja un buffer natural — un plist que JUSTO terminó
+    # hace `max_age` segundos no se kickstart hasta el próximo tick).
     if [ ! -f "${nightly_log}" ]; then
-      age="${max_age}"  # tratado como > max_age → trigger
+      age=$(( max_age + 1 ))  # asegurar que > max_age → trigger
     else
       log_mtime=$(stat -f "%m" "${nightly_log}" 2>/dev/null || echo "0")
       age=$(( catchup_now - log_mtime ))

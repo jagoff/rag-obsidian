@@ -18,7 +18,10 @@ from rag.today_correlator import (
 
 
 def test_canonicalize_name_basic():
-    assert _canonicalize_name("Marina Pérez") == "marina pérez"
+    # NFD diacritic strip: "Pérez" → "perez" (sin tilde, ver fix
+    # commit 22ae937 + tildes audit). Esto permite matchear contra
+    # "Maria Perez" en gmail con "María Pérez" en WhatsApp.
+    assert _canonicalize_name("Marina Pérez") == "marina perez"
     # Token-sorted: same canonical regardless of order
     assert _canonicalize_name("Marina Pérez") == _canonicalize_name("Pérez Marina")
     # Lowercase + strip
@@ -27,9 +30,10 @@ def test_canonicalize_name_basic():
 
 def test_canonicalize_name_strips_emojis_and_symbols():
     assert _canonicalize_name("Grecia 🩷") == "grecia"
-    assert _canonicalize_name("*Humanidades* Cuarto Año") in (
-        "año cuarto humanidades", "cuarto humanidades año",
-    )  # token-sorted
+    # NFD strip de "Año" → "Ano" (tilde ñ removida también — ñ se
+    # descompone a n + ◌̃ y el tilde combinante cae)
+    assert _canonicalize_name("*Humanidades* Cuarto Año") == \
+        "ano cuarto humanidades"  # token-sorted alphabetically
     assert _canonicalize_name("👻") == ""  # only emoji → empty
     assert _canonicalize_name("12345") == ""  # only digits → empty
     assert _canonicalize_name("a") == ""  # too short → empty
@@ -660,3 +664,129 @@ def test_gaps_partial_name_match_in_calendar():
     }
     result = correlate_today_signals({}, extras)
     assert result["gaps"] == []
+
+
+# ── Diacritic normalization (tildes) ────────────────────────────────────
+
+
+def test_canonicalize_strips_diacritics_for_match():
+    """'María Pérez' (con tildes) y 'Maria Perez' (sin) deben canonicalize
+    al mismo valor → matchear como la misma persona.
+    """
+    assert _canonicalize_name("María Pérez") == _canonicalize_name("Maria Perez")
+    assert _canonicalize_name("José") == _canonicalize_name("Jose")
+    assert _canonicalize_name("ÁNGELA") == _canonicalize_name("Angela")
+    # Ñ se preserva (es alfabética sin diacrítico — categoría Lo)
+    assert "n" in _canonicalize_name("Ñoño")
+
+
+def test_people_match_across_diacritic_variants():
+    """gmail llega con 'Maria Perez', WA con 'María Pérez' → MATCH como
+    misma persona cross-source.
+    """
+    extras = {
+        "gmail_today": [
+            {"from": "Maria Perez <m@x.com>", "subject": "x", "snippet": ""},
+        ],
+        "whatsapp_today": [
+            {"name": "María Pérez", "count": 5, "last_snippet": "che"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    assert len(result["people"]) == 1
+    assert result["people"][0]["sources_count"] == 2
+
+
+# ── Grupos WA filtrados de gaps ─────────────────────────────────────────
+
+
+def test_gaps_skips_wa_group_with_asterisks():
+    """Chat WA con '*' en el nombre es grupo, no persona individual."""
+    from rag.today_correlator import _looks_like_wa_group
+    assert _looks_like_wa_group("*Humanidades* Cuarto Año")
+    assert _looks_like_wa_group("**Equipo X**")
+    assert not _looks_like_wa_group("Marina Pérez")
+
+
+def test_gaps_skips_wa_group_with_marker_keywords():
+    from rag.today_correlator import _looks_like_wa_group
+    assert _looks_like_wa_group("Equipo Backend")
+    assert _looks_like_wa_group("Team Marketing")
+    assert _looks_like_wa_group("Grupo Familia")
+    assert _looks_like_wa_group("Comunidad Devs")
+    # case insensitive
+    assert _looks_like_wa_group("EQUIPO ALPHA")
+
+
+def test_gaps_skips_wa_group_with_4plus_words():
+    """Nombres largos típicos de grupo: 'Fifteens - Casa Santa Fe'."""
+    from rag.today_correlator import _looks_like_wa_group
+    assert _looks_like_wa_group("Fifteens - Casa Santa Fe")
+    assert _looks_like_wa_group("Reunión Padres Cuarto Año Mañana")
+    # Person con 2-3 tokens NO es grupo
+    assert not _looks_like_wa_group("Marina Pérez")
+    assert not _looks_like_wa_group("Pablo Fernández González")
+
+
+def test_gaps_filters_groups_in_correlation():
+    """Integration: grupos en wa_unreplied no aparecen como gaps."""
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "*Humanidades* Cuarto Año", "jid": "x@g.us",
+             "last_snippet": "info patrullaje", "hours_waiting": 30},
+            {"name": "Marina Pérez", "jid": "y@s",
+             "last_snippet": "che", "hours_waiting": 30},
+        ],
+        "tomorrow_calendar": [],
+    }
+    result = correlate_today_signals({}, extras)
+    persons = [g["person"] for g in result["gaps"]]
+    assert "Marina Pérez" in persons
+    assert all("Humanidades" not in p for p in persons)
+
+
+def test_gaps_skips_when_hours_waiting_is_none():
+    """Datos incompletos del fetcher no deben generar gap silencioso."""
+    extras = {
+        "whatsapp_unreplied": [
+            {"name": "Pablo", "jid": "x", "last_snippet": "hola",
+             "hours_waiting": None},
+        ],
+        "tomorrow_calendar": [],
+    }
+    result = correlate_today_signals({}, extras)
+    assert result["gaps"] == []
+
+
+# ── Time overlap timezone consistency ───────────────────────────────────
+
+
+def test_time_overlap_uses_local_time_consistently():
+    """Test que `_correlate_time_overlaps` usa `datetime.fromtimestamp()`
+    sin `tz=` (local naive), igual que el helper `_ms_at_local_time`.
+    Si alguien cambia a UTC en uno solo de los dos, los tests pasan
+    inconsistente con el código real. Smoke test contra un timestamp
+    sintético de "ahora 14:00 local".
+    """
+    # Generar un ms a "hoy 14:00 local" usando el helper
+    ms_at_14 = _ms_at_local_time(14, 0)
+    # Crear extras con gmail a esa hora + calendar event a la misma hora
+    # con tokens compartidos
+    extras = {
+        "gmail_today": [
+            {"from": "x@y.com", "subject": "demo proyecto",
+             "snippet": "demo proyecto a las 14",
+             "internal_date_ms": ms_at_14},
+        ],
+        "calendar_today": [
+            {"title": "Demo proyecto", "start": "14:00", "end": "15:00"},
+        ],
+    }
+    result = correlate_today_signals({}, extras)
+    overlaps = result["time_overlaps"]
+    # Debe haber match — gmail 14:00 local + calendar 14:00 local
+    # con tokens "demo" + "proyecto" compartidos.
+    assert len(overlaps) >= 1, (
+        "Time overlap NO detectado — posible timezone mismatch entre "
+        "_ms_at_local_time (test helper) y fromtimestamp (correlator)."
+    )

@@ -226,18 +226,33 @@ def _extract_names_from_title(title: str) -> list[str]:
 
 def _canonicalize_name(name: str) -> str:
     """Normalize for dedup: lowercase, strip whitespace, remove emojis,
-    sort word tokens (so "Marina Pérez" == "Pérez Marina"). Returns "".
-    si el name es vacío o solo digits/símbolos.
+    remove diacritics (tildes), sort word tokens. Returns "" si el name
+    es vacío o solo digits/símbolos.
 
     Token-sort permite matchear "Pablo Fernández" vs "Fernández Pablo"
     como la misma persona. Ver `_canonicals_match()` para matching
     subset (e.g. "Pablo" matches "Pablo Fer").
+
+    NFD + diacritic strip: "María" == "Maria" == "MARÍA". Esto es
+    importante para hispanohablantes — gmail puede llegar con/sin
+    tildes según cómo lo escribió el remitente, y WhatsApp lo mismo
+    (autocorrect, teclados móviles). Sin esta normalización, "Marina
+    Pérez" en gmail y "Marina Perez" en WhatsApp se detectan como
+    personas distintas — false negative del correlator.
     """
     if not name:
         return ""
+    # Normalizar Unicode: NFD descompone "é" en "e" + acento combinado,
+    # luego filtramos los diacríticos (categoría "Mn" = Mark, Nonspacing).
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", name)
+    no_diacritics = "".join(
+        c for c in decomposed
+        if unicodedata.category(c) != "Mn"
+    )
     # Strip emojis y caracteres no-alfa (excepto espacios y guiones).
     cleaned = "".join(
-        c for c in name
+        c for c in no_diacritics
         if c.isalpha() or c.isspace() or c in "-'"
     ).strip().lower()
     if not cleaned or len(cleaned) < 2:
@@ -546,18 +561,29 @@ def _correlate_time_overlaps(
     """
     items: list[dict] = []
 
-    # Gmail today: timestamp del internal_date_ms
+    # Gmail today: timestamp del internal_date_ms.
+    # `internal_date_ms` viene en epoch UTC desde Gmail API. `fromtimestamp()`
+    # sin `tz=` lo convierte a LOCAL time naive. Esa decisión es intencional
+    # — los calendar events vienen también en local time (icalBuddy en macOS
+    # devuelve la hora local del usuario), entonces compararlos en local
+    # naive ES correcto Y consistente. NO usar UTC acá porque entonces un
+    # gmail "Reunión 14hs" recibido a las 14:00 ART (17:00 UTC) NO matchearía
+    # con un calendar event "14:00–15:00 ART" (que es local).
+    # El bug real solo aparece si la Mac está en una timezone que NO es la
+    # del user (típicamente CI corriendo en UTC). Para CI tests, los tests
+    # usan `_ms_at_local_time()` helper que está en la misma timezone que
+    # `fromtimestamp()` → consistente.
+    from datetime import datetime as _dt
     for m in (extras.get("gmail_today") or [])[:20]:
         if _is_self_notification(m.get("from") or m.get("sender") or ""):
             continue
         ts_ms = m.get("internal_date_ms")
         if not ts_ms:
             continue
-        from datetime import datetime as _dt
         try:
             t = _dt.fromtimestamp(int(ts_ms) / 1000)
             ts_minutes = t.hour * 60 + t.minute
-        except (ValueError, OSError):
+        except (ValueError, OSError, OverflowError):
             continue
         text = (m.get("subject") or "") + " " + (m.get("snippet") or "")
         items.append({
@@ -662,9 +688,19 @@ def _correlate_gaps(today_ev: dict, extras: dict) -> list[dict]:
     gaps: list[dict] = []
     for w in wa_unreplied[:10]:
         name = w.get("name") or ""
-        hours = w.get("hours_waiting") or 0
+        hours = w.get("hours_waiting")
+        if hours is None:
+            continue  # datos incompletos → skip
         if hours < 24:
             continue  # solo cuenta como gap si lleva ≥1 día sin respuesta
+        # Filtrar grupos WA — no son personas individuales, no tiene
+        # sentido sugerir "agendá tiempo para responderle" a un grupo.
+        # Heurística: un chat es grupo si el nombre tiene asteriscos
+        # decorativos (`*Humanidades*`), 3+ palabras (típico de
+        # "Equipo X de Y"), O contiene marcadores de grupo comunes
+        # ("grupo", "team", "group") en cualquier mayúscula.
+        if _looks_like_wa_group(name):
+            continue
         canonical = _canonicalize_name(name)
         if not canonical:
             continue
@@ -684,6 +720,44 @@ def _correlate_gaps(today_ev: dict, extras: dict) -> list[dict]:
 
     gaps.sort(key=lambda g: -g["hours_waiting"])
     return gaps[:5]
+
+
+_WA_GROUP_MARKERS = ("grupo", "group", "team", "equipo", "comunidad",
+                     "channel", "canal", "broadcast")
+
+
+def _looks_like_wa_group(name: str) -> bool:
+    """Heurística: True si el `name` de un chat WA es un grupo (no
+    persona individual). Evita que el correlator de gaps sugiera
+    "agendá tiempo para responderle" a `*Humanidades* Cuarto Año`.
+
+    Triggers:
+      - Asteriscos decorativos (`*Humanidades*`, `**Equipo**`)
+      - ≥4 palabras (típico de nombres de grupo: "Fifteens - Casa
+        Santa Fe", "PublicCloudInfrastructure equipo")
+      - Markers explícitos: "grupo", "team", "group", "equipo",
+        "comunidad", "channel", "canal", "broadcast"
+
+    Falso positivo conocido: una persona con nombre completo de 4+
+    tokens (ej. "María José de la Torre Fernández"). Aceptable —
+    raro y la peor consecuencia es "no detecto que esa persona es
+    un loose end" (false negative tolerable).
+    """
+    if not name:
+        return True
+    if "*" in name:
+        return True
+    name_lower = name.lower()
+    for marker in _WA_GROUP_MARKERS:
+        if marker in name_lower:
+            return True
+    # ≥4 palabras: heurística de grupo.
+    word_count = sum(
+        1 for tok in re.split(r"[\s,()/:;-]+", name) if tok.strip()
+    )
+    if word_count >= 4:
+        return True
+    return False
 
 
 # ── Voice normalization (post-processing del LLM output) ──────────────────

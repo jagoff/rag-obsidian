@@ -40230,6 +40230,410 @@ def wa_scheduled_send(dry_run: bool, late_threshold_min: int,
     )
 
 
+# ── `rag bridge` — manage the WhatsApp bridge daemon ────────────────
+#
+# Constants para el bridge daemon. Rutas hardcodeadas porque los plists
+# y scripts ya las usan de fábrica — si alguna vez se mueven, hay que
+# bumpearlas en este bloque + en `~/Library/LaunchAgents/com.fer.whatsapp-
+# bridge.plist` + en `bridge.log` filenames del watchdog. Defer hasta
+# que sea un problema real (multi-host setup, etc.).
+_WA_BRIDGE_LAUNCHD_LABEL = "com.fer.whatsapp-bridge"
+_WA_BRIDGE_PLIST = Path.home() / "Library/LaunchAgents/com.fer.whatsapp-bridge.plist"
+_WA_BRIDGE_BINARY = Path.home() / ".local/bin/whatsapp-bridge"
+_WA_BRIDGE_REPO = Path("/Users/fer/repositories/whatsapp-mcp/whatsapp-bridge")
+_WA_BRIDGE_SESSION_DB = _WA_BRIDGE_REPO / "store/whatsapp.db"
+_WA_BRIDGE_MESSAGES_DB = _WA_BRIDGE_REPO / "store/messages.db"
+_WA_BRIDGE_SENTINEL = _WA_BRIDGE_REPO / "store/.needs-reauth"
+_WA_BRIDGE_LOG = Path.home() / ".local/share/whatsapp-bridge/bridge.log"
+_WA_BRIDGE_HEALTH_URL = "http://localhost:8080/api/health"
+
+
+def _wa_bridge_uid() -> int:
+    """Resolve the user UID for the launchd domain (`gui/<uid>`).
+
+    `launchctl` requires the explicit UID for user-level (per-session)
+    daemons under macOS 10.10+. We read it once via `os.getuid()` since
+    the CLI always runs as the user that owns the plist (no sudo
+    paths). If somebody's running this with sudo, `os.getuid()` returns
+    0 and `launchctl` will fail loudly — that's a bug they should fix
+    in their setup, not silently swallow.
+    """
+    return os.getuid()
+
+
+def _wa_bridge_is_loaded() -> bool:
+    """Return True if the launchd label is currently loaded.
+
+    We use `launchctl print` (macOS 10.10+) instead of the legacy
+    `launchctl list | grep` because `print` returns a non-zero exit
+    code if the label isn't loaded, which is what we want — much
+    cheaper than parsing `list` output.
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{_wa_bridge_uid()}/{_WA_BRIDGE_LAUNCHD_LABEL}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _wa_bridge_http_probe() -> tuple[bool, str]:
+    """Probe the bridge's `/api/health` to check WA connectivity.
+
+    Returns `(is_healthy, detail)` where `is_healthy` is True iff the
+    bridge process is alive AND has an active WebSocket connection to
+    WhatsApp servers. The `/api/health` endpoint is side-effect-free:
+    no fake send attempts that could double-deliver to a real contact.
+
+    Possible outcomes:
+      - HTTP 200 + `{"connected": true, "logged_in": true}` → all OK.
+      - HTTP 200 + `{"connected": false, "logged_in": true}` → socket
+        dropped but session still valid; bridge will auto-reconnect
+        (or you wait & retry).
+      - HTTP 200 + `{"connected": false, "logged_in": false}` → no
+        paired device; need `rag bridge reauth` to scan QR.
+      - HTTP 404 → bridge running but doesn't expose `/api/health`
+        yet (old binary). Caller should fall back to /api/send probe
+        or just rebuild the bridge.
+      - ConnectionRefusedError → daemon not running.
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(_WA_BRIDGE_HEALTH_URL)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return False, f"HTTP {resp.status}: invalid_json: {body[:80]}"
+            connected = bool(data.get("connected"))
+            logged_in = bool(data.get("logged_in"))
+            if connected and logged_in:
+                return True, f"connected (jid={data.get('jid', '')[:30]})"
+            if not logged_in:
+                return False, "not_paired (no session — run `rag bridge reauth`)"
+            return False, "logged_in but socket dropped (auto-reconnect pending)"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False, "no_health_endpoint (old bridge binary — `cd ~/repositories/whatsapp-mcp/whatsapp-bridge && go build -o ~/.local/bin/whatsapp-bridge .`)"
+        return False, f"HTTP {exc.code}"
+    except (ConnectionRefusedError, urllib.error.URLError) as exc:
+        return False, f"unreachable: {exc!r}"
+    except Exception as exc:
+        return False, f"probe_error: {exc!r}"
+
+
+@cli.group()
+def bridge():
+    """Gestionar el daemon `whatsapp-bridge` (login, status, re-auth).
+
+    El bridge es el proceso Go que mantiene la conexión con WhatsApp Web
+    via WebSocket. Cuando WA expulsa la sesión (rotación, dispositivo
+    duplicado, etc.) el proceso queda zombie con session inválida —
+    todo `propose_whatsapp_send` empieza a fallar con `send_failed`.
+    Este grupo de comandos te deja diagnosticar y recuperarlo sin
+    memorizar los 6 pasos de launchctl + sqlite manual.
+    """
+
+
+@bridge.command("status")
+def bridge_status():
+    """Mostrar estado actual del bridge (daemon, conexión WA, sentinel).
+
+    Diagnóstico rápido — no toca nada. Útil cuando un send falla con
+    `send_failed` y no sabés si es problema del bridge o del propose
+    tool. Reporta:
+
+      - launchd: cargado / no cargado
+      - HTTP probe: conectado / no conectado / unreachable
+      - Sentinel `.needs-reauth`: presente (con timestamp) / ausente
+      - Última línea de `LoggedOut` / `Connected` en bridge.log
+
+    Si todo está verde, el bridge está sano. Si hay algo en rojo,
+    leer la guía en pantalla — usualmente es `rag bridge reauth`.
+    """
+    is_loaded = _wa_bridge_is_loaded()
+    is_connected, detail = _wa_bridge_http_probe()
+    sentinel_ts = None
+    if _WA_BRIDGE_SENTINEL.exists():
+        try:
+            sentinel_ts = _WA_BRIDGE_SENTINEL.read_text().strip()
+        except Exception as exc:
+            sentinel_ts = f"<read error: {exc!r}>"
+
+    # Last LoggedOut / Connected events in bridge.log (best-effort)
+    last_logged_out = None
+    last_connected = None
+    if _WA_BRIDGE_LOG.exists():
+        try:
+            tail = subprocess.run(
+                ["tail", "-n", "5000", str(_WA_BRIDGE_LOG)],
+                capture_output=True, text=True, timeout=3,
+            )
+            for line in tail.stdout.splitlines():
+                if "Device logged out" in line:
+                    last_logged_out = line.strip()[:160]
+                elif "Connected to WhatsApp" in line and "Successfully" not in line:
+                    last_connected = line.strip()[:160]
+        except Exception:
+            pass
+
+    # Compose console output
+    console.print()
+    console.print("[bold]WhatsApp Bridge — Status[/bold]")
+    console.print(f"  label:      [cyan]{_WA_BRIDGE_LAUNCHD_LABEL}[/cyan]")
+    console.print(f"  binary:     [cyan]{_WA_BRIDGE_BINARY}[/cyan]")
+    console.print(
+        f"  daemon:     "
+        + ("[green]✓ loaded[/green]" if is_loaded else "[red]✗ not loaded[/red]")
+    )
+    console.print(
+        f"  connection: "
+        + ("[green]✓ connected[/green]" if is_connected else "[red]✗ disconnected[/red]")
+        + f"  [dim]({detail})[/dim]"
+    )
+    if sentinel_ts:
+        console.print(
+            f"  sentinel:   [yellow]⚠ .needs-reauth[/yellow] [dim](since {sentinel_ts})[/dim]"
+        )
+    else:
+        console.print("  sentinel:   [green]✓ none[/green]")
+    if last_connected:
+        console.print(f"  last-conn:  [dim]{last_connected}[/dim]")
+    if last_logged_out:
+        console.print(f"  last-out:   [yellow]{last_logged_out}[/yellow]")
+    console.print()
+
+    if not is_connected:
+        console.print(
+            "[yellow]→ Para recuperar:[/yellow] [bold]rag bridge reauth[/bold]"
+        )
+        console.print()
+        # Exit code 1 so cron/scripts can detect "needs attention".
+        raise click.exceptions.Exit(1)
+
+
+@bridge.command("reauth")
+@click.option("--keep-session", is_flag=True,
+              help="No borrar `whatsapp.db` (intenta reconectar sin re-pair). "
+                   "Solo útil si sospechás que el bridge se cuelga sin haber "
+                   "perdido la sesión real. Default: borra session DB.")
+@click.option("--yes", "-y", is_flag=True,
+              help="Saltarse el prompt de confirmación.")
+def bridge_reauth(keep_session: bool, yes: bool):
+    """Re-autenticar el bridge con un escaneo de QR fresco.
+
+    Automatiza los 6 pasos manuales que normalmente hay que hacer cuando
+    WhatsApp expulsa la sesión:
+
+      1. Detener el daemon (`launchctl bootout`).
+      2. Backup + borrar `store/whatsapp.db` (la session DB; deja
+         `messages.db` intacto — historial preservado).
+      3. Lanzar el bridge en foreground attaché al TTY actual.
+      4. Mostrar el QR que el bridge imprime → vos lo escaneás con
+         WhatsApp en el teléfono (Settings → Linked Devices → Link a
+         Device).
+      5. Esperar el "Successfully connected and authenticated!".
+      6. Vos hacés Ctrl-C cuando ves el success → reload del daemon
+         con `launchctl bootstrap`.
+
+    REQUIERE TTY interactiva — el QR usa half-block Unicode chars que
+    sólo se renderizan en una terminal real (no en pipes ni redirects).
+    Si corrés esto vía SSH sin -t, sale con error.
+
+    El backup de la session DB queda en
+    `store/whatsapp.db.backup-<timestamp>` — si algo sale mal podés
+    restaurarlo manualmente y reintentar.
+    """
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        console.print(
+            "[red]✗[/red] `rag bridge reauth` requiere TTY interactiva — "
+            "el QR usa half-block Unicode que no se renderiza en pipes."
+        )
+        console.print(
+            "[dim]Si estás en SSH, reconectá con `ssh -t`. Si estás en "
+            "tmux/screen, abrí una pane real.[/dim]"
+        )
+        raise click.exceptions.Exit(2)
+
+    if not _WA_BRIDGE_BINARY.exists():
+        console.print(
+            f"[red]✗[/red] No existe el binario del bridge en "
+            f"[cyan]{_WA_BRIDGE_BINARY}[/cyan]. Buildealo primero con:"
+        )
+        console.print(
+            f"  [dim]cd {_WA_BRIDGE_REPO} && go build -o {_WA_BRIDGE_BINARY} .[/dim]"
+        )
+        raise click.exceptions.Exit(2)
+
+    if not _WA_BRIDGE_REPO.exists():
+        console.print(
+            f"[red]✗[/red] No existe el repo del bridge en "
+            f"[cyan]{_WA_BRIDGE_REPO}[/cyan]. Cloneá `jagoff/whatsapp-mcp`."
+        )
+        raise click.exceptions.Exit(2)
+
+    # Pre-flight summary
+    console.print()
+    console.print("[bold]WhatsApp Bridge — Re-auth flow[/bold]")
+    console.print(f"  daemon:        [cyan]{_WA_BRIDGE_LAUNCHD_LABEL}[/cyan]")
+    console.print(f"  session DB:    [cyan]{_WA_BRIDGE_SESSION_DB}[/cyan]"
+                  + (" [dim](preserved)[/dim]" if keep_session else " [dim](será borrada)[/dim]"))
+    console.print(f"  messages DB:   [cyan]{_WA_BRIDGE_MESSAGES_DB}[/cyan] [dim](preserved)[/dim]")
+    console.print()
+
+    if not yes:
+        try:
+            ans = click.prompt(
+                "¿Continuar? [y/N]", default="n", show_default=False,
+            )
+        except click.exceptions.Abort:
+            console.print("[dim]cancelado.[/dim]")
+            return
+        if (ans or "").strip().lower() not in {"y", "yes", "s", "si", "sí"}:
+            console.print("[dim]cancelado.[/dim]")
+            return
+
+    # ── Step 1: stop the daemon ───────────────────────────────────────
+    if _wa_bridge_is_loaded():
+        console.print("[dim]→ deteniendo daemon…[/dim]", end=" ")
+        try:
+            subprocess.run(
+                ["launchctl", "bootout",
+                 f"gui/{_wa_bridge_uid()}/{_WA_BRIDGE_LAUNCHD_LABEL}"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except Exception as exc:
+            console.print(f"[yellow]warn:[/yellow] launchctl bootout: {exc!r}")
+        # Wait for bridge to release port 8080. Up to 5s — usually <1s.
+        for _ in range(50):
+            time.sleep(0.1)
+            if not _wa_bridge_is_loaded():
+                break
+        console.print("[green]✓[/green]")
+    else:
+        console.print("[dim]→ daemon no estaba cargado (skip stop)[/dim]")
+
+    # ── Step 2: backup + delete the session DB ────────────────────────
+    if not keep_session and _WA_BRIDGE_SESSION_DB.exists():
+        import shutil
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = _WA_BRIDGE_SESSION_DB.with_suffix(f".db.backup-{ts}")
+        try:
+            shutil.copy2(_WA_BRIDGE_SESSION_DB, backup)
+            _WA_BRIDGE_SESSION_DB.unlink()
+            # Also delete WAL + SHM siblings; sqlite reconstructs them.
+            for ext in ("-wal", "-shm"):
+                sib = _WA_BRIDGE_SESSION_DB.with_name(_WA_BRIDGE_SESSION_DB.name + ext)
+                if sib.exists():
+                    try:
+                        sib.unlink()
+                    except Exception:
+                        pass
+            console.print(
+                f"[dim]→ session DB borrada (backup: [cyan]{backup.name}[/cyan])[/dim] "
+                f"[green]✓[/green]"
+            )
+        except Exception as exc:
+            console.print(f"[red]✗[/red] error backup/borrado: {exc!r}")
+            raise click.exceptions.Exit(3)
+
+    # Clear the sentinel — next *Connected event in the new run will
+    # also clear it, but anticipate so `bridge status` queries during
+    # the reauth window don't show stale yellow.
+    if _WA_BRIDGE_SENTINEL.exists():
+        try:
+            _WA_BRIDGE_SENTINEL.unlink()
+        except Exception:
+            pass
+
+    # ── Step 3: run bridge in foreground ──────────────────────────────
+    console.print()
+    console.print("[bold yellow]Próximos pasos (manuales):[/bold yellow]")
+    console.print("  1. Voy a lanzar el bridge attached a esta terminal.")
+    console.print("  2. Va a aparecer un QR code grande.")
+    console.print("  3. Abrí WhatsApp en el [bold]teléfono[/bold] →")
+    console.print("     Settings → Linked Devices → [bold]Link a Device[/bold]")
+    console.print("     → escaneá el QR.")
+    console.print("  4. Esperá hasta que veas:")
+    console.print("     [green]\"Successfully connected and authenticated!\"[/green]")
+    console.print("  5. Cuando aparezca, presioná [bold]Ctrl-C[/bold] para detener")
+    console.print("     el bridge interactivo — yo me encargo del resto.")
+    console.print()
+    console.print("[dim]Lanzando bridge en 2s…[/dim]")
+    time.sleep(2)
+    console.print()
+
+    bridge_proc = None
+    try:
+        # Run with TTY inherited from the parent so qrterminal renders
+        # correctly. We DON'T capture stdout/stderr — let it stream
+        # straight to the user's terminal. We pass `cwd=_WA_BRIDGE_REPO`
+        # so `store/whatsapp.db` resolves correctly (the bridge uses a
+        # relative `file:store/whatsapp.db` path).
+        bridge_proc = subprocess.Popen(
+            [str(_WA_BRIDGE_BINARY)],
+            cwd=str(_WA_BRIDGE_REPO),
+        )
+        bridge_proc.wait()
+    except KeyboardInterrupt:
+        # User saw "Successfully connected" and pressed Ctrl-C — that's
+        # expected. SIGINT propagated to the child and it should exit
+        # cleanly. Wait up to 3s for the child to finish.
+        if bridge_proc and bridge_proc.poll() is None:
+            try:
+                bridge_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                bridge_proc.kill()
+        console.print()
+        console.print("[dim]→ bridge interactivo terminado.[/dim]")
+
+    # ── Step 4: bootstrap the daemon back ─────────────────────────────
+    if not _WA_BRIDGE_PLIST.exists():
+        console.print(
+            f"[red]✗[/red] No existe el plist en [cyan]{_WA_BRIDGE_PLIST}[/cyan]. "
+            "Reauth completo, pero el daemon NO se va a auto-restartar."
+        )
+        raise click.exceptions.Exit(0)
+
+    console.print("[dim]→ recargando daemon…[/dim]", end=" ")
+    try:
+        result = subprocess.run(
+            ["launchctl", "bootstrap",
+             f"gui/{_wa_bridge_uid()}", str(_WA_BRIDGE_PLIST)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            console.print(f"[yellow]warn:[/yellow] launchctl bootstrap rc={result.returncode}: {result.stderr.strip()}")
+        else:
+            console.print("[green]✓[/green]")
+    except Exception as exc:
+        console.print(f"[red]✗[/red] launchctl bootstrap: {exc!r}")
+
+    # ── Step 5: verify with HTTP probe ────────────────────────────────
+    # Wait up to 8s for the bridge to come up + reconnect.
+    console.print("[dim]→ verificando…[/dim]", end=" ")
+    for _ in range(40):
+        time.sleep(0.2)
+        ok, detail = _wa_bridge_http_probe()
+        if ok:
+            console.print("[green]✓ conectado[/green]")
+            console.print()
+            console.print("[green bold]✓ Re-auth completo. WhatsApp está activo.[/green bold]")
+            return
+        # If detail says "not_connected" the daemon is up but session
+        # didn't take — keep waiting.
+    console.print("[yellow]⚠ daemon arrancó pero el HTTP probe sigue fallando.[/yellow]")
+    console.print(f"[dim]Último detail: {detail}[/dim]")
+    console.print(
+        "[dim]Mirá `tail -f ~/.local/share/whatsapp-bridge/bridge.log` "
+        "y reintentá si hace falta.[/dim]"
+    )
+
+
 @cli.command("contact-note")
 @click.argument("contact_name")
 @click.argument("observation")

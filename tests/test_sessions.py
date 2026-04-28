@@ -399,6 +399,15 @@ def test_session_summary_returns_none_when_window_covers_all():
     assert "compressed_history" not in sess
 
 
+# 2026-04-28 P3: tras subir SESSION_HISTORY_WINDOW de 6 → 10 estos tests
+# pasan window=6 explícito para mantener su intent (testar la lógica
+# "compress turns aged out of window") sin acoplarse al valor del default.
+# El número 6 sigue siendo el que producen los `n=10, window=6` de los
+# comentarios — el comportamiento testeado es el mismo que antes del
+# cambio del default.
+_LEGACY_WINDOW = 6
+
+
 def test_session_summary_computes_and_caches(monkeypatch):
     calls: list[list[dict]] = []
 
@@ -408,7 +417,7 @@ def test_session_summary_computes_and_caches(monkeypatch):
 
     monkeypatch.setattr(rag, "_compress_turns", fake_compress)
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)  # n=10, window=6
-    out = rag.session_summary(sess)
+    out = rag.session_summary(sess, window=_LEGACY_WINDOW)
     assert out == "resumen de 4 turnos"  # turns[:n - window] = turns[:4]
     cache = sess["compressed_history"]
     assert cache["version"] == rag.SESSION_SUMMARY_VERSION
@@ -427,9 +436,9 @@ def test_session_summary_uses_cache_when_idx_unchanged(monkeypatch):
 
     monkeypatch.setattr(rag, "_compress_turns", fake_compress)
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
-    rag.session_summary(sess)
-    rag.session_summary(sess)
-    rag.session_summary(sess)
+    rag.session_summary(sess, window=_LEGACY_WINDOW)
+    rag.session_summary(sess, window=_LEGACY_WINDOW)
+    rag.session_summary(sess, window=_LEGACY_WINDOW)
     assert call_count["n"] == 1
 
 
@@ -441,9 +450,9 @@ def test_session_summary_recomputes_when_window_advances(monkeypatch):
 
     monkeypatch.setattr(rag, "_compress_turns", fake_compress)
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)  # n=10, until=4
-    assert rag.session_summary(sess) == "v1"
+    assert rag.session_summary(sess, window=_LEGACY_WINDOW) == "v1"
     sess["turns"].extend([{"q": f"q{i}", "a": f"a{i}"} for i in range(10, 13)])  # n=13, until=7
-    assert rag.session_summary(sess) == "v2"
+    assert rag.session_summary(sess, window=_LEGACY_WINDOW) == "v2"
     assert sess["compressed_history"]["covers_until_idx"] == 7
 
 
@@ -456,9 +465,9 @@ def test_session_summary_invalidates_cache_on_version_bump(monkeypatch):
 
     monkeypatch.setattr(rag, "_compress_turns", fake_compress)
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
-    rag.session_summary(sess)
+    rag.session_summary(sess, window=_LEGACY_WINDOW)
     monkeypatch.setattr(rag, "SESSION_SUMMARY_VERSION", rag.SESSION_SUMMARY_VERSION + 1)
-    out = rag.session_summary(sess)
+    out = rag.session_summary(sess, window=_LEGACY_WINDOW)
     assert call_count["n"] == 2
     assert out == "call2"
 
@@ -473,9 +482,9 @@ def test_session_summary_falls_back_to_cached_on_empty_compress(monkeypatch):
 
     monkeypatch.setattr(rag, "_compress_turns", fake_compress)
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
-    assert rag.session_summary(sess) == "good"
+    assert rag.session_summary(sess, window=_LEGACY_WINDOW) == "good"
     sess["turns"].extend([{"q": f"q{i}", "a": f"a{i}"} for i in range(10, 14)])
-    out = rag.session_summary(sess)
+    out = rag.session_summary(sess, window=_LEGACY_WINDOW)
     assert out == "good"  # falls back to cached, doesn't return empty
     # Cache should still reflect the original (idx=4), not the failed advance.
     assert sess["compressed_history"]["covers_until_idx"] == 4
@@ -484,7 +493,7 @@ def test_session_summary_falls_back_to_cached_on_empty_compress(monkeypatch):
 def test_session_summary_returns_none_when_compress_empty_no_cache(monkeypatch):
     monkeypatch.setattr(rag, "_compress_turns", lambda turns: "")
     sess = _sess_with_turns(rag.SESSION_COMPRESSION_THRESHOLD + 3)
-    assert rag.session_summary(sess) is None
+    assert rag.session_summary(sess, window=_LEGACY_WINDOW) is None
     assert "compressed_history" not in sess
 
 
@@ -493,7 +502,7 @@ def test_save_load_roundtrip_persists_compressed_history(sessions_tmp, monkeypat
     sess = rag.ensure_session("compress-rt", mode="chat")
     for i in range(rag.SESSION_COMPRESSION_THRESHOLD + 3):
         rag.append_turn(sess, {"q": f"q{i}", "a": f"a{i}"})
-    rag.session_summary(sess)
+    rag.session_summary(sess, window=_LEGACY_WINDOW)
     rag.save_session(sess)
 
     loaded = rag.load_session("compress-rt")

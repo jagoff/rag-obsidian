@@ -1670,7 +1670,13 @@ SESSIONS_DIR = Path.home() / ".local/share/obsidian-rag/sessions"
 LAST_SESSION_FILE = Path.home() / ".local/share/obsidian-rag/last_session"
 SESSION_TTL_DAYS = 30
 SESSION_MAX_TURNS = 50           # cap per file — keeps JSON small, bounds retrieval context
-SESSION_HISTORY_WINDOW = 6       # last N messages fed to reformulate_query / LLM
+# 2026-04-28 P3 (continuidad multi-turn): subido 6→10 (5 turnos user+assistant
+# vs 3 antes). Caso típico que tapaba la ventana de 6: turn 1 (long answer
+# del LLM) + turn 2 (clarification corta del user) + turn 3 (segunda
+# respuesta) ya consumía los 6 mensajes — el turn 4 perdía contexto del
+# turn 1 que era la pregunta original. Cap absoluto sigue en
+# SESSION_MAX_TURNS=50; este es el cap del WINDOW que se manda al LLM.
+SESSION_HISTORY_WINDOW = 10      # last N messages fed to reformulate_query / LLM
 SESSION_COMPRESSION_THRESHOLD = 7  # turn count at which compressed_history kicks in
 SESSION_SUMMARY_VERSION = 1      # bump if compressor prompt/format changes (invalidates cache)
 
@@ -13871,11 +13877,55 @@ _TOPIC_SHIFT_FOLLOWUP_RE = re.compile(
     r"resum[ií]me|"                             # "resumime eso"
     r"tradu[cz]i?[ií]?(?:me|lo|la)?|"           # "traducíme/traducilo"
     r"y\s+despu[eé]s|y\s+entonces|y\s+ahora|"  # "y después?"
-    r"recomend[aá]ri[aá]s|sugerir[ií]as)\b",   # "qué recomendarías"
+    r"recomend[aá]ri[aá]s|sugerir[ií]as|"      # "qué recomendarías"
+    # 2026-04-28 P3: extensiones rioplatenses que el regex anterior no
+    # cubría — cosine-an bajo (0.20-0.35) pero son CLARAMENTE referencias
+    # al turno anterior. Detectados en conversaciones reales con el bot.
+    r"contame\s+(?:m[aá]s|otra|c[oó]mo|qu[eé])|"   # "contame más", "contame otra cosa"
+    r"cont[aá]\s+(?:m[aá]s|otra)|"                  # "contá más" (más informal)
+    r"del\s+(?:primer[oa]?|segund[oa]|tercer[oa]?|"
+    r"otr[oa]|anterior|[uú]ltim[oa])\b|"            # "del primero", "del último", "del anterior"
+    r"\b(?:el|la)\s+(?:primer[oa]?|segund[oa]|"
+    r"[uú]ltim[oa])\s+(?:que|de|del)|"              # "el primero que dijiste"
+    r"alguna?\s+(?:otra|m[aá]s)\s+(?:cosa|opci[oó]n|idea|forma|manera)|"  # "alguna otra opción"
+    r"algo\s+m[aá]s\s+(?:sobre|de|que)|"            # "algo más sobre eso"
+    r"otra\s+vez\s+(?:eso|el|la|los|las)|"          # "otra vez eso?"
+    r"explic[aá](?:lo|la|me)\b|"                    # "explicalo", "explicame"
+    r"d[aá]le\s+(?:m[aá]s|otra|otro)|"              # "dale más", "dale otro"
+    r"y\s+(?:vos|usted|tu|tú)\s+qu[eé]|"            # "y vos qué pensás?" (continuación)
+    r"justo\s+(?:eso|esto|por\s+eso))\b",           # "justo eso quería preguntar"
+    # NOTA: "claro" / "bien" / "aha" sueltos NO se incluyen acá. Como acuses
+    # son anáforas reales, pero matchearlas en ANY position genera too
+    # many false-keeps ("entendí bien, qué es X" mantendría history aunque
+    # X sea unrelated). Lo dejo sin cubrir; si emerge como problema real,
+    # mejor agregar gate "starts-with acuse" + cosine combinado.
     re.IGNORECASE,
 )
 
-TOPIC_SHIFT_COSINE = 0.40
+# 2026-04-28 P3: bajado 0.40 → 0.32 tras feedback de continuidad multi-turn.
+# Caso reportado por el user: pregunta 1 + pregunta 2 relacionadas pero con
+# vocabulario distinto (paráfrasis sin overlap léxico) cosine-an en
+# 0.32-0.39 → con threshold 0.40 caía como "shift" y descartaba history,
+# las dos preguntas se respondían como conversaciones separadas.
+#
+# Trade-off del cambio:
+#   - Antes (0.40): false-shifts en paráfrasis = MAYORÍA de los problemas.
+#     False-keeps en cambios reales = pocos.
+#   - Ahora (0.32): false-shifts ↓ (paráfrasis con cosine 0.32-0.40 ahora
+#     mantienen history, fix correcto). False-keeps ↑ (cambios reales con
+#     cosine 0.32-0.40 mantienen history y traen contexto irrelevante al
+#     LLM). El balance neto se eligió tras ver que la mayoría de cambios
+#     REALES de tema en este vault caen en cosine < 0.30 (medido en
+#     conversaciones reales de RagNet 2026-04-26 a 2026-04-28).
+#
+# El borderline LLM reformulator del web server cubre [0.32, 0.70] —
+# cuando el cosine es ambigüo el LLM reformula la query con el contexto
+# del turn anterior antes del retrieve, mitigando los false-keeps.
+#
+# Si volvemos a ver "no encuentra relación entre turns": subir window
+# antes de bajar el cosine de nuevo. Si vemos "trae contexto random":
+# considerar volver a 0.40 y mejorar el regex de follow-ups en su lugar.
+TOPIC_SHIFT_COSINE = 0.32
 
 
 def detect_topic_shift(

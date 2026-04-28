@@ -22830,24 +22830,55 @@ def push_due_reminders_to_whatsapp(
 
 
 def _validate_scheduled_for(raw: object) -> str | None:
-    """Permissive ISO8601 validator para el campo opcional ``scheduled_for``.
+    """Validator + NL fallback parser para el campo opcional
+    ``scheduled_for``. Devuelve un ISO8601 string válido si pudo
+    interpretar la entrada, ``None`` si no.
 
-    Devuelve el string si parsea como ISO8601 (con o sin offset),
-    ``None`` en cualquier otro caso (input vacío, tipo distinto a str,
-    formato inválido). Permisivo a propósito: si el LLM emite algo
-    inesperado NO rompemos la proposal — la card sale igual sin
-    schedule (envío inmediato, comportamiento legacy).
+    Acepta DOS formatos:
+
+      1. ISO8601 directo ("2026-04-28T12:55:00-03:00"). Pasa-thru.
+      2. Lenguaje natural ("a las 12:55", "mañana 14:30", "el viernes
+         18hs"). Se resuelve via `_parse_natural_datetime` con
+         anchor=now y se serializa a ISO8601 con offset Argentina
+         (-03:00).
+
+    Por qué el fallback NL: qwen2.5:7b consistentemente alucinaba años
+    random cuando le pedíamos ISO8601 ("2028-11-29T12:55:00-03:00" para
+    "a las 12:55" de hoy, observado 2026-04-28). El system prompt ahora
+    le pide pasar NL — y este validator lo resuelve. Si el LLM igual
+    se equivoca y pasa ISO con año raro, lo dejamos pasar (responsabilidad
+    del LLM); este validator NO chequea "fecha futura" / "fecha razonable",
+    solo formato.
+
+    Permisivo a propósito: si el input es claramente inválido (vacío,
+    tipo distinto a str, ni ISO ni NL parseable) devuelve ``None`` y la
+    proposal sale sin schedule (envío inmediato, comportamiento legacy).
     """
     if not isinstance(raw, str):
         return None
     s = raw.strip()
     if not s:
         return None
+    # Fast path: already valid ISO8601.
     try:
         datetime.fromisoformat(s)
+        return s
     except (ValueError, TypeError):
-        return None
-    return s
+        pass
+    # Fallback: NL ("a las 12:55", "mañana 14:30", etc.). Anchor=now
+    # ensures the LLM doesn't have to know today's date — defense-in-
+    # depth on top of the system prompt that injects today's date.
+    try:
+        parsed = _parse_natural_datetime(s, now=datetime.now())
+    except Exception:
+        parsed = None
+    if isinstance(parsed, datetime):
+        # Format as ISO8601 with explicit Argentina offset. The parser
+        # returns naive datetime in BA local time; we attach -03:00
+        # explicitly so downstream code sees a timezone-aware ISO string
+        # consistent with what ISO inputs look like.
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    return None
 
 
 def propose_whatsapp_send(

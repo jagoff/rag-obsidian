@@ -1633,83 +1633,127 @@ _WEB_SYSTEM_PROMPT = (
 # was the literal example → model responded with exactly that text,
 # tool_rounds=0). The override now makes the tool call the PRIMARY
 # action and describes the response shape abstractly.
-_PROPOSE_CREATE_OVERRIDE = (
-    "El usuario te pide REGISTRAR algo (recordatorio, evento de "
-    "calendario, mensaje de WhatsApp, mail). Las tools disponibles "
-    "están en el schema que te pasa Ollama — invocalas como tool_calls "
-    "del protocolo, no como texto ni como prosa.\n\n"
-    "Criterio de selección:\n"
-    "  - propose_calendar_event → visitas, cumpleaños, reuniones, "
-    "    turnos médicos, viajes, vacaciones, feriados (cosas con fecha/"
-    "    hora que vivirán en Apple Calendar).\n"
-    "  - propose_reminder → tareas, pagos, llamadas, cosas para "
-    "    acordarse (Apple Reminders).\n"
-    "  - propose_whatsapp_send → mandar un mensaje a un tercero. "
-    "    Verbos rioplatenses: 'mandale/enviale/decile/escribile a "
-    "    <Contacto>'. Ver reglas detalladas abajo.\n"
-    "  - propose_whatsapp_reply → responder a UN mensaje específico "
-    "    que el user recibió ('respondele/contestale a <X> al del...'). "
-    "    Distinto al send.\n"
-    "  - propose_whatsapp_send_note → mandar el contenido de una nota "
-    "    del vault ('pasale a <X> la receta de Y').\n"
-    "  - propose_whatsapp_send_contact_card → mandar el tel/email/dir "
-    "    de un contacto ('pasale a <X> el teléfono de <Y>').\n"
-    "  - propose_mail_send → mandar un email via Gmail.\n\n"
-    "Para el título de eventos/reminders: extraé el sustantivo + "
-    "contexto del mensaje (sin fechas, sin horas). Ej: 'cumpleaños de "
-    "Astor el viernes' → título 'cumpleaños de Astor'.\n\n"
-    "Para la fecha/hora de eventos/reminders: pasala EXACTAMENTE como "
-    "la dijo el usuario ('el viernes', 'mañana a las 10', 'el "
-    "miercoles'). La tool la parsea con anchor de hoy. Si el usuario "
-    "no dio hora, no pasés ningún campo de hora — la tool detecta sola "
-    "que es all-day.\n\n"
-    # ── WhatsApp-specific rules — el bug del 2026-04-28 mostró que el
-    # docstring de propose_whatsapp_send + reglas genéricas no alcanza
-    # con qwen2.5:7b. Hay que ser MUY explícito acá porque el modelo
-    # tiende a (a) truncar el body cuando ve palabras tipo "programado"
-    # / "urgente" pensando que son meta-descripciones, y (b) ignorar
-    # "a las HH:MM" como horario de envío.
-    "REGLAS DE WHATSAPP (críticas, el modelo se equivoca seguido):\n\n"
-    "  1) `message_text` es LITERAL hasta el FINAL del prompt. Cuando "
-    "el user dice 'diciendo: X' / 'que diga: X' / ': X', TODO lo que "
-    "viene después de los dos puntos es el cuerpo, hasta el final, "
-    "incluyendo signos de exclamación, palabras tipo 'programado'/"
-    "'urgente'/'de aviso', emojis, todo. NO interpretes 'mensaje "
-    "programado' como meta-descripción del envío y la saques del "
-    "cuerpo: es texto literal que el user quiere mandar. Si el user "
-    "dice 'mandale: Hola! mensaje programado' → message_text=\"Hola! "
-    "mensaje programado\" (no \"Hola!\").\n\n"
-    "  2) `scheduled_for` (campo OPCIONAL): si el user mencionó hora/"
-    "fecha futura, pasala como ISO8601 con offset -03:00. Patterns "
-    "que SIEMPRE disparan scheduled_for:\n"
-    "       - 'a las HH:MM' / 'a las HHhs' → hoy a esa hora si está "
-    "         en el futuro, mañana si ya pasó. Ej: 'mandale a Mama a "
-    "         las 11:55' → scheduled_for=\"<hoy>T11:55:00-03:00\". "
-    "         Este es el caso que más se olvida: si ves 'a las HH:MM' "
-    "         en el prompt, NO ENTRES en envío inmediato; pasá "
-    "         scheduled_for.\n"
-    "       - 'mañana <hora>' / 'el viernes 14:30' / 'el 5 de mayo a "
-    "         las 18hs' → resolver fecha y pasar ISO.\n"
-    "       - 'en 2 horas' / 'en 30 minutos' → now + delta.\n"
-    "       - 'esta tarde'/'esta noche'/'mañana temprano' → 16:00/"
-    "         20:00/08:00 default y pasá scheduled_for.\n"
-    "     Si el user NO mencionó fecha/hora, OMITÍ el arg. NO pongas "
-    "null. NO inventes fecha.\n\n"
-    "  3) EJEMPLO CANÓNICO combinando 1 y 2: 'mandale a mi mamá a "
-    "las 11:55 diciendo: Hola! mensaje programado' →\n"
-    "       propose_whatsapp_send(\n"
-    "           contact_name=\"mama\",\n"
-    "           message_text=\"Hola! mensaje programado\",\n"
-    "           scheduled_for=\"<hoy>T11:55:00-03:00\"\n"
-    "       )\n"
-    "     NUNCA truncar a \"Hola!\". NUNCA omitir scheduled_for.\n\n"
-    "Después del tool call, el siguiente turn del assistant (sin tool "
-    "calls) es UNA oración breve de confirmación. No repitas los "
-    "campos (el usuario los ve en el chip inline del chat).\n\n"
-    "No cites notas del vault, no inventes paths, no menciones "
-    "REGLA 1. El único output válido acá es un tool_call en el "
-    "protocolo; imprimir el call como texto es un bug."
-)
+_WD_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+
+def _build_propose_create_override(today: datetime | None = None) -> str:
+    """Build the create-intent system override string with today's date
+    injected. The LLM (qwen2.5:7b) is bad at knowing what "today" is
+    out-of-the-box — sin esto, pidiéndole "a las 12:55" emite ISO con
+    año/mes random ("2028-11-29T12:55:00-03:00" observado 2026-04-28).
+    Pinearle la fecha actual al inicio del prompt evita el
+    hallucinated-date failure mode.
+
+    `today` se inyecta por request (el caller pasa `datetime.now()`).
+    Esto rompe el prefix-cache de ollama por turn (la fecha cambia día
+    a día), pero es trade-off aceptable: create-intent turns son raros
+    comparado con read-intent, y el cache cold de la primera frase no
+    impacta la latencia perceived (el LLM igual se toma 1-2s en
+    arrancar a generar tool_calls).
+
+    También enseña al modelo a pasar `scheduled_for` como NL ("a las
+    12:55") en lugar de ISO — _validate_scheduled_for ahora hace
+    fallback a _parse_natural_datetime, así no le exigimos al LLM que
+    haga date math (que históricamente le sale mal).
+    """
+    if today is None:
+        today = datetime.now()
+    today_str = f"{_WD_ES[today.weekday()]} {today.strftime('%Y-%m-%d')}"
+    now_str = today.strftime("%H:%M")
+    iso_today = today.strftime("%Y-%m-%d")
+
+    return (
+        f"Hoy es {today_str}, son las {now_str} (Argentina, UTC-3). "
+        "Usá esto como anchor para resolver fechas relativas como "
+        "'mañana', 'el viernes', 'a las HH:MM'.\n\n"
+        "El usuario te pide REGISTRAR algo (recordatorio, evento de "
+        "calendario, mensaje de WhatsApp, mail). Las tools disponibles "
+        "están en el schema que te pasa Ollama — invocalas como tool_calls "
+        "del protocolo, no como texto ni como prosa.\n\n"
+        "Criterio de selección:\n"
+        "  - propose_calendar_event → visitas, cumpleaños, reuniones, "
+        "    turnos médicos, viajes, vacaciones, feriados (cosas con "
+        "    fecha/hora que vivirán en Apple Calendar).\n"
+        "  - propose_reminder → tareas, pagos, llamadas, cosas para "
+        "    acordarse (Apple Reminders).\n"
+        "  - propose_whatsapp_send → mandar un mensaje a un tercero. "
+        "    Verbos rioplatenses: 'mandale/enviale/decile/escribile a "
+        "    <Contacto>'. Ver reglas detalladas abajo.\n"
+        "  - propose_whatsapp_reply → responder a UN mensaje específico "
+        "    que el user recibió ('respondele/contestale a <X> al "
+        "    del...'). Distinto al send.\n"
+        "  - propose_whatsapp_send_note → mandar el contenido de una "
+        "    nota del vault ('pasale a <X> la receta de Y').\n"
+        "  - propose_whatsapp_send_contact_card → mandar el tel/email/"
+        "    dir de un contacto ('pasale a <X> el teléfono de <Y>').\n"
+        "  - propose_mail_send → mandar un email via Gmail.\n\n"
+        "Para el título de eventos/reminders: extraé el sustantivo + "
+        "contexto del mensaje (sin fechas, sin horas). Ej: 'cumpleaños "
+        "de Astor el viernes' → título 'cumpleaños de Astor'.\n\n"
+        "Para la fecha/hora de eventos/reminders: pasala EXACTAMENTE "
+        "como la dijo el usuario ('el viernes', 'mañana a las 10', 'el "
+        "miercoles'). La tool la parsea con anchor de hoy. Si el "
+        "usuario no dio hora, no pasés ningún campo de hora — la tool "
+        "detecta sola que es all-day.\n\n"
+        # ── WhatsApp-specific rules — el bug del 2026-04-28 mostró que
+        # el docstring de propose_whatsapp_send + reglas genéricas no
+        # alcanza con qwen2.5:7b. Hay que ser MUY explícito acá porque
+        # el modelo tiende a (a) truncar el body cuando ve palabras
+        # tipo "programado"/"urgente" pensando que son meta-descrip-
+        # ciones, (b) ignorar "a las HH:MM" como horario de envío, y
+        # (c) hallucinar fechas (emitir "2028-11-29" para "a las 12:55"
+        # de hoy). Las reglas abajo + el anchor de fecha al inicio
+        # del prompt mitigan los tres modos de falla.
+        "REGLAS DE WHATSAPP (críticas, el modelo se equivoca seguido):\n\n"
+        "  1) `message_text` es LITERAL hasta el FINAL del prompt. "
+        "Cuando el user dice 'diciendo: X' / 'que diga: X' / ': X', "
+        "TODO lo que viene después de los dos puntos es el cuerpo, "
+        "hasta el final, incluyendo signos de exclamación, palabras "
+        "tipo 'programado'/'urgente'/'de aviso', emojis, todo. NO "
+        "interpretes 'mensaje programado' como meta-descripción del "
+        "envío y la saques del cuerpo: es texto literal que el user "
+        "quiere mandar. Si el user dice 'mandale: Hola! mensaje "
+        "programado' → message_text=\"Hola! mensaje programado\" (no "
+        "\"Hola!\").\n\n"
+        "  2) `scheduled_for` (campo OPCIONAL): si el user mencionó "
+        "hora/fecha futura, pasala. **La tool acepta DOS formatos** y "
+        "tu mejor opción es la primera:\n"
+        "     a) **Lenguaje natural EXACTO** como lo dijo el user — "
+        "        'a las 12:55', 'mañana 14:30', 'el viernes 18hs', "
+        "        'en 2 horas'. La tool corre _parse_natural_datetime "
+        "        con anchor=hoy, así que NO necesitás computar la "
+        "        fecha. Esta es la forma RECOMENDADA — el modelo "
+        "        consistentemente alucina años random cuando intenta "
+        "        emitir ISO ('2028-11-29' para algo de hoy, observado).\n"
+        f"     b) ISO8601 completo con offset -03:00 ('{iso_today}"
+        "T12:55:00-03:00'). Sólo si tenés ALTA confianza en la fecha. "
+        "Si tenés duda, usá (a).\n"
+        "     Patterns que SIEMPRE disparan scheduled_for (cualquier "
+        "formato):\n"
+        "       - 'a las HH:MM' / 'a las HHhs'\n"
+        "       - 'mañana <hora>' / 'el <día> <hora>' / 'el <fecha> a "
+        "         las <hora>'\n"
+        "       - 'en N horas/minutos/días'\n"
+        "       - 'esta tarde' / 'esta noche' / 'mañana temprano'\n"
+        "     Si el user NO mencionó fecha/hora, OMITÍ el arg. NO "
+        "pongas null. NO inventes fecha.\n\n"
+        "  3) EJEMPLO CANÓNICO con NL (preferido):\n"
+        "       'mandale a mi mamá a las 11:55 diciendo: Hola! mensaje "
+        "programado' →\n"
+        "       propose_whatsapp_send(\n"
+        "           contact_name=\"mama\",\n"
+        "           message_text=\"Hola! mensaje programado\",\n"
+        "           scheduled_for=\"a las 11:55\"\n"
+        "       )\n"
+        "     NUNCA truncar a \"Hola!\". NUNCA omitir scheduled_for. "
+        "NUNCA inventar año/mes random.\n\n"
+        "Después del tool call, el siguiente turn del assistant (sin "
+        "tool calls) es UNA oración breve de confirmación. No repitas "
+        "los campos (el usuario los ve en el chip inline del chat).\n\n"
+        "No cites notas del vault, no inventes paths, no menciones "
+        "REGLA 1. El único output válido acá es un tool_call en el "
+        "protocolo; imprimir el call como texto es un bug."
+    )
 
 
 @_on_startup
@@ -9699,7 +9743,8 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # with prior turns, no pronouns to resolve against earlier context.
         if is_propose_intent:
             _system_msgs: list[dict] = [
-                {"role": "system", "content": _PROPOSE_CREATE_OVERRIDE},
+                {"role": "system",
+                 "content": _build_propose_create_override(datetime.now())},
             ]
             _turn_history: list[dict] = []
         else:

@@ -102,6 +102,95 @@ if [ "${fails}" -ge "${FAIL_THRESHOLD}" ]; then
   fi
 fi
 
+# ── Nightly catchup — plists con StartCalendarInterval que se saltearon ────
+# macOS launchd se saltea schedules con StartCalendarInterval cuando la
+# Mac está dormida en el horario programado (no hay catch-up retroactivo).
+# Para mac laptops esto pasa típicamente con plists nightly como wake-up
+# (4am) o consolidate (lunes 6am) — observado el 2026-04-27 con `runs=0`
+# después de 17h+ instalado.
+#
+# Estrategia: este watchdog ya corre cada 60s. Aprovechamos la cadencia
+# para detectar plists nightly cuyo log no se actualizó hace > su window
+# esperada + buffer. Si pasa, kickstart manual.
+#
+# Cada entry: LABEL_SUFFIX:LOG_BASENAME:MAX_AGE_SECONDS
+#   - LABEL_SUFFIX se concatena con `com.fer.obsidian-rag-`
+#   - LOG_BASENAME es el archivo en ~/.local/share/obsidian-rag/
+#   - MAX_AGE_SECONDS antes de considerarlo missed
+#
+# Schedules conocidos:
+#   wake-up:     daily 4am           → 26h max age (24h ciclo + 2h buffer)
+#   archive:     daily 23h           → 26h max age
+#   consolidate: weekly mon 6am      → 8d max age (7d ciclo + 1d buffer)
+#   digest:      weekly sun 22h      → 8d max age
+#   patterns:    weekly sun 20h      → 8d max age
+#   emergent:    weekly fri 10am     → 8d max age
+#
+# Si querés pausar el catchup: setear RAG_WATCHDOG_CATCHUP_DISABLED=1.
+
+if [ -z "${RAG_WATCHDOG_CATCHUP_DISABLED:-}" ]; then
+  NIGHTLY_PLISTS=(
+    "wake-up:wake-up.log:93600"
+    "archive:archive.log:93600"
+    "consolidate:consolidate.log:691200"
+    "digest:digest.log:691200"
+    "patterns:patterns.log:691200"
+    "emergent:emergent.log:691200"
+  )
+
+  catchup_state="${STATE_DIR}/serve-watchdog.catchup.state"
+  # Cooldown por plist — evita kickstart repetido si el plist en sí está
+  # tardando mucho. Si ya kickstart en los últimos N segundos, skip.
+  CATCHUP_COOLDOWN_SEC="${RAG_CATCHUP_COOLDOWN_SEC:-3600}"  # 1h
+  catchup_now=$(date +%s)
+
+  for entry in "${NIGHTLY_PLISTS[@]}"; do
+    suffix="${entry%%:*}"
+    rest="${entry#*:}"
+    log_basename="${rest%%:*}"
+    max_age="${rest##*:}"
+    nightly_label="com.fer.obsidian-rag-${suffix}"
+    nightly_log="${STATE_DIR}/${log_basename}"
+
+    # ¿Ya kickstart-eamos este plist recientemente? Skip si sí.
+    last_kick_var="last_catchup_${suffix//-/_}"
+    last_kick=0
+    if [ -f "${catchup_state}" ]; then
+      last_kick=$(grep "^${last_kick_var}=" "${catchup_state}" 2>/dev/null \
+                  | tail -1 | cut -d'=' -f2)
+      last_kick="${last_kick:-0}"
+    fi
+    if [ $(( catchup_now - last_kick )) -lt "${CATCHUP_COOLDOWN_SEC}" ]; then
+      continue
+    fi
+
+    # Determinar la "edad" del último run. Si el log no existe O su mtime
+    # es viejo, considerar missed.
+    if [ ! -f "${nightly_log}" ]; then
+      age="${max_age}"  # tratado como > max_age → trigger
+    else
+      log_mtime=$(stat -f "%m" "${nightly_log}" 2>/dev/null || echo "0")
+      age=$(( catchup_now - log_mtime ))
+    fi
+
+    if [ "${age}" -gt "${max_age}" ]; then
+      log "CATCHUP    — ${suffix} last_log_mtime=${age}s > ${max_age}s → kickstart"
+      if launchctl kickstart "${DOMAIN}/${nightly_label}" 2>>"${LOG}"; then
+        # Append al state file (read all entries, replace this one)
+        tmp_state="${catchup_state}.tmp.$$"
+        if [ -f "${catchup_state}" ]; then
+          grep -v "^${last_kick_var}=" "${catchup_state}" > "${tmp_state}" 2>/dev/null || true
+        fi
+        printf '%s=%s\n' "${last_kick_var}" "${catchup_now}" >> "${tmp_state}"
+        mv -f "${tmp_state}" "${catchup_state}"
+        log "CATCHUP_OK — kickstart ${nightly_label}"
+      else
+        log "CATCHUP_FAIL — ${nightly_label} (label registered? domain ok?)"
+      fi
+    fi
+  done
+fi
+
 # Persist state. Sobreescribe atómicamente via temp+rename.
 tmp="${STATE}.tmp.$$"
 {

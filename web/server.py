@@ -9775,11 +9775,18 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # también: para "lista todas X" valen las paraphrases
             # ("notas sobre X", "archivos con X", "menciones de X")
             # — el costo de la 2da call al qwen2.5:3b reformer (1-3s)
-            # es aceptable para queries de exploración. Cap k=12 para
-            # que el contexto post-retrieve no explote num_ctx=4096.
+            # es aceptable para queries de exploración.
+            #
+            # Iteración 1 (mismo día): k=12 + multi_query=True saturaba
+            # el num_ctx=4096 — Playwright autónomo midió ttft=107820ms
+            # con timeout en synthesis. El context post-tools llegaba a
+            # ~30k chars y qwen2.5:7b prefill no terminaba a tiempo.
+            # Compromiso: k=8 (2x el default sin list intent) + pool=15
+            # da más recall sin saturar el modelo. El user que quiere
+            # 12+ resultados puede iterar pidiendo "más" en el chat.
             _is_list_intent = bool(_LIST_INTENT_RE.search(search_question))
-            _retrieve_k = 12 if _is_list_intent else 4
-            _retrieve_pool = 20 if _is_list_intent else 5
+            _retrieve_k = 8 if _is_list_intent else 4
+            _retrieve_pool = 15 if _is_list_intent else 5
             _retrieve_multi_query = _is_list_intent
             result = multi_retrieve(
                 vaults, search_question, _retrieve_k, None, history, None, False,

@@ -5512,6 +5512,100 @@ class _IberianLeakFilter:
         return _normalize_canonical_filenames(_replace_iberian_leaks(tail))
 
 
+# 2026-04-28 wave-5: el LLM (qwen2.5:7b) ocasionalmente emite la SINTAXIS
+# de un tool call como TEXTO en vez de invocar el tool real via el
+# protocol. Repro Playwright:
+#   - "agendá mi cumpleaños el 12 de febrero" → response:
+#     `propose_calendar_event(title="cumpleaños", date="el 12 de febrero")`
+#   - "recordame X" → response: `propose_reminder(title='X', when='')`
+#   - "clima en Mendoza para mañana" → "工具调用：propose_weather_forecast(...)"
+# El tool nunca se ejecuta, el user ve el call como prosa. Es un model bug
+# que ningún prompt arregla 100%. Fix: stripper que detecta el patrón
+# `<tool_name>(args...)` en los primeros chars del stream y lo reemplaza
+# por una clarificación.
+_RAW_TOOL_CALL_RE = re.compile(
+    r"^\s*"
+    r"(?:工具调用[：:]\s*)?"  # opcional prefijo en chino
+    r"(?P<name>(?:propose_|search_|read_|gmail_|whatsapp_|calendar_|reminders_|weather|drive_|finance_|credit_|record_)\w*)"
+    r"\s*\([^)]{0,300}\)?",
+    re.IGNORECASE,
+)
+
+
+def _detect_raw_tool_call(text: str) -> str | None:
+    """Returns the matched tool name if `text` starts with a raw tool-call
+    syntax. None otherwise. Used to short-circuit synthesis output that
+    leaked tool-call markup instead of executing it.
+    """
+    if not text:
+        return None
+    m = _RAW_TOOL_CALL_RE.match(text)
+    if not m:
+        return None
+    return (m.group("name") or "").lower()
+
+
+class _RawToolCallStripper:
+    """Streaming filter que detecta raw tool-call syntax al inicio del
+    stream y la reemplaza con una clarificación amigable. Buffer first
+    ~120 chars antes de decidir; si match → swallow + emit clarification;
+    si no → flush + pass-through del resto.
+    """
+
+    _BUFFER_CAP = 120
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._decided = False
+        self._was_raw_tool_call = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        if self._decided:
+            # Si detectamos raw tool call al inicio, swallow TODO el resto del
+            # stream — el LLM va a seguir emitiendo el resto del call (params,
+            # cierre de paréntesis, etc.) que NO queremos mostrar al user. Ya
+            # emitimos la clarificación, no agregamos nada más.
+            if self._was_raw_tool_call:
+                return ""
+            return chunk
+        self._buf += chunk
+        # Decisión rápida si ya tenemos suficientes chars.
+        if len(self._buf) >= self._BUFFER_CAP:
+            return self._decide_and_flush()
+        return ""
+
+    def _decide_and_flush(self) -> str:
+        self._decided = True
+        m = _RAW_TOOL_CALL_RE.match(self._buf)
+        if m:
+            self._was_raw_tool_call = True
+            tool = (m.group("name") or "tool").lower()
+            self._buf = ""  # discard buffered raw tool call syntax
+            # Clarification messages tailored al tool detectado.
+            clarif = {
+                "propose_reminder": "Necesito un poco más para crearte el recordatorio. Decime qué querés que te recuerde y cuándo (ej: 'recordame llamar al banco el lunes a las 9am').",
+                "propose_calendar_event": "Para agendar el evento necesito el detalle. Decime qué evento y cuándo (ej: 'agendá reunión con Pedro el miércoles a las 4pm').",
+                "propose_whatsapp_send": "Para mandar el WhatsApp decime a quién y qué (ej: 'mensajeale a María: nos vemos a las 8').",
+                "weather": "Para el clima decime qué ciudad (ej: 'clima en Buenos Aires' o 'pronóstico Madrid mañana').",
+            }.get(tool, f"Necesito un poco más de detalle para usar la tool `{tool}`. Probá reformular con más contexto.")
+            return clarif
+        # No es raw tool call — flush normal.
+        out = self._buf
+        self._buf = ""
+        return out
+
+    def flush(self) -> str:
+        if self._decided:
+            if self._was_raw_tool_call:
+                return ""
+            tail = self._buf
+            self._buf = ""
+            return tail
+        return self._decide_and_flush()
+
+
 class _InlineCitationStripper:
     """Streaming filter that elides `[Title](path.md)` from LLM output.
 
@@ -11033,6 +11127,11 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # No override de num_ctx — pin al valor pre-loaded.
 
         parts: list[str] = []
+        # Pipeline orden: raw_tool_call → citation → iberian.
+        # raw_tool_call PRIMERO porque puede swallow los primeros 120 chars
+        # antes de que pasen al resto del pipeline (early-exit si el LLM
+        # leaked tool-call syntax).
+        raw_tool_filter = _RawToolCallStripper()
         stripper = _InlineCitationStripper()
         # 2026-04-23: chain de filtro de leaks portugueses/gallegos
         # (qwen2.5:7b se contagia del CONTEXTO de WhatsApp con
@@ -11062,12 +11161,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 if not _first_token_logged:
                     _t_first_token = time.perf_counter()
                     _first_token_logged = True
-                filtered = stripper.feed(delta)
+                pre = raw_tool_filter.feed(delta)
+                if not pre:
+                    continue
+                filtered = stripper.feed(pre)
                 if filtered:
                     cleaned = iberian.feed(filtered)
                     if cleaned:
                         parts.append(cleaned)
                         yield _sse("token", {"delta": cleaned})
+            # Flush raw_tool_filter primero (puede emitir clarificación).
+            raw_tail = raw_tool_filter.flush()
+            if raw_tail:
+                filtered_raw_tail = stripper.feed(raw_tail)
+                if filtered_raw_tail:
+                    cleaned_raw_tail = iberian.feed(filtered_raw_tail)
+                    if cleaned_raw_tail:
+                        parts.append(cleaned_raw_tail)
+                        yield _sse("token", {"delta": cleaned_raw_tail})
             # Flush any tail that was held back waiting for a close-paren.
             tail = stripper.flush()
             if tail:
@@ -11080,6 +11191,14 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             if final_tail:
                 parts.append(final_tail)
                 yield _sse("token", {"delta": final_tail})
+            # 2026-04-28 wave-5: log si emitimos clarificación de raw tool call.
+            if raw_tool_filter._was_raw_tool_call:
+                print(
+                    f"[chat-raw-tool-call] LLM leaked tool-call syntax — "
+                    f"replaced with clarification. tools_fired={tool_names_called or 'none'} "
+                    f"is_propose={is_propose_intent}",
+                    flush=True,
+                )
         except Exception as exc:
             # Diagnóstico: sin este print el server NO loggea NADA cuando el
             # frontend muestra "LLM falló: timed out". Debugear regresiones
@@ -11101,6 +11220,28 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 f"got_first_token={_first_token_logged} parts_so_far={len(parts)}",
                 flush=True,
             )
+            # 2026-04-28 wave-5: auto-recovery on synthesis ReadTimeout.
+            # Si llegamos acá con ttft=90s+ y got_first_token=False, el daemon
+            # está wedged — el preflight `_ollama_chat_probe` pasó pero el
+            # /api/chat real cuelga. Spawn restart en background thread (no
+            # bloqueamos el response al user, que ya se va a ir con error)
+            # para que la PRÓXIMA request no caiga en el mismo wedge.
+            # Threshold 75s+ porque eso es más que cualquier cold-load
+            # legítimo (15s peor caso documentado en chat-timing logs).
+            _exc_type_str = type(exc).__name__
+            if (
+                _exc_type_str in ("ReadTimeout", "RemoteProtocolError")
+                and _err_ttft_ms >= 75000
+                and not _first_token_logged
+            ):
+                def _bg_restart():
+                    try:
+                        print(f"[ollama-auto-recovery] triggering after {_exc_type_str} ttft={_err_ttft_ms}ms", flush=True)
+                        ok = _ollama_restart_if_stuck()
+                        print(f"[ollama-auto-recovery] result ok={ok}", flush=True)
+                    except Exception as _bg_exc:
+                        print(f"[ollama-auto-recovery] error: {_bg_exc!r}", flush=True)
+                threading.Thread(target=_bg_restart, daemon=True, name="ollama-auto-recovery").start()
             yield _sse("error", {"message": f"LLM falló: {exc}"})
             # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
             yield _sse("done", {"error": True, "top_score": 0.0})  # BUG #31

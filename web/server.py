@@ -1695,6 +1695,23 @@ def _build_propose_create_override(today: datetime | None = None) -> str:
         "miercoles'). La tool la parsea con anchor de hoy. Si el "
         "usuario no dio hora, no pasés ningún campo de hora — la tool "
         "detecta sola que es all-day.\n\n"
+        # ── Reminder/Calendar slim rules — historia 2026-04-28: intenté
+        # agregar reglas detalladas + ejemplos para que el modelo no
+        # omita `when` (reminder) ni `recurrence_text="yearly"` (cumples).
+        # Resultado: el override se infló a 5300+ chars y el modelo
+        # se confundía rutiando reminders a propose_whatsapp_send. La
+        # versión minimal abajo es suficiente para que el modelo
+        # entienda los basics — las reglas detalladas viven en los
+        # docstrings de los tools (que el modelo SÍ ve via el JSON
+        # schema). Si en el futuro hace falta endurecer, mejor un
+        # override DEDICADO por tipo de propose-intent que uno gigante
+        # único — ver `_detect_propose_intent` para discriminar.
+        "Para reminders: si el user mencionó cualquier hint temporal "
+        "(día, hora, 'mañana'), pasalo en `when`. Si no hubo hint, "
+        "dejá `when` vacío.\n\n"
+        "Para cumples y aniversarios: usá `propose_calendar_event` "
+        "(no reminder) con `all_day` true y `recurrence_text` 'yearly' "
+        "para que el evento se repita cada año.\n\n"
         # ── WhatsApp-specific rules — el bug del 2026-04-28 mostró que
         # el docstring de propose_whatsapp_send + reglas genéricas no
         # alcanza con qwen2.5:7b. Hay que ser MUY explícito acá porque

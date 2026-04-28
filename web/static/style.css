@@ -890,6 +890,40 @@ body {
   padding-left: 2ch;
 }
 
+/* Auto-retry row — sits debajo del .error rojo cuando detectamos un
+   network error transitorio (ej. el web server reinició mid-stream).
+   Mismo padding que .error/.meta para alinear con la columna de texto.
+   Color amarillo (no rojo) porque es un estado intermedio: "el error
+   ya pasó, estoy reintentando". 2026-04-28 MEDIUM #12. */
+.retry-row {
+  color: var(--yellow);
+  font-size: 13px;
+  padding-left: 2ch;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.retry-status {
+  flex: 0 0 auto;
+}
+.retry-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 80ms, border-color 80ms;
+}
+.retry-cancel-btn:hover,
+.retry-cancel-btn:focus-visible {
+  color: var(--text);
+  border-color: var(--text);
+  outline: none;
+}
+
 .thinking {
   padding-left: 2ch;
   display: flex;
@@ -4662,6 +4696,40 @@ body {
   color: var(--red);
   font-size: 13px;
   padding-left: 2ch;
+}
+
+/* Auto-retry row — sits debajo del .error rojo cuando detectamos un
+   network error transitorio (ej. el web server reinició mid-stream).
+   Mismo padding que .error/.meta para alinear con la columna de texto.
+   Color amarillo (no rojo) porque es un estado intermedio: "el error
+   ya pasó, estoy reintentando". 2026-04-28 MEDIUM #12. */
+.retry-row {
+  color: var(--yellow);
+  font-size: 13px;
+  padding-left: 2ch;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.retry-status {
+  flex: 0 0 auto;
+}
+.retry-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 80ms, border-color 80ms;
+}
+.retry-cancel-btn:hover,
+.retry-cancel-btn:focus-visible {
+  color: var(--text);
+  border-color: var(--text);
+  outline: none;
 }
 
 .thinking {

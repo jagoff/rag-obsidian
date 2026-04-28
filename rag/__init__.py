@@ -42961,6 +42961,25 @@ def _web_plist(rag_bin: str) -> str:
         if youtube_key else ""
     )
     chat_model = os.environ.get("OBSIDIAN_RAG_WEB_CHAT_MODEL", "qwen2.5:7b")
+    # 2026-04-28 (eval Playwright MEDIUM #12 — server crashes mid-conversation):
+    # `launchctl print` mostraba `runs = 46` en 2h con un mix de SIGKILL by
+    # launchd[1] + SIGTERM-then-SIGKILL escalado. Diagnóstico:
+    #   1. RAG_MEMORY_PRESSURE_THRESHOLD default=85% reaccionaba TARDE — el
+    #      jetsam macOS pegaba antes que el watchdog descargara modelos.
+    #      Bajamos a 80% para desalojar chat model + reranker proactivamente.
+    #   2. ExitTimeOut implícito de 5s (visible en `launchctl print`) cortaba
+    #      el graceful shutdown de uvicorn cuando había una SSE en vuelo:
+    #      launchd → SIGTERM → 5s → SIGKILL aunque la respuesta estuviera
+    #      por terminar. 20s da margen al pipeline de chat (typical 8-15s
+    #      end-to-end) para drenar antes que escale a SIGKILL.
+    #   3. ProcessType=Interactive le indica a launchd que es un servicio
+    #      foreground (web UI activamente en uso) → menos agresivo bajo
+    #      memory pressure. Sin esto launchd lo trataba como Background,
+    #      jetsam priority alta, primero en la cola para morir.
+    # Síntoma user-facing pre-fix: "tu › qué decías sobre LangChain? error:
+    # network error" + "tu › a ver si tengo otra referencia error: Failed to
+    # fetch" — 2 turnos perdidos por turno de respawn. Ver
+    # docs/eval-2026-04-28/playwright-conversations-bug-log.md MEDIUM #12.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42984,10 +43003,13 @@ def _web_plist(rag_bin: str) -> str:
     <key>HF_HUB_OFFLINE</key><string>1</string>
     <key>TRANSFORMERS_OFFLINE</key><string>1</string>
     <key>RAG_MEMORY_PRESSURE_INTERVAL</key><string>20</string>
+    <key>RAG_MEMORY_PRESSURE_THRESHOLD</key><string>80</string>
 {yt_line}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>20</integer>
+  <key>ProcessType</key><string>Interactive</string>
   <key>WorkingDirectory</key><string>{working_dir}</string>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/web.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/web.error.log</string>

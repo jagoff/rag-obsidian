@@ -284,7 +284,7 @@ Conv 1, T1: qué dice mi nota Ikigai
 
 ---
 
-### ⚠️ MEDIUM #12 — Server crashes mid-conversation ocasionalmente
+### ✅ MEDIUM #12 — Server crashes mid-conversation ocasionalmente — FIXED 2026-04-28
 
 **Repro:**
 ```
@@ -295,14 +295,27 @@ Conv 8, T4: olvidemos esto, qué hago hoy? → ✅ recovered
 
 **Impacto:** el user pierde 2 turns de la conversación. El recovery tarda ~30s.
 
-**Causa probable:** el web server se reinicia (ver logs `INFO: Started server process [...]`). Probablemente Ollama wedge → auto-recovery se gatilla → kill ollama → web server pierde la conexión actual → uvicorn restarting.
+**Causa real (post-investigación 2026-04-28):** la hipótesis original ("ollama wedge → auto-recovery") era parcial. El verdadero culprit es **`launchctl print` mostraba `runs = 46` en 2h** con un mix de:
+- `SIGKILL by launchd[1]` — jetsam macOS killing el web server bajo memory pressure (qwen2.5:7b + reranker + bge-m3 saturando los 36 GB unified).
+- `SIGTERM-then-SIGKILL` escalado — graceful shutdown cortado a los 5s (default `ExitTimeOut`) cuando había una SSE en vuelo, escalado a SIGKILL con la respuesta a medio drenar.
 
-**Fix sugerido:**
-1. El auto-recovery NO debería matar el web server. Solo Ollama.
-2. Verificar que `_ollama_restart_if_stuck()` no afecte el server uvicorn.
-3. Si la query actual está in-flight cuando se gatilla recovery, devolver un error específico: "El motor LLM se reinició — probá de nuevo".
+Cuando eso pasa, el browser ve `Failed to fetch` (intentando POST durante el respawn de ~30s de launchd) o `network error` (body interrumpido mid-stream).
 
-**Prioridad:** P2.
+**Fix shippeado:**
+1. **Plist hardening** (`rag/__init__.py:_web_plist` + plist instalado):
+   - `RAG_MEMORY_PRESSURE_THRESHOLD=80` (era 85 default) → desaloja chat model + reranker proactivamente, antes que jetsam pegue.
+   - `ExitTimeOut=20` (era 5) → uvicorn tiene 20s para drenar SSE en vuelo antes que escale a SIGKILL.
+   - `ProcessType=Interactive` → hint a launchd que es servicio foreground, jetsam lo trata con prioridad menor (último en morir bajo presión).
+2. **Client-side auto-retry** (`web/static/app.js`):
+   - `_isNetworkError(err)` detecta los strings de fetch errors browser (Failed to fetch, NetworkError, network connection lost, Load failed, net::, connection appears to be offline).
+   - `_friendlyChatErrorMessage(err)` reemplaza el "error: Failed to fetch" inglés por "conexión interrumpida — el servidor se reinició mid-respuesta" en español.
+   - Auto-retry una vez tras 8s con countdown visible ("↻ reintentando en 8s…") + botón "cancelar" si el user prefiere abortar.
+   - Si el segundo intento también falla por red → muestra mensaje terminal "esperá unos segundos más y volvé a tipear la pregunta" sin loop infinito.
+3. **Cancelación correcta del timer** en navegación (/new, loadSession, triggerNewChat) vía `abortSideFetches() → cancelPendingAutoRetry()`.
+
+**Verificación:** `tests/test_plist_web_serve.py` (19 passed), `node -e` smoke test del regex de network errors (12/12 pass), `launchctl print` confirmó `exit timeout = 20` + `RAG_MEMORY_PRESSURE_THRESHOLD => 80` post-bootstrap.
+
+**Prioridad:** P2 — fixed.
 
 ---
 

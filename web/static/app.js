@@ -45,6 +45,60 @@ function abortSideFetches() {
     try { ac.abort(); } catch (_) {}
   }
   inflightSideFetches.clear();
+  // 2026-04-28: misma motivación. Si el user navega a otra sesión o
+  // arranca /new mientras hay un auto-retry encolado, cancelarlo —
+  // sino el timer se dispara contra el contexto nuevo y re-emite una
+  // pregunta vieja en una sesión que no la espera.
+  cancelPendingAutoRetry();
+}
+
+// ── Auto-retry on transient network errors ─────────────────────────────
+// 2026-04-28 (eval Playwright MEDIUM #12): si el web server se reinicia
+// mid-stream (jetsam SIGKILL bajo memory pressure → respawn por launchd
+// en ~30s), el browser ve `Failed to fetch` / `network error` y el user
+// pierde el turno. Detectamos esos errores en el catch de send() y
+// scheduleamos UN re-intento automático tras 8s. Si el segundo también
+// falla por red → mostramos error final con sugerencia de retry manual.
+//
+// El timer es cancelable (botón "cancelar" en la UI + cualquier nueva
+// invocación de send() o navegación a otra sesión lo aborta).
+let pendingRetryTimer = null;
+let pendingRetryCountdown = null;
+function cancelPendingAutoRetry() {
+  if (pendingRetryTimer) {
+    clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = null;
+  }
+  if (pendingRetryCountdown) {
+    clearInterval(pendingRetryCountdown);
+    pendingRetryCountdown = null;
+  }
+}
+
+// Heurística para distinguir errores de red transitorios (worth retry)
+// de errores de aplicación (HTTP 4xx/5xx, JSON inválido, etc — NO retry,
+// el server contestó algo). Cubre los string que las distintas APIs
+// browser exponen en `err.message`:
+//   Chrome/Edge:   "Failed to fetch"
+//   Firefox:       "NetworkError when attempting to fetch resource."
+//   Safari macOS:  "The network connection was lost.", "Load failed"
+//   Safari iOS:    "Load failed", "The Internet connection appears to be offline."
+const _NETWORK_ERROR_RE = /failed to fetch|networkerror|network error|network connection|connection lost|load failed|net::|err_internet|connection appears to be offline/i;
+
+function _isNetworkError(err) {
+  if (!err) return false;
+  const msg = (err.message || "").toString();
+  return _NETWORK_ERROR_RE.test(msg);
+}
+
+// Friendly Spanish para el error rendereado en la línea `error: <msg>`.
+// La idea: en vez de gritarle al user "Failed to fetch" en inglés genérico,
+// explicarle qué pasó probablemente y qué va a hacer la UI a continuación.
+function _friendlyChatErrorMessage(err) {
+  if (_isNetworkError(err)) {
+    return "  conexión interrumpida — el servidor se reinició mid-respuesta";
+  }
+  return `  error: ${err.message}`;
 }
 let currentAudio = null;           // In-flight <audio> playback
 let lastUserQuestion = "";         // For ⌘↑ edit-last
@@ -4118,6 +4172,13 @@ let lastTurnId = null;
 // redo_turn_id is set.
 async function send(question, opts = {}) {
   if (pending) return;
+  // Si había un auto-retry pendiente del turno anterior y el user
+  // ya tipeó otra cosa antes que el timer se dispare, cancelarlo —
+  // sino vamos a re-enviar la pregunta vieja sobre el contexto nuevo
+  // y confunde la conversación. Para auto-retry "real" (opts.
+  // _isAutoRetry), NO cancelar — esa es la invocación que el timer
+  // disparó y ya limpió sus refs en el setTimeout callback.
+  if (!opts._isAutoRetry) cancelPendingAutoRetry();
   // a11y / race-condition: deshabilitar el botón en el DOM ANTES de
   // tocar `pending` evita el doble-tap rápido (touch users en mobile,
   // mouse double-click en desktop). El guard JS `if (pending) return`
@@ -4319,9 +4380,70 @@ async function send(question, opts = {}) {
       thinking.remove();
       // a11y: role="alert" sobre el error de red/transport — el user
       // está esperando una respuesta y necesita enterarse que falló.
-      const errNode = el("div", "error", `  error: ${err.message}`);
+      const isNet = _isNetworkError(err);
+      const errNode = el("div", "error", _friendlyChatErrorMessage(err));
       errNode.setAttribute("role", "alert");
       turn.appendChild(errNode);
+
+      // 2026-04-28 (MEDIUM #12): auto-retry una vez si el error es de red
+      // (jetsam SIGKILL del web server bajo memory pressure → respawn de
+      // launchd ~30s). 8s de espera es el sweet spot — suficiente para
+      // que launchd termine el respawn y el server vuelva a aceptar
+      // requests, no tanto como para que el user piense que la UI se
+      // colgó. Si el retry también falla por red, NO volvemos a auto-
+      // retry (queremos evitar loops infinitos cuando el server está
+      // realmente caído por más tiempo).
+      if (isNet && !opts._isAutoRetry) {
+        cancelPendingAutoRetry();
+        const retryRow = el("div", "retry-row");
+        const status = el("span", "retry-status",
+          "  ↻ reintentando en 8s…");
+        const cancelBtn = el("button", "retry-cancel-btn", "cancelar");
+        cancelBtn.type = "button";
+        cancelBtn.setAttribute("aria-label",
+          "cancelar reintento automático");
+        retryRow.appendChild(status);
+        retryRow.appendChild(cancelBtn);
+        turn.appendChild(retryRow);
+
+        let secsLeft = 8;
+        pendingRetryCountdown = setInterval(() => {
+          secsLeft -= 1;
+          if (secsLeft > 0) {
+            status.textContent = `  ↻ reintentando en ${secsLeft}s…`;
+          } else if (pendingRetryCountdown) {
+            clearInterval(pendingRetryCountdown);
+            pendingRetryCountdown = null;
+            status.textContent = "  ↻ reintentando…";
+          }
+        }, 1000);
+
+        cancelBtn.addEventListener("click", () => {
+          cancelPendingAutoRetry();
+          retryRow.remove();
+        });
+
+        const retriedQuestion = question;
+        const retriedOpts = { ...opts, _isAutoRetry: true };
+        pendingRetryTimer = setTimeout(() => {
+          pendingRetryTimer = null;
+          if (pendingRetryCountdown) {
+            clearInterval(pendingRetryCountdown);
+            pendingRetryCountdown = null;
+          }
+          retryRow.remove();
+          send(retriedQuestion, retriedOpts);
+        }, 8000);
+      } else if (isNet && opts._isAutoRetry) {
+        // Segundo intento también falló por red — el server está caído
+        // por más que 8s. No hacemos un tercer intento; le dejamos al
+        // user el control para decidir cuándo volver a probar.
+        const hint = el("div", "error",
+          "  esperá unos segundos más y volvé a tipear la pregunta — " +
+          "el servidor está en plena recuperación");
+        hint.setAttribute("role", "status");
+        turn.appendChild(hint);
+      }
     }
   } finally {
     stopGeneratingTicker();

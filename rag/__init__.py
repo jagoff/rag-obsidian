@@ -29080,22 +29080,32 @@ def _run_eval_gate() -> tuple[float | None, float | None, str]:
     one or both values may be None (treat as regression). Scrubs RAG_EXPLORE
     from subprocess env so the eval run is production-equivalent.
 
-    Timeout sized at 1200s (20 min): post 2026-04-27 vault reorg + golden
-    remap (n=54 singles + n=9 chains), real cost is 10-12 min warm under
-    typical conditions. The previous 300s cap was sized when n was smaller
-    AND when chains used a lighter pipeline; with the cross-source corpus
-    (8k+ chunks) and the n=9 chain turns each running a full retrieve(),
-    chains alone now take 5-8 min. 5 min was triggering false-positive
-    auto-rollback every nightly run (observed in online-tune.log:
-    "✗ CI gate falló: No se pudo parsear singles hit@5 (timeout o error)"
-    while singles parsed fine but chains never ran). 20 min is the cold-
-    start margin (ollama unload + reload of qwen2.5:3b helper for
-    reformulate_query in chains).
-    Override via RAG_EVAL_GATE_TIMEOUT_S env if your hardware is faster
-    or slower.
+    Timeout sized at 2400s (40 min): post 2026-04-27 vault reorg + golden
+    remap + cross-source ingester expansion. Real cost measured 2026-04-27
+    on M-chip mac with corpus 8k+ chunks: singles ~10:30 + chains ~13:45 +
+    setup/teardown ~30s = **24 min total warm**.
+
+    Timeline de timeouts:
+      - originalmente 300s (5 min) — sized cuando n era más chico y chains
+        usaban pipeline lighter
+      - 2026-04-25: 1200s (20 min) — post-expansion del corpus, sized para
+        "10-12 min warm typical" (medición optimista)
+      - 2026-04-27: 2400s (40 min) — la medición optimista era WRONG, el
+        eval real tarda 24 min y `rag tune --online` corre 5 trials de
+        random search ANTES del eval (~3-5 min adicionales). Timeout 20
+        min disparaba false-positive auto-rollback en TODAS las corridas
+        nightly desde el 2026-04-25 (observado en online-tune.log:
+        "✗ CI gate falló: No se pudo parsear singles hit@5 (timeout o
+        error)"). 40 min deja margen cómodo para el cold-start de ollama
+        + reload del qwen2.5:3b helper en chains + variación normal del
+        random search.
+
+    Override via RAG_EVAL_GATE_TIMEOUT_S env si tu hardware es faster o
+    slower. El plist `com.fer.obsidian-rag-online-tune` lo setea
+    explícitamente para no depender del default del código.
     """
     import subprocess
-    _GATE_TIMEOUT_S = int(os.environ.get("RAG_EVAL_GATE_TIMEOUT_S", "1200"))
+    _GATE_TIMEOUT_S = int(os.environ.get("RAG_EVAL_GATE_TIMEOUT_S", "2400"))
     env = {k: v for k, v in os.environ.items() if k != "RAG_EXPLORE"}
     assert "RAG_EXPLORE" not in env, "RAG_EXPLORE must not be set during gate eval"
     try:
@@ -42662,6 +42672,13 @@ def _online_tune_plist(rag_bin: str) -> str:
     "No existe /queries.yaml" en el log → 5 noches sin tune efectivo
     (``ranker.json saved_at=2026-04-20T19:19:12``). Fix: anclar el cwd al
     repo (donde vive ``queries.yaml``) usando el path del package.
+
+    Bug 2026-04-25 → fix 2026-04-27: el CI gate timeoutea a 1200s (20 min)
+    pero el ``rag eval`` real tarda 24 min en mac M-chip warm. Resultado:
+    auto-rollback en TODA corrida nightly desde el 25, marcando el plist
+    como crashed (``status=1``) y disparando el panel rojo "Algo no está
+    bien" en /learning. Fix: setear ``RAG_EVAL_GATE_TIMEOUT_S=2400`` (40 min)
+    explícito en el plist para no depender del default del código.
     """
     working_dir = Path(__file__).resolve().parent.parent
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -42685,6 +42702,7 @@ def _online_tune_plist(rag_bin: str) -> str:
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
+    <key>RAG_EVAL_GATE_TIMEOUT_S</key><string>2400</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>

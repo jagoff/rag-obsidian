@@ -19722,6 +19722,7 @@ def retrieve(
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
+    hyde: bool | None = None,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied,
@@ -19854,7 +19855,12 @@ def retrieve(
     #    bulk chunk embeds continue on ollama.
     where = build_where(folder, tag, date_range)
     _t0 = time.perf_counter()
-    if precise:
+    # HyDE was historically bundled with `precise=True`. Decoupled
+    # 2026-04-25 (`hyde` kwarg) so eval/CLI can A/B-test it independent
+    # of reformulation. `hyde=None` (default) preserves legacy behavior:
+    # follow `precise`. Explicit True/False overrides the bundle.
+    _hyde_effective = precise if hyde is None else bool(hyde)
+    if _hyde_effective:
         variant_embeds = [hyde_embed(v) for v in variants]
     else:
         # Wait up to `RAG_LOCAL_EMBED_WAIT_MS` (default 6000ms desde
@@ -20745,6 +20751,7 @@ def deep_retrieve(
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
+    hyde: bool | None = None,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -20762,6 +20769,7 @@ def deep_retrieve(
         seen_titles=seen_titles,
         source=source,
         intent=intent,
+        hyde=hyde,
     )
     if not result["docs"]:
         result["deep_retrieve_iterations"] = 1
@@ -21190,6 +21198,7 @@ def multi_retrieve(
     seen_titles: list[str] | set[str] | None = None,
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
+    hyde: bool | None = None,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -21228,6 +21237,7 @@ def multi_retrieve(
             seen_titles=seen_titles,
             source=source,
             intent=intent,
+            hyde=hyde,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para
         # uno). Via __setitem__ funciona con RetrieveResult y con dicts
@@ -21252,6 +21262,7 @@ def multi_retrieve(
             seen_titles=seen_titles,
             source=source,
             intent=intent,
+            hyde=hyde,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -25699,7 +25710,7 @@ def watch(debounce: float, all_vaults: bool):
 @click.option("--tag", default=None, help="Filtrar por tag (ej: letra, rock, ai, finanzas)")
 @click.option("--since", "since", default=None,
               help="Filtrar por fecha de creación. Acepta '7d'/'2w'/'3m'/'1y' o ISO (YYYY-MM-DD).")
-@click.option("--hyde", is_flag=True, help="Activa HyDE (mejora con LLMs grandes; con modelos chicos tiende a empeorar)")
+@click.option("--hyde/--no-hyde", "hyde", default=None, help="Forzar HyDE on/off independiente de --precise (decoupling 2026-04-25). Default (None) = legacy bundle: sigue a precise.")
 @click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −29% P95 singles sin pérdida de quality)")
 @click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
@@ -25729,7 +25740,7 @@ def watch(debounce: float, all_vaults: bool):
 def query(
     question: str, k: int, folder: str | None, tag: str | None,
     since: str | None,
-    hyde: bool, multi: bool, no_multi: bool, no_auto_filter: bool,
+    hyde: bool | None, multi: bool, no_multi: bool, no_auto_filter: bool,
     raw: bool, loose: bool, force: bool,
     session_id: str | None, continue_: bool, plain: bool,
     counter: bool, no_deep: bool, critique: bool,
@@ -26083,10 +26094,18 @@ def query(
             )
             return
         source_filter = frozenset(parts)
+    # `--hyde` legacy: bundled with precise (history-aware reformulation)
+    # to preserve the prior behavior of `rag query --hyde --continue`.
+    # `--no-hyde` / no flag: precise=False (no reformulation), hyde
+    # passed explicitly to retrieve so the downstream resolution is
+    # unambiguous (hyde=None defaults via precise; hyde=False forces
+    # off even if some inner caller flips precise=True later).
     _retrieve_kwargs = dict(
         col=col, question=effective_question, k=k, folder=folder,
         history=history, tag=tag,
-        precise=hyde, multi_query=_multi_enabled, auto_filter=not no_auto_filter,
+        precise=bool(hyde),
+        hyde=hyde,
+        multi_query=_multi_enabled, auto_filter=not no_auto_filter,
         date_range=date_range, variants=pre_variants,
         source=source_filter,
         intent=intent,
@@ -26958,6 +26977,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 @click.option("--since", "since", default=None,
               help="Filtrar por fecha de creación. '7d'/'2w'/'3m'/'1y' o ISO. También se auto-detecta en preguntas tipo 'la última semana'.")
 @click.option("--precise", is_flag=True, help="HyDE + reformulación (más preciso, ~5s extra)")
+@click.option("--hyde/--no-hyde", "hyde", default=None, help="Forzar HyDE on/off independiente de --precise. Default (None) = respeta --precise (legacy bundling).")
 @click.option("--multi", is_flag=True, help="Activa multi-query expansion (default: off desde 2026-04-21, bench mostró −85% P95 chains sin pérdida de quality)")
 @click.option("--no-multi", is_flag=True, help="[deprecated] no-op — multi-query está off por default")
 @click.option("--no-auto-filter", is_flag=True, help="Desactiva inferencia de filtros")
@@ -26977,6 +26997,7 @@ def _handle_chat_create_intent(question: str) -> tuple[bool, dict | None]:
 def chat(
     k: int, folder: str | None, tag: str | None,
     since: str | None, precise: bool,
+    hyde: bool | None,
     multi: bool, no_multi: bool, no_auto_filter: bool,
     session_id: str | None, resume: bool, counter: bool,
     deep_mode: bool,
@@ -27585,6 +27606,7 @@ def chat(
                 multi_query=_multi_enabled, auto_filter=not no_auto_filter,
                 date_range=pinned_date_range, summary=sess_summary,
                 intent=_chat_turn_intent,
+                hyde=hyde,
             )
             # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
             # match en el vault, deep no va a encontrar nada nuevo).
@@ -27599,6 +27621,7 @@ def chat(
                     date_range=pinned_date_range, summary=sess_summary,
                     deep=True,
                     intent=_chat_turn_intent,
+                    hyde=hyde,
                 )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")

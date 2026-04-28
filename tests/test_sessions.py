@@ -63,6 +63,76 @@ def test_ensure_session_returns_existing_when_id_matches(sessions_tmp):
     assert s2["turns"][0]["q"] == "uno"
 
 
+def test_chat_and_query_share_history_when_session_id_matches(sessions_tmp):
+    """P1 contract (2026-04-28 listener fix): si el listener manda el mismo
+    `session_id` a `/chat` (mode='chat') y `/query` (mode='serve'), los turns
+    se acumulan en el mismo file y `session_history` los devuelve juntos.
+
+    Antes el listener mandaba sids distintos:
+      - /chat  → wa:${replyTo}            (sin suffix)
+      - /query → wa:${BOT_CHAT_JID}:${vault.name}  (suffix de vault, hardcoded)
+
+    Resultado: 5 sessions distintas en disco para el mismo bot, history
+    partida cada vez que el routing decidía entre conversational ("hola")
+    y factual ("qué sabes de X"). Después del fix los dos endpoints usan
+    `wa:${replyTo}` literal.
+
+    El invariante que P1 explota es: `ensure_session` carga la session
+    EXISTENTE por id (sin filtrar por mode), así que el `mode` del segundo
+    caller es metadata pura. `session_history` recorre TODOS los turns sin
+    filtrar — el mode del fundador no afecta el lookup posterior.
+    """
+    sid = "wa:120363426178035051@g.us"  # formato real RagNet (@g.us)
+
+    # Turn 1 vía /chat (mode='chat')
+    s_chat = rag.ensure_session(sid, mode="chat")
+    rag.append_turn(s_chat, {"q": "hola", "a": "qué onda?"})
+    rag.save_session(s_chat)
+
+    # Turn 2 vía /query (mode='serve') — mismo sid, distinto mode
+    s_query = rag.ensure_session(sid, mode="serve")
+    assert s_query["id"] == sid
+    # ensure_session NO crea una sesión nueva: levanta la del disco con
+    # los turns de /chat ya adentro.
+    assert len(s_query["turns"]) == 1
+    assert s_query["turns"][0]["q"] == "hola"
+
+    rag.append_turn(s_query, {"q": "qué sabes de Maria?", "a": "no tengo info"})
+    rag.save_session(s_query)
+
+    # Turn 3 vía /chat de nuevo — debe ver los 2 turns previos.
+    s_chat2 = rag.ensure_session(sid, mode="chat")
+    hist = rag.session_history(s_chat2)
+    contents = [m["content"] for m in hist]
+    assert "hola" in contents
+    assert "qué onda?" in contents
+    assert "qué sabes de Maria?" in contents
+    assert "no tengo info" in contents
+
+
+@pytest.mark.parametrize(
+    "jid",
+    [
+        # JIDs reales que el listener manda como parte de `wa:${replyTo}`.
+        "wa:120363426178035051@g.us",                # RagNet (grupo)
+        "wa:242738851246099@lid",                    # self-chat (LID)
+        "wa:74191281901822@lid",                     # contacto 1:1 (LID)
+        "wa:5493425299606@s.whatsapp.net",           # contacto 1:1 (legacy)
+        "wa:5491153280296@s.whatsapp.net",           # números argentinos
+    ],
+)
+def test_listener_session_id_format_is_valid(jid):
+    """Cada `wa:${replyTo}` literal del listener debe matchear SESSION_ID_RE
+    sin transformación. El listener NO sanitiza el `@`; el server lo acepta
+    directo (regex `[A-Za-z0-9_.@:-]{1,80}`).
+
+    Si esta aserción rompe, el listener manda un sid inválido → server
+    monta un sid fresh aleatorio → la continuidad multi-turn se pierde
+    silenciosamente (mismo bug que P1, distinta causa raíz).
+    """
+    assert rag._valid_session_id(jid), f"sid del listener inválido: {jid!r}"
+
+
 def test_append_turn_caps_at_session_max_turns(sessions_tmp, monkeypatch):
     monkeypatch.setattr(rag, "SESSION_MAX_TURNS", 3)
     sess = rag.ensure_session(None, mode="chat")

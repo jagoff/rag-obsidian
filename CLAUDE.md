@@ -1218,7 +1218,11 @@ The `.bak.<ts>` files under `~/.local/share/obsidian-rag/` are still there (kept
 
 Default: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes`. Override: `OBSIDIAN_RAG_VAULT` env var. Collections namespaced per vault (sha256[:8]).
 
-Claude Code memory (`~/.claude/projects/-Users-fer/memory/`) is symlinked into vault at `04-Archive/99-obsidian-system/99-AI/memory/`.
+**Persistent memories del MCP [`mem-vault`](https://github.com/jagoff/mem-vault)** viven en `04-Archive/99-obsidian-system/99-AI/memory/` (folder real, no symlink — el comentario antiguo sobre Claude Code era obsoleto). Configurado via env vars del web server plist:
+- `MEM_VAULT_PATH=Notes/`
+- `MEM_VAULT_MEMORY_SUBDIR=04-Archive/99-obsidian-system/99-AI/memory`
+
+A diferencia del resto de `99-obsidian-system/`, este folder **NO está excluido por `is_excluded()`** (junto con `99-Mentions/`) — `rag index` lo scanea y los `.md` de memorias entran al index como notas más del vault `home`. Eso permite que `rag query "..."` recupere bug patterns, decisiones y convenciones acumuladas entre sesiones (66 memorias / 398 chunks al 2026-04-29). El MCP `mem-vault` sigue teniendo su propio Qdrant local con las mismas memorias — los dos sistemas coexisten: el MCP es el writer canónico, `rag` es un reader adicional via el embedding pipeline normal.
 
 ## Features que dependen de launchd: dejá el daemon ACTIVO al cerrar el commit
 

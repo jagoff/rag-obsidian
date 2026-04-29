@@ -2789,10 +2789,16 @@ def is_excluded(rel_path: str) -> bool:
       that may live outside 04-Archive via other symlink targets.
     - 04-Archive/99-obsidian-system/*: Obsidian system folders (99-Attachments,
       99-Canvas, 99-AI, 99-Daily routine, 99-Forms, 99-Templates) — binary
-      assets, template scaffolding, plugin data. 99-Mentions is the ONE
-      exception: those are per-person dossiers that enrich retrieval via
-      `build_person_context()` and should stay indexed so they also surface
-      through normal search.
+      assets, template scaffolding, plugin data. Two exceptions stay indexed
+      because they're high-signal user-curated content that enriches retrieval:
+      (1) 99-Mentions: per-person dossiers consumed by `build_person_context()`
+      and surfaced through normal search; (2) 99-AI/memory: persistent memories
+      written by the `mem-vault` MCP server (decisions, bug patterns, conventions
+      the user accumulates across sessions). Indexing 99-AI/memory lets `rag query`
+      surface those alongside regular notes. Risk: feedback-loop-like behavior if
+      the agent answers a question primarily from a memory it saved itself, but
+      this is much less acute than the `99-AI/conversations/` case (which was
+      raw chat transcripts) — memories are curated facts, not turn logs.
     - 03-Resources/Claude/<slug>/: auto-generated Claude Code session
       transcripts (280+ files, one per `~/.claude/projects/<slug>/*.jsonl`).
       Written by `_sync_claude_code_transcripts`. They pollute retrieval with
@@ -2817,8 +2823,9 @@ def is_excluded(rel_path: str) -> bool:
     if "/99-AI/skills/" in f"/{rel_path}":
         return True
     system_prefix = "04-Archive/99-obsidian-system/"
-    if rel_path.startswith(system_prefix) and not rel_path.startswith(
-        system_prefix + "99-Mentions/"
+    if rel_path.startswith(system_prefix) and not (
+        rel_path.startswith(system_prefix + "99-Mentions/")
+        or rel_path.startswith(system_prefix + "99-AI/memory/")
     ):
         return True
     claude_prefix = "03-Resources/Claude/"

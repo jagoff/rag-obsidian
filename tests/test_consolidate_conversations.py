@@ -299,6 +299,29 @@ def test_is_excluded_covers_archived_conversations():
     assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/conversations/foo.md") is True
 
 
+def test_is_excluded_indexes_mem_vault_memories():
+    """Las memorias persistentes del MCP `mem-vault` viven bajo
+    `04-Archive/99-obsidian-system/99-AI/memory/` y son la única excepción
+    (junto con `99-Mentions/`) al exclude del prefix de system folders.
+    Las queremos indexadas para que `rag query` recupere bug patterns,
+    decisiones y convenciones que el user acumuló entre sesiones.
+    """
+    # ✅ memory/ excepcionado
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/memory/foo.md") is False
+    assert rag.is_excluded(
+        "04-Archive/99-obsidian-system/99-AI/memory/bug_pattern_xyz.md"
+    ) is False
+    # ✅ 99-Mentions sigue indexado (regression guard, este caso es histórico)
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Mentions/Maria.md") is False
+    # ❌ Otras subcarpetas de 99-AI/ siguen excluidas
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/reviews/2026-04-29.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/conversations/x.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-AI/system/foo/plan.md") is True
+    # ❌ Otras carpetas de system siguen excluidas
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Templates/x.md") is True
+    assert rag.is_excluded("04-Archive/99-obsidian-system/99-Attachments/img.png") is True
+
+
 # ── End-to-end run() ─────────────────────────────────────────────────────
 
 def test_run_dry_run_does_not_write(tmp_vault: Path, monkeypatch):

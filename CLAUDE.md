@@ -407,6 +407,33 @@ drafts: total 47
 
 Health check rápido: si `total` no crece después de un día de uso, o todo se va a `expired`, el flujo está roto (listener no postea, draft nunca llega al RagNet, etc.).
 
+**Activación del loop — flag `WA_DRAFT_ALL_CONTACTS`**:
+
+Por default el listener requiere whitelist explícita (`/draft on <contacto>` desde RagNet) para auto-draftear. La env var `WA_DRAFT_ALL_CONTACTS=1` en el plist del listener (`~/Library/LaunchAgents/com.fer.whatsapp-listener.plist`) activa **bypass global**: todo chat 1:1 (no `@g.us`) genera draft sin pasar por la whitelist. Grupos siguen bloqueados siempre — auto-draftear a 30 personas a la vez no es deseable. El SELF_CHAT_JID (chat 1:1 del user consigo mismo) también queda excluido — el user no se draftea a sí mismo. Mensajes con prefix `\u200B` (BOT_MARKER, outgoing del rag al bridge) se ignoran row-by-row para no loopear.
+
+Para flipearlo: editar el plist + `launchctl bootout/bootstrap`. La env var no se hot-reloadea; el listener la pickup recién al próximo arranque.
+
+**Bug pattern: flag respetada en helper público pero NO en el path real (2026-04-29)**:
+
+Hasta el commit [`whatsapp-listener@29141d2`](https://github.com/jagoff/whatsapp-listener/commit/29141d2) había un bug silencioso. `isDraftWhitelisted(jid, wl)` (helper público, 1 línea: `if (isDraftAllContactsOn() && !jid.endsWith('@g.us')) return true`) sí respetaba el bypass. Pero `processDraftIncoming` (el handler que cada tick mira la bridge SQLite y dispara generación de drafts) construía el SQL siempre con `chat_jid IN (whitelistedJids)` — la whitelist explícita ganaba aunque `WA_DRAFT_ALL_CONTACTS=1` estuviera ON, así que el bypass quedaba muerto en el único path que importa. Síntoma: la flag estaba seteada en el plist hace días, el user veía mensajes entrar al bridge pero ningún draft aparecía en RagNet para contactos NO whitelisteados.
+
+**Lección generalizable**: cuando agregás una flag de comportamiento, no alcanza con que el helper público (`isXEnabled()`) la respete — hay que **auditar TODOS los call sites donde el feature decide qué procesar** y asegurarse que cada uno consulte la flag. Especialmente cuando hay paths que precomputan listas (SQL builders, batch fetchers, cron job consumers) que NO llaman al helper sino que reusan la fuente de datos original (whitelist file, allowlist DB, etc.). Patrón de detección: si el helper se exporta `isXEnabled(arg) → bool` pero hay un call site que filtra por `Object.keys(getXSource())` directamente, el helper no se va a invocar y la flag muere.
+
+Fix en este caso: extraer `buildDraftIncomingQuery({bypassOn, whitelistedJids, selfChatJid, sinceTs}) → {sql, params}` (puro/testeable) y ramificar el SQL según `bypassOn`. Tests cubren bypass on/off, ignora whitelist con bypass, params correctos, SQL invariants.
+
+**Latencia del enriquecimiento de draft con vault context (2026-04-29)**:
+
+`loadVaultContextForDraft(query, contactName)` en el listener llama a `POST /query retrieve_only=true` del rag serve para inyectar sources del corpus indexado al prompt del LLM (qwen2.5:14b genera el draft). Default ts'd timeout era 8s, pero medimos en producción (corpus actual, warm):
+
+| Query | Latencia |
+|---|---|
+| Q1 cold post-restart | 11.2s |
+| Q2 warm | 8.9s |
+| Q3 warm | 8.2s |
+| Listener-shape (300 chars + nombre) | 7.96s |
+
+`/query retrieve_only=true` p50 ~9s con el rerank cross-encoder bge-reranker-v2-m3 + BM25 + embed bge-m3 secuenciales. Con timeout 8s el call abortaba ~50% de las veces (visible en `~/.local/share/whatsapp-listener/listener.error.log`: `[draft] loadVaultContextForDraft falló: The operation timed out`) y los drafts caían al fallback `[]` silenciosamente — el bot generaba drafts SIN sources del corpus, quedaban genéricos. Bumpeo a 12s en commit [`whatsapp-listener@c160079`](https://github.com/jagoff/whatsapp-listener/commit/c160079). Latencia total del draft sigue dominada por el LLM call (qwen2.5:14b, 30-90s); +4s en retrieve son ~6% del total y compensan con drafts ricos en context. Si el rag serve baja a <6s p99 en el futuro (perf audit pendiente del path `/query retrieve_only=true`), bajamos de nuevo.
+
 **Endpoints relacionados**:
 
 - [`POST /api/draft/decision`](web/server.py) — escribir una decisión (4 decision types válidas, Pydantic valida pre-handler).

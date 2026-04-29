@@ -39,7 +39,13 @@ function applyChartDefaults() {
   Chart.defaults.plugins.tooltip.titleFont = { size: 11 };
   Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
   Chart.defaults.plugins.tooltip.padding = 10;
-  Chart.defaults.scale.grid = { color: C.grid };
+  // CRITICAL: NO usar `Chart.defaults.scale.grid = {...}` — eso REEMPLAZA el
+  // objeto entero y pierde props como `display`, `drawOnChartArea`, `tickWidth`,
+  // `lineWidth`, `tickLength`, `offset`, `drawTicks`, `tickColor`. Ese reemplazo
+  // hace que las barras (BarController) NO se rendereen — el canvas queda solo
+  // con los ejes. Bug confirmado el 2026-04-29 sobre Chart.js v4.4.7. Hay que
+  // mutar la prop puntual:
+  Chart.defaults.scale.grid.color = C.grid;
   Chart.defaults.animation.duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 350;
 }
 applyChartDefaults();

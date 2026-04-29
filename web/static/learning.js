@@ -68,7 +68,13 @@ function applyChartDefaults() {
   Chart.defaults.plugins.tooltip.titleFont = { size: 11 };
   Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
   Chart.defaults.plugins.tooltip.padding = 10;
-  Chart.defaults.scale.grid = { color: C.grid };
+  // CRITICAL: NO usar `Chart.defaults.scale.grid = {...}` — eso REEMPLAZA el
+  // objeto entero y pierde props como `display`, `drawOnChartArea`, `tickWidth`,
+  // `lineWidth`, `tickLength`, `offset`, `drawTicks`, `tickColor`. Ese reemplazo
+  // hace que las barras (BarController) NO se rendereen — el canvas queda solo
+  // con los ejes. Bug confirmado el 2026-04-29 sobre Chart.js v4.4.7. Hay que
+  // mutar la prop puntual:
+  Chart.defaults.scale.grid.color = C.grid;
   Chart.defaults.animation.duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 350;
 }
 
@@ -826,11 +832,20 @@ function renderFeedbackExplicit(payload) {
     });
   }
 
-  // 3. By scope — donut.
+  // 3. Origen del feedback — donut con 4 buckets (manual/implícito × pos/neg).
+  // El bucketing del backend cambió 2026-04-29: scope nunca se setea como
+  // "answer"/"retrieval"/"both" en el writer real, así que la dona vieja
+  // mostraba 100% en "unknown" y era inservible. Ahora separamos por fuente
+  // (manual = thumbs/harvester, implícito = inferido de sesión) y por signo.
   const bs = payload.by_scope || {};
-  // No "insufficient" en este — siempre rendereamos aunque todos sean 0.
-  const labels = ["answer", "retrieval", "both", "unknown"];
-  const data = labels.map((k) => bs[k] || 0);
+  const buckets = [
+    { key: "manual_pos",   label: "Manual positivo",     color: C.green },
+    { key: "manual_neg",   label: "Manual negativo",     color: C.red },
+    { key: "implicit_pos", label: "Implícito positivo",  color: C.cyan },
+    { key: "implicit_neg", label: "Implícito negativo",  color: C.orange },
+  ];
+  const labels = buckets.map((b) => b.label);
+  const data = buckets.map((b) => bs[b.key] || 0);
   const total = data.reduce((a, b) => a + b, 0);
   if (total === 0) {
     maybeInsufficient("chart-feedback-by-scope", { insufficient: true, n_samples: 0 });
@@ -846,7 +861,7 @@ function renderFeedbackExplicit(payload) {
         labels,
         datasets: [{
           data,
-          backgroundColor: [C.cyan, C.green, C.purple, C.dim],
+          backgroundColor: buckets.map((b) => b.color),
           borderColor: C.card,
           borderWidth: 2,
         }],
@@ -1153,7 +1168,20 @@ function renderQueryLearning(payload) {
   // 3. Top paraphrases — horizontal bar.
   const tp = payload.top_paraphrases || [];
   if (!Array.isArray(tp) || tp.length === 0) {
+    // Placeholder específico: la tabla `rag_learned_paraphrases` se llena
+    // sólo cuando corre `rag paraphrases train` sobre feedback positivo.
+    // Sin paraphrases entrenadas, "Datos insuficientes" sin contexto es
+    // confuso ("no hay datos" sugiere bug). Pintamos un mensaje propio
+    // que indica el comando exacto para activarla.
     maybeInsufficient("chart-top-paraphrases", { insufficient: true, n_samples: 0 });
+    const card = document.getElementById("chart-top-paraphrases")?.closest(".chart-card");
+    const ph = card?.querySelector(".insufficient[data-placeholder]");
+    if (ph) {
+      ph.innerHTML = `
+        <span>Sin variantes aprendidas todavía</span>
+        <span class="ins-n">Corré <code>rag paraphrases train</code> sobre el feedback positivo</span>
+      `;
+    }
   } else {
     resetCanvas("chart-top-paraphrases");
     const card = document.getElementById("chart-top-paraphrases")?.closest(".chart-card");

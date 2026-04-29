@@ -504,6 +504,15 @@ def _retrieval_eval_over_time(days: int) -> dict:
 
 
 def _retrieval_tune_deltas(days: int) -> dict:
+    """Bar chart: % de mejora vs línea base por iteración de tune.
+
+    Filtra runs con `delta` NULL o exactamente 0 — esos son tunes que NO
+    encontraron mejora (espacio de búsqueda saturado, ej. 378 de 392 runs en
+    el snapshot del 2026-04-29). Mostrar 392 barras de altura 0 hace que la
+    chart parezca vacía: el usuario no ve los 14 ajustes que realmente
+    movieron la aguja. Filtramos al backend y agregamos `n_total` /
+    `n_zero_filtered` para que la UI pueda mencionar el contexto si quiere.
+    """
     from rag import _ragvec_state_conn, _sql_read_with_retry
 
     cutoff = _cutoff_iso(days)
@@ -516,20 +525,32 @@ def _retrieval_tune_deltas(days: int) -> dict:
                 (cutoff,),
             ).fetchall()
         series = []
+        n_total = len(rows)
+        n_zero_filtered = 0
         for ts, delta, rolled_back, n_cases in rows:
+            if delta is None:
+                n_zero_filtered += 1
+                continue
             try:
-                delta_pct = float(delta) * 100.0 if delta is not None else None
+                delta_f = float(delta)
             except Exception:
-                delta_pct = None
+                n_zero_filtered += 1
+                continue
+            if delta_f == 0.0:
+                n_zero_filtered += 1
+                continue
+            delta_pct = delta_f * 100.0
             series.append({
                 "ts": ts,
-                "delta_pct": round(delta_pct, 4) if delta_pct is not None else None,
+                "delta_pct": round(delta_pct, 4),
                 "rolled_back": bool(rolled_back) if rolled_back is not None else False,
                 "n_cases": int(n_cases) if n_cases is not None else 0,
             })
         return {
             "series": series,
             "n_samples": len(series),
+            "n_total": n_total,
+            "n_zero_filtered": n_zero_filtered,
             "insufficient": _insufficient(len(series)),
         }
 
@@ -540,7 +561,17 @@ def _retrieval_tune_deltas(days: int) -> dict:
 
 def _retrieval_latency_vs_score() -> dict:
     """Scatter plot: 1 punto por query reciente. Cap a 1000 más recientes
-    para no inflar el JSON (~30KB worst case)."""
+    para no inflar el JSON (~30KB worst case).
+
+    IMPORTANTE: filtramos NaN/inf con `math.isfinite` — sqlite a veces guarda
+    `-inf` en `top_score` (visto en producción 2026-04-29) y eso se serializa
+    como literal `-Infinity` en JSON, que NO es JSON válido. El endpoint
+    REST `/api/learning` lo limpia FastAPI, pero el SSE
+    `/api/learning/stream` usa `json.dumps` directo y rompía el `JSON.parse`
+    del cliente cada 30s ("No number after minus sign at position 83609"),
+    cortando el live update. Filtramos al origen.
+    """
+    import math
     from rag import _ragvec_state_conn, _sql_read_with_retry
 
     def _do() -> dict:
@@ -550,11 +581,15 @@ def _retrieval_latency_vs_score() -> dict:
                 "WHERE t_retrieve IS NOT NULL AND top_score IS NOT NULL "
                 "ORDER BY id DESC LIMIT 1000"
             ).fetchall()
-        points = [
-            {"t_retrieve": float(t), "top_score": float(s)}
-            for t, s in rows
-            if isinstance(t, (int, float)) and isinstance(s, (int, float))
-        ]
+        points = []
+        for t, s in rows:
+            if not isinstance(t, (int, float)) or not isinstance(s, (int, float)):
+                continue
+            t_f = float(t)
+            s_f = float(s)
+            if not (math.isfinite(t_f) and math.isfinite(s_f)):
+                continue
+            points.append({"t_retrieve": t_f, "top_score": s_f})
         return {
             "points": points,
             "n_samples": len(points),
@@ -788,34 +823,54 @@ def _feedback_corrective_cumulative(days: int) -> dict:
 
 
 def _feedback_by_scope(days: int) -> dict:
-    """Bucketing por scope. El schema actual usa "turn" o NULL — no
-    "answer"/"retrieval"/"both" como en el spec. Mapeamos:
-        scope == "answer" → answer
-        scope == "retrieval" → retrieval
-        scope == "both" → both
-        cualquier otro valor / NULL → unknown (incluye "turn")
+    """Bucketing por origen × signo del feedback.
+
+    El spec original asumía scope="answer"/"retrieval"/"both", pero el writer
+    real nunca setea esos valores — los rows tienen scope="turn" (manual
+    explícito vía thumbs/harvester) o scope=NULL (señal implícita derivada
+    del comportamiento de sesión, ej. session_outcome_win/loss). Auditado el
+    2026-04-29: 100% de los 556 rows caían en "unknown" → la dona quedaba
+    inservible.
+
+    Re-categorizamos por **fuente × signo**, que es lo que realmente nos
+    interesa al mirar la dona: ¿el feedback vino del usuario explícito o
+    inferido de la sesión, y fue positivo o negativo?
+
+        scope IN ("turn", "answer", "retrieval", "both") + rating>0  → manual_pos
+        scope IN ("turn", "answer", "retrieval", "both") + rating<=0 → manual_neg
+        scope IS NULL + rating>0                                     → implicit_pos
+        scope IS NULL + rating<=0                                    → implicit_neg
+
     Las 4 keys están siempre presentes (default 0)."""
     from rag import _ragvec_state_conn, _sql_read_with_retry
 
     cutoff = _cutoff_iso(days)
 
     def _do() -> dict:
-        out = {"answer": 0, "retrieval": 0, "both": 0, "unknown": 0}
+        out = {"manual_pos": 0, "manual_neg": 0, "implicit_pos": 0, "implicit_neg": 0}
         with _ragvec_state_conn() as conn:
             rows = conn.execute(
-                "SELECT scope, COUNT(*) FROM rag_feedback "
-                "WHERE ts >= ? GROUP BY scope",
+                "SELECT scope, rating, COUNT(*) FROM rag_feedback "
+                "WHERE ts >= ? GROUP BY scope, rating",
                 (cutoff,),
             ).fetchall()
-        for scope, n in rows:
-            key = scope if scope in ("answer", "retrieval", "both") else "unknown"
+        for scope, rating, n in rows:
+            try:
+                r = int(rating) if rating is not None else 0
+            except Exception:
+                r = 0
+            is_manual = scope is not None  # turn / answer / retrieval / both → manual
+            if is_manual:
+                key = "manual_pos" if r > 0 else "manual_neg"
+            else:
+                key = "implicit_pos" if r > 0 else "implicit_neg"
             out[key] += int(n)
         return out
 
     return _sql_read_with_retry(
         _do,
         "learning_feedback_by_scope_failed",
-        default={"answer": 0, "retrieval": 0, "both": 0, "unknown": 0},
+        default={"manual_pos": 0, "manual_neg": 0, "implicit_pos": 0, "implicit_neg": 0},
     )
 
 

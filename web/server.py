@@ -19143,6 +19143,32 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
             raise HTTPException(status_code=429,
                 detail=f"too many concurrent streams (max {_SSE_MAX_PER_IP} per IP)")
 
+    # Helper para serializar JSON tolerando NaN/Inf — `json.dumps` por default
+    # escupe literales `Infinity`/`-Infinity`/`NaN` que NO son JSON válido y
+    # rompen `JSON.parse` del cliente. El endpoint REST `/api/learning` los
+    # filtra FastAPI por nosotros, pero acá usamos `json.dumps` directo.
+    # Bug detectado 2026-04-29: `rag_queries.top_score` con `-inf` pasaba al
+    # snapshot SSE y cada 30s el cliente loggeaba "No number after minus
+    # sign at position 83609" y nunca actualizaba los charts en vivo.
+    def _safe_json_dumps(obj) -> str:
+        try:
+            return json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            # Hay algún `inf`/`nan` no filtrado en el payload. Recorremos y
+            # los convertimos a `None`. Costo lineal en el tamaño del payload
+            # — solo ocurre cuando hay valores no-finitos, no en cada tick.
+            import math as _math
+
+            def _clean(v):
+                if isinstance(v, float):
+                    return v if _math.isfinite(v) else None
+                if isinstance(v, dict):
+                    return {k: _clean(x) for k, x in v.items()}
+                if isinstance(v, (list, tuple)):
+                    return [_clean(x) for x in v]
+                return v
+            return json.dumps(_clean(obj), ensure_ascii=False, allow_nan=False)
+
     async def gen():
         last_snapshot_ts = 0.0
         try:
@@ -19150,7 +19176,7 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
             # Audit 2026-04-26 BUG #1 web: pre-fix bloqueaba el loop por
             # toda la duración (10s+ con 11 secciones SQL).
             payload = await asyncio.to_thread(learning_api, days=30)
-            yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield f"event: snapshot\ndata: {_safe_json_dumps(payload)}\n\n"
             last_snapshot_ts = time.time()
             while True:
                 if request is not None and await request.is_disconnected():
@@ -19158,7 +19184,7 @@ async def learning_stream(request: Request = None) -> StreamingResponse:  # type
                 now = time.time()
                 if now - last_snapshot_ts >= 30:
                     payload = await asyncio.to_thread(learning_api, days=30)
-                    yield f"event: snapshot\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    yield f"event: snapshot\ndata: {_safe_json_dumps(payload)}\n\n"
                     last_snapshot_ts = now
                 else:
                     yield ": keep-alive\n\n"

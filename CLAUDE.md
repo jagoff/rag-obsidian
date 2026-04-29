@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Local RAG over an Obsidian vault. Single-file: `rag.py` (54.5k lines as of 2026-04-27 — drift +56% vs prior 32.7k snapshot, package-split is now an open discussion not a settled "no") + `mcp_server.py` (thin wrapper, 662 lines) + `web/` (FastAPI `web/server.py` 17.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (6,072 tests, 337 files).
+Local RAG over an Obsidian vault. **Package reorganization (post-2026-04-21)**: el entry point principal es ahora `rag/__init__.py` (58,087 líneas) — no un single-file `rag.py`. Módulos extraídos del monolith al mismo package: `anticipatory.py`, `whisper.py`, `ocr.py`, `pendientes.py`, `today_correlator.py`, `wa_scheduled.py`, `wa_tasks.py`, `proactive.py`, `_ollama_health.py`, `_shutdown.py`, `_tool_output_helpers.py` + `rag/integrations/` (apple_mail, calendar, chrome_bookmarks, drive, gmail, reminders, screentime, weather, whatsapp) + `rag/prompts/`. El package-split sigue siendo un "work in progress" orgánico — la funcionalidad está en `rag/`, no en un `rag.py` raíz. Complementado por `mcp_server.py` (thin wrapper, 662 lines) + `web/` (FastAPI `web/server.py` 17.6k lines + ~7.7k JS/HTML/CSS) + `tests/` (6,072 tests, 337 files).
 
 Entry points (both installed via `uv tool install --editable '.[entities]'` — incluye el extra `entities` para que gliner se instale en el uv tool venv y la feature de entity-aware retrieval quede activa de fábrica; sin el extra los 5 ingesters loggean `dep \`gliner\` not available` cada corrida y la feature corre desactivada silenciosamente):
 - `rag` — CLI for indexing, querying, chat, productivity, automation
@@ -674,15 +674,18 @@ rag free [--apply --yes --force --json --min-age-days N --ranker-keep N --skip-{
 python scripts/backfill_entities.py [--dry-run --limit N --vault NAME]  # one-shot GLiNER entity extraction
 python scripts/audit_telemetry_health.py [--days 7] [--json]  # data-first health audit: errores SQL/silent, latency outliers, cache probe distribution, DB sizes; primer comando antes de cualquier "auditá el sistema"
 
-rag implicit-feedback [--days 14 --json]  # recolecta feedback implícito de interacciones
-rag routing-rules [--reset --debug --json]  # descriptor de rutas + patterns detectados
-rag whisper-vocab [--refresh --show --source X --limit N]  # manejo de vocabulario de transcripción WhatsApp
+rag feedback infer-implicit [--window-seconds N --dry-run --json]   # derivar corrective_path desde behavior
+rag feedback detect-requery [--json]       # requery implícito como loss signal
+rag feedback classify-sessions [--json]    # reward shaping por session outcome
+rag routing extract-rules [--auto-promote] # extraer + promover reglas de routing (nightly: plist [manual])
+rag whisper vocab refresh                  # forzar refresh manual del vocab WA (nightly: plist [manual])
+rag whisper vocab show [--source X --limit N]
+rag index --source drive [--reset --dry-run --json]  # Google Drive ingester (nightly: plist [manual])
 rag vault-cleanup [--dry-run --apply --force]  # limpia carpetas transitorias del vault
-rag ingest-drive [--reset --dry-run --json]  # Google Drive ingester — busca DAO + documentos compartidos
 
 
 # Automation
-rag setup [--remove]                       # install/remove 31 launchd services (anticipate incluido 2026-04-24)
+rag setup [--remove]                       # install/remove 27 launchd services vía _services_spec() (ver tabla "Daemons activos")
 
 # Tests
 .venv/bin/python -m pytest tests/ -q
@@ -693,7 +696,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 
 ### Env vars
 
-**Catálogo completo**: [docs/env-vars-catalog.md](docs/env-vars-catalog.md) lista las **47 env vars adicionales** que `rag.py` consulta pero no están documentadas aquí (config defaults, feature flags, infra). Esta sección cubre solo las críticas con rollback paths + historia detallada.
+**Catálogo completo**: [docs/env-vars-catalog.md](docs/env-vars-catalog.md) lista las env vars adicionales que `rag/__init__.py` + `web/server.py` consultan pero no están documentadas aquí. Al 2026-04-29 hay **~115 env vars únicas** consultadas en el código (via `os.environ.get`) — esta sección cubre solo las críticas con rollback paths + historia detallada.
 
 - `OBSIDIAN_RAG_VAULT` — override default vault path. Collections are namespaced per resolved path (sha256[:8]). En la precedencia multi-vault, gana sobre el `current` del registry. `rag query --vault NAME` y `rag index --vault NAME` son equivalentes por-invocación sin mutar el env. Single-vault only en ambos comandos; para cross-vault query usar `rag chat --vault a,b`. Los cross-source ETLs (MOZE, WhatsApp, Gmail, Reminders, Calendar, Chrome, Drive, GitHub, Claude, YouTube, Spotify) se gatean por `_is_cross_source_target(vault_path)` — por default solo el `_DEFAULT_VAULT` (iCloud Notes) los recibe. Para opt-inear a otro vault agregar `"cross_source_target": "<name>"` al `~/.config/obsidian-rag/vaults.json`. Sin opt-in, `rag index --vault work` skippea los 11 ETLs con un log `[dim]Cross-source syncs: skip[/dim]` y solo indexa las `.md` reales del vault — evita la contaminación medida 2026-04-21 en que los ETLs copiaron 19 archivos MOZE al vault `work`. Tests: `tests/test_vaults.py` (10 casos sobre guard + flag).
 - `RAG_OCR=0` — desactiva OCR en imágenes embebidas durante el indexing (default ON cuando `ocrmac` está disponible). El indexer extrae `![[img.png]]` + `![alt](img.png)` de cada nota (`_extract_embedded_images` en `rag.py`), llama `_ocr_image` vía Apple Vision (es-ES + en-US), y concatena el texto extraído al body antes de chunkear con un marker `<!-- OCR: path/to/img -->`. Cache persistente en `rag_ocr_cache` SQL table (key = abs path, invalidación por mtime — sin TTL). El hash del chunk (`_file_hash_with_images`) suma los mtimes de las imágenes embebidas, así que una screenshot actualizada fuerza reindex aunque el .md no haya cambiado. Soft-dep: ocrmac + pyobjc son macOS-only — en Linux el `try: import ocrmac` falla y el OCR skippea silently. Motivación (2026-04-21): notas tipo link-hub (`dev cycles.md` = un link + un `![[captura.png]]` con la tabla informativa en la PNG) eran invisibles al retrieval porque el body textual tenía ~0 signal; post-OCR el rerank score pasó de +0.0 a +1.1 y el LLM responde queries específicas ("cuándo termina el cycle 10.59"). Tests: `tests/test_ocr_embedded_images.py` (26 casos).
@@ -721,7 +724,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 - `OBSIDIAN_RAG_WATCH_EXCLUDE_FOLDERS` — comma-separated vault-relative folders `rag watch` must ignore. Default `"03-Resources/WhatsApp"` (WA dumps re-fire the handler dozens of times per minute via periodic ETL; they're picked up by manual/periodic `rag index` instead).
 - `OBSIDIAN_RAG_INDEX_WA_MONTHLY` — rollback para la exclusión permanente de `03-Resources/WhatsApp/<chat>/<YYYY-MM>.md` en `is_excluded()` (`rag.py:2201`). **Default OFF = monthly rollups NO se indexan como `source=vault`** (medido 2026-04-22). El directorio sigue recibiendo los `.md` desde `scripts/ingest_whatsapp.py` (para leer en Obsidian), pero los mensajes individuales ya están indexados como ~4150 chunks `source="whatsapp"` (pseudo-URI doc_id `whatsapp://<jid>/<msg_id>`, ~143 chars each). Pre-fix la duplicación agregaba +1355 chunks `source="vault"` con sizes hasta 21808 chars → el retrieve pescaba la misma conversación en 2 representaciones que competían por spots en top-k, y el LLM recibía context redundante que inflaba prefill + gen. Queries donde top-1 era WA tenían avg gen 16.3s / P95 37.9s. Setear `OBSIDIAN_RAG_INDEX_WA_MONTHLY=1` + `rag index --reset` para rehabilitar el double-indexing (útil sólo si se detectan regresiones de recall en queries WA específicas post-rollout). Tests: [`tests/test_wa_perf_fast_path.py`](tests/test_wa_perf_fast_path.py) (4 casos sobre `is_excluded`).
 - `RAG_WA_SKIP_PARAPHRASE` — rollback para el auto-skip de `expand_queries()` cuando el caller explícita `source="whatsapp"` (único valor). **Default ON** (`val not in ("0","false","no")` → skip paraphrase). Motivación (2026-04-22): cuando el caller filtra por WA, las 3 paraphrases de qwen2.5:3b + 3× embed bge-m3 cuestan ~600ms para near-zero recall gain — WA chunks son mensajes literales de ~143 chars donde los tokens lexicales originales ya dominan BM25 + semantic. Medido en bench sintético: retrieve avg 3001ms → 2404ms (-20%) sin pérdida de hit@5. Skipear sólo cuando el único source es whatsapp — multi-source callers (`source={"whatsapp","calendar"}`) mantienen paraphrase porque calendar todavía se beneficia. Rollback: `export RAG_WA_SKIP_PARAPHRASE=0`. Tests: [`tests/test_wa_perf_fast_path.py`](tests/test_wa_perf_fast_path.py) (7 casos sobre single/set/list/multi-source/no-source/explicit-false/rollback).
-- `RAG_DRAFT_VIA_RAGNET` — **flag temporal de testing (2026-04-28)**: cuando está prendida (`1`/`true`/`yes`), TODOS los ambient sends a WhatsApp (morning brief, archive push, reminder push, contradicciones digest — todo lo que entra por `_ambient_whatsapp_send` en [`rag/integrations/whatsapp.py`](rag/integrations/whatsapp.py)) se redirigen al grupo **RagNet** (el grupo del bot, `WHATSAPP_BOT_JID`) en vez de mandarse al destinatario original. El payload mantiene el U+200B anti-loop al inicio y se prepende un header `📨 *RagNet draft* → \`<jid_original>\`` para que sea obvio qué iba a salir y a dónde. **NO afecta** sends user-initiated (`propose_whatsapp_send`, replies, scheduled, contact cards) — esos van directo via `_whatsapp_send_to_jid` y son explícitamente confirmados con [Enviar] en la proposal card. **Para flipearla**: `export RAG_DRAFT_VIA_RAGNET=1` en tu shell + reiniciar los daemons relevantes (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist && launchctl bootstrap gui/$(id -u) ...`) para que hereden la env var. Para apagarla cuando termines testing: `unset RAG_DRAFT_VIA_RAGNET` + bootout/bootstrap idem. **Plan de retirada**: Fer pidió esto solo para revisar 1-2 días qué dispararía el sistema sin spamear; cuando confirme que terminó, removemos el flag entero (la rama `if jid != WHATSAPP_BOT_JID and os.environ...` en `_ambient_whatsapp_send`). Tests: [`tests/test_whatsapp_send_draft.py`](tests/test_whatsapp_send_draft.py) (5 casos cubren flag off, flag on con redirect + header, idempotencia cuando ya iba a RagNet, truthy/falsy variants, y que `_whatsapp_send_to_jid(anti_loop=False)` queda intacto).
+- `RAG_DRAFT_VIA_RAGNET` — **[DEPRECATED 2026-04-28, pending removal ≈ 2026-05-15]** flag temporal de testing: cuando está prendida (`1`/`true`/`yes`), TODOS los ambient sends a WhatsApp (morning brief, archive push, reminder push, contradicciones digest — todo lo que entra por `_ambient_whatsapp_send` en [`rag/integrations/whatsapp.py`](rag/integrations/whatsapp.py)) se redirigen al grupo **RagNet** (el grupo del bot, `WHATSAPP_BOT_JID`) en vez de mandarse al destinatario original. El payload mantiene el U+200B anti-loop al inicio y se prepende un header `📨 *RagNet draft* → \`<jid_original>\`` para que sea obvio qué iba a salir y a dónde. **NO afecta** sends user-initiated (`propose_whatsapp_send`, replies, scheduled, contact cards) — esos van directo via `_whatsapp_send_to_jid` y son explícitamente confirmados con [Enviar] en la proposal card. **Para flipearla**: `export RAG_DRAFT_VIA_RAGNET=1` en tu shell + reiniciar los daemons relevantes (`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.fer.obsidian-rag-*.plist && launchctl bootstrap gui/$(id -u) ...`) para que hereden la env var. Para apagarla cuando termines testing: `unset RAG_DRAFT_VIA_RAGNET` + bootout/bootstrap idem. **Retirada pendiente**: remover el branch `if jid != WHATSAPP_BOT_JID and os.environ...` en `_ambient_whatsapp_send` + los tests `test_whatsapp_send_draft.py`. Tests: [`tests/test_whatsapp_send_draft.py`](tests/test_whatsapp_send_draft.py) (5 casos cubren flag off, flag on con redirect + header, idempotencia cuando ya iba a RagNet, truthy/falsy variants, y que `_whatsapp_send_to_jid(anti_loop=False)` queda intacto).
 - `RAG_WA_FAST_PATH` / `RAG_WA_FAST_PATH_THRESHOLD` — extiende el fast-path de `RAG_ADAPTIVE_ROUTING` a queries dominadas por WhatsApp. El default gate (inherited) exige `top_score > _LOOKUP_THRESHOLD` (0.6) — WA queries **NUNCA** alcanzan ese umbral porque la calibración absoluta del cross-encoder bge-reranker-v2-m3 sobre chats cortos (~143 chars) pone los scores en rango **0.02-0.10** incluso cuando los matches son perfectos. Medido 2026-04-22 post-reindex: "qué charlamos con María en marzo sobre laburo" → 0.056, "mensajes con Juli sobre su mudanza" → 0.092. Sin el gate WA → todas caían al pipeline full (qwen2.5:7b + num_ctx default + citation repair, gen 40-55s). **Gate con 2 ramas** (post-2026-04-22 tarde): (1) caller explícito `source="whatsapp"` → fast-path incondicional, bypassea score gate (el caller ya declaró intent, no necesitamos umbral — branch 1); (2) detección implícita: ≥2 de los top-3 metas tienen `source="whatsapp"` AND top-1 score > `RAG_WA_FAST_PATH_THRESHOLD` (default **0.05**, bajado de 0.3 porque a ese umbral NINGUNA query real disparaba branch 2). La majority check de branch 2 protege contra un chunk WA incidental flipeando el pipeline. **Default ON** (`RAG_WA_FAST_PATH != "0"`). Rollback: `export RAG_WA_FAST_PATH=0` desactiva ambas ramas; `RAG_WA_FAST_PATH_THRESHOLD=0.3` deshabilita branch 2 efectivamente (no afecta branch 1). Medición bench con data real (5 queries WA, post-reindex): retrieve avg 3751ms → 2584ms (-31%) — Track 2+3 en conjunto. Branch 1 dispara correctamente en 5/5 queries; branch 2 requiere scores que aparecen menos seguido pero también dispara cuando hay. Tests: [`tests/test_wa_perf_fast_path.py`](tests/test_wa_perf_fast_path.py) (21 casos, incluye branch 1 vs 2, score gate bypass, threshold override, rollback, interacciones con default gate).
 
 - `RAG_ADAPTIVE_ROUTING` — activa el pipeline adaptativo (Mejora #3). Cuando está ON: (a) `_should_skip_reformulate()` saltea el helper call de reformulación para intents metadata-only (`count`, `list`, `recent`, `agenda`, `entity_lookup`) — ahorra ~1-2s; (b) fast-path dispatch cuando `top_score >= _LOOKUP_THRESHOLD` (0.6) — usa `qwen2.5:3b` con `num_ctx=4096` (bumped desde 2048 el 2026-04-22 por refuses falsos, ver `RAG_LOOKUP_NUM_CTX`) y saltea citation-repair, pure perf win para queries simples. **Default ON tras 2026-04-22** (`os.environ.get("RAG_ADAPTIVE_ROUTING", "").strip().lower() not in ("0","false","no")`). Sin regresión eval: ambas runs ON y OFF producen resultados bit-idénticos en `rag eval` (validado 2026-04-21, ver §Eval baselines). Rollback: `export RAG_ADAPTIVE_ROUTING=0` → pipeline legacy bit-idéntico. Ver `docs/improvement-3-adaptive-routing-design.md`.
@@ -750,7 +753,7 @@ query → classify_intent → infer_filters [auto]
       → per variant: sqlite-vec sem + BM25 (accent-normalised, GIL-serialised — do NOT parallelise)
       → RRF merge → dedup → expand to parent section (O(1) metadata)
       → cross-encoder rerank (bge-reranker-v2-m3, MPS+fp32)
-      → [RAG_ADAPTIVE_ROUTING + score≥0.6: fast-path → qwen2.5:3b num_ctx=2048, skip citation-repair]
+      → [RAG_ADAPTIVE_ROUTING + score≥0.6: fast-path → qwen2.5:3b num_ctx=4096, skip citation-repair]
       → graph expansion (1-hop wikilink neighbors, always on)
       → [auto-deep: if confidence < 0.10, iterative sub-query retrieval]
       → top-k → LLM (streamed)
@@ -764,7 +767,7 @@ Intent dispatch: semantic | synthesis | comparison | count | list | recent | age
 
 **Auto-deep retrieval**: when top rerank score < `CONFIDENCE_DEEP_THRESHOLD` (0.10), `deep_retrieve()` auto-triggers: helper model judges sufficiency → generates focused sub-query → second retrieve pass → merge results. Max 3 iterations (`_DEEP_MAX_ITERS`) + wall-time cap `_DEEP_MAX_SECONDS` (default 30s, env `RAG_DEEP_MAX_SECONDS`, added 2026-04-22). Disable with `--no-deep`. **Motivación del timeout** (audit 2026-04-22): el peor query en 7d tuvo `t_retrieve=202.6s` — factor 5x sobre el P99 normal (~38s). Causa: bajo contención intermitente de Ollama (reranker idle-unload + cold-load del chat model + 3 pases de `retrieve()` cada uno con `expand_queries()` + rerank) cada iteración puede pasar de 5s nominal a 60-70s → 3 iters = 200s. El guard absoluto garantiza que ninguna query bloquee más de 30s en retrieve aunque el juez siga pidiendo sub-queries. Tests: [`tests/test_deep_retrieve.py`](tests/test_deep_retrieve.py) (3 casos nuevos: timeout dispara, default es 30s, env override funciona).
 
-**Rerank pool** (`RERANK_POOL_MAX = 15`, dropped from 30 on 2026-04-21): cap on candidates scored by the cross-encoder. `rag eval --latency` bench sweep (pool=30/25/20/15 × 60 singles + 30 chains):
+**Rerank pool** (`RERANK_POOL_MAX = 25` as of 2026-04-27, commit `9de81d5`): cap on candidates scored by the cross-encoder. The bench sweep below was run when pool=15 was the active value (2026-04-21); pool was later bumped back to 25 for the full CLI path while the `retrieve_only=true` path (used by the WA listener for draft enrichment) keeps an internal cap of 10 to unblock that latency-sensitive path. `rag eval --latency` bench sweep (pool=30/25/20/15 × 60 singles + 30 chains, historical):
 
 | pool | singles hit@5 | singles MRR | chains MRR | singles P50 | singles P95 |
 |---|---|---|---|---|---|
@@ -773,7 +776,7 @@ Intent dispatch: semantic | synthesis | comparison | count | list | recent | age
 | 20 | 71.67% | 0.681 | 0.757 | 1458 ms | 1914 ms |
 | **15** | **71.67%** | **0.681** | **0.790** | **1163 ms** | **1577 ms** |
 
-Pool=15 domina: hit@5 bit-identical, MRR chains **+5pp** (less noise in the rerank head), P95 singles **−66%** (−3.1s). The pre-existing comment claiming "pool=25 pierde 1 hit (90.48% vs 95.24%)" was measured against a smaller/older `queries.yaml` and does not reproduce on the current corpus. Web `/api/chat` still passes `rerank_pool=5` explicitly; CLI inherits the default. `rag tune` now fits weights on pool=15 feature vectors (old weights fit on pool=30 should be re-tuned — default weights are unaffected).
+Pool=15 dominaba la bench original: hit@5 bit-identical, MRR chains **+5pp**, P95 singles **−66%**. El bump a 25 (2026-04-27) priorizó recall sobre latencia en el path CLI/chat — re-correr `rag eval --latency` con el corpus actual para confirmar el tradeoff. Web `/api/chat` still passes `rerank_pool=5` explicitly; `retrieve_only=true` uses an internal cap of 10. `rag tune` fits weights on the active pool value — re-tune after any pool change.
 
 **Corpus cache** (`_load_corpus`): BM25 + vocab built once, invalidated by `col.count()` delta. Cold 341ms → warm 2ms. Do not touch without re-measuring.
 
@@ -1099,7 +1102,7 @@ Source weight 0.80 (mismo banda que calls — signal factual rico pero no curado
 Telemetry + learning state lives en **dos** databases bajo `~/.local/share/obsidian-rag/ragvec/`:
 
 - **`ragvec.db`** (~104M) — sqlite-vec `meta_*`/`vec_*` tables del corpus + **10 state tables**: `rag_whatsapp_state`, `rag_calendar_state`, `rag_gmail_state`, `rag_reminders_state`, `rag_contacts_state`, `rag_calls_state`, `rag_safari_history_state`, `rag_safari_bookmark_state`, `rag_wa_media_state`, `rag_schema_version`. Sólo cursors + dedup keys de ingesters.
-- **`telemetry.db`** (~36M) — **45+ tablas** operativas: `rag_queries`, `rag_behavior`, `rag_feedback`, `rag_feedback_golden*`, `rag_tune`, `rag_contradictions`, `rag_ambient*`, `rag_brief_*`, `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log`, `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics`, `rag_conversations_index`, `rag_response_cache`, `rag_entities`, `rag_entity_mentions`, `rag_ocr_cache`, `rag_vlm_captions`, `rag_audio_transcripts`, `rag_learned_paraphrases`, `rag_cita_detections`, `rag_score_calibration`, `rag_schema_version`.
+- **`telemetry.db`** (~36M) — **52 tablas** operativas (verificado 2026-04-29 con `.tables`): `rag_queries`, `rag_behavior`, `rag_feedback`, `rag_feedback_golden*`, `rag_tune`, `rag_contradictions`, `rag_ambient*`, `rag_brief_*`, `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log`, `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics`, `rag_conversations_index`, `rag_response_cache`, `rag_entities`, `rag_entity_mentions`, `rag_ocr_cache`, `rag_vlm_captions`, `rag_audio_transcripts`, `rag_learned_paraphrases`, `rag_cita_detections`, `rag_score_calibration`, `rag_schema_version`, `rag_anticipate_candidates`, `rag_anticipate_feedback`, `rag_audio_corrections`, `rag_behavior_priors_wa`, `rag_draft_decisions`, `rag_error_queue`, `rag_home_compute_metrics`, `rag_negotiation_pending_sends`, `rag_negotiation_turns`, `rag_negotiations`, `rag_promises`, `rag_reminder_wa_pushed`, `rag_routing_decisions`, `rag_routing_rules`, `rag_status_samples`, `rag_style_fingerprints`, `rag_synthetic_negatives`, `rag_synthetic_queries`, `rag_whatsapp_scheduled`, `rag_whisper_vocab`, `rag_brief_feedback`, `rag_brief_state`, `rag_brief_written`, `rag_proactive_log`.
 
 **Split rationale** (`scripts/migrate_ragvec_split.py`, 2026-04-21): cada DB comparte un único WAL entre todos sus writers. Mezclar chunks + telemetría en un WAL único causaba bursts de lock contention — el indexer escribiendo 100 chunks interfería con el write sync de cada query log. Separar en 2 DBs permite que cada WAL tenga su propio pattern de writes (indexer bulk vs telemetry append) sin bloquearse entre sí. `_ragvec_state_conn()` resuelve a `telemetry.db` (post-split); los ingesters siguen abriendo directamente `ragvec.db` para su state cursor (ver `rag.DB_PATH / "ragvec.db"` en `scripts/ingest_*.py`).
 
@@ -1170,12 +1173,14 @@ Cuatro reglas que el código tiene que respetar — violar cualquiera deja bugs 
 
 Diagnóstico data-first: correr `python scripts/audit_telemetry_health.py --days 7` antes de cualquier "auditá el sistema" — agrega los 5 queries que reprodujeron el audit 2026-04-24 en 1 segundo (errores SQL/silent, latency outliers, cache probe distribution, DB sizes). Primer comando del workflow.
 
-rag implicit-feedback [--days 14 --json]  # recolecta feedback implícito de interacciones
-rag routing-rules [--reset --debug --json]  # descriptor de rutas + patterns detectados
-rag whisper-vocab [--refresh --show --source X --limit N]  # manejo de vocabulario de transcripción WhatsApp
+rag feedback infer-implicit [--window-seconds N --dry-run --json]   # derivar corrective_path (ver sección GC#2.C)
+rag feedback detect-requery [--json]       # requery implícito como loss signal
+rag feedback classify-sessions [--json]    # reward shaping por session outcome
+rag routing extract-rules [--auto-promote] # extraer + promover reglas de routing
+rag whisper vocab refresh                  # forzar refresh manual del vocab WA (nightly: plist [manual])
+rag whisper vocab show [--source X --limit N]
+rag index --source drive [--reset --dry-run --json]  # Google Drive ingester (nightly: plist [manual])
 rag vault-cleanup [--dry-run --apply --force]  # limpia carpetas transitorias del vault
-rag ingest-drive [--reset --dry-run --json]  # Google Drive ingester — busca DAO + documentos compartidos
-
 
 **Drift fixes (2026-04-21 evening)** — four CLI readers still tail-read JSONL files that post-T10 either no longer receive the expected events or got repurposed for another log stream. All migrated to SQL:
 
@@ -1253,7 +1258,7 @@ Aprendido el 2026-04-25 con `com.fer.obsidian-rag-wa-scheduled-send` (worker de 
 
 ### Daemons activos del proyecto (referencia)
 
-Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` muestre):
+**Fuente de verdad**: `_services_spec()` en `rag/__init__.py` (27 entradas, instala `rag setup`). Los plists marcados `[manual]` están instalados en `~/Library/LaunchAgents/` pero NO se generan vía `rag setup` — se instalaron con scripts externos o a mano.
 
 | Plist | Cadencia | Comando | Propósito |
 |---|---|---|---|
@@ -1269,27 +1274,28 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-archive` | weekly | `rag archive` | Auto-archivo de notas muertas |
 | `com.fer.obsidian-rag-wa-tasks` | 30min | `rag wa-tasks` | Extracción de tareas WhatsApp |
 | `com.fer.obsidian-rag-reminder-wa-push` | 5min | `rag remind-wa` | Push de Reminders al WA |
-| `com.fer.obsidian-rag-wa-scheduled-send` | 5min | `rag wa-scheduled-send` | **(nuevo 2026-04-25)** Worker de mensajes WA programados |
+| `com.fer.obsidian-rag-wa-scheduled-send` | 5min | `rag wa-scheduled-send` | Worker de mensajes WA programados |
 | `com.fer.obsidian-rag-anticipate` | 10min | `rag anticipate` | Anticipatory agent |
+| `com.fer.obsidian-rag-active-learning-nudge` | lunes 10am | `rag feedback harvest` (auto) | Nudge WA cuando hay ≥20 queries low-conf sin labels |
 | `com.fer.obsidian-rag-auto-harvest` | weekly | `rag auto-harvest` | Auto-tune feedback |
+| `com.fer.obsidian-rag-implicit-feedback` | 15min | `rag implicit-feedback` | Auto-harvest de feedback implícito |
 | `com.fer.obsidian-rag-online-tune` | nightly 03:30 | `rag tune --apply` | Ranker-vivo nightly |
 | `com.fer.obsidian-rag-calibrate` | nightly | `rag calibrate` | Score calibration |
 | `com.fer.obsidian-rag-maintenance` | weekly | `rag maintenance` | Vacuum + WAL checkpoint + log rotation |
 | `com.fer.obsidian-rag-consolidate` | nightly | `rag consolidate` | Memory consolidation |
+| `com.fer.obsidian-rag-vault-cleanup` | nightly | `rag vault-cleanup` | Limpieza de carpetas transitorias |
 | `com.fer.obsidian-rag-ingest-whatsapp` | horaria | `rag index --source whatsapp` | WhatsApp ingester |
 | `com.fer.obsidian-rag-ingest-gmail` | horaria | `rag index --source gmail` | Gmail ingester |
 | `com.fer.obsidian-rag-ingest-calendar` | cada 6h | `rag index --source calendar` | Google Calendar ingester |
 | `com.fer.obsidian-rag-ingest-reminders` | cada 6h | `rag index --source reminders` | Apple Reminders ingester |
-| `com.fer.obsidian-rag-ingest-drive` | horaria | `rag index --source drive` | Google Drive ingester |
-| `com.fer.obsidian-rag-implicit-feedback` | 15min | `rag implicit-feedback` | Auto-harvest de feedback implícito |
-| `com.fer.obsidian-rag-routing-rules` | 5min | `rag routing-rules` | Detector de patrones de ruteo |
-| `com.fer.obsidian-rag-cloudflare-tunnel` | KeepAlive | `cloudflared tunnel` | HTTPS público via Cloudflare Quick Tunnel |
-| `com.fer.obsidian-rag-cloudflare-tunnel-watcher` | daemon | `scripts/cloudflared_watcher.sh` | Monitor de túnel + notificación de URL |
 | `com.fer.obsidian-rag-serve-watchdog` | daemon | Monitor de `com.fer.obsidian-rag-serve` | Watchdog para reiniciar serve si cae |
-| `com.fer.obsidian-rag-vault-cleanup` | nightly | `rag vault-cleanup` | Limpieza de carpetas transitorias |
-| `com.fer.obsidian-rag-whisper-vocab` | 03:15 | `rag whisper-vocab refresh` | Extracción nightly de vocab WhatsApp |
+| `com.fer.obsidian-rag-ingest-drive` | horaria | `rag index --source drive` | Google Drive ingester `[manual]` |
+| `com.fer.obsidian-rag-routing-rules` | 5min | script externo | Detector de patrones de ruteo `[manual]` |
+| `com.fer.obsidian-rag-cloudflare-tunnel` | KeepAlive | `cloudflared tunnel` | HTTPS público via Cloudflare Quick Tunnel `[manual]` |
+| `com.fer.obsidian-rag-cloudflare-tunnel-watcher` | daemon | `scripts/cloudflared_watcher.sh` | Monitor de túnel + notificación de URL `[manual]` |
+| `com.fer.obsidian-rag-whisper-vocab` | 03:15 | script externo | Extracción nightly de vocab WhatsApp `[manual]` |
 
-Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py:39190+`](rag/__init__.py) (función `_plists_to_install` o similar — `grep "_plists" rag/__init__.py`).
+Si el listado anterior queda desactualizado, el source de verdad es `_services_spec()` en `rag/__init__.py` (`grep "_services_spec" rag/__init__.py`).
 
 ### Bypass: `rag setup` también funciona
 

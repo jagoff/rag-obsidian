@@ -233,6 +233,7 @@ window.addEventListener("beforeunload", () => {
 load(true);
 startPolling();
 startStream();
+fetchSqlQueueHealth();
 
 // ── Loading + polling ─────────────────────────────────────────────────────
 
@@ -1013,6 +1014,81 @@ function renderHealth(d) {
       </div>
     </div>
   `;
+}
+
+// ── SQL Queue Health card (Task A 2026-04-29) ─────────────────────────────
+// Fetches GET /api/health/sql-queue every 30s (independent of the main 60s
+// dashboard poll — queue state is process-runtime data, not SQL-aggregated).
+// Appends a fourth card to the #health section with status-color coding:
+//   ok       → green  (no drops, queue < 10% capacity)
+//   warn     → yellow (drops > 0 OR queue 10–49%)
+//   degraded → red    (queue ≥ 50% capacity)
+// The card is idempotent: if #health-sql-queue-card already exists it is
+// mutated in place (avoids flicker on the 30s refresh cycle).
+
+const SQL_QUEUE_POLL_MS = 30_000;
+let _sqlQueuePollTimer = null;
+
+async function fetchSqlQueueHealth() {
+  try {
+    const res = await fetch("/api/health/sql-queue");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const q = await res.json();
+    renderSqlQueueCard(q);
+  } catch (_) {
+    // silently ignore — the card stays at its last value (or absent if never loaded)
+  }
+  _sqlQueuePollTimer = setTimeout(fetchSqlQueueHealth, SQL_QUEUE_POLL_MS);
+}
+
+function renderSqlQueueCard(q) {
+  const statusCls = q.status === "ok" ? "good" : q.status === "warn" ? "warn" : "bad";
+  const p50txt = q.write_latency_p50_ms != null ? `${q.write_latency_p50_ms}ms` : "—";
+  const p95txt = q.write_latency_p95_ms != null ? `${q.write_latency_p95_ms}ms` : "—";
+  const depthBar = q.queue_max_capacity > 0
+    ? `<div class="health-bar" style="margin-top:8px">
+         <div style="flex:${q.fill_pct};background:var(--${statusCls === 'good' ? 'green' : statusCls === 'warn' ? 'yellow' : 'red'})"></div>
+         <div style="flex:${100 - q.fill_pct};background:var(--bg-2)"></div>
+       </div>`
+    : "";
+  const html = `
+    <div class="health-card" id="health-sql-queue-card">
+      <h3>SQL Queue (bg writer)</h3>
+      <div class="health-row">
+        <span class="health-label">Estado</span>
+        <span class="health-value ${statusCls}">${q.status.toUpperCase()}</span>
+      </div>
+      <div class="health-row">
+        <span class="health-label">Cola actual / pico</span>
+        <span class="health-value">${q.queue_depth_current} / ${q.queue_depth_peak}</span>
+      </div>
+      <div class="health-row">
+        <span class="health-label">Drops totales</span>
+        <span class="health-value ${q.drop_count_total > 0 ? 'bad' : 'good'}">${q.drop_count_total}${q.last_drop_reason ? ` (${q.last_drop_reason})` : ''}</span>
+      </div>
+      <div class="health-row">
+        <span class="health-label">Writes completados</span>
+        <span class="health-value">${q.write_count_total.toLocaleString()}</span>
+      </div>
+      <div class="health-row">
+        <span class="health-label">Latencia p50 / p95</span>
+        <span class="health-value">${p50txt} / ${p95txt}</span>
+      </div>
+      <div class="health-row" style="font-size:10px;color:var(--text-faint)">
+        <span class="health-label">Samples</span>
+        <span>${q.latency_window_samples} / ${SQL_QUEUE_POLL_MS / 1000}s poll</span>
+      </div>
+      ${depthBar}
+    </div>
+  `;
+  const healthEl = document.getElementById("health");
+  if (!healthEl) return;
+  const existing = document.getElementById("health-sql-queue-card");
+  if (existing) {
+    existing.outerHTML = html;  // mutate in place
+  } else {
+    healthEl.insertAdjacentHTML("beforeend", html);
+  }
 }
 
 // ── Signals panel (2026-04-22) ─────────────────────────────────────────

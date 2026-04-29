@@ -267,3 +267,82 @@ def test_from_dict_ignores_unknown_keys():
     }
     r = rag.RetrieveResult.from_dict(d)
     assert r.docs == []
+
+
+# ── _finite_score: guard for -inf in log_query_event ───────────────────────
+
+
+def test_finite_score_returns_float():
+    import math
+    assert math.isfinite(rag._finite_score(0.5))
+
+
+def test_finite_score_passthrough_normal():
+    assert rag._finite_score(0.75) == 0.75
+    assert rag._finite_score(0.0) == 0.0
+    assert rag._finite_score(1.5) == 1.5
+
+
+def test_finite_score_clamps_neg_inf():
+    assert rag._finite_score(float("-inf")) == 0.0
+
+
+def test_finite_score_clamps_pos_inf():
+    assert rag._finite_score(float("inf")) == 0.0
+
+
+def test_finite_score_clamps_nan():
+    assert rag._finite_score(float("nan")) == 0.0
+
+
+def test_to_log_event_guards_neg_inf_confidence():
+    """to_log_event() must never emit -inf as top_score.
+
+    This is the existing guard in RetrieveResult.to_log_event(). It exists
+    independently of the _finite_score() guard applied to direct
+    result["confidence"] uses in query() / chat() / rag serve.
+    """
+    import math
+    r = rag.RetrieveResult(docs=[], metas=[], scores=[], confidence=float("-inf"))
+    ev = r.to_log_event()
+    assert math.isfinite(ev["top_score"]), f"top_score was {ev['top_score']}"
+    assert ev["top_score"] == 0.0
+
+
+def test_finite_score_used_in_log_query_event_call_sites():
+    """Source-level regression: every log_query_event call site in query()
+    / chat() / rag serve that uses result["confidence"] must route through
+    _finite_score(). This test checks the rag module source code to prevent
+    silent regressions when new call sites are added without the guard.
+    """
+    import ast
+    import inspect
+    src = inspect.getsource(rag)
+    tree = ast.parse(src)
+
+    unguarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "log_query_event"):
+            continue
+        # The single dict argument
+        if not node.args:
+            continue
+        d = node.args[0]
+        if not isinstance(d, ast.Dict):
+            continue
+        for key, val in zip(d.keys, d.values):
+            if not (isinstance(key, ast.Constant) and key.value == "top_score"):
+                continue
+            # val should be round(_finite_score(...), N) — check _finite_score present
+            src_val = ast.unparse(val)
+            if "_finite_score" not in src_val and "to_log_event" not in src_val:
+                unguarded.append(f"line {node.lineno}: top_score = {src_val[:80]}")
+
+    assert not unguarded, (
+        "log_query_event call sites with unguarded top_score found "
+        "(use _finite_score() to prevent -inf in rag_queries):\n"
+        + "\n".join(unguarded)
+    )

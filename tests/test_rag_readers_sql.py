@@ -56,6 +56,11 @@ def _reset_caches(monkeypatch) -> None:
     monkeypatch.setattr(rag, "_behavior_priors_cache", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    # Reset TTL timestamp so back-to-back calls within a test don't hit the
+    # 60s TTL gate and return stale data. The TTL (_BEHAVIOR_PRIORS_TTL_S) was
+    # added 2026-04-29; tests that call _load_behavior_priors twice need this
+    # reset or the second call short-circuits without re-reading the DB.
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", 0.0)
     monkeypatch.setattr(rag, "_feedback_golden_memo", None)
     monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", None)
 
@@ -272,6 +277,10 @@ def test_reader_cache_invalidates_on_new_max_ts(sql_env):
     first = rag._load_behavior_priors()
     assert "first.md" in first["click_prior"]
     first_key = rag._behavior_priors_cache_key_sql
+    # Expire the TTL so the next call re-reads SQL instead of returning the
+    # cached snapshot. _BEHAVIOR_PRIORS_TTL_S (60s) was added 2026-04-29;
+    # back-to-back in-process calls need the TTL zeroed to hit the DB.
+    rag._behavior_priors_loaded_ts = 0.0
     # Insert newer event.
     _seed_rag_behavior(sql_env, [
         {"ts": "2026-04-19T09:00:00", "source": "cli", "event": "open",

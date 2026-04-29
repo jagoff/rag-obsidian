@@ -43,6 +43,10 @@ def reset_behavior_cache(monkeypatch):
     monkeypatch.setattr(rag, "_behavior_priors_cache", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    # TTL gate (audit 2026-04-29): reset el timestamp así cada test
+    # arranca con TTL "expirado" — los tests que no testean el TTL
+    # explícitamente esperan SQL hits cada call, no cache hits.
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", 0.0)
 
 
 def test_behavior_priors_returns_stale_cache_on_sql_retry_exhausted(
@@ -115,6 +119,9 @@ def test_behavior_priors_uses_8_retry_attempts(
 def reset_feedback_memo(monkeypatch):
     monkeypatch.setattr(rag, "_feedback_golden_memo", None)
     monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", "")
+    # TTL gate (audit 2026-04-29): reset el timestamp así cada test
+    # arranca con TTL "expirado".
+    monkeypatch.setattr(rag, "_feedback_golden_loaded_ts", 0.0)
 
 
 def test_feedback_golden_does_not_poison_memo_on_error(
@@ -207,3 +214,271 @@ def test_non_transient_error_short_circuits_retry(
     )
     # Y degrada limpiamente al empty fallback.
     assert result["hash"] == "sql:error"
+
+
+# ── TTL memoization (Task B 2026-04-29) ──────────────────────────────────────
+#
+# Tests para el TTL gate de 60s de los SQL readers de retrieve():
+#   - _load_behavior_priors() y load_feedback_golden().
+# Bajo carga del web server (5-20 retrieve()/s) cada call pegaba SQL.
+# Con TTL, calls dentro del window devuelven cache directo sin tocar
+# DB. SQL se pega solo cuando TTL expiró → reduce contención WAL
+# proporcionalmente.
+
+
+def test_behavior_priors_ttl_gate_skips_sql_within_window(
+    monkeypatch, reset_behavior_cache,
+):
+    """Dos calls dentro del TTL window: solo la PRIMERA pega SQL, la segunda
+    devuelve cache directo sin abrir conexión."""
+    sql_opens = {"n": 0}
+
+    class _DummyConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def execute(self, *a, **kw):
+            class _Cur:
+                def fetchall(self): return []
+                def fetchone(self): return None
+            return _Cur()
+        @property
+        def row_factory(self): return None
+        @row_factory.setter
+        def row_factory(self, v): pass
+
+    def counting_open(*a, **kw):
+        sql_opens["n"] += 1
+        return _DummyConn()
+
+    # Mock _sql_max_ts para que devuelva None (DB vacía) — fuerza el "empty"
+    # path que es el más rápido y no requiere mocks complejos del rebuild.
+    monkeypatch.setattr(rag, "_ragvec_state_conn", counting_open)
+    monkeypatch.setattr(rag, "_sql_max_ts", lambda *a, **kw: None)
+
+    # Primera call: pega SQL, llena cache.
+    r1 = rag._load_behavior_priors()
+    assert sql_opens["n"] == 1
+    assert r1 is not None
+
+    # Segunda call inmediata: TTL gate hit, NO pega SQL.
+    r2 = rag._load_behavior_priors()
+    assert sql_opens["n"] == 1, (
+        f"expected SQL hit count UNCHANGED on cache hit; got {sql_opens['n']}"
+    )
+    assert r2 is r1, "cached snapshot debe ser el mismo objeto (identity)"
+
+
+def test_behavior_priors_ttl_gate_expires_after_window(
+    monkeypatch, reset_behavior_cache,
+):
+    """Tras TTL_S segundos sin tocar el cache, la próxima call pega SQL
+    de nuevo. Sin esto el cache nunca se refrescaría."""
+    sql_opens = {"n": 0}
+
+    class _DummyConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def execute(self, *a, **kw):
+            class _Cur:
+                def fetchall(self): return []
+                def fetchone(self): return None
+            return _Cur()
+        @property
+        def row_factory(self): return None
+        @row_factory.setter
+        def row_factory(self, v): pass
+
+    def counting_open(*a, **kw):
+        sql_opens["n"] += 1
+        return _DummyConn()
+
+    monkeypatch.setattr(rag, "_ragvec_state_conn", counting_open)
+    monkeypatch.setattr(rag, "_sql_max_ts", lambda *a, **kw: None)
+
+    # Primera call: SQL hit.
+    rag._load_behavior_priors()
+    assert sql_opens["n"] == 1
+
+    # Forzar expiración del TTL: bajar loaded_ts a hace TTL+10s.
+    monkeypatch.setattr(
+        rag, "_behavior_priors_loaded_ts",
+        rag._behavior_priors_loaded_ts - rag._BEHAVIOR_PRIORS_TTL_S - 10.0,
+    )
+
+    # Segunda call tras "expirar" el TTL: pega SQL de nuevo.
+    rag._load_behavior_priors()
+    assert sql_opens["n"] == 2, (
+        f"expected SQL hit on TTL expiration; got {sql_opens['n']}"
+    )
+
+
+def test_behavior_priors_ttl_does_not_bump_on_sql_failure(
+    monkeypatch, reset_behavior_cache,
+):
+    """Si el SQL read falla (retry exhausto), NO bumpeamos loaded_ts —
+    así la próxima call reintenta SQL inmediatamente. Sin esto, un
+    fail transitorio congelaría el ranker sin priors por 60s.
+
+    Coopera con el invariante #3 de CLAUDE.md (stale-cache fallback):
+    devolvemos el cache previo si existe, pero NO marcamos el read
+    como exitoso."""
+    import sqlite3
+
+    # Pre-cargar cache stale + loaded_ts viejo (simulando que ya hubo
+    # un read exitoso hace mucho).
+    stale = {"click_prior": {"x.md": 0.5}, "n_events": 10, "hash": "sql:old"}
+    monkeypatch.setattr(rag, "_behavior_priors_cache", stale)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", "old_ts")
+    # Forzar TTL expirado para que el gate NO corte; la call debe
+    # intentar SQL → fallar → devolver stale + NO bumpear loaded_ts.
+    import time as _time
+    very_old = _time.monotonic() - 1000.0
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", very_old)
+
+    def fail_open(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    with patch.object(rag, "_ragvec_state_conn", fail_open), \
+         patch("time.sleep"):
+        result = rag._load_behavior_priors()
+
+    # Devuelve stale.
+    assert result is stale
+    # loaded_ts SIGUE siendo el viejo (no se bumpeó).
+    assert rag._behavior_priors_loaded_ts == very_old, (
+        "loaded_ts NO debe bumpearse en error path — sino congela 60s"
+    )
+
+
+def test_feedback_golden_ttl_gate_skips_sql_within_window(
+    monkeypatch, reset_feedback_memo,
+):
+    """Dos calls dentro del TTL window: solo la PRIMERA pega SQL."""
+    sql_opens = {"n": 0}
+
+    class _DummyConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def execute(self, *a, **kw):
+            class _Cur:
+                def fetchall(self): return []
+                def fetchone(self): return None
+            return _Cur()
+
+    def counting_open(*a, **kw):
+        sql_opens["n"] += 1
+        return _DummyConn()
+
+    # Pre-cargar memo válido + loaded_ts reciente para que el TTL gate
+    # corte. (Sin pre-load, el gate ve memo=None y va a SQL.)
+    real_memo = {"positives": [{"path": "x.md", "emb": [0.1]}], "negatives": []}
+    monkeypatch.setattr(rag, "_feedback_golden_memo", real_memo)
+    monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", "ts1")
+    import time as _time
+    monkeypatch.setattr(rag, "_feedback_golden_loaded_ts", _time.monotonic())
+
+    monkeypatch.setattr(rag, "_ragvec_state_conn", counting_open)
+
+    # Call 1: TTL gate hit, devuelve memo SIN tocar SQL.
+    r1 = rag.load_feedback_golden()
+    assert sql_opens["n"] == 0, (
+        f"TTL hit debe skipear SQL; got {sql_opens['n']} opens"
+    )
+    assert r1 is real_memo
+
+
+def test_feedback_golden_ttl_does_not_bump_on_sql_failure(
+    monkeypatch, reset_feedback_memo,
+):
+    """Si SQL read falla, NO bumpeamos loaded_ts → próxima call
+    reintenta SQL inmediatamente."""
+    import sqlite3
+
+    real_memo = {"positives": [{"path": "x.md", "emb": [0.1]}], "negatives": []}
+    monkeypatch.setattr(rag, "_feedback_golden_memo", real_memo)
+    monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", "ts1")
+    # TTL expirado para que el gate no corte.
+    import time as _time
+    very_old = _time.monotonic() - 1000.0
+    monkeypatch.setattr(rag, "_feedback_golden_loaded_ts", very_old)
+
+    def fail_open(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    with patch.object(rag, "_ragvec_state_conn", fail_open), \
+         patch("time.sleep"):
+        result = rag.load_feedback_golden()
+
+    # Devuelve el memo real (stale-cache fallback).
+    assert result is real_memo
+    # loaded_ts NO bumpeado.
+    assert rag._feedback_golden_loaded_ts == very_old, (
+        "loaded_ts NO debe bumpearse en error path"
+    )
+
+
+def test_feedback_golden_ttl_concurrent_access_safe(
+    monkeypatch, reset_feedback_memo,
+):
+    """Multiple threads concurrentes leyendo: el lock garantiza que el
+    state (memo + loaded_ts + source_ts) queda consistente."""
+    import threading
+
+    real_memo = {"positives": [{"path": "x.md", "emb": [0.1]}], "negatives": []}
+    monkeypatch.setattr(rag, "_feedback_golden_memo", real_memo)
+    monkeypatch.setattr(rag, "_feedback_golden_source_ts_sql", "ts1")
+    import time as _time
+    monkeypatch.setattr(rag, "_feedback_golden_loaded_ts", _time.monotonic())
+
+    # No mock del SQL — el TTL gate debe cortar antes del SQL.
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(rag.load_feedback_golden())
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert not errors, f"concurrent calls raised: {errors}"
+    assert len(results) == 10
+    # Todos los results son el mismo memo (TTL gate hit en todos).
+    assert all(r is real_memo for r in results)
+
+
+def test_behavior_priors_ttl_concurrent_access_safe(
+    monkeypatch, reset_behavior_cache,
+):
+    """Idem para behavior priors."""
+    import threading
+
+    stale = {"click_prior": {"x.md": 0.5}, "n_events": 10, "hash": "sql:fresh"}
+    monkeypatch.setattr(rag, "_behavior_priors_cache", stale)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", "ts1")
+    import time as _time
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", _time.monotonic())
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(rag._load_behavior_priors())
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert not errors, f"concurrent calls raised: {errors}"
+    assert len(results) == 10
+    assert all(r is stale for r in results)

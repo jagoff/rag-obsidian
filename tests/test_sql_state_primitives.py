@@ -93,10 +93,12 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # 1 brief feedback (rag_brief_feedback, 2026-04-29 — cierra el
     # loop de morning/evening/digest briefs: push con footer
     # `_brief:<vault_relpath>_` → reaction 👍/👎/🔇 en RagNet →
-    # /api/brief/feedback) = 46 tables total.
+    # /api/brief/feedback) +
+    # 1 scheduler runs (rag_scheduler_runs, 2026-04-29 — unified in-process
+    # scheduler run log; replaces ~24 cron-style launchd plists) = 47 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 46
+    assert len(expected) == 47
     c.close()
 
 

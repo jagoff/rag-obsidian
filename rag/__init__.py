@@ -854,18 +854,98 @@ atexit.register(_flush_log_queue)
 # bounded atexit drain. Drops on shutdown are acceptable because the cache
 # is a speed optimization, not a correctness path.
 # Audit 2026-04-26 (BUG #16): cap a 10K items + drops counter para alerting.
+#
+# Observability (Task A 2026-04-29): in-memory rolling metrics accessible
+# via `bg_sql_queue_stats()` and exposed at GET /api/health/sql-queue.
+# Metrics are updated inside the writer loop under _BG_SQL_METRICS_LOCK.
+# Rolling latency histogram uses a fixed-size deque of the last
+# _BG_SQL_LATENCY_WINDOW samples — p50/p95 are computed on demand (sorted
+# each call, acceptable since the deque is small and the endpoint is rare).
 _BACKGROUND_SQL_QUEUE_MAX = int(os.environ.get("RAG_BG_QUEUE_MAX", "10000"))
 _BACKGROUND_SQL_QUEUE: queue.Queue = queue.Queue(maxsize=_BACKGROUND_SQL_QUEUE_MAX)
 _BACKGROUND_SQL_QUEUE_DROPS = 0
 
+# Rolling metrics for the background SQL writer.
+_BG_SQL_METRICS_LOCK = threading.Lock()
+_BG_SQL_LATENCY_WINDOW = 200          # samples kept for p50/p95 rolling window
+_BG_SQL_LATENCY_SAMPLES: "collections.deque[float]" = None  # type: ignore[assignment]
+_BG_SQL_QUEUE_DEPTH_PEAK = 0          # max qsize observed since process start
+_BG_SQL_WRITE_COUNT_TOTAL = 0         # total writes completed (success + error)
+_BG_SQL_DROP_COUNT_TOTAL = 0          # alias kept in sync with _BACKGROUND_SQL_QUEUE_DROPS
+_BG_SQL_LAST_DROP_REASON: str = ""    # error_tag of the most recent drop
+
+# Lazy-init the deque here to avoid importing collections at module top.
+import collections as _collections_mod
+_BG_SQL_LATENCY_SAMPLES = _collections_mod.deque(maxlen=_BG_SQL_LATENCY_WINDOW)
+
+
+def bg_sql_queue_stats() -> dict:
+    """Return a snapshot of the background SQL writer queue health metrics.
+
+    Thread-safe; never raises. Called by GET /api/health/sql-queue and any
+    monitoring / alerting code that wants runtime queue observability without
+    grep'ing the logs.
+
+    Returns
+    -------
+    {
+      "queue_depth_current": int,     # items waiting right now
+      "queue_depth_peak": int,        # max ever observed since process start
+      "queue_max_capacity": int,      # _BACKGROUND_SQL_QUEUE_MAX
+      "write_count_total": int,       # writes completed (success+error)
+      "drop_count_total": int,        # items dropped on Full exception
+      "last_drop_reason": str,        # error_tag of most recent drop ("" if none)
+      "write_latency_p50_ms": float | None,   # p50 of last N write durations
+      "write_latency_p95_ms": float | None,   # p95 of last N write durations
+      "latency_window_samples": int,  # how many samples in the rolling window
+    }
+    """
+    with _BG_SQL_METRICS_LOCK:
+        samples = list(_BG_SQL_LATENCY_SAMPLES)
+        peak = _BG_SQL_QUEUE_DEPTH_PEAK
+        writes = _BG_SQL_WRITE_COUNT_TOTAL
+        drops = _BG_SQL_DROP_COUNT_TOTAL
+        last_reason = _BG_SQL_LAST_DROP_REASON
+
+    current_depth = _BACKGROUND_SQL_QUEUE.qsize()
+
+    p50 = p95 = None
+    if samples:
+        s = sorted(samples)
+        n = len(s)
+        p50 = s[int(n * 0.50)]
+        p95 = s[min(int(n * 0.95), n - 1)]
+
+    return {
+        "queue_depth_current": current_depth,
+        "queue_depth_peak": peak,
+        "queue_max_capacity": _BACKGROUND_SQL_QUEUE_MAX,
+        "write_count_total": writes,
+        "drop_count_total": drops,
+        "last_drop_reason": last_reason,
+        "write_latency_p50_ms": round(p50, 2) if p50 is not None else None,
+        "write_latency_p95_ms": round(p95, 2) if p95 is not None else None,
+        "latency_window_samples": len(samples),
+    }
+
 
 def _background_sql_writer_loop() -> None:
+    global _BG_SQL_QUEUE_DEPTH_PEAK, _BG_SQL_WRITE_COUNT_TOTAL
     while True:
         item = _BACKGROUND_SQL_QUEUE.get()
         try:
             if item is None:
                 return
             write_fn, error_tag = item
+            # Track peak queue depth (sampled at dequeue time — approximation,
+            # good enough for alerting; exact peak would need a lock on every
+            # put_nowait which is undesirable on the hot path).
+            depth = _BACKGROUND_SQL_QUEUE.qsize()
+            with _BG_SQL_METRICS_LOCK:
+                if depth > _BG_SQL_QUEUE_DEPTH_PEAK:
+                    _BG_SQL_QUEUE_DEPTH_PEAK = depth
+
+            t0 = time.monotonic()
             try:
                 _sql_write_with_retry(write_fn, error_tag)
             except Exception as exc:
@@ -873,6 +953,10 @@ def _background_sql_writer_loop() -> None:
                 # this outer guard catches any bug in the retry helper itself
                 # (e.g. argument misuse) so the worker thread never dies.
                 _log_sql_state_error(error_tag, err=repr(exc))
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            with _BG_SQL_METRICS_LOCK:
+                _BG_SQL_LATENCY_SAMPLES.append(elapsed_ms)
+                _BG_SQL_WRITE_COUNT_TOTAL += 1
         finally:
             _BACKGROUND_SQL_QUEUE.task_done()
 
@@ -890,17 +974,20 @@ def _enqueue_background_sql(write_fn, error_tag: str) -> None:
     (same contract as `_sql_write_with_retry`). error_tag is forwarded to
     `_log_sql_state_error` if the retry budget is exhausted.
 
-    If the queue put fails (should never happen — unbounded queue) the
-    write is dropped silently to preserve the no-raise contract of the
-    hot path.
+    If the queue put fails (queue at maxsize) the write is dropped silently
+    to preserve the no-raise contract of the hot path; the drop is counted
+    in the metrics returned by `bg_sql_queue_stats()`.
     """
-    global _BACKGROUND_SQL_QUEUE_DROPS
+    global _BACKGROUND_SQL_QUEUE_DROPS, _BG_SQL_DROP_COUNT_TOTAL, _BG_SQL_LAST_DROP_REASON
     try:
         _BACKGROUND_SQL_QUEUE.put_nowait((write_fn, error_tag))
     except queue.Full:
         # Audit 2026-04-26 (BUG #16): overflow → bumpea drops counter
         # para que el alerting de silent_log lo detecte.
         _BACKGROUND_SQL_QUEUE_DROPS += 1
+        with _BG_SQL_METRICS_LOCK:
+            _BG_SQL_DROP_COUNT_TOTAL += 1
+            _BG_SQL_LAST_DROP_REASON = error_tag
         try:
             _silent_log(
                 f"bg_sql_queue_full:{error_tag}",
@@ -3595,9 +3682,19 @@ _behavior_priors_cache_key_sql: str | None = None
 # CLI/web threads are mid-lookup. RLock in case a reader calls out to a
 # function that re-enters (defensive; today's callers don't).
 _behavior_priors_lock = threading.RLock()
+# TTL memoization (audit 2026-04-29): _load_behavior_priors() runs on
+# every retrieve() — bajo carga del web server (multiple chats + serve)
+# eso son 5-20 calls/seg, cada una pegando SQL al menos para `MAX(ts)`
+# en rag_behavior. Bajo contención WAL (84K+ rows en 7d) eso explicaba
+# 311 `behavior_priors_sql_read_failed` en 7d. TTL 60s reduce el SQL
+# hit rate ~60-1200×: la mayoría de calls dentro del TTL devuelven
+# cache directo sin tocar la DB. Refresh real ocurre cuando el TTL
+# expiró Y hay nueva data (MAX(ts) check después del TTL gate).
+_BEHAVIOR_PRIORS_TTL_S = 60.0
+_behavior_priors_loaded_ts: float = 0.0
 
 
-def _compute_behavior_priors_from_rows(rows_iter) -> dict:
+def _compute_behavior_priors_from_rows(rows_iter, impression_counts: "dict | None" = None) -> dict:
     """Fold behavior rows (dict-like, with `event`/`path`/`ts`/`dwell_ms`) into the
     priors snapshot. Shared between the SQL and JSONL readers so CTR arithmetic
     lives in one place.
@@ -3606,6 +3703,15 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     Accepts both JSONL `dwell_ms` and SQL `dwell_s` — the latter is stored in
     seconds per the rag_behavior schema; if present we multiply by 1000 to match
     the JSONL dwell_ms convention before folding into dwell_acc.
+
+    `impression_counts` (optional): pre-aggregated {path: count} dict from a SQL
+    GROUP BY query. When provided, impression rows are NOT expected in `rows_iter`
+    (they should be excluded from the SQL query that produced it). The counts are
+    applied directly to `path_acc` and `folder_acc` denominators at the end,
+    avoiding per-row Python iteration for high-volume impression events.
+    Perf fix 2026-04-29: impression events are ~90% of rag_behavior volume (20K of
+    21K rows in a typical 90d window); pre-aggregating in SQL reduces row transfer
+    from ~20K to ~N_distinct_paths (~200), saving ~1-2MB of wire and Python iteration.
     """
     path_acc: dict[str, list[int]] = {}
     folder_acc: dict[str, list[int]] = {}
@@ -3698,6 +3804,26 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
                     except (TypeError, ValueError):
                         pass
 
+    # Merge pre-aggregated impression counts (perf fix 2026-04-29).
+    # impression events are denominator-only (is_click=0): they only increment
+    # path_acc[path][1] and folder_acc[folder][1]. Hour/weekday/dwell are NOT
+    # updated (impressions carry no ts or dwell_s that matters for CTR
+    # context). Applying them here after the row loop is arithmetically
+    # identical to iterating individual impression rows.
+    if impression_counts:
+        for imp_path, imp_count in impression_counts.items():
+            if not imp_path or imp_count <= 0:
+                continue
+            if imp_path not in path_acc:
+                path_acc[imp_path] = [0, 0]
+            path_acc[imp_path][1] += imp_count
+            imp_folder = imp_path.split("/")[0] if "/" in imp_path else ""
+            if imp_folder:
+                if imp_folder not in folder_acc:
+                    folder_acc[imp_folder] = [0, 0]
+                folder_acc[imp_folder][1] += imp_count
+            n_events += imp_count
+
     import math
 
     def _laplace_ctr(clicks: int, impressions: int) -> float:
@@ -3763,6 +3889,7 @@ def _load_behavior_priors() -> dict:
     persistentes — edge case real pero raro.
     """
     global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
+    global _behavior_priors_loaded_ts
 
     # `_behavior_priors_lock` fue creado con un comentario de "serialises
     # reads + writes of the three globals" pero nunca se adquiría. Bajo
@@ -3772,6 +3899,22 @@ def _load_behavior_priors() -> dict:
     # stale que nunca se refrescaba. Fix: envolver read-then-write en el
     # RLock pre-existente.
     with _behavior_priors_lock:
+        # TTL gate (audit 2026-04-29): si el cache es válido (no None) y
+        # la última lectura exitosa fue hace <60s, devolver el cache sin
+        # tocar SQL. Reduce SQL hits 60-1200× bajo carga normal del web
+        # server. Refresh real (con MAX(ts) check) ocurre cuando TTL
+        # expiró. Behavior signal "queda atrás" hasta TTL_S segundos —
+        # tradeoff aceptable: las CTR per-path cambian en bursts de 5-50
+        # opens (no per-event), así que stale-by-60s ≈ fresh para el
+        # ranker. Si el SQL read falla (retry exhausto), el cache previo
+        # se mantiene SIN bumpear el loaded_ts → próxima call reintenta
+        # SQL. Esto coopera con el invariante #3 (CLAUDE.md): retry +
+        # stale-cache fallback, nunca empty default que sobrescribe memo.
+        import time as _time_mod
+        _now = _time_mod.monotonic()
+        if (_behavior_priors_cache is not None
+                and (_now - _behavior_priors_loaded_ts) < _BEHAVIOR_PRIORS_TTL_S):
+            return _behavior_priors_cache
 
         def _read_priors():
             with _ragvec_state_conn() as conn:
@@ -3787,33 +3930,40 @@ def _load_behavior_priors() -> dict:
                 prev_factory = conn.row_factory
                 try:
                     conn.row_factory = _sqlite3.Row
-                    # Audit perf 2026-04-26: pre-fix scaneaba TODA rag_behavior
-                    # sin filtros (84K+ rows en 7d → todos los Row objects en
-                    # RAM ~50-200MB en cada cache rebuild). El filtro lado-DB
-                    # elimina round-trip de Python para events que
-                    # `_compute_behavior_priors_from_rows` skipea por
-                    # event_type ∉ POSITIVE|NEGATIVE|IMPRESSION_ONLY.
-                    # Retención rag_behavior = 90d; bound `ts >= now-90d`
-                    # es belt-and-suspenders contra rotación atrasada +
-                    # permite usar `ix_rag_behavior_ts`. CRÍTICO: incluir
-                    # 'impression' — denominador de la CTR (Laplace
-                    # smoothing). Sin él todos los paths tendrían
-                    # click_prior ~1 falso. NO usar LIMIT — la CTR requiere
-                    # conteo completo dentro del window.
-                    # Audit 2026-04-26 H3: SQLite `'now'` retorna **UTC**,
-                    # pero `ts` se inserta con `datetime.now().isoformat()`
-                    # (local). Para AR (UTC-3) eso cortaba 3h antes en el
-                    # límite del window de 90d → events del borde se
-                    # perdían. `'now', 'localtime'` resuelve.
+                    # Perf fix 2026-04-29: impression events dominate rag_behavior
+                    # volume (~90% — 20K of 21K rows in a typical 90d window) but
+                    # carry zero per-row signal beyond their count: is_click=0, no
+                    # dwell, no hour/weekday. Pre-fix fetched all rows together,
+                    # passing ~20K impression Row objects to Python. Fix: two
+                    # queries — (1) aggregate impression counts in SQL (O(1) wire
+                    # per distinct path, ~200 paths), (2) individual rows only for
+                    # click/negative events (~300 rows). Both share the same window.
+                    # Audit 2026-04-26 H3: `'now','localtime'` keeps the window
+                    # boundary consistent with AR (UTC-3) ts-insertion convention.
+                    # CRÍTICO: impression counts are the CTR denominator (Laplace
+                    # smoothing). Excluding them would make click_prior ~1 (false).
+                    _WINDOW = "datetime('now','localtime','-90 days')"
+                    # Query 1: SQL-aggregated impression counts per path
+                    imp_rows = conn.execute(
+                        "SELECT path, COUNT(*) AS cnt FROM rag_behavior "
+                        f"WHERE ts >= {_WINDOW} AND event='impression' "
+                        "AND path IS NOT NULL AND path != '' "
+                        "GROUP BY path"
+                    ).fetchall()
+                    imp_counts: dict[str, int] = {
+                        r["path"]: r["cnt"] for r in imp_rows if r["path"]
+                    }
+                    # Query 2: individual rows for click/negative events (need ts,
+                    # dwell_s for hour/weekday/CTR computation).
                     rows = list(conn.execute(
                         "SELECT ts, event, path, dwell_s FROM rag_behavior "
-                        "WHERE ts >= datetime('now','localtime','-90 days') "
+                        f"WHERE ts >= {_WINDOW} "
                         "AND event IN ('open','open_external','positive_implicit',"
-                        "'negative_implicit','kept','deleted','save','copy','impression')"
+                        "'negative_implicit','kept','deleted','save','copy')"
                     ).fetchall())
                 finally:
                     conn.row_factory = prev_factory
-                snapshot = _compute_behavior_priors_from_rows(rows)
+                snapshot = _compute_behavior_priors_from_rows(rows, impression_counts=imp_counts)
                 snapshot["hash"] = f"sql:{max_ts}"
                 return ("rebuilt", snapshot, max_ts)
 
@@ -3832,6 +3982,11 @@ def _load_behavior_priors() -> dict:
                 _behavior_priors_cache_key_sql = max_ts
                 _behavior_priors_cache_key = None
             # kind == "hit": cache ya está fresh, sólo retornamos.
+            # Bump TTL stamp en cualquier path exitoso (hit / rebuilt /
+            # empty) — todos confirman que el SQL read corrió bien y el
+            # cache está sincronizado con la DB. La próxima call dentro
+            # del TTL window saltea la SQL roundtrip entera.
+            _behavior_priors_loaded_ts = _now
             return snapshot
 
         # Retry exhausted. Stale cache > empty snapshot — sin priors el
@@ -4495,6 +4650,15 @@ def feedback_counts() -> tuple[int, int]:
 _feedback_golden_memo: dict | None = None
 # SQL-backed memo key — rag_feedback MAX(ts) (post-T10, the only source).
 _feedback_golden_source_ts_sql: str | None = None
+# TTL memoization (audit 2026-04-29): gemelo del knob de behavior priors.
+# 297 `feedback_golden_sql_read_failed` en 7d explicaban -50% del scoring
+# del ranker (feedback_pos/neg = 0 cuando golden = empty). TTL 60s baja
+# las SQL roundtrips dramaticamente y se coopera con el retry+stale-cache
+# fallback existente: si el read falla, no se bumpea el loaded_ts → la
+# próxima call reintenta SQL.
+_FEEDBACK_GOLDEN_TTL_S = 60.0
+_feedback_golden_loaded_ts: float = 0.0
+_feedback_golden_lock = threading.RLock()
 
 
 def _pack_embedding(emb) -> tuple[bytes, int]:
@@ -4715,73 +4879,99 @@ def load_feedback_golden() -> dict:
     retrieval.
     """
     global _feedback_golden_memo, _feedback_golden_source_ts_sql
+    global _feedback_golden_loaded_ts
 
-    def _read():
-        with _ragvec_state_conn() as conn:
-            source_ts = _sql_max_ts(conn, "rag_feedback")
-            meta_ts = _feedback_golden_meta_ts(conn)
-            table_empty = _feedback_golden_table_empty(conn)
-
-            need_rebuild = False
-            if source_ts is not None:
-                # rag_feedback has rows. Rebuild if meta missing/stale or
-                # the golden table is empty.
-                if table_empty or meta_ts is None or meta_ts < source_ts:
-                    need_rebuild = True
-
-            if need_rebuild:
-                rebuilt = _rebuild_feedback_golden_from_sql_feedback(conn)
-                return ("rebuilt", rebuilt,
-                        _feedback_golden_meta_ts(conn) or source_ts or "")
-
-            # Cache hit on current source_ts.
-            if (_feedback_golden_memo is not None
-                    and _feedback_golden_source_ts_sql == (meta_ts or "")
-                    and not table_empty):
-                return ("memo", _feedback_golden_memo, None)
-
-            if not table_empty:
-                loaded = _read_feedback_golden_sql(conn)
-                return ("loaded", loaded, meta_ts or "")
-
-            # Nothing in either table → empty snapshot.
-            return ("empty", {"positives": [], "negatives": []}, "")
-
-    # Audit 2026-04-24: bumped attempts 5→8 to match writers. 211
-    # `feedback_golden_sql_read_failed` en 6 días post semantic-cache wiring
-    # implicaba que los 5 intentos × ~250ms jitter (~1.25s budget) no
-    # alcanzaban contra la contención WAL real.
-    result = _sql_read_with_retry(
-        _read, "feedback_golden_sql_read_failed",
-        default=("error", {"positives": [], "negatives": []}, None),
-        attempts=8,
-    )
-    kind, payload, new_ts = result
-    # Observability: hit = in-memory memo reused; miss = SQL read / rebuild /
-    # empty / error (cualquier path no-memo implica lectura a disco/CPU).
-    if kind == "memo":
-        record_cache_event("feedback_golden", hits=1)
-        return payload
-    if kind == "error":
-        # Audit 2026-04-24 — el path original sobrescribía `_feedback_golden_memo`
-        # con el empty snapshot del default, **invalidando el memo previo**
-        # que tenía las señales reales del user. La próxima call veía
-        # `_feedback_golden_memo is not None` y `kind == "memo"` → devolvía
-        # empty de forma cacheada hasta que rag_feedback recibiera una
-        # nueva entry y el rebuild se disparara. Resultado: 211 reads
-        # fallidos posiblemente envenenaron el cache cuando aún tenían
-        # data buena cargada. Fix: en error, devolver el memo previo
-        # (si existe) sin tocar el cache. Es el mismo principio del
-        # behavior_priors stale-cache fallback.
-        record_cache_event("feedback_golden", misses=1)
-        if _feedback_golden_memo is not None:
+    # TTL gate (audit 2026-04-29): mismo patrón que _load_behavior_priors.
+    # Si el memo es válido (no None) y la última lectura exitosa fue hace
+    # <60s, devolver el memo sin tocar SQL. Reduce SQL hits 60-1200×
+    # bajo carga normal del web server. La invalidación explícita de
+    # record_feedback() (que hace DELETE FROM rag_feedback_golden +
+    # bumpea source_ts) sigue funcionando: la próxima call al expirar el
+    # TTL detecta el meta drift y rebuildea. Worst case staleness = 60s,
+    # aceptable para feedback signal (cambia en bursts user-driven).
+    with _feedback_golden_lock:
+        import time as _time_mod
+        _now_fb = _time_mod.monotonic()
+        if (_feedback_golden_memo is not None
+                and (_now_fb - _feedback_golden_loaded_ts) < _FEEDBACK_GOLDEN_TTL_S):
+            record_cache_event("feedback_golden", hits=1)
             return _feedback_golden_memo
-        return payload  # Fresh process sin memo — empty es lo único que tenemos.
-    record_cache_event("feedback_golden", misses=1)
-    _feedback_golden_memo = payload
-    if new_ts is not None:
-        _feedback_golden_source_ts_sql = new_ts
-    return payload
+
+        def _read():
+            with _ragvec_state_conn() as conn:
+                source_ts = _sql_max_ts(conn, "rag_feedback")
+                meta_ts = _feedback_golden_meta_ts(conn)
+                table_empty = _feedback_golden_table_empty(conn)
+
+                need_rebuild = False
+                if source_ts is not None:
+                    # rag_feedback has rows. Rebuild if meta missing/stale or
+                    # the golden table is empty.
+                    if table_empty or meta_ts is None or meta_ts < source_ts:
+                        need_rebuild = True
+
+                if need_rebuild:
+                    rebuilt = _rebuild_feedback_golden_from_sql_feedback(conn)
+                    return ("rebuilt", rebuilt,
+                            _feedback_golden_meta_ts(conn) or source_ts or "")
+
+                # Cache hit on current source_ts.
+                if (_feedback_golden_memo is not None
+                        and _feedback_golden_source_ts_sql == (meta_ts or "")
+                        and not table_empty):
+                    return ("memo", _feedback_golden_memo, None)
+
+                if not table_empty:
+                    loaded = _read_feedback_golden_sql(conn)
+                    return ("loaded", loaded, meta_ts or "")
+
+                # Nothing in either table → empty snapshot.
+                return ("empty", {"positives": [], "negatives": []}, "")
+
+        # Audit 2026-04-24: bumped attempts 5→8 to match writers. 211
+        # `feedback_golden_sql_read_failed` en 6 días post semantic-cache wiring
+        # implicaba que los 5 intentos × ~250ms jitter (~1.25s budget) no
+        # alcanzaban contra la contención WAL real.
+        result = _sql_read_with_retry(
+            _read, "feedback_golden_sql_read_failed",
+            default=("error", {"positives": [], "negatives": []}, None),
+            attempts=8,
+        )
+        kind, payload, new_ts = result
+        # Observability: hit = in-memory memo reused; miss = SQL read / rebuild /
+        # empty / error (cualquier path no-memo implica lectura a disco/CPU).
+        if kind == "memo":
+            record_cache_event("feedback_golden", hits=1)
+            # Bump TTL stamp — el SQL roundtrip confirmó que el memo está
+            # sincronizado con la DB.
+            _feedback_golden_loaded_ts = _now_fb
+            return payload
+        if kind == "error":
+            # Audit 2026-04-24 — el path original sobrescribía `_feedback_golden_memo`
+            # con el empty snapshot del default, **invalidando el memo previo**
+            # que tenía las señales reales del user. La próxima call veía
+            # `_feedback_golden_memo is not None` y `kind == "memo"` → devolvía
+            # empty de forma cacheada hasta que rag_feedback recibiera una
+            # nueva entry y el rebuild se disparara. Resultado: 211 reads
+            # fallidos posiblemente envenenaron el cache cuando aún tenían
+            # data buena cargada. Fix: en error, devolver el memo previo
+            # (si existe) sin tocar el cache. Es el mismo principio del
+            # behavior_priors stale-cache fallback.
+            # NOTE: NO bumpeamos _feedback_golden_loaded_ts en error path —
+            # próxima call (tras TTL gate hit) reintenta SQL. Si bumpeáramos,
+            # un fail transitorio congelaría el memo por 60s.
+            record_cache_event("feedback_golden", misses=1)
+            if _feedback_golden_memo is not None:
+                return _feedback_golden_memo
+            return payload  # Fresh process sin memo — empty es lo único que tenemos.
+        record_cache_event("feedback_golden", misses=1)
+        _feedback_golden_memo = payload
+        if new_ts is not None:
+            _feedback_golden_source_ts_sql = new_ts
+        # Bump TTL stamp en cualquier path exitoso (rebuilt / loaded /
+        # empty) — el SQL read confirmó que el memo refleja la DB.
+        _feedback_golden_loaded_ts = _now_fb
+        return payload
 
 
 def _soft_feedback_weight(cos: float, floor: float) -> float:
@@ -6562,6 +6752,29 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
             ")",
             "CREATE INDEX IF NOT EXISTS ix_behavior_priors_wa_computed "
             "ON rag_behavior_priors_wa(computed_at DESC)",
+        ),
+    ),
+    (
+        # Unified scheduler run log (2026-04-29) — append-only history of
+        # every job dispatched by the BackgroundScheduler in rag/scheduler.py.
+        # Consultar con `rag scheduler status`. Retention: 90d via
+        # `rag maintenance` (same as rag_queries). Keep all entries until
+        # then — granular per-job history is the main debugging surface.
+        "rag_scheduler_runs",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_scheduler_runs ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts_start TEXT NOT NULL,"
+            " ts_end TEXT,"
+            " job_name TEXT NOT NULL,"
+            " exit_code INTEGER,"
+            " duration_s REAL,"
+            " error_msg TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_scheduler_runs_ts"
+            " ON rag_scheduler_runs(ts_start)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_scheduler_runs_job"
+            " ON rag_scheduler_runs(job_name, ts_start)",
         ),
     ),
 )
@@ -30201,39 +30414,85 @@ def _brief_synthetic_cases(
                 (cutoff_iso,),
             ).fetchall()
 
+            if not brief_rows:
+                return []
+
+            # Perf fix 2026-04-29: pre-fix did N individual `paths_json LIKE`
+            # queries (one per brief event), each a full table scan because
+            # paths_json TEXT has no index. With ~20 brief events = 20 scans.
+            # Fix: single query fetches ALL rag_queries rows in the widest
+            # possible window, then join in Python using set membership on the
+            # parsed paths_json array. Semantics are identical: exact path
+            # matching (no substring false-positives), causal window enforced
+            # per brief event, max_queries_per_path cap preserved.
+            if hasattr(brief_rows[0], "keys"):
+                _bget = lambda r, k: r[k]  # noqa: E731
+            else:
+                _bget = lambda r, k: r[{"path": 0, "event": 1, "ts": 2}[k]]  # noqa: E731
+
+            # Compute the overall time window for the single bulk query.
+            all_ev_ts = [_bget(be, "ts") for be in brief_rows]
+            earliest_ev_ts = min(all_ev_ts)
+            latest_ev_ts = max(all_ev_ts)
+            earliest_lookback = (
+                datetime.fromisoformat(earliest_ev_ts) - timedelta(days=lookback_days)
+            ).isoformat(timespec="seconds")
+
+            # Single bulk fetch of all candidate queries in the window.
+            all_query_rows = conn.execute(
+                "SELECT q, paths_json, ts FROM rag_queries "
+                "WHERE ts >= ? AND ts <= ? "
+                "  AND q IS NOT NULL AND q != '' "
+                "  AND paths_json IS NOT NULL AND paths_json != '' "
+                "ORDER BY ts DESC",
+                (earliest_lookback, latest_ev_ts),
+            ).fetchall()
+
+            if all_query_rows and hasattr(all_query_rows[0], "keys"):
+                _qget = lambda r, k: r[k]  # noqa: E731
+            else:
+                _qget = lambda r, k: r[{"q": 0, "paths_json": 1, "ts": 2}[k]]  # noqa: E731
+
+            # Pre-parse paths_json once per query row (avoids repeated
+            # json.loads in the per-event inner loop).
+            parsed_queries: list[tuple[str, set[str], str]] = []
+            for qr in all_query_rows:
+                q_val = (_qget(qr, "q") or "").strip()
+                if not q_val:
+                    continue
+                pj = _qget(qr, "paths_json") or ""
+                try:
+                    path_set = set(json.loads(pj))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    path_set = set()
+                parsed_queries.append((q_val, path_set, _qget(qr, "ts") or ""))
+
             for be in brief_rows:
-                path = be["path"] if hasattr(be, "keys") else be[0]
-                event = be["event"] if hasattr(be, "keys") else be[1]
-                ev_ts = be["ts"] if hasattr(be, "keys") else be[2]
+                path = _bget(be, "path")
+                event = _bget(be, "event")
+                ev_ts = _bget(be, "ts")
                 # Lookback bound: don't attach queries posterior to the
-                # brief event (would be leakage from future to past).
+                # brief event (causal-only — no leakage from future).
                 lookback_ts = (
                     datetime.fromisoformat(ev_ts) - timedelta(days=lookback_days)
                 ).isoformat(timespec="seconds")
-                # JSON array LIKE: paths_json is `["a", "b"]`; match on
-                # quoted path so we don't false-positive on substrings.
-                # Path can't contain `"` in the vault (Obsidian disallows),
-                # so simple LIKE is safe.
-                pat = '%"' + path + '"%'
-                qrows = conn.execute(
-                    "SELECT q FROM rag_queries "
-                    "WHERE ts >= ? AND ts <= ? "
-                    "  AND paths_json LIKE ? "
-                    "  AND q IS NOT NULL AND q != '' "
-                    "ORDER BY ts DESC LIMIT ?",
-                    (lookback_ts, ev_ts, pat, max_queries_per_path),
-                ).fetchall()
-                for r in qrows:
-                    q = (r["q"] if hasattr(r, "keys") else r[0]) or ""
-                    q = q.strip()
-                    if not q:
-                        continue
-                    norm_q = " ".join(q.lower().split())
+
+                count = 0
+                for q_val, path_set, q_ts in parsed_queries:
+                    if q_ts > ev_ts or q_ts < lookback_ts:
+                        continue  # outside causal window for this event
+                    if path not in path_set:
+                        continue  # this query didn't return the path
+                    norm_q = " ".join(q_val.lower().split())
                     key = (norm_q, path)
                     if event == "kept":
                         pos[key] = "brief_kept_synthetic"
                     elif event == "deleted":
                         neg[key] = "brief_deleted_synthetic"
+                    count += 1
+                    if count >= max_queries_per_path:
+                        break
+
     except Exception as exc:
         _log_sql_state_error("brief_synthetic_cases_sql_read_failed",
                               err=repr(exc))
@@ -45582,8 +45841,44 @@ def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usad
 """
 
 
+def _scheduler_plist(rag_bin: str) -> str:
+    """Unified in-process scheduler — replaces ~24 cron-style plists.
+
+    KeepAlive=true. Only installed when RAG_USE_SCHEDULER=1 (via _services_spec).
+    Config: ~/.config/obsidian-rag/scheduler.yaml (auto-generated on first run).
+    State: rag_scheduler_runs in telemetry.db.
+    """
+    from rag.scheduler import scheduler_plist as _scheduler_plist_fn
+    return _scheduler_plist_fn(rag_bin)
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
-    """Return [(label, plist_filename, plist_xml), ...]."""
+    """Return [(label, plist_filename, plist_xml), ...].
+
+    When RAG_USE_SCHEDULER=1: returns only the 5 critical KeepAlive plists
+    + the scheduler plist. The scheduler daemon replaces the ~24 cron-style
+    individual plists.
+
+    Without RAG_USE_SCHEDULER: legacy behaviour — all individual plists.
+    """
+    use_scheduler = os.environ.get("RAG_USE_SCHEDULER", "").strip().lower() in (
+        "1", "true", "yes"
+    )
+    if use_scheduler:
+        return [
+            ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
+             _watch_plist(rag_bin)),
+            ("com.fer.obsidian-rag-serve", "com.fer.obsidian-rag-serve.plist",
+             _serve_plist(rag_bin)),
+            ("com.fer.obsidian-rag-web", "com.fer.obsidian-rag-web.plist",
+             _web_plist(rag_bin)),
+            ("com.fer.obsidian-rag-serve-watchdog",
+             "com.fer.obsidian-rag-serve-watchdog.plist",
+             _serve_watchdog_plist(rag_bin)),
+            ("com.fer.obsidian-rag-scheduler",
+             "com.fer.obsidian-rag-scheduler.plist",
+             _scheduler_plist(rag_bin)),
+        ]
     return [
         ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
          _watch_plist(rag_bin)),
@@ -45690,6 +45985,88 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          "com.fer.obsidian-rag-serve-watchdog.plist",
          _serve_watchdog_plist(rag_bin)),
     ]
+
+
+# ── Unified scheduler CLI ─────────────────────────────────────────────────────
+
+@cli.group("scheduler", invoke_without_command=True)
+@click.pass_context
+def scheduler_group(ctx):
+    """Unified in-process scheduler — runs all cron-style jobs in one process.
+
+    ``rag scheduler`` (no subcommand): starts the daemon (blocks).
+    ``rag scheduler status``: list jobs with last_run/exit_code.
+    ``rag scheduler generate-config``: write default scheduler.yaml.
+
+    Enable via: RAG_USE_SCHEDULER=1 rag setup (installs single plist).
+    """
+    if ctx.invoked_subcommand is None:
+        from rag.scheduler import start_scheduler
+        import logging as _logging
+        _logging.basicConfig(
+            level=_logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
+        start_scheduler()
+
+
+@scheduler_group.command("status")
+@click.option("--plain", is_flag=True, help="Plain output (no Rich tables)")
+def scheduler_status(plain: bool):
+    """List all scheduler jobs with last run info."""
+    from rag.scheduler import get_scheduler_status
+    rows = get_scheduler_status()
+    if not rows:
+        console.print("[dim]No scheduler jobs found.[/dim]")
+        return
+    if plain:
+        for r in rows:
+            status = "ok" if r["last_exit_code"] == 0 else (
+                "err" if r["last_exit_code"] is not None else "never"
+            )
+            print(f"{r['job_name']:30s} {status:6s} last={r['last_run'] or 'never'}")
+        return
+    from rich.table import Table
+    t = Table(title="Scheduler Jobs", show_lines=False)
+    t.add_column("Job", style="bold")
+    t.add_column("Last Run")
+    t.add_column("Exit")
+    t.add_column("Duration")
+    t.add_column("Error")
+    for r in rows:
+        exit_str = str(r["last_exit_code"]) if r["last_exit_code"] is not None else "—"
+        exit_style = "green" if r["last_exit_code"] == 0 else (
+            "red" if r["last_exit_code"] is not None else "dim"
+        )
+        dur = f"{r['last_duration_s']:.1f}s" if r["last_duration_s"] else "—"
+        err = (r["last_error"] or "")[:40]
+        t.add_row(
+            r["job_name"],
+            r["last_run"] or "[dim]never[/dim]",
+            f"[{exit_style}]{exit_str}[/{exit_style}]",
+            dur,
+            err,
+        )
+    console.print(t)
+
+
+@scheduler_group.command("generate-config")
+@click.option("--force", is_flag=True, help="Overwrite existing config")
+def scheduler_generate_config(force: bool):
+    """Write the default scheduler.yaml to ~/.config/obsidian-rag/."""
+    from rag.scheduler import _CONFIG_DIR, _SCHEDULER_YAML, _DEFAULT_JOBS
+    import yaml as _yaml
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if _SCHEDULER_YAML.exists() and not force:
+        console.print(
+            f"[yellow]Ya existe:[/yellow] {_SCHEDULER_YAML}  "
+            f"(usá --force para sobreescribir)"
+        )
+        return
+    doc = {"jobs": _DEFAULT_JOBS}
+    with open(_SCHEDULER_YAML, "w", encoding="utf-8") as fh:
+        _yaml.dump(doc, fh, default_flow_style=False, allow_unicode=True, sort_keys=True)
+    console.print(f"[green]✓[/green] Generado: {_SCHEDULER_YAML}")
 
 
 @cli.command()
@@ -49908,67 +50285,118 @@ def _telemetry_wal_checkpoint(dry_run: bool = False) -> dict:
     return _wal_checkpoint_for(DB_PATH / _TELEMETRY_DB_FILENAME, dry_run=dry_run)
 
 
-# ── SQL log rotation (T7) ────────────────────────────────────────────────────
-# Retention policies per log-style rag_* table. When RAG_STATE_SQL=1 and
-# `rag maintenance` runs, rows with ts < now - retention are DELETEd. State-
-# style tables (rag_ambient_state, rag_brief_state, rag_conversations_index,
-# rag_feedback_golden, rag_feedback_golden_meta) are keyed upserts and MUST
-# NOT appear here.
+# ── SQL log rotation (T7) — unified retention policy ─────────────────────────
+# Single source of truth for every telemetry table's retention behaviour.
+# Policy values:
+#   int   → rotate (DELETE rows with ts < now - days)
+#   None  → keep forever (high-signal, small, intentionally unbounded)
+#   "state" → upsert-by-PK, never rotated (rag_ambient_state, etc.)
+#   "cache" → content-hash invalidated, never time-rotated
 #
-# Defaults chosen in T7:
-#   90d: queries, behavior             — ranker-vivo signal window
-#   60d: ambient, brief_written, wa_tasks, archive, filing, eval, surface,
-#        proactive — useful historic context but not ranker input
-#   30d: cpu_metrics, memory_metrics — sampled every minute by the web
-#        sampler; bloat magnet otherwise
-#   ∞ : feedback, tune, contradictions — small, high-signal, intentionally
-#        kept (feedback golden depends on full rag_feedback history, tune
-#        history feeds `rag dashboard`, contradictions are audit).
+# Back-compat aliases (_SQL_ROTATION_POLICY, _SQL_STATE_TABLES,
+# _SQL_KEEP_ALL_TABLES) are derived below so existing callers don't change.
 #
-# Tables explicitly NOT rotated (empty tuple): retained forever.
-_SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = (
-    ("rag_queries", 90),
-    ("rag_behavior", 90),
-    ("rag_ambient", 60),
-    ("rag_brief_written", 60),
-    ("rag_wa_tasks", 60),
-    ("rag_archive_log", 60),
-    ("rag_filing_log", 60),
-    ("rag_eval_runs", 60),
-    ("rag_surface_log", 60),
-    ("rag_proactive_log", 60),
-    ("rag_cpu_metrics", 30),
-    ("rag_memory_metrics", 30),
-    ("system_memory_metrics", 30),
-    # Audit 2026-04-26 BUG #2 telemetry: estas tablas son creadas por
-    # writers fuera de _TELEMETRY_DDL (rag_ranker_lgbm/synthetic_queries.py
-    # + hard_negatives.py + wa_scheduled.py + obsidian-rag-promises fork).
-    # Pre-fix crecían sin rotation — `rag_synthetic_negatives` ya tiene
-    # ~3K rows. Estas son señales temporales del fine-tune y la auto-
-    # tuning pipeline; rotation 90d es generosa.
-    ("rag_synthetic_queries", 90),
-    ("rag_synthetic_negatives", 90),
-    ("rag_promises", 90),
-    ("rag_whatsapp_scheduled", 30),
-)
+# Tables outside _TELEMETRY_DDL (defined in satellite modules or web/server.py)
+# are also listed here so `test_retention_policy.py` can enforce completeness.
+_TELEMETRY_RETENTION_POLICY: "dict[str, int | None | str]" = {
+    # ── Log-style with rotation (int days) ──
+    "rag_queries":                   90,
+    "rag_behavior":                  90,
+    "rag_ambient":                   60,
+    "rag_brief_written":             60,
+    "rag_wa_tasks":                  60,
+    "rag_archive_log":               60,
+    "rag_filing_log":                60,
+    "rag_eval_runs":                 60,
+    "rag_surface_log":               60,
+    "rag_proactive_log":             60,
+    "rag_cpu_metrics":               30,
+    "rag_memory_metrics":            30,
+    "system_memory_metrics":         30,
+    # Fine-tune pipeline signals (writers outside _TELEMETRY_DDL)
+    "rag_synthetic_queries":         90,
+    "rag_synthetic_negatives":       90,
+    "rag_promises":                  90,
+    "rag_whatsapp_scheduled":        30,
+    # Anticipatory / brief feedback
+    "rag_anticipate_candidates":     90,
+    "rag_anticipate_feedback":       60,
+    "rag_brief_feedback":            60,
+    # Draft loop (gold dataset — generous 365d before review)
+    "rag_draft_decisions":          365,
+    # Routing + error queue
+    "rag_routing_decisions":         90,
+    "rag_error_queue":               60,
+    # Misc sampled / ephemeral tables
+    "rag_home_compute_metrics":      60,
+    "rag_scheduler_runs":            60,
+    "rag_status_samples":             8,
+    "rag_audio_corrections":         60,
+    "rag_reminder_wa_pushed":        30,
+    "rag_negotiation_turns":         30,
+    "rag_negotiation_pending_sends": 30,
+    "rag_learned_paraphrases":      180,
+    # ── Keep forever (None) ──
+    "rag_feedback":                  None,
+    "rag_tune":                      None,
+    "rag_contradictions":            None,
+    "rag_negotiations":              None,
+    "rag_routing_rules":             None,
+    "rag_entities":                  None,
+    "rag_entity_mentions":           None,
+    "rag_cita_detections":           None,
+    # ── State tables (upsert-by-PK, never rotated) ──
+    "rag_ambient_state":             "state",
+    "rag_brief_state":               "state",
+    "rag_conversations_index":       "state",
+    "rag_feedback_golden":           "state",
+    "rag_feedback_golden_meta":      "state",
+    "rag_schema_version":            "state",
+    "rag_style_fingerprints":        "state",
+    "rag_behavior_priors_wa":        "state",
+    "rag_score_calibration":         "state",
+    "rag_whisper_vocab":             "state",
+    # ── Cache tables (content-hash invalidated, never time-rotated) ──
+    "rag_ocr_cache":                 "cache",
+    "rag_vlm_captions":              "cache",
+    "rag_audio_transcripts":         "cache",
+    "rag_response_cache":            "cache",
+}
 
-# Tables that upsert on a PK instead of appending log rows. Listed here both
-# for the rollback DROP loop and as documentation of the no-rotate contract.
-_SQL_STATE_TABLES: tuple[str, ...] = (
-    "rag_ambient_state",
-    "rag_brief_state",
-    "rag_conversations_index",
-    "rag_feedback_golden",
-    "rag_feedback_golden_meta",
-)
-
-# Log-style tables that are kept forever (no rotation row). Auditable in
-# `test_rotation_different_retentions_per_table` — their row count must not
-# decrease after rotation.
-_SQL_KEEP_ALL_TABLES: tuple[str, ...] = (
+# Tables with None policy that intentionally have a ts column.
+# test_retention_policy.py asserts no table outside this set has None policy
+# + ts column (guard against accidentally unbounded log tables).
+_RETENTION_NONE_ALLOWED: frozenset[str] = frozenset({
     "rag_feedback",
     "rag_tune",
     "rag_contradictions",
+    "rag_negotiations",
+    "rag_routing_rules",
+    "rag_entities",
+    "rag_entity_mentions",
+    "rag_cita_detections",
+})
+
+# ── Back-compat aliases (derived from the unified policy) ────────────────────
+_SQL_ROTATION_POLICY: tuple[tuple[str, int], ...] = tuple(
+    (t, d)
+    for t, d in _TELEMETRY_RETENTION_POLICY.items()
+    if isinstance(d, int)
+)
+
+_SQL_STATE_TABLES: tuple[str, ...] = tuple(
+    t for t, d in _TELEMETRY_RETENTION_POLICY.items() if d == "state"
+)
+
+_SQL_KEEP_ALL_TABLES: tuple[str, ...] = tuple(
+    t for t, d in _TELEMETRY_RETENTION_POLICY.items() if d is None
+)
+
+# Size watchdog threshold: if any table's estimated byte footprint exceeds
+# this value, a table_size_warning event is written to LOG_PATH.
+# Override via RAG_TABLE_SIZE_WARN_BYTES env var.
+_TABLE_SIZE_WARN_BYTES: int = int(
+    os.environ.get("RAG_TABLE_SIZE_WARN_BYTES", str(100 * 1024 * 1024))
 )
 
 # VACUUM gate: page_count * page_size must exceed last_vacuum_size by this
@@ -50038,8 +50466,30 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
             ).fetchall()
         }
 
+        # Build a set of tables that have a TEXT `ts` column — the rotation
+        # query uses `WHERE ts < ?` with an ISO-8601 string which only works
+        # for TEXT columns.  Tables with INTEGER/REAL ts or a different column
+        # name are skipped here (they'd need custom rotation logic if needed).
+        _ts_text_tables: set[str] = set()
+        for _tbl_check in existing:
+            try:
+                _col_rows = conn.execute(
+                    f"PRAGMA table_info([{_tbl_check}])"
+                ).fetchall()
+                for _cid, _cname, _ctype, *_ in _col_rows:
+                    if _cname == "ts" and "TEXT" in (_ctype or "").upper():
+                        _ts_text_tables.add(_tbl_check)
+                        break
+            except Exception:
+                pass
+
         for table, days in _SQL_ROTATION_POLICY:
             if table not in existing:
+                continue
+            if table not in _ts_text_tables:
+                # Table exists but ts column is absent or non-TEXT — skip
+                # silently.  Add custom rotation logic here if needed.
+                out["rows_deleted"].setdefault(table, 0)
                 continue
             cutoff_iso = _dt.fromtimestamp(now - days * 86400).isoformat(
                 timespec="seconds"
@@ -50057,6 +50507,52 @@ def _sql_rotate_log_tables(*, dry_run: bool = False,
 
         if not dry_run:
             conn.commit()
+
+        # ── Size watchdog ────────────────────────────────────────────────────
+        # After rotation, check each existing telemetry table for bloat.
+        # Uses PRAGMA page_count * page_size for the whole DB as a proxy, then
+        # uses COUNT(*) * avg_row_bytes per table to estimate individual sizes.
+        # Emits a table_size_warning log entry for any table over the threshold.
+        try:
+            db_page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            for tbl in existing:
+                if tbl.startswith("sqlite_") or tbl.startswith("vec_"):
+                    continue
+                row_count_row = conn.execute(
+                    f"SELECT COUNT(*) FROM [{tbl}]"
+                ).fetchone()
+                row_count = int(row_count_row[0]) if row_count_row else 0
+                if row_count == 0:
+                    continue
+                # Estimate: sqlite page_size × (pages used / table_count).
+                # This is coarse — use it only as a magnitude signal.
+                # A more precise approach would be `dbstat` but that requires
+                # the dbstat virtual table which isn't always compiled in.
+                col_count_row = conn.execute(
+                    f"PRAGMA table_info([{tbl}])"
+                ).fetchall()
+                col_count = max(1, len(col_count_row))
+                # Heuristic: 8 bytes per column per row
+                estimated_bytes = row_count * col_count * 8
+                if estimated_bytes >= _TABLE_SIZE_WARN_BYTES:
+                    _warn_ts = _dt.fromtimestamp(now).isoformat(timespec="seconds")
+                    _silent_log(
+                        {
+                            "event": "table_size_warning",
+                            "table": tbl,
+                            "estimated_bytes": estimated_bytes,
+                            "row_count": row_count,
+                            "col_count": col_count,
+                            "threshold_bytes": _TABLE_SIZE_WARN_BYTES,
+                            "ts": _warn_ts,
+                        },
+                        LOG_PATH,
+                    )
+                    out.setdefault("size_warnings", []).append(
+                        {"table": tbl, "estimated_bytes": estimated_bytes, "row_count": row_count}
+                    )
+        except Exception:
+            pass  # Watchdog is best-effort; never abort the rotation pass.
 
         # WAL checkpoint once after all deletes — cheaper than N checkpoints.
         # Post-split: telemetry.db-wal (not ragvec.db-wal).
@@ -57642,40 +58138,48 @@ def _upsert_entities_for_chunk(
     ts: float,
     snippet: str = "",
 ) -> int:
-    """Upsert entities + mentions. Returns count of entities touched."""
+    """Upsert entities + mentions. Returns count of entities touched.
+
+    Perf fix 2026-04-29: pre-fix did SELECT-then-INSERT/UPDATE per entity
+    (2 round-trips per entity × 5-15 entities × 50 chunks/run = 500-1500
+    extra SELECTs in `rag watch` hot path). Fix: single
+    `INSERT ... ON CONFLICT(normalized, entity_type) DO UPDATE` per entity
+    (rag_entities already has UNIQUE(normalized, entity_type) from DDL).
+    SQLite 3.35+ guarantees lastrowid returns the existing row's id on
+    conflict — used to thread entity_id into the rag_entity_mentions insert.
+    Confidence formula preserved: running average
+      new_conf = (old_conf * old_count + new_conf) / (old_count + 1)
+    computed in SQL via `excluded` virtual table so we don't need a prior
+    SELECT to read old_conf and old_count.
+    """
     if not entities or not chunk_id:
         return 0
     count = 0
     for (norm, etype), data in entities.items():
         try:
-            row = conn.execute(
-                "SELECT id, mention_count, first_seen_ts, confidence FROM rag_entities "
-                "WHERE normalized=? AND entity_type=?",
-                (norm, etype),
-            ).fetchone()
             aliases_json = json.dumps(data["aliases"]) if data.get("aliases") else None
-            if row is None:
-                cur = conn.execute(
-                    "INSERT INTO rag_entities "
-                    "(canonical_name, normalized, entity_type, aliases, "
-                    " first_seen_ts, last_seen_ts, mention_count, confidence) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (data["canonical"], norm, etype, aliases_json,
-                     ts, ts, 1, data["confidence"]),
-                )
-                entity_id = cur.lastrowid
-            else:
-                entity_id = row[0]
-                new_conf = (
-                    (row[3] * row[1] + data["confidence"]) / (row[1] + 1)
-                    if row[3] else data["confidence"]
-                )
-                conn.execute(
-                    "UPDATE rag_entities SET last_seen_ts=?, mention_count=mention_count+1, "
-                    " confidence=?, aliases=COALESCE(?, aliases) "
-                    "WHERE id=?",
-                    (ts, new_conf, aliases_json, entity_id),
-                )
+            # Single upsert: INSERT on first sight, UPDATE counters on conflict.
+            # Running-average confidence formula in pure SQL avoids a prior
+            # SELECT. On INSERT: mention_count=1, confidence=new_val.
+            # On UPDATE: mention_count+1, confidence weighted average.
+            cur = conn.execute(
+                "INSERT INTO rag_entities "
+                "(canonical_name, normalized, entity_type, aliases, "
+                " first_seen_ts, last_seen_ts, mention_count, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(normalized, entity_type) DO UPDATE SET "
+                "  last_seen_ts = excluded.last_seen_ts, "
+                "  mention_count = mention_count + 1, "
+                "  confidence = CASE WHEN confidence IS NULL THEN excluded.confidence "
+                "               ELSE (confidence * mention_count + excluded.confidence)"
+                "                    / (mention_count + 1) END, "
+                "  aliases = COALESCE(excluded.aliases, aliases)",
+                (data["canonical"], norm, etype, aliases_json,
+                 ts, ts, data["confidence"]),
+            )
+            # On INSERT lastrowid = new row id; on UPDATE (SQLite ≥ 3.35)
+            # lastrowid = the existing row's rowid. Both give us entity_id.
+            entity_id = cur.lastrowid
             conn.execute(
                 "INSERT OR IGNORE INTO rag_entity_mentions "
                 "(entity_id, chunk_id, source, ts, snippet, confidence) "

@@ -476,6 +476,103 @@ def test_orchestrator_pushes_when_not_dry_run(monkeypatch, state_db):
     assert pushed[0][0] == "anticipate-calendar"
 
 
+# ── Snooze fallback (bug fix: top-1 snoozed should not block #2 and #3) ──────
+
+def test_orchestrator_top1_snoozed_falls_to_second(monkeypatch, state_db):
+    """If the highest-scoring candidate is snoozed, the orchestrator should
+    push the second-highest instead of silently doing nothing."""
+    cand_high = rag.AnticipatoryCandidate(
+        kind="anticipate-dupes_pressure", score=1.0, message="dupes msg",
+        dedup_key="dupes:key", snooze_hours=264, reason="r",  # 11-day snooze
+    )
+    cand_low = rag.AnticipatoryCandidate(
+        kind="anticipate-echo", score=0.7, message="echo msg",
+        dedup_key="echo:key", snooze_hours=72, reason="r",
+    )
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: [cand_high, cand_low]),))
+    pushed_kinds = []
+
+    def mock_push(kind, msg, **kw):
+        pushed_kinds.append(kind)
+        # Simulate: dupes_pressure is snoozed (returns False), echo is not
+        if kind == "anticipate-dupes_pressure":
+            return (False, "snoozed until 2026-05-10")
+        return (True, None)
+
+    monkeypatch.setattr(rag, "proactive_push", mock_push)
+    res = rag.anticipate_run_impl(dry_run=False)
+
+    # Both kinds were tried
+    assert "anticipate-dupes_pressure" in pushed_kinds
+    assert "anticipate-echo" in pushed_kinds
+    # The echo (second candidate) ended up being the selected+sent one
+    assert res["selected"]["kind"] == "anticipate-echo"
+    assert res["sent"] is True
+
+
+def test_orchestrator_top2_snoozed_falls_to_third(monkeypatch, state_db):
+    """When both top-1 and top-2 are snoozed, the third candidate is pushed."""
+    cands = [
+        rag.AnticipatoryCandidate(
+            kind="anticipate-calendar", score=0.9, message="cal",
+            dedup_key="cal:key", snooze_hours=2, reason="r",
+        ),
+        rag.AnticipatoryCandidate(
+            kind="anticipate-dupes_pressure", score=0.8, message="dupes",
+            dedup_key="dupes:key", snooze_hours=264, reason="r",
+        ),
+        rag.AnticipatoryCandidate(
+            kind="anticipate-commitment", score=0.6, message="commit",
+            dedup_key="commit:key", snooze_hours=168, reason="r",
+        ),
+    ]
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: cands),))
+    pushed_kinds = []
+
+    def mock_push(kind, msg, **kw):
+        pushed_kinds.append(kind)
+        if kind in ("anticipate-calendar", "anticipate-dupes_pressure"):
+            return (False, "snoozed")
+        return (True, None)
+
+    monkeypatch.setattr(rag, "proactive_push", mock_push)
+    res = rag.anticipate_run_impl(dry_run=False)
+
+    assert res["selected"]["kind"] == "anticipate-commitment"
+    assert res["sent"] is True
+    assert len(pushed_kinds) == 3  # tried all three before succeeding
+
+
+def test_orchestrator_all_snoozed_returns_none_with_log(monkeypatch, state_db):
+    """When every viable candidate is snoozed, selected=None and
+    skip_reason='all kinds snoozed'."""
+    cands = [
+        rag.AnticipatoryCandidate(
+            kind="anticipate-calendar", score=0.9, message="cal",
+            dedup_key="cal:key", snooze_hours=2, reason="r",
+        ),
+        rag.AnticipatoryCandidate(
+            kind="anticipate-echo", score=0.7, message="echo",
+            dedup_key="echo:key", snooze_hours=72, reason="r",
+        ),
+    ]
+    monkeypatch.setattr(rag, "_ANTICIPATE_SIGNALS",
+                        (("a", lambda now: cands),))
+    # All push attempts return (False, snoozed)
+    monkeypatch.setattr(rag, "proactive_push",
+                        lambda kind, msg, **kw: (False, "snoozed"))
+
+    res = rag.anticipate_run_impl(dry_run=False)
+
+    assert res["selected"] is None
+    assert res["sent"] is False
+    assert res.get("skip_reason") == "all kinds snoozed"
+    # all candidates are still reported in 'all'
+    assert len(res["all"]) == 2
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def test_cli_anticipate_run_default_no_subcommand(monkeypatch, state_db):

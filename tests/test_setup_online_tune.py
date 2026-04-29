@@ -223,27 +223,48 @@ def test_serve_plist_warm_model_env():
 
 
 def test_services_spec_total_count():
-    specs = rag_module._services_spec(RAG_BIN)
-    # 21 base servicios + 4 ingesters cross-source
-    # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
-    # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
-    # pero el plist siempre está en el spec.
-    # Base roster: watch, serve, web (agregado 2026-04-22 — pre-fix estaba
-    # instalado manualmente fuera de setup), digest, morning, today,
-    # wake-up (agregado 2026-04-24 — orquestador nocturno 04:00),
-    # emergent, patterns, archive, wa-tasks, reminder-wa-push (cron 5min
-    # para disparar Apple Reminders via WhatsApp bridge antes de la due
-    # — ver docstring en _services_spec), wa-scheduled-send (2026-04-25 —
-    # worker de mensajes WA programados, idempotente vía status enum),
-    # auto-harvest (2026-04-23 — LLM-as-judge nocturno que labelea
-    # queries low-conf sin feedback), implicit-feedback (2026-04-26 —
-    # Sprint 1 del cierre del loop de auto-aprendizaje), online-tune,
-    # calibrate (2026-04-23 — per-source isotonic regression re-entrenada
-    # con feedback), maintenance (2026-04-21 hardening), consolidate,
-    # vault-cleanup (2026-04-27 — purge diario de carpetas transitorias
-    # bajo 99-AI/, mueve a .trash/ del vault), anticipate (2026-04-24 —
-    # game-changer push proactivo cada 10 min).
-    assert len(specs) == 25
+    # Legacy mode (no RAG_USE_SCHEDULER): all individual plists returned.
+    # Roster (27 total):
+    #   watch, serve, web, digest, morning, today, wake-up, emergent,
+    #   patterns, archive, wa-tasks, reminder-wa-push, wa-scheduled-send,
+    #   auto-harvest, active-learning-nudge, implicit-feedback, online-tune,
+    #   calibrate, maintenance, consolidate, vault-cleanup, anticipate,
+    #   ingest-whatsapp, ingest-gmail, ingest-reminders, ingest-calendar,
+    #   serve-watchdog = 27.
+    # Note: the old count of 25 was off by 2 (missed active-learning-nudge
+    # and serve-watchdog which were added before the scheduler work).
+    import os
+    env_bak = os.environ.pop("RAG_USE_SCHEDULER", None)
+    try:
+        specs_no_sched = rag_module._services_spec(RAG_BIN)
+        assert len(specs_no_sched) == 27
+    finally:
+        if env_bak is not None:
+            os.environ["RAG_USE_SCHEDULER"] = env_bak
+
+
+def test_services_spec_scheduler_mode():
+    """When RAG_USE_SCHEDULER=1, _services_spec returns only 5 KeepAlive + scheduler."""
+    import os
+    env_bak = os.environ.get("RAG_USE_SCHEDULER")
+    os.environ["RAG_USE_SCHEDULER"] = "1"
+    try:
+        specs = rag_module._services_spec(RAG_BIN)
+        labels = {s[0] for s in specs}
+        assert "com.fer.obsidian-rag-scheduler" in labels
+        assert "com.fer.obsidian-rag-watch" in labels
+        assert "com.fer.obsidian-rag-serve" in labels
+        assert "com.fer.obsidian-rag-web" in labels
+        assert "com.fer.obsidian-rag-serve-watchdog" in labels
+        # cron-style jobs must NOT appear
+        assert "com.fer.obsidian-rag-morning" not in labels
+        assert "com.fer.obsidian-rag-ingest-whatsapp" not in labels
+        assert len(specs) == 5
+    finally:
+        if env_bak is None:
+            os.environ.pop("RAG_USE_SCHEDULER", None)
+        else:
+            os.environ["RAG_USE_SCHEDULER"] = env_bak
 
 
 def test_services_spec_includes_maintenance():

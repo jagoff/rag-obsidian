@@ -94,6 +94,7 @@ from rag import (  # noqa: E402
     _SQL_STATE_ERROR_LOG,
     _enqueue_background_sql,
     _log_sql_state_error,
+    bg_sql_queue_stats,
     _map_cpu_row,
     _map_memory_row,
     _ragvec_state_conn,
@@ -14903,6 +14904,44 @@ def status_uptime(nocache: int = 0) -> dict:
 @app.get("/status")
 def status_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "status.html")
+
+
+# ── /api/health/sql-queue — runtime observability for the background SQL ──────
+# writer queue. Exposes the in-memory metrics maintained by `bg_sql_queue_stats()`
+# (defined in rag/__init__.py alongside the queue itself). No DB reads, pure
+# in-memory snapshot — always fast (<1ms). Intended for dashboards, alerts,
+# and quick sanity checks without needing to grep logs.
+#
+# Response shape (stable contract for dashboard.js):
+#   queue_depth_current   — items waiting right now (0 = idle)
+#   queue_depth_peak      — max qsize seen since process start
+#   queue_max_capacity    — maxsize the queue was created with (RAG_BG_QUEUE_MAX)
+#   write_count_total     — writes completed by the worker (success + retry + error)
+#   drop_count_total      — items dropped because the queue was full
+#   last_drop_reason      — error_tag of the most recent drop ("" if none)
+#   write_latency_p50_ms  — p50 of last 200 write durations in ms (null if no data)
+#   write_latency_p95_ms  — p95 of last 200 write durations in ms (null if no data)
+#   latency_window_samples — how many samples are in the rolling window
+#   status                — "ok" | "warn" | "degraded"
+#     ok       : drops == 0 AND depth_current < 10% capacity
+#     warn     : drops > 0 OR depth_current in [10%, 50%) of capacity
+#     degraded : depth_current >= 50% capacity
+@app.get("/api/health/sql-queue")
+def health_sql_queue() -> dict:
+    """Runtime observability for the background SQL writer queue."""
+    stats = bg_sql_queue_stats()
+    # Derive a simple status verdict for the dashboard card.
+    depth = stats["queue_depth_current"]
+    capacity = stats["queue_max_capacity"]
+    drops = stats["drop_count_total"]
+    fill_pct = (depth / capacity * 100) if capacity > 0 else 0
+    if fill_pct >= 50:
+        status = "degraded"
+    elif drops > 0 or fill_pct >= 10:
+        status = "warn"
+    else:
+        status = "ok"
+    return {**stats, "status": status, "fill_pct": round(fill_pct, 1)}
 
 
 # ── /logs — dashboard de logs del sistema ─────────────────────────────

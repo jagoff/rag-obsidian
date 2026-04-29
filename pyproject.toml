@@ -59,6 +59,7 @@ dependencies = [
     # pesadas. Lo dejamos core (no opt-in) porque es el único parser
     # nativo de xlsx y el overhead es ínfimo.
     "openpyxl>=3.1",
+    "apscheduler>=3.11.2",
 ]
 
 [project.optional-dependencies]

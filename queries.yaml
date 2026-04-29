@@ -403,6 +403,201 @@ queries:
       - calendar://fernandoferrari@gmail.com/369o0b149snreaiip2ul95emmb
     note: "calendar — turno profesional one-off, subject-literal"
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Expansión 2026-04-29: vault singles sub-representados + cross-source reales
+  # ─────────────────────────────────────────────────────────────────────────
+  # Vault — Moka company history (65-chunk notes, high BM25 signal)
+  - question: "notas del uno a uno con flor en moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/1 a 1/Moka - Notas 1 a 1.md
+    note: "vault — Moka 1:1 notes con Flor/Maxi/Mateo/Andres; paraphrase sin 'notas 1 a 1'"
+
+  - question: "datos de la empresa moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/Moka - Datos.md
+    note: "vault — nombre legal, dirección Florida, Moka Creative Agency LLC"
+
+  - question: "brand voice guidelines de moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/Moka -  Brand voice guidelines.md
+    note: "vault — guía de voz de marca de Moka"
+
+  - question: "política de vacaciones y días libres en moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/Estandares/Moka - Vacaciones y días libres.md
+    note: "vault — HR policy de vacaciones"
+
+  - question: "server setup stack de moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/Old/Moka - Server setup Stack.md
+    note: "vault — infra stack histórica de Moka"
+
+  - question: "standard de pentesting en moka"
+    expected:
+      - 04-Archive/Old Notes/Moka/Estandares/Standard - Pentesting.md
+    note: "vault — estándar de seguridad / pentesting"
+
+  - question: "career ladder de ingeniería"
+    expected:
+      - 04-Archive/Old Notes/Moka/Engineering Career Ladder.md
+    note: "vault — Etsy/Dropbox career ladders para ingenieros"
+
+  # Vault — Personal / guitar
+  - question: "tabs de tool en guitarra"
+    expected:
+      - 04-Archive/Personal/Guitar/Guitar.md
+    note: "vault — 38 chunks, Tool tabs, Adam Jones gear, transcripciones"
+
+  - question: "lista de cosas que quiero hacer antes de morir"
+    expected:
+      - 04-Archive/Personal/Lista de pendientes.md
+    note: "vault — bucket list: parachute, NASA, mountain, etc."
+
+  - question: "libros y cursos que quiero estudiar"
+    expected:
+      - 03-Resources/Personal/Estudiar - Leer.md
+    note: "vault — lista de lectura y cursos pendientes"
+
+  - question: "dieta keto qué puedo comer"
+    expected:
+      - 03-Resources/Personal/Dieta Keto.md
+    note: "vault — lista de alimentos en dieta keto"
+
+  # Vault — Personal identity
+  - question: "mi perfil personal e identidad profesional"
+    expected:
+      - 04-Archive/Personal/Personal - Identidad.md
+    note: "vault — 37 chunks, personal branding, LinkedIn, valores"
+
+  # Vault — BBI / Avature companies
+  - question: "role play de closers en bbi"
+    expected:
+      - 04-Archive/Companies/02 BBI/BBI - Role play closers 1.md
+    note: "vault — roleplay de ventas en BBI"
+
+  - question: "presencia online de bbi"
+    expected:
+      - 04-Archive/Companies/02 BBI/BBI Company.md
+    note: "vault — BBI company online presence"
+
+  - question: "recursos de terraform en avature"
+    expected:
+      - 04-Archive/Companies/01 Avature/Terraform.md
+    note: "vault — AWS Terraform resources en Avature"
+
+  # Vault — Coaching content
+  - question: "guía para convertirte en millonario"
+    expected:
+      - 04-Archive/Coaching/Contenido/Guia para Convertirte en Millonario.md
+    note: "vault — 21 chunks de contenido de coaching sobre finanzas"
+
+  - question: "modelos organizacionales ágiles"
+    expected:
+      - 04-Archive/Coaching/Contenido/Art - Modelos organizacionales.md
+    note: "vault — 19 chunks, org models para coaching"
+
+  - question: "ley de brooks"
+    expected:
+      - 04-Archive/Coaching/Contenido/Ley de brooks.md
+    note: "vault — Brooks' Law, agregar programadores retrasa proyectos"
+
+  - question: "leyes de larman sobre agilidad"
+    expected:
+      - 04-Archive/Coaching/Contenido/Leyes de Larman.md
+    note: "vault — Larman's Laws of organizational behavior"
+
+  - question: "las cinco disfunciones del equipo"
+    expected:
+      - 02-Areas/Coaching/Fer Coach.md
+    note: "vault — 5 dysfunctions of team, Lencioni"
+
+  # Vault — Agile dynamics
+  - question: "dinámicas para equipos de trabajo"
+    expected:
+      - 03-Resources/Agile/Dinamicas grupales.md
+    note: "vault — team building activities, dinámicas grupales"
+
+  # Vault — Ops / tech
+  - question: "renovar certificado lets encrypt en centos"
+    expected:
+      - 04-Archive/Ops-old/Webserver/Install and renew lets encrypt on centos 7.md
+    note: "vault — 29 chunks, certbot let's encrypt procedimiento"
+
+  - question: "comandos de macos que uso"
+    expected:
+      - 04-Archive/Tech/MacOS - cmd.md
+    note: "vault — 24 chunks, macOS CLI commands reference"
+
+  # Vault — Music
+  - question: "letra de la balada toma tres"
+    expected:
+      - 02-Areas/Musica/Toma tres.md
+    note: "vault — letra original de la balada 'toma tres'"
+
+  # ─── WhatsApp cross-source singles (corpus verificado 2026-04-29) ───────
+  # Paths verificados en meta_obsidian_notes_v11 — sin sufijo ::idx
+  - question: "qué actividades está haciendo el nene de maría"
+    expected:
+      - whatsapp://255804326297735@lid/3A8FBC2FF6BC8D6C7CBF
+    note: "whatsapp — María, actividades de su hijo (fútbol, opciones)"
+
+  - question: "conversación con maría sobre opciones para los chicos"
+    expected:
+      - whatsapp://255804326297735@lid/3A7372F17692FAB63E64
+    note: "whatsapp — María update general ('está en casa no hace nada')"
+
+  - question: "caída de gitlab en el trabajo"
+    expected:
+      - whatsapp://5491155894168-1358009189@g.us/3EB017FD99B8EE251D5137
+    note: "whatsapp — Cloud Services group, GitLab outage discussion"
+
+  - question: "quiero comprar algo para trabajar con inteligencia artificial"
+    expected:
+      - whatsapp://8203957964826@lid/3B5BC8FC5AE17E2A267A
+    note: "whatsapp — Fer F, comprar equipo para trabajo con AI"
+
+  - question: "hice mi propio agente de ia con openclaw"
+    expected:
+      - whatsapp://8203957964826@lid/3EB00C03DF83F65CAF6179
+    note: "whatsapp — Fer F, openclaw + agente propio"
+
+  - question: "turno presencial con erica franzen el martes"
+    expected:
+      - whatsapp://97019167260833@lid/A56E50EB8E9ABEB4C296361650874A0B
+    note: "whatsapp — Erica Franzen, turno presencial martes"
+
+  # ─── Gmail cross-source singles (corpus verificado 2026-04-29) ──────────
+  - question: "curso de introducción al model context protocol de anthropic"
+    expected:
+      - gmail://thread/19dd93c2e9873984
+    note: "gmail — Anthropic Education, MCP intro course"
+
+  - question: "curso de introducción a subagentes de anthropic"
+    expected:
+      - gmail://thread/19dd937e819e1955
+    note: "gmail — Anthropic Education, subagents course"
+
+  - question: "alerta de google por nuevo inicio de sesión en mi mac"
+    expected:
+      - gmail://thread/19dd97668006315e
+    note: "gmail — Google security alert, new sign-in Mac"
+
+  - question: "falla de CI en el repo mem-vault de github"
+    expected:
+      - gmail://thread/19dd806e540ec2f9
+    note: "gmail — GitHub Actions CI failure, mem-vault repo"
+
+  # ─── Drive cross-source singles (corpus verificado 2026-04-29) ──────────
+  - question: "lista de precios de iphone en dólares"
+    expected:
+      - gdrive://file/1-cibpFZvBWK48aW0jIa64cGXHGtDxm3tNHp44v-tBho
+    note: "drive — Lista de precios Online, iPhone 15/16 en USD/ARS"
+
+  - question: "migración de servidores de kvm a openstack"
+    expected:
+      - gdrive://file/1F2P9KXa0epRa9B2EUu9PQqRpEJccn_9guA6djwiQbR0
+    note: "drive — China MA Migration tracker, KVM→OpenStack/AWS"
+
 # Multi-turn chains: each chain is an independent conversation where later
 # turns may contain pronouns or ellipsis that only resolve against the
 # prior user/assistant exchange. Eval builds `history` progressively per
@@ -553,6 +748,77 @@ chains:
   # (2026-04-27) Removida chain `rag-workshops-cross` — la turn 0 apuntaba a
   # obsidian-rag - Pipelines.md, movida a .trash/. Sin anchor vault en t1
   # la chain no mide nada útil.
+
+  # === Chains 2026-04-29: expansión golden set post vault-reorg ===
+  # Objetivo: +5 chains que cubran dominios sub-representados (Moka, personal,
+  # coaching cross-folder) + 3 cross-source chains (vault→WA, vault→Drive,
+  # vault→Gmail). Las chains cross-source tienen t1 siempre evaluable (vault);
+  # t2 requiere el ingester correspondiente activo.
+
+  # Moka: datos empresa → política de vacaciones (mismo folder sub-folder)
+  - id: moka-empresa-politicas
+    turns:
+      - question: "datos de la empresa moka"
+        expected:
+          - 04-Archive/Old Notes/Moka/Moka - Datos.md
+      - question: "y qué política de vacaciones tenían"
+        expected:
+          - 04-Archive/Old Notes/Moka/Estandares/Moka - Vacaciones y días libres.md
+
+  # Personal keto → dieta cross con identidad profesional
+  - id: personal-keto-identidad
+    turns:
+      - question: "qué puedo comer en dieta keto"
+        expected:
+          - 03-Resources/Personal/Dieta Keto.md
+      - question: "y qué otras cosas quiero lograr este año"
+        expected:
+          - 04-Archive/Personal/Lista de pendientes.md
+          - 03-Resources/Personal/Estudiar - Leer.md
+
+  # Coaching: ley de brooks → disfunciones del equipo (cross-note synthesis)
+  - id: coaching-leyes-disfunciones
+    turns:
+      - question: "ley de brooks sobre los proyectos de software"
+        expected:
+          - 04-Archive/Coaching/Contenido/Ley de brooks.md
+      - question: "y qué otras disfunciones de equipo tengo anotadas"
+        expected:
+          - 02-Areas/Coaching/Fer Coach.md
+
+  # vault→WhatsApp: actividades de los chicos → conversación WA con María
+  - id: personal-chicos-wa-cross
+    turns:
+      - question: "mi perfil personal e identidad profesional"
+        expected:
+          - 04-Archive/Personal/Personal - Identidad.md
+      - question: "qué actividades está haciendo el nene de maría"
+        expected:
+          - whatsapp://255804326297735@lid/3A8FBC2FF6BC8D6C7CBF
+    note: "t2 requiere whatsapp ingester activo"
+
+  # vault→Drive: avature terraform → lista de precios iPhone en Drive
+  - id: avature-terraform-drive-cross
+    turns:
+      - question: "recursos de terraform en avature"
+        expected:
+          - 04-Archive/Companies/01 Avature/Terraform.md
+      - question: "y la lista de precios de iphone en dólares"
+        expected:
+          - gdrive://file/1-cibpFZvBWK48aW0jIa64cGXHGtDxm3tNHp44v-tBho
+    note: "t2 requiere drive ingester activo"
+
+  # vault→Gmail: coaching referentes → curso de anthropic en gmail
+  - id: coaching-referentes-gmail-cross
+    turns:
+      - question: "quiénes son mis referentes en coaching"
+        expected:
+          - 03-Resources/Coaching/Coaching - Referentes.md
+      - question: "y los cursos de anthropic que me llegaron por mail"
+        expected:
+          - gmail://thread/19dd93c2e9873984
+          - gmail://thread/19dd937e819e1955
+    note: "t2 requiere gmail ingester activo"
 
   # NOTA 2026-04-25: dos chains adicionales se postergaron tras eval seco
   # (sólo `vault` cargado) porque el chain hit@5 caía fuera del budget de 3pp.

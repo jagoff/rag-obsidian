@@ -53,10 +53,13 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
 
     # Cross-source native-id prefixes = placeholders acceptable before the
     # ingester populates the corpus. Kept in sync with rag.VALID_SOURCES.
+    # Note: Drive ingester stores doc_ids as gdrive://file/<id> (not drive://)
+    # but VALID_SOURCES uses "drive" as the canonical name. Both prefixes are
+    # accepted here; the VALID_SOURCES cross-check uses _PREFIX_ALIASES below.
     CROSS_SOURCE_PREFIXES = ("gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://")
+                             "drive://", "gdrive://")
 
     def _path_ok(p: str) -> bool:
         if p.startswith(CROSS_SOURCE_PREFIXES):
@@ -80,15 +83,27 @@ def test_queries_yaml_all_paths_exist_or_placeholder():
 def test_queries_yaml_cross_source_prefixes_cover_all_valid_sources():
     """Sanity: the whitelist in the path-existence test must track
     rag.VALID_SOURCES. If a new source is added there, add it here too, or
-    document why it's file-backed (like vault)."""
+    document why it's file-backed (like vault).
+
+    Note: the Drive ingester uses 'gdrive://' as doc_id prefix (not 'drive://')
+    but VALID_SOURCES registers the source as 'drive'. _PREFIX_ALIASES maps
+    ingester-specific prefixes back to their canonical VALID_SOURCES name so
+    this test stays in sync without requiring VALID_SOURCES to know about
+    internal ingester naming conventions.
+    """
     import rag
     CROSS_SOURCE_PREFIXES = {"gmail://", "whatsapp://", "calendar://",
                              "reminders://", "messages://",
                              "contacts://", "calls://", "safari://",
-                             "drive://"}
+                             "drive://", "gdrive://"}
+    # Aliases: ingester prefix name → canonical VALID_SOURCES name
+    _PREFIX_ALIASES = {"gdrive": "drive"}
     # vault is file-backed → not a prefix
     expected_whitelisted = rag.VALID_SOURCES - {"vault"}
-    prefix_sources = {p.rstrip("://") for p in CROSS_SOURCE_PREFIXES}
+    prefix_sources = set()
+    for p in CROSS_SOURCE_PREFIXES:
+        raw = p.rstrip("://")
+        prefix_sources.add(_PREFIX_ALIASES.get(raw, raw))
     assert prefix_sources == expected_whitelisted, (
         f"Whitelist drift: prefixes {prefix_sources} vs VALID_SOURCES-vault "
         f"{expected_whitelisted}. Update test_queries_yaml_all_paths_exist_or_placeholder."

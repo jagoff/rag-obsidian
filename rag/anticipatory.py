@@ -564,10 +564,23 @@ def anticipate_run_impl(
             "all": [_anticipate_candidate_to_dict(c) for c in all_candidates],
         }
 
-    top = viable[0]
+    # Iterate through viable candidates (already sorted by score DESC) and
+    # return the first one that proactive_push actually delivers.  Before this
+    # fix, the orchestrator picked top-1 unconditionally; if that kind was
+    # snoozed, proactive_push returned (False, reason) and the whole run was
+    # a no-op even when lower-ranked kinds had no snooze.  The new loop falls
+    # through to the next candidate transparently.
+    top: AnticipatoryCandidate | None = None
     sent = False
     skip_reason: str | None = None
-    if not dry_run:
+
+    for candidate in viable:
+        if dry_run:
+            # In dry-run mode we never call proactive_push, so just pick the
+            # highest-score candidate (first in the already-sorted list).
+            top = candidate
+            break
+
         try:
             # Pasamos `dedup_key` para que `proactive_push` sufije el body
             # con `_anticipate:<key>_` — el listener TS lo lee al detectar
@@ -576,14 +589,33 @@ def anticipate_run_impl(
             # otra forma de mapear "el user reaccionó a este push" →
             # "qué dedup_key era").
             sent, skip_reason = _rag.proactive_push(
-                top.kind, top.message,
-                snooze_hours=top.snooze_hours,
-                dedup_key=top.dedup_key,
+                candidate.kind, candidate.message,
+                snooze_hours=candidate.snooze_hours,
+                dedup_key=candidate.dedup_key,
             )
         except Exception as exc:
             _silent_log("anticipate_proactive_push", exc)
             sent = False
             skip_reason = f"exception: {exc}"
+
+        if sent:
+            # Successfully pushed — record which candidate won and stop.
+            top = candidate
+            break
+        # Not sent (snoozed / daily-cap / silenced) — try the next candidate.
+
+    if top is None:
+        # All viable candidates were snoozed / exhausted (or viable was empty
+        # in a non-dry-run pass — the dry_run branch always sets top).
+        import logging
+        logging.getLogger(__name__).info(
+            "anticipate: all %d viable kinds snoozed — nothing pushed", len(viable)
+        )
+        return {
+            "selected": None, "sent": False,
+            "skip_reason": "all kinds snoozed",
+            "all": [_anticipate_candidate_to_dict(c) for c in all_candidates],
+        }
 
     try:
         _anticipate_log_candidate(top, selected=True, sent=sent)

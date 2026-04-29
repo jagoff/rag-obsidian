@@ -149,9 +149,15 @@ def test_load_behavior_priors_cache_invalidation(tmp_path, monkeypatch):
     monkeypatch.setattr(rag, "_behavior_priors_cache", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    # Reset TTL timestamp so the second call doesn't hit the 60s TTL gate
+    # and return stale data (_BEHAVIOR_PRIORS_TTL_S added 2026-04-29).
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", 0.0)
 
     p1 = rag._load_behavior_priors()
     n1 = p1["n_events"]
+
+    # Expire the TTL so the next call re-reads SQL.
+    monkeypatch.setattr(rag, "_behavior_priors_loaded_ts", 0.0)
 
     # Seed events → MAX(ts) moves, cache invalidates.
     _seed_sql_behavior(tmp_path, _TEST_EVENTS)

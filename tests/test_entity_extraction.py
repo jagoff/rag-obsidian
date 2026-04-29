@@ -206,6 +206,107 @@ def test_batch_returns_one_dict_per_input(reset_gliner_state, monkeypatch):
     assert all(isinstance(d, dict) for d in result)
 
 
+def test_batch_uses_inference_not_predict_entities(reset_gliner_state, monkeypatch):
+    """_extract_entities_batch calls model.inference (batched), not predict_entities in a loop."""
+    mock_model = MagicMock()
+    # inference() returns List[List[Dict]] — one list per input text
+    mock_model.inference.return_value = [
+        [{"text": "Juan", "label": "person", "score": 0.95}],
+        [{"text": "Moka", "label": "organization", "score": 0.90}],
+    ]
+    monkeypatch.setattr(rag, "_get_gliner_model", lambda: mock_model)
+    result = rag._extract_entities_batch(["Juan habla.", "Moka es una empresa."])
+    # inference called ONCE with the full list, not twice
+    assert mock_model.inference.call_count == 1
+    call_args = mock_model.inference.call_args
+    assert call_args[0][0] == ["Juan habla.", "Moka es una empresa."]
+    # predict_entities never called
+    assert mock_model.predict_entities.call_count == 0
+    # Each result is a clustered dict
+    assert len(result) == 2
+    assert ("juan", "person") in result[0]
+    assert ("moka", "organization") in result[1]
+
+
+def test_batch_inference_raises_returns_empty_dicts(reset_gliner_state, monkeypatch):
+    """model.inference raising returns [{}] * n, no crash."""
+    mock_model = MagicMock()
+    mock_model.inference.side_effect = RuntimeError("inference failed")
+    monkeypatch.setattr(rag, "_get_gliner_model", lambda: mock_model)
+    result = rag._extract_entities_batch(["text1", "text2"])
+    assert result == [{}, {}]
+
+
+def test_batch_output_identical_to_single_loop(reset_gliner_state, monkeypatch):
+    """Output of batch path is bit-identical to calling _extract_entities_single per item."""
+    entities_per_text = [
+        [{"text": "Juan", "label": "person", "score": 0.95}],
+        [{"text": "yo", "label": "person", "score": 0.92}],  # stopword — filtered
+        [{"text": "Moka", "label": "organization", "score": 0.88}],
+    ]
+    texts = ["t1", "t2", "t3"]
+
+    # Batched path
+    mock_batch = MagicMock()
+    mock_batch.inference.return_value = entities_per_text
+    monkeypatch.setattr(rag, "_get_gliner_model", lambda: mock_batch)
+    batch_result = rag._extract_entities_batch(texts)
+
+    # Single-loop path (simulate old behaviour via _parse_raw_entities directly)
+    single_result = [
+        rag._cluster_entities(rag._parse_raw_entities(raw))
+        for raw in entities_per_text
+    ]
+
+    assert batch_result == single_result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# _parse_raw_entities
+# ──────────────────────────────────────────────────────────────────────
+
+def test_parse_raw_filters_low_confidence():
+    raw = [
+        {"text": "Juan", "label": "person", "score": 0.95},
+        {"text": "Ana", "label": "person", "score": 0.50},  # below 0.70
+    ]
+    result = rag._parse_raw_entities(raw)
+    assert len(result) == 1
+    assert result[0][0] == "Juan"
+
+
+def test_parse_raw_filters_stopword_person():
+    raw = [{"text": "yo", "label": "person", "score": 0.95}]
+    assert rag._parse_raw_entities(raw) == []
+
+
+def test_parse_raw_filters_phone_id():
+    raw = [{"text": "5493424303891", "label": "person", "score": 0.92}]
+    assert rag._parse_raw_entities(raw) == []
+
+
+def test_parse_raw_filters_short_entity():
+    raw = [{"text": "pc", "label": "organization", "score": 0.90}]
+    assert rag._parse_raw_entities(raw) == []
+
+
+def test_parse_raw_filters_unknown_label():
+    raw = [{"text": "Argentina", "label": "country", "score": 0.92}]
+    assert rag._parse_raw_entities(raw) == []
+
+
+def test_parse_raw_passes_valid_entities():
+    raw = [
+        {"text": "Juan", "label": "person", "score": 0.90},
+        {"text": "Moka", "label": "organization", "score": 0.85},
+    ]
+    result = rag._parse_raw_entities(raw)
+    assert len(result) == 2
+    texts = [r[0] for r in result]
+    assert "Juan" in texts
+    assert "Moka" in texts
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _upsert_entities_for_chunk
 # ──────────────────────────────────────────────────────────────────────

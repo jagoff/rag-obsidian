@@ -45088,7 +45088,7 @@ def _auto_harvest_plist(rag_bin: str) -> str:
     <string>--since</string>
     <string>1</string>
     <string>--limit</string>
-    <string>20</string>
+    <string>50</string>
     <string>--json</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -45108,6 +45108,54 @@ def _auto_harvest_plist(rag_bin: str) -> str:
   <key>KeepAlive</key><false/>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/auto-harvest.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/auto-harvest.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _active_learning_nudge_plist(rag_bin: str) -> str:
+    """Lunes 10am — recordatorio de labelear queries low-confidence.
+
+    Reemplaza el plist con bash inline historico (que disparaba osascript
+    notification de macOS y quedaba sepultado en el Notification Center)
+    por una invocacion al command Python `rag active-learning nudge`,
+    que prefiere mandar push WA al grupo RagNet con link directo a la
+    UI de /learning + fallback a osascript si el bridge esta caido.
+
+    Threshold default 20 candidates ultimos 7 dias. Override por flags
+    del CLI si se necesita re-tunear (no env vars hoy — el plist es la
+    fuente unica del schedule + parametros).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-active-learning-nudge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>active-learning</string>
+    <string>nudge</string>
+    <string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>10</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/active-learning-nudge.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/active-learning-nudge.error.log</string>
 </dict>
 </plist>
 """
@@ -45559,6 +45607,13 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
          _wa_scheduled_send_plist(rag_bin)),
         ("com.fer.obsidian-rag-auto-harvest", "com.fer.obsidian-rag-auto-harvest.plist",
          _auto_harvest_plist(rag_bin)),
+        # Active-learning nudge (C.6, 2026-04-29) — Lunes 10am: cuenta
+        # queries low-conf ultimos 7d sin labels y manda push al RagNet
+        # con link a /learning si supera 20 candidates. Reemplazo del
+        # bash inline que disparaba osascript notification.
+        ("com.fer.obsidian-rag-active-learning-nudge",
+         "com.fer.obsidian-rag-active-learning-nudge.plist",
+         _active_learning_nudge_plist(rag_bin)),
         # Implicit corrective_path inference — corre 03:25, 5 min antes
         # del online-tune. Pre-popula corrective_paths desde behavior
         # post-👎 sin pedir input al user. Sprint 1 del cierre del loop
@@ -51844,12 +51899,22 @@ def _feedback_insert_harvested(
     *, q: str, rating: int, paths: list[str],
     original_query_id: int | None = None,
     corrective_path: str | None = None,
+    source: str = "harvester",
 ) -> bool:
     """Insert a new rag_feedback row from the harvest flow.
 
-    Tagged source='harvester' + original_query_id in extra_json so the
-    row can be traced back to the rag_queries entry that originated it.
-    When corrective_path is provided, stores it inside extra_json as well.
+    Tagged with `source` (default 'harvester' = manual CLI / skill) +
+    original_query_id in extra_json so the row can be traced back to
+    the rag_queries entry that originated it. When corrective_path is
+    provided, stores it inside extra_json as well.
+
+    Quick Win C.7 (2026-04-29): `source` ahora es parametro — pre-fix
+    estaba hardcodeado y los rows del `auto_harvest()` daemon (LLM-as-
+    judge nocturno) caian bajo el mismo tag 'harvester', imposibles de
+    distinguir en auditoria. Valores esperados:
+      - 'harvester': manual CLI/skill (`rag feedback harvest`).
+      - 'auto-harvester': LLM judge daemon (`rag feedback auto-harvest`).
+      - 'active-learning-nudge': push WA con quick replies (C.6 follow-up).
 
     Generates a fresh turn_id (12 hex chars) — harvest rows aren't tied
     to an existing chat turn.
@@ -51864,7 +51929,7 @@ def _feedback_insert_harvested(
         "paths": [p for p in (paths or []) if p],
         "scope": "turn",
         # Unknown-to-_map_feedback_row keys land in extra_json flat.
-        "source": "harvester",
+        "source": source,
     }
     if original_query_id is not None:
         event["original_query_id"] = int(original_query_id)
@@ -55521,6 +55586,7 @@ def auto_harvest(
                 ok = _feedback_insert_harvested(
                     q=c["q"], rating=-1, paths=paths[:5],
                     original_query_id=c["id"],
+                    source="auto-harvester",
                 )
                 if not ok:
                     stats["errors"] += 1
@@ -55544,6 +55610,7 @@ def auto_harvest(
             ok = _feedback_insert_harvested(
                 q=c["q"], rating=1, paths=[vpath],
                 original_query_id=c["id"], corrective_path=vpath,
+                source="auto-harvester",
             )
             if not ok:
                 stats["errors"] += 1
@@ -55632,6 +55699,265 @@ def feedback_auto_harvest(
                          if remaining > 0
                          else "[bold green](gate open!)[/bold green]"))
     console.print()
+
+
+# ─── C.6 (2026-04-29): active-learning nudge with WA push ─────────────────
+#
+# Pre-fix: el plist `com.fer.obsidian-rag-active-learning-nudge.plist`
+# tenia un bash inline que contaba queries low-conf y disparaba una
+# osascript notification de macOS — utilil pero quedaba sepultada en el
+# Notification Center y el user no lo veia hasta abrir la Mac.
+#
+# Post-fix: nuevo command Python `rag active-learning nudge` que:
+#   1. Cuenta las mismas queries que el bash legacy.
+#   2. Si supera el threshold, manda un push WA al grupo RagNet con link
+#      directo a `/learning` UI + comando alternativo de terminal.
+#   3. Fallback a osascript si el bridge WA esta caido — el user no
+#      pierde la se~nal aunque WhatsApp este down.
+#
+# El plist actualizado invoca este command (no mas bash inline) — el
+# code Python testea, lintea y evoluciona mejor que un bash escapado
+# en XML.
+#
+# Quick reply pattern (futuro): el footer `_active-learning-nudge:<date>_`
+# permite que el listener TS detecte cuando el user responde al push y
+# abra el flow interactivo de labeling. Esto NO esta implementado en
+# este commit — el user clickea el link y labelea via web por ahora.
+
+DEFAULT_ACTIVE_LEARNING_NUDGE_THRESHOLD = 20
+DEFAULT_ACTIVE_LEARNING_TOP_SCORE_MAX = 0.20
+DEFAULT_ACTIVE_LEARNING_SINCE_DAYS = 7
+
+# Queries triviales / smoke tests que siempre quedan low-conf y no
+# aportan signal labelearlas. Lista igual a la del bash legacy
+# (mantengo paridad para no perder candidates utiles).
+_ACTIVE_LEARNING_TRIVIAL_QUERIES = (
+    "test", "probando", "hola", "ping",
+)
+
+
+def _count_active_learning_candidates(
+    conn,
+    *,
+    since_days: int = DEFAULT_ACTIVE_LEARNING_SINCE_DAYS,
+    top_score_max: float = DEFAULT_ACTIVE_LEARNING_TOP_SCORE_MAX,
+) -> int:
+    """Count low-confidence queries last N days sin feedback explicito.
+
+    Mismo SQL que el bash inline del plist legacy — paridad para que
+    el threshold de 20 candidates siga teniendo el mismo significado.
+    Filtramos queries triviales (length<=4, smoke tests fijos) que
+    siempre caen low-conf y no contribuyen signal.
+    """
+    placeholders = ",".join(["?"] * len(_ACTIVE_LEARNING_TRIVIAL_QUERIES))
+    try:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM rag_queries q
+            WHERE q.ts > datetime('now', '-' || ? || ' days')
+              AND q.top_score IS NOT NULL
+              AND q.top_score < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM rag_feedback f
+                  WHERE f.q = q.q
+                    AND ABS(julianday(f.ts) - julianday(q.ts)) < 1
+              )
+              AND length(q.q) > 4
+              AND q.q NOT IN ({placeholders})
+            """,
+            (since_days, top_score_max, *_ACTIVE_LEARNING_TRIVIAL_QUERIES),
+        ).fetchone()
+    except Exception:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _send_active_learning_nudge_wa(n: int, since_days: int) -> bool:
+    """Manda un push WA al grupo RagNet con link a /learning.
+
+    Returns True si el bridge respondio 2xx, False en cualquier otro
+    caso (bridge caido, timeout, etc.). El caller decide si fallback
+    a osascript en False.
+    """
+    try:
+        from rag.integrations.whatsapp import (
+            WHATSAPP_BOT_JID,
+            _ambient_whatsapp_send,
+        )
+    except Exception:
+        return False
+
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    msg = (
+        "*Active learning*\n\n"
+        f"Tenes *{n} queries* de baja confianza estos ultimos {since_days} "
+        "dias sin labels. Cada thumbs-up/down ayuda al ranker a aprender "
+        "mas rapido.\n\n"
+        "Labelear ahora: http://localhost:8765/learning\n"
+        "(o desde terminal: `rag feedback harvest --limit 20`)\n\n"
+        f"_active-learning-nudge:{today_iso}_"
+    )
+    return _ambient_whatsapp_send(WHATSAPP_BOT_JID, msg)
+
+
+def _send_active_learning_nudge_macos(n: int, since_days: int) -> bool:
+    """Fallback: osascript notification de macOS (legacy behavior).
+
+    Returns True siempre — osascript no falla en runtime habitual.
+    """
+    import subprocess
+    title = "obsidian-rag - active learning"
+    subtitle = f"{n} nuevas estos ultimos {since_days} dias"
+    msg = (
+        f"{n} queries de baja confianza sin labels. Corre "
+        "`rag feedback harvest --limit 20` o "
+        "http://localhost:8765/learning"
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{msg}" with title "{title}" '
+             f'subtitle "{subtitle}"'],
+            timeout=5, check=False,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def active_learning_nudge(
+    *,
+    threshold: int = DEFAULT_ACTIVE_LEARNING_NUDGE_THRESHOLD,
+    since_days: int = DEFAULT_ACTIVE_LEARNING_SINCE_DAYS,
+    top_score_max: float = DEFAULT_ACTIVE_LEARNING_TOP_SCORE_MAX,
+    channel: str = "auto",
+    dry_run: bool = False,
+) -> dict:
+    """Run one pass of the active-learning nudge.
+
+    Counts low-conf queries last `since_days` and, if the count >=
+    `threshold`, sends a push to the user (WA preferred, macOS fallback)
+    reminding them to labelize via `/learning` UI or
+    `rag feedback harvest`.
+
+    Args:
+        threshold: minimum candidates to fire the nudge.
+        since_days: window size for the count.
+        top_score_max: max top_score to consider "low-confidence".
+        channel: "auto" (try WA, fallback macOS) | "wa" | "macos".
+        dry_run: count but do NOT send.
+
+    Returns:
+        dict {n_candidates, fired, channel_used, dry_run, threshold,
+              since_days}
+    """
+    result = {
+        "n_candidates": 0,
+        "fired": False,
+        "channel_used": None,
+        "dry_run": dry_run,
+        "threshold": threshold,
+        "since_days": since_days,
+    }
+    try:
+        with _ragvec_state_conn() as conn:
+            n = _count_active_learning_candidates(
+                conn, since_days=since_days, top_score_max=top_score_max,
+            )
+    except Exception:
+        return result
+    result["n_candidates"] = n
+
+    if n < threshold:
+        return result
+
+    if dry_run:
+        result["channel_used"] = "(dry-run)"
+        return result
+
+    # Channel routing.
+    if channel == "wa":
+        ok = _send_active_learning_nudge_wa(n, since_days)
+        result["fired"] = ok
+        result["channel_used"] = "wa" if ok else "wa-failed"
+        return result
+    if channel == "macos":
+        ok = _send_active_learning_nudge_macos(n, since_days)
+        result["fired"] = ok
+        result["channel_used"] = "macos"
+        return result
+    # auto: WA primero, fallback macOS si WA falla.
+    if _send_active_learning_nudge_wa(n, since_days):
+        result["fired"] = True
+        result["channel_used"] = "wa"
+    else:
+        ok = _send_active_learning_nudge_macos(n, since_days)
+        result["fired"] = ok
+        result["channel_used"] = "macos-fallback" if ok else "all-failed"
+    return result
+
+
+@cli.group("active-learning")
+def active_learning() -> None:
+    """Active learning: nudge + (futuro) batch labeling via WA quick reply."""
+
+
+@active_learning.command("nudge")
+@click.option("--threshold", default=DEFAULT_ACTIVE_LEARNING_NUDGE_THRESHOLD,
+              show_default=True, type=int,
+              help="Minimo de candidates para disparar el push.")
+@click.option("--since-days", "since_days",
+              default=DEFAULT_ACTIVE_LEARNING_SINCE_DAYS,
+              show_default=True, type=int,
+              help="Ventana en dias para contar candidates.")
+@click.option("--top-score-max", "top_score_max",
+              default=DEFAULT_ACTIVE_LEARNING_TOP_SCORE_MAX,
+              show_default=True, type=float,
+              help="Maximo top_score para clasificar como low-conf.")
+@click.option("--channel", type=click.Choice(["auto", "wa", "macos"]),
+              default="auto", show_default=True,
+              help="Canal del push. 'auto' = WA con macOS fallback.")
+@click.option("--dry-run", is_flag=True,
+              help="Contar candidates sin disparar push.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Output JSON (para launchd logs).")
+def active_learning_nudge_cli(
+    threshold: int, since_days: int, top_score_max: float,
+    channel: str, dry_run: bool, as_json: bool,
+) -> None:
+    """Recordatorio de labelear queries low-confidence.
+
+    Reemplaza al bash inline historico del plist. Default: manda push
+    WA al grupo RagNet con link a /learning UI; fallback a osascript
+    si el bridge WA esta caido.
+    """
+    result = active_learning_nudge(
+        threshold=threshold,
+        since_days=since_days,
+        top_score_max=top_score_max,
+        channel=channel,
+        dry_run=dry_run,
+    )
+    if as_json:
+        click.echo(json.dumps(result))
+        return
+    console.print()
+    console.print("[bold]rag active-learning nudge[/bold]")
+    console.print(f"  Candidates ultimos {since_days}d: "
+                  f"[cyan]{result['n_candidates']}[/cyan]  "
+                  f"(threshold: {threshold})")
+    if result["fired"]:
+        console.print(f"  [green]Push fired[/green] -> "
+                      f"channel={result['channel_used']}")
+    elif result["n_candidates"] < threshold:
+        console.print(f"  [dim]Below threshold, no push.[/dim]")
+    else:
+        console.print(f"  [yellow]Push failed[/yellow] -> "
+                      f"channel={result['channel_used']}")
+    console.print()
+
+
+# ─── /end C.6 ────────────────────────────────────────────────────────────
 
 
 @feedback.command("infer-implicit")

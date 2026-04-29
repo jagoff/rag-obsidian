@@ -296,10 +296,11 @@ def test_auto_harvest_high_conf_positive_inserts_row(
     assert json.loads(row[2]) == ["golden.md"]
     extra = json.loads(row[3])
     assert extra["corrective_path"] == "golden.md"
-    # Tagged as auto-harvester (NOT manual 'harvester').
-    # Actual source is 'harvester' because _feedback_insert_harvested tags it.
-    # The distinction lives in extra_json.source_variant if we need it.
-    assert extra["source"] == "harvester"
+    # Quick Win C.7 (2026-04-29): auto_harvest tags rows con
+    # source='auto-harvester' (distinto del manual 'harvester' skill).
+    # Pre-fix _feedback_insert_harvested hardcodeaba 'harvester' para
+    # todo, lo que hacia indistinguible auto vs manual en auditoria.
+    assert extra["source"] == "auto-harvester"
 
 
 def test_auto_harvest_low_conf_skips_without_insert(

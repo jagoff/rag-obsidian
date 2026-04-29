@@ -81,6 +81,14 @@ _SOURCE_RATING_POS = "rating_pos"
 _SOURCE_RATING_NEG_NO_CORR = "rating_neg_no_corrective"
 _SOURCE_BEHAVIOR_PREFIX = "behavior_"  # + event type, e.g. behavior_copy
 
+# rag_behavior.source values que cuentan como user signal (cerrado 2026-04-28).
+# El caller del retrieve() ahora propaga el caller real al field `source` —
+# bot-initiated (anticipate-*, followup, eval) NO entra al training set.
+# `cli` cubre el CLI del user, `web` el chat web (PWA + dashboard), `whatsapp`
+# el listener (cuando emite eventos vía /api/behavior). Si en el futuro agregás
+# nuevos canales user-driven (mobile app, IDE plugin, etc.), agregalos acá.
+_USER_BEHAVIOR_SOURCES: frozenset[str] = frozenset({"cli", "web", "whatsapp"})
+
 
 # ── Extractors — one per positive signal source ─────────────────────────────
 
@@ -144,18 +152,33 @@ def _extract_behavior_rows(cutoff_iso: str) -> list[dict]:
 
     Shape per row:
       {ts, source, event, path, query, rank}
+
+    **Filter (cerrado 2026-04-28)**: solo `source IN _USER_BEHAVIOR_SOURCES`
+    (cli, web, whatsapp). Esto excluye bot-initiated impressions
+    (anticipate-calendar, anticipate-echo, followup, eval) que el retrieve
+    loguea con el caller real desde el commit `16df67e`. Pre-fix, esos
+    rows entraban al training set como signal del user — el ranker
+    aprendía a despriorizar paths que el bot mismo buscaba seguido (no son
+    clicks reales del user). El SQL `source IN (?, ?, ?)` filtra cleanly.
+
+    Migration note: rows pre-2026-04-28 con `source="cli"` que en realidad
+    eran bot-initiated NO se distinguen acá — la limpieza histórica vive
+    en `scripts/cleanup_bot_behavior_rows.py` (commit separado).
     """
     rows: list[dict] = []
+    placeholders = ",".join("?" for _ in _USER_BEHAVIOR_SOURCES)
     sql = (
         "SELECT ts, source, event, path, query, rank "
         "FROM rag_behavior "
         "WHERE ts >= ? "
         "  AND path IS NOT NULL AND path != '' "
         "  AND query IS NOT NULL AND query != '' "
+        f"  AND source IN ({placeholders}) "
         "ORDER BY ts ASC"
     )
+    params = (cutoff_iso, *sorted(_USER_BEHAVIOR_SOURCES))
     with rag._ragvec_state_conn() as conn:
-        cur = conn.execute(sql, (cutoff_iso,))
+        cur = conn.execute(sql, params)
         for ts, source, event, path, query, rank in cur.fetchall():
             # Skip cross-source paths — same rationale as feedback.
             if not path or "://" in path:

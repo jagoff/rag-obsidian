@@ -60,6 +60,77 @@ def _seed_query(ev: dict) -> None:
         rag._sql_append_event(conn, "rag_queries", rag._map_queries_row(ev))
 
 
+# ── Behavior source filter (cerrado 2026-04-28) ────────────────────────────
+
+
+def test_extract_behavior_rows_filters_bot_initiated_sources(tmp_db):
+    """rag_behavior rows con source bot-initiated (anticipate-calendar,
+    anticipate-echo, followup, eval) NO entran al training set. Solo
+    `cli`, `web`, `whatsapp` cuentan como user signal.
+
+    Cerrado 2026-04-28: pre-fix `retrieve()` siempre logueaba con
+    source="cli" hardcoded → bot-initiated impressions contaminaban el
+    training. El caller-aware logging ya distinguía; este test verifica
+    que el miner respeta el split."""
+    now = datetime.now()
+    iso = lambda d: d.isoformat(timespec="seconds")  # noqa: E731
+
+    # User signal — debe pasar.
+    _seed_behavior({
+        "ts": iso(now), "source": "cli", "event": "impression",
+        "query": "user query 1", "path": "user-a.md", "rank": 1,
+    })
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=1)), "source": "web",
+        "event": "open", "query": "user query 2", "path": "user-b.md",
+    })
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=2)), "source": "whatsapp",
+        "event": "kept", "query": "user query 3", "path": "user-c.md",
+    })
+
+    # Bot signal — debe filtrarse.
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=3)), "source": "anticipate-calendar",
+        "event": "impression", "query": "calendar event title",
+        "path": "bot-a.md", "rank": 1,
+    })
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=4)), "source": "anticipate-echo",
+        "event": "impression", "query": "echo snippet",
+        "path": "bot-b.md", "rank": 1,
+    })
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=5)), "source": "followup",
+        "event": "impression", "query": "follow-up loop",
+        "path": "bot-c.md", "rank": 1,
+    })
+    _seed_behavior({
+        "ts": iso(now - timedelta(minutes=6)), "source": "eval",
+        "event": "impression", "query": "eval set query",
+        "path": "bot-d.md", "rank": 1,
+    })
+
+    cutoff_iso = iso(now - timedelta(hours=1))
+    rows = etp._extract_behavior_rows(cutoff_iso)
+    paths = sorted(r["path"] for r in rows)
+    sources = sorted(set(r["source"] for r in rows))
+
+    assert paths == ["user-a.md", "user-b.md", "user-c.md"], (
+        f"esperado solo user paths, got: {paths}"
+    )
+    assert sources == ["cli", "web", "whatsapp"], (
+        f"sources should only contain user-driven channels, got: {sources}"
+    )
+
+
+def test_extract_behavior_rows_includes_only_whitelist():
+    """Sanity: el frozenset de allowed sources es el contract. Si alguien
+    agrega una source que no debería contar como user signal, este test
+    rompe y obliga a actualizar el whitelist conscientemente."""
+    assert etp._USER_BEHAVIOR_SOURCES == frozenset({"cli", "web", "whatsapp"})
+
+
 # ── Positive sources: priority ordering ─────────────────────────────────────
 
 

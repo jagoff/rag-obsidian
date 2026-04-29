@@ -46,7 +46,9 @@ from rag_ranker_lgbm.hard_negatives import (
 )
 from rag_ranker_lgbm.inference import LambdaRankerScorer
 from rag_ranker_lgbm.synthetic_queries import (
+    CROSS_SOURCE_SOURCES,
     generate_synthetic_queries,
+    generate_synthetic_queries_for_cross_source,
     get_synthetic_stats,
 )
 from rag_ranker_lgbm.train import (
@@ -55,11 +57,13 @@ from rag_ranker_lgbm.train import (
 )
 
 __all__ = [
+    "CROSS_SOURCE_SOURCES",
     "DEFAULT_MODEL_PATH",
     "FEATURE_NAMES",
     "LambdaRankerScorer",
     "feedback_to_training_data",
     "generate_synthetic_queries",
+    "generate_synthetic_queries_for_cross_source",
     "get_negatives_stats",
     "get_synthetic_stats",
     "mine_hard_negatives_for_synthetic",

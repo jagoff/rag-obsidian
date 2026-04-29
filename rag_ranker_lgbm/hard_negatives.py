@@ -153,6 +153,21 @@ def mine_hard_negatives_for_synthetic(
             metrics["n_queries_no_neighbors"] += 1
             continue
 
+        # Quick Win #4 (2026-04-29): capturar el cosine query->positive
+        # explicitamente. Antes era TODO (column siempre NULL). Ahora lo
+        # extraemos del NN search results: si el positive aparece en los
+        # top-K, su cosine al query es signal de "qué tan bueno es el
+        # match" que el calibrate per-source consume como raw_score
+        # sintético del lado positivo.
+        cosine_query_to_positive: float | None = None
+        for _n in neighbors:
+            if _n.get("path") == positive_path:
+                try:
+                    cosine_query_to_positive = float(_n.get("cosine", 0.0))
+                except (TypeError, ValueError):
+                    cosine_query_to_positive = None
+                break
+
         # Filter: drop positive itself + duplicates.
         filtered: list[dict[str, Any]] = []
         for n in neighbors:
@@ -189,10 +204,21 @@ def mine_hard_negatives_for_synthetic(
                 "positive": positive_path,
                 "negative": n["path"],
                 "cosine_to_query": round(float(n.get("cosine", 0.0)), 3),
+                "cosine_query_to_positive": (
+                    round(cosine_query_to_positive, 3)
+                    if cosine_query_to_positive is not None else None
+                ),
             })
             if dry_run:
                 continue
             try:
+                # `cosine_to_positive` ahora se popula con el cosine
+                # query->positive (Quick Win #4). Es el mismo valor para
+                # todas las rows del mismo synth_id (depende solo del
+                # par query/positive_path). El campo queda NULL si el
+                # positive no apareció en top-K del NN search — caso
+                # raro pero posible si el embedding del positive_path
+                # está marginal vs el query.
                 conn.execute(
                     "INSERT OR IGNORE INTO rag_synthetic_negatives "
                     "(ts, synthetic_query_id, query, positive_path, "
@@ -201,7 +227,7 @@ def mine_hard_negatives_for_synthetic(
                     (
                         now_iso, synth_id, query, positive_path,
                         n["path"], float(n.get("cosine", 0.0)),
-                        None,  # cosine_to_positive: TODO si hace falta más precision
+                        cosine_query_to_positive,
                     ),
                 )
                 if conn.total_changes > 0:

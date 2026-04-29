@@ -52353,6 +52353,10 @@ def _classify_source_from_path(path: str) -> str:
         # Normalize scheme aliases.
         if scheme in ("whatsapp", "whats_app", "wa"):
             return "whatsapp"
+        # `gdrive://` es el scheme histórico del ingester de Drive
+        # (gdrive://file/<id>); `_CALIBRATION_SOURCES` usa "drive".
+        if scheme == "gdrive":
+            return "drive"
         if scheme in _CALIBRATION_SOURCES:
             return scheme
         return "vault"
@@ -52361,20 +52365,111 @@ def _classify_source_from_path(path: str) -> str:
     return "vault"
 
 
+# Quick Win #4 (2026-04-29): umbral minimo de pares de FEEDBACK REAL
+# por debajo del cual fallback-eamos a synthetic. Igual al
+# `min_pairs_per_source` del CLI (default 20). Conservador a proposito:
+# 19 reales + 50 sinteticos es peor que 19 reales puros (el cosine
+# bge-m3 introduce un sesgo que la calibracion isotonic absorbe). Solo
+# disparamos fallback cuando el real signal es claramente insuficiente.
+SYNTH_FALLBACK_THRESHOLD = 20
+
+
+def _gather_synthetic_calibration_pairs(
+    conn, source: str,
+) -> list[tuple[float, int]]:
+    """Pull (raw_score, label) pairs from synthetic queries + negatives.
+
+    Quick Win #4 fallback cuando el feedback real para una source no
+    alcanza `SYNTH_FALLBACK_THRESHOLD`. Las "fuentes" de raw score son
+    los cosines del bge-m3 embedding (no el cross-encoder score que usa
+    el feedback real), por lo que la calibracion resultante NO es
+    directamente comparable — el row se persiste con
+    `model_version='isotonic-v1-synth'` para que el lector (ej.
+    `calibrate_score`) sepa que cosa absorbio.
+
+    Positives: cada synthetic query tiene un `positive_path`. El cosine
+    query->positive lo captura `mine_hard_negatives_for_synthetic` en
+    la column `cosine_to_positive` de `rag_synthetic_negatives` (mismo
+    valor para todas las rows del mismo synth_id). DISTINCT para no
+    contar el mismo positive N veces.
+
+    Negatives: cada row de `rag_synthetic_negatives` con `neg_path`
+    matcheando la source contribuye un par (cosine_to_query, 0).
+
+    Args:
+        conn: connection a `telemetry.db`.
+        source: source target (vault/whatsapp/gmail/...).
+
+    Returns:
+        Lista de pares (raw_score, label) — vacia si la tabla no existe
+        o no hay datos para la source.
+    """
+    pairs: list[tuple[float, int]] = []
+
+    # Positives: distinct synth_id con cosine_to_positive populated.
+    try:
+        pos_rows = conn.execute(
+            "SELECT DISTINCT synthetic_query_id, cosine_to_positive, "
+            "       positive_path "
+            "FROM rag_synthetic_negatives "
+            "WHERE cosine_to_positive IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        pos_rows = []
+    for _synth_id, cos_pos, positive_path in pos_rows:
+        if cos_pos is None:
+            continue
+        try:
+            score = float(cos_pos)
+        except (TypeError, ValueError):
+            continue
+        if _classify_source_from_path(positive_path) == source:
+            pairs.append((score, 1))
+
+    # Negatives: every hard negative row whose neg_path matches source.
+    try:
+        neg_rows = conn.execute(
+            "SELECT cosine_to_query, neg_path FROM rag_synthetic_negatives"
+        ).fetchall()
+    except Exception:
+        neg_rows = []
+    for cos_q, neg_path in neg_rows:
+        if cos_q is None:
+            continue
+        try:
+            score = float(cos_q)
+        except (TypeError, ValueError):
+            continue
+        if _classify_source_from_path(neg_path) == source:
+            pairs.append((score, 0))
+
+    return pairs
+
+
 def train_calibration(
     *,
     since_days: int = 90,
     min_pairs_per_source: int = 20,
     dry_run: bool = False,
+    use_synthetic_fallback: bool = True,
 ) -> dict:
     """Train isotonic regression per-source and persist to rag_score_calibration.
 
     Returns per-source stats:
-      {sources: {src: {status, n_pairs, n_pos, n_neg, knots}, ...},
+      {sources: {src: {status, n_pairs, n_pos, n_neg, knots,
+                       used_synthetic, n_synth_pairs}, ...},
        total_pairs, trained_sources}
 
     Never raises (wraps everything defensively). dry_run=True computes
     knots but skips the DB write.
+
+    Quick Win #4 (2026-04-29): si `use_synthetic_fallback=True` (default)
+    y una source tiene < SYNTH_FALLBACK_THRESHOLD pares de feedback real,
+    suplementa con pares sinteticos derivados de
+    `rag_synthetic_queries`/`rag_synthetic_negatives` (cosine bge-m3 como
+    proxy de raw_score). El row de calibracion resultante se persiste
+    con `model_version='isotonic-v1-synth'` para distinguirlo del
+    `isotonic-v1` puro de feedback real.
     """
     from datetime import datetime
     result: dict = {
@@ -52386,16 +52481,45 @@ def train_calibration(
     try:
         with _ragvec_state_conn() as conn:
             for src in _CALIBRATION_SOURCES:
-                pairs = _gather_calibration_pairs(
+                real_pairs = _gather_calibration_pairs(
                     conn, src, since_days=since_days,
                 )
+                pairs = list(real_pairs)
+                synth_pairs: list[tuple[float, int]] = []
+                used_synthetic = False
+                # Quick Win #4: synthetic fallback. Solo si feedback real
+                # cae por debajo del umbral — preferimos siempre real
+                # signal cuando haya. El threshold es el mismo que el
+                # `min_pairs_per_source` del CLI (default 20).
+                if (
+                    use_synthetic_fallback
+                    and len(real_pairs) < SYNTH_FALLBACK_THRESHOLD
+                ):
+                    try:
+                        synth_pairs = _gather_synthetic_calibration_pairs(
+                            conn, src,
+                        )
+                    except Exception:
+                        synth_pairs = []
+                    if synth_pairs:
+                        pairs.extend(synth_pairs)
+                        used_synthetic = True
                 n_pos = sum(1 for _, y in pairs if y == 1)
                 n_neg = len(pairs) - n_pos
+                n_real_pos = sum(1 for _, y in real_pairs if y == 1)
+                n_real_neg = len(real_pairs) - n_real_pos
                 entry = {
                     "status": "skipped",
                     "n_pairs": len(pairs),
                     "n_pos": n_pos,
                     "n_neg": n_neg,
+                    # Subset de los counts: cuantos vinieron de synthetic
+                    # vs feedback real. Util para diagnostics — el
+                    # dashboard de calibration muestra el split.
+                    "n_real_pos": n_real_pos,
+                    "n_real_neg": n_real_neg,
+                    "n_synth_pairs": len(synth_pairs),
+                    "used_synthetic": used_synthetic,
                 }
                 result["total_pairs"] += len(pairs)
                 if len(pairs) < min_pairs_per_source or n_pos == 0 or n_neg == 0:
@@ -52420,6 +52544,16 @@ def train_calibration(
                 result["trained_sources"] += 1
                 if dry_run:
                     continue
+                # Quick Win #4: model_version refleja si la calibracion
+                # se baso en feedback real puro (`isotonic-v1`) o si
+                # absorbio pares sinteticos como fallback
+                # (`isotonic-v1-synth`). Lectores como `calibrate_score`
+                # NO discriminan hoy, pero el flag esta disponible para
+                # heuristicas futuras (ej. mostrar warning en el dashboard
+                # si una source critica esta siendo calibrada con synth).
+                model_version = (
+                    "isotonic-v1-synth" if used_synthetic else "isotonic-v1"
+                )
                 try:
                     conn.execute(
                         "INSERT INTO rag_score_calibration "
@@ -52439,7 +52573,7 @@ def train_calibration(
                             json.dumps(cal_k),
                             n_pos, n_neg,
                             result["trained_at"],
-                            "isotonic-v1",
+                            model_version,
                         ),
                     )
                 except Exception as exc:
@@ -55939,6 +56073,12 @@ def synth_queries() -> None:
               help="Cuántas queries pedirle al LLM por nota.")
 @click.option("--model", default="qwen2.5:7b", show_default=True,
               help="Modelo LLM para generar.")
+@click.option("--source", "source", default="vault", show_default=True,
+              help="Source a procesar. 'vault' = FS-based (default). "
+                   "Cualquier otro (whatsapp/gmail/calendar/drive/"
+                   "reminders/safari/contacts/calls) lee items desde "
+                   "la collection vectorial filtrando por meta.source "
+                   "— Quick Win #4.")
 @click.option("--apply", is_flag=True,
               help="Persistir a rag_synthetic_queries (default: dry-run).")
 @click.option("--json", "as_json", is_flag=True,
@@ -55947,21 +56087,47 @@ def synth_queries_generate(
     limit: int | None,
     queries_per_note: int,
     model: str,
+    source: str,
     apply: bool,
     as_json: bool,
 ) -> None:
-    """Generar queries sintéticas para el corpus."""
+    """Generar queries sintéticas para el corpus.
+
+    Default: vault (FS-based). Para sources cross-source:
+      rag synth-queries generate --source gmail --apply
+      rag synth-queries generate --source whatsapp --apply
+    """
     import json as _json
-    from rag_ranker_lgbm import generate_synthetic_queries
+    from rag_ranker_lgbm import (
+        CROSS_SOURCE_SOURCES,
+        generate_synthetic_queries,
+        generate_synthetic_queries_for_cross_source,
+    )
+
+    if source != "vault" and source not in CROSS_SOURCE_SOURCES:
+        raise click.ClickException(
+            f"--source={source!r} inválido. Valores: 'vault' o uno de "
+            f"{CROSS_SOURCE_SOURCES}"
+        )
 
     with _ragvec_state_conn() as conn:
-        result = generate_synthetic_queries(
-            conn,
-            limit=limit,
-            queries_per_note=queries_per_note,
-            model=model,
-            dry_run=not apply,
-        )
+        if source == "vault":
+            result = generate_synthetic_queries(
+                conn,
+                limit=limit,
+                queries_per_note=queries_per_note,
+                model=model,
+                dry_run=not apply,
+            )
+        else:
+            result = generate_synthetic_queries_for_cross_source(
+                conn,
+                source=source,
+                limit=limit,
+                queries_per_note=queries_per_note,
+                model=model,
+                dry_run=not apply,
+            )
 
     if as_json:
         out = {k: v for k, v in result.items() if k != "pairs_sample"}

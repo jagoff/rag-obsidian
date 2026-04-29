@@ -1780,6 +1780,28 @@ app.mount(
     name="static",
 )
 
+# ── /memory: mem-vault UI mounted as a sub-application ───────────────────
+# Boot mem-vault's FastAPI app once (Qdrant + mem0 are expensive) and let
+# it serve everything under /memory/*. Same origin as the rest of the web
+# UI so links + cookies + CSP work without surprises. Best-effort: if the
+# mem-vault package isn't installed in this venv (it lives in a separate
+# repo, optional dep) we just skip the mount and the link in the navbar
+# will 404 — easy to spot but doesn't crash the rest of the server.
+try:
+    from mem_vault.ui.server import create_app as _mem_vault_create_app  # type: ignore[import-not-found]
+
+    _mem_vault_app = _mem_vault_create_app()
+    app.mount("/memory", _mem_vault_app, name="mem-vault-ui")
+    print("[mem-vault] UI mounted at /memory", file=sys.stderr, flush=True)
+except Exception as _exc:  # pragma: no cover — best-effort wiring
+    print(
+        f"[mem-vault] UI not mounted ({_exc}). "
+        "Install with `uv pip install --editable /path/to/mem-vault[ui,hybrid]` "
+        "if you want /memory to work.",
+        file=sys.stderr,
+        flush=True,
+    )
+
 # CORS: same-origin only. The server is bound to 127.0.0.1 by the
 # launchd plist, so cross-origin requests would come from a browser
 # running an untrusted origin (e.g. a malicious local webpage trying

@@ -141,13 +141,23 @@ def _proactive_can_push(kind: str) -> tuple[bool, str]:
 
 
 def proactive_push(
-    kind: str, message: str, *, snooze_hours: int | None = None,
+    kind: str, message: str, *,
+    snooze_hours: int | None = None,
+    dedup_key: str | None = None,
 ) -> tuple[bool, str | None]:
     """Push proactivo a WA con rate-limit + silencio + snooze compartidos.
 
     Si `snooze_hours` se pasa, tras enviar el kind entra en snooze por ese
     tiempo — evita repetir el mismo trigger (ej: emergent theme sobre 'X'
     ya se pingeó, no repetir hasta snooze_hours después).
+
+    Si `dedup_key` se pasa, el body se sufija con
+    `\\n\\n_anticipate:<dedup_key>_` (markdown italic, WA lo renderiza
+    como cursiva pequeña). El listener TS lee este footer cuando el user
+    responde 👍/👎/🔇 al push y lo postea a `/api/anticipate/feedback`
+    con el `dedup_key` parseado — cierra el loop de feedback del
+    Anticipatory Agent. Sin `dedup_key`, el body queda intacto (back-
+    compat con `emergent` y `patterns` que no tienen dedup_key estable).
 
     Returns `(sent, reason)`:
       - sent=True, reason=None   → mensaje enviado al WA jid.
@@ -177,7 +187,13 @@ def proactive_push(
         # Defensive: _proactive_can_push ya chequea esto, pero por si la
         # config se borra entre el chequeo y el send.
         return (False, "ambient WA no habilitado (/enable_ambient desde el bot)")
-    sent = _ambient_whatsapp_send(cfg["jid"], message)
+    # Sufijar el footer ANTES de mandar al bridge. Markdown italic
+    # discreto pero visible para audit; el listener parsea
+    # `_anticipate:<key>_` con un regex simple en el reply.
+    body = message
+    if dedup_key:
+        body = f"{message}\n\n_anticipate:{dedup_key}_"
+    sent = _ambient_whatsapp_send(cfg["jid"], body)
     state = _proactive_load_state()
     if sent:
         state["daily_count"] = state.get("daily_count", 0) + 1
@@ -186,5 +202,5 @@ def proactive_push(
                 datetime.now() + timedelta(hours=snooze_hours)
             ).isoformat(timespec="seconds")
         _proactive_save_state(state)
-    _proactive_log({"kind": kind, "sent": sent, "message_preview": message[:120]})
+    _proactive_log({"kind": kind, "sent": sent, "message_preview": body[:120]})
     return (sent, None if sent else "WA bridge send failed")

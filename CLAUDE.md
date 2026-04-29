@@ -324,6 +324,96 @@ rag silence anticipate-calendar --off    # re-activar
 
 **Fase 2 (roadmap documentado, NO implementado)**: feedback loop (replies 👍/👎 → ajustes thresholds per-kind), quiet hours contextuales (22h→8h + "en reunión" via calendar), voice briefs matinales (morning via TTS en WA), user-configurable weights. Ver [`plans/anticipatory-agent.md`](plans/anticipatory-agent.md) y [`docs/anticipatory-agent.md`](docs/anticipatory-agent.md) para detalles.
 
+### Footer `_anticipate:<dedup_key>_` en pushes anticipate (2026-04-29)
+
+Cuando `proactive_push(...)` recibe `dedup_key=<key>` (lo pasa el orchestrator de anticipate; los callers `emergent` / `patterns` NO pasan dedup_key estable y siguen sin footer), el body se sufija con un párrafo italic markdown:
+
+```
+📅 En 30 min: call con Juan — [[Coaching - Juan]] score 87%
+
+_anticipate:cal:event-uuid-123_
+```
+
+WhatsApp lo renderiza como cursiva pequeña, discreto pero visible para audit. El footer es **lo que cierra el loop de feedback**: el listener TS, cuando el user responde 👍/👎/🔇 al push, parsea `_anticipate:<key>_` del mensaje quoted y postea a [`POST /api/anticipate/feedback`](web/server.py) con `{dedup_key, rating, reason}`. La row se persiste a `rag_anticipate_feedback` para tunear thresholds + scoring per-kind.
+
+Sin este footer, no hay forma de mapear "el user reaccionó" → "qué dedup_key era" (el orchestrator descarta el state después del push). Por eso lo ponemos inline en el body.
+
+## Bot WA draft loop — auto-aprendizaje del modelo de respuestas (2026-04-29)
+
+Loop completo: incoming WhatsApp → bot draft → user puntúa `/si` `/no` `/editar` en el RagNet group → reply al contacto + feedback al modelo.
+
+**Cómo cierra el loop**:
+
+1. Llega un mensaje al user (Mac de Fer) → el [listener TS](https://github.com/Fonsoide/whatsapp-listener) (otro repo, [`/Users/fer/whatsapp-listener`](file:///Users/fer/whatsapp-listener)) genera un `bot_draft` con un LLM y lo postea al RagNet group para puntuar.
+2. El user responde `/si` (aprueba tal cual), `/no` (rechaza), o `/editar <texto corregido>` (aprueba con edits). Si el draft expira sin respuesta → `expired`.
+3. El listener postea a [`POST /api/draft/decision`](web/server.py) con shape:
+   ```json
+   {
+     "draft_id": "abc123",
+     "contact_jid": "5491155555555@s.whatsapp.net",
+     "contact_name": "Juan",
+     "original_msgs": [{"id": "m1", "text": "hola", "ts": "..."}],
+     "bot_draft": "todo bien, vos?",
+     "decision": "approved_si | approved_editar | rejected | expired",
+     "sent_text": "todo bien, vos?",
+     "extra": {"draft_score": 0.85, "model": "qwen2.5:7b"}
+   }
+   ```
+4. El web server persiste a `rag_draft_decisions` (silent-fail si DB inaccesible — la UX del listener nunca se rompe por telemetría).
+
+**Tabla `rag_draft_decisions`** (append-only, retention infinita; el dataset histórico vale oro para fine-tunes futuros):
+
+```sql
+CREATE TABLE rag_draft_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,                    -- ISO local
+  draft_id TEXT NOT NULL,              -- short hex del listener TS, estable across updates del mismo draft
+  contact_jid TEXT NOT NULL,
+  contact_name TEXT,
+  original_msgs_json TEXT,             -- JSON array de {id, text, ts}
+  bot_draft TEXT,                      -- texto que el LLM generó
+  decision TEXT NOT NULL CHECK(decision IN ('approved_si','approved_editar','rejected','expired')),
+  sent_text TEXT,                      -- lo que finalmente se mandó al contacto (NULL si rejected/expired)
+  extra_json TEXT                      -- libre: draft_score, model, latency, etc.
+);
+```
+
+Indices: `ix_rag_draft_decisions_ts`, `ix_rag_draft_decisions_decision`, `ix_rag_draft_decisions_jid`.
+
+**Pares (bot_draft, sent_text) cuando `decision='approved_editar'` son gold humano** para fine-tunear el modelo de drafts. Por ahora NO se consumen en el training loop (eso es cambio bigger); cuando llegue el momento, la query es:
+
+```sql
+SELECT bot_draft, sent_text FROM rag_draft_decisions
+WHERE decision='approved_editar' AND sent_text IS NOT NULL;
+```
+
+**CLI**:
+
+```bash
+rag draft                          # = rag draft stats (default)
+rag draft stats                    # conteos por tipo + última fecha
+rag draft stats --plain            # output plano (piping/scripts)
+```
+
+Ejemplo de output:
+```
+drafts: total 47
+  approved_si: 12  (25.5%)
+  approved_editar: 18  (38.3%)
+  rejected: 9  (19.1%)
+  expired: 8  (17.0%)
+última decisión: 2026-04-29T14:32:18
+```
+
+Health check rápido: si `total` no crece después de un día de uso, o todo se va a `expired`, el flujo está roto (listener no postea, draft nunca llega al RagNet, etc.).
+
+**Endpoints relacionados**:
+
+- [`POST /api/draft/decision`](web/server.py) — escribir una decisión (4 decision types válidas, Pydantic valida pre-handler).
+- [`POST /api/anticipate/feedback`](web/server.py) — escribir un feedback de push proactivo (rating ∈ `positive|negative|mute`). El listener lo llama cuando parsea `_anticipate:<key>_` en un reply (ver footer pattern arriba).
+
+**Tests**: [`tests/test_draft_decisions_table.py`](tests/test_draft_decisions_table.py) (DDL + helper, 10 casos), [`tests/test_draft_decisions_endpoint.py`](tests/test_draft_decisions_endpoint.py) (4 decision types + validation + persistencia, 9 casos), [`tests/test_anticipate_feedback_endpoint.py`](tests/test_anticipate_feedback_endpoint.py) (3 ratings + validation + silent-fail, 7 casos), [`tests/test_proactive_push_dedup_key_footer.py`](tests/test_proactive_push_dedup_key_footer.py) (footer agrega `_anticipate:<key>_` + back-compat sin dedup_key, 7 casos). Drift guard: table count en [`tests/test_sql_state_primitives.py`](tests/test_sql_state_primitives.py) bumpeado 44→45.
+
 ## Whisper learning loop — la transcripción mejora con el uso (2026-04-25)
 
 El sistema de transcripción de audios de WhatsApp aprende del corpus + correcciones manuales del usuario. Cada audio se loguea, las correcciones se acumulan, y un job nightly extrae vocabulario del corpus para sesgar el `--prompt` de whisper. Plan completo en el vault: [`04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
@@ -895,6 +985,7 @@ Log-style tables (`id INTEGER PK AUTOINCREMENT`, `ts TEXT` ISO-8601, indexed):
 - `rag_brief_state` — kept/deleted dedup (upsert by pair_key = hash(brief_type, kind, path)).
 - `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log` — 60d retention.
 - `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics` — per-minute samplers, 30d retention.
+- `rag_draft_decisions` (2026-04-29) — decisiones del user sobre drafts del bot WA (`approved_si | approved_editar | rejected | expired`) + bot_draft + sent_text + original_msgs. **Keep all forever** — el dataset histórico es gold humano para fine-tunear el modelo de drafts (ver "Bot WA draft loop" más arriba). Populated via `POST /api/draft/decision` desde el listener TS.
 
 State-style tables:
 - `rag_conversations_index` — episodic session_id → relative_path (web/conversation_writer.py upsert; replaces the old conversations_index.json + fcntl dance).

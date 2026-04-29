@@ -2650,6 +2650,139 @@ def submit_feedback(req: FeedbackRequest) -> dict:
     return {"ok": True}
 
 
+# ── /api/draft/decision ──────────────────────────────────────────────────────
+# Cierra el loop de auto-aprendizaje del bot WA (2026-04-29):
+#   incoming WA → bot draft → user puntúa /si /no /editar en RagNet
+#   → reply al contacto + feedback al modelo.
+# El listener TS postea acá la decisión final del user. No hay retry
+# logic en el listener: si el endpoint falla, peor caso perdemos una
+# row de telemetría (UX no se rompe). El `decision` se valida contra
+# `rag._VALID_DRAFT_DECISIONS` ANTES de tocar SQL para fallar rápido.
+
+# Validamos `decision` contra el mismo set que el helper Python +
+# CHECK constraint de la tabla. Mantener el set en `rag` (single source
+# of truth); copiarlo acá rompería sync.
+_VALID_DRAFT_DECISIONS_WEB: frozenset[str] = frozenset({
+    "approved_si", "approved_editar", "rejected", "expired",
+})
+
+
+class DraftDecisionPayload(BaseModel):
+    draft_id: str = Field(..., max_length=120)
+    contact_jid: str = Field(..., max_length=120)
+    contact_name: str | None = Field(None, max_length=200)
+    # Cap defensivo: 50 mensajes × 4 KB cada uno = 200 KB. El listener
+    # truncar antes de postear si la conversación pre-draft fue muy larga.
+    original_msgs: list[dict] = Field(default_factory=list, max_length=50)
+    bot_draft: str = Field("", max_length=8000)
+    decision: str
+    sent_text: str | None = Field(None, max_length=8000)
+    extra: dict | None = None
+
+    @field_validator("decision")
+    @classmethod
+    def _check_decision(cls, v: str) -> str:
+        if v not in _VALID_DRAFT_DECISIONS_WEB:
+            raise ValueError(
+                f"decision must be one of {sorted(_VALID_DRAFT_DECISIONS_WEB)}"
+            )
+        return v
+
+
+@app.post("/api/draft/decision")
+def submit_draft_decision(req: DraftDecisionPayload) -> dict:
+    """Persiste la decisión del user sobre un draft del bot WhatsApp.
+
+    Llamado por el listener TS al detectar `/si`, `/no`, `/editar <texto>`
+    o expiry en el RagNet group. La response es síncrona (200 + row id)
+    o `{ok: False, reason: ...}` si el INSERT falla por DB inaccesible —
+    el listener no debe romper la UX al user por un fallo de telemetría.
+
+    Body shape: ver `DraftDecisionPayload`. `decision` debe ser uno de
+    `approved_si | approved_editar | rejected | expired`; cualquier otro
+    valor → 400 (Pydantic validation rebota antes de entrar al handler).
+    """
+    # Importamos el helper acá para que monkeypatches en tests
+    # (`patch.object(_web_server, "_record_draft_decision", ...)`) NO sean
+    # necesarios — el handler resuelve via `rag._record_draft_decision`
+    # cada vez. Tradeoff: micro-overhead de attribute lookup vs zero
+    # boilerplate en tests. Se sigue el mismo patrón que `record_feedback`
+    # (importado al top y patched directo en `_web_server.record_feedback`).
+    from rag import _record_draft_decision
+    try:
+        row_id = _record_draft_decision(
+            draft_id=req.draft_id,
+            contact_jid=req.contact_jid,
+            contact_name=req.contact_name,
+            original_msgs=req.original_msgs or [],
+            bot_draft=req.bot_draft or "",
+            decision=req.decision,
+            sent_text=req.sent_text,
+            extra=req.extra,
+        )
+    except Exception as exc:  # pragma: no cover — el helper ya hace silent-fail
+        return {"ok": False, "reason": f"helper raised: {exc}"}
+    if row_id is None:
+        # El helper devuelve None en silent-fail (DB inaccesible, etc.)
+        # o si la decision quedó inválida (raro acá, ya validamos con
+        # Pydantic). Devolvemos 200 + ok=False para que el listener
+        # logueé y siga sin romper.
+        return {"ok": False, "reason": "write failed (telemetry unavailable)"}
+    return {"ok": True, "id": int(row_id)}
+
+
+# ── /api/anticipate/feedback ─────────────────────────────────────────────────
+# Cuando el user responde 👍/👎/🔇 a un push del Anticipatory Agent, el
+# listener TS extrae el `dedup_key` del footer del mensaje quoted (ver
+# `proactive_push` con `dedup_key=...` que sufija el body con
+# `_anticipate:<dedup_key>_`) y postea acá. La row se persiste a
+# `rag_anticipate_feedback` para tunear thresholds + scoring per-kind.
+
+_VALID_ANTICIPATE_RATINGS: frozenset[str] = frozenset({
+    "positive", "negative", "mute",
+})
+
+
+class AnticipateFeedbackPayload(BaseModel):
+    dedup_key: str = Field(..., max_length=200)
+    rating: str
+    reason: str = Field("", max_length=500)
+
+    @field_validator("rating")
+    @classmethod
+    def _check_rating(cls, v: str) -> str:
+        if v not in _VALID_ANTICIPATE_RATINGS:
+            raise ValueError(
+                f"rating must be one of {sorted(_VALID_ANTICIPATE_RATINGS)}"
+            )
+        return v
+
+
+@app.post("/api/anticipate/feedback")
+def submit_anticipate_feedback(req: AnticipateFeedbackPayload) -> dict:
+    """Persiste un feedback del user sobre un push del Anticipatory Agent.
+
+    Llamado por el listener TS cuando el user responde al push proactivo
+    (👍/👎/🔇 o texto plano "util"/"no"/"basta"). El listener ya parseó
+    el rating; nosotros solo persistimos. `rag_anticipate.feedback.
+    record_feedback` es silent-fail — devolvemos `{ok: False, reason: ...}`
+    si el write falla, pero NUNCA un 5xx para no romper el listener.
+    """
+    # Import deferred igual que en `submit_draft_decision`: tests pueden
+    # monkeypatchear `rag_anticipate.feedback.record_feedback` directamente.
+    from rag_anticipate.feedback import record_feedback as _rec_feedback
+    try:
+        ok = _rec_feedback(
+            req.dedup_key, req.rating,
+            reason=req.reason or "", source="wa",
+        )
+    except Exception as exc:  # pragma: no cover
+        return {"ok": False, "reason": f"helper raised: {exc}"}
+    if not ok:
+        return {"ok": False, "reason": "write failed (telemetry unavailable)"}
+    return {"ok": True}
+
+
 # ── /api/behavior ─────────────────────────────────────────────────────────────
 # In-memory token bucket for rate limiting: 120 events/min per IP.
 # Stored as {ip: [timestamp, ...]} with a 60s sliding window. No new deps.

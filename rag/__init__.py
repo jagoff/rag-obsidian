@@ -5709,6 +5709,42 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Draft decisions — cierra el loop de auto-aprendizaje del bot WA
+        # (2026-04-29). Cuando llega un mensaje al usuario, el listener
+        # genera un `bot_draft` y lo manda al RagNet group para puntuar.
+        # El user responde `/si`, `/no`, o `/editar <texto>`; el listener
+        # postea acá la decisión + el texto que finalmente se mandó al
+        # contacto (si aplica). Pares (bot_draft, sent_text) cuando
+        # `decision='approved_editar'` son gold humano para futuro fine-
+        # tune del modelo de drafts (ver `rag draft stats` para conteo).
+        # Append-only; una row por draft × decisión final. Si el draft
+        # se updatea N veces antes de la decision, todas comparten el
+        # mismo `draft_id` (short hex del listener TS). `extra_json`
+        # queda libre para roundtrip future (ej. score del LLM, latency).
+        "rag_draft_decisions",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_draft_decisions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " draft_id TEXT NOT NULL,"
+            " contact_jid TEXT NOT NULL,"
+            " contact_name TEXT,"
+            " original_msgs_json TEXT,"
+            " bot_draft TEXT,"
+            " decision TEXT NOT NULL CHECK("
+            "decision IN ('approved_si', 'approved_editar', 'rejected', 'expired')),"
+            " sent_text TEXT,"
+            " extra_json TEXT"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_draft_decisions_ts"
+            " ON rag_draft_decisions(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_draft_decisions_decision"
+            " ON rag_draft_decisions(decision)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_draft_decisions_jid"
+            " ON rag_draft_decisions(contact_jid)",
+        ),
+    ),
+    (
         "rag_cpu_metrics",
         (
             "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
@@ -7447,6 +7483,104 @@ def _map_anticipate_row(ev: dict) -> dict:
         v = ev.get(flag, 0)
         out[flag] = int(bool(v))
     return out
+
+
+# Decisión válida del user en RagNet: aprueba el draft tal cual ('si'),
+# aprueba con edits ('editar'), lo descarta ('rejected'), o el draft
+# venció sin respuesta del user ('expired'). El CHECK constraint de la
+# tabla rag_draft_decisions enforcea el mismo set; lo replicamos en
+# Python para fallar temprano sin tocar SQL.
+_VALID_DRAFT_DECISIONS: frozenset[str] = frozenset({
+    "approved_si", "approved_editar", "rejected", "expired",
+})
+
+
+def _map_draft_decision_row(ev: dict) -> dict:
+    """Mapper para rag_draft_decisions. Las cols `*_json` aceptan dict/list
+    y se serializan automáticamente en `_sql_append_event`."""
+    out: dict = {}
+    for k in ("ts", "draft_id", "contact_jid", "contact_name",
+              "bot_draft", "decision", "sent_text"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    if "original_msgs" in ev and ev["original_msgs"] is not None:
+        out["original_msgs_json"] = ev["original_msgs"]
+    if "extra" in ev and ev["extra"] is not None:
+        out["extra_json"] = ev["extra"]
+    return out
+
+
+def _record_draft_decision(
+    *,
+    draft_id: str,
+    contact_jid: str,
+    contact_name: str | None,
+    original_msgs: list[dict],
+    bot_draft: str,
+    decision: str,
+    sent_text: str | None = None,
+    extra: dict | None = None,
+) -> int | None:
+    """Persiste una decisión de draft a `rag_draft_decisions`.
+
+    Cierra el loop de auto-aprendizaje del bot WhatsApp: cuando el user
+    puntúa un draft via `/si`, `/no`, o `/editar` en el RagNet group, el
+    listener postea acá la decisión + lo que se mandó al contacto. Pares
+    (bot_draft, sent_text) cuando `decision='approved_editar'` son gold
+    humano para futuro fine-tune del modelo de drafts.
+
+    Args:
+        draft_id: short hex del listener TS, estable across updates del
+            mismo draft (si el bot regenera el draft N veces antes de la
+            decisión final, todas las rows comparten draft_id).
+        contact_jid: jid de WhatsApp del contacto que escribió.
+        contact_name: display name (opcional).
+        original_msgs: list de `{id, text, ts}` con los mensajes que
+            dispararon el draft.
+        bot_draft: texto que el LLM generó.
+        decision: uno de `approved_si`, `approved_editar`, `rejected`,
+            `expired`. Cualquier otro valor → return None.
+        sent_text: lo que finalmente se mandó al contacto. NULL si
+            rejected/expired.
+        extra: dict libre para metadatos future (ej. score del LLM,
+            latency, model tag).
+
+    Returns:
+        rowid del INSERT, o None si la decisión es inválida o el write
+        falló (silent-fail para no romper el listener si el DB está
+        inaccesible — la UX del user nunca depende de telemetría).
+    """
+    if decision not in _VALID_DRAFT_DECISIONS:
+        return None
+    row = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "draft_id": draft_id,
+        "contact_jid": contact_jid,
+        "contact_name": contact_name,
+        "original_msgs": original_msgs or [],
+        "bot_draft": bot_draft or "",
+        "decision": decision,
+        "sent_text": sent_text,
+        "extra": extra,
+    }
+    # `_sql_write_with_retry` traga errors via _silent_log; usamos un
+    # holder mutable para devolver el rowid al caller (las write_fn no
+    # aceptan return value en su contract).
+    holder: dict = {"id": None}
+
+    def _do() -> None:
+        with _ragvec_state_conn() as conn:
+            holder["id"] = _sql_append_event(
+                conn, "rag_draft_decisions", _map_draft_decision_row(row),
+            )
+    try:
+        _sql_write_with_retry(_do, "draft_decision_sql_write_failed")
+    except Exception as exc:  # pragma: no cover - retry helper ya silencia
+        _silent_log("draft_decision_helper", exc)
+        return None
+    return holder["id"]
 
 
 def _map_cpu_row(ev: dict) -> dict:
@@ -28769,6 +28903,91 @@ def fix(path: str, session_id: str | None, plain: bool):
     click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
 
 
+# ── rag draft — auditar el loop de drafts del bot WhatsApp ────────────────
+# `rag_draft_decisions` se popula via /api/draft/decision cuando el user
+# puntúa /si /no /editar en el RagNet group. Este grupo permite mirar el
+# health del loop sin tener que abrir sqlite a mano (use case: "¿el bot
+# está tirando drafts útiles? ¿qué % aprueba el user tal cual vs editado?").
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def draft(ctx: click.Context):
+    """Auditar el loop de drafts del bot WhatsApp.
+
+    Subcomandos:
+      rag draft stats           # conteos por tipo de decisión + última fecha
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(draft_stats, plain=False)
+
+
+@draft.command("stats")
+@click.option("--plain", is_flag=True,
+              help="Output plano sin colores (para piping/scripts).")
+def draft_stats(plain: bool):
+    """Muestra conteo de decisiones por tipo + última fecha.
+
+    Pensado para sanity-check del loop: si el `total` no crece después
+    de un día de uso, o todo se va a `expired`, hay algo roto en el
+    flujo (listener no postea, draft nunca llega al RagNet, etc.).
+
+    Pares (bot_draft, sent_text) cuando `decision='approved_editar'`
+    son gold humano para futuro fine-tune del modelo de drafts; el
+    conteo `approved_editar` mide cuántos pares hay disponibles.
+    """
+    rows: list[tuple] = []
+    last_ts: str | None = None
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = list(conn.execute(
+                "SELECT decision, COUNT(*) FROM rag_draft_decisions "
+                "GROUP BY decision ORDER BY decision"
+            ).fetchall())
+            row = conn.execute(
+                "SELECT MAX(ts) FROM rag_draft_decisions"
+            ).fetchone()
+            if row and row[0]:
+                last_ts = row[0]
+    except Exception as exc:
+        msg = f"error leyendo rag_draft_decisions: {exc}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    if not rows:
+        msg = "sin registros — el bot todavía no recibió decisiones"
+        click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+        return
+
+    counts = {decision: int(n) for decision, n in rows}
+    total = sum(counts.values())
+
+    # Orden fijo para que el output sea estable entre corridas.
+    ordered_keys = ("approved_si", "approved_editar", "rejected", "expired")
+    if plain:
+        click.echo(f"total: {total}")
+        for k in ordered_keys:
+            n = counts.get(k, 0)
+            pct = (n / total * 100.0) if total else 0.0
+            click.echo(f"  {k}: {n}  ({pct:.1f}%)")
+        if last_ts:
+            click.echo(f"última: {last_ts}")
+    else:
+        console.print(f"[bold]drafts:[/bold] total {total}")
+        for k in ordered_keys:
+            n = counts.get(k, 0)
+            pct = (n / total * 100.0) if total else 0.0
+            color = {
+                "approved_si": "green",
+                "approved_editar": "cyan",
+                "rejected": "red",
+                "expired": "yellow",
+            }.get(k, "white")
+            console.print(
+                f"  [{color}]{k}[/{color}]: {n}  [dim]({pct:.1f}%)[/dim]"
+            )
+        if last_ts:
+            console.print(f"[dim]última decisión: {last_ts}[/dim]")
+
+
 @cli.command("state")
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")
@@ -40303,6 +40522,30 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
     return f"\n\n---\n_ayer cerraste con:_ [[{title}]]"
 
 
+_MORNING_PLACEHOLDER_RE = re.compile(
+    r"^\s*\W*\s*("
+    r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
+    r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
+    r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
+    r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
+    r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_bullet(text: str) -> bool:
+    """True si el bullet del LLM es solo prosa de relleno tipo 'Nada quedó
+    suelto', 'No hay novedades', 'Ninguna pregunta abierta', etc. Accent-fold
+    para que matchee con/sin tildes.
+    """
+    if not text:
+        return True
+    folded = unicodedata.normalize("NFD", text)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return bool(_MORNING_PLACEHOLDER_RE.match(folded))
+
+
 def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
     """Anti-alucinación post-LLM: descarta bullets que no tienen sustento en
     la evidencia real. El LLM tiende a inventar contradicciones, low-conf
@@ -40320,12 +40563,31 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
       - `yesterday` se vacía si no hay recent_notes Y no hay evidencia
         cruzada (calendar/reminders/gmail/recent_queries). Sin material,
         el LLM no puede más que inventar.
+      - Cualquier bullet de `focus`/`pending`/`attention` que sea solo
+        placeholder ("Nada quedó suelto", "Ninguna pregunta", etc.) se
+        descarta. Si el LLM puebla la lista entera con placeholders, la
+        lista queda vacía y la sección desaparece.
 
     No muta el dict de input. Devuelve uno nuevo con las mismas claves.
     """
     if not isinstance(parts, dict):
         return parts
     out = dict(parts)
+    # Pre-filter: drop placeholder bullets en focus/pending/attention.
+    # Si el LLM contestó "Ninguna pregunta abierta" como bullet, no es
+    # un bullet — es relleno y debe desaparecer (ni el header se muestra
+    # si la lista queda vacía).
+    for key in ("focus", "pending", "attention"):
+        v = out.get(key)
+        if isinstance(v, list):
+            out[key] = [
+                b for b in v
+                if isinstance(b, str) and b.strip()
+                and not _is_placeholder_bullet(b)
+            ]
+    if out.get("yesterday") and isinstance(out["yesterday"], str):
+        if _is_placeholder_bullet(out["yesterday"]):
+            out["yesterday"] = ""
 
     has_contrad = bool(ev.get("new_contradictions"))
     has_low_conf = bool(ev.get("low_conf_queries"))
@@ -41145,8 +41407,12 @@ def _render_today_prompt(
     )
     sections_hint = (
         f"## OUTPUT — formato (longitud total: {word_budget})\n\n"
-        "Empezá tu respuesta con `## 🪞 Lo que pasó hoy` y entregá "
-        "EXACTAMENTE estas 4 secciones (no más, no menos)" + extras_clause
+        "Empezá tu respuesta con `## 🪞 Lo que pasó hoy`. Las secciones de "
+        "abajo son OPCIONALES — si una no tiene contenido real, OMITILA "
+        "ENTERA (header + body). NO escribas placeholders como "
+        "'nada quedó suelto', 'no hay datos suficientes', "
+        "'ninguna pregunta abierta', 'sin novedades' — preferimos un "
+        "brief más corto antes que un header con relleno" + extras_clause
         + " Citá notas con [[Título]]. Citá personas por nombre cuando "
         "aparezcan en gmail/wa/calendar."
     )
@@ -41156,22 +41422,25 @@ def _render_today_prompt(
         "## 🪞 Lo que pasó hoy",
         "(3-4 líneas concretas: qué notas tocaste, qué temas aparecieron, "
         "qué mails/mensajes movieron la aguja. Si no hubo casi nada, decilo "
-        "breve. Mezclá señales — no listés solo notas)",
+        "breve. Mezclá señales — no listés solo notas. Esta sección SIEMPRE "
+        "va, aun si es 1 línea breve.)",
         "",
         "## 📥 Sin procesar",
         "(listar capturas de hoy que todavía no tienen carpeta/tags + mails "
-        "VIP sin responder + chats WhatsApp esperando respuesta. Si no hay "
-        "nada de esto, decir 'nada quedó suelto')",
+        "VIP sin responder + chats WhatsApp esperando respuesta. SI NO HAY "
+        "NADA, OMITÍ LA SECCIÓN ENTERA — no escribas el header.)",
         "",
         "## 🔍 Preguntas abiertas",
         "(queries low-confidence de hoy → notas que podrías escribir; "
-        "citá las preguntas literales; omitir la sección si no hubo ninguna)",
+        "citá las preguntas literales. SI NO HUBO NINGUNA, OMITÍ LA "
+        "SECCIÓN ENTERA — no escribas el header.)",
         "",
         "## 🌅 Para mañana",
         "(2-3 action items concretos derivados de cabos sueltos de hoy. "
         "Si hay eventos en el calendario de mañana, mencionalos SOLO si "
         "se conectan con algo de hoy — no copies la agenda. NO agenda "
-        "genérica — todo tiene que venir del contexto real)",
+        "genérica — todo tiene que venir del contexto real. SI NO HAY "
+        "NADA accionable, OMITÍ LA SECCIÓN ENTERA — no escribas el header.)",
     ])
     if has_cross_source:
         parts.extend([
@@ -41255,6 +41524,80 @@ def _today_brief_client():
     return _TODAY_BRIEF_CLIENT
 
 
+def _strip_empty_today_sections(narrative: str) -> str:
+    """Drop secciones del evening cuyo body es solo placeholder ("nada quedó
+    suelto", "no hubo X", "ninguna pregunta", etc.) o está vacío.
+
+    El prompt le dice al LLM "OMITÍ la sección entera" pero qwen2.5:7b
+    igual rellena con frases tipo "Nada quedó suelto que no haya sido ya
+    categorizado" — ese tipo de header sin contenido real es exactamente
+    lo que el user pidió sacar.
+
+    Heurística: para cada `## Section`, miramos el body (líneas hasta el
+    próximo `## ` o EOF). Si toda la prosa hace match contra patrones
+    placeholder (case-insensitive, accent-folded), drop header + body.
+    Conservador: si hay UNA sola línea no-placeholder, mantenemos.
+    """
+    if not narrative:
+        return narrative
+    placeholder_re = re.compile(
+        r"^\s*\W*\s*("
+        r"nada\s+qued|no\s+hubo|no\s+hay\b|no\s+habia|"
+        r"ninguna|ningun\b|sin\s+novedades?|sin\s+actividad|sin\s+nada|"
+        r"no\s+se\s+registr|no\s+se\s+detect|no\s+aparec|"
+        r"no\s+hay\s+datos?\s+suficientes|no\s+aplica|"
+        r"todo\s+(quedo|esta)\s+(en\s+orden|al\s+dia|categorizado)"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def _is_placeholder_body(body: str) -> bool:
+        # Strip todas las líneas en blanco / list-marker only / "(nota)" lines
+        lines = [
+            ln.strip()
+            for ln in body.splitlines()
+            if ln.strip() and not ln.strip() in ("-", "*")
+        ]
+        if not lines:
+            return True
+        # Accent-fold para los regexes
+        folded = []
+        for ln in lines:
+            n = unicodedata.normalize("NFD", ln)
+            n = "".join(c for c in n if not unicodedata.combining(c))
+            folded.append(n)
+        # Drop si TODAS las líneas matchean placeholder
+        return all(placeholder_re.match(ln) for ln in folded)
+
+    # Split por headers `## ` (top-level del brief). Mantenemos el primer
+    # bloque pre-header como prefacio (suele ser vacío).
+    pieces = re.split(r"(?m)^(?=## )", narrative)
+    # Si no hay ningún `## ` header, el split devuelve [narrative] entero —
+    # nada que strippear, devolver tal cual para preservar el contrato del
+    # caller (que puede esperar sin trailing-newline).
+    if len(pieces) == 1 and not pieces[0].startswith("## "):
+        return narrative
+    out_pieces: list[str] = []
+    for piece in pieces:
+        if not piece.strip():
+            continue
+        if not piece.startswith("## "):
+            out_pieces.append(piece)
+            continue
+        # Header + body
+        nl_idx = piece.find("\n")
+        if nl_idx < 0:
+            # Solo el header sin body — drop
+            continue
+        body = piece[nl_idx + 1:]
+        if _is_placeholder_body(body):
+            continue
+        out_pieces.append(piece)
+    if not out_pieces:
+        return ""
+    return "\n\n".join(p.rstrip() for p in out_pieces) + "\n"
+
+
 def _generate_today_narrative(prompt: str) -> str:
     try:
         resp = _today_brief_client().chat(
@@ -41274,9 +41617,13 @@ def _generate_today_narrative(prompt: str) -> str:
     # del usuario citado.
     try:
         from rag.today_correlator import normalize_voice_to_2da_persona
-        return normalize_voice_to_2da_persona(raw)
+        normalized = normalize_voice_to_2da_persona(raw)
     except Exception:
-        return raw
+        normalized = raw
+    # Sacar secciones con placeholder ("nada quedó suelto", etc.) — el
+    # user pidió explícitamente que si está vacío no se muestre ni el
+    # título.
+    return _strip_empty_today_sections(normalized)
 
 
 # ── Phase 4b: `rag wa-tasks` Click command moved to `rag.wa_tasks` ──────

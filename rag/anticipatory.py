@@ -569,8 +569,16 @@ def anticipate_run_impl(
     skip_reason: str | None = None
     if not dry_run:
         try:
+            # Pasamos `dedup_key` para que `proactive_push` sufije el body
+            # con `_anticipate:<key>_` — el listener TS lo lee al detectar
+            # un reply 👍/👎/🔇 y lo postea a /api/anticipate/feedback.
+            # Sin esto, el feedback loop quedaría desconectado (no hay
+            # otra forma de mapear "el user reaccionó a este push" →
+            # "qué dedup_key era").
             sent, skip_reason = _rag.proactive_push(
-                top.kind, top.message, snooze_hours=top.snooze_hours,
+                top.kind, top.message,
+                snooze_hours=top.snooze_hours,
+                dedup_key=top.dedup_key,
             )
         except Exception as exc:
             _silent_log("anticipate_proactive_push", exc)

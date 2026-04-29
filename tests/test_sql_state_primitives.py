@@ -86,12 +86,14 @@ def test_ensure_telemetry_tables_idempotent(tmp_path):
     # de audios reenviados a RagNet) +
     # 5 negotiation tables (rag_negotiations, rag_negotiation_turns,
     # rag_negotiation_pending_sends, rag_style_fingerprints,
-    # rag_behavior_priors_wa — WA Negotiation Auto-Pilot Fase 0) =
-    # 44 tables total (43 + rag_promises agregada 2026-04-25 con la
-    # infra base del feat de promesas WhatsApp).
+    # rag_behavior_priors_wa — WA Negotiation Auto-Pilot Fase 0) +
+    # 1 draft decisions (rag_draft_decisions, 2026-04-29 — cierra
+    # el loop de auto-aprendizaje del bot WA: incoming → draft →
+    # /si /no /editar en RagNet → reply + feedback al modelo) =
+    # 45 tables total.
     expected = {name for name, _ in rag._TELEMETRY_DDL}
     assert expected.issubset(after)
-    assert len(expected) == 44
+    assert len(expected) == 45
     c.close()
 
 

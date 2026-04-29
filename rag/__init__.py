@@ -37093,7 +37093,11 @@ def _read_generate_summary(prompt: str) -> str:
             options=CHAT_OPTIONS,
             keep_alive=chat_keep_alive(),
         )
-        return (resp.message.content or "").strip()
+        # 2026-04-29: filter PT→ES post-gen — el resumen de URL se guarda
+        # en `03-Resources/` y se renderiza en el CLI (`rag read <url>`).
+        # Sin filter, leaks del LLM con texto pt llegan a la nota guardada.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        return replace_iberian_leaks((resp.message.content or "").strip())
     except Exception:
         return ""
 
@@ -41870,7 +41874,23 @@ def _generate_morning_json(prompt: str) -> dict | None:
         if not raw:
             return None
         data = json.loads(raw)
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # 2026-04-29: aplicar filter PT→ES recursivamente a todos los
+        # strings del dict — el morning brief json se manda a WhatsApp y
+        # se guarda en `00-Inbox/`. Sin filter, leaks pt en cualquier
+        # field del JSON ("celebrate", "gaps", etc.) llegan al user.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+
+        def _filter_strings(v):
+            if isinstance(v, str):
+                return replace_iberian_leaks(v)
+            if isinstance(v, dict):
+                return {k: _filter_strings(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_filter_strings(x) for x in v]
+            return v
+        return _filter_strings(data)
     except Exception:
         return None
 
@@ -58232,7 +58252,11 @@ def _pp_task_repair(
             stream=False,
             keep_alive=chat_keep_alive(_postprocess_model()),
         )
-        repair_full = (resp.message.content or "").strip()
+        # 2026-04-29: filter PT→ES post-gen. La respuesta reparada se
+        # le muestra al user en CLI y web — sin filter, leaks pt del
+        # repair pueden llegar al usuario.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        repair_full = replace_iberian_leaks((resp.message.content or "").strip())
     except Exception as exc:
         _silent_log("postprocess_repair_failed", exc)
         return {"ran": True, "ok": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}
@@ -58288,7 +58312,11 @@ def _pp_task_critique(
             stream=False,
             keep_alive=chat_keep_alive(_postprocess_model()),
         )
-        crit_full = (resp.message.content or "").strip()
+        # 2026-04-29: filter PT→ES post-gen. La crítica regenera la
+        # respuesta y el caller la pinta directo en CLI/web — sin
+        # filter, leaks pt llegan al user.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        crit_full = replace_iberian_leaks((resp.message.content or "").strip())
     except Exception as exc:
         _silent_log("postprocess_critique_failed", exc)
         return {"ran": True, "changed": False, "full": None, "ms": int((time.perf_counter() - t0) * 1000)}

@@ -427,44 +427,34 @@ def test_stream_corpus_expandido_2026_04_29():
         )
 
 
-def test_stream_limitacion_starters_adyacentes():
-    """Limitación conocida y documentada del streaming filter: cuando 2
-    compound starters son adyacentes (ej. "ela era", "ele tem"), bajo
-    `chunk_size=1` el filter los emite separados y la regla compound
-    de 2-pronombres no matchea.
+def test_stream_starters_adyacentes_arreglado():
+    """Refactor 2026-04-29: el streaming filter ahora usa "safe-to-emit
+    check" — verifica que aplicar el filter al buffer completo == a las
+    partes separadas. Si difieren, un compound atraviesa el borde y
+    retiene todo. Esto cubre starter chains (`ela era`, `ele tem`) que
+    el algoritmo previo no manejaba bajo `chunk_size=1`.
 
-    Comportamiento:
-    - sync (`replace_iberian_leaks(text)`) — caza correctamente: "ela era" → "ella era".
-    - streaming con `chunk_size=1` — emite "ela " separado de "era ", la
-      regla `\\bela\\s+era\\b` no matchea, sale "ela era" sin tocar.
-    - streaming con chunks grandes (≥10 chars) — la palabra completa "ela era"
-      llega en un solo chunk → matchea correctamente.
-
-    Para arreglar habría que reescribir el algoritmo de retención de
-    buffer del `_IberianLeakFilter` para detectar "starter chains" y
-    retener TODO. Refactor mayor — por ahora aceptamos la limitación:
-    el caso es raro (LLM emite respuestas con `chunk_size=1` solo en
-    debug) y el sync lo caza al final.
+    Antes de este refactor existía `test_stream_limitacion_starters_adyacentes`
+    que DOCUMENTABA la limitación. Ahora la limitación está resuelta y
+    este test verifica que el comportamiento esperado se mantiene
+    (sync == streaming para cualquier chunk_size).
     """
     replace, Filter = _import_helpers()
     text = "ela era una niña."
     sync_output = replace(text)
     assert sync_output == "ella era una niña.", f"sync should fix: got {sync_output!r}"
 
-    # Streaming con chunk_size=1: NO caza "ela era" adyacente.
+    # Ahora streaming con chunk_size=1 SÍ caza "ela era" adyacente.
     f = Filter()
     out = ""
     for ch in text:
         out += f.feed(ch)
     out += f.flush()
-    # Documenta el comportamiento actual: "ela era" SOBREVIVE en streaming
-    # con chunks de 1 char. Este assert va a romper si alguien arregla
-    # el algoritmo (good — actualizar a `assert out == sync_output` ahí).
-    assert "ela era" in out or out == sync_output, (
-        f"streaming chunk_size=1: got {out!r}"
+    assert out == sync_output, (
+        f"streaming chunk_size=1 debería matchear sync ahora: got {out!r}"
     )
 
-    # Pero con chunks grandes (texto completo en 1 chunk) sí matchea.
+    # Y con chunks grandes también, obviamente.
     f = Filter()
     out = f.feed(text) + f.flush()
     assert out == sync_output, (

@@ -6137,25 +6137,33 @@ class _IberianLeakFilter:
     """Streaming filter chained después de `_InlineCitationStripper` que
     reemplaza leaks portugueses/gallegos con su equivalente español.
 
-    Problema de diseño: las frases multi-palabra ("em março", "contigo
-    em", "uma conversa") llegan partidas entre chunks del stream (peor
-    caso: ollama chunk_size=1). Si emitimos cada palabra al llegar a un
+    Problema de diseño: las frases multi-palabra ("em março", "ela era",
+    "uma conversa") llegan partidas entre chunks del stream (peor caso:
+    ollama chunk_size=1). Si emitimos cada palabra al llegar a un
     boundary, la regex compuesta nunca matchea porque los fragmentos
     ya fueron emitidos por separado.
 
-    Solución: **retener compound starters**. Cuando el candidate de
-    emit TERMINA con "em ", "uma " o "contigo " (las 3 palabras que
-    inician compounds en `_IBERIAN_LEAK_REPLACEMENTS`), retenemos ese
-    starter en el buffer esperando la siguiente palabra. Cuando llega,
-    el buffer tiene "em março" completa y la regla dispara. Ver
-    `_COMPOUND_STARTER_TAIL_RE` — mantenerlo sincronizado con los
-    compounds multi-palabra al agregar frases nuevas.
+    Solución (refactor 2026-04-29): **safe-to-emit check**. Antes de
+    emitir un candidate, verificamos que aplicar el filter al buffer
+    completo da el mismo resultado que aplicarlo a (candidate +
+    remainder) por separado. Si difieren → un compound atraviesa el
+    borde → retenemos todo el buffer hasta que llegue más texto.
+
+    Esto reemplaza el algoritmo previo que solo retenía starters
+    individuales (`em`, `uma`, `contigo`) — ese fallaba cuando 2
+    starters eran adyacentes (`ela era`): retenía `era` separadamente
+    de `ela` y la regla `\\bela\\s+era\\b` nunca matchea.
+
+    Costo: ~2× regex scans por feed (full-buffer vs split). Para chunks
+    típicos de 5-20 chars y ~150 reglas, ~50-100µs total. Aceptable.
 
     API:
-      - `.feed(chunk)` acumula; emite hasta el último boundary menos
-        cualquier compound starter pendiente al final.
+      - `.feed(chunk)` acumula; emite hasta el último boundary si es
+        safe (no rompe compounds), retiene si no.
       - `.flush()` drena el buffer aplicando replace.
       - Idempotente: texto ya en español pasa sin modificar.
+      - Invariante: `stream(c1+c2+...) == replace(concat)` para
+        cualquier partition (chunk_size).
     """
 
     _MAX_HOLD = 200  # cap de emergencia contra tokens gigantes sin espacios.
@@ -6182,31 +6190,80 @@ class _IberianLeakFilter:
                 self._buf = ""
                 return out
             return ""
+
         candidate = self._buf[:last_boundary + 1]
-        # Clave para el streaming de compounds: si el candidate TERMINA
-        # con un "starter" de frase compuesta ("em ", "uma ", "contigo
-        # "), lo retenemos en el buffer porque podría completar una
-        # frase cuando lleguen más chars. Sin este safeguard, con
-        # chunk_size=1 el candidate "hola em " emitiría "em" antes de
-        # ver "março" y la regla `em\s+março` nunca dispararía.
+        rest = self._buf[last_boundary + 1:]
+
+        # Algoritmo híbrido (refactor 2026-04-29):
+        #
+        # 1. PESSIMISTIC STARTER CHECK: si el candidate termina con un
+        #    compound starter (`em `, `uma `, `ela `, etc.), asumimos
+        #    que el siguiente chunk puede traer la 2da palabra del
+        #    compound (`em ` + `março` → `em março`). Retenemos desde
+        #    el starter sin emit. Pesimista: asume futuro adverso.
+        #
+        # 2. SAFE-EMIT SPLIT CHECK: una vez descartado (1), aplicar el
+        #    invariante `replace(full) == replace(emit) + replace(buf)`.
+        #    Si pasa → emit. Si no → un compound EXISTENTE en el buffer
+        #    atraviesa el split (ej. starter chains "ela era" donde el
+        #    starter tail caza solo "era" pero "ela era" es el compound).
+        #    En ese caso retenemos todo.
+        #
+        # El split en 2 pasos cubre tanto el caso "futuro adverso"
+        # (chunk siguiente completa compound) como "presente roto"
+        # (compound ya en buffer pero atraviesa el boundary).
+
+        # CHECK 1 — pesimista por starter pendiente.
         m = _COMPOUND_STARTER_TAIL_RE.search(candidate)
         if m:
             starter_start = m.start()
             if starter_start == 0:
-                # El candidate es sólo el starter + espacios — no hay
-                # nada que emitir por ahora. Esperamos más chunks.
+                # Candidate es SÓLO starter + espacios. No emitir.
                 if len(self._buf) > self._MAX_HOLD:
                     out = _normalize_canonical_filenames(_replace_iberian_leaks(self._buf))
                     self._buf = ""
-                    return out
+                    return _redact_pii(out)[0]
                 return ""
-            # Retener desde el starter; emitir todo lo anterior.
-            to_emit = self._buf[:starter_start]
-            self._buf = self._buf[starter_start:]
-            return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(to_emit)))[0]
-        to_emit = candidate
-        self._buf = self._buf[last_boundary + 1:]
-        return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(to_emit)))[0]
+            # Hay texto antes del starter — proponer split en starter.
+            pre_starter = self._buf[:starter_start]
+            from_starter = self._buf[starter_start:]
+            # CHECK 2 sobre ese split: ¿algún compound atraviesa el
+            # límite "pre_starter|from_starter"? Ej. con buf="ela era ":
+            # pre_starter="ela " (matchea solo `ela`), from_starter="era "
+            # → split rompe el compound `ela era`. Retener todo.
+            full_filtered = _replace_iberian_leaks(self._buf)
+            parts_filtered = (
+                _replace_iberian_leaks(pre_starter)
+                + _replace_iberian_leaks(from_starter)
+            )
+            if parts_filtered != full_filtered:
+                # Compound atraviesa el split propuesto → retener todo.
+                if len(self._buf) > self._MAX_HOLD:
+                    out = _normalize_canonical_filenames(_replace_iberian_leaks(self._buf))
+                    self._buf = ""
+                    return _redact_pii(out)[0]
+                return ""
+            # Split safe: emitir pre_starter, retener desde starter.
+            self._buf = from_starter
+            return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(pre_starter)))[0]
+
+        # CHECK 2 — safe-emit split sobre candidate.
+        full_filtered = _replace_iberian_leaks(self._buf)
+        parts_filtered = (
+            _replace_iberian_leaks(candidate)
+            + _replace_iberian_leaks(rest)
+        )
+        if parts_filtered != full_filtered:
+            # Compound atraviesa el último boundary. Retener todo.
+            if len(self._buf) > self._MAX_HOLD:
+                out = _normalize_canonical_filenames(_replace_iberian_leaks(self._buf))
+                self._buf = ""
+                return _redact_pii(out)[0]
+            return ""
+
+        # Safe-to-emit candidate entero.
+        self._buf = rest
+        return _redact_pii(_normalize_canonical_filenames(_replace_iberian_leaks(candidate)))[0]
 
     def flush(self) -> str:
         tail = self._buf

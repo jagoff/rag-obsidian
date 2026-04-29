@@ -398,6 +398,11 @@ def _weather_comment(question: str, forecast: str) -> str:
             options={**HELPER_OPTIONS, "num_predict": 80},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
-        return resp.message.content.strip()
+        # 2026-04-29: filter PT→ES post-gen. El comentario sobre el
+        # pronóstico aparece en el morning brief (WhatsApp + vault) y
+        # en el CLI cuando se renderiza. Sin filter, leaks pt llegan
+        # al user.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        return replace_iberian_leaks(resp.message.content.strip())
     except Exception:
         return ""

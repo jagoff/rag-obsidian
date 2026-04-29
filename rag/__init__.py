@@ -35927,10 +35927,18 @@ def _has_explicit_time(text: str) -> bool:
       - Digit patterns: `18hs`, `18h`, `10am`, `4pm`, `14:30`
 
     Pure substring regex, no side effects — safe for tool fast path.
+
+    2026-04-28 wave-8 fix: usaba `_TIME_MARKER_RE` que matchea "mañana"
+    sola (porque doublea como period-of-day en "a la mañana"), lo cual
+    rompía propose-intent: "y mañana?" caía en branch 4 con
+    has_temporal=True + has_explicit_time=True → True. Pero "mañana"
+    sola es DAY word, no clock. La constante narrow `_CLOCK_RE_EXPLICIT`
+    fue definida exactamente para este caso (require digit clock o
+    "a la|al + period"); plug-in pendiente desde 2026-04-21.
     """
     if not text:
         return False
-    return bool(_TIME_MARKER_RE.search(text))
+    return bool(_CLOCK_RE_EXPLICIT.search(text))
 
 
 def _parse_natural_datetime(

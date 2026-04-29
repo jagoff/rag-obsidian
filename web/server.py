@@ -367,6 +367,55 @@ _WEATHER_LOCATION_RE = re.compile(
 )
 
 
+# 2026-04-28 wave-8 (eval Conv 4 T2): patrones de follow-up anafórico
+# temporal que indican "lo mismo del turno previo, pero shifteado en
+# tiempo o en el slot de location". Repro: "y mañana?" tras "qué hago
+# hoy?" — el LLM alucinaba propose_reminder. Usado por el carry-over
+# pre-router para re-fire los mismos read-intent tools del turno previo.
+_ANAPHORIC_TEMPORAL_RE = re.compile(
+    r"^\s*"
+    r"(?:y\s+)?"  # opcional "y ..."
+    r"(?:"
+    # Adverbios temporales puros (con o sin trailing words cortos)
+    r"(?:hoy|ma[ñn]ana|ayer|anoche|antier|pasado\s+ma[ñn]ana)"
+    # Frases temporales "la/esta/proxima semana/tarde/noche/mañana"
+    r"|(?:la|esta|esa|el|este|pr[oó]xim[oa]|la\s+pr[oó]xima|la\s+que\s+viene)"
+    r"\s+(?:semana|tarde|noche|ma[ñn]ana|finde|fin\s+de\s+semana|mes|a[ñn]o|d[ií]a)"
+    r"(?:\s+que\s+viene)?"
+    # Location follow-up: "en X"
+    r"|en\s+\w+(?:\s+\w+)?"
+    # Weather attribute follow-up: "cuánta lluvia/nieve" (con cualquier
+    # trailing — "cuánta lluvia se espera?")
+    r"|cu[aá]nta?\s+(?:lluvia|nieve|tormenta|llovizna|fr[ií]o|calor)"
+    r")"
+    # Trailing chars hasta cap razonable — permite "se espera?", "habrá?",
+    # etc. sin saltar a frases largas que ya no son anafóricas.
+    r"\b.{0,30}\s*[?!.]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_anaphoric_args(tool_name: str, question: str, last_location: str | None) -> dict:
+    """Compute args para el tool re-fire en follow-up anafórico.
+
+    Para `weather` específicamente: si la query menciona una nueva location
+    (ej. "y en Barcelona?"), usa esa; sino usa la `last_location` del turno
+    previo. Esto preserva el contexto de la ciudad sin re-prompt.
+
+    Para otros tools (calendar_ahead, reminders_due, etc.) los args default
+    son fine — el tool ya respeta horizonte de "hoy/esta semana" interno.
+    """
+    args: dict = {}
+    if tool_name == "weather":
+        # Detectar si query menciona nueva location.
+        m = re.search(r"\ben\s+([A-ZÁÉÍÓÚÑa-záéíóúñ][\wáéíóúñÁÉÍÓÚÑ\s]{1,40}?)(?=\s*[?!.]?\s*$)", question, re.IGNORECASE)
+        if m:
+            args["location"] = m.group(1).strip().rstrip(",.;:")
+        elif last_location:
+            args["location"] = last_location
+    return args
+
+
 def _detect_weather_explicit_location_intent(q: str) -> tuple[str, dict] | None:
     """Detect 'clima/tiempo en CIUDAD' patterns. Returns ('weather', {'location': X})
     si matchea, None si no. Cuando matchea, debe forzar SOLO weather sin
@@ -9280,6 +9329,24 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # pre-router further down.
     is_propose_intent = _detect_propose_intent(question)
 
+    # 2026-04-28 wave-8: track de tools y location del turno previo.
+    # Se inicializan acá para que estén disponibles en todas las paths
+    # (cache hit, metachat, retrieve, etc.) y se persistan al cierre.
+    _last_weather_location: str | None = None
+    _last_turn_tools: list[str] = []
+    _last_turn_weather_location: str | None = None
+    try:
+        _prev_session_for_state = ensure_session(req.session_id, mode="chat") if req.session_id else None
+        _prev_turns_state = (_prev_session_for_state or {}).get("turns") or []
+        if _prev_turns_state:
+            _last_t = _prev_turns_state[-1]
+            _last_turn_tools = list(_last_t.get("tools_fired") or [])
+            _last_turn_weather_location = _last_t.get("weather_location") or None
+    except Exception:
+        # Defense in depth — el state lookup no debe romper la chat call.
+        _last_turn_tools = []
+        _last_turn_weather_location = None
+
     # Meta-chat short-circuit — greetings / thanks / "what can you do".
     # 2026-04-21 Playwright probe (Fer F.): "hola" produced "Según tus
     # notas, tenés varias interacciones con diferentes contactos por
@@ -9461,6 +9528,13 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             return None
 
     def gen():
+        # 2026-04-28 wave-8: nonlocal de _last_weather_location porque
+        # asignamos a esa variable dentro de gen() (línea ~10395) y sin
+        # nonlocal Python la considera local-only y los reads tempranos
+        # (append_turn al final) tiran UnboundLocalError. _last_turn_*
+        # son read-only para gen(), no requieren nonlocal.
+        nonlocal _last_weather_location
+
         _t0 = time.perf_counter()
         yield _sse("session", {"id": sess["id"]})
 
@@ -10294,7 +10368,54 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # BUG #31 wave-2: top_score=0.0 dispara fallback cluster.
             yield _sse("done", {"error": True, "top_score": 0.0})
             return
+
+        # 2026-04-28 wave-8: anaphoric carry-over de tools del turno previo.
+        # Repro Conv 4 T2: "y mañana?" tras "qué hago hoy?" → el LLM
+        # alucinaba propose_reminder. Fix: si el turno previo fired tools
+        # de read-intent (calendar_ahead, reminders_due, weather, etc.) Y
+        # la query actual matchea un patrón anaphoric+temporal (`y X?`,
+        # `y mañana?`, `y la semana?`, etc.), re-fire los mismos tools
+        # con los args ajustados por el shift temporal.
+        #
+        # UNION semantics — el `_detect_tool_intent` ya pudo haber emitido
+        # `reminders_due/calendar_ahead/whatsapp_pending` por matchear
+        # "mañana"/"hoy", pero NO `weather` (no hay keyword genérico).
+        # Si el turno previo fired weather y el actual es anafórico,
+        # ADD weather al set actual sin descartar lo que ya hay.
+        if (
+            not is_propose_intent
+            and _last_turn_tools
+            and _ANAPHORIC_TEMPORAL_RE.match(question.strip())
+        ):
+            _read_intent_tools = {
+                "calendar_ahead", "reminders_due", "whatsapp_pending",
+                "gmail_recent", "weather", "whatsapp_list_scheduled",
+                "drive_search",
+            }
+            _existing_names = {n for n, _ in _forced_tool_pairs}
+            _carryover_added: list[tuple[str, dict]] = []
+            for name in _last_turn_tools:
+                if name in _read_intent_tools and name not in _existing_names:
+                    _carryover_added.append(
+                        (name, _resolve_anaphoric_args(name, question, _last_turn_weather_location))
+                    )
+                    _existing_names.add(name)
+            if _carryover_added:
+                _forced_tool_pairs = list(_forced_tool_pairs) + _carryover_added
+                print(
+                    f"[chat-anaphoric-carryover] q={question!r} "
+                    f"prev_tools={_last_turn_tools} "
+                    f"existing={[n for n,_ in _forced_tool_pairs[:len(_forced_tool_pairs)-len(_carryover_added)]]} "
+                    f"added={[n for n,_ in _carryover_added]}",
+                    flush=True,
+                )
         _has_forced_tools = bool(_forced_tool_pairs)
+        # Capturamos location de weather si el pre-router la trajo —
+        # para persistir en el next turn.
+        for _n, _a in _forced_tool_pairs:
+            if _n == "weather" and isinstance(_a, dict) and _a.get("location"):
+                _last_weather_location = _a["location"]
+                break
 
         if not result["docs"]:
             # Propose-intent turns don't need vault context — the tool
@@ -10882,7 +11003,14 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             # already exists. Skip the pre-router entirely when propose
             # intent is detected — let the LLM decide cleanly.
             _propose_intent = is_propose_intent
-            _forced_tools = [] if _propose_intent else _detect_tool_intent(question)
+            # 2026-04-28 wave-8: usamos `_forced_tool_pairs` ya computados al
+            # entrar a gen() (línea ~10362) en vez de re-correr
+            # `_detect_tool_intent` acá, porque el original perdía el carry-
+            # over anafórico (Conv B T2 "y en Barcelona?": el carryover
+            # populaba _forced_tool_pairs con [('weather', {'location': 'Barcelona'})]
+            # pero esta línea lo ignoraba y re-detectaba [], saltando la
+            # ejecución del tool entera).
+            _forced_tools = [] if _propose_intent else list(_forced_tool_pairs)
             if _forced_tools:
                 _f_serial = [(n, a) for n, a in _forced_tools if n not in PARALLEL_SAFE]
                 _f_parallel = [(n, a) for n, a in _forced_tools if n in PARALLEL_SAFE]
@@ -11666,6 +11794,14 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             "paths": [m.get("file", "") for m in result["metas"]],
             "top_score": round(_sanitize_confidence(result["confidence"]), 3),
             "turn_id": turn_id,
+            # 2026-04-28 wave-8: track tools fired this turn para que el
+            # próximo turn pueda detectar follow-ups anafóricos como
+            # "y mañana?" tras "qué hago hoy?" y re-fire los mismos read-
+            # intent tools con date shift, en lugar de pasar a propose_*.
+            "tools_fired": list(tool_names_called),
+            # Track la última weather location explícita para carry-over
+            # en follow-ups tipo "y mañana?" o "cuánta lluvia?".
+            "weather_location": _last_weather_location,
         })
         save_session(sess)
         log_query_event({

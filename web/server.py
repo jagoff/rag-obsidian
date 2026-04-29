@@ -14943,11 +14943,25 @@ _LOG_DIRS: tuple[Path, ...] = (
 # Heurística para clasificar líneas. Sin word boundary INICIAL así
 # matchea CamelCase tipo `OperationalError` o `UserWarning` (que NO
 # tienen boundary entre `l-E` o `r-W`), pero con boundary final + un
-# lookahead negativo `(?!s?[\s:=]+0\b)` que evita clasificar como error
-# las stats "failed=0" / "errors: 0".
+# lookahead negativo que evita clasificar como error las stats con valor
+# 0 (`failed=0` / `errors: 0` / `"errors": 0` / `"skipped_judge_failed":
+# 0`). El char-class `[\s:='\"]` cubre las 4 formas comunes:
+#   - `failed=0`         → separador `=`
+#   - `errors: 0`        → separadores ` :` (espacio + dos puntos)
+#   - `"errors": 0`      → separadores `"` `:` (cierre de quote + dos
+#                          puntos), forma JSON estándar
+#   - `'errors': 0`      → separadores `'` `:` (cierre de quote + dos
+#                          puntos), JSON con single-quotes (raro pero
+#                          aparece en algunos logs Python repr())
+# Bug histórico (2026-04-29): el regex tenía sólo `[\s:=]` así que
+# clasificaba `"skipped_judge_failed": 0` (en el JSON heartbeat de
+# auto-harvest) como error → la sidebar de /logs mostraba 3 errores
+# falsos para auto-harvest, pero el botón "fix con IA" después decía
+# "no hay errores recientes" porque /api/logs/file con only_errors=1
+# usaba otra heurística que sí filtraba bien. UI inconsistente.
 _LOG_RE_ERROR = re.compile(
     r"(error|exception|traceback|failed|fatal|panic|critical)"
-    r"(?!s?[\s:=]+0\b)\b",
+    r"(?!s?[\s:='\"]+0\b)\b",
     re.IGNORECASE,
 )
 _LOG_RE_WARN = re.compile(r"(warning|warn|deprec|retry)\b", re.IGNORECASE)

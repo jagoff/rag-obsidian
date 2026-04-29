@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <!-- viewport-fit=cover: empareja con dashboard / finance / home para que la
+       PWA standalone no tenga gaps blancos arriba/abajo. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="rag">
+  <title>rag · atlas</title>
+
+  <!-- ── PWA wiring (mismo set que el resto) ─────────────────────────── -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/pwa/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/pwa/favicon-16.png">
+  <link rel="apple-touch-icon" href="/static/pwa/apple-touch-icon.png">
+
+  <script>
+    // Inline theme init — corre antes del paint para evitar flash de tema.
+    (function () {
+      try {
+        var t = localStorage.getItem("rag-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <script src="/static/pwa/register-sw.js" defer></script>
+  <!-- Chart.js para sparklines de entidades. Misma versión que dashboard/finance. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+  <!-- D3 v7 para el force-directed graph estilo Obsidian. Solo módulo "force"
+       + "selection" + "drag" + "zoom" alcanzaría, pero el bundle full es ~280
+       KB gzip y nos ahorra trabajo de cherry-pick. -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js" defer></script>
+  <style>
+    :root {
+      --bg: #1a1a1f;
+      --bg-elev: #222228;
+      --bg-card: #26262c;
+      --border: #33333a;
+      --border-strong: #3e3e46;
+      --text: #ececed;
+      --text-dim: #a0a0a6;
+      --text-faint: #7a7a82;
+      --green: #7ee787;
+      --cyan: #79c0ff;
+      --cyan-dim: #5a9bd5;
+      --yellow: #e3c27a;
+      --red: #ff7b72;
+      --purple: #d2a8ff;
+      --orange: #ffa657;
+      --pink: #f778ba;
+      --grid: rgba(255,255,255,0.04);
+      --hover: rgba(255,255,255,0.06);
+      --sep: rgba(255,255,255,0.03);
+      color-scheme: dark;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #fafafa;
+      --bg-elev: #ffffff;
+      --bg-card: #ffffff;
+      --border: #e2e2e5;
+      --border-strong: #cfcfd4;
+      --text: #1a1a20;
+      --text-dim: #52525b;
+      --text-faint: #70707a;
+      --green: #2f8f3d;
+      --cyan: #0969da;
+      --cyan-dim: #0969da;
+      --yellow: #a0761a;
+      --red: #c8311f;
+      --purple: #7c3aed;
+      --orange: #c25a11;
+      --pink: #d02a8a;
+      --grid: rgba(0,0,0,0.05);
+      --hover: rgba(0,0,0,0.04);
+      --sep: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme="dark"]) {
+        --bg: #fafafa;
+        --bg-elev: #ffffff;
+        --bg-card: #ffffff;
+        --border: #e2e2e5;
+        --border-strong: #cfcfd4;
+        --text: #1a1a20;
+        --text-dim: #52525b;
+        --text-faint: #70707a;
+        --green: #2f8f3d;
+        --cyan: #0969da;
+        --cyan-dim: #0969da;
+        --yellow: #a0761a;
+        --red: #c8311f;
+        --purple: #7c3aed;
+        --orange: #c25a11;
+        --pink: #d02a8a;
+        --grid: rgba(0,0,0,0.05);
+        --hover: rgba(0,0,0,0.04);
+        --sep: rgba(0,0,0,0.04);
+        color-scheme: light;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "SF Mono", "Menlo", "Monaco", "JetBrains Mono", ui-monospace, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    :focus { outline: none; }
+    :focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    /* ── Header sticky (mismo patrón que finance/dashboard) ─────────── */
+    header.hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 14px 24px 16px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .hdr-l {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .hdr-l .brand { color: var(--cyan); text-decoration: none; }
+    .hdr-l .brand:hover { color: var(--cyan); filter: brightness(1.15); }
+    .hdr-l .sep { color: var(--text-faint); font-weight: 400; }
+    .hdr-l .title { color: var(--text-faint); font-weight: 400; }
+
+    .hdr-r {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-dim);
+      flex-wrap: wrap;
+    }
+
+    /* Selector segmentado de días — mismo look que finance. */
+    .seg {
+      display: inline-flex;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+    }
+    .seg-btn {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      padding: 4px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .seg-btn:hover { color: var(--text); }
+    .seg-btn.active { background: var(--bg-card); color: var(--cyan); }
+
+    .btn-icon {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-faint);
+      cursor: pointer;
+      user-select: none;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      font-family: inherit;
+    }
+    .btn-icon:hover { border-color: var(--border-strong); color: var(--text); }
+
+    .hdr-nav { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+    .hdr-nav a {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-decoration: none;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    .hdr-nav a:hover { color: var(--cyan); background: var(--hover); }
+
+    .meta-period {
+      font-variant-numeric: tabular-nums;
+      color: var(--text-faint);
+    }
+
+    /* ── KPI hero (4 tarjetas, 2 cols mobile / 4 desktop) ───────────── */
+    .kpi-hero {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      padding: 16px 24px;
+    }
+    @media (max-width: 900px) {
+      .kpi-hero { grid-template-columns: repeat(2, 1fr); }
+    }
+    .kpi {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .kpi-label {
+      font-size: 11px;
+      color: var(--text-faint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .kpi-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--cyan);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ── Secciones colapsables ─────────────────────────────────────── */
+    .learn-section {
+      padding: 16px 24px;
+      border-top: 1px solid var(--border);
+    }
+    .learn-section-hdr {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .learn-section-hdr h2 {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0;
+      color: var(--text);
+    }
+    .learn-section-hdr p.muted {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin: 0;
+      flex: 1;
+    }
+    .collapse-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .collapse-btn:hover { color: var(--text); border-color: var(--border-strong); }
+    .learn-section-body.collapsed { display: none; }
+
+    /* ── Graph estilo Obsidian ───────────────────────────────────────
+       Contenedor SVG que ocupa ancho completo y se redibuja al resize.
+       Force-directed layout via D3. */
+    .graph-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0;
+      position: relative;
+      height: 640px;
+      overflow: hidden;
+    }
+    .graph-card svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    .graph-card svg:active { cursor: grabbing; }
+    .graph-controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      display: inline-flex;
+      flex-direction: column;
+      gap: 6px;
+      z-index: 5;
+    }
+    .graph-controls .btn-icon { padding: 4px 8px; font-size: 11px; }
+    .graph-legend {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      display: inline-flex;
+      gap: 12px;
+      font-size: 10px;
+      color: var(--text-dim);
+      background: color-mix(in srgb, var(--bg-card) 85%, transparent);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 6px;
+      backdrop-filter: blur(4px);
+      flex-wrap: wrap;
+      max-width: calc(100% - 24px);
+      z-index: 5;
+    }
+    .graph-legend-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .graph-stats {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      font-size: 10px;
+      color: var(--text-faint);
+      background: color-mix(in srgb, var(--bg-card) 85%, transparent);
+      border: 1px solid var(--border);
+      padding: 4px 8px;
+      border-radius: 6px;
+      backdrop-filter: blur(4px);
+      z-index: 5;
+    }
+    .graph-tip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--bg-elev);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11px;
+      color: var(--text);
+      max-width: 280px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      z-index: 20;
+      opacity: 0;
+      transition: opacity 80ms;
+    }
+    .graph-tip.show { opacity: 1; }
+    .graph-tip .tip-folder {
+      font-size: 10px;
+      color: var(--text-faint);
+      margin-top: 2px;
+    }
+
+    /* SVG nodes / links / labels */
+    .g-node {
+      cursor: pointer;
+      stroke: var(--bg);
+      stroke-width: 1.2px;
+      transition: opacity 120ms;
+    }
+    .g-node.dim { opacity: 0.18; }
+    .g-link {
+      stroke: var(--border-strong);
+      stroke-opacity: 0.45;
+      transition: stroke-opacity 120ms;
+    }
+    .g-link.dim { stroke-opacity: 0.06; }
+    .g-link.hl { stroke: var(--cyan); stroke-opacity: 0.85; }
+    .g-label {
+      font-family: inherit;
+      font-size: 10px;
+      fill: var(--text-dim);
+      pointer-events: none;
+      user-select: none;
+      paint-order: stroke;
+      stroke: var(--bg);
+      stroke-width: 3px;
+      stroke-linejoin: round;
+    }
+    .g-label.hidden { display: none; }
+    .g-label.hl { fill: var(--cyan); }
+
+    /* ── Top entities grid (4 columnas: person/location/org/event) ─── */
+    .ents-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+    @media (max-width: 1100px) {
+      .ents-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 600px) {
+      .ents-grid { grid-template-columns: 1fr; }
+    }
+    .ents-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .ents-col h3 {
+      font-size: 12px;
+      font-weight: 600;
+      margin: 0 0 10px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .ents-col h3 .count {
+      font-size: 10px;
+      color: var(--text-faint);
+      font-weight: 400;
+    }
+    .ents-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .ent-row {
+      display: grid;
+      grid-template-columns: 1fr 56px 32px;
+      gap: 8px;
+      align-items: center;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .ent-row:hover { background: var(--hover); }
+    .ent-row.active { background: color-mix(in srgb, var(--cyan) 14%, var(--bg-elev)); }
+    .ent-name {
+      font-size: 12px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ent-spark {
+      width: 56px;
+      height: 18px;
+    }
+    .ent-count {
+      font-size: 11px;
+      color: var(--text-faint);
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    /* ── Hot vs Stale grid ──────────────────────────────────────────── */
+    .hs-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 800px) {
+      .hs-grid { grid-template-columns: 1fr; }
+    }
+    .hs-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .hs-card h3 {
+      font-size: 12px;
+      font-weight: 600;
+      margin: 0 0 4px;
+      color: var(--text);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .hs-card p.muted {
+      font-size: 11px;
+      color: var(--text-faint);
+      margin: 0 0 12px;
+    }
+    .hs-card.hot h3 { color: var(--orange); }
+    .hs-card.stale h3 { color: var(--text-dim); }
+    .hs-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .hs-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      padding: 4px 0;
+      border-top: 1px dashed var(--sep);
+    }
+    .hs-row:first-child { border-top: none; }
+    .hs-name {
+      font-size: 12px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .hs-name .type-pill {
+      font-size: 9px;
+      color: var(--text-faint);
+      margin-left: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .hs-meta {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .hs-meta.up { color: var(--green); }
+    .hs-meta.down { color: var(--red); }
+
+    /* ── Co-ocurrencias ─────────────────────────────────────────────── */
+    .cooc-list {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 6px 16px;
+    }
+    @media (max-width: 800px) {
+      .cooc-list { grid-template-columns: 1fr; }
+    }
+    .cooc-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 48px;
+      gap: 8px;
+      align-items: center;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .cooc-row:hover { background: var(--hover); }
+    .cooc-side {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cooc-side.left { color: var(--text); }
+    .cooc-side.right { color: var(--text); text-align: right; }
+    .cooc-count {
+      font-size: 11px;
+      color: var(--cyan);
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .cooc-bar {
+      grid-column: 1 / -1;
+      height: 2px;
+      background: var(--sep);
+      border-radius: 1px;
+      position: relative;
+    }
+    .cooc-bar > span {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      background: color-mix(in srgb, var(--cyan) 60%, transparent);
+      border-radius: 1px;
+    }
+
+    /* ── Type pills (color por tipo de entidad) ─────────────────────── */
+    .type-pill {
+      display: inline-block;
+      font-size: 9px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    /* ── Loading + skeleton ─────────────────────────────────────────── */
+    .skip-link {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: var(--cyan);
+      color: var(--bg);
+      padding: 8px 14px;
+      border-radius: 0 0 8px 0;
+      font-weight: 700;
+      font-size: 13px;
+      text-decoration: none;
+      z-index: 9999;
+      transform: translateY(-110%);
+      transition: transform 120ms ease-out;
+    }
+    .skip-link:focus, .skip-link:focus-visible {
+      transform: translateY(0);
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    main:focus, main:focus-visible { outline: none; }
+
+    .loading {
+      text-align: center;
+      padding: 60px 0;
+      color: var(--text-dim);
+    }
+    .empty {
+      text-align: center;
+      padding: 24px 0;
+      color: var(--text-faint);
+      font-size: 12px;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <a href="#content" class="skip-link">Saltar al contenido</a>
+
+  <header class="hdr">
+    <div class="hdr-l">
+      <a href="/" class="brand">rag</a>
+      <span class="sep">·</span>
+      <span class="title">atlas</span>
+    </div>
+    <div class="hdr-r">
+      <span class="meta-period" id="meta-period"></span>
+      <span class="meta-period" id="meta-updated"></span>
+      <!-- Selector de ventana — define `window_days` para sparkline + hot/stale -->
+      <div class="seg" role="tablist" aria-label="Ventana de tiempo">
+        <button class="seg-btn" type="button" data-days="7" role="tab">7d</button>
+        <button class="seg-btn active" type="button" data-days="30" role="tab" aria-selected="true">30d</button>
+        <button class="seg-btn" type="button" data-days="90" role="tab">90d</button>
+        <button class="seg-btn" type="button" data-days="180" role="tab">6m</button>
+      </div>
+      <button id="theme-toggle" class="btn-icon" type="button"
+              aria-label="Alternar tema claro/oscuro">
+        <span id="theme-icon" aria-hidden="true"></span>
+      </button>
+      <nav class="hdr-nav" aria-label="Navegación principal">
+        <a href="/dashboard">dashboard</a>
+        <a href="/finance">finance</a>
+        <a href="/learning">learning</a>
+        <a href="/status">status</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="content" tabindex="-1">
+    <!-- ── KPI HERO ──────────────────────────────────────────────── -->
+    <section class="kpi-hero" aria-label="Indicadores del atlas">
+      <div class="kpi" id="kpi-entities" title="Total de entidades canónicas detectadas en el vault">
+        <span class="kpi-label">Entidades</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-sub">personas + lugares + orgs + eventos</span>
+      </div>
+      <div class="kpi" id="kpi-mentions" title="Veces que el sistema vio una entidad mencionada en algún chunk">
+        <span class="kpi-label">Menciones</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-sub">total a través del vault</span>
+      </div>
+      <div class="kpi" id="kpi-notes" title="Notas indexadas del vault activo">
+        <span class="kpi-label">Notas</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-sub">en el grafo</span>
+      </div>
+      <div class="kpi" id="kpi-edges" title="Wikilinks resueltos entre notas — undirected">
+        <span class="kpi-label">Conexiones</span>
+        <span class="kpi-value">—</span>
+        <span class="kpi-sub">wikilinks entre notas</span>
+      </div>
+    </section>
+
+    <!-- ── 1. GRAFO DE NOTAS (estilo Obsidian) ───────────────────── -->
+    <section class="learn-section" id="sec-graph" aria-labelledby="h-graph">
+      <header class="learn-section-hdr">
+        <h2 id="h-graph" title="Force-directed graph igual al graph view de Obsidian">Mapa de conexiones entre notas</h2>
+        <p class="muted">Cada círculo es una nota; las líneas son wikilinks <code>[[...]]</code>. Tamaño = cantidad de conexiones. Color = carpeta. Click en una nota para resaltar sus vecinos.</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-graph" data-collapse="body-graph">−</button>
+      </header>
+      <div class="learn-section-body" id="body-graph">
+        <div class="graph-card" id="graph-card">
+          <div class="graph-stats" id="graph-stats">cargando…</div>
+          <div class="graph-controls">
+            <button class="btn-icon" id="graph-zoom-in" type="button" title="Acercar">+</button>
+            <button class="btn-icon" id="graph-zoom-out" type="button" title="Alejar">−</button>
+            <button class="btn-icon" id="graph-reset" type="button" title="Recentrar">⟲</button>
+            <button class="btn-icon" id="graph-toggle-labels" type="button" title="Mostrar/ocultar etiquetas">aA</button>
+          </div>
+          <svg id="graph-svg" role="img" aria-label="Graph view: notas como círculos, wikilinks como líneas"></svg>
+          <div class="graph-tip" id="graph-tip" role="tooltip"></div>
+          <div class="graph-legend" id="graph-legend"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 2. TOP ENTIDADES (4 cols: person / location / org / event) ── -->
+    <section class="learn-section" id="sec-entities" aria-labelledby="h-entities">
+      <header class="learn-section-hdr">
+        <h2 id="h-entities" title="Top entidades por menciones totales, agrupadas por tipo">Quién y qué aparece más en tus notas</h2>
+        <p class="muted">Top 50 por tipo. La línea es la frecuencia diaria en la ventana seleccionada arriba.</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-entities" data-collapse="body-entities">−</button>
+      </header>
+      <div class="learn-section-body" id="body-entities">
+        <div class="ents-grid">
+          <div class="ents-col" data-type="person">
+            <h3>Personas <span class="count" id="cnt-person">—</span></h3>
+            <ul class="ents-list" id="list-person"><li class="empty">cargando…</li></ul>
+          </div>
+          <div class="ents-col" data-type="location">
+            <h3>Lugares <span class="count" id="cnt-location">—</span></h3>
+            <ul class="ents-list" id="list-location"><li class="empty">cargando…</li></ul>
+          </div>
+          <div class="ents-col" data-type="organization">
+            <h3>Organizaciones <span class="count" id="cnt-organization">—</span></h3>
+            <ul class="ents-list" id="list-organization"><li class="empty">cargando…</li></ul>
+          </div>
+          <div class="ents-col" data-type="event">
+            <h3>Eventos <span class="count" id="cnt-event">—</span></h3>
+            <ul class="ents-list" id="list-event"><li class="empty">cargando…</li></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 3. HOT vs STALE ──────────────────────────────────────── -->
+    <section class="learn-section" id="sec-hotstale" aria-labelledby="h-hotstale">
+      <header class="learn-section-hdr">
+        <h2 id="h-hotstale" title="Lo que está calentando vs lo que perdiste de vista">Lo que sube y lo que se enfría</h2>
+        <p class="muted">Hot = más menciones en la ventana actual vs la previa. Stale = entidad importante históricamente, sin menciones recientes.</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-hotstale" data-collapse="body-hotstale">−</button>
+      </header>
+      <div class="learn-section-body" id="body-hotstale">
+        <div class="hs-grid">
+          <div class="hs-card hot">
+            <h3>🔥 Hot (creciendo)</h3>
+            <p class="muted">Entidades con más menciones en la ventana actual que en la previa.</p>
+            <ul class="hs-list" id="list-hot"><li class="empty">cargando…</li></ul>
+          </div>
+          <div class="hs-card stale">
+            <h3>💤 Stale (sin contacto)</h3>
+            <p class="muted">Importantes alguna vez (≥30 menciones) pero sin aparecer en la ventana actual.</p>
+            <ul class="hs-list" id="list-stale"><li class="empty">cargando…</li></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 4. CO-OCURRENCIAS ─────────────────────────────────────── -->
+    <section class="learn-section" id="sec-cooc" aria-labelledby="h-cooc">
+      <header class="learn-section-hdr">
+        <h2 id="h-cooc" title="Pares de entidades que aparecen juntas en el mismo chunk">Quién va con quién</h2>
+        <p class="muted">Top 30 pares de entidades que aparecen juntas en el mismo chunk. Útil para descubrir patrones.</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-cooc" data-collapse="body-cooc">−</button>
+      </header>
+      <div class="learn-section-body" id="body-cooc">
+        <div class="cooc-list" id="cooc-list">
+          <div class="empty">cargando…</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <span id="atlas-status" class="sr-only" role="status" aria-live="polite">Cargando datos del atlas</span>
+
+  <script src="/static/atlas.js" defer></script>
+</body>
+</html>

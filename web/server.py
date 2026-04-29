@@ -12600,6 +12600,56 @@ def finance_api(months: int = 12, window_days: int = 30) -> dict:
     return payload
 
 
+# ── /atlas — dashboard del atlas semántico del vault ────────────────────────
+# Combina dos fuentes ya capturadas en disco que hasta hoy no tenían vista
+# web dedicada:
+#   1) Entidades del vault (rag_entities + rag_entity_mentions) — top
+#      personas/lugares/orgs/eventos con sparkline de menciones, hot/stale,
+#      co-ocurrencias.
+#   2) Wikilinks entre notas (meta_*.outlinks) — graph view estilo Obsidian
+#      (force-directed) que muestra cómo están conectadas tus notas.
+#
+# Performance budget: cold ~200-500ms, warm <5ms. TTL 60s.
+_ATLAS_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "key": None}
+_ATLAS_DASH_LOCK = threading.Lock()
+_ATLAS_DASH_TTL = 60.0
+
+
+@app.get("/atlas")
+def atlas_page() -> FileResponse:
+    """HTML del atlas semántico. Hidrata via /api/atlas."""
+    return FileResponse(STATIC_DIR / "atlas.html")
+
+
+@app.get("/api/atlas")
+def atlas_api(window_days: int = 30, top_entities: int = 50, graph_top_notes: int = 250) -> dict:
+    """Snapshot del atlas semántico — entities + graph de notas. TTL 60s.
+
+    Cache key incluye los 3 parámetros para que distintas vistas (ej.
+    window 7d vs 30d, top 20 vs 50) cacheen por separado.
+    """
+    window_days = max(7, min(int(window_days or 30), 365))
+    top_entities = max(5, min(int(top_entities or 50), 200))
+    graph_top_notes = max(50, min(int(graph_top_notes or 250), 2000))
+    key = (window_days, top_entities, graph_top_notes)
+    now_ts = time.time()
+    with _ATLAS_DASH_LOCK:
+        hit = _ATLAS_DASH_CACHE
+        if hit["key"] == key and hit["payload"] and now_ts - hit["ts"] < _ATLAS_DASH_TTL:
+            return hit["payload"]
+    from web.atlas_dashboard import snapshot
+    payload = snapshot(
+        window_days=window_days,
+        top_entities=top_entities,
+        graph_top_notes=graph_top_notes,
+    )
+    with _ATLAS_DASH_LOCK:
+        _ATLAS_DASH_CACHE["ts"] = now_ts
+        _ATLAS_DASH_CACHE["key"] = key
+        _ATLAS_DASH_CACHE["payload"] = payload
+    return payload
+
+
 # ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
 # Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
 # de las transcripciones de audio, correcciones acumuladas, y top vocab terms

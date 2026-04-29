@@ -14997,6 +14997,34 @@ _LOG_RE_ERROR_QUEUE_META = re.compile(
     r"\[error-queue (scanner|worker)\]\s+"
     r"(enqueued |processing error id=|done id=)",
 )
+# Cloudflared reconnection / DNS / update-check noise. Per usuario:
+# "Los errores típicos del tunnel `com.fer.obsidian-rag-cloudflare-tunnel`
+# son ruido normal y se auto-recuperan. NO accionar a menos que la
+# verificación falle." (memoria mem-vault `pattern_cloudflared_quic_
+# reconnection_noise_es_self_healing_no_a`).
+#
+# Estos patrones cubren TODOS los ERR del cloudflared.error.log que son
+# transient network blips durante boot del Mac o reconnection cycles
+# normales. NO son crashes del tunnel; el daemon se recupera solo en
+# segundos. Demoteo a "info" para que no contaminen el sidebar de /logs.
+#
+# Si en algún futuro cloudflared empezara a tirar OTROS errores que sí
+# son reales (ej. `tunnel credentials invalid`, `port already in use`,
+# etc.), esos patrones NO matchean acá y siguen clasificados como
+# "error" → aparecen en el sidebar y disparan la atención.
+_LOG_RE_CLOUDFLARED_NOISE = re.compile(
+    r"(Failed to dial a quic connection"
+    r"|failed to accept incoming stream requests"
+    r"|failed to run the datagram handler"
+    r"|failed to serve tunnel connection"
+    r"|Serve tunnel error"
+    r"|Failed to refresh feature selector"
+    r"|Failed to refresh DNS local resolver"
+    r"|accept stream listener encountered a failure"
+    r"|update check failed"
+    r")",
+    re.IGNORECASE,
+)
 
 # Patrones de timestamp que aparecen en los logs del stack. En orden de
 # prioridad — el primer match gana. Soportamos:
@@ -15071,6 +15099,11 @@ def _classify_log_line(line: str) -> str:
     # "finalize failed" como error (esos sí son fallas reales del subsistema).
     if _LOG_RE_ERROR_QUEUE_META.search(line):
         return "info"
+    # Cloudflared QUIC / DNS reconnection noise — known transient,
+    # self-healing. Per memoria del user. Demoteo a "info" para que
+    # no contamine el sidebar.
+    if _LOG_RE_CLOUDFLARED_NOISE.search(line):
+        return "info"
     if _LOG_RE_ERROR.search(line):
         return "error"
     if _LOG_RE_WARN.search(line):
@@ -15130,6 +15163,37 @@ def _read_tail_lines(path: Path, max_lines: int, max_bytes: int = 4 * 1024 * 102
         return []
 
 
+def _line_is_recent(line: str, cutoff_unix_ts: float) -> bool:
+    """¿La línea tiene un ts >= cutoff? Si no tiene ts parseable, devuelve
+    True por default (el caller decide skip o no via _has_recent_timestamp
+    a nivel archivo). Tracebacks de Python no tienen ts → asumimos que
+    son contextuales a la línea anterior y se cuentan."""
+    ts_iso = _extract_log_ts(line)
+    if not ts_iso:
+        return True
+    try:
+        line_ts = datetime.fromisoformat(ts_iso).timestamp()
+        return line_ts >= cutoff_unix_ts
+    except Exception:
+        return True
+
+
+def _has_recent_timestamp(lines: list[str], cutoff_unix_ts: float) -> bool:
+    """¿Hay AL MENOS UNA línea con ts >= cutoff? Si no, todo este chunk
+    es viejo (daemon stale) y se puede skipear entero."""
+    for ln in lines:
+        ts_iso = _extract_log_ts(ln)
+        if not ts_iso:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_iso).timestamp()
+            if ts >= cutoff_unix_ts:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _classify_file_status(error_log_path: Path, recent_lines: list[str]) -> tuple[str, int]:
     """Decidir el status agregado de un service: 'ok' | 'warn' | 'error'.
 
@@ -15138,22 +15202,43 @@ def _classify_file_status(error_log_path: Path, recent_lines: list[str]) -> tupl
     - warn si las últimas N líneas tienen pattern de warn.
     - ok en otro caso.
 
+    Time-awareness (added 2026-04-29): el classifier ANTES contaba como
+    error CADA línea de las últimas 200 que matcheara el regex,
+    independientemente de cuándo ocurrió. Resultado: daemons que
+    crashearon hace 2 días y nunca se reiniciaron seguían apareciendo
+    en rojo en /logs eternamente, porque su `.error.log` tenía 200
+    líneas de tracebacks viejos en el tail. La gate del mtime del
+    archivo (`age_s < 86400`) ayudaba algo pero NO si yo había tocado
+    el archivo después (truncate, mv, etc.) — el mtime se refrescaba.
+    Y para `.log` (stdout) no había gate de tiempo en absoluto.
+
+    Fix: PER-LINE timestamp filter via `_line_is_recent`. Si la línea
+    tiene un ts parseable (ISO `YYYY-MM-DD HH:MM:SS` con T o espacio)
+    Y ese ts es > 24h vieja, skip. Líneas sin ts (tracebacks de Python)
+    se cuentan igual — confían en el contexto del file.
+
+    Para evitar el caso "daemon stale acumuló tracebacks sin ts":
+    además del filtro por línea, sumamos un EARLY-OUT vía
+    `_has_recent_timestamp`: si NO encontramos ningún ts fresco en las
+    últimas N líneas, skip el archivo entero (asumimos que toda esta
+    basura es vieja).
+
     Devuelve (status, error_count_recent).
     """
     error_count = 0
     has_warn = False
-    # Inspeccionar .error.log: si existe, tiene size > 0 y mtime
-    # reciente, contar líneas con pattern.
+    cutoff_ts = time.time() - _LOG_RECENT_ERROR_WINDOW_S  # 24h ago
+    # Inspeccionar .error.log: si existe y tiene size > 0, contar líneas
+    # con pattern — pero filtradas por ts (early-out si nada fresco).
     if error_log_path.is_file():
         try:
             stat = error_log_path.stat()
             if stat.st_size > 0:
-                age_s = time.time() - stat.st_mtime
-                if age_s < _LOG_RECENT_ERROR_WINDOW_S:
-                    # Leer las últimas 200 líneas del error log y
-                    # contar las que matchean error.
-                    err_lines = _read_tail_lines(error_log_path, 200)
+                err_lines = _read_tail_lines(error_log_path, 200)
+                if _has_recent_timestamp(err_lines, cutoff_ts):
                     for ln in err_lines:
+                        if not _line_is_recent(ln, cutoff_ts):
+                            continue
                         lvl = _classify_log_line(ln)
                         if lvl == "error":
                             error_count += 1
@@ -15162,13 +15247,16 @@ def _classify_file_status(error_log_path: Path, recent_lines: list[str]) -> tupl
         except Exception:
             pass
     # También revisar las recent lines del stdout — algunos daemons
-    # imprimen tracebacks ahí en vez de stderr.
-    for ln in recent_lines:
-        lvl = _classify_log_line(ln)
-        if lvl == "error":
-            error_count += 1
-        elif lvl == "warn":
-            has_warn = True
+    # imprimen tracebacks ahí en vez de stderr. Mismo time-filter.
+    if _has_recent_timestamp(recent_lines, cutoff_ts):
+        for ln in recent_lines:
+            if not _line_is_recent(ln, cutoff_ts):
+                continue
+            lvl = _classify_log_line(ln)
+            if lvl == "error":
+                error_count += 1
+            elif lvl == "warn":
+                has_warn = True
     if error_count > 0:
         return ("error", error_count)
     if has_warn:

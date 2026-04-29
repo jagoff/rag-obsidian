@@ -817,54 +817,92 @@
       }
     }
 
-    /* ── Finance-specific tweaks ──────────────────────────────────── */
+    /* ── Finance-specific styling ────────────────────────────────────
+       Upgrade visual: sparklines en KPIs, credit-card con look real,
+       gradients en charts, avatares en transferencias, animaciones de
+       entrada escalonadas. */
 
+    /* KPI hero: número grande + sparkline mini al pie. */
+    .kpi-hero .kpi {
+      position: relative; overflow: hidden;
+    }
     .kpi-hero .kpi-value { font-variant-numeric: tabular-nums; }
+    .kpi-spark {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 36px;
+      pointer-events: none;
+      opacity: 0.55;
+    }
+    .kpi-spark canvas { width: 100% !important; height: 100% !important; }
+    /* Cuando hay sparkline, reservar espacio abajo para que no tape el delta */
+    .kpi-hero .kpi.has-spark { padding-bottom: 38px; }
 
+    /* Lista de categorías / destinatarios con barra. */
     .cat-list {
-      display: flex; flex-direction: column; gap: 8px;
+      display: flex; flex-direction: column; gap: 10px;
       padding: 0; margin: 0; list-style: none;
     }
     .cat-row {
       display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 4px 12px; align-items: center;
+      grid-template-columns: 22px 1fr auto;
+      gap: 4px 10px; align-items: center;
       font-size: 12px;
     }
+    .cat-row-swatch {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--cyan);
+      grid-row: 1; grid-column: 1;
+      justify-self: center;
+    }
     .cat-row-name {
-      color: var(--text);
+      color: var(--text); grid-row: 1; grid-column: 2;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    .cat-row-amount { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .cat-row-amount {
+      color: var(--text-dim); grid-row: 1; grid-column: 3;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+    }
     .cat-row-bar {
-      grid-column: 1 / -1; height: 4px;
-      background: var(--grid); border-radius: 2px; overflow: hidden;
+      grid-column: 1 / -1;
+      height: 4px;
+      background: var(--grid); border-radius: 999px; overflow: hidden;
     }
     .cat-row-bar-fill {
-      height: 100%; background: var(--cyan); border-radius: 2px;
+      height: 100%; background: var(--cyan);
+      border-radius: 999px;
+      transition: width 600ms cubic-bezier(.2,.8,.2,1);
     }
-    .cat-row-bar-fill.green  { background: var(--green); }
-    .cat-row-bar-fill.yellow { background: var(--yellow); }
-    .cat-row-bar-fill.red    { background: var(--red); }
-    .cat-row-bar-fill.purple { background: var(--purple); }
-    .cat-row-bar-fill.orange { background: var(--orange); }
-    .cat-row-bar-fill.pink   { background: var(--pink); }
+    .cat-row-bar-fill.green  { background: linear-gradient(90deg, var(--green), color-mix(in oklab, var(--green) 60%, var(--cyan))); }
+    .cat-row-bar-fill.yellow { background: linear-gradient(90deg, var(--yellow), color-mix(in oklab, var(--yellow) 70%, var(--orange))); }
+    .cat-row-bar-fill.red    { background: linear-gradient(90deg, var(--red), color-mix(in oklab, var(--red) 70%, var(--pink))); }
+    .cat-row-bar-fill.purple { background: linear-gradient(90deg, var(--purple), color-mix(in oklab, var(--purple) 60%, var(--cyan))); }
+    .cat-row-bar-fill.orange { background: linear-gradient(90deg, var(--orange), color-mix(in oklab, var(--orange) 60%, var(--yellow))); }
+    .cat-row-bar-fill.pink   { background: linear-gradient(90deg, var(--pink), color-mix(in oklab, var(--pink) 70%, var(--purple))); }
+    .cat-row-bar-fill        { background: linear-gradient(90deg, var(--cyan), color-mix(in oklab, var(--cyan) 60%, var(--purple))); }
 
+    /* Tabla de movimientos. */
     .tx-table {
       width: 100%; border-collapse: collapse;
       font-size: 12px; font-variant-numeric: tabular-nums;
     }
     .tx-table thead th {
       text-align: left; color: var(--text-faint); font-weight: 500;
-      padding: 6px 8px; border-bottom: 1px solid var(--border);
+      padding: 9px 12px; border-bottom: 1px solid var(--border);
       position: sticky; top: 0; background: var(--bg-card);
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
     }
     .tx-table tbody td {
-      padding: 6px 8px; border-bottom: 1px solid var(--sep); color: var(--text);
+      padding: 9px 12px; border-bottom: 1px solid var(--sep); color: var(--text);
+    }
+    .tx-table tbody tr {
+      transition: background 120ms ease;
     }
     .tx-table tbody tr:hover { background: var(--hover); }
+    .tx-table tbody tr:nth-child(even) { background: color-mix(in oklab, var(--bg-card) 92%, var(--bg-elev) 8%); }
+    .tx-table tbody tr:nth-child(even):hover { background: var(--hover); }
     .tx-table .tx-amount {
-      text-align: right; font-variant-numeric: tabular-nums;
+      text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap;
     }
     .tx-table .tx-amount.expense { color: var(--red); }
     .tx-table .tx-amount.income  { color: var(--green); }
@@ -872,61 +910,266 @@
     .tx-table .tx-store { color: var(--text-dim); }
     .tx-scroll {
       max-height: 480px; overflow-y: auto;
-      border: 1px solid var(--border); border-radius: 6px;
+      border: 1px solid var(--border); border-radius: 10px;
       background: var(--bg-card);
     }
+    /* Pill para la categoría en la tabla */
+    .tx-cat-pill {
+      display: inline-block;
+      padding: 1px 8px; border-radius: 999px;
+      font-size: 10px; font-weight: 500;
+      background: color-mix(in oklab, var(--cyan) 18%, transparent);
+      color: color-mix(in oklab, var(--cyan) 75%, var(--text) 25%);
+      letter-spacing: 0.02em;
+    }
+    .tx-cat-pill.c-0 { background: color-mix(in oklab, var(--cyan)   18%, transparent); color: color-mix(in oklab, var(--cyan)   80%, var(--text) 20%); }
+    .tx-cat-pill.c-1 { background: color-mix(in oklab, var(--green)  18%, transparent); color: color-mix(in oklab, var(--green)  80%, var(--text) 20%); }
+    .tx-cat-pill.c-2 { background: color-mix(in oklab, var(--yellow) 18%, transparent); color: color-mix(in oklab, var(--yellow) 80%, var(--text) 20%); }
+    .tx-cat-pill.c-3 { background: color-mix(in oklab, var(--red)    18%, transparent); color: color-mix(in oklab, var(--red)    80%, var(--text) 20%); }
+    .tx-cat-pill.c-4 { background: color-mix(in oklab, var(--purple) 18%, transparent); color: color-mix(in oklab, var(--purple) 80%, var(--text) 20%); }
+    .tx-cat-pill.c-5 { background: color-mix(in oklab, var(--orange) 18%, transparent); color: color-mix(in oklab, var(--orange) 80%, var(--text) 20%); }
+    .tx-cat-pill.c-6 { background: color-mix(in oklab, var(--pink)   18%, transparent); color: color-mix(in oklab, var(--pink)   80%, var(--text) 20%); }
 
-    .credit-card {
-      display: flex; flex-direction: column; gap: 12px;
-      padding: 16px; background: var(--bg-card);
-      border: 1px solid var(--border); border-radius: 10px;
+    /* ── Credit card ─────────────────────────────────────────────────
+       Card visual con gradient + brand + numeración tipo tarjeta real.
+       Mantiene un layout flex con la tarjeta a la izquierda y el detalle
+       de movimientos a la derecha (en mobile colapsa a stack). */
+    .credit-card-wrap {
+      display: grid;
+      grid-template-columns: minmax(260px, 360px) 1fr;
+      gap: 20px;
+      align-items: start;
     }
-    .credit-card-hdr {
-      display: flex; justify-content: space-between;
-      align-items: baseline; gap: 12px; flex-wrap: wrap;
+    @media (max-width: 760px) {
+      .credit-card-wrap { grid-template-columns: 1fr; }
     }
-    .credit-card-brand { font-size: 14px; font-weight: 600; color: var(--text); }
-    .credit-card-brand .last4 { color: var(--text-dim); font-weight: 400; margin-left: 6px; }
-    .credit-card-totals { display: flex; gap: 16px; flex-wrap: wrap; }
-    .credit-card-total { display: flex; flex-direction: column; gap: 2px; }
-    .credit-card-total-label {
+    .credit-card-visual {
+      position: relative;
+      aspect-ratio: 1.586 / 1;  /* ISO 7810 ID-1 ratio */
+      border-radius: 16px;
+      padding: 22px;
+      color: #f5f5fb;
+      background:
+        radial-gradient(ellipse 80% 60% at 0% 0%, color-mix(in oklab, var(--cyan) 60%, #2a1860 40%), transparent 60%),
+        radial-gradient(ellipse 100% 80% at 100% 100%, color-mix(in oklab, var(--purple) 70%, #11122a 30%), transparent 60%),
+        linear-gradient(135deg, #1a1a4d 0%, #2a1860 50%, #4a1860 100%);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,0.08) inset,
+        0 -1px 0 rgba(0,0,0,0.25) inset,
+        0 12px 30px -8px rgba(0,0,0,0.55);
+      overflow: hidden;
+      isolation: isolate;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .credit-card-visual::before {
+      content: ""; position: absolute; inset: 0;
+      background:
+        radial-gradient(circle at 85% 25%, rgba(255,255,255,0.08) 0%, transparent 28%),
+        radial-gradient(circle at 15% 85%, rgba(255,255,255,0.05) 0%, transparent 30%);
+      pointer-events: none;
+    }
+    .credit-card-visual::after {
+      content: ""; position: absolute;
+      width: 110px; height: 110px; border-radius: 50%;
+      right: -28px; bottom: -28px;
+      background: radial-gradient(circle, rgba(255,255,255,0.10), transparent 70%);
+      pointer-events: none;
+    }
+    .cc-top {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 12px; position: relative; z-index: 1;
+    }
+    .cc-bank {
+      font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
+      opacity: 0.85; font-weight: 500;
+    }
+    .cc-chip {
+      width: 36px; height: 26px; border-radius: 5px;
+      background:
+        linear-gradient(135deg, #f6d77c 0%, #c79a3a 50%, #a3782a 100%);
+      box-shadow:
+        0 1px 0 rgba(255,255,255,0.4) inset,
+        0 -1px 0 rgba(0,0,0,0.25) inset,
+        0 1px 3px rgba(0,0,0,0.3);
+      position: relative;
+    }
+    .cc-chip::before {
+      content: ""; position: absolute; inset: 4px;
+      border: 1px solid rgba(0,0,0,0.18);
+      border-radius: 3px;
+    }
+    .cc-chip::after {
+      content: ""; position: absolute;
+      left: 50%; top: 4px; bottom: 4px;
+      width: 1px; background: rgba(0,0,0,0.18);
+    }
+    .cc-number {
+      font-family: "SF Mono","Menlo","Monaco","JetBrains Mono",ui-monospace,monospace;
+      font-size: 18px; letter-spacing: 0.18em;
+      font-variant-numeric: tabular-nums;
+      position: relative; z-index: 1;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    }
+    .cc-bottom {
+      display: flex; justify-content: space-between; align-items: flex-end;
+      gap: 12px; position: relative; z-index: 1;
+    }
+    .cc-holder {
+      font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+      font-weight: 500;
+    }
+    .cc-holder small {
+      display: block;
+      font-size: 9px; opacity: 0.65; letter-spacing: 0.18em; margin-bottom: 2px;
+      text-transform: uppercase; font-weight: 400;
+    }
+    .cc-brand {
+      font-family: "Helvetica Neue", "Arial", sans-serif;
+      font-style: italic; font-weight: 700;
+      font-size: 22px; letter-spacing: 0.04em;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    }
+    .cc-totals {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+      margin-top: 12px;
+    }
+    .cc-total {
+      padding: 10px 12px;
+      background: color-mix(in oklab, var(--bg-card) 80%, var(--cyan) 6%);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .cc-total-label {
       font-size: 10px; color: var(--text-faint);
-      text-transform: uppercase; letter-spacing: 0.05em;
+      text-transform: uppercase; letter-spacing: 0.06em;
     }
-    .credit-card-total-value {
-      font-size: 16px; font-weight: 600; color: var(--text);
+    .cc-total-value {
+      font-size: 18px; font-weight: 600; color: var(--text);
       font-variant-numeric: tabular-nums;
     }
-    .credit-card-dates {
-      display: flex; gap: 16px; flex-wrap: wrap;
-      font-size: 12px; color: var(--text-dim);
+    .cc-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px 16px;
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--text-dim);
     }
-    .credit-card-date strong { color: var(--text); }
+    .cc-meta-row { display: flex; flex-direction: column; gap: 2px; }
+    .cc-meta-label {
+      font-size: 9px; color: var(--text-faint);
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .cc-meta-value { color: var(--text); font-variant-numeric: tabular-nums; }
+    .cc-detail {
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .cc-detail-title {
+      font-size: 12px; color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
 
+    /* ── Transfer feed (avatar + recipient + amount) ───────────────── */
+    .transfer-list { display: flex; flex-direction: column; gap: 0; }
     .transfer-row {
       display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 8px 12px; padding: 8px 0;
+      grid-template-columns: 32px auto 1fr auto;
+      gap: 4px 12px; padding: 10px 0;
       border-bottom: 1px solid var(--sep);
       font-size: 12px; align-items: center;
     }
     .transfer-row:last-child { border-bottom: none; }
-    .transfer-date { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .transfer-recipient { color: var(--text); }
+    .transfer-avatar {
+      grid-row: 1 / span 2;
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 600; color: #fff;
+      letter-spacing: 0.03em;
+      background: var(--cyan);
+      flex-shrink: 0;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.06) inset;
+    }
+    .transfer-recipient {
+      color: var(--text); font-weight: 500;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
     .transfer-amount {
       color: var(--red); font-variant-numeric: tabular-nums;
-      text-align: right; white-space: nowrap;
+      text-align: right; white-space: nowrap; font-weight: 500;
+    }
+    .transfer-meta {
+      grid-column: 2 / 4;
+      color: var(--text-faint);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
     }
 
+    /* ── Empty states con ilustración SVG simple ───────────────────── */
     .empty-state {
-      padding: 32px; text-align: center; color: var(--text-dim);
+      padding: 32px 16px; text-align: center; color: var(--text-dim);
       background: var(--bg-card); border: 1px dashed var(--border-strong);
-      border-radius: 10px;
+      border-radius: 12px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
     }
-    .empty-state h3 { color: var(--text); margin-bottom: 8px; }
+    .empty-state svg {
+      width: 36px; height: 36px;
+      color: var(--text-faint); opacity: 0.6;
+    }
+    .empty-state h3 { color: var(--text); margin: 0; font-size: 14px; }
+    .empty-state p { margin: 0; font-size: 12px; line-height: 1.5; max-width: 360px; }
     .empty-state code {
       background: var(--bg-elev); padding: 2px 6px;
       border-radius: 4px; font-size: 11px;
+    }
+
+    /* ── Donut center label (total amount) ─────────────────────────── */
+    .donut-wrap { position: relative; }
+    .donut-center {
+      position: absolute;
+      inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      pointer-events: none;
+      text-align: center;
+    }
+    .donut-center-label {
+      font-size: 10px; color: var(--text-faint);
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .donut-center-value {
+      font-size: 18px; font-weight: 600; color: var(--text);
+      font-variant-numeric: tabular-nums;
+      margin-top: 2px;
+    }
+    .donut-center-sub {
+      font-size: 11px; color: var(--text-dim); margin-top: 2px;
+    }
+
+    /* ── Animaciones de entrada (stagger) ──────────────────────────── */
+    @media (prefers-reduced-motion: no-preference) {
+      .kpi-hero .kpi,
+      .learn-section,
+      .credit-card-visual {
+        opacity: 0; transform: translateY(8px);
+        animation: fadeUp 480ms cubic-bezier(.2,.8,.2,1) forwards;
+      }
+      .kpi-hero .kpi:nth-child(1) { animation-delay: 0ms; }
+      .kpi-hero .kpi:nth-child(2) { animation-delay: 60ms; }
+      .kpi-hero .kpi:nth-child(3) { animation-delay: 120ms; }
+      .kpi-hero .kpi:nth-child(4) { animation-delay: 180ms; }
+      .kpi-hero .kpi:nth-child(5) { animation-delay: 240ms; }
+      .kpi-hero .kpi:nth-child(6) { animation-delay: 300ms; }
+      .learn-section:nth-of-type(1) { animation-delay: 360ms; }
+      .learn-section:nth-of-type(2) { animation-delay: 420ms; }
+      .learn-section:nth-of-type(3) { animation-delay: 480ms; }
+      .learn-section:nth-of-type(4) { animation-delay: 540ms; }
+      .learn-section:nth-of-type(5) { animation-delay: 600ms; }
+      .learn-section:nth-of-type(n+6) { animation-delay: 660ms; }
+    }
+    @keyframes fadeUp {
+      to { opacity: 1; transform: translateY(0); }
     }
   </style>
 </head>

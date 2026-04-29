@@ -378,12 +378,67 @@ def _ym(d: str) -> str:
     return d[:7] if len(d) >= 7 else d
 
 
+def _kpi_sparks(txs: list[dict], now: datetime, n_months: int = 6) -> dict:
+    """Serie mensual de los últimos N meses por KPI, alimenta el sparkline
+    del frontend. Cada serie es de `n_months` puntos (rellenando con 0
+    los meses sin data) terminando en el mes actual.
+
+    Devuelve dict con keys ``expenses_ars, expenses_usd, income_ars,
+    balance_ars, txs_count``. Cada value es una lista de N floats.
+    """
+    # Generar labels de los últimos N meses terminando en `now`.
+    cur_y, cur_m = now.year, now.month
+    labels: list[str] = []
+    for _ in range(n_months):
+        labels.append(f"{cur_y:04d}-{cur_m:02d}")
+        cur_m -= 1
+        if cur_m == 0:
+            cur_m = 12
+            cur_y -= 1
+    labels.reverse()
+    label_set = set(labels)
+    expenses_ars = {lab: 0.0 for lab in labels}
+    expenses_usd = {lab: 0.0 for lab in labels}
+    income_ars = {lab: 0.0 for lab in labels}
+    income_usd = {lab: 0.0 for lab in labels}
+    txs_count = {lab: 0 for lab in labels}
+    for t in txs:
+        ym = _ym(t["date"])
+        if ym not in label_set:
+            continue
+        cb = t["currency_bucket"]
+        if t["type"] == "expense":
+            txs_count[ym] += 1
+            if cb == "ARS":
+                expenses_ars[ym] += abs(t["amount"])
+            elif cb == "USD":
+                expenses_usd[ym] += abs(t["amount"])
+        elif t["type"] == "income":
+            txs_count[ym] += 1
+            if cb == "ARS":
+                income_ars[ym] += abs(t["amount"])
+            elif cb == "USD":
+                income_usd[ym] += abs(t["amount"])
+    balance_ars_series = [income_ars[lab] - expenses_ars[lab] for lab in labels]
+    return {
+        "labels": labels,
+        "expenses_ars": [expenses_ars[lab] for lab in labels],
+        "expenses_usd": [expenses_usd[lab] for lab in labels],
+        "income_ars": [income_ars[lab] for lab in labels],
+        "income_usd": [income_usd[lab] for lab in labels],
+        "balance_ars": balance_ars_series,
+        "txs_count": [float(txs_count[lab]) for lab in labels],
+    }
+
+
 def _kpis(txs: list[dict], now: datetime) -> dict:
     """Calcula los KPI hero del dashboard: gastos del mes actual, gastos
     del mes previo, ingresos del mes, balance neto, # transacciones, top
     categoría. Cada KPI viene con `value`, `delta_pct` (vs mes previo
     cuando aplica), `n_samples`, e `insufficient` para que el frontend
-    pinte el badge "datos insuf." sin lógica.
+    pinte el badge "datos insuf." sin lógica. Adicional: cada KPI trae
+    `spark` (serie de los últimos 6 meses) para que el frontend pinte un
+    sparkline mini bajo el valor.
     """
     this_ym = now.strftime("%Y-%m")
     prev_anchor = (now.replace(day=1) - timedelta(days=1))
@@ -438,22 +493,33 @@ def _kpis(txs: list[dict], now: datetime) -> dict:
     usd_this = expenses_this["USD"]
     usd_prev = expenses_prev["USD"]
 
+    sparks = _kpi_sparks(txs, now, n_months=6)
+
+    expenses_ars = _kpi(ars_this, _delta(ars_this, ars_prev), n_this)
+    expenses_ars["spark"] = sparks["expenses_ars"]
+    expenses_usd = _kpi(usd_this, _delta(usd_this, usd_prev), n_this)
+    expenses_usd["spark"] = sparks["expenses_usd"]
+    income_ars = _kpi(income_this["ARS"], _delta(income_this["ARS"], income_prev["ARS"]), n_this)
+    income_ars["spark"] = sparks["income_ars"]
+    balance_ars = _kpi(income_this["ARS"] - ars_this, None, n_this)
+    balance_ars["spark"] = sparks["balance_ars"]
+    txs_count_kpi = _kpi(float(n_this), _delta(float(n_this), float(n_prev)) if n_prev else None, n_this)
+    txs_count_kpi["spark"] = sparks["txs_count"]
+
     return {
-        "expenses_ars": _kpi(ars_this, _delta(ars_this, ars_prev), n_this),
-        "expenses_usd": _kpi(usd_this, _delta(usd_this, usd_prev), n_this),
-        "income_ars": _kpi(income_this["ARS"], _delta(income_this["ARS"], income_prev["ARS"]), n_this),
-        "balance_ars": _kpi(
-            income_this["ARS"] - ars_this,
-            None,
-            n_this,
-        ),
-        "txs_count": _kpi(float(n_this), _delta(float(n_this), float(n_prev)) if n_prev else None, n_this),
+        "expenses_ars": expenses_ars,
+        "expenses_usd": expenses_usd,
+        "income_ars": income_ars,
+        "balance_ars": balance_ars,
+        "txs_count": txs_count_kpi,
         "top_category": {
             "value": top_cat_amount,
             "name": top_cat_name,
             "n_samples": n_this,
             "insufficient": n_this == 0,
+            "spark": [float(by_cat_this.get(top_cat_name, 0))],  # placeholder, no es time-serie
         },
+        "spark_labels": sparks["labels"],
     }
 
 
@@ -633,8 +699,14 @@ def _recent_transactions(txs: list[dict], n: int = 50) -> list[dict]:
     return out
 
 
-def _transfers_summary(transfers: list[dict]) -> dict:
-    """Resumen de transferencias bancarias (PDF). Por mes + top destinatarios."""
+def _transfers_summary(transfers: list[dict], now: datetime, months: int = 12) -> dict:
+    """Resumen de transferencias bancarias (PDF). Por mes + top destinatarios.
+
+    El `by_month` siempre devuelve los últimos `months` meses (rellenando
+    con 0 los que no tienen PDF) — así el bar chart del frontend no se ve
+    "vacío" cuando solo hay 1 PDF. Si en el futuro el user agrega PDFs de
+    meses anteriores, las barras correspondientes aparecen automáticas.
+    """
     if not transfers:
         return {"by_month": {"labels": [], "amounts": []}, "by_recipient": [], "total": 0.0, "count": 0}
     by_month: dict[str, float] = defaultdict(float)
@@ -647,9 +719,19 @@ def _transfers_summary(transfers: list[dict]) -> dict:
         by_rec[t["recipient"]] += t["amount"]
         rec_count[t["recipient"]] += 1
         total += t["amount"]
-    labels = sorted(by_month.keys())
+    # Generar labels secuenciales de los últimos N meses terminando en `now`,
+    # rellenando los meses sin PDF con 0.
+    cur_y, cur_m = now.year, now.month
+    labels: list[str] = []
+    for _ in range(months):
+        labels.append(f"{cur_y:04d}-{cur_m:02d}")
+        cur_m -= 1
+        if cur_m == 0:
+            cur_m = 12
+            cur_y -= 1
+    labels.reverse()
     return {
-        "by_month": {"labels": labels, "amounts": [by_month[k] for k in labels]},
+        "by_month": {"labels": labels, "amounts": [by_month.get(k, 0.0) for k in labels]},
         "by_recipient": [
             {"name": name, "amount": amount, "count": rec_count[name]}
             for name, amount in by_rec.most_common(20)
@@ -733,7 +815,7 @@ def snapshot(finance_dir: Path | None = None, now: datetime | None = None, month
         "top_stores_usd": _top_stores(transactions, window_days, now, "USD"),
         "by_account": _by_account(transactions),
         "recent": _recent_transactions(transactions, n=50),
-        "transfers": _transfers_summary(transfers),
+        "transfers": _transfers_summary(transfers, now, months=months),
         "transfers_recent": transfers[:50],
         "cards": cards,
     }
@@ -761,12 +843,13 @@ def _empty_payload(now: datetime, reason: str, finance_dir: str) -> dict:
             "n_cards": 0,
         },
         "kpis": {
-            "expenses_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True},
-            "expenses_usd": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True},
-            "income_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True},
-            "balance_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True},
-            "txs_count": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True},
-            "top_category": {"value": 0, "name": "—", "n_samples": 0, "insufficient": True},
+            "expenses_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},
+            "expenses_usd": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},
+            "income_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},
+            "balance_ars": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},
+            "txs_count": {"value": 0, "delta_pct": None, "n_samples": 0, "insufficient": True, "spark": []},
+            "top_category": {"value": 0, "name": "—", "n_samples": 0, "insufficient": True, "spark": []},
+            "spark_labels": [],
         },
         "by_month": {"labels": [], "expenses_ars": [], "expenses_usd": [], "income_ars": [], "income_usd": []},
         "by_category_ars": {"items": [], "subcategories": {}, "currency": "ARS", "window_days": 30},

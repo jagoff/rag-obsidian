@@ -1,22 +1,18 @@
 /* obsidian-rag finance dashboard — Chart.js 4 + vanilla JS.
  *
- * Hermano de dashboard.js / learning.js pero specialized en finanzas
- * personales. Lee `/api/finance?months=12&window_days=30` y pinta:
+ * Visual upgrade (v2):
+ *   - Sparklines en cada KPI hero (mini line chart con últimos 6 meses).
+ *   - Credit card con look de tarjeta física (gradient + chip + brand).
+ *   - Line charts con gradient fill + smooth curves + dots solo en hover.
+ *   - Donut con label central (total + label).
+ *   - Top stores con bars rounded + datalabels custom.
+ *   - Avatares circulares con iniciales por destinatario, color por hash.
+ *   - Empty states con SVG simple.
+ *   - Animaciones de entrada controladas por CSS (respeta prefers-reduced-motion).
  *
- *   - 6 KPIs hero (gastos ARS / USD, ingresos, balance, # transacciones,
- *     top categoría)
- *   - Sección "Ingresos vs gastos por mes" — 2 line charts (ARS, USD)
- *   - Sección "Categorías" — 2 donuts (ARS, USD) + listas con barra
- *   - Sección "Top comercios" — 2 bar charts horizontales
- *   - Sección "Por cuenta" — tabla
- *   - Sección "Tarjeta de crédito" — card con detalle del último resumen
- *   - Sección "Transferencias bancarias" — bars + lista de top destinatarios
- *   - Sección "Movimientos recientes" — tabla scrolleable (50 últimas)
- *
- * Patrón calcado de learning.js: readTokens() / applyChartDefaults() para
- * que Chart.js respete las CSS variables, polling cada 60s con backoff
- * cuando hidden, theme toggle re-aplica defaults + redraws, selector de
- * ventana destruye charts + re-fetcha.
+ * Patrón core idéntico a learning.js: readTokens, applyChartDefaults,
+ * polling con backoff cuando hidden, theme toggle re-aplica colors,
+ * selector de ventana destruye charts y re-fetcha.
  */
 
 "use strict";
@@ -47,12 +43,9 @@ function readTokens() {
 }
 readTokens();
 
-// Paleta indexable para datasets sin color asignado.
 function paletteSeries() {
   return [C.cyan, C.green, C.yellow, C.red, C.purple, C.orange, C.pink];
 }
-
-// Nombres de la paleta para clases CSS (.cat-row-bar-fill.green, etc.).
 const PALETTE_CLASSES = ["", "green", "yellow", "red", "purple", "orange", "pink"];
 
 function applyChartDefaults() {
@@ -71,8 +64,11 @@ function applyChartDefaults() {
   Chart.defaults.plugins.tooltip.titleFont = { size: 11 };
   Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
   Chart.defaults.plugins.tooltip.padding = 10;
+  Chart.defaults.plugins.tooltip.cornerRadius = 6;
+  Chart.defaults.plugins.tooltip.displayColors = false;
   Chart.defaults.scale.grid = { color: C.grid };
-  Chart.defaults.animation.duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 350;
+  Chart.defaults.animation.duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 600;
+  Chart.defaults.animation.easing = "easeOutQuart";
 }
 
 // ── State ────────────────────────────────────────────────────────────────
@@ -110,7 +106,6 @@ const el = {
   collapseButtons: Array.from(document.querySelectorAll(".collapse-btn")),
 };
 
-// SVG icons sun/moon — mismo viewBox que dashboard.js / learning.js.
 const SUN_SVG  = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/><path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M6.34 17.66l-1.41 1.41"/><path d="M19.07 4.93l-1.41 1.41"/></svg>';
 const MOON_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
 
@@ -128,7 +123,6 @@ function setTheme(next) {
   if (el.themeToggle) el.themeToggle.setAttribute("aria-label", next === "light" ? "Cambiar a tema oscuro" : "Cambiar a tema claro");
   readTokens();
   applyChartDefaults();
-  // Re-render todo: las paletas de los donuts dependen de tokens.
   if (state.data) renderAll(state.data);
 }
 
@@ -225,6 +219,14 @@ function fmtMoneyARS(v) {
   return "$" + Math.abs(Number(v)).toLocaleString("es-AR", { maximumFractionDigits: 0 });
 }
 
+function fmtMoneyARSCompact(v) {
+  if (v == null || isNaN(v)) return "—";
+  const abs = Math.abs(Number(v));
+  if (abs >= 1_000_000) return "$" + (abs / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (abs >= 1_000) return "$" + (abs / 1_000).toFixed(1).replace(/\.0$/, "") + "k";
+  return "$" + abs.toFixed(0);
+}
+
 function fmtMoneyARSSigned(v) {
   if (v == null || isNaN(v)) return "—";
   const abs = Math.abs(Number(v)).toLocaleString("es-AR", { maximumFractionDigits: 0 });
@@ -256,6 +258,15 @@ function fmtMonth(ym) {
   return `${months[m - 1] || "?"} '${y}`;
 }
 
+function fmtDateShort(iso) {
+  if (!iso) return "—";
+  const months = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+  const parts = iso.split("-");
+  if (parts.length !== 3) return iso;
+  const m = parseInt(parts[1], 10);
+  return `${parts[2]} ${months[m - 1] || "?"}`;
+}
+
 function alpha(color, a) {
   if (!color) return `rgba(127,127,127,${a})`;
   const c = color.trim();
@@ -274,6 +285,23 @@ function alpha(color, a) {
     return `rgba(${parts[0]},${parts[1]},${parts[2]},${a})`;
   }
   return c;
+}
+
+// Vertical gradient (top color → bottom transparent) — used for area fills.
+function verticalGradient(ctx, color, height) {
+  const g = ctx.createLinearGradient(0, 0, 0, height || 240);
+  g.addColorStop(0, alpha(color, 0.42));
+  g.addColorStop(0.5, alpha(color, 0.16));
+  g.addColorStop(1, alpha(color, 0.0));
+  return g;
+}
+
+// Horizontal gradient (left light → right strong) — used for bar fills.
+function horizontalGradient(ctx, colorA, colorB, width) {
+  const g = ctx.createLinearGradient(0, 0, width || 600, 0);
+  g.addColorStop(0, alpha(colorA, 0.55));
+  g.addColorStop(1, alpha(colorB, 0.95));
+  return g;
 }
 
 function destroyChart(id) {
@@ -302,19 +330,75 @@ function createChart(canvasId, config) {
   }
 }
 
-// ── KPI rendering ────────────────────────────────────────────────────────
+// ── Sparklines ───────────────────────────────────────────────────────────
 //
-// Cada KPI tiene 3 spans en el HTML: .kpi-value, .kpi-delta, .kpi-badge.
-// Payload: {value, delta_pct, n_samples, insufficient}. Para "Top categoría"
-// hay un campo extra `name` que reemplaza el value formato moneda con el
-// nombre de la categoría.
+// Cada KPI hero tiene un canvas inyectado con la serie de los últimos
+// 6 meses. Sin axes, sin grid, sin dots — solo la curva con gradient.
+
+function ensureSparkCanvas(kpiNode, id) {
+  let wrap = kpiNode.querySelector(".kpi-spark");
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.className = "kpi-spark";
+    const cv = document.createElement("canvas");
+    cv.id = id;
+    cv.setAttribute("aria-hidden", "true");
+    wrap.appendChild(cv);
+    kpiNode.appendChild(wrap);
+    kpiNode.classList.add("has-spark");
+  }
+  return wrap.querySelector("canvas");
+}
+
+function renderSparkline(canvasId, series, colorMode = "neutral") {
+  if (!series || !series.length) {
+    destroyChart(canvasId);
+    return;
+  }
+  // colorMode: "neutral" (cyan), "expense" (red), "income" (green),
+  // "balance" (red if last<0 else green)
+  let color = C.cyan;
+  if (colorMode === "expense") color = C.red;
+  else if (colorMode === "income") color = C.green;
+  else if (colorMode === "balance") color = (series[series.length - 1] < 0) ? C.red : C.green;
+  else if (colorMode === "neutral") color = C.cyan;
+
+  const labels = series.map((_, i) => String(i));
+  createChart(canvasId, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        data: series,
+        borderColor: color,
+        backgroundColor: (ctx) => verticalGradient(ctx.chart.ctx, color, ctx.chart.height || 36),
+        fill: true,
+        borderWidth: 1.6,
+        pointRadius: 0,
+        tension: 0.4,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false, beginAtZero: false },
+      },
+      elements: { line: { capBezierPoints: true } },
+    },
+  });
+}
+
+// ── KPI rendering ────────────────────────────────────────────────────────
 const KPI_MAP = [
-  { id: "kpi-expenses-ars",  key: "expenses_ars",  fmt: "ars",  higherIsBetter: false },
-  { id: "kpi-expenses-usd",  key: "expenses_usd",  fmt: "usd",  higherIsBetter: false },
-  { id: "kpi-income-ars",    key: "income_ars",    fmt: "ars",  higherIsBetter: true  },
-  { id: "kpi-balance-ars",   key: "balance_ars",   fmt: "ars_signed", higherIsBetter: true },
-  { id: "kpi-txs-count",     key: "txs_count",     fmt: "int",  higherIsBetter: null  },
-  { id: "kpi-top-category",  key: "top_category",  fmt: "category_name", higherIsBetter: null },
+  { id: "kpi-expenses-ars",  key: "expenses_ars",  fmt: "ars",  higherIsBetter: false, sparkColor: "expense" },
+  { id: "kpi-expenses-usd",  key: "expenses_usd",  fmt: "usd",  higherIsBetter: false, sparkColor: "expense" },
+  { id: "kpi-income-ars",    key: "income_ars",    fmt: "ars",  higherIsBetter: true,  sparkColor: "income"  },
+  { id: "kpi-balance-ars",   key: "balance_ars",   fmt: "ars_signed", higherIsBetter: true, sparkColor: "balance" },
+  { id: "kpi-txs-count",     key: "txs_count",     fmt: "int",  higherIsBetter: null,  sparkColor: "neutral" },
+  { id: "kpi-top-category",  key: "top_category",  fmt: "category_name", higherIsBetter: null, sparkColor: null },
 ];
 
 function renderKPIs(kpis) {
@@ -340,11 +424,9 @@ function renderKPIs(kpis) {
     }
     if (valEl) {
       valEl.textContent = valTxt;
-      // Para "Top categoría", el subtítulo va con el monto debajo del nombre.
-      if (cfg.fmt === "category_name") {
-        valEl.style.fontSize = "16px";
-      }
+      if (cfg.fmt === "category_name") valEl.style.fontSize = "16px";
     }
+
     if (data.insufficient === true) {
       node.classList.add("insufficient");
       if (dEl) {
@@ -369,10 +451,17 @@ function renderKPIs(kpis) {
         }
       }
     }
+
+    // Sparkline (solo si hay serie y colorMode definido)
+    if (cfg.sparkColor && Array.isArray(data.spark) && data.spark.length > 1) {
+      const sparkId = `spark-${cfg.id}`;
+      ensureSparkCanvas(node, sparkId);
+      renderSparkline(sparkId, data.spark, cfg.sparkColor);
+    }
   });
 }
 
-// ── Render: ingresos vs gastos por mes ───────────────────────────────────
+// ── Render: ingresos vs gastos por mes (line con gradient fill) ───────
 function renderByMonth(byMonth) {
   if (!byMonth || !byMonth.labels || !byMonth.labels.length) {
     destroyChart("chart-by-month-ars");
@@ -380,6 +469,27 @@ function renderByMonth(byMonth) {
     return;
   }
   const labels = byMonth.labels.map(fmtMonth);
+
+  // Si toda la serie de un currency es 0, mostrar empty state en su card.
+  const renderEmptyOrChart = (canvasId, incomeData, expenseData, currency) => {
+    const sum = (incomeData || []).reduce((s, x) => s + Math.abs(x), 0)
+              + (expenseData || []).reduce((s, x) => s + Math.abs(x), 0);
+    const wrap = document.getElementById(canvasId)?.closest(".chart-wrap");
+    if (sum === 0) {
+      destroyChart(canvasId);
+      if (wrap && !wrap.querySelector(".empty-state")) {
+        wrap.classList.add("is-empty");
+        wrap.innerHTML = emptyStateSVG(`Sin movimientos en ${currency} en los últimos 12 meses.`);
+      }
+      return;
+    }
+    if (wrap && wrap.classList.contains("is-empty")) {
+      wrap.classList.remove("is-empty");
+      wrap.innerHTML = `<canvas id="${canvasId}" aria-label="Líneas: ingresos y gastos en ${currency} por mes"></canvas>`;
+    }
+    createChart(canvasId, mkConfig(incomeData, expenseData, currency));
+  };
+
   const mkConfig = (incomeData, expenseData, currency) => ({
     type: "line",
     data: {
@@ -389,21 +499,29 @@ function renderByMonth(byMonth) {
           label: `Ingresos ${currency}`,
           data: incomeData,
           borderColor: C.green,
-          backgroundColor: alpha(C.green, 0.18),
-          tension: 0.3,
+          backgroundColor: (ctx) => verticalGradient(ctx.chart.ctx, C.green, ctx.chart.height),
+          tension: 0.4,
           fill: true,
-          pointRadius: 3,
-          pointBackgroundColor: C.green,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHoverBackgroundColor: C.green,
+          pointHoverBorderColor: C.bg,
+          pointHoverBorderWidth: 2,
+          borderWidth: 2,
         },
         {
           label: `Gastos ${currency}`,
           data: expenseData,
           borderColor: C.red,
-          backgroundColor: alpha(C.red, 0.15),
-          tension: 0.3,
+          backgroundColor: (ctx) => verticalGradient(ctx.chart.ctx, C.red, ctx.chart.height),
+          tension: 0.4,
           fill: true,
-          pointRadius: 3,
-          pointBackgroundColor: C.red,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHoverBackgroundColor: C.red,
+          pointHoverBorderColor: C.bg,
+          pointHoverBorderWidth: 2,
+          borderWidth: 2,
         },
       ],
     },
@@ -412,39 +530,67 @@ function renderByMonth(byMonth) {
       maintainAspectRatio: false,
       interaction: { mode: "index", intersect: false },
       scales: {
+        x: { grid: { display: false } },
         y: {
           beginAtZero: true,
-          ticks: {
-            callback: (v) => currency === "ARS" ? fmtMoneyARS(v) : fmtMoneyUSD(v),
-          },
+          border: { display: false },
+          ticks: { callback: (v) => currency === "ARS" ? fmtMoneyARSCompact(v) : fmtMoneyUSD(v) },
         },
       },
       plugins: {
-        legend: { position: "top", align: "end" },
+        legend: { position: "top", align: "end", labels: { boxHeight: 8, usePointStyle: true, pointStyle: "circle" } },
         tooltip: {
+          displayColors: true,
           callbacks: {
+            title: (ctx) => ctx[0].label,
             label: (ctx) => {
               const v = ctx.parsed.y;
-              return `${ctx.dataset.label}: ${currency === "ARS" ? fmtMoneyARS(v) : fmtMoneyUSD(v)}`;
+              return ` ${ctx.dataset.label}: ${currency === "ARS" ? fmtMoneyARS(v) : fmtMoneyUSD(v)}`;
             },
           },
         },
       },
     },
   });
-  createChart("chart-by-month-ars", mkConfig(byMonth.income_ars, byMonth.expenses_ars, "ARS"));
-  createChart("chart-by-month-usd", mkConfig(byMonth.income_usd, byMonth.expenses_usd, "USD"));
+  renderEmptyOrChart("chart-by-month-ars", byMonth.income_ars, byMonth.expenses_ars, "ARS");
+  renderEmptyOrChart("chart-by-month-usd", byMonth.income_usd, byMonth.expenses_usd, "USD");
 }
 
-// ── Render: categorías (donut + lista con barra) ─────────────────────────
+// ── Render: categorías (donut con label central + lista con barras) ─────
+function emptyStateSVG(text) {
+  return `<div class="empty-state">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9"/>
+      <path d="M12 7v5"/><path d="M12 16h.01"/>
+    </svg>
+    <h3>Sin gastos en la ventana</h3>
+    <p>${text}</p>
+  </div>`;
+}
+
 function renderCategoryDonut(canvasId, listId, payload, currency) {
+  const list = document.getElementById(listId);
+  const wrap = document.getElementById(canvasId)?.closest(".chart-wrap");
   if (!payload || !payload.items || !payload.items.length) {
     destroyChart(canvasId);
-    const list = document.getElementById(listId);
-    if (list) list.innerHTML = `<li class="cat-row"><span class="cat-row-name muted">Sin gastos en la ventana</span></li>`;
+    if (wrap) {
+      wrap.classList.add("is-empty");
+      // Replace canvas with empty state once
+      if (!wrap.querySelector(".empty-state")) {
+        wrap.innerHTML = emptyStateSVG(`No hay gastos en ${currency} dentro de la ventana seleccionada.`);
+      }
+    }
+    if (list) list.innerHTML = "";
     return;
   }
-  const items = payload.items.slice(0, 8);  // top 8 + agrupados
+
+  // Canvas debe existir (re-recrearlo si el empty state lo borró antes).
+  if (wrap && wrap.classList.contains("is-empty")) {
+    wrap.classList.remove("is-empty");
+    wrap.innerHTML = `<canvas id="${canvasId}" aria-label="Donut: gastos por categoría"></canvas>`;
+  }
+
+  const items = payload.items.slice(0, 8);
   const rest = payload.items.slice(8);
   const restSum = rest.reduce((s, x) => s + x.amount, 0);
   if (restSum > 0) items.push({ name: `Otros (${rest.length})`, amount: restSum });
@@ -452,32 +598,50 @@ function renderCategoryDonut(canvasId, listId, payload, currency) {
   const colors = items.map((_, i) => palette[i % palette.length]);
   const total = items.reduce((s, x) => s + x.amount, 0) || 1;
 
+  // Wrap para center label.
+  if (wrap) wrap.classList.add("donut-wrap");
+  let center = wrap?.querySelector(".donut-center");
+  if (wrap && !center) {
+    center = document.createElement("div");
+    center.className = "donut-center";
+    wrap.appendChild(center);
+  }
+  if (center) {
+    const fmt = currency === "ARS" ? fmtMoneyARSCompact : fmtMoneyUSD;
+    center.innerHTML = `
+      <div class="donut-center-label">Total ${currency}</div>
+      <div class="donut-center-value">${fmt(total)}</div>
+      <div class="donut-center-sub">${items.length - (restSum > 0 ? 1 : 0)} categor${(items.length - (restSum > 0 ? 1 : 0)) === 1 ? "ía" : "ías"}</div>
+    `;
+  }
+
   createChart(canvasId, {
     type: "doughnut",
     data: {
       labels: items.map((it) => it.name),
-      datasets: [
-        {
-          data: items.map((it) => it.amount),
-          backgroundColor: colors,
-          borderColor: C.bg,
-          borderWidth: 2,
-          hoverOffset: 8,
-        },
-      ],
+      datasets: [{
+        data: items.map((it) => it.amount),
+        backgroundColor: colors,
+        borderColor: C.bg,
+        borderWidth: 3,
+        hoverOffset: 10,
+        hoverBorderColor: C.bg,
+      }],
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      cutout: "60%",
+      cutout: "68%",
+      layout: { padding: 6 },
       plugins: {
         legend: { display: false },
         tooltip: {
+          displayColors: true,
           callbacks: {
             label: (ctx) => {
               const fmt = currency === "ARS" ? fmtMoneyARS : fmtMoneyUSD;
               const pct = ((ctx.parsed / total) * 100).toFixed(1);
-              return `${ctx.label}: ${fmt(ctx.parsed)} · ${pct}%`;
+              return ` ${ctx.label}: ${fmt(ctx.parsed)} · ${pct}%`;
             },
           },
         },
@@ -485,8 +649,7 @@ function renderCategoryDonut(canvasId, listId, payload, currency) {
     },
   });
 
-  // Lista con barras.
-  const list = document.getElementById(listId);
+  // Lista con barras + swatch del color.
   if (list) {
     list.innerHTML = "";
     const fmt = currency === "ARS" ? fmtMoneyARS : fmtMoneyUSD;
@@ -494,9 +657,11 @@ function renderCategoryDonut(canvasId, listId, payload, currency) {
       const li = document.createElement("li");
       li.className = "cat-row";
       const pct = (it.amount / total) * 100;
-      const barCls = PALETTE_CLASSES[i % palette.length];
+      const colorIdx = i % palette.length;
+      const barCls = PALETTE_CLASSES[colorIdx];
       li.innerHTML = `
-        <span class="cat-row-name" title="${it.name}">${escapeHtml(it.name)}</span>
+        <span class="cat-row-swatch" style="background: ${colors[i]}"></span>
+        <span class="cat-row-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>
         <span class="cat-row-amount">${fmt(it.amount)} · ${pct.toFixed(1)}%</span>
         <span class="cat-row-bar"><span class="cat-row-bar-fill ${barCls}" style="width: ${pct}%"></span></span>
       `;
@@ -505,44 +670,95 @@ function renderCategoryDonut(canvasId, listId, payload, currency) {
   }
 }
 
-// ── Render: top stores (bar horizontal) ──────────────────────────────────
+// ── Render: top stores (bar horizontal con datalabels) ───────────────────
 function renderTopStores(canvasId, payload, currency) {
+  const wrap = document.getElementById(canvasId)?.closest(".chart-wrap");
   if (!payload || !payload.items || !payload.items.length) {
     destroyChart(canvasId);
+    if (wrap && !wrap.querySelector(".empty-state")) {
+      wrap.classList.add("is-empty");
+      wrap.innerHTML = emptyStateSVG(`No hay gastos en ${currency} dentro de la ventana seleccionada.`);
+    }
     return;
   }
-  const items = payload.items.slice().reverse();  // chart.js bar horizontal: orden invertido
+  if (wrap && wrap.classList.contains("is-empty")) {
+    wrap.classList.remove("is-empty");
+    wrap.innerHTML = `<canvas id="${canvasId}" aria-label="Barras: top comercios"></canvas>`;
+  }
+
+  const items = payload.items.slice().reverse();
   const fmt = currency === "ARS" ? fmtMoneyARS : fmtMoneyUSD;
+
+  // Plugin custom para pintar el monto al final de cada barra.
+  const dataLabelsPlugin = {
+    id: "barEndLabel",
+    afterDatasetDraw(chart, args) {
+      const { ctx, scales: { y, x }, data } = chart;
+      const ds = data.datasets[args.index];
+      ctx.save();
+      ctx.fillStyle = C.text;
+      ctx.font = "11px 'SF Mono', Menlo, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ds.data.forEach((v, i) => {
+        const yC = y.getPixelForValue(i);
+        const xC = x.getPixelForValue(v);
+        const txt = currency === "ARS" ? fmtMoneyARSCompact(v) : fmtMoneyUSD(v);
+        const w = ctx.measureText(txt).width;
+        // Si la barra es muy corta, dibujar el texto afuera (a la derecha);
+        // sino, adentro (a la izquierda del extremo, en blanco).
+        if (xC + w + 8 < x.getPixelForValue(x.max)) {
+          ctx.fillStyle = C.text;
+          ctx.fillText(txt, xC + 6, yC);
+        } else {
+          ctx.fillStyle = "#fff";
+          ctx.fillText(txt, xC - w - 6, yC);
+        }
+      });
+      ctx.restore();
+    },
+  };
+
   createChart(canvasId, {
     type: "bar",
     data: {
       labels: items.map((it) => it.name),
-      datasets: [
-        {
-          label: `Gasto ${currency}`,
-          data: items.map((it) => it.amount),
-          backgroundColor: alpha(C.cyan, 0.7),
-          borderColor: C.cyan,
-          borderWidth: 1,
+      datasets: [{
+        label: `Gasto ${currency}`,
+        data: items.map((it) => it.amount),
+        backgroundColor: (ctx) => {
+          const chart = ctx.chart;
+          if (!chart.chartArea) return C.cyan;
+          return horizontalGradient(chart.ctx, C.cyan, C.purple, chart.width);
         },
-      ],
+        borderColor: alpha(C.cyan, 0.7),
+        borderWidth: 0,
+        borderRadius: 6,
+        borderSkipped: false,
+        barThickness: 16,
+        maxBarThickness: 18,
+      }],
     },
     options: {
       indexAxis: "y",
       responsive: true,
       maintainAspectRatio: false,
+      layout: { padding: { right: 60 } },
       scales: {
         x: {
           beginAtZero: true,
-          ticks: { callback: (v) => fmt(v) },
+          border: { display: false },
+          grid: { color: C.grid },
+          ticks: { callback: (v) => fmt(v), display: true },
         },
         y: {
+          border: { display: false },
+          grid: { display: false },
           ticks: {
             autoSkip: false,
             callback: function (val) {
-              // Truncamos labels largos para que no rompan el layout.
               const lab = this.getLabelForValue(val);
-              return lab && lab.length > 28 ? lab.slice(0, 27) + "…" : lab;
+              return lab && lab.length > 26 ? lab.slice(0, 25) + "…" : lab;
             },
           },
         },
@@ -550,6 +766,7 @@ function renderTopStores(canvasId, payload, currency) {
       plugins: {
         legend: { display: false },
         tooltip: {
+          displayColors: false,
           callbacks: {
             title: (ctx) => ctx[0].label,
             label: (ctx) => {
@@ -560,6 +777,7 @@ function renderTopStores(canvasId, payload, currency) {
         },
       },
     },
+    plugins: [dataLabelsPlugin],
   });
 }
 
@@ -587,47 +805,100 @@ function renderByAccount(payload) {
   });
 }
 
-// ── Render: tarjetas de crédito ──────────────────────────────────────────
+// ── Render: tarjetas de crédito (visual real) ────────────────────────────
 function renderCards(cards) {
   const container = document.getElementById("cards-container");
   if (!container) return;
   container.innerHTML = "";
   if (!cards || !cards.length) {
     container.innerHTML = `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2" y="6" width="20" height="14" rx="2"/>
+        <path d="M2 11h20"/>
+      </svg>
       <h3>Sin resúmenes de tarjeta</h3>
-      <p>Cuando aparezca un <code>Último resumen - &lt;Marca&gt; &lt;NNNN&gt;.xlsx</code> en la carpeta <code>Finances/</code>, se mostrará acá.</p>
+      <p>Cuando aparezca un <code>Último resumen - &lt;Marca&gt; &lt;NNNN&gt;.xlsx</code> en la carpeta <code>Finances/</code>, se mostrará acá con todos los consumos del ciclo.</p>
     </div>`;
     return;
   }
+
   cards.forEach((card) => {
-    const el = document.createElement("div");
-    el.className = "credit-card";
-    const purchasesAR = (card.all_purchases_ars || []);
-    const purchasesUSD = (card.all_purchases_usd || []);
-    const totalRowsAR = purchasesAR.length;
-    const totalRowsUSD = purchasesUSD.length;
-    el.innerHTML = `
-      <div class="credit-card-hdr">
-        <div class="credit-card-brand">${escapeHtml(card.brand || "Tarjeta")}<span class="last4">·· ${escapeHtml(card.last4 || "")}</span></div>
-        <div class="credit-card-totals">
-          <div class="credit-card-total">
-            <span class="credit-card-total-label">Total ARS</span>
-            <span class="credit-card-total-value">${fmtMoneyARS(card.total_ars)}</span>
-          </div>
-          <div class="credit-card-total">
-            <span class="credit-card-total-label">Total USD</span>
-            <span class="credit-card-total-value">${fmtMoneyUSD(card.total_usd)}</span>
-          </div>
+    const wrap = document.createElement("div");
+    wrap.className = "credit-card-wrap";
+
+    // Visual de la tarjeta (gradient + chip + brand).
+    const visual = document.createElement("div");
+    visual.className = "credit-card-visual";
+    const last4 = card.last4 || "0000";
+    const brand = (card.brand || "Card").toUpperCase();
+    const holder = (card.holder || "Titular").toUpperCase();
+    visual.innerHTML = `
+      <div class="cc-top">
+        <div>
+          <div class="cc-bank">obsidian-rag</div>
+          <div class="cc-bank" style="opacity: 0.55; font-size: 10px;">resumen del ciclo</div>
+        </div>
+        <div class="cc-chip" aria-hidden="true"></div>
+      </div>
+      <div class="cc-number" aria-label="Número de tarjeta enmascarado">
+        ••••&nbsp;&nbsp;••••&nbsp;&nbsp;••••&nbsp;&nbsp;${escapeHtml(last4)}
+      </div>
+      <div class="cc-bottom">
+        <div class="cc-holder">
+          <small>Titular</small>
+          ${escapeHtml(holder)}
+        </div>
+        <div class="cc-brand">${escapeHtml(brand)}</div>
+      </div>
+    `;
+    wrap.appendChild(visual);
+
+    // Detalle al lado (totales, fechas, lista).
+    const detail = document.createElement("div");
+    detail.className = "cc-detail";
+
+    const totalsHtml = `
+      <div class="cc-totals">
+        <div class="cc-total">
+          <span class="cc-total-label">Total ARS</span>
+          <span class="cc-total-value">${fmtMoneyARS(card.total_ars)}</span>
+        </div>
+        <div class="cc-total">
+          <span class="cc-total-label">Total USD</span>
+          <span class="cc-total-value">${fmtMoneyUSD(card.total_usd)}</span>
         </div>
       </div>
-      <div class="credit-card-dates">
-        <span class="credit-card-date">Cierre: <strong>${escapeHtml(card.closing_date || "—")}</strong></span>
-        <span class="credit-card-date">Vencimiento: <strong>${escapeHtml(card.due_date || "—")}</strong></span>
-        ${card.next_closing_date ? `<span class="credit-card-date">Próx cierre: <strong>${escapeHtml(card.next_closing_date)}</strong></span>` : ""}
-        ${card.next_due_date ? `<span class="credit-card-date">Próx venc.: <strong>${escapeHtml(card.next_due_date)}</strong></span>` : ""}
-        ${card.holder ? `<span class="credit-card-date">Titular: <strong>${escapeHtml(card.holder)}</strong></span>` : ""}
+      <div class="cc-meta">
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Cierre</span>
+          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.closing_date))}</span>
+        </div>
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Vencimiento</span>
+          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.due_date))}</span>
+        </div>
+        ${card.next_closing_date ? `
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Próximo cierre</span>
+          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.next_closing_date))}</span>
+        </div>` : ""}
+        ${card.next_due_date ? `
+        <div class="cc-meta-row">
+          <span class="cc-meta-label">Próximo venc.</span>
+          <span class="cc-meta-value">${escapeHtml(fmtDateShort(card.next_due_date))}</span>
+        </div>` : ""}
       </div>
-      ${(totalRowsAR + totalRowsUSD) ? `
+    `;
+
+    const purchasesAR = (card.all_purchases_ars || []);
+    const purchasesUSD = (card.all_purchases_usd || []);
+    const allPurchases = [...purchasesAR, ...purchasesUSD]
+      .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+    const detailHtml = `
+      ${totalsHtml}
+      ${allPurchases.length ? `
+      <div class="cc-detail-title">Consumos del ciclo · ${allPurchases.length}</div>
       <div class="tx-scroll" style="max-height: 320px;">
         <table class="tx-table">
           <thead>
@@ -639,75 +910,116 @@ function renderCards(cards) {
             </tr>
           </thead>
           <tbody>
-            ${[...purchasesAR, ...purchasesUSD]
-              .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
-              .map((p) => `
-                <tr>
-                  <td>${escapeHtml(p.date || "—")}</td>
-                  <td>${escapeHtml(p.description || "—")}</td>
-                  <td>${escapeHtml(p.installments || "")}</td>
-                  <td class="tx-amount expense">${p.currency === "USD" ? fmtMoneyUSD(p.amount) : fmtMoneyARS(p.amount)}</td>
-                </tr>
-              `).join("")}
+            ${allPurchases.map((p) => `
+              <tr>
+                <td>${escapeHtml(fmtDateShort(p.date))}</td>
+                <td>${escapeHtml(p.description || "—")}</td>
+                <td class="tx-store">${escapeHtml(p.installments || "")}</td>
+                <td class="tx-amount expense">${p.currency === "USD" ? fmtMoneyUSD(p.amount) : fmtMoneyARS(p.amount)}</td>
+              </tr>
+            `).join("")}
           </tbody>
         </table>
       </div>` : ""}
       ${(card.other_charges && card.other_charges.length) ? `
-        <details>
-          <summary class="muted" style="cursor: pointer; font-size: 12px;">
-            Otros conceptos · ${fmtMoneyARS(card.other_charges_total_ars || 0)} (${card.other_charges.length} ítems)
-          </summary>
-          <ul style="margin-top: 8px; padding-left: 16px; font-size: 12px; color: var(--text-dim);">
-            ${card.other_charges.map((c) => `<li>${escapeHtml(c.description || "—")} · ${fmtMoneyARS(c.amount)}</li>`).join("")}
-          </ul>
-        </details>
+      <details>
+        <summary class="muted" style="cursor: pointer; font-size: 12px;">
+          Otros conceptos · ${fmtMoneyARS(card.other_charges_total_ars || 0)} (${card.other_charges.length} ítems)
+        </summary>
+        <ul style="margin-top: 8px; padding-left: 16px; font-size: 12px; color: var(--text-dim);">
+          ${card.other_charges.map((c) => `<li>${escapeHtml(c.description || "—")} · ${fmtMoneyARS(c.amount)}</li>`).join("")}
+        </ul>
+      </details>
       ` : ""}
       <div class="muted" style="font-size: 11px;">
         Origen: <code>${escapeHtml(card.source_file || "—")}</code>
       </div>
     `;
-    container.appendChild(el);
+    detail.innerHTML = detailHtml;
+    wrap.appendChild(detail);
+    container.appendChild(wrap);
   });
 }
 
-// ── Render: transferencias bancarias (PDF) ───────────────────────────────
+// ── Render: transferencias (avatar + nombre + monto) ─────────────────────
+function avatarColor(name) {
+  // Hash simple → índice paleta.
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  const palette = paletteSeries();
+  return palette[Math.abs(h) % palette.length];
+}
+
+function avatarInitials(name) {
+  if (!name) return "?";
+  const parts = name.trim().split(/[\s,]+/).filter(Boolean);
+  if (!parts.length) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
 function renderTransfers(payload, recent) {
   const summary = payload || {};
   const byMonth = summary.by_month || { labels: [], amounts: [] };
 
-  // Bar chart por mes.
+  const wrapBM = document.getElementById("chart-transfers-by-month")?.closest(".chart-wrap");
   if (!byMonth.labels.length) {
     destroyChart("chart-transfers-by-month");
+    if (wrapBM && !wrapBM.querySelector(".empty-state")) {
+      wrapBM.classList.add("is-empty");
+      wrapBM.innerHTML = emptyStateSVG("No hay PDFs con transferencias en la carpeta.");
+    }
   } else {
+    if (wrapBM && wrapBM.classList.contains("is-empty")) {
+      wrapBM.classList.remove("is-empty");
+      wrapBM.innerHTML = `<canvas id="chart-transfers-by-month"></canvas>`;
+    }
+    // Line con gradient fill. Para serie temporal con muchos zeros (los
+    // meses sin PDF), una línea resalta mejor el trend cuando aparece una
+    // transferencia que un mar de bars vacíos. Bar charts con muchos
+    // valores en 0 también disparaban un bug de `base: NaN` en Chart.js 4.4.7.
     createChart("chart-transfers-by-month", {
-      type: "bar",
+      type: "line",
       data: {
         labels: byMonth.labels.map(fmtMonth),
-        datasets: [
-          {
-            label: "Total transferido (ARS)",
-            data: byMonth.amounts,
-            backgroundColor: alpha(C.purple, 0.7),
-            borderColor: C.purple,
-            borderWidth: 1,
-          },
-        ],
+        datasets: [{
+          label: "Total transferido (ARS)",
+          data: byMonth.amounts,
+          borderColor: C.purple,
+          backgroundColor: (ctx) => verticalGradient(ctx.chart.ctx, C.purple, ctx.chart.height),
+          borderWidth: 2,
+          tension: 0.35,
+          fill: true,
+          pointRadius: (ctx) => ctx.parsed.y > 0 ? 4 : 0,
+          pointBackgroundColor: C.purple,
+          pointBorderColor: C.bg,
+          pointBorderWidth: 2,
+          pointHoverRadius: 6,
+        }],
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
         scales: {
-          y: { beginAtZero: true, ticks: { callback: (v) => fmtMoneyARS(v) } },
+          x: { grid: { display: false }, border: { display: false } },
+          y: {
+            beginAtZero: true,
+            border: { display: false },
+            ticks: { callback: (v) => fmtMoneyARSCompact(v) },
+          },
         },
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: (ctx) => fmtMoneyARS(ctx.parsed.y) } },
+          tooltip: {
+            displayColors: false,
+            callbacks: { label: (ctx) => fmtMoneyARS(ctx.parsed.y) },
+          },
         },
       },
     });
   }
 
-  // Lista de top destinatarios.
+  // Top destinatarios.
   const list = document.getElementById("transfers-by-recipient");
   if (list) {
     list.innerHTML = "";
@@ -716,13 +1028,16 @@ function renderTransfers(payload, recent) {
       list.innerHTML = `<li class="cat-row"><span class="cat-row-name muted">Sin transferencias detectadas</span></li>`;
     } else {
       const total = items.reduce((s, x) => s + x.amount, 0) || 1;
+      const palette = paletteSeries();
       items.forEach((it, i) => {
         const li = document.createElement("li");
         li.className = "cat-row";
         const pct = (it.amount / total) * 100;
-        const barCls = PALETTE_CLASSES[i % 7];
+        const barCls = PALETTE_CLASSES[i % palette.length];
+        const swatchColor = palette[i % palette.length];
         li.innerHTML = `
-          <span class="cat-row-name" title="${it.name}">${escapeHtml(it.name)}</span>
+          <span class="cat-row-swatch" style="background: ${swatchColor}"></span>
+          <span class="cat-row-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>
           <span class="cat-row-amount">${fmtMoneyARS(it.amount)} · ${it.count}×</span>
           <span class="cat-row-bar"><span class="cat-row-bar-fill ${barCls}" style="width: ${pct}%"></span></span>
         `;
@@ -731,21 +1046,24 @@ function renderTransfers(payload, recent) {
     }
   }
 
-  // Lista de movimientos recientes.
+  // Feed de transferencias recientes con avatares.
   const recentEl = document.getElementById("transfers-recent");
   if (recentEl) {
     recentEl.innerHTML = "";
     const items = (recent || []).slice(0, 30);
     if (!items.length) {
-      recentEl.innerHTML = `<div class="muted" style="text-align:center;padding:16px;">Sin transferencias detectadas</div>`;
+      recentEl.innerHTML = `<div class="muted" style="text-align:center;padding:24px;font-size: 12px;">Sin transferencias detectadas</div>`;
     } else {
       items.forEach((t) => {
         const row = document.createElement("div");
         row.className = "transfer-row";
+        const init = avatarInitials(t.recipient);
+        const color = avatarColor(t.recipient);
         row.innerHTML = `
-          <span class="transfer-date">${escapeHtml(t.date)}</span>
-          <span class="transfer-recipient">${escapeHtml(t.recipient)}</span>
-          <span class="transfer-amount">${fmtMoneyARSSigned(-t.amount)}</span>
+          <span class="transfer-avatar" style="background: ${color}; box-shadow: 0 0 0 2px ${alpha(color, 0.18)} inset, 0 1px 0 rgba(255,255,255,0.06) inset;">${escapeHtml(init)}</span>
+          <span class="transfer-recipient" title="${escapeHtml(t.recipient)}">${escapeHtml(t.recipient)}</span>
+          <span class="transfer-meta">${escapeHtml(fmtDateShort(t.date))}</span>
+          <span class="transfer-amount">−${fmtMoneyARS(t.amount)}</span>
         `;
         recentEl.appendChild(row);
       });
@@ -754,6 +1072,15 @@ function renderTransfers(payload, recent) {
 }
 
 // ── Render: movimientos recientes (MOZE) ─────────────────────────────────
+//
+// Asignamos un color stable a cada categoría (hash → índice paleta) para
+// el pill — así "House" siempre tiene el mismo color en toda la tabla.
+function categoryColorIndex(name) {
+  let h = 0;
+  for (let i = 0; i < (name || "").length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  return Math.abs(h) % 7;
+}
+
 function renderRecent(items) {
   const tbody = document.querySelector("#recent-table tbody");
   if (!tbody) return;
@@ -768,9 +1095,10 @@ function renderRecent(items) {
     const cls = isExpense ? "expense" : "income";
     const fmt = (t.currency === "ARS") ? fmtMoneyARS : fmtMoneyUSD;
     const amountText = fmt(t.amount) + (t.currency && t.currency !== "ARS" ? ` ${t.currency}` : "");
+    const catColor = categoryColorIndex(t.category || "—");
     tr.innerHTML = `
-      <td>${escapeHtml(t.date)}</td>
-      <td class="tx-cat">${escapeHtml(t.category || "—")} · ${escapeHtml(t.subcategory || "—")}</td>
+      <td>${escapeHtml(fmtDateShort(t.date))}</td>
+      <td><span class="tx-cat-pill c-${catColor}">${escapeHtml(t.category || "—")}</span></td>
       <td title="${t.note || ""}">${escapeHtml(t.name || "—")}</td>
       <td class="tx-store">${escapeHtml(t.store || "—")}</td>
       <td class="tx-store">${escapeHtml(t.account || "—")}</td>
@@ -845,7 +1173,6 @@ function renderAll(data) {
   renderTransfers(data.transfers, data.transfers_recent);
   renderRecent(data.recent);
   renderSources(data.meta || {});
-  // meta-period label.
   if (el.metaPeriod && data.meta) {
     const wd = data.meta.window_days || state.windowDays;
     el.metaPeriod.textContent = `${wd} días · ${data.meta.months || 12}m`;

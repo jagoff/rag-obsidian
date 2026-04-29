@@ -21735,6 +21735,123 @@ def collect_ranker_features(
     return feats
 
 
+# B.5 (2026-04-29): per-source feedback ratio amplification
+#
+# Goal: nivelar el peso del feedback entre sources con volumenes muy
+# distintos. Vault tiene 423 pares en `rag_feedback`; whatsapp tiene 39;
+# gmail 0. Un thumbs-down sobre un resultado WA es ~10x mas raro que uno
+# sobre vault — por proporcionalidad estadistica, cada signal raro deberia
+# pesar mas para nivelar la velocidad de aprendizaje del ranker.
+#
+# Formula: factor = sqrt(reference_volume / source_volume), capeado a
+# SOURCE_FEEDBACK_AMP_MAX. Sqrt en vez de linear para que la amplificacion
+# sea moderada (10x volumen → 3.16x signal, no 10x). Cap a 3.0x para
+# evitar oscilaciones cuando una source tiene 1-2 signals iniciales.
+#
+# Reference volume = max count across known sources. Si todas las sources
+# tienen <REF_MIN feedback, el factor queda en 1.0 (no hay base para
+# amplificar — todas son igualmente subcalibradas).
+
+SOURCE_FEEDBACK_AMP_MAX = 3.0
+SOURCE_FEEDBACK_AMP_REF_MIN = 50
+SOURCE_FEEDBACK_AMP_WINDOW_DAYS = 90
+
+_source_feedback_amp_cache: dict | None = None
+_source_feedback_amp_cache_key: str | None = None
+_source_feedback_amp_lock = threading.Lock()
+
+
+def _compute_source_feedback_amplification(conn) -> dict:
+    """Read rag_feedback ultima ventana, contar signals por source,
+    devolver factor sqrt-based capeado.
+
+    Source counts: para cada feedback row con `paths_json` poblado,
+    incrementa el counter de la source del primer path (top-1 que el
+    ranker eligio). Es una proxy razonable: el rating se da al resultado
+    dominante, no a cada candidato del top-K.
+    """
+    counts: dict = {}
+    try:
+        rows = conn.execute(
+            "SELECT paths_json FROM rag_feedback "
+            "WHERE rating != 0 "
+            "  AND paths_json IS NOT NULL "
+            "  AND paths_json != '' "
+            f"  AND ts > datetime('now', '-{SOURCE_FEEDBACK_AMP_WINDOW_DAYS} days')"
+        ).fetchall()
+    except Exception:
+        return {}
+    for (paths_json_str,) in rows:
+        try:
+            paths = json.loads(paths_json_str or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not paths:
+            continue
+        top = paths[0]
+        if not isinstance(top, str):
+            continue
+        src = _classify_source_from_path(top)
+        counts[src] = counts.get(src, 0) + 1
+
+    if not counts:
+        return {}
+    ref_volume = max(counts.values())
+    if ref_volume < SOURCE_FEEDBACK_AMP_REF_MIN:
+        return {}
+    factors: dict = {}
+    for src, n in counts.items():
+        if n <= 0:
+            factors[src] = SOURCE_FEEDBACK_AMP_MAX
+            continue
+        factor = (ref_volume / n) ** 0.5
+        factors[src] = min(factor, SOURCE_FEEDBACK_AMP_MAX)
+    return factors
+
+
+def _source_feedback_amp() -> dict:
+    """Cached per-source amplification factor.
+
+    Returns empty dict when the feature is disabled
+    (RAG_SOURCE_FEEDBACK_AMP_DISABLE=1) — apply_weighted_scores trata
+    cada source como factor=1.0 (no-op).
+
+    Cache invalidation via MAX(ts) from rag_feedback.
+    """
+    if os.environ.get("RAG_SOURCE_FEEDBACK_AMP_DISABLE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return {}
+
+    global _source_feedback_amp_cache, _source_feedback_amp_cache_key
+    with _source_feedback_amp_lock:
+        try:
+            with _ragvec_state_conn() as conn:
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM rag_feedback"
+                ).fetchone()
+                max_ts = (row[0] or "") if row else ""
+                if (
+                    _source_feedback_amp_cache is not None
+                    and _source_feedback_amp_cache_key == max_ts
+                ):
+                    return _source_feedback_amp_cache
+                computed = _compute_source_feedback_amplification(conn)
+                _source_feedback_amp_cache = computed
+                _source_feedback_amp_cache_key = max_ts
+                return computed
+        except Exception:
+            return _source_feedback_amp_cache or {}
+
+
+def _reset_source_feedback_amp_cache() -> None:
+    """Invalidate the in-process amplification cache."""
+    global _source_feedback_amp_cache, _source_feedback_amp_cache_key
+    with _source_feedback_amp_lock:
+        _source_feedback_amp_cache = None
+        _source_feedback_amp_cache_key = None
+
+
 def apply_weighted_scores(
     feats: list[dict],
     weights: RankerWeights,
@@ -21745,6 +21862,11 @@ def apply_weighted_scores(
     Each returned item carries the original feature dict plus a `score` key.
     Ignored paths are dropped. Deterministic given the same input + weights.
     """
+    # B.5: cargar la tabla de amplificacion una vez por llamada al ranker
+    # (no por candidato). El dict es vacio cuando la feature esta off via
+    # RAG_SOURCE_FEEDBACK_AMP_DISABLE=1, en cuyo caso `_amp_for(src)` cae
+    # al default 1.0 y la amplificacion es no-op.
+    src_amp_table = _source_feedback_amp()
     scored: list[tuple[float, dict]] = []
     for f in feats:
         if f["ignored"]:
@@ -21778,12 +21900,19 @@ def apply_weighted_scores(
         # cional a log1p(count_distinct_ts).
         if weights.contradiction_penalty and f.get("contradiction_count"):
             score -= weights.contradiction_penalty * f["contradiction_count"]
+        # B.5: per-source amplification para feedback_pos/feedback_neg.
+        # Sources con poco feedback real reciben factor > 1.0 (capeado a
+        # SOURCE_FEEDBACK_AMP_MAX) — cada signal pesa mas para nivelar
+        # el playing field con vault. Default 1.0 cuando la source no
+        # esta en la tabla (sistema en bootstrap, feature off, etc.).
+        _src_for_amp = normalize_source(f["meta"].get("source"))
+        _src_amp = src_amp_table.get(_src_for_amp, 1.0)
         pos_w = _soft_feedback_weight(f.get("fb_pos_cos", 0.0), weights.feedback_match_floor)
         if pos_w:
-            score += weights.feedback_pos * pos_w
+            score += weights.feedback_pos * pos_w * _src_amp
         neg_w = _soft_feedback_weight(f.get("fb_neg_cos", 0.0), weights.feedback_match_floor)
         if neg_w:
-            score -= weights.feedback_neg * neg_w
+            score -= weights.feedback_neg * neg_w * _src_amp
         # Cross-source multiplicative adjustment (Phase 1): static weight
         # per source × per-source exponential recency decay. For `vault`
         # (default) both factors are 1.0 so this is a no-op on legacy data.

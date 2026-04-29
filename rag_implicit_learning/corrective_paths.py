@@ -233,6 +233,7 @@ def _infer_corrective_via_paraphrase(
     top_path: str,
     paths: list[str],
     paraphrase_top_score_min: float = DEFAULT_PARAPHRASE_TOP_SCORE_MIN,
+    follow_up_query: str | None = None,
 ) -> str | None:
     """Fallback: si el user no abrió nada pero re-preguntó, el top-1 de la
     paráfrasis (con cosine ≥ threshold y distinto del original) es el
@@ -271,23 +272,50 @@ def _infer_corrective_via_paraphrase(
     # mantenemos lazy (el helper solo se llama en la branch fallback).
     from rag_implicit_learning.requery_detection import is_paraphrase
 
+    # 2026-04-29: si el caller nos pasó `follow_up_query` (caso típico:
+    # el feedback row es una paráfrasis auto-detectada por
+    # `requery_detection.py` y el `extra_json.follow_up_query` ya tiene
+    # la query exacta), buscamos POR string exacto en `rag_queries`,
+    # ignorando el window temporal. Razón: las paraphrases se insertan
+    # con `ts=now()` del nightly run, NO del query original — el scan
+    # temporal `WHERE ts > after_ts` falla siempre porque busca
+    # follow-ups posteriores a ahora. El detector ya validó que la
+    # paráfrasis estuvo dentro del window de 30s, así que skip ese
+    # check acá. Si NO hay follow_up_query, mantenemos el scan
+    # temporal (path original — útil para feedbacks externos donde
+    # el caller no tiene la paráfrasis pre-detectada).
     try:
-        rows = conn.execute(
-            """
-            SELECT q, paths_json, top_score, ts
-            FROM rag_queries
-            WHERE session = ?
-              AND datetime(ts) > datetime(?)
-              AND datetime(ts) < datetime(?, '+' || ? || ' seconds')
-              AND q IS NOT NULL
-              AND q != ''
-              AND paths_json IS NOT NULL
-              AND paths_json != ''
-            ORDER BY datetime(ts) ASC
-            LIMIT 5
-            """,
-            (session, after_ts, after_ts, int(window_seconds)),
-        ).fetchall()
+        if follow_up_query:
+            rows = conn.execute(
+                """
+                SELECT q, paths_json, top_score, ts
+                FROM rag_queries
+                WHERE session = ?
+                  AND q = ?
+                  AND paths_json IS NOT NULL
+                  AND paths_json != ''
+                ORDER BY datetime(ts) DESC
+                LIMIT 5
+                """,
+                (session, follow_up_query),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT q, paths_json, top_score, ts
+                FROM rag_queries
+                WHERE session = ?
+                  AND datetime(ts) > datetime(?)
+                  AND datetime(ts) < datetime(?, '+' || ? || ' seconds')
+                  AND q IS NOT NULL
+                  AND q != ''
+                  AND paths_json IS NOT NULL
+                  AND paths_json != ''
+                ORDER BY datetime(ts) ASC
+                LIMIT 5
+                """,
+                (session, after_ts, after_ts, int(window_seconds)),
+            ).fetchall()
     except sqlite3.OperationalError as exc:
         # `rag_queries` puede no existir en DBs minimal-schema (algunos
         # tests + bootstrap pre-`_ensure_telemetry_tables`). Silent-fail
@@ -481,6 +509,11 @@ def infer_corrective_paths_from_behavior(
             # corrective implícito. Backwards-compat: si hay opens, la
             # rama 1 gana (no llegamos acá). Ver doc del helper para el
             # razonamiento del threshold.
+            # 2026-04-29: si el feedback es una paráfrasis auto-detectada,
+            # extra.follow_up_query ya tiene la query exacta — pasarla
+            # bypassea el scan temporal (que falla porque ts del feedback
+            # paraphrase es now() del nightly, no del query original).
+            follow_up_q = extra.get("follow_up_query")
             corrective_path = _infer_corrective_via_paraphrase(
                 conn,
                 after_ts=ts,
@@ -489,6 +522,7 @@ def infer_corrective_paths_from_behavior(
                 orig_q=q,
                 top_path=top_path,
                 paths=paths,
+                follow_up_query=follow_up_q if follow_up_q else None,
             )
             if corrective_path is None:
                 # Ni opens ni paráfrasis útil → bucket "no_open" sigue

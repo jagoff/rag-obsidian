@@ -226,7 +226,7 @@ def detect_requery_loss_signal(
 
     rows = conn.execute(
         f"""
-        SELECT id, ts, session, q, cmd
+        SELECT id, ts, session, q, cmd, paths_json
         FROM rag_queries
         WHERE {where_sql}
         ORDER BY session ASC, datetime(ts) ASC
@@ -249,14 +249,14 @@ def detect_requery_loss_signal(
     current_session: str | None = None
     prev_row: tuple | None = None
     for row in rows:
-        _id, ts, session, q, cmd = row
+        _id, ts, session, q, cmd, _paths_json = row
         if session != current_session:
             current_session = session
             prev_row = row
             continue
 
         # Same session as previous; check the pair.
-        prev_id, prev_ts, _, prev_q, prev_cmd = prev_row
+        prev_id, prev_ts, _, prev_q, prev_cmd, prev_paths_json = prev_row
         prev_row = row  # advance window
 
         # Slash commands (`/q`, `/clear`, etc.) no son queries reales,
@@ -306,6 +306,18 @@ def detect_requery_loss_signal(
 
         if not dry_run:
             extra = {
+                # 2026-04-29: agregamos `session` (sin underscore) además
+                # del `session_id` legacy. El helper QW1
+                # `_infer_corrective_via_paraphrase` y QW2
+                # `_recover_paths_from_behavior` en corrective_paths.py
+                # buscan por `extra.get("session")` — el resto del codebase
+                # usa esa key consistente. Pre-fix las 108 paraphrases
+                # detectadas tenían solo `session_id` y por eso el JOIN
+                # del helper devolvía NULL → 0 corrective_paths inferidos
+                # via paraphrase aunque la rama corría. Mantenemos
+                # `session_id` para backwards-compat con consumidores
+                # legacy si los hay (no encontramos ninguno pero defensivo).
+                "session": session,
                 "session_id": session,
                 "implicit_loss_source": "requery_detection",
                 "implicit_loss_inferred_at": now_iso,
@@ -313,6 +325,13 @@ def detect_requery_loss_signal(
                 "follow_up_delta_seconds": round(delta_seconds, 2),
                 "follow_up_similarity_threshold": similarity_threshold,
             }
+            # 2026-04-29: pasar `prev_paths_json` (los paths citados al
+            # query original) en vez de None. Pre-fix los 108 paraphrase
+            # rows tenían paths_json=NULL → el helper de inferencia
+            # skipea con `n_skip_no_paths` ANTES de llegar a la rama
+            # paraphrase. Con los paths del query original poblados, el
+            # helper puede llegar a la rama 2 (paraphrase fallback) y
+            # comparar el top-1 del follow-up vs el top-1 original.
             conn.execute(
                 """
                 INSERT INTO rag_feedback
@@ -324,7 +343,7 @@ def detect_requery_loss_signal(
                     prev_turn_id,
                     -1,
                     prev_q,
-                    None,
+                    prev_paths_json,
                     json.dumps(extra),
                 ),
             )

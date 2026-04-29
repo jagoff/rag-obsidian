@@ -2943,6 +2943,28 @@ RETRIEVE_K = 20    # candidates from semantic + BM25 each
 #   `rag tune --apply` reajusta. Pre-tune los weights default (todos 0
 #   salvo recency_cue) se mantienen bit-identical.
 RERANK_POOL_MAX = 25
+# Pool reducido para `retrieve_only=true` (callers que solo quieren sources +
+# excerpts, no LLM answer — típicamente el WhatsApp listener pidiendo vault
+# context para draftear respuestas en `loadVaultContextForDraft`).
+#
+# Audit empírico 2026-04-29 (post-fix WA_DRAFT_ALL_CONTACTS): el rerank con
+# pool=25 dominaba ~50-60% del tiempo total del endpoint (~5s de los ~9s
+# warm), y el caller del listener desecha igualmente todo lo que esté
+# debajo de los top-3 con score >= 0.4 (ver
+# `loadVaultContextForDraft`/`VAULT_CONTEXT_MAX_ITEMS=3` en
+# `whatsapp-listener/listener.ts`). Procesar 25 pares cuando el caller usa 3
+# es trabajo descartado. El comentario histórico de RERANK_POOL_MAX (2026-04-25)
+# confirma además que pool=15 ya da hit@5 idéntico en queries single-source,
+# y `retrieve_only=true` es siempre single-source (vault, no cross-source).
+#
+# Pool=10 da margen sobre los 3 finales que el listener consume + algo de
+# colchón si la query es ambigua y los 5 primeros del rerank no calzan con
+# `score >= VAULT_CONTEXT_MIN_SCORE=0.4`. Speedup esperado: ~1.5s del rerank
+# (15 pares menos × ~50ms/par MPS = ~750ms en el batch + overhead).
+#
+# NO afecta el path normal de `/query` (LLM answer): callers sin
+# `retrieve_only` siguen con RERANK_POOL_MAX=25.
+RERANK_POOL_RETRIEVE_ONLY = 10
 RERANK_TOP = 5     # final chunks after reranking
 PROGRESSIVE_CONTEXT_K = 6   # extra chunks for progressive context (summarized to 1-liners)
                             # bajado 15→6: cada entry cuesta prefill, y con top-5
@@ -47910,15 +47932,23 @@ def serve(host: str, port: int):
         # pre-upgrade)" aunque la sesión fuera fresh).
         query_turn_id = new_turn_id()
         t0 = time.perf_counter()
+        # 2026-04-29: pool reducido cuando el caller solo quiere sources +
+        # excerpts (typical: WA listener pidiendo vault context). Ver
+        # comentario en RERANK_POOL_RETRIEVE_ONLY arriba para el racional
+        # y la medición. El path normal (LLM answer) sigue con default
+        # RERANK_POOL_MAX=25.
+        _retrieve_pool = RERANK_POOL_RETRIEVE_ONLY if retrieve_only else None
         result = retrieve(
             col, effective, k, qfolder, tag=qtag, precise=False,
             multi_query=multi_q, auto_filter=True, variants=pre_variants,
+            rerank_pool=_retrieve_pool,
         )
         if (deep and result["docs"]
                 and result["confidence"] < CONFIDENCE_DEEP_THRESHOLD):
             result = deep_retrieve(
                 col, effective, k, qfolder, tag=qtag, precise=False,
                 multi_query=multi_q, auto_filter=True, variants=pre_variants,
+                rerank_pool=_retrieve_pool,
             )
         t_retrieve = time.perf_counter() - t0
 

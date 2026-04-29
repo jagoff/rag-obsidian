@@ -8,6 +8,37 @@ Entry points (both installed via `uv tool install --editable '.[entities]'` — 
 
 Fully local: Sqlite-vec + Ollama + sentence-transformers. **Exception**: Gmail + Calendar cross-source ingesters (Phase 1.b/c, pending) use OAuth Google via the Claude harness MCP — user override 2026-04-20, see `docs/design-cross-source-corpus.md §10.6`. WhatsApp + Reminders stay local (bridge SQLite + EventKit).
 
+## Idioma — español rioplatense (Argentina) por default
+
+**Toda comunicación con el usuario va en español rioplatense (Argentina).** Esto aplica a:
+
+- Respuestas en chat / terminal del agente.
+- Mensajes de commit (subject + body).
+- Comentarios nuevos en código que el agente escribe.
+- Notas de Obsidian que el agente crea bajo `99-AI/...` o `00-Inbox/`.
+- Output de scripts y daemons que produce el agente (briefs WA/morning/evening, summaries, etc.).
+- Mensajes de error visibles al usuario.
+
+**Voseo argentino**, no tuteo neutro: "vos podés" / "fijate" / "agarrá" / "mirá" — no "tú puedes" / "fíjate" / "agarra" / "mira". Vocabulario rioplatense natural ("dale", "tranqui", "che", "laburar") cuando aporta claridad sin sonar forzado.
+
+**Excepciones que SÍ van en inglés** (no traducir):
+
+- Tecnicismos estándar de software: `commit`, `pull request`, `branch`, `rebase`, `endpoint`, `payload`, `cache`, `streaming`, `SSE`, `LoRA`, `embedding`, `chunk`, `daemon`, `plist`, `launchctl`, `query`, `index`, `vault`, `scope`, `re-rank`, `retrieve`, `tune`, `eval`, etc.
+- Nombres propios de productos / herramientas / paquetes: `Obsidian`, `FastAPI`, `Chart.js`, `Ollama`, `sqlite-vec`, `Devin`, `Claude Code`, `iCloud`, `LaunchAgents`.
+- Stack traces, output literal de comandos, snippets de código, JSON de respuesta — son output mecánico, no se traducen.
+- Output de `git`, `gh`, `pytest`, `uv`, etc. — se cita literal.
+- Si el usuario explícitamente escribe en otro idioma o pide la respuesta en otro idioma, contestar en ese idioma.
+
+**Lo que NO se permite** (problema observado y razón de existir esta regla):
+
+- Respuestas o partes de respuestas en **portugués** ("você", "estamos fazendo", "esses", "isso", "obrigado") — el modelo a veces se desliza al portugués cuando el contexto tiene mucho input portugués cerca, especialmente con palabras parecidas. Si te encontrás escribiendo "esse"/"essa"/"isso"/"você" en una respuesta para el user, es bug — corregir a español rioplatense.
+- Respuestas o partes de respuestas en **chino**, **japonés**, **coreano** o cualquier otro idioma no-español que no haya pedido explícitamente el user.
+- Español neutro plano tipo manual de microondas ("usted puede ejecutar el siguiente comando") en vez de rioplatense — suena impersonal y no es lo que pide el user.
+
+**Verificación rápida antes de mandar la respuesta**: si tu output contiene "você", "obrigad", "esses", "essa", "isso", "sim/não", caracteres CJK (汉字, 日本語, 한국어), o "tú" / "ustedes" en un contexto donde correspondería "vos" / "ustedes-rioplatense" — algo está roto, corregilo antes de enviar.
+
+Esta regla NO cambia entre sesiones — es el comportamiento default. El usuario sólo escribe en inglés cuando cita doc inglesa o nombre técnico inglés; eso no es señal para cambiar de idioma.
+
 ## Agent dispatch rule
 
 **Any task that will edit ≥3 files MUST go through `pm` first.** No preguntas — invocar directamente:

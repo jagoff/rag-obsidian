@@ -12572,6 +12572,52 @@ def dashboard_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "dashboard.html")
 
 
+# ── /finance — dashboard de finanzas (MOZE + tarjetas + transferencias) ─────
+#
+# Página HTML que hidrata vía `/api/finance`. Lee la carpeta iCloud
+# `Finances/` (override por `OBSIDIAN_RAG_FINANCE_DIR`) y agrega:
+#   - Transacciones MOZE (categorizadas, multi-mes) — fuente PRIMARIA
+#   - Tarjetas de crédito (xlsx del banco) — sección aparte
+#   - Transferencias bancarias (PDF Santander) — sección aparte
+#
+# El user pidió: "tablero igual estéticamente al resto, exclusivamente de
+# finanzas". El payload se cachea 60s (la data cambia cuando el user
+# re-exporta MOZE o tira un PDF nuevo, no más rápido que eso).
+_FINANCE_DASH_CACHE: dict = {"ts": 0.0, "payload": None, "key": None}
+_FINANCE_DASH_LOCK = threading.Lock()
+_FINANCE_DASH_TTL = 60.0
+
+
+@app.get("/finance")
+def finance_page() -> FileResponse:
+    """HTML del dashboard de finanzas. Hidrata via /api/finance."""
+    return FileResponse(STATIC_DIR / "finance.html")
+
+
+@app.get("/api/finance")
+def finance_api(months: int = 12, window_days: int = 30) -> dict:
+    """Snapshot agregado de las fuentes en `Finances/`. TTL 60s (cache key
+    incluye `months` + `window_days` para que distintas vistas no se
+    pisen). Importa lazy `web.finance_dashboard` — el módulo no se carga
+    al import-time del server si nadie pide /finance.
+    """
+    months = max(1, min(int(months or 12), 36))
+    window_days = max(7, min(int(window_days or 30), 365))
+    key = (months, window_days)
+    now_ts = time.time()
+    with _FINANCE_DASH_LOCK:
+        hit = _FINANCE_DASH_CACHE
+        if hit["key"] == key and hit["payload"] and now_ts - hit["ts"] < _FINANCE_DASH_TTL:
+            return hit["payload"]
+    from web.finance_dashboard import snapshot
+    payload = snapshot(months=months, window_days=window_days)
+    with _FINANCE_DASH_LOCK:
+        _FINANCE_DASH_CACHE["ts"] = now_ts
+        _FINANCE_DASH_CACHE["key"] = key
+        _FINANCE_DASH_CACHE["payload"] = payload
+    return payload
+
+
 # ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
 # Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
 # de las transcripciones de audio, correcciones acumuladas, y top vocab terms

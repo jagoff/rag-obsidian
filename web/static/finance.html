@@ -10,7 +10,7 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="rag">
-  <title>rag · learning</title>
+  <title>rag · finance</title>
 
   <!-- ── PWA wiring (idéntico a dashboard.html — ver index.html para nota
        de regeneración) ─────────────────────────────────────────────── -->
@@ -816,6 +816,118 @@
         min-height: 36px;
       }
     }
+
+    /* ── Finance-specific tweaks ──────────────────────────────────── */
+
+    .kpi-hero .kpi-value { font-variant-numeric: tabular-nums; }
+
+    .cat-list {
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 0; margin: 0; list-style: none;
+    }
+    .cat-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px 12px; align-items: center;
+      font-size: 12px;
+    }
+    .cat-row-name {
+      color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .cat-row-amount { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .cat-row-bar {
+      grid-column: 1 / -1; height: 4px;
+      background: var(--grid); border-radius: 2px; overflow: hidden;
+    }
+    .cat-row-bar-fill {
+      height: 100%; background: var(--cyan); border-radius: 2px;
+    }
+    .cat-row-bar-fill.green  { background: var(--green); }
+    .cat-row-bar-fill.yellow { background: var(--yellow); }
+    .cat-row-bar-fill.red    { background: var(--red); }
+    .cat-row-bar-fill.purple { background: var(--purple); }
+    .cat-row-bar-fill.orange { background: var(--orange); }
+    .cat-row-bar-fill.pink   { background: var(--pink); }
+
+    .tx-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 12px; font-variant-numeric: tabular-nums;
+    }
+    .tx-table thead th {
+      text-align: left; color: var(--text-faint); font-weight: 500;
+      padding: 6px 8px; border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: var(--bg-card);
+    }
+    .tx-table tbody td {
+      padding: 6px 8px; border-bottom: 1px solid var(--sep); color: var(--text);
+    }
+    .tx-table tbody tr:hover { background: var(--hover); }
+    .tx-table .tx-amount {
+      text-align: right; font-variant-numeric: tabular-nums;
+    }
+    .tx-table .tx-amount.expense { color: var(--red); }
+    .tx-table .tx-amount.income  { color: var(--green); }
+    .tx-table .tx-cat { color: var(--text-dim); white-space: nowrap; }
+    .tx-table .tx-store { color: var(--text-dim); }
+    .tx-scroll {
+      max-height: 480px; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--bg-card);
+    }
+
+    .credit-card {
+      display: flex; flex-direction: column; gap: 12px;
+      padding: 16px; background: var(--bg-card);
+      border: 1px solid var(--border); border-radius: 10px;
+    }
+    .credit-card-hdr {
+      display: flex; justify-content: space-between;
+      align-items: baseline; gap: 12px; flex-wrap: wrap;
+    }
+    .credit-card-brand { font-size: 14px; font-weight: 600; color: var(--text); }
+    .credit-card-brand .last4 { color: var(--text-dim); font-weight: 400; margin-left: 6px; }
+    .credit-card-totals { display: flex; gap: 16px; flex-wrap: wrap; }
+    .credit-card-total { display: flex; flex-direction: column; gap: 2px; }
+    .credit-card-total-label {
+      font-size: 10px; color: var(--text-faint);
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .credit-card-total-value {
+      font-size: 16px; font-weight: 600; color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .credit-card-dates {
+      display: flex; gap: 16px; flex-wrap: wrap;
+      font-size: 12px; color: var(--text-dim);
+    }
+    .credit-card-date strong { color: var(--text); }
+
+    .transfer-row {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px 12px; padding: 8px 0;
+      border-bottom: 1px solid var(--sep);
+      font-size: 12px; align-items: center;
+    }
+    .transfer-row:last-child { border-bottom: none; }
+    .transfer-date { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .transfer-recipient { color: var(--text); }
+    .transfer-amount {
+      color: var(--red); font-variant-numeric: tabular-nums;
+      text-align: right; white-space: nowrap;
+    }
+
+    .empty-state {
+      padding: 32px; text-align: center; color: var(--text-dim);
+      background: var(--bg-card); border: 1px dashed var(--border-strong);
+      border-radius: 10px;
+    }
+    .empty-state h3 { color: var(--text); margin-bottom: 8px; }
+    .empty-state code {
+      background: var(--bg-elev); padding: 2px 6px;
+      border-radius: 4px; font-size: 11px;
+    }
   </style>
 </head>
 <body>
@@ -825,406 +937,262 @@
     <div class="hdr-l">
       <a href="/" class="brand">rag</a>
       <span class="sep">·</span>
-      <span class="title">learning</span>
+      <span class="title">finance</span>
     </div>
     <div class="hdr-r">
       <span class="meta-period" id="meta-period"></span>
       <span class="meta-period" id="meta-updated"></span>
-      <!-- Selector de ventana -->
+      <!-- Selector de ventana — define `window_days` que aplica a los
+           widgets de "categoría / top stores". El "by_month" siempre
+           muestra los últimos 12 meses, independientemente. -->
       <div class="seg" role="tablist" aria-label="Ventana de tiempo">
-        <button class="seg-btn" type="button" data-days="7" role="tab">7d</button>
-        <button class="seg-btn active" type="button" data-days="30" role="tab" aria-selected="true">30d</button>
+        <button class="seg-btn" type="button" data-days="30" role="tab" aria-selected="true">30d</button>
         <button class="seg-btn" type="button" data-days="90" role="tab">90d</button>
+        <button class="seg-btn" type="button" data-days="180" role="tab">6m</button>
         <button class="seg-btn" type="button" data-days="365" role="tab">1a</button>
       </div>
-      <!-- Live toggle -->
       <button id="live-toggle" class="btn-icon" type="button" data-state="off"
               aria-pressed="false" aria-label="Pausar o reanudar actualizaciones en vivo">
         <span class="dot" aria-hidden="true"></span>
         <span id="live-label">conectando…</span>
       </button>
-      <!-- Theme toggle -->
       <button id="theme-toggle" class="btn-icon" type="button"
               aria-label="Alternar tema claro/oscuro">
         <span id="theme-icon" aria-hidden="true"></span>
       </button>
-      <!-- Nav links -->
       <nav class="hdr-nav" aria-label="Navegación principal">
         <a href="/dashboard">dashboard</a>
-        <a href="/finance">finance</a>
+        <a href="/learning">learning</a>
         <a href="/status">status</a>
         <a href="/memory/">memory</a>
-        <a href="/transcripts">transcripts</a>
       </nav>
     </div>
   </header>
 
   <main id="content" tabindex="-1">
-    <!-- ── HEALTH BANNER (semáforo del sistema) ───────────────────
-         Lo PRIMERO que ve el usuario: bloque verde / amarillo / rojo con
-         texto en lenguaje plain explicando si todo está OK. JS hidrata los
-         signals desde /api/learning/health (TTL 15s) y refresca
-         cada 30s. Si la red falla, queda en .is-loading. Worst-case wins:
-         si una sola señal está roja, el banner va rojo. -->
-    <section id="health-banner" class="health-banner is-loading"
-             aria-live="polite" role="status"
-             aria-label="Estado general del sistema">
-      <div class="health-main">
-        <span class="health-icon" aria-hidden="true"></span>
-        <div class="health-text">
-          <h2 id="health-headline" class="health-headline">Verificando estado…</h2>
-          <p id="health-summary" class="health-summary">Cargando indicadores de salud del sistema.</p>
-        </div>
-        <span id="health-updated" class="health-updated"></span>
-      </div>
-      <ul id="health-signals" class="health-signals" role="list"></ul>
-    </section>
-
-    <!-- ── VEREDICTO ─────────────────────────────────────────────
-         Estado actual de los 12 sistemas de aprendizaje. Auto-generado
-         desde `verdict()` en `web/learning_queries.py`. La idea: lo que
-         antes había que diagnosticar a mano (¿aprende?, ¿cuánto?, ¿cuándo?)
-         ahora vive permanente acá. Si un sistema se rompe, se ve en rojo. -->
-    <section class="verdict" id="verdict-hero" aria-label="Veredicto del aprendizaje del sistema">
-      <header class="verdict-hdr">
-        <div class="verdict-summary">
-          <span class="verdict-headline" id="verdict-headline">cargando&hellip;</span>
-          <span class="verdict-counts">
-            <span class="vc vc-alive"><span class="vc-dot"></span><span id="verdict-count-alive">0</span> vivos</span>
-            <span class="vc vc-stale"><span class="vc-dot"></span><span id="verdict-count-stale">0</span> stale</span>
-            <span class="vc vc-dormant"><span class="vc-dot"></span><span id="verdict-count-dormant">0</span> dormidos</span>
-          </span>
-        </div>
-      </header>
-      <div class="verdict-grid" id="verdict-grid"></div>
-    </section>
-
-    <!-- ── KPI HERO ─────────────────────────────────────────────── -->
-    <section class="kpi-hero" aria-label="Indicadores clave de aprendizaje">
-      <div class="kpi" id="kpi-eval-singles" title="hit@5 sobre singles del eval set">
-        <span class="kpi-label">Acierto en preguntas simples</span>
+    <!-- ── KPI HERO ─────────────────────────────────────────────────
+         6 KPIs del mes en curso. Cada KPI tiene shape
+         {value, delta_pct, n_samples, insufficient} desde payload.kpis. -->
+    <section class="kpi-hero" aria-label="Indicadores clave de finanzas">
+      <div class="kpi" id="kpi-expenses-ars" title="Gastos ARS del mes en curso vs mes anterior">
+        <span class="kpi-label">Gastos ARS este mes</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-eval-chains" title="hit@5 sobre chains del eval set">
-        <span class="kpi-label">Acierto en preguntas con varios pasos</span>
+      <div class="kpi" id="kpi-expenses-usd" title="Gastos USD del mes en curso vs mes anterior">
+        <span class="kpi-label">Gastos USD este mes</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-feedback-total" title="Total de thumbs ↑/↓ en la ventana">
-        <span class="kpi-label">Feedback que diste</span>
+      <div class="kpi" id="kpi-income-ars" title="Ingresos ARS del mes en curso">
+        <span class="kpi-label">Ingresos ARS este mes</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-behavior-per-query" title="Ratio: eventos rag_behavior / queries">
-        <span class="kpi-label">Señales implícitas por pregunta</span>
+      <div class="kpi" id="kpi-balance-ars" title="Ingresos − Gastos del mes en curso (ARS)">
+        <span class="kpi-label">Balance neto ARS</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-cache-hit" title="Tasa de hit del response cache">
-        <span class="kpi-label">Respuestas desde memoria reciente</span>
+      <div class="kpi" id="kpi-txs-count" title="Cantidad de transacciones registradas en el mes">
+        <span class="kpi-label">Transacciones este mes</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
-      <div class="kpi" id="kpi-paraphrases" title="Conteo total de paraphrases creadas">
-        <span class="kpi-label">Variantes de preguntas aprendidas</span>
-        <span class="kpi-value">—</span>
-        <span class="kpi-delta neutral">—</span>
-        <span class="kpi-badge">datos insuf.</span>
-      </div>
-      <div class="kpi" id="kpi-entities" title="Snapshot total de entities en la vault">
-        <span class="kpi-label">Personas y lugares reconocidos</span>
-        <span class="kpi-value">—</span>
-        <span class="kpi-delta neutral">—</span>
-        <span class="kpi-badge">datos insuf.</span>
-      </div>
-      <div class="kpi" id="kpi-contradictions" title="% de contradictions con decisión (resuelta/dismissed)">
-        <span class="kpi-label">Inconsistencias que aclaraste</span>
+      <div class="kpi" id="kpi-top-category" title="Categoría con mayor gasto en el mes en curso">
+        <span class="kpi-label">Top categoría este mes</span>
         <span class="kpi-value">—</span>
         <span class="kpi-delta neutral">—</span>
         <span class="kpi-badge">datos insuf.</span>
       </div>
     </section>
 
-    <!-- ── 1. RETRIEVAL QUALITY ─────────────────────────────────── -->
-    <section class="learn-section" id="sec-retrieval-quality" aria-labelledby="h-retrieval-quality">
+    <!-- ── 1. INGRESOS vs GASTOS POR MES ─────────────────────────── -->
+    <section class="learn-section" id="sec-by-month" aria-labelledby="h-by-month">
       <header class="learn-section-hdr">
-        <h2 id="h-retrieval-quality" title="Retrieval quality: hit@5, MRR, latencia vs score">Qué tan bien encuentra notas</h2>
-        <p class="muted">Acierto, ranking, regresiones y velocidad por consulta</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-retrieval-quality" data-collapse="body-retrieval-quality">−</button>
+        <h2 id="h-by-month" title="Serie temporal de los últimos 12 meses">Ingresos y gastos por mes</h2>
+        <p class="muted">Últimos 12 meses, separado por moneda</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-by-month" data-collapse="body-by-month">−</button>
       </header>
-      <div class="learn-section-body" id="body-retrieval-quality">
+      <div class="learn-section-body" id="body-by-month">
         <div class="chart-grid">
-          <div class="chart-card" data-chart-card="eval-over-time">
-            <h3 title="Eval over time: hit@5 + MRR, singles + chains">Precisión en el tiempo</h3>
-            <div class="chart-wrap"><canvas id="chart-eval-over-time" aria-label="Líneas: hit@5 y MRR para singles y chains a lo largo del tiempo"></canvas></div>
+          <div class="chart-card wide" data-chart-card="by-month-ars">
+            <h3 title="Ingresos vs gastos en ARS por mes">ARS · ingresos vs gastos</h3>
+            <div class="chart-wrap"><canvas id="chart-by-month-ars" aria-label="Líneas: ingresos y gastos en ARS por mes"></canvas></div>
           </div>
-          <div class="chart-card" data-chart-card="tune-deltas">
-            <h3 title="Tune deltas — % delta vs baseline weights">Mejora por ajuste (% vs línea base)</h3>
-            <div class="chart-wrap"><canvas id="chart-tune-deltas" aria-label="Barras: % de mejora por iteración de tune"></canvas></div>
-          </div>
-          <div class="chart-card wide" data-chart-card="latency-vs-score">
-            <h3 title="Latency (s) vs top score per query">Velocidad vs relevancia</h3>
-            <div class="chart-wrap"><canvas id="chart-latency-vs-score" aria-label="Scatter: latencia de retrieval (s) vs top score por query"></canvas></div>
+          <div class="chart-card wide" data-chart-card="by-month-usd">
+            <h3 title="Ingresos vs gastos en USD por mes">USD · ingresos vs gastos</h3>
+            <div class="chart-wrap"><canvas id="chart-by-month-usd" aria-label="Líneas: ingresos y gastos en USD por mes"></canvas></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 2. RANKER WEIGHTS ────────────────────────────────────── -->
-    <section class="learn-section" id="sec-ranker-weights" aria-labelledby="h-ranker-weights">
+    <!-- ── 2. POR CATEGORÍA (donut + lista) ──────────────────────── -->
+    <section class="learn-section" id="sec-by-category" aria-labelledby="h-by-category">
       <header class="learn-section-hdr">
-        <h2 id="h-ranker-weights" title="Ranker weights over time (12 features)">Importancia de cada factor de búsqueda</h2>
-        <p class="muted">Una mini-línea por factor — peso actual vs inicial</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-ranker-weights" data-collapse="body-ranker-weights">−</button>
+        <h2 id="h-by-category" title="Donut: gastos por categoría dentro de la ventana">En qué se va la plata</h2>
+        <p class="muted">Categorías de gasto dentro de la ventana seleccionada</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-by-category" data-collapse="body-by-category">−</button>
       </header>
-      <div class="learn-section-body" id="body-ranker-weights">
-        <div class="chart-card wide" data-chart-card="ranker-weights">
-          <h3 title="Ranker weights over time vs baseline">Importancia de cada factor (12 mini-gráficos)</h3>
-          <div id="ranker-weights-grid" class="small-multiples"></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ── 3. SCORE CALIBRATION ─────────────────────────────────── -->
-    <section class="learn-section" id="sec-score-calibration" aria-labelledby="h-score-calibration">
-      <header class="learn-section-hdr">
-        <h2 id="h-score-calibration" title="Score calibration: raw vs calibrated por source">Calibración de confianza por fuente</h2>
-        <p class="muted">Cómo se ajusta la confianza para cada fuente de resultados</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-score-calibration" data-collapse="body-score-calibration">−</button>
-      </header>
-      <div class="learn-section-body" id="body-score-calibration">
-        <div id="score-calibration-grid" class="chart-grid"></div>
-      </div>
-    </section>
-
-    <!-- ── 4. FEEDBACK EXPLÍCITO ────────────────────────────────── -->
-    <section class="learn-section" id="sec-feedback-explicit" aria-labelledby="h-feedback-explicit">
-      <header class="learn-section-hdr">
-        <h2 id="h-feedback-explicit" title="Explicit feedback: rag_feedback table">Lo que dijiste (thumbs ↑/↓)</h2>
-        <p class="muted">Reacciones, correcciones manuales, y a qué parte de la respuesta apuntaron</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-explicit" data-collapse="body-feedback-explicit">−</button>
-      </header>
-      <div class="learn-section-body" id="body-feedback-explicit">
+      <div class="learn-section-body" id="body-by-category">
         <div class="chart-grid">
-          <div class="chart-card" data-chart-card="thumbs-over-time">
-            <h3 title="Thumbs/day: positive, negative, corrective">Reacciones diarias</h3>
-            <div class="chart-wrap"><canvas id="chart-thumbs-over-time"></canvas></div>
+          <div class="chart-card" data-chart-card="cat-donut-ars">
+            <h3 title="Donut: gastos ARS por categoría">Categorías ARS</h3>
+            <div class="chart-wrap"><canvas id="chart-cat-donut-ars" aria-label="Donut: gastos ARS por categoría"></canvas></div>
           </div>
-          <div class="chart-card" data-chart-card="corrective-cumulative">
-            <h3 title="Corrective paths cumulative">Correcciones acumuladas</h3>
-            <div class="chart-wrap"><canvas id="chart-corrective-cumulative"></canvas></div>
+          <div class="chart-card" data-chart-card="cat-list-ars">
+            <h3 title="Lista de categorías ARS con monto y barra">Detalle ARS</h3>
+            <ul class="cat-list" id="cat-list-ars"></ul>
           </div>
-          <div class="chart-card wide" data-chart-card="feedback-by-scope">
-            <h3 title="Feedback by scope: answer/retrieval/both">Dónde fue el feedback</h3>
-            <div class="chart-wrap"><canvas id="chart-feedback-by-scope"></canvas></div>
+          <div class="chart-card" data-chart-card="cat-donut-usd">
+            <h3 title="Donut: gastos USD por categoría">Categorías USD</h3>
+            <div class="chart-wrap"><canvas id="chart-cat-donut-usd" aria-label="Donut: gastos USD por categoría"></canvas></div>
+          </div>
+          <div class="chart-card" data-chart-card="cat-list-usd">
+            <h3 title="Lista de categorías USD con monto y barra">Detalle USD</h3>
+            <ul class="cat-list" id="cat-list-usd"></ul>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 5. FEEDBACK IMPLÍCITO ────────────────────────────────── -->
-    <section class="learn-section" id="sec-feedback-implicit" aria-labelledby="h-feedback-implicit">
+    <!-- ── 3. TOP COMERCIOS ──────────────────────────────────────── -->
+    <section class="learn-section" id="sec-top-stores" aria-labelledby="h-top-stores">
       <header class="learn-section-hdr">
-        <h2 id="h-feedback-implicit" title="Implicit feedback: re-queries, dwell, outcomes">Lo que hiciste (sin decir nada)</h2>
-        <p class="muted">Cuando re-preguntás, abandonás o corregís sin decir nada explícito</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-feedback-implicit" data-collapse="body-feedback-implicit">−</button>
+        <h2 id="h-top-stores" title="Top 15 comercios por gasto en la ventana">Dónde más gastaste</h2>
+        <p class="muted">Top comercios dentro de la ventana</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-top-stores" data-collapse="body-top-stores">−</button>
       </header>
-      <div class="learn-section-body" id="body-feedback-implicit">
+      <div class="learn-section-body" id="body-top-stores">
         <div class="chart-grid">
-          <div class="chart-card" data-chart-card="implicit-by-source">
-            <h3 title="Implicit feedback by source">Señales implícitas por fuente</h3>
-            <div class="chart-wrap"><canvas id="chart-implicit-by-source"></canvas></div>
+          <div class="chart-card wide" data-chart-card="top-stores-ars">
+            <h3 title="Top 15 comercios en ARS por gasto">Top comercios ARS</h3>
+            <div class="chart-wrap"><canvas id="chart-top-stores-ars" aria-label="Barras horizontales: top comercios en ARS"></canvas></div>
           </div>
-          <div class="chart-card" data-chart-card="implicit-rate-over-time">
-            <h3 title="Implicit signal rate per day">% de señales implícitas (por día)</h3>
-            <div class="chart-wrap"><canvas id="chart-implicit-rate"></canvas></div>
+          <div class="chart-card wide" data-chart-card="top-stores-usd">
+            <h3 title="Top 15 comercios en USD por gasto">Top comercios USD</h3>
+            <div class="chart-wrap"><canvas id="chart-top-stores-usd" aria-label="Barras horizontales: top comercios en USD"></canvas></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 6. BEHAVIOR ──────────────────────────────────────────── -->
-    <section class="learn-section" id="sec-behavior" aria-labelledby="h-behavior">
+    <!-- ── 4. POR CUENTA ─────────────────────────────────────────── -->
+    <section class="learn-section" id="sec-by-account" aria-labelledby="h-by-account">
       <header class="learn-section-hdr">
-        <h2 id="h-behavior" title="Behavior: rag_behavior events">Cómo interactuaste</h2>
-        <p class="muted">Clicks por fuente, tiempo de lectura, notas más visitadas, mapa día×hora</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-behavior" data-collapse="body-behavior">−</button>
+        <h2 id="h-by-account" title="Resumen de movimientos por cuenta">Movimiento por cuenta</h2>
+        <p class="muted">Total de gastos e ingresos en cada cuenta del histórico completo</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-by-account" data-collapse="body-by-account">−</button>
       </header>
-      <div class="learn-section-body" id="body-behavior">
-        <div class="chart-grid">
-          <div class="chart-card" data-chart-card="ctr-by-source">
-            <h3 title="CTR by source over time">Click rate por fuente</h3>
-            <div class="chart-wrap"><canvas id="chart-ctr-by-source"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="dwell-distribution">
-            <h3 title="Dwell time distribution">Cuánto tiempo pasaste leyendo</h3>
-            <div class="chart-wrap"><canvas id="chart-dwell-distribution"></canvas></div>
-          </div>
-          <div class="chart-card wide" data-chart-card="top-paths">
-            <h3 title="Top paths: clicks + avg dwell">Notas más visitadas</h3>
-            <div class="chart-wrap"><canvas id="chart-top-paths"></canvas></div>
-          </div>
-          <div class="chart-card wide" data-chart-card="heatmap-dow-hour">
-            <h3 title="Heatmap day-of-week × hour">Mapa de actividad</h3>
-            <div id="heatmap-dow-hour" class="heatmap-dow-hour" role="img" aria-label="Heatmap de actividad por día de la semana y hora del día"></div>
-            <div id="heatmap-hours-axis" class="heatmap-hours" aria-hidden="true"></div>
+      <div class="learn-section-body" id="body-by-account">
+        <div class="chart-card wide" data-chart-card="by-account-table">
+          <div class="tx-scroll">
+            <table class="tx-table" id="by-account-table">
+              <thead>
+                <tr>
+                  <th>Cuenta</th>
+                  <th class="tx-amount">Gastos</th>
+                  <th class="tx-amount">Ingresos</th>
+                  <th class="tx-amount">Neto</th>
+                  <th class="tx-amount">N°</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 7. QUERY LEARNING ────────────────────────────────────── -->
-    <section class="learn-section" id="sec-query-learning" aria-labelledby="h-query-learning">
+    <!-- ── 5. TARJETAS DE CRÉDITO (xlsx) ─────────────────────────── -->
+    <section class="learn-section" id="sec-cards" aria-labelledby="h-cards">
       <header class="learn-section-hdr">
-        <h2 id="h-query-learning" title="Query learning: paraphrases + cache">Cómo aprendió a entender tus preguntas</h2>
-        <p class="muted">Variantes aprendidas, formas más usadas, respuestas servidas desde cache</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-query-learning" data-collapse="body-query-learning">−</button>
+        <h2 id="h-cards" title="Resúmenes de tarjeta del banco (xlsx)">Tarjeta de crédito</h2>
+        <p class="muted">Último resumen del banco con detalle de consumos del ciclo</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-cards" data-collapse="body-cards">−</button>
       </header>
-      <div class="learn-section-body" id="body-query-learning">
+      <div class="learn-section-body" id="body-cards">
+        <div id="cards-container"></div>
+      </div>
+    </section>
+
+    <!-- ── 6. TRANSFERENCIAS BANCARIAS (PDF) ─────────────────────── -->
+    <section class="learn-section" id="sec-transfers" aria-labelledby="h-transfers">
+      <header class="learn-section-hdr">
+        <h2 id="h-transfers" title="Transferencias salientes parseadas del PDF de comprobantes">Transferencias bancarias</h2>
+        <p class="muted">Comprobantes de transferencias salientes (PDF de Santander)</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-transfers" data-collapse="body-transfers">−</button>
+      </header>
+      <div class="learn-section-body" id="body-transfers">
         <div class="chart-grid">
-          <div class="chart-card" data-chart-card="paraphrases-count">
-            <h3 title="Paraphrases cumulative per day">Variantes de preguntas (acumuladas)</h3>
-            <div class="chart-wrap"><canvas id="chart-paraphrases-count"></canvas></div>
+          <div class="chart-card" data-chart-card="transfers-by-month">
+            <h3 title="Total transferido por mes">Total por mes</h3>
+            <div class="chart-wrap"><canvas id="chart-transfers-by-month" aria-label="Barras: total transferido por mes"></canvas></div>
           </div>
-          <div class="chart-card" data-chart-card="cache-hit-rate-time">
-            <h3 title="Cache hit rate per day">Respuestas desde cache (por día)</h3>
-            <div class="chart-wrap"><canvas id="chart-cache-hit-rate-time"></canvas></div>
+          <div class="chart-card" data-chart-card="transfers-by-recipient">
+            <h3 title="Top destinatarios por monto acumulado">Top destinatarios</h3>
+            <ul class="cat-list" id="transfers-by-recipient"></ul>
           </div>
-          <div class="chart-card wide" data-chart-card="top-paraphrases">
-            <h3 title="Top paraphrases by hit count">Variantes más usadas</h3>
-            <div class="chart-wrap"><canvas id="chart-top-paraphrases"></canvas></div>
+          <div class="chart-card wide" data-chart-card="transfers-recent">
+            <h3 title="Últimas transferencias salientes">Movimientos recientes</h3>
+            <div id="transfers-recent" class="transfer-list"></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 8. ANTICIPATORY ──────────────────────────────────────── -->
-    <section class="learn-section" id="sec-anticipatory" aria-labelledby="h-anticipatory">
+    <!-- ── 7. MOVIMIENTOS RECIENTES (MOZE) ───────────────────────── -->
+    <section class="learn-section" id="sec-recent" aria-labelledby="h-recent">
       <header class="learn-section-hdr">
-        <h2 id="h-anticipatory" title="Anticipatory: rag_anticipate_candidates">Predicciones que hizo</h2>
-        <p class="muted">Predicciones por tipo, aciertos, reacciones tuyas, importancia de cada tipo</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-anticipatory" data-collapse="body-anticipatory">−</button>
+        <h2 id="h-recent" title="Últimos 50 movimientos del CSV de MOZE">Movimientos recientes</h2>
+        <p class="muted">Últimos 50 gastos / ingresos categorizados</p>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-recent" data-collapse="body-recent">−</button>
       </header>
-      <div class="learn-section-body" id="body-anticipatory">
-        <div class="chart-grid">
-          <div class="chart-card" data-chart-card="anti-candidates">
-            <h3 title="Anticipated candidates by kind (stacked)">Predicciones por tipo</h3>
-            <div class="chart-wrap"><canvas id="chart-anti-candidates"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="anti-selection-send">
-            <h3 title="Anticipatory selection + send rate">Acierto de predicciones</h3>
-            <div class="chart-wrap"><canvas id="chart-anti-selection-send"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="anti-reactions">
-            <h3 title="Anticipatory user reactions">Cómo reaccionaste</h3>
-            <div class="chart-wrap"><canvas id="chart-anti-reactions"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="anti-weights">
-            <h3 title="Anticipatory weights by kind">Importancia de cada tipo de predicción</h3>
-            <div class="chart-wrap"><canvas id="chart-anti-weights"></canvas></div>
+      <div class="learn-section-body" id="body-recent">
+        <div class="chart-card wide" data-chart-card="recent-table">
+          <div class="tx-scroll">
+            <table class="tx-table" id="recent-table">
+              <thead>
+                <tr>
+                  <th>Fecha</th>
+                  <th>Categoría</th>
+                  <th>Descripción</th>
+                  <th>Comercio</th>
+                  <th>Cuenta</th>
+                  <th class="tx-amount">Monto</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ── 9. ROUTING LEARNING ──────────────────────────────────── -->
-    <section class="learn-section" id="sec-routing" aria-labelledby="h-routing">
+    <!-- ── 8. FUENTES DETECTADAS ─────────────────────────────────── -->
+    <section class="learn-section" id="sec-sources" aria-labelledby="h-sources">
       <header class="learn-section-hdr">
-        <h2 id="h-routing" title="Routing learning: rag_routing_decisions">A dónde envió cada pregunta</h2>
-        <p class="muted">A qué destino fue cada pregunta, reglas activas, confianza de las decisiones</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-routing" data-collapse="body-routing">−</button>
+        <h2 id="h-sources" title="Archivos detectados en la carpeta Finances/">Archivos leídos</h2>
+        <p class="muted">Carpeta iCloud · MOZE_*.csv (deduplicado), Último resumen*.xlsx, *.pdf</p>
+        <button class="collapse-btn" type="button" aria-expanded="false" aria-controls="body-sources" data-collapse="body-sources">+</button>
       </header>
-      <div class="learn-section-body" id="body-routing">
-        <div class="chart-grid">
-          <div class="chart-card" data-chart-card="routing-decisions">
-            <h3 title="Routing decisions by bucket (stacked)">A dónde fueron las preguntas</h3>
-            <div class="chart-wrap"><canvas id="chart-routing-decisions"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="routing-rules">
-            <h3 title="Active routing rules over time">Reglas activas</h3>
-            <div class="chart-wrap"><canvas id="chart-routing-rules"></canvas></div>
-          </div>
-          <div class="chart-card wide" data-chart-card="routing-evidence">
-            <h3 title="Routing evidence ratio distribution">Confianza de las decisiones</h3>
-            <div class="chart-wrap"><canvas id="chart-routing-evidence"></canvas></div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ── 10. WHISPER LEARNING ─────────────────────────────────── -->
-    <section class="learn-section" id="sec-whisper" aria-labelledby="h-whisper">
-      <header class="learn-section-hdr">
-        <h2 id="h-whisper" title="Whisper learning: vocab + corrections">Cómo mejoró la transcripción</h2>
-        <p class="muted">Vocabulario aprendido, correcciones manuales, confianza promedio, términos más importantes</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-whisper" data-collapse="body-whisper">−</button>
-      </header>
-      <div class="learn-section-body" id="body-whisper">
-        <div class="chart-grid">
-          <div class="chart-card" data-chart-card="whisper-vocab-source">
-            <h3 title="Whisper vocab size by source">Vocabulario por fuente</h3>
-            <div class="chart-wrap"><canvas id="chart-whisper-vocab-source"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="whisper-corrections">
-            <h3 title="Whisper corrections by source over time">Correcciones de transcripción</h3>
-            <div class="chart-wrap"><canvas id="chart-whisper-corrections"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="whisper-logprob">
-            <h3 title="Whisper avg logprob per day">Confianza de transcripciones</h3>
-            <div class="chart-wrap"><canvas id="chart-whisper-logprob"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="whisper-top-vocab">
-            <h3 title="Top whisper vocab by weight">Términos más importantes</h3>
-            <div class="chart-wrap"><canvas id="chart-whisper-top-vocab"></canvas></div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ── 11. VAULT INTELLIGENCE ───────────────────────────────── -->
-    <section class="learn-section" id="sec-vault" aria-labelledby="h-vault">
-      <header class="learn-section-hdr">
-        <h2 id="h-vault" title="Vault intelligence: entities + contradictions">Qué aprendió de tus notas</h2>
-        <p class="muted">Personas y lugares, menciones, inconsistencias detectadas, organización de notas</p>
-        <button class="collapse-btn" type="button" aria-expanded="true" aria-controls="body-vault" data-collapse="body-vault">−</button>
-      </header>
-      <div class="learn-section-body" id="body-vault">
-        <div class="chart-grid">
-          <div class="chart-card" data-chart-card="vault-entities-type">
-            <h3 title="Entities by type over time">Personas y lugares en el tiempo</h3>
-            <div class="chart-wrap"><canvas id="chart-vault-entities-type"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="vault-mentions">
-            <h3 title="Mentions per day">Menciones de entidades</h3>
-            <div class="chart-wrap"><canvas id="chart-vault-mentions"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="vault-contradictions">
-            <h3 title="Contradictions per week: detected vs resolved">Inconsistencias detectadas vs resueltas</h3>
-            <div class="chart-wrap"><canvas id="chart-vault-contradictions"></canvas></div>
-          </div>
-          <div class="chart-card" data-chart-card="vault-filing">
-            <h3 title="Filing by folder (stacked)">Distribución en carpetas</h3>
-            <div class="chart-wrap"><canvas id="chart-vault-filing"></canvas></div>
-          </div>
-          <div class="chart-card wide" data-chart-card="vault-surface-archive">
-            <h3 title="Surface vs archive over time">Notas activas vs archivadas</h3>
-            <div class="chart-wrap"><canvas id="chart-vault-surface-archive"></canvas></div>
-          </div>
+      <div class="learn-section-body collapsed" id="body-sources">
+        <div class="chart-card wide" data-chart-card="sources-list">
+          <div id="sources-meta" class="muted" style="font-size: 12px; margin-bottom: 8px;"></div>
+          <div id="sources-list"></div>
         </div>
       </div>
     </section>
   </main>
 
-  <!-- Persistent SR-only live region — sobrevive al re-render de las
-       secciones (mismo patrón que dashboard.html). -->
-  <span id="learning-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de aprendizaje</span>
+  <span id="finance-status" class="sr-only" role="status" aria-live="polite">Cargando datos del dashboard de finanzas</span>
 
-  <script src="/static/learning.js" defer></script>
+  <script src="/static/finance.js" defer></script>
 </body>
 </html>

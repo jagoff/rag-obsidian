@@ -291,6 +291,23 @@ def _disable_semantic_response_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _disable_incremental_tune_trigger(monkeypatch):
+    """B6 (2026-04-29): `record_feedback` triggers an incremental tune
+    via `_maybe_trigger_incremental_tune` when ≥10 feedbacks pile up
+    since the last tune. In tests we don't want any subprocess.Popen
+    of a real `rag tune --online --apply` — set the threshold to 0
+    so the trigger no-ops. Tests that exercise the trigger directly
+    can override via `monkeypatch.setenv("RAG_INCREMENTAL_TUNE_THRESHOLD", "10")`.
+    """
+    monkeypatch.setenv("RAG_INCREMENTAL_TUNE_THRESHOLD", "0")
+    # `record_feedback` reads the constant via the module namespace, not
+    # at call time, so override the already-imported value too.
+    import rag
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 0)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _force_log_query_event_sync(monkeypatch):
     """Perf audit 2026-04-22: ``log_query_event`` pasó a async por default
     (queue daemon `_BACKGROUND_SQL_QUEUE`) para eliminar el 1.3s retry

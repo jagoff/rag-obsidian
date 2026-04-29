@@ -4203,6 +4203,118 @@ def record_feedback(
     global _feedback_golden_memo, _feedback_golden_source_ts_sql
     _feedback_golden_memo = None
     _feedback_golden_source_ts_sql = None
+    # B6 (2026-04-29): trigger an incremental tune in the background when
+    # enough feedbacks have piled up since the last tune. The 4x/day
+    # scheduled tune from the plist is the safety net; this just shortens
+    # the latency between feedback arrival and weight update for active
+    # learning bursts.
+    _maybe_trigger_incremental_tune()
+
+
+# ── Online incremental tune trigger (B6) ──────────────────────────────────
+# Threshold + cooldown configurable via env. Default: every 10 new feedbacks
+# OR every 30 minutes since last tune (whichever comes first), provided
+# at least one explicit feedback has arrived. Set the threshold env var
+# to 0 to disable the trigger entirely (only the scheduled 4x/day tune
+# from `com.fer.obsidian-rag-online-tune` runs).
+INCREMENTAL_TUNE_THRESHOLD = int(
+    os.environ.get("RAG_INCREMENTAL_TUNE_THRESHOLD", "10")
+)
+INCREMENTAL_TUNE_COOLDOWN_S = int(
+    os.environ.get("RAG_INCREMENTAL_TUNE_COOLDOWN_S", "1800")
+)
+
+
+def _maybe_trigger_incremental_tune() -> bool:
+    """If enough feedback has accumulated since the last tune, kick off
+    an async tune in the background.
+
+    Idempotent: if a tune is already running (lockfile present), no-op.
+    Returns True iff a tune was actually launched.
+
+    Disabled when RAG_INCREMENTAL_TUNE_THRESHOLD=0. Tests use this env
+    to avoid spawning real subprocesses.
+    """
+    if INCREMENTAL_TUNE_THRESHOLD <= 0:
+        return False
+    try:
+        with _ragvec_state_conn() as conn:
+            # Last tune timestamp — fall back to "epoch" if the tune
+            # table is empty (first-ever launch).
+            row = conn.execute(
+                "SELECT MAX(ts) FROM rag_tune"
+            ).fetchone()
+            last_tune_iso = (row[0] if row else None) or "1970-01-01T00:00:00"
+            # Count feedbacks since the last tune.
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM rag_feedback WHERE ts > ?",
+                (last_tune_iso,),
+            ).fetchone()
+            n_new = int(cnt[0] if cnt else 0)
+    except Exception as exc:
+        _log_sql_state_error("incremental_tune_check_sql_failed",
+                              err=repr(exc))
+        return False
+    if n_new < INCREMENTAL_TUNE_THRESHOLD:
+        return False
+    # Cooldown: don't kick off if the previous tune is too recent.
+    try:
+        last_tune_dt = datetime.fromisoformat(last_tune_iso)
+        elapsed = (datetime.now() - last_tune_dt).total_seconds()
+    except (ValueError, TypeError):
+        elapsed = INCREMENTAL_TUNE_COOLDOWN_S + 1
+    if elapsed < INCREMENTAL_TUNE_COOLDOWN_S:
+        return False
+    # Lockfile to prevent overlap with the scheduled plist tune.
+    lock = Path.home() / ".local/share/obsidian-rag/incremental-tune.lock"
+    if lock.exists():
+        # Stale lock if older than 1h — clear and proceed.
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return False
+        if age < 3600:
+            return False
+        try:
+            lock.unlink()
+        except OSError:
+            return False
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(os.getpid()))
+    except OSError:
+        return False
+    # Fire-and-forget subprocess. The tune writes its own log to the
+    # standard online-tune.log via the rag CLI's logging hooks.
+    rag_bin = (
+        Path.home() / ".local" / "bin" / "rag"
+        if (Path.home() / ".local" / "bin" / "rag").exists()
+        else "rag"  # PATH lookup
+    )
+    try:
+        subprocess.Popen(
+            [
+                str(rag_bin), "tune", "--online", "--apply", "--yes",
+                "--days", "14",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env={
+                **os.environ,
+                "RAG_INCREMENTAL_TUNE_THRESHOLD": "0",  # avoid recursion
+            },
+        )
+    except Exception as exc:
+        _log_sql_state_error("incremental_tune_spawn_failed",
+                              err=repr(exc))
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def feedback_counts() -> tuple[int, int]:

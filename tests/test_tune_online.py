@@ -403,6 +403,121 @@ def test_feedback_implicit_skips_session_scope(tmp_path, monkeypatch):
     assert result == []
 
 
+# ── _maybe_trigger_incremental_tune (B6) ─────────────────────────────────────
+
+def _seed_tune(tune_ts_iso: str) -> None:
+    """Seed a tune row to set the 'last tune' timestamp."""
+    with rag._ragvec_state_conn() as conn:
+        rag._sql_append_event(conn, "rag_tune", rag._map_tune_row({
+            "ts": tune_ts_iso,
+            "cmd": "tune",
+            "samples": 1,
+            "seed": 42,
+            "n_cases": 1,
+            "baseline_json": {},
+            "best_json": {},
+            "delta": 0.0,
+        }))
+
+
+def test_incremental_tune_disabled_when_threshold_zero(tmp_path, monkeypatch):
+    """RAG_INCREMENTAL_TUNE_THRESHOLD=0 disables the trigger."""
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 0)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    assert rag._maybe_trigger_incremental_tune() is False
+
+
+def test_incremental_tune_under_threshold(tmp_path, monkeypatch):
+    """Sub-threshold feedback count → no trigger."""
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 10)
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_COOLDOWN_S", 0)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    spawned = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: spawned.append(a))
+
+    _seed_tune(_iso(-7200))  # last tune 2h ago
+    _seed_feedback([
+        {"rating": 1, "q": f"q{i}", "paths": ["P.md"], "ts": _iso(-100)}
+        for i in range(5)  # only 5 < 10
+    ])
+    assert rag._maybe_trigger_incremental_tune() is False
+    assert spawned == []
+
+
+def test_incremental_tune_within_cooldown(tmp_path, monkeypatch):
+    """Above threshold but within cooldown → no trigger."""
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 5)
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_COOLDOWN_S", 1800)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    spawned = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: spawned.append(a))
+
+    _seed_tune(_iso(-300))  # 5 min ago — still in cooldown
+    _seed_feedback([
+        {"rating": 1, "q": f"q{i}", "paths": ["P.md"], "ts": _iso(-100)}
+        for i in range(10)
+    ])
+    assert rag._maybe_trigger_incremental_tune() is False
+    assert spawned == []
+
+
+def test_incremental_tune_fires_when_above_threshold_and_past_cooldown(
+    tmp_path, monkeypatch
+):
+    """Above threshold + past cooldown → fires subprocess."""
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 5)
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_COOLDOWN_S", 1800)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    spawned = []
+
+    def fake_popen(*args, **kwargs):
+        spawned.append(args[0] if args else None)
+        # Return something Popen-like that won't break.
+        return MagicMock()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    _seed_tune(_iso(-7200))  # 2h ago — past cooldown
+    _seed_feedback([
+        {"rating": 1, "q": f"q{i}", "paths": ["P.md"], "ts": _iso(-100)}
+        for i in range(10)
+    ])
+    result = rag._maybe_trigger_incremental_tune()
+    assert result is True
+    assert len(spawned) == 1
+    cmd = spawned[0]
+    # Verify the subprocess invocation includes tune --online --apply --yes.
+    assert any("tune" in str(arg) for arg in cmd)
+    assert "--online" in cmd
+    assert "--apply" in cmd
+
+
+def test_incremental_tune_lockfile_prevents_overlap(tmp_path, monkeypatch):
+    """Existing fresh lockfile → no trigger."""
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_THRESHOLD", 5)
+    monkeypatch.setattr(rag, "INCREMENTAL_TUNE_COOLDOWN_S", 0)
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    spawned = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: spawned.append(a))
+
+    # Create a fresh lockfile (just-now mtime).
+    lock = Path.home() / ".local/share/obsidian-rag/incremental-tune.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("99999")
+
+    _seed_tune(_iso(-7200))
+    _seed_feedback([
+        {"rating": 1, "q": f"q{i}", "paths": ["P.md"], "ts": _iso(-100)}
+        for i in range(10)
+    ])
+    try:
+        assert rag._maybe_trigger_incremental_tune() is False
+        assert spawned == []
+    finally:
+        if lock.exists():
+            lock.unlink()
+
+
 # ── Ranker config versioning ──────────────────────────────────────────────────
 
 def test_backup_ranker_config_no_existing(tmp_path):

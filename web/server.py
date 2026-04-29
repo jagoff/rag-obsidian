@@ -395,6 +395,42 @@ _ANAPHORIC_TEMPORAL_RE = re.compile(
 )
 
 
+# 2026-04-28 wave-8 (P3 #10): patrones meta/referenciales de follow-up.
+# Distintos del temporal — acá el user pregunta SOBRE la lista del turno
+# previo en vez de cambiar la ventana temporal. Ejemplos del eval Conv 2:
+#
+#   T1: "qué eventos esta semana?" → calendar_ahead
+#   T2: "y de eso qué puedo postergar?" → ❌ off-topic (sin fix)
+#
+# Match patterns:
+#   - "y de eso/esos/esas/esto/estas"
+#   - "cuál podría/puedo/podés/sería/es el más X"
+#   - "los demás", "el primero", "el último", "el de X"
+#   - "el más urgente/importante/...", "qué prioridad...", "qué es lo más X"
+#
+# Cuando matchea: re-fire el read tool del turno previo Y propagamos su
+# output renderizado al CONTEXTO con un header "DATOS DEL TURNO ANTERIOR".
+_ANAPHORIC_REFERENCE_RE = re.compile(
+    r"^\s*"
+    r"(?:y\s+)?"
+    r"(?:"
+    # "de eso/eso(s)/esto/estas/aquellos" — referencia directa al turno previo
+    r"(?:de|sobre|en)\s+(?:eso|esos?|esto|estas?|aquellos?|aquellas?)"
+    # "los/las anteriores", "los demás", "el primero", "el último"
+    r"|(?:los|las)\s+(?:anteriores?|dem[aá]s|primeros?|[uú]ltimos?)"
+    r"|el\s+(?:primero|[uú]ltimo|m[aá]s\s+\w+|de\s+\w+)"
+    # "cuál es/podría/sería/podés/puedo el más X" / "cuál podría posponer"
+    r"|cu[aá]l\s+(?:es|podr[ií]a|ser[ií]a|pod[eé]s|puedo|deber[ií]a|tendr[ií]a)"
+    # "qué tan X", "qué X es lo más Y", "qué es lo más X"
+    r"|qu[eé]\s+(?:tan|es\s+lo\s+m[aá]s|es\s+m[aá]s)"
+    # "cuáles son los más X", "cuáles puedo X"
+    r"|cu[aá]les\s+(?:son|puedo|podr[ií]a|deber[ií]a)"
+    r")"
+    r"\b.{0,80}\s*[?!.]?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _resolve_anaphoric_args(tool_name: str, question: str, last_location: str | None) -> dict:
     """Compute args para el tool re-fire en follow-up anafórico.
 
@@ -10486,19 +10522,22 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # Repro Conv 4 T2: "y mañana?" tras "qué hago hoy?" → el LLM
         # alucinaba propose_reminder. Fix: si el turno previo fired tools
         # de read-intent (calendar_ahead, reminders_due, weather, etc.) Y
-        # la query actual matchea un patrón anaphoric+temporal (`y X?`,
-        # `y mañana?`, `y la semana?`, etc.), re-fire los mismos tools
-        # con los args ajustados por el shift temporal.
+        # la query actual matchea un patrón anaphoric — temporal ("y
+        # mañana?") o referencial ("y de eso qué puedo posponer?") —
+        # re-fire los mismos tools con args ajustados.
         #
         # UNION semantics — el `_detect_tool_intent` ya pudo haber emitido
         # `reminders_due/calendar_ahead/whatsapp_pending` por matchear
         # "mañana"/"hoy", pero NO `weather` (no hay keyword genérico).
         # Si el turno previo fired weather y el actual es anafórico,
         # ADD weather al set actual sin descartar lo que ya hay.
+        _q_stripped = question.strip()
+        _is_anaphoric_temporal = bool(_ANAPHORIC_TEMPORAL_RE.match(_q_stripped))
+        _is_anaphoric_reference = bool(_ANAPHORIC_REFERENCE_RE.match(_q_stripped))
         if (
             not is_propose_intent
             and _last_turn_tools
-            and _ANAPHORIC_TEMPORAL_RE.match(question.strip())
+            and (_is_anaphoric_temporal or _is_anaphoric_reference)
         ):
             _read_intent_tools = {
                 "calendar_ahead", "reminders_due", "whatsapp_pending",
@@ -10515,8 +10554,9 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                     _existing_names.add(name)
             if _carryover_added:
                 _forced_tool_pairs = list(_forced_tool_pairs) + _carryover_added
+                _kind = "temporal" if _is_anaphoric_temporal else "reference"
                 print(
-                    f"[chat-anaphoric-carryover] q={question!r} "
+                    f"[chat-anaphoric-carryover] kind={_kind} q={question!r} "
                     f"prev_tools={_last_turn_tools} "
                     f"existing={[n for n,_ in _forced_tool_pairs[:len(_forced_tool_pairs)-len(_carryover_added)]]} "
                     f"added={[n for n,_ in _carryover_added]}",

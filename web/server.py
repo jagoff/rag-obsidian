@@ -14943,25 +14943,39 @@ _LOG_DIRS: tuple[Path, ...] = (
 # Heurística para clasificar líneas. Sin word boundary INICIAL así
 # matchea CamelCase tipo `OperationalError` o `UserWarning` (que NO
 # tienen boundary entre `l-E` o `r-W`), pero con boundary final + un
-# lookahead negativo que evita clasificar como error las stats con valor
-# 0 (`failed=0` / `errors: 0` / `"errors": 0` / `"skipped_judge_failed":
-# 0`). El char-class `[\s:='\"]` cubre las 4 formas comunes:
-#   - `failed=0`         → separador `=`
-#   - `errors: 0`        → separadores ` :` (espacio + dos puntos)
-#   - `"errors": 0`      → separadores `"` `:` (cierre de quote + dos
-#                          puntos), forma JSON estándar
-#   - `'errors': 0`      → separadores `'` `:` (cierre de quote + dos
-#                          puntos), JSON con single-quotes (raro pero
-#                          aparece en algunos logs Python repr())
-# Bug histórico (2026-04-29): el regex tenía sólo `[\s:=]` así que
-# clasificaba `"skipped_judge_failed": 0` (en el JSON heartbeat de
-# auto-harvest) como error → la sidebar de /logs mostraba 3 errores
-# falsos para auto-harvest, pero el botón "fix con IA" después decía
-# "no hay errores recientes" porque /api/logs/file con only_errors=1
-# usaba otra heurística que sí filtraba bien. UI inconsistente.
+# lookahead negativo que evita 2 clases de falsos positivos:
+#
+# (1) Stats con valor 0 — `failed=0` / `errors: 0` / `"errors": 0` /
+#     `"skipped_judge_failed": 0`. El char-class `[\s:='\"]` cubre las
+#     4 formas comunes:
+#       - `failed=0`         → separador `=`
+#       - `errors: 0`        → separadores ` :` (espacio + dos puntos)
+#       - `"errors": 0`      → separadores `"` `:` (cierre de quote +
+#                              dos puntos), forma JSON estándar
+#       - `'errors': 0`      → separadores `'` `:` (cierre de quote +
+#                              dos puntos), JSON con single-quotes
+#                              (raro pero aparece en logs Python repr())
+#
+# (2) Paths a archivos de log que mencionan `error` en el filename —
+#     ej. `tailing /var/log/cloudflared.error.log` (cloudflared-watcher
+#     loguea esto cada vez que arranca), `cat foo.error.log`, etc. La
+#     heurística `\.(?:log|txt|json|csv|jsonl|err|out)\b` captura las
+#     extensiones de log más comunes después del keyword. Para uvicorn
+#     `INFO:    "GET /api/logs/file?name=...error.log... 200 OK"` ya
+#     hay un guard separado con `_LOG_RE_INFO_PREFIX`.
+#
+# Bugs históricos (2026-04-29):
+#   1. `"skipped_judge_failed": 0` (heartbeat JSON de auto-harvest)
+#      → 3 errores falsos en sidebar de /logs.
+#   2. `Watcher started, tailing /.../cloudflared.error.log`
+#      (cloudflared-watcher imprime esto cada vez que arranca) →
+#      11 errores falsos en sidebar.
+# Ambos casos: el botón "fix con IA" del service-level mostraba "no
+# hay errores recientes" porque el endpoint `/api/logs/file?
+# only_errors=1` usa otra heurística menos agresiva. UI inconsistente.
 _LOG_RE_ERROR = re.compile(
     r"(error|exception|traceback|failed|fatal|panic|critical)"
-    r"(?!s?[\s:='\"]+0\b)\b",
+    r"(?!s?[\s:='\"]+0\b|\.(?:log|txt|json|csv|jsonl|err|out)\b)\b",
     re.IGNORECASE,
 )
 _LOG_RE_WARN = re.compile(r"(warning|warn|deprec|retry)\b", re.IGNORECASE)

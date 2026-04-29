@@ -82,7 +82,15 @@ class LambdaRankerScorer:
 
     @classmethod
     def load(cls, model_path: str | Path) -> "LambdaRankerScorer":
-        """Carga el booster desde disk sin caching (uso explícito)."""
+        """Carga el booster desde disk sin caching (uso explícito).
+
+        Si la dimensión del modelo no matchea `FEATURE_NAMES` actual (ej.
+        modelo entrenado con N features pero el código actual genera N+1),
+        loggea un warning y retorna un wrapper que falla a 0.0. Esto evita
+        crashear el caller cuando se agrega una feature nueva (C7) sin
+        haber retrained el modelo aún. Workaround: `rag tune-lambdarank
+        --apply` para retrain con el feature set actual.
+        """
         import lightgbm as lgb
 
         path_str = str(model_path)
@@ -93,6 +101,21 @@ class LambdaRankerScorer:
         if not feat_names:
             from rag_ranker_lgbm.features import FEATURE_NAMES
             feat_names = list(FEATURE_NAMES)
+        # Feature dimension drift guard. The booster's expected dim is
+        # the number of features it was trained with. Compare against
+        # the current FEATURE_NAMES; if it shrunk we're loading a stale
+        # model.
+        from rag_ranker_lgbm.features import FEATURE_NAMES
+        expected_dim = booster.num_feature() if hasattr(booster, "num_feature") else len(feat_names)
+        if expected_dim != len(FEATURE_NAMES):
+            logger.warning(
+                "Stale ranker.lgbm: trained with %d features but code "
+                "expects %d (FEATURE_NAMES). Retrain with `rag tune-"
+                "lambdarank --apply`. Predictions will fall back to "
+                "constant 0.0.",
+                expected_dim, len(FEATURE_NAMES),
+            )
+            return cls(_StaleBoosterStub(), feat_names)
         return cls(booster, feat_names)
 
     @classmethod
@@ -123,3 +146,18 @@ class LambdaRankerScorer:
         """Util para tests / hot-reload tras retrain."""
         with _cache_lock:
             _scorer_cache.clear()
+
+
+class _StaleBoosterStub:
+    """Stand-in for a real lgb.Booster when the persisted model dim doesn't
+    match the current FEATURE_NAMES. Returns 0.0 for every candidate so
+    `apply_weighted_scores` keeps producing usable output (linear ranker
+    score dominates) until the user runs `rag tune-lambdarank --apply`.
+    """
+
+    def predict(self, X) -> list[float]:
+        try:
+            n = len(X)
+        except TypeError:
+            n = 0
+        return [0.0] * n

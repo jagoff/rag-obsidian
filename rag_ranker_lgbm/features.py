@@ -51,6 +51,7 @@ FEATURE_NAMES: list[str] = [
     "click_prior",           # CTR per-path desde behavior
     "click_prior_folder",    # CTR per-folder
     "click_prior_hour",      # CTR para hora del día
+    "click_prior_dayofweek", # CTR para día de la semana (lun=0..dom=6)
     "dwell_score",           # log1p(mean_dwell_s)
 ]
 
@@ -73,6 +74,7 @@ def _candidate_to_feature_vector(
     click_prior = float(candidate.get("click_prior", 0.0))
     click_prior_folder = float(candidate.get("click_prior_folder", 0.0))
     click_prior_hour = float(candidate.get("click_prior_hour", 0.0))
+    click_prior_dayofweek = float(candidate.get("click_prior_dayofweek", 0.0))
     dwell_score = float(candidate.get("dwell_score", 0.0))
 
     # `feedback_match_floor`: 1 si el chunk tuvo match en feedback corpus
@@ -92,6 +94,7 @@ def _candidate_to_feature_vector(
         click_prior,
         click_prior_folder,
         click_prior_hour,
+        click_prior_dayofweek,
         dwell_score,
     ]
 

@@ -29,9 +29,48 @@ def test_load_behavior_priors_missing_file(tmp_path, monkeypatch):
     assert priors["click_prior"] == {}
     assert priors["click_prior_folder"] == {}
     assert priors["click_prior_hour"] == {}
+    assert priors["click_prior_dayofweek"] == {}
     assert priors["dwell_score"] == {}
     assert priors["n_events"] == 0
     assert "hash" in priors
+
+
+def test_click_prior_dayofweek_aggregation(tmp_path, monkeypatch):
+    """C7 (2026-04-29): path × weekday CTR. Mismo Laplace que click_prior_hour
+    pero indexado por datetime.weekday() (0=Mon..6=Sun) en lugar de hour."""
+    import rag
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    monkeypatch.setattr(rag, "_behavior_priors_cache", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    # 2026-04-13 is Monday (weekday=0). 2026-04-19 is Sunday (weekday=6).
+    _seed_sql_behavior(tmp_path, [
+        # 3 clicks Monday on path A
+        {"source": "cli", "event": "open", "path": "Work.md",
+         "ts": "2026-04-13T09:00:00"},
+        {"source": "cli", "event": "open", "path": "Work.md",
+         "ts": "2026-04-13T10:00:00"},
+        {"source": "cli", "event": "open", "path": "Work.md",
+         "ts": "2026-04-13T11:00:00"},
+        # 1 click Sunday on path A
+        {"source": "cli", "event": "open", "path": "Work.md",
+         "ts": "2026-04-19T15:00:00"},
+        # 1 click Sunday on path B
+        {"source": "cli", "event": "open", "path": "Family.md",
+         "ts": "2026-04-19T16:00:00"},
+    ])
+    priors = rag._load_behavior_priors()
+    cdw = priors["click_prior_dayofweek"]
+    # (Work.md, Monday=0): 3 clicks 3 imps → (3+1)/(3+10) ≈ 0.308
+    assert ("Work.md", 0) in cdw
+    assert abs(cdw[("Work.md", 0)] - (3 + 1) / (3 + 10)) < 1e-6
+    # (Work.md, Sunday=6): 1 click 1 imp → (1+1)/(1+10) ≈ 0.182
+    assert ("Work.md", 6) in cdw
+    assert abs(cdw[("Work.md", 6)] - (1 + 1) / (1 + 10)) < 1e-6
+    # (Family.md, Monday=0): not present (no events Monday)
+    assert ("Family.md", 0) not in cdw
+    # (Family.md, Sunday=6): present
+    assert ("Family.md", 6) in cdw
 
 
 _TEST_EVENTS = [

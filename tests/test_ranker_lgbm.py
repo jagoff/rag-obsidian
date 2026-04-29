@@ -93,10 +93,12 @@ def test_feature_vector_has_correct_length():
         "fb_pos_cos": 0.3, "fb_neg_cos": 0.0,
         "graph_pagerank": 0.05,
         "click_prior": 0.2, "click_prior_folder": 0.15, "click_prior_hour": 0.1,
+        "click_prior_dayofweek": 0.05,
         "dwell_score": 0.4,
     }
     vec = _candidate_to_feature_vector(cand, has_recency_cue=True)
-    assert len(vec) == len(FEATURE_NAMES) == 12
+    # C7 (2026-04-29): bumpeamos 12 → 13 al sumar `click_prior_dayofweek`.
+    assert len(vec) == len(FEATURE_NAMES) == 13
 
 
 def test_feature_vector_recency_cue_gating():
@@ -286,11 +288,12 @@ def test_train_lambdarank_minimal_e2e(tmp_path: Path):
     X: list[list[float]] = []
     y: list[int] = []
     group: list[int] = []
+    n_feat = len(FEATURE_NAMES)
     for q_idx in range(5):
         for cand_idx in range(3):
             # Feature 0 alto = label alto. Los otros features ruido.
             label = cand_idx  # 0, 1, 2
-            row = [float(label)] + [0.0] * 11
+            row = [float(label)] + [0.0] * (n_feat - 1)
             X.append(row)
             y.append(label)
         group.append(3)
@@ -308,7 +311,7 @@ def test_train_lambdarank_minimal_e2e(tmp_path: Path):
     assert output_path.exists()
     assert output_path.with_suffix(".meta.json").exists()
     metadata = result["metadata"]
-    assert metadata["n_features"] == 12
+    assert metadata["n_features"] == n_feat
     assert metadata["n_train_queries"] == 5
     assert "feature_importance_gain" in metadata
 
@@ -321,16 +324,17 @@ def test_train_lambdarank_validates_input(tmp_path: Path):
             output_path=tmp_path / "test.lgbm",
         )
 
+    n_feat = len(FEATURE_NAMES)
     with pytest.raises(ValueError, match="X y y tienen len distintos"):
         train_lambdarank(
-            [[0.0] * 12], [1, 2], [1],
+            [[0.0] * n_feat], [1, 2], [1],
             feature_names=FEATURE_NAMES,
             output_path=tmp_path / "test.lgbm",
         )
 
     with pytest.raises(ValueError, match="sum.group"):
         train_lambdarank(
-            [[0.0] * 12, [0.0] * 12], [1, 2], [3],  # group sum=3, X len=2
+            [[0.0] * n_feat, [0.0] * n_feat], [1, 2], [3],  # group sum=3, X len=2
             feature_names=FEATURE_NAMES,
             output_path=tmp_path / "test.lgbm",
         )
@@ -344,9 +348,10 @@ def trained_model_path(tmp_path: Path) -> Path:
     X: list[list[float]] = []
     y: list[int] = []
     group: list[int] = []
+    n_feat = len(FEATURE_NAMES)
     for _ in range(5):
         for cand_idx in range(3):
-            X.append([float(cand_idx)] + [0.1] * 11)
+            X.append([float(cand_idx)] + [0.1] * (n_feat - 1))
             y.append(cand_idx)
         group.append(3)
 

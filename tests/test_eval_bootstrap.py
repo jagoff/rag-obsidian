@@ -9,6 +9,21 @@ import pytest
 import yaml
 
 
+@pytest.fixture(autouse=True)
+def _isolate_db_path(tmp_path):
+    """Snap+restore manual de `rag.DB_PATH` per-test. El monkeypatch in-test
+    revierte en su propio teardown DESPUÉS del `_stabilize_rag_state` y deja
+    leak hacia la prod telemetry.db (1038 rows polluted detectadas 2026-04-29).
+    Pattern documentado en CLAUDE.md §"Test DB_PATH isolation per-file"."""
+    import rag as _rag
+    snap = _rag.DB_PATH
+    _rag.DB_PATH = tmp_path / "ragvec"
+    try:
+        yield
+    finally:
+        _rag.DB_PATH = snap
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

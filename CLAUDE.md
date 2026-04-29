@@ -1070,3 +1070,55 @@ Si la feature shippea junto con cambios al `rag setup` (o si el user prefiere re
 ### Cuándo NO instalar el plist en el commit
 
 Excepción legítima: si la feature requiere config previo del user (ej. OAuth de Gmail, ambient.json, etc.) y el plist crashea sin eso. En ese caso, el commit msg debe decir explícitamente "el plist NO se instala automáticamente porque requiere `<X>` primero" — no "corré `rag setup` cuando puedas" sin más contexto. El [`com.fer.obsidian-rag-ingest-calendar.plist`](rag/__init__.py) es ejemplo: `rag setup` lo skipea si `~/.calendar-mcp/credentials.json` no existe.
+
+## Wave-8 gotchas — pipeline de filtros + carry-over (2026-04-28)
+
+Tres patrones que se mordieron durante la wave-8 de la eval Playwright. Documentados acá porque cualquiera de los tres puede repetirse silenciosamente y costar una sesión entera de debug.
+
+### Filtros definidos pero no cableados
+
+**Síntoma**: el codebase tiene una clase `_XxxFilter` o función `_strip_*`/`_redact_*`/`_normalize_*` con regex completo + docstring + comentario explicando el bug que arregla, pero **ningún call site la invoca**. La intención es real, alguien la dejó "lista para conectar" y nunca la conectó. El bug que se suponía fixeada sigue ahí.
+
+**Caso real**: `_strip_foreign_scripts` (`web/server.py:1504-1531`) existía con docstring "Remove characters from non-allowed scripts (CJK, Cyrillic, Hebrew, Arabic…)". Nunca se llamaba. CJK leak en respuestas de weather siguió en producción hasta wave-8.
+
+**Cómo evitarlo en el futuro**:
+
+1. Cuando agregues un nuevo filtro, también editá el `_emit()` helper dentro de `gen()` (línea ~11631 de `web/server.py`) Y la pipeline de cache replay (línea ~9887 — `_redact_pii(_sem_text)`).
+2. Antes de "ya está, queda para wirear después", ya escribí el call site. Si lo dejás para "después" no llega.
+3. Hay un test de regresión [`tests/test_filter_wiring.py`](tests/test_filter_wiring.py) que falla si una clase `_*Filter` o función `_strip_*`/`_redact_*` está definida sin call site. Si alguna vez te marca un false-positive (filter intencionalmente no usado), agregalo a la allowlist del test, no lo borres.
+
+### Carry-over del pre-router silenciosamente sobrescrito por el fast-path
+
+**Síntoma**: agregaste lógica al inicio de `gen()` que computa `_forced_tool_pairs` (lo que el pre-router decidió disparar). El log dice que se computó. Pero en la respuesta el tool nunca corre. La causa es que **otro branch downstream** dentro de la misma `gen()` está re-llamando `_detect_tool_intent(question)` y descartando tu `_forced_tool_pairs`.
+
+**Caso real**: wave-8 carry-over anafórico. Pre-router setear `_forced_tool_pairs = [('weather', {'location': 'Barcelona'})]`. Línea 10996 hacía `_forced_tools = [] if _propose_intent else _detect_tool_intent(question)` que retornaba `[]` (sin la query "y en Barcelona?" no matchea ningún keyword). El tool nunca corría aunque el log decía que se había decidido. Fix: esa línea ahora hace `_forced_tools = list(_forced_tool_pairs)`.
+
+**Cómo evitarlo en el futuro**:
+
+```bash
+# Antes de cerrar un fix que toque _forced_tool_pairs, grep por re-detección:
+grep -n '_detect_tool_intent\|_forced_tools\s*=' web/server.py
+```
+
+Si aparece más de una asignación a `_forced_tools` o más de una llamada a `_detect_tool_intent`, **leé el contexto de cada una**. La regla es: el pre-router corre UNA vez al inicio de `gen()`, todo el resto del flow debe LEER de `_forced_tool_pairs`, no recomputar.
+
+### Bumpeo de `_FILTER_VERSION` es parte del fix, no un extra
+
+**Síntoma**: arreglaste un filtro / system prompt / regex que cambia el output user-facing. Validás vía Playwright. El test reporta que el bug sigue. Te volvés loco buscando el bug en tu código. La causa es que **el semantic cache sigue sirviendo respuestas pre-fix** porque la cache key no incluye nada que tu fix haya cambiado.
+
+**Mecanismo**: `_FILTER_VERSION` (`rag/__init__.py:4656`) está horneado dentro de `_hash_chunk_count` (línea 4659+) y usado como parte del corpus_hash que entra en la cache key del semantic cache. Bumpear la string invalida TODAS las entries del cache pre-fix de un saque.
+
+**Cuándo bumpear**:
+
+- Cambia un regex que afecta tools_fired (PII redact, raw tool stripper, iberian leaks, foreign scripts, lo que sea).
+- Cambia el `_WEB_SYSTEM_PROMPT` o cualquier de las REGLA N.
+- Cambia la traducción de descriptions (weather, etc.) inyectada al CONTEXTO.
+- Cualquier cambio que un user con cache hit verá como "no se aplicó tu fix".
+
+**Cuándo NO bumpear**:
+
+- Cambios en performance / refactors sin output change.
+- Cambios en features off-by-default (gated por env var).
+- Cambios en herramientas administrativas (CLI flags, scripts).
+
+**Convención de naming**: `wave<N>-<YYYY-MM-DD>` ej. `wave8-2026-04-28`. Greppable + cronológico.

@@ -1,6 +1,6 @@
 {
   "$schema": "https://cli.devin.ai/schemas/config.json",
-  "_comment": "Project permissions para obsidian-rag. Allow-list cubre el workflow habitual (git, rag CLI, uv, pytest, sqlite3, launchctl, observabilidad) para que el modo Normal no pida permiso en casi nada. Deny-list corta accidentes destructivos (rm -rf, sudo). Para zero prompts absolutos: `devin --permission-mode bypass` o Shift+Tab en sesion. Ver CLAUDE.md seccion 'Autonomous mode'.",
+  "_comment": "Project permissions para obsidian-rag. Allow-list cubre el workflow habitual (git, rag CLI, uv, pytest, sqlite3, launchctl, observabilidad, rm + rm -rf) para que el modo Normal no pida permiso en casi nada. Deny-list corta lo verdaderamente irrecuperable que NO tiene fallback en GitHub (sudo, git reset --hard, git push --force, git branch -D). rm -rf se sacó de deny el 2026-04-28 por pedido del user — el repo vive en remote y el vault está protegido por la ask-rule, asi que el blast radius queda acotado. Para zero prompts absolutos: `devin --permission-mode bypass` o Shift+Tab en sesion. Ver CLAUDE.md seccion 'Autonomous mode'.",
   "permissions": {
     "allow": [
       "Read(**)",
@@ -95,11 +95,11 @@
       "Exec(ollama ls)",
       "Exec(ollama list)",
       "Exec(ollama ps)",
-      "Exec(ollama show)"
+      "Exec(ollama show)",
+
+      "Exec(rm)"
     ],
     "deny": [
-      "Exec(rm -rf)",
-      "Exec(rm -fr)",
       "Exec(sudo)",
       "Exec(sudo -s)",
       "Exec(git reset --hard)",
@@ -108,7 +108,6 @@
       "Exec(git branch -D)"
     ],
     "ask": [
-      "Exec(rm)",
       "Write(.env*)",
       "Write(~/.ssh/**)",
       "Write(~/.aws/**)",

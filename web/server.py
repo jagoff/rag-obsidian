@@ -5833,147 +5833,33 @@ def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:
     return resolve_vault_paths([scope])
 
 
-# Palabras portuguesas/gallegas que qwen2.5:7b ocasionalmente leakea
-# bajo contextos WhatsApp con contactos brasileros (o notas scrapeadas
-# de fuentes en portugués). REGLA 0 del prompt ya las prohíbe
-# textualmente pero el modelo igual se contagia del lenguaje del
-# CONTEXTO. Este filter es la última barrera: reemplaza palabra-por-
-# palabra a su equivalente español. Medido 2026-04-23 en scratch_eval:
-# 1/20 respuestas tenía "do´mañá" literal (galego) pese al prompt
-# endurecido. Conservador: sólo pares alta-confianza donde la palabra
-# portuguesa/gallega NO existe (o es muy rara) en español.
-_IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
-    # Orden crítico: frases multi-palabra PRIMERO. Si aplicáramos las
-    # reglas atomicas antes, "em março" → "em marzo" (palabra "em"
-    # quedaría como galego en la respuesta).
-    (r"\buma\s+conversa\b", "una conversación"),
-    (r"\buma\s+conversação\b", "una conversación"),
-    (r"\bem\s+março\b", "en marzo"),
-    (r"\bem\s+maio\b", "en mayo"),
-    (r"\bem\s+junho\b", "en junio"),
-    (r"\bem\s+julho\b", "en julio"),
-    (r"\bem\s+setembro\b", "en septiembre"),
-    (r"\bem\s+outubro\b", "en octubre"),
-    (r"\bem\s+novembro\b", "en noviembre"),
-    (r"\bem\s+dezembro\b", "en diciembre"),
-    (r"\bem\s+fevereiro\b", "en febrero"),
-    (r"\bcontigo\s+em\b", "contigo en"),
-    # Meses (único sentido en portugués — en español todos tienen
-    # otra grafía).
-    (r"\bmarço\b", "marzo"),
-    (r"\bmaio\b", "mayo"),
-    (r"\bjunho\b", "junio"),
-    (r"\bjulho\b", "julio"),
-    (r"\bsetembro\b", "septiembre"),
-    (r"\boutubro\b", "octubre"),
-    (r"\bnovembro\b", "noviembre"),
-    (r"\bdezembro\b", "diciembre"),
-    (r"\bfevereiro\b", "febrero"),
-    # Tiempo (palabras que NO existen en español).
-    (r"\bhoje\b", "hoy"),
-    (r"\bontem\b", "ayer"),
-    (r"\bamanhã\b", "mañana"),
-    # Galego: "mañá" + variantes con apóstrofe ascii / unicode prime /
-    # backtick. Incluimos formas truncadas que el LLM emite cuando
-    # "trata" de españolizar el galego a medias ("do´man", "do´mañ",
-    # "do´mana") — captura cualquier "do[apóstrofe]ma[nñ][a|á]?".
-    (r"\bdo['´`]ma[nñ][áa]?\b", "mañana"),
-    (r"\bmañá\b", "mañana"),
-    # Pronombres claros (pt).
-    (r"\bnão\b", "no"),
-    # "sim" podría ser "sim" de simulación en español técnico — prefix
-    # la palabra con word-boundary y usamos case-insensitive para no
-    # cazar SIM en siglas.
-    (r"\bsim\b", "sí"),
-    # Cantidad (pt).
-    (r"\bmuito\b", "mucho"),
-    (r"\bmuita\b", "mucha"),
-    (r"\bmuitos\b", "muchos"),
-    (r"\bmuitas\b", "muchas"),
-    # Cortesía.
-    (r"\bobrigado\b", "gracias"),
-    (r"\bobrigada\b", "gracias"),
-    # Verbos comunes (pt — conjugaciones que no existen en español).
-    (r"\besqueças\b", "olvides"),       # "no te esqueças" → "no te olvides"
-    (r"\besqueça\b", "olvide"),
-    (r"\bdessas\b", "de esas"),         # "no te esqueças dessas"
-    (r"\bdesses\b", "de esos"),
-    # 2026-04-28 wave-5: leaks observados en Playwright batch sobre nota
-    # Ikigai. El LLM mezcló pt en respuestas que sí debían ser español.
-    # "tem" (3ra persona singular del verbo ter en pt) → "tiene". CUIDADO:
-    # "tem" puede aparecer en frases como "sistema TEM-1" — usamos word
-    # boundary + lookahead que pida espacio + minúscula después para no
-    # tocar siglas técnicas.
-    (r"\btem\s+(?=[a-záéíóúñ])", "tiene "),
-    (r"\bté\b", "té"),                  # idempotent (té ya está en español)
-    # Demostrativos/adjetivos (pt) — diferenciable porque las grafías
-    # con doble s NO existen en español.
-    (r"\besse\b", "ese"),
-    (r"\bessa\b", "esa"),
-    (r"\besses\b", "esos"),
-    (r"\bessas\b", "esas"),
-    (r"\bisso\b", "eso"),
-    (r"\bisto\b", "esto"),
-    (r"\baquilo\b", "aquello"),
-    # Adverbios/locuciones pt comunes en respuestas.
-    (r"\bAqui\s+estão\b", "Acá están"),
-    (r"\baqui\s+está\b", "acá está"),
-    (r"\baqui\b", "acá"),               # SOLO al inicio de frase + minúscula
-    (r"\bestão\b", "están"),
-    (r"\bmelhor\b", "mejor"),
-    (r"\bpior\b", "peor"),
-    # Verbos de movimiento/uso (pt → es).
-    (r"\bajudar\b", "ayudar"),
-    (r"\bajuda\b", "ayuda"),
-    (r"\bvocê\b", "vos"),
-    (r"\bvocês\b", "ustedes"),
-    # Conectores/preposiciones (pt — claramente no español).
-    (r"\bcom\s+(?=[a-záéíóúñ])", "con "),
-    (r"\bde\s+(?=[a-záéíóúñ]\w+ção\b)", "de "),  # idempotente — solo prep
-    # Sufijos -ção / -ções son siempre pt; convertir a -ción/-ciones en
-    # contexto. Caso específico observado.
-    (r"\bação\b", "acción"),
-    (r"\bações\b", "acciones"),
-    (r"\bsolução\b", "solución"),
-    (r"\bsoluções\b", "soluciones"),
-    (r"\bquestão\b", "cuestión"),
-    (r"\bquestões\b", "cuestiones"),
-    # Francés/italiano stray words (hallucination genuina, no contagio).
-    # "Voulu" observado al inicio de respuesta — claramente falso.
-    (r"\bVoulu,?\s+", ""),
-    (r"\bvoilà\b", "acá"),
+# 2026-04-29: las constantes y la función `_replace_iberian_leaks` se
+# movieron al módulo compartido `rag.iberian_leak_filter` para que
+# tanto el web (acá) como el CLI (`rag query` / `rag chat` via
+# `render_response()`) apliquen el mismo filtro PT→ES. Antes el filtro
+# vivía sólo acá y el CLI emitía respuestas con portugués mezclado
+# (reportado el 2026-04-29 con "Que tenes de Grecia?" → respuesta con
+# "primeira", "tua", "falam", "vistes", "primeiramente", "nos braços").
+# Importamos los nombres viejos como aliases para no romper los tests
+# en `tests/test_iberian_leak_filter.py` ni call sites que los usan.
+from rag.iberian_leak_filter import (  # noqa: E402  -- imports al top hechos arriba
+    _IBERIAN_LEAK_COMPILED,
+    _IBERIAN_LEAK_REPLACEMENTS,
 )
-_IBERIAN_LEAK_COMPILED: tuple[tuple[re.Pattern, str], ...] = tuple(
-    (re.compile(pat, re.IGNORECASE), repl)
-    for pat, repl in _IBERIAN_LEAK_REPLACEMENTS
-)
+from rag.iberian_leak_filter import replace_iberian_leaks as _replace_iberian_leaks  # noqa: E402
 
 # Palabras que INICIAN una frase multi-palabra del dict anterior. Cuando
 # el streaming filter ve un candidate que TERMINA con una de estas más
 # whitespace opcional, retiene la palabra en el buffer porque la
 # próxima llegada podría completar el compound (`em ` + `março` →
 # `em março` → `en marzo`). Mantener en sync con los compounds de
-# `_IBERIAN_LEAK_REPLACEMENTS` que son multi-palabra.
+# `_IBERIAN_LEAK_REPLACEMENTS` que son multi-palabra. NO se movió al
+# módulo común porque sólo lo usa el streaming filter de `_IberianLeakFilter`
+# acá abajo, no el path sync del CLI.
 _COMPOUND_STARTER_TAIL_RE = re.compile(
-    r"\b(uma|em|contigo)(\s+\S*)?\s*$",
+    r"\b(uma|em|contigo|tua|teu|tuas|teus|nos)(\s+\S*)?\s*$",
     re.IGNORECASE,
 )
-
-
-def _replace_iberian_leaks(text: str) -> str:
-    """Apply the _IBERIAN_LEAK_REPLACEMENTS regexes in order. Safe on
-    non-string / empty input. Preserves case for common cases via
-    `IGNORECASE` on the regex side — but the replacement is lowercase,
-    so mixed-case originals ("Março" → "marzo") normalise to lowercase.
-    That's acceptable: the leak itself is a model quirk, not a stylistic
-    choice we want to preserve.
-    """
-    if not text:
-        return text
-    out = text
-    for pat, repl in _IBERIAN_LEAK_COMPILED:
-        out = pat.sub(repl, out)
-    return out
 
 
 # 2026-04-28 wave-4: el LLM (qwen2.5:7b) tipea mal los nombres de archivos

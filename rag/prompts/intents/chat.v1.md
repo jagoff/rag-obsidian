@@ -2,7 +2,7 @@
 name: chat
 version: v1
 date: 2026-04-21
-includes: [chunk_as_data.v1, name_preservation.v1]
+includes: [language_es_AR.v1, chunk_as_data.v1, name_preservation.v1]
 notes: |
   Ultra-compressed variant for chat surfaces (WhatsApp via rag serve).
   ~60 tokens vs ~180 del STRICT. Menos prefill = faster first-token.

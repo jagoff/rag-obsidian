@@ -2,7 +2,7 @@
 name: comparison
 version: v2
 date: 2026-04-22
-includes: [chunk_as_data.v1, name_preservation.v1]
+includes: [language_es_AR.v1, chunk_as_data.v1, name_preservation.v1]
 notes: |
   Post-2026-04-22: refusal explícito cuando <2 fuentes. La versión v1
   permitía "respondé directamente sin forzar la estructura" con 1 sola

@@ -2,7 +2,7 @@
 name: synthesis
 version: v2
 date: 2026-04-22
-includes: [chunk_as_data.v1, name_preservation.v1]
+includes: [language_es_AR.v1, chunk_as_data.v1, name_preservation.v1]
 notes: |
   Post-2026-04-22: agrega refusal explícito cuando hay <2 fuentes
   relevantes — cerraba una avenida de hallucination silenciosa (modelo

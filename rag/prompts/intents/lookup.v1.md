@@ -2,7 +2,7 @@
 name: lookup
 version: v1
 date: 2026-04-21
-includes: [chunk_as_data.v1, name_preservation.v1]
+includes: [language_es_AR.v1, chunk_as_data.v1, name_preservation.v1]
 notes: |
   Intent: count / list / recent / agenda. Terse 1-2 sentences.
   Refusal exacto "No encontré esto en el vault." (distinto de STRICT

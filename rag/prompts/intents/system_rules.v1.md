@@ -2,7 +2,7 @@
 name: system_rules
 version: v1
 date: 2026-04-21
-includes: [chunk_as_data.v1, name_preservation.v1]
+includes: [language_es_AR.v1, chunk_as_data.v1, name_preservation.v1]
 notes: |
   Default "loose" prompt. Uses `--loose` CLI flag and web chat default.
   Allows <<ext>>...<</ext>> markers for external prose beyond the context,

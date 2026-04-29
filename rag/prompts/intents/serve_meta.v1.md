@@ -2,7 +2,7 @@
 name: serve_meta
 version: v1
 date: 2026-04-27
-includes: []
+includes: [language_es_AR.v1]
 notes: |
   System prompt para el endpoint /chat de `rag serve` — es el que usa
   el listener de WhatsApp para bare text sin intent de búsqueda

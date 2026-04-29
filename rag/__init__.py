@@ -450,7 +450,19 @@ def render_response(text: str) -> Text:
 
     El pipeline extrae primero los fences (que no contienen más markdown),
     después procesa lo de afuera con ext → links → inline code.
+
+    2026-04-29: aplica `replace_iberian_leaks` al texto ANTES de
+    procesar markdown. Los LLM locales (qwen2.5:7b, command-r) a veces
+    se deslizan al portugués/galego pese al system prompt en español
+    rioplatense — el filter es la última barrera. Reportado con
+    `rag query "Que tenes de Grecia?"` que devolvió respuesta con
+    "primeira", "tua", "falam", "vistes", "primeiramente", "nos braços".
+    Aplicar acá garantiza que TODOS los call sites del CLI que
+    rendereen output del LLM pasen por el filter (chat, query,
+    summarize, history replay).
     """
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    text = replace_iberian_leaks(text)
     out = Text()
 
     def emit_plain_or_inline(seg: str, base_style: str | None = None):

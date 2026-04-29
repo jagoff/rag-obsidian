@@ -3829,6 +3829,61 @@ def _load_behavior_priors() -> dict:
         return snapshot
 
 
+def _load_contradiction_priors(
+    *,
+    window_days: int = 90,
+    max_paths: int = 5000,
+) -> dict[str, float]:
+    """Devuelve {subject_path: contradiction_score} en una ventana de N días.
+
+    Score = log1p(count_distinct_ts) — penaliza más fuerte las notas con
+    múltiples detecciones SEPARADAS en el tiempo (señal robusta de
+    contradicción persistente, no de un falso positivo único). Cap a
+    `max_paths` para no inflar memoria si el corpus tiene mucha
+    contradicción (top-N por count desc — preserva las notas más
+    contradictorias, descarta la cola larga).
+
+    Silent-fail: retorna {} si la tabla no existe o la query falla. El
+    consumer (retrieve, collect_ranker_features) tiene que tolerar dict
+    vacío sin romper — gating por `weights.contradiction_penalty > 0`
+    upstream evita siquiera pegarle a la DB cuando la feature está OFF.
+
+    Window: usa `datetime('now','localtime','-N days')` igual que
+    `_load_behavior_priors` para evitar el corte de 3h al borde del
+    window cuando `ts` se inserta en local time (AR=UTC-3) y SQLite
+    `'now'` retorna UTC. Audit 2026-04-26 H3.
+    """
+    import math
+    def _read():
+        with _ragvec_state_conn() as conn:
+            sql = (
+                "SELECT subject_path, COUNT(DISTINCT ts) AS n"
+                " FROM rag_contradictions"
+                " WHERE ts >= datetime('now','localtime',?)"
+                "   AND subject_path IS NOT NULL AND subject_path != ''"
+                " GROUP BY subject_path"
+                " ORDER BY n DESC"
+                " LIMIT ?"
+            )
+            rows = conn.execute(
+                sql, (f"-{int(window_days)} days", int(max_paths))
+            ).fetchall()
+        out: dict[str, float] = {}
+        for r in rows:
+            path = r[0]
+            n = int(r[1] or 0)
+            if not path or n <= 0:
+                continue
+            out[path] = math.log1p(n)
+        return out
+
+    result = _sql_read_with_retry(
+        _read, "contradiction_priors_sql_read_failed",
+        default={}, attempts=3,
+    )
+    return result if isinstance(result, dict) else {}
+
+
 class RankerWeights:
     """Linear combination aplicada al rerank score. Pure dataclass-like.
 
@@ -3861,6 +3916,7 @@ class RankerWeights:
         "feedback_pos", "feedback_neg", "feedback_match_floor", "graph_pagerank",
         "click_prior", "click_prior_folder", "click_prior_hour",
         "click_prior_dayofweek", "dwell_score",
+        "contradiction_penalty",
     )
 
     def __init__(
@@ -3878,6 +3934,12 @@ class RankerWeights:
         click_prior_hour: float = 0.0,
         click_prior_dayofweek: float = 0.0,
         dwell_score: float = 0.0,
+        # Default OFF: el comportamiento es idéntico al pre-feature hasta
+        # que `rag tune` encuentre que ayuda. Pesar contradicciones en el
+        # ranker es una señal nueva — arrancar con weight 0 evita ANY
+        # regression durante el rollout. El nightly tune puede levantarlo
+        # si la métrica mejora.
+        contradiction_penalty: float = 0.0,
     ):
         self.recency_cue = float(recency_cue)
         self.recency_always = float(recency_always)
@@ -3892,6 +3954,7 @@ class RankerWeights:
         self.click_prior_hour = float(click_prior_hour)
         self.click_prior_dayofweek = float(click_prior_dayofweek)
         self.dwell_score = float(dwell_score)
+        self.contradiction_penalty = float(contradiction_penalty)
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}
@@ -5745,6 +5808,40 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Brief feedback — cierra el loop de los morning/evening/digest
+        # briefs (2026-04-29). Cuando el daemon escribe un brief y lo
+        # pushea a WhatsApp via `_brief_push_to_whatsapp`, el body
+        # incluye un footer markdown italic `_brief:<vault_relpath>_`.
+        # Si el user reacciona en RagNet (👍/👎/🔇 o "ok"/"no"/"basta")
+        # dentro de los 30min siguientes, el listener parsea el rating
+        # y postea acá. Same precedencia que `rag_anticipate_feedback`
+        # (mute > negative > positive). El `dedup_key` es el path
+        # relativo al vault del brief (ej.
+        # `02-Areas/Briefs/2026-04-29-morning.md`) — único por brief
+        # porque el archivo lleva la fecha en el nombre. Append-only;
+        # una row por reaction (si el user reacciona dos veces con
+        # ratings distintos, quedan ambas — la lectura usa la más
+        # reciente). Útil para tunear: si los morning briefs concentran
+        # 'mute' a la mañana temprano, mover el horario; si todos los
+        # digest llevan 'positive', subir su frecuencia; etc.
+        "rag_brief_feedback",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_feedback ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL,"
+            " dedup_key TEXT NOT NULL,"
+            " rating TEXT NOT NULL CHECK("
+            "rating IN ('positive', 'negative', 'mute')),"
+            " reason TEXT,"
+            " source TEXT DEFAULT 'wa'"
+            ")",
+            "CREATE INDEX IF NOT EXISTS ix_rag_brief_feedback_ts"
+            " ON rag_brief_feedback(ts)",
+            "CREATE INDEX IF NOT EXISTS ix_rag_brief_feedback_dedup_key"
+            " ON rag_brief_feedback(dedup_key)",
+        ),
+    ),
+    (
         "rag_cpu_metrics",
         (
             "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
@@ -7579,6 +7676,90 @@ def _record_draft_decision(
         _sql_write_with_retry(_do, "draft_decision_sql_write_failed")
     except Exception as exc:  # pragma: no cover - retry helper ya silencia
         _silent_log("draft_decision_helper", exc)
+        return None
+    return holder["id"]
+
+
+# Set válido de ratings para `rag_brief_feedback`. Mismo dominio que el
+# `rag_anticipate_feedback` (mute > negative > positive de precedencia
+# en el parser TS); replicamos la frozenset acá para validación rápida
+# sin tocar SQL. El CHECK de la tabla enforcea lo mismo a nivel DB.
+_VALID_BRIEF_FEEDBACK_RATINGS: frozenset[str] = frozenset({
+    "positive", "negative", "mute",
+})
+
+
+def _map_brief_feedback_row(ev: dict) -> dict:
+    """Mapper para rag_brief_feedback. Shape simple: ts/dedup_key/rating/
+    reason/source. NO hay extra_json — si en el futuro queremos meter
+    más metadata por feedback (chat origin, latency entre push y
+    reply, etc.), agregamos columna nueva via migration."""
+    out: dict = {}
+    for k in ("ts", "dedup_key", "rating", "reason", "source"):
+        if k in ev and ev[k] is not None:
+            out[k] = ev[k]
+    if "ts" not in out:
+        out["ts"] = datetime.now().isoformat(timespec="seconds")
+    return out
+
+
+def _record_brief_feedback(
+    *,
+    dedup_key: str,
+    rating: str,
+    reason: str = "",
+    source: str = "wa",
+) -> int | None:
+    """Persiste un feedback del user sobre un brief (morning/evening/digest)
+    a `rag_brief_feedback`. Cierra el loop de los briefs:
+
+    - El daemon de briefs escribe el archivo + lo pushea a WhatsApp
+      con un footer `_brief:<vault_relpath>_` (ver
+      `_brief_push_to_whatsapp`).
+    - El listener TS detecta la reacción del user (👍/👎/🔇 o tokens
+      "ok"/"no"/"basta") dentro de los 30min siguientes y postea acá
+      via `POST /api/brief/feedback`.
+    - Esta función inserta la row.
+
+    Args:
+        dedup_key: vault_relpath del brief al que apunta el feedback.
+            Único por brief (cada brief lleva la fecha en el nombre).
+        rating: uno de `positive | negative | mute`. Cualquier otro
+            valor → return None.
+        reason: texto libre opcional (ej. el body completo del reply
+            para debug).
+        source: origen del feedback (default 'wa' — WhatsApp). Forward-
+            compatible con otros canales (PWA, CLI, etc.).
+
+    Returns:
+        rowid del INSERT, o None si la rating es inválida o el write
+        falla (silent-fail — la UX del listener no debe romperse por
+        un fallo de telemetría). Mismo contract que
+        `_record_draft_decision` y `record_feedback` del anticipatory
+        agent.
+    """
+    if not dedup_key:
+        return None
+    if rating not in _VALID_BRIEF_FEEDBACK_RATINGS:
+        return None
+    row = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "dedup_key": dedup_key,
+        "rating": rating,
+        "reason": reason or "",
+        "source": source or "wa",
+    }
+    holder: dict = {"id": None}
+
+    def _do() -> None:
+        with _ragvec_state_conn() as conn:
+            holder["id"] = _sql_append_event(
+                conn, "rag_brief_feedback", _map_brief_feedback_row(row),
+            )
+    try:
+        _sql_write_with_retry(_do, "brief_feedback_sql_write_failed")
+    except Exception as exc:  # pragma: no cover - retry helper ya silencia
+        _silent_log("brief_feedback_helper", exc)
         return None
     return holder["id"]
 
@@ -20604,6 +20785,13 @@ def retrieve(
     _now_dt = datetime.now() if _any_behavior_weight else None
     _behavior_hour = _now_dt.hour if _now_dt else 0
     _behavior_weekday = _now_dt.weekday() if _now_dt else 0
+    # Contradiction priors — opt-in via weights.contradiction_penalty.
+    # Default 0.0 → este block es no-op y NO le pegamos a la DB. Cuando
+    # `rag tune` levanta el peso, cargamos el dict {path: log1p(n_ts)}
+    # una vez por retrieve() y lo aplicamos en el score-loop más abajo.
+    contradiction_priors: dict[str, float] = (
+        _load_contradiction_priors() if weights.contradiction_penalty else {}
+    )
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
@@ -20702,6 +20890,13 @@ def retrieve(
                 final += weights.dwell_score * min(
                     ds.get(path, 0.0) / DWELL_LOG_NORM_CAP, 1.0,
                 )
+        # Contradiction penalty: notas con detecciones recientes en
+        # rag_contradictions reciben un debuff. log1p de count_distinct_ts
+        # en una ventana de 90d (cargado en `contradiction_priors` arriba).
+        # Default weight conservador (0.0) para no sobre-penalizar mientras
+        # `rag tune` aprende. Path ausente del dict → penalty 0 (no rompe).
+        if weights.contradiction_penalty and contradiction_priors:
+            final -= weights.contradiction_penalty * contradiction_priors.get(path, 0.0)
         # Soft ramp: at cos=floor → w=0 (no effect), at cos=1.0 → w=1.0 (full weight).
         # Floor is tunable (weights.feedback_match_floor) so rag tune can find the
         # optimal gate point instead of relying on a hardcoded threshold.
@@ -21487,6 +21682,11 @@ def collect_ranker_features(
 
     # Behavior priors — loaded once per call, never raises.
     priors = _load_behavior_priors()
+    # Contradiction priors — siempre los cargamos en collect_ranker_features
+    # porque esta función alimenta tanto retrieve scoring (con tune dinámico)
+    # como training data del LightGBM ranker. Si la tabla no existe o falla,
+    # el helper devuelve {} silently — el feature default es 0.0 entonces.
+    contradiction_priors = _load_contradiction_priors()
     _now_dt = datetime.now()
     current_hour = _now_dt.hour
     current_weekday = _now_dt.weekday()
@@ -21525,6 +21725,11 @@ def collect_ranker_features(
                 (path, current_weekday), 0.0,
             ),
             "dwell_score": priors["dwell_score"].get(path, 0.0),
+            # Contradiction signal: log1p(count_distinct_ts) en ventana 90d.
+            # Default 0.0 cuando el path no aparece en rag_contradictions.
+            # apply_weighted_scores lo aplica como penalty (resta) gated por
+            # weights.contradiction_penalty.
+            "contradiction_count": float(contradiction_priors.get(path, 0.0)),
             "meta": meta,
         })
     return feats
@@ -21567,6 +21772,12 @@ def apply_weighted_scores(
         if weights.dwell_score and f.get("dwell_score"):
             # Same cap as retrieve(): log1p(dwell_s) saturates at DWELL_LOG_NORM_CAP.
             score += weights.dwell_score * min(f["dwell_score"] / DWELL_LOG_NORM_CAP, 1.0)
+        # Contradiction penalty: paridad con retrieve(). Default weight 0.0
+        # → no-op. Cuando `rag tune` lo levanta, paths con detecciones
+        # recientes en rag_contradictions reciben downward shift propor-
+        # cional a log1p(count_distinct_ts).
+        if weights.contradiction_penalty and f.get("contradiction_count"):
+            score -= weights.contradiction_penalty * f["contradiction_count"]
         pos_w = _soft_feedback_weight(f.get("fb_pos_cos", 0.0), weights.feedback_match_floor)
         if pos_w:
             score += weights.feedback_pos * pos_w
@@ -24889,6 +25100,16 @@ def _brief_push_to_whatsapp(
 
     Citations in the narrative are rewritten to `obsidian://` URLs so they
     render clickable in WhatsApp Mobile (taps open the note in Obsidian).
+
+    Footer markdown italic `_brief:<vault_relpath>_` al final del body
+    (2026-04-29): cierra el loop de feedback. Cuando el user reacciona
+    al push (👍/👎/🔇 o "ok"/"no"/"basta") dentro de los 30min en el
+    grupo RagNet, el listener TS parsea el `vault_relpath` del footer
+    y postea a `POST /api/brief/feedback` → row en
+    `rag_brief_feedback`. El `vault_relpath` es único por brief (lleva
+    la fecha en el nombre) así que sirve directo como `dedup_key`. No
+    contiene newlines (es un file path simple) — el regex del listener
+    asume eso.
     """
     cfg = _ambient_config()
     if cfg is None:
@@ -24896,6 +25117,7 @@ def _brief_push_to_whatsapp(
     body = convert_obsidian_links(narrative)
     msg = (
         f"📓 *{title}* — `{vault_relpath}`\n\n{body}"
+        f"\n\n_brief:{vault_relpath}_"
     )
     sent = _ambient_whatsapp_send(cfg["jid"], msg)
     _ambient_log_event({
@@ -28988,6 +29210,92 @@ def draft_stats(plain: bool):
             console.print(f"[dim]última decisión: {last_ts}[/dim]")
 
 
+# ── rag brief — auditar el loop de feedback de los briefs ──────────────────
+# `rag_brief_feedback` se popula via /api/brief/feedback cuando el user
+# reacciona 👍/👎/🔇 a un push de morning/evening/digest brief en RagNet.
+# Mismo patrón que `rag draft stats` (auto-aprendizaje del bot WA): este
+# grupo permite mirar el health del loop sin tocar sqlite a mano.
+# Use case: "¿el morning brief de las 8am tiene buena recepción?
+# ¿debería mover el evening a las 22hs en lugar de las 19hs?".
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def brief(ctx: click.Context):
+    """Auditar el loop de feedback de los briefs (morning/evening/digest).
+
+    Subcomandos:
+      rag brief stats           # conteos por rating + última fecha
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(brief_stats, plain=False)
+
+
+@brief.command("stats")
+@click.option("--plain", is_flag=True,
+              help="Output plano sin colores (para piping/scripts).")
+def brief_stats(plain: bool):
+    """Muestra conteo de feedback por rating + última fecha.
+
+    Pensado para sanity-check del loop: si el `total` no crece después
+    de una semana de uso, o todo se va a `mute`, hay algo roto en el
+    flujo (listener no postea, el footer del brief se rompió, los
+    briefs no se están enviando, etc.).
+
+    Mismo shape que `rag draft stats`: total + breakdown por rating
+    + última fecha.
+    """
+    rows: list[tuple] = []
+    last_ts: str | None = None
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = list(conn.execute(
+                "SELECT rating, COUNT(*) FROM rag_brief_feedback "
+                "GROUP BY rating ORDER BY rating"
+            ).fetchall())
+            row = conn.execute(
+                "SELECT MAX(ts) FROM rag_brief_feedback"
+            ).fetchone()
+            if row and row[0]:
+                last_ts = row[0]
+    except Exception as exc:
+        msg = f"error leyendo rag_brief_feedback: {exc}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    if not rows:
+        msg = "sin registros — el bot todavía no recibió feedback"
+        click.echo(msg) if plain else console.print(f"[dim]{msg}[/dim]")
+        return
+
+    counts = {rating: int(n) for rating, n in rows}
+    total = sum(counts.values())
+
+    # Orden fijo para que el output sea estable entre corridas.
+    ordered_keys = ("positive", "negative", "mute")
+    if plain:
+        click.echo(f"total: {total}")
+        for k in ordered_keys:
+            n = counts.get(k, 0)
+            pct = (n / total * 100.0) if total else 0.0
+            click.echo(f"  {k}: {n}  ({pct:.1f}%)")
+        if last_ts:
+            click.echo(f"última: {last_ts}")
+    else:
+        console.print(f"[bold]briefs:[/bold] total {total}")
+        for k in ordered_keys:
+            n = counts.get(k, 0)
+            pct = (n / total * 100.0) if total else 0.0
+            color = {
+                "positive": "green",
+                "negative": "red",
+                "mute": "yellow",
+            }.get(k, "white")
+            console.print(
+                f"  [{color}]{k}[/{color}]: {n}  [dim]({pct:.1f}%)[/dim]"
+            )
+        if last_ts:
+            console.print(f"[dim]último feedback: {last_ts}[/dim]")
+
+
 @cli.command("state")
 @click.argument("text", required=False)
 @click.option("--clear", is_flag=True, help="Borra el estado actual")
@@ -29446,6 +29754,11 @@ _TUNE_SPACE = {
     "click_prior_hour":   (0.0, 0.20),   # path × current-hour CTR
     "click_prior_dayofweek": (0.0, 0.15),  # path × weekday CTR (lun=0..dom=6)
     "dwell_score":        (0.0, 0.10),   # log1p(mean_dwell_s) per path
+    # Contradiction penalty (default 0.0, opt-in). Range conservador 0-0.30:
+    # log1p(count_distinct_ts) puede llegar a ~3 (e.g. 20 detecciones en
+    # 90d) → contribución máxima ~0.9 al score, en el orden del feedback_neg.
+    # Si tune encuentra que ayuda, debería convergir a un valor pequeño.
+    "contradiction_penalty": (0.0, 0.30),
 }
 
 

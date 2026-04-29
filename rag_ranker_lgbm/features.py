@@ -36,9 +36,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Mismas 11 features que el ranker.json actual. ORDEN IMPORTA — tiene
-# que matchear el feature_name del modelo. Si esto cambia, retrain
-# desde cero.
+# Features alineadas con `collect_ranker_features` + `apply_weighted_scores`
+# en rag/__init__.py. ORDEN IMPORTA — tiene que matchear el feature_name del
+# modelo. Si esto cambia, retrain desde cero (el inference path detecta el
+# mismatch via `expected_dim != len(FEATURE_NAMES)` y degrada a 0.0).
 FEATURE_NAMES: list[str] = [
     "rerank",                # cross-encoder score, 0-1
     "recency_cue",           # has_recency_cue * recency_raw
@@ -53,6 +54,7 @@ FEATURE_NAMES: list[str] = [
     "click_prior_hour",      # CTR para hora del día
     "click_prior_dayofweek", # CTR para día de la semana (lun=0..dom=6)
     "dwell_score",           # log1p(mean_dwell_s)
+    "contradiction_count",   # log1p(count_distinct_ts) en ventana 90d
 ]
 
 
@@ -76,6 +78,10 @@ def _candidate_to_feature_vector(
     click_prior_hour = float(candidate.get("click_prior_hour", 0.0))
     click_prior_dayofweek = float(candidate.get("click_prior_dayofweek", 0.0))
     dwell_score = float(candidate.get("dwell_score", 0.0))
+    # log1p(count_distinct_ts) en ventana 90d. Default 0.0 si el path no
+    # aparece en rag_contradictions o si collect_ranker_features no lo
+    # populó (silent-fail del SQL read).
+    contradiction_count = float(candidate.get("contradiction_count", 0.0))
 
     # `feedback_match_floor`: 1 si el chunk tuvo match en feedback corpus
     # (signal "esta nota tuvo feedback antes"). El ranker linear lo usa
@@ -96,6 +102,7 @@ def _candidate_to_feature_vector(
         click_prior_hour,
         click_prior_dayofweek,
         dwell_score,
+        contradiction_count,
     ]
 
 

@@ -414,6 +414,72 @@ Health check rápido: si `total` no crece después de un día de uso, o todo se 
 
 **Tests**: [`tests/test_draft_decisions_table.py`](tests/test_draft_decisions_table.py) (DDL + helper, 10 casos), [`tests/test_draft_decisions_endpoint.py`](tests/test_draft_decisions_endpoint.py) (4 decision types + validation + persistencia, 9 casos), [`tests/test_anticipate_feedback_endpoint.py`](tests/test_anticipate_feedback_endpoint.py) (3 ratings + validation + silent-fail, 7 casos), [`tests/test_proactive_push_dedup_key_footer.py`](tests/test_proactive_push_dedup_key_footer.py) (footer agrega `_anticipate:<key>_` + back-compat sin dedup_key, 7 casos). Drift guard: table count en [`tests/test_sql_state_primitives.py`](tests/test_sql_state_primitives.py) bumpeado 44→45.
 
+### Brief feedback loop — los briefs aprenden de las reactions (2026-04-29)
+
+Mismo shape que el loop de anticipate (footer markdown italic + listener TS parsea reactions y postea acá), aplicado a los morning / evening / digest briefs que el daemon escribe + pushea por WhatsApp.
+
+**Cómo cierra el loop**:
+
+1. El daemon arma el brief y lo escribe al vault (ej. `02-Areas/Briefs/2026-04-29-morning.md`).
+2. `_brief_push_to_whatsapp(title, vault_relpath, narrative)` formatea el msg WA y le agrega un footer `\n\n_brief:<vault_relpath>_` ANTES de mandarlo. El `vault_relpath` siempre está disponible y es único por brief (lleva la fecha en el nombre), así que sirve directo como `dedup_key`. A diferencia de `proactive_push`, acá el footer NO es opcional — todo brief lleva el suyo.
+3. El user reacciona en RagNet con 👍/👎/🔇 (o tokens "ok"/"no"/"basta") dentro de los 30min siguientes. Window más largo que anticipate (10min) porque los briefs se leen más relax, no son urgentes.
+4. El listener TS detecta la reaction, busca el push reciente con el footer en la bridge SQLite, parsea el rating con la misma precedencia que anticipate (mute > negative > positive) y postea a [`POST /api/brief/feedback`](web/server.py).
+5. El web server persiste a `rag_brief_feedback` (silent-fail si la DB está inaccesible — el listener nunca rompe por telemetría).
+
+**Tabla `rag_brief_feedback`** (append-only):
+
+```sql
+CREATE TABLE rag_brief_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,                    -- ISO local
+  dedup_key TEXT NOT NULL,             -- vault_relpath del brief
+  rating TEXT NOT NULL CHECK(rating IN ('positive','negative','mute')),
+  reason TEXT,                         -- texto libre del reply (debug)
+  source TEXT DEFAULT 'wa'             -- forward-compatible (PWA, CLI, ...)
+);
+```
+
+Indices: `ix_rag_brief_feedback_ts`, `ix_rag_brief_feedback_dedup_key`.
+
+**Footer pattern**: el msg WA queda con shape:
+
+```
+📓 *Morning 2026-04-29* — `02-Areas/Briefs/2026-04-29-morning.md`
+
+<body con citations renderizadas a obsidian:// URIs>
+
+_brief:02-Areas/Briefs/2026-04-29-morning.md_
+```
+
+El listener TS extrae el `vault_relpath` del footer con regex (última línea no-vacía debe matchear `^_brief:([^_]+)_$`). Mismo formato visual que el footer `_anticipate:<key>_` — WA renderiza ambos como cursiva pequeña.
+
+**Hook en el listener**: chequea brief PRIMERO, después anticipate. Razón: el window del brief (30min) es mayor que el de anticipate (10min), pero un push de anticipate puede aparecer DESPUÉS del brief en la misma sesión. Al chequear brief primero solo cuando hay un dedup_key reciente Y rating reconocible, el flow degrada gracefully al anticipate cuando no hay brief candidato.
+
+**CLI**:
+
+```bash
+rag brief                          # = rag brief stats (default)
+rag brief stats                    # conteos por rating + última fecha
+rag brief stats --plain            # output plano (piping/scripts)
+```
+
+Ejemplo de output:
+```
+briefs: total 12
+  positive: 8  (66.7%)
+  negative: 1  (8.3%)
+  mute: 3  (25.0%)
+último feedback: 2026-04-29T08:31:42
+```
+
+Health check: si `total` no crece después de unos días de uso, o todo se va a `mute`, el flujo está roto (listener no postea, footer del brief roto, briefs no se están enviando, etc.).
+
+**Endpoint relacionado**:
+
+- [`POST /api/brief/feedback`](web/server.py) — escribir un feedback de brief (rating ∈ `positive|negative|mute`, dedup_key = vault_relpath). El listener lo llama cuando parsea `_brief:<key>_` en una reaction.
+
+**Tests**: [`tests/test_brief_feedback_endpoint.py`](tests/test_brief_feedback_endpoint.py) (3 ratings + validation + silent-fail + persistencia E2E, 9 casos), [`tests/test_brief_push_dedup_key_footer.py`](tests/test_brief_push_dedup_key_footer.py) (footer agrega `_brief:<vault_relpath>_` para morning/evening/digest, 8 casos). Drift guard: table count en [`tests/test_sql_state_primitives.py`](tests/test_sql_state_primitives.py) bumpeado 45→46.
+
 ## Whisper learning loop — la transcripción mejora con el uso (2026-04-25)
 
 El sistema de transcripción de audios de WhatsApp aprende del corpus + correcciones manuales del usuario. Cada audio se loguea, las correcciones se acumulan, y un job nightly extrae vocabulario del corpus para sesgar el `--prompt` de whisper. Plan completo en el vault: [`04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
@@ -761,19 +827,21 @@ OSC 8 `file://` hyperlinks for both `[Label](path.md)` and `[path.md]` formats. 
 
 ```
 score = rerank_logit
-      + w.recency_cue        * recency_raw      [if has_recency_cue]
-      + w.recency_always     * recency_raw      [always]
-      + w.tag_literal        * n_tag_matches
-      + w.graph_pagerank     * (pr/max_pr)      [wikilink authority signal]
-      + w.click_prior        * ctr_path         [behavior: path CTR, Laplace-smoothed]
-      + w.click_prior_folder * ctr_folder       [behavior: top-level folder CTR]
-      + w.click_prior_hour   * ctr_path_hour    [behavior: path × current-hour CTR]
-      + w.dwell_score        * log1p(dwell_s)   [behavior: mean dwell time per path]
-      + w.feedback_pos                          [if path in feedback+ cosine≥0.80]
-      - w.feedback_neg                          [if path in feedback- cosine≥0.80]
+      + w.recency_cue            * recency_raw         [if has_recency_cue]
+      + w.recency_always         * recency_raw         [always]
+      + w.tag_literal            * n_tag_matches
+      + w.graph_pagerank         * (pr/max_pr)         [wikilink authority signal]
+      + w.click_prior            * ctr_path            [behavior: path CTR, Laplace-smoothed]
+      + w.click_prior_folder     * ctr_folder          [behavior: top-level folder CTR]
+      + w.click_prior_hour       * ctr_path_hour       [behavior: path × current-hour CTR]
+      + w.click_prior_dayofweek  * ctr_path_weekday    [behavior: path × weekday CTR]
+      + w.dwell_score            * log1p(dwell_s)      [behavior: mean dwell time per path]
+      - w.contradiction_penalty  * log1p(n_contrad_ts) [contradicciones recientes en rag_contradictions, 90d window]
+      + w.feedback_pos                                 [if path in feedback+ cosine≥0.80]
+      - w.feedback_neg                                 [if path in feedback- cosine≥0.80]
 ```
 
-Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0, click_*=0, dwell_score=0` preserve pre-tune behavior. Behavior knobs are inert until `rag_behavior` accumulates signal and `rag tune` finds non-zero weights.
+Weights in `~/.local/share/obsidian-rag/ranker.json` (written by `rag tune --apply`). Defaults `recency_always=0, tag_literal=0, click_*=0, dwell_score=0, contradiction_penalty=0` preserve pre-tune behavior. Behavior + contradiction knobs are inert until `rag_behavior` / `rag_contradictions` accumulate signal y `rag tune` finds non-zero weights.
 
 Behavior priors (`_load_behavior_priors()`): read from `rag_behavior` (SQL), cached per MAX(ts). Positive events: `open`, `positive_implicit`, `save`, `kept`. Negative: `negative_implicit`, `deleted`. CTR uses Laplace smoothing `(clicks+1)/(impressions+10)`.
 
@@ -814,6 +882,8 @@ Subsystems have autodescriptive docstrings in `rag.py` and dedicated test files.
 **Ambient agent**: hook in `_index_single_file` on saves within `allowed_folders` (default `["00-Inbox"]`). Config: `~/.local/share/obsidian-rag/ambient.json` (`{jid, enabled, allowed_folders?}`). Skip rules: outside allowed_folders, no config, frontmatter `ambient: skip`, `type: morning-brief|weekly-digest|prep`, dedup 5min (upsert on `rag_ambient_state.path`). Sends via `whatsapp-bridge` POST (`http://localhost:8080/api/send`). Bridge down = message lost but analysis persists in `rag_ambient`.
 
 **Contradiction radar**: Phase 1 (query-time `--counter`), Phase 2 (index-time frontmatter `contradicts:` + `rag_contradictions`), Phase 3 (`rag digest` weekly). Skipped on `--reset` (O(n²)) and `note_body < 200 chars`.
+
+**Contradicciones → ranker penalty (loop cerrado, default OFF)**: `_load_contradiction_priors()` lee `rag_contradictions` (window 90d, cap 5000 paths) y devuelve `{subject_path: log1p(count_distinct_ts)}` — penaliza más fuerte las notas con detecciones SEPARADAS en el tiempo (señal robusta de contradicción persistente, no falso positivo único). Consumido por (a) `retrieve()` como debuff `final -= weights.contradiction_penalty * priors.get(path, 0.0)` después del bloque behavior priors, (b) `collect_ranker_features()` como feature `contradiction_count` (14ta del LightGBM ranker, última posición). Default `weights.contradiction_penalty = 0.0` → loop OFF: hasta que `rag tune` no lo levante (range `(0.0, 0.30)` en `_TUNE_SPACE`), el comportamiento es bit-idéntico al pre-feature. Silent-fail en el read SQL → `{}` (retrieve sigue funcionando sin priors). Schema `rag_contradictions` ya existía (populado por `_log_contradictions` cuando `rag contradictions <path>` corre); este es el primer consumer que lo realimenta al ranker. Tests: `tests/test_contradiction_priors.py`, `tests/test_retrieve_contradiction_penalty.py`, `tests/test_ranker_lgbm_contradiction_feature.py`.
 
 **URL sub-index**: `obsidian_urls_v1` collection embeds **prose context** (±240 chars) not URL strings. `PER_FILE_CAP=2`. Auto-backfill on first `find_urls()` if collection empty.
 
@@ -986,6 +1056,7 @@ Log-style tables (`id INTEGER PK AUTOINCREMENT`, `ts TEXT` ISO-8601, indexed):
 - `rag_wa_tasks`, `rag_archive_log`, `rag_filing_log`, `rag_eval_runs`, `rag_surface_log`, `rag_proactive_log` — 60d retention.
 - `rag_cpu_metrics`, `rag_memory_metrics`, `system_memory_metrics` — per-minute samplers, 30d retention.
 - `rag_draft_decisions` (2026-04-29) — decisiones del user sobre drafts del bot WA (`approved_si | approved_editar | rejected | expired`) + bot_draft + sent_text + original_msgs. **Keep all forever** — el dataset histórico es gold humano para fine-tunear el modelo de drafts (ver "Bot WA draft loop" más arriba). Populated via `POST /api/draft/decision` desde el listener TS.
+- `rag_brief_feedback` (2026-04-29) — reactions del user sobre los briefs (morning / evening / digest) pusheados por el daemon (`positive | negative | mute`) + `dedup_key=vault_relpath`. **Keep all forever** — input de tuning para horario / cadencia / contenido de los briefs (ver "Brief feedback loop" más arriba). Populated via `POST /api/brief/feedback` desde el listener TS.
 
 State-style tables:
 - `rag_conversations_index` — episodic session_id → relative_path (web/conversation_writer.py upsert; replaces the old conversations_index.json + fcntl dance).

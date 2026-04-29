@@ -2783,6 +2783,66 @@ def submit_anticipate_feedback(req: AnticipateFeedbackPayload) -> dict:
     return {"ok": True}
 
 
+# ── /api/brief/feedback ───────────────────────────────────────────────────────
+# Cuando el user responde 👍/👎/🔇 a un brief (morning / evening / digest)
+# pusheado por el daemon, el listener TS extrae el `dedup_key` del footer
+# `_brief:<vault_relpath>_` (ver `_brief_push_to_whatsapp` en `rag/__init__.py`)
+# y postea acá. La row se persiste a `rag_brief_feedback` para tunear el
+# horario / contenido / cadencia de los briefs según engagement real.
+
+_VALID_BRIEF_RATINGS: frozenset[str] = frozenset({
+    "positive", "negative", "mute",
+})
+
+
+class BriefFeedbackPayload(BaseModel):
+    # `dedup_key` es el vault_relpath del brief (ej.
+    # `02-Areas/Briefs/2026-04-29-morning.md`). Cap defensivo en 400
+    # chars — los paths del vault son cortos, pero no quiero un caller
+    # malicioso meter MB de string en una row de telemetría.
+    dedup_key: str = Field(..., max_length=400)
+    rating: str
+    reason: str = Field("", max_length=500)
+
+    @field_validator("rating")
+    @classmethod
+    def _check_rating(cls, v: str) -> str:
+        if v not in _VALID_BRIEF_RATINGS:
+            raise ValueError(
+                f"rating must be one of {sorted(_VALID_BRIEF_RATINGS)}"
+            )
+        return v
+
+
+@app.post("/api/brief/feedback")
+def submit_brief_feedback(req: BriefFeedbackPayload) -> dict:
+    """Persiste un feedback del user sobre un brief (morning/evening/digest).
+
+    Llamado por el listener TS cuando el user reacciona en RagNet a un
+    push de brief con un rating reconocible (👍/👎/🔇 o tokens
+    "ok"/"no"/"basta"). El listener ya parseó el rating + extrajo el
+    `dedup_key` del footer; nosotros solo persistimos. `_record_brief_
+    feedback` es silent-fail — devolvemos `{ok: False, reason: ...}` si
+    el write falla, pero NUNCA un 5xx para no romper el listener.
+    """
+    # Import deferred igual que en `submit_draft_decision` y
+    # `submit_anticipate_feedback`: tests pueden monkeypatchear
+    # `rag._record_brief_feedback` directamente.
+    from rag import _record_brief_feedback
+    try:
+        row_id = _record_brief_feedback(
+            dedup_key=req.dedup_key,
+            rating=req.rating,
+            reason=req.reason or "",
+            source="wa",
+        )
+    except Exception as exc:  # pragma: no cover — el helper hace silent-fail
+        return {"ok": False, "reason": f"helper raised: {exc}"}
+    if row_id is None:
+        return {"ok": False, "reason": "write failed (telemetry unavailable)"}
+    return {"ok": True, "id": int(row_id)}
+
+
 # ── /api/behavior ─────────────────────────────────────────────────────────────
 # In-memory token bucket for rate limiting: 120 events/min per IP.
 # Stored as {ip: [timestamp, ...]} with a 60s sliding window. No new deps.

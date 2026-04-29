@@ -95,10 +95,13 @@ def test_feature_vector_has_correct_length():
         "click_prior": 0.2, "click_prior_folder": 0.15, "click_prior_hour": 0.1,
         "click_prior_dayofweek": 0.05,
         "dwell_score": 0.4,
+        "contradiction_count": 0.69,
     }
     vec = _candidate_to_feature_vector(cand, has_recency_cue=True)
     # C7 (2026-04-29): bumpeamos 12 → 13 al sumar `click_prior_dayofweek`.
-    assert len(vec) == len(FEATURE_NAMES) == 13
+    # Contradiction loop (2026-04-29 tarde): 13 → 14 al sumar
+    # `contradiction_count` (penalty por detecciones en rag_contradictions).
+    assert len(vec) == len(FEATURE_NAMES) == 14
 
 
 def test_feature_vector_recency_cue_gating():

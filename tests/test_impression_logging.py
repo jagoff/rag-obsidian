@@ -125,6 +125,74 @@ def test_retrieve_caller_default_is_cli_for_backward_compat(behavior_env, monkey
     # Si llegamos acá, signature es válida.
 
 
+def test_log_impressions_kill_switch_skips_writes(behavior_env, monkeypatch):
+    """RAG_SKIP_BEHAVIOR_LOG=1 hace que log_impressions early-return sin
+    tocar la DB. Necesario para el harness de `rag eval` y para tests de
+    perf donde no querés flood the rag_behavior table.
+
+    Cerrado 2026-04-28 junto con el caller-aware logging y el filter en
+    export_training_pairs.py."""
+    monkeypatch.setenv("RAG_SKIP_BEHAVIOR_LOG", "1")
+    rag.log_impressions("test", ["a.md", "b.md", "c.md"])
+    assert _rows(behavior_env) == [], "kill-switch debe suprimir TODA write"
+
+    # Truthy variants
+    for truthy in ("true", "TRUE", "yes", "Yes"):
+        monkeypatch.setenv("RAG_SKIP_BEHAVIOR_LOG", truthy)
+        rag.log_impressions(f"q-{truthy}", ["a.md"])
+    assert _rows(behavior_env) == []
+
+    # Falsy → re-habilita writes (cada queryX, cada path):
+    rag._impression_last_seen.clear()
+    for falsy in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("RAG_SKIP_BEHAVIOR_LOG", falsy)
+        rag.log_impressions(f"q-{falsy}", ["live.md"])
+    rows = _rows(behavior_env)
+    assert len(rows) >= 5, (
+        f"falsy values deberían permitir writes, got {len(rows)} rows"
+    )
+
+
+def test_log_query_event_kill_switch(monkeypatch, tmp_path):
+    """Mismo kill-switch para log_query_event. eval() necesita silenciar
+    AMBAS tablas (rag_queries + rag_behavior) sino las queries del eval
+    entran al auto-harvest pipeline aunque no contaminen el ranker."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    with rag._ragvec_state_conn() as conn:
+        rag._ensure_telemetry_tables(conn)
+    monkeypatch.setenv("RAG_LOG_QUERY_ASYNC", "0")  # forzar sync para read-back
+
+    monkeypatch.setenv("RAG_SKIP_BEHAVIOR_LOG", "1")
+    rag.log_query_event({"cmd": "eval", "q": "test query"})
+    with rag._ragvec_state_conn() as conn:
+        rows = conn.execute("SELECT count(*) FROM rag_queries").fetchone()
+    assert rows[0] == 0, "RAG_SKIP_BEHAVIOR_LOG debe suprimir log_query_event"
+
+    monkeypatch.delenv("RAG_SKIP_BEHAVIOR_LOG")
+    rag.log_query_event({"cmd": "query", "q": "real user query"})
+    with rag._ragvec_state_conn() as conn:
+        rows = conn.execute("SELECT count(*) FROM rag_queries").fetchone()
+    assert rows[0] == 1, "sin flag, log_query_event escribe normal"
+
+
+def test_log_behavior_event_kill_switch(behavior_env, monkeypatch):
+    """Tercera escritura silenciada: log_behavior_event (open/save/kept/
+    deleted/etc.). Si el flag está prendido, ninguna interaction event va
+    a la tabla."""
+    monkeypatch.setenv("RAG_SKIP_BEHAVIOR_LOG", "1")
+    rag.log_behavior_event({
+        "source": "cli", "event": "open", "query": "q", "path": "a.md",
+    })
+    assert _rows(behavior_env) == []
+
+    monkeypatch.delenv("RAG_SKIP_BEHAVIOR_LOG")
+    rag.log_behavior_event({
+        "source": "cli", "event": "open", "query": "q2", "path": "b.md",
+    })
+    rows = _rows(behavior_env)
+    assert len(rows) == 1
+
+
 def test_impression_events_count_as_denominator_only(behavior_env):
     """Path with 10 impressions + 0 clicks must have low CTR; path with 5/5 must be higher."""
     # p1: 5 impressions, 0 clicks → low CTR

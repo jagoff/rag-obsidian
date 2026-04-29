@@ -1263,6 +1263,10 @@ def log_query_event(event: dict) -> None:
     error, logs to sql_state_errors.jsonl and silently drops the event (no
     JSONL fallback post-T10).
 
+    Kill-switch: ``RAG_SKIP_BEHAVIOR_LOG=1`` (any of ``1``/``true``/``yes``)
+    early-returns sin tocar la DB. Lo usa ``rag eval`` para que el harness
+    no contamine ``rag_queries`` con queries sintéticas. Default OFF.
+
     **Async por default (2026-04-22)**: las writes van al queue daemon
     ``_BACKGROUND_SQL_QUEUE`` salvo que el env var ``RAG_LOG_QUERY_ASYNC=0``
     las fuerze a sync. Pre-fix audit encontró 195+ eventos
@@ -1279,6 +1283,8 @@ def log_query_event(event: dict) -> None:
     telemetry writers) para absorber lock windows transient. En modo
     async el worker del queue aplica el mismo retry off-thread.
     """
+    if _telemetry_writes_disabled():
+        return
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
     except Exception:
@@ -1292,6 +1298,22 @@ def log_query_event(event: dict) -> None:
         _enqueue_background_sql(_do, "queries_sql_write_failed")
     else:
         _sql_write_with_retry(_do, "queries_sql_write_failed")
+
+
+def _telemetry_writes_disabled() -> bool:
+    """Kill-switch global: cuando ``RAG_SKIP_BEHAVIOR_LOG=1`` (o ``true``/``yes``),
+    los writers de telemetry user-signal (``log_query_event``,
+    ``log_behavior_event``, ``log_impressions``) early-returnean sin tocar
+    la DB. Lo usa ``rag eval`` para que el harness no contamine
+    ``rag_queries`` ni ``rag_behavior`` con queries sintéticas — no son
+    user signal, no deben entrar al training set del ranker ni al
+    auto-harvest pipeline.
+
+    Default OFF. Setear inline (``RAG_SKIP_BEHAVIOR_LOG=1 rag eval``) o
+    en el plist del cron del eval (``com.fer.obsidian-rag-online-tune``).
+    """
+    val = os.environ.get("RAG_SKIP_BEHAVIOR_LOG", "").strip().lower()
+    return val in ("1", "true", "yes")
 
 
 def log_behavior_event(event: dict) -> None:
@@ -1313,8 +1335,13 @@ def log_behavior_event(event: dict) -> None:
     logs to sql_state_errors.jsonl and silently drops the event (no JSONL
     fallback post-T10). The TypeScript WhatsApp listener and FastAPI web
     callers write into the same rag_behavior table via their own SQL paths.
+
+    Kill-switch: ``RAG_SKIP_BEHAVIOR_LOG=1`` early-returns. Ver
+    ``_telemetry_writes_disabled()``.
     """
     if not event:
+        return
+    if _telemetry_writes_disabled():
         return
     try:
         event = {"ts": datetime.now().isoformat(timespec="seconds"), **event}
@@ -1363,8 +1390,14 @@ def log_impressions(
     `cap` bounds how many paths we log per call — Laplace gives diminishing
     returns past the top-5 impressions and the rag_behavior row count is the
     scarce resource (nightly tune reads every event since the cache key).
+
+    Kill-switch: ``RAG_SKIP_BEHAVIOR_LOG=1`` early-returns. Ver
+    ``_telemetry_writes_disabled()``. Lo usa ``rag eval`` para no contaminar
+    ``rag_behavior`` con queries del eval set.
     """
     if not query or not paths:
+        return
+    if _telemetry_writes_disabled():
         return
     top1 = paths[0]
     key = (query, top1)
@@ -28789,6 +28822,18 @@ def eval(queries_file: str, k: int, hyde: bool, no_multi: bool,
     assert os.environ.get("RAG_EXPLORE") != "1", (
         "RAG_EXPLORE must not be set during eval — it corrupts metrics"
     )
+    # `RAG_SKIP_BEHAVIOR_LOG=1` (2026-04-28): silencia los writers de
+    # telemetry user-signal (`log_query_event`, `log_behavior_event`,
+    # `log_impressions`) durante eval. Sin esto, las queries del eval set
+    # entraban a `rag_queries` (con cmd="eval") y a `rag_behavior` (con
+    # source="eval" tras commit `16df67e`); el auto-harvest pipeline
+    # podía pescarlas como "low-confidence user queries" para mandarlas
+    # al LLM judge — gasto de ciclos LLM en queries sintéticas. El
+    # caller-aware logging ya las marcaba; este flag las elimina del
+    # todo. Belt-and-suspenders. Setteado vía os.environ in-process: el
+    # plist `com.fer.obsidian-rag-online-tune` también lo setea como
+    # variable de entorno para coherencia.
+    os.environ["RAG_SKIP_BEHAVIOR_LOG"] = "1"
 
     import pathlib
     path = pathlib.Path(queries_file)

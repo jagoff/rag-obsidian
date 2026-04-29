@@ -14987,6 +14987,16 @@ _LOG_RE_OK = re.compile(r"^\[heartbeat\]|alive=true|✓\s|status=ok\b", re.IGNOR
 # `INFO:    "GET /api/logs/file?name=...error.log... 200 OK"` aparecía
 # como ERROR sólo porque la URL contenía "error.log".
 _LOG_RE_INFO_PREFIX = re.compile(r"^\s*(INFO|DEBUG|TRACE|NOTICE)[\s:]", re.IGNORECASE)
+# Meta-eventos del propio error-queue subsystem. Skip explícito en el
+# classifier para evitar el self-feedback loop (scanner enqueueando su
+# propio "enqueued N new errors", worker enqueueando su propio
+# "processing error id=X"). Las variantes "tick failed" / "DDL failed" /
+# "finalize failed" NO matchean acá — esas sí son fallas legítimas del
+# subsystema y siguen clasificándose como error por el regex general.
+_LOG_RE_ERROR_QUEUE_META = re.compile(
+    r"\[error-queue (scanner|worker)\]\s+"
+    r"(enqueued |processing error id=|done id=)",
+)
 
 # Patrones de timestamp que aparecen en los logs del stack. En orden de
 # prioridad — el primer match gana. Soportamos:
@@ -15052,6 +15062,14 @@ def _classify_log_line(line: str) -> str:
         return "ok"
     # `INFO:`/`DEBUG:` prefix gana sobre los matches de "error" en URLs.
     if _LOG_RE_INFO_PREFIX.match(line):
+        return "info"
+    # Meta-events del propio error-queue scanner/worker — NO son errores.
+    # Bug histórico (2026-04-26): el scanner emite cada 5min "enqueued N new
+    # errors (seen M)", el regex de error matchea "errors", el scanner se
+    # auto-enqueuea, y el worker termina procesando su propia línea de log.
+    # Loop de auto-feedback. Mantener "tick failed" / "DDL failed" /
+    # "finalize failed" como error (esos sí son fallas reales del subsistema).
+    if _LOG_RE_ERROR_QUEUE_META.search(line):
         return "info"
     if _LOG_RE_ERROR.search(line):
         return "error"
@@ -17302,10 +17320,18 @@ def _scanner_loop() -> None:
             seen = 0
             for ln in payload.get("lines", []):
                 seen += 1
+                text = ln.get("text") or ""
+                # Defensa-en-profundidad contra el self-feedback loop.
+                # _classify_log_line ya filtra estos meta-events del feed
+                # de errores, pero si un día alguien cambia el clasificador
+                # y se cuela uno, queremos que el scanner lo skipee igual.
+                # Ver _LOG_RE_ERROR_QUEUE_META para el pattern.
+                if _LOG_RE_ERROR_QUEUE_META.search(text):
+                    continue
                 _, was_new = _enqueue_error(
                     service=ln.get("service") or "unknown",
                     file_ref=ln.get("ref") or "",
-                    error_text=ln.get("text") or "",
+                    error_text=text,
                     context_lines=[],  # Scanner no tiene contexto líneas; el feed global no lo provee
                     error_ts=ln.get("ts"),
                 )

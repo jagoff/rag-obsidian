@@ -14973,7 +14973,14 @@ _LOG_DIRS: tuple[Path, ...] = (
 # Ambos casos: el botón "fix con IA" del service-level mostraba "no
 # hay errores recientes" porque el endpoint `/api/logs/file?
 # only_errors=1` usa otra heurística menos agresiva. UI inconsistente.
+# El lookbehind negativo `(?<!\b0\s)` evita las stats con el cero
+# ANTES de la palabra (e.g. "0 failed", "0 errors") — patrón típico
+# de los syncs que reportan `X fetched · 0 failed · N known` (YouTube
+# transcripts) o `live worker · 5 ok · 0 failed`. Bug histórico
+# 2026-04-29: el alerter agarró `0 failed · 29 known, 8463ms` del
+# wake-up.log como error.
 _LOG_RE_ERROR = re.compile(
+    r"(?<!\b0\s)"
     r"(error|exception|traceback|failed|fatal|panic|critical)"
     r"(?!s?[\s:='\"]+0\b|\.(?:log|txt|json|csv|jsonl|err|out)\b)\b",
     re.IGNORECASE,

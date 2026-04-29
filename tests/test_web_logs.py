@@ -53,6 +53,17 @@ _client = TestClient(_server.app)
     ("live reminder push · pushed=0 skipped=0 failed=0 items=0", "info"),
     ("live wa-scheduled-send · processed=0 sent=0 failed=0", "info"),
     ("errors: 0", "info"),
+    # Idem con el cero ANTES de la palabra ("0 failed", "0 errors").
+    # Patrón típico de los syncs tipo YouTube transcripts:
+    # `(10 fetched · 0 failed · 29 known, 8463ms)`. Bug histórico
+    # 2026-04-29: el alerter agarró esto como error porque el regex
+    # solo cubría `failed=0`, no `0 failed`.
+    ("YT trans. sync: 10 fetched · 0 failed · 29 known, 8463ms", "info"),
+    ("0 failed · 29 known, 8463ms)", "info"),
+    # Pero `1 failed` / `5 errors` SÍ son errores (cualquier número
+    # distinto de cero antes de la palabra debe seguir clasificándose).
+    ("scan: 1 failed · 5 known", "error"),
+    ("daemon · 5 failed in last hour", "error"),
     # Warnings (incluyendo CamelCase).
     ("warnings.warn(", "warn"),
     ("UserWarning: resource_tracker: leaked semaphore", "warn"),

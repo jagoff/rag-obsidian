@@ -3555,6 +3555,12 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     path_acc: dict[str, list[int]] = {}
     folder_acc: dict[str, list[int]] = {}
     hour_acc: dict[tuple[str, int], list[int]] = {}
+    # C7 (2026-04-29): path × dayofweek CTR. Captures patterns like
+    # "lunes laburo / domingo familia" — same path may have very different
+    # CTR depending on the day of the week. Same Laplace smoothing as
+    # `hour_acc` so paths with sparse interaction stay numerically stable.
+    # Monday=0..Sunday=6 (datetime.weekday() convention).
+    dayofweek_acc: dict[tuple[str, int], list[int]] = {}
     dwell_acc: dict[str, list[float]] = {}
     n_events = 0
 
@@ -3601,13 +3607,21 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
                 try:
                     _ts_dt = datetime.fromisoformat(ts_str.rstrip("Z"))
                     hour = _ts_dt.hour
+                    weekday = _ts_dt.weekday()  # 0=Mon..6=Sun
                 except (ValueError, TypeError):
                     hour = int(ts_str[11:13])  # fallback al slice viejo
+                    weekday = None
                 key_h = (path, hour)
                 if key_h not in hour_acc:
                     hour_acc[key_h] = [0, 0]
                 hour_acc[key_h][0] += is_click
                 hour_acc[key_h][1] += 1
+                if weekday is not None:
+                    key_dow = (path, weekday)
+                    if key_dow not in dayofweek_acc:
+                        dayofweek_acc[key_dow] = [0, 0]
+                    dayofweek_acc[key_dow][0] += is_click
+                    dayofweek_acc[key_dow][1] += 1
         except (ValueError, IndexError, TypeError):
             pass
 
@@ -3644,6 +3658,9 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     click_prior_hour: dict[tuple[str, int], float] = {
         k: _laplace_ctr(acc[0], acc[1]) for k, acc in hour_acc.items()
     }
+    click_prior_dayofweek: dict[tuple[str, int], float] = {
+        k: _laplace_ctr(acc[0], acc[1]) for k, acc in dayofweek_acc.items()
+    }
     dwell_score: dict[str, float] = {
         p: math.log1p(sum(ms_list) / len(ms_list) / 1000.0)
         for p, ms_list in dwell_acc.items()
@@ -3654,6 +3671,7 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
         "click_prior": click_prior,
         "click_prior_folder": click_prior_folder,
         "click_prior_hour": click_prior_hour,
+        "click_prior_dayofweek": click_prior_dayofweek,
         "dwell_score": dwell_score,
         "n_events": n_events,
     }
@@ -3808,7 +3826,8 @@ class RankerWeights:
     __slots__ = (
         "recency_cue", "recency_always", "tag_literal", "title_match",
         "feedback_pos", "feedback_neg", "feedback_match_floor", "graph_pagerank",
-        "click_prior", "click_prior_folder", "click_prior_hour", "dwell_score",
+        "click_prior", "click_prior_folder", "click_prior_hour",
+        "click_prior_dayofweek", "dwell_score",
     )
 
     def __init__(
@@ -3824,6 +3843,7 @@ class RankerWeights:
         click_prior: float = 0.0,
         click_prior_folder: float = 0.0,
         click_prior_hour: float = 0.0,
+        click_prior_dayofweek: float = 0.0,
         dwell_score: float = 0.0,
     ):
         self.recency_cue = float(recency_cue)
@@ -3837,6 +3857,7 @@ class RankerWeights:
         self.click_prior = float(click_prior)
         self.click_prior_folder = float(click_prior_folder)
         self.click_prior_hour = float(click_prior_hour)
+        self.click_prior_dayofweek = float(click_prior_dayofweek)
         self.dwell_score = float(dwell_score)
 
     def as_dict(self) -> dict:
@@ -19947,6 +19968,7 @@ def retrieve(
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
     hyde: bool | None = None,
+    caller: str = "cli",
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied,
@@ -19971,6 +19993,17 @@ def retrieve(
     `{"vault", "calendar"}`. Applied post-rerank (the filter is cheap and
     keeps the reranker's mental model — which was tuned on mixed inputs —
     unchanged). Legacy rows without a `source` field default to `"vault"`.
+
+    ``caller`` (2026-04-28): identifica quién dispara esta retrieve para
+    poder distinguir user-initiated de bot-initiated en ``rag_behavior``.
+    Default ``"cli"`` (mantiene comportamiento histórico). Otros valores
+    estables: ``"web"`` (FastAPI ``/api/chat``, ``/api/search``),
+    ``"anticipate-calendar"`` / ``"anticipate-echo"`` / ``"anticipate-commitment"``
+    (anticipatory agent signals), ``"followup"`` (find_followup_loops daemon),
+    ``"eval"`` (rag eval harness), ``"weekly"`` (weekly digest evidence
+    collection). El ranker training (``scripts/export_training_pairs.py``)
+    filtra por ``source IN ('cli', 'web')`` para no usar bot-initiated
+    impressions como signal del user.
 
     Pipeline:
       - optional history-aware reformulation (precise), with optional `summary`
@@ -20386,10 +20419,13 @@ def retrieve(
     # Behavior priors — loaded once per retrieve() call, safe when file absent.
     _any_behavior_weight = any([
         weights.click_prior, weights.click_prior_folder,
-        weights.click_prior_hour, weights.dwell_score,
+        weights.click_prior_hour, weights.click_prior_dayofweek,
+        weights.dwell_score,
     ])
     priors = _load_behavior_priors() if _any_behavior_weight else {}
-    _behavior_hour = datetime.now().hour if _any_behavior_weight else 0
+    _now_dt = datetime.now() if _any_behavior_weight else None
+    _behavior_hour = _now_dt.hour if _now_dt else 0
+    _behavior_weekday = _now_dt.weekday() if _now_dt else 0
     # Hard-ignore: paths declarados "no mostrar nunca" vía `rag ignore`.
     # Se excluyen completamente del candidate pool — no es penalty, es filtro.
     ignored = load_ignored_paths()
@@ -20467,6 +20503,7 @@ def retrieve(
             cp = priors.get("click_prior", {})
             cf = priors.get("click_prior_folder", {})
             ch = priors.get("click_prior_hour", {})
+            cdw = priors.get("click_prior_dayofweek", {})
             ds = priors.get("dwell_score", {})
             path_folder = path.split("/")[0] if "/" in path else ""
             if weights.click_prior and cp:
@@ -20475,6 +20512,10 @@ def retrieve(
                 final += weights.click_prior_folder * cf.get(path_folder, 0.0)
             if weights.click_prior_hour and ch:
                 final += weights.click_prior_hour * ch.get((path, _behavior_hour), 0.0)
+            if weights.click_prior_dayofweek and cdw:
+                final += weights.click_prior_dayofweek * cdw.get(
+                    (path, _behavior_weekday), 0.0,
+                )
             if weights.dwell_score and ds:
                 # f["dwell_score"] is log1p(mean_dwell_s); cap at
                 # DWELL_LOG_NORM_CAP so the boost saturates instead of
@@ -20755,10 +20796,15 @@ def retrieve(
     # Impression logging: record what we surfaced so CTR = clicks / real
     # impressions (previously clicks / interactions only, which inflated
     # active paths). Throttled + silent per `log_impressions()` contract.
+    #
+    # `source=caller` (2026-04-28): propagamos el caller para que
+    # bot-initiated retrieves (anticipate-*, followup, eval) no se mezclen
+    # con user signal en `rag_behavior`. El default `caller="cli"` mantiene
+    # el comportamiento histórico para los call sites que no se actualicen.
     try:
         final_paths = [m.get("file") for m in metas if m.get("file")]
         if final_paths:
-            log_impressions(question, final_paths, source="cli")
+            log_impressions(question, final_paths, source=caller)
     except Exception as exc:
         _silent_log("retrieve.log_impressions", exc)
 
@@ -20976,6 +21022,7 @@ def deep_retrieve(
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
     hyde: bool | None = None,
+    caller: str = "cli",
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -20994,6 +21041,7 @@ def deep_retrieve(
         source=source,
         intent=intent,
         hyde=hyde,
+        caller=caller,
     )
     if not result["docs"]:
         result["deep_retrieve_iterations"] = 1
@@ -21067,6 +21115,7 @@ def deep_retrieve(
             exclude_path_prefixes=exclude_path_prefixes,
             source=source,
             intent=intent,
+            caller=caller,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -21260,7 +21309,9 @@ def collect_ranker_features(
 
     # Behavior priors — loaded once per call, never raises.
     priors = _load_behavior_priors()
-    current_hour = datetime.now().hour
+    _now_dt = datetime.now()
+    current_hour = _now_dt.hour
+    current_weekday = _now_dt.weekday()
 
     feats: list[dict] = []
     for (_, meta, _), s in zip(candidates, rerank_scores):
@@ -21292,6 +21343,9 @@ def collect_ranker_features(
             "click_prior": priors["click_prior"].get(path, 0.0),
             "click_prior_folder": priors["click_prior_folder"].get(path_folder, 0.0),
             "click_prior_hour": priors["click_prior_hour"].get((path, current_hour), 0.0),
+            "click_prior_dayofweek": priors.get("click_prior_dayofweek", {}).get(
+                (path, current_weekday), 0.0,
+            ),
             "dwell_score": priors["dwell_score"].get(path, 0.0),
             "meta": meta,
         })
@@ -21423,6 +21477,7 @@ def multi_retrieve(
     source: str | list[str] | set[str] | None = None,
     intent: str | None = None,
     hyde: bool | None = None,
+    caller: str = "cli",
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -21462,6 +21517,7 @@ def multi_retrieve(
             source=source,
             intent=intent,
             hyde=hyde,
+            caller=caller,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para
         # uno). Via __setitem__ funciona con RetrieveResult y con dicts
@@ -21487,6 +21543,7 @@ def multi_retrieve(
             source=source,
             intent=intent,
             hyde=hyde,
+            caller=caller,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -29106,6 +29163,7 @@ _TUNE_SPACE = {
     "click_prior":        (0.0, 0.30),   # per-path CTR from open/save events
     "click_prior_folder": (0.0, 0.15),   # top-level folder CTR
     "click_prior_hour":   (0.0, 0.20),   # path × current-hour CTR
+    "click_prior_dayofweek": (0.0, 0.15),  # path × weekday CTR (lun=0..dom=6)
     "dwell_score":        (0.0, 0.10),   # log1p(mean_dwell_s) per path
 }
 

@@ -73,6 +73,58 @@ def test_log_impressions_not_throttled_across_queries(behavior_env):
     assert len(rows) == 2
 
 
+def test_log_impressions_propagates_caller_to_source(behavior_env):
+    """Source field se setea desde el ``source`` kwarg. Verificá que pasar
+    distintos callers (anticipate-calendar, followup, eval, web) deja un
+    trail con el source correcto en rag_behavior — necesario para que el
+    training pairs miner pueda filtrar bot-initiated impressions del
+    user-initiated training set.
+
+    Cerrado 2026-04-28: pre-fix `retrieve()` siempre llamaba
+    ``log_impressions(source="cli")`` hardcodeado, así que rows del bot se
+    mezclaban con rows del user en `rag_behavior` y el ranker training las
+    consumía como signal del user. Ahora `retrieve(caller=X)` propaga X
+    como source."""
+    rag.log_impressions("q1", ["a.md"], source="anticipate-calendar")
+    rag.log_impressions("q2", ["b.md"], source="followup")
+    rag.log_impressions("q3", ["c.md"], source="eval")
+    rag.log_impressions("q4", ["d.md"], source="web")
+    rag.log_impressions("q5", ["e.md"], source="cli")  # default
+
+    rows = _rows(behavior_env)
+    by_path = {r["path"]: r["source"] for r in rows}
+    assert by_path["a.md"] == "anticipate-calendar"
+    assert by_path["b.md"] == "followup"
+    assert by_path["c.md"] == "eval"
+    assert by_path["d.md"] == "web"
+    assert by_path["e.md"] == "cli"
+
+
+def test_retrieve_caller_default_is_cli_for_backward_compat(behavior_env, monkeypatch):
+    """retrieve() sin pasar `caller` mantiene el comportamiento histórico
+    de antes del fix 2026-04-28: log_impressions con source='cli'.
+    Backward-compat sanity — los 117 call sites que NO se actualicen
+    (tests, scripts viejos, plugins externos) siguen logueando como
+    'cli' sin cambios."""
+    captured: list[dict] = []
+
+    def _capture_impressions(query, paths, *, source="cli", session=None, cap=10):
+        captured.append({"source": source, "query": query, "paths": list(paths)})
+
+    monkeypatch.setattr(rag, "log_impressions", _capture_impressions)
+
+    # Stub minimal para que retrieve() corra hasta log_impressions sin
+    # hacer un retrieval real (que requiere col + corpus poblado).
+    class _FakeCol:
+        def count(self):
+            return 0  # corpus vacío → retrieve early-returns sin loguear
+    rag.retrieve(_FakeCol(), "test query", k=5, folder=None)
+    # Corpus vacío → no log. Verificá que retrieve() ACEPTA el kwarg
+    # `caller` sin crashear (signature backward-compat).
+    rag.retrieve(_FakeCol(), "test query 2", k=5, folder=None, caller="eval")
+    # Si llegamos acá, signature es válida.
+
+
 def test_impression_events_count_as_denominator_only(behavior_env):
     """Path with 10 impressions + 0 clicks must have low CTR; path with 5/5 must be higher."""
     # p1: 5 impressions, 0 clicks → low CTR

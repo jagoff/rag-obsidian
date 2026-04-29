@@ -20328,6 +20328,12 @@ class ChatTurnResult:
             # None en production default; populado cuando
             # RAG_LLM_INTENT_SHADOW=1 para medir agreement regex vs LLM.
             "intent_shadow": self.intent_shadow,
+            # Contradiction penalty counter (2026-04-29). 0 = penalty
+            # apagado o ningún chunk matcheó la tabla `rag_contradictions`.
+            # >0 = N chunks fueron demoted post-rerank pre top-k cap.
+            "contradiction_penalty_applied": int(
+                rr.get("contradiction_penalty_applied", 0) or 0,
+            ),
         }
 
 
@@ -20501,6 +20507,7 @@ def run_chat_turn(req: ChatTurnRequest) -> ChatTurnResult:
         seen_titles=req.seen_titles,
         source=req.source,
         intent=intent_value,
+        counter=req.counter,
     )
     t_retrieve_ms = int((time.perf_counter() - t_retrieve_start) * 1000)
 
@@ -22476,6 +22483,7 @@ def multi_retrieve(
     all_graph: list[tuple[str, dict]] = []
     variants: list[str] | None = None
     filters_applied: dict = {}
+    _mv_contradiction_count_acc = 0
     for name, path in vaults:
         col = get_db_for(path)
         if col.count() == 0:
@@ -22503,6 +22511,15 @@ def multi_retrieve(
         # Primer vault con filtros inferidos manda (raro que difieran).
         if not filters_applied and r["filters_applied"]:
             filters_applied = r["filters_applied"]
+        # Acumular contadores de contradiction penalty de cada per-vault
+        # retrieve para que el caller agregado pueda surface-arlos en
+        # telemetría.
+        try:
+            _mv_contradiction_count_acc += int(
+                r.get("contradiction_penalty_applied", 0) or 0
+            )
+        except Exception:
+            pass
         # Merge graph-expanded context from all vaults
         for gd, gm in zip(r.get("graph_docs", []), r.get("graph_metas", [])):
             gm_annotated = dict(gm)
@@ -22529,6 +22546,12 @@ def multi_retrieve(
         and top
         and float(top[0][0]) > _LOOKUP_THRESHOLD
     )
+    # Sumar contradiction_penalty_applied de todos los vaults consultados.
+    # Cada per-vault retrieve() ya aplicó su propio penalty (multi_retrieve
+    # no re-rankea cross-vault, solo merge-sortea por score). El total
+    # puede exceder los k finales — está bien, telemetría es señal de
+    # cuántos chunks fueron demoted, no cuántos sobrevivieron al cap.
+    _mv_contradiction_count = _mv_contradiction_count_acc
     return RetrieveResult(
         docs=[d for _, d, _ in top],
         metas=[m for _, _, m in top],
@@ -22542,6 +22565,7 @@ def multi_retrieve(
         graph_metas=[m for _, m in all_graph],
         intent=intent,
         fast_path=_multi_fast_path,
+        contradiction_penalty_applied=_mv_contradiction_count,
     )
 
 
@@ -27457,6 +27481,7 @@ def query(
         date_range=date_range, variants=pre_variants,
         source=source_filter,
         intent=intent,
+        counter=counter,
     )
 
     def _do_retrieve():
@@ -27523,6 +27548,9 @@ def query(
             # rationale extendido. Audit 2026-04-25.
             "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
             "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+            "contradiction_penalty_applied": int(
+                result.get("contradiction_penalty_applied", 0) or 0,
+            ),
         })
         if plain:
             click.echo("Sin resultados.")
@@ -27604,6 +27632,9 @@ def query(
             # rationale extendido. Audit 2026-04-25.
             "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
             "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+            "contradiction_penalty_applied": int(
+                result.get("contradiction_penalty_applied", 0) or 0,
+            ),
         })
         if sess is not None:
             append_turn(sess, {
@@ -27907,6 +27938,9 @@ def query(
         # rationale extendido. Audit 2026-04-25.
         "deep_retrieve_iterations": result.get("deep_retrieve_iterations"),
         "deep_retrieve_exit_reason": result.get("deep_retrieve_exit_reason"),
+        "contradiction_penalty_applied": int(
+            result.get("contradiction_penalty_applied", 0) or 0,
+        ),
     })
 
     if sess is not None:
@@ -28955,6 +28989,7 @@ def chat(
                 date_range=pinned_date_range, summary=sess_summary,
                 intent=_chat_turn_intent,
                 hyde=hyde,
+                counter=counter,
             )
             # Auto-deep: solo si confidence baja pero >0 (0.0 = no hay
             # match en el vault, deep no va a encontrar nada nuevo).
@@ -28970,6 +29005,7 @@ def chat(
                     deep=True,
                     intent=_chat_turn_intent,
                     hyde=hyde,
+                    counter=counter,
                 )
         if not result["docs"]:
             console.print("[yellow]Sin resultados relevantes.[/yellow]")

@@ -171,6 +171,123 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\bcriança\b", "niño"),
     (r"\bmãe\b", "mamá"),
     (r"\bpai\b", "papá"),
+    # 2026-04-29 (E2E test sobre /api/chat con "qué tengo de Grecia"):
+    # el LLM (qwen2.5:7b o command-r) sigue emitiendo portugués denso
+    # pese al system prompt + intent prompts. Output observado:
+    # "Tu nota es una carta para alguém em sua vida. A carta habla
+    # sobre o amor e a revolução que vos trouxe à família, desde a
+    # chegada da niño até os momentos emocionantes da primária."
+    #
+    # Agregamos las palabras que faltaban de ese output. Todas tienen
+    # grafías que NO existen en español rioplatense (acentos nasales
+    # `ã`/`õ`, sufijos `-ução`, vocabulario distintivo pt).
+    (r"\balguém\b", "alguien"),       # quien (pt) → alguien (es)
+    (r"\bninguém\b", "nadie"),
+    (r"\btrouxe\b", "trajo"),         # ele/ela trouxe = él/ella trajo
+    (r"\btrouxeram\b", "trajeron"),
+    (r"\bprimária\b", "primaria"),    # acento en la 'a' es pt; en es es 'i'
+    (r"\bsecundária\b", "secundaria"),
+    (r"\brevolução\b", "revolución"),
+    (r"\brevoluções\b", "revoluciones"),
+    (r"\beducação\b", "educación"),
+    (r"\binformação\b", "información"),
+    (r"\binformações\b", "informaciones"),
+    (r"\bemoção\b", "emoción"),
+    (r"\bemoções\b", "emociones"),
+    (r"\bcanção\b", "canción"),
+    (r"\bcanções\b", "canciones"),
+    (r"\bnação\b", "nación"),
+    (r"\bnações\b", "naciones"),
+    (r"\brelação\b", "relación"),
+    (r"\brelações\b", "relaciones"),
+    # Sufijo general `-ução` (pt) → `-ución` (es). Captura cualquier
+    # palabra terminada en -ução que no esté en la lista explícita
+    # de arriba (ej. "destruição" → "destrucción", "construção" →
+    # "construcción"). El sufijo `-ução` SÓLO existe en pt.
+    (r"\b(\w+?)ução\b", r"\1ución"),
+    (r"\b(\w+?)uções\b", r"\1uciones"),
+    # Sufijo `-ção` (pt) → `-ción` (es). Cubre los casos que no eran
+    # palabras estándar (ej. "atualização" → "actualización" — aunque
+    # el "atu" sigue siendo pt, el sufijo se corrige). Las palabras
+    # explícitas de arriba (ação, solução, etc.) ya estaban; ésta es
+    # red de protección.
+    (r"\b(\w+?)ção\b", r"\1ción"),
+    (r"\b(\w+?)ções\b", r"\1ciones"),
+    # Preposiciones pt con `à`/`às`/`ao`/`aos` (contracción `a + el`)
+    # — no existen en es. "à família" → "a la familia", pero distinguir
+    # género (la/el) sin contexto es complejo. Conservador: sólo
+    # convertir cuando el siguiente sustantivo se reconoce, o usar
+    # el patrón genérico → "a" sin género (puede sonar raro pero es
+    # mejor que "à").
+    (r"\bà\b", "a la"),
+    (r"\bàs\b", "a las"),
+    (r"\bao\b", "al"),
+    (r"\baos\b", "a los"),
+    # "em sua" / "em seu" — pt explícito. "em" como starter ya tiene
+    # algunas reglas (em março, em junho, etc.) pero "em sua" / "em
+    # seu" son contextos de posesivo muy comunes en pt.
+    (r"\bem\s+sua\b", "en su"),
+    (r"\bem\s+seu\b", "en su"),
+    (r"\bem\s+suas\b", "en sus"),
+    (r"\bem\s+seus\b", "en sus"),
+    (r"\bem\s+um\b", "en un"),
+    (r"\bem\s+uma\b", "en una"),
+    # "até" (pt: "hasta") — la grafía con `é` final es pt. En es se
+    # escribe "hasta" o "incluso". Conservador: convertir a "hasta".
+    (r"\baté\b", "hasta"),
+    # "vos trouxe" / "para vos" donde el `vos` apunta a 2da persona
+    # pt (no rioplatense — en pt brasileiro no se usa "vos"; en pt
+    # europeo arcaico sí). En rioplatense "vos" es OK, pero combinado
+    # con verbos pt como "trouxe" es leak. La regla de "trouxe" ya
+    # arriba lo cubre — no agregamos "vos" → "vos" (idempotente).
+    # "novo" / "nova" / "novos" / "novas" (pt) → "nuevo"/etc. (es).
+    # CUIDADO: "novo" no existe en es estándar (es "nuevo"), pero
+    # tampoco es muy común el typo. Lo agregamos:
+    (r"\bnovo\b", "nuevo"),
+    (r"\bnova\b", "nueva"),
+    (r"\bnovos\b", "nuevos"),
+    (r"\bnovas\b", "nuevas"),
+    # "capítulo" en pt y "capítulo" en es son IGUALES. No tocar.
+    # "esperando" en ambos idiomas también. No tocar.
+    # "momentos" en ambos. No tocar.
+    # Sufijo `-mente` adverbial: igual en pt y es. No tocar.
+    # "chegada" (pt) → "llegada" (es). La grafía con `ch` para sonido
+    # /ʃ/ es pt; en es es siempre /tʃ/.
+    (r"\bchegada\b", "llegada"),
+    (r"\bchegou\b", "llegó"),
+    (r"\bchegar\b", "llegar"),
+    # Artículos contraídos pt SEGUROS (no aparecen en español rioplatense
+    # como palabra suelta + letra). EXCLUIDOS:
+    #   - `\bno\b` y `\bnos\b` → SUPER COMÚN en es como negación y
+    #     pronombre reflexivo ("no quiero", "nos vamos", "se nos hizo").
+    #     La regla específica `\bnos\s+braços\b` ya está arriba.
+    #   - `\bdos\b` → es número 2 ("dos casas", "dos personas").
+    #   - `\bo\b`, `\ba\b` → artículos super genéricos en pt, pero "o"
+    #     en es es conjunción ("ese o el otro") y "a" es preposición
+    #     ("voy a casa"). Demasiado riesgo.
+    (r"\bda\s+", "de la "),
+    (r"\bdo\s+(?=[a-záéíóúñ])", "del "),  # cuidado con "do" como verbo musical / sigla
+    (r"\bdas\s+", "de las "),
+    (r"\bna\s+", "en la "),
+    (r"\bnas\s+", "en las "),
+    # "os" (pt: "los") y "as" (pt: "las") — en rioplatense no se usan
+    # como pronombres (es voseo, no vosotros). En español de España
+    # SÍ ("os digo", "as visto") pero el target es rioplatense. Riesgo
+    # bajo. Lookahead exige letra después para evitar matches en
+    # acrónimos/abreviaciones (OS X, etc.).
+    (r"\bos\s+(?=[a-záéíóúñ])", "los "),
+    (r"\bas\s+(?=[a-záéíóúñ])", "las "),
+    # "um" (pt: "un") → "un". "uma" ya está como "una". CUIDADO con
+    # palabras técnicas como "UMI", "UMP" — `\b` las aísla pero el
+    # case-insensitive matchea. En la práctica no son palabras + letra
+    # minúscula.
+    (r"\bum\s+(?=[a-záéíóúñ])", "un "),
+    # "família" (pt: "familia") — la tilde nasal sobre la `i` no
+    # existe en es.
+    (r"\bfamília\b", "familia"),
+    (r"\bfamílias\b", "familias"),
+    (r"\bescola\b", "escuela"),  # pt → es
+    (r"\bescolas\b", "escuelas"),
     # 2026-04-29: sufijos y palabras pt con `-ência` (acento circunflejo
     # nasal en `ê`). En es es `-encia`. La grafía con `ê` SÓLO existe
     # en pt — convertir es seguro. Cubre "experiência", "ciência",

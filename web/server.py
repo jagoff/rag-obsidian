@@ -15641,13 +15641,21 @@ def _build_global_errors_payload(window_s: int, level_filter: str) -> dict:
                     ts = last_ts
                     ts_inferred = True
                 else:
-                    # Fallback: mtime - (offset from tail) seg. Para que las
-                    # líneas más cerca del final del archivo queden con ts
-                    # más reciente.
-                    secs_back = (n_total - 1 - idx)
-                    synthetic_dt = mtime_dt - timedelta(seconds=secs_back)
-                    ts = synthetic_dt.isoformat(timespec="seconds")
-                    ts_synthetic = True
+                    # Sin ts inline Y sin last_ts previo en el archivo →
+                    # SKIP. El fallback synthetic via mtime que había
+                    # antes (mtime - secs_back) inyectaba un ts "reciente"
+                    # falso para líneas que en realidad eran historicas:
+                    # típicamente líneas de mem0 / library output que se
+                    # printean sin ts a stderr y quedan acumuladas en
+                    # `.error.log` mientras el daemon sigue escribiendo
+                    # otros INFO, que refrescan el mtime del archivo →
+                    # las líneas viejas heredaban un ts sintético reciente
+                    # y reaparecían en el feed de errores eternamente.
+                    # Bug observado 2026-04-29 con `Failed to load spaCy
+                    # lemma model` que ya no era real (spaCy fixeado en
+                    # mem-vault commit 735e969) pero seguía mostrándose
+                    # en /logs cada vez que el web daemon escribía algo.
+                    continue
                 # Filter por window — si el ts (real o sintético) cae
                 # antes de cutoff, skip.
                 try:

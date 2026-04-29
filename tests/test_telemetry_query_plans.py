@@ -225,6 +225,7 @@ def test_every_telemetry_table_has_at_least_one_index(telemetry_db):
         "rag_surface_log",          # immutable log
         "rag_reminder_wa_pushed",   # set membership
         "rag_feedback_golden",      # state by id
+        "rag_brief_schedule_prefs", # override hour/minute by brief_kind PK
     }
 
     rows = telemetry_db.execute(

@@ -48,6 +48,81 @@ WEATHER_LOCATION = "Santa+Fe,Argentina"
 WEATHER_RAIN_THRESHOLD = 70  # contract in repo CLAUDE.md: hint only if rain ≥70%
 
 
+# 2026-04-28 wave-8: traducir descripciones de wttr.in al español. Sin
+# esto el LLM (qwen2.5:7b) recibía CONTEXTO con strings en inglés
+# ("Patchy rain nearby", "Partly cloudy") y bajo presión de contexto
+# leakeaba tokens CJK al sintetizar la respuesta — observado en eval
+# Conv B T1: "Según el clima预报，今天在马德里的天气是多云且有零星降雨,
+# 气温约为17°C". Stripping CJK post-decode dejaba la respuesta rota.
+# Mejor remover el "language hint" upstream traduciendo el JSON.
+#
+# Cobertura: las ~50 condiciones más comunes que wttr.in/WWO devuelven.
+# Lookup case-insensitive, lo no-mapeado pasa tal cual (wttr.in puede
+# emitir variantes raras — preferimos un default tolerante a verbatim).
+_WEATHER_DESC_ES: dict[str, str] = {
+    "clear": "despejado",
+    "sunny": "soleado",
+    "partly cloudy": "parcialmente nublado",
+    "cloudy": "nublado",
+    "overcast": "muy nublado",
+    "mist": "neblina",
+    "fog": "niebla",
+    "freezing fog": "niebla helada",
+    "patchy rain possible": "posibilidad de lluvias aisladas",
+    "patchy rain nearby": "lluvias aisladas cerca",
+    "patchy snow possible": "posibilidad de nieve aislada",
+    "patchy sleet possible": "posibilidad de aguanieve aislada",
+    "patchy freezing drizzle possible": "posibilidad de llovizna helada aislada",
+    "thundery outbreaks possible": "posibles tormentas",
+    "blowing snow": "nieve con viento",
+    "blizzard": "ventisca",
+    "patchy light drizzle": "llovizna aislada",
+    "light drizzle": "llovizna",
+    "freezing drizzle": "llovizna helada",
+    "heavy freezing drizzle": "llovizna helada intensa",
+    "patchy light rain": "lluvia ligera aislada",
+    "light rain": "lluvia ligera",
+    "moderate rain at times": "lluvia moderada por momentos",
+    "moderate rain": "lluvia moderada",
+    "heavy rain at times": "lluvia intensa por momentos",
+    "heavy rain": "lluvia intensa",
+    "light freezing rain": "lluvia helada ligera",
+    "moderate or heavy freezing rain": "lluvia helada moderada o intensa",
+    "light sleet": "aguanieve ligera",
+    "moderate or heavy sleet": "aguanieve moderada o intensa",
+    "patchy light snow": "nevada ligera aislada",
+    "light snow": "nieve ligera",
+    "patchy moderate snow": "nevada moderada aislada",
+    "moderate snow": "nieve moderada",
+    "patchy heavy snow": "nevada intensa aislada",
+    "heavy snow": "nieve intensa",
+    "ice pellets": "granizo",
+    "light rain shower": "chubasco ligero",
+    "moderate or heavy rain shower": "chubasco moderado o intenso",
+    "torrential rain shower": "chubasco torrencial",
+    "light sleet showers": "chubascos de aguanieve ligera",
+    "moderate or heavy sleet showers": "chubascos de aguanieve moderada o intensa",
+    "light snow showers": "chubascos de nieve ligera",
+    "moderate or heavy snow showers": "chubascos de nieve moderada o intensa",
+    "light showers of ice pellets": "chubascos de granizo ligero",
+    "moderate or heavy showers of ice pellets": "chubascos de granizo moderado o intenso",
+    "patchy light rain with thunder": "lluvia ligera aislada con tormenta",
+    "moderate or heavy rain with thunder": "lluvia moderada o intensa con tormenta",
+    "patchy light snow with thunder": "nieve ligera aislada con tormenta",
+    "moderate or heavy snow with thunder": "nieve moderada o intensa con tormenta",
+}
+
+
+def _translate_weather_desc(en: str) -> str:
+    """Traduce la descripción de wttr.in al español. Pass-through para
+    descriptions no mapeadas (preferimos texto crudo que un guess malo).
+    """
+    if not en:
+        return en
+    key = en.strip().lower()
+    return _WEATHER_DESC_ES.get(key, en)
+
+
 def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
     """Query wttr.in. Returns a summary dict ONLY if rain is in the forecast
     for today (chance ≥ WEATHER_RAIN_THRESHOLD in any upcoming 3h block, or
@@ -67,15 +142,19 @@ def _fetch_weather_rain(location: str = WEATHER_LOCATION) -> dict | None:
         return None
 
     # Current conditions: "Rain", "Light rain", "Thunderstorm", etc.
+    # Translation está OK porque el regex `rain|shower|thunder|...` se aplica
+    # ANTES — sobre el desc original — para detectar la categoría. La copia
+    # traducida sólo se inyecta en el `summary` user-facing.
     current = ""
+    desc_en = ""
     try:
         cc = data.get("current_condition") or []
         if cc:
-            desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
-            current = desc.strip()
+            desc_en = (cc[0].get("weatherDesc") or [{}])[0].get("value", "").strip()
+            current = _translate_weather_desc(desc_en)
     except Exception:
         current = ""
-    currently_raining = bool(re.search(r"rain|shower|thunder|storm|drizzle", current, re.I))
+    currently_raining = bool(re.search(r"rain|shower|thunder|storm|drizzle", desc_en, re.I))
 
     # Today hourly: each entry has time="0|300|600|…|2100" (3h blocks) and
     # chanceofrain / chanceofthunder as string ints.
@@ -247,7 +326,7 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
         cc = data.get("current_condition") or []
         if cc:
             desc = (cc[0].get("weatherDesc") or [{}])[0].get("value", "")
-            current = desc.strip()
+            current = _translate_weather_desc(desc.strip())
             temp_c = cc[0].get("temp_C", "")
     except Exception:
         pass
@@ -265,7 +344,8 @@ def _fetch_weather_forecast(location: str = WEATHER_LOCATION) -> dict | None:
                 max_thunder = max(max_thunder, int(h.get("chanceofthunder", "0") or 0))
             except Exception:
                 pass
-            d = (h.get("weatherDesc") or [{}])[0].get("value", "")
+            d_raw = (h.get("weatherDesc") or [{}])[0].get("value", "")
+            d = _translate_weather_desc(d_raw)
             if d and d not in descs:
                 descs.append(d)
         days.append({

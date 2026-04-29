@@ -9899,6 +9899,21 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                                 f"invalidated by corpus_hash bump",
                                 flush=True,
                             )
+                        # 2026-04-28 wave-8: idem para CJK leaks. Cache
+                        # entries pre-fix pueden tener 汉字 incrustados
+                        # (qwen2.5:7b leaks bajo presión de contexto en
+                        # weather queries).
+                        _sem_text_pre_strip_len = len(_sem_text)
+                        _sem_text = _strip_foreign_scripts(_sem_text)
+                        _sem_strip_n = _sem_text_pre_strip_len - len(_sem_text)
+                        if _sem_strip_n > 0:
+                            print(
+                                f"[chat-cjk-strip] phase=cache_hit "
+                                f"stripped {_sem_strip_n} foreign char(s) "
+                                f"from cached response — filter_version "
+                                f"bump should invalidate stale entries",
+                                flush=True,
+                            )
                         _sem_sources = [
                             {
                                 "file": _p,
@@ -11616,10 +11631,23 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         # mismo-chunk. Greppable: incrementa pii.
         pii_filter = _PiiRedactFilter()
 
+        # 2026-04-28 wave-8 fix: el filter `_strip_foreign_scripts` estaba
+        # definido (líneas ~1504-1531) pero NUNCA se llamaba, así que los
+        # leaks de CJK que sí ocurren bajo presión de contexto (qwen2.5:7b
+        # mete 汉字 en respuestas de weather, observado eval Conv B T1
+        # "Según el clima预报，今天在马德里...") salían tal cual al user.
+        # Greppable: incrementa cjk_strip_count.
+        _foreign_strip_count = 0
+
         def _emit(token_text: str) -> str:
-            """Helper: pasa token_text por el pii_filter y devuelve lo
-            que se debe yieldear (puede ser '' si está holdeado)."""
-            return pii_filter.feed(token_text)
+            """Helper: pasa token_text por strip_foreign_scripts → pii_filter
+            y devuelve lo que se debe yieldear (puede ser '' si está holdeado).
+            """
+            nonlocal _foreign_strip_count
+            cleaned = _strip_foreign_scripts(token_text)
+            if cleaned != token_text:
+                _foreign_strip_count += len(token_text) - len(cleaned)
+            return pii_filter.feed(cleaned)
 
         _t_llm_start = time.perf_counter()
         _first_token_logged = False
@@ -11700,6 +11728,14 @@ def chat(req: ChatRequest, request: Request) -> StreamingResponse:
                 print(
                     f"[chat-pii-redact] redacted {pii_filter._redact_count} "
                     f"PII pattern(s) from response. tools_fired="
+                    f"{tool_names_called or 'none'}",
+                    flush=True,
+                )
+            # 2026-04-28 wave-8: log si stripped CJK/foreign tokens.
+            if _foreign_strip_count > 0:
+                print(
+                    f"[chat-cjk-strip] stripped {_foreign_strip_count} "
+                    f"foreign char(s) from streaming output. tools_fired="
                     f"{tool_names_called or 'none'}",
                     flush=True,
                 )

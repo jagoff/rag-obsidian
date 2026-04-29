@@ -29483,6 +29483,13 @@ def _brief_synthetic_cases(
     Returns:
         list of dicts compatible with `_behavior_augmented_cases` output.
         Conflicting (q, path) keys (same pair as both pos and neg) are dropped.
+        Cada caso emitido lleva ``synthetic_source="brief"`` (cerrado
+        2026-04-28) para que downstream tuning pueda down-weight o filtrar
+        este pool — son casos LLM-curated (el brief fue armado por el
+        LLM a partir del corpus + reminders + calendar), no clicks
+        directos del user. La distinción permite ablation experiments
+        ("¿qué pasa si entreno SOLO con casos directos?") sin tener que
+        re-derivar el origen post-hoc.
     """
     cutoff_ts = time.time() - days * 86400
     cutoff_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
@@ -29552,6 +29559,7 @@ def _brief_synthetic_cases(
             "kind_hint": "behavior_pos",
             "source": source,
             "weight": weight,
+            "synthetic_source": "brief",
         })
     for key, source in neg.items():
         if key in conflict:
@@ -29563,6 +29571,7 @@ def _brief_synthetic_cases(
             "kind_hint": "behavior_neg",
             "source": source,
             "weight": weight,
+            "synthetic_source": "brief",
         })
     return out
 

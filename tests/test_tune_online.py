@@ -167,6 +167,10 @@ def test_brief_synthetic_kept_attaches_to_recent_query(tmp_path, monkeypatch):
     assert case["kind_hint"] == "behavior_pos"
     assert case["source"] == "brief_kept_synthetic"
     assert case["weight"] == 0.3
+    # Marker `synthetic_source="brief"` (cerrado 2026-04-28): permite que
+    # downstream tuning ablate o down-weight casos LLM-curated vs casos
+    # directos del user.
+    assert case["synthetic_source"] == "brief"
 
 
 def test_brief_synthetic_deleted_attaches_as_negative(tmp_path, monkeypatch):
@@ -189,6 +193,8 @@ def test_brief_synthetic_deleted_attaches_as_negative(tmp_path, monkeypatch):
     assert case["anti_expected"] == [target]
     assert case["kind_hint"] == "behavior_neg"
     assert case["source"] == "brief_deleted_synthetic"
+    # Marker `synthetic_source="brief"` también en negatives (2026-04-28).
+    assert case["synthetic_source"] == "brief"
 
 
 def test_brief_synthetic_only_attaches_prior_queries(tmp_path, monkeypatch):

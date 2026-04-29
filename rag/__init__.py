@@ -29121,6 +29121,120 @@ def _behavior_augmented_cases(days: int = 14) -> list[dict]:
     return out
 
 
+def _brief_synthetic_cases(
+    days: int = 14,
+    lookback_days: int = 7,
+    max_queries_per_path: int = 5,
+    weight: float = 0.3,
+) -> list[dict]:
+    """Recover brief kept/deleted events that lack a `query` field by attaching
+    them to recent queries whose top-K returned the same path.
+
+    Brief events arrive without a query because the brief is a curated stack
+    of items presented to the user — the user kept/deleted each independently
+    of the original retrieval call. But the path almost always surfaced via
+    one or more recent queries (those queries' paths_json contains it). This
+    function reconstructs (q, path) cases from that join:
+
+      brief.kept    + path P + recent query Q where P ∈ Q.top_K  →  (Q, P) positive
+      brief.deleted + path P + recent query Q where P ∈ Q.top_K  →  (Q, P) negative
+
+    Args:
+        days: window for brief events (matches `_behavior_augmented_cases`).
+        lookback_days: how far back to search rag_queries for each event;
+            limited to events PRIOR to the brief event ts (causal-only).
+        max_queries_per_path: cap synthetic queries per (event, path) so a
+            single popular path doesn't dominate the training signal.
+        weight: lower than 0.5 (the direct behavior signal) because the
+            (q, path) pair is reconstructed, not directly observed.
+
+    Returns:
+        list of dicts compatible with `_behavior_augmented_cases` output.
+        Conflicting (q, path) keys (same pair as both pos and neg) are dropped.
+    """
+    cutoff_ts = time.time() - days * 86400
+    cutoff_iso = datetime.fromtimestamp(cutoff_ts).isoformat(timespec="seconds")
+    pos: dict[tuple[str, str], str] = {}
+    neg: dict[tuple[str, str], str] = {}
+
+    try:
+        with _ragvec_state_conn() as conn:
+            brief_rows = conn.execute(
+                "SELECT path, event, ts FROM rag_behavior "
+                "WHERE source='brief' AND event IN ('kept','deleted') "
+                "  AND path IS NOT NULL AND path != '' "
+                "  AND (query IS NULL OR query = '') "
+                "  AND ts >= ?",
+                (cutoff_iso,),
+            ).fetchall()
+
+            for be in brief_rows:
+                path = be["path"] if hasattr(be, "keys") else be[0]
+                event = be["event"] if hasattr(be, "keys") else be[1]
+                ev_ts = be["ts"] if hasattr(be, "keys") else be[2]
+                # Lookback bound: don't attach queries posterior to the
+                # brief event (would be leakage from future to past).
+                lookback_ts = (
+                    datetime.fromisoformat(ev_ts) - timedelta(days=lookback_days)
+                ).isoformat(timespec="seconds")
+                # JSON array LIKE: paths_json is `["a", "b"]`; match on
+                # quoted path so we don't false-positive on substrings.
+                # Path can't contain `"` in the vault (Obsidian disallows),
+                # so simple LIKE is safe.
+                pat = '%"' + path + '"%'
+                qrows = conn.execute(
+                    "SELECT q FROM rag_queries "
+                    "WHERE ts >= ? AND ts <= ? "
+                    "  AND paths_json LIKE ? "
+                    "  AND q IS NOT NULL AND q != '' "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (lookback_ts, ev_ts, pat, max_queries_per_path),
+                ).fetchall()
+                for r in qrows:
+                    q = (r["q"] if hasattr(r, "keys") else r[0]) or ""
+                    q = q.strip()
+                    if not q:
+                        continue
+                    norm_q = " ".join(q.lower().split())
+                    key = (norm_q, path)
+                    if event == "kept":
+                        pos[key] = "brief_kept_synthetic"
+                    elif event == "deleted":
+                        neg[key] = "brief_deleted_synthetic"
+    except Exception as exc:
+        _log_sql_state_error("brief_synthetic_cases_sql_read_failed",
+                              err=repr(exc))
+        return []
+
+    # Drop conflicting (q, path) pairs (rare but possible if the user
+    # kept then later deleted the same brief item).
+    conflict = set(pos.keys()) & set(neg.keys())
+    out: list[dict] = []
+    for key, source in pos.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "expected": [path],
+            "kind_hint": "behavior_pos",
+            "source": source,
+            "weight": weight,
+        })
+    for key, source in neg.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "anti_expected": [path],
+            "kind_hint": "behavior_neg",
+            "source": source,
+            "weight": weight,
+        })
+    return out
+
+
 def _score_case(feats: list[dict], expected: set[str],
                 weights: "RankerWeights", k: int,
                 anti_expected: set[str] | None = None) -> tuple[bool, float, float]:
@@ -29463,11 +29577,19 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
     behavior_cases: list[dict] = []
     if online:
         behavior_cases = _behavior_augmented_cases(days=days)
+        # Synthetic attachment for brief kept/deleted events (which lack a
+        # `query` field by design — the brief is a curated stack, not the
+        # output of a single query). For each such event, we look up recent
+        # rag_queries whose top-K returned the same path, and emit a
+        # (q, path) case with reduced weight (0.3 vs 0.5 for direct signal).
+        # See `_brief_synthetic_cases` for rationale.
+        synthetic = _brief_synthetic_cases(days=days)
+        behavior_cases.extend(synthetic)
         console.print(
             f"[dim]Behavior cases: {len(behavior_cases)} "
             f"(pos={sum(1 for c in behavior_cases if 'expected' in c)}, "
             f"neg={sum(1 for c in behavior_cases if 'anti_expected' in c)}, "
-            f"últimos {days}d)[/dim]"
+            f"synthetic={len(synthetic)}, últimos {days}d)[/dim]"
         )
 
     col = get_db()

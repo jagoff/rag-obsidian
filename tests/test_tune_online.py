@@ -116,6 +116,158 @@ def test_behavior_ignores_events_without_query(tmp_path, monkeypatch):
     assert result[0]["expected"] == ["Note.md"]
 
 
+# ── _brief_synthetic_cases (synthetic query attachment) ──────────────────────
+
+def _seed_query(events: list[dict]) -> None:
+    """Seed rag_queries with the given events via the SQL primitives.
+
+    Tests pass `paths_json` as a list — we rename to `paths` (which is the
+    src key that `_map_queries_row` understands) so the mapper routes it to
+    the `paths_json` column. `_sql_append_event` then JSON-serialises lists
+    automatically for `*_json` columns.
+    """
+    with rag._ragvec_state_conn() as conn:
+        for ev in events:
+            ev = dict(ev)
+            if "paths_json" in ev:
+                ev["paths"] = ev.pop("paths_json")
+            rag._sql_append_event(conn, "rag_queries",
+                                   rag._map_queries_row(ev))
+
+
+def test_brief_synthetic_no_brief_events(tmp_path, monkeypatch):
+    """Sin brief events → lista vacía (no crash)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    result = rag._brief_synthetic_cases(days=14)
+    assert result == []
+
+
+def test_brief_synthetic_kept_attaches_to_recent_query(tmp_path, monkeypatch):
+    """brief.kept con path → busca queries recientes con ese path en paths_json
+    y emite (q, path) positive con weight=0.3."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    target_path = "02-Areas/Coaching/Ikigai.md"
+    # Seed: una query reciente que devolvió el path en su top-K
+    _seed_query([{
+        "cmd": "ask",
+        "q": "ikigai framework",
+        "ts": _iso(-3600),
+        "paths_json": [target_path, "Other.md"],
+    }])
+    # Seed: brief kept event SIN query (típico) posterior a la query
+    _seed_sql(tmp_path, [
+        {"source": "brief", "event": "kept", "path": target_path,
+         "ts": _iso(-100)},
+    ])
+    result = rag._brief_synthetic_cases(days=14)
+    assert len(result) == 1
+    case = result[0]
+    assert case["question"] == "ikigai framework"
+    assert case["expected"] == [target_path]
+    assert case["kind_hint"] == "behavior_pos"
+    assert case["source"] == "brief_kept_synthetic"
+    assert case["weight"] == 0.3
+
+
+def test_brief_synthetic_deleted_attaches_as_negative(tmp_path, monkeypatch):
+    """brief.deleted + path → emite anti_expected (negative)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    target = "03-Resources/Wrong.md"
+    _seed_query([{
+        "cmd": "ask",
+        "q": "wrong topic",
+        "ts": _iso(-3600),
+        "paths_json": [target],
+    }])
+    _seed_sql(tmp_path, [
+        {"source": "brief", "event": "deleted", "path": target,
+         "ts": _iso(-100)},
+    ])
+    result = rag._brief_synthetic_cases(days=14)
+    assert len(result) == 1
+    case = result[0]
+    assert case["anti_expected"] == [target]
+    assert case["kind_hint"] == "behavior_neg"
+    assert case["source"] == "brief_deleted_synthetic"
+
+
+def test_brief_synthetic_only_attaches_prior_queries(tmp_path, monkeypatch):
+    """Solo se attachean queries ANTERIORES al brief event (no leakage)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    target = "Note.md"
+    _seed_query([
+        # Query prior al brief event (válida)
+        {"cmd": "ask", "q": "prior query", "ts": _iso(-3600),
+         "paths_json": [target]},
+        # Query posterior al brief event (debe ser ignorada)
+        {"cmd": "ask", "q": "future query", "ts": _iso(+3600),
+         "paths_json": [target]},
+    ])
+    _seed_sql(tmp_path, [
+        {"source": "brief", "event": "kept", "path": target, "ts": _iso(0)},
+    ])
+    result = rag._brief_synthetic_cases(days=14)
+    questions = {c["question"] for c in result}
+    assert "prior query" in questions
+    assert "future query" not in questions
+
+
+def test_brief_synthetic_skips_events_with_query(tmp_path, monkeypatch):
+    """Brief events que YA tienen query no entran a la attach (eso lo hace
+    `_behavior_augmented_cases` directo)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_query([{
+        "cmd": "ask", "q": "real query", "ts": _iso(-3600),
+        "paths_json": ["Note.md"],
+    }])
+    _seed_sql(tmp_path, [
+        # query ya viene poblada — la fn debe ignorar este event
+        {"source": "brief", "event": "kept", "query": "explicit",
+         "path": "Note.md", "ts": _iso(-100)},
+    ])
+    result = rag._brief_synthetic_cases(days=14)
+    assert result == []
+
+
+def test_brief_synthetic_caps_queries_per_path(tmp_path, monkeypatch):
+    """max_queries_per_path limita la cantidad de queries que se attachean
+    para evitar que un path popular domine el training signal."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    target = "Popular.md"
+    # 10 queries que devolvieron este path
+    _seed_query([
+        {"cmd": "ask", "q": f"query #{i}", "ts": _iso(-3600 - i),
+         "paths_json": [target]}
+        for i in range(10)
+    ])
+    _seed_sql(tmp_path, [
+        {"source": "brief", "event": "kept", "path": target, "ts": _iso(0)},
+    ])
+    result = rag._brief_synthetic_cases(days=14, max_queries_per_path=3)
+    assert len(result) == 3
+
+
+def test_brief_synthetic_path_quoted_match(tmp_path, monkeypatch):
+    """LIKE pattern usa comillas (`"path"`) para evitar match parcial:
+    una query con paths_json `["foobar.md"]` NO debe matchear path `foo.md`."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_query([
+        # path superset que NO debe matchear "Note.md"
+        {"cmd": "ask", "q": "wrong", "ts": _iso(-3600),
+         "paths_json": ["NoteExtra.md"]},
+        # path exacto
+        {"cmd": "ask", "q": "right", "ts": _iso(-3600),
+         "paths_json": ["Note.md"]},
+    ])
+    _seed_sql(tmp_path, [
+        {"source": "brief", "event": "kept", "path": "Note.md", "ts": _iso(0)},
+    ])
+    result = rag._brief_synthetic_cases(days=14)
+    questions = {c["question"] for c in result}
+    assert "right" in questions
+    assert "wrong" not in questions
+
+
 # ── Ranker config versioning ──────────────────────────────────────────────────
 
 def test_backup_ranker_config_no_existing(tmp_path):

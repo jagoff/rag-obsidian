@@ -3064,6 +3064,39 @@ GRAPH_EXPANSION_GATE = 0.5
 # 0 to disable the feature (equivalent to the pre-2026-04-20 behaviour).
 SEEN_TITLE_PENALTY = 0.1
 
+# Contradiction penalty (post-rerank, pre cap top-k). Demote leve a chunks
+# cuyo path aparece en `rag_contradictions` con `skipped IS NULL OR ''`
+# (o `resolved_at IS NULL` si esa columna existe). Default ON, magnitud 0.05
+# sobre el rango típico de rerank_logit [0, 1] — equivale a ~10% del gap
+# entre dos candidates consecutivos típicos, así que mueve uno o dos slots
+# sin matar matches claramente relevantes. Skipeado cuando el caller pasa
+# `counter=True` (flag --counter — el user explícitamente quiere ver
+# contradicciones, no esconderlas).
+#
+# Tunables (leídos por retrieve() cada call, no cacheados — cheap getenv):
+#   RAG_CONTRADICTION_PENALTY=0                  → desactiva (helper ni se llama)
+#   RAG_CONTRADICTION_PENALTY_MAGNITUDE=0.10     → magnitud (positivo);
+#                                                  el offset aplicado es -magnitud.
+#
+# Helper: rag/contradictions_penalty.py (cache TTL 5min, read-only consumer
+# de la tabla — el detector indexer-time vive en otro módulo y no se toca).
+
+
+def _contradiction_penalty_enabled() -> bool:
+    val = os.environ.get("RAG_CONTRADICTION_PENALTY", "1").strip().lower()
+    return val not in ("0", "false", "no", "off", "")
+
+
+def _contradiction_penalty_magnitude() -> float:
+    raw = os.environ.get("RAG_CONTRADICTION_PENALTY_MAGNITUDE", "0.05").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.05
+    # Magnitud siempre no-negativa; el caller la usa como `-magnitude`.
+    return abs(v)
+
+
 console = Console()
 
 
@@ -19864,6 +19897,13 @@ class RetrieveResult:
     # los writes pero NO los fields.
     deep_retrieve_iterations: int = 0
     deep_retrieve_exit_reason: str = ""
+    # Contradiction penalty (2026-04-29): cuántos chunks del scored_all
+    # recibieron el demote de `apply_contradiction_penalty`. 0 cuando el
+    # feature está apagado (RAG_CONTRADICTION_PENALTY=0), cuando el caller
+    # pasó counter=True, o cuando ningún path matcheó la tabla
+    # `rag_contradictions`. Surfaced en `extra_json` del query log para
+    # poder medir cuán a menudo el penalty fire en producción.
+    contradiction_penalty_applied: int = 0
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 
@@ -20656,6 +20696,7 @@ def retrieve(
     intent: str | None = None,
     hyde: bool | None = None,
     caller: str = "cli",
+    counter: bool = False,
 ) -> dict:
     """Full retrieval pipeline. Returns dict:
        { docs, metas, scores, confidence, search_query, filters_applied,
@@ -21315,6 +21356,60 @@ def retrieve(
             scored_all, lambda_=_mmr_lambda,
             pool_size=max(int(k * _mmr_pool_mult), k + 5),
         )
+    # ── Contradiction penalty (post-rerank, pre cap top-k) ────────────────
+    # Demote a chunks cuyo path tiene una contradicción no-resuelta en
+    # `rag_contradictions`. Soft re-score, NO filtra. Skipea cuando el
+    # caller explícitamente pidió contradiction radar (--counter) — en ese
+    # caso el user QUIERE ver las contradicciones, no esconderlas. Helper
+    # vive en rag/contradictions_penalty.py con cache TTL 5min para evitar
+    # un SQL fetch por retrieve(). Tunables via env (leídos cada call):
+    #   RAG_CONTRADICTION_PENALTY=0           → desactiva
+    #   RAG_CONTRADICTION_PENALTY_MAGNITUDE   → magnitud (default 0.05)
+    _contradiction_penalty_count = 0
+    if (
+        scored_all
+        and not counter
+        and _contradiction_penalty_enabled()
+    ):
+        try:
+            from rag.contradictions_penalty import (
+                apply_contradiction_penalty as _apply_contradiction_penalty,
+                count_penalized as _count_penalized_contradictions,
+                load_contradiction_paths as _load_contradiction_paths,
+            )
+            with _ragvec_state_conn() as _cp_conn:
+                _bad_paths = _load_contradiction_paths(_cp_conn)
+            if _bad_paths:
+                # Adapter: el helper espera list[dict] con `path`+`score`.
+                # Conservamos el índice original para reconstruir scored_all
+                # en el nuevo orden sin perder los tuples (candidate, doc).
+                _wrapped = [
+                    {
+                        "path": (c[1].get("file") if isinstance(c[1], dict) else ""),
+                        "score": s,
+                        "_idx": i,
+                    }
+                    for i, (c, _, s) in enumerate(scored_all)
+                ]
+                _contradiction_penalty_count = _count_penalized_contradictions(
+                    _wrapped, _bad_paths,
+                )
+                if _contradiction_penalty_count:
+                    _wrapped = _apply_contradiction_penalty(
+                        _wrapped, _bad_paths,
+                        penalty=-_contradiction_penalty_magnitude(),
+                    )
+                    scored_all = [
+                        (
+                            scored_all[w["_idx"]][0],
+                            scored_all[w["_idx"]][1],
+                            w["score"],
+                        )
+                        for w in _wrapped
+                    ]
+        except Exception as _cp_exc:
+            _silent_log("contradiction_penalty_failed", _cp_exc)
+
     # Feature #14 (2026-04-23): adaptive k — cuando el top-1 domina
     # claramente al resto, reducir k ahorra prefill tokens sin perder
     # calidad. Busca el primer gap significativo en los top scores y
@@ -21616,6 +21711,7 @@ def retrieve(
         timing=dict(_timing),
         fast_path=_fast_path,
         intent=intent,
+        contradiction_penalty_applied=int(_contradiction_penalty_count),
     )
 
 
@@ -21724,6 +21820,7 @@ def deep_retrieve(
     intent: str | None = None,
     hyde: bool | None = None,
     caller: str = "cli",
+    counter: bool = False,
 ) -> dict:
     """Iterative retrieval: retrieve, judge sufficiency, sub-query, merge.
 
@@ -21743,6 +21840,7 @@ def deep_retrieve(
         intent=intent,
         hyde=hyde,
         caller=caller,
+        counter=counter,
     )
     if not result["docs"]:
         result["deep_retrieve_iterations"] = 1
@@ -21817,6 +21915,7 @@ def deep_retrieve(
             source=source,
             intent=intent,
             caller=caller,
+            counter=counter,
         )
         # Merge new results, dedup by chunk identity
         added = 0
@@ -22324,6 +22423,7 @@ def multi_retrieve(
     intent: str | None = None,
     hyde: bool | None = None,
     caller: str = "cli",
+    counter: bool = False,
 ) -> dict:
     """Retrieve cross-vault. Para cada vault de `vaults`:
       1. Abre su colección (get_db_for).
@@ -22364,6 +22464,7 @@ def multi_retrieve(
             intent=intent,
             hyde=hyde,
             caller=caller,
+            counter=counter,
         )
         # Solo anotamos si hay >=2 en scope el display (innecesario para
         # uno). Via __setitem__ funciona con RetrieveResult y con dicts
@@ -22390,6 +22491,7 @@ def multi_retrieve(
             intent=intent,
             hyde=hyde,
             caller=caller,
+            counter=counter,
         )
         if variants is None:
             variants = r["query_variants"]
@@ -25546,6 +25648,8 @@ def propose_whatsapp_reply(
 
 def _brief_push_to_whatsapp(
     title: str, vault_relpath: str, narrative: str,
+    *,
+    audio_path: "Path | None" = None,
 ) -> bool:
     """Push a brief (morning / today / digest) to the user's WhatsApp chat.
 
@@ -25567,13 +25671,32 @@ def _brief_push_to_whatsapp(
     la fecha en el nombre) así que sirve directo como `dedup_key`. No
     contiene newlines (es un file path simple) — el regex del listener
     asume eso.
+
+    Voice brief (Anticipatory Phase 2.C, 2026-04-29): si `audio_path` se
+    pasa y el archivo existe, primero se manda el audio (vía
+    `voice_brief.send_audio_to_whatsapp`, POST con `media_path` al
+    bridge) y después el texto con un marker corto "(audio arriba ↑)"
+    intercalado entre el body y el footer. El listener sigue leyendo el
+    footer del texto (no del audio), así que el feedback loop sigue
+    funcionando intacto. Si el send del audio falla, el texto sale solo
+    sin marker — fallback transparente.
     """
     cfg = _ambient_config()
     if cfg is None:
         return False
     body = convert_obsidian_links(narrative)
+    audio_sent = False
+    if audio_path is not None:
+        try:
+            from rag.voice_brief import send_audio_to_whatsapp  # noqa: PLC0415
+            audio_sent = send_audio_to_whatsapp(cfg["jid"], audio_path)
+        except Exception as exc:
+            _silent_log("brief_push_audio", exc)
+            audio_sent = False
+    audio_marker = "\n\n(audio arriba ↑)" if audio_sent else ""
     msg = (
         f"📓 *{title}* — `{vault_relpath}`\n\n{body}"
+        f"{audio_marker}"
         f"\n\n_brief:{vault_relpath}_"
     )
     sent = _ambient_whatsapp_send(cfg["jid"], msg)
@@ -25583,6 +25706,7 @@ def _brief_push_to_whatsapp(
         "path": vault_relpath,
         "narrative_len": len(narrative),
         "whatsapp_sent": sent,
+        "audio_sent": audio_sent,
     })
     return sent
 
@@ -32412,7 +32536,12 @@ def _generate_digest_narrative(prompt: str) -> str:
         options=CHAT_OPTIONS,
         keep_alive=chat_keep_alive(),
     )
-    return (resp.message.content or "").strip()
+    # 2026-04-29: filter PT→ES post-gen — el digest semanal se guarda en
+    # `04-Archive/99-obsidian-system/99-AI/reviews/` y se le pushea al
+    # user. El prompt inline (línea 32400+) no incluye `language_es_AR.v1`
+    # por ahora; el filter es safety net.
+    from rag.iberian_leak_filter import replace_iberian_leaks
+    return replace_iberian_leaks((resp.message.content or "").strip())
 
 
 DIGEST_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
@@ -35578,13 +35707,13 @@ def prep(topic: str, k: int, folder: str | None, save: bool,
         or "(sin URLs en el vault para esto)"
     )
 
-    rules = (
-        "Sos un asistente que arma briefs de contexto a partir de las notas "
-        "personales del usuario, en 1ra persona. NO inventes información que "
-        "no esté en el contexto. Citá las notas con [[Título]] cuando hagas "
-        "afirmaciones puntuales. Si no hay info para una sección, escribí "
-        "honestamente que no hay nada en el vault."
-    )
+    # 2026-04-29: cargar el prompt via load_prompt() para que prepend
+    # `language_es_AR.v1` (forzar español rioplatense, sin pt/galego leaks).
+    # Antes era un literal inline acá sin regla de idioma — vulnerable a
+    # que el LLM emitiera portugués cuando el contexto tenía palabras
+    # parecidas (reportado el 2026-04-29 con `rag query "Que tenes de
+    # Grecia?"` → "Tus notas... falam sobre tua experiência").
+    rules = load_prompt("prep", version="v1")
     prompt = (
         f"{rules}\n\n"
         f"TEMA / PERSONA / PROYECTO: {topic}\n\n"
@@ -41240,7 +41369,13 @@ def _generate_morning_narrative(prompt: str) -> str:
             options=CHAT_OPTIONS,
             keep_alive=chat_keep_alive(),
         )
-        return (resp.message.content or "").strip()
+        # 2026-04-29: aplicar el filter PT→ES post-gen como defense-in-depth.
+        # El prompt del morning brief vive inline (no via load_prompt) y por
+        # ahora no incluye `language_es_AR.v1`. El brief se manda al usuario
+        # via WhatsApp + se guarda en `00-Inbox/`, así que cualquier leak pt
+        # es visible. Filter es idempotente y safe sobre texto en es puro.
+        from rag.iberian_leak_filter import replace_iberian_leaks
+        return replace_iberian_leaks((resp.message.content or "").strip())
     except Exception:
         return ""
 
@@ -41944,13 +42079,23 @@ def _assemble_morning_brief(
               help="Fecha objetivo YYYY-MM-DD (default: hoy)")
 @click.option("--lookback-hours", default=36, show_default=True,
               help="Ventana de evidencia hacia atrás")
-def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
+@click.option("--voice", "voice_flag", is_flag=True,
+              help="Generar audio (TTS via macOS `say`) y mandarlo junto al texto al WhatsApp ambient")
+def morning(dry_run: bool, date_opt: str | None, lookback_hours: int,
+            voice_flag: bool):
     """Brief matutino: qué pasó ayer + qué enfocar hoy.
 
     Consume notas modificadas, 00-Inbox/ pending, todo/due frontmatter,
     contradicciones index-time del sidecar y queries low-confidence.
     command-r arma un brief de 120-280 palabras. Escribe a
     `04-Archive/99-obsidian-system/99-AI/reviews/YYYY-MM-DD.md` (auto-indexado) salvo --dry-run.
+
+    `--voice` (o env ``RAG_MORNING_VOICE=1``, configurable desde el plist):
+    además del texto, sintetiza el brief a OGG/Opus via macOS ``say`` (voz
+    ``TTS_VOICE`` o ``Mónica`` default) y lo manda como voice note antes
+    del texto al WhatsApp ambient. Si TTS falla, sale solo el texto
+    (fallback transparente). Audio cacheado en
+    ``~/.local/share/obsidian-rag/voice_briefs/<date>-morning.ogg``.
     """
     _diff_brief_signal()  # compare yesterday's brief vs on-disk state → behavior events
     if date_opt:
@@ -42088,8 +42233,146 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
     # Push to WhatsApp if ambient is enabled — landing the brief in the chat
     # at 7:00 means the user wakes up to the brief instead of having to open
     # Obsidian to find it.
-    if _brief_push_to_whatsapp(f"Morning {date_label}", str(rel), brief_body):
+    voice_enabled = voice_flag or os.environ.get("RAG_MORNING_VOICE", "").strip().lower() in ("1", "true", "yes")
+    audio_path: Path | None = None
+    if voice_enabled:
+        try:
+            from rag.voice_brief import synthesize_brief_audio  # noqa: PLC0415
+            audio_path = synthesize_brief_audio(
+                brief_body, kind="morning", date_str=date_label,
+            )
+            if audio_path:
+                console.print(
+                    f"[dim]→ audio:[/dim] [bold]{audio_path}[/bold] "
+                    f"[dim]({audio_path.stat().st_size / 1024:.0f} KB)[/dim]"
+                )
+            else:
+                console.print("[dim]→ audio: TTS no disponible o falló — text-only[/dim]")
+        except Exception as exc:
+            _silent_log("morning_voice_brief", exc)
+            audio_path = None
+    if _brief_push_to_whatsapp(
+        f"Morning {date_label}", str(rel), brief_body,
+        audio_path=audio_path,
+    ):
         console.print("[dim]→ enviado a WhatsApp[/dim]")
+
+
+# ── rag voice-brief — generar audio de un brief manual ────────────────────
+# Anticipatory Phase 2.C (2026-04-29). El comando manual permite:
+#   - regenerar el audio de un brief ya escrito (ej. el listener perdió
+#     el push original y querés re-mandarlo)
+#   - probar TTS con un texto custom sin escribir un brief al vault
+#   - debug del pipeline say → ffmpeg → OGG sin ejecutar morning/today
+@cli.group(name="voice-brief", invoke_without_command=True)
+@click.pass_context
+def voice_brief_grp(ctx: click.Context):
+    """Generar / mandar el audio TTS de un brief.
+
+    Subcomandos:
+      rag voice-brief generate --date YYYY-MM-DD            # del brief en disco
+      rag voice-brief generate --text "..."                 # texto custom
+      rag voice-brief generate --date 2026-04-29 --apply    # también lo manda al WhatsApp
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@voice_brief_grp.command("generate")
+@click.option("--date", "date_opt", default=None,
+              help="Fecha del brief en disco (YYYY-MM-DD). Si se omite + --text, default=hoy.")
+@click.option("--text", "text_override", default=None,
+              help="Texto custom a sintetizar (en lugar de leer un brief del vault).")
+@click.option("--kind", default="morning", show_default=True,
+              type=click.Choice(["morning", "evening", "digest"]),
+              help="Tipo del brief — afecta el filename del audio + el path del brief.")
+@click.option("--apply", "apply_flag", is_flag=True,
+              help="Después de generar, mandar el audio al WhatsApp ambient (jid de _ambient_config).")
+@click.option("--voice", "voice_override", default=None,
+              help="Voz override (default: env TTS_VOICE → Mónica).")
+def voice_brief_generate(date_opt: str | None, text_override: str | None,
+                         kind: str, apply_flag: bool,
+                         voice_override: str | None):
+    """Genera el audio del brief y opcionalmente lo manda al WhatsApp.
+
+    Modos:
+
+    1. ``--text "..."`` — sintetiza el texto literal pasado por flag.
+       Ideal para testing: ``rag voice-brief generate --text "hola mundo"``.
+
+    2. ``--date YYYY-MM-DD`` (sin ``--text``) — busca el brief en disco
+       (``04-Archive/99-obsidian-system/99-AI/reviews/<date>.md`` para
+       morning, ``-evening.md`` para evening, etc.) y lo sintetiza.
+
+    Por default solo guarda el ``.ogg`` en el cache. Con ``--apply``
+    también lo manda como voice note al WhatsApp ambient (mismo jid que
+    el morning push). El texto del brief NO se reenvía — este comando
+    asume que ya salió por su daemon habitual; sirve para complementar
+    con audio cuando el text-only ya está en el chat.
+    """
+    from rag.voice_brief import (  # noqa: PLC0415
+        synthesize_brief_audio, send_audio_to_whatsapp,
+    )
+
+    if text_override is None and date_opt is None:
+        # Default: ``--text`` exige --date solo si no hay text. Si no
+        # pasaron ninguno, asumimos --date=hoy (intuitive para
+        # "regeneráme el de hoy").
+        date_opt = datetime.now().strftime("%Y-%m-%d")
+
+    if text_override is not None:
+        text = text_override
+        date_label = date_opt or datetime.now().strftime("%Y-%m-%d")
+    else:
+        # Read from vault. Naming sigue el convention de morning/today/digest.
+        if kind == "morning":
+            brief_filename = f"{date_opt}.md"
+        else:
+            brief_filename = f"{date_opt}-{kind}.md"
+        brief_path = VAULT_PATH / MORNING_FOLDER / brief_filename
+        if not brief_path.is_file():
+            console.print(
+                f"[red]Brief no encontrado:[/red] {brief_path.relative_to(VAULT_PATH)}"
+            )
+            raise click.exceptions.Exit(1)
+        try:
+            text = brief_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[red]Error leyendo brief:[/red] {exc}")
+            raise click.exceptions.Exit(1)
+        date_label = date_opt
+
+    audio_path = synthesize_brief_audio(
+        text, kind=kind, date_str=date_label, voice=voice_override,
+    )
+    if audio_path is None:
+        console.print(
+            "[yellow]Audio no generado.[/yellow] TTS no disponible "
+            "(¿`say` instalado? ¿`ffmpeg`?) o el archivo superó 5MB."
+        )
+        raise click.exceptions.Exit(1)
+    size_kb = audio_path.stat().st_size / 1024
+    console.print(
+        f"[green]✓ Audio:[/green] [bold]{audio_path}[/bold] "
+        f"[dim]({size_kb:.0f} KB)[/dim]"
+    )
+
+    if apply_flag:
+        cfg = _ambient_config()
+        if cfg is None:
+            console.print(
+                "[yellow]Sin ambient config — no se manda.[/yellow] "
+                "Habilitalo desde el bot de WhatsApp con /enable_ambient."
+            )
+            return
+        ok = send_audio_to_whatsapp(cfg["jid"], audio_path)
+        if ok:
+            console.print(f"[green]✓ Enviado a[/green] {cfg['jid']}")
+        else:
+            console.print(
+                "[red]Send failed.[/red] Bridge down? "
+                f"({AMBIENT_WHATSAPP_BRIDGE_URL})"
+            )
 
 
 # ── EVENING BRIEF (rag today) ────────────────────────────────────────────────
@@ -45318,6 +45601,15 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
     Defaults preserve the historical schedule when no pref exists; the
     auto-tune writer enforces the safe band before persisting, so a
     pref-driven override never lands outside `[06:30, 09:00]`.
+
+    Voice brief opt-in (Anticipatory Phase 2.C, 2026-04-29):
+    ``RAG_MORNING_VOICE`` se inyecta vacío por default — text-only
+    behavior. Para activar el audio matinal: el user edita el plist
+    seteando el value a ``1`` (o ``true``/``yes``) y hace
+    ``launchctl bootout`` + ``bootstrap`` (o re-instala con
+    ``rag setup``). Voz de la lectura: env var ``TTS_VOICE`` (default
+    ``Mónica``). Cap de audio: 5MB; si excede, fallback a text-only
+    silencioso. Audios viejos (>30d) limpiados por ``rag maintenance``.
     """
     h = int(hour)
     m = int(minute)
@@ -45338,6 +45630,7 @@ def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
     <key>NO_COLOR</key><string>1</string>
     <key>TERM</key><string>dumb</string>
     <key>RAG_EXPLORE</key><string>1</string>
+    <key>RAG_MORNING_VOICE</key><string></string>
   </dict>
   <key>StartCalendarInterval</key>
   <array>
@@ -51722,6 +52015,43 @@ def run_maintenance(
         results["tmp_cleaned"] = n_tmp
     else:
         results["tmp_cleaned"] = _cleanup_tmp_files()
+
+    # 10c. Voice brief audios TTL cleanup (Anticipatory Phase 2.C, 2026-04-29).
+    # Los audios morning/today se cachean en
+    # ``~/.local/share/obsidian-rag/voice_briefs/`` con naming
+    # ``YYYY-MM-DD-<kind>.ogg``. Sin TTL ese dir crece sin bound. El
+    # texto en el vault (`reviews/<date>.md`) es la fuente de verdad
+    # histórica; el audio es transiente y se regenera on-demand con
+    # ``rag voice-brief generate --date YYYY-MM-DD``. Default 30 días.
+    if dry_run:
+        try:
+            from rag.voice_brief import get_voice_brief_dir as _gvbd  # noqa: PLC0415
+            vb_dir = _gvbd()
+            ttl_days = int(os.environ.get("RAG_VOICE_BRIEF_TTL_DAYS", "30"))
+            cutoff = _t.time() - ttl_days * 86400
+            n_vb = 0
+            bytes_vb = 0
+            if vb_dir.is_dir():
+                for f in vb_dir.iterdir():
+                    if not f.is_file():
+                        continue
+                    try:
+                        if f.stat().st_mtime < cutoff:
+                            n_vb += 1
+                            bytes_vb += f.stat().st_size
+                    except OSError:
+                        continue
+            results["voice_briefs_cleaned"] = {
+                "deleted": n_vb, "bytes_freed": bytes_vb, "errors": [],
+            }
+        except Exception as e:
+            results["voice_briefs_cleaned_error"] = str(e)
+    else:
+        try:
+            from rag.voice_brief import cleanup_old_voice_briefs as _cobv  # noqa: PLC0415
+            results["voice_briefs_cleaned"] = _cobv()
+        except Exception as e:
+            results["voice_briefs_cleaned_error"] = str(e)
 
     # 10b. Chat-uploads TTL cleanup (audit 2026-04-25 R2-Security #6).
     # Las imágenes que el user sube via /api/chat/upload-image quedan en

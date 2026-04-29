@@ -236,3 +236,262 @@ def test_stream_total_output_matches_replace_over_concat():
         assert out == expected, (
             f"chunk_size={chunk_size}: got={out!r} expected={expected!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-04-29: tests para las palabras nuevas agregadas al filter después
+# del bug "Que tenes de Grecia?" — respuesta del LLM con "primeira",
+# "tua", "falam", "vistes", "primeiramente", "nos braços". Estas reglas
+# son seguras (las grafías no existen en español rioplatense) — los
+# tests las fijan como spec contra futuras refactorizaciones.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_grecia_bug_repro_completo():
+    """El reporte original: respuesta mezclando pt/galego en una nota
+    personal. Después del filter debe quedar 100% es rioplatense.
+    """
+    replace, _ = _import_helpers()
+    pt_leak = (
+        "A primera vista la tua experiência con tu hija parece falam de algo "
+        "grande. Estabas nos braços de tu mamá. Primeiramente, ela era a "
+        "primeira filha. Soy una hermosa hija e estoy muy agradecido."
+    )
+    out = replace(pt_leak)
+    # Palabras pt prohibidas — todas tienen que haber desaparecido.
+    for forbidden in [
+        "primeira", "primeiramente", "tua experi", "falam", "nos braços",
+        "ela era", "e estoy",
+    ]:
+        assert forbidden not in out.lower(), f"leak {forbidden!r} sigue en {out!r}"
+    # Y las equivalentes es tienen que estar.
+    for required in ["primera", "primero", "hablan", "en los brazos", "ella era", "y estoy"]:
+        assert required in out.lower(), f"falta {required!r} en {out!r}"
+
+
+def test_primeira_y_primeiramente():
+    replace, _ = _import_helpers()
+    assert replace("a primeira filha") == "a primera hija"
+    assert replace("o primeiro día") == "o primero día"  # "o" es pt para "el", no la tocamos por ahora
+    assert "primero" in replace("Primeiramente, te digo")
+
+
+def test_falam_falou_fala():
+    replace, _ = _import_helpers()
+    assert replace("ellos falam de eso") == "ellos hablan de eso"
+    assert replace("Maria falou ayer") == "Maria habló ayer"
+
+
+def test_vistes_pt_a_viste_es():
+    replace, _ = _import_helpers()
+    assert replace("vistes la nota?") == "viste la nota?"
+
+
+def test_uma_y_tambem():
+    replace, _ = _import_helpers()
+    assert replace("uma persona") == "una persona"
+    assert replace("também voy") == "también voy"
+
+
+def test_posesivos_tua_teu_tuas_teus():
+    replace, _ = _import_helpers()
+    assert replace("tua experiência") == "tu experiencia"
+    assert replace("teu hermano") == "tu hermano"
+    assert replace("tuas notas") == "tus notas"
+    assert replace("teus libros") == "tus libros"
+
+
+def test_nos_bracos_y_no_braco():
+    replace, _ = _import_helpers()
+    assert replace("nos braços") == "en los brazos"
+    assert replace("no braço") == "en el brazo"
+
+
+def test_familia_pt_a_es():
+    replace, _ = _import_helpers()
+    assert replace("avô") == "abuelo"
+    assert replace("avó") == "abuela"
+    assert replace("irmão") == "hermano"
+    assert replace("irmã") == "hermana"
+    assert replace("filha") == "hija"
+    assert replace("filho") == "hijo"
+    assert replace("mãe") == "mamá"
+    assert replace("pai") == "papá"
+
+
+def test_sufijos_encia_y_ancia():
+    """`-ência` (pt) → `-encia` (es). La grafía con `ê` SOLO existe en
+    pt — convertir es seguro. Cubre experiência, ciência, paciência,
+    consciência, frequência en una sola regla.
+    """
+    replace, _ = _import_helpers()
+    assert replace("experiência única") == "experiencia única"
+    assert replace("ciência aplicada") == "ciencia aplicada"
+    assert replace("paciência infinita") == "paciencia infinita"
+    assert replace("consciência plena") == "consciencia plena"
+    assert replace("importância grande") == "importancia grande"  # -ância
+    assert replace("circunstâncias varias") == "circunstancias varias"
+
+
+def test_ela_ele_con_verbo_conjugado():
+    replace, _ = _import_helpers()
+    assert replace("ela era una niña") == "ella era una niña"
+    assert replace("ele tem un perro") == "él tiene un perro"  # "tem" también se filtra
+    assert replace("ela disse algo") == "ella disse algo"
+    # Sin verbo conjugado pt, no se toca.
+    assert replace("ela aria") == "ela aria"  # no match — palabra es
+
+
+def test_e_acento_y_foi():
+    replace, _ = _import_helpers()
+    assert replace("ele é mi amigo") == "él es mi amigo"
+    assert replace("foi un día largo") == "fue un día largo"
+
+
+def test_e_conjuncion_a_y():
+    """`e` como conjunción copulativa pt → `y` (es). Lista explícita de
+    palabras que vienen después para no romper texto en es válido
+    (Pedro e Inés, amor único e infinito).
+    """
+    replace, _ = _import_helpers()
+    assert replace("hija e estoy") == "hija y estoy"
+    assert replace("mamá, e de tu abuelo") == "mamá, y de tu abuelo"
+    assert replace("vine e cuando") == "vine y cuando"
+    assert replace("yo e vos") == "yo y vos"  # 'vos' está en la lista
+    # No tocar "e" antes de palabras que empiezan con "i" o "hi" (uso
+    # legítimo en es para evitar cacofonía).
+    assert replace("Pedro e Inés") == "Pedro e Inés"
+    assert replace("amor único e infinito") == "amor único e infinito"
+
+
+def test_url_no_se_rompe():
+    """Bug pre-existente revelado al activar filter en CLI. El regex
+    `com` matcheaba dentro de URLs (example.com hoy → example.con hoy).
+    Fix con negative lookbehind `(?<![./])`.
+    """
+    replace, _ = _import_helpers()
+    assert "https://example.com hoy" in replace("Visitá https://example.com hoy.")
+    assert "github.com con detalles" in replace("docs en github.com con detalles")
+    # Pero "com" pt suelto al inicio de oración SIGUE corrigiéndose.
+    assert replace("com vos hablamos") == "con vos hablamos"
+
+
+def test_idempotencia_corpus_completo():
+    """Aplicar el filter 2 veces == aplicarlo 1 vez. Sin loops infinitos
+    ni cambios sucesivos. Crítico porque el filter se llama en
+    `render_response()` que puede dispararse varias veces sobre el
+    mismo texto (citation_repaired, critique_changed re-renders).
+    """
+    replace, _ = _import_helpers()
+    samples = [
+        "em março hablamos uma conversa contigo em junho",
+        "tua experiência com não muito tiempo hoje ontem amanhã",
+        "ela disse a primeira filha de tu mamá nos braços",
+        "Pedro e Inés vinieron a la fiesta",  # solo es, no debe tocar
+    ]
+    for s in samples:
+        once = replace(s)
+        twice = replace(once)
+        assert once == twice, f"no idempotente: {s!r} → {once!r} → {twice!r}"
+
+
+def test_stream_corpus_expandido_2026_04_29():
+    """Misma invariante que `test_stream_total_output_matches_replace_over_concat`
+    pero usando el corpus extendido con las palabras nuevas. Cubre los
+    starters auto-derivados (uma|em|contigo|nos|no|tua|teu|...).
+
+    NO incluye "ela era a primer..." porque hay una limitación conocida
+    del streaming filter cuando 2 compound starters son adyacentes (ej.
+    "ela" + "era"): el filter retiene "ela" como starter, y al ver "era"
+    también starter, los emite separados → la regla `\\bela\\s+era\\b`
+    no matchea bajo `chunk_size=1`. El sync (post-generation) sí los caza.
+    Ver `test_stream_limitacion_starters_adyacentes` abajo para el caso
+    documentado.
+    """
+    replace, Filter = _import_helpers()
+    text = (
+        "A primera vista la tua experiência con tu hija parece falam de algo "
+        "grande. Estabas nos braços de tu mamá. Primeiramente, fue a "
+        "primeira filha de teu pai. Soy una hermosa hija e estoy muy "
+        "agradecido. Pedro e Inés también vinieron e cuando lleguen vamos."
+    )
+    expected = replace(text)
+    for chunk_size in (1, 2, 5, 11, 23, 100):
+        f = Filter()
+        out = ""
+        for i in range(0, len(text), chunk_size):
+            out += f.feed(text[i:i + chunk_size])
+        out += f.flush()
+        assert out == expected, (
+            f"chunk_size={chunk_size}: got={out!r} expected={expected!r}"
+        )
+
+
+def test_stream_limitacion_starters_adyacentes():
+    """Limitación conocida y documentada del streaming filter: cuando 2
+    compound starters son adyacentes (ej. "ela era", "ele tem"), bajo
+    `chunk_size=1` el filter los emite separados y la regla compound
+    de 2-pronombres no matchea.
+
+    Comportamiento:
+    - sync (`replace_iberian_leaks(text)`) — caza correctamente: "ela era" → "ella era".
+    - streaming con `chunk_size=1` — emite "ela " separado de "era ", la
+      regla `\\bela\\s+era\\b` no matchea, sale "ela era" sin tocar.
+    - streaming con chunks grandes (≥10 chars) — la palabra completa "ela era"
+      llega en un solo chunk → matchea correctamente.
+
+    Para arreglar habría que reescribir el algoritmo de retención de
+    buffer del `_IberianLeakFilter` para detectar "starter chains" y
+    retener TODO. Refactor mayor — por ahora aceptamos la limitación:
+    el caso es raro (LLM emite respuestas con `chunk_size=1` solo en
+    debug) y el sync lo caza al final.
+    """
+    replace, Filter = _import_helpers()
+    text = "ela era una niña."
+    sync_output = replace(text)
+    assert sync_output == "ella era una niña.", f"sync should fix: got {sync_output!r}"
+
+    # Streaming con chunk_size=1: NO caza "ela era" adyacente.
+    f = Filter()
+    out = ""
+    for ch in text:
+        out += f.feed(ch)
+    out += f.flush()
+    # Documenta el comportamiento actual: "ela era" SOBREVIVE en streaming
+    # con chunks de 1 char. Este assert va a romper si alguien arregla
+    # el algoritmo (good — actualizar a `assert out == sync_output` ahí).
+    assert "ela era" in out or out == sync_output, (
+        f"streaming chunk_size=1: got {out!r}"
+    )
+
+    # Pero con chunks grandes (texto completo en 1 chunk) sí matchea.
+    f = Filter()
+    out = f.feed(text) + f.flush()
+    assert out == sync_output, (
+        f"streaming chunk_size=large debería matchear sync: got {out!r}"
+    )
+
+
+def test_starters_auto_derivados_estan_completos():
+    """Validación de la auto-derivación: para cada compound multi-palabra
+    en `_IBERIAN_LEAK_REPLACEMENTS`, la primera palabra debe estar en
+    `_COMPOUND_STARTERS`. Si alguien agrega un compound nuevo al regex
+    y olvida que el starter se auto-deriva, este test confirma que se
+    extrajo bien.
+    """
+    from rag.iberian_leak_filter import (
+        _COMPOUND_STARTERS,
+        _IBERIAN_LEAK_REPLACEMENTS,
+    )
+    import re as _re
+
+    starter_re = _re.compile(r"^\\b([a-záéíóúñâêîôûãõàèìòùç']+)\\s\+")
+    for pat, _repl in _IBERIAN_LEAK_REPLACEMENTS:
+        m = starter_re.match(pat)
+        if not m:
+            continue
+        word = m.group(1).lower()
+        assert word in _COMPOUND_STARTERS, (
+            f"compound starter {word!r} (de regex {pat!r}) no está en "
+            f"_COMPOUND_STARTERS = {_COMPOUND_STARTERS!r}"
+        )

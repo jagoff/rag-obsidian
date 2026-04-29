@@ -184,9 +184,13 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     # 2026-04-29: pronombres personales pt → es donde la grafía es
     # CLARAMENTE pt (no existe en español). "ela" en es no existe
     # como palabra suelta (sí "él"/"ella"); restringido a contextos
-    # conjugados.
-    (r"\bela\s+(é|era|foi|estava|tem|teve|disse)\b", r"ella \1"),
-    (r"\bele\s+(é|era|foi|estava|tem|teve|disse)\b", r"él \1"),
+    # conjugados. Incluimos "tiene" en la lista (no solo "tem")
+    # porque el regex `\btem\s+...→tiene` puede aplicarse ANTES si el
+    # input es "ele tem un perro" (la regla de "tem" matchea primero,
+    # quedando "ele tiene un perro" — sin la opción "tiene" en el
+    # match siguiente, el "ele" no se cazaría).
+    (r"\bela\s+(é|es|era|foi|fue|estava|estaba|tem|tiene|teve|tuvo|disse|dijo)\b", r"ella \1"),
+    (r"\bele\s+(é|es|era|foi|fue|estava|estaba|tem|tiene|teve|tuvo|disse|dijo)\b", r"él \1"),
     # 2026-04-29: "é" suelto (verbo ser pt 3ra sing) → "es". El acento
     # agudo en "é" sola NO existe en es (la palabra "es" no lleva tilde).
     (r"\bé\b", "es"),
@@ -253,6 +257,58 @@ _IBERIAN_LEAK_REPLACEMENTS: tuple[tuple[str, str], ...] = (
 _IBERIAN_LEAK_COMPILED: tuple[tuple[re.Pattern, str], ...] = tuple(
     (re.compile(pat, re.IGNORECASE), repl)
     for pat, repl in _IBERIAN_LEAK_REPLACEMENTS
+)
+
+
+# Auto-extracción de "compound starters" para el streaming filter del web.
+#
+# Problema: cuando el LLM emite respuestas via SSE chunk-by-chunk, las frases
+# multi-palabra (ej. "em março", "nos braços") llegan partidas. Si emitimos
+# al primer boundary, "em " sale antes de ver "março" y la regla compound
+# nunca matchea. El filter retiene en buffer cualquier candidate que
+# TERMINE con un "starter" conocido (primera palabra de un compound).
+#
+# Antes este regex se mantenía manual en `web/server.py` con riesgo de drift:
+# si alguien agregaba un compound nuevo (ej. `\bnos\s+braços\b`) y olvidaba
+# updater el regex de starters, el web streaming filter no lo cazaba aunque
+# el batch sync sí. Auto-derivar elimina el riesgo.
+#
+# Heurística: extraemos la primera palabra de cada regex que matchee el
+# patrón `\b<palabra>\s+` (compound de 2+ tokens). Los regexes single-word
+# (`\bcom\b`, `\btua\s+` que es prefijo no-compound) se filtran porque su
+# replace dispara inmediato sin buffer.
+def _extract_compound_starters() -> tuple[str, ...]:
+    """Extrae los starters de compounds de los regexes del filter.
+
+    Un "starter" es la primera palabra de cualquier regex que tenga la
+    forma `\\b<palabra>\\s+...<algo después de \\s+>...`. Devuelve la
+    lista deduplicada y lowercase.
+    """
+    # Match `\b<chars>\s+` donde chars es letra/acento/apóstrofe.
+    starter_re = re.compile(r"^\\b([a-záéíóúñâêîôûãõàèìòùç']+)\\s\+")
+    seen: set[str] = set()
+    out: list[str] = []
+    for pat, _repl in _IBERIAN_LEAK_REPLACEMENTS:
+        m = starter_re.match(pat)
+        if not m:
+            continue
+        word = m.group(1).lower()
+        if word in seen:
+            continue
+        seen.add(word)
+        out.append(word)
+    return tuple(out)
+
+
+_COMPOUND_STARTERS: tuple[str, ...] = _extract_compound_starters()
+
+
+# Regex compilada lista para usar por el streaming filter del web. Matchea
+# un candidate de emit que TERMINE con uno de los starters detectados.
+# El web debe importar esto en vez de mantener una copia manual.
+_COMPOUND_STARTER_TAIL_RE: re.Pattern = re.compile(
+    r"\b(" + "|".join(_COMPOUND_STARTERS) + r")(\s+\S*)?\s*$",
+    re.IGNORECASE,
 )
 
 

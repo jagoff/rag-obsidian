@@ -5025,16 +5025,12 @@ def followups(req: FollowupsRequest) -> dict:
     if snippets:
         ctx_bits.append("Fragmentos de las notas que aparecieron:\n" + "\n".join(snippets))
     ctx = "\n\n".join(ctx_bits)
-    prompt = (
-        "Sugerí 3 preguntas de seguimiento concretas que el usuario podría "
-        "hacer para profundizar usando su vault de Obsidian. Las preguntas "
-        "DEBEN anclarse en hechos, nombres, herramientas o conceptos que "
-        "aparezcan literalmente en los fragmentos de arriba — no inventes "
-        "ángulos no presentes. Cada pregunta ≤70 caracteres, en español "
-        "rioplatense (tuteo). Devolvé SOLO un JSON con la forma "
-        '{"followups": ["...", "...", "..."]}. Sin texto extra.\n\n'
-        f"{ctx}\n\nJSON:"
-    )
+    # 2026-04-29: prompt cargado via load_prompt() para prepend
+    # `language_es_AR.v1` (forzar voseo rioplatense, sin pt). El prompt
+    # viejo decía "tuteo" pero el user usa voseo y el LLM se deslizaba
+    # al portugués cuando el contexto tenía notas en pt.
+    from rag import load_prompt as _lp
+    prompt = _lp("followups", version="v1") + f"\n\n{ctx}\n\nJSON:"
     try:
         resp = ollama.chat(
             model=resolve_chat_model(),
@@ -5833,33 +5829,26 @@ def _resolve_scope(scope: str | None) -> list[tuple[str, "Path"]]:
     return resolve_vault_paths([scope])
 
 
-# 2026-04-29: las constantes y la función `_replace_iberian_leaks` se
-# movieron al módulo compartido `rag.iberian_leak_filter` para que
-# tanto el web (acá) como el CLI (`rag query` / `rag chat` via
-# `render_response()`) apliquen el mismo filtro PT→ES. Antes el filtro
-# vivía sólo acá y el CLI emitía respuestas con portugués mezclado
-# (reportado el 2026-04-29 con "Que tenes de Grecia?" → respuesta con
-# "primeira", "tua", "falam", "vistes", "primeiramente", "nos braços").
-# Importamos los nombres viejos como aliases para no romper los tests
-# en `tests/test_iberian_leak_filter.py` ni call sites que los usan.
+# 2026-04-29: las constantes, función `_replace_iberian_leaks` y el
+# regex `_COMPOUND_STARTER_TAIL_RE` se movieron al módulo compartido
+# `rag.iberian_leak_filter` para que tanto el web (acá) como el CLI
+# (`rag query` / `rag chat` via `render_response()`) apliquen el mismo
+# filtro PT→ES. Antes el filtro vivía sólo acá y el CLI emitía
+# respuestas con portugués mezclado (reportado el 2026-04-29 con
+# "Que tenes de Grecia?" → respuesta con "primeira", "tua", "falam",
+# "vistes", "primeiramente", "nos braços"). Importamos los nombres
+# viejos como aliases para no romper los tests en
+# `tests/test_iberian_leak_filter.py` ni call sites que los usan.
+#
+# `_COMPOUND_STARTER_TAIL_RE` ahora se auto-deriva de los regexes del
+# módulo común — antes era manual y existía riesgo de drift cuando
+# alguien agregaba un compound nuevo y olvidaba updater el starter.
 from rag.iberian_leak_filter import (  # noqa: E402  -- imports al top hechos arriba
+    _COMPOUND_STARTER_TAIL_RE,
     _IBERIAN_LEAK_COMPILED,
     _IBERIAN_LEAK_REPLACEMENTS,
 )
 from rag.iberian_leak_filter import replace_iberian_leaks as _replace_iberian_leaks  # noqa: E402
-
-# Palabras que INICIAN una frase multi-palabra del dict anterior. Cuando
-# el streaming filter ve un candidate que TERMINA con una de estas más
-# whitespace opcional, retiene la palabra en el buffer porque la
-# próxima llegada podría completar el compound (`em ` + `março` →
-# `em março` → `en marzo`). Mantener en sync con los compounds de
-# `_IBERIAN_LEAK_REPLACEMENTS` que son multi-palabra. NO se movió al
-# módulo común porque sólo lo usa el streaming filter de `_IberianLeakFilter`
-# acá abajo, no el path sync del CLI.
-_COMPOUND_STARTER_TAIL_RE = re.compile(
-    r"\b(uma|em|contigo|tua|teu|tuas|teus|nos)(\s+\S*)?\s*$",
-    re.IGNORECASE,
-)
 
 
 # 2026-04-28 wave-4: el LLM (qwen2.5:7b) tipea mal los nombres de archivos
@@ -15803,67 +15792,12 @@ def _resolve_diagnose_model() -> str:
     return _DIAGNOSE_MODEL_RESOLVED
 
 
-_DIAGNOSE_ERROR_SYSTEM_PROMPT = """\
-Sos un asistente experto en el stack `obsidian-rag` de Fer (Fernando Ferrari).
-El user te muestra una línea de log con un error y pide diagnóstico.
-
-Stack relevante:
-- Local-first RAG sobre vault Obsidian, single-file `rag.py` (~50k líneas)
-  + `web/server.py` (FastAPI) + daemons launchd (watch, ingest-*, anticipate,
-  reminder-wa-push, wa-scheduled-send, etc.).
-- SQLite-vec (`ragvec.db`) con escrituras concurrentes — `database is
-  locked` es el patrón típico de contención, recoverable.
-- Ollama local + sentence-transformers + reranker (BGE).
-
-Errores frecuentes:
-- `OperationalError: no such column: ...` → falta migration de schema.
-- `database is locked` → contención SQLite, recoverable. Serio sólo si
-  se acumulan decenas seguidos en pocos minutos.
-- `UserWarning: leaked semaphore` → tqdm/loky multi-process. Patch ya
-  documentado en `web/server.py` líneas iniciales.
-- `another row available` → bug real: `LIMIT 1` faltante en SQL o join
-  que duplica.
-
-Formato de respuesta (markdown, español rioplatense):
-
-## Qué está pasando
-1-2 oraciones: causa probable + severidad (ok/warning/serio).
-
-## Cómo arreglarlo
-Pasos concretos. Si está documentado en CLAUDE.md o docs/, apuntá ahí.
-Si no estás seguro, decilo y pedí más contexto en vez de inventar.
-
-## Comandos sugeridos
-Si hay comandos shell que ayudan, ponelos en bloques ```bash```. Cada
-comando en su propia línea, sin pipes (`|`), redirects (`>`), command
-substitution (`$()`), ni encadenamiento (`;`, `&&`). El user va a poder
-clickear "▶ ejecutar" y el server los corre directo — pero hay una
-WHITELIST estricta del lado del server, así que sólo estas formas pasan:
-
-- `launchctl kickstart -k <label>` — reiniciar un daemon. Label debe
-  matchear `com.fer.obsidian-rag-*` o `com.fer.whatsapp-*`. Aceptamos
-  el prefix `gui/501/` opcional. Ejemplos OK:
-  - `launchctl kickstart -k com.fer.obsidian-rag-watch`
-  - `launchctl kickstart -k gui/501/com.fer.obsidian-rag-wa-scheduled-send`
-- `launchctl list com.fer.obsidian-rag-<service>` — ver estado.
-- `launchctl print gui/501/com.fer.obsidian-rag-<service>` — info detallada.
-- `tail [-n N] /Users/fer/.local/share/obsidian-rag/<archivo>.log` — leer log.
-  Soportamos también `tail -50 <path>`. NO uses `-f` (se cuelga).
-- `head [-n N] <log_path>` — primeras N líneas.
-- `wc -l <log_path>` — contar líneas.
-- `cat <log_path>` — todo el archivo.
-- `ls -la /Users/fer/.local/share/obsidian-rag/` — listar logs.
-- `rag stats` / `rag status` / `rag vault list` — CLI read-only.
-
-Cualquier otro comando va a ser RECHAZADO por la whitelist con un 403.
-NUNCA sugieras `rm`, `mv`, `cp`, `sudo`, `bash -c`, `python -c`, `git push`,
-`kill`, ni nada con shell metachars. Si la solución requiere algo así,
-NO lo pongas en un bloque ```bash``` — describilo en prosa para que el
-user lo haga a mano.
-
-NO inventes paths, archivos, o líneas que no estén en el contexto.
-Si el "error" parece un falso positivo del clasificador, decilo.
-"""
+# 2026-04-29: prompt cargado via `load_prompt("diagnose_error")` para
+# que prepend `language_es_AR.v1` (forzar español rioplatense, sin pt
+# leaks). Antes era un string literal acá sin regla de idioma fuerte.
+# El body completo vive en `rag/prompts/intents/diagnose_error.v1.md`.
+from rag import load_prompt as _lp_diagnose  # noqa: E402
+_DIAGNOSE_ERROR_SYSTEM_PROMPT = _lp_diagnose("diagnose_error", version="v1")
 
 
 def _build_diagnose_error_prompt(req: _DiagnoseErrorRequest) -> str:
@@ -16350,92 +16284,10 @@ def diagnose_error_execute(req: _DiagnoseExecuteRequest, request: Request) -> di
 _AUTO_FIX_MAX_TURNS = 8
 _AUTO_FIX_OUTPUT_TRUNCATE = 2000  # truncado del stdout/stderr inyectado al LLM
 
-_AUTO_FIX_SYSTEM_PROMPT = """\
-Sos un agente que resuelve errores del stack obsidian-rag de Fer.
-
-Recibís un error en un log y tenés que diagnosticar Y resolver el
-problema en un ciclo de hasta 6 turnos. NO le das al user instrucciones
-para que él haga algo — vos hacés el trabajo ejecutando comandos.
-
-Stack relevante:
-- Daemons launchd: com.fer.obsidian-rag-{watch,web,wa-scheduled-send,
-  ingest-{calendar,gmail,drive,whatsapp,reminders},anticipate,
-  reminder-wa-push,maintenance,morning,today, ...}.
-- Logs: /Users/fer/.local/share/obsidian-rag/<servicename>.log y
-  <servicename>.error.log.
-- SQLite-vec con escrituras concurrentes (database is locked es típico,
-  recoverable).
-
-Tools disponibles (whitelist estricta — cualquier otra cosa es rechazada):
-- `launchctl kickstart -k gui/501/<label>` — reiniciar daemon. IMPORTANTE:
-  el label DEBE venir prefixed con `gui/501/`, sino macOS lo rechaza.
-  Ejemplo correcto: `launchctl kickstart -k gui/501/com.fer.obsidian-rag-watch`
-  Ejemplo INCORRECTO: `launchctl kickstart -k com.fer.obsidian-rag-watch`
-  (tira `Unrecognized target specifier`).
-- `launchctl list com.fer.obsidian-rag-<service>` — ver estado del daemon
-  (este SÍ usa label desnudo, sin gui/501/).
-- `launchctl print gui/501/com.fer.obsidian-rag-<service>` — info detallada.
-- `tail [-n N] <log_path>` — leer últimas líneas (NO uses -f, se cuelga).
-- `head [-n N] <log_path>` — primeras líneas.
-- `wc -l <log_path>` — contar líneas.
-- `cat <log_path>` — todo el archivo.
-- `ls -la <dir>` — listar files (sólo bajo el log dir).
-- `rag stats` / `rag status` / `rag vault list` — CLI read-only.
-
-Workflow esperado (sé EFICIENTE — máximo 1-2 turnos de investigación):
-1. Investigá UNA vez: ej. `launchctl list <label>` o `tail -50 <log>`.
-   NO hagas tail múltiples veces — la primera lectura ya te debería
-   dar suficiente contexto. Si necesitás MÁS líneas, usá `tail -n 200`
-   en el siguiente turno, NO repitas `tail -50`.
-2. Decidí el fix: kickstart del daemon (caso típico) o no-acción
-   (si es un error transient/aislado).
-3. Aplicá el fix con la sintaxis correcta (`gui/501/<label>` para kickstart).
-4. Verificá: `tail -10` post-restart o `launchctl list` para confirmar PID nuevo.
-5. Devolvé done=true con summary.
-
-Errores comunes y fix asociado:
-- "database is locked" + REPETIDO (≥3 ocurrencias en últimos 5 min):
-  kickstart del daemon → `launchctl kickstart -k gui/501/<label>`.
-  Si es 1-2 ocurrencias aisladas: NO requiere acción (el daemon retrió
-  bien). Devolvé done=true marcándolo como aislado.
-- "OperationalError: no such column" → schema desincronizado. NO se
-  resuelve sin tocar código. Devolvé done=true con summary explicando
-  que requiere intervención humana (schema migration).
-- "UserWarning: leaked semaphore" → ruido de tqdm/loky. Falso positivo,
-  no es serio. Devolvé done=true marcándolo como ignorable.
-- "another row available" → bug SQL real (LIMIT 1 faltante). No se
-  resuelve con kickstart. Devolvé done=true explicando que requiere
-  fix de código.
-
-FORMATO DE RESPUESTA (responder SIEMPRE con JSON válido):
-{
-  "thought": "explicación corta de qué vas a hacer ahora (≤2 frases)",
-  "action": "<comando exacto sin pipes ni metachars>" o null,
-  "done": false,
-  "summary": ""
-}
-
-Cuando termines (resuelto o no-resoluble):
-{
-  "thought": "última observación",
-  "action": null,
-  "done": true,
-  "summary": "qué hiciste / qué pasó / qué requiere atención manual"
-}
-
-Reglas:
-- NUNCA emitas comandos con `;`, `&&`, `|`, `>`, `$()`, backticks. La
-  whitelist los rechaza y perdés un turno.
-- NUNCA inventes paths que no estén en el contexto.
-- NUNCA reinicies el daemon `obsidian-rag-web` (com.fer.obsidian-rag-web).
-  Vos vivís adentro de ese daemon — kickstartearlo te mata mid-request
-  y el user pierde la conexión sin ver el resultado. Si el error es
-  del daemon web, devolvé done=true explicando qué viste pero pediendo
-  que el user reinicie a mano.
-- Si después de 2-3 acciones no encontrás progreso, devolvé done=true
-  con summary explicando qué intentaste y qué requiere review humano.
-- Sé conservador: si dudás entre kickstart y no-acción, prefiero no-acción.
-"""
+# 2026-04-29: prompt cargado via load_prompt("auto_fix") para prepend
+# `language_es_AR.v1` (forzar español rioplatense). El body completo
+# vive en `rag/prompts/intents/auto_fix.v1.md`.
+_AUTO_FIX_SYSTEM_PROMPT = _lp_diagnose("auto_fix", version="v1")
 
 
 def _build_initial_auto_fix_user_prompt(req: "_AutoFixRequest") -> str:

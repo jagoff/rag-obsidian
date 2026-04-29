@@ -58,6 +58,23 @@ FEATURE_NAMES: list[str] = [
 ]
 
 
+# 2026-04-29 — weight de candidates derivados de signal débil.
+# Cuando reward_shaping persistió un rating=-1 con
+# `implicit_loss_source='session_outcome_weak_negative'` (abandon de
+# session con top_score <0.4), el costo de equivocarse en el label es
+# menor que el de un loss "real". Aplicamos peso 0.3 en lugar de 1.0
+# para que el lambdarank gradient penalice la mitad — la signal entra
+# pero atenuada.
+#
+# Cambiar este número es seguro (no requiere re-train de cero), pero
+# cualquier cambio impacta cómo el modelo balancea negativos débiles
+# vs negativos fuertes. Si subimos esto a 1.0 desactivamos la
+# atenuación (los weak_negative pesan igual que un loss real); si lo
+# bajamos a 0.0 desactivamos el feature (no aportan gradient).
+WEAK_NEGATIVE_TRAINING_WEIGHT: float = 0.3
+WEAK_NEGATIVE_SOURCE: str = "session_outcome_weak_negative"
+
+
 def _candidate_to_feature_vector(
     candidate: dict[str, Any], has_recency_cue: bool
 ) -> list[float]:
@@ -178,8 +195,12 @@ def feedback_to_training_data(
             list[dict] de candidatos. Si None, importa lazy desde rag.
 
     Returns:
-        dict con X, y, group, feature_names, n_queries, n_candidates,
-        n_skipped_no_signal, n_skipped_no_features.
+        dict con X, y, group, weight, feature_names, n_queries, n_candidates,
+        n_skipped_no_signal, n_skipped_no_features, n_weak_negative_candidates.
+        `weight` es paralelo a X/y — 1.0 default, `WEAK_NEGATIVE_TRAINING_WEIGHT`
+        (0.3) si el feedback row tiene `implicit_loss_source =
+        'session_outcome_weak_negative'`. Pasarlo a `lgb.Dataset(weight=...)`
+        atenúa el gradient del lambdarank para esos candidates.
     """
     rows = conn.execute(
         """
@@ -193,8 +214,10 @@ def feedback_to_training_data(
     X: list[list[float]] = []
     y: list[int] = []
     group: list[int] = []
+    weight: list[float] = []
     n_skipped_no_signal = 0
     n_skipped_no_features = 0
+    n_weak_negative_candidates = 0
 
     if replay_features_fn is None:
         replay_features_fn = _default_replay_features
@@ -233,6 +256,16 @@ def feedback_to_training_data(
             n_skipped_no_signal += 1
             continue
 
+        # Resolver el peso del row. Default 1.0 = full strength. Si el
+        # feedback fue inferido por reward_shaping como weak_negative
+        # (abandon + top_score bajo), atenuamos a WEAK_NEGATIVE_TRAINING_WEIGHT
+        # (0.3) para que el ranker no sobre-aprenda de signal débil. Inline
+        # check sobre extra_json — ver `rag_implicit_learning.reward_shaping`
+        # para el writer side.
+        cand_weight = 1.0
+        if extra.get("implicit_loss_source") == WEAK_NEGATIVE_SOURCE:
+            cand_weight = WEAK_NEGATIVE_TRAINING_WEIGHT
+
         # Re-extract features. Si falla (modelo no cargado, error ollama),
         # skipeamos esa query.
         try:
@@ -262,7 +295,10 @@ def feedback_to_training_data(
                 continue
             X.append(_candidate_to_feature_vector(cand, has_recency_cue))
             y.append(label)
+            weight.append(cand_weight)
             group_size += 1
+            if cand_weight != 1.0:
+                n_weak_negative_candidates += 1
 
         if group_size == 0:
             n_skipped_no_signal += 1
@@ -274,11 +310,13 @@ def feedback_to_training_data(
         "X": X,
         "y": y,
         "group": group,
+        "weight": weight,
         "feature_names": FEATURE_NAMES,
         "n_queries": len(group),
         "n_candidates": len(X),
         "n_skipped_no_signal": n_skipped_no_signal,
         "n_skipped_no_features": n_skipped_no_features,
+        "n_weak_negative_candidates": n_weak_negative_candidates,
     }
 
 
@@ -338,6 +376,7 @@ def synthetic_to_training_data(
     X: list[list[float]] = []
     y: list[int] = []
     group: list[int] = []
+    weight: list[float] = []
     n_skipped_no_features = 0
 
     for synth_id, query, positive_path in queries:
@@ -375,6 +414,10 @@ def synthetic_to_training_data(
                 label = 0
             X.append(_candidate_to_feature_vector(cand, has_recency_cue))
             y.append(label)
+            # Synthetic data siempre weight=1.0 — son positivos curados
+            # (rag_synthetic_queries) o hard-negatives explícitos
+            # (rag_synthetic_negatives). No hay branch de "weak" acá.
+            weight.append(1.0)
             group_size += 1
 
         if group_size == 0:
@@ -386,6 +429,7 @@ def synthetic_to_training_data(
         "X": X,
         "y": y,
         "group": group,
+        "weight": weight,
         "feature_names": FEATURE_NAMES,
         "n_queries": len(group),
         "n_candidates": len(X),
@@ -424,7 +468,9 @@ def combined_training_data(
     X_combined: list[list[float]] = []
     y_combined: list[int] = []
     group_combined: list[int] = []
+    weight_combined: list[float] = []
     sources: dict[str, int] = {"feedback": 0, "synthetic": 0}
+    n_weak_negative_candidates = 0
 
     if use_feedback:
         fb_data = feedback_to_training_data(
@@ -433,7 +479,11 @@ def combined_training_data(
         X_combined.extend(fb_data["X"])
         y_combined.extend(fb_data["y"])
         group_combined.extend(fb_data["group"])
+        weight_combined.extend(fb_data.get("weight") or [1.0] * len(fb_data["X"]))
         sources["feedback"] = fb_data["n_queries"]
+        n_weak_negative_candidates += int(
+            fb_data.get("n_weak_negative_candidates", 0)
+        )
 
     if use_synthetic:
         synth_data = synthetic_to_training_data(
@@ -443,14 +493,19 @@ def combined_training_data(
         X_combined.extend(synth_data["X"])
         y_combined.extend(synth_data["y"])
         group_combined.extend(synth_data["group"])
+        weight_combined.extend(
+            synth_data.get("weight") or [1.0] * len(synth_data["X"])
+        )
         sources["synthetic"] = synth_data["n_queries"]
 
     return {
         "X": X_combined,
         "y": y_combined,
         "group": group_combined,
+        "weight": weight_combined,
         "feature_names": FEATURE_NAMES,
         "n_queries": len(group_combined),
         "n_candidates": len(X_combined),
         "sources": sources,
+        "n_weak_negative_candidates": n_weak_negative_candidates,
     }

@@ -547,6 +547,40 @@ rag whisper import FILE [--dry-run]         # restore/migrate
 
 **Calibración futura**: después de unos días de uso real, mirar histogram en `/transcripts` y ajustar threshold; correr `rag whisper patterns` para ver errores sistemáticos del modelo; backup periódico con `rag whisper export -o ~/Backups/corrections-$(date +%F).json`.
 
+## Implicit feedback — reward shaping con negativos débiles (2026-04-29)
+
+`rag feedback classify-sessions` (en el plist [`com.fer.obsidian-rag-implicit-feedback`](rag/__init__.py)) backpropaga el outcome de una session entera (win/loss/abandon/partial) como signal a cada turn. La rutina vive en [`rag_implicit_learning/reward_shaping.py:apply_reward_from_session_outcomes`](rag_implicit_learning/reward_shaping.py).
+
+**Branches por outcome**:
+
+- `win` → `rating=+1`, `extra_json.implicit_loss_source='session_outcome_win'`. Aplica gate `confidence ≥ DEFAULT_MIN_CONFIDENCE` (0.7).
+- `loss` → `rating=-1`, source `session_outcome_loss`. Mismo gate.
+- `partial` → skip total (n_skip_ambiguous_outcome).
+- `abandon` → branch nuevo (Quick Win #3, 2026-04-29):
+  - Lee `top_score` del primer turn de la session (de `rag_queries.top_score`).
+  - Si `top_score < WEAK_NEGATIVE_TOP_SCORE_THRESHOLD` (0.4) → `rating=-1`, source `session_outcome_weak_negative`. **El confidence gate NO aplica** (el feature absorbe data débil de propósito; `effective_confidence` se capa a min(0.5, session_confidence) para señalizar la duda).
+  - Si `top_score >= 0.4` o no hay top_score → skip ambiguous (legacy).
+
+**Treatment en training del ranker** ([`rag_ranker_lgbm/features.py:feedback_to_training_data`](rag_ranker_lgbm/features.py)): los candidates de feedback rows con `implicit_loss_source='session_outcome_weak_negative'` reciben `weight=0.3` (constante `WEAK_NEGATIVE_TRAINING_WEIGHT`). El resto pesa 1.0. El array `weight` se pasa a `lgb.Dataset(weight=...)` en `train_lambdarank` → el lambdarank gradient penaliza la mitad para esos rows. La columna `rating` queda como -1 (compatibilidad con downstream code que solo lee `rating`); la atenuación es solo en TRAINING.
+
+**Por qué importa**: pre-fix había 542 sessions con outcome=abandon en la ventana de 14d → solo 18 loss confirmados → asimetría 30:1 en signal negativa. El sistema descartaba abandon como "ambiguo" por defecto, perdiendo la signal de queries que claramente no encontraron nada (top_score bajo + user se fue). Post-fix se espera absorber ~50-100 negativos débiles por semana sin contaminar los positivos (weight 0.3 acota el blast radius si la inferencia "abandon=loss" estuvo errada).
+
+**Configuración** (in-code, no env var por ahora — cambios requieren edit + redeploy del CLI):
+
+- `WEAK_NEGATIVE_TOP_SCORE_THRESHOLD = 0.4` en [`rag_implicit_learning/reward_shaping.py`](rag_implicit_learning/reward_shaping.py). Subir → más sessions abandon caen como weak_negative; bajar → solo las queries con top_score muy bajo. 0.4 es el equilibrio observado en el dataset (cae mid-distribution post-rerank).
+- `WEAK_NEGATIVE_TRAINING_WEIGHT = 0.3` en [`rag_ranker_lgbm/features.py`](rag_ranker_lgbm/features.py). Subir a 1.0 desactiva la atenuación; bajar a 0.0 desactiva el feature.
+
+**Tests**: [`tests/test_reward_shaping_weak_negative.py`](tests/test_reward_shaping_weak_negative.py) (11 casos: happy path, threshold boundary, no top_score, win/loss/partial intactos, confidence override, idempotencia, dry-run, training weight end-to-end). Pre-existentes [`tests/test_implicit_learning_session_outcome.py`](tests/test_implicit_learning_session_outcome.py) (17 casos del flow original, todos siguen pasando).
+
+**Telemetry rápida**:
+
+```bash
+sqlite3 ~/.local/share/obsidian-rag/ragvec/telemetry.db <<'EOF'
+SELECT COUNT(*) FROM rag_feedback WHERE json_extract(extra_json, '$.implicit_loss_source')='session_outcome_loss';
+SELECT COUNT(*) FROM rag_feedback WHERE json_extract(extra_json, '$.implicit_loss_source')='session_outcome_weak_negative';
+EOF
+```
+
 ## Commands
 
 ```bash
@@ -601,6 +635,7 @@ rag log [-n 20] [--low-confidence]
 rag dashboard [--days 30]                  # analytics: scores, latency, topics, PageRank
 rag feedback status                        # progress hacia los 20 corrective_paths del gate GC#2.C
 rag feedback backfill [--limit N --rating pos|neg|both --since DAYS]  # agregar corrective_path a turns existentes
+rag feedback infer-implicit [--window-seconds 600 --dry-run --json]   # derivar corrective_path desde opens + paráfrasis follow-up
 rag behavior backfill [--dry-run --window-minutes N --limit N]  # linkea opens huérfanos (original_query_id NULL) al rag_queries.id — +training signal
 rag feedback harvest [--limit N --since DAYS --confidence-below F]    # labelear queries low-conf sin thumbs
 rag open <path> [--query Q --rank N --source cli]  # emits behavior event + `open` path (ranker-vivo click tracking)
@@ -857,6 +892,7 @@ Behavior priors (`_load_behavior_priors()`): read from `rag_behavior` (SQL), cac
   - `rag feedback backfill` — rescata corrective_path de turns ya en `rag_feedback` que no lo tienen (aplica a los 55 positivos del run del 2026-04-22 que no recibieron el prompt — el commit 23f2899 es posterior). Muestra query + top-5 del turn, aceptás [1-5]/texto libre/skip/quit. Update in-place via `json_set()`, nunca duplica rows.
   - `rag feedback harvest` — equivalente CLI del skill `rag-feedback-harvester` de Claude Code. Lista queries recent low-confidence sin thumbs y pide [+N/-/c/s/q]. Tagged `source='harvester'` + `original_query_id` en `extra_json` para trazabilidad.
   - `rag feedback status` — progress hacia los 20 del gate + breakdown por bucket (pos_no_cp / neg_no_cp) + comando exacto para re-disparar el fine-tune cuando el gate está open.
+  - `rag feedback infer-implicit [--window-seconds N --dry-run --json]` — derivador batch: para cada `rating=-1` que no tenga `corrective_path` todavía, prueba dos ramas (en orden): (1) **opens-based** — busca un `open` en `rag_behavior` dentro del window, mismo `session_id`, path distinto al top-1 que el ranker eligió → ESE es el corrective; `corrective_source = "implicit_behavior_inference"`. (2) **paráfrasis fallback** (post-2026-04-29) — si no hubo opens, busca en `rag_queries` una follow-up query en la misma session que sea paráfrasis del original (`requery_detection.is_paraphrase`) Y cuyo `top_score >= 0.5` Y top-1 distinto del original → ESE top-1 es el corrective; `corrective_source = "implicit_paraphrase_inference"`. **Window default 600s (10 min)** — pre-2026-04-29 era 60s, lo subimos porque con 60s cerrábamos solo 1 corrective_path en 6 días (el user lee la nota abierta antes de actuar, no abre otra al toque). Idempotente: skipea feedbacks que ya tienen `corrective_path`. **Valores posibles de `corrective_source`**: `implicit_behavior_inference` (rama 1, señal fuerte), `implicit_paraphrase_inference` (rama 2, señal más débil pero útil para destrabar el gate de 20 que dispara el LoRA fine-tune del reranker). Tests: [`tests/test_implicit_learning_corrective.py`](tests/test_implicit_learning_corrective.py) (rama opens) + [`tests/test_corrective_paraphrase_fallback.py`](tests/test_corrective_paraphrase_fallback.py) (rama paráfrasis + backwards-compat).
 - **Miner JSONL como data alternativa** (commit `5f33d44`): [`scripts/export_training_pairs.py`](scripts/export_training_pairs.py) complementa `rag_feedback` directo con signal implícita de `rag_behavior` (`copy`/`open`/`save`/`kept`/`positive_implicit`) + hard-negs mined de `impression` events reales del historial (no re-retrieve). Análisis del JSONL actual: [`docs/training-pairs-miner-analysis-2026-04-22.md`](docs/training-pairs-miner-analysis-2026-04-22.md) — 176 pairs, ratio neg:pos 6.1:1 (vs 2.4:1 del run previo), 74% con ≥5 hard-negs. Calidad superior al run noisy → próximo intento con estos pairs + `--epochs 2` tiene chances reales de pasar el eval gate. Integración al finetune pendiente (zona de abp2vvvw actual).
 - **Monitoreo**: `sqlite3 ~/.local/share/obsidian-rag/ragvec/telemetry.db "SELECT COUNT(*) FROM rag_feedback WHERE json_extract(extra_json, '\$.corrective_path') IS NOT NULL AND json_extract(extra_json, '\$.corrective_path') <> ''"` — conteo directo de corrective_paths disponibles. (Post split 2026-04-21 `rag_feedback` vive en `telemetry.db`, no `ragvec.db`.)
 - **Re-trigger**: `python scripts/finetune_reranker.py --epochs 2` una vez que el gate lo permita (2 epochs, no 3 — la loss convergió a 0.22 en epoch 2 en el run noisy; epoch 3 es overfit puro). El gate de `rag eval` decide promoción via symlink `~/.cache/obsidian-rag/reranker-ft-current`.

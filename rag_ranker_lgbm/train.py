@@ -34,6 +34,7 @@ def _validation_split(
     y: list[int],
     group: list[int],
     *,
+    weight: list[float] | None = None,
     val_fraction: float = 0.2,
     seed: int = 42,
 ) -> dict[str, Any]:
@@ -42,6 +43,9 @@ def _validation_split(
 
     Lambdarank con val_fraction=0 (sin validation) sigue funcionando — no
     early stopping pero tampoco overfit signal.
+
+    Si `weight` is provided, splittea en paralelo a X/y manteniendo el
+    mismo orden de slices.
     """
     import random
 
@@ -51,9 +55,11 @@ def _validation_split(
             "X_train": X,
             "y_train": y,
             "group_train": group,
+            "weight_train": list(weight) if weight is not None else None,
             "X_val": [],
             "y_val": [],
             "group_val": [],
+            "weight_val": [] if weight is not None else None,
         }
 
     rng = random.Random(seed)
@@ -68,6 +74,8 @@ def _validation_split(
     X_val: list[list[float]] = []
     y_val: list[int] = []
     group_val: list[int] = []
+    w_train: list[float] | None = [] if weight is not None else None
+    w_val: list[float] | None = [] if weight is not None else None
 
     cursor = 0
     for gi, gsize in enumerate(group):
@@ -76,19 +84,25 @@ def _validation_split(
             X_val.extend(X[cand_slice])
             y_val.extend(y[cand_slice])
             group_val.append(gsize)
+            if weight is not None and w_val is not None:
+                w_val.extend(weight[cand_slice])
         else:
             X_train.extend(X[cand_slice])
             y_train.extend(y[cand_slice])
             group_train.append(gsize)
+            if weight is not None and w_train is not None:
+                w_train.extend(weight[cand_slice])
         cursor += gsize
 
     return {
         "X_train": X_train,
         "y_train": y_train,
         "group_train": group_train,
+        "weight_train": w_train,
         "X_val": X_val,
         "y_val": y_val,
         "group_val": group_val,
+        "weight_val": w_val,
     }
 
 
@@ -98,6 +112,7 @@ def train_lambdarank(
     group: list[int],
     *,
     feature_names: list[str],
+    weight: list[float] | None = None,
     output_path: Path | None = None,
     val_fraction: float = 0.2,
     num_boost_round: int = 200,
@@ -112,6 +127,10 @@ def train_lambdarank(
         X, y, group: training data según contrato de feedback_to_training_data.
         feature_names: lista de nombres de features (debe coincidir en orden
             con las columnas de X). Persistida con el modelo para audit.
+        weight: opcional, paralelo a X/y. Pasa a `lgb.Dataset(weight=...)`
+            para atenuar el gradient de candidates débiles. Hoy lo usa
+            la rama `session_outcome_weak_negative` de reward_shaping
+            (peso 0.3 vs 1.0 default). Si None, todos los rows pesan 1.0.
         output_path: dónde guardar el .lgbm (default ~/.local/share/obsidian-rag/ranker.lgbm).
         val_fraction: fracción de groups para validation. 0 = sin val.
         num_boost_round: árboles máximo. Lightgbm puede early-stop antes.
@@ -145,16 +164,30 @@ def train_lambdarank(
             f"no coinciden con candidates."
         )
 
-    split = _validation_split(X, y, group, val_fraction=val_fraction, seed=seed)
+    if weight is not None and len(weight) != len(X):
+        raise ValueError(
+            f"weight tiene len {len(weight)} != len(X)={len(X)} — weight "
+            f"debe estar paralelo a X/y."
+        )
+
+    split = _validation_split(
+        X, y, group, weight=weight, val_fraction=val_fraction, seed=seed,
+    )
 
     train_X = np.array(split["X_train"], dtype=np.float64)
     train_y = np.array(split["y_train"], dtype=np.int32)
     train_group = np.array(split["group_train"], dtype=np.int32)
+    train_weight = (
+        np.array(split["weight_train"], dtype=np.float64)
+        if split.get("weight_train") is not None
+        else None
+    )
 
     train_set = lgb.Dataset(
         train_X,
         label=train_y,
         group=train_group,
+        weight=train_weight,
         feature_name=feature_names,
     )
 
@@ -164,8 +197,14 @@ def train_lambdarank(
         val_X = np.array(split["X_val"], dtype=np.float64)
         val_y = np.array(split["y_val"], dtype=np.int32)
         val_group = np.array(split["group_val"], dtype=np.int32)
+        val_weight = (
+            np.array(split["weight_val"], dtype=np.float64)
+            if split.get("weight_val") is not None
+            else None
+        )
         val_set = lgb.Dataset(
             val_X, label=val_y, group=val_group,
+            weight=val_weight,
             feature_name=feature_names, reference=train_set,
         )
         valid_sets.append(val_set)

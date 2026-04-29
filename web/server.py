@@ -2984,7 +2984,21 @@ _BEHAVIOR_KNOWN_EVENTS = frozenset({
     # copied text length is gated client-side (≥20 chars) to skip
     # accidental copies of short labels / path fragments.
     "copy",
+    # "query_response" (2026-04-29 — Quick Win #2): el bot WhatsApp
+    # postea acá DESPUÉS de mostrarle al user la respuesta del RAG, con
+    # `paths_json` poblado. El implicit-feedback inference
+    # (`infer_corrective_paths_from_behavior`) usa ESOS paths como
+    # fallback cuando el `paths_json` del feedback row está vacío
+    # (caso típico del WA: feedback negativo sin captura de sources).
+    # Antes de este event 228/270 (84%) de los feedbacks negativos
+    # skipeaban con `n_skip_no_paths`. No necesita `path` ni `rank` —
+    # solo session + paths_json para el lookup.
+    "query_response",
 })
+# Sources permitidas en el endpoint. "web" = dashboard/PWA (UI primaria).
+# "whatsapp" = bot listener postea `query_response` con paths_json
+# después de cada query del user. Otros valores se rechazan con 400.
+_BEHAVIOR_KNOWN_SOURCES = frozenset({"web", "whatsapp"})
 _BEHAVIOR_SESSION_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,80}$")
 
 
@@ -2996,14 +3010,27 @@ class BehaviorRequest(BaseModel):
     rank: int | None = None
     dwell_ms: int | None = None
     session: str | None = None
+    # JSON-encoded array de vault-relative paths citados en la respuesta
+    # (top-k del retrieve). Lo manda el listener TS de WhatsApp en el
+    # event `query_response` para que `_recover_paths_from_behavior` los
+    # use como fallback cuando el feedback row no tiene paths_json
+    # propio. Ver Quick Win #2 (2026-04-29). Validamos que sea JSON
+    # parseable y que el resultado sea lista de strings; si no, 422.
+    paths_json: str | None = None
 
 
 @app.post("/api/behavior")
 def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
     """Record a user-behavior event from the web dashboard into behavior.jsonl."""
-    # Validate source
-    if req.source != "web":
-        raise HTTPException(status_code=400, detail="source must be 'web'")
+    # Validate source — el set se expandió en 2026-04-29 (Quick Win #2)
+    # para aceptar al listener WA, además del web. Cualquier valor fuera
+    # del set conocido se rechaza para que un cliente nuevo se entere
+    # con un 400 en lugar de un silent drop.
+    if req.source not in _BEHAVIOR_KNOWN_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown source '{req.source}'; valid: {sorted(_BEHAVIOR_KNOWN_SOURCES)}",
+        )
 
     # Validate event
     if req.event not in _BEHAVIOR_KNOWN_EVENTS:
@@ -3011,6 +3038,45 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
             status_code=400,
             detail=f"unknown event '{req.event}'; valid: {sorted(_BEHAVIOR_KNOWN_EVENTS)}",
         )
+
+    # Validate paths_json: si vino, tiene que ser JSON parseable y el
+    # resultado tiene que ser lista de strings vault-relative. Si no
+    # cumple, 422 — preferimos un fail loud al cliente que silently
+    # guardar un blob roto que después rompe `_recover_paths_from_behavior`
+    # cuando intente parsearlo. Lista vacía = no-op (skip silent, igual
+    # que ausencia del field).
+    paths_list_validated: list[str] | None = None
+    if req.paths_json is not None:
+        try:
+            parsed = json.loads(req.paths_json)
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(
+                status_code=422,
+                detail="paths_json must be a JSON-encoded array",
+            )
+        if not isinstance(parsed, list):
+            raise HTTPException(
+                status_code=422,
+                detail="paths_json must decode to a JSON array",
+            )
+        cleaned: list[str] = []
+        for p in parsed:
+            if not isinstance(p, str) or not p:
+                raise HTTPException(
+                    status_code=422,
+                    detail="paths_json entries must be non-empty strings",
+                )
+            # Cross-source native ids (calendar://, whatsapp://, gmail://)
+            # NO son vault-relative — el ranker-vivo CTR aggregator no los
+            # consume. Mismo criterio que el path nativo arriba: rechazar
+            # acá para que el cliente se entere en lugar de silent drop.
+            if "://" in p:
+                raise HTTPException(
+                    status_code=422,
+                    detail="paths_json entries must be vault-relative (no URI schemes)",
+                )
+            cleaned.append(p)
+        paths_list_validated = cleaned
 
     # Validate session regex if present
     if req.session is not None and not _BEHAVIOR_SESSION_RE.match(req.session):
@@ -3075,7 +3141,7 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
         except Exception:
             pass  # silent — peor caso queda como antes (query=None)
     try:
-        log_behavior_event({
+        event_payload: dict = {
             "source": req.source,
             "event": req.event,
             "query": query_val,
@@ -3083,7 +3149,18 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
             "rank": req.rank,
             "dwell_s": dwell_s,
             "session": req.session,
-        })
+        }
+        # `paths_json` no es columna nativa de `rag_behavior` — el helper
+        # `_map_behavior_row` agarra cualquier key fuera del set conocido
+        # y la mete en `extra_json`, que `_sql_serialise_row` despues
+        # JSON-encodea. Pasamos la lista parseada (no el string crudo)
+        # para que el round-trip sea limpio: extra_json acaba conteniendo
+        # `{"paths_json": ["foo.md", ...]}` en lugar de un string-of-array
+        # anidado. Solo loggeamos si la lista NO está vacía — un array
+        # vacío no aporta señal y ensucia el extra_json.
+        if paths_list_validated:
+            event_payload["paths_json"] = paths_list_validated
+        log_behavior_event(event_payload)
     except Exception as exc:
         # Never 500 on I/O failure — degrade gracefully
         print(f"[behavior] write error: {exc}", flush=True)

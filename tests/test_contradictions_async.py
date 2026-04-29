@@ -341,6 +341,12 @@ def test_check_and_flag_skips_when_set_unchanged(monkeypatch, tmp_path):
     """The idempotence short-circuit: if on-disk contradicts already
     match the newly-detected set, no write, no log, no console alert.
     Prevents the async re-index loop."""
+    # Aislar DB_PATH para que cualquier _log_contradictions accidental
+    # caiga en tmp_path en lugar de la DB real del usuario. La idempotency
+    # guard hace que este test no llegue a loguear, pero defensa en
+    # profundidad — un día alguien edita `_check_and_flag_contradictions`
+    # y rompe la guard, y queremos que el daño quede contenido al tmp.
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     f = tmp_path / "c.md"
     f.write_text(
         "---\ncontradicts:\n- path/one.md\n---\n\n" + "body " * 100,
@@ -360,6 +366,13 @@ def test_check_and_flag_skips_when_set_unchanged(monkeypatch, tmp_path):
 
 def test_check_and_flag_writes_when_set_differs(monkeypatch, tmp_path):
     """If detected set differs, frontmatter IS rewritten."""
+    # Aislar DB_PATH: este test SÍ pasa por `_log_contradictions` porque el
+    # set detectado difiere del frontmatter. Pre-fix (2026-04-29) el test
+    # escribía 261 rows fake (`subject_path="d.md"`, `contradicts_json` con
+    # `new/two.md`) a la DB real `~/.local/share/obsidian-rag/ragvec/telemetry.db`
+    # cada `pytest` — envenenando `_load_contradiction_priors()` y el tune
+    # del ranker (esos paths no existen en el vault, son fixtures del test).
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     f = tmp_path / "d.md"
     f.write_text(
         "---\ncontradicts:\n- old/one.md\n---\n\n" + "body " * 100,

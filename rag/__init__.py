@@ -55372,10 +55372,13 @@ def feedback_auto_harvest(
 
 
 @feedback.command("infer-implicit")
-@click.option("--window-seconds", "window_seconds", default=60,
+@click.option("--window-seconds", "window_seconds", default=600,
               show_default=True,
               help="Cuántos segundos después de un 👎 considerar como reacción "
-                   "del user (60s = ventana típica para search UX).")
+                   "del user (default 600s / 10 min — pre-2026-04-29 era 60s, "
+                   "el bump destrabó casos donde el user lee la nota antes de "
+                   "actuar). Cubre tanto opens en `rag_behavior` como "
+                   "paráfrasis follow-up en `rag_queries`.")
 @click.option("--dry-run", is_flag=True,
               help="No persistir cambios — solo reportar qué se inferiría.")
 @click.option("--json", "as_json", is_flag=True,
@@ -55386,10 +55389,20 @@ def feedback_infer_implicit(
     """Inferir corrective_path implícito desde behavior post-👎.
 
     Para cada feedback con `rating=-1` que NO tiene `corrective_path`
-    todavía, busca eventos `open` en `rag_behavior` dentro de la ventana
-    temporal post-feedback en la misma session. Si el path opened NO es
-    el #1 que se rankeó, ESE es el corrective_path implícito — el user
-    contradijo el ranking abriendo otra source.
+    todavía, prueba dos ramas en orden:
+
+    1. **Opens-based** (señal fuerte): busca eventos `open` en
+       `rag_behavior` dentro de la ventana temporal post-feedback en la
+       misma session. Si el path opened NO es el #1 que se rankeó, ESE
+       es el corrective_path implícito — el user contradijo el ranking.
+       `corrective_source = "implicit_behavior_inference"`.
+
+    2. **Paráfrasis fallback** (post-2026-04-29, señal más débil): si
+       no hubo opens, busca en `rag_queries` una follow-up query en la
+       misma session que sea paráfrasis de la original (vía
+       `requery_detection.is_paraphrase`) Y cuyo top-1 score sea
+       ≥ 0.5 Y distinto del top original. ESE top-1 es el corrective.
+       `corrective_source = "implicit_paraphrase_inference"`.
 
     Útil para destrabar el gate del fine-tune (`online-tune` necesita
     ≥20 feedbacks con corrective_path para mover los pesos del ranker).
@@ -55402,7 +55415,8 @@ def feedback_infer_implicit(
 
     Persiste a `rag_feedback.extra_json`:
       - `corrective_path`: el path inferido
-      - `corrective_source`: "implicit_behavior_inference"
+      - `corrective_source`: "implicit_behavior_inference" |
+        "implicit_paraphrase_inference"
       - `corrective_inferred_at`: timestamp ISO
       - `corrective_in_top_k`: si el path estaba en los top-k mostrados
     """
@@ -55430,12 +55444,19 @@ def feedback_infer_implicit(
     console.print(f"  Candidatos (rating=-1):  {result['n_candidates']}")
     console.print(f"  [bold green]Inferidos:               "
                   f"{result['n_inferred']}[/bold green]")
+    via_paraphrase = result.get("n_inferred_via_paraphrase", 0)
+    if via_paraphrase:
+        console.print(f"    [dim]· vía opens:        "
+                      f"{result['n_inferred'] - via_paraphrase}[/dim]")
+        console.print(f"    [dim]· vía paráfrasis:   "
+                      f"{via_paraphrase}[/dim]")
     console.print(f"  Skip — ya tienen corrective: "
                   f"{result['n_skip_already_corrective']}")
     console.print(f"  Skip — sin session_id:       "
                   f"{result['n_skip_no_session']}")
     console.print(f"  Skip — sin paths_json:       {result['n_skip_no_paths']}")
-    console.print(f"  Skip — sin opens en ventana: {result['n_skip_no_open']}")
+    console.print(f"  Skip — sin opens ni paráfrasis: "
+                  f"{result['n_skip_no_open']}")
     console.print(f"  Skip — abrió el top path:    "
                   f"{result['n_skip_opened_top']}")
     console.print()
@@ -55702,6 +55723,12 @@ def tune_lambdarank(
                       f"Candidates: {data['n_candidates']}")
         console.print(f"    feedback:  {data['sources']['feedback']}")
         console.print(f"    synthetic: {data['sources']['synthetic']}")
+        n_weak = int(data.get("n_weak_negative_candidates", 0))
+        if n_weak > 0:
+            console.print(
+                f"    weak_neg:  {n_weak} candidates (peso 0.3 vs 1.0; "
+                f"source=session_outcome_weak_negative)"
+            )
         console.print()
 
         if data["n_queries"] == 0:
@@ -55723,6 +55750,7 @@ def tune_lambdarank(
         result = train_lambdarank(
             data["X"], data["y"], data["group"],
             feature_names=FEATURE_NAMES,
+            weight=data.get("weight"),
             output_path=target_path,
             num_boost_round=num_boost_round,
             learning_rate=learning_rate,

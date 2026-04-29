@@ -28,6 +28,7 @@ import pytest
 
 from rag_implicit_learning.corrective_paths import (
     DEFAULT_WINDOW_SECONDS,
+    _recover_paths_from_behavior,
     infer_corrective_paths_from_behavior,
 )
 
@@ -35,7 +36,15 @@ from rag_implicit_learning.corrective_paths import (
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _seed_schema(conn: sqlite3.Connection) -> None:
-    """Crea las tablas mínimas para el test (mismo schema que telemetry.db)."""
+    """Crea las tablas mínimas para el test (mismo schema que telemetry.db).
+
+    Incluye `rag_queries` además de feedback/behavior porque la rama
+    paráfrasis-fallback (post-2026-04-29) la consulta. En estos tests
+    la dejamos vacía: ningún fixture la rellena, así la rama fallback
+    jamás encuentra paráfrasis y el branching opens-only sigue siendo
+    el único camino exercitado. Los tests específicos del fallback
+    viven en `tests/test_corrective_paraphrase_fallback.py`.
+    """
     conn.executescript(
         """
         CREATE TABLE rag_feedback (
@@ -59,6 +68,20 @@ def _seed_schema(conn: sqlite3.Connection) -> None:
             dwell_s REAL,
             extra_json TEXT,
             trace_id TEXT
+        );
+        CREATE TABLE rag_queries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            cmd TEXT,
+            q TEXT NOT NULL,
+            session TEXT,
+            mode TEXT,
+            top_score REAL,
+            t_retrieve REAL,
+            t_gen REAL,
+            answer_len INTEGER,
+            paths_json TEXT,
+            extra_json TEXT
         );
         """
     )
@@ -105,6 +128,31 @@ def _insert_behavior_open(
         "INSERT INTO rag_behavior (ts, source, event, path, extra_json) "
         "VALUES (?, ?, 'open', ?, ?)",
         (ts, source, path, extra_json),
+    )
+    return cur.lastrowid
+
+
+def _insert_behavior_query_response(
+    conn: sqlite3.Connection,
+    *,
+    ts: str,
+    paths: list[str],
+    session: str = "wa:abc",
+    source: str = "whatsapp",
+    paths_json_as_string: bool = False,
+) -> int:
+    """Inserta un evento `query_response` en rag_behavior, simulando lo que
+    postea el listener WA. `paths_json_as_string=True` simula el formato
+    legacy donde el field se persistió como string JSON anidado (no es lo
+    que hace el flow actual, pero el helper tolera ambas formas)."""
+    if paths_json_as_string:
+        extra = {"session": session, "paths_json": json.dumps(paths)}
+    else:
+        extra = {"session": session, "paths_json": paths}
+    cur = conn.execute(
+        "INSERT INTO rag_behavior (ts, source, event, extra_json) "
+        "VALUES (?, ?, 'query_response', ?)",
+        (ts, source, json.dumps(extra)),
     )
     return cur.lastrowid
 
@@ -265,11 +313,12 @@ def test_skips_when_user_opened_top_path(conn):
 # ── Boundary: ventana temporal ──────────────────────────────────────────────
 
 def test_open_outside_window_does_not_count(conn):
-    """Open 90s después del feedback NO cuenta con default window=60s."""
+    """Open 700s después del feedback NO cuenta con default window=600s."""
     _insert_feedback(
         conn, ts="2026-04-25T18:00:00", paths=["wrong.md", "right.md"]
     )
-    _insert_behavior_open(conn, ts="2026-04-25T18:01:30", path="right.md")  # +90s
+    # +700s = 11min 40s, fuera del default 600s (10 min).
+    _insert_behavior_open(conn, ts="2026-04-25T18:11:40", path="right.md")
 
     result = infer_corrective_paths_from_behavior(conn, dry_run=False)
     assert result["n_inferred"] == 0
@@ -277,7 +326,7 @@ def test_open_outside_window_does_not_count(conn):
 
 
 def test_custom_window_extends_lookback(conn):
-    """Con window=120s, el open a +90s sí cuenta."""
+    """Con window=120s, el open a +90s sí cuenta (override sobre el default)."""
     _insert_feedback(
         conn, ts="2026-04-25T18:00:00", paths=["wrong.md", "right.md"]
     )
@@ -288,6 +337,21 @@ def test_custom_window_extends_lookback(conn):
     )
     assert result["n_inferred"] == 1
     assert result["window_seconds"] == 120
+
+
+def test_custom_window_can_shrink_below_default(conn):
+    """Con window=30s, un open a +90s NO cuenta — el override achica
+    correctamente la ventana respecto al default 600s."""
+    _insert_feedback(
+        conn, ts="2026-04-25T18:00:00", paths=["wrong.md", "right.md"]
+    )
+    _insert_behavior_open(conn, ts="2026-04-25T18:01:30", path="right.md")
+
+    result = infer_corrective_paths_from_behavior(
+        conn, window_seconds=30, dry_run=False
+    )
+    assert result["n_inferred"] == 0
+    assert result["window_seconds"] == 30
 
 
 def test_open_at_same_timestamp_does_not_count(conn):
@@ -410,8 +474,223 @@ def test_first_open_wins_over_later_one(conn):
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
-def test_default_window_is_60_seconds():
-    """Sanity: el default no cambió silenciosamente. Si baja el default, el
-    behavior post-feedback queda fuera; si sube, capturamos opens que ya
-    no son reactivos al thumbsdown."""
-    assert DEFAULT_WINDOW_SECONDS == 60
+def test_default_window_is_600_seconds():
+    """Sanity: el default no cambió silenciosamente.
+
+    Pre-2026-04-29 era 60s (heurística estándar de search UX). Lo
+    subimos a 600s tras observar que con 60s solo cerrábamos 1
+    corrective_path en 6 días — el user lee la nota abierta antes de
+    actuar y no abre otra al toque. Si este test rompe, alguien tocó
+    el default — confirmar que el cambio es deliberado y que el gate
+    de 20 corrective_paths sigue siendo alcanzable a la nueva cadencia.
+    """
+    assert DEFAULT_WINDOW_SECONDS == 600
+
+
+def test_corrective_source_default_is_behavior_inference(conn):
+    """En la rama opens-based, `corrective_source` queda como
+    `implicit_behavior_inference` (la rama paráfrasis usa otro tag —
+    ver `tests/test_corrective_paraphrase_fallback.py`)."""
+    fb_id = _insert_feedback(
+        conn, ts="2026-04-25T18:00:00", paths=["wrong.md", "right.md"]
+    )
+    _insert_behavior_open(conn, ts="2026-04-25T18:00:30", path="right.md")
+
+    result = infer_corrective_paths_from_behavior(conn, dry_run=False)
+    assert result["n_inferred"] == 1
+    assert result["n_inferred_via_paraphrase"] == 0
+    assert result["updates"][0]["corrective_source"] == "implicit_behavior_inference"
+    extra = _get_extra(conn, fb_id)
+    assert extra["corrective_source"] == "implicit_behavior_inference"
+
+
+# ── Quick Win #2: paths recovery from `query_response` events ───────────────
+
+# Cuando el feedback row no tiene `paths_json` propio (caso típico
+# WhatsApp, donde el bot no captura las sources al row), el inference
+# antes skipeaba el feedback con `n_skip_no_paths`. Post-Quick Win #2
+# (2026-04-29) intenta recuperar los paths desde un evento
+# `query_response` reciente que el listener TS posteó al rag_behavior.
+
+
+def test_recover_paths_returns_list_when_match_in_window(conn):
+    """Helper aislado: encuentra el `paths_json` del query_response
+    reciente que matchea la session."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:30",
+        paths=["alex-pago.md", "moka-foda.md"],
+        session="wa:abc",
+    )
+    paths = _recover_paths_from_behavior(
+        conn,
+        session="wa:abc",
+        before_ts="2026-04-25T18:00:00",
+        window_seconds=60,
+    )
+    assert paths == ["alex-pago.md", "moka-foda.md"]
+
+
+def test_recover_paths_returns_none_when_session_mismatch(conn):
+    """Filter por session aplica."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:30",
+        paths=["alex-pago.md"],
+        session="wa:OTHER",
+    )
+    paths = _recover_paths_from_behavior(
+        conn, session="wa:abc",
+        before_ts="2026-04-25T18:00:00", window_seconds=60,
+    )
+    assert paths is None
+
+
+def test_recover_paths_returns_none_when_outside_window(conn):
+    """Eventos fuera de la ventana hacia atrás no cuentan."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:55:00",  # 5 min antes
+        paths=["alex-pago.md"],
+        session="wa:abc",
+    )
+    paths = _recover_paths_from_behavior(
+        conn, session="wa:abc",
+        before_ts="2026-04-25T18:00:00", window_seconds=60,  # 1 min back
+    )
+    assert paths is None
+
+
+def test_recover_paths_picks_most_recent_when_multiple(conn):
+    """Si hay varios eventos en la session, elegimos el MÁS RECIENTE
+    (el que está más cerca temporalmente del feedback)."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:55:00",
+        paths=["old1.md", "old2.md"],
+        session="wa:abc",
+    )
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:30",
+        paths=["new1.md", "new2.md"],
+        session="wa:abc",
+    )
+    paths = _recover_paths_from_behavior(
+        conn, session="wa:abc",
+        before_ts="2026-04-25T18:00:00", window_seconds=600,
+    )
+    assert paths == ["new1.md", "new2.md"]
+
+
+def test_recover_paths_tolerates_legacy_string_format(conn):
+    """Tolerancia defensiva: si un cliente viejo guardó `paths_json`
+    como string JSON anidado (no lista nativa), igual lo parseamos."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:30",
+        paths=["legacy.md"],
+        session="wa:abc",
+        paths_json_as_string=True,
+    )
+    paths = _recover_paths_from_behavior(
+        conn, session="wa:abc",
+        before_ts="2026-04-25T18:00:00", window_seconds=60,
+    )
+    assert paths == ["legacy.md"]
+
+
+def test_recover_paths_tolerates_at_same_timestamp(conn):
+    """Comparamos `<= before_ts` (no `<`) para tolerar el caso edge
+    donde behavior + feedback tienen el mismo wallclock segundo."""
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T18:00:00",
+        paths=["edge.md"],
+        session="wa:abc",
+    )
+    paths = _recover_paths_from_behavior(
+        conn, session="wa:abc",
+        before_ts="2026-04-25T18:00:00", window_seconds=60,
+    )
+    assert paths == ["edge.md"]
+
+
+def test_infer_recovers_paths_from_behavior_when_feedback_has_none(conn):
+    """End-to-end: feedback sin paths_json → recovery desde
+    query_response → corrective inferido via open posterior."""
+    fb_id = _insert_feedback(
+        conn,
+        ts="2026-04-25T18:00:00",
+        paths=[],  # SIN paths
+        session="wa:abc",
+    )
+    # query_response reciente con los paths citados
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:50",
+        paths=["wrong.md", "right.md"],
+        session="wa:abc",
+    )
+    # User abre la nota correcta DESPUÉS del 👎
+    _insert_behavior_open(
+        conn, ts="2026-04-25T18:00:20", path="right.md", session="wa:abc"
+    )
+
+    result = infer_corrective_paths_from_behavior(conn, dry_run=False)
+
+    assert result["n_inferred"] == 1
+    assert result["n_paths_recovered"] == 1
+    assert result["n_skip_no_paths"] == 0
+    assert result["updates"][0]["corrective_path"] == "right.md"
+    assert result["updates"][0]["top_path"] == "wrong.md"
+
+    extra = _get_extra(conn, fb_id)
+    assert extra["corrective_path"] == "right.md"
+
+
+def test_infer_still_skips_when_no_recovery_match(conn):
+    """Si el feedback no tiene paths_json propio Y no hay query_response
+    reciente, sigue cayendo en `n_skip_no_paths`."""
+    _insert_feedback(
+        conn,
+        ts="2026-04-25T18:00:00",
+        paths=[],
+        session="wa:abc",
+    )
+    # Hay un open pero NINGÚN query_response → el helper devuelve None.
+    _insert_behavior_open(
+        conn, ts="2026-04-25T18:00:20", path="some.md", session="wa:abc"
+    )
+
+    result = infer_corrective_paths_from_behavior(conn, dry_run=False)
+    assert result["n_inferred"] == 0
+    assert result["n_paths_recovered"] == 0
+    assert result["n_skip_no_paths"] == 1
+
+
+def test_infer_does_not_double_count_when_feedback_has_own_paths(conn):
+    """Si el feedback YA tiene paths_json propio, no contamos
+    `n_paths_recovered` aunque haya un query_response disponible."""
+    _insert_feedback(
+        conn,
+        ts="2026-04-25T18:00:00",
+        paths=["wrong.md", "right.md"],
+        session="wa:abc",
+    )
+    _insert_behavior_query_response(
+        conn,
+        ts="2026-04-25T17:59:30",
+        paths=["other1.md", "other2.md"],
+        session="wa:abc",
+    )
+    _insert_behavior_open(
+        conn, ts="2026-04-25T18:00:30", path="right.md", session="wa:abc"
+    )
+
+    result = infer_corrective_paths_from_behavior(conn, dry_run=False)
+    assert result["n_inferred"] == 1
+    # NO se recuperó nada — el feedback ya tenía sus propios paths.
+    assert result["n_paths_recovered"] == 0
+    # El corrective vino de los paths NATIVOS del feedback (right.md).
+    assert result["updates"][0]["corrective_path"] == "right.md"

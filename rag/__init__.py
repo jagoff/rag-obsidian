@@ -29041,6 +29041,117 @@ def _feedback_augmented_cases(min_len: int = 4) -> list[dict]:
     return out
 
 
+def _feedback_implicit_cases(
+    days: int = 30,
+    weight: float = 0.3,
+) -> list[dict]:
+    """Mine rag_feedback for IMPLICIT signals that `_feedback_augmented_cases`
+    misses — feedbacks with `q` + `paths_json` but no `corrective_path`.
+
+    Sources covered:
+      - explicit ratings (+1/-1) without corrective: user reacted but
+        didn't single out a path. Treat ALL top-K paths as weak signal.
+      - session_outcome_loss / session_outcome_win: reward shaping daemon
+        (rag feedback classify-sessions) flagged the session.
+      - requery_detection: paraphrase within 30s → previous turn's paths
+        are weak negatives.
+
+    Why these are 'weak': we don't know which specific path drove the
+    rating; the (q, path) pair is reconstructed from the top-K. Weight
+    defaults to 0.3 — half of the strong signal (corrective_path = 1.0,
+    direct behavior open = 0.5). Lower = lower influence on the tune
+    objective relative to ground-truth golden cases.
+
+    Returns dicts compatible with `_feedback_augmented_cases` /
+    `_behavior_augmented_cases` output.
+    """
+    cutoff = (
+        datetime.fromtimestamp(time.time() - days * 86400)
+        .isoformat(timespec="seconds")
+    )
+    pos: dict[tuple[str, str], str] = {}
+    neg: dict[tuple[str, str], str] = {}
+
+    sql = (
+        "SELECT rating, q, paths_json, "
+        "       json_extract(extra_json, '$.implicit_loss_source')  AS loss_src, "
+        "       json_extract(extra_json, '$.implicit_win_source')   AS win_src, "
+        "       json_extract(extra_json, '$.corrective_path')       AS cp "
+        "FROM rag_feedback "
+        "WHERE (scope IS NULL OR scope != 'session') "
+        "  AND q IS NOT NULL AND q != '' "
+        "  AND paths_json IS NOT NULL AND paths_json != '' "
+        "  AND ts >= ? "
+        "ORDER BY ts ASC"
+    )
+    try:
+        with _ragvec_state_conn() as conn:
+            rows = conn.execute(sql, (cutoff,)).fetchall()
+    except Exception as exc:
+        _log_sql_state_error("feedback_implicit_cases_sql_read_failed",
+                              err=repr(exc))
+        return []
+
+    for row in rows:
+        rating = row["rating"] if hasattr(row, "keys") else row[0]
+        q = (row["q"] if hasattr(row, "keys") else row[1]) or ""
+        paths_json = row["paths_json"] if hasattr(row, "keys") else row[2]
+        cp = row["cp"] if hasattr(row, "keys") else row[5]
+        # Skip rows with explicit corrective_path — those are the strong
+        # signal that `_feedback_augmented_cases` already consumes.
+        if cp:
+            continue
+        try:
+            paths = json.loads(paths_json) if isinstance(paths_json, str) else paths_json
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not paths or not isinstance(paths, list):
+            continue
+        norm_q = " ".join(q.strip().lower().split())
+        if not norm_q:
+            continue
+        # Determine sign from rating + implicit source.
+        is_pos = rating == 1
+        is_neg = rating == -1
+        if not (is_pos or is_neg):
+            continue
+        for p in paths:
+            if not isinstance(p, str) or not p:
+                continue
+            key = (norm_q, p)
+            if is_pos:
+                pos[key] = "feedback_implicit_pos"
+            else:
+                neg[key] = "feedback_implicit_neg"
+
+    # Drop conflicting keys (same q+path appearing as both pos and neg).
+    conflict = set(pos.keys()) & set(neg.keys())
+    out: list[dict] = []
+    for key, source in pos.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "expected": [path],
+            "kind_hint": "behavior_pos",
+            "source": source,
+            "weight": weight,
+        })
+    for key, source in neg.items():
+        if key in conflict:
+            continue
+        norm_q, path = key
+        out.append({
+            "question": norm_q,
+            "anti_expected": [path],
+            "kind_hint": "behavior_neg",
+            "source": source,
+            "weight": weight,
+        })
+    return out
+
+
 def _behavior_augmented_cases(days: int = 14) -> list[dict]:
     """Mine behavior events for implicit feedback — forms gold (query, path) tuples.
 
@@ -29585,11 +29696,22 @@ def tune(queries_file: str, k: int, samples: int, seed: int,
         # See `_brief_synthetic_cases` for rationale.
         synthetic = _brief_synthetic_cases(days=days)
         behavior_cases.extend(synthetic)
+        # Weak feedback signals: rag_feedback rows that have q + paths_json
+        # but no corrective_path (i.e. implicit signals from
+        # session_outcome / requery_detection / explicit ratings without
+        # corrective). `_feedback_augmented_cases` only picks up rows with
+        # corrective_path — this picks up the rest. weight=0.3 reflects
+        # that the (q, path) pair is reconstructed from top-K, not directly
+        # observed. See `_feedback_implicit_cases`.
+        implicit_fb = _feedback_implicit_cases(days=max(days, 30))
+        behavior_cases.extend(implicit_fb)
         console.print(
             f"[dim]Behavior cases: {len(behavior_cases)} "
             f"(pos={sum(1 for c in behavior_cases if 'expected' in c)}, "
             f"neg={sum(1 for c in behavior_cases if 'anti_expected' in c)}, "
-            f"synthetic={len(synthetic)}, últimos {days}d)[/dim]"
+            f"synthetic_brief={len(synthetic)}, "
+            f"implicit_feedback={len(implicit_fb)}, "
+            f"últimos {days}d)[/dim]"
         )
 
     col = get_db()

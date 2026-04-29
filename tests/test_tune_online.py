@@ -268,6 +268,141 @@ def test_brief_synthetic_path_quoted_match(tmp_path, monkeypatch):
     assert "wrong" not in questions
 
 
+# ── _feedback_implicit_cases (weak signals) ──────────────────────────────────
+
+def _seed_feedback(events: list[dict]) -> None:
+    """Seed rag_feedback with the given events via the SQL primitives.
+
+    `paths_json` (list) gets renamed to `paths` so `_map_feedback_row`
+    routes it to the `paths_json` column. extra_json (dict) gets passed
+    through — keys not in the known set fold into `extra_json`.
+    """
+    with rag._ragvec_state_conn() as conn:
+        for ev in events:
+            ev = dict(ev)
+            if "paths_json" in ev:
+                ev["paths"] = ev.pop("paths_json")
+            rag._sql_append_event(conn, "rag_feedback",
+                                   rag._map_feedback_row(ev))
+
+
+def test_feedback_implicit_no_rows(tmp_path, monkeypatch):
+    """Sin rag_feedback rows → lista vacía."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    result = rag._feedback_implicit_cases(days=30)
+    assert result == []
+
+
+def test_feedback_implicit_skips_corrective(tmp_path, monkeypatch):
+    """Rows con corrective_path se skipean (los maneja
+    `_feedback_augmented_cases`, no éste)."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "rating": -1, "q": "wrong query",
+        "paths": ["A.md", "B.md"],
+        "corrective_path": "C.md",
+        "ts": _iso(-3600),
+    }])
+    result = rag._feedback_implicit_cases(days=30)
+    assert result == []
+
+
+def test_feedback_implicit_positive_rating_emits_top_paths(tmp_path, monkeypatch):
+    """rating=+1 sin corrective → todos los paths del top-K son weak positives."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "rating": 1, "q": "good query",
+        "paths": ["A.md", "B.md", "C.md"],
+        "ts": _iso(-3600),
+    }])
+    result = rag._feedback_implicit_cases(days=30)
+    assert len(result) == 3
+    paths = {c["expected"][0] for c in result}
+    assert paths == {"A.md", "B.md", "C.md"}
+    for c in result:
+        assert c["weight"] == 0.3
+        assert c["kind_hint"] == "behavior_pos"
+        assert c["source"] == "feedback_implicit_pos"
+
+
+def test_feedback_implicit_negative_rating_emits_anti_paths(tmp_path, monkeypatch):
+    """rating=-1 sin corrective → todos los paths son weak negatives."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "rating": -1, "q": "bad query",
+        "paths": ["X.md", "Y.md"],
+        "ts": _iso(-3600),
+    }])
+    result = rag._feedback_implicit_cases(days=30)
+    assert len(result) == 2
+    for c in result:
+        assert "anti_expected" in c
+        assert c["kind_hint"] == "behavior_neg"
+        assert c["source"] == "feedback_implicit_neg"
+
+
+def test_feedback_implicit_session_outcome_loss(tmp_path, monkeypatch):
+    """session_outcome_loss (rating=-1 + extra_json.implicit_loss_source)
+    se trata igual que cualquier negative implícito."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "rating": -1, "q": "session loss query",
+        "paths": ["P.md"],
+        "implicit_loss_source": "session_outcome",
+        "ts": _iso(-3600),
+    }])
+    result = rag._feedback_implicit_cases(days=30)
+    assert len(result) == 1
+    assert result[0]["anti_expected"] == ["P.md"]
+
+
+def test_feedback_implicit_conflict_dropped(tmp_path, monkeypatch):
+    """Mismo (q, path) con rating=+1 y rating=-1 → ambos se dropean."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([
+        {"rating": 1, "q": "ambiguous", "paths": ["Same.md"],
+         "ts": _iso(-100)},
+        {"rating": -1, "q": "ambiguous", "paths": ["Same.md"],
+         "ts": _iso(-50)},
+        # Otro path solo positivo — debe sobrevivir
+        {"rating": 1, "q": "ambiguous", "paths": ["Other.md"],
+         "ts": _iso(-100)},
+    ])
+    result = rag._feedback_implicit_cases(days=30)
+    paths = {(c["question"], c.get("expected", c.get("anti_expected", [None]))[0])
+             for c in result}
+    assert ("ambiguous", "Same.md") not in paths
+    assert ("ambiguous", "Other.md") in paths
+
+
+def test_feedback_implicit_respects_days_window(tmp_path, monkeypatch):
+    """Rows older than the days window are excluded."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    old_ts = rag.datetime.fromtimestamp(time.time() - 60 * 86400).isoformat(timespec="seconds")
+    _seed_feedback([
+        {"rating": 1, "q": "old", "paths": ["Old.md"], "ts": old_ts},
+        {"rating": 1, "q": "recent", "paths": ["Recent.md"], "ts": _iso(-100)},
+    ])
+    result = rag._feedback_implicit_cases(days=30)
+    paths = {c["expected"][0] for c in result if "expected" in c}
+    assert "Recent.md" in paths
+    assert "Old.md" not in paths
+
+
+def test_feedback_implicit_skips_session_scope(tmp_path, monkeypatch):
+    """Feedbacks con scope='session' se skipean — esos son meta-feedbacks
+    sobre la sesión completa, no sobre paths individuales."""
+    monkeypatch.setattr(rag, "DB_PATH", tmp_path)
+    _seed_feedback([{
+        "rating": 1, "q": "session-level query",
+        "paths": ["Path.md"],
+        "scope": "session",
+        "ts": _iso(-100),
+    }])
+    result = rag._feedback_implicit_cases(days=30)
+    assert result == []
+
+
 # ── Ranker config versioning ──────────────────────────────────────────────────
 
 def test_backup_ranker_config_no_existing(tmp_path):
@@ -538,8 +673,10 @@ def test_eval_gate_timeout_is_bounded():
         rag._run_eval_gate()
 
     assert captured["timeout"] is not None, "timeout kwarg missing from subprocess.run"
-    assert 600 <= captured["timeout"] <= 1800, (
-        f"eval gate timeout is {captured['timeout']}s — expected in [600, 1800]s "
-        f"range (current default 1200s post-2026-04-27 vault reorg). "
+    assert 600 <= captured["timeout"] <= 3600, (
+        f"eval gate timeout is {captured['timeout']}s — expected in [600, 3600]s "
+        f"range (current default 2400s post-2026-04-27 vault reorg + "
+        f"cross-source corpus expansion). Cap kept ≤ 3600s (60 min) to still "
+        f"fail relatively fast if ollama is down. "
         f"Override via RAG_EVAL_GATE_TIMEOUT_S if hardware differs."
     )

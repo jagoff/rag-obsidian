@@ -54,12 +54,22 @@ class TestIsParaphrase:
         assert not is_paraphrase("qué sabés", "")
         assert not is_paraphrase("", "")
 
-    def test_identical_query(self):
-        """Idéntica = paráfrasis trivial (ratio=1.0)."""
-        assert is_paraphrase(
+    def test_identical_query_is_not_paraphrase(self):
+        """Idéntica NO es paráfrasis — re-write 2026-04-29.
+
+        Pre-fix la fn devolvía True (ratio=1.0). Pero el detector itera
+        pares consecutivos en `rag_queries`, y cuando el endpoint loguea
+        la misma query dos veces (pre-retrieve `serve.received` +
+        post-retrieve `serve`), pasaban como self-match → 100+ falsos
+        positivos en la live DB. La paráfrasis útil para el sistema es
+        cuando el USER reformula, no cuando el writer duplica logs.
+        """
+        assert not is_paraphrase(
             "cuánto debe Alex de la macbook",
             "cuánto debe Alex de la macbook",
         )
+        # Trim + case insensitivity también cuenta como self-match.
+        assert not is_paraphrase("Hola", "  hola  ")
 
     def test_threshold_makes_short_edits_paraphrases(self):
         """Con threshold default 0.5, edits chicos cuentan como paráfrasis."""

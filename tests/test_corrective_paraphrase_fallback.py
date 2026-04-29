@@ -276,7 +276,11 @@ def test_paraphrase_with_same_top_does_not_infer(conn):
 
 
 def test_paraphrase_with_low_top_score_is_skipped(conn):
-    """Paráfrasis con `top_score < 0.5` → no confiamos en su top-1, skip."""
+    """Paráfrasis con `top_score < threshold` → no confiamos en su top-1, skip.
+
+    2026-04-29: threshold bajado de 0.5 a 0.1 — ahora el "low score" es
+    <0.1 (rangos típicos del cross-encoder en queries fallidas).
+    """
     _insert_feedback(
         conn,
         ts="2026-04-25T18:00:00",
@@ -288,7 +292,7 @@ def test_paraphrase_with_low_top_score_is_skipped(conn):
         ts="2026-04-25T18:00:30",
         q="dame info sobre Grecia",
         paths=["right-grecia.md"],
-        top_score=0.30,  # Por debajo del threshold default 0.5.
+        top_score=0.05,  # Por debajo del threshold default 0.1.
     )
 
     result = infer_corrective_paths_from_behavior(conn, dry_run=False)
@@ -318,11 +322,18 @@ def test_paraphrase_with_null_top_score_is_skipped(conn):
     assert result["n_inferred"] == 0
 
 
-def test_paraphrase_threshold_constant_is_05():
+def test_paraphrase_threshold_constant_is_01():
     """Sanity sobre el threshold default. Si baja, agrandamos el dataset
     pero metemos más ruido al fine-tune. Si sube, el dataset se achica.
-    Ambos cambios deberían ser deliberados."""
-    assert DEFAULT_PARAPHRASE_TOP_SCORE_MIN == 0.5
+    Ambos cambios deberían ser deliberados.
+
+    2026-04-29: bajado de 0.5 a 0.1 después de validar contra DB live.
+    El cross-encoder bge-reranker-v2-m3 produce scores muy bajos (<0.15)
+    para queries de WhatsApp/voz por su calibración absoluta — con 0.5
+    ningún paraphrase WA pasaba el gate. 0.1 deja pasar matches con
+    overlap léxico fuerte sin abrir compuertas para top_score~0.
+    """
+    assert DEFAULT_PARAPHRASE_TOP_SCORE_MIN == 0.1
 
 
 # ── No es paraphrase: distinto tema ─────────────────────────────────────────
@@ -537,7 +548,7 @@ def test_skips_low_score_paraphrase_then_picks_next_valid(conn):
         ts="2026-04-25T18:00:20",
         q="dame info sobre Grecia",
         paths=["bad-confidence.md"],
-        top_score=0.20,  # Por debajo del threshold.
+        top_score=0.05,  # Por debajo del threshold (0.1 default 2026-04-29).
     )
     _insert_query(
         conn,

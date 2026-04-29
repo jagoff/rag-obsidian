@@ -85,14 +85,25 @@ DEFAULT_WINDOW_SECONDS = 600
 
 # Threshold de top_score (cosine del cross-encoder reranker) para confiar
 # en la paráfrasis follow-up: si el user reformuló y la nueva corrida
-# devolvió un top-1 con score < 0.5, asumimos que tampoco encontró nada
-# útil — no usamos ese path como corrective. Conservador (preferimos
-# perder signal antes que envenenar el dataset del fine-tune con
-# falsos positivos). Calibrado vs `_LOOKUP_THRESHOLD=0.6` (gate de
-# confianza global) — mantenemos 0.1 de margen para captar paráfrasis
-# semi-buenas que no llegaron al gate principal pero son útiles como
-# negative-of-positive signal contra el top_path original.
-DEFAULT_PARAPHRASE_TOP_SCORE_MIN = 0.5
+# devolvió un top-1 con score < threshold, asumimos que tampoco encontró
+# nada útil — no usamos ese path como corrective.
+#
+# 2026-04-29: bajado 0.5 → 0.1 después de validar contra DB live. La calibración
+# absoluta del cross-encoder `bge-reranker-v2-m3` da scores en rangos
+# muy distintos según el source:
+#   - Vault notes: 0.4-0.9 (alto, calibración estándar)
+#   - WhatsApp:    0.02-0.15 (muy bajo, ver `RAG_WA_FAST_PATH_THRESHOLD=0.05`
+#                  documentado en CLAUDE.md por la misma razón)
+#   - Calendar / Reminders: rango medio
+# Con 0.5 ningún query del bot WA pasaba el gate, perdiendo TODOS los
+# signal de WA paraphrases (la mayoría del corpus). 0.1 deja pasar las
+# WA queries con match razonable (>0.1 indica al menos overlap léxico
+# fuerte) sin abrir compuertas para queries con scores ínfimos (<0.1
+# = el reranker no encontró nada relevante).
+#
+# Si el dataset del fine-tune se contamina con falsos positivos, subir
+# este threshold (0.15-0.20) o agregar un threshold per-source.
+DEFAULT_PARAPHRASE_TOP_SCORE_MIN = 0.1
 
 
 def _extract_session(extra_json_str: str | None) -> str | None:

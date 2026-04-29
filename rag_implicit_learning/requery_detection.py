@@ -118,6 +118,14 @@ def is_paraphrase(
     es paráfrasis. Si ratio alto pero zero overlap, también NO — el
     user puede estar re-usando palabras de relleno con tema distinto.
     """
+    # 2026-04-29: defensive — q1 == q2 NO es paráfrasis. El detector itera
+    # pares consecutivos en `rag_queries`; cuando el endpoint loguea la
+    # misma query dos veces (pre-retrieve `serve.received` + post-retrieve
+    # `serve`), pasaban como paráfrasis "self-match" con ratio=1.0. Pre-fix
+    # esto generó 100+ falsos positivos en la live DB.
+    if (q1 or "").strip().lower() == (q2 or "").strip().lower():
+        return False
+
     tokens1 = _normalize_tokens(q1)
     tokens2 = _normalize_tokens(q2)
 
@@ -217,8 +225,24 @@ def detect_requery_loss_signal(
     """
     _ensure_feedback_table(conn)
 
-    where_clauses = ["session IS NOT NULL", "session != ''", "q IS NOT NULL", "q != ''"]
-    params: list[Any] = []
+    # 2026-04-29: filtro de cmd añadido. Pre-fix el detector iteraba TODAS
+    # las rows de `rag_queries`, incluyendo eventos meta tipo
+    # `serve.received` (pre-retrieve, sin paths), `serve.error`,
+    # `serve.weather`, `serve.metachat`, `serve.tasks`, `web.chat.metachat`
+    # — cuando el endpoint loguea pre Y post retrieve para la misma query,
+    # el detector marcaba el par como paráfrasis self-match. La nueva
+    # whitelist incluye solo cmds que representan queries REALES con
+    # potencial de paths_json: `serve` (post-retrieve), `web` (web chat),
+    # `query` (CLI), `chat` (CLI chat). Esto elimina los falsos positivos
+    # masivos sin perder paraphrases legítimas (que aparecen en cmds
+    # post-retrieve, los que devolvieron sources al user).
+    _ALLOWED_CMDS = ("serve", "web", "query", "chat")
+    where_clauses = [
+        "session IS NOT NULL", "session != ''",
+        "q IS NOT NULL", "q != ''",
+        "cmd IN ({})".format(",".join(["?"] * len(_ALLOWED_CMDS))),
+    ]
+    params: list[Any] = list(_ALLOWED_CMDS)
     if only_after_ts:
         where_clauses.append("datetime(ts) >= datetime(?)")
         params.append(only_after_ts)

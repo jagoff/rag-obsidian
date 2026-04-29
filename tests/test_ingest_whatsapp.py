@@ -147,6 +147,93 @@ def test_read_messages_excludes_status_broadcast(fake_bridge):
     assert all(m.chat_jid != "status@broadcast" for m in msgs)
 
 
+def test_read_messages_excludes_ragnet_bot_group(tmp_path):
+    """RagNet (`WHATSAPP_BOT_JID`) es la UI del bot — recibe briefs,
+    archive pushes, slash commands del user (`/help`, `/note`), y las
+    respuestas del bot a esos comandos. Nada de esto es contenido
+    conversacional del corpus. El indexer DEBE skipearlo aunque el user
+    haya optado por indexar WhatsApp, sino se forma un feedback loop:
+    bot pushea brief → indexer chunkea el brief → next retrieve devuelve
+    el brief de ayer → el siguiente brief incluye self-references.
+
+    Cerrado 2026-04-28 junto con `RAG_DRAFT_VIA_RAGNET` (que amplificaba
+    el leak — testing 1-2 días de ambient sends redirigidos podía
+    agregar cientos de chunks de output del bot al corpus).
+    """
+    db = tmp_path / "messages.db"
+    now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    rows = [
+        # Brief que el bot le mandó a RagNet — tiene el U+200B prefix
+        # porque sale via _ambient_whatsapp_send con anti_loop=True.
+        ("b1", rag.WHATSAPP_BOT_JID, "RagNet", "bot",
+         "\u200B📓 Morning brief\n\nHoy tenés 3 reuniones...",
+         now_iso, 1, None),
+        # User le tipea `/help` a RagNet — sin U+200B, pero el filter
+        # por JID igual lo skipea (es noise de UI, no corpus content).
+        ("u1", rag.WHATSAPP_BOT_JID, "RagNet", "fer",
+         "/help", now_iso, 0, None),
+        # Respuesta del bot al /help — con U+200B (anti-loop) Y en RagNet,
+        # doble guardia.
+        ("b2", rag.WHATSAPP_BOT_JID, "RagNet", "bot",
+         "\u200BComandos disponibles: /note, /cap, ...",
+         now_iso, 1, None),
+        # Mensaje legítimo de un contacto real — debe pasar.
+        ("ok1", "grecia@s.whatsapp.net", "Grecia", "grecia",
+         "hola che cómo estás", now_iso, 0, None),
+    ]
+    _mk_bridge_db(db, rows)
+    msgs = iw.read_messages(db, since_ts=0)
+
+    # RagNet entera (4 mensajes en la fixture: 2 bot + 1 user + 1 bot)
+    # → 0 mensajes en out.
+    assert all(m.chat_jid != rag.WHATSAPP_BOT_JID for m in msgs), (
+        f"esperado: 0 chunks de RagNet, got: {[m.chat_jid for m in msgs]}"
+    )
+    # El mensaje de Grecia sí pasa.
+    assert any(m.chat_jid == "grecia@s.whatsapp.net" for m in msgs)
+    assert any("Grecia" in m.chat_name for m in msgs)
+
+
+def test_read_messages_drops_u200b_anti_loop_in_other_chats(tmp_path):
+    """Defense in depth: si por alguna razón un mensaje con prefix U+200B
+    aparece en un chat que NO es RagNet (ej. el bot manda algo a un
+    self-chat futuro o el bridge re-escribe destinos), el content-level
+    filter lo descarta. Hoy el JID guard cubre todos los casos prod, pero
+    este filter mantiene el invariante 'U+200B = bot output, never index'
+    sin depender de actualizar la JID list cada vez que se agrega un
+    nuevo chat de bot."""
+    db = tmp_path / "messages.db"
+    now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    rows = [
+        # Mensaje del bot con U+200B prefix en un chat 1:1 inventado.
+        ("b1", "fer-self@s.whatsapp.net", "Fer Self", "bot",
+         "\u200BTest output del bot", now_iso, 1, None),
+        # Mismo chat, pero un mensaje real del user (sin U+200B).
+        ("u1", "fer-self@s.whatsapp.net", "Fer Self", "fer",
+         "una nota mía importante", now_iso, 1, None),
+        # Edge case: U+200B en mitad del texto, NO al inicio. Debe pasar
+        # — solo el prefix nos dice "bot output", no la presencia.
+        ("u2", "ana@s.whatsapp.net", "Ana", "ana",
+         "hola\u200Bche", now_iso, 0, None),
+    ]
+    _mk_bridge_db(db, rows)
+    msgs = iw.read_messages(db, since_ts=0)
+    contents = [m.content for m in msgs]
+
+    assert "Test output del bot" not in [c.lstrip("\u200B") for c in contents]
+    assert "una nota mía importante" in contents
+    assert any("\u200B" in c for c in contents), (
+        "U+200B en mitad del texto NO debe filtrar el mensaje"
+    )
+
+
+def test_hardcoded_exclude_jids_includes_bot_group():
+    """Sanity: la frozenset hardcoded contiene RagNet. Si alguien la
+    edita y saca el JID del bot por error, este test rompe."""
+    assert "status@broadcast" in iw.HARDCODED_EXCLUDE_JIDS
+    assert rag.WHATSAPP_BOT_JID in iw.HARDCODED_EXCLUDE_JIDS
+
+
 def test_read_messages_respects_since_ts(fake_bridge):
     # All messages have ts >= now → high since_ts drops them all
     future = time.time() + 10000

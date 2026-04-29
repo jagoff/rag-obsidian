@@ -66,9 +66,39 @@ PARENT_MAX_CHARS = 1200               # cap (vault convention)
 DOC_ID_PREFIX = "whatsapp"
 
 # Chat JIDs we never want to index regardless of user opt-out decision.
-# `status@broadcast` is WhatsApp's internal story/status feed — not
-# conversational, not something the user "said", just ambient noise.
-HARDCODED_EXCLUDE_JIDS = frozenset({"status@broadcast"})
+#
+# - `status@broadcast` — WhatsApp's internal story/status feed. Not
+#   conversational, not something the user "said", just ambient noise.
+# - `rag.WHATSAPP_BOT_JID` (RagNet group `120363426178035051@g.us`) —
+#   the bot's own UI surface. Receives morning briefs, archive
+#   notifications, reminder pushes, anticipatory agent prompts, draft
+#   cards, AND the user's slash commands (`/help`, `/note`, `/cap`,
+#   etc.) and the bot's responses to them. None of this is
+#   conversational corpus content — indexing it creates a feedback
+#   loop: bot pushes a brief → indexer chunks the brief → next
+#   retrieve surfaces yesterday's brief as "context" → next brief
+#   includes references to its own past output. The fetchers used by
+#   the brief itself (`_fetch_whatsapp_unread`, `_fetch_whatsapp_today`,
+#   `_fetch_whatsapp_window`) already exclude this JID at the SQL
+#   level; the indexer was the last open path. Closed 2026-04-28
+#   alongside the `RAG_DRAFT_VIA_RAGNET` redirect flag (which would
+#   amplify the leak — testing 1-2 days of redirected ambient sends
+#   could add hundreds of bot-output chunks to the corpus).
+#
+# Also content-level: any message whose first char is U+200B (zero-
+# width space) is bot output (the listener anti-loop marker). Defense
+# in depth for any future bot-to-non-RagNet-chat path; today the JID
+# guard alone catches all production cases.
+HARDCODED_EXCLUDE_JIDS = frozenset({
+    "status@broadcast",
+    rag.WHATSAPP_BOT_JID,
+})
+
+# U+200B (zero-width space) anti-loop marker. The listener bot prefixes
+# every outbound message with this char; any message in the bridge DB
+# starting with it is bot output, not user content, and must not enter
+# the corpus.
+_ANTILOOP_MARKER = "\u200B"
 
 
 # ── Data types ─────────────────────────────────────────────────────────────
@@ -262,6 +292,13 @@ def read_messages(
         jid = r["chat_jid"]
         if jid in exclude_jids:
             continue
+        content = str(r["content"] or "")
+        # Skip the bot's own anti-loop output. The listener prefixes every
+        # outbound bot message with U+200B so it can ignore its own echoes;
+        # the same marker tells us "this row was authored by the bot, not
+        # a human". Drop unconditionally — these rows have no corpus value.
+        if content.startswith(_ANTILOOP_MARKER):
+            continue
         ts = _parse_bridge_ts(r["timestamp"])
         if ts is None or ts <= since_ts:
             continue
@@ -270,7 +307,7 @@ def read_messages(
             chat_jid=jid,
             chat_name=str(r["chat_name"] or jid),
             sender=str(r["sender"] or ""),
-            content=str(r["content"] or ""),
+            content=content,
             timestamp=ts,
             is_from_me=bool(r["is_from_me"]),
             media_type=r["media_type"],

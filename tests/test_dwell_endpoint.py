@@ -173,6 +173,113 @@ def test_multiple_dwell_events_accumulate(behavior_env):
 #    might accidentally revert the conversion. ──────────────────────
 
 
+def test_open_event_populates_original_query_id(behavior_env, client):
+    """Round-trip: insert una query en rag_queries con session='web:xyz',
+    luego POST /api/behavior con event='open' y el mismo session.
+    El row en rag_behavior debe tener original_query_id en extra_json
+    apuntando al id de la query insertada.
+
+    Cierra el loop de feedback implícito: el consumer en
+    rag_implicit_learning/corrective_paths.py filtra opens por
+    `original_query_id IS NOT NULL` — sin este campo el 89.7% de los
+    opens del web quedaban invisibles al gate de corrective_paths.
+    """
+    import json as _json
+    import datetime
+
+    # Insertar una query de prueba en rag_queries con session conocido
+    ts = datetime.datetime.now().isoformat()
+    with rag._ragvec_state_conn() as conn:
+        conn.execute(
+            "INSERT INTO rag_queries (ts, session, q, cmd) VALUES (?, ?, ?, ?)",
+            (ts, "web:xyz", "qué hago hoy", "web.chat"),
+        )
+        inserted_id = conn.execute(
+            "SELECT id FROM rag_queries WHERE session = 'web:xyz' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        conn.commit()
+
+    # POST del open con el mismo session
+    resp = client.post("/api/behavior", json={
+        "source": "web",
+        "event": "open",
+        "path": "02-Areas/Test-oqid.md",
+        "query": "qué hago hoy",
+        "rank": 1,
+        "session": "web:xyz",
+    })
+    assert resp.status_code == 200
+
+    # Verificar que el row en rag_behavior tiene original_query_id en extra_json
+    with rag._ragvec_state_conn() as conn:
+        row = conn.execute(
+            "SELECT extra_json FROM rag_behavior "
+            "WHERE path = ? ORDER BY id DESC LIMIT 1",
+            ("02-Areas/Test-oqid.md",),
+        ).fetchone()
+    assert row is not None, "No se insertó el row de behavior"
+    extra = _json.loads(row[0]) if row[0] else {}
+    assert "original_query_id" in extra, (
+        f"original_query_id ausente en extra_json — feedback loop roto. "
+        f"extra_json={extra}"
+    )
+    assert extra["original_query_id"] == inserted_id, (
+        f"original_query_id={extra['original_query_id']} no coincide con "
+        f"el id esperado={inserted_id}"
+    )
+
+
+def test_non_open_event_no_original_query_id(behavior_env, client):
+    """Eventos que NO son 'open' no deben tener original_query_id,
+    incluso con session activa. El lookup solo corre para event='open'."""
+    import json as _json
+    import datetime
+
+    ts = datetime.datetime.now().isoformat()
+    with rag._ragvec_state_conn() as conn:
+        conn.execute(
+            "INSERT INTO rag_queries (ts, session, q, cmd) VALUES (?, ?, ?, ?)",
+            (ts, "web:nooqid", "alguna query", "web.chat"),
+        )
+        conn.commit()
+
+    resp = client.post("/api/behavior", json={
+        "source": "web",
+        "event": "copy",
+        "path": "02-Areas/Impression-test.md",
+        "query": "alguna query",
+        "rank": 2,
+        "session": "web:nooqid",
+    })
+    assert resp.status_code == 200
+
+    with rag._ragvec_state_conn() as conn:
+        row = conn.execute(
+            "SELECT extra_json FROM rag_behavior "
+            "WHERE path = ? ORDER BY id DESC LIMIT 1",
+            ("02-Areas/Impression-test.md",),
+        ).fetchone()
+    extra = _json.loads(row[0]) if row and row[0] else {}
+    assert "original_query_id" not in extra, (
+        f"original_query_id no debe estar en eventos no-open. extra_json={extra}"
+    )
+
+
+def test_open_without_session_no_original_query_id(client):
+    """Un open sin session no tiene a qué query asociar — no debe tener
+    original_query_id en extra_json (y no debe crashear el endpoint)."""
+    with patch.object(_web_server, "log_behavior_event") as mock_log:
+        resp = client.post("/api/behavior", json={
+            "source": "web",
+            "event": "open",
+            "path": "x.md",
+            "query": "q",
+        })
+    assert resp.status_code == 200
+    call_event = mock_log.call_args.args[0]
+    assert "original_query_id" not in call_event
+
+
 def test_server_never_persists_raw_dwell_ms(behavior_env, client):
     """Round-trip: POST with dwell_ms, read the row back from SQL, assert
     dwell_ms is not in extra_json and dwell_s is the right magnitude."""

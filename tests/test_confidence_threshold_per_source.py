@@ -1,8 +1,14 @@
-"""Tests for per-source confidence threshold scaffolding (Phase 1.f).
+"""Tests for per-source confidence threshold (Phase 1.f / W3.9).
 
-All values currently equal the global baseline (0.015) — this is a pure
-scaffolding change. The tests lock in the helper contract so future
-tuning passes don't accidentally break the gate.
+Vault stays at the global baseline (0.015). Short-body sources
+(whatsapp / calendar / reminders / messages / calls) calibrated to
+0.008 because bge-reranker-v2-m3 systematically scores their bodies
+in the 0.02-0.10 band (vs vault's 0.10+). gmail / drive intermediate
+at 0.010, contacts / safari at 0.012.
+
+The tests lock in the helper contract + the calibrated values so
+future tuning passes go through the explicit data-driven channel
+(`rag eval` + behavior priors) rather than silent edits.
 """
 from __future__ import annotations
 
@@ -33,12 +39,31 @@ def test_threshold_helper_all_sources_covered():
     assert set(rag.CONFIDENCE_RERANK_MIN_PER_SOURCE) == rag.VALID_SOURCES
 
 
-def test_threshold_scaffolding_currently_equals_baseline():
-    """Lock in the 'no-op scaffolding' invariant. Remove this test when
-    per-source values diverge from the baseline (they should diverge
-    after Phase 1.f calibration)."""
-    for src, val in rag.CONFIDENCE_RERANK_MIN_PER_SOURCE.items():
-        assert val == rag.CONFIDENCE_RERANK_MIN, (
-            f"{src} threshold drifted to {val} — update this test "
-            "to reflect calibrated value + document in CLAUDE.md"
+def test_threshold_calibrated_values_w3_9():
+    """Lock in the W3.9 (2026-04-29) calibrated values. Drift here is
+    intentional only when accompanied by an `rag eval` run + CLAUDE.md
+    doc update — fail loud otherwise."""
+    expected = {
+        "vault":     0.015,   # baseline (vault-prose calibrated)
+        "whatsapp":  0.008,   # bodies cortos ~143 chars
+        "calendar":  0.008,   # eventos cortos
+        "reminders": 0.008,   # ítems cortos
+        "messages":  0.008,   # iMessage/SMS, mismo patrón que WA
+        "calls":     0.008,   # entries muy cortas
+        "gmail":     0.010,   # threads más largos, scores intermedios
+        "drive":     0.010,   # docs cortos en la fase actual del ingester
+        "contacts":  0.012,   # bodies medianos, signal alto
+        "safari":    0.012,   # title + body de bookmark/history
+    }
+    assert rag.CONFIDENCE_RERANK_MIN_PER_SOURCE == expected, (
+        "Per-source thresholds drifted from W3.9 calibration. "
+        "Run `rag eval` to validate before updating expected dict."
+    )
+    # Vault must NOT regress below the baseline — vault is the dominant
+    # source and a refused vault hit is a false negative we can't tolerate.
+    assert rag.CONFIDENCE_RERANK_MIN_PER_SOURCE["vault"] == rag.CONFIDENCE_RERANK_MIN
+    # Short-body sources must be < baseline (rationale of the calibration).
+    for src in ("whatsapp", "calendar", "reminders", "messages", "calls"):
+        assert rag.CONFIDENCE_RERANK_MIN_PER_SOURCE[src] < rag.CONFIDENCE_RERANK_MIN, (
+            f"{src} should be lower than baseline (short-body)"
         )

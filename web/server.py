@@ -3190,6 +3190,29 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
                     query_val = _row[0]
         except Exception:
             pass  # silent — peor caso queda como antes (query=None)
+
+    # Resolver original_query_id desde la última query de la sesión para
+    # eventos "open". El consumer en rag_implicit_learning/corrective_paths.py
+    # filtra opens por `original_query_id IS NOT NULL` — sin este campo el
+    # 89.7% de los opens del web quedan invisibles al feedback loop implícito
+    # y el reranker LoRA fine-tune gate nunca alcanza los 20 corrective_paths.
+    # Best-effort: si falla o no hay sesión, oqid=None y el evento se graba
+    # igual pero sin el campo (comportamiento previo preservado).
+    oqid: int | None = None
+    if req.event == "open" and req.session:
+        try:
+            with _ragvec_state_conn() as _conn:
+                _row = _conn.execute(
+                    "SELECT id FROM rag_queries WHERE session = ? "
+                    "AND q IS NOT NULL AND q != '' "
+                    "ORDER BY ts DESC LIMIT 1",
+                    (req.session,),
+                ).fetchone()
+                if _row:
+                    oqid = int(_row[0])
+        except Exception:
+            pass  # silent-fail — telemetría nunca rompe el endpoint
+
     try:
         event_payload: dict = {
             "source": req.source,
@@ -3210,6 +3233,8 @@ def submit_behavior(req: BehaviorRequest, request: Request) -> dict:
         # vacío no aporta señal y ensucia el extra_json.
         if paths_list_validated:
             event_payload["paths_json"] = paths_list_validated
+        if oqid is not None:
+            event_payload["original_query_id"] = oqid
         log_behavior_event(event_payload)
     except Exception as exc:
         # Never 500 on I/O failure — degrade gracefully

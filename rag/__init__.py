@@ -3014,23 +3014,27 @@ CONFIDENCE_RERANK_MIN = 0.015
 # global 0.015 was calibrated against vault-only; dialing it down for
 # short-text sources avoids refusing legitimate matches.
 #
-# Status (2026-04-21): all entries set to the global baseline as
-# *scaffolding* — no production cross-source data yet to calibrate against.
-# When `rag eval` + behavior priors accumulate signal from real queries
-# hitting mixed corpora, tune these down (expected: WA 0.008-0.010,
-# Calendar 0.012, Gmail 0.010-0.012, Reminders 0.012). Until then this is
-# a no-op surface that lets us tune without editing code paths.
+# Status (2026-04-29, W3.9): per-source thresholds calibrated empirically.
+# Data point: agenda intent avg top_score=0.115 in 30d (vs semantic 0.324)
+# because bge-reranker-v2-m3 systematically scores short bodies (calendar
+# events, reminders, WA messages ~143 chars) much lower than vault prose.
+# The global 0.015 was calibrated against vault-only and was rejecting 26+
+# legitimate agenda/cross-source queries per 30d as "no encontré esta
+# información". Lowered short-body sources to 0.008 (well below the
+# 0.02-0.10 band where their relevant matches sit) and kept gmail / safari
+# / contacts at 0.010-0.012 (intermediate body length). Vault stays at the
+# baseline 0.015 (no regression intended for the dominant source).
 CONFIDENCE_RERANK_MIN_PER_SOURCE: dict[str, float] = {
-    "vault":     0.015,   # calibrated
-    "contacts":  0.015,   # scaffolding — tune with data
-    "calendar":  0.015,   # scaffolding — tune with data
-    "gmail":     0.015,   # scaffolding — tune with data
-    "reminders": 0.015,   # scaffolding — tune with data
-    "safari":    0.015,   # scaffolding — tune with data
-    "calls":     0.015,   # scaffolding — tune with data
-    "whatsapp":  0.015,   # scaffolding — tune with data
-    "messages":  0.015,   # scaffolding — tune with data
-    "drive":     0.015,   # scaffolding — tune with data
+    "vault":     0.015,   # baseline (vault-prose calibrated)
+    "whatsapp":  0.008,   # bodies ~143 chars, scores 0.02-0.10 normales
+    "calendar":  0.008,   # eventos cortos, mismo problema que WA
+    "reminders": 0.008,   # ítems estructurados pero cortos
+    "messages":  0.008,   # iMessage/SMS, mismo patrón que WA
+    "calls":     0.008,   # entries muy cortas, signal factual
+    "gmail":     0.010,   # threads más largos, scores intermedios
+    "contacts":  0.012,   # bodies medianos, signal alto
+    "safari":    0.012,   # title + body de bookmark/history
+    "drive":     0.010,   # docs cortos en la fase actual del ingester
 }
 
 

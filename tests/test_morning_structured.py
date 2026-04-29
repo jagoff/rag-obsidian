@@ -713,3 +713,262 @@ def test_render_morning_structured_prompt_no_mail_section_when_empty():
     ev = {"mail_unread": []}
     prompt = rag._render_morning_structured_prompt("2026-04-16", ev)
     assert "Mail no leído" not in prompt
+
+
+# ── _is_daemon_generated_path ───────────────────────────────────────────────
+
+
+def test_daemon_path_calendar():
+    assert rag._is_daemon_generated_path("03-Resources/Calendar/2026-W18.md")
+
+
+def test_daemon_path_screentime():
+    assert rag._is_daemon_generated_path("03-Resources/Screentime/2026-04-29.md")
+
+
+def test_daemon_path_github():
+    assert rag._is_daemon_generated_path("03-Resources/GitHub/2026-04-29.md")
+
+
+def test_daemon_path_reminders():
+    assert rag._is_daemon_generated_path("03-Resources/Reminders/active.md")
+
+
+def test_daemon_path_inbox_wa():
+    assert rag._is_daemon_generated_path("00-Inbox/WA-2026-04-25.md")
+
+
+def test_daemon_path_inbox_user_note_not_daemon():
+    # Daily user notes en 00-Inbox/ NO son daemon (el user las edita).
+    assert not rag._is_daemon_generated_path("00-Inbox/2026-04-29.md")
+    assert not rag._is_daemon_generated_path("00-Inbox/Idea Random.md")
+
+
+def test_daemon_path_user_notes_not_daemon():
+    assert not rag._is_daemon_generated_path("01-Projects/RAG-Local/plan.md")
+    assert not rag._is_daemon_generated_path("02-Areas/Personal/Salud/notas.md")
+    assert not rag._is_daemon_generated_path(
+        "03-Resources/Coaching/sesiones.md"
+    )
+
+
+def test_daemon_path_handles_none_and_empty():
+    assert not rag._is_daemon_generated_path("")
+    assert not rag._is_daemon_generated_path(None)  # type: ignore[arg-type]
+
+
+# ── _sanitize_morning_parts ─────────────────────────────────────────────────
+
+
+def test_sanitize_clears_attention_when_no_evidence():
+    parts = {
+        "yesterday": "x", "focus": [], "pending": [],
+        "attention": ["Low-conf query: ¿cumple Astor?", "Contradicción Ghostty"],
+    }
+    ev = {
+        "new_contradictions": [], "low_conf_queries": [],
+        "recent_notes": [{"path": "01-Projects/x.md", "title": "x"}],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["attention"] == []
+
+
+def test_sanitize_keeps_attention_when_low_conf_real():
+    parts = {"yesterday": "", "focus": [], "pending": [],
+             "attention": ["Low-conf query real"]}
+    ev = {
+        "new_contradictions": [],
+        "low_conf_queries": [{"q": "x", "top_score": -0.5}],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["attention"] == ["Low-conf query real"]
+
+
+def test_sanitize_keeps_attention_when_contradiction_real():
+    parts = {"yesterday": "", "focus": [], "pending": [],
+             "attention": ["Contradicción real"]}
+    ev = {
+        "new_contradictions": [{"subject_path": "x", "targets": []}],
+        "low_conf_queries": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["attention"] == ["Contradicción real"]
+
+
+def test_sanitize_clears_pending_when_no_actionable_evidence():
+    parts = {
+        "yesterday": "", "focus": [],
+        "pending": ["Revisar Drive", "Actualizar bookmarks"],
+        "attention": [],
+    }
+    # Drive/bookmarks/vaults/screentime NO califican como pending source
+    ev = {
+        "inbox_pending": [], "todos": [], "mail_unread": [],
+        "gmail": {}, "whatsapp_unread": [], "wa_scheduled_today": [],
+        "recent_notes": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["pending"] == []
+
+
+def test_sanitize_keeps_pending_when_inbox_real():
+    parts = {"yesterday": "", "focus": [], "attention": [],
+             "pending": ["Triar nota nueva"]}
+    ev = {
+        "inbox_pending": [{"path": "00-Inbox/x.md", "title": "x"}],
+        "todos": [], "mail_unread": [], "gmail": {}, "whatsapp_unread": [],
+        "wa_scheduled_today": [], "recent_notes": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["pending"] == ["Triar nota nueva"]
+
+
+def test_sanitize_drops_pending_that_only_mentions_drive_filename():
+    parts = {
+        "yesterday": "", "focus": [], "attention": [],
+        "pending": [
+            "Revisar Sheet: Accesos",
+            "Actualizar Lista de precios Online",
+            "Enviar mensaje real",  # legítimo, no menciona Drive
+        ],
+    }
+    ev = {
+        "inbox_pending": [], "todos": [], "mail_unread": [], "gmail": {},
+        "whatsapp_unread": [], "wa_scheduled_today": [],
+        "recent_notes": [{"path": "x", "title": "x"}],
+        "drive": {
+            "files": [
+                {"name": "Accesos", "mime_label": "Sheet"},
+                {"name": "Lista de precios Online", "mime_label": "Sheet"},
+            ],
+        },
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["pending"] == ["Enviar mensaje real"]
+
+
+def test_sanitize_drops_pending_that_mentions_bookmark_name():
+    parts = {
+        "yesterday": "", "focus": [], "attention": [],
+        "pending": [
+            "Visitar InvertirOnline",  # bookmark
+            "Llamar a Juan",  # legítimo
+        ],
+    }
+    ev = {
+        "inbox_pending": [], "todos": [], "mail_unread": [], "gmail": {},
+        "whatsapp_unread": [], "wa_scheduled_today": [],
+        "recent_notes": [{"path": "x", "title": "x"}],
+        "bookmarks_used": [{"name": "InvertirOnline"}],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["pending"] == ["Llamar a Juan"]
+
+
+def test_sanitize_drops_focus_pointing_to_calendar_weekly():
+    parts = {
+        "yesterday": "", "pending": [], "attention": [],
+        "focus": ["[[2026-W18]] revisar agenda", "[[Plan real]] avanzar"],
+    }
+    ev = {"recent_notes": [], "low_conf_queries": [], "new_contradictions": []}
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["focus"] == ["[[Plan real]] avanzar"]
+
+
+def test_sanitize_drops_focus_pointing_to_dated_files():
+    parts = {
+        "yesterday": "", "pending": [], "attention": [],
+        "focus": [
+            "[[2026-04-29]] hacer X",   # daily — daemon
+            "[[2026-04]] revisar",       # monthly — daemon
+            "[[_index]] mirar",          # index — daemon
+            "[[Plan real]] avanzar",
+        ],
+    }
+    ev = {"recent_notes": [], "low_conf_queries": [], "new_contradictions": []}
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["focus"] == ["[[Plan real]] avanzar"]
+
+
+def test_sanitize_clears_yesterday_when_no_evidence_at_all():
+    parts = {"yesterday": "Hice X ayer", "focus": [], "pending": [],
+             "attention": []}
+    ev = {
+        "recent_notes": [], "calendar_today": [], "reminders_due": [],
+        "gmail": {}, "recent_queries": [], "inbox_pending": [], "todos": [],
+        "low_conf_queries": [], "new_contradictions": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["yesterday"] == ""
+
+
+def test_sanitize_keeps_yesterday_when_recent_notes_exist():
+    parts = {"yesterday": "Edité notas X e Y", "focus": [], "pending": [],
+             "attention": []}
+    ev = {
+        "recent_notes": [{"path": "01-Projects/x.md", "title": "x"}],
+        "calendar_today": [], "reminders_due": [], "gmail": {},
+        "recent_queries": [], "inbox_pending": [], "todos": [],
+        "low_conf_queries": [], "new_contradictions": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["yesterday"] == "Edité notas X e Y"
+
+
+def test_sanitize_does_not_mutate_input():
+    parts = {"yesterday": "", "focus": [], "pending": ["x"], "attention": ["y"]}
+    ev = {"new_contradictions": [], "low_conf_queries": [],
+          "inbox_pending": [], "todos": [], "mail_unread": [],
+          "gmail": {}, "whatsapp_unread": [], "wa_scheduled_today": [],
+          "recent_notes": []}
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert parts["pending"] == ["x"]
+    assert parts["attention"] == ["y"]
+    assert out["pending"] == []
+    assert out["attention"] == []
+
+
+def test_sanitize_handles_non_dict_input():
+    # Defensive — _generate_morning_json returns None on parse fail; we
+    # don't call sanitize then, but if upstream changes we shouldn't crash.
+    assert rag._sanitize_morning_parts(None, {}) is None  # type: ignore[arg-type]
+    assert rag._sanitize_morning_parts("not a dict", {}) == "not a dict"  # type: ignore[arg-type]
+
+
+# ── _render_morning_vaults_section: obsidian:// URI ─────────────────────────
+
+
+def test_vaults_section_renders_obsidian_uri():
+    ev = {
+        "vault_activity": {
+            "home": [
+                {"path": "01-Projects/RAG-Local/plan.md",
+                 "title": "plan", "modified": "2026-04-29T10:00:00",
+                 "snippet": ""},
+            ],
+        },
+    }
+    out = rag._render_morning_vaults_section(ev)
+    assert "obsidian://open?vault=" in out
+    assert "file=01-Projects/RAG-Local/plan" in out
+    # NO debe terminar con .md en el parámetro file
+    assert "file=01-Projects/RAG-Local/plan.md" not in out
+
+
+def test_vaults_section_url_encodes_spaces():
+    ev = {
+        "vault_activity": {
+            "home": [
+                {"path": "03-Resources/Mi Nota Con Espacios.md",
+                 "title": "Mi Nota Con Espacios", "modified": "2026-04-29",
+                 "snippet": ""},
+            ],
+        },
+    }
+    out = rag._render_morning_vaults_section(ev)
+    assert "Mi%20Nota%20Con%20Espacios" in out
+
+
+def test_vaults_section_empty_when_no_activity():
+    assert rag._render_morning_vaults_section({"vault_activity": {}}) == ""
+    assert rag._render_morning_vaults_section({"vault_activity": {"home": []}}) == ""

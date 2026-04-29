@@ -35833,6 +35833,44 @@ def read_cmd(url: str, save: bool, plain: bool):
 MORNING_FOLDER = "04-Archive/99-obsidian-system/99-AI/reviews"
 
 
+# ── Daemon-generated paths ─────────────────────────────────────────────────
+# Subcarpetas escritas por daemons / ingesters automáticos. Estas notas SÍ
+# se indexan (el user puede preguntarle al RAG "qué eventos tengo en W18"),
+# pero NO califican como "actividad del user" para el morning brief: están
+# escritas por procesos que corren todos los días, así que su mtime no
+# representa intención humana.
+#
+# Sin este filtro, el brief muestra `[[2026-04-29]]` (GitHub events daily),
+# `[[2026-W18]]` (Calendar weekly), `[[2026-04-28]]` (Screentime daily),
+# `[[_index]]` (Screentime index), etc. en "🎯 Foco sugerido" y "📝 Vaults",
+# desplazando notas reales que el user editó. Mantenemos `is_excluded()`
+# intacto (los daemons siguen siendo retrievable) y aplicamos esta lista
+# solo en `_collect_morning_evidence` y `_fetch_vault_activity`.
+_DAEMON_GENERATED_PREFIXES = (
+    "03-Resources/Calendar/",
+    "03-Resources/Chrome/",
+    "03-Resources/GitHub/",
+    "03-Resources/Gmail/",
+    "03-Resources/Reminders/",
+    "03-Resources/Screentime/",
+    "03-Resources/WhatsApp/",
+    "03-Resources/YouTube/",
+    "03-Resources/GoogleDrive/",
+    "00-Inbox/WA-",  # 00-Inbox/WA-YYYY-MM-DD.md (whatsapp listener daily)
+)
+
+
+def _is_daemon_generated_path(rel_path: str) -> bool:
+    """True si el path lo escribe un daemon/ingester automático y NO es
+    actividad humana. Usado solo para depurar el morning brief — no afecta
+    indexing ni retrieval. Defensivo ante None / paths absolutos.
+    """
+    if not rel_path:
+        return False
+    rel = rel_path.lstrip("/")
+    return any(rel.startswith(p) for p in _DAEMON_GENERATED_PREFIXES)
+
+
 # ── Apple integrations (Calendar / Reminders / Mail) ─────────────────────────
 # osascript-backed evidence for the morning brief. Silent-fail by design:
 # a timeout, missing app, or denied Automation permission returns []. First
@@ -38668,6 +38706,8 @@ def _fetch_vault_activity(hours: int = 48, n_per_vault: int = 5) -> dict:
                     continue
                 if rel.startswith(f"{MORNING_FOLDER}/"):
                     continue
+                if _is_daemon_generated_path(rel):
+                    continue
                 try:
                     mtime = datetime.fromtimestamp(p.stat().st_mtime)
                 except OSError:
@@ -39510,13 +39550,17 @@ def _collect_morning_evidence(
                 continue
             fm = parse_frontmatter(raw)
             title = p.stem
-            if rel.startswith(f"{_CAPTURE_FOLDER}/"):
+            if rel.startswith(f"{_CAPTURE_FOLDER}/") and not _is_daemon_generated_path(rel):
                 inbox.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
                     "snippet": clean_md(raw)[:160].strip(),
                 })
-            if start <= mtime < now and not rel.startswith(f"{MORNING_FOLDER}/"):
+            if (
+                start <= mtime < now
+                and not rel.startswith(f"{MORNING_FOLDER}/")
+                and not _is_daemon_generated_path(rel)
+            ):
                 recent.append({
                     "path": rel, "title": title,
                     "modified": mtime.isoformat(timespec="seconds"),
@@ -39942,22 +39986,45 @@ def _render_morning_bookmarks_section(ev: dict) -> str:
 def _render_morning_vaults_section(ev: dict) -> str:
     """Deterministic render of 📝 Vaults — per-vault recent activity, never
     mixed. One subsection per registered vault ("home", "work", …) so
-    personal/work stay visibly separated. Returns "" if *all* vaults
-    are empty in the 48h window.
+    personal/work stay visibles separated. Returns "" if *all* vaults are
+    empty in the 48h window.
+
+    El bullet usa `obsidian://open?vault=<dir>&file=<path>` para que un
+    click en macOS/iOS abra la nota directo en Obsidian (markdown links a
+    paths relativos no abren nada). El nombre del vault para la URI viene
+    de la dir-basename del path registrado, no del display-name.
     """
     va = ev.get("vault_activity") or {}
     if not va or not any(v for v in va.values()):
         return ""
+    # Resolver display-name → dir-name (para la URI obsidian://). Si el
+    # registry no devuelve el vault (test mode, registry vacío), caemos a
+    # `VAULT_PATH.name` que es el default sensible.
+    name_to_dir: dict[str, str] = {}
+    try:
+        for name, path in resolve_vault_paths(["all"]):
+            name_to_dir[name] = Path(path).name
+    except Exception:
+        pass
     parts: list[str] = ["## 📝 Vaults (últimas 48h)"]
     for name in sorted(va.keys()):
         items = va.get(name) or []
         if not items:
             continue
         parts.append(f"### {name} ({len(items)})")
+        vault_dir = name_to_dir.get(name) or VAULT_PATH.name
         for n in items[:5]:
             title = (n.get("title") or "").strip() or "(sin título)"
             path = n.get("path") or ""
-            parts.append(f"- [[{title}]] ([{path}]({path}))")
+            # Strip .md and url-encode for the obsidian URI (Obsidian agrega
+            # el .md solo). El display label sigue siendo el path relativo
+            # legible.
+            file_param = path[:-3] if path.endswith(".md") else path
+            uri = (
+                f"obsidian://open?vault={urllib.parse.quote(vault_dir, safe='')}"
+                f"&file={urllib.parse.quote(file_param, safe='/')}"
+            )
+            parts.append(f"- [[{title}]] · [{path}]({uri})")
     return "\n".join(parts)
 
 
@@ -40189,9 +40256,15 @@ def _render_morning_structured_prompt(date_label: str, ev: dict) -> str:
         "- yesterday: 1 oración 15-30 palabras. Si no hay evidencia de ayer → string vacío.",
         "- focus: 2-4 bullets con [[wikilink]] a la nota relevante. Priorizá lo urgente. "
         "Si realmente no hay nada crítico → array vacío.",
-        "- pending: bullets de inbox + todos. Max 5. Vacío si no hay.",
-        "- attention: contradicciones + low-conf queries + gaps. Max 4. Vacío si no hay.",
-        "- NUNCA inventes placeholders como '(nada)' ni repitas la sección Agenda.",
+        "- pending: SOLO bullets que vengan de 00-Inbox sin triar, todos/due en notas, "
+        "mail no leído, WhatsApp no leído o WA programado. NO inventes 'revisar Drive', "
+        "'mirar bookmarks', 'actualizar Vaults' — Drive/Bookmarks/Vaults/Pantalla ya tienen "
+        "su propia sección, no son pendientes per se. Max 5. Vacío si no hay.",
+        "- attention: SOLO contradicciones nuevas + low-conf queries reales del día. "
+        "NO inventes 'gaps' genéricos ni 'falta programar X' si no hay evidencia explícita. "
+        "Max 4. Vacío si no hay.",
+        "- NUNCA inventes placeholders como '(nada)' ni repitas las secciones determinísticas "
+        "(Agenda, Gmail, Drive, Bookmarks, Vaults, Pantalla, Sistema).",
     ])
     return "\n".join(parts)
 
@@ -40228,6 +40301,131 @@ def _yesterday_evening_link(target: datetime, vault: Path) -> str:
         return ""
     title = f"{yesterday.strftime('%Y-%m-%d')}-evening"
     return f"\n\n---\n_ayer cerraste con:_ [[{title}]]"
+
+
+def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
+    """Anti-alucinación post-LLM: descarta bullets que no tienen sustento en
+    la evidencia real. El LLM tiende a inventar contradicciones, low-conf
+    queries y "gaps" aun cuando se le dice explícitamente "vacío si no hay" —
+    este filtro aplica esa regla en código.
+
+    Reglas:
+      - `attention` se vacía si no hay contradicciones nuevas NI low-conf
+        queries. (Si el LLM solo detectó "gaps" generic-de-cualquier-cosa
+        y no hay evidencia dura, no vale la pena imprimirlo.)
+      - `pending` se vacía si no hay inbox-pending NI todos NI mail unread
+        NI WA unread NI WA scheduled today NI recent_notes (post-filtro).
+      - `focus` filtra wikilinks que apuntan a paths daemon-generated. Si
+        después del filtro queda 0, se vacía.
+      - `yesterday` se vacía si no hay recent_notes Y no hay evidencia
+        cruzada (calendar/reminders/gmail/recent_queries). Sin material,
+        el LLM no puede más que inventar.
+
+    No muta el dict de input. Devuelve uno nuevo con las mismas claves.
+    """
+    if not isinstance(parts, dict):
+        return parts
+    out = dict(parts)
+
+    has_contrad = bool(ev.get("new_contradictions"))
+    has_low_conf = bool(ev.get("low_conf_queries"))
+    if not has_contrad and not has_low_conf:
+        out["attention"] = []
+
+    has_inbox = bool(ev.get("inbox_pending"))
+    has_todos = bool(ev.get("todos"))
+    has_mail = bool(ev.get("mail_unread"))
+    gm = ev.get("gmail") or {}
+    has_gmail = bool(
+        gm.get("awaiting_reply") or gm.get("starred") or gm.get("unread_count")
+    )
+    has_wa_unread = bool(ev.get("whatsapp_unread"))
+    has_wa_sched = bool(ev.get("wa_scheduled_today"))
+    has_recent = bool(ev.get("recent_notes"))
+    if not (
+        has_inbox or has_todos or has_mail or has_gmail
+        or has_wa_unread or has_wa_sched or has_recent
+    ):
+        out["pending"] = []
+    else:
+        # Bullet-level filter — el LLM tiende a re-imprimir Drive/Bookmarks
+        # como "pendientes" aun cuando se le dice explícitamente que no.
+        # Si un bullet solo menciona el nombre de un archivo Drive o el
+        # nombre de un bookmark (y nada más), lo descartamos: esa info ya
+        # está en su sección determinística.
+        pending = parts.get("pending") or []
+        if isinstance(pending, list) and pending:
+            drive_names = {
+                _normalize_task_text(f.get("name") or "")
+                for f in (ev.get("drive") or {}).get("files") or []
+                if (f.get("name") or "").strip()
+            }
+            bookmark_names = {
+                _normalize_task_text(b.get("name") or "")
+                for b in ev.get("bookmarks_used") or []
+                if (b.get("name") or "").strip()
+            }
+            noise_keywords = drive_names | bookmark_names
+            cleaned: list[str] = []
+            for b in pending:
+                if not isinstance(b, str) or not b.strip():
+                    continue
+                btxt = _normalize_task_text(b)
+                # Drop si el bullet contiene un nombre Drive/Bookmark.
+                # Threshold: el nombre tiene que tener ≥3 chars para que
+                # cuente (evita falsos positivos con palabras genéricas).
+                if any(
+                    name and len(name) >= 3 and name in btxt
+                    for name in noise_keywords
+                ):
+                    continue
+                cleaned.append(b)
+            out["pending"] = cleaned
+
+    focus = parts.get("focus") or []
+    if isinstance(focus, list) and focus:
+        wl_re = re.compile(r"\[\[([^\]|#]+)")
+        # Map title → known real path from filtered evidence (recent_notes
+        # already excludes daemon paths). If a [[wikilink]] in focus matches
+        # a daemon-generated title we know about, drop the bullet.
+        daemon_titles: set[str] = set()
+        for r in ev.get("recent_notes_unfiltered") or []:
+            if _is_daemon_generated_path(r.get("path", "")):
+                t = (r.get("title") or "").strip()
+                if t:
+                    daemon_titles.add(t)
+        cleaned: list[str] = []
+        for b in focus:
+            if not isinstance(b, str):
+                continue
+            m = wl_re.search(b)
+            if m:
+                title = m.group(1).strip()
+                # Drop YYYY-MM-DD, YYYY-WNN, YYYY-MM, _index — patterns that
+                # are *always* daemon-generated regardless of where they live.
+                if (
+                    re.match(r"^\d{4}-\d{2}-\d{2}$", title)
+                    or re.match(r"^\d{4}-W\d{1,2}$", title)
+                    or re.match(r"^\d{4}-\d{2}$", title)
+                    or title == "_index"
+                    or title in daemon_titles
+                ):
+                    continue
+            cleaned.append(b)
+        out["focus"] = cleaned
+
+    yesterday = (parts.get("yesterday") or "").strip()
+    if yesterday:
+        has_calendar = bool(ev.get("calendar_today"))
+        has_reminders = bool(ev.get("reminders_due"))
+        has_recent_q = bool(ev.get("recent_queries"))
+        if not (
+            has_recent or has_calendar or has_reminders or has_gmail
+            or has_recent_q or has_inbox or has_todos
+        ):
+            out["yesterday"] = ""
+
+    return out
 
 
 def _assemble_morning_brief(
@@ -40367,6 +40565,7 @@ def morning(dry_run: bool, date_opt: str | None, lookback_hours: int):
         parts = _generate_morning_json(structured_prompt)
     continuity = _yesterday_evening_link(target, VAULT_PATH)
     if parts is not None:
+        parts = _sanitize_morning_parts(parts, ev)
         brief_body = _assemble_morning_brief(
             date_label, agenda_md, parts, continuity,
             system_md=system_md, gmail_md=gmail_md, drive_md=drive_md,

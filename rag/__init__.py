@@ -7031,7 +7031,17 @@ def _ensure_telemetry_tables(conn) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rag_schema_version'"
         ).fetchone())
         try:
-            conn.execute("BEGIN")
+            # BEGIN IMMEDIATE adquiere el reserved lock al entrar a la
+            # transacción, no al primer write. Antes era `BEGIN` (DEFERRED) y
+            # entre el BEGIN y el INSERT OR IGNORE de abajo, otro proceso (web
+            # server, otro daemon launchd) podía tomar el WAL lock — el
+            # `executemany` levantaba `database is locked` aunque tengamos
+            # busy_timeout=60s, porque el conflicto explota DENTRO de la txn,
+            # no al adquirir el lock al principio. Aprendido 2026-04-29 — el
+            # daemon `reminder-wa-push` cascadeó 12 errores en ráfaga durante
+            # un push de mass-fix del audit. Con IMMEDIATE el busy_timeout
+            # cubre la espera del reserved lock al entrar.
+            conn.execute("BEGIN IMMEDIATE")
             for _table_name, stmts in _TELEMETRY_DDL:
                 for stmt in stmts:
                     conn.execute(stmt)

@@ -25,6 +25,7 @@ hay), warm < 5ms. El endpoint le pone TTL de 60s encima.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections import Counter, defaultdict
@@ -36,6 +37,42 @@ from pathlib import Path
 # tick del scheduler invalida automáticamente.
 _DASHBOARD_CACHE: dict = {"key": None, "payload": None}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
+
+
+# ── Junk entity filter ────────────────────────────────────────────────────────
+# GLiNER (el extractor que puebla rag_entities) a veces clasifica como
+# `person` strings que en realidad son números de teléfono internacionales
+# o IDs puramente numéricos del WhatsApp bridge (ej. `5493424303891`,
+# `34084894028025`). En la lista del atlas eso es ruido — bajan al user
+# entidades reales del top y desordenan los rankings de hot/stale.
+#
+# Heurística: descartar nombres sin al menos UNA letra unicode. Cubre
+# números puros, números con separadores (`+54 9 342 ...`), strings vacías,
+# y strings de solo símbolos. Mantenemos legítimos como "5to grado",
+# "C3PO", "Av. 9 de Julio" porque tienen al menos una letra.
+#
+# Aplicado tanto al query SELECT (con buffer 3x para no quedar por debajo
+# del top_per_type post-filter) como a hot/stale (que iteran sobre `full`
+# que ya viene filtrado).
+_HAS_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def _is_junk_entity_name(name: str | None) -> bool:
+    """True si el nombre es ruido del extractor (número, ID, solo símbolos).
+
+    Usado para filtrar entidades GLiNER que no deberían aparecer en el
+    top de personas/lugares/orgs/eventos del atlas. Mantiene cualquier
+    string que contenga al menos una letra (incluye unicode — para que
+    "Á", "Ñ", "ç" no se descarten).
+    """
+    if not name:
+        return True
+    s = str(name).strip()
+    if len(s) < 2:  # "yo" pasa, "x" no
+        return True
+    if not _HAS_LETTER_RE.search(s):
+        return True
+    return False
 
 
 def _utc_now() -> datetime:
@@ -94,6 +131,10 @@ def _query_entities_by_type(
     prev_window_start_ts = now.timestamp() - 2 * window_days * 86400
 
     for entity_type in types:
+        # Buffer 3x: el filter de junk (`_is_junk_entity_name`) descarta
+        # ~10% de los hits en el top de `person` (números de teléfono
+        # del WA bridge). Pedimos 3x para que post-filter SIEMPRE alcance
+        # `top_per_type` salvo en vaults pequeñísimos.
         rows = conn.execute(
             """
             SELECT id, canonical_name, entity_type, mention_count,
@@ -103,11 +144,17 @@ def _query_entities_by_type(
              ORDER BY mention_count DESC
              LIMIT ?
             """,
-            (entity_type, top_per_type),
+            (entity_type, top_per_type * 3),
         ).fetchall()
 
+        kept = 0
         for row in rows:
+            if kept >= top_per_type:
+                break
             ent_id, name, etype, mc, first_ts, last_ts, aliases_json = row
+            if _is_junk_entity_name(name):
+                continue
+            kept += 1
             aliases: list[str] = []
             if aliases_json:
                 try:
@@ -424,6 +471,232 @@ def _build_graph(meta_table: str, ragvec_db: Path, top_notes: int) -> dict:
         "total_notes": len(notes),
         "total_edges": len(edges),
     }
+
+
+# ── note_detail (side-panel del frontend al click en un nodo del grafo) ─────
+
+
+def note_detail(
+    *,
+    path: str,
+    vault_path: Path | None = None,
+    preview_chars: int = 600,
+    max_entities: int = 20,
+    max_neighbors: int = 30,
+) -> dict:
+    """Devuelve datos detallados de UNA nota para el side-panel del atlas.
+
+    Shape:
+        { meta, preview, entities, neighbors, vault_uri }
+
+    - `preview`: primeros ~600 chars del cuerpo (sin frontmatter).
+    - `entities`: top entidades mencionadas en chunks de esta nota.
+    - `neighbors`: notas conectadas 1-hop (in + out wikilinks).
+    - `vault_uri`: deep link `obsidian://open?vault=<name>&file=<path>`
+      para abrir la nota en Obsidian con un click.
+
+    Fail-safe: cualquier error → payload vacío con `error` poblado, sin
+    excepciones para evitar 500s en el frontend.
+    """
+    now = _utc_now()
+    out: dict = {
+        "meta": {
+            "generated_at": now.isoformat(timespec="seconds"),
+            "path": path,
+        },
+        "preview": "",
+        "entities": [],
+        "neighbors": [],
+        "vault_uri": None,
+        "error": None,
+    }
+
+    if not path or ".." in path or path.startswith("/"):
+        out["error"] = "invalid_path"
+        return out
+
+    try:
+        from rag import (  # type: ignore
+            DB_PATH,
+            VAULT_PATH,
+            _TELEMETRY_DB_FILENAME,
+            get_db,
+            get_db_for,
+        )
+    except Exception as e:
+        out["error"] = f"rag_import_failed:{e}"
+        return out
+
+    if vault_path is None:
+        vault_path = VAULT_PATH
+    note_full = Path(vault_path) / path
+
+    # 1) Preview del cuerpo (skip frontmatter YAML).
+    try:
+        if note_full.exists() and note_full.is_file():
+            text = note_full.read_text(encoding="utf-8", errors="replace")
+            # Skip YAML frontmatter si está al inicio.
+            if text.startswith("---"):
+                end = text.find("---", 3)
+                if end >= 0:
+                    text = text[end + 3:].lstrip()
+            out["preview"] = text[:preview_chars]
+            if len(text) > preview_chars:
+                out["preview"] += "…"
+    except OSError as e:
+        out["preview"] = f"(no se pudo leer la nota: {e})"
+
+    # 2) Vault URI — el name del vault es el último segmento del path.
+    try:
+        vault_name = Path(vault_path).name
+        # URL-encode mínimo: solo lo crítico que rompe el URI scheme.
+        from urllib.parse import quote
+        out["vault_uri"] = (
+            f"obsidian://open?vault={quote(vault_name, safe='')}"
+            f"&file={quote(path, safe='')}"
+        )
+    except Exception:
+        pass
+
+    # 3) Entities mencionadas en chunks de esta nota.
+    telemetry_db = Path(DB_PATH) / _TELEMETRY_DB_FILENAME
+    if telemetry_db.exists():
+        try:
+            tconn = sqlite3.connect(
+                f"file:{telemetry_db}?mode=ro", uri=True, timeout=30.0
+            )
+            try:
+                # En el schema actual, `m.source` es el bucket cross-source
+                # (`vault`, `gmail`, `calendar`, etc.), NO el path. El path
+                # vive en `chunk_id` con formato `<path>::<chunk_idx>`.
+                # Filtramos con `chunk_id LIKE 'path::%'` para traer solo
+                # las menciones que viven en chunks de ESTA nota específica.
+                rows = tconn.execute(
+                    """
+                    SELECT e.id, e.canonical_name, e.entity_type, e.mention_count,
+                           COUNT(*) AS chunks_in_note
+                      FROM rag_entity_mentions m
+                      JOIN rag_entities e ON e.id = m.entity_id
+                     WHERE m.chunk_id LIKE ?
+                  GROUP BY e.id
+                  ORDER BY chunks_in_note DESC, e.mention_count DESC
+                     LIMIT ?
+                    """,
+                    (f"{path}::%", max_entities),
+                ).fetchall()
+                for r in rows:
+                    if _is_junk_entity_name(r[1]):
+                        continue
+                    out["entities"].append({
+                        "id": r[0],
+                        "name": r[1],
+                        "type": r[2],
+                        "mention_count": int(r[3] or 0),
+                        "chunks_in_note": int(r[4] or 0),
+                    })
+            finally:
+                tconn.close()
+        except sqlite3.OperationalError as e:
+            out["error"] = f"entities_query_failed:{e}"
+
+    # 4) Vecinos 1-hop (in + out wikilinks). Reusamos el mismo path que
+    # `_build_graph` pero filtrado al `path` solicitado, así no inflamos
+    # el payload con todo el grafo.
+    try:
+        col = get_db_for(vault_path) if vault_path else get_db()
+        meta_table = col._meta  # type: ignore[attr-defined]
+        ragvec_db = Path(DB_PATH) / "ragvec.db"
+        rconn = sqlite3.connect(
+            f"file:{ragvec_db}?mode=ro", uri=True, timeout=30.0
+        )
+        try:
+            # Out: outlinks de esta nota.
+            out_rows = rconn.execute(
+                f"""
+                SELECT GROUP_CONCAT(outlinks, ',') AS all_outlinks,
+                       MAX(folder) AS folder,
+                       MAX(title) AS title
+                  FROM {meta_table}
+                 WHERE file = ?
+                """,
+                (path,),
+            ).fetchone()
+            outlinks_csv = (out_rows[0] if out_rows else "") or ""
+            out_targets = {tok.strip() for tok in outlinks_csv.split(",") if tok.strip()}
+
+            # In: notas que mencionan a esta en su outlinks.
+            # Match por path exacto Y por basename (sin .md) para cubrir
+            # ambas formas que produce `_resolve_wikilinks_to_paths`.
+            note_basename = Path(path).stem
+            in_rows = rconn.execute(
+                f"""
+                SELECT DISTINCT file, MAX(folder) AS folder, MAX(title) AS title
+                  FROM {meta_table}
+                 WHERE file != ?
+                   AND outlinks IS NOT NULL AND outlinks != ''
+                   AND (outlinks LIKE ? OR outlinks LIKE ? OR outlinks LIKE ?)
+              GROUP BY file
+                 LIMIT ?
+                """,
+                (
+                    path,
+                    f"%{path}%",
+                    f"%{note_basename}.md%",
+                    f"%{note_basename}%",
+                    max_neighbors * 2,  # buffer porque LIKE puede traer false positives
+                ),
+            ).fetchall()
+
+            seen = set()
+            # Out neighbors first (notas que esta nota linkea).
+            for tgt in list(out_targets)[:max_neighbors]:
+                if tgt in seen:
+                    continue
+                seen.add(tgt)
+                # Resolve target a path real si es solo un title.
+                resolved = tgt if tgt.endswith(".md") else None
+                row = rconn.execute(
+                    f"SELECT MAX(folder), MAX(title) FROM {meta_table} WHERE file = ? OR file LIKE ? LIMIT 1",
+                    (resolved or "", f"%{tgt}%"),
+                ).fetchone()
+                folder = (row[0] if row else "") or ""
+                title = (row[1] if row else None) or Path(tgt).stem
+                out["neighbors"].append({
+                    "path": resolved or tgt,
+                    "label": title,
+                    "folder": folder,
+                    "direction": "out",
+                })
+
+            # In neighbors (notas que linkean a esta).
+            for r in in_rows:
+                if len(out["neighbors"]) >= max_neighbors:
+                    break
+                file_p, folder, title = r
+                if file_p in seen:
+                    continue
+                seen.add(file_p)
+                out["neighbors"].append({
+                    "path": file_p,
+                    "label": title or Path(file_p).stem,
+                    "folder": folder or "",
+                    "direction": "in",
+                })
+
+            # Si no encontramos ni meta del file, igual seteamos label
+            if out_rows and out_rows[2]:
+                out["meta"]["title"] = out_rows[2]
+                out["meta"]["folder"] = out_rows[1] or ""
+        finally:
+            rconn.close()
+    except sqlite3.OperationalError as e:
+        if not out["error"]:
+            out["error"] = f"neighbors_query_failed:{e}"
+    except Exception as e:
+        if not out["error"]:
+            out["error"] = f"neighbors_unexpected:{e}"
+
+    return out
 
 
 # ── snapshot ────────────────────────────────────────────────────────────────

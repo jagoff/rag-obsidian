@@ -37,7 +37,21 @@ const state = {
   showLabels: true,
   selectedNode: null,
   sparkCharts: new Map(),  // entity_id → Chart.js instance
+  // Filter state — cuando el user hace click en una entidad del top-list,
+  // dimmamos los nodos del grafo cuyo path NO contiene esa entidad. Implica
+  // un fetch al endpoint /api/atlas/note por nota, pero como ya tenemos las
+  // entities por nota en el backend, lo más eficiente es hacer una consulta
+  // server-side. Por simplicidad acá lo manejamos con búsqueda fuzzy en el
+  // label (proxy razonable cuando el name de la entity matches el name
+  // de la nota — ej. "Maria" matches "Info - Maria").
+  entityFilter: null,  // { id, name, type } | null
+  searchQuery: "",     // string
 };
+
+// Detectar mobile para cap del graph_top_notes (perf en iPhone con 250+ nodos
+// + force-sim es brutal). 720px es el breakpoint del rest del proyecto.
+const IS_MOBILE = window.matchMedia("(max-width: 720px)").matches;
+const GRAPH_TOP_NOTES = IS_MOBILE ? 150 : 250;
 
 // ── Theme toggle (mismo patrón que dashboard/finance) ────────────────────
 function applyTheme() {
@@ -88,7 +102,7 @@ document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 async function fetchAndRender() {
   setStatus("Cargando atlas…");
   try {
-    const r = await fetch(`/api/atlas?window_days=${state.windowDays}&top_entities=50&graph_top_notes=250`);
+    const r = await fetch(`/api/atlas?window_days=${state.windowDays}&top_entities=50&graph_top_notes=${GRAPH_TOP_NOTES}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const payload = await r.json();
     state.payload = payload;
@@ -168,13 +182,22 @@ function renderEntities(byType) {
       const li = document.createElement("li");
       li.className = "ent-row";
       li.dataset.entityId = String(e.id);
+      li.dataset.entityName = e.name;
       li.dataset.type = type;
-      li.title = `${e.name} — ${TYPE_LABELS[type]} · ${e.mention_count} menciones totales · ${e.recent_mentions} en últimos ${state.windowDays}d${e.aliases?.length ? ` · alias: ${e.aliases.join(", ")}` : ""}`;
+      li.title = `${e.name} — ${TYPE_LABELS[type]} · ${e.mention_count} menciones totales · ${e.recent_mentions} en últimos ${state.windowDays}d${e.aliases?.length ? ` · alias: ${e.aliases.join(", ")}` : ""}\n\nClick para filtrar el grafo a notas que la mencionan.`;
       li.innerHTML = `
         <span class="ent-name">${escapeHtml(e.name)}</span>
         <canvas class="ent-spark" id="spark-${e.id}"></canvas>
         <span class="ent-count">${formatCount(e.mention_count)}</span>
       `;
+      li.addEventListener("click", () => {
+        // Toggle: click en la misma entity 2 veces limpia el filtro
+        if (state.entityFilter && state.entityFilter.id === e.id) {
+          clearEntityFilter();
+        } else {
+          applyEntityFilter({ id: e.id, name: e.name, type });
+        }
+      });
       ul.appendChild(li);
       // Sparkline inline.
       const ctx = li.querySelector("canvas");
@@ -378,6 +401,16 @@ function renderGraph(graph) {
   // ─ Click en background = clear selection ────────────────
   svg.on("click", () => clearSelection());
 
+  // Guardamos refs a las selecciones para que las funciones de filter
+  // (search, entity-filter) puedan re-aplicar clases sin re-render.
+  state.graphLinks = links;
+  state.graphNodes = nodes;
+  state.nodeSel = nodeSel;
+  state.linkSel = linkSel;
+  state.labelSel = labelSel;
+  state.zoom = zoom;
+  state.svg = svg;
+
   // ─ Tick handler ─────────────────────────────────────────
   sim.on("tick", () => {
     linkSel
@@ -447,12 +480,222 @@ function renderGraph(graph) {
     });
     labelSel.classed("hidden", (n) => !neighborIds.has(n.id));
     labelSel.classed("hl", (n) => n.id === d.id);
+    // Side-panel con detalle de la nota.
+    openSidePanel(d);
   }
   function clearSelection() {
     state.selectedNode = null;
     nodeSel.classed("dim", false);
     linkSel.classed("dim", false).classed("hl", false);
     labelSel.classed("hidden", false).classed("hl", false);
+    closeSidePanel();
+    // Re-aplicar entity filter si está activo (clearSelection no debe
+    // limpiar el filter, son cosas independientes).
+    if (state.entityFilter) applyEntityFilter(state.entityFilter);
+  }
+}
+
+// ── Side-panel: detalle de una nota seleccionada ────────────────────────
+async function openSidePanel(node) {
+  const panel = document.getElementById("graph-panel");
+  const inner = document.getElementById("gp-inner");
+  if (!panel || !inner) return;
+  panel.classList.add("open");
+  inner.innerHTML = `
+    <button class="gp-close" id="gp-close" type="button" aria-label="Cerrar panel">×</button>
+    <div class="gp-title">${escapeHtml(node.label || "(sin título)")}</div>
+    <div class="gp-folder">${escapeHtml(node.folder || "—")}</div>
+    <div class="gp-loading">Cargando detalle…</div>
+  `;
+  document.getElementById("gp-close").addEventListener("click", () => {
+    if (state.nodeSel) state.nodeSel.classed("dim", false);
+    if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
+    if (state.labelSel) state.labelSel.classed("hidden", false).classed("hl", false);
+    state.selectedNode = null;
+    closeSidePanel();
+  });
+
+  // Fetch detalle.
+  let detail;
+  try {
+    const r = await fetch(`/api/atlas/note?path=${encodeURIComponent(node.id)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    detail = await r.json();
+  } catch (e) {
+    inner.querySelector(".gp-loading").textContent = "Error al cargar detalle: " + e.message;
+    return;
+  }
+
+  // Render del panel completo.
+  const obsLink = detail.vault_uri
+    ? `<a class="gp-action" href="${escapeHtml(detail.vault_uri)}" title="Abrir en Obsidian">📓 abrir en Obsidian</a>`
+    : "";
+
+  const previewBlock = detail.preview
+    ? `<div class="gp-section">
+         <h4>Preview</h4>
+         <div class="gp-preview">${escapeHtml(detail.preview)}</div>
+       </div>` : "";
+
+  const entitiesBlock = detail.entities?.length
+    ? `<div class="gp-section">
+         <h4>Entidades mencionadas (${detail.entities.length})</h4>
+         <ul class="gp-list">
+           ${detail.entities.slice(0, 12).map((e) => `
+             <li class="gp-list-row" data-entity-id="${e.id}" data-entity-name="${escapeHtml(e.name)}" data-entity-type="${e.type}" title="${e.mention_count} menciones totales — click para filtrar el grafo">
+               <span class="ent-pill" style="background:${TYPE_COLORS[e.type] || "var(--text-faint)"}">${(TYPE_LABELS[e.type] || e.type).slice(0, 3)}</span>
+               <span style="flex:1; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(e.name)}</span>
+               <span style="color:var(--text-faint); font-size:10px;">${e.chunks_in_note}×</span>
+             </li>
+           `).join("")}
+         </ul>
+       </div>` : "";
+
+  const neighborsBlock = detail.neighbors?.length
+    ? `<div class="gp-section">
+         <h4>Vecinos 1-hop (${detail.neighbors.length})</h4>
+         <ul class="gp-list">
+           ${detail.neighbors.slice(0, 15).map((n) => `
+             <li class="gp-list-row" data-neighbor-path="${escapeHtml(n.path)}" title="${escapeHtml(n.path)}">
+               <span class="gp-neighbor-arrow">${n.direction === "out" ? "→" : "←"}</span>
+               <span style="flex:1; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(n.label)}</span>
+             </li>
+           `).join("")}
+         </ul>
+       </div>` : "";
+
+  inner.innerHTML = `
+    <button class="gp-close" id="gp-close" type="button" aria-label="Cerrar panel">×</button>
+    <div class="gp-title">${escapeHtml(node.label || "(sin título)")}</div>
+    <div class="gp-folder">${escapeHtml(node.folder || "—")} · ${node.degree} conexión${node.degree === 1 ? "" : "es"} · ${node.n_chunks} chunk${node.n_chunks === 1 ? "" : "s"}</div>
+    <div class="gp-actions">${obsLink}</div>
+    ${previewBlock}
+    ${entitiesBlock}
+    ${neighborsBlock}
+  `;
+
+  document.getElementById("gp-close").addEventListener("click", () => {
+    if (state.nodeSel) state.nodeSel.classed("dim", false);
+    if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
+    if (state.labelSel) state.labelSel.classed("hidden", false).classed("hl", false);
+    state.selectedNode = null;
+    closeSidePanel();
+  });
+
+  // Click en entidad del panel → filter del grafo.
+  inner.querySelectorAll(".gp-list-row[data-entity-id]").forEach((row) => {
+    row.addEventListener("click", () => {
+      const entId = parseInt(row.dataset.entityId, 10);
+      const entName = row.dataset.entityName;
+      const entType = row.dataset.entityType;
+      applyEntityFilter({ id: entId, name: entName, type: entType });
+    });
+  });
+
+  // Click en vecino → selecciono el vecino (si está en el grafo visible).
+  inner.querySelectorAll(".gp-list-row[data-neighbor-path]").forEach((row) => {
+    row.addEventListener("click", () => {
+      const path = row.dataset.neighborPath;
+      if (!state.graphNodes) return;
+      const target = state.graphNodes.find((n) => n.id === path);
+      if (target && state.nodeSel) {
+        // Trigger del mismo handler que un click en el SVG.
+        state.nodeSel.filter((n) => n.id === path).dispatch("click");
+      }
+    });
+  });
+}
+
+function closeSidePanel() {
+  const panel = document.getElementById("graph-panel");
+  if (panel) panel.classList.remove("open");
+}
+
+// ── Entity filter — click en una entity dimmea las notas que NO la mencionan ──
+function applyEntityFilter(entity) {
+  state.entityFilter = entity;
+  // Heurística sin hit al backend: si el label de la nota INCLUYE el name
+  // de la entity (case-insensitive), la consideramos match. Cubre los casos
+  // típicos del vault del user (`Info - Maria` matches `Maria`,
+  // `Moka - 1 a 1` matches `Moka`, etc.). Para el caso general donde el name
+  // de la entity NO está en el label, igual el visual feedback es útil
+  // (muestra qué notas TIENEN la entity en el título).
+  const needle = entity.name.toLowerCase();
+  if (!state.nodeSel || !state.linkSel) return;
+  const matchIds = new Set();
+  state.graphNodes.forEach((n) => {
+    if ((n.label || "").toLowerCase().includes(needle)) matchIds.add(n.id);
+  });
+  state.nodeSel.classed("dim", (n) => !matchIds.has(n.id));
+  state.linkSel.classed("dim", (l) => {
+    const sId = (typeof l.source === "object") ? l.source.id : l.source;
+    const tId = (typeof l.target === "object") ? l.target.id : l.target;
+    return !matchIds.has(sId) && !matchIds.has(tId);
+  });
+  state.linkSel.classed("hl", false);
+  state.labelSel.classed("hidden", (n) => !matchIds.has(n.id));
+  // Banner explicativo.
+  const banner = document.getElementById("graph-filter-banner");
+  if (banner) {
+    banner.hidden = false;
+    banner.innerHTML = `Filtro: <strong>${escapeHtml(entity.name)}</strong> (${TYPE_LABELS[entity.type] || entity.type}) · ${matchIds.size} nota${matchIds.size === 1 ? "" : "s"} — click la entity de nuevo para limpiar`;
+  }
+  // Marcar la entity activa visualmente en la lista.
+  document.querySelectorAll(".ent-row").forEach((row) => {
+    row.classList.toggle("active", parseInt(row.dataset.entityId, 10) === entity.id);
+  });
+  // Mostrar el botón × del filter.
+  const clearBtn = document.getElementById("graph-clear-filter");
+  if (clearBtn) clearBtn.hidden = false;
+}
+
+function clearEntityFilter() {
+  state.entityFilter = null;
+  if (state.nodeSel) state.nodeSel.classed("dim", false);
+  if (state.linkSel) state.linkSel.classed("dim", false).classed("hl", false);
+  if (state.labelSel) state.labelSel.classed("hidden", false);
+  document.querySelectorAll(".ent-row").forEach((row) => row.classList.remove("active"));
+  const banner = document.getElementById("graph-filter-banner");
+  if (banner) banner.hidden = true;
+  const clearBtn = document.getElementById("graph-clear-filter");
+  if (clearBtn) clearBtn.hidden = true;
+  // Re-aplicar selección de nodo si hay una activa.
+  if (state.selectedNode && state.nodeSel) {
+    state.nodeSel.filter((n) => n.id === state.selectedNode.id).dispatch("click");
+  }
+}
+
+// ── Buscador del grafo — input en el header del card ────────────────────
+function applySearch(query) {
+  state.searchQuery = (query || "").trim().toLowerCase();
+  if (!state.nodeSel || !state.labelSel) return;
+  if (!state.searchQuery) {
+    state.nodeSel.classed("search-hit", false);
+    return;
+  }
+  // Match: substring del label (case-insensitive). Sirve también para folders
+  // (ej. buscar "01-Projects" highlightea todas las notas en proyectos).
+  const matchIds = new Set();
+  state.graphNodes.forEach((n) => {
+    const hay = ((n.label || "") + " " + (n.folder || "")).toLowerCase();
+    if (hay.includes(state.searchQuery)) matchIds.add(n.id);
+  });
+  state.nodeSel.classed("search-hit", (n) => matchIds.has(n.id));
+  // Forzar labels visibles para los hits.
+  state.labelSel.classed("hidden", (n) => !matchIds.has(n.id));
+  // Centrar el zoom en el primer hit (si hay).
+  if (matchIds.size > 0 && matchIds.size <= 5 && state.zoom && state.svg) {
+    const firstHit = state.graphNodes.find((n) => matchIds.has(n.id));
+    if (firstHit && firstHit.x != null) {
+      const rect = document.getElementById("graph-main").getBoundingClientRect();
+      const scale = 1.6;
+      const tx = rect.width / 2 - firstHit.x * scale;
+      const ty = rect.height / 2 - firstHit.y * scale;
+      state.svg.transition().duration(420).call(
+        state.zoom.transform,
+        d3.zoomIdentity.translate(tx, ty).scale(scale)
+      );
+    }
   }
 }
 
@@ -551,5 +794,35 @@ window.addEventListener("DOMContentLoaded", () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => repaintGraphColors(), 220);
   });
+
+  // Buscador del grafo — debounced 120ms para no recalcular mientras escribís.
+  const searchInput = document.getElementById("graph-search");
+  if (searchInput) {
+    let searchTimer = null;
+    searchInput.addEventListener("input", (e) => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => applySearch(e.target.value), 120);
+    });
+  }
+
+  // Botón × para limpiar el entity filter.
+  const clearBtn = document.getElementById("graph-clear-filter");
+  if (clearBtn) clearBtn.addEventListener("click", () => clearEntityFilter());
+
+  // Esc cierra el side-panel.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (state.searchQuery) {
+        if (searchInput) searchInput.value = "";
+        applySearch("");
+      } else if (state.entityFilter) {
+        clearEntityFilter();
+      } else if (state.selectedNode) {
+        // Trigger clearSelection via background-svg click handler.
+        if (state.svg) state.svg.dispatch("click");
+      }
+    }
+  });
+
   fetchAndRender();
 });

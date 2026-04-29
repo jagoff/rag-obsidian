@@ -12675,6 +12675,20 @@ def atlas_api(window_days: int = 30, top_entities: int = 50, graph_top_notes: in
     return payload
 
 
+@app.get("/api/atlas/note")
+def atlas_note_api(path: str) -> dict:
+    """Detalle de UNA nota — preview, entidades mencionadas, vecinos 1-hop +
+    `obsidian://` deep link. Lo consume el side-panel del frontend cuando
+    el user hace click en un nodo del grafo. Sin cache (es cheap, ~50ms).
+
+    `path` se valida en `note_detail` (rechaza `..` y abs paths).
+    """
+    if not path or len(path) > 500:
+        return {"error": "invalid_path", "preview": "", "entities": [], "neighbors": []}
+    from web.atlas_dashboard import note_detail
+    return note_detail(path=path)
+
+
 # ── /transcripts — dashboard de telemetría del whisper learning loop ─────────
 # Phase 2 Step 3.b. Página HTML server-rendered (no SPA) con stats agregadas
 # de las transcripciones de audio, correcciones acumuladas, y top vocab terms

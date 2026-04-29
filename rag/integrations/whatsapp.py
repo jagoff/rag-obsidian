@@ -64,6 +64,7 @@ call re-resolves the attribute on the `rag` module).
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,7 +101,33 @@ def _ambient_whatsapp_send(jid: str, text: str) -> bool:
     `{recipient: <jid>, message: <text>}`. El listener del bot RAG
     filtra mensajes que arrancan con U+200B (anti-loop) — se prefixa
     acá para evitar que nuestro propio output se procese como query.
+
+    ── DRAFT MODE (testing flag, 2026-04-28) ────────────────────────────
+    Cuando ``RAG_DRAFT_VIA_RAGNET`` está prendida (``1``/``true``/``yes``),
+    TODOS los ambient sends (morning brief, archive push, reminder push,
+    contradicciones digest, etc.) se redirigen al grupo RagNet
+    (``WHATSAPP_BOT_JID``) en vez de mandarse al destinatario original.
+    El header ``📨 *RagNet draft* → <jid_original>`` se prepende para que
+    se vea claro qué iba a salir y a dónde.
+
+    Sirve para revisar qué dispararía el sistema sin spamear al user
+    (típico antes de enable/disable de una feature nueva, o cuando tunás
+    el morning brief y querés iterar sin notificar).
+
+    El flag NO afecta sends user-initiated (``propose_whatsapp_send``,
+    replies, scheduled messages, contact cards) — esos van directo via
+    ``_whatsapp_send_to_jid`` y son explícitamente confirmados por el
+    user con [Enviar] en la proposal card.
+
+    Para apagarlo: ``unset RAG_DRAFT_VIA_RAGNET`` y reiniciar los daemons
+    afectados (``launchctl bootout`` + ``bootstrap`` de los plists tipo
+    ``com.fer.obsidian-rag-*``).
     """
+    if jid != WHATSAPP_BOT_JID and os.environ.get(
+        "RAG_DRAFT_VIA_RAGNET", "",
+    ).lower() in ("1", "true", "yes"):
+        text = f"📨 *RagNet draft* → `{jid}`\n\n{text}"
+        jid = WHATSAPP_BOT_JID
     return _whatsapp_send_to_jid(jid, text, anti_loop=True)
 
 

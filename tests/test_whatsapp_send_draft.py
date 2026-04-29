@@ -107,6 +107,124 @@ def test_ambient_send_still_uses_anti_loop(monkeypatch):
     assert payload["message"].startswith("\u200b")
 
 
+# ── 1.b RAG_DRAFT_VIA_RAGNET redirect (testing flag, 2026-04-28) ──────────
+
+
+class _OkResp:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def _capture_urlopen(captured: dict):
+    def _fake(req, timeout=10):
+        captured["data"] = req.data
+        return _OkResp()
+    return _fake
+
+
+def test_ambient_send_flag_off_no_redirect(monkeypatch):
+    """Default (sin RAG_DRAFT_VIA_RAGNET): el ambient send sale al JID
+    original sin tocar el cuerpo. Comportamiento histórico — la flag
+    NO debe afectar nada cuando está unset."""
+    monkeypatch.delenv("RAG_DRAFT_VIA_RAGNET", raising=False)
+    captured = {}
+    monkeypatch.setattr("urllib.request.urlopen", _capture_urlopen(captured))
+
+    rag._ambient_whatsapp_send("5491155555555@s.whatsapp.net", "morning brief")
+    payload = json.loads(captured["data"].decode("utf-8"))
+
+    # Sale al JID original, NO al grupo RagNet.
+    assert payload["recipient"] == "5491155555555@s.whatsapp.net"
+    # Body sin header — solo el U+200B anti-loop + el texto literal.
+    assert payload["message"] == "\u200bmorning brief"
+
+
+def test_ambient_send_flag_on_redirects_to_ragnet(monkeypatch):
+    """Con RAG_DRAFT_VIA_RAGNET=1: el send a un JID NO-RagNet se
+    redirige al grupo del bot, prepende un header con el destino
+    original, y mantiene el U+200B anti-loop al inicio."""
+    monkeypatch.setenv("RAG_DRAFT_VIA_RAGNET", "1")
+    captured = {}
+    monkeypatch.setattr("urllib.request.urlopen", _capture_urlopen(captured))
+
+    original_jid = "5491155555555@s.whatsapp.net"
+    rag._ambient_whatsapp_send(original_jid, "morning brief")
+    payload = json.loads(captured["data"].decode("utf-8"))
+
+    # Recipient: RagNet (el grupo del bot), no el JID original.
+    assert payload["recipient"] == rag.WHATSAPP_BOT_JID
+    # U+200B se mantiene al inicio (sino el listener procesa el draft
+    # como query entrante y loopea).
+    assert payload["message"].startswith("\u200b")
+    # Header visible (post anti-loop char) con el JID original.
+    assert "RagNet draft" in payload["message"]
+    assert original_jid in payload["message"]
+    # El cuerpo original sigue presente.
+    assert "morning brief" in payload["message"]
+
+
+def test_ambient_send_flag_on_idempotent_when_already_ragnet(monkeypatch):
+    """Si el JID original YA es RagNet (config existente del user que
+    apunta el ambient al grupo del bot), no se prepende header — el
+    redirect es no-op para evitar duplicar el meta-header en cada send."""
+    monkeypatch.setenv("RAG_DRAFT_VIA_RAGNET", "true")
+    captured = {}
+    monkeypatch.setattr("urllib.request.urlopen", _capture_urlopen(captured))
+
+    rag._ambient_whatsapp_send(rag.WHATSAPP_BOT_JID, "morning brief")
+    payload = json.loads(captured["data"].decode("utf-8"))
+
+    assert payload["recipient"] == rag.WHATSAPP_BOT_JID
+    # Sin header — el destino ya era RagNet, redirect inútil.
+    assert "RagNet draft" not in payload["message"]
+    assert payload["message"] == "\u200bmorning brief"
+
+
+def test_ambient_send_flag_accepts_truthy_variants(monkeypatch):
+    """La flag acepta '1', 'true', 'yes' (case-insensitive). Otros valores
+    (incl. vacío) cuentan como off."""
+    captured = {}
+    monkeypatch.setattr("urllib.request.urlopen", _capture_urlopen(captured))
+
+    for truthy in ("1", "true", "TRUE", "yes", "Yes"):
+        captured.clear()
+        monkeypatch.setenv("RAG_DRAFT_VIA_RAGNET", truthy)
+        rag._ambient_whatsapp_send("5491100000000@s.whatsapp.net", "x")
+        payload = json.loads(captured["data"].decode("utf-8"))
+        assert payload["recipient"] == rag.WHATSAPP_BOT_JID, (
+            f"truthy={truthy!r} debería redirigir"
+        )
+
+    for falsy in ("", "0", "false", "no", "off", "anything"):
+        captured.clear()
+        monkeypatch.setenv("RAG_DRAFT_VIA_RAGNET", falsy)
+        rag._ambient_whatsapp_send("5491100000000@s.whatsapp.net", "x")
+        payload = json.loads(captured["data"].decode("utf-8"))
+        assert payload["recipient"] == "5491100000000@s.whatsapp.net", (
+            f"falsy={falsy!r} NO debería redirigir"
+        )
+
+
+def test_propose_send_unaffected_by_ragnet_flag(monkeypatch):
+    """RAG_DRAFT_VIA_RAGNET solo afecta `_ambient_whatsapp_send`. Sends
+    user-initiated via `_whatsapp_send_to_jid(anti_loop=False)` (los
+    propose_whatsapp_send confirmados con [Enviar]) NO se redirigen —
+    si el user explícitamente le mandó algo a Grecia, va a Grecia."""
+    monkeypatch.setenv("RAG_DRAFT_VIA_RAGNET", "1")
+    captured = {}
+    monkeypatch.setattr("urllib.request.urlopen", _capture_urlopen(captured))
+
+    ok = rag._whatsapp_send_to_jid(
+        "5491155555555@s.whatsapp.net", "hola Grecia", anti_loop=False,
+    )
+    assert ok is True
+    payload = json.loads(captured["data"].decode("utf-8"))
+    # Sale a Grecia, no a RagNet. Sin U+200B (anti_loop=False).
+    assert payload["recipient"] == "5491155555555@s.whatsapp.net"
+    assert payload["message"] == "hola Grecia"
+
+
 # ── 2. _whatsapp_jid_from_contact ──────────────────────────────────────────
 
 

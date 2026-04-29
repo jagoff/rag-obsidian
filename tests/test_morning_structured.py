@@ -935,6 +935,87 @@ def test_sanitize_handles_non_dict_input():
     assert rag._sanitize_morning_parts("not a dict", {}) == "not a dict"  # type: ignore[arg-type]
 
 
+# ── _is_placeholder_bullet ──────────────────────────────────────────────────
+
+
+def test_placeholder_nada_quedo_suelto():
+    assert rag._is_placeholder_bullet("Nada quedó suelto.")
+    assert rag._is_placeholder_bullet("nada quedó suelto que no haya sido")
+
+
+def test_placeholder_no_hay_no_hubo():
+    assert rag._is_placeholder_bullet("No hay datos suficientes.")
+    assert rag._is_placeholder_bullet("No hubo capturas hoy.")
+    assert rag._is_placeholder_bullet("No había novedades.")
+
+
+def test_placeholder_ninguna():
+    assert rag._is_placeholder_bullet("Ninguna pregunta abierta hoy.")
+    assert rag._is_placeholder_bullet("Ningún cabo suelto.")
+
+
+def test_placeholder_sin_novedades():
+    assert rag._is_placeholder_bullet("Sin novedades.")
+    assert rag._is_placeholder_bullet("Sin actividad relevante.")
+
+
+def test_placeholder_real_bullet_passes():
+    assert not rag._is_placeholder_bullet("Llamar al psiquiatra")
+    assert not rag._is_placeholder_bullet("[[Plan]] avanzar")
+    assert not rag._is_placeholder_bullet("Revisar Sheet: China MA")
+
+
+def test_placeholder_empty():
+    assert rag._is_placeholder_bullet("")
+    assert rag._is_placeholder_bullet(None)  # type: ignore[arg-type]
+
+
+def test_sanitize_drops_placeholder_attention_bullet():
+    parts = {
+        "yesterday": "", "focus": [], "pending": [],
+        "attention": [
+            "Contradicción real entre A y B",
+            "Ninguna pregunta abierta hoy",  # placeholder
+        ],
+    }
+    ev = {
+        "new_contradictions": [{"subject_path": "x", "targets": []}],
+        "low_conf_queries": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["attention"] == ["Contradicción real entre A y B"]
+
+
+def test_sanitize_drops_placeholder_pending_bullet():
+    parts = {
+        "yesterday": "", "focus": [], "attention": [],
+        "pending": [
+            "Llamar al psiquiatra",
+            "Nada quedó suelto",  # placeholder
+        ],
+    }
+    ev = {
+        "inbox_pending": [{"path": "00-Inbox/x.md", "title": "x"}],
+        "todos": [], "mail_unread": [], "gmail": {}, "whatsapp_unread": [],
+        "wa_scheduled_today": [], "recent_notes": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["pending"] == ["Llamar al psiquiatra"]
+
+
+def test_sanitize_drops_placeholder_yesterday():
+    parts = {"yesterday": "No había nada relevante ayer.",
+             "focus": [], "pending": [], "attention": []}
+    ev = {
+        "recent_notes": [{"path": "01-Projects/x.md", "title": "x"}],
+        "calendar_today": [], "reminders_due": [], "gmail": {},
+        "recent_queries": [], "inbox_pending": [], "todos": [],
+        "low_conf_queries": [], "new_contradictions": [],
+    }
+    out = rag._sanitize_morning_parts(parts, ev)
+    assert out["yesterday"] == ""
+
+
 # ── _render_morning_vaults_section: obsidian:// URI ─────────────────────────
 
 

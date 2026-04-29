@@ -40614,8 +40614,9 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
         # como "pendientes" aun cuando se le dice explícitamente que no.
         # Si un bullet solo menciona el nombre de un archivo Drive o el
         # nombre de un bookmark (y nada más), lo descartamos: esa info ya
-        # está en su sección determinística.
-        pending = parts.get("pending") or []
+        # está en su sección determinística. Leemos de `out` (no `parts`)
+        # para encadenar correctamente con el filter de placeholders.
+        pending = out.get("pending") or []
         if isinstance(pending, list) and pending:
             drive_names = {
                 _normalize_task_text(f.get("name") or "")
@@ -40644,7 +40645,7 @@ def _sanitize_morning_parts(parts: dict, ev: dict) -> dict:
                 cleaned.append(b)
             out["pending"] = cleaned
 
-    focus = parts.get("focus") or []
+    focus = out.get("focus") or []
     if isinstance(focus, list) and focus:
         wl_re = re.compile(r"\[\[([^\]|#]+)")
         # Map title → known real path from filtered evidence (recent_notes

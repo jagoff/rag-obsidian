@@ -713,3 +713,130 @@ def test_today_plist_registered_in_services(tmp_path):
     assert "<key>Hour</key><integer>22</integer>" in plist_xml
     assert "today.log" in plist_xml
     assert "today.error.log" in plist_xml
+
+
+# ── _strip_empty_today_sections ─────────────────────────────────────────────
+
+
+def test_strip_drops_section_with_nada_quedo_suelto():
+    raw = (
+        "## 🪞 Lo que pasó hoy\n"
+        "Trabajaste en el RAG.\n\n"
+        "## 📥 Sin procesar\n"
+        "Nada quedó suelto que no haya sido ya categorizado.\n\n"
+        "## 🌅 Para mañana\n"
+        "Llamar al psiquiatra.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "📥 Sin procesar" not in out
+    assert "🪞 Lo que pasó hoy" in out
+    assert "🌅 Para mañana" in out
+    assert "Llamar al psiquiatra" in out
+
+
+def test_strip_drops_section_with_no_hay_datos_suficientes():
+    raw = (
+        "## 🔍 Preguntas abiertas\n"
+        "No hay datos suficientes para responder.\n\n"
+        "## 🌅 Para mañana\n"
+        "Revisar el calendario.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "🔍 Preguntas abiertas" not in out
+    assert "🌅 Para mañana" in out
+
+
+def test_strip_drops_section_with_ninguna():
+    raw = (
+        "## 🔍 Preguntas abiertas\n"
+        "Ninguna pregunta abierta hoy.\n\n"
+        "## 🪞 Lo que pasó hoy\n"
+        "Día tranquilo.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "🔍 Preguntas abiertas" not in out
+    assert "🪞 Lo que pasó hoy" in out
+
+
+def test_strip_drops_section_with_no_hubo():
+    raw = (
+        "## 📥 Sin procesar\n"
+        "No hubo capturas hoy ni mails sin responder.\n\n"
+        "## 🪞 Lo que pasó hoy\n"
+        "Trabajé en X.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "📥 Sin procesar" not in out
+    assert "🪞 Lo que pasó hoy" in out
+
+
+def test_strip_drops_section_header_only():
+    # LLM emite el header sin body — debería caer también
+    raw = (
+        "## 🪞 Lo que pasó hoy\n"
+        "Día activo.\n\n"
+        "## 📥 Sin procesar"  # sin newline ni body
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "📥 Sin procesar" not in out
+    assert "Día activo" in out
+
+
+def test_strip_keeps_section_with_real_content():
+    raw = (
+        "## 🪞 Lo que pasó hoy\n"
+        "Avanzaste con el RAG y mandaste un mensaje a Grecia.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "🪞 Lo que pasó hoy" in out
+    assert "Avanzaste con el RAG" in out
+
+
+def test_strip_handles_empty_input():
+    assert rag._strip_empty_today_sections("") == ""
+    assert rag._strip_empty_today_sections(None) is None  # type: ignore[arg-type]
+
+
+def test_strip_section_mixed_real_and_placeholder_keeps_real():
+    raw = (
+        "## 🪞 Lo que pasó hoy\n"
+        "Trabajaste en X.\n"
+        "Charlaste con Y.\n"
+        "Nada quedó suelto.\n"  # una línea placeholder mezclada
+    )
+    out = rag._strip_empty_today_sections(raw)
+    # La sección entera tiene 2 líneas reales + 1 placeholder, NO se borra
+    assert "🪞 Lo que pasó hoy" in out
+    assert "Trabajaste en X" in out
+
+
+def test_strip_accent_folds_for_match():
+    # "no había" con tilde, "ningún" con tilde — el regex está en accent-fold
+    raw = (
+        "## 📥 Sin procesar\n"
+        "No había capturas hoy.\n\n"
+        "## 🌅 Para mañana\n"
+        "Avanzar con el feature.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "📥 Sin procesar" not in out
+
+
+def test_strip_drops_multiple_placeholder_sections():
+    raw = (
+        "## 🪞 Lo que pasó hoy\n"
+        "Día activo.\n\n"
+        "## 📥 Sin procesar\n"
+        "Nada quedó suelto.\n\n"
+        "## 🔍 Preguntas abiertas\n"
+        "Ninguna pregunta hoy.\n\n"
+        "## 🌅 Para mañana\n"
+        "Sin novedades.\n"
+    )
+    out = rag._strip_empty_today_sections(raw)
+    assert "🪞 Lo que pasó hoy" in out
+    assert "Día activo" in out
+    # Las otras 3 caen
+    assert "📥 Sin procesar" not in out
+    assert "🔍 Preguntas abiertas" not in out
+    assert "🌅 Para mañana" not in out

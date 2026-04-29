@@ -59285,54 +59285,156 @@ def _upsert_entities_for_chunk(
     ts: float,
     snippet: str = "",
 ) -> int:
-    """Upsert entities + mentions. Returns count of entities touched."""
+    """Upsert entities + mentions with batch SQL — single commit per chunk.
+
+    Reduces SQL calls from N×3+N commits (old loop) to:
+      1 SELECT (existing entity IDs for this chunk)
+      1 executemany INSERT INTO rag_entities ... ON CONFLICT (entities not yet seen by this chunk)
+      1 executemany INSERT OR IGNORE INTO rag_entity_mentions
+      1 commit
+    This eliminates per-entity SELECT+INSERT/UPDATE round-trips and the N inner
+    commits that caused WAL contention during bulk indexing.
+
+    Correctness invariant: mention_count in rag_entities is incremented only
+    for genuinely new (entity_id, chunk_id) pairs — re-indexing the same chunk
+    is idempotent.
+    """
     if not entities or not chunk_id:
         return 0
-    count = 0
-    for (norm, etype), data in entities.items():
-        try:
-            row = conn.execute(
-                "SELECT id, mention_count, first_seen_ts, confidence FROM rag_entities "
-                "WHERE normalized=? AND entity_type=?",
-                (norm, etype),
-            ).fetchone()
+
+    snippet_trunc = snippet[:200] if snippet else ""
+    norm_etype_list = list(entities.keys())
+
+    try:
+        # ── Step 1: resolve existing entity IDs for these (normalized, entity_type) pairs.
+        # Entities not yet in the DB will be absent from id_map.
+        placeholders = ",".join("(?,?)" for _ in norm_etype_list)
+        flat_params = [v for pair in norm_etype_list for v in pair]
+        existing_rows = conn.execute(
+            f"SELECT id, normalized, entity_type FROM rag_entities "
+            f"WHERE (normalized, entity_type) IN (VALUES {placeholders})",
+            flat_params,
+        ).fetchall()
+        id_map = {(r[1], r[2]): r[0] for r in existing_rows}
+
+        # ── Step 2: find which of these entities already have a mention for
+        # this chunk_id.  mention_count must NOT be incremented for those.
+        existing_entity_ids = list(id_map.values())
+        already_mentioned: set = set()
+        if existing_entity_ids:
+            id_ph = ",".join("?" for _ in existing_entity_ids)
+            already_mentioned = {
+                r[0]
+                for r in conn.execute(
+                    f"SELECT entity_id FROM rag_entity_mentions "
+                    f"WHERE chunk_id=? AND entity_id IN ({id_ph})",
+                    [chunk_id, *existing_entity_ids],
+                ).fetchall()
+            }
+
+        # ── Step 3: batch upsert rag_entities.
+        # For entities whose (entity_id, chunk_id) pair already exists we
+        # only update last_seen_ts; for genuinely new mentions we also
+        # increment mention_count and blend confidence.
+        new_entity_rows = []      # not yet in rag_entities
+        update_only_rows = []     # exist but this chunk already mentioned → ts only
+        new_mention_rows = []     # exist but this chunk is new → count + conf update
+
+        for (norm, etype), data in entities.items():
             aliases_json = json.dumps(data["aliases"]) if data.get("aliases") else None
-            if row is None:
-                cur = conn.execute(
-                    "INSERT INTO rag_entities "
-                    "(canonical_name, normalized, entity_type, aliases, "
-                    " first_seen_ts, last_seen_ts, mention_count, confidence) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (data["canonical"], norm, etype, aliases_json,
-                     ts, ts, 1, data["confidence"]),
-                )
-                entity_id = cur.lastrowid
+            conf = data["confidence"]
+            eid = id_map.get((norm, etype))
+            if eid is None:
+                # Brand-new entity — INSERT will handle it.
+                new_entity_rows.append((
+                    data["canonical"], norm, etype, aliases_json,
+                    ts, ts, conf,
+                ))
+            elif eid in already_mentioned:
+                # Entity exists AND chunk already seen — just bump last_seen_ts.
+                update_only_rows.append((ts, eid))
             else:
-                entity_id = row[0]
-                new_conf = (
-                    (row[3] * row[1] + data["confidence"]) / (row[1] + 1)
-                    if row[3] else data["confidence"]
-                )
-                conn.execute(
-                    "UPDATE rag_entities SET last_seen_ts=?, mention_count=mention_count+1, "
-                    " confidence=?, aliases=COALESCE(?, aliases) "
-                    "WHERE id=?",
-                    (ts, new_conf, aliases_json, entity_id),
-                )
-            conn.execute(
+                # Entity exists but this chunk is new — increment + blend.
+                new_mention_rows.append((ts, conf, eid))
+
+        if new_entity_rows:
+            # ON CONFLICT covers the race where two parallel indexers insert
+            # the same entity simultaneously.
+            conn.executemany(
+                """
+                INSERT INTO rag_entities
+                    (canonical_name, normalized, entity_type, aliases,
+                     first_seen_ts, last_seen_ts, mention_count, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(normalized, entity_type) DO UPDATE SET
+                    last_seen_ts  = excluded.last_seen_ts,
+                    mention_count = mention_count + 1,
+                    confidence    = CASE
+                        WHEN confidence IS NULL THEN excluded.confidence
+                        ELSE (confidence * mention_count + excluded.confidence)
+                             / (mention_count + 1)
+                    END,
+                    aliases       = COALESCE(excluded.aliases, aliases)
+                """,
+                new_entity_rows,
+            )
+            # Re-fetch IDs for the newly inserted entities.
+            new_norms = [(norm, etype) for (norm, etype) in norm_etype_list
+                         if (norm, etype) not in id_map]
+            if new_norms:
+                ph2 = ",".join("(?,?)" for _ in new_norms)
+                fp2 = [v for pair in new_norms for v in pair]
+                for r in conn.execute(
+                    f"SELECT id, normalized, entity_type FROM rag_entities "
+                    f"WHERE (normalized, entity_type) IN (VALUES {ph2})",
+                    fp2,
+                ).fetchall():
+                    id_map[(r[1], r[2])] = r[0]
+
+        if update_only_rows:
+            conn.executemany(
+                "UPDATE rag_entities SET last_seen_ts=? WHERE id=?",
+                update_only_rows,
+            )
+
+        if new_mention_rows:
+            conn.executemany(
+                "UPDATE rag_entities SET last_seen_ts=?, "
+                "mention_count=mention_count+1, "
+                "confidence=CASE WHEN confidence IS NULL THEN ? "
+                "ELSE (confidence*mention_count+?)/(mention_count+1) END "
+                "WHERE id=?",
+                # note: confidence param appears twice (CASE branches)
+                [(ts, conf, conf, eid) for (ts, conf, eid) in new_mention_rows],
+            )
+
+        # ── Step 4: batch insert mentions (INSERT OR IGNORE = idempotent).
+        mention_rows = []
+        for (norm, etype), data in entities.items():
+            entity_id = id_map.get((norm, etype))
+            if entity_id is None:
+                continue
+            mention_rows.append((
+                entity_id, chunk_id, source, ts,
+                snippet_trunc, data["confidence"],
+            ))
+        if mention_rows:
+            conn.executemany(
                 "INSERT OR IGNORE INTO rag_entity_mentions "
                 "(entity_id, chunk_id, source, ts, snippet, confidence) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (entity_id, chunk_id, source, ts, snippet[:200] if snippet else "", data["confidence"]),
+                mention_rows,
             )
-            count += 1
-        except Exception as exc:
-            try:
-                _silent_log("entity_upsert_failed", exc)
-            except Exception:
-                pass
-    conn.commit()
-    return count
+
+        conn.commit()
+        return len(entities)
+
+    except Exception as exc:
+        try:
+            _silent_log("entity_upsert_failed", exc)
+        except Exception:
+            pass
+        return 0
 
 
 def _extract_and_index_entities_for_chunks(

@@ -4262,7 +4262,18 @@ def record_feedback(
     # scheduled tune from the plist is the safety net; this just shortens
     # the latency between feedback arrival and weight update for active
     # learning bursts.
-    _maybe_trigger_incremental_tune()
+    #
+    # CRITICAL: wrapped in try/except so a bug here NEVER blocks the
+    # feedback INSERT from the user's perspective. The trigger is a
+    # nice-to-have optimization (the scheduled tune from the plist
+    # picks up the same feedback in <6h regardless). Logging the
+    # exception keeps the failure observable without poisoning the
+    # call site.
+    try:
+        _maybe_trigger_incremental_tune()
+    except Exception as exc:
+        _log_sql_state_error("incremental_tune_trigger_unexpected_failure",
+                              err=repr(exc))
 
 
 # ── Online incremental tune trigger (B6) ──────────────────────────────────

@@ -3158,7 +3158,7 @@ def _save_context_cache() -> None:
     CONTEXT_CACHE_PATH.write_text(payload)
 
 
-_SUMMARY_CLIENT: ollama.Client | None = None
+_SUMMARY_CLIENT: "_TimedOllamaProxy | None" = None
 _INDEX_CHAT_CLIENT: ollama.Client | None = None
 _HELPER_CLIENT: "_TimedOllamaProxy | None" = None
 _CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
@@ -3166,6 +3166,17 @@ _CHAT_CAPPED_CLIENT: "_TimedOllamaProxy | None" = None
 # Capture the original `ollama.chat` at import time so _TimedOllamaProxy
 # can detect monkey-patches (tests replace `rag.ollama.chat` with mocks).
 _ORIGINAL_OLLAMA_CHAT = ollama.chat
+
+# Semaphore that caps concurrent qwen2.5:3b (HELPER_MODEL) calls.
+# Ollama serialises at the GPU level but each blocked Python thread holds
+# an open httpx connection that eventually times out (measured: 277
+# ReadTimeout errors in 7d from morning + anticipate + followup running
+# concurrently). Capping to 2 lets a second request queue in Python
+# instead of timing out against Ollama's internal queue.
+# Override: RAG_HELPER_CONCURRENCY=N (default 2).
+_HELPER_SEM: threading.Semaphore = threading.Semaphore(
+    int(os.environ.get("RAG_HELPER_CONCURRENCY", "2"))
+)
 
 
 class _TimedOllamaProxy:
@@ -3183,11 +3194,16 @@ class _TimedOllamaProxy:
     a wedged ollama daemon raises httpx.ReadTimeout and the caller's
     existing `except Exception` path handles it. In tests, the proxy is
     transparent.
+
+    When `semaphore` is provided (set by _helper_client and _summary_client
+    for all qwen2.5:3b call sites), concurrent calls block on acquire()
+    rather than piling up inside Ollama and timing out.
     """
 
-    def __init__(self, timeout: float):
+    def __init__(self, timeout: float, semaphore: "threading.Semaphore | None" = None):
         self._timeout = timeout
         self._client: ollama.Client | None = None
+        self._semaphore = semaphore
 
     def chat(self, **kwargs):
         if ollama.chat is not _ORIGINAL_OLLAMA_CHAT:
@@ -3196,6 +3212,9 @@ class _TimedOllamaProxy:
             return ollama.chat(**kwargs)
         if self._client is None:
             self._client = ollama.Client(timeout=self._timeout)
+        if self._semaphore is not None:
+            with self._semaphore:
+                return self._client.chat(**kwargs)
         return self._client.chat(**kwargs)
 
 
@@ -3212,8 +3231,8 @@ def _index_chat_client() -> ollama.Client:
     return _INDEX_CHAT_CLIENT
 
 
-def _summary_client() -> ollama.Client:
-    """Dedicated ollama client with a hard timeout for context-summary calls.
+def _summary_client() -> "_TimedOllamaProxy":
+    """Dedicated proxy with a hard timeout for context-summary calls.
 
     The module-level `ollama.chat` uses the default httpx client which
     has no read timeout — a stuck runner (seen in the wild when indexing
@@ -3221,10 +3240,13 @@ def _summary_client() -> ollama.Client:
     block the whole indexing batch on `recvfrom`. A 45s ceiling is well
     above the p99 call time (~1s on qwen2.5:3b for a 2k-char prompt) but
     bounds the worst case so indexing keeps moving.
+
+    Uses _HELPER_SEM (shared with _helper_client) so index-time context
+    summary calls are rate-limited alongside query-time helper calls.
     """
     global _SUMMARY_CLIENT
     if _SUMMARY_CLIENT is None:
-        _SUMMARY_CLIENT = ollama.Client(timeout=45.0)
+        _SUMMARY_CLIENT = _TimedOllamaProxy(timeout=45.0, semaphore=_HELPER_SEM)
     return _SUMMARY_CLIENT
 
 
@@ -3233,10 +3255,14 @@ def _helper_client() -> "_TimedOllamaProxy":
     (reformulate_query, expand_queries, _judge_sufficiency,
     _generate_synthetic_questions, HyDE). Monkey-patch-compatible — see
     _TimedOllamaProxy docstring.
+
+    Uses _HELPER_SEM to cap concurrent qwen2.5:3b calls and prevent
+    ReadTimeout errors when multiple daemons (morning, anticipate,
+    followup, chat) hit the helper simultaneously.
     """
     global _HELPER_CLIENT
     if _HELPER_CLIENT is None:
-        _HELPER_CLIENT = _TimedOllamaProxy(timeout=30.0)
+        _HELPER_CLIENT = _TimedOllamaProxy(timeout=30.0, semaphore=_HELPER_SEM)
     return _HELPER_CLIENT
 
 
@@ -3642,7 +3668,14 @@ _behavior_priors_cache_key: tuple[float, int] | None = None  # (mtime, size) —
 # the JSONL fallback's cache key stays a distinct type. T10 will collapse
 # both into one after the 7-day observation window.
 _behavior_priors_cache_key_sql: str | None = None
-# Serialises reads + writes of the three globals above. Same motivation as
+# Wave1 (2026-04-29): TTL fast-path para no pegar SQL en cada retrieve.
+# `rag_behavior` recibe ~41K impressions/día → MAX(ts) cambia cada 30-60s
+# en pico, pero los priors agregados son ~99% iguales minuto a minuto.
+# El TTL de 60s clampa el SQL probe a una vez por minuto por proceso.
+# Se valida con monotonic clock (no walltime — inmune a NTP jumps).
+_BEHAVIOR_PRIORS_TTL_SECONDS = 60.0
+_behavior_priors_cache_loaded_at: float | None = None
+# Serialises reads + writes of the four globals above. Same motivation as
 # _corpus_cache_lock: the watchdog / behavior loggers can invalidate while
 # CLI/web threads are mid-lookup. RLock in case a reader calls out to a
 # function that re-enters (defensive; today's callers don't).
@@ -3784,6 +3817,144 @@ def _compute_behavior_priors_from_rows(rows_iter) -> dict:
     }
 
 
+def _compute_behavior_priors_from_groups(groups_iter) -> dict:
+    """Fold pre-grouped SQL rows into the priors snapshot (Wave1, 2026-04-29).
+
+    Pushdown del GROUP BY a SQL: pre-fix scan O(N rows) en Python (~42K rows
+    en 90d). Post-fix scan O(K groups) (~2K groups distintos). Cada `group`
+    es un dict (o sqlite3.Row con bracket access) con keys:
+      path     str  — note path
+      event    str  — open/positive_implicit/.../impression
+      hour     str  — strftime('%H', ts) → '00'..'23'
+      weekday  str  — strftime('%w', ts) → '0'=Sunday..'6'=Saturday
+      n        int  — COUNT(*) del bucket
+      avg_dwell float|None — AVG(dwell_s) en seconds, NULL si no hay dwell
+
+    SQLite weekday convention (`%w`): 0=Sunday..6=Saturday.
+    Python `datetime.weekday()`: 0=Monday..6=Sunday.
+    Convertimos: `python_weekday = (sqlite_dow - 1) % 7` para preservar el
+    contrato de output (los tests verifican Monday=0).
+
+    Mantiene el mismo contrato de output que `_compute_behavior_priors_from_rows`.
+    """
+    path_acc: dict[str, list[int]] = {}
+    folder_acc: dict[str, list[int]] = {}
+    hour_acc: dict[tuple[str, int], list[int]] = {}
+    dayofweek_acc: dict[tuple[str, int], list[int]] = {}
+    # path → [sum_ms_total, n_clicks_total]. Reducimos al final con
+    # mean = sum_ms / n / 1000 → log1p(mean_s) para preservar el contrato
+    # del row-based aggregator.
+    dwell_acc: dict[str, list] = {}
+    n_events = 0
+
+    def _get(row, key):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
+
+    for g in groups_iter:
+        event_type = _get(g, "event") or ""
+        path = _get(g, "path") or ""
+        if not path or event_type not in (
+            _BEHAVIOR_POSITIVE | _BEHAVIOR_NEGATIVE | _BEHAVIOR_IMPRESSION_ONLY
+        ):
+            continue
+        try:
+            n = int(_get(g, "n") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            continue
+
+        n_events += n
+        is_click_unit = 1 if event_type in _BEHAVIOR_POSITIVE else 0
+        clicks = n if is_click_unit else 0
+
+        if path not in path_acc:
+            path_acc[path] = [0, 0]
+        path_acc[path][0] += clicks
+        path_acc[path][1] += n
+
+        folder = path.split("/")[0] if "/" in path else ""
+        if folder:
+            if folder not in folder_acc:
+                folder_acc[folder] = [0, 0]
+            folder_acc[folder][0] += clicks
+            folder_acc[folder][1] += n
+
+        hour_raw = _get(g, "hour")
+        if hour_raw is not None and hour_raw != "":
+            try:
+                hour = int(hour_raw)
+                key_h = (path, hour)
+                if key_h not in hour_acc:
+                    hour_acc[key_h] = [0, 0]
+                hour_acc[key_h][0] += clicks
+                hour_acc[key_h][1] += n
+            except (TypeError, ValueError):
+                pass
+
+        weekday_raw = _get(g, "weekday")
+        if weekday_raw is not None and weekday_raw != "":
+            try:
+                sqlite_dow = int(weekday_raw)
+                weekday = (sqlite_dow - 1) % 7
+                key_dow = (path, weekday)
+                if key_dow not in dayofweek_acc:
+                    dayofweek_acc[key_dow] = [0, 0]
+                dayofweek_acc[key_dow][0] += clicks
+                dayofweek_acc[key_dow][1] += n
+            except (TypeError, ValueError):
+                pass
+
+        if is_click_unit:
+            avg_dwell_s = _get(g, "avg_dwell")
+            if avg_dwell_s is not None:
+                try:
+                    avg_s = float(avg_dwell_s)
+                    sum_ms_group = avg_s * n * 1000.0
+                    if path not in dwell_acc:
+                        dwell_acc[path] = [0.0, 0]
+                    dwell_acc[path][0] += sum_ms_group
+                    dwell_acc[path][1] += n
+                except (TypeError, ValueError):
+                    pass
+
+    import math
+
+    def _laplace_ctr(clicks: int, impressions: int) -> float:
+        return (clicks + 1) / (impressions + 10)
+
+    click_prior: dict[str, float] = {
+        p: _laplace_ctr(acc[0], acc[1]) for p, acc in path_acc.items()
+    }
+    click_prior_folder: dict[str, float] = {
+        f: _laplace_ctr(acc[0], acc[1]) for f, acc in folder_acc.items()
+    }
+    click_prior_hour: dict[tuple[str, int], float] = {
+        k: _laplace_ctr(acc[0], acc[1]) for k, acc in hour_acc.items()
+    }
+    click_prior_dayofweek: dict[tuple[str, int], float] = {
+        k: _laplace_ctr(acc[0], acc[1]) for k, acc in dayofweek_acc.items()
+    }
+    dwell_score: dict[str, float] = {}
+    for p, (sum_ms_total, n_total) in dwell_acc.items():
+        if n_total > 0:
+            mean_s = sum_ms_total / n_total / 1000.0
+            if mean_s > 0:
+                dwell_score[p] = math.log1p(mean_s)
+
+    return {
+        "click_prior": click_prior,
+        "click_prior_folder": click_prior_folder,
+        "click_prior_hour": click_prior_hour,
+        "click_prior_dayofweek": click_prior_dayofweek,
+        "dwell_score": dwell_score,
+        "n_events": n_events,
+    }
+
+
 def _load_behavior_priors() -> dict:
     """Read behavior events and return an immutable aggregated snapshot.
 
@@ -3815,6 +3986,7 @@ def _load_behavior_priors() -> dict:
     persistentes — edge case real pero raro.
     """
     global _behavior_priors_cache, _behavior_priors_cache_key, _behavior_priors_cache_key_sql
+    global _behavior_priors_cache_loaded_at
 
     # `_behavior_priors_lock` fue creado con un comentario de "serialises
     # reads + writes of the three globals" pero nunca se adquiría. Bajo
@@ -3824,48 +3996,68 @@ def _load_behavior_priors() -> dict:
     # stale que nunca se refrescaba. Fix: envolver read-then-write en el
     # RLock pre-existente.
     with _behavior_priors_lock:
+        # Wave1 (2026-04-29) TTL fast-path. Pre-fix cada call abría conn +
+        # leía MAX(ts) aunque los priors fueran ~idénticos. Post-fix: si
+        # el cache es fresh dentro del TTL, no tocamos SQL. Es el path
+        # dominante (>90% de calls bajo carga normal — retrieve corre por
+        # cada query del web/CLI). monotonic clock — inmune a NTP jumps.
+        if (
+            _behavior_priors_cache is not None
+            and _behavior_priors_cache_loaded_at is not None
+            and (time.monotonic() - _behavior_priors_cache_loaded_at) < _BEHAVIOR_PRIORS_TTL_SECONDS
+        ):
+            return _behavior_priors_cache
 
         def _read_priors():
             with _ragvec_state_conn() as conn:
                 max_ts = _sql_max_ts(conn, "rag_behavior")
                 if max_ts is None:
-                    snapshot = _compute_behavior_priors_from_rows([])
+                    snapshot = _compute_behavior_priors_from_groups([])
                     snapshot["hash"] = "sql:empty"
                     return ("empty", snapshot, "")
                 if (_behavior_priors_cache is not None
                         and _behavior_priors_cache_key_sql == max_ts):
+                    # MAX(ts) no se movió desde el último rebuild. NO
+                    # rehacemos el GROUP BY — sólo refrescamos TTL fuera
+                    # del helper (post-retry block).
                     return ("hit", _behavior_priors_cache, max_ts)
                 import sqlite3 as _sqlite3
                 prev_factory = conn.row_factory
                 try:
                     conn.row_factory = _sqlite3.Row
-                    # Audit perf 2026-04-26: pre-fix scaneaba TODA rag_behavior
-                    # sin filtros (84K+ rows en 7d → todos los Row objects en
-                    # RAM ~50-200MB en cada cache rebuild). El filtro lado-DB
-                    # elimina round-trip de Python para events que
-                    # `_compute_behavior_priors_from_rows` skipea por
-                    # event_type ∉ POSITIVE|NEGATIVE|IMPRESSION_ONLY.
-                    # Retención rag_behavior = 90d; bound `ts >= now-90d`
-                    # es belt-and-suspenders contra rotación atrasada +
-                    # permite usar `ix_rag_behavior_ts`. CRÍTICO: incluir
-                    # 'impression' — denominador de la CTR (Laplace
-                    # smoothing). Sin él todos los paths tendrían
-                    # click_prior ~1 falso. NO usar LIMIT — la CTR requiere
-                    # conteo completo dentro del window.
-                    # Audit 2026-04-26 H3: SQLite `'now'` retorna **UTC**,
-                    # pero `ts` se inserta con `datetime.now().isoformat()`
-                    # (local). Para AR (UTC-3) eso cortaba 3h antes en el
-                    # límite del window de 90d → events del borde se
-                    # perdían. `'now', 'localtime'` resuelve.
+                    # Wave1 (2026-04-29): GROUP BY pushdown a SQL. Pre-fix
+                    # devolvía ts/event/path/dwell_s row-by-row (~42K rows
+                    # en 90d, ~50-200MB RAM por rebuild). Post-fix devolvemos
+                    # buckets agregados — SQLite hace COUNT(*) + AVG(dwell_s)
+                    # + strftime('%H'|'%w') lado-DB; Python sólo dobla buckets
+                    # en el snapshot (~2K rows típico).
+                    #
+                    # Window 90d (retención rag_behavior). 'now','localtime'
+                    # porque `ts` se inserta naive local (AR=UTC-3) y SQLite
+                    # `'now'` es UTC. Audit 2026-04-26 H3.
+                    #
+                    # weekday `%w` → 0=Sunday..6=Saturday (SQLite). El
+                    # aggregator hace la conversión a Python's Monday=0
+                    # para preservar el contrato `datetime.weekday()`.
+                    #
+                    # Audit 2026-04-26: incluir 'impression' es CRÍTICO —
+                    # es el denominador de la CTR (Laplace). Sin él todos
+                    # los paths tendrían click_prior ~1 falso.
                     rows = list(conn.execute(
-                        "SELECT ts, event, path, dwell_s FROM rag_behavior "
+                        "SELECT path, event, "
+                        "       strftime('%H', ts) AS hour, "
+                        "       strftime('%w', ts) AS weekday, "
+                        "       COUNT(*) AS n, "
+                        "       AVG(dwell_s) AS avg_dwell "
+                        "FROM rag_behavior "
                         "WHERE ts >= datetime('now','localtime','-90 days') "
                         "AND event IN ('open','open_external','positive_implicit',"
-                        "'negative_implicit','kept','deleted','save','copy','impression')"
+                        "'negative_implicit','kept','deleted','save','copy','impression') "
+                        "GROUP BY path, event, hour, weekday"
                     ).fetchall())
                 finally:
                     conn.row_factory = prev_factory
-                snapshot = _compute_behavior_priors_from_rows(rows)
+                snapshot = _compute_behavior_priors_from_groups(rows)
                 snapshot["hash"] = f"sql:{max_ts}"
                 return ("rebuilt", snapshot, max_ts)
 
@@ -3883,14 +4075,17 @@ def _load_behavior_priors() -> dict:
                 _behavior_priors_cache = snapshot
                 _behavior_priors_cache_key_sql = max_ts
                 _behavior_priors_cache_key = None
-            # kind == "hit": cache ya está fresh, sólo retornamos.
+            # kind == "hit": cache ya está fresh — sólo refrescamos TTL.
+            _behavior_priors_cache_loaded_at = time.monotonic()
             return snapshot
 
         # Retry exhausted. Stale cache > empty snapshot — sin priors el
         # ranker baja a baseline. Stale by 1-5min es ~idéntico al fresh.
         # Audit 2026-04-26 (BUG #18): invalidar cache_key_sql para forzar
         # rebuild en la próxima call con DB sana. Pre-fix: la siguiente
-        # call veía cache_key == max_ts (hit stale).
+        # call veía cache_key == max_ts (hit stale). NO bumpeamos
+        # `loaded_at` — queremos que el próximo call re-pruebe SQL en
+        # cuanto la DB sane, no esperar 60s extra de TTL.
         if _behavior_priors_cache is not None:
             _behavior_priors_cache_key_sql = ""
             return _behavior_priors_cache
@@ -3898,7 +4093,7 @@ def _load_behavior_priors() -> dict:
         # Fresh process sin cache + DB locked persistente → fallback final
         # empty (mantiene retrieval funcional, scoring sin priors). Este
         # path solo se da en cold-start con la DB inaccesible — raro.
-        snapshot = _compute_behavior_priors_from_rows([])
+        snapshot = _compute_behavior_priors_from_groups([])
         snapshot["hash"] = "sql:error"
         return snapshot
 
@@ -16113,6 +16308,9 @@ _INTENT_SYNTHESIS_RE = re.compile(
     r"integr[aá](?:me|r)?\s+(?:todo|lo)\b|"
     r"qu[eé]\s+(?:dice|hay|s[eé])\s+(?:en\s+)?(?:el\s+)?vault\s+(?:sobre|de|acerca\s+de)|"
     r"todo\s+lo\s+que\s+(?:hay|s[eé]|tengo|encuentres)\s+sobre|"
+    # "leé X y resumime/sintetizame/dame un resumen" — read-then-summarise pattern.
+    # Uses \S+ (not \w+) so filenames with dots like CLAUDE.md are tolerated.
+    r"le[eé](?:me|lo|las?|los)?\s+(?:\S+\s+){0,5}y\s+(?:res[uú]mim[eé]|sintetiz[áa]m[eé]|d[áa]m[eé]\s+(?:un\s+)?res[uú]men)\b|"
     r"summary\s+of|synthesis\s+of|synthesi[sz]e"
     r")",
     re.IGNORECASE,
@@ -19904,6 +20102,12 @@ class RetrieveResult:
     # `rag_contradictions`. Surfaced en `extra_json` del query log para
     # poder medir cuán a menudo el penalty fire en producción.
     contradiction_penalty_applied: int = 0
+    # MMR diversification (2026-04-29): cuántos slots del scored_all fueron
+    # re-ordenados por la pasada MMR (rag/mmr_diversification.py). 0 cuando
+    # el feature está apagado (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0), cuando
+    # el caller pasó counter=True, o cuando MMR fue no-op (ya estaba
+    # diverso). Surfaced en extra_json del query log.
+    mmr_applied: int = 0
 
     # ── Retrocompat dict access ─────────────────────────────────────────
 
@@ -20334,6 +20538,10 @@ class ChatTurnResult:
             "contradiction_penalty_applied": int(
                 rr.get("contradiction_penalty_applied", 0) or 0,
             ),
+            # MMR diversification counter (2026-04-29). 0 = MMR apagado
+            # (RAG_MMR=0 + RAG_MMR_FOLDER_PENALTY=0) o no-op (ya diverso).
+            # >0 = N slots reordenados por MMR post-rerank pre top-k cap.
+            "mmr_applied": int(rr.get("mmr_applied", 0) or 0),
         }
 
 
@@ -21417,6 +21625,84 @@ def retrieve(
         except Exception as _cp_exc:
             _silent_log("contradiction_penalty_failed", _cp_exc)
 
+    # ── MMR diversification (post-rerank, pre cap top-k) ──────────────────
+    # Re-ordena scored_all balanceando relevance vs novelty (Carbonell &
+    # Goldstein 1998). Cuando los top-k vienen del mismo cluster semántico
+    # o folder, MMR promueve alternativas diversas a similar score.
+    # Helper en rag/mmr_diversification.py. NO filtra — sólo re-ordena.
+    #
+    # Dos variantes opt-in (default OFF — conservative rollout):
+    #   RAG_MMR=1                  → MMR pleno (cosine sobre embeddings bge-m3)
+    #   RAG_MMR_FOLDER_PENALTY=1   → variante cheap (sin embed, penaliza folder)
+    #
+    # Tunables vía env (leídos cada call):
+    #   RAG_MMR_LAMBDA=0.7         → tradeoff relevance/diversity ∈ [0,1]
+    #   RAG_MMR_TOP_K=10           → cuántos slots reordena (resto preservado)
+    #   RAG_MMR_FOLDER_PENALTY_MAGNITUDE=0.1
+    #
+    # Skip cuando counter=True (el user quiere ver TODO, igual que con
+    # contradiction_penalty). Si la variante embedding-based excede el
+    # budget de batch (~500ms), fallback silencioso a "no MMR".
+    _mmr_applied_count = 0
+    if scored_all and not counter and len(scored_all) > 1:
+        try:
+            from rag.mmr_diversification import (
+                apply_mmr as _apply_mmr,
+                apply_mmr_with_folder_penalty as _apply_mmr_folder,
+                count_reordered as _count_mmr_reordered,
+                env_enabled as _mmr_env_enabled,
+                env_folder_penalty as _mmr_env_folder_penalty,
+                env_lambda as _mmr_env_lambda,
+                env_top_k as _mmr_env_top_k,
+            )
+            _mmr_full = _mmr_env_enabled("RAG_MMR")
+            _mmr_folder = _mmr_env_enabled("RAG_MMR_FOLDER_PENALTY")
+            if _mmr_full or _mmr_folder:
+                # Adapter: scored_all es list[((cand, meta), expanded_text, score)].
+                # apply_mmr toma list[(doc, score)] — armamos un payload con
+                # `path` (para folder) y `text` (para embed).
+                _mmr_wrapped: list[tuple[dict, float]] = []
+                for i, (c, e, s) in enumerate(scored_all):
+                    _meta = c[1] if isinstance(c[1], dict) else {}
+                    _path = _meta.get("file") if isinstance(_meta, dict) else ""
+                    _mmr_wrapped.append((
+                        {
+                            "path": _path or "",
+                            "text": e if isinstance(e, str) else "",
+                            "_idx": i,
+                        },
+                        float(s),
+                    ))
+                _mmr_top_k = _mmr_env_top_k(10)
+                _before = list(_mmr_wrapped)
+                if _mmr_full:
+                    _lambda = _mmr_env_lambda(0.7)
+                    _mmr_after = _apply_mmr(
+                        _mmr_wrapped,
+                        lambda_=_lambda,
+                        top_k=_mmr_top_k,
+                        on_skip=lambda reason: _silent_log(
+                            "mmr_skipped", Exception(reason),
+                        ),
+                    )
+                else:
+                    _penalty = _mmr_env_folder_penalty(0.1)
+                    _mmr_after = _apply_mmr_folder(
+                        _mmr_wrapped,
+                        top_k=_mmr_top_k,
+                        folder_penalty=_penalty,
+                    )
+                _mmr_applied_count = _count_mmr_reordered(_before, _mmr_after)
+                if _mmr_applied_count:
+                    # Reconstruimos scored_all en el nuevo orden, preservando
+                    # los scores originales (MMR es re-orden, no re-score).
+                    scored_all = [
+                        scored_all[doc["_idx"]]
+                        for doc, _ in _mmr_after
+                    ]
+        except Exception as _mmr_exc:
+            _silent_log("mmr_failed", _mmr_exc)
+
     # Feature #14 (2026-04-23): adaptive k — cuando el top-1 domina
     # claramente al resto, reducir k ahorra prefill tokens sin perder
     # calidad. Busca el primer gap significativo en los top scores y
@@ -21719,6 +22005,7 @@ def retrieve(
         fast_path=_fast_path,
         intent=intent,
         contradiction_penalty_applied=int(_contradiction_penalty_count),
+        mmr_applied=int(_mmr_applied_count),
     )
 
 
@@ -22484,6 +22771,7 @@ def multi_retrieve(
     variants: list[str] | None = None
     filters_applied: dict = {}
     _mv_contradiction_count_acc = 0
+    _mv_mmr_count_acc = 0
     for name, path in vaults:
         col = get_db_for(path)
         if col.count() == 0:
@@ -22518,6 +22806,10 @@ def multi_retrieve(
             _mv_contradiction_count_acc += int(
                 r.get("contradiction_penalty_applied", 0) or 0
             )
+        except Exception:
+            pass
+        try:
+            _mv_mmr_count_acc += int(r.get("mmr_applied", 0) or 0)
         except Exception:
             pass
         # Merge graph-expanded context from all vaults
@@ -22566,6 +22858,7 @@ def multi_retrieve(
         intent=intent,
         fast_path=_multi_fast_path,
         contradiction_penalty_applied=_mv_contradiction_count,
+        mmr_applied=int(_mv_mmr_count_acc),
     )
 
 
@@ -27551,6 +27844,7 @@ def query(
             "contradiction_penalty_applied": int(
                 result.get("contradiction_penalty_applied", 0) or 0,
             ),
+            "mmr_applied": int(result.get("mmr_applied", 0) or 0),
         })
         if plain:
             click.echo("Sin resultados.")
@@ -27635,6 +27929,7 @@ def query(
             "contradiction_penalty_applied": int(
                 result.get("contradiction_penalty_applied", 0) or 0,
             ),
+            "mmr_applied": int(result.get("mmr_applied", 0) or 0),
         })
         if sess is not None:
             append_turn(sess, {
@@ -27941,6 +28236,7 @@ def query(
         "contradiction_penalty_applied": int(
             result.get("contradiction_penalty_applied", 0) or 0,
         ),
+        "mmr_applied": int(result.get("mmr_applied", 0) or 0),
     })
 
     if sess is not None:
@@ -44939,6 +45235,9 @@ def archive(min_age_days: int, query_window_days: int, folder: str | None,
 
 FOLLOWUP_STALE_DAYS = 14
 FOLLOWUP_RESOLVE_MIN_SCORE = 0.03
+_FOLLOWUP_CACHE_TTL = 600.0  # segundos — igual al intervalo del daemon anticipate
+_followup_loops_cache: dict | None = None  # {ts: float, max_mtime: float, result: list}
+_followup_loops_cache_lock = threading.Lock()
 
 _FOLLOWUP_CHECKBOX_LINE_RE = re.compile(
     r"^\s*[-*]\s*\[[ xX]\][^\n]*", re.MULTILINE,
@@ -45198,6 +45497,33 @@ def _classify_followup_loop(
     return out
 
 
+def _followup_vault_max_mtime(vault: Path) -> float | None:
+    """Devuelve el max(mtime) de los .md del vault con os.scandir recursivo.
+    Retorna None si hay error de permisos irrecuperable."""
+    try:
+        max_mtime = 0.0
+        stack = [vault]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.name.endswith(".md"):
+                            try:
+                                st = entry.stat()
+                                if st.st_mtime > max_mtime:
+                                    max_mtime = st.st_mtime
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+        return max_mtime
+    except Exception:
+        return None
+
+
 def find_followup_loops(
     col: SqliteVecCollection,
     vault: Path,
@@ -45216,8 +45542,35 @@ def find_followup_loops(
     `_fetch_completed_reminders`), el classifier prioriza matches Jaccard
     contra ellas antes de caer al retrieval + LLM judge. None → fetch
     automático con ventana = `days`.
+
+    Cache TTL 10min + invalidación por max(mtime) del vault. Se inhabilita
+    cuando el caller pasa now/judge_fn/completed_reminders explícitos para
+    preservar el comportamiento determinístico de los tests.
     """
+    global _followup_loops_cache  # noqa: PLW0603
+
+    # Cache solo cuando el caller no sobreescribe parámetros sensibles al tiempo
+    _use_cache = now is None and judge_fn is None and completed_reminders is None
+    current_max_mtime: float | None = None
+
+    if _use_cache:
+        current_max_mtime = _followup_vault_max_mtime(vault)
+        call_ts = datetime.now().timestamp()
+        with _followup_loops_cache_lock:
+            c = _followup_loops_cache
+            if (
+                c is not None
+                and current_max_mtime is not None
+                and (call_ts - c["ts"]) < _FOLLOWUP_CACHE_TTL
+                and c["max_mtime"] == current_max_mtime
+                and c["days"] == days
+                and c["stale_days"] == stale_days
+                and c["min_score"] == min_score
+            ):
+                return list(c["result"])  # copia superficial — evita mutación del cache
+
     from datetime import timedelta as _td
+
     now = now or datetime.now()
     start = now - _td(days=days)
     all_loops: list[dict] = []
@@ -45253,14 +45606,30 @@ def find_followup_loops(
 
     classified = [
         _classify_followup_loop(
-            col, loop, now,
-            stale_days=stale_days, min_score=min_score, judge_fn=judge_fn,
+            col,
+            loop,
+            now,
+            stale_days=stale_days,
+            min_score=min_score,
+            judge_fn=judge_fn,
             completed_reminders=completed_reminders,
         )
         for loop in all_loops
     ]
     order = {"stale": 0, "activo": 1, "resolved": 2}
     classified.sort(key=lambda r: (order.get(r["status"], 3), -r["age_days"]))
+
+    if _use_cache and current_max_mtime is not None:
+        with _followup_loops_cache_lock:
+            _followup_loops_cache = {
+                "ts": datetime.now().timestamp(),
+                "max_mtime": current_max_mtime,
+                "days": days,
+                "stale_days": stale_days,
+                "min_score": min_score,
+                "result": list(classified),
+            }
+
     return classified
 
 
@@ -48624,6 +48993,16 @@ def serve(host: str, port: int):
         # session persistence (no es un turn de conversación).
         retrieve_only = bool(body.get("retrieve_only", False))
 
+        # retrieve_only skipea expand_queries() — el caller (listener WA)
+        # descarta el output LLM-side y solo usa sources, así que las 3
+        # paráfrasis de qwen2.5:3b (1-3s) son overhead puro. Mismo patrón
+        # que `RAG_WA_SKIP_PARAPHRASE` cuando source="whatsapp". Medido
+        # 7d: serve.retrieve_only avg t_retrieve=25.3s; expand recorta
+        # 1-3s de eso sin tocar recall (BM25 + semantic + rerank ya
+        # cubren la query original).
+        if retrieve_only:
+            multi_q = False
+
         # Emit "received" event before processing — lets the dashboard surface
         # in-flight queries even when retrieval/generation hangs (the prior
         # behavior was to log only on success, so failures silently disappeared
@@ -49191,6 +49570,7 @@ def serve(host: str, port: int):
                     "n_sources": len(sources_with_excerpts),
                     "t_retrieve": round(t_retrieve, 3),
                     "top_score": round(float(result.get("confidence", 0.0)), 3),
+                    "extra_json": {"expand_skipped": "retrieve_only"},
                 })
             except Exception:
                 pass

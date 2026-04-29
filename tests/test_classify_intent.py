@@ -252,3 +252,37 @@ def test_synthesis_does_not_fire_on_plain_resume_verb():
         "cuál fue el resumen ejecutivo que escribí ayer", TAGS, FOLDERS,
     )
     assert intent == "semantic"
+
+
+# ── "leé X y resumime" read-then-summarise pattern (W1.5) ─────────────
+# Captures the 5 mis-fires in 30d where "leé el archivo X y resumime"
+# fell into intent=semantic instead of synthesis. Uses \S+ (not \w+) so
+# filenames with dots (CLAUDE.md, coaching.md) tolerate the period.
+
+@pytest.mark.parametrize("q", [
+    "leé CLAUDE.md y resumime en 3 bullets",
+    "leeme el archivo coaching.md y sintetizame",
+    "lee el inbox y dame un resumen en 3 bullets",
+])
+def test_synthesis_fires_on_read_then_summarise(q):
+    intent, _ = rag.classify_intent(q, TAGS, FOLDERS)
+    assert intent == "synthesis", f"expected synthesis for {q!r}, got {intent}"
+
+
+@pytest.mark.parametrize("q", [
+    "leé CLAUDE.md",                                  # plain read, no summarise verb
+    "qué dice CLAUDE.md sobre rerank",                # genuine semantic question
+])
+def test_read_only_does_not_fire_synthesis(q):
+    intent, _ = rag.classify_intent(q, TAGS, FOLDERS)
+    assert intent == "semantic", f"{q!r} should stay semantic, got {intent}"
+
+
+def test_read_and_compare_routes_to_comparison():
+    # "leé X y comparame con Y" — comparison precedence wins over the
+    # read-then-summarise synthesis branch (matches existing
+    # COMPARISON-before-SYNTHESIS dispatch order in classify_intent).
+    intent, _ = rag.classify_intent(
+        "leé CLAUDE.md y comparame con README.md", TAGS, FOLDERS,
+    )
+    assert intent == "comparison"

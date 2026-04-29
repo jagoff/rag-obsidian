@@ -69,6 +69,43 @@ Este gotcha aplica también a **skills** custom en `.devin/skills/` y `.claude/s
 
 Aprendido el 2026-04-25 cuando creé `rag-perf-auditor.md` durante una sesión y `run_subagent(profile="rag-perf-auditor", ...)` rebotó.
 
+## Auto-save a `mem-vault` al cerrar una tarea
+
+**Regla universal** (versión completa en [`~/.claude/CLAUDE.md`](file:///Users/fer/.claude/CLAUDE.md) → "Auto-save a `mem-vault` al terminar una tarea"): cada vez que termino una tarea no-trivial en este repo (feature, fix, refactor, debugging con root cause, decisión arquitectónica, descubrimiento del codebase, gotcha) guardo el aprendizaje en [`mem-vault`](file:///Users/fer/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Notes/04-Archive/99-obsidian-system/99-AI/memory/) **sin que el user lo pida**.
+
+**Triggers típicos en obsidian-rag** que SÍ ameritan memoria:
+
+- Bug fix con root cause no obvio en `rag/__init__.py` / `web/server.py` (los archivos grandes donde es fácil olvidar contexto).
+- Refactor de algoritmo con invariantes (ej. el hybrid algorithm del `_IberianLeakFilter` streaming, commit `582406f`).
+- Convención de un wrapper de `ollama.chat` (qué dict devuelve, qué timeout aplica, dónde se aplica el filter chain).
+- Performance findings con números reales (telemetría de `rag_log_sql`, p50/p95/p99).
+- Workflow operativo nuevo (ej. `git apply --recount --3way` para extraer hunks de un working tree compartido con peer agents).
+- Setup steps no triviales (env vars `RAG_*`, plists, permissions de macOS).
+- Eval baselines (qué métrica mediste, con qué dataset, qué número fue el delta).
+
+**No guardar**: tareas exploratorias puras, cambios cosméticos, info ya en `CLAUDE.md` / `AGENTS.md` / docstrings (mejor referenciar que duplicar).
+
+**Tool**:
+
+```python
+mcp_call_tool(
+  server_name="mem-vault",
+  tool_name="memory_save",
+  arguments={
+    "title": "...",                           # frase descriptiva, no slug
+    "type": "decision",                       # decision / fact / bug / feedback / preference / note / todo
+    "tags": ["rag", "obsidian-rag", "..."],   # mínimo 3 (proyecto + dominio + técnica)
+    "content": "# ...\n## Contexto\n...",     # markdown enriquecido (ver detalle en global)
+  }
+)
+```
+
+**Formato del content**: secciones `## Contexto`, `## Problema` / `## Causa raíz`, `## Solución` con bloques de código, `## Cómo lo medí` / `## Tests`, `## Cuándo aplicar este patrón`, `## Aprendido el YYYY-MM-DD` (con commit SHA). Inline code para nombres de funciones/archivos/env vars. Listas con bullets, no walls of text.
+
+**`auto_extract=false`** (default) — el body crudo es lo que quiero indexar, no una versión resumida por LLM.
+
+**Por qué importa especialmente en este repo**: `rag/__init__.py` tiene 54.5k líneas y muchas funciones con sufijos similares (`_pp_task_repair`, `_pp_task_critique`, `_pp_format_critique`, ...). Sin memoria persistente de qué wrapper hace qué, en 2 sesiones futuras vuelvo a romper el filter chain o a re-descubrir un truco. Las memorias quedan searchable semánticamente y sobreviven al context-compaction.
+
 ## Auto-pull + commit + push rule
 
 **Regla universal: cuando termino ALGO — feature, fix, refactor, limpieza, ajuste — el ciclo es siempre `git pull → git commit → git push origin master`. Sin preguntar.**

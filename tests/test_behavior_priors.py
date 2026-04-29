@@ -143,18 +143,28 @@ def test_load_behavior_priors_with_events(tmp_path, monkeypatch):
 
 
 def test_load_behavior_priors_cache_invalidation(tmp_path, monkeypatch):
-    """Cache invalidates when rag_behavior MAX(ts) moves forward."""
+    """Cache invalidates when rag_behavior MAX(ts) moves forward.
+
+    Wave1 (2026-04-29): el TTL fast-path bypasea SQL si `loaded_at` está
+    dentro del window. Para verificar invalidación por MAX(ts), reseteamos
+    `_behavior_priors_cache_loaded_at` antes de cada call que necesita
+    re-consultar SQL.
+    """
     import rag
     monkeypatch.setattr(rag, "DB_PATH", tmp_path)
     monkeypatch.setattr(rag, "_behavior_priors_cache", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key", None)
     monkeypatch.setattr(rag, "_behavior_priors_cache_key_sql", None)
+    monkeypatch.setattr(rag, "_behavior_priors_cache_loaded_at", None)
 
     p1 = rag._load_behavior_priors()
     n1 = p1["n_events"]
 
     # Seed events → MAX(ts) moves, cache invalidates.
     _seed_sql_behavior(tmp_path, _TEST_EVENTS)
+    # Reseteo del TTL: sin esto el fast-path devolvería el snapshot vacío
+    # de la primera call (TTL=60s y el seed corre en <1s).
+    monkeypatch.setattr(rag, "_behavior_priors_cache_loaded_at", None)
     p2 = rag._load_behavior_priors()
     n2 = p2["n_events"]
 

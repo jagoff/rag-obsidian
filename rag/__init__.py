@@ -5871,6 +5871,27 @@ _TELEMETRY_DDL: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Brief schedule overrides — auto-tune destination (2026-04-29).
+        # Una row por brief_kind (morning/today/digest). Si existe, el
+        # `_services_spec()` la usa al regenerar el plist de ese kind;
+        # si no existe, cae al default hardcoded en `_morning_plist` /
+        # `_today_plist` / `_digest_plist`. Las prefs se escriben desde
+        # `rag/brief_schedule.py` (set_brief_schedule_pref) y se leen
+        # desde el spec (get_brief_schedule_pref). Bandas seguras
+        # enforced por la función writer — la DB sólo enforce el PK.
+        # Reset via DELETE (rag brief schedule reset --kind <kind>).
+        "rag_brief_schedule_prefs",
+        (
+            "CREATE TABLE IF NOT EXISTS rag_brief_schedule_prefs ("
+            " brief_kind TEXT PRIMARY KEY,"
+            " hour INTEGER NOT NULL,"
+            " minute INTEGER NOT NULL DEFAULT 0,"
+            " last_updated TEXT NOT NULL,"
+            " reason TEXT"
+            ")",
+        ),
+    ),
+    (
         "rag_cpu_metrics",
         (
             "CREATE TABLE IF NOT EXISTS rag_cpu_metrics ("
@@ -14554,6 +14575,10 @@ def _resolve_reranker_model_path() -> str:
     GC#2.B (2026-04-22): fine-tune shipped via `scripts/finetune_reranker.py`
     promotes a checkpoint through the symlink only after passing the eval
     gate. Absent or broken symlink → baseline stays in effect.
+
+    Note: this function returns the **base** model path. The LoRA adapter
+    from GC#2.C is loaded **on top** of whatever base this returns — see
+    `_apply_reranker_lora_adapter()` below.
     """
     explicit = os.environ.get("RAG_RERANKER_FT_PATH", "").strip()
     if explicit and Path(explicit).exists():
@@ -14568,6 +14593,106 @@ def _resolve_reranker_model_path() -> str:
     except Exception:
         pass
     return RERANKER_MODEL
+
+
+# ── GC#2.C — LoRA adapter loader (2026-04-23) ─────────────────────────────
+# Fine-tune del cross-encoder via PEFT/LoRA en vez del full-model fine-tune
+# de GC#2.B. Diferencias:
+#   - GC#2.B (RAG_RERANKER_FT_PATH / symlink): substitutes the full model.
+#     ~2 GiB on disk per checkpoint. Promoted via the eval gate inside
+#     scripts/finetune_reranker.py.
+#   - GC#2.C (RAG_RERANKER_FT=1, this section): trains a tiny LoRA adapter
+#     (r=8, alpha=16, ~5 MB on disk) on top of the base model. Loaded as a
+#     runtime overlay — base weights are immutable, the adapter projects
+#     low-rank updates into Q/K/V. Cheaper to train (LoRA params only),
+#     cheaper to revert (delete the adapter dir), and the user can
+#     A/B base-vs-LoRA via toggling the env flag.
+# Both paths can coexist in principle, but the ranking matters:
+#   1. RAG_RERANKER_FT=1 + valid adapter → base model (resolved by
+#      `_resolve_reranker_model_path()`) + LoRA adapter on top.
+#   2. RAG_RERANKER_FT=1 but adapter missing/invalid → fall back to the
+#      resolved base model alone, log to `silent_errors.jsonl`. NEVER
+#      raises — the reranker is on the hot path of every retrieve().
+#   3. RAG_RERANKER_FT unset → base model alone (default behaviour, no
+#      change vs pre-GC#2.C).
+#
+# Adapter dir convention: `~/.local/share/obsidian-rag/reranker_ft/`
+# (not `~/.cache/`, because user feedback signal is not regeneratable —
+# the cache root is wiped by macOS automatically when low on disk; this
+# is a curated fine-tune output we don't want to lose silently).
+RERANKER_FT_ADAPTER_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "reranker_ft"
+
+
+def _reranker_ft_enabled() -> bool:
+    """True iff the RAG_RERANKER_FT env var is set to a truthy value.
+
+    Default OFF during rollout — operator explicitly opts in. The flag is
+    a boolean, not a path; the adapter dir is hardcoded to
+    `~/.local/share/obsidian-rag/reranker_ft/` for predictability (no
+    guessing which checkpoint is active).
+    """
+    return os.environ.get("RAG_RERANKER_FT", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
+    """Apply a PEFT/LoRA adapter on top of a freshly-loaded CrossEncoder.
+
+    Returns True iff the adapter was applied successfully. On any failure
+    (peft not installed, adapter dir missing, config malformed, peft load
+    raises) → log to `silent_errors.jsonl` via `_silent_log()` and return
+    False so the caller leaves the model on the base path.
+
+    Conservative design: this function MUST NOT raise. The reranker sits
+    on the hot path of every retrieve() — a missing dependency or stale
+    adapter dir cannot tumble user-facing queries. Worst case, the user
+    sees baseline rerank quality + a silent_errors entry.
+    """
+    try:
+        if not isinstance(adapter_dir, Path):
+            adapter_dir = Path(adapter_dir)
+        if not adapter_dir.is_dir():
+            _silent_log(
+                "reranker_ft_adapter_dir_missing",
+                FileNotFoundError(str(adapter_dir)),
+            )
+            return False
+        # PEFT adapter dir convention: adapter_config.json + the weights
+        # file (adapter_model.safetensors or adapter_model.bin). Cheap
+        # sanity check before importing peft + spinning up the loader.
+        if not (adapter_dir / "adapter_config.json").is_file():
+            _silent_log(
+                "reranker_ft_adapter_config_missing",
+                FileNotFoundError(str(adapter_dir / "adapter_config.json")),
+            )
+            return False
+        try:
+            from peft import PeftModel  # type: ignore
+        except ImportError as exc:
+            _silent_log("reranker_ft_peft_missing", exc)
+            return False
+        # CrossEncoder wraps the HF transformer in `.model` — that's the
+        # module PEFT needs to wrap. Older sentence-transformers versions
+        # used a different attribute name; fall through to the model
+        # itself if `.model` doesn't exist (best-effort).
+        underlying = getattr(model, "model", None)
+        if underlying is None:
+            _silent_log(
+                "reranker_ft_no_underlying_model",
+                AttributeError("CrossEncoder has no `.model` attribute"),
+            )
+            return False
+        peft_model = PeftModel.from_pretrained(underlying, str(adapter_dir))
+        # Splice the PEFT-wrapped module back into the CrossEncoder so
+        # downstream `.predict()` calls hit the LoRA-adjusted forward.
+        model.model = peft_model
+        return True
+    except Exception as exc:
+        # Catch-all: any unexpected failure (corrupt safetensors, dtype
+        # mismatch, OOM during adapter init) falls back to base model.
+        _silent_log("reranker_ft_adapter_load_failed", exc)
+        return False
 
 
 def get_reranker():
@@ -14610,6 +14735,13 @@ def get_reranker():
             device = "cpu"
         model_path = _resolve_reranker_model_path()
         _reranker = CrossEncoder(model_path, max_length=512, device=device)
+        # GC#2.C: opt-in LoRA adapter overlay. Only attempted when the
+        # operator set RAG_RERANKER_FT=1 — default OFF during rollout.
+        # `_apply_reranker_lora_adapter()` never raises; on any failure
+        # the reranker stays on the base path and a line is appended to
+        # silent_errors.jsonl for the operator to inspect.
+        if _reranker_ft_enabled():
+            _apply_reranker_lora_adapter(_reranker, RERANKER_FT_ADAPTER_DIR)
     return _reranker
 
 
@@ -29381,7 +29513,11 @@ def brief(ctx: click.Context):
     """Auditar el loop de feedback de los briefs (morning/evening/digest).
 
     Subcomandos:
-      rag brief stats           # conteos por rating + última fecha
+      rag brief stats              # conteos por rating + última fecha
+      rag brief schedule           # current schedule + recommendations
+      rag brief schedule status    # `analyze_brief_feedback` por kind
+      rag brief schedule reset     # borra override (vuelve al default)
+      rag brief schedule auto-tune # aplica el shift sugerido
     """
     if ctx.invoked_subcommand is None:
         ctx.invoke(brief_stats, plain=False)
@@ -29452,6 +29588,270 @@ def brief_stats(plain: bool):
             )
         if last_ts:
             console.print(f"[dim]último feedback: {last_ts}[/dim]")
+
+
+# ── rag brief schedule — auto-tuning del horario de los briefs ─────────────
+# Si el user mutea consistentemente el morning brief en la primera hora
+# (07:00–07:59), este sub-grupo ofrece (a) ver la recomendación, (b)
+# aplicarla escribiendo en `rag_brief_schedule_prefs`, (c) volver al
+# default. El daemon `com.fer.obsidian-rag-brief-auto-tune` corre el
+# `auto-tune --apply` cada Domingo 03:00. Lógica en
+# `rag/brief_schedule.py` (analyze_brief_feedback + safe-bands).
+#
+# Nombre del callable Python = `brief_schedule_grp` (NO `brief_schedule`)
+# para no sombrear el submódulo `rag.brief_schedule` cuando alguien hace
+# `from rag import brief_schedule`. El nombre del subcomando de Click
+# ("schedule") es independiente y no cambia.
+@brief.group("schedule", invoke_without_command=True)
+@click.pass_context
+def brief_schedule_grp(ctx: click.Context):
+    """Ver/ajustar el horario de los briefs morning/today/digest.
+
+    Sin subcomando muestra el current schedule + recommendations
+    (equivalente a `rag brief schedule status`).
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(brief_schedule_status, plain=False)
+
+
+def _format_recommendation_line(kind: str, analysis: dict, plain: bool) -> str:
+    cur = f"{analysis['current_hour']:02d}:{analysis['current_minute']:02d}"
+    rec = analysis["recommendation"]
+    if rec["should_shift"]:
+        sh, sm = rec["suggested_hour"], rec["suggested_minute"]
+        new = f"{sh:02d}:{sm:02d}"
+        body = (
+            f"{kind:>7}: {cur} → {new}  "
+            f"[mute={analysis['mute_count']} pos={analysis['positive_count']} "
+            f"neg={analysis['negative_count']}]  {rec['reason']}"
+        )
+        return body if plain else f"[yellow]{body}[/yellow]"
+    body = (
+        f"{kind:>7}: {cur} (no shift)  "
+        f"[mute={analysis['mute_count']} pos={analysis['positive_count']} "
+        f"neg={analysis['negative_count']}]  {rec['reason']}"
+    )
+    return body if plain else f"[dim]{body}[/dim]"
+
+
+@brief_schedule_grp.command("status")
+@click.option("--plain", is_flag=True,
+              help="Output plano sin colores (para piping/scripts).")
+@click.option("--lookback-days", type=int, default=30, show_default=True,
+              help="Ventana en días para `rag_brief_feedback`.")
+def brief_schedule_status(plain: bool, lookback_days: int):
+    """Muestra current schedule + recommendation por cada brief_kind.
+
+    Lee `rag_brief_schedule_prefs` (current overrides) + `rag_brief_feedback`
+    (últimos N días) y corre `analyze_brief_feedback` para cada kind. Output:
+
+        morning: 07:00 → 08:00  [mute=4 pos=1 neg=0]  shift +30min: ...
+        today:   22:00 (no shift)  [mute=0 pos=0 neg=0]  sin feedback ...
+        digest:  22:00 (no shift)  [...]
+
+    Pensado para ojo manual y para el daemon de auto-tune (que parsea
+    el JSON via `analyze_all` directamente, no este CLI).
+    """
+    try:
+        from rag.brief_schedule import VALID_BRIEF_KINDS, analyze_brief_feedback
+    except Exception as exc:
+        msg = f"error importando rag.brief_schedule: {exc}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    if plain:
+        click.echo(f"brief schedule (lookback {lookback_days}d):")
+    else:
+        console.print(
+            f"[bold]brief schedule[/bold] [dim](lookback {lookback_days}d)[/dim]"
+        )
+    for kind in VALID_BRIEF_KINDS:
+        try:
+            analysis = analyze_brief_feedback(kind, lookback_days=lookback_days)
+        except Exception as exc:
+            line = f"  {kind}: ERROR {exc}"
+            click.echo(line) if plain else console.print(f"[red]{line}[/red]")
+            continue
+        line = _format_recommendation_line(kind, analysis, plain)
+        click.echo("  " + line) if plain else console.print("  " + line)
+
+
+@brief_schedule_grp.command("reset")
+@click.option("--kind", "kind", type=click.Choice(["morning", "today", "digest", "all"]),
+              required=True, help="Cuál override borrar.")
+@click.option("--plain", is_flag=True)
+def brief_schedule_reset(kind: str, plain: bool):
+    """Borra el override de `rag_brief_schedule_prefs` (vuelve al default).
+
+    Útil si el auto-tune metió un horario que no te gusta o si querés
+    resetear todo después de un experimento. El próximo `rag setup`
+    regenerará los plists con el default hardcoded.
+
+    `--kind all` borra los tres overrides en una sola llamada.
+    """
+    try:
+        from rag.brief_schedule import (
+            VALID_BRIEF_KINDS, reset_brief_schedule_pref,
+        )
+    except Exception as exc:
+        msg = f"error importando rag.brief_schedule: {exc}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    targets = list(VALID_BRIEF_KINDS) if kind == "all" else [kind]
+    for k in targets:
+        ok = reset_brief_schedule_pref(k)
+        if ok:
+            line = f"✓ {k}: override borrado (vuelve al default)"
+            click.echo(line) if plain else console.print(f"[green]{line}[/green]")
+        else:
+            line = f"✗ {k}: error borrando override"
+            click.echo(line) if plain else console.print(f"[red]{line}[/red]")
+
+
+def _bootstrap_brief_plist(kind: str) -> tuple[bool, str]:
+    """Re-bootstrap the launchd plist for `kind` only. Used by
+    `auto-tune --apply` after writing the override so launchd picks up
+    the new StartCalendarInterval without waiting for `rag setup`.
+
+    Returns (ok, message). Silent-fail-friendly: returns False + message
+    if launchctl isn't available (Linux CI, sandboxed env). The override
+    row is still in the DB, so the next `rag setup` will regenerate the
+    plist correctly.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("launchctl") is None:
+        return (False, "launchctl no disponible (skip bootstrap)")
+    label = f"com.fer.obsidian-rag-{kind}"
+    fname = f"{label}.plist"
+    plist_path = _LAUNCH_AGENTS_DIR / fname
+    if not plist_path.is_file():
+        return (False, f"{fname} no instalado (correr `rag setup`)")
+    try:
+        rag_bin = _rag_binary()
+        # Regenerate the plist XML using the now-current pref.
+        if kind == "morning":
+            xml = _morning_plist(rag_bin, *current_schedule_for_bootstrap("morning"))
+        elif kind == "today":
+            xml = _today_plist(rag_bin, *current_schedule_for_bootstrap("today"))
+        elif kind == "digest":
+            xml = _digest_plist(rag_bin, *current_schedule_for_bootstrap("digest"))
+        else:
+            return (False, f"kind desconocido: {kind}")
+        plist_path.write_text(xml, encoding="utf-8")
+        # `bootout` then `bootstrap` swaps the running plist atomically.
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{__import__('os').getuid()}", str(plist_path)],
+            check=False, capture_output=True,
+        )
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{__import__('os').getuid()}", str(plist_path)],
+            check=False, capture_output=True,
+        )
+        return (True, f"{label} re-bootstrapped")
+    except Exception as exc:
+        return (False, f"error: {exc}")
+
+
+def current_schedule_for_bootstrap(kind: str) -> tuple[int, int]:
+    """Helper: read the currently-effective schedule (override or default)
+    for `kind`. Mirrors `rag.brief_schedule.current_schedule` but lives
+    here so the bootstrap path doesn't depend on the analyzer module
+    reloading on each launchctl invocation."""
+    try:
+        from rag.brief_schedule import current_schedule
+        return current_schedule(kind)
+    except Exception:
+        # Defensive fallback to defaults from DEFAULT_SCHEDULES.
+        return {"morning": (7, 0), "today": (22, 0), "digest": (22, 0)}.get(kind, (0, 0))
+
+
+@brief_schedule_grp.command("auto-tune")
+@click.option("--dry-run", is_flag=True,
+              help="Forzar dry-run aunque venga --apply (CI / sanity check).")
+@click.option("--apply", "apply_flag", is_flag=True,
+              help="Escribir overrides + re-bootstrap del plist afectado.")
+@click.option("--lookback-days", type=int, default=30, show_default=True,
+              help="Ventana en días para `rag_brief_feedback`.")
+@click.option("--plain", is_flag=True)
+def brief_schedule_auto_tune(dry_run: bool, apply_flag: bool, lookback_days: int, plain: bool):
+    """Aplicar el shift sugerido por `analyze_brief_feedback` para cada kind.
+
+    Sin `--apply` corre en dry-run: muestra qué shifts haría sin tocar la
+    DB. Con `--apply`, escribe en `rag_brief_schedule_prefs` y re-bootstrappea
+    sólo el plist afectado (no toca los otros) via `launchctl bootout` +
+    `bootstrap`. `--dry-run` siempre gana sobre `--apply` (útil para
+    pre-flight check antes del cron del Domingo).
+
+    Modo de uso:
+
+      rag brief schedule auto-tune              # dry-run, ver qué haría
+      rag brief schedule auto-tune --apply      # aplicar (escribe + bootstrap)
+
+    El daemon `com.fer.obsidian-rag-brief-auto-tune.plist` corre con
+    `--apply` cada Domingo 03:00.
+    """
+    # Default = dry-run unless --apply is set. --dry-run forces dry-run.
+    is_dry = dry_run or not apply_flag
+    try:
+        from rag.brief_schedule import (
+            VALID_BRIEF_KINDS, analyze_brief_feedback, set_brief_schedule_pref,
+        )
+    except Exception as exc:
+        msg = f"error importando rag.brief_schedule: {exc}"
+        click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
+        return
+
+    header = f"brief auto-tune {'(dry-run)' if is_dry else '(apply)'}"
+    if plain:
+        click.echo(header)
+    else:
+        console.print(f"[bold]{header}[/bold]")
+
+    any_shift = False
+    for kind in VALID_BRIEF_KINDS:
+        try:
+            analysis = analyze_brief_feedback(kind, lookback_days=lookback_days)
+        except Exception as exc:
+            line = f"  {kind}: ERROR {exc}"
+            click.echo(line) if plain else console.print(f"[red]{line}[/red]")
+            continue
+        rec = analysis["recommendation"]
+        if not rec["should_shift"]:
+            line = (
+                f"  {kind}: no shift "
+                f"({rec['reason']})"
+            )
+            click.echo(line) if plain else console.print(f"[dim]{line}[/dim]")
+            continue
+        any_shift = True
+        sh, sm = rec["suggested_hour"], rec["suggested_minute"]
+        cur_h, cur_m = analysis["current_hour"], analysis["current_minute"]
+        line = (
+            f"  {kind}: {cur_h:02d}:{cur_m:02d} → {sh:02d}:{sm:02d}  "
+            f"({rec['reason']})"
+        )
+        click.echo(line) if plain else console.print(f"[yellow]{line}[/yellow]")
+        if is_dry:
+            continue
+        ok = set_brief_schedule_pref(kind, sh, sm, reason=rec["reason"])
+        if not ok:
+            err = f"    ✗ falló escribir pref para {kind}"
+            click.echo(err) if plain else console.print(f"[red]{err}[/red]")
+            continue
+        bok, bmsg = _bootstrap_brief_plist(kind)
+        prefix = "    ✓" if bok else "    ·"
+        line2 = f"{prefix} {bmsg}"
+        if plain:
+            click.echo(line2)
+        else:
+            console.print(line2 if bok else f"[dim]{line2}[/dim]")
+
+    if not any_shift:
+        msg = "nada para aplicar — todos los kinds en zona buena"
+        click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
 
 
 @cli.command("state")
@@ -44547,7 +44947,15 @@ def _web_plist(rag_bin: str) -> str:
 """
 
 
-def _digest_plist(rag_bin: str) -> str:
+def _digest_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
+    """Weekly digest plist — Sunday `hour:minute` (default 22:00).
+
+    `hour`/`minute` honor a `rag_brief_schedule_prefs` override when
+    `_services_spec()` reads one (auto-tune feature, 2026-04-29).
+    Defaults preserve the historical schedule when no pref exists; the
+    auto-tune writer enforces the safe band before persisting, so a
+    pref-driven override never lands outside `[21:00, 23:30]`.
+    """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44568,8 +44976,8 @@ def _digest_plist(rag_bin: str) -> str:
   <key>StartCalendarInterval</key>
   <dict>
     <key>Weekday</key><integer>0</integer>
-    <key>Hour</key><integer>22</integer>
-    <key>Minute</key><integer>0</integer>
+    <key>Hour</key><integer>{int(hour)}</integer>
+    <key>Minute</key><integer>{int(minute)}</integer>
   </dict>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/digest.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/digest.error.log</string>
@@ -44578,7 +44986,17 @@ def _digest_plist(rag_bin: str) -> str:
 """
 
 
-def _morning_plist(rag_bin: str) -> str:
+def _morning_plist(rag_bin: str, hour: int = 7, minute: int = 0) -> str:
+    """Morning brief plist — Mon-Fri `hour:minute` (default 07:00).
+
+    `hour`/`minute` honor a `rag_brief_schedule_prefs` override when
+    `_services_spec()` reads one (auto-tune feature, 2026-04-29).
+    Defaults preserve the historical schedule when no pref exists; the
+    auto-tune writer enforces the safe band before persisting, so a
+    pref-driven override never lands outside `[06:30, 09:00]`.
+    """
+    h = int(hour)
+    m = int(minute)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44599,11 +45017,11 @@ def _morning_plist(rag_bin: str) -> str:
   </dict>
   <key>StartCalendarInterval</key>
   <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
   </array>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/morning.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/morning.error.log</string>
@@ -44612,7 +45030,17 @@ def _morning_plist(rag_bin: str) -> str:
 """
 
 
-def _today_plist(rag_bin: str) -> str:
+def _today_plist(rag_bin: str, hour: int = 22, minute: int = 0) -> str:
+    """Evening "today" brief plist — Mon-Fri `hour:minute` (default 22:00).
+
+    `hour`/`minute` honor a `rag_brief_schedule_prefs` override when
+    `_services_spec()` reads one (auto-tune feature, 2026-04-29). The
+    safe band for `today` is `[18:00, 21:00]`; the historical default
+    (22:00) lives outside that band by design — it's the user's
+    explicit baseline, only auto-tune-driven shifts have to stay inside.
+    """
+    h = int(hour)
+    m = int(minute)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44633,11 +45061,11 @@ def _today_plist(rag_bin: str) -> str:
   </dict>
   <key>StartCalendarInterval</key>
   <array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
   </array>
   <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/today.log</string>
   <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/today.error.log</string>
@@ -45591,8 +46019,95 @@ def _serve_watchdog_plist(rag_bin: str) -> str:  # noqa: ARG001 (rag_bin no usad
 """
 
 
+def _brief_auto_tune_plist(rag_bin: str) -> str:
+    """Sunday 03:00 weekly auto-tune of brief schedules (2026-04-29).
+
+    Reads `rag_brief_feedback`, decides whether to shift any of the
+    morning/today/digest plists' StartCalendarInterval forward, and
+    applies the override via `rag_brief_schedule_prefs`. Sunday 03:00
+    is chosen so:
+
+      - It runs AFTER online-tune (03:30 daily) on the only day it
+        matters in the same window — actually online-tune is at 03:30,
+        so 03:00 sneaks in BEFORE it. That's deliberate: the auto-tune
+        write only touches `rag_brief_schedule_prefs` (a single-row PK
+        upsert), zero contention with the heavy SQL of online-tune.
+      - It's well before `rag digest` (Sunday 22:00 by default, or its
+        override) so any shift takes effect on the same Sunday's digest.
+      - The user is asleep — no UX surprise from a plist re-bootstrap.
+
+    `--apply` writes the override AND re-bootstraps only the affected
+    kind via `launchctl`. `RunAtLoad=false` so `rag setup` doesn't
+    fire it on install (no point — there's nothing to tune yet).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fer.obsidian-rag-brief-auto-tune</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{rag_bin}</string>
+    <string>brief</string>
+    <string>schedule</string>
+    <string>auto-tune</string>
+    <string>--apply</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>{Path.home()}</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{Path.home()}/.local/bin</string>
+    <key>NO_COLOR</key><string>1</string>
+    <key>TERM</key><string>dumb</string>
+    <key>RAG_STATE_SQL</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>{_RAG_LOG_DIR}/brief-auto-tune.log</string>
+  <key>StandardErrorPath</key><string>{_RAG_LOG_DIR}/brief-auto-tune.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
-    """Return [(label, plist_filename, plist_xml), ...]."""
+    """Return [(label, plist_filename, plist_xml), ...].
+
+    Brief schedule overrides (2026-04-29): morning/today/digest plists
+    consult `rag_brief_schedule_prefs` via `rag.brief_schedule.
+    get_brief_schedule_pref()` BEFORE generating their XML. If a row
+    exists, the override `(hour, minute)` is substituted; otherwise the
+    historical defaults from the plist functions kick in. The lookup
+    is silent-fail on any SQL error (fresh DB, locked file, etc.) so
+    `rag setup` on a brand-new install never blocks on telemetry.
+    """
+    # Lazy import keeps module-load lightweight + avoids a circular
+    # import (brief_schedule lazy-imports back into rag for SQL conn).
+    try:
+        from rag.brief_schedule import get_brief_schedule_pref
+    except Exception:
+        def get_brief_schedule_pref(_kind):  # type: ignore
+            return None
+
+    def _override(kind: str, default_hour: int, default_minute: int) -> tuple[int, int]:
+        try:
+            pref = get_brief_schedule_pref(kind)
+        except Exception:
+            pref = None
+        if pref is None:
+            return (default_hour, default_minute)
+        return (int(pref.get("hour", default_hour)), int(pref.get("minute", default_minute)))
+
+    morning_h, morning_m = _override("morning", 7, 0)
+    today_h, today_m = _override("today", 22, 0)
+    digest_h, digest_m = _override("digest", 22, 0)
+
     return [
         ("com.fer.obsidian-rag-watch", "com.fer.obsidian-rag-watch.plist",
          _watch_plist(rag_bin)),
@@ -45605,11 +46120,11 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-web", "com.fer.obsidian-rag-web.plist",
          _web_plist(rag_bin)),
         ("com.fer.obsidian-rag-digest", "com.fer.obsidian-rag-digest.plist",
-         _digest_plist(rag_bin)),
+         _digest_plist(rag_bin, hour=digest_h, minute=digest_m)),
         ("com.fer.obsidian-rag-morning", "com.fer.obsidian-rag-morning.plist",
-         _morning_plist(rag_bin)),
+         _morning_plist(rag_bin, hour=morning_h, minute=morning_m)),
         ("com.fer.obsidian-rag-today", "com.fer.obsidian-rag-today.plist",
-         _today_plist(rag_bin)),
+         _today_plist(rag_bin, hour=today_h, minute=today_m)),
         ("com.fer.obsidian-rag-wake-up", "com.fer.obsidian-rag-wake-up.plist",
          _wake_up_plist(rag_bin)),
         ("com.fer.obsidian-rag-emergent", "com.fer.obsidian-rag-emergent.plist",
@@ -45698,6 +46213,14 @@ def _services_spec(rag_bin: str) -> list[tuple[str, str, str]]:
         ("com.fer.obsidian-rag-serve-watchdog",
          "com.fer.obsidian-rag-serve-watchdog.plist",
          _serve_watchdog_plist(rag_bin)),
+        # Brief schedule auto-tune (2026-04-29) — Sunday 03:00 reads
+        # rag_brief_feedback last 30d, decides whether to shift any of
+        # morning/today/digest plists' StartCalendarInterval forward
+        # (within safe bands), and re-bootstraps only the affected kind.
+        # Silent-fail end-to-end — no UX disruption from a stuck cron.
+        ("com.fer.obsidian-rag-brief-auto-tune",
+         "com.fer.obsidian-rag-brief-auto-tune.plist",
+         _brief_auto_tune_plist(rag_bin)),
     ]
 
 
@@ -52913,6 +53436,10 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "Pin reranker en MPS VRAM permanentemente. Seteado en web+serve plists."),
     ("RAG_RERANKER_FT_PATH", "", "path",
      "Path a un fine-tuned reranker (override del base bge-reranker-v2-m3)."),
+    ("RAG_RERANKER_FT", "", "bool",
+     "GC#2.C: cargar LoRA adapter desde ~/.local/share/obsidian-rag/reranker_ft/ "
+     "on top del base reranker. Default OFF; fallback silencioso si peft no "
+     "está instalado o el adapter no existe."),
 
     # — Memory
     ("RAG_MEMORY_PRESSURE_DISABLE", "", "bool",

@@ -507,6 +507,54 @@ Health check: si `total` no crece después de unos días de uso, o todo se va a 
 
 **Tests**: [`tests/test_brief_feedback_endpoint.py`](tests/test_brief_feedback_endpoint.py) (3 ratings + validation + silent-fail + persistencia E2E, 9 casos), [`tests/test_brief_push_dedup_key_footer.py`](tests/test_brief_push_dedup_key_footer.py) (footer agrega `_brief:<vault_relpath>_` para morning/evening/digest, 8 casos). Drift guard: table count en [`tests/test_sql_state_primitives.py`](tests/test_sql_state_primitives.py) bumpeado 45→46.
 
+### Brief schedule auto-tuning — el horario de los briefs se mueve solo (2026-04-29)
+
+Cierra el ciclo del brief feedback loop: si el usuario mutea consistentemente el morning brief en la primera hora (07:00–07:59), el sistema mueve el plist morning a un horario más tardío automáticamente — sin pedir nada. Mismo principio para today / digest dentro de bandas seguras hardcoded.
+
+**Lógica** (en [`rag/brief_schedule.py`](rag/brief_schedule.py)):
+
+- `analyze_brief_feedback(brief_kind, lookback_days=30)` lee `rag_brief_feedback`, filtra por kind via path heuristic (`_classify_brief_kind` matchea `-morning.md` / `-evening.md` / `-digest.md` o el patrón date-only/`YYYY-Wnn.md`), bucketiza ratings + cuenta mutes por hora-de-feedback.
+- **Decision rule**: si `mutes_first_hour ≥ 3` (mutes cuyo `ts.hour == current_brief_hour`) AND `mute / (mute + positive) > 0.5` → sugerir shift `+30min` iterativo dentro de la banda hasta encontrar un slot con menos mutes.
+- **Bandas seguras** (hardcoded — invariante operativo, no user-tunable): `morning ∈ [06:30, 09:00]`, `today ∈ [18:00, 21:00]`, `digest ∈ [21:00, 23:30]`. `set_brief_schedule_pref()` rechaza writes fuera de banda; nunca puede landear ahí ni con un caller buggy.
+
+**Tabla `rag_brief_schedule_prefs`** (single-row-per-kind, upsert):
+
+```sql
+CREATE TABLE rag_brief_schedule_prefs (
+  brief_kind TEXT PRIMARY KEY,    -- 'morning' | 'today' | 'digest'
+  hour INTEGER NOT NULL,
+  minute INTEGER NOT NULL DEFAULT 0,
+  last_updated TEXT NOT NULL,
+  reason TEXT                      -- diagnóstico humano: por qué shifteó
+);
+```
+
+**Cómo se aplica el override**: [`_services_spec()`](rag/__init__.py) consulta `get_brief_schedule_pref(kind)` para morning/today/digest ANTES de generar cada plist. Si hay row, sustituye el `(hour, minute)` en `StartCalendarInterval`; si no, usa los defaults hardcoded de `_morning_plist` (07:00 Mon-Fri) / `_today_plist` (22:00 Mon-Fri) / `_digest_plist` (22:00 Sun). Lookup silent-fail — `rag setup` en una install fresca nunca bloquea por telemetría.
+
+**CLI** (todo en `rag brief schedule *`):
+
+```bash
+rag brief schedule                       # = status (default)
+rag brief schedule status [--plain]      # current schedule + recommendations por kind
+rag brief schedule reset --kind morning  # borra el override (vuelve al default)
+rag brief schedule reset --kind all      # borra los 3 overrides
+rag brief schedule auto-tune             # dry-run: muestra qué shifts haría
+rag brief schedule auto-tune --apply     # escribe overrides + re-bootstrap del plist afectado
+```
+
+`auto-tune --apply` escribe la pref Y re-bootstrappea sólo el plist del kind afectado (`launchctl bootout` + `bootstrap`) — no toca los otros plists ni espera al próximo `rag setup`. `--dry-run` siempre gana sobre `--apply` (sanity-check pre-cron).
+
+**Daemon nuevo** [`com.fer.obsidian-rag-brief-auto-tune.plist`](~/Library/LaunchAgents/com.fer.obsidian-rag-brief-auto-tune.plist):
+
+- Schedule: Domingo 03:00 (Sunday=0, Hour=3, Minute=0).
+- Comando: `rag brief schedule auto-tune --apply`.
+- Logs: `~/.local/share/obsidian-rag/brief-auto-tune.{log,error.log}`.
+- `RunAtLoad=false` — no dispara al install (no hay nada que tunear todavía). Se activa solo en el próximo Domingo 03:00.
+
+Por qué Domingo 03:00 específicamente: el digest semanal corre Domingo 22:00, así que cualquier shift toma efecto en el mismo digest del día. El cron de auto-tune sneakea ANTES del online-tune diario (03:30) — sin contención, ya que sólo upsertea una row PK en `rag_brief_schedule_prefs`.
+
+**Tests**: [`tests/test_brief_schedule.py`](tests/test_brief_schedule.py) (11 casos: dry-run / apply / reset / band-respect / classifier / pref-roundtrip / `_services_spec` lee la pref / daemon registrado en spec).
+
 ## Whisper learning loop — la transcripción mejora con el uso (2026-04-25)
 
 El sistema de transcripción de audios de WhatsApp aprende del corpus + correcciones manuales del usuario. Cada audio se loguea, las correcciones se acumulan, y un job nightly extrae vocabulario del corpus para sesgar el `--prompt` de whisper. Plan completo en el vault: [`04-Archive/99-obsidian-system/99-AI/system/whatsapp-whisper-learning/plan.md`](obsidian://open?vault=Notes&file=04-Archive%2F99-obsidian-system%2F99-AI%2Fsystem%2Fwhatsapp-whisper-learning%2Fplan).
@@ -710,6 +758,7 @@ Python 3.13, `uv`. Runtime venv: `.venv/bin/python`. Global tool: `~/.local/shar
 - `RAG_EXPLORE=1` — enable ε-exploration in `retrieve()` (10% chance to swap a top-3 result with a rank-4..7 candidate). Set on `morning`/`today` plists to generate counterfactuals. MUST be unset during `rag eval` — the command actively `os.environ.pop`s it and asserts, as a belt-and-suspenders guard.
 - `RAG_RERANKER_IDLE_TTL` — seconds the cross-encoder stays resident before idle-unload (default 900).
 - `RAG_RERANKER_NEVER_UNLOAD` — set to `1` in the web + serve launchd plists to pin the reranker in MPS VRAM permanently; sweeper loop still runs but skips `maybe_unload_reranker()`. Eliminates the 9s cold-reload hit after idle eviction. Cost: ~2-3 GB unified memory pinned. Safe on 36 GB with command-r + qwen3:8b resident.
+- `RAG_RERANKER_FT=1` — **GC#2.C (2026-04-23)**: opt-in al LoRA adapter del cross-encoder. Cuando está prendida, `get_reranker()` carga el adapter desde [`~/.local/share/obsidian-rag/reranker_ft/`](file:///Users/fer/.local/share/obsidian-rag/reranker_ft/) on top del base bge-reranker-v2-m3 vía [peft](https://github.com/huggingface/peft) (`PeftModel.from_pretrained`). El adapter se entrena con [`scripts/finetune_reranker.py --mode lora`](scripts/finetune_reranker.py) sobre los pares positivos/negativos de `rag_feedback` (rating=+1) + `rag_behavior` (`event='positive_implicit'` como positivos, `event='impression'` con rank ≥3 sin `open` posterior como hard-negs). LoRA config: `r=8, alpha=16, dropout=0.1`, target `query`/`value` projections de XLM-RoBERTa. **Default OFF** durante el rollout — el operador opt-inea explícitamente. Failure modes (todos silent_fail con log a `silent_errors.jsonl`, NUNCA tumban el flow): (a) flag prendida + dir vacío → fallback a base, (b) `peft` no instalado → fallback a base, (c) `adapter_config.json` missing/inválido → fallback a base. **Distinto del `RAG_RERANKER_FT_PATH`** (GC#2.B, full fine-tune via symlink): este es un overlay LoRA de ~5 MB, no un checkpoint completo de 2 GB. Pueden coexistir — el path resuelto por `_resolve_reranker_model_path()` es la base sobre la que se aplica el LoRA. **Setup**: `uv tool install --reinstall --editable '.[finetune]'` para los deps (peft + transformers + datasets + accelerate); después `python scripts/finetune_reranker.py --mode lora --epochs 3 --lr 2e-5` para entrenar. Tests: [`tests/test_finetune_reranker_gate.py`](tests/test_finetune_reranker_gate.py) (19 casos: env-unset → no peft import, dir vacío → fallback + warning, adapter válido → load OK, scores stay en [0,1], smoke con flag ON sin adapter, helpers de nDCG@5 + AUC).
 - `RAG_LOCAL_EMBED` — set to `1` in the web + serve launchd plists to use in-process `SentenceTransformer("BAAI/bge-m3")` for query embedding instead of ollama HTTP (~10-30ms vs ~140ms). Requires BAAI/bge-m3 cached in `~/.cache/huggingface/hub/` — download once with `python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"` before enabling. Verify cosine >0.999 vs ollama embeddings of same text before enabling in production. Do NOT set for indexing/watch/ingest processes — bulk chunk embedding stays on ollama. Uses CLS pooling (same as ollama gguf). Post 2026-04-21 the CLI group (`cli()` in `rag.py:11894`) auto-sets this to `1` when invoking query-like subcommands (set in `_LOCAL_EMBED_AUTO_CMDS`: `query`, `chat`, `do`, `pendientes`, `prep`, `links`, `dupes`) unless the user already set it explicitly (both truthy + falsy overrides respected). Bulk paths (`index`, `watch`, ingesters) stay off the allow-list per the same invariant. **Cold-load warmup**: loading `SentenceTransformer` on MPS takes ~5.6s end-to-end (imports + weights + first encode JIT). `_warmup_local_embedder()` (rag.py, next to `query_embed_local`) centralises the preload and is invoked from `warmup_async()` (background daemon thread for CLI query-like subcommands) and from `rag serve`'s eager warmup. Before this, only `web/server.py:_do_warmup` preloaded it — `rag serve` and one-shot CLI invocations paid the 5.6s on the critical path of the first retrieve (confirmed 2026-04-21 in `rag_queries.extra_json`: embed_ms 3455/4137/4898 on the first few serve turns, dropping to 46ms post-warmup). Helper self-gates on `_local_embed_enabled()`, swallows exceptions, and is a no-op when the flag is falsy — safe to call unconditionally. Tests: `tests/test_warmup_local_embed.py` (16 cases). **Non-blocking gate (2026-04-21 evening)**: `_local_embedder_ready: threading.Event` fires *only* after `_warmup_local_embedder()` completes load + first successful encode. `query_embed_local()` checks `Event.is_set()` **before** entering the lock — if clear, returns None immediately so the caller falls back to ollama embed (~150ms). Pre-fix the main thread blocked on the lock for 5-12s on one-shot CLI when warmup_async raced the query (measured embed_ms up to 12014 in production). Long-running processes warm up at startup so the Event is set before the first user query, keeping the fast in-process path. Tests: `tests/test_local_embed_nonblocking.py` (9 cases: Event-clear bail timing, slow-loader doesn't block, post-warmup path works, concurrent warmup+5 queries stay <100ms).
 - `RAG_FAST_PATH_KEEP_WITH_TOOLS` — rollback del auto-downgrade en `/api/chat` cuando el pre-router matchea tools deterministas estando en fast-path. **Default OFF** (downgrade activo). Motivación (2026-04-24, medido 2026-04-23): queries como "qué pendientes tengo" disparaban `fast_path=1` en `retrieve()` (intent `recent` + top-score alto) → web switchaba a `_LOOKUP_MODEL` (qwen2.5:3b) + `_LOOKUP_NUM_CTX` (4096). Pero ese mismo query matchea el pre-router (`_PLANNING_PAT`) → dispara `reminders_due` + `calendar_ahead` y **reemplaza** el CONTEXTO entero con la salida formateada (2-4K tokens de listas). qwen2.5:3b en M3 Max prefillea esas listas a ~2.5ms/tok → 7-11s sólo de prefill (medido: `"qué pendientes tengo"` llm_prefill=11595ms total=16.3s). qwen2.5:7b prefillea a ~0.5ms/tok → 1.5-2s en el mismo ctx, total estimado ~5s. El gate nuevo hace downgrade runtime: si `_fast_path=True` AND `_forced_tools` no está vacío, switch a `_resolve_web_chat_model()` + `_WEB_CHAT_NUM_CTX`. El marker `fast_path=True` en telemetry se mantiene (refleja la decisión de `retrieve()`); el marker nuevo `fast_path_downgraded=True` registra cuántas veces el downgrade disparó. Setear `export RAG_FAST_PATH_KEEP_WITH_TOOLS=1` para restaurar pre-fix. Tests: [`tests/test_web_fast_path_downgrade.py`](tests/test_web_fast_path_downgrade.py) (9 casos: contratos source-level + 3 functional con TestClient). El downgrade sólo aplica a `/api/chat` (web endpoint); `rag serve` y CLI no lo necesitan porque su fast-path no usa pre-router regex con tools.
 - `RAG_LOCAL_EMBED_WAIT_MS` — budget (milliseconds) para esperar que `_local_embedder_ready` dispare antes de caer a `embed()` ollama en `retrieve()`. **Default 6000ms tras 2026-04-23** (bumped desde 4000ms). El cold load de `SentenceTransformer('BAAI/bge-m3')` en MPS toma ~5s extremo-a-extremo (imports + weights + first encode JIT). Con el default histórico de 4000ms, el wait timeaba **exactamente** al 4s antes del Event fire — producción mostró un patrón repetido de `embed_ms=4005` exacto en 4 CLI `query` consecutivas (2026-04-23T15:14-15:15): el user pagaba 4s de wait + 5ms de fallback ollama (warm) para un total de 4005ms de embed per query — pura latencia gratis. Con 6000ms el Event dispara dentro del budget, el user recibe el path MPS (~30ms encode) en la misma query. Si el warmup también timea (disk frío, HF cache distante), el fallback ollama sigue siendo 140ms warm → cap final ~6.14s (vs 4.14s + potencial ollama cold = peor). Rollback `export RAG_LOCAL_EMBED_WAIT_MS=4000` para restaurar pre-2026-04-23. `RAG_LOCAL_EMBED_WAIT_MS=0` restaura non-blocking legacy (Event.wait returns inmediato, fallback siempre). `RAG_LOCAL_EMBED_WAIT_MS=10000` para Macs lentas (HDD externa o spinning disk). Self-contained — no cambia warmup_async ni el path long-running (serve/web), donde el Event ya está set pre-query. Tests: [`tests/test_warmup_parallel.py`](tests/test_warmup_parallel.py) + [`tests/test_query_embed_local_wait.py`](tests/test_query_embed_local_wait.py) (contratos sobre el nuevo default 6.0s).
@@ -1292,6 +1341,7 @@ Lista de plists registrados (cualquier `obsidian-rag-*` que `launchctl list` mue
 | `com.fer.obsidian-rag-serve-watchdog` | daemon | Monitor de `com.fer.obsidian-rag-serve` | Watchdog para reiniciar serve si cae |
 | `com.fer.obsidian-rag-vault-cleanup` | nightly | `rag vault-cleanup` | Limpieza de carpetas transitorias |
 | `com.fer.obsidian-rag-whisper-vocab` | 03:15 | `rag whisper-vocab refresh` | Extracción nightly de vocab WhatsApp |
+| `com.fer.obsidian-rag-brief-auto-tune` | Domingo 03:00 | `rag brief schedule auto-tune --apply` | **(nuevo 2026-04-29)** Auto-tune del horario de los briefs (morning/today/digest) basado en `rag_brief_feedback` |
 
 Si el listado anterior queda desactualizado, el source de verdad es la lista de tuplas en [`rag/__init__.py:39190+`](rag/__init__.py) (función `_plists_to_install` o similar — `grep "_plists" rag/__init__.py`).
 

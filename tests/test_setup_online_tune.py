@@ -224,7 +224,7 @@ def test_serve_plist_warm_model_env():
 
 def test_services_spec_total_count():
     specs = rag_module._services_spec(RAG_BIN)
-    # 21 base servicios + 4 ingesters cross-source
+    # 22 base servicios + 4 ingesters cross-source
     # (WhatsApp/Gmail/Reminders/Calendar). Calendar se skipea al install
     # si ~/.calendar-mcp/credentials.json no existe (gate en `setup()`),
     # pero el plist siempre está en el spec.
@@ -242,8 +242,12 @@ def test_services_spec_total_count():
     # con feedback), maintenance (2026-04-21 hardening), consolidate,
     # vault-cleanup (2026-04-27 — purge diario de carpetas transitorias
     # bajo 99-AI/, mueve a .trash/ del vault), anticipate (2026-04-24 —
-    # game-changer push proactivo cada 10 min).
-    assert len(specs) == 25
+    # game-changer push proactivo cada 10 min), serve-watchdog
+    # (2026-04-27 — HTTP healthcheck del web server cada 60s),
+    # active-learning-nudge (2026-04-29), brief-auto-tune (2026-04-29
+    # — Sunday 03:00 shift de morning/today/digest si el user mutea
+    # consistentemente). Total: 24 base + 4 ingesters cross-source = 28.
+    assert len(specs) == 28
 
 
 def test_services_spec_includes_maintenance():

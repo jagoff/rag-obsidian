@@ -1,20 +1,49 @@
 """Fine-tune bge-reranker-v2-m3 on user feedback (GC#2.B/2.C, 2026-04-22).
 
-Pipeline:
-  1. Load feedback pairs from rag_feedback ⋈ rag_queries (via turn_id).
-  2. Mine hard negatives from the corpus (top-K retrieve() results that weren't
-     in the user-positively-rated turn).
-  3. Fine-tune sentence-transformers/CrossEncoder on pairwise data.
-  4. Save to ~/.cache/obsidian-rag/reranker-ft-{ts}/.
-  5. Run `rag eval` with the fine-tuned model and the baseline. Promote the
-     symlink `~/.cache/obsidian-rag/reranker-ft-current` ONLY if both singles
-     hit@5 AND chains hit@5 beat the baseline by >= +0pp (no regression).
+Two modes are supported, dispatched via `--mode`:
+
+  --mode lora  (DEFAULT, GC#2.C 2026-04-23)
+    Trains a tiny PEFT/LoRA adapter (r=8, alpha=16, dropout=0.1) on top of
+    the base bge-reranker-v2-m3. Output: a ~5 MB adapter dir at
+    `~/.local/share/obsidian-rag/reranker_ft/`. Loaded at runtime when the
+    operator sets `RAG_RERANKER_FT=1` (default OFF).
+    Requires the `[finetune]` extra (`peft`, `transformers`, `datasets`,
+    `accelerate`). Install with:
+        uv tool install --reinstall --editable '.[finetune]'
+
+  --mode full  (GC#2.B 2026-04-22, kept for backwards-compat)
+    Full CrossEncoder fine-tune. Output: ~2 GB checkpoint dir at
+    `~/.cache/obsidian-rag/reranker-ft-{ts}/`. Promoted via the
+    `reranker-ft-current` symlink + `RAG_RERANKER_FT_PATH` env when the
+    `rag eval` gate passes (no regression on singles+chains hit@5).
+
+Pipeline (shared between both modes):
+  1. Load positive pairs from `rag_feedback` (rating=+1) + `rag_behavior`
+     (`event='positive_implicit'`) filtered by query field.
+  2. Mine hard negatives:
+     - Default: top-K retrieve() results NOT in the rated-positive turn
+       (mode=full path).
+     - With --pairs-from: pre-mined from impression history by
+       `scripts/export_training_pairs.py`.
+     - LoRA path: also samples from rag_behavior — chunks that appeared
+       in top-5 (`event='impression'` with rank ≥3) on a query whose
+       user-clicked path was different.
+  3. Stratified 80/20 split by query for held-out validation.
+  4. Train (LoRA adapter or full CrossEncoder fine-tune).
+  5. Print held-out metrics: pos/neg margin, nDCG@5 (LoRA mode), pair-rank
+     correlation.
+  6. Optional: run `rag eval` and gate-promote (full mode) / report deltas
+     vs baseline (LoRA mode).
 
 Usage:
-  python scripts/finetune_reranker.py               # training + eval + gate
-  python scripts/finetune_reranker.py --dry-run     # prepare data only
-  python scripts/finetune_reranker.py --no-eval     # skip the gate (debug only)
-  python scripts/finetune_reranker.py --epochs 3 --lr 2e-5
+  # GC#2.C — LoRA fine-tune (default mode)
+  uv run python scripts/finetune_reranker.py
+  uv run python scripts/finetune_reranker.py --epochs 3 --lr 2e-5
+  uv run python scripts/finetune_reranker.py --dry-run     # prepare data only
+
+  # GC#2.B — full fine-tune (legacy)
+  python scripts/finetune_reranker.py --mode full
+  python scripts/finetune_reranker.py --mode full --no-eval
 
   # Alternative: consume pairs pre-exported by scripts/export_training_pairs.py
   # (2026-04-22). That miner uses rag_behavior events (copies, opens, dwells)
@@ -56,9 +85,23 @@ import rag  # noqa: E402
 
 
 CACHE_ROOT = Path.home() / ".cache" / "obsidian-rag"
+# GC#2.C — LoRA adapter output dir. Picked under XDG data home (not cache)
+# because the user feedback signal is not regeneratable; we don't want the
+# OS to wipe a curated adapter when low on disk. Loader at runtime reads
+# from the same path (`rag.RERANKER_FT_ADAPTER_DIR`).
+LOCAL_FT_ROOT = Path.home() / ".local" / "share" / "obsidian-rag" / "reranker_ft"
 MODEL_TAG_BASE = "BAAI/bge-reranker-v2-m3"
 BASELINE_SINGLES_MIN = 0.0  # overwritten by actual baseline at runtime
 BASELINE_CHAINS_MIN = 0.0
+
+# GC#2.C — LoRA defaults. r=8 keeps the adapter ~5 MB; alpha=16 sets
+# scaling factor 2.0; dropout=0.1 to dampen overfit on the small (~hundreds
+# of pairs) dataset. Targets the attention Q/V projections only — the
+# convention that empirically works for cross-encoder ranking heads.
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.1
+LORA_TARGET_MODULES = ("query", "value")  # XLM-RoBERTa attention proj names
 
 
 def _fetch_feedback_pairs() -> list[dict]:
@@ -426,12 +469,639 @@ def _load_pairs_from_jsonl(
     return pairs
 
 
+# ── GC#2.C — LoRA-specific data + training ────────────────────────────────
+
+
+def _fetch_behavior_positive_pairs(window_days: int = 90) -> list[dict]:
+    """Return implicit positives from `rag_behavior` events.
+
+    Schema-aware: rag_behavior has a `query` field (added 2026-04-22 as
+    part of GC#2.A "telemetry honesty"). When present + the event is a
+    positive signal (`positive_implicit`/`open`/`save`/`kept`) we have a
+    clean (query, path) tuple ready to feed the trainer with label=1.0.
+
+    Defensive: rows without query are skipped (they predate the schema
+    change). The `vault path` filter is the same as the feedback path —
+    pseudo-URI sources (whatsapp://, gmail://, ...) require their own
+    `_path_to_doc` reader, not implemented in this script yet.
+
+    Used only in `--mode lora` — the legacy `--mode full` path keeps the
+    feedback-only signal source unchanged for parity with prior runs.
+    """
+    rows: list[dict] = []
+    try:
+        with rag._ragvec_state_conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT query, path
+                FROM rag_behavior
+                WHERE event = 'positive_implicit'
+                  AND query IS NOT NULL AND query != ''
+                  AND path  IS NOT NULL AND path != ''
+                  AND ts >= datetime('now', 'localtime', ?)
+                ORDER BY ts DESC
+                """,
+                (f"-{int(window_days)} days",),
+            )
+            for q, p in cursor.fetchall():
+                if "://" in p:
+                    # Cross-source pseudo-URI — not readable as vault file.
+                    # Future: extend `_path_to_doc` to fetch from the
+                    # source-specific store. For now skip silently.
+                    continue
+                rows.append({"q": q, "path": p})
+    except Exception as exc:
+        print(f"  [warn] _fetch_behavior_positive_pairs: {exc}", file=sys.stderr)
+    return rows
+
+
+def _fetch_behavior_hard_negatives(window_days: int = 90) -> list[dict]:
+    """Mine hard negatives from rag_behavior impressions.
+
+    Heuristic: when the user issued a query and `event='impression'` shows
+    a top-5 with rank ≥3, but a subsequent `event='open'` (close in time,
+    same query) hit a different path → the impression at rank ≥3 is a
+    hard negative for that query. The user saw it, the system thought it
+    was relevant enough to surface, but the user didn't pick it.
+
+    Output rows: {q, path, opened_path}. The opened_path is the positive
+    that anchored this triple — it's used downstream to dedup against
+    positives so the same (q, path) doesn't end up in both buckets.
+
+    Conservative: requires both impression AND open events to coexist for
+    the same (query, ts-window). Without the open event we can't
+    distinguish "didn't pick" from "didn't see / abandoned the query".
+    """
+    rows: list[dict] = []
+    try:
+        with rag._ragvec_state_conn() as conn:
+            # Step 1: opens with a query field (the positive anchor).
+            opens = conn.execute(
+                """
+                SELECT ts, query, path
+                FROM rag_behavior
+                WHERE event = 'open'
+                  AND query IS NOT NULL AND query != ''
+                  AND path  IS NOT NULL AND path != ''
+                  AND ts >= datetime('now', 'localtime', ?)
+                """,
+                (f"-{int(window_days)} days",),
+            ).fetchall()
+            # Step 2: for each open, find impressions w/ same query + rank≥3
+            # within ±10 minutes. SQLite's `datetime()` window math is
+            # tolerable here because we're scanning hundreds of rows max.
+            for ts, q, opened in opens:
+                impressions = conn.execute(
+                    """
+                    SELECT path, rank
+                    FROM rag_behavior
+                    WHERE event = 'impression'
+                      AND query = ?
+                      AND rank >= 3
+                      AND path  IS NOT NULL AND path != ''
+                      AND path != ?
+                      AND ABS(julianday(ts) - julianday(?)) * 86400 < 600
+                    """,
+                    (q, opened, ts),
+                ).fetchall()
+                for path, _rank in impressions:
+                    if "://" in path:
+                        continue
+                    rows.append({"q": q, "path": path, "opened_path": opened})
+    except Exception as exc:
+        print(f"  [warn] _fetch_behavior_hard_negatives: {exc}", file=sys.stderr)
+    return rows
+
+
+def _build_lora_training_pairs(
+    feedback_rows: list[dict],
+    vault_root: Path,
+    *,
+    include_behavior: bool = True,
+) -> list[dict]:
+    """Materialise {text1, text2, label} triples for the LoRA path.
+
+    Sources, in priority order:
+      1. rag_feedback rating=+1 with `corrective_path` (cleanest signal).
+      2. rag_feedback rating=+1 without corrective (noisy fallback — every
+         turn path is treated as positive).
+      3. rag_behavior `positive_implicit` events with a query field (when
+         `include_behavior=True`).
+    Hard negatives are ALSO mined from rag_behavior — impressions at
+    rank ≥3 with no subsequent open. This is the GC#2.C-specific signal
+    requested in the plan: chunks the system surfaced but the user did
+    NOT click. The full-FT path (mode=full) keeps the runtime retrieve()
+    miner instead.
+
+    Dedup contract: a (query, path) tuple appears at most once across the
+    whole output, with positive winning if the same (q, path) shows up in
+    both buckets (avoids the model learning contradictory labels).
+    """
+    pairs: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+    skipped_unreadable = 0
+
+    # ── 1+2. rag_feedback positives ──
+    for row in feedback_rows:
+        corrective = row.get("corrective_path")
+        positives = [corrective] if corrective else list(row.get("paths", []))
+        for p in positives:
+            if not p or "://" in p:
+                continue
+            key = (row["q"], p)
+            if key in seen_keys:
+                continue
+            doc = _path_to_doc(p, vault_root)
+            if doc is None:
+                skipped_unreadable += 1
+                continue
+            pairs.append({"text1": row["q"], "text2": doc, "label": 1.0})
+            seen_keys.add(key)
+
+    # ── 3. rag_behavior positive_implicit ──
+    if include_behavior:
+        for row in _fetch_behavior_positive_pairs():
+            key = (row["q"], row["path"])
+            if key in seen_keys:
+                continue
+            doc = _path_to_doc(row["path"], vault_root)
+            if doc is None:
+                skipped_unreadable += 1
+                continue
+            pairs.append({"text1": row["q"], "text2": doc, "label": 1.0})
+            seen_keys.add(key)
+
+    # ── Hard negatives from impressions ──
+    if include_behavior:
+        for row in _fetch_behavior_hard_negatives():
+            key = (row["q"], row["path"])
+            if key in seen_keys:
+                continue  # positive wins
+            doc = _path_to_doc(row["path"], vault_root)
+            if doc is None:
+                skipped_unreadable += 1
+                continue
+            pairs.append({"text1": row["q"], "text2": doc, "label": 0.0})
+            seen_keys.add(key)
+
+    print(f"  Built {len(pairs)} LoRA training pairs "
+          f"({skipped_unreadable} skipped unreadable).", file=sys.stderr)
+    return pairs
+
+
+def _ndcg_at_k(scores_with_labels: list[tuple[float, float]], k: int = 5) -> float:
+    """Compute nDCG@k for a single ranked list.
+
+    `scores_with_labels` is a list of (predicted_score, ground_truth_label)
+    tuples — labels are binary 0.0/1.0 in our setup. Returns 0.0 when the
+    list is empty or has no positives (degenerate but expected for some
+    held-out queries with only negatives).
+    """
+    import math
+    if not scores_with_labels:
+        return 0.0
+    ranked = sorted(scores_with_labels, key=lambda x: x[0], reverse=True)[:k]
+    dcg = sum(
+        (rel / math.log2(i + 2))  # i+2 because positions are 1-indexed (log2(1+1)=1)
+        for i, (_, rel) in enumerate(ranked)
+    )
+    ideal = sorted([rel for _, rel in scores_with_labels], reverse=True)[:k]
+    idcg = sum(rel / math.log2(i + 2) for i, rel in enumerate(ideal))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def _ndcg_per_query(
+    val_pairs: list[dict],
+    predictor,
+    k: int = 5,
+) -> dict[str, float]:
+    """Compute mean nDCG@k across queries in val_pairs.
+
+    `predictor` is a callable `[(text1, text2), ...] -> [score, ...]`.
+    Returns `{n_queries, mean_ndcg, n_no_pos}` where `n_no_pos` counts
+    queries that ended up without any positive in held-out (they get
+    nDCG=0 in the mean which is expected — they're degenerate tests).
+    """
+    by_q: dict[str, list[tuple[float, float]]] = {}
+    if not val_pairs:
+        return {"n_queries": 0, "mean_ndcg": 0.0, "n_no_pos": 0}
+    inputs = [(p["text1"], p["text2"]) for p in val_pairs]
+    preds = predictor(inputs)
+    if hasattr(preds, "tolist"):
+        preds = preds.tolist()
+    for pair, score in zip(val_pairs, preds):
+        by_q.setdefault(pair["text1"], []).append((float(score), float(pair["label"])))
+    ndcgs: list[float] = []
+    n_no_pos = 0
+    for _q, items in by_q.items():
+        if not any(lbl == 1.0 for _s, lbl in items):
+            n_no_pos += 1
+        ndcgs.append(_ndcg_at_k(items, k=k))
+    return {
+        "n_queries": len(by_q),
+        "mean_ndcg": sum(ndcgs) / len(ndcgs) if ndcgs else 0.0,
+        "n_no_pos": n_no_pos,
+    }
+
+
+def _pair_ranking_correlation(val_predictions: list[tuple[float, float]]) -> float | None:
+    """Spearman-ish ranking correlation between predicted scores and labels.
+
+    Since labels are binary, "correlation" reduces to: do positives tend
+    to outrank negatives? We compute the AUC-style stat: probability that
+    a random positive scores higher than a random negative. 0.5 is chance,
+    1.0 is perfect, <0.5 is anti-correlated (bad).
+
+    Returns None if either bucket is empty (no signal).
+    """
+    pos = [s for s, lbl in val_predictions if lbl == 1.0]
+    neg = [s for s, lbl in val_predictions if lbl == 0.0]
+    if not pos or not neg:
+        return None
+    wins = 0
+    ties = 0
+    for ps in pos:
+        for ns in neg:
+            if ps > ns:
+                wins += 1
+            elif ps == ns:
+                ties += 1
+    total = len(pos) * len(neg)
+    return (wins + 0.5 * ties) / total if total else None
+
+
+def _train_lora_adapter(
+    train_pairs: list[dict],
+    val_pairs: list[dict],
+    *,
+    out_dir: Path,
+    epochs: int = 3,
+    lr: float = 2e-5,
+    batch_size: int = 8,
+) -> dict:
+    """Fine-tune a PEFT/LoRA adapter on top of bge-reranker-v2-m3.
+
+    Uses transformers + peft directly (vs sentence-transformers'
+    CrossEncoderTrainer): we need fine-grained control over the LoRA
+    config and the adapter save path. The trainer wraps an
+    `AutoModelForSequenceClassification` (num_labels=1, regression head)
+    so it matches the cross-encoder's contract; the LoRA adapter wraps
+    Q/V projections of the XLM-RoBERTa backbone.
+
+    Output: writes a PEFT adapter dir to `out_dir`. Returns a metrics
+    dict for the held-out val set:
+      - `pos_mean`, `neg_mean`: predicted score means per bucket
+      - `margin`: pos_mean - neg_mean (should be > 0)
+      - `auc`: pair-ranking probability (0.5 chance, >0.5 better)
+      - `ndcg_at_5`: mean nDCG@5 across val queries
+      - `ndcg_at_5_baseline`: same metric with the BASE model (no LoRA)
+        for an apples-to-apples delta the operator can read at a glance.
+    """
+    try:
+        import torch  # noqa: F401
+        import transformers
+        from peft import LoraConfig, TaskType, get_peft_model
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            Trainer,
+            TrainingArguments,
+        )
+        from datasets import Dataset
+    except ImportError as exc:
+        print(
+            "  [error] missing dep for LoRA mode: "
+            f"{exc}\n"
+            "  Install with: uv tool install --reinstall --editable '.[finetune]'",
+            file=sys.stderr,
+        )
+        sys.exit(6)
+
+    device = os.environ.get("RAG_FT_DEVICE", "cpu").lower()
+    print(
+        f"  Loading {MODEL_TAG_BASE} (transformers={transformers.__version__}) on {device} …",
+        file=sys.stderr,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_TAG_BASE)
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_TAG_BASE, num_labels=1, problem_type="regression",
+    )
+
+    # Reference predictions BEFORE wrapping in PEFT — gives the operator
+    # the "without fine-tune" reading on the same val pairs, eliminating
+    # noise from val-split selection.
+    print("  Computing baseline (pre-LoRA) val metrics …", file=sys.stderr)
+    base_preds = _predict_with_hf_model(base_model, tokenizer, val_pairs)
+    base_metrics = _summarise_predictions(base_preds, val_pairs)
+
+    lora_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=list(LORA_TARGET_MODULES),
+        bias="none",
+    )
+    model = get_peft_model(base_model, lora_config)
+    try:
+        # peft >=0.5 exposes a printable summary of trainable parameter
+        # counts. Best-effort — older versions silently skip.
+        model.print_trainable_parameters()
+    except Exception:
+        pass
+
+    # ── Tokenization ──
+    def _tok(batch):
+        enc = tokenizer(
+            batch["text1"], batch["text2"],
+            truncation=True, max_length=512, padding=False,
+        )
+        enc["labels"] = batch["label"]
+        return enc
+
+    train_ds = Dataset.from_list(train_pairs).map(_tok, batched=True)
+    val_ds = Dataset.from_list(val_pairs).map(_tok, batched=True) if val_pairs else None
+    keep_cols = {"input_ids", "attention_mask", "labels"}
+    train_ds = train_ds.remove_columns(
+        [c for c in train_ds.column_names if c not in keep_cols]
+    )
+    if val_ds is not None:
+        val_ds = val_ds.remove_columns(
+            [c for c in val_ds.column_names if c not in keep_cols]
+        )
+
+    args = TrainingArguments(
+        output_dir=str(out_dir / "ckpts"),
+        num_train_epochs=epochs,
+        learning_rate=lr,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        save_strategy="no",
+        eval_strategy="no",
+        logging_steps=10,
+        seed=42,
+        fp16=False,
+        bf16=False,
+        report_to=[],
+        use_cpu=(device == "cpu"),
+    )
+
+    from transformers import DataCollatorWithPadding
+    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        data_collator=collator,
+        tokenizer=tokenizer,
+    )
+    trainer.train()
+    # PEFT save: writes adapter_config.json + adapter_model.safetensors.
+    # NOT the full base model — we want the ~5 MB adapter, not the 2 GB
+    # checkpoint.
+    model.save_pretrained(str(out_dir))
+    # Also drop the tokenizer in the adapter dir so the runtime loader
+    # has everything it needs in one place. Cheap (~10 MB) compared to
+    # the gain in operator simplicity.
+    try:
+        tokenizer.save_pretrained(str(out_dir))
+    except Exception as exc:
+        print(f"  [warn] tokenizer.save_pretrained failed: {exc}", file=sys.stderr)
+
+    # ── Held-out val metrics POST-LoRA ──
+    ft_preds = _predict_with_hf_model(model, tokenizer, val_pairs)
+    ft_metrics = _summarise_predictions(ft_preds, val_pairs)
+
+    return {
+        "baseline": base_metrics,
+        "fine_tuned": ft_metrics,
+        "delta_ndcg_at_5": ft_metrics.get("ndcg_at_5", 0.0)
+                           - base_metrics.get("ndcg_at_5", 0.0),
+        "delta_margin": ft_metrics.get("margin", 0.0)
+                        - base_metrics.get("margin", 0.0),
+    }
+
+
+def _predict_with_hf_model(model, tokenizer, val_pairs: list[dict]) -> list[float]:
+    """Score `val_pairs` with a HF AutoModel head. Returns plain Python floats.
+
+    Conservative batching (batch=8) so we don't OOM on CPU; for typical
+    held-out sizes (<200 pairs) this is well under a second on M-series.
+    """
+    import torch
+    if not val_pairs:
+        return []
+    model.eval()
+    scores: list[float] = []
+    with torch.no_grad():
+        for i in range(0, len(val_pairs), 8):
+            batch = val_pairs[i:i + 8]
+            enc = tokenizer(
+                [p["text1"] for p in batch],
+                [p["text2"] for p in batch],
+                truncation=True, max_length=512,
+                padding=True, return_tensors="pt",
+            )
+            out = model(**enc)
+            # Sigmoid because the cross-encoder output is a logit; we
+            # want the [0,1] score that matches the loader's contract.
+            sig = torch.sigmoid(out.logits.squeeze(-1))
+            scores.extend(sig.cpu().tolist())
+    return scores
+
+
+def _summarise_predictions(preds: list[float], val_pairs: list[dict]) -> dict:
+    """Aggregate held-out predictions into operator-readable metrics."""
+    if not preds or not val_pairs:
+        return {
+            "n_pairs": 0, "n_pos": 0, "n_neg": 0,
+            "pos_mean": 0.0, "neg_mean": 0.0, "margin": 0.0,
+            "auc": None, "ndcg_at_5": 0.0, "n_queries": 0,
+        }
+    import statistics
+    pairs_with_preds = list(zip(preds, [p["label"] for p in val_pairs]))
+    pos_preds = [s for s, lbl in pairs_with_preds if lbl == 1.0]
+    neg_preds = [s for s, lbl in pairs_with_preds if lbl == 0.0]
+    pos_mean = statistics.fmean(pos_preds) if pos_preds else 0.0
+    neg_mean = statistics.fmean(neg_preds) if neg_preds else 0.0
+    auc = _pair_ranking_correlation(pairs_with_preds)
+    # nDCG: group by query
+    by_q: dict[str, list[tuple[float, float]]] = {}
+    for pair, score in zip(val_pairs, preds):
+        by_q.setdefault(pair["text1"], []).append((score, float(pair["label"])))
+    ndcgs = [_ndcg_at_k(items, k=5) for items in by_q.values()]
+    return {
+        "n_pairs": len(val_pairs),
+        "n_pos": len(pos_preds),
+        "n_neg": len(neg_preds),
+        "pos_mean": pos_mean,
+        "neg_mean": neg_mean,
+        "margin": pos_mean - neg_mean,
+        "auc": auc,
+        "ndcg_at_5": sum(ndcgs) / len(ndcgs) if ndcgs else 0.0,
+        "n_queries": len(by_q),
+    }
+
+
+def _print_lora_report(metrics: dict) -> None:
+    """Pretty-print the before/after metrics block for the LoRA mode."""
+    base = metrics["baseline"]
+    ft = metrics["fine_tuned"]
+    print("  ── Held-out validation (before vs after LoRA) ──", file=sys.stderr)
+    print(
+        f"    n_queries={ft['n_queries']}  n_pairs={ft['n_pairs']}  "
+        f"(pos={ft['n_pos']} neg={ft['n_neg']})",
+        file=sys.stderr,
+    )
+    print(
+        f"    nDCG@5      base={base['ndcg_at_5']:.4f}  "
+        f"ft={ft['ndcg_at_5']:.4f}  Δ={metrics['delta_ndcg_at_5']:+.4f}",
+        file=sys.stderr,
+    )
+    print(
+        f"    pos mean    base={base['pos_mean']:.3f}  "
+        f"ft={ft['pos_mean']:.3f}",
+        file=sys.stderr,
+    )
+    print(
+        f"    neg mean    base={base['neg_mean']:.3f}  "
+        f"ft={ft['neg_mean']:.3f}",
+        file=sys.stderr,
+    )
+    print(
+        f"    margin      base={base['margin']:+.3f}  "
+        f"ft={ft['margin']:+.3f}  Δ={metrics['delta_margin']:+.3f}",
+        file=sys.stderr,
+    )
+    if base["auc"] is not None and ft["auc"] is not None:
+        print(
+            f"    pair-rank   base AUC={base['auc']:.3f}  "
+            f"ft AUC={ft['auc']:.3f}  (>0.5 = pos>neg)",
+            file=sys.stderr,
+        )
+
+
+def _run_lora_mode(args) -> None:
+    """Top-level dispatch for the LoRA fine-tune (GC#2.C).
+
+    Steps:
+      1. Build pairs from rag_feedback + rag_behavior.
+      2. Stratified 80/20 split (held-out is for OUR metrics, not the
+         repo's `rag eval` — that gate runs separately downstream).
+      3. Train LoRA adapter, save under
+         `~/.local/share/obsidian-rag/reranker_ft/`.
+      4. Print before/after nDCG@5 + ranking correlation.
+
+    Conservative gates:
+      - <10 positives → abort (signal too weak for a meaningful fine-tune).
+        Lower than the full-FT path because LoRA tolerates small data
+        better.
+      - --dry-run → exit after pair build, no training.
+    """
+    print("== GC#2.C — LoRA fine-tune of bge-reranker-v2-m3 ==", file=sys.stderr)
+    vault_root = rag._resolve_vault_path()
+
+    if args.pairs_from:
+        # Same JSONL ingestion as the full-FT path. The labels are
+        # already 1.0/0.0 — no rebuild against rag_behavior.
+        jsonl_path = Path(args.pairs_from).expanduser().resolve()
+        print(f"  Loading pre-mined pairs from: {jsonl_path}", file=sys.stderr)
+        pairs = _load_pairs_from_jsonl(
+            jsonl_path, vault_root, hard_neg_k=args.hard_neg_k,
+        )
+    else:
+        rows = _fetch_feedback_pairs()
+        print(f"  Feedback positives (rating=+1): {len(rows)}", file=sys.stderr)
+        pairs = _build_lora_training_pairs(
+            rows, vault_root, include_behavior=True,
+        )
+
+    pos = sum(1 for p in pairs if p["label"] == 1.0)
+    neg = sum(1 for p in pairs if p["label"] == 0.0)
+    print(
+        f"  Training pairs: total={len(pairs)} pos={pos} neg={neg}",
+        file=sys.stderr,
+    )
+    if pos < 10:
+        print(
+            f"  Not enough positives ({pos} < 10). Need more rag_feedback "
+            "rating=+1 turns or rag_behavior positive_implicit events with a "
+            "query field. Aborting.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.dry_run:
+        print("  [dry-run] exiting before training.", file=sys.stderr)
+        return
+
+    train_pairs, val_pairs = _split_train_val(pairs, val_frac=0.2)
+    print(
+        f"  Split: train={len(train_pairs)} val={len(val_pairs)}",
+        file=sys.stderr,
+    )
+
+    LOCAL_FT_ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"  Training → {LOCAL_FT_ROOT}", file=sys.stderr)
+    t0 = time.time()
+    metrics = _train_lora_adapter(
+        train_pairs, val_pairs,
+        out_dir=LOCAL_FT_ROOT,
+        epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
+    )
+    print(f"  Trained in {time.time() - t0:.1f}s", file=sys.stderr)
+    _print_lora_report(metrics)
+
+    # Persist a JSON next to the adapter so `rag stats` / a future
+    # `rag feedback status` can surface the last train run without
+    # re-loading the model. Best-effort.
+    try:
+        meta = {
+            "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "lora_r": LORA_R,
+            "lora_alpha": LORA_ALPHA,
+            "lora_dropout": LORA_DROPOUT,
+            "n_train": len(train_pairs),
+            "n_val": len(val_pairs),
+            "metrics": metrics,
+        }
+        (LOCAL_FT_ROOT / "ft_meta.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"  [warn] writing ft_meta.json failed: {exc}", file=sys.stderr)
+
+    print(
+        "  Adapter saved. To activate: `export RAG_RERANKER_FT=1` and "
+        "restart any long-running rag processes (web, serve).",
+        file=sys.stderr,
+    )
+
+
+# ── End of GC#2.C LoRA helpers ────────────────────────────────────────────
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode",
+        choices=("lora", "full"),
+        default="lora",
+        help=("Training mode. `lora` (default, GC#2.C 2026-04-23) trains a "
+              "PEFT adapter saved to ~/.local/share/obsidian-rag/reranker_ft/. "
+              "`full` (GC#2.B) does a full CrossEncoder fine-tune saved to "
+              "~/.cache/obsidian-rag/reranker-ft-{ts}/ with eval-gate promotion."),
+    )
     ap.add_argument("--dry-run", action="store_true",
                     help="Build pairs and print counts; no training or eval.")
     ap.add_argument("--no-eval", action="store_true",
-                    help="Skip the `rag eval` gate (debug only).")
+                    help="Skip the `rag eval` gate (debug only). "
+                         "Mode=lora ignores this — eval gate is mode=full only.")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -445,7 +1115,14 @@ def main():
                           "history-based hard negs."))
     args = ap.parse_args()
 
-    print("== GC#2.C — fine-tune reranker ==", file=sys.stderr)
+    # Dispatch to the LoRA path early — it has its own pre-flight + data
+    # build (LoRA-specific positives from rag_behavior + impression-based
+    # hard negs). The legacy full-FT path stays inline below.
+    if args.mode == "lora":
+        _run_lora_mode(args)
+        return
+
+    print("== GC#2.B — full fine-tune reranker ==", file=sys.stderr)
 
     col = rag.get_db()
     vault_root = rag._resolve_vault_path()

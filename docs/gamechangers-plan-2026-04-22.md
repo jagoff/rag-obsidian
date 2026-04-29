@@ -83,23 +83,41 @@ Orden: #3 → #1 → #2 (de menos a más riesgoso, de self-contained a cross-cut
 3. Si delta singles hit@5 <0.5pp → **remover** `get_context_summary()`. Ahorra ~11 min/reindex + 1-3s/query.
 4. Si delta ≥1pp → mantener + documentar el número real en CLAUDE.md.
 
-### 2.C Fine-tune del reranker
-1. `scripts/finetune_reranker.py` nuevo. Inputs:
-   - Positive pairs: `rag_feedback` con `rating=1` + `corrective_path` events.
-   - Hard negatives: top-10 rerank candidates del retrieve() sobre cada query que NO son el positivo, cosine 0.5-0.85 al pos (semánticamente cercanos pero incorrectos).
-   - Held-out: 20% stratified por intent/source.
-2. [sentence-transformers CrossEncoder training](https://www.sbert.net/docs/cross_encoder/training/overview.html) con LoRA (r=8, alpha=16) sobre bge-reranker-v2-m3. 3 epochs, lr=2e-5, batch=8 en MPS fp32.
-3. Output: `~/.cache/obsidian-rag/reranker-ft-{ts}/` + symlink `~/.cache/obsidian-rag/reranker-ft-current`.
-4. `rag.py` carga el reranker fine-tuned si existe el symlink + `RAG_RERANKER_FT=1` (default OFF durante rollout).
-5. Gate: `rag eval` post-fine-tune ≥ baseline (hit@5 + MRR). Si no, el script no promueve el symlink.
-6. Métricas: hit@5 + MRR sobre held-out + queries.yaml, antes/después.
+### 2.C Fine-tune del reranker — ✅ COMPLETADO 2026-04-23
 
-**Tests**:
-- `tests/test_telemetry_intent_logged.py`: 5 casos — query/chat populan intent en extra_json.
-- `tests/test_rag_behavior_query_field.py`: 4 casos — behavior events incluyen query field.
-- `tests/test_finetune_reranker_gate.py`: 6 casos — gate rechaza fine-tunes que bajan eval, symlink solo se promueve si ≥baseline.
+**Estado**: infra LoRA shipped. Loader runtime + script de entrenamiento + tests + docs completos. Pendiente solo correr el training real cuando haya ≥10 pares positivos (gate del script) — ortogonal a la infra que ya quedó verificada.
 
-**Rollback**: el reranker fine-tuned es opt-in (RAG_RERANKER_FT=1). Borrar symlink vuelve al base.
+**Cambios shippeados**:
+
+1. **[`scripts/finetune_reranker.py`](../scripts/finetune_reranker.py)** ahora soporta `--mode {lora,full}` (default `lora`). El modo nuevo:
+   - Lee positivos de `rag_feedback` (rating=+1, con `corrective_path` cuando está) **y** de `rag_behavior` (`event='positive_implicit'` con query field).
+   - Mina hard negatives de `rag_behavior`: chunks que aparecieron en top-5 (`event='impression'` con rank ≥3) cuando el user clickeó OTRO path en una ventana de ±10 min.
+   - Held-out 20% stratified por query (mismo split que el modo full).
+   - Entrena LoRA con [peft](https://github.com/huggingface/peft) — `r=8`, `alpha=16`, `dropout=0.1`, target `query`/`value` projections de XLM-RoBERTa. 3 epochs default, lr=2e-5, batch=8 en CPU (override con `RAG_FT_DEVICE=mps`).
+   - Output: `~/.local/share/obsidian-rag/reranker_ft/` (PEFT adapter dir, ~5 MB) + `ft_meta.json` con métricas del run.
+   - Print metrics: nDCG@5 antes/después en held-out, mean pos/neg score, margin, AUC pair-ranking.
+2. **Loader en [`rag/__init__.py`](../rag/__init__.py)** (sección "GC#2.C — LoRA adapter loader"):
+   - `RERANKER_FT_ADAPTER_DIR` constante apunta al path canónico.
+   - `_reranker_ft_enabled()` parsea `RAG_RERANKER_FT` con la misma tabla de truthy strings que el resto del codebase (`1`/`true`/`yes`/`on`).
+   - `_apply_reranker_lora_adapter(model, dir)` aplica el adapter on top del CrossEncoder. NUNCA raisea: dir missing, peft no instalado, adapter_config inválido, splice failure → log a `silent_errors.jsonl` + return False, caller queda en base model.
+   - `get_reranker()` invoca `_apply_reranker_lora_adapter` solo cuando la flag está prendida (default OFF, no cambia comportamiento pre-GC#2.C).
+3. **Tests**: [`tests/test_finetune_reranker_gate.py`](../tests/test_finetune_reranker_gate.py) — 19 casos (los 6 del plan + 13 de invariantes adicionales del helper). Cubren: env-unset → no peft import, dir vacío → fallback + warning, adapter válido → load OK, scores stay en [0,1], smoke con flag ON sin adapter, helpers de nDCG@5 + AUC, todos los failure modes del `_apply_reranker_lora_adapter`. Mocks pesados — los tests no requieren peft instalado.
+4. **Pyproject**: nuevo extra `[finetune]` con `peft + transformers + datasets + accelerate`. Soft dep — el loader y los tests degradan a base+warning si falta. Install: `uv tool install --reinstall --editable '.[finetune]'`.
+5. **Env var doc**: `CLAUDE.md` actualizado con `RAG_RERANKER_FT` (default OFF) — distinto de `RAG_RERANKER_FT_PATH` que sigue siendo el switch del modo `full` (GC#2.B).
+
+**Coexistencia con GC#2.B**: ambos pueden estar prendidos simultáneamente. El path resuelto por `_resolve_reranker_model_path()` (base o full-FT-via-symlink) es el modelo sobre el que se aplica el LoRA. Default operacional: GC#2.B desactivado, GC#2.C desactivado → bge-reranker-v2-m3 plano.
+
+**Próximo paso**: cuando `rag feedback status` muestre ≥10 positivos limpios (rating=+1 con o sin `corrective_path`), correr:
+
+```bash
+uv tool install --reinstall --editable '.[finetune]'
+python scripts/finetune_reranker.py --mode lora --epochs 3 --lr 2e-5
+export RAG_RERANKER_FT=1   # opt-in al adapter
+```
+
+El script printea las métricas before/after; el operador decide si setear la env var en los plists. Para revertir: `unset RAG_RERANKER_FT` (o borrar la línea del plist) + `launchctl bootout/bootstrap` para que tome efecto.
+
+**Rollback**: el reranker fine-tuned es opt-in (`RAG_RERANKER_FT=1`). `unset RAG_RERANKER_FT` o `rm -rf ~/.local/share/obsidian-rag/reranker_ft/` lo desactiva.
 
 ---
 

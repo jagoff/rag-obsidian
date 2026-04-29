@@ -91,6 +91,16 @@ entities = ["gliner>=0.2.26"]
 # auto-download on first use to ~/.cache/huggingface/hub/.
 # Install: `uv tool install --reinstall --editable '.[stt]'`
 stt = ["faster-whisper>=1.0.0"]
+# LoRA fine-tune del cross-encoder reranker (GC#2.C, 2026-04-23).
+# `scripts/finetune_reranker.py --mode lora` entrena un adapter PEFT
+# (r=8, alpha=16, dropout=0.1) on top de bge-reranker-v2-m3 usando los
+# pares positivos/negativos de `rag_feedback` + `rag_behavior`. El
+# adapter se guarda en `~/.local/share/obsidian-rag/reranker_ft/` y
+# solo se carga en runtime cuando `RAG_RERANKER_FT=1` (default OFF).
+# Soft dependency: el script + el loader fallan a base model con un
+# warning a `silent_errors.jsonl` cuando peft no está instalado.
+# Install: `uv tool install --reinstall --editable '.[finetune]'`
+finetune = ["peft>=0.12", "transformers>=4.40", "datasets>=2.20", "accelerate>=0.30"]
 
 [project.scripts]
 rag = "rag:cli"

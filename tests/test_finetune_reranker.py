@@ -224,7 +224,10 @@ def test_gate_aborts_below_minimum_correctives(monkeypatch, capsys):
     monkeypatch.setattr(ft, "_fetch_feedback_pairs",
                         lambda: _mk_rows(with_cp=5, without_cp=60))
     monkeypatch.setenv("RAG_FINETUNE_MIN_CORRECTIVES", "20")
-    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py"])
+    # Pass --mode full because the legacy gate (RAG_FINETUNE_MIN_CORRECTIVES)
+    # only applies to the GC#2.B path. The new default --mode lora has its
+    # own pre-flight (≥10 positives) tested in test_finetune_reranker_gate.py.
+    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--mode", "full"])
 
     with pytest.raises(SystemExit) as ei:
         ft.main()
@@ -242,7 +245,10 @@ def test_gate_proceeds_above_minimum_correctives(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(rag, "get_db", lambda: object())
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     monkeypatch.setenv("RAG_FINETUNE_MIN_CORRECTIVES", "20")
-    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--dry-run"])
+    # Pass --mode full because the legacy gate (RAG_FINETUNE_MIN_CORRECTIVES)
+    # only applies to the GC#2.B path; --mode lora (the new default) has its
+    # own gate tested in tests/test_finetune_reranker_gate.py.
+    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--mode", "full", "--dry-run"])
 
     ft.main()
     err = capsys.readouterr().err
@@ -256,7 +262,9 @@ def test_gate_env_var_override(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(rag, "get_db", lambda: object())
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     monkeypatch.setenv("RAG_FINETUNE_MIN_CORRECTIVES", "5")
-    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--dry-run"])
+    # Same reasoning as test_gate_proceeds_above_minimum_correctives — the
+    # RAG_FINETUNE_MIN_CORRECTIVES gate is the legacy GC#2.B contract.
+    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--mode", "full", "--dry-run"])
 
     monkeypatch.setattr(ft, "_fetch_feedback_pairs",
                         lambda: _mk_rows(with_cp=7, without_cp=5))
@@ -282,7 +290,8 @@ def test_dry_run_reports_corrective_counts(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(rag, "get_db", lambda: object())
     monkeypatch.setattr(rag, "_resolve_vault_path", lambda: tmp_path)
     monkeypatch.setenv("RAG_FINETUNE_MIN_CORRECTIVES", "20")
-    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--dry-run"])
+    # Legacy gate output → --mode full path.
+    monkeypatch.setattr(sys, "argv", ["finetune_reranker.py", "--mode", "full", "--dry-run"])
 
     ft.main()
     err = capsys.readouterr().err

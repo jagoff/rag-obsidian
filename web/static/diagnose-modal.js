@@ -151,6 +151,11 @@
     // crudo en un <pre> que va creciendo.
     const streamState = {
       outputAccum: "",
+      // thoughtEl: el `<article>` con el thought bubble (se crea en 'start').
+      // outputEl: el `<pre>` con el texto de la respuesta (lazy, se crea
+      //           en el primer evento 'output' que llega — porque devin -p
+      //           block-buffera y no vamos a recibir nada hasta el final).
+      thoughtEl: null,
       outputEl: null,
     };
     try {
@@ -216,25 +221,46 @@
     switch (event.type) {
       case "start": {
         status.textContent = "Devin investigando…";
-        // Crear el bloque de output inicial donde vamos a volcar el stream.
-        if (!streamState.outputEl) {
+        // Crear el bloque del thought bubble. NO creamos el `<pre>` vacío
+        // todavía — `devin -p` block-buffera stdout (sin TTY pasa a
+        // block-buffered, no line-buffered) así que durante 3-10 min no
+        // vamos a recibir output ninguno. Mostrar una caja vacía con
+        // placeholder "esperando..." era engañoso. El `<pre>` se crea
+        // recién en el primer evento `output` que llegue (típicamente al
+        // final, cuando recovery del transcript JSON inyecta la respuesta
+        // completa). Hasta entonces solo mostramos el spinner + counter
+        // del status arriba.
+        if (!streamState.thoughtEl) {
           const turn = el("article", { class: "diag-turn diag-devin-turn" });
           turn.appendChild(el("div", { class: "diag-thought" },
             el("span", { class: "diag-thought-icon" }, "🤖"),
             el("span", { class: "diag-thought-text" },
-              "Devin tiene acceso completo al repo — está leyendo el código, ejecutando tools, y resolviendo el problema. Esto puede tardar 30-120s.")
+              "Devin tiene acceso completo al repo — está leyendo el código, ejecutando tools, y resolviendo el problema. Esto puede tardar 3-10 minutos. Si cerrás esta modal, Devin sigue investigando en segundo plano y el resultado queda guardado en el audit log.")
           ));
-          const outputPre = el("pre", { class: "diag-action-output diag-devin-stream" });
-          outputPre.textContent = "";
-          turn.appendChild(outputPre);
           timeline.appendChild(turn);
-          streamState.outputEl = outputPre;
+          streamState.thoughtEl = turn;
         }
         break;
       }
 
       case "output": {
-        if (!streamState.outputEl) return;
+        // Lazy-create el `<pre>` la primera vez que llega output (no en
+        // 'start' como antes, porque `devin -p` block-buffera y la caja
+        // vacía con "esperando..." se quedaba 3-10 min en pantalla).
+        if (!streamState.outputEl) {
+          const outputPre = el("pre", { class: "diag-action-output diag-devin-stream" });
+          // Si tenemos thoughtEl (turn que creamos en 'start'), pegamos
+          // el pre adentro de ese mismo turn. Si no, creamos uno nuevo.
+          if (streamState.thoughtEl) {
+            streamState.thoughtEl.appendChild(outputPre);
+          } else {
+            const turn = el("article", { class: "diag-turn diag-devin-turn" });
+            turn.appendChild(outputPre);
+            timeline.appendChild(turn);
+            streamState.thoughtEl = turn;
+          }
+          streamState.outputEl = outputPre;
+        }
         streamState.outputAccum += event.chunk || "";
         streamState.outputEl.textContent = streamState.outputAccum;
         // Al recibir output real, el status vuelve a "investigando"
@@ -266,12 +292,27 @@
         status.classList.add(ok ? "diag-status-done" : "diag-status-error");
         retryBtn.disabled = false;
 
-        // Final output — si el stream no capturó nada, usar el output
-        // completo del evento done. Si capturamos bien, el <pre> ya tiene
-        // lo que necesitamos — pero lo reemplazamos por el formateado
-        // con links clickeables a archivos.
-        const finalOutput = event.output || streamState.outputAccum;
-        if (streamState.outputEl && finalOutput) {
+        // Final output — preferimos lo acumulado por chunks. Si está
+        // vacío (caso típico del block-buffer), usar el campo `output`
+        // del evento done que el server completó con el transcript JSON
+        // recuperado.
+        const finalOutput = streamState.outputAccum || event.output || "";
+        if (finalOutput) {
+          // Si todavía no creamos el `<pre>` (porque nunca llegó un
+          // 'output' event antes), creamos ahora — para evitar perder
+          // la respuesta cuando todo viene en el 'done'.
+          if (!streamState.outputEl) {
+            const outputPre = el("pre", { class: "diag-action-output diag-devin-stream" });
+            if (streamState.thoughtEl) {
+              streamState.thoughtEl.appendChild(outputPre);
+            } else {
+              const turn = el("article", { class: "diag-turn diag-devin-turn" });
+              turn.appendChild(outputPre);
+              timeline.appendChild(turn);
+              streamState.thoughtEl = turn;
+            }
+            streamState.outputEl = outputPre;
+          }
           streamState.outputEl.innerHTML = formatDevinOutput(finalOutput);
         }
 

@@ -499,18 +499,16 @@
 
 /* ── Devin stream output ─────────────────────────────────────────────
    El `pre` con el output crudo de `devin -p` — puede ser largo (1-2KB
-   típico), así que le damos max-height generoso + scroll. */
+   típico), así que le damos max-height generoso + scroll. NO ponemos
+   placeholder ":empty::before" como antes ("esperando output…") porque
+   ahora el `<pre>` solo se crea cuando ya hay output que mostrar (lazy
+   create en JS). El bubble del thought-icon arriba ya explica al user
+   qué está pasando mientras espera. */
 .diag-devin-stream {
   max-height: 50vh;
   min-height: 80px;
   font-size: 11.5px;
   line-height: 1.45;
-}
-
-.diag-devin-stream:empty::before {
-  content: "esperando output de Devin…";
-  color: var(--diag-fg-faint);
-  font-style: italic;
 }
 
 .diag-devin-stream code {

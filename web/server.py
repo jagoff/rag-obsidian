@@ -16583,7 +16583,69 @@ _DEVIN_BIN = _which_safe("devin", (
     str(Path.home() / ".local/bin/devin"),
     "/usr/local/bin/devin",
 ))
-_AUTO_FIX_DEVIN_TIMEOUT_S = 300.0  # 5min cap
+_AUTO_FIX_DEVIN_TIMEOUT_S = 600.0  # 10min cap — Devin tasks reales tardan
+                                    # 5-8min (investigar + fixear + commit + push).
+                                    # Antes era 300s y matábamos al subprocess
+                                    # justo en el momento del wait final → el
+                                    # transcript se exportaba pero el cliente
+                                    # ya había cerrado la modal hacía rato.
+                                    # Aprendido el 2026-04-29 con un fix de
+                                    # spaCy que tardó 5m12s end-to-end.
+
+
+def _recover_devin_final_message(pid: int) -> str | None:
+    """Recover the final assistant message from Devin's transcript JSON.
+
+    Por qué existe: `devin -p` emite stdout en modo block-buffered cuando
+    está conectado a un pipe (Rust default sin TTY). Resultado: nuestro
+    `select.select()` sobre el pipe nunca devuelve datos hasta que el
+    subprocess termina y flushea — incluso entonces el output puede ser
+    truncado si lo matamos con SIGTERM por timeout.
+
+    Pero Devin SIEMPRE escribe un transcript JSON estructurado al disco
+    durante el shutdown (graceful o por SIGTERM, no por SIGKILL):
+        ~/.local/share/devin/cli/transcripts/<session_name>.json
+
+    Para encontrar nuestro transcript:
+      1. Ubicamos el log interno de Devin por PID:
+         ~/.local/share/devin/cli/logs/devin_<utc-ts>_<pid>.log
+      2. Grepeamos `Created new session: <name>` adentro.
+      3. Leemos el transcript correspondiente.
+      4. Buscamos el último step con source=='agent' y mensaje no vacío
+         — ese es el final assistant message (el output que el user
+         hubiera visto si el stream funcionara).
+
+    Best-effort: cualquier excepción → None y caemos al stdout buffer
+    como antes."""
+    try:
+        cli_root = Path.home() / ".local" / "share" / "devin" / "cli"
+        logs_dir = cli_root / "logs"
+        candidates = list(logs_dir.glob(f"devin_*_{pid}.log"))
+        if not candidates:
+            return None
+        # Si hubiera reuse de PID (raro), usamos el más reciente.
+        log_path = max(candidates, key=lambda p: p.stat().st_mtime)
+        session_name: str | None = None
+        for line in log_path.read_text(errors="ignore").splitlines():
+            marker = "Created new session:"
+            if marker in line:
+                session_name = line.split(marker, 1)[1].strip()
+                break
+        if not session_name:
+            return None
+        transcript_path = cli_root / "transcripts" / f"{session_name}.json"
+        if not transcript_path.exists():
+            return None
+        data = json.loads(transcript_path.read_text(encoding="utf-8", errors="replace"))
+        steps = data.get("steps") or []
+        for step in reversed(steps):
+            if step.get("source") == "agent":
+                msg = (step.get("message") or "").strip()
+                if msg:
+                    return msg
+        return None
+    except Exception:  # pragma: no cover — best-effort
+        return None
 
 
 def _build_devin_prompt(req: "_AutoFixRequest") -> str:
@@ -16724,13 +16786,17 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
 
                 elapsed = time.monotonic() - t0
                 if elapsed > _AUTO_FIX_DEVIN_TIMEOUT_S:
+                    # Timeout: SIGTERM (graceful shutdown — Devin alcanza a
+                    # exportar el transcript) → wait → SIGKILL si no cierra.
+                    # NO hacemos `return` acá; salimos del while para caer
+                    # en el bloque post-loop que recupera el transcript.
                     proc.terminate()
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'timeout después de {_AUTO_FIX_DEVIN_TIMEOUT_S}s'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'timeout después de {_AUTO_FIX_DEVIN_TIMEOUT_S}s — recuperando lo que Devin alcanzó a escribir…'})}\n\n"
                     try:
-                        proc.wait(timeout=5)
+                        proc.wait(timeout=8)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                    return
+                    break
 
                 # Poll stdout por hasta 1s. Si hay datos, leer un chunk
                 # (hasta 4KB) y emitirlo. Si no, chequear si toca heartbeat.
@@ -16756,7 +16822,18 @@ def auto_fix_devin(req: _AutoFixRequest, request: Request) -> StreamingResponse:
             yield f"data: {json.dumps({'type': 'error', 'message': f'{type(e).__name__}: {e}'})}\n\n"
             return
 
+        # ── Recuperar el final assistant message del transcript ──────────
+        # Devin emite stdout block-buffered → muy probable que
+        # full_output_chunks esté vacío incluso después de un exit limpio.
+        # El transcript JSON tiene el mensaje final escrito al disco
+        # durante el shutdown (SIGTERM o exit natural). Si pudimos
+        # recuperarlo, lo mandamos como UN chunk al cliente para que el
+        # modal renderee la respuesta real en lugar de una caja vacía.
         full_output = "".join(full_output_chunks)
+        recovered = _recover_devin_final_message(proc.pid)
+        if recovered and recovered not in full_output:
+            yield f"data: {json.dumps({'type': 'output', 'chunk': recovered})}\n\n"
+            full_output = (full_output + "\n\n" + recovered) if full_output else recovered
         yield f"data: {json.dumps({'type': 'done', 'exit_code': exit_code, 'output': full_output[:16000]})}\n\n"
 
     return StreamingResponse(

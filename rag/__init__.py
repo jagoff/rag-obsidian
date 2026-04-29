@@ -14695,6 +14695,161 @@ def _apply_reranker_lora_adapter(model, adapter_dir: Path) -> bool:
         return False
 
 
+# ── GC#3 — LoRA fine-tune del modelo de drafts WhatsApp (2026-04-29) ──────
+# Mismo patrón que el reranker LoRA: adapter PEFT vive bajo XDG data
+# (no cache porque la signal es no-regenerable), loader runtime hace
+# silent-fail si peft no está / adapter no existe / RAG_DRAFTS_FT OFF.
+#
+# IMPORTANTE: el listener TS sigue usando `qwen2.5:14b` para generar
+# drafts en producción. El adapter fine-tuned NO sustituye eso. El único
+# call-site del adapter es `/api/draft/preview` (web/server.py), que el
+# user llama manualmente para A/B "qué hubiera salido del baseline" vs
+# "qué hubiera salido del fine-tuned". NO está en el hot path.
+#
+# Adapter dir convention: `~/.local/share/obsidian-rag/drafts_ft/`
+DRAFTS_FT_ADAPTER_DIR = Path.home() / ".local" / "share" / "obsidian-rag" / "drafts_ft"
+
+# Modelo base del fine-tune. Override via `RAG_DRAFTS_FT_BASE_MODEL`
+# para experimentos. El default debe matchear el del training script.
+DRAFTS_FT_BASE_MODEL = os.environ.get(
+    "RAG_DRAFTS_FT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"
+)
+
+# Cache lazy-loaded del modelo + tokenizer + lock para thread safety.
+# El endpoint preview lo arma una sola vez y reusa entre calls.
+_drafts_ft_model = None
+_drafts_ft_tokenizer = None
+_drafts_ft_lock = threading.Lock()
+
+
+def _drafts_ft_enabled() -> bool:
+    """True iff `RAG_DRAFTS_FT=1` (truthy). Default OFF.
+
+    Es el flag operacional que el user setea manualmente cuando quiere
+    A/B vía `/api/draft/preview`. Sin él, el endpoint hace echo del
+    bot_draft_baseline sin tocar el modelo (zero-cost passthrough).
+    """
+    return os.environ.get("RAG_DRAFTS_FT", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _drafts_ft_adapter_available() -> bool:
+    """Cheap check: existe el dir + adapter_config.json. NO valida que
+    el adapter sea cargeable (eso lo hace _load_drafts_ft_model en el
+    primer use). Útil para `rag drafts stats` que solo quiere saber si
+    hay metadata para mostrar.
+    """
+    try:
+        return (
+            DRAFTS_FT_ADAPTER_DIR.is_dir()
+            and (DRAFTS_FT_ADAPTER_DIR / "adapter_config.json").is_file()
+        )
+    except Exception:
+        return False
+
+
+def _load_drafts_ft_model():
+    """Lazy-load del modelo fine-tuned + tokenizer. Thread-safe.
+
+    Returns:
+        (model, tokenizer) tuple, or (None, None) si:
+          - peft / transformers no están instalados
+          - el adapter dir no existe / falta adapter_config.json
+          - la carga del PEFT model raiseó (corrupt safetensors,
+            base model dist mismatch, etc.)
+
+    Conservative: NUNCA raisea. Loguea a `silent_errors.jsonl` y
+    devuelve (None, None) — el caller (preview endpoint) interpreta
+    eso como "fallback a echo del baseline".
+    """
+    global _drafts_ft_model, _drafts_ft_tokenizer
+    with _drafts_ft_lock:
+        if _drafts_ft_model is not None:
+            return _drafts_ft_model, _drafts_ft_tokenizer
+        if not _drafts_ft_adapter_available():
+            _silent_log(
+                "drafts_ft_adapter_missing",
+                FileNotFoundError(str(DRAFTS_FT_ADAPTER_DIR)),
+            )
+            return None, None
+        try:
+            from peft import PeftModel  # type: ignore
+            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+        except ImportError as exc:
+            _silent_log("drafts_ft_peft_missing", exc)
+            return None, None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(str(DRAFTS_FT_ADAPTER_DIR))
+        except Exception:
+            # Si el adapter dir no tiene tokenizer save (training viejo),
+            # fall back al base model tokenizer.
+            try:
+                from transformers import AutoTokenizer as _AT
+                tokenizer = _AT.from_pretrained(DRAFTS_FT_BASE_MODEL)
+            except Exception as exc:
+                _silent_log("drafts_ft_tokenizer_load_failed", exc)
+                return None, None
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                DRAFTS_FT_BASE_MODEL, torch_dtype="auto",
+            )
+            model = PeftModel.from_pretrained(base, str(DRAFTS_FT_ADAPTER_DIR))
+            model.eval()
+            _drafts_ft_model = model
+            _drafts_ft_tokenizer = tokenizer
+            return _drafts_ft_model, _drafts_ft_tokenizer
+        except Exception as exc:
+            _silent_log("drafts_ft_load_failed", exc)
+            return None, None
+
+
+def generate_draft_preview(
+    *, original_conversation: str, bot_draft_baseline: str,
+    max_new_tokens: int = 200,
+) -> str:
+    """Genera el output del modelo fine-tuned para A/B manual del user.
+
+    Contract:
+      - Si `RAG_DRAFTS_FT` está OFF → echo del baseline.
+      - Si el adapter no existe / peft falta → echo del baseline +
+        log a silent_errors.jsonl.
+      - Si el modelo carga pero la generación crashea → echo del
+        baseline + log.
+      - Si todo OK → devuelve el output del modelo (string post-strip
+        del prompt, máx max_new_tokens).
+
+    Note: NUNCA raisea. El endpoint preview siempre devuelve algo
+    útil al caller (mínimo el baseline echo).
+    """
+    if not _drafts_ft_enabled():
+        return bot_draft_baseline
+    model, tokenizer = _load_drafts_ft_model()
+    if model is None or tokenizer is None:
+        return bot_draft_baseline
+    try:
+        import torch  # noqa: F401
+        prompt = (
+            f"{original_conversation}\n\n"
+            f"## Borrador del bot:\n"
+            f"{bot_draft_baseline}\n\n"
+            f"## Mensaje final que mandó Fer:\n"
+        )
+        inp = tokenizer(prompt, return_tensors="pt", truncation=True,
+                        max_length=1024)
+        out = model.generate(
+            **inp, max_new_tokens=max_new_tokens, do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        full = tokenizer.decode(out[0], skip_special_tokens=True)
+        if full.startswith(prompt):
+            return full[len(prompt):].strip()
+        return full.strip()
+    except Exception as exc:
+        _silent_log("drafts_ft_generate_failed", exc)
+        return bot_draft_baseline
+
+
 def get_reranker():
     """Lazy-load cross-encoder reranker on the best available accelerator.
     Explicit device picks MPS on Apple Silicon — sentence-transformers'
@@ -29415,18 +29570,24 @@ def fix(path: str, session_id: str | None, plain: bool):
     click.echo(msg) if plain else console.print(f"[green]{msg}[/green]")
 
 
-# ── rag draft — auditar el loop de drafts del bot WhatsApp ────────────────
+# ── rag draft / rag drafts — auditar el loop de drafts del bot WhatsApp ───
 # `rag_draft_decisions` se popula via /api/draft/decision cuando el user
 # puntúa /si /no /editar en el RagNet group. Este grupo permite mirar el
 # health del loop sin tener que abrir sqlite a mano (use case: "¿el bot
 # está tirando drafts útiles? ¿qué % aprueba el user tal cual vs editado?").
+#
+# Alias: `rag drafts` (plural) hace lo mismo que `rag draft`. Cuando
+# (2026-04-29 GC#3) agregamos el subcomando `finetune`, el user pidió
+# `rag drafts finetune` (plural). Mantenemos los dos aliases vivos en
+# lugar de romper el shell history del singular.
 @cli.group(invoke_without_command=True)
 @click.pass_context
 def draft(ctx: click.Context):
     """Auditar el loop de drafts del bot WhatsApp.
 
     Subcomandos:
-      rag draft stats           # conteos por tipo de decisión + última fecha
+      rag draft stats           # conteos por tipo + ratios + adapter info
+      rag draft finetune        # entrenar LoRA adapter sobre approved_editar
     """
     if ctx.invoked_subcommand is None:
         ctx.invoke(draft_stats, plain=False)
@@ -29436,18 +29597,27 @@ def draft(ctx: click.Context):
 @click.option("--plain", is_flag=True,
               help="Output plano sin colores (para piping/scripts).")
 def draft_stats(plain: bool):
-    """Muestra conteo de decisiones por tipo + última fecha.
+    """Muestra conteo de decisiones por tipo + última fecha + adapter info.
 
     Pensado para sanity-check del loop: si el `total` no crece después
     de un día de uso, o todo se va a `expired`, hay algo roto en el
     flujo (listener no postea, draft nunca llega al RagNet, etc.).
 
     Pares (bot_draft, sent_text) cuando `decision='approved_editar'`
-    son gold humano para futuro fine-tune del modelo de drafts; el
-    conteo `approved_editar` mide cuántos pares hay disponibles.
+    son gold humano para fine-tune del modelo de drafts (ver
+    `rag draft finetune`); el conteo `approved_editar` mide cuántos
+    pares hay disponibles.
+
+    Output extendido (2026-04-29 GC#3):
+      - total + breakdown por decision type
+      - review-only count (extra_json.review_only=true)
+      - distribución últimos 30 días
+      - adapter metadata si existe (~/.local/share/obsidian-rag/drafts_ft/)
     """
     rows: list[tuple] = []
     last_ts: str | None = None
+    n_review_only = 0
+    rows_30d: list[tuple] = []
     try:
         with _ragvec_state_conn() as conn:
             rows = list(conn.execute(
@@ -29459,6 +29629,23 @@ def draft_stats(plain: bool):
             ).fetchone()
             if row and row[0]:
                 last_ts = row[0]
+            # Review-only: rows con extra_json.review_only=true. Esto fue
+            # agregado al schema recientemente — antes no había rows con
+            # esa flag. SQLite json_extract devuelve NULL si la key no
+            # está; el `= 1` filtra solo los explícitos.
+            n_row = conn.execute(
+                "SELECT COUNT(*) FROM rag_draft_decisions "
+                "WHERE extra_json IS NOT NULL "
+                "AND json_extract(extra_json, '$.review_only') IN (1, 'true', true)"
+            ).fetchone()
+            if n_row:
+                n_review_only = int(n_row[0])
+            # Distribución últimos 30 días por decision.
+            rows_30d = list(conn.execute(
+                "SELECT decision, COUNT(*) FROM rag_draft_decisions "
+                "WHERE ts >= datetime('now', 'localtime', '-30 days') "
+                "GROUP BY decision ORDER BY decision"
+            ).fetchall())
     except Exception as exc:
         msg = f"error leyendo rag_draft_decisions: {exc}"
         click.echo(msg) if plain else console.print(f"[red]{msg}[/red]")
@@ -29470,7 +29657,9 @@ def draft_stats(plain: bool):
         return
 
     counts = {decision: int(n) for decision, n in rows}
+    counts_30d = {decision: int(n) for decision, n in rows_30d}
     total = sum(counts.values())
+    total_30d = sum(counts_30d.values())
 
     # Orden fijo para que el output sea estable entre corridas.
     ordered_keys = ("approved_si", "approved_editar", "rejected", "expired")
@@ -29480,6 +29669,11 @@ def draft_stats(plain: bool):
             n = counts.get(k, 0)
             pct = (n / total * 100.0) if total else 0.0
             click.echo(f"  {k}: {n}  ({pct:.1f}%)")
+        click.echo(f"review_only: {n_review_only}")
+        click.echo(f"últimos_30d: {total_30d}")
+        for k in ordered_keys:
+            n = counts_30d.get(k, 0)
+            click.echo(f"  {k}_30d: {n}")
         if last_ts:
             click.echo(f"última: {last_ts}")
     else:
@@ -29496,8 +29690,126 @@ def draft_stats(plain: bool):
             console.print(
                 f"  [{color}]{k}[/{color}]: {n}  [dim]({pct:.1f}%)[/dim]"
             )
+        if n_review_only > 0:
+            console.print(
+                f"  [dim]review_only (extra_json):[/dim] {n_review_only}"
+            )
+        console.print(
+            f"\n[bold]últimos 30 días:[/bold] {total_30d}"
+        )
+        for k in ordered_keys:
+            n = counts_30d.get(k, 0)
+            console.print(f"  [dim]{k}:[/dim] {n}")
         if last_ts:
-            console.print(f"[dim]última decisión: {last_ts}[/dim]")
+            console.print(f"\n[dim]última decisión:[/dim] {last_ts}")
+
+    # ── Adapter metadata ──
+    # Si hay un adapter entrenado, mostrar su metadata. Mismo path que
+    # el loader runtime usa (DRAFTS_FT_ADAPTER_DIR).
+    meta_path = DRAFTS_FT_ADAPTER_DIR / "ft_meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = None
+        if meta:
+            ft_active = _drafts_ft_enabled() and _drafts_ft_adapter_available()
+            if plain:
+                click.echo("\nadapter:")
+                click.echo(f"  trained_at: {meta.get('trained_at', '?')}")
+                click.echo(f"  base_model: {meta.get('base_model', '?')}")
+                click.echo(f"  n_train: {meta.get('n_train', 0)}")
+                click.echo(f"  n_val: {meta.get('n_val', 0)}")
+                m = meta.get("metrics", {}) or {}
+                if m.get("bleu1_mean") is not None:
+                    click.echo(f"  bleu1_mean: {m['bleu1_mean']:.3f}")
+                if m.get("sim_mean") is not None:
+                    click.echo(f"  sim_mean: {m['sim_mean']:.3f}")
+                click.echo(f"  RAG_DRAFTS_FT active: {ft_active}")
+            else:
+                console.print("\n[bold]adapter:[/bold] "
+                              f"[dim]{DRAFTS_FT_ADAPTER_DIR}[/dim]")
+                console.print(
+                    f"  trained_at: [cyan]{meta.get('trained_at', '?')}[/cyan]"
+                )
+                console.print(
+                    f"  base_model: [cyan]{meta.get('base_model', '?')}[/cyan]"
+                )
+                console.print(
+                    f"  n_train={meta.get('n_train', 0)}  "
+                    f"n_val={meta.get('n_val', 0)}"
+                )
+                m = meta.get("metrics", {}) or {}
+                if m.get("bleu1_mean") is not None:
+                    console.print(
+                        f"  BLEU-1: [cyan]{m['bleu1_mean']:.3f}[/cyan]  "
+                        f"sim: [cyan]{m.get('sim_mean', 0.0):.3f}[/cyan]"
+                    )
+                badge = "[green]active[/green]" if ft_active else "[dim]inactive[/dim]"
+                console.print(f"  RAG_DRAFTS_FT: {badge}")
+    else:
+        if plain:
+            click.echo("\nadapter: not trained yet")
+        else:
+            console.print(
+                "\n[dim]adapter:[/dim] not trained yet "
+                f"[dim](correr `rag draft finetune` cuando tengas ≥100 pares)[/dim]"
+            )
+
+
+@draft.command("finetune")
+@click.option("--epochs", type=int, default=3, show_default=True,
+              help="Número de epochs de training.")
+@click.option("--lr", type=float, default=1e-4, show_default=True,
+              help="Learning rate del optimizer.")
+@click.option("--exclude-review-only", is_flag=True,
+              help="Filtrar rows con extra_json.review_only=true. "
+                   "Default: incluir (signal real igual).")
+@click.option("--dry-run", is_flag=True,
+              help="Build pairs + report stats; NO entrena.")
+def draft_finetune(
+    epochs: int, lr: float, exclude_review_only: bool, dry_run: bool,
+) -> None:
+    """Entrena un LoRA adapter sobre los gold pairs (approved_editar).
+
+    Bypass al script `scripts/finetune_drafts.py`. Mismo CLI que el
+    script directo, pero accesible vía `rag drafts finetune` para
+    consistency con el resto del CLI (stats, schedule, brief, etc.).
+
+    Prerequisito: ≥100 pares totales (gold + anti). Si <100 → exit 1
+    con mensaje claro. Para chequear el conteo actual:
+        rag draft stats
+
+    El adapter se guarda en ~/.local/share/obsidian-rag/drafts_ft/ y
+    se activa via `RAG_DRAFTS_FT=1` (default OFF). El listener TS NO
+    lo usa — el endpoint /api/draft/preview es el único call site.
+    """
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "scripts" / "finetune_drafts.py"
+    if not script.is_file():
+        console.print(f"[red]script no encontrado: {script}[/red]")
+        raise click.exceptions.Exit(1)
+    cmd = [sys.executable, str(script),
+           "--epochs", str(epochs), "--lr", str(lr)]
+    if exclude_review_only:
+        cmd.append("--exclude-review-only")
+    if dry_run:
+        cmd.append("--dry-run")
+    # Pasamos a través el stdout/stderr para que el user vea progress
+    # bars + métricas en tiempo real. Exit code propaga.
+    try:
+        proc = subprocess.run(cmd, check=False)
+    except Exception as exc:
+        console.print(f"[red]error invocando script: {exc}[/red]")
+        raise click.exceptions.Exit(1)
+    raise click.exceptions.Exit(proc.returncode)
+
+
+# `rag drafts` (plural) — alias del singular. Misma instancia de Click
+# group, registrado con dos nombres en `cli`. Permite que tanto el
+# shell history viejo (`rag draft stats`) como el nuevo (`rag drafts
+# finetune`) funcionen sin duplicar la implementación.
+cli.add_command(draft, name="drafts")
 
 
 # ── rag brief — auditar el loop de feedback de los briefs ──────────────────
@@ -53440,6 +53752,15 @@ _CONFIG_VARS: tuple[tuple[str, str, str, str], ...] = (
      "GC#2.C: cargar LoRA adapter desde ~/.local/share/obsidian-rag/reranker_ft/ "
      "on top del base reranker. Default OFF; fallback silencioso si peft no "
      "está instalado o el adapter no existe."),
+    ("RAG_DRAFTS_FT", "", "bool",
+     "GC#3: activar el modelo de drafts fine-tuned en /api/draft/preview. "
+     "Lee adapter de ~/.local/share/obsidian-rag/drafts_ft/. Default OFF "
+     "→ endpoint hace echo del bot_draft_baseline. NO afecta el listener "
+     "TS (sigue con qwen2.5:14b en producción)."),
+    ("RAG_DRAFTS_FT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct", "str",
+     "Modelo base para el fine-tune de drafts. Override solo para "
+     "experimentos — el default debe matchear training time vs runtime "
+     "(si entrenaste sobre Qwen2.5-7B-Instruct, runtime tiene que ser el mismo)."),
 
     # — Memory
     ("RAG_MEMORY_PRESSURE_DISABLE", "", "bool",

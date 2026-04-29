@@ -2731,6 +2731,56 @@ def submit_draft_decision(req: DraftDecisionPayload) -> dict:
     return {"ok": True, "id": int(row_id)}
 
 
+# ── /api/draft/preview ───────────────────────────────────────────────────────
+# A/B manual del fine-tuned drafts model (2026-04-29). El listener TS
+# NO usa este endpoint — sigue generando drafts con qwen2.5:14b en
+# producción. El endpoint existe para que el user pueda comparar
+# manualmente "qué hubiera salido del baseline (lo que el listener
+# acaba de mandar)" vs "qué hubiera salido del fine-tuned (este
+# adapter)" via curl o una UI futura.
+#
+# Contract:
+#   - Si `RAG_DRAFTS_FT` está OFF → echo del bot_draft_baseline.
+#   - Si el adapter no existe / peft falta → echo + silent_errors log.
+#   - Si la generación falla → echo + silent_errors log.
+#   - Si todo OK → output del modelo fine-tuned.
+# El endpoint NUNCA raisea — el caller siempre recibe algo útil.
+
+class DraftPreviewPayload(BaseModel):
+    # Cap defensivo: las conversaciones de WA pre-draft que el listener
+    # construye son <2KB típico. 8KB es un margen amplio.
+    original_conversation: str = Field("", max_length=8000)
+    bot_draft_baseline: str = Field("", max_length=8000)
+
+
+@app.post("/api/draft/preview")
+def submit_draft_preview(req: DraftPreviewPayload) -> dict:
+    """Genera el output del modelo fine-tuned para A/B manual.
+
+    Body shape: ver `DraftPreviewPayload`. Devuelve:
+      `{"ok": True, "preview": "<output>", "ft_active": bool}`
+
+    `ft_active` indica si el modelo realmente corrió (true) o fue
+    echo del baseline (false) — útil para que el caller sepa si
+    está viendo un A/B real o el mismo baseline.
+    """
+    from rag import (
+        _drafts_ft_adapter_available,
+        _drafts_ft_enabled,
+        generate_draft_preview,
+    )
+    ft_active = bool(_drafts_ft_enabled() and _drafts_ft_adapter_available())
+    try:
+        preview = generate_draft_preview(
+            original_conversation=req.original_conversation,
+            bot_draft_baseline=req.bot_draft_baseline,
+        )
+    except Exception:  # pragma: no cover — el helper ya hace silent-fail
+        preview = req.bot_draft_baseline
+        ft_active = False
+    return {"ok": True, "preview": preview, "ft_active": ft_active}
+
+
 # ── /api/anticipate/feedback ─────────────────────────────────────────────────
 # Cuando el user responde 👍/👎/🔇 a un push del Anticipatory Agent, el
 # listener TS extrae el `dedup_key` del footer del mensaje quoted (ver

@@ -1021,9 +1021,67 @@ def _format_calendar_block(raw: str, now: datetime | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+# 2026-04-28 wave-8: noise detectors para gmail_recent. Agrupar CI/security/
+# marketing reduce ruido en el CONTEXTO y pistas el LLM hacia los mails que
+# importan ("tenés 4 mails de CI fallando + 1 de OSDE + 1 personal" en vez
+# de listar cada notificación con su SHA).
+_GMAIL_GITHUB_BRACKET_RE = re.compile(r"^\s*\[[\w.-]+/[\w.-]+\]")  # [user/repo]
+_GMAIL_CI_RE = re.compile(
+    r"\b(?:run\s+(?:failed|cancelled|succeeded|skipped)|ci\s+(?:failed|passed)|"
+    r"build\s+(?:failed|passed|succeeded)|workflow\s+run|pipeline)\b",
+    re.IGNORECASE,
+)
+_GMAIL_SECURITY_RE = re.compile(
+    r"\b(?:security\s+alert|vulnerability|cve-?\d{4}|dependabot|advisory|"
+    r"alerta\s+de\s+seguridad)\b",
+    re.IGNORECASE,
+)
+_GMAIL_MARKETING_RE = re.compile(
+    r"\b(?:newsletter|unsubscribe|promo(?:ci[oó]n)?|oferta|"
+    r"discount|sale|black\s+friday|cyber\s+monday)\b",
+    re.IGNORECASE,
+)
+_GMAIL_NOREPLY_RE = re.compile(
+    # Conservative: solo no-reply explícito + alias claramente automatizados.
+    # `info@` se quitó porque OSDE/Galicia/etc usan `info@org` para
+    # notificaciones legítimas que al user le importan (turnos médicos,
+    # avisos bancarios). Mejor un false negative en automated que
+    # ocultar un mail real.
+    r"(?:no.?reply|noreply|donot.?reply|news(?:letter)?@|marketing@|"
+    r"updates?@|notifications?@)",
+    re.IGNORECASE,
+)
+
+
+def _classify_gmail_thread(frm: str, subj: str) -> str:
+    """Clasifica un thread de gmail en una bucket de ruido.
+
+    Returns "ci", "security", "marketing", "automated", o "personal".
+    Personal es el bucket default — los mails que NO matchean ninguno de
+    los patrones de ruido son los que importan al user.
+    """
+    full = f"{frm} {subj}".strip()
+    # Order matters: CI antes que automated porque CI es más específico.
+    if _GMAIL_GITHUB_BRACKET_RE.search(subj) or _GMAIL_CI_RE.search(full):
+        return "ci"
+    if _GMAIL_SECURITY_RE.search(full):
+        return "security"
+    if _GMAIL_MARKETING_RE.search(full):
+        return "marketing"
+    if _GMAIL_NOREPLY_RE.search(frm):
+        return "automated"
+    return "personal"
+
+
 def _format_gmail_block(raw: str) -> str:
     """Render Gmail evidence as 'Mails' section with awaiting-reply and
     starred threads as bullets. Keeps the tool name out of the output.
+
+    2026-04-28 wave-8: agrupar mails de noise (CI, security alerts, marketing,
+    automated notifications) en summary lines. El user pidió "qué mails
+    pendientes tengo" y antes recibía 4 líneas separadas con commit SHAs +
+    `[jagoff/rag-obsidian]` brackets. Ahora resume "4 mails de CI: 2 fail,
+    1 ok, 1 cancelled" + lista solo los mails personales.
     """
     try:
         data = json.loads(raw)
@@ -1044,12 +1102,52 @@ def _format_gmail_block(raw: str) -> str:
         header_bits.append(f"{unread} no leído{'s' if unread != 1 else ''}")
     header = f"### Mails ({', '.join(header_bits)})" if header_bits else "### Mails"
     lines = [header]
-    # Mapping kind → etiqueta entre corchetes. `recent` es el default
-    # (últimos del inbox sin filtros) y NO lleva tag — sería ruido
-    # visual: "- Fer F · Asunto [recent]". Si el mail vino del bucket
-    # flagueado (awaiting_reply o starred) sí ponemos el tag porque es
-    # signal útil para el user ("este hilo te espera respuesta").
+
+    # Agrupar threads por bucket. Personal va listado uno por uno; los
+    # demás se resumen en una sola línea con count.
+    buckets: dict[str, list[dict]] = {
+        "ci": [], "security": [], "marketing": [],
+        "automated": [], "personal": [],
+    }
     for t in valid_threads:
+        frm = str(t.get("from", "")).strip()
+        subj = str(t.get("subject", "")).strip()
+        bucket = _classify_gmail_thread(frm, subj)
+        buckets[bucket].append(t)
+
+    # Resumen de noise (siempre primero — los grupos compactos arriba).
+    noise_labels = {
+        "ci": "CI/builds",
+        "security": "alertas de seguridad",
+        "marketing": "marketing/newsletters",
+        "automated": "notificaciones automáticas",
+    }
+    for bucket_name in ("ci", "security", "marketing", "automated"):
+        items = buckets[bucket_name]
+        if not items:
+            continue
+        n = len(items)
+        label = noise_labels[bucket_name]
+        # Para CI agregar el desglose por outcome (failed/passed/cancelled).
+        if bucket_name == "ci":
+            outcomes = {"failed": 0, "passed": 0, "cancelled": 0, "other": 0}
+            for it in items:
+                s = str(it.get("subject", "")).lower()
+                if "failed" in s or "fail:" in s or " fail" in s:
+                    outcomes["failed"] += 1
+                elif "passed" in s or "succeeded" in s or "success" in s:
+                    outcomes["passed"] += 1
+                elif "cancelled" in s or "skipped" in s:
+                    outcomes["cancelled"] += 1
+                else:
+                    outcomes["other"] += 1
+            outcome_bits = [f"{v} {k}" for k, v in outcomes.items() if v > 0]
+            lines.append(f"- {n} {label} ({', '.join(outcome_bits)})")
+        else:
+            lines.append(f"- {n} {label}")
+
+    # Mails personales: uno por línea con tag de bucket si corresponde.
+    for t in buckets["personal"]:
         frm = str(t.get("from", "")).strip()
         subj = str(t.get("subject", "")).strip()
         kind = str(t.get("kind", "")).strip()

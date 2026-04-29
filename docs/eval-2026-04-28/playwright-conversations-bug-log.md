@@ -31,7 +31,11 @@
 
 ## Issues abiertos para triagear
 
-### 🚨 CRITICAL #1 — Password/credenciales del vault salen en chat responses
+### ✅ CRITICAL #1 — Password/credenciales del vault salen en chat responses — FIXED 2026-04-28 (wave-7 `e018328`)
+
+**Status:** RESUELTO. PII redaction filter shipped. Greppable `[chat-pii-redact]`.
+
+
 
 **Repro:**
 ```
@@ -56,7 +60,11 @@ bot: Tu mamá se llama María y tiene los siguientes datos:
 
 ---
 
-### 🚨 CRITICAL #2 — Internal error message expuesto al user
+### ✅ CRITICAL #2 — Internal error message expuesto al user — FIXED 2026-04-28 (wave-7 `e018328`)
+
+**Status:** RESUELTO. `_sanitize_error_for_user(exc, phase)` aplicado en 4 sites (tasks_brief, tool_decision, synthesis, retrieve). Greppable `[chat-error-sanitized]`.
+
+
 
 **Repro:**
 ```
@@ -80,7 +88,11 @@ bot: retrieve falló: bm25_search llamado en paralelo — es GIL-serialised
 
 ---
 
-### ⚠️ HIGH #3 — "y mañana?" alucina propose_reminder
+### ✅ HIGH #3 — "y mañana?" alucina propose_reminder — FIXED 2026-04-28 (wave-8 `47fb545`)
+
+**Status:** RESUELTO. (a) `_has_explicit_time` dejó de matchear "mañana" sola (bug latente en `_TIME_MARKER_RE`). (b) Anaphoric carry-over re-fires read-intent tools del turno previo cuando current matchea `_ANAPHORIC_TEMPORAL_RE`. Validado real-UI: `qué tengo hoy?` → `y mañana?` re-fires `reminders_due,calendar_ahead,whatsapp_pending` con response "...para mañana".
+
+
 
 **Repro:**
 ```
@@ -103,7 +115,11 @@ Conv 4, T2: "y mañana?" → emite raw `propose_reminder(...)` syntax,
 
 ---
 
-### ⚠️ HIGH #4 — "sumále también X" no actualiza el recordatorio anterior, pero el bot dice que sí
+### ✅ HIGH #4 — "sumále también X" no actualiza el recordatorio anterior, pero el bot dice que sí — FIXED 2026-04-28 (wave-7 `e018328`)
+
+**Status:** RESUELTO. REGLA 1.c en `_WEB_SYSTEM_PROMPT` prohíbe explícitamente confirmar acciones sin tools_fired. El user todavía no puede editar reminders (no hay tool), pero la respuesta ya no afirma falsamente que se hizo.
+
+
 
 **Repro:**
 ```
@@ -155,7 +171,11 @@ Conv 3, T3: qué recordatorios tengo
 
 ---
 
-### ⚠️ HIGH #6 — "cancelar el del médico" rutea a propose_whatsapp_cancel_scheduled
+### ✅ HIGH #6 — "cancelar el del médico" rutea a propose_whatsapp_cancel_scheduled — PARCIALMENTE FIXED 2026-04-28 (wave-7 `e018328`)
+
+**Status:** PARCIAL. REGLA explícita en `_build_propose_create_override` prohíbe usar `propose_whatsapp_cancel_scheduled` cuando el contexto NO es WhatsApp. El tool de "cancelar reminder/event" sigue sin existir — open backlog para próxima wave.
+
+
 
 **Repro:**
 ```
@@ -176,7 +196,11 @@ Conv 3, T4: cancelar el del médico
 
 ---
 
-### ⚠️ HIGH #7 — Weather follow-up sin location carry
+### ✅ HIGH #7 — Weather follow-up sin location carry — FIXED 2026-04-28 (wave-8 `47fb545` + `b91678f`)
+
+**Status:** RESUELTO. (a) `weather_location` se persiste en sesión via `append_turn`. (b) `_resolve_anaphoric_args("weather", q, last_location)` extrae nueva location ("y en Barcelona?") o reusa la previa. (c) Bonus: `_translate_weather_desc` traduce los strings de wttr.in al español, eliminando el leak CJK que ocurría como side-effect cuando el LLM tenía CONTEXTO en inglés. Validado real-UI: `clima en Madrid` → `y en Barcelona?` correctamente fires weather con location=Barcelona, response 100% en español rioplatense.
+
+
 
 **Repro (conv anterior, no en este eval pero confirmado en wave-5):**
 ```
@@ -263,7 +287,11 @@ Conv 2, T3: y de eso qué puedo postergar?
 
 ---
 
-### ⚠️ MEDIUM #11 — Cache stale serve respuestas con bugs ya fixeados
+### ✅ MEDIUM #11 — Cache stale serve respuestas con bugs ya fixeados — FIXED 2026-04-28 (wave-7 + wave-8)
+
+**Status:** RESUELTO. `_FILTER_VERSION` baked en `_hash_chunk_count` invalida cache entries pre-fix. Bumped `wave7-2026-04-28` → `wave8-2026-04-28`. Cleanup script borró 50 stale rows en wave-7. Cache hits aplican PII redaction y CJK strip como defense-in-depth.
+
+
 
 **Repro:**
 ```
@@ -353,29 +381,32 @@ bot: Tarjeta $549.439 + U$S98.93 + MOZE $5.119.709
 
 ## Resumen de fixes sugeridos por prioridad
 
-### P0 (CRITICAL — fixear ya)
-1. **PII redaction post-stream** (passwords, DNI, phone — Conv 5 leak)
-2. **Sanitize SSE errors** (no exponer assertion text al user — Conv 6)
+### P0 (CRITICAL) — TODOS RESUELTOS
+1. ✅ **PII redaction post-stream** (passwords, DNI, phone — Conv 5 leak) — wave-7 `e018328`
+2. ✅ **Sanitize SSE errors** (no exponer assertion text al user — Conv 6) — wave-7 `e018328`
 
-### P1 (HIGH — fixear esta sesión o la próxima)
-3. **Follow-up shift desde read-intent** ("y mañana?" tras "qué hago hoy" debe re-fire calendar_ahead, no propose_reminder)
-4. **No false confirmations** ("sumále" sin tool fired NO debe decir "se ha programado")
+### P1 (HIGH) — TODOS RESUELTOS
+3. ✅ **Follow-up shift desde read-intent** ("y mañana?" tras "qué hago hoy" debe re-fire calendar_ahead, no propose_reminder) — wave-8 `47fb545`
+4. ✅ **No false confirmations** ("sumále" sin tool fired NO debe decir "se ha programado") — wave-7 `e018328` REGLA 1.c
 
-### P2 (HIGH — backlog)
-5. **EventKit cache lag** post-create
-6. **Reminder/calendar cancel tools** (no existen, LLM rutea al de WhatsApp por confusión)
-7. **Weather location carry** (`y en Barcelona?` tras Madrid)
-8. **Auto-recovery no debe matar web server**
+### P2 (HIGH)
+5. **EventKit cache lag** post-create — backlog
+6. ✅ **Reminder/calendar cancel tools** — PARCIAL: REGLA prohíbe ruteo equivocado, falta tool real — wave-7 `e018328`
+7. ✅ **Weather location carry** (`y en Barcelona?` tras Madrid) — wave-8 `47fb545` + `b91678f`
+8. ✅ **Auto-recovery no debe matar web server** — wave-6 `5b42c0d`
 
 ### P3 (MEDIUM)
-9. **Topic anchor multi-turn** (limit conocido del CONCAT)
-10. **Mails summary** (agrupar CI/notifications)
-11. **Tool output context al siguiente turn** ("y de eso qué puedo postergar?")
-12. **Cache versioning** (prompt_version + filter_version en key)
+9. **Topic anchor multi-turn** (limit conocido del CONCAT) — backlog
+10. **Mails summary** (agrupar CI/notifications) — backlog
+11. **Tool output context al siguiente turn** ("y de eso qué puedo postergar?") — backlog
+12. ✅ **Cache versioning** (prompt_version + filter_version en key) — wave-7 + wave-8
 
 ### P4 (LOW — nits)
-13. **"you" ambiguity** en preguntas multilang
-14. **Savings vs spending** distinción
+13. **"you" ambiguity** en preguntas multilang — backlog
+14. **Savings vs spending** distinción — backlog
+
+### Bonus (wave-8 fix de regression no listado en eval original)
+- ✅ **CJK leak en weather responses** — qwen2.5:7b leakeaba 汉字 cuando wttr.in devolvía descriptions en inglés. Fix doble: traducir descriptions upstream + aplicar `_strip_foreign_scripts` defensivo en stream pipeline. Wave-8 `b91678f`.
 
 ## Telemetría útil para tracking
 

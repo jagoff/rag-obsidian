@@ -65,3 +65,11 @@ ocr-e2e-*.png
 # Local screenshots from playwright iterations during dev
 v2-iter*.png
 ra-home-current.png
+
+# Stray scratch artifacts en root (screenshots de iteración visual,
+# canvas dumps base64, outputs ad-hoc de scripts de testing). El repo
+# NO commitea PNGs ni TXT en root — todo lo que es tracked vive bajo
+# subdirs (web/static/, docs/, tests/). Si necesitás una imagen
+# tracked, ponéla en un subdir explícito.
+/*.png
+/*.txt
